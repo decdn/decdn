@@ -156,11 +156,10 @@ jobs:
   changes:
     name: detect changes
     runs-on: ubuntu-latest
-    # pull-requests: read is needed by dorny/paths-filter to call the
-    # listFiles API on PR events; on push it falls back to git diff.
+    # Only contents: read — `token: ''` below keeps paths-filter off the
+    # listFiles API, so the pull-requests: read scope it needed is gone.
     permissions:
       contents: read
-      pull-requests: read
     outputs:
       rust: ${{ steps.filter.outputs.rust }}
       adr: ${{ steps.filter.outputs.adr }}
@@ -172,6 +171,19 @@ jobs:
       - uses: dorny/paths-filter@v4
         id: filter
         with:
+          # Detect changes with git, not the pulls/{n}/files API. That endpoint
+          # is a hard single point of failure for the whole pipeline: when it
+          # 503s, this job dies, every downstream job reports `skipping`, and
+          # the `ci-success` gate fails — with nothing having compiled. A
+          # GitHub incident did exactly that and no re-run could clear it.
+          # `token: ''` is the action's documented switch for this; git keeps
+          # working through REST outages.
+          #
+          # Semantics are unchanged: checkout leaves us on the PR merge commit,
+          # so paths-filter's `git diff base..HEAD` yields the same file list
+          # the API returned. It self-fetches the base SHA, so no fetch-depth
+          # bump is needed. On `push` this job already used git.
+          token: ''
           filters: |
             rust:
               - '**/*.rs'

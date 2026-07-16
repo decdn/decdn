@@ -84,8 +84,10 @@ use tracing::{debug, error, info, warn};
 use crate::chain_events::resumable_watcher::{
     self, CursorPolicy, LogSink, NoneFallback, WatcherConfig,
 };
+use crate::chain_events::shared_head::HeadSource;
 use crate::chain_events::{
-    MAX_BACKFILL_BLOCK_SPAN, REORG_MARGIN_BLOCKS, WATCHER_INITIAL_BACKOFF, WATCHER_MAX_BACKOFF,
+    AbortOnDrop, MAX_BACKFILL_BLOCK_SPAN, REORG_MARGIN_BLOCKS, WATCHER_INITIAL_BACKOFF,
+    WATCHER_MAX_BACKOFF, timed,
 };
 use crate::handlers::client::ClientHandler;
 use crate::metrics::{Metrics, SettleParty};
@@ -189,17 +191,6 @@ const CHECKPOINT_FLUSH_BLOCKS: u64 = 512;
 /// negligible while making the worst-case lost progress a handful of L2 blocks.
 const CHECKPOINT_FLUSH_INTERVAL: Duration = Duration::from_secs(30);
 
-/// Aborts the wrapped task on drop so a node-restart cycle never leaks a
-/// chain-poll task. Same pattern as `chain_staker_set::AbortOnDrop`.
-#[derive(Debug)]
-struct AbortOnDrop(JoinHandle<()>);
-
-impl Drop for AbortOnDrop {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
-}
-
 /// Seller-side `PaymentChannel` settlement service. Generic over the alloy
 /// [`Provider`] (a wallet-filled provider is required for the `withdraw` /
 /// `closeChannel` write path). Cheap to construct; owns its background tasks.
@@ -256,6 +247,7 @@ impl<P: Provider + Clone + 'static> PaymentChannelService<P> {
         redeem_threshold: U256,
         auto_settle: AutoSettleConfig,
         event_poll_interval: Duration,
+        head: Arc<dyn HeadSource>,
         metrics: Arc<Metrics>,
     ) -> Result<Self> {
         let contract = PaymentChannel::new(payment_channel_addr, provider);
@@ -279,11 +271,17 @@ impl<P: Provider + Clone + 'static> PaymentChannelService<P> {
         // The backfill floor and downtime-gap resume (#751/#762) are now the
         // cursor policy's job: a persisted `ChannelOpened` checkpoint resumes
         // across restarts; a first-ever boot (`none_fallback: Head`) scans from
-        // head, so nothing predating the node is chased. `confirmations = 0`
-        // keeps channel-registration latency minimal (a shallow reorg is covered
-        // by the resume `reorg_margin` and the sink's idempotent
-        // `register_open_channel`). The closing-reconciliation backfill (#839) is
-        // subsumed: `ChannelCloseInitiated` logs flow through the same scan.
+        // head, so nothing predating the node is chased. The closing-
+        // reconciliation backfill (#839) is subsumed: `ChannelCloseInitiated`
+        // logs flow through the same scan.
+        //
+        // This watcher's scan runs to head with no confirmation lag, as they all
+        // do — see `chain_events`' module doc, which now carries that rationale
+        // (this was the only one of six sites that stated it, #1227). The cost
+        // that makes it load-bearing *here* specifically: a lag would delay
+        // channel registration, so a client's first request on a fresh channel
+        // would be rejected as unknown. A shallow reorg is covered by the resume
+        // `reorg_margin` and the sink's idempotent `register_open_channel`.
         let watcher_shutdown = CancellationToken::new();
         let sink = SettlementSink {
             contract: contract.clone(),
@@ -294,6 +292,7 @@ impl<P: Provider + Clone + 'static> PaymentChannelService<P> {
             metrics: Arc::clone(&metrics),
         };
         let cfg = WatcherConfig {
+            head,
             filter: Filter::new()
                 .address(payment_channel_addr)
                 .event_signature(vec![
@@ -304,8 +303,6 @@ impl<P: Provider + Clone + 'static> PaymentChannelService<P> {
                 ]),
             from_block: 0,
             poll_interval: event_poll_interval,
-            confirmations: 0,
-            reorg_margin: REORG_MARGIN_BLOCKS,
             max_backfill_span: MAX_BACKFILL_BLOCK_SPAN,
             cursor: cursor_policy(Arc::clone(&checkpoint_store)),
             initial_backoff: WATCHER_INITIAL_BACKOFF,
@@ -858,7 +855,10 @@ fn pending_settle_for_closing(
 ///
 /// `getChannel` is the authoritative deadline source (honors a later
 /// `disputeChannel` extension), and `record_pending` overwrites idempotently —
-/// so re-running every boot, and on every close event, is safe. Both failure
+/// so re-running every boot, and on every close event, is safe. The `getChannel`
+/// read is bounded by [`timed`] — this is the payment-critical path, and an
+/// unbounded read against a stalled provider would wedge the tick with no
+/// backoff rather than fail into the recovery below. Both failure
 /// legs (the `getChannel` read and the `record_pending` write) propagate as an
 /// `Err` from `SettlementSink::apply`: the tick aborts before the window is
 /// persisted, so the cursor stays below the `ChannelCloseInitiated` block and the
@@ -872,9 +872,7 @@ async fn reconcile_closing_channel<P: Provider + Clone>(
     pending_store: &Arc<dyn PendingSettleStore>,
     channel_id: ChannelId,
 ) -> Result<()> {
-    let ch = contract
-        .getChannel(channel_id)
-        .call()
+    let ch = timed(None, "getChannel", contract.getChannel(channel_id).call())
         .await
         .with_context(|| format!("getChannel for closing reconciliation of {channel_id}"))?;
     let Some(entry) = pending_settle_for_closing(
@@ -903,11 +901,15 @@ async fn reconcile_closing_channel<P: Provider + Clone>(
 /// there is no history to replay. Pinned by a test: swapping the fallback to
 /// `FromBlock` full-scans chain history on every fresh node (`from_block` is
 /// `0` here), and swapping the key forfeits the persisted resume.
+///
+/// The `reorg_margin` rewind lives here too: it is only meaningful against a
+/// durable cursor, so [`CursorPolicy::Persisted`] owns it (#1227).
 fn cursor_policy(store: Arc<dyn KeyedCheckpointStore>) -> CursorPolicy {
     CursorPolicy::Persisted {
         store,
         key: CheckpointKey::ChannelOpened,
         none_fallback: NoneFallback::Head,
+        reorg_margin: REORG_MARGIN_BLOCKS,
     }
 }
 
@@ -2213,6 +2215,13 @@ mod tests {
     /// floor and anchors a first-ever boot at head. A `FromBlock` fallback here
     /// would full-scan chain history on every fresh node (settlement's
     /// `from_block` is 0); a different key forfeits the #751 resume.
+    ///
+    /// Also pins the reorg rewind at the shared `REORG_MARGIN_BLOCKS`. This
+    /// asserts the value the *production* config carries, which is the point:
+    /// the deleted `scan_upper_bound_lags_by_confirmations` passed for the life
+    /// of #1227 because it tested the arithmetic against a value no config ever
+    /// supplied. A rewind of `0` here would silently forfeit the shallow-reorg
+    /// coverage on resume.
     #[test]
     fn cursor_policy_is_persisted_channel_opened_head_fallback() {
         let store: Arc<dyn KeyedCheckpointStore> = Arc::new(RecordingCheckpointStore::default());
@@ -2221,6 +2230,7 @@ mod tests {
             CursorPolicy::Persisted {
                 key: CheckpointKey::ChannelOpened,
                 none_fallback: NoneFallback::Head,
+                reorg_margin: REORG_MARGIN_BLOCKS,
                 ..
             }
         ));
@@ -2894,6 +2904,38 @@ mod tests {
     /// that read the `settlement_finalize_*` family.
     fn finalize_counter(metrics: &Arc<Metrics>, name: &str) -> u64 {
         auto_settle_counter(metrics, name)
+    }
+
+    /// A stalled `getChannel` must fail the tick, not wedge it.
+    ///
+    /// This is the payment-critical leg: unbounded, a provider that holds the
+    /// connection open and never answers stops settlement entirely — no cursor
+    /// movement, no backoff, no metric. Bounded, it lands on the documented
+    /// recovery path (the tick aborts below the `ChannelCloseInitiated` block
+    /// and the backoff re-scans it).
+    ///
+    /// `FailingPendingStore` is the sentinel: the store is only reached *after*
+    /// the read succeeds, so if the `timed` wrap were ever dropped and the read
+    /// somehow resolved, the failure would be a store error instead — and the
+    /// timeout assertion below would catch that rather than pass vacuously.
+    #[tokio::test(start_paused = true)]
+    async fn hanging_get_channel_fails_the_tick_rather_than_wedging() {
+        use crate::chain_events::test_support::{bounded, hanging_provider};
+        let contract =
+            PaymentChannel::PaymentChannelInstance::new(Address::ZERO, hanging_provider());
+        let store: Arc<dyn PendingSettleStore> = Arc::new(FailingPendingStore);
+        let err = bounded(
+            "reconcile_closing_channel",
+            reconcile_closing_channel(&contract, Address::ZERO, &store, ChannelId::from([7u8; 32])),
+        )
+        .await
+        .err()
+        .map(|e| format!("{e:#}"));
+        assert!(
+            err.as_ref()
+                .is_some_and(|e| e.contains("getChannel timed out after")),
+            "a stalled getChannel must fail into the backoff, not hang: {err:?}"
+        );
     }
 
     /// A `PendingSettleStore` whose writes always fail — drives the persist-

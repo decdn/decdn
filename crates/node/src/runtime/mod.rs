@@ -4,7 +4,8 @@ pub mod reload;
 
 pub use reload::{LogLevelSetter, ReloadSnapshot, RuntimeReloadState};
 
-use std::collections::HashSet;
+use crate::chain_events::shared_head::{HeadSource, SharedHead};
+
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
@@ -29,7 +30,7 @@ use decdn_gossip::{GossipMetrics, GossipRuntimeConfig, GossipService, PeerTable,
 
 use crate::admin;
 use crate::channel_store::PersistentChannelStateStore;
-use crate::dht::{ChainStakerSet, DhtRateLimiter, RecordStore, RecordStoreConfig, StakerSet};
+use crate::dht::{DhtRateLimiter, RecordStore, RecordStoreConfig, StakerSet};
 use crate::dispatch::ConnectionLimiter;
 use crate::handlers::client::{ClientHandler, MAX_CLIENT_STREAMS};
 use crate::handlers::dht::DhtHandler;
@@ -115,13 +116,23 @@ const QUIC_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
 /// connection and then closing.
 const QUIC_MAX_CONCURRENT_BIDI_STREAMS: u32 = 100;
 
-/// Apply an explicit filter poll interval to a freshly built provider,
-/// overriding alloy's localhost-detected 250 ms default that floods a local
-/// anvil with `eth_getFilterChanges` (#1011). `set_poll_interval` uses interior
-/// mutability, so this applies to the already-constructed provider and returns
-/// it unchanged in type — wallet/nonce-filler providers route through it too,
-/// because `client()` is a default `Provider` trait method available on every
-/// provider. The interval comes from `blockchain.event_poll_interval_ms`.
+/// Apply an explicit client poll interval to a freshly built provider,
+/// overriding alloy's localhost-detected 250 ms default (#1011).
+///
+/// Despite the config knob's name this no longer touches event watching: since
+/// #1106 the chain watchers tick on `WatcherConfig::poll_interval` and never read
+/// the client interval. The one consumer still reachable from this node is
+/// `PendingTransactionBuilder::get_receipt`'s heartbeat (alloy-provider
+/// `heart.rs`), which the node awaits in `payment_settlement` and
+/// `buyer_channel` — so this bounds how fast a node awaiting a mined settlement /
+/// channel tx re-polls for its receipt, and alloy's 250 ms localhost default
+/// would otherwise hammer a dev anvil for the life of every pending tx.
+///
+/// `set_poll_interval` uses interior mutability, so this applies to the
+/// already-constructed provider and returns it unchanged in type —
+/// wallet/nonce-filler providers route through it too, because `client()` is a
+/// default `Provider` trait method available on every provider. The interval
+/// comes from `blockchain.event_poll_interval_ms`.
 fn with_poll_interval<P: Provider>(provider: P, interval: Duration) -> P {
     provider.client().set_poll_interval(interval);
     provider
@@ -695,25 +706,52 @@ pub async fn run(
         .content_blacklist_address
         .as_deref()
         .map(|_| rpc_url.clone());
-    // Explicit filter poll interval for every chain-event provider (#1011),
-    // overriding alloy's 250 ms localhost default that floods a dev anvil.
+    // One value, two consumers (#1011/#1106): the `eth_getLogs` tick cadence each
+    // watcher gets via `WatcherConfig::poll_interval`, and — through
+    // `with_poll_interval` below — the pending-tx receipt heartbeat, overriding
+    // alloy's 250 ms localhost default that would hammer a dev anvil.
     let event_poll_interval = Duration::from_millis(cfg.blockchain.event_poll_interval_ms);
     let chain_provider = with_poll_interval(
         ProviderBuilder::new().connect_http(rpc_url.clone()),
         event_poll_interval,
     );
-    let staker_set: Arc<dyn StakerSet> = Arc::new(
-        ChainStakerSet::bootstrap(
-            chain_provider,
-            capacity_bond_addr,
-            event_poll_interval,
-            Arc::clone(&node_metrics),
-        )
-        .await
-        .with_context(|| {
-            format!("ChainStakerSet bootstrap from CapacityBond at {capacity_bond_addr}")
-        })?,
-    );
+    // One `eth_blockNumber` per TTL window for ALL watchers, instead of one per
+    // watcher per tick. Plain read-only provider: a head read needs no wallet or
+    // nonce filler, and coupling it to the signer stack would give every watcher's
+    // head read a dependency on it. Deliberately NOT wrapped in
+    // `with_poll_interval` — that only sets the pending-tx receipt heartbeat, and
+    // this provider never builds a `PendingTransactionBuilder`.
+    let head: Arc<dyn HeadSource> = Arc::new(SharedHead::new(
+        ProviderBuilder::new().connect_http(rpc_url.clone()),
+        event_poll_interval,
+    ));
+    // Graceful-shutdown tokens for the three watchers that previously minted one
+    // inline and dropped it, leaving nothing able to cancel them (#1230). Minted
+    // unconditionally so the cancels in the shutdown sequence are unconditional
+    // too — cancelling a token no watcher ever received is a no-op, which is
+    // cheaper than threading an `Option` through for the reputation indexer's
+    // `subscribe_reputation` gate.
+    let capacity_bond_watcher_shutdown = CancellationToken::new();
+    let slash_watcher_shutdown = CancellationToken::new();
+    let reputation_indexer_shutdown = CancellationToken::new();
+    // One CapacityBond enumeration + one watcher feeding both registry
+    // projections (#1110). The bindings half is built only when pull-through is
+    // on; it derives from page data already read here, so — unlike when it had its
+    // own bootstrap — it has no RPC that can fail on its own. `getActiveNodes`
+    // failure was already fatal via this same (unconditional, first-to-run) call,
+    // so nothing that boots today loses pull-through.
+    let registry = crate::dht::capacity_bond_registry::bootstrap(
+        chain_provider,
+        capacity_bond_addr,
+        event_poll_interval,
+        Arc::clone(&head),
+        cfg.cache.node_to_node_pull_through_enabled,
+        Arc::clone(&node_metrics),
+        capacity_bond_watcher_shutdown.clone(),
+    )
+    .await
+    .with_context(|| format!("CapacityBond registry bootstrap at {capacity_bond_addr}"))?;
+    let staker_set: Arc<dyn StakerSet> = registry.staker_set;
 
     // Slash-detection watcher (#1032, G-NODE-05): follow `SlashJudge.Slashed`
     // for this operator so the slash surfaces over `admin_v1_slashes` (+ the
@@ -732,42 +770,19 @@ pub async fn run(
         eth_signer.address(),
         cfg.blockchain.slash_judge_from_block,
         event_poll_interval,
+        Arc::clone(&head),
         Arc::clone(&node_metrics),
+        slash_watcher_shutdown.clone(),
     );
     let slash_store = slash_watcher.store();
 
-    // NodeId → bonded operator address resolver for node-to-node pulls (#831).
-    // Reads the same `CapacityBond` registration data as the staker set
-    // (`getActiveNodes` / `NodeRegistered` carry `ethAddress`). Built only when
-    // the feature is on; a bootstrap failure is NON-fatal — like the buyer
-    // service, node→node buying is opportunistic, so a failed resolver just
-    // leaves pull-through disabled rather than aborting the seller node. Held to
-    // provision the `NodeOrigin` below.
+    // NodeId → bonded operator address resolver for node-to-node pulls (#831),
+    // produced by the same CapacityBond bootstrap as the staker set above and
+    // `Some` exactly when pull-through is enabled. Held to provision the
+    // `NodeOrigin` below.
     let node_address_resolver: Option<Arc<dyn crate::dht::NodeAddressResolver>> =
         if cfg.cache.node_to_node_pull_through_enabled {
-            match crate::dht::node_address::ChainNodeAddressDirectory::bootstrap(
-                with_poll_interval(
-                    ProviderBuilder::new().connect_http(rpc_url.clone()),
-                    event_poll_interval,
-                ),
-                capacity_bond_addr,
-                event_poll_interval,
-                Arc::clone(&node_metrics),
-            )
-            .await
-            {
-                Ok(dir) => Some(Arc::new(dir)),
-                Err(err) => {
-                    tracing::warn!(
-                        err = %sanitize_rpc_display(&err),
-                        %capacity_bond_addr,
-                        "ChainNodeAddressDirectory bootstrap failed; node→node pull-through is \
-                         DISABLED for this process (cannot resolve provider payout addresses). \
-                         Restart to retry."
-                    );
-                    None
-                }
-            }
+            registry.node_addresses
         } else {
             None
         };
@@ -899,6 +914,7 @@ pub async fn run(
                     cfg.blockchain.origin_directory_from_block,
                     Arc::clone(&watcher_checkpoint_store),
                     event_poll_interval,
+                    Arc::clone(&head),
                     Arc::clone(&staker_set),
                     Arc::clone(&node_metrics),
                     origin_watcher_shutdown.clone(),
@@ -1048,6 +1064,7 @@ pub async fn run(
             voucher_nonce_span_threshold: cfg.blockchain.settlement_auto_by_voucher_nonce_span,
         },
         event_poll_interval,
+        Arc::clone(&head),
         Arc::clone(&node_metrics),
     )
     .await
@@ -1370,6 +1387,7 @@ pub async fn run(
                 cache.clone(),
                 cfg.blockchain.content_blacklist_from_block,
                 event_poll_interval,
+                Arc::clone(&head),
                 Duration::from_secs(cfg.blockchain.content_blacklist_poll_interval_sec),
                 shutdown.clone(),
             ));
@@ -1495,10 +1513,16 @@ pub async fn run(
         announce_interval_sec: cfg.gossip.announce_interval_sec,
         subscribe_global: cfg.gossip.subscribe_global,
         region: cfg.identity.region.clone(),
-        allowlist: cfg.gossip.allowlist.iter().copied().collect::<HashSet<_>>(),
         subscribe_reputation: cfg.gossip.subscribe_reputation,
         reputation_publish_interval_sec: cfg.gossip.reputation_publish_interval_sec,
     };
+    // ADR 001 rule 2: a NodeAnnounce is accepted only from a currently-staked
+    // node. Enforced against the live on-chain registry (`staker_set`, kept
+    // fresh by the CapacityBond event tail) — not a static allowlist. Bootstrap
+    // failure already aborted startup above, so this is always `Some`.
+    let announce_staked: Option<Arc<dyn decdn_gossip::StakedNodeSet>> = Some(Arc::new(
+        crate::reputation_wiring::NodeStakedNodeSet::new(Arc::clone(&staker_set)),
+    ));
     let gossip_metrics: Arc<dyn GossipMetrics> =
         Arc::new(NodeGossipMetrics::new(Arc::clone(&node_metrics)));
 
@@ -1548,9 +1572,9 @@ pub async fn run(
             Arc::clone(&staker_set),
             min_counterparties,
         ))),
-        staked: Some(Arc::new(
-            crate::reputation_wiring::NodeStakedReporterSet::new(Arc::clone(&staker_set)),
-        )),
+        staked: Some(Arc::new(crate::reputation_wiring::NodeStakedNodeSet::new(
+            Arc::clone(&staker_set),
+        ))),
         // Outbound report capture (#831): the `NodeOrigin` pull path feeds
         // `observation_buffer` with delivery/probe outcomes, so wire the drain —
         // which spawns the gossip publisher — whenever pull-through is enabled.
@@ -1796,6 +1820,7 @@ pub async fn run(
         Arc::clone(&peer_table),
         gossip_metrics,
         gossip_shutdown.clone(),
+        announce_staked,
         reputation_wiring,
     )
     .await
@@ -1816,7 +1841,9 @@ pub async fn run(
             capacity_bond_addr,
             Arc::clone(&settlement_source),
             event_poll_interval,
+            Arc::clone(&head),
             Arc::clone(&node_metrics),
+            reputation_indexer_shutdown.clone(),
         )
         .await
         {
@@ -2087,6 +2114,26 @@ pub async fn run(
         tracing::warn!(%err, "router shutdown reported an error");
     }
     gossip_shutdown.cancel();
+    // The three watchers that had no cancel path before #1230, stopped here for
+    // the same reason gossip is: cooperative exit of an infinite loop at its
+    // next await, once nothing depends on it any more.
+    //
+    // *After* `router.shutdown` deliberately, and the capacity-bond one is why:
+    // its projection is the cached active-staker set, which gates DHT `Store`
+    // admission and decides which probes the stake-lane reservation sheds.
+    // Cancelling it before the drain would freeze that set while the router is
+    // still serving, so a membership change landing mid-drain would be missed
+    // by exactly the requests still in flight. Slash and the reputation indexer
+    // are not consulted by the serve path and could stop earlier, but they stop
+    // here too — one cancel site for the shared `capacity-bond`-era watchers is
+    // easier to keep correct than three orderings each justified separately.
+    //
+    // None of the three persists a cursor, so unlike `origin_watcher_shutdown`
+    // above there is no checkpoint to flush and no deadline this must beat: the
+    // cancel buys a clean exit, and `AbortOnDrop` remains the backstop.
+    capacity_bond_watcher_shutdown.cancel();
+    slash_watcher_shutdown.cancel();
+    reputation_indexer_shutdown.cancel();
     // Cancel any in-flight background cache-fill tasks (#859): the router has
     // drained, so warming the cache for future requests is moot. They observe
     // the token at their next await and exit; being advisory, they are not
@@ -3145,11 +3192,11 @@ mod tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    /// `with_poll_interval` overrides alloy's localhost-detected 250 ms filter
-    /// poll default (#1011). Building against a `127.0.0.1` URL exercises the
-    /// exact path that triggers the flood — alloy would seed 250 ms — and the
-    /// helper must replace it. No network I/O: `poll_interval()` reads a local
-    /// atomic on the client.
+    /// `with_poll_interval` overrides alloy's localhost-detected 250 ms client
+    /// poll default — the interval alloy's pending-tx receipt heartbeat polls on
+    /// (#1011). Building against a `127.0.0.1` URL exercises the exact path that
+    /// triggers it — alloy would seed 250 ms — and the helper must replace it. No
+    /// network I/O: `poll_interval()` reads a local atomic on the client.
     #[test]
     fn with_poll_interval_overrides_alloy_local_default() {
         let url: alloy::transports::http::reqwest::Url =
@@ -3332,7 +3379,6 @@ mod tests {
                 subscribe_global: false,
                 subscribe_reputation: true,
                 reputation_publish_interval_sec: 3600,
-                allowlist: Vec::new(),
                 max_peer_entries: Some(100_000),
             },
             security: ResolvedSecurity {

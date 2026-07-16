@@ -158,6 +158,24 @@ since project inception and will roll into the first tagged release.
 
 ### Changed
 
+#### Runtime (observability)
+
+- **The `decdn_node_address_watcher_*` metrics are removed (#1231).** Gone:
+  `decdn_node_address_watcher_restarts_total` and
+  `decdn_node_address_watcher_down_seconds`. Since #1226 collapsed the
+  node-address and staker-set watchers into one `capacity-bond` loop, these were
+  a perfectly-correlated shadow of `decdn_staker_set_watcher_restarts_total` /
+  `decdn_staker_set_watcher_down_seconds` — one loop's health reported twice.
+  **Migration:** use the `decdn_staker_set_watcher_*` family, which now covers
+  the bindings projection too because the same loop feeds it. Worse than
+  redundant, the removed family was gated on the bindings projection existing,
+  so a node with `cache.node_to_node_pull_through_enabled = false` reported
+  `down_seconds` frozen at `0` forever — an alert that could never fire.
+  `decdn_node_address_directory_size` is **not** affected: it measures the
+  projection's cardinality rather than the loop's health, and is retained. Note
+  that it is exported even when pull-through is off, where it sits at a
+  permanent `0`; scope any alert on it to nodes with pull-through on.
+
 #### CLI
 
 - **The CLI now rejects the zero address for the four addresses resolved by
@@ -357,6 +375,18 @@ since project inception and will roll into the first tagged release.
 
 ### Security
 
+- **Gossip rule-2 enforced against the live registry, not a static allowlist
+  (#1170).** `NodeAnnounce` admission (ADR 001 rule 2) now checks the announcer
+  against the live on-chain staker set (`CapacityBond`, kept fresh by the
+  `NodeRegistered` / `NodeDeregistered` / `NodeAutoEjected` event tail) instead
+  of the file-configured allowlist, so a deregistered or slashed node can no
+  longer enter peer tables during its stale-cache window. The rejection metric
+  label changed from `not_allowlisted` to `not_staked`.
+  - **Config-breaking:** the `gossip.allowlist` field is removed. Because
+    `[gossip]` uses `deny_unknown_fields`, a config file that still sets
+    `gossip.allowlist` now fails `decdn config validate` and node startup —
+    delete the key. The staked-node check is no longer operator-tunable; it is
+    always enforced against the registry.
 - `rustls-webpki` → 0.103.12 (RUSTSEC-2026-0098, RUSTSEC-2026-0099) (#253).
 - `rustls-webpki` → 0.103.13 (RUSTSEC-2026-0104: reachable panic in CRL
   parsing) (#286).

@@ -187,6 +187,20 @@ aws-smithy-types = "1"
 tempfile = "3"
 wiremock = "0.6"
 proptest = "1"
+# `decdn-node`'s chain-watcher tests need a provider whose RPCs never resolve, to
+# prove each sink-internal read is bounded by `chain_events::timed`. alloy's own
+# `Asserter` cannot express that (it pops a queued response or errors — never
+# pends), so the tests build a `tower::Service` transport returning `pending()`.
+# alloy already depends on tower 0.5; this pins the same major so the `Service`
+# impl satisfies alloy's `Transport` blanket bound.
+tower = "0.5"
+# The packet types that transport's `Service` impl is generic over. Taken as a
+# dev-dep rather than by enabling alloy's `json-rpc` feature: the feature is
+# workspace-wide (it would widen `decdn-cli`'s surface too, cf. #578), whereas
+# this is test-only. alloy already pulls alloy-json-rpc via alloy-network, so
+# cargo unifies this onto that same instance and no extra crate is compiled —
+# which is also what keeps the `Service` impl's types identical to alloy's.
+alloy-json-rpc = "2"
 # Public-API stability snapshot (issue #304, `decdn-protocol` only). `public-api`
 # renders the crate's exported surface from rustdoc JSON, which `rustdoc-json`
 # generates with the workspace's pinned *stable* toolchain (no nightly — the

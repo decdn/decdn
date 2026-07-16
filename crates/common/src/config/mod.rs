@@ -65,13 +65,22 @@ const DEFAULT_RPC_WATCHDOG_INTERVAL_SEC: u64 = 30;
 /// the watchdog probing the RPC endpoint frequently enough to risk
 /// tripping provider rate limits or exhausting paid quotas.
 const MIN_RPC_WATCHDOG_INTERVAL_SEC: u64 = 10;
-/// Default chain-event filter poll interval (milliseconds). 7000 ms matches
-/// alloy's non-local default, so live-RPC load is unchanged from before #1011;
-/// it overrides alloy's 250 ms localhost default that floods a dev anvil.
+/// Default chain-event poll interval (milliseconds). One knob, two unrelated
+/// consumers (see `ResolvedBlockchain::event_poll_interval_ms`): the
+/// `eth_getLogs` watcher tick cadence, and alloy's pending-transaction receipt
+/// heartbeat. 7000 ms matches alloy's non-local default, so live-RPC load is
+/// unchanged from before #1011; it also overrides alloy's 250 ms localhost
+/// default, which the receipt heartbeat would otherwise use against a dev anvil.
 const DEFAULT_EVENT_POLL_INTERVAL_MS: u64 = 7000;
-/// Minimum chain-event filter poll interval. Below this, the ~6 long-lived
-/// watcher filters issue enough `eth_getFilterChanges` to recreate the #1011
-/// flood; it also matches alloy's own localhost floor.
+/// Minimum chain-event poll interval. The floor is unchanged from #1011; its
+/// reason is not. The long-lived `eth_newFilter` streams it was originally sized
+/// against are gone — #1106 replaced them with `eth_getLogs` polling, so no
+/// `eth_getFilterChanges` is issued anywhere on the node. At 250 ms the node's
+/// ~6 watcher loops would each scan `[cursor, head]` four times a second against
+/// one endpoint, tripping provider rate limits and burning paid quota just as the
+/// original flood did. The same floor bounds the receipt-heartbeat consumer.
+/// 250 ms is kept as the floor because it is alloy's own localhost cadence: a dev
+/// anvil can still be driven at the fastest interval alloy itself considers sane.
 const MIN_EVENT_POLL_INTERVAL_MS: u64 = 250;
 
 /// Default accrued-claim redemption threshold: 1 USDC (`1_000_000` `µUSDC`).
@@ -762,9 +771,9 @@ fn resolve_discovery_into(
 /// check: `PublicKey::from_str` requires lowercase hex *and* a valid Ed25519
 /// curve point, so an uppercase or non-curve-point id that a bare hex check
 /// would accept must be rejected here too — otherwise it would pass
-/// `config validate` and then fail node startup. (Unlike `gossip.allowlist`,
-/// which decodes to bytes consumed directly, this path carries the id as a
-/// String the node re-parses, so the two checks must agree.)
+/// `config validate` and then fail node startup. This path carries the id as a
+/// String the node re-parses, so the config-time and bring-up checks must
+/// agree.
 fn resolve_discovery_peer(
     node_id: &str,
     peer: &types::DiscoveryPeer,
@@ -1180,8 +1189,10 @@ fn resolve_blockchain_into(
         "blockchain.event_poll_interval_ms",
         || {
             format!(
-                "blockchain.event_poll_interval_ms={event_poll_interval_ms} would flood the \
-                 RPC endpoint with eth_getFilterChanges (minimum {MIN_EVENT_POLL_INTERVAL_MS}ms)"
+                "blockchain.event_poll_interval_ms={event_poll_interval_ms} would poll the \
+                 RPC endpoint too frequently — it drives both the eth_getLogs watcher \
+                 tick and pending-tx receipt polling \
+                 (minimum {MIN_EVENT_POLL_INTERVAL_MS}ms)"
             )
         },
     );
@@ -2207,12 +2218,9 @@ pub fn resolve_observability_into(
     }
 }
 
-/// Resolve gossip fields. Every allowlist entry is parsed as a 64-character
-/// hex node ID (either case accepted); each malformed entry is dropped from
-/// the returned list and recorded under `gossip.allowlist[<idx>]` (so an
-/// operator sees every bad ID at once), and resolution still fails at startup
-/// before the partial allowlist is used — never silently degrading to
-/// accept-all mode later.
+/// Resolve gossip fields. The ADR 001 rule-2 staked-node check is enforced at
+/// runtime against the live on-chain registry (`decdn_gossip::StakedNodeSet`),
+/// so no static allowlist is resolved here.
 #[cfg(test)]
 fn resolve_gossip(file: Option<&types::GossipConfig>) -> anyhow::Result<ResolvedGossip> {
     one_section(|bag| resolve_gossip_into(file, bag))
@@ -2267,25 +2275,12 @@ fn resolve_gossip_into(
         "gossip.reputation_publish_interval_sec must be > 0",
     );
 
-    let allowlist = file
-        .and_then(|g| g.allowlist.as_ref())
-        .map(|v| {
-            v.iter()
-                .enumerate()
-                .filter_map(|(idx, s)| {
-                    bag.try_with(format!("gossip.allowlist[{idx}]"), parse_node_id_hex(s))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
     ResolvedGossip {
         announce_interval_sec,
         peer_ttl_sec,
         subscribe_global,
         subscribe_reputation,
         reputation_publish_interval_sec,
-        allowlist,
         max_peer_entries,
     }
 }
@@ -2786,41 +2781,6 @@ fn parse_trusted_ips(
     out
 }
 
-/// Parse a 64-character hex (case-insensitive) node ID into 32 raw bytes.
-///
-/// The error message is field-agnostic — callers (currently
-/// `gossip.allowlist`) wrap the result with the field path of the
-/// offending entry.
-fn parse_node_id_hex(s: &str) -> anyhow::Result<[u8; 32]> {
-    anyhow::ensure!(
-        s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()),
-        "must be 64 hex chars, got {s:?}"
-    );
-    let mut out = [0u8; 32];
-    let bytes = s.as_bytes();
-    for (i, slot) in out.iter_mut().enumerate() {
-        let hi = bytes
-            .get(i * 2)
-            .copied()
-            .ok_or_else(|| anyhow::anyhow!("hex too short"))?;
-        let lo = bytes
-            .get(i * 2 + 1)
-            .copied()
-            .ok_or_else(|| anyhow::anyhow!("hex too short"))?;
-        *slot = (hex_val(hi)? << 4) | hex_val(lo)?;
-    }
-    Ok(out)
-}
-
-fn hex_val(b: u8) -> anyhow::Result<u8> {
-    match b {
-        b'0'..=b'9' => Ok(b - b'0'),
-        b'a'..=b'f' => Ok(b - b'a' + 10),
-        b'A'..=b'F' => Ok(b - b'A' + 10),
-        _ => anyhow::bail!("invalid hex digit: {}", b as char),
-    }
-}
-
 /// Load a [`FileConfig`] from disk.
 ///
 /// - If `explicit_path` is `Some`, reads that file (errors if missing).
@@ -3158,36 +3118,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn parse_node_id_hex_accepts_either_case() -> anyhow::Result<()> {
-        let lower = "0".repeat(64);
-        let upper = "A".repeat(64);
-        let mixed: String = "Aa".repeat(32);
-        assert_eq!(parse_node_id_hex(&lower)?, [0u8; 32]);
-        assert_eq!(parse_node_id_hex(&upper)?, [0xAA; 32]);
-        assert_eq!(parse_node_id_hex(&mixed)?, [0xAA; 32]);
-        Ok(())
-    }
-
-    #[test]
-    fn parse_node_id_hex_round_trips_nibble_order() -> anyhow::Result<()> {
-        let hex = "0123456789abcdef".repeat(4);
-        let bytes = parse_node_id_hex(&hex)?;
-        // First byte should be 0x01 — high nibble from '0', low from '1'.
-        assert_eq!(bytes[0], 0x01);
-        assert_eq!(bytes[1], 0x23);
-        assert_eq!(bytes[31], 0xef);
-        Ok(())
-    }
-
-    #[test]
-    fn parse_node_id_hex_rejects_bad_input() {
-        assert!(parse_node_id_hex(&"0".repeat(63)).is_err());
-        assert!(parse_node_id_hex(&"0".repeat(65)).is_err());
-        assert!(parse_node_id_hex(&"g".repeat(64)).is_err());
-        assert!(parse_node_id_hex("").is_err());
-    }
-
     // vitalik.eth, known-good EIP-55 checksum.
     const GOOD_ADDR: &str = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045";
     const ALT_ADDR_1: &str = "0x0000000000000000000000000000000000000001";
@@ -3265,22 +3195,6 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn resolve_gossip_allowlist_happy_path() -> anyhow::Result<()> {
-        // "0123456789abcdef" repeated 4× = 64 hex chars.
-        // Decodes pairwise to 8 bytes (01 23 45 67 89 ab cd ef), repeated 4×.
-        let cfg = types::GossipConfig {
-            allowlist: Some(vec!["0123456789abcdef".repeat(4)]),
-            ..Default::default()
-        };
-        let g = resolve_gossip(Some(&cfg))?;
-        let pattern = [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef];
-        let expected: [u8; 32] = std::array::from_fn(|i| pattern[i % 8]);
-        assert!(g.allowlist.contains(&expected));
-        assert_eq!(g.allowlist.len(), 1);
-        Ok(())
-    }
-
     fn ident(region: Option<&str>) -> ResolvedIdentity {
         ResolvedIdentity {
             data_dir: PathBuf::from("/tmp/unused"),
@@ -3295,7 +3209,6 @@ mod tests {
             subscribe_global,
             subscribe_reputation: true,
             reputation_publish_interval_sec: 3600,
-            allowlist: Vec::new(),
             max_peer_entries: None,
         }
     }
@@ -3330,7 +3243,6 @@ mod tests {
             announce_interval_sec: Some(42),
             peer_ttl_sec: Some(123),
             subscribe_global: Some(false),
-            allowlist: None,
             max_peer_entries: Some(7),
             ..Default::default()
         };
@@ -3338,7 +3250,6 @@ mod tests {
         assert_eq!(g.announce_interval_sec, 42);
         assert_eq!(g.peer_ttl_sec, 123);
         assert!(!g.subscribe_global);
-        assert!(g.allowlist.is_empty());
         assert_eq!(g.max_peer_entries, Some(7));
         Ok(())
     }
@@ -3354,7 +3265,6 @@ mod tests {
             g.reputation_publish_interval_sec,
             DEFAULT_REPUTATION_PUBLISH_INTERVAL_SEC
         );
-        assert!(g.allowlist.is_empty());
         assert_eq!(g.max_peer_entries, None);
         Ok(())
     }
@@ -3571,25 +3481,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn resolve_gossip_rejects_bad_allowlist_entry() {
-        let cfg = types::GossipConfig {
-            allowlist: Some(vec!["0".repeat(63)]),
-            ..Default::default()
-        };
-        let err = resolve_gossip(Some(&cfg))
-            .expect_err("expected error")
-            .to_string();
-        assert!(
-            err.contains("64 hex chars"),
-            "error missing field context: {err}"
-        );
-    }
-
     // Per-field merge coverage for `[gossip]` (#434). The companion to
     // `resolve_security` per-field tests above. Each field gets a
-    // file-leg "override" test and a "default when absent" test, with
-    // the allowlist hex-validation error path covered alongside.
+    // file-leg "override" test and a "default when absent" test.
 
     #[test]
     fn resolve_gossip_announce_interval_file_override() -> anyhow::Result<()> {
@@ -3661,60 +3555,6 @@ mod tests {
         Ok(())
     }
 
-    /// Allowlist hex validation: non-hex characters in an otherwise
-    /// 64-char entry must be rejected. Sibling to the existing
-    /// `resolve_gossip_rejects_bad_allowlist_entry` (wrong length)
-    /// test — together they cover the two failure modes
-    /// `parse_node_id_hex` raises on the allowlist path so a regression
-    /// in either won't slip past CI silently (#434).
-    #[test]
-    fn resolve_gossip_rejects_non_hex_allowlist_entry() {
-        let cfg = types::GossipConfig {
-            allowlist: Some(vec!["g".repeat(64)]),
-            ..Default::default()
-        };
-        let err = resolve_gossip(Some(&cfg))
-            .expect_err("non-hex entry should be rejected")
-            .to_string();
-        assert!(
-            err.contains("64 hex chars") || err.contains("hex"),
-            "error missing hex-context: {err}"
-        );
-    }
-
-    /// Every malformed allowlist entry is dropped from the returned vec
-    /// *and* recorded under its own `gossip.allowlist[<idx>]` label, so
-    /// resolution fails at startup before the partial list is used (never
-    /// silently degrading to accept-all). Two invalid entries at indices
-    /// 0 and 2 (valid hex at 1) must both surface — a regression to
-    /// fail-fast on the first bad entry would only report one.
-    #[test]
-    fn resolve_gossip_accumulates_every_invalid_allowlist_entry() {
-        let cfg = types::GossipConfig {
-            allowlist: Some(vec![
-                "z".repeat(64),               // idx 0: invalid (non-hex)
-                "0123456789abcdef".repeat(4), // idx 1: valid
-                "q".repeat(64),               // idx 2: invalid (non-hex)
-            ]),
-            ..Default::default()
-        };
-        let err = resolve_gossip(Some(&cfg))
-            .expect_err("every invalid allowlist entry must be reported")
-            .to_string();
-        assert!(
-            err.contains("gossip.allowlist[0]") && err.contains("gossip.allowlist[2]"),
-            "both bad entries must be named by index: {err}"
-        );
-        assert!(
-            !err.contains("gossip.allowlist[1]"),
-            "the valid entry must not be reported: {err}"
-        );
-        assert!(
-            err.contains("hex"),
-            "error must surface hex-validation failure: {err}"
-        );
-    }
-
     /// Independent gossip field overrides: setting one field to a
     /// non-default value must leave the others at their defaults.
     /// Catches a regression that copy-pasted the wrong source field
@@ -3729,7 +3569,6 @@ mod tests {
         assert_eq!(g.announce_interval_sec, 7);
         assert_eq!(g.peer_ttl_sec, DEFAULT_PEER_TTL_SEC);
         assert!(g.subscribe_global);
-        assert!(g.allowlist.is_empty());
         Ok(())
     }
 
@@ -8889,8 +8728,9 @@ swap_pool_address = \"0xPool\"
 
     #[test]
     fn resolve_blockchain_rejects_event_poll_interval_below_minimum() -> anyhow::Result<()> {
-        // #1011: a sub-minimum interval would recreate the eth_getFilterChanges
-        // flood the knob exists to prevent, so resolution must reject it.
+        // #1011/#1106: a sub-minimum interval would drive every eth_getLogs
+        // watcher tick — and the pending-tx receipt heartbeat — too frequently,
+        // so resolution must reject it.
         let dir = data_dir_with_keystore()?;
         let cli = BlockchainArgs {
             origin_assignment_address: None,

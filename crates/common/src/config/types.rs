@@ -204,12 +204,15 @@ pub struct BlockchainConfig {
     /// watchdog entirely; absent => default (30s). Non-zero values below
     /// `MIN_RPC_WATCHDOG_INTERVAL_SEC` are rejected at config resolution.
     pub rpc_watchdog_interval_sec: Option<u64>,
-    /// Milliseconds between `eth_getFilterChanges` polls for the chain event
-    /// watchers (#1011). Overrides alloy's default, which is 250 ms for a
-    /// localhost RPC (it auto-detects `127.0.0.1`/`localhost`) and 7000 ms
-    /// otherwise — the 250 ms local default floods a dev anvil. Absent =>
-    /// default (`DEFAULT_EVENT_POLL_INTERVAL_MS`, 7000 ms, matching alloy's
-    /// non-local cadence so live-RPC load is unchanged). Values below
+    /// Milliseconds between chain-event poll ticks (#1011, #1106). Drives two
+    /// unrelated consumers: the `eth_getLogs` tick cadence of every chain
+    /// watcher, and alloy's pending-transaction receipt heartbeat (see
+    /// `ResolvedBlockchain::event_poll_interval_ms`). The heartbeat is why this
+    /// overrides alloy's own default, which is 250 ms for a localhost RPC (it
+    /// auto-detects `127.0.0.1`/`localhost`) and 7000 ms otherwise — the 250 ms
+    /// local default hammers a dev anvil. Absent => default
+    /// (`DEFAULT_EVENT_POLL_INTERVAL_MS`, 7000 ms, matching alloy's non-local
+    /// cadence so live-RPC load is unchanged). Values below
     /// `MIN_EVENT_POLL_INTERVAL_MS` are rejected at config resolution.
     pub event_poll_interval_ms: Option<u64>,
     /// Accrued un-redeemed USDC (base units, `µUSDC`) at which the node
@@ -756,11 +759,6 @@ pub struct GossipConfig {
     /// Seconds between reputation-report publish ticks. Default 3600 (matches
     /// the ADR 008 1-hour per-(reporter, node) rate limit). Must be `> 0`.
     pub reputation_publish_interval_sec: Option<u64>,
-    /// Optional allowlist of accepted announcer node IDs, hex-encoded
-    /// (64 hex chars, either case). Absent/empty = accept any signature-valid
-    /// announce. Local stand-in for ADR 001 rule 2 (staked-node check)
-    /// until the on-chain staking registry contract lands.
-    pub allowlist: Option<Vec<String>>,
     /// Optional hard cap on `PeerTable` entry count
     /// (appendix-peer-table-eviction § No hard size cap). Once the table is
     /// at the cap, new announces from previously-unseen node IDs are

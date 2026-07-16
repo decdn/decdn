@@ -36,14 +36,16 @@ use alloy::rpc::types::{Filter, Log};
 use alloy::sol_types::SolEvent;
 use anyhow::Result;
 use decdn_incentive::slash_judge::SlashJudge;
-use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
+
+use decdn_common::redact::sanitize_err_chain;
 
 use crate::chain_events::resumable_watcher::{
     self, CursorPolicy, LogSink, WatcherConfig, WatcherHook,
 };
-use crate::chain_events::{MAX_BACKFILL_BLOCK_SPAN, REORG_MARGIN_BLOCKS, WATCHER_INITIAL_BACKOFF};
+use crate::chain_events::shared_head::HeadSource;
+use crate::chain_events::{AbortOnDrop, MAX_BACKFILL_BLOCK_SPAN, WATCHER_INITIAL_BACKOFF, timed};
 use crate::metrics::Metrics;
 
 /// Nominal appeal filing window (ADR 028: 30 days from the slash timestamp).
@@ -101,16 +103,6 @@ pub struct DetectedSlash {
 /// read-only `admin_v1_slashes` surface.
 pub type SlashStore = Arc<RwLock<Vec<DetectedSlash>>>;
 
-/// Abort the background task when the owning [`SlashWatcher`] is dropped, so a
-/// runtime teardown doesn't leak the poller.
-struct AbortOnDrop(JoinHandle<()>);
-
-impl Drop for AbortOnDrop {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
-}
-
 /// A running slash-detection watcher. Holds the shared store and owns the
 /// background task (aborted on drop).
 pub struct SlashWatcher {
@@ -138,13 +130,16 @@ impl SlashWatcher {
     /// O(chain-age) scan — the store is not durable, so a resume cursor could not
     /// skip this rebuild.
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn bootstrap<P: Provider + Clone + 'static>(
         provider: P,
         slash_judge_addr: Address,
         self_address: Address,
         from_block: u64,
         event_poll_interval: Duration,
+        head: Arc<dyn HeadSource>,
         metrics: Arc<Metrics>,
+        shutdown: CancellationToken,
     ) -> Self {
         info!(%slash_judge_addr, %self_address, from_block, "slash-detection watcher started");
         let store: SlashStore = Arc::new(RwLock::new(Vec::new()));
@@ -157,11 +152,10 @@ impl SlashWatcher {
             metrics,
         };
         let cfg = WatcherConfig {
+            head,
             filter: operator_filter(slash_judge_addr, self_address),
             from_block,
             poll_interval: event_poll_interval,
-            confirmations: 0,
-            reorg_margin: REORG_MARGIN_BLOCKS,
             max_backfill_span: MAX_BACKFILL_BLOCK_SPAN,
             // No durable resume cursor (the in-memory store is rebuilt each boot);
             // re-scan the bounded appeal-window lookback, clamped to the deploy
@@ -173,7 +167,7 @@ impl SlashWatcher {
             initial_backoff: WATCHER_INITIAL_BACKOFF,
             max_backoff: SLASH_MAX_BACKOFF,
             rpc_call_timeout: None,
-            shutdown: CancellationToken::new(),
+            shutdown,
             seed_cursor: None,
             label: "slash",
             on_established,
@@ -301,16 +295,32 @@ async fn record_log<P: Provider>(
 
 /// Nominal appeal-window close = block timestamp + 30 days, or `None` when the
 /// block number is absent (pending log) or the block read fails (best-effort).
+///
+/// The read is bounded by [`timed`], and a timeout takes the same soft-degrade
+/// path as any other read failure: the slash is still recorded, only its appeal
+/// deadline is unknown. That is strictly better than the unbounded alternative,
+/// where one stalled `get_block` wedges the whole tick and *no* slash surfaces.
 async fn appeal_window_close<P: Provider>(provider: &P, block_number: Option<u64>) -> Option<u64> {
     let block_number = block_number?;
-    match provider
-        .get_block(alloy::eips::BlockId::from(block_number))
-        .await
+    match timed(
+        None,
+        "get_block",
+        provider.get_block(alloy::eips::BlockId::from(block_number)),
+    )
+    .await
     {
         Ok(Some(block)) => Some(block.header.timestamp + APPEAL_FILING_WINDOW_SECS),
         Ok(None) => None,
         Err(err) => {
-            warn!(%err, block_number, "failed to read slash block timestamp for appeal window");
+            // Scrubbed, not `%err`: `timed` folds in the transport leg, whose
+            // Display carries reqwest's ` for url (…)` tail — i.e. the raw
+            // `rpc_url`, credentials and all. This was the one chain-error log
+            // in the tree rendering an alloy error unscrubbed.
+            warn!(
+                err = %sanitize_err_chain(&err),
+                block_number,
+                "failed to read slash block timestamp for appeal window"
+            );
             None
         }
     }
@@ -348,6 +358,28 @@ fn record_slash(store: &SlashStore, metrics: &Arc<Metrics>, slash: DetectedSlash
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// A stalled provider must not wedge the tick: the block read is bounded, and
+    /// a timeout takes the same soft-degrade path as any other read failure.
+    ///
+    /// This drives the real `appeal_window_close` against a real provider, so it
+    /// fails if the `timed` wrap is ever dropped from the call site — asserting
+    /// `timed` in isolation would prove the mechanism but not this wiring.
+    /// `start_paused` auto-advances to the deadline, so it costs no wall-clock.
+    #[tokio::test(start_paused = true)]
+    async fn hanging_block_read_degrades_to_no_deadline_rather_than_wedging() {
+        use crate::chain_events::test_support::{bounded, hanging_provider};
+        let provider = hanging_provider();
+        assert_eq!(
+            bounded(
+                "appeal_window_close",
+                appeal_window_close(&provider, Some(100))
+            )
+            .await,
+            None,
+            "a stalled get_block must degrade to an unknown appeal deadline"
+        );
+    }
 
     /// A `DetectedSlash` distinguished only by `slash_id` (the dedup key).
     fn slash(id: u64) -> DetectedSlash {

@@ -570,14 +570,15 @@ pub struct DecdnMetrics {
     /// it — exactly the silent drift these #783/#788 metrics exist to surface.
     /// Unlike a stream-level error, this does NOT trip a backoff/restart, so it
     /// would otherwise move no metric at all. Pairs with the per-failure
-    /// `warn!` in `apply_operator_change`. Field has no `_total` suffix because
+    /// `warn!` in [`crate::dht::capacity_bond_registry`]'s
+    /// `RegistrySink::on_operator_change`. Field has no `_total` suffix because
     /// the `OpenMetrics` encoder appends it.
     pub staker_set_watcher_resolve_failures: Counter,
     /// `decdn_staker_set_watcher_down_seconds` (#783, semantics corrected
     /// #788): true downtime — seconds the staker-set watcher has been in the
-    /// error/backoff state with no established event filters. Reads `0` for the
-    /// entire life of any established cycle, however long or quiet (a healthy
-    /// filter stream persists indefinitely, so this must NOT measure cycle
+    /// error/backoff state, i.e. failing its `eth_getLogs` poll tick. Reads `0`
+    /// for the entire life of any established cycle, however long or quiet (a
+    /// healthy poll loop persists indefinitely, so this must NOT measure cycle
     /// age), and climbs only while the loop is between a failed cycle and the
     /// next successful re-establishment. Reads `0` until the first cycle is
     /// established after bootstrap. Recomputed at scrape time from a monotonic
@@ -1008,19 +1009,6 @@ pub struct DecdnMetrics {
     /// `narrow_pull_delta` warning. Field has no `_total` suffix because the
     /// `OpenMetrics` encoder appends it.
     pub node_pull_delta_overflow: Counter,
-    /// `decdn_node_address_watcher_restarts_total` (#831): distinct drift windows
-    /// of the `NodeId → address` resolver's event watcher (mirrors the staker-set
-    /// watcher, #788). Edge-triggered once per outage, not per backoff iteration.
-    /// While down, fresh `NodeRegistered` bindings are missed → those providers
-    /// become unpayable and are silently skipped, so this is the signal that the
-    /// pull path's reachable-provider set may be capped by stale bindings.
-    pub node_address_watcher_restarts: Counter,
-    /// `decdn_node_address_watcher_down_seconds` (#831): seconds the
-    /// `NodeId → address` resolver watcher has been in its current error/backoff
-    /// window, recomputed at scrape from `node_address_watcher_down_since`. Reads
-    /// `0` across any established cycle; a poisoned lock reports `i64::MAX` (the
-    /// conservative alerting direction).
-    pub node_address_watcher_down_seconds: Gauge,
     /// `decdn_reputation_indexer_rpc_failures_total` (#326): failing poll ticks —
     /// the settlement indexer's `get_logs`/head RPC errored, or a `nodeIdOf`
     /// party-resolution RPC (in the sink's `apply`) failed. Both now propagate to
@@ -1070,8 +1058,8 @@ pub struct DecdnMetrics {
     /// per-failure `warn!` in `chain_origin_directory`.
     pub origin_directory_watcher_resolve_failures: Counter,
     /// `decdn_origin_directory_watcher_down_seconds` (#651): true downtime —
-    /// seconds the origin-directory watcher has been in the error/backoff state
-    /// with no established filters. Reads `0` for the life of any established
+    /// seconds the origin-directory watcher has been in the error/backoff state,
+    /// i.e. failing its `eth_getLogs` poll tick. Reads `0` for the life of any established
     /// cycle; recomputed at scrape time from a monotonic `down_since`. A
     /// poisoned lock reports `i64::MAX` (alerting direction).
     pub origin_directory_watcher_down_seconds: Gauge,
@@ -1232,11 +1220,6 @@ pub struct Metrics {
     /// `i64::MAX` down-seconds (the conservative, alerting direction for a
     /// downtime gauge — reporting `0` would mask an in-progress outage).
     staker_set_watcher_down_since: Mutex<Option<Instant>>,
-    /// Monotonic instant at which the `NodeId → address` resolver watcher
-    /// entered its current error/backoff window (#831). Same semantics as
-    /// `staker_set_watcher_down_since`: `None` while a cycle is healthy, `Some`
-    /// only during an outage; backs `node_address_watcher_down_seconds`.
-    node_address_watcher_down_since: Mutex<Option<Instant>>,
     /// Monotonic instant at which the origin-directory watcher entered its
     /// current error/backoff window (#651). `None` whenever a cycle is
     /// established. Backs the `origin_directory_watcher_down_seconds` gauge,
@@ -1277,7 +1260,6 @@ impl Metrics {
             started_at: Instant::now(),
             session_ticket_peers: Mutex::new(HashSet::new()),
             staker_set_watcher_down_since: Mutex::new(None),
-            node_address_watcher_down_since: Mutex::new(None),
             origin_directory_watcher_down_since: Mutex::new(None),
             slash_watcher_down_since: Mutex::new(None),
         }
@@ -1690,7 +1672,8 @@ impl Metrics {
     /// A `nodeIdOf(operator)` resolution for an operator-indexed event failed,
     /// dropping the membership change (#788, [`crate::dht::chain_staker_set`]).
     /// Bumps `staker_set_watcher_resolve_failures_total`. Pairs with the
-    /// per-failure `warn!` in `apply_operator_change`.
+    /// per-failure `warn!` in [`crate::dht::capacity_bond_registry`]'s
+    /// `RegistrySink::on_operator_change`.
     pub fn staker_set_watcher_resolve_failure(&self) {
         self.decdn.staker_set_watcher_resolve_failures.inc();
     }
@@ -2054,30 +2037,6 @@ impl Metrics {
     /// counted so `spawned == succeeded + missed + failed + cancelled + panicked` balances.
     pub fn node_pull_through_background_cancelled(&self) {
         self.decdn.node_pull_through_background_cancelled.inc();
-    }
-
-    /// Open a drift window for the `NodeId → address` resolver watcher (#831):
-    /// stamp `node_address_watcher_down_since` and, on the edge into the error
-    /// state, bump `node_address_watcher_restarts_total` exactly once. Mirrors
-    /// [`Self::staker_set_watcher_backoff_started`]; a poisoned lock skips the
-    /// update (the gauge then keeps climbing — the safe alerting direction).
-    pub fn node_address_watcher_backoff_started(&self) {
-        if let Ok(mut down_since) = self.node_address_watcher_down_since.lock()
-            && down_since.is_none()
-        {
-            *down_since = Some(Instant::now());
-            self.decdn.node_address_watcher_restarts.inc();
-        }
-    }
-
-    /// Mark the `NodeId → address` resolver watcher cycle established (#831):
-    /// clear `node_address_watcher_down_since` so `..._down_seconds` reads `0`
-    /// for the life of the cycle. Mirrors
-    /// [`Self::staker_set_watcher_cycle_established`].
-    pub fn node_address_watcher_cycle_established(&self) {
-        if let Ok(mut down_since) = self.node_address_watcher_down_since.lock() {
-            *down_since = None;
-        }
     }
 
     /// Bump `reputation_indexer_rpc_failures_total` (#326): an indexer event
@@ -2481,17 +2440,6 @@ impl Metrics {
             Err(_) => i64::MAX,
         };
         self.decdn.staker_set_watcher_down_seconds.set(down_seconds);
-
-        // Same recompute for the node-address resolver watcher (#831).
-        let node_addr_down_seconds = match self.node_address_watcher_down_since.lock() {
-            Ok(down_since) => down_since
-                .map(|t| t.elapsed().as_secs())
-                .map_or(0, |s| i64::try_from(s).unwrap_or(i64::MAX)),
-            Err(_) => i64::MAX,
-        };
-        self.decdn
-            .node_address_watcher_down_seconds
-            .set(node_addr_down_seconds);
 
         // Same recompute for the origin-directory watcher (#651).
         let origin_dir_down_seconds = match self.origin_directory_watcher_down_since.lock() {
@@ -3319,7 +3267,7 @@ mod tests {
     #[test]
     fn staker_set_watcher_down_seconds_reads_zero_across_a_long_healthy_cycle() {
         // CRITICAL-fix regression guard (#788): `down_seconds` measures true
-        // downtime, NOT cycle age. A healthy filter stream persists
+        // downtime, NOT cycle age. A healthy poll loop persists
         // indefinitely, so the gauge must read 0 for the entire life of an
         // established cycle — even when the node has been up (and the cycle
         // live) for a while. We simulate "a while" by backdating the metrics'

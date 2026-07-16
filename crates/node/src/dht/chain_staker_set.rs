@@ -1,12 +1,20 @@
 //! Chain-backed [`StakerSet`] implementation.
 //!
-//! Reads the active-staker set from `CapacityBond.getActiveNodes()`
-//! at startup, filters each entry through `isActive(operator)` to apply
-//! the full predicate (registered + bond ≥ minBond + no unbonding +
-//! not ejected; the `getActiveNodes` page is the un-filtered
-//! `_registeredAddrs` array per the contract's own comment), then runs
-//! a background task that follows the five membership-mutating events
-//! and emits [`StakerChange`] for every observed transition.
+//! This module owns the **projection** only: the cached `NodeId → active?` set
+//! and its accessors. The `CapacityBond` enumeration and
+//! the event watcher that keep it current live in
+//! [`crate::dht::capacity_bond_registry`] (#1110), which builds this via
+//! `ChainStakerSet::from_parts` — it shares one `getActiveNodes` read and one
+//! `eth_getLogs` loop with the node-address directory, since both are derived
+//! from the same contract.
+//!
+//! The cached set is seeded from `CapacityBond.getActiveNodes()`, each entry
+//! filtered through `isActive(operator)` to apply the full predicate — registered,
+//! bond ≥ minBond, no unbonding, not ejected — because the `getActiveNodes` page
+//! is the un-filtered `_registeredAddrs` array per the contract's own comment. It
+//! then follows the five membership-mutating events, applying a `StakerChange`
+//! for every observed transition. (Not an intra-doc link: `StakerChange` is
+//! private to `dht` since #1231, and this module doc is public.)
 //!
 //! # Spec mapping
 //!
@@ -16,24 +24,23 @@
 //! - ADR 019 § Step 3.3: bootstrap pattern (initial paginated
 //!   `getActiveNodes` + event follow — implemented as an `eth_getLogs`
 //!   poll, #1106).
-//! - The event set this watcher follows is grounded in
+//! - The event set the watcher follows is grounded in
 //!   `CapacityBond.sol`'s own write-paths — every contract write
 //!   that flips the canonical `isActive` predicate is mirrored by an
-//!   event here.
+//!   event there.
 //!
 //! # Failure model
 //!
-//! Bootstrap RPC failure → caller propagates the error (the runtime
-//! treats it as fatal; the DHT cannot function without a staker set).
+//! Bootstrap RPC failure → the registry bootstrap propagates the error (the
+//! runtime treats it as fatal; the DHT cannot function without a staker set).
 //!
-//! Watcher RPC failure (mid-run) → the task logs at `warn!`, sleeps
-//! for an exponentially-growing backoff (1s → 60s cap), and re-polls. The
-//! cursor is retained across the backoff, so the next `eth_getLogs` tick
-//! re-scans `[cursor, head]` and re-applies any membership event that landed
-//! during the outage — no stream-level drift window. (There is still no
-//! `getActiveNodes` resync to reconcile against a checkpoint older than the
-//! live cursor, but that is only reachable via the per-event `nodeIdOf` drop
-//! below, not a backoff gap.)
+//! Watcher RPC failure (mid-run) → the shared loop logs at `warn!`, sleeps for an
+//! exponentially-growing backoff (1s → 60s cap), and re-polls. The cursor is
+//! retained across the backoff, so the next `eth_getLogs` tick re-scans
+//! `[cursor, head]` and re-applies any membership event that landed during the
+//! outage — no stream-level drift window. (There is still no `getActiveNodes`
+//! resync to reconcile against a checkpoint older than the live cursor, but that
+//! is only reachable via the per-event `nodeIdOf` drop below, not a backoff gap.)
 //!
 //! A narrower drift source: an operator-indexed event whose follow-up
 //! `nodeIdOf(operator)` RPC fails is dropped (the membership change is
@@ -58,52 +65,44 @@
 //! - `decdn_staker_set_active_count` — current cached active-set size,
 //!   to spot a frozen or collapsed cache.
 //!
+//! Since #1110 these describe the one shared `capacity-bond` loop, which also
+//! feeds the bindings projection — so they are that loop's health for both, and
+//! there is no separate node-address watcher family to correlate against
+//! (#1231).
+//!
 //! A `getActiveNodes` resync-on-extended-outage path is a follow-up;
 //! these metrics surface the window that path would close.
-//!
-//! # N+1 round-trips at bootstrap
-//!
-//! Each page of `getActiveNodes` returns up to 100 entries; we then
-//! issue one `isActive(operator)` per entry to filter. At `PoC` scale
-//! (tens of nodes) this is tens of RPC round-trips — acceptable for a
-//! one-shot startup path. `Multicall3` batching is a natural
-//! follow-up.
 
 use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
 
-use alloy::primitives::{Address, U256};
-use alloy::providers::Provider;
-use alloy::rpc::types::{Filter, Log};
-use alloy::sol_types::SolEvent;
-use anyhow::{Context, Result};
-use tokio::sync::broadcast;
-use tokio::task::JoinHandle;
-use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::warn;
 
-use crate::chain_events::resumable_watcher::{
-    self, CursorPolicy, LogSink, WatcherConfig, WatcherHook,
-};
-use crate::chain_events::{MAX_BACKFILL_BLOCK_SPAN, WATCHER_INITIAL_BACKOFF, WATCHER_MAX_BACKOFF};
+use crate::chain_events::AbortOnDrop;
 use crate::dht::routing::NodeId;
-use crate::dht::staker_set::{StakerChange, StakerSet};
+use crate::dht::staker_set::StakerSet;
 use crate::metrics::Metrics;
-use decdn_common::redact::sanitize_rpc_display;
-use decdn_incentive::capacity_bond::CapacityBond;
 
-/// Page size for the initial paginated `getActiveNodes` read.
-/// Matches ADR 019 § Step 3.3's worked-example limit.
-const PAGE_SIZE: u64 = 100;
-
-/// Capacity of the `StakerChange` broadcast channel. Sized so that a
-/// slow subscriber can fall behind by a single bootstrap cycle (~100
-/// changes in the bursty re-sync window) without forcing a lagging
-/// recv into the `Lagged` arm. Real steady-state traffic is sparse
-/// (operator stakes / unstakes are infrequent), so 128 is a healthy
-/// headroom rather than a hot-path constraint.
-const CHANGES_CHANNEL_CAPACITY: usize = 128;
+/// One membership transition, as [`apply_change`] applies it to the cached set.
+///
+/// `capacity_bond_registry` builds one of these for every observed
+/// `CapacityBond` event that flips the canonical `isActive` predicate
+/// (`NodeRegistered` / `NodeDeregistered` / `NodeAutoEjected` / `Reinstated` /
+/// `UnbondingRequested`).
+///
+/// Internal to `dht`, and it lives here rather than in `staker_set` because
+/// `ConfigStakerSet` has no use for it: the only producer
+/// (`capacity_bond_registry`) and the only consumer (`apply_change`, below) are
+/// both on the chain-backed path. It was briefly public, as the payload of a
+/// `StakerSet::subscribe_changes` broadcast that nothing ever subscribed to
+/// (#1231).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StakerChange {
+    /// `node_id` joined the active set (was absent, now present).
+    Active(NodeId),
+    /// `node_id` left the active set (was present, now absent).
+    Inactive(NodeId),
+}
 
 /// Chain-backed staker set. Cheap to clone via the shared inner
 /// [`Arc`]; the runtime holds one `Arc<dyn StakerSet>` and consumers
@@ -113,189 +112,23 @@ const CHANGES_CHANNEL_CAPACITY: usize = 128;
 #[derive(Debug)]
 pub struct ChainStakerSet {
     active: Arc<RwLock<HashSet<NodeId>>>,
-    changes_tx: broadcast::Sender<StakerChange>,
-    _watcher: AbortOnDrop,
+    _watcher: Arc<AbortOnDrop>,
 }
 
 impl ChainStakerSet {
-    /// Initial bootstrap: paginate `getActiveNodes`, filter each entry
-    /// through `isActive(operator)`, spawn the background event
-    /// watcher. Returns once the cache is populated and the watcher
-    /// is running — the watcher's own poll-tick failures do not
-    /// fail bootstrap.
-    pub async fn bootstrap<P>(
-        provider: P,
-        registry_addr: Address,
-        event_poll_interval: Duration,
-        metrics: Arc<Metrics>,
-    ) -> Result<Self>
-    where
-        P: Provider + Clone + 'static,
-    {
-        let registry = CapacityBond::new(registry_addr, provider.clone());
-        let initial = bootstrap_active_set(&registry).await.with_context(|| {
-            format!("paginated getActiveNodes from CapacityBond at {registry_addr}")
-        })?;
-        info!(
-            active_count = initial.len(),
-            %registry_addr,
-            "ChainStakerSet bootstrap from CapacityBond complete"
-        );
-        // Publish the bootstrap size so the gauge is non-`(no data)` before
-        // the first membership change, and so a watcher that never observes
-        // an event still reports a meaningful active count.
-        metrics.staker_set_active_count(initial.len());
-
-        let (changes_tx, _) = broadcast::channel(CHANGES_CHANNEL_CAPACITY);
-        let active = Arc::new(RwLock::new(initial));
-        // The authoritative set came from `getActiveNodes` enumeration above; the
-        // watcher only needs to *follow* membership events from head forward, so
-        // it live-tails on the shared getLogs poller (#1092/#1106) with no
-        // historical backfill and no persisted cursor.
-        let sink = StakerSink {
-            registry,
-            active: Arc::clone(&active),
-            changes_tx: changes_tx.clone(),
-            metrics: Arc::clone(&metrics),
-        };
-        let cfg = WatcherConfig {
-            filter: Filter::new().address(registry_addr).event_signature(vec![
-                CapacityBond::NodeRegistered::SIGNATURE_HASH,
-                CapacityBond::NodeDeregistered::SIGNATURE_HASH,
-                CapacityBond::NodeAutoEjected::SIGNATURE_HASH,
-                CapacityBond::Reinstated::SIGNATURE_HASH,
-                CapacityBond::UnbondingRequested::SIGNATURE_HASH,
-            ]),
-            from_block: 0,
-            poll_interval: event_poll_interval,
-            confirmations: 0,
-            reorg_margin: 0,
-            // Live-from-head, but still chunk `[cursor, head]` so a long lag
-            // (RPC outage / rate-limit) recovers in bounded windows instead of one
-            // range-limit-tripping `eth_getLogs`.
-            max_backfill_span: MAX_BACKFILL_BLOCK_SPAN,
-            cursor: CursorPolicy::HeadMinusWindow {
-                window_blocks: 0,
-                floor: 0,
-            },
-            initial_backoff: WATCHER_INITIAL_BACKOFF,
-            max_backoff: WATCHER_MAX_BACKOFF,
-            rpc_call_timeout: None,
-            shutdown: CancellationToken::new(),
-            seed_cursor: None,
-            label: "staker-set",
-            on_established: Some(established_hook(&metrics)),
-            on_backoff: Some(backoff_hook(&metrics)),
-        };
-        let watcher_handle = tokio::spawn(resumable_watcher::run(provider, cfg, sink));
-
-        Ok(Self {
+    /// Assemble from parts owned by `capacity_bond_registry`, which does the
+    /// enumeration and runs the shared watcher. `watcher` is shared with
+    /// `ChainNodeAddressDirectory` when pull-through is on, so the task outlives
+    /// whichever façade is dropped first.
+    pub(super) const fn from_parts(
+        active: Arc<RwLock<HashSet<NodeId>>>,
+        watcher: Arc<AbortOnDrop>,
+    ) -> Self {
+        Self {
             active,
-            changes_tx,
-            _watcher: AbortOnDrop(watcher_handle),
-        })
-    }
-}
-
-/// Applies `CapacityBond` membership logs to the active set (#1092). `apply`
-/// live-tails events from head (the authoritative set came from `getActiveNodes`
-/// at bootstrap); it never returns `Err` — an operator-indexed event's
-/// `nodeIdOf` resolution failure is counted and skipped, and an undecodable log
-/// is logged and skipped, so neither hot-loops the deterministic re-scan.
-struct StakerSink<P: Provider + Clone> {
-    registry: CapacityBond::CapacityBondInstance<P>,
-    active: Arc<RwLock<HashSet<NodeId>>>,
-    changes_tx: broadcast::Sender<StakerChange>,
-    metrics: Arc<Metrics>,
-}
-
-impl<P: Provider + Clone> LogSink for StakerSink<P> {
-    #[allow(clippy::cognitive_complexity)]
-    async fn apply(&mut self, log: Log) -> Result<()> {
-        match log.topic0().copied() {
-            Some(sig) if sig == CapacityBond::NodeRegistered::SIGNATURE_HASH => {
-                match CapacityBond::NodeRegistered::decode_log_data(&log.inner.data) {
-                    Ok(event) => apply_change(
-                        &self.active,
-                        &self.changes_tx,
-                        &self.metrics,
-                        StakerChange::Active(event.nodeId.0.into()),
-                    ),
-                    Err(err) => warn!(%err, "skipping undecodable NodeRegistered log"),
-                }
-            }
-            Some(sig) if sig == CapacityBond::NodeDeregistered::SIGNATURE_HASH => {
-                match CapacityBond::NodeDeregistered::decode_log_data(&log.inner.data) {
-                    Ok(event) => apply_change(
-                        &self.active,
-                        &self.changes_tx,
-                        &self.metrics,
-                        StakerChange::Inactive(event.nodeId.0.into()),
-                    ),
-                    Err(err) => warn!(%err, "skipping undecodable NodeDeregistered log"),
-                }
-            }
-            Some(sig) if sig == CapacityBond::NodeAutoEjected::SIGNATURE_HASH => {
-                match CapacityBond::NodeAutoEjected::decode_log_data(&log.inner.data) {
-                    Ok(event) => apply_change(
-                        &self.active,
-                        &self.changes_tx,
-                        &self.metrics,
-                        StakerChange::Inactive(event.nodeId.0.into()),
-                    ),
-                    Err(err) => warn!(%err, "skipping undecodable NodeAutoEjected log"),
-                }
-            }
-            Some(sig) if sig == CapacityBond::Reinstated::SIGNATURE_HASH => {
-                match CapacityBond::Reinstated::decode_log_data(&log.inner.data) {
-                    Ok(event) => {
-                        apply_operator_change(
-                            &self.registry,
-                            &self.active,
-                            &self.changes_tx,
-                            &self.metrics,
-                            event.operator,
-                            true,
-                        )
-                        .await;
-                    }
-                    Err(err) => warn!(%err, "skipping undecodable Reinstated log"),
-                }
-            }
-            Some(sig) if sig == CapacityBond::UnbondingRequested::SIGNATURE_HASH => {
-                match CapacityBond::UnbondingRequested::decode_log_data(&log.inner.data) {
-                    Ok(event) => {
-                        apply_operator_change(
-                            &self.registry,
-                            &self.active,
-                            &self.changes_tx,
-                            &self.metrics,
-                            event.operator,
-                            false,
-                        )
-                        .await;
-                    }
-                    Err(err) => warn!(%err, "skipping undecodable UnbondingRequested log"),
-                }
-            }
-            _ => {
-                debug!(topic0 = ?log.topic0(), "unmatched CapacityBond event in subscribed OR-set");
-            }
+            _watcher: watcher,
         }
-        Ok(())
     }
-}
-
-/// Wire the healthy-cycle transition to the down-seconds gauge (→ 0).
-fn established_hook(metrics: &Arc<Metrics>) -> WatcherHook {
-    let metrics = Arc::clone(metrics);
-    Box::new(move || metrics.staker_set_watcher_cycle_established())
-}
-
-/// Wire a tick failure to the backoff gauge (opens the down-seconds window).
-fn backoff_hook(metrics: &Arc<Metrics>) -> WatcherHook {
-    let metrics = Arc::clone(metrics);
-    Box::new(move || metrics.staker_set_watcher_backoff_started())
 }
 
 impl StakerSet for ChainStakerSet {
@@ -313,10 +146,6 @@ impl StakerSet for ChainStakerSet {
 
     fn len(&self) -> usize {
         read_active(&self.active, HashSet::len)
-    }
-
-    fn subscribe_changes(&self) -> broadcast::Receiver<StakerChange> {
-        self.changes_tx.subscribe()
     }
 }
 
@@ -339,126 +168,23 @@ where
     }
 }
 
-/// Watcher join handle that aborts the task on drop. The task itself
-/// is `pin`-friendly and self-contained, so abort is sufficient
-/// cleanup; we do not await its completion (the runtime's drain pass
-/// only awaits handles registered in the main `JoinSet`).
-#[derive(Debug)]
-struct AbortOnDrop(JoinHandle<()>);
-
-impl Drop for AbortOnDrop {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
-}
-
-/// Paginate `getActiveNodes`, filter through `isActive`, collect the
-/// strict active set. Returns an error if any RPC call fails — the
-/// runtime cannot bootstrap the DHT without a complete picture.
-async fn bootstrap_active_set<P>(
-    registry: &CapacityBond::CapacityBondInstance<P>,
-) -> Result<HashSet<NodeId>>
-where
-    P: Provider + Clone,
-{
-    let mut active = HashSet::new();
-    let mut offset = 0u64;
-    loop {
-        let page = registry
-            .getActiveNodes(U256::from(offset), U256::from(PAGE_SIZE))
-            .call()
-            .await
-            .with_context(|| format!("getActiveNodes(offset={offset}, limit={PAGE_SIZE})"))?;
-        if page.is_empty() {
-            break;
-        }
-        let page_len = page.len() as u64;
-        for node in &page {
-            let is_active = registry
-                .isActive(node.ethAddress)
-                .call()
-                .await
-                .with_context(|| format!("isActive({operator})", operator = node.ethAddress))?;
-            if is_active {
-                active.insert(NodeId::from_bytes(node.nodeId.0));
-            }
-        }
-        offset = offset.saturating_add(page_len);
-    }
-    Ok(active)
-}
-
-/// Resolve an operator-indexed event to its `(NodeId, current_active)`
-/// via `nodeIdOf`, then apply the implied change. If the event's
-/// implied active state disagrees with the canonical `nodeIdOf.active`
-/// (race between the event and a subsequent state change), the
-/// canonical value wins. If the operator has no `nodeId` binding
-/// (`bytes32(0)`), the change is silently dropped — the registry
-/// invariant says binding precedes activation.
-#[allow(clippy::cognitive_complexity)] // Tracing macros inflate complexity; the function body is straight-line resolve + decide + apply
-async fn apply_operator_change<P>(
-    registry: &CapacityBond::CapacityBondInstance<P>,
+/// Apply a change to the active set. Returns whether membership actually
+/// moved — `false` for an idempotent no-op (a re-insert, or a remove of an
+/// absent id), which a re-scanned `eth_getLogs` window produces routinely.
+///
+/// The bool mirrors the `HashSet::insert` / `HashSet::remove` contract this
+/// function dispatches to, and is computed anyway to gate the
+/// `staker_set_active_count` republish below. Callers may ignore it (hence no
+/// `#[must_use]`) — every production call site does, since an idempotent no-op
+/// is a routine outcome rather than an error. In production the mutation-gated
+/// gauge is the observable signal; the bool is what the idempotence tests below
+/// assert on, having previously watched a `broadcast` emission that was retired
+/// in #1231.
+pub(super) fn apply_change(
     active: &Arc<RwLock<HashSet<NodeId>>>,
-    changes_tx: &broadcast::Sender<StakerChange>,
-    metrics: &Arc<Metrics>,
-    operator: Address,
-    event_implies_active: bool,
-) where
-    P: Provider + Clone,
-{
-    let resolved = match registry.nodeIdOf(operator).call().await {
-        Ok(r) => r,
-        Err(err) => {
-            // Dropping the change leaves the cached set out of sync
-            // with chain state until either a follow-up event for
-            // the same operator arrives or the resync-on-extended-
-            // outage path is implemented. Unlike a stream-level error
-            // this does not trip the watcher backoff, so without an
-            // explicit counter it would move no metric at all — bump
-            // the resolve-failure counter (alertable as drift risk)
-            // alongside the loud `warn!`.
-            metrics.staker_set_watcher_resolve_failure();
-            warn!(
-                err = %sanitize_rpc_display(&err),
-                %operator,
-                "nodeIdOf RPC failed; cached active set may diverge from chain state for this operator"
-            );
-            return;
-        }
-    };
-    let node_id = resolved.nodeId.0;
-    if node_id == [0u8; 32] {
-        debug!(%operator, "operator-indexed event for unbound operator; ignoring");
-        return;
-    }
-    let now_active = resolved.active;
-    if now_active != event_implies_active {
-        debug!(
-            %operator,
-            event_implies_active,
-            now_active,
-            "operator-indexed event disagrees with canonical nodeIdOf.active; trusting nodeIdOf"
-        );
-    }
-    let change = if now_active {
-        StakerChange::Active(node_id.into())
-    } else {
-        StakerChange::Inactive(node_id.into())
-    };
-    apply_change(active, changes_tx, metrics, change);
-}
-
-/// Apply a change to the active set, then broadcast it. The broadcast
-/// send error case (no live subscribers) is ignored: the set has
-/// already been updated, and any later `subscribe_changes` call sees
-/// the post-update state via `is_active` / `active_nodes`. A `Lagged`
-/// subscriber is on the receiver to handle.
-fn apply_change(
-    active: &Arc<RwLock<HashSet<NodeId>>>,
-    changes_tx: &broadcast::Sender<StakerChange>,
     metrics: &Arc<Metrics>,
     change: StakerChange,
-) {
+) -> bool {
     let (mutated, size) = {
         let mut guard = match active.write() {
             Ok(g) => g,
@@ -480,11 +206,8 @@ fn apply_change(
         // (re-insert / absent-remove) leaves the set — and the gauge —
         // unchanged.
         metrics.staker_set_active_count(size);
-        // No live subscriber is a normal case for an empty
-        // ConfigStakerSet runtime, or a chain-backed set during
-        // bootstrap before any consumer has subscribed.
-        let _ = changes_tx.send(change);
     }
+    mutated
 }
 
 #[cfg(test)]
@@ -501,52 +224,49 @@ mod tests {
         NodeId::from_bytes([byte; 32])
     }
 
-    fn fresh_state() -> (
-        Arc<RwLock<HashSet<NodeId>>>,
-        broadcast::Sender<StakerChange>,
-        Arc<Metrics>,
-    ) {
-        let (tx, _) = broadcast::channel(8);
+    fn fresh_state() -> (Arc<RwLock<HashSet<NodeId>>>, Arc<Metrics>) {
         (
             Arc::new(RwLock::new(HashSet::new())),
-            tx,
             Arc::new(Metrics::new()),
         )
     }
 
-    /// `apply_change(Active)` on an absent `NodeId` inserts and emits.
-    /// Re-applying the same Active is a no-op (idempotent — no extra
-    /// emission).
+    /// `apply_change(Active)` on an absent `NodeId` inserts and reports the
+    /// mutation. Re-applying the same Active is a no-op — the set is unchanged
+    /// and the return says so. Idempotence is load-bearing: a re-scanned
+    /// `eth_getLogs` window replays events routinely.
     #[test]
     fn apply_change_active_idempotent() {
-        let (active, tx, metrics) = fresh_state();
-        let mut rx = tx.subscribe();
-        apply_change(&active, &tx, &metrics, StakerChange::Active(nid(1)));
+        let (active, metrics) = fresh_state();
+        assert!(
+            apply_change(&active, &metrics, StakerChange::Active(nid(1))),
+            "first insert of an absent id is a real change"
+        );
         assert!(active.read().unwrap().contains(&nid(1)));
-        assert_eq!(rx.try_recv().unwrap(), StakerChange::Active(nid(1)));
 
-        apply_change(&active, &tx, &metrics, StakerChange::Active(nid(1)));
+        assert!(
+            !apply_change(&active, &metrics, StakerChange::Active(nid(1))),
+            "re-inserting a present id must report no change"
+        );
         assert_eq!(active.read().unwrap().len(), 1);
-        // Second application was a no-op; channel empty.
-        let err = rx.try_recv().expect_err("no second emission");
-        assert!(matches!(err, broadcast::error::TryRecvError::Empty));
     }
 
-    /// `apply_change(Inactive)` removes and emits. Removing an absent
-    /// `NodeId` is a no-op (no emission).
+    /// `apply_change(Inactive)` removes and reports the mutation. Removing an
+    /// absent `NodeId` is a no-op.
     #[test]
     fn apply_change_inactive_idempotent() {
-        let (active, tx, metrics) = fresh_state();
+        let (active, metrics) = fresh_state();
         active.write().unwrap().insert(nid(1));
-        let mut rx = tx.subscribe();
-        apply_change(&active, &tx, &metrics, StakerChange::Inactive(nid(1)));
+        assert!(
+            apply_change(&active, &metrics, StakerChange::Inactive(nid(1))),
+            "removing a present id is a real change"
+        );
         assert!(!active.read().unwrap().contains(&nid(1)));
-        assert_eq!(rx.try_recv().unwrap(), StakerChange::Inactive(nid(1)));
 
-        apply_change(&active, &tx, &metrics, StakerChange::Inactive(nid(2)));
-        // nid(2) was never in the set; no emission.
-        let err = rx.try_recv().expect_err("no emission for absent removal");
-        assert!(matches!(err, broadcast::error::TryRecvError::Empty));
+        assert!(
+            !apply_change(&active, &metrics, StakerChange::Inactive(nid(2))),
+            "removing an id that was never present must report no change"
+        );
     }
 
     /// A real membership change republishes `decdn_staker_set_active_count`;
@@ -555,10 +275,10 @@ mod tests {
     /// (#783).
     #[test]
     fn apply_change_updates_active_count_gauge_only_on_real_change() {
-        let (active, tx, metrics) = fresh_state();
+        let (active, metrics) = fresh_state();
         // Two distinct inserts → gauge tracks the growing set.
-        apply_change(&active, &tx, &metrics, StakerChange::Active(nid(1)));
-        apply_change(&active, &tx, &metrics, StakerChange::Active(nid(2)));
+        apply_change(&active, &metrics, StakerChange::Active(nid(1)));
+        apply_change(&active, &metrics, StakerChange::Active(nid(2)));
         let text = metrics.encode().unwrap();
         assert!(
             text.lines().any(|l| l == "decdn_staker_set_active_count 2"),
@@ -566,7 +286,7 @@ mod tests {
         );
 
         // A no-op re-insert must not move the gauge.
-        apply_change(&active, &tx, &metrics, StakerChange::Active(nid(1)));
+        apply_change(&active, &metrics, StakerChange::Active(nid(1)));
         let text = metrics.encode().unwrap();
         assert!(
             text.lines().any(|l| l == "decdn_staker_set_active_count 2"),
@@ -574,7 +294,7 @@ mod tests {
         );
 
         // A real removal shrinks it.
-        apply_change(&active, &tx, &metrics, StakerChange::Inactive(nid(1)));
+        apply_change(&active, &metrics, StakerChange::Inactive(nid(1)));
         let text = metrics.encode().unwrap();
         assert!(
             text.lines().any(|l| l == "decdn_staker_set_active_count 1"),
@@ -623,7 +343,7 @@ mod tests {
         );
     }
 
-    /// A `nodeIdOf` resolution failure in `apply_operator_change` bumps
+    /// A `nodeIdOf` resolution failure in `RegistrySink::on_operator_change` bumps
     /// `decdn_staker_set_watcher_resolve_failures_total` (#788). Exercises the
     /// metric wiring directly — the `Err` arm calls exactly this method.
     #[test]

@@ -94,22 +94,22 @@ use alloy::providers::Provider;
 use alloy::rpc::types::{Filter, Log};
 use alloy::sol_types::SolEvent;
 use anyhow::{Context, Result};
-use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::chain_events::resumable_watcher::{
     self, CursorPolicy, LogSink, NoneFallback, WatcherConfig, WatcherHook,
 };
+use crate::chain_events::shared_head::HeadSource;
 use crate::chain_events::{
-    MAX_BACKFILL_BLOCK_SPAN, REORG_MARGIN_BLOCKS, WATCHER_INITIAL_BACKOFF, WATCHER_MAX_BACKOFF,
-    backfill_windows, check_backfill_range,
+    AbortOnDrop, MAX_BACKFILL_BLOCK_SPAN, REORG_MARGIN_BLOCKS, WATCHER_INITIAL_BACKOFF,
+    WATCHER_MAX_BACKOFF, backfill_windows, check_backfill_range, timed,
 };
 use crate::dht::origin::{Hash, OriginDirectory};
 use crate::dht::routing::NodeId;
 use crate::dht::staker_set::StakerSet;
 use crate::metrics::Metrics;
-use decdn_common::redact::sanitize_rpc_display;
+use decdn_common::redact::sanitize_err_chain;
 use decdn_incentive::capacity_bond::CapacityBond;
 use decdn_incentive::origin_assignment::OriginAssignment;
 use decdn_incentive::{CheckpointKey, KeyedCheckpointStore};
@@ -255,9 +255,11 @@ where
     P: Provider + Clone,
 {
     async fn get_origins(&self, namespace: U256) -> Result<Vec<Address>> {
-        self.origin
-            .getOrigins(namespace)
-            .call()
+        // Bounded here, in the production impl, rather than at the sink: a
+        // timeout must surface as the same `Err` the sink's existing defer/retry
+        // path already handles (`on_tick_complete` bails while any namespace is
+        // deferred, driving the backoff). `StubReads` needs no timeout.
+        timed(None, "getOrigins", self.origin.getOrigins(namespace).call())
             .await
             .with_context(|| format!("getOrigins(namespace={namespace})"))
     }
@@ -291,6 +293,7 @@ impl ChainOriginDirectory {
         from_block: u64,
         checkpoint_store: Arc<dyn KeyedCheckpointStore>,
         event_poll_interval: Duration,
+        head: Arc<dyn HeadSource>,
         staker_set: Arc<dyn StakerSet>,
         metrics: Arc<Metrics>,
         shutdown: CancellationToken,
@@ -339,6 +342,7 @@ impl ChainOriginDirectory {
             deferred: HashSet::new(),
         };
         let cfg = WatcherConfig {
+            head,
             filter: Filter::new()
                 .address(vec![publisher_registry_addr, origin_assignment_addr])
                 .event_signature(vec![
@@ -352,8 +356,6 @@ impl ChainOriginDirectory {
                 ]),
             from_block,
             poll_interval: event_poll_interval,
-            confirmations: 0,
-            reorg_margin: REORG_MARGIN_BLOCKS,
             max_backfill_span: MAX_BACKFILL_BLOCK_SPAN,
             cursor: cursor_policy(checkpoint_store),
             initial_backoff: WATCHER_INITIAL_BACKOFF,
@@ -450,7 +452,7 @@ impl<P: Provider + Clone> LogSink for OriginSink<P> {
                 Err(err) => {
                     self.metrics.origin_directory_watcher_resolve_failure();
                     warn!(
-                        err = %sanitize_rpc_display(&err),
+                        err = %sanitize_err_chain(&err),
                         %namespace,
                         "deferred getOrigins re-read still failing"
                     );
@@ -567,14 +569,26 @@ impl<P: Provider + Clone> OriginSink<P> {
 /// `ContentClaimed` from the **deploy floor** — the `hash → namespaces` view
 /// has no on-chain enumeration, so the stream must be replayed for
 /// correctness. Pinned by a test: a `Head` fallback silently loses every claim
-/// that predates the node. (In steady state `bootstrap` seeds the live cursor
-/// at its snapshot block, so the fallback governs only a checkpoint-less start
-/// of the poller itself.)
+/// that predates the node.
+///
+/// **Neither field below is read on the live path today.** `bootstrap` seeds the
+/// cursor at its snapshot block ([`WatcherConfig::seed_cursor`]), and a seeded
+/// cursor bypasses floor derivation entirely — `initial_from`, the only reader of
+/// `none_fallback` and `reorg_margin`, is never reached. This watcher's real
+/// resume floor is `replay_from` above: the raw checkpoint, with **no** reorg
+/// rewind. They are declared because `CursorPolicy::Persisted` requires them and
+/// they are the values derivation *would* use, not because they take effect; do
+/// not cite this site as evidence the margin applies. Making that
+/// unrepresentable needs `CursorPolicy`'s persistence and floor-derivation axes
+/// split apart (#1238) — which is also why the test below pins the shape but not
+/// the margin: a pin on a value nothing reads is the #1227 defect, not a guard
+/// against it.
 fn cursor_policy(store: Arc<dyn KeyedCheckpointStore>) -> CursorPolicy {
     CursorPolicy::Persisted {
         store,
         key: CheckpointKey::Origin,
         none_fallback: NoneFallback::FromBlock,
+        reorg_margin: REORG_MARGIN_BLOCKS,
     }
 }
 
@@ -613,18 +627,6 @@ where
             warn!("ChainOriginDirectory cache RwLock poisoned; recovering inner state");
             f(&poisoned.into_inner())
         }
-    }
-}
-
-/// Watcher join handle that aborts the task on drop. Mirrors
-/// `ChainStakerSet::AbortOnDrop` — abort is sufficient cleanup; we do not await
-/// completion (the watcher is self-contained chain polling).
-#[derive(Debug)]
-struct AbortOnDrop(JoinHandle<()>);
-
-impl Drop for AbortOnDrop {
-    fn drop(&mut self) {
-        self.0.abort();
     }
 }
 
@@ -719,6 +721,32 @@ where
         .collect();
 
     // 4. operator → NodeId for every operator we learned about.
+    resolve_bootstrap_bindings(&contracts.bond, &mut cache, metrics).await;
+
+    Ok((cache, latest))
+}
+
+/// Resolve every operator `bootstrap_cache` learned about to its `NodeId`,
+/// filling `cache.operator_node`.
+///
+/// A failed lookup degrades — counted, warned, operator left unmapped — rather
+/// than propagating, for the same reason the replay floor in `bootstrap_cache`
+/// does: `bootstrap` is one-shot (no retry) and its error is fatal at
+/// `runtime`'s call site, so a crash here is strictly worse than graceful
+/// degradation. That matters more now `nodeIdOf` is bounded by [`timed`] —
+/// propagating would turn one slow (>10s) call on a congested or rate-limited
+/// endpoint (#1108) into a node that will not start, and this issues one such
+/// call per authorised operator. An unmapped operator is a routing-only
+/// degradation that self-heals: [`resolve_and_store_operators`] re-resolves it
+/// on that operator's next event, which is the posture that path already takes
+/// for this identical read.
+async fn resolve_bootstrap_bindings<P>(
+    bond: &CapacityBond::CapacityBondInstance<P>,
+    cache: &mut DirectoryCache,
+    metrics: &Metrics,
+) where
+    P: Provider + Clone,
+{
     let operators: HashSet<Address> = cache
         .origins_of_ns
         .values()
@@ -727,17 +755,34 @@ where
         .copied()
         .collect();
     for op in operators {
-        if let Some(node_id) = resolve_node_id(&contracts.bond, op).await? {
-            cache.operator_node.insert(op, node_id);
+        match resolve_node_id(bond, op).await {
+            Ok(Some(node_id)) => {
+                cache.operator_node.insert(op, node_id);
+            }
+            Ok(None) => debug!(%op, "authorized operator has no NodeId binding; not probeable"),
+            Err(err) => {
+                metrics.origin_directory_watcher_resolve_failure();
+                warn!(
+                    err = %sanitize_err_chain(&err),
+                    %op,
+                    "nodeIdOf failed during bootstrap; operator unmapped until a later event"
+                );
+            }
         }
     }
-
-    Ok((cache, latest))
 }
 
 /// Resolve an operator address to its bound `NodeId` via `nodeIdOf`. Returns
 /// `Ok(None)` when the operator has no binding (`bytes32(0)`) — it cannot be a
-/// probeable origin. RPC errors propagate (caller decides fatal vs. drop).
+/// probeable origin. The read is bounded by [`timed`]; RPC errors (including a
+/// timeout) propagate to the caller.
+///
+/// Both callers absorb that error rather than fail on it — `bootstrap_cache`
+/// because a one-shot startup path must not crash on a slow read, and
+/// `resolve_and_store_operators` because the binding self-heals on the
+/// operator's next event. Each bumps `origin_directory_watcher_resolve_failure`
+/// and leaves the operator unmapped. Keep it that way: this returns `Result` so
+/// the *decision* stays at the call site, not because failing is expected.
 async fn resolve_node_id<P>(
     bond: &CapacityBond::CapacityBondInstance<P>,
     operator: Address,
@@ -745,9 +790,7 @@ async fn resolve_node_id<P>(
 where
     P: Provider + Clone,
 {
-    let resolved = bond
-        .nodeIdOf(operator)
-        .call()
+    let resolved = timed(None, "nodeIdOf", bond.nodeIdOf(operator).call())
         .await
         .with_context(|| format!("nodeIdOf({operator})"))?;
     let node_id = resolved.nodeId.0;
@@ -823,7 +866,7 @@ async fn on_content_claimed<R: OriginChainReads>(
     if !namespace_known && let Err(err) = resync_namespace(reads, cache, metrics, namespace).await {
         metrics.origin_directory_watcher_resolve_failure();
         deferred.insert(namespace);
-        warn!(err = %sanitize_rpc_display(&err), %namespace, "getOrigins for newly-claimed namespace failed; deferred for retry");
+        warn!(err = %sanitize_err_chain(&err), %namespace, "getOrigins for newly-claimed namespace failed; deferred for retry");
     }
 }
 
@@ -841,7 +884,7 @@ async fn on_namespace_changed<R: OriginChainReads>(
     if let Err(err) = resync_namespace(reads, cache, metrics, namespace).await {
         metrics.origin_directory_watcher_resolve_failure();
         deferred.insert(namespace);
-        warn!(err = %sanitize_rpc_display(&err), %namespace, "getOrigins re-read failed on activation; deferred for retry");
+        warn!(err = %sanitize_err_chain(&err), %namespace, "getOrigins re-read failed on activation; deferred for retry");
     }
 }
 
@@ -856,7 +899,7 @@ async fn on_default_open_changed<R: OriginChainReads>(
     if let Err(err) = resync_default_open(reads, cache, metrics).await {
         metrics.origin_directory_watcher_resolve_failure();
         deferred.insert(DEFAULT_OPEN_NAMESPACE);
-        warn!(err = %sanitize_rpc_display(&err), "getOrigins(0) re-read failed on default-open change; deferred for retry");
+        warn!(err = %sanitize_err_chain(&err), "getOrigins(0) re-read failed on default-open change; deferred for retry");
     }
 }
 
@@ -884,7 +927,7 @@ async fn on_origin_removed<R: OriginChainReads>(
     if let Err(err) = resynced {
         metrics.origin_directory_watcher_resolve_failure();
         deferred.insert(namespace);
-        warn!(err = %sanitize_rpc_display(&err), %namespace, %operator, "getOrigins re-read failed on removal; applying precise delta fallback");
+        warn!(err = %sanitize_err_chain(&err), %namespace, %operator, "getOrigins re-read failed on removal; applying precise delta fallback");
         delta_remove_origin(cache, metrics, namespace, operator);
     }
 }
@@ -933,7 +976,7 @@ async fn resolve_and_store_operators<R: OriginChainReads>(
             Ok(None) => debug!(%op, "authorized operator has no NodeId binding; not probeable"),
             Err(err) => {
                 metrics.origin_directory_watcher_resolve_failure();
-                warn!(err = %sanitize_rpc_display(&err), %op, "nodeIdOf failed; operator unmapped until a later event");
+                warn!(err = %sanitize_err_chain(&err), %op, "nodeIdOf failed; operator unmapped until a later event");
             }
         }
     }
@@ -986,9 +1029,136 @@ where
 mod tests {
     use super::*;
     use std::sync::RwLock as StdRwLock;
-    use tokio::sync::broadcast;
 
-    use crate::dht::staker_set::StakerChange;
+    /// Origin's `getOrigins` is bounded, so a stalled provider fails the tick
+    /// into the existing defer/retry path instead of wedging it.
+    ///
+    /// This drives `Contracts<P>` — the *production* [`OriginChainReads`] impl —
+    /// deliberately. Every other test in this module uses `StubReads`, which
+    /// carries no `timed` wrap and would therefore pass whether or not the
+    /// production impl bounds anything: a stub-level test here would look like a
+    /// wiring test while asserting nothing about the wiring.
+    #[tokio::test(start_paused = true)]
+    async fn hanging_get_origins_fails_the_tick_rather_than_wedging() {
+        use crate::chain_events::test_support::{bounded, hanging_provider};
+        let provider = hanging_provider();
+        let contracts = Contracts {
+            origin: OriginAssignment::OriginAssignmentInstance::new(
+                Address::ZERO,
+                provider.clone(),
+            ),
+            publisher: PublisherRegistry::PublisherRegistryInstance::new(
+                Address::ZERO,
+                provider.clone(),
+            ),
+            bond: CapacityBond::CapacityBondInstance::new(Address::ZERO, provider),
+        };
+        let err = bounded("get_origins", contracts.get_origins(U256::from(1)))
+            .await
+            .err()
+            .map(|e| format!("{e:#}"));
+        assert!(
+            err.as_ref()
+                .is_some_and(|e| e.contains("getOrigins timed out after")),
+            "a stalled getOrigins must fail into the backoff, not hang: {err:?}"
+        );
+    }
+
+    /// Origin's `nodeIdOf` is bounded — but unlike `getOrigins` it fails no tick,
+    /// so this asserts boundedness and nothing more. Both callers absorb the
+    /// error: `resolve_and_store_operators` counts-and-skips, `bootstrap_cache`
+    /// degrades rather than crash a one-shot startup. Hence "is bounded" and not
+    /// "fails the tick" — the wedge is the bug; the policy above it is deliberate.
+    ///
+    /// Drives the free `resolve_node_id` rather than `Contracts<P>` because that
+    /// is where the wrap lives and both callers route through it.
+    #[tokio::test(start_paused = true)]
+    async fn hanging_node_id_of_is_bounded_rather_than_wedging() {
+        use crate::chain_events::test_support::{bounded, hanging_provider};
+        let bond = CapacityBond::CapacityBondInstance::new(Address::ZERO, hanging_provider());
+        let err = bounded("resolve_node_id", resolve_node_id(&bond, Address::ZERO))
+            .await
+            .err()
+            .map(|e| format!("{e:#}"));
+        assert!(
+            err.as_ref()
+                .is_some_and(|e| e.contains("nodeIdOf timed out after")),
+            "a stalled nodeIdOf must be bounded, not hang: {err:?}"
+        );
+    }
+
+    /// The operator-facing render must name *why* the read failed, not just what
+    /// was attempted.
+    ///
+    /// `get_origins` wraps `timed` in `.with_context(…)`, and an `anyhow`
+    /// Display renders only the outermost context — so logging it with
+    /// `sanitize_rpc_display` prints a bare `getOrigins(namespace=1)` and drops
+    /// "timed out after 10s", which is the entire product of bounding the read.
+    /// This pins the *render*, deliberately: every wiring test above asserts on
+    /// `format!("{e:#}")`, which no production log site uses, so all of them
+    /// would pass while the operator's log said nothing at all.
+    #[tokio::test(start_paused = true)]
+    async fn stalled_get_origins_renders_the_timeout_to_the_operator() {
+        use crate::chain_events::test_support::{bounded, hanging_provider};
+        let provider = hanging_provider();
+        let contracts = Contracts {
+            origin: OriginAssignment::OriginAssignmentInstance::new(
+                Address::ZERO,
+                provider.clone(),
+            ),
+            publisher: PublisherRegistry::PublisherRegistryInstance::new(
+                Address::ZERO,
+                provider.clone(),
+            ),
+            bond: CapacityBond::CapacityBondInstance::new(Address::ZERO, provider),
+        };
+        let err = bounded("get_origins", contracts.get_origins(U256::from(1)))
+            .await
+            .unwrap_err();
+
+        let rendered = sanitize_err_chain(&err);
+        assert!(
+            rendered.contains("getOrigins timed out after"),
+            "the operator must see why it failed, not only what was attempted: {rendered}"
+        );
+        assert!(
+            rendered.contains("namespace=1"),
+            "the context must survive alongside the cause: {rendered}"
+        );
+    }
+
+    /// A stalled `nodeIdOf` during bootstrap must degrade, not propagate.
+    ///
+    /// This is the other half of the policy split at [`resolve_node_id`]'s two
+    /// callers, and the reason the bound there could not simply be inherited:
+    /// `bootstrap_cache`'s error is fatal at `runtime`'s call site, so before
+    /// this degraded, bounding the read turned one slow (>10s) call on a
+    /// congested endpoint into a node that would not start at all.
+    #[tokio::test(start_paused = true)]
+    async fn hanging_bootstrap_binding_degrades_rather_than_failing_start() {
+        use crate::chain_events::test_support::{bounded, hanging_provider};
+        let bond = CapacityBond::CapacityBondInstance::new(Address::ZERO, hanging_provider());
+        let metrics = Metrics::new();
+        let mut cache = DirectoryCache::default();
+        cache.default_open.insert(addr(1));
+
+        bounded(
+            "resolve_bootstrap_bindings",
+            resolve_bootstrap_bindings(&bond, &mut cache, &metrics),
+        )
+        .await;
+
+        assert!(
+            cache.operator_node.is_empty(),
+            "a stalled nodeIdOf must leave the operator unmapped, not bind it"
+        );
+        let text = metrics.encode().unwrap();
+        assert!(
+            text.lines()
+                .any(|l| l == "decdn_origin_directory_watcher_resolve_failures_total 1"),
+            "the degraded binding must be counted, not silently dropped:\n{text}"
+        );
+    }
 
     fn h(b: u8) -> Hash {
         Hash::from_bytes([b; 32])
@@ -1022,11 +1192,6 @@ mod tests {
         }
         fn len(&self) -> usize {
             self.0.read().unwrap().len()
-        }
-        fn subscribe_changes(&self) -> broadcast::Receiver<StakerChange> {
-            let (tx, rx) = broadcast::channel(1);
-            drop(tx);
-            rx
         }
     }
 

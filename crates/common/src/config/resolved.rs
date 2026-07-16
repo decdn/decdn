@@ -129,11 +129,18 @@ pub struct ResolvedBlockchain {
     /// watchdog entirely; otherwise the resolver enforces a minimum (see
     /// `MIN_RPC_WATCHDOG_INTERVAL_SEC`).
     pub rpc_watchdog_interval_sec: u64,
-    /// Milliseconds between `eth_getFilterChanges` polls for the chain event
-    /// watchers (#1011). Applied to every provider via `with_poll_interval` so
-    /// it overrides alloy's localhost-detected 250 ms default. Defaults to
-    /// 7000 ms (`DEFAULT_EVENT_POLL_INTERVAL_MS`); the resolver enforces a
-    /// minimum (see `MIN_EVENT_POLL_INTERVAL_MS`).
+    /// Milliseconds between chain-event poll ticks (#1011, #1106). Two unrelated
+    /// consumers read this one value:
+    /// - `resumable_watcher`'s `WatcherConfig::poll_interval` — the `eth_getLogs`
+    ///   tick cadence of every chain watcher.
+    /// - alloy's pending-transaction receipt heartbeat, applied to every provider
+    ///   via the node's `with_poll_interval` (`client().set_poll_interval`) and
+    ///   consumed by `PendingTransactionBuilder::get_receipt` when the node awaits
+    ///   a mined settlement / channel tx. This is also what overrides alloy's
+    ///   localhost-detected 250 ms default.
+    ///
+    /// Defaults to 7000 ms (`DEFAULT_EVENT_POLL_INTERVAL_MS`); the resolver
+    /// enforces a minimum (see `MIN_EVENT_POLL_INTERVAL_MS`).
     pub event_poll_interval_ms: u64,
     /// Accrued un-redeemed USDC (base units, `µUSDC`) at which the seller
     /// settlement path submits an on-chain `withdraw` (#327). Defaults to
@@ -422,10 +429,6 @@ pub struct ResolvedGossip {
     /// Interval between reputation-report publish ticks (seconds). Matches the
     /// ADR 008 1-hour per-(reporter, node) rate limit by default.
     pub reputation_publish_interval_sec: u64,
-    /// Validated allowlist of accepted announcer node IDs. Empty = accept any
-    /// signature-valid announce (local substitute for ADR 001 rule 2 until
-    /// the on-chain staking registry contract lands).
-    pub allowlist: Vec<[u8; 32]>,
     /// Optional hard cap on `PeerTable` entry count
     /// (appendix-peer-table-eviction § No hard size cap). `None` => no cap
     /// (unlimited); `Some(n)` is always positive (the resolver rejects `0`).

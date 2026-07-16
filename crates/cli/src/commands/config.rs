@@ -430,7 +430,7 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # slash_judge_address = ""           # REQUIRED: 0x-prefixed hex (EIP-712 verifyingContract, ADR 014)
 # chain_id = 421614                  # EIP-712 chain id; default Arbitrum Sepolia
 # rpc_watchdog_interval_sec = 30     # 0 disables the connectivity watchdog
-# event_poll_interval_ms = 7000      # eth_getFilterChanges poll cadence for chain watchers (#1011); default 7000ms, min 250ms (lower for a local anvil)
+# event_poll_interval_ms = 7000      # eth_getLogs tick cadence for chain watchers + pending-tx receipt polling (#1011/#1106); default 7000ms, min 250ms (lower for a local anvil)
 # redeem_threshold_micro_usdc = 1000000          # seller redeems accrued vouchers on-chain at this µUSDC balance (#327); default 1 USDC
 # buyer_deposit_micro_usdc = 10000000            # deposit when the buyer opens a node-to-node PaymentChannel on a miss (#744); default 10 USDC
 # buyer_max_approve = true                       # unlimited USDC approval for PaymentChannel (#744); node default true, decdn client default false (exact deposit-sized approval); set true on the client to opt into unlimited
@@ -487,7 +487,6 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # subscribe_global = true                   # subscribe/publish on cdn/global/v1
 # subscribe_reputation = true               # subscribe/publish on cdn/reputation/v1 (ADR 008)
 # reputation_publish_interval_sec = 3600    # reputation-report publish cadence; matches the ADR 008 1-hour rate limit
-# allowlist = []                            # accepted announcer node IDs (64-char hex); empty = accept any signature-valid announce
 # max_peer_entries = 100000                 # optional hard cap on PeerTable entries; omit = unlimited; must be > 0 when set
 
 [security]

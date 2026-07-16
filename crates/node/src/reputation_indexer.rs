@@ -39,7 +39,6 @@ use alloy::rpc::types::{Filter, Log};
 use alloy::sol_types::SolEvent;
 use anyhow::{Context, Result};
 use iroh::PublicKey;
-use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -53,21 +52,11 @@ use crate::metrics::Metrics;
 // `MAX_BACKFILL_BLOCK_SPAN` doubles as this watcher's head-anchored boot
 // lookback; imported (not duplicated) so the shared per-call range cap can't
 // silently diverge.
+use crate::chain_events::shared_head::HeadSource;
 use crate::chain_events::{
-    MAX_BACKFILL_BLOCK_SPAN, REORG_MARGIN_BLOCKS, WATCHER_INITIAL_BACKOFF, WATCHER_MAX_BACKOFF,
+    AbortOnDrop, MAX_BACKFILL_BLOCK_SPAN, WATCHER_INITIAL_BACKOFF, WATCHER_MAX_BACKOFF, timed,
 };
 use crate::reputation_wiring::NodeSettlementSource;
-
-/// Aborts the watcher task on drop so a node-restart cycle never leaks a
-/// chain-poll task. Same pattern as `chain_staker_set::AbortOnDrop`.
-#[derive(Debug)]
-struct AbortOnDrop(JoinHandle<()>);
-
-impl Drop for AbortOnDrop {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
-}
 
 /// Background settlement indexer. Holds only the task handle; all observed
 /// state flows into the shared [`NodeSettlementSource`] passed at bootstrap.
@@ -80,27 +69,33 @@ impl SettlementIndexer {
     /// Capture the head block and spawn the indexer task. Returns once the task
     /// is running; the initial backfill happens inside the task so a transient
     /// RPC error backs off and retries rather than failing node startup.
+    #[allow(clippy::too_many_arguments)]
     pub async fn bootstrap<P>(
         provider: P,
         payment_channel_addr: Address,
         capacity_bond_addr: Address,
         settlement: Arc<NodeSettlementSource>,
         event_poll_interval: Duration,
+        head: Arc<dyn HeadSource>,
         metrics: Arc<Metrics>,
+        shutdown: CancellationToken,
     ) -> Result<Self>
     where
         P: Provider + Clone + 'static,
     {
         // Fail-fast bring-up smoke check: confirm the RPC is reachable before
         // spawning the poller (the backfill floor itself is the poller's job now).
-        let head = provider
+        // Deliberately a direct read, NOT the shared `head` source: a TTL-cached
+        // hit would satisfy this without touching the RPC, defeating the only
+        // thing this check exists to prove.
+        let head_block = provider
             .get_block_number()
             .await
             .context("read head block for settlement-indexer bring-up")?;
         let capacity_bond = CapacityBond::new(capacity_bond_addr, provider.clone());
         info!(
             %payment_channel_addr,
-            head,
+            head_block,
             "SettlementIndexer bootstrap (network-wide ChannelSettled, getLogs poller)"
         );
         let sink = ReputationSink {
@@ -110,6 +105,7 @@ impl SettlementIndexer {
             state: IndexerState::new(),
         };
         let cfg = WatcherConfig {
+            head,
             filter: Filter::new()
                 .address(payment_channel_addr)
                 .event_signature(vec![
@@ -118,8 +114,6 @@ impl SettlementIndexer {
                 ]),
             from_block: 0,
             poll_interval: event_poll_interval,
-            confirmations: 0,
-            reorg_margin: REORG_MARGIN_BLOCKS,
             max_backfill_span: MAX_BACKFILL_BLOCK_SPAN,
             // Bounded recent lookback each boot (in-memory rebuild; no durable
             // cursor); the live tail then flows forward from there.
@@ -130,7 +124,7 @@ impl SettlementIndexer {
             initial_backoff: WATCHER_INITIAL_BACKOFF,
             max_backoff: WATCHER_MAX_BACKOFF,
             rpc_call_timeout: None,
-            shutdown: CancellationToken::new(),
+            shutdown,
             seed_cursor: None,
             label: "reputation-indexer",
             on_established: None,
@@ -471,9 +465,17 @@ fn apply_settlement(
 /// - `Ok(Some(..))` — a live binding to a valid curve point.
 /// - `Ok(None)` — *permanently* unresolvable: no binding, or the bound bytes
 ///   aren't a valid key. The caller may safely mark the settlement seen.
-/// - `Err(..)` — a *transient* RPC failure. The caller propagates this to the
-///   watcher loop's backoff-and-retry rather than dropping the settlement (the
-///   watcher meters it as an RPC failure on the retry boundary).
+/// - `Err(..)` — a *transient* RPC failure (including a [`timed`] timeout). The
+///   caller propagates this to the watcher loop's backoff-and-retry rather than
+///   dropping the settlement (the watcher meters it as an RPC failure on the
+///   retry boundary).
+///
+/// Note the deliberate asymmetry with `capacity_bond_registry::ContractReads`,
+/// which issues the *same* `nodeIdOf` read but counts-and-skips a failure
+/// instead of failing the tick. Both are right for their watcher: a skipped
+/// settlement here is a silent accounting gap in reporter weight that nothing
+/// re-derives, whereas the registry's projection self-heals on the operator's
+/// next event. Do not "unify" them.
 async fn resolve_binding<P>(
     capacity_bond: &CapacityBond::CapacityBondInstance<P>,
     addr: Address,
@@ -481,9 +483,7 @@ async fn resolve_binding<P>(
 where
     P: Provider + Clone,
 {
-    let resolved = capacity_bond
-        .nodeIdOf(addr)
-        .call()
+    let resolved = timed(None, "nodeIdOf", capacity_bond.nodeIdOf(addr).call())
         .await
         .with_context(|| format!("nodeIdOf RPC for {addr}"))?;
     let bytes = resolved.nodeId.0;
@@ -590,6 +590,27 @@ mod tests {
     use alloy::primitives::U256;
     use decdn_reputation::{SettlementSource, compute_reporter_weight};
     use iroh::SecretKey;
+
+    /// A stalled `nodeIdOf` must fail the tick, not hang it — so the settlement
+    /// is retried by the watcher's backoff rather than silently un-credited.
+    ///
+    /// This is the counterpart to `capacity_bond_registry`'s deliberately
+    /// *opposite* policy for the same RPC (see `resolve_binding`'s doc). Driving
+    /// the real read path is the point: a stub that returns `Err` would pass
+    /// whether or not the `timed` wrap exists.
+    #[tokio::test(start_paused = true)]
+    async fn hanging_node_id_of_fails_the_tick_rather_than_wedging() {
+        use crate::chain_events::test_support::{bounded, hanging_provider};
+        let bond = CapacityBond::CapacityBondInstance::new(addr(1), hanging_provider());
+        let err = bounded("resolve_binding", resolve_binding(&bond, addr(2)))
+            .await
+            .err()
+            .map(|e| format!("{e:#}"));
+        assert!(
+            err.as_ref().is_some_and(|e| e.contains("timed out after")),
+            "a stalled nodeIdOf must surface as a retryable Err: {err:?}"
+        );
+    }
 
     fn pk() -> PublicKey {
         SecretKey::generate().public()
