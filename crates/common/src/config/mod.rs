@@ -1190,7 +1190,8 @@ fn resolve_blockchain_into(
         || {
             format!(
                 "blockchain.event_poll_interval_ms={event_poll_interval_ms} would poll the \
-                 RPC endpoint with eth_getLogs faster than any provider tolerates \
+                 RPC endpoint too frequently — it drives both the eth_getLogs watcher \
+                 tick and pending-tx receipt polling \
                  (minimum {MIN_EVENT_POLL_INTERVAL_MS}ms)"
             )
         },
@@ -8728,8 +8729,8 @@ swap_pool_address = \"0xPool\"
     #[test]
     fn resolve_blockchain_rejects_event_poll_interval_below_minimum() -> anyhow::Result<()> {
         // #1011/#1106: a sub-minimum interval would drive every eth_getLogs
-        // watcher tick — and the pending-tx receipt heartbeat — faster than any
-        // provider tolerates, so resolution must reject it.
+        // watcher tick — and the pending-tx receipt heartbeat — too frequently,
+        // so resolution must reject it.
         let dir = data_dir_with_keystore()?;
         let cli = BlockchainArgs {
             origin_assignment_address: None,
