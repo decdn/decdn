@@ -55,8 +55,8 @@ pub(crate) const WATCHER_MAX_BACKOFF: Duration = Duration::from_mins(1);
 /// default makes such a call fail fast into the retry/backoff path instead.
 pub(crate) const DEFAULT_RPC_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Apply a per-call timeout to an RPC future, mapping its error into `anyhow`. A
-/// timeout is a retryable error (the tick backs off). A `None` config uses
+/// Apply a per-call timeout to an RPC future, folding the elapsed case and the
+/// call's own error into one `anyhow::Error`. A `None` config uses
 /// [`DEFAULT_RPC_CALL_TIMEOUT`].
 ///
 /// **Every** chain read on a watcher's path routes through here: the loop's own

@@ -78,9 +78,6 @@ use crate::chain_events::{
     MAX_BACKFILL_BLOCK_SPAN, REORG_MARGIN_BLOCKS, WATCHER_INITIAL_BACKOFF, WATCHER_MAX_BACKOFF,
     timed,
 };
-/// Per-call ceiling on RPC reads (scope view, log query, head) so a stalled
-/// provider — which has no request timeout configured — cannot wedge the watcher.
-const RPC_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Mutable deny-set carried across poll ticks. The scan cursor lives on the
 /// resumable watcher; this holds only the re-scopable entry set.
@@ -249,7 +246,7 @@ pub(crate) async fn run<P>(
         cursor: cursor_policy(from_block),
         initial_backoff: WATCHER_INITIAL_BACKOFF,
         max_backoff: WATCHER_MAX_BACKOFF,
-        rpc_call_timeout: Some(RPC_CALL_TIMEOUT),
+        rpc_call_timeout: None,
         shutdown,
         seed_cursor: None,
         label: "blacklist",
@@ -408,9 +405,12 @@ where
     }
 }
 
-/// `isHashBlacklistedForOperator` bounded by [`RPC_CALL_TIMEOUT`]. `None` on
-/// timeout or RPC error (caller keeps the hash in `known` for the next re-scope),
-/// `Some(bool)` otherwise.
+/// `isHashBlacklistedForOperator` bounded by the shared
+/// [`chain_events::DEFAULT_RPC_CALL_TIMEOUT`]. `None` on timeout or RPC error
+/// (caller keeps the hash in `known` for the next re-scope), `Some(bool)`
+/// otherwise.
+///
+/// [`chain_events::DEFAULT_RPC_CALL_TIMEOUT`]: crate::chain_events::DEFAULT_RPC_CALL_TIMEOUT
 async fn scope_check<P>(
     contract: &ContentBlacklist::ContentBlacklistInstance<P>,
     operator: Address,
@@ -421,7 +421,7 @@ where
 {
     let hash_key = B256::from(*hash.as_bytes());
     match timed(
-        Some(RPC_CALL_TIMEOUT),
+        None,
         "isHashBlacklistedForOperator",
         contract
             .isHashBlacklistedForOperator(hash_key, operator)
