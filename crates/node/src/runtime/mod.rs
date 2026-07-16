@@ -4,6 +4,8 @@ pub mod reload;
 
 pub use reload::{LogLevelSetter, ReloadSnapshot, RuntimeReloadState};
 
+use crate::chain_events::shared_head::{HeadSource, SharedHead};
+
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
@@ -713,11 +715,22 @@ pub async fn run(
         ProviderBuilder::new().connect_http(rpc_url.clone()),
         event_poll_interval,
     );
+    // One `eth_blockNumber` per TTL window for ALL watchers, instead of one per
+    // watcher per tick. Plain read-only provider: a head read needs no wallet or
+    // nonce filler, and coupling it to the signer stack would give every watcher's
+    // head read a dependency on it. Deliberately NOT wrapped in
+    // `with_poll_interval` — that only sets the pending-tx receipt heartbeat, and
+    // this provider never builds a `PendingTransactionBuilder`.
+    let head: Arc<dyn HeadSource> = Arc::new(SharedHead::new(
+        ProviderBuilder::new().connect_http(rpc_url.clone()),
+        event_poll_interval,
+    ));
     let staker_set: Arc<dyn StakerSet> = Arc::new(
         ChainStakerSet::bootstrap(
             chain_provider,
             capacity_bond_addr,
             event_poll_interval,
+            Arc::clone(&head),
             Arc::clone(&node_metrics),
         )
         .await
@@ -743,6 +756,7 @@ pub async fn run(
         eth_signer.address(),
         cfg.blockchain.slash_judge_from_block,
         event_poll_interval,
+        Arc::clone(&head),
         Arc::clone(&node_metrics),
     );
     let slash_store = slash_watcher.store();
@@ -763,6 +777,7 @@ pub async fn run(
                 ),
                 capacity_bond_addr,
                 event_poll_interval,
+                Arc::clone(&head),
                 Arc::clone(&node_metrics),
             )
             .await
@@ -910,6 +925,7 @@ pub async fn run(
                     cfg.blockchain.origin_directory_from_block,
                     Arc::clone(&watcher_checkpoint_store),
                     event_poll_interval,
+                    Arc::clone(&head),
                     Arc::clone(&staker_set),
                     Arc::clone(&node_metrics),
                     origin_watcher_shutdown.clone(),
@@ -1059,6 +1075,7 @@ pub async fn run(
             voucher_nonce_span_threshold: cfg.blockchain.settlement_auto_by_voucher_nonce_span,
         },
         event_poll_interval,
+        Arc::clone(&head),
         Arc::clone(&node_metrics),
     )
     .await
@@ -1381,6 +1398,7 @@ pub async fn run(
                 cache.clone(),
                 cfg.blockchain.content_blacklist_from_block,
                 event_poll_interval,
+                Arc::clone(&head),
                 Duration::from_secs(cfg.blockchain.content_blacklist_poll_interval_sec),
                 shutdown.clone(),
             ));
@@ -1833,6 +1851,7 @@ pub async fn run(
             capacity_bond_addr,
             Arc::clone(&settlement_source),
             event_poll_interval,
+            Arc::clone(&head),
             Arc::clone(&node_metrics),
         )
         .await

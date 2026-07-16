@@ -86,6 +86,7 @@ use tracing::{debug, info, warn};
 use crate::chain_events::resumable_watcher::{
     self, CursorPolicy, LogSink, WatcherConfig, WatcherHook,
 };
+use crate::chain_events::shared_head::HeadSource;
 use crate::chain_events::{MAX_BACKFILL_BLOCK_SPAN, WATCHER_INITIAL_BACKOFF, WATCHER_MAX_BACKOFF};
 use crate::dht::routing::NodeId;
 use crate::dht::staker_set::{StakerChange, StakerSet};
@@ -127,6 +128,7 @@ impl ChainStakerSet {
         provider: P,
         registry_addr: Address,
         event_poll_interval: Duration,
+        head: Arc<dyn HeadSource>,
         metrics: Arc<Metrics>,
     ) -> Result<Self>
     where
@@ -159,6 +161,7 @@ impl ChainStakerSet {
             metrics: Arc::clone(&metrics),
         };
         let cfg = WatcherConfig {
+            head,
             filter: Filter::new().address(registry_addr).event_signature(vec![
                 CapacityBond::NodeRegistered::SIGNATURE_HASH,
                 CapacityBond::NodeDeregistered::SIGNATURE_HASH,

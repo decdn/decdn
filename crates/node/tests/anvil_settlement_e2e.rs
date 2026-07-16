@@ -87,6 +87,7 @@ use decdn_incentive::{
     slash_judge_domain, voucher_domain,
 };
 use decdn_node::buyer_channel::{BuyerChannelService, ChannelOpenPending};
+use decdn_node::chain_events::shared_head::{HeadSource, SharedHead};
 use decdn_node::channel_store::{BuyerChannelStoreHandle, PersistentChannelStateStore};
 use decdn_node::client_requester::{ChannelContext, stream_fetch};
 use decdn_node::metrics::Metrics;
@@ -174,6 +175,21 @@ impl Drop for AnvilGuard {
         // Manifest is gitignored, but remove it so re-runs start clean.
         let _ = std::fs::remove_file(&self.manifest);
     }
+}
+
+/// A real [`SharedHead`] over the anvil provider, matching the poll interval each
+/// service is bootstrapped with (so the TTL is 125 ms here, not the 3.5 s a
+/// production 7 s interval yields). Each service gets its own rather than sharing
+/// one: `service2`/`service3` model a node restarting against the same store, and
+/// a head cache surviving that restart would not.
+fn e2e_head<P>(provider: &P) -> Arc<dyn HeadSource>
+where
+    P: Provider + Clone + 'static,
+{
+    Arc::new(SharedHead::new(
+        provider.clone(),
+        Duration::from_millis(250),
+    ))
 }
 
 fn contracts_dir() -> PathBuf {
@@ -556,6 +572,7 @@ async fn run_e2e() -> anyhow::Result<()> {
         U256::from(REDEEM_THRESHOLD_MICRO_USDC),
         AutoSettleConfig::default(),
         Duration::from_millis(250),
+        e2e_head(&node_provider),
         Arc::clone(&metrics),
     )
     .await?;
@@ -1049,6 +1066,7 @@ async fn run_e2e() -> anyhow::Result<()> {
             voucher_nonce_span_threshold: None,
         },
         Duration::from_millis(250),
+        e2e_head(&node_provider),
         Arc::clone(&metrics),
     )
     .await?;
@@ -1285,6 +1303,7 @@ async fn run_e2e() -> anyhow::Result<()> {
         U256::from(REDEEM_THRESHOLD_MICRO_USDC),
         AutoSettleConfig::default(),
         Duration::from_millis(250),
+        e2e_head(&node_provider),
         Arc::clone(&metrics),
     )
     .await?;
@@ -1367,6 +1386,7 @@ async fn run_e2e() -> anyhow::Result<()> {
         U256::from(REDEEM_THRESHOLD_MICRO_USDC),
         AutoSettleConfig::default(),
         Duration::from_millis(250),
+        e2e_head(&node_provider),
         Arc::clone(&metrics),
     )
     .await?;

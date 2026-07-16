@@ -84,6 +84,7 @@ use tracing::{debug, error, info, warn};
 use crate::chain_events::resumable_watcher::{
     self, CursorPolicy, LogSink, NoneFallback, WatcherConfig,
 };
+use crate::chain_events::shared_head::HeadSource;
 use crate::chain_events::{
     MAX_BACKFILL_BLOCK_SPAN, REORG_MARGIN_BLOCKS, WATCHER_INITIAL_BACKOFF, WATCHER_MAX_BACKOFF,
 };
@@ -256,6 +257,7 @@ impl<P: Provider + Clone + 'static> PaymentChannelService<P> {
         redeem_threshold: U256,
         auto_settle: AutoSettleConfig,
         event_poll_interval: Duration,
+        head: Arc<dyn HeadSource>,
         metrics: Arc<Metrics>,
     ) -> Result<Self> {
         let contract = PaymentChannel::new(payment_channel_addr, provider);
@@ -294,6 +296,7 @@ impl<P: Provider + Clone + 'static> PaymentChannelService<P> {
             metrics: Arc::clone(&metrics),
         };
         let cfg = WatcherConfig {
+            head,
             filter: Filter::new()
                 .address(payment_channel_addr)
                 .event_signature(vec![

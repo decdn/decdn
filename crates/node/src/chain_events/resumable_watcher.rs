@@ -35,7 +35,8 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
-use super::backfill_windows;
+use super::shared_head::HeadSource;
+use super::{backfill_windows, timed};
 
 /// What a first-ever boot (no persisted checkpoint) falls back to for a
 /// [`CursorPolicy::Persisted`] watcher.
@@ -171,6 +172,12 @@ pub(crate) trait LogSink: Send {
 
 /// Immutable per-watcher configuration for [`run`].
 pub(crate) struct WatcherConfig {
+    /// Shared head-block source. Every watcher reads head through the same
+    /// [`super::shared_head::SharedHead`], so N watchers ticking on one endpoint
+    /// cost one `eth_blockNumber` per TTL window rather than one each per tick.
+    /// The value may lag by up to the TTL but never runs ahead of the chain,
+    /// which is what makes it safe here — see that module's doc.
+    pub(crate) head: Arc<dyn HeadSource>,
     /// Base filter (address(es) + `topic0` OR-set, plus any indexed-topic
     /// constraint such as slash's `topic2` operator). The block range is set per
     /// window.
@@ -191,8 +198,10 @@ pub(crate) struct WatcherConfig {
     /// Initial / max failed-tick retry backoff.
     pub(crate) initial_backoff: Duration,
     pub(crate) max_backoff: Duration,
-    /// Per-RPC-call timeout (head read + each `get_logs`); `None` = the loop's
-    /// [`DEFAULT_RPC_CALL_TIMEOUT`] (10s).
+    /// Per-call timeout for each `get_logs`; `None` = the shared
+    /// [`super::DEFAULT_RPC_CALL_TIMEOUT`] (10s). The head read is NOT bounded by
+    /// this — it is issued by the shared [`super::shared_head::HeadSource`],
+    /// which carries its own timeout.
     pub(crate) rpc_call_timeout: Option<Duration>,
     /// Cancelled on graceful shutdown; flushes the checkpoint and returns.
     pub(crate) shutdown: CancellationToken,
@@ -275,35 +284,6 @@ pub(crate) const fn resolve_head_window_start(head: u64, window: u64, floor: u64
     if floored < head { floored } else { head }
 }
 
-/// Fallback per-RPC-call timeout when a watcher does not set its own. The alloy
-/// HTTP provider has no request timeout of its own, so a provider that keeps the
-/// connection open but never responds would otherwise wedge the tick forever —
-/// silently stopping event processing and blocking graceful shutdown. A bounded
-/// default makes such a call fail fast into the retry/backoff path instead.
-const DEFAULT_RPC_CALL_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Apply a per-call timeout to an RPC future, mapping its error into `anyhow`. A
-/// timeout is a retryable error (the tick backs off). A `None` config uses
-/// [`DEFAULT_RPC_CALL_TIMEOUT`].
-///
-/// This bounds only the calls it wraps — the loop's own `get_block_number` and
-/// `get_logs`. A follow-up RPC a [`LogSink::apply`] issues (`getOrigins`,
-/// `nodeIdOf`, `getChannel`, …) is NOT routed through here and stays unbounded
-/// unless the sink wraps it itself (as `blacklist_watcher::scope_check` does), so
-/// a provider that stalls one of those can still wedge a tick. Bounding every
-/// sink-internal read is a tracked follow-up.
-async fn timed<T, E, F>(timeout: Option<Duration>, what: &str, fut: F) -> Result<T>
-where
-    F: Future<Output = std::result::Result<T, E>>,
-    E: std::error::Error + Send + Sync + 'static,
-{
-    let d = timeout.unwrap_or(DEFAULT_RPC_CALL_TIMEOUT);
-    tokio::time::timeout(d, fut)
-        .await
-        .map_err(|_| anyhow::anyhow!("{what} timed out after {d:?}"))?
-        .map_err(anyhow::Error::new)
-}
-
 /// Run one poll tick: read head, scan `[cursor, head - confirmations]` in
 /// windows, apply each log, advancing + persisting the cursor per completed
 /// window. Returns `Err` on any retryable failure (RPC error/timeout or a
@@ -318,13 +298,10 @@ where
     P: Provider + Clone,
     S: LogSink,
 {
-    let head = timed(
-        cfg.rpc_call_timeout,
-        "get_block_number",
-        provider.get_block_number(),
-    )
-    .await
-    .context("read head block")?;
+    // The context stays here rather than in the head source so a failed head read
+    // renders identically to before the read was shared, and so a test fake
+    // produces the same error shape as production.
+    let head = cfg.head.head().await.context("read head block")?;
     let to = scan_upper_bound(head, cfg.confirmations);
     let from = match *cursor {
         Some(c) => c,
@@ -421,6 +398,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use super::super::shared_head::SharedHead;
     use super::*;
 
     // The production reorg rewind, exercised by the persisted-cursor cases.
@@ -596,8 +574,17 @@ mod tests {
 
     /// Build a `run_tick` config over the mocked provider: span-10 windows,
     /// no confirmations lag / reorg rewind, persisting through `store`.
-    fn tick_cfg(store: Arc<MemoryCheckpointStore>) -> WatcherConfig {
+    ///
+    /// The `Duration::ZERO` head TTL is load-bearing. These tests push head and
+    /// `get_logs` responses onto one ordered `Asserter` queue, so a cached head
+    /// would skip a queued `U64` and hand it to the *next* `get_logs` instead —
+    /// surfacing as a deserialization error that looks nothing like the cause.
+    fn tick_cfg<P: Provider + 'static>(
+        provider: P,
+        store: Arc<MemoryCheckpointStore>,
+    ) -> WatcherConfig {
         WatcherConfig {
+            head: Arc::new(SharedHead::with_ttl(provider, Duration::ZERO, None)),
             filter: Filter::new(),
             from_block: 0,
             poll_interval: Duration::from_secs(1),
@@ -635,7 +622,7 @@ mod tests {
         let asserter = alloy::providers::mock::Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
         let store = Arc::new(MemoryCheckpointStore::default());
-        let cfg = tick_cfg(Arc::clone(&store));
+        let cfg = tick_cfg(provider.clone(), Arc::clone(&store));
         let load = |store: &MemoryCheckpointStore| {
             store
                 .load_checkpoint(CheckpointKey::ChannelOpened)
@@ -688,7 +675,7 @@ mod tests {
         let asserter = alloy::providers::mock::Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
         let store = Arc::new(MemoryCheckpointStore::default());
-        let cfg = tick_cfg(Arc::clone(&store));
+        let cfg = tick_cfg(provider.clone(), Arc::clone(&store));
 
         // Cursor already past the head → no get_logs response queued at all.
         asserter.push_success(&U64::from(25));
@@ -706,6 +693,38 @@ mod tests {
             .ok()
             .flatten();
         assert_eq!(stored, None, "idle tick persists nothing");
+    }
+
+    /// A failing head read still fails the tick with the `read head block`
+    /// context, so `run` fires `on_backoff` and retries. Pins that routing the
+    /// head through the shared source did not swallow the error or move the
+    /// context off the loop (a head source that added its own would double it,
+    /// and one that dropped it would leave a bare transport error in the log).
+    #[tokio::test]
+    async fn head_read_failure_fails_the_tick() {
+        use alloy::providers::ProviderBuilder;
+
+        let asserter = alloy::providers::mock::Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let store = Arc::new(MemoryCheckpointStore::default());
+        let cfg = tick_cfg(provider.clone(), Arc::clone(&store));
+
+        asserter.push_failure_msg("head is down");
+        let mut sink = ScriptedSink {
+            applied: 0,
+            fail_on: None,
+        };
+        let mut cursor = None;
+        let err = run_tick(&provider, &cfg, &mut sink, &mut cursor)
+            .await
+            .err()
+            .map(|e| format!("{e:#}"));
+        assert!(
+            err.as_ref().is_some_and(|e| e.contains("read head block")),
+            "head failure must fail the tick with its context: {err:?}"
+        );
+        assert_eq!(cursor, None, "a tick that never read head advances nothing");
+        assert_eq!(sink.applied, 0);
     }
 
     fn persisted(none_fallback: NoneFallback) -> CursorPolicy {

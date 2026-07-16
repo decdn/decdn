@@ -53,6 +53,7 @@ use crate::metrics::Metrics;
 // `MAX_BACKFILL_BLOCK_SPAN` doubles as this watcher's head-anchored boot
 // lookback; imported (not duplicated) so the shared per-call range cap can't
 // silently diverge.
+use crate::chain_events::shared_head::HeadSource;
 use crate::chain_events::{
     MAX_BACKFILL_BLOCK_SPAN, REORG_MARGIN_BLOCKS, WATCHER_INITIAL_BACKOFF, WATCHER_MAX_BACKOFF,
 };
@@ -86,6 +87,7 @@ impl SettlementIndexer {
         capacity_bond_addr: Address,
         settlement: Arc<NodeSettlementSource>,
         event_poll_interval: Duration,
+        head: Arc<dyn HeadSource>,
         metrics: Arc<Metrics>,
     ) -> Result<Self>
     where
@@ -93,14 +95,17 @@ impl SettlementIndexer {
     {
         // Fail-fast bring-up smoke check: confirm the RPC is reachable before
         // spawning the poller (the backfill floor itself is the poller's job now).
-        let head = provider
+        // Deliberately a direct read, NOT the shared `head` source: a TTL-cached
+        // hit would satisfy this without touching the RPC, defeating the only
+        // thing this check exists to prove.
+        let head_block = provider
             .get_block_number()
             .await
             .context("read head block for settlement-indexer bring-up")?;
         let capacity_bond = CapacityBond::new(capacity_bond_addr, provider.clone());
         info!(
             %payment_channel_addr,
-            head,
+            head_block,
             "SettlementIndexer bootstrap (network-wide ChannelSettled, getLogs poller)"
         );
         let sink = ReputationSink {
@@ -110,6 +115,7 @@ impl SettlementIndexer {
             state: IndexerState::new(),
         };
         let cfg = WatcherConfig {
+            head,
             filter: Filter::new()
                 .address(payment_channel_addr)
                 .event_signature(vec![

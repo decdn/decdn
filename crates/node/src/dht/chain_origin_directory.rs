@@ -101,6 +101,7 @@ use tracing::{debug, info, warn};
 use crate::chain_events::resumable_watcher::{
     self, CursorPolicy, LogSink, NoneFallback, WatcherConfig, WatcherHook,
 };
+use crate::chain_events::shared_head::HeadSource;
 use crate::chain_events::{
     MAX_BACKFILL_BLOCK_SPAN, REORG_MARGIN_BLOCKS, WATCHER_INITIAL_BACKOFF, WATCHER_MAX_BACKOFF,
     backfill_windows, check_backfill_range,
@@ -291,6 +292,7 @@ impl ChainOriginDirectory {
         from_block: u64,
         checkpoint_store: Arc<dyn KeyedCheckpointStore>,
         event_poll_interval: Duration,
+        head: Arc<dyn HeadSource>,
         staker_set: Arc<dyn StakerSet>,
         metrics: Arc<Metrics>,
         shutdown: CancellationToken,
@@ -339,6 +341,7 @@ impl ChainOriginDirectory {
             deferred: HashSet::new(),
         };
         let cfg = WatcherConfig {
+            head,
             filter: Filter::new()
                 .address(vec![publisher_registry_addr, origin_assignment_addr])
                 .event_signature(vec![

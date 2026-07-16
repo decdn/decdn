@@ -43,6 +43,7 @@ use tracing::{debug, info, warn};
 use crate::chain_events::resumable_watcher::{
     self, CursorPolicy, LogSink, WatcherConfig, WatcherHook,
 };
+use crate::chain_events::shared_head::HeadSource;
 use crate::chain_events::{MAX_BACKFILL_BLOCK_SPAN, REORG_MARGIN_BLOCKS, WATCHER_INITIAL_BACKOFF};
 use crate::metrics::Metrics;
 
@@ -144,6 +145,7 @@ impl SlashWatcher {
         self_address: Address,
         from_block: u64,
         event_poll_interval: Duration,
+        head: Arc<dyn HeadSource>,
         metrics: Arc<Metrics>,
     ) -> Self {
         info!(%slash_judge_addr, %self_address, from_block, "slash-detection watcher started");
@@ -157,6 +159,7 @@ impl SlashWatcher {
             metrics,
         };
         let cfg = WatcherConfig {
+            head,
             filter: operator_filter(slash_judge_addr, self_address),
             from_block,
             poll_interval: event_poll_interval,

@@ -56,6 +56,7 @@
 //! local protection.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::Duration;
 
 use alloy::primitives::{Address, B256};
@@ -72,6 +73,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::chain_events::resumable_watcher::{self, CursorPolicy, LogSink, WatcherConfig};
+use crate::chain_events::shared_head::HeadSource;
 use crate::chain_events::{
     MAX_BACKFILL_BLOCK_SPAN, REORG_MARGIN_BLOCKS, WATCHER_INITIAL_BACKOFF, WATCHER_MAX_BACKOFF,
 };
@@ -212,6 +214,7 @@ pub(crate) async fn run<P>(
     cache: CacheEngine,
     from_block: u64,
     event_poll_interval: Duration,
+    head: Arc<dyn HeadSource>,
     rescan_interval: Duration,
     shutdown: CancellationToken,
 ) where
@@ -232,6 +235,7 @@ pub(crate) async fn run<P>(
         last_rescan: None,
     };
     let cfg = WatcherConfig {
+        head,
         filter: Filter::new().address(contract_addr).event_signature(vec![
             HashBlacklisted::SIGNATURE_HASH,
             HashRemoved::SIGNATURE_HASH,
