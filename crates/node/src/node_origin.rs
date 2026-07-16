@@ -404,12 +404,33 @@ impl NodeOrigin {
         }
         deps.metrics.node_pull_attempt();
         let ranked = probe_and_rank(deps, providers, hash_bytes).await;
-        for candidate in ranked.iter().take(MAX_PROVIDER_ATTEMPTS) {
+        self.open_from_candidates(deps, &ranked, hash_bytes, MAX_PROVIDER_ATTEMPTS)
+            .await
+            .0
+    }
+
+    /// The window twin of [`try_pull`]: walk the ranked candidates, opening from
+    /// each until one succeeds, bounded by `budget` remaining attempts. Returns
+    /// the opened pull (if any) and how many candidates were tried.
+    ///
+    /// Not a [`PullOutcome`] because the payload type differs, and a generic over
+    /// the terminal async op costs more `Pin<Box<dyn Future>>` ceremony than the
+    /// four duplicated lines are worth.
+    async fn open_from_candidates(
+        &self,
+        deps: &NodeOriginDeps,
+        ranked: &[Candidate],
+        hash_bytes: [u8; 32],
+        budget: usize,
+    ) -> (Option<(UpstreamPullHeader, NodeProgressivePull)>, usize) {
+        let mut attempts = 0;
+        for candidate in ranked.iter().take(budget) {
+            attempts += 1;
             if let Some(opened) = self.open_from_candidate(deps, candidate, hash_bytes).await {
-                return Some(opened);
+                return (Some(opened), attempts);
             }
         }
-        None
+        (None, attempts)
     }
 
     /// Resolve, open/reuse a channel, and open a progressive upstream pull from
@@ -804,7 +825,10 @@ impl Origin for NodeOrigin {
             }
             deps.metrics.node_pull_attempt();
             let ranked = probe_and_rank(deps, providers, hash_bytes).await;
-            match try_pull(deps, &ranked, hash_bytes).await {
+            match try_pull(deps, &ranked, hash_bytes, MAX_PROVIDER_ATTEMPTS)
+                .await
+                .bytes
+            {
                 Some(bytes) => Ok(OriginFetch::found_one_shot(bytes)),
                 // KNOWN LIMITATION (#1145 review, #1129): this collapses every non-hit onto a
                 // clean `NotFound` — no providers, all refused, all stalled, AND a LOCAL fault
@@ -992,23 +1016,57 @@ async fn probe_candidate(
     })
 }
 
+/// What one walk of a ranked candidate list consumed and produced.
+///
+/// The `attempts` count is the load-bearing half (#1165). [`MAX_PROVIDER_ATTEMPTS`]
+/// is a budget for the whole FETCH, not for each list, and a fetch that hits the
+/// probe cache walks two lists: the cached providers, then — if they all fail — a
+/// freshly discovered one. Handing each list its own [`MAX_PROVIDER_ATTEMPTS`]
+/// would double the worst case to six sequential pulls, silently blowing through
+/// [`crate::selection::outer_pull_deadline`], which budgets for exactly three
+/// (`(open + pull + stall) × MAX_PROVIDER_ATTEMPTS + slack`, 172s at defaults).
+/// The deadline is enforced OUTSIDE this path, so nothing would fail loudly: the
+/// fetch would just be killed mid-pull by a timeout sized for a world it no
+/// longer lived in — the #859 starvation that formula exists to prevent.
+///
+/// So the caller carries a remaining-attempts budget across both phases and this
+/// reports what was spent.
+struct PullOutcome {
+    /// The blob, iff some candidate delivered.
+    bytes: Option<Bytes>,
+    /// Candidates actually TRIED — i.e. `pull_from_candidate` calls, whether or
+    /// not they delivered. Never exceeds the `budget` passed in.
+    #[allow(dead_code)] // Consumed by the probe-cache fallback wiring (#1165, Task 5).
+    attempts: usize,
+}
+
 /// Walk the ranked candidates (best-first), opening a channel and pulling from
-/// each until one delivers, bounded by [`MAX_PROVIDER_ATTEMPTS`]. Records a
+/// each until one delivers, bounded by `budget` remaining attempts. Records a
 /// reputation outcome for every candidate that reaches `stream_fetch`;
 /// candidates skipped earlier for an unresolvable operator address or a local
 /// channel-open failure are intentionally not scored (neither is the provider's
-/// fault).
+/// fault). `budget` is the fetch-wide [`MAX_PROVIDER_ATTEMPTS`] remainder rather
+/// than the constant itself — see [`PullOutcome`].
 async fn try_pull(
     deps: &NodeOriginDeps,
     ranked: &[Candidate],
     hash_bytes: [u8; 32],
-) -> Option<Bytes> {
-    for candidate in ranked.iter().take(MAX_PROVIDER_ATTEMPTS) {
+    budget: usize,
+) -> PullOutcome {
+    let mut attempts = 0;
+    for candidate in ranked.iter().take(budget) {
+        attempts += 1;
         if let Some(bytes) = pull_from_candidate(deps, candidate, hash_bytes).await {
-            return Some(bytes);
+            return PullOutcome {
+                bytes: Some(bytes),
+                attempts,
+            };
         }
     }
-    None
+    PullOutcome {
+        bytes: None,
+        attempts,
+    }
 }
 
 /// Attach this node's ADR 005 client identity binding to an upstream pull's
