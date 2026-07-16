@@ -114,13 +114,23 @@ const QUIC_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
 /// connection and then closing.
 const QUIC_MAX_CONCURRENT_BIDI_STREAMS: u32 = 100;
 
-/// Apply an explicit filter poll interval to a freshly built provider,
-/// overriding alloy's localhost-detected 250 ms default that floods a local
-/// anvil with `eth_getFilterChanges` (#1011). `set_poll_interval` uses interior
-/// mutability, so this applies to the already-constructed provider and returns
-/// it unchanged in type — wallet/nonce-filler providers route through it too,
-/// because `client()` is a default `Provider` trait method available on every
-/// provider. The interval comes from `blockchain.event_poll_interval_ms`.
+/// Apply an explicit client poll interval to a freshly built provider,
+/// overriding alloy's localhost-detected 250 ms default (#1011).
+///
+/// Despite the config knob's name this no longer touches event watching: since
+/// #1106 the chain watchers tick on `WatcherConfig::poll_interval` and never read
+/// the client interval. The one consumer still reachable from this node is
+/// `PendingTransactionBuilder::get_receipt`'s heartbeat (alloy-provider
+/// `heart.rs`), which the node awaits in `payment_settlement` and
+/// `buyer_channel` — so this bounds how fast a node awaiting a mined settlement /
+/// channel tx re-polls for its receipt, and alloy's 250 ms localhost default
+/// would otherwise hammer a dev anvil for the life of every pending tx.
+///
+/// `set_poll_interval` uses interior mutability, so this applies to the
+/// already-constructed provider and returns it unchanged in type —
+/// wallet/nonce-filler providers route through it too, because `client()` is a
+/// default `Provider` trait method available on every provider. The interval
+/// comes from `blockchain.event_poll_interval_ms`.
 fn with_poll_interval<P: Provider>(provider: P, interval: Duration) -> P {
     provider.client().set_poll_interval(interval);
     provider
@@ -694,8 +704,10 @@ pub async fn run(
         .content_blacklist_address
         .as_deref()
         .map(|_| rpc_url.clone());
-    // Explicit filter poll interval for every chain-event provider (#1011),
-    // overriding alloy's 250 ms localhost default that floods a dev anvil.
+    // One value, two consumers (#1011/#1106): the `eth_getLogs` tick cadence each
+    // watcher gets via `WatcherConfig::poll_interval`, and — through
+    // `with_poll_interval` below — the pending-tx receipt heartbeat, overriding
+    // alloy's 250 ms localhost default that would hammer a dev anvil.
     let event_poll_interval = Duration::from_millis(cfg.blockchain.event_poll_interval_ms);
     let chain_provider = with_poll_interval(
         ProviderBuilder::new().connect_http(rpc_url.clone()),
@@ -3150,11 +3162,11 @@ mod tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    /// `with_poll_interval` overrides alloy's localhost-detected 250 ms filter
-    /// poll default (#1011). Building against a `127.0.0.1` URL exercises the
-    /// exact path that triggers the flood — alloy would seed 250 ms — and the
-    /// helper must replace it. No network I/O: `poll_interval()` reads a local
-    /// atomic on the client.
+    /// `with_poll_interval` overrides alloy's localhost-detected 250 ms client
+    /// poll default — the interval alloy's pending-tx receipt heartbeat polls on
+    /// (#1011). Building against a `127.0.0.1` URL exercises the exact path that
+    /// triggers it — alloy would seed 250 ms — and the helper must replace it. No
+    /// network I/O: `poll_interval()` reads a local atomic on the client.
     #[test]
     fn with_poll_interval_overrides_alloy_local_default() {
         let url: alloy::transports::http::reqwest::Url =

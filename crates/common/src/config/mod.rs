@@ -65,13 +65,22 @@ const DEFAULT_RPC_WATCHDOG_INTERVAL_SEC: u64 = 30;
 /// the watchdog probing the RPC endpoint frequently enough to risk
 /// tripping provider rate limits or exhausting paid quotas.
 const MIN_RPC_WATCHDOG_INTERVAL_SEC: u64 = 10;
-/// Default chain-event filter poll interval (milliseconds). 7000 ms matches
-/// alloy's non-local default, so live-RPC load is unchanged from before #1011;
-/// it overrides alloy's 250 ms localhost default that floods a dev anvil.
+/// Default chain-event poll interval (milliseconds). One knob, two unrelated
+/// consumers (see `ResolvedBlockchain::event_poll_interval_ms`): the
+/// `eth_getLogs` watcher tick cadence, and alloy's pending-transaction receipt
+/// heartbeat. 7000 ms matches alloy's non-local default, so live-RPC load is
+/// unchanged from before #1011; it also overrides alloy's 250 ms localhost
+/// default, which the receipt heartbeat would otherwise use against a dev anvil.
 const DEFAULT_EVENT_POLL_INTERVAL_MS: u64 = 7000;
-/// Minimum chain-event filter poll interval. Below this, the ~6 long-lived
-/// watcher filters issue enough `eth_getFilterChanges` to recreate the #1011
-/// flood; it also matches alloy's own localhost floor.
+/// Minimum chain-event poll interval. The floor is unchanged from #1011; its
+/// reason is not. The long-lived `eth_newFilter` streams it was originally sized
+/// against are gone — #1106 replaced them with `eth_getLogs` polling, so no
+/// `eth_getFilterChanges` is issued anywhere on the node. At 250 ms the node's
+/// ~6 watcher loops would each scan `[cursor, head]` four times a second against
+/// one endpoint, tripping provider rate limits and burning paid quota just as the
+/// original flood did. The same floor bounds the receipt-heartbeat consumer.
+/// 250 ms is kept as the floor because it is alloy's own localhost cadence: a dev
+/// anvil can still be driven at the fastest interval alloy itself considers sane.
 const MIN_EVENT_POLL_INTERVAL_MS: u64 = 250;
 
 /// Default accrued-claim redemption threshold: 1 USDC (`1_000_000` `µUSDC`).
@@ -1180,8 +1189,9 @@ fn resolve_blockchain_into(
         "blockchain.event_poll_interval_ms",
         || {
             format!(
-                "blockchain.event_poll_interval_ms={event_poll_interval_ms} would flood the \
-                 RPC endpoint with eth_getFilterChanges (minimum {MIN_EVENT_POLL_INTERVAL_MS}ms)"
+                "blockchain.event_poll_interval_ms={event_poll_interval_ms} would poll the \
+                 RPC endpoint with eth_getLogs faster than any provider tolerates \
+                 (minimum {MIN_EVENT_POLL_INTERVAL_MS}ms)"
             )
         },
     );
@@ -8717,8 +8727,9 @@ swap_pool_address = \"0xPool\"
 
     #[test]
     fn resolve_blockchain_rejects_event_poll_interval_below_minimum() -> anyhow::Result<()> {
-        // #1011: a sub-minimum interval would recreate the eth_getFilterChanges
-        // flood the knob exists to prevent, so resolution must reject it.
+        // #1011/#1106: a sub-minimum interval would drive every eth_getLogs
+        // watcher tick — and the pending-tx receipt heartbeat — faster than any
+        // provider tolerates, so resolution must reject it.
         let dir = data_dir_with_keystore()?;
         let cli = BlockchainArgs {
             origin_assignment_address: None,
