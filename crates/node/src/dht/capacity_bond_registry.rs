@@ -296,33 +296,28 @@ where
     Ok((active, bindings))
 }
 
-/// Fire the staker-set gauges, plus the node-address ones only when that
-/// projection exists.
+/// Fire the watcher-health gauges for the shared `capacity-bond` loop.
 ///
-/// Both families are kept rather than collapsed to one: they now describe the
-/// same loop, so they are perfectly correlated — but retiring one would break
-/// existing dashboards and alerts, and freezing `node_address_watcher_down_seconds`
-/// at 0 forever would be an alert that can never fire, which is worse than
-/// deleting it. The `bindings_live` gate stops a pull-through-off node reporting
-/// health for a directory it does not have.
-fn hooks(metrics: &Arc<Metrics>, bindings_live: bool) -> (WatcherHook, WatcherHook) {
+/// `staker_set_watcher_*` is that loop's health, and it covers the bindings
+/// projection too — one loop feeds both, so there is one thing to report.
+///
+/// A parallel `node_address_watcher_*` family used to be fired alongside these
+/// and was retired in #1231: since #1226 collapsed the two loops into one it was
+/// a perfectly-correlated shadow, reporting the same outage twice. It was kept
+/// at the time on the grounds that retiring it would break existing dashboards
+/// and alerts — no dashboard, alert, ADR, or runbook in this repo ever
+/// referenced it — and that a gauge frozen at `0` forever is an alert that can
+/// never fire. That second argument was the stronger one, and it cut the other
+/// way: the family was gated on the bindings projection existing, so a
+/// pull-through-off node reported exactly that frozen `0`.
+fn hooks(metrics: &Arc<Metrics>) -> (WatcherHook, WatcherHook) {
     let established = {
         let metrics = Arc::clone(metrics);
-        Box::new(move || {
-            metrics.staker_set_watcher_cycle_established();
-            if bindings_live {
-                metrics.node_address_watcher_cycle_established();
-            }
-        }) as WatcherHook
+        Box::new(move || metrics.staker_set_watcher_cycle_established()) as WatcherHook
     };
     let backoff = {
         let metrics = Arc::clone(metrics);
-        Box::new(move || {
-            metrics.staker_set_watcher_backoff_started();
-            if bindings_live {
-                metrics.node_address_watcher_backoff_started();
-            }
-        }) as WatcherHook
+        Box::new(move || metrics.staker_set_watcher_backoff_started()) as WatcherHook
     };
     (established, backoff)
 }
@@ -376,7 +371,7 @@ where
     let active = Arc::new(RwLock::new(initial_active));
     let bindings = track_node_addresses.then(|| Arc::new(RwLock::new(initial_bindings)));
 
-    let (on_established, on_backoff) = hooks(&metrics, bindings.is_some());
+    let (on_established, on_backoff) = hooks(&metrics);
     let sink = RegistrySink {
         reads: ContractReads {
             registry: registry.clone(),
@@ -672,11 +667,16 @@ mod tests {
         assert!(!is_active(&active, nid(1)));
     }
 
-    /// Both gauge families track the one shared loop when bindings are live.
+    /// The staker-set family tracks the one shared loop. It is unconditional:
+    /// this loop feeds the bindings projection too, so its health is the same
+    /// health whether or not pull-through is on. (Before #1231 a second,
+    /// perfectly-correlated `node_address_watcher_*` family was fired alongside
+    /// it, gated on the projection existing — which is what made the gate, and
+    /// a second test for the gated-off case, necessary.)
     #[test]
-    fn composed_hooks_bump_both_families_when_bindings_live() {
+    fn composed_hooks_track_the_shared_loop() {
         let metrics = Arc::new(Metrics::new());
-        let (established, backoff) = hooks(&metrics, true);
+        let (established, backoff) = hooks(&metrics);
         backoff();
         established();
 
@@ -688,30 +688,8 @@ mod tests {
         );
         assert!(
             text.lines()
-                .any(|l| l == "decdn_node_address_watcher_restarts_total 1"),
-            "node-address family must track the same shared loop:\n{text}"
-        );
-    }
-
-    /// ...and only staker-set's when the directory does not exist, so a
-    /// pull-through-off node never reports health for a projection it lacks.
-    #[test]
-    fn composed_hooks_bump_only_staker_set_when_bindings_absent() {
-        let metrics = Arc::new(Metrics::new());
-        let (established, backoff) = hooks(&metrics, false);
-        backoff();
-        established();
-
-        let text = metrics.encode().unwrap();
-        assert!(
-            text.lines()
-                .any(|l| l == "decdn_staker_set_watcher_restarts_total 1"),
-            "staker-set family still tracks the loop:\n{text}"
-        );
-        assert!(
-            text.lines()
-                .any(|l| l == "decdn_node_address_watcher_restarts_total 0"),
-            "node-address family must stay flat when no directory exists:\n{text}"
+                .any(|l| l == "decdn_staker_set_watcher_down_seconds 0"),
+            "an established cycle must close the drift window:\n{text}"
         );
     }
 }

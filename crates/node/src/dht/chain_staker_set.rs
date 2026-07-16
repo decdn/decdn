@@ -65,9 +65,10 @@
 //! - `decdn_staker_set_active_count` — current cached active-set size,
 //!   to spot a frozen or collapsed cache.
 //!
-//! Since #1110 these describe the one shared `capacity-bond` loop, so they move
-//! in lockstep with the `node_address_watcher_*` family whenever pull-through is
-//! on.
+//! Since #1110 these describe the one shared `capacity-bond` loop, which also
+//! feeds the bindings projection — so they are that loop's health for both, and
+//! there is no separate node-address watcher family to correlate against
+//! (#1231).
 //!
 //! A `getActiveNodes` resync-on-extended-outage path is a follow-up;
 //! these metrics surface the window that path would close.
