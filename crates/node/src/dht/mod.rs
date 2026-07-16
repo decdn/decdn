@@ -16,6 +16,7 @@ pub mod lookup;
 pub mod negative_cache;
 pub mod node_address;
 pub mod origin;
+pub mod probe_cache;
 pub mod publish;
 pub mod rate_limit;
 pub mod records;
@@ -33,6 +34,7 @@ pub use node_address::{
     ChainNodeAddressDirectory, NodeAddressResolver, StaticNodeAddressDirectory,
 };
 pub use origin::{ConfigOriginDirectory, OriginDirectory};
+pub use probe_cache::{PositiveProbeCache, ProbedProvider};
 pub use publish::RepublishScheduler;
 pub use rate_limit::{DhtRateLimiter, DhtRejectLayer};
 pub use records::{InsertOutcome, RecordStore, RecordStoreConfig};
