@@ -4,7 +4,6 @@ pub mod reload;
 
 pub use reload::{LogLevelSetter, ReloadSnapshot, RuntimeReloadState};
 
-use std::collections::HashSet;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
@@ -1495,10 +1494,16 @@ pub async fn run(
         announce_interval_sec: cfg.gossip.announce_interval_sec,
         subscribe_global: cfg.gossip.subscribe_global,
         region: cfg.identity.region.clone(),
-        allowlist: cfg.gossip.allowlist.iter().copied().collect::<HashSet<_>>(),
         subscribe_reputation: cfg.gossip.subscribe_reputation,
         reputation_publish_interval_sec: cfg.gossip.reputation_publish_interval_sec,
     };
+    // ADR 001 rule 2: a NodeAnnounce is accepted only from a currently-staked
+    // node. Enforced against the live on-chain registry (`staker_set`, kept
+    // fresh by the CapacityBond event tail) — not a static allowlist. Bootstrap
+    // failure already aborted startup above, so this is always `Some`.
+    let announce_staked: Option<Arc<dyn decdn_gossip::StakedNodeSet>> = Some(Arc::new(
+        crate::reputation_wiring::NodeStakedNodeSet::new(Arc::clone(&staker_set)),
+    ));
     let gossip_metrics: Arc<dyn GossipMetrics> =
         Arc::new(NodeGossipMetrics::new(Arc::clone(&node_metrics)));
 
@@ -1548,9 +1553,9 @@ pub async fn run(
             Arc::clone(&staker_set),
             min_counterparties,
         ))),
-        staked: Some(Arc::new(
-            crate::reputation_wiring::NodeStakedReporterSet::new(Arc::clone(&staker_set)),
-        )),
+        staked: Some(Arc::new(crate::reputation_wiring::NodeStakedNodeSet::new(
+            Arc::clone(&staker_set),
+        ))),
         // Outbound report capture (#831): the `NodeOrigin` pull path feeds
         // `observation_buffer` with delivery/probe outcomes, so wire the drain —
         // which spawns the gossip publisher — whenever pull-through is enabled.
@@ -1795,6 +1800,7 @@ pub async fn run(
         Arc::clone(&peer_table),
         gossip_metrics,
         gossip_shutdown.clone(),
+        announce_staked,
         reputation_wiring,
     )
     .await
@@ -3331,7 +3337,6 @@ mod tests {
                 subscribe_global: false,
                 subscribe_reputation: true,
                 reputation_publish_interval_sec: 3600,
-                allowlist: Vec::new(),
                 max_peer_entries: Some(100_000),
             },
             security: ResolvedSecurity {

@@ -756,11 +756,6 @@ pub struct GossipConfig {
     /// Seconds between reputation-report publish ticks. Default 3600 (matches
     /// the ADR 008 1-hour per-(reporter, node) rate limit). Must be `> 0`.
     pub reputation_publish_interval_sec: Option<u64>,
-    /// Optional allowlist of accepted announcer node IDs, hex-encoded
-    /// (64 hex chars, either case). Absent/empty = accept any signature-valid
-    /// announce. Local stand-in for ADR 001 rule 2 (staked-node check)
-    /// until the on-chain staking registry contract lands.
-    pub allowlist: Option<Vec<String>>,
     /// Optional hard cap on `PeerTable` entry count
     /// (appendix-peer-table-eviction § No hard size cap). Once the table is
     /// at the cap, new announces from previously-unseen node IDs are

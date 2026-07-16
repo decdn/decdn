@@ -5,12 +5,12 @@
 //! variant maps one-to-one to a stable metric label via
 //! [`AnnounceReject::label`].
 
-use std::collections::HashSet;
-
 use decdn_protocol::{
     GOSSIP_VERSION, GossipEnvelope, GossipPayload, NodeAnnounce, SIGNATURE_LEN, is_valid_region,
 };
 use thiserror::Error;
+
+use crate::reputation::StakedNodeSet;
 
 /// Every reason an incoming envelope can be rejected. Each variant's
 /// [`Self::label`] is stable and suitable as a Prometheus label value.
@@ -40,8 +40,8 @@ pub enum AnnounceReject {
     StaleTimestamp,
     #[error("region must be an ISO 3166-1 alpha-2 code (assigned or user-reserved)")]
     BadRegion,
-    #[error("announcer not in allowlist")]
-    NotAllowlisted,
+    #[error("announcer is not a currently-staked node")]
+    NotStaked,
     /// Trailing bytes after the postcard envelope exceed
     /// [`MAX_TRAILING_BYTES`] (4 KiB, #577 M3). ADR 013 §Tier 1
     /// permits trailing bytes for forward-compat; this defense-in-
@@ -65,7 +65,7 @@ impl AnnounceReject {
             Self::ClockSkew => "clock_skew",
             Self::StaleTimestamp => "stale_timestamp",
             Self::BadRegion => "bad_region",
-            Self::NotAllowlisted => "not_allowlisted",
+            Self::NotStaked => "not_staked",
             Self::OversizeTrailingBytes => "oversize_trailing_bytes",
         }
     }
@@ -133,14 +133,18 @@ const _: () = assert!(
 /// result through the peer table, where the final monotonic/stale check
 /// (rule 4) is enforced against the latest stored entry.
 ///
-/// `allowlist` is checked only if non-empty: empty allowlist means accept
-/// any signature-valid announce. This stands in for ADR 001 rule 2
-/// (on-chain staking registry check) until the registry contract lands;
-/// it is not an implementation of the rule itself.
-pub fn validate_envelope<S: std::hash::BuildHasher>(
+/// `staked` enforces ADR 001 rule 2: an announce is accepted only when its
+/// author `node_id` is a currently-staked node in the on-chain registry
+/// (queried through the live [`StakedNodeSet`] cache, kept fresh by the
+/// registry event tail). `None` disables the check — accept any
+/// signature-valid announce — and exists only for tests and for
+/// unstaked/subscribe-only modes; the runtime always passes `Some`. Note the
+/// empty-set semantics: a `Some` set with no members rejects every announce,
+/// which is correct — an empty active registry has no staked peers to learn.
+pub fn validate_envelope(
     bytes: &[u8],
     now_us: u64,
-    allowlist: &HashSet<[u8; 32], S>,
+    staked: Option<&dyn StakedNodeSet>,
 ) -> Result<NodeAnnounce, AnnounceReject> {
     // Check the version byte *before* deserializing the payload. Postcard
     // encodes a u8 as a single byte, so the first byte is always the
@@ -178,8 +182,10 @@ pub fn validate_envelope<S: std::hash::BuildHasher>(
     validate_announce_fields(&announce, now_us)?;
     verify_signature(&announce)?;
 
-    if !allowlist.is_empty() && !allowlist.contains(&announce.body.node_id) {
-        return Err(AnnounceReject::NotAllowlisted);
+    if let Some(staked) = staked
+        && !staked.contains(&announce.body.node_id)
+    {
+        return Err(AnnounceReject::NotStaked);
     }
 
     Ok(announce)
@@ -257,7 +263,7 @@ mod tests {
                 AnnounceReject::ClockSkew => "clock_skew",
                 AnnounceReject::StaleTimestamp => "stale_timestamp",
                 AnnounceReject::BadRegion => "bad_region",
-                AnnounceReject::NotAllowlisted => "not_allowlisted",
+                AnnounceReject::NotStaked => "not_staked",
                 AnnounceReject::OversizeTrailingBytes => "oversize_trailing_bytes",
             }
         }
@@ -274,7 +280,7 @@ mod tests {
             AnnounceReject::ClockSkew,
             AnnounceReject::StaleTimestamp,
             AnnounceReject::BadRegion,
-            AnnounceReject::NotAllowlisted,
+            AnnounceReject::NotStaked,
             AnnounceReject::OversizeTrailingBytes,
         ] {
             assert_eq!(r.label(), expected_label(&r), "label drift for {r:?}");
@@ -317,15 +323,20 @@ mod tests {
         })
     }
 
-    fn no_list() -> HashSet<[u8; 32]> {
-        HashSet::new()
+    /// Membership stub: staked iff the node ID is in the list. An empty list
+    /// therefore rejects every announce — the strict rule-2 default.
+    struct StakedSet(Vec<[u8; 32]>);
+    impl StakedNodeSet for StakedSet {
+        fn contains(&self, node_id: &[u8; 32]) -> bool {
+            self.0.contains(node_id)
+        }
     }
 
     #[test]
     fn happy_path() {
         let sk = fresh_key();
         let bytes = mk_envelope(&sk, |_| {});
-        let a = validate_envelope(&bytes, 1_700_000_000_000_000, &no_list()).expect("valid");
+        let a = validate_envelope(&bytes, 1_700_000_000_000_000, None).expect("valid");
         assert_eq!(a.body.node_id, *sk.public().as_bytes());
     }
 
@@ -339,7 +350,7 @@ mod tests {
             payload: GossipPayload::NodeAnnounce(NodeAnnounce { body, signature }),
         });
         assert_eq!(
-            validate_envelope(&bytes, 1_700_000_000_000_000, &no_list()),
+            validate_envelope(&bytes, 1_700_000_000_000_000, None),
             Err(AnnounceReject::UnknownVersion)
         );
     }
@@ -356,7 +367,7 @@ mod tests {
             }),
         });
         assert_eq!(
-            validate_envelope(&bytes, 1_700_000_000_000_000, &no_list()),
+            validate_envelope(&bytes, 1_700_000_000_000_000, None),
             Err(AnnounceReject::InvalidSignature)
         );
     }
@@ -373,7 +384,7 @@ mod tests {
             }),
         });
         assert_eq!(
-            validate_envelope(&bytes, 1_700_000_000_000_000, &no_list()),
+            validate_envelope(&bytes, 1_700_000_000_000_000, None),
             Err(AnnounceReject::BadSignatureLen)
         );
     }
@@ -387,7 +398,7 @@ mod tests {
         // now 61s earlier than ts
         let now = 2_000_000_000_000_000 - (61 * 1_000_000);
         assert_eq!(
-            validate_envelope(&bytes, now, &no_list()),
+            validate_envelope(&bytes, now, None),
             Err(AnnounceReject::ClockSkew)
         );
     }
@@ -400,7 +411,7 @@ mod tests {
         });
         let now = 2_000_000_000_000_000 + (61 * 1_000_000);
         assert_eq!(
-            validate_envelope(&bytes, now, &no_list()),
+            validate_envelope(&bytes, now, None),
             Err(AnnounceReject::ClockSkew)
         );
     }
@@ -417,7 +428,7 @@ mod tests {
         for bad in bad_inputs {
             let bytes = mk_envelope(&sk, |b| b.region = bad.to_string());
             assert_eq!(
-                validate_envelope(&bytes, 1_700_000_000_000_000, &no_list()),
+                validate_envelope(&bytes, 1_700_000_000_000_000, None),
                 Err(AnnounceReject::BadRegion),
                 "region {bad:?} should be rejected"
             );
@@ -433,24 +444,48 @@ mod tests {
         for good in ["AA", "QM", "QZ", "XA", "XK", "XZ", "ZZ"] {
             let bytes = mk_envelope(&sk, |b| b.region = good.to_string());
             assert!(
-                validate_envelope(&bytes, 1_700_000_000_000_000, &no_list()).is_ok(),
+                validate_envelope(&bytes, 1_700_000_000_000_000, None).is_ok(),
                 "region {good:?} should be accepted"
             );
         }
     }
 
+    /// ADR 001 rule 2: with a `Some` staked set, an announce from a non-member
+    /// is rejected (`NotStaked`) and one from a member is accepted.
     #[test]
-    fn allowlist_enforced_when_non_empty() {
+    fn staked_node_gate_enforced() {
         let sk = fresh_key();
         let bytes = mk_envelope(&sk, |_| {});
-        let mut allow = HashSet::new();
-        allow.insert([42u8; 32]);
+        // A set that does not contain the announcer rejects it — including the
+        // empty set (no staked peers to learn).
+        let others = StakedSet(vec![[42u8; 32]]);
         assert_eq!(
-            validate_envelope(&bytes, 1_700_000_000_000_000, &allow),
-            Err(AnnounceReject::NotAllowlisted)
+            validate_envelope(&bytes, 1_700_000_000_000_000, Some(&others)),
+            Err(AnnounceReject::NotStaked)
         );
-        allow.insert(*sk.public().as_bytes());
-        assert!(validate_envelope(&bytes, 1_700_000_000_000_000, &allow).is_ok());
+        let with_announcer = StakedSet(vec![[42u8; 32], *sk.public().as_bytes()]);
+        assert!(validate_envelope(&bytes, 1_700_000_000_000_000, Some(&with_announcer)).is_ok());
+    }
+
+    /// The empty staked set rejects every announce — the strict rule-2 default
+    /// (an empty active registry has no staked peers, so nothing is learnable).
+    #[test]
+    fn empty_staked_set_rejects_all() {
+        let sk = fresh_key();
+        let bytes = mk_envelope(&sk, |_| {});
+        assert_eq!(
+            validate_envelope(&bytes, 1_700_000_000_000_000, Some(&StakedSet(Vec::new()))),
+            Err(AnnounceReject::NotStaked)
+        );
+    }
+
+    /// `None` disables the gate (tests / unstaked modes): any signature-valid
+    /// announce is accepted.
+    #[test]
+    fn staked_none_accepts_any() {
+        let sk = fresh_key();
+        let bytes = mk_envelope(&sk, |_| {});
+        assert!(validate_envelope(&bytes, 1_700_000_000_000_000, None).is_ok());
     }
 
     /// Now that `GossipPayload` has a second variant, a `ReputationReport`
@@ -480,23 +515,22 @@ mod tests {
             payload: GossipPayload::ReputationReport(ReputationReport { body, signature }),
         });
         assert_eq!(
-            validate_envelope(&bytes, 1_700_000_000_000_000, &no_list()),
+            validate_envelope(&bytes, 1_700_000_000_000_000, None),
             Err(AnnounceReject::UnknownVariant)
         );
     }
 
     #[test]
     fn garbage_bytes_rejected() {
-        let allow = no_list();
         // First byte 0xFF != GOSSIP_VERSION, so the version-first check
         // rejects before attempting deserialization.
         assert_eq!(
-            validate_envelope(&[0xFFu8, 0xFF], 1_700_000_000_000_000, &allow),
+            validate_envelope(&[0xFFu8, 0xFF], 1_700_000_000_000_000, None),
             Err(AnnounceReject::UnknownVersion)
         );
         // Empty input has no version byte at all → DecodeFailed.
         assert_eq!(
-            validate_envelope(&[], 1_700_000_000_000_000, &allow),
+            validate_envelope(&[], 1_700_000_000_000_000, None),
             Err(AnnounceReject::DecodeFailed)
         );
     }
@@ -526,7 +560,7 @@ mod tests {
         });
 
         assert_eq!(
-            validate_envelope(&bytes, 1_700_000_000_000_000, &no_list()),
+            validate_envelope(&bytes, 1_700_000_000_000_000, None),
             Err(AnnounceReject::InvalidSignature)
         );
     }
@@ -555,7 +589,7 @@ mod tests {
         });
 
         assert_eq!(
-            validate_envelope(&bytes, 1_700_000_000_000_000, &no_list()),
+            validate_envelope(&bytes, 1_700_000_000_000_000, None),
             Err(AnnounceReject::InvalidSignature)
         );
     }
@@ -572,7 +606,7 @@ mod tests {
         let mut bytes = mk_envelope(&sk, |_| {});
         bytes.extend(std::iter::repeat_n(0xAAu8, MAX_TRAILING_BYTES + 1));
         assert_eq!(
-            validate_envelope(&bytes, 1_700_000_000_000_000, &no_list()),
+            validate_envelope(&bytes, 1_700_000_000_000_000, None),
             Err(AnnounceReject::OversizeTrailingBytes)
         );
     }
@@ -590,7 +624,7 @@ mod tests {
         let mut bytes = mk_envelope(&sk, |_| {});
         bytes.extend(std::iter::repeat_n(0xAAu8, MAX_TRAILING_BYTES));
         assert!(
-            validate_envelope(&bytes, 1_700_000_000_000_000, &no_list()).is_ok(),
+            validate_envelope(&bytes, 1_700_000_000_000_000, None).is_ok(),
             "exactly MAX_TRAILING_BYTES of padding must be accepted"
         );
     }
@@ -619,7 +653,7 @@ mod tests {
         });
         bytes.extend(std::iter::repeat_n(0xAAu8, MAX_TRAILING_BYTES + 1));
         assert_eq!(
-            validate_envelope(&bytes, 1_700_000_000_000_000, &no_list()),
+            validate_envelope(&bytes, 1_700_000_000_000_000, None),
             Err(AnnounceReject::OversizeTrailingBytes),
             "size check must run BEFORE signature verify"
         );

@@ -847,7 +847,6 @@ impl RuntimeReloadState {
                 subscribe_global: false,
                 subscribe_reputation: true,
                 reputation_publish_interval_sec: 3600,
-                allowlist: Vec::new(),
                 max_peer_entries: Some(100_000),
             },
             security: ResolvedSecurity {
@@ -1222,7 +1221,7 @@ fn log_ignored_other_sections(file: &decdn_common::config::FileConfig, prev: &Fi
     }
     if changed("gossip", file.gossip.as_ref(), prev.gossip.as_ref()) && file.gossip.is_some() {
         warn_ignored(
-            "gossip.* (announce_interval, peer_ttl, allowlist, subscribe_global, \
+            "gossip.* (announce_interval, peer_ttl, subscribe_global, \
              subscribe_reputation, reputation_publish_interval_sec)",
         );
     }
@@ -1361,7 +1360,6 @@ mod tests {
                 subscribe_global: false,
                 subscribe_reputation: true,
                 reputation_publish_interval_sec: 3600,
-                allowlist: Vec::new(),
                 max_peer_entries: Some(100_000),
             },
             security: ResolvedSecurity {

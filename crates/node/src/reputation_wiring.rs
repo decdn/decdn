@@ -4,8 +4,8 @@
 //! The leaf crates define trait seams; this module implements them over the
 //! node's concrete subsystems:
 //!
-//! - [`NodeStakedReporterSet`] gates inbound reports to staked nodes via the
-//!   chain [`StakerSet`].
+//! - [`NodeStakedNodeSet`] gates inbound `NodeAnnounce` and reputation-report
+//!   admission to staked nodes via the chain [`StakerSet`].
 //! - [`NodeSettlementSource`] supplies reporter-credibility settlement history.
 //! - [`NodeReputationSink`] folds validated reports into the network score and
 //!   the regional-coverage map.
@@ -33,7 +33,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use decdn_gossip::{PeerTable, ReportDrain, ReputationSink, StakedReporterSet, ValidatedReport};
+use decdn_gossip::{PeerTable, ReportDrain, ReputationSink, StakedNodeSet, ValidatedReport};
 use decdn_protocol::{NodeId as ProtocolNodeId, ReportMetrics};
 use decdn_reputation::{
     NetworkReputation, ObservationBuffer, RegionalCoverage, ReportInput, SettlementRecord,
@@ -51,26 +51,27 @@ fn now_secs() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-/// Adapts the chain [`StakerSet`] to the gossip [`StakedReporterSet`] gate:
-/// only staked nodes may submit reputation reports (ADR 008 §Gossip Protocol).
+/// Adapts the chain [`StakerSet`] to the gossip [`StakedNodeSet`] gate: only
+/// currently-staked nodes may announce (ADR 001 rule 2) or submit reputation
+/// reports (ADR 008 §Gossip Protocol).
 #[derive(Debug)]
-pub struct NodeStakedReporterSet {
+pub struct NodeStakedNodeSet {
     staker_set: Arc<dyn StakerSet>,
 }
 
-impl NodeStakedReporterSet {
+impl NodeStakedNodeSet {
     /// Wrap the runtime's staker set.
     pub fn new(staker_set: Arc<dyn StakerSet>) -> Self {
         Self { staker_set }
     }
 }
 
-impl StakedReporterSet for NodeStakedReporterSet {
-    fn contains(&self, reporter: &[u8; 32]) -> bool {
+impl StakedNodeSet for NodeStakedNodeSet {
+    fn contains(&self, node_id: &[u8; 32]) -> bool {
         // `NodeId` is a freely-constructible 32-byte newtype; the bytes were
         // already signature-verified in the gossip validator.
         self.staker_set
-            .is_active(&ProtocolNodeId::from_bytes(*reporter))
+            .is_active(&ProtocolNodeId::from_bytes(*node_id))
     }
 }
 
@@ -287,7 +288,7 @@ pub struct NodeReputationSink {
     /// staked node before it can create a network/coverage entry. Without this,
     /// a staked but rate-limited reporter could name arbitrary 32-byte provider
     /// ids and grow the aggregation maps unboundedly. Same authoritative source
-    /// that gates reporters via [`NodeStakedReporterSet`].
+    /// that gates reporters via [`NodeStakedNodeSet`].
     staker_set: Arc<dyn StakerSet>,
     min_counterparties: u32,
 }
@@ -402,6 +403,19 @@ mod tests {
 
     fn pk() -> PublicKey {
         SecretKey::generate().public()
+    }
+
+    /// The gossip-facing gate keys on the raw 32-byte `NodeId` (the identity
+    /// function over the staker set): a member's bytes return `true`, a
+    /// non-member's `false`. This is what enforces ADR 001 rule 2 on the
+    /// `NodeAnnounce` path and the ADR 008 reporter gate.
+    #[test]
+    fn node_staked_node_set_delegates_to_staker_set() {
+        let member = pk();
+        let outsider = pk();
+        let gate = NodeStakedNodeSet::new(staker_set_with(member));
+        assert!(gate.contains(member.as_bytes()));
+        assert!(!gate.contains(outsider.as_bytes()));
     }
 
     #[test]

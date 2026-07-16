@@ -54,12 +54,16 @@ pub trait ReputationSink: Send + Sync + 'static {
     fn accept(&self, report: ValidatedReport);
 }
 
-/// Membership test for the staked-reporter set (ADR 008 §Gossip Protocol —
-/// reports are accepted only from staked nodes). Implemented in `decdn-node`
-/// over the chain staker set.
-pub trait StakedReporterSet: Send + Sync + 'static {
-    /// Whether `reporter` (a `NodeId`'s 32 bytes) is a currently staked node.
-    fn contains(&self, reporter: &[u8; 32]) -> bool;
+/// Membership test for the live staked-node set. Implemented in `decdn-node`
+/// over the chain staker set (kept fresh by the `NodeRegistered` /
+/// `NodeDeregistered` / `NodeAutoEjected` event tail). Gates two subscriber
+/// paths: `NodeAnnounce` admission (ADR 001 rule 2 — see
+/// [`crate::validation::validate_envelope`]) and reputation-report admission
+/// (ADR 008 §Gossip Protocol). Called on the subscriber hot path —
+/// implementations must be cheap and non-blocking.
+pub trait StakedNodeSet: Send + Sync + 'static {
+    /// Whether `node_id` (a `NodeId`'s 32 bytes) is a currently staked node.
+    fn contains(&self, node_id: &[u8; 32]) -> bool;
 }
 
 /// Source of pending outbound reports for the publisher (ADR 008 §Gossip
@@ -137,7 +141,7 @@ impl ReputationReject {
 pub fn validate_reputation_envelope(
     bytes: &[u8],
     now_secs: u64,
-    staked: &dyn StakedReporterSet,
+    staked: &dyn StakedNodeSet,
 ) -> Result<ValidatedReport, ReputationReject> {
     // Version byte first (same discipline as `validate_envelope`): an unknown
     // version is a silent drop per ADR 013, not a decode error.
@@ -293,13 +297,13 @@ mod tests {
     use iroh::SecretKey;
 
     struct AllStaked;
-    impl StakedReporterSet for AllStaked {
+    impl StakedNodeSet for AllStaked {
         fn contains(&self, _reporter: &[u8; 32]) -> bool {
             true
         }
     }
     struct NoneStaked;
-    impl StakedReporterSet for NoneStaked {
+    impl StakedNodeSet for NoneStaked {
         fn contains(&self, _reporter: &[u8; 32]) -> bool {
             false
         }
