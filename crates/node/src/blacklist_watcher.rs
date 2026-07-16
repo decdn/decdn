@@ -65,7 +65,7 @@ use alloy::rpc::types::{Filter, Log};
 use alloy::sol_types::SolEvent;
 use anyhow::Result;
 use decdn_cache::{CacheEngine, Hash};
-use decdn_common::redact::sanitize_rpc_display;
+use decdn_common::redact::sanitize_err_chain;
 use decdn_incentive::content_blacklist::ContentBlacklist;
 use decdn_incentive::content_blacklist::ContentBlacklist::{HashBlacklisted, HashRemoved};
 use tokio::time::Instant;
@@ -433,11 +433,13 @@ where
         // One arm for both legs: `timed` folds the elapsed case into the same
         // `Err`, and its message names the call and the deadline ("… timed out
         // after 10s"), so the timeout stays distinguishable in the log text
-        // without a separate arm carrying a `timeout_secs` field.
+        // without a separate arm carrying a `timeout_secs` field. That holds
+        // only because the render is `sanitize_err_chain` — plain Display would
+        // drop the deadline the moment anything above added context.
         Err(err) => {
             warn!(
                 %hash,
-                err = %sanitize_rpc_display(&err),
+                err = %sanitize_err_chain(&err),
                 "blacklist watcher: isHashBlacklistedForOperator failed; keeping for re-scope"
             );
             None

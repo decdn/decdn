@@ -109,7 +109,7 @@ use crate::dht::origin::{Hash, OriginDirectory};
 use crate::dht::routing::NodeId;
 use crate::dht::staker_set::StakerSet;
 use crate::metrics::Metrics;
-use decdn_common::redact::sanitize_rpc_display;
+use decdn_common::redact::sanitize_err_chain;
 use decdn_incentive::capacity_bond::CapacityBond;
 use decdn_incentive::origin_assignment::OriginAssignment;
 use decdn_incentive::{CheckpointKey, KeyedCheckpointStore};
@@ -454,7 +454,7 @@ impl<P: Provider + Clone> LogSink for OriginSink<P> {
                 Err(err) => {
                     self.metrics.origin_directory_watcher_resolve_failure();
                     warn!(
-                        err = %sanitize_rpc_display(&err),
+                        err = %sanitize_err_chain(&err),
                         %namespace,
                         "deferred getOrigins re-read still failing"
                     );
@@ -753,7 +753,7 @@ async fn resolve_bootstrap_bindings<P>(
             Err(err) => {
                 metrics.origin_directory_watcher_resolve_failure();
                 warn!(
-                    err = %sanitize_rpc_display(&err),
+                    err = %sanitize_err_chain(&err),
                     %op,
                     "nodeIdOf failed during bootstrap; operator unmapped until a later event"
                 );
@@ -856,7 +856,7 @@ async fn on_content_claimed<R: OriginChainReads>(
     if !namespace_known && let Err(err) = resync_namespace(reads, cache, metrics, namespace).await {
         metrics.origin_directory_watcher_resolve_failure();
         deferred.insert(namespace);
-        warn!(err = %sanitize_rpc_display(&err), %namespace, "getOrigins for newly-claimed namespace failed; deferred for retry");
+        warn!(err = %sanitize_err_chain(&err), %namespace, "getOrigins for newly-claimed namespace failed; deferred for retry");
     }
 }
 
@@ -874,7 +874,7 @@ async fn on_namespace_changed<R: OriginChainReads>(
     if let Err(err) = resync_namespace(reads, cache, metrics, namespace).await {
         metrics.origin_directory_watcher_resolve_failure();
         deferred.insert(namespace);
-        warn!(err = %sanitize_rpc_display(&err), %namespace, "getOrigins re-read failed on activation; deferred for retry");
+        warn!(err = %sanitize_err_chain(&err), %namespace, "getOrigins re-read failed on activation; deferred for retry");
     }
 }
 
@@ -889,7 +889,7 @@ async fn on_default_open_changed<R: OriginChainReads>(
     if let Err(err) = resync_default_open(reads, cache, metrics).await {
         metrics.origin_directory_watcher_resolve_failure();
         deferred.insert(DEFAULT_OPEN_NAMESPACE);
-        warn!(err = %sanitize_rpc_display(&err), "getOrigins(0) re-read failed on default-open change; deferred for retry");
+        warn!(err = %sanitize_err_chain(&err), "getOrigins(0) re-read failed on default-open change; deferred for retry");
     }
 }
 
@@ -917,7 +917,7 @@ async fn on_origin_removed<R: OriginChainReads>(
     if let Err(err) = resynced {
         metrics.origin_directory_watcher_resolve_failure();
         deferred.insert(namespace);
-        warn!(err = %sanitize_rpc_display(&err), %namespace, %operator, "getOrigins re-read failed on removal; applying precise delta fallback");
+        warn!(err = %sanitize_err_chain(&err), %namespace, %operator, "getOrigins re-read failed on removal; applying precise delta fallback");
         delta_remove_origin(cache, metrics, namespace, operator);
     }
 }
@@ -966,7 +966,7 @@ async fn resolve_and_store_operators<R: OriginChainReads>(
             Ok(None) => debug!(%op, "authorized operator has no NodeId binding; not probeable"),
             Err(err) => {
                 metrics.origin_directory_watcher_resolve_failure();
-                warn!(err = %sanitize_rpc_display(&err), %op, "nodeIdOf failed; operator unmapped until a later event");
+                warn!(err = %sanitize_err_chain(&err), %op, "nodeIdOf failed; operator unmapped until a later event");
             }
         }
     }
@@ -1077,6 +1077,46 @@ mod tests {
             err.as_ref()
                 .is_some_and(|e| e.contains("nodeIdOf timed out after")),
             "a stalled nodeIdOf must be bounded, not hang: {err:?}"
+        );
+    }
+
+    /// The operator-facing render must name *why* the read failed, not just what
+    /// was attempted.
+    ///
+    /// `get_origins` wraps `timed` in `.with_context(…)`, and an `anyhow`
+    /// Display renders only the outermost context — so logging it with
+    /// `sanitize_rpc_display` prints a bare `getOrigins(namespace=1)` and drops
+    /// "timed out after 10s", which is the entire product of bounding the read.
+    /// This pins the *render*, deliberately: every wiring test above asserts on
+    /// `format!("{e:#}")`, which no production log site uses, so all of them
+    /// would pass while the operator's log said nothing at all.
+    #[tokio::test(start_paused = true)]
+    async fn stalled_get_origins_renders_the_timeout_to_the_operator() {
+        use crate::chain_events::test_support::{bounded, hanging_provider};
+        let provider = hanging_provider();
+        let contracts = Contracts {
+            origin: OriginAssignment::OriginAssignmentInstance::new(
+                Address::ZERO,
+                provider.clone(),
+            ),
+            publisher: PublisherRegistry::PublisherRegistryInstance::new(
+                Address::ZERO,
+                provider.clone(),
+            ),
+            bond: CapacityBond::CapacityBondInstance::new(Address::ZERO, provider),
+        };
+        let err = bounded("get_origins", contracts.get_origins(U256::from(1)))
+            .await
+            .unwrap_err();
+
+        let rendered = sanitize_err_chain(&err);
+        assert!(
+            rendered.contains("getOrigins timed out after"),
+            "the operator must see why it failed, not only what was attempted: {rendered}"
+        );
+        assert!(
+            rendered.contains("namespace=1"),
+            "the context must survive alongside the cause: {rendered}"
         );
     }
 

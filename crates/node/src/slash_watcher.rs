@@ -39,6 +39,8 @@ use decdn_incentive::slash_judge::SlashJudge;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+use decdn_common::redact::sanitize_err_chain;
+
 use crate::chain_events::resumable_watcher::{
     self, CursorPolicy, LogSink, WatcherConfig, WatcherHook,
 };
@@ -312,7 +314,15 @@ async fn appeal_window_close<P: Provider>(provider: &P, block_number: Option<u64
         Ok(Some(block)) => Some(block.header.timestamp + APPEAL_FILING_WINDOW_SECS),
         Ok(None) => None,
         Err(err) => {
-            warn!(%err, block_number, "failed to read slash block timestamp for appeal window");
+            // Scrubbed, not `%err`: `timed` folds in the transport leg, whose
+            // Display carries reqwest's ` for url (…)` tail — i.e. the raw
+            // `rpc_url`, credentials and all. This was the one chain-error log
+            // in the tree rendering an alloy error unscrubbed.
+            warn!(
+                err = %sanitize_err_chain(&err),
+                block_number,
+                "failed to read slash block timestamp for appeal window"
+            );
             None
         }
     }

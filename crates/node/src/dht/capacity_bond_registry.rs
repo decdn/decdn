@@ -63,7 +63,7 @@ use crate::dht::node_address::{
 use crate::dht::routing::NodeId;
 use crate::dht::staker_set::{StakerChange, StakerSet};
 use crate::metrics::Metrics;
-use decdn_common::redact::sanitize_rpc_display;
+use decdn_common::redact::sanitize_err_chain;
 use decdn_incentive::capacity_bond::CapacityBond;
 
 /// Page size for the paginated `getActiveNodes` read. Matches ADR 019 § Step
@@ -188,7 +188,7 @@ impl<R: RegistryChainReads> RegistrySink<R> {
                 // backoff, so without this counter it would move no metric at all.
                 self.metrics.staker_set_watcher_resolve_failure();
                 warn!(
-                    err = %sanitize_rpc_display(&*err),
+                    err = %sanitize_err_chain(&err),
                     %operator,
                     "nodeIdOf RPC failed; cached active set may diverge from chain state for this operator"
                 );
