@@ -1,8 +1,8 @@
 //! Requester-side POSITIVE probe cache (ADR 001 §Probe cache).
 //!
 //! The mirror of [`super::negative_cache`]: where that one remembers which
-//! `(NodeId, hash)` pairs answered `has_blob: false`, this one remembers which
-//! nodes answered `has_blob: true` — so a second miss for the same hash inside
+//! `(NodeId, hash)` pairs answered `has_blob: false` (or refused a pull), this
+//! one remembers which nodes answered `has_blob: true` — so a second miss for the same hash inside
 //! the TTL skips the DHT lookup AND the probe fanout entirely and goes straight
 //! to selection. Per ADR 001 §Probe cache the cache:
 //!
@@ -23,7 +23,7 @@
 //! evidence locker.
 //!
 //! `reputation` is likewise NOT stored, for a different reason: it is a local,
-//! live value that moves on every pull outcome. Freezing it for 15s would let a
+//! live value that moves on every pull outcome. Freezing it for the TTL would let a
 //! node that just failed three pulls keep the rank it held before them.
 //! `node_origin::cached_candidates` recomputes reputation and region on read and
 //! re-runs `rank_candidates` — ADR 001's "goes straight to selection" means
@@ -47,7 +47,10 @@ pub use crate::dht::records::Hash;
 /// compute the others from it"): a governance change to the slashing window must
 /// move this with it, and a literal would silently not move. The 15s ceiling is
 /// what keeps a stream opened from a cached entry inside the window during which
-/// a misbehaving provider is still slashable.
+/// a misbehaving provider is still slashable — and, per ADR 001, below
+/// `probe_hold_duration` ([`decdn_cache::PROBE_HOLD_DURATION`], 35s), so the
+/// provider's eviction hold still covers the blob when that stream opens. The
+/// second bound is what makes `EvictedSinceProbe` rare on the hit path.
 ///
 /// Expressed through `as_secs` because `Duration: Div<u32>` is not `const` — the
 /// same reason [`decdn_cache::PROBE_HOLD_DURATION`] reaches for
@@ -78,6 +81,12 @@ pub struct ProbedProvider {
     /// The round-trip latency observed on that probe.
     pub rtt_ms: u32,
 }
+
+// Tripwire for the "no evidence retention" invariant: this type must never grow
+// a field. 32 (node_id) + 8 (rate) + 4 (rtt) pads to 48; any addition trips this
+// at compile time and forces the author to argue past the module doc above
+// before deleting it.
+const _: () = assert!(size_of::<ProbedProvider>() <= 48);
 
 #[derive(Debug)]
 struct Entry {
@@ -176,7 +185,7 @@ impl PositiveProbeCache {
         // Remove first: an expired entry is then already evicted (below), and a
         // live one is re-inserted at the front. This drops the redundant `get`
         // that a check-then-remove-then-reinsert shape would cost, and keeps the
-        // hit path to two `IndexMap` ops (Gemini review).
+        // hit path to two `IndexMap` ops (#1223 review).
         let entry = guard.entries.shift_remove(hash)?;
         if entry.expiry <= now {
             return None;
@@ -224,9 +233,11 @@ impl PositiveProbeCache {
     /// Drop the entry for `hash`, if any.
     ///
     /// ADR 001 §Probe cache: "if all fail, run a fresh DHT lookup + probe." A hit
-    /// whose every provider failed to deliver has been disproved by the only
-    /// evidence that outranks a probe — an actual pull — so it is removed rather
-    /// than left to keep hitting for the rest of its 15s.
+    /// whose every BUDGETED provider failed to deliver has been disproved by the
+    /// only evidence that outranks a probe — actual pulls — so it is removed
+    /// rather than left to keep hitting for the rest of its TTL. The caller may
+    /// not have tried the entry's whole list (the attempt budget can be smaller
+    /// than the list); the top-ranked members failing is disproof enough.
     pub fn invalidate(&self, hash: &Hash) {
         self.lock().entries.shift_remove(hash);
     }

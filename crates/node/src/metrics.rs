@@ -612,13 +612,17 @@ pub struct DecdnMetrics {
     /// (DHT plus the origin-directory fallback) surfaced no provider — the blob
     /// is unavailable on the network, not a pull failure.
     pub node_pull_no_providers: Counter,
-    /// `decdn_probe_cache_hits_total` (#1165): cache-miss pulls that found a
-    /// live ADR 001 §Probe cache entry with at least one still-selectable
-    /// provider, and so skipped the DHT lookup and the probe fanout entirely.
-    /// Field has no `_total` suffix because the `OpenMetrics` encoder appends it.
-    /// With `probe_cache_misses` this is the hit ratio the 15s TTL exists to buy;
-    /// a ratio near zero means the TTL is shorter than the request inter-arrival
-    /// time for hot blobs and the cache is pure overhead.
+    /// `decdn_probe_cache_hits_total` (#1165): cache-miss pulls whose candidate
+    /// walk STARTED from a live ADR 001 §Probe cache entry with at least one
+    /// still-selectable provider. The DHT lookup and probe fanout are skipped —
+    /// unless every cached provider fails within the remaining attempt budget,
+    /// in which case the same fetch falls through to a fresh lookup + probe but
+    /// stays counted here (the hit is "the cache had something worth trying",
+    /// not "the cache delivered"). Field has no `_total` suffix because the
+    /// `OpenMetrics` encoder appends it. With `probe_cache_misses` this is the
+    /// hit ratio the TTL exists to buy; a ratio near zero means the TTL is
+    /// shorter than the request inter-arrival time for hot blobs and the cache
+    /// is pure overhead.
     pub probe_cache_hits: Counter,
     /// `decdn_probe_cache_misses_total` (#1165): cache-miss pulls that had to run
     /// a fresh DHT lookup + probe. Counts an entry that was absent, expired, OR
