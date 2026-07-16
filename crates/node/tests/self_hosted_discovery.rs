@@ -583,6 +583,14 @@ async fn non_staked_announce_is_dropped_at_subscriber() -> anyhow::Result<()> {
         "B's subscriber must reject A's announce with not_staked — proving the \
          announce reached B's validator and was dropped, not silently lost in the mesh"
     );
+    // End-state invariant, made explicit at teardown and as a guard against
+    // future edits to the loop's break condition. Not a race fix: `NoneStaked`
+    // rejects unconditionally, so no A announce can ever be admitted — but
+    // asserting it here documents that the reject state holds right up to shutdown.
+    assert!(
+        !learned_peer(&b_peers, &a_id, "US").await,
+        "receiver B must still not have inserted the non-staked publisher A after the reject"
+    );
 
     shutdown.cancel();
     join_gossip_tasks(a_handles.tasks.into_iter().chain(b_handles.tasks)).await;
