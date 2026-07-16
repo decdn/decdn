@@ -193,7 +193,7 @@ impl PositiveProbeCache {
     /// cap overflow.
     ///
     /// `providers` MUST already be in selection order, best-first: this keeps the
-    /// first [`MAX_PROVIDERS_PER_HASH`], which is ADR 001's "top 10 by selection
+    /// first `MAX_PROVIDERS_PER_HASH`, which is ADR 001's "top 10 by selection
     /// score" only if the caller ranked first. The cache cannot rank them itself
     /// — the selection score needs `reputation`, which is precisely the field
     /// this cache refuses to store.

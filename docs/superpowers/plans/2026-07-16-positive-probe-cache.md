@@ -21,6 +21,7 @@
 **"No evidence retention" is a security property, not a memory optimisation.** Before #1200 the ADR had the cache holding `Vec<(NodeId, rate_per_mb, rtt, ProbeResponse)>`. A `ProbeResponse` carries `slash_sig` — a peer's EIP-712-signed `has_blob: true`, which is on-chain phantom-announcement slash evidence for `PROBE_SLASH_WINDOW` (`adr/005-protocol.md:56`). A structure that survives one request to speed up the next has no business holding another node's slashable statements. Store the triple; drop the signature.
 
 **Three decisions the user has settled** (do not re-open):
+
 1. **Shared attempt budget.** ADR 001 says that when every cached provider fails, the node runs a fresh DHT lookup + probe. Given each phase its own `MAX_PROVIDER_ATTEMPTS`, one fetch could cost six sequential pulls against an `outer_pull_deadline` (`selection.rs:127`) sized for three — 172s at defaults. That deadline is enforced *outside* this path, so nothing would fail loudly; the fetch would just be killed mid-pull by a timeout sized for a world it no longer lived in. That is the #859 starvation the arithmetic exists to prevent. So: **one budget for the whole fetch**, cached candidates first, cold path continues on the remainder. Worst case is unchanged, and `outer_pull_deadline` needs no edit.
 2. **Metrics in scope.** Hit/miss counters, plus wiring the ADR-mandated `decdn_probe_post_eviction_failures_total`, which `adr/appendix-observability.md:86` specifies but nothing emits — `monitoring/grafana-dashboard.json:411` has been scraping a dead panel.
 3. **`PROBE_TIMEOUT` is out of scope.** `selection.rs:25` is `5s`; ADR 001 §Probe response collection and #1200 both mandate `500ms`. Commit `deaab0f` (#1145) appears to have reverted it while relocating the constant. File a separate issue (Task 0) — fixing it shifts `PULL_THROUGH_OUTER_SLACK` and every derived deadline, which deserves its own review.
@@ -81,11 +82,13 @@ Found during #1165 planning."
 ## Task 1: The `PositiveProbeCache` type
 
 **Files:**
+
 - Create: `crates/node/src/dht/probe_cache.rs`
 - Modify: `crates/node/src/dht/mod.rs`
 - Test: inline `mod tests` (matching `negative_cache.rs`)
 
 **Interfaces produced** (later tasks depend on these exact signatures):
+
 ```rust
 pub struct ProbedProvider { pub node_id: NodeId, pub rate_per_mb: u64, pub rtt_ms: u32 }
 impl PositiveProbeCache {
@@ -560,6 +563,7 @@ git commit -m "feat(node): lean positive probe cache (ADR 001, 15s TTL, no evide
 ADR 001 §Probe cache attaches one observability requirement to this feature: track the `EvictedSinceProbe` response rate. `adr/appendix-observability.md:86` already assigns it the canonical name — and `monitoring/grafana-dashboard.json:411` already scrapes it. The panel has been reading a metric nothing emits.
 
 **Files:**
+
 - Modify: `crates/node/src/metrics.rs`, `crates/node/src/node_origin.rs`
 - Test: `crates/node/src/node_origin.rs` inline tests (beside `:2341`)
 
@@ -737,6 +741,7 @@ Sequenced **before** any behaviour change so the existing 100%-green suite is it
 **Files:** Modify `crates/node/src/node_origin.rs`
 
 **Interfaces produced:**
+
 ```rust
 struct PullOutcome { bytes: Option<Bytes>, attempts: usize }
 async fn try_pull(deps: &NodeOriginDeps, ranked: &[Candidate], hash_bytes: [u8; 32], budget: usize) -> PullOutcome;
@@ -950,6 +955,7 @@ git commit -m "feat(node): populate the positive probe cache from probe_and_rank
 **Files:** Modify `crates/node/src/node_origin.rs`, `crates/node/tests/node_origin_pull.rs`
 
 **Existing-test impact — investigated, no breakage.** `Origin::fetch` has 34 call sites in `node_origin_pull.rs`; exactly four issue two calls, and three reuse a hash. All three pass, and one becomes free regression coverage:
+
 - `node_origin_not_found_refusal_does_not_tar_upstream` (`:6164`/`:6207`) — fetch 1 caches `[N, A]`; N refuses `NotFound` → negative-cached 30s; A delivers. Fetch 2 hits the cache, `cached_candidates` filters N via the negative cache → `[A]` → delivers. **This test only stays green because of the negative-cache filter in `cached_candidates`** — drop it and N is resurrected and refused again. Do not touch this test.
 - `refusal_suppression_after` (`:6326`/`:6335`, 3 callers) — injects a 100ms negative TTL, deliberately inverted against the positive cache's 15s. All three assertions hold; the third now skips a probe it used to send, but asserts on `node_pull_refused_total`, which fires in `classify_pull_failure` regardless. **Amend its doc in this commit**: "observed through `probe_and_rank`'s filter" becomes "through `cached_candidates`' filter on a probe-cache hit, and `probe_and_rank`'s on the cold path — the two chokepoints every candidate passes."
 - `node_origin_reused_channel_resumes_voucher_progress` (`:6711`/`:6724`) — one provider; fetch 2 hits the cache and pulls it directly. Asserts on the voucher log, which the shortcut does not touch.
