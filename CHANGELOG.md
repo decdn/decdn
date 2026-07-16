@@ -169,8 +169,21 @@ since project inception and will roll into the first tagged release.
   of an opaque on-chain revert later. Previously only `slash_appeal_address` was
   guarded. This is a new hard error on `0x0` for the three other addresses
   (present-but-zero only; an unset optional publish address still resolves to
-  `None`). Other CLI contract addresses parsed outside these resolvers are not
-  yet guarded (tracked separately).
+  `None`).
+
+- **The zero-address guard now covers every parsed contract address across the
+  CLI, not just the resolve\* family (#1213).** The `fetch`
+  (`payment_channel_address`, `slash_judge_address`, `capacity_bond_address`),
+  `channel` (`payment_channel_address`), and `setup` (`usdc_address`) sites, plus
+  the swap venue addresses parsed in `decdn-incentive`'s `swap_venue`
+  (`swap_router_address`, `swap_quoter_address`, `swap_pool_address` /
+  `swap_balancer_pool`, `usdc_address`), now reject `0x0000…0000` with the same
+  "must not be the zero address" error instead of an opaque on-chain revert later.
+  This closes the inconsistency where the *same
+  logical address* was guarded via `resolve()` but not via `fetch`. New hard error
+  on `0x0` (present-but-zero only; unset optionals still resolve to `None`).
+  Account/EOA addresses (`--provider-address`, `operator`) are unchanged — the
+  guard is contract-specific.
 
 #### Gossip
 

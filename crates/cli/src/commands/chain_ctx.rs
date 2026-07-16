@@ -207,10 +207,14 @@ pub fn parse_address(value: &str, label: &str) -> anyhow::Result<Address> {
 /// Parse a contract address and reject the zero address. `Address::ZERO` parses
 /// cleanly but is never a real deployment — it would surface only as an opaque
 /// on-chain revert at call time, so reject it here with a clear, labelled error.
-/// Applied to the four addresses resolved by `resolve` / `resolve_appeal` /
-/// `resolve_publish` (#1153). Other contract addresses parsed directly via
-/// [`parse_address`] elsewhere in the CLI are not yet guarded (tracked
-/// separately).
+///
+/// Use this for **every contract address** parsed from a flag/config — the
+/// `resolve` / `resolve_appeal` / `resolve_publish` addresses (#1153) and the
+/// `fetch` / `channel` / `setup` sites (#1213). Account/EOA addresses
+/// (`--provider-address`, `operator`) deliberately stay on [`parse_address`] —
+/// the "never a real deployment" rationale is contract-specific. Swap venue
+/// addresses are guarded by an equivalent local helper in `decdn-incentive`'s
+/// `swap_venue` (which cannot depend on this crate).
 pub fn parse_nonzero_address(value: &str, label: &str) -> anyhow::Result<Address> {
     let addr = parse_address(value, label)?;
     anyhow::ensure!(

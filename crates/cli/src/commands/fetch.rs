@@ -162,7 +162,7 @@ pub(crate) fn resolve_chain(
                  blockchain.payment_channel_address)"
             )
         })?;
-    let payment_channel = chain_ctx::parse_address(&pc_raw, "payment_channel_address")?;
+    let payment_channel = chain_ctx::parse_nonzero_address(&pc_raw, "payment_channel_address")?;
 
     let sj_raw = args
         .slash_judge_address
@@ -174,7 +174,7 @@ pub(crate) fn resolve_chain(
                  blockchain.slash_judge_address)"
             )
         })?;
-    let slash_judge = chain_ctx::parse_address(&sj_raw, "slash_judge_address")?;
+    let slash_judge = chain_ctx::parse_nonzero_address(&sj_raw, "slash_judge_address")?;
 
     // Optional: only the auto-discovery path reads it, and it errors there if
     // unset rather than failing every explicit-node fetch.
@@ -182,7 +182,7 @@ pub(crate) fn resolve_chain(
         .capacity_bond_address
         .clone()
         .or_else(|| bc.and_then(|b| b.capacity_bond_address.clone()))
-        .map(|raw| chain_ctx::parse_address(&raw, "capacity_bond_address"))
+        .map(|raw| chain_ctx::parse_nonzero_address(&raw, "capacity_bond_address"))
         .transpose()?;
 
     let region = args
@@ -964,6 +964,45 @@ mod tests {
         );
         let err = resolve_chain(&common(), &file).unwrap_err();
         assert!(err.to_string().contains("rpc_url not set"), "{err}");
+    }
+
+    /// A present-but-zero contract address fails fast at resolve time via the
+    /// shared `parse_nonzero_address` guard, not as an opaque on-chain revert
+    /// later (#1213). Each contract address on the fetch path is checked
+    /// independently; the EOA `--provider-address` stays unguarded by design.
+    #[test]
+    fn resolve_chain_rejects_zero_payment_channel() {
+        let file = config(
+            "[blockchain]\nrpc_url = \"http://config:8545\"\npayment_channel_address = \"0x0000000000000000000000000000000000000000\"\nslash_judge_address = \"0x4444444444444444444444444444444444444444\"\n",
+        );
+        let err = resolve_chain(&common(), &file).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("payment_channel_address"), "{err}");
+        assert!(msg.contains("must not be the zero address"), "{err}");
+    }
+
+    #[test]
+    fn resolve_chain_rejects_zero_slash_judge() {
+        let file = config(
+            "[blockchain]\nrpc_url = \"http://config:8545\"\npayment_channel_address = \"0x3333333333333333333333333333333333333333\"\nslash_judge_address = \"0x0000000000000000000000000000000000000000\"\n",
+        );
+        let err = resolve_chain(&common(), &file).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("slash_judge_address"), "{err}");
+        assert!(msg.contains("must not be the zero address"), "{err}");
+    }
+
+    #[test]
+    fn resolve_chain_rejects_zero_capacity_bond() {
+        // `capacity_bond_address` is optional, but a present zero must still
+        // error (it does not silently resolve to `None`).
+        let file = config(
+            "[blockchain]\nrpc_url = \"http://config:8545\"\npayment_channel_address = \"0x3333333333333333333333333333333333333333\"\nslash_judge_address = \"0x4444444444444444444444444444444444444444\"\ncapacity_bond_address = \"0x0000000000000000000000000000000000000000\"\n",
+        );
+        let err = resolve_chain(&common(), &file).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("capacity_bond_address"), "{err}");
+        assert!(msg.contains("must not be the zero address"), "{err}");
     }
 
     #[test]
