@@ -7,6 +7,49 @@
 //! which the default public Arbitrum Sepolia RPC and most keyless endpoints
 //! reject with `-32601` (#1106). No `watch_logs`/`eth_newFilter` call remains on
 //! the node's hot path.
+//!
+//! # Watchers scan to head, deliberately
+//!
+//! Every watcher's scan upper bound is the head block itself. There is no
+//! confirmation lag and no knob for one: a `WatcherConfig::confirmations` field
+//! existed, documented a `head - confirmations` bound, and was passed `0` by all
+//! six watchers — so it never lagged anything, while its doc claimed otherwise
+//! (#1227).
+//!
+//! Two distinct things can go wrong at the unstable tip, and re-scan idempotency
+//! covers only one of them:
+//!
+//! - **Re-delivery of a canonical log.** Covered. The retry and reorg-rewind
+//!   paths already re-deliver, so `resumable_watcher`'s module doc does not
+//!   merely observe sink idempotency, it *requires* it (dedup by id / set
+//!   insertion / authoritative re-read). A re-mined event is re-applied
+//!   harmlessly.
+//! - **A log that never becomes canonical.** *Not* covered, and not the same
+//!   property: idempotency makes a repeated apply cheap, whereas a confirmation
+//!   lag would prevent the apply happening at all. `eth_getLogs` returns only
+//!   canonical logs, so no sink ever observes a removal and none has an un-apply
+//!   path. An event from an orphaned block therefore stays applied.
+//!
+//! That second case is an accepted residual, not a solved problem. It is
+//! accepted because reorgs on the target chain are shallow and rare (see
+//! `backfill`'s `REORG_MARGIN_BLOCKS`, which carries the sizing rationale for an
+//! Arbitrum-Sepolia-class L2 and is the single place that claim lives), and
+//! because the sinks holding an authoritative on-chain enumeration source
+//! re-read it and self-heal. The two without one are where an orphan sticks:
+//! settlement's `register_open_channel` (durable — an fsynced phantom channel,
+//! reclaimed only by the expiry sweep) and reputation's settlement accumulator
+//! (in-memory, so a reboot clears it). Both predate #1227 and are unchanged by
+//! it — deleting an always-zero field cannot alter what a lag never did.
+//!
+//! For the settlement watcher specifically, a lag also carries a concrete cost,
+//! which is what makes zero an active choice there rather than an inherited one:
+//! it would delay channel registration, so a client's first request on a
+//! freshly-opened channel would be rejected as unknown.
+//!
+//! If a future chain needs a lag, reintroduce it as a config knob with a
+//! **non-zero default and a test asserting a live production config engages
+//! it** — not a silently-zero field whose unit test exercises the arithmetic
+//! rather than the wiring.
 
 pub(crate) mod backfill;
 pub(crate) mod resumable_watcher;

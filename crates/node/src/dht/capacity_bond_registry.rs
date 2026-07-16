@@ -394,8 +394,6 @@ where
         ]),
         from_block: 0,
         poll_interval: event_poll_interval,
-        confirmations: 0,
-        reorg_margin: 0,
         // Live-from-head, but still chunk `[cursor, head]` so a long lag (RPC
         // outage / rate-limit) recovers in bounded windows instead of one
         // range-limit-tripping `eth_getLogs`.

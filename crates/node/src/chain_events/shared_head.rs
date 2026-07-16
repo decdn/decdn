@@ -348,8 +348,6 @@ mod tests {
                     filter: Filter::new(),
                     from_block: 0,
                     poll_interval: INTERVAL,
-                    confirmations: 0,
-                    reorg_margin: 0,
                     max_backfill_span: 10_000,
                     cursor: CursorPolicy::HeadMinusWindow {
                         window_blocks: 0,

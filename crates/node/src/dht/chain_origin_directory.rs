@@ -356,8 +356,6 @@ impl ChainOriginDirectory {
                 ]),
             from_block,
             poll_interval: event_poll_interval,
-            confirmations: 0,
-            reorg_margin: REORG_MARGIN_BLOCKS,
             max_backfill_span: MAX_BACKFILL_BLOCK_SPAN,
             cursor: cursor_policy(checkpoint_store),
             initial_backoff: WATCHER_INITIAL_BACKOFF,
@@ -571,14 +569,26 @@ impl<P: Provider + Clone> OriginSink<P> {
 /// `ContentClaimed` from the **deploy floor** — the `hash → namespaces` view
 /// has no on-chain enumeration, so the stream must be replayed for
 /// correctness. Pinned by a test: a `Head` fallback silently loses every claim
-/// that predates the node. (In steady state `bootstrap` seeds the live cursor
-/// at its snapshot block, so the fallback governs only a checkpoint-less start
-/// of the poller itself.)
+/// that predates the node.
+///
+/// **Neither field below is read on the live path today.** `bootstrap` seeds the
+/// cursor at its snapshot block ([`WatcherConfig::seed_cursor`]), and a seeded
+/// cursor bypasses floor derivation entirely — `initial_from`, the only reader of
+/// `none_fallback` and `reorg_margin`, is never reached. This watcher's real
+/// resume floor is `replay_from` above: the raw checkpoint, with **no** reorg
+/// rewind. They are declared because `CursorPolicy::Persisted` requires them and
+/// they are the values derivation *would* use, not because they take effect; do
+/// not cite this site as evidence the margin applies. Making that
+/// unrepresentable needs `CursorPolicy`'s persistence and floor-derivation axes
+/// split apart (#1238) — which is also why the test below pins the shape but not
+/// the margin: a pin on a value nothing reads is the #1227 defect, not a guard
+/// against it.
 fn cursor_policy(store: Arc<dyn KeyedCheckpointStore>) -> CursorPolicy {
     CursorPolicy::Persisted {
         store,
         key: CheckpointKey::Origin,
         none_fallback: NoneFallback::FromBlock,
+        reorg_margin: REORG_MARGIN_BLOCKS,
     }
 }
 

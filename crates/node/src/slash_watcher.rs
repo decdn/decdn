@@ -45,9 +45,7 @@ use crate::chain_events::resumable_watcher::{
     self, CursorPolicy, LogSink, WatcherConfig, WatcherHook,
 };
 use crate::chain_events::shared_head::HeadSource;
-use crate::chain_events::{
-    AbortOnDrop, MAX_BACKFILL_BLOCK_SPAN, REORG_MARGIN_BLOCKS, WATCHER_INITIAL_BACKOFF, timed,
-};
+use crate::chain_events::{AbortOnDrop, MAX_BACKFILL_BLOCK_SPAN, WATCHER_INITIAL_BACKOFF, timed};
 use crate::metrics::Metrics;
 
 /// Nominal appeal filing window (ADR 028: 30 days from the slash timestamp).
@@ -156,8 +154,6 @@ impl SlashWatcher {
             filter: operator_filter(slash_judge_addr, self_address),
             from_block,
             poll_interval: event_poll_interval,
-            confirmations: 0,
-            reorg_margin: REORG_MARGIN_BLOCKS,
             max_backfill_span: MAX_BACKFILL_BLOCK_SPAN,
             // No durable resume cursor (the in-memory store is rebuilt each boot);
             // re-scan the bounded appeal-window lookback, clamped to the deploy

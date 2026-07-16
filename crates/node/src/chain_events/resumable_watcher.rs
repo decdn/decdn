@@ -1,9 +1,9 @@
 //! Resumable `eth_getLogs` polling watcher (#1092/#1106/#1108).
 //!
 //! One cursor loop drives every on-chain watcher: each poll tick reads head,
-//! scans `[cursor, head - confirmations]` in `MAX_BACKFILL_BLOCK_SPAN` windows
-//! via `eth_getLogs`, hands each log to a [`LogSink`], then advances — and, for
-//! a [`CursorPolicy::Persisted`] watcher, durably records — the cursor per
+//! scans `[cursor, head]` in `MAX_BACKFILL_BLOCK_SPAN` windows via
+//! `eth_getLogs`, hands each log to a [`LogSink`], then advances — and, for a
+//! [`CursorPolicy::Persisted`] watcher, durably records — the cursor per
 //! window. The **first tick's** large range *is* the historical backfill; later
 //! ticks are the live tail. This replaces alloy's `watch_logs`
 //! (`eth_newFilter` + `eth_getFilterChanges`), which the default public
@@ -61,6 +61,23 @@ pub(crate) enum CursorPolicy {
         store: Arc<dyn KeyedCheckpointStore>,
         key: CheckpointKey,
         none_fallback: NoneFallback,
+        /// Blocks to rewind the checkpoint on resume (reorg safety), normally
+        /// [`super::REORG_MARGIN_BLOCKS`].
+        ///
+        /// Lives in this variant rather than on [`WatcherConfig`] because only
+        /// this arm reads it: it is the rewind applied to a *durable* cursor,
+        /// and the other two policies re-derive their floor from head on every
+        /// boot. As a `WatcherConfig` field it was inert for five of the six
+        /// watchers — four of which passed a real 128 into something that never
+        /// read it (#1227).
+        ///
+        /// Moving it here shrinks that to two sites but does not fully close it:
+        /// a [`WatcherConfig::seed_cursor`] watcher never resolves a floor, so
+        /// the origin directory still carries a margin it cannot read. Only the
+        /// settlement watcher actually rewinds. Splitting this variant's
+        /// persistence and floor-derivation axes is what would make that
+        /// unrepresentable (#1238).
+        reorg_margin: u64,
     },
     /// Re-derive the floor from head each boot as `head - window_blocks`
     /// (clamped `>= floor`); do not persist. Used where a resume cursor is
@@ -88,12 +105,13 @@ impl CursorPolicy {
     /// the fallback is the deploy floor, where the worst case of a lost
     /// checkpoint is only a wider (idempotent) rescan, so a read error degrades
     /// to the fallback with a warning.
-    fn initial_from(&self, from_block: u64, head: u64, reorg_margin: u64) -> Result<u64> {
+    fn initial_from(&self, from_block: u64, head: u64) -> Result<u64> {
         match self {
             Self::Persisted {
                 store,
                 key,
                 none_fallback,
+                reorg_margin,
             } => {
                 let last = match (store.load_checkpoint(*key), none_fallback) {
                     (Ok(v), _) => v,
@@ -115,7 +133,7 @@ impl CursorPolicy {
                     last,
                     head,
                     from_block,
-                    reorg_margin,
+                    *reorg_margin,
                     *none_fallback,
                 ))
             }
@@ -186,11 +204,6 @@ pub(crate) struct WatcherConfig {
     pub(crate) from_block: u64,
     /// Delay between poll ticks (the chain `event_poll_interval`).
     pub(crate) poll_interval: Duration,
-    /// Confirmation lag: the scan upper bound is `head - confirmations`, so the
-    /// live tail never emits logs from the unstable chain tip.
-    pub(crate) confirmations: u64,
-    /// Blocks to rewind a persisted checkpoint on resume (reorg safety).
-    pub(crate) reorg_margin: u64,
     /// Max block span per `eth_getLogs` window.
     pub(crate) max_backfill_span: u64,
     /// Floor-derivation and persistence policy.
@@ -228,12 +241,6 @@ fn fire(hook: Option<&WatcherHook>) {
     if let Some(hook) = hook {
         hook();
     }
-}
-
-/// The scan upper bound for a given head: lag by `confirmations` so the live
-/// tail never emits logs from the unstable chain tip.
-const fn scan_upper_bound(head: u64, confirmations: u64) -> u64 {
-    head.saturating_sub(confirmations)
 }
 
 /// Resolve a [`CursorPolicy::Persisted`] watcher's initial scan floor from its
@@ -284,10 +291,10 @@ pub(crate) const fn resolve_head_window_start(head: u64, window: u64, floor: u64
     if floored < head { floored } else { head }
 }
 
-/// Run one poll tick: read head, scan `[cursor, head - confirmations]` in
-/// windows, apply each log, advancing + persisting the cursor per completed
-/// window. Returns `Err` on any retryable failure (RPC error/timeout or a
-/// sink's retryable error) with the cursor left at the last completed window.
+/// Run one poll tick: read head, scan `[cursor, head]` in windows, apply each
+/// log, advancing + persisting the cursor per completed window. Returns `Err` on
+/// any retryable failure (RPC error/timeout or a sink's retryable error) with
+/// the cursor left at the last completed window.
 async fn run_tick<P, S>(
     provider: &P,
     cfg: &WatcherConfig,
@@ -301,17 +308,14 @@ where
     // The context stays here rather than in the head source so a failed head read
     // renders identically to before the read was shared, and so a test fake
     // produces the same error shape as production.
-    let head = cfg.head.head().await.context("read head block")?;
-    let to = scan_upper_bound(head, cfg.confirmations);
+    let to = cfg.head.head().await.context("read head block")?;
     let from = match *cursor {
         Some(c) => c,
-        None => cfg
-            .cursor
-            .initial_from(cfg.from_block, to, cfg.reorg_margin)?,
+        None => cfg.cursor.initial_from(cfg.from_block, to)?,
     };
     if from > to {
-        // Head has not advanced past the cursor yet (idle tick or confirmations
-        // lag). Retain the resolved floor so the next tick does not re-resolve.
+        // Head has not advanced past the cursor yet (idle tick). Retain the
+        // resolved floor so the next tick does not re-resolve.
         *cursor = Some(from);
     } else {
         for (start, end) in backfill_windows(from, to, cfg.max_backfill_span) {
@@ -498,12 +502,6 @@ mod tests {
         assert_eq!(resolve_head_window_start(500, 10_000, 0), 0);
     }
 
-    #[test]
-    fn scan_upper_bound_lags_by_confirmations() {
-        assert_eq!(scan_upper_bound(1_000, 12), 988);
-        assert_eq!(scan_upper_bound(5, 12), 0);
-    }
-
     /// A store whose reads always fail, for the load-error policy cases.
     struct FailingLoadStore;
 
@@ -579,7 +577,7 @@ mod tests {
     }
 
     /// Build a `run_tick` config over the mocked provider: span-10 windows,
-    /// no confirmations lag / reorg rewind, persisting through `store`.
+    /// no reorg rewind, persisting through `store`.
     ///
     /// The `Duration::ZERO` head TTL is load-bearing. These tests push head and
     /// `get_logs` responses onto one ordered `Asserter` queue, so a cached head
@@ -594,13 +592,12 @@ mod tests {
             filter: Filter::new(),
             from_block: 0,
             poll_interval: Duration::from_secs(1),
-            confirmations: 0,
-            reorg_margin: 0,
             max_backfill_span: 10,
             cursor: CursorPolicy::Persisted {
                 store,
                 key: CheckpointKey::ChannelOpened,
                 none_fallback: NoneFallback::FromBlock,
+                reorg_margin: 0,
             },
             initial_backoff: Duration::from_millis(1),
             max_backoff: Duration::from_millis(1),
@@ -738,7 +735,47 @@ mod tests {
             store: Arc::new(FailingLoadStore),
             key: CheckpointKey::ChannelOpened,
             none_fallback,
+            reorg_margin: MARGIN,
         }
+    }
+
+    /// The configured `reorg_margin` actually reaches `resolve_persisted_start`
+    /// — the *wiring*, not the arithmetic.
+    ///
+    /// Nothing else covers this seam, which is why it exists. The seven
+    /// `resolve_persisted_start` tests call that pure fn directly, so they prove
+    /// the rewind *given* a margin. The `cursor_policy` pins prove settlement's
+    /// production config *carries* `REORG_MARGIN_BLOCKS`. Neither proves
+    /// `initial_from` hands one to the other: hard-coding `0` at that call site
+    /// passed the entire suite. Two legs of three — the same shape that let
+    /// #1227 ship documented-but-disabled, one field over.
+    ///
+    /// Every other `Persisted` test reaches the `None` arm (a `FailingLoadStore`
+    /// or an empty store), which ignores the margin entirely; only a stored
+    /// `Some(checkpoint)` exercises the rewind. The three constants are mutually
+    /// distinct so an argument-order slip among `resolve_persisted_start`'s
+    /// consecutive `u64`s fails here too.
+    #[test]
+    fn persisted_initial_from_engages_the_configured_margin() {
+        const CHECKPOINT: u64 = 10_000;
+        const HEAD: u64 = 20_000;
+        const FROM_BLOCK: u64 = 500;
+
+        let store = Arc::new(MemoryCheckpointStore::default());
+        let recorded = store.record_checkpoint(CheckpointKey::ChannelOpened, CHECKPOINT);
+        assert!(recorded.is_ok(), "seeding the checkpoint must succeed");
+        let policy = CursorPolicy::Persisted {
+            store,
+            key: CheckpointKey::ChannelOpened,
+            none_fallback: NoneFallback::Head,
+            reorg_margin: MARGIN,
+        };
+
+        assert_eq!(
+            policy.initial_from(FROM_BLOCK, HEAD).unwrap_or(u64::MAX),
+            CHECKPOINT - MARGIN,
+            "a resumed floor must be rewound by the policy's own reorg_margin"
+        );
     }
 
     #[test]
@@ -748,7 +785,7 @@ mod tests {
         // into backoff instead so the read is retried.
         assert!(
             persisted(NoneFallback::Head)
-                .initial_from(0, 1_000, MARGIN)
+                .initial_from(0, 1_000)
                 .is_err()
         );
     }
@@ -758,7 +795,7 @@ mod tests {
         // For a deploy-floor watcher the worst case of a lost checkpoint is a
         // wider idempotent rescan, so a read error degrades instead of failing.
         let start = persisted(NoneFallback::FromBlock)
-            .initial_from(200, 1_000, MARGIN)
+            .initial_from(200, 1_000)
             .unwrap_or(u64::MAX);
         assert_eq!(start, 200);
     }
