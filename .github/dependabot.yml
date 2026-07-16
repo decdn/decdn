@@ -6,6 +6,16 @@ updates:
       interval: weekly
       day: monday
     open-pull-requests-limit: 10
+    # Pin the title convention instead of leaving it to Dependabot's inference
+    # from commit history. The `pr-title` job in ci.yml conventional-commit
+    # lints the PR title and is part of the required `CI success` gate, so an
+    # unprefixed title is unmergeable. Inference produced "chore(deps): ..."
+    # for months, then silently regressed to a bare "bump x from a to b" and
+    # blocked every open Dependabot PR (#1239, #1240, #1241). `chore` + scope
+    # reproduces the historical titles verbatim; nothing infers it now.
+    commit-message:
+      prefix: chore
+      include: scope
     groups:
       rust-dependencies:
         patterns: ["*"]
@@ -19,6 +29,10 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    # Same rationale as the cargo ecosystem above.
+    commit-message:
+      prefix: chore
+      include: scope
     # No dtolnay/rust-toolchain ignore: MSRV and the stable lint pin are both
     # 1.95.0 right now (see Cargo.toml workspace.package.rust-version and the
     # @1.95.0 refs in ci.yml / release.yml), so all refs should bump in
