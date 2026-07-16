@@ -790,6 +790,12 @@ fn build_origin_with_probe_caches(
     negative_cache: NegativeProbeCache,
     probe_cache: PositiveProbeCache,
 ) -> NodeOrigin {
+    // Providers are active stakers, matching production (a probe-cache HIT
+    // re-checks `is_active`, so an empty set would make every cached provider
+    // un-servable on a hit). `find_providers` still returns empty for them — no
+    // routing entries — so fetch #1 resolves via the directory as before. Built
+    // before `providers` is moved into `dir`.
+    let stakers = ConfigStakerSet::new(providers.iter().copied().collect());
     let mut dir = HashMap::new();
     dir.insert(DhtHash::from_bytes(*hash.as_bytes()), providers);
 
@@ -797,7 +803,7 @@ fn build_origin_with_probe_caches(
     origin.provision(NodeOriginDeps {
         endpoint: ep_b.clone(),
         routing_table: Arc::new(Mutex::new(RoutingTable::new(b_dht))),
-        staker_set: Arc::new(ConfigStakerSet::empty()) as Arc<dyn StakerSet>,
+        staker_set: Arc::new(stakers) as Arc<dyn StakerSet>,
         origin_directory: Arc::new(ConfigOriginDirectory::new(dir)) as Arc<dyn OriginDirectory>,
         addr_resolver: Arc::new(StaticNodeAddressDirectory::new(addr_map))
             as Arc<dyn NodeAddressResolver>,
@@ -859,7 +865,12 @@ fn build_origin_multi_hash(
     origin.provision(NodeOriginDeps {
         endpoint: ep_b.clone(),
         routing_table: Arc::new(Mutex::new(RoutingTable::new(b_dht))),
-        staker_set: Arc::new(ConfigStakerSet::empty()) as Arc<dyn StakerSet>,
+        // Providers are active stakers, matching production (a probe-cache HIT
+        // re-checks `is_active`, so an empty set would make every cached provider
+        // un-servable on a hit). `find_providers` still returns empty for them —
+        // no routing entries — so fetch #1 resolves via the directory as before.
+        staker_set: Arc::new(ConfigStakerSet::new(providers.iter().copied().collect()))
+            as Arc<dyn StakerSet>,
         origin_directory: Arc::new(ConfigOriginDirectory::new(dir)) as Arc<dyn OriginDirectory>,
         addr_resolver: Arc::new(StaticNodeAddressDirectory::new(addr_map))
             as Arc<dyn NodeAddressResolver>,

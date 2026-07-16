@@ -1192,21 +1192,28 @@ async fn cached_candidates(deps: &NodeOriginDeps, target: DhtHash) -> Option<Vec
         // chokepoint every candidate passes through. A pull-time refusal recorded
         // a negative for this exact (peer, hash) seconds ago
         // (`classify_pull_failure`), and a wedged channel cannot serve ANY hash.
-        //
-        // Deliberately NOT re-applying the staker-set membership filter
-        // `find_providers` applies on the cold path. A provider DEREGISTERED
-        // since it was cached is caught at pull time, when `addr_resolver
-        // .address_of` fails to resolve it (deregistration clears the binding);
-        // one that was ejected or entered unbonding is NOT — the address binding
-        // survives those transitions — so it can win at most one pull inside the
-        // TTL that the cold path would have denied it. The BLAKE3 verify on
-        // whatever it returns guarantees content integrity either way, which
-        // bounds the exposure to a mis-paid pull, not a wrong blob.
         if deps
             .negative_cache
             .contains_active(&provider.node_id, &target)
             || deps.provider_is_wedged(&provider.node_id, now_secs)
         {
+            continue;
+        }
+        // ADR 001 §Probe cache: "verify the selected node_id is still active in
+        // the local registry cache" before opening `cdn/client/v1`. The cold path
+        // applies this inside `find_providers` (`filter_active_stakers`); the hit
+        // path bypasses `find_providers`, so re-apply it here. `addr_resolver` is
+        // NOT this guard — the address binding survives ejection/unbonding (only
+        // deregistration clears it), which is what let a node ejected inside the
+        // TTL win a paid pull the cold path would deny (#1223 review).
+        //
+        // NOTE: a static-config origin (`dht.static_origins`) that is not a staker
+        // is skipped here and falls through to the cold path, where the unfiltered
+        // `ConfigOriginDirectory` fallback re-serves it — static-only deployments
+        // get correctness, not hit acceleration. Production directories are
+        // chain-backed and staker-filtered, so their origins are stakers and this
+        // check is complete.
+        if !deps.staker_set.is_active(&provider.node_id) {
             continue;
         }
         let Ok(pk) = PublicKey::from_bytes(provider.node_id.as_bytes()) else {
