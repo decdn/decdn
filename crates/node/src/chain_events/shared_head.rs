@@ -154,6 +154,12 @@ impl<P: Provider> HeadSource for SharedHead<P> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
     use alloy::primitives::U64;
@@ -261,73 +267,74 @@ mod tests {
     /// Asserts both bounds that matter: the TTL bound (what the cache promises)
     /// and `< WATCHERS * ticks` (what it replaces). The second is the one that
     /// would catch a regression where `head` is accidentally rebuilt per watcher.
+    /// Discards logs — the counting test measures RPC counts, not projection state.
+    struct NullSink;
+
+    impl super::super::resumable_watcher::LogSink for NullSink {
+        async fn apply(&mut self, _log: alloy::rpc::types::Log) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A JSON-RPC mock that echoes the request id and counts calls per method.
+    struct CountingRpc {
+        head_hits: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl wiremock::Respond for CountingRpc {
+        fn respond(&self, req: &wiremock::Request) -> wiremock::ResponseTemplate {
+            use std::sync::atomic::Ordering;
+            let body: serde_json::Value =
+                serde_json::from_slice(&req.body).unwrap_or(serde_json::Value::Null);
+            let id = body.get("id").cloned().unwrap_or(serde_json::json!(0));
+            let result = match body.get("method").and_then(serde_json::Value::as_str) {
+                Some("eth_blockNumber") => {
+                    self.head_hits.fetch_add(1, Ordering::SeqCst);
+                    serde_json::json!("0x64")
+                }
+                Some("eth_getLogs") => serde_json::json!([]),
+                // Alloy probes chain id when building the provider.
+                _ => serde_json::json!("0x1"),
+            };
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0", "id": id, "result": result,
+            }))
+        }
+    }
+
+    /// Stand up the counting JSON-RPC mock; returns a provider pointed at it and
+    /// the `eth_blockNumber` counter. The server is returned so the caller keeps
+    /// it alive for the duration of the test.
+    async fn counting_server() -> (
+        wiremock::MockServer,
+        impl Provider + Clone,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let head_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(CountingRpc {
+                head_hits: Arc::clone(&head_hits),
+            })
+            .mount(&server)
+            .await;
+        let url = server.uri().parse().expect("mock server uri parses");
+        let provider = ProviderBuilder::new().connect_http(url);
+        (server, provider, head_hits)
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn watchers_sharing_one_head_collapse_the_block_number_reads() {
-        use super::super::resumable_watcher::{self, CursorPolicy, LogSink, WatcherConfig};
-        use alloy::rpc::types::{Filter, Log};
-        use std::sync::atomic::{AtomicUsize, Ordering};
+        use super::super::resumable_watcher::{self, CursorPolicy, WatcherConfig};
+        use alloy::rpc::types::Filter;
+        use std::sync::atomic::Ordering;
         use tokio_util::sync::CancellationToken;
-        use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate, matchers};
-
-        /// Discards logs — this test measures RPC counts, not projection state.
-        struct NullSink;
-
-        impl LogSink for NullSink {
-            async fn apply(&mut self, _log: Log) -> Result<()> {
-                Ok(())
-            }
-        }
-
-        /// Echoes the JSON-RPC id and counts calls per method.
-        struct CountingRpc {
-            head_hits: Arc<AtomicUsize>,
-            logs_hits: Arc<AtomicUsize>,
-        }
-
-        impl Respond for CountingRpc {
-            fn respond(&self, req: &Request) -> ResponseTemplate {
-                let body: serde_json::Value =
-                    serde_json::from_slice(&req.body).unwrap_or(serde_json::Value::Null);
-                let id = body.get("id").cloned().unwrap_or(serde_json::json!(0));
-                let result = match body.get("method").and_then(serde_json::Value::as_str) {
-                    Some("eth_blockNumber") => {
-                        self.head_hits.fetch_add(1, Ordering::SeqCst);
-                        serde_json::json!("0x64")
-                    }
-                    Some("eth_getLogs") => {
-                        self.logs_hits.fetch_add(1, Ordering::SeqCst);
-                        serde_json::json!([])
-                    }
-                    // Alloy probes chain id when building the provider.
-                    _ => serde_json::json!("0x1"),
-                };
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "jsonrpc": "2.0", "id": id, "result": result,
-                }))
-            }
-        }
 
         const WATCHERS: usize = 6;
         const INTERVAL: Duration = Duration::from_millis(100);
         const RUN_FOR: Duration = Duration::from_millis(550);
 
-        let head_hits = Arc::new(AtomicUsize::new(0));
-        // Counted so the mock can serve `eth_getLogs`; the assertions use head reads.
-        let logs_hits = Arc::new(AtomicUsize::new(0));
-        let server = MockServer::start().await;
-        Mock::given(matchers::method("POST"))
-            .respond_with(CountingRpc {
-                head_hits: Arc::clone(&head_hits),
-                logs_hits: Arc::clone(&logs_hits),
-            })
-            .mount(&server)
-            .await;
-
-        let Ok(url) = server.uri().parse() else {
-            // Not an assertion about the code under test - bail rather than panic.
-            return;
-        };
-        let provider = ProviderBuilder::new().connect_http(url);
+        let (_server, provider, head_hits) = counting_server().await;
         // The one thing under test: a single head source behind every watcher.
         let head: Arc<dyn HeadSource> = Arc::new(SharedHead::new(provider.clone(), INTERVAL));
         let shutdown = CancellationToken::new();
@@ -359,11 +366,13 @@ mod tests {
             })
             .collect();
 
+        let started = tokio::time::Instant::now();
         tokio::time::sleep(RUN_FOR).await;
         shutdown.cancel();
         for w in watchers {
             let _ = w.await;
         }
+        let elapsed = started.elapsed();
 
         let heads = head_hits.load(Ordering::SeqCst);
 
@@ -377,15 +386,23 @@ mod tests {
         let unshared = WATCHERS * ticks;
 
         // The TTL bound: at most one head read per TTL window, +1 for a partial
-        // window at each end.
-        let ttl_bound = (per_ms(RUN_FOR) / per_ms(INTERVAL / 2)) as usize + 2;
+        // window at each end. Derived from MEASURED elapsed rather than the
+        // intended `RUN_FOR`: the sleep can overshoot, and after `cancel()` each
+        // watcher may still finish an in-flight tick (`run_tick` reads head before
+        // it checks shutdown). Every extra TTL window legitimately permits one
+        // more read, so bounding by the intended duration would fail under CI
+        // scheduling jitter while the cache is behaving perfectly.
+        let ttl_bound = (per_ms(elapsed) / per_ms(INTERVAL / 2)) as usize + 2;
         assert!(
             heads <= ttl_bound,
-            "head reads ({heads}) must respect the ttl bound ({ttl_bound})"
+            "head reads ({heads}) must respect the ttl bound ({ttl_bound}) \
+             over {elapsed:?}"
         );
         // The bound that matters: strictly fewer than one head read per watcher
         // per tick, which is what sharing replaces. This is the assertion that
-        // fails if `head` is ever accidentally rebuilt per watcher.
+        // fails if `head` is ever accidentally rebuilt per watcher. Deliberately
+        // still derived from `RUN_FOR`: an overshooting run means MORE real ticks,
+        // so this under-count can only make the assertion harder to pass.
         assert!(
             heads < unshared,
             "sharing must beat one-head-per-watcher-per-tick \
