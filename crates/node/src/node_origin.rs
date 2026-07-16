@@ -1355,7 +1355,7 @@ enum RefusalVerdict {
     NodeFault,
     /// A true, lasting fact about this (peer, hash) pair. Suppress the pair for the full
     /// [`NegativeProbeCache`] TTL — asking again soon would get the same answer.
-    DurableMiss,
+    DurableMiss(DurableMissCause),
     /// Transient, or not attributable to the peer at all. Suppress the pair only briefly
     /// ([`REFUSAL_SUPPRESSION_TTL`]) — long enough that a peer serving nothing stops
     /// burning a candidate slot on every miss in a retry burst, short enough that we do
@@ -1363,6 +1363,27 @@ enum RefusalVerdict {
     Transient,
     /// OUR fault. Score nothing, suppress nothing.
     OurFault,
+}
+
+/// Why a [`RefusalVerdict::DurableMiss`] is durable.
+///
+/// The verdict itself answers "what does this refusal say about the peer?", and
+/// both causes give the same answer: asking this peer for this hash again inside
+/// the TTL gets the same reply, so suppress it and don't spend a candidate slot
+/// finding out. They are NOT the same thing to an operator, though —
+/// `EvictedSinceProbe` is a peer contradicting its own signed `has_blob: true`
+/// and is the ADR 001-mandated `decdn_probe_post_eviction_failures_total`
+/// signal, while `BlobTooLarge` is a static fact about the blob that says
+/// nothing about anyone's hold mechanism. A payload rather than a fourth
+/// `RefusalVerdict` variant, because a variant would claim the two mean
+/// different things about the peer, and they do not (#1165).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DurableMissCause {
+    /// The peer held the blob at probe time and lost it to cache pressure
+    /// before we opened the stream — a hold-mechanism failure (ADR 005).
+    EvictedSinceProbe,
+    /// The blob is over the peer's ceiling — deterministic for this blob.
+    BlobTooLarge,
 }
 
 /// How long a (peer, hash) pair is suppressed after a refusal we cannot attribute to the
@@ -1393,7 +1414,10 @@ const fn classify_refusal(error: &StreamError) -> RefusalVerdict {
         // about, and `BlobTooLarge` is deterministic for this blob. Asking this peer for
         // this hash again inside the TTL gets the same answer, so don't spend a candidate
         // slot finding out.
-        StreamError::EvictedSinceProbe | StreamError::BlobTooLarge => RefusalVerdict::DurableMiss,
+        StreamError::EvictedSinceProbe => {
+            RefusalVerdict::DurableMiss(DurableMissCause::EvictedSinceProbe)
+        }
+        StreamError::BlobTooLarge => RefusalVerdict::DurableMiss(DurableMissCause::BlobTooLarge),
         // Honest but NOT durable, and — for `NotFound` — not even attributable: see
         // `REFUSAL_SUPPRESSION_TTL`. `Overloaded` is backpressure, which the code's own
         // policy says to respect rather than punish; suppressing the peer for five
@@ -1829,9 +1853,18 @@ fn classify_pull_failure(
                     debug!(%provider_addr, %err, "node-origin: upstream reports itself degraded; scoring unreachable");
                     record_outcome(deps, pk, &Outcome::Unreachable);
                 }
-                RefusalVerdict::DurableMiss => {
+                RefusalVerdict::DurableMiss(cause) => {
+                    if cause == DurableMissCause::EvictedSinceProbe {
+                        // ADR 001 §Probe cache mandates tracking this rate; ADR 005
+                        // says a correct hold mechanism should make it rare, so a
+                        // sustained rate is a remote implementation bug, not a
+                        // tuning knob. `monitoring/grafana-dashboard.json` already
+                        // scrapes this panel — it has been reading a metric nobody
+                        // emitted (#1165).
+                        deps.metrics.probe_post_eviction_failure();
+                    }
                     suppress(None);
-                    debug!(%provider_addr, %err, "node-origin: upstream does not have this blob; negative-caching this (peer, hash) for the full TTL without tarring reputation");
+                    debug!(%provider_addr, ?cause, %err, "node-origin: upstream does not have this blob; negative-caching this (peer, hash) for the full TTL without tarring reputation");
                 }
                 RefusalVerdict::Transient => {
                     suppress(Some(REFUSAL_SUPPRESSION_TTL));
@@ -2229,10 +2262,16 @@ mod tests {
     fn only_a_durable_refusal_earns_the_full_suppression_ttl() {
         // A peer that truthfully says the blob is gone, or is over its ceiling, will say
         // the same thing in a minute. Worth the full TTL.
-        for error in [StreamError::EvictedSinceProbe, StreamError::BlobTooLarge] {
+        for (error, cause) in [
+            (
+                StreamError::EvictedSinceProbe,
+                DurableMissCause::EvictedSinceProbe,
+            ),
+            (StreamError::BlobTooLarge, DurableMissCause::BlobTooLarge),
+        ] {
             assert_eq!(
                 classify_refusal(&error),
-                RefusalVerdict::DurableMiss,
+                RefusalVerdict::DurableMiss(cause),
                 "{error:?} is a lasting fact about this (peer, hash)"
             );
         }
@@ -2338,7 +2377,10 @@ mod tests {
         for (error, want) in [
             (StreamError::NotFound, RefusalVerdict::Transient),
             (StreamError::Overloaded, RefusalVerdict::Transient),
-            (StreamError::EvictedSinceProbe, RefusalVerdict::DurableMiss),
+            (
+                StreamError::EvictedSinceProbe,
+                RefusalVerdict::DurableMiss(DurableMissCause::EvictedSinceProbe),
+            ),
             (StreamError::InternalError, RefusalVerdict::NodeFault),
         ] {
             // Exactly what the receive loops now raise — wrapped, because a real one comes
@@ -2355,6 +2397,23 @@ mod tests {
                 "a mid-stream {error:?} must be judged as a refusal, not fall to the catch-all"
             );
         }
+    }
+
+    /// ADR 001 §Probe cache mandates tracking the `EvictedSinceProbe` rate, and
+    /// ADR 005 explains why it is not just "a candidate failed": a peer emitting
+    /// it inside `PROBE_SLASH_WINDOW` has handed us slash evidence. Both causes
+    /// are `DurableMiss` — they say the same thing about the peer — but only one
+    /// is that signal, and a shared unpayloaded variant cannot tell them apart.
+    #[test]
+    fn only_an_eviction_carries_the_post_eviction_cause() {
+        assert_eq!(
+            classify_refusal(&StreamError::EvictedSinceProbe),
+            RefusalVerdict::DurableMiss(DurableMissCause::EvictedSinceProbe)
+        );
+        assert_eq!(
+            classify_refusal(&StreamError::BlobTooLarge),
+            RefusalVerdict::DurableMiss(DurableMissCause::BlobTooLarge)
+        );
     }
 
     /// The residual arm has to stay reachable — it is how a genuinely dead node gets
