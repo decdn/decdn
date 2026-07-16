@@ -47,7 +47,7 @@ use decdn_node::dht::{
 };
 use decdn_node::leech_governor::{LeechCaps, LeechCapsConfig, LeechGovernor};
 use decdn_node::metrics::Metrics;
-use decdn_node::node_origin::{NodeOrigin, NodeOriginConfig, NodeOriginDeps};
+use decdn_node::node_origin::{NodeOrigin, NodeOriginConfig, NodeOriginDeps, TeeVerdict};
 use decdn_node::probe_client::probe_once;
 use decdn_node::region_accounting::{RegionAccountant, RegionResolver};
 use decdn_node::selection::outer_pull_deadline;
@@ -9992,5 +9992,163 @@ async fn a_probe_cache_hit_still_honours_the_negative_cache() -> Result<()> {
     ep_a.close().await;
     task_n.abort();
     task_a.abort();
+    Ok(())
+}
+
+/// Task 6 (#1165): the window-paced path shares the probe cache with the buffered one — it
+/// must, because it shares the chokepoint that fills it (`probe_and_rank`). A path that
+/// populates the cache and never reads it pays the write cost for someone else's benefit.
+///
+/// `Origin::fetch` (buffered) runs first and writes the cache; `open_progressive_pull`
+/// (window-paced) for the SAME hash must then reuse it — no second probe at the wire — while
+/// still delivering the payload.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::expect_used, clippy::too_many_lines)] // test setup; failures should panic loudly
+async fn a_progressive_pull_reuses_a_probe_cache_entry_written_by_a_buffered_fetch() -> Result<()> {
+    let payload = vec![0x1Bu8; PAYLOAD_LEN];
+    let hash = Hash::new(&payload);
+    let total_bytes = u64::try_from(PAYLOAD_LEN).unwrap_or(u64::MAX);
+
+    // --- Node A: holds the blob; serves probe + client, counting probes. ------
+    let (cache_a, hash_a, _tmp_a) = cache_with_blob(&payload).await?;
+    anyhow::ensure!(hash_a == hash, "fixture hash mismatch");
+    let a_sk = fresh_key();
+    let a_id = a_sk.public();
+    let a_eth = Arc::new(PrivateKeySigner::random());
+    let b_buyer = Arc::new(PrivateKeySigner::random());
+    let channel_id = B256::repeat_byte(0x1B);
+    let store_a = Arc::new(MemoryChannelStateStore::new());
+    store_a.record(&ChannelState::new(
+        channel_id,
+        b_buyer.address(),
+        TOKEN,
+        U256::from(DEPOSIT_MICRO_USDC),
+    ))?;
+    let metrics_a = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics_a);
+    let domains = HandlerDomains {
+        slash: slash_domain(),
+        voucher: voucher_dom(),
+        binding: binding_dom(),
+    };
+    let handler_a = build_handler_full(
+        a_id,
+        &a_eth,
+        &metrics_a,
+        limiter,
+        cache_a,
+        store_a as Arc<dyn ChannelStateStore>,
+        RATE,
+        &domains,
+        0,
+        16,
+    )?;
+    let (ep_a, addr_a) =
+        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    let probes = Arc::new(AtomicUsize::new(0));
+    let task_a = spawn_a_probe_counting_server(
+        ep_a.clone(),
+        handler_a,
+        Arc::clone(&a_eth),
+        slash_domain(),
+        total_bytes,
+        RATE,
+        Arc::clone(&probes),
+    );
+
+    // --- Node B: dial-only endpoint hosting the NodeOrigin. -------------------
+    let b_sk = fresh_key();
+    let b_id = b_sk.public();
+    let (ep_b, _addr_b) = local_endpoint(b_sk, vec![]).await?;
+    let _ = probe_once(
+        &ep_b,
+        EndpointAddr::new(a_id).with_ip_addr(addr_a),
+        *hash.as_bytes(),
+        1,
+        false,
+        None,
+        Duration::from_secs(10),
+    )
+    .await?;
+    // The priming dial above is itself a real probe against A's counting server
+    // — reset so the counter below measures only the pulls under test.
+    probes.store(0, Ordering::SeqCst);
+
+    let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
+    let obs_buffer = Arc::new(ObservationBuffer::new());
+    let b_metrics = Arc::new(Metrics::new());
+    let (providers, addr_map) =
+        one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
+    let (origin, _recorded) = provisioned_origin(
+        &ep_b,
+        DhtNodeId::from_bytes(*b_id.as_bytes()),
+        hash,
+        channel_id,
+        &b_buyer,
+        &local_rep,
+        &obs_buffer,
+        &b_metrics,
+        providers,
+        addr_map,
+    );
+
+    // The buffered fetch: cold path. Probes A once and writes the probe cache at
+    // `probe_and_rank`'s tail.
+    let first = Origin::fetch(&origin, hash, u64::MAX)
+        .await
+        .map_err(|e| anyhow::anyhow!("buffered fetch: {e}"))?
+        .collect_to_bytes()
+        .await?;
+    anyhow::ensure!(
+        first.is_some_and(|b| b.as_ref() == payload.as_slice()),
+        "the buffered fetch must deliver the blob"
+    );
+    anyhow::ensure!(
+        probes.load(Ordering::SeqCst) == 1,
+        "the buffered fetch must probe"
+    );
+    assert_counter(&b_metrics, "probe_cache_misses_total", 1)?;
+
+    // The window-paced pull for the SAME hash must hit the cache the buffered
+    // fetch just wrote and send NO new probe.
+    let (header, mut pull) =
+        tokio::time::timeout(Duration::from_secs(10), origin.open_progressive_pull(hash))
+            .await
+            .map_err(|_| anyhow::anyhow!("open_progressive_pull never returned"))?
+            .ok_or_else(|| anyhow::anyhow!("expected an open against the cached candidate"))?;
+    anyhow::ensure!(
+        probes.load(Ordering::SeqCst) == 1,
+        "the progressive pull re-probed A — the probe cache saved nothing, which is the \
+         entire point of Task 6 (#1165), got {} probes",
+        probes.load(Ordering::SeqCst)
+    );
+    assert_counter(&b_metrics, "probe_cache_hits_total", 1)?;
+    assert_counter(&b_metrics, "probe_cache_misses_total", 1)?;
+    // ONE orchestration per call, however many candidate lists it walks — same
+    // contract as the buffered path.
+    assert_counter(&b_metrics, "node_pull_attempts_total", 2)?;
+
+    let mut wire = Vec::new();
+    while let Some(chunk) = pull
+        .next_chunk()
+        .await
+        .map_err(|e| anyhow::anyhow!("next_chunk: {e}"))?
+    {
+        wire.extend_from_slice(&chunk);
+    }
+    let decoded = decode_bao_whole(hash, header.total_bytes, &wire).ok_or_else(|| {
+        anyhow::anyhow!("the progressive pull delivered a stream that did not verify")
+    })?;
+    anyhow::ensure!(
+        decoded == payload,
+        "the progressive pull delivered the wrong bytes"
+    );
+    pull.finish(TeeVerdict::Verified)
+        .await
+        .map_err(|e| anyhow::anyhow!("pull finish: {e}"))?;
+
+    ep_b.close().await;
+    ep_a.close().await;
+    task_a.await?;
     Ok(())
 }

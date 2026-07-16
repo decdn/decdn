@@ -387,12 +387,15 @@ impl NodeOrigin {
 
     /// Open a window-paced progressive pull for `hash` (#856), the streaming
     /// counterpart of [`Origin::fetch`]'s buffered pull. Runs the same
-    /// discover → probe → rank → open-channel pipeline, but instead of buffering
-    /// the whole blob it returns the upstream header (so the caller can sign its
-    /// own `StreamResponse`) and a live [`NodeProgressivePull`] the caller drives
-    /// chunk-by-chunk — forwarding each chunk to the paying downstream client and
-    /// teeing it into the cache — so per-request speculative exposure is bounded
-    /// to the caller's window rather than the entire upstream cost.
+    /// cached-first discover → probe → rank → open-channel pipeline (ADR 001
+    /// §Probe cache — this path shares the cache with the buffered one, since
+    /// both feed off the same `probe_and_rank` chokepoint), but instead of
+    /// buffering the whole blob it returns the upstream header (so the caller
+    /// can sign its own `StreamResponse`) and a live [`NodeProgressivePull`] the
+    /// caller drives chunk-by-chunk — forwarding each chunk to the paying
+    /// downstream client and teeing it into the cache — so per-request
+    /// speculative exposure is bounded to the caller's window rather than the
+    /// entire upstream cost.
     ///
     /// Candidate fallback happens at OPEN time only: it walks the ranked
     /// candidates until one successfully opens (handshake + verified response),
@@ -405,15 +408,52 @@ impl NodeOrigin {
     ) -> Option<(UpstreamPullHeader, NodeProgressivePull)> {
         let deps = self.deps.get()?;
         let hash_bytes = *hash.as_bytes();
+        let target = DhtHash::from_bytes(hash_bytes);
+        // ONE budget for the whole call, spent across both phases — see `Origin::fetch`'s
+        // twin of this flow.
+        let mut budget = MAX_PROVIDER_ATTEMPTS;
+        // Mirrors `Origin::fetch`'s `attempt_metered`: one orchestration per call however
+        // many candidate lists it walks.
+        let mut attempt_metered = false;
+
+        // ADR 001 §Probe cache: "On a cache miss the requester checks the probe cache
+        // first; if a valid entry exists, it skips DHT lookup and goes straight to
+        // selection."
+        if let Some(cached) = cached_candidates(deps, target).await {
+            deps.metrics.probe_cache_hit();
+            deps.metrics.node_pull_attempt();
+            attempt_metered = true;
+            let (opened, attempts) = self
+                .open_from_candidates(deps, &cached, hash_bytes, budget)
+                .await;
+            if let Some(opened) = opened {
+                return Some(opened);
+            }
+            budget = budget.saturating_sub(attempts);
+            // Every cached provider failed to open. Disproved by an actual pull attempt,
+            // which outranks a probe — drop the entry rather than let it keep hitting.
+            deps.probe_cache.invalidate(&target);
+            if budget == 0 {
+                debug!(%hash, "node-origin: probe-cache candidates exhausted the attempt budget");
+                return None;
+            }
+        } else {
+            deps.metrics.probe_cache_miss();
+        }
+
+        // ADR 001 §Probe cache: "if all fail, run a fresh DHT lookup + probe."
         let providers = discover(deps, hash_bytes).await;
         if providers.is_empty() {
             deps.metrics.node_pull_no_providers();
             debug!(%hash, "node-origin: no providers discovered for window-paced pull");
             return None;
         }
-        deps.metrics.node_pull_attempt();
+        if !attempt_metered {
+            deps.metrics.node_pull_attempt();
+        }
+        // Writes the probe cache at its tail.
         let ranked = probe_and_rank(deps, providers, hash_bytes).await;
-        self.open_from_candidates(deps, &ranked, hash_bytes, MAX_PROVIDER_ATTEMPTS)
+        self.open_from_candidates(deps, &ranked, hash_bytes, budget)
             .await
             .0
     }
