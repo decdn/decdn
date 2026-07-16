@@ -216,7 +216,8 @@ impl GossipService {
     ///
     /// `staked` gates `NodeAnnounce` admission to currently-staked nodes (ADR 001
     /// rule 2). The runtime always passes `Some(live registry set)`; `None`
-    /// (accept any signature-valid announce) is for tests and unstaked modes.
+    /// (accept any signature-valid announce) is for tests only — there is no
+    /// production path that disables the gate.
     #[allow(
         clippy::too_many_arguments,
         clippy::needless_pass_by_value,
@@ -1472,7 +1473,7 @@ mod tests {
         }
         struct Staked;
         impl StakedNodeSet for Staked {
-            fn contains(&self, _reporter: &[u8; 32]) -> bool {
+            fn contains(&self, _node_id: &[u8; 32]) -> bool {
                 true
             }
         }

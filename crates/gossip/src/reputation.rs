@@ -298,13 +298,13 @@ mod tests {
 
     struct AllStaked;
     impl StakedNodeSet for AllStaked {
-        fn contains(&self, _reporter: &[u8; 32]) -> bool {
+        fn contains(&self, _node_id: &[u8; 32]) -> bool {
             true
         }
     }
     struct NoneStaked;
     impl StakedNodeSet for NoneStaked {
-        fn contains(&self, _reporter: &[u8; 32]) -> bool {
+        fn contains(&self, _node_id: &[u8; 32]) -> bool {
             false
         }
     }

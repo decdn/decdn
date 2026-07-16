@@ -137,8 +137,8 @@ const _: () = assert!(
 /// author `node_id` is a currently-staked node in the on-chain registry
 /// (queried through the live [`StakedNodeSet`] cache, kept fresh by the
 /// registry event tail). `None` disables the check — accept any
-/// signature-valid announce — and exists only for tests and for
-/// unstaked/subscribe-only modes; the runtime always passes `Some`. Note the
+/// signature-valid announce — and exists only for tests; the runtime always
+/// passes `Some` (there is no production path that disables the gate). Note the
 /// empty-set semantics: a `Some` set with no members rejects every announce,
 /// which is correct — an empty active registry has no staked peers to learn.
 pub fn validate_envelope(
