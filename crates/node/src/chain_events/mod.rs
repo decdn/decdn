@@ -14,24 +14,37 @@
 //! confirmation lag and no knob for one: a `WatcherConfig::confirmations` field
 //! existed, documented a `head - confirmations` bound, and was passed `0` by all
 //! six watchers — so it never lagged anything, while its doc claimed otherwise
-//! (#1227). Reading from the unstable tip is safe here for two reasons:
+//! (#1227).
 //!
-//! - **Every sink is idempotent under re-scan.** `resumable_watcher`'s module
-//!   doc does not merely observe this, it *requires* it (dedup by id / set
-//!   insertion / authoritative re-read) — the retry and reorg-rewind paths
-//!   already re-deliver logs. A re-mined event is therefore re-applied
-//!   harmlessly, which is the same property a confirmation lag would buy.
-//! - **Reorgs on the target chain are shallow.** See `backfill`'s
-//!   `REORG_MARGIN_BLOCKS`, which carries the sizing rationale for an
-//!   Arbitrum-Sepolia-class L2 and is the single place that claim lives.
+//! Two distinct things can go wrong at the unstable tip, and re-scan idempotency
+//! covers only one of them:
 //!
-//! The two `CursorPolicy::Persisted` watchers additionally rewind `reorg_margin`
-//! blocks on resume, covering a shallow reorg *across* a restart — the case
-//! re-scan idempotency alone cannot reach, because the cursor is durable.
+//! - **Re-delivery of a canonical log.** Covered. The retry and reorg-rewind
+//!   paths already re-deliver, so `resumable_watcher`'s module doc does not
+//!   merely observe sink idempotency, it *requires* it (dedup by id / set
+//!   insertion / authoritative re-read). A re-mined event is re-applied
+//!   harmlessly.
+//! - **A log that never becomes canonical.** *Not* covered, and not the same
+//!   property: idempotency makes a repeated apply cheap, whereas a confirmation
+//!   lag would prevent the apply happening at all. `eth_getLogs` returns only
+//!   canonical logs, so no sink ever observes a removal and none has an un-apply
+//!   path. An event from an orphaned block therefore stays applied.
 //!
-//! The concrete cost of a lag is why it is zero rather than merely unnecessary:
-//! it would delay channel registration by `confirmations` blocks, so a client's
-//! first request on a freshly-opened channel would be rejected as unknown.
+//! That second case is an accepted residual, not a solved problem. It is
+//! accepted because reorgs on the target chain are shallow and rare (see
+//! `backfill`'s `REORG_MARGIN_BLOCKS`, which carries the sizing rationale for an
+//! Arbitrum-Sepolia-class L2 and is the single place that claim lives), and
+//! because the sinks holding an authoritative on-chain enumeration source
+//! re-read it and self-heal. The two without one are where an orphan sticks:
+//! settlement's `register_open_channel` (durable — an fsynced phantom channel,
+//! reclaimed only by the expiry sweep) and reputation's settlement accumulator
+//! (in-memory, so a reboot clears it). Both predate #1227 and are unchanged by
+//! it — deleting an always-zero field cannot alter what a lag never did.
+//!
+//! For the settlement watcher specifically, a lag also carries a concrete cost,
+//! which is what makes zero an active choice there rather than an inherited one:
+//! it would delay channel registration, so a client's first request on a
+//! freshly-opened channel would be rejected as unknown.
 //!
 //! If a future chain needs a lag, reintroduce it as a config knob with a
 //! **non-zero default and a test asserting a live production config engages

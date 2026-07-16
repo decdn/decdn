@@ -24,10 +24,17 @@ use anyhow::Result;
 /// Reachable only from [`resumable_watcher::CursorPolicy::Persisted`], the
 /// variant that carries it (#1227) — it is the rewind applied to a *durable*
 /// cursor, and the `HeadMinusWindow` / `FullReplay` watchers re-derive their
-/// floor from head on every boot, so there is nothing to rewind. Its two
-/// consumers are the settlement watcher ([`crate::payment_settlement`], #751)
-/// and the origin directory ([`crate::dht::chain_origin_directory`]); shared so
-/// they can't fork the sizing rationale.
+/// floor from head on every boot, so there is nothing to rewind.
+///
+/// Its one live consumer is the settlement watcher
+/// ([`crate::payment_settlement`], #751). The origin directory
+/// ([`crate::dht::chain_origin_directory`]) also constructs a `Persisted` policy
+/// carrying this value, but never reads it: it seeds its cursor from its
+/// bootstrap snapshot block, and a seeded cursor bypasses floor derivation
+/// entirely (see `WatcherConfig::seed_cursor`), so its resume floor is the raw
+/// checkpoint with no rewind. That dead field is pre-existing and needs
+/// `CursorPolicy`'s persistence and floor-derivation axes split apart to remove
+/// (#1238); do not read it as evidence the margin applies there.
 ///
 /// [`resumable_watcher::CursorPolicy::Persisted`]: super::resumable_watcher::CursorPolicy
 pub(crate) const REORG_MARGIN_BLOCKS: u64 = 128;

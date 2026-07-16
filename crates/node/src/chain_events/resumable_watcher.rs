@@ -67,8 +67,16 @@ pub(crate) enum CursorPolicy {
         /// Lives in this variant rather than on [`WatcherConfig`] because only
         /// this arm reads it: it is the rewind applied to a *durable* cursor,
         /// and the other two policies re-derive their floor from head on every
-        /// boot. As a `WatcherConfig` field it was inert for three of the six
-        /// watchers, which passed a real 128 into something that never read it.
+        /// boot. As a `WatcherConfig` field it was inert for five of the six
+        /// watchers — four of which passed a real 128 into something that never
+        /// read it (#1227).
+        ///
+        /// Moving it here shrinks that to two sites but does not fully close it:
+        /// a [`WatcherConfig::seed_cursor`] watcher never resolves a floor, so
+        /// the origin directory still carries a margin it cannot read. Only the
+        /// settlement watcher actually rewinds. Splitting this variant's
+        /// persistence and floor-derivation axes is what would make that
+        /// unrepresentable (#1238).
         reorg_margin: u64,
     },
     /// Re-derive the floor from head each boot as `head - window_blocks`
@@ -729,6 +737,45 @@ mod tests {
             none_fallback,
             reorg_margin: MARGIN,
         }
+    }
+
+    /// The configured `reorg_margin` actually reaches `resolve_persisted_start`
+    /// — the *wiring*, not the arithmetic.
+    ///
+    /// Nothing else covers this seam, which is why it exists. The seven
+    /// `resolve_persisted_start` tests call that pure fn directly, so they prove
+    /// the rewind *given* a margin. The `cursor_policy` pins prove settlement's
+    /// production config *carries* `REORG_MARGIN_BLOCKS`. Neither proves
+    /// `initial_from` hands one to the other: hard-coding `0` at that call site
+    /// passed the entire suite. Two legs of three — the same shape that let
+    /// #1227 ship documented-but-disabled, one field over.
+    ///
+    /// Every other `Persisted` test reaches the `None` arm (a `FailingLoadStore`
+    /// or an empty store), which ignores the margin entirely; only a stored
+    /// `Some(checkpoint)` exercises the rewind. The three constants are mutually
+    /// distinct so an argument-order slip among `resolve_persisted_start`'s
+    /// consecutive `u64`s fails here too.
+    #[test]
+    fn persisted_initial_from_engages_the_configured_margin() {
+        const CHECKPOINT: u64 = 10_000;
+        const HEAD: u64 = 20_000;
+        const FROM_BLOCK: u64 = 500;
+
+        let store = Arc::new(MemoryCheckpointStore::default());
+        let recorded = store.record_checkpoint(CheckpointKey::ChannelOpened, CHECKPOINT);
+        assert!(recorded.is_ok(), "seeding the checkpoint must succeed");
+        let policy = CursorPolicy::Persisted {
+            store,
+            key: CheckpointKey::ChannelOpened,
+            none_fallback: NoneFallback::Head,
+            reorg_margin: MARGIN,
+        };
+
+        assert_eq!(
+            policy.initial_from(FROM_BLOCK, HEAD).unwrap_or(u64::MAX),
+            CHECKPOINT - MARGIN,
+            "a resumed floor must be rewound by the policy's own reorg_margin"
+        );
     }
 
     #[test]
