@@ -21,14 +21,13 @@ use anyhow::Result;
 /// few extra blocks of `eth_getLogs`. Sized for the shallow reorgs of an
 /// Arbitrum-Sepolia-class L2.
 ///
-/// Only [`resumable_watcher::CursorPolicy::Persisted`] reads this (via
-/// `resolve_persisted_start`) — it is the rewind applied to a *durable* cursor,
-/// so it is inert for the `HeadMinusWindow` / `FullReplay` watchers, which
-/// re-derive their floor from head on every boot. The two consumers that
-/// actually rewind are therefore the settlement watcher
-/// ([`crate::payment_settlement`], #751) and the origin directory
-/// ([`crate::dht::chain_origin_directory`]); shared so they can't fork the
-/// sizing rationale.
+/// Reachable only from [`resumable_watcher::CursorPolicy::Persisted`], the
+/// variant that carries it (#1227) — it is the rewind applied to a *durable*
+/// cursor, and the `HeadMinusWindow` / `FullReplay` watchers re-derive their
+/// floor from head on every boot, so there is nothing to rewind. Its two
+/// consumers are the settlement watcher ([`crate::payment_settlement`], #751)
+/// and the origin directory ([`crate::dht::chain_origin_directory`]); shared so
+/// they can't fork the sizing rationale.
 ///
 /// [`resumable_watcher::CursorPolicy::Persisted`]: super::resumable_watcher::CursorPolicy
 pub(crate) const REORG_MARGIN_BLOCKS: u64 = 128;

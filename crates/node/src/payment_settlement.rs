@@ -271,11 +271,17 @@ impl<P: Provider + Clone + 'static> PaymentChannelService<P> {
         // The backfill floor and downtime-gap resume (#751/#762) are now the
         // cursor policy's job: a persisted `ChannelOpened` checkpoint resumes
         // across restarts; a first-ever boot (`none_fallback: Head`) scans from
-        // head, so nothing predating the node is chased. `confirmations = 0`
-        // keeps channel-registration latency minimal (a shallow reorg is covered
-        // by the resume `reorg_margin` and the sink's idempotent
-        // `register_open_channel`). The closing-reconciliation backfill (#839) is
-        // subsumed: `ChannelCloseInitiated` logs flow through the same scan.
+        // head, so nothing predating the node is chased. The closing-
+        // reconciliation backfill (#839) is subsumed: `ChannelCloseInitiated`
+        // logs flow through the same scan.
+        //
+        // This watcher's scan runs to head with no confirmation lag, as they all
+        // do — see `chain_events`' module doc, which now carries that rationale
+        // (this was the only one of six sites that stated it, #1227). The cost
+        // that makes it load-bearing *here* specifically: a lag would delay
+        // channel registration, so a client's first request on a fresh channel
+        // would be rejected as unknown. A shallow reorg is covered by the resume
+        // `reorg_margin` and the sink's idempotent `register_open_channel`.
         let watcher_shutdown = CancellationToken::new();
         let sink = SettlementSink {
             contract: contract.clone(),
@@ -297,8 +303,6 @@ impl<P: Provider + Clone + 'static> PaymentChannelService<P> {
                 ]),
             from_block: 0,
             poll_interval: event_poll_interval,
-            confirmations: 0,
-            reorg_margin: REORG_MARGIN_BLOCKS,
             max_backfill_span: MAX_BACKFILL_BLOCK_SPAN,
             cursor: cursor_policy(Arc::clone(&checkpoint_store)),
             initial_backoff: WATCHER_INITIAL_BACKOFF,
@@ -897,11 +901,15 @@ async fn reconcile_closing_channel<P: Provider + Clone>(
 /// there is no history to replay. Pinned by a test: swapping the fallback to
 /// `FromBlock` full-scans chain history on every fresh node (`from_block` is
 /// `0` here), and swapping the key forfeits the persisted resume.
+///
+/// The `reorg_margin` rewind lives here too: it is only meaningful against a
+/// durable cursor, so [`CursorPolicy::Persisted`] owns it (#1227).
 fn cursor_policy(store: Arc<dyn KeyedCheckpointStore>) -> CursorPolicy {
     CursorPolicy::Persisted {
         store,
         key: CheckpointKey::ChannelOpened,
         none_fallback: NoneFallback::Head,
+        reorg_margin: REORG_MARGIN_BLOCKS,
     }
 }
 
@@ -2207,6 +2215,13 @@ mod tests {
     /// floor and anchors a first-ever boot at head. A `FromBlock` fallback here
     /// would full-scan chain history on every fresh node (settlement's
     /// `from_block` is 0); a different key forfeits the #751 resume.
+    ///
+    /// Also pins the reorg rewind at the shared `REORG_MARGIN_BLOCKS`. This
+    /// asserts the value the *production* config carries, which is the point:
+    /// the deleted `scan_upper_bound_lags_by_confirmations` passed for the life
+    /// of #1227 because it tested the arithmetic against a value no config ever
+    /// supplied. A rewind of `0` here would silently forfeit the shallow-reorg
+    /// coverage on resume.
     #[test]
     fn cursor_policy_is_persisted_channel_opened_head_fallback() {
         let store: Arc<dyn KeyedCheckpointStore> = Arc::new(RecordingCheckpointStore::default());
@@ -2215,6 +2230,7 @@ mod tests {
             CursorPolicy::Persisted {
                 key: CheckpointKey::ChannelOpened,
                 none_fallback: NoneFallback::Head,
+                reorg_margin: REORG_MARGIN_BLOCKS,
                 ..
             }
         ));

@@ -7,6 +7,36 @@
 //! which the default public Arbitrum Sepolia RPC and most keyless endpoints
 //! reject with `-32601` (#1106). No `watch_logs`/`eth_newFilter` call remains on
 //! the node's hot path.
+//!
+//! # Watchers scan to head, deliberately
+//!
+//! Every watcher's scan upper bound is the head block itself. There is no
+//! confirmation lag and no knob for one: a `WatcherConfig::confirmations` field
+//! existed, documented a `head - confirmations` bound, and was passed `0` by all
+//! six watchers — so it never lagged anything, while its doc claimed otherwise
+//! (#1227). Reading from the unstable tip is safe here for two reasons:
+//!
+//! - **Every sink is idempotent under re-scan.** `resumable_watcher`'s module
+//!   doc does not merely observe this, it *requires* it (dedup by id / set
+//!   insertion / authoritative re-read) — the retry and reorg-rewind paths
+//!   already re-deliver logs. A re-mined event is therefore re-applied
+//!   harmlessly, which is the same property a confirmation lag would buy.
+//! - **Reorgs on the target chain are shallow.** See `backfill`'s
+//!   `REORG_MARGIN_BLOCKS`, which carries the sizing rationale for an
+//!   Arbitrum-Sepolia-class L2 and is the single place that claim lives.
+//!
+//! The two `CursorPolicy::Persisted` watchers additionally rewind `reorg_margin`
+//! blocks on resume, covering a shallow reorg *across* a restart — the case
+//! re-scan idempotency alone cannot reach, because the cursor is durable.
+//!
+//! The concrete cost of a lag is why it is zero rather than merely unnecessary:
+//! it would delay channel registration by `confirmations` blocks, so a client's
+//! first request on a freshly-opened channel would be rejected as unknown.
+//!
+//! If a future chain needs a lag, reintroduce it as a config knob with a
+//! **non-zero default and a test asserting a live production config engages
+//! it** — not a silently-zero field whose unit test exercises the arithmetic
+//! rather than the wiring.
 
 pub(crate) mod backfill;
 pub(crate) mod resumable_watcher;

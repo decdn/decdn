@@ -356,8 +356,6 @@ impl ChainOriginDirectory {
                 ]),
             from_block,
             poll_interval: event_poll_interval,
-            confirmations: 0,
-            reorg_margin: REORG_MARGIN_BLOCKS,
             max_backfill_span: MAX_BACKFILL_BLOCK_SPAN,
             cursor: cursor_policy(checkpoint_store),
             initial_backoff: WATCHER_INITIAL_BACKOFF,
@@ -574,11 +572,15 @@ impl<P: Provider + Clone> OriginSink<P> {
 /// that predates the node. (In steady state `bootstrap` seeds the live cursor
 /// at its snapshot block, so the fallback governs only a checkpoint-less start
 /// of the poller itself.)
+///
+/// The `reorg_margin` rewind lives here too: it is only meaningful against a
+/// durable cursor, so [`CursorPolicy::Persisted`] owns it (#1227).
 fn cursor_policy(store: Arc<dyn KeyedCheckpointStore>) -> CursorPolicy {
     CursorPolicy::Persisted {
         store,
         key: CheckpointKey::Origin,
         none_fallback: NoneFallback::FromBlock,
+        reorg_margin: REORG_MARGIN_BLOCKS,
     }
 }
 
@@ -1751,6 +1753,7 @@ mod tests {
             CursorPolicy::Persisted {
                 key: CheckpointKey::Origin,
                 none_fallback: NoneFallback::FromBlock,
+                reorg_margin: REORG_MARGIN_BLOCKS,
                 ..
             }
         ));

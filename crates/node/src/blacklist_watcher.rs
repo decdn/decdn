@@ -75,8 +75,7 @@ use tracing::{debug, info, warn};
 use crate::chain_events::resumable_watcher::{self, CursorPolicy, LogSink, WatcherConfig};
 use crate::chain_events::shared_head::HeadSource;
 use crate::chain_events::{
-    MAX_BACKFILL_BLOCK_SPAN, REORG_MARGIN_BLOCKS, WATCHER_INITIAL_BACKOFF, WATCHER_MAX_BACKOFF,
-    timed,
+    MAX_BACKFILL_BLOCK_SPAN, WATCHER_INITIAL_BACKOFF, WATCHER_MAX_BACKOFF, timed,
 };
 
 /// Mutable deny-set carried across poll ticks. The scan cursor lives on the
@@ -240,8 +239,6 @@ pub(crate) async fn run<P>(
         ]),
         from_block,
         poll_interval: event_poll_interval.max(Duration::from_secs(1)),
-        confirmations: 0,
-        reorg_margin: REORG_MARGIN_BLOCKS,
         max_backfill_span: MAX_BACKFILL_BLOCK_SPAN,
         cursor: cursor_policy(from_block),
         initial_backoff: WATCHER_INITIAL_BACKOFF,

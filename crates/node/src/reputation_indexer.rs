@@ -54,8 +54,7 @@ use crate::metrics::Metrics;
 // silently diverge.
 use crate::chain_events::shared_head::HeadSource;
 use crate::chain_events::{
-    AbortOnDrop, MAX_BACKFILL_BLOCK_SPAN, REORG_MARGIN_BLOCKS, WATCHER_INITIAL_BACKOFF,
-    WATCHER_MAX_BACKOFF, timed,
+    AbortOnDrop, MAX_BACKFILL_BLOCK_SPAN, WATCHER_INITIAL_BACKOFF, WATCHER_MAX_BACKOFF, timed,
 };
 use crate::reputation_wiring::NodeSettlementSource;
 
@@ -113,8 +112,6 @@ impl SettlementIndexer {
                 ]),
             from_block: 0,
             poll_interval: event_poll_interval,
-            confirmations: 0,
-            reorg_margin: REORG_MARGIN_BLOCKS,
             max_backfill_span: MAX_BACKFILL_BLOCK_SPAN,
             // Bounded recent lookback each boot (in-memory rebuild; no durable
             // cursor); the live tail then flows forward from there.
