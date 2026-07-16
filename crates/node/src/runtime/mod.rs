@@ -725,6 +725,15 @@ pub async fn run(
         ProviderBuilder::new().connect_http(rpc_url.clone()),
         event_poll_interval,
     ));
+    // Graceful-shutdown tokens for the three watchers that previously minted one
+    // inline and dropped it, leaving nothing able to cancel them (#1230). Minted
+    // unconditionally so the cancels in the shutdown sequence are unconditional
+    // too — cancelling a token no watcher ever received is a no-op, which is
+    // cheaper than threading an `Option` through for the reputation indexer's
+    // `subscribe_reputation` gate.
+    let capacity_bond_watcher_shutdown = CancellationToken::new();
+    let slash_watcher_shutdown = CancellationToken::new();
+    let reputation_indexer_shutdown = CancellationToken::new();
     // One CapacityBond enumeration + one watcher feeding both registry
     // projections (#1110). The bindings half is built only when pull-through is
     // on; it derives from page data already read here, so — unlike when it had its
@@ -738,6 +747,7 @@ pub async fn run(
         Arc::clone(&head),
         cfg.cache.node_to_node_pull_through_enabled,
         Arc::clone(&node_metrics),
+        capacity_bond_watcher_shutdown.clone(),
     )
     .await
     .with_context(|| format!("CapacityBond registry bootstrap at {capacity_bond_addr}"))?;
@@ -762,6 +772,7 @@ pub async fn run(
         event_poll_interval,
         Arc::clone(&head),
         Arc::clone(&node_metrics),
+        slash_watcher_shutdown.clone(),
     );
     let slash_store = slash_watcher.store();
 
@@ -1831,6 +1842,7 @@ pub async fn run(
             event_poll_interval,
             Arc::clone(&head),
             Arc::clone(&node_metrics),
+            reputation_indexer_shutdown.clone(),
         )
         .await
         {
@@ -2101,6 +2113,26 @@ pub async fn run(
         tracing::warn!(%err, "router shutdown reported an error");
     }
     gossip_shutdown.cancel();
+    // The three watchers that had no cancel path before #1230, stopped here for
+    // the same reason gossip is: cooperative exit of an infinite loop at its
+    // next await, once nothing depends on it any more.
+    //
+    // *After* `router.shutdown` deliberately, and the capacity-bond one is why:
+    // its projection is the cached active-staker set, which gates DHT `Store`
+    // admission and decides which probes the stake-lane reservation sheds.
+    // Cancelling it before the drain would freeze that set while the router is
+    // still serving, so a membership change landing mid-drain would be missed
+    // by exactly the requests still in flight. Slash and the reputation indexer
+    // are not consulted by the serve path and could stop earlier, but they stop
+    // here too — one cancel site for the shared `capacity-bond`-era watchers is
+    // easier to keep correct than three orderings each justified separately.
+    //
+    // None of the three persists a cursor, so unlike `origin_watcher_shutdown`
+    // above there is no checkpoint to flush and no deadline this must beat: the
+    // cancel buys a clean exit, and `AbortOnDrop` remains the backstop.
+    capacity_bond_watcher_shutdown.cancel();
+    slash_watcher_shutdown.cancel();
+    reputation_indexer_shutdown.cancel();
     // Cancel any in-flight background cache-fill tasks (#859): the router has
     // drained, so warming the cache for future requests is moot. They observe
     // the token at their next await and exit; being advisory, they are not

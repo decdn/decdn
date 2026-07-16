@@ -217,6 +217,20 @@ pub(crate) struct WatcherConfig {
     /// which carries its own timeout.
     pub(crate) rpc_call_timeout: Option<Duration>,
     /// Cancelled on graceful shutdown; flushes the checkpoint and returns.
+    ///
+    /// Must be a token some owner actually cancels — the runtime for five of the
+    /// six watchers, and the owning service for settlement (which cancels its
+    /// own before the channel-close deadline, an ordering only it knows). That
+    /// this field is a `CancellationToken` and not an `Option` enforces only
+    /// *presence*, which was never the problem: three watchers used to construct
+    /// one inline and drop it, so the token was present and inert, and every
+    /// branch below was unreachable (#1230).
+    ///
+    /// Liveness is a property of the surrounding program and no type expresses
+    /// it, so the enforcement is the `bootstrap` signatures: each takes a token
+    /// rather than minting one, which makes `CancellationToken::new()` greppable
+    /// to the runtime and to `payment_settlement`'s deliberate self-mint. It is
+    /// not a proof — reviewing a change to the shutdown *sequence* is.
     pub(crate) shutdown: CancellationToken,
     /// Explicit starting cursor (origin's bootstrap snapshot head). When set,
     /// the first tick scans from here instead of resolving the policy floor.
@@ -554,6 +568,49 @@ mod tests {
         }
     }
 
+    /// A store that counts `flush_checkpoint` calls.
+    ///
+    /// `MemoryCheckpointStore` takes the trait's default no-op flush, so it
+    /// cannot observe one — and `KeyedCheckpointStore::flush_checkpoint`
+    /// defaulting to a no-op is exactly why a watcher whose flush never runs
+    /// looks fine in every other test.
+    #[derive(Default)]
+    struct FlushCountingStore {
+        flushes: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FlushCountingStore {
+        fn flushes(&self) -> usize {
+            self.flushes.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl KeyedCheckpointStore for FlushCountingStore {
+        fn load_checkpoint(
+            &self,
+            _key: CheckpointKey,
+        ) -> std::result::Result<Option<u64>, decdn_incentive::StoreError> {
+            Ok(None)
+        }
+
+        fn record_checkpoint(
+            &self,
+            _key: CheckpointKey,
+            _block: u64,
+        ) -> std::result::Result<(), decdn_incentive::StoreError> {
+            Ok(())
+        }
+
+        fn flush_checkpoint(
+            &self,
+            _key: CheckpointKey,
+        ) -> std::result::Result<(), decdn_incentive::StoreError> {
+            self.flushes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
     /// Sink scripted to fail on the N-th apply (0-indexed), counting deliveries.
     struct ScriptedSink {
         applied: usize,
@@ -728,6 +785,130 @@ mod tests {
         );
         assert_eq!(cursor, None, "a tick that never read head advances nothing");
         assert_eq!(sink.applied, 0);
+    }
+
+    /// Cancelling the shutdown token makes `run` flush the checkpoint and
+    /// return.
+    ///
+    /// This is the mechanism the whole graceful-shutdown path rests on, and
+    /// nothing exercised it: every other test here drives `run_tick` directly,
+    /// so `run`'s two flush arms and `CursorPolicy::flush` had no coverage at
+    /// all. That gap is what let three watchers ship with a token nothing could
+    /// cancel (#1230) — an unreachable branch looks no different from a
+    /// reachable one when neither is tested.
+    ///
+    /// `run` is spawned rather than awaited: it loops until cancelled, so a
+    /// bare `.await` would hang forever on success.
+    #[tokio::test(start_paused = true)]
+    async fn cancelling_shutdown_flushes_the_checkpoint_and_returns() {
+        use alloy::providers::ProviderBuilder;
+
+        let asserter = alloy::providers::mock::Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let store = Arc::new(FlushCountingStore::default());
+        let shutdown = CancellationToken::new();
+
+        let mut cfg = tick_cfg(provider.clone(), Arc::new(MemoryCheckpointStore::default()));
+        cfg.cursor = CursorPolicy::Persisted {
+            store: Arc::clone(&store) as Arc<dyn KeyedCheckpointStore>,
+            key: CheckpointKey::ChannelOpened,
+            none_fallback: NoneFallback::FromBlock,
+            reorg_margin: 0,
+        };
+        cfg.shutdown = shutdown.clone();
+
+        // Cancel before spawning: the loop's first act is the `biased` select on
+        // the token, so the flush arm is taken deterministically and no queued
+        // `Asserter` response is needed.
+        shutdown.cancel();
+        let task = tokio::spawn(run(
+            provider,
+            cfg,
+            ScriptedSink {
+                applied: 0,
+                fail_on: None,
+            },
+        ));
+        assert!(task.await.is_ok(), "run must return, not hang or panic");
+        assert_eq!(
+            store.flushes(),
+            1,
+            "a cancelled watcher must flush its checkpoint exactly once"
+        );
+    }
+
+    /// A multi-window backfill yields to a cancel *between* windows: the window
+    /// in flight finishes and persists, and the next one never starts.
+    ///
+    /// `run_tick`'s cancel check cites "slash's appeal-window span" as a case it
+    /// exists for — but slash's token was inert, so the check never fired for
+    /// one of the two watchers it names, on the longest tick in the system
+    /// (~1037 windows). #1230 gives slash a live token; this pins the behaviour
+    /// that now reaches it.
+    ///
+    /// The cancel fires from inside the sink, mid-window-1. Cancelling before
+    /// the call instead would only prove that a tick cancelled up front scans
+    /// nothing — the check would fire at window 1 and the *between*-windows
+    /// property, which is the whole point, would go untested.
+    #[tokio::test]
+    async fn cancel_between_windows_stops_the_backfill_at_a_window_boundary() {
+        use alloy::primitives::U64;
+        use alloy::providers::ProviderBuilder;
+
+        /// Cancels the token as it applies its first log — i.e. while window 1
+        /// is still draining.
+        struct CancelOnApply {
+            applied: usize,
+            shutdown: CancellationToken,
+        }
+
+        impl LogSink for CancelOnApply {
+            async fn apply(&mut self, _log: Log) -> Result<()> {
+                self.applied += 1;
+                self.shutdown.cancel();
+                Ok(())
+            }
+        }
+
+        let asserter = alloy::providers::mock::Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let store = Arc::new(MemoryCheckpointStore::default());
+        let shutdown = CancellationToken::new();
+        let mut cfg = tick_cfg(provider.clone(), Arc::clone(&store));
+        cfg.shutdown = shutdown.clone();
+
+        // head=25 over span-10 windows → [0,9], [10,19], [20,25]. Only window
+        // 1's response is queued: an `Asserter` errors on an empty queue, so if
+        // the tick did NOT stop between windows the second `get_logs` would fail
+        // the tick. The `is_ok` below therefore asserts the stop rather than
+        // merely coexisting with it.
+        asserter.push_success(&U64::from(25));
+        asserter.push_success(&one_log());
+
+        let mut sink = CancelOnApply {
+            applied: 0,
+            shutdown: shutdown.clone(),
+        };
+        let mut cursor = None;
+        let result = run_tick(&provider, &cfg, &mut sink, &mut cursor).await;
+
+        assert!(result.is_ok(), "a cancelled tick exits cleanly: {result:?}");
+        assert_eq!(sink.applied, 1, "window 1 drained before the cancel landed");
+        assert_eq!(
+            cursor,
+            Some(10),
+            "the in-flight window completes and advances the cursor to the next \
+             window's start; progress is not discarded by the cancel"
+        );
+        let stored = store
+            .load_checkpoint(CheckpointKey::ChannelOpened)
+            .ok()
+            .flatten();
+        assert_eq!(
+            stored,
+            Some(9),
+            "the completed window is persisted, so the next boot resumes here"
+        );
     }
 
     fn persisted(none_fallback: NoneFallback) -> CursorPolicy {

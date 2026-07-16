@@ -69,6 +69,7 @@ impl SettlementIndexer {
     /// Capture the head block and spawn the indexer task. Returns once the task
     /// is running; the initial backfill happens inside the task so a transient
     /// RPC error backs off and retries rather than failing node startup.
+    #[allow(clippy::too_many_arguments)]
     pub async fn bootstrap<P>(
         provider: P,
         payment_channel_addr: Address,
@@ -77,6 +78,7 @@ impl SettlementIndexer {
         event_poll_interval: Duration,
         head: Arc<dyn HeadSource>,
         metrics: Arc<Metrics>,
+        shutdown: CancellationToken,
     ) -> Result<Self>
     where
         P: Provider + Clone + 'static,
@@ -122,7 +124,7 @@ impl SettlementIndexer {
             initial_backoff: WATCHER_INITIAL_BACKOFF,
             max_backoff: WATCHER_MAX_BACKOFF,
             rpc_call_timeout: None,
-            shutdown: CancellationToken::new(),
+            shutdown,
             seed_cursor: None,
             label: "reputation-indexer",
             on_established: None,
