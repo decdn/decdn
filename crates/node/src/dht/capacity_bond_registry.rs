@@ -45,7 +45,6 @@ use alloy::providers::Provider;
 use alloy::rpc::types::{Filter, Log};
 use alloy::sol_types::SolEvent;
 use anyhow::{Context, Result};
-use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -56,12 +55,13 @@ use crate::chain_events::shared_head::HeadSource;
 use crate::chain_events::{
     AbortOnDrop, MAX_BACKFILL_BLOCK_SPAN, WATCHER_INITIAL_BACKOFF, WATCHER_MAX_BACKOFF, timed,
 };
+use crate::dht::chain_staker_set::StakerChange;
 use crate::dht::chain_staker_set::{ChainStakerSet, apply_change};
 use crate::dht::node_address::{
     ChainNodeAddressDirectory, NodeAddressResolver, remove_binding, set_binding,
 };
 use crate::dht::routing::NodeId;
-use crate::dht::staker_set::{StakerChange, StakerSet};
+use crate::dht::staker_set::StakerSet;
 use crate::metrics::Metrics;
 use decdn_common::redact::sanitize_rpc_display;
 use decdn_incentive::capacity_bond::CapacityBond;
@@ -69,11 +69,6 @@ use decdn_incentive::capacity_bond::CapacityBond;
 /// Page size for the paginated `getActiveNodes` read. Matches ADR 019 § Step
 /// 3.3's worked-example limit.
 const PAGE_SIZE: u64 = 100;
-
-/// Capacity of the `StakerChange` broadcast channel. Sized so a slow subscriber
-/// can fall behind by a single bootstrap cycle (~100 changes in the bursty
-/// re-sync window) without forcing a lagging recv into the `Lagged` arm.
-const CHANGES_CHANNEL_CAPACITY: usize = 128;
 
 /// Both projections, plus the shared watcher that keeps them current.
 ///
@@ -138,7 +133,6 @@ impl<P: Provider + Clone> RegistryChainReads for ContractReads<P> {
 pub(crate) struct RegistrySink<R> {
     pub(crate) reads: R,
     pub(crate) active: Arc<RwLock<HashSet<NodeId>>>,
-    pub(crate) changes_tx: broadcast::Sender<StakerChange>,
     /// `None` when pull-through is off — see [`RegistryHandles::node_addresses`].
     pub(crate) bindings: Option<Arc<RwLock<HashMap<NodeId, Address>>>>,
     pub(crate) metrics: Arc<Metrics>,
@@ -148,12 +142,7 @@ impl<R: RegistryChainReads> RegistrySink<R> {
     /// `NodeRegistered`: active insert (unfiltered — see the module doc) AND a
     /// binding insert.
     fn on_registered(&self, node_id: NodeId, eth_address: Address) {
-        apply_change(
-            &self.active,
-            &self.changes_tx,
-            &self.metrics,
-            StakerChange::Active(node_id),
-        );
+        apply_change(&self.active, &self.metrics, StakerChange::Active(node_id));
         if let Some(bindings) = &self.bindings {
             set_binding(bindings, &self.metrics, node_id, eth_address);
         }
@@ -163,12 +152,7 @@ impl<R: RegistryChainReads> RegistrySink<R> {
     /// it and `deregisterNode` clears it. Bond/unbonding/ejection transitions flip
     /// `isActive` without touching the binding.
     fn on_deregistered(&self, node_id: NodeId) {
-        apply_change(
-            &self.active,
-            &self.changes_tx,
-            &self.metrics,
-            StakerChange::Inactive(node_id),
-        );
+        apply_change(&self.active, &self.metrics, StakerChange::Inactive(node_id));
         if let Some(bindings) = &self.bindings {
             remove_binding(bindings, &self.metrics, &node_id);
         }
@@ -212,7 +196,7 @@ impl<R: RegistryChainReads> RegistrySink<R> {
         } else {
             StakerChange::Inactive(node_id)
         };
-        apply_change(&self.active, &self.changes_tx, &self.metrics, change);
+        apply_change(&self.active, &self.metrics, change);
     }
 }
 
@@ -239,12 +223,13 @@ impl<R: RegistryChainReads> LogSink for RegistrySink<R> {
                     // Deactivates WITHOUT clearing the binding: ejection flips
                     // `isActive` only, and the operator may still be owed payment
                     // on an open channel.
-                    Ok(event) => apply_change(
-                        &self.active,
-                        &self.changes_tx,
-                        &self.metrics,
-                        StakerChange::Inactive(event.nodeId.0.into()),
-                    ),
+                    Ok(event) => {
+                        apply_change(
+                            &self.active,
+                            &self.metrics,
+                            StakerChange::Inactive(event.nodeId.0.into()),
+                        );
+                    }
                     Err(err) => warn!(%err, "skipping undecodable NodeAutoEjected log"),
                 }
             }
@@ -388,7 +373,6 @@ where
         metrics.node_address_directory_size(initial_bindings.len());
     }
 
-    let (changes_tx, _) = broadcast::channel(CHANGES_CHANNEL_CAPACITY);
     let active = Arc::new(RwLock::new(initial_active));
     let bindings = track_node_addresses.then(|| Arc::new(RwLock::new(initial_bindings)));
 
@@ -398,7 +382,6 @@ where
             registry: registry.clone(),
         },
         active: Arc::clone(&active),
-        changes_tx: changes_tx.clone(),
         bindings: bindings.clone(),
         metrics: Arc::clone(&metrics),
     };
@@ -439,11 +422,8 @@ where
         provider, cfg, sink,
     ))));
 
-    let staker_set: Arc<dyn StakerSet> = Arc::new(ChainStakerSet::from_parts(
-        active,
-        changes_tx,
-        Arc::clone(&watcher),
-    ));
+    let staker_set: Arc<dyn StakerSet> =
+        Arc::new(ChainStakerSet::from_parts(active, Arc::clone(&watcher)));
     let node_addresses = bindings.map(|b| {
         Arc::new(ChainNodeAddressDirectory::from_parts(b, watcher)) as Arc<dyn NodeAddressResolver>
     });
@@ -498,11 +478,9 @@ mod tests {
         let active = Arc::new(RwLock::new(HashSet::new()));
         let bindings = bindings_on.then(|| Arc::new(RwLock::new(HashMap::new())));
         let metrics = Arc::new(Metrics::new());
-        let (changes_tx, _rx) = broadcast::channel(16);
         let s = RegistrySink {
             reads,
             active: Arc::clone(&active),
-            changes_tx,
             bindings: bindings.clone(),
             metrics: Arc::clone(&metrics),
         };

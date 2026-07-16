@@ -976,9 +976,6 @@ where
 mod tests {
     use super::*;
     use std::sync::RwLock as StdRwLock;
-    use tokio::sync::broadcast;
-
-    use crate::dht::staker_set::StakerChange;
 
     fn h(b: u8) -> Hash {
         Hash::from_bytes([b; 32])
@@ -1012,11 +1009,6 @@ mod tests {
         }
         fn len(&self) -> usize {
             self.0.read().unwrap().len()
-        }
-        fn subscribe_changes(&self) -> broadcast::Receiver<StakerChange> {
-            let (tx, rx) = broadcast::channel(1);
-            drop(tx);
-            rx
         }
     }
 
