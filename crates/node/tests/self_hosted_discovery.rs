@@ -573,6 +573,13 @@ async fn non_staked_announce_is_dropped_at_subscriber() -> anyhow::Result<()> {
             !learned_peer(&b_peers, &a_id, "US").await,
             "receiver B must never insert the non-staked publisher A (rule-2 reject)"
         );
+        // `not_staked > 0` attributes the reject to A only because (a) there are
+        // exactly two nodes and (b) plumtree never routes a message back to its
+        // origin, so B never receives — and rejects — its own announce. If it
+        // ever did, `NoneStaked` would reject B's self-echo inside
+        // `validate_envelope` (the self-echo drop is in the later `Ok` arm, after
+        // validation), satisfying this check without A's announce arriving. Safe
+        // today; revisit if either assumption changes.
         if b_metrics.not_staked() > 0 {
             rejected = true;
             break;

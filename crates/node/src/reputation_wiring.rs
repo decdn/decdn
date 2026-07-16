@@ -431,15 +431,23 @@ mod tests {
     }
 
     /// The runtime's `NodeAnnounce` gate constructor must always enforce
-    /// (ADR 001 rule 2) — it returns `Some`, never the fail-open `None`. Guards
+    /// (ADR 001 rule 2): it returns `Some` (never the fail-open `None`) *and* the
+    /// returned gate delegates to the live staker set — not a non-`None` stub
+    /// that admits everyone (which `is_some()` alone would not catch). Guards
     /// against a future refactor silently disabling rule 2 (the #1170 hole),
     /// which `run()` alone would only surface under the anvil e2e (#1222).
     #[test]
-    fn announce_staked_gate_is_always_some() {
-        let gate = announce_staked_gate(staker_set_with(pk()));
+    fn announce_staked_gate_enforces_never_fails_open() {
+        let member = pk();
+        let gate = announce_staked_gate(staker_set_with(member))
+            .expect("announce gate must enforce, never fail open (None)");
         assert!(
-            gate.is_some(),
-            "announce gate must enforce, never fail open"
+            gate.contains(member.as_bytes()),
+            "staked member must be admitted"
+        );
+        assert!(
+            !gate.contains(pk().as_bytes()),
+            "non-member must be rejected"
         );
     }
 
