@@ -1162,6 +1162,11 @@ async fn cached_candidates(deps: &NodeOriginDeps, target: DhtHash) -> Option<Vec
         // chokepoint every candidate passes through. A pull-time refusal recorded
         // a negative for this exact (peer, hash) seconds ago
         // (`classify_pull_failure`), and a wedged channel cannot serve ANY hash.
+        //
+        // Deliberately NOT re-applying the staker-set membership filter `find_providers`
+        // applies on the cold path: a provider deregistered since it was cached is still
+        // caught at pull time, when `addr_resolver.address_of` fails to resolve it, and the
+        // BLAKE3 verify on whatever it does return guarantees content integrity either way.
         if deps
             .negative_cache
             .contains_active(&provider.node_id, &target)

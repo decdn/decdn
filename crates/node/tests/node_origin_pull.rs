@@ -9803,6 +9803,263 @@ async fn cached_candidates_and_the_cold_path_share_one_attempt_budget() -> Resul
     Ok(())
 }
 
+/// A cache hit whose (fewer-than-budget) cached candidates ALL fail must still fall through
+/// to the cold path WITHIN THE SAME fetch, and that fetch must still meter
+/// `node_pull_attempt()` exactly once (#1165 review).
+///
+/// `cached_candidates_and_the_cold_path_share_one_attempt_budget` (above) proves the budget is
+/// shared, but its cached phase spends the WHOLE budget (3 refusers) and never reaches the
+/// cold path within the second fetch. This test hits the other branch: a cache with FEWER than
+/// [`decdn_node::selection::MAX_PROVIDER_ATTEMPTS`] candidates, all of which fail, so `budget`
+/// stays positive and the fetch falls through to a fresh discovery — the only path that
+/// exercises `fetch`'s `if !attempt_metered` skip. If that guard regressed to always firing,
+/// this exact fetch would double-count `node_pull_attempts_total`.
+///
+/// Provider N refuses every pull but answers probes honestly, so it is cached after fetch #1
+/// yet fails again on fetch #2's cached-phase attempt. Provider H is a real, healthy upstream
+/// that is *unreachable* (no bound endpoint at all, mirroring
+/// `node_origin_probe_unreachable_is_scored`'s "dialing it fails fast") during fetch #1 — so it
+/// is never probed, never becomes a cached candidate, and is never negative-cached — then comes
+/// online between the two fetches. H quotes a far cheaper rate so it always ranks ahead of N
+/// once both are probed fresh, guaranteeing fetch #2's cold path tries H first and delivers
+/// without retrying N.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::expect_used, clippy::too_many_lines)] // test setup; failures should panic loudly
+async fn a_partial_cached_budget_falls_through_to_the_cold_path_and_meters_once() -> Result<()> {
+    let payload = vec![0x1Bu8; 4096];
+    let hash = Hash::new(&payload);
+    let total_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
+
+    // --- Provider N: reachable, honest at probe, refuses the pull with
+    //     `InternalError` — reported node-fault, so NOT negative-cached and NOT
+    //     wedged, exactly like the shared-budget test's three refusers. -----------
+    let probes_n = Arc::new(AtomicUsize::new(0));
+    let streams_n = Arc::new(AtomicUsize::new(0));
+    let n_sk = fresh_key();
+    let n_id = n_sk.public();
+    let n_eth = Arc::new(PrivateKeySigner::random());
+    let (ep_n, addr_n) =
+        local_endpoint(n_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    let task_n = spawn_a_refusing_server_with_counters(
+        ep_n.clone(),
+        Arc::clone(&n_eth),
+        slash_domain(),
+        total_bytes,
+        RATE,
+        StreamError::InternalError,
+        Arc::clone(&probes_n),
+        Arc::clone(&streams_n),
+    );
+
+    // --- Provider H: identity only for now — NO endpoint bound yet, so it is
+    //     undiscoverable (dialing it fails fast, like a fresh identity with no
+    //     server) until it comes online after fetch #1. ------------------------
+    let h_sk = fresh_key();
+    let h_id = h_sk.public();
+    let h_eth = Arc::new(PrivateKeySigner::random());
+
+    // --- Node B: dial-only endpoint hosting the NodeOrigin. -------------------
+    let b_sk = fresh_key();
+    let b_id = b_sk.public();
+    let (ep_b, _addr_b) = local_endpoint(b_sk, vec![]).await?;
+
+    // Prime ep_b's address book for N only — H has no address to learn yet.
+    let _ = probe_once(
+        &ep_b,
+        EndpointAddr::new(n_id).with_ip_addr(addr_n),
+        *hash.as_bytes(),
+        1,
+        false,
+        None,
+        Duration::from_secs(10),
+    )
+    .await?;
+    // The priming dial above is itself a real probe against N's counting server
+    // — reset so the counters below measure only the fetches under test.
+    probes_n.store(0, Ordering::SeqCst);
+    streams_n.store(0, Ordering::SeqCst);
+
+    let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
+    let obs_buffer = Arc::new(ObservationBuffer::new());
+    let b_metrics = Arc::new(Metrics::new());
+    let b_buyer = Arc::new(PrivateKeySigner::random());
+    let channel_id = B256::repeat_byte(0x1B);
+
+    let n_dht = DhtNodeId::from_bytes(*n_id.as_bytes());
+    let h_dht = DhtNodeId::from_bytes(*h_id.as_bytes());
+    let mut addr_map = HashMap::new();
+    addr_map.insert(n_dht, n_eth.address());
+    addr_map.insert(h_dht, h_eth.address());
+
+    let buyer = Arc::new(StubOpener {
+        channel_id,
+        token: TOKEN,
+        deposit: U256::from(DEPOSIT_MICRO_USDC),
+        signer: Arc::clone(&b_buyer),
+        voucher_domain: voucher_dom(),
+        recorded: Arc::new(Mutex::new(Vec::new())),
+        retired: Arc::new(Mutex::new(Vec::new())),
+    }) as Arc<dyn ChannelOpener>;
+
+    let origin = build_origin_with_timeout(
+        &ep_b,
+        DhtNodeId::from_bytes(*b_id.as_bytes()),
+        hash,
+        buyer,
+        &local_rep,
+        &obs_buffer,
+        &b_metrics,
+        &empty_region_accountant(),
+        vec![n_dht, h_dht],
+        addr_map,
+        Duration::from_secs(20),
+        Duration::from_secs(20),
+        0,
+    );
+
+    // Fetch #1: cold path (cache empty). H is undiscoverable, so only N is
+    // probed and cached — a SINGLE cached candidate, fewer than
+    // `MAX_PROVIDER_ATTEMPTS`. N refuses, so the fetch is a clean miss.
+    let first = Origin::fetch(&origin, hash, u64::MAX)
+        .await
+        .map_err(|e| anyhow::anyhow!("first fetch: {e}"))?
+        .collect_to_bytes()
+        .await?;
+    anyhow::ensure!(
+        first.is_none(),
+        "H is unreachable and N refuses; the first fetch must miss"
+    );
+    anyhow::ensure!(
+        probes_n.load(Ordering::SeqCst) == 1,
+        "expected N probed exactly once, got {}",
+        probes_n.load(Ordering::SeqCst)
+    );
+    anyhow::ensure!(
+        streams_n.load(Ordering::SeqCst) == 1,
+        "expected N pulled-from exactly once, got {}",
+        streams_n.load(Ordering::SeqCst)
+    );
+    assert_counter(&b_metrics, "probe_cache_misses_total", 1)?;
+    assert_counter(&b_metrics, "node_pull_refused_total", 1)?;
+    // 2, not 1: H's failed probe scores Unreachable, AND N's `InternalError` refusal is
+    // classified `RefusalVerdict::NodeFault`, which — per `classify_pull_failure` — ALSO
+    // scores `Outcome::Unreachable` on top of incrementing `node_pull_refused_total` (a
+    // refusal proves reachability at the wire but is still reputation-scored as
+    // unreachable). This is why the shared-budget test above never asserts this counter.
+    assert_counter(&b_metrics, "node_pull_unreachable_total", 2)?;
+    assert_counter(&b_metrics, "node_pull_attempts_total", 1)?;
+
+    // --- Bring H online between the two fetches: a real, healthy upstream
+    //     holding the blob, quoting a far cheaper rate so it always outranks N
+    //     once both are probed fresh. -------------------------------------------
+    let (cache_h, hash_h, _tmp_h) = cache_with_blob(&payload).await?;
+    anyhow::ensure!(hash_h == hash, "fixture hash mismatch");
+    let store_h = Arc::new(MemoryChannelStateStore::new());
+    store_h.record(&ChannelState::new(
+        channel_id,
+        b_buyer.address(),
+        TOKEN,
+        U256::from(DEPOSIT_MICRO_USDC),
+    ))?;
+    let metrics_h_side = Arc::new(Metrics::new());
+    let limiter_h = permissive_limiter(&metrics_h_side);
+    let domains = HandlerDomains {
+        slash: slash_domain(),
+        voucher: voucher_dom(),
+        binding: binding_dom(),
+    };
+    let h_rate = 1u64;
+    let handler_h = build_handler_full(
+        h_id,
+        &h_eth,
+        &metrics_h_side,
+        limiter_h,
+        cache_h,
+        store_h as Arc<dyn ChannelStateStore>,
+        h_rate,
+        &domains,
+        0,
+        16,
+    )?;
+    let (ep_h, addr_h) =
+        local_endpoint(h_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    let probes_h = Arc::new(AtomicUsize::new(0));
+    let task_h = spawn_a_probe_counting_server(
+        ep_h.clone(),
+        handler_h,
+        Arc::clone(&h_eth),
+        slash_domain(),
+        total_bytes,
+        h_rate,
+        Arc::clone(&probes_h),
+    );
+
+    // Prime ep_b's address book for H now that it is listening.
+    let _ = probe_once(
+        &ep_b,
+        EndpointAddr::new(h_id).with_ip_addr(addr_h),
+        *hash.as_bytes(),
+        1,
+        false,
+        None,
+        Duration::from_secs(10),
+    )
+    .await?;
+    // Again, the priming dial is itself a real probe — reset before the fetch
+    // under test.
+    probes_h.store(0, Ordering::SeqCst);
+
+    // Fetch #2: cache hit on N alone. The cached phase spends 1 of the 3-attempt
+    // budget on N (refused again), leaving budget > 0, so the fetch falls
+    // through — WITHIN THIS CALL — to a fresh lookup that discovers both N and
+    // H, ranks H first (cheaper rate), and delivers via H without retrying N.
+    let second = Origin::fetch(&origin, hash, u64::MAX)
+        .await
+        .map_err(|e| anyhow::anyhow!("second fetch: {e}"))?
+        .collect_to_bytes()
+        .await?;
+    anyhow::ensure!(
+        second.is_some_and(|b| b.as_ref() == payload.as_slice()),
+        "the second fetch must deliver the blob via the cold fallthrough"
+    );
+    anyhow::ensure!(
+        streams_n.load(Ordering::SeqCst) == 2,
+        "N must be pulled-from exactly twice total (once per fetch) — the cold path must not \
+         retry it once H (ranked first) delivers, got {}",
+        streams_n.load(Ordering::SeqCst)
+    );
+    anyhow::ensure!(
+        probes_n.load(Ordering::SeqCst) == 2,
+        "N must be re-probed by the fresh cold-path lookup (the cache hit itself never probes), \
+         got {}",
+        probes_n.load(Ordering::SeqCst)
+    );
+    anyhow::ensure!(
+        probes_h.load(Ordering::SeqCst) == 1,
+        "H must be probed exactly once, by the cold-path fallthrough, got {}",
+        probes_h.load(Ordering::SeqCst)
+    );
+    assert_counter(&b_metrics, "probe_cache_hits_total", 1)?;
+    assert_counter(&b_metrics, "probe_cache_misses_total", 1)?;
+    assert_counter(&b_metrics, "node_pull_refused_total", 2)?;
+    // 3, not 2: the 2 from fetch #1 (H unreachable + N's NodeFault refusal) plus one more
+    // from N's second (cached-phase) refusal. H's successful cold-path probe and delivery
+    // add none.
+    assert_counter(&b_metrics, "node_pull_unreachable_total", 3)?;
+    // THE property under test: one orchestration per fetch, however many
+    // candidate lists it walks THIS TIME — 2, not 3. A regressed
+    // `if !attempt_metered` guard that always fires would double-count fetch
+    // #2's cold-path fallthrough and push this to 3.
+    assert_counter(&b_metrics, "node_pull_attempts_total", 2)?;
+
+    ep_b.close().await;
+    ep_n.close().await;
+    ep_h.close().await;
+    task_n.abort();
+    task_h.abort();
+    Ok(())
+}
+
 /// A cached entry can go stale INSIDE its own 15s. A pull-time refusal recorded a negative
 /// for this (peer, hash) seconds ago, and the hit path must honour it — otherwise the
 /// positive cache resurrects exactly the peers the last fetch just learned not to ask,
