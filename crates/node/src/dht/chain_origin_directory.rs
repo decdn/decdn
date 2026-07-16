@@ -94,7 +94,6 @@ use alloy::providers::Provider;
 use alloy::rpc::types::{Filter, Log};
 use alloy::sol_types::SolEvent;
 use anyhow::{Context, Result};
-use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -103,8 +102,8 @@ use crate::chain_events::resumable_watcher::{
 };
 use crate::chain_events::shared_head::HeadSource;
 use crate::chain_events::{
-    MAX_BACKFILL_BLOCK_SPAN, REORG_MARGIN_BLOCKS, WATCHER_INITIAL_BACKOFF, WATCHER_MAX_BACKOFF,
-    backfill_windows, check_backfill_range,
+    AbortOnDrop, MAX_BACKFILL_BLOCK_SPAN, REORG_MARGIN_BLOCKS, WATCHER_INITIAL_BACKOFF,
+    WATCHER_MAX_BACKOFF, backfill_windows, check_backfill_range,
 };
 use crate::dht::origin::{Hash, OriginDirectory};
 use crate::dht::routing::NodeId;
@@ -616,18 +615,6 @@ where
             warn!("ChainOriginDirectory cache RwLock poisoned; recovering inner state");
             f(&poisoned.into_inner())
         }
-    }
-}
-
-/// Watcher join handle that aborts the task on drop. Mirrors
-/// `ChainStakerSet::AbortOnDrop` — abort is sufficient cleanup; we do not await
-/// completion (the watcher is self-contained chain polling).
-#[derive(Debug)]
-struct AbortOnDrop(JoinHandle<()>);
-
-impl Drop for AbortOnDrop {
-    fn drop(&mut self) {
-        self.0.abort();
     }
 }
 

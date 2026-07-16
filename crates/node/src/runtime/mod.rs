@@ -30,7 +30,7 @@ use decdn_gossip::{GossipMetrics, GossipRuntimeConfig, GossipService, PeerTable,
 
 use crate::admin;
 use crate::channel_store::PersistentChannelStateStore;
-use crate::dht::{ChainStakerSet, DhtRateLimiter, RecordStore, RecordStoreConfig, StakerSet};
+use crate::dht::{DhtRateLimiter, RecordStore, RecordStoreConfig, StakerSet};
 use crate::dispatch::ConnectionLimiter;
 use crate::handlers::client::{ClientHandler, MAX_CLIENT_STREAMS};
 use crate::handlers::dht::DhtHandler;
@@ -725,19 +725,23 @@ pub async fn run(
         ProviderBuilder::new().connect_http(rpc_url.clone()),
         event_poll_interval,
     ));
-    let staker_set: Arc<dyn StakerSet> = Arc::new(
-        ChainStakerSet::bootstrap(
-            chain_provider,
-            capacity_bond_addr,
-            event_poll_interval,
-            Arc::clone(&head),
-            Arc::clone(&node_metrics),
-        )
-        .await
-        .with_context(|| {
-            format!("ChainStakerSet bootstrap from CapacityBond at {capacity_bond_addr}")
-        })?,
-    );
+    // One CapacityBond enumeration + one watcher feeding both registry
+    // projections (#1110). The bindings half is built only when pull-through is
+    // on; it derives from page data already read here, so — unlike when it had its
+    // own bootstrap — it has no RPC that can fail on its own. `getActiveNodes`
+    // failure was already fatal via this same (unconditional, first-to-run) call,
+    // so nothing that boots today loses pull-through.
+    let registry = crate::dht::capacity_bond_registry::bootstrap(
+        chain_provider,
+        capacity_bond_addr,
+        event_poll_interval,
+        Arc::clone(&head),
+        cfg.cache.node_to_node_pull_through_enabled,
+        Arc::clone(&node_metrics),
+    )
+    .await
+    .with_context(|| format!("CapacityBond registry bootstrap at {capacity_bond_addr}"))?;
+    let staker_set: Arc<dyn StakerSet> = registry.staker_set;
 
     // Slash-detection watcher (#1032, G-NODE-05): follow `SlashJudge.Slashed`
     // for this operator so the slash surfaces over `admin_v1_slashes` (+ the
@@ -761,39 +765,13 @@ pub async fn run(
     );
     let slash_store = slash_watcher.store();
 
-    // NodeId → bonded operator address resolver for node-to-node pulls (#831).
-    // Reads the same `CapacityBond` registration data as the staker set
-    // (`getActiveNodes` / `NodeRegistered` carry `ethAddress`). Built only when
-    // the feature is on; a bootstrap failure is NON-fatal — like the buyer
-    // service, node→node buying is opportunistic, so a failed resolver just
-    // leaves pull-through disabled rather than aborting the seller node. Held to
-    // provision the `NodeOrigin` below.
+    // NodeId → bonded operator address resolver for node-to-node pulls (#831),
+    // produced by the same CapacityBond bootstrap as the staker set above and
+    // `Some` exactly when pull-through is enabled. Held to provision the
+    // `NodeOrigin` below.
     let node_address_resolver: Option<Arc<dyn crate::dht::NodeAddressResolver>> =
         if cfg.cache.node_to_node_pull_through_enabled {
-            match crate::dht::node_address::ChainNodeAddressDirectory::bootstrap(
-                with_poll_interval(
-                    ProviderBuilder::new().connect_http(rpc_url.clone()),
-                    event_poll_interval,
-                ),
-                capacity_bond_addr,
-                event_poll_interval,
-                Arc::clone(&head),
-                Arc::clone(&node_metrics),
-            )
-            .await
-            {
-                Ok(dir) => Some(Arc::new(dir)),
-                Err(err) => {
-                    tracing::warn!(
-                        err = %sanitize_rpc_display(&err),
-                        %capacity_bond_addr,
-                        "ChainNodeAddressDirectory bootstrap failed; node→node pull-through is \
-                         DISABLED for this process (cannot resolve provider payout addresses). \
-                         Restart to retry."
-                    );
-                    None
-                }
-            }
+            registry.node_addresses
         } else {
             None
         };

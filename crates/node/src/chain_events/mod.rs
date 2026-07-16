@@ -18,10 +18,24 @@ pub(crate) use backfill::{
     MAX_BACKFILL_BLOCK_SPAN, REORG_MARGIN_BLOCKS, backfill_windows, check_backfill_range,
 };
 
-use std::future::Future;
+use std::future::IntoFuture;
 use std::time::Duration;
 
 use anyhow::Result;
+use tokio::task::JoinHandle;
+
+/// Aborts a spawned watcher task on drop, so a node-restart cycle never leaks a
+/// chain-poll task. Shared by every watcher (and the buyer-channel service): the
+/// definition was copy-pasted seven times before, which made it look like each
+/// watcher had its own teardown policy when they were byte-identical.
+#[derive(Debug)]
+pub(crate) struct AbortOnDrop(pub(crate) JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
 
 /// Default first backoff after a failing poll tick, doubled (bounded by
 /// [`WATCHER_MAX_BACKOFF`]) on each successive failure and reset on a clean
@@ -45,16 +59,21 @@ pub(crate) const DEFAULT_RPC_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 /// timeout is a retryable error (the tick backs off). A `None` config uses
 /// [`DEFAULT_RPC_CALL_TIMEOUT`].
 ///
-/// This bounds only the calls it wraps — `resumable_watcher`'s own `get_logs`
-/// and `shared_head`'s `get_block_number`. A follow-up RPC a
-/// [`resumable_watcher::LogSink::apply`] issues (`getOrigins`, `nodeIdOf`,
-/// `getChannel`, …) is NOT routed through here and stays unbounded unless the
-/// sink wraps it itself (as `blacklist_watcher::scope_check` does), so a provider
-/// that stalls one of those can still wedge a tick. Bounding every sink-internal
-/// read is a tracked follow-up.
+/// This bounds only the calls it wraps — `resumable_watcher`'s own `get_logs`,
+/// `shared_head`'s `get_block_number`, and any sink read that wraps itself (as
+/// `capacity_bond_registry`'s `nodeIdOf` and `blacklist_watcher::scope_check` do).
+/// A follow-up RPC a [`resumable_watcher::LogSink::apply`] issues (`getOrigins`,
+/// `getChannel`, …) is NOT routed through here automatically and stays unbounded
+/// otherwise, so a provider that stalls one of those can still wedge a tick.
+/// Bounding every remaining sink-internal read is a tracked follow-up.
+///
+/// Takes `IntoFuture`, not `Future`, so an alloy `.call()` (which returns an
+/// `EthCall`, not a future) can be wrapped directly rather than each caller
+/// spelling `.into_future()`. Every `Future` is an `IntoFuture`, so this is a
+/// strict widening.
 pub(crate) async fn timed<T, E, F>(timeout: Option<Duration>, what: &str, fut: F) -> Result<T>
 where
-    F: Future<Output = std::result::Result<T, E>>,
+    F: IntoFuture<Output = std::result::Result<T, E>>,
     E: std::error::Error + Send + Sync + 'static,
 {
     let d = timeout.unwrap_or(DEFAULT_RPC_CALL_TIMEOUT);
@@ -62,4 +81,56 @@ where
         .await
         .map_err(|_| anyhow::anyhow!("{what} timed out after {d:?}"))?
         .map_err(anyhow::Error::new)
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
+mod tests {
+    use super::*;
+
+    /// A call that never resolves must fail at [`DEFAULT_RPC_CALL_TIMEOUT`] rather
+    /// than wedge the tick forever, and the error must name the call so the
+    /// caller's context composes onto something diagnostic. `start_paused` lets
+    /// tokio auto-advance to the deadline, so this costs no wall-clock time.
+    ///
+    /// This is the mechanism every self-bounding sink read relies on (the
+    /// `nodeIdOf` / `scope_check` pattern), so it is pinned here rather than at
+    /// each call site.
+    #[tokio::test(start_paused = true)]
+    async fn timed_bounds_a_hanging_call_at_the_default() {
+        let hang = std::future::pending::<std::result::Result<u64, std::io::Error>>();
+        let err = timed(None, "nodeIdOf", hang)
+            .await
+            .err()
+            .map(|e| format!("{e:#}"));
+        assert!(
+            err.as_ref()
+                .is_some_and(|e| e.contains("nodeIdOf timed out after")),
+            "a hanging call must time out and name itself: {err:?}"
+        );
+    }
+
+    /// An explicit timeout overrides the default.
+    #[tokio::test(start_paused = true)]
+    async fn timed_honours_an_explicit_timeout() {
+        let hang = std::future::pending::<std::result::Result<u64, std::io::Error>>();
+        let started = tokio::time::Instant::now();
+        let _ = timed(Some(Duration::from_millis(50)), "get_logs", hang).await;
+        assert!(
+            started.elapsed() < DEFAULT_RPC_CALL_TIMEOUT,
+            "explicit timeout must win over the 10s default"
+        );
+    }
+
+    /// A call that succeeds inside the deadline passes its value through.
+    #[tokio::test(start_paused = true)]
+    async fn timed_passes_a_prompt_success_through() {
+        let ok = async { Ok::<u64, std::io::Error>(7) };
+        assert_eq!(timed(None, "get_block_number", ok).await.ok(), Some(7));
+    }
 }
