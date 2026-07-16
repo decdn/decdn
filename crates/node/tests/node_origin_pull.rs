@@ -43,7 +43,7 @@ use decdn_node::dht::negative_cache::Hash as DhtHash;
 use decdn_node::dht::routing::{NodeId as DhtNodeId, RoutingTable};
 use decdn_node::dht::{
     ConfigOriginDirectory, ConfigStakerSet, NegativeProbeCache, NodeAddressResolver,
-    OriginDirectory, PositiveProbeCache, StakerSet, StaticNodeAddressDirectory,
+    OriginDirectory, PositiveProbeCache, StakerChange, StakerSet, StaticNodeAddressDirectory,
 };
 use decdn_node::leech_governor::{LeechCaps, LeechCapsConfig, LeechGovernor};
 use decdn_node::metrics::Metrics;
@@ -11258,6 +11258,359 @@ async fn a_probe_cache_hit_still_honours_the_wedged_provider_filter() -> Result<
     // The entry WAS consulted (H survived the filters), so fetch #3 is a hit.
     assert_counter(&b_metrics, "probe_cache_hits_total", 1)?;
     assert_counter(&b_metrics, "probe_cache_misses_total", 2)?;
+
+    ep_b.close().await;
+    ep_a.close().await;
+    task_a.abort();
+    Ok(())
+}
+
+/// A [`StakerSet`] whose active set can be mutated mid-test, so a fetch can eject a
+/// provider between the probe-cache write and a later hit inside the same TTL
+/// (#1223). Models a chain ejection the cold path's `filter_active_stakers` would
+/// deny — the hit path (`cached_candidates`) must deny it too.
+#[derive(Debug)]
+struct MutableStakerSet {
+    active: Mutex<HashSet<DhtNodeId>>,
+    /// Held solely to hand out live receivers via [`StakerSet::subscribe_changes`];
+    /// this test drives membership by direct mutation, not by emitting events.
+    tx: tokio::sync::broadcast::Sender<StakerChange>,
+}
+
+impl MutableStakerSet {
+    fn new(active: HashSet<DhtNodeId>) -> Self {
+        let (tx, _) = tokio::sync::broadcast::channel(4);
+        Self {
+            active: Mutex::new(active),
+            tx,
+        }
+    }
+
+    /// Eject `node_id` from the active set — the chain-atomic drop a fetch inside
+    /// the TTL must observe on the hit path.
+    fn remove(&self, node_id: &DhtNodeId) {
+        self.active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(node_id);
+    }
+}
+
+impl StakerSet for MutableStakerSet {
+    fn is_active(&self, node_id: &DhtNodeId) -> bool {
+        self.active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(node_id)
+    }
+
+    fn active_nodes(&self) -> Vec<DhtNodeId> {
+        self.active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .copied()
+            .collect()
+    }
+
+    fn subscribe_changes(&self) -> tokio::sync::broadcast::Receiver<StakerChange> {
+        self.tx.subscribe()
+    }
+}
+
+/// An [`OriginDirectory`] whose hash → origins map can be mutated mid-test, so a
+/// fetch can drop the fallback entry alongside the staker ejection (#1223). Removing
+/// the entry is what stops the cold fall-through — after the hit-path skip — from
+/// re-serving the ejected provider, isolating the hit-path filter as the thing
+/// under test.
+#[derive(Debug)]
+struct MutableOriginDirectory {
+    origins: Mutex<HashMap<DhtHash, Vec<DhtNodeId>>>,
+}
+
+impl MutableOriginDirectory {
+    const fn new(origins: HashMap<DhtHash, Vec<DhtNodeId>>) -> Self {
+        Self {
+            origins: Mutex::new(origins),
+        }
+    }
+
+    /// Drop `hash`'s entry — the directory half of a chain ejection.
+    fn remove(&self, hash: &DhtHash) {
+        self.origins
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(hash);
+    }
+}
+
+impl OriginDirectory for MutableOriginDirectory {
+    fn lookup_origins(&self, hash: &DhtHash) -> Vec<DhtNodeId> {
+        self.origins
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(hash)
+            .cloned()
+            .unwrap_or_default()
+    }
+}
+
+/// Like [`spawn_a_probe_counting_server`], but also counts client-ALPN opens in
+/// `streams`, so a test can witness AT THE WIRE whether A was asked to serve. A
+/// serves the real blob through `client_handler`; the stream counter is what proves
+/// a provider dropped on a probe-cache hit sees NO new client stream (#1223).
+#[allow(clippy::too_many_arguments)]
+fn spawn_a_serving_server_with_counters(
+    ep: iroh::Endpoint,
+    client_handler: Arc<decdn_node::handlers::client::ClientHandler>,
+    a_eth: Arc<PrivateKeySigner>,
+    slash: Eip712Domain,
+    total_bytes: u64,
+    rate: u64,
+    probes: Arc<AtomicUsize>,
+    streams: Arc<AtomicUsize>,
+) -> tokio::task::JoinHandle<()> {
+    use iroh::protocol::ProtocolHandler;
+    tokio::spawn(async move {
+        while let Some(incoming) = ep.accept().await {
+            let Ok(connecting) = incoming.accept() else {
+                continue;
+            };
+            let Ok(conn) = connecting.await else { continue };
+            if conn.alpn() == ALPN_PROBE {
+                let eth = Arc::clone(&a_eth);
+                let dom = slash.clone();
+                let probes = Arc::clone(&probes);
+                tokio::spawn(async move {
+                    probes.fetch_add(1, Ordering::SeqCst);
+                    let _ = answer_probe(conn, &eth, &dom, rate, total_bytes).await;
+                });
+            } else {
+                let handler = Arc::clone(&client_handler);
+                let streams = Arc::clone(&streams);
+                tokio::spawn(async move {
+                    streams.fetch_add(1, Ordering::SeqCst);
+                    let _ = handler.accept(conn).await;
+                });
+            }
+        }
+    })
+}
+
+/// A cached entry can be disowned INSIDE its own 15s: a node ejected from the active
+/// set (chain ejection / unbonding) while its probe-cache entry is still live. The
+/// cold path denies it via `filter_active_stakers`; the hit path bypasses
+/// `find_providers`, so it must re-apply `staker_set.is_active` itself (#1223). This
+/// proves that re-check FIRES — the ejected provider is skipped on the hit and NOT
+/// re-served at the wire — rather than winning a paid pull the cold path would deny.
+///
+/// The provider is ejected from BOTH the staker set and the origin directory, as a
+/// chain ejection is atomic across the two. The directory removal is load-bearing:
+/// without it the cold fall-through (after the hit-path skip) would re-serve A
+/// through the unfiltered directory, masking whether the hit-path check ran at all.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::expect_used, clippy::too_many_lines)] // test setup; failures should panic loudly
+async fn a_probe_cache_hit_drops_a_provider_no_longer_admitted() -> Result<()> {
+    let payload = vec![0xA7u8; PAYLOAD_LEN];
+    let hash = Hash::new(&payload);
+    let total_bytes = u64::try_from(PAYLOAD_LEN).unwrap_or(u64::MAX);
+
+    // --- Node A: holds the blob; serves probe + client, counting BOTH so a hit
+    //     that wrongly re-serves A is visible at the wire. --------------------
+    let (cache_a, hash_a, _tmp_a) = cache_with_blob(&payload).await?;
+    anyhow::ensure!(hash_a == hash, "fixture hash mismatch");
+    let a_sk = fresh_key();
+    let a_id = a_sk.public();
+    let a_eth = Arc::new(PrivateKeySigner::random());
+    let b_buyer = Arc::new(PrivateKeySigner::random());
+    let channel_id = B256::repeat_byte(0xA7);
+    let store_a = Arc::new(MemoryChannelStateStore::new());
+    store_a.record(&ChannelState::new(
+        channel_id,
+        b_buyer.address(),
+        TOKEN,
+        U256::from(DEPOSIT_MICRO_USDC),
+    ))?;
+    let metrics_a = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics_a);
+    let domains = HandlerDomains {
+        slash: slash_domain(),
+        voucher: voucher_dom(),
+        binding: binding_dom(),
+    };
+    let handler_a = build_handler_full(
+        a_id,
+        &a_eth,
+        &metrics_a,
+        limiter,
+        cache_a,
+        store_a as Arc<dyn ChannelStateStore>,
+        RATE,
+        &domains,
+        0,
+        16,
+    )?;
+    let (ep_a, addr_a) =
+        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    let a_probes = Arc::new(AtomicUsize::new(0));
+    let a_streams = Arc::new(AtomicUsize::new(0));
+    let task_a = spawn_a_serving_server_with_counters(
+        ep_a.clone(),
+        handler_a,
+        Arc::clone(&a_eth),
+        slash_domain(),
+        total_bytes,
+        RATE,
+        Arc::clone(&a_probes),
+        Arc::clone(&a_streams),
+    );
+
+    // --- Node B: dial-only endpoint hosting the NodeOrigin. -------------------
+    let b_sk = fresh_key();
+    let b_id = b_sk.public();
+    let (ep_b, _addr_b) = local_endpoint(b_sk, vec![]).await?;
+    // Prime B's address book so it can dial A by node-id during the fetch; this
+    // dial is itself a real probe, so reset the counters after it.
+    let _ = probe_once(
+        &ep_b,
+        EndpointAddr::new(a_id).with_ip_addr(addr_a),
+        *hash.as_bytes(),
+        1,
+        false,
+        None,
+        Duration::from_secs(10),
+    )
+    .await?;
+    a_probes.store(0, Ordering::SeqCst);
+    a_streams.store(0, Ordering::SeqCst);
+
+    let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
+    let obs_buffer = Arc::new(ObservationBuffer::new());
+    let b_metrics = Arc::new(Metrics::new());
+    let a_dht = DhtNodeId::from_bytes(*a_id.as_bytes());
+    let b_dht = DhtNodeId::from_bytes(*b_id.as_bytes());
+    let dht_hash = DhtHash::from_bytes(*hash.as_bytes());
+
+    // A starts admitted: in the staker set AND in the directory for the hash.
+    // Handles are cloned so the test can eject A between the two fetches.
+    let mutable_staker = Arc::new(MutableStakerSet::new(HashSet::from([a_dht])));
+    let mutable_dir = Arc::new(MutableOriginDirectory::new(HashMap::from([(
+        dht_hash,
+        vec![a_dht],
+    )])));
+
+    let mut addr_map = HashMap::new();
+    addr_map.insert(a_dht, a_eth.address());
+    let buyer = Arc::new(StubOpener {
+        channel_id,
+        token: TOKEN,
+        deposit: U256::from(DEPOSIT_MICRO_USDC),
+        signer: Arc::clone(&b_buyer),
+        voucher_domain: voucher_dom(),
+        recorded: Arc::new(Mutex::new(Vec::new())),
+        retired: Arc::new(Mutex::new(Vec::new())),
+    }) as Arc<dyn ChannelOpener>;
+
+    // Provisioned inline (the shared builders hardcode `ConfigStakerSet` /
+    // `ConfigOriginDirectory`, which cannot be mutated mid-test). A default 15s
+    // positive-cache TTL keeps the fetch #1 entry live through the ejection and
+    // fetch #2, so only the `is_active` re-check can drop it.
+    let origin = NodeOrigin::new();
+    origin.provision(NodeOriginDeps {
+        endpoint: ep_b.clone(),
+        routing_table: Arc::new(Mutex::new(RoutingTable::new(b_dht))),
+        staker_set: Arc::clone(&mutable_staker) as Arc<dyn StakerSet>,
+        origin_directory: Arc::clone(&mutable_dir) as Arc<dyn OriginDirectory>,
+        addr_resolver: Arc::new(StaticNodeAddressDirectory::new(addr_map))
+            as Arc<dyn NodeAddressResolver>,
+        buyer,
+        self_id: b_dht,
+        slash_domain: slash_domain(),
+        bind_domain: binding_dom(),
+        local_rep: Arc::clone(&local_rep),
+        obs_buffer: Arc::clone(&obs_buffer),
+        network_rep: Arc::new(
+            NetworkReputation::new(NetworkReputationConfig::default())
+                .expect("network reputation config"),
+        ),
+        rep_cfg: NetworkReputationConfig::default(),
+        negative_cache: NegativeProbeCache::new(),
+        probe_cache: PositiveProbeCache::new(),
+        metrics: Arc::clone(&b_metrics),
+        region_accountant: empty_region_accountant(),
+        config: NodeOriginConfig {
+            probe_fanout: 5,
+            pull_timeout: Duration::from_secs(20),
+            stall_timeout: Duration::from_secs(20),
+            max_blob_size_bytes: 0,
+            enable_0rtt: false,
+            deposit_hint: U256::from(DEPOSIT_MICRO_USDC),
+            lookup: decdn_node::dht::LookupConfig::default(),
+            own_region: None,
+        },
+        acquisition_observer: None,
+        ledgers: Arc::new(decdn_node::buyer_ledgers::BuyerLedgers::default()),
+        wedged_providers: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+    });
+
+    // Fetch #1: cold path. `find_providers` is empty (no routing entries), so the
+    // directory fallback returns [A]; A is probed once, cached, and delivers.
+    let first = Origin::fetch(&origin, hash, u64::MAX)
+        .await
+        .map_err(|e| anyhow::anyhow!("first fetch: {e}"))?
+        .collect_to_bytes()
+        .await?;
+    anyhow::ensure!(
+        first.is_some_and(|b| b.as_ref() == payload.as_slice()),
+        "first fetch must deliver the blob from A"
+    );
+    anyhow::ensure!(
+        a_probes.load(Ordering::SeqCst) == 1,
+        "A must be probed exactly once on the cold path, got {}",
+        a_probes.load(Ordering::SeqCst)
+    );
+    anyhow::ensure!(
+        a_streams.load(Ordering::SeqCst) == 1,
+        "A must be pulled exactly once on the cold path, got {}",
+        a_streams.load(Ordering::SeqCst)
+    );
+    assert_counter(&b_metrics, "probe_cache_misses_total", 1)?;
+    assert_counter(&b_metrics, "probe_cache_hits_total", 0)?;
+
+    // Eject A inside the live TTL: a chain ejection drops it from BOTH the staker
+    // set and the directory atomically. The probe-cache entry for [A] is untouched
+    // and still live, so nothing but the hit-path `is_active` re-check can deny it.
+    mutable_staker.remove(&a_dht);
+    mutable_dir.remove(&dht_hash);
+
+    // Fetch #2: the entry is still live, so the hit path walks [A] — but A is no
+    // longer active, so `cached_candidates` drops it, returns None, and the fetch
+    // records a probe-cache MISS (a hit that serves no one is not a hit). The cold
+    // fall-through then finds no providers (routing empty + directory now empty),
+    // so the fetch is a clean NotFound. Crucially, A is never re-contacted.
+    let second = Origin::fetch(&origin, hash, u64::MAX)
+        .await
+        .map_err(|e| anyhow::anyhow!("second fetch: {e}"))?
+        .collect_to_bytes()
+        .await?;
+    anyhow::ensure!(
+        second.is_none(),
+        "second fetch must miss — the only cached provider was ejected inside the TTL"
+    );
+    anyhow::ensure!(
+        a_streams.load(Ordering::SeqCst) == 1,
+        "the hit re-served an EJECTED A — `is_active` must deny it on the hit path, got {} \
+         streams",
+        a_streams.load(Ordering::SeqCst)
+    );
+    anyhow::ensure!(
+        a_probes.load(Ordering::SeqCst) == 1,
+        "the ejected A must not be re-probed, got {}",
+        a_probes.load(Ordering::SeqCst)
+    );
+    assert_counter(&b_metrics, "probe_cache_hits_total", 0)?;
+    assert_counter(&b_metrics, "probe_cache_misses_total", 2)?;
+    assert_counter(&b_metrics, "node_pull_no_providers_total", 1)?;
 
     ep_b.close().await;
     ep_a.close().await;
