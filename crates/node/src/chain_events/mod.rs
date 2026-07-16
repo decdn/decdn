@@ -73,9 +73,14 @@ pub(crate) const DEFAULT_RPC_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 /// This helper guarantees only that a call is *bounded*. What a timeout **means**
 /// is the call site's decision, and each documents its own — the two live shapes
 /// being fail-the-tick-and-back-off (`getChannel`, reputation's `nodeIdOf`,
-/// origin's reads) and degrade-and-continue (`slash`'s `get_block`, the
-/// registry's `nodeIdOf`). Note `nodeIdOf` appears on both lists deliberately;
-/// see `reputation_indexer::resolve_binding`.
+/// origin's `getOrigins`) and degrade-and-continue (`slash`'s `get_block`, the
+/// registry's `nodeIdOf`, origin's `nodeIdOf`).
+///
+/// `nodeIdOf` is the same read at three sites under two policies, which is
+/// deliberate and not a bug to unify: reputation fails the tick because a
+/// skipped settlement is a silent accounting gap nothing re-derives, while the
+/// registry and origin count-and-skip because their projections self-heal on
+/// the operator's next event. See `reputation_indexer::resolve_binding`.
 ///
 /// Takes `IntoFuture`, not `Future`, so an alloy `.call()` (which returns an
 /// `EthCall`, not a future) can be wrapped directly rather than each caller
@@ -106,12 +111,18 @@ where
 /// a queued response or errors immediately on an empty queue — it never pends.
 /// So this is the smallest transport that can: `poll_ready` is always ready and
 /// `call` returns `pending()`, so a request is dispatched and then hangs with no
-/// I/O involved. That last part matters — the future is purely in-process, so
-/// `#[tokio::test(start_paused = true)]` sees an idle runtime and auto-advances
-/// to the `timed` deadline. A wiremock server with a long response delay would
-/// look equivalent and is not: it parks the task on the I/O driver, where the
-/// paused clock does not auto-advance, and the test would either hang or burn
-/// real wall-clock.
+/// I/O involved. That last part matters, but not for the reason you might
+/// expect. Under `#[tokio::test(start_paused = true)]` the clock auto-advances
+/// whenever the runtime goes idle, and waiting on I/O does *not* inhibit that —
+/// only `spawn_blocking` does (it is the sole caller of tokio's
+/// `inhibit_auto_advance`; `park_thread_timeout` otherwise polls the I/O driver
+/// with a zero timeout and then advances). So a wiremock server with a long
+/// response delay does not hang the test — it fails it *vacuously*: the clock
+/// races to the 10s deadline while the HTTP round-trip is still in flight, so
+/// `timed` fires on virtual time rather than on the stall being tested, and the
+/// test no longer distinguishes a bounded read from a slow one. A never-resolving
+/// in-process future has nothing to race: the deadline is the only pending timer,
+/// so firing it is the assertion.
 #[cfg(test)]
 #[allow(clippy::panic)]
 pub(crate) mod test_support {
@@ -159,8 +170,10 @@ pub(crate) mod test_support {
     ///
     /// Failure legibility, not correctness: if a `timed` wrap is ever dropped
     /// from the site under test, the read hangs forever and the test hangs with
-    /// it — and there is no `slow-timeout` in `.config/nextest.toml` to cut that
-    /// short, so CI would stall for its whole run rather than fail. Wrapping
+    /// it — and nothing cuts that short, since the repo carries no nextest
+    /// config at all and the built-in `slow-timeout` only warns (it sets no
+    /// `terminate-after`), so CI would stall for its whole run rather than
+    /// fail. Wrapping
     /// here turns that regression into a millisecond failure that names the
     /// site. Both deadlines are virtual under `start_paused`, so this costs no
     /// wall-clock in the passing case.

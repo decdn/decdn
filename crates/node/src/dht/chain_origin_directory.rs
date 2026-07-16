@@ -711,6 +711,32 @@ where
         .collect();
 
     // 4. operator → NodeId for every operator we learned about.
+    resolve_bootstrap_bindings(&contracts.bond, &mut cache, metrics).await;
+
+    Ok((cache, latest))
+}
+
+/// Resolve every operator `bootstrap_cache` learned about to its `NodeId`,
+/// filling `cache.operator_node`.
+///
+/// A failed lookup degrades — counted, warned, operator left unmapped — rather
+/// than propagating, for the same reason the replay floor in `bootstrap_cache`
+/// does: `bootstrap` is one-shot (no retry) and its error is fatal at
+/// `runtime`'s call site, so a crash here is strictly worse than graceful
+/// degradation. That matters more now `nodeIdOf` is bounded by [`timed`] —
+/// propagating would turn one slow (>10s) call on a congested or rate-limited
+/// endpoint (#1108) into a node that will not start, and this issues one such
+/// call per authorised operator. An unmapped operator is a routing-only
+/// degradation that self-heals: [`resolve_and_store_operators`] re-resolves it
+/// on that operator's next event, which is the posture that path already takes
+/// for this identical read.
+async fn resolve_bootstrap_bindings<P>(
+    bond: &CapacityBond::CapacityBondInstance<P>,
+    cache: &mut DirectoryCache,
+    metrics: &Metrics,
+) where
+    P: Provider + Clone,
+{
     let operators: HashSet<Address> = cache
         .origins_of_ns
         .values()
@@ -719,18 +745,34 @@ where
         .copied()
         .collect();
     for op in operators {
-        if let Some(node_id) = resolve_node_id(&contracts.bond, op).await? {
-            cache.operator_node.insert(op, node_id);
+        match resolve_node_id(bond, op).await {
+            Ok(Some(node_id)) => {
+                cache.operator_node.insert(op, node_id);
+            }
+            Ok(None) => debug!(%op, "authorized operator has no NodeId binding; not probeable"),
+            Err(err) => {
+                metrics.origin_directory_watcher_resolve_failure();
+                warn!(
+                    err = %sanitize_rpc_display(&err),
+                    %op,
+                    "nodeIdOf failed during bootstrap; operator unmapped until a later event"
+                );
+            }
         }
     }
-
-    Ok((cache, latest))
 }
 
 /// Resolve an operator address to its bound `NodeId` via `nodeIdOf`. Returns
 /// `Ok(None)` when the operator has no binding (`bytes32(0)`) — it cannot be a
 /// probeable origin. The read is bounded by [`timed`]; RPC errors (including a
-/// timeout) propagate (caller decides fatal vs. drop).
+/// timeout) propagate to the caller.
+///
+/// Both callers absorb that error rather than fail on it — `bootstrap_cache`
+/// because a one-shot startup path must not crash on a slow read, and
+/// `resolve_and_store_operators` because the binding self-heals on the
+/// operator's next event. Each bumps `origin_directory_watcher_resolve_failure`
+/// and leaves the operator unmapped. Keep it that way: this returns `Result` so
+/// the *decision* stays at the call site, not because failing is expected.
 async fn resolve_node_id<P>(
     bond: &CapacityBond::CapacityBondInstance<P>,
     operator: Address,
@@ -981,10 +1023,10 @@ mod tests {
 
     use crate::dht::staker_set::StakerChange;
 
-    /// Both of origin's sink-internal reads are bounded, so a stalled provider
-    /// fails the tick into the existing defer/retry path instead of wedging it.
+    /// Origin's `getOrigins` is bounded, so a stalled provider fails the tick
+    /// into the existing defer/retry path instead of wedging it.
     ///
-    /// These drive `Contracts<P>` — the *production* [`OriginChainReads`] impl —
+    /// This drives `Contracts<P>` — the *production* [`OriginChainReads`] impl —
     /// deliberately. Every other test in this module uses `StubReads`, which
     /// carries no `timed` wrap and would therefore pass whether or not the
     /// production impl bounds anything: a stub-level test here would look like a
@@ -1015,8 +1057,16 @@ mod tests {
         );
     }
 
+    /// Origin's `nodeIdOf` is bounded — but unlike `getOrigins` it fails no tick,
+    /// so this asserts boundedness and nothing more. Both callers absorb the
+    /// error: `resolve_and_store_operators` counts-and-skips, `bootstrap_cache`
+    /// degrades rather than crash a one-shot startup. Hence "is bounded" and not
+    /// "fails the tick" — the wedge is the bug; the policy above it is deliberate.
+    ///
+    /// Drives the free `resolve_node_id` rather than `Contracts<P>` because that
+    /// is where the wrap lives and both callers route through it.
     #[tokio::test(start_paused = true)]
-    async fn hanging_node_id_of_fails_the_tick_rather_than_wedging() {
+    async fn hanging_node_id_of_is_bounded_rather_than_wedging() {
         use crate::chain_events::test_support::{bounded, hanging_provider};
         let bond = CapacityBond::CapacityBondInstance::new(Address::ZERO, hanging_provider());
         let err = bounded("resolve_node_id", resolve_node_id(&bond, Address::ZERO))
@@ -1026,7 +1076,40 @@ mod tests {
         assert!(
             err.as_ref()
                 .is_some_and(|e| e.contains("nodeIdOf timed out after")),
-            "a stalled nodeIdOf must fail into the backoff, not hang: {err:?}"
+            "a stalled nodeIdOf must be bounded, not hang: {err:?}"
+        );
+    }
+
+    /// A stalled `nodeIdOf` during bootstrap must degrade, not propagate.
+    ///
+    /// This is the other half of the policy split at [`resolve_node_id`]'s two
+    /// callers, and the reason the bound there could not simply be inherited:
+    /// `bootstrap_cache`'s error is fatal at `runtime`'s call site, so before
+    /// this degraded, bounding the read turned one slow (>10s) call on a
+    /// congested endpoint into a node that would not start at all.
+    #[tokio::test(start_paused = true)]
+    async fn hanging_bootstrap_binding_degrades_rather_than_failing_start() {
+        use crate::chain_events::test_support::{bounded, hanging_provider};
+        let bond = CapacityBond::CapacityBondInstance::new(Address::ZERO, hanging_provider());
+        let metrics = Metrics::new();
+        let mut cache = DirectoryCache::default();
+        cache.default_open.insert(addr(1));
+
+        bounded(
+            "resolve_bootstrap_bindings",
+            resolve_bootstrap_bindings(&bond, &mut cache, &metrics),
+        )
+        .await;
+
+        assert!(
+            cache.operator_node.is_empty(),
+            "a stalled nodeIdOf must leave the operator unmapped, not bind it"
+        );
+        let text = metrics.encode().unwrap();
+        assert!(
+            text.lines()
+                .any(|l| l == "decdn_origin_directory_watcher_resolve_failures_total 1"),
+            "the degraded binding must be counted, not silently dropped:\n{text}"
         );
     }
 
