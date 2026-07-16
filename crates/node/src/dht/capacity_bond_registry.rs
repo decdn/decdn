@@ -54,7 +54,7 @@ use crate::chain_events::resumable_watcher::{
 };
 use crate::chain_events::shared_head::HeadSource;
 use crate::chain_events::{
-    AbortOnDrop, MAX_BACKFILL_BLOCK_SPAN, WATCHER_INITIAL_BACKOFF, WATCHER_MAX_BACKOFF,
+    AbortOnDrop, MAX_BACKFILL_BLOCK_SPAN, WATCHER_INITIAL_BACKOFF, WATCHER_MAX_BACKOFF, timed,
 };
 use crate::dht::chain_staker_set::{ChainStakerSet, apply_change};
 use crate::dht::node_address::{
@@ -112,7 +112,14 @@ struct ContractReads<P: Provider + Clone> {
 
 impl<P: Provider + Clone> RegistryChainReads for ContractReads<P> {
     async fn node_id_of(&self, operator: Address) -> Result<Option<(NodeId, bool)>> {
-        let resolved = self.registry.nodeIdOf(operator).call().await?;
+        // Bounded explicitly: `WatcherConfig::rpc_call_timeout` covers only the
+        // loop's own `get_logs`, so a sink's follow-up read stays unbounded unless
+        // it wraps itself (the `blacklist_watcher::scope_check` precedent). That
+        // matters more now than it did per-watcher: one stalled `nodeIdOf` used to
+        // wedge just the staker-set loop, but this loop also feeds the bindings
+        // projection. A timeout surfaces as `Err`, which `on_operator_change`
+        // already counts and skips without tripping the stream backoff.
+        let resolved = timed(None, "nodeIdOf", self.registry.nodeIdOf(operator).call()).await?;
         let node_id = resolved.nodeId.0;
         if node_id == [0u8; 32] {
             return Ok(None);
