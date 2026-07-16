@@ -39,7 +39,6 @@ use alloy::rpc::types::{Filter, Log};
 use alloy::sol_types::SolEvent;
 use anyhow::{Context, Result};
 use iroh::PublicKey;
-use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -55,20 +54,10 @@ use crate::metrics::Metrics;
 // silently diverge.
 use crate::chain_events::shared_head::HeadSource;
 use crate::chain_events::{
-    MAX_BACKFILL_BLOCK_SPAN, REORG_MARGIN_BLOCKS, WATCHER_INITIAL_BACKOFF, WATCHER_MAX_BACKOFF,
+    AbortOnDrop, MAX_BACKFILL_BLOCK_SPAN, REORG_MARGIN_BLOCKS, WATCHER_INITIAL_BACKOFF,
+    WATCHER_MAX_BACKOFF,
 };
 use crate::reputation_wiring::NodeSettlementSource;
-
-/// Aborts the watcher task on drop so a node-restart cycle never leaks a
-/// chain-poll task. Same pattern as `chain_staker_set::AbortOnDrop`.
-#[derive(Debug)]
-struct AbortOnDrop(JoinHandle<()>);
-
-impl Drop for AbortOnDrop {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
-}
 
 /// Background settlement indexer. Holds only the task handle; all observed
 /// state flows into the shared [`NodeSettlementSource`] passed at bootstrap.

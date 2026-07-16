@@ -22,6 +22,20 @@ use std::future::Future;
 use std::time::Duration;
 
 use anyhow::Result;
+use tokio::task::JoinHandle;
+
+/// Aborts a spawned watcher task on drop, so a node-restart cycle never leaks a
+/// chain-poll task. Shared by every watcher (and the buyer-channel service): the
+/// definition was copy-pasted seven times before, which made it look like each
+/// watcher had its own teardown policy when they were byte-identical.
+#[derive(Debug)]
+pub(crate) struct AbortOnDrop(pub(crate) JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
 
 /// Default first backoff after a failing poll tick, doubled (bounded by
 /// [`WATCHER_MAX_BACKOFF`]) on each successive failure and reset on a clean

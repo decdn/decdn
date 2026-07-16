@@ -36,7 +36,6 @@ use alloy::rpc::types::{Filter, Log};
 use alloy::sol_types::SolEvent;
 use anyhow::Result;
 use decdn_incentive::slash_judge::SlashJudge;
-use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -44,7 +43,9 @@ use crate::chain_events::resumable_watcher::{
     self, CursorPolicy, LogSink, WatcherConfig, WatcherHook,
 };
 use crate::chain_events::shared_head::HeadSource;
-use crate::chain_events::{MAX_BACKFILL_BLOCK_SPAN, REORG_MARGIN_BLOCKS, WATCHER_INITIAL_BACKOFF};
+use crate::chain_events::{
+    AbortOnDrop, MAX_BACKFILL_BLOCK_SPAN, REORG_MARGIN_BLOCKS, WATCHER_INITIAL_BACKOFF,
+};
 use crate::metrics::Metrics;
 
 /// Nominal appeal filing window (ADR 028: 30 days from the slash timestamp).
@@ -101,16 +102,6 @@ pub struct DetectedSlash {
 /// deduped by `slashId`. Cloned into [`crate::admin::AdminState`] for the
 /// read-only `admin_v1_slashes` surface.
 pub type SlashStore = Arc<RwLock<Vec<DetectedSlash>>>;
-
-/// Abort the background task when the owning [`SlashWatcher`] is dropped, so a
-/// runtime teardown doesn't leak the poller.
-struct AbortOnDrop(JoinHandle<()>);
-
-impl Drop for AbortOnDrop {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
-}
 
 /// A running slash-detection watcher. Holds the shared store and owns the
 /// background task (aborted on drop).

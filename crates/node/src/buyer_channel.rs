@@ -44,14 +44,15 @@ use decdn_incentive::{
 };
 use futures_util::FutureExt;
 use iroh::{Endpoint, EndpointAddr, PublicKey};
-use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
 use crate::client_requester::ChannelContext;
 // The buyer-channel open kernel (#940) — the `openChannel` tx + `ChannelOpened`
 // decode + state/ctx build, and the one-time USDC approval — now live in the
 // shared `decdn-client-pull` crate (re-exported here as `client_requester`).
-use crate::chain_events::{MAX_BACKFILL_BLOCK_SPAN, backfill_windows, check_backfill_range};
+use crate::chain_events::{
+    AbortOnDrop, MAX_BACKFILL_BLOCK_SPAN, backfill_windows, check_backfill_range,
+};
 use crate::client_requester::buyer_channel::{
     LOW_WATER_DIVISOR, OpenedChannel, ensure_allowance, open_channel, refill_amount,
 };
@@ -147,17 +148,6 @@ pub struct BuyerReconcileConfig {
 /// An orphan older than this window is missed (it is reclaim-able only after its long
 /// expiry anyway); promote to config if operators need a full-lifetime scan.
 const BUYER_RECONCILE_LOOKBACK_BLOCKS: u64 = 700_000;
-
-/// Aborts the wrapped task on drop so a node-restart cycle never leaks the
-/// reclaim-sweep task. Same pattern as the seller service's `AbortOnDrop`.
-#[derive(Debug)]
-struct AbortOnDrop(JoinHandle<()>);
-
-impl Drop for AbortOnDrop {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
-}
 
 /// Bound the wait for the `reclaimExpired` receipt on the open path's rotate leg.
 ///

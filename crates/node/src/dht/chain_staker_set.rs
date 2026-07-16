@@ -79,7 +79,6 @@ use alloy::rpc::types::{Filter, Log};
 use alloy::sol_types::SolEvent;
 use anyhow::{Context, Result};
 use tokio::sync::broadcast;
-use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -87,7 +86,9 @@ use crate::chain_events::resumable_watcher::{
     self, CursorPolicy, LogSink, WatcherConfig, WatcherHook,
 };
 use crate::chain_events::shared_head::HeadSource;
-use crate::chain_events::{MAX_BACKFILL_BLOCK_SPAN, WATCHER_INITIAL_BACKOFF, WATCHER_MAX_BACKOFF};
+use crate::chain_events::{
+    AbortOnDrop, MAX_BACKFILL_BLOCK_SPAN, WATCHER_INITIAL_BACKOFF, WATCHER_MAX_BACKOFF,
+};
 use crate::dht::routing::NodeId;
 use crate::dht::staker_set::{StakerChange, StakerSet};
 use crate::metrics::Metrics;
@@ -339,19 +340,6 @@ where
             warn!("ChainStakerSet active set RwLock poisoned; recovering inner state");
             f(&poisoned.into_inner())
         }
-    }
-}
-
-/// Watcher join handle that aborts the task on drop. The task itself
-/// is `pin`-friendly and self-contained, so abort is sufficient
-/// cleanup; we do not await its completion (the runtime's drain pass
-/// only awaits handles registered in the main `JoinSet`).
-#[derive(Debug)]
-struct AbortOnDrop(JoinHandle<()>);
-
-impl Drop for AbortOnDrop {
-    fn drop(&mut self) {
-        self.0.abort();
     }
 }
 

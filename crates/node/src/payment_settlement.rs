@@ -86,7 +86,8 @@ use crate::chain_events::resumable_watcher::{
 };
 use crate::chain_events::shared_head::HeadSource;
 use crate::chain_events::{
-    MAX_BACKFILL_BLOCK_SPAN, REORG_MARGIN_BLOCKS, WATCHER_INITIAL_BACKOFF, WATCHER_MAX_BACKOFF,
+    AbortOnDrop, MAX_BACKFILL_BLOCK_SPAN, REORG_MARGIN_BLOCKS, WATCHER_INITIAL_BACKOFF,
+    WATCHER_MAX_BACKOFF,
 };
 use crate::handlers::client::ClientHandler;
 use crate::metrics::{Metrics, SettleParty};
@@ -189,17 +190,6 @@ const CHECKPOINT_FLUSH_BLOCKS: u64 = 512;
 /// would defer the write indefinitely. 30s keeps the steady-state fsync rate
 /// negligible while making the worst-case lost progress a handful of L2 blocks.
 const CHECKPOINT_FLUSH_INTERVAL: Duration = Duration::from_secs(30);
-
-/// Aborts the wrapped task on drop so a node-restart cycle never leaks a
-/// chain-poll task. Same pattern as `chain_staker_set::AbortOnDrop`.
-#[derive(Debug)]
-struct AbortOnDrop(JoinHandle<()>);
-
-impl Drop for AbortOnDrop {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
-}
 
 /// Seller-side `PaymentChannel` settlement service. Generic over the alloy
 /// [`Provider`] (a wallet-filled provider is required for the `withdraw` /
