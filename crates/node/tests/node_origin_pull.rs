@@ -42,7 +42,7 @@ use decdn_node::dht::negative_cache::Hash as DhtHash;
 use decdn_node::dht::routing::{NodeId as DhtNodeId, RoutingTable};
 use decdn_node::dht::{
     ConfigOriginDirectory, ConfigStakerSet, NegativeProbeCache, NodeAddressResolver,
-    OriginDirectory, StakerSet, StaticNodeAddressDirectory,
+    OriginDirectory, PositiveProbeCache, StakerSet, StaticNodeAddressDirectory,
 };
 use decdn_node::leech_governor::{LeechCaps, LeechCapsConfig, LeechGovernor};
 use decdn_node::metrics::Metrics;
@@ -706,6 +706,50 @@ fn build_origin_with_negative_cache(
     max_blob_size_bytes: u64,
     negative_cache: NegativeProbeCache,
 ) -> NodeOrigin {
+    build_origin_with_probe_caches(
+        ep_b,
+        b_dht,
+        hash,
+        buyer,
+        local_rep,
+        obs_buffer,
+        metrics,
+        region_accountant,
+        providers,
+        addr_map,
+        pull_timeout,
+        stall_timeout,
+        max_blob_size_bytes,
+        negative_cache,
+        PositiveProbeCache::new(),
+    )
+}
+
+/// [`build_origin_with_timeout`] with BOTH probe caches injected, so a test can pick each
+/// TTL independently.
+///
+/// The positive cache anchors expiry on `Instant` like its negative twin, so `tokio::time`
+/// cannot fast-forward it and 15s per assertion is not a test suite. Injecting the two
+/// separately is also what makes their INTERACTION observable: a positive entry that
+/// outlives a negative one is how a peer becomes selectable again without a re-probe.
+#[allow(clippy::too_many_arguments, clippy::expect_used)]
+fn build_origin_with_probe_caches(
+    ep_b: &iroh::Endpoint,
+    b_dht: DhtNodeId,
+    hash: Hash,
+    buyer: Arc<dyn ChannelOpener>,
+    local_rep: &Arc<LocalReputation>,
+    obs_buffer: &Arc<ObservationBuffer>,
+    metrics: &Arc<Metrics>,
+    region_accountant: &Arc<RegionAccountant>,
+    providers: Vec<DhtNodeId>,
+    addr_map: HashMap<DhtNodeId, Address>,
+    pull_timeout: Duration,
+    stall_timeout: Duration,
+    max_blob_size_bytes: u64,
+    negative_cache: NegativeProbeCache,
+    probe_cache: PositiveProbeCache,
+) -> NodeOrigin {
     let mut dir = HashMap::new();
     dir.insert(DhtHash::from_bytes(*hash.as_bytes()), providers);
 
@@ -729,6 +773,7 @@ fn build_origin_with_negative_cache(
         ),
         rep_cfg: NetworkReputationConfig::default(),
         negative_cache,
+        probe_cache,
         metrics: Arc::clone(metrics),
         region_accountant: Arc::clone(region_accountant),
         config: NodeOriginConfig {
@@ -790,6 +835,7 @@ fn build_origin_multi_hash(
         ),
         rep_cfg: NetworkReputationConfig::default(),
         negative_cache: NegativeProbeCache::new(),
+        probe_cache: PositiveProbeCache::new(),
         metrics: Arc::clone(metrics),
         region_accountant: Arc::clone(region_accountant),
         config: NodeOriginConfig {
@@ -993,6 +1039,7 @@ async fn prefetch_acquire_pulls_and_records_spend() -> Result<()> {
         ),
         rep_cfg: NetworkReputationConfig::default(),
         negative_cache: NegativeProbeCache::new(),
+        probe_cache: PositiveProbeCache::new(),
         metrics: Arc::clone(&b_metrics),
         region_accountant: empty_region_accountant(),
         config: NodeOriginConfig {
@@ -1438,6 +1485,7 @@ async fn prefetch_acquired_blob_credits_served_through_serve_loop() -> Result<()
         ),
         rep_cfg: NetworkReputationConfig::default(),
         negative_cache: NegativeProbeCache::new(),
+        probe_cache: PositiveProbeCache::new(),
         metrics: Arc::clone(&b_metrics),
         region_accountant: empty_region_accountant(),
         config: NodeOriginConfig {
@@ -9128,6 +9176,7 @@ async fn two_concurrent_pulls_to_one_provider_share_the_channel_ledger() -> Resu
         ),
         rep_cfg: NetworkReputationConfig::default(),
         negative_cache: NegativeProbeCache::new(),
+        probe_cache: PositiveProbeCache::new(),
         metrics: Arc::clone(&b_metrics),
         region_accountant: empty_region_accountant(),
         config: NodeOriginConfig {

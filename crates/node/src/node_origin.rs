@@ -72,7 +72,8 @@ use crate::client_requester::{
 use crate::dht::negative_cache::Hash as DhtHash;
 use crate::dht::routing::{NodeId as DhtNodeId, RoutingTable};
 use crate::dht::{
-    LookupConfig, NegativeProbeCache, NodeAddressResolver, OriginDirectory, StakerSet,
+    LookupConfig, NegativeProbeCache, NodeAddressResolver, OriginDirectory, PositiveProbeCache,
+    ProbedProvider, StakerSet,
 };
 use crate::metrics::Metrics;
 use crate::probe_client::probe_once;
@@ -286,6 +287,14 @@ pub struct NodeOriginDeps {
     pub rep_cfg: NetworkReputationConfig,
     /// Requester-side negative-probe cache (drops known-absent providers).
     pub negative_cache: NegativeProbeCache,
+    /// Requester-side positive probe cache (ADR 001 §Probe cache): lets a repeat
+    /// miss for a hash inside the TTL skip the DHT lookup and probe fanout
+    /// (#1165). Beside the negative cache, and by value for the same reason:
+    /// `NodeOrigin` holds its deps behind `Arc<OnceLock<NodeOriginDeps>>`, so
+    /// every concurrent pull already shares one instance through that `Arc`, and
+    /// the cache's own `Mutex` gives it interior mutability behind `&self`. A
+    /// second `Arc` here would buy nothing but a pointer chase.
+    pub probe_cache: PositiveProbeCache,
     /// Node metrics for the paid-pull observability counters (#831).
     pub metrics: Arc<Metrics>,
     /// Per-region byte accountant; the inbound (`bytes_in`) counterpart of the
@@ -916,6 +925,34 @@ async fn probe_and_rank(
         .into_iter()
         .flatten()
         .collect();
+    let ranked = rank(candidates);
+    // ADR 001 §Probe cache: retain the top 10 by selection score, so a repeat
+    // miss for this hash inside the TTL skips the lookup and the probe fanout.
+    // `insert` does the truncation; `ranked` is already in selection order,
+    // which is the ordering that claim depends on.
+    //
+    // Only the triple is stored — never the signed `ProbeResponse` (its
+    // `slash_sig` is another node's slashable statement, and #1165's "no
+    // evidence retention" is that this cache must not become an evidence
+    // locker), and never `reputation`, which `cached_candidates` recomputes.
+    deps.probe_cache.insert(
+        target,
+        ranked
+            .iter()
+            .map(|c| ProbedProvider {
+                node_id: DhtNodeId::from_bytes(c.node_id),
+                rate_per_mb: c.rate_per_mb,
+                rtt_ms: c.rtt_ms,
+            })
+            .collect(),
+    );
+    ranked
+}
+
+/// `rank_candidates` reduced to the best-first `Candidate` list both pull paths
+/// consume. Shared by the cold path and the probe-cache-hit path so a change to
+/// what "ranked" means cannot apply to one and not the other.
+fn rank(candidates: Vec<Candidate>) -> Vec<Candidate> {
     rank_candidates(candidates)
         .into_iter()
         .map(|r| r.candidate)

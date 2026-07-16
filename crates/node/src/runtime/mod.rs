@@ -1708,6 +1708,7 @@ pub async fn run(
                     network_rep: network_reputation_c,
                     rep_cfg: node_origin_reputation_cfg,
                     negative_cache: crate::dht::NegativeProbeCache::new(),
+                    probe_cache: crate::dht::PositiveProbeCache::new(),
                     metrics: node_metrics_for_origin,
                     region_accountant: region_accountant_c,
                     config: node_origin_config,
