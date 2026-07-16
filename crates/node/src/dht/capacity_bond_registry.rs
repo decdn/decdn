@@ -337,6 +337,7 @@ pub async fn bootstrap<P>(
     head: Arc<dyn HeadSource>,
     track_node_addresses: bool,
     metrics: Arc<Metrics>,
+    shutdown: CancellationToken,
 ) -> Result<RegistryHandles>
 where
     P: Provider + Clone + 'static,
@@ -405,7 +406,7 @@ where
         initial_backoff: WATCHER_INITIAL_BACKOFF,
         max_backoff: WATCHER_MAX_BACKOFF,
         rpc_call_timeout: None,
-        shutdown: CancellationToken::new(),
+        shutdown,
         seed_cursor: Some(snapshot_block),
         label: "capacity-bond",
         on_established: Some(established_hook(&metrics)),

@@ -130,6 +130,7 @@ impl SlashWatcher {
     /// O(chain-age) scan — the store is not durable, so a resume cursor could not
     /// skip this rebuild.
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn bootstrap<P: Provider + Clone + 'static>(
         provider: P,
         slash_judge_addr: Address,
@@ -138,6 +139,7 @@ impl SlashWatcher {
         event_poll_interval: Duration,
         head: Arc<dyn HeadSource>,
         metrics: Arc<Metrics>,
+        shutdown: CancellationToken,
     ) -> Self {
         info!(%slash_judge_addr, %self_address, from_block, "slash-detection watcher started");
         let store: SlashStore = Arc::new(RwLock::new(Vec::new()));
@@ -165,7 +167,7 @@ impl SlashWatcher {
             initial_backoff: WATCHER_INITIAL_BACKOFF,
             max_backoff: SLASH_MAX_BACKOFF,
             rpc_call_timeout: None,
-            shutdown: CancellationToken::new(),
+            shutdown,
             seed_cursor: None,
             label: "slash",
             on_established,
