@@ -43,7 +43,7 @@ use decdn_node::dht::negative_cache::Hash as DhtHash;
 use decdn_node::dht::routing::{NodeId as DhtNodeId, RoutingTable};
 use decdn_node::dht::{
     ConfigOriginDirectory, ConfigStakerSet, NegativeProbeCache, NodeAddressResolver,
-    OriginDirectory, PositiveProbeCache, StakerChange, StakerSet, StaticNodeAddressDirectory,
+    OriginDirectory, PositiveProbeCache, StakerSet, StaticNodeAddressDirectory,
 };
 use decdn_node::leech_governor::{LeechCaps, LeechCapsConfig, LeechGovernor};
 use decdn_node::metrics::Metrics;
@@ -11272,17 +11272,12 @@ async fn a_probe_cache_hit_still_honours_the_wedged_provider_filter() -> Result<
 #[derive(Debug)]
 struct MutableStakerSet {
     active: Mutex<HashSet<DhtNodeId>>,
-    /// Held solely to hand out live receivers via [`StakerSet::subscribe_changes`];
-    /// this test drives membership by direct mutation, not by emitting events.
-    tx: tokio::sync::broadcast::Sender<StakerChange>,
 }
 
 impl MutableStakerSet {
-    fn new(active: HashSet<DhtNodeId>) -> Self {
-        let (tx, _) = tokio::sync::broadcast::channel(4);
+    const fn new(active: HashSet<DhtNodeId>) -> Self {
         Self {
             active: Mutex::new(active),
-            tx,
         }
     }
 
@@ -11311,10 +11306,6 @@ impl StakerSet for MutableStakerSet {
             .iter()
             .copied()
             .collect()
-    }
-
-    fn subscribe_changes(&self) -> tokio::sync::broadcast::Receiver<StakerChange> {
-        self.tx.subscribe()
     }
 }
 
