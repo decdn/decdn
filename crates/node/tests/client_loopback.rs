@@ -51,6 +51,7 @@ use decdn_protocol::client::{
 use decdn_protocol::{
     ALPN_CLIENT, decode_message, encode_message, encode_stream_request, read_frame, write_frame,
 };
+use iroh::endpoint::ConnectionError;
 use iroh::{Endpoint, EndpointAddr};
 
 mod support;
@@ -237,6 +238,193 @@ async fn client_delivery_roundtrip_advances_channel_state() -> anyhow::Result<()
         only.last_bytes_delivered()
     );
     anyhow::ensure!(only.last_amount() > U256::ZERO, "amount must be non-zero");
+
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
+/// ADR 005 §Connection lifetime (#1193): a connection with no active stream is
+/// closed by the application layer after `APP_IDLE_TIMEOUT`. A short timeout is
+/// injected via `set_idle_timeout` so the test need not wait the production 30s.
+/// The client opens no stream, so the server's serve loop is idle from the start
+/// and must close it; the close is asserted to be the graceful no-error "idle"
+/// close (`APP_ERR_NO_ERROR` + reason `"idle"`), not a fault or transport reset.
+#[tokio::test(flavor = "multi_thread")]
+async fn idle_connection_is_closed_by_the_app_layer() -> anyhow::Result<()> {
+    let (cache, _cache_tmp) = empty_cache().await?;
+    let store: Arc<dyn ChannelStateStore> = Arc::new(MemoryChannelStateStore::new());
+
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = Arc::new(PrivateKeySigner::random());
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let handler = build_handler(
+        server_id,
+        &server_eth,
+        &metrics,
+        limiter,
+        cache,
+        store,
+        RATE_PER_MB,
+    )?;
+    handler.set_idle_timeout(Duration::from_millis(300));
+
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+    let conn = client_ep
+        .connect(target, ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+
+    // No stream is ever opened: the serve loop is idle from the first poll and
+    // must close us after the injected 300ms window. The outer 10s bound is
+    // generous against CI jitter yet still fails if the idle arm never fires.
+    let err = tokio::time::timeout(Duration::from_secs(10), conn.closed())
+        .await
+        .map_err(|_| anyhow::anyhow!("connection was not idle-closed within 10s"))?;
+
+    match err {
+        ConnectionError::ApplicationClosed(ac) => {
+            // `APP_ERR_NO_ERROR` (0x00) — the handler's clean-lifecycle close code.
+            anyhow::ensure!(
+                ac.error_code.into_inner() == 0,
+                "idle close must use the no-error code, got {}",
+                ac.error_code.into_inner()
+            );
+            anyhow::ensure!(
+                ac.reason.as_ref() == b"idle",
+                "idle close reason: {:?}",
+                ac.reason
+            );
+        }
+        other => anyhow::bail!("expected a graceful application idle-close, got {other:?}"),
+    }
+
+    // The reap must be metered, not just logged at `debug!` — the counter is the
+    // operator's only signal for the streamless-keep-alive abuse pattern (#1193).
+    // Asserting the exact `name value` line also guards the recorder wiring: a
+    // typo'd metric name or a bump of the wrong counter would fail here.
+    let encoded = metrics.encode()?;
+    anyhow::ensure!(
+        metric_line_present(&encoded, "decdn_client_idle_close_total 1"),
+        "idle-close must bump decdn_client_idle_close_total; got:\n{encoded}"
+    );
+
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
+/// ADR 005 §Connection lifetime (#1193): the app-layer idle reaper must (a) NOT
+/// close a connection while a stream is still being served, and (b) re-arm from
+/// that stream's completion — the two invariants the never-opened-a-stream test
+/// above cannot reach. The client opens one stream and parks it mid-request (it
+/// sends only the frame's length prefix, so the server blocks in `read_frame`),
+/// holding the serve loop's `inflight` non-empty; the connection must survive
+/// several idle windows. Completing the frame lets the serve future finish and
+/// empties `inflight`; the reaper then re-arms and reaps the now-idle connection.
+#[tokio::test(flavor = "multi_thread")]
+async fn in_flight_stream_defers_idle_close_then_reaps_on_completion() -> anyhow::Result<()> {
+    // Frame-body length promised in the prefix but withheld to park the server's
+    // `read_frame`; a single varint byte since 64 < 128.
+    const BODY_LEN: u8 = 64;
+
+    let (cache, _cache_tmp) = empty_cache().await?;
+    let store: Arc<dyn ChannelStateStore> = Arc::new(MemoryChannelStateStore::new());
+
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = Arc::new(PrivateKeySigner::random());
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let handler = build_handler(
+        server_id,
+        &server_eth,
+        &metrics,
+        limiter,
+        cache,
+        store,
+        RATE_PER_MB,
+    )?;
+    let idle = Duration::from_millis(150);
+    handler.set_idle_timeout(idle);
+
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+    let conn = client_ep
+        .connect(target, ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+
+    // Open a stream and send ONLY the frame's length prefix, then withhold the
+    // body. The server accepts the stream and parks in `read_frame`'s
+    // `read_exact`, so its serve future stays in `inflight` — held there well
+    // within the 5s request-read timeout.
+    let (mut send, _recv) = conn
+        .open_bi()
+        .await
+        .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
+    send.write_all(&[BODY_LEN])
+        .await
+        .map_err(|e| anyhow::anyhow!("write frame len: {e}"))?;
+
+    // (a) Gating: with a stream in flight the reaper is disabled, so the
+    // connection must NOT be closed even after several idle windows. A resolved
+    // `closed()` here means the `inflight.is_empty()` gate is broken and a live
+    // stream was truncated. The `idle * 5` bound is well past the idle window yet
+    // far short of the 5s read timeout, so a pass is the gate holding open, not
+    // the parked read expiring.
+    let premature = tokio::time::timeout(idle * 5, conn.closed()).await;
+    anyhow::ensure!(
+        premature.is_err(),
+        "connection was idle-closed while a stream was in flight: {premature:?}"
+    );
+
+    // Complete the frame; the 64 bytes decode to no valid request, so the server
+    // resets the stream and its serve future returns, emptying `inflight`.
+    send.write_all(&[0xFFu8; BODY_LEN as usize])
+        .await
+        .map_err(|e| anyhow::anyhow!("write frame body: {e}"))?;
+
+    // (b) Re-arm: from that completion the idle clock restarts and must reap the
+    // now-streamless connection with the same graceful no-error "idle" close.
+    let err = tokio::time::timeout(Duration::from_secs(10), conn.closed())
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!("connection was not idle-closed after the stream completed")
+        })?;
+    match err {
+        ConnectionError::ApplicationClosed(ac) => {
+            anyhow::ensure!(
+                ac.error_code.into_inner() == 0,
+                "idle close must use the no-error code, got {}",
+                ac.error_code.into_inner()
+            );
+            anyhow::ensure!(
+                ac.reason.as_ref() == b"idle",
+                "idle close reason: {:?}",
+                ac.reason
+            );
+        }
+        other => anyhow::bail!("expected a graceful application idle-close, got {other:?}"),
+    }
+
+    // Exactly one connection was reaped, and only after the stream finished.
+    let encoded = metrics.encode()?;
+    anyhow::ensure!(
+        metric_line_present(&encoded, "decdn_client_idle_close_total 1"),
+        "post-stream idle-close must bump decdn_client_idle_close_total; got:\n{encoded}"
+    );
 
     client_ep.close().await;
     server_ep.close().await;

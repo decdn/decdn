@@ -94,8 +94,9 @@ const PROBE_RATE_LIMIT_GC_INTERVAL: Duration = Duration::from_mins(1);
 /// dropping the mapping"). The QUIC timer is a defense-in-depth floor
 /// for genuinely silent paths (e.g. peer crash / network partition); the
 /// "close 30s after last stream and no unacked vouchers" rule is
-/// application-layer and lives in the cdn/client/v1 handler (not yet
-/// implemented).
+/// application-layer and lives in the cdn/client/v1 handler's serve loop
+/// (`handlers::client::APP_IDLE_TIMEOUT`), which reaps keep-alive'd-but-
+/// streamless connections the transport timer cannot.
 const QUIC_MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Interval between QUIC PING keep-alive frames. Per ADR 005 §Connection
