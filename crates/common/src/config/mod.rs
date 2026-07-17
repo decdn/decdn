@@ -1014,6 +1014,36 @@ fn resolve_blockchain_into(
         bag,
     );
 
+    // The all-zero address checksum-validates cleanly but is never a real
+    // deployment; settling/staking against a codeless address surfaces only as
+    // an opaque on-chain revert. Reject it here — mirroring `slash_judge_address`
+    // and `content_blacklist_address` below — so `decdn config check` catches it
+    // and the daemon's runtime guard (#1219) is uniform defense-in-depth rather
+    // than the sole check. Skipped when the value is an empty placeholder: the
+    // missing/parse problem is already recorded.
+    if !payment_channel_address.is_empty() {
+        bag.check(
+            payment_channel_address
+                .trim_start_matches("0x")
+                .bytes()
+                .any(|b| b != b'0'),
+            "blockchain.payment_channel_address",
+            "blockchain.payment_channel_address must not be the zero address — \
+             set it to the deployed PaymentChannel contract",
+        );
+    }
+    if !capacity_bond_address.is_empty() {
+        bag.check(
+            capacity_bond_address
+                .trim_start_matches("0x")
+                .bytes()
+                .any(|b| b != b'0'),
+            "blockchain.capacity_bond_address",
+            "blockchain.capacity_bond_address must not be the zero address — \
+             set it to the deployed CapacityBond contract",
+        );
+    }
+
     // Optional chain-backed origin directory (ADR 022 §FIND_VALUE Flow):
     // `OriginAssignment` + `PublisherRegistry`. Both-or-neither — the directory
     // resolution chain needs both reads, so a lone address is an operator
@@ -1055,6 +1085,25 @@ fn resolve_blockchain_into(
             parse_contract_address("publisher_registry_address", &v),
         )
     });
+    // Present-but-zero is a fail-open trap like the other contract addresses:
+    // the directory would resolve every hash against a codeless address. Reject
+    // it (mirroring `content_blacklist_address`); a missing value stays `None`.
+    if let Some(addr) = origin_assignment_address.as_deref() {
+        bag.check(
+            addr.trim_start_matches("0x").bytes().any(|b| b != b'0'),
+            "blockchain.origin_assignment_address",
+            "blockchain.origin_assignment_address must not be the zero address — \
+             set it to the deployed OriginAssignment contract",
+        );
+    }
+    if let Some(addr) = publisher_registry_address.as_deref() {
+        bag.check(
+            addr.trim_start_matches("0x").bytes().any(|b| b != b'0'),
+            "blockchain.publisher_registry_address",
+            "blockchain.publisher_registry_address must not be the zero address — \
+             set it to the deployed PublisherRegistry contract",
+        );
+    }
     // File-only tuning for the chain-backed origin directory's log replay.
     // Default `0` is correct but scans the whole chain; operators set this to
     // the PublisherRegistry deployment block on an established L2.
@@ -8244,6 +8293,116 @@ swap_pool_address = \"0xPool\"
         let msg = format!("{err:#}");
         assert!(
             msg.contains("content_blacklist_address") && msg.contains("zero address"),
+            "error should reject the zero address: {msg}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_blockchain_rejects_zero_payment_channel_address() -> anyhow::Result<()> {
+        let dir = data_dir_with_keystore()?;
+        let cli = BlockchainArgs {
+            origin_assignment_address: None,
+            publisher_registry_address: None,
+            rpc_url: Some("https://example/rpc".to_string()),
+            eth_keystore: None,
+            keystore_password_file: None,
+            payment_channel_address: Some("0x0000000000000000000000000000000000000000".to_string()),
+            capacity_bond_address: Some(GOOD_ADDR.to_string()),
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            content_blacklist_address: None,
+            chain_id: None,
+        };
+        let Err(err) = resolve_blockchain(&cli, None, dir.path()) else {
+            anyhow::bail!("expected error for zero payment_channel_address");
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("payment_channel_address") && msg.contains("zero address"),
+            "error should reject the zero address: {msg}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_blockchain_rejects_zero_capacity_bond_address() -> anyhow::Result<()> {
+        let dir = data_dir_with_keystore()?;
+        let cli = BlockchainArgs {
+            origin_assignment_address: None,
+            publisher_registry_address: None,
+            rpc_url: Some("https://example/rpc".to_string()),
+            eth_keystore: None,
+            keystore_password_file: None,
+            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            capacity_bond_address: Some("0x0000000000000000000000000000000000000000".to_string()),
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            content_blacklist_address: None,
+            chain_id: None,
+        };
+        let Err(err) = resolve_blockchain(&cli, None, dir.path()) else {
+            anyhow::bail!("expected error for zero capacity_bond_address");
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("capacity_bond_address") && msg.contains("zero address"),
+            "error should reject the zero address: {msg}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_blockchain_rejects_zero_origin_assignment_address() -> anyhow::Result<()> {
+        // Both-or-neither with publisher_registry, so set both with only
+        // origin_assignment zeroed to exercise its guard in isolation.
+        let dir = data_dir_with_keystore()?;
+        let cli = BlockchainArgs {
+            origin_assignment_address: Some(
+                "0x0000000000000000000000000000000000000000".to_string(),
+            ),
+            publisher_registry_address: Some(GOOD_ADDR.to_string()),
+            rpc_url: Some("https://example/rpc".to_string()),
+            eth_keystore: None,
+            keystore_password_file: None,
+            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            capacity_bond_address: Some(GOOD_ADDR.to_string()),
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            content_blacklist_address: None,
+            chain_id: None,
+        };
+        let Err(err) = resolve_blockchain(&cli, None, dir.path()) else {
+            anyhow::bail!("expected error for zero origin_assignment_address");
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("origin_assignment_address") && msg.contains("zero address"),
+            "error should reject the zero address: {msg}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_blockchain_rejects_zero_publisher_registry_address() -> anyhow::Result<()> {
+        let dir = data_dir_with_keystore()?;
+        let cli = BlockchainArgs {
+            origin_assignment_address: Some(GOOD_ADDR.to_string()),
+            publisher_registry_address: Some(
+                "0x0000000000000000000000000000000000000000".to_string(),
+            ),
+            rpc_url: Some("https://example/rpc".to_string()),
+            eth_keystore: None,
+            keystore_password_file: None,
+            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            capacity_bond_address: Some(GOOD_ADDR.to_string()),
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            content_blacklist_address: None,
+            chain_id: None,
+        };
+        let Err(err) = resolve_blockchain(&cli, None, dir.path()) else {
+            anyhow::bail!("expected error for zero publisher_registry_address");
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("publisher_registry_address") && msg.contains("zero address"),
             "error should reject the zero address: {msg}"
         );
         Ok(())
