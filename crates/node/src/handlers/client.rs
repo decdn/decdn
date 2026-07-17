@@ -602,6 +602,9 @@ pub struct ClientHandler {
     /// guards the map; each inner mutex serializes voucher application for one
     /// channel across its concurrent streams (ADR 003 §concurrent streams).
     channels: Arc<Mutex<HashMap<ChannelId, Arc<Mutex<ChannelDeliveryState>>>>>,
+    /// Serializes absolute channel snapshots without holding the channel map
+    /// while individual channel state (which may be fsync-bound) is locked.
+    channel_metrics_refresh: Mutex<()>,
     /// Redeem-hint sender to the on-chain settlement service (#327), attached
     /// post-construction via [`ClientHandler::attach_redeem_hint`]. `None`
     /// until attached (e.g. in tests with no settlement service) — a hint is
@@ -760,6 +763,7 @@ impl ClientHandler {
             channel_state_store,
             receipt_sink,
             channels: Arc::new(Mutex::new(map)),
+            channel_metrics_refresh: Mutex::new(()),
             redeem_hint: OnceLock::new(),
             voucher_activity: OnceLock::new(),
             region_accountant: OnceLock::new(),
@@ -1409,13 +1413,19 @@ impl ClientHandler {
     }
 
     async fn refresh_channel_metrics(&self) {
-        let channels = self.channels.lock().await;
+        let _refresh = self.channel_metrics_refresh.lock().await;
+        let (open, channels) = {
+            let channels = self.channels.lock().await;
+            (
+                channels.len(),
+                channels.values().cloned().collect::<Vec<_>>(),
+            )
+        };
         let mut deposit = U256::ZERO;
-        for channel in channels.values() {
+        for channel in channels {
             deposit = deposit.saturating_add(channel.lock().await.state.deposit);
         }
-        self.metrics
-            .set_inbound_channel_snapshot(channels.len(), deposit);
+        self.metrics.set_inbound_channel_snapshot(open, deposit);
     }
 
     /// Accept the connection-level rate-limit permit, then serve each inbound
@@ -3423,6 +3433,80 @@ mod tests {
         )
         .expect("handler");
         (Arc::new(handler), dir)
+    }
+
+    #[tokio::test]
+    async fn channel_metric_refresh_releases_map_and_serializes_snapshots() {
+        let metrics = Arc::new(Metrics::new());
+        let (handler, _dir) = handler_for_warm_tests(&metrics).await;
+        let old_id = B256::repeat_byte(0xA1);
+        let old = Arc::new(Mutex::new(ChannelDeliveryState {
+            state: ChannelState::new(
+                old_id,
+                Address::repeat_byte(0x11),
+                Address::repeat_byte(0x22),
+                U256::from(10u64),
+            ),
+            bytes_delivered_cumulative: U256::ZERO,
+        }));
+        handler
+            .channels
+            .lock()
+            .await
+            .insert(old_id, Arc::clone(&old));
+
+        let held = old.lock().await;
+        let first = tokio::spawn({
+            let handler = Arc::clone(&handler);
+            async move { handler.refresh_channel_metrics().await }
+        });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            !first.is_finished(),
+            "refresh must be waiting on the channel"
+        );
+
+        let new_id = B256::repeat_byte(0xB2);
+        let mut channels =
+            tokio::time::timeout(Duration::from_millis(100), handler.channels.lock())
+                .await
+                .expect("refresh must release the global map before awaiting a channel");
+        channels.clear();
+        channels.insert(
+            new_id,
+            Arc::new(Mutex::new(ChannelDeliveryState {
+                state: ChannelState::new(
+                    new_id,
+                    Address::repeat_byte(0x33),
+                    Address::repeat_byte(0x44),
+                    U256::from(20u64),
+                ),
+                bytes_delivered_cumulative: U256::ZERO,
+            })),
+        );
+        drop(channels);
+
+        let mut second = tokio::spawn({
+            let handler = Arc::clone(&handler);
+            async move { handler.refresh_channel_metrics().await }
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut second)
+                .await
+                .is_err(),
+            "a newer refresh must wait so it publishes after the older snapshot"
+        );
+
+        drop(held);
+        first.await.expect("first refresh task");
+        second.await.expect("second refresh task");
+        let encoded = metrics.encode().expect("metrics encode");
+        assert!(encoded.lines().any(|line| line == "decdn_channels_open 1"));
+        assert!(
+            encoded
+                .lines()
+                .any(|line| line == "decdn_channel_deposit_usdc 20")
+        );
     }
 
     /// The warm memory budget must SHED, not just be computed (#1145 review).
