@@ -15,14 +15,17 @@ use crate::dht::lookup::{DEFAULT_ROUND_TIMEOUT, MAX_LOOKUP_ROUNDS};
 /// caller (issue #322 — "max 3 provider attempts before returning error").
 pub const MAX_PROVIDER_ATTEMPTS: usize = 3;
 
-/// Per-candidate probe timeout. Short relative to the pull timeout — a probe is a single
-/// unpaid round trip, so a slow candidate is dropped quickly rather than burning the
-/// caller's miss-latency budget on it.
+/// Per-candidate probe timeout. Because candidates are probed concurrently, this also
+/// bounds the whole probe-collection phase. The budget covers connection setup plus one
+/// unpaid probe request/response; warm or 0-RTT connections (ADR 015) complete in a single
+/// round trip, so the 500 ms ceiling accommodates inter-continental RTTs while still
+/// dropping a slow or unreachable candidate before it burns the caller's miss-latency
+/// budget (ADR 001 § Probe response collection).
 ///
 /// Lives here, beside the deadline arithmetic that has to budget for it, rather than in
 /// `node_origin` where it is used (#1145 review). Every term of [`outer_pull_deadline`] is
 /// then visible in one file, which is what stops the next one from being guessed.
-pub const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+pub const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// One-time headroom added on top of the `MAX_PROVIDER_ATTEMPTS` sequential per-candidate
 /// costs when computing the outer pull-through deadline (#859). It covers the *one-time*
@@ -33,13 +36,14 @@ pub const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// tunable judgement value… small relative to one per-candidate budget", and it was smaller
 /// than the thing it was named for:
 ///
-/// - probing is concurrent, so it costs one [`PROBE_TIMEOUT`] — 5 s; but
+/// - probing is concurrent, so it costs one [`PROBE_TIMEOUT`] — 500 ms; but
 /// - discovery is `find_providers`, whose rounds are each bounded by
-///   [`DEFAULT_ROUND_TIMEOUT`] (8 s) and whose ROUND COUNT was unbounded.
+///   [`DEFAULT_ROUND_TIMEOUT`] (8 s) and whose round count is capped by
+///   [`MAX_LOOKUP_ROUNDS`] (4).
 ///
-/// So a single slow round plus the probe phase already cost 13 s against a 10 s budget,
-/// before any lookup that needed a second round. The outer deadline was therefore short of
-/// what the fetch could actually spend, and the `tokio::time::timeout` around
+/// At those defaults, four discovery rounds plus the probe phase can cost 32.5 s against
+/// the old 10 s budget. The outer deadline was therefore short of what the fetch could
+/// actually spend, and the `tokio::time::timeout` around
 /// `discover → probe → rank → pull` could fire while candidate #3 was still in its stall
 /// window — the #859 fallback starvation this whole formula exists to prevent, reachable at
 /// the defaults.
@@ -465,6 +469,11 @@ mod tests {
     use super::*;
     use rand::SeedableRng;
 
+    #[test]
+    fn probe_timeout_matches_the_adr_collection_ceiling() {
+        assert_eq!(PROBE_TIMEOUT, Duration::from_millis(500));
+    }
+
     // #859 regression guard: the derived outer pull-through deadline must strictly
     // exceed the sum of what all `MAX_PROVIDER_ATTEMPTS` candidates can actually
     // cost, so the outer `tokio::time::timeout` can never preempt the fallback loop
@@ -527,7 +536,7 @@ mod tests {
     // crate does not depend on — hence the literals). Pinned because the worst-case client
     // wait is a user-visible number RESTATED IN PROSE elsewhere, and it moved three times
     // while the formula was corrected — most recently when the slack stopped being a guess
-    // (#1145 review): 10 s -> 5 + 4×8 = 37 s, so 145 s -> 172 s.
+    // (#1145 review): 10 s -> 0.5 + 4×8 = 32.5 s, so 145 s -> 167.5 s.
     //
     // The sites that restate it, so the next person to move it can find them all — this list
     // is the whole reason the number keeps going stale, and the previous version of this
@@ -538,9 +547,13 @@ mod tests {
     //   - `cli::commands::config` (the DEFAULT_CONFIG template)
     //   - `handlers::client::BACKGROUND_FILL_HARD_CAP` + `runtime` (as a RATIO against it)
     #[test]
-    fn outer_pull_deadline_at_defaults_is_172s() {
+    fn outer_pull_deadline_at_defaults_is_167_5s() {
         let outer = outer_pull_deadline(Duration::from_secs(20), Duration::from_secs(20));
-        assert_eq!(outer, Duration::from_secs(172), "(5 + 20 + 20) × 3 + 37");
+        assert_eq!(
+            outer,
+            Duration::from_millis(167_500),
+            "(5s + 20s + 20s) × 3 + (500ms + 4 × 8s)"
+        );
     }
 
     // A zero per-candidate budget still yields a positive outer deadline (the

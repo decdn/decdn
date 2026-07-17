@@ -1116,7 +1116,7 @@ pub async fn run(
         // capping it at the budget the foreground just exhausted meant a blob too
         // large to fetch in one deadline could never be warmed either — the node
         // could not acquire any blob needing more transfer time than the derived
-        // deadline (172 s at defaults) allows.
+        // deadline (167.5 s at defaults) allows.
         //
         // But "not the foreground deadline" is not the same as "no bound". The
         // streaming stage is bounded by INACTIVITY, which resets on any byte — so an
@@ -1127,7 +1127,7 @@ pub async fn run(
         // of the process. An inactivity bound is not a liveness bound.
         //
         // So: a generous absolute backstop, sized as a leak guard rather than a
-        // health signal. It is ~21× the foreground deadline (1 h against 172 s at the
+        // health signal. It is ~21.5× the foreground deadline (1 h against 167.5 s at the
         // defaults — see `outer_pull_deadline`), so it constrains no
         // honest transfer the node's `max_blob_size_mb` ceiling permits; it exists
         // only so a pathological upstream cannot pin a task and poison a hash
