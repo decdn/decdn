@@ -6,6 +6,7 @@
 
 use alloy::primitives::{Address, B256, U256};
 use alloy::providers::Provider;
+use decdn_common::address::parse_nonzero_address;
 
 use crate::swap_balancer::BalancerV3Venue;
 use crate::swap_uniswap::UniswapV3Venue;
@@ -124,25 +125,6 @@ pub struct ResolvedSwap {
     pub pool: Option<String>,
 }
 
-/// Parse a swap contract address with a labelled error and reject the zero
-/// address. `Address::ZERO` parses cleanly but is never a real deployment — it
-/// would surface only as an opaque on-chain revert deep in the swap path (a
-/// call to the codeless zero address), so reject it here with a clear, labelled
-/// error. Mirrors the CLI's `chain_ctx::parse_nonzero_address` guard
-/// (#1153/#1213); duplicated because `incentive` cannot depend on the `cli`
-/// crate. The "… is not a valid address" wording is preserved so the existing
-/// malformed-address tests keep matching.
-fn parse_nonzero(value: &str, label: &str) -> anyhow::Result<Address> {
-    let addr: Address = value
-        .parse()
-        .map_err(|e| anyhow::anyhow!("{label} {value:?} is not a valid address: {e}"))?;
-    anyhow::ensure!(
-        addr != Address::ZERO,
-        "{label} must not be the zero address — set it to the deployed contract address"
-    );
-    Ok(addr)
-}
-
 /// Construct the configured [`SwapVenue`] from resolved chain config,
 /// dispatching on `resolved.venue`. `token` is the TOKEN address being
 /// bought (not carried by `ResolvedSwap`, which is USDC-side config only).
@@ -157,17 +139,17 @@ pub fn from_config<P: Provider + Clone + 'static>(
 ) -> anyhow::Result<SwapVenue> {
     match resolved.venue.as_str() {
         "uniswap-v3" => {
-            let router = parse_nonzero(&resolved.router, "swap_router_address")?;
+            let router = parse_nonzero_address(&resolved.router, "swap_router_address")?;
             let quoter_str = resolved.quoter.as_ref().ok_or_else(|| {
                 anyhow::anyhow!("swap_quoter_address required for --swap-venue uniswap-v3")
             })?;
-            let quoter = parse_nonzero(quoter_str, "swap_quoter_address")?;
-            let usdc = parse_nonzero(&resolved.usdc, "usdc_address")?;
+            let quoter = parse_nonzero_address(quoter_str, "swap_quoter_address")?;
+            let usdc = parse_nonzero_address(&resolved.usdc, "usdc_address")?;
             let fee = resolved.uniswap_fee_tier.ok_or_else(|| {
                 anyhow::anyhow!("uniswap_fee_tier required for --swap-venue uniswap-v3")
             })?;
             let pool = match &resolved.pool {
-                Some(p) => Some(parse_nonzero(p, "swap_pool_address")?),
+                Some(p) => Some(parse_nonzero_address(p, "swap_pool_address")?),
                 None => None,
             };
             Ok(SwapVenue::UniswapV3(UniswapV3Venue::new(
@@ -175,12 +157,12 @@ pub fn from_config<P: Provider + Clone + 'static>(
             )))
         }
         "balancer-v3" => {
-            let router = parse_nonzero(&resolved.router, "swap_router_address")?;
-            let usdc = parse_nonzero(&resolved.usdc, "usdc_address")?;
+            let router = parse_nonzero_address(&resolved.router, "swap_router_address")?;
+            let usdc = parse_nonzero_address(&resolved.usdc, "usdc_address")?;
             let pool_str = resolved.balancer_pool_address.as_ref().ok_or_else(|| {
                 anyhow::anyhow!("swap_balancer_pool required for --swap-venue balancer-v3")
             })?;
-            let pool = parse_nonzero(pool_str, "swap_balancer_pool")?;
+            let pool = parse_nonzero_address(pool_str, "swap_balancer_pool")?;
             Ok(SwapVenue::BalancerV3(BalancerV3Venue::new(
                 provider, router, pool, usdc, token, payer,
             )))
@@ -427,7 +409,7 @@ mod tests {
 
     /// `addr_hex(0x00)` is the zero address as a hex string. A zero contract
     /// address parses cleanly but is never a real deployment; `from_config` now
-    /// rejects it at parse time via the local `parse_nonzero` guard (#1213)
+    /// rejects it at parse time via the shared `parse_nonzero_address` guard (#1213)
     /// rather than letting it surface as an opaque on-chain revert deep in the
     /// swap path. Every parsed swap address is covered across both venues.
     fn assert_rejects_zero(resolved: &ResolvedSwap, label: &str) {
