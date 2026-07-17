@@ -1368,65 +1368,6 @@ impl Metrics {
             .set(i64::from(throttled));
     }
 
-    /// The slash-detection watcher's cycle errored and the loop is about to back
-    /// off (#1032). Stamps `slash_watcher_down_since` (once per drift window) so
-    /// `slash_watcher_down_seconds` climbs until the next healthy cycle. Mirrors
-    /// [`Self::staker_set_watcher_backoff_started`]; a poisoned lock skips the
-    /// update (the gauge keeps climbing — the safe alerting direction).
-    pub fn slash_watcher_backoff_started(&self) {
-        if let Ok(mut down_since) = self.slash_watcher_down_since.lock()
-            && down_since.is_none()
-        {
-            *down_since = Some(Instant::now());
-            self.decdn.slash_watcher_restarts.inc();
-        }
-    }
-
-    /// Mark the slash-detection watcher cycle established (#1032): clear
-    /// `slash_watcher_down_since` so `slash_watcher_down_seconds` reads `0` for
-    /// the life of the cycle. Mirrors [`Self::staker_set_watcher_cycle_established`].
-    pub fn slash_watcher_cycle_established(&self) {
-        if let Ok(mut down_since) = self.slash_watcher_down_since.lock() {
-            *down_since = None;
-        }
-    }
-
-    /// A staker-set watcher poll tick failed with an error and the loop is
-    /// about to back off (#783, [`crate::dht::chain_staker_set`]).
-    /// Stamps `down_since` so `staker_set_watcher_down_seconds` begins to climb,
-    /// and — on the *transition* from a healthy cycle into the error state
-    /// (`down_since` was `None`) — bumps `staker_set_watcher_restarts_total`
-    /// exactly once per drift window, rather than once per backoff iteration of
-    /// one continuous outage. A poisoned lock is treated as "skip the update"
-    /// rather than panicking (anti-panic policy); the gauge's poison fallback
-    /// (`i64::MAX`) still keeps the alert tripped. This method is the
-    /// `on_backoff` hook wired in [`crate::dht::chain_staker_set`]; it pairs with
-    /// the loop-level `warn!` in `resumable_watcher::run` (`"watcher RPC error;
-    /// restarting after backoff"`).
-    pub fn staker_set_watcher_backoff_started(&self) {
-        if let Ok(mut down_since) = self.staker_set_watcher_down_since.lock()
-            && down_since.is_none()
-        {
-            // Edge into the error state: open a fresh drift window and count it.
-            *down_since = Some(Instant::now());
-            self.decdn.staker_set_watcher_restarts.inc();
-        }
-    }
-
-    /// Mark the staker-set watcher's poll cycle as established (#783,
-    /// downtime semantics #788): a poll tick succeeded and logs are flowing
-    /// again (the `on_established` hook). Clears `down_since` to `None` so
-    /// `staker_set_watcher_down_seconds`
-    /// reads `0` for the entire life of this cycle, however long. A poisoned
-    /// lock is treated as "skip the update" rather than panicking (anti-panic
-    /// policy); the gauge then keeps climbing, which is the safe (alerting)
-    /// direction.
-    pub fn staker_set_watcher_cycle_established(&self) {
-        if let Ok(mut down_since) = self.staker_set_watcher_down_since.lock() {
-            *down_since = None;
-        }
-    }
-
     /// Record a buyer `openChannel`-tx failure broken out by cause (#966): bumps
     /// the `decdn_channel_open_failures_{reason}_total` sibling counter for
     /// `reason`. Pairs with the structured `reason` field on the `warn!`/`debug!`
@@ -1445,27 +1386,6 @@ impl Metrics {
             ChannelOpenFailureReason::RpcError => {
                 self.decdn.channel_open_failures_rpc_error.inc();
             }
-        }
-    }
-
-    /// An origin-directory watcher poll tick errored and the loop is
-    /// about to back off (#651). Mirrors `staker_set_watcher_backoff_started`:
-    /// stamps `down_since` and counts exactly one restart per drift window.
-    pub fn origin_directory_watcher_backoff_started(&self) {
-        if let Ok(mut down_since) = self.origin_directory_watcher_down_since.lock()
-            && down_since.is_none()
-        {
-            *down_since = Some(Instant::now());
-            self.decdn.origin_directory_watcher_restarts.inc();
-        }
-    }
-
-    /// Mark the origin-directory watcher's poll cycle as established
-    /// (#651): clears `down_since` so `origin_directory_watcher_down_seconds`
-    /// reads `0` for the life of this cycle.
-    pub fn origin_directory_watcher_cycle_established(&self) {
-        if let Ok(mut down_since) = self.origin_directory_watcher_down_since.lock() {
-            *down_since = None;
         }
     }
 
@@ -1658,6 +1578,60 @@ macro_rules! recorders {
                 $(#[$meta])*
                 pub fn $method(&self $(, $arg: $ty)?) {
                     self.decdn.$field.$op($($val)?);
+                }
+            )*
+        }
+    };
+}
+
+/// Generate the per-watcher downtime recorders on [`Metrics`].
+///
+/// The three chain watchers (`slash`, `staker_set`, `origin_directory`) share
+/// one downtime state machine: a `*_backoff_started` recorder that, on the
+/// `None -> Some` edge into an error window, stamps the watcher's
+/// `Mutex<Option<Instant>>` `down_since` field and bumps its `*_restarts`
+/// counter exactly once per drift window; and a `*_cycle_established` recorder
+/// that clears `down_since` on recovery. A poisoned lock skips the update — the
+/// `*_down_seconds` gauge keeps climbing, which is the safe alerting direction.
+///
+/// These cannot live in [`recorders!`] because their bodies branch and touch
+/// `Metrics`'s own `Mutex` state rather than a single `self.decdn.field.op(v)`.
+/// Each row spells out both method names (production hooks call them by exact
+/// name, and this crate adds no `paste`) and labels the three struct-field
+/// idents so positions aren't counted. Docs pass through as `$meta`, so each
+/// recorder's rationale stays byte-identical and keeps its call-site span for
+/// `clippy` and `rustdoc`.
+///
+/// Note that `rustfmt` does not format macro-invocation bodies, so the table
+/// below is hand-maintained: keep the multi-line docs tidy and the field lines
+/// within the 100-column limit — `cargo fmt` will neither help nor complain.
+macro_rules! watcher_downtime_recorders {
+    ($(
+        $(#[$backoff_meta:meta])*
+        $backoff:ident,
+        $(#[$established_meta:meta])*
+        $established:ident,
+        down_since: $down_since:ident,
+        restarts: $restarts:ident,
+        down_seconds: $down_seconds:ident;
+    )*) => {
+        impl Metrics {
+            $(
+                $(#[$backoff_meta])*
+                pub fn $backoff(&self) {
+                    if let Ok(mut down_since) = self.$down_since.lock()
+                        && down_since.is_none()
+                    {
+                        *down_since = Some(Instant::now());
+                        self.decdn.$restarts.inc();
+                    }
+                }
+
+                $(#[$established_meta])*
+                pub fn $established(&self) {
+                    if let Ok(mut down_since) = self.$down_since.lock() {
+                        *down_since = None;
+                    }
                 }
             )*
         }
@@ -2257,6 +2231,60 @@ recorders! {
     /// Record that the server rejected a 0-RTT attempt and the client
     /// fell back to a 1-RTT handshake.
     record_0rtt_rejected => quic_0rtt_rejected.inc();
+}
+
+watcher_downtime_recorders! {
+    /// The slash-detection watcher's cycle errored and the loop is about to back
+    /// off (#1032). Stamps `slash_watcher_down_since` (once per drift window) so
+    /// `slash_watcher_down_seconds` climbs until the next healthy cycle. Mirrors
+    /// [`Self::staker_set_watcher_backoff_started`]; a poisoned lock skips the
+    /// update (the gauge keeps climbing — the safe alerting direction).
+    slash_watcher_backoff_started,
+    /// Mark the slash-detection watcher cycle established (#1032): clear
+    /// `slash_watcher_down_since` so `slash_watcher_down_seconds` reads `0` for
+    /// the life of the cycle. Mirrors [`Self::staker_set_watcher_cycle_established`].
+    slash_watcher_cycle_established,
+    down_since: slash_watcher_down_since,
+    restarts: slash_watcher_restarts,
+    down_seconds: slash_watcher_down_seconds;
+
+    /// A staker-set watcher poll tick failed with an error and the loop is
+    /// about to back off (#783, [`crate::dht::chain_staker_set`]).
+    /// Stamps `down_since` so `staker_set_watcher_down_seconds` begins to climb,
+    /// and — on the *transition* from a healthy cycle into the error state
+    /// (`down_since` was `None`) — bumps `staker_set_watcher_restarts_total`
+    /// exactly once per drift window, rather than once per backoff iteration of
+    /// one continuous outage. A poisoned lock is treated as "skip the update"
+    /// rather than panicking (anti-panic policy); the gauge's poison fallback
+    /// (`i64::MAX`) still keeps the alert tripped. This method is the
+    /// `on_backoff` hook wired in [`crate::dht::chain_staker_set`]; it pairs with
+    /// the loop-level `warn!` in `resumable_watcher::run` (`"watcher RPC error;
+    /// restarting after backoff"`).
+    staker_set_watcher_backoff_started,
+    /// Mark the staker-set watcher's poll cycle as established (#783,
+    /// downtime semantics #788): a poll tick succeeded and logs are flowing
+    /// again (the `on_established` hook). Clears `down_since` to `None` so
+    /// `staker_set_watcher_down_seconds`
+    /// reads `0` for the entire life of this cycle, however long. A poisoned
+    /// lock is treated as "skip the update" rather than panicking (anti-panic
+    /// policy); the gauge then keeps climbing, which is the safe (alerting)
+    /// direction.
+    staker_set_watcher_cycle_established,
+    down_since: staker_set_watcher_down_since,
+    restarts: staker_set_watcher_restarts,
+    down_seconds: staker_set_watcher_down_seconds;
+
+    /// An origin-directory watcher poll tick errored and the loop is
+    /// about to back off (#651). Mirrors `staker_set_watcher_backoff_started`:
+    /// stamps `down_since` and counts exactly one restart per drift window.
+    origin_directory_watcher_backoff_started,
+    /// Mark the origin-directory watcher's poll cycle as established
+    /// (#651): clears `down_since` so `origin_directory_watcher_down_seconds`
+    /// reads `0` for the life of this cycle.
+    origin_directory_watcher_cycle_established,
+    down_since: origin_directory_watcher_down_since,
+    restarts: origin_directory_watcher_restarts,
+    down_seconds: origin_directory_watcher_down_seconds;
 }
 
 /// Which side of a `PaymentChannel` the shared settle-finalization helper
