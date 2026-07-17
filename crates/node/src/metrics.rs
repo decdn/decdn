@@ -1204,6 +1204,15 @@ impl Default for Metrics {
     }
 }
 
+/// Saturating `usize` → `i64` for gauge values: a count too large to fit an
+/// `i64` reports `i64::MAX` rather than wrapping. Saturation is the
+/// conservative direction for the sizes and counts these gauges carry, and it
+/// keeps the workspace `unwrap_used` deny satisfied without pushing a
+/// `Result` onto every recorder signature.
+fn sat(n: usize) -> i64 {
+    i64::try_from(n).unwrap_or(i64::MAX)
+}
+
 impl Metrics {
     /// Create the registry and register deCDN's metric group plus the
     /// cache crate's `decdn_cache_*` group. The cache handle is shared
@@ -1287,17 +1296,13 @@ impl Metrics {
 
     /// Publish the current count of active probe holds (ADR 005).
     pub fn probe_hold_slots(&self, used: usize) {
-        self.decdn
-            .probe_hold_slots_used
-            .set(i64::try_from(used).unwrap_or(i64::MAX));
+        self.decdn.probe_hold_slots_used.set(sat(used));
     }
 
     /// Publish the configured `max_probe_holds` budget (registry-mandatory
     /// `decdn_probe_hold_slots_max`). Called once at runtime bring-up.
     pub fn probe_hold_slots_max(&self, max: usize) {
-        self.decdn
-            .probe_hold_slots_max
-            .set(i64::try_from(max).unwrap_or(i64::MAX));
+        self.decdn.probe_hold_slots_max.set(sat(max));
     }
 
     /// The node clamped `rate_per_mb` to the configured delivery bounds
@@ -1663,18 +1668,14 @@ impl Metrics {
     /// cached view — which under a watcher outage is exactly the (possibly
     /// stale) set that admission decisions read.
     pub fn staker_set_active_count(&self, count: usize) {
-        self.decdn
-            .staker_set_active_count
-            .set(i64::try_from(count).unwrap_or(i64::MAX));
+        self.decdn.staker_set_active_count.set(sat(count));
     }
 
     /// Publish the current cached `NodeId → operator address` binding count
     /// (#831). Sampled on every binding change the node-address watcher applies,
     /// so it tracks the cached view the pull path resolves against.
     pub fn node_address_directory_size(&self, count: usize) {
-        self.decdn
-            .node_address_directory_size
-            .set(i64::try_from(count).unwrap_or(i64::MAX));
+        self.decdn.node_address_directory_size.set(sat(count));
     }
 
     /// A node-to-node pull orchestration found ≥1 candidate and is attempting a
@@ -2051,9 +2052,7 @@ impl Metrics {
     /// unlike the monotonic `operator → NodeId` binding cache. The caller
     /// recomputes this (`authorized_operator_count`) after each set mutation.
     pub fn origin_directory_operator_count(&self, count: usize) {
-        self.decdn
-            .origin_directory_operator_count
-            .set(i64::try_from(count).unwrap_or(i64::MAX));
+        self.decdn.origin_directory_operator_count.set(sat(count));
     }
 
     pub fn connection_opened(&self) {
@@ -2197,16 +2196,12 @@ impl Metrics {
     /// gauge-set pattern elsewhere in this module and stays within the
     /// workspace's anti-panic policy.
     pub fn dht_rate_limit_tracked_per_ip_set(&self, n: usize) {
-        self.decdn
-            .dht_rate_limit_tracked_per_ip
-            .set(i64::try_from(n).unwrap_or(i64::MAX));
+        self.decdn.dht_rate_limit_tracked_per_ip.set(sat(n));
     }
 
     /// Set the per-peer DHT keyed-limiter tracked-size gauge (#645).
     pub fn dht_rate_limit_tracked_per_peer_set(&self, n: usize) {
-        self.decdn
-            .dht_rate_limit_tracked_per_peer
-            .set(i64::try_from(n).unwrap_or(i64::MAX));
+        self.decdn.dht_rate_limit_tracked_per_peer.set(sat(n));
     }
 
     /// Record a `cdn/probe/v1` request rejected at the per-peer layer.
@@ -2238,16 +2233,12 @@ impl Metrics {
 
     /// Set the per-IP probe keyed-limiter tracked-size gauge (#645).
     pub fn probe_rate_limit_tracked_per_ip_set(&self, n: usize) {
-        self.decdn
-            .probe_rate_limit_tracked_per_ip
-            .set(i64::try_from(n).unwrap_or(i64::MAX));
+        self.decdn.probe_rate_limit_tracked_per_ip.set(sat(n));
     }
 
     /// Set the per-peer probe keyed-limiter tracked-size gauge (#645).
     pub fn probe_rate_limit_tracked_per_peer_set(&self, n: usize) {
-        self.decdn
-            .probe_rate_limit_tracked_per_peer
-            .set(i64::try_from(n).unwrap_or(i64::MAX));
+        self.decdn.probe_rate_limit_tracked_per_peer.set(sat(n));
     }
 
     /// Record a `cdn/dht/v1` request that was admitted by the rate
@@ -2345,9 +2336,7 @@ impl Metrics {
             self.decdn.quic_session_ticket_peers_dropped.inc();
         }
         let size = peers.len();
-        self.decdn
-            .quic_session_ticket_cache_size
-            .set(i64::try_from(size).unwrap_or(i64::MAX));
+        self.decdn.quic_session_ticket_cache_size.set(sat(size));
     }
 
     /// Read the current value of the `rpc_healthy` gauge. Test-only —
