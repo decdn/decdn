@@ -72,7 +72,8 @@ use crate::client_requester::{
 use crate::dht::negative_cache::Hash as DhtHash;
 use crate::dht::routing::{NodeId as DhtNodeId, RoutingTable};
 use crate::dht::{
-    LookupConfig, NegativeProbeCache, NodeAddressResolver, OriginDirectory, StakerSet,
+    LookupConfig, NegativeProbeCache, NodeAddressResolver, OriginDirectory, PositiveProbeCache,
+    ProbedProvider, StakerSet,
 };
 use crate::metrics::Metrics;
 use crate::probe_client::probe_once;
@@ -286,6 +287,14 @@ pub struct NodeOriginDeps {
     pub rep_cfg: NetworkReputationConfig,
     /// Requester-side negative-probe cache (drops known-absent providers).
     pub negative_cache: NegativeProbeCache,
+    /// Requester-side positive probe cache (ADR 001 §Probe cache): lets a repeat
+    /// miss for a hash inside the TTL skip the DHT lookup and probe fanout
+    /// (#1165). Beside the negative cache, and by value for the same reason:
+    /// `NodeOrigin` holds its deps behind `Arc<OnceLock<NodeOriginDeps>>`, so
+    /// every concurrent pull already shares one instance through that `Arc`, and
+    /// the cache's own `Mutex` gives it interior mutability behind `&self`. A
+    /// second `Arc` here would buy nothing but a pointer chase.
+    pub probe_cache: PositiveProbeCache,
     /// Node metrics for the paid-pull observability counters (#831).
     pub metrics: Arc<Metrics>,
     /// Per-region byte accountant; the inbound (`bytes_in`) counterpart of the
@@ -378,12 +387,15 @@ impl NodeOrigin {
 
     /// Open a window-paced progressive pull for `hash` (#856), the streaming
     /// counterpart of [`Origin::fetch`]'s buffered pull. Runs the same
-    /// discover → probe → rank → open-channel pipeline, but instead of buffering
-    /// the whole blob it returns the upstream header (so the caller can sign its
-    /// own `StreamResponse`) and a live [`NodeProgressivePull`] the caller drives
-    /// chunk-by-chunk — forwarding each chunk to the paying downstream client and
-    /// teeing it into the cache — so per-request speculative exposure is bounded
-    /// to the caller's window rather than the entire upstream cost.
+    /// cached-first discover → probe → rank → open-channel pipeline (ADR 001
+    /// §Probe cache — this path shares the cache with the buffered one, since
+    /// both feed off the same `probe_and_rank` chokepoint), but instead of
+    /// buffering the whole blob it returns the upstream header (so the caller
+    /// can sign its own `StreamResponse`) and a live [`NodeProgressivePull`] the
+    /// caller drives chunk-by-chunk — forwarding each chunk to the paying
+    /// downstream client and teeing it into the cache — so per-request
+    /// speculative exposure is bounded to the caller's window rather than the
+    /// entire upstream cost.
     ///
     /// Candidate fallback happens at OPEN time only: it walks the ranked
     /// candidates until one successfully opens (handshake + verified response),
@@ -396,20 +408,94 @@ impl NodeOrigin {
     ) -> Option<(UpstreamPullHeader, NodeProgressivePull)> {
         let deps = self.deps.get()?;
         let hash_bytes = *hash.as_bytes();
+        let target = DhtHash::from_bytes(hash_bytes);
+        // ONE budget for the whole call, spent across both phases — see `Origin::fetch`'s
+        // twin of this flow.
+        let mut budget = MAX_PROVIDER_ATTEMPTS;
+        // Mirrors `Origin::fetch`'s `attempt_metered`: one orchestration per call however
+        // many candidate lists it walks.
+        let mut attempt_metered = false;
+
+        // ADR 001 §Probe cache: "On a cache miss the requester checks the probe cache
+        // first; if a valid entry exists, it skips DHT lookup and goes straight to
+        // selection."
+        if let Some(cached) = cached_candidates(deps, target).await {
+            deps.metrics.probe_cache_hit();
+            deps.metrics.node_pull_attempt();
+            attempt_metered = true;
+            let outcome = self
+                .open_from_candidates(deps, &cached, hash_bytes, budget)
+                .await;
+            if let Some(opened) = outcome.payload {
+                return Some(opened);
+            }
+            budget = budget.saturating_sub(outcome.attempts);
+            // Every cached provider we had budget to open from failed. Disproved by
+            // actual pull attempts, which outrank a probe — drop the entry rather
+            // than let it keep hitting (any untried tail beyond `budget` is
+            // forfeited with it; a fresh probe is cheaper than trusting a list
+            // whose top-ranked members just failed).
+            deps.probe_cache.invalidate(&target);
+            if budget == 0 {
+                // Ends the call as `None`, which the caller reads as a miss — the
+                // same collapse the KNOWN LIMITATION note on `Origin::fetch`'s cold
+                // arm documents (#1129). A fix there must cover this exit too.
+                debug!(%hash, "node-origin: probe-cache candidates exhausted the attempt budget");
+                return None;
+            }
+        } else {
+            deps.metrics.probe_cache_miss();
+        }
+
+        // ADR 001 §Probe cache: "if all fail, run a fresh DHT lookup + probe."
         let providers = discover(deps, hash_bytes).await;
         if providers.is_empty() {
-            deps.metrics.node_pull_no_providers();
+            // `node_pull_no_providers` means "the blob is unavailable on the
+            // network, NOT a pull failure" — mutually exclusive with
+            // `node_pull_attempts` per fetch. A hit-then-fallthrough call already
+            // TRIED cached providers (and metered the attempt), so an empty
+            // re-discovery here is a pull story, not an availability one.
+            if !attempt_metered {
+                deps.metrics.node_pull_no_providers();
+            }
             debug!(%hash, "node-origin: no providers discovered for window-paced pull");
             return None;
         }
-        deps.metrics.node_pull_attempt();
+        if !attempt_metered {
+            deps.metrics.node_pull_attempt();
+        }
+        // Writes the probe cache at its tail.
         let ranked = probe_and_rank(deps, providers, hash_bytes).await;
-        for candidate in ranked.iter().take(MAX_PROVIDER_ATTEMPTS) {
+        self.open_from_candidates(deps, &ranked, hash_bytes, budget)
+            .await
+            .payload
+    }
+
+    /// The window twin of [`try_pull`]: walk the ranked candidates, opening from
+    /// each until one succeeds, bounded by `budget` remaining attempts. Returns
+    /// the opened pull (if any) and how many candidates were tried, as a
+    /// [`PullOutcome`] whose payload is the opened header + driver.
+    async fn open_from_candidates(
+        &self,
+        deps: &NodeOriginDeps,
+        ranked: &[Candidate],
+        hash_bytes: [u8; 32],
+        budget: usize,
+    ) -> PullOutcome<(UpstreamPullHeader, NodeProgressivePull)> {
+        let mut attempts = 0;
+        for candidate in ranked.iter().take(budget) {
+            attempts += 1;
             if let Some(opened) = self.open_from_candidate(deps, candidate, hash_bytes).await {
-                return Some(opened);
+                return PullOutcome {
+                    payload: Some(opened),
+                    attempts,
+                };
             }
         }
-        None
+        PullOutcome {
+            payload: None,
+            attempts,
+        }
     }
 
     /// Resolve, open/reuse a channel, and open a progressive upstream pull from
@@ -796,15 +882,76 @@ impl Origin for NodeOrigin {
                 return Ok(OriginFetch::NotFound);
             };
             let hash_bytes = *hash.as_bytes();
+            let target = DhtHash::from_bytes(hash_bytes);
+            // ONE budget for the whole fetch, spent across both phases — see
+            // `PullOutcome`.
+            let mut budget = MAX_PROVIDER_ATTEMPTS;
+            // `node_pull_attempts` counts pull ORCHESTRATIONS ("found ≥1 candidate
+            // to try"), and is the denominator for the success / corruption /
+            // unreachable rates. One `fetch` is one orchestration however many
+            // candidate lists it walks, so a probe-cache hit that exhausts its
+            // providers and falls through to the cold path must still meter
+            // exactly once — otherwise every such fetch inflates the denominator
+            // and quietly deflates every rate built on it.
+            let mut attempt_metered = false;
+
+            // ADR 001 §Probe cache: "On a cache miss the requester checks the probe
+            // cache first; if a valid entry exists, it skips DHT lookup and goes
+            // straight to selection."
+            if let Some(cached) = cached_candidates(deps, target).await {
+                deps.metrics.probe_cache_hit();
+                deps.metrics.node_pull_attempt();
+                attempt_metered = true;
+                let outcome = try_pull(deps, &cached, hash_bytes, budget).await;
+                if let Some(bytes) = outcome.payload {
+                    return Ok(OriginFetch::found_one_shot(bytes));
+                }
+                budget = budget.saturating_sub(outcome.attempts);
+                // Every cached provider we had budget to try failed to deliver.
+                // The entry has been disproved by the only evidence that outranks
+                // a probe — actual pulls — so drop it rather than let it keep
+                // hitting for the rest of its TTL. Any untried tail beyond
+                // `budget` is forfeited with it: a fresh probe is cheaper than
+                // trusting a list whose top-ranked members just failed.
+                deps.probe_cache.invalidate(&target);
+                if budget == 0 {
+                    // The cached candidates ate the whole fetch-wide budget.
+                    // Running a fresh lookup + probe now would either exceed the
+                    // worst case `outer_pull_deadline` is sized for, or discover
+                    // providers it has no attempts left to try. This fetch is a
+                    // clean miss; the entry is gone, so the next one goes cold.
+                    //
+                    // Collapses onto `NotFound` like the cold-path arm below — the
+                    // KNOWN LIMITATION note there (#1129) applies to this exit
+                    // too, and a fix there must cover it.
+                    debug!(%hash, "node-origin: probe-cache candidates exhausted the attempt budget");
+                    return Ok(OriginFetch::NotFound);
+                }
+            } else {
+                deps.metrics.probe_cache_miss();
+            }
+
+            // ADR 001 §Probe cache: "if all fail, run a fresh DHT lookup + probe."
             let providers = discover(deps, hash_bytes).await;
             if providers.is_empty() {
-                deps.metrics.node_pull_no_providers();
+                // `node_pull_no_providers` means "the blob is unavailable on the
+                // network, NOT a pull failure" — mutually exclusive with
+                // `node_pull_attempts` per fetch. A hit-then-fallthrough fetch
+                // already TRIED cached providers (and metered the attempt), so an
+                // empty re-discovery here is a pull story, not an availability
+                // one; metering both would break that exclusivity.
+                if !attempt_metered {
+                    deps.metrics.node_pull_no_providers();
+                }
                 debug!(%hash, "node-origin: no providers discovered for cache-miss pull");
                 return Ok(OriginFetch::NotFound);
             }
-            deps.metrics.node_pull_attempt();
+            if !attempt_metered {
+                deps.metrics.node_pull_attempt();
+            }
+            // Writes the probe cache at its tail.
             let ranked = probe_and_rank(deps, providers, hash_bytes).await;
-            match try_pull(deps, &ranked, hash_bytes).await {
+            match try_pull(deps, &ranked, hash_bytes, budget).await.payload {
                 Some(bytes) => Ok(OriginFetch::found_one_shot(bytes)),
                 // KNOWN LIMITATION (#1145 review, #1129): this collapses every non-hit onto a
                 // clean `NotFound` — no providers, all refused, all stalled, AND a LOCAL fault
@@ -892,6 +1039,34 @@ async fn probe_and_rank(
         .into_iter()
         .flatten()
         .collect();
+    let ranked = rank(candidates);
+    // ADR 001 §Probe cache: retain the top 10 by selection score, so a repeat
+    // miss for this hash inside the TTL skips the lookup and the probe fanout.
+    // `insert` does the truncation; `ranked` is already in selection order,
+    // which is the ordering that claim depends on.
+    //
+    // Only the triple is stored — never the signed `ProbeResponse` (its
+    // `slash_sig` is another node's slashable statement, and #1165's "no
+    // evidence retention" is that this cache must not become an evidence
+    // locker), and never `reputation`, which `cached_candidates` recomputes.
+    deps.probe_cache.insert(
+        target,
+        ranked
+            .iter()
+            .map(|c| ProbedProvider {
+                node_id: DhtNodeId::from_bytes(c.node_id),
+                rate_per_mb: c.rate_per_mb,
+                rtt_ms: c.rtt_ms,
+            })
+            .collect(),
+    );
+    ranked
+}
+
+/// `rank_candidates` reduced to the best-first `Candidate` list both pull paths
+/// consume. Shared by the cold path and the probe-cache-hit path so a change to
+/// what "ranked" means cannot apply to one and not the other.
+fn rank(candidates: Vec<Candidate>) -> Vec<Candidate> {
     rank_candidates(candidates)
         .into_iter()
         .map(|r| r.candidate)
@@ -992,23 +1167,144 @@ async fn probe_candidate(
     })
 }
 
+/// Rebuild ranked [`Candidate`]s from a probe-cache hit (ADR 001 §Probe cache).
+///
+/// `None` means "no usable cached candidate", covering three cases the caller has
+/// no reason to distinguish: no entry, an expired entry, and an entry whose every
+/// provider is currently suppressed. All three cost a fresh lookup + probe and all
+/// three count as `probe_cache_miss` — a hit that saves no network work is not a
+/// hit in any sense a dashboard cares about.
+///
+/// The cache stores only the ADR triple. `reputation` and `region` are rebuilt
+/// here, FRESH, and the result re-ranked. That is what ADR 001's "goes straight to
+/// selection" means: skip discovery and probing — not skip the selection
+/// algorithm. Caching a `Candidate` whole would have been less code and would have
+/// frozen `reputation` for the TTL, letting a node that failed three pulls in
+/// the meantime keep the rank it earned before them; the fields we decline to
+/// cache are the ones that MOVE.
+async fn cached_candidates(deps: &NodeOriginDeps, target: DhtHash) -> Option<Vec<Candidate>> {
+    let providers = deps.probe_cache.get(&target)?;
+    let now_secs = crate::payment_settlement::unix_now();
+    let mut candidates = Vec::with_capacity(providers.len());
+    for provider in providers {
+        // An entry can be stale INSIDE its own TTL, so the same two filters
+        // `probe_and_rank` applies are applied here — this is the other
+        // chokepoint every candidate passes through. A pull-time refusal recorded
+        // a negative for this exact (peer, hash) seconds ago
+        // (`classify_pull_failure`), and a wedged channel cannot serve ANY hash.
+        if deps
+            .negative_cache
+            .contains_active(&provider.node_id, &target)
+            || deps.provider_is_wedged(&provider.node_id, now_secs)
+        {
+            continue;
+        }
+        // ADR 001 §Probe cache: "verify the selected node_id is still active in
+        // the local registry cache" before opening `cdn/client/v1`. The cold path
+        // applies this inside `find_providers` (`filter_active_stakers`); the hit
+        // path bypasses `find_providers`, so re-apply it here. `addr_resolver` is
+        // NOT this guard — the address binding survives ejection/unbonding (only
+        // deregistration clears it), which is what let a node ejected inside the
+        // TTL win a paid pull the cold path would deny (#1223 review).
+        //
+        // NOTE: a static-config origin (`dht.static_origins`) that is not a staker
+        // is skipped here and falls through to the cold path, where the unfiltered
+        // `ConfigOriginDirectory` fallback re-serves it — static-only deployments
+        // get correctness, not hit acceleration. Production directories are
+        // chain-backed and staker-filtered, so their origins are stakers and this
+        // check is complete.
+        if !deps.staker_set.is_active(&provider.node_id) {
+            continue;
+        }
+        let Ok(pk) = PublicKey::from_bytes(provider.node_id.as_bytes()) else {
+            // Matches `probe_candidate`: a key that does not decode implies
+            // upstream state corruption — skip rather than panic.
+            continue;
+        };
+        let region = deps
+            .region_accountant
+            .region_of(provider.node_id.as_bytes())
+            .await
+            .unwrap_or_default();
+        // Deliberately NOT re-running the ADR 030 region-latency penalty here,
+        // unlike `probe_candidate`. That penalty reads a probe's `rtt` as EVIDENCE
+        // against a self-attested region claim, and we already scored this rtt
+        // once — at probe time, when it was evidence. A cache hit performs no
+        // probe and produces no new evidence, so re-recording would charge one
+        // probe's latency to the peer again on every hit inside the TTL: an EWMA
+        // beaten down by a single stale sample replayed as many times as the
+        // blob happens to be requested. Popularity is not guilt.
+        candidates.push(Candidate {
+            node_id: *provider.node_id.as_bytes(),
+            rate_per_mb: provider.rate_per_mb,
+            rtt_ms: provider.rtt_ms,
+            reputation: combined_reputation(deps, pk, now_secs),
+            region,
+            stake: None,
+        });
+    }
+    if candidates.is_empty() {
+        return None;
+    }
+    Some(rank(candidates))
+}
+
+/// What one walk of a ranked candidate list consumed and produced.
+///
+/// The `attempts` count is the load-bearing half (#1165). [`MAX_PROVIDER_ATTEMPTS`]
+/// is a budget for the whole FETCH, not for each list, and a fetch that hits the
+/// probe cache walks two lists: the cached providers, then — if they all fail — a
+/// freshly discovered one. Handing each list its own [`MAX_PROVIDER_ATTEMPTS`]
+/// would double the worst case to six sequential pulls, silently blowing through
+/// [`crate::selection::outer_pull_deadline`], which budgets for exactly three
+/// (`(open + pull + stall) × MAX_PROVIDER_ATTEMPTS + slack`, 172s at defaults).
+/// The deadline is enforced OUTSIDE this path, so nothing would fail loudly: the
+/// fetch would just be killed mid-pull by a timeout sized for a world it no
+/// longer lived in — the #859 starvation that formula exists to prevent.
+///
+/// So the caller carries a remaining-attempts budget across both phases and this
+/// reports what was spent.
+///
+/// Generic over the payload so both walkers share it: [`try_pull`] returns
+/// `PullOutcome<Bytes>` (the buffered blob), [`NodeOrigin::open_from_candidates`]
+/// returns `PullOutcome<(UpstreamPullHeader, NodeProgressivePull)>` (the opened
+/// stream). A plain type parameter — no future is generic here, only the value a
+/// successful walk hands back.
+struct PullOutcome<T> {
+    /// The delivered payload, iff some candidate succeeded.
+    payload: Option<T>,
+    /// Candidates actually TRIED — i.e. per-candidate attempts, whether or
+    /// not they delivered. Never exceeds the `budget` passed in.
+    attempts: usize,
+}
+
 /// Walk the ranked candidates (best-first), opening a channel and pulling from
-/// each until one delivers, bounded by [`MAX_PROVIDER_ATTEMPTS`]. Records a
+/// each until one delivers, bounded by `budget` remaining attempts. Records a
 /// reputation outcome for every candidate that reaches `stream_fetch`;
 /// candidates skipped earlier for an unresolvable operator address or a local
 /// channel-open failure are intentionally not scored (neither is the provider's
-/// fault).
+/// fault). `budget` is the fetch-wide [`MAX_PROVIDER_ATTEMPTS`] remainder rather
+/// than the constant itself — see [`PullOutcome`].
 async fn try_pull(
     deps: &NodeOriginDeps,
     ranked: &[Candidate],
     hash_bytes: [u8; 32],
-) -> Option<Bytes> {
-    for candidate in ranked.iter().take(MAX_PROVIDER_ATTEMPTS) {
+    budget: usize,
+) -> PullOutcome<Bytes> {
+    let mut attempts = 0;
+    for candidate in ranked.iter().take(budget) {
+        attempts += 1;
         if let Some(bytes) = pull_from_candidate(deps, candidate, hash_bytes).await {
-            return Some(bytes);
+            return PullOutcome {
+                payload: Some(bytes),
+                attempts,
+            };
         }
     }
-    None
+    PullOutcome {
+        payload: None,
+        attempts,
+    }
 }
 
 /// Attach this node's ADR 005 client identity binding to an upstream pull's
@@ -1355,7 +1651,7 @@ enum RefusalVerdict {
     NodeFault,
     /// A true, lasting fact about this (peer, hash) pair. Suppress the pair for the full
     /// [`NegativeProbeCache`] TTL — asking again soon would get the same answer.
-    DurableMiss,
+    DurableMiss(DurableMissCause),
     /// Transient, or not attributable to the peer at all. Suppress the pair only briefly
     /// ([`REFUSAL_SUPPRESSION_TTL`]) — long enough that a peer serving nothing stops
     /// burning a candidate slot on every miss in a retry burst, short enough that we do
@@ -1363,6 +1659,27 @@ enum RefusalVerdict {
     Transient,
     /// OUR fault. Score nothing, suppress nothing.
     OurFault,
+}
+
+/// Why a [`RefusalVerdict::DurableMiss`] is durable.
+///
+/// The verdict itself answers "what does this refusal say about the peer?", and
+/// both causes give the same answer: asking this peer for this hash again inside
+/// the TTL gets the same reply, so suppress it and don't spend a candidate slot
+/// finding out. They are NOT the same thing to an operator, though —
+/// `EvictedSinceProbe` is a peer contradicting its own signed `has_blob: true`
+/// and is the ADR 001-mandated `decdn_probe_post_eviction_failures_total`
+/// signal, while `BlobTooLarge` is a static fact about the blob that says
+/// nothing about anyone's hold mechanism. A payload rather than a fourth
+/// `RefusalVerdict` variant, because a variant would claim the two mean
+/// different things about the peer, and they do not (#1165).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DurableMissCause {
+    /// The peer held the blob at probe time and lost it to cache pressure
+    /// before we opened the stream — a hold-mechanism failure (ADR 005).
+    EvictedSinceProbe,
+    /// The blob is over the peer's ceiling — deterministic for this blob.
+    BlobTooLarge,
 }
 
 /// How long a (peer, hash) pair is suppressed after a refusal we cannot attribute to the
@@ -1393,7 +1710,10 @@ const fn classify_refusal(error: &StreamError) -> RefusalVerdict {
         // about, and `BlobTooLarge` is deterministic for this blob. Asking this peer for
         // this hash again inside the TTL gets the same answer, so don't spend a candidate
         // slot finding out.
-        StreamError::EvictedSinceProbe | StreamError::BlobTooLarge => RefusalVerdict::DurableMiss,
+        StreamError::EvictedSinceProbe => {
+            RefusalVerdict::DurableMiss(DurableMissCause::EvictedSinceProbe)
+        }
+        StreamError::BlobTooLarge => RefusalVerdict::DurableMiss(DurableMissCause::BlobTooLarge),
         // Honest but NOT durable, and — for `NotFound` — not even attributable: see
         // `REFUSAL_SUPPRESSION_TTL`. `Overloaded` is backpressure, which the code's own
         // policy says to respect rather than punish; suppressing the peer for five
@@ -1829,9 +2149,25 @@ fn classify_pull_failure(
                     debug!(%provider_addr, %err, "node-origin: upstream reports itself degraded; scoring unreachable");
                     record_outcome(deps, pk, &Outcome::Unreachable);
                 }
-                RefusalVerdict::DurableMiss => {
+                RefusalVerdict::DurableMiss(cause) => {
+                    // Exhaustive on the cause, not an `if ==` — a new cause added
+                    // tomorrow must DECIDE its telemetry here, the same discipline
+                    // `RefusalVerdict`'s own doc demands of new `StreamError`s.
+                    match cause {
+                        // ADR 001 §Probe cache mandates tracking this rate; ADR
+                        // 005 says a correct hold mechanism should make it rare,
+                        // so a sustained rate is a remote implementation bug, not
+                        // a tuning knob. The `monitoring/grafana-dashboard.json`
+                        // panel scraping this metric predates the emitter (#1165).
+                        DurableMissCause::EvictedSinceProbe => {
+                            deps.metrics.probe_post_eviction_failure();
+                        }
+                        // A static fact about the blob vs. the peer's ceiling —
+                        // says nothing about any hold mechanism; no telemetry.
+                        DurableMissCause::BlobTooLarge => {}
+                    }
                     suppress(None);
-                    debug!(%provider_addr, %err, "node-origin: upstream does not have this blob; negative-caching this (peer, hash) for the full TTL without tarring reputation");
+                    debug!(%provider_addr, ?cause, %err, "node-origin: upstream does not have this blob; negative-caching this (peer, hash) for the full TTL without tarring reputation");
                 }
                 RefusalVerdict::Transient => {
                     suppress(Some(REFUSAL_SUPPRESSION_TTL));
@@ -2229,10 +2565,16 @@ mod tests {
     fn only_a_durable_refusal_earns_the_full_suppression_ttl() {
         // A peer that truthfully says the blob is gone, or is over its ceiling, will say
         // the same thing in a minute. Worth the full TTL.
-        for error in [StreamError::EvictedSinceProbe, StreamError::BlobTooLarge] {
+        for (error, cause) in [
+            (
+                StreamError::EvictedSinceProbe,
+                DurableMissCause::EvictedSinceProbe,
+            ),
+            (StreamError::BlobTooLarge, DurableMissCause::BlobTooLarge),
+        ] {
             assert_eq!(
                 classify_refusal(&error),
-                RefusalVerdict::DurableMiss,
+                RefusalVerdict::DurableMiss(cause),
                 "{error:?} is a lasting fact about this (peer, hash)"
             );
         }
@@ -2338,7 +2680,10 @@ mod tests {
         for (error, want) in [
             (StreamError::NotFound, RefusalVerdict::Transient),
             (StreamError::Overloaded, RefusalVerdict::Transient),
-            (StreamError::EvictedSinceProbe, RefusalVerdict::DurableMiss),
+            (
+                StreamError::EvictedSinceProbe,
+                RefusalVerdict::DurableMiss(DurableMissCause::EvictedSinceProbe),
+            ),
             (StreamError::InternalError, RefusalVerdict::NodeFault),
         ] {
             // Exactly what the receive loops now raise — wrapped, because a real one comes
@@ -2355,6 +2700,23 @@ mod tests {
                 "a mid-stream {error:?} must be judged as a refusal, not fall to the catch-all"
             );
         }
+    }
+
+    /// ADR 001 §Probe cache mandates tracking the `EvictedSinceProbe` rate, and
+    /// ADR 005 explains why it is not just "a candidate failed": a peer emitting
+    /// it inside `PROBE_SLASH_WINDOW` has handed us slash evidence. Both causes
+    /// are `DurableMiss` — they say the same thing about the peer — but only one
+    /// is that signal, and a shared unpayloaded variant cannot tell them apart.
+    #[test]
+    fn only_an_eviction_carries_the_post_eviction_cause() {
+        assert_eq!(
+            classify_refusal(&StreamError::EvictedSinceProbe),
+            RefusalVerdict::DurableMiss(DurableMissCause::EvictedSinceProbe)
+        );
+        assert_eq!(
+            classify_refusal(&StreamError::BlobTooLarge),
+            RefusalVerdict::DurableMiss(DurableMissCause::BlobTooLarge)
+        );
     }
 
     /// The residual arm has to stay reachable — it is how a genuinely dead node gets

@@ -627,6 +627,44 @@ pub struct DecdnMetrics {
     /// (DHT plus the origin-directory fallback) surfaced no provider — the blob
     /// is unavailable on the network, not a pull failure.
     pub node_pull_no_providers: Counter,
+    /// `decdn_probe_cache_hits_total` (#1165): cache-miss pulls whose candidate
+    /// walk STARTED from a live ADR 001 §Probe cache entry with at least one
+    /// still-selectable provider. The DHT lookup and probe fanout are skipped —
+    /// unless every cached provider fails, in which case the same fetch either
+    /// falls through to a fresh lookup + probe (if attempt budget remains) or
+    /// returns a clean miss (if the cached providers exhausted the budget first,
+    /// the common case since an entry holds up to 10 providers but the budget is
+    /// 3) — either way it stays counted here (the hit is "the cache had
+    /// something worth trying", not "the cache delivered"). Field has no
+    /// `_total` suffix because the
+    /// `OpenMetrics` encoder appends it. With `probe_cache_misses` this is the
+    /// hit ratio the TTL exists to buy; a ratio near zero means the TTL is
+    /// shorter than the request inter-arrival time for hot blobs and the cache
+    /// is pure overhead.
+    pub probe_cache_hits: Counter,
+    /// `decdn_probe_cache_misses_total` (#1165): cache-miss pulls that had to run
+    /// a fresh DHT lookup + probe. Counts an entry that was absent, expired, OR
+    /// fully suppressed (every cached provider negative-cached, wedged, no longer
+    /// an active staker, or otherwise unselectable) — all three cost the same
+    /// network work, which is what this measures.
+    pub probe_cache_misses: Counter,
+    /// `decdn_probe_post_eviction_failures_total` (ADR 001 §Probe cache,
+    /// ADR 005 §`EvictedSinceProbe` semantics; #1165): an upstream answered
+    /// `StreamError::EvictedSinceProbe` — it held the blob when it signed
+    /// `has_blob: true` and lost it to cache pressure before we opened the
+    /// stream.
+    ///
+    /// ADR 001 mandates tracking this rate; ADR 005 says why it matters more than
+    /// "a candidate failed": a node using probe-triggered eviction holds
+    /// correctly should *rarely* emit this, because a held blob is invisible to
+    /// the LRU driver. A sustained rate above ~1% therefore indicates a remote
+    /// hold-mechanism FAILURE — an implementation bug or resource exhaustion —
+    /// not a budget-configuration issue, which would surface as `has_blob: false`
+    /// at probe time and never reach a stream request.
+    ///
+    /// Narrower than the `RefusalVerdict::DurableMiss` arm that fires it, which
+    /// also covers `BlobTooLarge` — hence `DurableMissCause`.
+    pub probe_post_eviction_failures: Counter,
     /// `decdn_dht_lookup_round_ceiling_total` (#1145 review): a `find_providers` lookup was
     /// TRUNCATED at `MAX_LOOKUP_ROUNDS` while still finding closer nodes.
     ///
@@ -1860,6 +1898,18 @@ recorders! {
 
     /// A cache miss surfaced no provider from discovery (#831).
     node_pull_no_providers => node_pull_no_providers.inc();
+
+    /// A cache-miss pull was served from the ADR 001 probe cache: no DHT lookup,
+    /// no probe fanout (#1165).
+    probe_cache_hit => probe_cache_hits.inc();
+
+    /// A cache-miss pull found no usable probe-cache entry and ran a fresh
+    /// lookup + probe (#1165).
+    probe_cache_miss => probe_cache_misses.inc();
+
+    /// An upstream refused a stream with `EvictedSinceProbe` after answering
+    /// `has_blob: true` at probe (ADR 001 §Probe cache; #1165).
+    probe_post_eviction_failure => probe_post_eviction_failures.inc();
 
     /// A DHT lookup was truncated at `MAX_LOOKUP_ROUNDS` while still finding closer nodes
     /// (#1145 review). A sustained rate means the ceiling is too low for the network size.
