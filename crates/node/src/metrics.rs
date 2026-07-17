@@ -38,6 +38,13 @@ pub struct DecdnMetrics {
     pub probe_requests: Counter,
     /// Currently open QUIC connections.
     pub active_connections: Gauge,
+    /// `cdn/client/v1` connections closed by the application-layer idle reaper
+    /// (ADR 005 §Connection lifetime): no stream for `APP_IDLE_TIMEOUT` after the
+    /// last one closed. A sustained rate flags peers parking streamless
+    /// keep-alive'd connections — the abuse pattern the reaper exists to reclaim,
+    /// invisible in `active_connections` alone. Operator-visible name:
+    /// `decdn_client_idle_close_total`.
+    pub client_idle_close: Counter,
     /// Seconds since node start.
     pub uptime_seconds: Gauge,
     /// `NodeAnnounce` messages published to any gossip topic.
@@ -2062,6 +2069,12 @@ impl Metrics {
 
     pub fn connection_closed(&self) {
         self.decdn.active_connections.dec();
+    }
+
+    /// Record a `cdn/client/v1` connection reaped by the application-layer idle
+    /// closer (ADR 005 §Connection lifetime).
+    pub fn client_idle_close(&self) {
+        self.decdn.client_idle_close.inc();
     }
 
     pub fn gossip_published(&self, _topic: &str) {

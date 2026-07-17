@@ -84,7 +84,8 @@ const REJECTION_CLOSE_TIMEOUT: Duration = Duration::from_millis(250);
 const WINDOW_PULL_FALLBACK_DEADLINE: Duration = Duration::from_mins(1);
 
 /// Application-layer idle-close ceiling (ADR 005 §Connection lifetime): a served
-/// connection is closed this long after its last stream closes. Distinct from
+/// connection is closed this long after its last stream closes — or after it is
+/// accepted, if no stream ever opens. Distinct from
 /// the QUIC transport idle timeout (`runtime::QUIC_MAX_IDLE_TIMEOUT`, also 30s):
 /// keep-alive PINGs refresh the transport timer, so a peer can hold a connection
 /// open indefinitely while sending zero streams — only this app-layer clock
@@ -776,9 +777,9 @@ impl ClientHandler {
     }
 
     /// Override the application-layer idle-close ceiling (`APP_IDLE_TIMEOUT`).
-    /// A test/tuning seam — production leaves it unset and the 30s ADR 005 value
-    /// applies. Idempotent: a second call is ignored (the `OnceLock` keeps the
-    /// first), matching the `attach_*` wiring methods.
+    /// A test seam — no production path calls this, so production leaves it unset
+    /// and the 30s ADR 005 value applies. Idempotent: a second call is ignored
+    /// (the `OnceLock` keeps the first), matching the `attach_*` wiring methods.
     pub fn set_idle_timeout(&self, idle: Duration) {
         let _ = self.idle_timeout.set(idle);
     }
@@ -1445,13 +1446,18 @@ impl ClientHandler {
                     Err(_) => break,
                 },
                 // ADR 005 §Connection lifetime: close `idle_timeout` after the
-                // last stream closes. Gated on `is_empty()` so an active stream
-                // keeps the connection open; the fresh `sleep` per iteration
-                // re-arms on any activity, so the clock counts from the last
-                // stream's close. `biased` polls `accept_bi` first, so a stream
-                // arriving at the deadline wins over the close.
+                // last stream closes (or after accept, if none ever opened).
+                // Gated on `is_empty()` so an active stream keeps the connection
+                // open; the fresh `sleep` per iteration re-arms on any activity,
+                // so the clock counts from the last stream's close. `biased`
+                // polls `accept_bi` first, so a stream arriving at the deadline
+                // wins over the close.
                 () = tokio::time::sleep(idle_timeout), if inflight.is_empty() => {
-                    // A clean lifecycle close, not a fault — use the no-error code.
+                    // A clean lifecycle close, not a fault — use the no-error
+                    // code. Metered + logged so the reaper's firing rate (the
+                    // streamless-keep-alive abuse pattern) is visible to operators.
+                    self.metrics.client_idle_close();
+                    tracing::debug!(?idle_timeout, "client connection idle-closed");
                     conn.close(VarInt::from_u32(APP_ERR_NO_ERROR), b"idle");
                     break;
                 }
