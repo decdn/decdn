@@ -98,7 +98,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::chain_events::resumable_watcher::{
-    self, CursorPolicy, LogSink, NoneFallback, WatcherConfig, WatcherHook,
+    self, Checkpoint, CursorStart, LogSink, WatcherConfig, WatcherHook,
 };
 use crate::chain_events::shared_head::HeadSource;
 use crate::chain_events::{
@@ -308,15 +308,16 @@ impl ChainOriginDirectory {
         };
 
         // Resume the `ContentClaimed` replay floor from the persisted cursor
-        // (#1108) — a restart rebuilds `namespaces_of` from there rather than from
-        // the deploy block. `None` (first-ever boot) falls back to `from_block`.
-        // Claims below the cursor resolve as unclaimed until re-surfaced (the same
-        // routing-only posture the resync clamp already documented); membership is
-        // always authoritative via `getOrigins`, so no revoke is ever missed.
-        let replay_from = checkpoint_store
-            .load_checkpoint(CheckpointKey::Origin)
-            .context("read origin-directory scan checkpoint at bootstrap")?
-            .unwrap_or(from_block);
+        // (#1108), rewound by `REORG_MARGIN_BLOCKS` and floored at the deploy
+        // block for shallow-reorg safety across restarts (#1238) — a checkpoint
+        // written before a reorg re-enumerates the rewound span rather than
+        // trusting a block that may have been orphaned. A restart rebuilds
+        // `namespaces_of` from there rather than from the deploy block. `None`
+        // (first-ever boot) falls back to `from_block`. Claims below the cursor
+        // resolve as unclaimed until re-surfaced (the same routing-only posture
+        // the resync clamp already documented); membership is always
+        // authoritative via `getOrigins`, so no revoke is ever missed.
+        let replay_from = resume_replay_floor(checkpoint_store.as_ref(), from_block)?;
         let (cache, snapshot_block) = bootstrap_cache(&contracts, replay_from, &metrics)
             .await
             .context("snapshot OriginAssignment / PublisherRegistry at bootstrap")?;
@@ -357,12 +358,11 @@ impl ChainOriginDirectory {
             from_block,
             poll_interval: event_poll_interval,
             max_backfill_span: MAX_BACKFILL_BLOCK_SPAN,
-            cursor: cursor_policy(checkpoint_store),
+            start: cursor_start(snapshot_block, checkpoint_store),
             initial_backoff: WATCHER_INITIAL_BACKOFF,
             max_backoff: WATCHER_MAX_BACKOFF,
             rpc_call_timeout: None,
             shutdown,
-            seed_cursor: Some(snapshot_block),
             label: "origin-directory",
             on_established: Some(established_hook(&metrics)),
             on_backoff: Some(backoff_hook(&metrics)),
@@ -564,32 +564,60 @@ impl<P: Provider + Clone> OriginSink<P> {
     }
 }
 
-/// The origin watcher's cursor policy: resume the durable
-/// [`CheckpointKey::Origin`] scan cursor (#1108); a first-ever boot replays
-/// `ContentClaimed` from the **deploy floor** — the `hash → namespaces` view
-/// has no on-chain enumeration, so the stream must be replayed for
-/// correctness. Pinned by a test: a `Head` fallback silently loses every claim
-/// that predates the node.
+/// The origin watcher's cursor start: **seed** the live tail from the bootstrap
+/// snapshot block and **persist** the [`CheckpointKey::Origin`] cursor forward
+/// each window (#1108). The historical range `[replay_from, snapshot_block]` is
+/// covered by the enumeration `bootstrap` runs before the watcher spawns, so the
+/// watcher does not resolve a floor — it starts at `at` and writes forward.
 ///
-/// **Neither field below is read on the live path today.** `bootstrap` seeds the
-/// cursor at its snapshot block ([`WatcherConfig::seed_cursor`]), and a seeded
-/// cursor bypasses floor derivation entirely — `initial_from`, the only reader of
-/// `none_fallback` and `reorg_margin`, is never reached. This watcher's real
-/// resume floor is `replay_from` above: the raw checkpoint, with **no** reorg
-/// rewind. They are declared because `CursorPolicy::Persisted` requires them and
-/// they are the values derivation *would* use, not because they take effect; do
-/// not cite this site as evidence the margin applies. Making that
-/// unrepresentable needs `CursorPolicy`'s persistence and floor-derivation axes
-/// split apart (#1238) — which is also why the test below pins the shape but not
-/// the margin: a pin on a value nothing reads is the #1227 defect, not a guard
-/// against it.
-fn cursor_policy(store: Arc<dyn KeyedCheckpointStore>) -> CursorPolicy {
-    CursorPolicy::Persisted {
-        store,
-        key: CheckpointKey::Origin,
-        none_fallback: NoneFallback::FromBlock,
-        reorg_margin: REORG_MARGIN_BLOCKS,
+/// The reorg rewind is applied to `replay_from` (the enumeration floor), not
+/// here: this watcher replays from an enumeration rather than the generic
+/// `initial_from` path, so the durable checkpoint is rewound where it is read,
+/// at bootstrap. Because the start no longer carries a `reorg_margin` /
+/// `none_fallback` it never reads, the #1238 dead-field shape is gone — that is
+/// why the split moved persistence (`persist`) apart from floor derivation.
+fn cursor_start(at: u64, store: Arc<dyn KeyedCheckpointStore>) -> CursorStart {
+    CursorStart::Seeded {
+        at,
+        persist: Some(Checkpoint {
+            store,
+            key: CheckpointKey::Origin,
+        }),
     }
+}
+
+/// The `ContentClaimed` replay floor for a bootstrap: the persisted
+/// [`CheckpointKey::Origin`] checkpoint rewound `REORG_MARGIN_BLOCKS` for
+/// shallow-reorg safety across restarts (#1238), floored at the deploy block;
+/// `None` (first-ever boot) → the deploy block. Origin resolves this itself
+/// rather than through the watcher's `initial_from` because it replays from an
+/// enumeration, not the generic getLogs floor. Pure so the rewind is
+/// unit-testable without a live provider.
+const fn replay_floor(checkpoint: Option<u64>, from_block: u64) -> u64 {
+    match checkpoint {
+        Some(last) => {
+            let rewound = last.saturating_sub(REORG_MARGIN_BLOCKS);
+            if rewound > from_block {
+                rewound
+            } else {
+                from_block
+            }
+        }
+        None => from_block,
+    }
+}
+
+/// Read the persisted [`CheckpointKey::Origin`] cursor and resolve the bootstrap
+/// replay floor through [`replay_floor`]. A read error propagates (a failed
+/// checkpoint read fails start, unchanged by #1238); a cold store degrades to
+/// the deploy block. Wraps the read + rewind as one seam so `bootstrap`'s wiring
+/// — that the durable cursor actually feeds the rewind — is unit-testable
+/// without a live provider.
+fn resume_replay_floor(store: &dyn KeyedCheckpointStore, from_block: u64) -> Result<u64> {
+    let checkpoint = store
+        .load_checkpoint(CheckpointKey::Origin)
+        .context("read origin-directory scan checkpoint at bootstrap")?;
+    Ok(replay_floor(checkpoint, from_block))
 }
 
 /// Wire the watcher's healthy-cycle transition to the established gauge.
@@ -1733,12 +1761,13 @@ mod tests {
         });
     }
 
-    /// POLICY PIN: the origin watcher persists `CheckpointKey::Origin` and a
-    /// first-ever boot replays from the deploy floor — `hash → namespaces` has
-    /// no enumeration view, so a `Head` fallback silently loses every claim
-    /// that predates the node.
+    /// POLICY PIN: the origin watcher seeds the live tail from its bootstrap
+    /// snapshot block and persists `CheckpointKey::Origin` forward. The historical
+    /// range is covered by the enumeration `bootstrap` runs first; the
+    /// cross-restart reorg rewind lives on `replay_from` (see `replay_floor`),
+    /// not on the seeded start.
     #[test]
-    fn cursor_policy_is_persisted_origin_from_block_fallback() {
+    fn cursor_start_is_seeded_with_origin_persist() {
         struct NoopCheckpointStore;
         impl KeyedCheckpointStore for NoopCheckpointStore {
             fn load_checkpoint(
@@ -1757,13 +1786,74 @@ mod tests {
         }
         let store: Arc<dyn KeyedCheckpointStore> = Arc::new(NoopCheckpointStore);
         assert!(matches!(
-            cursor_policy(store),
-            CursorPolicy::Persisted {
-                key: CheckpointKey::Origin,
-                none_fallback: NoneFallback::FromBlock,
-                ..
+            cursor_start(1234, store),
+            CursorStart::Seeded {
+                at: 1234,
+                persist: Some(Checkpoint {
+                    key: CheckpointKey::Origin,
+                    ..
+                }),
             }
         ));
+    }
+
+    /// GUARDRAIL (#1238): a resumed origin boot re-enumerates `REORG_MARGIN_BLOCKS`
+    /// below the persisted cursor so a shallow reorg near the checkpoint cannot
+    /// orphan claims across a restart. Pins that the rewind *engages* — before
+    /// #1238 `replay_from` was the raw checkpoint with no rewind, so this would
+    /// read `10_000`.
+    #[test]
+    fn replay_floor_rewinds_checkpoint_by_reorg_margin() {
+        assert_eq!(
+            replay_floor(Some(10_000), 500),
+            10_000 - REORG_MARGIN_BLOCKS
+        );
+    }
+
+    /// The rewound floor never drops below the deploy block.
+    #[test]
+    fn replay_floor_floored_at_deploy_block() {
+        assert_eq!(replay_floor(Some(REORG_MARGIN_BLOCKS), 500), 500);
+    }
+
+    /// A first-ever boot (cold store) replays from the deploy block.
+    #[test]
+    fn replay_floor_cold_boot_is_deploy_block() {
+        assert_eq!(replay_floor(None, 500), 500);
+    }
+
+    /// GUARDRAIL (#1238) — the *wiring*, not just the arithmetic: `bootstrap`
+    /// resolves its replay floor by reading the persisted `CheckpointKey::Origin`
+    /// cursor and applying the rewind. The `replay_floor_*` tests pin the pure
+    /// math; this pins that the durable read feeds it, so a call site that
+    /// dropped the rewind (the pre-#1238 raw `unwrap_or`) fails here — it would
+    /// read `10_000`, not `10_000 - REORG_MARGIN_BLOCKS`.
+    #[test]
+    fn resume_replay_floor_rewinds_the_persisted_origin_checkpoint() {
+        /// Returns a fixed checkpoint, asserting the `Origin` key is the one read.
+        struct SeededOriginStore(u64);
+        impl KeyedCheckpointStore for SeededOriginStore {
+            fn load_checkpoint(
+                &self,
+                key: CheckpointKey,
+            ) -> Result<Option<u64>, decdn_incentive::StoreError> {
+                assert_eq!(
+                    key,
+                    CheckpointKey::Origin,
+                    "resume must read the Origin cursor"
+                );
+                Ok(Some(self.0))
+            }
+            fn record_checkpoint(
+                &self,
+                _key: CheckpointKey,
+                _block: u64,
+            ) -> Result<(), decdn_incentive::StoreError> {
+                Ok(())
+            }
+        }
+        let floor = resume_replay_floor(&SeededOriginStore(10_000), 500).ok();
+        assert_eq!(floor, Some(10_000 - REORG_MARGIN_BLOCKS));
     }
 
     #[test]

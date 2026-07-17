@@ -3,8 +3,8 @@
 //! One cursor loop drives every on-chain watcher: each poll tick reads head,
 //! scans `[cursor, head]` in `MAX_BACKFILL_BLOCK_SPAN` windows via
 //! `eth_getLogs`, hands each log to a [`LogSink`], then advances — and, for a
-//! [`CursorPolicy::Persisted`] watcher, durably records — the cursor per
-//! window. The **first tick's** large range *is* the historical backfill; later
+//! watcher whose [`CursorStart`] owns a [`Checkpoint`], durably records — the
+//! cursor per window. The **first tick's** large range *is* the historical backfill; later
 //! ticks are the live tail. This replaces alloy's `watch_logs`
 //! (`eth_newFilter` + `eth_getFilterChanges`), which the default public
 //! Arbitrum Sepolia RPC and most keyless endpoints reject with `-32601` (#1106).
@@ -38,133 +38,154 @@ use tracing::{debug, warn};
 use super::shared_head::HeadSource;
 use super::{backfill_windows, timed};
 
-/// What a first-ever boot (no persisted checkpoint) falls back to for a
-/// [`CursorPolicy::Persisted`] watcher.
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum NoneFallback {
-    /// Nothing existed before this node did (e.g. settlement `ChannelOpened`):
-    /// start at head, scanning essentially nothing.
-    Head,
-    /// The stream must be replayed from the deploy block for correctness
-    /// because the contract exposes no current-state enumeration (origin's
-    /// `ContentClaimed` cursor — blacklist has the same constraint but uses
-    /// [`CursorPolicy::FullReplay`] instead of a persisted cursor): start at
-    /// the configured `from_block` (deploy block).
-    FromBlock,
+/// A durable per-key scan checkpoint: the store plus the key it reads and writes
+/// under. Carried by the [`CursorStart`] variants that persist their cursor
+/// forward — and, for [`CursorStart::FromCheckpoint`], the source its resume
+/// floor is read from.
+pub(crate) struct Checkpoint {
+    pub(crate) store: Arc<dyn KeyedCheckpointStore>,
+    pub(crate) key: CheckpointKey,
 }
 
-/// How a watcher derives its initial scan floor and whether it persists progress.
-pub(crate) enum CursorPolicy {
-    /// Resume from a durable per-key checkpoint, rewound by `reorg_margin`;
-    /// persist forward each window. First boot uses `none_fallback`.
-    Persisted {
-        store: Arc<dyn KeyedCheckpointStore>,
-        key: CheckpointKey,
-        none_fallback: NoneFallback,
+/// How the **first** tick derives its scan floor, and whether the cursor is
+/// persisted forward.
+///
+/// Persistence rides inside the variants that own a [`Checkpoint`] rather than
+/// on a separate field, so the two dead-field shapes #1238 removed cannot recur:
+/// a watcher that resumes from a checkpoint cannot be configured without one,
+/// and a watcher that re-derives its floor from head cannot declare a margin or
+/// window it never reads. This replaces the fused `CursorPolicy` + the
+/// `WatcherConfig::seed_cursor` override, where a seeded watcher silently
+/// bypassed floor derivation and left its policy's derivation fields inert
+/// (#1227).
+pub(crate) enum CursorStart {
+    /// Start at an explicit block — a bootstrap snapshot head, already covered
+    /// by an out-of-band enumeration. Bypasses floor derivation entirely.
+    /// `persist` carries the cursor forward when the projection has a durable
+    /// checkpoint (origin's `ContentClaimed` cursor) and is `None` for an
+    /// ephemeral live-follow rebuilt from its enumeration each boot (the
+    /// capacity-bond staker set).
+    Seeded {
+        at: u64,
+        persist: Option<Checkpoint>,
+    },
+    /// Resume from a durable checkpoint, rewound by `reorg_margin`, persisting
+    /// forward each window. A first-ever boot (cold store) starts at **head** —
+    /// nothing predates the node, so there is no history to replay; a watcher
+    /// that must replay from the deploy block instead uses [`Self::FullReplay`]
+    /// or a [`Self::Seeded`] enumeration. This is the only start that reads a
+    /// checkpoint to derive its floor (settlement `ChannelOpened`).
+    FromCheckpoint {
+        checkpoint: Checkpoint,
         /// Blocks to rewind the checkpoint on resume (reorg safety), normally
-        /// [`super::REORG_MARGIN_BLOCKS`].
-        ///
-        /// Lives in this variant rather than on [`WatcherConfig`] because only
-        /// this arm reads it: it is the rewind applied to a *durable* cursor,
-        /// and the other two policies re-derive their floor from head on every
-        /// boot. As a `WatcherConfig` field it was inert for five of the six
-        /// watchers — four of which passed a real 128 into something that never
-        /// read it (#1227).
-        ///
-        /// Moving it here shrinks that to two sites but does not fully close it:
-        /// a [`WatcherConfig::seed_cursor`] watcher never resolves a floor, so
-        /// the origin directory still carries a margin it cannot read. Only the
-        /// settlement watcher actually rewinds. Splitting this variant's
-        /// persistence and floor-derivation axes is what would make that
-        /// unrepresentable (#1238).
+        /// [`super::REORG_MARGIN_BLOCKS`]. Only this variant resolves a floor
+        /// from a durable cursor, so it is the only reader of a margin — every
+        /// other start re-derives its floor from head each boot.
         reorg_margin: u64,
     },
-    /// Re-derive the floor from head each boot as `head - window_blocks`
-    /// (clamped `>= floor`); do not persist. Used where a resume cursor is
-    /// unsafe or unnecessary: slash (re-scan the appeal window every boot),
-    /// reputation (bounded recent window), and the enumeration-bootstrapped
-    /// live-follow watchers (`window_blocks = 0` → start at head). `window_blocks`
-    /// is always a *bounded* recent window here — full-history replay is
-    /// [`Self::FullReplay`], not a giant window.
-    HeadMinusWindow { window_blocks: u64, floor: u64 },
-    /// Replay the entire stream from `floor` (the deploy block) on **every** boot;
-    /// do not persist. For an in-memory projection with no on-chain enumeration
-    /// source, where a resume cursor would drop entries that must be rebuilt (the
-    /// blacklist deny-set — see `blacklist_watcher`).
-    FullReplay { floor: u64 },
+    /// Re-derive the floor from head each boot as `head - window_blocks` (clamped
+    /// `>= from_block`); do not persist. Used where a resume cursor is unsafe or
+    /// unnecessary: slash (re-scan the appeal window every boot) and reputation
+    /// (bounded recent window). `window_blocks` is always a *bounded* recent
+    /// window here — full-history replay is [`Self::FullReplay`], not a giant
+    /// window.
+    HeadMinusWindow { window_blocks: u64 },
+    /// Replay the entire stream from `from_block` (the deploy block) on **every**
+    /// boot; do not persist. For an in-memory projection with no on-chain
+    /// enumeration source, where a resume cursor would drop entries that must be
+    /// rebuilt (the blacklist deny-set — see `blacklist_watcher`).
+    FullReplay,
 }
 
-impl CursorPolicy {
+impl CursorStart {
+    /// The explicit starting cursor, if this is a [`Self::Seeded`] start. `Some`
+    /// pre-sets `run`'s cursor so the first tick scans from here and never
+    /// resolves a floor.
+    const fn seed(&self) -> Option<u64> {
+        match self {
+            Self::Seeded { at, .. } => Some(*at),
+            Self::FromCheckpoint { .. } | Self::HeadMinusWindow { .. } | Self::FullReplay => None,
+        }
+    }
+
+    /// The durable checkpoint this start writes forward to (and, for
+    /// [`Self::FromCheckpoint`], reads its resume floor from), if any.
+    const fn checkpoint(&self) -> Option<&Checkpoint> {
+        match self {
+            Self::Seeded { persist, .. } => persist.as_ref(),
+            Self::FromCheckpoint { checkpoint, .. } => Some(checkpoint),
+            Self::HeadMinusWindow { .. } | Self::FullReplay => None,
+        }
+    }
+
     /// Resolve the first tick's scan floor against the current scan upper bound.
+    /// Reached only on the `None` cursor branch, so [`Self::Seeded`] — whose
+    /// cursor is pre-set from [`Self::seed`] — never lands here and resolves to
+    /// `from_block` defensively.
     ///
-    /// A checkpoint read error is **retryable** for a [`NoneFallback::Head`]
-    /// watcher: falling back to head would anchor the first persisted window at
-    /// head and durably *overwrite* the stored floor, permanently discarding the
-    /// downtime gap the checkpoint exists to cover (#751/#762) — so the tick
-    /// fails into backoff and re-resolves next tick. For [`NoneFallback::FromBlock`]
-    /// the fallback is the deploy floor, where the worst case of a lost
-    /// checkpoint is only a wider (idempotent) rescan, so a read error degrades
-    /// to the fallback with a warning.
+    /// A checkpoint read error is **retryable**: falling back to head would
+    /// anchor the first persisted window at head and durably *overwrite* the
+    /// stored floor, permanently discarding the downtime gap the checkpoint
+    /// exists to cover (#751/#762) — so the tick fails into backoff and
+    /// re-resolves next tick rather than degrading to a silent rescan.
     fn initial_from(&self, from_block: u64, head: u64) -> Result<u64> {
         match self {
-            Self::Persisted {
-                store,
-                key,
-                none_fallback,
+            Self::FromCheckpoint {
+                checkpoint,
                 reorg_margin,
             } => {
-                let last = match (store.load_checkpoint(*key), none_fallback) {
-                    (Ok(v), _) => v,
-                    (Err(err), NoneFallback::Head) => {
-                        return Err(anyhow::Error::new(err)).with_context(|| {
-                            format!("read watcher scan checkpoint {}", key.as_str())
-                        });
-                    }
-                    (Err(err), NoneFallback::FromBlock) => {
-                        warn!(
-                            err = %n(&err),
-                            key = key.as_str(),
-                            "failed to read watcher scan checkpoint; rescanning from deploy floor"
-                        );
-                        None
-                    }
-                };
+                let last = checkpoint
+                    .store
+                    .load_checkpoint(checkpoint.key)
+                    .with_context(|| {
+                        format!("read watcher scan checkpoint {}", checkpoint.key.as_str())
+                    })?;
                 Ok(resolve_persisted_start(
                     last,
                     head,
                     from_block,
                     *reorg_margin,
-                    *none_fallback,
                 ))
             }
-            Self::HeadMinusWindow {
-                window_blocks,
-                floor,
-            } => Ok(resolve_head_window_start(head, *window_blocks, *floor)),
+            Self::HeadMinusWindow { window_blocks } => {
+                Ok(resolve_head_window_start(head, *window_blocks, from_block))
+            }
             // Full replay from the deploy floor: `head - u64::MAX` saturates to 0,
-            // clamped up to `floor` and down to `head`.
-            Self::FullReplay { floor } => Ok(resolve_head_window_start(head, u64::MAX, *floor)),
+            // clamped up to `from_block` and down to `head`.
+            Self::FullReplay => Ok(resolve_head_window_start(head, u64::MAX, from_block)),
+            // A seeded start pre-sets the cursor (see `seed`), so `run_tick`'s
+            // `None` branch never calls this arm. The deploy floor is the safe
+            // fallback (anti-panic policy); the `warn!` makes a future break of
+            // the "Seeded ⇒ cursor pre-seeded" invariant observable rather than a
+            // silent full re-scan from the deploy block.
+            Self::Seeded { .. } => {
+                warn!(
+                    label = "seeded start reached initial_from",
+                    from_block, "cursor seed invariant violated; falling back to deploy floor"
+                );
+                Ok(from_block)
+            }
         }
     }
 
     /// Durably record `block` as scanned (no-op for the non-persisting
-    /// [`Self::HeadMinusWindow`] and [`Self::FullReplay`] policies).
-    /// Best-effort: a lost write only widens the next rescan (see the store's
-    /// monotonic-floor contract).
+    /// [`Self::HeadMinusWindow`], [`Self::FullReplay`], and unpersisted
+    /// [`Self::Seeded`] starts). Best-effort: a lost write only widens the next
+    /// rescan (see the store's monotonic-floor contract).
     fn persist(&self, block: u64) {
-        if let Self::Persisted { store, key, .. } = self
-            && let Err(err) = store.record_checkpoint(*key, block)
+        if let Some(cp) = self.checkpoint()
+            && let Err(err) = cp.store.record_checkpoint(cp.key, block)
         {
-            warn!(err = %n(&err), key = key.as_str(), block, "failed to persist watcher checkpoint");
+            warn!(err = %n(&err), key = cp.key.as_str(), block, "failed to persist watcher checkpoint");
         }
     }
 
     /// Force any buffered checkpoint out on graceful shutdown.
     fn flush(&self) {
-        if let Self::Persisted { store, key, .. } = self
-            && let Err(err) = store.flush_checkpoint(*key)
+        if let Some(cp) = self.checkpoint()
+            && let Err(err) = cp.store.flush_checkpoint(cp.key)
         {
-            warn!(err = %n(&err), key = key.as_str(), "failed to flush watcher checkpoint");
+            warn!(err = %n(&err), key = cp.key.as_str(), "failed to flush watcher checkpoint");
         }
     }
 }
@@ -200,14 +221,16 @@ pub(crate) struct WatcherConfig {
     /// constraint such as slash's `topic2` operator). The block range is set per
     /// window.
     pub(crate) filter: Filter,
-    /// Contract deploy block — the floor a `FromBlock` first boot scans from.
+    /// Contract deploy block — the scan floor for `FullReplay` / `HeadMinusWindow`
+    /// starts and the lower clamp on a rewound `FromCheckpoint` resume (the
+    /// contract does not exist below its deploy block).
     pub(crate) from_block: u64,
     /// Delay between poll ticks (the chain `event_poll_interval`).
     pub(crate) poll_interval: Duration,
     /// Max block span per `eth_getLogs` window.
     pub(crate) max_backfill_span: u64,
-    /// Floor-derivation and persistence policy.
-    pub(crate) cursor: CursorPolicy,
+    /// Floor-derivation and persistence for the first tick.
+    pub(crate) start: CursorStart,
     /// Initial / max failed-tick retry backoff.
     pub(crate) initial_backoff: Duration,
     pub(crate) max_backoff: Duration,
@@ -232,9 +255,6 @@ pub(crate) struct WatcherConfig {
     /// to the runtime and to `payment_settlement`'s deliberate self-mint. It is
     /// not a proof — reviewing a change to the shutdown *sequence* is.
     pub(crate) shutdown: CancellationToken,
-    /// Explicit starting cursor (origin's bootstrap snapshot head). When set,
-    /// the first tick scans from here instead of resolving the policy floor.
-    pub(crate) seed_cursor: Option<u64>,
     /// Log label for backoff/established diagnostics.
     pub(crate) label: &'static str,
     /// Called once each time the watcher transitions into a healthy cycle (first
@@ -257,21 +277,20 @@ fn fire(hook: Option<&WatcherHook>) {
     }
 }
 
-/// Resolve a [`CursorPolicy::Persisted`] watcher's initial scan floor from its
-/// stored checkpoint and the current scan upper bound. `Some(b)` → `b - margin`
-/// (reorg rewind), floored at `from_block` (the contract does not exist below
-/// its deploy block) and clamped `<= head` (a checkpoint momentarily ahead of a
-/// lagging RPC head never inverts the range). `None` (first-ever boot) → the
-/// configured `none_fallback`: `Head` (nothing predates this node) or
-/// `FromBlock` (the event stream must be replayed for correctness). Pure so the
-/// policy is unit-testable without a live provider. Generalizes the settlement
-/// watcher's original `resolve_backfill_start` (which was `None => head`).
+/// Resolve a [`CursorStart::FromCheckpoint`] watcher's initial scan floor from
+/// its stored checkpoint and the current scan upper bound. `Some(b)` →
+/// `b - margin` (reorg rewind), floored at `from_block` (the contract does not
+/// exist below its deploy block) and clamped `<= head` (a checkpoint momentarily
+/// ahead of a lagging RPC head never inverts the range). `None` (first-ever,
+/// cold-store boot) → `head`: nothing predates this node, so there is no history
+/// to replay. Pure so the start is unit-testable without a live provider.
+/// Generalizes the settlement watcher's original `resolve_backfill_start` (which
+/// was `None => head`).
 pub(crate) const fn resolve_persisted_start(
     last: Option<u64>,
     head: u64,
     from_block: u64,
     margin: u64,
-    none_fallback: NoneFallback,
 ) -> u64 {
     match last {
         Some(b) => {
@@ -283,20 +302,11 @@ pub(crate) const fn resolve_persisted_start(
             };
             if floored < head { floored } else { head }
         }
-        None => match none_fallback {
-            NoneFallback::Head => head,
-            NoneFallback::FromBlock => {
-                if from_block < head {
-                    from_block
-                } else {
-                    head
-                }
-            }
-        },
+        None => head,
     }
 }
 
-/// Resolve a [`CursorPolicy::HeadMinusWindow`] watcher's floor: `head - window`,
+/// Resolve a [`CursorStart::HeadMinusWindow`] watcher's floor: `head - window`,
 /// clamped `>= floor` and `<= head`. `window == 0` → `head` (live-from-head, no
 /// backfill). Pure and unit-testable.
 pub(crate) const fn resolve_head_window_start(head: u64, window: u64, floor: u64) -> u64 {
@@ -325,7 +335,7 @@ where
     let to = cfg.head.head().await.context("read head block")?;
     let from = match *cursor {
         Some(c) => c,
-        None => cfg.cursor.initial_from(cfg.from_block, to)?,
+        None => cfg.start.initial_from(cfg.from_block, to)?,
     };
     if from > to {
         // Head has not advanced past the cursor yet (idle tick). Retain the
@@ -347,10 +357,11 @@ where
             for log in logs {
                 sink.apply(log).await?;
             }
-            // Window drained: advance the cursor and (Persisted only) persist it,
-            // so a mid-backfill crash resumes here rather than at the floor (#1108).
+            // Window drained: advance the cursor and (persisting starts only)
+            // persist it, so a mid-backfill crash resumes here rather than at the
+            // floor (#1108).
             *cursor = Some(end.saturating_add(1));
-            cfg.cursor.persist(end);
+            cfg.start.persist(end);
         }
     }
     // Always run the end-of-tick reconcile, including on an idle tick — a sink
@@ -371,7 +382,7 @@ where
     P: Provider + Clone,
     S: LogSink,
 {
-    let mut cursor: Option<u64> = cfg.seed_cursor;
+    let mut cursor: Option<u64> = cfg.start.seed();
     let mut backoff = cfg.initial_backoff;
     let mut established = false;
     let mut ticker = tokio::time::interval(cfg.poll_interval);
@@ -380,7 +391,7 @@ where
         tokio::select! {
             biased;
             () = cfg.shutdown.cancelled() => {
-                cfg.cursor.flush();
+                cfg.start.flush();
                 return;
             }
             _ = ticker.tick() => {}
@@ -411,7 +422,7 @@ where
                 );
                 tokio::select! {
                     biased;
-                    () = cfg.shutdown.cancelled() => { cfg.cursor.flush(); return; }
+                    () = cfg.shutdown.cancelled() => { cfg.start.flush(); return; }
                     () = tokio::time::sleep(backoff) => {}
                 }
                 backoff = (backoff * 2).min(cfg.max_backoff);
@@ -429,36 +440,22 @@ mod tests {
     const MARGIN: u64 = crate::chain_events::REORG_MARGIN_BLOCKS;
 
     #[test]
-    fn persisted_none_head_starts_at_head() {
-        // Settlement: nothing predates the node → scan essentially nothing.
-        assert_eq!(
-            resolve_persisted_start(None, 1_000, 0, MARGIN, NoneFallback::Head),
-            1_000
-        );
+    fn persisted_none_starts_at_head() {
+        // Cold store: nothing predates the node → scan essentially nothing.
+        assert_eq!(resolve_persisted_start(None, 1_000, 0, MARGIN), 1_000);
     }
 
     #[test]
-    fn persisted_none_from_block_starts_at_from_block() {
-        // Origin: no enumeration view for claims → replay from the deploy block.
-        assert_eq!(
-            resolve_persisted_start(None, 1_000, 200, MARGIN, NoneFallback::FromBlock),
-            200
-        );
-    }
-
-    #[test]
-    fn persisted_none_from_block_clamped_to_head() {
-        // A deploy block momentarily above a lagging RPC head never inverts.
-        assert_eq!(
-            resolve_persisted_start(None, 50, 200, MARGIN, NoneFallback::FromBlock),
-            50
-        );
+    fn persisted_none_starts_at_head_ignoring_from_block() {
+        // The cold-store floor is head, not the deploy block — a persisted-cursor
+        // watcher has no history to replay before its own first channel.
+        assert_eq!(resolve_persisted_start(None, 1_000, 200, MARGIN), 1_000);
     }
 
     #[test]
     fn persisted_some_rewinds_by_margin() {
         assert_eq!(
-            resolve_persisted_start(Some(10_000), 20_000, 0, MARGIN, NoneFallback::Head),
+            resolve_persisted_start(Some(10_000), 20_000, 0, MARGIN),
             10_000 - MARGIN
         );
     }
@@ -466,27 +463,18 @@ mod tests {
     #[test]
     fn persisted_some_floored_at_from_block() {
         // The rewound cursor never drops below the deploy floor.
-        assert_eq!(
-            resolve_persisted_start(Some(300), 20_000, 250, MARGIN, NoneFallback::FromBlock),
-            250
-        );
+        assert_eq!(resolve_persisted_start(Some(300), 20_000, 250, MARGIN), 250);
     }
 
     #[test]
     fn persisted_some_clamped_to_head() {
         // A checkpoint ahead of a lagging head clamps to head, not an inverted range.
-        assert_eq!(
-            resolve_persisted_start(Some(20_000), 500, 0, MARGIN, NoneFallback::Head),
-            500
-        );
+        assert_eq!(resolve_persisted_start(Some(20_000), 500, 0, MARGIN), 500);
     }
 
     #[test]
     fn persisted_saturates_at_zero() {
-        assert_eq!(
-            resolve_persisted_start(Some(10), 1_000, 0, MARGIN, NoneFallback::Head),
-            0
-        );
+        assert_eq!(resolve_persisted_start(Some(10), 1_000, 0, MARGIN), 0);
     }
 
     #[test]
@@ -514,6 +502,93 @@ mod tests {
     #[test]
     fn head_window_saturates_at_zero() {
         assert_eq!(resolve_head_window_start(500, 10_000, 0), 0);
+    }
+
+    // The variant → resolver wiring: each `CursorStart` must feed its own fields
+    // (and the config `from_block`) into the right pure resolver. The
+    // `resolve_*` tests above cover the arithmetic; these pin the hookup so a
+    // mis-wired variant (e.g. `FullReplay` feeding a bounded window) is caught.
+
+    /// `seed` pre-sets the cursor for a `Seeded` start and only that start;
+    /// every other start resolves its floor on the first tick (`seed` → `None`).
+    #[test]
+    fn seed_is_some_only_for_seeded() {
+        assert_eq!(
+            CursorStart::Seeded {
+                at: 42,
+                persist: None
+            }
+            .seed(),
+            Some(42)
+        );
+        assert_eq!(CursorStart::FullReplay.seed(), None);
+        assert_eq!(
+            CursorStart::HeadMinusWindow { window_blocks: 10 }.seed(),
+            None
+        );
+    }
+
+    /// A `Seeded { persist: Some(_) }` start writes its cursor forward (origin's
+    /// `CheckpointKey::Origin` resume); a `persist: None` seed records nothing
+    /// (capacity-bond, rebuilt each boot).
+    #[test]
+    fn seeded_persist_drives_the_forward_checkpoint() {
+        let store = Arc::new(MemoryCheckpointStore::default());
+        let persisting = CursorStart::Seeded {
+            at: 0,
+            persist: Some(Checkpoint {
+                store: Arc::clone(&store) as Arc<dyn KeyedCheckpointStore>,
+                key: CheckpointKey::Origin,
+            }),
+        };
+        persisting.persist(99);
+        assert_eq!(
+            store.load_checkpoint(CheckpointKey::Origin).ok().flatten(),
+            Some(99),
+            "a persisting seed records its cursor forward"
+        );
+
+        let ephemeral = CursorStart::Seeded {
+            at: 0,
+            persist: None,
+        };
+        assert!(
+            ephemeral.checkpoint().is_none(),
+            "a None-persist seed has no durable checkpoint"
+        );
+    }
+
+    /// `FullReplay` resolves to the deploy floor (`from_block`): it feeds
+    /// `u64::MAX` as the window, so a swap to a bounded window would stop being a
+    /// full replay and fail here.
+    #[test]
+    fn full_replay_initial_from_is_the_deploy_floor() {
+        assert_eq!(
+            CursorStart::FullReplay.initial_from(500, 20_000).ok(),
+            Some(500)
+        );
+    }
+
+    /// `HeadMinusWindow` resolves `head - window_blocks`, clamped to `from_block`
+    /// — pins that the variant feeds its own `window_blocks` and the config floor.
+    #[test]
+    fn head_minus_window_initial_from_subtracts_the_window() {
+        let start = CursorStart::HeadMinusWindow {
+            window_blocks: 1_000,
+        };
+        assert_eq!(start.initial_from(500, 20_000).ok(), Some(19_000));
+    }
+
+    /// The defensive `Seeded` arm of `initial_from` is unreachable in production
+    /// (`seed` pre-sets the cursor), but if reached it falls back to the deploy
+    /// floor rather than panicking.
+    #[test]
+    fn seeded_initial_from_defensive_fallback_is_the_deploy_floor() {
+        let start = CursorStart::Seeded {
+            at: 5_000,
+            persist: None,
+        };
+        assert_eq!(start.initial_from(500, 20_000).ok(), Some(500));
     }
 
     /// A store whose reads always fail, for the load-error policy cases.
@@ -650,17 +725,17 @@ mod tests {
             from_block: 0,
             poll_interval: Duration::from_secs(1),
             max_backfill_span: 10,
-            cursor: CursorPolicy::Persisted {
-                store,
-                key: CheckpointKey::ChannelOpened,
-                none_fallback: NoneFallback::FromBlock,
+            start: CursorStart::FromCheckpoint {
+                checkpoint: Checkpoint {
+                    store,
+                    key: CheckpointKey::ChannelOpened,
+                },
                 reorg_margin: 0,
             },
             initial_backoff: Duration::from_millis(1),
             max_backoff: Duration::from_millis(1),
             rpc_call_timeout: None,
             shutdown: CancellationToken::new(),
-            seed_cursor: None,
             label: "test",
             on_established: None,
             on_backoff: None,
@@ -690,8 +765,10 @@ mod tests {
                 .flatten()
         };
 
-        // Tick 1: head 25 → windows [0,9], [10,19], [20,25]. One log per queried
-        // window; the sink fails on the second delivery (window [10,19]).
+        // Tick 1: cursor resumed at 0, head 25 → windows [0,9], [10,19], [20,25].
+        // One log per queried window; the sink fails on the second delivery
+        // (window [10,19]). Starting the cursor explicitly keeps this test on the
+        // window/persist loop rather than floor derivation (covered separately).
         asserter.push_success(&U64::from(25));
         asserter.push_success(&one_log());
         asserter.push_success(&one_log());
@@ -699,7 +776,7 @@ mod tests {
             applied: 0,
             fail_on: Some(1),
         };
-        let mut cursor = None;
+        let mut cursor = Some(0);
         let result = run_tick(&provider, &cfg, &mut sink, &mut cursor).await;
         assert!(result.is_err(), "the failed window must fail the tick");
         assert_eq!(cursor, Some(10), "cursor at the last completed window");
@@ -792,7 +869,7 @@ mod tests {
     ///
     /// This is the mechanism the whole graceful-shutdown path rests on, and
     /// nothing exercised it: every other test here drives `run_tick` directly,
-    /// so `run`'s two flush arms and `CursorPolicy::flush` had no coverage at
+    /// so `run`'s two flush arms and `CursorStart::flush` had no coverage at
     /// all. That gap is what let three watchers ship with a token nothing could
     /// cancel (#1230) — an unreachable branch looks no different from a
     /// reachable one when neither is tested.
@@ -809,10 +886,11 @@ mod tests {
         let shutdown = CancellationToken::new();
 
         let mut cfg = tick_cfg(provider.clone(), Arc::new(MemoryCheckpointStore::default()));
-        cfg.cursor = CursorPolicy::Persisted {
-            store: Arc::clone(&store) as Arc<dyn KeyedCheckpointStore>,
-            key: CheckpointKey::ChannelOpened,
-            none_fallback: NoneFallback::FromBlock,
+        cfg.start = CursorStart::FromCheckpoint {
+            checkpoint: Checkpoint {
+                store: Arc::clone(&store) as Arc<dyn KeyedCheckpointStore>,
+                key: CheckpointKey::ChannelOpened,
+            },
             reorg_margin: 0,
         };
         cfg.shutdown = shutdown.clone();
@@ -889,7 +967,7 @@ mod tests {
             applied: 0,
             shutdown: shutdown.clone(),
         };
-        let mut cursor = None;
+        let mut cursor = Some(0);
         let result = run_tick(&provider, &cfg, &mut sink, &mut cursor).await;
 
         assert!(result.is_ok(), "a cancelled tick exits cleanly: {result:?}");
@@ -911,11 +989,12 @@ mod tests {
         );
     }
 
-    fn persisted(none_fallback: NoneFallback) -> CursorPolicy {
-        CursorPolicy::Persisted {
-            store: Arc::new(FailingLoadStore),
-            key: CheckpointKey::ChannelOpened,
-            none_fallback,
+    fn persisted() -> CursorStart {
+        CursorStart::FromCheckpoint {
+            checkpoint: Checkpoint {
+                store: Arc::new(FailingLoadStore),
+                key: CheckpointKey::ChannelOpened,
+            },
             reorg_margin: MARGIN,
         }
     }
@@ -923,15 +1002,15 @@ mod tests {
     /// The configured `reorg_margin` actually reaches `resolve_persisted_start`
     /// — the *wiring*, not the arithmetic.
     ///
-    /// Nothing else covers this seam, which is why it exists. The seven
+    /// Nothing else covers this seam, which is why it exists. The
     /// `resolve_persisted_start` tests call that pure fn directly, so they prove
-    /// the rewind *given* a margin. The `cursor_policy` pins prove settlement's
+    /// the rewind *given* a margin. The `cursor_start` pins prove settlement's
     /// production config *carries* `REORG_MARGIN_BLOCKS`. Neither proves
     /// `initial_from` hands one to the other: hard-coding `0` at that call site
     /// passed the entire suite. Two legs of three — the same shape that let
     /// #1227 ship documented-but-disabled, one field over.
     ///
-    /// Every other `Persisted` test reaches the `None` arm (a `FailingLoadStore`
+    /// The other `FromCheckpoint` tests reach the `None` arm (a `FailingLoadStore`
     /// or an empty store), which ignores the margin entirely; only a stored
     /// `Some(checkpoint)` exercises the rewind. The three constants are mutually
     /// distinct so an argument-order slip among `resolve_persisted_start`'s
@@ -945,39 +1024,26 @@ mod tests {
         let store = Arc::new(MemoryCheckpointStore::default());
         let recorded = store.record_checkpoint(CheckpointKey::ChannelOpened, CHECKPOINT);
         assert!(recorded.is_ok(), "seeding the checkpoint must succeed");
-        let policy = CursorPolicy::Persisted {
-            store,
-            key: CheckpointKey::ChannelOpened,
-            none_fallback: NoneFallback::Head,
+        let start = CursorStart::FromCheckpoint {
+            checkpoint: Checkpoint {
+                store,
+                key: CheckpointKey::ChannelOpened,
+            },
             reorg_margin: MARGIN,
         };
 
         assert_eq!(
-            policy.initial_from(FROM_BLOCK, HEAD).unwrap_or(u64::MAX),
+            start.initial_from(FROM_BLOCK, HEAD).unwrap_or(u64::MAX),
             CHECKPOINT - MARGIN,
-            "a resumed floor must be rewound by the policy's own reorg_margin"
+            "a resumed floor must be rewound by the start's own reorg_margin"
         );
     }
 
     #[test]
-    fn load_error_is_retryable_for_head_fallback() {
-        // Falling back to head would durably overwrite the stored floor and
-        // permanently discard the downtime gap (#751/#762) — the tick must fail
-        // into backoff instead so the read is retried.
-        assert!(
-            persisted(NoneFallback::Head)
-                .initial_from(0, 1_000)
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn load_error_degrades_to_deploy_floor_for_from_block_fallback() {
-        // For a deploy-floor watcher the worst case of a lost checkpoint is a
-        // wider idempotent rescan, so a read error degrades instead of failing.
-        let start = persisted(NoneFallback::FromBlock)
-            .initial_from(200, 1_000)
-            .unwrap_or(u64::MAX);
-        assert_eq!(start, 200);
+    fn load_error_is_retryable() {
+        // A checkpoint read error must fail the tick into backoff so the read is
+        // retried: falling back to head would durably overwrite the stored floor
+        // and permanently discard the downtime gap (#751/#762).
+        assert!(persisted().initial_from(0, 1_000).is_err());
     }
 }

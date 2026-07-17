@@ -49,7 +49,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::chain_events::resumable_watcher::{
-    self, CursorPolicy, LogSink, WatcherConfig, WatcherHook,
+    self, CursorStart, LogSink, WatcherConfig, WatcherHook,
 };
 use crate::chain_events::shared_head::HeadSource;
 use crate::chain_events::{
@@ -399,15 +399,17 @@ where
         // outage / rate-limit) recovers in bounded windows instead of one
         // range-limit-tripping `eth_getLogs`.
         max_backfill_span: MAX_BACKFILL_BLOCK_SPAN,
-        cursor: CursorPolicy::HeadMinusWindow {
-            window_blocks: 0,
-            floor: 0,
+        // Seed the live tail from the enumeration snapshot head; the staker set
+        // is rebuilt from that enumeration each boot, so there is no durable
+        // cursor to persist.
+        start: CursorStart::Seeded {
+            at: snapshot_block,
+            persist: None,
         },
         initial_backoff: WATCHER_INITIAL_BACKOFF,
         max_backoff: WATCHER_MAX_BACKOFF,
         rpc_call_timeout: None,
         shutdown,
-        seed_cursor: Some(snapshot_block),
         label: "capacity-bond",
         on_established: Some(established_hook(&metrics)),
         on_backoff: Some(backoff_hook(&metrics)),
