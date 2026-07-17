@@ -27,6 +27,7 @@ pub mod node_origin;
 pub mod payment_settlement;
 pub mod prefetch;
 pub mod probe_client;
+pub(crate) mod prune_guard;
 pub mod rate_limit;
 pub mod receipt_log;
 pub mod region_accounting;

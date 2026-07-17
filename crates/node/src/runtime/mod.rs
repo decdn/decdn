@@ -140,6 +140,53 @@ fn with_poll_interval<P: Provider>(provider: P, interval: Duration) -> P {
     provider
 }
 
+type HttpUrl = alloy::transports::http::reqwest::Url;
+
+/// Construct the four HTTP-provider roles owned by the node runtime (#1252).
+///
+/// Keeping these constructors together makes the pending-transaction poll
+/// interval and wallet nonce policy single-sourced while preserving separate
+/// provider instances for every consumer. The shared-head provider is the one
+/// deliberate exception to the poll override: it never creates pending
+/// transactions and therefore keeps Alloy's transport default.
+struct ProviderFactory;
+
+impl ProviderFactory {
+    fn read_only(url: HttpUrl, interval: Duration) -> impl Provider + Clone {
+        with_poll_interval(ProviderBuilder::new().connect_http(url), interval)
+    }
+
+    fn shared_head(url: HttpUrl) -> impl Provider + Clone {
+        ProviderBuilder::new().connect_http(url)
+    }
+
+    fn seller_wallet(
+        url: HttpUrl,
+        signer: PrivateKeySigner,
+        interval: Duration,
+    ) -> impl Provider + Clone {
+        Self::wallet(url, signer, interval)
+    }
+
+    fn buyer_wallet(
+        url: HttpUrl,
+        signer: PrivateKeySigner,
+        interval: Duration,
+    ) -> impl Provider + Clone {
+        Self::wallet(url, signer, interval)
+    }
+
+    fn wallet(url: HttpUrl, signer: PrivateKeySigner, interval: Duration) -> impl Provider + Clone {
+        with_poll_interval(
+            ProviderBuilder::new()
+                .with_simple_nonce_management()
+                .wallet(EthereumWallet::from(signer))
+                .connect_http(url),
+            interval,
+        )
+    }
+}
+
 /// Runtime [`QuicTransportConfig`]. Tests build their own config via
 /// the same builder when they need to shorten the idle timeout to keep
 /// the test runtime under a second.
@@ -675,13 +722,12 @@ pub async fn run(
     // responder. Built here (ahead of the probe handler) so the probe
     // handler can consult it for stake-lane probe-acceptance (#757); the
     // DHT handler below shares the same `Arc`.
-    let rpc_url: alloy::transports::http::reqwest::Url =
-        cfg.blockchain.rpc_url.parse().with_context(|| {
-            format!(
-                "blockchain.rpc_url {:?} is not a valid URL",
-                cfg.blockchain.rpc_url
-            )
-        })?;
+    let rpc_url: HttpUrl = cfg.blockchain.rpc_url.parse().with_context(|| {
+        format!(
+            "blockchain.rpc_url {:?} is not a valid URL",
+            cfg.blockchain.rpc_url
+        )
+    })?;
     let capacity_bond_addr = parse_nonzero_address(
         &cfg.blockchain.capacity_bond_address,
         "blockchain.capacity_bond_address",
@@ -702,10 +748,7 @@ pub async fn run(
     // `with_poll_interval` below — the pending-tx receipt heartbeat, overriding
     // alloy's 250 ms localhost default that would hammer a dev anvil.
     let event_poll_interval = Duration::from_millis(cfg.blockchain.event_poll_interval_ms);
-    let chain_provider = with_poll_interval(
-        ProviderBuilder::new().connect_http(rpc_url.clone()),
-        event_poll_interval,
-    );
+    let chain_provider = ProviderFactory::read_only(rpc_url.clone(), event_poll_interval);
     // One `eth_blockNumber` per TTL window for ALL watchers, instead of one per
     // watcher per tick. Plain read-only provider: a head read needs no wallet or
     // nonce filler, and coupling it to the signer stack would give every watcher's
@@ -713,7 +756,7 @@ pub async fn run(
     // `with_poll_interval` — that only sets the pending-tx receipt heartbeat, and
     // this provider never builds a `PendingTransactionBuilder`.
     let head: Arc<dyn HeadSource> = Arc::new(SharedHead::new(
-        ProviderBuilder::new().connect_http(rpc_url.clone()),
+        ProviderFactory::shared_head(rpc_url.clone()),
         event_poll_interval,
     ));
     // Graceful-shutdown tokens for the three watchers that previously minted one
@@ -753,10 +796,7 @@ pub async fn run(
     // loop, so a bring-up RPC blip retries with backoff rather than disabling
     // detection for the daemon's lifetime.
     let slash_watcher = crate::slash_watcher::SlashWatcher::bootstrap(
-        with_poll_interval(
-            ProviderBuilder::new().connect_http(rpc_url.clone()),
-            event_poll_interval,
-        ),
+        ProviderFactory::read_only(rpc_url.clone(), event_poll_interval),
         slash_judge_addr,
         eth_signer.address(),
         cfg.blockchain.slash_judge_from_block,
@@ -822,7 +862,7 @@ pub async fn run(
         Arc::clone(&probe_rate_limiter),
         cache.clone(),
         Arc::clone(&eth_signer),
-        slash_domain,
+        slash_domain.clone(),
         cfg.payment.delivery_floor,
         cfg.payment.delivery_ceiling,
         // ADR 015 master switch. Restart-required (it changes the
@@ -889,10 +929,7 @@ pub async fn run(
                 parse_nonzero_address(publisher_addr, "blockchain.publisher_registry_address")?;
             Arc::new(
                 crate::dht::ChainOriginDirectory::bootstrap(
-                    with_poll_interval(
-                        ProviderBuilder::new().connect_http(rpc_url.clone()),
-                        event_poll_interval,
-                    ),
+                    ProviderFactory::read_only(rpc_url.clone(), event_poll_interval),
                     origin_assignment_addr,
                     publisher_registry_addr,
                     capacity_bond_addr,
@@ -988,9 +1025,9 @@ pub async fn run(
         Arc::clone(&limiter),
         cache.clone(),
         Arc::clone(&eth_signer),
-        decdn_incentive::slash_judge_domain(cfg.blockchain.chain_id, slash_judge_addr),
-        voucher_domain,
-        bind_domain,
+        slash_domain.clone(),
+        voucher_domain.clone(),
+        bind_domain.clone(),
         Arc::clone(&channel_state_store),
         Arc::clone(&receipt_sink),
         reload_state.rate_per_mb(),
@@ -1019,13 +1056,8 @@ pub async fn run(
     // until restart. `SimpleNonceManager` stores nothing — each send re-reads
     // the pending nonce — so a failed send can't gap the lane. The buyer
     // provider below relies on this same property for the retried `reclaimExpired`.
-    let wallet_provider = with_poll_interval(
-        ProviderBuilder::new()
-            .with_simple_nonce_management()
-            .wallet(EthereumWallet::from((*eth_signer).clone()))
-            .connect_http(rpc_url.clone()),
-        event_poll_interval,
-    );
+    let wallet_provider =
+        ProviderFactory::seller_wallet(rpc_url.clone(), (*eth_signer).clone(), event_poll_interval);
     let payment_service = PaymentChannelService::bootstrap(
         wallet_provider,
         payment_channel_addr,
@@ -1205,13 +1237,8 @@ pub async fn run(
     // on `SimpleNonceManager` re-reading the pending nonce each send (a transient
     // racing collision just gets a fresh nonce on the next attempt), not on the
     // sends being strictly serialized.
-    let buyer_wallet_provider = with_poll_interval(
-        ProviderBuilder::new()
-            .with_simple_nonce_management()
-            .wallet(EthereumWallet::from((*eth_signer).clone()))
-            .connect_http(rpc_url),
-        event_poll_interval,
-    );
+    let buyer_wallet_provider =
+        ProviderFactory::buyer_wallet(rpc_url, (*eth_signer).clone(), event_poll_interval);
     let buyer_channel_store: Arc<dyn decdn_incentive::BuyerChannelStore> = Arc::new(
         crate::channel_store::BuyerChannelStoreHandle::new(Arc::clone(&concrete_channel_store)),
     );
@@ -1356,10 +1383,7 @@ pub async fn run(
                 parse_nonzero_address(addr, "blockchain.content_blacklist_address")?;
             let shutdown = CancellationToken::new();
             tasks.spawn(crate::blacklist_watcher::run(
-                with_poll_interval(
-                    ProviderBuilder::new().connect_http(url),
-                    event_poll_interval,
-                ),
+                ProviderFactory::read_only(url, event_poll_interval),
                 content_blacklist_addr,
                 eth_signer.address(),
                 cache.clone(),
@@ -1579,20 +1603,17 @@ pub async fn run(
     // Precompute every cfg/secret-derived value the task needs: the closure is
     // `'static` so it can't borrow `cfg`/`secret_key`, and those are used later.
     let (buyer_bootstrap_stop_tx, buyer_bootstrap_stop_rx) = oneshot::channel::<()>();
-    let buyer_voucher_domain =
-        decdn_incentive::voucher_domain(cfg.blockchain.chain_id, payment_channel_addr);
+    let buyer_voucher_domain = voucher_domain;
     let buyer_default_deposit = U256::from(cfg.blockchain.buyer_deposit_micro_usdc);
     let buyer_ensure_max_approval = cfg.blockchain.buyer_max_approve;
     let buyer_signer_address = eth_signer.address();
     let pull_through_enabled = cfg.cache.node_to_node_pull_through_enabled;
     let node_origin_self_id = crate::dht::NodeId::from_bytes(*secret_key.public().as_bytes());
-    let node_origin_slash_domain =
-        decdn_incentive::slash_judge_domain(cfg.blockchain.chain_id, slash_judge_addr);
+    let node_origin_slash_domain = slash_domain;
     // #1117: the `CapacityBond` bind domain this node signs its node→node client
     // identity binding under — same construction as the serving-side
     // `bind_domain` (:961) so an upstream verifies against an identical domain.
-    let node_origin_bind_domain =
-        decdn_incentive::bind_node_id_domain(cfg.blockchain.chain_id, capacity_bond_addr);
+    let node_origin_bind_domain = bind_domain;
     let node_origin_config = crate::node_origin::NodeOriginConfig {
         probe_fanout: cfg.cache.node_pull_probe_fanout,
         pull_timeout: std::time::Duration::from_secs(cfg.cache.node_pull_timeout_sec),
@@ -1810,10 +1831,7 @@ pub async fn run(
     // reputation is best-effort, so the node still starts (weights stay 0).
     let _settlement_indexer = if cfg.gossip.subscribe_reputation {
         match crate::reputation_indexer::SettlementIndexer::bootstrap(
-            with_poll_interval(
-                ProviderBuilder::new().connect_http(reputation_rpc_url),
-                event_poll_interval,
-            ),
+            ProviderFactory::read_only(reputation_rpc_url, event_poll_interval),
             payment_channel_addr,
             capacity_bond_addr,
             Arc::clone(&settlement_source),
@@ -3187,6 +3205,23 @@ mod tests {
             Duration::from_secs(7),
         );
         assert_eq!(provider.client().poll_interval(), Duration::from_secs(7));
+    }
+
+    #[test]
+    fn provider_factory_preserves_role_polling_policy() {
+        let url: HttpUrl = "http://localhost:8545".parse().expect("valid URL");
+        let interval = Duration::from_secs(7);
+
+        let read = ProviderFactory::read_only(url.clone(), interval);
+        let head = ProviderFactory::shared_head(url.clone());
+        let seller =
+            ProviderFactory::seller_wallet(url.clone(), PrivateKeySigner::random(), interval);
+        let buyer = ProviderFactory::buyer_wallet(url, PrivateKeySigner::random(), interval);
+
+        assert_eq!(read.client().poll_interval(), interval);
+        assert_eq!(head.client().poll_interval(), Duration::from_millis(250));
+        assert_eq!(seller.client().poll_interval(), interval);
+        assert_eq!(buyer.client().poll_interval(), interval);
     }
 
     /// `admin_stop_order` defaults to `Early` (the original
