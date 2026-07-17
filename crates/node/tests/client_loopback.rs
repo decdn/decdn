@@ -51,6 +51,7 @@ use decdn_protocol::client::{
 use decdn_protocol::{
     ALPN_CLIENT, decode_message, encode_message, encode_stream_request, read_frame, write_frame,
 };
+use iroh::endpoint::ConnectionError;
 use iroh::{Endpoint, EndpointAddr};
 
 mod support;
@@ -237,6 +238,73 @@ async fn client_delivery_roundtrip_advances_channel_state() -> anyhow::Result<()
         only.last_bytes_delivered()
     );
     anyhow::ensure!(only.last_amount() > U256::ZERO, "amount must be non-zero");
+
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
+/// ADR 005 §Connection lifetime (#1193): a connection with no active stream is
+/// closed by the application layer after `APP_IDLE_TIMEOUT`. A short timeout is
+/// injected via `set_idle_timeout` so the test need not wait the production 30s.
+/// The client opens no stream, so the server's serve loop is idle from the start
+/// and must close it; the close is asserted to be the graceful no-error "idle"
+/// close (`APP_ERR_NO_ERROR` + reason `"idle"`), not a fault or transport reset.
+#[tokio::test(flavor = "multi_thread")]
+async fn idle_connection_is_closed_by_the_app_layer() -> anyhow::Result<()> {
+    let (cache, _cache_tmp) = empty_cache().await?;
+    let store: Arc<dyn ChannelStateStore> = Arc::new(MemoryChannelStateStore::new());
+
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = Arc::new(PrivateKeySigner::random());
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let handler = build_handler(
+        server_id,
+        &server_eth,
+        &metrics,
+        limiter,
+        cache,
+        store,
+        RATE_PER_MB,
+    )?;
+    handler.set_idle_timeout(Duration::from_millis(300));
+
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+    let conn = client_ep
+        .connect(target, ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+
+    // No stream is ever opened: the serve loop is idle from the first poll and
+    // must close us after the injected 300ms window. The outer 10s bound is
+    // generous against CI jitter yet still fails if the idle arm never fires.
+    let err = tokio::time::timeout(Duration::from_secs(10), conn.closed())
+        .await
+        .map_err(|_| anyhow::anyhow!("connection was not idle-closed within 10s"))?;
+
+    match err {
+        ConnectionError::ApplicationClosed(ac) => {
+            // `APP_ERR_NO_ERROR` (0x00) — the handler's clean-lifecycle close code.
+            anyhow::ensure!(
+                ac.error_code.into_inner() == 0,
+                "idle close must use the no-error code, got {}",
+                ac.error_code.into_inner()
+            );
+            anyhow::ensure!(
+                ac.reason.as_ref() == b"idle",
+                "idle close reason: {:?}",
+                ac.reason
+            );
+        }
+        other => anyhow::bail!("expected a graceful application idle-close, got {other:?}"),
+    }
 
     client_ep.close().await;
     server_ep.close().await;

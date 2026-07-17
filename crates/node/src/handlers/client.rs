@@ -83,6 +83,17 @@ const REJECTION_CLOSE_TIMEOUT: Duration = Duration::from_millis(250);
 /// one alongside the window provider, so this only guards a misconfiguration.
 const WINDOW_PULL_FALLBACK_DEADLINE: Duration = Duration::from_mins(1);
 
+/// Application-layer idle-close ceiling (ADR 005 §Connection lifetime): a served
+/// connection is closed this long after its last stream closes. Distinct from
+/// the QUIC transport idle timeout (`runtime::QUIC_MAX_IDLE_TIMEOUT`, also 30s):
+/// keep-alive PINGs refresh the transport timer, so a peer can hold a connection
+/// open indefinitely while sending zero streams — only this app-layer clock
+/// reclaims it. On the serving side the node is the seller (it *receives*
+/// vouchers and replies with `VoucherAck`; it never holds a sent voucher
+/// awaiting ack), so ADR 005's "no unacknowledged vouchers in flight" clause is
+/// vacuously satisfied here and the rule reduces to purely stream-idle.
+const APP_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
 // QUIC application error codes (ADR 013 §Application Error Codes). A clean
 // voucher rejection does NOT use these — it writes a `StreamError` frame and
 // finishes the stream so the reason survives.
@@ -673,6 +684,11 @@ pub struct ClientHandler {
     voucher_interval_mb: u64,
     max_blob_size_bytes: u64,
     max_concurrent_streams: usize,
+    /// Application-layer idle-close ceiling (ADR 005 §Connection lifetime).
+    /// Unset (the default and production path) reads as [`APP_IDLE_TIMEOUT`]
+    /// (30s); a shorter value is injected via [`ClientHandler::set_idle_timeout`]
+    /// only by tests, so an idle-close case need not wait a real 30s.
+    idle_timeout: OnceLock<Duration>,
 }
 
 impl std::fmt::Debug for ClientHandler {
@@ -755,7 +771,16 @@ impl ClientHandler {
             voucher_interval_mb,
             max_blob_size_bytes,
             max_concurrent_streams,
+            idle_timeout: OnceLock::new(),
         })
+    }
+
+    /// Override the application-layer idle-close ceiling (`APP_IDLE_TIMEOUT`).
+    /// A test/tuning seam — production leaves it unset and the 30s ADR 005 value
+    /// applies. Idempotent: a second call is ignored (the `OnceLock` keeps the
+    /// first), matching the `attach_*` wiring methods.
+    pub fn set_idle_timeout(&self, idle: Duration) {
+        let _ = self.idle_timeout.set(idle);
     }
 
     /// Attach the redeem-hint sender from the on-chain settlement service
@@ -1374,6 +1399,12 @@ impl ClientHandler {
     /// signature borrows `&self` — spawned tasks would need a `'static` handle
     /// the trait does not hand us. Cooperative concurrency is sufficient for
     /// the I/O-bound delivery path.
+    ///
+    /// The loop also enforces the ADR 005 §Connection lifetime application-layer
+    /// idle-close: once no stream is in flight, a connection with no new stream
+    /// for [`APP_IDLE_TIMEOUT`] is closed (any activity re-arms the clock). This
+    /// reclaims a peer that keeps the QUIC connection alive with keep-alive PINGs
+    /// but sends no streams — which the transport idle timer never reaps.
     #[allow(clippy::cognitive_complexity)] // linear accept/select loop; splitting obscures it.
     async fn serve(&self, conn: Connection) -> anyhow::Result<()> {
         let _permit = match self.limiter.acquire(&conn) {
@@ -1398,6 +1429,7 @@ impl ClientHandler {
         let bound_addr: Arc<Mutex<Option<Address>>> = Arc::new(Mutex::new(None));
         let client_node_id = B256::from(*conn.remote_id().as_bytes());
 
+        let idle_timeout = self.idle_timeout.get().copied().unwrap_or(APP_IDLE_TIMEOUT);
         let mut inflight = futures_util::stream::FuturesUnordered::new();
         loop {
             tokio::select! {
@@ -1412,6 +1444,17 @@ impl ClientHandler {
                     // accepting new streams. Not a handler fault.
                     Err(_) => break,
                 },
+                // ADR 005 §Connection lifetime: close `idle_timeout` after the
+                // last stream closes. Gated on `is_empty()` so an active stream
+                // keeps the connection open; the fresh `sleep` per iteration
+                // re-arms on any activity, so the clock counts from the last
+                // stream's close. `biased` polls `accept_bi` first, so a stream
+                // arriving at the deadline wins over the close.
+                () = tokio::time::sleep(idle_timeout), if inflight.is_empty() => {
+                    // A clean lifecycle close, not a fault — use the no-error code.
+                    conn.close(VarInt::from_u32(APP_ERR_NO_ERROR), b"idle");
+                    break;
+                }
                 Some(res) = inflight.next(), if !inflight.is_empty() => {
                     if let Err(e) = res {
                         tracing::debug!(error = %e, "client stream ended with error");
