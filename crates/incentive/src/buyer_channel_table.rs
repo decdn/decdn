@@ -18,7 +18,7 @@
 //! #1246 each store carried its own copy of this code, and the
 //! byte-compatibility contract between them was asserted only by a doc comment;
 //! now it is the same code, and
-//! `buyer_channel_redb::tests::encode_is_byte_stable` pins the bytes.
+//! `tests::encode_is_byte_stable` pins the bytes.
 //!
 //! The operations here never assume they own the file or that the buyer table is
 //! the only table in it — that is what makes the node's multi-table layout safe
@@ -639,6 +639,59 @@ mod tests {
 
     const OTHER_CHANNEL: ChannelId =
         b256!("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+
+    /// Postcard encoding of the record built by [`golden_state`], captured from
+    /// the encoder as it stood before #1246. Hex rather than a 206-byte array
+    /// literal so a diff shows exactly which field moved.
+    const GOLDEN_RECORD_HEX: &str = concat!(
+        "01",                                                               // schema_version (varint)
+        "0000000000000000000000000000000000000000000000000000000000000007", // channel_id
+        "0000000000000000000000000000000000000007",                         // provider
+        "a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",                         // token
+        "0000000000000000000000000000000000000000000000000000000000989680", // deposit
+        "0000000000000000000000000000000000000000000000000000000000001b58", // last_amount
+        "0000000000000000000000000000000000000000000000000000000000000007", // last_nonce
+        "0000000000000000000000000000000000000000000000000000000000001c00", // last_bytes_delivered
+        "87e6fe8907",                                                       // expires_at (varint)
+    );
+
+    /// Lowercase hex of `bytes`. `fold` + `write!` rather than the obvious
+    /// `map(format!).collect()`, which trips `clippy::format_collect`.
+    fn hex_of(bytes: &[u8]) -> String {
+        use std::fmt::Write as _;
+        bytes
+            .iter()
+            .fold(String::with_capacity(bytes.len() * 2), |mut acc, b| {
+                // Infallible: writing to a String never errors.
+                let _ = write!(acc, "{b:02x}");
+                acc
+            })
+    }
+
+    /// The buyer record is a **frozen on-disk format**, shared by the node's
+    /// `channels.redb` and the client's `buyer-channels.redb`. Postcard encodes
+    /// struct fields positionally and unnamed, so reordering, retyping, or
+    /// inserting a field rewrites the bytes with no compile error and no other
+    /// test failure — every store the suites build is a fresh tempdir, so they
+    /// would all still pass while every record an older binary wrote was
+    /// silently orphaned.
+    ///
+    /// This golden is the tripwire for that, and the only test here that would
+    /// fail on such a change. Captured from the pre-#1246 encoder, so it also
+    /// pins the format across the hoist itself. `state(7)` is byte-for-byte the
+    /// fixture the node's suite used, so the golden equally pins what both
+    /// crates used to encode independently.
+    #[test]
+    fn encode_is_byte_stable() -> anyhow::Result<()> {
+        let hex = hex_of(&encode_record(&state(7))?);
+        anyhow::ensure!(
+            hex == GOLDEN_RECORD_HEX,
+            "the buyer record's on-disk encoding changed — this orphans every existing record in \
+             both `channels.redb` and `buyer-channels.redb`.\n  got:  {hex}\n  want: \
+             {GOLDEN_RECORD_HEX}",
+        );
+        Ok(())
+    }
 
     #[test]
     fn open_empty_store_returns_no_entries() -> anyhow::Result<()> {

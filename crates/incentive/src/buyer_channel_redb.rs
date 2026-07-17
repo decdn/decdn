@@ -1,124 +1,44 @@
 //! `redb`-backed persistent [`BuyerChannelStore`] for client-side use (#940).
 //!
-//! The node persists buyer channels in a *combined* seller+buyer redb file
-//! (`node::channel_store`), deliberately sharing one open + one fsync across
-//! both tables. A client (`decdn fetch`) has no seller state, so it gets this
-//! **buyer-only** store: one redb file, one table, the same durable
-//! (`Durability::Immediate`, fsync-on-commit) write discipline and the same
-//! versioned `StoredBuyerChannelState` encoding + transactional advance/deposit
-//! semantics as the node's buyer table, so a channel opened in one `fetch`
-//! invocation is reused (resuming its voucher watermark) by the next.
+//! A client (`decdn fetch`) has no seller state, so it gets a **buyer-only**
+//! store: its own `buyer-channels.redb`, one table. The node instead keeps its
+//! buyer table inside a combined `channels.redb` alongside the seller,
+//! pending-settle, and watcher-checkpoint tables, because `redb` forbids two
+//! `Database` handles on one file.
+//!
+//! That file ownership — plus the guards on
+//! [`open`](crate::buyer_channel_redb::RedbBuyerChannelStore::open) — is **all**
+//! this module contributes. The record codec and every table operation live in
+//! [`crate::buyer_channel_table`], which the node's store delegates to as well,
+//! so the two cannot drift in on-disk format or in advance/deposit semantics
+//! (#1246). Before that, this module carried its own byte-identical copy of
+//! both, kept in sync by hand.
+//!
+//! (Links are fully qualified because rustdoc merges the outer `///` on this
+//! module's `lib.rs` declaration with these `//!` docs and resolves the result
+//! in *that* scope.)
 //!
 //! Gated behind the `redb` feature so non-client consumers of `decdn-incentive`
-//! (the contracts/voucher logic) don't pull `redb`/`postcard`.
+//! (the contracts/voucher logic) don't pull `redb`/`postcard`. The shared table
+//! sits behind `buyer-store-core`, which this feature implies.
 
 use std::path::Path;
 
-use alloy::primitives::{Address, B256, U256};
-use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
-use serde::{Deserialize, Serialize};
+use alloy::primitives::{Address, U256};
+use redb::{Database, TableDefinition};
 
 use crate::buyer_channel::{AdvanceOutcome, BuyerChannelState, BuyerChannelStore, DepositOutcome};
+use crate::buyer_channel_table::{BUYER_CHANNEL_TABLE_NAME, BuyerChannelTable, BuyerTableDef};
 use crate::channel::ChannelId;
 use crate::store::StoreError;
 
 /// File name of the buyer-channel redb database within the data dir.
 const BUYER_CHANNELS_DB_FILE: &str = "buyer-channels.redb";
 
-/// redb table holding buyer channel state, keyed by the 20-byte provider
-/// address (one open channel per provider). Value: postcard-encoded
-/// [`StoredBuyerChannelState`].
-const BUYER_CHANNEL_TABLE: TableDefinition<&[u8; 20], &[u8]> =
-    TableDefinition::new("buyer_channel_state_v1");
-
-/// Highest buyer-record `schema_version` this binary can decode. Matches the
-/// node's buyer table so the on-disk shape is identical.
-const BUYER_SUPPORTED_SCHEMA_VERSION: u32 = 1;
-
-/// Trailing-bytes warning threshold on decode (additive-forward-compat slack).
-const SANE_TRAILER_MAX_BYTES: usize = 256;
-
-/// On-disk buyer record. `schema_version` lives in the value (not the key) so a
-/// future additive field ships without renaming the table; decode uses
-/// [`postcard::take_from_bytes`], tolerating trailing bytes. Byte-compatible
-/// with the node's buyer table.
-#[derive(Debug, Serialize, Deserialize)]
-struct StoredBuyerChannelState {
-    schema_version: u32,
-    channel_id: [u8; 32],
-    provider: [u8; 20],
-    token: [u8; 20],
-    deposit: [u8; 32],
-    last_amount: [u8; 32],
-    last_nonce: [u8; 32],
-    last_bytes_delivered: [u8; 32],
-    expires_at: u64,
-}
-
-impl From<&BuyerChannelState> for StoredBuyerChannelState {
-    fn from(state: &BuyerChannelState) -> Self {
-        Self {
-            schema_version: BUYER_SUPPORTED_SCHEMA_VERSION,
-            channel_id: state.channel_id.into(),
-            provider: state.provider.into(),
-            token: state.token.into(),
-            deposit: state.deposit.to_be_bytes(),
-            last_amount: state.last_amount.to_be_bytes(),
-            last_nonce: state.last_nonce.to_be_bytes(),
-            last_bytes_delivered: state.last_bytes_delivered.to_be_bytes(),
-            expires_at: state.expires_at,
-        }
-    }
-}
-
-impl StoredBuyerChannelState {
-    fn into_state(self) -> Result<BuyerChannelState, StoreError> {
-        if self.schema_version > BUYER_SUPPORTED_SCHEMA_VERSION {
-            return Err(StoreError::UnsupportedSchema {
-                found: self.schema_version,
-                supported: BUYER_SUPPORTED_SCHEMA_VERSION,
-            });
-        }
-        Ok(BuyerChannelState {
-            channel_id: B256::from(self.channel_id),
-            provider: Address::from(self.provider),
-            token: Address::from(self.token),
-            deposit: U256::from_be_bytes(self.deposit),
-            last_amount: U256::from_be_bytes(self.last_amount),
-            last_nonce: U256::from_be_bytes(self.last_nonce),
-            last_bytes_delivered: U256::from_be_bytes(self.last_bytes_delivered),
-            expires_at: self.expires_at,
-        })
-    }
-}
-
-fn decode_buyer_record(
-    key_bytes: [u8; 20],
-    value_bytes: &[u8],
-) -> Result<BuyerChannelState, StoreError> {
-    let provider = Address::from(key_bytes);
-    let (stored, remainder): (StoredBuyerChannelState, &[u8]) =
-        postcard::take_from_bytes(value_bytes).map_err(|err| StoreError::Corrupt {
-            channel_id: None,
-            detail: format!("buyer record postcard decode failed (provider {provider}): {err}"),
-        })?;
-    if stored.provider != key_bytes {
-        return Err(StoreError::Corrupt {
-            channel_id: None,
-            detail: format!("buyer record provider {provider} does not match table key"),
-        });
-    }
-    if remainder.len() > SANE_TRAILER_MAX_BYTES {
-        tracing::warn!(
-            %provider,
-            remainder = remainder.len(),
-            limit = SANE_TRAILER_MAX_BYTES,
-            event = "buyer_channel_store_excess_trailer",
-            "buyer channel record has unusually large trailing bytes; possible schema skew",
-        );
-    }
-    stored.into_state()
-}
+/// This store's handle on the shared buyer table. Declared from
+/// [`BUYER_CHANNEL_TABLE_NAME`] so the on-disk name has exactly one definition
+/// across both buyer stores.
+const BUYER_CHANNEL_TABLE: BuyerTableDef = TableDefinition::new(BUYER_CHANNEL_TABLE_NAME);
 
 /// Buyer-only `redb`-backed [`BuyerChannelStore`]. One redb file, one table;
 /// every mutating call fsyncs on commit (`Durability::Immediate`).
@@ -128,13 +48,6 @@ pub struct RedbBuyerChannelStore {
 }
 
 impl RedbBuyerChannelStore {
-    /// Open (or create) the buyer-channel store at `<data_dir>/buyer-channels.redb`,
-    /// creating `data_dir` with hardened permissions first.
-    ///
-    /// # Errors
-    ///
-    /// [`StoreError::Backend`] if the data dir cannot be created/hardened or
-    /// redb cannot open the database.
     pub fn open(data_dir: &Path) -> Result<Self, StoreError> {
         decdn_common::identity::ensure_data_dir(data_dir)
             .map_err(|err| StoreError::Backend(format!("ensure data dir: {err}")))?;
@@ -169,108 +82,25 @@ impl RedbBuyerChannelStore {
         Ok(Self { db })
     }
 
-    fn write_state(&self, state: &BuyerChannelState) -> Result<(), StoreError> {
-        let encoded = postcard::to_allocvec(&StoredBuyerChannelState::from(state))
-            .map_err(|err| StoreError::Codec(format!("buyer record postcard encode: {err}")))?;
-        let key: [u8; 20] = state.provider.into();
-        let mut write_txn = self
-            .db
-            .begin_write()
-            .map_err(|err| StoreError::Backend(format!("begin_write: {err}")))?;
-        write_txn
-            .set_durability(Durability::Immediate)
-            .map_err(|err| StoreError::Backend(format!("set_durability: {err}")))?;
-        {
-            let mut table = write_txn
-                .open_table(BUYER_CHANNEL_TABLE)
-                .map_err(|err| StoreError::Backend(format!("open_table: {err}")))?;
-            table
-                .insert(&key, encoded.as_slice())
-                .map_err(|err| StoreError::Backend(format!("insert: {err}")))?;
-        }
-        write_txn
-            .commit()
-            .map_err(|err| StoreError::Backend(format!("commit (fsync): {err}")))?;
-        Ok(())
-    }
-
-    /// `true` if the buyer table exists, `false` if the store was never written.
-    /// Lets the no-row methods avoid implicitly creating the table.
-    fn table_exists(&self) -> Result<bool, StoreError> {
-        let read_txn = self
-            .db
-            .begin_read()
-            .map_err(|err| StoreError::Backend(format!("begin_read: {err}")))?;
-        match read_txn.open_table(BUYER_CHANNEL_TABLE) {
-            Ok(_) => Ok(true),
-            Err(redb::TableError::TableDoesNotExist(_)) => Ok(false),
-            Err(err) => Err(StoreError::Backend(format!("open_table: {err}"))),
-        }
+    /// Bind the shared table operations to this store's database.
+    const fn table(&self) -> BuyerChannelTable<'_> {
+        BuyerChannelTable::new(&self.db, BUYER_CHANNEL_TABLE)
     }
 }
 
+/// Every method delegates to [`crate::buyer_channel_table`]; this store owns the
+/// file, not the logic.
 impl BuyerChannelStore for RedbBuyerChannelStore {
     fn load_all(&self) -> Result<Vec<BuyerChannelState>, StoreError> {
-        let read_txn = self
-            .db
-            .begin_read()
-            .map_err(|err| StoreError::Backend(format!("begin_read: {err}")))?;
-        let table = match read_txn.open_table(BUYER_CHANNEL_TABLE) {
-            Ok(t) => t,
-            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
-            Err(err) => return Err(StoreError::Backend(format!("open_table: {err}"))),
-        };
-        let mut out = Vec::new();
-        let iter = table
-            .iter()
-            .map_err(|err| StoreError::Backend(format!("table iter: {err}")))?;
-        for entry in iter {
-            let (key_guard, value_guard) =
-                entry.map_err(|err| StoreError::Backend(format!("iter entry: {err}")))?;
-            let key_bytes: [u8; 20] = *key_guard.value();
-            // One undecodable row must not sink the whole load (mirrors the
-            // node's non-fatal buyer hydration): log it and skip.
-            match decode_buyer_record(key_bytes, value_guard.value()) {
-                Ok(state) => out.push(state),
-                Err(err) => tracing::error!(
-                    provider = %Address::from(key_bytes),
-                    %err,
-                    event = "buyer_channel_store_skip_undecodable_record",
-                    "skipping an undecodable buyer record; repair it to recover the channel",
-                ),
-            }
-        }
-        Ok(out)
+        self.table().load_all()
     }
 
     fn record(&self, state: &BuyerChannelState) -> Result<(), StoreError> {
-        self.write_state(state)
+        self.table().record(state)
     }
 
     fn forget(&self, provider: Address) -> Result<(), StoreError> {
-        if !self.table_exists()? {
-            return Ok(());
-        }
-        let key: [u8; 20] = provider.into();
-        let mut write_txn = self
-            .db
-            .begin_write()
-            .map_err(|err| StoreError::Backend(format!("begin_write: {err}")))?;
-        write_txn
-            .set_durability(Durability::Immediate)
-            .map_err(|err| StoreError::Backend(format!("set_durability: {err}")))?;
-        {
-            let mut table = write_txn
-                .open_table(BUYER_CHANNEL_TABLE)
-                .map_err(|err| StoreError::Backend(format!("open_table: {err}")))?;
-            table
-                .remove(&key)
-                .map_err(|err| StoreError::Backend(format!("remove: {err}")))?;
-        }
-        write_txn
-            .commit()
-            .map_err(|err| StoreError::Backend(format!("commit (fsync): {err}")))?;
-        Ok(())
+        self.table().forget(provider)
     }
 
     fn forget_if_channel(
@@ -278,63 +108,11 @@ impl BuyerChannelStore for RedbBuyerChannelStore {
         provider: Address,
         channel_id: ChannelId,
     ) -> Result<bool, StoreError> {
-        if !self.table_exists()? {
-            return Ok(false);
-        }
-        let key: [u8; 20] = provider.into();
-        let mut write_txn = self
-            .db
-            .begin_write()
-            .map_err(|err| StoreError::Backend(format!("begin_write: {err}")))?;
-        write_txn
-            .set_durability(Durability::Immediate)
-            .map_err(|err| StoreError::Backend(format!("set_durability: {err}")))?;
-        let deleted = {
-            let mut table = write_txn
-                .open_table(BUYER_CHANNEL_TABLE)
-                .map_err(|err| StoreError::Backend(format!("open_table: {err}")))?;
-            // Read the row inside the same serialised write txn so match-and-remove
-            // is atomic against a concurrent replace.
-            let matches = match table
-                .get(&key)
-                .map_err(|err| StoreError::Backend(format!("get: {err}")))?
-            {
-                Some(value_guard) => {
-                    decode_buyer_record(key, value_guard.value())?.channel_id == channel_id
-                }
-                None => false,
-            };
-            if matches {
-                table
-                    .remove(&key)
-                    .map_err(|err| StoreError::Backend(format!("remove: {err}")))?;
-            }
-            matches
-        };
-        write_txn
-            .commit()
-            .map_err(|err| StoreError::Backend(format!("commit (fsync): {err}")))?;
-        Ok(deleted)
+        self.table().forget_if_channel(provider, channel_id)
     }
 
     fn get_by_provider(&self, provider: Address) -> Result<Option<BuyerChannelState>, StoreError> {
-        let key: [u8; 20] = provider.into();
-        let read_txn = self
-            .db
-            .begin_read()
-            .map_err(|err| StoreError::Backend(format!("begin_read: {err}")))?;
-        let table = match read_txn.open_table(BUYER_CHANNEL_TABLE) {
-            Ok(t) => t,
-            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
-            Err(err) => return Err(StoreError::Backend(format!("open_table: {err}"))),
-        };
-        let Some(value_guard) = table
-            .get(&key)
-            .map_err(|err| StoreError::Backend(format!("get: {err}")))?
-        else {
-            return Ok(None);
-        };
-        Ok(Some(decode_buyer_record(key, value_guard.value())?))
+        self.table().get_by_provider(provider)
     }
 
     fn advance_progress(
@@ -345,48 +123,8 @@ impl BuyerChannelStore for RedbBuyerChannelStore {
         bytes_delivered: U256,
         amount: U256,
     ) -> Result<AdvanceOutcome, StoreError> {
-        if !self.table_exists()? {
-            return Ok(AdvanceOutcome::UnknownProvider);
-        }
-        let key: [u8; 20] = provider.into();
-        let mut write_txn = self
-            .db
-            .begin_write()
-            .map_err(|err| StoreError::Backend(format!("begin_write: {err}")))?;
-        write_txn
-            .set_durability(Durability::Immediate)
-            .map_err(|err| StoreError::Backend(format!("set_durability: {err}")))?;
-        {
-            let mut table = write_txn
-                .open_table(BUYER_CHANNEL_TABLE)
-                .map_err(|err| StoreError::Backend(format!("open_table: {err}")))?;
-            // Read the committed row inside the same write txn so the advance is
-            // checked against — and written over — the committed watermark.
-            let Some(value_guard) = table
-                .get(&key)
-                .map_err(|err| StoreError::Backend(format!("get: {err}")))?
-            else {
-                // No-write outcome: return early so the write txn aborts on drop.
-                return Ok(AdvanceOutcome::UnknownProvider);
-            };
-            let mut state = decode_buyer_record(key, value_guard.value())?;
-            drop(value_guard);
-            if state.channel_id != channel_id {
-                return Ok(AdvanceOutcome::ChannelMismatch);
-            }
-            if let Err(err) = state.advance(nonce, bytes_delivered, amount) {
-                return Ok(AdvanceOutcome::Regressed(err));
-            }
-            let encoded = postcard::to_allocvec(&StoredBuyerChannelState::from(&state))
-                .map_err(|err| StoreError::Codec(format!("buyer record postcard encode: {err}")))?;
-            table
-                .insert(&key, encoded.as_slice())
-                .map_err(|err| StoreError::Backend(format!("insert: {err}")))?;
-        }
-        write_txn
-            .commit()
-            .map_err(|err| StoreError::Backend(format!("commit (fsync): {err}")))?;
-        Ok(AdvanceOutcome::Advanced)
+        self.table()
+            .advance_progress(provider, channel_id, nonce, bytes_delivered, amount)
     }
 
     fn add_deposit(
@@ -395,157 +133,27 @@ impl BuyerChannelStore for RedbBuyerChannelStore {
         channel_id: ChannelId,
         additional: U256,
     ) -> Result<DepositOutcome, StoreError> {
-        if !self.table_exists()? {
-            return Ok(DepositOutcome::UnknownProvider);
-        }
-        let key: [u8; 20] = provider.into();
-        let mut write_txn = self
-            .db
-            .begin_write()
-            .map_err(|err| StoreError::Backend(format!("begin_write: {err}")))?;
-        write_txn
-            .set_durability(Durability::Immediate)
-            .map_err(|err| StoreError::Backend(format!("set_durability: {err}")))?;
-        let new_deposit = {
-            let mut table = write_txn
-                .open_table(BUYER_CHANNEL_TABLE)
-                .map_err(|err| StoreError::Backend(format!("open_table: {err}")))?;
-            let Some(value_guard) = table
-                .get(&key)
-                .map_err(|err| StoreError::Backend(format!("get: {err}")))?
-            else {
-                return Ok(DepositOutcome::UnknownProvider);
-            };
-            let mut state = decode_buyer_record(key, value_guard.value())?;
-            drop(value_guard);
-            if state.channel_id != channel_id {
-                return Ok(DepositOutcome::ChannelMismatch);
-            }
-            state.deposit = state.deposit.saturating_add(additional);
-            let encoded = postcard::to_allocvec(&StoredBuyerChannelState::from(&state))
-                .map_err(|err| StoreError::Codec(format!("buyer record postcard encode: {err}")))?;
-            table
-                .insert(&key, encoded.as_slice())
-                .map_err(|err| StoreError::Backend(format!("insert: {err}")))?;
-            state.deposit
-        };
-        write_txn
-            .commit()
-            .map_err(|err| StoreError::Backend(format!("commit (fsync): {err}")))?;
-        Ok(DepositOutcome::Added(new_deposit))
+        self.table().add_deposit(provider, channel_id, additional)
     }
 }
 
 #[cfg(test)]
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::indexing_slicing,
-    clippy::panic
-)]
 mod tests {
     use super::*;
 
-    /// Postcard encoding of the record built by [`golden_state`], captured from
-    /// the encoder as it stood before #1246. Hex rather than a 206-byte array
-    /// literal so a diff shows exactly which field moved.
-    const GOLDEN_RECORD_HEX: &str = concat!(
-        "01",                                                               // schema_version (varint)
-        "0000000000000000000000000000000000000000000000000000000000000007", // channel_id
-        "0000000000000000000000000000000000000007",                         // provider
-        "a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",                         // token
-        "0000000000000000000000000000000000000000000000000000000000989680", // deposit
-        "0000000000000000000000000000000000000000000000000000000000001b58", // last_amount
-        "0000000000000000000000000000000000000000000000000000000000000007", // last_nonce
-        "0000000000000000000000000000000000000000000000000000000000001c00", // last_bytes_delivered
-        "87e6fe8907",                                                       // expires_at (varint)
-    );
-
-    /// Lowercase hex of `bytes`. `fold` + `write!` rather than the obvious
-    /// `map(format!).collect()`, which trips `clippy::format_collect`.
-    fn hex_of(bytes: &[u8]) -> String {
-        use std::fmt::Write as _;
-        bytes
-            .iter()
-            .fold(String::with_capacity(bytes.len() * 2), |mut acc, b| {
-                // Infallible: writing to a String never errors.
-                let _ = write!(acc, "{b:02x}");
-                acc
-            })
-    }
-
-    /// The fixture behind [`GOLDEN_RECORD_HEX`]. Byte-for-byte the state that
-    /// `decdn-node`'s `channel_store::tests::buyer_sample(7)` builds, so the
-    /// golden pins *both* crates' encoders to one layout.
-    fn golden_state() -> BuyerChannelState {
-        let mut id = [0u8; 32];
-        id[31] = 7;
-        let mut prov = [0u8; 20];
-        prov[19] = 7;
-        BuyerChannelState {
-            channel_id: id.into(),
-            provider: Address::from(prov),
-            // USDC on mainnet — the same literal the node fixture uses.
-            token: Address::from([
-                0xa0, 0xb8, 0x69, 0x91, 0xc6, 0x21, 0x8b, 0x36, 0xc1, 0xd1, 0x9d, 0x4a, 0x2e, 0x9e,
-                0xb0, 0xce, 0x36, 0x06, 0xeb, 0x48,
-            ]),
-            deposit: U256::from(10_000_000u64),
-            last_amount: U256::from(7_000u64),
-            last_nonce: U256::from(7u64),
-            last_bytes_delivered: U256::from(7_168u64),
-            expires_at: 1_900_000_007,
-        }
-    }
-
-    /// The buyer record is a **frozen on-disk format** shared by this store's
-    /// `buyer-channels.redb` and the node's `channels.redb`. Postcard encodes
-    /// struct fields positionally and unnamed, so reordering, retyping, or
-    /// inserting a field rewrites the bytes with no compile error and no other
-    /// test failure — every store the fresh-tempdir suites build would still
-    /// pass while every record an older binary wrote was silently orphaned.
-    ///
-    /// This golden is the tripwire for that. Until #1246 the byte-compat
-    /// contract between the two crates was asserted only by a doc comment.
-    #[test]
-    fn encode_is_byte_stable() -> anyhow::Result<()> {
-        let encoded = postcard::to_allocvec(&StoredBuyerChannelState::from(&golden_state()))
-            .map_err(|err| anyhow::anyhow!("encode: {err}"))?;
-        let hex = hex_of(&encoded);
-        anyhow::ensure!(
-            hex == GOLDEN_RECORD_HEX,
-            "the buyer record's on-disk encoding changed — this orphans every existing \
-             record in both `channels.redb` and `buyer-channels.redb`.\n  got:  {hex}\n  want: \
-             {GOLDEN_RECORD_HEX}",
-        );
-        Ok(())
-    }
-
-    /// The golden must also survive a full round-trip through this store, so a
-    /// decode-side drift (key width, table name) can't hide behind an encoder
-    /// that still emits the right bytes.
-    #[test]
-    fn golden_record_round_trips_through_the_store() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
+    /// Only what is specific to *this* store: `open()`'s guards, and that the
+    /// trait delegations are wired to the right shared operation. The record
+    /// codec and the table semantics are covered once, next to the shared
+    /// implementation in `crate::buyer_channel_table`.
+    fn store(dir: &tempfile::TempDir) -> anyhow::Result<RedbBuyerChannelStore> {
         // `open` hardens the data dir to 0o700 and rejects anything looser, so
-        // point it at a subdir it creates rather than the 0o775 tempdir root.
-        let store = RedbBuyerChannelStore::open(&dir.path().join("d"))?;
-        let want = golden_state();
-        store.record(&want)?;
-
-        let got = store
-            .get_by_provider(want.provider)?
-            .ok_or_else(|| anyhow::anyhow!("golden record missing after record()"))?;
-        anyhow::ensure!(
-            got == want,
-            "golden round-trip mismatch:\n {got:?}\n {want:?}"
-        );
-        Ok(())
+        // point it at a subdir it creates rather than the tempdir root.
+        Ok(RedbBuyerChannelStore::open(&dir.path().join("d"))?)
     }
 
     fn state(provider: u8, nonce: u64, bytes: u64, amount: u64) -> BuyerChannelState {
         BuyerChannelState {
-            channel_id: B256::repeat_byte(provider),
+            channel_id: alloy::primitives::B256::repeat_byte(provider),
             provider: Address::repeat_byte(provider),
             token: Address::repeat_byte(0xaa),
             deposit: U256::from(1_000_000u64),
@@ -557,211 +165,129 @@ mod tests {
     }
 
     #[test]
-    fn second_concurrent_open_is_already_open_not_raw_backend() {
+    fn second_concurrent_open_is_already_open_not_raw_backend() -> anyhow::Result<()> {
         // #942: a second opener on the same data dir (a concurrent `decdn fetch`
         // / `bundle pull`) trips redb's process-exclusive write lock. It must
         // fail with the dedicated, user-facing `AlreadyOpen` — never a raw redb
         // backend string — and recover once the first handle drops.
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir()?;
         let data = dir.path().join("d");
-        let first = RedbBuyerChannelStore::open(&data).unwrap();
+        let first = RedbBuyerChannelStore::open(&data)?;
 
-        let err = RedbBuyerChannelStore::open(&data).unwrap_err();
-        assert!(
+        let err = RedbBuyerChannelStore::open(&data)
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("a second concurrent open must fail"))?;
+        anyhow::ensure!(
             matches!(&err, StoreError::AlreadyOpen { path } if path == &data.join(BUYER_CHANNELS_DB_FILE)),
             "wrong error or path: {err:?}"
         );
         let msg = err.to_string();
-        assert!(
+        anyhow::ensure!(
             msg.contains("another decdn process is using") && msg.contains("--data-dir"),
             "message must be user-facing, got: {msg}"
         );
 
         // Releasing the first handle frees the lock; a fresh open then succeeds.
         drop(first);
-        RedbBuyerChannelStore::open(&data).expect("reopen after the first handle drops");
+        RedbBuyerChannelStore::open(&data)?;
+        Ok(())
     }
 
     #[test]
-    fn record_then_reuse_resumes_watermark_across_reopen() {
-        let dir = tempfile::tempdir().unwrap();
-        let provider = Address::repeat_byte(7);
-        let s = state(7, 3, 3000, 300);
-        {
-            let store = RedbBuyerChannelStore::open(&dir.path().join("d")).unwrap();
-            store.record(&s).unwrap();
-        }
-        // Reopen: the channel + its watermark must survive (this is what lets a
-        // later `fetch` reuse the channel instead of opening a new one).
-        let store = RedbBuyerChannelStore::open(&dir.path().join("d")).unwrap();
-        let got = store
-            .get_by_provider(provider)
-            .unwrap()
-            .expect("channel persisted");
-        assert_eq!(got.channel_id, s.channel_id);
-        assert_eq!(got.last_nonce, U256::from(3u64));
-        assert_eq!(got.last_bytes_delivered, U256::from(3000u64));
-    }
-
-    #[test]
-    fn advance_progress_guards_regression_and_channel_mismatch() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = RedbBuyerChannelStore::open(&dir.path().join("d")).unwrap();
-        let provider = Address::repeat_byte(7);
-        let cid = B256::repeat_byte(7);
-        store.record(&state(7, 1, 1000, 100)).unwrap();
-
-        // Forward advance commits.
-        assert!(matches!(
-            store
-                .advance_progress(
-                    provider,
-                    cid,
-                    U256::from(2u64),
-                    U256::from(2000u64),
-                    U256::from(200u64)
-                )
-                .unwrap(),
-            AdvanceOutcome::Advanced
-        ));
-        // Regression (lower nonce) is rejected without writing.
-        assert!(matches!(
-            store
-                .advance_progress(
-                    provider,
-                    cid,
-                    U256::from(1u64),
-                    U256::from(1500u64),
-                    U256::from(150u64)
-                )
-                .unwrap(),
-            AdvanceOutcome::Regressed(_)
-        ));
-        // Wrong channel id for this provider → mismatch, no write.
-        assert!(matches!(
-            store
-                .advance_progress(
-                    provider,
-                    B256::repeat_byte(9),
-                    U256::from(3u64),
-                    U256::from(3000u64),
-                    U256::from(300u64)
-                )
-                .unwrap(),
-            AdvanceOutcome::ChannelMismatch
-        ));
-        // The committed watermark is still the forward advance.
-        let got = store.get_by_provider(provider).unwrap().unwrap();
-        assert_eq!(got.last_nonce, U256::from(2u64));
-    }
-
-    #[test]
-    fn rejects_zero_length_db_file() {
-        let dir = tempfile::tempdir().unwrap();
+    fn rejects_zero_length_db_file() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
         let data = dir.path().join("d");
-        // First open creates the data dir (0700) and a non-empty db.
+        drop(store(&dir)?); // create, then release the lock
+        // Truncate to zero: redb would treat this as "create fresh" and silently
+        // wipe the watermark, so `open` must refuse.
+        std::fs::write(data.join(BUYER_CHANNELS_DB_FILE), b"")?;
+        let err = RedbBuyerChannelStore::open(&data)
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("a zero-length db file must be rejected"))?;
+        anyhow::ensure!(
+            matches!(&err, StoreError::Corrupt { detail, .. } if detail.contains("empty (length 0)")),
+            "expected Corrupt(empty), got {err:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn record_then_reuse_resumes_watermark_across_reopen() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let s = state(1, 5, 5_000, 50);
         {
-            let s = RedbBuyerChannelStore::open(&data).unwrap();
-            s.record(&state(7, 1, 1000, 100)).unwrap();
+            let store = store(&dir)?;
+            store.record(&s)?;
         }
-        // Simulate a truncation / filesystem rollback that zeroes the file.
-        std::fs::File::create(data.join("buyer-channels.redb")).unwrap();
-        // Reopening must refuse rather than silently start a fresh (empty) store
-        // that would wipe the watermark.
-        let err = RedbBuyerChannelStore::open(&data).unwrap_err();
-        assert!(matches!(err, StoreError::Corrupt { .. }), "{err:?}");
+        // A later `decdn fetch` on the same data dir resumes the watermark
+        // instead of re-signing a stale nonce (#940).
+        let reopened = store(&dir)?;
+        let got = reopened
+            .get_by_provider(s.provider)?
+            .ok_or_else(|| anyhow::anyhow!("row vanished across reopen"))?;
+        anyhow::ensure!(got == s, "watermark must resume across invocations");
+        Ok(())
     }
 
+    /// Each of the seven trait methods must reach its matching shared operation.
+    /// The shared suite proves the operations are correct but cannot catch a
+    /// transposed delegation here (e.g. `forget` wired to `forget_if_channel`),
+    /// so exercise every one through the real store.
     #[test]
-    fn unknown_provider_outcomes_on_empty_store() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = RedbBuyerChannelStore::open(&dir.path().join("d")).unwrap();
-        let p = Address::repeat_byte(1);
-        assert!(store.get_by_provider(p).unwrap().is_none());
-        assert!(matches!(
-            store
-                .advance_progress(p, B256::ZERO, U256::ZERO, U256::ZERO, U256::ZERO)
-                .unwrap(),
-            AdvanceOutcome::UnknownProvider
-        ));
-        assert!(!store.forget_if_channel(p, B256::ZERO).unwrap());
-    }
+    fn store_delegates_every_op() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = store(&dir)?;
+        let s = state(2, 1, 1_000, 10);
 
-    #[test]
-    fn load_all_returns_every_recorded_channel() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = RedbBuyerChannelStore::open(&dir.path().join("d")).unwrap();
-        store.record(&state(1, 1, 10, 1)).unwrap();
-        store.record(&state(2, 1, 10, 1)).unwrap();
-        let mut providers: Vec<_> = store
-            .load_all()
-            .unwrap()
-            .into_iter()
-            .map(|s| s.provider)
-            .collect();
-        providers.sort();
-        assert_eq!(
-            providers,
-            vec![Address::repeat_byte(1), Address::repeat_byte(2)]
+        // record + get_by_provider + load_all
+        store.record(&s)?;
+        anyhow::ensure!(
+            store.get_by_provider(s.provider)?.as_ref() == Some(&s),
+            "record/get"
         );
-    }
+        anyhow::ensure!(store.load_all()?.len() == 1, "load_all");
 
-    #[test]
-    fn forget_removes_entry_and_is_noop_when_absent() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = RedbBuyerChannelStore::open(&dir.path().join("d")).unwrap();
-        let p = Address::repeat_byte(7);
-        store.record(&state(7, 1, 10, 1)).unwrap();
-        store.forget(p).unwrap();
-        assert!(store.get_by_provider(p).unwrap().is_none());
-        // Forgetting an absent provider is a no-op, not an error.
-        store.forget(p).unwrap();
-    }
-
-    #[test]
-    fn forget_if_channel_only_deletes_the_matching_channel() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = RedbBuyerChannelStore::open(&dir.path().join("d")).unwrap();
-        let p = Address::repeat_byte(7);
-        store.record(&state(7, 1, 10, 1)).unwrap(); // channel_id == 0x07..07
-        // A stale channel id must NOT delete the live row (CAS guard).
-        assert!(!store.forget_if_channel(p, B256::repeat_byte(9)).unwrap());
-        assert!(store.get_by_provider(p).unwrap().is_some());
-        // The matching channel id deletes it.
-        assert!(store.forget_if_channel(p, B256::repeat_byte(7)).unwrap());
-        assert!(store.get_by_provider(p).unwrap().is_none());
-    }
-
-    #[test]
-    fn add_deposit_adds_and_guards_channel_and_provider() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = RedbBuyerChannelStore::open(&dir.path().join("d")).unwrap();
-        let p = Address::repeat_byte(7);
-        let cid = B256::repeat_byte(7);
-        store.record(&state(7, 1, 10, 1)).unwrap(); // deposit 1_000_000
-
-        // Matching channel → deposit grows by `additional`.
-        assert!(matches!(
-            store.add_deposit(p, cid, U256::from(500_000u64)).unwrap(),
-            DepositOutcome::Added(d) if d == U256::from(1_500_000u64)
-        ));
-        // Wrong channel id → mismatch, no change.
-        assert!(matches!(
-            store
-                .add_deposit(p, B256::repeat_byte(9), U256::from(1u64))
-                .unwrap(),
-            DepositOutcome::ChannelMismatch
-        ));
-        // Unknown provider → unknown, no change.
-        assert!(matches!(
-            store
-                .add_deposit(Address::repeat_byte(8), cid, U256::from(1u64))
-                .unwrap(),
-            DepositOutcome::UnknownProvider
-        ));
-        assert_eq!(
-            store.get_by_provider(p).unwrap().unwrap().deposit,
-            U256::from(1_500_000u64)
+        // advance_progress
+        anyhow::ensure!(
+            store.advance_progress(
+                s.provider,
+                s.channel_id,
+                U256::from(2u64),
+                U256::from(2_000u64),
+                U256::from(20u64),
+            )? == AdvanceOutcome::Advanced,
+            "advance_progress"
         );
+
+        // add_deposit
+        anyhow::ensure!(
+            store.add_deposit(s.provider, s.channel_id, U256::from(7u64))?
+                == DepositOutcome::Added(s.deposit + U256::from(7u64)),
+            "add_deposit"
+        );
+
+        // forget_if_channel: wrong id leaves the row, right id deletes it.
+        anyhow::ensure!(
+            !store.forget_if_channel(s.provider, alloy::primitives::B256::repeat_byte(0xee))?,
+            "forget_if_channel must not delete on a mismatched channel"
+        );
+        anyhow::ensure!(
+            store.get_by_provider(s.provider)?.is_some(),
+            "row must survive"
+        );
+        anyhow::ensure!(
+            store.forget_if_channel(s.provider, s.channel_id)?,
+            "forget_if_channel must delete on a match"
+        );
+        anyhow::ensure!(
+            store.get_by_provider(s.provider)?.is_none(),
+            "row must be gone"
+        );
+
+        // forget
+        store.record(&s)?;
+        store.forget(s.provider)?;
+        anyhow::ensure!(store.load_all()?.is_empty(), "forget");
+        Ok(())
     }
 }
