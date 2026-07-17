@@ -1569,8 +1569,9 @@ macro_rules! recorders {
 /// These cannot live in `recorders!` because their bodies branch and touch
 /// `Metrics`'s own `Mutex` state rather than a single `self.decdn.field.op(v)`.
 /// Each row spells out both method names (production hooks call them by exact
-/// name, and this crate adds no `paste`) and labels the three struct-field
-/// idents so positions aren't counted. Docs pass through as `$meta`, so each
+/// name, and this crate adds no `paste`) and labels the three backing field
+/// idents (`down_since` on `Metrics`; `restarts`/`down_seconds` on `self.decdn`)
+/// so positions aren't counted. Docs pass through as `$meta`, so each
 /// recorder's rationale stays byte-identical and keeps its call-site span for
 /// `clippy` and `rustdoc`.
 ///
@@ -3236,6 +3237,44 @@ mod tests {
         assert!(
             has_metric_line(&text, "decdn_origin_directory_watcher_down_seconds", 0),
             "down-seconds should reset to 0 once the cycle re-establishes:\n{text}"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::panic)] // deliberately poison the lock, mirroring `dispatch::tests`.
+    fn poisoned_down_since_reports_i64_max_not_zero() {
+        // The load-bearing invariant of the down-seconds gauges: a poisoned
+        // `down_since` must report `i64::MAX`, never `0`, because reporting `0`
+        // would MASK an in-progress outage (#783/#651/#1032). #1266 folded the
+        // three watchers' scrape recompute into one shared
+        // `refresh_watcher_down_seconds` template, so poisoning any single lock
+        // exercises that conservative-alerting fallback for all of them.
+        let metrics = Arc::new(Metrics::new());
+        let for_thread = Arc::clone(&metrics);
+        // Poison `slash_watcher_down_since` from a panicking thread holding the
+        // lock (the house pattern — see `dispatch::tests`).
+        let join = std::thread::spawn(move || {
+            let _g = for_thread.slash_watcher_down_since.lock().unwrap();
+            panic!("intentional");
+        });
+        let _ = join.join();
+        assert!(metrics.slash_watcher_down_since.is_poisoned());
+
+        let i64_max = u64::try_from(i64::MAX).unwrap();
+        let text = metrics.encode().unwrap();
+        assert!(
+            has_metric_line(&text, "decdn_slash_watcher_down_seconds", i64_max),
+            "a poisoned down_since must report i64::MAX, not 0:\n{text}"
+        );
+        // The two healthy watchers still read 0 in the same scrape — the poison
+        // is isolated to its own row of the shared recompute.
+        assert!(
+            has_metric_line(&text, "decdn_staker_set_watcher_down_seconds", 0),
+            "a poisoned slash lock must not perturb the staker-set gauge:\n{text}"
+        );
+        assert!(
+            has_metric_line(&text, "decdn_origin_directory_watcher_down_seconds", 0),
+            "a poisoned slash lock must not perturb the origin-directory gauge:\n{text}"
         );
     }
 
