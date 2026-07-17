@@ -11,6 +11,7 @@
 //! first (`cargo build -p decdn-node`); `decdn_node_bin` locates it relative
 //! to the test executable and errors clearly if absent.
 
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::process::Child;
 use std::sync::Arc;
@@ -137,6 +138,32 @@ impl NodeFixture {
         region: &str,
         serve_blobs: &[&[u8]],
     ) -> anyhow::Result<(Self, Vec<Hash>)> {
+        Self::launch_configured(chain, region, serve_blobs, false, &[]).await
+    }
+
+    /// Launch an empty bonded cache node whose misses use paid node-to-node
+    /// pull-through, gated by the chain-backed authorized-origin directory.
+    pub async fn launch_pull_through_cache(
+        chain: &ChainFixture,
+        region: &str,
+        discovery_peers: &[&NodeFixture],
+    ) -> anyhow::Result<Self> {
+        let (node, hashes) =
+            Self::launch_configured(chain, region, &[], true, discovery_peers).await?;
+        anyhow::ensure!(
+            hashes.is_empty(),
+            "empty cache launch returned seeded hashes"
+        );
+        Ok(node)
+    }
+
+    async fn launch_configured(
+        chain: &ChainFixture,
+        region: &str,
+        serve_blobs: &[&[u8]],
+        node_to_node_pull_through: bool,
+        discovery_peers: &[&NodeFixture],
+    ) -> anyhow::Result<(Self, Vec<Hash>)> {
         let data_dir = tempfile::tempdir().context("create node data dir")?;
         // `identity::ensure_data_dir` (and the keystore/identity writers) require
         // an `0o700` data dir; a umask of 022 leaves the tempdir at 0o755, so
@@ -190,6 +217,10 @@ impl NodeFixture {
         // Bind to a local so the `&str` field borrows a value that clearly
         // outlives the `render_config` call (not a same-statement temporary).
         let rpc_url = chain.rpc_url();
+        let discovery_peers: Vec<_> = discovery_peers
+            .iter()
+            .map(|peer| (peer.node_id(), peer.bind_port()))
+            .collect();
         let config = render_config(&RenderConfig {
             data_dir: data_dir.path().to_path_buf(),
             region,
@@ -202,19 +233,18 @@ impl NodeFixture {
             origin_dir: origin_dir.path(),
             chain_id: chain.chain_id(),
             addrs: chain.addrs(),
+            node_to_node_pull_through,
+            discovery_peers: &discovery_peers,
         });
         let config_path = data_dir.path().join("node.toml");
         std::fs::write(&config_path, config).context("write node config")?;
 
         // Pre-warm the node's cache store from the filesystem origin. The
-        // `cdn/client/v1` serve path gates on local-store presence
-        // (`cache.has`); origin pull-through is NOT consulted on this fixture's
-        // path (reactive pull-through is not attached by default, and this
-        // fixture's channel is unbound (`client_binding: None`), so it sends no
-        // ADR 005 ownership binding to authorize a reactive origin pull — #1115).
-        // So an operator serves content it already holds — warm it the same way
-        // production does, via the origin engine, then let the daemon reopen the
-        // populated store. Mirrors the node integration `cache_with_blob` helper.
+        // default fixture models content the operator already holds: warm it
+        // through the production origin engine, then let the daemon reopen the
+        // populated store. The empty pull-through variant has no hashes to warm
+        // and instead exercises the bound client's reactive acquisition path.
+        // Mirrors the node integration `cache_with_blob` helper.
         std::fs::create_dir_all(&cache_dir).context("create cache dir")?;
         {
             let origin: Arc<dyn Origin> = Arc::new(
@@ -351,6 +381,8 @@ struct RenderConfig<'a> {
     origin_dir: &'a std::path::Path,
     chain_id: u64,
     addrs: ContractAddrs,
+    node_to_node_pull_through: bool,
+    discovery_peers: &'a [(iroh::PublicKey, u16)],
 }
 
 /// Render the daemon TOML config. Emits only the keys the fixture sets; the
@@ -362,7 +394,7 @@ fn render_config(c: &RenderConfig<'_>) -> String {
     // Windows path (or any stray escape) round-trip verbatim. The other string
     // values are controlled (alpha-2 region, `http://127.0.0.1:port` RPC, hex
     // addresses) and stay double-quoted.
-    format!(
+    let mut rendered = format!(
         r#"[identity]
 data_dir = '{data_dir}'
 region = "{region}"
@@ -390,6 +422,8 @@ redeem_threshold_micro_usdc = 10
 [cache]
 cache_dir = '{cache_dir}'
 cache_size_mb = 4096
+node_to_node_pull_through_enabled = {node_to_node_pull_through}
+pull_through_require_authorized_origin = {node_to_node_pull_through}
 
 [cache.origin]
 kind = "fs"
@@ -419,10 +453,18 @@ metrics_bind = "127.0.0.1"
         publisher_registry = a.publisher_registry,
         origin_assignment = a.origin_assignment,
         cache_dir = c.cache_dir.display(),
+        node_to_node_pull_through = c.node_to_node_pull_through,
         origin_dir = c.origin_dir.display(),
         admin_port = c.admin_port,
         metrics_port = c.metrics_port,
-    )
+    );
+    for (node_id, port) in c.discovery_peers {
+        let _ = write!(
+            &mut rendered,
+            "\n[network.discovery.peers.{node_id}]\naddrs = [\"127.0.0.1:{port}\"]\n"
+        );
+    }
+    rendered
 }
 
 /// Write `blob` into a filesystem-origin shard layout (`{root}/{hex[..2]}/{hex}`).
@@ -503,6 +545,7 @@ mod tests {
             origin_assignment: Address::from([0xAA; 20]),
             content_blacklist: Address::from([0xBB; 20]),
         };
+        let discovery_peers = [(iroh::SecretKey::from_bytes(&[0xCC; 32]).public(), 4434)];
         let rendered = render_config(&RenderConfig {
             data_dir: PathBuf::from("/var/lib/decdn"),
             region: "US",
@@ -515,6 +558,8 @@ mod tests {
             origin_dir: std::path::Path::new("/var/lib/decdn/origin"),
             chain_id: 31_337,
             addrs,
+            node_to_node_pull_through: true,
+            discovery_peers: &discovery_peers,
         });
 
         // The core check: the whole template parses as TOML.
@@ -533,6 +578,20 @@ mod tests {
         );
         assert_eq!(doc["cache"]["origin"]["kind"].as_str(), Some("fs"));
         assert!(doc["cache"]["origin"].get("path").is_some());
+        assert_eq!(
+            doc["cache"]["node_to_node_pull_through_enabled"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            doc["cache"]["pull_through_require_authorized_origin"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            doc["network"]["discovery"]["peers"]
+                .as_table()
+                .map(toml::Table::len),
+            Some(1)
+        );
         assert_eq!(doc["payment"]["rate_per_mb"].as_integer(), Some(10));
         assert_eq!(doc["observability"]["admin_port"].as_integer(), Some(9944));
         assert_eq!(

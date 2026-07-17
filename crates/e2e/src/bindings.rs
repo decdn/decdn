@@ -107,8 +107,10 @@ alloy::sol! {
     /// for the origin-recognition journeys #1038/#1039).
     #[sol(rpc)]
     contract OriginAssignment {
+        function assignmentTimelock() external view returns (uint256);
         function proposeAssignment(uint256 namespaceId, address[] operators) external;
         function activateAssignment(uint256 namespaceId) external;
+        function addDefaultOpenOperator(address operator) external;
         function getOrigins(uint256 namespaceId) external view returns (address[] memory);
         function isAuthorizedOrigin(uint256 namespaceId, address operator) external view returns (bool);
     }

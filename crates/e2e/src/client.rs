@@ -17,9 +17,9 @@ use anyhow::Context;
 use decdn_cache::Hash;
 use decdn_client_pull::{
     BlobTooLargeClaim, ChannelContext, HashMismatch, PullDeadlines, UpstreamRefused,
-    UpstreamVoucherRejected, VoucherProgress, stream_fetch_tracked,
+    UpstreamVoucherRejected, VoucherProgress, sign_client_binding, stream_fetch_tracked,
 };
-use decdn_incentive::{slash_judge_domain, voucher_domain};
+use decdn_incentive::{bind_node_id_domain, slash_judge_domain, voucher_domain};
 use decdn_protocol::client::StreamError;
 use iroh::endpoint::presets;
 use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey};
@@ -125,7 +125,7 @@ impl ClientFixture {
             u64::try_from(nonce).context("channel nonce overflow")?,
         );
 
-        let mut ctx = ChannelContext {
+        let ctx = ChannelContext {
             channel_id: cid,
             token: chain.usdc(),
             deposit,
@@ -136,6 +136,13 @@ impl ClientFixture {
             prior_amount: U256::ZERO,
             client_binding: None,
         };
+        let bind_domain = bind_node_id_domain(chain.chain_id(), chain.addrs().capacity_bond);
+        let own_node_id = B256::from(*self.endpoint.id().as_bytes());
+        let mut ctx = ctx.with_client_binding(sign_client_binding(
+            &self.signer,
+            own_node_id,
+            &bind_domain,
+        )?);
         let slash_domain = slash_judge_domain(chain.chain_id(), chain.addrs().slash_judge);
         let target = EndpointAddr::new(node.node_id()).with_ip_addr(SocketAddr::V4(
             SocketAddrV4::new(Ipv4Addr::LOCALHOST, node.bind_port()),
