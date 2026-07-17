@@ -12,6 +12,7 @@
 //! dependency. This crate holds only what *both* binaries need to
 //! parse, validate, or pass between processes.
 
+pub mod address;
 pub mod admin;
 pub mod cli;
 pub mod config;

@@ -41,9 +41,10 @@ use crate::metrics;
 use crate::payment_settlement::PaymentChannelService;
 use crate::rate_limit::RateLimitConfig;
 use alloy::network::EthereumWallet;
-use alloy::primitives::{Address, U256};
+use alloy::primitives::U256;
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::signers::local::PrivateKeySigner;
+use decdn_common::address::parse_nonzero_address;
 use decdn_common::config::ResolvedConfig;
 use decdn_common::identity;
 use decdn_common::redact::{redact_userinfo, sanitize_rpc_display};
@@ -655,20 +656,15 @@ pub async fn run(
     // during the rest of startup still finds a target.
     reload_state.attach_limiter(Some(Arc::clone(&limiter)));
 
-    // SlashJudge EIP-712 domain for probe `slash_sig` (ADR 014 §1–2). The
-    // address was validated checksummed at config resolution
-    // (`parse_contract_address`), so the parse here cannot fail in practice;
-    // map the error rather than unwrap to satisfy the anti-panic policy.
-    let slash_judge_addr: alloy::primitives::Address = cfg
-        .blockchain
-        .slash_judge_address
-        .parse()
-        .with_context(|| {
-        format!(
-            "blockchain.slash_judge_address is not a valid address: {}",
-            cfg.blockchain.slash_judge_address
-        )
-    })?;
+    // SlashJudge EIP-712 domain for probe `slash_sig` (ADR 014 §1–2). Parsed
+    // through the shared zero-address guard (#1219) for a uniform "every daemon
+    // contract address is non-zero" invariant. `resolve_blockchain` already
+    // rejects a zero or malformed `slash_judge_address` at config load, so here
+    // the guard is defense-in-depth rather than the sole check.
+    let slash_judge_addr = parse_nonzero_address(
+        &cfg.blockchain.slash_judge_address,
+        "blockchain.slash_judge_address",
+    )?;
     let slash_domain =
         decdn_incentive::slash_judge_domain(cfg.blockchain.chain_id, slash_judge_addr);
 
@@ -685,16 +681,10 @@ pub async fn run(
                 cfg.blockchain.rpc_url
             )
         })?;
-    let capacity_bond_addr: Address =
-        cfg.blockchain
-            .capacity_bond_address
-            .parse()
-            .with_context(|| {
-                format!(
-                    "blockchain.capacity_bond_address {:?} is not a valid address",
-                    cfg.blockchain.capacity_bond_address
-                )
-            })?;
+    let capacity_bond_addr = parse_nonzero_address(
+        &cfg.blockchain.capacity_bond_address,
+        "blockchain.capacity_bond_address",
+    )?;
     // Reserved for the settlement indexer's read-only provider (#326); cloned
     // here before `rpc_url` is moved into the wallet providers below.
     let reputation_rpc_url = rpc_url.clone();
@@ -892,16 +882,10 @@ pub async fn run(
         cfg.blockchain.publisher_registry_address.as_deref(),
     ) {
         (Some(origin_addr), Some(publisher_addr)) => {
-            let origin_assignment_addr: Address = origin_addr.parse().with_context(|| {
-                format!(
-                    "blockchain.origin_assignment_address {origin_addr:?} is not a valid address"
-                )
-            })?;
-            let publisher_registry_addr: Address = publisher_addr.parse().with_context(|| {
-                format!(
-                    "blockchain.publisher_registry_address {publisher_addr:?} is not a valid address"
-                )
-            })?;
+            let origin_assignment_addr =
+                parse_nonzero_address(origin_addr, "blockchain.origin_assignment_address")?;
+            let publisher_registry_addr =
+                parse_nonzero_address(publisher_addr, "blockchain.publisher_registry_address")?;
             Arc::new(
                 crate::dht::ChainOriginDirectory::bootstrap(
                     with_poll_interval(
@@ -962,16 +946,10 @@ pub async fn run(
     // which holds the NodeId↔address mappings). The handler hydrates per-channel
     // voucher state from `channel_state_store` so a restart cannot replay an
     // already-accepted voucher (#527).
-    let payment_channel_addr: Address = cfg
-        .blockchain
-        .payment_channel_address
-        .parse()
-        .with_context(|| {
-            format!(
-                "blockchain.payment_channel_address {:?} is not a valid address",
-                cfg.blockchain.payment_channel_address
-            )
-        })?;
+    let payment_channel_addr = parse_nonzero_address(
+        &cfg.blockchain.payment_channel_address,
+        "blockchain.payment_channel_address",
+    )?;
     let voucher_domain =
         decdn_incentive::voucher_domain(cfg.blockchain.chain_id, payment_channel_addr);
     let bind_domain =
@@ -1373,9 +1351,8 @@ pub async fn run(
         blacklist_rpc_url,
     ) {
         (Some(addr), Some(url)) => {
-            let content_blacklist_addr: Address = addr.parse().with_context(|| {
-                format!("blockchain.content_blacklist_address {addr:?} is not a valid address")
-            })?;
+            let content_blacklist_addr =
+                parse_nonzero_address(addr, "blockchain.content_blacklist_address")?;
             let shutdown = CancellationToken::new();
             tasks.spawn(crate::blacklist_watcher::run(
                 with_poll_interval(
