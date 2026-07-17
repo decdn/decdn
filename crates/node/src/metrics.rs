@@ -1204,6 +1204,15 @@ impl Default for Metrics {
     }
 }
 
+/// Saturating `usize` → `i64` for gauge values: a count too large to fit an
+/// `i64` reports `i64::MAX` rather than wrapping. Saturation is the
+/// conservative direction for the sizes and counts these gauges carry, and it
+/// keeps the workspace `unwrap_used` deny satisfied without pushing a
+/// `Result` onto every recorder signature.
+fn sat(n: usize) -> i64 {
+    i64::try_from(n).unwrap_or(i64::MAX)
+}
+
 impl Metrics {
     /// Create the registry and register deCDN's metric group plus the
     /// cache crate's `decdn_cache_*` group. The cache handle is shared
@@ -1253,72 +1262,6 @@ impl Metrics {
         Ok(())
     }
 
-    pub fn started(&self) {
-        self.decdn.uptime_seconds.set(0);
-    }
-
-    pub fn probe_request(&self) {
-        self.decdn.probe_requests.inc();
-    }
-
-    /// A probe answered `has_blob: false` despite the bytes being present,
-    /// because the eviction hold could not be guaranteed (ADR 005 §Hold
-    /// budget).
-    pub fn probe_hold_violation(&self) {
-        self.decdn.probe_hold_violations.inc();
-    }
-
-    /// A probe answered `has_blob: false` for a present blob because the
-    /// eviction-hold path is disabled by config (`max_probe_holds == 0`) —
-    /// an intentional operator decision, not budget pressure (#739, ADR 005
-    /// §Hold budget).
-    pub fn probe_holds_disabled(&self) {
-        self.decdn.probe_holds_disabled.inc();
-    }
-
-    /// An end-client probe answered `has_blob: false` because the hold
-    /// budget reached the stake-lane-reserved end-client ceiling, before any
-    /// cache lookup (#757, ADR 003 §Admission and Priority). A deliberate,
-    /// content-independent priority decision — not budget pressure or a
-    /// config disable.
-    pub fn probe_stake_lane_reserved(&self) {
-        self.decdn.probe_stake_lane_reserved.inc();
-    }
-
-    /// Publish the current count of active probe holds (ADR 005).
-    pub fn probe_hold_slots(&self, used: usize) {
-        self.decdn
-            .probe_hold_slots_used
-            .set(i64::try_from(used).unwrap_or(i64::MAX));
-    }
-
-    /// Publish the configured `max_probe_holds` budget (registry-mandatory
-    /// `decdn_probe_hold_slots_max`). Called once at runtime bring-up.
-    pub fn probe_hold_slots_max(&self, max: usize) {
-        self.decdn
-            .probe_hold_slots_max
-            .set(i64::try_from(max).unwrap_or(i64::MAX));
-    }
-
-    /// The node clamped `rate_per_mb` to the configured delivery bounds
-    /// before signing (ADR 005 §Rate bounds validation).
-    pub fn rate_bounds_clamped(&self) {
-        self.decdn.rate_bounds_clamp_events.inc();
-    }
-
-    /// A voucher was refused for paying below the protocol per-byte price
-    /// floor (`delivery_floor`) — the off-chain mirror of the on-chain
-    /// `RateFloorViolation` settlement guard (#846).
-    pub fn voucher_rate_floor_rejected(&self) {
-        self.decdn.voucher_rate_floor_rejections.inc();
-    }
-
-    /// Set the `decdn_prefetch_enabled` gauge once at startup (ADR 022
-    /// §Prefetch; appendix-observability §Prefetch Metrics).
-    pub fn set_prefetch_enabled(&self, enabled: bool) {
-        self.decdn.prefetch_enabled.set(i64::from(enabled));
-    }
-
     /// Record the outcome of a prefetch decision against the skip counters.
     /// The would-acquire split (authorized vs bypassed) is recorded separately
     /// by [`Self::record_prefetch_acquire`].
@@ -1350,33 +1293,6 @@ impl Metrics {
         }
     }
 
-    /// Add `micro_usdc` to the cumulative prefetch spend (#820). Called from the
-    /// acquisition observer on each prefetch-initiated paid pull that acked
-    /// vouchers, whether it ultimately succeeded or failed after paying.
-    pub fn add_prefetch_spend(&self, micro_usdc: u64) {
-        self.decdn.prefetch_spend_usdc.inc_by(micro_usdc);
-    }
-
-    /// A speculative acquisition cached the blob (#820).
-    pub fn prefetch_acquire_succeeded(&self) {
-        self.decdn.prefetch_acquire_succeeded.inc();
-    }
-
-    /// A speculative acquisition found no source or errored (#820).
-    pub fn prefetch_acquire_failed(&self) {
-        self.decdn.prefetch_acquire_failed.inc();
-    }
-
-    /// A speculative acquisition hit its per-acquisition deadline (#820).
-    pub fn prefetch_acquire_timeout(&self) {
-        self.decdn.prefetch_acquire_timeout.inc();
-    }
-
-    /// A speculative acquisition was dropped at the concurrency cap (#820).
-    pub fn prefetch_acquire_dropped_saturated(&self) {
-        self.decdn.prefetch_acquire_dropped_saturated.inc();
-    }
-
     /// Refresh the demand-quality gauges from the policy state. `ratio` is
     /// scaled ×1000 into the integer gauge; non-finite/negative ratios report
     /// `0`.
@@ -1398,196 +1314,6 @@ impl Metrics {
         self.decdn
             .prefetch_throttle_active
             .set(i64::from(throttled));
-    }
-
-    /// An accepted voucher skipped one or more nonce values past
-    /// `last_nonce + 1` (#747). Counted once per gapped voucher; the precise
-    /// skip count rides the paired `tracing::warn!` in `apply_voucher`.
-    pub fn voucher_nonce_gap(&self) {
-        self.decdn.voucher_nonce_gaps.inc();
-    }
-
-    /// A redeem hint was dropped because the bounded advisory channel was full
-    /// (`try_send` → `Full`, #751). Advisory, so a few drops are benign; a
-    /// sustained rate means the redeemer is not keeping up with fan-out.
-    pub fn redeem_hint_dropped(&self) {
-        self.decdn.redeem_hints_dropped.inc();
-    }
-
-    /// A download-receipt audit write was dropped because the bounded writer
-    /// queue was full (`try_send` → `Full`, #803). Audit-only, so a drop never
-    /// affects settlement; a sustained rate means the writer is not keeping up
-    /// with disk I/O and audit records are being lost.
-    pub fn receipt_write_dropped(&self) {
-        self.decdn.receipt_writes_dropped.inc();
-    }
-
-    /// A redemption attempt (`try_redeem`) failed with an RPC/receipt error
-    /// (#751). Pairs with the `warn!` in `redeemer_loop`.
-    pub fn redemption_failure(&self) {
-        self.decdn.redemption_failures.inc();
-    }
-
-    /// A buyer-side reclaim-sweep attempt (`try_reclaim`) failed — an RPC/receipt
-    /// error, an on-chain revert, or a failed store write when clearing the local
-    /// record (#906). Pairs with the per-attempt `warn!` in `try_reclaim` and the
-    /// threshold `error!` in `reclaim_once`.
-    pub fn buyer_reclaim_failure(&self) {
-        self.decdn.buyer_reclaim_failures.inc();
-    }
-
-    /// The idle-reconcile sweep cooperatively closed one idle buyer channel,
-    /// reclaiming its deposit early (#972).
-    pub fn buyer_reconcile_settled(&self) {
-        self.decdn.buyer_reconcile_settled.inc();
-    }
-
-    /// The reconcile sweep escalated an idle channel to a **unilateral**
-    /// `closeChannel` because the provider was unreachable for a cooperative
-    /// close — deregistered, or timing out repeatedly (#988/#989). The
-    /// timeout-shaped-unreachability bucket, distinct from
-    /// `buyer_unilateral_close_rpc_failure`.
-    pub fn buyer_unilateral_close_unreachable(&self) {
-        self.decdn.buyer_unilateral_close_unreachable.inc();
-    }
-
-    /// A unilateral `closeChannel` did not secure the claim — the RPC
-    /// send/receipt errored or the tx reverted on-chain (#988/#989). An
-    /// infrastructure/on-chain fault, not provider unreachability.
-    pub fn buyer_unilateral_close_rpc_failure(&self) {
-        self.decdn.buyer_unilateral_close_rpc_failure.inc();
-    }
-
-    /// A unilateral `closeChannel` landed, opening the dispute window for the
-    /// buyer settle sweep to reclaim the deposit early (#988).
-    pub fn buyer_unilateral_close_ok(&self) {
-        self.decdn.buyer_unilateral_close_ok.inc();
-    }
-
-    /// A buyer `settleChannel` finalization landed, or re-read the channel as
-    /// already-`Closed` (a co-settler finalized first) — either way the buyer's
-    /// deposit refund is recovered (#988).
-    pub fn buyer_settle_ok(&self) {
-        self.decdn.buyer_settle_ok.inc();
-    }
-
-    /// A buyer `settleChannel` finalization did not finalize this sweep and was
-    /// left for the next — a transient RPC fault, a dispute-extended re-stamp,
-    /// an unresolved revert, or a pending store-write failure (#988).
-    pub fn buyer_settle_deferred(&self) {
-        self.decdn.buyer_settle_deferred.inc();
-    }
-
-    /// A background low-water top-up (#1146) landed: a reused buyer channel below
-    /// its 20% low-water mark was re-funded to the working deposit. Pairs with the
-    /// `info!` in `spawn_refill_if_low`.
-    pub fn buyer_topup_ok(&self) {
-        self.decdn.buyer_topup_ok.inc();
-    }
-
-    /// A background low-water top-up (#1146) did not cleanly land — the allowance
-    /// re-approval or the `topUp` submit/receipt errored or reverted, OR the `topUp`
-    /// landed on-chain but the local row vanished/rotated during the RPC
-    /// (`DepositOutcome::UnknownProvider` / `ChannelMismatch`, i.e. escrowed-but-
-    /// untracked). Folding the untracked case in here keeps stranded deposits
-    /// visible on this counter. Best-effort, so the channel is left un-topped; pairs
-    /// with the `warn!` (or `top_up`'s own error!/warn!) around the call in
-    /// `spawn_refill_if_low`.
-    pub fn buyer_topup_failure(&self) {
-        self.decdn.buyer_topup_failure.inc();
-    }
-
-    /// An auto-settlement trigger fired and the seller path `closeChannel`d a
-    /// channel to secure its un-redeemed balance on-chain (#742). Pairs with
-    /// the `info!` in `try_redeem`.
-    pub fn settlement_auto_triggered(&self) {
-        self.decdn.settlement_auto_triggered.inc();
-    }
-
-    /// An auto-settlement trigger fired but the `closeChannel` did NOT secure
-    /// the balance — the submit failed or the receipt reverted/errored (#742).
-    /// Pairs with the `warn!` in `try_auto_settle_close`. Kept distinct from
-    /// `settlement_auto_triggered` so a fire-vs-secured ratio is computable.
-    pub fn settlement_auto_failure(&self) {
-        self.decdn.settlement_auto_failures.inc();
-    }
-
-    /// A `settleChannel` finalization sweep landed: the dispute window cleared,
-    /// the provider remainder routed through the `FeeRouter`, and the pending
-    /// entry was dropped (#810). Pairs with the success `info!` in `try_settle`.
-    pub fn settlement_finalize_ok(&self) {
-        self.decdn.settlement_finalize_ok.inc();
-    }
-
-    /// A `settleChannel` finalization sweep could not submit — `send()` errored
-    /// on a transient RPC/network fault and the entry is retried next sweep
-    /// (#810). Pairs with the send-arm `warn!` in `try_settle`.
-    pub fn settlement_finalize_transient_send(&self) {
-        self.decdn.settlement_finalize_transient_send.inc();
-    }
-
-    /// A `settleChannel` finalization sweep submitted but `get_receipt()`
-    /// errored before a receipt was seen — a transient RPC fault, retried next
-    /// sweep (#810). Pairs with the receipt-arm `warn!` in `try_settle`.
-    pub fn settlement_finalize_transient_receipt(&self) {
-        self.decdn.settlement_finalize_transient_receipt.inc();
-    }
-
-    /// A `settleChannel` finalization sweep reverted on-chain
-    /// (`receipt.status() == false`, #810). Raw revert count; the cause is
-    /// classified afterward by `drop_pending_if_finalized` into the
-    /// `settlement_finalize_confirmed_closed` / `_restamped` / `_confirm_failed`
-    /// counters. Pairs with the revert-arm `warn!` in `try_settle`.
-    pub fn settlement_finalize_reverted(&self) {
-        self.decdn.settlement_finalize_reverted.inc();
-    }
-
-    /// A reverted `settleChannel` re-read as already-`Closed`: a co-settler
-    /// finalized first, the obligation is retired (#810). The benign
-    /// co-settler-race case. Pairs with the `Closed`-arm `info!` in
-    /// `drop_pending_if_finalized`.
-    pub fn settlement_finalize_confirmed_closed(&self) {
-        self.decdn.settlement_finalize_confirmed_closed.inc();
-    }
-
-    /// A reverted `settleChannel` re-read as still-`Closing`: a dispute
-    /// extended the window, the gate is re-stamped and retried (#810). Benign.
-    /// Pairs with the `Closing`-arm re-stamp in `drop_pending_if_finalized`.
-    pub fn settlement_finalize_restamped(&self) {
-        self.decdn.settlement_finalize_restamped.inc();
-    }
-
-    /// A reverted `settleChannel` left unresolved: the confirming `getChannel`
-    /// re-read errored, or returned an unexpected non-terminal status, so the
-    /// entry is kept (#810) — the genuinely-degraded signal. Pairs with the
-    /// read-error and unexpected-status `warn!`s in `drop_pending_if_finalized`.
-    pub fn settlement_finalize_confirm_failed(&self) {
-        self.decdn.settlement_finalize_confirm_failed.inc();
-    }
-
-    /// A finalization-path pending-settle store write (`forget_pending` or a
-    /// re-stamp `record_pending`) returned a `StoreError` and was swallowed
-    /// (#810). Pairs with the persist-failure `warn!` sites in
-    /// `forget_pending_logged` / `restamp_pending_logged`.
-    pub fn settlement_pending_persist_failure(&self) {
-        self.decdn.settlement_pending_persist_failures.inc();
-    }
-
-    /// The settlement watcher hit a channel-lifecycle persist failure
-    /// (`register_open_channel` / `update_channel_deposit` / `forget_channel`,
-    /// #751), in `SettlementSink::apply` (`payment_settlement.rs`). Only the
-    /// `forget_channel` arm is swallowed, and it carries the sole per-site
-    /// `warn!` ("failed to forget settled channel"); the other arms return `Err`,
-    /// so their context surfaces in `resumable_watcher::run`'s loop-level
-    /// `warn!` ("watcher RPC error; restarting after backoff") instead.
-    pub fn watcher_persist_failure(&self) {
-        self.decdn.watcher_persist_failures.inc();
-    }
-
-    /// A distinct slash against this node's operator was detected by the slash
-    /// watcher (#1032). Counts each `slashId` once (backfill + live dedup).
-    pub fn slash_detected(&self) {
-        self.decdn.slashes_detected.inc();
     }
 
     /// The slash-detection watcher's cycle errored and the loop is about to back
@@ -1635,15 +1361,6 @@ impl Metrics {
         }
     }
 
-    /// A `nodeIdOf(operator)` resolution for an operator-indexed event failed,
-    /// dropping the membership change (#788, [`crate::dht::chain_staker_set`]).
-    /// Bumps `staker_set_watcher_resolve_failures_total`. Pairs with the
-    /// per-failure `warn!` in [`crate::dht::capacity_bond_registry`]'s
-    /// `RegistrySink::on_operator_change`.
-    pub fn staker_set_watcher_resolve_failure(&self) {
-        self.decdn.staker_set_watcher_resolve_failures.inc();
-    }
-
     /// Mark the staker-set watcher's poll cycle as established (#783,
     /// downtime semantics #788): a poll tick succeeded and logs are flowing
     /// again (the `on_established` hook). Clears `down_since` to `None` so
@@ -1656,68 +1373,6 @@ impl Metrics {
         if let Ok(mut down_since) = self.staker_set_watcher_down_since.lock() {
             *down_since = None;
         }
-    }
-
-    /// Publish the current cached active-staker set size (#783). Sampled on
-    /// every membership change the watcher applies, so the gauge tracks the
-    /// cached view — which under a watcher outage is exactly the (possibly
-    /// stale) set that admission decisions read.
-    pub fn staker_set_active_count(&self, count: usize) {
-        self.decdn
-            .staker_set_active_count
-            .set(i64::try_from(count).unwrap_or(i64::MAX));
-    }
-
-    /// Publish the current cached `NodeId → operator address` binding count
-    /// (#831). Sampled on every binding change the node-address watcher applies,
-    /// so it tracks the cached view the pull path resolves against.
-    pub fn node_address_directory_size(&self, count: usize) {
-        self.decdn
-            .node_address_directory_size
-            .set(i64::try_from(count).unwrap_or(i64::MAX));
-    }
-
-    /// A node-to-node pull orchestration found ≥1 candidate and is attempting a
-    /// fill (#831).
-    pub fn node_pull_attempt(&self) {
-        self.decdn.node_pull_attempts.inc();
-    }
-
-    /// A node-to-node pull delivered verified bytes (#831).
-    pub fn node_pull_success(&self) {
-        self.decdn.node_pull_success.inc();
-    }
-
-    /// A cache miss surfaced no provider from discovery (#831).
-    pub fn node_pull_no_providers(&self) {
-        self.decdn.node_pull_no_providers.inc();
-    }
-
-    /// A DHT lookup was truncated at `MAX_LOOKUP_ROUNDS` while still finding closer nodes
-    /// (#1145 review). A sustained rate means the ceiling is too low for the network size.
-    pub fn dht_lookup_round_ceiling(&self) {
-        self.decdn.dht_lookup_round_ceiling.inc();
-    }
-
-    /// An upstream served hash-mismatched bytes for a paid pull (#831).
-    pub fn node_pull_corruption(&self) {
-        self.decdn.node_pull_corruption.inc();
-    }
-
-    /// A probe or pull to a candidate failed at the transport (#831).
-    pub fn node_pull_unreachable(&self) {
-        self.decdn.node_pull_unreachable.inc();
-    }
-
-    /// A probed peer claimed this node's own region but exceeded the ADR 030
-    /// latency ceiling, so it took the local reputation penalty (#1177).
-    pub fn node_region_latency_penalty(&self) {
-        self.decdn.node_region_latency_penalty.inc();
-    }
-
-    /// A buyer channel open/reuse failed before a pull could start (#831).
-    pub fn node_pull_channel_open_failure(&self) {
-        self.decdn.node_pull_channel_open_failures.inc();
     }
 
     /// Record a buyer `openChannel`-tx failure broken out by cause (#966): bumps
@@ -1741,271 +1396,6 @@ impl Metrics {
         }
     }
 
-    /// A selected upstream claimed a `total_bytes` above this node's
-    /// `max_blob_size` ceiling and the buyer rejected it before buffering
-    /// (#840). A buyer-side policy decision, so it does not score the provider.
-    pub fn node_pull_too_large(&self) {
-        self.decdn.node_pull_too_large.inc();
-    }
-
-    /// Record a paid-delivery (`serve_stream`) request refused because the
-    /// blob was evicted between probe and stream (#876).
-    pub fn serve_stream_rejected_evicted_since_probe(&self) {
-        self.decdn.serve_stream_rejected_evicted_since_probe.inc();
-    }
-
-    /// Record a `serve_stream` request refused on a cache miss that
-    /// pull-through could not fill (#876).
-    pub fn serve_stream_rejected_cache_miss(&self) {
-        self.decdn.serve_stream_rejected_cache_miss.inc();
-    }
-
-    /// Record a `serve_stream` request refused by a local store fault,
-    /// surfaced as `InternalError` (#876).
-    pub fn serve_stream_rejected_internal_error(&self) {
-        self.decdn.serve_stream_rejected_internal_error.inc();
-    }
-
-    /// Record a `serve_stream` request refused because the blob exceeds
-    /// `max_blob_size_bytes` (#876).
-    pub fn serve_stream_rejected_blob_too_large(&self) {
-        self.decdn.serve_stream_rejected_blob_too_large.inc();
-    }
-
-    /// Record a `serve_stream` request refused on an unknown channel (#876).
-    pub fn serve_stream_rejected_unknown_channel(&self) {
-        self.decdn.serve_stream_rejected_unknown_channel.inc();
-    }
-
-    /// Record a `serve_stream` request refused because the client binding did
-    /// not authorize the named channel (#876).
-    pub fn serve_stream_rejected_owner_mismatch(&self) {
-        self.decdn.serve_stream_rejected_owner_mismatch.inc();
-    }
-
-    /// Record a `serve_stream` cache-miss refused by the pre-flight deposit guard
-    /// (#856): the requesting channel could not cover the worst-case blob cost,
-    /// so no upstream pull was started.
-    pub fn serve_stream_rejected_insufficient_deposit(&self) {
-        self.decdn.serve_stream_rejected_insufficient_deposit.inc();
-    }
-
-    /// Record a `serve_stream` cache-miss refused by the authorized-origin gate
-    /// (#821): `pull_through_require_authorized_origin` is on and the hash's
-    /// namespace has no authorized origin, so no upstream pull was started.
-    pub fn serve_stream_rejected_unauthorized_origin(&self) {
-        self.decdn.serve_stream_rejected_unauthorized_origin.inc();
-    }
-
-    /// Record a `serve_stream` delivery refused because the channel has a signed
-    /// cooperative-close waiver (ADR 003 §Cooperative close).
-    pub fn serve_stream_rejected_cooperative_close_signed(&self) {
-        self.decdn
-            .serve_stream_rejected_cooperative_close_signed
-            .inc();
-    }
-
-    /// Record a `serve_stream` delivery refused because the requested bounded
-    /// range is out of bounds for the blob (ADR 005 §Bounded byte ranges).
-    pub fn serve_stream_rejected_range_not_satisfiable(&self) {
-        self.decdn.serve_stream_rejected_range_not_satisfiable.inc();
-    }
-
-    /// The window-paced serve loop paused the upstream pull at `pull_ahead_bytes`
-    /// to wait for the downstream voucher to clear (#856).
-    pub fn node_pull_through_window_paused(&self) {
-        self.decdn.node_pull_through_window_paused.inc();
-    }
-
-    /// A speculative pull-through was refused/paused by the node-wide
-    /// unrecouped-leech budget (#856).
-    pub fn node_pull_through_leech_budget_paused(&self) {
-        self.decdn.node_pull_through_leech_budget_paused.inc();
-    }
-
-    /// A speculative pull-through was refused because a peer exceeded its
-    /// `share_ratio` ceiling (#856).
-    pub fn node_pull_through_share_ratio_paused(&self) {
-        self.decdn.node_pull_through_share_ratio_paused.inc();
-    }
-
-    /// A window-paced serve was abandoned because the requesting client dropped
-    /// or underpaid mid-pull (#856).
-    pub fn node_pull_through_client_abandoned(&self) {
-        self.decdn.node_pull_through_client_abandoned.inc();
-    }
-
-    /// A window-paced serve delivered the full blob but failed to promote it into
-    /// the local cache (#856).
-    pub fn node_pull_through_tee_finalize_failed(&self) {
-        self.decdn.node_pull_through_tee_finalize_failed.inc();
-    }
-
-    /// A window-paced serve forwarded an upstream stream that failed its whole-blob
-    /// hash check at finalization (#856).
-    pub fn node_pull_through_upstream_verify_failed(&self) {
-        self.decdn.node_pull_through_upstream_verify_failed.inc();
-    }
-
-    /// A window-paced serve aborted because a local cache-tee write of an
-    /// already-paid upstream chunk failed (#856) — a store fault, not a downstream
-    /// client drop.
-    pub fn node_pull_through_local_tee_failed(&self) {
-        self.decdn.node_pull_through_local_tee_failed.inc();
-    }
-
-    /// A per-pull prefetch-ledger delta overflowed `u64` and was clamped to `0`
-    /// (#820) — a signal of upstream voucher-accounting corruption.
-    pub fn node_pull_delta_overflow(&self) {
-        self.decdn.node_pull_delta_overflow.inc();
-    }
-
-    /// A buyer→upstream pull hit this node's own `pull_timeout` deadline (#857).
-    /// A buyer-side condition, so it does not score the provider's reputation.
-    pub fn node_pull_timeout(&self) {
-        self.decdn.node_pull_timeout.inc();
-    }
-
-    /// An upstream rejected a voucher this node presented mid-pull (#857) — a
-    /// buyer payment-side fault, so it does not score the provider's reputation.
-    pub fn node_pull_voucher_rejected(&self) {
-        self.decdn.node_pull_voucher_rejected.inc();
-    }
-
-    /// A channel was settled on-chain (`CooperativeCloseSigned`), so its row was dropped
-    /// and the next pull to that provider opens a fresh one (#1145 review).
-    pub fn node_pull_channel_retired(&self) {
-        self.decdn.node_pull_channel_retired.inc();
-    }
-
-    /// A channel can no longer pay but its deposit is still escrowed, so the row was KEPT
-    /// for the reclaim sweep and the provider suppressed instead (#1145 review). Money at
-    /// rest — see the counter's docs.
-    pub fn node_pull_channel_wedged(&self) {
-        self.decdn.node_pull_channel_wedged.inc();
-    }
-
-    /// The store write retiring a settled channel's row failed (#1145 review).
-    pub fn node_pull_channel_retire_failure(&self) {
-        self.decdn.node_pull_channel_retire_failure.inc();
-    }
-
-    /// A selected upstream refused delivery up front (#1144). Counts every wire
-    /// code; only `InternalError` also scores the provider's reputation.
-    pub fn node_pull_refused(&self) {
-        self.decdn.node_pull_refused.inc();
-    }
-
-    /// An upstream went silent mid-stream (#1134); the pull was abandoned and the
-    /// provider scored `Unreachable`.
-    pub fn node_pull_stalled(&self) {
-        self.decdn.node_pull_stalled.inc();
-    }
-
-    /// A pull failed for a LOCAL reason (#1145 review) — signer, encode, range — so
-    /// the upstream was exonerated. Says nothing about the network; any sustained
-    /// rate means this node cannot pay for anything.
-    pub fn node_pull_local_fault(&self) {
-        self.decdn.node_pull_local_fault.inc();
-    }
-
-    /// A buyer channel open outlived the per-candidate budget (#1143). The open
-    /// continues in the background; the pull moves on. No reputation effect.
-    pub fn node_pull_channel_open_pending(&self) {
-        self.decdn.node_pull_channel_open_pending.inc();
-    }
-
-    /// A pull paid ≥1 voucher but persisting the buyer channel resume watermark
-    /// failed (#852); the channel's stored progress now lags the upstream.
-    pub fn node_pull_progress_persist_failure(&self) {
-        self.decdn.node_pull_progress_persist_failures.inc();
-    }
-
-    /// A paid voucher's watermark was DROPPED because the provider's channel slot had
-    /// been replaced by a newer open before the write landed (#1145 review).
-    pub fn node_pull_progress_dropped(&self) {
-        self.decdn.node_pull_progress_dropped.inc();
-    }
-
-    /// A concurrent settle on the shared channel ledger persisted a higher watermark first, so
-    /// this write was superseded (benign under `BuyerLedgers`; #1145 review).
-    pub fn node_pull_progress_superseded(&self) {
-        self.decdn.node_pull_progress_superseded.inc();
-    }
-
-    /// The delivery handler abandoned a pull-through at its deadline (#831).
-    pub fn node_pull_through_timeout(&self) {
-        self.decdn.node_pull_through_timeouts.inc();
-    }
-
-    /// A cache-engine error (not a clean miss) was hit filling a miss (#831).
-    pub fn node_pull_through_error(&self) {
-        self.decdn.node_pull_through_errors.inc();
-    }
-
-    /// A detached background cache-fill was spawned after the foreground
-    /// delivery deadline fired (#859).
-    pub fn node_pull_through_background_spawned(&self) {
-        self.decdn.node_pull_through_background_spawned.inc();
-    }
-
-    /// A background cache-fill was shed because the in-flight warms already reserve the
-    /// whole memory budget (#1145 review). Speculative work dropped under load; the hash
-    /// stays unclaimed, so a later miss retries it.
-    pub fn node_pull_through_background_shed(&self) {
-        self.decdn.node_pull_through_background_shed.inc();
-    }
-
-    /// A background cache-fill populated the blob into the store (#859).
-    pub fn node_pull_through_background_succeeded(&self) {
-        self.decdn.node_pull_through_background_succeeded.inc();
-    }
-
-    /// A background cache-fill failed on a FAULT — a store/IO error, unverifiable bytes, a
-    /// broken origin, or the absolute cap (#859). Alertable; a clean miss is not counted
-    /// here (#1145 review).
-    pub fn node_pull_through_background_failed(&self) {
-        self.decdn.node_pull_through_background_failed.inc();
-    }
-
-    /// A background cache-fill found nothing to warm — no provider, or no origin (#1145
-    /// review). Routine, and kept out of `..._failed_total` so that counter can be alerted
-    /// on.
-    pub fn node_pull_through_background_missed(&self) {
-        self.decdn.node_pull_through_background_missed.inc();
-    }
-
-    /// A background cache-fill task PANICKED (#1145 review). Nothing awaits these tasks, so
-    /// this counter is the only trace one leaves. Any non-zero value is a bug in this node.
-    pub fn node_pull_through_background_panicked(&self) {
-        self.decdn.node_pull_through_background_panicked.inc();
-    }
-
-    /// A background cache-fill was abandoned at shutdown (#1145 review). Not a failure —
-    /// counted so `spawned == succeeded + missed + failed + cancelled + panicked` balances.
-    pub fn node_pull_through_background_cancelled(&self) {
-        self.decdn.node_pull_through_background_cancelled.inc();
-    }
-
-    /// Bump `reputation_indexer_rpc_failures_total` (#326): an indexer event
-    /// stream errored or a `nodeIdOf` resolution RPC failed. Pairs with the
-    /// per-failure `warn!` in `crate::reputation_indexer`.
-    pub fn reputation_indexer_rpc_failure(&self) {
-        self.decdn.reputation_indexer_rpc_failures.inc();
-    }
-
-    /// Bump `reputation_indexer_settlements_credited_total` (#326) by `n` party
-    /// creditings applied for one settlement (0, 1, or 2).
-    pub fn reputation_indexer_settlements_credited(&self, n: u64) {
-        self.decdn.reputation_indexer_settlements_credited.inc_by(n);
-    }
-
-    /// Bump `reputation_indexer_amount_overflows_total` (#326): a settlement
-    /// amount exceeded `u128` and was skipped (not saturated).
-    pub fn reputation_indexer_amount_overflow(&self) {
-        self.decdn.reputation_indexer_amount_overflows.inc();
-    }
-
     /// An origin-directory watcher poll tick errored and the loop is
     /// about to back off (#651). Mirrors `staker_set_watcher_backoff_started`:
     /// stamps `down_since` and counts exactly one restart per drift window.
@@ -2018,24 +1408,6 @@ impl Metrics {
         }
     }
 
-    /// A `getOrigins` / `nodeIdOf` resolution failed, leaving an operator
-    /// unmapped in the origin directory (#651). Bumps
-    /// `origin_directory_watcher_resolve_failures_total`.
-    pub fn origin_directory_watcher_resolve_failure(&self) {
-        self.decdn.origin_directory_watcher_resolve_failures.inc();
-    }
-
-    /// The origin-directory bootstrap replay range was inverted
-    /// (`replay_from > latest`) — a stale / lagging RPC head vs. the persisted
-    /// replay checkpoint (#1152). The genesis replay was skipped this boot;
-    /// claimed hashes fall back to the default-open set until the live tail
-    /// re-surfaces claims. Bumps
-    /// `origin_directory_bootstrap_range_anomaly_total`. Pairs with the warn! in
-    /// `bootstrap_cache`.
-    pub fn origin_directory_bootstrap_range_anomaly(&self) {
-        self.decdn.origin_directory_bootstrap_range_anomaly.inc();
-    }
-
     /// Mark the origin-directory watcher's poll cycle as established
     /// (#651): clears `down_since` so `origin_directory_watcher_down_seconds`
     /// reads `0` for the life of this cycle.
@@ -2043,33 +1415,6 @@ impl Metrics {
         if let Ok(mut down_since) = self.origin_directory_watcher_down_since.lock() {
             *down_since = None;
         }
-    }
-
-    /// Publish the count of distinct operator addresses currently authorised as
-    /// origins — the union of every namespace's operator set and the
-    /// default-open allow-list (#651). Falls on revoke/prune/remove/replace,
-    /// unlike the monotonic `operator → NodeId` binding cache. The caller
-    /// recomputes this (`authorized_operator_count`) after each set mutation.
-    pub fn origin_directory_operator_count(&self, count: usize) {
-        self.decdn
-            .origin_directory_operator_count
-            .set(i64::try_from(count).unwrap_or(i64::MAX));
-    }
-
-    pub fn connection_opened(&self) {
-        self.decdn.active_connections.inc();
-    }
-
-    pub fn connection_closed(&self) {
-        self.decdn.active_connections.dec();
-    }
-
-    pub fn gossip_published(&self, _topic: &str) {
-        self.decdn.gossip_announces_published_total.inc();
-    }
-
-    pub fn gossip_received(&self, _topic: &str) {
-        self.decdn.gossip_announces_received_total.inc();
     }
 
     pub fn gossip_rejected(&self, reason: &'static str) {
@@ -2083,46 +1428,6 @@ impl Metrics {
         if reason == decdn_gossip::AnnounceReject::ClockSkew.label() {
             self.decdn.gossip_messages_rejected_clock_skew.inc();
         }
-    }
-
-    pub fn gossip_peer_table_size(&self, n: i64) {
-        self.decdn.gossip_peer_table_size.set(n);
-    }
-
-    /// Increment the TTL-eviction counter by the sweeper's evicted count.
-    pub fn peer_table_evicted_ttl(&self, n: u64) {
-        self.decdn.peer_table_evicted_ttl.inc_by(n);
-    }
-
-    pub fn gossip_reconnected(&self, _topic: &str) {
-        self.decdn.gossip_subscriber_reconnections_total.inc();
-    }
-
-    /// Set the RPC health gauge. `true` -> 1 (reachable), `false` -> 0
-    /// (unreachable). Driven by the watchdog task spawned in
-    /// `runtime::run`.
-    pub fn rpc_healthy(&self, ok: bool) {
-        self.decdn.rpc_healthy.set(i64::from(ok));
-    }
-
-    /// Record a connection rejected by the global concurrency semaphore.
-    pub fn dispatch_rejected_global(&self) {
-        self.decdn.dispatch_rejected_global.inc();
-    }
-
-    /// Record a connection rejected by the per-source rate limiter.
-    pub fn dispatch_rejected_per_source(&self) {
-        self.decdn.dispatch_rejected_per_source.inc();
-    }
-
-    /// Increment the in-flight dispatch permit gauge.
-    pub fn dispatch_permit_acquired(&self) {
-        self.decdn.dispatch_in_flight.inc();
-    }
-
-    /// Decrement the in-flight dispatch permit gauge.
-    pub fn dispatch_permit_released(&self) {
-        self.decdn.dispatch_in_flight.dec();
     }
 
     /// Current value of the `dispatch_in_flight` gauge as a `u64`. Read
@@ -2158,161 +1463,6 @@ impl Metrics {
         0
     }
 
-    /// Record a relay-only connection accepted while the per-source
-    /// layer was enabled but no peer IP could be resolved at accept
-    /// time.
-    pub fn dispatch_per_source_skipped_no_addr(&self) {
-        self.decdn.dispatch_per_source_skipped_no_addr.inc();
-    }
-
-    /// Record a `cdn/dht/v1` request rejected at the per-peer layer.
-    pub fn dht_rate_limit_rejected_per_peer(&self) {
-        self.decdn.dht_rate_limit_rejected_per_peer.inc();
-    }
-
-    /// Record a `cdn/dht/v1` request rejected at the per-IP layer.
-    pub fn dht_rate_limit_rejected_per_ip(&self) {
-        self.decdn.dht_rate_limit_rejected_per_ip.inc();
-    }
-
-    /// Record a `cdn/dht/v1` request rejected at the global layer.
-    pub fn dht_rate_limit_rejected_global(&self) {
-        self.decdn.dht_rate_limit_rejected_global.inc();
-    }
-
-    /// Record a `retain_recent` sweep of the per-IP DHT keyed-limiter
-    /// map (#645).
-    pub fn dht_rate_limit_prune_sweep_per_ip(&self) {
-        self.decdn.dht_rate_limit_prune_sweeps_per_ip.inc();
-    }
-
-    /// Record a `retain_recent` sweep of the per-peer DHT keyed-limiter
-    /// map (#645).
-    pub fn dht_rate_limit_prune_sweep_per_peer(&self) {
-        self.decdn.dht_rate_limit_prune_sweeps_per_peer.inc();
-    }
-
-    /// Set the per-IP DHT keyed-limiter tracked-size gauge (#645). The
-    /// `try_from(...).unwrap_or(i64::MAX)` clamp matches the existing
-    /// gauge-set pattern elsewhere in this module and stays within the
-    /// workspace's anti-panic policy.
-    pub fn dht_rate_limit_tracked_per_ip_set(&self, n: usize) {
-        self.decdn
-            .dht_rate_limit_tracked_per_ip
-            .set(i64::try_from(n).unwrap_or(i64::MAX));
-    }
-
-    /// Set the per-peer DHT keyed-limiter tracked-size gauge (#645).
-    pub fn dht_rate_limit_tracked_per_peer_set(&self, n: usize) {
-        self.decdn
-            .dht_rate_limit_tracked_per_peer
-            .set(i64::try_from(n).unwrap_or(i64::MAX));
-    }
-
-    /// Record a `cdn/probe/v1` request rejected at the per-peer layer.
-    pub fn probe_rate_limit_rejected_per_peer(&self) {
-        self.decdn.probe_rate_limit_rejected_per_peer.inc();
-    }
-
-    /// Record a `cdn/probe/v1` request rejected at the per-IP layer.
-    pub fn probe_rate_limit_rejected_per_ip(&self) {
-        self.decdn.probe_rate_limit_rejected_per_ip.inc();
-    }
-
-    /// Record a `cdn/probe/v1` request rejected at the global layer.
-    pub fn probe_rate_limit_rejected_global(&self) {
-        self.decdn.probe_rate_limit_rejected_global.inc();
-    }
-
-    /// Record a `retain_recent` sweep of the per-IP probe keyed-limiter
-    /// map (#645).
-    pub fn probe_rate_limit_prune_sweep_per_ip(&self) {
-        self.decdn.probe_rate_limit_prune_sweeps_per_ip.inc();
-    }
-
-    /// Record a `retain_recent` sweep of the per-peer probe keyed-limiter
-    /// map (#645).
-    pub fn probe_rate_limit_prune_sweep_per_peer(&self) {
-        self.decdn.probe_rate_limit_prune_sweeps_per_peer.inc();
-    }
-
-    /// Set the per-IP probe keyed-limiter tracked-size gauge (#645).
-    pub fn probe_rate_limit_tracked_per_ip_set(&self, n: usize) {
-        self.decdn
-            .probe_rate_limit_tracked_per_ip
-            .set(i64::try_from(n).unwrap_or(i64::MAX));
-    }
-
-    /// Set the per-peer probe keyed-limiter tracked-size gauge (#645).
-    pub fn probe_rate_limit_tracked_per_peer_set(&self, n: usize) {
-        self.decdn
-            .probe_rate_limit_tracked_per_peer
-            .set(i64::try_from(n).unwrap_or(i64::MAX));
-    }
-
-    /// Record a `cdn/dht/v1` request that was admitted by the rate
-    /// limiter but failed after that (frame decode, write, encode,
-    /// timeout, etc).
-    pub fn dht_request_failed(&self) {
-        self.decdn.dht_requests_failed.inc();
-    }
-
-    /// Record a `Store` rejected by the `holder != authenticated NodeId`
-    /// check (ADR 022 §STORE Flow line 140 — lying-holder attack).
-    pub fn dht_store_rejected_holder_mismatch(&self) {
-        self.decdn.dht_store_rejected_holder_mismatch.inc();
-    }
-
-    /// Record a `Store` rejected by the active-staker filter (ADR 022
-    /// §STORE Flow line 140 — non-staked publisher).
-    pub fn dht_store_rejected_non_staked(&self) {
-        self.decdn.dht_store_rejected_non_staked.inc();
-    }
-
-    /// Record a `Store` rejected by the per-publisher quota (ADR 022
-    /// §Content Records and TTL — 200-record hard cap).
-    pub fn dht_store_rejected_quota(&self) {
-        self.decdn.dht_store_rejected_quota.inc();
-    }
-
-    /// Record a `Store` admitted to the record store (newly inserted or
-    /// refreshed).
-    pub fn dht_store_accepted(&self) {
-        self.decdn.dht_store_accepted.inc();
-    }
-
-    /// Record a `BatchStore` that reached per-hash admission (passed
-    /// stage-1 rate limiting + the batch-level holder check, #648).
-    pub fn dht_batch_store_received(&self) {
-        self.decdn.dht_batch_store_received.inc();
-    }
-
-    /// Record `count` `BatchStore` hashes deferred (acked `false`)
-    /// because the two-stage rate-limit budget ran out before reaching
-    /// them (ADR 022 §Batch token accounting, #648).
-    pub fn dht_batch_store_hashes_deferred_rate_limit(&self, count: u64) {
-        self.decdn
-            .dht_batch_store_hashes_deferred_rate_limit
-            .inc_by(count);
-    }
-
-    /// Record a 0-RTT connection attempt (ADR 015): a cached session
-    /// ticket existed and early data was sent.
-    pub fn record_0rtt_attempt(&self) {
-        self.decdn.quic_0rtt_attempts.inc();
-    }
-
-    /// Record that the server accepted a 0-RTT attempt.
-    pub fn record_0rtt_accepted(&self) {
-        self.decdn.quic_0rtt_accepted.inc();
-    }
-
-    /// Record that the server rejected a 0-RTT attempt and the client
-    /// fell back to a 1-RTT handshake.
-    pub fn record_0rtt_rejected(&self) {
-        self.decdn.quic_0rtt_rejected.inc();
-    }
-
     /// Note a remote endpoint with which a 0-RTT-eligible handshake
     /// completed, refreshing the approximate
     /// `quic_session_ticket_cache_size` gauge. Idempotent per peer; a
@@ -2345,9 +1495,7 @@ impl Metrics {
             self.decdn.quic_session_ticket_peers_dropped.inc();
         }
         let size = peers.len();
-        self.decdn
-            .quic_session_ticket_cache_size
-            .set(i64::try_from(size).unwrap_or(i64::MAX));
+        self.decdn.quic_session_ticket_cache_size.set(sat(size));
     }
 
     /// Read the current value of the `rpc_healthy` gauge. Test-only —
@@ -2418,6 +1566,620 @@ impl Metrics {
         reg.encode_openmetrics_to_string()
             .map_err(|e| anyhow::anyhow!("openmetrics encode failed: {e}"))
     }
+}
+
+/// Generate the trivial forwarding recorders on [`Metrics`].
+///
+/// Each entry spells out both names — `method => field.op(value)` — because the
+/// two diverge for 45 of them: the method reads as a singular event while the
+/// field is plural (`probe_request` vs `probe_requests`), or the field is a
+/// semantic rename of the action (`started` sets `uptime_seconds`,
+/// `connection_opened` bumps `active_connections`). Deriving one name from the
+/// other would bind the wrong series, so neither is ever synthesized. (Field
+/// names also carry their own encoder convention — most omit the `_total`
+/// suffix the `OpenMetrics` encoder appends, though a few spell it out — but
+/// that governs the exported name, not the method-to-field mapping here.)
+///
+/// Docs pass through as `$meta`, so multi-line rationale stays byte-identical
+/// and keeps its call-site span for `clippy` and `rustdoc`.
+///
+/// What belongs here is a body that is a single `self.decdn.field.op(expr)` —
+/// including a one-expression transform of the argument (`sat(n)`,
+/// `i64::from(flag)`), which several entries do. Recorders whose body needs
+/// more than that — branching, multiple statements, or touching `Metrics`'s own
+/// `Mutex` state — stay hand-written in the `impl` block above. There is no
+/// `Counter`/`Gauge` token to pick because the op is written explicitly per
+/// entry; the one dangerous confusion, calling `dec()` on a `Counter`, does not
+/// compile because `Counter` has no `dec()` (a wrong `set`/`inc` on the right
+/// kind still would, so the entries are the source of truth).
+///
+/// Note that `rustfmt` does not format macro-invocation bodies, so the entry
+/// table below is hand-maintained: keep it at one entry per line, within the
+/// 100-column limit, and `cargo fmt` will neither help nor complain.
+macro_rules! recorders {
+    ($(
+        $(#[$meta:meta])*
+        $method:ident $(($arg:ident: $ty:ty))? => $field:ident . $op:ident ( $($val:expr)? ) ;
+    )*) => {
+        impl Metrics {
+            $(
+                $(#[$meta])*
+                pub fn $method(&self $(, $arg: $ty)?) {
+                    self.decdn.$field.$op($($val)?);
+                }
+            )*
+        }
+    };
+}
+
+recorders! {
+    started => uptime_seconds.set(0);
+    probe_request => probe_requests.inc();
+
+    /// A probe answered `has_blob: false` despite the bytes being present,
+    /// because the eviction hold could not be guaranteed (ADR 005 §Hold
+    /// budget).
+    probe_hold_violation => probe_hold_violations.inc();
+
+    /// A probe answered `has_blob: false` for a present blob because the
+    /// eviction-hold path is disabled by config (`max_probe_holds == 0`) —
+    /// an intentional operator decision, not budget pressure (#739, ADR 005
+    /// §Hold budget).
+    probe_holds_disabled => probe_holds_disabled.inc();
+
+    /// An end-client probe answered `has_blob: false` because the hold
+    /// budget reached the stake-lane-reserved end-client ceiling, before any
+    /// cache lookup (#757, ADR 003 §Admission and Priority). A deliberate,
+    /// content-independent priority decision — not budget pressure or a
+    /// config disable.
+    probe_stake_lane_reserved => probe_stake_lane_reserved.inc();
+
+    /// Publish the current count of active probe holds (ADR 005).
+    probe_hold_slots(used: usize) => probe_hold_slots_used.set(sat(used));
+
+    /// Publish the configured `max_probe_holds` budget (registry-mandatory
+    /// `decdn_probe_hold_slots_max`). Called once at runtime bring-up.
+    probe_hold_slots_max(max: usize) => probe_hold_slots_max.set(sat(max));
+
+    /// The node clamped `rate_per_mb` to the configured delivery bounds
+    /// before signing (ADR 005 §Rate bounds validation).
+    rate_bounds_clamped => rate_bounds_clamp_events.inc();
+
+    /// A voucher was refused for paying below the protocol per-byte price
+    /// floor (`delivery_floor`) — the off-chain mirror of the on-chain
+    /// `RateFloorViolation` settlement guard (#846).
+    voucher_rate_floor_rejected => voucher_rate_floor_rejections.inc();
+
+    /// Set the `decdn_prefetch_enabled` gauge once at startup (ADR 022
+    /// §Prefetch; appendix-observability §Prefetch Metrics).
+    set_prefetch_enabled(enabled: bool) => prefetch_enabled.set(i64::from(enabled));
+
+    /// Add `micro_usdc` to the cumulative prefetch spend (#820). Called from the
+    /// acquisition observer on each prefetch-initiated paid pull that acked
+    /// vouchers, whether it ultimately succeeded or failed after paying.
+    add_prefetch_spend(micro_usdc: u64) => prefetch_spend_usdc.inc_by(micro_usdc);
+
+    /// A speculative acquisition cached the blob (#820).
+    prefetch_acquire_succeeded => prefetch_acquire_succeeded.inc();
+
+    /// A speculative acquisition found no source or errored (#820).
+    prefetch_acquire_failed => prefetch_acquire_failed.inc();
+
+    /// A speculative acquisition hit its per-acquisition deadline (#820).
+    prefetch_acquire_timeout => prefetch_acquire_timeout.inc();
+
+    /// A speculative acquisition was dropped at the concurrency cap (#820).
+    prefetch_acquire_dropped_saturated => prefetch_acquire_dropped_saturated.inc();
+
+    /// An accepted voucher skipped one or more nonce values past
+    /// `last_nonce + 1` (#747). Counted once per gapped voucher; the precise
+    /// skip count rides the paired `tracing::warn!` in `apply_voucher`.
+    voucher_nonce_gap => voucher_nonce_gaps.inc();
+
+    /// A redeem hint was dropped because the bounded advisory channel was full
+    /// (`try_send` → `Full`, #751). Advisory, so a few drops are benign; a
+    /// sustained rate means the redeemer is not keeping up with fan-out.
+    redeem_hint_dropped => redeem_hints_dropped.inc();
+
+    /// A download-receipt audit write was dropped because the bounded writer
+    /// queue was full (`try_send` → `Full`, #803). Audit-only, so a drop never
+    /// affects settlement; a sustained rate means the writer is not keeping up
+    /// with disk I/O and audit records are being lost.
+    receipt_write_dropped => receipt_writes_dropped.inc();
+
+    /// A redemption attempt (`try_redeem`) failed with an RPC/receipt error
+    /// (#751). Pairs with the `warn!` in `redeemer_loop`.
+    redemption_failure => redemption_failures.inc();
+
+    /// A buyer-side reclaim-sweep attempt (`try_reclaim`) failed — an RPC/receipt
+    /// error, an on-chain revert, or a failed store write when clearing the local
+    /// record (#906). Pairs with the per-attempt `warn!` in `try_reclaim` and the
+    /// threshold `error!` in `reclaim_once`.
+    buyer_reclaim_failure => buyer_reclaim_failures.inc();
+
+    /// The idle-reconcile sweep cooperatively closed one idle buyer channel,
+    /// reclaiming its deposit early (#972).
+    buyer_reconcile_settled => buyer_reconcile_settled.inc();
+
+    /// The reconcile sweep escalated an idle channel to a **unilateral**
+    /// `closeChannel` because the provider was unreachable for a cooperative
+    /// close — deregistered, or timing out repeatedly (#988/#989). The
+    /// timeout-shaped-unreachability bucket, distinct from
+    /// `buyer_unilateral_close_rpc_failure`.
+    buyer_unilateral_close_unreachable => buyer_unilateral_close_unreachable.inc();
+
+    /// A unilateral `closeChannel` did not secure the claim — the RPC
+    /// send/receipt errored or the tx reverted on-chain (#988/#989). An
+    /// infrastructure/on-chain fault, not provider unreachability.
+    buyer_unilateral_close_rpc_failure => buyer_unilateral_close_rpc_failure.inc();
+
+    /// A unilateral `closeChannel` landed, opening the dispute window for the
+    /// buyer settle sweep to reclaim the deposit early (#988).
+    buyer_unilateral_close_ok => buyer_unilateral_close_ok.inc();
+
+    /// A buyer `settleChannel` finalization landed, or re-read the channel as
+    /// already-`Closed` (a co-settler finalized first) — either way the buyer's
+    /// deposit refund is recovered (#988).
+    buyer_settle_ok => buyer_settle_ok.inc();
+
+    /// A buyer `settleChannel` finalization did not finalize this sweep and was
+    /// left for the next — a transient RPC fault, a dispute-extended re-stamp,
+    /// an unresolved revert, or a pending store-write failure (#988).
+    buyer_settle_deferred => buyer_settle_deferred.inc();
+
+    /// A background low-water top-up (#1146) landed: a reused buyer channel below
+    /// its 20% low-water mark was re-funded to the working deposit. Pairs with the
+    /// `info!` in `spawn_refill_if_low`.
+    buyer_topup_ok => buyer_topup_ok.inc();
+
+    /// A background low-water top-up (#1146) did not cleanly land — the allowance
+    /// re-approval or the `topUp` submit/receipt errored or reverted, OR the `topUp`
+    /// landed on-chain but the local row vanished/rotated during the RPC
+    /// (`DepositOutcome::UnknownProvider` / `ChannelMismatch`, i.e. escrowed-but-
+    /// untracked). Folding the untracked case in here keeps stranded deposits
+    /// visible on this counter. Best-effort, so the channel is left un-topped; pairs
+    /// with the `warn!` (or `top_up`'s own error!/warn!) around the call in
+    /// `spawn_refill_if_low`.
+    buyer_topup_failure => buyer_topup_failure.inc();
+
+    /// An auto-settlement trigger fired and the seller path `closeChannel`d a
+    /// channel to secure its un-redeemed balance on-chain (#742). Pairs with
+    /// the `info!` in `try_redeem`.
+    settlement_auto_triggered => settlement_auto_triggered.inc();
+
+    /// An auto-settlement trigger fired but the `closeChannel` did NOT secure
+    /// the balance — the submit failed or the receipt reverted/errored (#742).
+    /// Pairs with the `warn!` in `try_auto_settle_close`. Kept distinct from
+    /// `settlement_auto_triggered` so a fire-vs-secured ratio is computable.
+    settlement_auto_failure => settlement_auto_failures.inc();
+
+    /// A `settleChannel` finalization sweep landed: the dispute window cleared,
+    /// the provider remainder routed through the `FeeRouter`, and the pending
+    /// entry was dropped (#810). Pairs with the success `info!` in `try_settle`.
+    settlement_finalize_ok => settlement_finalize_ok.inc();
+
+    /// A `settleChannel` finalization sweep could not submit — `send()` errored
+    /// on a transient RPC/network fault and the entry is retried next sweep
+    /// (#810). Pairs with the send-arm `warn!` in `try_settle`.
+    settlement_finalize_transient_send => settlement_finalize_transient_send.inc();
+
+    /// A `settleChannel` finalization sweep submitted but `get_receipt()`
+    /// errored before a receipt was seen — a transient RPC fault, retried next
+    /// sweep (#810). Pairs with the receipt-arm `warn!` in `try_settle`.
+    settlement_finalize_transient_receipt => settlement_finalize_transient_receipt.inc();
+
+    /// A `settleChannel` finalization sweep reverted on-chain
+    /// (`receipt.status() == false`, #810). Raw revert count; the cause is
+    /// classified afterward by `drop_pending_if_finalized` into the
+    /// `settlement_finalize_confirmed_closed` / `_restamped` / `_confirm_failed`
+    /// counters. Pairs with the revert-arm `warn!` in `try_settle`.
+    settlement_finalize_reverted => settlement_finalize_reverted.inc();
+
+    /// A reverted `settleChannel` re-read as already-`Closed`: a co-settler
+    /// finalized first, the obligation is retired (#810). The benign
+    /// co-settler-race case. Pairs with the `Closed`-arm `info!` in
+    /// `drop_pending_if_finalized`.
+    settlement_finalize_confirmed_closed => settlement_finalize_confirmed_closed.inc();
+
+    /// A reverted `settleChannel` re-read as still-`Closing`: a dispute
+    /// extended the window, the gate is re-stamped and retried (#810). Benign.
+    /// Pairs with the `Closing`-arm re-stamp in `drop_pending_if_finalized`.
+    settlement_finalize_restamped => settlement_finalize_restamped.inc();
+
+    /// A reverted `settleChannel` left unresolved: the confirming `getChannel`
+    /// re-read errored, or returned an unexpected non-terminal status, so the
+    /// entry is kept (#810) — the genuinely-degraded signal. Pairs with the
+    /// read-error and unexpected-status `warn!`s in `drop_pending_if_finalized`.
+    settlement_finalize_confirm_failed => settlement_finalize_confirm_failed.inc();
+
+    /// A finalization-path pending-settle store write (`forget_pending` or a
+    /// re-stamp `record_pending`) returned a `StoreError` and was swallowed
+    /// (#810). Pairs with the persist-failure `warn!` sites in
+    /// `forget_pending_logged` / `restamp_pending_logged`.
+    settlement_pending_persist_failure => settlement_pending_persist_failures.inc();
+
+    /// The settlement watcher hit a channel-lifecycle persist failure
+    /// (`register_open_channel` / `update_channel_deposit` / `forget_channel`,
+    /// #751), in `SettlementSink::apply` (`payment_settlement.rs`). Only the
+    /// `forget_channel` arm is swallowed, and it carries the sole per-site
+    /// `warn!` ("failed to forget settled channel"); the other arms return `Err`,
+    /// so their context surfaces in `resumable_watcher::run`'s loop-level
+    /// `warn!` ("watcher RPC error; restarting after backoff") instead.
+    watcher_persist_failure => watcher_persist_failures.inc();
+
+    /// A distinct slash against this node's operator was detected by the slash
+    /// watcher (#1032). Counts each `slashId` once (backfill + live dedup).
+    slash_detected => slashes_detected.inc();
+
+    /// A `nodeIdOf(operator)` resolution for an operator-indexed event failed,
+    /// dropping the membership change (#788, [`crate::dht::chain_staker_set`]).
+    /// Bumps `staker_set_watcher_resolve_failures_total`. Pairs with the
+    /// per-failure `warn!` in [`crate::dht::capacity_bond_registry`]'s
+    /// `RegistrySink::on_operator_change`.
+    staker_set_watcher_resolve_failure => staker_set_watcher_resolve_failures.inc();
+
+    /// Publish the current cached active-staker set size (#783). Sampled on
+    /// every membership change the watcher applies, so the gauge tracks the
+    /// cached view — which under a watcher outage is exactly the (possibly
+    /// stale) set that admission decisions read.
+    staker_set_active_count(count: usize) => staker_set_active_count.set(sat(count));
+
+    /// Publish the current cached `NodeId → operator address` binding count
+    /// (#831). Sampled on every binding change the node-address watcher applies,
+    /// so it tracks the cached view the pull path resolves against.
+    node_address_directory_size(count: usize) => node_address_directory_size.set(sat(count));
+
+    /// A node-to-node pull orchestration found ≥1 candidate and is attempting a
+    /// fill (#831).
+    node_pull_attempt => node_pull_attempts.inc();
+
+    /// A node-to-node pull delivered verified bytes (#831).
+    node_pull_success => node_pull_success.inc();
+
+    /// A cache miss surfaced no provider from discovery (#831).
+    node_pull_no_providers => node_pull_no_providers.inc();
+
+    /// A DHT lookup was truncated at `MAX_LOOKUP_ROUNDS` while still finding closer nodes
+    /// (#1145 review). A sustained rate means the ceiling is too low for the network size.
+    dht_lookup_round_ceiling => dht_lookup_round_ceiling.inc();
+
+    /// An upstream served hash-mismatched bytes for a paid pull (#831).
+    node_pull_corruption => node_pull_corruption.inc();
+
+    /// A probe or pull to a candidate failed at the transport (#831).
+    node_pull_unreachable => node_pull_unreachable.inc();
+
+    /// A probed peer claimed this node's own region but exceeded the ADR 030
+    /// latency ceiling, so it took the local reputation penalty (#1177).
+    node_region_latency_penalty => node_region_latency_penalty.inc();
+
+    /// A buyer channel open/reuse failed before a pull could start (#831).
+    node_pull_channel_open_failure => node_pull_channel_open_failures.inc();
+
+    /// A selected upstream claimed a `total_bytes` above this node's
+    /// `max_blob_size` ceiling and the buyer rejected it before buffering
+    /// (#840). A buyer-side policy decision, so it does not score the provider.
+    node_pull_too_large => node_pull_too_large.inc();
+
+    /// Record a paid-delivery (`serve_stream`) request refused because the
+    /// blob was evicted between probe and stream (#876).
+    serve_stream_rejected_evicted_since_probe => serve_stream_rejected_evicted_since_probe.inc();
+
+    /// Record a `serve_stream` request refused on a cache miss that
+    /// pull-through could not fill (#876).
+    serve_stream_rejected_cache_miss => serve_stream_rejected_cache_miss.inc();
+
+    /// Record a `serve_stream` request refused by a local store fault,
+    /// surfaced as `InternalError` (#876).
+    serve_stream_rejected_internal_error => serve_stream_rejected_internal_error.inc();
+
+    /// Record a `serve_stream` request refused because the blob exceeds
+    /// `max_blob_size_bytes` (#876).
+    serve_stream_rejected_blob_too_large => serve_stream_rejected_blob_too_large.inc();
+
+    /// Record a `serve_stream` request refused on an unknown channel (#876).
+    serve_stream_rejected_unknown_channel => serve_stream_rejected_unknown_channel.inc();
+
+    /// Record a `serve_stream` request refused because the client binding did
+    /// not authorize the named channel (#876).
+    serve_stream_rejected_owner_mismatch => serve_stream_rejected_owner_mismatch.inc();
+
+    /// Record a `serve_stream` cache-miss refused by the pre-flight deposit guard
+    /// (#856): the requesting channel could not cover the worst-case blob cost,
+    /// so no upstream pull was started.
+    serve_stream_rejected_insufficient_deposit => serve_stream_rejected_insufficient_deposit.inc();
+
+    /// Record a `serve_stream` cache-miss refused by the authorized-origin gate
+    /// (#821): `pull_through_require_authorized_origin` is on and the hash's
+    /// namespace has no authorized origin, so no upstream pull was started.
+    serve_stream_rejected_unauthorized_origin => serve_stream_rejected_unauthorized_origin.inc();
+
+    /// Record a `serve_stream` delivery refused because the channel has a signed
+    /// cooperative-close waiver (ADR 003 §Cooperative close).
+    serve_stream_rejected_cooperative_close_signed
+        => serve_stream_rejected_cooperative_close_signed.inc();
+
+    /// Record a `serve_stream` delivery refused because the requested bounded
+    /// range is out of bounds for the blob (ADR 005 §Bounded byte ranges).
+    serve_stream_rejected_range_not_satisfiable
+        => serve_stream_rejected_range_not_satisfiable.inc();
+
+    /// The window-paced serve loop paused the upstream pull at `pull_ahead_bytes`
+    /// to wait for the downstream voucher to clear (#856).
+    node_pull_through_window_paused => node_pull_through_window_paused.inc();
+
+    /// A speculative pull-through was refused/paused by the node-wide
+    /// unrecouped-leech budget (#856).
+    node_pull_through_leech_budget_paused => node_pull_through_leech_budget_paused.inc();
+
+    /// A speculative pull-through was refused because a peer exceeded its
+    /// `share_ratio` ceiling (#856).
+    node_pull_through_share_ratio_paused => node_pull_through_share_ratio_paused.inc();
+
+    /// A window-paced serve was abandoned because the requesting client dropped
+    /// or underpaid mid-pull (#856).
+    node_pull_through_client_abandoned => node_pull_through_client_abandoned.inc();
+
+    /// A window-paced serve delivered the full blob but failed to promote it into
+    /// the local cache (#856).
+    node_pull_through_tee_finalize_failed => node_pull_through_tee_finalize_failed.inc();
+
+    /// A window-paced serve forwarded an upstream stream that failed its whole-blob
+    /// hash check at finalization (#856).
+    node_pull_through_upstream_verify_failed => node_pull_through_upstream_verify_failed.inc();
+
+    /// A window-paced serve aborted because a local cache-tee write of an
+    /// already-paid upstream chunk failed (#856) — a store fault, not a downstream
+    /// client drop.
+    node_pull_through_local_tee_failed => node_pull_through_local_tee_failed.inc();
+
+    /// A per-pull prefetch-ledger delta overflowed `u64` and was clamped to `0`
+    /// (#820) — a signal of upstream voucher-accounting corruption.
+    node_pull_delta_overflow => node_pull_delta_overflow.inc();
+
+    /// A buyer→upstream pull hit this node's own `pull_timeout` deadline (#857).
+    /// A buyer-side condition, so it does not score the provider's reputation.
+    node_pull_timeout => node_pull_timeout.inc();
+
+    /// An upstream rejected a voucher this node presented mid-pull (#857) — a
+    /// buyer payment-side fault, so it does not score the provider's reputation.
+    node_pull_voucher_rejected => node_pull_voucher_rejected.inc();
+
+    /// A channel was settled on-chain (`CooperativeCloseSigned`), so its row was dropped
+    /// and the next pull to that provider opens a fresh one (#1145 review).
+    node_pull_channel_retired => node_pull_channel_retired.inc();
+
+    /// A channel can no longer pay but its deposit is still escrowed, so the row was KEPT
+    /// for the reclaim sweep and the provider suppressed instead (#1145 review). Money at
+    /// rest — see the counter's docs.
+    node_pull_channel_wedged => node_pull_channel_wedged.inc();
+
+    /// The store write retiring a settled channel's row failed (#1145 review).
+    node_pull_channel_retire_failure => node_pull_channel_retire_failure.inc();
+
+    /// A selected upstream refused delivery up front (#1144). Counts every wire
+    /// code; only `InternalError` also scores the provider's reputation.
+    node_pull_refused => node_pull_refused.inc();
+
+    /// An upstream went silent mid-stream (#1134); the pull was abandoned and the
+    /// provider scored `Unreachable`.
+    node_pull_stalled => node_pull_stalled.inc();
+
+    /// A pull failed for a LOCAL reason (#1145 review) — signer, encode, range — so
+    /// the upstream was exonerated. Says nothing about the network; any sustained
+    /// rate means this node cannot pay for anything.
+    node_pull_local_fault => node_pull_local_fault.inc();
+
+    /// A buyer channel open outlived the per-candidate budget (#1143). The open
+    /// continues in the background; the pull moves on. No reputation effect.
+    node_pull_channel_open_pending => node_pull_channel_open_pending.inc();
+
+    /// A pull paid ≥1 voucher but persisting the buyer channel resume watermark
+    /// failed (#852); the channel's stored progress now lags the upstream.
+    node_pull_progress_persist_failure => node_pull_progress_persist_failures.inc();
+
+    /// A paid voucher's watermark was DROPPED because the provider's channel slot had
+    /// been replaced by a newer open before the write landed (#1145 review).
+    node_pull_progress_dropped => node_pull_progress_dropped.inc();
+
+    /// A concurrent settle on the shared channel ledger persisted a higher watermark first, so
+    /// this write was superseded (benign under `BuyerLedgers`; #1145 review).
+    node_pull_progress_superseded => node_pull_progress_superseded.inc();
+
+    /// The delivery handler abandoned a pull-through at its deadline (#831).
+    node_pull_through_timeout => node_pull_through_timeouts.inc();
+
+    /// A cache-engine error (not a clean miss) was hit filling a miss (#831).
+    node_pull_through_error => node_pull_through_errors.inc();
+
+    /// A detached background cache-fill was spawned after the foreground
+    /// delivery deadline fired (#859).
+    node_pull_through_background_spawned => node_pull_through_background_spawned.inc();
+
+    /// A background cache-fill was shed because the in-flight warms already reserve the
+    /// whole memory budget (#1145 review). Speculative work dropped under load; the hash
+    /// stays unclaimed, so a later miss retries it.
+    node_pull_through_background_shed => node_pull_through_background_shed.inc();
+
+    /// A background cache-fill populated the blob into the store (#859).
+    node_pull_through_background_succeeded => node_pull_through_background_succeeded.inc();
+
+    /// A background cache-fill failed on a FAULT — a store/IO error, unverifiable bytes, a
+    /// broken origin, or the absolute cap (#859). Alertable; a clean miss is not counted
+    /// here (#1145 review).
+    node_pull_through_background_failed => node_pull_through_background_failed.inc();
+
+    /// A background cache-fill found nothing to warm — no provider, or no origin (#1145
+    /// review). Routine, and kept out of `..._failed_total` so that counter can be alerted
+    /// on.
+    node_pull_through_background_missed => node_pull_through_background_missed.inc();
+
+    /// A background cache-fill task PANICKED (#1145 review). Nothing awaits these tasks, so
+    /// this counter is the only trace one leaves. Any non-zero value is a bug in this node.
+    node_pull_through_background_panicked => node_pull_through_background_panicked.inc();
+
+    /// A background cache-fill was abandoned at shutdown (#1145 review). Not a failure —
+    /// counted so `spawned == succeeded + missed + failed + cancelled + panicked` balances.
+    node_pull_through_background_cancelled => node_pull_through_background_cancelled.inc();
+
+    /// Bump `reputation_indexer_rpc_failures_total` (#326): an indexer event
+    /// stream errored or a `nodeIdOf` resolution RPC failed. Pairs with the
+    /// per-failure `warn!` in `crate::reputation_indexer`.
+    reputation_indexer_rpc_failure => reputation_indexer_rpc_failures.inc();
+
+    /// Bump `reputation_indexer_settlements_credited_total` (#326) by `n` party
+    /// creditings applied for one settlement (0, 1, or 2).
+    reputation_indexer_settlements_credited(n: u64)
+        => reputation_indexer_settlements_credited.inc_by(n);
+
+    /// Bump `reputation_indexer_amount_overflows_total` (#326): a settlement
+    /// amount exceeded `u128` and was skipped (not saturated).
+    reputation_indexer_amount_overflow => reputation_indexer_amount_overflows.inc();
+
+    /// A `getOrigins` / `nodeIdOf` resolution failed, leaving an operator
+    /// unmapped in the origin directory (#651). Bumps
+    /// `origin_directory_watcher_resolve_failures_total`.
+    origin_directory_watcher_resolve_failure => origin_directory_watcher_resolve_failures.inc();
+
+    /// The origin-directory bootstrap replay range was inverted
+    /// (`replay_from > latest`) — a stale / lagging RPC head vs. the persisted
+    /// replay checkpoint (#1152). The genesis replay was skipped this boot;
+    /// claimed hashes fall back to the default-open set until the live tail
+    /// re-surfaces claims. Bumps
+    /// `origin_directory_bootstrap_range_anomaly_total`. Pairs with the warn! in
+    /// `bootstrap_cache`.
+    origin_directory_bootstrap_range_anomaly => origin_directory_bootstrap_range_anomaly.inc();
+
+    /// Publish the count of distinct operator addresses currently authorised as
+    /// origins — the union of every namespace's operator set and the
+    /// default-open allow-list (#651). Falls on revoke/prune/remove/replace,
+    /// unlike the monotonic `operator → NodeId` binding cache. The caller
+    /// recomputes this (`authorized_operator_count`) after each set mutation.
+    origin_directory_operator_count(count: usize)
+        => origin_directory_operator_count.set(sat(count));
+    connection_opened => active_connections.inc();
+    connection_closed => active_connections.dec();
+    gossip_published(_topic: &str) => gossip_announces_published_total.inc();
+    gossip_received(_topic: &str) => gossip_announces_received_total.inc();
+    gossip_peer_table_size(n: i64) => gossip_peer_table_size.set(n);
+
+    /// Increment the TTL-eviction counter by the sweeper's evicted count.
+    peer_table_evicted_ttl(n: u64) => peer_table_evicted_ttl.inc_by(n);
+    gossip_reconnected(_topic: &str) => gossip_subscriber_reconnections_total.inc();
+
+    /// Set the RPC health gauge. `true` -> 1 (reachable), `false` -> 0
+    /// (unreachable). Driven by the watchdog task spawned in
+    /// `runtime::run`.
+    rpc_healthy(ok: bool) => rpc_healthy.set(i64::from(ok));
+
+    /// Record a connection rejected by the global concurrency semaphore.
+    dispatch_rejected_global => dispatch_rejected_global.inc();
+
+    /// Record a connection rejected by the per-source rate limiter.
+    dispatch_rejected_per_source => dispatch_rejected_per_source.inc();
+
+    /// Increment the in-flight dispatch permit gauge.
+    dispatch_permit_acquired => dispatch_in_flight.inc();
+
+    /// Decrement the in-flight dispatch permit gauge.
+    dispatch_permit_released => dispatch_in_flight.dec();
+
+    /// Record a relay-only connection accepted while the per-source
+    /// layer was enabled but no peer IP could be resolved at accept
+    /// time.
+    dispatch_per_source_skipped_no_addr => dispatch_per_source_skipped_no_addr.inc();
+
+    /// Record a `cdn/dht/v1` request rejected at the per-peer layer.
+    dht_rate_limit_rejected_per_peer => dht_rate_limit_rejected_per_peer.inc();
+
+    /// Record a `cdn/dht/v1` request rejected at the per-IP layer.
+    dht_rate_limit_rejected_per_ip => dht_rate_limit_rejected_per_ip.inc();
+
+    /// Record a `cdn/dht/v1` request rejected at the global layer.
+    dht_rate_limit_rejected_global => dht_rate_limit_rejected_global.inc();
+
+    /// Record a `retain_recent` sweep of the per-IP DHT keyed-limiter
+    /// map (#645).
+    dht_rate_limit_prune_sweep_per_ip => dht_rate_limit_prune_sweeps_per_ip.inc();
+
+    /// Record a `retain_recent` sweep of the per-peer DHT keyed-limiter
+    /// map (#645).
+    dht_rate_limit_prune_sweep_per_peer => dht_rate_limit_prune_sweeps_per_peer.inc();
+
+    /// Set the per-IP DHT keyed-limiter tracked-size gauge (#645). The
+    /// `try_from(...).unwrap_or(i64::MAX)` clamp matches the existing
+    /// gauge-set pattern elsewhere in this module and stays within the
+    /// workspace's anti-panic policy.
+    dht_rate_limit_tracked_per_ip_set(n: usize) => dht_rate_limit_tracked_per_ip.set(sat(n));
+
+    /// Set the per-peer DHT keyed-limiter tracked-size gauge (#645).
+    dht_rate_limit_tracked_per_peer_set(n: usize) => dht_rate_limit_tracked_per_peer.set(sat(n));
+
+    /// Record a `cdn/probe/v1` request rejected at the per-peer layer.
+    probe_rate_limit_rejected_per_peer => probe_rate_limit_rejected_per_peer.inc();
+
+    /// Record a `cdn/probe/v1` request rejected at the per-IP layer.
+    probe_rate_limit_rejected_per_ip => probe_rate_limit_rejected_per_ip.inc();
+
+    /// Record a `cdn/probe/v1` request rejected at the global layer.
+    probe_rate_limit_rejected_global => probe_rate_limit_rejected_global.inc();
+
+    /// Record a `retain_recent` sweep of the per-IP probe keyed-limiter
+    /// map (#645).
+    probe_rate_limit_prune_sweep_per_ip => probe_rate_limit_prune_sweeps_per_ip.inc();
+
+    /// Record a `retain_recent` sweep of the per-peer probe keyed-limiter
+    /// map (#645).
+    probe_rate_limit_prune_sweep_per_peer => probe_rate_limit_prune_sweeps_per_peer.inc();
+
+    /// Set the per-IP probe keyed-limiter tracked-size gauge (#645).
+    probe_rate_limit_tracked_per_ip_set(n: usize) => probe_rate_limit_tracked_per_ip.set(sat(n));
+
+    /// Set the per-peer probe keyed-limiter tracked-size gauge (#645).
+    probe_rate_limit_tracked_per_peer_set(n: usize)
+        => probe_rate_limit_tracked_per_peer.set(sat(n));
+
+    /// Record a `cdn/dht/v1` request that was admitted by the rate
+    /// limiter but failed after that (frame decode, write, encode,
+    /// timeout, etc).
+    dht_request_failed => dht_requests_failed.inc();
+
+    /// Record a `Store` rejected by the `holder != authenticated NodeId`
+    /// check (ADR 022 §STORE Flow line 140 — lying-holder attack).
+    dht_store_rejected_holder_mismatch => dht_store_rejected_holder_mismatch.inc();
+
+    /// Record a `Store` rejected by the active-staker filter (ADR 022
+    /// §STORE Flow line 140 — non-staked publisher).
+    dht_store_rejected_non_staked => dht_store_rejected_non_staked.inc();
+
+    /// Record a `Store` rejected by the per-publisher quota (ADR 022
+    /// §Content Records and TTL — 200-record hard cap).
+    dht_store_rejected_quota => dht_store_rejected_quota.inc();
+
+    /// Record a `Store` admitted to the record store (newly inserted or
+    /// refreshed).
+    dht_store_accepted => dht_store_accepted.inc();
+
+    /// Record a `BatchStore` that reached per-hash admission (passed
+    /// stage-1 rate limiting + the batch-level holder check, #648).
+    dht_batch_store_received => dht_batch_store_received.inc();
+
+    /// Record `count` `BatchStore` hashes deferred (acked `false`)
+    /// because the two-stage rate-limit budget ran out before reaching
+    /// them (ADR 022 §Batch token accounting, #648).
+    dht_batch_store_hashes_deferred_rate_limit(count: u64)
+        => dht_batch_store_hashes_deferred_rate_limit.inc_by(count);
+
+    /// Record a 0-RTT connection attempt (ADR 015): a cached session
+    /// ticket existed and early data was sent.
+    record_0rtt_attempt => quic_0rtt_attempts.inc();
+
+    /// Record that the server accepted a 0-RTT attempt.
+    record_0rtt_accepted => quic_0rtt_accepted.inc();
+
+    /// Record that the server rejected a 0-RTT attempt and the client
+    /// fell back to a 1-RTT handshake.
+    record_0rtt_rejected => quic_0rtt_rejected.inc();
 }
 
 /// Which side of a `PaymentChannel` the shared settle-finalization helper
