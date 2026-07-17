@@ -36,9 +36,7 @@ use std::path::{Path, PathBuf};
 
 use alloy::primitives::{Address, B256, U256};
 use decdn_common::identity;
-use decdn_incentive::buyer_channel_table::{
-    BUYER_CHANNEL_TABLE_NAME, BuyerChannelTable, BuyerTableDef,
-};
+use decdn_incentive::buyer_channel_table::BuyerChannelTable;
 use decdn_incentive::store::{
     ChannelStateStore, CheckpointKey, KeyedCheckpointStore, PendingSettle, PendingSettleStore,
     StoreError,
@@ -85,21 +83,6 @@ const SANE_TRAILER_MAX_BYTES: usize = 256;
 /// Key: raw `ChannelId` bytes (`[u8; 32]`).
 /// Value: postcard-encoded [`StoredChannelState`] (variable length).
 const CHANNEL_TABLE: TableDefinition<&[u8; 32], &[u8]> = TableDefinition::new("channel_state_v1");
-
-/// redb table holding buyer-side channel bookkeeping (#744), keyed by the
-/// **upstream provider address** so the cache-miss open trigger can reuse an
-/// existing channel instead of opening (and depositing into) a new one. Lives
-/// in the same database file as [`CHANNEL_TABLE`] so both stores share one
-/// `redb::Database` handle and the file-mode hardening — redb forbids two
-/// `Database` handles to the same file, so a second store file would need the
-/// whole #527 open/cleanup path duplicated. The two tables never collide:
-/// distinct names, distinct key widths (`[u8; 20]` here vs `[u8; 32]`).
-///
-/// Key/value types and the name both come from
-/// [`decdn_incentive::buyer_channel_table`], which owns the on-disk contract —
-/// the client's `buyer-channels.redb` declares the same table from the same
-/// constant, so the two cannot drift (#1246).
-const BUYER_CHANNEL_TABLE: BuyerTableDef = TableDefinition::new(BUYER_CHANNEL_TABLE_NAME);
 
 /// redb table holding the pending-settle set (#327 / PR #743 review): channels
 /// this node closed on-chain that await a `settleChannel` finalization once
@@ -612,6 +595,17 @@ fn decode_record(key_bytes: [u8; 32], value_bytes: &[u8]) -> Result<ChannelState
 }
 
 impl ChannelStateStore for PersistentChannelStateStore {
+    /// Hydrate the seller table. A corrupt or forward-schema record **aborts
+    /// startup** — running past it would reopen the #527 voucher-replay window.
+    ///
+    /// This is deliberately the opposite of the *buyer* `load_all`
+    /// ([`decdn_incentive::buyer_channel_table::BuyerChannelTable::load_all`]),
+    /// which logs and skips a bad row because propagating there would stop the
+    /// reclaim sweep spawning and strand every other channel's deposit (PR #753).
+    /// The two policies are both correct and must not be reconciled with each
+    /// other. Since #1246 they live in different crates, so neither one's tests
+    /// will notice if you change this — the note is the only thing connecting
+    /// them.
     fn load_all(&self) -> Result<Vec<ChannelState>, StoreError> {
         let read_txn = self
             .db
@@ -775,34 +769,18 @@ impl PersistentChannelStateStore {
     /// Test/e2e-only: write raw value bytes under a buyer provider key, bypassing
     /// the postcard encoder, to simulate a row left undecodable by a binary
     /// downgrade. The buyer reconciliation + mixed-reclaim e2e (#763) lives in a
-    /// separate integration-test file and cannot reach the private buyer table;
-    /// this is the seam it uses to seed corruption against a live store.
-    #[cfg(any(test, feature = "anvil-e2e"))]
+    /// separate integration-test file and cannot reach the buyer table; this is
+    /// the seam it uses to seed corruption against a live store.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Backend`] if the write or durable commit fails.
     pub fn insert_raw_buyer_record(
         &self,
         provider: Address,
         bytes: &[u8],
     ) -> Result<(), StoreError> {
-        let key: [u8; 20] = provider.into();
-        let mut write_txn = self
-            .db
-            .begin_write()
-            .map_err(|err| StoreError::Backend(format!("begin_write: {err}")))?;
-        write_txn
-            .set_durability(Durability::Immediate)
-            .map_err(|err| StoreError::Backend(format!("set_durability: {err}")))?;
-        {
-            let mut table = write_txn
-                .open_table(BUYER_CHANNEL_TABLE)
-                .map_err(|err| StoreError::Backend(format!("open_table: {err}")))?;
-            table
-                .insert(&key, bytes)
-                .map_err(|err| StoreError::Backend(format!("insert: {err}")))?;
-        }
-        write_txn
-            .commit()
-            .map_err(|err| StoreError::Backend(format!("commit (fsync): {err}")))?;
-        Ok(())
+        BuyerChannelTable::new(&self.db).insert_raw(provider, bytes)
     }
 }
 
@@ -826,12 +804,11 @@ impl BuyerChannelStoreHandle {
 }
 
 impl BuyerChannelStoreHandle {
-    /// Bind the shared buyer-table operations to this store's `channels.redb`
-    /// handle and its own [`BUYER_CHANNEL_TABLE`].
+    /// View this store's `channels.redb` as the buyer table.
     ///
     /// Not `const` — it derefs the `Arc`, which const fns cannot do.
     fn table(&self) -> BuyerChannelTable<'_> {
-        BuyerChannelTable::new(&self.inner.db, BUYER_CHANNEL_TABLE)
+        BuyerChannelTable::new(&self.inner.db)
     }
 }
 
@@ -1884,11 +1861,19 @@ mod tests {
         Ok(())
     }
 
-    /// Each of the seven trait methods must reach its matching shared operation.
-    /// The shared suite proves the operations are correct but structurally cannot
-    /// catch a transposed delegation here (e.g. `forget` wired to
-    /// `forget_if_channel`) — and `buyer_and_seller_tables_are_independent` only
-    /// exercises three of the seven. So call every one through the handle.
+    /// Each of the seven trait methods must reach its matching shared operation
+    /// with its arguments in the right order. The shared suite proves the
+    /// operations are correct but structurally cannot see this file's wiring, and
+    /// `buyer_and_seller_tables_are_independent` exercises only three of seven.
+    ///
+    /// Method-level transpositions are mostly impossible — `forget(Address)`
+    /// cannot be wired to `forget_if_channel(Address, ChannelId) -> bool`, the
+    /// types reject it. The reachable mistake is *argument* order among
+    /// `advance_progress`'s three `U256`s (and `add_deposit`'s), which the
+    /// compiler cannot catch and which silently corrupts a payment watermark. So
+    /// assert the resulting **row**, not just the outcome enum: passing
+    /// `bytes_delivered` where `amount` belongs writes the wrong value into
+    /// `last_amount` while still returning `Advanced`.
     #[test]
     fn buyer_handle_delegates_every_op() -> anyhow::Result<()> {
         let dir = data_dir()?;
@@ -1922,6 +1907,32 @@ mod tests {
             handle.add_deposit(s.provider, s.channel_id, U256::from(7u64))?
                 == DepositOutcome::Added(s.deposit + U256::from(7u64)),
             "add_deposit"
+        );
+
+        // The outcomes above are all reachable with the U256 arguments permuted;
+        // only the row proves each landed in its own field.
+        let row = handle
+            .get_by_provider(s.provider)?
+            .ok_or_else(|| anyhow::anyhow!("row vanished"))?;
+        anyhow::ensure!(
+            row.last_nonce == s.last_nonce + U256::from(1u64),
+            "last_nonce = {}",
+            row.last_nonce
+        );
+        anyhow::ensure!(
+            row.last_bytes_delivered == s.last_bytes_delivered + U256::from(1_024u64),
+            "last_bytes_delivered = {}",
+            row.last_bytes_delivered
+        );
+        anyhow::ensure!(
+            row.last_amount == s.last_amount + U256::from(10u64),
+            "last_amount = {}",
+            row.last_amount
+        );
+        anyhow::ensure!(
+            row.deposit == s.deposit + U256::from(7u64),
+            "deposit = {}",
+            row.deposit
         );
 
         // forget_if_channel: wrong id keeps the row, right id deletes it.

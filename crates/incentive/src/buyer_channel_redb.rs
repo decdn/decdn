@@ -6,39 +6,30 @@
 //! pending-settle, and watcher-checkpoint tables, because `redb` forbids two
 //! `Database` handles on one file.
 //!
-//! That file ownership — plus the guards on
-//! [`open`](crate::buyer_channel_redb::RedbBuyerChannelStore::open) — is **all**
+//! That file ownership — plus the guards on [`RedbBuyerChannelStore::open`] — is
+//! **all**
 //! this module contributes. The record codec and every table operation live in
 //! [`crate::buyer_channel_table`], which the node's store delegates to as well,
 //! so the two cannot drift in on-disk format or in advance/deposit semantics
 //! (#1246). Before that, this module carried its own byte-identical copy of
 //! both, kept in sync by hand.
 //!
-//! (Links are fully qualified because rustdoc merges the outer `///` on this
-//! module's `lib.rs` declaration with these `//!` docs and resolves the result
-//! in *that* scope.)
-//!
 //! Gated behind the `redb` feature so non-client consumers of `decdn-incentive`
-//! (the contracts/voucher logic) don't pull `redb`/`postcard`. The shared table
-//! sits behind `buyer-store-core`, which this feature implies.
+//! (the contracts/voucher logic) don't link `redb`. The shared table sits behind
+//! `buyer-store-core`, which this feature implies.
 
 use std::path::Path;
 
 use alloy::primitives::{Address, U256};
-use redb::{Database, TableDefinition};
+use redb::Database;
 
 use crate::buyer_channel::{AdvanceOutcome, BuyerChannelState, BuyerChannelStore, DepositOutcome};
-use crate::buyer_channel_table::{BUYER_CHANNEL_TABLE_NAME, BuyerChannelTable, BuyerTableDef};
+use crate::buyer_channel_table::BuyerChannelTable;
 use crate::channel::ChannelId;
 use crate::store::StoreError;
 
 /// File name of the buyer-channel redb database within the data dir.
 const BUYER_CHANNELS_DB_FILE: &str = "buyer-channels.redb";
-
-/// This store's handle on the shared buyer table. Declared from
-/// [`BUYER_CHANNEL_TABLE_NAME`] so the on-disk name has exactly one definition
-/// across both buyer stores.
-const BUYER_CHANNEL_TABLE: BuyerTableDef = TableDefinition::new(BUYER_CHANNEL_TABLE_NAME);
 
 /// Buyer-only `redb`-backed [`BuyerChannelStore`]. One redb file, one table;
 /// every mutating call fsyncs on commit (`Durability::Immediate`).
@@ -48,6 +39,13 @@ pub struct RedbBuyerChannelStore {
 }
 
 impl RedbBuyerChannelStore {
+    /// Open (or create) the buyer-channel store at `<data_dir>/buyer-channels.redb`,
+    /// creating `data_dir` with hardened permissions first.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Backend`] if the data dir cannot be created/hardened or
+    /// redb cannot open the database.
     pub fn open(data_dir: &Path) -> Result<Self, StoreError> {
         decdn_common::identity::ensure_data_dir(data_dir)
             .map_err(|err| StoreError::Backend(format!("ensure data dir: {err}")))?;
@@ -84,7 +82,7 @@ impl RedbBuyerChannelStore {
 
     /// Bind the shared table operations to this store's database.
     const fn table(&self) -> BuyerChannelTable<'_> {
-        BuyerChannelTable::new(&self.db, BUYER_CHANNEL_TABLE)
+        BuyerChannelTable::new(&self.db)
     }
 }
 
@@ -229,10 +227,15 @@ mod tests {
         Ok(())
     }
 
-    /// Each of the seven trait methods must reach its matching shared operation.
-    /// The shared suite proves the operations are correct but cannot catch a
-    /// transposed delegation here (e.g. `forget` wired to `forget_if_channel`),
-    /// so exercise every one through the real store.
+    /// Each of the seven trait methods must reach its matching shared operation
+    /// with its arguments in the right order — the shared suite proves the
+    /// operations are correct but cannot see this store's wiring.
+    ///
+    /// Method-level transpositions are mostly impossible (the types reject
+    /// `forget` wired to `forget_if_channel`). The reachable mistake is *argument*
+    /// order among `advance_progress`'s three `U256`s, which the compiler cannot
+    /// catch and which silently corrupts a payment watermark — so assert the
+    /// resulting **row**, not just the outcome enum.
     #[test]
     fn store_delegates_every_op() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
@@ -264,6 +267,32 @@ mod tests {
             store.add_deposit(s.provider, s.channel_id, U256::from(7u64))?
                 == DepositOutcome::Added(s.deposit + U256::from(7u64)),
             "add_deposit"
+        );
+
+        // The outcomes above are all reachable with the U256 arguments permuted;
+        // only the row proves each landed in its own field.
+        let row = store
+            .get_by_provider(s.provider)?
+            .ok_or_else(|| anyhow::anyhow!("row vanished"))?;
+        anyhow::ensure!(
+            row.last_nonce == U256::from(2u64),
+            "last_nonce = {}",
+            row.last_nonce
+        );
+        anyhow::ensure!(
+            row.last_bytes_delivered == U256::from(2_000u64),
+            "last_bytes_delivered = {}",
+            row.last_bytes_delivered
+        );
+        anyhow::ensure!(
+            row.last_amount == U256::from(20u64),
+            "last_amount = {}",
+            row.last_amount
+        );
+        anyhow::ensure!(
+            row.deposit == s.deposit + U256::from(7u64),
+            "deposit = {}",
+            row.deposit
         );
 
         // forget_if_channel: wrong id leaves the row, right id deletes it.

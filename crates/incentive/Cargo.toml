@@ -8,23 +8,33 @@ description = "Payment channels, bonding, and voucher management for deCDN"
 
 [features]
 # Shared buyer-channel redb table (`buyer_channel_table`, #1246): the on-disk
-# record codec plus the table operations, parameterized over the caller's
-# `redb::Database` + `TableDefinition`. The node's combined seller+buyer
-# `channels.redb` store enables *only* this and keeps its own file, table const,
-# and per-op transaction wiring (redb forbids two `Database` handles on one
-# file), so both buyer stores share one definition of the on-disk format without
-# the node adopting `RedbBuyerChannelStore`.
+# record codec plus the table operations, over a caller-supplied
+# `redb::Database`. The node's combined seller+buyer `channels.redb` store
+# enables *only* this and keeps its own file + per-op transaction wiring (redb
+# forbids two `Database` handles on one file), so both buyer stores share one
+# definition of the on-disk format without the node adopting
+# `RedbBuyerChannelStore`.
 #
-# NOTE: `dep:redb` must stay spelled here. It is what suppresses Cargo's
-# implicit `redb` feature for the optional dependency of the same name; drop it
-# and that implicit feature collides with the explicit `redb` feature below.
+# NOTE: `dep:redb` must stay spelled here. An optional dependency has to be
+# referenced as `dep:<name>` by some feature or Cargo rejects the manifest
+# outright ("optional dependency `redb` is not included in any feature"), and
+# the explicit `redb` feature below shadows the name so it cannot serve that
+# role itself.
 buyer-store-core = ["dep:redb", "dep:postcard"]
 # Persistent buyer-only store (`buyer_channel_redb`): adds
 # `RedbBuyerChannelStore` (its own `buyer-channels.redb` file + open guards) on
 # top of the shared table. Off by default so the contracts/voucher logic doesn't
-# pull redb/postcard; the CLI (`decdn fetch`, #940) enables it for
-# cross-invocation channel reuse.
+# link `redb`; the CLI (`decdn fetch`, #940) enables it for cross-invocation
+# channel reuse. (Only `redb` is avoided — `postcard` arrives unconditionally
+# via `decdn-protocol` no matter what is enabled here.)
 redb = ["buyer-store-core"]
+# Exposes `BuyerChannelTable::insert_raw`, which writes raw bytes past the
+# encoder to seed an undecodable row. Gated so a corruption-seeding writer stays
+# out of the shipped API, but NOT `#[cfg(test)]`: a cross-crate `cfg(test)` does
+# not propagate, and `decdn-node`'s `insert_raw_buyer_record` seam (its #763
+# reconciliation e2e) has to reach it. Enabled from downstream
+# `[dev-dependencies]` — same pattern as `decdn-client-pull`'s `test-util`.
+test-util = []
 
 [dependencies]
 decdn-common = { workspace = true }

@@ -6,33 +6,24 @@
 //! differ only in *which file they own*:
 //!
 //! - `buyer_channel_redb::RedbBuyerChannelStore` owns a buyer-only
-//!   `buyer-channels.redb` for the client (`decdn fetch`, #940).
+//!   `buyer-channels.redb` for the client (`decdn fetch`, #940). (Code span, not
+//!   a link: that module exists only under the `redb` feature, so linking it
+//!   would break a `buyer-store-core`-only doc build.)
 //! - `decdn-node`'s `channel_store::PersistentChannelStateStore` owns a combined
 //!   `channels.redb` holding the seller, buyer, pending-settle, and
 //!   watcher-checkpoint tables — one file, because `redb` forbids two
 //!   `Database` handles on the same file.
 //!
 //! That is a file-ownership difference, not a logic difference, so both stores
-//! keep their own `Database` + `TableDefinition` and delegate the actual work to
-//! [`BuyerChannelTable`](crate::buyer_channel_table::BuyerChannelTable). Before
-//! #1246 each store carried its own copy of this code, and the
-//! byte-compatibility contract between them was asserted only by a doc comment;
-//! now it is the same code, and
-//! `tests::encode_is_byte_stable` pins the bytes.
+//! supply only their own `Database` and delegate the actual work to
+//! [`BuyerChannelTable`]. Before #1246 each store carried its own copy of this
+//! code, and the byte-compatibility contract between them was asserted only by a
+//! doc comment; now it is the same code, and `tests::encode_is_byte_stable` pins
+//! the bytes.
 //!
 //! The operations here never assume they own the file or that the buyer table is
 //! the only table in it — that is what makes the node's multi-table layout safe
 //! to serve from the same code.
-//!
-//! Two doc-link constraints, both easy to trip and both invisible in the
-//! workspace-wide CI doc job: `buyer_channel_redb` is named as a code span
-//! rather than linked because it exists only under the `redb` feature (linking
-//! it breaks a `buyer-store-core`-only doc build, which feature unification
-//! hides); and links here are fully qualified because rustdoc merges the outer
-//! `///` on this module's `lib.rs` declaration with these `//!` docs and
-//! resolves the result in *that* scope.
-
-use std::fmt;
 
 use alloy::primitives::{Address, B256, U256};
 use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
@@ -42,26 +33,26 @@ use crate::buyer_channel::{AdvanceOutcome, BuyerChannelState, DepositOutcome};
 use crate::channel::ChannelId;
 use crate::store::StoreError;
 
-/// Name of the `redb` table holding buyer channel state.
+/// The buyer table: name, key type, and value type.
 ///
-/// **Frozen on-disk identifier.** Changing it orphans every existing record in
-/// both the node's `channels.redb` and the client's `buyer-channels.redb`. Each
-/// store declares its own [`TableDefinition`] from this constant — the *file*
-/// wiring cannot be shared, but the name must not be typed twice.
+/// **The whole thing is a frozen on-disk identifier**, and it is deliberately
+/// private and non-configurable. Changing the name orphans every existing record
+/// in both the node's `channels.redb` and the client's `buyer-channels.redb`;
+/// changing the key/value types breaks them harder still, because `redb`
+/// persists key/value *type names* in the table metadata and refuses to open a
+/// table whose types don't match — at runtime, not compile time.
+///
+/// Callers supply the `Database` (the one thing they legitimately differ on) and
+/// nothing else. An earlier draft let each store pass its own `TableDefinition`;
+/// that parameter had exactly one valid inhabitant, and a typo'd name would have
+/// compiled, read an empty table, and told the reclaim sweep there was nothing to
+/// reclaim. A frozen global is not a per-call knob.
 ///
 /// The `_v1` suffix is a version tag: a future breaking layout change ships as
 /// `_v2` with a one-shot migration on open, while additive changes stay on `_v1`
 /// (decode tolerates unknown trailing bytes).
-pub const BUYER_CHANNEL_TABLE_NAME: &str = "buyer_channel_state_v1";
-
-/// The buyer table's `redb` type signature: key = raw provider [`Address`] bytes
-/// (`[u8; 20]`), value = the postcard-encoded record (variable length).
-///
-/// Part of the on-disk contract, not a convenience alias: `redb` persists the
-/// key/value **type names** in the table metadata and refuses to open a table
-/// whose types don't match. Widening `&[u8; 20]` to `Vec<u8>` would break every
-/// store written by an older binary — at runtime, not compile time.
-pub type BuyerTableDef = TableDefinition<'static, &'static [u8; 20], &'static [u8]>;
+const BUYER_CHANNEL_TABLE: TableDefinition<'static, &'static [u8; 20], &'static [u8]> =
+    TableDefinition::new("buyer_channel_state_v1");
 
 /// Highest buyer-record `schema_version` this binary can decode. Independent of
 /// the node's seller table — the buyer table is new in #744 with no legacy
@@ -175,53 +166,41 @@ fn decode_record(key_bytes: [u8; 20], value_bytes: &[u8]) -> Result<BuyerChannel
     stored.into_state()
 }
 
-/// A borrowed view of one buyer-channel table inside a caller-owned
-/// [`Database`]. Zero-cost: a `&Database` plus a `Copy` table handle.
+/// `db` viewed as the buyer-channel table: a typed capability over a caller-owned
+/// [`Database`]. Zero-cost — it borrows and owns nothing, and does no I/O until a
+/// method is called. Construct one per operation.
 ///
-/// Binding `(db, table)` once here — rather than threading both through every
-/// operation — keeps the pairing invariant in one place and keeps
-/// `advance_progress` under `clippy::too_many_arguments`.
-///
-/// Construct one per operation; it borrows, owns nothing, and does no I/O until
-/// a method is called.
+/// The *file* is the only thing the two buyer stores legitimately differ on, so
+/// it is the only thing this takes. Everything else about the table — name, key
+/// type, value type, record codec — is frozen in this module (see the private
+/// `BUYER_CHANNEL_TABLE`).
+#[derive(Debug)]
 pub struct BuyerChannelTable<'a> {
     db: &'a Database,
-    table: BuyerTableDef,
-}
-
-// `redb::TableDefinition` implements `Display` but not `Debug`, so the
-// workspace's `missing_debug_implementations` lint needs this by hand.
-impl fmt::Debug for BuyerChannelTable<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("BuyerChannelTable")
-            .field("table", &redb::TableHandle::name(&self.table))
-            .finish_non_exhaustive()
-    }
 }
 
 impl<'a> BuyerChannelTable<'a> {
-    /// Bind the shared buyer-table operations to `db`'s `table`.
-    ///
-    /// `table` must be declared from [`BUYER_CHANNEL_TABLE_NAME`]; the type
-    /// signature pins the key/value types ([`BuyerTableDef`]).
+    /// View `db` as the buyer-channel table.
     #[must_use]
-    pub const fn new(db: &'a Database, table: BuyerTableDef) -> Self {
-        Self { db, table }
+    pub const fn new(db: &'a Database) -> Self {
+        Self { db }
     }
 
     /// `true` if the table exists, `false` if the store was never written. Lets
     /// the no-row operations avoid implicitly creating it —
     /// `WriteTransaction::open_table` would.
     ///
-    /// Benign TOCTOU: another writer may create the table between this check and
-    /// the write txn; the op then falls through to a `get` miss and returns the
-    /// same no-row outcome.
+    /// Benign TOCTOU: a concurrent writer may create the table *and* insert a row
+    /// after this returns `false`, so the caller reports `UnknownProvider` /
+    /// `false` for a provider that by then has a row. Harmless — it linearizes as
+    /// "our op ran first". (Note the caller returns early on `false`; it does not
+    /// fall through to a `get` miss.)
     fn table_exists(&self) -> Result<bool, StoreError> {
         let read_txn = self
             .db
             .begin_read()
             .map_err(|err| StoreError::Backend(format!("begin_read: {err}")))?;
-        match read_txn.open_table(self.table) {
+        match read_txn.open_table(BUYER_CHANNEL_TABLE) {
             Ok(_) => Ok(true),
             Err(redb::TableError::TableDoesNotExist(_)) => Ok(false),
             Err(err) => Err(StoreError::Backend(format!("open_table: {err}"))),
@@ -260,7 +239,21 @@ impl<'a> BuyerChannelTable<'a> {
     /// escrowed-but-unreclaimable until an operator repairs the record, so it
     /// warrants action (and must not be filtered out of alerting). The channel
     /// id can't be named — it lives inside the undecodable bytes — so the
-    /// on-chain provider key is the only handle the operator gets.
+    /// on-chain provider key is the only handle it can offer.
+    ///
+    /// **That log only reaches a `decdn-node` operator.** The node installs a
+    /// `tracing` subscriber; the `decdn` CLI — the sole consumer of
+    /// `RedbBuyerChannelStore` — does not, and has no `tracing` dependency at
+    /// all, so for the client store this skip is entirely silent: `decdn channel
+    /// list` omits the row and `decdn channel clean` can report "no tracked
+    /// channels to clean" while the deposit is still escrowed. Pre-existing (both
+    /// stores behaved this way before #1246 unified them), and not fixable from
+    /// here — it needs `load_all` to *return* the skipped providers so each
+    /// caller can surface them, which changes the [`BuyerChannelStore`] trait.
+    /// Tracked as follow-up; do not read the paragraph above as a claim that a
+    /// CLI user is told anything.
+    ///
+    /// [`BuyerChannelStore`]: crate::buyer_channel::BuyerChannelStore
     ///
     /// # Errors
     ///
@@ -270,7 +263,7 @@ impl<'a> BuyerChannelTable<'a> {
             .db
             .begin_read()
             .map_err(|err| StoreError::Backend(format!("begin_read: {err}")))?;
-        let table = match read_txn.open_table(self.table) {
+        let table = match read_txn.open_table(BUYER_CHANNEL_TABLE) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
             Err(err) => return Err(StoreError::Backend(format!("open_table: {err}"))),
@@ -315,7 +308,7 @@ impl<'a> BuyerChannelTable<'a> {
         let write_txn = self.begin_durable_write()?;
         {
             let mut table = write_txn
-                .open_table(self.table)
+                .open_table(BUYER_CHANNEL_TABLE)
                 .map_err(|err| StoreError::Backend(format!("open_table: {err}")))?;
             table
                 .insert(&key, encoded.as_slice())
@@ -342,7 +335,7 @@ impl<'a> BuyerChannelTable<'a> {
         let write_txn = self.begin_durable_write()?;
         {
             let mut table = write_txn
-                .open_table(self.table)
+                .open_table(BUYER_CHANNEL_TABLE)
                 .map_err(|err| StoreError::Backend(format!("open_table: {err}")))?;
             table
                 .remove(&key)
@@ -374,7 +367,7 @@ impl<'a> BuyerChannelTable<'a> {
             .db
             .begin_read()
             .map_err(|err| StoreError::Backend(format!("begin_read: {err}")))?;
-        let table = match read_txn.open_table(self.table) {
+        let table = match read_txn.open_table(BUYER_CHANNEL_TABLE) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
             Err(err) => return Err(StoreError::Backend(format!("open_table: {err}"))),
@@ -413,7 +406,7 @@ impl<'a> BuyerChannelTable<'a> {
         let write_txn = self.begin_durable_write()?;
         let deleted = {
             let mut table = write_txn
-                .open_table(self.table)
+                .open_table(BUYER_CHANNEL_TABLE)
                 .map_err(|err| StoreError::Backend(format!("open_table: {err}")))?;
             // Read the current row inside the same (serialised) write txn so the
             // match-and-remove is atomic against a concurrent replace.
@@ -470,7 +463,7 @@ impl<'a> BuyerChannelTable<'a> {
         let write_txn = self.begin_durable_write()?;
         {
             let mut table = write_txn
-                .open_table(self.table)
+                .open_table(BUYER_CHANNEL_TABLE)
                 .map_err(|err| StoreError::Backend(format!("open_table: {err}")))?;
             // Read the committed row inside the same (serialised) write txn so
             // the advance is checked against — and written over — the committed
@@ -524,7 +517,7 @@ impl<'a> BuyerChannelTable<'a> {
         let write_txn = self.begin_durable_write()?;
         let new_deposit = {
             let mut table = write_txn
-                .open_table(self.table)
+                .open_table(BUYER_CHANNEL_TABLE)
                 .map_err(|err| StoreError::Backend(format!("open_table: {err}")))?;
             let Some(value_guard) = table
                 .get(&key)
@@ -555,25 +548,27 @@ impl<'a> BuyerChannelTable<'a> {
     /// Write raw value bytes under `provider`'s key, **bypassing the encoder**,
     /// to simulate a row left undecodable by a binary downgrade.
     ///
-    /// Seeds corruption against a live store for the tolerance tests here and
-    /// for `decdn-node`'s buyer reconciliation + mixed-reclaim e2e (#763), which
-    /// lives in a separate integration-test crate.
+    /// Seeds corruption against a live store for the tolerance tests here, and —
+    /// via `decdn-node`'s `insert_raw_buyer_record` — for its buyer
+    /// reconciliation + mixed-reclaim e2e (#763), which lives in a separate
+    /// integration-test crate.
     ///
-    /// Not `#[cfg(test)]`-gated because a cross-crate `cfg(test)` does not
-    /// propagate: a gated seam here could not serve the node's own
-    /// `insert_raw_buyer_record`. Reaching it needs a [`Database`] handle the
-    /// caller already owns, and neither buyer store exposes its handle, so this
-    /// is not a path production code can stumble into.
+    /// Gated behind `test-util` rather than `#[cfg(test)]` because a cross-crate
+    /// `cfg(test)` does not propagate: node's seam could not reach a
+    /// `cfg(test)`-only method here. The feature keeps a corruption-seeding
+    /// writer out of the shipped API; enable it from `[dev-dependencies]` (the
+    /// same pattern `decdn-client-pull`'s `test-util` uses).
     ///
     /// # Errors
     ///
     /// [`StoreError::Backend`] if the write or durable commit fails.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn insert_raw(&self, provider: Address, bytes: &[u8]) -> Result<(), StoreError> {
         let key: [u8; 20] = provider.into();
         let write_txn = self.begin_durable_write()?;
         {
             let mut table = write_txn
-                .open_table(self.table)
+                .open_table(BUYER_CHANNEL_TABLE)
                 .map_err(|err| StoreError::Backend(format!("open_table: {err}")))?;
             table
                 .insert(&key, bytes)
@@ -593,10 +588,6 @@ mod tests {
 
     use super::*;
 
-    /// Declared from [`BUYER_CHANNEL_TABLE_NAME`] exactly as each real store
-    /// does, so the suite also exercises the parameterization.
-    const TEST_TABLE: BuyerTableDef = TableDefinition::new(BUYER_CHANNEL_TABLE_NAME);
-
     /// A bare `redb` database in a temp dir. These tests drive the shared table
     /// ops directly, so they need no store, no data-dir hardening, and no file
     /// layout — which is the point: the ops are agnostic about who owns the file.
@@ -607,7 +598,7 @@ mod tests {
     }
 
     fn tbl(db: &Database) -> BuyerChannelTable<'_> {
-        BuyerChannelTable::new(db, TEST_TABLE)
+        BuyerChannelTable::new(db)
     }
 
     /// `true` if the buyer table was never created. Distinguishes "no row" from
@@ -615,7 +606,7 @@ mod tests {
     fn table_absent(db: &Database) -> anyhow::Result<bool> {
         let read_txn = db.begin_read()?;
         Ok(matches!(
-            read_txn.open_table(TEST_TABLE),
+            read_txn.open_table(BUYER_CHANNEL_TABLE),
             Err(redb::TableError::TableDoesNotExist(_))
         ))
     }
@@ -640,20 +631,74 @@ mod tests {
     const OTHER_CHANNEL: ChannelId =
         b256!("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
 
-    /// Postcard encoding of the record built by [`golden_state`], captured from
-    /// the encoder as it stood before #1246. Hex rather than a 206-byte array
-    /// literal so a diff shows exactly which field moved.
+    /// Postcard encoding of [`golden_state`].
+    ///
+    /// Produced by running the **pre-#1246 encoder** (on `main`, before the codec
+    /// moved) over this fixture, so it pins the format across the hoist and not
+    /// merely against itself. Hex rather than a 206-byte array literal so a diff
+    /// shows exactly which field moved.
     const GOLDEN_RECORD_HEX: &str = concat!(
         "01",                                                               // schema_version (varint)
-        "0000000000000000000000000000000000000000000000000000000000000007", // channel_id
-        "0000000000000000000000000000000000000007",                         // provider
-        "a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",                         // token
-        "0000000000000000000000000000000000000000000000000000000000989680", // deposit
-        "0000000000000000000000000000000000000000000000000000000000001b58", // last_amount
-        "0000000000000000000000000000000000000000000000000000000000000007", // last_nonce
-        "0000000000000000000000000000000000000000000000000000000000001c00", // last_bytes_delivered
-        "87e6fe8907",                                                       // expires_at (varint)
+        "1111111111111111111111111111111111111111111111111111111111111111", // channel_id
+        "2222222222222222222222222222222222222222",                         // provider
+        "3333333333333333333333333333333333333333",                         // token
+        "000000000000000000000000000000000000000000000000aaaaaaaaaaaaaaaa", // deposit
+        "000000000000000000000000000000000000000000000000bbbbbbbbbbbbbbbb", // last_amount
+        "000000000000000000000000000000000000000000000000cccccccccccccccc", // last_nonce
+        "000000000000000000000000000000000000000000000000dddddddddddddddd", // last_bytes_delivered
+        "eeddbbf70e",                                                       // expires_at (varint)
     );
+
+    /// The frozen bytes must also *decode* back to the fixture.
+    ///
+    /// [`encode_is_byte_stable`] pins the encoder, but the direction that
+    /// actually matters — an older binary's record still loads — runs the other
+    /// way, and every other test in this suite round-trips through the current
+    /// codec, so a matched encoder/decoder drift would pass all of them.
+    /// `GOLDEN_RECORD_HEX` is a source literal no running code produced, so this
+    /// holds `take_from_bytes`, the provider/key cross-check, and the
+    /// schema-version gate against the format as it was written on disk.
+    #[test]
+    fn golden_bytes_still_decode() -> anyhow::Result<()> {
+        let bytes: Vec<u8> = (0..GOLDEN_RECORD_HEX.len() / 2)
+            .map(|i| {
+                GOLDEN_RECORD_HEX
+                    .get(i * 2..i * 2 + 2)
+                    .ok_or_else(|| anyhow::anyhow!("odd-length golden hex"))
+                    .and_then(|b| u8::from_str_radix(b, 16).map_err(Into::into))
+            })
+            .collect::<anyhow::Result<_>>()?;
+        let want = golden_state();
+        let got = decode_record(want.provider.into(), &bytes)?;
+        anyhow::ensure!(
+            got == want,
+            "frozen bytes no longer decode:\n {got:?}\n {want:?}"
+        );
+        Ok(())
+    }
+
+    /// The fixture behind [`GOLDEN_RECORD_HEX`].
+    ///
+    /// Every field carries a **distinct** byte pattern, and that is the whole
+    /// point: postcard writes fields positionally, so a golden can only catch a
+    /// reordering if the swapped fields encode differently. The obvious fixture
+    /// (`state(7)`) fails that — its `channel_id` is 32 bytes ending `07` and its
+    /// `last_nonce` is `U256::from(7)`, i.e. *the same 32 bytes*, so swapping the
+    /// two is invisible. Verified: with `state(7)` this test passed a
+    /// `channel_id`/`last_nonce` swap, which would mis-decode every record on
+    /// disk. Keep all eight values distinct.
+    fn golden_state() -> BuyerChannelState {
+        BuyerChannelState {
+            channel_id: B256::repeat_byte(0x11),
+            provider: Address::repeat_byte(0x22),
+            token: Address::repeat_byte(0x33),
+            deposit: U256::from(0xAAAA_AAAA_AAAA_AAAAu64),
+            last_amount: U256::from(0xBBBB_BBBB_BBBB_BBBBu64),
+            last_nonce: U256::from(0xCCCC_CCCC_CCCC_CCCCu64),
+            last_bytes_delivered: U256::from(0xDDDD_DDDD_DDDD_DDDDu64),
+            expires_at: 0xEEEE_EEEEu64,
+        }
+    }
 
     /// Lowercase hex of `bytes`. `fold` + `write!` rather than the obvious
     /// `map(format!).collect()`, which trips `clippy::format_collect`.
@@ -677,13 +722,14 @@ mod tests {
     /// silently orphaned.
     ///
     /// This golden is the tripwire for that, and the only test here that would
-    /// fail on such a change. Captured from the pre-#1246 encoder, so it also
-    /// pins the format across the hoist itself. `state(7)` is byte-for-byte the
-    /// fixture the node's suite used, so the golden equally pins what both
-    /// crates used to encode independently.
+    /// fail on such a change. Captured from the pre-#1246 encoder, so it pins the
+    /// format across the hoist itself — and, because both crates encoded this
+    /// identically beforehand, across the two implementations it replaced.
+    ///
+    /// See [`golden_state`] for why every field must hold a distinct value.
     #[test]
     fn encode_is_byte_stable() -> anyhow::Result<()> {
-        let hex = hex_of(&encode_record(&state(7))?);
+        let hex = hex_of(&encode_record(&golden_state())?);
         anyhow::ensure!(
             hex == GOLDEN_RECORD_HEX,
             "the buyer record's on-disk encoding changed — this orphans every existing record in \
@@ -749,7 +795,13 @@ mod tests {
         for byte in 1..=4u8 {
             tbl(&db).record(&state(byte))?;
         }
-        anyhow::ensure!(tbl(&db).load_all()?.len() == 4);
+        let mut got: Vec<_> = tbl(&db).load_all()?.iter().map(|s| s.provider).collect();
+        got.sort_unstable();
+        let want: Vec<_> = (1..=4u8).map(|b| state(b).provider).collect();
+        anyhow::ensure!(
+            got == want,
+            "load_all must return every provider, got {got:?}"
+        );
         Ok(())
     }
 
@@ -949,6 +1001,29 @@ mod tests {
 
         let s = state(9);
         tbl(&db).record(&s)?;
+
+        // With the table now present, an unrecorded provider must still report
+        // UnknownProvider. This is a *different* branch from the `ghost` calls
+        // above: those short-circuit at `table_exists()`, this one returns from
+        // inside the write txn (aborting it on drop). Mutating that return to
+        // ChannelMismatch otherwise passes the whole suite.
+        let absent = state(0x5A);
+        anyhow::ensure!(
+            tbl(&db).advance_progress(
+                absent.provider,
+                absent.channel_id,
+                U256::from(1u64),
+                U256::from(1u64),
+                U256::from(1u64)
+            )? == AdvanceOutcome::UnknownProvider,
+            "advance_progress on an absent row of an existing table"
+        );
+        anyhow::ensure!(
+            tbl(&db).add_deposit(absent.provider, absent.channel_id, U256::from(1u64))?
+                == DepositOutcome::UnknownProvider,
+            "add_deposit on an absent row of an existing table"
+        );
+
         anyhow::ensure!(
             tbl(&db).advance_progress(
                 s.provider,
