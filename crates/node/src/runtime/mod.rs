@@ -1519,10 +1519,9 @@ pub async fn run(
     // ADR 001 rule 2: a NodeAnnounce is accepted only from a currently-staked
     // node. Enforced against the live on-chain registry (`staker_set`, kept
     // fresh by the CapacityBond event tail) — not a static allowlist. Bootstrap
-    // failure already aborted startup above, so this is always `Some`.
-    let announce_staked: Option<Arc<dyn decdn_gossip::StakedNodeSet>> = Some(Arc::new(
-        crate::reputation_wiring::NodeStakedNodeSet::new(Arc::clone(&staker_set)),
-    ));
+    // failure already aborted startup above, so this is always `Some`
+    // (`announce_staked_gate` is the unit-tested guarantee of that).
+    let announce_staked = crate::reputation_wiring::announce_staked_gate(Arc::clone(&staker_set));
     let gossip_metrics: Arc<dyn GossipMetrics> =
         Arc::new(NodeGossipMetrics::new(Arc::clone(&node_metrics)));
 

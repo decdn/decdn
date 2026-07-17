@@ -64,7 +64,7 @@
 
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use alloy::dyn_abi::Eip712Domain;
@@ -73,8 +73,8 @@ use alloy::signers::local::PrivateKeySigner;
 use decdn_cache::CacheEngine;
 use decdn_common::config::ResolvedSecurity;
 use decdn_gossip::{
-    GossipRuntimeConfig, GossipService, PeerTable, ReputationWiring, StakedNodeSet, build_gossip,
-    metrics::NoopMetrics,
+    AnnounceReject, GossipRuntimeConfig, GossipService, PeerTable, ReputationWiring, StakedNodeSet,
+    build_gossip, metrics::NoopMetrics,
 };
 use decdn_node::dispatch::ConnectionLimiter;
 use decdn_node::handlers::probe::ProbeHandler;
@@ -178,6 +178,44 @@ impl StakedNodeSet for AllStaked {
     fn contains(&self, _node_id: &[u8; 32]) -> bool {
         true
     }
+}
+
+/// Reject-any stub for the ADR 001 rule-2 gate — stands in for a live registry
+/// in which the announcing peer is *not* currently staked, so every inbound
+/// `NodeAnnounce` must be dropped at the subscriber (`AnnounceReject::NotStaked`).
+#[derive(Debug)]
+struct NoneStaked;
+impl StakedNodeSet for NoneStaked {
+    fn contains(&self, _node_id: &[u8; 32]) -> bool {
+        false
+    }
+}
+
+/// A [`GossipMetrics`](decdn_gossip::GossipMetrics) that counts `not_staked`
+/// rejects. `NoopMetrics` can't observe counters, so the reject test uses this
+/// to prove the announce actually *reached* the subscriber's validator and was
+/// dropped there (rather than being silently lost in the mesh). All other
+/// counters are inert — only the rule-2 reject signal matters here.
+#[derive(Debug, Default)]
+struct NotStakedRejectCounter {
+    not_staked: AtomicU64,
+}
+impl NotStakedRejectCounter {
+    fn not_staked(&self) -> u64 {
+        self.not_staked.load(Ordering::Relaxed)
+    }
+}
+impl decdn_gossip::GossipMetrics for NotStakedRejectCounter {
+    fn inc_rejected(&self, reason: &'static str) {
+        if reason == AnnounceReject::NotStaked.label() {
+            self.not_staked.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    fn inc_published(&self, _topic: &str) {}
+    fn inc_received(&self, _topic: &str) {}
+    fn set_peer_table_size(&self, _n: i64) {}
+    fn inc_reconnected(&self, _topic: &str) {}
+    fn add_evicted_ttl(&self, _n: u64) {}
 }
 
 /// Check whether `peers` has learned `node_id` via `NodeAnnounce`, asserting the
@@ -420,6 +458,147 @@ async fn two_nodes_exchange_node_announce_via_self_hosted_discovery() -> anyhow:
 
     // Teardown. Join the background gossip tasks, re-raising any task panic
     // rather than dropping it (see `join_gossip_tasks`).
+    shutdown.cancel();
+    join_gossip_tasks(a_handles.tasks.into_iter().chain(b_handles.tasks)).await;
+    a_router.shutdown().await.ok();
+    b_router.shutdown().await.ok();
+    a_ep.close().await;
+    b_ep.close().await;
+    Ok(())
+}
+
+/// Rule-2 **reject** direction (#1222): a subscriber whose gate excludes the
+/// publisher drops the announce and never inserts it. This complements
+/// `two_nodes_exchange_node_announce_via_self_hosted_discovery`, which wires both
+/// sides with `AllStaked` and only exercises the *accept* direction. Here B's
+/// gate is `NoneStaked`, so A's announce must be rejected on B's real
+/// `spawn → subscriber_task → validate_envelope` path with
+/// `AnnounceReject::NotStaked`, leaving B's peer table empty. B runs a counting
+/// metric so the test proves the reject actually *fired* — i.e. A's announce
+/// reached B's validator and was dropped — rather than the weaker "the announce
+/// never showed up" (which an unformed mesh would also satisfy).
+#[tokio::test(flavor = "multi_thread")]
+async fn non_staked_announce_is_dropped_at_subscriber() -> anyhow::Result<()> {
+    let a_secret = SecretKey::generate();
+    let b_secret = SecretKey::generate();
+    let a_id = *a_secret.public().as_bytes();
+
+    // Same self-hosted discovery wiring as the accept test: MemoryLookup only,
+    // no n0 DNS/pkarr/relay. Bind A first, seed B with A, then seed A with B.
+    let (a_ep, a_addr, a_lookup) =
+        bind_discovery_endpoint(a_secret.clone(), vec![GOSSIP_ALPN.to_vec()], Vec::new()).await?;
+    let (b_ep, b_addr, _b_lookup) = bind_discovery_endpoint(
+        b_secret.clone(),
+        vec![GOSSIP_ALPN.to_vec()],
+        vec![a_addr.clone()],
+    )
+    .await?;
+    a_lookup.add_endpoint_info(b_addr.clone());
+
+    let a_gossip = build_gossip(a_ep.clone());
+    let b_gossip = build_gossip(b_ep.clone());
+
+    let a_router = Router::builder(a_ep.clone())
+        .accept(GOSSIP_ALPN, a_gossip.clone())
+        .spawn();
+    let b_router = Router::builder(b_ep.clone())
+        .accept(GOSSIP_ALPN, b_gossip.clone())
+        .spawn();
+
+    let a_peers = Arc::new(RwLock::new(PeerTable::new(60_000_000, 128)));
+    let b_peers = Arc::new(RwLock::new(PeerTable::new(60_000_000, 128)));
+    let a_metrics: Arc<dyn decdn_gossip::GossipMetrics> = Arc::new(NoopMetrics);
+    // Keep a typed handle to read the reject counter after the mesh has run;
+    // hand the subscriber a trait-object clone of the same counter.
+    let b_metrics = Arc::new(NotStakedRejectCounter::default());
+    let b_metrics_gossip: Arc<dyn decdn_gossip::GossipMetrics> = b_metrics.clone();
+    let shutdown = CancellationToken::new();
+
+    // A: staked publisher. Its own gate is irrelevant to the reject direction —
+    // what matters is that A actually broadcasts a `NodeAnnounce`.
+    let a_handles = spawn_publisher(
+        a_ep.clone(),
+        a_secret.clone(),
+        a_gossip.clone(),
+        "US",
+        Arc::clone(&a_peers),
+        Arc::clone(&a_metrics),
+        shutdown.clone(),
+        Some(Arc::new(AllStaked)),
+    )
+    .await;
+    // B: receiver whose gate EXCLUDES A, so B must reject every A announce.
+    let b_handles = spawn_publisher(
+        b_ep.clone(),
+        b_secret.clone(),
+        b_gossip.clone(),
+        "DE",
+        Arc::clone(&b_peers),
+        b_metrics_gossip,
+        shutdown.clone(),
+        Some(Arc::new(NoneStaked)),
+    )
+    .await;
+
+    // Seed the mesh in both directions (same rationale as the accept test) so
+    // A's broadcast reaches B's subscriber. Held to keep membership alive.
+    let _a_bootstrap = a_gossip
+        .subscribe_and_join(global_topic_id(), vec![b_secret.public()])
+        .await
+        .map_err(|e| anyhow::anyhow!("A bootstrap subscribe_and_join: {e}"))?;
+    let _b_bootstrap = b_gossip
+        .subscribe_and_join(global_topic_id(), vec![a_secret.public()])
+        .await
+        .map_err(|e| anyhow::anyhow!("B bootstrap subscribe_and_join: {e}"))?;
+
+    let a_trigger = a_handles
+        .announce_trigger
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("node A publisher should be wired (region set)"))?;
+    let b_trigger = b_handles
+        .announce_trigger
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("node B publisher should be wired (region set)"))?;
+
+    // Drive a fresh announce from each node every round. Two invariants hold on
+    // every iteration until B's validator rejects A: B must NEVER insert A, and
+    // once the mesh forms B must record a `not_staked` reject. Bound generously
+    // (same 50×100ms budget as the accept test) so slow CI doesn't flake.
+    let mut rejected = false;
+    for _ in 0..50 {
+        a_trigger.announce_now();
+        b_trigger.announce_now();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !learned_peer(&b_peers, &a_id, "US").await,
+            "receiver B must never insert the non-staked publisher A (rule-2 reject)"
+        );
+        // `not_staked > 0` attributes the reject to A only because (a) there are
+        // exactly two nodes and (b) plumtree never routes a message back to its
+        // origin, so B never receives — and rejects — its own announce. If it
+        // ever did, `NoneStaked` would reject B's self-echo inside
+        // `validate_envelope` (the self-echo drop is in the later `Ok` arm, after
+        // validation), satisfying this check without A's announce arriving. Safe
+        // today; revisit if either assumption changes.
+        if b_metrics.not_staked() > 0 {
+            rejected = true;
+            break;
+        }
+    }
+    assert!(
+        rejected,
+        "B's subscriber must reject A's announce with not_staked — proving the \
+         announce reached B's validator and was dropped, not silently lost in the mesh"
+    );
+    // End-state invariant, made explicit at teardown and as a guard against
+    // future edits to the loop's break condition. Not a race fix: `NoneStaked`
+    // rejects unconditionally, so no A announce can ever be admitted — but
+    // asserting it here documents that the reject state holds right up to shutdown.
+    assert!(
+        !learned_peer(&b_peers, &a_id, "US").await,
+        "receiver B must still not have inserted the non-staked publisher A after the reject"
+    );
+
     shutdown.cancel();
     join_gossip_tasks(a_handles.tasks.into_iter().chain(b_handles.tasks)).await;
     a_router.shutdown().await.ok();
