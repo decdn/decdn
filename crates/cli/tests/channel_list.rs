@@ -117,6 +117,10 @@ fn undecodable_row_is_named_on_stderr() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains(&format!("{provider:#x}")), "{stderr}");
     assert!(stderr.contains("escrowed"), "{stderr}");
+    // The store is not truly empty — a deposit is escrowed behind the skipped
+    // row — so the empty sentinel must not claim otherwise.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("(no tracked channels)"), "{stdout}");
 }
 
 #[tokio::test]

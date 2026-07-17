@@ -791,7 +791,7 @@ fn list(args: &cli::ChannelListArgs, config_path: Option<&Path>) -> anyhow::Resu
         serde_json::to_writer_pretty(&mut out, &view)?;
         writeln!(out)?;
     } else {
-        write_channels(&mut out, &channels)?;
+        write_channels(&mut out, &channels, &skipped)?;
     }
     Ok(())
 }
@@ -822,11 +822,20 @@ fn write_clean_empty_status(w: &mut impl Write, skipped: &[Address]) -> std::io:
 /// Render the tracked buyer channels as an aligned table. Pure (writes to any
 /// sink) so the layout is unit-testable without a store. Mirrors the operator
 /// side's `decdn node channels` style: a `key=value` summary line, a `(no ...)`
-/// sentinel when empty, then fixed-width columns.
-fn write_channels(w: &mut impl Write, channels: &[BuyerChannelState]) -> std::io::Result<()> {
+/// sentinel when truly empty, then fixed-width columns. Like the `clean`
+/// sentinel, `(no tracked channels)` is suppressed when a row was skipped as
+/// undecodable — an escrowed deposit still exists, so the store is not empty.
+fn write_channels(
+    w: &mut impl Write,
+    channels: &[BuyerChannelState],
+    skipped: &[Address],
+) -> std::io::Result<()> {
     writeln!(w, "channels={}", channels.len())?;
     if channels.is_empty() {
-        return writeln!(w, "(no tracked channels)");
+        if skipped.is_empty() {
+            writeln!(w, "(no tracked channels)")?;
+        }
+        return Ok(());
     }
     writeln!(
         w,
@@ -1016,16 +1025,25 @@ mod tests {
     #[test]
     fn write_channels_empty_emits_sentinel() {
         let mut buf = Vec::new();
-        write_channels(&mut buf, &[]).unwrap();
+        write_channels(&mut buf, &[], &[]).unwrap();
         let out = String::from_utf8(buf).unwrap();
         assert!(out.contains("channels=0"), "{out}");
         assert!(out.contains("(no tracked channels)"), "{out}");
     }
 
     #[test]
+    fn write_channels_empty_sentinel_is_suppressed_when_a_row_was_skipped() {
+        let mut buf = Vec::new();
+        write_channels(&mut buf, &[], &[Address::repeat_byte(0x66)]).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(out.contains("channels=0"), "{out}");
+        assert!(!out.contains("(no tracked channels)"), "{out}");
+    }
+
+    #[test]
     fn write_channels_renders_summary_header_and_rows() {
         let mut buf = Vec::new();
-        write_channels(&mut buf, &[mk_state(0x11, 7, 2_000_000)]).unwrap();
+        write_channels(&mut buf, &[mk_state(0x11, 7, 2_000_000)], &[]).unwrap();
         let out = String::from_utf8(buf).unwrap();
         assert!(out.contains("channels=1"), "{out}");
         assert!(out.contains("PROVIDER"), "{out}");
