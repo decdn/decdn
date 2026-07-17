@@ -1061,7 +1061,7 @@ mod tests {
 
             tbl(&db).forget(forgotten.provider)?;
             anyhow::ensure!(
-                tbl(&db).forget_if_channel(compare_deleted.provider, compare_deleted.channel_id,)?
+                tbl(&db).forget_if_channel(compare_deleted.provider, compare_deleted.channel_id)?
             );
         }
 
