@@ -21,9 +21,14 @@
 
 pub mod bind_sig;
 pub mod buyer_channel;
-/// Persistent buyer-channel store (#940); requires the `redb` feature.
+// NOTE: no outer `///` docs on these two — each module's `//!` header is its
+// documentation. An outer doc here would be a second copy free to drift, and
+// rustdoc merges it with the `//!` block and resolves the result in *this*
+// module's scope, silently breaking the module's own intra-doc links.
 #[cfg(feature = "redb")]
 pub mod buyer_channel_redb;
+#[cfg(feature = "buyer-store-core")]
+pub mod buyer_channel_table;
 pub mod capacity_bond;
 pub mod channel;
 pub mod channel_open_error;
