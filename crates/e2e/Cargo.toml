@@ -25,8 +25,14 @@ default = []
 # always compile; only the tests that actually drive a chain are gated. Enables
 # `decdn-incentive`'s `redb` store here rather than on the direct dependency: the
 # only `RedbBuyerChannelStore` user is the gated `cli_fetch_topup` test, so
-# default builds skip that crate's `buyer_channel_redb` module and its `postcard`
-# code (the `redb` crate itself still arrives transitively via `decdn-node`).
+# default builds skip that crate's `buyer_channel_redb` module.
+#
+# What this gate buys is the *store type*, not the dependency. Since #1246 the
+# shared buyer-table codec/ops (`buyer_channel_table`) compile in every build of
+# this crate: `decdn-node` is a non-optional dep and enables
+# `decdn-incentive/buyer-store-core`. `redb` and `postcard` were never actually
+# gated out here either — `redb` arrives transitively via `decdn-node`, and
+# `postcard` via `decdn-protocol`.
 anvil-e2e = ["decdn-incentive/redb"]
 
 [dependencies]
