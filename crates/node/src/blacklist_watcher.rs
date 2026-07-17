@@ -1,7 +1,8 @@
 //! Blacklist compliance watcher (ADR 011 § Content Takedown, ADR 031).
 //!
-//! When the operator configures `blockchain.content_blacklist_address`, this
-//! task keeps the local blob store compliant with `ContentBlacklist`: it evicts
+//! Every paid-delivery node runs this task after resolving the mandatory
+//! `blockchain.content_blacklist_address`. It keeps the local blob store
+//! compliant with `ContentBlacklist`: it evicts
 //! any blob whose hash is blacklisted *in scope* for this operator (global ∪
 //! current-region ∪ ripening-prev-region). The scope decision is the contract's
 //! `isHashBlacklistedForOperator` view, so region packing and the ADR 030
@@ -56,7 +57,7 @@
 //! local protection.
 
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use alloy::primitives::{Address, B256};
@@ -68,6 +69,7 @@ use decdn_cache::{CacheEngine, Hash};
 use decdn_common::redact::sanitize_err_chain;
 use decdn_incentive::content_blacklist::ContentBlacklist;
 use decdn_incentive::content_blacklist::ContentBlacklist::{HashBlacklisted, HashRemoved};
+use tokio::sync::oneshot;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -77,6 +79,37 @@ use crate::chain_events::shared_head::HeadSource;
 use crate::chain_events::{
     MAX_BACKFILL_BLOCK_SPAN, WATCHER_INITIAL_BACKOFF, WATCHER_MAX_BACKOFF, timed,
 };
+
+/// Result reported exactly once when the first full replay + re-scope pass
+/// either establishes compliance or proves startup cannot safely continue.
+pub(crate) type InitialSyncResult = std::result::Result<(), String>;
+
+#[derive(Clone)]
+struct InitialSyncGate(Arc<Mutex<Option<oneshot::Sender<InitialSyncResult>>>>);
+
+impl InitialSyncGate {
+    fn new(sender: oneshot::Sender<InitialSyncResult>) -> Self {
+        Self(Arc::new(Mutex::new(Some(sender))))
+    }
+
+    fn pending(&self) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+    }
+
+    fn signal(&self, result: InitialSyncResult) {
+        let sender = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(sender) = sender {
+            let _ = sender.send(result);
+        }
+    }
+}
 
 /// Mutable deny-set carried across poll ticks. The scan cursor lives on the
 /// resumable watcher; this holds only the re-scopable entry set.
@@ -138,6 +171,8 @@ struct BlacklistSink<P: Provider + Clone> {
     rescan_interval: Duration,
     /// When the last batched re-scope ran; `None` forces one on the first tick.
     last_rescan: Option<Instant>,
+    /// Still pending only during the mandatory first full replay + re-scope.
+    initial_sync: InitialSyncGate,
 }
 
 impl<P: Provider + Clone> LogSink for BlacklistSink<P> {
@@ -182,6 +217,11 @@ impl<P: Provider + Clone> LogSink for BlacklistSink<P> {
             // it comes back clean; only a clean pass waits out the full
             // operator cadence again.
             self.last_rescan = clean.then(Instant::now);
+            if !clean && self.initial_sync.pending() {
+                anyhow::bail!(
+                    "initial ContentBlacklist replay/re-scope could not enforce every entry"
+                );
+            }
         }
         Ok(())
     }
@@ -214,11 +254,13 @@ pub(crate) async fn run<P>(
     head: Arc<dyn HeadSource>,
     rescan_interval: Duration,
     shutdown: CancellationToken,
+    initial_sync_tx: oneshot::Sender<InitialSyncResult>,
 ) where
     P: Provider + Clone,
 {
     let contract = ContentBlacklist::new(contract_addr, provider.clone());
     info!(%contract_addr, %operator, from_block, "blacklist compliance watcher starting");
+    let initial_sync = InitialSyncGate::new(initial_sync_tx);
 
     let sink = BlacklistSink {
         contract,
@@ -230,7 +272,10 @@ pub(crate) async fn run<P>(
         shutdown: shutdown.clone(),
         rescan_interval: rescan_interval.max(Duration::from_secs(1)),
         last_rescan: None,
+        initial_sync: initial_sync.clone(),
     };
+    let established_gate = initial_sync.clone();
+    let backoff_gate = initial_sync;
     let cfg = WatcherConfig {
         head,
         filter: Filter::new().address(contract_addr).event_signature(vec![
@@ -247,8 +292,13 @@ pub(crate) async fn run<P>(
         shutdown,
         seed_cursor: None,
         label: "blacklist",
-        on_established: None,
-        on_backoff: None,
+        on_established: Some(Box::new(move || established_gate.signal(Ok(())))),
+        on_backoff: Some(Box::new(move || {
+            backoff_gate.signal(Err(
+                "initial ContentBlacklist sync failed: chain RPC or cache eviction unavailable"
+                    .to_string(),
+            ));
+        })),
     };
     resumable_watcher::run(provider, cfg, sink).await;
 }
@@ -461,6 +511,7 @@ async fn evict(cache: &CacheEngine, hash: Hash) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Context as _;
 
     const US: B256 = B256::repeat_byte(0x01);
     const FR: B256 = B256::repeat_byte(0x02);
@@ -469,6 +520,52 @@ mod tests {
         WatcherState {
             known: HashSet::new(),
         }
+    }
+
+    struct FailingHead;
+
+    #[async_trait::async_trait]
+    impl HeadSource for FailingHead {
+        async fn head(&self) -> Result<u64> {
+            anyhow::bail!("head unavailable")
+        }
+    }
+
+    #[tokio::test]
+    async fn initial_head_failure_signals_startup_error() -> Result<()> {
+        let asserter = alloy::providers::mock::Asserter::new();
+        let provider = alloy::providers::ProviderBuilder::new().connect_mocked_client(asserter);
+        let tmp = tempfile::tempdir()?;
+        let cache = CacheEngine::open(tmp.path(), Vec::new(), 1).await?;
+        let shutdown = CancellationToken::new();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+
+        let task = tokio::spawn(run(
+            provider,
+            Address::repeat_byte(0x11),
+            Address::repeat_byte(0x22),
+            cache,
+            0,
+            Duration::from_secs(1),
+            Arc::new(FailingHead),
+            Duration::from_mins(10),
+            shutdown.clone(),
+            ready_tx,
+        ));
+        let readiness = tokio::time::timeout(Duration::from_secs(1), ready_rx)
+            .await
+            .context("watcher did not report initial-sync failure")?
+            .context("watcher dropped the readiness channel")?;
+
+        assert!(
+            readiness
+                .as_ref()
+                .is_err_and(|message| message.contains("initial ContentBlacklist sync failed")),
+            "startup should receive a useful initial-sync error: {readiness:?}"
+        );
+        shutdown.cancel();
+        task.await.context("blacklist watcher task panicked")?;
+        Ok(())
     }
 
     /// COMPLIANCE PIN: the blacklist watcher must full-replay from the deploy

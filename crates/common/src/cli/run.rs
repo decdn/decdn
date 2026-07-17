@@ -111,9 +111,8 @@ pub struct BlockchainArgs {
     #[arg(long, value_name = "ADDR", env = "DECDN_SLASH_JUDGE_ADDRESS")]
     pub slash_judge_address: Option<String>,
 
-    /// `ContentBlacklist` contract address (0x-prefixed hex). Optional: enables
-    /// the blacklist compliance watcher that evicts in-scope blacklisted blobs
-    /// (ADR 011/031). Unset => no watcher.
+    /// Required `ContentBlacklist` contract address (0x-prefixed hex). Startup
+    /// waits for its initial compliance sync before accepting any ALPN.
     #[arg(long, value_name = "ADDR", env = "DECDN_CONTENT_BLACKLIST_ADDRESS")]
     pub content_blacklist_address: Option<String>,
 

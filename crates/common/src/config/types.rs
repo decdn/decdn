@@ -176,12 +176,9 @@ pub struct BlockchainConfig {
     /// denies unknown fields and a node's `node.toml` is shared with the CLI —
     /// but does not resolve or use it.
     pub slash_appeal_address: Option<String>,
-    /// `ContentBlacklist` contract address. Optional: when set, the node runs
-    /// the blacklist compliance watcher (ADR 011/031) — it evicts held blobs
-    /// whose hash is blacklisted in scope for this operator (global ∪ region),
-    /// which cascades to DHT-announce suppression, probe `has_blob:false`, and
-    /// delivery refusal. Unset => no watcher (serving a blacklisted hash after
-    /// its compliance window is then slashable with no local protection).
+    /// `ContentBlacklist` contract address. Required at node config resolution;
+    /// startup completes the initial global + operator-scope replay before any
+    /// ALPN accepts connections (ADR 011/019/031).
     pub content_blacklist_address: Option<String>,
     /// Block height at which the blacklist watcher begins its `HashBlacklisted`
     /// log replay. SHOULD be the `ContentBlacklist` deployment block; absent =>
