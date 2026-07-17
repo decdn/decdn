@@ -91,6 +91,7 @@ use crate::chain_events::{
 };
 use crate::handlers::client::ClientHandler;
 use crate::metrics::{Metrics, SettleParty};
+use crate::onchain_tx::{TxOutcome, send_and_await_receipt};
 
 /// Capacity of the redeem-hint channel. Hints are advisory (a missed hint
 /// only delays a redemption until the next voucher or shutdown), so a bounded
@@ -1838,9 +1839,10 @@ pub(crate) async fn settle_pass<P: Provider + Clone>(
 /// another party already settled (status left `Closing`): confirm via
 /// `getChannel` and drop the entry if the channel is now `Closed`, otherwise
 /// leave it for the next sweep (e.g. local-clock skew ahead of the chain).
-// Linear guard-and-act sequence (send → receipt → status → confirm); the
-// early-return guards read more clearly inline than split across helpers,
-// same posture as `try_redeem` / `try_close_for_expiry`.
+// The send→receipt→status plumbing is folded once by `send_and_await_receipt`;
+// this matches on the resulting `TxOutcome` and each arm carries the
+// party-aware metric plus the terminal's meaning — transient-retry (send /
+// receipt) vs the getChannel revert-confirm.
 #[allow(clippy::cognitive_complexity)]
 pub(crate) async fn try_settle<P: Provider + Clone>(
     contract: &PaymentChannel::PaymentChannelInstance<P>,
@@ -1849,49 +1851,54 @@ pub(crate) async fn try_settle<P: Provider + Clone>(
     party: SettleParty,
     metrics: &Arc<Metrics>,
 ) {
-    let send = match contract.settleChannel(channel_id).send().await {
-        Ok(p) => p,
-        Err(err) => {
+    match send_and_await_receipt(contract.settleChannel(channel_id).send().await, None).await {
+        TxOutcome::Landed(receipt) => {
+            record_settle_receipt_outcome(party, metrics, true);
+            info!(
+                %channel_id,
+                tx = %receipt.transaction_hash,
+                outcome = "ok",
+                "settled channel; routed provider remainder through FeeRouter"
+            );
+            forget_pending_logged(pending_store, channel_id, party, metrics);
+        }
+        TxOutcome::Reverted(receipt) => {
+            record_settle_receipt_outcome(party, metrics, false);
+            // Reverted: most likely `ChannelNotClosing` because another party
+            // already finalized. Confirm before dropping the obligation.
+            warn!(
+                %channel_id,
+                tx = %receipt.transaction_hash,
+                outcome = "reverted",
+                "settleChannel reverted; checking whether it was already finalized"
+            );
+            drop_pending_if_finalized(contract, pending_store, channel_id, party, metrics).await;
+        }
+        TxOutcome::SendErr(err) => {
             party.finalize_transient_send(metrics);
             warn!(
                 err = %sanitize_rpc_display(&err), %channel_id, outcome = "transient_send",
                 "settleChannel send failed; will retry next sweep"
             );
-            return;
         }
-    };
-    let receipt = match send.get_receipt().await {
-        Ok(r) => r,
-        Err(err) => {
+        TxOutcome::ReceiptErr(err) => {
             party.finalize_transient_receipt(metrics);
             warn!(
                 err = %sanitize_rpc_display(&err), %channel_id, outcome = "transient_receipt",
                 "settleChannel receipt failed; will retry next sweep"
             );
-            return;
         }
-    };
-    let landed = receipt.status();
-    record_settle_receipt_outcome(party, metrics, landed);
-    if landed {
-        info!(
-            %channel_id,
-            tx = %receipt.transaction_hash,
-            outcome = "ok",
-            "settled channel; routed provider remainder through FeeRouter"
-        );
-        forget_pending_logged(pending_store, channel_id, party, metrics);
-        return;
+        TxOutcome::Timeout => {
+            // No receipt timeout is supplied above, so this arm is unreachable;
+            // fold it into the transient-receipt retry bucket rather than
+            // panicking, per the workspace anti-panic policy.
+            party.finalize_transient_receipt(metrics);
+            warn!(
+                %channel_id, outcome = "transient_receipt",
+                "settleChannel receipt wait elapsed; will retry next sweep"
+            );
+        }
     }
-    // Reverted: most likely `ChannelNotClosing` because another party already
-    // finalized. Confirm before dropping the obligation.
-    warn!(
-        %channel_id,
-        tx = %receipt.transaction_hash,
-        outcome = "reverted",
-        "settleChannel reverted; checking whether it was already finalized"
-    );
-    drop_pending_if_finalized(contract, pending_store, channel_id, party, metrics).await;
 }
 
 /// Count the terminal outcome of a `settleChannel` receipt: a landed receipt

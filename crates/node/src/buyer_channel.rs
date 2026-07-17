@@ -62,6 +62,7 @@ use crate::client_requester::cooperative_close::{
 };
 use crate::dht::NodeAddressResolver;
 use crate::metrics::{Metrics, SettleParty};
+use crate::onchain_tx::{TxKind, TxOutcome, send_and_await_receipt};
 use crate::payment_settlement::{settle_pass, unix_now};
 
 /// How often the reclaim sweep scans tracked buyer channels for expiry.
@@ -1952,7 +1953,7 @@ async fn close_unilateral<P: Provider + Clone>(
         }
     };
     let sig = Bytes::from(voucher.signature.as_bytes().to_vec());
-    let pending = match contract
+    let sent = contract
         .closeChannel(
             st.channel_id,
             st.last_amount,
@@ -1961,43 +1962,54 @@ async fn close_unilateral<P: Provider + Clone>(
             sig,
         )
         .send()
-        .await
-    {
-        Ok(pending) => pending,
-        Err(err) => {
-            metrics.buyer_unilateral_close_rpc_failure();
-            warn!(
-                channel_id = %st.channel_id, err = %sanitize_rpc_display(&err),
-                "reconcile: unilateral closeChannel send failed; leaving for next sweep / expiry reclaim"
-            );
-            return false;
-        }
-    };
-    match pending.get_receipt().await {
-        Ok(receipt) if receipt.status() => {
+        .await;
+    let outcome = send_and_await_receipt(sent, None).await;
+    match &outcome {
+        TxOutcome::Landed(receipt) => info!(
+            channel_id = %st.channel_id, provider = %st.provider,
+            tx = %receipt.transaction_hash,
+            "reconcile: unilateral closeChannel landed (dispute window open); will settle after window"
+        ),
+        TxOutcome::Reverted(receipt) => warn!(
+            channel_id = %st.channel_id, tx = %receipt.transaction_hash,
+            "reconcile: unilateral closeChannel reverted on-chain (channel may already be \
+             closing/closed); caller reconciles on-chain status"
+        ),
+        TxOutcome::SendErr(err) => warn!(
+            channel_id = %st.channel_id, err = %sanitize_rpc_display(err),
+            "reconcile: unilateral closeChannel send failed; leaving for next sweep / expiry reclaim"
+        ),
+        TxOutcome::ReceiptErr(err) => warn!(
+            channel_id = %st.channel_id, err = %sanitize_rpc_display(err),
+            "reconcile: unilateral closeChannel receipt failed; leaving for next sweep / expiry reclaim"
+        ),
+        // No receipt timeout is supplied above, so this arm is unreachable; it
+        // folds into the same `rpc_failure` retry bucket as the other failures
+        // rather than panicking, per the workspace anti-panic policy.
+        TxOutcome::Timeout => warn!(
+            channel_id = %st.channel_id,
+            "reconcile: unilateral closeChannel receipt wait elapsed; leaving for next sweep / expiry reclaim"
+        ),
+    }
+    record_unilateral_close_outcome(metrics, outcome.kind())
+}
+
+/// Record the #989 two-bucket metric for a completed unilateral-close
+/// submission and report whether it succeeded: a landed receipt ticks
+/// `buyer_unilateral_close_ok` and returns `true`; every other terminal —
+/// revert, send/receipt error, or receipt-wait timeout — ticks
+/// `buyer_unilateral_close_rpc_failure` and returns `false` (the caller
+/// reconciles on-chain status on the next sweep). Split out (mirroring
+/// `record_settle_receipt_outcome`) so the ok-vs-failure mapping is
+/// unit-testable without a live provider.
+fn record_unilateral_close_outcome(metrics: &Arc<Metrics>, kind: TxKind) -> bool {
+    match kind {
+        TxKind::Landed => {
             metrics.buyer_unilateral_close_ok();
-            info!(
-                channel_id = %st.channel_id, provider = %st.provider,
-                tx = %receipt.transaction_hash,
-                "reconcile: unilateral closeChannel landed (dispute window open); will settle after window"
-            );
             true
         }
-        Ok(receipt) => {
+        TxKind::Reverted | TxKind::SendErr | TxKind::ReceiptErr | TxKind::Timeout => {
             metrics.buyer_unilateral_close_rpc_failure();
-            warn!(
-                channel_id = %st.channel_id, tx = %receipt.transaction_hash,
-                "reconcile: unilateral closeChannel reverted on-chain (channel may already be \
-                 closing/closed); caller reconciles on-chain status"
-            );
-            false
-        }
-        Err(err) => {
-            metrics.buyer_unilateral_close_rpc_failure();
-            warn!(
-                channel_id = %st.channel_id, err = %sanitize_rpc_display(&err),
-                "reconcile: unilateral closeChannel receipt failed; leaving for next sweep / expiry reclaim"
-            );
             false
         }
     }
@@ -2412,44 +2424,64 @@ async fn try_reclaim<P: Provider + Clone>(
         return forget_reclaimed(store, st, "expired channel already closed on-chain");
     }
 
-    let receipt = match contract.reclaimExpired(st.channel_id).send().await {
-        // Bounded (#1143): `run_open` calls this on the rotate leg, INSIDE the
-        // detached open task that holds the provider's in-flight slot. An unbounded
-        // wait here would let a stuck `reclaimExpired` pin that slot for the life of
-        // the process, wedging the provider — the very starvation #1143 removes.
-        // Safe to bound precisely because a reclaim refunds rather than escrows: the
-        // row stays, the hourly sweep retries, nothing is stranded.
-        Ok(pending) => {
-            match tokio::time::timeout(RECLAIM_RECEIPT_TIMEOUT, pending.get_receipt()).await {
-                Ok(Ok(r)) => r,
-                Ok(Err(err)) => {
-                    warn!(err = %sanitize_rpc_display(&err), channel_id = %st.channel_id, "buyer reclaim: receipt failed");
-                    return ReclaimOutcome::Failed;
-                }
-                Err(_) => {
-                    warn!(
-                        channel_id = %st.channel_id,
-                        timeout = ?RECLAIM_RECEIPT_TIMEOUT,
-                        "buyer reclaim: receipt timed out; the tx may still mine and the sweep will retry"
-                    );
-                    return ReclaimOutcome::Failed;
-                }
-            }
-        }
-        Err(err) => {
-            warn!(err = %sanitize_rpc_display(&err), channel_id = %st.channel_id, "buyer reclaim: send failed");
-            return ReclaimOutcome::Failed;
-        }
-    };
-    if !receipt.status() {
-        warn!(
+    // Bounded (#1143): `run_open` calls this on the rotate leg, INSIDE the
+    // detached open task that holds the provider's in-flight slot. An unbounded
+    // wait here would let a stuck `reclaimExpired` pin that slot for the life of
+    // the process, wedging the provider — the very starvation #1143 removes.
+    // Safe to bound precisely because a reclaim refunds rather than escrows: the
+    // row stays, the hourly sweep retries, nothing is stranded.
+    let outcome = send_and_await_receipt(
+        contract.reclaimExpired(st.channel_id).send().await,
+        Some(RECLAIM_RECEIPT_TIMEOUT),
+    )
+    .await;
+    match &outcome {
+        TxOutcome::Landed(_) => {}
+        TxOutcome::Reverted(receipt) => warn!(
             channel_id = %st.channel_id,
             tx = %receipt.transaction_hash,
             "reclaimExpired reverted on-chain; leaving record for retry"
-        );
-        return ReclaimOutcome::Failed;
+        ),
+        TxOutcome::SendErr(err) => {
+            warn!(err = %sanitize_rpc_display(err), channel_id = %st.channel_id, "buyer reclaim: send failed");
+        }
+        TxOutcome::ReceiptErr(err) => {
+            warn!(err = %sanitize_rpc_display(err), channel_id = %st.channel_id, "buyer reclaim: receipt failed");
+        }
+        TxOutcome::Timeout => warn!(
+            channel_id = %st.channel_id,
+            timeout = ?RECLAIM_RECEIPT_TIMEOUT,
+            "buyer reclaim: receipt timed out; the tx may still mine and the sweep will retry"
+        ),
     }
-    forget_reclaimed(store, st, "reclaimed expired buyer channel deposit")
+    match reclaim_disposition(outcome.kind()) {
+        ReclaimDisposition::Forget => {
+            forget_reclaimed(store, st, "reclaimed expired buyer channel deposit")
+        }
+        ReclaimDisposition::Retry => ReclaimOutcome::Failed,
+    }
+}
+
+/// Whether a completed `reclaimExpired` submission lets us drop the local
+/// record. Only a landed receipt actually refunds the deposit; every other
+/// terminal — revert, send/receipt error, or receipt-wait timeout — leaves the
+/// row for the next hourly sweep. Split out (mirroring
+/// `record_settle_receipt_outcome`) so the terminal-vs-retry split is
+/// unit-testable without a live provider.
+const fn reclaim_disposition(kind: TxKind) -> ReclaimDisposition {
+    match kind {
+        TxKind::Landed => ReclaimDisposition::Forget,
+        TxKind::Reverted | TxKind::SendErr | TxKind::ReceiptErr | TxKind::Timeout => {
+            ReclaimDisposition::Retry
+        }
+    }
+}
+
+/// Outcome of [`reclaim_disposition`]: drop the record, or keep it for the next
+/// sweep.
+enum ReclaimDisposition {
+    Forget,
+    Retry,
 }
 
 /// Compare-and-delete the buyer record for `st`'s channel after a reclaim (or a
@@ -3051,6 +3083,65 @@ mod tests {
         // Tally restarts: one stale sweep is below threshold again.
         assert!(!observe_idle(&mut obs, ch, U256::from(2u64), 2)); // stale 1
         assert!(observe_idle(&mut obs, ch, U256::from(2u64), 2)); // stale 2 → idle
+    }
+
+    /// The reclaim terminal-vs-retry split: only a landed receipt drops the
+    /// record; a revert, a send/receipt error, and a receipt-wait timeout must
+    /// all leave the row for the next sweep. An inverted arm here would either
+    /// strand a refundable deposit or drop a record whose deposit never came
+    /// back, so pin every kind. Provider-free via [`TxKind`].
+    #[test]
+    fn reclaim_forgets_only_on_landed_receipt() {
+        assert!(matches!(
+            reclaim_disposition(TxKind::Landed),
+            ReclaimDisposition::Forget
+        ));
+        for kind in [
+            TxKind::Reverted,
+            TxKind::SendErr,
+            TxKind::ReceiptErr,
+            TxKind::Timeout,
+        ] {
+            assert!(
+                matches!(reclaim_disposition(kind), ReclaimDisposition::Retry),
+                "{kind:?} must leave the record for retry"
+            );
+        }
+    }
+
+    /// The unilateral-close #989 two-bucket mapping: a landed receipt is the
+    /// only success (ticks `ok`, returns `true`); every other terminal ticks
+    /// `rpc_failure` and returns `false`. Assert both the returned flag and the
+    /// counter that moved, against a fresh registry, so a swapped bucket can't
+    /// slip through.
+    #[test]
+    fn unilateral_close_counts_ok_only_on_landed_receipt() {
+        let landed = Arc::new(Metrics::new());
+        assert!(record_unilateral_close_outcome(&landed, TxKind::Landed));
+        assert_eq!(counter(&landed, "buyer_unilateral_close_ok_total"), 1);
+        assert_eq!(
+            counter(&landed, "buyer_unilateral_close_rpc_failure_total"),
+            0
+        );
+
+        for kind in [
+            TxKind::Reverted,
+            TxKind::SendErr,
+            TxKind::ReceiptErr,
+            TxKind::Timeout,
+        ] {
+            let failed = Arc::new(Metrics::new());
+            assert!(
+                !record_unilateral_close_outcome(&failed, kind),
+                "{kind:?} must report failure"
+            );
+            assert_eq!(counter(&failed, "buyer_unilateral_close_ok_total"), 0);
+            assert_eq!(
+                counter(&failed, "buyer_unilateral_close_rpc_failure_total"),
+                1,
+                "{kind:?} must tick rpc_failure"
+            );
+        }
     }
 
     /// A persistent reclaim failure stays silent for the first few sweeps (the
