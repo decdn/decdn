@@ -616,10 +616,13 @@ pub struct DecdnMetrics {
     /// `decdn_probe_cache_hits_total` (#1165): cache-miss pulls whose candidate
     /// walk STARTED from a live ADR 001 §Probe cache entry with at least one
     /// still-selectable provider. The DHT lookup and probe fanout are skipped —
-    /// unless every cached provider fails within the remaining attempt budget,
-    /// in which case the same fetch falls through to a fresh lookup + probe but
-    /// stays counted here (the hit is "the cache had something worth trying",
-    /// not "the cache delivered"). Field has no `_total` suffix because the
+    /// unless every cached provider fails, in which case the same fetch either
+    /// falls through to a fresh lookup + probe (if attempt budget remains) or
+    /// returns a clean miss (if the cached providers exhausted the budget first,
+    /// the common case since an entry holds up to 10 providers but the budget is
+    /// 3) — either way it stays counted here (the hit is "the cache had
+    /// something worth trying", not "the cache delivered"). Field has no
+    /// `_total` suffix because the
     /// `OpenMetrics` encoder appends it. With `probe_cache_misses` this is the
     /// hit ratio the TTL exists to buy; a ratio near zero means the TTL is
     /// shorter than the request inter-arrival time for hot blobs and the cache
@@ -627,8 +630,9 @@ pub struct DecdnMetrics {
     pub probe_cache_hits: Counter,
     /// `decdn_probe_cache_misses_total` (#1165): cache-miss pulls that had to run
     /// a fresh DHT lookup + probe. Counts an entry that was absent, expired, OR
-    /// fully suppressed (every cached provider negative-cached or wedged) — all
-    /// three cost the same network work, which is what this measures.
+    /// fully suppressed (every cached provider negative-cached, wedged, no longer
+    /// an active staker, or otherwise unselectable) — all three cost the same
+    /// network work, which is what this measures.
     pub probe_cache_misses: Counter,
     /// `decdn_probe_post_eviction_failures_total` (ADR 001 §Probe cache,
     /// ADR 005 §`EvictedSinceProbe` semantics; #1165): an upstream answered

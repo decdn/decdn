@@ -82,10 +82,16 @@ pub struct ProbedProvider {
     pub rtt_ms: u32,
 }
 
-// Tripwire for the "no evidence retention" invariant: this type must never grow
-// a field. 32 (node_id) + 8 (rate) + 4 (rtt) pads to 48; any addition trips this
-// at compile time and forces the author to argue past the module doc above
-// before deleting it.
+// Review speed-bump for the "no evidence retention" invariant, NOT a hard
+// enforcement of it. 32 (node_id) + 8 (rate) + 4 (rtt) = 44, which the `u64`
+// pads to 48 — so this only trips for a field large enough to push past that
+// padding (another `NodeId`, a signature, an embedded `ProbeResponse`); a field
+// of ≤4 bytes fits in the existing tail padding and slips past silently. The
+// real guards against retaining slashable evidence are `#[derive(Copy)]` above
+// (a `Signature`/`Vec<u8>`/`ProbeResponse` is not `Copy`, so it fails to
+// compile) and the exhaustive struct literal at the single write site (no `..`,
+// so any new field must be populated there — sending the author back to the
+// module doc). This assert just adds a footprint ceiling on top of those.
 const _: () = assert!(size_of::<ProbedProvider>() <= 48);
 
 #[derive(Debug)]

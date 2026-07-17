@@ -10855,6 +10855,239 @@ async fn a_window_pull_with_a_partial_cached_budget_falls_through_cold_and_meter
     Ok(())
 }
 
+/// The window-paced twin of
+/// [`cached_candidates_and_the_cold_path_share_one_attempt_budget`]: the FULL-exhaustion
+/// contract on `open_progressive_pull`, which carries its own copy of the exhaustion arm
+/// (`node_origin.rs`: the `budget == 0 → return None` short-circuit and the `invalidate`
+/// that precedes it) separate from `Origin::fetch`'s (#1223 review).
+///
+/// The partial-budget window twin above only ever leaves budget > 0, so the window path's
+/// `budget == 0` early-return and its `probe_cache.invalidate(&target)` were BOTH untested:
+/// deleting either left the whole suite green, exactly the blind spot a third fetch closed
+/// on the buffered side. This drives them:
+///
+/// - Call #2 (the hit) must spend the whole 3-attempt budget on the three cached refusers
+///   and END there — NOT reach `discover` for three more opens. Proven at the wire by the
+///   probe counter staying at 3 (the exhaustion short-circuit fires before any fresh lookup)
+///   and by exactly three more stream opens, not six.
+/// - Call #3 must go COLD: the entry call #2 disproved has to have been invalidated, so the
+///   third call re-probes all three at the wire (probe counter 3 → 6). Without the
+///   `invalidate`, it would hit the same dead list a second time and never re-probe.
+///
+/// Same fixture as the buffered budget test: three providers reachable and honest at probe,
+/// refusing every open with `InternalError` (a reported node-fault, so NOT negative-cached
+/// and NOT wedged — which is what keeps all three in the cache for the hit to spend budget
+/// on).
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::expect_used, clippy::too_many_lines)] // test setup; failures should panic loudly
+async fn a_window_pull_shares_one_attempt_budget_and_invalidates_on_exhaustion() -> Result<()> {
+    let payload = vec![0x7Cu8; 4096];
+    let hash = Hash::new(&payload);
+    let total_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
+
+    // Two wire counters shared across all three servers: probes prove the
+    // exhaustion short-circuit (no fresh lookup) and the invalidate (re-probe on
+    // call #3); streams prove the shared budget (three opens per call, not six).
+    let probes = Arc::new(AtomicUsize::new(0));
+    let streams = Arc::new(AtomicUsize::new(0));
+
+    // --- Three providers: reachable, honest at probe, refuse the open with
+    //     `InternalError` — reported node-fault, so NOT negative-cached and NOT
+    //     wedged, so all three survive in the cache for call #2 to walk. ----------
+    let n0_sk = fresh_key();
+    let n0_id = n0_sk.public();
+    let n0_eth = Arc::new(PrivateKeySigner::random());
+    let (ep_n0, addr_n0) =
+        local_endpoint(n0_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    let task_n0 = spawn_a_refusing_server_with_counters(
+        ep_n0.clone(),
+        Arc::clone(&n0_eth),
+        slash_domain(),
+        total_bytes,
+        RATE,
+        StreamError::InternalError,
+        Arc::clone(&probes),
+        Arc::clone(&streams),
+    );
+
+    let n1_sk = fresh_key();
+    let n1_id = n1_sk.public();
+    let n1_eth = Arc::new(PrivateKeySigner::random());
+    let (ep_n1, addr_n1) =
+        local_endpoint(n1_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    let task_n1 = spawn_a_refusing_server_with_counters(
+        ep_n1.clone(),
+        Arc::clone(&n1_eth),
+        slash_domain(),
+        total_bytes,
+        RATE,
+        StreamError::InternalError,
+        Arc::clone(&probes),
+        Arc::clone(&streams),
+    );
+
+    let n2_sk = fresh_key();
+    let n2_id = n2_sk.public();
+    let n2_eth = Arc::new(PrivateKeySigner::random());
+    let (ep_n2, addr_n2) =
+        local_endpoint(n2_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    let task_n2 = spawn_a_refusing_server_with_counters(
+        ep_n2.clone(),
+        Arc::clone(&n2_eth),
+        slash_domain(),
+        total_bytes,
+        RATE,
+        StreamError::InternalError,
+        Arc::clone(&probes),
+        Arc::clone(&streams),
+    );
+
+    // --- Node B: dial-only endpoint hosting the NodeOrigin. -------------------
+    let b_sk = fresh_key();
+    let b_id = b_sk.public();
+    let (ep_b, _addr_b) = local_endpoint(b_sk, vec![]).await?;
+    for (id, addr) in [(n0_id, addr_n0), (n1_id, addr_n1), (n2_id, addr_n2)] {
+        let _ = probe_once(
+            &ep_b,
+            EndpointAddr::new(id).with_ip_addr(addr),
+            *hash.as_bytes(),
+            1,
+            false,
+            None,
+            Duration::from_secs(10),
+        )
+        .await?;
+    }
+    // The priming dials above are themselves real probes against the counting
+    // servers — reset so the counters below measure only the calls under test.
+    probes.store(0, Ordering::SeqCst);
+    streams.store(0, Ordering::SeqCst);
+
+    let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
+    let obs_buffer = Arc::new(ObservationBuffer::new());
+    let b_metrics = Arc::new(Metrics::new());
+    let b_buyer = Arc::new(PrivateKeySigner::random());
+
+    let n0_dht = DhtNodeId::from_bytes(*n0_id.as_bytes());
+    let n1_dht = DhtNodeId::from_bytes(*n1_id.as_bytes());
+    let n2_dht = DhtNodeId::from_bytes(*n2_id.as_bytes());
+    let mut addr_map = HashMap::new();
+    addr_map.insert(n0_dht, n0_eth.address());
+    addr_map.insert(n1_dht, n1_eth.address());
+    addr_map.insert(n2_dht, n2_eth.address());
+
+    let buyer = Arc::new(StubOpener {
+        channel_id: B256::repeat_byte(0x7C),
+        token: TOKEN,
+        deposit: U256::from(DEPOSIT_MICRO_USDC),
+        signer: Arc::clone(&b_buyer),
+        voucher_domain: voucher_dom(),
+        recorded: Arc::new(Mutex::new(Vec::new())),
+        retired: Arc::new(Mutex::new(Vec::new())),
+    }) as Arc<dyn ChannelOpener>;
+
+    let origin = build_origin_with_timeout(
+        &ep_b,
+        DhtNodeId::from_bytes(*b_id.as_bytes()),
+        hash,
+        buyer,
+        &local_rep,
+        &obs_buffer,
+        &b_metrics,
+        &empty_region_accountant(),
+        vec![n0_dht, n1_dht, n2_dht],
+        addr_map,
+        Duration::from_secs(20),
+        Duration::from_secs(20),
+        0,
+    );
+
+    // Call #1: cold path (cache empty). Discovers, probes, and ranks all three;
+    // the whole budget is spent opening-and-refused, and the ranked list is cached
+    // at `probe_and_rank`'s tail regardless of the miss.
+    let first = tokio::time::timeout(Duration::from_secs(10), origin.open_progressive_pull(hash))
+        .await
+        .map_err(|_| anyhow::anyhow!("call #1 open_progressive_pull never returned"))?;
+    anyhow::ensure!(
+        first.is_none(),
+        "all three providers refuse; the first window pull must miss"
+    );
+    anyhow::ensure!(
+        probes.load(Ordering::SeqCst) == 3,
+        "expected all three providers probed exactly once on the cold path, got {}",
+        probes.load(Ordering::SeqCst)
+    );
+    anyhow::ensure!(
+        streams.load(Ordering::SeqCst) == 3,
+        "the cold path must open-against all three within budget, got {}",
+        streams.load(Ordering::SeqCst)
+    );
+    assert_counter(&b_metrics, "probe_cache_misses_total", 1)?;
+    assert_counter(&b_metrics, "node_pull_attempts_total", 1)?;
+
+    // Call #2: the probe-cache hit walks the SAME three cached candidates. It must
+    // spend exactly the fetch-wide budget of 3 opening-and-refused, then hit the
+    // window path's `budget == 0` short-circuit — WITHOUT re-probing and WITHOUT a
+    // fresh lookup for three more opens. Three more streams (6 total), not six.
+    let second = tokio::time::timeout(Duration::from_secs(10), origin.open_progressive_pull(hash))
+        .await
+        .map_err(|_| anyhow::anyhow!("call #2 open_progressive_pull never returned"))?;
+    anyhow::ensure!(
+        second.is_none(),
+        "the cached candidates all refuse again; the second window pull must miss too"
+    );
+    anyhow::ensure!(
+        probes.load(Ordering::SeqCst) == 3,
+        "the exhausted hit must NOT reach a fresh lookup — no re-probe expected, got {} probes",
+        probes.load(Ordering::SeqCst)
+    );
+    anyhow::ensure!(
+        streams.load(Ordering::SeqCst) == 6,
+        "the hit must open-against exactly the 3-attempt budget (6 total), not hand a fresh \
+         lookup three more, got {}",
+        streams.load(Ordering::SeqCst)
+    );
+    assert_counter(&b_metrics, "probe_cache_hits_total", 1)?;
+    assert_counter(&b_metrics, "probe_cache_misses_total", 1)?;
+
+    // Call #3: call #2 disproved the cached entry by spending the whole budget on
+    // it, so the window path must have INVALIDATED it — none of the three refusers
+    // is negative-cached or wedged, so only the invalidate stands between this call
+    // and a second hit on the dead list. It must go COLD: a fresh lookup that
+    // re-probes all three at the wire.
+    let third = tokio::time::timeout(Duration::from_secs(10), origin.open_progressive_pull(hash))
+        .await
+        .map_err(|_| anyhow::anyhow!("call #3 open_progressive_pull never returned"))?;
+    anyhow::ensure!(
+        third.is_none(),
+        "all three providers still refuse; the third window pull must miss too"
+    );
+    anyhow::ensure!(
+        probes.load(Ordering::SeqCst) == 6,
+        "the third call must re-probe all three — the exhausted entry was disproved by real \
+         opens and must not survive to hit again, got {} probes",
+        probes.load(Ordering::SeqCst)
+    );
+    anyhow::ensure!(
+        streams.load(Ordering::SeqCst) == 9,
+        "the cold re-walk opens all three once more (9 total), got {}",
+        streams.load(Ordering::SeqCst)
+    );
+    assert_counter(&b_metrics, "probe_cache_hits_total", 1)?;
+    assert_counter(&b_metrics, "probe_cache_misses_total", 2)?;
+    // Still one orchestration per call: cold, hit-exhausted, cold again.
+    assert_counter(&b_metrics, "node_pull_attempts_total", 3)?;
+
+    ep_b.close().await;
+    ep_n0.close().await;
+    ep_n1.close().await;
+    ep_n2.close().await;
+    task_n0.abort();
+    task_n1.abort();
+    task_n2.abort();
+    Ok(())
+}
+
 /// A cache entry whose EVERY provider is currently suppressed is a miss, not a hit —
 /// `cached_candidates`' `candidates.is_empty() → None` branch (#1223 review).
 ///
