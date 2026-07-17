@@ -1571,20 +1571,27 @@ impl Metrics {
 /// Generate the trivial forwarding recorders on [`Metrics`].
 ///
 /// Each entry spells out both names — `method => field.op(value)` — because the
-/// two diverge for 45 of them: fields omit the `_total` suffix the
-/// `OpenMetrics` encoder appends, and several recorders read as singular events
-/// against a plural field. Deriving one name from the other would silently
-/// produce `..._total_total` or bind the wrong series, so neither is ever
-/// synthesized.
+/// two diverge for 45 of them: the method reads as a singular event while the
+/// field is plural (`probe_request` vs `probe_requests`), or the field is a
+/// semantic rename of the action (`started` sets `uptime_seconds`,
+/// `connection_opened` bumps `active_connections`). Deriving one name from the
+/// other would bind the wrong series, so neither is ever synthesized. (Field
+/// names also carry their own encoder convention — most omit the `_total`
+/// suffix the `OpenMetrics` encoder appends, though a few spell it out — but
+/// that governs the exported name, not the method-to-field mapping here.)
 ///
 /// Docs pass through as `$meta`, so multi-line rationale stays byte-identical
 /// and keeps its call-site span for `clippy` and `rustdoc`.
 ///
-/// Only the uniform "forward one call to one field" shape belongs here.
-/// Recorders that branch, take a value they transform, or touch `Metrics`'s own
-/// `Mutex` state stay hand-written in the `impl` block above. There is no
-/// `Counter`/`Gauge` argument because the type system already rejects a
-/// mismatched op — `Counter` has no `dec()`.
+/// What belongs here is a body that is a single `self.decdn.field.op(expr)` —
+/// including a one-expression transform of the argument (`sat(n)`,
+/// `i64::from(flag)`), which several entries do. Recorders whose body needs
+/// more than that — branching, multiple statements, or touching `Metrics`'s own
+/// `Mutex` state — stay hand-written in the `impl` block above. There is no
+/// `Counter`/`Gauge` token to pick because the op is written explicitly per
+/// entry; the one dangerous confusion, calling `dec()` on a `Counter`, does not
+/// compile because `Counter` has no `dec()` (a wrong `set`/`inc` on the right
+/// kind still would, so the entries are the source of truth).
 ///
 /// Note that `rustfmt` does not format macro-invocation bodies, so the entry
 /// table below is hand-maintained: keep it at one entry per line, within the
