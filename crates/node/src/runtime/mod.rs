@@ -98,7 +98,7 @@ const PROBE_RATE_LIMIT_GC_INTERVAL: Duration = Duration::from_mins(1);
 const QUIC_MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Interval between QUIC PING keep-alive frames. Per ADR 005 §Connection
-/// lifecycle, endpoints SHOULD send PINGs at 10s intervals — strictly
+/// lifetime, endpoints SHOULD send PINGs at 10s intervals — strictly
 /// less than [`QUIC_MAX_IDLE_TIMEOUT`] so a single dropped probe doesn't
 /// trip the idle reaper, and well below the typical NAT mapping timeout
 /// so middleboxes don't drop the path under quiet load. Quinn applies
