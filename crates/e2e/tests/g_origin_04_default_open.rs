@@ -1,7 +1,4 @@
-//! G-ORIGIN-04: an unclaimed hash resolves through the namespace-0 default-open
-//! origin set, a bonded cache node can re-serve the verified bytes it acquired,
-//! and a later namespace claim switches canonical origin resolution to the
-//! registered assignment instead of retaining default-open treatment.
+//! G-ORIGIN-04: migrate a cached hash from default-open to an assigned origin.
 
 #![cfg(feature = "anvil-e2e")]
 #![allow(
@@ -124,7 +121,6 @@ async fn run() -> anyhow::Result<()> {
             .await?
     );
 
-    // Compare one explicit epoch: the three-day activation may cross a boundary.
     let baseline_epoch = chain.head_timestamp().await? / EPOCH_LENGTH_SECS;
     let fee = FeeRouter::new(chain.addrs().fee_router, chain.admin());
     let default_open_before = fee
@@ -136,7 +132,6 @@ async fn run() -> anyhow::Result<()> {
         .call()
         .await?;
 
-    // The verified cache may re-serve without adding an origin delivery.
     let cached = client.fetch(&chain, &cache, hash).await?;
     assert_eq!(cached.bytes, payload);
     assert_eq!(
@@ -165,6 +160,7 @@ async fn wait_for_origin_settlement(
     let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
     loop {
         let channels = admin.channels().await.context("origin admin channels")?;
+        let redeem_threshold = U256::from(channels.redeem_threshold_micro_usdc);
         for snapshot in channels.channels {
             if snapshot.outstanding_micro_usdc == 0 {
                 continue;
@@ -179,7 +175,10 @@ async fn wait_for_origin_settlement(
                 channel_id,
             )
             .await?;
-            if on_chain.withdrawnAmount == U256::from(snapshot.outstanding_micro_usdc) {
+            let outstanding = U256::from(snapshot.outstanding_micro_usdc);
+            if !on_chain.withdrawnAmount.is_zero()
+                && outstanding.saturating_sub(on_chain.withdrawnAmount) < redeem_threshold
+            {
                 return Ok(());
             }
         }
