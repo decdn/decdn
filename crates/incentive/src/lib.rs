@@ -24,6 +24,12 @@ pub mod buyer_channel;
 /// Persistent buyer-channel store (#940); requires the `redb` feature.
 #[cfg(feature = "redb")]
 pub mod buyer_channel_redb;
+/// Shared buyer-channel redb table (#1246): the on-disk record codec plus the
+/// table operations both buyer stores delegate to, parameterized over the
+/// caller's `redb::Database` + `TableDefinition`. Requires the
+/// `buyer-store-core` feature.
+#[cfg(feature = "buyer-store-core")]
+pub mod buyer_channel_table;
 pub mod capacity_bond;
 pub mod channel;
 pub mod channel_open_error;

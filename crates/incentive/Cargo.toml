@@ -7,10 +7,24 @@ rust-version.workspace = true
 description = "Payment channels, bonding, and voucher management for deCDN"
 
 [features]
-# Persistent buyer-channel store (`buyer_channel_redb`). Off by default so the
-# contracts/voucher logic doesn't pull redb/postcard; the CLI (`decdn fetch`,
-# #940) enables it for cross-invocation channel reuse.
-redb = ["dep:redb", "dep:postcard"]
+# Shared buyer-channel redb table (`buyer_channel_table`, #1246): the on-disk
+# record codec plus the table operations, parameterized over the caller's
+# `redb::Database` + `TableDefinition`. The node's combined seller+buyer
+# `channels.redb` store enables *only* this and keeps its own file, table const,
+# and per-op transaction wiring (redb forbids two `Database` handles on one
+# file), so both buyer stores share one definition of the on-disk format without
+# the node adopting `RedbBuyerChannelStore`.
+#
+# NOTE: `dep:redb` must stay spelled here. It is what suppresses Cargo's
+# implicit `redb` feature for the optional dependency of the same name; drop it
+# and that implicit feature collides with the explicit `redb` feature below.
+buyer-store-core = ["dep:redb", "dep:postcard"]
+# Persistent buyer-only store (`buyer_channel_redb`): adds
+# `RedbBuyerChannelStore` (its own `buyer-channels.redb` file + open guards) on
+# top of the shared table. Off by default so the contracts/voucher logic doesn't
+# pull redb/postcard; the CLI (`decdn fetch`, #940) enables it for
+# cross-invocation channel reuse.
+redb = ["buyer-store-core"]
 
 [dependencies]
 decdn-common = { workspace = true }
