@@ -174,7 +174,9 @@ jobs:
     outputs:
       rust: ${{ steps.filter.outputs.rust }}
       adr: ${{ steps.filter.outputs.adr }}
-      solidity: ${{ steps.filter.outputs.solidity }}
+      solidity: >-
+        ${{ steps.filter.outputs.solidity_dependencies == 'true' ||
+            steps.solidity_contracts.outputs.solidity == 'true' }}
       markdown: ${{ steps.filter.outputs.markdown }}
       scripts: ${{ steps.filter.outputs.scripts }}
     steps:
@@ -220,16 +222,7 @@ jobs:
               - 'adr/**/*.md'
               - 'adr/Makefile'
               - '.github/workflows/ci.yml'
-            solidity:
-              - 'contracts/**'
-              # Deployment manifests (contracts/deployments/<chainId>.json) are
-              # recorded artifacts — no code, no tests. A manifest-only commit
-              # (e.g. the Arbitrum Sepolia 421614.json for #1083) should not
-              # trigger build/test/slither/aderyn/coverage/fork jobs. dorny
-              # negation is last-match-wins, so this excludes them from the
-              # 'contracts/**' match above. (Test-chain 31337*.json manifests
-              # are gitignored and never committed.)
-              - '!contracts/deployments/**'
+            solidity_dependencies:
               - '.gitmodules'
               - '.github/workflows/ci.yml'
               - '.github/actions/**'
@@ -240,12 +233,27 @@ jobs:
               - '.markdownlint.yaml'
               - '.github/workflows/ci.yml'
             scripts:
-              # Gates `coverage-tooling-tests` (the pytest suite for
-              # coverage-diff.py). The helper itself + its test fixtures live
-              # under .github/scripts/; nothing else exercises them, so a PR
-              # that touches no scripts has nothing for that job to verify.
+              # Gates `coverage-tooling-tests` (the pytest suite under
+              # .github/scripts/tests). The helpers and their regression tests
+              # live under .github/scripts/; a PR that touches no scripts has
+              # nothing for that job to verify.
               - '.github/scripts/**'
               - '.github/workflows/ci.yml'
+      - name: Detect Solidity contract changes
+        uses: dorny/paths-filter@v4
+        id: solidity_contracts
+        with:
+          token: ''
+          # dorny ORs rules by default, so a negation is not subtraction. With
+          # `every`, a path must be under contracts/ and outside deployments/.
+          # This lives in its own action because the quantifier is action-wide.
+          predicate-quantifier: 'every'
+          filters: |
+            solidity:
+              - 'contracts/**'
+              # Deployment manifests are recorded artifacts, not contract
+              # inputs. Test-chain 31337*.json manifests are also gitignored.
+              - '!contracts/deployments/**'
 
   test:
     name: test
@@ -1114,7 +1122,7 @@ jobs:
       - run: make -C adr check-md-anchors
       - run: make -C adr check-no-section-numbers
 
-  # Pytest suite for .github/scripts/coverage-diff.py. Non-blocking by design
+  # Pytest suite for CI helper and path-filter regressions. Non-blocking by design
   # — excluded from ci-success.needs — so a regression in the helper surfaces
   # as a red X (visible in the checks list) without blocking PRs. Lives in its
   # own job so the signal stays distinct from yellow continue-on-error steps
@@ -1132,9 +1140,9 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
-      - name: Test coverage-diff helper
+      - name: Test CI tooling
         run: |
-          python3 -m pip install 'pytest==8.*'
+          python3 -m pip install 'pytest==8.*' 'pyyaml==6.*'
           python3 -m pytest .github/scripts/tests -q
 
   # Single gate for branch protection. Point required-checks at this one job
