@@ -156,71 +156,61 @@ fn quic_transport_config() -> anyhow::Result<QuicTransportConfig> {
         .build())
 }
 
-/// Body of the periodic dispatch-limiter GC task (#440). Extracted from
-/// the spawn site so the shutdown-promptness contract can be tested
-/// directly: a regression where the loop ignores `stop_rx` would
-/// silently extend `SHUTDOWN_DEADLINE` by up to one tick interval
-/// (`DISPATCH_GC_INTERVAL` = 60s by default), which the runtime's normal
-/// shutdown path would mask as a "task slow to drain" rather than a bug.
+/// Spawn a periodic task onto `tasks`: burn the first tick, then run `tick`
+/// every `interval` until the returned stop signal is sent (or its sender is
+/// dropped). Every tick body here is synchronous, so `tick` is a plain
+/// `FnMut()` run to completion inside the task.
 ///
-/// The first tick is burned so the first GC pass lands one interval
-/// after startup rather than on the same tick — there are no stale
-/// buckets to clean up at t=0.
-async fn run_dispatch_gc(
-    limiter: Arc<ConnectionLimiter>,
-    mut stop_rx: oneshot::Receiver<()>,
+/// The `biased; stop-before-tick` select keeps shutdown prompt: the stop arm is
+/// polled first, so a signalled stop returns without waiting out the current
+/// `interval`. A stop arm that failed to return would instead stall shutdown by
+/// up to one full `interval`, which the runtime's normal path would mask as a
+/// "task slow to drain" rather than a bug. `spawn_periodic_exits_promptly_on_shutdown`
+/// pins that a signalled stop returns promptly and that the first tick is
+/// burned; `spawn_periodic_fires_the_tick_body` pins that ticks otherwise run.
+///
+/// The first tick is burned so the first pass lands one interval after startup
+/// rather than on the same tick as bring-up. `name` labels the shutdown log.
+fn spawn_periodic<F>(
+    tasks: &mut JoinSet<()>,
+    name: &'static str,
     interval: Duration,
-) {
-    let mut ticker = tokio::time::interval(interval);
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    ticker.tick().await;
-    loop {
-        tokio::select! {
-            biased;
-            _ = &mut stop_rx => {
-                tracing::debug!("dispatch GC shutdown signal received");
-                return;
-            }
-            _ = ticker.tick() => {
-                if let Some((before, after)) = limiter.gc_per_source() {
-                    let dropped = before.saturating_sub(after);
-                    tracing::debug!(
-                        before,
-                        after,
-                        dropped,
-                        "dispatch GC sweep complete"
-                    );
+    mut tick: F,
+) -> oneshot::Sender<()>
+where
+    F: FnMut() + Send + 'static,
+{
+    let (stop_tx, mut stop_rx) = oneshot::channel::<()>();
+    tasks.spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ticker.tick().await;
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut stop_rx => {
+                    tracing::debug!(task = name, "periodic task shutdown signal received");
+                    return;
                 }
+                _ = ticker.tick() => tick(),
             }
         }
-    }
+    });
+    stop_tx
 }
 
-/// Periodic per-region bandwidth accounting log (#750). Mirrors
-/// [`run_dispatch_gc`]'s shutdown shape: stops on its own oneshot at a clean
-/// await boundary so a regression that ignores `stop_rx` is directly testable.
-/// The first tick is burned so the first line lands one interval after startup
-/// (there is nothing to report at t=0). Emits one structured line per region;
-/// totals are cumulative since process start.
-async fn run_region_accounting_log(
-    accountant: Arc<crate::region_accounting::RegionAccountant>,
-    mut stop_rx: oneshot::Receiver<()>,
-    interval: Duration,
-) {
-    let mut ticker = tokio::time::interval(interval);
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    ticker.tick().await;
-    loop {
-        tokio::select! {
-            biased;
-            _ = &mut stop_rx => {
-                tracing::debug!("region accounting log shutdown signal received");
-                return;
-            }
-            _ = ticker.tick() => {
-                log_region_snapshot(&accountant);
-            }
-        }
+/// Emit one `debug` line for a keyed rate-limiter GC sweep that pruned buckets.
+/// Shared by the DHT and probe rate-limiter GC ticks, whose per-layer
+/// (`per_ip` / `per_peer`) log arms are otherwise byte-identical.
+fn log_keyspace_gc(kind: &'static str, layer: &'static str, sweep: Option<(usize, usize)>) {
+    if let Some((before, after)) = sweep {
+        tracing::debug!(
+            layer,
+            before,
+            after,
+            dropped = before.saturating_sub(after),
+            "{kind} rate-limit GC sweep complete"
+        );
     }
 }
 
@@ -244,178 +234,6 @@ fn log_region_snapshot(accountant: &crate::region_accounting::RegionAccountant) 
             bytes_out = r.bytes_out,
             "per-region bandwidth (cumulative since start)"
         );
-    }
-}
-
-/// Periodic DHT record-store GC task (ADR 022 §Content Records and TTL).
-///
-/// `RecordStore::providers_at` lazily scrubs expired records for the
-/// hash it's queried about, but a hash that nobody ever queries again
-/// keeps its expired entries — they continue to count against the
-/// publisher's per-publisher quota and against the global cap until
-/// this task fires. Without it a node that publishes a one-shot blob
-/// can eventually exhaust its 200-record quota and have every future
-/// `Store` rejected.
-///
-/// The sweep is `O(expired × log N)` over the global LRU thanks to the
-/// front-walk in [`crate::dht::RecordStore::gc`]. Default interval is
-/// 60s — well below the 1-hour record TTL.
-// Same linear shape as `run_dispatch_gc` above (tick → maybe-prune →
-// log → loop). Splitting the body would scatter the "every tick takes
-// the lock and runs the BTreeSet walk" admission seam — the cognitive
-// complexity is the linear seq of two await points, not branching depth.
-#[allow(clippy::cognitive_complexity)]
-async fn run_record_store_gc(
-    records: Arc<std::sync::Mutex<RecordStore>>,
-    mut stop_rx: oneshot::Receiver<()>,
-    interval: Duration,
-) {
-    let mut ticker = tokio::time::interval(interval);
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    ticker.tick().await;
-    loop {
-        tokio::select! {
-            biased;
-            _ = &mut stop_rx => {
-                tracing::debug!("dht record-store GC shutdown signal received");
-                return;
-            }
-            _ = ticker.tick() => {
-                let now_us = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_or(0, |d| u64::try_from(d.as_micros()).unwrap_or(u64::MAX));
-                let removed = if let Ok(mut store) = records.lock() {
-                    store.gc(now_us)
-                } else {
-                    tracing::error!(
-                        "dht record-store mutex poisoned; skipping GC sweep this tick"
-                    );
-                    0
-                };
-                if removed > 0 {
-                    tracing::debug!(removed, "dht record-store GC sweep complete");
-                }
-            }
-        }
-    }
-}
-
-/// Periodic DHT rate-limiter GC task (#645).
-///
-/// The acquire path opportunistically prunes when the per-IP / per-peer
-/// keyed maps exceed `cap + cap/10`, but a node whose DHT traffic falls
-/// below the over-cap threshold can carry millions of stale buckets
-/// indefinitely. One task drives both keyed layers; `gc_per_ip` and
-/// `gc_per_peer` use independent single-flight flags internally so a
-/// concurrent lazy prune of one layer (from `check`) does not block the
-/// GC sweep of the other layer. The two sweeps in this task itself run
-/// sequentially within one tick — there is no internal parallelism here.
-///
-/// **Panic contract.** A panic inside `retain_recent` (e.g. from a
-/// `governor` internal arithmetic bug or an allocator OOM during the
-/// walk) unwinds out of `gc_per_ip` / `gc_per_peer` and exits this
-/// task. The `PruneGuard` Drop impl still releases the single-flight
-/// flag during unwind, so the lazy-prune path in `check` keeps working
-/// — but the periodic sweep is permanently dead until the next process
-/// restart. The panic surfaces via `JoinSet::join_next` at graceful
-/// shutdown, not earlier; operators who want earlier notice should
-/// alert on the `decdn_dht_rate_limit_tracked_{per_ip,per_peer}` gauges
-/// failing to drop on a quiet node (the lazy-prune path in `check` also
-/// writes these gauges, but on a quiet node `check` is not called, so
-/// the periodic sweep is the only writer — and it stops writing if it
-/// dies). The signal needs a non-zero starting value: a map that was
-/// already empty when the sweep died will sit at `0` legitimately,
-/// indistinguishable from a healthy GC task on an empty map.
-// Same linear shape as `run_dispatch_gc` and `run_record_store_gc`
-// above (tick → maybe-prune-per-layer → log → loop), with two
-// `if let Some(...)` branches instead of one because there are two
-// keyed maps to sweep. Splitting the per-layer arm into a helper
-// would scatter the `biased; stop_rx | ticker.tick()` seam that the
-// `*_exits_promptly_on_shutdown` tests pin — the cognitive
-// complexity is the count of mostly-identical `tracing::debug!`
-// log-arms, not branching depth.
-#[allow(clippy::cognitive_complexity)]
-async fn run_dht_rate_limit_gc(
-    limiter: Arc<DhtRateLimiter>,
-    mut stop_rx: oneshot::Receiver<()>,
-    interval: Duration,
-) {
-    let mut ticker = tokio::time::interval(interval);
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    ticker.tick().await;
-    loop {
-        tokio::select! {
-            biased;
-            _ = &mut stop_rx => {
-                tracing::debug!("dht rate-limit GC shutdown signal received");
-                return;
-            }
-            _ = ticker.tick() => {
-                if let Some((before, after)) = limiter.gc_per_ip() {
-                    tracing::debug!(
-                        layer = "per_ip",
-                        before,
-                        after,
-                        dropped = before.saturating_sub(after),
-                        "dht rate-limit GC sweep complete"
-                    );
-                }
-                if let Some((before, after)) = limiter.gc_per_peer() {
-                    tracing::debug!(
-                        layer = "per_peer",
-                        before,
-                        after,
-                        dropped = before.saturating_sub(after),
-                        "dht rate-limit GC sweep complete"
-                    );
-                }
-            }
-        }
-    }
-}
-
-// Sibling of `run_dht_rate_limit_gc` for the `cdn/probe/v1` three-layer
-// limiter (#982). Kept as a separate function (rather than generalized) to
-// match the existing dispatch-GC / dht-GC split and leave the heavily-tested
-// DHT GC task untouched; see that function's note on the cognitive-complexity
-// allow.
-#[allow(clippy::cognitive_complexity)]
-async fn run_probe_rate_limit_gc(
-    limiter: Arc<ProbeRateLimiter>,
-    mut stop_rx: oneshot::Receiver<()>,
-    interval: Duration,
-) {
-    let mut ticker = tokio::time::interval(interval);
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    ticker.tick().await;
-    loop {
-        tokio::select! {
-            biased;
-            _ = &mut stop_rx => {
-                tracing::debug!("probe rate-limit GC shutdown signal received");
-                return;
-            }
-            _ = ticker.tick() => {
-                if let Some((before, after)) = limiter.gc_per_ip() {
-                    tracing::debug!(
-                        layer = "per_ip",
-                        before,
-                        after,
-                        dropped = before.saturating_sub(after),
-                        "probe rate-limit GC sweep complete"
-                    );
-                }
-                if let Some((before, after)) = limiter.gc_per_peer() {
-                    tracing::debug!(
-                        layer = "per_peer",
-                        before,
-                        after,
-                        dropped = before.saturating_sub(after),
-                        "probe rate-limit GC sweep complete"
-                    );
-                }
-            }
-        }
     }
 }
 
@@ -1282,24 +1100,30 @@ pub async fn run(
     // limiter `n = 0` so the steady-state cost is one mutex acquire
     // per minute. Stops on its own oneshot — same pattern as the
     // metrics and admin servers.
-    let (dispatch_gc_stop_tx, dispatch_gc_stop_rx) = oneshot::channel::<()>();
-    let dispatch_gc_limiter = Arc::clone(&limiter);
-    tasks.spawn(run_dispatch_gc(
-        dispatch_gc_limiter,
-        dispatch_gc_stop_rx,
-        DISPATCH_GC_INTERVAL,
-    ));
+    let dispatch_gc_stop_tx = {
+        let limiter = Arc::clone(&limiter);
+        spawn_periodic(&mut tasks, "dispatch_gc", DISPATCH_GC_INTERVAL, move || {
+            if let Some((before, after)) = limiter.gc_per_source() {
+                tracing::debug!(
+                    before,
+                    after,
+                    dropped = before.saturating_sub(after),
+                    "dispatch GC sweep complete"
+                );
+            }
+        })
+    };
 
     // Periodic per-region bandwidth log (#750). `interval == 0` disables it,
     // mirroring the RPC watchdog's opt-out. Same oneshot-stop shape as the GCs.
     let region_log_stop_tx = if cfg.observability.region_accounting_interval_sec > 0 {
-        let (tx, rx) = oneshot::channel::<()>();
-        tasks.spawn(run_region_accounting_log(
-            Arc::clone(&region_accountant),
-            rx,
+        let accountant = Arc::clone(&region_accountant);
+        Some(spawn_periodic(
+            &mut tasks,
+            "region_accounting_log",
             Duration::from_secs(cfg.observability.region_accounting_interval_sec),
-        ));
-        Some(tx)
+            move || log_region_snapshot(&accountant),
+        ))
     } else {
         tracing::info!(
             "region accounting log disabled (observability.region_accounting_interval_sec = 0)"
@@ -1308,38 +1132,83 @@ pub async fn run(
     };
 
     // Periodic DHT record-store GC (ADR 022 §Content Records and TTL).
-    // Without this, expired records accumulate against per-publisher
-    // and global caps — a node could exhaust its 200-record per-
-    // publisher quota and start rejecting every `Store` even though
-    // the TTL window has long passed. Same shutdown shape as the
-    // dispatch GC above.
-    let (record_store_gc_stop_tx, record_store_gc_stop_rx) = oneshot::channel::<()>();
-    tasks.spawn(run_record_store_gc(
-        Arc::clone(&record_store),
-        record_store_gc_stop_rx,
-        DISPATCH_GC_INTERVAL,
-    ));
+    // `RecordStore::providers_at` lazily scrubs expired records for the hash it
+    // is queried about, but a hash nobody queries again keeps its expired
+    // entries — they keep counting against the publisher's per-publisher quota
+    // and against the global cap until this sweep fires. Without it a node that
+    // publishes a one-shot blob can exhaust its 200-record quota and reject
+    // every future `Store`. The sweep is `O(expired × log N)` over the global
+    // LRU (front-walk in `RecordStore::gc`); default 60s is well below the
+    // 1-hour record TTL.
+    let record_store_gc_stop_tx = {
+        let records = Arc::clone(&record_store);
+        spawn_periodic(
+            &mut tasks,
+            "record_store_gc",
+            DISPATCH_GC_INTERVAL,
+            move || {
+                let now_us = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| u64::try_from(d.as_micros()).unwrap_or(u64::MAX));
+                let removed = if let Ok(mut store) = records.lock() {
+                    store.gc(now_us)
+                } else {
+                    tracing::error!("dht record-store mutex poisoned; skipping GC sweep this tick");
+                    0
+                };
+                if removed > 0 {
+                    tracing::debug!(removed, "dht record-store GC sweep complete");
+                }
+            },
+        )
+    };
 
-    // Periodic DHT rate-limiter GC (#645). Without this, the per-IP and
-    // per-peer keyed maps accumulate stale buckets indefinitely on nodes
-    // whose DHT traffic falls below the over-cap lazy-prune threshold —
-    // same DoS shape that the dispatch-limiter GC above prevents at the
-    // connection layer.
-    let (dht_rate_limit_gc_stop_tx, dht_rate_limit_gc_stop_rx) = oneshot::channel::<()>();
-    tasks.spawn(run_dht_rate_limit_gc(
-        Arc::clone(&dht_rate_limiter),
-        dht_rate_limit_gc_stop_rx,
-        DHT_RATE_LIMIT_GC_INTERVAL,
-    ));
+    // Periodic DHT rate-limiter GC (#645). The acquire path opportunistically
+    // prunes when the per-IP / per-peer keyed maps exceed `cap + cap/10`, but a
+    // node whose DHT traffic falls below that threshold can carry millions of
+    // stale buckets indefinitely — the same DoS shape the dispatch-limiter GC
+    // prevents at the connection layer. `gc_per_ip` / `gc_per_peer` use
+    // independent single-flight flags, so the two sequential sweeps here never
+    // block a concurrent lazy prune from `check`.
+    //
+    // Panic contract: a panic inside `retain_recent` (governor arithmetic bug,
+    // allocator OOM during the walk) unwinds out of the sweep and kills this
+    // task. `PruneGuard`'s Drop still releases the single-flight flag, so the
+    // lazy-prune path in `check` keeps working — but the periodic sweep is dead
+    // until restart, surfacing only via `JoinSet::join_next` at shutdown.
+    // Operators wanting earlier notice should alert on the
+    // `decdn_dht_rate_limit_tracked_{per_ip,per_peer}` gauges failing to drop on
+    // a quiet node (there the periodic sweep is their only writer). A map already
+    // empty when the sweep died sits at `0` legitimately — indistinguishable
+    // from a healthy sweep over an empty map.
+    let dht_rate_limit_gc_stop_tx = {
+        let limiter = Arc::clone(&dht_rate_limiter);
+        spawn_periodic(
+            &mut tasks,
+            "dht_rate_limit_gc",
+            DHT_RATE_LIMIT_GC_INTERVAL,
+            move || {
+                log_keyspace_gc("dht", "per_ip", limiter.gc_per_ip());
+                log_keyspace_gc("dht", "per_peer", limiter.gc_per_peer());
+            },
+        )
+    };
 
-    // Probe rate-limiter keyspace GC (#982) — same DoS-shape rationale as the
-    // DHT GC above, for the `cdn/probe/v1` per-IP / per-peer keyed maps.
-    let (probe_rate_limit_gc_stop_tx, probe_rate_limit_gc_stop_rx) = oneshot::channel::<()>();
-    tasks.spawn(run_probe_rate_limit_gc(
-        Arc::clone(&probe_rate_limiter),
-        probe_rate_limit_gc_stop_rx,
-        PROBE_RATE_LIMIT_GC_INTERVAL,
-    ));
+    // Probe rate-limiter keyspace GC (#982) — same DoS-shape rationale and panic
+    // contract as the DHT GC above, for the `cdn/probe/v1` per-IP / per-peer
+    // keyed maps.
+    let probe_rate_limit_gc_stop_tx = {
+        let limiter = Arc::clone(&probe_rate_limiter);
+        spawn_periodic(
+            &mut tasks,
+            "probe_rate_limit_gc",
+            PROBE_RATE_LIMIT_GC_INTERVAL,
+            move || {
+                log_keyspace_gc("probe", "per_ip", limiter.gc_per_ip());
+                log_keyspace_gc("probe", "per_peer", limiter.gc_per_peer());
+            },
+        )
+    };
 
     // Blacklist compliance watcher (ADR 011/031, issue #1031). Runs only when
     // the operator configures a `ContentBlacklist` address. It evicts held
@@ -3538,191 +3407,79 @@ mod tests {
         assert_eq!(ShutdownSignal::AdminDrain.to_string(), "admin-drain");
     }
 
-    /// `run_dispatch_gc` exits promptly when the stop oneshot fires,
-    /// even if the next ticker tick is far away. Without the
-    /// shutdown-wins-over-tick `biased` select, a regression that
-    /// dropped the stop arm or polled it after `ticker.tick()` would
-    /// silently extend `SHUTDOWN_DEADLINE` by up to one full
-    /// `DISPATCH_GC_INTERVAL` (60s by default).
+    /// A `spawn_periodic` task exits promptly when its stop signal fires, even
+    /// when the next tick is far away. This is the shared shutdown contract for
+    /// every periodic runner (dispatch / region / record-store / DHT / probe
+    /// GC): without the `biased; stop-before-tick` select, a regression that
+    /// dropped the stop arm or polled it after `ticker.tick()` would silently
+    /// extend `SHUTDOWN_DEADLINE` by up to one full tick interval (60s at
+    /// defaults). Also pins the burned first tick — the body must not run before
+    /// the first interval elapses.
     #[tokio::test]
-    async fn run_dispatch_gc_exits_promptly_on_shutdown() {
-        use crate::dispatch::ConnectionLimiter;
-        use crate::metrics::Metrics;
-        use decdn_common::config::ResolvedSecurity;
+    async fn spawn_periodic_exits_promptly_on_shutdown() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let metrics = Arc::new(Metrics::new());
-        let cfg = ResolvedSecurity {
-            max_concurrent_handlers: u32::MAX,
-            per_source_rate_per_sec: 0.0,
-            per_source_burst: 0,
-            max_tracked_sources: 0,
+        let ticked = Arc::new(AtomicUsize::new(0));
+        let mut tasks: JoinSet<()> = JoinSet::new();
+        // 60s interval mirrors the runtime default: on a regression that polled
+        // the ticker before the stop signal the task would hang for 60s, so the
+        // timeout below catches the real bug rather than an unrelated
+        // short-interval race.
+        let stop_tx = {
+            let ticked = Arc::clone(&ticked);
+            spawn_periodic(&mut tasks, "test", Duration::from_mins(1), move || {
+                ticked.fetch_add(1, Ordering::Relaxed);
+            })
         };
-        let limiter = Arc::new(ConnectionLimiter::new(&cfg, metrics));
 
-        let (stop_tx, stop_rx) = oneshot::channel::<()>();
-        // 60s interval to mirror the runtime default: the test would hang
-        // for 60s on a regression that polled the ticker before the stop
-        // signal, so the timeout below catches the real bug rather than
-        // an unrelated short-interval race.
-        let task = tokio::spawn(run_dispatch_gc(
-            Arc::clone(&limiter),
-            stop_rx,
-            Duration::from_mins(1),
-        ));
-
-        // Give the task a moment to enter the select loop, then signal
-        // shutdown. The task should exit well within the timeout —
-        // we allow generous headroom for slow CI runners.
+        // Give the task a moment to enter the select loop (past the burned first
+        // tick), then signal shutdown; it should exit well within the timeout,
+        // with generous headroom for slow CI runners.
         tokio::time::sleep(Duration::from_millis(50)).await;
         stop_tx.send(()).expect("receiver still alive");
 
-        let result = tokio::time::timeout(Duration::from_millis(500), task).await;
+        let joined = tokio::time::timeout(Duration::from_millis(500), tasks.join_next()).await;
         assert!(
-            result.is_ok(),
-            "run_dispatch_gc must exit within 500ms of shutdown signal; \
-             a 60s hang here means the stop arm of the select was lost"
+            matches!(joined, Ok(Some(Ok(())))),
+            "spawn_periodic must exit within 500ms of shutdown signal; a 60s hang \
+             here means the stop arm of the select was lost"
         );
-        result
-            .expect("timeout already asserted")
-            .expect("task should not panic");
+        assert_eq!(
+            ticked.load(Ordering::Relaxed),
+            0,
+            "tick body ran even though the first tick is burned and the interval never elapsed"
+        );
     }
 
+    /// `spawn_periodic` actually runs its tick body on each interval — the
+    /// complement to the burned-first-tick assertion above. A regression that
+    /// broke the `ticker.tick() => tick()` arm (or burned every tick) would
+    /// leave all five production GC/log tasks silently dead, and no shutdown
+    /// test would catch it.
     #[tokio::test]
-    async fn region_accounting_log_stops_promptly_on_signal() {
-        use std::sync::Arc;
+    async fn spawn_periodic_fires_the_tick_body() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
-        use crate::region_accounting::{RegionAccountant, RegionResolver};
+        let ticked = Arc::new(AtomicUsize::new(0));
+        let mut tasks: JoinSet<()> = JoinSet::new();
+        // Short interval so the first (post-burn) tick lands fast; the stop
+        // sender is held for the task's lifetime so it is not cancelled early.
+        let _stop_tx = {
+            let ticked = Arc::clone(&ticked);
+            spawn_periodic(&mut tasks, "test", Duration::from_millis(10), move || {
+                ticked.fetch_add(1, Ordering::Relaxed);
+            })
+        };
 
-        struct NoRegions;
-        #[async_trait::async_trait]
-        impl RegionResolver for NoRegions {
-            async fn region_of(&self, _node_id: &[u8; 32]) -> Option<String> {
-                None
+        // Poll for at least one tick with generous headroom for slow CI runners,
+        // rather than sleeping a fixed duration that could race the first tick.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while ticked.load(Ordering::Relaxed) == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
             }
-        }
-
-        let accountant = Arc::new(RegionAccountant::new(Arc::new(NoRegions)));
-        let (stop_tx, stop_rx) = oneshot::channel::<()>();
-        // A long interval so the test can only finish via the stop signal.
-        let handle = tokio::spawn(run_region_accounting_log(
-            accountant,
-            stop_rx,
-            Duration::from_hours(1),
-        ));
-        stop_tx.send(()).expect("receiver still alive");
-        tokio::time::timeout(Duration::from_secs(5), handle)
-            .await
-            .expect("log task did not stop within 5s")
-            .expect("log task panicked");
-    }
-
-    /// `run_record_store_gc` exits promptly when the stop oneshot
-    /// fires, mirroring the `run_dispatch_gc` contract above. A
-    /// regression that reordered the `tokio::select!` arms or dropped
-    /// `biased` would silently extend `SHUTDOWN_DEADLINE` by up to
-    /// one tick interval — under default `DISPATCH_GC_INTERVAL=60s`
-    /// the node would hang for a minute at shutdown.
-    #[tokio::test]
-    async fn run_record_store_gc_exits_promptly_on_shutdown() {
-        use crate::dht::{RecordStore, RecordStoreConfig};
-
-        let records = Arc::new(std::sync::Mutex::new(RecordStore::new(
-            RecordStoreConfig::default(),
-        )));
-        let (stop_tx, stop_rx) = oneshot::channel::<()>();
-        // 60s interval matches the runtime default so the test would
-        // hang for 60s on a regression rather than racing through a
-        // shorter interval.
-        let task = tokio::spawn(run_record_store_gc(
-            Arc::clone(&records),
-            stop_rx,
-            Duration::from_mins(1),
-        ));
-
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        stop_tx.send(()).expect("receiver still alive");
-        let result = tokio::time::timeout(Duration::from_millis(500), task).await;
-        assert!(
-            result.is_ok(),
-            "run_record_store_gc must exit within 500ms of shutdown signal; \
-             a 60s hang here means the stop arm of the select was lost"
-        );
-        result
-            .expect("timeout already asserted")
-            .expect("task should not panic");
-    }
-
-    /// `run_dht_rate_limit_gc` exits promptly when the stop oneshot
-    /// fires. Same shutdown-promptness contract as the sibling GC
-    /// tasks: a regression that reordered the `tokio::select!` arms or
-    /// dropped `biased` would silently extend `SHUTDOWN_DEADLINE` by up
-    /// to one `DHT_RATE_LIMIT_GC_INTERVAL` (60s) — at default settings
-    /// the node would hang for a minute at shutdown.
-    #[tokio::test]
-    async fn run_dht_rate_limit_gc_exits_promptly_on_shutdown() {
-        use crate::dht::rate_limit::{DhtRateLimitConfig, DhtRateLimiter};
-        use crate::metrics::Metrics;
-
-        let metrics = Arc::new(Metrics::new());
-        let limiter = Arc::new(DhtRateLimiter::new(&DhtRateLimitConfig::default(), metrics));
-
-        let (stop_tx, stop_rx) = oneshot::channel::<()>();
-        // 60s interval matches the runtime default so the test would
-        // hang for 60s on a regression rather than racing through a
-        // shorter interval.
-        let task = tokio::spawn(run_dht_rate_limit_gc(
-            Arc::clone(&limiter),
-            stop_rx,
-            Duration::from_mins(1),
-        ));
-
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        stop_tx.send(()).expect("receiver still alive");
-        let result = tokio::time::timeout(Duration::from_millis(500), task).await;
-        assert!(
-            result.is_ok(),
-            "run_dht_rate_limit_gc must exit within 500ms of shutdown signal; \
-             a 60s hang here means the stop arm of the select was lost"
-        );
-        result
-            .expect("timeout already asserted")
-            .expect("task should not panic");
-    }
-
-    /// `run_probe_rate_limit_gc` (#982) exits promptly when the stop oneshot
-    /// fires. Same shutdown-promptness contract as `run_dht_rate_limit_gc`
-    /// above — the probe GC task is a near-verbatim sibling, so a reordered
-    /// `tokio::select!` arm or a dropped `biased` would extend shutdown by up
-    /// to one `PROBE_RATE_LIMIT_GC_INTERVAL` (60s). Guards the copy-paste seam.
-    #[tokio::test]
-    async fn run_probe_rate_limit_gc_exits_promptly_on_shutdown() {
-        use crate::handlers::probe_rate_limit::ProbeRateLimiter;
-        use crate::metrics::Metrics;
-        use crate::rate_limit::RateLimitConfig;
-
-        let metrics = Arc::new(Metrics::new());
-        let limiter = Arc::new(ProbeRateLimiter::new(&RateLimitConfig::default(), metrics));
-
-        let (stop_tx, stop_rx) = oneshot::channel::<()>();
-        // 60s interval matches the runtime default so the test would hang for
-        // 60s on a regression rather than racing through a shorter interval.
-        let task = tokio::spawn(run_probe_rate_limit_gc(
-            Arc::clone(&limiter),
-            stop_rx,
-            Duration::from_mins(1),
-        ));
-
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        stop_tx.send(()).expect("receiver still alive");
-        let result = tokio::time::timeout(Duration::from_millis(500), task).await;
-        assert!(
-            result.is_ok(),
-            "run_probe_rate_limit_gc must exit within 500ms of shutdown signal; \
-             a 60s hang here means the stop arm of the select was lost"
-        );
-        result
-            .expect("timeout already asserted")
-            .expect("task should not panic");
+        })
+        .await
+        .expect("spawn_periodic never ran its tick body within 2s");
     }
 
     /// Mount a JSON-RPC `200 OK` POST handler. The mount lives on
