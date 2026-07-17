@@ -158,10 +158,12 @@ impl CursorStart {
             // fallback (anti-panic policy); the `warn!` makes a future break of
             // the "Seeded ⇒ cursor pre-seeded" invariant observable rather than a
             // silent full re-scan from the deploy block.
-            Self::Seeded { .. } => {
+            Self::Seeded { at, .. } => {
                 warn!(
-                    label = "seeded start reached initial_from",
-                    from_block, "cursor seed invariant violated; falling back to deploy floor"
+                    invariant = "seeded_start_reached_initial_from",
+                    seed = *at,
+                    from_block,
+                    "cursor seed invariant violated; falling back to deploy floor"
                 );
                 Ok(from_block)
             }
