@@ -86,13 +86,14 @@ const WINDOW_PULL_FALLBACK_DEADLINE: Duration = Duration::from_mins(1);
 /// Application-layer idle-close ceiling (ADR 005 §Connection lifetime): a served
 /// connection is closed this long after its last stream closes — or after it is
 /// accepted, if no stream ever opens. Distinct from
-/// the QUIC transport idle timeout (`runtime::QUIC_MAX_IDLE_TIMEOUT`, also 30s):
-/// keep-alive PINGs refresh the transport timer, so a peer can hold a connection
-/// open indefinitely while sending zero streams — only this app-layer clock
-/// reclaims it. On the serving side the node is the seller (it *receives*
-/// vouchers and replies with `VoucherAck`; it never holds a sent voucher
-/// awaiting ack), so ADR 005's "no unacknowledged vouchers in flight" clause is
-/// vacuously satisfied here and the rule reduces to purely stream-idle.
+/// the QUIC transport idle timeout (`runtime::QUIC_MAX_IDLE_TIMEOUT`, also 30s
+/// today — the two are independent constants that happen to match): keep-alive
+/// PINGs refresh the transport timer, so a peer can hold a connection open
+/// indefinitely while sending zero streams — only this app-layer clock reclaims
+/// it. ADR 005's "no unacknowledged vouchers in flight" clause never delays the
+/// reaper here: vouchers only ever flow *inside* a stream, so a connection with
+/// no stream in flight has no voucher in flight either (sent or received), and
+/// the rule reduces to purely stream-idle.
 const APP_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 // QUIC application error codes (ADR 013 §Application Error Codes). A clean
@@ -778,10 +779,17 @@ impl ClientHandler {
 
     /// Override the application-layer idle-close ceiling (`APP_IDLE_TIMEOUT`).
     /// A test seam — no production path calls this, so production leaves it unset
-    /// and the 30s ADR 005 value applies. Idempotent: a second call is ignored
-    /// (the `OnceLock` keeps the first), matching the `attach_*` wiring methods.
+    /// and the 30s ADR 005 value applies. Unlike the deliberately-lax `attach_*`
+    /// wiring methods, a second call here is a test bug: the injected timeout
+    /// would be silently dropped (the `OnceLock` keeps the first), leaving the
+    /// test on an unexpected window. So it trips a `debug_assert!` rather than
+    /// being quietly ignored.
     pub fn set_idle_timeout(&self, idle: Duration) {
-        let _ = self.idle_timeout.set(idle);
+        let newly_set = self.idle_timeout.set(idle).is_ok();
+        debug_assert!(
+            newly_set,
+            "set_idle_timeout called twice; second value ignored"
+        );
     }
 
     /// Attach the redeem-hint sender from the on-chain settlement service
@@ -1445,8 +1453,9 @@ impl ClientHandler {
                     // accepting new streams. Not a handler fault.
                     Err(_) => break,
                 },
-                // ADR 005 §Connection lifetime: close `idle_timeout` after the
-                // last stream closes (or after accept, if none ever opened).
+                // ADR 005 §Connection lifetime: close the connection after
+                // `idle_timeout` elapses with no stream — measured from the last
+                // stream's close, or from accept if none ever opened.
                 // Gated on `is_empty()` so an active stream keeps the connection
                 // open; the fresh `sleep` per iteration re-arms on any activity,
                 // so the clock counts from the last stream's close. `biased`
