@@ -46,7 +46,7 @@ use decdn_incentive::capacity_bond::CapacityBond;
 use decdn_incentive::payment_channel::PaymentChannel;
 
 use crate::chain_events::resumable_watcher::{
-    self, CursorPolicy, LogSink, WatcherConfig, WatcherHook,
+    self, CursorStart, LogSink, WatcherConfig, WatcherHook,
 };
 use crate::metrics::Metrics;
 // `MAX_BACKFILL_BLOCK_SPAN` doubles as this watcher's head-anchored boot
@@ -116,16 +116,15 @@ impl SettlementIndexer {
             poll_interval: event_poll_interval,
             max_backfill_span: MAX_BACKFILL_BLOCK_SPAN,
             // Bounded recent lookback each boot (in-memory rebuild; no durable
-            // cursor); the live tail then flows forward from there.
-            cursor: CursorPolicy::HeadMinusWindow {
+            // cursor); the live tail then flows forward from there. The floor is
+            // the watcher's `from_block` (0 here).
+            start: CursorStart::HeadMinusWindow {
                 window_blocks: MAX_BACKFILL_BLOCK_SPAN,
-                floor: 0,
             },
             initial_backoff: WATCHER_INITIAL_BACKOFF,
             max_backoff: WATCHER_MAX_BACKOFF,
             rpc_call_timeout: None,
             shutdown,
-            seed_cursor: None,
             label: "reputation-indexer",
             on_established: None,
             on_backoff: Some(rpc_failure_hook(&metrics)),

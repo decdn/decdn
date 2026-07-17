@@ -42,7 +42,7 @@ use tracing::{debug, info, warn};
 use decdn_common::redact::sanitize_err_chain;
 
 use crate::chain_events::resumable_watcher::{
-    self, CursorPolicy, LogSink, WatcherConfig, WatcherHook,
+    self, CursorStart, LogSink, WatcherConfig, WatcherHook,
 };
 use crate::chain_events::shared_head::HeadSource;
 use crate::chain_events::{AbortOnDrop, MAX_BACKFILL_BLOCK_SPAN, WATCHER_INITIAL_BACKOFF, timed};
@@ -159,16 +159,14 @@ impl SlashWatcher {
             max_backfill_span: MAX_BACKFILL_BLOCK_SPAN,
             // No durable resume cursor (the in-memory store is rebuilt each boot);
             // re-scan the bounded appeal-window lookback, clamped to the deploy
-            // floor, so a slash mined while down is re-surfaced (#1108).
-            cursor: CursorPolicy::HeadMinusWindow {
+            // floor (`from_block`), so a slash mined while down is re-surfaced (#1108).
+            start: CursorStart::HeadMinusWindow {
                 window_blocks: appeal_window_blocks(),
-                floor: from_block,
             },
             initial_backoff: WATCHER_INITIAL_BACKOFF,
             max_backoff: SLASH_MAX_BACKOFF,
             rpc_call_timeout: None,
             shutdown,
-            seed_cursor: None,
             label: "slash",
             on_established,
             on_backoff,

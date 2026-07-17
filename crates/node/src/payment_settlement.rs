@@ -82,7 +82,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::chain_events::resumable_watcher::{
-    self, CursorPolicy, LogSink, NoneFallback, WatcherConfig,
+    self, Checkpoint, CursorStart, LogSink, WatcherConfig,
 };
 use crate::chain_events::shared_head::HeadSource;
 use crate::chain_events::{
@@ -270,9 +270,9 @@ impl<P: Provider + Clone + 'static> PaymentChannelService<P> {
 
         // Settlement watcher on the resumable `eth_getLogs` poller (#1092/#1106).
         // The backfill floor and downtime-gap resume (#751/#762) are now the
-        // cursor policy's job: a persisted `ChannelOpened` checkpoint resumes
-        // across restarts; a first-ever boot (`none_fallback: Head`) scans from
-        // head, so nothing predating the node is chased. The closing-
+        // cursor start's job: a persisted `ChannelOpened` checkpoint resumes
+        // across restarts; a first-ever boot (cold store) anchors at head, so
+        // nothing predating the node is chased. The closing-
         // reconciliation backfill (#839) is subsumed: `ChannelCloseInitiated`
         // logs flow through the same scan.
         //
@@ -305,12 +305,11 @@ impl<P: Provider + Clone + 'static> PaymentChannelService<P> {
             from_block: 0,
             poll_interval: event_poll_interval,
             max_backfill_span: MAX_BACKFILL_BLOCK_SPAN,
-            cursor: cursor_policy(Arc::clone(&checkpoint_store)),
+            start: cursor_start(Arc::clone(&checkpoint_store)),
             initial_backoff: WATCHER_INITIAL_BACKOFF,
             max_backoff: WATCHER_MAX_BACKOFF,
             rpc_call_timeout: None,
             shutdown: watcher_shutdown.clone(),
-            seed_cursor: None,
             label: "settlement",
             on_established: None,
             on_backoff: None,
@@ -896,20 +895,20 @@ async fn reconcile_closing_channel<P: Provider + Clone>(
     Ok(())
 }
 
-/// The settlement watcher's cursor policy: resume the durable
-/// [`CheckpointKey::ChannelOpened`] floor (#751); a first-ever boot anchors at
-/// **head** — no channel toward this node can predate the node itself, so
-/// there is no history to replay. Pinned by a test: swapping the fallback to
-/// `FromBlock` full-scans chain history on every fresh node (`from_block` is
-/// `0` here), and swapping the key forfeits the persisted resume.
+/// The settlement watcher's cursor start: resume the durable
+/// [`CheckpointKey::ChannelOpened`] floor (#751); a first-ever boot (cold store)
+/// anchors at **head** — no channel toward this node can predate the node
+/// itself, so there is no history to replay. Pinned by a test: swapping the key
+/// forfeits the persisted resume.
 ///
 /// The `reorg_margin` rewind lives here too: it is only meaningful against a
-/// durable cursor, so [`CursorPolicy::Persisted`] owns it (#1227).
-fn cursor_policy(store: Arc<dyn KeyedCheckpointStore>) -> CursorPolicy {
-    CursorPolicy::Persisted {
-        store,
-        key: CheckpointKey::ChannelOpened,
-        none_fallback: NoneFallback::Head,
+/// durable cursor, so [`CursorStart::FromCheckpoint`] owns it (#1227).
+fn cursor_start(store: Arc<dyn KeyedCheckpointStore>) -> CursorStart {
+    CursorStart::FromCheckpoint {
+        checkpoint: Checkpoint {
+            store,
+            key: CheckpointKey::ChannelOpened,
+        },
         reorg_margin: REORG_MARGIN_BLOCKS,
     }
 }
@@ -2219,9 +2218,9 @@ mod tests {
     }
 
     /// POLICY PIN: the settlement watcher resumes the durable `ChannelOpened`
-    /// floor and anchors a first-ever boot at head. A `FromBlock` fallback here
-    /// would full-scan chain history on every fresh node (settlement's
-    /// `from_block` is 0); a different key forfeits the #751 resume.
+    /// floor; a different key forfeits the #751 resume. A cold-store first boot
+    /// anchors at head (see `resolve_persisted_start`), so no fresh node
+    /// full-scans chain history.
     ///
     /// Also pins the reorg rewind at the shared `REORG_MARGIN_BLOCKS`. This
     /// asserts the value the *production* config carries, which is the point:
@@ -2230,15 +2229,16 @@ mod tests {
     /// supplied. A rewind of `0` here would silently forfeit the shallow-reorg
     /// coverage on resume.
     #[test]
-    fn cursor_policy_is_persisted_channel_opened_head_fallback() {
+    fn cursor_start_is_from_checkpoint_channel_opened() {
         let store: Arc<dyn KeyedCheckpointStore> = Arc::new(RecordingCheckpointStore::default());
         assert!(matches!(
-            cursor_policy(store),
-            CursorPolicy::Persisted {
-                key: CheckpointKey::ChannelOpened,
-                none_fallback: NoneFallback::Head,
+            cursor_start(store),
+            CursorStart::FromCheckpoint {
+                checkpoint: Checkpoint {
+                    key: CheckpointKey::ChannelOpened,
+                    ..
+                },
                 reorg_margin: REORG_MARGIN_BLOCKS,
-                ..
             }
         ));
     }
