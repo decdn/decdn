@@ -1563,8 +1563,9 @@ macro_rules! recorders {
 /// `None -> Some` edge into an error window, stamps the watcher's
 /// `Mutex<Option<Instant>>` `down_since` field and bumps its `*_restarts`
 /// counter exactly once per drift window; and a `*_cycle_established` recorder
-/// that clears `down_since` on recovery. A poisoned lock skips the update — the
-/// `*_down_seconds` gauge keeps climbing, which is the safe alerting direction.
+/// that clears `down_since` on recovery. A poisoned lock skips the update; the
+/// scrape-time recompute then reports the `*_down_seconds` gauge as `i64::MAX`
+/// — the safe alerting direction, never `0` (which would mask an outage).
 ///
 /// These cannot live in `recorders!` because their bodies branch and touch
 /// `Metrics`'s own `Mutex` state rather than a single `self.decdn.field.op(v)`.
@@ -2231,7 +2232,8 @@ watcher_downtime_recorders! {
     /// off (#1032). Stamps `slash_watcher_down_since` (once per drift window) so
     /// `slash_watcher_down_seconds` climbs until the next healthy cycle. Mirrors
     /// [`Self::staker_set_watcher_backoff_started`]; a poisoned lock skips the
-    /// update (the gauge keeps climbing — the safe alerting direction).
+    /// update (the gauge then reads `i64::MAX` at scrape — the safe alerting
+    /// direction).
     slash_watcher_backoff_started,
     /// Mark the slash-detection watcher cycle established (#1032): clear
     /// `slash_watcher_down_since` so `slash_watcher_down_seconds` reads `0` for
@@ -2260,8 +2262,8 @@ watcher_downtime_recorders! {
     /// `staker_set_watcher_down_seconds`
     /// reads `0` for the entire life of this cycle, however long. A poisoned
     /// lock is treated as "skip the update" rather than panicking (anti-panic
-    /// policy); the gauge then keeps climbing, which is the safe (alerting)
-    /// direction.
+    /// policy); the gauge's poison fallback (`i64::MAX`) then keeps the alert
+    /// tripped — the safe (alerting) direction.
     staker_set_watcher_cycle_established,
     down_since: staker_set_watcher_down_since,
     restarts: staker_set_watcher_restarts,
