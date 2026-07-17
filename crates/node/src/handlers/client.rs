@@ -110,8 +110,8 @@ struct ChannelDeliveryState {
 /// for the task's lifetime, so a warm that never ends means the node can never warm
 /// that blob again for the life of the process.
 ///
-/// Sized ~21× the derived foreground deadline ([`crate::selection::outer_pull_deadline`] —
-/// `(5 + 20 + 20) × 3 + 37 s = 172 s` at defaults), so it bounds no honest transfer the
+/// Sized ~21.5× the derived foreground deadline ([`crate::selection::outer_pull_deadline`] —
+/// `(5 + 20 + 20) × 3 + 32.5 s = 167.5 s` at defaults), so it bounds no honest transfer the
 /// node's `max_blob_size_mb` ceiling permits — a 1 GiB blob would have to average under
 /// 300 KB/s to hit it — while still guaranteeing every warm terminates. Not config-tunable
 /// (YAGNI): an operator who needs to tune this wants `node_pull_stall_timeout_sec`, which is
@@ -119,7 +119,8 @@ struct ChannelDeliveryState {
 ///
 /// The ratio is stated against the deadline rather than restating its arithmetic, because
 /// restating it is how this comment went stale: it said `+ 10 s` and `~25×` after the slack
-/// became derived (5 s probe + 4 × 8 s lookup = 37 s, not 10 s), and 3600/172 is ~21, not 25.
+/// became derived (500 ms probe + 4 × 8 s lookup = 32.5 s, not 10 s), and 3600/167.5 is
+/// ~21.5, not 25.
 pub const BACKGROUND_FILL_HARD_CAP: Duration = Duration::from_hours(1);
 
 /// Ceiling on the memory background warms may hold at once, in MiB (#1145 review).

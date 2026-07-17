@@ -223,7 +223,7 @@ pub const DEFAULT_NODE_PULL_TIMEOUT_SEC: u64 = 20;
 /// candidates — otherwise a single silent peer eats the whole deadline and the fallback
 /// loop never reaches the others (#859, and the reason this knob is an argument to that
 /// function). So each second added here adds ~3 to the worst-case wait a client can see on
-/// a total miss: 172 s at defaults.
+/// a total miss: 167.5 s at defaults.
 pub const DEFAULT_NODE_PULL_STALL_TIMEOUT_SEC: u64 = 20;
 
 /// Default window-paced pull-through pipeline window (#856, ADR 037
