@@ -735,7 +735,9 @@ impl ClientHandler {
         max_concurrent_streams: usize,
     ) -> anyhow::Result<Self> {
         let mut map = HashMap::new();
+        let mut channel_deposit = U256::ZERO;
         for state in channel_state_store.load_all()? {
+            channel_deposit = channel_deposit.saturating_add(state.deposit);
             let bytes = state.last_bytes_delivered();
             map.insert(
                 state.channel_id,
@@ -745,6 +747,7 @@ impl ClientHandler {
                 })),
             );
         }
+        metrics.set_inbound_channel_snapshot(map.len(), channel_deposit);
         Ok(Self {
             node_id,
             metrics,
@@ -1339,6 +1342,7 @@ impl ClientHandler {
                     bytes_delivered_cumulative: bytes,
                 }))
             });
+        self.refresh_channel_metrics().await;
         Ok(())
     }
 
@@ -1351,6 +1355,7 @@ impl ClientHandler {
     /// Propagates a [`StoreError`] if the durable delete fails.
     pub async fn forget_channel(&self, channel_id: ChannelId) -> Result<(), StoreError> {
         self.channels.lock().await.remove(&channel_id);
+        self.refresh_channel_metrics().await;
         // Drop the in-memory last-voucher stamp too (issue #749 review):
         // `touch` inserts per-channel with no eviction, so without this a
         // settled channel's `Instant` would linger for the whole process
@@ -1398,7 +1403,19 @@ impl ClientHandler {
             .await
             .map_err(|e| StoreError::Backend(format!("update_channel_deposit join: {e}")))??;
         guard.state = next;
+        drop(guard);
+        self.refresh_channel_metrics().await;
         Ok(())
+    }
+
+    async fn refresh_channel_metrics(&self) {
+        let channels = self.channels.lock().await;
+        let mut deposit = U256::ZERO;
+        for channel in channels.values() {
+            deposit = deposit.saturating_add(channel.lock().await.state.deposit);
+        }
+        self.metrics
+            .set_inbound_channel_snapshot(channels.len(), deposit);
     }
 
     /// Accept the connection-level rate-limit permit, then serve each inbound
@@ -1528,6 +1545,7 @@ impl ClientHandler {
                 return self.handle_cooperative_close(send, cc).await;
             }
         };
+        let _stream_guard = self.metrics.inbound_stream_guard();
 
         // Verify an ephemeral client binding if present (ADR 005 §Client
         // identity binding) and remember the recovered address for the

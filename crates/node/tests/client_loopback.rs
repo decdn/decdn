@@ -2529,6 +2529,87 @@ async fn update_channel_deposit_raises_and_is_idempotent() -> anyhow::Result<()>
     Ok(())
 }
 
+/// Key-rotation runbook gauges are absolute snapshots of the live inbound
+/// channel map: hydration, add, top-up, settle, and replay must never drift.
+#[tokio::test]
+async fn channel_metrics_follow_lifecycle_without_replay_double_count() -> anyhow::Result<()> {
+    let (cache, _tmp) = empty_cache().await?;
+    let store = Arc::new(MemoryChannelStateStore::new());
+    let client = PrivateKeySigner::random().address();
+    store.record(&ChannelState::new(
+        channel_id(),
+        client,
+        TOKEN,
+        U256::from(10_000_000u64),
+    ))?;
+
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let server_eth = Arc::new(PrivateKeySigner::random());
+    let store_dyn: Arc<dyn ChannelStateStore> = store;
+    let handler = build_handler(
+        fresh_key().public(),
+        &server_eth,
+        &metrics,
+        limiter,
+        cache,
+        store_dyn,
+        RATE_PER_MB,
+    )?;
+
+    let assert_snapshot = |open: u64, deposit: u64| -> anyhow::Result<()> {
+        let encoded = metrics.encode()?;
+        anyhow::ensure!(
+            metric_line_present(&encoded, &format!("decdn_channels_open {open}")),
+            "open-channel gauge mismatch:\n{encoded}"
+        );
+        anyhow::ensure!(
+            metric_line_present(&encoded, &format!("decdn_channel_deposit_usdc {deposit}")),
+            "channel-deposit gauge mismatch:\n{encoded}"
+        );
+        Ok(())
+    };
+
+    assert_snapshot(1, 10_000_000)?;
+
+    // Replaying the hydrated open must not add either the channel or deposit.
+    handler
+        .register_open_channel(ChannelState::new(
+            channel_id(),
+            client,
+            TOKEN,
+            U256::from(1u64),
+        ))
+        .await?;
+    assert_snapshot(1, 10_000_000)?;
+
+    let second = B256::repeat_byte(0x88);
+    handler
+        .register_open_channel(ChannelState::new(
+            second,
+            client,
+            TOKEN,
+            U256::from(7_000_000u64),
+        ))
+        .await?;
+    assert_snapshot(2, 17_000_000)?;
+
+    handler
+        .update_channel_deposit(second, U256::from(9_000_000u64))
+        .await?;
+    assert_snapshot(2, 19_000_000)?;
+    handler
+        .update_channel_deposit(second, U256::from(9_000_000u64))
+        .await?;
+    assert_snapshot(2, 19_000_000)?;
+
+    handler.forget_channel(channel_id()).await?;
+    assert_snapshot(1, 9_000_000)?;
+    handler.forget_channel(channel_id()).await?;
+    assert_snapshot(1, 9_000_000)?;
+    Ok(())
+}
+
 // ===========================================================================
 // Node-to-node cache-miss pull-through authorization gate (#831)
 //

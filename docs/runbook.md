@@ -176,11 +176,11 @@ publishing DHT records, stop serving (`StreamRequest` → `HashBlacklisted`), an
 evict. **None of this is implemented at PoC, on either side.** The deployed
 `ContentBlacklist` exposes no `getBlacklistVersion()` accessor (so even the
 delta-sync query the ADR assumes would need a contract change), and the node
-has no blacklist watcher in `crates/`. The `decdn_blacklist_sync_lag_seconds` /
-`decdn_blacklist_version_behind` metrics and their alerts exist in
+has no blacklist watcher in `crates/`. Alerts for
+`decdn_blacklist_sync_lag_seconds` / `decdn_blacklist_version_behind` exist in
 `monitoring/prometheus-alerts.yml` (and the sync-lag panel in the Grafana
-dashboard) but are **not emitted by the node** (the same situation as
-`decdn_streams_active` — pre-wired ahead of the implementation). Until both land, hash-level takedown is a
+dashboard), but the underlying metrics are **not emitted by the node**. Until
+the watcher and metrics land, hash-level takedown is a
 **manual operator action** — see Remediate below.
 
 Operator-*level* blacklisting is different and **is** enforced today: when
@@ -286,10 +286,7 @@ nodeId-indexed `NodeAutoEjected`. The node's staker-set watcher follows
   10 minutes (the alert and metric are registered as
   `decdn_gossip_peer_table_size` in `crates/node/src/metrics.rs`).
 - `DecdnNoActiveStreams` (warning) — `decdn_streams_active == 0` across all
-  directions for 15 minutes (gossip degradation is one of several causes;
-  note the underlying `decdn_streams_active` metric is not yet exported by
-  the node — track in `monitoring/prometheus-alerts.yml` until stream
-  instrumentation lands).
+  directions for 15 minutes (gossip degradation is one of several causes).
 - `decdn_iroh_*` transport-level metrics for connection failures (registered
   under the `decdn_iroh_` prefix per `crates/node/src/metrics.rs`).
 

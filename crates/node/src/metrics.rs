@@ -9,6 +9,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
+use alloy::primitives::U256;
 use bytes::Bytes;
 use decdn_cache::CacheMetrics;
 use decdn_incentive::ChannelOpenFailureReason;
@@ -17,7 +18,9 @@ use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use iroh::Endpoint;
-use iroh_metrics::{Counter, Gauge, MetricsGroup, MetricsSource, Registry};
+use iroh_metrics::{
+    Counter, EncodeLabelSet, EncodeLabelValue, Family, Gauge, MetricsGroup, MetricsSource, Registry,
+};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, oneshot};
@@ -26,6 +29,31 @@ use tokio::sync::{Semaphore, oneshot};
 /// peer opens many sockets to the operational-data endpoint and exhausts
 /// tasks.
 const MAX_METRICS_CONNECTIONS: usize = 32;
+
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Hash,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Serialize,
+    Deserialize,
+    EncodeLabelValue,
+)]
+enum StreamDirection {
+    Inbound,
+    Outbound,
+}
+
+#[derive(
+    Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, EncodeLabelSet,
+)]
+struct StreamLabels {
+    direction: StreamDirection,
+}
 
 /// deCDN-specific counters and gauges surfaced at `/metrics`.
 ///
@@ -38,6 +66,12 @@ pub struct DecdnMetrics {
     pub probe_requests: Counter,
     /// Currently open QUIC connections.
     pub active_connections: Gauge,
+    /// Currently open paid delivery streams, split by node direction.
+    streams_active: Family<StreamLabels, Gauge>,
+    /// Currently open inbound payment channels.
+    pub channels_open: Gauge,
+    /// Total raw USDC deposits across open inbound payment channels.
+    pub channel_deposit_usdc: Gauge,
     /// `cdn/client/v1` connections closed by the application-layer idle reaper
     /// (ADR 005 §Connection lifetime): no stream for `APP_IDLE_TIMEOUT` after the
     /// last one closed. A sustained rate flags peers parking streamless
@@ -46,7 +80,7 @@ pub struct DecdnMetrics {
     /// `decdn_client_idle_close_total`.
     pub client_idle_close: Counter,
     /// Seconds since node start.
-    pub uptime_seconds: Gauge,
+    pub node_uptime_seconds: Gauge,
     /// `NodeAnnounce` messages published to any gossip topic.
     pub gossip_announces_published_total: Counter,
     /// `NodeAnnounce`-bearing gossip envelopes received on any topic.
@@ -1219,6 +1253,8 @@ pub struct Metrics {
     registry: Arc<RwLock<Registry>>,
     decdn: Arc<DecdnMetrics>,
     cache: Arc<CacheMetrics>,
+    inbound_streams: Arc<Gauge>,
+    outbound_streams: Arc<Gauge>,
     started_at: Instant,
     /// Distinct remote endpoint ids with a completed 0-RTT-eligible
     /// handshake. Backs the approximate `quic_session_ticket_cache_size`
@@ -1265,6 +1301,13 @@ fn sat(n: usize) -> i64 {
     i64::try_from(n).unwrap_or(i64::MAX)
 }
 
+fn sat_u256(n: U256) -> i64 {
+    u64::try_from(n)
+        .ok()
+        .and_then(|raw| i64::try_from(raw).ok())
+        .unwrap_or(i64::MAX)
+}
+
 impl Metrics {
     /// Create the registry and register deCDN's metric group plus the
     /// cache crate's `decdn_cache_*` group. The cache handle is shared
@@ -1272,6 +1315,12 @@ impl Metrics {
     /// land in the same encoder output.
     pub fn new() -> Self {
         let decdn = Arc::new(DecdnMetrics::default());
+        let inbound_streams = decdn.streams_active.get_or_create(&StreamLabels {
+            direction: StreamDirection::Inbound,
+        });
+        let outbound_streams = decdn.streams_active.get_or_create(&StreamLabels {
+            direction: StreamDirection::Outbound,
+        });
         let cache = Arc::new(CacheMetrics::default());
         let mut registry = Registry::default();
         registry.register(decdn.clone() as Arc<dyn MetricsGroup>);
@@ -1284,6 +1333,8 @@ impl Metrics {
             registry: Arc::new(RwLock::new(registry)),
             decdn,
             cache,
+            inbound_streams,
+            outbound_streams,
             started_at: Instant::now(),
             session_ticket_peers: Mutex::new(HashSet::new()),
             staker_set_watcher_down_since: Mutex::new(None),
@@ -1295,6 +1346,12 @@ impl Metrics {
     /// Shared `Arc<CacheMetrics>` for wiring into [`decdn_cache::CacheEngine`].
     pub fn cache_metrics(&self) -> Arc<CacheMetrics> {
         Arc::clone(&self.cache)
+    }
+
+    /// Replace the inbound channel gauges with a snapshot from the live store.
+    pub(crate) fn set_inbound_channel_snapshot(&self, open: usize, deposit: U256) {
+        self.decdn.channels_open.set(sat(open));
+        self.decdn.channel_deposit_usdc.set(sat_u256(deposit));
     }
 
     /// Register iroh's transport metrics under the `decdn_iroh_` prefix so
@@ -1485,6 +1542,16 @@ impl Metrics {
         ConnectionGuard::new(self)
     }
 
+    /// Count one inbound paid-delivery stream until the returned guard drops.
+    pub(crate) fn inbound_stream_guard(&self) -> StreamGuard {
+        StreamGuard::new(Arc::clone(&self.inbound_streams))
+    }
+
+    /// Count one outbound paid-delivery stream until the returned guard drops.
+    pub(crate) fn outbound_stream_guard(&self) -> StreamGuard {
+        StreamGuard::new(Arc::clone(&self.outbound_streams))
+    }
+
     /// Render the registry as `OpenMetrics` text — exactly the body the
     /// public `/metrics` HTTP endpoint serves. `pub` (not `pub(crate)`)
     /// so integration tests in sibling crates can assert on the exported
@@ -1492,7 +1559,7 @@ impl Metrics {
     /// unauthenticated `/metrics` endpoint doesn't already.
     pub fn encode(&self) -> anyhow::Result<String> {
         let uptime = i64::try_from(self.started_at.elapsed().as_secs()).unwrap_or(i64::MAX);
-        self.decdn.uptime_seconds.set(uptime);
+        self.decdn.node_uptime_seconds.set(uptime);
 
         // Recompute the per-watcher down-seconds gauges from their `down_since`,
         // mirroring `uptime_seconds` above (staker_set #783, origin_directory
@@ -1514,7 +1581,7 @@ impl Metrics {
 /// Each entry spells out both names — `method => field.op(value)` — because the
 /// two diverge for 45 of them: the method reads as a singular event while the
 /// field is plural (`probe_request` vs `probe_requests`), or the field is a
-/// semantic rename of the action (`started` sets `uptime_seconds`,
+/// semantic rename of the action (`started` sets `node_uptime_seconds`,
 /// `connection_opened` bumps `active_connections`). Deriving one name from the
 /// other would bind the wrong series, so neither is ever synthesized. (Field
 /// names also carry their own encoder convention — most omit the `_total`
@@ -1633,7 +1700,7 @@ macro_rules! watcher_downtime_recorders {
 }
 
 recorders! {
-    started => uptime_seconds.set(0);
+    started => node_uptime_seconds.set(0);
     probe_request => probe_requests.inc();
 
     /// A probe answered `has_blob: false` despite the bytes being present,
@@ -2542,6 +2609,25 @@ impl Drop for ConnectionGuard<'_> {
     }
 }
 
+/// Drop-safe accounting for a paid delivery stream in one direction.
+#[derive(Debug)]
+pub(crate) struct StreamGuard {
+    gauge: Arc<Gauge>,
+}
+
+impl StreamGuard {
+    fn new(gauge: Arc<Gauge>) -> Self {
+        gauge.inc();
+        Self { gauge }
+    }
+}
+
+impl Drop for StreamGuard {
+    fn drop(&mut self) {
+        self.gauge.dec();
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -2557,6 +2643,68 @@ mod tests {
     fn has_metric_line(text: &str, name: &str, value: u64) -> bool {
         let needle = format!("{name} {value}");
         text.lines().any(|l| l == needle)
+    }
+
+    #[test]
+    fn key_rotation_metrics_export_canonical_names_at_zero() {
+        let metrics = Metrics::new();
+        let text = metrics.encode().unwrap();
+
+        for name in [
+            "decdn_streams_active{direction=\"inbound\"}",
+            "decdn_streams_active{direction=\"outbound\"}",
+            "decdn_channels_open",
+            "decdn_channel_deposit_usdc",
+            "decdn_node_uptime_seconds",
+        ] {
+            assert!(
+                has_metric_line(&text, name, 0),
+                "canonical gauge {name} should be exposed at zero:\n{text}"
+            );
+        }
+        assert!(
+            !text
+                .lines()
+                .any(|line| line.starts_with("decdn_uptime_seconds ")),
+            "retired uptime name must not be exported:\n{text}"
+        );
+    }
+
+    #[test]
+    fn stream_guards_track_direction_and_drop_on_error() {
+        fn inbound_error(metrics: &Metrics) -> Result<(), ()> {
+            let _guard = metrics.inbound_stream_guard();
+            let text = metrics.encode().unwrap();
+            assert!(has_metric_line(
+                &text,
+                "decdn_streams_active{direction=\"inbound\"}",
+                1
+            ));
+            Err(())
+        }
+
+        let metrics = Metrics::new();
+        assert!(inbound_error(&metrics).is_err());
+        assert!(has_metric_line(
+            &metrics.encode().unwrap(),
+            "decdn_streams_active{direction=\"inbound\"}",
+            0
+        ));
+
+        {
+            let _first = metrics.outbound_stream_guard();
+            let _second = metrics.outbound_stream_guard();
+            assert!(has_metric_line(
+                &metrics.encode().unwrap(),
+                "decdn_streams_active{direction=\"outbound\"}",
+                2
+            ));
+        }
+        assert!(has_metric_line(
+            &metrics.encode().unwrap(),
+            "decdn_streams_active{direction=\"outbound\"}",
+            0
+        ));
     }
 
     #[test]
@@ -3128,7 +3276,7 @@ mod tests {
         // Sanity: the node really is "old" (uptime reflects the backdate), so a
         // gauge that tracked age would be non-zero.
         assert!(
-            has_metric_line(&text, "decdn_uptime_seconds", 3600),
+            has_metric_line(&text, "decdn_node_uptime_seconds", 3600),
             "uptime should reflect the backdated start:\n{text}"
         );
         assert!(
