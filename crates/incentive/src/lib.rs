@@ -61,8 +61,8 @@ pub use bind_sig::{
     bind_node_id_domain, binding_signing_hash, register_node_signing_hash, verify_binding,
 };
 pub use buyer_channel::{
-    AdvanceOutcome, BuyerChannelState, BuyerChannelStore, BuyerProgressError, DepositOutcome,
-    MemoryBuyerChannelStore,
+    AdvanceOutcome, BuyerChannelState, BuyerChannelStore, BuyerLoad, BuyerProgressError,
+    DepositOutcome, MemoryBuyerChannelStore,
 };
 pub use channel::{ChannelError, ChannelId, ChannelState, VoucherApplied};
 pub use channel_open_error::ChannelOpenFailureReason;

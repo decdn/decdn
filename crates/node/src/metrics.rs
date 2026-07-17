@@ -362,6 +362,13 @@ pub struct DecdnMetrics {
     /// consecutive sweeps. Operator-visible name:
     /// `decdn_buyer_reclaim_failures_total`.
     pub buyer_reclaim_failures: Counter,
+    /// Buyer-channel rows omitted from a successful store hydration because
+    /// their persisted values could not be decoded. Counted once per skipped
+    /// row per load attempt, so a persistent malformed row keeps the alert
+    /// active while healthy rows continue through buyer maintenance. Operator-
+    /// visible name:
+    /// `decdn_buyer_channel_store_skipped_undecodable_records_total`.
+    pub buyer_channel_store_skipped_undecodable_records: Counter,
     /// Idle buyer channels cooperatively closed by the reconcile sweep (#972),
     /// reclaiming their deposit early instead of waiting for on-chain expiry. A
     /// healthy capital-efficiency signal — each increment is one deposit freed
@@ -1704,6 +1711,14 @@ recorders! {
     /// threshold `error!` in `reclaim_once`.
     buyer_reclaim_failure => buyer_reclaim_failures.inc();
 
+    /// Buyer-channel rows skipped as undecodable during one successful store
+    /// hydration (#1271). Counted once per skipped row per load attempt (each of
+    /// the startup, reconcile, and reclaim loads bumps it), so a persistent
+    /// malformed row keeps the escrowed-but-untracked alert active. The
+    /// `usize` count is saturated into the `u64` counter.
+    buyer_channel_store_skipped_undecodable_records(count: usize)
+        => buyer_channel_store_skipped_undecodable_records.inc_by(u64::try_from(count).unwrap_or(u64::MAX));
+
     /// The idle-reconcile sweep cooperatively closed one idle buyer channel,
     /// reclaiming its deposit early (#972).
     buyer_reconcile_settled => buyer_reconcile_settled.inc();
@@ -2568,6 +2583,40 @@ mod tests {
         assert!(
             has_metric_line(&text, "decdn_voucher_nonce_gaps_total", 2),
             "expected 2 gap events (one bump each, not gap-size weighted):\n{text}"
+        );
+    }
+
+    #[test]
+    fn buyer_channel_skipped_undecodable_metric_starts_at_zero_and_increments() {
+        // #1271. The struct field is `buyer_channel_store_skipped_undecodable_records`;
+        // the OpenMetrics encoder appends `_total`, so the exported name is
+        // `decdn_buyer_channel_store_skipped_undecodable_records_total` — the
+        // operator-visible name the observability appendix and any escrowed-but-
+        // untracked alert reference. Pin the suffixed form: a rename that re-added
+        // `_total` would emit `..._total_total` (the same footgun the cache GC and
+        // voucher-nonce counters guard against), silently dropping the alert. The
+        // counter takes a per-load skipped count, so `inc_by(2)` must read 2.
+        let metrics = Metrics::new();
+        let text = metrics.encode().unwrap();
+        assert!(
+            has_metric_line(
+                &text,
+                "decdn_buyer_channel_store_skipped_undecodable_records_total",
+                0
+            ),
+            "skipped-undecodable counter should be exposed at zero on a fresh registry:\n{text}"
+        );
+
+        metrics.buyer_channel_store_skipped_undecodable_records(2);
+
+        let text = metrics.encode().unwrap();
+        assert!(
+            has_metric_line(
+                &text,
+                "decdn_buyer_channel_store_skipped_undecodable_records_total",
+                2
+            ),
+            "expected the per-load skipped count (2) to increment the counter:\n{text}"
         );
     }
 

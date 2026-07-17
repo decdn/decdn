@@ -120,6 +120,7 @@ The metrics backend (`iroh_metrics`) carries no label dimension, so the per-`gat
 | `decdn_channels_open` | Gauge | M | Currently open payment channels (as node — inbound from clients). |
 | `decdn_channels_settled_total` | Counter | M | Channels settled on-chain. |
 | `decdn_channel_deposit_usdc` | Gauge | M | Total USDC deposited across all currently open inbound channels. Represents maximum on-chain recoverable value. |
+| `decdn_buyer_channel_store_skipped_undecodable_records_total` | Counter | M | Buyer-channel rows omitted from successful store hydration because their persisted values cannot be decoded. One bad row does not stop healthy channels from loading or being reclaimed; each load attempt counts every omitted row, so any increase means a buyer deposit is escrowed but untracked and requires record repair. |
 | `decdn_vouchers_signed_total` | Counter | M | Vouchers signed by this node as the payee. |
 | `decdn_vouchers_received_total` | Counter | R | Vouchers received by this node as the payer (node-to-node pulls). |
 | `decdn_channel_disputes_total` | Counter | R | Channels that entered the dispute window. |

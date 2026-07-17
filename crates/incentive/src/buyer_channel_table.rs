@@ -29,7 +29,7 @@ use alloy::primitives::{Address, B256, U256};
 use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 
-use crate::buyer_channel::{AdvanceOutcome, BuyerChannelState, DepositOutcome};
+use crate::buyer_channel::{AdvanceOutcome, BuyerChannelState, BuyerLoad, DepositOutcome};
 use crate::channel::ChannelId;
 use crate::store::StoreError;
 
@@ -224,34 +224,27 @@ impl<'a> BuyerChannelTable<'a> {
     /// id can't be named — it lives inside the undecodable bytes — so the
     /// on-chain provider key is the only handle it can offer.
     ///
-    /// **That log only reaches a `decdn-node` operator.** The node installs a
-    /// `tracing` subscriber; the `decdn` CLI — the sole consumer of
-    /// `RedbBuyerChannelStore` — does not, and has no `tracing` dependency at
-    /// all, so for the client store this skip is entirely silent: `decdn channel
-    /// list` omits the row and `decdn channel clean` can report "no tracked
-    /// channels to clean" while the deposit is still escrowed. Pre-existing (both
-    /// stores behaved this way before #1246 unified them), and not fixable from
-    /// here — it needs `load_all` to *return* the skipped providers so each
-    /// caller can surface them, which changes the [`BuyerChannelStore`] trait.
-    /// Tracked as follow-up; do not read the paragraph above as a claim that a
-    /// CLI user is told anything.
+    /// The returned [`BuyerLoad`] also carries every skipped provider. This lets
+    /// callers expose the condition through their own user or operator surface
+    /// without coupling the incentive crate to a CLI or node metrics backend.
     ///
     /// [`BuyerChannelStore`]: crate::buyer_channel::BuyerChannelStore
     ///
     /// # Errors
     ///
     /// [`StoreError::Backend`] if the table or its iterator is unreadable.
-    pub fn load_all(&self) -> Result<Vec<BuyerChannelState>, StoreError> {
+    pub fn load_all(&self) -> Result<BuyerLoad, StoreError> {
         let read_txn = self
             .db
             .begin_read()
             .map_err(|err| StoreError::Backend(format!("begin_read: {err}")))?;
         let table = match read_txn.open_table(BUYER_CHANNEL_TABLE) {
             Ok(t) => t,
-            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(BuyerLoad::default()),
             Err(err) => return Err(StoreError::Backend(format!("open_table: {err}"))),
         };
         let mut out = Vec::new();
+        let mut skipped = Vec::new();
         let iter = table
             .iter()
             .map_err(|err| StoreError::Backend(format!("table iter: {err}")))?;
@@ -261,17 +254,24 @@ impl<'a> BuyerChannelTable<'a> {
             let key_bytes: [u8; 20] = *key_guard.value();
             match decode_record(key_bytes, value_guard.value()) {
                 Ok(state) => out.push(state),
-                Err(err) => tracing::error!(
-                    provider = %Address::from(key_bytes),
-                    %err,
-                    event = "buyer_channel_store_skip_undecodable_record",
-                    "buyer channel hydration: skipping an undecodable record; its escrowed deposit \
-                     is untracked and will not be auto-reclaimed until the record is repaired \
-                     (other channels remain healthy)",
-                ),
+                Err(err) => {
+                    let provider = Address::from(key_bytes);
+                    skipped.push(provider);
+                    tracing::error!(
+                        %provider,
+                        %err,
+                        event = "buyer_channel_store_skip_undecodable_record",
+                        "buyer channel hydration: skipping an undecodable record; its escrowed \
+                         deposit is untracked and will not be auto-reclaimed until the record is \
+                         repaired (other channels remain healthy)",
+                    );
+                }
             }
         }
-        Ok(out)
+        Ok(BuyerLoad {
+            channels: out,
+            skipped,
+        })
     }
 
     /// Persist (insert or overwrite) the state for one channel, keyed by
@@ -510,10 +510,8 @@ impl<'a> BuyerChannelTable<'a> {
     /// Write raw value bytes under `provider`'s key, **bypassing the encoder**,
     /// to simulate a row left undecodable by a binary downgrade.
     ///
-    /// Seeds corruption against a live store for the tolerance tests here, and —
-    /// via `decdn-node`'s `insert_raw_buyer_record` — for its buyer
-    /// reconciliation + mixed-reclaim e2e (#763), which lives in a separate
-    /// integration-test crate.
+    /// Seeds corruption against a live store for the tolerance tests here and,
+    /// through store-specific test seams, for cross-crate consumer tests.
     ///
     /// Gated behind `test-util` rather than `#[cfg(test)]` because a cross-crate
     /// `cfg(test)` does not propagate: node's seam could not reach a
@@ -704,7 +702,7 @@ mod tests {
     #[test]
     fn open_empty_store_returns_no_entries() -> anyhow::Result<()> {
         let (_d, db) = db()?;
-        anyhow::ensure!(tbl(&db).load_all()?.is_empty());
+        anyhow::ensure!(tbl(&db).load_all()?.channels.is_empty());
         anyhow::ensure!(tbl(&db).get_by_provider(state(1).provider)?.is_none());
         Ok(())
     }
@@ -726,11 +724,17 @@ mod tests {
         }
         // Reopen the same file: records survive.
         let db = Database::create(&path)?;
-        let mut all = tbl(&db).load_all()?;
-        all.sort_by_key(|s| s.provider);
-        anyhow::ensure!(all.len() == 2);
-        anyhow::ensure!(*all.first().ok_or_else(|| anyhow::anyhow!("[0]"))? == a);
-        anyhow::ensure!(*all.get(1).ok_or_else(|| anyhow::anyhow!("[1]"))? == b);
+        let mut load = tbl(&db).load_all()?;
+        load.channels.sort_by_key(|s| s.provider);
+        anyhow::ensure!(load.channels.len() == 2);
+        anyhow::ensure!(
+            *load
+                .channels
+                .first()
+                .ok_or_else(|| anyhow::anyhow!("[0]"))?
+                == a
+        );
+        anyhow::ensure!(*load.channels.get(1).ok_or_else(|| anyhow::anyhow!("[1]"))? == b);
         Ok(())
     }
 
@@ -742,7 +746,10 @@ mod tests {
         s.last_nonce = U256::from(99u64);
         s.deposit = U256::from(20_000_000u64);
         tbl(&db).record(&s)?;
-        anyhow::ensure!(tbl(&db).load_all()?.len() == 1, "same provider overwrites");
+        anyhow::ensure!(
+            tbl(&db).load_all()?.channels.len() == 1,
+            "same provider overwrites"
+        );
         let only = tbl(&db)
             .get_by_provider(s.provider)?
             .ok_or_else(|| anyhow::anyhow!("missing"))?;
@@ -757,7 +764,12 @@ mod tests {
         for byte in 1..=4u8 {
             tbl(&db).record(&state(byte))?;
         }
-        let mut got: Vec<_> = tbl(&db).load_all()?.iter().map(|s| s.provider).collect();
+        let mut got: Vec<_> = tbl(&db)
+            .load_all()?
+            .channels
+            .iter()
+            .map(|s| s.provider)
+            .collect();
         got.sort_unstable();
         let want: Vec<_> = (1..=4u8).map(|b| state(b).provider).collect();
         anyhow::ensure!(
@@ -773,7 +785,7 @@ mod tests {
         let s = state(3);
         tbl(&db).record(&s)?;
         tbl(&db).forget(s.provider)?;
-        anyhow::ensure!(tbl(&db).load_all()?.is_empty());
+        anyhow::ensure!(tbl(&db).load_all()?.channels.is_empty());
         // forget on an unknown provider is a no-op.
         tbl(&db).forget(address!("00000000000000000000000000000000000000ff"))?;
         Ok(())
@@ -792,10 +804,12 @@ mod tests {
         let encoded = postcard::to_allocvec(&stored)?;
         tbl(&db).insert_raw(s.provider, &encoded)?;
 
+        let load = tbl(&db).load_all()?;
         anyhow::ensure!(
-            tbl(&db).load_all()?.is_empty(),
+            load.channels.is_empty(),
             "future-schema record must be skipped, not propagated, by load_all",
         );
+        anyhow::ensure!(load.skipped == vec![s.provider]);
         let err = tbl(&db)
             .get_by_provider(s.provider)
             .err()
@@ -822,10 +836,14 @@ mod tests {
         tbl(&db).record(&healthy)?;
         tbl(&db).insert_raw(state(3).provider, &[0u8; 8])?; // far too short
 
-        let all = tbl(&db).load_all()?;
+        let load = tbl(&db).load_all()?;
         anyhow::ensure!(
-            all.len() == 1 && all.first() == Some(&healthy),
-            "corrupt row must be skipped while the healthy row survives, got {all:?}",
+            load.channels.len() == 1 && load.channels.first() == Some(&healthy),
+            "corrupt row must be skipped while the healthy row survives, got {load:?}",
+        );
+        anyhow::ensure!(
+            load.skipped == vec![state(3).provider],
+            "the skipped provider is the only repair handle, got {load:?}",
         );
         let err = tbl(&db)
             .get_by_provider(state(3).provider)
@@ -848,10 +866,12 @@ mod tests {
         // Filed under a *different* provider's key.
         tbl(&db).insert_raw(state(0xBB).provider, &encoded)?;
 
+        let load = tbl(&db).load_all()?;
         anyhow::ensure!(
-            tbl(&db).load_all()?.is_empty(),
+            load.channels.is_empty(),
             "provider/key-mismatch record must be skipped by load_all",
         );
+        anyhow::ensure!(load.skipped == vec![state(0xBB).provider]);
         let err = tbl(&db)
             .get_by_provider(state(0xBB).provider)
             .err()
@@ -875,9 +895,12 @@ mod tests {
         encoded.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01]);
         tbl(&db).insert_raw(s.provider, &encoded)?;
 
-        let all = tbl(&db).load_all()?;
-        anyhow::ensure!(all.len() == 1);
-        let only = all.first().ok_or_else(|| anyhow::anyhow!("missing"))?;
+        let load = tbl(&db).load_all()?;
+        anyhow::ensure!(load.channels.len() == 1);
+        let only = load
+            .channels
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("missing"))?;
         anyhow::ensure!(*only == s, "prefix must decode despite trailing bytes");
         Ok(())
     }
