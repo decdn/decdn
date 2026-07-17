@@ -61,6 +61,17 @@ jobs:
           # saturates.
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      # `--workspace` unifies features, so `decdn-cli` turns on
+      # `decdn-incentive/redb` for everyone and the two configurations the
+      # feature split exists to create are never actually compiled: the node's
+      # (`buyer-store-core` without `redb`, #1246) and the contracts/voucher
+      # consumer's (neither, so redb isn't linked). Both are real — a plain
+      # `cargo build -p decdn-node`, or any downstream taking `decdn-incentive`
+      # alone — and both break silently under unification. Check them directly.
+      - run: cargo clippy -p decdn-incentive --no-default-features -- -D warnings
+      - run: >
+          cargo clippy -p decdn-incentive --no-default-features
+          --features buyer-store-core -- -D warnings
 
   deny:
     name: cargo deny
@@ -934,7 +945,7 @@ jobs:
         working-directory: contracts
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6.4.0
+      - uses: actions/setup-node@v7.0.0
         with:
           node-version: '20'
           cache: 'npm'
