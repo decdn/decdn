@@ -787,7 +787,10 @@ fn list(args: &cli::ChannelListArgs, config_path: Option<&Path>) -> anyhow::Resu
     // buffered into one allocation.
     let mut out = std::io::stdout().lock();
     if args.json {
-        let view: Vec<ChannelJson> = channels.iter().map(ChannelJson::from).collect();
+        let view = ChannelListJson {
+            channels: channels.iter().map(ChannelJson::from).collect(),
+            skipped: skipped.iter().map(|p| format!("{p:#x}")).collect(),
+        };
         serde_json::to_writer_pretty(&mut out, &view)?;
         writeln!(out)?;
     } else {
@@ -856,6 +859,16 @@ fn write_channels(
         )?;
     }
     Ok(())
+}
+
+/// Top-level `--json` document. `channels` is the decoded rows; `skipped` lists
+/// the provider addresses of undecodable rows (`{:#x}` hex) so a programmatic
+/// consumer sees the escrowed-but-untracked deposits in-band, not only in the
+/// stderr warning. The human table path surfaces the same split separately.
+#[derive(Serialize)]
+struct ChannelListJson {
+    channels: Vec<ChannelJson>,
+    skipped: Vec<String>,
 }
 
 /// Serializable view for `--json`. String-encodes the 256-bit fields (hex for

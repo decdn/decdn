@@ -2587,6 +2587,40 @@ mod tests {
     }
 
     #[test]
+    fn buyer_channel_skipped_undecodable_metric_starts_at_zero_and_increments() {
+        // #1271. The struct field is `buyer_channel_store_skipped_undecodable_records`;
+        // the OpenMetrics encoder appends `_total`, so the exported name is
+        // `decdn_buyer_channel_store_skipped_undecodable_records_total` — the
+        // operator-visible name the observability appendix and any escrowed-but-
+        // untracked alert reference. Pin the suffixed form: a rename that re-added
+        // `_total` would emit `..._total_total` (the same footgun the cache GC and
+        // voucher-nonce counters guard against), silently dropping the alert. The
+        // counter takes a per-load skipped count, so `inc_by(2)` must read 2.
+        let metrics = Metrics::new();
+        let text = metrics.encode().unwrap();
+        assert!(
+            has_metric_line(
+                &text,
+                "decdn_buyer_channel_store_skipped_undecodable_records_total",
+                0
+            ),
+            "skipped-undecodable counter should be exposed at zero on a fresh registry:\n{text}"
+        );
+
+        metrics.buyer_channel_store_skipped_undecodable_records(2);
+
+        let text = metrics.encode().unwrap();
+        assert!(
+            has_metric_line(
+                &text,
+                "decdn_buyer_channel_store_skipped_undecodable_records_total",
+                2
+            ),
+            "expected the per-load skipped count (2) to increment the counter:\n{text}"
+        );
+    }
+
+    #[test]
     fn gossip_clock_skew_and_ttl_eviction_counters_start_at_zero_and_increment() {
         // #1191 / #1192. Both fields omit the `_total` suffix; the
         // OpenMetrics encoder appends it, so the operator-visible names are

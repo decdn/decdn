@@ -3692,60 +3692,62 @@ mod tests {
             .unwrap_or(0)
     }
 
+    /// A store whose hydration always yields zero healthy channels and two
+    /// undecodable rows. Lets a sweep exercise the skipped-row metric increment
+    /// without any decodable channel driving a chain call. Shared by the reclaim
+    /// and reconcile sweep tests so both call sites of
+    /// `buyer_channel_store_skipped_undecodable_records` are covered.
+    #[derive(Debug)]
+    struct StoreWithSkippedRows;
+
+    impl BuyerChannelStore for StoreWithSkippedRows {
+        fn load_all(&self) -> Result<decdn_incentive::BuyerLoad, StoreError> {
+            Ok(decdn_incentive::BuyerLoad {
+                channels: Vec::new(),
+                skipped: vec![Address::repeat_byte(0x31), Address::repeat_byte(0x32)],
+            })
+        }
+
+        fn record(&self, _s: &BuyerChannelState) -> Result<(), StoreError> {
+            Ok(())
+        }
+
+        fn forget(&self, _p: Address) -> Result<(), StoreError> {
+            Ok(())
+        }
+
+        fn forget_if_channel(&self, _p: Address, _c: ChannelId) -> Result<bool, StoreError> {
+            Ok(false)
+        }
+
+        fn get_by_provider(&self, _p: Address) -> Result<Option<BuyerChannelState>, StoreError> {
+            Ok(None)
+        }
+
+        fn advance_progress(
+            &self,
+            _p: Address,
+            _c: ChannelId,
+            _n: U256,
+            _b: U256,
+            _a: U256,
+        ) -> Result<AdvanceOutcome, StoreError> {
+            Ok(AdvanceOutcome::UnknownProvider)
+        }
+
+        fn add_deposit(
+            &self,
+            _p: Address,
+            _c: ChannelId,
+            _additional: U256,
+        ) -> Result<decdn_incentive::DepositOutcome, StoreError> {
+            Ok(decdn_incentive::DepositOutcome::UnknownProvider)
+        }
+    }
+
     #[tokio::test]
     #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     async fn reclaim_sweep_counts_every_skipped_buyer_row() {
-        #[derive(Debug)]
-        struct StoreWithSkippedRows;
-
-        impl BuyerChannelStore for StoreWithSkippedRows {
-            fn load_all(&self) -> Result<decdn_incentive::BuyerLoad, StoreError> {
-                Ok(decdn_incentive::BuyerLoad {
-                    channels: Vec::new(),
-                    skipped: vec![Address::repeat_byte(0x31), Address::repeat_byte(0x32)],
-                })
-            }
-
-            fn record(&self, _s: &BuyerChannelState) -> Result<(), StoreError> {
-                Ok(())
-            }
-
-            fn forget(&self, _p: Address) -> Result<(), StoreError> {
-                Ok(())
-            }
-
-            fn forget_if_channel(&self, _p: Address, _c: ChannelId) -> Result<bool, StoreError> {
-                Ok(false)
-            }
-
-            fn get_by_provider(
-                &self,
-                _p: Address,
-            ) -> Result<Option<BuyerChannelState>, StoreError> {
-                Ok(None)
-            }
-
-            fn advance_progress(
-                &self,
-                _p: Address,
-                _c: ChannelId,
-                _n: U256,
-                _b: U256,
-                _a: U256,
-            ) -> Result<AdvanceOutcome, StoreError> {
-                Ok(AdvanceOutcome::UnknownProvider)
-            }
-
-            fn add_deposit(
-                &self,
-                _p: Address,
-                _c: ChannelId,
-                _additional: U256,
-            ) -> Result<decdn_incentive::DepositOutcome, StoreError> {
-                Ok(decdn_incentive::DepositOutcome::UnknownProvider)
-            }
-        }
-
         let server = wiremock::MockServer::start().await;
         let service = service_against(&server);
         let store: Arc<dyn BuyerChannelStore> = Arc::new(StoreWithSkippedRows);
@@ -3757,6 +3759,60 @@ mod tests {
             &store,
             service.self_address,
             &failures,
+            &metrics,
+        )
+        .await;
+
+        assert_eq!(
+            counter(
+                &metrics,
+                "buyer_channel_store_skipped_undecodable_records_total"
+            ),
+            2
+        );
+    }
+
+    /// The idle-reconcile sweep counts skipped rows on its own `load_all` call,
+    /// independently of the reclaim sweep (#1271). Both legs carry an identical
+    /// `buyer_channel_store_skipped_undecodable_records` line, so a regression
+    /// that drops or mis-destructures it on one leg while the other stays green
+    /// would slip past a reclaim-only test.
+    #[tokio::test]
+    #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    async fn reconcile_sweep_counts_every_skipped_buyer_row() {
+        let server = wiremock::MockServer::start().await;
+        let service = service_against(&server);
+        let store: Arc<dyn BuyerChannelStore> = Arc::new(StoreWithSkippedRows);
+        let metrics = Arc::new(Metrics::new());
+
+        // No healthy channel is returned, so the sweep never dials or touches the
+        // chain — only the skipped-row count runs. The reconcile config is still
+        // required by the signature; a bound endpoint and empty resolver satisfy
+        // it without being reached.
+        let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .bind()
+            .await
+            .expect("bind a local endpoint for the reconcile config");
+        let config = BuyerReconcileConfig {
+            endpoint,
+            resolver: Arc::new(crate::dht::node_address::StaticNodeAddressDirectory::new(
+                HashMap::new(),
+            )),
+        };
+        let pending_store: Arc<dyn PendingSettleStore> =
+            Arc::new(decdn_incentive::MemoryPendingSettleStore::new());
+        let mut obs = HashMap::new();
+        let mut close_failures = HashMap::new();
+
+        reconcile_once(
+            &service.contract,
+            &store,
+            &service.signer,
+            &service.voucher_domain,
+            &config,
+            &mut obs,
+            &mut close_failures,
+            &pending_store,
             &metrics,
         )
         .await;

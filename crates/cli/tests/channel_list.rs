@@ -123,6 +123,33 @@ fn undecodable_row_is_named_on_stderr() {
     assert!(!stdout.contains("(no tracked channels)"), "{stdout}");
 }
 
+#[test]
+fn json_lists_skipped_providers_in_band_alongside_healthy_channels() {
+    let dir = data_dir();
+    let healthy = Address::repeat_byte(0x11);
+    let corrupt = Address::repeat_byte(0x44);
+    seed(dir.path(), 0x11);
+    seed_corrupt(dir.path(), corrupt);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_decdn"))
+        .args(["channel", "list", "--json", "--data-dir"])
+        .arg(dir.path())
+        .output()
+        .expect("run decdn channel list --json");
+    assert!(
+        output.status.success(),
+        "list failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // The skipped provider must reach the structured stdout payload, not only
+    // the stderr warning — a machine consumer parsing stdout would otherwise be
+    // blind to the escrowed-but-untracked deposit.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("\"skipped\""), "{stdout}");
+    assert!(stdout.contains(&format!("{corrupt:#x}")), "{stdout}");
+    assert!(stdout.contains(&format!("{healthy:#x}")), "{stdout}");
+}
+
 #[tokio::test]
 async fn list_with_data_dir_ignores_broken_config_env_expansion() {
     let dir = data_dir();
