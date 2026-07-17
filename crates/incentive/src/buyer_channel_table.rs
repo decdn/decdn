@@ -186,32 +186,15 @@ impl<'a> BuyerChannelTable<'a> {
         Self { db }
     }
 
-    /// `true` if the table exists, `false` if the store was never written. Lets
-    /// the no-row operations avoid implicitly creating it —
-    /// `WriteTransaction::open_table` would.
-    ///
-    /// Benign TOCTOU: a concurrent writer may create the table *and* insert a row
-    /// after this returns `false`, so the caller reports `UnknownProvider` /
-    /// `false` for a provider that by then has a row. Harmless — it linearizes as
-    /// "our op ran first". (Note the caller returns early on `false`; it does not
-    /// fall through to a `get` miss.)
-    fn table_exists(&self) -> Result<bool, StoreError> {
-        let read_txn = self
-            .db
-            .begin_read()
-            .map_err(|err| StoreError::Backend(format!("begin_read: {err}")))?;
-        match read_txn.open_table(BUYER_CHANNEL_TABLE) {
-            Ok(_) => Ok(true),
-            Err(redb::TableError::TableDoesNotExist(_)) => Ok(false),
-            Err(err) => Err(StoreError::Backend(format!("open_table: {err}"))),
-        }
-    }
-
     /// Begin a write transaction with fsync-on-commit durability.
     ///
     /// `Durability::Immediate` is `redb`'s current default but is set explicitly
     /// so a future default change cannot silently weaken the persistence
-    /// guarantee the buyer watermark depends on.
+    /// guarantee the buyer watermark depends on. No-row operations open the
+    /// table in this transaction and return without committing; dropping the
+    /// transaction aborts it, rolls back the implicit table creation, and avoids
+    /// both a preflight read transaction and a no-op fsync. Callers therefore
+    /// commit only after an actual mutation.
     fn begin_durable_write(&self) -> Result<redb::WriteTransaction, StoreError> {
         let mut write_txn = self
             .db
@@ -321,25 +304,25 @@ impl<'a> BuyerChannelTable<'a> {
     }
 
     /// Drop the persisted entry for `provider`. A no-op if no record exists or
-    /// the table was never written. Commits durably.
+    /// the table was never written. An actual deletion is committed durably.
     ///
     /// # Errors
     ///
     /// [`StoreError::Backend`] if the delete or durable commit fails.
     pub fn forget(&self, provider: Address) -> Result<(), StoreError> {
         let key: [u8; 20] = provider.into();
-        if !self.table_exists()? {
-            return Ok(());
-        }
-
         let write_txn = self.begin_durable_write()?;
-        {
+        let removed = {
             let mut table = write_txn
                 .open_table(BUYER_CHANNEL_TABLE)
                 .map_err(|err| StoreError::Backend(format!("open_table: {err}")))?;
             table
                 .remove(&key)
-                .map_err(|err| StoreError::Backend(format!("remove: {err}")))?;
+                .map_err(|err| StoreError::Backend(format!("remove: {err}")))?
+                .is_some()
+        };
+        if !removed {
+            return Ok(());
         }
         write_txn
             .commit()
@@ -399,40 +382,32 @@ impl<'a> BuyerChannelTable<'a> {
         channel_id: ChannelId,
     ) -> Result<bool, StoreError> {
         let key: [u8; 20] = provider.into();
-        if !self.table_exists()? {
-            return Ok(false);
-        }
-
         let write_txn = self.begin_durable_write()?;
-        let deleted = {
+        {
             let mut table = write_txn
                 .open_table(BUYER_CHANNEL_TABLE)
                 .map_err(|err| StoreError::Backend(format!("open_table: {err}")))?;
             // Read the current row inside the same (serialised) write txn so the
             // match-and-remove is atomic against a concurrent replace.
-            let matches = match table
+            let Some(value_guard) = table
                 .get(&key)
                 .map_err(|err| StoreError::Backend(format!("get: {err}")))?
-            {
-                Some(value_guard) => {
-                    decode_record(key, value_guard.value())?.channel_id == channel_id
-                }
-                None => false,
+            else {
+                return Ok(false);
             };
-            if matches {
-                table
-                    .remove(&key)
-                    .map_err(|err| StoreError::Backend(format!("remove: {err}")))?;
+            let matches = decode_record(key, value_guard.value())?.channel_id == channel_id;
+            drop(value_guard);
+            if !matches {
+                return Ok(false);
             }
-            matches
-        };
-        // NOTE: unlike `advance_progress`/`add_deposit`, this commits even when
-        // nothing matched (an empty txn + fsync). Pre-existing behaviour in both
-        // stores; preserved deliberately rather than "fixed" here.
+            table
+                .remove(&key)
+                .map_err(|err| StoreError::Backend(format!("remove: {err}")))?;
+        }
         write_txn
             .commit()
             .map_err(|err| StoreError::Backend(format!("commit (fsync): {err}")))?;
-        Ok(deleted)
+        Ok(true)
     }
 
     /// Atomically advance the committed progress for `provider`'s channel inside
@@ -456,10 +431,6 @@ impl<'a> BuyerChannelTable<'a> {
         amount: U256,
     ) -> Result<AdvanceOutcome, StoreError> {
         let key: [u8; 20] = provider.into();
-        if !self.table_exists()? {
-            return Ok(AdvanceOutcome::UnknownProvider);
-        }
-
         let write_txn = self.begin_durable_write()?;
         {
             let mut table = write_txn
@@ -472,9 +443,6 @@ impl<'a> BuyerChannelTable<'a> {
                 .get(&key)
                 .map_err(|err| StoreError::Backend(format!("get: {err}")))?
             else {
-                // No-write outcomes return early so the uncommitted write txn is
-                // aborted on drop — avoiding a pointless `Durability::Immediate`
-                // fsync on a transaction that changed nothing.
                 return Ok(AdvanceOutcome::UnknownProvider);
             };
             let mut state = decode_record(key, value_guard.value())?;
@@ -510,10 +478,6 @@ impl<'a> BuyerChannelTable<'a> {
         additional: U256,
     ) -> Result<DepositOutcome, StoreError> {
         let key: [u8; 20] = provider.into();
-        if !self.table_exists()? {
-            return Ok(DepositOutcome::UnknownProvider);
-        }
-
         let write_txn = self.begin_durable_write()?;
         let new_deposit = {
             let mut table = write_txn
@@ -523,8 +487,6 @@ impl<'a> BuyerChannelTable<'a> {
                 .get(&key)
                 .map_err(|err| StoreError::Backend(format!("get: {err}")))?
             else {
-                // No-write outcome returns early so the uncommitted write txn is
-                // aborted on drop — no pointless `Durability::Immediate` fsync.
                 return Ok(DepositOutcome::UnknownProvider);
             };
             let mut state = decode_record(key, value_guard.value())?;
@@ -1003,10 +965,9 @@ mod tests {
         tbl(&db).record(&s)?;
 
         // With the table now present, an unrecorded provider must still report
-        // UnknownProvider. This is a *different* branch from the `ghost` calls
-        // above: those short-circuit at `table_exists()`, this one returns from
-        // inside the write txn (aborting it on drop). Mutating that return to
-        // ChannelMismatch otherwise passes the whole suite.
+        // UnknownProvider. Both these calls and the never-written-store calls
+        // above return from inside the write transaction. Mutating that return
+        // to ChannelMismatch otherwise passes the whole suite.
         let absent = state(0x5A);
         anyhow::ensure!(
             tbl(&db).advance_progress(
@@ -1045,10 +1006,10 @@ mod tests {
     }
 
     /// The no-row operations must not implicitly create the table on a
-    /// never-written store — `WriteTransaction::open_table` would, so each one
-    /// pre-checks. The node's suite asserted the outcomes but never the "no
-    /// table" half of the claim; assert it here, since a dropped pre-check is
-    /// exactly what this refactor could regress.
+    /// never-written store. Each opens it inside a write transaction, then
+    /// returns without committing; abort-on-drop must roll the creation back.
+    /// Committing any of these no-write paths leaves the table behind and makes
+    /// the corresponding assertion fail.
     #[test]
     fn no_row_ops_do_not_create_the_table() -> anyhow::Result<()> {
         let (_d, db) = db()?;
@@ -1080,6 +1041,41 @@ mod tests {
         // `record`, by contrast, is supposed to create it.
         tbl(&db).record(&s)?;
         anyhow::ensure!(!table_absent(&db)?, "record must create the table");
+        Ok(())
+    }
+
+    /// Real deletions still honour the `Durability::Immediate` contract: both
+    /// unconditional and compare-and-delete removals survive a database reopen.
+    #[test]
+    fn forget_deletions_survive_reopen() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("t.redb");
+        let forgotten = state(0x31);
+        let compare_deleted = state(0x32);
+        let retained = state(0x33);
+        {
+            let db = Database::create(&path)?;
+            tbl(&db).record(&forgotten)?;
+            tbl(&db).record(&compare_deleted)?;
+            tbl(&db).record(&retained)?;
+
+            tbl(&db).forget(forgotten.provider)?;
+            anyhow::ensure!(
+                tbl(&db).forget_if_channel(compare_deleted.provider, compare_deleted.channel_id)?
+            );
+        }
+
+        let db = Database::create(&path)?;
+        anyhow::ensure!(tbl(&db).get_by_provider(forgotten.provider)?.is_none());
+        anyhow::ensure!(
+            tbl(&db)
+                .get_by_provider(compare_deleted.provider)?
+                .is_none()
+        );
+        anyhow::ensure!(
+            tbl(&db).get_by_provider(retained.provider)? == Some(retained),
+            "unrelated row must survive both durable deletions"
+        );
         Ok(())
     }
 
