@@ -446,6 +446,103 @@ impl BuyerChannelStore for RedbBuyerChannelStore {
 mod tests {
     use super::*;
 
+    /// Postcard encoding of the record built by [`golden_state`], captured from
+    /// the encoder as it stood before #1246. Hex rather than a 206-byte array
+    /// literal so a diff shows exactly which field moved.
+    const GOLDEN_RECORD_HEX: &str = concat!(
+        "01",                                                               // schema_version (varint)
+        "0000000000000000000000000000000000000000000000000000000000000007", // channel_id
+        "0000000000000000000000000000000000000007",                         // provider
+        "a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",                         // token
+        "0000000000000000000000000000000000000000000000000000000000989680", // deposit
+        "0000000000000000000000000000000000000000000000000000000000001b58", // last_amount
+        "0000000000000000000000000000000000000000000000000000000000000007", // last_nonce
+        "0000000000000000000000000000000000000000000000000000000000001c00", // last_bytes_delivered
+        "87e6fe8907",                                                       // expires_at (varint)
+    );
+
+    /// Lowercase hex of `bytes`. `fold` + `write!` rather than the obvious
+    /// `map(format!).collect()`, which trips `clippy::format_collect`.
+    fn hex_of(bytes: &[u8]) -> String {
+        use std::fmt::Write as _;
+        bytes
+            .iter()
+            .fold(String::with_capacity(bytes.len() * 2), |mut acc, b| {
+                // Infallible: writing to a String never errors.
+                let _ = write!(acc, "{b:02x}");
+                acc
+            })
+    }
+
+    /// The fixture behind [`GOLDEN_RECORD_HEX`]. Byte-for-byte the state that
+    /// `decdn-node`'s `channel_store::tests::buyer_sample(7)` builds, so the
+    /// golden pins *both* crates' encoders to one layout.
+    fn golden_state() -> BuyerChannelState {
+        let mut id = [0u8; 32];
+        id[31] = 7;
+        let mut prov = [0u8; 20];
+        prov[19] = 7;
+        BuyerChannelState {
+            channel_id: id.into(),
+            provider: Address::from(prov),
+            // USDC on mainnet — the same literal the node fixture uses.
+            token: Address::from([
+                0xa0, 0xb8, 0x69, 0x91, 0xc6, 0x21, 0x8b, 0x36, 0xc1, 0xd1, 0x9d, 0x4a, 0x2e, 0x9e,
+                0xb0, 0xce, 0x36, 0x06, 0xeb, 0x48,
+            ]),
+            deposit: U256::from(10_000_000u64),
+            last_amount: U256::from(7_000u64),
+            last_nonce: U256::from(7u64),
+            last_bytes_delivered: U256::from(7_168u64),
+            expires_at: 1_900_000_007,
+        }
+    }
+
+    /// The buyer record is a **frozen on-disk format** shared by this store's
+    /// `buyer-channels.redb` and the node's `channels.redb`. Postcard encodes
+    /// struct fields positionally and unnamed, so reordering, retyping, or
+    /// inserting a field rewrites the bytes with no compile error and no other
+    /// test failure — every store the fresh-tempdir suites build would still
+    /// pass while every record an older binary wrote was silently orphaned.
+    ///
+    /// This golden is the tripwire for that. Until #1246 the byte-compat
+    /// contract between the two crates was asserted only by a doc comment.
+    #[test]
+    fn encode_is_byte_stable() -> anyhow::Result<()> {
+        let encoded = postcard::to_allocvec(&StoredBuyerChannelState::from(&golden_state()))
+            .map_err(|err| anyhow::anyhow!("encode: {err}"))?;
+        let hex = hex_of(&encoded);
+        anyhow::ensure!(
+            hex == GOLDEN_RECORD_HEX,
+            "the buyer record's on-disk encoding changed — this orphans every existing \
+             record in both `channels.redb` and `buyer-channels.redb`.\n  got:  {hex}\n  want: \
+             {GOLDEN_RECORD_HEX}",
+        );
+        Ok(())
+    }
+
+    /// The golden must also survive a full round-trip through this store, so a
+    /// decode-side drift (key width, table name) can't hide behind an encoder
+    /// that still emits the right bytes.
+    #[test]
+    fn golden_record_round_trips_through_the_store() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        // `open` hardens the data dir to 0o700 and rejects anything looser, so
+        // point it at a subdir it creates rather than the 0o775 tempdir root.
+        let store = RedbBuyerChannelStore::open(&dir.path().join("d"))?;
+        let want = golden_state();
+        store.record(&want)?;
+
+        let got = store
+            .get_by_provider(want.provider)?
+            .ok_or_else(|| anyhow::anyhow!("golden record missing after record()"))?;
+        anyhow::ensure!(
+            got == want,
+            "golden round-trip mismatch:\n {got:?}\n {want:?}"
+        );
+        Ok(())
+    }
+
     fn state(provider: u8, nonce: u64, bytes: u64, amount: u64) -> BuyerChannelState {
         BuyerChannelState {
             channel_id: B256::repeat_byte(provider),
