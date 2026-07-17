@@ -191,7 +191,7 @@ Expected: if both commands print paths, continue to Step 3; otherwise record com
 Run:
 
 ```bash
-cargo build -p decdn-node -p decdn
+cargo build -p decdn-node -p decdn-cli
 cargo nextest run -p decdn-e2e --features anvil-e2e cli_publish
 ```
 

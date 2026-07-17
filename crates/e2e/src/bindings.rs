@@ -111,6 +111,16 @@ alloy::sol! {
         function activateAssignment(uint256 namespaceId) external;
         function getOrigins(uint256 namespaceId) external view returns (address[] memory);
         function isAuthorizedOrigin(uint256 namespaceId, address operator) external view returns (bool);
+        // Pending (proposed, not-yet-activated) assignment read — the state
+        // `decdn publish assign` leaves behind, since it only `proposeAssignment`s
+        // (activation is a separate governance step). Returns the proposed
+        // operator set and the timelock deadline (`readyAt == 0` means no pending
+        // proposal). Matches the tuple-return contract signature; alloy generates
+        // a `getPendingAssignmentReturn { operators, readyAt }` struct.
+        function getPendingAssignment(uint256 namespaceId)
+            external
+            view
+            returns (address[] memory operators, uint256 readyAt);
     }
 
     /// `SlashJudge.submitBlacklistChallenge` — the blacklist-violation slash
