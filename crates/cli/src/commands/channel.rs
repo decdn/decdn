@@ -28,7 +28,7 @@ use decdn_client_pull::cooperative_close::{
 };
 use decdn_common::cli::{self, common::expand_tilde};
 use decdn_common::config::{DEFAULT_CHAIN_ID, FileConfig, load_file_config};
-use decdn_incentive::buyer_channel::{BuyerChannelState, BuyerChannelStore};
+use decdn_incentive::buyer_channel::{BuyerChannelState, BuyerChannelStore, BuyerLoad};
 use decdn_incentive::buyer_channel_redb::RedbBuyerChannelStore;
 use decdn_incentive::eth_identity::{self, PasswordSource, load_signer, read_password};
 use decdn_incentive::payment_channel::PaymentChannel;
@@ -709,10 +709,15 @@ async fn clean(args: &cli::ChannelCleanArgs, config_path: Option<&Path>) -> anyh
     let chain = resolve_chain(&args.chain, &file)?;
 
     let store = RedbBuyerChannelStore::open(&chain.data_dir)?;
-    let mut channels = store.load_all()?;
+    let BuyerLoad {
+        mut channels,
+        mut skipped,
+    } = store.load_all()?;
     channels.sort_by_key(|c| c.provider);
+    skipped.sort_unstable();
+    write_skipped_providers(&mut std::io::stderr().lock(), &skipped)?;
     if channels.is_empty() {
-        println!("no tracked channels to clean");
+        write_clean_empty_status(&mut std::io::stdout().lock(), &skipped)?;
         return Ok(());
     }
 
@@ -768,9 +773,14 @@ fn list(args: &cli::ChannelListArgs, config_path: Option<&Path>) -> anyhow::Resu
     };
 
     let store = RedbBuyerChannelStore::open(&data_dir)?;
-    let mut channels = store.load_all()?;
+    let BuyerLoad {
+        mut channels,
+        mut skipped,
+    } = store.load_all()?;
     // Stable output regardless of the store's internal key order.
     channels.sort_by_key(|c| c.provider);
+    skipped.sort_unstable();
+    write_skipped_providers(&mut std::io::stderr().lock(), &skipped)?;
 
     // Write to locked stdout so a `BrokenPipe` (e.g. piping to `head`) surfaces
     // as a propagated error rather than a `println!` panic, and the JSON isn't
@@ -782,6 +792,29 @@ fn list(args: &cli::ChannelListArgs, config_path: Option<&Path>) -> anyhow::Resu
         writeln!(out)?;
     } else {
         write_channels(&mut out, &channels)?;
+    }
+    Ok(())
+}
+
+/// Warn about every undecodable buyer row on stderr. The provider key is the
+/// only available repair handle because the channel id lives in the bytes that
+/// failed to decode.
+fn write_skipped_providers(w: &mut impl Write, skipped: &[Address]) -> std::io::Result<()> {
+    for provider in skipped {
+        writeln!(
+            w,
+            "warning: buyer channel for provider {provider:#x} could not be decoded; its deposit \
+             remains escrowed but untracked and will not be auto-reclaimed until the record is \
+             repaired"
+        )?;
+    }
+    Ok(())
+}
+
+/// Print the true-empty `clean` sentinel only when no row was skipped.
+fn write_clean_empty_status(w: &mut impl Write, skipped: &[Address]) -> std::io::Result<()> {
+    if skipped.is_empty() {
+        writeln!(w, "no tracked channels to clean")?;
     }
     Ok(())
 }
@@ -1001,6 +1034,33 @@ mod tests {
         assert!(out.contains("2.000000"), "{out}");
         assert!(out.contains("1.500000"), "{out}");
         assert!(!out.contains("(no tracked channels)"), "{out}");
+    }
+
+    #[test]
+    fn skipped_provider_warning_names_every_escrowed_row() {
+        let skipped = [Address::repeat_byte(0x11), Address::repeat_byte(0x22)];
+        let mut buf = Vec::new();
+        write_skipped_providers(&mut buf, &skipped).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        for provider in skipped {
+            assert!(out.contains(&format!("{provider:#x}")), "{out}");
+        }
+        assert!(out.contains("escrowed"), "{out}");
+        assert!(out.contains("not be auto-reclaimed"), "{out}");
+    }
+
+    #[test]
+    fn clean_empty_status_is_suppressed_when_a_row_was_skipped() {
+        let mut clean = Vec::new();
+        write_clean_empty_status(&mut clean, &[]).unwrap();
+        assert_eq!(
+            String::from_utf8(clean).unwrap(),
+            "no tracked channels to clean\n"
+        );
+
+        let mut skipped = Vec::new();
+        write_clean_empty_status(&mut skipped, &[Address::repeat_byte(0x33)]).unwrap();
+        assert!(skipped.is_empty());
     }
 
     #[test]

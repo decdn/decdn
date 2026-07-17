@@ -42,7 +42,8 @@ use decdn_incentive::store::{
     StoreError,
 };
 use decdn_incentive::{
-    AdvanceOutcome, BuyerChannelState, BuyerChannelStore, ChannelId, ChannelState, DepositOutcome,
+    AdvanceOutcome, BuyerChannelState, BuyerChannelStore, BuyerLoad, ChannelId, ChannelState,
+    DepositOutcome,
 };
 use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
@@ -815,7 +816,7 @@ impl BuyerChannelStoreHandle {
 /// Every method delegates to [`decdn_incentive::buyer_channel_table`]; this
 /// newtype contributes the `channels.redb` wiring, not the logic.
 impl BuyerChannelStore for BuyerChannelStoreHandle {
-    fn load_all(&self) -> Result<Vec<BuyerChannelState>, StoreError> {
+    fn load_all(&self) -> Result<BuyerLoad, StoreError> {
         self.table().load_all()
     }
 
@@ -1850,7 +1851,7 @@ mod tests {
 
         // Each table sees only its own row.
         anyhow::ensure!(ChannelStateStore::load_all(store.as_ref())?.len() == 1);
-        anyhow::ensure!(handle.load_all()?.len() == 1);
+        anyhow::ensure!(handle.load_all()?.channels.len() == 1);
         let got_seller = ChannelStateStore::get(store.as_ref(), seller.channel_id)?
             .ok_or_else(|| anyhow::anyhow!("seller row missing"))?;
         anyhow::ensure!(got_seller == seller);
@@ -1888,7 +1889,7 @@ mod tests {
             handle.get_by_provider(s.provider)?.as_ref() == Some(&s),
             "record/get_by_provider"
         );
-        anyhow::ensure!(handle.load_all()?.len() == 1, "load_all");
+        anyhow::ensure!(handle.load_all()?.channels.len() == 1, "load_all");
 
         // advance_progress
         anyhow::ensure!(
@@ -1959,7 +1960,7 @@ mod tests {
         // forget
         handle.record(&s)?;
         handle.forget(s.provider)?;
-        anyhow::ensure!(handle.load_all()?.is_empty(), "forget");
+        anyhow::ensure!(handle.load_all()?.channels.is_empty(), "forget");
         Ok(())
     }
 }

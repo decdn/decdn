@@ -39,8 +39,9 @@ use anyhow::{Context, Result};
 use decdn_common::redact::sanitize_rpc_display;
 use decdn_incentive::payment_channel::PaymentChannel;
 use decdn_incentive::{
-    AdvanceOutcome, BuyerChannelState, BuyerChannelStore, ChannelId, ChannelOpenFailureReason,
-    DepositOutcome, PendingSettle, PendingSettleStore, StoreError, Voucher,
+    AdvanceOutcome, BuyerChannelState, BuyerChannelStore, BuyerLoad, ChannelId,
+    ChannelOpenFailureReason, DepositOutcome, PendingSettle, PendingSettleStore, StoreError,
+    Voucher,
 };
 use futures_util::FutureExt;
 use iroh::{Endpoint, EndpointAddr, PublicKey};
@@ -685,10 +686,11 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
             ensure_allowance(&provider, token, self_address, payment_channel_addr, None).await?;
         }
 
-        let tracked = store
+        let load = store
             .load_all()
-            .context("hydrate persisted buyer channels")?
-            .len();
+            .context("hydrate persisted buyer channels")?;
+        metrics.buyer_channel_store_skipped_undecodable_records(load.skipped.len());
+        let tracked = load.channels.len();
         info!(
             %payment_channel_addr,
             %token,
@@ -1528,16 +1530,17 @@ async fn reconcile_once<P: Provider + Clone>(
     pending_store: &Arc<dyn PendingSettleStore>,
     metrics: &Arc<Metrics>,
 ) {
-    let states = match store.load_all() {
-        Ok(s) => s,
+    let BuyerLoad { channels, skipped } = match store.load_all() {
+        Ok(load) => load,
         Err(err) => {
             warn!(%err, "buyer reconcile sweep: failed to load channel state");
             return;
         }
     };
+    metrics.buyer_channel_store_skipped_undecodable_records(skipped.len());
     let now = unix_now();
     let mut seen: HashSet<ChannelId> = HashSet::new();
-    for st in &states {
+    for st in &channels {
         // Expired channels are the reclaim sweep's job; a never-paid channel
         // (nonce 0) has no voucher to settle cooperatively — the provider would
         // decline — so it too waits for the expiry reclaim.
@@ -2119,16 +2122,17 @@ async fn reclaim_once<P: Provider + Clone>(
     failures: &Arc<Mutex<HashMap<ChannelId, u32>>>,
     metrics: &Arc<Metrics>,
 ) {
-    let states = match store.load_all() {
-        Ok(s) => s,
+    let BuyerLoad { channels, skipped } = match store.load_all() {
+        Ok(load) => load,
         Err(err) => {
             warn!(%err, "buyer reclaim sweep: failed to load channel state");
             return;
         }
     };
+    metrics.buyer_channel_store_skipped_undecodable_records(skipped.len());
     let now = unix_now();
     let mut seen: HashSet<ChannelId> = HashSet::new();
-    for st in &states {
+    for st in &channels {
         if !st.is_expired_at(now) {
             continue;
         }
@@ -3646,8 +3650,8 @@ mod tests {
             }
             Err(StoreError::Backend("simulated store fault".to_string()))
         }
-        fn load_all(&self) -> Result<Vec<BuyerChannelState>, StoreError> {
-            Ok(Vec::new())
+        fn load_all(&self) -> Result<BuyerLoad, StoreError> {
+            Ok(BuyerLoad::default())
         }
         fn record(&self, _s: &BuyerChannelState) -> Result<(), StoreError> {
             Ok(())
@@ -3686,6 +3690,84 @@ mod tests {
             .find_map(|line| line.strip_prefix(&format!("decdn_{name} ")))
             .and_then(|v| v.trim().parse().ok())
             .unwrap_or(0)
+    }
+
+    #[tokio::test]
+    #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    async fn reclaim_sweep_counts_every_skipped_buyer_row() {
+        #[derive(Debug)]
+        struct StoreWithSkippedRows;
+
+        impl BuyerChannelStore for StoreWithSkippedRows {
+            fn load_all(&self) -> Result<decdn_incentive::BuyerLoad, StoreError> {
+                Ok(decdn_incentive::BuyerLoad {
+                    channels: Vec::new(),
+                    skipped: vec![Address::repeat_byte(0x31), Address::repeat_byte(0x32)],
+                })
+            }
+
+            fn record(&self, _s: &BuyerChannelState) -> Result<(), StoreError> {
+                Ok(())
+            }
+
+            fn forget(&self, _p: Address) -> Result<(), StoreError> {
+                Ok(())
+            }
+
+            fn forget_if_channel(&self, _p: Address, _c: ChannelId) -> Result<bool, StoreError> {
+                Ok(false)
+            }
+
+            fn get_by_provider(
+                &self,
+                _p: Address,
+            ) -> Result<Option<BuyerChannelState>, StoreError> {
+                Ok(None)
+            }
+
+            fn advance_progress(
+                &self,
+                _p: Address,
+                _c: ChannelId,
+                _n: U256,
+                _b: U256,
+                _a: U256,
+            ) -> Result<AdvanceOutcome, StoreError> {
+                Ok(AdvanceOutcome::UnknownProvider)
+            }
+
+            fn add_deposit(
+                &self,
+                _p: Address,
+                _c: ChannelId,
+                _additional: U256,
+            ) -> Result<decdn_incentive::DepositOutcome, StoreError> {
+                Ok(decdn_incentive::DepositOutcome::UnknownProvider)
+            }
+        }
+
+        let server = wiremock::MockServer::start().await;
+        let service = service_against(&server);
+        let store: Arc<dyn BuyerChannelStore> = Arc::new(StoreWithSkippedRows);
+        let failures = Arc::new(Mutex::new(HashMap::new()));
+        let metrics = Arc::new(Metrics::new());
+
+        reclaim_once(
+            &service.contract,
+            &store,
+            service.self_address,
+            &failures,
+            &metrics,
+        )
+        .await;
+
+        assert_eq!(
+            counter(
+                &metrics,
+                "buyer_channel_store_skipped_undecodable_records_total"
+            ),
+            2
+        );
     }
 
     /// A store fault under the open slot must be LOUD (#1145 review). `run_open` is
@@ -3744,8 +3826,8 @@ mod tests {
             std::thread::sleep(self.delay);
             panic!("simulated panic inside the detached open task");
         }
-        fn load_all(&self) -> Result<Vec<BuyerChannelState>, StoreError> {
-            Ok(Vec::new())
+        fn load_all(&self) -> Result<BuyerLoad, StoreError> {
+            Ok(BuyerLoad::default())
         }
         fn record(&self, _s: &BuyerChannelState) -> Result<(), StoreError> {
             Ok(())

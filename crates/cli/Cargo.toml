@@ -72,6 +72,7 @@ alloy = { workspace = true }
 futures-util = { workspace = true }
 
 [dev-dependencies]
+decdn-incentive = { workspace = true, features = ["redb", "test-util"] }
 # Integration tests in `tests/admin_peers.rs` exercise the loopback admin
 # RPC end-to-end against a real `AdminState` spawned from the daemon
 # crate, so the daemon's surface is a dev-dependency here. `decdn-cache`

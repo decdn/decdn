@@ -23,7 +23,9 @@ use std::path::Path;
 use alloy::primitives::{Address, U256};
 use redb::Database;
 
-use crate::buyer_channel::{AdvanceOutcome, BuyerChannelState, BuyerChannelStore, DepositOutcome};
+use crate::buyer_channel::{
+    AdvanceOutcome, BuyerChannelState, BuyerChannelStore, BuyerLoad, DepositOutcome,
+};
 use crate::buyer_channel_table::BuyerChannelTable;
 use crate::channel::ChannelId;
 use crate::store::StoreError;
@@ -84,12 +86,27 @@ impl RedbBuyerChannelStore {
     const fn table(&self) -> BuyerChannelTable<'_> {
         BuyerChannelTable::new(&self.db)
     }
+
+    /// Test-only corruption seam used to verify consumer handling of an
+    /// undecodable buyer row.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if the raw row cannot be committed durably.
+    #[cfg(feature = "test-util")]
+    pub fn insert_raw_buyer_record(
+        &self,
+        provider: Address,
+        bytes: &[u8],
+    ) -> Result<(), StoreError> {
+        self.table().insert_raw(provider, bytes)
+    }
 }
 
 /// Every method delegates to [`crate::buyer_channel_table`]; this store owns the
 /// file, not the logic.
 impl BuyerChannelStore for RedbBuyerChannelStore {
-    fn load_all(&self) -> Result<Vec<BuyerChannelState>, StoreError> {
+    fn load_all(&self) -> Result<BuyerLoad, StoreError> {
         self.table().load_all()
     }
 
@@ -248,7 +265,7 @@ mod tests {
             store.get_by_provider(s.provider)?.as_ref() == Some(&s),
             "record/get"
         );
-        anyhow::ensure!(store.load_all()?.len() == 1, "load_all");
+        anyhow::ensure!(store.load_all()?.channels.len() == 1, "load_all");
 
         // advance_progress
         anyhow::ensure!(
@@ -316,7 +333,7 @@ mod tests {
         // forget
         store.record(&s)?;
         store.forget(s.provider)?;
-        anyhow::ensure!(store.load_all()?.is_empty(), "forget");
+        anyhow::ensure!(store.load_all()?.channels.is_empty(), "forget");
         Ok(())
     }
 }

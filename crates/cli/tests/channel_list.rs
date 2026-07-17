@@ -16,6 +16,7 @@
 )]
 
 use std::os::unix::fs::PermissionsExt;
+use std::process::Command;
 
 use alloy::primitives::{Address, B256, U256};
 use decdn_cli::commands::channel::channel_dispatch;
@@ -57,6 +58,11 @@ fn seed(data_dir: &std::path::Path, provider_byte: u8) {
     store.record(&state).unwrap();
 }
 
+fn seed_corrupt(data_dir: &std::path::Path, provider: Address) {
+    let store = RedbBuyerChannelStore::open(data_dir).unwrap();
+    store.insert_raw_buyer_record(provider, &[0u8; 8]).unwrap();
+}
+
 /// Hermetic empty config so `load_file_config` never reads the developer's real
 /// `~/.decdn/node.toml`; the command only needs the explicit `--data-dir` flag.
 fn empty_config(dir: &std::path::Path) -> std::path::PathBuf {
@@ -90,6 +96,27 @@ async fn empty_store_lists_without_error() {
     channel_dispatch(&list_args(dir.path(), false), Some(&cfg))
         .await
         .expect("listing an empty store should succeed");
+}
+
+#[test]
+fn undecodable_row_is_named_on_stderr() {
+    let dir = data_dir();
+    let provider = Address::repeat_byte(0x44);
+    seed_corrupt(dir.path(), provider);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_decdn"))
+        .args(["channel", "list", "--data-dir"])
+        .arg(dir.path())
+        .output()
+        .expect("run decdn channel list");
+    assert!(
+        output.status.success(),
+        "list failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(&format!("{provider:#x}")), "{stderr}");
+    assert!(stderr.contains("escrowed"), "{stderr}");
 }
 
 #[tokio::test]

@@ -18,6 +18,7 @@
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+use std::process::Command;
 
 use alloy::primitives::{Address, B256, U256};
 use decdn_cli::commands::channel::channel_dispatch;
@@ -72,6 +73,11 @@ fn seed(dir: &Path, provider_byte: u8) {
     store.record(&state).unwrap();
 }
 
+fn seed_corrupt(dir: &Path, provider: Address) {
+    let store = RedbBuyerChannelStore::open(dir).unwrap();
+    store.insert_raw_buyer_record(provider, &[0u8; 8]).unwrap();
+}
+
 #[tokio::test]
 async fn clean_empty_store_is_a_noop_success() {
     let dir = data_dir();
@@ -84,6 +90,40 @@ async fn clean_empty_store_is_a_noop_success() {
     channel_dispatch(&args, Some(&cfg))
         .await
         .expect("clean over an empty store should be a no-op success");
+}
+
+#[test]
+fn clean_with_only_an_undecodable_row_does_not_claim_nothing_to_clean() {
+    let dir = data_dir();
+    let cfg = empty_config(dir.path());
+    let provider = Address::repeat_byte(0x55);
+    seed_corrupt(dir.path(), provider);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_decdn"))
+        .arg("--config")
+        .arg(cfg)
+        .args([
+            "channel",
+            "clean",
+            "--rpc-url",
+            "http://127.0.0.1:1",
+            "--payment-channel-address",
+            "0x00000000000000000000000000000000000000ab",
+            "--data-dir",
+        ])
+        .arg(dir.path())
+        .output()
+        .expect("run decdn channel clean");
+    assert!(
+        output.status.success(),
+        "clean failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stdout.contains("no tracked channels to clean"), "{stdout}");
+    assert!(stderr.contains(&format!("{provider:#x}")), "{stderr}");
+    assert!(stderr.contains("escrowed"), "{stderr}");
 }
 
 #[tokio::test]

@@ -84,6 +84,20 @@ pub struct BuyerChannelState {
     pub expires_at: u64,
 }
 
+/// Result of hydrating the buyer-channel store.
+///
+/// A disk-backed store keeps hydration available when one row cannot be
+/// decoded: healthy channels remain usable and reclaimable, while the row's
+/// provider key is retained as the only available repair handle.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BuyerLoad {
+    /// Successfully decoded buyer channels.
+    pub channels: Vec<BuyerChannelState>,
+    /// Providers whose persisted rows could not be decoded. Their deposits
+    /// remain escrowed but untracked until the rows are repaired.
+    pub skipped: Vec<Address>,
+}
+
 impl BuyerChannelState {
     /// Construct fresh state for a newly-opened buyer channel. The `last_*`
     /// fields start at zero, matching the on-chain `Channel` defaults.
@@ -237,9 +251,10 @@ pub trait BuyerChannelStore: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns a [`StoreError`] if the backing store is unreadable or contains
-    /// corrupt entries.
-    fn load_all(&self) -> Result<Vec<BuyerChannelState>, StoreError>;
+    /// Returns a [`StoreError`] if the backing store itself is unreadable.
+    /// Individual undecodable rows are reported in [`BuyerLoad::skipped`] so
+    /// they do not prevent healthy channels from loading.
+    fn load_all(&self) -> Result<BuyerLoad, StoreError>;
 
     /// Persist (insert or overwrite) the state for one channel, keyed by
     /// `state.provider`. MUST be durable before returning `Ok`.
@@ -369,12 +384,15 @@ impl MemoryBuyerChannelStore {
 }
 
 impl BuyerChannelStore for MemoryBuyerChannelStore {
-    fn load_all(&self) -> Result<Vec<BuyerChannelState>, StoreError> {
+    fn load_all(&self) -> Result<BuyerLoad, StoreError> {
         let guard = self
             .inner
             .lock()
             .map_err(|err| StoreError::Backend(format!("memory store mutex poisoned: {err}")))?;
-        Ok(guard.values().cloned().collect())
+        Ok(BuyerLoad {
+            channels: guard.values().cloned().collect(),
+            skipped: Vec::new(),
+        })
     }
 
     fn record(&self, state: &BuyerChannelState) -> Result<(), StoreError> {
