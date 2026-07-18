@@ -15,7 +15,7 @@
 //! by a small [`raw_request`] client, since the honest requester never sends a
 //! binding), and per-channel voucher serialization under concurrency.
 //!
-//! The ADR 005 §Connection lifetime idle-close (#1193) has its own trio: the
+//! The ADR 005 §Connection lifetime idle-close (#1193) has its own group: the
 //! never-opened-a-stream reap, the `inflight.is_empty()` gate under a parked
 //! request read, and — driven by [`stall_delivery_at_closing_voucher`], a raw
 //! delivery client that parks a REAL paid stream at its closing-voucher exchange
@@ -70,7 +70,7 @@ use decdn_node::receipt_log::{DownloadReceipt, spawn_receipt_writer};
 use support::{
     BlockingReceiptLog, FailingReceiptLog, HandlerDomains, VecReceiptLog, build_handler_full,
     build_handler_full_with_receipts, build_handler_full_with_sink, cache_with_blob, empty_cache,
-    fresh_key, local_endpoint, permissive_limiter, spawn_server,
+    fresh_key, local_endpoint, permissive_limiter, read_client_msg, spawn_server, write_client_msg,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -492,24 +492,6 @@ struct StalledDelivery {
     wire_bytes: u64,
 }
 
-/// Read one framed [`ClientMessage`] from `recv`.
-async fn read_client_msg(recv: &mut RecvStream) -> anyhow::Result<ClientMessage> {
-    let frame = read_frame(recv)
-        .await
-        .map_err(|e| anyhow::anyhow!("read frame (stream reset?): {e}"))?;
-    let (msg, _rest) =
-        decode_message::<ClientMessage>(&frame).map_err(|e| anyhow::anyhow!("decode: {e}"))?;
-    Ok(msg)
-}
-
-/// Write one framed [`ClientMessage`] to `send`.
-async fn write_client_msg(send: &mut SendStream, msg: &ClientMessage) -> anyhow::Result<()> {
-    let payload = encode_message(msg).map_err(|e| anyhow::anyhow!("encode: {e}"))?;
-    write_frame(send, &payload)
-        .await
-        .map_err(|e| anyhow::anyhow!("write: {e}"))
-}
-
 /// Drive a real paid delivery up to — but not through — its closing voucher.
 ///
 /// The honest requester (`stream_fetch`) owns its connection internally, so a
@@ -582,16 +564,18 @@ async fn stall_delivery_at_closing_voucher(
 impl StalledDelivery {
     /// Pay the closing voucher and read the delivery out to its `StreamEnd`,
     /// releasing the server's `serve_stream` future. Returns the still-open
-    /// connection plus the instant the stream completed — the origin the idle
-    /// clock is required to count from.
+    /// connection plus the instant the CLIENT saw `StreamEnd` — a lower bound on
+    /// the server-side stream close the idle clock is required to count from.
     async fn pay_and_finish(
         mut self,
         signer: &PrivateKeySigner,
     ) -> anyhow::Result<(Connection, Instant)> {
         let voucher = Voucher {
             channel_id: channel_id(),
-            // Exactly the rate floor for the bytes served — accepted by a
-            // zero-tolerance `verify_rate`.
+            // Exactly the advertised-rate minimum for the bytes served, which
+            // clears the handler's per-delta `verify_rate` (1% tolerance). The
+            // cumulative rate-floor check is inert here: the fixture builds the
+            // handler with `delivery_floor = 0`.
             amount: min_payment(self.wire_bytes, RATE_PER_MB),
             nonce: U256::ONE,
             bytes_delivered: U256::from(self.wire_bytes),
@@ -638,16 +622,19 @@ fn ensure_graceful_idle_close(err: &ConnectionError) -> anyhow::Result<()> {
     }
 }
 
-/// ADR 005 §Connection lifetime (#1261): the `inflight.is_empty()` gate under a
-/// REAL paid delivery. The sibling test above parks the server in its *request*
-/// read; this one parks it past the whole blob, in `collect_voucher` — so an
-/// inverted or removed gate would truncate a delivery with every byte already on
-/// the wire and payment pending. The connection must survive several idle
-/// windows, and the delivery must complete normally once the voucher is paid.
+/// ADR 005 §Connection lifetime (#1261): a stalled paid delivery survives the
+/// idle window and then settles at the exact byte count. The sibling test above
+/// already pins the `inflight.is_empty()` gate itself (it kills the same
+/// delete/invert mutations); what is new here is the PARK POINT and the
+/// settlement assertions — the server sits past the whole blob in
+/// `collect_voucher`, with every byte on the wire and payment pending, so this
+/// is the test that fails if the deferral is ever narrowed to the request-read
+/// phase alone (e.g. by moving the reaper inside `serve_stream`).
 #[tokio::test(flavor = "multi_thread")]
 async fn active_delivery_stream_defers_idle_close() -> anyhow::Result<()> {
-    // 64 KiB: far under the 1 MiB default voucher interval, so the delivery has
-    // exactly one (closing) voucher and the park point is unambiguous.
+    // 64 KiB: far under the fixture's 1 MiB voucher interval (hardcoded in
+    // `build_handler_full_with_sink`), so the delivery has exactly one (closing)
+    // voucher and the park point is unambiguous.
     let payload = vec![0x3Du8; 64 * 1024];
     let idle = Duration::from_millis(150);
     let fx = idle_fixture(&payload, idle).await?;
@@ -706,11 +693,11 @@ async fn active_delivery_stream_defers_idle_close() -> anyhow::Result<()> {
 ///
 /// This one holds a real delivery in flight for `idle * 3`, so a timer armed at
 /// connection start has long since expired by the time the stream closes. The
-/// close must then arrive a further ~`idle` AFTER completion. Verified against
-/// the hoisted variant: it fires the instant `inflight` drains, which truncates
-/// the closing `VoucherAck`/`StreamEnd` — the delivery is reset rather than
-/// merely reaped early, so the break is caught either at the floor assertion
-/// below or at the read that precedes it.
+/// close must then arrive a further ~`idle` AFTER completion. Under the hoisted
+/// variant the already-expired timer is merely gated off by `is_empty()`, so it
+/// fires on the first iteration after `inflight` drains — landing within a
+/// round-trip of completion, an order of magnitude under the floor asserted
+/// below.
 #[tokio::test(flavor = "multi_thread")]
 async fn idle_clock_re_arms_from_last_stream_close() -> anyhow::Result<()> {
     let payload = vec![0x4Eu8; 64 * 1024];
@@ -736,8 +723,12 @@ async fn idle_clock_re_arms_from_last_stream_close() -> anyhow::Result<()> {
         .map_err(|_| {
             anyhow::anyhow!("connection was not idle-closed after the stream completed")
         })?;
-    // Measured after `closed()` resolves, so it includes the close's flight time —
-    // it can only over-report, never under-report, the server's own delay.
+    // Both endpoints of this measurement are stamped client-side, so the two
+    // loopback flight times largely cancel. What does NOT cancel is that the
+    // server writes `StreamEnd` BEFORE `serve_stream` returns, so it re-arms
+    // strictly after the instant `completed_at` records: the interval is
+    // `idle + (re-arm - StreamEnd write)`, i.e. it can only over-report the
+    // server's own delay. That direction is what makes the floor below safe.
     let since_completion = completed_at.elapsed();
     ensure_graceful_idle_close(&err)?;
 
