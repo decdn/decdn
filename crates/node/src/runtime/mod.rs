@@ -140,6 +140,22 @@ fn with_poll_interval<P: Provider>(provider: P, interval: Duration) -> P {
     provider
 }
 
+/// Keep every iroh ALPN listener closed until the blacklist watcher reports one
+/// clean full replay + operator-scope pass. The closure is the explicit seam
+/// that makes it impossible to construct the `Router` on either pending or
+/// failed readiness.
+async fn gate_listener_on_blacklist_sync<T>(
+    readiness: oneshot::Receiver<crate::blacklist_watcher::InitialSyncResult>,
+    start_listener: impl FnOnce() -> T,
+) -> anyhow::Result<T> {
+    readiness
+        .await
+        .context("blacklist watcher exited before initial sync completed")?
+        .map_err(anyhow::Error::msg)
+        .context("initial ContentBlacklist sync unavailable")?;
+    Ok(start_listener())
+}
+
 type HttpUrl = alloy::transports::http::reqwest::Url;
 
 /// Construct the four HTTP-provider roles owned by the node runtime (#1252).
@@ -553,14 +569,19 @@ pub async fn run(
     // Reserved for the settlement indexer's read-only provider (#326); cloned
     // here before `rpc_url` is moved into the wallet providers below.
     let reputation_rpc_url = rpc_url.clone();
-    // Cloned here for the same reason: the blacklist compliance watcher (#1031)
-    // builds its own read-only provider at its spawn site, well after `rpc_url`
-    // is moved below. `None` when the watcher is unconfigured.
-    let blacklist_rpc_url = cfg
-        .blockchain
-        .content_blacklist_address
-        .as_deref()
-        .map(|_| rpc_url.clone());
+    // Mandatory for paid delivery. Config resolution rejects absence; this
+    // runtime guard preserves fail-closed behavior for directly constructed
+    // `ResolvedConfig` values as well.
+    let content_blacklist_addr = parse_nonzero_address(
+        cfg.blockchain
+            .content_blacklist_address
+            .as_deref()
+            .context("missing mandatory blockchain.content_blacklist_address")?,
+        "blockchain.content_blacklist_address",
+    )?;
+    // Retained for the blacklist watcher's read-only provider after `rpc_url`
+    // moves into the buyer wallet provider below.
+    let blacklist_rpc_url = rpc_url.clone();
     // One value, two consumers (#1011/#1106): the `eth_getLogs` tick cadence each
     // watcher gets via `WatcherConfig::poll_interval`, and — through
     // `with_poll_interval` below — the pending-tx receipt heartbeat, overriding
@@ -1078,15 +1099,30 @@ pub async fn run(
     // the "node runtime ready" banner come up independent of any chain RPC. The
     // provider/store/pending handles built just above are moved into that task.
 
-    let router = Router::builder(ep.clone())
-        .accept(ProbeHandler::ALPN, probe_handler)
-        .accept(ClientHandler::ALPN, client_handler)
-        .accept(DhtHandler::ALPN, dht_handler)
-        .accept(
-            GOSSIP_ALPN,
-            LimitedHandler::new(gossip.clone(), Arc::clone(&limiter)),
-        )
-        .spawn();
+    // Blacklist compliance watcher (ADR 011/031, issue #1031), spawned early in
+    // bring-up (where the router used to be built) so its mandatory first replay
+    // and operator-scope pass runs concurrently with the rest of startup. It
+    // evicts held blobs whose hash is
+    // blacklisted in scope for this operator, which cascades to DHT-announce
+    // suppression (the republisher's `is_evicted` gate), probe `has_blob:false`,
+    // and delivery refusal — the node's only local protection against the slash
+    // for serving blacklisted content. `blacklist_ready_rx` gates the ALPN
+    // router below on that first pass; the returned `WatcherHandle` owns the
+    // loop's shutdown token (its sink shares it, #1236), and because the watcher
+    // persists no cursor the handle's `AbortOnDrop` is a sufficient backstop
+    // after the graceful `shutdown()` at teardown.
+    let (blacklist_ready_tx, blacklist_ready_rx) = oneshot::channel();
+    let blacklist_watcher = crate::blacklist_watcher::spawn(
+        ProviderFactory::read_only(blacklist_rpc_url, event_poll_interval),
+        content_blacklist_addr,
+        eth_signer.address(),
+        cache.clone(),
+        cfg.blockchain.content_blacklist_from_block,
+        event_poll_interval,
+        Arc::clone(&head),
+        Duration::from_secs(cfg.blockchain.content_blacklist_poll_interval_sec),
+        blacklist_ready_tx,
+    );
 
     // Bootstrap (ADR 022 §Bootstrap): seed the routing table from the
     // active-staker set + parallel `FindNode(self.node_id)` against a
@@ -1111,10 +1147,10 @@ pub async fn run(
         .await
         .context("failed to bind metrics listener")?;
 
-    let mut tasks = JoinSet::new();
     let (metrics_stop_tx, metrics_stop_rx) = oneshot::channel::<()>();
 
     let metrics_handle = Arc::clone(&node_metrics);
+    let mut tasks = JoinSet::new();
     tasks.spawn(async move {
         if let Err(err) = metrics::serve(metrics_listener, metrics_handle, metrics_stop_rx).await {
             tracing::error!(%err, "metrics server exited with error");
@@ -1237,38 +1273,6 @@ pub async fn run(
                 log_keyspace_gc("probe", "per_peer", limiter.gc_per_peer());
             },
         )
-    };
-
-    // Blacklist compliance watcher (ADR 011/031, issue #1031). Runs only when
-    // the operator configures a `ContentBlacklist` address. It evicts held
-    // blobs whose hash is blacklisted in scope for this operator, which
-    // cascades to DHT-announce suppression (the republisher's `is_evicted`
-    // gate), probe `has_blob:false`, and delivery refusal — the node's only
-    // local protection against the slash for serving blacklisted content.
-    // Since #1236 blacklist spawns its own task (returning a `WatcherHandle`)
-    // rather than running as a future the runtime awaits on `tasks`: its sink and
-    // the poll loop must share the shutdown token `spawn` mints, and it persists
-    // no cursor, so the handle's `AbortOnDrop` is a sufficient backstop after the
-    // graceful `shutdown()` below.
-    let blacklist_watcher = match (
-        cfg.blockchain.content_blacklist_address.as_deref(),
-        blacklist_rpc_url,
-    ) {
-        (Some(addr), Some(url)) => {
-            let content_blacklist_addr =
-                parse_nonzero_address(addr, "blockchain.content_blacklist_address")?;
-            Some(crate::blacklist_watcher::spawn(
-                ProviderFactory::read_only(url, event_poll_interval),
-                content_blacklist_addr,
-                eth_signer.address(),
-                cache.clone(),
-                cfg.blockchain.content_blacklist_from_block,
-                event_poll_interval,
-                Arc::clone(&head),
-                Duration::from_secs(cfg.blockchain.content_blacklist_poll_interval_sec),
-            ))
-        }
-        _ => None,
     };
 
     // DHT republish scheduler (ADR 022 §STORE Flow). The subscribe
@@ -1853,6 +1857,31 @@ pub async fn run(
         "node runtime ready"
     );
 
+    // No Probe, Client, DHT, or gossip ALPN is registered before the mandatory
+    // first global + operator-region blacklist replay/scope pass succeeds. The
+    // gate sits here — after the metrics/admin listeners are bound and every
+    // background task is spawned — so a *slow* (still-pending) initial sync keeps
+    // the paid-delivery listeners closed while observability, the admin control
+    // surface, and the startup banner stay up. A *failed* initial sync is
+    // fail-closed the hard way: the gate returns `Err`, `run` propagates it, and
+    // the process exits (tearing those listeners down with it) rather than ever
+    // serving un-vetted content. The watcher was spawned earlier in bring-up
+    // (where the router used to be built), so its initial replay runs
+    // concurrently and is often already complete by the time control reaches
+    // this gate.
+    let router = gate_listener_on_blacklist_sync(blacklist_ready_rx, || {
+        Router::builder(ep.clone())
+            .accept(ProbeHandler::ALPN, probe_handler)
+            .accept(ClientHandler::ALPN, client_handler)
+            .accept(DhtHandler::ALPN, dht_handler)
+            .accept(
+                GOSSIP_ALPN,
+                LimitedHandler::new(gossip.clone(), Arc::clone(&limiter)),
+            )
+            .spawn()
+    })
+    .await?;
+
     // Install signal streams once, before entering the select loop.
     // tokio docs are explicit that `Signal::recv` is the supported way
     // to await repeated signals, and re-creating the stream per signal
@@ -1919,9 +1948,7 @@ pub async fn run(
     let _ = probe_rate_limit_gc_stop_tx.send(());
     let _ = republish_stop_tx.send(());
     let _ = bucket_refresh_stop_tx.send(());
-    if let Some(watcher) = &blacklist_watcher {
-        watcher.shutdown();
-    }
+    blacklist_watcher.shutdown();
     if let Some(watcher) = &origin_watcher {
         watcher.shutdown();
     }
@@ -3158,6 +3185,92 @@ mod tests {
         assert_eq!(
             admin_stop_order(ShutdownSignal::Sigterm, &trigger),
             AdminStopOrder::Early,
+        );
+    }
+
+    #[tokio::test]
+    async fn listener_waits_for_successful_initial_blacklist_sync() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let started = Arc::new(AtomicBool::new(false));
+        let gate = gate_listener_on_blacklist_sync(ready_rx, {
+            let started = Arc::clone(&started);
+            move || started.store(true, Ordering::SeqCst)
+        });
+        tokio::pin!(gate);
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut gate)
+                .await
+                .is_err(),
+            "listener gate must stay pending while initial blacklist sync is pending"
+        );
+        assert!(
+            !started.load(Ordering::SeqCst),
+            "no ALPN listener may start before blacklist readiness"
+        );
+
+        ready_tx.send(Ok(())).expect("readiness receiver is live");
+        assert!(gate.await.is_ok(), "successful sync should open the gate");
+        assert!(
+            started.load(Ordering::SeqCst),
+            "listener starts only after successful blacklist readiness"
+        );
+    }
+
+    #[tokio::test]
+    async fn listener_stays_closed_when_initial_blacklist_sync_fails() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let started = Arc::new(AtomicBool::new(false));
+        ready_tx
+            .send(Err("ContentBlacklist getLogs unavailable".to_string()))
+            .expect("readiness receiver is live");
+
+        let err = gate_listener_on_blacklist_sync(ready_rx, {
+            let started = Arc::clone(&started);
+            move || started.store(true, Ordering::SeqCst)
+        })
+        .await
+        .expect_err("failed initial sync must fail startup");
+
+        assert!(
+            format!("{err:#}").contains("ContentBlacklist getLogs unavailable"),
+            "startup error should preserve the sync failure: {err:#}"
+        );
+        assert!(
+            !started.load(Ordering::SeqCst),
+            "listener must remain closed after a failed initial sync"
+        );
+    }
+
+    #[tokio::test]
+    async fn listener_fails_closed_when_watcher_drops_readiness() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // The watcher task died (panicked/aborted) before signaling either
+        // outcome: the gate must treat a dropped sender as a hard failure, not
+        // hang or silently open the listeners.
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let started = Arc::new(AtomicBool::new(false));
+        drop(ready_tx);
+
+        let err = gate_listener_on_blacklist_sync(ready_rx, {
+            let started = Arc::clone(&started);
+            move || started.store(true, Ordering::SeqCst)
+        })
+        .await
+        .expect_err("a dropped readiness channel must fail startup closed");
+
+        assert!(
+            format!("{err:#}").contains("blacklist watcher exited before initial sync completed"),
+            "startup error should explain the watcher exited early: {err:#}"
+        );
+        assert!(
+            !started.load(Ordering::SeqCst),
+            "listener must remain closed when the watcher never reported readiness"
         );
     }
 

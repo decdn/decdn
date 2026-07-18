@@ -1150,34 +1150,37 @@ fn resolve_blockchain_into(
     // (via `chain_ctx::resolve_appeal`, which validates it) — the daemon does
     // not resolve or use it, so there is nothing to resolve here.
 
-    // Optional `ContentBlacklist` address: when set the node runs the blacklist
-    // compliance watcher (ADR 011/031). Opt-in like the origin-directory
-    // addresses — a missing value is not an error, it just means no watcher.
-    let content_blacklist_address = cli
-        .content_blacklist_address
-        .clone()
-        .or_else(|| file.and_then(|b| b.content_blacklist_address.clone()))
-        .filter(|s| !s.is_empty())
-        .and_then(|v| {
-            bag.try_with(
-                "blockchain.content_blacklist_address",
-                parse_contract_address("content_blacklist_address", &v),
-            )
-        });
+    // Required for every paid-delivery node: without this contract the daemon
+    // has no local protection against serving slashable blacklisted content.
+    let content_blacklist_address = resolve_contract_address(
+        "blockchain.content_blacklist_address",
+        "content_blacklist_address",
+        "missing required option: --content-blacklist-address \
+         (or blockchain.content_blacklist_address in config file)",
+        cli.content_blacklist_address
+            .clone()
+            .or_else(|| file.and_then(|b| b.content_blacklist_address.clone())),
+        bag,
+    );
     // The zero address is a fail-open trap for compliance (unlike the opt-in
     // origin-directory addresses): every `isHashBlacklistedForOperator` call
     // against a codeless address reverts on empty return data, the watcher maps
     // that to "leave the blob in place", and nothing is ever evicted while the
     // operator believes compliance is active — maximal slash exposure with a
     // "configured" watcher. Reject it explicitly, mirroring `slash_judge_address`.
-    if let Some(addr) = content_blacklist_address.as_deref() {
+    if !content_blacklist_address.is_empty() {
         bag.check(
-            addr.trim_start_matches("0x").bytes().any(|b| b != b'0'),
+            content_blacklist_address
+                .trim_start_matches("0x")
+                .bytes()
+                .any(|b| b != b'0'),
             "blockchain.content_blacklist_address",
             "blockchain.content_blacklist_address must not be the zero address — \
              set it to the deployed ContentBlacklist contract (ADR 011/031)",
         );
     }
+    let content_blacklist_address =
+        (!content_blacklist_address.is_empty()).then_some(content_blacklist_address);
     // File-only tuning for the watcher's `HashBlacklisted` log replay start block
     // (mirrors `origin_directory_from_block`). SHOULD be the ContentBlacklist
     // deployment block; absent => `0`, correct but scans the whole chain.
@@ -7117,7 +7120,7 @@ swap_pool_address = \"0xPool\"
             payment_channel_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
-            content_blacklist_address: None,
+            content_blacklist_address: Some(GOOD_ADDR.to_string()),
             chain_id: None,
         };
         let dir = data_dir_with_keystore()?;
@@ -7138,7 +7141,7 @@ swap_pool_address = \"0xPool\"
             payment_channel_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
-            content_blacklist_address: None,
+            content_blacklist_address: Some(GOOD_ADDR.to_string()),
             chain_id: None,
         };
         let dir = data_dir_with_keystore()?;
@@ -7321,7 +7324,7 @@ swap_pool_address = \"0xPool\"
             payment_channel_address: None,
             capacity_bond_address: None,
             slash_judge_address: Some(GOOD_ADDR.to_string()),
-            content_blacklist_address: None,
+            content_blacklist_address: Some(GOOD_ADDR.to_string()),
             chain_id: None,
         }
     }
@@ -8059,7 +8062,7 @@ swap_pool_address = \"0xPool\"
             payment_channel_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
-            content_blacklist_address: None,
+            content_blacklist_address: Some(GOOD_ADDR.to_string()),
             chain_id: None,
         };
         let file = types::BlockchainConfig {
@@ -8237,6 +8240,33 @@ swap_pool_address = \"0xPool\"
         assert!(
             msg.contains("slash_judge_address"),
             "error should mention slash_judge_address: {msg}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_blockchain_errors_when_content_blacklist_address_missing() -> anyhow::Result<()> {
+        let dir = data_dir_with_keystore()?;
+        let cli = BlockchainArgs {
+            origin_assignment_address: None,
+            publisher_registry_address: None,
+            rpc_url: Some("https://example/rpc".to_string()),
+            eth_keystore: None,
+            keystore_password_file: None,
+            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            capacity_bond_address: Some(GOOD_ADDR.to_string()),
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            content_blacklist_address: None,
+            chain_id: None,
+        };
+        let Err(err) = resolve_blockchain(&cli, None, dir.path()) else {
+            anyhow::bail!("expected error when content_blacklist_address is missing");
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("content_blacklist_address")
+                && msg.contains("--content-blacklist-address"),
+            "error should name the required config key and CLI flag: {msg}"
         );
         Ok(())
     }
@@ -8709,7 +8739,7 @@ swap_pool_address = \"0xPool\"
             payment_channel_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
-            content_blacklist_address: None,
+            content_blacklist_address: Some(GOOD_ADDR.to_string()),
             chain_id: None,
         };
         let resolved = resolve_blockchain(&cli, None, dir.path())?;
@@ -8730,7 +8760,7 @@ swap_pool_address = \"0xPool\"
             payment_channel_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
-            content_blacklist_address: None,
+            content_blacklist_address: Some(GOOD_ADDR.to_string()),
             chain_id: None,
         };
         let file = types::BlockchainConfig {
@@ -8779,7 +8809,7 @@ swap_pool_address = \"0xPool\"
             payment_channel_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
-            content_blacklist_address: None,
+            content_blacklist_address: Some(GOOD_ADDR.to_string()),
             chain_id: None,
         };
         let file = types::BlockchainConfig {
@@ -8823,7 +8853,7 @@ swap_pool_address = \"0xPool\"
             payment_channel_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
-            content_blacklist_address: None,
+            content_blacklist_address: Some(GOOD_ADDR.to_string()),
             chain_id: None,
         };
         let file = types::BlockchainConfig {
@@ -8874,7 +8904,7 @@ swap_pool_address = \"0xPool\"
             payment_channel_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
-            content_blacklist_address: None,
+            content_blacklist_address: Some(GOOD_ADDR.to_string()),
             chain_id: None,
         };
         let resolved = resolve_blockchain(&cli, None, dir.path())?;
@@ -8937,7 +8967,7 @@ swap_pool_address = \"0xPool\"
             payment_channel_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
-            content_blacklist_address: None,
+            content_blacklist_address: Some(GOOD_ADDR.to_string()),
             chain_id: None,
         };
         let resolved = resolve_blockchain(&cli, None, dir.path())?;
@@ -8965,7 +8995,7 @@ swap_pool_address = \"0xPool\"
             payment_channel_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
-            content_blacklist_address: None,
+            content_blacklist_address: Some(GOOD_ADDR.to_string()),
             chain_id: None,
         };
         let at_min = types::BlockchainConfig {

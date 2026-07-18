@@ -34,6 +34,7 @@ rpc_url = "https://sepolia-rollup.arbitrum.io/rpc"
 payment_channel_address = "0x0000000000000000000000000000000000000001"
 capacity_bond_address = "0x0000000000000000000000000000000000000002"
 slash_judge_address = "0x0000000000000000000000000000000000000003"
+content_blacklist_address = "0x0000000000000000000000000000000000000004"
 "#;
 
 const MISSING_RPC: &str = r#"
@@ -253,10 +254,15 @@ fn validate_emits_all_problems_at_once() -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("expected validation to fail"))?;
     let msg = format!("{err:#}");
     anyhow::ensure!(
-        msg.contains("configuration has 3 problem(s):"),
+        msg.contains("configuration has 4 problem(s):"),
         "expected aggregated header: {msg}"
     );
-    for needle in ["rpc_url", "max_blob_size_mb", "rate_per_mb"] {
+    for needle in [
+        "rpc_url",
+        "content_blacklist_address",
+        "max_blob_size_mb",
+        "rate_per_mb",
+    ] {
         anyhow::ensure!(
             msg.contains(needle),
             "aggregated error should name {needle}: {msg}"

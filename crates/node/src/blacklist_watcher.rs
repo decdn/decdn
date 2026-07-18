@@ -1,7 +1,8 @@
 //! Blacklist compliance watcher (ADR 011 § Content Takedown, ADR 031).
 //!
-//! When the operator configures `blockchain.content_blacklist_address`, this
-//! task keeps the local blob store compliant with `ContentBlacklist`: it evicts
+//! Every paid-delivery node runs this task after resolving the mandatory
+//! `blockchain.content_blacklist_address`. It keeps the local blob store
+//! compliant with `ContentBlacklist`: it evicts
 //! any blob whose hash is blacklisted *in scope* for this operator (global ∪
 //! current-region ∪ ripening-prev-region). The scope decision is the contract's
 //! `isHashBlacklistedForOperator` view, so region packing and the ADR 030
@@ -56,7 +57,7 @@
 //! local protection.
 
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use alloy::primitives::{Address, B256};
@@ -68,6 +69,7 @@ use decdn_cache::{CacheEngine, Hash};
 use decdn_common::redact::sanitize_err_chain;
 use decdn_incentive::content_blacklist::ContentBlacklist;
 use decdn_incentive::content_blacklist::ContentBlacklist::{HashBlacklisted, HashRemoved};
+use tokio::sync::oneshot;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -77,6 +79,37 @@ use crate::chain_events::resumable_watcher::{
 };
 use crate::chain_events::shared_head::HeadSource;
 use crate::chain_events::timed;
+
+/// Result reported exactly once when the first full replay + re-scope pass
+/// either establishes compliance or proves startup cannot safely continue.
+pub(crate) type InitialSyncResult = std::result::Result<(), String>;
+
+#[derive(Clone)]
+struct InitialSyncGate(Arc<Mutex<Option<oneshot::Sender<InitialSyncResult>>>>);
+
+impl InitialSyncGate {
+    fn new(sender: oneshot::Sender<InitialSyncResult>) -> Self {
+        Self(Arc::new(Mutex::new(Some(sender))))
+    }
+
+    fn pending(&self) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+    }
+
+    fn signal(&self, result: InitialSyncResult) {
+        let sender = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(sender) = sender {
+            let _ = sender.send(result);
+        }
+    }
+}
 
 /// Mutable deny-set carried across poll ticks. The scan cursor lives on the
 /// resumable watcher; this holds only the re-scopable entry set.
@@ -138,6 +171,8 @@ struct BlacklistSink<P: Provider + Clone> {
     rescan_interval: Duration,
     /// When the last batched re-scope ran; `None` forces one on the first tick.
     last_rescan: Option<Instant>,
+    /// Still pending only during the mandatory first full replay + re-scope.
+    initial_sync: InitialSyncGate,
 }
 
 impl<P: Provider + Clone> LogSink for BlacklistSink<P> {
@@ -182,6 +217,11 @@ impl<P: Provider + Clone> LogSink for BlacklistSink<P> {
             // it comes back clean; only a clean pass waits out the full
             // operator cadence again.
             self.last_rescan = clean.then(Instant::now);
+            if !clean && self.initial_sync.pending() {
+                anyhow::bail!(
+                    "initial ContentBlacklist replay/re-scope could not enforce every entry"
+                );
+            }
         }
         Ok(())
     }
@@ -204,6 +244,9 @@ const fn cursor_start() -> CursorStart {
 /// starts (the `ContentBlacklist` deploy block) — re-scanned every boot, no
 /// persisted cursor (see the module header). `event_poll_interval` is the
 /// getLogs poll cadence; `rescan_interval` is the batched re-scope cadence.
+/// `initial_sync_tx` fires once the mandatory first full replay + re-scope
+/// either completes cleanly (`Ok`) or the loop falls into backoff (`Err`), so
+/// the runtime can gate the ALPN router on blacklist enforcement being live.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn<P>(
     provider: P,
@@ -214,12 +257,16 @@ pub(crate) fn spawn<P>(
     event_poll_interval: Duration,
     head: Arc<dyn HeadSource>,
     rescan_interval: Duration,
+    initial_sync_tx: oneshot::Sender<InitialSyncResult>,
 ) -> WatcherHandle
 where
     P: Provider + Clone + 'static,
 {
     let contract = ContentBlacklist::new(contract_addr, provider.clone());
     info!(%contract_addr, %operator, from_block, "blacklist compliance watcher starting");
+    let initial_sync = InitialSyncGate::new(initial_sync_tx);
+    let established_gate = initial_sync.clone();
+    let backoff_gate = initial_sync.clone();
 
     let cfg = WatcherConfig::new(
         head,
@@ -231,7 +278,19 @@ where
         event_poll_interval.max(Duration::from_secs(1)),
         "blacklist",
     )
-    .with_from_block(from_block);
+    .with_from_block(from_block)
+    // The initial-sync gate rides the generic loop's healthy/backoff hooks: the
+    // first established cycle signals `Ok`, the first backoff signals `Err`, and
+    // an initial re-scope that can't enforce every entry bails the sink into that
+    // backoff (see `BlacklistSink::on_tick_complete`). Later cycles are no-ops
+    // once the gate has fired (`signal` takes the sender exactly once).
+    .on_established(Box::new(move || established_gate.signal(Ok(()))))
+    .on_backoff(Box::new(move || {
+        backoff_gate.signal(Err(
+            "initial ContentBlacklist sync failed: chain RPC or cache eviction unavailable"
+                .to_string(),
+        ));
+    }));
     // Unlike the five flush-only sinks, `BlacklistSink` must observe the *same*
     // token the loop cancels: `rescan` polls it between per-hash `eth_call`s so a
     // large deny-set re-scope yields promptly to shutdown. `spawn` mints one
@@ -246,6 +305,7 @@ where
         shutdown: shutdown.clone(),
         rescan_interval: rescan_interval.max(Duration::from_secs(1)),
         last_rescan: None,
+        initial_sync,
     })
 }
 
@@ -457,6 +517,7 @@ async fn evict(cache: &CacheEngine, hash: Hash) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Context as _;
 
     const US: B256 = B256::repeat_byte(0x01);
     const FR: B256 = B256::repeat_byte(0x02);
@@ -465,6 +526,100 @@ mod tests {
         WatcherState {
             known: HashSet::new(),
         }
+    }
+
+    struct FailingHead;
+
+    #[async_trait::async_trait]
+    impl HeadSource for FailingHead {
+        async fn head(&self) -> Result<u64> {
+            anyhow::bail!("head unavailable")
+        }
+    }
+
+    #[tokio::test]
+    async fn initial_head_failure_signals_startup_error() -> Result<()> {
+        let asserter = alloy::providers::mock::Asserter::new();
+        let provider = alloy::providers::ProviderBuilder::new().connect_mocked_client(asserter);
+        let tmp = tempfile::tempdir()?;
+        let cache = CacheEngine::open(tmp.path(), Vec::new(), 1).await?;
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+
+        let handle = spawn(
+            provider,
+            Address::repeat_byte(0x11),
+            Address::repeat_byte(0x22),
+            cache,
+            0,
+            Duration::from_secs(1),
+            Arc::new(FailingHead),
+            Duration::from_mins(10),
+            ready_tx,
+        );
+        let readiness = tokio::time::timeout(Duration::from_secs(1), ready_rx)
+            .await
+            .context("watcher did not report initial-sync failure")?
+            .context("watcher dropped the readiness channel")?;
+
+        assert!(
+            readiness
+                .as_ref()
+                .is_err_and(|message| message.contains("initial ContentBlacklist sync failed")),
+            "startup should receive a useful initial-sync error: {readiness:?}"
+        );
+        // Dropping the handle aborts the loop; cancel first for a graceful stop.
+        handle.shutdown();
+        Ok(())
+    }
+
+    struct StaticHead(u64);
+
+    #[async_trait::async_trait]
+    impl HeadSource for StaticHead {
+        async fn head(&self) -> Result<u64> {
+            Ok(self.0)
+        }
+    }
+
+    /// The positive counterpart to the failure test: a clean first tick (head
+    /// resolves, the replay window returns no logs, and the empty deny-set
+    /// re-scope is trivially clean) must drive `on_established` and signal `Ok`
+    /// through the real `spawn` wiring. Guards against a hook swap or mis-cloned
+    /// `InitialSyncGate` that would keep every node's listeners closed forever
+    /// while leaving the failure-path test green.
+    #[tokio::test]
+    async fn initial_clean_replay_signals_ready() -> Result<()> {
+        let asserter = alloy::providers::mock::Asserter::new();
+        // One empty `eth_getLogs` for the [from_block, head] replay window; the
+        // head itself comes from the injected `StaticHead`, not the provider.
+        asserter.push_success(&Vec::<Log>::new());
+        let provider = alloy::providers::ProviderBuilder::new().connect_mocked_client(asserter);
+        let tmp = tempfile::tempdir()?;
+        let cache = CacheEngine::open(tmp.path(), Vec::new(), 1).await?;
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+
+        let handle = spawn(
+            provider,
+            Address::repeat_byte(0x11),
+            Address::repeat_byte(0x22),
+            cache,
+            0,
+            Duration::from_secs(1),
+            Arc::new(StaticHead(25)),
+            Duration::from_mins(10),
+            ready_tx,
+        );
+        let readiness = tokio::time::timeout(Duration::from_secs(1), ready_rx)
+            .await
+            .context("watcher did not report initial-sync result")?
+            .context("watcher dropped the readiness channel")?;
+
+        assert!(
+            readiness.is_ok(),
+            "a clean first replay must signal readiness: {readiness:?}"
+        );
+        handle.shutdown();
+        Ok(())
     }
 
     /// COMPLIANCE PIN: the blacklist watcher must full-replay from the deploy
