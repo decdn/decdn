@@ -2665,6 +2665,7 @@ dependencies = [
  "indicatif",
  "iroh",
  "jsonrpsee",
+ "postcard",
  "rand 0.10.2",
  "reqwest",
  "serde",

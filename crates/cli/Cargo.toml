@@ -50,6 +50,10 @@ walkdir = { workspace = true }
 globset = { workspace = true }
 blake3 = { workspace = true }
 tempfile = { workspace = true }
+# `DECDNMAN` file manifests (ADR 012 § File Manifests, #1183) are postcard-encoded,
+# so the client decodes them with the same codec the wire protocol uses. Already in
+# this binary's tree via `decdn-protocol`; no new dependency weight.
+postcard = { workspace = true }
 # `decdn fetch` (#1118) renders a delivery progress bar to stderr. TTY-aware, so
 # a piped/redirected fetch stays silent. Small dep tree (console, unicode-width),
 # unrelated to the iroh-blobs/AWS-free invariant above.
