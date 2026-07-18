@@ -477,6 +477,30 @@ fn write_fs_origin_blob(root: &std::path::Path, hash: &Hash, blob: &[u8]) -> any
     Ok(())
 }
 
+/// Locate the built `decdn` CLI binary relative to the current test executable
+/// (`target/<profile>/decdn`), falling back to `DECDN_CLI_BIN`. The sibling of
+/// this module's private `decdn_node_bin`, for tests that drive the
+/// user-facing binary rather than the daemon.
+pub fn decdn_cli_bin() -> anyhow::Result<PathBuf> {
+    if let Some(p) = std::env::var_os("DECDN_CLI_BIN") {
+        return Ok(PathBuf::from(p));
+    }
+    let exe = std::env::current_exe().context("current_exe")?;
+    // .../target/<profile>/deps/<test-bin>  → .../target/<profile>/decdn
+    let profile_dir = exe
+        .parent()
+        .and_then(|deps| deps.parent())
+        .context("resolve target profile dir")?;
+    let bin = profile_dir.join(if cfg!(windows) { "decdn.exe" } else { "decdn" });
+    anyhow::ensure!(
+        bin.exists(),
+        "decdn binary not found at {}; run `cargo build -p decdn-cli` first \
+         (or set DECDN_CLI_BIN)",
+        bin.display()
+    );
+    Ok(bin)
+}
+
 /// Locate the built `decdn-node` binary relative to the current test executable
 /// (`target/<profile>/decdn-node`), falling back to `DECDN_NODE_BIN`.
 fn decdn_node_bin() -> anyhow::Result<PathBuf> {
