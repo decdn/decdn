@@ -43,11 +43,14 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use alloy::primitives::Address;
-use tracing::warn;
 
-use crate::chain_events::AbortOnDrop;
+use crate::chain_events::resumable_watcher::WatcherHandle;
+use crate::dht::chain_projection::{ChainProjection, mutate_gauged};
 use crate::dht::routing::NodeId;
 use crate::metrics::Metrics;
+
+/// Names the projection in the poison-recovery `warn!` and gauge helpers.
+const LABEL: &str = "ChainNodeAddressDirectory bindings";
 
 /// Read-only resolver from a provider's iroh [`NodeId`] to its bonded operator
 /// Ethereum [`Address`]. Implementations MUST be cheap to clone (typically
@@ -102,12 +105,11 @@ impl NodeAddressResolver for StaticNodeAddressDirectory {
 }
 
 /// Chain-backed [`NodeAddressResolver`]. Cheap to clone via the shared inner
-/// [`Arc`]; the background watcher is owned via a private `AbortOnDrop` so a
-/// node-restart cycle never leaks chain-poll tasks.
+/// [`Arc`]; the background watcher is owned via the projection (shared with the
+/// staker-set façade) so a node-restart cycle never leaks chain-poll tasks.
 #[derive(Debug)]
 pub struct ChainNodeAddressDirectory {
-    bindings: Arc<RwLock<HashMap<NodeId, Address>>>,
-    _watcher: Arc<AbortOnDrop>,
+    proj: ChainProjection<HashMap<NodeId, Address>>,
 }
 
 impl ChainNodeAddressDirectory {
@@ -116,27 +118,17 @@ impl ChainNodeAddressDirectory {
     /// `ChainStakerSet`, so the task outlives whichever façade is dropped first.
     pub(super) const fn from_parts(
         bindings: Arc<RwLock<HashMap<NodeId, Address>>>,
-        watcher: Arc<AbortOnDrop>,
+        watcher: Arc<WatcherHandle>,
     ) -> Self {
         Self {
-            bindings,
-            _watcher: watcher,
+            proj: ChainProjection::from_parts(bindings, LABEL, watcher),
         }
     }
 }
 
 impl NodeAddressResolver for ChainNodeAddressDirectory {
     fn address_of(&self, node_id: &NodeId) -> Option<Address> {
-        // Poison-tolerant read: a poisoned lock means something panicked while
-        // holding the write guard; the map is still structurally valid, so
-        // recover rather than propagate a panic into the pull path.
-        match self.bindings.read() {
-            Ok(guard) => guard.get(node_id).copied(),
-            Err(poisoned) => {
-                warn!("ChainNodeAddressDirectory bindings RwLock poisoned; recovering inner state");
-                poisoned.into_inner().get(node_id).copied()
-            }
-        }
+        self.proj.read(|bindings| bindings.get(node_id).copied())
     }
 
     fn node_id_for(&self, address: &Address) -> Option<NodeId> {
@@ -144,18 +136,11 @@ impl NodeAddressResolver for ChainNodeAddressDirectory {
         // for a handful of channels, so a reverse index isn't worth maintaining.
         // Add a reverse map only if a node ever tracks thousands of buyer
         // channels.
-        let scan = |guard: &HashMap<NodeId, Address>| {
-            guard
+        self.proj.read(|bindings| {
+            bindings
                 .iter()
                 .find_map(|(node_id, addr)| (addr == address).then_some(*node_id))
-        };
-        match self.bindings.read() {
-            Ok(guard) => scan(&guard),
-            Err(poisoned) => {
-                warn!("ChainNodeAddressDirectory bindings RwLock poisoned; recovering inner state");
-                scan(&poisoned.into_inner())
-            }
-        }
+        })
     }
 }
 
@@ -163,51 +148,35 @@ impl NodeAddressResolver for ChainNodeAddressDirectory {
 /// set actually grew (a re-registration that overwrites an existing binding
 /// with the same key does not change cardinality).
 pub(super) fn set_binding(
-    bindings: &Arc<RwLock<HashMap<NodeId, Address>>>,
+    bindings: &RwLock<HashMap<NodeId, Address>>,
     metrics: &Arc<Metrics>,
     node_id: NodeId,
     address: Address,
 ) {
-    let (is_new, size) = {
-        let mut guard = match bindings.write() {
-            Ok(g) => g,
-            Err(poisoned) => {
-                warn!("ChainNodeAddressDirectory bindings RwLock poisoned; recovering inner state");
-                poisoned.into_inner()
-            }
-        };
+    mutate_gauged(
+        bindings,
+        LABEL,
         // `insert` returns the prior value: `None` means a new key (cardinality
         // grew); `Some` means an overwrite (same key, possibly rotated address)
         // that leaves the size — and thus the gauge — unchanged.
-        let is_new = guard.insert(node_id, address).is_none();
-        (is_new, guard.len())
-    };
-    if is_new {
-        metrics.node_address_directory_size(size);
-    }
+        |map| map.insert(node_id, address).is_none().then_some(map.len()),
+        |size| metrics.node_address_directory_size(size),
+    );
 }
 
 /// Remove `node_id`'s binding, republishing the size gauge only on a real
 /// removal (removing an absent key is a no-op).
 pub(super) fn remove_binding(
-    bindings: &Arc<RwLock<HashMap<NodeId, Address>>>,
+    bindings: &RwLock<HashMap<NodeId, Address>>,
     metrics: &Arc<Metrics>,
     node_id: &NodeId,
 ) {
-    let (removed, size) = {
-        let mut guard = match bindings.write() {
-            Ok(g) => g,
-            Err(poisoned) => {
-                warn!("ChainNodeAddressDirectory bindings RwLock poisoned; recovering inner state");
-                poisoned.into_inner()
-            }
-        };
-        let removed = guard.remove(node_id).is_some();
-        (removed, guard.len())
-    };
-    if removed {
-        metrics.node_address_directory_size(size);
-    }
+    mutate_gauged(
+        bindings,
+        LABEL,
+        |map| map.remove(node_id).is_some().then_some(map.len()),
+        |size| metrics.node_address_directory_size(size),
+    );
 }
 
 #[cfg(test)]

@@ -44,6 +44,7 @@ use iroh::endpoint::Connection;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::metrics::Metrics;
+use crate::prune_guard::PruneGuard;
 use crate::rate_limit::peer_ip;
 use decdn_common::config::ResolvedSecurity;
 
@@ -252,23 +253,6 @@ pub struct ConnectionLimiter {
     /// completes picks up the work.
     pruning_in_progress: AtomicBool,
     metrics: Arc<Metrics>,
-}
-
-/// RAII reset for `ConnectionLimiter::pruning_in_progress`. Holding one
-/// of these means the holder owns the single-flight slot for
-/// `retain_recent`; on drop — including drop during panic unwind — the
-/// flag is released. Without this, a panic inside `retain_recent` (e.g.
-/// from a future regression in the keyed limiter or an allocation
-/// failure during the walk) would leave the flag stuck `true` and
-/// permanently disable both prune codepaths for the lifetime of the
-/// process, which is the exact unbounded-keyspace failure mode #440 is
-/// meant to prevent.
-struct PruneGuard<'a>(&'a AtomicBool);
-
-impl Drop for PruneGuard<'_> {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
-    }
 }
 
 impl ConnectionLimiter {

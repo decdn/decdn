@@ -74,11 +74,11 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use crate::chain_events::resumable_watcher::{self, CursorPolicy, LogSink, WatcherConfig};
-use crate::chain_events::shared_head::HeadSource;
-use crate::chain_events::{
-    MAX_BACKFILL_BLOCK_SPAN, WATCHER_INITIAL_BACKOFF, WATCHER_MAX_BACKOFF, timed,
+use crate::chain_events::resumable_watcher::{
+    self, CursorStart, LogSink, WatcherConfig, WatcherHandle,
 };
+use crate::chain_events::shared_head::HeadSource;
+use crate::chain_events::timed;
 
 /// Result reported exactly once when the first full replay + re-scope pass
 /// either establishes compliance or proves startup cannot safely continue.
@@ -233,18 +233,22 @@ impl<P: Provider + Clone> LogSink for BlacklistSink<P> {
 /// out-of-scope, so un-evicted) entries are gone from `known` — silently
 /// dropping them from re-scoping, a slashable compliance gap (see the module
 /// header). Pinned by a test so a wiring change to a persisted cursor cannot
-/// land silently.
-const fn cursor_policy(from_block: u64) -> CursorPolicy {
-    CursorPolicy::FullReplay { floor: from_block }
+/// land silently. The replay floor is the watcher's `from_block` (the deploy
+/// block), resolved by [`CursorStart::FullReplay`] on every boot.
+const fn cursor_start() -> CursorStart {
+    CursorStart::FullReplay
 }
 
-/// Run the blacklist compliance watcher until `shutdown` is cancelled.
-/// `from_block` is where the `HashBlacklisted` replay starts (the
-/// `ContentBlacklist` deploy block) — re-scanned every boot, no persisted cursor
-/// (see the module header). `event_poll_interval` is the getLogs poll cadence;
-/// `rescan_interval` is the batched re-scope cadence.
+/// Spawn the blacklist compliance watcher, returning the handle that owns its
+/// task and shutdown token. `from_block` is where the `HashBlacklisted` replay
+/// starts (the `ContentBlacklist` deploy block) — re-scanned every boot, no
+/// persisted cursor (see the module header). `event_poll_interval` is the
+/// getLogs poll cadence; `rescan_interval` is the batched re-scope cadence.
+/// `initial_sync_tx` fires once the mandatory first full replay + re-scope
+/// either completes cleanly (`Ok`) or the loop falls into backoff (`Err`), so
+/// the runtime can gate the ALPN router on blacklist enforcement being live.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn run<P>(
+pub(crate) fn spawn<P>(
     provider: P,
     contract_addr: Address,
     operator: Address,
@@ -253,16 +257,45 @@ pub(crate) async fn run<P>(
     event_poll_interval: Duration,
     head: Arc<dyn HeadSource>,
     rescan_interval: Duration,
-    shutdown: CancellationToken,
     initial_sync_tx: oneshot::Sender<InitialSyncResult>,
-) where
-    P: Provider + Clone,
+) -> WatcherHandle
+where
+    P: Provider + Clone + 'static,
 {
     let contract = ContentBlacklist::new(contract_addr, provider.clone());
     info!(%contract_addr, %operator, from_block, "blacklist compliance watcher starting");
     let initial_sync = InitialSyncGate::new(initial_sync_tx);
+    let established_gate = initial_sync.clone();
+    let backoff_gate = initial_sync.clone();
 
-    let sink = BlacklistSink {
+    let cfg = WatcherConfig::new(
+        head,
+        Filter::new().address(contract_addr).event_signature(vec![
+            HashBlacklisted::SIGNATURE_HASH,
+            HashRemoved::SIGNATURE_HASH,
+        ]),
+        cursor_start(),
+        event_poll_interval.max(Duration::from_secs(1)),
+        "blacklist",
+    )
+    .with_from_block(from_block)
+    // The initial-sync gate rides the generic loop's healthy/backoff hooks: the
+    // first established cycle signals `Ok`, the first backoff signals `Err`, and
+    // an initial re-scope that can't enforce every entry bails the sink into that
+    // backoff (see `BlacklistSink::on_tick_complete`). Later cycles are no-ops
+    // once the gate has fired (`signal` takes the sender exactly once).
+    .on_established(Box::new(move || established_gate.signal(Ok(()))))
+    .on_backoff(Box::new(move || {
+        backoff_gate.signal(Err(
+            "initial ContentBlacklist sync failed: chain RPC or cache eviction unavailable"
+                .to_string(),
+        ));
+    }));
+    // Unlike the five flush-only sinks, `BlacklistSink` must observe the *same*
+    // token the loop cancels: `rescan` polls it between per-hash `eth_call`s so a
+    // large deny-set re-scope yields promptly to shutdown. `spawn` mints one
+    // token and hands it to the factory, so sink and loop share it (#1236).
+    resumable_watcher::spawn(provider, cfg, move |shutdown| BlacklistSink {
         contract,
         operator,
         cache,
@@ -272,35 +305,8 @@ pub(crate) async fn run<P>(
         shutdown: shutdown.clone(),
         rescan_interval: rescan_interval.max(Duration::from_secs(1)),
         last_rescan: None,
-        initial_sync: initial_sync.clone(),
-    };
-    let established_gate = initial_sync.clone();
-    let backoff_gate = initial_sync;
-    let cfg = WatcherConfig {
-        head,
-        filter: Filter::new().address(contract_addr).event_signature(vec![
-            HashBlacklisted::SIGNATURE_HASH,
-            HashRemoved::SIGNATURE_HASH,
-        ]),
-        from_block,
-        poll_interval: event_poll_interval.max(Duration::from_secs(1)),
-        max_backfill_span: MAX_BACKFILL_BLOCK_SPAN,
-        cursor: cursor_policy(from_block),
-        initial_backoff: WATCHER_INITIAL_BACKOFF,
-        max_backoff: WATCHER_MAX_BACKOFF,
-        rpc_call_timeout: None,
-        shutdown,
-        seed_cursor: None,
-        label: "blacklist",
-        on_established: Some(Box::new(move || established_gate.signal(Ok(())))),
-        on_backoff: Some(Box::new(move || {
-            backoff_gate.signal(Err(
-                "initial ContentBlacklist sync failed: chain RPC or cache eviction unavailable"
-                    .to_string(),
-            ));
-        })),
-    };
-    resumable_watcher::run(provider, cfg, sink).await;
+        initial_sync,
+    })
 }
 
 /// Re-scope every distinct hash in `known` (one scope `eth_call` per hash, not
@@ -537,10 +543,9 @@ mod tests {
         let provider = alloy::providers::ProviderBuilder::new().connect_mocked_client(asserter);
         let tmp = tempfile::tempdir()?;
         let cache = CacheEngine::open(tmp.path(), Vec::new(), 1).await?;
-        let shutdown = CancellationToken::new();
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
 
-        let task = tokio::spawn(run(
+        let handle = spawn(
             provider,
             Address::repeat_byte(0x11),
             Address::repeat_byte(0x22),
@@ -549,9 +554,8 @@ mod tests {
             Duration::from_secs(1),
             Arc::new(FailingHead),
             Duration::from_mins(10),
-            shutdown.clone(),
             ready_tx,
-        ));
+        );
         let readiness = tokio::time::timeout(Duration::from_secs(1), ready_rx)
             .await
             .context("watcher did not report initial-sync failure")?
@@ -563,22 +567,19 @@ mod tests {
                 .is_err_and(|message| message.contains("initial ContentBlacklist sync failed")),
             "startup should receive a useful initial-sync error: {readiness:?}"
         );
-        shutdown.cancel();
-        task.await.context("blacklist watcher task panicked")?;
+        // Dropping the handle aborts the loop; cancel first for a graceful stop.
+        handle.shutdown();
         Ok(())
     }
 
     /// COMPLIANCE PIN: the blacklist watcher must full-replay from the deploy
-    /// floor on every boot. A swap to `CursorPolicy::Persisted` resumes past
-    /// logs whose entries no longer exist in the in-memory deny-set, silently
-    /// dropping them from re-scoping — serving such a hash is slashable.
+    /// floor on every boot. A swap to a persisted resume skips past logs whose
+    /// entries no longer exist in the in-memory deny-set, silently dropping them
+    /// from re-scoping — serving such a hash is slashable.
     #[test]
-    fn cursor_policy_is_full_replay_never_persisted() {
+    fn cursor_start_is_full_replay_never_persisted() {
         assert!(
-            matches!(
-                cursor_policy(1234),
-                CursorPolicy::FullReplay { floor: 1234 }
-            ),
+            matches!(cursor_start(), CursorStart::FullReplay),
             "blacklist deny-set rebuild requires FullReplay from the deploy block"
         );
     }

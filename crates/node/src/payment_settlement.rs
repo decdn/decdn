@@ -78,19 +78,16 @@ use decdn_incentive::{
 };
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::chain_events::resumable_watcher::{
-    self, CursorPolicy, LogSink, NoneFallback, WatcherConfig,
+    self, Checkpoint, CursorStart, LogSink, WatcherConfig, WatcherHandle,
 };
 use crate::chain_events::shared_head::HeadSource;
-use crate::chain_events::{
-    AbortOnDrop, MAX_BACKFILL_BLOCK_SPAN, REORG_MARGIN_BLOCKS, WATCHER_INITIAL_BACKOFF,
-    WATCHER_MAX_BACKOFF, timed,
-};
+use crate::chain_events::{AbortOnDrop, REORG_MARGIN_BLOCKS, timed};
 use crate::handlers::client::ClientHandler;
 use crate::metrics::{Metrics, SettleParty};
+use crate::onchain_tx::{TxOutcome, send_and_await_receipt};
 
 /// Capacity of the redeem-hint channel. Hints are advisory (a missed hint
 /// only delays a redemption until the next voucher or shutdown), so a bounded
@@ -199,8 +196,15 @@ pub struct PaymentChannelService<P: Provider + Clone + 'static> {
     store: Arc<dyn ChannelStateStore>,
     pending_store: Arc<dyn PendingSettleStore>,
     redeem_tx: mpsc::Sender<ChannelId>,
-    _watcher: AbortOnDrop,
-    /// The redemption task handle. Unlike `_watcher`/`_sweeper` (aborted only on
+    /// The settlement watcher, owning both its task and the shutdown token that
+    /// stops it (#1236). `close_open_channels_on_shutdown` calls
+    /// [`WatcherHandle::shutdown`] at a point only this service knows — before
+    /// its channel-close deadline, so a slow `closeChannel` cannot starve the
+    /// checkpoint flush — which is why the token is not runtime-owned. Held (not
+    /// `_`-dropped) so that graceful `shutdown()` runs before the wrapped
+    /// `AbortOnDrop` hard-stops the task.
+    watcher: WatcherHandle,
+    /// The redemption task handle. Unlike `watcher`/`_sweeper` (aborted only on
     /// drop) this is held so the shutdown path can abort+await it *before*
     /// closing channels (#751) — greatly narrowing (not eliminating; a tx already
     /// broadcast before the abort can still mine) the window where a live
@@ -219,10 +223,6 @@ pub struct PaymentChannelService<P: Provider + Clone + 'static> {
     /// re-scanning the debounce window. A directly-durable store's `flush` is a
     /// no-op, so this is harmless when no debounce decorator is installed.
     checkpoint_store: Arc<dyn KeyedCheckpointStore>,
-    /// Cancels the settlement watcher's `eth_getLogs` poll loop on graceful
-    /// shutdown so it flushes its checkpoint and returns before the process
-    /// exits (the `AbortOnDrop` wrapper is the hard safety net).
-    watcher_shutdown: CancellationToken,
 }
 
 impl<P: Provider + Clone + 'static> PaymentChannelService<P> {
@@ -269,9 +269,9 @@ impl<P: Provider + Clone + 'static> PaymentChannelService<P> {
 
         // Settlement watcher on the resumable `eth_getLogs` poller (#1092/#1106).
         // The backfill floor and downtime-gap resume (#751/#762) are now the
-        // cursor policy's job: a persisted `ChannelOpened` checkpoint resumes
-        // across restarts; a first-ever boot (`none_fallback: Head`) scans from
-        // head, so nothing predating the node is chased. The closing-
+        // cursor start's job: a persisted `ChannelOpened` checkpoint resumes
+        // across restarts; a first-ever boot (cold store) anchors at head, so
+        // nothing predating the node is chased. The closing-
         // reconciliation backfill (#839) is subsumed: `ChannelCloseInitiated`
         // logs flow through the same scan.
         //
@@ -282,7 +282,6 @@ impl<P: Provider + Clone + 'static> PaymentChannelService<P> {
         // channel registration, so a client's first request on a fresh channel
         // would be rejected as unknown. A shallow reorg is covered by the resume
         // `reorg_margin` and the sink's idempotent `register_open_channel`.
-        let watcher_shutdown = CancellationToken::new();
         let sink = SettlementSink {
             contract: contract.clone(),
             self_address,
@@ -291,9 +290,9 @@ impl<P: Provider + Clone + 'static> PaymentChannelService<P> {
             pending_store: Arc::clone(&pending_store),
             metrics: Arc::clone(&metrics),
         };
-        let cfg = WatcherConfig {
+        let cfg = WatcherConfig::new(
             head,
-            filter: Filter::new()
+            Filter::new()
                 .address(payment_channel_addr)
                 .event_signature(vec![
                     PaymentChannel::ChannelOpened::SIGNATURE_HASH,
@@ -301,24 +300,15 @@ impl<P: Provider + Clone + 'static> PaymentChannelService<P> {
                     PaymentChannel::ChannelSettled::SIGNATURE_HASH,
                     PaymentChannel::ChannelCloseInitiated::SIGNATURE_HASH,
                 ]),
-            from_block: 0,
-            poll_interval: event_poll_interval,
-            max_backfill_span: MAX_BACKFILL_BLOCK_SPAN,
-            cursor: cursor_policy(Arc::clone(&checkpoint_store)),
-            initial_backoff: WATCHER_INITIAL_BACKOFF,
-            max_backoff: WATCHER_MAX_BACKOFF,
-            rpc_call_timeout: None,
-            shutdown: watcher_shutdown.clone(),
-            seed_cursor: None,
-            label: "settlement",
-            on_established: None,
-            on_backoff: None,
-        };
-        let watcher = tokio::spawn(resumable_watcher::run(
-            contract.provider().clone(),
-            cfg,
-            sink,
-        ));
+            cursor_start(Arc::clone(&checkpoint_store)),
+            event_poll_interval,
+            "settlement",
+        );
+        // This sink observes no shutdown token, so it ignores the one `spawn`
+        // mints (`|_| sink`). The returned handle owns that token; the service
+        // cancels it in `close_open_channels_on_shutdown` at its own ordering
+        // point, before the channel-close deadline.
+        let watcher = resumable_watcher::spawn(contract.provider().clone(), cfg, move |_| sink);
         let redeemer = tokio::spawn(redeemer_loop(
             contract.clone(),
             Arc::clone(&store),
@@ -344,11 +334,10 @@ impl<P: Provider + Clone + 'static> PaymentChannelService<P> {
             store,
             pending_store,
             redeem_tx,
-            _watcher: AbortOnDrop(watcher),
+            watcher,
             redeemer: std::sync::Mutex::new(Some(redeemer)),
             _sweeper: AbortOnDrop(sweeper),
             checkpoint_store,
-            watcher_shutdown,
         })
     }
 
@@ -372,7 +361,7 @@ impl<P: Provider + Clone + 'static> PaymentChannelService<P> {
         // needlessly re-scan the debounce window. Both are cheap and idempotent;
         // done before the channel-close deadline so a slow `closeChannel` cannot
         // starve them.
-        self.watcher_shutdown.cancel();
+        self.watcher.shutdown();
         self.flush_checkpoint_on_shutdown();
         // Quiesce the redeemer first (#751): with the router already drained, no
         // new hints arrive, and aborting the redeemer here stops it from *issuing*
@@ -895,20 +884,20 @@ async fn reconcile_closing_channel<P: Provider + Clone>(
     Ok(())
 }
 
-/// The settlement watcher's cursor policy: resume the durable
-/// [`CheckpointKey::ChannelOpened`] floor (#751); a first-ever boot anchors at
-/// **head** — no channel toward this node can predate the node itself, so
-/// there is no history to replay. Pinned by a test: swapping the fallback to
-/// `FromBlock` full-scans chain history on every fresh node (`from_block` is
-/// `0` here), and swapping the key forfeits the persisted resume.
+/// The settlement watcher's cursor start: resume the durable
+/// [`CheckpointKey::ChannelOpened`] floor (#751); a first-ever boot (cold store)
+/// anchors at **head** — no channel toward this node can predate the node
+/// itself, so there is no history to replay. Pinned by a test: swapping the key
+/// forfeits the persisted resume.
 ///
 /// The `reorg_margin` rewind lives here too: it is only meaningful against a
-/// durable cursor, so [`CursorPolicy::Persisted`] owns it (#1227).
-fn cursor_policy(store: Arc<dyn KeyedCheckpointStore>) -> CursorPolicy {
-    CursorPolicy::Persisted {
-        store,
-        key: CheckpointKey::ChannelOpened,
-        none_fallback: NoneFallback::Head,
+/// durable cursor, so [`CursorStart::FromCheckpoint`] owns it (#1227).
+fn cursor_start(store: Arc<dyn KeyedCheckpointStore>) -> CursorStart {
+    CursorStart::FromCheckpoint {
+        checkpoint: Checkpoint {
+            store,
+            key: CheckpointKey::ChannelOpened,
+        },
         reorg_margin: REORG_MARGIN_BLOCKS,
     }
 }
@@ -1838,9 +1827,10 @@ pub(crate) async fn settle_pass<P: Provider + Clone>(
 /// another party already settled (status left `Closing`): confirm via
 /// `getChannel` and drop the entry if the channel is now `Closed`, otherwise
 /// leave it for the next sweep (e.g. local-clock skew ahead of the chain).
-// Linear guard-and-act sequence (send → receipt → status → confirm); the
-// early-return guards read more clearly inline than split across helpers,
-// same posture as `try_redeem` / `try_close_for_expiry`.
+// The send→receipt→status plumbing is folded once by `send_and_await_receipt`;
+// this matches on the resulting `TxOutcome` and each arm carries the
+// party-aware metric plus the terminal's meaning — transient-retry (send /
+// receipt) vs the getChannel revert-confirm.
 #[allow(clippy::cognitive_complexity)]
 pub(crate) async fn try_settle<P: Provider + Clone>(
     contract: &PaymentChannel::PaymentChannelInstance<P>,
@@ -1849,49 +1839,54 @@ pub(crate) async fn try_settle<P: Provider + Clone>(
     party: SettleParty,
     metrics: &Arc<Metrics>,
 ) {
-    let send = match contract.settleChannel(channel_id).send().await {
-        Ok(p) => p,
-        Err(err) => {
+    match send_and_await_receipt(contract.settleChannel(channel_id).send().await, None).await {
+        TxOutcome::Landed(receipt) => {
+            record_settle_receipt_outcome(party, metrics, true);
+            info!(
+                %channel_id,
+                tx = %receipt.transaction_hash,
+                outcome = "ok",
+                "settled channel; routed provider remainder through FeeRouter"
+            );
+            forget_pending_logged(pending_store, channel_id, party, metrics);
+        }
+        TxOutcome::Reverted(receipt) => {
+            record_settle_receipt_outcome(party, metrics, false);
+            // Reverted: most likely `ChannelNotClosing` because another party
+            // already finalized. Confirm before dropping the obligation.
+            warn!(
+                %channel_id,
+                tx = %receipt.transaction_hash,
+                outcome = "reverted",
+                "settleChannel reverted; checking whether it was already finalized"
+            );
+            drop_pending_if_finalized(contract, pending_store, channel_id, party, metrics).await;
+        }
+        TxOutcome::SendErr(err) => {
             party.finalize_transient_send(metrics);
             warn!(
                 err = %sanitize_rpc_display(&err), %channel_id, outcome = "transient_send",
                 "settleChannel send failed; will retry next sweep"
             );
-            return;
         }
-    };
-    let receipt = match send.get_receipt().await {
-        Ok(r) => r,
-        Err(err) => {
+        TxOutcome::ReceiptErr(err) => {
             party.finalize_transient_receipt(metrics);
             warn!(
                 err = %sanitize_rpc_display(&err), %channel_id, outcome = "transient_receipt",
                 "settleChannel receipt failed; will retry next sweep"
             );
-            return;
         }
-    };
-    let landed = receipt.status();
-    record_settle_receipt_outcome(party, metrics, landed);
-    if landed {
-        info!(
-            %channel_id,
-            tx = %receipt.transaction_hash,
-            outcome = "ok",
-            "settled channel; routed provider remainder through FeeRouter"
-        );
-        forget_pending_logged(pending_store, channel_id, party, metrics);
-        return;
+        TxOutcome::Timeout => {
+            // No receipt timeout is supplied above, so this arm is unreachable;
+            // fold it into the transient-receipt retry bucket rather than
+            // panicking, per the workspace anti-panic policy.
+            party.finalize_transient_receipt(metrics);
+            warn!(
+                %channel_id, outcome = "transient_receipt",
+                "settleChannel receipt wait elapsed; will retry next sweep"
+            );
+        }
     }
-    // Reverted: most likely `ChannelNotClosing` because another party already
-    // finalized. Confirm before dropping the obligation.
-    warn!(
-        %channel_id,
-        tx = %receipt.transaction_hash,
-        outcome = "reverted",
-        "settleChannel reverted; checking whether it was already finalized"
-    );
-    drop_pending_if_finalized(contract, pending_store, channel_id, party, metrics).await;
 }
 
 /// Count the terminal outcome of a `settleChannel` receipt: a landed receipt
@@ -2212,9 +2207,9 @@ mod tests {
     }
 
     /// POLICY PIN: the settlement watcher resumes the durable `ChannelOpened`
-    /// floor and anchors a first-ever boot at head. A `FromBlock` fallback here
-    /// would full-scan chain history on every fresh node (settlement's
-    /// `from_block` is 0); a different key forfeits the #751 resume.
+    /// floor; a different key forfeits the #751 resume. A cold-store first boot
+    /// anchors at head (see `resolve_persisted_start`), so no fresh node
+    /// full-scans chain history.
     ///
     /// Also pins the reorg rewind at the shared `REORG_MARGIN_BLOCKS`. This
     /// asserts the value the *production* config carries, which is the point:
@@ -2223,15 +2218,16 @@ mod tests {
     /// supplied. A rewind of `0` here would silently forfeit the shallow-reorg
     /// coverage on resume.
     #[test]
-    fn cursor_policy_is_persisted_channel_opened_head_fallback() {
+    fn cursor_start_is_from_checkpoint_channel_opened() {
         let store: Arc<dyn KeyedCheckpointStore> = Arc::new(RecordingCheckpointStore::default());
         assert!(matches!(
-            cursor_policy(store),
-            CursorPolicy::Persisted {
-                key: CheckpointKey::ChannelOpened,
-                none_fallback: NoneFallback::Head,
+            cursor_start(store),
+            CursorStart::FromCheckpoint {
+                checkpoint: Checkpoint {
+                    key: CheckpointKey::ChannelOpened,
+                    ..
+                },
                 reorg_margin: REORG_MARGIN_BLOCKS,
-                ..
             }
         ));
     }

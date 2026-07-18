@@ -53,6 +53,7 @@ use iroh::endpoint::Connection;
 
 use crate::dht::routing::NodeId;
 use crate::dispatch::source_key;
+use crate::prune_guard::PruneGuard;
 
 /// Resolved three-layer rate-limit configuration.
 ///
@@ -223,20 +224,6 @@ pub struct ThreeLayerRateLimiter {
     pruning_per_peer: AtomicBool,
     trusted_ips: HashSet<IpAddr>,
     metrics: Arc<dyn RateLimitMetricsSink>,
-}
-
-/// RAII reset for [`ThreeLayerRateLimiter::pruning_per_ip`] /
-/// [`ThreeLayerRateLimiter::pruning_per_peer`] — see [`crate::dispatch`]'s
-/// `PruneGuard` for the full rationale. Briefly: holding one means the holder
-/// owns the single-flight slot for `retain_recent`; on drop (including drop
-/// during panic unwind) the flag is released with `Release` ordering, so a
-/// panic in `retain_recent` cannot permanently stall the prune codepath.
-struct PruneGuard<'a>(&'a AtomicBool);
-
-impl Drop for PruneGuard<'_> {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
-    }
 }
 
 impl ThreeLayerRateLimiter {
