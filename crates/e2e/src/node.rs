@@ -437,7 +437,8 @@ fn write_fs_origin_blob(root: &std::path::Path, hash: &Hash, blob: &[u8]) -> any
 
 /// Locate the built `decdn` CLI binary relative to the current test executable
 /// (`target/<profile>/decdn`), falling back to `DECDN_CLI_BIN`. The sibling of
-/// [`decdn_node_bin`] for tests that drive the user-facing binary.
+/// this module's private `decdn_node_bin`, for tests that drive the
+/// user-facing binary rather than the daemon.
 pub fn decdn_cli_bin() -> anyhow::Result<PathBuf> {
     if let Some(p) = std::env::var_os("DECDN_CLI_BIN") {
         return Ok(PathBuf::from(p));
