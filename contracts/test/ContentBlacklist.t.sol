@@ -140,6 +140,80 @@ contract ContentBlacklistTest is Test {
         assertFalse(blacklist.isHashBlacklisted(SAMPLE_HASH));
     }
 
+    /// @notice ADR 011 § Blacklist version — `getBlacklistVersion()` starts at
+    ///         zero and advances by exactly one on every hash add and every hash
+    ///         removal, on the global path, the regional path, and the
+    ///         appeal-ratification path (which removes via the same choke point).
+    ///         Nodes poll this instead of replaying the full event history.
+    function test_getBlacklistVersion_bumpsOnEveryAddAndRemove() public {
+        assertEq(blacklist.getBlacklistVersion(), 0);
+
+        vm.prank(admin);
+        blacklist.addHashGlobal(SAMPLE_HASH, "DMCA-TEST");
+        assertEq(blacklist.getBlacklistVersion(), 1);
+
+        vm.prank(regionalBody);
+        blacklist.addHashRegional(REGION_US, SAMPLE_HASH, "DMCA-TEST");
+        assertEq(blacklist.getBlacklistVersion(), 2);
+
+        vm.prank(admin);
+        blacklist.removeHashGlobal(SAMPLE_HASH);
+        assertEq(blacklist.getBlacklistVersion(), 3);
+
+        vm.prank(regionalBody);
+        blacklist.removeHashRegional(REGION_US, SAMPLE_HASH);
+        assertEq(blacklist.getBlacklistVersion(), 4);
+
+        // Re-adding an already-removed hash is a fresh add, so it bumps again —
+        // the counter tracks operations, not the live entry count.
+        vm.prank(admin);
+        blacklist.addHashGlobal(SAMPLE_HASH, "DMCA-TEST-2");
+        assertEq(blacklist.getBlacklistVersion(), 5);
+    }
+
+    /// @notice The counter must not move for anything that is not a hash
+    ///         add/remove: operator + origin blacklisting, governance setters,
+    ///         reads, and the appeal-driven `suspended` toggle (a per-entry
+    ///         liveness flag observable via `getHashEntry`, not an entry-set
+    ///         change). A spurious bump would cost every node a delta fetch.
+    function test_getBlacklistVersion_unaffectedByNonEntryOperations() public {
+        vm.prank(regionalBody);
+        blacklist.addHashRegional(REGION_US, SAMPLE_HASH, "DMCA-TEST");
+        uint256 versionAfterAdd = blacklist.getBlacklistVersion();
+        assertEq(versionAfterAdd, 1);
+
+        vm.startPrank(admin);
+        blacklist.addOperator(operator);
+        blacklist.removeOperator(operator);
+        blacklist.setOriginBlacklist(address(0xBEEF), true);
+        blacklist.setAppealBond(200e18);
+        blacklist.setRejectionCooldownWindow(30 days);
+        vm.stopPrank();
+        assertEq(blacklist.getBlacklistVersion(), versionAfterAdd);
+
+        // Reads never bump.
+        blacklist.isHashBlacklistedInRegion(SAMPLE_HASH, REGION_US);
+        blacklist.getHashEntry(REGION_US, SAMPLE_HASH);
+        assertEq(blacklist.getBlacklistVersion(), versionAfterAdd);
+
+        // Fast-track suspends the entry without removing it — no bump.
+        vm.prank(filer);
+        uint256 appealId = blacklist.openBlacklistAppeal(
+            SAMPLE_HASH, REGION_US, bytes32("evidence"), ContentBlacklist.StandingPath.Operator, 0
+        );
+        assertEq(blacklist.getBlacklistVersion(), versionAfterAdd);
+        vm.prank(multisig);
+        blacklist.fastTrackBlacklistAppeal(appealId);
+        assertTrue(blacklist.getHashEntry(REGION_US, SAMPLE_HASH).suspended);
+        assertEq(blacklist.getBlacklistVersion(), versionAfterAdd);
+
+        // Ratification DOES remove the entry, so that one bumps.
+        vm.prank(admin);
+        blacklist.ratifyBlacklistAppealRemoval(appealId);
+        assertEq(blacklist.getHashEntry(REGION_US, SAMPLE_HASH).addedAt, 0);
+        assertEq(blacklist.getBlacklistVersion(), versionAfterAdd + 1);
+    }
+
     function test_addOperator_callsEjectOnCapacityBond() public {
         vm.prank(admin);
         blacklist.addOperator(operator);

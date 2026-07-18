@@ -207,6 +207,19 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     ///         Blacklisting).
     mapping(address origin => bool) public isOriginBlacklisted;
 
+    /// @notice Monotonic blacklist revision (ADR 011 § Blacklist version), read
+    ///         via `getBlacklistVersion`. Bumped once per hash add and once per
+    ///         hash removal, across every path. Nodes cache the last-seen value
+    ///         and re-fetch entry deltas only when it advances, replacing a full
+    ///         event replay from the deploy block with an O(1) version check.
+    /// @dev    Bumped in the two internal choke points `_addHash` and
+    ///         `_removeHashRegional`, which every add/remove funnels through, so
+    ///         no call site has to remember to increment it. Deliberately not a
+    ///         `public` auto-getter: ADR 011 names the accessor
+    ///         `getBlacklistVersion()`, and an auto-getter would be
+    ///         `blacklistVersion()`.
+    uint256 internal _blacklistVersion;
+
     // -----------------------------------------------------------------
     // Storage — appeals
     // -----------------------------------------------------------------
@@ -475,6 +488,18 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
 
     function getHashEntry(bytes32 region, bytes32 hash) external view returns (HashEntry memory) {
         return _hashEntries[region][hash];
+    }
+
+    /// @notice Current blacklist revision (ADR 011 § Blacklist version) —
+    ///         monotonically increasing, bumped once per hash add and once per
+    ///         hash removal across all paths. An O(1) poll target: a caller whose
+    ///         cached value still matches knows no entry was added or removed and
+    ///         can skip fetching entry deltas entirely.
+    /// @dev    Counts entry-set changes only. The appeal-driven `suspended`
+    ///         toggle is a per-entry liveness flag, not an add/remove, so it does
+    ///         not bump this; read it off `getHashEntry`.
+    function getBlacklistVersion() external view returns (uint256) {
+        return _blacklistVersion;
     }
 
     // -----------------------------------------------------------------
@@ -857,6 +882,9 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         e.addedAt = uint64(block.timestamp);
         e.suspended = false;
         hashReason[region][hash] = reason;
+        unchecked {
+            ++_blacklistVersion;
+        }
         emit HashBlacklisted(region, hash, reason);
     }
 
@@ -865,6 +893,9 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         if (e.addedAt == 0) revert EntryNotBlacklisted(region, hash);
         delete _hashEntries[region][hash];
         delete hashReason[region][hash];
+        unchecked {
+            ++_blacklistVersion;
+        }
         emit HashRemoved(region, hash);
     }
 
