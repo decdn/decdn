@@ -208,16 +208,18 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     mapping(address origin => bool) public isOriginBlacklisted;
 
     /// @notice Monotonic blacklist revision (ADR 011 § Blacklist version), read
-    ///         via `getBlacklistVersion`. Bumped once per hash add and once per
-    ///         hash removal, across every path. Nodes cache the last-seen value
-    ///         and re-fetch entry deltas only when it advances, replacing a full
-    ///         event replay from the deploy block with an O(1) version check.
-    /// @dev    Bumped in the two internal choke points `_addHash` and
-    ///         `_removeHashRegional`, which every add/remove funnels through, so
-    ///         no call site has to remember to increment it. Deliberately not a
-    ///         `public` auto-getter: ADR 011 names the accessor
-    ///         `getBlacklistVersion()`, and an auto-getter would be
-    ///         `blacklistVersion()`.
+    ///         via `getBlacklistVersion`. Bumped once per change to the enforced
+    ///         blacklist: every hash add, every hash removal, and every
+    ///         appeal-driven suspend/resume, across every path. Nodes cache the
+    ///         last-seen value and re-fetch entry deltas only when it advances,
+    ///         replacing a full event replay from the deploy block with an O(1)
+    ///         version check.
+    /// @dev    Bumped in the three internal choke points `_addHash`,
+    ///         `_removeHashRegional`, and `_setEntrySuspended`, which every
+    ///         add/remove/suspend funnels through, so no call site has to
+    ///         remember to increment it. Deliberately not a `public` auto-getter:
+    ///         ADR 011 names the accessor `getBlacklistVersion()`, and an
+    ///         auto-getter would be `_blacklistVersion()`.
     uint256 internal _blacklistVersion;
 
     // -----------------------------------------------------------------
