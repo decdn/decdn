@@ -117,20 +117,24 @@ async fn run() -> anyhow::Result<()> {
     );
 
     // ---- Cross-layer: delivery landed on-chain — the seller redeemed the
-    // voucher, so FeeRouter accumulates the voucher's delivered-bytes (ADR 036).
-    // A single-blob fetch redeems one cumulative voucher, so served-bytes equals
-    // the exact payload size; assert that precise count to catch accounting
-    // drift, not merely that it advanced past zero.
+    // voucher(s), so FeeRouter accumulates the delivered-bytes (ADR 036). The
+    // client pays a cumulative voucher at each `voucher_interval_mb` boundary
+    // plus a closing voucher, so a payload spanning multiple intervals is
+    // redeemed on-chain in more than one step: served-bytes climbs to the exact
+    // payload total but is briefly observable at an intermediate boundary. Poll
+    // until it *reaches* the expected total (not merely past zero — that races
+    // the first interval's redemption), then assert exact equality to still
+    // catch accounting drift that would overshoot the payload size.
     let expected_served = U256::from(payload.len());
     let served = poll(Duration::from_secs(90), || async {
         let b = chain
             .served_bytes(node.operator_addr())
             .await
             .context("read served bytes")?;
-        Ok(if b > U256::ZERO { Some(b) } else { None })
+        Ok(if b >= expected_served { Some(b) } else { None })
     })
     .await?
-    .context("on-chain served-bytes never advanced (seller redeem did not land)")?;
+    .context("on-chain served-bytes never reached the payload size (seller redeem did not land)")?;
     assert_eq!(
         served, expected_served,
         "on-chain served-bytes must equal the delivered payload size"
