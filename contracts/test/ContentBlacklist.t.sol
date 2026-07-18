@@ -142,9 +142,10 @@ contract ContentBlacklistTest is Test {
 
     /// @notice ADR 011 § Blacklist version — `getBlacklistVersion()` starts at
     ///         zero and advances by exactly one on every hash add and every hash
-    ///         removal, on the global path, the regional path, and the
-    ///         appeal-ratification path (which removes via the same choke point).
-    ///         Nodes poll this instead of replaying the full event history.
+    ///         removal, on both the global and the regional path. Nodes poll this
+    ///         instead of replaying the full event history. The appeal paths
+    ///         (ratification-removal, suspend, resume) are covered separately by
+    ///         the version tests below — this one drives no appeal at all.
     function test_getBlacklistVersion_bumpsOnEveryAddAndRemove() public {
         assertEq(blacklist.getBlacklistVersion(), 0);
 
@@ -175,7 +176,7 @@ contract ContentBlacklistTest is Test {
     ///         hash set alone: operator + origin blacklisting, governance
     ///         setters, and reads. A spurious bump costs every node a delta
     ///         fetch. (The `suspended` toggle DOES move it — it changes what
-    ///         `isBlacklisted` reports; see the two suspension tests below.)
+    ///         `isHashBlacklisted*` reports; see the suspension tests below.)
     function test_getBlacklistVersion_unaffectedByNonEntryOperations() public {
         vm.prank(regionalBody);
         blacklist.addHashRegional(REGION_US, SAMPLE_HASH, "DMCA-TEST");
@@ -203,17 +204,22 @@ contract ContentBlacklistTest is Test {
         );
         assertEq(blacklist.getBlacklistVersion(), versionAfterAdd);
 
-        // Ratification removes the entry, so that one bumps.
+        // Fast-tracking suspends the entry, and that is itself a bump — which is
+        // why the ratification assertion below must be relative to a version
+        // captured *here* rather than to `versionAfterAdd`.
         vm.prank(multisig);
         blacklist.fastTrackBlacklistAppeal(appealId);
         uint256 versionAfterSuspend = blacklist.getBlacklistVersion();
+        assertEq(versionAfterSuspend, versionAfterAdd + 1);
+
+        // Ratification removes the entry, so that one bumps too.
         vm.prank(admin);
         blacklist.ratifyBlacklistAppealRemoval(appealId);
         assertEq(blacklist.getHashEntry(REGION_US, SAMPLE_HASH).addedAt, 0);
         assertEq(blacklist.getBlacklistVersion(), versionAfterSuspend + 1);
     }
 
-    /// @notice Suspension flips `isBlacklisted` to false, so it must bump the
+    /// @notice Suspension flips `isHashBlacklisted*` to false, so it must bump the
     ///         counter — a node that missed it would keep enforcing a hash the
     ///         contract no longer considers blacklisted, blocking content and
     ///         exposing operators to slashing for serving it.
@@ -234,8 +240,9 @@ contract ContentBlacklistTest is Test {
         assertEq(blacklist.getBlacklistVersion(), versionAfterAdd + 1);
     }
 
-    /// @notice Resumption re-arms enforcement, and ADR 011 § 248 / § 325 have
-    ///         operators detect it off exactly this counter. Without the bump a
+    /// @notice Resumption re-arms enforcement, and ADR 011 § Authority and flow /
+    ///         § Compliance Window have operators detect it off exactly this
+    ///         counter. Without the bump a
     ///         node would silently under-enforce a live entry — the compliance
     ///         failure the poll cycle exists to prevent.
     function test_getBlacklistVersion_bumpsOnResume() public {
@@ -1377,6 +1384,7 @@ contract ContentBlacklistTest is Test {
         // Global override deletes the suspended entry mid-appeal.
         vm.prank(regionalBody);
         blacklist.removeHashRegional(REGION_US, bytes32(uint256(1)));
+        uint256 versionAfterRemove = blacklist.getBlacklistVersion();
 
         uint256 filerBalBefore = token.balanceOf(filer);
         uint256 supplyBefore = token.totalSupply();
@@ -1391,6 +1399,14 @@ contract ContentBlacklistTest is Test {
         assertEq(blacklist.regionActiveReliefCount(REGION_US), 0);
         assertEq(blacklist.filerRegionActiveRelief(REGION_US, filer), 0);
         assertFalse(blacklist.hasActiveAppeal(REGION_US, bytes32(uint256(1))));
+
+        // The `entryGone` branch must NOT bump: the removal already bumped, and
+        // there is no `suspended` flag left to clear, so nothing about the
+        // enforced set changed here. A second bump would cost every polling node
+        // a wasted fleet-wide delta fetch. This is the negative half of the only
+        // CONDITIONAL bump site in the contract — the positive half is asserted
+        // by `test_cleanup_fastTrackedTimeout_burnsBond`.
+        assertEq(blacklist.getBlacklistVersion(), versionAfterRemove);
     }
 
     /// @notice A terminal appeal is still inadmissible for cleanup even after a
@@ -1404,5 +1420,114 @@ contract ContentBlacklistTest is Test {
         blacklist.removeHashRegional(REGION_US, bytes32(uint256(1)));
         vm.expectRevert(abi.encodeWithSelector(ContentBlacklist.AppealNotOpen.selector, appealId));
         blacklist.cleanupExpiredBlacklistAppeal(appealId);
+    }
+
+    // -----------------------------------------------------------------
+    // #1299 — no phantom version bump when the entry is removed mid-appeal
+    //
+    // `removeHashGlobal`/`removeHashRegional` carry no `hasActiveAppeal` guard
+    // (only `_addHash` does), so governance can delete an entry while its appeal
+    // is still Open or FastTracked — a supported path with its own lapse reason
+    // code (3, GlobalOverride). Every terminal appeal path then calls
+    // `_setEntrySuspended(.., false)` on a zeroed struct. That must be a no-op:
+    // writing `suspended = false` (already false) and bumping the counter is a
+    // PHANTOM REVISION — the version advances with zero change to what any
+    // `isHashBlacklisted*` view reports, so every polling node re-fetches deltas
+    // for nothing and the audit trail claims a change that never happened.
+    //
+    // Suite invariant, worth stating once here: every test that asserts
+    // `suspended` changed should also assert the version moved, and every test
+    // that asserts it did NOT change should assert the version held. Asserting
+    // the flag alone is exactly what let the original missing-bump bug through.
+    // -----------------------------------------------------------------
+
+    /// @notice Helper: add + open + fast-track, then global-override the entry
+    ///         away. Returns the appeal id and the version after the removal —
+    ///         the value every terminal path below must leave untouched.
+    function _fastTrackedThenEntryRemoved(bytes32 h) internal returns (uint256, uint256) {
+        uint256 appealId = _open(h);
+        vm.prank(multisig);
+        blacklist.fastTrackBlacklistAppeal(appealId);
+        vm.prank(regionalBody);
+        blacklist.removeHashRegional(REGION_US, h);
+        assertEq(blacklist.getHashEntry(REGION_US, h).addedAt, 0);
+        return (appealId, blacklist.getBlacklistVersion());
+    }
+
+    /// @notice `rejectBlacklistAppeal` on a fast-tracked appeal whose entry was
+    ///         already removed must not bump the version.
+    function test_rejectAppeal_entryRemovedMidAppeal_doesNotBumpVersion() public {
+        bytes32 h = bytes32(uint256(1));
+        (uint256 appealId, uint256 versionAfterRemove) = _fastTrackedThenEntryRemoved(h);
+
+        vm.prank(multisig);
+        blacklist.rejectBlacklistAppeal(appealId);
+
+        // The appeal still reaches its terminal state — this pins "no bump",
+        // not "the call reverted".
+        ContentBlacklist.BlacklistAppeal memory a = blacklist.getAppeal(appealId);
+        assertEq(uint8(a.status), uint8(ContentBlacklist.AppealStatus.Rejected));
+        assertEq(blacklist.getBlacklistVersion(), versionAfterRemove);
+        assertFalse(blacklist.isHashBlacklistedInRegion(h, REGION_US));
+    }
+
+    /// @notice Same for `rejectAppealAsPerjury`.
+    function test_rejectAppealAsPerjury_entryRemovedMidAppeal_doesNotBumpVersion() public {
+        bytes32 h = bytes32(uint256(1));
+        (uint256 appealId, uint256 versionAfterRemove) = _fastTrackedThenEntryRemoved(h);
+
+        vm.prank(multisig);
+        blacklist.rejectAppealAsPerjury(appealId);
+
+        ContentBlacklist.BlacklistAppeal memory a = blacklist.getAppeal(appealId);
+        assertEq(uint8(a.status), uint8(ContentBlacklist.AppealStatus.Rejected));
+        assertEq(blacklist.getBlacklistVersion(), versionAfterRemove);
+        assertFalse(blacklist.isHashBlacklistedInRegion(h, REGION_US));
+    }
+
+    /// @notice Same for `reverseBlacklistAppeal`, the one unconditional
+    ///         `_setEntrySuspended(false)` call site.
+    function test_reverseAppeal_entryRemovedMidAppeal_doesNotBumpVersion() public {
+        bytes32 h = bytes32(uint256(1));
+        (uint256 appealId, uint256 versionAfterRemove) = _fastTrackedThenEntryRemoved(h);
+
+        vm.prank(admin);
+        blacklist.reverseBlacklistAppeal(appealId);
+
+        ContentBlacklist.BlacklistAppeal memory a = blacklist.getAppeal(appealId);
+        assertEq(uint8(a.status), uint8(ContentBlacklist.AppealStatus.Reversed));
+        assertEq(blacklist.getBlacklistVersion(), versionAfterRemove);
+        assertFalse(blacklist.isHashBlacklistedInRegion(h, REGION_US));
+    }
+
+    /// @notice The suspend side of the same guard, and the nastier direction:
+    ///         the entry is removed BEFORE the fast-track. Without the guard,
+    ///         `fastTrackBlacklistAppeal` writes `suspended = true` onto a zeroed
+    ///         slot and bumps; cleanup then skips the clear precisely because the
+    ///         entry is gone, so the stale flag outlives the appeal and a later
+    ///         re-add of the same hash is permanently unenforceable (`_isLive`
+    ///         false forever). The guard makes the write a no-op instead.
+    function test_fastTrack_afterEntryRemoved_doesNotSuspendOrBump() public {
+        bytes32 h = bytes32(uint256(1));
+        uint256 appealId = _open(h);
+
+        // Global override removes the entry while the appeal is still Open.
+        vm.prank(regionalBody);
+        blacklist.removeHashRegional(REGION_US, h);
+        uint256 versionAfterRemove = blacklist.getBlacklistVersion();
+
+        vm.prank(multisig);
+        blacklist.fastTrackBlacklistAppeal(appealId);
+
+        // No entry to suspend: no flag written, no phantom bump.
+        assertFalse(blacklist.getHashEntry(REGION_US, h).suspended);
+        assertEq(blacklist.getBlacklistVersion(), versionAfterRemove);
+
+        // Settle the appeal, then re-add: the hash must be enforceable again.
+        blacklist.cleanupExpiredBlacklistAppeal(appealId);
+        vm.prank(regionalBody);
+        blacklist.addHashRegional(REGION_US, h, "DMCA-TEST-2");
+        assertFalse(blacklist.getHashEntry(REGION_US, h).suspended);
+        assertTrue(blacklist.isHashBlacklistedInRegion(h, REGION_US));
     }
 }
