@@ -376,9 +376,10 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             return EntryOutcome::failed(&entry.path, &anyhow!("create {}: {e}", parent.display()));
         }
         // A bundle entry's blob may itself be a `DECDNMAN` file manifest — the
-        // two layers compose (`appendix-bundles.md` § Relationship to file
-        // manifests) — in which case the entry's real bytes are its chunks
-        // (#1183). Without the magic these ARE the bytes; write them as-is.
+        // two layers compose (`appendix-bundles.md` § Non-relationship to ADR
+        // 012's `DECDNMAN` chunk manifest) — in which case the entry's real bytes
+        // are its chunks (#1183). Without the magic these ARE the bytes; write
+        // them as-is.
         if let Some(manifest) = file_manifest::sniff(&bytes) {
             return match self.reconstruct_entry(manifest, hash, &dest).await {
                 Ok(n) => EntryOutcome::Fetched(n),

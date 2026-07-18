@@ -10,8 +10,9 @@
 //! # Not the bundle manifest
 //!
 //! This is a different layer from the *bundle* manifest in
-//! [`super::bundle_pull`] (`appendix-bundles.md` § Relationship to file
-//! manifests). That one is JSON, publisher-side, and **inter-file**: it maps
+//! [`super::bundle_pull`] (`appendix-bundles.md` § Non-relationship to ADR 012's
+//! `DECDNMAN` chunk manifest). That one is JSON, publisher-side, and
+//! **inter-file**: it maps
 //! relative paths to blob hashes across a directory. This one is postcard,
 //! ingest-side, and **intra-file**: it maps chunk indices to blob hashes within
 //! one file. They compose — a bundle entry's `hash` may itself name a
@@ -398,6 +399,41 @@ mod tests {
         reconstruct(&manifest, hash, &downloads, &out, true, |h| src.get(h))
             .await
             .unwrap();
+        assert_eq!(*src.fetched.borrow(), vec![manifest.chunks[1].hash]);
+        assert_eq!(std::fs::read(&out).unwrap(), b"onetwo");
+    }
+
+    /// A part that is the *right size* but holds the wrong bytes (bit-rot, or a
+    /// stale part left by a size-colliding chunk) is re-fetched, not reused. This
+    /// exercises the hash branch of `part_is_verified` — distinct from
+    /// `a_truncated_part_is_refetched`, which is rejected earlier on length: if
+    /// the hash check regressed, corrupt bytes would be silently concatenated and
+    /// the size-only `total_bytes` guard would not catch it (the sizes still sum).
+    #[tokio::test]
+    async fn a_same_size_corrupt_part_is_refetched() {
+        let chunks: [&[u8]; 2] = [b"one", b"two"];
+        let (manifest, blob) = manifest_for(&chunks);
+        let hash = *blake3::hash(&blob).as_bytes();
+        let dir = tempfile::tempdir().unwrap();
+        let downloads = dir.path().join("downloads");
+        let out = dir.path().join("out.bin");
+        let src = Source::new(&chunks);
+
+        reconstruct(&manifest, hash, &downloads, &out, true, |h| src.get(h))
+            .await
+            .unwrap();
+
+        // Corrupt chunk 1's part in place, keeping its length (3 bytes → 3 bytes)
+        // so only the hash check can reject it.
+        let part = downloads.join(hex(&hash)).join("chunk-1.part");
+        assert_eq!(std::fs::metadata(&part).unwrap().len(), 3);
+        std::fs::write(&part, b"XXX").unwrap();
+        src.fetched.borrow_mut().clear();
+
+        reconstruct(&manifest, hash, &downloads, &out, true, |h| src.get(h))
+            .await
+            .unwrap();
+        // Only the corrupt chunk is re-fetched; the good chunk-0 part is reused.
         assert_eq!(*src.fetched.borrow(), vec![manifest.chunks[1].hash]);
         assert_eq!(std::fs::read(&out).unwrap(), b"onetwo");
     }
