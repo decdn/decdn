@@ -75,7 +75,7 @@ use crate::dht::{
     LookupConfig, NegativeProbeCache, NodeAddressResolver, OriginDirectory, PositiveProbeCache,
     ProbedProvider, StakerSet,
 };
-use crate::metrics::Metrics;
+use crate::metrics::{Metrics, StreamGuard};
 use crate::probe_client::probe_once;
 use crate::selection::{Candidate, MAX_PROVIDER_ATTEMPTS, PROBE_TIMEOUT, rank_candidates};
 
@@ -584,6 +584,7 @@ impl NodeOrigin {
             }
         };
         let ledger = channel_ledger(deps, provider_addr, &ctx);
+        let stream_guard = deps.metrics.outbound_stream_guard();
         match open_progressive_upstream(
             &deps.endpoint,
             EndpointAddr::new(pk),
@@ -621,6 +622,7 @@ impl NodeOrigin {
                         prior_bytes_delivered: ctx.prior_bytes_delivered,
                         ledger,
                     },
+                    stream_guard,
                 },
             )),
             Err(err) => {
@@ -687,6 +689,8 @@ pub struct NodeProgressivePull {
     /// a node shutdown or a downstream connection reset drops that future outright, and no
     /// terminal method runs (#1145 review).
     settle: SettleOnDrop<'static>,
+    /// Keeps the outbound stream gauge raised through every terminal/drop path.
+    stream_guard: StreamGuard,
 }
 
 impl NodeProgressivePull {
@@ -745,8 +749,10 @@ impl NodeProgressivePull {
             node_id,
             hash_bytes,
             settle,
+            stream_guard,
         } = self;
         let verify = pull.finish().await;
+        drop(stream_guard);
         let elapsed = started.elapsed();
         // Settle before scoring, and via the guard rather than by hand: it reads the
         // watermark from the channel ledger, which outlives the consumed `pull`, so a
@@ -1463,6 +1469,7 @@ async fn pull_from_candidate(
     // never waits longer than that; on expiry it gets a clean miss and the transfer
     // continues in a detached background warm. So "no hard cap here" does not mean
     // "a client can wait forever".
+    let _stream_guard = deps.metrics.outbound_stream_guard();
     let result = stream_fetch_shared(
         &deps.endpoint,
         EndpointAddr::new(pk),

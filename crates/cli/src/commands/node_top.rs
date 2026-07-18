@@ -89,7 +89,7 @@ impl Snapshot {
             })
         };
         Self {
-            uptime_seconds: u("decdn_uptime_seconds"),
+            uptime_seconds: u("decdn_node_uptime_seconds"),
             active_connections: u("decdn_active_connections"),
             dispatch_in_flight: u("decdn_dispatch_in_flight"),
             cache_hits: u("decdn_cache_hits_total"),
@@ -686,7 +686,7 @@ mod snapshot_tests {
         rpc: f64,
     ) -> HashMap<String, f64> {
         let mut m = HashMap::new();
-        m.insert("decdn_uptime_seconds".into(), uptime);
+        m.insert("decdn_node_uptime_seconds".into(), uptime);
         m.insert("decdn_cache_hits_total".into(), hits);
         m.insert("decdn_cache_misses_total".into(), misses);
         m.insert("decdn_cache_bytes_returned_total".into(), bytes);
