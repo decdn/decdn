@@ -268,6 +268,62 @@ pub(crate) struct WatcherConfig {
     pub(crate) on_backoff: Option<WatcherHook>,
 }
 
+impl WatcherConfig {
+    /// Construct with the defaults the six `LogSink` sites share, so each site
+    /// spells out only its own inputs. `max_backfill_span`, `initial_backoff`,
+    /// and `rpc_call_timeout` (`None`) are invariant across all six and have no
+    /// setter; `from_block` (`0`), `max_backoff`, and both hooks (unset) are
+    /// defaults a site overrides with the chained setters below when it needs to.
+    pub(crate) fn new(
+        head: Arc<dyn HeadSource>,
+        filter: Filter,
+        start: CursorStart,
+        poll_interval: Duration,
+        shutdown: CancellationToken,
+        label: &'static str,
+    ) -> Self {
+        Self {
+            head,
+            filter,
+            from_block: 0,
+            poll_interval,
+            max_backfill_span: super::MAX_BACKFILL_BLOCK_SPAN,
+            start,
+            initial_backoff: super::WATCHER_INITIAL_BACKOFF,
+            max_backoff: super::WATCHER_MAX_BACKOFF,
+            rpc_call_timeout: None,
+            shutdown,
+            label,
+            on_established: None,
+            on_backoff: None,
+        }
+    }
+
+    /// Override the scan floor for a site whose contract deploy block is not 0.
+    pub(crate) const fn with_from_block(mut self, from_block: u64) -> Self {
+        self.from_block = from_block;
+        self
+    }
+
+    /// Override the failed-tick backoff ceiling (slash uses a tighter 30s).
+    pub(crate) const fn max_backoff(mut self, max_backoff: Duration) -> Self {
+        self.max_backoff = max_backoff;
+        self
+    }
+
+    /// Wire the healthy-cycle hook; see the [`on_established`](field@Self::on_established) field.
+    pub(crate) fn on_established(mut self, hook: WatcherHook) -> Self {
+        self.on_established = Some(hook);
+        self
+    }
+
+    /// Wire the backoff hook; see the [`on_backoff`](field@Self::on_backoff) field.
+    pub(crate) fn on_backoff(mut self, hook: WatcherHook) -> Self {
+        self.on_backoff = Some(hook);
+        self
+    }
+}
+
 /// A loop-level observability hook (see [`WatcherConfig::on_established`] /
 /// [`WatcherConfig::on_backoff`]). Boxed so a watcher can close over its
 /// `Arc<Metrics>` without the generic loop knowing the concrete metric.

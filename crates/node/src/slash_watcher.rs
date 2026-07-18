@@ -41,12 +41,10 @@ use tracing::{debug, info, warn};
 
 use decdn_common::redact::sanitize_err_chain;
 
-use crate::chain_events::resumable_watcher::{
-    self, CursorStart, LogSink, WatcherConfig, WatcherHook,
-};
+use crate::chain_events::resumable_watcher::{self, CursorStart, LogSink, WatcherConfig};
 use crate::chain_events::shared_head::HeadSource;
-use crate::chain_events::{AbortOnDrop, MAX_BACKFILL_BLOCK_SPAN, WATCHER_INITIAL_BACKOFF, timed};
-use crate::metrics::Metrics;
+use crate::chain_events::{AbortOnDrop, timed};
+use crate::metrics::{Metrics, metric_hook};
 
 /// Nominal appeal filing window (ADR 028: 30 days from the slash timestamp).
 const APPEAL_FILING_WINDOW_SECS: u64 = 30 * 24 * 60 * 60;
@@ -143,34 +141,32 @@ impl SlashWatcher {
     ) -> Self {
         info!(%slash_judge_addr, %self_address, from_block, "slash-detection watcher started");
         let store: SlashStore = Arc::new(RwLock::new(Vec::new()));
-        let on_established = Some(established_hook(&metrics));
-        let on_backoff = Some(backoff_hook(&metrics));
+        // Built before `metrics` is moved into the sink below.
+        let on_established = metric_hook(&metrics, Metrics::slash_watcher_cycle_established);
+        let on_backoff = metric_hook(&metrics, Metrics::slash_watcher_backoff_started);
         let sink = SlashSink {
             provider: provider.clone(),
             self_address,
             store: Arc::clone(&store),
             metrics,
         };
-        let cfg = WatcherConfig {
+        let cfg = WatcherConfig::new(
             head,
-            filter: operator_filter(slash_judge_addr, self_address),
-            from_block,
-            poll_interval: event_poll_interval,
-            max_backfill_span: MAX_BACKFILL_BLOCK_SPAN,
+            operator_filter(slash_judge_addr, self_address),
             // No durable resume cursor (the in-memory store is rebuilt each boot);
             // re-scan the bounded appeal-window lookback, clamped to the deploy
             // floor (`from_block`), so a slash mined while down is re-surfaced (#1108).
-            start: CursorStart::HeadMinusWindow {
+            CursorStart::HeadMinusWindow {
                 window_blocks: appeal_window_blocks(),
             },
-            initial_backoff: WATCHER_INITIAL_BACKOFF,
-            max_backoff: SLASH_MAX_BACKOFF,
-            rpc_call_timeout: None,
+            event_poll_interval,
             shutdown,
-            label: "slash",
-            on_established,
-            on_backoff,
-        };
+            "slash",
+        )
+        .with_from_block(from_block)
+        .max_backoff(SLASH_MAX_BACKOFF)
+        .on_established(on_established)
+        .on_backoff(on_backoff);
         let task = tokio::spawn(resumable_watcher::run(provider, cfg, sink));
         Self {
             store,
@@ -209,20 +205,6 @@ impl<P: Provider + Clone> LogSink for SlashSink<P> {
         .await;
         Ok(())
     }
-}
-
-/// Wire the watcher's healthy-cycle transition to `slash_watcher_cycle_established`
-/// (down-seconds → 0).
-fn established_hook(metrics: &Arc<Metrics>) -> WatcherHook {
-    let metrics = Arc::clone(metrics);
-    Box::new(move || metrics.slash_watcher_cycle_established())
-}
-
-/// Wire a tick failure to `slash_watcher_backoff_started` (opens the downtime
-/// window `slash_watcher_down_seconds` reads).
-fn backoff_hook(metrics: &Arc<Metrics>) -> WatcherHook {
-    let metrics = Arc::clone(metrics);
-    Box::new(move || metrics.slash_watcher_backoff_started())
 }
 
 /// The address + `Slashed`-signature + `topic2 == operator` filter applied to

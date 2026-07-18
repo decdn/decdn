@@ -74,9 +74,7 @@ use tracing::{debug, info, warn};
 
 use crate::chain_events::resumable_watcher::{self, CursorStart, LogSink, WatcherConfig};
 use crate::chain_events::shared_head::HeadSource;
-use crate::chain_events::{
-    MAX_BACKFILL_BLOCK_SPAN, WATCHER_INITIAL_BACKOFF, WATCHER_MAX_BACKOFF, timed,
-};
+use crate::chain_events::timed;
 
 /// Mutable deny-set carried across poll ticks. The scan cursor lives on the
 /// resumable watcher; this holds only the re-scopable entry set.
@@ -232,24 +230,18 @@ pub(crate) async fn run<P>(
         rescan_interval: rescan_interval.max(Duration::from_secs(1)),
         last_rescan: None,
     };
-    let cfg = WatcherConfig {
+    let cfg = WatcherConfig::new(
         head,
-        filter: Filter::new().address(contract_addr).event_signature(vec![
+        Filter::new().address(contract_addr).event_signature(vec![
             HashBlacklisted::SIGNATURE_HASH,
             HashRemoved::SIGNATURE_HASH,
         ]),
-        from_block,
-        poll_interval: event_poll_interval.max(Duration::from_secs(1)),
-        max_backfill_span: MAX_BACKFILL_BLOCK_SPAN,
-        start: cursor_start(),
-        initial_backoff: WATCHER_INITIAL_BACKOFF,
-        max_backoff: WATCHER_MAX_BACKOFF,
-        rpc_call_timeout: None,
+        cursor_start(),
+        event_poll_interval.max(Duration::from_secs(1)),
         shutdown,
-        label: "blacklist",
-        on_established: None,
-        on_backoff: None,
-    };
+        "blacklist",
+    )
+    .with_from_block(from_block);
     resumable_watcher::run(provider, cfg, sink).await;
 }
 
