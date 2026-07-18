@@ -76,7 +76,7 @@ crates/
   common/       — shared types: config schema + resolver, identity loading, AdminRpc trait + DTOs
   protocol/     — shared types, wire format, ALPN message definitions (leaf crate, minimal deps)
   config-types/ — config-vocabulary value types (RetryPolicy, DecompressMode, OriginUrl, OriginKind, Hash, PinnedHashes) shared by cache + common (leaf crate: serde + url only, no iroh-blobs / no AWS — #578)
-  bao-range/    — iroh-blobs-free bao verified-range helpers (ADR 038): chunk-group alignment, range encode/verify against an untrusted `{H}.obao4` pre-order outboard. Depends only on `bao-tree`, which is what keeps the CLI pull path iroh-blobs-free (#823, #915, #578)
+  bao-range/    — iroh-blobs-free bao verified-range helpers (ADR 038): chunk-group alignment, range encode/verify against an untrusted `{H}.obao4` pre-order outboard. Builds on `bao-tree` rather than `iroh-blobs`, which is what keeps the CLI pull path iroh-blobs-free (#823, #915, #578)
   cache/        — cache engine wrapping iroh-blobs + origin pull-through
   client-pull/  — reusable `cdn/client/v1` paid-pull requester (`stream_fetch`) + buyer-side channel open: signs the request, verifies the signed `StreamResponse`, pays cumulative vouchers at each interval, assembles the blob. Shared by `node` (node-to-node miss pulls, #317) and `cli` (client fetch / bundle pull)
   gossip/       — NodeAnnounce pub/sub over iroh-gossip, peer table, envelope validation
@@ -90,7 +90,7 @@ contracts/      — Solidity contracts + Foundry (repo root, excluded from works
 
 `client-pull` is the shared paid-fetch requester, and its edge into `node` is the one worth internalizing: **the daemon is itself a paying client on its upstream cache-miss leg**, so `node` takes `decdn-client-pull` as a normal dependency and re-exports it as `client_requester` (`crates/node/src/lib.rs:19`) to preserve pre-split call-site paths.
 
-The two binaries share `common` for config schema, identity, and admin wire types — see [`adr/appendix-binaries.md`](adr/appendix-binaries.md) for the dockerd-style split rationale. Cache and incentive are independent — `cache` works without payment logic (useful for testing/local dev); the paid path lives in `client-pull` instead. The only cycle-shaped edges are dev-only: `cli` dev-depends on `node`, `cache`, and `gossip`, while no library depends on `cli`.
+The two binaries share `common` for config schema, identity, and admin wire types — see [`adr/appendix-binaries.md`](adr/appendix-binaries.md) for the dockerd-style split rationale. Cache and incentive are independent — `cache` works without payment logic (useful for testing/local dev); the paid path lives in `client-pull` instead. The only cycle-shaped edges are dev-only: `cli` dev-depends on `node`, `cache`, `gossip`, and `incentive`, while no library depends on `cli`.
 
 ### Wire Protocols (Core CDN)
 
