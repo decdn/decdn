@@ -24,6 +24,7 @@ pub mod handlers;
 pub mod leech_governor;
 pub mod metrics;
 pub mod node_origin;
+pub mod onchain_tx;
 pub mod payment_settlement;
 pub mod prefetch;
 pub mod probe_client;

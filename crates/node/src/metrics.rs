@@ -25,6 +25,8 @@ use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, oneshot};
 
+use crate::chain_events::resumable_watcher::WatcherHook;
+
 /// Cap concurrent `/metrics` connections. Prevents a trivial `DoS` where a
 /// peer opens many sockets to the operational-data endpoint and exhausts
 /// tasks.
@@ -53,6 +55,16 @@ enum StreamDirection {
 )]
 struct StreamLabels {
     direction: StreamDirection,
+}
+
+/// Build a [`WatcherHook`] that invokes one `&self` recorder on a shared
+/// `Metrics`, deduping the per-watcher `Box::new(move || metrics.foo())`
+/// closures the four metrics-wiring watcher sites used to each define (#1251;
+/// the other two `LogSink` sites wire no hooks). Pass the recorder as a method
+/// path, e.g. `metric_hook(&metrics, Metrics::slash_watcher_cycle_established)`.
+pub(crate) fn metric_hook(metrics: &Arc<Metrics>, record: fn(&Metrics)) -> WatcherHook {
+    let metrics = Arc::clone(metrics);
+    Box::new(move || record(&metrics))
 }
 
 /// deCDN-specific counters and gauges surfaced at `/metrics`.

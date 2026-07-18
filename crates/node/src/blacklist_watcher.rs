@@ -72,11 +72,9 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use crate::chain_events::resumable_watcher::{self, CursorPolicy, LogSink, WatcherConfig};
+use crate::chain_events::resumable_watcher::{self, CursorStart, LogSink, WatcherConfig};
 use crate::chain_events::shared_head::HeadSource;
-use crate::chain_events::{
-    MAX_BACKFILL_BLOCK_SPAN, WATCHER_INITIAL_BACKOFF, WATCHER_MAX_BACKOFF, timed,
-};
+use crate::chain_events::timed;
 
 /// Mutable deny-set carried across poll ticks. The scan cursor lives on the
 /// resumable watcher; this holds only the re-scopable entry set.
@@ -193,9 +191,10 @@ impl<P: Provider + Clone> LogSink for BlacklistSink<P> {
 /// out-of-scope, so un-evicted) entries are gone from `known` — silently
 /// dropping them from re-scoping, a slashable compliance gap (see the module
 /// header). Pinned by a test so a wiring change to a persisted cursor cannot
-/// land silently.
-const fn cursor_policy(from_block: u64) -> CursorPolicy {
-    CursorPolicy::FullReplay { floor: from_block }
+/// land silently. The replay floor is the watcher's `from_block` (the deploy
+/// block), resolved by [`CursorStart::FullReplay`] on every boot.
+const fn cursor_start() -> CursorStart {
+    CursorStart::FullReplay
 }
 
 /// Run the blacklist compliance watcher until `shutdown` is cancelled.
@@ -231,25 +230,18 @@ pub(crate) async fn run<P>(
         rescan_interval: rescan_interval.max(Duration::from_secs(1)),
         last_rescan: None,
     };
-    let cfg = WatcherConfig {
+    let cfg = WatcherConfig::new(
         head,
-        filter: Filter::new().address(contract_addr).event_signature(vec![
+        Filter::new().address(contract_addr).event_signature(vec![
             HashBlacklisted::SIGNATURE_HASH,
             HashRemoved::SIGNATURE_HASH,
         ]),
-        from_block,
-        poll_interval: event_poll_interval.max(Duration::from_secs(1)),
-        max_backfill_span: MAX_BACKFILL_BLOCK_SPAN,
-        cursor: cursor_policy(from_block),
-        initial_backoff: WATCHER_INITIAL_BACKOFF,
-        max_backoff: WATCHER_MAX_BACKOFF,
-        rpc_call_timeout: None,
+        cursor_start(),
+        event_poll_interval.max(Duration::from_secs(1)),
         shutdown,
-        seed_cursor: None,
-        label: "blacklist",
-        on_established: None,
-        on_backoff: None,
-    };
+        "blacklist",
+    )
+    .with_from_block(from_block);
     resumable_watcher::run(provider, cfg, sink).await;
 }
 
@@ -472,16 +464,13 @@ mod tests {
     }
 
     /// COMPLIANCE PIN: the blacklist watcher must full-replay from the deploy
-    /// floor on every boot. A swap to `CursorPolicy::Persisted` resumes past
-    /// logs whose entries no longer exist in the in-memory deny-set, silently
-    /// dropping them from re-scoping — serving such a hash is slashable.
+    /// floor on every boot. A swap to a persisted resume skips past logs whose
+    /// entries no longer exist in the in-memory deny-set, silently dropping them
+    /// from re-scoping — serving such a hash is slashable.
     #[test]
-    fn cursor_policy_is_full_replay_never_persisted() {
+    fn cursor_start_is_full_replay_never_persisted() {
         assert!(
-            matches!(
-                cursor_policy(1234),
-                CursorPolicy::FullReplay { floor: 1234 }
-            ),
+            matches!(cursor_start(), CursorStart::FullReplay),
             "blacklist deny-set rebuild requires FullReplay from the deploy block"
         );
     }
