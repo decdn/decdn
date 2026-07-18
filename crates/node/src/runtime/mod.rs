@@ -1089,21 +1089,6 @@ pub async fn run(
         blacklist_ready_tx,
     ));
 
-    // No Probe, Client, DHT, or gossip ALPN is registered before the mandatory
-    // first global + operator-region blacklist replay/scope pass succeeds.
-    let router = gate_listener_on_blacklist_sync(blacklist_ready_rx, || {
-        Router::builder(ep.clone())
-            .accept(ProbeHandler::ALPN, probe_handler)
-            .accept(ClientHandler::ALPN, client_handler)
-            .accept(DhtHandler::ALPN, dht_handler)
-            .accept(
-                GOSSIP_ALPN,
-                LimitedHandler::new(gossip.clone(), Arc::clone(&limiter)),
-            )
-            .spawn()
-    })
-    .await?;
-
     // Bootstrap (ADR 022 §Bootstrap): seed the routing table from the
     // active-staker set + parallel `FindNode(self.node_id)` against a
     // fan-out of seeds. Best-effort — failures here log but don't
@@ -1841,6 +1826,27 @@ pub async fn run(
         subscribe_global = cfg.gossip.subscribe_global,
         "node runtime ready"
     );
+
+    // No Probe, Client, DHT, or gossip ALPN is registered before the mandatory
+    // first global + operator-region blacklist replay/scope pass succeeds. The
+    // gate sits here — after the metrics/admin listeners are bound and every
+    // background task is spawned — so a slow or failed initial sync keeps the
+    // paid-delivery listeners closed WITHOUT taking down observability, the
+    // admin control surface, or the startup banner. The watcher was spawned near
+    // the top of bring-up, so its initial replay runs concurrently and is often
+    // already complete by the time control reaches this gate.
+    let router = gate_listener_on_blacklist_sync(blacklist_ready_rx, || {
+        Router::builder(ep.clone())
+            .accept(ProbeHandler::ALPN, probe_handler)
+            .accept(ClientHandler::ALPN, client_handler)
+            .accept(DhtHandler::ALPN, dht_handler)
+            .accept(
+                GOSSIP_ALPN,
+                LimitedHandler::new(gossip.clone(), Arc::clone(&limiter)),
+            )
+            .spawn()
+    })
+    .await?;
 
     // Install signal streams once, before entering the select loop.
     // tokio docs are explicit that `Signal::recv` is the supported way
