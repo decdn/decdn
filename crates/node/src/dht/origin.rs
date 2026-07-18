@@ -15,10 +15,19 @@
 //! caring whether the implementation reads from chain (production), an
 //! operator-supplied file (initial-network bootstrap), or a mock (tests).
 //!
-//! The chain-backed `ChainOriginDirectory` lands with the on-chain
-//! origin-directory follow-up; this module ships only the trait + a
-//! `ConfigOriginDirectory` that reads from operator-supplied TOML for
-//! testnet bring-up.
+//! Two implementations exist:
+//!
+//! - [`crate::dht::ChainOriginDirectory`] — the production path. Reads
+//!   the resolution chain above from RPC, serving lookups from an
+//!   event-fed in-memory cache.
+//! - [`ConfigOriginDirectory`] (this module) — the in-memory fallback,
+//!   used when the chain contracts aren't configured and by tests.
+//!
+//! The runtime picks between them at bring-up: it constructs a
+//! `ChainOriginDirectory` when **both** `blockchain.origin_assignment_address`
+//! and `blockchain.publisher_registry_address` are set, and otherwise falls
+//! back to an empty `ConfigOriginDirectory` (see `crate::runtime`). With that
+//! fallback in place every lookup miss yields no origin candidates.
 
 use std::collections::HashMap;
 
@@ -59,14 +68,18 @@ pub trait OriginDirectory: Send + Sync + std::fmt::Debug {
     }
 }
 
-/// File-config-driven [`OriginDirectory`] implementation.
+/// In-memory [`OriginDirectory`] implementation over a fixed
+/// hash → origin-`NodeId` map.
 ///
-/// Used for testnet bring-up where the operator hand-curates the
-/// hash → origin-NodeId map in `decdn-node.toml` before the on-chain
-/// `PublisherRegistry` / `OriginAssignment` contracts ship. The
-/// chain-backed `ChainOriginDirectory` (issue tracked in the on-chain
-/// origin-directory follow-up) reads the same shape from RPC and
-/// substitutes via the same trait.
+/// This is the fallback the runtime installs when the on-chain
+/// `PublisherRegistry` / `OriginAssignment` addresses are not both
+/// configured; the chain-backed [`crate::dht::ChainOriginDirectory`] is the
+/// production path and resolves the same shape from RPC via this trait.
+///
+/// No config field currently populates this map — the runtime always builds
+/// the fallback empty, so on a node without the chain directory every
+/// origin-fallback lookup returns nothing. Tests construct populated
+/// instances via [`ConfigOriginDirectory::new`].
 #[derive(Debug)]
 pub struct ConfigOriginDirectory {
     /// Map from BLAKE3 hash to the list of authorised origin `NodeId`s.
@@ -77,16 +90,16 @@ pub struct ConfigOriginDirectory {
 }
 
 impl ConfigOriginDirectory {
-    /// Build from a parsed `hash → origins` map. The runtime constructs
-    /// this from the resolved `dht.static_origins` field.
+    /// Build from a `hash → origins` map. The runtime passes an empty map
+    /// (no config field feeds it); tests pass fixture entries.
     #[must_use]
     pub const fn new(origins: HashMap<Hash, Vec<NodeId>>) -> Self {
         Self { origins }
     }
 
-    /// Empty directory — useful for tests and as the default when no
-    /// `dht.static_origins` is configured. An empty directory means
-    /// every DHT lookup that returns no providers also gets no
+    /// Empty directory — useful for tests, and the shape the runtime
+    /// installs when the chain directory is not configured. An empty
+    /// directory means every DHT lookup that returns no providers also gets no
     /// origin-fallback candidates, and the blob is reported as
     /// "unavailable on the network" to the caller.
     #[must_use]
