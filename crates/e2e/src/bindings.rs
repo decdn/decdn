@@ -111,6 +111,14 @@ alloy::sol! {
             view
             returns (address newOwner, uint64 readyAt);
         function namespaceTransferTimelock() external view returns (uint64);
+        // Declared so a reverted `.call()` decodes to a *named* error rather
+        // than an opaque selector — the negatives assert the specific guard
+        // that fired, not merely that something reverted.
+        error NotNamespaceOwner(uint256 namespaceId, address caller);
+        error NoPendingTransfer(uint256 namespaceId);
+        error TransferNotReady(uint256 readyAt);
+        error NotPendingOwner(uint256 namespaceId, address caller);
+        error AlreadyClaimed(uint256 namespaceId, bytes32 blake3Hash);
     }
 
     /// `OriginAssignment` propose (publisher) + activate (governance) + reads

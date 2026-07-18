@@ -17,12 +17,16 @@
 //!   past `pendingTransfer.readyAt`. There is no `publish namespace transfer`
 //!   CLI subcommand, so this leg drives the contract bindings directly.
 //!
-//! Deliberately out of scope: proving `H` becomes servable *as an origin*. That
-//! needs chain-backed origin recognition in the daemon (`ChainOriginDirectory`),
-//! which does not exist — `crates/node/src/dht/origin.rs` ships only the trait
-//! plus the TOML-driven `ConfigOriginDirectory`. That half belongs to G-NODE-08.
+//! Deliberately out of scope: proving `H` becomes servable *as an origin*. The
+//! daemon can already do it — `crates/node/src/dht/chain_origin_directory.rs`
+//! resolves `namespaceOf(H)` → assigned origins → operator, and the runtime
+//! selects it whenever the registry addresses are configured. What is missing
+//! is the *fixture*: driving it end-to-end needs an `OriginAssignment` proposal,
+//! governance activation of that assignment, and a bonded operator to serve it.
+//! That setup is G-NODE-08's, so this file stops at the on-chain claim state.
 //!
 //! ```bash
+//! cargo build -p decdn-cli   # the tests exec the built binary
 //! cargo nextest run -p decdn-e2e --features anvil-e2e g_origin_01
 //! ```
 
@@ -37,16 +41,18 @@
     clippy::duration_suboptimal_units
 )]
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
 use alloy::primitives::{Address, B256, U256};
+use alloy::providers::Provider;
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::Context;
 use decdn_cache::Hash;
 use decdn_e2e::bindings::PublisherRegistry;
 use decdn_e2e::chain::ChainFixture;
+use decdn_e2e::node::decdn_cli_bin;
 use decdn_e2e::time;
 use decdn_incentive::eth_identity;
 
@@ -60,6 +66,11 @@ const KEYSTORE_PASSWORD: &str = "e2e-publisher-password";
 
 /// ADR 002 default `namespaceTransferTimelock`.
 const SEVEN_DAYS: u64 = 7 * 24 * 60 * 60;
+
+/// How far short of `readyAt` the pre-timelock leg warps. Anvil derives block
+/// timestamps from wall-clock, so this has to absorb the wall time a few RPC
+/// round-trips take on a loaded CI runner — minutes of slack, not seconds.
+const WARP_MARGIN: u64 = 600;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn namespace_create_claim_and_union() -> anyhow::Result<()> {
@@ -128,6 +139,18 @@ async fn run_publish() -> anyhow::Result<()> {
         msg.contains("claimContent"),
         "the failure must come from claimContent, got: {msg}"
     );
+    // The CLI's error text alone cannot tell `AlreadyClaimed` apart from an RPC
+    // hiccup or an out-of-gas publisher, so pin the *guard* down against the
+    // binding: the same call must revert with exactly `AlreadyClaimed`.
+    let publisher_registry =
+        PublisherRegistry::new(chain.addrs().publisher_registry, publisher.provider(&chain));
+    expect_revert::<_, PublisherRegistry::AlreadyClaimed>(
+        publisher_registry
+            .claimContent(U256::from(ns1), hash_key)
+            .call()
+            .await,
+        "re-claiming H into the same namespace",
+    )?;
     let after = registry.namespaceOf(hash_key).call().await?;
     anyhow::ensure!(
         after == vec![U256::from(ns1)],
@@ -136,7 +159,9 @@ async fn run_publish() -> anyhow::Result<()> {
 
     // --- Negative: multi-claim union resolves. ------------------------------
     // A second namespace claiming the same H does NOT displace the first: both
-    // ids are returned, in claim order (ADR 002 § Multi-claim semantics).
+    // ids are returned (ADR 002 § Multi-claim semantics), in claim order —
+    // `claimContent` appends to `_claimingNamespaces` (`PublisherRegistry.sol`).
+    // The ADR mandates the union; the ordering is the contract's.
     let ns2 = publisher.namespace_create(&chain)?;
     anyhow::ensure!(ns2 != ns1, "createNamespace must mint a fresh id");
     publisher.claim(&chain, &hash_hex, ns2)?;
@@ -152,6 +177,29 @@ async fn run_publish() -> anyhow::Result<()> {
         );
     }
 
+    // --- Negative: only the namespace owner may claim into it. --------------
+    // Every claim above was made by the namespace's own owner, so without this
+    // a registry that dropped the owner check entirely would still pass.
+    // A bare signer, not a `Publisher`: this identity only makes direct contract
+    // calls, and standing up a second encrypted keystore costs seconds of scrypt.
+    let stranger = PrivateKeySigner::random();
+    chain.fund_eth(stranger.address(), 10).await?;
+    let other_hash = B256::from(*Hash::new(b"g-origin-01 someone else's content").as_bytes());
+    expect_revert::<_, PublisherRegistry::NotNamespaceOwner>(
+        PublisherRegistry::new(
+            chain.addrs().publisher_registry,
+            chain.provider_for(&stranger),
+        )
+        .claimContent(U256::from(ns1), other_hash)
+        .call()
+        .await,
+        "a non-owner claiming into someone else's namespace",
+    )?;
+    anyhow::ensure!(
+        registry.namespaceOf(other_hash).call().await?.is_empty(),
+        "a rejected non-owner claim must not register the hash"
+    );
+
     Ok(())
 }
 
@@ -163,7 +211,9 @@ async fn run_transfer() -> anyhow::Result<()> {
     let chain = ChainFixture::launch().await?;
     let owner = PrivateKeySigner::random();
     let recipient = PrivateKeySigner::random();
+    let stranger = PrivateKeySigner::random();
     chain.fund_eth(recipient.address(), 10).await?;
+    chain.fund_eth(stranger.address(), 10).await?;
 
     // `create_namespace` funds the owner and mints the id.
     let ns = chain.create_namespace(&owner).await?;
@@ -198,30 +248,83 @@ async fn run_transfer() -> anyhow::Result<()> {
         pending.newOwner == recipient.address(),
         "pendingTransfer must name the recipient"
     );
-    let head = chain.head_timestamp().await?;
+    // `readyAt` is exactly `timelock` past the block that ran the initiate — the
+    // receipt names that block, so this is an equality, not a slack window. A
+    // one-sided `>= now + timelock` would also pass for `now + 700 days`.
+    let init_block = receipt
+        .block_number
+        .context("initiateNamespaceTransfer receipt carried no block number")?;
+    let init_ts = block_timestamp(chain.admin(), init_block).await?;
     anyhow::ensure!(
-        pending.readyAt >= head + timelock - 5,
-        "readyAt ({}) must be ~{timelock}s past the head ({head})",
+        pending.readyAt == init_ts + timelock,
+        "readyAt ({}) must be exactly {timelock}s past the initiating block ({init_ts})",
         pending.readyAt
     );
 
-    // --- Before the timelock elapses: finalization is rejected. -------------
-    let recipient_registry = PublisherRegistry::new(registry_addr, chain.provider_for(&recipient));
-    // Warp to one second short of `readyAt` — so the rejection is the timelock
-    // gate specifically, not merely "no time has passed".
-    time::advance_to(chain.admin(), pending.readyAt - 2).await?;
+    // --- Cancel is the owner's escape hatch, and it really un-queues. -------
+    let owner_registry = PublisherRegistry::new(registry_addr, &owner_provider);
+    let cancel = owner_registry
+        .cancelNamespaceTransfer(ns)
+        .send()
+        .await
+        .context("cancelNamespaceTransfer send")?
+        .get_receipt()
+        .await
+        .context("cancelNamespaceTransfer receipt")?;
+    anyhow::ensure!(cancel.status(), "cancelNamespaceTransfer reverted");
     anyhow::ensure!(
+        read.pendingTransfer(ns).call().await?.newOwner == Address::ZERO,
+        "cancel must clear the pending transfer"
+    );
+    let recipient_registry = PublisherRegistry::new(registry_addr, chain.provider_for(&recipient));
+    expect_revert::<_, PublisherRegistry::NoPendingTransfer>(
         recipient_registry
             .finalizeNamespaceTransfer(ns)
             .call()
-            .await
-            .is_err(),
-        "finalizeNamespaceTransfer must revert before readyAt"
-    );
+            .await,
+        "finalizing a cancelled transfer",
+    )?;
+
+    // Re-queue it so the timelock legs below have something to finalize.
+    let receipt = owner_registry
+        .initiateNamespaceTransfer(ns, recipient.address())
+        .send()
+        .await
+        .context("re-initiateNamespaceTransfer send")?
+        .get_receipt()
+        .await
+        .context("re-initiateNamespaceTransfer receipt")?;
+    anyhow::ensure!(receipt.status(), "re-initiateNamespaceTransfer reverted");
+    let pending = read.pendingTransfer(ns).call().await?;
+
+    // --- Before the timelock elapses: finalization is rejected. -------------
+    // Warp to comfortably short of `readyAt` rather than shaving a second off
+    // it: anvil derives block timestamps from wall-clock, so a loaded runner
+    // can overshoot a tight margin and turn a real gate into a spurious pass.
+    // The margin is then asserted, so an overshoot fails as an overshoot.
+    time::increase_time(chain.admin(), timelock - WARP_MARGIN).await?;
+    let head = chain.head_timestamp().await?;
     anyhow::ensure!(
-        read.ownerOf(ns).call().await? == owner.address(),
-        "ownership must not move before the timelock elapses"
+        head < pending.readyAt,
+        "warp overshot readyAt ({}) — head is {head}; widen WARP_MARGIN",
+        pending.readyAt
     );
+    expect_revert::<_, PublisherRegistry::TransferNotReady>(
+        recipient_registry
+            .finalizeNamespaceTransfer(ns)
+            .call()
+            .await,
+        "finalizing before readyAt",
+    )?;
+
+    // --- Only the pending owner may finalize, ever. -------------------------
+    expect_revert::<_, PublisherRegistry::NotPendingOwner>(
+        PublisherRegistry::new(registry_addr, chain.provider_for(&stranger))
+            .finalizeNamespaceTransfer(ns)
+            .call()
+            .await,
+        "a third party finalizing someone else's transfer",
+    )?;
 
     // --- After the timelock elapses: the recipient can finalize. ------------
     time::advance_to(chain.admin(), pending.readyAt).await?;
@@ -255,6 +358,9 @@ struct Publisher {
     _dir: tempfile::TempDir,
     data_dir: PathBuf,
     address: Address,
+    /// The same key the keystore holds, for the assertions that go straight to
+    /// the contract instead of through the CLI.
+    signer: PrivateKeySigner,
 }
 
 impl Publisher {
@@ -269,12 +375,23 @@ impl Publisher {
         .context("chmod data dir 0o700")?;
         let address = eth_identity::generate_and_persist(dir.path(), KEYSTORE_PASSWORD, false)
             .context("generate publisher keystore")?;
+        // Load the key back out of the keystore the CLI will itself decrypt, so
+        // the direct-contract assertions sign as exactly the same identity.
+        let signer =
+            eth_identity::load_signer(&eth_identity::keystore_path(dir.path()), KEYSTORE_PASSWORD)
+                .context("load publisher keystore")?;
         chain.fund_eth(address, 10).await?;
         Ok(Self {
             data_dir: dir.path().to_path_buf(),
             _dir: dir,
             address,
+            signer,
         })
+    }
+
+    /// A provider signing as this publisher, for direct contract calls.
+    fn provider(&self, chain: &ChainFixture) -> alloy::providers::DynProvider {
+        chain.provider_for(&self.signer)
     }
 
     /// `decdn publish namespace create` → the minted namespace id.
@@ -304,7 +421,7 @@ impl Publisher {
     /// chain coordinates, returning the parsed `--json` stdout. A non-zero exit
     /// is an error carrying stderr (the CLI's `Context` chain).
     fn run(&self, chain: &ChainFixture, args: &[&str]) -> anyhow::Result<serde_json::Value> {
-        let output = Command::new(decdn_bin()?)
+        let output = Command::new(decdn_cli_bin()?)
             .args(args)
             .args([
                 "--rpc-url",
@@ -337,23 +454,43 @@ impl Publisher {
     }
 }
 
-/// Locate the built `decdn` binary next to the test executable
-/// (`target/<profile>/decdn`), falling back to `DECDN_BIN`. Mirrors
-/// `decdn_e2e::node`'s `decdn-node` lookup.
-fn decdn_bin() -> anyhow::Result<PathBuf> {
-    if let Some(p) = std::env::var_os("DECDN_BIN") {
-        return Ok(PathBuf::from(p));
-    }
-    let exe = std::env::current_exe().context("current_exe")?;
-    let profile_dir: &Path = exe
-        .parent()
-        .and_then(Path::parent)
-        .context("resolve target profile dir")?;
-    let bin = profile_dir.join(if cfg!(windows) { "decdn.exe" } else { "decdn" });
+/// Assert an alloy contract call reverted with exactly `E`, matching on the
+/// 4-byte selector. Distinguishes the guard under test from a transport fault
+/// (no revert data at all) and from a *different* revert — both of which an
+/// `is_err()` check would happily accept.
+fn expect_revert<T, E: alloy::sol_types::SolError>(
+    result: Result<T, alloy::contract::Error>,
+    what: &str,
+) -> anyhow::Result<()> {
+    let err = match result {
+        Ok(_) => anyhow::bail!("{what} must revert with {}, but succeeded", E::SIGNATURE),
+        Err(err) => err,
+    };
+    let data = err.as_revert_data().with_context(|| {
+        format!(
+            "{what}: expected a {} revert, got no revert data: {err}",
+            E::SIGNATURE
+        )
+    })?;
+    let selector = data
+        .get(..4)
+        .context("revert payload too short to carry a selector")?;
     anyhow::ensure!(
-        bin.exists(),
-        "decdn binary not found at {}; run `cargo build -p decdn-cli` first (or set DECDN_BIN)",
-        bin.display()
+        selector == E::SELECTOR,
+        "{what}: expected {}, got revert data 0x{}",
+        E::SIGNATURE,
+        alloy::hex::encode(&data)
     );
-    Ok(bin)
+    Ok(())
+}
+
+/// The timestamp of block `number`.
+async fn block_timestamp<P: Provider>(provider: &P, number: u64) -> anyhow::Result<u64> {
+    Ok(provider
+        .get_block(alloy::eips::BlockId::number(number))
+        .await
+        .context("get block by number")?
+        .with_context(|| format!("block {number} not found"))?
+        .header
+        .timestamp)
 }

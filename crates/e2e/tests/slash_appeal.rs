@@ -34,7 +34,6 @@
     clippy::duration_suboptimal_units
 )]
 
-use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
@@ -46,7 +45,7 @@ use decdn_common::admin::AdminRpcClient;
 use decdn_e2e::bindings::SlashAppeal;
 use decdn_e2e::chain::ChainFixture;
 use decdn_e2e::client::ClientFixture;
-use decdn_e2e::node::{KEYSTORE_PASSWORD, NodeFixture};
+use decdn_e2e::node::{KEYSTORE_PASSWORD, NodeFixture, decdn_cli_bin};
 use decdn_e2e::time;
 
 const MIB: usize = 1024 * 1024;
@@ -296,26 +295,6 @@ fn run_appeal_cli(
         "`decdn appeal slash` exited non-zero: {status}"
     );
     Ok(())
-}
-
-/// Locate the built `decdn` CLI binary relative to the test executable
-/// (`target/<profile>/decdn`), falling back to `DECDN_CLI_BIN`.
-fn decdn_cli_bin() -> anyhow::Result<PathBuf> {
-    if let Some(p) = std::env::var_os("DECDN_CLI_BIN") {
-        return Ok(PathBuf::from(p));
-    }
-    let exe = std::env::current_exe().context("current_exe")?;
-    let profile_dir = exe
-        .parent()
-        .and_then(|deps| deps.parent())
-        .context("resolve target profile dir")?;
-    let bin = profile_dir.join(if cfg!(windows) { "decdn.exe" } else { "decdn" });
-    anyhow::ensure!(
-        bin.exists(),
-        "decdn binary not found at {}; run `cargo build -p decdn` first (or set DECDN_CLI_BIN)",
-        bin.display()
-    );
-    Ok(bin)
 }
 
 /// Poll `f` until it yields `Some` or `timeout` elapses; a closure error aborts
