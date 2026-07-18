@@ -98,17 +98,16 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::chain_events::resumable_watcher::{
-    self, Checkpoint, CursorStart, LogSink, WatcherConfig, WatcherHook,
+    self, Checkpoint, CursorStart, LogSink, WatcherConfig,
 };
 use crate::chain_events::shared_head::HeadSource;
 use crate::chain_events::{
-    AbortOnDrop, MAX_BACKFILL_BLOCK_SPAN, REORG_MARGIN_BLOCKS, WATCHER_INITIAL_BACKOFF,
-    WATCHER_MAX_BACKOFF, backfill_windows, check_backfill_range, timed,
+    AbortOnDrop, REORG_MARGIN_BLOCKS, backfill_windows, check_backfill_range, timed,
 };
 use crate::dht::origin::{Hash, OriginDirectory};
 use crate::dht::routing::NodeId;
 use crate::dht::staker_set::StakerSet;
-use crate::metrics::Metrics;
+use crate::metrics::{Metrics, metric_hook};
 use decdn_common::redact::sanitize_err_chain;
 use decdn_incentive::capacity_bond::CapacityBond;
 use decdn_incentive::origin_assignment::OriginAssignment;
@@ -126,8 +125,8 @@ use decdn_incentive::publisher_registry::PublisherRegistry::ContentClaimed;
 /// `span` to [`backfill_windows`]. Kept well under the common provider
 /// `eth_getLogs` 10k-block cap so bootstrap works on range-limited RPCs without
 /// a per-provider knob. This is a *deliberate* override of the shared
-/// [`MAX_BACKFILL_BLOCK_SPAN`] (10k), not drift — the extra 1k of margin is the
-/// point; don't "fix" the divergence by unifying the constant.
+/// [`crate::chain_events::MAX_BACKFILL_BLOCK_SPAN`] (10k), not drift — the extra
+/// 1k of margin is the point; don't "fix" the divergence by unifying the constant.
 const REPLAY_WINDOW_BLOCKS: u64 = 9_000;
 
 /// The default-open allow-list lives at namespace 0 (ADR 022 § FIND\_VALUE
@@ -342,9 +341,9 @@ impl ChainOriginDirectory {
             metrics: Arc::clone(&metrics),
             deferred: HashSet::new(),
         };
-        let cfg = WatcherConfig {
+        let cfg = WatcherConfig::new(
             head,
-            filter: Filter::new()
+            Filter::new()
                 .address(vec![publisher_registry_addr, origin_assignment_addr])
                 .event_signature(vec![
                     ContentClaimed::SIGNATURE_HASH,
@@ -355,18 +354,20 @@ impl ChainOriginDirectory {
                     DefaultOpenOperatorAdded::SIGNATURE_HASH,
                     DefaultOpenOperatorRemoved::SIGNATURE_HASH,
                 ]),
-            from_block,
-            poll_interval: event_poll_interval,
-            max_backfill_span: MAX_BACKFILL_BLOCK_SPAN,
-            start: cursor_start(snapshot_block, checkpoint_store),
-            initial_backoff: WATCHER_INITIAL_BACKOFF,
-            max_backoff: WATCHER_MAX_BACKOFF,
-            rpc_call_timeout: None,
+            cursor_start(snapshot_block, checkpoint_store),
+            event_poll_interval,
             shutdown,
-            label: "origin-directory",
-            on_established: Some(established_hook(&metrics)),
-            on_backoff: Some(backoff_hook(&metrics)),
-        };
+            "origin-directory",
+        )
+        .with_from_block(from_block)
+        .on_established(metric_hook(
+            &metrics,
+            Metrics::origin_directory_watcher_cycle_established,
+        ))
+        .on_backoff(metric_hook(
+            &metrics,
+            Metrics::origin_directory_watcher_backoff_started,
+        ));
         let watcher_handle = tokio::spawn(resumable_watcher::run(provider, cfg, sink));
 
         Ok(Self {
@@ -618,18 +619,6 @@ fn resume_replay_floor(store: &dyn KeyedCheckpointStore, from_block: u64) -> Res
         .load_checkpoint(CheckpointKey::Origin)
         .context("read origin-directory scan checkpoint at bootstrap")?;
     Ok(replay_floor(checkpoint, from_block))
-}
-
-/// Wire the watcher's healthy-cycle transition to the established gauge.
-fn established_hook(metrics: &Arc<Metrics>) -> WatcherHook {
-    let metrics = Arc::clone(metrics);
-    Box::new(move || metrics.origin_directory_watcher_cycle_established())
-}
-
-/// Wire a tick failure to the backoff gauge.
-fn backoff_hook(metrics: &Arc<Metrics>) -> WatcherHook {
-    let metrics = Arc::clone(metrics);
-    Box::new(move || metrics.origin_directory_watcher_backoff_started())
 }
 
 impl OriginDirectory for ChainOriginDirectory {

@@ -48,20 +48,16 @@ use anyhow::{Context, Result};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use crate::chain_events::resumable_watcher::{
-    self, CursorStart, LogSink, WatcherConfig, WatcherHook,
-};
+use crate::chain_events::resumable_watcher::{self, CursorStart, LogSink, WatcherConfig};
 use crate::chain_events::shared_head::HeadSource;
-use crate::chain_events::{
-    AbortOnDrop, MAX_BACKFILL_BLOCK_SPAN, WATCHER_INITIAL_BACKOFF, WATCHER_MAX_BACKOFF, timed,
-};
+use crate::chain_events::{AbortOnDrop, timed};
 use crate::dht::chain_staker_set::{ChainStakerSet, StakerChange, apply_change};
 use crate::dht::node_address::{
     ChainNodeAddressDirectory, NodeAddressResolver, remove_binding, set_binding,
 };
 use crate::dht::routing::NodeId;
 use crate::dht::staker_set::StakerSet;
-use crate::metrics::Metrics;
+use crate::metrics::{Metrics, metric_hook};
 use decdn_common::redact::sanitize_err_chain;
 use decdn_incentive::capacity_bond::CapacityBond;
 
@@ -300,32 +296,6 @@ where
     Ok((active, bindings))
 }
 
-/// Wire the watcher's healthy-cycle transition to the established gauge.
-///
-/// `staker_set_watcher_*` is the shared `capacity-bond` loop's health, and it
-/// covers the bindings projection too — one loop feeds both, so there is one
-/// thing to report.
-///
-/// A parallel `node_address_watcher_*` family used to be fired alongside these
-/// and was retired in #1231: since #1226 collapsed the two loops into one it was
-/// a perfectly-correlated shadow, reporting the same outage twice. It was kept
-/// at the time on the grounds that retiring it would break existing dashboards
-/// and alerts — no dashboard, alert, ADR, or runbook in this repo ever
-/// referenced it — and that a gauge frozen at `0` forever is an alert that can
-/// never fire. That second argument was the stronger one, and it cut the other
-/// way: the family was gated on the bindings projection existing, so a
-/// pull-through-off node reported exactly that frozen `0`.
-fn established_hook(metrics: &Arc<Metrics>) -> WatcherHook {
-    let metrics = Arc::clone(metrics);
-    Box::new(move || metrics.staker_set_watcher_cycle_established())
-}
-
-/// Wire a tick failure to the backoff gauge.
-fn backoff_hook(metrics: &Arc<Metrics>) -> WatcherHook {
-    let metrics = Arc::clone(metrics);
-    Box::new(move || metrics.staker_set_watcher_backoff_started())
-}
-
 /// Enumerate `CapacityBond` once, then spawn the single watcher that keeps both
 /// projections current.
 ///
@@ -384,36 +354,45 @@ where
         bindings: bindings.clone(),
         metrics: Arc::clone(&metrics),
     };
-    let cfg = WatcherConfig {
+    let cfg = WatcherConfig::new(
         head,
-        filter: Filter::new().address(registry_addr).event_signature(vec![
+        Filter::new().address(registry_addr).event_signature(vec![
             CapacityBond::NodeRegistered::SIGNATURE_HASH,
             CapacityBond::NodeDeregistered::SIGNATURE_HASH,
             CapacityBond::NodeAutoEjected::SIGNATURE_HASH,
             CapacityBond::Reinstated::SIGNATURE_HASH,
             CapacityBond::UnbondingRequested::SIGNATURE_HASH,
         ]),
-        from_block: 0,
-        poll_interval: event_poll_interval,
-        // Live-from-head, but still chunk `[cursor, head]` so a long lag (RPC
-        // outage / rate-limit) recovers in bounded windows instead of one
-        // range-limit-tripping `eth_getLogs`.
-        max_backfill_span: MAX_BACKFILL_BLOCK_SPAN,
         // Seed the live tail from the enumeration snapshot head; the staker set
         // is rebuilt from that enumeration each boot, so there is no durable
         // cursor to persist.
-        start: CursorStart::Seeded {
+        CursorStart::Seeded {
             at: snapshot_block,
             persist: None,
         },
-        initial_backoff: WATCHER_INITIAL_BACKOFF,
-        max_backoff: WATCHER_MAX_BACKOFF,
-        rpc_call_timeout: None,
+        event_poll_interval,
         shutdown,
-        label: "capacity-bond",
-        on_established: Some(established_hook(&metrics)),
-        on_backoff: Some(backoff_hook(&metrics)),
-    };
+        "capacity-bond",
+    )
+    // `staker_set_watcher_*` is the shared `capacity-bond` loop's health, and it
+    // covers the bindings projection too — one loop feeds both, so there is one
+    // thing to report. A parallel `node_address_watcher_*` family used to be
+    // fired alongside these and was retired in #1231: since #1226 collapsed the
+    // two loops into one it was a perfectly-correlated shadow, reporting the same
+    // outage twice. It was kept at the time on the grounds that retiring it would
+    // break existing dashboards and alerts — no dashboard, alert, ADR, or runbook
+    // in this repo ever referenced it — and that a gauge frozen at `0` forever is
+    // an alert that can never fire. That second argument was the stronger one,
+    // and it cut the other way: the family was gated on the bindings projection
+    // existing, so a pull-through-off node reported exactly that frozen `0`.
+    .on_established(metric_hook(
+        &metrics,
+        Metrics::staker_set_watcher_cycle_established,
+    ))
+    .on_backoff(metric_hook(
+        &metrics,
+        Metrics::staker_set_watcher_backoff_started,
+    ));
     // One task, one `AbortOnDrop`, shared by both façades: it lives while either
     // does and aborts when the last is dropped. Strictly safer than the old shape,
     // where dropping the resolver killed only its own loop.
@@ -687,8 +666,8 @@ mod tests {
     #[test]
     fn watcher_hooks_track_the_shared_loop() {
         let metrics = Arc::new(Metrics::new());
-        let established = established_hook(&metrics);
-        let backoff = backoff_hook(&metrics);
+        let established = metric_hook(&metrics, Metrics::staker_set_watcher_cycle_established);
+        let backoff = metric_hook(&metrics, Metrics::staker_set_watcher_backoff_started);
         backoff();
         established();
         backoff();

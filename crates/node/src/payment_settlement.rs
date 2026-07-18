@@ -85,10 +85,7 @@ use crate::chain_events::resumable_watcher::{
     self, Checkpoint, CursorStart, LogSink, WatcherConfig,
 };
 use crate::chain_events::shared_head::HeadSource;
-use crate::chain_events::{
-    AbortOnDrop, MAX_BACKFILL_BLOCK_SPAN, REORG_MARGIN_BLOCKS, WATCHER_INITIAL_BACKOFF,
-    WATCHER_MAX_BACKOFF, timed,
-};
+use crate::chain_events::{AbortOnDrop, REORG_MARGIN_BLOCKS, timed};
 use crate::handlers::client::ClientHandler;
 use crate::metrics::{Metrics, SettleParty};
 use crate::onchain_tx::{TxOutcome, send_and_await_receipt};
@@ -292,9 +289,9 @@ impl<P: Provider + Clone + 'static> PaymentChannelService<P> {
             pending_store: Arc::clone(&pending_store),
             metrics: Arc::clone(&metrics),
         };
-        let cfg = WatcherConfig {
+        let cfg = WatcherConfig::new(
             head,
-            filter: Filter::new()
+            Filter::new()
                 .address(payment_channel_addr)
                 .event_signature(vec![
                     PaymentChannel::ChannelOpened::SIGNATURE_HASH,
@@ -302,18 +299,11 @@ impl<P: Provider + Clone + 'static> PaymentChannelService<P> {
                     PaymentChannel::ChannelSettled::SIGNATURE_HASH,
                     PaymentChannel::ChannelCloseInitiated::SIGNATURE_HASH,
                 ]),
-            from_block: 0,
-            poll_interval: event_poll_interval,
-            max_backfill_span: MAX_BACKFILL_BLOCK_SPAN,
-            start: cursor_start(Arc::clone(&checkpoint_store)),
-            initial_backoff: WATCHER_INITIAL_BACKOFF,
-            max_backoff: WATCHER_MAX_BACKOFF,
-            rpc_call_timeout: None,
-            shutdown: watcher_shutdown.clone(),
-            label: "settlement",
-            on_established: None,
-            on_backoff: None,
-        };
+            cursor_start(Arc::clone(&checkpoint_store)),
+            event_poll_interval,
+            watcher_shutdown.clone(),
+            "settlement",
+        );
         let watcher = tokio::spawn(resumable_watcher::run(
             contract.provider().clone(),
             cfg,
