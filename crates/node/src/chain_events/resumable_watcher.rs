@@ -36,7 +36,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use super::shared_head::HeadSource;
-use super::{backfill_windows, timed};
+use super::{AbortOnDrop, backfill_windows, timed};
 
 /// A durable per-key scan checkpoint: the store plus the key it reads and writes
 /// under. Carried by the [`CursorStart`] variants that persist their cursor
@@ -241,22 +241,6 @@ pub(crate) struct WatcherConfig {
     /// this — it is issued by the shared [`super::shared_head::HeadSource`],
     /// which carries its own timeout.
     pub(crate) rpc_call_timeout: Option<Duration>,
-    /// Cancelled on graceful shutdown; flushes the checkpoint and returns.
-    ///
-    /// Must be a token some owner actually cancels — the runtime for five of the
-    /// six watchers, and the owning service for settlement (which cancels its
-    /// own before the channel-close deadline, an ordering only it knows). That
-    /// this field is a `CancellationToken` and not an `Option` enforces only
-    /// *presence*, which was never the problem: three watchers used to construct
-    /// one inline and drop it, so the token was present and inert, and every
-    /// branch below was unreachable (#1230).
-    ///
-    /// Liveness is a property of the surrounding program and no type expresses
-    /// it, so the enforcement is the `bootstrap` signatures: each takes a token
-    /// rather than minting one, which makes `CancellationToken::new()` greppable
-    /// to the runtime and to `payment_settlement`'s deliberate self-mint. It is
-    /// not a proof — reviewing a change to the shutdown *sequence* is.
-    pub(crate) shutdown: CancellationToken,
     /// Log label for backoff/established diagnostics.
     pub(crate) label: &'static str,
     /// Called once each time the watcher transitions into a healthy cycle (first
@@ -279,7 +263,6 @@ impl WatcherConfig {
         filter: Filter,
         start: CursorStart,
         poll_interval: Duration,
-        shutdown: CancellationToken,
         label: &'static str,
     ) -> Self {
         Self {
@@ -292,7 +275,6 @@ impl WatcherConfig {
             initial_backoff: super::WATCHER_INITIAL_BACKOFF,
             max_backoff: super::WATCHER_MAX_BACKOFF,
             rpc_call_timeout: None,
-            shutdown,
             label,
             on_established: None,
             on_backoff: None,
@@ -382,6 +364,7 @@ async fn run_tick<P, S>(
     cfg: &WatcherConfig,
     sink: &mut S,
     cursor: &mut Option<u64>,
+    shutdown: &CancellationToken,
 ) -> Result<()>
 where
     P: Provider + Clone,
@@ -405,7 +388,7 @@ where
             // full replay, slash's appeal-window span) yields promptly to a
             // graceful shutdown rather than blocking it until the whole tick
             // completes. Progress persisted per window resumes on the next boot.
-            if cfg.shutdown.is_cancelled() {
+            if shutdown.is_cancelled() {
                 return Ok(());
             }
             let filter = cfg.filter.clone().from_block(start).to_block(end);
@@ -431,12 +414,22 @@ where
 }
 
 /// Drive `sink` from `cfg.filter` on an `eth_getLogs` polling loop until
-/// `cfg.shutdown` is cancelled. The outer loop ticks on `cfg.poll_interval`,
+/// `shutdown` is cancelled. The outer loop ticks on `cfg.poll_interval`,
 /// resetting the backoff on a clean tick and backing off (bounded) on a failing
 /// one; the cursor is carried across ticks so backfill flows straight into the
 /// live tail.
-pub(crate) async fn run<P, S>(provider: P, cfg: WatcherConfig, mut sink: S)
-where
+///
+/// `shutdown` is passed explicitly rather than living on [`WatcherConfig`] so no
+/// caller can construct an inert token: the only way to obtain one paired with a
+/// running task is [`spawn`], which mints it internally and returns the owning
+/// [`WatcherHandle`] (#1236). Kept `pub(crate)` so the flush tests can drive the
+/// loop directly with a token they cancel.
+pub(crate) async fn run<P, S>(
+    provider: P,
+    cfg: WatcherConfig,
+    mut sink: S,
+    shutdown: CancellationToken,
+) where
     P: Provider + Clone,
     S: LogSink,
 {
@@ -448,13 +441,13 @@ where
     loop {
         tokio::select! {
             biased;
-            () = cfg.shutdown.cancelled() => {
+            () = shutdown.cancelled() => {
                 cfg.start.flush();
                 return;
             }
             _ = ticker.tick() => {}
         }
-        match run_tick(&provider, &cfg, &mut sink, &mut cursor).await {
+        match run_tick(&provider, &cfg, &mut sink, &mut cursor, &shutdown).await {
             Ok(()) => {
                 backoff = cfg.initial_backoff;
                 if !established {
@@ -480,12 +473,63 @@ where
                 );
                 tokio::select! {
                     biased;
-                    () = cfg.shutdown.cancelled() => { cfg.start.flush(); return; }
+                    () = shutdown.cancelled() => { cfg.start.flush(); return; }
                     () = tokio::time::sleep(backoff) => {}
                 }
                 backoff = (backoff * 2).min(cfg.max_backoff);
             }
         }
+    }
+}
+
+/// Owns a running watcher task and the shutdown token that stops it. The token
+/// is minted inside [`spawn`] and never escapes except through [`shutdown`], so
+/// no call site can conjure or drop an inert token — the mistake #1230 fixed by
+/// convention, made unrepresentable (#1236). [`shutdown`] is the graceful path
+/// (the loop flushes its cursor and returns); the wrapped [`AbortOnDrop`] is the
+/// hard safety net when the handle drops without a prior `shutdown`.
+///
+/// [`shutdown`]: WatcherHandle::shutdown
+#[derive(Debug)]
+pub(crate) struct WatcherHandle {
+    shutdown: CancellationToken,
+    _task: AbortOnDrop,
+}
+
+impl WatcherHandle {
+    /// Signal the loop to flush its cursor and return. Idempotent; the owner
+    /// calls it at whatever point in graceful shutdown its ordering demands
+    /// (settlement, for one, cancels before its channel-close deadline).
+    pub(crate) fn shutdown(&self) {
+        self.shutdown.cancel();
+    }
+}
+
+/// Mint the shutdown token, build the sink with access to it, spawn [`run`], and
+/// return the owning [`WatcherHandle`]. This is the only way to pair a live task
+/// with its token, which is what keeps the token from ever being inert (#1236).
+///
+/// `make_sink` receives the freshly-minted token by reference so a sink that
+/// itself needs to observe shutdown (blacklist's re-scope short-circuits on it)
+/// closes over the *same* token the loop cancels. Sinks that do not care ignore
+/// the argument (`|_| sink`); the clone they could take is harmless because the
+/// returned handle still owns the canonical token and is the only thing that
+/// cancels it.
+pub(crate) fn spawn<P, S>(
+    provider: P,
+    cfg: WatcherConfig,
+    make_sink: impl FnOnce(&CancellationToken) -> S,
+) -> WatcherHandle
+where
+    P: Provider + Clone + 'static,
+    S: LogSink + 'static,
+{
+    let shutdown = CancellationToken::new();
+    let sink = make_sink(&shutdown);
+    let task = AbortOnDrop(tokio::spawn(run(provider, cfg, sink, shutdown.clone())));
+    WatcherHandle {
+        shutdown,
+        _task: task,
     }
 }
 
@@ -793,11 +837,16 @@ mod tests {
             initial_backoff: Duration::from_millis(1),
             max_backoff: Duration::from_millis(1),
             rpc_call_timeout: None,
-            shutdown: CancellationToken::new(),
             label: "test",
             on_established: None,
             on_backoff: None,
         }
+    }
+
+    /// A never-cancelled token for the tick tests that don't exercise shutdown
+    /// (the flush/cancel tests below mint and cancel their own).
+    fn no_shutdown() -> CancellationToken {
+        CancellationToken::new()
     }
 
     /// The anti-strand invariant, end to end through `run_tick` on a mocked
@@ -835,7 +884,7 @@ mod tests {
             fail_on: Some(1),
         };
         let mut cursor = Some(0);
-        let result = run_tick(&provider, &cfg, &mut sink, &mut cursor).await;
+        let result = run_tick(&provider, &cfg, &mut sink, &mut cursor, &no_shutdown()).await;
         assert!(result.is_err(), "the failed window must fail the tick");
         assert_eq!(cursor, Some(10), "cursor at the last completed window");
         assert_eq!(
@@ -851,7 +900,7 @@ mod tests {
         asserter.push_success(&one_log());
         asserter.push_success(&Vec::<Log>::new());
         sink.fail_on = None;
-        let result = run_tick(&provider, &cfg, &mut sink, &mut cursor).await;
+        let result = run_tick(&provider, &cfg, &mut sink, &mut cursor, &no_shutdown()).await;
         assert!(result.is_ok(), "retry tick should complete: {result:?}");
         assert_eq!(cursor, Some(26));
         assert_eq!(load(&store), Some(25));
@@ -879,7 +928,7 @@ mod tests {
             fail_on: None,
         };
         let mut cursor = Some(26);
-        let result = run_tick(&provider, &cfg, &mut sink, &mut cursor).await;
+        let result = run_tick(&provider, &cfg, &mut sink, &mut cursor, &no_shutdown()).await;
         assert!(result.is_ok(), "idle tick should succeed: {result:?}");
         assert_eq!(cursor, Some(26), "cursor retained");
         assert_eq!(sink.applied, 0);
@@ -910,7 +959,7 @@ mod tests {
             fail_on: None,
         };
         let mut cursor = None;
-        let err = run_tick(&provider, &cfg, &mut sink, &mut cursor)
+        let err = run_tick(&provider, &cfg, &mut sink, &mut cursor, &no_shutdown())
             .await
             .err()
             .map(|e| format!("{e:#}"));
@@ -951,7 +1000,6 @@ mod tests {
             },
             reorg_margin: 0,
         };
-        cfg.shutdown = shutdown.clone();
 
         // Cancel before spawning: the loop's first act is the `biased` select on
         // the token, so the flush arm is taken deterministically and no queued
@@ -964,12 +1012,57 @@ mod tests {
                 applied: 0,
                 fail_on: None,
             },
+            shutdown,
         ));
         assert!(task.await.is_ok(), "run must return, not hang or panic");
         assert_eq!(
             store.flushes(),
             1,
             "a cancelled watcher must flush its checkpoint exactly once"
+        );
+    }
+
+    /// `spawn` hands the sink factory the *same* token the returned
+    /// `WatcherHandle::shutdown` cancels. This is the seam blacklist relies on
+    /// (its sink observes the token to short-circuit its re-scope) and the whole
+    /// point of #1236: the token cannot be inert, because the only way to hold
+    /// one paired with a live task is this factory. `run` responding to that
+    /// token is proven by the flush test above; this pins that `spawn` wires the
+    /// sink and handle to one token, not two.
+    #[tokio::test]
+    async fn spawn_hands_the_sink_the_token_shutdown_cancels() {
+        use alloy::providers::ProviderBuilder;
+
+        let asserter = alloy::providers::mock::Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let cfg = tick_cfg(provider.clone(), Arc::new(MemoryCheckpointStore::default()));
+
+        // The factory runs synchronously inside `spawn`, so the token it receives
+        // is captured before `spawn` returns.
+        let captured: Arc<std::sync::Mutex<Option<CancellationToken>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let captured_in_sink = Arc::clone(&captured);
+        let handle = spawn(provider, cfg, move |token| {
+            if let Ok(mut slot) = captured_in_sink.lock() {
+                *slot = Some(token.clone());
+            }
+            ScriptedSink {
+                applied: 0,
+                fail_on: None,
+            }
+        });
+
+        let sink_token: Option<CancellationToken> = captured.lock().ok().and_then(|g| g.clone());
+        assert!(
+            sink_token.as_ref().is_some_and(|t| !t.is_cancelled()),
+            "make_sink must run and receive a live (uncancelled) token"
+        );
+        handle.shutdown();
+        assert!(
+            sink_token
+                .as_ref()
+                .is_some_and(CancellationToken::is_cancelled),
+            "handle.shutdown() must cancel the very token make_sink received"
         );
     }
 
@@ -1010,8 +1103,7 @@ mod tests {
         let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
         let store = Arc::new(MemoryCheckpointStore::default());
         let shutdown = CancellationToken::new();
-        let mut cfg = tick_cfg(provider.clone(), Arc::clone(&store));
-        cfg.shutdown = shutdown.clone();
+        let cfg = tick_cfg(provider.clone(), Arc::clone(&store));
 
         // head=25 over span-10 windows → [0,9], [10,19], [20,25]. Only window
         // 1's response is queued: an `Asserter` errors on an empty queue, so if
@@ -1026,7 +1118,7 @@ mod tests {
             shutdown: shutdown.clone(),
         };
         let mut cursor = Some(0);
-        let result = run_tick(&provider, &cfg, &mut sink, &mut cursor).await;
+        let result = run_tick(&provider, &cfg, &mut sink, &mut cursor, &shutdown).await;
 
         assert!(result.is_ok(), "a cancelled tick exits cleanly: {result:?}");
         assert_eq!(sink.applied, 1, "window 1 drained before the cancel landed");

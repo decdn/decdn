@@ -39,26 +39,27 @@ use alloy::rpc::types::{Filter, Log};
 use alloy::sol_types::SolEvent;
 use anyhow::{Context, Result};
 use iroh::PublicKey;
-use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use decdn_incentive::capacity_bond::CapacityBond;
 use decdn_incentive::payment_channel::PaymentChannel;
 
-use crate::chain_events::resumable_watcher::{self, CursorStart, LogSink, WatcherConfig};
+use crate::chain_events::resumable_watcher::{
+    self, CursorStart, LogSink, WatcherConfig, WatcherHandle,
+};
 use crate::metrics::{Metrics, metric_hook};
 // `MAX_BACKFILL_BLOCK_SPAN` doubles as this watcher's head-anchored boot
 // lookback; imported (not duplicated) so the shared per-call range cap can't
 // silently diverge.
 use crate::chain_events::shared_head::HeadSource;
-use crate::chain_events::{AbortOnDrop, MAX_BACKFILL_BLOCK_SPAN, timed};
+use crate::chain_events::{MAX_BACKFILL_BLOCK_SPAN, timed};
 use crate::reputation_wiring::NodeSettlementSource;
 
-/// Background settlement indexer. Holds only the task handle; all observed
+/// Background settlement indexer. Holds only the watcher handle; all observed
 /// state flows into the shared [`NodeSettlementSource`] passed at bootstrap.
 #[derive(Debug)]
 pub struct SettlementIndexer {
-    _watcher: AbortOnDrop,
+    watcher: WatcherHandle,
 }
 
 impl SettlementIndexer {
@@ -74,7 +75,6 @@ impl SettlementIndexer {
         event_poll_interval: Duration,
         head: Arc<dyn HeadSource>,
         metrics: Arc<Metrics>,
-        shutdown: CancellationToken,
     ) -> Result<Self>
     where
         P: Provider + Clone + 'static,
@@ -115,17 +115,22 @@ impl SettlementIndexer {
                 window_blocks: MAX_BACKFILL_BLOCK_SPAN,
             },
             event_poll_interval,
-            shutdown,
             "reputation-indexer",
         )
         .on_backoff(metric_hook(
             &metrics,
             Metrics::reputation_indexer_rpc_failure,
         ));
-        let handle = tokio::spawn(resumable_watcher::run(provider, cfg, sink));
-        Ok(Self {
-            _watcher: AbortOnDrop(handle),
-        })
+        // This sink observes no shutdown token, so it ignores the one `spawn`
+        // mints (`|_| sink`); the runtime drives graceful stop via `shutdown`.
+        let watcher = resumable_watcher::spawn(provider, cfg, move |_| sink);
+        Ok(Self { watcher })
+    }
+
+    /// Signal the indexer to stop its poll loop and return. Called by the runtime
+    /// on graceful shutdown; the `WatcherHandle`'s `AbortOnDrop` is the backstop.
+    pub fn shutdown(&self) {
+        self.watcher.shutdown();
     }
 }
 

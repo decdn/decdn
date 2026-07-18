@@ -76,12 +76,14 @@
 use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 
-use tracing::warn;
-
-use crate::chain_events::AbortOnDrop;
+use crate::chain_events::resumable_watcher::WatcherHandle;
+use crate::dht::chain_projection::{ChainProjection, mutate_gauged};
 use crate::dht::routing::NodeId;
 use crate::dht::staker_set::StakerSet;
 use crate::metrics::Metrics;
+
+/// Names the projection in the poison-recovery `warn!` and gauge helpers.
+const LABEL: &str = "ChainStakerSet active set";
 
 /// One membership transition, as [`apply_change`] applies it to the cached set.
 ///
@@ -107,12 +109,11 @@ pub(super) enum StakerChange {
 /// Chain-backed staker set. Cheap to clone via the shared inner
 /// [`Arc`]; the runtime holds one `Arc<dyn StakerSet>` and consumers
 /// access the cached set through it. The background watcher task is
-/// owned via a private `AbortOnDrop` wrapper so a node-restart cycle
-/// never leaks chain-poll tasks.
+/// owned via the projection (shared with the address-binding façade)
+/// so a node-restart cycle never leaks chain-poll tasks.
 #[derive(Debug)]
 pub struct ChainStakerSet {
-    active: Arc<RwLock<HashSet<NodeId>>>,
-    _watcher: Arc<AbortOnDrop>,
+    proj: ChainProjection<HashSet<NodeId>>,
 }
 
 impl ChainStakerSet {
@@ -122,49 +123,25 @@ impl ChainStakerSet {
     /// whichever façade is dropped first.
     pub(super) const fn from_parts(
         active: Arc<RwLock<HashSet<NodeId>>>,
-        watcher: Arc<AbortOnDrop>,
+        watcher: Arc<WatcherHandle>,
     ) -> Self {
         Self {
-            active,
-            _watcher: watcher,
+            proj: ChainProjection::from_parts(active, LABEL, watcher),
         }
     }
 }
 
 impl StakerSet for ChainStakerSet {
     fn is_active(&self, node_id: &NodeId) -> bool {
-        // RwLock read; on poison the active set is still
-        // structurally valid (we never panic while holding the write
-        // lock), so recover the inner state rather than propagating
-        // a panic into the hot path.
-        read_active(&self.active, |s| s.contains(node_id))
+        self.proj.read(|s| s.contains(node_id))
     }
 
     fn active_nodes(&self) -> Vec<NodeId> {
-        read_active(&self.active, |s| s.iter().copied().collect())
+        self.proj.read(|s| s.iter().copied().collect())
     }
 
     fn len(&self) -> usize {
-        read_active(&self.active, HashSet::len)
-    }
-}
-
-/// Helper for the poison-tolerant `RwLock` read used by every
-/// `StakerSet` accessor: recover the inner set rather than propagate
-/// a panic into the handler hot path. A poisoned read means *something
-/// panicked while holding the write lock* — we log on the recovery
-/// arm so the panic surfaces somewhere, matching the in-repo
-/// precedent in `cache/src/engine.rs`.
-fn read_active<R, F>(active: &Arc<RwLock<HashSet<NodeId>>>, f: F) -> R
-where
-    F: FnOnce(&HashSet<NodeId>) -> R,
-{
-    match active.read() {
-        Ok(guard) => f(&guard),
-        Err(poisoned) => {
-            warn!("ChainStakerSet active set RwLock poisoned; recovering inner state");
-            f(&poisoned.into_inner())
-        }
+        self.proj.read(HashSet::len)
     }
 }
 
@@ -181,33 +158,22 @@ where
 /// assert on, having previously watched a `broadcast` emission that was retired
 /// in #1231.
 pub(super) fn apply_change(
-    active: &Arc<RwLock<HashSet<NodeId>>>,
+    active: &RwLock<HashSet<NodeId>>,
     metrics: &Arc<Metrics>,
     change: StakerChange,
 ) -> bool {
-    let (mutated, size) = {
-        let mut guard = match active.write() {
-            Ok(g) => g,
-            Err(poisoned) => {
-                warn!("ChainStakerSet active set RwLock poisoned; recovering inner state");
-                poisoned.into_inner()
-            }
-        };
-        let mutated = match change {
-            StakerChange::Active(id) => guard.insert(id),
-            StakerChange::Inactive(id) => guard.remove(&id),
-        };
-        // Sample the size while holding the lock so the gauge can never
-        // observe a torn view from a concurrent change.
-        (mutated, guard.len())
-    };
-    if mutated {
-        // Only republish the gauge on a real membership change; a no-op
-        // (re-insert / absent-remove) leaves the set — and the gauge —
-        // unchanged.
-        metrics.staker_set_active_count(size);
-    }
-    mutated
+    mutate_gauged(
+        active,
+        LABEL,
+        |set| {
+            let mutated = match change {
+                StakerChange::Active(id) => set.insert(id),
+                StakerChange::Inactive(id) => set.remove(&id),
+            };
+            mutated.then_some(set.len())
+        },
+        |size| metrics.staker_set_active_count(size),
+    )
 }
 
 #[cfg(test)]

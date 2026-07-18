@@ -94,16 +94,14 @@ use alloy::providers::Provider;
 use alloy::rpc::types::{Filter, Log};
 use alloy::sol_types::SolEvent;
 use anyhow::{Context, Result};
-use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::chain_events::resumable_watcher::{
-    self, Checkpoint, CursorStart, LogSink, WatcherConfig,
+    self, Checkpoint, CursorStart, LogSink, WatcherConfig, WatcherHandle,
 };
 use crate::chain_events::shared_head::HeadSource;
-use crate::chain_events::{
-    AbortOnDrop, REORG_MARGIN_BLOCKS, backfill_windows, check_backfill_range, timed,
-};
+use crate::chain_events::{REORG_MARGIN_BLOCKS, backfill_windows, check_backfill_range, timed};
+use crate::dht::chain_projection::{ChainProjection, with_read, with_write};
 use crate::dht::origin::{Hash, OriginDirectory};
 use crate::dht::routing::NodeId;
 use crate::dht::staker_set::StakerSet;
@@ -213,15 +211,18 @@ impl DirectoryCache {
     }
 }
 
+/// Names the projection in the poison-recovery `warn!` emitted by
+/// [`read_cache`] / [`write_cache`].
+const LABEL: &str = "ChainOriginDirectory cache";
+
 /// Chain-backed origin directory. Cheap to clone via the shared inner [`Arc`];
 /// the runtime holds one `Arc<dyn OriginDirectory>` and the prefetch engine
-/// resolves through it. The background watcher task is owned via a private
-/// `AbortOnDrop` wrapper so a node-restart cycle never leaks chain-poll tasks.
+/// resolves through it. The background watcher task is owned via the projection
+/// so a node-restart cycle never leaks chain-poll tasks.
 #[derive(Debug)]
 pub struct ChainOriginDirectory {
-    cache: Arc<RwLock<DirectoryCache>>,
+    proj: ChainProjection<DirectoryCache>,
     staker_set: Arc<dyn StakerSet>,
-    _watcher: AbortOnDrop,
 }
 
 /// Contract handles the watcher needs, bundled so the bootstrap and watcher
@@ -295,7 +296,6 @@ impl ChainOriginDirectory {
         head: Arc<dyn HeadSource>,
         staker_set: Arc<dyn StakerSet>,
         metrics: Arc<Metrics>,
-        shutdown: CancellationToken,
     ) -> Result<Self>
     where
         P: Provider + Clone + 'static,
@@ -356,7 +356,6 @@ impl ChainOriginDirectory {
                 ]),
             cursor_start(snapshot_block, checkpoint_store),
             event_poll_interval,
-            shutdown,
             "origin-directory",
         )
         .with_from_block(from_block)
@@ -368,12 +367,14 @@ impl ChainOriginDirectory {
             &metrics,
             Metrics::origin_directory_watcher_backoff_started,
         ));
-        let watcher_handle = tokio::spawn(resumable_watcher::run(provider, cfg, sink));
+        // This sink observes no shutdown token, so it ignores the one `spawn`
+        // mints (`|_| sink`); the runtime drives graceful stop, then flushes the
+        // origin scan checkpoint, via `watcher`.
+        let watcher = Arc::new(resumable_watcher::spawn(provider, cfg, move |_| sink));
 
         Ok(Self {
-            cache,
+            proj: ChainProjection::from_parts(cache, LABEL, watcher),
             staker_set,
-            _watcher: AbortOnDrop(watcher_handle),
         })
     }
 }
@@ -621,30 +622,38 @@ fn resume_replay_floor(store: &dyn KeyedCheckpointStore, from_block: u64) -> Res
     Ok(replay_floor(checkpoint, from_block))
 }
 
-impl OriginDirectory for ChainOriginDirectory {
-    fn lookup_origins(&self, hash: &Hash) -> Vec<NodeId> {
-        read_cache(&self.cache, |c| c.resolve(hash, self.staker_set.as_ref()))
-    }
-
-    fn has_origin(&self, hash: &Hash) -> bool {
-        read_cache(&self.cache, |c| c.has_any(hash, self.staker_set.as_ref()))
+impl ChainOriginDirectory {
+    /// The owned watcher handle, cloned so the runtime can drive graceful
+    /// shutdown in its deliberate order (cancel, then flush the `Origin`
+    /// checkpoint) — see `runtime`.
+    pub(crate) fn watcher(&self) -> Arc<WatcherHandle> {
+        self.proj.watcher()
     }
 }
 
-/// Poison-tolerant `RwLock` read, mirroring `ChainStakerSet`: recover the inner
-/// cache rather than propagate a panic into the lookup hot path. We never panic
-/// while holding the write lock, so the inner state is structurally valid.
+impl OriginDirectory for ChainOriginDirectory {
+    fn lookup_origins(&self, hash: &Hash) -> Vec<NodeId> {
+        self.proj
+            .read(|c| c.resolve(hash, self.staker_set.as_ref()))
+    }
+
+    fn has_origin(&self, hash: &Hash) -> bool {
+        self.proj
+            .read(|c| c.has_any(hash, self.staker_set.as_ref()))
+    }
+}
+
+/// Poison-tolerant `RwLock` read for the cache the sink and free helpers share,
+/// delegating to the shared [`with_read`] so the recovery arm lives in one place
+/// (#1255). The `Origin` cache is `T` for its own [`ChainProjection`], but the
+/// event handlers below hold a bare `Arc<RwLock<DirectoryCache>>` (they run
+/// inside the watcher task, so they cannot reach the projection), hence these
+/// free wrappers.
 fn read_cache<R, F>(cache: &Arc<RwLock<DirectoryCache>>, f: F) -> R
 where
     F: FnOnce(&DirectoryCache) -> R,
 {
-    match cache.read() {
-        Ok(guard) => f(&guard),
-        Err(poisoned) => {
-            warn!("ChainOriginDirectory cache RwLock poisoned; recovering inner state");
-            f(&poisoned.into_inner())
-        }
-    }
+    with_read(cache, LABEL, f)
 }
 
 /// Snapshot current chain state: replay `ContentClaimed` to learn the
@@ -1027,13 +1036,7 @@ fn write_cache<R, F>(cache: &Arc<RwLock<DirectoryCache>>, f: F) -> R
 where
     F: FnOnce(&mut DirectoryCache) -> R,
 {
-    match cache.write() {
-        Ok(mut guard) => f(&mut guard),
-        Err(poisoned) => {
-            warn!("ChainOriginDirectory cache RwLock poisoned; recovering inner state");
-            f(&mut poisoned.into_inner())
-        }
-    }
+    with_write(cache, LABEL, f)
 }
 
 #[cfg(test)]

@@ -78,11 +78,10 @@ use decdn_incentive::{
 };
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::chain_events::resumable_watcher::{
-    self, Checkpoint, CursorStart, LogSink, WatcherConfig,
+    self, Checkpoint, CursorStart, LogSink, WatcherConfig, WatcherHandle,
 };
 use crate::chain_events::shared_head::HeadSource;
 use crate::chain_events::{AbortOnDrop, REORG_MARGIN_BLOCKS, timed};
@@ -197,8 +196,15 @@ pub struct PaymentChannelService<P: Provider + Clone + 'static> {
     store: Arc<dyn ChannelStateStore>,
     pending_store: Arc<dyn PendingSettleStore>,
     redeem_tx: mpsc::Sender<ChannelId>,
-    _watcher: AbortOnDrop,
-    /// The redemption task handle. Unlike `_watcher`/`_sweeper` (aborted only on
+    /// The settlement watcher, owning both its task and the shutdown token that
+    /// stops it (#1236). `close_open_channels_on_shutdown` calls
+    /// [`WatcherHandle::shutdown`] at a point only this service knows — before
+    /// its channel-close deadline, so a slow `closeChannel` cannot starve the
+    /// checkpoint flush — which is why the token is not runtime-owned. Held (not
+    /// `_`-dropped) so that graceful `shutdown()` runs before the wrapped
+    /// `AbortOnDrop` hard-stops the task.
+    watcher: WatcherHandle,
+    /// The redemption task handle. Unlike `watcher`/`_sweeper` (aborted only on
     /// drop) this is held so the shutdown path can abort+await it *before*
     /// closing channels (#751) — greatly narrowing (not eliminating; a tx already
     /// broadcast before the abort can still mine) the window where a live
@@ -217,10 +223,6 @@ pub struct PaymentChannelService<P: Provider + Clone + 'static> {
     /// re-scanning the debounce window. A directly-durable store's `flush` is a
     /// no-op, so this is harmless when no debounce decorator is installed.
     checkpoint_store: Arc<dyn KeyedCheckpointStore>,
-    /// Cancels the settlement watcher's `eth_getLogs` poll loop on graceful
-    /// shutdown so it flushes its checkpoint and returns before the process
-    /// exits (the `AbortOnDrop` wrapper is the hard safety net).
-    watcher_shutdown: CancellationToken,
 }
 
 impl<P: Provider + Clone + 'static> PaymentChannelService<P> {
@@ -280,7 +282,6 @@ impl<P: Provider + Clone + 'static> PaymentChannelService<P> {
         // channel registration, so a client's first request on a fresh channel
         // would be rejected as unknown. A shallow reorg is covered by the resume
         // `reorg_margin` and the sink's idempotent `register_open_channel`.
-        let watcher_shutdown = CancellationToken::new();
         let sink = SettlementSink {
             contract: contract.clone(),
             self_address,
@@ -301,14 +302,13 @@ impl<P: Provider + Clone + 'static> PaymentChannelService<P> {
                 ]),
             cursor_start(Arc::clone(&checkpoint_store)),
             event_poll_interval,
-            watcher_shutdown.clone(),
             "settlement",
         );
-        let watcher = tokio::spawn(resumable_watcher::run(
-            contract.provider().clone(),
-            cfg,
-            sink,
-        ));
+        // This sink observes no shutdown token, so it ignores the one `spawn`
+        // mints (`|_| sink`). The returned handle owns that token; the service
+        // cancels it in `close_open_channels_on_shutdown` at its own ordering
+        // point, before the channel-close deadline.
+        let watcher = resumable_watcher::spawn(contract.provider().clone(), cfg, move |_| sink);
         let redeemer = tokio::spawn(redeemer_loop(
             contract.clone(),
             Arc::clone(&store),
@@ -334,11 +334,10 @@ impl<P: Provider + Clone + 'static> PaymentChannelService<P> {
             store,
             pending_store,
             redeem_tx,
-            _watcher: AbortOnDrop(watcher),
+            watcher,
             redeemer: std::sync::Mutex::new(Some(redeemer)),
             _sweeper: AbortOnDrop(sweeper),
             checkpoint_store,
-            watcher_shutdown,
         })
     }
 
@@ -362,7 +361,7 @@ impl<P: Provider + Clone + 'static> PaymentChannelService<P> {
         // needlessly re-scan the debounce window. Both are cheap and idempotent;
         // done before the channel-close deadline so a slow `closeChannel` cannot
         // starve them.
-        self.watcher_shutdown.cancel();
+        self.watcher.shutdown();
         self.flush_checkpoint_on_shutdown();
         // Quiesce the redeemer first (#751): with the router already drained, no
         // new hints arrive, and aborting the redeemer here stops it from *issuing*

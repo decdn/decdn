@@ -72,7 +72,9 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use crate::chain_events::resumable_watcher::{self, CursorStart, LogSink, WatcherConfig};
+use crate::chain_events::resumable_watcher::{
+    self, CursorStart, LogSink, WatcherConfig, WatcherHandle,
+};
 use crate::chain_events::shared_head::HeadSource;
 use crate::chain_events::timed;
 
@@ -197,13 +199,13 @@ const fn cursor_start() -> CursorStart {
     CursorStart::FullReplay
 }
 
-/// Run the blacklist compliance watcher until `shutdown` is cancelled.
-/// `from_block` is where the `HashBlacklisted` replay starts (the
-/// `ContentBlacklist` deploy block) — re-scanned every boot, no persisted cursor
-/// (see the module header). `event_poll_interval` is the getLogs poll cadence;
-/// `rescan_interval` is the batched re-scope cadence.
+/// Spawn the blacklist compliance watcher, returning the handle that owns its
+/// task and shutdown token. `from_block` is where the `HashBlacklisted` replay
+/// starts (the `ContentBlacklist` deploy block) — re-scanned every boot, no
+/// persisted cursor (see the module header). `event_poll_interval` is the
+/// getLogs poll cadence; `rescan_interval` is the batched re-scope cadence.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn run<P>(
+pub(crate) fn spawn<P>(
     provider: P,
     contract_addr: Address,
     operator: Address,
@@ -212,14 +214,29 @@ pub(crate) async fn run<P>(
     event_poll_interval: Duration,
     head: Arc<dyn HeadSource>,
     rescan_interval: Duration,
-    shutdown: CancellationToken,
-) where
-    P: Provider + Clone,
+) -> WatcherHandle
+where
+    P: Provider + Clone + 'static,
 {
     let contract = ContentBlacklist::new(contract_addr, provider.clone());
     info!(%contract_addr, %operator, from_block, "blacklist compliance watcher starting");
 
-    let sink = BlacklistSink {
+    let cfg = WatcherConfig::new(
+        head,
+        Filter::new().address(contract_addr).event_signature(vec![
+            HashBlacklisted::SIGNATURE_HASH,
+            HashRemoved::SIGNATURE_HASH,
+        ]),
+        cursor_start(),
+        event_poll_interval.max(Duration::from_secs(1)),
+        "blacklist",
+    )
+    .with_from_block(from_block);
+    // Unlike the five flush-only sinks, `BlacklistSink` must observe the *same*
+    // token the loop cancels: `rescan` polls it between per-hash `eth_call`s so a
+    // large deny-set re-scope yields promptly to shutdown. `spawn` mints one
+    // token and hands it to the factory, so sink and loop share it (#1236).
+    resumable_watcher::spawn(provider, cfg, move |shutdown| BlacklistSink {
         contract,
         operator,
         cache,
@@ -229,20 +246,7 @@ pub(crate) async fn run<P>(
         shutdown: shutdown.clone(),
         rescan_interval: rescan_interval.max(Duration::from_secs(1)),
         last_rescan: None,
-    };
-    let cfg = WatcherConfig::new(
-        head,
-        Filter::new().address(contract_addr).event_signature(vec![
-            HashBlacklisted::SIGNATURE_HASH,
-            HashRemoved::SIGNATURE_HASH,
-        ]),
-        cursor_start(),
-        event_poll_interval.max(Duration::from_secs(1)),
-        shutdown,
-        "blacklist",
-    )
-    .with_from_block(from_block);
-    resumable_watcher::run(provider, cfg, sink).await;
+    })
 }
 
 /// Re-scope every distinct hash in `known` (one scope `eth_call` per hash, not
