@@ -41,6 +41,7 @@ use serde::{Deserialize, Serialize};
 
 use super::chain_ctx;
 use super::fetch;
+use super::file_manifest;
 use decdn_client_pull::PullDeadlines;
 use decdn_client_pull::discovery::{self, NodeCandidate};
 use decdn_client_pull::endpoint as client_endpoint;
@@ -374,10 +375,46 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         {
             return EntryOutcome::failed(&entry.path, &anyhow!("create {}: {e}", parent.display()));
         }
+        // A bundle entry's blob may itself be a `DECDNMAN` file manifest — the
+        // two layers compose (`appendix-bundles.md` § Non-relationship to ADR
+        // 012's `DECDNMAN` chunk manifest) — in which case the entry's real bytes
+        // are its chunks (#1183). Without the magic these ARE the bytes; write
+        // them as-is.
+        if let Some(manifest) = file_manifest::sniff(&bytes) {
+            return match self.reconstruct_entry(manifest, hash, &dest).await {
+                Ok(n) => EntryOutcome::Fetched(n),
+                Err(e) => EntryOutcome::failed(&entry.path, &e),
+            };
+        }
         if let Err(e) = fetch::write_blob_atomic(&dest, &bytes) {
             return EntryOutcome::failed(&entry.path, &anyhow!("write {}: {e}", dest.display()));
         }
         EntryOutcome::Fetched(bytes.len() as u64)
+    }
+
+    /// Expand a manifest entry whose blob turned out to be a file manifest:
+    /// fetch and verify its chunks in order, then reconstruct into `dest`.
+    ///
+    /// Chunk pulls go through the same [`Self::fetch`] as any other blob, so
+    /// they respect per-provider channel serialization; the ADR's in-order
+    /// requirement keeps them sequential within this one entry, while other
+    /// entries continue in parallel.
+    async fn reconstruct_entry(
+        &self,
+        manifest: anyhow::Result<file_manifest::FileManifest>,
+        manifest_hash: [u8; 32],
+        dest: &Path,
+    ) -> anyhow::Result<u64> {
+        let manifest = manifest?;
+        file_manifest::reconstruct(
+            &manifest,
+            manifest_hash,
+            &file_manifest::downloads_root(),
+            dest,
+            !self.common.no_keep_blobs,
+            |chunk_hash| self.fetch(chunk_hash),
+        )
+        .await
     }
 }
 

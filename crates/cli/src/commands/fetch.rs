@@ -49,6 +49,7 @@ use decdn_protocol::client::StreamError;
 use iroh::{Endpoint, EndpointAddr, PublicKey, RelayUrl};
 
 use super::chain_ctx;
+use super::file_manifest;
 use decdn_client_pull::discovery::{self, NodeCandidate};
 use decdn_client_pull::endpoint as client_endpoint;
 use decdn_client_pull::probe::probe_once;
@@ -520,8 +521,15 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
     let slash_dom = slash_judge_domain(chain.chain_id, chain.slash_judge);
 
     // Reuse a live channel for this provider (resuming its watermark), else open
-    // and persist a new one.
-    let ctx = open_or_reuse(
+    // and persist a new one, with the ADR 005 client binding attached.
+    //
+    // Rebuilt before EVERY blob rather than hoisted: the context snapshots the
+    // channel's voucher watermark (`prior_nonce`), which `fetch_blob` advances in
+    // the store as it pays. A chunked-manifest fetch (#1183) issues many
+    // sequential pulls on one channel, and reusing a stale context would re-sign
+    // an already-spent nonce. It also gives each chunk a fresh low-deposit
+    // refill check (#1103).
+    let ctx = build_channel_ctx(
         &store,
         &contract,
         &rpc,
@@ -529,31 +537,10 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
         &voucher_dom,
         provider,
         self_address,
-        chain.payment_channel,
-        chain.deposit,
-        chain.max_approve,
+        &chain,
+        &endpoint,
     )
     .await?;
-
-    // ADR 005 client identity binding (#1115): sign our OWN iroh NodeId with the
-    // buyer key so the serving node can prove we own the channel and reactively
-    // pull a cache-missed blob from its configured origin. The bind domain's
-    // verifying contract is the `CapacityBond`; without it configured we can't
-    // sign, so we fall back to the pre-#1115 behavior (only already-cached
-    // content is served — a cache miss is refused).
-    let ctx = if let Some(capacity_bond) = chain.capacity_bond {
-        let bind_dom = bind_node_id_domain(chain.chain_id, capacity_bond);
-        let own_node_id = B256::from(*endpoint.id().as_bytes());
-        ctx.with_client_binding(sign_client_binding(&signer, own_node_id, &bind_dom)?)
-    } else {
-        // No `CapacityBond` configured ⇒ we can't sign the ADR 005 binding, so the
-        // request goes out unbound and the node serves only content it already
-        // holds (a cache miss is refused). No warning here — it would fire on
-        // every successful cached fetch too, training users to ignore it; the
-        // refusal is instead explained at the point of failure below
-        // (`annotate_unbound_cache_miss`).
-        ctx
-    };
 
     let mut target = EndpointAddr::new(node_id);
     // `--addr` requires `--node-id` (clap), so it only pins the explicit-node
@@ -570,23 +557,12 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
     // itself automatically when stderr is not a terminal, so a piped/redirected
     // fetch stays silent. The bar starts length-less; the first callback (which
     // fires once the signed `StreamResponse` fixes the total) sets its length.
-    let bar = new_progress_bar();
-    // `ProgressBar` is `Arc`-backed, so the clone the callback owns drives the
-    // same bar we `finish_and_clear` below. The callback must be `'static`
-    // (`ProgressCallback`), hence the owned clone rather than a borrow.
-    let cb_bar = bar.clone();
-    // `expected` is constant across the pull, so set the bar length once (it
-    // takes a write lock) rather than on every chunk in the hot receive loop.
-    let length_set = std::sync::atomic::AtomicBool::new(false);
-    let on_progress = move |received: u64, expected: u64| {
-        if !length_set.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            cb_bar.set_length(expected);
-        }
-        cb_bar.set_position(received);
-    };
+    let (bar, on_progress) = delivery_progress();
     let blob = fetch_blob(
         &endpoint,
-        target,
+        // Cloned, not moved: a `DECDNMAN` manifest expands into per-chunk pulls
+        // to the same node below (#1183).
+        target.clone(),
         &ctx,
         &slash_dom,
         provider,
@@ -611,10 +587,195 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
     bar.finish_and_clear();
     let blob = blob.map_err(|err| annotate_unbound_cache_miss(err, &ctx))?;
 
+    // A `DECDNMAN` manifest blob is a chunked FILE, not the file's bytes: expand
+    // it into per-chunk pulls and reconstruct (ADR 012 § Download flow, #1183).
+    // Anything without the magic is a raw blob and is written through unchanged.
+    if let Some(manifest) = file_manifest::sniff(&blob) {
+        let chunks = ChunkFetcher {
+            endpoint: &endpoint,
+            target: &target,
+            store: &store,
+            contract: &contract,
+            rpc: &rpc,
+            signer: &signer,
+            voucher_dom: &voucher_dom,
+            slash_dom: &slash_dom,
+            chain: &chain,
+            provider,
+            self_address,
+            deadlines: PullDeadlines::capped(
+                common.stall_timeout(),
+                common.stall_timeout(),
+                common.hard_cap(),
+            )?,
+            max_blob_bytes,
+        };
+        return chunks
+            .reconstruct(&manifest?, hash, &args.output, !common.no_keep_blobs)
+            .await;
+    }
+
     write_blob_atomic(&args.output, &blob)
         .map_err(|e| anyhow::anyhow!("write {}: {e}", args.output.display()))?;
     println!("fetched {} bytes -> {}", blob.len(), args.output.display());
     Ok(())
+}
+
+/// The `decdn fetch` delivery progress bar plus the callback that drives it,
+/// returned as a pair so the caller can `finish_and_clear` the bar before its
+/// terminal message (#1118).
+fn delivery_progress() -> (indicatif::ProgressBar, impl Fn(u64, u64) + 'static) {
+    let bar = new_progress_bar();
+    // `ProgressBar` is `Arc`-backed, so the clone the callback owns drives the
+    // same bar the caller clears. The callback must be `'static`
+    // (`ProgressCallback`), hence the owned clone rather than a borrow.
+    let cb_bar = bar.clone();
+    // `expected` is constant across the pull, so set the bar length once (it
+    // takes a write lock) rather than on every chunk in the hot receive loop.
+    let length_set = std::sync::atomic::AtomicBool::new(false);
+    let on_progress = move |received: u64, expected: u64| {
+        if !length_set.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            cb_bar.set_length(expected);
+        }
+        cb_bar.set_position(received);
+    };
+    (bar, on_progress)
+}
+
+/// The fetch-wide state a chunked `DECDNMAN` download needs to pull each chunk
+/// (#1183), borrowed from [`fetch`]'s own locals.
+///
+/// It exists because chunk pulls are *repeated* single-blob fetches: they reuse
+/// the node, channel, and deadlines already resolved for the manifest blob, but
+/// each needs a freshly-rebuilt [`ChannelContext`] (see [`build_channel_ctx`]).
+/// Bundling them beats threading a dozen arguments through a free function.
+struct ChunkFetcher<'a, P: alloy::providers::Provider + Clone> {
+    endpoint: &'a Endpoint,
+    /// The node that served the manifest; its chunks are pulled from it too.
+    target: &'a EndpointAddr,
+    store: &'a RedbBuyerChannelStore,
+    contract: &'a PaymentChannel::PaymentChannelInstance<P>,
+    rpc: &'a P,
+    signer: &'a Arc<PrivateKeySigner>,
+    voucher_dom: &'a Eip712Domain,
+    slash_dom: &'a Eip712Domain,
+    chain: &'a ResolvedChain,
+    provider: Address,
+    self_address: Address,
+    /// Applied per chunk, matching how `--stall-timeout-ms`/`--timeout-ms` are
+    /// documented to apply per entry for `bundle pull`.
+    deadlines: PullDeadlines,
+    max_blob_bytes: u64,
+}
+
+impl<P: alloy::providers::Provider + Clone> ChunkFetcher<'_, P> {
+    /// Pull one chunk blob on a fresh channel context.
+    async fn fetch(&self, hash: [u8; 32]) -> anyhow::Result<Vec<u8>> {
+        let ctx = build_channel_ctx(
+            self.store,
+            self.contract,
+            self.rpc,
+            self.signer,
+            self.voucher_dom,
+            self.provider,
+            self.self_address,
+            self.chain,
+            self.endpoint,
+        )
+        .await?;
+        fetch_blob(
+            self.endpoint,
+            self.target.clone(),
+            &ctx,
+            self.slash_dom,
+            self.provider,
+            self.store,
+            hash,
+            self.deadlines,
+            self.max_blob_bytes,
+            // No per-chunk byte bar: it would reset once per chunk and read as a
+            // stuttering restart. Chunk progress is the printed lines here plus
+            // the per-chunk error context from `file_manifest::reconstruct`.
+            None,
+        )
+        .await
+        .map_err(|err| annotate_unbound_cache_miss(err, &ctx))
+    }
+
+    /// Reconstruct the manifest's file into `output` and report.
+    async fn reconstruct(
+        &self,
+        manifest: &file_manifest::FileManifest,
+        manifest_hash: [u8; 32],
+        output: &Path,
+        keep_blobs: bool,
+    ) -> anyhow::Result<()> {
+        println!(
+            "fetched a file manifest ({} chunk(s), {} bytes); reconstructing",
+            manifest.chunks.len(),
+            manifest.total_bytes
+        );
+        let written = file_manifest::reconstruct(
+            manifest,
+            manifest_hash,
+            &file_manifest::downloads_root(),
+            output,
+            keep_blobs,
+            |chunk_hash| self.fetch(chunk_hash),
+        )
+        .await?;
+        println!("reconstructed {written} bytes -> {}", output.display());
+        Ok(())
+    }
+}
+
+/// [`open_or_reuse`] plus the ADR 005 client identity binding (#1115): sign our
+/// OWN iroh `NodeId` with the buyer key so the serving node can prove we own the
+/// channel and reactively pull a cache-missed blob from its configured origin.
+///
+/// The bind domain's verifying contract is the `CapacityBond`; without one
+/// configured we can't sign, so the request goes out unbound and the node serves
+/// only content it already holds (a cache miss is refused). No warning is
+/// emitted for that — it would fire on every successful cached fetch too,
+/// training users to ignore it; the refusal is explained at the point of failure
+/// by [`annotate_unbound_cache_miss`].
+///
+/// Its own function (rather than inline in [`fetch`]) because a chunked-manifest
+/// download rebuilds the context once per chunk — see the call site.
+#[allow(clippy::too_many_arguments)]
+async fn build_channel_ctx<P>(
+    store: &RedbBuyerChannelStore,
+    contract: &PaymentChannel::PaymentChannelInstance<P>,
+    rpc: &P,
+    signer: &Arc<PrivateKeySigner>,
+    voucher_dom: &Eip712Domain,
+    provider: Address,
+    self_address: Address,
+    chain: &ResolvedChain,
+    endpoint: &Endpoint,
+) -> anyhow::Result<ChannelContext>
+where
+    P: alloy::providers::Provider + Clone,
+{
+    let ctx = open_or_reuse(
+        store,
+        contract,
+        rpc,
+        signer,
+        voucher_dom,
+        provider,
+        self_address,
+        chain.payment_channel,
+        chain.deposit,
+        chain.max_approve,
+    )
+    .await?;
+    let Some(capacity_bond) = chain.capacity_bond else {
+        return Ok(ctx);
+    };
+    let bind_dom = bind_node_id_domain(chain.chain_id, capacity_bond);
+    let own_node_id = B256::from(*endpoint.id().as_bytes());
+    Ok(ctx.with_client_binding(sign_client_binding(signer, own_node_id, &bind_dom)?))
 }
 
 /// Reuse the live channel tracked for `provider` (resuming its watermark), or
@@ -787,6 +948,7 @@ mod tests {
             max_blob_mb: 1024,
             stall_timeout_ms: 30_000,
             timeout_ms: 3_600_000,
+            no_keep_blobs: false,
         }
     }
 

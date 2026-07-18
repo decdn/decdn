@@ -33,7 +33,7 @@ default = []
 # `decdn-incentive/buyer-store-core`. `redb` and `postcard` were never actually
 # gated out here either — `redb` arrives transitively via `decdn-node`, and
 # `postcard` via `decdn-protocol`.
-anvil-e2e = ["decdn-incentive/redb"]
+anvil-e2e = ["decdn-incentive/redb", "dep:postcard", "dep:serde"]
 
 [dependencies]
 decdn-node = { workspace = true }
@@ -43,6 +43,11 @@ decdn-common = { workspace = true }
 decdn-client-pull = { workspace = true }
 decdn-protocol = { workspace = true }
 decdn-config-types = { workspace = true }
+# `cli_fetch_manifest` (anvil-e2e only) postcard-encodes a `DECDNMAN` manifest blob
+# to seed into the node, mirroring the ADR 012 § Manifest format wire layout the CLI
+# consumer decodes. Gated with the test so default builds carry no unused dep.
+postcard = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
 alloy = { workspace = true }
 iroh = { workspace = true }
 tokio = { workspace = true }
