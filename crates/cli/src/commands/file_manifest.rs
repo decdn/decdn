@@ -16,7 +16,7 @@
 //! ingest-side, and **intra-file**: it maps chunk indices to blob hashes within
 //! one file. They compose — a bundle entry's `hash` may itself name a
 //! `DECDNMAN` manifest — but they are separate types with separate magic, hence
-//! the deliberately distinct [`FileManifest`] / `Manifest` naming.
+//! the deliberately distinct `FileManifest` / `Manifest` naming.
 //!
 //! # Backward compatibility
 //!
@@ -190,15 +190,24 @@ where
 
 /// Whether an existing part file already holds this chunk's verified bytes.
 /// Any read/IO problem simply means "not verified" — the chunk is re-fetched.
+///
+/// The declared size is checked from the directory entry *before* hashing: a
+/// truncated part from an interrupted run is the common case here, and chunks
+/// are 256 MiB, so reading one only to reject it on length is a wasted pass.
 fn part_is_verified(part: &Path, chunk: &ChunkEntry) -> bool {
-    let Ok(file) = std::fs::File::open(part) else {
+    let Ok(mut file) = std::fs::File::open(part) else {
         return false;
     };
+    if !file.metadata().is_ok_and(|m| m.len() == chunk.size) {
+        return false;
+    }
     let mut hasher = blake3::Hasher::new();
-    let Ok(read) = std::io::copy(&mut std::io::BufReader::new(file), &mut hasher) else {
+    // `update_reader` over `io::copy`: it owns its buffering and retries
+    // interrupted reads rather than surfacing them as a verification failure.
+    if hasher.update_reader(&mut file).is_err() {
         return false;
-    };
-    read == chunk.size && *hasher.finalize().as_bytes() == chunk.hash
+    }
+    *hasher.finalize().as_bytes() == chunk.hash
 }
 
 /// Check freshly-fetched chunk bytes against the manifest's hash and size.
@@ -362,6 +371,34 @@ mod tests {
             .await
             .unwrap();
         assert!(src.fetched.borrow().is_empty());
+        assert_eq!(std::fs::read(&out).unwrap(), b"onetwo");
+    }
+
+    /// A part left truncated by an interrupted run is re-fetched, not reused —
+    /// the size check rejects it before the (256 MiB-scale) hash pass runs.
+    #[tokio::test]
+    async fn a_truncated_part_is_refetched() {
+        let chunks: [&[u8]; 2] = [b"one", b"two"];
+        let (manifest, blob) = manifest_for(&chunks);
+        let hash = *blake3::hash(&blob).as_bytes();
+        let dir = tempfile::tempdir().unwrap();
+        let downloads = dir.path().join("downloads");
+        let out = dir.path().join("out.bin");
+        let src = Source::new(&chunks);
+
+        reconstruct(&manifest, hash, &downloads, &out, true, |h| src.get(h))
+            .await
+            .unwrap();
+
+        // Simulate a run cut short mid-write: chunk 1's part is short.
+        let part = downloads.join(hex(&hash)).join("chunk-1.part");
+        std::fs::write(&part, b"tw").unwrap();
+        src.fetched.borrow_mut().clear();
+
+        reconstruct(&manifest, hash, &downloads, &out, true, |h| src.get(h))
+            .await
+            .unwrap();
+        assert_eq!(*src.fetched.borrow(), vec![manifest.chunks[1].hash]);
         assert_eq!(std::fs::read(&out).unwrap(), b"onetwo");
     }
 
