@@ -22,6 +22,7 @@
 ### Task 1: Rebase and name the inherited worktree safely
 
 **Files:**
+
 - Preserve: `crates/node/src/dispatch.rs`
 - Preserve: `crates/node/src/lib.rs`
 - Preserve: `crates/node/src/rate_limit.rs`
@@ -29,6 +30,7 @@
 - Preserve: `crates/node/src/prune_guard.rs`
 
 **Interfaces:**
+
 - Consumes: Claude's dirty worktree and current local `main`.
 - Produces: the inherited patch on a correctly named, current branch.
 
@@ -60,6 +62,7 @@ Expected: the branch is based on current `main`; the five inherited production p
 ### Task 2: Validate the shared `PruneGuard`
 
 **Files:**
+
 - Create: `crates/node/src/prune_guard.rs`
 - Modify: `crates/node/src/lib.rs`
 - Modify: `crates/node/src/dispatch.rs`
@@ -68,6 +71,7 @@ Expected: the branch is based on current `main`; the five inherited production p
 - Test: `crates/node/src/rate_limit.rs`
 
 **Interfaces:**
+
 - Produces: `pub(crate) struct PruneGuard<'a>(pub(crate) &'a AtomicBool)` with a `Drop` implementation that stores `false` using `Ordering::Release`.
 - Consumes: both limiters' existing single-flight `AtomicBool` fields.
 
@@ -95,9 +99,11 @@ Expected: the definition and `Drop` implementation appear only in `prune_guard.r
 ### Task 3: Compute the EIP-712 domains once
 
 **Files:**
+
 - Modify: `crates/node/src/runtime/mod.rs`
 
 **Interfaces:**
+
 - Produces: local `slash_domain`, `voucher_domain`, and `bind_domain` values constructed once.
 - Consumes: parsed `slash_judge_addr`, `payment_channel_addr`, `capacity_bond_addr`, and `cfg.blockchain.chain_id`.
 
@@ -147,10 +153,12 @@ Expected: exactly three production matches, one for each domain function; test-o
 ### Task 4: Introduce and test the provider factory
 
 **Files:**
+
 - Modify: `crates/node/src/runtime/mod.rs`
 - Test: `crates/node/src/runtime/mod.rs` test module
 
 **Interfaces:**
+
 - Produces: `ProviderFactory::{read_only, seller_wallet, buyer_wallet, shared_head}`.
 - Consumes: Alloy HTTP URLs, `PrivateKeySigner`, and the configured `Duration` poll interval.
 
@@ -257,6 +265,7 @@ Expected: production builder calls are confined to `ProviderFactory`; test-only 
 ### Task 5: Verify and commit the complete micro-dedup refactor
 
 **Files:**
+
 - Verify all paths from Tasks 2-4.
 
 - [ ] **Step 1: Run formatting, focused tests, the node suite, and Clippy**
