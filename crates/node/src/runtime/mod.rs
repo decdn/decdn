@@ -1099,10 +1099,10 @@ pub async fn run(
     // the "node runtime ready" banner come up independent of any chain RPC. The
     // provider/store/pending handles built just above are moved into that task.
 
-    let mut tasks = JoinSet::new();
-    // Blacklist compliance watcher (ADR 011/031, issue #1031), spawned near the
-    // top of bring-up so its mandatory first replay + operator-scope pass runs
-    // concurrently with the rest of startup. It evicts held blobs whose hash is
+    // Blacklist compliance watcher (ADR 011/031, issue #1031), spawned early in
+    // bring-up (where the router used to be built) so its mandatory first replay
+    // and operator-scope pass runs concurrently with the rest of startup. It
+    // evicts held blobs whose hash is
     // blacklisted in scope for this operator, which cascades to DHT-announce
     // suppression (the republisher's `is_evicted` gate), probe `has_blob:false`,
     // and delivery refusal — the node's only local protection against the slash
@@ -1150,6 +1150,7 @@ pub async fn run(
     let (metrics_stop_tx, metrics_stop_rx) = oneshot::channel::<()>();
 
     let metrics_handle = Arc::clone(&node_metrics);
+    let mut tasks = JoinSet::new();
     tasks.spawn(async move {
         if let Err(err) = metrics::serve(metrics_listener, metrics_handle, metrics_stop_rx).await {
             tracing::error!(%err, "metrics server exited with error");
@@ -1859,11 +1860,15 @@ pub async fn run(
     // No Probe, Client, DHT, or gossip ALPN is registered before the mandatory
     // first global + operator-region blacklist replay/scope pass succeeds. The
     // gate sits here — after the metrics/admin listeners are bound and every
-    // background task is spawned — so a slow or failed initial sync keeps the
-    // paid-delivery listeners closed WITHOUT taking down observability, the
-    // admin control surface, or the startup banner. The watcher was spawned near
-    // the top of bring-up, so its initial replay runs concurrently and is often
-    // already complete by the time control reaches this gate.
+    // background task is spawned — so a *slow* (still-pending) initial sync keeps
+    // the paid-delivery listeners closed while observability, the admin control
+    // surface, and the startup banner stay up. A *failed* initial sync is
+    // fail-closed the hard way: the gate returns `Err`, `run` propagates it, and
+    // the process exits (tearing those listeners down with it) rather than ever
+    // serving un-vetted content. The watcher was spawned earlier in bring-up
+    // (where the router used to be built), so its initial replay runs
+    // concurrently and is often already complete by the time control reaches
+    // this gate.
     let router = gate_listener_on_blacklist_sync(blacklist_ready_rx, || {
         Router::builder(ep.clone())
             .accept(ProbeHandler::ALPN, probe_handler)
@@ -3238,6 +3243,34 @@ mod tests {
         assert!(
             !started.load(Ordering::SeqCst),
             "listener must remain closed after a failed initial sync"
+        );
+    }
+
+    #[tokio::test]
+    async fn listener_fails_closed_when_watcher_drops_readiness() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // The watcher task died (panicked/aborted) before signaling either
+        // outcome: the gate must treat a dropped sender as a hard failure, not
+        // hang or silently open the listeners.
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let started = Arc::new(AtomicBool::new(false));
+        drop(ready_tx);
+
+        let err = gate_listener_on_blacklist_sync(ready_rx, {
+            let started = Arc::clone(&started);
+            move || started.store(true, Ordering::SeqCst)
+        })
+        .await
+        .expect_err("a dropped readiness channel must fail startup closed");
+
+        assert!(
+            format!("{err:#}").contains("blacklist watcher exited before initial sync completed"),
+            "startup error should explain the watcher exited early: {err:#}"
+        );
+        assert!(
+            !started.load(Ordering::SeqCst),
+            "listener must remain closed when the watcher never reported readiness"
         );
     }
 

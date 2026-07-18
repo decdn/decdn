@@ -572,6 +572,56 @@ mod tests {
         Ok(())
     }
 
+    struct StaticHead(u64);
+
+    #[async_trait::async_trait]
+    impl HeadSource for StaticHead {
+        async fn head(&self) -> Result<u64> {
+            Ok(self.0)
+        }
+    }
+
+    /// The positive counterpart to the failure test: a clean first tick (head
+    /// resolves, the replay window returns no logs, and the empty deny-set
+    /// re-scope is trivially clean) must drive `on_established` and signal `Ok`
+    /// through the real `spawn` wiring. Guards against a hook swap or mis-cloned
+    /// `InitialSyncGate` that would keep every node's listeners closed forever
+    /// while leaving the failure-path test green.
+    #[tokio::test]
+    async fn initial_clean_replay_signals_ready() -> Result<()> {
+        let asserter = alloy::providers::mock::Asserter::new();
+        // One empty `eth_getLogs` for the [from_block, head] replay window; the
+        // head itself comes from the injected `StaticHead`, not the provider.
+        asserter.push_success(&Vec::<Log>::new());
+        let provider = alloy::providers::ProviderBuilder::new().connect_mocked_client(asserter);
+        let tmp = tempfile::tempdir()?;
+        let cache = CacheEngine::open(tmp.path(), Vec::new(), 1).await?;
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+
+        let handle = spawn(
+            provider,
+            Address::repeat_byte(0x11),
+            Address::repeat_byte(0x22),
+            cache,
+            0,
+            Duration::from_secs(1),
+            Arc::new(StaticHead(25)),
+            Duration::from_mins(10),
+            ready_tx,
+        );
+        let readiness = tokio::time::timeout(Duration::from_secs(1), ready_rx)
+            .await
+            .context("watcher did not report initial-sync result")?
+            .context("watcher dropped the readiness channel")?;
+
+        assert!(
+            readiness.is_ok(),
+            "a clean first replay must signal readiness: {readiness:?}"
+        );
+        handle.shutdown();
+        Ok(())
+    }
+
     /// COMPLIANCE PIN: the blacklist watcher must full-replay from the deploy
     /// floor on every boot. A swap to a persisted resume skips past logs whose
     /// entries no longer exist in the in-memory deny-set, silently dropping them
