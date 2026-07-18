@@ -1484,8 +1484,8 @@ pub async fn run(
     let node_origin_self_id = crate::dht::NodeId::from_bytes(*secret_key.public().as_bytes());
     let node_origin_slash_domain = slash_domain;
     // #1117: the `CapacityBond` bind domain this node signs its node→node client
-    // identity binding under — same construction as the serving-side
-    // `bind_domain` (:961) so an upstream verifies against an identical domain.
+    // identity binding under — reuses the serving-side `bind_domain` constructed
+    // once above so an upstream verifies against an identical domain.
     let node_origin_bind_domain = bind_domain;
     let node_origin_config = crate::node_origin::NodeOriginConfig {
         probe_fanout: cfg.cache.node_pull_probe_fanout,
