@@ -688,15 +688,11 @@ pub async fn run(
     // prior behavior). The prefetch enabled gauge is published regardless so
     // dashboards have a uniform schema across enabled/disabled nodes
     // (appendix-observability §Prefetch).
-    // Cancelled by the shutdown sequence so the origin watcher's cancel path
-    // flushes its debounced `CheckpointKey::Origin` cursor (an abort-only
-    // teardown would drop up to a debounce window of scan progress on every
-    // clean stop). Unconditionally cancelled at shutdown; without the
-    // chain-backed directory nothing listens, so that cancel is a no-op.
     // The chain-backed directory's watcher handle, captured before the `Arc<dyn>`
-    // coercion so the ordered graceful stop below can cancel it and *then* flush
-    // the `Origin` scan checkpoint. `None` on the config fallback, which has no
-    // watcher — nothing to stop.
+    // coercion so the ordered graceful stop below can `shutdown()` it and *then*
+    // flush the debounced `CheckpointKey::Origin` cursor (an abort-only teardown
+    // would drop up to a debounce window of scan progress on every clean stop).
+    // `None` on the config fallback, which has no watcher — nothing to stop.
     let (origin_directory, origin_watcher): (
         Arc<dyn crate::dht::origin::OriginDirectory>,
         Option<Arc<crate::chain_events::resumable_watcher::WatcherHandle>>,

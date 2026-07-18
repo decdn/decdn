@@ -279,11 +279,13 @@ impl ChainOriginDirectory {
     /// the `ChainStakerSet` bootstrap (fatal — the prefetch authorized-origin
     /// gate cannot be trusted without a complete snapshot).
     ///
-    /// `shutdown` must be a token the runtime cancels on graceful shutdown: the
-    /// watcher persists its scan cursor through the (debounced)
-    /// `checkpoint_store`, and only the cancel path flushes the buffered tail
-    /// (`CheckpointKey::Origin`) to disk — an abort-only teardown would silently
-    /// drop up to a debounce window of progress on every clean stop.
+    /// The watcher owns its own shutdown token (minted by `resumable_watcher::
+    /// spawn`); the runtime drives graceful stop via the returned directory's
+    /// `watcher()` handle. That path matters here: the watcher
+    /// persists its scan cursor through the (debounced) `checkpoint_store`, and
+    /// only `shutdown()` (not the `AbortOnDrop` backstop) flushes the buffered
+    /// tail (`CheckpointKey::Origin`) to disk — an abort-only teardown would
+    /// silently drop up to a debounce window of progress on every clean stop.
     #[allow(clippy::too_many_arguments)]
     pub async fn bootstrap<P>(
         provider: P,
