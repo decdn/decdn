@@ -300,22 +300,7 @@ async fn idle_connection_is_closed_by_the_app_layer() -> anyhow::Result<()> {
         .await
         .map_err(|_| anyhow::anyhow!("connection was not idle-closed within 10s"))?;
 
-    match err {
-        ConnectionError::ApplicationClosed(ac) => {
-            // `APP_ERR_NO_ERROR` (0x00) — the handler's clean-lifecycle close code.
-            anyhow::ensure!(
-                ac.error_code.into_inner() == 0,
-                "idle close must use the no-error code, got {}",
-                ac.error_code.into_inner()
-            );
-            anyhow::ensure!(
-                ac.reason.as_ref() == b"idle",
-                "idle close reason: {:?}",
-                ac.reason
-            );
-        }
-        other => anyhow::bail!("expected a graceful application idle-close, got {other:?}"),
-    }
+    ensure_graceful_idle_close(&err)?;
 
     // The reap must be metered, not just logged at `debug!` — the counter is the
     // operator's only signal for the streamless-keep-alive abuse pattern (#1193).
@@ -414,21 +399,7 @@ async fn in_flight_stream_defers_idle_close_then_reaps_on_completion() -> anyhow
         .map_err(|_| {
             anyhow::anyhow!("connection was not idle-closed after the stream completed")
         })?;
-    match err {
-        ConnectionError::ApplicationClosed(ac) => {
-            anyhow::ensure!(
-                ac.error_code.into_inner() == 0,
-                "idle close must use the no-error code, got {}",
-                ac.error_code.into_inner()
-            );
-            anyhow::ensure!(
-                ac.reason.as_ref() == b"idle",
-                "idle close reason: {:?}",
-                ac.reason
-            );
-        }
-        other => anyhow::bail!("expected a graceful application idle-close, got {other:?}"),
-    }
+    ensure_graceful_idle_close(&err)?;
 
     // Exactly one connection was reaped, and only after the stream finished.
     let encoded = metrics.encode()?;
