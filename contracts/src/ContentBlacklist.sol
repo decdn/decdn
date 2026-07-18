@@ -207,6 +207,21 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     ///         Blacklisting).
     mapping(address origin => bool) public isOriginBlacklisted;
 
+    /// @notice Monotonic blacklist revision (ADR 011 § Blacklist version), read
+    ///         via `getBlacklistVersion`. Bumped once per change to the enforced
+    ///         blacklist: every hash add, every hash removal, and every
+    ///         appeal-driven suspend/resume, across every path. Nodes cache the
+    ///         last-seen value and re-fetch entry deltas only when it advances,
+    ///         replacing a full event replay from the deploy block with an O(1)
+    ///         version check.
+    /// @dev    Bumped in the three internal choke points `_addHash`,
+    ///         `_removeHashRegional`, and `_setEntrySuspended`, which every
+    ///         add/remove/suspend funnels through, so no call site has to
+    ///         remember to increment it. Deliberately not a `public` auto-getter:
+    ///         ADR 011 names the accessor `getBlacklistVersion()`, and an
+    ///         auto-getter would be `_blacklistVersion()`.
+    uint256 internal _blacklistVersion;
+
     // -----------------------------------------------------------------
     // Storage — appeals
     // -----------------------------------------------------------------
@@ -477,6 +492,22 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         return _hashEntries[region][hash];
     }
 
+    /// @notice Current blacklist revision (ADR 011 § Blacklist version) —
+    ///         monotonically increasing, bumped once per change to the enforced
+    ///         blacklist: every hash add, every hash removal, and every
+    ///         appeal-driven suspend/resume. An O(1) poll target: a caller whose
+    ///         cached value still matches knows the set of hashes it must
+    ///         enforce is unchanged and can skip fetching deltas entirely.
+    /// @dev    Suspension counts because it flips what `isBlacklisted` reports
+    ///         (`_isLive` is `addedAt != 0 && !suspended`), so a poller that
+    ///         missed it would over-enforce a suspended hash and — worse —
+    ///         under-enforce a resumed one. ADR 011 § 248 and § 325 specify
+    ///         operators detect appeal resumption off this poll cycle. All
+    ///         toggles funnel through `_setEntrySuspended`.
+    function getBlacklistVersion() external view returns (uint256) {
+        return _blacklistVersion;
+    }
+
     // -----------------------------------------------------------------
     // Appeals (ADR 031)
     // -----------------------------------------------------------------
@@ -633,7 +664,7 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         a.status = AppealStatus.FastTracked;
         regionActiveReliefCount[region] += 1;
         filerRegionActiveRelief[region][filer] += 1;
-        _hashEntries[region][a.hash].suspended = true;
+        _setEntrySuspended(region, a.hash, true);
         emit BlacklistAppealFastTracked(appealId);
     }
 
@@ -641,7 +672,7 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         BlacklistAppeal storage a = _appeals[appealId];
         if (a.status != AppealStatus.Open && a.status != AppealStatus.FastTracked) revert AppealNotOpen(appealId);
         if (a.status == AppealStatus.FastTracked) {
-            _hashEntries[a.region][a.hash].suspended = false;
+            _setEntrySuspended(a.region, a.hash, false);
             // Only fast-tracked appeals charge the relief caps (M-1); release both tiers.
             if (regionActiveReliefCount[a.region] != 0) regionActiveReliefCount[a.region] -= 1;
             if (filerRegionActiveRelief[a.region][a.filer] != 0) filerRegionActiveRelief[a.region][a.filer] -= 1;
@@ -672,7 +703,7 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         perjuryDenylistUntilAt[a.filer] = until;
 
         if (a.status == AppealStatus.FastTracked) {
-            _hashEntries[a.region][a.hash].suspended = false;
+            _setEntrySuspended(a.region, a.hash, false);
             // Only fast-tracked appeals charge the relief caps (M-1); release both tiers.
             if (regionActiveReliefCount[a.region] != 0) regionActiveReliefCount[a.region] -= 1;
             if (filerRegionActiveRelief[a.region][a.filer] != 0) filerRegionActiveRelief[a.region][a.filer] -= 1;
@@ -715,7 +746,7 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         uint256 bondBurned = a.bond;
         a.bond = 0;
         a.status = AppealStatus.Reversed;
-        _hashEntries[a.region][a.hash].suspended = false;
+        _setEntrySuspended(a.region, a.hash, false);
         if (regionActiveReliefCount[a.region] != 0) regionActiveReliefCount[a.region] -= 1;
         if (filerRegionActiveRelief[a.region][a.filer] != 0) filerRegionActiveRelief[a.region][a.filer] -= 1;
         hasActiveAppeal[a.region][a.hash] = false;
@@ -776,7 +807,7 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         // is already gone (condition c on a fast-tracked appeal), there is no
         // `suspended` flag to clear — the slot release still applies.
         if (status == AppealStatus.FastTracked) {
-            if (!entryGone) _hashEntries[region][hash].suspended = false;
+            if (!entryGone) _setEntrySuspended(region, hash, false);
             if (regionActiveReliefCount[region] != 0) regionActiveReliefCount[region] -= 1;
             if (filerRegionActiveRelief[region][filer] != 0) filerRegionActiveRelief[region][filer] -= 1;
         }
@@ -857,6 +888,9 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         e.addedAt = uint64(block.timestamp);
         e.suspended = false;
         hashReason[region][hash] = reason;
+        unchecked {
+            ++_blacklistVersion;
+        }
         emit HashBlacklisted(region, hash, reason);
     }
 
@@ -865,7 +899,25 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         if (e.addedAt == 0) revert EntryNotBlacklisted(region, hash);
         delete _hashEntries[region][hash];
         delete hashReason[region][hash];
+        unchecked {
+            ++_blacklistVersion;
+        }
         emit HashRemoved(region, hash);
+    }
+
+    /// @dev The single choke point for the appeal-driven `suspended` toggle, so
+    ///      no appeal path has to remember to bump the version. Suspension flips
+    ///      what `_isLive` (and therefore `isBlacklisted`) reports, so it changes
+    ///      the enforced blacklist exactly as an add/remove does; ADR 011 § 248
+    ///      and § 325 have operators detect appeal resumption off the
+    ///      `getBlacklistVersion()` poll cycle, which only holds if the toggle
+    ///      bumps the counter. Callers must have already checked that the entry
+    ///      exists — the flag is meaningless on a deleted entry.
+    function _setEntrySuspended(bytes32 region, bytes32 hash, bool suspended) internal {
+        _hashEntries[region][hash].suspended = suspended;
+        unchecked {
+            ++_blacklistVersion;
+        }
     }
 
     /// @dev Reads storage directly to avoid the `storage → memory` flagged
