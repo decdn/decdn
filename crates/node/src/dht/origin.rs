@@ -12,14 +12,18 @@
 //!
 //! This trait abstracts the directory so the iterative-lookup module
 //! consumes a single `lookup_origins(hash) -> Vec<NodeId>` call without
-//! caring whether the implementation reads from chain (production), an
-//! operator-supplied file (initial-network bootstrap), or a mock (tests).
+//! caring whether the implementation resolves from chain (production) or
+//! from an in-memory map (fallback and tests).
 //!
 //! Two implementations exist:
 //!
-//! - [`crate::dht::ChainOriginDirectory`] — the production path. Reads
-//!   the resolution chain above from RPC, serving lookups from an
-//!   event-fed in-memory cache.
+//! - [`crate::dht::ChainOriginDirectory`] — the production path. It yields
+//!   the same candidate set the chain above specifies, but does not perform
+//!   that literal call sequence: the `hash → namespace` view is replayed
+//!   from `ContentClaimed` logs rather than read via `namespaceOf`, and the
+//!   `active` filter is applied from the shared `StakerSet` at lookup time
+//!   rather than taken from the `nodeIdOf` tuple. Lookups are served from
+//!   an event-fed in-memory cache and never hit RPC.
 //! - [`ConfigOriginDirectory`] (this module) — the in-memory fallback,
 //!   used when the chain contracts aren't configured and by tests.
 //!
