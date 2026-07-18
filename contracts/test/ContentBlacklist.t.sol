@@ -171,11 +171,11 @@ contract ContentBlacklistTest is Test {
         assertEq(blacklist.getBlacklistVersion(), 5);
     }
 
-    /// @notice The counter must not move for anything that is not a hash
-    ///         add/remove: operator + origin blacklisting, governance setters,
-    ///         reads, and the appeal-driven `suspended` toggle (a per-entry
-    ///         liveness flag observable via `getHashEntry`, not an entry-set
-    ///         change). A spurious bump would cost every node a delta fetch.
+    /// @notice The counter must not move for anything that leaves the enforced
+    ///         hash set alone: operator + origin blacklisting, governance
+    ///         setters, and reads. A spurious bump costs every node a delta
+    ///         fetch. (The `suspended` toggle DOES move it — it changes what
+    ///         `isBlacklisted` reports; see the two suspension tests below.)
     function test_getBlacklistVersion_unaffectedByNonEntryOperations() public {
         vm.prank(regionalBody);
         blacklist.addHashRegional(REGION_US, SAMPLE_HASH, "DMCA-TEST");
@@ -196,22 +196,67 @@ contract ContentBlacklistTest is Test {
         blacklist.getHashEntry(REGION_US, SAMPLE_HASH);
         assertEq(blacklist.getBlacklistVersion(), versionAfterAdd);
 
-        // Fast-track suspends the entry without removing it — no bump.
+        // Merely filing an appeal changes nothing enforceable — no bump.
         vm.prank(filer);
         uint256 appealId = blacklist.openBlacklistAppeal(
             SAMPLE_HASH, REGION_US, bytes32("evidence"), ContentBlacklist.StandingPath.Operator, 0
         );
         assertEq(blacklist.getBlacklistVersion(), versionAfterAdd);
+
+        // Ratification removes the entry, so that one bumps.
         vm.prank(multisig);
         blacklist.fastTrackBlacklistAppeal(appealId);
-        assertTrue(blacklist.getHashEntry(REGION_US, SAMPLE_HASH).suspended);
-        assertEq(blacklist.getBlacklistVersion(), versionAfterAdd);
-
-        // Ratification DOES remove the entry, so that one bumps.
+        uint256 versionAfterSuspend = blacklist.getBlacklistVersion();
         vm.prank(admin);
         blacklist.ratifyBlacklistAppealRemoval(appealId);
         assertEq(blacklist.getHashEntry(REGION_US, SAMPLE_HASH).addedAt, 0);
+        assertEq(blacklist.getBlacklistVersion(), versionAfterSuspend + 1);
+    }
+
+    /// @notice Suspension flips `isBlacklisted` to false, so it must bump the
+    ///         counter — a node that missed it would keep enforcing a hash the
+    ///         contract no longer considers blacklisted, blocking content and
+    ///         exposing operators to slashing for serving it.
+    function test_getBlacklistVersion_bumpsOnSuspend() public {
+        vm.prank(regionalBody);
+        blacklist.addHashRegional(REGION_US, SAMPLE_HASH, "DMCA-TEST");
+        uint256 versionAfterAdd = blacklist.getBlacklistVersion();
+
+        vm.prank(filer);
+        uint256 appealId = blacklist.openBlacklistAppeal(
+            SAMPLE_HASH, REGION_US, bytes32("evidence"), ContentBlacklist.StandingPath.Operator, 0
+        );
+        vm.prank(multisig);
+        blacklist.fastTrackBlacklistAppeal(appealId);
+
+        assertTrue(blacklist.getHashEntry(REGION_US, SAMPLE_HASH).suspended);
+        assertFalse(blacklist.isHashBlacklistedInRegion(SAMPLE_HASH, REGION_US));
         assertEq(blacklist.getBlacklistVersion(), versionAfterAdd + 1);
+    }
+
+    /// @notice Resumption re-arms enforcement, and ADR 011 § 248 / § 325 have
+    ///         operators detect it off exactly this counter. Without the bump a
+    ///         node would silently under-enforce a live entry — the compliance
+    ///         failure the poll cycle exists to prevent.
+    function test_getBlacklistVersion_bumpsOnResume() public {
+        vm.prank(regionalBody);
+        blacklist.addHashRegional(REGION_US, SAMPLE_HASH, "DMCA-TEST");
+        uint256 versionAfterAdd = blacklist.getBlacklistVersion();
+
+        vm.prank(filer);
+        uint256 appealId = blacklist.openBlacklistAppeal(
+            SAMPLE_HASH, REGION_US, bytes32("evidence"), ContentBlacklist.StandingPath.Operator, 0
+        );
+        vm.prank(multisig);
+        blacklist.fastTrackBlacklistAppeal(appealId);
+
+        // Reversal clears `suspended`: the entry is enforced again.
+        vm.prank(admin);
+        blacklist.reverseBlacklistAppeal(appealId);
+
+        assertFalse(blacklist.getHashEntry(REGION_US, SAMPLE_HASH).suspended);
+        assertTrue(blacklist.isHashBlacklistedInRegion(SAMPLE_HASH, REGION_US));
+        assertEq(blacklist.getBlacklistVersion(), versionAfterAdd + 2);
     }
 
     function test_addOperator_callsEjectOnCapacityBond() public {
