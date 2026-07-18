@@ -12,12 +12,12 @@
 //! This is a different layer from the *bundle* manifest in
 //! [`super::bundle_pull`] (`appendix-bundles.md` § Non-relationship to ADR 012's
 //! `DECDNMAN` chunk manifest). That one is JSON, publisher-side, and
-//! **inter-file**: it maps
-//! relative paths to blob hashes across a directory. This one is postcard,
-//! ingest-side, and **intra-file**: it maps chunk indices to blob hashes within
-//! one file. They compose — a bundle entry's `hash` may itself name a
-//! `DECDNMAN` manifest — but they are separate types with separate magic, hence
-//! the deliberately distinct `FileManifest` / `Manifest` naming.
+//! **inter-file**: it maps relative paths to blob hashes across a directory.
+//! This one is postcard, ingest-side, and **intra-file**: it maps chunk indices
+//! to blob hashes within one file. They compose — a bundle entry's `hash` may
+//! itself name a `DECDNMAN` manifest — but they are separate types with separate
+//! framing (the bundle manifest is JSON with a `version` field and no magic),
+//! hence the deliberately distinct `FileManifest` / `Manifest` naming.
 //!
 //! # Backward compatibility
 //!
@@ -26,7 +26,6 @@
 //! so raw single-blob downloads are untouched by this path.
 
 use std::future::Future;
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, bail};
@@ -39,6 +38,16 @@ pub(crate) const MAGIC: [u8; 8] = *b"DECDNMAN";
 
 /// The only manifest version this build understands.
 pub(crate) const VERSION: u8 = 1;
+
+/// Upper bound on the chunk count a manifest may declare.
+///
+/// Every chunk is a separate *paid* sequential pull, so an over-large list is a
+/// way to spend someone else's channel balance. `--max-blob-mb` bounds the
+/// manifest blob itself (1024 MiB by default), but at ~34 bytes per encoded
+/// [`ChunkEntry`] that still leaves room for tens of millions of chunks. ADR 012
+/// sizes the format for "10,000-chunk files", so this is three orders of
+/// magnitude of headroom over the documented scale.
+pub(crate) const MAX_CHUNKS: usize = 1_000_000;
 
 /// A chunked file's manifest (ADR 012 § Manifest format).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,7 +62,8 @@ pub(crate) struct FileManifest {
     pub mime_type: String,
     /// Basename hint, empty if not provided.
     pub filename: String,
-    /// Chunks in file order; the last one is partial.
+    /// Chunks in file order; the last one is typically partial (a file whose
+    /// size is an exact multiple of the chunk size ends on a full one).
     pub chunks: Vec<ChunkEntry>,
 }
 
@@ -82,8 +92,19 @@ pub(crate) fn sniff(bytes: &[u8]) -> Option<anyhow::Result<FileManifest>> {
 
 /// Deserialise + validate manifest bytes whose magic already matched.
 fn decode(bytes: &[u8]) -> anyhow::Result<FileManifest> {
-    let manifest: FileManifest =
-        postcard::from_bytes(bytes).context("decode DECDNMAN file manifest")?;
+    // `take_from_bytes` rather than `from_bytes`: the latter ignores trailing
+    // input, so a manifest with garbage appended would decode happily. The blob
+    // was fetched by hash so integrity holds either way, but this module's whole
+    // posture is that a blob claiming to be a manifest and failing to be one is
+    // an error rather than something to paper over.
+    let (manifest, rest): (FileManifest, &[u8]) =
+        postcard::take_from_bytes(bytes).context("decode DECDNMAN file manifest")?;
+    if !rest.is_empty() {
+        bail!(
+            "file manifest has {} trailing byte(s) after a complete record",
+            rest.len()
+        );
+    }
     if manifest.magic != MAGIC {
         bail!("file manifest magic mismatch after decode (truncated or corrupt blob)");
     }
@@ -91,6 +112,31 @@ fn decode(bytes: &[u8]) -> anyhow::Result<FileManifest> {
         bail!(
             "unsupported file manifest version {} (this build supports v{VERSION})",
             manifest.version
+        );
+    }
+    if manifest.chunks.len() > MAX_CHUNKS {
+        bail!(
+            "file manifest declares {} chunks, over the {MAX_CHUNKS} limit",
+            manifest.chunks.len()
+        );
+    }
+    // A zero-size chunk costs a part file and a pull but contributes nothing.
+    // The empty blob is trivially present in iroh-blobs, so such a pull always
+    // "succeeds" — millions of them would be a file-creation storm that every
+    // other check here would wave through.
+    if let Some(index) = manifest.chunks.iter().position(|c| c.size == 0) {
+        bail!("file manifest chunk {index} declares zero bytes");
+    }
+    // `filename` is a basename *hint* and is not used as a path today. Reject a
+    // path-bearing one at the door so it cannot become a traversal vector the
+    // day someone wires it up to a default output name.
+    if manifest.filename.contains('/')
+        || manifest.filename.contains('\\')
+        || matches!(manifest.filename.as_str(), "." | "..")
+    {
+        bail!(
+            "file manifest filename {:?} is not a bare basename",
+            manifest.filename
         );
     }
     // The chunk sizes are what reconstruction actually concatenates, so a
@@ -111,10 +157,17 @@ fn decode(bytes: &[u8]) -> anyhow::Result<FileManifest> {
     Ok(manifest)
 }
 
-/// Root of the per-manifest chunk part directories: `~/.decdn/downloads`
+/// Root of the per-manifest chunk part directories: `<data_dir>/downloads`
 /// (ADR 012 § Download flow).
-pub(crate) fn downloads_root() -> PathBuf {
-    decdn_common::cli::common::expand_tilde(Path::new("~/.decdn/downloads"))
+///
+/// Derived from the resolved client data dir rather than a hardcoded
+/// `~/.decdn/downloads` so that `--data-dir`/`identity.data_dir` governs where
+/// parts land. They share a root with the buyer-channel store, which matters
+/// because a chunked download is the largest thing the client writes — hundreds
+/// of GB — and silently ignoring an explicit `--data-dir` for it would be a
+/// surprise.
+pub(crate) fn downloads_root(data_dir: &Path) -> PathBuf {
+    data_dir.join("downloads")
 }
 
 /// Lowercase hex of a BLAKE3 digest — the per-manifest part-directory name.
@@ -149,32 +202,62 @@ where
     Fut: Future<Output = anyhow::Result<Vec<u8>>>,
 {
     let part_dir = downloads_root.join(hex(&manifest_hash));
-    std::fs::create_dir_all(&part_dir)
-        .with_context(|| format!("create part dir {}", part_dir.display()))?;
+    blocking(
+        {
+            let dir = part_dir.clone();
+            move || std::fs::create_dir_all(&dir)
+        },
+        || format!("create part dir {}", part_dir.display()),
+    )
+    .await?;
 
     let total = manifest.chunks.len();
     let mut parts = Vec::with_capacity(total);
     for (index, chunk) in manifest.chunks.iter().enumerate() {
         let part = part_dir.join(format!("chunk-{index}.part"));
-        if !part_is_verified(&part, chunk) {
+        // Hashing a 256 MiB part is far too long to sit on the executor:
+        // `bundle pull` polls every entry from ONE task (`buffer_unordered`, no
+        // `tokio::spawn` because `probe_once` is not `Send`), so blocking here
+        // stalls every sibling entry — and their stall deadlines are wall-clock
+        // timers that elapse unpolled and fire the instant we yield.
+        let verified = {
+            let (part, chunk) = (part.clone(), chunk.clone());
+            tokio::task::spawn_blocking(move || part_is_verified(&part, &chunk))
+                .await
+                .context("verify cached chunk part")?
+        };
+        if !verified {
             let bytes = fetch_chunk(chunk.hash)
                 .await
                 .with_context(|| format!("fetch chunk {}/{total}", index + 1))?;
             verify_chunk(&bytes, chunk, index)?;
-            super::fetch::write_blob_atomic(&part, &bytes)
-                .with_context(|| format!("write {}", part.display()))?;
+            blocking(
+                {
+                    let part = part.clone();
+                    move || super::fetch::write_blob_atomic(&part, &bytes)
+                },
+                || format!("write {}", part.display()),
+            )
+            .await?;
         }
         parts.push(part);
     }
 
-    let written = concat_parts(&parts, output)
-        .with_context(|| format!("reconstruct into {}", output.display()))?;
-    if written != manifest.total_bytes {
-        bail!(
-            "reconstructed {written} bytes but the manifest declares {}",
-            manifest.total_bytes
-        );
-    }
+    // The length check lives inside `concat_parts`, before it renames anything
+    // into place: a mismatch must leave `output` untouched rather than publish
+    // wrong bytes under the final name and merely *report* failure. `bundle
+    // pull`'s skip-existing would treat such a file as verified-good forever,
+    // and this module already pins "no output on a failed verification" for the
+    // BLAKE3 path.
+    let expected = manifest.total_bytes;
+    let written = blocking(
+        {
+            let (parts, output) = (parts.clone(), output.to_path_buf());
+            move || concat_parts(&parts, &output, expected)
+        },
+        || format!("reconstruct into {}", output.display()),
+    )
+    .await?;
 
     if !keep_blobs {
         // Best-effort: the file is already reconstructed and verified, so a
@@ -184,31 +267,89 @@ where
                 eprintln!("warning: could not remove {}: {e}", part.display());
             }
         }
-        let _ = std::fs::remove_dir(&part_dir);
+        // Not `let _ =`: `write_blob_atomic` stages its temp file *inside* this
+        // directory, so a run killed mid-write leaves an orphan `.tmp` that the
+        // loop above never sees. `remove_dir` then fails `ENOTEMPTY` — and since
+        // nothing ever GCs the downloads root, a silent failure here is a leak
+        // that the user asked us specifically to avoid.
+        if let Err(e) = std::fs::remove_dir(&part_dir) {
+            eprintln!(
+                "warning: could not remove part dir {} ({e}); leftover files may remain",
+                part_dir.display()
+            );
+        }
     }
     Ok(written)
 }
 
+/// Run a blocking filesystem call on the blocking pool, flattening the join
+/// error and attaching `context` to the inner failure.
+async fn blocking<T, E, F, C>(f: F, context: impl FnOnce() -> C) -> anyhow::Result<T>
+where
+    F: FnOnce() -> Result<T, E> + Send + 'static,
+    T: Send + 'static,
+    E: Into<anyhow::Error> + Send + 'static,
+    C: std::fmt::Display + Send + Sync + 'static,
+{
+    match tokio::task::spawn_blocking(f).await {
+        Ok(inner) => inner.map_err(Into::into).with_context(context),
+        Err(join) => Err(anyhow::Error::new(join)).with_context(context),
+    }
+}
+
 /// Whether an existing part file already holds this chunk's verified bytes.
-/// Any read/IO problem simply means "not verified" — the chunk is re-fetched.
+/// Anything else means "not verified" — the chunk is re-fetched.
 ///
-/// The declared size is checked from the directory entry *before* hashing: a
+/// The declared size is checked from the file's metadata *before* hashing: a
 /// truncated part from an interrupted run is the common case here, and chunks
-/// are 256 MiB, so reading one only to reject it on length is a wasted pass.
+/// are large, so reading one only to reject it on length is a wasted pass.
+///
+/// Only a missing part is silent. Every other failure is warned about, because
+/// re-fetching is not free: it is a *paid* transfer of up to a whole chunk, and
+/// retention is sold on the promise of not re-paying for bytes already held. A
+/// bad sector that silently costs the user money on every run is exactly the
+/// failure this warning exists to make visible.
 fn part_is_verified(part: &Path, chunk: &ChunkEntry) -> bool {
-    let Ok(mut file) = std::fs::File::open(part) else {
-        return false;
+    let warn = |what: &str, e: &dyn std::fmt::Display| {
+        eprintln!(
+            "warning: {what} for cached chunk {} ({e}); re-fetching it (a paid transfer)",
+            part.display()
+        );
     };
-    if !file.metadata().is_ok_and(|m| m.len() == chunk.size) {
-        return false;
+
+    let mut file = match std::fs::File::open(part) {
+        Ok(f) => f,
+        // The part simply isn't there yet: the ordinary first-run path.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(e) => {
+            warn("cannot open", &e);
+            return false;
+        }
+    };
+    match file.metadata() {
+        Ok(m) if m.len() == chunk.size => {}
+        // A short part is an interrupted write, not a fault — stay quiet.
+        Ok(_) => return false,
+        Err(e) => {
+            warn("cannot stat", &e);
+            return false;
+        }
     }
     let mut hasher = blake3::Hasher::new();
-    // `update_reader` over `io::copy`: it owns its buffering and retries
-    // interrupted reads rather than surfacing them as a verification failure.
-    if hasher.update_reader(&mut file).is_err() {
+    // `update_reader` over `io::copy`: it owns a 64 KiB buffer sized for the
+    // hasher's block processing, rather than round-tripping through `Hasher`'s
+    // `Write` impl. (Both retry `ErrorKind::Interrupted`, so that is not the
+    // distinction.)
+    if let Err(e) = hasher.update_reader(&mut file) {
+        warn("cannot read", &e);
         return false;
     }
-    *hasher.finalize().as_bytes() == chunk.hash
+    if *hasher.finalize().as_bytes() != chunk.hash {
+        // Right size, wrong bytes: corruption or tampering, not a partial write.
+        warn("BLAKE3 mismatch", &"cached bytes do not match the manifest");
+        return false;
+    }
+    true
 }
 
 /// Check freshly-fetched chunk bytes against the manifest's hash and size.
@@ -232,20 +373,23 @@ fn verify_chunk(bytes: &[u8], chunk: &ChunkEntry, index: usize) -> anyhow::Resul
 }
 
 /// Stream `parts` in order into `output`, written atomically (temp-in-dir then
-/// rename). Streamed rather than buffered: a manifest's chunks are 256 MiB each
-/// and the whole point is that the file need not fit in memory.
-fn concat_parts(parts: &[PathBuf], output: &Path) -> std::io::Result<u64> {
-    let parent = output.parent().filter(|p| !p.as_os_str().is_empty());
-    let mut tmp = match parent {
-        Some(p) => tempfile::NamedTempFile::new_in(p)?,
-        None => tempfile::NamedTempFile::new_in(".")?,
-    };
+/// rename). Streamed rather than buffered: a manifest's chunks are large and the
+/// whole point is that the file need not fit in memory.
+///
+/// `expected` is checked against the concatenated length *before* the rename, so
+/// a mismatch destroys the temp file and leaves `output` as it was.
+fn concat_parts(parts: &[PathBuf], output: &Path, expected: u64) -> anyhow::Result<u64> {
+    let mut tmp = super::fetch::temp_in_parent(output)?;
     let mut written = 0u64;
     for part in parts {
-        let mut src = std::io::BufReader::new(std::fs::File::open(part)?);
+        let mut src = std::io::BufReader::new(
+            std::fs::File::open(part).with_context(|| format!("open {}", part.display()))?,
+        );
         written = written.saturating_add(std::io::copy(&mut src, tmp.as_file_mut())?);
     }
-    tmp.flush()?;
+    if written != expected {
+        bail!("reconstructed {written} bytes but the manifest declares {expected}");
+    }
     tmp.as_file().sync_all()?;
     tmp.persist(output).map_err(|e| e.error)?;
     Ok(written)
@@ -532,5 +676,109 @@ mod tests {
         let blob = postcard::to_allocvec(&manifest).unwrap();
         let err = sniff(&blob).expect("magic matches").unwrap_err();
         assert!(format!("{err:#}").contains("disagrees"), "{err:#}");
+    }
+
+    /// Every chunk is a separate *paid* pull, so the chunk count is a spending
+    /// bound, not just a memory one.
+    #[test]
+    fn a_chunk_list_over_the_cap_is_rejected() {
+        let (mut manifest, _) = manifest_for(&[b"x"]);
+        manifest.chunks = vec![
+            ChunkEntry {
+                hash: [0u8; 32],
+                size: 1,
+            };
+            MAX_CHUNKS + 1
+        ];
+        manifest.total_bytes = manifest.chunks.len() as u64;
+        let blob = postcard::to_allocvec(&manifest).unwrap();
+        let err = sniff(&blob).expect("magic matches").unwrap_err();
+        assert!(format!("{err:#}").contains("over the"), "{err:#}");
+    }
+
+    /// A zero-size chunk costs a part file and a pull but contributes nothing,
+    /// and the empty blob is trivially present, so such pulls always "succeed".
+    #[test]
+    fn a_zero_size_chunk_is_rejected() {
+        let (mut manifest, _) = manifest_for(&[b"abc"]);
+        manifest.chunks.push(ChunkEntry {
+            hash: *blake3::hash(b"").as_bytes(),
+            size: 0,
+        });
+        let blob = postcard::to_allocvec(&manifest).unwrap();
+        let err = sniff(&blob).expect("magic matches").unwrap_err();
+        assert!(format!("{err:#}").contains("zero bytes"), "{err:#}");
+    }
+
+    /// `from_bytes` would ignore trailing input; a blob claiming to be a
+    /// manifest and only partly being one is an error, not something to accept.
+    #[test]
+    fn trailing_bytes_after_the_record_are_rejected() {
+        let (_, mut blob) = manifest_for(&[b"abc"]);
+        blob.extend_from_slice(b"junk");
+        let err = sniff(&blob).expect("magic matches").unwrap_err();
+        assert!(format!("{err:#}").contains("trailing"), "{err:#}");
+    }
+
+    /// `filename` is a basename hint today, but it is exactly the field someone
+    /// will later wire to a default output name. Reject traversal at the door.
+    #[test]
+    fn a_path_bearing_filename_is_rejected() {
+        for evil in ["../../etc/passwd", "sub/dir.bin", "..", r"back\slash"] {
+            let (mut manifest, _) = manifest_for(&[b"abc"]);
+            manifest.filename = evil.to_string();
+            let blob = postcard::to_allocvec(&manifest).unwrap();
+            let err = sniff(&blob).expect("magic matches").unwrap_err();
+            assert!(
+                format!("{err:#}").contains("not a bare basename"),
+                "{evil}: {err:#}"
+            );
+        }
+    }
+
+    /// A length mismatch must not publish bytes under the final name. `bundle
+    /// pull`'s skip-existing treats a present file as verified-good, so a
+    /// corrupt file left at `output` would be skipped on every later run.
+    #[tokio::test]
+    async fn a_length_mismatch_leaves_no_output_file() {
+        let chunks: [&[u8]; 2] = [b"one", b"two"];
+        let (mut manifest, blob) = manifest_for(&chunks);
+        let hash = *blake3::hash(&blob).as_bytes();
+        // Only reachable by constructing the struct directly: `decode` proves
+        // `total_bytes == sum(chunk.size)`, so this models a part mutating
+        // between verification and concatenation.
+        manifest.total_bytes = 99;
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out.bin");
+        std::fs::write(&out, b"pre-existing").unwrap();
+        let src = Source::new(&chunks);
+
+        let err = reconstruct(
+            &manifest,
+            hash,
+            &dir.path().join("downloads"),
+            &out,
+            true,
+            |h| src.get(h),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("but the manifest declares"),
+            "{err:#}"
+        );
+        // The prior contents survive: the temp file was dropped, never renamed.
+        assert_eq!(std::fs::read(&out).unwrap(), b"pre-existing");
+    }
+
+    /// Part files follow the resolved data dir so `--data-dir` governs where a
+    /// multi-hundred-GB reconstruction lands.
+    #[test]
+    fn downloads_root_is_data_dir_relative() {
+        assert_eq!(
+            downloads_root(Path::new("/custom/data")),
+            Path::new("/custom/data/downloads")
+        );
     }
 }
