@@ -28,8 +28,8 @@ use decdn_incentive::{
 };
 
 use crate::bindings::{
-    AccessControl, CapacityBond, ContentBlacklist, DecdnGovernor, Erc20, PublisherRegistry,
-    SlashAppeal, SlashJudge, TimelockController,
+    AccessControl, CapacityBond, ContentBlacklist, DecdnGovernor, Erc20, OriginAssignment,
+    PublisherRegistry, SlashAppeal, SlashJudge, TimelockController,
 };
 
 /// Base for the per-fixture chain id. Each `ChainFixture` derives its chain id
@@ -443,6 +443,115 @@ impl ChainFixture {
         // trust it once the real transaction is confirmed non-reverted.
         crate::ensure_mined(&receipt, "createNamespace")?;
         Ok(id)
+    }
+
+    /// Governance-seat one active operator in namespace 0's default-open set.
+    pub async fn add_default_open_operator(&self, operator: Address) -> anyhow::Result<()> {
+        self.impersonate(self.addrs.timelock).await?;
+        let raw = self.raw_provider();
+        let receipt = OriginAssignment::new(self.addrs.origin_assignment, &raw)
+            .addDefaultOpenOperator(operator)
+            .from(self.addrs.timelock)
+            .send()
+            .await
+            .context("addDefaultOpenOperator send")?
+            .get_receipt()
+            .await
+            .context("addDefaultOpenOperator receipt")?;
+        crate::ensure_mined(&receipt, "addDefaultOpenOperator")
+    }
+
+    /// Current authorized-origin addresses for `namespace` (0 = default-open).
+    pub async fn origins(&self, namespace: U256) -> anyhow::Result<Vec<Address>> {
+        OriginAssignment::new(self.addrs.origin_assignment, &self.admin)
+            .getOrigins(namespace)
+            .call()
+            .await
+            .context("getOrigins")
+    }
+
+    /// Publisher namespaces currently claiming `hash` (empty means default-open).
+    pub async fn content_namespaces(&self, hash: B256) -> anyhow::Result<Vec<U256>> {
+        PublisherRegistry::new(self.addrs.publisher_registry, &self.admin)
+            .namespaceOf(hash)
+            .call()
+            .await
+            .context("namespaceOf")
+    }
+
+    /// Whether `operator` is authorized for `namespace` in chain truth.
+    pub async fn is_authorized_origin(
+        &self,
+        namespace: U256,
+        operator: Address,
+    ) -> anyhow::Result<bool> {
+        OriginAssignment::new(self.addrs.origin_assignment, &self.admin)
+            .isAuthorizedOrigin(namespace, operator)
+            .call()
+            .await
+            .context("isAuthorizedOrigin")
+    }
+
+    /// Claim `hash` into `namespace` as its publisher owner.
+    pub async fn claim_content(
+        &self,
+        owner: &PrivateKeySigner,
+        namespace: U256,
+        hash: B256,
+    ) -> anyhow::Result<()> {
+        let provider = self.provider_for(owner);
+        let receipt = PublisherRegistry::new(self.addrs.publisher_registry, &provider)
+            .claimContent(namespace, hash)
+            .send()
+            .await
+            .context("claimContent send")?
+            .get_receipt()
+            .await
+            .context("claimContent receipt")?;
+        crate::ensure_mined(&receipt, "claimContent")
+    }
+
+    /// Propose the registered namespace's replacement origin set as its owner.
+    pub async fn propose_assignment(
+        &self,
+        owner: &PrivateKeySigner,
+        namespace: U256,
+        operators: &[Address],
+    ) -> anyhow::Result<()> {
+        let provider = self.provider_for(owner);
+        let receipt = OriginAssignment::new(self.addrs.origin_assignment, &provider)
+            .proposeAssignment(namespace, operators.to_vec())
+            .send()
+            .await
+            .context("proposeAssignment send")?
+            .get_receipt()
+            .await
+            .context("proposeAssignment receipt")?;
+        crate::ensure_mined(&receipt, "proposeAssignment")
+    }
+
+    /// Advance past the assignment delay, then activate as the governance Timelock.
+    pub async fn activate_assignment_after_timelock(&self, namespace: U256) -> anyhow::Result<()> {
+        let assignment = OriginAssignment::new(self.addrs.origin_assignment, &self.admin);
+        let delay = assignment
+            .assignmentTimelock()
+            .call()
+            .await
+            .context("read assignmentTimelock")?;
+        crate::time::increase_time(&self.admin, delay.to::<u64>() + 1).await?;
+
+        self.impersonate(self.addrs.timelock).await?;
+        let raw = self.raw_provider();
+        let receipt = OriginAssignment::new(self.addrs.origin_assignment, &raw)
+            .activateAssignment(namespace)
+            .from(self.addrs.timelock)
+            .send()
+            .await
+            .context("activateAssignment send")?
+            .get_receipt()
+            .await
+            .context("activateAssignment receipt")?;
+        crate::ensure_mined(&receipt, "activateAssignment")
     }
 
     /// Current `FeeRouter.bytesPerEpoch(operator)` for the epoch at the chain's

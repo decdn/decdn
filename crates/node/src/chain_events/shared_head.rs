@@ -327,7 +327,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn watchers_sharing_one_head_collapse_the_block_number_reads() {
-        use super::super::resumable_watcher::{self, CursorPolicy, WatcherConfig};
+        use super::super::resumable_watcher::{self, CursorStart, WatcherConfig};
         use alloy::rpc::types::Filter;
         use std::sync::atomic::Ordering;
         use tokio_util::sync::CancellationToken;
@@ -349,20 +349,20 @@ mod tests {
                     from_block: 0,
                     poll_interval: INTERVAL,
                     max_backfill_span: 10_000,
-                    cursor: CursorPolicy::HeadMinusWindow {
-                        window_blocks: 0,
-                        floor: 0,
-                    },
+                    start: CursorStart::HeadMinusWindow { window_blocks: 0 },
                     initial_backoff: Duration::from_millis(10),
                     max_backoff: Duration::from_millis(10),
                     rpc_call_timeout: None,
-                    shutdown: shutdown.clone(),
-                    seed_cursor: None,
                     label: "count-test",
                     on_established: None,
                     on_backoff: None,
                 };
-                tokio::spawn(resumable_watcher::run(provider.clone(), cfg, NullSink))
+                tokio::spawn(resumable_watcher::run(
+                    provider.clone(),
+                    cfg,
+                    NullSink,
+                    shutdown.clone(),
+                ))
             })
             .collect();
 

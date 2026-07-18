@@ -21,22 +21,19 @@ use anyhow::Result;
 /// few extra blocks of `eth_getLogs`. Sized for the shallow reorgs of an
 /// Arbitrum-Sepolia-class L2.
 ///
-/// Reachable only from [`resumable_watcher::CursorPolicy::Persisted`], the
-/// variant that carries it (#1227) — it is the rewind applied to a *durable*
-/// cursor, and the `HeadMinusWindow` / `FullReplay` watchers re-derive their
-/// floor from head on every boot, so there is nothing to rewind.
+/// The rewind applies only where a *durable* cursor is resumed — the
+/// `HeadMinusWindow` / `FullReplay` starts re-derive their floor from head on
+/// every boot, so there is nothing to rewind.
 ///
-/// Its one live consumer is the settlement watcher
-/// ([`crate::payment_settlement`], #751). The origin directory
-/// ([`crate::dht::chain_origin_directory`]) also constructs a `Persisted` policy
-/// carrying this value, but never reads it: it seeds its cursor from its
-/// bootstrap snapshot block, and a seeded cursor bypasses floor derivation
-/// entirely (see `WatcherConfig::seed_cursor`), so its resume floor is the raw
-/// checkpoint with no rewind. That dead field is pre-existing and needs
-/// `CursorPolicy`'s persistence and floor-derivation axes split apart to remove
-/// (#1238); do not read it as evidence the margin applies there.
-///
-/// [`resumable_watcher::CursorPolicy::Persisted`]: super::resumable_watcher::CursorPolicy
+/// Two live consumers after the #1238 axis split:
+/// - the settlement watcher ([`crate::payment_settlement`], #751), through
+///   [`super::resumable_watcher::CursorStart::FromCheckpoint`]'s `reorg_margin`; and
+/// - the origin directory ([`crate::dht::chain_origin_directory`]), whose
+///   bootstrap rewinds its persisted `CheckpointKey::Origin` cursor before
+///   re-enumerating (`chain_origin_directory::replay_floor`). Origin resolves
+///   the rewind there rather than in the watcher because it replays from an
+///   enumeration and seeds the live tail, not from the generic getLogs floor —
+///   which is exactly why #1238 split persistence apart from floor derivation.
 pub(crate) const REORG_MARGIN_BLOCKS: u64 = 128;
 
 /// Maximum block span scanned per `eth_getLogs` during the resume backfill

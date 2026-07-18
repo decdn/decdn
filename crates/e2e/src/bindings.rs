@@ -99,6 +99,26 @@ alloy::sol! {
         function claimContent(uint256 namespaceId, bytes32 blake3Hash) external;
         function namespaceOf(bytes32 blake3Hash) external view returns (uint256[] memory);
         function ownerOf(uint256 namespaceId) external view returns (address);
+        function hasClaimed(uint256 namespaceId, bytes32 blake3Hash) external view returns (bool);
+        // Timelocked 2-step namespace ownership transfer (ADR 002). No CLI
+        // subcommand drives these yet, so the G-ORIGIN-01 transfer leg (#1038)
+        // calls them directly. `pendingTransfer` is the public mapping getter.
+        function initiateNamespaceTransfer(uint256 namespaceId, address newOwner) external;
+        function finalizeNamespaceTransfer(uint256 namespaceId) external;
+        function cancelNamespaceTransfer(uint256 namespaceId) external;
+        function pendingTransfer(uint256 namespaceId)
+            external
+            view
+            returns (address newOwner, uint64 readyAt);
+        function namespaceTransferTimelock() external view returns (uint64);
+        // Declared so a reverted `.call()` decodes to a *named* error rather
+        // than an opaque selector — the negatives assert the specific guard
+        // that fired, not merely that something reverted.
+        error NotNamespaceOwner(uint256 namespaceId, address caller);
+        error NoPendingTransfer(uint256 namespaceId);
+        error TransferNotReady(uint256 readyAt);
+        error NotPendingOwner(uint256 namespaceId, address caller);
+        error AlreadyClaimed(uint256 namespaceId, bytes32 blake3Hash);
     }
 
     /// `OriginAssignment` propose (publisher) + activate (governance) + reads
@@ -107,8 +127,10 @@ alloy::sol! {
     /// for the origin-recognition journeys #1038/#1039).
     #[sol(rpc)]
     contract OriginAssignment {
+        function assignmentTimelock() external view returns (uint256);
         function proposeAssignment(uint256 namespaceId, address[] operators) external;
         function activateAssignment(uint256 namespaceId) external;
+        function addDefaultOpenOperator(address operator) external;
         function getOrigins(uint256 namespaceId) external view returns (address[] memory);
         function isAuthorizedOrigin(uint256 namespaceId, address operator) external view returns (bool);
     }
