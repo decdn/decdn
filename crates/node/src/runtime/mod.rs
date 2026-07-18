@@ -534,15 +534,11 @@ pub async fn run(
         ProviderBuilder::new().connect_http(rpc_url.clone()),
         event_poll_interval,
     ));
-    // Graceful-shutdown tokens for the three watchers that previously minted one
-    // inline and dropped it, leaving nothing able to cancel them (#1230). Minted
-    // unconditionally so the cancels in the shutdown sequence are unconditional
-    // too — cancelling a token no watcher ever received is a no-op, which is
-    // cheaper than threading an `Option` through for the reputation indexer's
-    // `subscribe_reputation` gate.
-    let capacity_bond_watcher_shutdown = CancellationToken::new();
-    let slash_watcher_shutdown = CancellationToken::new();
-    let reputation_indexer_shutdown = CancellationToken::new();
+    // The watcher shutdown tokens are no longer minted here: since #1236 each
+    // watcher's `spawn` mints its own and returns a `WatcherHandle` that owns it,
+    // so the runtime drives graceful stop through the handle (`handle.shutdown()`
+    // in the sequence below) rather than a token it might forget to cancel.
+    //
     // One CapacityBond enumeration + one watcher feeding both registry
     // projections (#1110). The bindings half is built only when pull-through is
     // on; it derives from page data already read here, so — unlike when it had its
@@ -556,11 +552,14 @@ pub async fn run(
         Arc::clone(&head),
         cfg.cache.node_to_node_pull_through_enabled,
         Arc::clone(&node_metrics),
-        capacity_bond_watcher_shutdown.clone(),
     )
     .await
     .with_context(|| format!("CapacityBond registry bootstrap at {capacity_bond_addr}"))?;
     let staker_set: Arc<dyn StakerSet> = registry.staker_set;
+    // The shared registry watcher, held for the ordered graceful stop below (it
+    // cancels *after* `router.shutdown`, as its staker set gates DHT admission
+    // during drain). Also held inside both façades' projections.
+    let capacity_bond_watcher = registry.watcher;
 
     // Slash-detection watcher (#1032, G-NODE-05): follow `SlashJudge.Slashed`
     // for this operator so the slash surfaces over `admin_v1_slashes` (+ the
@@ -581,7 +580,6 @@ pub async fn run(
         event_poll_interval,
         Arc::clone(&head),
         Arc::clone(&node_metrics),
-        slash_watcher_shutdown.clone(),
     );
     let slash_store = slash_watcher.store();
 
@@ -690,13 +688,15 @@ pub async fn run(
     // prior behavior). The prefetch enabled gauge is published regardless so
     // dashboards have a uniform schema across enabled/disabled nodes
     // (appendix-observability §Prefetch).
-    // Cancelled by the shutdown sequence so the origin watcher's cancel path
-    // flushes its debounced `CheckpointKey::Origin` cursor (an abort-only
-    // teardown would drop up to a debounce window of scan progress on every
-    // clean stop). Unconditionally cancelled at shutdown; without the
-    // chain-backed directory nothing listens, so that cancel is a no-op.
-    let origin_watcher_shutdown = CancellationToken::new();
-    let origin_directory: Arc<dyn crate::dht::origin::OriginDirectory> = match (
+    // The chain-backed directory's watcher handle, captured before the `Arc<dyn>`
+    // coercion so the ordered graceful stop below can `shutdown()` it and *then*
+    // flush the debounced `CheckpointKey::Origin` cursor (an abort-only teardown
+    // would drop up to a debounce window of scan progress on every clean stop).
+    // `None` on the config fallback, which has no watcher — nothing to stop.
+    let (origin_directory, origin_watcher): (
+        Arc<dyn crate::dht::origin::OriginDirectory>,
+        Option<Arc<crate::chain_events::resumable_watcher::WatcherHandle>>,
+    ) = match (
         cfg.blockchain.origin_assignment_address.as_deref(),
         cfg.blockchain.publisher_registry_address.as_deref(),
     ) {
@@ -705,30 +705,32 @@ pub async fn run(
                 parse_nonzero_address(origin_addr, "blockchain.origin_assignment_address")?;
             let publisher_registry_addr =
                 parse_nonzero_address(publisher_addr, "blockchain.publisher_registry_address")?;
-            Arc::new(
-                crate::dht::ChainOriginDirectory::bootstrap(
-                    with_poll_interval(
-                        ProviderBuilder::new().connect_http(rpc_url.clone()),
-                        event_poll_interval,
-                    ),
-                    origin_assignment_addr,
-                    publisher_registry_addr,
-                    capacity_bond_addr,
-                    cfg.blockchain.origin_directory_from_block,
-                    Arc::clone(&watcher_checkpoint_store),
+            let directory = crate::dht::ChainOriginDirectory::bootstrap(
+                with_poll_interval(
+                    ProviderBuilder::new().connect_http(rpc_url.clone()),
                     event_poll_interval,
-                    Arc::clone(&head),
-                    Arc::clone(&staker_set),
-                    Arc::clone(&node_metrics),
-                    origin_watcher_shutdown.clone(),
-                )
-                .await
-                .context("ChainOriginDirectory bootstrap")?,
+                ),
+                origin_assignment_addr,
+                publisher_registry_addr,
+                capacity_bond_addr,
+                cfg.blockchain.origin_directory_from_block,
+                Arc::clone(&watcher_checkpoint_store),
+                event_poll_interval,
+                Arc::clone(&head),
+                Arc::clone(&staker_set),
+                Arc::clone(&node_metrics),
             )
+            .await
+            .context("ChainOriginDirectory bootstrap")?;
+            let origin_watcher = directory.watcher();
+            (Arc::new(directory), Some(origin_watcher))
         }
-        _ => Arc::new(crate::dht::origin::ConfigOriginDirectory::new(
-            std::collections::HashMap::new(),
-        )),
+        _ => (
+            Arc::new(crate::dht::origin::ConfigOriginDirectory::new(
+                std::collections::HashMap::new(),
+            )),
+            None,
+        ),
     };
     let prefetch_engine = Arc::new(crate::prefetch::PrefetchEngine::new(
         cfg.prefetch,
@@ -1216,15 +1218,19 @@ pub async fn run(
     // cascades to DHT-announce suppression (the republisher's `is_evicted`
     // gate), probe `has_blob:false`, and delivery refusal — the node's only
     // local protection against the slash for serving blacklisted content.
-    let blacklist_watcher_shutdown = match (
+    // Since #1236 blacklist spawns its own task (returning a `WatcherHandle`)
+    // rather than running as a future the runtime awaits on `tasks`: its sink and
+    // the poll loop must share the shutdown token `spawn` mints, and it persists
+    // no cursor, so the handle's `AbortOnDrop` is a sufficient backstop after the
+    // graceful `shutdown()` below.
+    let blacklist_watcher = match (
         cfg.blockchain.content_blacklist_address.as_deref(),
         blacklist_rpc_url,
     ) {
         (Some(addr), Some(url)) => {
             let content_blacklist_addr =
                 parse_nonzero_address(addr, "blockchain.content_blacklist_address")?;
-            let shutdown = CancellationToken::new();
-            tasks.spawn(crate::blacklist_watcher::run(
+            Some(crate::blacklist_watcher::spawn(
                 with_poll_interval(
                     ProviderBuilder::new().connect_http(url),
                     event_poll_interval,
@@ -1236,9 +1242,7 @@ pub async fn run(
                 event_poll_interval,
                 Arc::clone(&head),
                 Duration::from_secs(cfg.blockchain.content_blacklist_poll_interval_sec),
-                shutdown.clone(),
-            ));
-            Some(shutdown)
+            ))
         }
         _ => None,
     };
@@ -1673,11 +1677,12 @@ pub async fn run(
     .context("gossip service failed to start")?;
 
     // Network-wide settlement indexer (ADR 008, #326): feeds `settlement_source`
-    // so reporter weights are live. Held for the process lifetime (its
-    // `AbortOnDrop` stops the chain watcher on shutdown). Only runs when
-    // reputation gossip is enabled. A bootstrap RPC failure is non-fatal —
-    // reputation is best-effort, so the node still starts (weights stay 0).
-    let _settlement_indexer = if cfg.gossip.subscribe_reputation {
+    // so reporter weights are live. Held for the process lifetime; `shutdown()`
+    // stops its chain watcher in the graceful sequence, its `WatcherHandle`'s
+    // `AbortOnDrop` the backstop. Only runs when reputation gossip is enabled. A
+    // bootstrap RPC failure is non-fatal — reputation is best-effort, so the node
+    // still starts (weights stay 0).
+    let settlement_indexer = if cfg.gossip.subscribe_reputation {
         match crate::reputation_indexer::SettlementIndexer::bootstrap(
             with_poll_interval(
                 ProviderBuilder::new().connect_http(reputation_rpc_url),
@@ -1689,7 +1694,6 @@ pub async fn run(
             event_poll_interval,
             Arc::clone(&head),
             Arc::clone(&node_metrics),
-            reputation_indexer_shutdown.clone(),
         )
         .await
         {
@@ -1897,10 +1901,12 @@ pub async fn run(
     let _ = probe_rate_limit_gc_stop_tx.send(());
     let _ = republish_stop_tx.send(());
     let _ = bucket_refresh_stop_tx.send(());
-    if let Some(token) = blacklist_watcher_shutdown {
-        token.cancel();
+    if let Some(watcher) = &blacklist_watcher {
+        watcher.shutdown();
     }
-    origin_watcher_shutdown.cancel();
+    if let Some(watcher) = &origin_watcher {
+        watcher.shutdown();
+    }
     // Deterministically flush the origin scan cursor: the watcher's own
     // cancel-path flush races `origin_directory`'s abort-on-drop teardown, and
     // a lost flush silently widens the next boot's rescan by up to a debounce
@@ -1974,12 +1980,15 @@ pub async fn run(
     // here too — one cancel site for the shared `capacity-bond`-era watchers is
     // easier to keep correct than three orderings each justified separately.
     //
-    // None of the three persists a cursor, so unlike `origin_watcher_shutdown`
-    // above there is no checkpoint to flush and no deadline this must beat: the
-    // cancel buys a clean exit, and `AbortOnDrop` remains the backstop.
-    capacity_bond_watcher_shutdown.cancel();
-    slash_watcher_shutdown.cancel();
-    reputation_indexer_shutdown.cancel();
+    // None of the three persists a cursor, so unlike the origin watcher above
+    // there is no checkpoint to flush and no deadline this must beat: the cancel
+    // buys a clean exit, and each `WatcherHandle`'s `AbortOnDrop` remains the
+    // backstop.
+    capacity_bond_watcher.shutdown();
+    slash_watcher.shutdown();
+    if let Some(indexer) = &settlement_indexer {
+        indexer.shutdown();
+    }
     // Cancel any in-flight background cache-fill tasks (#859): the router has
     // drained, so warming the cache for future requests is moot. They observe
     // the token at their next await and exit; being advisory, they are not

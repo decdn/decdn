@@ -45,12 +45,13 @@ use alloy::providers::Provider;
 use alloy::rpc::types::{Filter, Log};
 use alloy::sol_types::SolEvent;
 use anyhow::{Context, Result};
-use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use crate::chain_events::resumable_watcher::{self, CursorStart, LogSink, WatcherConfig};
+use crate::chain_events::resumable_watcher::{
+    self, CursorStart, LogSink, WatcherConfig, WatcherHandle,
+};
 use crate::chain_events::shared_head::HeadSource;
-use crate::chain_events::{AbortOnDrop, timed};
+use crate::chain_events::timed;
 use crate::dht::chain_staker_set::{ChainStakerSet, StakerChange, apply_change};
 use crate::dht::node_address::{
     ChainNodeAddressDirectory, NodeAddressResolver, remove_binding, set_binding,
@@ -81,6 +82,13 @@ const PAGE_SIZE: u64 = 100;
 pub struct RegistryHandles {
     pub staker_set: Arc<dyn StakerSet>,
     pub node_addresses: Option<Arc<dyn NodeAddressResolver>>,
+    /// The shared watcher, exposed so the runtime can drive graceful shutdown in
+    /// its deliberate order (this loop stops *after* `router.shutdown` because
+    /// its staker-set projection gates DHT admission during drain). Also held
+    /// inside both façades' projections, so the task lives until the last of the
+    /// three drops. `pub(crate)`, since `WatcherHandle` is crate-private and only
+    /// the runtime drives shutdown.
+    pub(crate) watcher: Arc<WatcherHandle>,
 }
 
 /// The chain reads the live watcher performs, behind a trait so the event
@@ -307,7 +315,6 @@ pub async fn bootstrap<P>(
     head: Arc<dyn HeadSource>,
     track_node_addresses: bool,
     metrics: Arc<Metrics>,
-    shutdown: CancellationToken,
 ) -> Result<RegistryHandles>
 where
     P: Provider + Clone + 'static,
@@ -371,7 +378,6 @@ where
             persist: None,
         },
         event_poll_interval,
-        shutdown,
         "capacity-bond",
     )
     // `staker_set_watcher_*` is the shared `capacity-bond` loop's health, and it
@@ -393,21 +399,25 @@ where
         &metrics,
         Metrics::staker_set_watcher_backoff_started,
     ));
-    // One task, one `AbortOnDrop`, shared by both façades: it lives while either
-    // does and aborts when the last is dropped. Strictly safer than the old shape,
-    // where dropping the resolver killed only its own loop.
-    let watcher = Arc::new(AbortOnDrop(tokio::spawn(resumable_watcher::run(
-        provider, cfg, sink,
-    ))));
+    // One task, one `WatcherHandle`, shared by both façades and the runtime: it
+    // lives while any of the three holds it and aborts when the last drops.
+    // Strictly safer than the old shape, where dropping the resolver killed only
+    // its own loop. This sink observes no shutdown token, so it ignores the one
+    // `spawn` mints (`|_| sink`).
+    let watcher = Arc::new(resumable_watcher::spawn(provider, cfg, move |_| sink));
 
     let staker_set: Arc<dyn StakerSet> =
         Arc::new(ChainStakerSet::from_parts(active, Arc::clone(&watcher)));
     let node_addresses = bindings.map(|b| {
-        Arc::new(ChainNodeAddressDirectory::from_parts(b, watcher)) as Arc<dyn NodeAddressResolver>
+        Arc::new(ChainNodeAddressDirectory::from_parts(
+            b,
+            Arc::clone(&watcher),
+        )) as Arc<dyn NodeAddressResolver>
     });
     Ok(RegistryHandles {
         staker_set,
         node_addresses,
+        watcher,
     })
 }
 

@@ -353,12 +353,16 @@ mod tests {
                     initial_backoff: Duration::from_millis(10),
                     max_backoff: Duration::from_millis(10),
                     rpc_call_timeout: None,
-                    shutdown: shutdown.clone(),
                     label: "count-test",
                     on_established: None,
                     on_backoff: None,
                 };
-                tokio::spawn(resumable_watcher::run(provider.clone(), cfg, NullSink))
+                tokio::spawn(resumable_watcher::run(
+                    provider.clone(),
+                    cfg,
+                    NullSink,
+                    shutdown.clone(),
+                ))
             })
             .collect();
 
