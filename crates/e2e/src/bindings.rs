@@ -99,6 +99,18 @@ alloy::sol! {
         function claimContent(uint256 namespaceId, bytes32 blake3Hash) external;
         function namespaceOf(bytes32 blake3Hash) external view returns (uint256[] memory);
         function ownerOf(uint256 namespaceId) external view returns (address);
+        function hasClaimed(uint256 namespaceId, bytes32 blake3Hash) external view returns (bool);
+        // Timelocked 2-step namespace ownership transfer (ADR 002). No CLI
+        // subcommand drives these yet, so the G-ORIGIN-01 transfer leg (#1038)
+        // calls them directly. `pendingTransfer` is the public mapping getter.
+        function initiateNamespaceTransfer(uint256 namespaceId, address newOwner) external;
+        function finalizeNamespaceTransfer(uint256 namespaceId) external;
+        function cancelNamespaceTransfer(uint256 namespaceId) external;
+        function pendingTransfer(uint256 namespaceId)
+            external
+            view
+            returns (address newOwner, uint64 readyAt);
+        function namespaceTransferTimelock() external view returns (uint64);
     }
 
     /// `OriginAssignment` propose (publisher) + activate (governance) + reads
