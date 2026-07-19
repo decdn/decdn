@@ -8,7 +8,7 @@ use crate::chain_events::shared_head::{HeadSource, SharedHead};
 
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::num::NonZeroUsize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -560,6 +560,103 @@ async fn build_infra(
         gossip,
         limiter,
     })
+}
+
+/// By-value bundle of the endpoint, handlers, gossip, limiter, and blacklist
+/// readiness receiver consumed when [`serve_until_shutdown`] builds the router.
+/// Every field is moved into the router builder (or its gate), so none is
+/// referenced by [`run`] after the serve call returns.
+struct ServeInputs {
+    ep: Endpoint,
+    probe_handler: Arc<ProbeHandler>,
+    client_handler: Arc<ClientHandler>,
+    dht_handler: Arc<DhtHandler>,
+    gossip: iroh_gossip::net::Gossip,
+    limiter: Arc<ConnectionLimiter>,
+    blacklist_ready_rx: oneshot::Receiver<crate::blacklist_watcher::InitialSyncResult>,
+}
+
+/// Serve phase extracted verbatim from the tail of [`run`] (issue #1253 PR3):
+/// build the paid-delivery router behind the fail-closed blacklist gate, install
+/// the signal + SIGHUP streams, and run the select loop until a shutdown signal
+/// arrives. Returns the live [`Router`] and the observed [`ShutdownSignal`] so
+/// [`run`] can drive the teardown sequence. `drain_trigger` is borrowed, not
+/// consumed, because [`run`] still passes it to [`shutdown`] afterwards.
+#[allow(clippy::cognitive_complexity)]
+async fn serve_until_shutdown(
+    reload_state: &RuntimeReloadState,
+    config_path: Option<&Path>,
+    drain_trigger: &Arc<admin::DrainTrigger>,
+    serve_in: ServeInputs,
+) -> anyhow::Result<(Router, ShutdownSignal)> {
+    let ServeInputs {
+        ep,
+        probe_handler,
+        client_handler,
+        dht_handler,
+        gossip,
+        limiter,
+        blacklist_ready_rx,
+    } = serve_in;
+
+    // No Probe, Client, DHT, or gossip ALPN is registered before the mandatory
+    // first global + operator-region blacklist replay/scope pass succeeds. The
+    // gate sits here — after the metrics/admin listeners are bound and every
+    // background task is spawned — so a *slow* (still-pending) initial sync keeps
+    // the paid-delivery listeners closed while observability, the admin control
+    // surface, and the startup banner stay up. A *failed* initial sync is
+    // fail-closed the hard way: the gate returns `Err`, `run` propagates it, and
+    // the process exits (tearing those listeners down with it) rather than ever
+    // serving un-vetted content. The watcher was spawned earlier in bring-up
+    // (where the router used to be built), so its initial replay runs
+    // concurrently and is often already complete by the time control reaches
+    // this gate.
+    let router = gate_listener_on_blacklist_sync(blacklist_ready_rx, || {
+        Router::builder(ep.clone())
+            .accept(ProbeHandler::ALPN, probe_handler)
+            .accept(ClientHandler::ALPN, client_handler)
+            .accept(DhtHandler::ALPN, dht_handler)
+            .accept(
+                GOSSIP_ALPN,
+                LimitedHandler::new(gossip.clone(), Arc::clone(&limiter)),
+            )
+            .spawn()
+    })
+    .await?;
+
+    // Install signal streams once, before entering the select loop.
+    // tokio docs are explicit that `Signal::recv` is the supported way
+    // to await repeated signals, and re-creating the stream per signal
+    // is not — see `tokio::signal::unix::signal` for the reasoning.
+    let mut shutdown_streams = ShutdownStreams::install();
+    let mut hup_stream = HupStream::install();
+
+    let signal = loop {
+        tokio::select! {
+            sig = shutdown_streams.recv() => break sig,
+            () = hup_stream.recv() => {
+                match config_path {
+                    Some(path) => {
+                        if let Err(err) = reload_state.reload(path).await {
+                            tracing::warn!(%err, "config reload error");
+                        }
+                    }
+                    None => {
+                        tracing::warn!(
+                            "SIGHUP received but no config file path is in use; ignoring"
+                        );
+                    }
+                }
+            }
+            () = drain_trigger.wait() => {
+                tracing::info!("admin_v1_drain received; initiating graceful shutdown");
+                break ShutdownSignal::AdminDrain;
+            }
+        }
+    };
+    tracing::info!(signal = %signal, "shutdown signal received; closing router");
+
+    Ok((router, signal))
 }
 
 /// Build the endpoint, register handlers on a `Router`, spawn the metrics
@@ -1930,62 +2027,21 @@ pub async fn run(
         "node runtime ready"
     );
 
-    // No Probe, Client, DHT, or gossip ALPN is registered before the mandatory
-    // first global + operator-region blacklist replay/scope pass succeeds. The
-    // gate sits here — after the metrics/admin listeners are bound and every
-    // background task is spawned — so a *slow* (still-pending) initial sync keeps
-    // the paid-delivery listeners closed while observability, the admin control
-    // surface, and the startup banner stay up. A *failed* initial sync is
-    // fail-closed the hard way: the gate returns `Err`, `run` propagates it, and
-    // the process exits (tearing those listeners down with it) rather than ever
-    // serving un-vetted content. The watcher was spawned earlier in bring-up
-    // (where the router used to be built), so its initial replay runs
-    // concurrently and is often already complete by the time control reaches
-    // this gate.
-    let router = gate_listener_on_blacklist_sync(blacklist_ready_rx, || {
-        Router::builder(ep.clone())
-            .accept(ProbeHandler::ALPN, probe_handler)
-            .accept(ClientHandler::ALPN, client_handler)
-            .accept(DhtHandler::ALPN, dht_handler)
-            .accept(
-                GOSSIP_ALPN,
-                LimitedHandler::new(gossip.clone(), Arc::clone(&limiter)),
-            )
-            .spawn()
-    })
+    let (router, signal) = serve_until_shutdown(
+        &reload_state,
+        config_path.as_deref(),
+        &drain_trigger,
+        ServeInputs {
+            ep,
+            probe_handler,
+            client_handler,
+            dht_handler,
+            gossip,
+            limiter,
+            blacklist_ready_rx,
+        },
+    )
     .await?;
-
-    // Install signal streams once, before entering the select loop.
-    // tokio docs are explicit that `Signal::recv` is the supported way
-    // to await repeated signals, and re-creating the stream per signal
-    // is not — see `tokio::signal::unix::signal` for the reasoning.
-    let mut shutdown_streams = ShutdownStreams::install();
-    let mut hup_stream = HupStream::install();
-
-    let signal = loop {
-        tokio::select! {
-            sig = shutdown_streams.recv() => break sig,
-            () = hup_stream.recv() => {
-                match config_path.as_deref() {
-                    Some(path) => {
-                        if let Err(err) = reload_state.reload(path).await {
-                            tracing::warn!(%err, "config reload error");
-                        }
-                    }
-                    None => {
-                        tracing::warn!(
-                            "SIGHUP received but no config file path is in use; ignoring"
-                        );
-                    }
-                }
-            }
-            () = drain_trigger.wait() => {
-                tracing::info!("admin_v1_drain received; initiating graceful shutdown");
-                break ShutdownSignal::AdminDrain;
-            }
-        }
-    };
-    tracing::info!(signal = %signal, "shutdown signal received; closing router");
 
     let handles = ShutdownHandles {
         metrics_stop_tx,
