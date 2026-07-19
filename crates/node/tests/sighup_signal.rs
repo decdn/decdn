@@ -162,11 +162,10 @@ fn write_config(path: &Path, body: &str) {
 
 /// `io::Write` sink that appends every byte into a shared buffer. Used to
 /// capture the reload path's `tracing` output so a test can assert on the
-/// `info`-level "ignoring change to X (requires restart)" diff lines — a
+/// `info`-level "ignoring change to X (requires restart)" lines — a
 /// restart-required field is intentionally never applied to *live runtime
 /// state*, so a tracing event is the only place its rejection is
-/// observable (the changed file content is also folded into the diff
-/// baseline, but that is not a runtime-behaviour surface).
+/// observable.
 #[derive(Clone)]
 struct BufferWriter(Arc<Mutex<Vec<u8>>>);
 
@@ -382,37 +381,34 @@ async fn sighup_applies_security_changes() {
 }
 
 /// SIGHUP must apply changes to mutable fields (`payment.rate_per_mb`,
-/// `observability.log_level`) while *rejecting* changes to
-/// restart-required fields (`network`, `blockchain`, `cache`, `identity`,
-/// `gossip`) — the rejection surfacing as an `info`-level "ignoring change
-/// to X (requires restart)" log line, never as a silently-applied or
-/// silently-dropped value (#499).
+/// `observability.log_level`) while restart-required sections
+/// (`network`, `blockchain`, `cache`, `identity`, `gossip`) surface an
+/// `info`-level "ignoring change to X (requires restart)" notice — never a
+/// silently-applied or silently-dropped value (#499).
 ///
-/// The unit tests in `runtime::reload::tests` exercise the diff helpers
-/// directly and the other tests in this file only ever feed reloadable
-/// sections, so nothing here previously drove a real SIGHUP that carried
-/// *both* a mutable and a restart-required change in the same file. A
-/// regression in the diff logic (e.g. a restart-required section wrongly
-/// classified as reloadable, or the notice suppressed) would go uncaught.
+/// The unit tests in `runtime::reload::tests` exercise the section notice
+/// emitter directly and the other tests in this file only ever feed
+/// reloadable sections, so nothing here previously drove a real SIGHUP that
+/// carried *both* a mutable and a restart-required change in the same file.
+/// A regression that wrongly classified a restart-required section as
+/// reloadable (applying it silently) would go uncaught.
 ///
-/// The two reloads exercise all three branches of the section diff
-/// (`log_ignored_other_sections::changed`):
-///   - **Reload #1** carries `[network]` against the empty startup
-///     baseline → the *absent→present* branch must emit the one-shot
-///     "requires restart" notice (the no-baseline conservative-warn path,
-///     `reload.rs` `log_ignored_other_sections`), while `blockchain` /
-///     `cache` (absent in the file) stay silent.
-///   - **Reload #2** keeps `[network]` byte-identical → the
-///     *unchanged-section* branch must **not** re-emit the notice
-///     (suppression), while newly-introduced `blockchain` / `cache` /
-///     `identity` / `gossip` changes each emit one — all alongside
-///     mutable `payment` / `observability` changes that must still apply.
+/// The notice is unconditional (`warn_restart_required_sections`): it fires
+/// once per restart-required section *present* in the reloaded file,
+/// whether or not the section changed. The two reloads assert that:
+///   - **Reload #1** carries `[network]` → one `network` notice; `[blockchain]`
+///     / `[cache]` (absent from the file) stay silent.
+///   - **Reload #2** carries `[network]` again plus new `[blockchain]` /
+///     `[cache]` / `[identity]` / `[gossip]` → each present section emits one
+///     notice (no cross-reload suppression), all alongside mutable
+///     `payment` / `observability` changes that must still apply.
 ///
 /// Runs on a single-thread runtime so the buffer-capturing subscriber
 /// installed via `set_default` (thread-local) observes the reload, which
 /// is awaited inline on the same thread rather than on a spawned task.
 // One deliberately sequential narrative: two full SIGHUP→reload cycles
-// whose ordering (baseline → suppression) is the property under test.
+// whose ordering (present-section notices on reload #1, then a buffer
+// clear and re-emit on reload #2) is the property under test.
 // Splitting it into helpers would hide that ordering, not clarify it.
 #[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "current_thread")]
@@ -470,7 +466,8 @@ async fn sighup_applies_mutable_but_rejects_restart_required_fields() {
     // assert on the stable section prefix + the `(requires restart)`
     // suffix rather than the full middle field list, so a cosmetic edit
     // to a field list in `warn_ignored` doesn't break the test while a
-    // misclassification / suppression regression still does.
+    // misclassification regression (a restart-only section wrongly
+    // treated as reloadable, so its notice vanishes) still does.
     let notice_count = |logs: &str, section: &str| -> usize {
         let prefix = format!("ignoring change to {section}.*");
         logs.lines()
@@ -479,10 +476,9 @@ async fn sighup_applies_mutable_but_rejects_restart_required_fields() {
     };
 
     // --- Reload #1: mutable fields + a restart-required `[network]`
-    //     section against the empty startup baseline. Mutable changes
-    //     apply; the absent→present network section hits the no-baseline
-    //     conservative-warn path and must emit exactly one notice;
-    //     blockchain/cache (not in the file) stay silent.
+    //     section. Mutable changes apply; `[network]` is present so it
+    //     emits exactly one notice; blockchain/cache (not in the file)
+    //     stay silent.
     write_config(
         &path,
         "[payment]\n\
@@ -505,8 +501,8 @@ async fn sighup_applies_mutable_but_rejects_restart_required_fields() {
     assert_eq!(
         notice_count(&after_first, "network"),
         1,
-        "a present restart-required [network] section against an empty \
-         baseline must emit exactly one (requires restart) notice, got:\n{after_first}"
+        "a present restart-required [network] section must emit exactly \
+         one (requires restart) notice, got:\n{after_first}"
     );
     assert_eq!(
         notice_count(&after_first, "blockchain"),
@@ -518,12 +514,34 @@ async fn sighup_applies_mutable_but_rejects_restart_required_fields() {
         0,
         "cache absent from the file must not warn, got:\n{after_first}"
     );
+    // `[observability]` is present but sets only the hot-reloadable
+    // `log_level`, and `[payment]` is fully reloadable — neither warns
+    // (field-gated notice, not section-presence).
+    assert_eq!(
+        notice_count(&after_first, "observability"),
+        0,
+        "observability with only log_level set (reloadable) must not warn, got:\n{after_first}"
+    );
+    assert_eq!(
+        notice_count(&after_first, "payment"),
+        0,
+        "fully-reloadable [payment] must not warn, got:\n{after_first}"
+    );
 
-    // --- Reload #2: mutable fields change; `[network]` is byte-identical
-    //     (must NOT re-warn — suppression branch); blockchain/cache/
-    //     identity/gossip are newly introduced and changed (each must
-    //     warn). Proves mutable changes still apply when bundled with
-    //     restart-required ones.
+    // Isolate reload #2's notices from reload #1's so the counts below
+    // reflect a single reload (the notice fires on field presence, not on
+    // change, so the cumulative buffer would otherwise double-count
+    // fields present in both files).
+    log_buf.lock().unwrap().clear();
+
+    // --- Reload #2: mutable fields change (payment/log_level, which apply)
+    //     bundled with restart-required ones. network/blockchain/identity/
+    //     gossip/dht/receipts warn on presence; `[cache]` warns because it
+    //     sets the non-reloadable `cache_dir` (a pinned_hashes-only edit
+    //     would not); `[observability]` does NOT warn because it sets only
+    //     the reloadable `log_level`; `[security]` never warns (fully
+    //     reloadable). Empty `[dht]`/`[receipts]`/`[security]` tables are
+    //     "present" so they exercise those emitter branches.
     write_config(
         &path,
         "[payment]\n\
@@ -539,7 +557,10 @@ async fn sighup_applies_mutable_but_rejects_restart_required_fields() {
          [identity]\n\
          region = \"US\"\n\n\
          [gossip]\n\
-         announce_interval_sec = 120\n",
+         announce_interval_sec = 120\n\n\
+         [dht]\n\n\
+         [receipts]\n\n\
+         [security]\n",
     );
     raise_sighup_soon();
     hup.recv().await.expect("second SIGHUP");
@@ -561,23 +582,35 @@ async fn sighup_applies_mutable_but_rejects_restart_required_fields() {
 
     let logs = captured_logs(&log_buf);
 
-    // Suppression branch: an unchanged restart-required section must not
-    // re-emit its notice on the second reload.
-    assert_eq!(
-        notice_count(&logs, "network"),
-        1,
-        "byte-identical [network] across reloads must NOT re-emit the \
-         (requires restart) notice (suppression branch), got:\n{logs}"
-    );
-
-    // Newly-introduced restart-required sections were each rejected with
-    // their own notice.
-    for section in ["blockchain", "cache", "identity", "gossip"] {
+    // Every section carrying a non-reloadable field emits exactly one
+    // notice — including `[network]`, present again (the notice fires on
+    // field presence, not on a change vs the previous reload).
+    for section in [
+        "network",
+        "blockchain",
+        "cache",
+        "identity",
+        "gossip",
+        "dht",
+        "receipts",
+    ] {
         assert_eq!(
             notice_count(&logs, section),
             1,
-            "expected exactly one (requires restart) notice for changed \
-             [{section}] section, got:\n{logs}"
+            "expected exactly one (requires restart) notice for [{section}] \
+             carrying a non-reloadable field, got:\n{logs}"
+        );
+    }
+
+    // Fully-reloadable sections, and partially-reloadable ones that set
+    // only their reloadable field, stay silent: `[payment]` and
+    // `[security]` are fully reloadable, and `[observability]` set only
+    // `log_level`.
+    for section in ["payment", "security", "observability"] {
+        assert_eq!(
+            notice_count(&logs, section),
+            0,
+            "[{section}] must not warn (no non-reloadable field set), got:\n{logs}"
         );
     }
 }
