@@ -200,6 +200,25 @@ async fn run() -> anyhow::Result<()> {
         expected.len()
     );
 
+    // (a2) Chunk parts landed under the *resolved* `--data-dir`, not a hardcoded
+    // `~/.decdn/downloads`. `HOME` is isolated to this same tempdir above, so the
+    // two locations are distinguishable: only honoring `--data-dir` puts them
+    // here. Retention is on (no `--no-keep-blobs`), so they survive the run.
+    // This is the only coverage that the flag reaches `downloads_root` at all —
+    // both call sites regress silently otherwise.
+    let part = client_dir
+        .path()
+        .join("downloads")
+        // `to_hex`, not `Display`: `iroh_blobs::Hash` displays as base32, while
+        // the part directory is named with lowercase hex.
+        .join(manifest_hash.to_hex())
+        .join("chunk-0.part");
+    anyhow::ensure!(
+        part.is_file(),
+        "chunk part not under the resolved --data-dir: {}",
+        part.display()
+    );
+
     // (b) The persisted watermark advanced past a single pull. The manifest blob
     // and all three chunks were paid on one channel; a hoisted context would have
     // failed the fetch outright above, so reaching here already proves per-chunk

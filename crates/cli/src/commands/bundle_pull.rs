@@ -166,6 +166,7 @@ pub async fn bundle_pull(args: &BundlePullArgs, config_path: Option<&Path>) -> a
         candidates,
         common,
         locks: RefCell::new(HashMap::new()),
+        manifest_locks: RefCell::new(HashMap::new()),
         open_lock: tokio::sync::Mutex::new(()),
     };
 
@@ -224,6 +225,10 @@ struct PullCtx<'a, P: Provider + Clone> {
     /// Per-provider locks: serialize fetches sharing one channel's voucher
     /// nonce. Lazily created; held only across one entry's fetch.
     locks: RefCell<HashMap<Address, Rc<tokio::sync::Mutex<()>>>>,
+    /// Per-manifest locks: serialize reconstructions of the same file manifest,
+    /// which share one part directory keyed on the manifest hash. Lazily
+    /// created; held across one entry's whole reconstruction.
+    manifest_locks: RefCell<HashMap<[u8; 32], Rc<tokio::sync::Mutex<()>>>>,
     /// Serializes channel *opens* across all providers. The buyer's USDC
     /// allowance for the `PaymentChannel` is a single owner→spender slot, and the
     /// client default approves it to the exact per-open deposit (ERC-20 `approve`
@@ -241,6 +246,15 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         let mut map = self.locks.borrow_mut();
         Rc::clone(
             map.entry(provider)
+                .or_insert_with(|| Rc::new(tokio::sync::Mutex::new(()))),
+        )
+    }
+
+    /// The per-manifest lock, created on first use.
+    fn manifest_lock(&self, manifest_hash: [u8; 32]) -> Rc<tokio::sync::Mutex<()>> {
+        let mut map = self.manifest_locks.borrow_mut();
+        Rc::clone(
+            map.entry(manifest_hash)
                 .or_insert_with(|| Rc::new(tokio::sync::Mutex::new(()))),
         )
     }
@@ -396,9 +410,11 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
     /// fetch and verify its chunks in order, then reconstruct into `dest`.
     ///
     /// Chunk pulls go through the same [`Self::fetch`] as any other blob, so
-    /// they respect per-provider channel serialization; the ADR's in-order
-    /// requirement keeps them sequential within this one entry, while other
-    /// entries continue in parallel.
+    /// they respect per-provider channel serialization — the guard is released
+    /// per call, so re-entering `fetch` per chunk does not deadlock on the
+    /// non-reentrant `tokio::sync::Mutex`. The ADR's in-order requirement keeps
+    /// them sequential within this one entry, while other entries continue in
+    /// parallel.
     async fn reconstruct_entry(
         &self,
         manifest: anyhow::Result<file_manifest::FileManifest>,
@@ -406,10 +422,29 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         dest: &Path,
     ) -> anyhow::Result<u64> {
         let manifest = manifest?;
+        // Two entries can name the SAME manifest blob — a bundle may hold one
+        // file's content at two paths, and nothing dedupes entries by hash. The
+        // part directory is keyed only on the manifest hash, so concurrent
+        // reconstructions would share it, one deleting or rewriting parts while
+        // the other is mid-concatenate. Serializing per manifest hash closes
+        // that race in both retention modes.
+        //
+        // It does NOT make the second entry free in both modes. Under the
+        // default retention it finds the first's verified parts and pays
+        // nothing; under `--no-keep-blobs` the first entry has already deleted
+        // them (ADR 012 § Blob retention: "delete immediately after
+        // reconstruction"), so the second re-fetches and re-pays. Whether that
+        // should change — by deferring the sweep or deduping entries by hash —
+        // is #1306.
+        //
+        // The lock is process-local; two concurrent `decdn` invocations sharing
+        // a data dir still race the same part directory (#1303).
+        let lock = self.manifest_lock(manifest_hash);
+        let _guard = lock.lock().await;
         file_manifest::reconstruct(
             &manifest,
             manifest_hash,
-            &file_manifest::downloads_root(),
+            &file_manifest::downloads_root(&self.chain.data_dir),
             dest,
             !self.common.no_keep_blobs,
             |chunk_hash| self.fetch(chunk_hash),

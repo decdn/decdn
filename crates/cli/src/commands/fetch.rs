@@ -718,7 +718,7 @@ impl<P: alloy::providers::Provider + Clone> ChunkFetcher<'_, P> {
         let written = file_manifest::reconstruct(
             manifest,
             manifest_hash,
-            &file_manifest::downloads_root(),
+            &file_manifest::downloads_root(&self.chain.data_dir),
             output,
             keep_blobs,
             |chunk_hash| self.fetch(chunk_hash),
@@ -905,15 +905,21 @@ where
     Ok(opened.ctx)
 }
 
+/// A unique `O_CREAT|O_EXCL` temp file in `target`'s directory, ready to be
+/// `persist`ed over it. Staging beside the destination is what makes the final
+/// rename atomic (same filesystem) — a temp in `/tmp` would not be.
+pub(crate) fn temp_in_parent(target: &Path) -> std::io::Result<tempfile::NamedTempFile> {
+    match target.parent().filter(|p| !p.as_os_str().is_empty()) {
+        Some(p) => tempfile::NamedTempFile::new_in(p),
+        None => tempfile::NamedTempFile::new_in("."),
+    }
+}
+
 /// Write `bytes` to `target` atomically: a unique `O_CREAT|O_EXCL` temp in the
 /// destination directory, then an atomic rename-replace.
 pub(crate) fn write_blob_atomic(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
-    let parent = target.parent().filter(|p| !p.as_os_str().is_empty());
-    let mut tmp = match parent {
-        Some(p) => tempfile::NamedTempFile::new_in(p)?,
-        None => tempfile::NamedTempFile::new_in(".")?,
-    };
+    let mut tmp = temp_in_parent(target)?;
     tmp.write_all(bytes)?;
     tmp.as_file().sync_all()?;
     tmp.persist(target).map_err(|e| e.error)?;

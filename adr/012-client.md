@@ -233,8 +233,12 @@ The manifest blob is pushed to the CDN like any other blob. It is typically < 1 
 ### Download flow
 
 1. Fetch manifest blob (`StreamRequest{hash: H_manifest}`), verify BLAKE3, deserialise.
-2. For each chunk in order: `StreamRequest{hash: chunk.hash}`, write to `~/.decdn/downloads/<H_manifest>/chunk-<index>.part`, verify BLAKE3.
-3. After all chunks verified: concatenate in order → output file; delete part files.
+2. For each chunk in order: `StreamRequest{hash: chunk.hash}`, write to `<data_dir>/downloads/<H_manifest>/chunk-<index>.part`, verify BLAKE3. A part already present that matches its declared size and BLAKE3 is reused rather than re-fetched, so an interrupted download resumes without paying twice.
+3. After all chunks verified: concatenate in order → output file, whose length is checked against `total_bytes` **before** the file is renamed into place. Part files are then retained or deleted per § Blob retention below.
+
+`<data_dir>` is the resolved client data dir — `--data-dir`/`identity.data_dir`, defaulting to `~/.decdn/client` — so parts share a root with the buyer-channel store rather than sitting in a fixed location an explicit `--data-dir` would not move.
+
+A manifest is rejected at decode if it declares more than 1,000,000 chunks, any zero-size chunk, a `filename` that is not a bare basename, or trailing bytes after the record. Each chunk is a separate paid pull and a separate part file, so the chunk cap bounds spending and file count; it is not an allocation bound, since the chunk list is decoded before the cap is applied (an over-large list implies an over-large manifest blob, which `--max-blob-mb` already caps).
 
 ### Blob retention
 
