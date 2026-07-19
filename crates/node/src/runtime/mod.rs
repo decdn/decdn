@@ -300,36 +300,40 @@ fn log_region_snapshot(accountant: &crate::region_accounting::RegionAccountant) 
     }
 }
 
-/// Build the endpoint, register handlers on a `Router`, spawn the metrics
-/// server and gossip tasks, and run until a shutdown signal is received.
+/// Runtime infrastructure built during the front bring-up phase of [`run`].
 ///
-/// SIGHUP triggers a hot-reload of mutable config fields via
-/// [`RuntimeReloadState`] (see issue #236). Other signals
-/// (SIGINT/SIGTERM) trigger graceful shutdown.
-///
-/// The signal streams (SIGHUP, SIGTERM) are registered **once** before
-/// the select loop and reused on every iteration. Re-creating
-/// `tokio::signal::unix::Signal` each iteration would race with signal
-/// delivery: a SIGHUP that arrives while `reload_runtime_config(..)` is
-/// running would have nowhere to land if the future holding the
-/// `Signal` had already been dropped, and would be silently lost. The
-/// persistent stream queues the signal until the next `recv()` call
-/// (kernel-managed, with coalescing) so concurrent or rapidly-repeated
-/// signals are observed deterministically.
-#[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
-pub async fn run(
-    cfg: ResolvedConfig,
-    config_path: Option<PathBuf>,
-    reload_state: Arc<RuntimeReloadState>,
-) -> anyhow::Result<()> {
-    // Captured at the very top of `run()`, before any `await` or I/O,
-    // so `admin_v1_health.uptime_s` reflects the entire process lifetime
-    // — including the RPC reachability preflight below (which can spend
-    // up to its 5s timeout on flaky networks). Operators reasoning about
-    // "how long has this node been up?" want every second since `decdn
-    // run` was invoked, not just everything after the admin server bound.
-    let started_at = std::time::Instant::now();
+/// A plain by-value bundle of the long-lived handles the rest of `run` (and the
+/// shutdown sequence) consumes. `run` destructures it immediately so every
+/// downstream call site keeps referring to the same-named locals.
+struct Infra {
+    node_metrics: Arc<metrics::Metrics>,
+    secret_key: SecretKey,
+    eth_signer: Arc<PrivateKeySigner>,
+    concrete_channel_store: Arc<PersistentChannelStateStore>,
+    channel_state_store: Arc<dyn ChannelStateStore>,
+    pending_settle_store: Arc<dyn PendingSettleStore>,
+    watcher_checkpoint_store: Arc<dyn decdn_incentive::KeyedCheckpointStore>,
+    receipt_writer_shutdown: CancellationToken,
+    receipt_sink: Arc<dyn crate::receipt_log::ReceiptSink>,
+    receipt_writer: tokio::task::JoinHandle<()>,
+    node_origin: Option<crate::node_origin::NodeOrigin>,
+    pull_through_origin: Option<Arc<crate::node_origin::NodeOrigin>>,
+    cache: CacheEngine,
+    ep: Endpoint,
+    gossip: iroh_gossip::net::Gossip,
+    limiter: Arc<ConnectionLimiter>,
+}
 
+/// Front bring-up phase: RPC preflight, identity/keystore load, voucher-state
+/// and receipt stores, cache + origin chain, iroh endpoint, gossip, and the
+/// connection limiter. Extracted verbatim from [`run`]; the two `reload_state`
+/// attach side effects stay inline at their original positions so a SIGHUP
+/// delivered mid-bring-up still finds a target.
+#[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
+async fn build_infra(
+    cfg: &ResolvedConfig,
+    reload_state: &RuntimeReloadState,
+) -> anyhow::Result<Infra> {
     // Preflight: verify RPC endpoint is reachable before committing to
     // port binding. A 5-second timeout keeps startup responsive on flaky
     // networks while still catching typos and dead endpoints early.
@@ -351,7 +355,7 @@ pub async fn run(
     // runs scrypt/argon2 (hundreds of milliseconds to multi-second under
     // hardened KDF params), so it must run on a blocking thread to avoid
     // stalling the tokio runtime.
-    let eth_signer = Arc::new(load_eth_signer(&cfg).await?);
+    let eth_signer = Arc::new(load_eth_signer(cfg).await?);
     tracing::info!(address = %eth_signer.address(), "loaded eth keystore");
 
     // Open the off-chain voucher-state store (issue #527, ADR 003
@@ -478,7 +482,7 @@ pub async fn run(
     // `populate` for the fused pull-and-forward path.
     let pull_through_origin = node_origin.clone().map(Arc::new);
     let cache = build_cache(
-        &cfg,
+        cfg,
         Arc::clone(&node_metrics),
         node_origin.clone().map(|o| Arc::new(o) as Arc<dyn Origin>),
     )
@@ -537,6 +541,75 @@ pub async fn run(
     // (#235). Done immediately after construction so a SIGHUP delivered
     // during the rest of startup still finds a target.
     reload_state.attach_limiter(Some(Arc::clone(&limiter)));
+
+    Ok(Infra {
+        node_metrics,
+        secret_key,
+        eth_signer,
+        concrete_channel_store,
+        channel_state_store,
+        pending_settle_store,
+        watcher_checkpoint_store,
+        receipt_writer_shutdown,
+        receipt_sink,
+        receipt_writer,
+        node_origin,
+        pull_through_origin,
+        cache,
+        ep,
+        gossip,
+        limiter,
+    })
+}
+
+/// Build the endpoint, register handlers on a `Router`, spawn the metrics
+/// server and gossip tasks, and run until a shutdown signal is received.
+///
+/// SIGHUP triggers a hot-reload of mutable config fields via
+/// [`RuntimeReloadState`] (see issue #236). Other signals
+/// (SIGINT/SIGTERM) trigger graceful shutdown.
+///
+/// The signal streams (SIGHUP, SIGTERM) are registered **once** before
+/// the select loop and reused on every iteration. Re-creating
+/// `tokio::signal::unix::Signal` each iteration would race with signal
+/// delivery: a SIGHUP that arrives while `reload_runtime_config(..)` is
+/// running would have nowhere to land if the future holding the
+/// `Signal` had already been dropped, and would be silently lost. The
+/// persistent stream queues the signal until the next `recv()` call
+/// (kernel-managed, with coalescing) so concurrent or rapidly-repeated
+/// signals are observed deterministically.
+#[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
+pub async fn run(
+    cfg: ResolvedConfig,
+    config_path: Option<PathBuf>,
+    reload_state: Arc<RuntimeReloadState>,
+) -> anyhow::Result<()> {
+    // Captured at the very top of `run()`, before any `await` or I/O,
+    // so `admin_v1_health.uptime_s` reflects the entire process lifetime
+    // — including the RPC reachability preflight below (which can spend
+    // up to its 5s timeout on flaky networks). Operators reasoning about
+    // "how long has this node been up?" want every second since `decdn
+    // run` was invoked, not just everything after the admin server bound.
+    let started_at = std::time::Instant::now();
+
+    let Infra {
+        node_metrics,
+        secret_key,
+        eth_signer,
+        concrete_channel_store,
+        channel_state_store,
+        pending_settle_store,
+        watcher_checkpoint_store,
+        receipt_writer_shutdown,
+        receipt_sink,
+        receipt_writer,
+        node_origin,
+        pull_through_origin,
+        cache,
+        ep,
+        gossip,
+        limiter,
+    } = Box::pin(build_infra(&cfg, &reload_state)).await?;
 
     // SlashJudge EIP-712 domain for probe `slash_sig` (ADR 014 §1–2). Parsed
     // through the shared zero-address guard (#1219) for a uniform "every daemon
