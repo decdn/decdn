@@ -3442,6 +3442,51 @@ mod tests {
     }
 
     #[test]
+    fn blacklist_watcher_down_seconds_tracks_true_downtime() {
+        // Mirrors the staker-set, slash, and origin-directory guards for the
+        // blacklist compliance watcher (#1283): the gauge measures downtime, not
+        // cycle age, so a long healthy cycle reads 0, a backoff window climbs,
+        // and re-establishing clears it. Blacklist reaches these recorders
+        // composed into the `InitialSyncGate` hooks rather than as standalone
+        // `on_established` / `on_backoff` closures, so this pins the recorder
+        // behavior independently of that composition.
+        let mut metrics = Metrics::new();
+        metrics.started_at = Instant::now()
+            .checked_sub(Duration::from_hours(1))
+            .unwrap_or_else(Instant::now);
+        metrics.blacklist_watcher_cycle_established();
+        let text = metrics.encode().unwrap();
+        assert!(
+            has_metric_line(&text, "decdn_blacklist_watcher_down_seconds", 0),
+            "down-seconds must read 0 across a long healthy cycle:\n{text}"
+        );
+
+        metrics.blacklist_watcher_backoff_started();
+        if let Ok(mut down_since) = metrics.blacklist_watcher_down_since.lock() {
+            *down_since = Instant::now().checked_sub(Duration::from_secs(150));
+        }
+        let text = metrics.encode().unwrap();
+        assert!(
+            has_metric_line(&text, "decdn_blacklist_watcher_down_seconds", 150),
+            "down-seconds should climb to the downtime depth once in backoff:\n{text}"
+        );
+        // The restart counter bumps exactly once per drift window (edge-triggered).
+        metrics.blacklist_watcher_backoff_started();
+        let text = metrics.encode().unwrap();
+        assert!(
+            has_metric_line(&text, "decdn_blacklist_watcher_restarts_total", 1),
+            "restarts must bump once per drift window, not per call:\n{text}"
+        );
+
+        metrics.blacklist_watcher_cycle_established();
+        let text = metrics.encode().unwrap();
+        assert!(
+            has_metric_line(&text, "decdn_blacklist_watcher_down_seconds", 0),
+            "down-seconds should reset to 0 once the cycle re-establishes:\n{text}"
+        );
+    }
+
+    #[test]
     #[allow(clippy::panic)] // deliberately poison the lock, mirroring `dispatch::tests`.
     fn poisoned_down_since_reports_i64_max_not_zero() {
         // The load-bearing invariant of the down-seconds gauges: a poisoned
@@ -3467,8 +3512,8 @@ mod tests {
             has_metric_line(&text, "decdn_slash_watcher_down_seconds", i64_max),
             "a poisoned down_since must report i64::MAX, not 0:\n{text}"
         );
-        // The two healthy watchers still read 0 in the same scrape — the poison
-        // is isolated to its own row of the shared recompute.
+        // The three healthy watchers still read 0 in the same scrape — the
+        // poison is isolated to its own row of the shared recompute.
         assert!(
             has_metric_line(&text, "decdn_staker_set_watcher_down_seconds", 0),
             "a poisoned slash lock must not perturb the staker-set gauge:\n{text}"
@@ -3476,6 +3521,10 @@ mod tests {
         assert!(
             has_metric_line(&text, "decdn_origin_directory_watcher_down_seconds", 0),
             "a poisoned slash lock must not perturb the origin-directory gauge:\n{text}"
+        );
+        assert!(
+            has_metric_line(&text, "decdn_blacklist_watcher_down_seconds", 0),
+            "a poisoned slash lock must not perturb the blacklist gauge:\n{text}"
         );
     }
 
