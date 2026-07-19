@@ -60,9 +60,10 @@ struct StreamLabels {
 /// Build a [`WatcherHook`] that invokes one `&self` recorder on a shared
 /// `Metrics`, deduping the per-watcher `Box::new(move || metrics.foo())`
 /// closures the metrics-wiring watcher sites used to each define (#1251; five
-/// of the six `LogSink` sites wire hooks since #1283 brought `blacklist` to
-/// parity). Pass the recorder as a method
-/// path, e.g. `metric_hook(&metrics, Metrics::slash_watcher_cycle_established)`.
+/// of the six `LogSink` sites now wire at least one hook — only `SettlementSink`
+/// wires none, and `reputation_indexer` wires `on_backoff` alone, to a
+/// non-downtime recorder (#1283)). Pass the recorder as a method path, e.g.
+/// `metric_hook(&metrics, Metrics::slash_watcher_cycle_established)`.
 pub(crate) fn metric_hook(metrics: &Arc<Metrics>, record: fn(&Metrics)) -> WatcherHook {
     let metrics = Arc::clone(metrics);
     Box::new(move || record(&metrics))
@@ -1103,15 +1104,22 @@ pub struct DecdnMetrics {
     /// During such a window the node stops learning `HashBlacklisted` entries
     /// and stops re-scoping the ones it holds, so a hash that becomes
     /// blacklisted in scope stays servable — and serving it is slashable
-    /// (`SlashJudge.submitBlacklistChallenge`). The `OpenMetrics` encoder
-    /// appends the `_total` suffix.
+    /// (`SlashJudge.submitBlacklistChallenge`).
+    ///
+    /// Scope: this tracks **chain-read outages only** — ticks the poll loop
+    /// reports as errors. A post-startup re-scope that fails to *enforce*
+    /// entries it already knows about does not move it, because
+    /// `BlacklistSink::on_tick_complete` returns `Ok` once the initial-sync
+    /// gate has fired. Do not read a flat counter as proof the deny-set is
+    /// enforced. The `OpenMetrics` encoder appends the `_total` suffix.
     pub blacklist_watcher_restarts: Counter,
     /// `decdn_blacklist_watcher_down_seconds` (#1283): true downtime — seconds
     /// the blacklist compliance watcher has been in the error/backoff state.
     /// Reads `0` for the life of any established cycle; recomputed at scrape
     /// time from a monotonic `down_since`. A poisoned lock reports `i64::MAX`
-    /// (alerting direction). This is the watcher whose silence is most
-    /// expensive, so it is the one worth alerting on non-zero.
+    /// (alerting direction). Non-zero means the node is serving under a stale
+    /// deny-set, which is slashable — unlike the peer watchers' downtime, this
+    /// window carries direct economic exposure.
     pub blacklist_watcher_down_seconds: Gauge,
     /// `decdn_origin_directory_watcher_restarts_total` (#651): distinct drift
     /// windows the [`crate::dht::chain_origin_directory`] watcher has entered.
@@ -1662,13 +1670,14 @@ macro_rules! recorders {
 /// Generate the per-watcher downtime recorders on [`Metrics`].
 ///
 /// The four chain watchers (`slash`, `staker_set`, `origin_directory`,
-/// `blacklist`) share one downtime state machine: a `*_backoff_started` recorder that, on the
-/// `None -> Some` edge into an error window, stamps the watcher's
-/// `Mutex<Option<Instant>>` `down_since` field and bumps its `*_restarts`
-/// counter exactly once per drift window; and a `*_cycle_established` recorder
-/// that clears `down_since` on recovery. A poisoned lock skips the update; the
-/// scrape-time recompute then reports the `*_down_seconds` gauge as `i64::MAX`
-/// — the safe alerting direction, never `0` (which would mask an outage).
+/// `blacklist`) share one downtime state machine: a `*_backoff_started`
+/// recorder that, on the `None -> Some` edge into an error window, stamps the
+/// watcher's `Mutex<Option<Instant>>` `down_since` field and bumps its
+/// `*_restarts` counter exactly once per drift window; and a
+/// `*_cycle_established` recorder that clears `down_since` on recovery. A
+/// poisoned lock skips the update; the scrape-time recompute then reports the
+/// `*_down_seconds` gauge as `i64::MAX` — the safe alerting direction, never
+/// `0` (which would mask an outage).
 ///
 /// These cannot live in `recorders!` because their bodies branch and touch
 /// `Metrics`'s own `Mutex` state rather than a single `self.decdn.field.op(v)`.

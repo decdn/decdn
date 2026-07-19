@@ -249,7 +249,11 @@ const fn cursor_start() -> CursorStart {
 /// either completes cleanly (`Ok`) or the loop falls into backoff (`Err`), so
 /// the runtime can gate the ALPN router on blacklist enforcement being live.
 /// `metrics` carries the `blacklist_watcher_*` downtime family (#1283), which
-/// reports every drift window — not just the first one the one-shot gate sees.
+/// reports every drift window the poll loop surfaces as a tick error — not
+/// just the first one the one-shot gate sees. It is error-triggered, so it
+/// does not observe a re-scope that fails to enforce entries after the gate
+/// has fired (`on_tick_complete` returns `Ok` in that case); see #1283's
+/// follow-up on enforcement-failure counters.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn<P>(
     provider: P,
@@ -274,7 +278,10 @@ where
     // Composed, not chained: `on_established`/`on_backoff` each hold a single
     // hook, and the one-shot `InitialSyncGate` already owns both. So the
     // downtime recorders are folded into the same closures rather than wired as
-    // separate calls the way the four peer watchers do it (#1283).
+    // separate `metric_hook` calls the way the three peer downtime watchers do
+    // it — `slash_watcher`, `dht::chain_origin_directory`, and
+    // `dht::capacity_bond_registry` (which fires the `staker_set_*` family, not
+    // a capacity-bond one) (#1283).
     let established_metric = metric_hook(metrics, Metrics::blacklist_watcher_cycle_established);
     let backoff_metric = metric_hook(metrics, Metrics::blacklist_watcher_backoff_started);
 
@@ -296,7 +303,14 @@ where
     // once the gate has fired (`signal` takes the sender exactly once).
     // The downtime recorders run first so a runtime woken by the one-shot gate
     // never observes a `/metrics` scrape that disagrees with the readiness it
-    // was just handed. Unlike the gate, they fire on *every* cycle transition.
+    // was just handed — and so the increment happens-before the send, which is
+    // what makes the tests' post-`ready_rx` metric assertions race-free.
+    // Unlike the gate, these fire on later cycles too, but the two legs are
+    // asymmetric: the loop edge-gates `on_established` behind its `established`
+    // flag, while `on_backoff` fires on *every* errored tick. The once-per-
+    // window restart count therefore rests entirely on the recorder's own
+    // `down_since.is_none()` guard in `watcher_downtime_recorders!` — do not
+    // remove it, or the counter becomes per-tick.
     .on_established(Box::new(move || {
         established_metric();
         established_gate.signal(Ok(()));
@@ -554,11 +568,55 @@ mod tests {
         }
     }
 
+    /// A head source that fails, then succeeds once, then fails again — the
+    /// RPC-flap shape that drives the loop through backoff → established →
+    /// backoff. `head` is the first call of every tick, so each verdict here
+    /// decides that whole tick's outcome.
+    struct FlakyHead {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl HeadSource for FlakyHead {
+        async fn head(&self) -> Result<u64> {
+            match self
+                .calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            {
+                1 => Ok(25),
+                _ => anyhow::bail!("head unavailable"),
+            }
+        }
+    }
+
     /// Render `/metrics` and report whether `name` is present with `value`.
-    /// Mirrors the `has_metric_line` helper the `metrics` unit tests use.
+    /// Same assertion shape as the `metrics` unit tests' `has_metric_line`, but
+    /// encodes internally so callers hold a `&Metrics`.
     fn metric_reads(metrics: &Metrics, name: &str, value: u64) -> Result<bool> {
         let needle = format!("{name} {value}");
         Ok(metrics.encode()?.lines().any(|line| line == needle))
+    }
+
+    /// Poll `/metrics` until `name` reads `value`. The watcher's tick cadence
+    /// floors at one second, so a multi-transition assertion cannot be made
+    /// synchronously after `spawn`. Safe against a missed sample: every metric
+    /// awaited here is monotonic.
+    async fn await_metric(metrics: &Metrics, name: &str, value: u64) -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if metric_reads(metrics, name, value)? {
+                    return Ok::<(), anyhow::Error>(());
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .with_context(|| {
+            format!(
+                "timed out waiting for `{name} {value}`:\n{:?}",
+                metrics.encode()
+            )
+        })?
     }
 
     #[tokio::test]
@@ -654,19 +712,60 @@ mod tests {
             readiness.is_ok(),
             "a clean first replay must signal readiness: {readiness:?}"
         );
-        // #1283: the metric hook is composed into the *same* closure as the gate
-        // signal above, so this pins that adding it did not displace the gate —
-        // and that a healthy cycle reports no downtime and no drift window.
-        assert!(
-            metric_reads(&metrics, "decdn_blacklist_watcher_down_seconds", 0)?,
-            "an established cycle must report zero downtime:\n{}",
-            metrics.encode()?
+        // Deliberately no metric assertion here. A fresh `Metrics` already
+        // reads `down_seconds 0` / `restarts_total 0` with the hooks entirely
+        // unwired, so asserting either would pin nothing. The `established`
+        // leg is covered by `established_rearms_the_drift_window` below, where
+        // a *later* backoff can only re-arm if this hook cleared `down_since`.
+        handle.shutdown();
+        Ok(())
+    }
+
+    /// The load-bearing test for the composed `on_established` hook. Deleting
+    /// `established_metric()` from the closure in `spawn` leaves every other
+    /// test in the suite green: the two `spawn` tests each cover a single
+    /// transition, and the recorder-level tests never go through `spawn` at
+    /// all. Only a re-arm proves the hook ran — `backoff_started` is
+    /// edge-triggered on `down_since` being unset, so the second window counts
+    /// if and only if `established` closed the first.
+    ///
+    /// Asserting `down_seconds 0` after the established tick would prove
+    /// nothing instead: an immediate scrape reads `0` even with the window
+    /// open, because the elapsed time floors to zero seconds. (Same reasoning
+    /// as the staker-set peer at `dht::capacity_bond_registry`.)
+    #[tokio::test]
+    async fn established_rearms_the_drift_window() -> Result<()> {
+        let asserter = alloy::providers::mock::Asserter::new();
+        // Consumed by the one healthy tick's replay window; the failing ticks
+        // never reach the provider, because `head` is what fails.
+        asserter.push_success(&Vec::<Log>::new());
+        let provider = alloy::providers::ProviderBuilder::new().connect_mocked_client(asserter);
+        let tmp = tempfile::tempdir()?;
+        let cache = CacheEngine::open(tmp.path(), Vec::new(), 1).await?;
+        let (ready_tx, _ready_rx) = tokio::sync::oneshot::channel();
+        let metrics = Arc::new(Metrics::new());
+
+        let handle = spawn(
+            provider,
+            Address::repeat_byte(0x11),
+            Address::repeat_byte(0x22),
+            cache,
+            0,
+            Duration::from_secs(1),
+            Arc::new(FlakyHead {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }),
+            Duration::from_mins(10),
+            ready_tx,
+            &metrics,
         );
-        assert!(
-            metric_reads(&metrics, "decdn_blacklist_watcher_restarts_total", 0)?,
-            "a clean cycle must count no drift window:\n{}",
-            metrics.encode()?
-        );
+
+        // Tick 1 fails: one drift window opens.
+        await_metric(&metrics, "decdn_blacklist_watcher_restarts_total", 1).await?;
+        // Tick 2 succeeds (`on_established` clears `down_since`) and tick 3
+        // fails again. The counter can only reach 2 if the clear happened.
+        await_metric(&metrics, "decdn_blacklist_watcher_restarts_total", 2).await?;
+
         handle.shutdown();
         Ok(())
     }
@@ -674,9 +773,10 @@ mod tests {
     /// The downtime family must track *repeated* outages, which is the whole
     /// gap #1283 closed: the one-shot `InitialSyncGate` fires exactly once, so
     /// before the metric hooks a blacklist loop that recovered and then wedged
-    /// again — the realistic RPC-flap shape — was invisible in both logs and
-    /// metrics. Drives the recorders directly (the composed hooks are covered
-    /// end-to-end through `spawn` by the two tests above).
+    /// again — the realistic RPC-flap shape — was visible only as a repeating
+    /// `watcher RPC error` warn line, with no metric an alert could fire on.
+    /// Drives the recorders directly; the composed hooks are covered
+    /// end-to-end through `spawn` by `established_rearms_the_drift_window`.
     #[test]
     fn repeated_drift_windows_each_count_once() -> Result<()> {
         let metrics = Metrics::new();
@@ -691,16 +791,14 @@ mod tests {
             metrics.encode()?
         );
 
-        // Recovery clears the downtime gauge...
+        // Recovery closes the window. Asserting `down_seconds 0` here would
+        // pass even if `cycle_established` were a no-op — an immediate scrape
+        // floors the elapsed time to zero seconds either way — so the re-arm
+        // below is what actually pins the clear.
         metrics.blacklist_watcher_cycle_established();
-        assert!(
-            metric_reads(&metrics, "decdn_blacklist_watcher_down_seconds", 0)?,
-            "recovery must clear the downtime gauge:\n{}",
-            metrics.encode()?
-        );
 
-        // ...and the next outage is a distinct window the one-shot gate could
-        // never have surfaced.
+        // The next outage is a distinct window the one-shot gate could never
+        // have surfaced.
         metrics.blacklist_watcher_backoff_started();
         assert!(
             metric_reads(&metrics, "decdn_blacklist_watcher_restarts_total", 2)?,
