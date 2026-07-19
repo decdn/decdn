@@ -236,6 +236,28 @@ The shared `capacity-bond` watcher follows `CapacityBond` membership events to k
 | `decdn_staker_set_watcher_restarts_total` (rate) | > 0 | > 0 sustained | Investigate a flapping RPC endpoint; correlate with `decdn_staker_set_watcher_down_seconds` depth. |
 | `decdn_staker_set_watcher_resolve_failures_total` (rate) | > 0 | > 0 sustained | A `nodeIdOf` RPC is failing and silently dropping membership changes — the cached active-staker set is drifting from chain state. Check the RPC provider; correlate with `decdn_staker_set_active_count`. |
 
+##### Watcher Liveness, Panic, and Enforcement Metrics
+
+All six chain-event watchers run through one shared `resumable_watcher::run` loop. The `*_down_seconds` / `*_restarts_total` down-family above is **error-triggered**: it moves only when a poll tick returns `Err`. A task that panics while healthy, wedges in an await the per-call timeout does not cover, or exits cleanly on shutdown leaves the down-since state unset, so `*_down_seconds` reads a healthy `0` — a dead watcher is byte-identical to a live one (#1316, #1320). Two additive families close that gap uniformly across all six, and #1283/#1316 also brought `blacklist`, `settlement`, and `reputation_indexer` to full down-family parity: they now expose `restarts_total` / `down_seconds` matching the staker-set rows above, and `reputation_indexer` additionally keeps its separate `reputation_indexer_rpc_failures_total` (which counts every failing tick rather than the healthy→error edge).
+
+In the metric names below, `<watcher>` expands to one of **`slash_watcher`**, **`staker_set_watcher`**, **`origin_directory_watcher`**, **`blacklist_watcher`**, **`settlement_watcher`**, or **`reputation_indexer`** — note the last carries **no** `_watcher_` infix (e.g. the real series is `decdn_reputation_indexer_last_tick_timestamp_seconds` / `decdn_reputation_indexer_restarts_total`, not `decdn_reputation_indexer_watcher_*`).
+
+| Metric | Type | Tier | Labels | Description |
+|--------|------|------|--------|-------------|
+| `decdn_<watcher>_last_tick_timestamp_seconds` | Gauge | M | — | **Positive liveness signal** (#1316): Unix wall-clock time of the last *successful* poll tick, stamped every tick (including idle ticks — a successful head read is proof of life). Unlike the error-triggered down-family, a panicked, wedged, or cleanly-exited task stops advancing this, so staleness is detectable. One series per watcher (`slash`, `staker_set`, `origin_directory`, `blacklist`, `settlement`, `reputation_indexer`). Reads `0` until the first successful tick. |
+| `decdn_<watcher>_task_panicked_total` | Counter | M | — | The watcher task unwound on a panic (#1316). Bumped from a `Drop` guard in `resumable_watcher::run` — the only thing that runs on the unwind, since the detached task is never awaited. **Any non-zero value is a bug in this node.** One series per watcher. |
+| `decdn_blacklist_enforcement_failures_total` | Counter | M | — | Distinct hashes a batched re-scope could not re-verify or evict this pass (`Recheck::Failed` — a disk error or a scope `eth_call` failure) (#1319). Non-zero means the deny-set is **not fully enforced** and a blacklisted blob may still be servable and slashable (`SlashJudge.submitBlacklistChallenge`), even while `decdn_blacklist_watcher_down_seconds` reads `0` — the two answer different questions (deny-set enforced vs chain readable). Pairs with the aggregate `warn!` (`"blacklist re-scope could not enforce every entry"`). |
+
+**Recommended alerts:**
+
+| Metric | Warning | Critical | Action |
+|--------|---------|----------|--------|
+| `(decdn_<watcher>_last_tick_timestamp_seconds > 0) and (time() - decdn_<watcher>_last_tick_timestamp_seconds > 3 × poll_interval)` | ✓ | sustained | The watcher has not completed a tick — panicked, wedged, or exited. For `blacklist` this means the node may be serving content blacklisted after the failure (slashable); for the others, the corresponding cache/projection is drifting. Restart the daemon and check the RPC provider. **The `> 0` guard is required:** the gauge reads `0` until the first successful tick, so an unguarded `time() - gauge` fires forever on a fresh boot and permanently on a node that never enables a conditionally-spawned watcher (`origin_directory`, `reputation_indexer`). A watcher that never establishes at all is caught by its down-family / the blacklist readiness gate, not here. |
+| `decdn_<watcher>_task_panicked_total` (rate) | > 0 | > 0 | A watcher task panicked. Never expected — capture the `error!` log line and file a bug. |
+| `decdn_blacklist_enforcement_failures_total` (rate) | > 0 | > 0 sustained | The blacklist deny-set is not fully enforced — a blacklisted blob may be servable and slashable. Check disk health and the `ContentBlacklist` RPC; correlate with the `unenforced` `warn!`. |
+
+> **Alert on the gauge, not the restart-counter rate (#1322).** The `*_watcher_restarts_total` counters are edge-triggered through a `Mutex<Option<Instant>>` whose update is skipped on a poisoned lock (anti-panic policy) — once poisoned, the counter freezes silently, so `rate(*_watcher_restarts_total[5m])` can go permanently quiet with no signal that it did. Alert on `*_down_seconds` (a poisoned lock there reports `i64::MAX`, the safe direction) for sustained chain-read outages, and on `time() - *_last_tick_timestamp_seconds` for liveness. The restart counter is for correlation/depth, not as a primary alert.
+
 ### Health Endpoint
 
 `GET /health` (same HTTP port as `/metrics`) returns a JSON object:

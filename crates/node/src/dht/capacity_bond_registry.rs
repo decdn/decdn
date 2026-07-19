@@ -398,6 +398,11 @@ where
     .on_backoff(metric_hook(
         &metrics,
         Metrics::staker_set_watcher_backoff_started,
+    ))
+    .on_tick_success(metric_hook(&metrics, Metrics::staker_set_watcher_tick))
+    .on_task_panic(metric_hook(
+        &metrics,
+        Metrics::staker_set_watcher_task_panicked,
     ));
     // One task, one `WatcherHandle`, shared by both façades and the runtime: it
     // lives while any of the three holds it and aborts when the last drops.

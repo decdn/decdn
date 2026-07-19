@@ -83,6 +83,53 @@ groups:
             Multiple blacklist versions missed. Investigate RPC / poll failure
             immediately.
 
+      - alert: DecdnBlacklistWatcherStalled
+        # Positive liveness: the gauge is stamped every successful poll tick, so
+        # staleness catches a panicked, wedged, or exited watcher that the
+        # error-triggered down-seconds gauge reads as a healthy 0 (#1316/#1320).
+        # 180s ≈ several poll intervals; tune to content_blacklist_poll_interval_sec.
+        # The `> 0` guard skips the pre-first-tick sentinel (the gauge reads 0
+        # until the first successful tick), so a fresh boot doesn't self-fire.
+        expr: (decdn_blacklist_watcher_last_tick_timestamp_seconds > 0) and (time() - decdn_blacklist_watcher_last_tick_timestamp_seconds > 180)
+        for: 5m
+        labels:
+          severity: critical
+          slash_risk: blacklist_violation
+        annotations:
+          summary: "Blacklist watcher not ticking on {{ $labels.instance }}"
+          description: |
+            No successful blacklist poll tick for several intervals — the
+            watcher has panicked, wedged, or exited. The node may be serving
+            content blacklisted after the failure, which is slashable. Restart
+            the daemon and check the RPC provider. See adr/011-content-takedown.md.
+
+      - alert: DecdnBlacklistEnforcementFailing
+        expr: rate(decdn_blacklist_enforcement_failures_total[10m]) > 0
+        for: 2m
+        labels:
+          severity: critical
+          slash_risk: blacklist_violation
+        annotations:
+          summary: "Blacklist deny-set not fully enforced on {{ $labels.instance }}"
+          description: |
+            A re-scope could not re-verify or evict every known entry (disk or
+            scope eth_call failure). A blacklisted blob may still be servable and
+            slashable even while blacklist_watcher_down_seconds reads 0. Check
+            disk health and the ContentBlacklist RPC. See adr/011-content-takedown.md.
+
+      - alert: DecdnWatcherTaskPanicked
+        # One rule covers all six chain-event watchers via the metric-name match.
+        expr: rate({__name__=~"decdn_.+_task_panicked_total"}[10m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "A chain-event watcher task panicked on {{ $labels.instance }}"
+          description: |
+            {{ $labels.__name__ }} incremented — a watcher task unwound on a
+            panic. Never expected under the anti-panic policy. Capture the
+            error! log line naming the watcher label and file a bug.
+
       - alert: DecdnRateBoundsClamp
         expr: rate(decdn_rate_bounds_clamp_events_total[5m]) > 0
         for: 10m
@@ -167,6 +214,51 @@ groups:
             Fewer than 3 peers known via gossip for 10 minutes. Check gossip
             connectivity; client selection will be impaired.
 
+      # Chain-event watcher liveness (#1316): the *_last_tick_timestamp_seconds
+      # gauge advances only while the watcher actually completes ticks, so
+      # staleness catches a panicked/wedged/exited task the error-triggered
+      # down-seconds gauge reads as a healthy 0. 180s ≈ several poll intervals;
+      # tune to your event_poll_interval. The `> 0` guard skips the pre-first-tick
+      # sentinel (gauge reads 0 until the first success), so a fresh boot — and a
+      # node that never enables a conditionally-spawned watcher — doesn't
+      # self-fire. Blacklist has its own (slash-risk) rule in decdn-slash-safety;
+      # settlement/reputation are in decdn-delivery.
+      - alert: DecdnSlashWatcherStalled
+        expr: (decdn_slash_watcher_last_tick_timestamp_seconds > 0) and (time() - decdn_slash_watcher_last_tick_timestamp_seconds > 180)
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Slash watcher not ticking on {{ $labels.instance }}"
+          description: |
+            No successful slash-detection poll tick for several intervals — the
+            watcher may have panicked, wedged, or exited, so a slash against this
+            operator could go undetected. Restart and check the RPC provider.
+
+      - alert: DecdnStakerSetWatcherStalled
+        expr: (decdn_staker_set_watcher_last_tick_timestamp_seconds > 0) and (time() - decdn_staker_set_watcher_last_tick_timestamp_seconds > 180)
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Staker-set watcher not ticking on {{ $labels.instance }}"
+          description: |
+            The cached active-staker set / node-address bindings projection is no
+            longer being refreshed and will drift from chain state. Correlate with
+            decdn_staker_set_watcher_down_seconds and check the RPC provider.
+
+      - alert: DecdnOriginDirectoryWatcherStalled
+        expr: (decdn_origin_directory_watcher_last_tick_timestamp_seconds > 0) and (time() - decdn_origin_directory_watcher_last_tick_timestamp_seconds > 180)
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Origin-directory watcher not ticking on {{ $labels.instance }}"
+          description: |
+            The cached namespace → operator directory is no longer refreshed; the
+            prefetch authorized-origin gate reads that cache. Restart and check the
+            RPC provider.
+
       # NOTE: /health 503 detection requires an external prober (e.g.
       # blackbox_exporter) — it is not surfaced as a decdn_* metric. Add
       # an alert in your blackbox rules file along the lines of
@@ -225,3 +317,33 @@ groups:
             Saturation forces has_blob: false answers for cached content,
             losing revenue. Increase max_probe_holds proportional to cache
             size (recommended: ≥25% of cache capacity).
+
+      # Chain-event watcher liveness (#1316) for the two settlement/reputation
+      # watchers — staleness of their last successful poll tick. 180s ≈ several
+      # poll intervals; tune to your event_poll_interval. The `> 0` guard skips
+      # the pre-first-tick sentinel; reputation_indexer is only spawned when
+      # subscribe_reputation is set, so the guard also silences it when disabled.
+      - alert: DecdnSettlementWatcherStalled
+        expr: (decdn_settlement_watcher_last_tick_timestamp_seconds > 0) and (time() - decdn_settlement_watcher_last_tick_timestamp_seconds > 180)
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Settlement watcher not ticking on {{ $labels.instance }}"
+          description: |
+            No successful payment-settlement poll tick for several intervals —
+            channel open/settle/close events are not being ingested, so
+            voucher redemption and reconciliation stall. Restart and check the
+            RPC provider.
+
+      - alert: DecdnReputationIndexerStalled
+        expr: (decdn_reputation_indexer_last_tick_timestamp_seconds > 0) and (time() - decdn_reputation_indexer_last_tick_timestamp_seconds > 180)
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Reputation indexer not ticking on {{ $labels.instance }}"
+          description: |
+            No successful reputation-indexer poll tick for several intervals — no
+            settlements are being ingested, so reporter weights stay 0 and network
+            scores never leave neutral. Restart and check the RPC provider.

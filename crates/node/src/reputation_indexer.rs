@@ -117,9 +117,24 @@ impl SettlementIndexer {
             event_poll_interval,
             "reputation-indexer",
         )
-        .on_backoff(metric_hook(
+        // Backoff fires two recorders: the pre-existing per-failing-tick
+        // `reputation_indexer_rpc_failure` counter AND the new edge-triggered
+        // `reputation_indexer_backoff_started` (once per drift window, #1316).
+        .on_backoff({
+            let metrics = Arc::clone(&metrics);
+            Box::new(move || {
+                metrics.reputation_indexer_rpc_failure();
+                metrics.reputation_indexer_backoff_started();
+            })
+        })
+        .on_established(metric_hook(
             &metrics,
-            Metrics::reputation_indexer_rpc_failure,
+            Metrics::reputation_indexer_cycle_established,
+        ))
+        .on_tick_success(metric_hook(&metrics, Metrics::reputation_indexer_tick))
+        .on_task_panic(metric_hook(
+            &metrics,
+            Metrics::reputation_indexer_task_panicked,
         ));
         // This sink observes no shutdown token, so it ignores the one `spawn`
         // mints (`|_| sink`); the runtime drives graceful stop via `shutdown`.

@@ -79,6 +79,7 @@ use crate::chain_events::resumable_watcher::{
 };
 use crate::chain_events::shared_head::HeadSource;
 use crate::chain_events::timed;
+use crate::metrics::{Metrics, metric_hook};
 
 /// Result reported exactly once when the first full replay + re-scope pass
 /// either establishes compliance or proves startup cannot safely continue.
@@ -173,6 +174,9 @@ struct BlacklistSink<P: Provider + Clone> {
     last_rescan: Option<Instant>,
     /// Still pending only during the mandatory first full replay + re-scope.
     initial_sync: InitialSyncGate,
+    /// Node metrics — feeds `blacklist_enforcement_failures` from a re-scope that
+    /// could not enforce every entry (#1319).
+    metrics: Arc<Metrics>,
 }
 
 impl<P: Provider + Clone> LogSink for BlacklistSink<P> {
@@ -205,7 +209,7 @@ impl<P: Provider + Clone> LogSink for BlacklistSink<P> {
             .last_rescan
             .is_none_or(|at| at.elapsed() >= self.rescan_interval);
         if due {
-            let clean = rescan(
+            let RescanOutcome { clean, failed } = rescan(
                 &self.contract,
                 self.operator,
                 &self.cache,
@@ -213,10 +217,25 @@ impl<P: Provider + Clone> LogSink for BlacklistSink<P> {
                 &self.shutdown,
             )
             .await;
+            // Surface the slashable "deny-set not fully enforced" condition even
+            // after the initial-sync gate has fired, when a failed re-scope
+            // otherwise returns `Ok(())` and every downtime metric reads healthy
+            // (#1319). Separate from the down-family, which tracks chain-read
+            // outages only.
+            if failed > 0 {
+                self.metrics.blacklist_enforcement_failure(failed);
+            }
             // A pass with any failed re-check retries at the poll cadence until
             // it comes back clean; only a clean pass waits out the full
             // operator cadence again.
             self.last_rescan = clean.then(Instant::now);
+            // An unenforceable initial re-scope bails so the shared loop's
+            // backoff hook fires `Err` into the readiness gate — fail-CLOSED, so
+            // the router never opens on an un-vetted deny-set. The shutdown case
+            // is handled in `resumable_watcher::run`, which suppresses the
+            // backoff EDGE (and the established edge) once the token is cancelled,
+            // so an orderly stop mid-sync stamps no false drift window (#1321) and
+            // signals no false readiness — no shutdown check is needed here.
             if !clean && self.initial_sync.pending() {
                 anyhow::bail!(
                     "initial ContentBlacklist replay/re-scope could not enforce every entry"
@@ -258,6 +277,7 @@ pub(crate) fn spawn<P>(
     head: Arc<dyn HeadSource>,
     rescan_interval: Duration,
     initial_sync_tx: oneshot::Sender<InitialSyncResult>,
+    metrics: &Arc<Metrics>,
 ) -> WatcherHandle
 where
     P: Provider + Clone + 'static,
@@ -267,6 +287,9 @@ where
     let initial_sync = InitialSyncGate::new(initial_sync_tx);
     let established_gate = initial_sync.clone();
     let backoff_gate = initial_sync.clone();
+    let established_metrics = Arc::clone(metrics);
+    let backoff_metrics = Arc::clone(metrics);
+    let sink_metrics = Arc::clone(metrics);
 
     let cfg = WatcherConfig::new(
         head,
@@ -283,14 +306,26 @@ where
     // first established cycle signals `Ok`, the first backoff signals `Err`, and
     // an initial re-scope that can't enforce every entry bails the sink into that
     // backoff (see `BlacklistSink::on_tick_complete`). Later cycles are no-ops
-    // once the gate has fired (`signal` takes the sender exactly once).
-    .on_established(Box::new(move || established_gate.signal(Ok(()))))
+    // once the gate has fired (`signal` takes the sender exactly once). The
+    // watcher-health recorder fires *before* the gate signal so a test awaiting
+    // the readiness oneshot never races the metric (#1283). This brings blacklist
+    // to parity with its five peers, which all wire the same down-family.
+    .on_established(Box::new(move || {
+        established_metrics.blacklist_watcher_cycle_established();
+        established_gate.signal(Ok(()));
+    }))
     .on_backoff(Box::new(move || {
+        backoff_metrics.blacklist_watcher_backoff_started();
         backoff_gate.signal(Err(
             "initial ContentBlacklist sync failed: chain RPC or cache eviction unavailable"
                 .to_string(),
         ));
-    }));
+    }))
+    .on_tick_success(metric_hook(metrics, Metrics::blacklist_watcher_tick))
+    .on_task_panic(metric_hook(
+        metrics,
+        Metrics::blacklist_watcher_task_panicked,
+    ));
     // Unlike the five flush-only sinks, `BlacklistSink` must observe the *same*
     // token the loop cancels: `rescan` polls it between per-hash `eth_call`s so a
     // large deny-set re-scope yields promptly to shutdown. `spawn` mints one
@@ -306,41 +341,76 @@ where
         rescan_interval: rescan_interval.max(Duration::from_secs(1)),
         last_rescan: None,
         initial_sync,
+        metrics: sink_metrics,
     })
+}
+
+/// Outcome of one batched re-scope pass.
+struct RescanOutcome {
+    /// `true` iff every entry was re-verified with no failed re-check. A
+    /// shutdown-cancelled pass is unclean (`false`); it is decidedly **not** a
+    /// drift window, but that is enforced in `resumable_watcher::run` (which
+    /// suppresses the backoff edge under a cancelled token), not here (#1321).
+    clean: bool,
+    /// Distinct hashes this pass could not enforce (`Recheck::Failed` — a disk
+    /// error or a scope `eth_call` failure). Feeds `blacklist_enforcement_failures`
+    /// so the slashable "deny-set not fully enforced" condition has a metric of
+    /// its own, even after the initial-sync gate has fired (#1319). A
+    /// shutdown-cancelled pass reports the failures observed **before** the
+    /// cancel (not `0`): a blob whose eviction already failed is a real, still-live
+    /// exposure that must not be zeroed just because the process is stopping.
+    failed: u64,
 }
 
 /// Re-scope every distinct hash in `known` (one scope `eth_call` per hash, not
 /// per regional entry) and evict those now in scope. Interruptible by shutdown
-/// between hashes. Returns `true` iff the pass completed with no failed
-/// re-check (a shutdown-interrupted pass counts as unclean so the next tick
-/// finishes it — moot in practice, since the loop exits on cancel).
+/// between hashes. A shutdown-interrupted pass returns `clean = false` (so the
+/// next tick would finish it — moot in practice, since the loop exits on cancel)
+/// and the `failed` count accumulated up to the cancel point (#1319 exposures
+/// already observed are not zeroed by an orderly stop).
 async fn rescan<P>(
     contract: &ContentBlacklist::ContentBlacklistInstance<P>,
     operator: Address,
     cache: &CacheEngine,
     state: &mut WatcherState,
     shutdown: &CancellationToken,
-) -> bool
+) -> RescanOutcome
 where
     P: Provider + Clone,
 {
     let snapshot = state.distinct_hashes();
     let mut evicted = 0usize;
+    let mut failed = 0u64;
     let mut clean = true;
     for hash in snapshot {
         if shutdown.is_cancelled() {
-            return false;
+            return RescanOutcome {
+                clean: false,
+                failed,
+            };
         }
         match recheck(contract, operator, cache, state, hash).await {
             Recheck::Evicted => evicted = evicted.saturating_add(1),
             Recheck::NoAction => {}
-            Recheck::Failed => clean = false,
+            Recheck::Failed => {
+                clean = false;
+                failed = failed.saturating_add(1);
+            }
         }
     }
     if evicted > 0 {
         info!(evicted, "blacklist watcher evicted blacklisted blobs");
     }
-    clean
+    if failed > 0 {
+        // The negative counterpart to the `evicted` line: the aggregate count of
+        // entries left unenforced this pass (#1319). Per-hash failures already
+        // log a `warn!` in `scope_check`/`evict`; this names the total.
+        warn!(
+            unenforced = failed,
+            "blacklist re-scope could not enforce every entry"
+        );
+    }
+    RescanOutcome { clean, failed }
 }
 
 /// Handle one live log: `HashBlacklisted` records the `(region, hash)` entry
@@ -555,6 +625,7 @@ mod tests {
             Arc::new(FailingHead),
             Duration::from_mins(10),
             ready_tx,
+            &Arc::new(Metrics::new()),
         );
         let readiness = tokio::time::timeout(Duration::from_secs(1), ready_rx)
             .await
@@ -608,6 +679,7 @@ mod tests {
             Arc::new(StaticHead(25)),
             Duration::from_mins(10),
             ready_tx,
+            &Arc::new(Metrics::new()),
         );
         let readiness = tokio::time::timeout(Duration::from_secs(1), ready_rx)
             .await
@@ -691,5 +763,105 @@ mod tests {
         state.add_entry(FR, hash);
 
         assert_eq!(state.distinct_hashes(), vec![hash]);
+    }
+
+    /// Build a `BlacklistSink` with `entries` distinct known hashes over a mocked
+    /// provider whose `eth_call` errors (empty asserter), so every re-scope
+    /// re-check forces `Recheck::Failed`. `initial_sync` is left pending or
+    /// pre-fired per the caller.
+    async fn failing_sink(
+        pending_gate: bool,
+        entries: u8,
+        metrics: &Arc<Metrics>,
+    ) -> Result<BlacklistSink<impl Provider + Clone>> {
+        let asserter = alloy::providers::mock::Asserter::new();
+        let provider = alloy::providers::ProviderBuilder::new().connect_mocked_client(asserter);
+        let tmp = tempfile::tempdir()?;
+        let cache = CacheEngine::open(tmp.path(), Vec::new(), 1).await?;
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let initial_sync = InitialSyncGate::new(tx);
+        if !pending_gate {
+            initial_sync.signal(Ok(()));
+        }
+        let mut state = state();
+        for n in 0..entries {
+            state.add_entry(US, Hash::from_bytes([n; 32]));
+        }
+        Ok(BlacklistSink {
+            contract: ContentBlacklist::new(Address::repeat_byte(0x11), provider),
+            operator: Address::repeat_byte(0x22),
+            cache,
+            state,
+            shutdown: CancellationToken::new(),
+            rescan_interval: Duration::from_secs(1),
+            last_rescan: None,
+            initial_sync,
+            metrics: Arc::clone(metrics),
+        })
+    }
+
+    /// #1319: after the initial-sync gate has fired, a re-scope that cannot
+    /// enforce every entry must NOT bail (so the loop reads healthy), but MUST
+    /// bump `blacklist_enforcement_failures_total` — the slashable exposure gets
+    /// its own metric even while `blacklist_watcher_down_seconds` reads 0.
+    #[tokio::test]
+    async fn post_gate_enforcement_failure_counts_without_bailing() -> Result<()> {
+        let metrics = Arc::new(Metrics::new());
+        let mut sink = failing_sink(false, 1, &metrics).await?;
+
+        let result = sink.on_tick_complete().await;
+        assert!(
+            result.is_ok(),
+            "a post-gate enforcement failure must not bail the tick: {result:?}"
+        );
+
+        let text = metrics.encode()?;
+        assert!(
+            text.lines()
+                .any(|l| l == "decdn_blacklist_enforcement_failures_total 1"),
+            "one unenforced entry must bump the enforcement counter:\n{text}"
+        );
+        assert!(
+            text.lines()
+                .any(|l| l == "decdn_blacklist_watcher_down_seconds 0"),
+            "an enforcement failure is not a chain-read outage — down_seconds stays 0:\n{text}"
+        );
+        Ok(())
+    }
+
+    /// #1319, aggregate semantics: the counter bumps by the *count* of unenforced
+    /// hashes in one pass (`inc_by`), not once — undercounting would understate a
+    /// slashable exposure that feeds a `rate()`-based alert.
+    #[tokio::test]
+    async fn enforcement_failure_counter_aggregates_per_pass() -> Result<()> {
+        let metrics = Arc::new(Metrics::new());
+        let mut sink = failing_sink(false, 2, &metrics).await?;
+
+        sink.on_tick_complete().await?;
+
+        let text = metrics.encode()?;
+        assert!(
+            text.lines()
+                .any(|l| l == "decdn_blacklist_enforcement_failures_total 2"),
+            "two unenforced entries in one pass must bump the counter by 2:\n{text}"
+        );
+        Ok(())
+    }
+
+    /// The #1321 guard's counterpart at the sink layer: with the gate still
+    /// pending and no shutdown, an unenforceable re-scope still bails into backoff
+    /// (the shared loop only suppresses that bail's *effect* under a cancelled
+    /// token — see `resumable_watcher::tests`; the sink must still signal it).
+    #[tokio::test]
+    async fn pending_unclean_still_bails() -> Result<()> {
+        let metrics = Arc::new(Metrics::new());
+        let mut sink = failing_sink(true, 1, &metrics).await?;
+
+        let result = sink.on_tick_complete().await;
+        assert!(
+            result.is_err(),
+            "a genuine unenforceable initial re-scope must still bail into backoff"
+        );
+        Ok(())
     }
 }

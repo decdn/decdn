@@ -86,7 +86,7 @@ use crate::chain_events::resumable_watcher::{
 use crate::chain_events::shared_head::HeadSource;
 use crate::chain_events::{AbortOnDrop, REORG_MARGIN_BLOCKS, timed};
 use crate::handlers::client::ClientHandler;
-use crate::metrics::{Metrics, SettleParty};
+use crate::metrics::{Metrics, SettleParty, metric_hook};
 use crate::onchain_tx::{TxOutcome, send_and_await_receipt};
 
 /// Capacity of the redeem-hint channel. Hints are advisory (a missed hint
@@ -308,7 +308,20 @@ impl<P: Provider + Clone + 'static> PaymentChannelService<P> {
             cursor_start(Arc::clone(&checkpoint_store)),
             event_poll_interval,
             "settlement",
-        );
+        )
+        .on_established(metric_hook(
+            &metrics,
+            Metrics::settlement_watcher_cycle_established,
+        ))
+        .on_backoff(metric_hook(
+            &metrics,
+            Metrics::settlement_watcher_backoff_started,
+        ))
+        .on_tick_success(metric_hook(&metrics, Metrics::settlement_watcher_tick))
+        .on_task_panic(metric_hook(
+            &metrics,
+            Metrics::settlement_watcher_task_panicked,
+        ));
         // This sink observes no shutdown token, so it ignores the one `spawn`
         // mints (`|_| sink`). The returned handle owns that token; the service
         // cancels it in `close_open_channels_on_shutdown` at its own ordering
