@@ -19,19 +19,20 @@ import { RegionScopeLib } from "./RegionScopeLib.sol";
 ///         token holders can post a TOKEN bond to challenge an entry; the
 ///         appeal flows through the same {open → fast-track → ratify/reverse}
 ///         lifecycle as `SlashAppeal` slashing appeals.
-/// @dev    Standing is enforced at filing for all three paths (ADR 031 § 216,
-///         audit I-3): `StandingPath.Operator` requires a current-region match
+/// @dev    Standing is enforced at filing for all three paths
+///         (ADR 031 § Function signatures and revert table, audit I-3):
+///         `StandingPath.Operator` requires a current-region match
 ///         (ADR 011 § Standing path 2, via ADR 030); `StandingPath.Publisher`
 ///         requires owning the declared namespace and that namespace having
 ///         claimed the hash (via `PublisherRegistry`); `StandingPath.TokenHolder`
 ///         needs no extra credential — the escrowed appeal bond IS the standing,
 ///         with no separate balance threshold. Because the bond is escrowed by
 ///         the appeal it cannot be flash-loaned, so the synthetic-standing
-///         clawback (ADR 031 § 216) is omitted by design, not
-///         deferred: there is nothing to fake. This is safe only because standing
-///         alone grants no automatic outcome (an `Open` appeal has zero interim
-///         relief and every consequential transition is multisig/governor-gated);
-///         revisit if that ever changes.
+///         clawback (ADR 031 § Function signatures and revert table) is omitted
+///         by design, not deferred: there is nothing to fake. This is safe only
+///         because standing alone grants no automatic outcome (an `Open` appeal
+///         has zero interim relief and every consequential transition is
+///         multisig/governor-gated); revisit if that ever changes.
 ///         The interim-relief concurrent fast-track cap is two-tier: a
 ///         per-region ceiling (`REGION_CONCURRENT_RELIEF_CAP`) plus a
 ///         per-(filer, region) sub-cap (`FILER_CONCURRENT_RELIEF_CAP`) so no
@@ -573,12 +574,13 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         // forge-lint: disable-next-line(block-timestamp)
         if (cooldownUntilAt > block.timestamp) revert FilerInRejectionCooldown(cooldownUntilAt);
 
-        // Standing enforcement (ADR 031 § 216, audit I-3). Enum-range check
-        // first; then Publisher and Operator each prove standing with a credential
-        // check, while TokenHolder standing is the escrowed bond itself (see its
-        // branch). All external reads below hit trusted immutable contracts and
-        // this function is `nonReentrant`, so the later appeal-state writes are not
-        // a reentrancy vector (aderyn reentrancy-state-change FP).
+        // Standing enforcement (ADR 031 § Function signatures and revert table,
+        // audit I-3). Enum-range check first; then Publisher and Operator each
+        // prove standing with a credential check, while TokenHolder standing is
+        // the escrowed bond itself (see its branch). All external reads below
+        // hit trusted immutable contracts and this function is `nonReentrant`,
+        // so the later appeal-state writes are not a reentrancy vector (aderyn
+        // reentrancy-state-change FP).
         if (uint8(standingPath) > uint8(StandingPath.TokenHolder)) revert UnauthorizedStanding(standingPath);
 
         if (standingPath == StandingPath.Publisher) {
@@ -607,8 +609,9 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
             // the `filerRejections` cooldown + the perjury denylist, so a balance
             // threshold would protect nothing that isn't already protected. And
             // because the bond is escrowed by the appeal it can't be flash-loaned,
-            // so the synthetic-standing clawback (ADR 031 § 216) is omitted by
-            // design, not deferred: there is nothing to fake.
+            // so the synthetic-standing clawback (ADR 031 § Function signatures
+            // and revert table) is omitted by design, not deferred: there is
+            // nothing to fake.
             //
             // SAFE ONLY because standing alone grants no automatic outcome: an
             // `Open` appeal has zero interim relief and every consequential

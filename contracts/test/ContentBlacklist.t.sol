@@ -1143,7 +1143,8 @@ contract ContentBlacklistTest is Test {
     }
 
     // -----------------------------------------------------------------
-    // ADR 031 § 216 — standing enforcement at filing (audit I-3)
+    // ADR 031 § Function signatures and revert table — standing enforcement at
+    // filing (audit I-3)
     // -----------------------------------------------------------------
 
     /// @dev Give `who` a namespace that has claimed `hash`, returning the id.
