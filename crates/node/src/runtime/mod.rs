@@ -2166,7 +2166,6 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
 /// persistent stream queues the signal until the next `recv()` call
 /// (kernel-managed, with coalescing) so concurrent or rapidly-repeated
 /// signals are observed deterministically.
-#[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
 pub async fn run(
     cfg: ResolvedConfig,
     config_path: Option<PathBuf>,
