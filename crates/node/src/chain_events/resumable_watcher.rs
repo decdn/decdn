@@ -338,9 +338,11 @@ impl WatcherConfig {
 /// [`WatcherConfig::on_backoff`]). Boxed so a watcher can close over its
 /// `Arc<Metrics>` without the generic loop knowing the concrete metric.
 ///
-/// Hooks MUST be panic-free: `on_task_panic` runs from a `Drop` guard during an
-/// unwind, where a second panic aborts the process. In practice every hook is a
-/// `metric_hook` closure that only bumps an infallible counter/gauge.
+/// Hooks SHOULD be panic-free: in practice every hook is a `metric_hook` closure
+/// that only bumps an infallible counter/gauge. `on_task_panic` additionally runs
+/// from a `Drop` guard during an unwind — where a second panic would abort the
+/// process — so [`run`]'s guard wraps that one call in `catch_unwind` as a
+/// backstop; the other hooks fire on normal paths and are not guarded.
 pub(crate) type WatcherHook = Box<dyn Fn() + Send + Sync>;
 
 fn fire(hook: Option<&WatcherHook>) {
@@ -484,7 +486,14 @@ struct PanicGuard<'a> {
 impl Drop for PanicGuard<'_> {
     fn drop(&mut self) {
         if std::thread::panicking() {
-            fire(self.on_panic);
+            // This runs during an unwind: a second panic here would abort the
+            // process. Hooks are contractually panic-free (see [`WatcherHook`]),
+            // but unlike the `WarmOutcome` precedent — which calls one hardcoded,
+            // known-infallible method — this guard fires an arbitrary
+            // caller-supplied closure, so catch defensively. A future hook bug
+            // must degrade to a swallowed panic, never take the node down.
+            let hook = self.on_panic;
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fire(hook)));
             error!(
                 label = self.label,
                 "watcher task PANICKED; nothing awaits this task, so this counter is its only trace"

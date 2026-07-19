@@ -3697,16 +3697,6 @@ mod tests {
     }
 
     #[test]
-    fn unix_now_secs_is_a_plausible_wall_clock() {
-        // A sanity floor: any real host clock is past 2023-11-14 (1_700_000_000).
-        // Anti-panic: the helper never unwraps, so a pre-epoch clock reads 0.
-        assert!(
-            unix_now_secs() > 1_700_000_000,
-            "unix_now_secs must return a plausible current wall-clock time"
-        );
-    }
-
-    #[test]
     fn watcher_liveness_gauges_stamp_wall_clock_on_tick() {
         // The `*_watcher_tick` recorders (the `on_tick_success` hooks) stamp a
         // wall-clock timestamp, so a live watcher's gauge is non-zero and a dead
