@@ -49,7 +49,7 @@ impl ClientHandler {
         let bound_addr: Arc<Mutex<Option<Address>>> = Arc::new(Mutex::new(None));
         let client_node_id = B256::from(*conn.remote_id().as_bytes());
 
-        let idle_timeout = self.idle_timeout.get().copied().unwrap_or(APP_IDLE_TIMEOUT);
+        let idle_timeout = self.idle_timeout.unwrap_or(APP_IDLE_TIMEOUT);
         let mut inflight = futures_util::stream::FuturesUnordered::new();
         loop {
             tokio::select! {
@@ -207,10 +207,10 @@ impl ClientHandler {
                 // semantics included). It is a pull-*initiation* gate only: a range
                 // already held is served from the `Ok(true)` arm above, so refusing
                 // held blobs stays `ContentBlacklist`'s job (ADR 011/031). The
-                // directory is attached only when the gate is enabled, so an unset
+                // directory is wired only when the gate is enabled, so an unset
                 // gate keeps the permissionless cache-role default.
                 if pull_origin_gate_blocks(
-                    self.pull_origin_gate.get(),
+                    self.pull_origin_gate.as_ref(),
                     &crate::dht::origin::Hash::from_bytes(req.hash),
                 ) {
                     return self
@@ -287,7 +287,7 @@ impl ClientHandler {
                 // of origin health.)
                 let mut locally_filled = false;
                 if range_pulled_size.is_none()
-                    && let Some(timeout) = self.local_populate.get().copied()
+                    && let Some(timeout) = self.local_populate
                     && self.pull_authorized(&req, verified_client).await
                 {
                     let local = self.try_local_populate(hash, timeout).await;
@@ -296,7 +296,7 @@ impl ClientHandler {
                 }
 
                 // Window-paced pull-through (#856, ADR 037) is the preferred path
-                // when its provider is attached: instead of buffering the whole
+                // when its provider is set: instead of buffering the whole
                 // blob via `populate` and only THEN serving (fronting 100% of the
                 // upstream cost before any downstream voucher), it fuses the
                 // upstream pull with downstream delivery so the per-request
@@ -320,7 +320,7 @@ impl ClientHandler {
                     // filled from a local origin (#1116). Skip the node→node fill
                     // and fall through to the size gate + delivery (which serves a
                     // partial via `export_range`).
-                } else if let Some(origin) = self.pull_through_origin.get()
+                } else if let Some(origin) = self.pull_through_origin.as_ref()
                     && req.byte_offset == 0
                     && req.byte_len == 0
                     && self.pull_authorized(&req, verified_client).await
@@ -358,8 +358,8 @@ impl ClientHandler {
                     }
                 } else {
                     // Buffered pull-through (#831): the pre-#856 path, used when
-                    // the window provider is unattached or for a resumed request.
-                    let buffered = match self.pull_through.get().copied() {
+                    // the window provider is unset or for a resumed request.
+                    let buffered = match self.pull_through {
                         Some(timeout) if self.pull_authorized(&req, verified_client).await => {
                             self.try_pull_through(hash, timeout).await
                         }

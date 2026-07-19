@@ -249,6 +249,8 @@ impl<P: Provider + Clone + 'static> PaymentChannelService<P> {
         event_poll_interval: Duration,
         head: Arc<dyn HeadSource>,
         metrics: Arc<Metrics>,
+        redeem_tx: mpsc::Sender<ChannelId>,
+        redeem_rx: mpsc::Receiver<ChannelId>,
     ) -> Result<Self> {
         let contract = PaymentChannel::new(payment_channel_addr, provider);
 
@@ -265,7 +267,10 @@ impl<P: Provider + Clone + 'static> PaymentChannelService<P> {
             "PaymentChannel settlement service bootstrap complete"
         );
 
-        let (redeem_tx, redeem_rx) = mpsc::channel(REDEEM_HINT_CAPACITY);
+        // The redeem-hint channel is created by the caller (`runtime`) and split:
+        // `redeem_tx` is handed to the `ClientHandler` at construction (so it can
+        // nudge redemption) and also stored here for `redeem_hint_sender()`;
+        // `redeem_rx` drives the redeemer loop below.
 
         // Settlement watcher on the resumable `eth_getLogs` poller (#1092/#1106).
         // The backfill floor and downtime-gap resume (#751/#762) are now the

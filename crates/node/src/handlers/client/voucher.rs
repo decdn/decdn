@@ -178,10 +178,10 @@ impl ClientHandler {
                 drop(guard);
                 // Stamp the in-memory last-voucher clock for
                 // `admin_v1_channels` (issue #749). Best-effort: an
-                // unattached clock (no admin surface) just skips. Done
+                // unset clock (no admin surface) just skips. Done
                 // after the guard drop — the activity map has its own
                 // lock and doesn't need the per-channel guard.
-                if let Some(activity) = self.voucher_activity.get() {
+                if let Some(activity) = self.voucher_activity.as_ref() {
                     activity.touch(channel_id);
                 }
                 // Audit receipt for this served-and-paid interval (issues #248,
@@ -189,24 +189,24 @@ impl ClientHandler {
                 // happens off the hot path in the background receipt writer.
                 self.record_receipt(hash, delta_bytes, client_node_id, wire.nonce);
                 // Per-region bandwidth accounting (#750). Best-effort: an
-                // unattached accountant (tests / no admin surface) skips.
+                // unset accountant (tests / no admin surface) skips.
                 // `delta_bytes` is exactly the bytes paid for this interval.
-                if let Some(acc) = self.region_accountant.get() {
+                if let Some(acc) = self.region_accountant.as_ref() {
                     acc.record_served(&client_node_id.0, delta_bytes).await;
                 }
                 // Credit the served bytes against the seed-leech caps (#856) for
                 // BOTH cache-hit and window-paced pull-through serves: this
                 // recoups the node-wide unrecouped-leech budget and raises the
                 // paying peer's per-peer share-ratio allowance. Best-effort —
-                // unattached (tests / feature off) just skips.
-                if let Some(gov) = self.leech_governor.get() {
+                // unset (tests / feature off) just skips.
+                if let Some(gov) = self.leech_governor.as_ref() {
                     gov.record_served(&client_node_id.0, delta_bytes);
                 }
                 // Demand-quality feedback (#820): if this blob was obtained by
                 // speculative prefetch, credit the served bytes to the policy's
                 // `served / acquired` ratio so the auto-throttle reflects whether
                 // prefetched content is actually being consumed.
-                if let Some(pf) = self.prefetch_engine.get() {
+                if let Some(pf) = self.prefetch_engine.as_ref() {
                     pf.note_served_if_prefetched(
                         *hash.as_bytes(),
                         delta_bytes,
@@ -222,7 +222,7 @@ impl ClientHandler {
                     self.metrics.voucher_nonce_gap();
                 }
                 // Hint the on-chain settlement service that this channel's
-                // accrued claim advanced (#327). Best-effort: an unattached or
+                // accrued claim advanced (#327). Best-effort: an unset or
                 // full hint channel just skips — the next voucher re-hints, the
                 // redeemer self-tick sweeps, and shutdown closes any residual
                 // claim. Only `Full` is counted (a saturated queue is a real
@@ -230,7 +230,7 @@ impl ClientHandler {
                 // #751). `Closed` — the redeemer aborted during shutdown
                 // `quiesce_redeemer` — is expected, not a fault, so it is
                 // deliberately left uncounted; don't "fix" this to count both.
-                if let Some(tx) = self.redeem_hint.get()
+                if let Some(tx) = self.redeem_hint.as_ref()
                     && let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) =
                         tx.try_send(channel_id)
                 {

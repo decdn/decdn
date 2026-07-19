@@ -86,7 +86,7 @@ impl ClientHandler {
         } else {
             let interval_bytes = self.voucher_interval_mb.saturating_mul(MB_BYTES).max(1);
             self.pull_ahead_bytes
-                .get()
+                .as_ref()
                 .map_or(decdn_common::config::DEFAULT_PULL_AHEAD_BYTES, |b| b.get())
                 .max(interval_bytes)
         };
@@ -117,11 +117,7 @@ impl ClientHandler {
 
         // (3) Open the progressive upstream pull, bounded by the pull-through
         // deadline so a slow/absent upstream can't pin the stream.
-        let deadline = self
-            .pull_through
-            .get()
-            .copied()
-            .unwrap_or(WINDOW_PULL_FALLBACK_DEADLINE);
+        let deadline = self.pull_through.unwrap_or(WINDOW_PULL_FALLBACK_DEADLINE);
         let (header, pull) =
             match tokio::time::timeout(deadline, origin.open_progressive_pull(hash)).await {
                 Ok(Some(pair)) => pair,
@@ -238,8 +234,6 @@ impl ClientHandler {
         // `pull_ahead_bytes` above that lets the pull run further ahead.
         let window = self
             .pull_ahead_bytes
-            .get()
-            .copied()
             .unwrap_or(Bytes::new(decdn_common::config::DEFAULT_PULL_AHEAD_BYTES))
             .max(Bytes::new(interval_bytes));
         let peer = client_node_id.0;

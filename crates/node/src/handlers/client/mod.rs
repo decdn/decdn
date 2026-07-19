@@ -18,8 +18,8 @@
 //! calls [`ClientHandler::register_open_channel`]. A voucher for a
 //! still-unknown `channel_id` is rejected with
 //! [`VoucherRejectReason::WrongChannel`] — the closest existing reason. After
-//! accepting a voucher the handler emits a redeem hint (see
-//! [`ClientHandler::attach_redeem_hint`]) so the settlement service can
+//! accepting a voucher the handler emits a redeem hint (via the `redeem_hint`
+//! sender wired on [`ClientHandlerDeps`]) so the settlement service can
 //! withdraw the accrued claim once it crosses its threshold.
 //!
 //! # 0-RTT
@@ -29,8 +29,8 @@
 //! takes the full handshake.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use alloy::dyn_abi::Eip712Domain;
@@ -90,7 +90,7 @@ const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const VOUCHER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const REJECTION_CLOSE_TIMEOUT: Duration = Duration::from_millis(250);
 /// Fallback overall deadline for opening a window-paced pull (#856) when no
-/// pull-through deadline is configured. In practice the runtime always attaches
+/// pull-through deadline is configured. In practice the runtime always sets
 /// one alongside the window provider, so this only guards a misconfiguration.
 const WINDOW_PULL_FALLBACK_DEADLINE: Duration = Duration::from_mins(1);
 
@@ -183,11 +183,12 @@ pub const BACKGROUND_FILL_HARD_CAP: Duration = Duration::from_hours(1);
 /// a FUTURE request, and dropping it costs a later cache miss, never a live one.
 pub const MAX_BACKGROUND_FILL_MB: u64 = 2048;
 
-/// Detached background cache-fill state (#859), attached post-construction via
-/// [`ClientHandler::attach_background_fill`]. When the foreground delivery
-/// deadline fires on a node-to-node miss, the handler spawns a task to keep
-/// warming the cache from a slow-but-available upstream for future requests.
-struct BackgroundFill {
+/// Detached background cache-fill state (#859), built by [`BackgroundFill::new`]
+/// and supplied to the handler at construction via [`ClientHandlerDeps`]. When
+/// the foreground delivery deadline fires on a node-to-node miss, the handler
+/// spawns a task to keep warming the cache from a slow-but-available upstream for
+/// future requests.
+pub(crate) struct BackgroundFill {
     /// Cancelled on node shutdown so in-flight warm tasks stop cooperatively at
     /// their next await rather than being left to run past drain.
     cancel: CancellationToken,
@@ -226,6 +227,40 @@ struct BackgroundFill {
     reserve_mb: u32,
 }
 
+impl BackgroundFill {
+    /// Build the background-fill state from the runtime knobs, sizing the memory
+    /// pool via [`warm_budget_mb`]. Called by the runtime wiring (and the
+    /// warm-budget tests) to populate [`ClientHandlerDeps::background_fill`].
+    ///
+    /// `budget` is an OPTIONAL overall wall-clock cap: the runtime passes
+    /// `Some(`[`BACKGROUND_FILL_HARD_CAP`]`)`; `None` (tests only) runs to
+    /// completion. It must be far LARGER than the foreground deadline, not equal
+    /// to it — the warm re-pulls from scratch, so capping it at the budget the
+    /// foreground just exhausted means a blob too large to fetch in one deadline
+    /// can never be warmed either (#1134) — but it cannot be absent, since
+    /// inactivity is not liveness (see [`BACKGROUND_FILL_HARD_CAP`]).
+    ///
+    /// `max_blob_size_mb` is the node's blob ceiling — what each warm reserves
+    /// from the [`MAX_BACKGROUND_FILL_MB`] memory pool, since a blob's size is not
+    /// known until it has been fetched. It is clamped to the pool, so an operator
+    /// who raises `max_blob_size_mb` above the pool gets one warm at a time rather
+    /// than none.
+    pub(crate) fn new(
+        cancel: CancellationToken,
+        budget: Option<Duration>,
+        max_blob_size_mb: u64,
+    ) -> Self {
+        let (pool_mb, reserve_mb) = warm_budget_mb(max_blob_size_mb);
+        Self {
+            cancel,
+            budget,
+            inflight: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            slots: Arc::new(tokio::sync::Semaphore::new(pool_mb as usize)),
+            reserve_mb,
+        }
+    }
+}
+
 /// RAII guard that clears a hash from [`BackgroundFill::inflight`] when its warm
 /// task ends (success, failure, or shutdown cancel), re-arming future misses.
 struct BgInflightGuard {
@@ -248,9 +283,9 @@ impl Drop for BgInflightGuard {
 
 /// Whether the reactive pull-through authorized-origin gate (#821) refuses to
 /// initiate a pull for `hash`. Returns `true` (refuse) only when the operator
-/// opted in — a directory is attached, via
-/// [`ClientHandler::attach_pull_origin_gate`] — AND that directory holds no
-/// authorized origin for the hash's namespace. An unattached gate (the default)
+/// opted in — a directory is wired on [`ClientHandlerDeps`] — AND that directory
+/// holds no
+/// authorized origin for the hash's namespace. An unset gate (the default)
 /// always returns `false`, preserving the permissionless cache role. Free
 /// function so the branch is unit-testable without a full handler / QUIC stream
 /// (the wire `NotFound` it produces is indistinguishable from a plain miss, so
@@ -285,7 +320,7 @@ fn arm_background_fill(
 
 /// Size the background-warm memory budget: `(pool_mb, reserve_mb)`, both in MiB.
 ///
-/// Split out from [`ClientHandler::attach_background_fill`] so the SIZING DECISION — the
+/// Split out from [`BackgroundFill::new`] so the SIZING DECISION — the
 /// only part with any judgement in it — is a pure function that can be asserted on
 /// directly. A test that stands up its own semaphore and reserves from it proves only that
 /// tokio's semaphore works; this is the thing that can actually be got wrong.
@@ -588,6 +623,124 @@ impl FillOutcome {
     }
 }
 
+/// Construction bundle for [`ClientHandler`] — the 16 required runtime deps plus
+/// every optional wiring hook, so a handler's full configuration is one literal
+/// at its call site instead of a `new()` call followed by a setter chain.
+///
+/// Build it with [`ClientHandlerDeps::new`] (required fields only; every optional
+/// defaults to `None`), set the `Some` optionals the deployment enables, then
+/// pass it to [`ClientHandler::new`]. Each optional field's runtime semantics are
+/// documented on the matching [`ClientHandler`] field.
+pub struct ClientHandlerDeps {
+    pub node_id: PublicKey,
+    pub metrics: Arc<Metrics>,
+    pub limiter: Arc<ConnectionLimiter>,
+    pub cache: CacheEngine,
+    pub eth_signer: Arc<PrivateKeySigner>,
+    pub slash_domain: Eip712Domain,
+    pub voucher_domain: Eip712Domain,
+    pub bind_domain: Eip712Domain,
+    pub channel_state_store: Arc<dyn ChannelStateStore>,
+    pub receipt_sink: Arc<dyn ReceiptSink>,
+    pub rate_per_mb: Arc<AtomicU64>,
+    pub delivery_floor: u64,
+    pub delivery_ceiling: u64,
+    pub voucher_interval_mb: u64,
+    pub max_blob_size_bytes: u64,
+    pub max_concurrent_streams: usize,
+    // Optional wiring — `None` unless the deployment enables the feature.
+    pub redeem_hint: Option<mpsc::Sender<ChannelId>>,
+    pub voucher_activity: Option<Arc<VoucherActivity>>,
+    pub region_accountant: Option<Arc<RegionAccountant>>,
+    pub pull_through: Option<Duration>,
+    pub local_populate: Option<Duration>,
+    /// `pub(crate)` — the inner [`BackgroundFill`] is a crate-internal type, so
+    /// only in-crate wiring/tests set it (via [`BackgroundFill::new`]); external
+    /// callers leave it `None`.
+    pub(crate) background_fill: Option<BackgroundFill>,
+    pub pull_through_origin: Option<Arc<NodeOrigin>>,
+    pub pull_ahead_bytes: Option<Bytes>,
+    pub leech_governor: Option<Arc<LeechGovernor>>,
+    pub pull_origin_gate: Option<Arc<dyn OriginDirectory>>,
+    pub prefetch_engine: Option<Arc<crate::prefetch::PrefetchEngine>>,
+    pub idle_timeout: Option<Duration>,
+}
+
+impl std::fmt::Debug for ClientHandlerDeps {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientHandlerDeps")
+            .field("node_id", &self.node_id)
+            .field("voucher_interval_mb", &self.voucher_interval_mb)
+            .field("max_blob_size_bytes", &self.max_blob_size_bytes)
+            .field("max_concurrent_streams", &self.max_concurrent_streams)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ClientHandlerDeps {
+    /// The required runtime deps; every optional wiring hook defaults to `None`.
+    #[allow(clippy::too_many_arguments)] // required runtime state; optionals set on the returned value.
+    pub fn new(
+        node_id: PublicKey,
+        metrics: Arc<Metrics>,
+        limiter: Arc<ConnectionLimiter>,
+        cache: CacheEngine,
+        eth_signer: Arc<PrivateKeySigner>,
+        slash_domain: Eip712Domain,
+        voucher_domain: Eip712Domain,
+        bind_domain: Eip712Domain,
+        channel_state_store: Arc<dyn ChannelStateStore>,
+        receipt_sink: Arc<dyn ReceiptSink>,
+        rate_per_mb: Arc<AtomicU64>,
+        delivery_floor: u64,
+        delivery_ceiling: u64,
+        voucher_interval_mb: u64,
+        max_blob_size_bytes: u64,
+        max_concurrent_streams: usize,
+    ) -> Self {
+        Self {
+            node_id,
+            metrics,
+            limiter,
+            cache,
+            eth_signer,
+            slash_domain,
+            voucher_domain,
+            bind_domain,
+            channel_state_store,
+            receipt_sink,
+            rate_per_mb,
+            delivery_floor,
+            delivery_ceiling,
+            voucher_interval_mb,
+            max_blob_size_bytes,
+            max_concurrent_streams,
+            redeem_hint: None,
+            voucher_activity: None,
+            region_accountant: None,
+            pull_through: None,
+            local_populate: None,
+            background_fill: None,
+            pull_through_origin: None,
+            pull_ahead_bytes: None,
+            leech_governor: None,
+            pull_origin_gate: None,
+            prefetch_engine: None,
+            idle_timeout: None,
+        }
+    }
+
+    /// Wire the window-paced pull-through provider and its companion window size
+    /// together (#856). The two are only meaningful as a pair — the serve path
+    /// gates the fused pull-and-forward on `pull_through_origin` being `Some` and
+    /// reads `pull_ahead_bytes` as the pipeline window — so setting them through
+    /// one call keeps a caller from half-wiring the window path.
+    pub fn set_window_pull_through(&mut self, origin: Arc<NodeOrigin>, pull_ahead_bytes: Bytes) {
+        self.pull_through_origin = Some(origin);
+        self.pull_ahead_bytes = Some(pull_ahead_bytes);
+    }
+}
+
 /// `cdn/client/v1` paid-delivery handler.
 pub struct ClientHandler {
     node_id: PublicKey,
@@ -616,85 +769,85 @@ pub struct ClientHandler {
     /// Serializes absolute channel snapshots without holding the channel map
     /// while individual channel state (which may be fsync-bound) is locked.
     channel_metrics_refresh: Mutex<()>,
-    /// Redeem-hint sender to the on-chain settlement service (#327), attached
-    /// post-construction via [`ClientHandler::attach_redeem_hint`]. `None`
-    /// until attached (e.g. in tests with no settlement service) — a hint is
-    /// best-effort, so an unattached or full channel just skips it.
-    redeem_hint: OnceLock<mpsc::Sender<ChannelId>>,
+    /// Redeem-hint sender to the on-chain settlement service (#327), set at
+    /// construction via [`ClientHandlerDeps`]. `None` when no settlement service
+    /// is wired (e.g. tests) — a hint is best-effort, so an absent sender or a
+    /// full channel just skips it.
+    redeem_hint: Option<mpsc::Sender<ChannelId>>,
     /// In-memory last-voucher clock shared with `admin_v1_channels`
-    /// (issue #749), attached post-construction via
-    /// [`ClientHandler::attach_voucher_activity`]. `None` until attached
-    /// (e.g. tests with no admin surface) — stamping is best-effort, so
-    /// an unattached handler just skips it and the channel reports "no
-    /// activity since restart" to the operator.
-    voucher_activity: OnceLock<Arc<VoucherActivity>>,
-    /// Per-region bandwidth accountant (issue #750), attached post-construction
-    /// via [`ClientHandler::attach_region_accountant`]. `None` until attached
-    /// (tests / no admin surface) — recording is best-effort, so an unattached
-    /// handler simply skips it.
-    region_accountant: OnceLock<Arc<RegionAccountant>>,
-    /// Node-to-node cache-miss pull-through deadline (#831), attached
-    /// post-construction via [`ClientHandler::attach_pull_through`]. Unset
-    /// (the default — feature off, and in tests) keeps the pre-#831 behaviour:
-    /// a cache miss returns `NotFound`. When set, a miss *from a request that
-    /// proves ownership of the named channel* (see [`Self::pull_authorized`])
-    /// triggers `cache.populate` (the engine's `NodeOrigin` discovers, pays,
-    /// pulls, and fills the store), bounded by this deadline so a slow upstream
-    /// can't pin the delivery path. Proven channel ownership — not mere channel
-    /// existence, which is public — is the anti-proxy-abuse gate: a client
-    /// without an owned channel cannot make this node front upstream egress.
-    pull_through: OnceLock<Duration>,
-    /// Reactive LOCAL-origin pull-through deadline (#1116), attached via
-    /// [`ClientHandler::attach_local_populate`] whenever `[cache.origin]` is
-    /// configured — INDEPENDENT of `node_to_node_pull_through_enabled`. When set,
-    /// a cache miss on a proven-owned channel first tries to fill from the node's
-    /// OWN fs/http/s3 origin (`CacheEngine::populate_local`, which never touches
-    /// the paid `Peer` origin), so a cache-only operator can reactively serve its
-    /// own content and a local origin is preferred over the paid peer window
-    /// path. Unset keeps the pre-#1116 behavior (miss ⇒ node→node path or a plain
+    /// (issue #749), set at construction via [`ClientHandlerDeps`]. `None` when
+    /// no admin surface is wired (e.g. tests) — stamping is best-effort, so the
+    /// handler just skips it and the channel reports "no activity since restart"
+    /// to the operator.
+    voucher_activity: Option<Arc<VoucherActivity>>,
+    /// Per-region bandwidth accountant (issue #750), set at construction via
+    /// [`ClientHandlerDeps`]. `None` when no admin surface is wired (tests) —
+    /// recording is best-effort, so the handler simply skips it.
+    region_accountant: Option<Arc<RegionAccountant>>,
+    /// Node-to-node cache-miss pull-through deadline (#831), set at construction
+    /// via [`ClientHandlerDeps`]. `None` (the default — feature off, and in
+    /// tests) keeps the pre-#831 behaviour: a cache miss returns `NotFound`. When
+    /// `Some`, a miss *from a request that proves ownership of the named channel*
+    /// (see [`Self::pull_authorized`]) triggers `cache.populate` (the engine's
+    /// `NodeOrigin` discovers, pays, pulls, and fills the store), bounded by this
+    /// deadline so a slow upstream can't pin the delivery path. Proven channel
+    /// ownership — not mere channel existence, which is public — is the
+    /// anti-proxy-abuse gate: a client without an owned channel cannot make this
+    /// node front upstream egress.
+    pull_through: Option<Duration>,
+    /// Reactive LOCAL-origin pull-through deadline (#1116), set at construction
+    /// via [`ClientHandlerDeps`] whenever `[cache.origin]` is configured —
+    /// INDEPENDENT of `node_to_node_pull_through_enabled`. When `Some`, a cache
+    /// miss on a proven-owned channel first tries to fill from the node's OWN
+    /// fs/http/s3 origin (`CacheEngine::populate_local`, which never touches the
+    /// paid `Peer` origin), so a cache-only operator can reactively serve its own
+    /// content and a local origin is preferred over the paid peer window path.
+    /// `None` keeps the pre-#1116 behavior (miss ⇒ node→node path or a plain
     /// `NotFound`).
-    local_populate: OnceLock<Duration>,
-    /// Background cache-fill state (#859), attached post-construction via
-    /// [`ClientHandler::attach_background_fill`]. Unset (the default — feature
-    /// off, and in tests) means a foreground pull-through deadline simply
-    /// returns `NotFound` with no warming. When set, the deadline additionally
-    /// spawns a detached task to keep filling the cache from a slow upstream.
-    background_fill: OnceLock<BackgroundFill>,
-    /// Window-paced node→node pull-through provider (#856), attached
-    /// post-construction via [`ClientHandler::attach_window_pull_through`]. When
-    /// set (alongside `pull_through`), a cache miss for an offset-0 request that
-    /// proves channel ownership is served by fusing a progressive upstream pull
-    /// with downstream delivery — forwarding each chunk to the paying client and
-    /// teeing it into the cache — so per-request speculative exposure is bounded
-    /// to `pull_ahead_bytes` instead of the whole blob. Unset keeps the buffered
-    /// `populate` path (`pull_through`) or a plain `NotFound`.
-    pull_through_origin: OnceLock<Arc<NodeOrigin>>,
+    local_populate: Option<Duration>,
+    /// Background cache-fill state (#859), set at construction via
+    /// [`ClientHandlerDeps`]. `None` (the default — feature off, and in tests)
+    /// means a foreground pull-through deadline simply returns `NotFound` with no
+    /// warming. When `Some`, the deadline additionally spawns a detached task to
+    /// keep filling the cache from a slow upstream.
+    background_fill: Option<BackgroundFill>,
+    /// Window-paced node→node pull-through provider (#856), set at construction
+    /// via [`ClientHandlerDeps`]. When `Some` (alongside `pull_through`), a cache
+    /// miss for an offset-0 request that proves channel ownership is served by
+    /// fusing a progressive upstream pull with downstream delivery — forwarding
+    /// each chunk to the paying client and teeing it into the cache — so
+    /// per-request speculative exposure is bounded to `pull_ahead_bytes` instead
+    /// of the whole blob. `None` keeps the buffered `populate` path
+    /// (`pull_through`) or a plain `NotFound`.
+    pull_through_origin: Option<Arc<NodeOrigin>>,
     /// Per-request pipeline window in bytes (#856, ADR 037 `pull_ahead_bytes`),
-    /// set with [`ClientHandler::attach_window_pull_through`]. The window-paced
-    /// loop pulls at most this many bytes ahead of cleared downstream payment.
-    pull_ahead_bytes: OnceLock<Bytes>,
-    /// Node-wide seed-leech caps (#856, ADR 037), attached via
-    /// [`ClientHandler::attach_leech_governor`]. Consulted before/while a
-    /// speculative pull-through proceeds and credited from the voucher path.
-    /// Unset (tests / feature off) leaves only the per-request window.
-    leech_governor: OnceLock<Arc<LeechGovernor>>,
+    /// set at construction via [`ClientHandlerDeps`] alongside
+    /// `pull_through_origin`. The window-paced loop pulls at most this many bytes
+    /// ahead of cleared downstream payment.
+    pull_ahead_bytes: Option<Bytes>,
+    /// Node-wide seed-leech caps (#856, ADR 037), set at construction via
+    /// [`ClientHandlerDeps`]. Consulted before/while a speculative pull-through
+    /// proceeds and credited from the voucher path. `None` (tests / feature off)
+    /// leaves only the per-request window.
+    leech_governor: Option<Arc<LeechGovernor>>,
     /// Optional content-authorization gate on the reactive pull-through path
-    /// (#821, ADR 037 §Seed-leech caps / ADR 022 §Scope and limits), attached via
-    /// [`ClientHandler::attach_pull_origin_gate`] only when the operator sets
-    /// `cache.pull_through_require_authorized_origin = true`. Unset (the default
+    /// (#821, ADR 037 §Seed-leech caps / ADR 022 §Scope and limits), set at
+    /// construction via [`ClientHandlerDeps`] only when the operator sets
+    /// `cache.pull_through_require_authorized_origin = true`. `None` (the default
     /// and in tests) keeps the permissionless cache role: misses pull through
-    /// unconditionally. When set, a cache miss whose hash has no authorized origin
-    /// in this directory (`has_origin == false`) is refused with `NotFound` before
-    /// any upstream pull or cache-warming write — a pull-*initiation* gate only,
-    /// never consulted for a range already held. Shares the same
-    /// `OriginDirectory` the prefetch gate uses, so the namespace / default-open
-    /// (`namespaceId == 0`) / fail-closed-on-RPC-loss semantics are identical.
-    pull_origin_gate: OnceLock<Arc<dyn OriginDirectory>>,
-    /// Speculative-prefetch engine (#820), attached post-construction via
-    /// [`ClientHandler::attach_prefetch_engine`]. `None` in tests / when prefetch
-    /// is off. When set, the serve path credits bytes served from
-    /// prefetch-acquired blobs to the demand-quality numerator.
-    prefetch_engine: OnceLock<Arc<crate::prefetch::PrefetchEngine>>,
+    /// unconditionally. When `Some`, a cache miss whose hash has no authorized
+    /// origin in this directory (`has_origin == false`) is refused with
+    /// `NotFound` before any upstream pull or cache-warming write — a
+    /// pull-*initiation* gate only, never consulted for a range already held.
+    /// Shares the same `OriginDirectory` the prefetch gate uses, so the namespace
+    /// / default-open (`namespaceId == 0`) / fail-closed-on-RPC-loss semantics
+    /// are identical.
+    pull_origin_gate: Option<Arc<dyn OriginDirectory>>,
+    /// Speculative-prefetch engine (#820), set at construction via
+    /// [`ClientHandlerDeps`]. `None` in tests / when prefetch is off. When
+    /// `Some`, the serve path credits bytes served from prefetch-acquired blobs
+    /// to the demand-quality numerator.
+    prefetch_engine: Option<Arc<crate::prefetch::PrefetchEngine>>,
     rate_per_mb: Arc<AtomicU64>,
     delivery_floor: u64,
     delivery_ceiling: u64,
@@ -702,10 +855,10 @@ pub struct ClientHandler {
     max_blob_size_bytes: u64,
     max_concurrent_streams: usize,
     /// Application-layer idle-close ceiling (ADR 005 §Connection lifetime).
-    /// Unset (the default and production path) reads as [`APP_IDLE_TIMEOUT`]
-    /// (30s); a shorter value is injected via [`ClientHandler::set_idle_timeout`]
+    /// `None` (the default and production path) reads as [`APP_IDLE_TIMEOUT`]
+    /// (30s); a shorter value is set at construction via [`ClientHandlerDeps`]
     /// only by tests, so an idle-close case need not wait a real 30s.
-    idle_timeout: OnceLock<Duration>,
+    idle_timeout: Option<Duration>,
 }
 
 impl std::fmt::Debug for ClientHandler {
@@ -722,35 +875,23 @@ impl std::fmt::Debug for ClientHandler {
 impl ClientHandler {
     pub const ALPN: &'static [u8] = ALPN_CLIENT;
 
-    /// Construct the handler, hydrating per-channel state from `channel_state_store`.
+    /// Construct the handler from [`ClientHandlerDeps`], hydrating per-channel
+    /// state from the deps' `channel_state_store`.
+    ///
+    /// All optional runtime wiring (settlement redeem hints, pull-through
+    /// deadlines, the window/leech providers, …) is supplied on `deps` as
+    /// `Some`/`None` at construction — there is no post-construction attach step,
+    /// so a handler's full wiring is one reviewable literal at its call site.
     ///
     /// # Errors
     ///
     /// Propagates a [`decdn_incentive::StoreError`] if the persisted channel
     /// state cannot be loaded — the node must not serve paid delivery without
     /// knowing prior voucher state (the #527 replay guard).
-    #[allow(clippy::too_many_arguments)] // wiring struct; each arg is distinct runtime state.
-    pub fn new(
-        node_id: PublicKey,
-        metrics: Arc<Metrics>,
-        limiter: Arc<ConnectionLimiter>,
-        cache: CacheEngine,
-        eth_signer: Arc<PrivateKeySigner>,
-        slash_domain: Eip712Domain,
-        voucher_domain: Eip712Domain,
-        bind_domain: Eip712Domain,
-        channel_state_store: Arc<dyn ChannelStateStore>,
-        receipt_sink: Arc<dyn ReceiptSink>,
-        rate_per_mb: Arc<AtomicU64>,
-        delivery_floor: u64,
-        delivery_ceiling: u64,
-        voucher_interval_mb: u64,
-        max_blob_size_bytes: u64,
-        max_concurrent_streams: usize,
-    ) -> anyhow::Result<Self> {
+    pub fn new(deps: ClientHandlerDeps) -> anyhow::Result<Self> {
         let mut map = HashMap::new();
         let mut channel_deposit = U256::ZERO;
-        for state in channel_state_store.load_all()? {
+        for state in deps.channel_state_store.load_all()? {
             channel_deposit = channel_deposit.saturating_add(state.deposit);
             let bytes = state.last_bytes_delivered();
             map.insert(
@@ -761,175 +902,40 @@ impl ClientHandler {
                 })),
             );
         }
-        metrics.set_inbound_channel_snapshot(map.len(), channel_deposit);
+        deps.metrics
+            .set_inbound_channel_snapshot(map.len(), channel_deposit);
         Ok(Self {
-            node_id,
-            metrics,
-            limiter,
-            cache,
-            eth_signer,
-            slash_domain,
-            voucher_domain,
-            bind_domain,
-            channel_state_store,
-            receipt_sink,
+            node_id: deps.node_id,
+            metrics: deps.metrics,
+            limiter: deps.limiter,
+            cache: deps.cache,
+            eth_signer: deps.eth_signer,
+            slash_domain: deps.slash_domain,
+            voucher_domain: deps.voucher_domain,
+            bind_domain: deps.bind_domain,
+            channel_state_store: deps.channel_state_store,
+            receipt_sink: deps.receipt_sink,
             channels: Arc::new(Mutex::new(map)),
             channel_metrics_refresh: Mutex::new(()),
-            redeem_hint: OnceLock::new(),
-            voucher_activity: OnceLock::new(),
-            region_accountant: OnceLock::new(),
-            pull_through: OnceLock::new(),
-            local_populate: OnceLock::new(),
-            background_fill: OnceLock::new(),
-            pull_through_origin: OnceLock::new(),
-            pull_ahead_bytes: OnceLock::new(),
-            leech_governor: OnceLock::new(),
-            pull_origin_gate: OnceLock::new(),
-            prefetch_engine: OnceLock::new(),
-            rate_per_mb,
-            delivery_floor,
-            delivery_ceiling,
-            voucher_interval_mb,
-            max_blob_size_bytes,
-            max_concurrent_streams,
-            idle_timeout: OnceLock::new(),
+            redeem_hint: deps.redeem_hint,
+            voucher_activity: deps.voucher_activity,
+            region_accountant: deps.region_accountant,
+            pull_through: deps.pull_through,
+            local_populate: deps.local_populate,
+            background_fill: deps.background_fill,
+            pull_through_origin: deps.pull_through_origin,
+            pull_ahead_bytes: deps.pull_ahead_bytes,
+            leech_governor: deps.leech_governor,
+            pull_origin_gate: deps.pull_origin_gate,
+            prefetch_engine: deps.prefetch_engine,
+            rate_per_mb: deps.rate_per_mb,
+            delivery_floor: deps.delivery_floor,
+            delivery_ceiling: deps.delivery_ceiling,
+            voucher_interval_mb: deps.voucher_interval_mb,
+            max_blob_size_bytes: deps.max_blob_size_bytes,
+            max_concurrent_streams: deps.max_concurrent_streams,
+            idle_timeout: deps.idle_timeout,
         })
-    }
-
-    /// Override the application-layer idle-close ceiling (`APP_IDLE_TIMEOUT`).
-    /// A test seam — no production path calls this, so production leaves it unset
-    /// and the 30s ADR 005 value applies. Unlike the deliberately-lax `attach_*`
-    /// wiring methods, a second call here is a test bug: the injected timeout
-    /// would be silently dropped (the `OnceLock` keeps the first), leaving the
-    /// test on an unexpected window. So it trips a `debug_assert!` rather than
-    /// being quietly ignored.
-    pub fn set_idle_timeout(&self, idle: Duration) {
-        let newly_set = self.idle_timeout.set(idle).is_ok();
-        debug_assert!(
-            newly_set,
-            "set_idle_timeout called twice; second value ignored"
-        );
-    }
-
-    /// Attach the redeem-hint sender from the on-chain settlement service
-    /// (#327). Called once during runtime wiring; a second call is ignored
-    /// (the `OnceLock` keeps the first). After this, an accepted voucher
-    /// best-effort hints the channel for redemption.
-    pub fn attach_redeem_hint(&self, tx: mpsc::Sender<ChannelId>) {
-        let _ = self.redeem_hint.set(tx);
-    }
-
-    /// Attach the in-memory voucher-activity clock shared with
-    /// `admin_v1_channels` (issue #749). Called once during runtime
-    /// wiring; a second call is ignored (the `OnceLock` keeps the first).
-    /// After this, each accepted voucher stamps the channel's last-voucher
-    /// time so `decdn node channels` can report "time since last voucher".
-    pub fn attach_voucher_activity(&self, activity: Arc<VoucherActivity>) {
-        let _ = self.voucher_activity.set(activity);
-    }
-
-    /// Attach the per-region bandwidth accountant (issue #750). Called once
-    /// during runtime wiring; a second call is ignored (the `OnceLock` keeps
-    /// the first). After this, each accepted voucher records the delivered
-    /// bytes against the paying peer's region.
-    pub fn attach_region_accountant(&self, accountant: Arc<RegionAccountant>) {
-        let _ = self.region_accountant.set(accountant);
-    }
-
-    /// Attach the speculative-prefetch engine (#820). Called once during runtime
-    /// wiring; a second call is ignored (the `OnceLock` keeps the first). After
-    /// this, each accepted voucher credits bytes served from prefetch-acquired
-    /// blobs to the engine's demand-quality numerator.
-    pub fn attach_prefetch_engine(&self, engine: Arc<crate::prefetch::PrefetchEngine>) {
-        let _ = self.prefetch_engine.set(engine);
-    }
-
-    /// Attach the node-to-node cache-miss pull-through deadline (#831). Called
-    /// once during runtime wiring when `cache.node_to_node_pull_through_enabled`
-    /// (and the engine's `NodeOrigin` is provisioned); a second call is ignored.
-    /// After this, a cache miss for a request on a channel this node already
-    /// holds attempts a paid upstream pull (bounded by `timeout`) before falling
-    /// back to `NotFound`.
-    pub fn attach_pull_through(&self, timeout: Duration) {
-        let _ = self.pull_through.set(timeout);
-    }
-
-    /// Attach the reactive LOCAL-origin pull-through deadline (#1116). Called once
-    /// during runtime wiring whenever `[cache.origin]` is configured, INDEPENDENT
-    /// of `cache.node_to_node_pull_through_enabled`; a second call is ignored.
-    /// After this, a cache miss on a proven-owned channel first attempts a
-    /// local-origin fill (`CacheEngine::populate_local`, which skips the paid
-    /// `Peer` origin) before any node→node path — letting a cache-only operator
-    /// serve its own content, and preferring the local origin over the peer
-    /// window path.
-    pub fn attach_local_populate(&self, timeout: Duration) {
-        let _ = self.local_populate.set(timeout);
-    }
-
-    /// Attach background cache-fill (#859). Called once during runtime wiring
-    /// when pull-through is enabled; a second call is ignored. After this, a
-    /// foreground pull-through deadline additionally spawns a detached task
-    /// (cancelled via `cancel` on shutdown) to keep warming the cache from a slow
-    /// upstream for future requests.
-    ///
-    /// `budget` is an OPTIONAL overall wall-clock cap. The runtime passes
-    /// `Some(`[`BACKGROUND_FILL_HARD_CAP`]`)`; `None` (tests only) runs to completion.
-    ///
-    /// The cap must be far LARGER than the foreground deadline, not equal to it: the
-    /// warm re-pulls from scratch, so capping it at the budget the foreground just
-    /// exhausted means a blob too large to fetch in one deadline can never be warmed
-    /// either (#1134). But it cannot be absent — inactivity is not liveness, and a peer
-    /// trickling one byte per stall-window would keep a warm alive forever. See
-    /// [`BACKGROUND_FILL_HARD_CAP`] for the sizing argument.
-    ///
-    /// `max_blob_size_mb` is the node's blob ceiling — what each warm reserves from the
-    /// [`MAX_BACKGROUND_FILL_MB`] memory pool, since a blob's size is not known until it
-    /// has been fetched. It is clamped to the pool, so an operator who raises
-    /// `max_blob_size_mb` above the pool gets one warm at a time rather than none.
-    pub fn attach_background_fill(
-        &self,
-        cancel: CancellationToken,
-        budget: Option<Duration>,
-        max_blob_size_mb: u64,
-    ) {
-        let (pool_mb, reserve_mb) = warm_budget_mb(max_blob_size_mb);
-        let _ = self.background_fill.set(BackgroundFill {
-            cancel,
-            budget,
-            inflight: Arc::new(std::sync::Mutex::new(HashSet::new())),
-            slots: Arc::new(tokio::sync::Semaphore::new(pool_mb as usize)),
-            reserve_mb,
-        });
-    }
-
-    /// Attach the window-paced node→node pull-through provider (#856). Called
-    /// once during runtime wiring when pull-through is enabled and the
-    /// `NodeOrigin` is provisioned; a second call is ignored. After this, an
-    /// offset-0 cache-miss request that proves channel ownership is served by the
-    /// fused pull-and-forward path bounded by `pull_ahead_bytes`, instead of the
-    /// buffered `populate` path.
-    pub fn attach_window_pull_through(&self, origin: Arc<NodeOrigin>, pull_ahead_bytes: Bytes) {
-        let _ = self.pull_through_origin.set(origin);
-        let _ = self.pull_ahead_bytes.set(pull_ahead_bytes);
-    }
-
-    /// Attach the node-wide seed-leech caps governor (#856). Called once during
-    /// runtime wiring; a second call is ignored. After this, speculative
-    /// pull-throughs are gated by the global unrecouped-leech budget and per-peer
-    /// share ratio, and the voucher path credits served bytes to it.
-    pub fn attach_leech_governor(&self, governor: Arc<LeechGovernor>) {
-        let _ = self.leech_governor.set(governor);
-    }
-
-    /// Attach the reactive-pull-through authorized-origin gate (#821). Called
-    /// once during runtime wiring, only when
-    /// `cache.pull_through_require_authorized_origin = true`; a second call is
-    /// ignored. After this, a cache miss whose hash has no authorized origin in
-    /// `dir` is refused with `NotFound` before any upstream pull. `dir` SHOULD be
-    /// the same `OriginDirectory` the prefetch gate consumes so the two gates
-    /// agree on what "authorized" means.
-    pub fn attach_pull_origin_gate(&self, dir: Arc<dyn OriginDirectory>) {
-        let _ = self.pull_origin_gate.set(dir);
     }
 
     /// Register a channel observed on-chain via `ChannelOpened` (#327) so the
@@ -988,8 +994,8 @@ impl ClientHandler {
         // `touch` inserts per-channel with no eviction, so without this a
         // settled channel's `Instant` would linger for the whole process
         // lifetime — a slow leak on a high-churn node. Best-effort, mirroring
-        // the live-map removal: an unattached clock just skips.
-        if let Some(activity) = self.voucher_activity.get() {
+        // the live-map removal: an unset clock just skips.
+        if let Some(activity) = self.voucher_activity.as_ref() {
             activity.forget(channel_id);
         }
         let store = Arc::clone(&self.channel_state_store);
@@ -1237,7 +1243,7 @@ mod tests {
     /// `BACKGROUND_FILL_HARD_CAP`, an hour — while eight concurrent warms of 4 MiB blobs
     /// cost 32 MiB and were throttled exactly as hard.
     ///
-    /// Asserted on `warm_budget_mb`, the real function `attach_background_fill` calls. (An
+    /// Asserted on `warm_budget_mb`, the real function `BackgroundFill::new` calls. (An
     /// earlier draft of this test stood up its own semaphore and reserved from it, which
     /// proves only that tokio's semaphore works — the same "assert against a copy of the
     /// logic" mistake this review round exists to remove.)
@@ -1355,8 +1361,11 @@ mod tests {
     }
 
     /// Build the smallest `ClientHandler` that can spawn a background warm.
+    /// `background_fill` is the (construction-time) warm state the test needs, or
+    /// `None` when the test does not exercise the warm path.
     async fn handler_for_warm_tests(
         metrics: &Arc<Metrics>,
+        background_fill: Option<BackgroundFill>,
     ) -> (Arc<ClientHandler>, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
         let cache = CacheEngine::open(
@@ -1367,7 +1376,7 @@ mod tests {
         .await
         .expect("cache");
         let domain = alloy::sol_types::eip712_domain! { name: "t", version: "1", };
-        let handler = ClientHandler::new(
+        let mut deps = ClientHandlerDeps::new(
             iroh::SecretKey::generate().public(),
             Arc::clone(metrics),
             Arc::new(ConnectionLimiter::new(
@@ -1395,15 +1404,16 @@ mod tests {
             1,
             0,
             16,
-        )
-        .expect("handler");
+        );
+        deps.background_fill = background_fill;
+        let handler = ClientHandler::new(deps).expect("handler");
         (Arc::new(handler), dir)
     }
 
     #[tokio::test]
     async fn channel_metric_refresh_releases_map_and_serializes_snapshots() {
         let metrics = Arc::new(Metrics::new());
-        let (handler, _dir) = handler_for_warm_tests(&metrics).await;
+        let (handler, _dir) = handler_for_warm_tests(&metrics, None).await;
         let old_id = B256::repeat_byte(0xA1);
         let old = Arc::new(Mutex::new(ChannelDeliveryState {
             state: ChannelState::new(
@@ -1490,11 +1500,18 @@ mod tests {
     #[tokio::test]
     async fn a_warm_that_cannot_reserve_its_memory_is_shed_rather_than_spawned() {
         let metrics = Arc::new(Metrics::new());
-        let (handler, _dir) = handler_for_warm_tests(&metrics).await;
         // A ceiling at (or above) the pool means each warm reserves the ENTIRE budget, so
         // exactly one can be in flight. `warm_budget_mb` clamps it, which is what makes an
         // operator who over-raises `max_blob_size_mb` get one warm rather than none.
-        handler.attach_background_fill(CancellationToken::new(), None, MAX_BACKGROUND_FILL_MB);
+        let (handler, _dir) = handler_for_warm_tests(
+            &metrics,
+            Some(BackgroundFill::new(
+                CancellationToken::new(),
+                None,
+                MAX_BACKGROUND_FILL_MB,
+            )),
+        )
+        .await;
 
         handler.maybe_spawn_background_fill(Hash::new(b"first"));
         // The first warm is parked in `HangingOrigin::fetch`, holding its reservation. Wait
@@ -1622,8 +1639,8 @@ mod tests {
     }
 
     // #821: the reactive pull-through authorized-origin gate refuses a pull only
-    // when the operator opted in (a directory is attached) AND the hash has no
-    // authorized origin; an unattached gate keeps the permissionless default.
+    // when the operator opted in (a directory is wired) AND the hash has no
+    // authorized origin; an unset gate keeps the permissionless default.
     #[test]
     fn pull_origin_gate_decision() {
         use crate::dht::origin::{ConfigOriginDirectory, Hash as OriginHash, OriginDirectory};
@@ -1631,7 +1648,7 @@ mod tests {
 
         let h = OriginHash::from_bytes([7u8; 32]);
 
-        // Unattached gate (default): never blocks — cache role stays permissionless.
+        // Unset gate (default): never blocks — cache role stays permissionless.
         assert!(!pull_origin_gate_blocks(None, &h));
 
         // Opted in, empty directory: blocks — no authorized origin for the hash.

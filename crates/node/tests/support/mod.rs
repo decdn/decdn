@@ -24,7 +24,7 @@ use decdn_cache::{CacheEngine, FilesystemOrigin, Hash};
 use decdn_common::config::ResolvedSecurity;
 use decdn_incentive::ChannelStateStore;
 use decdn_node::dispatch::ConnectionLimiter;
-use decdn_node::handlers::client::ClientHandler;
+use decdn_node::handlers::client::{ClientHandler, ClientHandlerDeps};
 use decdn_node::metrics::Metrics;
 use decdn_node::receipt_log::{DirectReceiptSink, DownloadReceipt, ReceiptLog, ReceiptSink};
 use decdn_protocol::client::ClientMessage;
@@ -332,7 +332,38 @@ pub fn build_handler_full_with_sink(
     max_blob_size_bytes: u64,
     max_concurrent_streams: usize,
 ) -> anyhow::Result<Arc<ClientHandler>> {
-    Ok(Arc::new(ClientHandler::new(
+    Ok(Arc::new(ClientHandler::new(client_handler_deps(
+        server_id,
+        server_eth,
+        metrics,
+        limiter,
+        cache,
+        store,
+        receipt_sink,
+        rate,
+        domains,
+        max_blob_size_bytes,
+        max_concurrent_streams,
+    ))?))
+}
+
+/// The required-deps [`ClientHandlerDeps`] shared by the builders — every
+/// optional wiring hook left `None`. Callers set the optionals they need.
+#[allow(clippy::too_many_arguments)]
+fn client_handler_deps(
+    server_id: iroh::PublicKey,
+    server_eth: &Arc<PrivateKeySigner>,
+    metrics: &Arc<Metrics>,
+    limiter: Arc<ConnectionLimiter>,
+    cache: CacheEngine,
+    store: Arc<dyn ChannelStateStore>,
+    receipt_sink: Arc<dyn ReceiptSink>,
+    rate: u64,
+    domains: &HandlerDomains,
+    max_blob_size_bytes: u64,
+    max_concurrent_streams: usize,
+) -> ClientHandlerDeps {
+    ClientHandlerDeps::new(
         server_id,
         Arc::clone(metrics),
         limiter,
@@ -349,7 +380,44 @@ pub fn build_handler_full_with_sink(
         1, // voucher_interval_mb
         max_blob_size_bytes,
         max_concurrent_streams,
-    )?))
+    )
+}
+
+/// Like [`build_handler_full`] but hands the assembled [`ClientHandlerDeps`] to
+/// `configure` before construction — the construction-time replacement for the
+/// removed `attach_*` setters (#1254). A test enables the optional wiring it
+/// exercises (pull-through deadline, window origin, leech governor, idle timeout,
+/// …) by setting the matching `deps` fields. Uses the throwaway in-memory receipt
+/// log, like [`build_handler_full`].
+#[allow(clippy::too_many_arguments)]
+pub fn build_handler_full_configured(
+    server_id: iroh::PublicKey,
+    server_eth: &Arc<PrivateKeySigner>,
+    metrics: &Arc<Metrics>,
+    limiter: Arc<ConnectionLimiter>,
+    cache: CacheEngine,
+    store: Arc<dyn ChannelStateStore>,
+    rate: u64,
+    domains: &HandlerDomains,
+    max_blob_size_bytes: u64,
+    max_concurrent_streams: usize,
+    configure: impl FnOnce(&mut ClientHandlerDeps),
+) -> anyhow::Result<Arc<ClientHandler>> {
+    let mut deps = client_handler_deps(
+        server_id,
+        server_eth,
+        metrics,
+        limiter,
+        cache,
+        store,
+        Arc::new(DirectReceiptSink::new(Arc::new(VecReceiptLog::default()))),
+        rate,
+        domains,
+        max_blob_size_bytes,
+        max_concurrent_streams,
+    );
+    configure(&mut deps);
+    Ok(Arc::new(ClientHandler::new(deps)?))
 }
 
 /// Read one length-framed [`ClientMessage`] from `recv`. Mirrors the requester's

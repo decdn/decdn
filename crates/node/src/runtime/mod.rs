@@ -1037,7 +1037,131 @@ async fn build_chain_and_handlers(
         crate::region_accounting::PeerTableResolver::new(Arc::clone(&peer_table)),
     )));
 
-    let client_handler = Arc::new(ClientHandler::new(
+    // Redeem-hint channel (#327), hoisted out of `PaymentChannelService::bootstrap`
+    // so the handler takes the sender at construction (no post-construction attach)
+    // while the service takes the receiver. `redeem_tx` is cloned into the handler
+    // deps below and also handed to the service (so `redeem_hint_sender()` keeps
+    // working); `redeem_rx` drives the service's redeemer loop.
+    let (redeem_tx, redeem_rx) =
+        tokio::sync::mpsc::channel(crate::payment_settlement::REDEEM_HINT_CAPACITY);
+
+    // In-memory last-voucher clock shared between the client handler (writer:
+    // stamps on each accepted voucher) and `admin_v1_channels` (reader:
+    // reports "time since last voucher"), issue #749. Non-durable by design —
+    // a restart resets it and channels report "no activity yet" until their
+    // next voucher (see `decdn_incentive::VoucherActivity`).
+    let voucher_activity = Arc::new(decdn_incentive::VoucherActivity::new());
+    // Cancels in-flight prefetch acquisitions on shutdown; cancelled below
+    // alongside `pull_through_bg_shutdown`.
+    let prefetch_shutdown = CancellationToken::new();
+    // Cancels the detached background cache-fill tasks (#859) the handler spawns
+    // when the foreground deadline fires; cancelled in the shutdown sequence below
+    // alongside `gossip_shutdown`.
+    let pull_through_bg_shutdown = CancellationToken::new();
+
+    // Reactive LOCAL-origin pull-through (#1116). Arm a local-only populate on the
+    // serve-miss path whenever the operator configured any origin (`[cache.origin]`),
+    // INDEPENDENT of `node_to_node_pull_through_enabled`: a cache-only operator must
+    // be able to reactively serve content it holds in its OWN fs/http/s3 origin, and
+    // — with node→node on — that local origin is preferred over the paid peer window
+    // path. The handler still gates it on proven channel ownership
+    // (`pull_authorized`), so it fronts no free egress, and `populate_local` never
+    // consults the paid `Peer` node→node origin. The node→node
+    // window/buffered/governor/gate paths below stay flag-gated.
+    //
+    // A single local origin-chain walk (fs/http/s3), NOT a provider fan-out — so
+    // budget it at the per-attempt `node_pull_timeout_sec`, not `outer_pull_deadline`
+    // (which budgets the sequential node→node pull). Using the outer deadline would
+    // let a wedged local origin block many times longer (>7× at defaults) before
+    // falling through to the node→node paths.
+    let local_populate = (!cfg.cache.origins.is_empty())
+        .then(|| Duration::from_secs(cfg.cache.node_pull_timeout_sec));
+
+    // Node→node pull-through deps (#831/#856/#821), all gated on
+    // `node_to_node_pull_through_enabled`. Computed as `Option`s here so the handler's
+    // wiring is one construction-time literal; the gates (and their nesting) are
+    // preserved exactly.
+    let mut pull_through = None;
+    let mut background_fill = None;
+    let mut pull_through_origin = None;
+    let mut pull_ahead_bytes = None;
+    let mut leech_governor = None;
+    let mut pull_origin_gate = None;
+    if cfg.cache.node_to_node_pull_through_enabled {
+        // The outer deadline bounds how long a miss blocks the delivery path before
+        // falling back to `NotFound`. It is *derived* from the per-candidate budget
+        // (`node_pull_timeout_sec`) rather than equal to it: the handler wraps the
+        // whole `discover → probe → rank → pull` fetch in one `tokio::time::timeout`,
+        // so an outer deadline equal to the per-candidate timeout would cancel the
+        // fetch the instant candidate #1 stalls, before the `MAX_PROVIDER_ATTEMPTS`
+        // fallback loop ever reaches candidates #2..N (#859). `outer_pull_deadline`
+        // budgets all three of each candidate's sequential stages — channel open,
+        // stream open, and one silent-streaming window — plus one-time discovery
+        // slack. Whether the pull can actually succeed additionally depends on the
+        // `NodeOrigin` being provisioned; an unprovisioned origin just makes the
+        // `get` a fast miss.
+        let per_candidate = Duration::from_secs(cfg.cache.node_pull_timeout_sec);
+        let stall = Duration::from_secs(cfg.cache.node_pull_stall_timeout_sec);
+        let outer_deadline = crate::selection::outer_pull_deadline(per_candidate, stall);
+        pull_through = Some(outer_deadline);
+        // Background fill keeps warming the cache after the delivery path gives up. It
+        // does NOT reuse `outer_deadline` (#1134): the foreground deadline bounds how
+        // long a *client* waits, but the warm has no client waiting on it, and capping
+        // it at the budget the foreground just exhausted meant a blob too large to
+        // fetch in one deadline could never be warmed either. The absolute
+        // `BACKGROUND_FILL_HARD_CAP` backstop is a leak guard (inactivity is not
+        // liveness): ~21.5× the foreground deadline, so it constrains no honest
+        // transfer the node's `max_blob_size_mb` ceiling permits, and only stops a
+        // pathological upstream from pinning a task and poisoning a hash forever.
+        // `max_blob_size_mb` additionally bounds the concurrent warms' memory: each
+        // reserves its whole blob ceiling from the `MAX_BACKGROUND_FILL_MB` pool.
+        background_fill = Some(crate::handlers::client::BackgroundFill::new(
+            pull_through_bg_shutdown.clone(),
+            Some(crate::handlers::client::BACKGROUND_FILL_HARD_CAP),
+            cfg.cache.max_blob_size_mb,
+        ));
+        // Window-paced pull-through (#856, ADR 037): when the `NodeOrigin` is
+        // available, serve cache misses by fusing the upstream pull with downstream
+        // delivery (bounded by `pull_ahead_bytes`) instead of the buffered `populate`,
+        // and govern aggregate speculation with the seed-leech caps. The deposit
+        // pre-check and per-request window apply even without the governor; the
+        // governor adds the global budget + the per-peer share ratio.
+        if let Some(origin) = &infra.pull_through_origin {
+            pull_through_origin = Some(Arc::clone(origin));
+            pull_ahead_bytes = Some(cfg.cache.pull_ahead_bytes);
+            // The resolver already enforces `pull_ahead_bytes <=
+            // max_unrecouped_leech_bytes` (with the `0`-disables carve-out), so this
+            // validated build is belt-and-suspenders — a self-contradicting pairing is
+            // a bring-up error, not a silently-degraded governor.
+            let leech_caps =
+                crate::leech_governor::LeechCaps::new(crate::leech_governor::LeechCapsConfig {
+                    max_unrecouped_leech_bytes: cfg.cache.max_unrecouped_leech_bytes,
+                    initial_allowance_bytes: cfg.cache.pull_ahead_bytes,
+                    share_ratio_percent: cfg.cache.pull_share_ratio_percent,
+                })
+                .context("invalid seed-leech caps: opening window exceeds the global budget")?;
+            leech_governor = Some(Arc::new(crate::leech_governor::LeechGovernor::new(
+                leech_caps,
+                Arc::clone(&infra.node_metrics),
+            )));
+        }
+        // Optional content-authorization gate on the reactive pull-through path
+        // (#821, ADR 037 §Seed-leech caps). Off by default — the cache role stays
+        // permissionless. When the operator opts in, the handler refuses to initiate
+        // an upstream pull for a hash with no authorized origin, reusing the same
+        // directory the prefetch gate consults so "authorized" means the same thing on
+        // both paths (and fails closed when the origin-directory addresses are unset,
+        // since the directory is then empty).
+        if cfg.cache.pull_through_require_authorized_origin {
+            pull_origin_gate = Some(Arc::clone(&origin_directory));
+        }
+    }
+
+    // Build the paid-delivery handler from a single deps literal (#1254): every
+    // optional wiring hook above is supplied at construction, not via a setter chain.
+    // Crediting the serve path from `prefetch_engine` is harmless when prefetch is off
+    // — the acquired-set is never populated, so the lookup always misses.
+    let mut client_deps = crate::handlers::client::ClientHandlerDeps::new(
         infra.secret_key.public(),
         Arc::clone(&infra.node_metrics),
         Arc::clone(&infra.limiter),
@@ -1056,7 +1180,19 @@ async fn build_chain_and_handlers(
             .max_blob_size_mb
             .saturating_mul(decdn_protocol::MB_BYTES),
         MAX_CLIENT_STREAMS,
-    )?);
+    );
+    client_deps.redeem_hint = Some(redeem_tx.clone());
+    client_deps.voucher_activity = Some(Arc::clone(&voucher_activity));
+    client_deps.region_accountant = Some(Arc::clone(&region_accountant));
+    client_deps.prefetch_engine = Some(Arc::clone(&prefetch_engine));
+    client_deps.local_populate = local_populate;
+    client_deps.pull_through = pull_through;
+    client_deps.background_fill = background_fill;
+    client_deps.pull_through_origin = pull_through_origin;
+    client_deps.pull_ahead_bytes = pull_ahead_bytes;
+    client_deps.leech_governor = leech_governor;
+    client_deps.pull_origin_gate = pull_origin_gate;
+    let client_handler = Arc::new(ClientHandler::new(client_deps)?);
 
     // On-chain seller-settlement service (#327). A wallet-filled provider
     // (the staker-set provider above is read-only) signs the `withdraw` /
@@ -1098,142 +1234,11 @@ async fn build_chain_and_handlers(
         event_poll_interval,
         Arc::clone(&head),
         Arc::clone(&infra.node_metrics),
+        redeem_tx,
+        redeem_rx,
     )
     .await
     .context("PaymentChannel settlement service bootstrap")?;
-    client_handler.attach_redeem_hint(payment_service.redeem_hint_sender());
-
-    // In-memory last-voucher clock shared between the client handler (writer:
-    // stamps on each accepted voucher) and `admin_v1_channels` (reader:
-    // reports "time since last voucher"), issue #749. Non-durable by design —
-    // a restart resets it and channels report "no activity yet" until their
-    // next voucher (see `decdn_incentive::VoucherActivity`).
-    let voucher_activity = Arc::new(decdn_incentive::VoucherActivity::new());
-    client_handler.attach_voucher_activity(Arc::clone(&voucher_activity));
-    client_handler.attach_region_accountant(Arc::clone(&region_accountant));
-    // Let the serve path credit bytes served from prefetch-acquired blobs to the
-    // demand-quality numerator (#820). Harmless when prefetch is off — the
-    // acquired-set is never populated, so the lookup always misses.
-    client_handler.attach_prefetch_engine(Arc::clone(&prefetch_engine));
-    // Cancels in-flight prefetch acquisitions on shutdown; cancelled below
-    // alongside `pull_through_bg_shutdown`.
-    let prefetch_shutdown = CancellationToken::new();
-    // Arm the cache-miss pull-through hook (#831) when the feature is enabled.
-    // The outer deadline bounds how long a miss blocks the delivery path before
-    // falling back to `NotFound`. It is *derived* from the per-candidate budget
-    // (`node_pull_timeout_sec`) rather than equal to it: the handler wraps the
-    // whole `discover → probe → rank → pull` fetch in one `tokio::time::timeout`,
-    // so an outer deadline equal to the per-candidate timeout would cancel the
-    // fetch the instant candidate #1 stalls, before the `MAX_PROVIDER_ATTEMPTS`
-    // fallback loop ever reaches candidates #2..N (#859). `outer_pull_deadline`
-    // budgets all three of each candidate's sequential stages — channel open, stream
-    // open, and one silent-streaming window — plus one-time discovery slack. Whether
-    // the pull can actually succeed additionally depends on the `NodeOrigin`
-    // being provisioned below (buyer service + address resolver bootstrapped);
-    // an unprovisioned origin just makes the `get` a fast miss.
-    //
-    // The token cancels the detached background cache-fill tasks (#859) the
-    // handler spawns when the foreground deadline fires; it is cancelled in the
-    // shutdown sequence below alongside `gossip_shutdown`.
-    let pull_through_bg_shutdown = CancellationToken::new();
-    // Reactive LOCAL-origin pull-through (#1116). Arm a local-only populate on the
-    // serve-miss path whenever the operator configured any origin
-    // (`[cache.origin]`), INDEPENDENT of `node_to_node_pull_through_enabled`: a
-    // cache-only operator must be able to reactively serve content it holds in its
-    // OWN fs/http/s3 origin, and — with node→node on — that local origin is
-    // preferred over the paid peer window path. The handler still gates it on
-    // proven channel ownership (`pull_authorized`), so it fronts no free egress,
-    // and `populate_local` never consults the paid `Peer` node→node origin. The
-    // node→node window/buffered/governor/gate paths below stay flag-gated.
-    if !cfg.cache.origins.is_empty() {
-        // A single local origin-chain walk (fs/http/s3), NOT a provider fan-out —
-        // so budget it at the per-attempt `node_pull_timeout_sec`, not
-        // `outer_pull_deadline` (which budgets `MAX_PROVIDER_ATTEMPTS ×
-        // (CHANNEL_OPEN_CALLER_BUDGET + per_candidate + stall) + PULL_THROUGH_OUTER_SLACK`
-        // for the sequential node→node pull). Using the outer deadline would let a
-        // wedged local origin block many times longer (>7× at defaults, and more at
-        // small per-attempt budgets where the fixed slack dominates) before falling
-        // through to the node→node paths.
-        let local_deadline = Duration::from_secs(cfg.cache.node_pull_timeout_sec);
-        client_handler.attach_local_populate(local_deadline);
-    }
-    if cfg.cache.node_to_node_pull_through_enabled {
-        let per_candidate = Duration::from_secs(cfg.cache.node_pull_timeout_sec);
-        let stall = Duration::from_secs(cfg.cache.node_pull_stall_timeout_sec);
-        let outer_deadline = crate::selection::outer_pull_deadline(per_candidate, stall);
-        client_handler.attach_pull_through(outer_deadline);
-        // Background fill keeps warming the cache after the delivery path gives up.
-        //
-        // It does NOT reuse `outer_deadline` (#1134): the foreground deadline bounds
-        // how long a *client* waits, but the warm has no client waiting on it, and
-        // capping it at the budget the foreground just exhausted meant a blob too
-        // large to fetch in one deadline could never be warmed either — the node
-        // could not acquire any blob needing more transfer time than the derived
-        // deadline (167.5 s at defaults) allows.
-        //
-        // But "not the foreground deadline" is not the same as "no bound". The
-        // streaming stage is bounded by INACTIVITY, which resets on any byte — so an
-        // upstream trickling one byte
-        // every `stall - ε` keeps a warm alive forever without ever tripping it. And
-        // because `arm_background_fill` claims the hash for the task's lifetime, a
-        // warm that never ends means that blob can never be warmed again for the life
-        // of the process. An inactivity bound is not a liveness bound.
-        //
-        // So: a generous absolute backstop, sized as a leak guard rather than a
-        // health signal. It is ~21.5× the foreground deadline (1 h against 167.5 s at the
-        // defaults — see `outer_pull_deadline`), so it constrains no
-        // honest transfer the node's `max_blob_size_mb` ceiling permits; it exists
-        // only so a pathological upstream cannot pin a task and poison a hash
-        // indefinitely. `max_blob_size_mb` additionally bounds how much memory the
-        // concurrent warms can hold: each reserves its whole blob ceiling from the
-        // `MAX_BACKGROUND_FILL_MB` pool, so at the defaults (1 GiB ceiling, 2 GiB pool) a
-        // node runs TWO warms at once — fewer than the 8 the old task-count ceiling
-        // allowed, but with a bounded memory footprint rather than an 8 GiB one. A node
-        // serving small blobs runs far more than 8.
-        client_handler.attach_background_fill(
-            pull_through_bg_shutdown.clone(),
-            Some(crate::handlers::client::BACKGROUND_FILL_HARD_CAP),
-            cfg.cache.max_blob_size_mb,
-        );
-        // Window-paced pull-through (#856, ADR 037): when the `NodeOrigin` is
-        // available, serve cache misses by fusing the upstream pull with
-        // downstream delivery (bounded by `pull_ahead_bytes`) instead of the
-        // buffered `populate`, and govern aggregate speculation with the
-        // seed-leech caps. The deposit pre-check and per-request window apply
-        // even without the governor; the governor adds the global budget + the
-        // per-peer share ratio.
-        if let Some(origin) = &infra.pull_through_origin {
-            client_handler
-                .attach_window_pull_through(Arc::clone(origin), cfg.cache.pull_ahead_bytes);
-            // The resolver already enforces `pull_ahead_bytes <=
-            // max_unrecouped_leech_bytes` (with the `0`-disables carve-out), so
-            // this validated build is belt-and-suspenders — a self-contradicting
-            // pairing is a bring-up error, not a silently-degraded governor.
-            let leech_caps =
-                crate::leech_governor::LeechCaps::new(crate::leech_governor::LeechCapsConfig {
-                    max_unrecouped_leech_bytes: cfg.cache.max_unrecouped_leech_bytes,
-                    initial_allowance_bytes: cfg.cache.pull_ahead_bytes,
-                    share_ratio_percent: cfg.cache.pull_share_ratio_percent,
-                })
-                .context("invalid seed-leech caps: opening window exceeds the global budget")?;
-            client_handler.attach_leech_governor(Arc::new(
-                crate::leech_governor::LeechGovernor::new(
-                    leech_caps,
-                    Arc::clone(&infra.node_metrics),
-                ),
-            ));
-        }
-        // Optional content-authorization gate on the reactive pull-through path
-        // (#821, ADR 037 §Seed-leech caps). Off by default — the cache role stays
-        // permissionless. When the operator opts in, the handler refuses to
-        // initiate an upstream pull for a hash with no authorized origin, reusing
-        // the same directory the prefetch gate consults so "authorized" means the
-        // same thing on both paths (and fails closed when the origin-directory
-        // addresses are unset, since the directory is then empty).
-        if cfg.cache.pull_through_require_authorized_origin {
-            client_handler.attach_pull_origin_gate(Arc::clone(&origin_directory));
-        }
-    }
 
     // Blacklist compliance watcher (ADR 011/031, issue #1031), spawned early in
     // bring-up (where the router used to be built) so its mandatory first replay

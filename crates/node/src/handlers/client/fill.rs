@@ -9,14 +9,14 @@ use super::{
 
 impl ClientHandler {
     /// Spawn a detached background cache-fill for `hash` (#859), unless one is already
-    /// running for it, every warm slot is busy, or the feature is unattached. The
+    /// running for it, every warm slot is busy, or the feature is unset. The
     /// foreground delivery path has already given up; this re-pulls from scratch under
     /// a far larger budget than the foreground had ([`BACKGROUND_FILL_HARD_CAP`](super::BACKGROUND_FILL_HARD_CAP)), so a
     /// slow-but-available upstream still warms the cache, however large the blob.
     /// Best-effort: never blocks the caller and never affects the foreground result.
     #[allow(clippy::too_many_lines)] // one linear spawn, every arm carrying its own rationale
     pub(super) fn maybe_spawn_background_fill(&self, hash: Hash) {
-        let Some(bg) = self.background_fill.get() else {
+        let Some(bg) = self.background_fill.as_ref() else {
             return;
         };
         // Dedup: only the first miss for a hash claims it and receives the guard
@@ -313,7 +313,7 @@ impl ClientHandler {
     /// on the same in-flight entry and re-checks presence; if no pull-through
     /// deadline is configured it degrades to a plain presence check.
     pub(super) async fn await_coalesced_fill(&self, hash: Hash) -> FillOutcome {
-        match self.pull_through.get().copied() {
+        match self.pull_through {
             Some(timeout) => self.try_pull_through(hash, timeout).await,
             // No pull-through configured: the coalesced fill either landed or it
             // did not. A `has` *error* is a real store fault, not a clean miss —
@@ -332,19 +332,19 @@ impl ClientHandler {
     }
 
     /// Whether a speculative pull may proceed for `peer` under the seed-leech caps
-    /// (#856). Always `true` when no governor is attached. Like
+    /// (#856). Always `true` when no governor is wired. Like
     /// [`LeechGovernor::poll_admission`](super::LeechGovernor::poll_admission) this is a stateful, advisory poll (it
     /// touches the peer's LRU entry and does not reserve budget), not a pure read.
     pub(super) fn leech_admit(&self, peer: &[u8; 32]) -> bool {
         self.leech_governor
-            .get()
+            .as_ref()
             .is_none_or(|g| g.poll_admission(peer))
     }
 
     /// Account `bytes` speculatively pulled for `peer` under the seed-leech caps
-    /// (#856). No-op when no governor is attached.
+    /// (#856). No-op when no governor is wired.
     pub(super) fn leech_record_pulled(&self, peer: &[u8; 32], bytes: u64) {
-        if let Some(g) = self.leech_governor.get() {
+        if let Some(g) = self.leech_governor.as_ref() {
             g.record_pulled(peer, bytes);
         }
     }
