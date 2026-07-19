@@ -97,7 +97,7 @@ use iroh::EndpointAddr;
 
 mod support;
 use support::{
-    HandlerDomains, build_handler_full, cache_with_blob, fresh_key, local_endpoint,
+    HandlerDomains, build_handler_full_configured, cache_with_blob, fresh_key, local_endpoint,
     permissive_limiter, spawn_server,
 };
 
@@ -548,7 +548,12 @@ async fn run_e2e() -> anyhow::Result<()> {
         voucher: voucher_domain(CHAIN_ID, payment_channel),
         binding: bind_domain.clone(),
     };
-    let handler = build_handler_full(
+    // Redeem-hint channel, now created by the caller (the settlement service no
+    // longer mints it): the sender is wired into the handler at construction, the
+    // receiver drives the service's redeemer loop (#1254).
+    let (redeem_tx, redeem_rx) =
+        tokio::sync::mpsc::channel(decdn_node::payment_settlement::REDEEM_HINT_CAPACITY);
+    let handler = build_handler_full_configured(
         node_pub,
         &node_eth,
         &metrics,
@@ -559,6 +564,7 @@ async fn run_e2e() -> anyhow::Result<()> {
         &domains,
         0,
         16,
+        |deps| deps.redeem_hint = Some(redeem_tx.clone()),
     )?;
 
     let service = PaymentChannelService::bootstrap(
@@ -574,9 +580,10 @@ async fn run_e2e() -> anyhow::Result<()> {
         Duration::from_millis(250),
         e2e_head(&node_provider),
         Arc::clone(&metrics),
+        redeem_tx,
+        redeem_rx,
     )
     .await?;
-    handler.attach_redeem_hint(service.redeem_hint_sender());
 
     let (server_ep, server_addr) = local_endpoint(node_iroh_sk, vec![ALPN_CLIENT.to_vec()]).await?;
     let server_task = spawn_server(server_ep.clone(), Arc::clone(&handler));
@@ -1038,7 +1045,7 @@ async fn run_e2e() -> anyhow::Result<()> {
     // redeemer can read the handler-persisted voucher. The original `service`'s
     // redeemer was permanently quiesced by the
     // `close_open_channels_on_shutdown` just above, and the handler's
-    // `redeem_hint` sender is a `OnceLock` already bound to that dead service —
+    // `redeem_hint` sender is wired at construction, bound to that dead service —
     // so we drive this service's redeemer directly via its OWN
     // `redeem_hint_sender()` after the
     // delivery persists the voucher. Deliver enough to cross BOTH the redeem
@@ -1049,6 +1056,8 @@ async fn run_e2e() -> anyhow::Result<()> {
     // leak: we stop serving a `Closing` channel).
     // ============================================================
     let auto_settle_store: Arc<dyn PendingSettleStore> = concrete_store.clone();
+    let (auto_redeem_tx, auto_redeem_rx) =
+        tokio::sync::mpsc::channel(decdn_node::payment_settlement::REDEEM_HINT_CAPACITY);
     let service_auto = PaymentChannelService::bootstrap(
         node_provider.clone(),
         payment_channel,
@@ -1068,6 +1077,8 @@ async fn run_e2e() -> anyhow::Result<()> {
         Duration::from_millis(250),
         e2e_head(&node_provider),
         Arc::clone(&metrics),
+        auto_redeem_tx,
+        auto_redeem_rx,
     )
     .await?;
     let auto_hint = service_auto.redeem_hint_sender();
@@ -1134,7 +1145,7 @@ async fn run_e2e() -> anyhow::Result<()> {
 
     // Wait for the handler's serve path to persist channel 3's voucher into the
     // shared store, then hint the auto-settle service's redeemer (the handler's
-    // OnceLock hint is bound to the now-dead original service, so we drive this
+    // construction-wired hint is bound to the now-dead original service, so we drive this
     // redeemer directly via its own sender). The redeemer reads the persisted
     // voucher from the same store.
     anyhow::ensure!(
@@ -1292,6 +1303,8 @@ async fn run_e2e() -> anyhow::Result<()> {
 
     // Node comes back up against the same store. Bootstrap re-reads the persisted
     // checkpoint and the bring-up backfill covers the downtime block.
+    let (restart_redeem_sender, restart_redeem_receiver) =
+        tokio::sync::mpsc::channel(decdn_node::payment_settlement::REDEEM_HINT_CAPACITY);
     let service2 = PaymentChannelService::bootstrap(
         node_provider.clone(),
         payment_channel,
@@ -1305,6 +1318,8 @@ async fn run_e2e() -> anyhow::Result<()> {
         Duration::from_millis(250),
         e2e_head(&node_provider),
         Arc::clone(&metrics),
+        restart_redeem_sender,
+        restart_redeem_receiver,
     )
     .await?;
     let backfilled = poll_until(Duration::from_secs(60), || {
@@ -1375,6 +1390,8 @@ async fn run_e2e() -> anyhow::Result<()> {
 
     // Node comes back up against the same store: the bring-up closing-
     // reconciliation backfill must record the obligation.
+    let (close_redeem_sender, close_redeem_receiver) =
+        tokio::sync::mpsc::channel(decdn_node::payment_settlement::REDEEM_HINT_CAPACITY);
     let service3 = PaymentChannelService::bootstrap(
         node_provider.clone(),
         payment_channel,
@@ -1388,6 +1405,8 @@ async fn run_e2e() -> anyhow::Result<()> {
         Duration::from_millis(250),
         e2e_head(&node_provider),
         Arc::clone(&metrics),
+        close_redeem_sender,
+        close_redeem_receiver,
     )
     .await?;
     let recovered = poll_until(Duration::from_secs(60), || {

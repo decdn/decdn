@@ -52,7 +52,7 @@ use decdn_node::client_requester::{
     stream_fetch_tracked_with_progress,
 };
 use decdn_node::dispatch::ConnectionLimiter;
-use decdn_node::handlers::client::ClientHandler;
+use decdn_node::handlers::client::{ClientHandler, ClientHandlerDeps};
 use decdn_node::metrics::Metrics;
 use decdn_node::region_accounting::{RegionAccountant, RegionResolver, UNKNOWN_REGION};
 use decdn_protocol::client::{
@@ -69,8 +69,9 @@ mod support;
 use decdn_node::receipt_log::{DownloadReceipt, spawn_receipt_writer};
 use support::{
     BlockingReceiptLog, FailingReceiptLog, HandlerDomains, VecReceiptLog, build_handler_full,
-    build_handler_full_with_receipts, build_handler_full_with_sink, cache_with_blob, empty_cache,
-    fresh_key, local_endpoint, permissive_limiter, read_client_msg, spawn_server, write_client_msg,
+    build_handler_full_configured, build_handler_full_with_receipts, build_handler_full_with_sink,
+    cache_with_blob, empty_cache, fresh_key, local_endpoint, permissive_limiter, read_client_msg,
+    spawn_server, write_client_msg,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -154,6 +155,53 @@ fn build_handler_limited(
         &loopback_domains(),
         max_blob_size_bytes,
         max_concurrent_streams,
+    )
+}
+
+/// [`build_handler`] with a construction-time `configure` hook for the optional
+/// deps that tests used to `attach_*` onto the built handler (#1254).
+#[allow(clippy::too_many_arguments)]
+fn build_handler_configured(
+    server_id: iroh::PublicKey,
+    server_eth: &Arc<PrivateKeySigner>,
+    metrics: &Arc<Metrics>,
+    limiter: Arc<ConnectionLimiter>,
+    cache: CacheEngine,
+    store: Arc<dyn ChannelStateStore>,
+    rate: u64,
+    configure: impl FnOnce(&mut ClientHandlerDeps),
+) -> anyhow::Result<Arc<ClientHandler>> {
+    build_handler_limited_configured(
+        server_id, server_eth, metrics, limiter, cache, store, rate, 0, 16, configure,
+    )
+}
+
+/// [`build_handler_limited`] with a construction-time `configure` hook (#1254).
+#[allow(clippy::too_many_arguments)]
+fn build_handler_limited_configured(
+    server_id: iroh::PublicKey,
+    server_eth: &Arc<PrivateKeySigner>,
+    metrics: &Arc<Metrics>,
+    limiter: Arc<ConnectionLimiter>,
+    cache: CacheEngine,
+    store: Arc<dyn ChannelStateStore>,
+    rate: u64,
+    max_blob_size_bytes: u64,
+    max_concurrent_streams: usize,
+    configure: impl FnOnce(&mut ClientHandlerDeps),
+) -> anyhow::Result<Arc<ClientHandler>> {
+    build_handler_full_configured(
+        server_id,
+        server_eth,
+        metrics,
+        limiter,
+        cache,
+        store,
+        rate,
+        &loopback_domains(),
+        max_blob_size_bytes,
+        max_concurrent_streams,
+        configure,
     )
 }
 
@@ -258,7 +306,7 @@ async fn client_delivery_roundtrip_advances_channel_state() -> anyhow::Result<()
 
 /// ADR 005 §Connection lifetime (#1193): a connection with no active stream is
 /// closed by the application layer after `APP_IDLE_TIMEOUT`. A short timeout is
-/// injected via `set_idle_timeout` so the test need not wait the production 30s.
+/// injected via `ClientHandlerDeps.idle_timeout` so the test need not wait the production 30s.
 /// The client opens no stream, so the server's serve loop is idle from the start
 /// and must close it; the close is asserted to be the graceful no-error "idle"
 /// close (`APP_ERR_NO_ERROR` + reason `"idle"`), not a fault or transport reset.
@@ -272,7 +320,7 @@ async fn idle_connection_is_closed_by_the_app_layer() -> anyhow::Result<()> {
     let server_eth = Arc::new(PrivateKeySigner::random());
     let metrics = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics);
-    let handler = build_handler(
+    let handler = build_handler_configured(
         server_id,
         &server_eth,
         &metrics,
@@ -280,8 +328,8 @@ async fn idle_connection_is_closed_by_the_app_layer() -> anyhow::Result<()> {
         cache,
         store,
         RATE_PER_MB,
+        |deps| deps.idle_timeout = Some(Duration::from_millis(300)),
     )?;
-    handler.set_idle_timeout(Duration::from_millis(300));
 
     let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
     let server_task = spawn_server(server_ep.clone(), handler);
@@ -340,7 +388,8 @@ async fn in_flight_stream_defers_idle_close_then_reaps_on_completion() -> anyhow
     let server_eth = Arc::new(PrivateKeySigner::random());
     let metrics = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics);
-    let handler = build_handler(
+    let idle = Duration::from_millis(150);
+    let handler = build_handler_configured(
         server_id,
         &server_eth,
         &metrics,
@@ -348,9 +397,8 @@ async fn in_flight_stream_defers_idle_close_then_reaps_on_completion() -> anyhow
         cache,
         store,
         RATE_PER_MB,
+        |deps| deps.idle_timeout = Some(idle),
     )?;
-    let idle = Duration::from_millis(150);
-    handler.set_idle_timeout(idle);
 
     let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
     let server_task = spawn_server(server_ep.clone(), handler);
@@ -453,7 +501,7 @@ async fn idle_fixture(payload: &[u8], idle: Duration) -> anyhow::Result<IdleFixt
     let metrics = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics);
     let store_dyn: Arc<dyn ChannelStateStore> = store.clone();
-    let handler = build_handler(
+    let handler = build_handler_configured(
         server_id,
         &server_eth,
         &metrics,
@@ -461,8 +509,8 @@ async fn idle_fixture(payload: &[u8], idle: Duration) -> anyhow::Result<IdleFixt
         cache,
         store_dyn,
         RATE_PER_MB,
+        |deps| deps.idle_timeout = Some(idle),
     )?;
-    handler.set_idle_timeout(idle);
 
     let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
     let server_task = spawn_server(server_ep.clone(), handler);
@@ -967,7 +1015,11 @@ async fn accepted_voucher_advances_shared_activity_clock() -> anyhow::Result<()>
     let metrics = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics);
     let store_dyn: Arc<dyn ChannelStateStore> = store.clone();
-    let handler = build_handler(
+    // Share one `Arc<VoucherActivity>` with the handler — the same wiring
+    // `runtime::run` performs (one Arc cloned into the handler and the admin
+    // surface). Before any accept the channel is unknown to the clock.
+    let activity = Arc::new(VoucherActivity::new());
+    let handler = build_handler_configured(
         server_id,
         &server_eth,
         &metrics,
@@ -975,13 +1027,8 @@ async fn accepted_voucher_advances_shared_activity_clock() -> anyhow::Result<()>
         cache,
         store_dyn,
         RATE_PER_MB,
+        |deps| deps.voucher_activity = Some(Arc::clone(&activity)),
     )?;
-
-    // Share one `Arc<VoucherActivity>` with the handler — the same wiring
-    // `runtime::run` performs (one Arc cloned into the handler and the admin
-    // surface). Before any accept the channel is unknown to the clock.
-    let activity = Arc::new(VoucherActivity::new());
-    handler.attach_voucher_activity(Arc::clone(&activity));
     assert_eq!(
         activity.seconds_since(channel_id()),
         None,
@@ -1065,15 +1112,6 @@ async fn accepted_voucher_records_served_bytes_by_region() -> anyhow::Result<()>
     let metrics = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics);
     let store_dyn: Arc<dyn ChannelStateStore> = store.clone();
-    let handler = build_handler(
-        server_id,
-        &server_eth,
-        &metrics,
-        limiter,
-        cache,
-        store_dyn,
-        RATE_PER_MB,
-    )?;
 
     // The client endpoint's key is what the handler sees as `client_node_id`.
     let client_sk = fresh_key();
@@ -1082,7 +1120,16 @@ async fn accepted_voucher_records_served_bytes_by_region() -> anyhow::Result<()>
         node_id: *client_id.as_bytes(),
         region: "DE".to_string(),
     })));
-    handler.attach_region_accountant(Arc::clone(&accountant));
+    let handler = build_handler_configured(
+        server_id,
+        &server_eth,
+        &metrics,
+        limiter,
+        cache,
+        store_dyn,
+        RATE_PER_MB,
+        |deps| deps.region_accountant = Some(Arc::clone(&accountant)),
+    )?;
     assert!(
         accountant.snapshot().is_empty(),
         "no delivery yet -> no region buckets"
@@ -3001,7 +3048,8 @@ async fn pull_through_gate_authorizes_only_channel_owner() -> anyhow::Result<()>
     let server_eth = Arc::new(PrivateKeySigner::random());
     let metrics = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics);
-    let handler = build_handler_full(
+    // Arm pull-through, as the runtime does when the feature is enabled.
+    let handler = build_handler_full_configured(
         server_id,
         &server_eth,
         &metrics,
@@ -3012,9 +3060,8 @@ async fn pull_through_gate_authorizes_only_channel_owner() -> anyhow::Result<()>
         &loopback_domains(),
         0,
         16,
+        |deps| deps.pull_through = Some(std::time::Duration::from_secs(10)),
     )?;
-    // Arm pull-through, as the runtime does when the feature is enabled.
-    handler.attach_pull_through(std::time::Duration::from_secs(10));
     let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
     let server_task = spawn_server(server_ep.clone(), handler);
     let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
@@ -3137,7 +3184,7 @@ impl decdn_cache::Origin for SlowOrigin {
 /// taking `origin_delay`, with the handler's outer pull-through deadline set to
 /// `outer_deadline`. Returns whether the foreground pull completed and filled the
 /// store (probed via a cloned cache handle after the response settles). No
-/// background fill is attached, so this isolates the foreground outer-deadline
+/// background fill is wired, so this isolates the foreground outer-deadline
 /// behaviour (a background warm could otherwise fill the store after the fact and
 /// mask the broken case).
 async fn pull_through_fills_under_deadline(
@@ -3164,7 +3211,7 @@ async fn pull_through_fills_under_deadline(
     let server_eth = Arc::new(PrivateKeySigner::random());
     let metrics = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics);
-    let handler = build_handler_full(
+    let handler = build_handler_full_configured(
         server_id,
         &server_eth,
         &metrics,
@@ -3175,8 +3222,8 @@ async fn pull_through_fills_under_deadline(
         &loopback_domains(),
         0,
         16,
+        |deps| deps.pull_through = Some(outer_deadline),
     )?;
-    handler.attach_pull_through(outer_deadline);
     let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
     let server_task = spawn_server(server_ep.clone(), handler);
     let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
@@ -3213,7 +3260,7 @@ async fn pull_through_fills_under_deadline(
 /// #859 regression: a slow pull (1.5s) exceeding one 1s per-candidate budget is
 /// abandoned by an outer deadline equal to that budget (the pre-#859 wiring), but
 /// completes under the derived `outer_pull_deadline`. This is the only test in
-/// the suite that fails if `attach_pull_through` is re-wired to the per-candidate
+/// the suite that fails if the `pull_through` deadline is re-wired to the per-candidate
 /// value (re-introducing #859).
 #[tokio::test(flavor = "multi_thread")]
 async fn pull_through_outer_deadline_accommodates_a_slow_pull() -> anyhow::Result<()> {
@@ -3425,7 +3472,7 @@ async fn empty_cache_with_fs_origin(
 }
 
 /// Spawn a `ClientHandler` server with buffered origin pull-through attached
-/// (`attach_pull_through`), returning the dial target and the server's voucher
+/// (`ClientHandlerDeps.pull_through`), returning the dial target and the server's voucher
 /// signer address. Unlike [`spawn_handler_server`], the handler is built inline
 /// so pull-through can be wired before it is spawned.
 async fn spawn_pull_through_server(
@@ -3437,7 +3484,7 @@ async fn spawn_pull_through_server(
     let server_eth = Arc::new(PrivateKeySigner::random());
     let metrics = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics);
-    let handler = build_handler_limited(
+    let handler = build_handler_limited_configured(
         server_id,
         &server_eth,
         &metrics,
@@ -3447,8 +3494,8 @@ async fn spawn_pull_through_server(
         RATE_PER_MB,
         0,
         16,
+        |deps| deps.pull_through = Some(Duration::from_secs(20)),
     )?;
-    handler.attach_pull_through(Duration::from_secs(20));
     let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
     let server_task = spawn_server(server_ep.clone(), handler);
     let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
@@ -3558,7 +3605,7 @@ async fn unbound_client_fetch_is_refused_on_origin_only_blob() -> anyhow::Result
 }
 
 /// Like [`spawn_pull_through_server`] but arms ONLY the reactive LOCAL-origin
-/// populate (`attach_local_populate`) — NOT the node→node buffered/window paths.
+/// populate (`ClientHandlerDeps.local_populate`) — NOT the node→node buffered/window paths.
 /// This is the cache-only-operator wiring (#1116): `[cache.origin]` set,
 /// `node_to_node_pull_through_enabled` off.
 async fn spawn_local_populate_server(
@@ -3570,7 +3617,7 @@ async fn spawn_local_populate_server(
     let server_eth = Arc::new(PrivateKeySigner::random());
     let metrics = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics);
-    let handler = build_handler_limited(
+    let handler = build_handler_limited_configured(
         server_id,
         &server_eth,
         &metrics,
@@ -3580,8 +3627,8 @@ async fn spawn_local_populate_server(
         RATE_PER_MB,
         0,
         16,
+        |deps| deps.local_populate = Some(Duration::from_secs(20)),
     )?;
-    handler.attach_local_populate(Duration::from_secs(20));
     let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
     let server_task = spawn_server(server_ep.clone(), handler);
     let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
@@ -3602,7 +3649,7 @@ async fn spawn_local_and_window_server(
     let server_eth = Arc::new(PrivateKeySigner::random());
     let metrics = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics);
-    let handler = build_handler_limited(
+    let handler = build_handler_limited_configured(
         server_id,
         &server_eth,
         &metrics,
@@ -3612,12 +3659,14 @@ async fn spawn_local_and_window_server(
         RATE_PER_MB,
         0,
         16,
+        |deps| {
+            deps.local_populate = Some(Duration::from_secs(20));
+            deps.set_window_pull_through(
+                Arc::new(decdn_node::node_origin::NodeOrigin::new()),
+                decdn_cache::Bytes::new(64 * 1024),
+            );
+        },
     )?;
-    handler.attach_local_populate(Duration::from_secs(20));
-    handler.attach_window_pull_through(
-        Arc::new(decdn_node::node_origin::NodeOrigin::new()),
-        decdn_cache::Bytes::new(64 * 1024),
-    );
     let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
     let server_task = spawn_server(server_ep.clone(), handler);
     let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
@@ -3855,7 +3904,7 @@ enum FaultTiers {
     /// Local populate + an UNPROVISIONED node→node window origin (a dead peer
     /// path that cleanly misses) — exercises the fault surviving a fall-through.
     LocalAndWindow,
-    /// The buffered node→node tier only (`attach_pull_through`), no window origin.
+    /// The buffered node→node tier only (`ClientHandlerDeps.pull_through`), no window origin.
     /// This is the `try_pull_through` path — the one whose `HardFault` no other
     /// test reaches.
     Buffered,
@@ -3884,7 +3933,7 @@ async fn spawn_fault_server(
     let server_eth = Arc::new(PrivateKeySigner::random());
     let metrics = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics);
-    let handler = build_handler_limited(
+    let handler = build_handler_limited_configured(
         server_id,
         &server_eth,
         &metrics,
@@ -3894,18 +3943,18 @@ async fn spawn_fault_server(
         RATE_PER_MB,
         0,
         16,
+        |deps| match tiers {
+            FaultTiers::LocalOnly => deps.local_populate = Some(Duration::from_secs(20)),
+            FaultTiers::LocalAndWindow => {
+                deps.local_populate = Some(Duration::from_secs(20));
+                deps.set_window_pull_through(
+                    Arc::new(decdn_node::node_origin::NodeOrigin::new()),
+                    decdn_cache::Bytes::new(64 * 1024),
+                );
+            }
+            FaultTiers::Buffered => deps.pull_through = Some(Duration::from_secs(20)),
+        },
     )?;
-    match tiers {
-        FaultTiers::LocalOnly => handler.attach_local_populate(Duration::from_secs(20)),
-        FaultTiers::LocalAndWindow => {
-            handler.attach_local_populate(Duration::from_secs(20));
-            handler.attach_window_pull_through(
-                Arc::new(decdn_node::node_origin::NodeOrigin::new()),
-                decdn_cache::Bytes::new(64 * 1024),
-            );
-        }
-        FaultTiers::Buffered => handler.attach_pull_through(Duration::from_secs(20)),
-    }
     let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
     let server_task = spawn_server(server_ep.clone(), handler);
     let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
@@ -4151,7 +4200,7 @@ async fn local_hard_fault_survives_fallthrough_to_the_window_tier() -> anyhow::R
 /// reverting that helper's `HardFault` arm to a clean miss breaks nothing: every
 /// other fault test drives `try_local_populate`.
 ///
-/// This is the tier a resumed request or an unattached window provider lands on,
+/// This is the tier a resumed request or an unset window provider lands on,
 /// and its outcome also has to compose with the latch at the call site
 /// (`miss_reason(fault_seen || buffered.is_fault())`) — the `buffered.is_fault()`
 /// side of that `||` is exercised nowhere else.

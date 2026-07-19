@@ -46,7 +46,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 mod support;
 use support::{
-    HandlerDomains, build_handler_full, fresh_key, local_endpoint, permissive_limiter,
+    HandlerDomains, build_handler_full_configured, fresh_key, local_endpoint, permissive_limiter,
     read_client_msg, spawn_server, write_client_msg,
 };
 
@@ -92,6 +92,7 @@ async fn handler_over_http_origin(
     client: Address,
     server_eth: &Arc<PrivateKeySigner>,
     server_id: iroh::PublicKey,
+    pull_through: Option<Duration>,
 ) -> anyhow::Result<(
     Arc<ClientHandler>,
     CacheEngine,
@@ -113,7 +114,7 @@ async fn handler_over_http_origin(
     let metrics = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics);
     let store_dyn: Arc<dyn ChannelStateStore> = store;
-    let handler = build_handler_full(
+    let handler = build_handler_full_configured(
         server_id,
         server_eth,
         &metrics,
@@ -124,6 +125,7 @@ async fn handler_over_http_origin(
         &domains(),
         0,
         16,
+        |deps| deps.pull_through = pull_through,
     )?;
     Ok((handler, cache, metrics, cache_dir))
 }
@@ -396,6 +398,7 @@ async fn cold_range_request_pulls_only_the_range_from_origin() -> anyhow::Result
         client_eth.address(),
         &server_eth,
         server_id,
+        None,
     )
     .await?;
 
@@ -501,16 +504,16 @@ async fn range_request_without_outboard_falls_back_to_whole_blob() -> anyhow::Re
     let server_sk = fresh_key();
     let server_id = server_sk.public();
     let server_eth = Arc::new(PrivateKeySigner::random());
+    // Enable the buffered whole-blob pull-through the fallback relies on.
     let (handler, cache, _metrics, _cache_tmp) = handler_over_http_origin(
         &server.uri(),
         channel_id,
         client_eth.address(),
         &server_eth,
         server_id,
+        Some(Duration::from_secs(15)),
     )
     .await?;
-    // Enable the buffered whole-blob pull-through the fallback relies on.
-    handler.attach_pull_through(Duration::from_secs(15));
 
     let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
     let server_task = spawn_server(server_ep.clone(), handler);
@@ -612,6 +615,7 @@ async fn unauthorized_range_request_triggers_no_origin_fetch() -> anyhow::Result
         client_eth.address(),
         &server_eth,
         server_id,
+        None,
     )
     .await?;
 
@@ -724,6 +728,7 @@ async fn resume_to_end_range_pull_serves_tail() -> anyhow::Result<()> {
         client_eth.address(),
         &server_eth,
         server_id,
+        None,
     )
     .await?;
 
@@ -797,6 +802,7 @@ async fn out_of_bounds_range_is_rejected_before_delivery() -> anyhow::Result<()>
         client_eth.address(),
         &server_eth,
         server_id,
+        None,
     )
     .await?;
     // Pre-populate the blob so the ranged request is a cache hit.

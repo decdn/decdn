@@ -69,8 +69,8 @@ use iroh::endpoint::Connection;
 
 mod support;
 use support::{
-    HandlerDomains, build_handler_full, cache_with_blob, empty_cache, fresh_key, local_endpoint,
-    permissive_limiter, spawn_server,
+    HandlerDomains, build_handler_full, build_handler_full_configured, cache_with_blob,
+    empty_cache, fresh_key, local_endpoint, permissive_limiter, spawn_server,
 };
 
 const CHAIN_ID: u64 = 421_614;
@@ -1291,7 +1291,9 @@ async fn node_origin_pull_chains_reactive_origin_via_client_binding() -> Result<
         voucher: voucher_dom(),
         binding: binding_dom(),
     };
-    let handler_a = build_handler_full(
+    // A reactively serves its OWN origin on a miss (#1116) — the chained pull B
+    // triggers. `pull_authorized` still gates it on B proving channel ownership.
+    let handler_a = build_handler_full_configured(
         a_id,
         &a_eth,
         &metrics_a,
@@ -1302,10 +1304,8 @@ async fn node_origin_pull_chains_reactive_origin_via_client_binding() -> Result<
         &domains,
         0,
         16,
+        |deps| deps.local_populate = Some(Duration::from_secs(20)),
     )?;
-    // A reactively serves its OWN origin on a miss (#1116) — the chained pull B
-    // triggers. `pull_authorized` still gates it on B proving channel ownership.
-    handler_a.attach_local_populate(Duration::from_secs(20));
     let (ep_a, addr_a) =
         local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
     let task_a = spawn_a_server(
@@ -1641,7 +1641,7 @@ async fn prefetch_acquired_blob_credits_served_through_serve_loop() -> Result<()
         U256::from(DEPOSIT_MICRO_USDC),
     ))?;
     let limiter_b = permissive_limiter(&b_metrics);
-    let handler_b = build_handler_full(
+    let handler_b = build_handler_full_configured(
         b_id,
         &b_eth,
         &b_metrics,
@@ -1652,8 +1652,8 @@ async fn prefetch_acquired_blob_credits_served_through_serve_loop() -> Result<()
         &domains,
         0,
         16,
+        |deps| deps.prefetch_engine = Some(Arc::clone(&engine)),
     )?;
-    handler_b.attach_prefetch_engine(Arc::clone(&engine));
     let task_b = spawn_server(ep_b.clone(), handler_b);
 
     let (ep_c, _addr_c) = local_endpoint(fresh_key(), vec![]).await?;
@@ -7397,6 +7397,7 @@ async fn build_node_b(
     leaf_eth_addr: Address,
     leaf_deposit: U256,
     max_blob_size_bytes: u64,
+    leech_caps: Option<LeechCaps>,
 ) -> Result<(
     Arc<decdn_node::handlers::client::ClientHandler>,
     EndpointAddr,
@@ -7405,6 +7406,7 @@ async fn build_node_b(
     decdn_cache::CacheEngine,
     Arc<Metrics>,
     Arc<LocalReputation>,
+    Option<Arc<LeechGovernor>>,
 )> {
     build_node_b_with_leaves(
         a_id,
@@ -7416,6 +7418,7 @@ async fn build_node_b(
         &[(leaf_channel_id, leaf_eth_addr, leaf_deposit)],
         max_blob_size_bytes,
         64,
+        leech_caps,
     )
     .await
 }
@@ -7442,6 +7445,10 @@ async fn build_node_b_with_leaves(
     leaves: &[(B256, Address, U256)],
     max_blob_size_bytes: u64,
     engine_max_blob_mb: u64,
+    // Seed-leech caps to enable the governor on node B; the governor is built
+    // over B's own `Metrics` (so leech counters land where tests assert them) and
+    // returned so a test can pre-exhaust it before serving (#1254).
+    leech_caps: Option<LeechCaps>,
 ) -> Result<(
     Arc<decdn_node::handlers::client::ClientHandler>,
     EndpointAddr,
@@ -7450,6 +7457,7 @@ async fn build_node_b_with_leaves(
     decdn_cache::CacheEngine,
     Arc<Metrics>,
     Arc<LocalReputation>,
+    Option<Arc<LeechGovernor>>,
 )> {
     let b_sk = fresh_key();
     let b_id = b_sk.public();
@@ -7508,7 +7516,12 @@ async fn build_node_b_with_leaves(
         voucher: voucher_dom(),
         binding: binding_dom(),
     };
-    let handler_b = build_handler_full(
+    // Build the governor over B's own `Metrics` so leech counters land where the
+    // tests assert them, and return it so a test can pre-exhaust it before serving.
+    let leech_governor =
+        leech_caps.map(|caps| Arc::new(LeechGovernor::new(caps, Arc::clone(&b_metrics))));
+    let returned_governor = leech_governor.clone();
+    let handler_b = build_handler_full_configured(
         b_id,
         &b_eth,
         &b_metrics,
@@ -7519,14 +7532,17 @@ async fn build_node_b_with_leaves(
         &domains,
         max_blob_size_bytes,
         16,
+        |deps| {
+            // Window-paced pull-through: the deadline accommodates the full
+            // discover→probe→pull, and the window is the default ~1 MiB (one interval).
+            deps.pull_through = Some(Duration::from_secs(20));
+            deps.set_window_pull_through(
+                Arc::new(origin),
+                decdn_cache::Bytes::new(decdn_common::config::DEFAULT_PULL_AHEAD_BYTES),
+            );
+            deps.leech_governor = leech_governor;
+        },
     )?;
-    // Window-paced pull-through: the deadline accommodates the full
-    // discover→probe→pull, and the window is the default ~1 MiB (one interval).
-    handler_b.attach_pull_through(Duration::from_secs(20));
-    handler_b.attach_window_pull_through(
-        Arc::new(origin),
-        decdn_cache::Bytes::new(decdn_common::config::DEFAULT_PULL_AHEAD_BYTES),
-    );
 
     let target = EndpointAddr::new(b_id).with_ip_addr(addr_b);
     Ok((
@@ -7537,6 +7553,7 @@ async fn build_node_b_with_leaves(
         cache_handle,
         b_metrics,
         local_rep,
+        returned_governor,
     ))
 }
 
@@ -7613,19 +7630,21 @@ async fn window_pull_through_serves_and_caches_full_blob() -> Result<()> {
 
     let leaf_eth = Arc::new(PrivateKeySigner::random());
     let leaf_channel_id = B256::repeat_byte(0x1F);
-    let (handler_b, b_target, ep_b, recorded, cache_b, b_metrics, _local_rep) = build_node_b(
-        a_id,
-        a_addr,
-        a_eth.address(),
-        hash,
-        ab_channel_id,
-        &b_buyer,
-        leaf_channel_id,
-        leaf_eth.address(),
-        U256::from(DEPOSIT_MICRO_USDC),
-        0,
-    )
-    .await?;
+    let (handler_b, b_target, ep_b, recorded, cache_b, b_metrics, _local_rep, _leech_gov) =
+        build_node_b(
+            a_id,
+            a_addr,
+            a_eth.address(),
+            hash,
+            ab_channel_id,
+            &b_buyer,
+            leaf_channel_id,
+            leaf_eth.address(),
+            U256::from(DEPOSIT_MICRO_USDC),
+            0,
+            None,
+        )
+        .await?;
     let task_b = spawn_server(ep_b.clone(), handler_b);
 
     let leaf_sk = fresh_key();
@@ -7714,19 +7733,21 @@ async fn window_pull_through_serves_and_caches_empty_blob() -> Result<()> {
 
     let leaf_eth = Arc::new(PrivateKeySigner::random());
     let leaf_channel_id = B256::repeat_byte(0x1F);
-    let (handler_b, b_target, ep_b, recorded, cache_b, _b_metrics, _local_rep) = build_node_b(
-        a_id,
-        a_addr,
-        a_eth.address(),
-        hash,
-        ab_channel_id,
-        &b_buyer,
-        leaf_channel_id,
-        leaf_eth.address(),
-        U256::from(DEPOSIT_MICRO_USDC),
-        0,
-    )
-    .await?;
+    let (handler_b, b_target, ep_b, recorded, cache_b, _b_metrics, _local_rep, _leech_gov) =
+        build_node_b(
+            a_id,
+            a_addr,
+            a_eth.address(),
+            hash,
+            ab_channel_id,
+            &b_buyer,
+            leaf_channel_id,
+            leaf_eth.address(),
+            U256::from(DEPOSIT_MICRO_USDC),
+            0,
+            None,
+        )
+        .await?;
     let task_b = spawn_server(ep_b.clone(), handler_b);
 
     let leaf_sk = fresh_key();
@@ -7810,7 +7831,7 @@ async fn window_pull_through_concurrent_same_hash_single_upstream_pull() -> Resu
     let leaf2_eth = Arc::new(PrivateKeySigner::random());
     let leaf1_channel_id = B256::repeat_byte(0x81);
     let leaf2_channel_id = B256::repeat_byte(0x82);
-    let (handler_b, b_target, ep_b, recorded, cache_b, b_metrics, _local_rep) =
+    let (handler_b, b_target, ep_b, recorded, cache_b, b_metrics, _local_rep, _leech_gov) =
         build_node_b_with_leaves(
             a_id,
             a_addr,
@@ -7832,6 +7853,7 @@ async fn window_pull_through_concurrent_same_hash_single_upstream_pull() -> Resu
             ],
             0,
             64,
+            None,
         )
         .await?;
     let task_b = spawn_server_concurrent(ep_b.clone(), handler_b);
@@ -7967,19 +7989,21 @@ async fn window_pull_through_resumed_offset_falls_back_not_fused() -> Result<()>
 
     let leaf_eth = Arc::new(PrivateKeySigner::random());
     let leaf_channel_id = B256::repeat_byte(0x7F);
-    let (handler_b, b_target, ep_b, recorded, cache_b, b_metrics, _local_rep) = build_node_b(
-        a_id,
-        a_addr,
-        a_eth.address(),
-        hash,
-        ab_channel_id,
-        &b_buyer,
-        leaf_channel_id,
-        leaf_eth.address(),
-        U256::from(DEPOSIT_MICRO_USDC),
-        0,
-    )
-    .await?;
+    let (handler_b, b_target, ep_b, recorded, cache_b, b_metrics, _local_rep, _leech_gov) =
+        build_node_b(
+            a_id,
+            a_addr,
+            a_eth.address(),
+            hash,
+            ab_channel_id,
+            &b_buyer,
+            leaf_channel_id,
+            leaf_eth.address(),
+            U256::from(DEPOSIT_MICRO_USDC),
+            0,
+            None,
+        )
+        .await?;
     let task_b = spawn_server(ep_b.clone(), handler_b);
 
     let leaf_sk = fresh_key();
@@ -8083,19 +8107,21 @@ async fn window_pull_through_drop_after_fill_bounds_upstream_spend() -> Result<(
 
     let leaf_eth = Arc::new(PrivateKeySigner::random());
     let leaf_channel_id = B256::repeat_byte(0x2F);
-    let (handler_b, b_target, ep_b, recorded, cache_b, _b_metrics, _local_rep) = build_node_b(
-        a_id,
-        a_addr,
-        a_eth.address(),
-        hash,
-        ab_channel_id,
-        &b_buyer,
-        leaf_channel_id,
-        leaf_eth.address(),
-        U256::from(DEPOSIT_MICRO_USDC),
-        0,
-    )
-    .await?;
+    let (handler_b, b_target, ep_b, recorded, cache_b, _b_metrics, _local_rep, _leech_gov) =
+        build_node_b(
+            a_id,
+            a_addr,
+            a_eth.address(),
+            hash,
+            ab_channel_id,
+            &b_buyer,
+            leaf_channel_id,
+            leaf_eth.address(),
+            U256::from(DEPOSIT_MICRO_USDC),
+            0,
+            None,
+        )
+        .await?;
     let task_b = spawn_server(ep_b.clone(), handler_b);
 
     let leaf_sk = fresh_key();
@@ -8174,19 +8200,21 @@ async fn window_pull_through_insufficient_deposit_refuses_before_pulling() -> Re
     // µUSDC; the leaf's deposit of 1 µUSDC cannot cover it. The blob itself is
     // well under 64 MiB, so this is the deposit guard firing, not the size gate.
     let max_blob_size_bytes = 64 * 1024 * 1024;
-    let (handler_b, b_target, ep_b, recorded, cache_b, b_metrics, _local_rep) = build_node_b(
-        a_id,
-        a_addr,
-        a_eth.address(),
-        hash,
-        ab_channel_id,
-        &b_buyer,
-        leaf_channel_id,
-        leaf_eth.address(),
-        U256::from(1u64),
-        max_blob_size_bytes,
-    )
-    .await?;
+    let (handler_b, b_target, ep_b, recorded, cache_b, b_metrics, _local_rep, _leech_gov) =
+        build_node_b(
+            a_id,
+            a_addr,
+            a_eth.address(),
+            hash,
+            ab_channel_id,
+            &b_buyer,
+            leaf_channel_id,
+            leaf_eth.address(),
+            U256::from(1u64),
+            max_blob_size_bytes,
+            None,
+        )
+        .await?;
     let task_b = spawn_server(ep_b.clone(), handler_b);
 
     let leaf_sk = fresh_key();
@@ -8253,27 +8281,25 @@ async fn window_pull_through_leech_stall_refuses_without_spinning() -> Result<()
 
     let leaf_eth = Arc::new(PrivateKeySigner::random());
     let leaf_channel_id = B256::repeat_byte(0x4F);
-    let (handler_b, b_target, ep_b, recorded, cache_b, b_metrics, _local_rep) = build_node_b(
-        a_id,
-        a_addr,
-        a_eth.address(),
-        hash,
-        ab_channel_id,
-        &b_buyer,
-        leaf_channel_id,
-        leaf_eth.address(),
-        U256::from(DEPOSIT_MICRO_USDC),
-        0,
-    )
-    .await?;
-    handler_b.attach_leech_governor(Arc::new(LeechGovernor::new(
-        LeechCaps::new_unchecked(LeechCapsConfig {
-            max_unrecouped_leech_bytes: Bytes::new(0),
-            initial_allowance_bytes: Bytes::new(CHUNK_SIZE as u64),
-            share_ratio_percent: Percent::new(0),
-        }),
-        Arc::clone(&b_metrics),
-    )));
+    let (handler_b, b_target, ep_b, recorded, cache_b, b_metrics, _local_rep, _leech_gov) =
+        build_node_b(
+            a_id,
+            a_addr,
+            a_eth.address(),
+            hash,
+            ab_channel_id,
+            &b_buyer,
+            leaf_channel_id,
+            leaf_eth.address(),
+            U256::from(DEPOSIT_MICRO_USDC),
+            0,
+            Some(LeechCaps::new_unchecked(LeechCapsConfig {
+                max_unrecouped_leech_bytes: Bytes::new(0),
+                initial_allowance_bytes: Bytes::new(CHUNK_SIZE as u64),
+                share_ratio_percent: Percent::new(0),
+            })),
+        )
+        .await?;
     let task_b = spawn_server(ep_b.clone(), handler_b);
 
     let leaf_sk = fresh_key();
@@ -8548,19 +8574,21 @@ async fn window_pull_through_lying_upstream_is_not_cached() -> Result<()> {
 
     let leaf_eth = Arc::new(PrivateKeySigner::random());
     let leaf_channel_id = B256::repeat_byte(0x6F);
-    let (handler_b, b_target, ep_b, _recorded, cache_b, b_metrics, local_rep) = build_node_b(
-        a_id,
-        a_addr,
-        a_eth.address(),
-        hash,
-        ab_channel_id,
-        &b_buyer,
-        leaf_channel_id,
-        leaf_eth.address(),
-        U256::from(DEPOSIT_MICRO_USDC),
-        0,
-    )
-    .await?;
+    let (handler_b, b_target, ep_b, _recorded, cache_b, b_metrics, local_rep, _leech_gov) =
+        build_node_b(
+            a_id,
+            a_addr,
+            a_eth.address(),
+            hash,
+            ab_channel_id,
+            &b_buyer,
+            leaf_channel_id,
+            leaf_eth.address(),
+            U256::from(DEPOSIT_MICRO_USDC),
+            0,
+            None,
+        )
+        .await?;
     let task_b = spawn_server(ep_b.clone(), handler_b);
     // A's reputation before the pull: the corrupt serve must LOWER it (#915 —
     // pre-fix, a wire-complete corrupt upstream banked a `Delivered` and the
@@ -8671,19 +8699,21 @@ async fn window_pull_through_mid_stream_corruption_scores_upstream_not_local() -
 
     let leaf_eth = Arc::new(PrivateKeySigner::random());
     let leaf_channel_id = B256::repeat_byte(0x7A);
-    let (handler_b, b_target, ep_b, _recorded, cache_b, b_metrics, local_rep) = build_node_b(
-        a_id,
-        a_addr,
-        a_eth.address(),
-        hash,
-        ab_channel_id,
-        &b_buyer,
-        leaf_channel_id,
-        leaf_eth.address(),
-        U256::from(DEPOSIT_MICRO_USDC),
-        0,
-    )
-    .await?;
+    let (handler_b, b_target, ep_b, _recorded, cache_b, b_metrics, local_rep, _leech_gov) =
+        build_node_b(
+            a_id,
+            a_addr,
+            a_eth.address(),
+            hash,
+            ab_channel_id,
+            &b_buyer,
+            leaf_channel_id,
+            leaf_eth.address(),
+            U256::from(DEPOSIT_MICRO_USDC),
+            0,
+            None,
+        )
+        .await?;
     let task_b = spawn_server(ep_b.clone(), handler_b);
     let a_score_before = local_rep.score(a_id);
 
@@ -8772,7 +8802,7 @@ async fn window_pull_through_tee_finalize_failure_serves_but_does_not_cache() ->
 
     let leaf_eth = Arc::new(PrivateKeySigner::random());
     let leaf_channel_id = B256::repeat_byte(0x9C);
-    let (handler_b, b_target, ep_b, _recorded, cache_b, b_metrics, _local_rep) =
+    let (handler_b, b_target, ep_b, _recorded, cache_b, b_metrics, _local_rep, _leech_gov) =
         build_node_b_with_leaves(
             a_id,
             a_addr,
@@ -8787,6 +8817,7 @@ async fn window_pull_through_tee_finalize_failure_serves_but_does_not_cache() ->
             )],
             0, // handler cap: unlimited, so the serve proceeds and `pull.finish()` is Ok
             1, // engine cap: 1 MiB = total - 1, so `tee.finish()` rejects the promote
+            None,
         )
         .await?;
     let task_b = spawn_server(ep_b.clone(), handler_b);
@@ -8961,19 +8992,21 @@ async fn window_pull_through_underpaid_voucher_abandons_bounded() -> Result<()> 
 
     let leaf_eth = Arc::new(PrivateKeySigner::random());
     let leaf_channel_id = B256::repeat_byte(0x7F);
-    let (handler_b, b_target, ep_b, recorded, cache_b, b_metrics, _local_rep) = build_node_b(
-        a_id,
-        a_addr,
-        a_eth.address(),
-        hash,
-        ab_channel_id,
-        &b_buyer,
-        leaf_channel_id,
-        leaf_eth.address(),
-        U256::from(DEPOSIT_MICRO_USDC),
-        0,
-    )
-    .await?;
+    let (handler_b, b_target, ep_b, recorded, cache_b, b_metrics, _local_rep, _leech_gov) =
+        build_node_b(
+            a_id,
+            a_addr,
+            a_eth.address(),
+            hash,
+            ab_channel_id,
+            &b_buyer,
+            leaf_channel_id,
+            leaf_eth.address(),
+            U256::from(DEPOSIT_MICRO_USDC),
+            0,
+            None,
+        )
+        .await?;
     let task_b = spawn_server(ep_b.clone(), handler_b);
 
     let leaf_sk = fresh_key();
@@ -9032,36 +9065,37 @@ async fn window_pull_through_global_budget_exhausted_refuses_admission() -> Resu
 
     let leaf_eth = Arc::new(PrivateKeySigner::random());
     let leaf_channel_id = B256::repeat_byte(0x5F);
-    let (handler_b, b_target, ep_b, recorded, cache_b, b_metrics, _local_rep) = build_node_b(
-        a_id,
-        a_addr,
-        a_eth.address(),
-        hash,
-        ab_channel_id,
-        &b_buyer,
-        leaf_channel_id,
-        leaf_eth.address(),
-        U256::from(DEPOSIT_MICRO_USDC),
-        0,
-    )
-    .await?;
-    let gov = Arc::new(LeechGovernor::new(
-        // `new_unchecked`: a tiny global budget below the opening window, so the
-        // global circuit breaker binds on the first admission (the scenario under
-        // test). `LeechCaps::new` rejects this pairing by design.
-        LeechCaps::new_unchecked(LeechCapsConfig {
-            max_unrecouped_leech_bytes: Bytes::new(CHUNK_SIZE as u64),
-            initial_allowance_bytes: Bytes::new(decdn_common::config::DEFAULT_PULL_AHEAD_BYTES),
-            share_ratio_percent: Percent::new(100),
-        }),
-        Arc::clone(&b_metrics),
-    ));
-    // Pre-exhaust the global budget through an unrelated peer.
+    let (handler_b, b_target, ep_b, recorded, cache_b, b_metrics, _local_rep, leech_gov) =
+        build_node_b(
+            a_id,
+            a_addr,
+            a_eth.address(),
+            hash,
+            ab_channel_id,
+            &b_buyer,
+            leaf_channel_id,
+            leaf_eth.address(),
+            U256::from(DEPOSIT_MICRO_USDC),
+            0,
+            // `new_unchecked`: a tiny global budget below the opening window, so the
+            // global circuit breaker binds on the first admission (the scenario under
+            // test). `LeechCaps::new` rejects this pairing by design.
+            Some(LeechCaps::new_unchecked(LeechCapsConfig {
+                max_unrecouped_leech_bytes: Bytes::new(CHUNK_SIZE as u64),
+                initial_allowance_bytes: Bytes::new(decdn_common::config::DEFAULT_PULL_AHEAD_BYTES),
+                share_ratio_percent: Percent::new(100),
+            })),
+        )
+        .await?;
+    // Pre-exhaust the global budget through an unrelated peer, on the same governor
+    // the handler now holds.
+    let Some(gov) = leech_gov else {
+        anyhow::bail!("leech governor built from caps");
+    };
     gov.record_pulled(
         &[0xEEu8; 32],
         decdn_common::config::DEFAULT_PULL_AHEAD_BYTES,
     );
-    handler_b.attach_leech_governor(gov);
     let task_b = spawn_server(ep_b.clone(), handler_b);
 
     let leaf_sk = fresh_key();
@@ -9126,19 +9160,21 @@ async fn window_pull_through_oversized_upstream_aborts_and_releases_tee() -> Res
     // deposit guard (ceiling = min_payment(1 MiB, RATE) = 10 µUSDC) passes against
     // the funded leaf, so we exercise step (4), not the step (1) deposit guard.
     let max_blob_size_bytes = 1024 * 1024;
-    let (handler_b, b_target, ep_b, recorded, cache_b, b_metrics, _local_rep) = build_node_b(
-        a_id,
-        a_addr,
-        a_eth.address(),
-        hash,
-        ab_channel_id,
-        &b_buyer,
-        leaf_channel_id,
-        leaf_eth.address(),
-        U256::from(DEPOSIT_MICRO_USDC),
-        max_blob_size_bytes,
-    )
-    .await?;
+    let (handler_b, b_target, ep_b, recorded, cache_b, b_metrics, _local_rep, _leech_gov) =
+        build_node_b(
+            a_id,
+            a_addr,
+            a_eth.address(),
+            hash,
+            ab_channel_id,
+            &b_buyer,
+            leaf_channel_id,
+            leaf_eth.address(),
+            U256::from(DEPOSIT_MICRO_USDC),
+            max_blob_size_bytes,
+            None,
+        )
+        .await?;
     let task_b = spawn_server(ep_b.clone(), handler_b);
 
     let leaf_sk = fresh_key();
@@ -9222,33 +9258,32 @@ async fn window_pull_through_share_ratio_refuses_at_admission() -> Result<()> {
 
     let leaf_eth = Arc::new(PrivateKeySigner::random());
     let leaf_channel_id = B256::repeat_byte(0x8F);
-    let (handler_b, b_target, ep_b, recorded, cache_b, b_metrics, _local_rep) = build_node_b(
-        a_id,
-        a_addr,
-        a_eth.address(),
-        hash,
-        ab_channel_id,
-        &b_buyer,
-        leaf_channel_id,
-        leaf_eth.address(),
-        U256::from(DEPOSIT_MICRO_USDC),
-        0,
-    )
-    .await?;
-    // No opening allowance, no share-ratio growth, global budget off: the peer is
-    // immediately over its (zero) ceiling at the first admission poll. These caps
-    // satisfy `LeechCaps::new` (a `0` global budget disables the window≤budget
-    // cross-check), so the validated constructor is used here.
-    let gov = Arc::new(LeechGovernor::new(
-        LeechCaps::new(LeechCapsConfig {
-            max_unrecouped_leech_bytes: Bytes::new(0),
-            initial_allowance_bytes: Bytes::new(0),
-            share_ratio_percent: Percent::new(0),
-        })
-        .map_err(|e| anyhow::anyhow!("invalid caps: {e}"))?,
-        Arc::clone(&b_metrics),
-    ));
-    handler_b.attach_leech_governor(gov);
+    let (handler_b, b_target, ep_b, recorded, cache_b, b_metrics, _local_rep, _leech_gov) =
+        build_node_b(
+            a_id,
+            a_addr,
+            a_eth.address(),
+            hash,
+            ab_channel_id,
+            &b_buyer,
+            leaf_channel_id,
+            leaf_eth.address(),
+            U256::from(DEPOSIT_MICRO_USDC),
+            0,
+            // No opening allowance, no share-ratio growth, global budget off: the peer is
+            // immediately over its (zero) ceiling at the first admission poll. These caps
+            // satisfy `LeechCaps::new` (a `0` global budget disables the window≤budget
+            // cross-check), so the validated constructor is used here.
+            Some(
+                LeechCaps::new(LeechCapsConfig {
+                    max_unrecouped_leech_bytes: Bytes::new(0),
+                    initial_allowance_bytes: Bytes::new(0),
+                    share_ratio_percent: Percent::new(0),
+                })
+                .map_err(|e| anyhow::anyhow!("invalid caps: {e}"))?,
+            ),
+        )
+        .await?;
     let task_b = spawn_server(ep_b.clone(), handler_b);
 
     let leaf_sk = fresh_key();
