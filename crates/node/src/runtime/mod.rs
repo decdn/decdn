@@ -340,7 +340,6 @@ async fn build_infra(
     check_rpc_reachability(&cfg.blockchain.rpc_url).await?;
 
     let node_metrics = Arc::new(metrics::Metrics::new());
-    node_metrics.started();
     // Registry-mandatory `decdn_probe_hold_slots_max` (ADR
     // appendix-observability.md) — static, set once from config.
     node_metrics.probe_hold_slots_max(cfg.cache.max_probe_holds);
