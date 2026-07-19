@@ -12,11 +12,11 @@
 //!     is *not* preserved across the rebuild. `0` in any `security.*`
 //!     field disables that layer.
 //!
-//! Every other field that changed in the file is logged and ignored
-//! with a "requires restart" message — the runtime would otherwise need
-//! to tear down the iroh endpoint, the metrics listener, the gossip
-//! subscriptions, etc., which is far beyond the scope of a quick
-//! reload.
+//! Any non-reloadable field the file carries gets a "requires restart"
+//! message (logged on presence, not on change) — the runtime would
+//! otherwise need to tear down the iroh endpoint, the metrics listener,
+//! the gossip subscriptions, etc., which is far beyond the scope of a
+//! quick reload.
 //!
 //! The reload entry point ([`RuntimeReloadState::reload`]) is also
 //! called directly by tests, so its only side effects are mutating
@@ -114,9 +114,8 @@ pub type LogLevelSetter = Box<dyn Fn(LogLevel) -> anyhow::Result<()> + Send + Sy
 /// associated `Resolved` type stays internal to each impl, so the
 /// trait stays `dyn`-safe.
 pub(crate) trait ReloadableSection: Send + Sync {
-    /// Stable identifier for tracing event keys and snapshot-diff
-    /// machinery. Returning `&'static str` keeps it cheap and
-    /// non-allocating in the hot path.
+    /// Stable identifier for tracing event keys. Returning `&'static str`
+    /// keeps it cheap and non-allocating in the hot path.
     fn name(&self) -> &'static str;
 
     /// Drop any value lingering in the buffer cell.
@@ -281,9 +280,8 @@ impl ReloadableSection for PaymentSection {
 
 /// Reloadable observability log level. The full `[observability]`
 /// section isn't reloadable (`metrics_port`, `log_format`, etc. all
-/// need a restart), but the level is. Other sub-fields fall through
-/// to the "ignored field X (requires restart)" diff machinery in
-/// `log_ignored_observability`.
+/// need a restart), but the level is. The other sub-fields get a
+/// "requires restart" notice from `warn_restart_required_sections`.
 struct LogLevelSection {
     cli: ObservabilityArgs,
     setter: LogLevelSetter,
@@ -523,80 +521,13 @@ pub struct RuntimeReloadState {
     /// `pinned_hashes`, `security`) so the user-visible commit ordering
     /// across sections doesn't shift behind the refactor.
     sections: Vec<Arc<dyn ReloadableSection>>,
-    /// Per-section snapshot of the *previously seen* file contents,
-    /// captured as `serde_json::Value` for cheap structural diffing.
-    /// Cross-cutting (not a `ReloadableSection`) — used to suppress
-    /// the noisy "ignored (requires restart)" line when the operator
-    /// hasn't actually changed anything in those sections between
-    /// reloads. Updated only after a fully successful reload so a
-    /// rejected file doesn't poison future diffs.
-    last_file_sections: std::sync::Mutex<FileSectionSnapshot>,
-}
-
-/// JSON-serialised snapshots of every section we don't (fully) hot-reload.
-/// Stored as `Option<serde_json::Value>` so "section absent" and "section
-/// present but empty" diff distinctly. `None` everywhere on construction;
-/// populated after the first successful reload.
-///
-/// `cache.*` is captured even though `cache.pinned_hashes` is reloadable —
-/// `cache_changed_only_reloadable_fields` needs the structural baseline to
-/// suppress the "requires restart" warning on a pin/unpin reload. `payment`
-/// and `security` are fully reloadable and have no snapshot field: nothing
-/// to diff against.
-#[derive(Debug, Default, Clone)]
-struct FileSectionSnapshot {
-    identity: Option<serde_json::Value>,
-    network: Option<serde_json::Value>,
-    blockchain: Option<serde_json::Value>,
-    cache: Option<serde_json::Value>,
-    gossip: Option<serde_json::Value>,
-    observability: Option<serde_json::Value>,
-    dht: Option<serde_json::Value>,
-    receipts: Option<serde_json::Value>,
-}
-
-impl FileSectionSnapshot {
-    /// Capture a snapshot from a freshly parsed `FileConfig`. Serialisation
-    /// failures collapse to `None` (treated as "section absent"), with a
-    /// `debug!` line per failure so an operator chasing phantom
-    /// "ignored (requires restart)" warnings has a thread to pull. The
-    /// tracking is best-effort noise reduction, not a correctness gate.
-    fn capture(file: &FileConfig) -> Self {
-        Self {
-            identity: snap_section("identity", file.identity.as_ref()),
-            network: snap_section("network", file.network.as_ref()),
-            blockchain: snap_section("blockchain", file.blockchain.as_ref()),
-            cache: snap_section("cache", file.cache.as_ref()),
-            gossip: snap_section("gossip", file.gossip.as_ref()),
-            observability: snap_section("observability", file.observability.as_ref()),
-            dht: snap_section("dht", file.dht.as_ref()),
-            receipts: snap_section("receipts", file.receipts.as_ref()),
-        }
-    }
-}
-
-/// Serialise a config section to `serde_json::Value`, logging serialisation
-/// failures at `debug!` instead of swallowing them silently. A poisoned
-/// baseline would cause subsequent unchanged reloads to spuriously emit
-/// "ignored (requires restart)" warnings forever — exactly the noise the
-/// diff was meant to suppress — so we want the failure visible to anyone
-/// who turns up the log level.
-fn snap_section<T: serde::Serialize>(
-    section: &'static str,
-    value: Option<&T>,
-) -> Option<serde_json::Value> {
-    value.and_then(|v| {
-        serde_json::to_value(v)
-            .map_err(|err| {
-                tracing::debug!(
-                    section,
-                    %err,
-                    "config diff snapshot serialisation failed; treating as unchanged"
-                );
-                err
-            })
-            .ok()
-    })
+    /// Serialises concurrent reloads. A SIGHUP racing an `admin_v1_reload`
+    /// (both call [`Self::reload`]) waits here so the two-phase commit of
+    /// one reload never interleaves with another's. Guards no data — the
+    /// per-section buffer cells own the in-flight state — so a poisoned
+    /// lock is recovered in place rather than surfaced: a prior
+    /// panic-mid-reload must not wedge every future reload.
+    reload_lock: std::sync::Mutex<()>,
 }
 
 impl std::fmt::Debug for RuntimeReloadState {
@@ -671,7 +602,7 @@ impl RuntimeReloadState {
             pinned,
             security,
             sections,
-            last_file_sections: std::sync::Mutex::new(FileSectionSnapshot::default()),
+            reload_lock: std::sync::Mutex::new(()),
         }
     }
 
@@ -704,30 +635,6 @@ impl RuntimeReloadState {
                     "runtime reload limiter mutex poisoned during attach; recovering inner state"
                 );
                 *poisoned.into_inner() = limiter;
-            }
-        }
-    }
-
-    /// Seed the file-section snapshot from the config file loaded at
-    /// startup. Without this, the very first SIGHUP after startup falls
-    /// into the "no baseline → warn once" branch of the cache-section
-    /// diff (`cache_changed_only_reloadable_fields`), which means an
-    /// operator who only changed `cache.pinned_hashes` between startup
-    /// and the first SIGHUP gets a misleading `cache.* (cache_dir,
-    /// sizes, origin, decompress)` "requires restart" warning alongside
-    /// the "config reload applied" success line.
-    ///
-    /// Idempotent. A poisoned mutex is recovered the same way
-    /// [`Self::attach_cache`] handles its slot.
-    pub fn seed_initial_file_snapshot(&self, file: &decdn_common::config::FileConfig) {
-        let snapshot = FileSectionSnapshot::capture(file);
-        match self.last_file_sections.lock() {
-            Ok(mut guard) => *guard = snapshot,
-            Err(poisoned) => {
-                tracing::error!(
-                    "runtime reload snapshot mutex poisoned during seed; recovering inner state"
-                );
-                *poisoned.into_inner() = snapshot;
             }
         }
     }
@@ -925,13 +832,15 @@ impl RuntimeReloadState {
     ///    `config reload section applied` tracing event keyed by
     ///    `section = name()`.
     ///
-    /// Fields outside the reloadable set are diffed against the
-    /// previously seen file contents (snapshot stored on `self`) and a
-    /// single info line is emitted only when those sections actually
-    /// changed — operators see "you changed X but it needs a restart"
-    /// without false positives on every routine SIGHUP.
+    /// A single "requires restart" info line is emitted for each
+    /// non-reloadable section that carries a non-reloadable field in the
+    /// new file (see `warn_restart_required_sections`) so an operator who
+    /// edited one of those fields sees "you changed X but it needs a
+    /// restart". It fires on presence of the field, not on a change to it
+    /// (no diff against the previous file) — best-effort operator
+    /// guidance, not a correctness gate.
     #[allow(
-        clippy::cognitive_complexity, // Three short loops + one read scope; reads better as one unit than split apart.
+        clippy::cognitive_complexity, // A few short phase loops; reads better as one unit than split apart.
         clippy::unused_async, // Future-shaped on purpose: see below.
     )]
     // `async` is preserved even though no body is currently `.await`ed:
@@ -945,6 +854,33 @@ impl RuntimeReloadState {
             Err(err) => {
                 tracing::warn!(%err, path = %path.display(), "config reload aborted (file load failed); previous values retained for every section");
                 return Err(err);
+            }
+        };
+
+        // Serialise concurrent reloads before *any* shared-state mutation.
+        // `reload()` has no `.await` points, so on a multi-threaded runtime
+        // two callers (a SIGHUP racing an `admin_v1_reload`) can execute in
+        // true parallel; the per-section buffer cells are cleared in phase 1
+        // and drained in phase 3, so the guard must cover clear+resolve
+        // through commit+swap — otherwise a second reload could clear/
+        // overwrite the first's freshly-resolved buffers mid-flight and make
+        // it swap a mixed set. Only the file load above (no shared state)
+        // stays outside. The lock guards no data itself, so a poisoned lock
+        // is recovered in place: a prior panic-mid-reload must not wedge
+        // every future reload. Recovery is logged loudly (this file's
+        // "recover-the-data, log-loudly, do-not-clear-poison" pattern — see
+        // `attach_engine_to_section` / `drain_or_log`): a poisoned
+        // `reload_lock` is the sole surviving evidence that a previous reload
+        // panicked mid-commit, and swallowing it silently would erase it.
+        let _reload_guard = match self.reload_lock.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                tracing::error!(
+                    "runtime reload_lock poisoned by a prior panic-mid-reload; \
+                     recovering and proceeding (an earlier reload may have \
+                     partially applied before panicking)"
+                );
+                poisoned.into_inner()
             }
         };
 
@@ -974,40 +910,9 @@ impl RuntimeReloadState {
             return Err(err);
         }
 
-        // Lock the snapshot mutex before the fallible-commit phase.
-        // Holding it across the rest of the function serialises
-        // concurrent reloads (a second SIGHUP racing the first one
-        // waits here) and makes the snapshot write-back at the end
-        // part of the same critical section. The lock acquisition is
-        // the *last* fallible step before phase 2; a `PoisonError`
-        // here surfaces before any commit runs, preserving the
-        // "previous values retained on error" contract.
-        let mut sections_snapshot_guard = self
-            .last_file_sections
-            .lock()
-            .map_err(|_| anyhow::anyhow!("file-section snapshot mutex poisoned"))?;
-
-        // Diff non-reloadable sections against the previous snapshot
-        // before committing. Emitting "ignored" lines is read-only and
-        // we want them out of the way before the commit step.
-        //
-        // The log-level section needs the freshly resolved value to
-        // compare against the file's raw observability fields (the
-        // diff suppresses "ignored field X" lines that match what the
-        // resolver already honoured). Borrow it through the buffer's
-        // mutex guard rather than cloning — `infallible_swap` still
-        // needs the value and `ResolvedObservability` isn't `Clone`.
-        {
-            let buf_guard = self
-                .log_level
-                .buf
-                .lock()
-                .map_err(|_| anyhow::anyhow!("log-level buffer mutex poisoned"))?;
-            let new_observability = buf_guard
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("log-level buffer empty after resolve"))?;
-            log_ignored_fields(&file, new_observability, &sections_snapshot_guard);
-        }
+        // Emit a "requires restart" notice for each non-reloadable field the
+        // file carries. Read-only, so do it before the commit step.
+        warn_restart_required_sections(&file);
 
         // Phase 2: fallible commits. The log-level section is the only
         // one that can fail here today; future sections may add more.
@@ -1036,11 +941,6 @@ impl RuntimeReloadState {
             section.infallible_swap();
         }
 
-        // Write back the snapshot baseline so the next reload's diff
-        // compares against this file (not the previous one).
-        *sections_snapshot_guard = FileSectionSnapshot::capture(&file);
-        drop(sections_snapshot_guard);
-
         // Final summary line, retained for backwards compatibility
         // with any operators / log scrapers that grep for it. The
         // per-section `config reload section applied` events carry
@@ -1050,53 +950,7 @@ impl RuntimeReloadState {
     }
 }
 
-/// Return true iff every cache field outside the reloadable set is
-/// byte-identical between the new file and the previous snapshot — i.e.
-/// the operator only changed reloadable fields (`pinned_hashes` today)
-/// and no "requires restart" warning is needed.
-///
-/// Returning `false` means "I can't prove the operator only changed
-/// reloadable fields", which the caller turns into the warning. The
-/// failure modes (no baseline yet; serialisation failed) are
-/// deliberately conservative — they emit a one-shot warning rather than
-/// silently swallowing a real change.
-fn cache_changed_only_reloadable_fields(
-    file_cache: Option<&decdn_common::config::types::CacheConfig>,
-    prev_cache_json: Option<&serde_json::Value>,
-) -> bool {
-    let Some(file_cache) = file_cache else {
-        return false;
-    };
-    let Some(prev) = prev_cache_json else {
-        // First reload after startup with a populated cache section:
-        // we have no baseline to compare. Conservative: warn once so
-        // the operator sees the "requires restart" notice for any
-        // non-reloadable change. Better than swallowing a real change
-        // because we happened to lack a baseline.
-        return false;
-    };
-    // Strip pinned_hashes from both sides before diffing. Easiest way is
-    // to serialise both sides without that field. Since prev is a
-    // serde_json::Value, we can clone-and-remove. For the new file we
-    // serialise into Value first.
-    let Some(mut curr_val) = snap_section("cache", Some(file_cache)) else {
-        // Serialisation failed: we cannot prove the non-reloadable
-        // fields are unchanged. Conservatively assume they changed and
-        // emit the "requires restart" warning — silent suppression here
-        // is exactly the failure mode the diff was meant to surface.
-        return false;
-    };
-    let mut prev_val = prev.clone();
-    if let Some(obj) = curr_val.as_object_mut() {
-        obj.remove("pinned_hashes");
-    }
-    if let Some(obj) = prev_val.as_object_mut() {
-        obj.remove("pinned_hashes");
-    }
-    curr_val == prev_val
-}
-
-/// Emit a single info line per ignored-but-changed field.
+/// Emit a single info line naming a non-reloadable field group.
 fn warn_ignored(field: &'static str) {
     tracing::info!(
         field,
@@ -1104,149 +958,183 @@ fn warn_ignored(field: &'static str) {
     );
 }
 
-/// Log a notice for every non-reloadable field the operator changed
-/// *since the last successful reload*. The previous-file snapshot lives
-/// on `state.last_file_sections` so we can diff structurally rather than
-/// emitting a warning every time a section is merely present.
-fn log_ignored_fields(
-    file: &decdn_common::config::FileConfig,
-    new_obs: &ResolvedObservability,
-    prev: &FileSectionSnapshot,
-) {
-    log_ignored_observability(
-        file.observability.as_ref(),
-        new_obs,
-        prev.observability.as_ref(),
-    );
-    log_ignored_other_sections(file, prev);
-}
-
-/// Observability sub-fields outside the reloadable set. Compared
-/// field-by-field against the freshly resolved values: the operator
-/// cares whether the *current file* contains a non-honoured value that
-/// disagrees with what's running, not whether any value is set at all.
-fn log_ignored_observability(
-    obs: Option<&decdn_common::config::types::ObservabilityConfig>,
-    new_obs: &ResolvedObservability,
-    prev_obs_json: Option<&serde_json::Value>,
-) {
-    let Some(obs) = obs else {
-        return;
-    };
-    // If the previous snapshot's observability section is byte-identical
-    // to the current one, nothing in the section changed — short-circuit
-    // before the per-field diffs to keep the common no-change reload
-    // silent.
-    if let Some(prev) = prev_obs_json
-        && let Some(curr) = snap_section("observability", Some(obs))
-        && *prev == curr
-    {
-        return;
-    }
-    if obs.log_format.is_some() && obs.log_format != Some(new_obs.log_format) {
-        warn_ignored("observability.log_format");
-    }
-    if obs.metrics_port.is_some() && obs.metrics_port != Some(new_obs.metrics_port) {
-        warn_ignored("observability.metrics_port");
-    }
-    if obs.metrics_bind.is_some() && obs.metrics_bind != Some(new_obs.metrics_bind) {
-        warn_ignored("observability.metrics_bind");
-    }
-    if obs.otlp_endpoint.is_some() && obs.otlp_endpoint != new_obs.otlp_endpoint {
-        warn_ignored("observability.otlp_endpoint");
-    }
-    // `admin_port`: file value None vs Some(0) vs Some(N) are three
-    // distinct cases. The resolved value is `None` only when the file
-    // explicitly set 0 (disabled). Compare the `Option`s directly rather
-    // than collapsing both into a sentinel `0`.
-    if let Some(file_admin) = obs.admin_port {
-        let resolved_matches = match new_obs.admin_port {
-            Some(p) => p == file_admin,
-            // resolved=None means disabled; only matches file=Some(0).
-            None => file_admin == 0,
-        };
-        if !resolved_matches {
-            warn_ignored("observability.admin_port");
-        }
-    }
-}
-
-/// identity / network / blockchain / cache / gossip: warn only when the
-/// section's TOML serialisation differs from the previous successful
-/// reload. The first reload (snapshot empty) treats any present section
-/// as a change so the operator still gets the "ignored" notice once;
-/// thereafter we stay silent unless the section actually moved.
-fn log_ignored_other_sections(file: &decdn_common::config::FileConfig, prev: &FileSectionSnapshot) {
-    /// Compare a freshly parsed section to its baseline snapshot. A
-    /// serialisation failure is treated as a change ("can't prove it
-    /// didn't move, so warn"); the underlying error is logged at
-    /// `debug!` via [`snap_section`] so the noise is traceable.
-    fn changed<T: serde::Serialize>(
-        section: &'static str,
-        curr: Option<&T>,
-        prev: Option<&serde_json::Value>,
-    ) -> bool {
-        match (curr, prev) {
-            (None, None) => false,
-            (Some(c), Some(p)) => snap_section(section, Some(c)).is_none_or(|c| &c != p),
-            // Section appearing or disappearing counts as a change.
-            (Some(_), None) | (None, Some(_)) => true,
-        }
-    }
-    if changed("identity", file.identity.as_ref(), prev.identity.as_ref())
-        && file.identity.is_some()
-    {
+/// Emit a "requires restart" notice for each non-reloadable field the
+/// operator can't hot-apply. Fully non-reloadable sections warn whenever
+/// they are *present*; the partially-reloadable sections (`cache`,
+/// `observability`, `payment`) warn only when they set a field *outside*
+/// their reloadable subset, so the common `cache.pinned_hashes`-only,
+/// `observability.log_level`-only, or `payment.rate_per_mb`-only reload
+/// stays quiet. `security` is fully reloadable and never warns.
+/// Best-effort operator guidance, not a correctness gate — this does not
+/// diff against the previous file, so a present-but-unchanged
+/// non-reloadable field still warns on every reload.
+fn warn_restart_required_sections(file: &decdn_common::config::FileConfig) {
+    if file.identity.is_some() {
         warn_ignored("identity.* (data_dir, region)");
     }
-    if changed("network", file.network.as_ref(), prev.network.as_ref()) && file.network.is_some() {
+    if file.network.is_some() {
         warn_ignored("network.* (bind_port, relay_urls, relay_url, discovery, enable_0rtt)");
     }
-    if changed(
-        "blockchain",
-        file.blockchain.as_ref(),
-        prev.blockchain.as_ref(),
-    ) && file.blockchain.is_some()
-    {
+    if file.blockchain.is_some() {
         warn_ignored("blockchain.* (rpc_url, eth_keystore, contract addresses)");
     }
-    if changed("cache", file.cache.as_ref(), prev.cache.as_ref()) && file.cache.is_some() {
-        // Suppress the "ignored" notice when the only fields that
-        // changed inside `cache.*` are reloadable ones (pinned_hashes
-        // today). Otherwise an operator who pinned/unpinned a hash
-        // would see a misleading "requires restart" warning right
-        // alongside the "config reload applied" success line.
-        if !cache_changed_only_reloadable_fields(file.cache.as_ref(), prev.cache.as_ref()) {
-            warn_ignored("cache.* (cache_dir, sizes, origin, decompress)");
-        }
+    if file
+        .cache
+        .as_ref()
+        .is_some_and(cache_has_restart_required_field)
+    {
+        warn_ignored("cache.* (cache_dir, sizes, origin, decompress)");
     }
-    if changed("gossip", file.gossip.as_ref(), prev.gossip.as_ref()) && file.gossip.is_some() {
+    if file
+        .payment
+        .as_ref()
+        .is_some_and(payment_has_restart_required_field)
+    {
+        // Only `voucher_interval_mb` lands here: `rate_per_mb` reloads, and
+        // `delivery_floor`/`delivery_ceiling` get a *change-based* notice
+        // from `PaymentSection::infallible_swap` (which holds the applied
+        // bounds to diff against). `voucher_interval_mb` has no such applied
+        // value to diff, so the presence-based notice is its only home.
+        warn_ignored("payment.* (voucher_interval_mb)");
+    }
+    if file.gossip.is_some() {
         warn_ignored(
             "gossip.* (announce_interval, peer_ttl, subscribe_global, \
              subscribe_reputation, reputation_publish_interval_sec)",
         );
     }
-    if changed("dht", file.dht.as_ref(), prev.dht.as_ref()) && file.dht.is_some() {
+    if file
+        .observability
+        .as_ref()
+        .is_some_and(observability_has_restart_required_field)
+    {
+        warn_ignored(
+            "observability.* (log_format, metrics_port, metrics_bind, otlp_endpoint, \
+             admin_port, region_accounting_interval_sec)",
+        );
+    }
+    if file.dht.is_some() {
         // `dht.*` (rate-limit caps, trusted IPs) is not currently
         // hot-reloadable — the limiter is constructed once at startup.
-        // Surfacing "requires restart" here keeps DHT on the same footing
-        // as the other restart-required sections; reloadability follows
-        // the dispatch-limiter pattern (`security.*`) and is a candidate
-        // for a future change once the limiter grows an ArcSwap on its
-        // inner state.
+        // Reloadability would follow the dispatch-limiter pattern
+        // (`security.*`) once the limiter grows an ArcSwap on its inner
+        // state.
         warn_ignored("dht.* (rate-limit, trusted_ips)");
     }
-    if changed("receipts", file.receipts.as_ref(), prev.receipts.as_ref())
-        && file.receipts.is_some()
-    {
+    if file.probe.is_some() {
+        // `probe.rate_limit` is read once at startup; changing it requires
+        // a restart (same footing as `dht.*`).
+        warn_ignored("probe.* (rate_limit)");
+    }
+    if file.receipts.is_some() {
         // `receipts.*` (rotation cap, retained backups) is read once when
         // `JsonlReceiptLog` is opened at bring-up; changing it requires a
-        // restart, so surface the same "ignored (requires restart)" notice
-        // as the other startup-only sections.
+        // restart.
         warn_ignored("receipts.* (max_file_bytes, retained_files)");
+    }
+    if file.prefetch.is_some() {
+        // The prefetch scheduler wires its budget/threshold knobs once at
+        // bring-up; none are hot-reloadable.
+        warn_ignored(
+            "prefetch.* (enabled, require_authorized_origin, budget_usdc_per_hour, \
+             thresholds, concurrency, timeout)",
+        );
     }
     // `security.*` is fully reloadable — see `RuntimeReloadState::reload`'s
     // commit step. Invalid values reject the entire reload via
     // `resolve_security` upstream rather than landing here.
+}
+
+/// Whether the file's `[cache]` section sets any field that a restart is
+/// required to apply — i.e. anything other than the hot-reloadable
+/// `pinned_hashes` (#276). Destructured exhaustively so that adding a new
+/// `CacheConfig` field is a compile error here until it's classified
+/// reloadable-or-not, rather than silently escaping the restart notice.
+const fn cache_has_restart_required_field(c: &decdn_common::config::types::CacheConfig) -> bool {
+    let decdn_common::config::types::CacheConfig {
+        pinned_hashes: _, // the only hot-reloadable cache field
+        cache_dir,
+        cache_size_mb,
+        max_blob_size_mb,
+        origin,
+        origins,
+        origin_retry,
+        circuit_breaker,
+        user_agent,
+        gc_interval_sec,
+        max_probe_holds,
+        stake_lane_reserved_holds,
+        node_to_node_pull_through_enabled,
+        node_pull_probe_fanout,
+        node_pull_timeout_sec,
+        node_pull_stall_timeout_sec,
+        pull_ahead_bytes,
+        max_unrecouped_leech_bytes,
+        pull_share_ratio_percent,
+        pull_through_require_authorized_origin,
+    } = c;
+    cache_dir.is_some()
+        || cache_size_mb.is_some()
+        || max_blob_size_mb.is_some()
+        || origin.is_some()
+        || origins.is_some()
+        || origin_retry.is_some()
+        || circuit_breaker.is_some()
+        || user_agent.is_some()
+        || gc_interval_sec.is_some()
+        || max_probe_holds.is_some()
+        || stake_lane_reserved_holds.is_some()
+        || node_to_node_pull_through_enabled.is_some()
+        || node_pull_probe_fanout.is_some()
+        || node_pull_timeout_sec.is_some()
+        || node_pull_stall_timeout_sec.is_some()
+        || pull_ahead_bytes.is_some()
+        || max_unrecouped_leech_bytes.is_some()
+        || pull_share_ratio_percent.is_some()
+        || pull_through_require_authorized_origin.is_some()
+}
+
+/// Whether the file's `[observability]` section sets any field that a
+/// restart is required to apply — i.e. anything other than the
+/// hot-reloadable `log_level`. Exhaustively destructured for the same
+/// compile-time-classification reason as [`cache_has_restart_required_field`].
+const fn observability_has_restart_required_field(
+    o: &decdn_common::config::types::ObservabilityConfig,
+) -> bool {
+    let decdn_common::config::types::ObservabilityConfig {
+        log_level: _, // the only hot-reloadable observability field
+        log_format,
+        metrics_port,
+        metrics_bind,
+        admin_port,
+        otlp_endpoint,
+        region_accounting_interval_sec,
+    } = o;
+    log_format.is_some()
+        || metrics_port.is_some()
+        || metrics_bind.is_some()
+        || admin_port.is_some()
+        || otlp_endpoint.is_some()
+        || region_accounting_interval_sec.is_some()
+}
+
+/// Whether the file's `[payment]` section sets a field whose restart notice
+/// belongs here. `rate_per_mb` reloads and `delivery_floor`/
+/// `delivery_ceiling` are warned change-based in
+/// [`PaymentSection::infallible_swap`], so only `voucher_interval_mb` — read
+/// once into the client handler at bring-up, with no applied value to diff —
+/// trips this gate. Exhaustively destructured for the same
+/// compile-time-classification reason as [`cache_has_restart_required_field`].
+const fn payment_has_restart_required_field(
+    p: &decdn_common::config::types::PaymentConfig,
+) -> bool {
+    let decdn_common::config::types::PaymentConfig {
+        rate_per_mb: _,      // hot-reloadable
+        delivery_floor: _,   // warned change-based in PaymentSection::infallible_swap
+        delivery_ceiling: _, // warned change-based in PaymentSection::infallible_swap
+        voucher_interval_mb,
+    } = p;
+    voucher_interval_mb.is_some()
 }
 
 #[cfg(test)]
@@ -1593,17 +1481,13 @@ mod tests {
         assert_eq!(st.rate_per_mb().load(Ordering::Relaxed), 33);
     }
 
-    /// Transactional contract for the *snapshot* mutex: if
-    /// `last_file_sections` is poisoned the reload must surface an
-    /// error before the live tracing filter is mutated and before the
-    /// rate atomic is swapped. The setter committing while a later
-    /// fallible step (snapshot lock) blew up was the original bug —
-    /// keep that path in the regression suite.
+    /// The `reload_lock` only serialises concurrent reloads; it guards no
+    /// data, so a poisoned lock (a prior panic-mid-reload) must not wedge
+    /// future reloads. A reload after poisoning still recovers the guard
+    /// and applies the file — the setter fires and the rate atomic moves.
     #[tokio::test]
-    async fn reload_keeps_log_level_when_sections_mutex_poisoned() {
+    async fn reload_recovers_from_poisoned_reload_lock() {
         let dir = tempfile::tempdir().unwrap();
-        // File asks for a log-level change *and* a rate change so the
-        // setter would be exercised if we reached the commit step.
         let path = write_config(
             dir.path(),
             "[payment]\nrate_per_mb = 99\n\n[observability]\nlog_level = \"debug\"\n",
@@ -1629,33 +1513,27 @@ mod tests {
             setter,
         );
 
-        // Same poisoning pattern as the log-level variant: hold the
-        // guard on a thread that panics, swallow the join payload to
-        // keep the test running.
+        // Poison the reload lock on a thread that panics while holding it.
         let st = Arc::new(state);
         let st_for_thread = Arc::clone(&st);
         let join = std::thread::spawn(move || {
-            let _guard = st_for_thread.last_file_sections.lock().unwrap();
-            panic!("intentional panic to poison snapshot mutex");
+            let _guard = st_for_thread.reload_lock.lock().unwrap();
+            panic!("intentional panic to poison reload lock");
         });
         let _ = join.join();
-        assert!(st.last_file_sections.is_poisoned());
+        assert!(st.reload_lock.is_poisoned());
 
-        let err = st.reload(&path).await.unwrap_err();
-        assert!(format!("{err:#}").contains("file-section snapshot mutex poisoned"));
-        // The setter must NOT have been called — that's the whole point
-        // of locking the snapshot mutex before any committing side-effect.
-        assert!(captured.lock().unwrap().is_none());
-        // Rate atomic must not have moved either.
-        assert_eq!(st.rate_per_mb().load(Ordering::Relaxed), 42);
+        // Reload still succeeds — the poisoned lock is recovered in place.
+        st.reload(&path).await.expect("reload recovers from poison");
+        assert_eq!(st.rate_per_mb().load(Ordering::Relaxed), 99);
+        assert_eq!(captured.lock().unwrap().as_ref(), Some(&LogLevel::Debug));
     }
 
-    /// Diff-based ignored-section logging: a second reload of the same
-    /// file must succeed and not touch the rate (already at target),
-    /// proving the snapshot is being captured and is queryable. We
-    /// can't directly capture `tracing` lines without a subscriber
-    /// fixture, but the public-state behaviour the operator cares
-    /// about is "reload remains idempotent across repeated SIGHUPs".
+    /// A second reload of the same file must succeed and not touch the
+    /// rate (already at target). We can't directly capture `tracing`
+    /// lines without a subscriber fixture, but the public-state behaviour
+    /// the operator cares about is "reload remains idempotent across
+    /// repeated SIGHUPs".
     #[tokio::test]
     async fn reload_is_idempotent_across_repeated_sighups() {
         let dir = tempfile::tempdir().unwrap();
@@ -1791,11 +1669,10 @@ mod tests {
     }
 
     /// A malformed TOML body must reject the reload before any commit
-    /// side-effect runs: the setter is never called, the rate atomic
-    /// stays at its previous value, and the snapshot baseline (which
-    /// other reloads diff against) is unchanged. Without this test the
-    /// transactional guarantees only get exercised on the *resolution*
-    /// failure paths, not on the parse failure path.
+    /// side-effect runs: the setter is never called and the rate atomic
+    /// stays at its previous value. Without this test the transactional
+    /// guarantees only get exercised on the *resolution* failure paths,
+    /// not on the parse failure path.
     #[tokio::test]
     async fn reload_returns_error_on_malformed_toml() {
         let dir = tempfile::tempdir().unwrap();
@@ -1824,11 +1701,6 @@ mod tests {
             setter,
         );
 
-        // Sample the snapshot before the reload to compare against the
-        // post-reload value. `FileSectionSnapshot` derives `Clone` so
-        // we can take a structural copy through the guard.
-        let snapshot_before = state.last_file_sections.lock().unwrap().clone();
-
         let err = state.reload(&path).await.unwrap_err();
         // Don't bind the test to a specific TOML diagnostic; just check
         // the call failed.
@@ -1836,16 +1708,6 @@ mod tests {
 
         assert_eq!(state.rate_per_mb().load(Ordering::Relaxed), 42);
         assert!(captured.lock().unwrap().is_none());
-
-        let snapshot_after = state.last_file_sections.lock().unwrap().clone();
-        // Snapshots cmp by serde_json::Value equality — any drift across
-        // a rejected parse would mean we mutated the diff baseline,
-        // which is exactly what the test guards against.
-        assert_eq!(
-            format!("{snapshot_before:?}"),
-            format!("{snapshot_after:?}"),
-            "snapshot baseline must not move on parse-failed reload"
-        );
     }
 
     // ----- pinned_hashes hot-reload (#276) -----
@@ -2052,12 +1914,11 @@ mod tests {
     }
 
     /// Direct test for the poison-recovery branch in `attach_cache`.
-    /// The existing `reload_keeps_*_when_*_mutex_poisoned` tests
-    /// poison `current_log_level` and `last_file_sections`, but never
-    /// the cache slot itself. This locks in the recovery path that
-    /// commit `a148c02` introduced — silently no-op'ing on a poisoned
-    /// cache mutex would turn every subsequent reload into a silent
-    /// no-op for pinning.
+    /// `reload_keeps_rate_when_log_level_mutex_poisoned` poisons the
+    /// log-level slot, but never the cache slot itself. This locks in the
+    /// recovery path that commit `a148c02` introduced — silently
+    /// no-op'ing on a poisoned cache mutex would turn every subsequent
+    /// reload into a silent no-op for pinning.
     #[tokio::test]
     async fn attach_cache_recovers_from_poisoned_mutex() {
         let initial = seed_resolved(10, LogLevel::Info);
@@ -2470,18 +2331,19 @@ mod tests {
         assert!(stored, "attach_limiter must store engine despite poison");
     }
 
-    /// `seed_initial_file_snapshot` primes the diff baseline from the
-    /// startup config, so the first SIGHUP after startup doesn't fall
-    /// into the "no baseline → warn once" branch in
-    /// `cache_changed_only_reloadable_fields`. The behaviour we can
-    /// assert directly: after seeding, `last_file_sections` reflects
-    /// the populated cache section instead of `Default::default()`.
-    #[test]
-    fn seed_initial_file_snapshot_primes_diff_baseline() {
-        use decdn_common::config::FileConfig;
-        use decdn_common::config::types::CacheConfig;
+    /// A non-reloadable section present in the file only earns a
+    /// "requires restart" notice — it must not gate the reload. A file
+    /// carrying `[network]` (restart-only) alongside a `[payment]` rate
+    /// change still applies the reloadable field.
+    #[tokio::test]
+    async fn reload_applies_despite_restart_only_section_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(
+            dir.path(),
+            "[payment]\nrate_per_mb = 77\n\n[network]\nbind_port = 4433\n",
+        );
 
-        let initial = seed_resolved(10, LogLevel::Info);
+        let initial = seed_resolved(42, LogLevel::Info);
         let (setter, _captured) = recording_setter();
         let state = RuntimeReloadState::new(
             PaymentArgs {
@@ -2501,23 +2363,84 @@ mod tests {
             setter,
         );
 
-        // Default state: cache snapshot is `None`.
-        let before = state.last_file_sections.lock().unwrap().clone();
-        assert!(before.cache.is_none(), "baseline should start empty");
+        state.reload(&path).await.expect("reload applies");
+        assert_eq!(state.rate_per_mb().load(Ordering::Relaxed), 77);
+    }
 
-        let file = FileConfig {
-            cache: Some(CacheConfig {
-                cache_size_mb: Some(2048),
-                ..CacheConfig::default()
-            }),
-            ..FileConfig::default()
+    /// The `[cache]` restart notice is gated on a *non-reloadable* field
+    /// being set: a `pinned_hashes`-only edit (the section's sole
+    /// hot-reloadable field) must not trip it, while any other field must.
+    #[test]
+    fn cache_notice_gate_ignores_pinned_hashes_only() {
+        use decdn_common::config::types::CacheConfig;
+
+        // Only the hot-reloadable field set -> no restart notice.
+        let pinned_only = CacheConfig {
+            pinned_hashes: Some(vec!["deadbeef".to_string()]),
+            ..CacheConfig::default()
         };
-        state.seed_initial_file_snapshot(&file);
+        assert!(!cache_has_restart_required_field(&pinned_only));
+        // Empty section -> no restart notice.
+        assert!(!cache_has_restart_required_field(&CacheConfig::default()));
+        // A non-reloadable field set -> notice.
+        let with_dir = CacheConfig {
+            cache_dir: Some(PathBuf::from("/tmp/decdn-cache")),
+            ..CacheConfig::default()
+        };
+        assert!(cache_has_restart_required_field(&with_dir));
+    }
 
-        let after = state.last_file_sections.lock().unwrap().clone();
-        assert!(
-            after.cache.is_some(),
-            "seeded snapshot should populate cache section"
-        );
+    /// The `[observability]` restart notice is gated on a *non-reloadable*
+    /// field being set: a `log_level`-only edit (hot-reloadable) must not
+    /// trip it, while e.g. `metrics_port` must.
+    #[test]
+    fn observability_notice_gate_ignores_log_level_only() {
+        use decdn_common::config::types::ObservabilityConfig;
+
+        let level_only = ObservabilityConfig {
+            log_level: Some(LogLevel::Debug),
+            ..ObservabilityConfig::default()
+        };
+        assert!(!observability_has_restart_required_field(&level_only));
+        assert!(!observability_has_restart_required_field(
+            &ObservabilityConfig::default()
+        ));
+        let with_metrics = ObservabilityConfig {
+            metrics_port: Some(9090),
+            ..ObservabilityConfig::default()
+        };
+        assert!(observability_has_restart_required_field(&with_metrics));
+    }
+
+    /// The `[payment]` restart notice is gated on `voucher_interval_mb`
+    /// only: `rate_per_mb` reloads and the delivery bounds are warned
+    /// change-based in `PaymentSection::infallible_swap`, so neither trips
+    /// this gate; `voucher_interval_mb` must.
+    #[test]
+    fn payment_notice_gate_covers_only_voucher_interval() {
+        use decdn_common::config::types::PaymentConfig;
+
+        // Reloadable field only -> no notice here.
+        let rate_only = PaymentConfig {
+            rate_per_mb: Some(100),
+            ..PaymentConfig::default()
+        };
+        assert!(!payment_has_restart_required_field(&rate_only));
+        // Delivery bounds are warned change-based elsewhere -> not here.
+        let bounds_only = PaymentConfig {
+            delivery_floor: Some(1),
+            delivery_ceiling: Some(2),
+            ..PaymentConfig::default()
+        };
+        assert!(!payment_has_restart_required_field(&bounds_only));
+        assert!(!payment_has_restart_required_field(
+            &PaymentConfig::default()
+        ));
+        // The one field with no other home -> notice.
+        let voucher = PaymentConfig {
+            voucher_interval_mb: Some(8),
+            ..PaymentConfig::default()
+        };
+        assert!(payment_has_restart_required_field(&voucher));
     }
 }

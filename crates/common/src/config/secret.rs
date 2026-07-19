@@ -16,20 +16,22 @@
 //! - [`serde::Deserialize`] is implemented (so TOML still works).
 //! - [`serde::Serialize`] is implemented but emits a redacted,
 //!   hashed form (`"hash:{digest}"`) — never the cleartext secret.
-//!   The hash uses [`std::collections::hash_map::DefaultHasher`],
-//!   which `std` documents as producing the same output for all
-//!   `DefaultHasher` instances in a given build of the standard
-//!   library — i.e. deterministic across processes built with the
-//!   same toolchain. It is non-cryptographic, so collisions are
-//!   theoretically possible but vanishingly rare for the
-//!   credential-rotation use case (single-pair collision
-//!   probability ≈ 2⁻⁶⁴ for a 64-bit hash). The purpose is to
-//!   preserve SIGHUP reload diff-detection in
-//!   `runtime::reload::FileSectionSnapshot`: two snapshots compare
-//!   equal iff the underlying secrets hash to the same value,
-//!   without the serialized form revealing either secret. We don't
-//!   need cryptographic strength here — the snapshot is in-process
-//!   memory only, never logged or written to disk.
+//!   The config section structs derive `Serialize` (for symmetry with
+//!   `Deserialize`), so `SecretString` must implement it for them to
+//!   compile; emitting a hash rather than the raw string is
+//!   defense-in-depth, the `Serialize` analogue of the `Debug`
+//!   redaction above — any incidental serialization of a config
+//!   section (diagnostics, tests, future call sites) cannot leak the
+//!   credential. The hash uses
+//!   [`std::collections::hash_map::DefaultHasher`], which `std`
+//!   documents as producing the same output for all `DefaultHasher`
+//!   instances in a given build of the standard library — i.e.
+//!   deterministic across processes built with the same toolchain, so
+//!   distinct secrets almost always serialize to distinct forms. It is
+//!   non-cryptographic (single-pair collision probability ≈ 2⁻⁶⁴ for a
+//!   64-bit hash); cryptographic strength is unnecessary because the
+//!   output only guards against accidental cleartext exposure, never
+//!   authenticates anything.
 
 use std::hash::{Hash, Hasher};
 
@@ -77,25 +79,22 @@ impl std::fmt::Debug for SecretString {
 
 impl Serialize for SecretString {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        // We cannot drop `Serialize` entirely: `runtime::reload`'s
-        // `FileSectionSnapshot::capture` calls `serde_json::to_value`
-        // on every config section to detect SIGHUP-time changes that
-        // are non-hot-reloadable. If we skipped the credentials
-        // field, an operator rotating the secret would see "no
-        // change" instead of "cache.* requires restart". So we emit
-        // a deterministic hash of the secret bytes: distinct secrets
-        // almost always map to distinct hashes (preserving diff
-        // detection) without the serialized form revealing the
-        // secret. `DefaultHasher` is non-cryptographic; std
-        // documents it as producing the same output across all
-        // `DefaultHasher` instances in a build, so the digest is
-        // stable for two snapshots taken in the same process. We
-        // don't need cryptographic strength here because the
-        // serialized value only lives in-memory and is compared
-        // structurally in `runtime::reload` — it is never logged
-        // or written to a file by anything in this codebase. The
-        // single-pair collision probability (~2⁻⁶⁴ for a 64-bit
-        // output) is negligible for credential-rotation diffing.
+        // We cannot drop `Serialize` entirely: the config section
+        // structs (`S3Credentials`, and `FileConfig` transitively)
+        // derive it for symmetry with `Deserialize`, so `SecretString`
+        // must implement it for them to compile. Rather than emit the
+        // cleartext, we hash it: any incidental serialization of a
+        // config section — diagnostics, tests, a future call site —
+        // then cannot leak the credential (defense-in-depth, the
+        // `Serialize` analogue of the `Debug` redaction). Distinct
+        // secrets almost always map to distinct hashes, so the form
+        // stays useful for equality checks. `DefaultHasher` is
+        // non-cryptographic; std documents it as producing the same
+        // output across all `DefaultHasher` instances in a build, so
+        // the digest is stable within a process. Cryptographic strength
+        // is unnecessary — the output only guards against accidental
+        // cleartext exposure, and the single-pair collision probability
+        // (~2⁻⁶⁴ for a 64-bit output) is negligible.
         let mut h = std::collections::hash_map::DefaultHasher::new();
         self.0.hash(&mut h);
         // 16 hex chars covers the full u64 hash output. Prefix is
@@ -179,10 +178,10 @@ mod tests {
 
     #[test]
     fn serialize_does_not_leak_value() {
-        // The serialized form must never contain the cleartext
-        // secret. This is the contract `runtime::reload::snap_section`
-        // depends on — it serializes the entire FileConfig section
-        // and any leak would surface in the in-memory snapshot Value.
+        // The serialized form must never contain the cleartext secret.
+        // This is the defense-in-depth contract: any serialization of a
+        // config section (the structs derive `Serialize`) must redact
+        // the credential rather than surface it.
         let s = SecretString::new("hunter2-this-is-the-secret");
         let json = serde_json::to_string(&s).unwrap();
         assert!(
@@ -197,12 +196,10 @@ mod tests {
 
     #[test]
     fn serialize_distinguishes_distinct_secrets() {
-        // Diff detection in `runtime::reload::FileSectionSnapshot`
-        // compares serialized forms structurally. Distinct secrets
-        // must produce distinct serialized forms; otherwise an
-        // operator rotating credentials via SIGHUP would see "no
-        // change" and not get the "cache.* requires restart"
-        // warning.
+        // Distinct secrets must produce distinct serialized forms so the
+        // redacted output stays useful for equality/change checks rather
+        // than collapsing every credential to one indistinguishable
+        // token.
         let a = SecretString::new("old-key");
         let b = SecretString::new("new-key");
         let ja = serde_json::to_string(&a).unwrap();
@@ -213,9 +210,8 @@ mod tests {
     #[test]
     fn serialize_is_deterministic_within_process() {
         // The same secret, serialized twice, must produce the same
-        // bytes — otherwise `snap_section` would always see a
-        // "change" between reloads and emit spurious "requires
-        // restart" warnings.
+        // bytes — a stable redacted form, so the hash is usable for
+        // equality checks rather than varying run-to-run.
         let s = SecretString::new("a-stable-key");
         let first = serde_json::to_string(&s).unwrap();
         let second = serde_json::to_string(&s).unwrap();
