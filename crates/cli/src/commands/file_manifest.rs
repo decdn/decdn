@@ -244,13 +244,28 @@ where
             let bytes = fetch_chunk(chunk.hash)
                 .await
                 .with_context(|| format!("fetch chunk {}/{total}", index + 1))?;
-            verify_chunk(&bytes, chunk, index)?;
+            // Verify AND write on the blocking pool. `verify_chunk` is a
+            // whole-chunk BLAKE3 hash — the same executor-stalling work
+            // `part_is_verified` is offloaded for just above — and the cache-miss
+            // path is the one place it is guaranteed to run, so it must not sit
+            // on the executor either. (The transport already verifies the bytes
+            // against `chunk.hash` via the bao decoder in `client-pull`; this is
+            // defense-in-depth, but a whole-chunk hash all the same.) Verifying
+            // before the write means a bad chunk never reaches disk.
+            let (part_w, chunk_w) = (part.clone(), chunk.clone());
             blocking(
-                {
-                    let part = part.clone();
-                    move || super::fetch::write_blob_atomic(&part, &bytes)
+                move || -> anyhow::Result<()> {
+                    verify_chunk(&bytes, &chunk_w, index)?;
+                    super::fetch::write_blob_atomic(&part_w, &bytes)?;
+                    Ok(())
                 },
-                || format!("write {}", part.display()),
+                || {
+                    format!(
+                        "verify and write chunk {}/{total} to {}",
+                        index + 1,
+                        part.display()
+                    )
+                },
             )
             .await?;
         }
@@ -573,7 +588,7 @@ mod tests {
     }
 
     /// A part left truncated by an interrupted run is re-fetched, not reused —
-    /// the size check rejects it before the (256 MiB-scale) hash pass runs.
+    /// the size check rejects it before the (whole-chunk) hash pass runs.
     #[tokio::test]
     async fn a_truncated_part_is_refetched() {
         let chunks: [&[u8]; 2] = [b"one", b"two"];
@@ -652,6 +667,43 @@ mod tests {
 
         assert_eq!(std::fs::read(&out).unwrap(), b"onetwo");
         assert!(!downloads.join(hex(&hash)).exists());
+    }
+
+    /// `--no-keep-blobs` cleanup must *surface* a part dir it cannot empty, not
+    /// silently leave it. `write_blob_atomic` stages its temp *inside* the part
+    /// dir, so a run killed mid-write leaves an orphan the delete loop never
+    /// enumerates; `remove_dir` then fails `ENOTEMPTY`. Since nothing GCs the
+    /// downloads root, the dir must remain (the leak is visible) and the run must
+    /// still succeed — cleanup is best-effort. A regression reverting the
+    /// `remove_dir` warning back to `let _ =` would make this leak invisible.
+    #[tokio::test]
+    async fn no_keep_blobs_leaves_a_dir_holding_an_orphan_tmp() {
+        let chunks: [&[u8]; 2] = [b"one", b"two"];
+        let (manifest, blob) = manifest_for(&chunks);
+        let hash = *blake3::hash(&blob).as_bytes();
+        let dir = tempfile::tempdir().unwrap();
+        let downloads = dir.path().join("downloads");
+        let out = dir.path().join("out.bin");
+        let src = Source::new(&chunks);
+
+        // Pre-seed the part dir with a stray temp file, as an interrupted
+        // `write_blob_atomic` would leave behind.
+        let part_dir = downloads.join(hex(&hash));
+        std::fs::create_dir_all(&part_dir).unwrap();
+        let orphan = part_dir.join("chunk-0.part.tmp-orphan");
+        std::fs::write(&orphan, b"half-written").unwrap();
+
+        reconstruct(&manifest, hash, &downloads, &out, false, |h| src.get(h))
+            .await
+            .unwrap();
+
+        // The file still reconstructed, and the chunk parts were deleted...
+        assert_eq!(std::fs::read(&out).unwrap(), b"onetwo");
+        assert!(!part_dir.join("chunk-0.part").exists());
+        // ...but the orphan kept the dir non-empty, so `remove_dir` failed and
+        // the dir survives rather than being silently gone.
+        assert!(part_dir.exists(), "orphan-holding part dir should remain");
+        assert!(orphan.exists());
     }
 
     /// A chunk whose bytes don't hash to the manifest's entry is rejected — the

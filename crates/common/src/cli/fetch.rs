@@ -157,8 +157,9 @@ pub struct ClientFetchArgs {
     /// Delete the per-chunk part files immediately after reconstructing a
     /// `DECDNMAN` file manifest (ADR 012 § Blob retention, #1183).
     ///
-    /// The parts under `~/.decdn/downloads/<manifest-hash>/` are **retained by
-    /// default** so the client can re-serve them, and so an interrupted
+    /// The parts under `<data-dir>/downloads/<manifest-hash>/` (default
+    /// `~/.decdn/client/downloads/`) are **retained by default** so the client
+    /// can re-serve them, and so an interrupted
     /// reconstruction resumes without re-fetching (and re-paying for) chunks it
     /// already holds. Pass this to trade that away for disk. No effect on a raw
     /// single-blob fetch, which has no chunks.
