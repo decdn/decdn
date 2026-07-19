@@ -857,6 +857,33 @@ impl RuntimeReloadState {
             }
         };
 
+        // Serialise concurrent reloads before *any* shared-state mutation.
+        // `reload()` has no `.await` points, so on a multi-threaded runtime
+        // two callers (a SIGHUP racing an `admin_v1_reload`) can execute in
+        // true parallel; the per-section buffer cells are cleared in phase 1
+        // and drained in phase 3, so the guard must cover clear+resolve
+        // through commit+swap — otherwise a second reload could clear/
+        // overwrite the first's freshly-resolved buffers mid-flight and make
+        // it swap a mixed set. Only the file load above (no shared state)
+        // stays outside. The lock guards no data itself, so a poisoned lock
+        // is recovered in place: a prior panic-mid-reload must not wedge
+        // every future reload. Recovery is logged loudly (this file's
+        // "recover-the-data, log-loudly, do-not-clear-poison" pattern — see
+        // `attach_engine_to_section` / `drain_or_log`): a poisoned
+        // `reload_lock` is the sole surviving evidence that a previous reload
+        // panicked mid-commit, and swallowing it silently would erase it.
+        let _reload_guard = match self.reload_lock.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                tracing::error!(
+                    "runtime reload_lock poisoned by a prior panic-mid-reload; \
+                     recovering and proceeding (an earlier reload may have \
+                     partially applied before panicking)"
+                );
+                poisoned.into_inner()
+            }
+        };
+
         // Clear every section's buffer up-front so a panic-mid-reload
         // from a previous attempt can't leave stale `Resolved` data
         // behind. Each `clear_buffer` is infallible (poison-recovering).
@@ -883,32 +910,8 @@ impl RuntimeReloadState {
             return Err(err);
         }
 
-        // Serialise concurrent reloads before the commit phases. Holding
-        // this guard across phases 2–3 makes a second SIGHUP (or an
-        // `admin_v1_reload` racing the first) wait here rather than
-        // interleave its commits. The lock guards no data — the per-section
-        // buffer cells own the in-flight state — so a poisoned lock is
-        // recovered in place: a prior panic-mid-reload must not wedge every
-        // future reload. Recovery is logged loudly (this file's
-        // "recover-the-data, log-loudly, do-not-clear-poison" pattern —
-        // see `attach_engine_to_section` / `drain_or_log`): a poisoned
-        // `reload_lock` is the sole surviving evidence that a previous
-        // reload panicked mid-commit, and swallowing it silently would
-        // erase that signal.
-        let _reload_guard = match self.reload_lock.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => {
-                tracing::error!(
-                    "runtime reload_lock poisoned by a prior panic-mid-reload; \
-                     recovering and proceeding (an earlier reload may have \
-                     partially applied before panicking)"
-                );
-                poisoned.into_inner()
-            }
-        };
-
-        // Emit a "requires restart" notice for every non-reloadable section
-        // present in the file. Read-only, so do it before the commit step.
+        // Emit a "requires restart" notice for each non-reloadable field the
+        // file carries. Read-only, so do it before the commit step.
         warn_restart_required_sections(&file);
 
         // Phase 2: fallible commits. The log-level section is the only
@@ -955,16 +958,16 @@ fn warn_ignored(field: &'static str) {
     );
 }
 
-/// Emit a "requires restart" notice for every non-reloadable section the
+/// Emit a "requires restart" notice for each non-reloadable field the
 /// operator can't hot-apply. Fully non-reloadable sections warn whenever
-/// they are *present*; the two partially-reloadable sections (`cache`,
-/// `observability`) warn only when they set a field *outside* their
-/// reloadable subset, so the common `cache.pinned_hashes`-only or
-/// `observability.log_level`-only reload stays quiet. `payment` and
-/// `security` are fully reloadable and never warn. Best-effort operator
-/// guidance, not a correctness gate — this does not diff against the
-/// previous file, so a present-but-unchanged non-reloadable field still
-/// warns on every reload.
+/// they are *present*; the partially-reloadable sections (`cache`,
+/// `observability`, `payment`) warn only when they set a field *outside*
+/// their reloadable subset, so the common `cache.pinned_hashes`-only,
+/// `observability.log_level`-only, or `payment.rate_per_mb`-only reload
+/// stays quiet. `security` is fully reloadable and never warns.
+/// Best-effort operator guidance, not a correctness gate — this does not
+/// diff against the previous file, so a present-but-unchanged
+/// non-reloadable field still warns on every reload.
 fn warn_restart_required_sections(file: &decdn_common::config::FileConfig) {
     if file.identity.is_some() {
         warn_ignored("identity.* (data_dir, region)");
@@ -981,6 +984,18 @@ fn warn_restart_required_sections(file: &decdn_common::config::FileConfig) {
         .is_some_and(cache_has_restart_required_field)
     {
         warn_ignored("cache.* (cache_dir, sizes, origin, decompress)");
+    }
+    if file
+        .payment
+        .as_ref()
+        .is_some_and(payment_has_restart_required_field)
+    {
+        // Only `voucher_interval_mb` lands here: `rate_per_mb` reloads, and
+        // `delivery_floor`/`delivery_ceiling` get a *change-based* notice
+        // from `PaymentSection::infallible_swap` (which holds the applied
+        // bounds to diff against). `voucher_interval_mb` has no such applied
+        // value to diff, so the presence-based notice is its only home.
+        warn_ignored("payment.* (voucher_interval_mb)");
     }
     if file.gossip.is_some() {
         warn_ignored(
@@ -1006,11 +1021,24 @@ fn warn_restart_required_sections(file: &decdn_common::config::FileConfig) {
         // state.
         warn_ignored("dht.* (rate-limit, trusted_ips)");
     }
+    if file.probe.is_some() {
+        // `probe.rate_limit` is read once at startup; changing it requires
+        // a restart (same footing as `dht.*`).
+        warn_ignored("probe.* (rate_limit)");
+    }
     if file.receipts.is_some() {
         // `receipts.*` (rotation cap, retained backups) is read once when
         // `JsonlReceiptLog` is opened at bring-up; changing it requires a
         // restart.
         warn_ignored("receipts.* (max_file_bytes, retained_files)");
+    }
+    if file.prefetch.is_some() {
+        // The prefetch scheduler wires its budget/threshold knobs once at
+        // bring-up; none are hot-reloadable.
+        warn_ignored(
+            "prefetch.* (enabled, require_authorized_origin, budget_usdc_per_hour, \
+             thresholds, concurrency, timeout)",
+        );
     }
     // `security.*` is fully reloadable — see `RuntimeReloadState::reload`'s
     // commit step. Invalid values reject the entire reload via
@@ -1088,6 +1116,25 @@ const fn observability_has_restart_required_field(
         || admin_port.is_some()
         || otlp_endpoint.is_some()
         || region_accounting_interval_sec.is_some()
+}
+
+/// Whether the file's `[payment]` section sets a field whose restart notice
+/// belongs here. `rate_per_mb` reloads and `delivery_floor`/
+/// `delivery_ceiling` are warned change-based in
+/// [`PaymentSection::infallible_swap`], so only `voucher_interval_mb` — read
+/// once into the client handler at bring-up, with no applied value to diff —
+/// trips this gate. Exhaustively destructured for the same
+/// compile-time-classification reason as [`cache_has_restart_required_field`].
+const fn payment_has_restart_required_field(
+    p: &decdn_common::config::types::PaymentConfig,
+) -> bool {
+    let decdn_common::config::types::PaymentConfig {
+        rate_per_mb: _,      // hot-reloadable
+        delivery_floor: _,   // warned change-based in PaymentSection::infallible_swap
+        delivery_ceiling: _, // warned change-based in PaymentSection::infallible_swap
+        voucher_interval_mb,
+    } = p;
+    voucher_interval_mb.is_some()
 }
 
 #[cfg(test)]
@@ -2363,5 +2410,37 @@ mod tests {
             ..ObservabilityConfig::default()
         };
         assert!(observability_has_restart_required_field(&with_metrics));
+    }
+
+    /// The `[payment]` restart notice is gated on `voucher_interval_mb`
+    /// only: `rate_per_mb` reloads and the delivery bounds are warned
+    /// change-based in `PaymentSection::infallible_swap`, so neither trips
+    /// this gate; `voucher_interval_mb` must.
+    #[test]
+    fn payment_notice_gate_covers_only_voucher_interval() {
+        use decdn_common::config::types::PaymentConfig;
+
+        // Reloadable field only -> no notice here.
+        let rate_only = PaymentConfig {
+            rate_per_mb: Some(100),
+            ..PaymentConfig::default()
+        };
+        assert!(!payment_has_restart_required_field(&rate_only));
+        // Delivery bounds are warned change-based elsewhere -> not here.
+        let bounds_only = PaymentConfig {
+            delivery_floor: Some(1),
+            delivery_ceiling: Some(2),
+            ..PaymentConfig::default()
+        };
+        assert!(!payment_has_restart_required_field(&bounds_only));
+        assert!(!payment_has_restart_required_field(
+            &PaymentConfig::default()
+        ));
+        // The one field with no other home -> notice.
+        let voucher = PaymentConfig {
+            voucher_interval_mb: Some(8),
+            ..PaymentConfig::default()
+        };
+        assert!(payment_has_restart_required_field(&voucher));
     }
 }

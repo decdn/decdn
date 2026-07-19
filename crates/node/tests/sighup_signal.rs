@@ -536,12 +536,14 @@ async fn sighup_applies_mutable_but_rejects_restart_required_fields() {
 
     // --- Reload #2: mutable fields change (payment/log_level, which apply)
     //     bundled with restart-required ones. network/blockchain/identity/
-    //     gossip/dht/receipts warn on presence; `[cache]` warns because it
-    //     sets the non-reloadable `cache_dir` (a pinned_hashes-only edit
-    //     would not); `[observability]` does NOT warn because it sets only
-    //     the reloadable `log_level`; `[security]` never warns (fully
-    //     reloadable). Empty `[dht]`/`[receipts]`/`[security]` tables are
-    //     "present" so they exercise those emitter branches.
+    //     gossip/dht/probe/receipts/prefetch warn on presence; `[cache]`
+    //     warns because it sets the non-reloadable `cache_dir` (a
+    //     pinned_hashes-only edit would not); `[observability]` does NOT warn
+    //     because it sets only the reloadable `log_level`; `[payment]` sets
+    //     only the reloadable `rate_per_mb` and `[security]` is fully
+    //     reloadable, so neither warns. Empty `[dht]`/`[probe]`/`[receipts]`/
+    //     `[prefetch]`/`[security]` tables are "present" so they exercise
+    //     those emitter branches.
     write_config(
         &path,
         "[payment]\n\
@@ -559,7 +561,9 @@ async fn sighup_applies_mutable_but_rejects_restart_required_fields() {
          [gossip]\n\
          announce_interval_sec = 120\n\n\
          [dht]\n\n\
+         [probe]\n\n\
          [receipts]\n\n\
+         [prefetch]\n\n\
          [security]\n",
     );
     raise_sighup_soon();
@@ -592,7 +596,9 @@ async fn sighup_applies_mutable_but_rejects_restart_required_fields() {
         "identity",
         "gossip",
         "dht",
+        "probe",
         "receipts",
+        "prefetch",
     ] {
         assert_eq!(
             notice_count(&logs, section),
