@@ -59,9 +59,12 @@ struct StreamLabels {
 
 /// Build a [`WatcherHook`] that invokes one `&self` recorder on a shared
 /// `Metrics`, deduping the per-watcher `Box::new(move || metrics.foo())`
-/// closures the four metrics-wiring watcher sites used to each define (#1251;
-/// the other two `LogSink` sites wire no hooks). Pass the recorder as a method
-/// path, e.g. `metric_hook(&metrics, Metrics::slash_watcher_cycle_established)`.
+/// closures each watcher site would otherwise define (#1251). Since #1316 all
+/// six `LogSink` sites route their liveness (`*_tick`) and panic
+/// (`*_task_panicked`) hooks — and their down-family established/backoff edges —
+/// through this helper (blacklist composes it with its readiness-gate closures).
+/// Pass the recorder as a method path,
+/// e.g. `metric_hook(&metrics, Metrics::slash_watcher_cycle_established)`.
 pub(crate) fn metric_hook(metrics: &Arc<Metrics>, record: fn(&Metrics)) -> WatcherHook {
     let metrics = Arc::clone(metrics);
     Box::new(move || record(&metrics))
@@ -1247,6 +1250,100 @@ pub struct DecdnMetrics {
     /// ranges. Visible name:
     /// `decdn_serve_stream_rejected_range_not_satisfiable_total`.
     pub serve_stream_rejected_range_not_satisfiable: Counter,
+
+    // ---- Uniform watcher liveness + panic surface (#1316, #1320) ----
+    //
+    // The `*_down_seconds` family below is edge-triggered off a tick *error*, so
+    // a watcher that panicked while healthy, wedged in an await, or exited
+    // cleanly leaves `down_since == None` and reads a healthy `0` forever — a
+    // dead watcher is byte-identical to a live one. These two families close
+    // that gap for all six chain-event watchers: `*_last_tick_timestamp_seconds`
+    // is a *positive* liveness signal a dead task cannot advance, and
+    // `*_task_panicked_total` makes an otherwise-discarded task panic visible.
+    /// `decdn_slash_watcher_last_tick_timestamp_seconds` (#1316): Unix time of
+    /// the slash watcher's last successful poll tick, stamped every tick (not
+    /// edge-triggered). Alert on staleness — `time() - value > 3 ×
+    /// poll_interval` — to catch a panicked, wedged, or cleanly-exited task that
+    /// `slash_watcher_down_seconds` (error-triggered) cannot. `0` until the
+    /// first successful tick.
+    pub slash_watcher_last_tick_timestamp_seconds: Gauge,
+    /// `decdn_staker_set_watcher_last_tick_timestamp_seconds` (#1316): Unix time
+    /// of the staker-set watcher's last successful poll tick. Staleness
+    /// semantics as `slash_watcher_last_tick_timestamp_seconds`.
+    pub staker_set_watcher_last_tick_timestamp_seconds: Gauge,
+    /// `decdn_origin_directory_watcher_last_tick_timestamp_seconds` (#1316): Unix
+    /// time of the origin-directory watcher's last successful poll tick.
+    pub origin_directory_watcher_last_tick_timestamp_seconds: Gauge,
+    /// `decdn_blacklist_watcher_last_tick_timestamp_seconds` (#1316, #1320): Unix
+    /// time of the blacklist watcher's last successful poll tick. This is the
+    /// signal that distinguishes a live blacklist loop from a dead one — a dead
+    /// loop keeps serving content blacklisted after the failure (slashable via
+    /// `SlashJudge.submitBlacklistChallenge`) while `blacklist_watcher_down_seconds`
+    /// reads `0`.
+    pub blacklist_watcher_last_tick_timestamp_seconds: Gauge,
+    /// `decdn_settlement_watcher_last_tick_timestamp_seconds` (#1316): Unix time
+    /// of the payment-settlement watcher's last successful poll tick.
+    pub settlement_watcher_last_tick_timestamp_seconds: Gauge,
+    /// `decdn_reputation_indexer_last_tick_timestamp_seconds` (#1316): Unix time
+    /// of the reputation-indexer watcher's last successful poll tick.
+    pub reputation_indexer_last_tick_timestamp_seconds: Gauge,
+    /// `decdn_slash_watcher_task_panicked_total` (#1316): the slash watcher task
+    /// unwound on a panic. Bumped from a `Drop` guard in `resumable_watcher::run`
+    /// — the only thing that still runs on the unwind, since nothing awaits the
+    /// detached task. Any non-zero value is a bug in this node.
+    pub slash_watcher_task_panicked: Counter,
+    /// `decdn_staker_set_watcher_task_panicked_total` (#1316): the staker-set
+    /// watcher task unwound on a panic. See `slash_watcher_task_panicked`.
+    pub staker_set_watcher_task_panicked: Counter,
+    /// `decdn_origin_directory_watcher_task_panicked_total` (#1316): the
+    /// origin-directory watcher task unwound on a panic.
+    pub origin_directory_watcher_task_panicked: Counter,
+    /// `decdn_blacklist_watcher_task_panicked_total` (#1316, #1283): the
+    /// blacklist watcher task unwound on a panic.
+    pub blacklist_watcher_task_panicked: Counter,
+    /// `decdn_settlement_watcher_task_panicked_total` (#1316): the
+    /// payment-settlement watcher task unwound on a panic.
+    pub settlement_watcher_task_panicked: Counter,
+    /// `decdn_reputation_indexer_task_panicked_total` (#1316): the
+    /// reputation-indexer watcher task unwound on a panic.
+    pub reputation_indexer_task_panicked: Counter,
+
+    // ---- Down-family parity for the three watchers that lacked it (#1283, #1316) ----
+    /// `decdn_blacklist_watcher_restarts_total` (#1283): distinct drift windows
+    /// the blacklist watcher entered, bumped once on the edge into the
+    /// error/backoff state. Mirrors `slash_watcher_restarts`.
+    pub blacklist_watcher_restarts: Counter,
+    /// `decdn_blacklist_watcher_down_seconds` (#1283): seconds the blacklist
+    /// watcher has been failing its chain read (`0` on a healthy cycle),
+    /// recomputed at scrape from `blacklist_watcher_down_since`. Tracks
+    /// chain-read outages only — an enforcement failure that leaves a blacklisted
+    /// blob servable is a separate signal (`blacklist_enforcement_failures`).
+    pub blacklist_watcher_down_seconds: Gauge,
+    /// `decdn_settlement_watcher_restarts_total` (#1316): distinct drift windows
+    /// the payment-settlement watcher entered. Mirrors `slash_watcher_restarts`.
+    pub settlement_watcher_restarts: Counter,
+    /// `decdn_settlement_watcher_down_seconds` (#1316): seconds the settlement
+    /// watcher has been failing its chain read, recomputed at scrape from
+    /// `settlement_watcher_down_since`.
+    pub settlement_watcher_down_seconds: Gauge,
+    /// `decdn_reputation_indexer_restarts_total` (#1316): distinct drift windows
+    /// the reputation indexer entered. Distinct from
+    /// `reputation_indexer_rpc_failures` (which counts every failing tick, not
+    /// just the healthy→error edge). Mirrors `slash_watcher_restarts`.
+    pub reputation_indexer_restarts: Counter,
+    /// `decdn_reputation_indexer_down_seconds` (#1316): seconds the reputation
+    /// indexer has been failing its chain read, recomputed at scrape from
+    /// `reputation_indexer_down_since`.
+    pub reputation_indexer_down_seconds: Gauge,
+
+    /// `decdn_blacklist_enforcement_failures_total` (#1319): distinct hashes a
+    /// batched re-scope could NOT re-verify or evict this pass (`Recheck::Failed`
+    /// — a disk error or a scope `eth_call` failure). Non-zero means the deny-set
+    /// is not fully enforced and a blacklisted blob may still be servable and
+    /// slashable, even while `blacklist_watcher_down_seconds` reads `0`. Answers
+    /// a different question than the down-family, which tracks chain-read outages
+    /// only. Pairs with the aggregate `warn!` in `rescan`.
+    pub blacklist_enforcement_failures: Counter,
 }
 
 /// Self-imposed cap on the distinct-peer tracking set (and hence the
@@ -1296,6 +1393,21 @@ pub struct Metrics {
     /// `slash_watcher_down_seconds` gauge, recomputed at scrape time. Mirrors
     /// `staker_set_watcher_down_since`.
     slash_watcher_down_since: Mutex<Option<Instant>>,
+    /// `Instant` the blacklist watcher entered its current error/backoff window
+    /// (#1283). `None` whenever a cycle is established. Backs the
+    /// `blacklist_watcher_down_seconds` gauge, recomputed at scrape time. Mirrors
+    /// `staker_set_watcher_down_since`.
+    blacklist_watcher_down_since: Mutex<Option<Instant>>,
+    /// `Instant` the payment-settlement watcher entered its current error/backoff
+    /// window (#1316). `None` whenever a cycle is established. Backs the
+    /// `settlement_watcher_down_seconds` gauge. Mirrors
+    /// `staker_set_watcher_down_since`.
+    settlement_watcher_down_since: Mutex<Option<Instant>>,
+    /// `Instant` the reputation-indexer watcher entered its current error/backoff
+    /// window (#1316). `None` whenever a cycle is established. Backs the
+    /// `reputation_indexer_down_seconds` gauge. Mirrors
+    /// `staker_set_watcher_down_since`.
+    reputation_indexer_down_since: Mutex<Option<Instant>>,
 }
 
 impl Default for Metrics {
@@ -1318,6 +1430,19 @@ fn sat_u256(n: U256) -> i64 {
         .ok()
         .and_then(|raw| i64::try_from(raw).ok())
         .unwrap_or(i64::MAX)
+}
+
+/// Current wall-clock time as whole seconds since the Unix epoch, saturating.
+///
+/// This is deliberately `SystemTime` (wall clock), not the monotonic `Instant`
+/// every other timer here uses: it backs the `*_last_tick_timestamp_seconds`
+/// liveness gauges, whose alerting expression compares them against Prometheus's
+/// `time()` (also wall clock). A pre-epoch clock (`Err`) reads `0` — i.e.
+/// "never ticked", the alerting direction. Anti-panic: no `unwrap`/`expect`.
+fn unix_now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
 }
 
 impl Metrics {
@@ -1352,6 +1477,9 @@ impl Metrics {
             staker_set_watcher_down_since: Mutex::new(None),
             origin_directory_watcher_down_since: Mutex::new(None),
             slash_watcher_down_since: Mutex::new(None),
+            blacklist_watcher_down_since: Mutex::new(None),
+            settlement_watcher_down_since: Mutex::new(None),
+            reputation_indexer_down_since: Mutex::new(None),
         }
     }
 
@@ -1671,6 +1799,13 @@ macro_rules! watcher_downtime_recorders {
         impl Metrics {
             $(
                 $(#[$backoff_meta])*
+                // Poison note: on a poisoned `down_since` lock the whole block is
+                // skipped (anti-panic policy), so `*_restarts_total` is NOT
+                // incremented and, because std poison is sticky, stays frozen for
+                // the process's life. The paired `*_down_seconds` gauge covers this
+                // — `refresh_watcher_down_seconds` reports `i64::MAX` on a poisoned
+                // lock — so alert on the gauge, never on `rate(*_restarts_total)`
+                // (appendix-observability § Watcher Liveness, #1322).
                 pub fn $backoff(&self) {
                     if let Ok(mut down_since) = self.$down_since.lock()
                         && down_since.is_none()
@@ -2303,6 +2438,39 @@ recorders! {
     /// Record that the server rejected a 0-RTT attempt and the client
     /// fell back to a 1-RTT handshake.
     record_0rtt_rejected => quic_0rtt_rejected.inc();
+
+    /// Stamp the slash watcher's `*_last_tick_timestamp_seconds` liveness gauge
+    /// with the current wall-clock time (#1316). The `on_tick_success` hook,
+    /// fired on EVERY successful poll tick so a dead task's gauge goes stale.
+    slash_watcher_tick => slash_watcher_last_tick_timestamp_seconds.set(unix_now_secs());
+    /// Stamp the staker-set watcher's liveness gauge (#1316). See `slash_watcher_tick`.
+    staker_set_watcher_tick => staker_set_watcher_last_tick_timestamp_seconds.set(unix_now_secs());
+    /// Stamp the origin-directory watcher's liveness gauge (#1316).
+    origin_directory_watcher_tick => origin_directory_watcher_last_tick_timestamp_seconds.set(unix_now_secs());
+    /// Stamp the blacklist watcher's liveness gauge (#1316, #1320).
+    blacklist_watcher_tick => blacklist_watcher_last_tick_timestamp_seconds.set(unix_now_secs());
+    /// Stamp the payment-settlement watcher's liveness gauge (#1316).
+    settlement_watcher_tick => settlement_watcher_last_tick_timestamp_seconds.set(unix_now_secs());
+    /// Stamp the reputation-indexer watcher's liveness gauge (#1316).
+    reputation_indexer_tick => reputation_indexer_last_tick_timestamp_seconds.set(unix_now_secs());
+
+    /// Record that the slash watcher task unwound on a panic (#1316). Bumped from
+    /// the `Drop` guard in `resumable_watcher::run` via the `on_task_panic` hook.
+    slash_watcher_task_panicked => slash_watcher_task_panicked.inc();
+    /// Record that the staker-set watcher task unwound on a panic (#1316).
+    staker_set_watcher_task_panicked => staker_set_watcher_task_panicked.inc();
+    /// Record that the origin-directory watcher task unwound on a panic (#1316).
+    origin_directory_watcher_task_panicked => origin_directory_watcher_task_panicked.inc();
+    /// Record that the blacklist watcher task unwound on a panic (#1316, #1283).
+    blacklist_watcher_task_panicked => blacklist_watcher_task_panicked.inc();
+    /// Record that the payment-settlement watcher task unwound on a panic (#1316).
+    settlement_watcher_task_panicked => settlement_watcher_task_panicked.inc();
+    /// Record that the reputation-indexer watcher task unwound on a panic (#1316).
+    reputation_indexer_task_panicked => reputation_indexer_task_panicked.inc();
+
+    /// Record `count` hashes a blacklist re-scope could not enforce this pass
+    /// (#1319 — `Recheck::Failed`). One aggregated bump per pass, not per hash.
+    blacklist_enforcement_failure(count: u64) => blacklist_enforcement_failures.inc_by(count);
 }
 
 watcher_downtime_recorders! {
@@ -2358,6 +2526,45 @@ watcher_downtime_recorders! {
     down_since: origin_directory_watcher_down_since,
     restarts: origin_directory_watcher_restarts,
     down_seconds: origin_directory_watcher_down_seconds;
+
+    /// The blacklist watcher's poll tick errored and the loop is about to back
+    /// off (#1283). Stamps `blacklist_watcher_down_since` once per drift window so
+    /// `blacklist_watcher_down_seconds` climbs until the next healthy cycle.
+    /// Tracks chain-read outages only; an enforcement failure that leaves a
+    /// blacklisted blob servable is the separate `blacklist_enforcement_failures`
+    /// counter (#1319). Mirrors [`Self::slash_watcher_backoff_started`].
+    blacklist_watcher_backoff_started,
+    /// Mark the blacklist watcher cycle established (#1283): clear
+    /// `blacklist_watcher_down_since` so `blacklist_watcher_down_seconds` reads
+    /// `0` for the life of the cycle. Mirrors [`Self::slash_watcher_cycle_established`].
+    blacklist_watcher_cycle_established,
+    down_since: blacklist_watcher_down_since,
+    restarts: blacklist_watcher_restarts,
+    down_seconds: blacklist_watcher_down_seconds;
+
+    /// The payment-settlement watcher's poll tick errored and the loop is about
+    /// to back off (#1316). Stamps `settlement_watcher_down_since` once per drift
+    /// window. Mirrors [`Self::slash_watcher_backoff_started`].
+    settlement_watcher_backoff_started,
+    /// Mark the payment-settlement watcher cycle established (#1316): clear
+    /// `settlement_watcher_down_since`. Mirrors [`Self::slash_watcher_cycle_established`].
+    settlement_watcher_cycle_established,
+    down_since: settlement_watcher_down_since,
+    restarts: settlement_watcher_restarts,
+    down_seconds: settlement_watcher_down_seconds;
+
+    /// The reputation-indexer watcher's poll tick errored and the loop is about
+    /// to back off (#1316). Stamps `reputation_indexer_down_since` once per drift
+    /// window. Distinct from `reputation_indexer_rpc_failures`, which counts every
+    /// failing tick rather than the healthy→error edge. Mirrors
+    /// [`Self::slash_watcher_backoff_started`].
+    reputation_indexer_backoff_started,
+    /// Mark the reputation-indexer watcher cycle established (#1316): clear
+    /// `reputation_indexer_down_since`. Mirrors [`Self::slash_watcher_cycle_established`].
+    reputation_indexer_cycle_established,
+    down_since: reputation_indexer_down_since,
+    restarts: reputation_indexer_restarts,
+    down_seconds: reputation_indexer_down_seconds;
 }
 
 /// Which side of a `PaymentChannel` the shared settle-finalization helper
@@ -3475,6 +3682,102 @@ mod tests {
             has_metric_line(&text, "decdn_origin_directory_watcher_down_seconds", 0),
             "a poisoned slash lock must not perturb the origin-directory gauge:\n{text}"
         );
+        // The three watchers brought to down-family parity (#1283/#1316) share
+        // the same recompute row, so they too read a clean 0 under the poison.
+        for name in [
+            "decdn_blacklist_watcher_down_seconds",
+            "decdn_settlement_watcher_down_seconds",
+            "decdn_reputation_indexer_down_seconds",
+        ] {
+            assert!(
+                has_metric_line(&text, name, 0),
+                "a poisoned slash lock must not perturb {name}:\n{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn watcher_liveness_gauges_stamp_wall_clock_on_tick() {
+        // The `*_watcher_tick` recorders (the `on_tick_success` hooks) stamp a
+        // wall-clock timestamp, so a live watcher's gauge is non-zero and a dead
+        // one's stays 0 — the positive liveness signal the error-triggered
+        // down-seconds gauge cannot provide (#1316/#1320).
+        let metrics = Metrics::new();
+        let before = unix_now_secs();
+
+        metrics.slash_watcher_tick();
+        metrics.staker_set_watcher_tick();
+        metrics.origin_directory_watcher_tick();
+        metrics.blacklist_watcher_tick();
+        metrics.settlement_watcher_tick();
+        metrics.reputation_indexer_tick();
+
+        let text = metrics.encode().unwrap();
+        for name in [
+            "decdn_slash_watcher_last_tick_timestamp_seconds",
+            "decdn_staker_set_watcher_last_tick_timestamp_seconds",
+            "decdn_origin_directory_watcher_last_tick_timestamp_seconds",
+            "decdn_blacklist_watcher_last_tick_timestamp_seconds",
+            "decdn_settlement_watcher_last_tick_timestamp_seconds",
+            "decdn_reputation_indexer_last_tick_timestamp_seconds",
+        ] {
+            let floor = u64::try_from(before).unwrap();
+            assert!(
+                metric_value(&text, name).is_some_and(|stamped| stamped >= floor),
+                "liveness gauge {name} must be exported and stamped with the current time:\n{text}"
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::type_complexity)] // a compact table of (recorder, recorder, gauge, counter).
+    fn new_watchers_down_seconds_track_true_downtime() {
+        // The three watchers brought to down-family parity (#1283/#1316) share
+        // the `watcher_downtime_recorders!` template, so one compact pass per
+        // watcher confirms the wiring: healthy reads 0, backoff climbs, one
+        // restart per drift window, re-establish clears.
+        let cases: [(fn(&Metrics), fn(&Metrics), &str, &str); 3] = [
+            (
+                Metrics::blacklist_watcher_cycle_established,
+                Metrics::blacklist_watcher_backoff_started,
+                "decdn_blacklist_watcher_down_seconds",
+                "decdn_blacklist_watcher_restarts_total",
+            ),
+            (
+                Metrics::settlement_watcher_cycle_established,
+                Metrics::settlement_watcher_backoff_started,
+                "decdn_settlement_watcher_down_seconds",
+                "decdn_settlement_watcher_restarts_total",
+            ),
+            (
+                Metrics::reputation_indexer_cycle_established,
+                Metrics::reputation_indexer_backoff_started,
+                "decdn_reputation_indexer_down_seconds",
+                "decdn_reputation_indexer_restarts_total",
+            ),
+        ];
+        for (established, backoff, down_seconds, restarts) in cases {
+            let metrics = Metrics::new();
+            established(&metrics);
+            let text = metrics.encode().unwrap();
+            assert!(
+                has_metric_line(&text, down_seconds, 0),
+                "{down_seconds} must read 0 on a healthy cycle:\n{text}"
+            );
+            backoff(&metrics);
+            backoff(&metrics); // second call: same drift window, no extra restart.
+            let text = metrics.encode().unwrap();
+            assert!(
+                has_metric_line(&text, restarts, 1),
+                "{restarts} must bump once per drift window:\n{text}"
+            );
+            established(&metrics);
+            let text = metrics.encode().unwrap();
+            assert!(
+                has_metric_line(&text, down_seconds, 0),
+                "{down_seconds} must reset to 0 once re-established:\n{text}"
+            );
+        }
     }
 
     #[test]

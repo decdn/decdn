@@ -368,6 +368,14 @@ impl ChainOriginDirectory {
         .on_backoff(metric_hook(
             &metrics,
             Metrics::origin_directory_watcher_backoff_started,
+        ))
+        .on_tick_success(metric_hook(
+            &metrics,
+            Metrics::origin_directory_watcher_tick,
+        ))
+        .on_task_panic(metric_hook(
+            &metrics,
+            Metrics::origin_directory_watcher_task_panicked,
         ));
         // This sink observes no shutdown token, so it ignores the one `spawn`
         // mints (`|_| sink`); the runtime drives graceful stop, then flushes the

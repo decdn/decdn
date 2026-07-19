@@ -1262,6 +1262,7 @@ async fn build_chain_and_handlers(
         Arc::clone(&head),
         Duration::from_secs(cfg.blockchain.content_blacklist_poll_interval_sec),
         blacklist_ready_tx,
+        &infra.node_metrics,
     );
 
     // Bootstrap (ADR 022 §Bootstrap): seed the routing table from the

@@ -33,7 +33,7 @@ use decdn_common::redact::{sanitize_err_chain, sanitize_rpc_display as n};
 use decdn_incentive::{CheckpointKey, KeyedCheckpointStore};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 use super::shared_head::HeadSource;
 use super::{AbortOnDrop, backfill_windows, timed};
@@ -250,6 +250,18 @@ pub(crate) struct WatcherConfig {
     /// Called each time a tick fails and the watcher enters backoff — the seam
     /// each watcher wires to its `*_backoff_started` gauge.
     pub(crate) on_backoff: Option<WatcherHook>,
+    /// Called on EVERY successful tick (not edge-triggered like
+    /// [`on_established`](field@Self::on_established)) — the seam each watcher
+    /// wires to its `*_last_tick_timestamp_seconds` liveness gauge (#1316). A
+    /// task that panicked, wedged, or exited cleanly stops firing this, so the
+    /// gauge goes stale where the error-triggered down-seconds gauge stays a
+    /// healthy `0`.
+    pub(crate) on_tick_success: Option<WatcherHook>,
+    /// Called from a `Drop` guard in [`run`] only when the task is unwinding on a
+    /// panic — the seam each watcher wires to its `*_task_panicked` counter
+    /// (#1316). Nothing awaits the detached task, so this is the only trace a
+    /// panic leaves.
+    pub(crate) on_task_panic: Option<WatcherHook>,
 }
 
 impl WatcherConfig {
@@ -278,6 +290,8 @@ impl WatcherConfig {
             label,
             on_established: None,
             on_backoff: None,
+            on_tick_success: None,
+            on_task_panic: None,
         }
     }
 
@@ -304,16 +318,60 @@ impl WatcherConfig {
         self.on_backoff = Some(hook);
         self
     }
+
+    /// Wire the per-tick liveness hook; see the
+    /// [`on_tick_success`](field@Self::on_tick_success) field.
+    pub(crate) fn on_tick_success(mut self, hook: WatcherHook) -> Self {
+        self.on_tick_success = Some(hook);
+        self
+    }
+
+    /// Wire the task-panic hook; see the
+    /// [`on_task_panic`](field@Self::on_task_panic) field.
+    pub(crate) fn on_task_panic(mut self, hook: WatcherHook) -> Self {
+        self.on_task_panic = Some(hook);
+        self
+    }
 }
 
 /// A loop-level observability hook (see [`WatcherConfig::on_established`] /
 /// [`WatcherConfig::on_backoff`]). Boxed so a watcher can close over its
 /// `Arc<Metrics>` without the generic loop knowing the concrete metric.
+///
+/// Hooks SHOULD be panic-free: in practice every hook is a `metric_hook` closure
+/// that only bumps an infallible counter/gauge. `on_task_panic` additionally runs
+/// from a `Drop` guard during an unwind — where a second panic would abort the
+/// process — so [`run`]'s guard wraps that one call in `catch_unwind` as a
+/// backstop; the other hooks fire on normal paths and are not guarded.
 pub(crate) type WatcherHook = Box<dyn Fn() + Send + Sync>;
 
 fn fire(hook: Option<&WatcherHook>) {
     if let Some(hook) = hook {
         hook();
+    }
+}
+
+/// Fire the observability hooks for a successful tick: the per-tick liveness
+/// stamp always, and the first-cycle `on_established` edge unless shutdown has
+/// been cancelled (see the call site in [`run`] for why the edge is suppressed
+/// under shutdown). Factored out of [`run`] to keep the loop within clippy's
+/// cognitive-complexity budget.
+fn fire_tick_success(cfg: &WatcherConfig, established: &mut bool, shutdown: &CancellationToken) {
+    // Every successful tick — including an idle one (a successful head read is
+    // still proof of life) — stamps the liveness gauge, so a wedged/panicked/
+    // exited task is detectable by staleness where the edge-triggered
+    // down-seconds gauge cannot (#1316).
+    fire(cfg.on_tick_success.as_ref());
+    // The established EDGE is suppressed once shutdown is cancelled: a tick that
+    // "succeeded" only because a sink observed the token mid-pass (blacklist's
+    // re-scope short-circuits on it) must NOT signal a readiness gate that its
+    // first sync completed — that would open a slash-relevant gate fail-OPEN on
+    // an incomplete deny-set replay. Liveness above still stamps; the node is
+    // stopping, so the missed edge is moot.
+    if !*established && !shutdown.is_cancelled() {
+        *established = true;
+        fire(cfg.on_established.as_ref());
+        debug!(label = cfg.label, "watcher established getLogs stream");
     }
 }
 
@@ -413,6 +471,37 @@ where
     Ok(())
 }
 
+/// Fires `on_panic` and logs at `error!` iff the enclosing [`run`] is unwinding
+/// on a panic (#1316). The watcher task is spawned detached ([`AbortOnDrop`]) and
+/// never awaited, so a panic is otherwise discarded with no log, counter, or
+/// restart; this guard — the only thing that still runs on the unwind — makes it
+/// visible. A graceful `return` (shutdown) or an `AbortOnDrop` teardown drops the
+/// guard with `thread::panicking() == false`, so neither trips it. Mirrors the
+/// `WarmOutcome` precedent in `crate::handlers::client`.
+struct PanicGuard<'a> {
+    label: &'static str,
+    on_panic: Option<&'a WatcherHook>,
+}
+
+impl Drop for PanicGuard<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            // This runs during an unwind: a second panic here would abort the
+            // process. Hooks are contractually panic-free (see [`WatcherHook`]),
+            // but unlike the `WarmOutcome` precedent — which calls one hardcoded,
+            // known-infallible method — this guard fires an arbitrary
+            // caller-supplied closure, so catch defensively. A future hook bug
+            // must degrade to a swallowed panic, never take the node down.
+            let hook = self.on_panic;
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fire(hook)));
+            error!(
+                label = self.label,
+                "watcher task PANICKED; nothing awaits this task, so this counter is its only trace"
+            );
+        }
+    }
+}
+
 /// Drive `sink` from `cfg.filter` on an `eth_getLogs` polling loop until
 /// `shutdown` is cancelled. The outer loop ticks on `cfg.poll_interval`,
 /// resetting the backoff on a clean tick and backing off (bounded) on a failing
@@ -433,6 +522,13 @@ pub(crate) async fn run<P, S>(
     P: Provider + Clone,
     S: LogSink,
 {
+    // Only fires if the loop below unwinds on a panic; a graceful return drops
+    // it inert. Borrows `cfg` immutably for the whole function, alongside the
+    // loop's other shared `&cfg` reads.
+    let _panic_guard = PanicGuard {
+        label: cfg.label,
+        on_panic: cfg.on_task_panic.as_ref(),
+    };
     let mut cursor: Option<u64> = cfg.start.seed();
     let mut backoff = cfg.initial_backoff;
     let mut established = false;
@@ -450,15 +546,17 @@ pub(crate) async fn run<P, S>(
         match run_tick(&provider, &cfg, &mut sink, &mut cursor, &shutdown).await {
             Ok(()) => {
                 backoff = cfg.initial_backoff;
-                if !established {
-                    established = true;
-                    fire(cfg.on_established.as_ref());
-                    debug!(label = cfg.label, "watcher established getLogs stream");
-                }
+                fire_tick_success(&cfg, &mut established, &shutdown);
             }
             Err(err) => {
                 established = false;
-                fire(cfg.on_backoff.as_ref());
+                // Likewise suppress the backoff EDGE under shutdown: a tick that
+                // failed only because the sink bailed on the cancel token is not a
+                // drift window, so it must not stamp `*_restarts_total` /
+                // `*_down_seconds` in the node's final scrapes (#1321).
+                if !shutdown.is_cancelled() {
+                    fire(cfg.on_backoff.as_ref());
+                }
                 // The chain, not the checkpoint store: render the full cause
                 // chain. This error is a `timed` bound ("get_logs timed out
                 // after 10s") under whatever context the tick added above it
@@ -840,6 +938,8 @@ mod tests {
             label: "test",
             on_established: None,
             on_backoff: None,
+            on_tick_success: None,
+            on_task_panic: None,
         }
     }
 
@@ -1195,5 +1295,295 @@ mod tests {
         // retried: falling back to head would durably overwrite the stored floor
         // and permanently discard the downtime gap (#751/#762).
         assert!(persisted().initial_from(0, 1_000).is_err());
+    }
+
+    /// A `LogSink` that cancels its shutdown token from the N-th `on_tick_complete`
+    /// (1-indexed), so the loop runs exactly N ticks then returns. `bail` makes
+    /// that cancelling tick also fail, mimicking blacklist's shutdown-interrupted
+    /// re-scope bail.
+    struct CancelOnNthTick {
+        shutdown: CancellationToken,
+        ticks: usize,
+        cancel_on: usize,
+        bail: bool,
+    }
+    impl LogSink for CancelOnNthTick {
+        async fn apply(&mut self, _log: Log) -> Result<()> {
+            Ok(())
+        }
+        async fn on_tick_complete(&mut self) -> Result<()> {
+            self.ticks += 1;
+            if self.ticks >= self.cancel_on {
+                self.shutdown.cancel();
+                if self.bail {
+                    anyhow::bail!("shutdown-interrupted tick");
+                }
+            }
+            Ok(())
+        }
+    }
+
+    /// Three hooks wired to atomic counters, for driving `run` and asserting which
+    /// loop edges fired.
+    fn counting_hooks() -> (
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<std::sync::atomic::AtomicUsize>,
+        WatcherHook,
+        WatcherHook,
+        WatcherHook,
+    ) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (tick, est, backoff) = (
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let (t, e, b) = (Arc::clone(&tick), Arc::clone(&est), Arc::clone(&backoff));
+        let tick_hook: WatcherHook = Box::new(move || {
+            t.fetch_add(1, Ordering::SeqCst);
+        });
+        let est_hook: WatcherHook = Box::new(move || {
+            e.fetch_add(1, Ordering::SeqCst);
+        });
+        let backoff_hook: WatcherHook = Box::new(move || {
+            b.fetch_add(1, Ordering::SeqCst);
+        });
+        (tick, est, backoff, tick_hook, est_hook, backoff_hook)
+    }
+
+    /// The liveness hook (#1316) fires on EVERY successful tick — a log-bearing
+    /// one and an idle one — whereas `on_established` fires only on the first-cycle
+    /// edge. Driving two ticks and asserting `on_tick_success == 2` while
+    /// `on_established == 1` pins that distinction (a regression that gated the
+    /// liveness hook behind the `!established` edge would read `1`/`1`).
+    #[tokio::test]
+    async fn on_tick_success_fires_every_tick_established_only_once() {
+        use alloy::primitives::U64;
+        use alloy::providers::ProviderBuilder;
+        use std::sync::atomic::Ordering;
+
+        let asserter = alloy::providers::mock::Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let shutdown = CancellationToken::new();
+
+        let (tick, est, _b, tick_hook, est_hook, _bh) = counting_hooks();
+        let mut cfg = tick_cfg(provider.clone(), Arc::new(MemoryCheckpointStore::default()));
+        cfg.start = CursorStart::HeadMinusWindow { window_blocks: 0 };
+        cfg.on_tick_success = Some(tick_hook);
+        cfg.on_established = Some(est_hook);
+
+        // tick 1: head(25) + one empty `get_logs` over [25,25] (cursor → 26).
+        // tick 2: head(25) only — from=26 > to=25 is an idle tick (no get_logs).
+        asserter.push_success(&U64::from(25));
+        asserter.push_success(&Vec::<Log>::new());
+        asserter.push_success(&U64::from(25));
+
+        run(
+            provider,
+            cfg,
+            CancelOnNthTick {
+                shutdown: shutdown.clone(),
+                ticks: 0,
+                cancel_on: 2,
+                bail: false,
+            },
+            shutdown,
+        )
+        .await;
+
+        assert_eq!(
+            tick.load(Ordering::SeqCst),
+            2,
+            "on_tick_success must fire on every tick, including the idle one"
+        );
+        assert_eq!(
+            est.load(Ordering::SeqCst),
+            1,
+            "on_established is the first-cycle edge — exactly once across both ticks"
+        );
+    }
+
+    /// The readiness fail-open fix: a successful tick that completes only because
+    /// the sink observed the cancel token must NOT fire the `on_established` edge
+    /// — that edge signals blacklist's readiness gate `Ok`, so firing it on an
+    /// incomplete initial sync would open a slash-relevant gate fail-OPEN.
+    /// Liveness still stamps (the tick did succeed).
+    #[tokio::test]
+    async fn shutdown_suppresses_the_established_edge() {
+        use alloy::primitives::U64;
+        use alloy::providers::ProviderBuilder;
+        use std::sync::atomic::Ordering;
+
+        let asserter = alloy::providers::mock::Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let shutdown = CancellationToken::new();
+
+        let (tick, est, _b, tick_hook, est_hook, _bh) = counting_hooks();
+        let mut cfg = tick_cfg(provider.clone(), Arc::new(MemoryCheckpointStore::default()));
+        cfg.start = CursorStart::HeadMinusWindow { window_blocks: 0 };
+        cfg.on_tick_success = Some(tick_hook);
+        cfg.on_established = Some(est_hook);
+
+        asserter.push_success(&U64::from(25));
+        asserter.push_success(&Vec::<Log>::new());
+
+        run(
+            provider,
+            cfg,
+            CancelOnNthTick {
+                shutdown: shutdown.clone(),
+                ticks: 0,
+                cancel_on: 1,
+                bail: false,
+            },
+            shutdown,
+        )
+        .await;
+
+        assert_eq!(
+            est.load(Ordering::SeqCst),
+            0,
+            "on_established must be suppressed once the token is cancelled (fail-closed)"
+        );
+        assert_eq!(
+            tick.load(Ordering::SeqCst),
+            1,
+            "liveness still stamps on the successful (if cancelled) tick"
+        );
+    }
+
+    /// The #1321 fix: a tick that fails only because the sink bailed on the cancel
+    /// token must NOT fire `on_backoff` — otherwise an orderly shutdown stamps a
+    /// false drift window (`*_restarts_total = 1` + climbing down-seconds) in the
+    /// node's final scrapes.
+    #[tokio::test]
+    async fn shutdown_suppresses_the_backoff_edge() {
+        use alloy::primitives::U64;
+        use alloy::providers::ProviderBuilder;
+        use std::sync::atomic::Ordering;
+
+        let asserter = alloy::providers::mock::Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let shutdown = CancellationToken::new();
+
+        let (_t, _e, backoff, tick_hook, est_hook, backoff_hook) = counting_hooks();
+        let mut cfg = tick_cfg(provider.clone(), Arc::new(MemoryCheckpointStore::default()));
+        cfg.start = CursorStart::HeadMinusWindow { window_blocks: 0 };
+        cfg.on_tick_success = Some(tick_hook);
+        cfg.on_established = Some(est_hook);
+        cfg.on_backoff = Some(backoff_hook);
+
+        asserter.push_success(&U64::from(25));
+        asserter.push_success(&Vec::<Log>::new());
+
+        run(
+            provider,
+            cfg,
+            CancelOnNthTick {
+                shutdown: shutdown.clone(),
+                ticks: 0,
+                cancel_on: 1,
+                bail: true,
+            },
+            shutdown,
+        )
+        .await;
+
+        assert_eq!(
+            backoff.load(Ordering::SeqCst),
+            0,
+            "on_backoff must be suppressed when the tick failed due to shutdown"
+        );
+    }
+
+    /// End-to-end: a panic inside a watcher tick, driven through the real `run`
+    /// task, fires the `on_task_panic` hook via the in-`run` `PanicGuard` — proving
+    /// the guard is actually installed and wired, not just correct in isolation.
+    #[tokio::test]
+    #[allow(clippy::panic)] // deliberately panic inside a tick to exercise the guard.
+    async fn run_task_panic_fires_the_panic_hook() {
+        use alloy::primitives::U64;
+        use alloy::providers::ProviderBuilder;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct PanicOnApply;
+        impl LogSink for PanicOnApply {
+            async fn apply(&mut self, _log: Log) -> Result<()> {
+                panic!("intentional tick panic");
+            }
+        }
+
+        let asserter = alloy::providers::mock::Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let shutdown = CancellationToken::new();
+
+        let panicked = Arc::new(AtomicUsize::new(0));
+        let hook_counter = Arc::clone(&panicked);
+        let mut cfg = tick_cfg(provider.clone(), Arc::new(MemoryCheckpointStore::default()));
+        cfg.start = CursorStart::HeadMinusWindow { window_blocks: 0 };
+        cfg.on_task_panic = Some(Box::new(move || {
+            hook_counter.fetch_add(1, Ordering::SeqCst);
+        }));
+
+        // head(25) then one log to apply — `apply` panics on it.
+        asserter.push_success(&U64::from(25));
+        asserter.push_success(&one_log());
+
+        let joined = tokio::spawn(run(provider, cfg, PanicOnApply, shutdown)).await;
+        assert!(joined.is_err(), "the watcher task must have panicked");
+        assert_eq!(
+            panicked.load(Ordering::SeqCst),
+            1,
+            "the PanicGuard in run must fire on_task_panic exactly once on the unwind"
+        );
+    }
+
+    /// The panic guard (#1316) is the only trace a panic in the detached watcher
+    /// task leaves: it fires `on_task_panic` iff [`run`] is unwinding, and NOT on
+    /// a graceful drop. Mirrors the `WarmOutcome` false-positive guard.
+    #[test]
+    #[allow(clippy::panic)] // deliberately unwind a thread to exercise the guard.
+    fn panic_guard_fires_only_on_unwind() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let fired = Arc::new(AtomicUsize::new(0));
+
+        // A graceful drop (no panic) must NOT fire the hook.
+        {
+            let f = Arc::clone(&fired);
+            let hook: WatcherHook = Box::new(move || {
+                f.fetch_add(1, Ordering::SeqCst);
+            });
+            let _guard = PanicGuard {
+                label: "test",
+                on_panic: Some(&hook),
+            };
+        }
+        assert_eq!(
+            fired.load(Ordering::SeqCst),
+            0,
+            "a graceful drop must not fire the panic hook"
+        );
+
+        // A drop during an unwind must fire the hook exactly once.
+        let f = Arc::clone(&fired);
+        let joined = std::thread::spawn(move || {
+            let hook: WatcherHook = Box::new(move || {
+                f.fetch_add(1, Ordering::SeqCst);
+            });
+            let _guard = PanicGuard {
+                label: "test",
+                on_panic: Some(&hook),
+            };
+            panic!("intentional");
+        })
+        .join();
+        assert!(joined.is_err(), "the worker thread must have panicked");
+        assert_eq!(
+            fired.load(Ordering::SeqCst),
+            1,
+            "an unwinding drop must fire the panic hook exactly once"
+        );
     }
 }

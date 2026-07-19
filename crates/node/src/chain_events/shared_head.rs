@@ -356,6 +356,8 @@ mod tests {
                     label: "count-test",
                     on_established: None,
                     on_backoff: None,
+                    on_tick_success: None,
+                    on_task_panic: None,
                 };
                 tokio::spawn(resumable_watcher::run(
                     provider.clone(),

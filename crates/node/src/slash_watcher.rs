@@ -146,6 +146,8 @@ impl SlashWatcher {
         // Built before `metrics` is moved into the sink below.
         let on_established = metric_hook(&metrics, Metrics::slash_watcher_cycle_established);
         let on_backoff = metric_hook(&metrics, Metrics::slash_watcher_backoff_started);
+        let on_tick_success = metric_hook(&metrics, Metrics::slash_watcher_tick);
+        let on_task_panic = metric_hook(&metrics, Metrics::slash_watcher_task_panicked);
         let sink = SlashSink {
             provider: provider.clone(),
             self_address,
@@ -167,7 +169,9 @@ impl SlashWatcher {
         .with_from_block(from_block)
         .max_backoff(SLASH_MAX_BACKOFF)
         .on_established(on_established)
-        .on_backoff(on_backoff);
+        .on_backoff(on_backoff)
+        .on_tick_success(on_tick_success)
+        .on_task_panic(on_task_panic);
         // This sink observes no shutdown token, so it ignores the one `spawn`
         // mints (`|_| sink`); the runtime drives graceful stop via `shutdown`.
         let watcher = resumable_watcher::spawn(provider, cfg, move |_| sink);
