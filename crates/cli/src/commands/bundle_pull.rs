@@ -425,11 +425,20 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         // Two entries can name the SAME manifest blob — a bundle may hold one
         // file's content at two paths, and nothing dedupes entries by hash. The
         // part directory is keyed only on the manifest hash, so concurrent
-        // reconstructions would share it: with `--no-keep-blobs` one entry's
-        // cleanup deletes parts while the other is mid-concatenate, and without
-        // it both fetch (and pay for) every chunk twice. Serializing per
-        // manifest hash makes the second entry find the first's verified parts
-        // and pay nothing.
+        // reconstructions would share it, one deleting or rewriting parts while
+        // the other is mid-concatenate. Serializing per manifest hash closes
+        // that race in both retention modes.
+        //
+        // It does NOT make the second entry free in both modes. Under the
+        // default retention it finds the first's verified parts and pays
+        // nothing; under `--no-keep-blobs` the first entry has already deleted
+        // them (ADR 012 § Blob retention: "delete immediately after
+        // reconstruction"), so the second re-fetches and re-pays. Whether that
+        // should change — by deferring the sweep or deduping entries by hash —
+        // is #1306.
+        //
+        // The lock is process-local; two concurrent `decdn` invocations sharing
+        // a data dir still race the same part directory (#1303).
         let lock = self.manifest_lock(manifest_hash);
         let _guard = lock.lock().await;
         file_manifest::reconstruct(

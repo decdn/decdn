@@ -238,7 +238,7 @@ The manifest blob is pushed to the CDN like any other blob. It is typically < 1 
 
 `<data_dir>` is the resolved client data dir — `--data-dir`/`identity.data_dir`, defaulting to `~/.decdn/client` — so parts share a root with the buyer-channel store rather than sitting in a fixed location an explicit `--data-dir` would not move.
 
-A manifest is rejected at decode if it declares more than 1,000,000 chunks, any zero-size chunk, a `filename` that is not a bare basename, or trailing bytes after the record. Each chunk is a separate paid pull, so the chunk count is a spending bound as much as a memory one.
+A manifest is rejected at decode if it declares more than 1,000,000 chunks, any zero-size chunk, a `filename` that is not a bare basename, or trailing bytes after the record. Each chunk is a separate paid pull and a separate part file, so the chunk cap bounds spending and file count; it is not an allocation bound, since the chunk list is decoded before the cap is applied (an over-large list implies an over-large manifest blob, which `--max-blob-mb` already caps).
 
 ### Blob retention
 
