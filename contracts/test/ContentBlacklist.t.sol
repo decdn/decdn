@@ -1428,8 +1428,11 @@ contract ContentBlacklistTest is Test {
     // `removeHashGlobal`/`removeHashRegional` carry no `hasActiveAppeal` guard
     // (only `_addHash` does), so governance can delete an entry while its appeal
     // is still Open or FastTracked — a supported path with its own lapse reason
-    // code (3, GlobalOverride). Every terminal appeal path then calls
-    // `_setEntrySuspended(.., false)` on a zeroed struct. That must be a no-op:
+    // code (3, GlobalOverride). The four terminal paths that clear the flag
+    // (reject, perjury-reject, reverse, cleanup) then call
+    // `_setEntrySuspended(.., false)` on a zeroed struct — ratify is the
+    // exception, it removes the entry instead and so reverts. That must be a
+    // no-op:
     // writing `suspended = false` (already false) and bumping the counter is a
     // PHANTOM REVISION — the version advances with zero change to what any
     // `isHashBlacklisted*` view reports, so every polling node re-fetches deltas
@@ -1500,13 +1503,23 @@ contract ContentBlacklistTest is Test {
         assertFalse(blacklist.isHashBlacklistedInRegion(h, REGION_US));
     }
 
-    /// @notice The suspend side of the same guard, and the nastier direction:
-    ///         the entry is removed BEFORE the fast-track. Without the guard,
-    ///         `fastTrackBlacklistAppeal` writes `suspended = true` onto a zeroed
-    ///         slot and bumps; cleanup then skips the clear precisely because the
-    ///         entry is gone, so the stale flag outlives the appeal and a later
-    ///         re-add of the same hash is permanently unenforceable (`_isLive`
-    ///         false forever). The guard makes the write a no-op instead.
+    /// @notice The suspend side of the same guard: the entry is removed BEFORE
+    ///         the fast-track. Without the guard, `fastTrackBlacklistAppeal`
+    ///         writes `suspended = true` onto a zeroed slot and bumps the
+    ///         version; cleanup then skips the clear precisely because the entry
+    ///         is gone, so the stale flag outlives the appeal. `_addHash`'s
+    ///         `suspended = false` reset would still recover a later re-add — the
+    ///         guard and that reset are belt-and-braces for the same failure mode
+    ///         (an entry that is live but permanently unenforceable), which is
+    ///         why neither is load-bearing on its own. The flag and version
+    ///         assertions below are what pin the guard; the trailing re-add
+    ///         assertions document the reset and hold either way.
+    /// @dev    Pins only that the fast-track neither suspends nor bumps. It
+    ///         deliberately does NOT bless the rest: the appeal still reaches
+    ///         `FastTracked` and still consumes two capped relief slots while
+    ///         suspending nothing — arguably a governance error the contract
+    ///         should reject outright. Pre-existing (pre-guard it set the flag on
+    ///         a dead struct, equally fake) and tracked separately.
     function test_fastTrack_afterEntryRemoved_doesNotSuspendOrBump() public {
         bytes32 h = bytes32(uint256(1));
         uint256 appealId = _open(h);
@@ -1523,11 +1536,57 @@ contract ContentBlacklistTest is Test {
         assertFalse(blacklist.getHashEntry(REGION_US, h).suspended);
         assertEq(blacklist.getBlacklistVersion(), versionAfterRemove);
 
-        // Settle the appeal, then re-add: the hash must be enforceable again.
+        // ...but the appeal is still FastTracked and has still charged BOTH
+        // capped relief tiers, holding interim relief over an entry that does
+        // not exist. Asserted so the side effect is explicit rather than
+        // incidental — the relief budget is scarce (REGION cap 3, FILER cap 2).
+        assertEq(blacklist.regionActiveReliefCount(REGION_US), 1);
+        assertEq(blacklist.filerRegionActiveRelief(REGION_US, filer), 1);
+
+        // Cleanup (condition (c), reason 3) is the exit: it returns both slots.
         blacklist.cleanupExpiredBlacklistAppeal(appealId);
+        assertEq(blacklist.regionActiveReliefCount(REGION_US), 0);
+        assertEq(blacklist.filerRegionActiveRelief(REGION_US, filer), 0);
+
+        // Re-add: the hash is enforceable again (documents `_addHash`'s reset).
         vm.prank(regionalBody);
         blacklist.addHashRegional(REGION_US, h, "DMCA-TEST-2");
         assertFalse(blacklist.getHashEntry(REGION_US, h).suspended);
         assertTrue(blacklist.isHashBlacklistedInRegion(h, REGION_US));
+    }
+
+    /// @notice `ratifyBlacklistAppealRemoval` is the one FastTracked terminal
+    ///         path that does NOT route through `_setEntrySuspended` — it removes
+    ///         the entry via `_removeHashRegional`, which reverts
+    ///         `EntryNotBlacklisted` when the entry is already gone. The whole tx
+    ///         rolls back, the appeal survives in `FastTracked`, and cleanup
+    ///         condition (c) is the working exit.
+    /// @dev    Pinned because this PR teaches a "no-op on a removed entry"
+    ///         instinct: applying it to `_removeHashRegional` would silently flip
+    ///         ratify from revert to succeed-and-refund with nothing failing.
+    ///         Note the consequence the revert preserves — ratify sets
+    ///         `lastRatifiedSuccessAt` (the 90-day frequency cap) and the cleanup
+    ///         fallback does not, so a filer whose ratify is blocked by a mid-
+    ///         appeal removal both keeps the bond and skips the cooldown.
+    function test_ratify_entryRemovedMidAppeal_reverts() public {
+        bytes32 h = bytes32(uint256(1));
+        (uint256 appealId, uint256 versionAfterRemove) = _fastTrackedThenEntryRemoved(h);
+
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(ContentBlacklist.EntryNotBlacklisted.selector, REGION_US, h));
+        blacklist.ratifyBlacklistAppealRemoval(appealId);
+
+        // Fully rolled back: appeal still live, no version movement, no
+        // ratification recorded against the filer's frequency cap.
+        ContentBlacklist.BlacklistAppeal memory a = blacklist.getAppeal(appealId);
+        assertEq(uint8(a.status), uint8(ContentBlacklist.AppealStatus.FastTracked));
+        assertEq(blacklist.getBlacklistVersion(), versionAfterRemove);
+        assertEq(blacklist.lastRatifiedSuccessAt(filer), 0);
+
+        // Cleanup remains available and refunds (reason 3).
+        uint256 filerBalBefore = token.balanceOf(filer);
+        blacklist.cleanupExpiredBlacklistAppeal(appealId);
+        assertEq(token.balanceOf(filer) - filerBalBefore, APPEAL_BOND);
+        assertEq(uint8(blacklist.getAppeal(appealId).status), uint8(ContentBlacklist.AppealStatus.Lapsed));
     }
 }

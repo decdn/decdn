@@ -210,10 +210,13 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     /// @notice Monotonic blacklist revision (ADR 011 § Blacklist version), read
     ///         via `getBlacklistVersion`. Bumped once per change to the enforced
     ///         blacklist: every hash add, every hash removal, and every
-    ///         appeal-driven suspend/resume, across every path. Nodes cache the
-    ///         last-seen value and re-fetch entry deltas only when it advances,
-    ///         replacing a full event replay from the deploy block with an O(1)
-    ///         version check.
+    ///         appeal-driven suspend/resume that actually changes something.
+    ///         The one exception is a suspend/resume against an entry that was
+    ///         already removed (`addedAt == 0`): nothing enforceable changes, so
+    ///         `_setEntrySuspended` no-ops rather than logging a phantom
+    ///         revision. Nodes cache the last-seen value and re-fetch entry
+    ///         deltas only when it advances, replacing a full event replay from
+    ///         the deploy block with an O(1) version check.
     /// @dev    Bumped in the three internal choke points `_addHash`,
     ///         `_removeHashRegional`, and `_setEntrySuspended`, which every
     ///         add/remove/suspend funnels through, so no call site has to
@@ -503,8 +506,10 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     ///         that missed it would over-enforce a suspended hash and — worse —
     ///         under-enforce a resumed one. ADR 011 § Authority and flow and
     ///         § Compliance Window specify operators detect appeal resumption off
-    ///         this poll cycle. All toggles funnel through `_setEntrySuspended`,
-    ///         which no-ops (no bump) when the entry was removed mid-appeal.
+    ///         this poll cycle. All appeal-driven toggles funnel through
+    ///         `_setEntrySuspended` (`_addHash` clears the flag on its own, as
+    ///         part of an add that bumps anyway), and that helper no-ops — no
+    ///         write, no bump — whenever the entry is gone (`addedAt == 0`).
     function getBlacklistVersion() external view returns (uint256) {
         return _blacklistVersion;
     }
@@ -892,12 +897,15 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         // Defense in depth against a permanently-unenforceable entry. `_isLive`
         // is `addedAt != 0 && !suspended`, so a stale `suspended = true` on a
         // re-added hash would silently disable enforcement forever. No live path
-        // can leave one behind — `_removeHashRegional` deletes the struct,
-        // `_setEntrySuspended` no-ops on a removed entry, every terminal appeal
-        // path clears the flag alongside `hasActiveAppeal`, and the guard above
-        // blocks a re-add while an appeal is live — but the cost here is one
-        // already-warm SSTORE against an unrecoverable failure mode, so the
-        // reset stays. Do not "simplify" it away.
+        // can leave one behind: `suspended = true` is only reachable via
+        // `fastTrackBlacklistAppeal`, which requires an active appeal, and every
+        // path that clears `hasActiveAppeal` either clears the flag through
+        // `_setEntrySuspended` (reject / perjury-reject / reverse / cleanup, on
+        // the fast-tracked branch that set it) or deletes the struct outright
+        // (`_removeHashRegional`, used by ratify) — and the guard above blocks a
+        // re-add while an appeal is live. But the cost here is one already-warm
+        // SSTORE against an unrecoverable failure mode, so the reset stays. Do
+        // not "simplify" it away.
         e.suspended = false;
         hashReason[region][hash] = reason;
         unchecked {
@@ -924,10 +932,12 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     ///      § Authority and flow and § Compliance Window have operators detect
     ///      appeal resumption off the `getBlacklistVersion()` poll cycle, which
     ///      only holds if the toggle bumps the counter.
-    /// @dev No-op on an entry that no longer exists. `removeHashGlobal` /
-    ///      `removeHashRegional` carry no `hasActiveAppeal` guard (unlike
-    ///      `_addHash`), so governance can delete an entry mid-appeal — a
-    ///      supported path, with its own lapse reason code (3, `GlobalOverride`).
+    /// @dev No-op on an entry that no longer exists. `removeHashGlobal`
+    ///      (`GOVERNANCE_ROLE`) and `removeHashRegional` (`REGIONAL_BODY_ROLE` —
+    ///      the actor in the common, appeal-relevant case) carry no
+    ///      `hasActiveAppeal` guard, unlike `_addHash`, so either can delete an
+    ///      entry mid-appeal — a supported path, with its own lapse reason code
+    ///      (3, `GlobalOverride`).
     ///      The terminal appeal paths still call this to clear `suspended`; on a
     ///      zeroed entry there is nothing to toggle, and bumping would be a
     ///      phantom revision — the counter advances with no change to what any
