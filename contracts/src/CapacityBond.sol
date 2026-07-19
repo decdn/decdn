@@ -484,7 +484,7 @@ contract CapacityBond is
     error AddressAlreadyBound(bytes32 currentNodeId);
     error InvalidBindingSignature();
     error InvalidEd25519Signature();
-    // ADR 019 § 243 — submitted `termsHash` did not match the
+    // ADR 019 § Governance-canonical terms version — submitted `termsHash` did not match the
     // governance-canonical `currentTermsHash` (stale terms / un-upgraded CLI).
     error TermsHashMismatch(bytes32 provided, bytes32 expected);
     // ADR 019 § Terms Acceptance — `currentTermsHash` must never be the zero
@@ -687,7 +687,8 @@ contract CapacityBond is
     /// @dev    The new region is stored in the operator's `NodeInfo.regionHint`
     ///         so all downstream readers (`getActiveNodes`, off-chain DHT)
     ///         see the same source of truth. `regionPrev` retains the prior
-    ///         value for the ADR 030 § 52 blacklist-scope ripening predicate
+    ///         value for the ADR 030 § Region-stability window blacklist-scope
+    ///         ripening predicate
     ///         ("the previous region's entries keep applying until the change
     ///         ripens"), now enforced on-chain by `SlashJudge` and
     ///         `ContentBlacklist` via the `regionScopeData` view (#800).
