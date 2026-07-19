@@ -70,7 +70,7 @@ contract SlashAppealTest is Test {
 
         vm.startPrank(operator);
         token.approve(address(bond), type(uint256).max);
-        // Filing is operator-only (ADR 028 §1), so the operator posts the bond.
+        // Filing is operator-only (ADR 028 § Contract surface), so the operator posts the bond.
         token.approve(address(appeal), type(uint256).max);
         vm.stopPrank();
         vm.prank(appellant);
@@ -120,7 +120,7 @@ contract SlashAppealTest is Test {
         appeal.openSlashAppeal(0, keccak256("e"));
     }
 
-    /// ADR 028 §1 — only the slashed operator may file; a third party (here the
+    /// ADR 028 § Contract surface — only the slashed operator may file; a third party (here the
     /// challenger, who profits from an upheld slash) cannot burn the slot.
     function test_open_revertsForNonOperator() public {
         uint256 slashId = _bondAndSlash();
@@ -365,7 +365,7 @@ contract SlashAppealTest is Test {
     }
 
     // -----------------------------------------------------------------
-    // ADR 028 §3 — upholdAppeal degrades gracefully when pool unset
+    // ADR 028 § Appeal flow — upholdAppeal degrades gracefully when pool unset
     // -----------------------------------------------------------------
 
     function test_uphold_poolUnset_burnsFullBond() public {
@@ -403,7 +403,7 @@ contract SlashAppealTest is Test {
     }
 
     // -----------------------------------------------------------------
-    // ADR 028 §5 — pause extends the filing window by the paused duration
+    // ADR 028 § Hard caps and frequency limits — pause extends the filing window by the paused duration
     // -----------------------------------------------------------------
 
     // ADR 009 § Emergency Multisig — the protocol-wide pause sunsets hard at

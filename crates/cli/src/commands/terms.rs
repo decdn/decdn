@@ -47,7 +47,8 @@ pub enum Decision {
     /// No terminal and no `--accept-terms` — cannot record consent; abort.
     NeedFlag,
     /// The embedded terms do not match the network's current terms; the client
-    /// is stale and must be updated before it can register (ADR 019 § 281).
+    /// is stale and must be updated before it can register
+    /// (ADR 019 § Governance-canonical terms version).
     StaleClient,
 }
 

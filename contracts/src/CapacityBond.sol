@@ -351,7 +351,7 @@ contract CapacityBond is
     ///         `creditPauseTime`, `SlashAppeal`'s pauses, so every appeal window
     ///         (filing here, review/ratification on `SlashAppeal`) extends by the
     ///         same total and a pause on either contract never silently consumes
-    ///         a window (ADR 028 §5). Conservative: a pause that predates a slash
+    ///         a window (ADR 028 § Hard caps and frequency limits). Conservative: a pause that predates a slash
     ///         still extends that slash's window, which only ever favors the
     ///         operator.
     uint64 public override pausedTotal;
@@ -1297,7 +1297,7 @@ contract CapacityBond is
     }
 
     /// @dev Stamp the pause start so `_unpause` can accumulate the duration
-    ///      into `pausedTotal` (ADR 028 §5 window extension).
+    ///      into `pausedTotal` (ADR 028 § Hard caps and frequency limits — window extension).
     function _pause() internal override {
         // forge-lint: disable-next-line(block-timestamp)
         _pausedAt = uint64(block.timestamp);

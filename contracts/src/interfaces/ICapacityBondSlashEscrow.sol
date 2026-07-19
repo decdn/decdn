@@ -36,7 +36,7 @@ interface ICapacityBondSlashEscrow {
     ///         `creditPauseTime`) `SlashAppeal`'s pauses fold in here, so every
     ///         window (filing, review, ratification) extends by the same total
     ///         and a pause on either contract never silently consumes a window
-    ///         (ADR 028 §5).
+    ///         (ADR 028 § Hard caps and frequency limits).
     function pausedTotal() external view returns (uint64);
 
     /// @notice Add `SlashAppeal`'s just-ended pause interval to the combined
