@@ -655,6 +655,13 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         // Cache the repeatedly-read fields to avoid redundant warm SLOADs.
         bytes32 region = a.region;
         address filer = a.filer;
+        // A global override (`removeHash*` carry no `hasActiveAppeal` guard) can
+        // delete the entry mid-appeal, leaving nothing to suspend. Fail loudly
+        // rather than advance a moot appeal to `FastTracked` and burn two scarce
+        // relief slots on a `_setEntrySuspended` that would no-op — the filer's
+        // exit is `cleanupExpiredBlacklistAppeal` (condition c, reason 3), which
+        // refunds the bond. Mirrors ratify's revert on the same precondition.
+        if (_hashEntries[region][a.hash].addedAt == 0) revert EntryNotBlacklisted(region, a.hash);
         // Both caps count only fast-tracked appeals — the ones actually holding
         // interim relief (a suspended entry) — so they bound simultaneous
         // suspensions without letting un-acted Open filings consume the budget
@@ -899,10 +906,12 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         // re-added hash would silently disable enforcement forever. No live path
         // can leave one behind: `suspended = true` is only reachable via
         // `fastTrackBlacklistAppeal`, which requires an active appeal, and every
-        // path that clears `hasActiveAppeal` either clears the flag through
-        // `_setEntrySuspended` (reject / perjury-reject / reverse / cleanup, on
-        // the fast-tracked branch that set it) or deletes the struct outright
-        // (`_removeHashRegional`, used by ratify) — and the guard above blocks a
+        // path that clears `hasActiveAppeal` leaves the entry with
+        // `suspended == false` or no entry at all: reject / perjury-reject /
+        // reverse clear the flag through `_setEntrySuspended`; cleanup does the
+        // same on a live entry and skips the call once the struct is gone; and
+        // ratify (via `_removeHashRegional`) or a prior global-override
+        // `removeHash*` deletes the struct outright — and the guard above blocks a
         // re-add while an appeal is live. But the cost here is one already-warm
         // SSTORE against an unrecoverable failure mode, so the reset stays. Do
         // not "simplify" it away.
@@ -938,11 +947,13 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     ///      `hasActiveAppeal` guard, unlike `_addHash`, so either can delete an
     ///      entry mid-appeal — a supported path, with its own lapse reason code
     ///      (3, `GlobalOverride`).
-    ///      The terminal appeal paths still call this to clear `suspended`; on a
-    ///      zeroed entry there is nothing to toggle, and bumping would be a
-    ///      phantom revision — the counter advances with no change to what any
-    ///      `isHashBlacklisted*` view reports, costing every polling node a
-    ///      wasted fleet-wide delta fetch.
+    ///      Only the clear (`false`) callers — reject / perjury-reject / reverse /
+    ///      cleanup — reach here on a zeroed entry; the suspend (`true`) side
+    ///      reverts upstream in `fastTrackBlacklistAppeal`. On a zeroed entry
+    ///      there is nothing to toggle, and bumping would be a phantom revision —
+    ///      the counter advances with no change to what any `isHashBlacklisted*`
+    ///      view reports, costing every polling node a wasted fleet-wide delta
+    ///      fetch.
     function _setEntrySuspended(bytes32 region, bytes32 hash, bool suspended) internal {
         HashEntry storage e = _hashEntries[region][hash];
         if (e.addedAt == 0) return;
