@@ -59,8 +59,9 @@ struct StreamLabels {
 
 /// Build a [`WatcherHook`] that invokes one `&self` recorder on a shared
 /// `Metrics`, deduping the per-watcher `Box::new(move || metrics.foo())`
-/// closures the four metrics-wiring watcher sites used to each define (#1251;
-/// the other two `LogSink` sites wire no hooks). Pass the recorder as a method
+/// closures the metrics-wiring watcher sites used to each define (#1251; five
+/// of the six `LogSink` sites wire hooks since #1283 brought `blacklist` to
+/// parity). Pass the recorder as a method
 /// path, e.g. `metric_hook(&metrics, Metrics::slash_watcher_cycle_established)`.
 pub(crate) fn metric_hook(metrics: &Arc<Metrics>, record: fn(&Metrics)) -> WatcherHook {
     let metrics = Arc::clone(metrics);
@@ -1095,6 +1096,23 @@ pub struct DecdnMetrics {
     /// denominator). Expected to stay 0; a nonzero value flags malformed/hostile
     /// on-chain data.
     pub reputation_indexer_amount_overflows: Counter,
+    /// `decdn_blacklist_watcher_restarts_total` (#1283): distinct drift windows
+    /// the [`crate::blacklist_watcher`] compliance loop has entered. Same
+    /// semantics as `staker_set_watcher_restarts` — bumped once on the
+    /// transition into the error/backoff state, not per backoff iteration.
+    /// During such a window the node stops learning `HashBlacklisted` entries
+    /// and stops re-scoping the ones it holds, so a hash that becomes
+    /// blacklisted in scope stays servable — and serving it is slashable
+    /// (`SlashJudge.submitBlacklistChallenge`). The `OpenMetrics` encoder
+    /// appends the `_total` suffix.
+    pub blacklist_watcher_restarts: Counter,
+    /// `decdn_blacklist_watcher_down_seconds` (#1283): true downtime — seconds
+    /// the blacklist compliance watcher has been in the error/backoff state.
+    /// Reads `0` for the life of any established cycle; recomputed at scrape
+    /// time from a monotonic `down_since`. A poisoned lock reports `i64::MAX`
+    /// (alerting direction). This is the watcher whose silence is most
+    /// expensive, so it is the one worth alerting on non-zero.
+    pub blacklist_watcher_down_seconds: Gauge,
     /// `decdn_origin_directory_watcher_restarts_total` (#651): distinct drift
     /// windows the [`crate::dht::chain_origin_directory`] watcher has entered.
     /// Same semantics as `staker_set_watcher_restarts` — bumped once on the
@@ -1296,6 +1314,11 @@ pub struct Metrics {
     /// `slash_watcher_down_seconds` gauge, recomputed at scrape time. Mirrors
     /// `staker_set_watcher_down_since`.
     slash_watcher_down_since: Mutex<Option<Instant>>,
+    /// `Instant` the blacklist compliance watcher entered its current
+    /// error/backoff window (#1283). `None` whenever a cycle is established.
+    /// Backs the `blacklist_watcher_down_seconds` gauge, recomputed at scrape
+    /// time. Mirrors `staker_set_watcher_down_since`.
+    blacklist_watcher_down_since: Mutex<Option<Instant>>,
 }
 
 impl Default for Metrics {
@@ -1352,6 +1375,7 @@ impl Metrics {
             staker_set_watcher_down_since: Mutex::new(None),
             origin_directory_watcher_down_since: Mutex::new(None),
             slash_watcher_down_since: Mutex::new(None),
+            blacklist_watcher_down_since: Mutex::new(None),
         }
     }
 
@@ -1637,8 +1661,8 @@ macro_rules! recorders {
 
 /// Generate the per-watcher downtime recorders on [`Metrics`].
 ///
-/// The three chain watchers (`slash`, `staker_set`, `origin_directory`) share
-/// one downtime state machine: a `*_backoff_started` recorder that, on the
+/// The four chain watchers (`slash`, `staker_set`, `origin_directory`,
+/// `blacklist`) share one downtime state machine: a `*_backoff_started` recorder that, on the
 /// `None -> Some` edge into an error window, stamps the watcher's
 /// `Mutex<Option<Instant>>` `down_since` field and bumps its `*_restarts`
 /// counter exactly once per drift window; and a `*_cycle_established` recorder
@@ -2359,6 +2383,21 @@ watcher_downtime_recorders! {
     down_since: origin_directory_watcher_down_since,
     restarts: origin_directory_watcher_restarts,
     down_seconds: origin_directory_watcher_down_seconds;
+
+    /// A blacklist compliance watcher poll tick errored and the loop is about
+    /// to back off (#1283). Mirrors `staker_set_watcher_backoff_started`:
+    /// stamps `down_since` and counts exactly one restart per drift window.
+    /// Composed with — not replacing — the one-shot `InitialSyncGate` backoff
+    /// hook in [`crate::blacklist_watcher`], which only ever fires on the
+    /// *first* window; this recorder is what makes every later window visible.
+    blacklist_watcher_backoff_started,
+    /// Mark the blacklist compliance watcher's poll cycle as established
+    /// (#1283): clears `down_since` so `blacklist_watcher_down_seconds` reads
+    /// `0` for the life of this cycle.
+    blacklist_watcher_cycle_established,
+    down_since: blacklist_watcher_down_since,
+    restarts: blacklist_watcher_restarts,
+    down_seconds: blacklist_watcher_down_seconds;
 }
 
 /// Which side of a `PaymentChannel` the shared settle-finalization helper

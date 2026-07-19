@@ -79,6 +79,7 @@ use crate::chain_events::resumable_watcher::{
 };
 use crate::chain_events::shared_head::HeadSource;
 use crate::chain_events::timed;
+use crate::metrics::{Metrics, metric_hook};
 
 /// Result reported exactly once when the first full replay + re-scope pass
 /// either establishes compliance or proves startup cannot safely continue.
@@ -247,6 +248,8 @@ const fn cursor_start() -> CursorStart {
 /// `initial_sync_tx` fires once the mandatory first full replay + re-scope
 /// either completes cleanly (`Ok`) or the loop falls into backoff (`Err`), so
 /// the runtime can gate the ALPN router on blacklist enforcement being live.
+/// `metrics` carries the `blacklist_watcher_*` downtime family (#1283), which
+/// reports every drift window — not just the first one the one-shot gate sees.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn<P>(
     provider: P,
@@ -258,6 +261,7 @@ pub(crate) fn spawn<P>(
     head: Arc<dyn HeadSource>,
     rescan_interval: Duration,
     initial_sync_tx: oneshot::Sender<InitialSyncResult>,
+    metrics: &Arc<Metrics>,
 ) -> WatcherHandle
 where
     P: Provider + Clone + 'static,
@@ -267,6 +271,12 @@ where
     let initial_sync = InitialSyncGate::new(initial_sync_tx);
     let established_gate = initial_sync.clone();
     let backoff_gate = initial_sync.clone();
+    // Composed, not chained: `on_established`/`on_backoff` each hold a single
+    // hook, and the one-shot `InitialSyncGate` already owns both. So the
+    // downtime recorders are folded into the same closures rather than wired as
+    // separate calls the way the four peer watchers do it (#1283).
+    let established_metric = metric_hook(metrics, Metrics::blacklist_watcher_cycle_established);
+    let backoff_metric = metric_hook(metrics, Metrics::blacklist_watcher_backoff_started);
 
     let cfg = WatcherConfig::new(
         head,
@@ -284,8 +294,15 @@ where
     // an initial re-scope that can't enforce every entry bails the sink into that
     // backoff (see `BlacklistSink::on_tick_complete`). Later cycles are no-ops
     // once the gate has fired (`signal` takes the sender exactly once).
-    .on_established(Box::new(move || established_gate.signal(Ok(()))))
+    // The downtime recorders run first so a runtime woken by the one-shot gate
+    // never observes a `/metrics` scrape that disagrees with the readiness it
+    // was just handed. Unlike the gate, they fire on *every* cycle transition.
+    .on_established(Box::new(move || {
+        established_metric();
+        established_gate.signal(Ok(()));
+    }))
     .on_backoff(Box::new(move || {
+        backoff_metric();
         backoff_gate.signal(Err(
             "initial ContentBlacklist sync failed: chain RPC or cache eviction unavailable"
                 .to_string(),
@@ -537,6 +554,13 @@ mod tests {
         }
     }
 
+    /// Render `/metrics` and report whether `name` is present with `value`.
+    /// Mirrors the `has_metric_line` helper the `metrics` unit tests use.
+    fn metric_reads(metrics: &Metrics, name: &str, value: u64) -> Result<bool> {
+        let needle = format!("{name} {value}");
+        Ok(metrics.encode()?.lines().any(|line| line == needle))
+    }
+
     #[tokio::test]
     async fn initial_head_failure_signals_startup_error() -> Result<()> {
         let asserter = alloy::providers::mock::Asserter::new();
@@ -544,6 +568,7 @@ mod tests {
         let tmp = tempfile::tempdir()?;
         let cache = CacheEngine::open(tmp.path(), Vec::new(), 1).await?;
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let metrics = Arc::new(Metrics::new());
 
         let handle = spawn(
             provider,
@@ -555,6 +580,7 @@ mod tests {
             Arc::new(FailingHead),
             Duration::from_mins(10),
             ready_tx,
+            &metrics,
         );
         let readiness = tokio::time::timeout(Duration::from_secs(1), ready_rx)
             .await
@@ -566,6 +592,14 @@ mod tests {
                 .as_ref()
                 .is_err_and(|message| message.contains("initial ContentBlacklist sync failed")),
             "startup should receive a useful initial-sync error: {readiness:?}"
+        );
+        // #1283: the composed `on_backoff` must drive the downtime family too,
+        // not just the one-shot gate. Before the hooks were wired, a wedged
+        // blacklist loop moved no metric at all.
+        assert!(
+            metric_reads(&metrics, "decdn_blacklist_watcher_restarts_total", 1)?,
+            "entering backoff must count one drift window:\n{}",
+            metrics.encode()?
         );
         // Dropping the handle aborts the loop; cancel first for a graceful stop.
         handle.shutdown();
@@ -597,6 +631,7 @@ mod tests {
         let tmp = tempfile::tempdir()?;
         let cache = CacheEngine::open(tmp.path(), Vec::new(), 1).await?;
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let metrics = Arc::new(Metrics::new());
 
         let handle = spawn(
             provider,
@@ -608,6 +643,7 @@ mod tests {
             Arc::new(StaticHead(25)),
             Duration::from_mins(10),
             ready_tx,
+            &metrics,
         );
         let readiness = tokio::time::timeout(Duration::from_secs(1), ready_rx)
             .await
@@ -618,7 +654,59 @@ mod tests {
             readiness.is_ok(),
             "a clean first replay must signal readiness: {readiness:?}"
         );
+        // #1283: the metric hook is composed into the *same* closure as the gate
+        // signal above, so this pins that adding it did not displace the gate —
+        // and that a healthy cycle reports no downtime and no drift window.
+        assert!(
+            metric_reads(&metrics, "decdn_blacklist_watcher_down_seconds", 0)?,
+            "an established cycle must report zero downtime:\n{}",
+            metrics.encode()?
+        );
+        assert!(
+            metric_reads(&metrics, "decdn_blacklist_watcher_restarts_total", 0)?,
+            "a clean cycle must count no drift window:\n{}",
+            metrics.encode()?
+        );
         handle.shutdown();
+        Ok(())
+    }
+
+    /// The downtime family must track *repeated* outages, which is the whole
+    /// gap #1283 closed: the one-shot `InitialSyncGate` fires exactly once, so
+    /// before the metric hooks a blacklist loop that recovered and then wedged
+    /// again — the realistic RPC-flap shape — was invisible in both logs and
+    /// metrics. Drives the recorders directly (the composed hooks are covered
+    /// end-to-end through `spawn` by the two tests above).
+    #[test]
+    fn repeated_drift_windows_each_count_once() -> Result<()> {
+        let metrics = Metrics::new();
+
+        // One continuous outage counts one window, however many backoff
+        // iterations it spans.
+        metrics.blacklist_watcher_backoff_started();
+        metrics.blacklist_watcher_backoff_started();
+        assert!(
+            metric_reads(&metrics, "decdn_blacklist_watcher_restarts_total", 1)?,
+            "one continuous outage is one drift window:\n{}",
+            metrics.encode()?
+        );
+
+        // Recovery clears the downtime gauge...
+        metrics.blacklist_watcher_cycle_established();
+        assert!(
+            metric_reads(&metrics, "decdn_blacklist_watcher_down_seconds", 0)?,
+            "recovery must clear the downtime gauge:\n{}",
+            metrics.encode()?
+        );
+
+        // ...and the next outage is a distinct window the one-shot gate could
+        // never have surfaced.
+        metrics.blacklist_watcher_backoff_started();
+        assert!(
+            metric_reads(&metrics, "decdn_blacklist_watcher_restarts_total", 2)?,
+            "a second outage must count a second drift window:\n{}",
+            metrics.encode()?
+        );
         Ok(())
     }
 
