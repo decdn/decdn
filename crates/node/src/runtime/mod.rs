@@ -1316,40 +1316,49 @@ async fn build_chain_and_handlers(
     })
 }
 
-/// Build the endpoint, register handlers on a `Router`, spawn the metrics
-/// server and gossip tasks, and run until a shutdown signal is received.
-///
-/// SIGHUP triggers a hot-reload of mutable config fields via
-/// [`RuntimeReloadState`] (see issue #236). Other signals
-/// (SIGINT/SIGTERM) trigger graceful shutdown.
-///
-/// The signal streams (SIGHUP, SIGTERM) are registered **once** before
-/// the select loop and reused on every iteration. Re-creating
-/// `tokio::signal::unix::Signal` each iteration would race with signal
-/// delivery: a SIGHUP that arrives while `reload_runtime_config(..)` is
-/// running would have nowhere to land if the future holding the
-/// `Signal` had already been dropped, and would be silently lost. The
-/// persistent stream queues the signal until the next `recv()` call
-/// (kernel-managed, with coalescing) so concurrent or rapidly-repeated
-/// signals are observed deterministically.
+/// Owned handle bundle produced by [`spawn_background_tasks`]: every local born
+/// in the background region that [`run`] still needs after it returns — the
+/// stop signals, task handles, and drain trigger that flow into
+/// [`serve_until_shutdown`] and [`ShutdownHandles`]. Non-generic: the buyer
+/// provider is consumed inside the region and the settlement indexer stores a
+/// concrete watcher handle, so no opaque provider type escapes.
+struct Background {
+    metrics_stop_tx: oneshot::Sender<()>,
+    dispatch_gc_stop_tx: oneshot::Sender<()>,
+    region_log_stop_tx: Option<oneshot::Sender<()>>,
+    record_store_gc_stop_tx: oneshot::Sender<()>,
+    dht_rate_limit_gc_stop_tx: oneshot::Sender<()>,
+    probe_rate_limit_gc_stop_tx: oneshot::Sender<()>,
+    republish_stop_tx: oneshot::Sender<()>,
+    bucket_refresh_stop_tx: oneshot::Sender<()>,
+    buyer_bootstrap_stop_tx: oneshot::Sender<()>,
+    rpc_watchdog: Option<(oneshot::Sender<()>, tokio::task::JoinHandle<()>)>,
+    gossip_shutdown: CancellationToken,
+    gossip_handles: Vec<tokio::task::JoinHandle<()>>,
+    settlement_indexer: Option<crate::reputation_indexer::SettlementIndexer>,
+    admin_stop_tx: Option<oneshot::Sender<()>>,
+    drain_trigger: Arc<admin::DrainTrigger>,
+    tasks: JoinSet<()>,
+}
+
+/// Background-tasks phase extracted verbatim from the middle of [`run`] (issue
+/// #1253 PR5): construct the buyer-side provider/stores, spawn every periodic
+/// GC / DHT / gossip / reputation / metrics / admin task, and emit the startup
+/// banner. Borrows [`Infra`] and [`ChainHandlers`]; the by-value `ch` moves the
+/// region performed on owned locals (`rpc_url`, the three EIP-712 domains, and
+/// `reputation_rpc_url`) become `.clone()`s here since they are read through a
+/// shared reference — each field is consumed exactly once and never read again,
+/// so the clone is behavior-identical. Returns the [`Background`] handles [`run`]
+/// threads into the serve call and [`ShutdownHandles`].
 #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
-pub async fn run(
-    cfg: ResolvedConfig,
-    config_path: Option<PathBuf>,
-    reload_state: Arc<RuntimeReloadState>,
-) -> anyhow::Result<()> {
-    // Captured at the very top of `run()`, before any `await` or I/O,
-    // so `admin_v1_health.uptime_s` reflects the entire process lifetime
-    // — including the RPC reachability preflight below (which can spend
-    // up to its 5s timeout on flaky networks). Operators reasoning about
-    // "how long has this node been up?" want every second since `decdn
-    // run` was invoked, not just everything after the admin server bound.
-    let started_at = std::time::Instant::now();
-
-    let infra = Box::pin(build_infra(&cfg, &reload_state)).await?;
-
-    let ch = Box::pin(build_chain_and_handlers(&cfg, &reload_state, &infra)).await?;
-
+async fn spawn_background_tasks<P: Provider + Clone + 'static>(
+    cfg: &ResolvedConfig,
+    config_path: Option<&PathBuf>,
+    reload_state: &Arc<RuntimeReloadState>,
+    infra: &Infra,
+    ch: &ChainHandlers<P>,
+    started_at: std::time::Instant,
+) -> anyhow::Result<Background> {
     // On-chain buyer-side service (#744). When this node pulls content from an
     // upstream provider on a cache miss it pays via the same channel mechanism,
     // acting as the client: a separate wallet-filled provider signs `approve` /
@@ -1377,7 +1386,7 @@ pub async fn run(
     // racing collision just gets a fresh nonce on the next attempt), not on the
     // sends being strictly serialized.
     let buyer_wallet_provider = ProviderFactory::buyer_wallet(
-        ch.rpc_url,
+        ch.rpc_url.clone(),
         (*infra.eth_signer).clone(),
         ch.event_poll_interval,
     );
@@ -1743,17 +1752,17 @@ pub async fn run(
     // Precompute every cfg/secret-derived value the task needs: the closure is
     // `'static` so it can't borrow `cfg`/`secret_key`, and those are used later.
     let (buyer_bootstrap_stop_tx, buyer_bootstrap_stop_rx) = oneshot::channel::<()>();
-    let buyer_voucher_domain = ch.voucher_domain;
+    let buyer_voucher_domain = ch.voucher_domain.clone();
     let buyer_default_deposit = U256::from(cfg.blockchain.buyer_deposit_micro_usdc);
     let buyer_ensure_max_approval = cfg.blockchain.buyer_max_approve;
     let buyer_signer_address = infra.eth_signer.address();
     let pull_through_enabled = cfg.cache.node_to_node_pull_through_enabled;
     let node_origin_self_id = crate::dht::NodeId::from_bytes(*infra.secret_key.public().as_bytes());
-    let node_origin_slash_domain = ch.slash_domain;
+    let node_origin_slash_domain = ch.slash_domain.clone();
     // #1117: the `CapacityBond` bind domain this node signs its node→node client
     // identity binding under — reuses the serving-side `bind_domain` constructed
     // once above so an upstream verifies against an identical domain.
-    let node_origin_bind_domain = ch.bind_domain;
+    let node_origin_bind_domain = ch.bind_domain.clone();
     let node_origin_config = crate::node_origin::NodeOriginConfig {
         probe_fanout: cfg.cache.node_pull_probe_fanout,
         pull_timeout: std::time::Duration::from_secs(cfg.cache.node_pull_timeout_sec),
@@ -1788,6 +1797,7 @@ pub async fn run(
     let node_metrics_for_origin = Arc::clone(&infra.node_metrics);
     let node_metrics_for_observer = Arc::clone(&infra.node_metrics);
     let mut buyer_bootstrap_stop_rx = buyer_bootstrap_stop_rx;
+    let payment_channel_addr_for_buyer = ch.payment_channel_addr;
     tasks.spawn(async move {
         let service = tokio::select! {
             biased;
@@ -1795,7 +1805,7 @@ pub async fn run(
             _ = &mut buyer_bootstrap_stop_rx => return,
             res = crate::buyer_channel::BuyerChannelService::bootstrap(
                 buyer_wallet_provider,
-                ch.payment_channel_addr,
+                payment_channel_addr_for_buyer,
                 buyer_signer_address,
                 buyer_channel_store,
                 eth_signer_for_buyer,
@@ -1819,7 +1829,7 @@ pub async fn run(
                 Err(err) => {
                     tracing::warn!(
                         err = %sanitize_rpc_display(&err),
-                        payment_channel_addr = %ch.payment_channel_addr,
+                        payment_channel_addr = %payment_channel_addr_for_buyer,
                         "buyer-side PaymentChannel bootstrap failed; node→node paid cache-miss \
                          pulls are DISABLED for this process (seller settlement is unaffected). \
                          This condition is sticky — restart the node to retry. Check: (1) \
@@ -1972,7 +1982,7 @@ pub async fn run(
     // still starts (weights stay 0).
     let settlement_indexer = if cfg.gossip.subscribe_reputation {
         match crate::reputation_indexer::SettlementIndexer::bootstrap(
-            ProviderFactory::read_only(ch.reputation_rpc_url, ch.event_poll_interval),
+            ProviderFactory::read_only(ch.reputation_rpc_url.clone(), ch.event_poll_interval),
             ch.payment_channel_addr,
             ch.capacity_bond_addr,
             Arc::clone(&settlement_source),
@@ -2043,8 +2053,8 @@ pub async fn run(
         // file path the SIGHUP arm uses, so both paths converge on a
         // single mutex-serialised reload — see `admin::AdminRpcImpl::reload`
         // and the SIGHUP arm of the select loop below.
-        let reload_hook = config_path.as_ref().map(|path| admin::ReloadHook {
-            reload_state: Arc::clone(&reload_state),
+        let reload_hook = config_path.map(|path| admin::ReloadHook {
+            reload_state: Arc::clone(reload_state),
             config_path: path.clone(),
         });
         let state = admin::AdminState::new(
@@ -2120,10 +2130,74 @@ pub async fn run(
         "node runtime ready"
     );
 
+    Ok(Background {
+        metrics_stop_tx,
+        dispatch_gc_stop_tx,
+        region_log_stop_tx,
+        record_store_gc_stop_tx,
+        dht_rate_limit_gc_stop_tx,
+        probe_rate_limit_gc_stop_tx,
+        republish_stop_tx,
+        bucket_refresh_stop_tx,
+        buyer_bootstrap_stop_tx,
+        rpc_watchdog,
+        gossip_shutdown,
+        gossip_handles,
+        settlement_indexer,
+        admin_stop_tx,
+        drain_trigger,
+        tasks,
+    })
+}
+
+/// Build the endpoint, register handlers on a `Router`, spawn the metrics
+/// server and gossip tasks, and run until a shutdown signal is received.
+///
+/// SIGHUP triggers a hot-reload of mutable config fields via
+/// [`RuntimeReloadState`] (see issue #236). Other signals
+/// (SIGINT/SIGTERM) trigger graceful shutdown.
+///
+/// The signal streams (SIGHUP, SIGTERM) are registered **once** before
+/// the select loop and reused on every iteration. Re-creating
+/// `tokio::signal::unix::Signal` each iteration would race with signal
+/// delivery: a SIGHUP that arrives while `reload_runtime_config(..)` is
+/// running would have nowhere to land if the future holding the
+/// `Signal` had already been dropped, and would be silently lost. The
+/// persistent stream queues the signal until the next `recv()` call
+/// (kernel-managed, with coalescing) so concurrent or rapidly-repeated
+/// signals are observed deterministically.
+#[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
+pub async fn run(
+    cfg: ResolvedConfig,
+    config_path: Option<PathBuf>,
+    reload_state: Arc<RuntimeReloadState>,
+) -> anyhow::Result<()> {
+    // Captured at the very top of `run()`, before any `await` or I/O,
+    // so `admin_v1_health.uptime_s` reflects the entire process lifetime
+    // — including the RPC reachability preflight below (which can spend
+    // up to its 5s timeout on flaky networks). Operators reasoning about
+    // "how long has this node been up?" want every second since `decdn
+    // run` was invoked, not just everything after the admin server bound.
+    let started_at = std::time::Instant::now();
+
+    let infra = Box::pin(build_infra(&cfg, &reload_state)).await?;
+
+    let ch = Box::pin(build_chain_and_handlers(&cfg, &reload_state, &infra)).await?;
+
+    let bg = Box::pin(spawn_background_tasks(
+        &cfg,
+        config_path.as_ref(),
+        &reload_state,
+        &infra,
+        &ch,
+        started_at,
+    ))
+    .await?;
+
     let (router, signal) = serve_until_shutdown(
         &reload_state,
         config_path.as_deref(),
-        &drain_trigger,
+        &bg.drain_trigger,
         ServeInputs {
             ep: infra.ep,
             probe_handler: ch.probe_handler,
@@ -2137,33 +2211,33 @@ pub async fn run(
     .await?;
 
     let handles = ShutdownHandles {
-        metrics_stop_tx,
-        dispatch_gc_stop_tx,
-        buyer_bootstrap_stop_tx,
-        region_log_stop_tx,
-        record_store_gc_stop_tx,
-        dht_rate_limit_gc_stop_tx,
-        probe_rate_limit_gc_stop_tx,
-        republish_stop_tx,
-        bucket_refresh_stop_tx,
+        metrics_stop_tx: bg.metrics_stop_tx,
+        dispatch_gc_stop_tx: bg.dispatch_gc_stop_tx,
+        buyer_bootstrap_stop_tx: bg.buyer_bootstrap_stop_tx,
+        region_log_stop_tx: bg.region_log_stop_tx,
+        record_store_gc_stop_tx: bg.record_store_gc_stop_tx,
+        dht_rate_limit_gc_stop_tx: bg.dht_rate_limit_gc_stop_tx,
+        probe_rate_limit_gc_stop_tx: bg.probe_rate_limit_gc_stop_tx,
+        republish_stop_tx: bg.republish_stop_tx,
+        bucket_refresh_stop_tx: bg.bucket_refresh_stop_tx,
         blacklist_watcher: ch.blacklist_watcher,
         origin_watcher: ch.origin_watcher,
         watcher_checkpoint_store: infra.watcher_checkpoint_store,
-        admin_stop_tx,
-        rpc_watchdog,
-        gossip_shutdown,
+        admin_stop_tx: bg.admin_stop_tx,
+        rpc_watchdog: bg.rpc_watchdog,
+        gossip_shutdown: bg.gossip_shutdown,
         capacity_bond_watcher: ch.capacity_bond_watcher,
         slash_watcher: ch.slash_watcher,
-        settlement_indexer,
+        settlement_indexer: bg.settlement_indexer,
         pull_through_bg_shutdown: ch.pull_through_bg_shutdown,
         prefetch_shutdown: ch.prefetch_shutdown,
         receipt_writer_shutdown: infra.receipt_writer_shutdown,
         payment_service: ch.payment_service,
-        gossip_handles,
+        gossip_handles: bg.gossip_handles,
         receipt_writer: infra.receipt_writer,
-        tasks,
+        tasks: bg.tasks,
     };
-    shutdown(handles, router, signal, &drain_trigger, infra.cache).await
+    shutdown(handles, router, signal, &bg.drain_trigger, infra.cache).await
 }
 
 /// Owned teardown state handed from [`run`] to [`shutdown`]. Every field is a
