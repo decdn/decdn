@@ -29,11 +29,10 @@ import { RegionScopeLib } from "./RegionScopeLib.sol";
 ///         with no separate balance threshold. Because the bond is escrowed by
 ///         the appeal it cannot be flash-loaned, so the synthetic-standing
 ///         clawback (ADR 031 § Function signatures and revert table) is omitted
-///         by design, not deferred: there is nothing to fake. This is safe
-///         only because standing
-///         alone grants no automatic outcome (an `Open` appeal has zero interim
-///         relief and every consequential transition is multisig/governor-gated);
-///         revisit if that ever changes.
+///         by design, not deferred: there is nothing to fake. This is safe only
+///         because standing alone grants no automatic outcome (an `Open` appeal
+///         has zero interim relief and every consequential transition is
+///         multisig/governor-gated); revisit if that ever changes.
 ///         The interim-relief concurrent fast-track cap is two-tier: a
 ///         per-region ceiling (`REGION_CONCURRENT_RELIEF_CAP`) plus a
 ///         per-(filer, region) sub-cap (`FILER_CONCURRENT_RELIEF_CAP`) so no
@@ -576,12 +575,12 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         if (cooldownUntilAt > block.timestamp) revert FilerInRejectionCooldown(cooldownUntilAt);
 
         // Standing enforcement (ADR 031 § Function signatures and revert table,
-        // audit I-3). Enum-range check
-        // first; then Publisher and Operator each prove standing with a credential
-        // check, while TokenHolder standing is the escrowed bond itself (see its
-        // branch). All external reads below hit trusted immutable contracts and
-        // this function is `nonReentrant`, so the later appeal-state writes are not
-        // a reentrancy vector (aderyn reentrancy-state-change FP).
+        // audit I-3). Enum-range check first; then Publisher and Operator each
+        // prove standing with a credential check, while TokenHolder standing is
+        // the escrowed bond itself (see its branch). All external reads below
+        // hit trusted immutable contracts and this function is `nonReentrant`,
+        // so the later appeal-state writes are not a reentrancy vector (aderyn
+        // reentrancy-state-change FP).
         if (uint8(standingPath) > uint8(StandingPath.TokenHolder)) revert UnauthorizedStanding(standingPath);
 
         if (standingPath == StandingPath.Publisher) {
