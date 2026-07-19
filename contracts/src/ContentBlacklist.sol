@@ -289,8 +289,23 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     // Events
     // -----------------------------------------------------------------
 
-    event HashBlacklisted(bytes32 indexed region, bytes32 indexed hash, string reason);
-    event HashRemoved(bytes32 indexed region, bytes32 indexed hash);
+    /// @notice A hash entered the enforced deny-set. `version` is the
+    ///         `getBlacklistVersion()` value *after* this change, so a delta
+    ///         consumer can order events and detect gaps against the counter
+    ///         (ADR 011 § Polling). Non-indexed: EVM topic filters are
+    ///         set-membership, not range, so indexing it buys no range query —
+    ///         the node reads the counter to decide *whether* to fetch, then a
+    ///         block-range `eth_getLogs` for *what* changed.
+    event HashBlacklisted(bytes32 indexed region, bytes32 indexed hash, uint256 version, string reason);
+    /// @notice A hash left the enforced deny-set. `version` as in
+    ///         `HashBlacklisted`.
+    event HashRemoved(bytes32 indexed region, bytes32 indexed hash, uint256 version);
+    /// @notice An appeal-driven suspend/resume flipped whether a live entry is
+    ///         enforced (`_isLive`), without adding or removing it. Emitted from
+    ///         the `_setEntrySuspended` choke point so every `_blacklistVersion`
+    ///         bump has a matching log — a delta consumer never sees the counter
+    ///         move with no event (ADR 011 § Polling). `version` as above.
+    event HashSuspensionUpdated(bytes32 indexed region, bytes32 indexed hash, uint256 version, bool suspended);
     event OperatorBlacklisted(address indexed operator);
     event OperatorBlacklistCleared(address indexed operator);
     event OriginBlacklistUpdated(address indexed origin, bool blacklisted);
@@ -923,7 +938,7 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         unchecked {
             ++_blacklistVersion;
         }
-        emit HashBlacklisted(region, hash, reason);
+        emit HashBlacklisted(region, hash, _blacklistVersion, reason);
     }
 
     function _removeHashRegional(bytes32 region, bytes32 hash) internal {
@@ -934,7 +949,7 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         unchecked {
             ++_blacklistVersion;
         }
-        emit HashRemoved(region, hash);
+        emit HashRemoved(region, hash, _blacklistVersion);
     }
 
     /// @dev The single choke point for the appeal-driven `suspended` toggle, so
@@ -964,6 +979,7 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         unchecked {
             ++_blacklistVersion;
         }
+        emit HashSuspensionUpdated(region, hash, _blacklistVersion, suspended);
     }
 
     /// @dev Reads storage directly to avoid the `storage → memory` flagged

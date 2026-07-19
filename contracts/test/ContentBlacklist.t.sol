@@ -266,6 +266,48 @@ contract ContentBlacklistTest is Test {
         assertEq(blacklist.getBlacklistVersion(), versionAfterAdd + 2);
     }
 
+    /// @notice ADR 011 § Polling — `HashRemoved` carries the post-change version
+    ///         so a delta consumer can key the removal to the counter it polled.
+    function test_HashRemoved_carriesVersion() public {
+        vm.prank(regionalBody);
+        blacklist.addHashRegional(REGION_US, SAMPLE_HASH, "DMCA-TEST");
+
+        uint256 expectedVersion = blacklist.getBlacklistVersion() + 1;
+        vm.expectEmit(true, true, false, true, address(blacklist));
+        emit ContentBlacklist.HashRemoved(REGION_US, SAMPLE_HASH, expectedVersion);
+        vm.prank(regionalBody);
+        blacklist.removeHashRegional(REGION_US, SAMPLE_HASH);
+    }
+
+    /// @notice ADR 011 § Polling — every `_blacklistVersion` bump has a matching
+    ///         log. Suspend and resume each emit `HashSuspensionUpdated` carrying
+    ///         the post-change version and the new `suspended` state, so a
+    ///         delta-fetcher never sees the counter move with no event (the
+    ///         silent-under-enforcement failure the poll cycle exists to prevent).
+    function test_HashSuspensionUpdated_onSuspendAndResume() public {
+        vm.prank(regionalBody);
+        blacklist.addHashRegional(REGION_US, SAMPLE_HASH, "DMCA-TEST");
+
+        vm.prank(filer);
+        uint256 appealId = blacklist.openBlacklistAppeal(
+            SAMPLE_HASH, REGION_US, bytes32("evidence"), ContentBlacklist.StandingPath.Operator, 0
+        );
+
+        // Fast-track suspends the entry: version bumps, state -> true.
+        uint256 suspendVersion = blacklist.getBlacklistVersion() + 1;
+        vm.expectEmit(true, true, false, true, address(blacklist));
+        emit ContentBlacklist.HashSuspensionUpdated(REGION_US, SAMPLE_HASH, suspendVersion, true);
+        vm.prank(multisig);
+        blacklist.fastTrackBlacklistAppeal(appealId);
+
+        // Reversal resumes it: version bumps again, state -> false.
+        uint256 resumeVersion = blacklist.getBlacklistVersion() + 1;
+        vm.expectEmit(true, true, false, true, address(blacklist));
+        emit ContentBlacklist.HashSuspensionUpdated(REGION_US, SAMPLE_HASH, resumeVersion, false);
+        vm.prank(admin);
+        blacklist.reverseBlacklistAppeal(appealId);
+    }
+
     /// @notice Rejecting a fast-tracked appeal also un-suspends the entry, so it
     ///         resumes enforcement and must bump the counter — the same
     ///         resume-side compliance case as `bumpsOnResume`, reached via
@@ -1257,8 +1299,9 @@ contract ContentBlacklistTest is Test {
 
     /// @notice `addHashGlobal` persists the reason and emits it on the event.
     function test_addHashGlobal_persistsReason() public {
+        uint256 expectedVersion = blacklist.getBlacklistVersion() + 1;
         vm.expectEmit(true, true, false, true, address(blacklist));
-        emit ContentBlacklist.HashBlacklisted(GLOBAL_REGION, SAMPLE_HASH, "DMCA-2026-001");
+        emit ContentBlacklist.HashBlacklisted(GLOBAL_REGION, SAMPLE_HASH, expectedVersion, "DMCA-2026-001");
         vm.prank(admin);
         blacklist.addHashGlobal(SAMPLE_HASH, "DMCA-2026-001");
         assertEq(blacklist.hashReason(GLOBAL_REGION, SAMPLE_HASH), "DMCA-2026-001");
@@ -1266,8 +1309,9 @@ contract ContentBlacklistTest is Test {
 
     /// @notice `addHashRegional` persists the reason under the entry's region.
     function test_addHashRegional_persistsReason() public {
+        uint256 expectedVersion = blacklist.getBlacklistVersion() + 1;
         vm.expectEmit(true, true, false, true, address(blacklist));
-        emit ContentBlacklist.HashBlacklisted(REGION_US, SAMPLE_HASH, "DSA-DE-001");
+        emit ContentBlacklist.HashBlacklisted(REGION_US, SAMPLE_HASH, expectedVersion, "DSA-DE-001");
         vm.prank(regionalBody);
         blacklist.addHashRegional(REGION_US, SAMPLE_HASH, "DSA-DE-001");
         assertEq(blacklist.hashReason(REGION_US, SAMPLE_HASH), "DSA-DE-001");
