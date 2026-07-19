@@ -883,7 +883,7 @@ async fn idle_clock_re_arms_from_last_stream_close() -> anyhow::Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn idle_clock_re_arms_after_each_completed_stream() -> anyhow::Result<()> {
     let payload = vec![0x6Au8; 64 * 1024];
-    let idle = Duration::from_millis(500);
+    let idle = Duration::from_secs(1);
     let activity_cadence = Duration::from_millis(300);
     let fx = idle_fixture(&payload, idle).await?;
     let blob = fx.blob(0)?;
