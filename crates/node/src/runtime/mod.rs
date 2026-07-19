@@ -1772,7 +1772,7 @@ pub async fn run(
     // `AnnounceTrigger`, spawn the admin serve task with the full state.
     // Bind happened earlier (see `admin_listener` above) so a port collision
     // would have failed startup before any side-effectful subscribes ran.
-    let mut admin_stop_tx = if let Some(listener) = admin_listener {
+    let admin_stop_tx = if let Some(listener) = admin_listener {
         let (tx, rx) = oneshot::channel::<()>();
         // Build the reload hook only when a config file path was passed
         // (CLI-only invocation has nothing on disk to re-read). The
@@ -1914,6 +1914,113 @@ pub async fn run(
     };
     tracing::info!(signal = %signal, "shutdown signal received; closing router");
 
+    let handles = ShutdownHandles {
+        metrics_stop_tx,
+        dispatch_gc_stop_tx,
+        buyer_bootstrap_stop_tx,
+        region_log_stop_tx,
+        record_store_gc_stop_tx,
+        dht_rate_limit_gc_stop_tx,
+        probe_rate_limit_gc_stop_tx,
+        republish_stop_tx,
+        bucket_refresh_stop_tx,
+        blacklist_watcher,
+        origin_watcher,
+        watcher_checkpoint_store,
+        admin_stop_tx,
+        rpc_watchdog,
+        gossip_shutdown,
+        capacity_bond_watcher,
+        slash_watcher,
+        settlement_indexer,
+        pull_through_bg_shutdown,
+        prefetch_shutdown,
+        receipt_writer_shutdown,
+        payment_service,
+        gossip_handles,
+        receipt_writer,
+        tasks,
+    };
+    shutdown(handles, router, signal, &drain_trigger, cache).await
+}
+
+/// Owned teardown state handed from [`run`] to [`shutdown`]. Every field is a
+/// stop signal, watcher handle, or task handle that the graceful-shutdown
+/// sequence consumes exactly once; the exhaustive destructure at the top of
+/// [`shutdown`] (no `..` rest) is a deliberate safety net — a field left
+/// unconsumed becomes an unused-variable error under `-D warnings`, proving no
+/// stop signal was dropped on the floor.
+struct ShutdownHandles<P: Provider + Clone + 'static> {
+    metrics_stop_tx: oneshot::Sender<()>,
+    dispatch_gc_stop_tx: oneshot::Sender<()>,
+    buyer_bootstrap_stop_tx: oneshot::Sender<()>,
+    region_log_stop_tx: Option<oneshot::Sender<()>>,
+    record_store_gc_stop_tx: oneshot::Sender<()>,
+    dht_rate_limit_gc_stop_tx: oneshot::Sender<()>,
+    probe_rate_limit_gc_stop_tx: oneshot::Sender<()>,
+    republish_stop_tx: oneshot::Sender<()>,
+    bucket_refresh_stop_tx: oneshot::Sender<()>,
+    blacklist_watcher: crate::chain_events::resumable_watcher::WatcherHandle,
+    origin_watcher: Option<Arc<crate::chain_events::resumable_watcher::WatcherHandle>>,
+    watcher_checkpoint_store: Arc<dyn decdn_incentive::KeyedCheckpointStore>,
+    admin_stop_tx: Option<oneshot::Sender<()>>,
+    rpc_watchdog: Option<(oneshot::Sender<()>, tokio::task::JoinHandle<()>)>,
+    gossip_shutdown: CancellationToken,
+    capacity_bond_watcher: Arc<crate::chain_events::resumable_watcher::WatcherHandle>,
+    slash_watcher: crate::slash_watcher::SlashWatcher,
+    settlement_indexer: Option<crate::reputation_indexer::SettlementIndexer>,
+    pull_through_bg_shutdown: CancellationToken,
+    prefetch_shutdown: CancellationToken,
+    receipt_writer_shutdown: CancellationToken,
+    payment_service: PaymentChannelService<P>,
+    gossip_handles: Vec<tokio::task::JoinHandle<()>>,
+    receipt_writer: tokio::task::JoinHandle<()>,
+    tasks: JoinSet<()>,
+}
+
+/// Graceful teardown extracted verbatim from the tail of [`run`] (issue #1253
+/// PR1). Consumes every field of [`ShutdownHandles`] via an exhaustive
+/// destructure — see that type's docs for why the `..`-free binding is
+/// load-bearing. The teardown ordering here is itself load-bearing (metrics
+/// accept-loop stop first; `origin_watcher` shutdown before the `Origin`
+/// checkpoint flush; `capacity_bond_watcher` shutdown after `router.shutdown`)
+/// and must not be reordered.
+#[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
+async fn shutdown<P: Provider + Clone + 'static>(
+    handles: ShutdownHandles<P>,
+    router: Router,
+    signal: ShutdownSignal,
+    drain_trigger: &Arc<admin::DrainTrigger>,
+    cache: CacheEngine,
+) -> anyhow::Result<()> {
+    let ShutdownHandles {
+        metrics_stop_tx,
+        dispatch_gc_stop_tx,
+        buyer_bootstrap_stop_tx,
+        region_log_stop_tx,
+        record_store_gc_stop_tx,
+        dht_rate_limit_gc_stop_tx,
+        probe_rate_limit_gc_stop_tx,
+        republish_stop_tx,
+        bucket_refresh_stop_tx,
+        blacklist_watcher,
+        origin_watcher,
+        watcher_checkpoint_store,
+        mut admin_stop_tx,
+        rpc_watchdog,
+        gossip_shutdown,
+        capacity_bond_watcher,
+        slash_watcher,
+        settlement_indexer,
+        pull_through_bg_shutdown,
+        prefetch_shutdown,
+        receipt_writer_shutdown,
+        payment_service,
+        gossip_handles,
+        receipt_writer,
+        mut tasks,
+    } = handles;
+
     // Signal the HTTP accept loops to stop *before* awaiting
     // `router.shutdown()`. Router shutdown can block indefinitely if a
     // protocol handler is slow, and while it's blocked the metrics/admin
@@ -1986,7 +2093,7 @@ pub async fn run(
     // the AfterRouter path when SIGTERM actually won the select (the
     // operator's stated intent wins; the RPC's request becomes a
     // no-op since drain is already in progress).
-    let stop_order = admin_stop_order(signal, &drain_trigger);
+    let stop_order = admin_stop_order(signal, drain_trigger);
     if matches!(stop_order, AdminStopOrder::Early)
         && let Some(tx) = admin_stop_tx.take()
         && tx.send(()).is_err()
