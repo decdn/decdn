@@ -2656,6 +2656,16 @@ mod tests {
         text.lines().any(|l| l == needle)
     }
 
+    /// Parse the `u64` value of an exact-named series from encoded
+    /// `OpenMetrics` text. Applies the same whole-line discipline as
+    /// [`has_metric_line`] — the name must be followed by a single space — so
+    /// `decdn_x 5` never matches a `decdn_x_total`/`decdn_x_foo` sibling.
+    /// Returns `None` if the series is absent or its value doesn't parse.
+    fn metric_value(text: &str, name: &str) -> Option<u64> {
+        text.lines()
+            .find_map(|l| l.strip_prefix(name)?.strip_prefix(' ')?.parse::<u64>().ok())
+    }
+
     #[test]
     fn key_rotation_metrics_export_canonical_names_at_zero() {
         let metrics = Metrics::new();
@@ -2689,16 +2699,23 @@ mod tests {
         // marks "started" — a re-introduced `set(0)` (or any pre-scrape write)
         // would be unobservable and is exactly the dead surface this issue
         // removed. Backdate `started_at` and scrape WITHOUT calling any hook:
-        // uptime must already reflect the backdate.
+        // uptime must reflect the backdate rather than reset to 0.
+        //
+        // `Instant` is monotonic (boot-relative), so the backdate stays small
+        // to keep `checked_sub` from underflowing to `None` on a freshly-booted
+        // CI host, and the check is a range rather than an exact second count so
+        // scrape-time `as_secs()` truncation can't race it.
+        const BACKDATE_SECS: u64 = 60;
         let mut metrics = Metrics::new();
         metrics.started_at = Instant::now()
-            .checked_sub(Duration::from_hours(2))
+            .checked_sub(Duration::from_secs(BACKDATE_SECS))
             .unwrap_or_else(Instant::now);
 
         let text = metrics.encode().unwrap();
+        let uptime = metric_value(&text, "decdn_node_uptime_seconds").unwrap();
         assert!(
-            has_metric_line(&text, "decdn_node_uptime_seconds", 7200),
-            "uptime must count from construction (started_at), no bring-up hook needed:\n{text}"
+            (BACKDATE_SECS..3600).contains(&uptime),
+            "uptime must count from construction (started_at ~{BACKDATE_SECS}s ago), got {uptime}:\n{text}"
         );
     }
 
