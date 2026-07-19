@@ -85,13 +85,23 @@ mod sol_types {
             // -----------------------------------------------------------------
 
             /// A `(region, hash)` entry was added (or re-added). `region` is
-            /// `bytes32("GLOBAL")` for the global scope. `reason` carries the
-            /// free-form on-chain audit-trail note (unused by the watcher, but
-            /// part of the event signature so topic0 matches the contract).
-            event HashBlacklisted(bytes32 indexed region, bytes32 indexed hash, string reason);
+            /// `bytes32("GLOBAL")` for the global scope.
+            ///
+            /// These declarations MUST match `ContentBlacklist.sol` field-for-field,
+            /// including parameters this watcher never reads. `topic0` is the keccak of
+            /// the event signature, and the non-indexed params are the ABI-encoded data
+            /// payload — so a drift in either breaks the watcher twice over: it matches
+            /// no logs at all, and would mis-decode any it did match. It fails SILENTLY,
+            /// as an empty deny-set, which reads exactly like "nothing is blacklisted"
+            /// while the node serves content it is slashable for serving.
+            ///
+            /// `version` (the post-change `getBlacklistVersion()`, ADR 011 § Polling) and
+            /// `reason` (the audit-trail note) are both unused here for that reason alone:
+            /// they are part of the signature, so they are part of this declaration.
+            event HashBlacklisted(bytes32 indexed region, bytes32 indexed hash, uint256 version, string reason);
 
-            /// A `(region, hash)` entry was removed.
-            event HashRemoved(bytes32 indexed region, bytes32 indexed hash);
+            /// A `(region, hash)` entry was removed. `version` as above.
+            event HashRemoved(bytes32 indexed region, bytes32 indexed hash, uint256 version);
         }
     }
 }

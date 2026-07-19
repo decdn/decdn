@@ -32,13 +32,15 @@ Each node also maintains a local denylist for operator-initiated removal without
 
 ```solidity
 interface IContentBlacklist {
-    // Global governance path (standard voting + timelock)
-    function addHash(bytes32 blake3Hash, string calldata reason) external;
-    function removeHash(bytes32 blake3Hash) external;
+    // Global governance path (standard voting + timelock) — GOVERNANCE_ROLE
+    function addHashGlobal(bytes32 blake3Hash, string calldata reason) external;
+    function removeHashGlobal(bytes32 blake3Hash) external;
 
-    // Regional governance path — callable only by a registered regional body
-    function addHashRegional(bytes32 blake3Hash, string calldata region, string calldata reason) external;
-    function removeHashRegional(bytes32 blake3Hash, string calldata region) external;
+    // Regional governance path — REGIONAL_BODY_ROLE, callable only by a
+    // registered regional body. Both revert on the global sentinel, so a
+    // regional body can never reach a global entry.
+    function addHashRegional(string calldata region, bytes32 blake3Hash, string calldata reason) external;
+    function removeHashRegional(string calldata region, bytes32 blake3Hash) external;
 
     // Operator blacklisting — global governance only
     function addOperator(address operator) external;
@@ -57,7 +59,7 @@ interface IContentBlacklist {
 
     // Emergency entries expire after their category-specific deadline unless ratified by governance.
     // Expiry is derived from the entry's addedAt timestamp: addedAt + expiryForCategory(category).
-    // isBlacklisted returns false after this deadline unless a governance addHash
+    // isBlacklisted returns false after this deadline unless a governance addHashGlobal
     // has been called for the same hash.
 
     // Regional body registry — global governance only
@@ -66,9 +68,10 @@ interface IContentBlacklist {
     function suspendRegionalBody(string calldata region) external;
     function unsuspendRegionalBody(string calldata region) external;
 
-    // Per-entry appeal flow (regional entries only — see § Blacklist Entry Appeals).
-    // openBlacklistAppeal reverts on global entries (region == "") and on entries
-    // past their filing window. The filer declares one standing path:
+    // Per-entry appeal flow (see § Blacklist Entry Appeals). Regional entries are
+    // the primary case; global entries are filable by naming GLOBAL_REGION.
+    // openBlacklistAppeal reverts on the UNSET region sentinel (bytes32(0)) and on
+    // entries past their filing window. The filer declares one standing path:
     //   enum StandingPath { None, Publisher, Operator, TokenHolder } // 0,1,2,3
     // Eligibility is verified under the declared path only; the path is recorded
     // on the appeal and fixed for its lifetime. Bond pulled via TOKEN.transferFrom.
@@ -88,7 +91,7 @@ interface IContentBlacklist {
     // Permissionless cleanup. Reverts unless one admissibility condition holds:
     //   (a) multisig silent past BLACKLIST_MULTISIG_REVIEW_WINDOW (never fast-tracked), or
     //   (b) governance silent past BLACKLIST_RATIFICATION_WINDOW (post-fast-track), or
-    //   (c) the underlying BlacklistEntry has been removed via removeHash /
+    //   (c) the underlying BlacklistEntry has been removed via removeHashGlobal /
     //       removeHashRegional global override (see § Global Override).
     // On success, refunds or burns the bond per § Bond and frequency caps for
     // the matched condition and emits BlacklistAppealLapsed. If the appeal had
@@ -105,11 +108,18 @@ interface IContentBlacklist {
     function getEntry(bytes32 blake3Hash) external view returns (BlacklistEntry memory);
     function getBlacklistVersion() external view returns (uint256);
 
-    // Events
-    event HashBlacklisted(bytes32 indexed blake3Hash, uint256 indexed version, uint256 effectiveAt, string region, string reason, bool emergency);
-    event HashRemoved(bytes32 indexed blake3Hash, uint256 indexed version, string region);
-    event OriginBlacklisted(address indexed operatorAddress, uint256 indexed version, string reason);
-    event OriginRemoved(address indexed operatorAddress, uint256 indexed version);
+    // Events. `version` is the getBlacklistVersion() value AFTER the change, so a
+    // delta consumer can order events and confirm no gap. Non-indexed: EVM topic
+    // filters are set-membership, not range, so indexing it buys no range query
+    // (see § Polling). Every hash-set change emits exactly one of the three below,
+    // so the counter never advances with no matching log.
+    event HashBlacklisted(bytes32 indexed region, bytes32 indexed blake3Hash, uint256 version, string reason);
+    event HashRemoved(bytes32 indexed region, bytes32 indexed blake3Hash, uint256 version);
+    event HashSuspensionUpdated(bytes32 indexed region, bytes32 indexed blake3Hash, uint256 version, bool suspended);
+    // Origin blacklisting is a single toggle, deliberately OUTSIDE the version
+    // mechanism: it carries no version and is enforced via OriginAssignment
+    // cross-reference (§ Permissionless property), not the hash version poll.
+    event OriginBlacklistUpdated(address indexed operatorAddress, bool blacklisted);
     event BlacklistAppealOpened(uint256 indexed appealId, bytes32 indexed blake3Hash, string region, address indexed filer, bytes32 evidenceBundleHash, uint8 standingPath);
     event BlacklistAppealFastTracked(uint256 indexed appealId);
     event BlacklistAppealUnFastTracked(uint256 indexed appealId);
@@ -172,12 +182,12 @@ The two appeal paths are deliberately decoupled. [ADR 028](028-slashing-appeals.
 
 ### Scope
 
-Appellable entries: **regional entries only.** Entries issued via `addHashRegional` carry a non-empty `region` field and are filed against a registered regional body. They are the entries this fast-track was designed to dispute.
+Appellable entries: **any live entry, regional or global.** Entries issued via `addHashRegional` carry a non-empty `region` and are filed against a registered regional body; they are what this fast-track was designed to dispute and remain its primary case. Global entries are filable too — `openBlacklistAppeal` takes the scope as an explicit argument and reverts only on the **unset** region sentinel (`bytes32(0)` → `MissingRegion`), never on the global sentinel. Callers must pass `GLOBAL_REGION` explicitly rather than relying on a default: silently rewriting an omitted argument to global scope would burn the filer's bond and 90-day rejection cooldown against an entry they never meant to contest.
 
-Out of scope for this fast-track:
+Filing is not winning. The intent that global entries are the *harder* case is enforced by the relief machinery, not by a filing gate — an `Open` appeal carries zero interim relief, `fastTrackBlacklistAppeal` is `EMERGENCY_MULTISIG_ROLE`-gated, and ratification is reserved to DecdnGovernor. Two categories are therefore reachable but deliberately unattractive on the merits:
 
-- **Emergency entries** (`emergencyAdd`, `emergencyAddOrigin`) are global by construction — the interface takes no `region` parameter — so they cannot be opened via `openBlacklistAppeal`, which reverts on `region == ""`. They are bounded by their category-specific auto-expiry from [§ Compliance Window](#compliance-window) (14d for `GENERAL`, 90d for `CSAM` / `TERRORIST`). Disputes route through the slow-path DecdnGovernor `removeHash` proposal — see [§ Global Override](#global-override). A regional-emergency variant or separate global-emergency appeal path is left to a future amendment if operational data shows it is needed.
-- **Global standard-vote entries** (`addHash`) are also out of scope: they have already passed the full DecdnGovernor process, so re-litigation belongs in a standard governance amendment, not this lighter-weight path. The slow-path override remains available.
+- **Emergency entries** (`emergencyAdd`, `emergencyAddOrigin`) are global by construction — the interface takes no `region` parameter — so they are contested under `GLOBAL_REGION`. They are additionally bounded by their category-specific auto-expiry from [§ Compliance Window](#compliance-window) (14d for `GENERAL`, 90d for `CSAM` / `TERRORIST`), and the slow-path DecdnGovernor `removeHashGlobal` proposal remains the primary route — see [§ Global Override](#global-override).
+- **Global standard-vote entries** (`addHashGlobal`) have already passed the full DecdnGovernor process, so re-litigation on the merits still belongs in a standard governance amendment rather than this lighter-weight path. The slow-path override remains available and is the expected route.
 
 Grounds for appeal:
 
@@ -185,14 +195,14 @@ Grounds for appeal:
 - **(b) Procedural defect.** The body deviated from its own constituted process (e.g., a 3-of-5 multisig issued an entry with only two valid signatures).
 - **(c) Substantive defect / wrongful takedown.** The underlying notice is invalid — a valid DMCA counter-notice was already filed, the publisher has jurisdictional immunity, the content does not match the notice.
 
-**Bootstrap-window degradation.** During the bootstrap window described in [§ Regional Governance Bodies](#regional-governance-bodies) — no regional bodies registered, `DEFAULT_ADMIN_ROLE` holder acts as sole governance — the appeal path is structurally non-functional: `addHash` and emergency entries are issued by the same admin key that would sit on the multisig hearing the appeal, and `openBlacklistAppeal` reverts on the global entries (`region == ""`) that are the only kind issued during this window. The slow-path global override (see [§ Global Override](#global-override)) is the operative recourse during the bootstrap window and for global entries thereafter. The fast-track path here becomes load-bearing only after the first regional body is registered by governance vote, when regional `addHashRegional` entries are issuable and an independent multisig + DecdnGovernor pairing exists to hear appeals. `openBlacklistAppeal` implementations MAY revert with `AppealPathNotYetActive` until the first regional body is registered, surfacing the degradation explicitly rather than failing on the downstream `region == ""` check.
+**Bootstrap-window degradation.** During the bootstrap window described in [§ Regional Governance Bodies](#regional-governance-bodies) — no regional bodies registered, `DEFAULT_ADMIN_ROLE` holder acts as sole governance — the appeal path is structurally non-functional for a reason no contract check can express: `addHashGlobal` and emergency entries are issued by the same admin key that would sit on the multisig hearing the appeal. A global entry issued in this window is *filable* (see [§ Scope](#scope)), but it buys the filer nothing — the adjudicator and the issuer are the same party — while still escrowing the bond and arming the rejection cooldown. The slow-path global override (see [§ Global Override](#global-override)) is the operative recourse during the bootstrap window. The fast-track path becomes load-bearing only after the first regional body is registered by governance vote, when regional `addHashRegional` entries are issuable and an independent multisig + DecdnGovernor pairing exists to hear appeals. `openBlacklistAppeal` implementations MAY revert with `AppealPathNotYetActive` until the first regional body is registered, surfacing that degradation explicitly rather than letting a filer burn a bond on a self-adjudicated appeal.
 
 ### Standing
 
 The filer declares one standing path at filing time via the `standingPath` parameter to `openBlacklistAppeal` (`uint8` enum: `Publisher = 1`, `Operator = 2`, `TokenHolder = 3`). The contract verifies eligibility under the declared path only and does not auto-select among paths a filer might qualify under, keeping the on-chain standing record unambiguous and verification single-branch per appeal.
 
 1. **The affected publisher** per [ADR 002 § Publisher Identity and Namespaces](002-content-addressing.md#publisher-identity-and-namespaces) — the on-chain `PublisherRegistry.ownerOf(namespaceId)` for the namespace whose content the disputed hash falls under. Path 1 is restricted to registered namespaces because the contract has no on-chain way to verify "publisher of record" claims for default-open content; default-open publishers, content advocates, and end-user proxies use path 3 instead. The filer passes the claiming `namespaceId` explicitly as a filing argument — a hash→namespace reverse lookup is ambiguous because many namespaces may claim the same hash — and the contract requires both `ownerOf(namespaceId) == filer` and that the namespace `hasClaimed` the disputed hash (see [ADR 002](002-content-addressing.md#publisher-identity-and-namespaces)); either check failing reverts path 1. Because `claimContent` is a permissionless self-assertion, this proves the filer controls a namespace that claimed the hash, not authorship — acceptable because path 1 confers no more than path 3 (any bond-poster already has standing) and standing alone grants no automatic outcome.
-2. **Any operator currently in compliance scope.** An operator whose declared `node.region` matches the entry's region — i.e., one whose bond is exposed to slashing under the entry. This catches operator-side disputes (compliance burden, jurisdictional mismatch with the operator's own legal posture). Because `node.region` is self-attested in `NodeAnnounce` (see [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh) and [ADR 030](030-node-region-self-attestation.md#adr-030-node-region-self-attestation)), an operator could in principle flip their `regionHint` immediately before filing to gain standing in any region. [ADR 030 § Region-stability window](030-node-region-self-attestation.md#region-stability-window) closes this surface: operator standing under path 2 additionally requires `block.timestamp - effective >= REGION_STABILITY_WINDOW` (where `effective` falls back to gate activation for pre-upgrade records; default 7 days, governable `[3d, 30d]` per the [ADR 009](009-governance.md#adr-009-governance-model) safety-bound pattern). Filings inside the window are not auto-rejected — they remain admissible at multisig discretion only, the soft-norm heightened-scrutiny fallback for legitimate post-relocation filers. The 1,000 TOKEN bond, the 90-day per-address frequency cap on successful appeals, and the perjury denylist are the additional deterrents on this path; there is no synthetic-standing clawback analogue because the operator bond is unbond-locked under [ADR 026 § Operator economics](026-tokenomics.md#operator-economics) and cannot be flash-acquired.
+2. **Any operator currently in compliance scope.** An operator whose declared `node.region` matches the entry's region — i.e., one whose bond is exposed to slashing under the entry. On a **global** entry the region-match check does not apply: a global entry binds every region, so any in-scope operator has standing without a matching region. This catches operator-side disputes (compliance burden, jurisdictional mismatch with the operator's own legal posture). Because `node.region` is self-attested in `NodeAnnounce` (see [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh) and [ADR 030](030-node-region-self-attestation.md#adr-030-node-region-self-attestation)), an operator could in principle flip their `regionHint` immediately before filing to gain standing in any region. [ADR 030 § Region-stability window](030-node-region-self-attestation.md#region-stability-window) closes this surface: operator standing under path 2 additionally requires `block.timestamp - effective >= REGION_STABILITY_WINDOW` (where `effective` falls back to gate activation for pre-upgrade records; default 7 days, governable `[3d, 30d]` per the [ADR 009](009-governance.md#adr-009-governance-model) safety-bound pattern). Filings inside the window are not auto-rejected — they remain admissible at multisig discretion only, the soft-norm heightened-scrutiny fallback for legitimate post-relocation filers. The 1,000 TOKEN bond, the 90-day per-address frequency cap on successful appeals, and the perjury denylist are the additional deterrents on this path; there is no synthetic-standing clawback analogue because the operator bond is unbond-locked under [ADR 026 § Operator economics](026-tokenomics.md#operator-economics) and cannot be flash-acquired.
 3. **Any TOKEN holder** who posts the appeal bond. Standing on this path is the escrowed appeal bond itself — there is no separate balance threshold. This opens a proxy path for end users, content advocates, and default-open publishers without requiring on-chain content ownership. Because the bond is escrowed by the appeal it cannot be flash-loaned, so the deterrents against frivolous filings are the bond (fully burned on rejection), the perjury denylist, the per-address rejection cooldown, and the frequency cap below. A balance gate protects nothing these do not already protect (see [§ Bond and frequency caps](#bond-and-frequency-caps)).
 
 Standing is verified at the filing transaction under the declared path. An operator who unbonds after filing does not lose standing for an already-open appeal — but cannot file new ones until standing is restored. Path 3 has no post-filing balance requirement: once the bond is escrowed the standing is settled, so there is nothing to re-check mid-flow. The declared path is fixed at filing.
@@ -299,16 +309,16 @@ Removing a wrongful entry going forward (this ADR) does not mechanically refund 
 
 The new entry points are listed in [§ Contract: ContentBlacklist](#contract-contentblacklist) above. Implementation notes:
 
-- `openBlacklistAppeal` reverts if `region == ""` (global entries — including emergency entries — are out of scope), if the entry is past its `BLACKLIST_APPEAL_FILING_WINDOW`, if the filer fails standing checks under the declared `standingPath`, if the filer is on the perjury denylist, or if the filer is in a rejection-cooldown window (see [§ Bond and frequency caps](#bond-and-frequency-caps) — `APPEAL_FILER_REJECTION_COOLDOWN`). Filings are not gated by the concurrent interim-relief caps — see the next bullet for where they apply. Bond is pulled via `TOKEN.transferFrom`; the appeal record is stored with the declared `standingPath` and `BlacklistAppealOpened` is emitted.
+- `openBlacklistAppeal` reverts if `region` is the **unset** sentinel (`bytes32(0)` → `MissingRegion`) — the caller must name the scope explicitly, passing `GLOBAL_REGION` to contest a global entry; global and emergency entries are in scope (see [§ Scope](#scope)). It also reverts if the entry is past its `BLACKLIST_APPEAL_FILING_WINDOW`, if the filer fails standing checks under the declared `standingPath`, if the filer is on the perjury denylist, or if the filer is in a rejection-cooldown window (see [§ Bond and frequency caps](#bond-and-frequency-caps) — `APPEAL_FILER_REJECTION_COOLDOWN`). Filings are not gated by the concurrent interim-relief caps — see the next bullet for where they apply. Bond is pulled via `TOKEN.transferFrom`; the appeal record is stored with the declared `standingPath` and `BlacklistAppealOpened` is emitted.
 - `fastTrackAppeal` / `unFastTrackAppeal` / `rejectAppeal` are restricted to the emergency multisig (the same address with the same threshold as the existing `suspendRegionalBody` flow), under the sub-mode authority described in [§ Authority and flow](#authority-and-flow). `fastTrackAppeal` reverts if the contested entry's region already has `REGION_CONCURRENT_RELIEF_CAP` entries in interim-relief (`entry.suspended == true`), or if the filer already holds `FILER_CONCURRENT_RELIEF_CAP` interim-relief slots in that region; the multisig must wait for one to resolve, or use `rejectAppeal` to triage one of the existing pending appeals first. `rejectAppeal` is not cap-gated. `unFastTrackAppeal` is the multisig's escape hatch when post-fast-track evidence (perjury, late counter-evidence) shows the suspension was misjudged: it requires `entry.suspended == true` and that the appeal is still pre-ratification, clears `suspended` (releasing the relief slot — both the region and per-filer counters), preserves the original `effectiveAt`, leaves the bond escrowed, opens a fresh `BLACKLIST_MULTISIG_REVIEW_WINDOW` from the un-fast-track timestamp during which the multisig may call `rejectAppeal` (burn) or do nothing (lapse → refund), and emits `BlacklistAppealUnFastTracked`. It is a one-shot per appeal — the contract reverts on a second invocation against the same `appealId` to prevent the multisig from indefinitely cycling fast-track ↔ un-fast-track to re-arm review windows. `unFastTrackAppeal` does not by itself trigger the perjury denylist; that requires a subsequent `rejectAppeal` on the same appeal with the perjury flag set.
 - `ratifyAppealRemoval` / `reverseAppeal` are restricted to GOVERNANCE_ROLE (DecdnGovernor). Ratification calls the contract's internal `_removeHashRegional` and emits both `BlacklistAppealRatified` and the standard `HashRemoved` event. Reversal clears `suspended`, **preserves the original `effectiveAt`** (per [§ Authority and flow](#authority-and-flow) — resetting was rejected to avoid shielding pre-suspension non-compliance), and burns the bond per [§ Bond and frequency caps](#bond-and-frequency-caps).
 - The full ABI (per-appeal storage layout, exact event topics, gas-optimized struct packing) is specified in [ADR 031](031-content-blacklist-appeals-contract.md#adr-031-contentblacklist-appeal-contract-surface) — same approach as [ADR 028 § Contract surface](028-slashing-appeals.md#contract-surface), whose contract-implementation ADR is [ADR 032](_history/032-safety-reserve-appeals-contract.md#adr-032-safetyreserve-appeal-surface-contract-surface).
 
 ### Global Override
 
-The slow-path global override is independent of the appeal flow above. DecdnGovernor proposals may call `removeHash` (global entries) and `removeHashRegional` (regional entries) directly via the standard timelock, regardless of any open appeal. Both functions are restricted to `GOVERNANCE_ROLE`; this is now explicitly documented as their access control. The slow path is always available for cases that do not fit the fast-track — global standard-vote entries, frequency-capped filers, expired filing windows, or coordinated multi-region disputes that warrant a single DecdnGovernor decision rather than per-region multisig action.
+The slow-path override is independent of the appeal flow above: either removal function may be called directly, regardless of any open appeal. The two are **not** the same access-control surface. `removeHashGlobal` (global entries) is restricted to `GOVERNANCE_ROLE`, which DecdnGovernor proposals reach via the standard timelock. `removeHashRegional` (regional entries) is restricted to `REGIONAL_BODY_ROLE` and reverts on the `GLOBAL_REGION` sentinel — so it is a *regional body's* unilateral power, not a governance one, and governance reaches a regional entry only by holding that role. This distinction is load-bearing for the threat model: because regional entries are the appeal-relevant ones, the actor that triggers the mid-appeal removal path described below is usually a regional body acting alone, not a timelocked governance vote. The slow path is always available for cases that do not fit the fast-track — global standard-vote entries, frequency-capped filers, expired filing windows, or coordinated multi-region disputes that warrant a single DecdnGovernor decision rather than per-region multisig action.
 
-If `removeHash` or `removeHashRegional` fires while an appeal is open against the same `(blake3Hash, region)` pair, the appeal is rendered moot. Bond refund and slot release happen lazily: the next call to `ratifyAppealRemoval`, `reverseAppeal`, or the permissionless `cleanupExpiredAppeal(appealId)` (see [§ Contract surface](#contract-surface)) observes the underlying entry no longer exists, treats the appeal as **lapsed** (not reversed) — so the bond is **refunded** under the lapse-path rule in [§ Bond and frequency caps](#bond-and-frequency-caps), not burned under the reversal-path rule — releases the body's concurrent-appeal slot, and emits `BlacklistAppealLapsed`. Subsequent calls against the appeal id then revert with `BlacklistAppealAlreadyClosed`. The contract does not auto-execute on `removeHash`/`removeHashRegional` because Solidity has no scheduler — the lazy pattern matches `OriginAssignment.pruneBlacklistedAssignment`'s permissionless-cleanup model.
+If `removeHashGlobal` or `removeHashRegional` fires while an appeal is open against the same `(blake3Hash, region)` pair, the appeal is rendered moot. Bond refund and slot release happen lazily: the next call to `ratifyAppealRemoval`, `reverseAppeal`, or the permissionless `cleanupExpiredAppeal(appealId)` (see [§ Contract surface](#contract-surface)) observes the underlying entry no longer exists, treats the appeal as **lapsed** (not reversed) — so the bond is **refunded** under the lapse-path rule in [§ Bond and frequency caps](#bond-and-frequency-caps), not burned under the reversal-path rule — releases the body's concurrent-appeal slot, and emits `BlacklistAppealLapsed`. Subsequent calls against the appeal id then revert with `BlacklistAppealAlreadyClosed`. The contract does not auto-execute on `removeHashGlobal`/`removeHashRegional` because Solidity has no scheduler — the lazy pattern matches `OriginAssignment.pruneBlacklistedAssignment`'s permissionless-cleanup model.
 
 ## Compliance Window
 
@@ -506,7 +516,7 @@ This authority extends the DAO's role from negative-only (blacklisting) to posit
 
 ### Polling
 
-Nodes poll `getBlacklistVersion()` on a configurable interval (`blacklist_poll_interval`, default 10 minutes). When the version has advanced, the node fetches new entries since its last-seen version, filtered to its declared region plus global entries. Delta fetching relies on contract event logs: `HashBlacklisted` and `OriginBlacklisted` events include an indexed `version` field, enabling efficient `eth_getLogs` queries filtered by version range. Nodes SHOULD expose `blacklist_sync_lag_seconds` and `blacklist_version_behind` metrics for operational monitoring — see [Appendix: Observability](appendix-observability.md#appendix-observability-and-metrics).
+Nodes poll `getBlacklistVersion()` on a configurable interval (`blacklist_poll_interval`, default 10 minutes). When the version has advanced, the node fetches new entries since its last-seen version, filtered to its declared region plus global entries. Delta fetching relies on contract event logs. The three hash-entry events — `HashBlacklisted`, `HashRemoved`, and `HashSuspensionUpdated` — each carry the post-change `version`, and every advance of the counter emits exactly one of them, so a delta consumer never sees the version move with no matching log (silently under-enforcing a resumed hash is the compliance failure this poll cycle exists to prevent). The `version` is a **non-indexed** field: EVM topic filters match by set membership, not range, so there is no "version range" `eth_getLogs` query. The node instead keys the log query on a **block range** from its last-seen checkpoint and uses `version` to order the deltas and prove it has seen every revision with no gap — the counter answers *whether* to fetch, the events answer *what* changed. Origin blacklisting is deliberately outside this poll: `OriginBlacklistUpdated` carries no version, and origin enforcement flows through `OriginAssignment` cross-reference at selection time with lazy permissionless cleanup (see [§ Interaction with ContentBlacklist](#interaction-with-contentblacklist) and [§ Permissionless property](#permissionless-property)). Nodes SHOULD expose `blacklist_sync_lag_seconds` and `blacklist_version_behind` metrics for operational monitoring — see [Appendix: Observability](appendix-observability.md#appendix-observability-and-metrics).
 
 #### Version sync recovery
 
@@ -637,4 +647,4 @@ The minimum viable process at launch:
 3. Clearly illegal content (CSAM, actively-exploited material) → emergency multisig path
 4. DMCA / DSA notices → appropriate governance body (global or regional) with the notice ID in the `reason` field
 5. Repeat-offender origin nodes → global governance vote for origin blacklisting
-6. Disputed regional entries → see [§ Blacklist Entry Appeals](#blacklist-entry-appeals) for the per-entry path. The slow-path global override (DecdnGovernor `removeHash` / `removeHashRegional` proposal) remains available for entries that fall outside the fast-track scope
+6. Disputed regional entries → see [§ Blacklist Entry Appeals](#blacklist-entry-appeals) for the per-entry path. The slow-path global override (DecdnGovernor `removeHashGlobal` / `removeHashRegional` proposal) remains available for entries that fall outside the fast-track scope
