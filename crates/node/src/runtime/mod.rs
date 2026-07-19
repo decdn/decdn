@@ -659,55 +659,60 @@ async fn serve_until_shutdown(
     Ok((router, signal))
 }
 
-/// Build the endpoint, register handlers on a `Router`, spawn the metrics
-/// server and gossip tasks, and run until a shutdown signal is received.
-///
-/// SIGHUP triggers a hot-reload of mutable config fields via
-/// [`RuntimeReloadState`] (see issue #236). Other signals
-/// (SIGINT/SIGTERM) trigger graceful shutdown.
-///
-/// The signal streams (SIGHUP, SIGTERM) are registered **once** before
-/// the select loop and reused on every iteration. Re-creating
-/// `tokio::signal::unix::Signal` each iteration would race with signal
-/// delivery: a SIGHUP that arrives while `reload_runtime_config(..)` is
-/// running would have nowhere to land if the future holding the
-/// `Signal` had already been dropped, and would be silently lost. The
-/// persistent stream queues the signal until the next `recv()` call
-/// (kernel-managed, with coalescing) so concurrent or rapidly-repeated
-/// signals are observed deterministically.
+/// Chain providers, event watchers, and paid-delivery handlers built during the
+/// middle phase of [`run`] (issue #1253 PR4). A by-value bundle of the
+/// long-lived handles the background-task, serve, and shutdown phases consume,
+/// mirroring [`Infra`]. Generic over the seller-wallet provider `P` (an opaque
+/// `impl Provider` threaded through [`PaymentChannelService`]); [`run`] infers
+/// `P` at the call site and hands it to [`ShutdownHandles`].
+struct ChainHandlers<P: Provider + Clone + 'static> {
+    rpc_url: HttpUrl,
+    reputation_rpc_url: HttpUrl,
+    event_poll_interval: Duration,
+    slash_domain: alloy::dyn_abi::Eip712Domain,
+    voucher_domain: alloy::dyn_abi::Eip712Domain,
+    bind_domain: alloy::dyn_abi::Eip712Domain,
+    capacity_bond_addr: alloy::primitives::Address,
+    payment_channel_addr: alloy::primitives::Address,
+    head: Arc<dyn HeadSource>,
+    staker_set: Arc<dyn StakerSet>,
+    capacity_bond_watcher: Arc<crate::chain_events::resumable_watcher::WatcherHandle>,
+    slash_watcher: crate::slash_watcher::SlashWatcher,
+    slash_store: crate::slash_watcher::SlashStore,
+    node_address_resolver: Option<Arc<dyn crate::dht::NodeAddressResolver>>,
+    probe_rate_limiter: Arc<ProbeRateLimiter>,
+    probe_handler: Arc<ProbeHandler>,
+    dht_rate_limiter: Arc<DhtRateLimiter>,
+    record_store: Arc<std::sync::Mutex<RecordStore>>,
+    origin_directory: Arc<dyn crate::dht::origin::OriginDirectory>,
+    origin_watcher: Option<Arc<crate::chain_events::resumable_watcher::WatcherHandle>>,
+    prefetch_engine: Arc<crate::prefetch::PrefetchEngine>,
+    dht_handler: Arc<DhtHandler>,
+    dht_routing: Arc<std::sync::Mutex<crate::dht::RoutingTable>>,
+    peer_table: Arc<RwLock<PeerTable>>,
+    region_accountant: Arc<crate::region_accounting::RegionAccountant>,
+    client_handler: Arc<ClientHandler>,
+    payment_service: PaymentChannelService<P>,
+    voucher_activity: Arc<decdn_incentive::VoucherActivity>,
+    prefetch_shutdown: CancellationToken,
+    pull_through_bg_shutdown: CancellationToken,
+    blacklist_watcher: crate::chain_events::resumable_watcher::WatcherHandle,
+    blacklist_ready_rx: oneshot::Receiver<crate::blacklist_watcher::InitialSyncResult>,
+}
+
+/// Middle phase extracted verbatim from [`run`] (issue #1253 PR4): parse the
+/// chain contract addresses and EIP-712 domains, bootstrap the `CapacityBond`
+/// registry / slash / origin watchers, and construct the probe, client, and DHT
+/// handlers plus the seller-side [`PaymentChannelService`]. Borrows [`Infra`];
+/// the buyer-side provider/store construction and the background tasks stay in
+/// [`run`]. Returns [`ChainHandlers`], whose seller-wallet provider `P` [`run`]
+/// infers and threads into [`ShutdownHandles`].
 #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
-pub async fn run(
-    cfg: ResolvedConfig,
-    config_path: Option<PathBuf>,
-    reload_state: Arc<RuntimeReloadState>,
-) -> anyhow::Result<()> {
-    // Captured at the very top of `run()`, before any `await` or I/O,
-    // so `admin_v1_health.uptime_s` reflects the entire process lifetime
-    // — including the RPC reachability preflight below (which can spend
-    // up to its 5s timeout on flaky networks). Operators reasoning about
-    // "how long has this node been up?" want every second since `decdn
-    // run` was invoked, not just everything after the admin server bound.
-    let started_at = std::time::Instant::now();
-
-    let Infra {
-        node_metrics,
-        secret_key,
-        eth_signer,
-        concrete_channel_store,
-        channel_state_store,
-        pending_settle_store,
-        watcher_checkpoint_store,
-        receipt_writer_shutdown,
-        receipt_sink,
-        receipt_writer,
-        node_origin,
-        pull_through_origin,
-        cache,
-        ep,
-        gossip,
-        limiter,
-    } = Box::pin(build_infra(&cfg, &reload_state)).await?;
-
+async fn build_chain_and_handlers(
+    cfg: &ResolvedConfig,
+    reload_state: &RuntimeReloadState,
+    infra: &Infra,
+) -> anyhow::Result<ChainHandlers<impl Provider + Clone + 'static>> {
     // SlashJudge EIP-712 domain for probe `slash_sig` (ADR 014 §1–2). Parsed
     // through the shared zero-address guard (#1219) for a uniform "every daemon
     // contract address is non-zero" invariant. `resolve_blockchain` already
@@ -785,7 +790,7 @@ pub async fn run(
         event_poll_interval,
         Arc::clone(&head),
         cfg.cache.node_to_node_pull_through_enabled,
-        Arc::clone(&node_metrics),
+        Arc::clone(&infra.node_metrics),
     )
     .await
     .with_context(|| format!("CapacityBond registry bootstrap at {capacity_bond_addr}"))?;
@@ -806,11 +811,11 @@ pub async fn run(
     let slash_watcher = crate::slash_watcher::SlashWatcher::bootstrap(
         ProviderFactory::read_only(rpc_url.clone(), event_poll_interval),
         slash_judge_addr,
-        eth_signer.address(),
+        infra.eth_signer.address(),
         cfg.blockchain.slash_judge_from_block,
         event_poll_interval,
         Arc::clone(&head),
-        Arc::clone(&node_metrics),
+        Arc::clone(&infra.node_metrics),
     );
     let slash_store = slash_watcher.store();
 
@@ -858,17 +863,17 @@ pub async fn run(
     let probe_rate_limit_cfg = RateLimitConfig::from(&cfg.probe);
     let probe_rate_limiter = Arc::new(ProbeRateLimiter::new(
         &probe_rate_limit_cfg,
-        Arc::clone(&node_metrics),
+        Arc::clone(&infra.node_metrics),
     ));
 
     let probe_handler = Arc::new(ProbeHandler::new(
-        secret_key.public(),
+        infra.secret_key.public(),
         reload_state.rate_per_mb(),
-        Arc::clone(&node_metrics),
-        Arc::clone(&limiter),
+        Arc::clone(&infra.node_metrics),
+        Arc::clone(&infra.limiter),
         Arc::clone(&probe_rate_limiter),
-        cache.clone(),
-        Arc::clone(&eth_signer),
+        infra.cache.clone(),
+        Arc::clone(&infra.eth_signer),
         slash_domain.clone(),
         cfg.payment.delivery_floor,
         cfg.payment.delivery_ceiling,
@@ -892,7 +897,7 @@ pub async fn run(
     let dht_rate_limit_cfg = RateLimitConfig::from(&cfg.dht);
     let dht_rate_limiter = Arc::new(DhtRateLimiter::new(
         &dht_rate_limit_cfg,
-        Arc::clone(&node_metrics),
+        Arc::clone(&infra.node_metrics),
     ));
     // Record store sized from the ADR 022 defaults; per-publisher /
     // global / per-hash caps are pinned by the protocol and only the
@@ -942,11 +947,11 @@ pub async fn run(
                 publisher_registry_addr,
                 capacity_bond_addr,
                 cfg.blockchain.origin_directory_from_block,
-                Arc::clone(&watcher_checkpoint_store),
+                Arc::clone(&infra.watcher_checkpoint_store),
                 event_poll_interval,
                 Arc::clone(&head),
                 Arc::clone(&staker_set),
-                Arc::clone(&node_metrics),
+                Arc::clone(&infra.node_metrics),
             )
             .await
             .context("ChainOriginDirectory bootstrap")?;
@@ -964,20 +969,22 @@ pub async fn run(
         cfg.prefetch,
         Arc::clone(&origin_directory),
     ));
-    node_metrics.set_prefetch_enabled(prefetch_engine.enabled());
+    infra
+        .node_metrics
+        .set_prefetch_enabled(prefetch_engine.enabled());
     // Seed the demand-quality gauges once so they read a sane baseline
     // (ratio = 1.0, throttle = false) rather than a misleading `0` on nodes that
     // never hit a threshold-cross; the handler refreshes them only on a decision.
-    node_metrics.set_prefetch_quality(
+    infra.node_metrics.set_prefetch_quality(
         prefetch_engine.policy().demand_quality_ratio(0),
         prefetch_engine.policy().throttle_active(0),
     );
     let dht_handler = Arc::new(
         DhtHandler::new(
-            secret_key.public(),
+            infra.secret_key.public(),
             Arc::clone(&dht_rate_limiter),
-            Arc::clone(&limiter),
-            Arc::clone(&node_metrics),
+            Arc::clone(&infra.limiter),
+            Arc::clone(&infra.node_metrics),
             Arc::clone(&staker_set),
             Arc::clone(&record_store),
         )
@@ -1031,16 +1038,16 @@ pub async fn run(
     )));
 
     let client_handler = Arc::new(ClientHandler::new(
-        secret_key.public(),
-        Arc::clone(&node_metrics),
-        Arc::clone(&limiter),
-        cache.clone(),
-        Arc::clone(&eth_signer),
+        infra.secret_key.public(),
+        Arc::clone(&infra.node_metrics),
+        Arc::clone(&infra.limiter),
+        infra.cache.clone(),
+        Arc::clone(&infra.eth_signer),
         slash_domain.clone(),
         voucher_domain.clone(),
         bind_domain.clone(),
-        Arc::clone(&channel_state_store),
-        Arc::clone(&receipt_sink),
+        Arc::clone(&infra.channel_state_store),
+        Arc::clone(&infra.receipt_sink),
         reload_state.rate_per_mb(),
         cfg.payment.delivery_floor,
         cfg.payment.delivery_ceiling,
@@ -1067,15 +1074,18 @@ pub async fn run(
     // until restart. `SimpleNonceManager` stores nothing — each send re-reads
     // the pending nonce — so a failed send can't gap the lane. The buyer
     // provider below relies on this same property for the retried `reclaimExpired`.
-    let wallet_provider =
-        ProviderFactory::seller_wallet(rpc_url.clone(), (*eth_signer).clone(), event_poll_interval);
+    let wallet_provider = ProviderFactory::seller_wallet(
+        rpc_url.clone(),
+        (*infra.eth_signer).clone(),
+        event_poll_interval,
+    );
     let payment_service = PaymentChannelService::bootstrap(
         wallet_provider,
         payment_channel_addr,
-        eth_signer.address(),
-        Arc::clone(&channel_state_store),
-        Arc::clone(&pending_settle_store),
-        Arc::clone(&watcher_checkpoint_store),
+        infra.eth_signer.address(),
+        Arc::clone(&infra.channel_state_store),
+        Arc::clone(&infra.pending_settle_store),
+        Arc::clone(&infra.watcher_checkpoint_store),
         Arc::clone(&client_handler),
         U256::from(cfg.blockchain.redeem_threshold_micro_usdc),
         crate::payment_settlement::AutoSettleConfig {
@@ -1087,7 +1097,7 @@ pub async fn run(
         },
         event_poll_interval,
         Arc::clone(&head),
-        Arc::clone(&node_metrics),
+        Arc::clone(&infra.node_metrics),
     )
     .await
     .context("PaymentChannel settlement service bootstrap")?;
@@ -1192,7 +1202,7 @@ pub async fn run(
         // seed-leech caps. The deposit pre-check and per-request window apply
         // even without the governor; the governor adds the global budget + the
         // per-peer share ratio.
-        if let Some(origin) = &pull_through_origin {
+        if let Some(origin) = &infra.pull_through_origin {
             client_handler
                 .attach_window_pull_through(Arc::clone(origin), cfg.cache.pull_ahead_bytes);
             // The resolver already enforces `pull_ahead_bytes <=
@@ -1207,7 +1217,10 @@ pub async fn run(
                 })
                 .context("invalid seed-leech caps: opening window exceeds the global budget")?;
             client_handler.attach_leech_governor(Arc::new(
-                crate::leech_governor::LeechGovernor::new(leech_caps, Arc::clone(&node_metrics)),
+                crate::leech_governor::LeechGovernor::new(
+                    leech_caps,
+                    Arc::clone(&infra.node_metrics),
+                ),
             ));
         }
         // Optional content-authorization gate on the reactive pull-through path
@@ -1221,6 +1234,121 @@ pub async fn run(
             client_handler.attach_pull_origin_gate(Arc::clone(&origin_directory));
         }
     }
+
+    // Blacklist compliance watcher (ADR 011/031, issue #1031), spawned early in
+    // bring-up (where the router used to be built) so its mandatory first replay
+    // and operator-scope pass runs concurrently with the rest of startup. It
+    // evicts held blobs whose hash is
+    // blacklisted in scope for this operator, which cascades to DHT-announce
+    // suppression (the republisher's `is_evicted` gate), probe `has_blob:false`,
+    // and delivery refusal — the node's only local protection against the slash
+    // for serving blacklisted content. `blacklist_ready_rx` gates the ALPN
+    // router below on that first pass; the returned `WatcherHandle` owns the
+    // loop's shutdown token (its sink shares it, #1236), and because the watcher
+    // persists no cursor the handle's `AbortOnDrop` is a sufficient backstop
+    // after the graceful `shutdown()` at teardown.
+    let (blacklist_ready_tx, blacklist_ready_rx) = oneshot::channel();
+    let blacklist_watcher = crate::blacklist_watcher::spawn(
+        ProviderFactory::read_only(blacklist_rpc_url, event_poll_interval),
+        content_blacklist_addr,
+        infra.eth_signer.address(),
+        infra.cache.clone(),
+        cfg.blockchain.content_blacklist_from_block,
+        event_poll_interval,
+        Arc::clone(&head),
+        Duration::from_secs(cfg.blockchain.content_blacklist_poll_interval_sec),
+        blacklist_ready_tx,
+    );
+
+    // Bootstrap (ADR 022 §Bootstrap): seed the routing table from the
+    // active-staker set + parallel `FindNode(self.node_id)` against a
+    // fan-out of seeds. Best-effort — failures here log but don't
+    // abort startup.
+    let bootstrap_outcome = crate::dht::bootstrap::bootstrap(
+        &infra.ep,
+        infra.secret_key.public(),
+        &dht_routing,
+        &staker_set,
+    )
+    .await;
+    tracing::info!(
+        seeds = bootstrap_outcome.seeds_seen,
+        inserted = bootstrap_outcome.seeds_inserted,
+        find_node_ok = bootstrap_outcome.find_node_ok,
+        find_node_err = bootstrap_outcome.find_node_err,
+        closer_added = bootstrap_outcome.closer_peers_inserted,
+        "dht bootstrap complete"
+    );
+
+    Ok(ChainHandlers {
+        rpc_url,
+        reputation_rpc_url,
+        event_poll_interval,
+        slash_domain,
+        voucher_domain,
+        bind_domain,
+        capacity_bond_addr,
+        payment_channel_addr,
+        head,
+        staker_set,
+        capacity_bond_watcher,
+        slash_watcher,
+        slash_store,
+        node_address_resolver,
+        probe_rate_limiter,
+        probe_handler,
+        dht_rate_limiter,
+        record_store,
+        origin_directory,
+        origin_watcher,
+        prefetch_engine,
+        dht_handler,
+        dht_routing,
+        peer_table,
+        region_accountant,
+        client_handler,
+        payment_service,
+        voucher_activity,
+        prefetch_shutdown,
+        pull_through_bg_shutdown,
+        blacklist_watcher,
+        blacklist_ready_rx,
+    })
+}
+
+/// Build the endpoint, register handlers on a `Router`, spawn the metrics
+/// server and gossip tasks, and run until a shutdown signal is received.
+///
+/// SIGHUP triggers a hot-reload of mutable config fields via
+/// [`RuntimeReloadState`] (see issue #236). Other signals
+/// (SIGINT/SIGTERM) trigger graceful shutdown.
+///
+/// The signal streams (SIGHUP, SIGTERM) are registered **once** before
+/// the select loop and reused on every iteration. Re-creating
+/// `tokio::signal::unix::Signal` each iteration would race with signal
+/// delivery: a SIGHUP that arrives while `reload_runtime_config(..)` is
+/// running would have nowhere to land if the future holding the
+/// `Signal` had already been dropped, and would be silently lost. The
+/// persistent stream queues the signal until the next `recv()` call
+/// (kernel-managed, with coalescing) so concurrent or rapidly-repeated
+/// signals are observed deterministically.
+#[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
+pub async fn run(
+    cfg: ResolvedConfig,
+    config_path: Option<PathBuf>,
+    reload_state: Arc<RuntimeReloadState>,
+) -> anyhow::Result<()> {
+    // Captured at the very top of `run()`, before any `await` or I/O,
+    // so `admin_v1_health.uptime_s` reflects the entire process lifetime
+    // — including the RPC reachability preflight below (which can spend
+    // up to its 5s timeout on flaky networks). Operators reasoning about
+    // "how long has this node been up?" want every second since `decdn
+    // run` was invoked, not just everything after the admin server bound.
+    let started_at = std::time::Instant::now();
+
+    let infra = Box::pin(build_infra(&cfg, &reload_state)).await?;
+
+    let ch = Box::pin(build_chain_and_handlers(&cfg, &reload_state, &infra)).await?;
 
     // On-chain buyer-side service (#744). When this node pulls content from an
     // upstream provider on a cache miss it pays via the same channel mechanism,
@@ -1248,18 +1376,22 @@ pub async fn run(
     // on `SimpleNonceManager` re-reading the pending nonce each send (a transient
     // racing collision just gets a fresh nonce on the next attempt), not on the
     // sends being strictly serialized.
-    let buyer_wallet_provider =
-        ProviderFactory::buyer_wallet(rpc_url, (*eth_signer).clone(), event_poll_interval);
-    let buyer_channel_store: Arc<dyn decdn_incentive::BuyerChannelStore> = Arc::new(
-        crate::channel_store::BuyerChannelStoreHandle::new(Arc::clone(&concrete_channel_store)),
+    let buyer_wallet_provider = ProviderFactory::buyer_wallet(
+        ch.rpc_url,
+        (*infra.eth_signer).clone(),
+        ch.event_poll_interval,
     );
+    let buyer_channel_store: Arc<dyn decdn_incentive::BuyerChannelStore> =
+        Arc::new(crate::channel_store::BuyerChannelStoreHandle::new(
+            Arc::clone(&infra.concrete_channel_store),
+        ));
     // Buyer pending-settle set (#988): a SEPARATE redb table from the seller's
     // `pending_settle_store` above, so the buyer settle sweep and the seller
     // settle sweep never finalize each other's closes (keeps the #989 metric
     // families cleanly attributed).
     let buyer_pending_settle_store: Arc<dyn PendingSettleStore> =
         Arc::new(crate::channel_store::BuyerPendingSettleStoreHandle::new(
-            Arc::clone(&concrete_channel_store),
+            Arc::clone(&infra.concrete_channel_store),
         ));
     // The buyer-side PaymentChannel bootstrap (whose on-chain round-trips —
     // notably the one-time USDC `approve` receipt — historically blocked for many
@@ -1268,46 +1400,6 @@ pub async fn run(
     // background task spawned below (#1109), so the metrics/admin listeners and
     // the "node runtime ready" banner come up independent of any chain RPC. The
     // provider/store/pending handles built just above are moved into that task.
-
-    // Blacklist compliance watcher (ADR 011/031, issue #1031), spawned early in
-    // bring-up (where the router used to be built) so its mandatory first replay
-    // and operator-scope pass runs concurrently with the rest of startup. It
-    // evicts held blobs whose hash is
-    // blacklisted in scope for this operator, which cascades to DHT-announce
-    // suppression (the republisher's `is_evicted` gate), probe `has_blob:false`,
-    // and delivery refusal — the node's only local protection against the slash
-    // for serving blacklisted content. `blacklist_ready_rx` gates the ALPN
-    // router below on that first pass; the returned `WatcherHandle` owns the
-    // loop's shutdown token (its sink shares it, #1236), and because the watcher
-    // persists no cursor the handle's `AbortOnDrop` is a sufficient backstop
-    // after the graceful `shutdown()` at teardown.
-    let (blacklist_ready_tx, blacklist_ready_rx) = oneshot::channel();
-    let blacklist_watcher = crate::blacklist_watcher::spawn(
-        ProviderFactory::read_only(blacklist_rpc_url, event_poll_interval),
-        content_blacklist_addr,
-        eth_signer.address(),
-        cache.clone(),
-        cfg.blockchain.content_blacklist_from_block,
-        event_poll_interval,
-        Arc::clone(&head),
-        Duration::from_secs(cfg.blockchain.content_blacklist_poll_interval_sec),
-        blacklist_ready_tx,
-    );
-
-    // Bootstrap (ADR 022 §Bootstrap): seed the routing table from the
-    // active-staker set + parallel `FindNode(self.node_id)` against a
-    // fan-out of seeds. Best-effort — failures here log but don't
-    // abort startup.
-    let bootstrap_outcome =
-        crate::dht::bootstrap::bootstrap(&ep, secret_key.public(), &dht_routing, &staker_set).await;
-    tracing::info!(
-        seeds = bootstrap_outcome.seeds_seen,
-        inserted = bootstrap_outcome.seeds_inserted,
-        find_node_ok = bootstrap_outcome.find_node_ok,
-        find_node_err = bootstrap_outcome.find_node_err,
-        closer_added = bootstrap_outcome.closer_peers_inserted,
-        "dht bootstrap complete"
-    );
 
     let metrics_addr = std::net::SocketAddr::new(
         cfg.observability.metrics_bind,
@@ -1319,7 +1411,7 @@ pub async fn run(
 
     let (metrics_stop_tx, metrics_stop_rx) = oneshot::channel::<()>();
 
-    let metrics_handle = Arc::clone(&node_metrics);
+    let metrics_handle = Arc::clone(&infra.node_metrics);
     let mut tasks = JoinSet::new();
     tasks.spawn(async move {
         if let Err(err) = metrics::serve(metrics_listener, metrics_handle, metrics_stop_rx).await {
@@ -1336,7 +1428,7 @@ pub async fn run(
     // per minute. Stops on its own oneshot — same pattern as the
     // metrics and admin servers.
     let dispatch_gc_stop_tx = {
-        let limiter = Arc::clone(&limiter);
+        let limiter = Arc::clone(&infra.limiter);
         spawn_periodic(&mut tasks, "dispatch_gc", DISPATCH_GC_INTERVAL, move || {
             if let Some((before, after)) = limiter.gc_per_source() {
                 tracing::debug!(
@@ -1352,7 +1444,7 @@ pub async fn run(
     // Periodic per-region bandwidth log (#750). `interval == 0` disables it,
     // mirroring the RPC watchdog's opt-out. Same oneshot-stop shape as the GCs.
     let region_log_stop_tx = if cfg.observability.region_accounting_interval_sec > 0 {
-        let accountant = Arc::clone(&region_accountant);
+        let accountant = Arc::clone(&ch.region_accountant);
         Some(spawn_periodic(
             &mut tasks,
             "region_accounting_log",
@@ -1376,7 +1468,7 @@ pub async fn run(
     // LRU (front-walk in `RecordStore::gc`); default 60s is well below the
     // 1-hour record TTL.
     let record_store_gc_stop_tx = {
-        let records = Arc::clone(&record_store);
+        let records = Arc::clone(&ch.record_store);
         spawn_periodic(
             &mut tasks,
             "record_store_gc",
@@ -1417,7 +1509,7 @@ pub async fn run(
     // empty when the sweep died sits at `0` legitimately — indistinguishable
     // from a healthy sweep over an empty map.
     let dht_rate_limit_gc_stop_tx = {
-        let limiter = Arc::clone(&dht_rate_limiter);
+        let limiter = Arc::clone(&ch.dht_rate_limiter);
         spawn_periodic(
             &mut tasks,
             "dht_rate_limit_gc",
@@ -1433,7 +1525,7 @@ pub async fn run(
     // contract as the DHT GC above, for the `cdn/probe/v1` per-IP / per-peer
     // keyed maps.
     let probe_rate_limit_gc_stop_tx = {
-        let limiter = Arc::clone(&probe_rate_limiter);
+        let limiter = Arc::clone(&ch.probe_rate_limiter);
         spawn_periodic(
             &mut tasks,
             "probe_rate_limit_gc",
@@ -1451,7 +1543,7 @@ pub async fn run(
     // gap between the snapshot and the spawn.
     let republish_scheduler = Arc::new(crate::dht::RepublishScheduler::new());
     let (republish_stop_tx, republish_stop_rx) = oneshot::channel::<()>();
-    let cache_inserts_rx = cache.subscribe_inserts();
+    let cache_inserts_rx = infra.cache.subscribe_inserts();
     // Walk the on-disk store (NOT `access_times_snapshot`, which maps `Hash →
     // Instant` and is empty on every cold start) so every committed,
     // non-evicted blob gets a `uniform(0, 40 min)` republish entry per ADR
@@ -1459,7 +1551,7 @@ pub async fn run(
     // steady-state `subscribe_inserts` path catches only blobs newly fetched
     // post-boot — blobs already on disk that get cache-HIT requests are NOT
     // re-scheduled until the next successful restart.
-    let cold_start_count = match cache.iter_hashes().await {
+    let cold_start_count = match infra.cache.iter_hashes().await {
         Ok(hashes) => republish_scheduler.seed_cold_start(
             hashes
                 .into_iter()
@@ -1478,11 +1570,11 @@ pub async fn run(
         "republish scheduler seeded from existing cache (ADR 022 §Bootstrap cold-start)"
     );
     tasks.spawn(crate::dht::publish::run_republish(
-        ep.clone(),
-        secret_key.public(),
-        Arc::clone(&dht_routing),
+        infra.ep.clone(),
+        infra.secret_key.public(),
+        Arc::clone(&ch.dht_routing),
         Arc::clone(&republish_scheduler),
-        cache.clone(),
+        infra.cache.clone(),
         cache_inserts_rx,
         republish_stop_rx,
     ));
@@ -1498,9 +1590,9 @@ pub async fn run(
     // reads it for the routing-table health view (issue #741).
     let bucket_refresh_clock = Arc::new(std::sync::atomic::AtomicU64::new(0));
     tasks.spawn(crate::dht::bucket_refresh::run_bucket_refresh(
-        ep.clone(),
-        secret_key.public(),
-        Arc::clone(&dht_routing),
+        infra.ep.clone(),
+        infra.secret_key.public(),
+        Arc::clone(&ch.dht_routing),
         bucket_refresh_stop_rx,
         crate::dht::bucket_refresh::BUCKET_REFRESH_TICK,
         Arc::clone(&bucket_refresh_clock),
@@ -1520,7 +1612,7 @@ pub async fn run(
     // — which alerts would (correctly, by their own logic) read as an
     // outage. Seeding before the watchdog-spawn branch covers the
     // `interval == 0` case too.
-    node_metrics.rpc_healthy(true);
+    infra.node_metrics.rpc_healthy(true);
     let rpc_watchdog = if cfg.blockchain.rpc_watchdog_interval_sec > 0 {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(5))
@@ -1532,7 +1624,7 @@ pub async fn run(
             client,
             cfg.blockchain.rpc_url.clone(),
             interval,
-            Arc::clone(&node_metrics),
+            Arc::clone(&infra.node_metrics),
             rx,
         );
         Some((tx, handle))
@@ -1570,9 +1662,10 @@ pub async fn run(
     // fresh by the CapacityBond event tail) — not a static allowlist. Bootstrap
     // failure already aborted startup above, so this is always `Some`
     // (`announce_staked_gate` is the unit-tested guarantee of that).
-    let announce_staked = crate::reputation_wiring::announce_staked_gate(Arc::clone(&staker_set));
+    let announce_staked =
+        crate::reputation_wiring::announce_staked_gate(Arc::clone(&ch.staker_set));
     let gossip_metrics: Arc<dyn GossipMetrics> =
-        Arc::new(NodeGossipMetrics::new(Arc::clone(&node_metrics)));
+        Arc::new(NodeGossipMetrics::new(Arc::clone(&infra.node_metrics)));
 
     // Network reputation aggregation (ADR 008, #326). The settlement indexer
     // (spawned after the gossip service below) feeds `settlement_source` with
@@ -1616,12 +1709,12 @@ pub async fn run(
             Arc::clone(&network_reputation),
             Arc::clone(&regional_coverage),
             Arc::clone(&settlement_source),
-            Arc::clone(&peer_table),
-            Arc::clone(&staker_set),
+            Arc::clone(&ch.peer_table),
+            Arc::clone(&ch.staker_set),
             min_counterparties,
         ))),
         staked: Some(Arc::new(crate::reputation_wiring::NodeStakedNodeSet::new(
-            Arc::clone(&staker_set),
+            Arc::clone(&ch.staker_set),
         ))),
         // Outbound report capture (#831): the `NodeOrigin` pull path feeds
         // `observation_buffer` with delivery/probe outcomes, so wire the drain —
@@ -1650,17 +1743,17 @@ pub async fn run(
     // Precompute every cfg/secret-derived value the task needs: the closure is
     // `'static` so it can't borrow `cfg`/`secret_key`, and those are used later.
     let (buyer_bootstrap_stop_tx, buyer_bootstrap_stop_rx) = oneshot::channel::<()>();
-    let buyer_voucher_domain = voucher_domain;
+    let buyer_voucher_domain = ch.voucher_domain;
     let buyer_default_deposit = U256::from(cfg.blockchain.buyer_deposit_micro_usdc);
     let buyer_ensure_max_approval = cfg.blockchain.buyer_max_approve;
-    let buyer_signer_address = eth_signer.address();
+    let buyer_signer_address = infra.eth_signer.address();
     let pull_through_enabled = cfg.cache.node_to_node_pull_through_enabled;
-    let node_origin_self_id = crate::dht::NodeId::from_bytes(*secret_key.public().as_bytes());
-    let node_origin_slash_domain = slash_domain;
+    let node_origin_self_id = crate::dht::NodeId::from_bytes(*infra.secret_key.public().as_bytes());
+    let node_origin_slash_domain = ch.slash_domain;
     // #1117: the `CapacityBond` bind domain this node signs its node→node client
     // identity binding under — reuses the serving-side `bind_domain` constructed
     // once above so an upstream verifies against an identical domain.
-    let node_origin_bind_domain = bind_domain;
+    let node_origin_bind_domain = ch.bind_domain;
     let node_origin_config = crate::node_origin::NodeOriginConfig {
         probe_fanout: cfg.cache.node_pull_probe_fanout,
         pull_timeout: std::time::Duration::from_secs(cfg.cache.node_pull_timeout_sec),
@@ -1679,21 +1772,21 @@ pub async fn run(
     let node_origin_prefetch_enabled = cfg.prefetch.enabled;
     let node_origin_reputation_cfg = reputation_cfg.clone();
     // Arc/handle clones for the task — the originals are used later in `run()`.
-    let ep_for_buyer = ep.clone();
-    let eth_signer_for_buyer = Arc::clone(&eth_signer);
-    let resolver_opt = node_address_resolver.clone();
-    let node_origin_opt = node_origin.clone();
-    let dht_routing_c = Arc::clone(&dht_routing);
-    let staker_set_c = Arc::clone(&staker_set);
-    let origin_directory_c = Arc::clone(&origin_directory);
+    let ep_for_buyer = infra.ep.clone();
+    let eth_signer_for_buyer = Arc::clone(&infra.eth_signer);
+    let resolver_opt = ch.node_address_resolver.clone();
+    let node_origin_opt = infra.node_origin.clone();
+    let dht_routing_c = Arc::clone(&ch.dht_routing);
+    let staker_set_c = Arc::clone(&ch.staker_set);
+    let origin_directory_c = Arc::clone(&ch.origin_directory);
     let local_reputation_c = Arc::clone(&local_reputation);
     let observation_buffer_c = Arc::clone(&observation_buffer);
     let network_reputation_c = Arc::clone(&network_reputation);
-    let region_accountant_c = Arc::clone(&region_accountant);
-    let prefetch_engine_c = Arc::clone(&prefetch_engine);
-    let node_metrics_for_buyer = Arc::clone(&node_metrics);
-    let node_metrics_for_origin = Arc::clone(&node_metrics);
-    let node_metrics_for_observer = Arc::clone(&node_metrics);
+    let region_accountant_c = Arc::clone(&ch.region_accountant);
+    let prefetch_engine_c = Arc::clone(&ch.prefetch_engine);
+    let node_metrics_for_buyer = Arc::clone(&infra.node_metrics);
+    let node_metrics_for_origin = Arc::clone(&infra.node_metrics);
+    let node_metrics_for_observer = Arc::clone(&infra.node_metrics);
     let mut buyer_bootstrap_stop_rx = buyer_bootstrap_stop_rx;
     tasks.spawn(async move {
         let service = tokio::select! {
@@ -1702,7 +1795,7 @@ pub async fn run(
             _ = &mut buyer_bootstrap_stop_rx => return,
             res = crate::buyer_channel::BuyerChannelService::bootstrap(
                 buyer_wallet_provider,
-                payment_channel_addr,
+                ch.payment_channel_addr,
                 buyer_signer_address,
                 buyer_channel_store,
                 eth_signer_for_buyer,
@@ -1726,7 +1819,7 @@ pub async fn run(
                 Err(err) => {
                     tracing::warn!(
                         err = %sanitize_rpc_display(&err),
-                        %payment_channel_addr,
+                        payment_channel_addr = %ch.payment_channel_addr,
                         "buyer-side PaymentChannel bootstrap failed; node→node paid cache-miss \
                          pulls are DISABLED for this process (seller settlement is unaffected). \
                          This condition is sticky — restart the node to retry. Check: (1) \
@@ -1829,10 +1922,10 @@ pub async fn run(
     // `cache.populate`, which uses the node-origin pull path provisioned above;
     // with pull-through off the populate just misses (no network spend).
     if cfg.prefetch.enabled {
-        prefetch_engine.provision_acquirer(
-            cache.clone(),
-            Arc::clone(&node_metrics),
-            prefetch_shutdown.clone(),
+        ch.prefetch_engine.provision_acquirer(
+            infra.cache.clone(),
+            Arc::clone(&infra.node_metrics),
+            ch.prefetch_shutdown.clone(),
         );
         tracing::info!(
             max_concurrent = cfg.prefetch.max_concurrent_acquisitions,
@@ -1858,11 +1951,11 @@ pub async fn run(
         // aggregates inbound reports but emits none.
         reputation_publish_trigger: _,
     } = GossipService::spawn(
-        ep.clone(),
-        secret_key.clone(),
-        gossip.clone(),
+        infra.ep.clone(),
+        infra.secret_key.clone(),
+        infra.gossip.clone(),
         gossip_runtime_cfg,
-        Arc::clone(&peer_table),
+        Arc::clone(&ch.peer_table),
         gossip_metrics,
         gossip_shutdown.clone(),
         announce_staked,
@@ -1879,13 +1972,13 @@ pub async fn run(
     // still starts (weights stay 0).
     let settlement_indexer = if cfg.gossip.subscribe_reputation {
         match crate::reputation_indexer::SettlementIndexer::bootstrap(
-            ProviderFactory::read_only(reputation_rpc_url, event_poll_interval),
-            payment_channel_addr,
-            capacity_bond_addr,
+            ProviderFactory::read_only(ch.reputation_rpc_url, ch.event_poll_interval),
+            ch.payment_channel_addr,
+            ch.capacity_bond_addr,
             Arc::clone(&settlement_source),
-            event_poll_interval,
-            Arc::clone(&head),
-            Arc::clone(&node_metrics),
+            ch.event_poll_interval,
+            Arc::clone(&ch.head),
+            Arc::clone(&infra.node_metrics),
         )
         .await
         {
@@ -1955,22 +2048,22 @@ pub async fn run(
             config_path: path.clone(),
         });
         let state = admin::AdminState::new(
-            Arc::clone(&peer_table),
-            *secret_key.public().as_bytes(),
+            Arc::clone(&ch.peer_table),
+            *infra.secret_key.public().as_bytes(),
             started_at,
-            cache.clone(),
+            infra.cache.clone(),
             announce_trigger,
             reload_hook,
             Arc::clone(&drain_trigger),
-            Arc::clone(&eth_signer),
-            Arc::clone(&node_metrics),
+            Arc::clone(&infra.eth_signer),
+            Arc::clone(&infra.node_metrics),
         )
         // DHT introspection for `admin_v1_status` (issue #741). All handles
         // are clones of state the DHT tasks already share — read-only here.
         .with_dht(admin::DhtStatusHandles {
-            routing: Arc::clone(&dht_routing),
-            staker_set: Arc::clone(&staker_set),
-            record_store: Arc::clone(&record_store),
+            routing: Arc::clone(&ch.dht_routing),
+            staker_set: Arc::clone(&ch.staker_set),
+            record_store: Arc::clone(&ch.record_store),
             republish: Arc::clone(&republish_scheduler),
             refresh_clock: Arc::clone(&bucket_refresh_clock),
             refresh_interval: crate::dht::bucket_refresh::BUCKET_REFRESH_TICK,
@@ -1980,11 +2073,11 @@ pub async fn run(
         // and settlement service use, plus the in-memory voucher-activity
         // clock — read-only here.
         .with_channels(admin::ChannelStatusHandles {
-            channel_store: Arc::clone(&channel_state_store),
-            voucher_activity: Arc::clone(&voucher_activity),
+            channel_store: Arc::clone(&infra.channel_state_store),
+            voucher_activity: Arc::clone(&ch.voucher_activity),
             redeem_threshold_micro_usdc: cfg.blockchain.redeem_threshold_micro_usdc,
         })
-        .with_region_accountant(Arc::clone(&region_accountant))
+        .with_region_accountant(Arc::clone(&ch.region_accountant))
         // Reputation introspection for `admin_v1_reputation` (#326). Shares the
         // same aggregation state the gossip reputation sink updates.
         .with_reputation(admin::ReputationStatusHandles {
@@ -1994,7 +2087,7 @@ pub async fn run(
         // Slash-detection introspection for `admin_v1_slashes` (#1032). Shares
         // the in-memory store the watcher appends to — read-only here.
         .with_slash_detection(admin::SlashStatusHandles {
-            store: Arc::clone(&slash_store),
+            store: Arc::clone(&ch.slash_store),
         });
         tasks.spawn(async move {
             if let Err(err) = admin::serve(listener, state, rx).await {
@@ -2012,7 +2105,7 @@ pub async fn run(
     // log aggregators key on them.
     tracing::info!(
         event = "startup_banner",
-        node_id = %secret_key.public(),
+        node_id = %infra.secret_key.public(),
         version = env!("CARGO_PKG_VERSION"),
         region = cfg.identity.region.as_deref().unwrap_or(""),
         bind_port = cfg.network.bind_port,
@@ -2032,13 +2125,13 @@ pub async fn run(
         config_path.as_deref(),
         &drain_trigger,
         ServeInputs {
-            ep,
-            probe_handler,
-            client_handler,
-            dht_handler,
-            gossip,
-            limiter,
-            blacklist_ready_rx,
+            ep: infra.ep,
+            probe_handler: ch.probe_handler,
+            client_handler: ch.client_handler,
+            dht_handler: ch.dht_handler,
+            gossip: infra.gossip,
+            limiter: infra.limiter,
+            blacklist_ready_rx: ch.blacklist_ready_rx,
         },
     )
     .await?;
@@ -2053,24 +2146,24 @@ pub async fn run(
         probe_rate_limit_gc_stop_tx,
         republish_stop_tx,
         bucket_refresh_stop_tx,
-        blacklist_watcher,
-        origin_watcher,
-        watcher_checkpoint_store,
+        blacklist_watcher: ch.blacklist_watcher,
+        origin_watcher: ch.origin_watcher,
+        watcher_checkpoint_store: infra.watcher_checkpoint_store,
         admin_stop_tx,
         rpc_watchdog,
         gossip_shutdown,
-        capacity_bond_watcher,
-        slash_watcher,
+        capacity_bond_watcher: ch.capacity_bond_watcher,
+        slash_watcher: ch.slash_watcher,
         settlement_indexer,
-        pull_through_bg_shutdown,
-        prefetch_shutdown,
-        receipt_writer_shutdown,
-        payment_service,
+        pull_through_bg_shutdown: ch.pull_through_bg_shutdown,
+        prefetch_shutdown: ch.prefetch_shutdown,
+        receipt_writer_shutdown: infra.receipt_writer_shutdown,
+        payment_service: ch.payment_service,
         gossip_handles,
-        receipt_writer,
+        receipt_writer: infra.receipt_writer,
         tasks,
     };
-    shutdown(handles, router, signal, &drain_trigger, cache).await
+    shutdown(handles, router, signal, &drain_trigger, infra.cache).await
 }
 
 /// Owned teardown state handed from [`run`] to [`shutdown`]. Every field is a
