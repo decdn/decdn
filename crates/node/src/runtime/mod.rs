@@ -2179,18 +2179,18 @@ pub async fn run(
     // run` was invoked, not just everything after the admin server bound.
     let started_at = std::time::Instant::now();
 
-    let infra = Box::pin(build_infra(&cfg, &reload_state)).await?;
+    let infra = build_infra(&cfg, &reload_state).await?;
 
-    let ch = Box::pin(build_chain_and_handlers(&cfg, &reload_state, &infra)).await?;
+    let ch = build_chain_and_handlers(&cfg, &reload_state, &infra).await?;
 
-    let bg = Box::pin(spawn_background_tasks(
+    let bg = spawn_background_tasks(
         &cfg,
         config_path.as_ref(),
         &reload_state,
         &infra,
         &ch,
         started_at,
-    ))
+    )
     .await?;
 
     let (router, signal) = serve_until_shutdown(
