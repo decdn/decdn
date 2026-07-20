@@ -120,7 +120,7 @@ library SlashEscrowLib {
         SlashRecord storage r = records[slashId];
         if (r.status != SlashStatus.Escrowed) revert SlashNotEscrowed(slashId);
         // Filing window extended by the cumulative paused duration so a pause
-        // never silently consumes the operator's window (ADR 028 §5).
+        // never silently consumes the operator's window (ADR 028 § Hard caps and frequency limits).
         uint64 closeAt = r.appealWindowClose + pausedTotal;
         // forge-lint: disable-next-line(block-timestamp)
         if (block.timestamp <= closeAt) revert FilingWindowStillOpen(closeAt);
@@ -128,7 +128,7 @@ library SlashEscrowLib {
     }
 
     /// @notice Flip an `Escrowed` record to `AppealOpen` within the filing
-    ///         window (ADR 028 §5). The single on-chain enforcer of the filing
+    ///         window (ADR 028 § Hard caps and frequency limits). The single on-chain enforcer of the filing
     ///         deadline; once open, `finalizeUnappealed` can no longer race it.
     function markAppealOpen(
         mapping(uint256 => SlashRecord) storage records,

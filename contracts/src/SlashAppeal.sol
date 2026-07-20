@@ -110,7 +110,7 @@ contract SlashAppeal is ISlashAppeal, AccessControl, ReentrancyGuard, Sunsetting
     ///         unpause it is credited to `CapacityBond.pausedTotal` (the single
     ///         combined counter), and the review / ratification window checks
     ///         read that combined value, so a pause on either contract extends
-    ///         every window uniformly (ADR 028 §5).
+    ///         every window uniformly (ADR 028 § Hard caps and frequency limits).
     uint64 internal _pausedAt;
 
     // -----------------------------------------------------------------
@@ -192,7 +192,7 @@ contract SlashAppeal is ISlashAppeal, AccessControl, ReentrancyGuard, Sunsetting
     ///      out of `Escrowed`), so a permissionless filer would let anyone —
     ///      notably the challenger, who earns 50% of an upheld slash — burn the
     ///      operator's only chance at recourse with a junk appeal. Requiring the
-    ///      operator closes that griefing/front-running vector (ADR 028 §1).
+    ///      operator closes that griefing/front-running vector (ADR 028 § Contract surface).
     // slither-disable-next-line reentrancy-no-eth,unused-return
     function openSlashAppeal(uint256 slashId, bytes32 evidenceBundleHash) external override nonReentrant whenNotPaused {
         // `slashRecords` is a view on the trusted, immutable `CapacityBond`;
@@ -289,7 +289,7 @@ contract SlashAppeal is ISlashAppeal, AccessControl, ReentrancyGuard, Sunsetting
     ///      degrade gracefully to a 100% bond burn — matching `rejectAppeal` —
     ///      rather than reverting; otherwise a misconfiguration would block the
     ///      uphold and let `cleanupExpiredAppeal` flip it to an operator-
-    ///      favorable grant after the ratification window (ADR 028 §3).
+    ///      favorable grant after the ratification window (ADR 028 § Appeal flow).
     function upholdAppeal(uint256 slashId) external override nonReentrant whenNotPaused onlyRole(GOVERNANCE_ROLE) {
         Appeal storage a = _appeals[slashId];
         if (a.status != AppealStatus.FastTracked) revert AppealNotFastTracked(slashId);
@@ -334,7 +334,7 @@ contract SlashAppeal is ISlashAppeal, AccessControl, ReentrancyGuard, Sunsetting
         if (a.status == AppealStatus.Open) {
             // Review window extended by the combined paused duration (this
             // contract's pauses + CapacityBond's) so a pause on either never
-            // silently consumes the multisig's window (ADR 028 §5).
+            // silently consumes the multisig's window (ADR 028 § Hard caps and frequency limits).
             uint64 readyAt = a.openedAt + uint64(APPEAL_REVIEW_WINDOW) + combinedPaused;
             // forge-lint: disable-next-line(block-timestamp)
             if (block.timestamp < readyAt) revert ReviewWindowOpen(readyAt);
@@ -401,7 +401,7 @@ contract SlashAppeal is ISlashAppeal, AccessControl, ReentrancyGuard, Sunsetting
     }
 
     /// @dev Stamp the pause start so `_unpause` can credit the duration to the
-    ///      combined `CapacityBond.pausedTotal` (ADR 028 §5 window extension).
+    ///      combined `CapacityBond.pausedTotal` (ADR 028 § Hard caps and frequency limits — window extension).
     function _pause() internal override {
         // forge-lint: disable-next-line(block-timestamp)
         _pausedAt = uint64(block.timestamp);
