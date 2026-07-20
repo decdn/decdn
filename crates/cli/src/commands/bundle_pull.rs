@@ -319,14 +319,13 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
 
     /// Fetch one blob after normal explicit selection or discovery.
     async fn fetch(&self, hash: [u8; 32]) -> anyhow::Result<Vec<u8>> {
-        let (node_id, provider) = self.pick(hash).await?;
-        self.fetch_from(hash, node_id, provider).await
+        Ok(self.fetch_with_target(hash).await?.0)
     }
 
     /// Fetch one blob and retain the target chosen for it.
     async fn fetch_with_target(&self, hash: [u8; 32]) -> anyhow::Result<(Vec<u8>, FetchTarget)> {
         let target = self.pick(hash).await?;
-        let bytes = self.fetch_from(hash, target.0, target.1).await?;
+        let bytes = self.fetch_from(hash, target).await?;
         Ok((bytes, target))
     }
 
@@ -334,8 +333,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
     async fn fetch_from(
         &self,
         hash: [u8; 32],
-        node_id: PublicKey,
-        provider: Address,
+        (node_id, provider): FetchTarget,
     ) -> anyhow::Result<Vec<u8>> {
         // Serialize all access to this provider's channel: the open-or-reuse +
         // voucher-signing critical section must be atomic per channel.
@@ -422,7 +420,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             hash,
             preferred,
             self.explicit.is_some(),
-            |hash, (node_id, provider)| self.fetch_from(hash, node_id, provider),
+            |hash, target| self.fetch_from(hash, target),
             |hash| self.pick(hash),
         )
         .await
@@ -821,6 +819,63 @@ mod tests {
             ),
             "{err:#}"
         );
+        assert_eq!(*discoveries.borrow(), 0);
+        assert_eq!(preferred.get(), 1);
+    }
+
+    /// The delivery-side gate is load-bearing in the money sense, so pin it from
+    /// this side too (`StreamError`'s own domain split is covered in
+    /// `decdn_protocol`). `VoucherRejected` is the one code that arrives ONLY
+    /// mid-stream — after bytes were delivered and paid for — and it reports a
+    /// buyer-side voucher fault that would follow us to the next node. Falling
+    /// back on it would re-fetch and re-pay the chunk to lose the same way twice,
+    /// once per remaining chunk.
+    #[tokio::test]
+    async fn voucher_rejection_does_not_fall_back() {
+        let preferred = std::cell::Cell::new(1u8);
+        let fetches = Rc::new(RefCell::new(0u8));
+        let discoveries = Rc::new(RefCell::new(0u8));
+
+        let err = fetch_preferred(
+            [1u8; 32],
+            &preferred,
+            false,
+            {
+                let fetches = Rc::clone(&fetches);
+                move |_, _| {
+                    let fetches = Rc::clone(&fetches);
+                    async move {
+                        *fetches.borrow_mut() += 1;
+                        Err(anyhow::Error::new(decdn_client_pull::UpstreamRefused {
+                            error: decdn_protocol::StreamError::VoucherRejected {
+                                reason: decdn_protocol::VoucherRejectReason::WrongSigner,
+                            },
+                        }))
+                    }
+                }
+            },
+            {
+                let discoveries = Rc::clone(&discoveries);
+                move |_| {
+                    let discoveries = Rc::clone(&discoveries);
+                    async move {
+                        *discoveries.borrow_mut() += 1;
+                        Ok(2u8)
+                    }
+                }
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                err.downcast_ref::<decdn_client_pull::UpstreamRefused>(),
+                Some(refused) if refused.error.is_mid_stream()
+            ),
+            "{err:#}"
+        );
+        assert_eq!(*fetches.borrow(), 1, "the refusal must not be retried");
         assert_eq!(*discoveries.borrow(), 0);
         assert_eq!(preferred.get(), 1);
     }
