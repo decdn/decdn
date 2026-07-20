@@ -23,4 +23,6 @@ pub use service::{
     AnnounceTrigger, GossipHandles, GossipRuntimeConfig, GossipService, GossipSpawnError,
     ReputationPublishTrigger, ReputationWiring, build_gossip,
 };
-pub use validation::{AnnounceReject, GOSSIP_MAX_FRAME, validate_envelope};
+pub use validation::{
+    AnnounceGate, AnnounceReject, GOSSIP_MAX_FRAME, OwnedAnnounceGate, validate_envelope,
+};

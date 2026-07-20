@@ -1680,10 +1680,10 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
     // ADR 001 rule 2: a NodeAnnounce is accepted only from a currently-staked
     // node. Enforced against the live on-chain registry (`staker_set`, kept
     // fresh by the CapacityBond event tail) — not a static allowlist. Bootstrap
-    // failure already aborted startup above, so this is always `Some`
-    // (`announce_staked_gate` is the unit-tested guarantee of that).
-    let announce_staked =
-        crate::reputation_wiring::announce_staked_gate(Arc::clone(&ch.staker_set));
+    // failure already aborted startup above, so this is always
+    // `AnnounceGate::Enforce` (`announce_staked_gate` is the unit-tested
+    // guarantee of that).
+    let announce_gate = crate::reputation_wiring::announce_staked_gate(Arc::clone(&ch.staker_set));
     let gossip_metrics: Arc<dyn GossipMetrics> =
         Arc::new(NodeGossipMetrics::new(Arc::clone(&infra.node_metrics)));
 
@@ -1979,7 +1979,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
         Arc::clone(&ch.peer_table),
         gossip_metrics,
         gossip_shutdown.clone(),
-        announce_staked,
+        announce_gate,
         reputation_wiring,
     )
     .await

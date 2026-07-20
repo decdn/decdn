@@ -23,7 +23,9 @@ use crate::reputation::{
     MAX_REPORTS_PER_REPORTER_PER_HR, ReportDrain, ReputationRateLimiter, ReputationSink,
     StakedNodeSet, validate_reputation_envelope,
 };
-use crate::{AnnounceReject, GossipMetrics, InsertOutcome, PeerTable, validate_envelope};
+use crate::{
+    AnnounceReject, GossipMetrics, InsertOutcome, OwnedAnnounceGate, PeerTable, validate_envelope,
+};
 
 /// Label passed to [`GossipMetrics::inc_rejected`] when a topic subscribe
 /// call fails at startup. Pinned by the label-stability test in
@@ -214,10 +216,10 @@ impl GossipService {
     /// an error-level log line; the old code merely `warn!`'d and left the
     /// subscriber task silently dead.
     ///
-    /// `staked` gates `NodeAnnounce` admission to currently-staked nodes (ADR 001
-    /// rule 2). The runtime always passes `Some(live registry set)`; `None`
-    /// (accept any signature-valid announce) is for tests only — there is no
-    /// production path that disables the gate.
+    /// `gate` admits `NodeAnnounce` per ADR 001 rule 2. The runtime always
+    /// passes [`AnnounceGate::Enforce`] over the live registry set;
+    /// [`AnnounceGate::Disabled`] (accept any signature-valid announce) is for
+    /// tests only — there is no production path that disables the gate.
     #[allow(
         clippy::too_many_arguments,
         clippy::needless_pass_by_value,
@@ -231,7 +233,7 @@ impl GossipService {
         peer_table: Arc<RwLock<PeerTable>>,
         metrics: Arc<dyn GossipMetrics>,
         shutdown: CancellationToken,
-        staked: Option<Arc<dyn StakedNodeSet>>,
+        gate: OwnedAnnounceGate,
         reputation: ReputationWiring,
     ) -> Result<GossipHandles, GossipSpawnError> {
         let topics = build_topic_list(&cfg);
@@ -316,7 +318,7 @@ impl GossipService {
                 wiring,
                 gossip.clone(),
                 self_node_id,
-                staked.clone(),
+                gate.clone(),
                 Arc::clone(&peer_table),
                 Arc::clone(&metrics),
                 shutdown.clone(),
@@ -542,7 +544,7 @@ fn subscriber_task(
     wiring: TopicWiring,
     gossip: Gossip,
     self_node_id: [u8; 32],
-    staked: Option<Arc<dyn StakedNodeSet>>,
+    gate: OwnedAnnounceGate,
     peer_table: Arc<RwLock<PeerTable>>,
     metrics: Arc<dyn GossipMetrics>,
     shutdown: CancellationToken,
@@ -596,7 +598,7 @@ fn subscriber_task(
                 // share the same timestamp (avoids a race if the system clock
                 // moves between the two reads) and halves the syscall cost.
                 let now = now_us();
-                match validate_envelope(&msg.content, now, staked.as_deref()) {
+                match validate_envelope(&msg.content, now, gate.as_gate()) {
                     Ok(announce) if is_self_announce(&announce, &self_node_id) => {
                         // Echo of our own announce (#845): drop it before it
                         // reaches `dispatch_insert` — inserting ourselves into
@@ -1414,7 +1416,7 @@ mod tests {
             peer_table,
             metrics,
             shutdown.clone(),
-            None,
+            OwnedAnnounceGate::Disabled,
             ReputationWiring::default(),
         )
         .await
@@ -1508,7 +1510,7 @@ mod tests {
             peer_table,
             metrics,
             shutdown.clone(),
-            None,
+            OwnedAnnounceGate::Disabled,
             wiring,
         )
         .await
@@ -1579,7 +1581,7 @@ mod tests {
             peer_table,
             metrics,
             shutdown.clone(),
-            None,
+            OwnedAnnounceGate::Disabled,
             wiring,
         )
         .await
