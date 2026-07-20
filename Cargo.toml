@@ -118,11 +118,6 @@ async-compression = { version = "0.4", features = ["tokio", "gzip", "zstd"] }
 walkdir = "2"
 globset = "0.4"
 blake3 = "1"
-# Cross-process advisory `flock` for `decdn`'s chunk-reconstruction part dir
-# (#1303): serializes concurrent invocations sharing one client data dir. Already
-# in the tree transitively; `fs` is the only feature the CLI needs. `flock` frees
-# on close, so a crashed holder leaves no stale lock.
-rustix = { version = "1", features = ["fs"] }
 
 # HTTP client (used by cache-origin backend)
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream", "json"] }

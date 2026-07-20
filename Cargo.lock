@@ -2668,7 +2668,6 @@ dependencies = [
  "postcard",
  "rand 0.10.2",
  "reqwest",
- "rustix",
  "serde",
  "serde_json",
  "tempfile",

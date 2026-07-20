@@ -26,7 +26,6 @@
 //! so raw single-blob downloads are untouched by this path.
 
 use std::future::Future;
-use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, bail};
@@ -225,13 +224,13 @@ where
 
     // Cross-process advisory lock (#1303). `bundle pull`'s per-hash dedup already
     // guarantees a single reconstruction of this manifest *within* one process;
-    // this `flock` extends that guarantee across separate `decdn` invocations
-    // sharing `downloads_root`, which would otherwise share this part directory —
-    // one process's `--no-keep-blobs` cleanup deleting parts mid-concatenate in
-    // the other, or both re-fetching and re-paying for every chunk. Held for the
-    // whole reconstruction (fetch → concat → optional cleanup) and released when
-    // `_lock` drops. `flock` frees on close, so a crashed holder needs no staleness
-    // policy.
+    // this lock extends that guarantee across separate `decdn` invocations sharing
+    // `downloads_root`, which would otherwise share this part directory — one
+    // process's `--no-keep-blobs` cleanup deleting parts mid-concatenate in the
+    // other, or both re-fetching and re-paying for every chunk. Held for the whole
+    // reconstruction (fetch → concat → optional cleanup) and released when `_lock`
+    // drops. The OS frees the lock on handle close, so a crashed holder needs no
+    // staleness policy.
     let _lock = {
         let root = downloads_root.to_path_buf();
         let name = hex(&manifest_hash);
@@ -400,19 +399,28 @@ where
 /// Blocking until the holder finishes is intended: the waiter then finds the
 /// holder's verified parts (default retention — free) or re-fetches them
 /// (`--no-keep-blobs`, a separate cross-process payment).
-fn acquire_part_lock(downloads_root: &Path, hex_name: &str) -> anyhow::Result<OwnedFd> {
-    use rustix::fs::{FlockOperation, Mode, OFlags, flock, open};
-
+///
+/// [`std::fs::File::lock`] (stable since Rust 1.89; MSRV here is 1.95) is a
+/// cross-platform OS advisory lock — `flock` on Unix, `LockFileEx` on Windows —
+/// so the CLI builds and locks on every release target including
+/// `x86_64-pc-windows-msvc`, with no third-party dependency. The returned
+/// [`File`](std::fs::File) *is* the lock guard: the OS releases the lock when it
+/// is dropped (or the process exits), so no unlock/staleness bookkeeping is
+/// needed.
+fn acquire_part_lock(downloads_root: &Path, hex_name: &str) -> anyhow::Result<std::fs::File> {
     let lock_path = downloads_root.join(format!("{hex_name}.lock"));
-    let fd = open(
-        &lock_path,
-        OFlags::CREATE | OFlags::RDWR | OFlags::CLOEXEC,
-        Mode::RUSR | Mode::WUSR,
-    )
-    .with_context(|| format!("open lock file {}", lock_path.display()))?;
-    flock(&fd, FlockOperation::LockExclusive)
-        .with_context(|| format!("flock {}", lock_path.display()))?;
-    Ok(fd)
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        // The lockfile is a 0-byte anchor; never truncate a concurrent holder's.
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| format!("open lock file {}", lock_path.display()))?;
+    // Exclusive, blocking; released when `file` drops.
+    file.lock()
+        .with_context(|| format!("lock {}", lock_path.display()))?;
+    Ok(file)
 }
 
 /// Whether an existing part file already holds this chunk's verified bytes.
