@@ -19,8 +19,9 @@
 //! never-opened-a-stream reap, the `inflight.is_empty()` gate under a parked
 //! request read, and — driven by [`stall_delivery_at_closing_voucher`], a raw
 //! delivery client that parks a REAL paid stream at its closing-voucher exchange
-//! — the gate under an active delivery plus the clock's re-arm from that
-//! stream's close (#1261).
+//! — the gate under active deliveries, repeated clock re-arms, and the rule that
+//! every concurrent stream must finish before the idle countdown begins (#1261,
+//! #1287).
 //!
 //! Still uncovered (need a hostile client that reimplements the receive loop —
 //! [`stall_delivery_at_closing_voucher`] is now that client's honest half and is
@@ -462,23 +463,38 @@ async fn in_flight_stream_defers_idle_close_then_reaps_on_completion() -> anyhow
     Ok(())
 }
 
-/// A server serving exactly one blob under an injected idle window, plus
-/// everything a raw client needs to drive a paid delivery against it — the
-/// shared fixture for the two #1261 idle-close guard tests below.
-struct IdleFixture {
-    target: EndpointAddr,
-    /// The channel's authorized client — the key a voucher must recover to.
-    client_signer: Arc<PrivateKeySigner>,
-    store: Arc<MemoryChannelStateStore>,
+/// One cached blob exposed by an [`IdleFixture`].
+#[derive(Clone, Copy)]
+struct IdleBlob {
     hash: Hash,
     /// Bao wire bytes the whole-blob delivery emits (content plus interleaved
     /// proof, ADR 038) — what a raw client must read before the server parks on
     /// the closing voucher, and what that voucher must cover.
     wire_bytes: u64,
+}
+
+/// A server serving one or more blobs under an injected idle window, plus
+/// everything a raw client needs to drive paid deliveries against it — the
+/// shared fixture for the #1261 and #1287 idle-close guard tests below.
+struct IdleFixture {
+    target: EndpointAddr,
+    /// The channel's authorized client — the key a voucher must recover to.
+    client_signer: Arc<PrivateKeySigner>,
+    store: Arc<MemoryChannelStateStore>,
+    blobs: Vec<IdleBlob>,
     metrics: Arc<Metrics>,
     server_ep: Endpoint,
     server_task: tokio::task::JoinHandle<()>,
     _cache_tmp: tempfile::TempDir,
+}
+
+impl IdleFixture {
+    fn blob(&self, index: usize) -> anyhow::Result<IdleBlob> {
+        self.blobs
+            .get(index)
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("idle fixture has no blob at index {index}"))
+    }
 }
 
 /// Build an [`IdleFixture`] serving `payload` with `idle` injected as the
@@ -486,6 +502,51 @@ struct IdleFixture {
 async fn idle_fixture(payload: &[u8], idle: Duration) -> anyhow::Result<IdleFixture> {
     let (cache, hash, cache_tmp) = cache_with_blob(payload).await?;
 
+    idle_fixture_with_cache(
+        cache,
+        vec![IdleBlob {
+            hash,
+            wire_bytes: support::bao_wire_len_whole(payload.len() as u64),
+        }],
+        cache_tmp,
+        idle,
+    )
+    .await
+}
+
+/// Build an [`IdleFixture`] serving two distinct blobs on the same connection.
+async fn idle_fixture_with_two_blobs(
+    a: &[u8],
+    b: &[u8],
+    idle: Duration,
+) -> anyhow::Result<IdleFixture> {
+    let (cache, hash_a, hash_b, cache_tmp) = cache_with_two_blobs(a, b).await?;
+    idle_fixture_with_cache(
+        cache,
+        vec![
+            IdleBlob {
+                hash: hash_a,
+                wire_bytes: support::bao_wire_len_whole(a.len() as u64),
+            },
+            IdleBlob {
+                hash: hash_b,
+                wire_bytes: support::bao_wire_len_whole(b.len() as u64),
+            },
+        ],
+        cache_tmp,
+        idle,
+    )
+    .await
+}
+
+/// Wire an idle-close handler around a pre-populated cache without duplicating
+/// the loopback endpoint and payment-channel setup.
+async fn idle_fixture_with_cache(
+    cache: CacheEngine,
+    blobs: Vec<IdleBlob>,
+    cache_tmp: tempfile::TempDir,
+    idle: Duration,
+) -> anyhow::Result<IdleFixture> {
     let client_signer = Arc::new(PrivateKeySigner::random());
     let store = Arc::new(MemoryChannelStateStore::new());
     store.record(&ChannelState::new(
@@ -519,8 +580,7 @@ async fn idle_fixture(payload: &[u8], idle: Duration) -> anyhow::Result<IdleFixt
         target: EndpointAddr::new(server_id).with_ip_addr(server_addr),
         client_signer,
         store,
-        hash,
-        wire_bytes: support::bao_wire_len_whole(payload.len() as u64),
+        blobs,
         metrics,
         server_ep,
         server_task,
@@ -533,11 +593,18 @@ async fn idle_fixture(payload: &[u8], idle: Duration) -> anyhow::Result<IdleFixt
 /// payment — so its `serve_stream` future is genuinely held in the serve loop's
 /// `inflight` set, for as long as the test declines to pay.
 struct StalledDelivery {
-    conn: Connection,
     send: SendStream,
     recv: RecvStream,
     /// Wire bytes read, and therefore what the closing voucher must cover.
     wire_bytes: u64,
+}
+
+/// Cumulative channel state used to settle a sequence of raw stalled streams.
+#[derive(Clone, Copy, Default)]
+struct VoucherTotals {
+    nonce: U256,
+    wire_bytes: u64,
+    amount: U256,
 }
 
 /// Drive a real paid delivery up to — but not through — its closing voucher.
@@ -553,15 +620,10 @@ struct StalledDelivery {
 /// rendezvous, not a race, and it holds until the test pays (well inside the
 /// handler's 10s `VOUCHER_READ_TIMEOUT`).
 async fn stall_delivery_at_closing_voucher(
-    client_ep: &Endpoint,
-    target: EndpointAddr,
+    conn: &Connection,
     hash: [u8; 32],
     expected_wire: u64,
 ) -> anyhow::Result<StalledDelivery> {
-    let conn = client_ep
-        .connect(target, ALPN_CLIENT)
-        .await
-        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
     let (mut send, mut recv) = conn
         .open_bi()
         .await
@@ -602,7 +664,6 @@ async fn stall_delivery_at_closing_voucher(
     );
 
     Ok(StalledDelivery {
-        conn,
         send,
         recv,
         wire_bytes,
@@ -611,22 +672,38 @@ async fn stall_delivery_at_closing_voucher(
 
 impl StalledDelivery {
     /// Pay the closing voucher and read the delivery out to its `StreamEnd`,
-    /// releasing the server's `serve_stream` future. Returns the still-open
-    /// connection plus the instant the CLIENT saw `StreamEnd` — a lower bound on
-    /// the server-side stream close the idle clock is required to count from.
+    /// releasing the server's `serve_stream` future. Returns the instant the
+    /// CLIENT saw `StreamEnd` — a lower bound on the server-side stream close the
+    /// idle clock is required to count from — plus the new cumulative totals.
     async fn pay_and_finish(
         mut self,
         signer: &PrivateKeySigner,
-    ) -> anyhow::Result<(Connection, Instant)> {
+        prior: VoucherTotals,
+    ) -> anyhow::Result<(Instant, VoucherTotals)> {
+        let amount_delta = min_payment(self.wire_bytes, RATE_PER_MB);
+        let settled = VoucherTotals {
+            nonce: prior
+                .nonce
+                .checked_add(U256::ONE)
+                .ok_or_else(|| anyhow::anyhow!("voucher nonce overflow"))?,
+            wire_bytes: prior
+                .wire_bytes
+                .checked_add(self.wire_bytes)
+                .ok_or_else(|| anyhow::anyhow!("voucher wire-byte total overflow"))?,
+            amount: prior
+                .amount
+                .checked_add(amount_delta)
+                .ok_or_else(|| anyhow::anyhow!("voucher amount overflow"))?,
+        };
         let voucher = Voucher {
             channel_id: channel_id(),
             // Exactly the advertised-rate minimum for the bytes served, which
             // clears the handler's per-delta `verify_rate` (1% tolerance). The
             // cumulative rate-floor check is inert here: the fixture builds the
             // handler with `delivery_floor = 0`.
-            amount: min_payment(self.wire_bytes, RATE_PER_MB),
-            nonce: U256::ONE,
-            bytes_delivered: U256::from(self.wire_bytes),
+            amount: settled.amount,
+            nonce: settled.nonce,
+            bytes_delivered: U256::from(settled.wire_bytes),
             token: TOKEN,
         }
         .sign(signer, &payment_domain())
@@ -645,7 +722,7 @@ impl StalledDelivery {
             ClientMessage::StreamEnd => {}
             other => anyhow::bail!("expected StreamEnd, got {other:?}"),
         }
-        Ok((self.conn, Instant::now()))
+        Ok((Instant::now(), settled))
     }
 }
 
@@ -686,20 +763,20 @@ async fn active_delivery_stream_defers_idle_close() -> anyhow::Result<()> {
     let payload = vec![0x3Du8; 64 * 1024];
     let idle = Duration::from_millis(150);
     let fx = idle_fixture(&payload, idle).await?;
+    let blob = fx.blob(0)?;
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
-    let stalled = stall_delivery_at_closing_voucher(
-        &client_ep,
-        fx.target.clone(),
-        *fx.hash.as_bytes(),
-        fx.wire_bytes,
-    )
-    .await?;
+    let conn = client_ep
+        .connect(fx.target.clone(), ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    let stalled =
+        stall_delivery_at_closing_voucher(&conn, *blob.hash.as_bytes(), blob.wire_bytes).await?;
 
     // The reaper is disabled while the stream is in flight: no close, however many
     // idle windows pass. `idle * 5` is well past the window yet far short of the
     // 10s voucher-read timeout, so a pass is the gate holding, not the park expiring.
-    let premature = tokio::time::timeout(idle * 5, stalled.conn.closed()).await;
+    let premature = tokio::time::timeout(idle * 5, conn.closed()).await;
     anyhow::ensure!(
         premature.is_err(),
         "connection was idle-closed while a paid delivery was in flight: {premature:?}"
@@ -708,7 +785,9 @@ async fn active_delivery_stream_defers_idle_close() -> anyhow::Result<()> {
     // Delivery completes on resume, and the channel advanced by exactly the bytes
     // that were already on the wire during the stall — proof the stall did not
     // corrupt or truncate the delivery it was holding open.
-    let (conn, _completed_at) = stalled.pay_and_finish(&fx.client_signer).await?;
+    let (_completed_at, _totals) = stalled
+        .pay_and_finish(&fx.client_signer, VoucherTotals::default())
+        .await?;
     let persisted = fx.store.load_all()?;
     let only = persisted
         .first()
@@ -719,10 +798,10 @@ async fn active_delivery_stream_defers_idle_close() -> anyhow::Result<()> {
         only.last_nonce()
     );
     anyhow::ensure!(
-        only.last_bytes_delivered() == U256::from(fx.wire_bytes),
+        only.last_bytes_delivered() == U256::from(blob.wire_bytes),
         "bytes_delivered: {} (expected {})",
         only.last_bytes_delivered(),
-        fx.wire_bytes
+        blob.wire_bytes
     );
 
     drop(conn);
@@ -751,20 +830,22 @@ async fn idle_clock_re_arms_from_last_stream_close() -> anyhow::Result<()> {
     let payload = vec![0x4Eu8; 64 * 1024];
     let idle = Duration::from_millis(400);
     let fx = idle_fixture(&payload, idle).await?;
+    let blob = fx.blob(0)?;
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
-    let stalled = stall_delivery_at_closing_voucher(
-        &client_ep,
-        fx.target.clone(),
-        *fx.hash.as_bytes(),
-        fx.wire_bytes,
-    )
-    .await?;
+    let conn = client_ep
+        .connect(fx.target.clone(), ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    let stalled =
+        stall_delivery_at_closing_voucher(&conn, *blob.hash.as_bytes(), blob.wire_bytes).await?;
 
     // Park past `connect + idle` so the two candidate origins are unambiguously
     // separated: a clock counting from accept is already due when we pay.
     tokio::time::sleep(idle * 3).await;
-    let (conn, completed_at) = stalled.pay_and_finish(&fx.client_signer).await?;
+    let (completed_at, _totals) = stalled
+        .pay_and_finish(&fx.client_signer, VoucherTotals::default())
+        .await?;
 
     let err = tokio::time::timeout(Duration::from_secs(10), conn.closed())
         .await
@@ -794,6 +875,169 @@ async fn idle_clock_re_arms_from_last_stream_close() -> anyhow::Result<()> {
     anyhow::ensure!(
         metric_line_present(&fx.metrics.encode()?, "decdn_client_idle_close_total 1"),
         "the re-armed reap must bump decdn_client_idle_close_total"
+    );
+
+    client_ep.close().await;
+    fx.server_ep.close().await;
+    fx.server_task.await?;
+    Ok(())
+}
+
+/// ADR 005 §Connection lifetime (#1287): every completed stream must re-arm
+/// the idle clock, not only the first one. Three paid deliveries finish on the
+/// same connection, with each successor starting before the previous fresh
+/// idle window expires. The connection survives every cadence, then one final
+/// uninterrupted idle window reaps it exactly once.
+#[tokio::test(flavor = "multi_thread")]
+async fn idle_clock_re_arms_after_each_completed_stream() -> anyhow::Result<()> {
+    let payload = vec![0x6Au8; 64 * 1024];
+    let idle = Duration::from_secs(1);
+    let activity_cadence = idle.mul_f64(0.6);
+    let fx = idle_fixture(&payload, idle).await?;
+    let blob = fx.blob(0)?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let conn = client_ep
+        .connect(fx.target.clone(), ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    let mut totals = VoucherTotals::default();
+    let mut final_completion = Instant::now();
+
+    for round in 1..=3 {
+        let stalled =
+            stall_delivery_at_closing_voucher(&conn, *blob.hash.as_bytes(), blob.wire_bytes)
+                .await?;
+        let (completed_at, settled) = stalled.pay_and_finish(&fx.client_signer, totals).await?;
+        totals = settled;
+        final_completion = completed_at;
+
+        if round < 3 {
+            let premature = tokio::time::timeout(activity_cadence, conn.closed()).await;
+            anyhow::ensure!(
+                premature.is_err(),
+                "connection closed after re-arm round {round}, before the next activity: \
+                 {premature:?}"
+            );
+        }
+    }
+
+    let err = tokio::time::timeout(Duration::from_secs(10), conn.closed())
+        .await
+        .map_err(|_| anyhow::anyhow!("connection was not reaped after the final idle window"))?;
+    // The server re-arms only after writing StreamEnd, so measuring from the
+    // client's read can only over-report the server-side idle delay.
+    let since_completion = final_completion.elapsed();
+    ensure_graceful_idle_close(&err)?;
+    let floor = idle.mul_f64(0.8);
+    anyhow::ensure!(
+        since_completion >= floor,
+        "final idle window was not freshly armed: closed {since_completion:?} after completion, \
+         expected at least {floor:?}"
+    );
+
+    let persisted = fx.store.load_all()?;
+    let only = persisted
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("no persisted channel"))?;
+    anyhow::ensure!(
+        only.last_nonce() == U256::from(3u64),
+        "nonce: {}",
+        only.last_nonce()
+    );
+    anyhow::ensure!(
+        only.last_bytes_delivered() == U256::from(totals.wire_bytes),
+        "bytes_delivered: {} (expected {})",
+        only.last_bytes_delivered(),
+        totals.wire_bytes
+    );
+    anyhow::ensure!(
+        metric_line_present(&fx.metrics.encode()?, "decdn_client_idle_close_total 1"),
+        "repeated re-arms must end in exactly one metered idle-close"
+    );
+
+    client_ep.close().await;
+    fx.server_ep.close().await;
+    fx.server_task.await?;
+    Ok(())
+}
+
+/// ADR 005 §Connection lifetime (#1287): draining one completed future from
+/// a connection with two concurrent paid streams must not arm the idle reaper.
+/// Only after BOTH streams finish may the fresh idle window begin.
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_streams_all_finish_before_idle_clock_arms() -> anyhow::Result<()> {
+    let payload_a = vec![0x71u8; 48 * 1024];
+    let payload_b = vec![0x82u8; 64 * 1024];
+    let idle = Duration::from_millis(300);
+    let fx = idle_fixture_with_two_blobs(&payload_a, &payload_b, idle).await?;
+    let blob_a = fx.blob(0)?;
+    let blob_b = fx.blob(1)?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let conn = client_ep
+        .connect(fx.target.clone(), ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    let stalled_a =
+        stall_delivery_at_closing_voucher(&conn, *blob_a.hash.as_bytes(), blob_a.wire_bytes)
+            .await?;
+    let stalled_b =
+        stall_delivery_at_closing_voucher(&conn, *blob_b.hash.as_bytes(), blob_b.wire_bytes)
+            .await?;
+
+    let (_first_completed_at, totals) = stalled_a
+        .pay_and_finish(&fx.client_signer, VoucherTotals::default())
+        .await?;
+
+    // One completed future may be drained, but the second delivery remains in
+    // `inflight`; surviving three whole windows distinguishes `is_empty()` from
+    // a broken one-entry/last-completed interpretation.
+    let premature = tokio::time::timeout(idle * 3, conn.closed()).await;
+    anyhow::ensure!(
+        premature.is_err(),
+        "connection was idle-closed while the second stream was still in flight: {premature:?}"
+    );
+
+    let (second_completed_at, _totals) =
+        stalled_b.pay_and_finish(&fx.client_signer, totals).await?;
+    let err = tokio::time::timeout(Duration::from_secs(10), conn.closed())
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!("connection was not reaped after both concurrent streams completed")
+        })?;
+    // The server re-arms only after writing StreamEnd, so measuring from the
+    // client's read can only over-report the server-side idle delay.
+    let since_completion = second_completed_at.elapsed();
+    ensure_graceful_idle_close(&err)?;
+    let floor = idle.mul_f64(0.8);
+    anyhow::ensure!(
+        since_completion >= floor,
+        "idle window started before the second stream closed: reaped {since_completion:?} after \
+         completion, expected at least {floor:?}"
+    );
+
+    let expected_wire_bytes = blob_a
+        .wire_bytes
+        .checked_add(blob_b.wire_bytes)
+        .ok_or_else(|| anyhow::anyhow!("expected wire-byte total overflow"))?;
+    let persisted = fx.store.load_all()?;
+    let only = persisted
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("no persisted channel"))?;
+    anyhow::ensure!(
+        only.last_nonce() == U256::from(2u64),
+        "persisted nonce: {}, expected 2",
+        only.last_nonce()
+    );
+    anyhow::ensure!(
+        only.last_bytes_delivered() == U256::from(expected_wire_bytes),
+        "persisted bytes: {}, expected {expected_wire_bytes}",
+        only.last_bytes_delivered(),
+    );
+    anyhow::ensure!(
+        metric_line_present(&fx.metrics.encode()?, "decdn_client_idle_close_total 1"),
+        "the post-concurrency idle reap must be metered exactly once"
     );
 
     client_ep.close().await;
