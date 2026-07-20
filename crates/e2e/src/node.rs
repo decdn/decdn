@@ -61,8 +61,9 @@ impl Drop for NodeGuard {
 #[derive(Debug)]
 pub struct NodeFixture {
     child: NodeGuard,
-    // TempDirs kept alive for the daemon's lifetime.
-    _data_dir: tempfile::TempDir,
+    // TempDirs kept alive for the daemon's lifetime. The data dir is also read
+    // back by `data_dir()` as an isolated `HOME` for CLI subprocesses.
+    data_dir: tempfile::TempDir,
     _origin_dir: tempfile::TempDir,
     operator: PrivateKeySigner,
     operator_addr: Address,
@@ -125,6 +126,14 @@ impl NodeFixture {
     #[must_use]
     pub fn config_path(&self) -> &std::path::Path {
         &self.config_path
+    }
+
+    /// The daemon's data dir (`0o700` on Unix). Doubles as the `HOME` a journey hands
+    /// [`crate::cli::decdn_command`] when it drives the `decdn` CLI against
+    /// this node's config + keystore (#1332).
+    #[must_use]
+    pub fn data_dir(&self) -> &std::path::Path {
+        self.data_dir.path()
     }
 
     /// Provision a data dir + keystore + iroh key, onboard the operator
@@ -265,11 +274,11 @@ impl NodeFixture {
             warm.shutdown().await.context("flush warm cache")?;
         }
 
-        let child = spawn_daemon(&config_path)?;
+        let child = spawn_daemon(&config_path, data_dir.path())?;
 
         let fixture = Self {
             child: NodeGuard(std::sync::Mutex::new(child)),
-            _data_dir: data_dir,
+            data_dir,
             _origin_dir: origin_dir,
             operator,
             operator_addr,
@@ -305,7 +314,7 @@ impl NodeFixture {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let _ = child.kill();
             let _ = child.wait();
-            *child = spawn_daemon(&self.config_path)?;
+            *child = spawn_daemon(&self.config_path, self.data_dir.path())?;
         }
         self.wait_healthy(Duration::from_secs(30))
             .await
@@ -477,70 +486,56 @@ fn write_fs_origin_blob(root: &std::path::Path, hash: &Hash, blob: &[u8]) -> any
     Ok(())
 }
 
-/// Locate the built `decdn` CLI binary relative to the current test executable
-/// (`target/<profile>/decdn`), falling back to `DECDN_CLI_BIN`. The sibling of
-/// this module's private `decdn_node_bin`, for tests that drive the
-/// user-facing binary rather than the daemon.
-pub fn decdn_cli_bin() -> anyhow::Result<PathBuf> {
-    if let Some(p) = std::env::var_os("DECDN_CLI_BIN") {
-        return Ok(PathBuf::from(p));
-    }
-    let exe = std::env::current_exe().context("current_exe")?;
-    // .../target/<profile>/deps/<test-bin>  → .../target/<profile>/decdn
-    let profile_dir = exe
-        .parent()
-        .and_then(|deps| deps.parent())
-        .context("resolve target profile dir")?;
-    let bin = profile_dir.join(if cfg!(windows) { "decdn.exe" } else { "decdn" });
-    anyhow::ensure!(
-        bin.exists(),
-        "decdn binary not found at {}; run `cargo build -p decdn-cli` first \
-         (or set DECDN_CLI_BIN)",
-        bin.display()
-    );
-    Ok(bin)
-}
-
 /// Locate the built `decdn-node` binary relative to the current test executable
 /// (`target/<profile>/decdn-node`), falling back to `DECDN_NODE_BIN`.
 fn decdn_node_bin() -> anyhow::Result<PathBuf> {
-    if let Some(p) = std::env::var_os("DECDN_NODE_BIN") {
-        return Ok(PathBuf::from(p));
-    }
-    let exe = std::env::current_exe().context("current_exe")?;
-    // .../target/<profile>/deps/<test-bin>  → .../target/<profile>/decdn-node
-    let profile_dir = exe
-        .parent()
-        .and_then(|deps| deps.parent())
-        .context("resolve target profile dir")?;
-    let bin = profile_dir.join(if cfg!(windows) {
-        "decdn-node.exe"
+    let overridden = std::env::var_os("DECDN_NODE_BIN");
+    let bin = if let Some(p) = &overridden {
+        PathBuf::from(p)
     } else {
-        "decdn-node"
-    });
+        let exe = std::env::current_exe().context("current_exe")?;
+        // .../target/<profile>/deps/<test-bin>  → .../target/<profile>/decdn-node
+        let profile_dir = exe
+            .parent()
+            .and_then(|deps| deps.parent())
+            .context("resolve target profile dir")?;
+        profile_dir.join(if cfg!(windows) {
+            "decdn-node.exe"
+        } else {
+            "decdn-node"
+        })
+    };
+    // Check both branches, so a stale `DECDN_NODE_BIN` fails here rather than as
+    // a bare "No such file or directory" at spawn time (mirrors `cli::decdn_cli_bin`).
     anyhow::ensure!(
         bin.exists(),
-        "decdn-node binary not found at {}; run `cargo build -p decdn-node` first \
-         (or set DECDN_NODE_BIN)",
-        bin.display()
+        "decdn-node binary not found at {}{}",
+        bin.display(),
+        if overridden.is_some() {
+            " (from DECDN_NODE_BIN — stale or misspelled?)"
+        } else {
+            "; run `cargo build -p decdn-node` first (or set DECDN_NODE_BIN)"
+        }
     );
     Ok(bin)
 }
 
 /// Spawn `decdn-node run --config <config_path>` with the fixture's test
-/// keystore password and log level. Shared by [`NodeFixture::launch`] and
-/// [`NodeFixture::restart`].
-fn spawn_daemon(config_path: &std::path::Path) -> anyhow::Result<Child> {
-    std::process::Command::new(decdn_node_bin()?)
+/// keystore password and log level, hermetically. Shared by
+/// [`NodeFixture::launch`] and [`NodeFixture::restart`].
+///
+/// `home` is taken explicitly rather than derived from `config_path`'s parent:
+/// the two coincide today only because the config is written *inside* the data
+/// dir, and `Path::parent` answers `Some("")` for a bare filename — an empty
+/// `HOME` that `dirs` resolves back to the developer's real home. The daemon's
+/// explicit `--config` already keeps it off `~/.decdn/node.toml`; the isolation
+/// here covers the `DECDN_*` env namespace (which outranks the config) and any
+/// path the config leaves to a `$HOME`-derived default (#1332).
+fn spawn_daemon(config_path: &std::path::Path, home: &std::path::Path) -> anyhow::Result<Child> {
+    crate::cli::hermetic_command(decdn_node_bin()?, home, KEYSTORE_PASSWORD)?
         .arg("--config")
         .arg(config_path)
         .arg("run")
-        .env("DECDN_KEYSTORE_PASSWORD", KEYSTORE_PASSWORD)
-        // Quiet by default; flip to `info`/`debug` when debugging a failure.
-        .env(
-            "RUST_LOG",
-            std::env::var("DECDN_NODE_LOG").unwrap_or_else(|_| "warn".into()),
-        )
         .spawn()
         .context("spawn decdn-node")
 }

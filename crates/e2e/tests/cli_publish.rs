@@ -41,13 +41,13 @@
     clippy::duration_suboptimal_units
 )]
 
-use std::path::PathBuf;
 use std::time::Duration;
 
 use alloy::primitives::{B256, U256};
 use anyhow::Context;
 use decdn_e2e::bindings::{OriginAssignment, PublisherRegistry};
 use decdn_e2e::chain::ChainFixture;
+use decdn_e2e::cli::decdn_command;
 use decdn_e2e::node::{KEYSTORE_PASSWORD, NodeFixture};
 use tokio::process::Command;
 
@@ -80,14 +80,13 @@ async fn run() -> anyhow::Result<()> {
     // the CLI reads its `[blockchain]` coordinates + keystore from.
     let serve_blob = b"decdn publish e2e fixture blob (#1073)".to_vec();
     let (node, _hash) = NodeFixture::launch(&chain, "US", &serve_blob).await?;
-    let config = node.config_path();
     let operator = node.operator_addr();
 
     let registry = PublisherRegistry::new(chain.addrs().publisher_registry, chain.admin());
     let assignment = OriginAssignment::new(chain.addrs().origin_assignment, chain.admin());
 
     // ---- 1. `publish namespace create` mints a namespace owned by the signer.
-    let create = run_publish(config, &["namespace", "create", "--json"]).await?;
+    let create = run_publish(&node, &["namespace", "create", "--json"]).await?;
     let namespace_id = parse_namespace_id(&create.stdout)?;
     assert!(
         namespace_id >= 1,
@@ -105,7 +104,7 @@ async fn run() -> anyhow::Result<()> {
     // `bytes32` (`parse_hash` → `blake3::Hash::from_hex`).
     let claim_hash = B256::repeat_byte(0x42);
     run_publish(
-        config,
+        &node,
         &[
             "claim",
             &format!("{claim_hash:#x}"),
@@ -125,7 +124,7 @@ async fn run() -> anyhow::Result<()> {
     // carries the proposed set + a non-zero timelock deadline, while the active
     // (`getOrigins`) set stays empty until governance ratifies.
     run_publish(
-        config,
+        &node,
         &[
             "assign",
             &namespace_id.to_string(),
@@ -161,21 +160,14 @@ async fn run() -> anyhow::Result<()> {
 /// Run `decdn publish <args…> --config <config>` against the node fixture's
 /// rendered config + keystore, asserting a clean exit, and return the captured
 /// output. The `[blockchain]` coordinates all come from the config; the keystore
-/// password comes from `DECDN_KEYSTORE_PASSWORD` (mirrors `slash_appeal.rs`).
-async fn run_publish(
-    config: &std::path::Path,
-    args: &[&str],
-) -> anyhow::Result<std::process::Output> {
-    let out = Command::new(decdn_cli_bin()?)
+/// password and the isolated `HOME` come from `decdn_command` (mirrors
+/// `slash_appeal.rs`).
+async fn run_publish(node: &NodeFixture, args: &[&str]) -> anyhow::Result<std::process::Output> {
+    let out = Command::from(decdn_command(node.data_dir(), KEYSTORE_PASSWORD)?)
         .arg("publish")
         .args(args)
         .arg("--config")
-        .arg(config)
-        .env("DECDN_KEYSTORE_PASSWORD", KEYSTORE_PASSWORD)
-        .env(
-            "RUST_LOG",
-            std::env::var("DECDN_NODE_LOG").unwrap_or_else(|_| "warn".into()),
-        )
+        .arg(node.config_path())
         // Make the outer `tokio::time::timeout` authoritative even if the CLI
         // wedges waiting for a receipt: dropping this future terminates the
         // child instead of leaving it orphaned in the test runner.
@@ -213,25 +205,4 @@ fn parse_namespace_id(stdout: &[u8]) -> anyhow::Result<u64> {
     v["namespace_id"]
         .as_u64()
         .context("namespace-create receipt missing a numeric namespace_id")
-}
-
-/// Locate the built `decdn` CLI binary relative to the test executable
-/// (`target/<profile>/decdn`), falling back to `DECDN_CLI_BIN`. Mirrors the
-/// daemon-binary lookup in the node fixture / `slash_appeal.rs`.
-fn decdn_cli_bin() -> anyhow::Result<PathBuf> {
-    if let Some(p) = std::env::var_os("DECDN_CLI_BIN") {
-        return Ok(PathBuf::from(p));
-    }
-    let exe = std::env::current_exe().context("current_exe")?;
-    let profile_dir = exe
-        .parent()
-        .and_then(|deps| deps.parent())
-        .context("resolve target profile dir")?;
-    let bin = profile_dir.join(if cfg!(windows) { "decdn.exe" } else { "decdn" });
-    anyhow::ensure!(
-        bin.exists(),
-        "decdn binary not found at {}; run `cargo build -p decdn-cli` first (or set DECDN_CLI_BIN)",
-        bin.display()
-    );
-    Ok(bin)
 }

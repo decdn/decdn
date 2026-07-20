@@ -42,7 +42,6 @@
 )]
 
 use std::path::PathBuf;
-use std::process::Command;
 use std::time::Duration;
 
 use alloy::primitives::{Address, B256, U256};
@@ -52,7 +51,7 @@ use anyhow::Context;
 use decdn_cache::Hash;
 use decdn_e2e::bindings::PublisherRegistry;
 use decdn_e2e::chain::ChainFixture;
-use decdn_e2e::node::decdn_cli_bin;
+use decdn_e2e::cli::decdn_command;
 use decdn_e2e::time;
 use decdn_incentive::eth_identity;
 
@@ -421,7 +420,15 @@ impl Publisher {
     /// chain coordinates, returning the parsed `--json` stdout. A non-zero exit
     /// is an error carrying stderr (the CLI's `Context` chain).
     fn run(&self, chain: &ChainFixture, args: &[&str]) -> anyhow::Result<serde_json::Value> {
-        let output = Command::new(decdn_cli_bin()?)
+        // `decdn_command` pins `HOME` to this publisher's `0o700` tempdir. That
+        // is load-bearing here, not hygiene: this is the one journey that
+        // passes no `--config`, so without it the CLI reads `~/.decdn/node.toml`
+        // from the machine running the test. Flags still win (chain_ctx
+        // resolves flag > config > default), but the call below passes no
+        // `--keystore` — so a real config's `blockchain.eth_keystore` fills that
+        // gap and the CLI decrypts the developer's keystore with
+        // `KEYSTORE_PASSWORD` instead of this tempdir's (#1332).
+        let output = decdn_command(&self.data_dir, KEYSTORE_PASSWORD)?
             .args(args)
             .args([
                 "--rpc-url",
@@ -434,7 +441,6 @@ impl Publisher {
             ])
             .arg(&self.data_dir)
             .arg("--json")
-            .env("DECDN_KEYSTORE_PASSWORD", KEYSTORE_PASSWORD)
             .output()
             .context("spawn decdn CLI")?;
         anyhow::ensure!(
