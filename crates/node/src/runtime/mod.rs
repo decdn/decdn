@@ -300,6 +300,30 @@ fn log_region_snapshot(accountant: &crate::region_accounting::RegionAccountant) 
     }
 }
 
+/// #1292: with the empty origin-directory fallback in place (no chain
+/// addresses), an armed authorized-origin gate denies every hash, and two of
+/// those denials look like ordinary operation. Given the gate config, return
+/// `Some((prefetch_gate, pull_through_gate))` when at least one gate is armed —
+/// the caller warns — else `None`.
+///
+/// Split out so the interaction is unit-testable: the prefetch gate needs
+/// prefetch *enabled* as well as `require_authorized_origin` (which defaults
+/// on, so the `enabled` guard is what stops the warning firing on every
+/// chain-less node), while the pull-through gate stands on its own.
+const fn armed_origin_gates_over_empty_fallback(
+    prefetch_enabled: bool,
+    prefetch_require_authorized_origin: bool,
+    pull_through_require_authorized_origin: bool,
+) -> Option<(bool, bool)> {
+    let prefetch_gate = prefetch_enabled && prefetch_require_authorized_origin;
+    let pull_through_gate = pull_through_require_authorized_origin;
+    if prefetch_gate || pull_through_gate {
+        Some((prefetch_gate, pull_through_gate))
+    } else {
+        None
+    }
+}
+
 /// Runtime infrastructure built during the front bring-up phase of [`run`].
 ///
 /// A plain by-value bundle of the long-lived handles the rest of `run` (and the
@@ -917,10 +941,10 @@ async fn build_chain_and_handlers(
     // chain-backed `ChainOriginDirectory` — a live, event-fed cache resolving
     // hash → namespace → authorized origin → active NodeId, reusing the
     // already-bootstrapped `staker_set` for operator liveness. Without those
-    // addresses this is an empty `ConfigOriginDirectory`: both gates reject
-    // every hash (the prefetch gate only matters once an operator sets
-    // `prefetch.enabled`) and the FIND_VALUE fallback resolves nothing (same
-    // prior behavior). The prefetch enabled gauge is published regardless so
+    // addresses this is an `EmptyOriginDirectory`: both gates reject every hash
+    // (the prefetch gate only matters once an operator sets `prefetch.enabled`)
+    // and the FIND_VALUE fallback resolves nothing (same prior behavior).
+    // The prefetch enabled gauge is published regardless so
     // dashboards have a uniform schema across enabled/disabled nodes
     // (appendix-observability §Prefetch).
     // The chain-backed directory's watcher handle, captured before the `Arc<dyn>`
@@ -931,38 +955,51 @@ async fn build_chain_and_handlers(
     let (origin_directory, origin_watcher): (
         Arc<dyn crate::dht::origin::OriginDirectory>,
         Option<Arc<crate::chain_events::resumable_watcher::WatcherHandle>>,
-    ) = match (
+    ) = if let (Some(origin_addr), Some(publisher_addr)) = (
         cfg.blockchain.origin_assignment_address.as_deref(),
         cfg.blockchain.publisher_registry_address.as_deref(),
     ) {
-        (Some(origin_addr), Some(publisher_addr)) => {
-            let origin_assignment_addr =
-                parse_nonzero_address(origin_addr, "blockchain.origin_assignment_address")?;
-            let publisher_registry_addr =
-                parse_nonzero_address(publisher_addr, "blockchain.publisher_registry_address")?;
-            let directory = crate::dht::ChainOriginDirectory::bootstrap(
-                ProviderFactory::read_only(rpc_url.clone(), event_poll_interval),
-                origin_assignment_addr,
-                publisher_registry_addr,
-                capacity_bond_addr,
-                cfg.blockchain.origin_directory_from_block,
-                Arc::clone(&infra.watcher_checkpoint_store),
-                event_poll_interval,
-                Arc::clone(&head),
-                Arc::clone(&staker_set),
-                Arc::clone(&infra.node_metrics),
-            )
-            .await
-            .context("ChainOriginDirectory bootstrap")?;
-            let origin_watcher = directory.watcher();
-            (Arc::new(directory), Some(origin_watcher))
+        let origin_assignment_addr =
+            parse_nonzero_address(origin_addr, "blockchain.origin_assignment_address")?;
+        let publisher_registry_addr =
+            parse_nonzero_address(publisher_addr, "blockchain.publisher_registry_address")?;
+        let directory = crate::dht::ChainOriginDirectory::bootstrap(
+            ProviderFactory::read_only(rpc_url.clone(), event_poll_interval),
+            origin_assignment_addr,
+            publisher_registry_addr,
+            capacity_bond_addr,
+            cfg.blockchain.origin_directory_from_block,
+            Arc::clone(&infra.watcher_checkpoint_store),
+            event_poll_interval,
+            Arc::clone(&head),
+            Arc::clone(&staker_set),
+            Arc::clone(&infra.node_metrics),
+        )
+        .await
+        .context("ChainOriginDirectory bootstrap")?;
+        let origin_watcher = directory.watcher();
+        (Arc::new(directory), Some(origin_watcher))
+    } else {
+        // The empty fallback makes every authorized-origin gate deny, and two
+        // of those denials are indistinguishable from ordinary operation (a
+        // prefetch `Unauthorized` skip; a pull-through wire `NotFound`). Warn if
+        // either gate is armed on a node with no chain directory so the dead
+        // path is diagnosable rather than silent (#1292).
+        if let Some((prefetch_gate, pull_through_gate)) = armed_origin_gates_over_empty_fallback(
+            cfg.prefetch.enabled,
+            cfg.prefetch.require_authorized_origin,
+            cfg.cache.pull_through_require_authorized_origin,
+        ) {
+            tracing::warn!(
+                prefetch_gate,
+                pull_through_gate,
+                "authorized-origin gate is armed but no chain origin directory is \
+                 configured (blockchain.origin_assignment_address / \
+                 publisher_registry_address unset); the gate will deny every hash — \
+                 prefetch skips as Unauthorized and pull-through misses return NotFound"
+            );
         }
-        _ => (
-            Arc::new(crate::dht::origin::ConfigOriginDirectory::new(
-                std::collections::HashMap::new(),
-            )),
-            None,
-        ),
+        (Arc::new(crate::dht::origin::EmptyOriginDirectory), None)
     };
     let prefetch_engine = Arc::new(crate::prefetch::PrefetchEngine::new(
         cfg.prefetch,
@@ -3610,6 +3647,44 @@ mod tests {
         assert_eq!(
             admin_stop_order(ShutdownSignal::Sigterm, &trigger),
             AdminStopOrder::Early,
+        );
+    }
+
+    /// #1292: the empty-fallback gate-armed warning. The load-bearing case is
+    /// the prefetch gate — `require_authorized_origin` defaults on, so without
+    /// the `enabled` guard the warning would fire on every chain-less node.
+    #[test]
+    fn armed_origin_gates_over_empty_fallback_cases() {
+        // Nothing armed: no warning.
+        assert_eq!(
+            armed_origin_gates_over_empty_fallback(false, false, false),
+            None
+        );
+        // Prefetch requires authorized origin but prefetch is disabled: the gate
+        // is inert, so no warning despite `require_authorized_origin = true`.
+        assert_eq!(
+            armed_origin_gates_over_empty_fallback(false, true, false),
+            None
+        );
+        // Prefetch enabled + requires authorized origin: prefetch gate armed.
+        assert_eq!(
+            armed_origin_gates_over_empty_fallback(true, true, false),
+            Some((true, false))
+        );
+        // Prefetch enabled but does not require an authorized origin: inert.
+        assert_eq!(
+            armed_origin_gates_over_empty_fallback(true, false, false),
+            None
+        );
+        // Pull-through gate stands alone, independent of prefetch.
+        assert_eq!(
+            armed_origin_gates_over_empty_fallback(false, false, true),
+            Some((false, true))
+        );
+        // Both armed: both flags reported for the diagnostic.
+        assert_eq!(
+            armed_origin_gates_over_empty_fallback(true, true, true),
+            Some((true, true))
         );
     }
 

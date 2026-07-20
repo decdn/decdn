@@ -208,7 +208,7 @@ mod tests {
     use decdn_common::config::ResolvedPrefetch;
 
     use super::{PrefetchDecision, PrefetchPolicy, SkipReason};
-    use crate::dht::origin::{ConfigOriginDirectory, Hash, OriginDirectory};
+    use crate::dht::origin::{Hash, OriginDirectory, StaticOriginDirectory};
     use crate::dht::routing::NodeId;
 
     fn hash() -> Hash {
@@ -219,12 +219,12 @@ mod tests {
     fn authorized_dir() -> Arc<dyn OriginDirectory> {
         let mut m = std::collections::HashMap::new();
         m.insert(hash(), vec![NodeId::from_bytes([1u8; 32])]);
-        Arc::new(ConfigOriginDirectory::new(m))
+        Arc::new(StaticOriginDirectory::new(m))
     }
 
     /// Directory that authorizes nothing.
     fn empty_dir() -> Arc<dyn OriginDirectory> {
-        Arc::new(ConfigOriginDirectory::new(std::collections::HashMap::new()))
+        Arc::new(StaticOriginDirectory::new(std::collections::HashMap::new()))
     }
 
     fn cfg(enabled: bool) -> ResolvedPrefetch {

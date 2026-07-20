@@ -221,13 +221,13 @@ mod tests {
     use decdn_common::config::ResolvedPrefetch;
 
     use super::{PrefetchEngine, PrefetchOutcome};
-    use crate::dht::origin::{ConfigOriginDirectory, Hash, OriginDirectory};
+    use crate::dht::origin::{Hash, OriginDirectory, StaticOriginDirectory};
     use crate::dht::routing::NodeId;
 
     fn dir_with(hash: Hash) -> Arc<dyn OriginDirectory> {
         let mut m = std::collections::HashMap::new();
         m.insert(hash, vec![NodeId::from_bytes([1u8; 32])]);
-        Arc::new(ConfigOriginDirectory::new(m))
+        Arc::new(StaticOriginDirectory::new(m))
     }
 
     #[test]
@@ -235,7 +235,7 @@ mod tests {
         let cfg = ResolvedPrefetch::default(); // enabled = false
         let key = [9u8; 32];
         let dir: Arc<dyn OriginDirectory> =
-            Arc::new(ConfigOriginDirectory::new(std::collections::HashMap::new()));
+            Arc::new(StaticOriginDirectory::new(std::collections::HashMap::new()));
         let engine = PrefetchEngine::new(cfg, dir);
         for t in 0..10 {
             assert_eq!(engine.on_find_value(&key, t), PrefetchOutcome::Inert);
@@ -274,7 +274,7 @@ mod tests {
             ..Default::default()
         };
         let dir: Arc<dyn OriginDirectory> =
-            Arc::new(ConfigOriginDirectory::new(std::collections::HashMap::new()));
+            Arc::new(StaticOriginDirectory::new(std::collections::HashMap::new()));
         PrefetchEngine::new(cfg, dir)
     }
 
@@ -309,7 +309,7 @@ mod tests {
         // outside a runtime). `try_acquire` returns before touching the acquirer.
         let engine = PrefetchEngine::new(
             ResolvedPrefetch::default(),
-            Arc::new(ConfigOriginDirectory::new(std::collections::HashMap::new())),
+            Arc::new(StaticOriginDirectory::new(std::collections::HashMap::new())),
         );
         engine.try_acquire([7u8; 32]);
     }

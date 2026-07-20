@@ -12,26 +12,31 @@
 //!
 //! This trait abstracts the directory so the iterative-lookup module
 //! consumes a single `lookup_origins(hash) -> Vec<NodeId>` call without
-//! caring whether the implementation resolves from chain (production) or
-//! from an in-memory map (fallback and tests).
+//! caring whether the implementation resolves from chain (production),
+//! from a fixed in-memory map (tests), or resolves nothing at all (the
+//! fallback installed when the chain contracts aren't configured).
 //!
-//! Two implementations exist:
+//! Three implementations exist:
 //!
-//! - [`crate::dht::ChainOriginDirectory`] — the production path. It yields
-//!   the same candidate set the chain above specifies, but does not perform
-//!   that literal call sequence: the `hash → namespace` view is replayed
-//!   from `ContentClaimed` logs rather than read via `namespaceOf`, and the
-//!   `active` filter is applied from the shared `StakerSet` at lookup time
-//!   rather than taken from the `nodeIdOf` tuple. Lookups are served from
-//!   an event-fed in-memory cache and never hit RPC.
-//! - [`ConfigOriginDirectory`] (this module) — the in-memory fallback,
-//!   used when the chain contracts aren't configured and by tests.
+//! - [`crate::dht::ChainOriginDirectory`] — the production path, and the only
+//!   one that can resolve anything. It yields the same candidate set the chain
+//!   above specifies, but does not perform that literal call sequence: the
+//!   `hash → namespace` view is replayed from `ContentClaimed` logs rather than
+//!   read via `namespaceOf`, and the `active` filter is applied from the shared
+//!   `StakerSet` at lookup time rather than taken from the `nodeIdOf` tuple.
+//!   Lookups are served from an event-fed in-memory cache and never hit RPC.
+//! - [`EmptyOriginDirectory`] (this module) — resolves nothing. What the
+//!   runtime installs when the chain contracts aren't configured.
+//! - [`StaticOriginDirectory`] (this module) — a fixed in-memory map, for tests
+//!   and any caller wiring a known origin set without a live chain. No config
+//!   key populates it; it has no production call site.
 //!
 //! The runtime picks between them at bring-up: it constructs a
 //! `ChainOriginDirectory` when **both** `blockchain.origin_assignment_address`
-//! and `blockchain.publisher_registry_address` are set, and otherwise falls
-//! back to an empty `ConfigOriginDirectory` (see `crate::runtime`). With that
-//! fallback in place every lookup miss yields no origin candidates.
+//! and `blockchain.publisher_registry_address` are set, and otherwise installs
+//! an [`EmptyOriginDirectory`] (see `crate::runtime`). With that fallback in
+//! place every lookup miss yields no origin candidates — see
+//! [`EmptyOriginDirectory`] for what that means for each consumer.
 
 use std::collections::HashMap;
 
@@ -72,61 +77,65 @@ pub trait OriginDirectory: Send + Sync + std::fmt::Debug {
     }
 }
 
-/// In-memory [`OriginDirectory`] implementation over a fixed
-/// hash → origin-`NodeId` map.
+/// [`OriginDirectory`] that resolves nothing.
 ///
-/// This is the fallback the runtime installs when the on-chain
-/// `PublisherRegistry` / `OriginAssignment` addresses are not both
-/// configured; the chain-backed [`crate::dht::ChainOriginDirectory`] is the
-/// production path and resolves the same shape from RPC via this trait.
+/// The shape the runtime installs when the on-chain `PublisherRegistry` /
+/// `OriginAssignment` addresses are not both configured. The chain-backed
+/// [`crate::dht::ChainOriginDirectory`] is the only directory with a
+/// production population path (ADR 022 §FIND\_VALUE Flow describes the
+/// fallback as the *on-chain* origin directory throughout), so "no chain
+/// config" means "no origin directory" rather than "an operator-supplied one".
 ///
-/// No config field currently populates this map — the runtime always builds
-/// the fallback empty, so on a node without the chain directory every
-/// origin-fallback lookup returns nothing. Tests construct populated
-/// instances via [`ConfigOriginDirectory::new`].
+/// Every consumer degrades to a hard deny, and in two cases that deny is
+/// indistinguishable from ordinary operation — worth knowing before enabling
+/// an authorized-origin gate on a node without chain addresses:
+///
+/// - the FIND\_VALUE fallback resolves nothing, so a DHT miss reports the blob
+///   unavailable on the network;
+/// - the prefetch gate (`prefetch.require_authorized_origin`) skips **every**
+///   hash as `Unauthorized`, silently disabling prefetch;
+/// - the pull-through gate (`cache.pull_through_require_authorized_origin`)
+///   refuses **every** cache miss with a wire `NotFound`, which is
+///   indistinguishable from a plain miss.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct EmptyOriginDirectory;
+
+impl OriginDirectory for EmptyOriginDirectory {
+    fn lookup_origins(&self, _hash: &Hash) -> Vec<NodeId> {
+        Vec::new()
+    }
+
+    fn has_origin(&self, _hash: &Hash) -> bool {
+        false
+    }
+}
+
+/// Static, in-memory [`OriginDirectory`] over a fixed hash → origin-`NodeId`
+/// map. Used by tests and any caller wiring a known origin set without a live
+/// chain.
+///
+/// No config key populates this map and the runtime never constructs one — the
+/// chain-backed [`crate::dht::ChainOriginDirectory`] is the production path,
+/// and [`EmptyOriginDirectory`] is what stands in when it is unconfigured.
+/// Mirrors [`crate::dht::StaticNodeAddressDirectory`], the same `Chain*` /
+/// `Static*` pairing one module over.
 #[derive(Debug)]
-pub struct ConfigOriginDirectory {
+pub struct StaticOriginDirectory {
     /// Map from BLAKE3 hash to the list of authorised origin `NodeId`s.
-    /// Pre-filtered at construction (the resolver drops malformed
-    /// entries with a config-level error), so `lookup_origins` is a
-    /// single `HashMap::get` clone-and-return.
+    /// Taken as-is from the caller, so `lookup_origins` is a single
+    /// `HashMap::get` clone-and-return.
     origins: HashMap<Hash, Vec<NodeId>>,
 }
 
-impl ConfigOriginDirectory {
-    /// Build from a `hash → origins` map. The runtime passes an empty map
-    /// (no config field feeds it); tests pass fixture entries.
+impl StaticOriginDirectory {
+    /// Build from a `hash → origins` map.
     #[must_use]
     pub const fn new(origins: HashMap<Hash, Vec<NodeId>>) -> Self {
         Self { origins }
     }
-
-    /// Empty directory — useful for tests, and the shape the runtime
-    /// installs when the chain directory is not configured. An empty
-    /// directory means every DHT lookup that returns no providers also gets no
-    /// origin-fallback candidates, and the blob is reported as
-    /// "unavailable on the network" to the caller.
-    #[must_use]
-    pub fn empty() -> Self {
-        Self {
-            origins: HashMap::new(),
-        }
-    }
-
-    /// Number of distinct hashes in the directory.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.origins.len()
-    }
-
-    /// Whether the directory contains zero hash mappings.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.origins.is_empty()
-    }
 }
 
-impl OriginDirectory for ConfigOriginDirectory {
+impl OriginDirectory for StaticOriginDirectory {
     fn lookup_origins(&self, hash: &Hash) -> Vec<NodeId> {
         self.origins.get(hash).cloned().unwrap_or_default()
     }
@@ -155,11 +164,20 @@ mod tests {
 
     #[test]
     fn empty_directory_returns_empty_for_every_lookup() {
-        let dir = ConfigOriginDirectory::empty();
-        assert!(dir.is_empty());
-        assert_eq!(dir.len(), 0);
+        // The runtime's non-chain fallback: nothing resolves, and `has_origin`
+        // is false for every hash, so each consuming gate hard-denies.
+        let dir = EmptyOriginDirectory;
         assert!(dir.lookup_origins(&h(0)).is_empty());
         assert!(dir.lookup_origins(&h(0xFF)).is_empty());
+        assert!(!dir.has_origin(&h(0)));
+        assert!(!dir.has_origin(&h(0xFF)));
+    }
+
+    #[test]
+    fn static_directory_with_no_entries_resolves_nothing() {
+        let dir = StaticOriginDirectory::new(HashMap::new());
+        assert!(dir.lookup_origins(&h(0)).is_empty());
+        assert!(!dir.has_origin(&h(0)));
     }
 
     #[test]
@@ -167,8 +185,7 @@ mod tests {
         let mut m = HashMap::new();
         m.insert(h(1), vec![nid(0xA), nid(0xB)]);
         m.insert(h(2), vec![nid(0xC)]);
-        let dir = ConfigOriginDirectory::new(m);
-        assert_eq!(dir.len(), 2);
+        let dir = StaticOriginDirectory::new(m);
         assert_eq!(dir.lookup_origins(&h(1)), vec![nid(0xA), nid(0xB)]);
         assert_eq!(dir.lookup_origins(&h(2)), vec![nid(0xC)]);
         // Unknown hash falls through to an empty vec — the caller
@@ -186,7 +203,7 @@ mod tests {
         let mut m = HashMap::new();
         m.insert(h(1), vec![nid(0xA)]);
         m.insert(h(2), Vec::new()); // present key, no origins
-        let dir = ConfigOriginDirectory::new(m);
+        let dir = StaticOriginDirectory::new(m);
         assert!(dir.has_origin(&h(1)));
         assert!(!dir.has_origin(&h(2)));
         assert!(!dir.has_origin(&h(3)));

@@ -1643,7 +1643,9 @@ mod tests {
     // authorized origin; an unset gate keeps the permissionless default.
     #[test]
     fn pull_origin_gate_decision() {
-        use crate::dht::origin::{ConfigOriginDirectory, Hash as OriginHash, OriginDirectory};
+        use crate::dht::origin::{
+            EmptyOriginDirectory, Hash as OriginHash, OriginDirectory, StaticOriginDirectory,
+        };
         use crate::dht::routing::NodeId;
 
         let h = OriginHash::from_bytes([7u8; 32]);
@@ -1651,14 +1653,16 @@ mod tests {
         // Unset gate (default): never blocks — cache role stays permissionless.
         assert!(!pull_origin_gate_blocks(None, &h));
 
-        // Opted in, empty directory: blocks — no authorized origin for the hash.
-        let empty: Arc<dyn OriginDirectory> = Arc::new(ConfigOriginDirectory::empty());
+        // Opted in on a node with no chain addresses — the runtime's fallback
+        // shape. Blocks every hash, which is the #1292 hazard: on the wire this
+        // is indistinguishable from a plain miss.
+        let empty: Arc<dyn OriginDirectory> = Arc::new(EmptyOriginDirectory);
         assert!(pull_origin_gate_blocks(Some(&empty), &h));
 
         // Opted in, directory holds an authorized origin: allows the pull.
         let mut m = HashMap::new();
         m.insert(h, vec![NodeId::from_bytes([1u8; 32])]);
-        let authorized: Arc<dyn OriginDirectory> = Arc::new(ConfigOriginDirectory::new(m));
+        let authorized: Arc<dyn OriginDirectory> = Arc::new(StaticOriginDirectory::new(m));
         assert!(!pull_origin_gate_blocks(Some(&authorized), &h));
         // A different, unclaimed hash through the same directory is still blocked.
         assert!(pull_origin_gate_blocks(

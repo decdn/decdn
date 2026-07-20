@@ -1213,7 +1213,7 @@ async fn cached_candidates(deps: &NodeOriginDeps, target: DhtHash) -> Option<Vec
         // deregistration clears it), which is what let a node ejected inside the
         // TTL win a paid pull the cold path would deny (#1223 review).
         //
-        // NOTE: an origin from a populated `ConfigOriginDirectory` (tests) that is
+        // NOTE: an origin from a populated `StaticOriginDirectory` (tests) that is
         // not a staker is skipped here and falls through to the cold path, where
         // that unfiltered fallback re-serves it — such directories get correctness,
         // not hit acceleration. Production directories are chain-backed and

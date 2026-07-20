@@ -27,7 +27,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use decdn_common::config::{ResolvedPrefetch, ResolvedSecurity};
-use decdn_node::dht::origin::{ConfigOriginDirectory, Hash, OriginDirectory};
+use decdn_node::dht::origin::{Hash, OriginDirectory, StaticOriginDirectory};
 use decdn_node::dht::routing::RoutingTable;
 use decdn_node::dht::{
     DhtRateLimiter, RecordStore, RecordStoreConfig, StakerSet, rate_limit::DhtRateLimitConfig,
@@ -1960,7 +1960,7 @@ async fn find_value_feeds_prefetch_engine_and_meters() -> anyhow::Result<()> {
         Hash::from_bytes(target),
         vec![NodeId::from_bytes([1u8; 32])],
     );
-    let dir: Arc<dyn OriginDirectory> = Arc::new(ConfigOriginDirectory::new(origins));
+    let dir: Arc<dyn OriginDirectory> = Arc::new(StaticOriginDirectory::new(origins));
 
     let cfg = ResolvedPrefetch {
         enabled: true,
