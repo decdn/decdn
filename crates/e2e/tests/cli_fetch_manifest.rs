@@ -44,17 +44,17 @@
     clippy::too_many_lines
 )]
 
-use std::path::PathBuf;
 use std::time::Duration;
 
 use alloy::primitives::U256;
 use anyhow::Context;
 use decdn_cache::Hash;
 use decdn_e2e::chain::ChainFixture;
+use decdn_e2e::cli::{decdn_command, ensure_decdn_cli_built};
 use decdn_e2e::node::NodeFixture;
 use decdn_incentive::buyer_channel::BuyerChannelStore;
 use decdn_incentive::buyer_channel_redb::RedbBuyerChannelStore;
-use decdn_incentive::eth_identity::{self, KEYSTORE_PASSWORD_ENV};
+use decdn_incentive::eth_identity;
 
 const DEPOSIT_MICRO_USDC: u64 = 10_000_000; // 10 USDC (>= deploy minDeposit)
 const KEYSTORE_PASSWORD: &str = "manifest-e2e-password";
@@ -95,7 +95,9 @@ async fn run() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .try_init();
 
-    let decdn = decdn_cli_bin()?;
+    // Fail fast (before anvil starts) if `cargo build -p decdn-cli` hasn't run;
+    // the per-invocation `decdn_command` below repeats the same lookup.
+    ensure_decdn_cli_built()?;
     let chain = ChainFixture::launch().await?;
 
     // The file: three distinct chunks. Small enough to keep the journey fast; the
@@ -160,22 +162,22 @@ async fn run() -> anyhow::Result<()> {
     // `ChannelOpened` event (~500ms poll). `decdn fetch` has no internal retry, so
     // the first run opens+records the channel and races the watcher (refused with
     // `NotFound`); later runs reuse that recorded channel and succeed once
-    // observation lands. The keystore password reaches the child via the env
-    // source `fetch` checks before prompting — `Command::env` sets it safely (no
-    // `set_var`, which the workspace forbids).
+    // observation lands.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
     loop {
-        let output = tokio::process::Command::new(&decdn)
-            .arg("fetch")
-            .args(&args)
-            .env(KEYSTORE_PASSWORD_ENV, KEYSTORE_PASSWORD)
-            // Isolate HOME so the child never reads this machine's real
-            // `~/.decdn/node.toml` (its `blockchain.eth_keystore` would otherwise
-            // override the flags) and writes chunk parts under the tempdir.
-            .env("HOME", client_dir.path())
-            .output()
-            .await
-            .context("spawn decdn fetch")?;
+        // `fetch_argv` pins both `--data-dir` and `--keystore`, and flags beat
+        // config, so this journey's paths are already its own. The isolation
+        // `decdn_command` adds is defense in depth: it keeps a developer's
+        // `~/.decdn/node.toml` from being parsed at all (a malformed one would
+        // fail the run), and strips the `DECDN_*` namespace, which outranks
+        // both (#1332).
+        let output =
+            tokio::process::Command::from(decdn_command(client_dir.path(), KEYSTORE_PASSWORD)?)
+                .arg("fetch")
+                .args(&args)
+                .output()
+                .await
+                .context("spawn decdn fetch")?;
         if output.status.success() {
             break;
         }
@@ -300,27 +302,4 @@ fn fetch_argv(
         "--deposit-micro-usdc".into(),
         DEPOSIT_MICRO_USDC.to_string(),
     ]
-}
-
-/// Locate the built `decdn` binary relative to the current test executable
-/// (`target/<profile>/decdn`), falling back to `DECDN_CLI_BIN`. Mirrors the
-/// node fixture's `decdn_node_bin`.
-fn decdn_cli_bin() -> anyhow::Result<PathBuf> {
-    if let Some(p) = std::env::var_os("DECDN_CLI_BIN") {
-        return Ok(PathBuf::from(p));
-    }
-    let exe = std::env::current_exe().context("current_exe")?;
-    // .../target/<profile>/deps/<test-bin>  → .../target/<profile>/decdn
-    let profile_dir = exe
-        .parent()
-        .and_then(|deps| deps.parent())
-        .context("resolve target profile dir")?;
-    let bin = profile_dir.join(if cfg!(windows) { "decdn.exe" } else { "decdn" });
-    anyhow::ensure!(
-        bin.exists(),
-        "decdn binary not found at {}; run `cargo build -p decdn-cli` first \
-         (or set DECDN_CLI_BIN)",
-        bin.display()
-    );
-    Ok(bin)
 }

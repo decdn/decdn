@@ -12,6 +12,8 @@
     clippy::panic
 )]
 
+mod common;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -226,7 +228,7 @@ fn json_status_line_shape_via_binary() {
     write_files(&src, &[("a.txt", b"x")]);
     let out = dir.path().join("b.json");
 
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_decdn"))
+    let output = common::decdn_command(dir.path())
         .args(["bundle", "create", "--json"])
         .arg("-i")
         .arg(&src)
@@ -255,7 +257,7 @@ fn json_status_line_shape_via_binary() {
 fn run_bundle_create_json(src: &Path) -> String {
     let dir = TempDir::new().unwrap();
     let out = dir.path().join("b.json");
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_decdn"))
+    let output = common::decdn_command(dir.path())
         .args(["bundle", "create", "--json"])
         .arg("-i")
         .arg(src)

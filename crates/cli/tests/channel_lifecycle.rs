@@ -16,9 +16,10 @@
     clippy::panic
 )]
 
+mod common;
+
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use std::process::Command;
 
 use alloy::primitives::{Address, B256, U256};
 use decdn_cli::commands::channel::channel_dispatch;
@@ -99,7 +100,7 @@ fn clean_with_only_an_undecodable_row_does_not_claim_nothing_to_clean() {
     let provider = Address::repeat_byte(0x55);
     seed_corrupt(dir.path(), provider);
 
-    let output = Command::new(env!("CARGO_BIN_EXE_decdn"))
+    let output = common::decdn_command(dir.path())
         .arg("--config")
         .arg(cfg)
         .args([

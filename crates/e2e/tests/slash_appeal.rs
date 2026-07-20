@@ -34,7 +34,6 @@
     clippy::duration_suboptimal_units
 )]
 
-use std::process::Command;
 use std::time::Duration;
 
 use alloy::primitives::{Address, B256, U256};
@@ -44,8 +43,9 @@ use anyhow::Context;
 use decdn_common::admin::AdminRpcClient;
 use decdn_e2e::bindings::SlashAppeal;
 use decdn_e2e::chain::ChainFixture;
+use decdn_e2e::cli::decdn_command;
 use decdn_e2e::client::ClientFixture;
-use decdn_e2e::node::{KEYSTORE_PASSWORD, NodeFixture, decdn_cli_bin};
+use decdn_e2e::node::{KEYSTORE_PASSWORD, NodeFixture};
 use decdn_e2e::time;
 
 const MIB: usize = 1024 * 1024;
@@ -165,7 +165,7 @@ async fn run() -> anyhow::Result<()> {
     // the appeal bond first — the CLI approves + posts it.
     chain.transfer_token(node_a.operator_addr(), bond).await?;
     let balance_before = chain.token_balance(node_a.operator_addr()).await?;
-    run_appeal_cli(node_a.config_path(), slash_id, evidence)?;
+    run_appeal_cli(&node_a, slash_id, evidence)?;
     assert_eq!(
         chain.appeal_status(slash_id).await?,
         STATUS_OPEN,
@@ -268,26 +268,17 @@ async fn fund_and_approve_bond(
     Ok(())
 }
 
-/// Run the built `decdn appeal slash` command against operator A's config +
-/// keystore, asserting a clean exit. Mirrors the daemon-binary lookup in the
-/// node fixture.
-fn run_appeal_cli(
-    config_path: &std::path::Path,
-    slash_id: U256,
-    evidence: B256,
-) -> anyhow::Result<()> {
-    let status = Command::new(decdn_cli_bin()?)
+/// Run the built `decdn appeal slash` command against the rendered config and
+/// keystore of `node`, asserting a clean exit. `decdn_command` supplies the
+/// keystore password and pins `HOME` to the fixture data dir.
+fn run_appeal_cli(node: &NodeFixture, slash_id: U256, evidence: B256) -> anyhow::Result<()> {
+    let status = decdn_command(node.data_dir(), KEYSTORE_PASSWORD)?
         .arg("appeal")
         .arg("slash")
         .arg(slash_id.to_string())
         .arg(format!("{evidence:#x}"))
         .arg("--config")
-        .arg(config_path)
-        .env("DECDN_KEYSTORE_PASSWORD", KEYSTORE_PASSWORD)
-        .env(
-            "RUST_LOG",
-            std::env::var("DECDN_NODE_LOG").unwrap_or_else(|_| "warn".into()),
-        )
+        .arg(node.config_path())
         .status()
         .context("spawn decdn appeal slash")?;
     anyhow::ensure!(

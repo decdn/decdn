@@ -11,6 +11,8 @@
 //!   wired to the chain, with its admin RPC client and graceful teardown.
 //! - [`client::ClientFixture`] — drive the real paid client path against a node
 //!   and verify delivered bytes.
+//! - [`cli::decdn_command`] — spawn the user-facing `decdn` binary under an
+//!   isolated `HOME`, so a journey never touches the developer's `~/.decdn`.
 //! - [`time`] — advance anvil time across dispute / timelock / unbond windows.
 //! - [`mod@assert`] — on-chain + admin-RPC + delivered-bytes assertion helpers.
 //!
@@ -29,6 +31,7 @@
 pub mod assert;
 pub mod bindings;
 pub mod chain;
+pub mod cli;
 pub mod client;
 pub mod node;
 pub mod time;

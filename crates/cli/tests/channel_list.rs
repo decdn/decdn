@@ -16,7 +16,8 @@
 )]
 
 use std::os::unix::fs::PermissionsExt;
-use std::process::Command;
+
+mod common;
 
 use alloy::primitives::{Address, B256, U256};
 use decdn_cli::commands::channel::channel_dispatch;
@@ -104,7 +105,7 @@ fn undecodable_row_is_named_on_stderr() {
     let provider = Address::repeat_byte(0x44);
     seed_corrupt(dir.path(), provider);
 
-    let output = Command::new(env!("CARGO_BIN_EXE_decdn"))
+    let output = common::decdn_command(dir.path())
         .args(["channel", "list", "--data-dir"])
         .arg(dir.path())
         .output()
@@ -131,7 +132,7 @@ fn json_lists_skipped_providers_in_band_alongside_healthy_channels() {
     seed(dir.path(), 0x11);
     seed_corrupt(dir.path(), corrupt);
 
-    let output = Command::new(env!("CARGO_BIN_EXE_decdn"))
+    let output = common::decdn_command(dir.path())
         .args(["channel", "list", "--json", "--data-dir"])
         .arg(dir.path())
         .output()
