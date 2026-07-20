@@ -24,7 +24,10 @@ pub fn ensure_decdn_cli_built() -> anyhow::Result<()> {
 fn decdn_cli_bin() -> anyhow::Result<PathBuf> {
     let overridden = std::env::var_os("DECDN_CLI_BIN");
     let bin = if let Some(p) = &overridden {
-        PathBuf::from(p)
+        // Expand `~` as the production CLI does for every user-supplied path
+        // (`cli::common::expand_tilde`): a quoted `~/…` in a shell rc reaches
+        // us literally, since only unquoted tildes are expanded by the shell.
+        decdn_common::cli::common::expand_tilde(Path::new(p))
     } else {
         let exe = std::env::current_exe().context("current_exe")?;
         // .../target/<profile>/deps/<test-bin>  → .../target/<profile>/decdn
@@ -36,11 +39,15 @@ fn decdn_cli_bin() -> anyhow::Result<PathBuf> {
     };
     // Check both branches: an unvalidated `DECDN_CLI_BIN` would defer a stale
     // path to a bare "No such file or directory" at spawn time, naming neither
-    // the variable nor the path tried.
+    // the variable nor the path tried. Report it absolute — a relative override
+    // resolves against the test process's cwd (the *crate* root, not the
+    // workspace root), so the bare string is not enough to debug the miss.
     anyhow::ensure!(
         bin.exists(),
         "decdn binary not found at {}{}",
-        bin.display(),
+        std::path::absolute(&bin)
+            .unwrap_or_else(|_| bin.clone())
+            .display(),
         if overridden.is_some() {
             " (from DECDN_CLI_BIN — stale or misspelled?)"
         } else {
@@ -114,7 +121,9 @@ pub(crate) fn hermetic_command(
         home.display()
     );
     let mut cmd = std::process::Command::new(bin);
-    // Strip before setting, or the two `env` calls below are stripped too.
+    // Strip before setting: `DECDN_KEYSTORE_PASSWORD` is itself in the stripped
+    // namespace, so the reverse order would remove the password we just set
+    // (`HOME` and `RUST_LOG` are unaffected either way).
     strip_decdn_env(&mut cmd, std::env::vars_os().map(|(k, _)| k));
     cmd.env("HOME", home)
         .env(

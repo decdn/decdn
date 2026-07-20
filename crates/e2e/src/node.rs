@@ -491,7 +491,9 @@ fn write_fs_origin_blob(root: &std::path::Path, hash: &Hash, blob: &[u8]) -> any
 fn decdn_node_bin() -> anyhow::Result<PathBuf> {
     let overridden = std::env::var_os("DECDN_NODE_BIN");
     let bin = if let Some(p) = &overridden {
-        PathBuf::from(p)
+        // Tilde-expanded like `cli::decdn_cli_bin`, matching how the production
+        // CLI treats every user-supplied path.
+        decdn_common::cli::common::expand_tilde(std::path::Path::new(p))
     } else {
         let exe = std::env::current_exe().context("current_exe")?;
         // .../target/<profile>/deps/<test-bin>  → .../target/<profile>/decdn-node
@@ -506,11 +508,15 @@ fn decdn_node_bin() -> anyhow::Result<PathBuf> {
         })
     };
     // Check both branches, so a stale `DECDN_NODE_BIN` fails here rather than as
-    // a bare "No such file or directory" at spawn time (mirrors `cli::decdn_cli_bin`).
+    // a bare "No such file or directory" at spawn time, and report the path
+    // absolute since a relative override resolves against the crate root
+    // (mirrors `cli::decdn_cli_bin`).
     anyhow::ensure!(
         bin.exists(),
         "decdn-node binary not found at {}{}",
-        bin.display(),
+        std::path::absolute(&bin)
+            .unwrap_or_else(|_| bin.clone())
+            .display(),
         if overridden.is_some() {
             " (from DECDN_NODE_BIN — stale or misspelled?)"
         } else {
