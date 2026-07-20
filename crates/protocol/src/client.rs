@@ -675,7 +675,8 @@ pub enum StreamError {
     NotFound,
     /// Node is at capacity; try another node.
     Overloaded,
-    /// Blob exceeds the node's configured `max_blob_size`; do not retry it.
+    /// Blob exceeds this node's configured `max_blob_size`; try another node,
+    /// but do not retry this one for the same blob.
     BlobTooLarge,
     /// Unexpected failure; do not retry this node.
     InternalError,
