@@ -102,6 +102,16 @@ mod sol_types {
 
             /// A `(region, hash)` entry was removed. `version` as above.
             event HashRemoved(bytes32 indexed region, bytes32 indexed hash, uint256 version);
+
+            /// An appeal-driven suspend/resume flipped whether a still-present
+            /// entry is enforced (`suspended` gates the contract's `_isLive`, and
+            /// therefore `isHashBlacklistedForOperator`). Neither add nor remove,
+            /// so it emits no `HashBlacklisted`/`HashRemoved` — without this event
+            /// a resume is invisible until the next batched re-scope, and serving
+            /// a re-enforced hash in that window is slashable. `version` as above.
+            event HashSuspensionUpdated(
+                bytes32 indexed region, bytes32 indexed hash, uint256 version, bool suspended
+            );
         }
     }
 }
