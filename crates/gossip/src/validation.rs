@@ -14,12 +14,16 @@ use thiserror::Error;
 
 use crate::reputation::StakedNodeSet;
 
-/// ADR 001 rule-2 admission gate for inbound `NodeAnnounce`, naming the two
-/// safety-opposite states the old `Option<&dyn StakedNodeSet>` conflated:
-/// [`Self::Enforce`] gates on staked membership, [`Self::Disabled`] fails open.
-/// The generic `S` is the membership-set handle — `&dyn StakedNodeSet` on the
-/// borrowed [`validate_envelope`] path, `Arc<dyn StakedNodeSet>` on the owned
-/// spawn path (see [`OwnedAnnounceGate`]).
+/// ADR 001 rule-2 admission gate for inbound `NodeAnnounce`, naming its two
+/// safety-opposite states so neither is the silent default: [`Self::Enforce`]
+/// gates on staked membership, [`Self::Disabled`] fails open. The generic `S` is
+/// the membership-set handle — `&dyn StakedNodeSet` on the borrowed
+/// [`validate_envelope`] path, `Arc<dyn StakedNodeSet>` on the owned spawn path
+/// (see [`OwnedAnnounceGate`]).
+// `Copy` is conditional: it applies only where `S: Copy`, i.e. the borrowed
+// `AnnounceGate<&dyn StakedNodeSet>`. The owned `OwnedAnnounceGate` (an `Arc`)
+// is `Clone`-only, so `gate.clone()` at each subscriber is a refcount bump, not
+// an `Arc` copy — do not read `Copy` as copying the set.
 #[derive(Clone, Copy)]
 pub enum AnnounceGate<S> {
     /// Enforce rule 2: accept an announce only when its author `node_id` is a
@@ -50,8 +54,8 @@ impl<S> std::fmt::Debug for AnnounceGate<S> {
 pub type OwnedAnnounceGate = AnnounceGate<Arc<dyn StakedNodeSet>>;
 
 impl OwnedAnnounceGate {
-    /// Borrow this owned gate as the validate-path gate — replaces the old
-    /// `Option::as_deref` bridge at the `validate_envelope` call site.
+    /// Borrow-project this owned gate into the borrowed form
+    /// [`validate_envelope`] takes, preserving the variant (`Enforce`/`Disabled`).
     pub fn as_gate(&self) -> AnnounceGate<&dyn StakedNodeSet> {
         match self {
             AnnounceGate::Enforce(s) => AnnounceGate::Enforce(s.as_ref()),
