@@ -26,6 +26,7 @@
 //! so raw single-blob downloads are untouched by this path.
 
 use std::future::Future;
+use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, bail};
@@ -210,6 +211,42 @@ where
     Fut: Future<Output = anyhow::Result<Vec<u8>>>,
 {
     let part_dir = downloads_root.join(hex(&manifest_hash));
+
+    // Ensure the never-GC'd downloads root exists first: the lockfile is opened
+    // there (O_CREAT) before the part dir is touched.
+    blocking(
+        {
+            let root = downloads_root.to_path_buf();
+            move || std::fs::create_dir_all(&root)
+        },
+        || format!("create downloads root {}", downloads_root.display()),
+    )
+    .await?;
+
+    // Cross-process advisory lock (#1303). `bundle pull`'s per-hash dedup already
+    // guarantees a single reconstruction of this manifest *within* one process;
+    // this `flock` extends that guarantee across separate `decdn` invocations
+    // sharing `downloads_root`, which would otherwise share this part directory —
+    // one process's `--no-keep-blobs` cleanup deleting parts mid-concatenate in
+    // the other, or both re-fetching and re-paying for every chunk. Held for the
+    // whole reconstruction (fetch → concat → optional cleanup) and released when
+    // `_lock` drops. `flock` frees on close, so a crashed holder needs no staleness
+    // policy.
+    let _lock = {
+        let root = downloads_root.to_path_buf();
+        let name = hex(&manifest_hash);
+        blocking(
+            move || acquire_part_lock(&root, &name),
+            || format!("lock reconstruction of {}", hex(&manifest_hash)),
+        )
+        .await?
+    };
+
+    // Create the part dir *under* the lock. A prior holder running
+    // `--no-keep-blobs` removes this dir during its (locked) cleanup, so a waiter
+    // that created it pre-lock could find it gone the moment it acquires the lock;
+    // the first `write_blob_atomic` would then fail `ENOENT` after already paying
+    // for a chunk. Creating it here, inside the critical section, closes that.
     blocking(
         {
             let dir = part_dir.clone();
@@ -346,6 +383,36 @@ where
         Ok(inner) => inner.map_err(Into::into).with_context(context),
         Err(join) => Err(anyhow::Error::new(join)).with_context(context),
     }
+}
+
+/// Acquire an exclusive, cross-process advisory lock for reconstructing the
+/// manifest named by `hex_name` (#1303).
+///
+/// The lock is a `flock` on a persistent `<downloads_root>/<hex>.lock` file — it
+/// is deliberately **not** the part directory nor a file inside it. Under
+/// `--no-keep-blobs` the part directory is removed at the end, and locking a
+/// target that is removed-then-recreated lets two processes hold locks on
+/// *different* inodes and both proceed. The lockfile lives in the never-GC'd
+/// downloads root and is never removed: it is empty, and the downloads root
+/// already accumulates by design (see [`remove_parts`]). `flock` releases on
+/// `close`, so a crashed holder frees it with no staleness bookkeeping.
+///
+/// Blocking until the holder finishes is intended: the waiter then finds the
+/// holder's verified parts (default retention — free) or re-fetches them
+/// (`--no-keep-blobs`, a separate cross-process payment).
+fn acquire_part_lock(downloads_root: &Path, hex_name: &str) -> anyhow::Result<OwnedFd> {
+    use rustix::fs::{FlockOperation, Mode, OFlags, flock, open};
+
+    let lock_path = downloads_root.join(format!("{hex_name}.lock"));
+    let fd = open(
+        &lock_path,
+        OFlags::CREATE | OFlags::RDWR | OFlags::CLOEXEC,
+        Mode::RUSR | Mode::WUSR,
+    )
+    .with_context(|| format!("open lock file {}", lock_path.display()))?;
+    flock(&fd, FlockOperation::LockExclusive)
+        .with_context(|| format!("flock {}", lock_path.display()))?;
+    Ok(fd)
 }
 
 /// Whether an existing part file already holds this chunk's verified bytes.
@@ -667,6 +734,37 @@ mod tests {
 
         assert_eq!(std::fs::read(&out).unwrap(), b"onetwo");
         assert!(!downloads.join(hex(&hash)).exists());
+    }
+
+    /// #1303: the cross-process lock is a persistent lockfile in the *downloads
+    /// root* — a sibling of the part dir, never inside it — so `--no-keep-blobs`
+    /// sweeping the part dir can't take the lock target with it. If it could, two
+    /// `decdn` processes would lock different inodes and both proceed, re-opening
+    /// the race the lock exists to close. Assert the lockfile is created and
+    /// outlives the part-dir cleanup.
+    #[tokio::test]
+    async fn reconstruct_leaves_a_persistent_cross_process_lockfile() {
+        let chunks: [&[u8]; 2] = [b"one", b"two"];
+        let (manifest, blob) = manifest_for(&chunks);
+        let hash = *blake3::hash(&blob).as_bytes();
+        let dir = tempfile::tempdir().unwrap();
+        let downloads = dir.path().join("downloads");
+        let out = dir.path().join("out.bin");
+        let src = Source::new(&chunks);
+
+        // --no-keep-blobs: the part dir is swept, but the lockfile must remain.
+        reconstruct(&manifest, hash, &downloads, &out, false, |h| src.get(h))
+            .await
+            .unwrap();
+
+        assert!(
+            downloads.join(format!("{}.lock", hex(&hash))).exists(),
+            "lockfile must persist in the downloads root for cross-process serialization"
+        );
+        assert!(
+            !downloads.join(hex(&hash)).exists(),
+            "part dir is swept under --no-keep-blobs, but the sibling lockfile is not"
+        );
     }
 
     /// `--no-keep-blobs` cleanup must *surface* a part dir it cannot empty, not

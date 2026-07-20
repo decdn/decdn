@@ -161,12 +161,21 @@ fetching its own blob hash first (`--hash`, mutually exclusive) — and
 fetches every entry over the paid `cdn/client/v1` path (the same kernel
 as `decdn fetch`):
 
-- **Node selection is per entry.** With an explicit `--node-id` every
-  entry is pulled from that one node; otherwise each entry independently
-  discovers a holder among the region-nearest active nodes
-  (`CapacityBond`, read once), so different entries may come from
-  different nodes.
-- **Concurrency** is bounded by `--jobs`. A payment channel's vouchers
+- **Node selection is per distinct blob.** With an explicit `--node-id`
+  every entry is pulled from that one node; otherwise each distinct blob
+  independently discovers a holder among the region-nearest active nodes
+  (`CapacityBond`, read once), so different blobs may come from different
+  nodes.
+- **Duplicate blobs are fetched once.** A bundle may hold one file's
+  content at two paths (nothing dedupes `entries[]` by `hash`). Entries
+  sharing a `hash` are grouped and the blob is fetched — and **paid for**
+  — a single time; the first destination receives the materialized bytes
+  and every other destination is a hard link (or a copy, on a
+  cross-device target) of it. Skip-existing and `--overwrite` are still
+  evaluated **per destination**, so an already-present duplicate path
+  triggers no fetch of its own (the group still fetches once if any
+  sibling path needs bytes).
+- **Concurrency** is bounded by `--jobs` (over distinct blobs). A payment channel's vouchers
   use a strictly increasing nonce, so fetches that share one provider's
   channel are serialized by a per-provider lock (which also makes the
   lazy open-or-reuse first-touch race-free); distinct providers proceed
@@ -188,5 +197,5 @@ there is no separate verify toggle.
 ### Deferred
 
 - Coverage is limited to the region-nearest candidate set probed per
-  entry; an entry no probed node holds fails (re-runnable). Broadening
-  beyond that set is a follow-up.
+  distinct blob; a blob no probed node holds fails every entry naming it
+  (re-runnable). Broadening beyond that set is a follow-up.

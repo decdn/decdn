@@ -50,6 +50,10 @@ walkdir = { workspace = true }
 globset = { workspace = true }
 blake3 = { workspace = true }
 tempfile = { workspace = true }
+# Cross-process advisory `flock` on the chunk-reconstruction part dir (#1303) so
+# two `decdn` invocations sharing a client data dir can't race the same part
+# directory. `fs`-only; already in this binary's tree transitively, no iroh-blobs.
+rustix = { workspace = true }
 # `DECDNMAN` file manifests (ADR 012 § File Manifests, #1183) are postcard-encoded,
 # so the client decodes them with the same codec the wire protocol uses. Already in
 # this binary's tree via `decdn-protocol`; no new dependency weight.
