@@ -1039,9 +1039,10 @@ mod tests {
     /// regional entry for the hash while leaving other hashes untouched.
     #[test]
     fn drop_hash_clears_all_regions_for_that_hash_only() -> Result<()> {
+        let store = Arc::new(MemEntryStore::default());
         let evicted = Hash::from_bytes([0xEE; 32]);
         let retained = Hash::from_bytes([0x11; 32]);
-        let mut state = state();
+        let mut state = state_with(store.clone());
         state.add_entry(US, evicted)?;
         state.add_entry(FR, evicted)?;
         state.add_entry(FR, retained)?;
@@ -1051,6 +1052,14 @@ mod tests {
         assert!(!state.known.contains(&(US, evicted)));
         assert!(!state.known.contains(&(FR, evicted)));
         assert_eq!(state.distinct_hashes(), vec![retained]);
+        // The durable half. Without this the in-memory assertions above pass
+        // even if `drop_hash` stops writing through, and the evicted hash walks
+        // back in on the next boot's reload.
+        assert_eq!(
+            store.load_blacklist_entries()?,
+            vec![(FR.0, *retained.as_bytes())],
+            "eviction must clear the hash from the durable set in every region"
+        );
         Ok(())
     }
 
