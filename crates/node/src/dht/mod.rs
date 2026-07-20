@@ -35,7 +35,7 @@ pub use negative_cache::NegativeProbeCache;
 pub use node_address::{
     ChainNodeAddressDirectory, NodeAddressResolver, StaticNodeAddressDirectory,
 };
-pub use origin::{ConfigOriginDirectory, OriginDirectory};
+pub use origin::{EmptyOriginDirectory, OriginDirectory, StaticOriginDirectory};
 pub use probe_cache::{PositiveProbeCache, ProbedProvider};
 pub use publish::RepublishScheduler;
 pub use rate_limit::{DhtRateLimiter, DhtRejectLayer};

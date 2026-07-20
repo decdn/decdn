@@ -42,8 +42,8 @@ use decdn_node::client_requester::{ChannelContext, stream_fetch};
 use decdn_node::dht::negative_cache::Hash as DhtHash;
 use decdn_node::dht::routing::{NodeId as DhtNodeId, RoutingTable};
 use decdn_node::dht::{
-    ConfigOriginDirectory, ConfigStakerSet, NegativeProbeCache, NodeAddressResolver,
-    OriginDirectory, PositiveProbeCache, StakerSet, StaticNodeAddressDirectory,
+    ConfigStakerSet, NegativeProbeCache, NodeAddressResolver, OriginDirectory, PositiveProbeCache,
+    StakerSet, StaticNodeAddressDirectory, StaticOriginDirectory,
 };
 use decdn_node::leech_governor::{LeechCaps, LeechCapsConfig, LeechGovernor};
 use decdn_node::metrics::Metrics;
@@ -804,7 +804,7 @@ fn build_origin_with_probe_caches(
         endpoint: ep_b.clone(),
         routing_table: Arc::new(Mutex::new(RoutingTable::new(b_dht))),
         staker_set: Arc::new(stakers) as Arc<dyn StakerSet>,
-        origin_directory: Arc::new(ConfigOriginDirectory::new(dir)) as Arc<dyn OriginDirectory>,
+        origin_directory: Arc::new(StaticOriginDirectory::new(dir)) as Arc<dyn OriginDirectory>,
         addr_resolver: Arc::new(StaticNodeAddressDirectory::new(addr_map))
             as Arc<dyn NodeAddressResolver>,
         buyer,
@@ -871,7 +871,7 @@ fn build_origin_multi_hash(
         // no routing entries — so fetch #1 resolves via the directory as before.
         staker_set: Arc::new(ConfigStakerSet::new(providers.iter().copied().collect()))
             as Arc<dyn StakerSet>,
-        origin_directory: Arc::new(ConfigOriginDirectory::new(dir)) as Arc<dyn OriginDirectory>,
+        origin_directory: Arc::new(StaticOriginDirectory::new(dir)) as Arc<dyn OriginDirectory>,
         addr_resolver: Arc::new(StaticNodeAddressDirectory::new(addr_map))
             as Arc<dyn NodeAddressResolver>,
         buyer,
@@ -1041,7 +1041,7 @@ async fn prefetch_acquire_pulls_and_records_spend() -> Result<()> {
         ..Default::default()
     };
     let authorized_dir: Arc<dyn OriginDirectory> =
-        Arc::new(ConfigOriginDirectory::new(HashMap::from([(
+        Arc::new(StaticOriginDirectory::new(HashMap::from([(
             DhtHash::from_bytes(*hash.as_bytes()),
             vec![DhtNodeId::from_bytes(*a_id.as_bytes())],
         )])));
@@ -1072,7 +1072,7 @@ async fn prefetch_acquire_pulls_and_records_spend() -> Result<()> {
             *b_id.as_bytes(),
         )))),
         staker_set: Arc::new(ConfigStakerSet::empty()) as Arc<dyn StakerSet>,
-        origin_directory: Arc::new(ConfigOriginDirectory::new(HashMap::from([(
+        origin_directory: Arc::new(StaticOriginDirectory::new(HashMap::from([(
             DhtHash::from_bytes(*hash.as_bytes()),
             providers,
         )]))) as Arc<dyn OriginDirectory>,
@@ -1486,7 +1486,7 @@ async fn prefetch_acquired_blob_credits_served_through_serve_loop() -> Result<()
         ..Default::default()
     };
     let authorized_dir: Arc<dyn OriginDirectory> =
-        Arc::new(ConfigOriginDirectory::new(HashMap::from([(
+        Arc::new(StaticOriginDirectory::new(HashMap::from([(
             DhtHash::from_bytes(hash_bytes),
             vec![DhtNodeId::from_bytes(*a_id.as_bytes())],
         )])));
@@ -1516,7 +1516,7 @@ async fn prefetch_acquired_blob_credits_served_through_serve_loop() -> Result<()
             *b_id.as_bytes(),
         )))),
         staker_set: Arc::new(ConfigStakerSet::empty()) as Arc<dyn StakerSet>,
-        origin_directory: Arc::new(ConfigOriginDirectory::new(HashMap::from([
+        origin_directory: Arc::new(StaticOriginDirectory::new(HashMap::from([
             (DhtHash::from_bytes(hash_bytes), providers.clone()),
             // blob2 is discoverable on A too, for the negative control's
             // reactive (non-prefetch) pull-through.
@@ -9441,7 +9441,7 @@ async fn two_concurrent_pulls_to_one_provider_share_the_channel_ledger() -> Resu
             *b_id.as_bytes(),
         )))),
         staker_set: Arc::new(ConfigStakerSet::empty()) as Arc<dyn StakerSet>,
-        origin_directory: Arc::new(ConfigOriginDirectory::new(HashMap::from([
+        origin_directory: Arc::new(StaticOriginDirectory::new(HashMap::from([
             (DhtHash::from_bytes(*hash.as_bytes()), providers.clone()),
             (DhtHash::from_bytes(*hash2.as_bytes()), providers),
         ]))) as Arc<dyn OriginDirectory>,
@@ -11771,7 +11771,7 @@ async fn a_probe_cache_hit_drops_a_provider_no_longer_admitted() -> Result<()> {
     }) as Arc<dyn ChannelOpener>;
 
     // Provisioned inline (the shared builders hardcode `ConfigStakerSet` /
-    // `ConfigOriginDirectory`, which cannot be mutated mid-test). A default 15s
+    // `StaticOriginDirectory`, which cannot be mutated mid-test). A default 15s
     // positive-cache TTL keeps the fetch #1 entry live through the ejection and
     // fetch #2, so only the `is_active` re-check can drop it.
     let origin = NodeOrigin::new();
