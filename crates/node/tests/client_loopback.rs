@@ -680,12 +680,20 @@ impl StalledDelivery {
         signer: &PrivateKeySigner,
         prior: VoucherTotals,
     ) -> anyhow::Result<(Instant, VoucherTotals)> {
+        let amount_delta = min_payment(self.wire_bytes, RATE_PER_MB);
         let settled = VoucherTotals {
-            nonce: prior.nonce.saturating_add(U256::ONE),
-            wire_bytes: prior.wire_bytes.saturating_add(self.wire_bytes),
+            nonce: prior
+                .nonce
+                .checked_add(U256::ONE)
+                .ok_or_else(|| anyhow::anyhow!("voucher nonce overflow"))?,
+            wire_bytes: prior
+                .wire_bytes
+                .checked_add(self.wire_bytes)
+                .ok_or_else(|| anyhow::anyhow!("voucher wire-byte total overflow"))?,
             amount: prior
                 .amount
-                .saturating_add(min_payment(self.wire_bytes, RATE_PER_MB)),
+                .checked_add(amount_delta)
+                .ok_or_else(|| anyhow::anyhow!("voucher amount overflow"))?,
         };
         let voucher = Voucher {
             channel_id: channel_id(),
@@ -884,7 +892,7 @@ async fn idle_clock_re_arms_from_last_stream_close() -> anyhow::Result<()> {
 async fn idle_clock_re_arms_after_each_completed_stream() -> anyhow::Result<()> {
     let payload = vec![0x6Au8; 64 * 1024];
     let idle = Duration::from_secs(1);
-    let activity_cadence = Duration::from_millis(300);
+    let activity_cadence = idle.mul_f64(0.6);
     let fx = idle_fixture(&payload, idle).await?;
     let blob = fx.blob(0)?;
 
@@ -917,6 +925,8 @@ async fn idle_clock_re_arms_after_each_completed_stream() -> anyhow::Result<()> 
     let err = tokio::time::timeout(Duration::from_secs(10), conn.closed())
         .await
         .map_err(|_| anyhow::anyhow!("connection was not reaped after the final idle window"))?;
+    // The server re-arms only after writing StreamEnd, so measuring from the
+    // client's read can only over-report the server-side idle delay.
     let since_completion = final_completion.elapsed();
     ensure_graceful_idle_close(&err)?;
     let floor = idle.mul_f64(0.8);
@@ -989,12 +999,15 @@ async fn concurrent_streams_all_finish_before_idle_clock_arms() -> anyhow::Resul
         "connection was idle-closed while the second stream was still in flight: {premature:?}"
     );
 
-    let (second_completed_at, totals) = stalled_b.pay_and_finish(&fx.client_signer, totals).await?;
+    let (second_completed_at, _totals) =
+        stalled_b.pay_and_finish(&fx.client_signer, totals).await?;
     let err = tokio::time::timeout(Duration::from_secs(10), conn.closed())
         .await
         .map_err(|_| {
             anyhow::anyhow!("connection was not reaped after both concurrent streams completed")
         })?;
+    // The server re-arms only after writing StreamEnd, so measuring from the
+    // client's read can only over-report the server-side idle delay.
     let since_completion = second_completed_at.elapsed();
     ensure_graceful_idle_close(&err)?;
     let floor = idle.mul_f64(0.8);
@@ -1004,28 +1017,23 @@ async fn concurrent_streams_all_finish_before_idle_clock_arms() -> anyhow::Resul
          completion, expected at least {floor:?}"
     );
 
-    anyhow::ensure!(totals.nonce == U256::from(2u64), "nonce: {}", totals.nonce);
-    anyhow::ensure!(
-        totals.wire_bytes == blob_a.wire_bytes + blob_b.wire_bytes,
-        "settled {} wire bytes, expected {}",
-        totals.wire_bytes,
-        blob_a.wire_bytes + blob_b.wire_bytes
-    );
+    let expected_wire_bytes = blob_a
+        .wire_bytes
+        .checked_add(blob_b.wire_bytes)
+        .ok_or_else(|| anyhow::anyhow!("expected wire-byte total overflow"))?;
     let persisted = fx.store.load_all()?;
     let only = persisted
         .first()
         .ok_or_else(|| anyhow::anyhow!("no persisted channel"))?;
     anyhow::ensure!(
-        only.last_nonce() == totals.nonce,
-        "persisted nonce: {}, expected {}",
-        only.last_nonce(),
-        totals.nonce
+        only.last_nonce() == U256::from(2u64),
+        "persisted nonce: {}, expected 2",
+        only.last_nonce()
     );
     anyhow::ensure!(
-        only.last_bytes_delivered() == U256::from(totals.wire_bytes),
-        "persisted bytes: {}, expected {}",
+        only.last_bytes_delivered() == U256::from(expected_wire_bytes),
+        "persisted bytes: {}, expected {expected_wire_bytes}",
         only.last_bytes_delivered(),
-        totals.wire_bytes
     );
     anyhow::ensure!(
         metric_line_present(&fx.metrics.encode()?, "decdn_client_idle_close_total 1"),
