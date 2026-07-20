@@ -217,9 +217,10 @@ impl GossipService {
     /// subscriber task silently dead.
     ///
     /// `gate` admits `NodeAnnounce` per ADR 001 rule 2. The runtime always
-    /// passes [`AnnounceGate::Enforce`] over the live registry set;
-    /// [`AnnounceGate::Disabled`] (accept any signature-valid announce) is for
-    /// tests only — there is no production path that disables the gate.
+    /// passes [`AnnounceGate::Enforce`](crate::AnnounceGate::Enforce) over the
+    /// live registry set; [`AnnounceGate::Disabled`](crate::AnnounceGate::Disabled)
+    /// (accept any signature-valid announce) is for tests only — there is no
+    /// production path that disables the gate.
     #[allow(
         clippy::too_many_arguments,
         clippy::needless_pass_by_value,
