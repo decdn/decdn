@@ -1248,9 +1248,9 @@ async fn build_chain_and_handlers(
     // and delivery refusal — the node's only local protection against the slash
     // for serving blacklisted content. `blacklist_ready_rx` gates the ALPN
     // router below on that first pass; the returned `WatcherHandle` owns the
-    // loop's shutdown token (its sink shares it, #1236), and because the watcher
-    // persists no cursor the handle's `AbortOnDrop` is a sufficient backstop
-    // after the graceful `shutdown()` at teardown.
+    // loop's shutdown token (its sink shares it, #1236). Since #1181 the watcher
+    // does persist a scan cursor, so teardown flushes `CheckpointKey::Blacklist`
+    // explicitly (see the shutdown path) rather than relying on `AbortOnDrop`.
     let (blacklist_ready_tx, blacklist_ready_rx) = oneshot::channel();
     let blacklist_watcher = crate::blacklist_watcher::spawn(
         ProviderFactory::read_only(blacklist_rpc_url, event_poll_interval),
@@ -1263,6 +1263,12 @@ async fn build_chain_and_handlers(
         Duration::from_secs(cfg.blockchain.content_blacklist_poll_interval_sec),
         blacklist_ready_tx,
         &infra.node_metrics,
+        // The deny-set store must be the *unbuffered* concrete store: the resume
+        // cursor's safety rests on those writes being durable before it advances.
+        // The cursor itself may ride the debounced checkpoint store — a lagging
+        // cursor only widens the next rescan, which is idempotent.
+        infra.concrete_channel_store.clone(),
+        Arc::clone(&infra.watcher_checkpoint_store),
     );
 
     // Bootstrap (ADR 022 §Bootstrap): seed the routing table from the
@@ -2370,6 +2376,18 @@ async fn shutdown<P: Provider + Clone + 'static>(
         watcher_checkpoint_store.flush_checkpoint(decdn_incentive::CheckpointKey::Origin)
     {
         tracing::warn!(%err, "failed to flush origin-directory scan checkpoint on shutdown");
+    }
+    // Same treatment for the blacklist cursor, which became a persisted cursor
+    // once the deny-set itself was made durable (#1181) and likewise has no
+    // owning service. Also best-effort, and for the same reason it is *only* an
+    // efficiency concern: a lost flush leaves the cursor lagging, and the sinks
+    // are idempotent, so the next boot merely re-scans a wider span. Under-
+    // enforcement is not on the table — the deny-set it rebuilds from is durable
+    // independently of this cursor.
+    if let Err(err) =
+        watcher_checkpoint_store.flush_checkpoint(decdn_incentive::CheckpointKey::Blacklist)
+    {
+        tracing::warn!(%err, "failed to flush blacklist scan checkpoint on shutdown");
     }
     // Admin server shutdown is ordered per `admin_stop_order`:
     //

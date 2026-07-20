@@ -31,18 +31,33 @@
 //! only thing that catches a region/ripening transition, which emits no event at
 //! all — so the two are complementary, not redundant.
 //!
-//! **Full replay each boot (no persisted cursor).** `known` is in-memory and the
-//! contract has no enumeration, so the deny-set can only be rebuilt by replaying
-//! `HashBlacklisted` from the deploy block on **every** start (`from_block`
-//! floor, no persist). A persisted scan cursor would resume past logs whose
-//! (still out-of-scope, so un-evicted) entries are gone from the in-memory
-//! `known`, silently dropping them from re-scoping — a compliance gap, since
-//! serving a blacklisted hash is slashable. The #1108 crash-loop (a rate-limited
-//! boot tripping the startup preflight) is instead mitigated by the preflight's
-//! bounded 429/5xx retry (`check_rpc_reachability` — a *persistently* throttled
-//! endpoint can still exhaust it): the poller then makes windowed forward
-//! progress under backoff without exiting the process. A durable deny-set (to
-//! make the resume safe) is a tracked follow-up.
+//! **Durable deny-set, resumable cursor (#1181).** `known` is mirrored to a
+//! durable [`BlacklistEntryStore`] and reloaded on boot, so the scan cursor is
+//! persisted (`CheckpointKey::Blacklist`) rather than replayed from the deploy
+//! block every start.
+//!
+//! That ordering is the whole safety argument, because the contract exposes no
+//! enumeration view. This watcher deliberately retains entries that are out of
+//! scope (wrong region) or appeal-suspended, since either can become enforceable
+//! again with no new `HashBlacklisted` log. While that set lived only in memory a
+//! resume would skip past those logs and silently drop the entries from
+//! re-scoping — a slashable compliance gap, and the reason the watcher used to
+//! full-replay. Persisting the set removes the premise.
+//!
+//! Two invariants keep it sound, both pinned by tests:
+//! 1. **The cursor never leads the deny-set.** Entry writes commit durably
+//!    *before* the in-memory set is touched, and a failed write aborts the tick
+//!    (`handle_log` returns `Err`) so the shared loop cannot persist a cursor
+//!    past a log whose entry was lost. A *lagging* cursor is harmless: every
+//!    operation here is idempotent, so a wider rescan only costs RPC.
+//! 2. **A cold store still replays everything.** First boot has no cursor and no
+//!    persisted entries, so it scans from `from_block` (`ColdStart::FromBlock`)
+//!    — anchoring at head would miss every pre-existing blacklist entry.
+//!
+//! This also retires the #1108 crash-loop exposure at its source: a rate-limited
+//! boot no longer re-scans the whole chain. The preflight's bounded 429/5xx retry
+//! (`check_rpc_reachability`) remains the backstop for a persistently throttled
+//! endpoint.
 //!
 //! Eviction is the single lever, and it cascades to every serving surface:
 //! [`decdn_cache::CacheEngine::evict`] durably records the takedown (survives
@@ -71,23 +86,24 @@ use alloy::primitives::{Address, B256};
 use alloy::providers::Provider;
 use alloy::rpc::types::{Filter, Log};
 use alloy::sol_types::SolEvent;
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use decdn_cache::{CacheEngine, Hash};
 use decdn_common::redact::sanitize_err_chain;
 use decdn_incentive::content_blacklist::ContentBlacklist;
 use decdn_incentive::content_blacklist::ContentBlacklist::{
     HashBlacklisted, HashRemoved, HashSuspensionUpdated,
 };
+use decdn_incentive::store::{BlacklistEntryStore, CheckpointKey, KeyedCheckpointStore};
 use tokio::sync::oneshot;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::chain_events::resumable_watcher::{
-    self, CursorStart, LogSink, WatcherConfig, WatcherHandle,
+    self, Checkpoint, ColdStart, CursorStart, LogSink, WatcherConfig, WatcherHandle,
 };
 use crate::chain_events::shared_head::HeadSource;
-use crate::chain_events::timed;
+use crate::chain_events::{REORG_MARGIN_BLOCKS, timed};
 use crate::metrics::{Metrics, metric_hook};
 
 /// Result reported exactly once when the first full replay + re-scope pass
@@ -130,24 +146,58 @@ struct WatcherState {
     /// transition (which emits no `HashBlacklisted`) still leads to eviction.
     /// Keyed like the contract's `_hashEntries[region][hash]` so a `HashRemoved`
     /// drops exactly the removed entry.
+    ///
+    /// Mirrors [`Self::store`]; loaded from it on boot.
     known: HashSet<(B256, Hash)>,
+    /// Durable mirror of `known`, which is what makes the persisted scan cursor
+    /// safe: a resume no longer forgets the still-out-of-scope entries this set
+    /// deliberately retains. Writes go here **before** the in-memory set, and a
+    /// failure propagates so the caller refuses to advance the cursor past the
+    /// log that produced it.
+    store: Arc<dyn BlacklistEntryStore>,
 }
 
 impl WatcherState {
     /// Record a `HashBlacklisted(region, hash)` entry.
-    fn add_entry(&mut self, region: B256, hash: Hash) {
+    ///
+    /// Durable first: if the write fails the entry is *not* added to `known`,
+    /// the tick aborts, and the log is re-read next tick. Losing an add is the
+    /// compliance-critical direction — an entry the node never re-learns is a
+    /// hash it may serve and be slashed for.
+    fn add_entry(&mut self, region: B256, hash: Hash) -> Result<()> {
+        self.store
+            .insert_blacklist_entry(region.0, *hash.as_bytes())
+            .context("persist blacklist deny-set entry")?;
         self.known.insert((region, hash));
+        Ok(())
     }
 
     /// Drop exactly the `HashRemoved(region, hash)` entry — same-hash entries
     /// under other regions stay retained for re-scoping.
-    fn remove_entry(&mut self, region: B256, hash: Hash) {
+    fn remove_entry(&mut self, region: B256, hash: Hash) -> Result<()> {
+        self.store
+            .remove_blacklist_entry(region.0, *hash.as_bytes())
+            .context("delete blacklist deny-set entry")?;
         self.known.remove(&(region, hash));
+        Ok(())
     }
 
     /// Drop every entry for `hash` (once locally evicted, the sticky eviction
     /// covers all regions).
+    ///
+    /// Unlike the two above this never fails the tick: the hash has already been
+    /// evicted locally (durably, via `evicted.log`), so a failed delete only
+    /// leaves a row that costs one redundant scope re-check next pass. It is
+    /// cleanup, not enforcement.
     fn drop_hash(&mut self, hash: Hash) {
+        if let Err(err) = self.store.remove_blacklist_hash(*hash.as_bytes()) {
+            warn!(
+                err = %sanitize_err_chain(&err.into()),
+                %hash,
+                "blacklist watcher: could not drop evicted hash from the durable deny-set; \
+                 it will be re-checked next pass (already evicted, so not an enforcement gap)"
+            );
+        }
         self.known.retain(|(_, known_hash)| *known_hash != hash);
     }
 
@@ -197,7 +247,7 @@ impl<P: Provider + Clone> LogSink for BlacklistSink<P> {
             &mut self.state,
             log,
         )
-        .await;
+        .await?;
         // A live `HashBlacklisted` whose scope-check or eviction failed must
         // retry at the poll cadence (seconds), not the operator's re-scope
         // cadence (default 10 min) — serving the blob meanwhile is slashable.
@@ -255,23 +305,47 @@ impl<P: Provider + Clone> LogSink for BlacklistSink<P> {
     }
 }
 
-/// The blacklist watcher's cursor policy: **full replay from the deploy floor
-/// on every boot, never persisted**. The in-memory deny-set has no on-chain
-/// enumeration source, so a persisted resume would skip logs whose (still
-/// out-of-scope, so un-evicted) entries are gone from `known` — silently
-/// dropping them from re-scoping, a slashable compliance gap (see the module
-/// header). Pinned by a test so a wiring change to a persisted cursor cannot
-/// land silently. The replay floor is the watcher's `from_block` (the deploy
-/// block), resolved by [`CursorStart::FullReplay`] on every boot.
-const fn cursor_start() -> CursorStart {
-    CursorStart::FullReplay
+/// The blacklist watcher's cursor policy: **resume from the durable
+/// [`CheckpointKey::Blacklist`] cursor, replaying from the deploy floor on a
+/// cold store** ([`ColdStart::FromBlock`]).
+///
+/// This is only safe because the deny-set projection is itself durable
+/// ([`BlacklistEntryStore`]). Before it was, a resume skipped logs whose (still
+/// out-of-scope, so un-evicted) entries lived only in the in-memory `known`,
+/// silently dropping them from re-scoping — a slashable compliance gap, which is
+/// why this watcher previously full-replayed every boot. The durable set removes
+/// the premise: a resumed boot reloads those entries from disk.
+///
+/// Two properties keep it safe, both pinned by tests:
+/// - **Cold start replays everything.** A first-ever boot has no cursor *and* no
+///   persisted entries, so it must scan from `from_block`; anchoring at head
+///   (the settlement watcher's [`ColdStart::Head`]) would miss every pre-existing
+///   blacklist entry.
+/// - **The cursor never leads the deny-set.** `WatcherState`'s writes are durable
+///   before the in-memory set is touched, and a failed write aborts the tick, so
+///   the shared loop cannot persist a cursor past a log whose entry was lost. A
+///   *lagging* cursor is harmless — the sinks are idempotent, so a wider rescan
+///   only costs RPC.
+fn cursor_start(store: Arc<dyn KeyedCheckpointStore>) -> CursorStart {
+    CursorStart::FromCheckpoint {
+        checkpoint: Checkpoint {
+            store,
+            key: CheckpointKey::Blacklist,
+        },
+        reorg_margin: REORG_MARGIN_BLOCKS,
+        cold_start: ColdStart::FromBlock,
+    }
 }
 
 /// Spawn the blacklist compliance watcher, returning the handle that owns its
-/// task and shutdown token. `from_block` is where the `HashBlacklisted` replay
-/// starts (the `ContentBlacklist` deploy block) — re-scanned every boot, no
-/// persisted cursor (see the module header). `event_poll_interval` is the
-/// getLogs poll cadence; `rescan_interval` is the batched re-scope cadence.
+/// task and shutdown token. `from_block` is the `ContentBlacklist` deploy block:
+/// the floor a cold store replays from, and the lower clamp on a resumed cursor
+/// (see the module header). `entry_store` is the durable deny-set — it MUST be
+/// the unbuffered store, not a debouncing decorator, since the cursor's safety
+/// rests on those writes being committed before it advances. `checkpoint_store`
+/// carries the scan cursor and MAY be debounced (a lagging cursor only widens the
+/// next rescan). `event_poll_interval` is the getLogs poll cadence;
+/// `rescan_interval` is the batched re-scope cadence.
 /// `initial_sync_tx` fires once the mandatory first full replay + re-scope
 /// either completes cleanly (`Ok`) or the loop falls into backoff (`Err`), so
 /// the runtime can gate the ALPN router on blacklist enforcement being live.
@@ -287,12 +361,40 @@ pub(crate) fn spawn<P>(
     rescan_interval: Duration,
     initial_sync_tx: oneshot::Sender<InitialSyncResult>,
     metrics: &Arc<Metrics>,
+    entry_store: Arc<dyn BlacklistEntryStore>,
+    checkpoint_store: Arc<dyn KeyedCheckpointStore>,
 ) -> WatcherHandle
 where
     P: Provider + Clone + 'static,
 {
     let contract = ContentBlacklist::new(contract_addr, provider.clone());
-    info!(%contract_addr, %operator, from_block, "blacklist compliance watcher starting");
+    // Rebuild the retained deny-set from disk before the first tick. A read
+    // failure is not fatal: an empty set plus the resumed cursor would under-
+    // enforce, so fall back to replaying from `from_block`, which reconstructs
+    // the set from events exactly as the pre-#1181 watcher did.
+    let (restored, replay_floor) = match entry_store.load_blacklist_entries() {
+        Ok(rows) => (rows, false),
+        Err(err) => {
+            warn!(
+                err = %sanitize_err_chain(&err.into()),
+                "blacklist watcher: durable deny-set unreadable; replaying from the deploy \
+                 block to rebuild it rather than resuming on a partial set"
+            );
+            (Vec::new(), true)
+        }
+    };
+    let known: HashSet<(B256, Hash)> = restored
+        .into_iter()
+        .map(|(region, hash)| (B256::from(region), Hash::from_bytes(hash)))
+        .collect();
+    info!(
+        %contract_addr,
+        %operator,
+        from_block,
+        restored_entries = known.len(),
+        replay_floor,
+        "blacklist compliance watcher starting"
+    );
     let initial_sync = InitialSyncGate::new(initial_sync_tx);
     let established_gate = initial_sync.clone();
     let backoff_gate = initial_sync.clone();
@@ -307,7 +409,11 @@ where
             HashRemoved::SIGNATURE_HASH,
             HashSuspensionUpdated::SIGNATURE_HASH,
         ]),
-        cursor_start(),
+        if replay_floor {
+            CursorStart::FullReplay
+        } else {
+            cursor_start(checkpoint_store)
+        },
         event_poll_interval.max(Duration::from_secs(1)),
         "blacklist",
     )
@@ -345,7 +451,8 @@ where
         operator,
         cache,
         state: WatcherState {
-            known: HashSet::new(),
+            known: known.clone(),
+            store: Arc::clone(&entry_store),
         },
         shutdown: shutdown.clone(),
         rescan_interval: rescan_interval.max(Duration::from_secs(1)),
@@ -426,30 +533,37 @@ where
 /// Handle one live log: `HashBlacklisted` records the `(region, hash)` entry
 /// and re-checks the hash; `HashRemoved` drops exactly that entry (hygiene —
 /// eviction stays sticky, and same-hash entries in other regions survive).
-/// Returns `true` iff a `HashBlacklisted` re-check failed and needs a prompt
-/// retry.
+/// `Ok(true)` iff a re-check failed and needs a prompt retry.
+///
+/// `Err` is reserved for a **durable deny-set write failure**, which is not a
+/// retryable-in-place condition: it aborts the tick so the shared loop leaves the
+/// scan cursor behind this log and re-reads it next tick. A scope-check RPC
+/// failure is *not* an `Err` — the entry is already durably recorded, so it stays
+/// in `known` and the pulled-forward re-scope retries it.
 async fn handle_log<P>(
     contract: &ContentBlacklist::ContentBlacklistInstance<P>,
     operator: Address,
     cache: &CacheEngine,
     state: &mut WatcherState,
     log: Log,
-) -> bool
+) -> Result<bool>
 where
     P: Provider + Clone,
 {
     match log.topic0() {
-        Some(topic) if *topic == HashBlacklisted::SIGNATURE_HASH => {
-            on_blacklisted_log(contract, operator, cache, state, &log).await == Recheck::Failed
-        }
+        Some(topic) if *topic == HashBlacklisted::SIGNATURE_HASH => Ok(on_blacklisted_log(
+            contract, operator, cache, state, &log,
+        )
+        .await?
+            == Recheck::Failed),
         Some(topic) if *topic == HashRemoved::SIGNATURE_HASH => {
-            on_removed_log(state, &log);
-            false
+            on_removed_log(state, &log)?;
+            Ok(false)
         }
         Some(topic) if *topic == HashSuspensionUpdated::SIGNATURE_HASH => {
-            on_suspension_log(contract, operator, cache, state, &log).await == Recheck::Failed
+            Ok(on_suspension_log(contract, operator, cache, state, &log).await? == Recheck::Failed)
         }
-        _ => false,
+        _ => Ok(false),
     }
 }
 
@@ -462,29 +576,29 @@ async fn on_blacklisted_log<P>(
     cache: &CacheEngine,
     state: &mut WatcherState,
     log: &Log,
-) -> Recheck
+) -> Result<Recheck>
 where
     P: Provider + Clone,
 {
     match HashBlacklisted::decode_log_data(&log.inner.data) {
         Ok(event) => {
             let hash = Hash::from_bytes(event.hash.0);
-            state.add_entry(event.region, hash);
-            recheck(contract, operator, cache, state, hash).await
+            state.add_entry(event.region, hash)?;
+            Ok(recheck(contract, operator, cache, state, hash).await)
         }
         Err(err) => {
             warn!(err = %err, "blacklist watcher: undecodable HashBlacklisted log");
-            Recheck::NoAction
+            Ok(Recheck::NoAction)
         }
     }
 }
 
 /// Decode a `HashRemoved` log and drop exactly that `(region, hash)` entry.
-fn on_removed_log(state: &mut WatcherState, log: &Log) {
+fn on_removed_log(state: &mut WatcherState, log: &Log) -> Result<()> {
     match HashRemoved::decode_log_data(&log.inner.data) {
         Ok(event) => {
             let hash = Hash::from_bytes(event.hash.0);
-            state.remove_entry(event.region, hash);
+            state.remove_entry(event.region, hash)?;
             debug!(
                 region = %event.region,
                 %hash,
@@ -493,6 +607,7 @@ fn on_removed_log(state: &mut WatcherState, log: &Log) {
         }
         Err(err) => warn!(err = %err, "blacklist watcher: undecodable HashRemoved log"),
     }
+    Ok(())
 }
 
 /// Decode a `HashSuspensionUpdated` log and react to the appeal-driven
@@ -517,14 +632,14 @@ async fn on_suspension_log<P>(
     cache: &CacheEngine,
     state: &mut WatcherState,
     log: &Log,
-) -> Recheck
+) -> Result<Recheck>
 where
     P: Provider + Clone,
 {
     match HashSuspensionUpdated::decode_log_data(&log.inner.data) {
         Ok(event) => {
             let hash = Hash::from_bytes(event.hash.0);
-            state.add_entry(event.region, hash);
+            state.add_entry(event.region, hash)?;
             if event.suspended {
                 debug!(
                     region = %event.region,
@@ -532,19 +647,19 @@ where
                     "blacklist entry suspended on-chain (retained for re-scoping; \
                      local eviction stays sticky)"
                 );
-                Recheck::NoAction
+                Ok(Recheck::NoAction)
             } else {
                 debug!(
                     region = %event.region,
                     %hash,
                     "blacklist entry resumed on-chain; re-checking scope immediately"
                 );
-                recheck(contract, operator, cache, state, hash).await
+                Ok(recheck(contract, operator, cache, state, hash).await)
             }
         }
         Err(err) => {
             warn!(err = %err, "blacklist watcher: undecodable HashSuspensionUpdated log");
-            Recheck::NoAction
+            Ok(Recheck::NoAction)
         }
     }
 }
@@ -654,14 +769,114 @@ async fn evict(cache: &CacheEngine, hash: Hash) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anyhow::Context as _;
 
     const US: B256 = B256::repeat_byte(0x01);
     const FR: B256 = B256::repeat_byte(0x02);
 
+    /// In-memory [`BlacklistEntryStore`], optionally wired to fail every write so
+    /// a test can prove a durable-write failure aborts the tick.
+    #[derive(Default)]
+    struct MemEntryStore {
+        rows: Mutex<HashSet<([u8; 32], [u8; 32])>>,
+        fail_writes: bool,
+    }
+
+    impl MemEntryStore {
+        fn failing() -> Self {
+            Self {
+                rows: Mutex::new(HashSet::new()),
+                fail_writes: true,
+            }
+        }
+
+        fn guard(&self) -> std::sync::MutexGuard<'_, HashSet<([u8; 32], [u8; 32])>> {
+            self.rows
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        }
+
+        fn deny(&self) -> Result<(), decdn_incentive::store::StoreError> {
+            if self.fail_writes {
+                return Err(decdn_incentive::store::StoreError::Backend(
+                    "injected deny-set write failure".into(),
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    impl BlacklistEntryStore for MemEntryStore {
+        fn load_blacklist_entries(
+            &self,
+        ) -> Result<Vec<([u8; 32], [u8; 32])>, decdn_incentive::store::StoreError> {
+            Ok(self.guard().iter().copied().collect())
+        }
+
+        fn insert_blacklist_entry(
+            &self,
+            region: [u8; 32],
+            hash: [u8; 32],
+        ) -> Result<(), decdn_incentive::store::StoreError> {
+            self.deny()?;
+            self.guard().insert((region, hash));
+            Ok(())
+        }
+
+        fn remove_blacklist_entry(
+            &self,
+            region: [u8; 32],
+            hash: [u8; 32],
+        ) -> Result<(), decdn_incentive::store::StoreError> {
+            self.deny()?;
+            self.guard().remove(&(region, hash));
+            Ok(())
+        }
+
+        fn remove_blacklist_hash(
+            &self,
+            hash: [u8; 32],
+        ) -> Result<(), decdn_incentive::store::StoreError> {
+            self.deny()?;
+            self.guard().retain(|(_, row_hash)| *row_hash != hash);
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct MemCheckpointStore(Mutex<Option<u64>>);
+
+    impl KeyedCheckpointStore for MemCheckpointStore {
+        fn load_checkpoint(
+            &self,
+            _key: CheckpointKey,
+        ) -> Result<Option<u64>, decdn_incentive::store::StoreError> {
+            Ok(*self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner))
+        }
+
+        fn record_checkpoint(
+            &self,
+            _key: CheckpointKey,
+            block: u64,
+        ) -> Result<(), decdn_incentive::store::StoreError> {
+            *self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(block);
+            Ok(())
+        }
+    }
+
     fn state() -> WatcherState {
+        state_with(Arc::new(MemEntryStore::default()))
+    }
+
+    fn state_with(store: Arc<dyn BlacklistEntryStore>) -> WatcherState {
         WatcherState {
             known: HashSet::new(),
+            store,
         }
     }
 
@@ -693,6 +908,8 @@ mod tests {
             Duration::from_mins(10),
             ready_tx,
             &Arc::new(Metrics::new()),
+            Arc::new(MemEntryStore::default()),
+            Arc::new(MemCheckpointStore::default()),
         );
         let readiness = tokio::time::timeout(Duration::from_secs(1), ready_rx)
             .await
@@ -747,6 +964,8 @@ mod tests {
             Duration::from_mins(10),
             ready_tx,
             &Arc::new(Metrics::new()),
+            Arc::new(MemEntryStore::default()),
+            Arc::new(MemCheckpointStore::default()),
         );
         let readiness = tokio::time::timeout(Duration::from_secs(1), ready_rx)
             .await
@@ -761,15 +980,27 @@ mod tests {
         Ok(())
     }
 
-    /// COMPLIANCE PIN: the blacklist watcher must full-replay from the deploy
-    /// floor on every boot. A swap to a persisted resume skips past logs whose
-    /// entries no longer exist in the in-memory deny-set, silently dropping them
-    /// from re-scoping — serving such a hash is slashable.
+    /// COMPLIANCE PIN, rewritten for #1181. The watcher now resumes from its
+    /// durable cursor, which is only safe because the deny-set itself is durable.
+    /// The cold-start leg is the part that must not regress: `ColdStart::Head`
+    /// here would silently skip every blacklist entry that predates a node's
+    /// first boot, and serving such a hash is slashable.
     #[test]
-    fn cursor_start_is_full_replay_never_persisted() {
+    fn cursor_start_resumes_but_cold_starts_from_the_deploy_block() {
+        let store: Arc<dyn KeyedCheckpointStore> = Arc::new(MemCheckpointStore::default());
         assert!(
-            matches!(cursor_start(), CursorStart::FullReplay),
-            "blacklist deny-set rebuild requires FullReplay from the deploy block"
+            matches!(
+                cursor_start(store),
+                CursorStart::FromCheckpoint {
+                    checkpoint: Checkpoint {
+                        key: CheckpointKey::Blacklist,
+                        ..
+                    },
+                    cold_start: ColdStart::FromBlock,
+                    ..
+                }
+            ),
+            "blacklist must resume from the Blacklist checkpoint and cold-start at from_block"
         );
     }
 
@@ -777,59 +1008,63 @@ mod tests {
     /// in another region — otherwise a later `updateRegion` into the surviving
     /// region (which emits no blacklist event) would never lead to eviction.
     #[test]
-    fn remove_entry_is_region_scoped() {
+    fn remove_entry_is_region_scoped() -> Result<()> {
         let hash = Hash::from_bytes([0xAB; 32]);
         let mut state = state();
-        state.add_entry(US, hash);
-        state.add_entry(FR, hash);
+        state.add_entry(US, hash)?;
+        state.add_entry(FR, hash)?;
 
-        state.remove_entry(FR, hash);
+        state.remove_entry(FR, hash)?;
 
         assert!(!state.known.contains(&(FR, hash)));
         assert!(state.known.contains(&(US, hash)), "US entry must survive");
         assert_eq!(state.distinct_hashes(), vec![hash]);
+        Ok(())
     }
 
     #[test]
-    fn remove_entry_drops_last_entry_for_hash() {
+    fn remove_entry_drops_last_entry_for_hash() -> Result<()> {
         let hash = Hash::from_bytes([0xCD; 32]);
         let mut state = state();
-        state.add_entry(US, hash);
+        state.add_entry(US, hash)?;
 
-        state.remove_entry(US, hash);
+        state.remove_entry(US, hash)?;
 
         assert!(state.known.is_empty());
         assert!(state.distinct_hashes().is_empty());
+        Ok(())
     }
 
     /// Local eviction is sticky and region-independent, so it clears every
     /// regional entry for the hash while leaving other hashes untouched.
     #[test]
-    fn drop_hash_clears_all_regions_for_that_hash_only() {
+    fn drop_hash_clears_all_regions_for_that_hash_only() -> Result<()> {
         let evicted = Hash::from_bytes([0xEE; 32]);
         let retained = Hash::from_bytes([0x11; 32]);
         let mut state = state();
-        state.add_entry(US, evicted);
-        state.add_entry(FR, evicted);
-        state.add_entry(FR, retained);
+        state.add_entry(US, evicted)?;
+        state.add_entry(FR, evicted)?;
+        state.add_entry(FR, retained)?;
 
         state.drop_hash(evicted);
 
         assert!(!state.known.contains(&(US, evicted)));
         assert!(!state.known.contains(&(FR, evicted)));
         assert_eq!(state.distinct_hashes(), vec![retained]);
+        Ok(())
     }
 
     /// The scope view is per `(operator, hash)`, so re-scoping must issue one
     /// check per distinct hash even when several regional entries share it.
     #[test]
-    fn distinct_hashes_dedupes_across_regions() {
+    fn distinct_hashes_dedupes_across_regions() -> Result<()> {
         let hash = Hash::from_bytes([0x42; 32]);
         let mut state = state();
-        state.add_entry(US, hash);
-        state.add_entry(FR, hash);
+        state.add_entry(US, hash)?;
+        state.add_entry(FR, hash)?;
 
         assert_eq!(state.distinct_hashes(), vec![hash]);
+        Ok(())
     }
 
     /// Build a `BlacklistSink` with `entries` distinct known hashes over a mocked
@@ -852,7 +1087,7 @@ mod tests {
         }
         let mut state = state();
         for n in 0..entries {
-            state.add_entry(US, Hash::from_bytes([n; 32]));
+            state.add_entry(US, Hash::from_bytes([n; 32]))?;
         }
         Ok(BlacklistSink {
             contract: ContentBlacklist::new(Address::repeat_byte(0x11), provider),
@@ -932,6 +1167,76 @@ mod tests {
         Ok(())
     }
 
+    fn blacklisted_log(region: B256, hash_bytes: [u8; 32], version: u64) -> Log {
+        let event = HashBlacklisted {
+            region,
+            hash: B256::from(hash_bytes),
+            version: alloy::primitives::U256::from(version),
+            reason: String::new(),
+        };
+        Log {
+            inner: alloy::primitives::Log {
+                address: Address::repeat_byte(0x11),
+                data: event.encode_log_data(),
+            },
+            ..Default::default()
+        }
+    }
+
+    /// #1181's load-bearing invariant. A durable deny-set write failure must
+    /// abort the tick with `Err`, so the shared loop leaves the scan cursor
+    /// *behind* this log and re-reads it next tick. Swallowing it would let the
+    /// cursor advance past an entry the node never re-learns — a hash it would
+    /// then serve, and be slashable for serving.
+    #[tokio::test]
+    async fn durable_write_failure_aborts_the_tick() -> Result<()> {
+        let metrics = Arc::new(Metrics::new());
+        let mut sink = failing_sink(false, 0, &metrics).await?;
+        sink.state = state_with(Arc::new(MemEntryStore::failing()));
+
+        let outcome = handle_log(
+            &sink.contract,
+            sink.operator,
+            &sink.cache,
+            &mut sink.state,
+            blacklisted_log(US, [0x05u8; 32], 3),
+        )
+        .await;
+
+        assert!(
+            outcome.is_err(),
+            "a failed deny-set write must abort the tick so the cursor cannot advance past it"
+        );
+        assert!(
+            sink.state.known.is_empty(),
+            "a failed write must not leave the entry claimed in the in-memory set"
+        );
+        Ok(())
+    }
+
+    /// The durable set is what a resumed boot rebuilds from, so an add must be
+    /// visible to a fresh reader and a remove must clear it.
+    #[tokio::test]
+    async fn deny_set_round_trips_through_the_store() -> Result<()> {
+        let store = Arc::new(MemEntryStore::default());
+        let mut state = state_with(store.clone());
+        let hash = Hash::from_bytes([0x42u8; 32]);
+
+        state.add_entry(US, hash)?;
+        assert_eq!(
+            store.load_blacklist_entries()?,
+            vec![(US.0, *hash.as_bytes())],
+            "an added entry must be durably visible for the next boot to reload"
+        );
+
+        state.remove_entry(US, hash)?;
+        assert!(
+            store.load_blacklist_entries()?.is_empty(),
+            "a removed entry must not survive into the next boot"
+        );
+        Ok(())
+    }
+
     fn suspension_log(region: B256, hash_bytes: [u8; 32], version: u64, suspended: bool) -> Log {
         let event = HashSuspensionUpdated {
             region,
@@ -967,7 +1272,7 @@ mod tests {
             &mut sink.state,
             &suspension_log(US, bytes, 9, false),
         )
-        .await;
+        .await?;
 
         assert!(
             outcome == Recheck::Failed,
@@ -997,7 +1302,7 @@ mod tests {
             &mut sink.state,
             &suspension_log(US, bytes, 10, true),
         )
-        .await;
+        .await?;
 
         assert!(
             outcome == Recheck::NoAction,

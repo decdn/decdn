@@ -58,6 +58,25 @@ pub(crate) struct Checkpoint {
 /// `WatcherConfig::seed_cursor` override, where a seeded watcher silently
 /// bypassed floor derivation and left its policy's derivation fields inert
 /// (#1227).
+/// Where a [`CursorStart::FromCheckpoint`] watcher starts on a first-ever boot,
+/// when no cursor has ever been persisted.
+///
+/// The two answers are not interchangeable: the choice is about whether on-chain
+/// state predating this node is *relevant* to the projection being built.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ColdStart {
+    /// Start at **head**: nothing predates this node, so there is no history
+    /// worth replaying. Settlement `ChannelOpened` — a channel opened before the
+    /// node's keypair existed cannot be one of ours.
+    Head,
+    /// Start at **`from_block`** (the deploy block) and replay the full history.
+    /// For a projection that must reflect *all* pre-existing on-chain state, not
+    /// merely what changed since this node first booted: the blacklist deny-set,
+    /// where silently missing a pre-existing entry means serving a hash the node
+    /// is slashable for serving.
+    FromBlock,
+}
+
 pub(crate) enum CursorStart {
     /// Start at an explicit block — a bootstrap snapshot head, already covered
     /// by an out-of-band enumeration. Bypasses floor derivation entirely.
@@ -70,11 +89,12 @@ pub(crate) enum CursorStart {
         persist: Option<Checkpoint>,
     },
     /// Resume from a durable checkpoint, rewound by `reorg_margin`, persisting
-    /// forward each window. A first-ever boot (cold store) starts at **head** —
-    /// nothing predates the node, so there is no history to replay; a watcher
-    /// that must replay from the deploy block instead uses [`Self::FullReplay`]
-    /// or a [`Self::Seeded`] enumeration. This is the only start that reads a
-    /// checkpoint to derive its floor (settlement `ChannelOpened`).
+    /// forward each window. This is the only start that reads a checkpoint to
+    /// derive its floor (settlement `ChannelOpened`, blacklist deny-set).
+    ///
+    /// What a first-ever (cold-store) boot does is the caller's choice — see
+    /// [`ColdStart`]. Getting that wrong is a correctness bug, not a tuning
+    /// knob, so it is an explicit field rather than a default.
     FromCheckpoint {
         checkpoint: Checkpoint,
         /// Blocks to rewind the checkpoint on resume (reorg safety), normally
@@ -82,6 +102,8 @@ pub(crate) enum CursorStart {
         /// from a durable cursor, so it is the only reader of a margin — every
         /// other start re-derives its floor from head each boot.
         reorg_margin: u64,
+        /// Floor to use when no cursor has ever been written.
+        cold_start: ColdStart,
     },
     /// Re-derive the floor from head each boot as `head - window_blocks` (clamped
     /// `>= from_block`); do not persist. Used where a resume cursor is unsafe or
@@ -133,6 +155,7 @@ impl CursorStart {
             Self::FromCheckpoint {
                 checkpoint,
                 reorg_margin,
+                cold_start,
             } => {
                 let last = checkpoint
                     .store
@@ -140,12 +163,18 @@ impl CursorStart {
                     .with_context(|| {
                         format!("read watcher scan checkpoint {}", checkpoint.key.as_str())
                     })?;
-                Ok(resolve_persisted_start(
-                    last,
-                    head,
-                    from_block,
-                    *reorg_margin,
-                ))
+                // A cold store under `ColdStart::FromBlock` replays the whole
+                // history; every other case (including a warm resume) rewinds the
+                // stored cursor normally.
+                match (last, cold_start) {
+                    (None, ColdStart::FromBlock) => Ok(from_block),
+                    _ => Ok(resolve_persisted_start(
+                        last,
+                        head,
+                        from_block,
+                        *reorg_margin,
+                    )),
+                }
             }
             Self::HeadMinusWindow { window_blocks } => {
                 Ok(resolve_head_window_start(head, *window_blocks, from_block))
@@ -926,6 +955,7 @@ mod tests {
             poll_interval: Duration::from_secs(1),
             max_backfill_span: 10,
             start: CursorStart::FromCheckpoint {
+                cold_start: ColdStart::Head,
                 checkpoint: Checkpoint {
                     store,
                     key: CheckpointKey::ChannelOpened,
@@ -1094,6 +1124,7 @@ mod tests {
 
         let mut cfg = tick_cfg(provider.clone(), Arc::new(MemoryCheckpointStore::default()));
         cfg.start = CursorStart::FromCheckpoint {
+            cold_start: ColdStart::Head,
             checkpoint: Checkpoint {
                 store: Arc::clone(&store) as Arc<dyn KeyedCheckpointStore>,
                 key: CheckpointKey::ChannelOpened,
@@ -1241,6 +1272,7 @@ mod tests {
 
     fn persisted() -> CursorStart {
         CursorStart::FromCheckpoint {
+            cold_start: ColdStart::Head,
             checkpoint: Checkpoint {
                 store: Arc::new(FailingLoadStore),
                 key: CheckpointKey::ChannelOpened,
@@ -1275,6 +1307,7 @@ mod tests {
         let recorded = store.record_checkpoint(CheckpointKey::ChannelOpened, CHECKPOINT);
         assert!(recorded.is_ok(), "seeding the checkpoint must succeed");
         let start = CursorStart::FromCheckpoint {
+            cold_start: ColdStart::Head,
             checkpoint: Checkpoint {
                 store,
                 key: CheckpointKey::ChannelOpened,
