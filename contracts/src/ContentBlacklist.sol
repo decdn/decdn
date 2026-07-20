@@ -356,6 +356,16 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     error RegionalCapHit(bytes32 region, uint256 cap);
     /// @notice The filer's per-(filer, region) interim-relief sub-cap (`FILER_CONCURRENT_RELIEF_CAP`) is full.
     error FilerReliefCapHit(address filer, uint256 cap);
+    /// @notice Invariant guard, unreachable by construction: a relief slot was
+    ///         released for a (region, filer) pair whose counters were already
+    ///         zero. `fastTrackBlacklistAppeal` is the sole increment site and
+    ///         runs exactly once per entry into `FastTracked`, and every release
+    ///         is gated on that status, so both counters are provably nonzero
+    ///         here. Reverting rather than clamping means a divergence in the
+    ///         relief-cap accounting surfaces at the point it occurs instead of
+    ///         silently throttling future fast-tracks in the region. Being
+    ///         unreachable, this branch is expected to show as uncovered.
+    error ReliefAccountingUnderflow(bytes32 region, address filer);
     error AppealAlreadyActive(bytes32 region, bytes32 hash);
     error HashHasActiveAppeal(bytes32 region, bytes32 hash);
     error FrequencyCapHit(uint64 nextAvailableAt);
@@ -705,8 +715,7 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         if (a.status == AppealStatus.FastTracked) {
             _setEntrySuspended(a.region, a.hash, false);
             // Only fast-tracked appeals charge the relief caps (M-1); release both tiers.
-            if (regionActiveReliefCount[a.region] != 0) regionActiveReliefCount[a.region] -= 1;
-            if (filerRegionActiveRelief[a.region][a.filer] != 0) filerRegionActiveRelief[a.region][a.filer] -= 1;
+            _releaseReliefSlot(a.region, a.filer);
         }
         uint256 bondBurned = a.bond;
         a.bond = 0;
@@ -736,8 +745,7 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         if (a.status == AppealStatus.FastTracked) {
             _setEntrySuspended(a.region, a.hash, false);
             // Only fast-tracked appeals charge the relief caps (M-1); release both tiers.
-            if (regionActiveReliefCount[a.region] != 0) regionActiveReliefCount[a.region] -= 1;
-            if (filerRegionActiveRelief[a.region][a.filer] != 0) filerRegionActiveRelief[a.region][a.filer] -= 1;
+            _releaseReliefSlot(a.region, a.filer);
         }
         uint256 bondBurned = a.bond;
         a.bond = 0;
@@ -760,8 +768,7 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
 
         a.bond = 0;
         a.status = AppealStatus.Ratified;
-        if (regionActiveReliefCount[region] != 0) regionActiveReliefCount[region] -= 1;
-        if (filerRegionActiveRelief[region][filer] != 0) filerRegionActiveRelief[region][filer] -= 1;
+        _releaseReliefSlot(region, filer);
         hasActiveAppeal[region][hash] = false;
         lastRatifiedSuccessAt[filer] = uint64(block.timestamp);
 
@@ -778,8 +785,7 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         a.bond = 0;
         a.status = AppealStatus.Reversed;
         _setEntrySuspended(a.region, a.hash, false);
-        if (regionActiveReliefCount[a.region] != 0) regionActiveReliefCount[a.region] -= 1;
-        if (filerRegionActiveRelief[a.region][a.filer] != 0) filerRegionActiveRelief[a.region][a.filer] -= 1;
+        _releaseReliefSlot(a.region, a.filer);
         hasActiveAppeal[a.region][a.hash] = false;
         if (bondBurned != 0) token.burn(bondBurned);
         emit BlacklistAppealReversed(appealId, bondBurned);
@@ -841,8 +847,7 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
             // `_setEntrySuspended` also no-ops on a gone entry; this guard is
             // kept as the explicit statement of condition (c) at the call site.
             if (!entryGone) _setEntrySuspended(region, hash, false);
-            if (regionActiveReliefCount[region] != 0) regionActiveReliefCount[region] -= 1;
-            if (filerRegionActiveRelief[region][filer] != 0) filerRegionActiveRelief[region][filer] -= 1;
+            _releaseReliefSlot(region, filer);
         }
 
         uint256 bond = a.bond;
@@ -980,6 +985,26 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
             ++_blacklistVersion;
         }
         emit HashSuspensionUpdated(region, hash, _blacklistVersion, suspended);
+    }
+
+    /// @dev Release the interim-relief slot a fast-tracked appeal holds, at both
+    ///      tiers (M-1). Every caller has already established that the appeal is
+    ///      `FastTracked` — either inside an `if (status == FastTracked)` block or
+    ///      behind a function-level `AppealNotFastTracked` revert — and
+    ///      `fastTrackBlacklistAppeal` is the only site that charges the caps, so
+    ///      both counters are nonzero on entry. The zero check states that
+    ///      invariant rather than handling a live case; see
+    ///      `ReliefAccountingUnderflow`.
+    function _releaseReliefSlot(bytes32 region, address filer) internal {
+        uint256 regionCount = regionActiveReliefCount[region];
+        uint256 filerCount = filerRegionActiveRelief[region][filer];
+        if (regionCount == 0 || filerCount == 0) {
+            revert ReliefAccountingUnderflow(region, filer);
+        }
+        unchecked {
+            regionActiveReliefCount[region] = regionCount - 1;
+            filerRegionActiveRelief[region][filer] = filerCount - 1;
+        }
     }
 
     /// @dev Reads storage directly to avoid the `storage → memory` flagged
