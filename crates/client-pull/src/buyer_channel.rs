@@ -169,7 +169,7 @@ pub async fn ensure_allowance<P: Provider + Clone>(
 /// into the `anyhow` error chain (recover it with
 /// `err.downcast_ref::<ChannelOpenFailureReason>()`), so a caller can bump the
 /// matching `decdn_channel_open_failures_{reason}_total` sibling counter
-/// (`iroh_metrics` has no label support, so each class is its own counter) without
+/// (a plain counter field carries no label dimension, so each class is its own counter) without
 /// re-parsing the alloy error: a deterministic revert (with ABI revert data,
 /// decoded against the insufficient-deposit error selectors) is split from a
 /// transport/RPC fault (no revert data) and a mined on-chain revert. The

@@ -16,7 +16,7 @@
 //!
 //! Splitting these lets the node bump the matching
 //! `decdn_channel_open_failures_{insufficient_deposit,contract_revert,rpc_error}_total`
-//! sibling counter (`iroh_metrics` has no label support, so each class is its own
+//! sibling counter (a plain counter field carries no label dimension, so each class is its own
 //! counter rather than one labeled `{reason=…}` series) and emit the same
 //! `reason` token as a structured-log field, so a dashboard distinguishes "the
 //! operator under-funded the gas/USDC wallet" from "the RPC endpoint is flaky"
@@ -51,7 +51,7 @@ sol! {
 /// Which class of failure aborted a buyer `openChannel` attempt (#966). Carried
 /// through the `anyhow` error chain as typed context so the metrics layer can
 /// bump the matching `decdn_channel_open_failures_{reason}_total` sibling
-/// counter (one counter per class — `iroh_metrics` has no label support) and
+/// counter (one counter per class — a plain counter field carries no label dimension) and
 /// attach a structured `reason` log field, while the human-readable message is
 /// preserved for logs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

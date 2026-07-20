@@ -248,8 +248,8 @@ pub struct DecdnMetrics {
     pub voucher_rate_floor_rejections: Counter,
     /// `cdn/dht/v1` requests rejected by the per-peer (`NodeId`) token
     /// bucket (ADR 022 §DHT Rate Limiting). One Counter per layer to match
-    /// the existing `dispatch_rejected_*` convention since the metrics
-    /// backend doesn't support per-field labels. Operator-visible name:
+    /// the existing `dispatch_rejected_*` convention: a plain counter field
+    /// carries no label dimension (a labeled series would need a `Family`). Operator-visible name:
     /// `decdn_dht_rate_limit_rejected_per_peer_total`.
     pub dht_rate_limit_rejected_per_peer: Counter,
     /// `cdn/dht/v1` requests rejected by the per-IP token bucket. Sibling
@@ -288,7 +288,8 @@ pub struct DecdnMetrics {
     /// `cdn/probe/v1` requests rejected by the per-peer (`NodeId`) token
     /// bucket (ADR 005 §Probe rate limiting). One Counter per layer to match
     /// the existing `dht_rate_limit_rejected_*` / `dispatch_rejected_*`
-    /// convention since the metrics backend doesn't support per-field labels;
+    /// convention; a plain counter field carries no label dimension (a labeled
+    /// series would need a `Family`);
     /// operators recover the rolled-up rate with
     /// `sum(rate(decdn_probe_rate_limit_rejected_{per_peer,per_ip,global}_total[1m]))`.
     /// Operator-visible name: `decdn_probe_rate_limit_rejected_per_peer_total`.
@@ -761,8 +762,9 @@ pub struct DecdnMetrics {
     /// `openChannel` tx reverted because the node's USDC balance/allowance could
     /// not cover the deposit, or the deposit was below the on-chain `minDeposit`
     /// floor. A *misconfiguration* signal — the fix is operator-side (fund the
-    /// wallet, raise the configured deposit), not infrastructure. `iroh_metrics`
-    /// has no label support, so the issue's `{reason=…}` split is realized as
+    /// wallet, raise the configured deposit), not infrastructure. A plain counter
+    /// field carries no label dimension (a labeled series would need a `Family`),
+    /// so the issue's `{reason=…}` split is realized as
     /// three sibling counters (mirroring `dht_rate_limit_rejected_*`); the
     /// `reason` value is the field-name token. The `OpenMetrics` encoder appends
     /// the `_total` suffix.
@@ -862,7 +864,7 @@ pub struct DecdnMetrics {
     /// delivery up front (a `StreamResponse` with `ok == false`). Counts every
     /// wire code, including the `InternalError` that DOES tar the provider's
     /// reputation — so this is a refusal counter, not an exoneration counter, and
-    /// it is deliberately not split by code (`iroh_metrics` has no label support,
+    /// it is deliberately not split by code (a labeled series would need a `Family`,
     /// and a per-code counter set is not yet worth five more series). Most refusals
     /// are honest and benign: a `NotFound` is simply a healthy-but-empty node, so
     /// a sustained rate here usually means content discovery is steering this node
@@ -1142,9 +1144,10 @@ pub struct DecdnMetrics {
     /// feature is on. Visible name: `decdn_prefetch_enabled`.
     pub prefetch_enabled: Gauge,
     /// Prefetch acquisitions that passed the authorized-origin gate. Visible
-    /// name: `decdn_prefetch_acquisitions_authorized_total`. (`iroh_metrics`
-    /// has no labels, so the appendix's `{gate_result=…}` split is realized as
-    /// three sibling counters, mirroring `dht_rate_limit_rejected_*`.)
+    /// name: `decdn_prefetch_acquisitions_authorized_total`. (A plain counter
+    /// field carries no label dimension, so the appendix's `{gate_result=…}`
+    /// split is realized as three sibling counters, mirroring
+    /// `dht_rate_limit_rejected_*`.)
     pub prefetch_acquisitions_authorized: Counter,
     /// Prefetch attempts rejected by the authorized-origin gate. Visible name:
     /// `decdn_prefetch_acquisitions_unauthorized_total`.
@@ -1187,8 +1190,8 @@ pub struct DecdnMetrics {
     pub prefetch_acquire_dropped_saturated: Counter,
     /// Paid-delivery (`serve_stream`) requests refused because the blob was
     /// deliberately evicted between probe and stream (#279). One `Counter` per
-    /// reason — like the `dispatch_rejected_*` convention — because the metrics
-    /// backend has no per-field labels, and the wire `StreamError` deliberately
+    /// reason — like the `dispatch_rejected_*` convention — because a plain counter
+    /// field carries no label dimension, and the wire `StreamError` deliberately
     /// conflates the three `NotFound` reasons (`cache_miss`, `unknown_channel`,
     /// `owner_mismatch`) (#876). Visible name:
     /// `decdn_serve_stream_rejected_evicted_since_probe_total`.
@@ -3144,7 +3147,7 @@ mod tests {
     #[test]
     fn serve_stream_rejected_counters_start_at_zero_and_increment_per_reason() {
         // #876. Each `serve_stream` reject branch maps to a distinct counter
-        // because the metrics backend has no per-field labels and the wire
+        // because a plain counter field carries no label dimension and the wire
         // `StreamError` deliberately conflates the three `NotFound` reasons.
         // The exported names carry the encoder-appended `_total` suffix. All
         // must be exposed at zero on a fresh registry (so dashboards don't read
