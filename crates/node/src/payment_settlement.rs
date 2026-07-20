@@ -81,7 +81,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
 use crate::chain_events::resumable_watcher::{
-    self, Checkpoint, CursorStart, LogSink, WatcherConfig, WatcherHandle,
+    self, Checkpoint, ColdStart, CursorStart, LogSink, WatcherConfig, WatcherHandle,
 };
 use crate::chain_events::shared_head::HeadSource;
 use crate::chain_events::{AbortOnDrop, REORG_MARGIN_BLOCKS, timed};
@@ -904,9 +904,9 @@ async fn reconcile_closing_channel<P: Provider + Clone>(
 
 /// The settlement watcher's cursor start: resume the durable
 /// [`CheckpointKey::ChannelOpened`] floor (#751); a first-ever boot (cold store)
-/// anchors at **head** — no channel toward this node can predate the node
-/// itself, so there is no history to replay. Pinned by a test: swapping the key
-/// forfeits the persisted resume.
+/// anchors at **head** ([`ColdStart::Head`]) — no channel toward this node can
+/// predate the node itself, so there is no history to replay. Pinned by a test:
+/// swapping the key forfeits the persisted resume.
 ///
 /// The `reorg_margin` rewind lives here too: it is only meaningful against a
 /// durable cursor, so [`CursorStart::FromCheckpoint`] owns it (#1227).
@@ -917,6 +917,7 @@ fn cursor_start(store: Arc<dyn KeyedCheckpointStore>) -> CursorStart {
             key: CheckpointKey::ChannelOpened,
         },
         reorg_margin: REORG_MARGIN_BLOCKS,
+        cold_start: ColdStart::Head,
     }
 }
 
@@ -2246,6 +2247,7 @@ mod tests {
                     ..
                 },
                 reorg_margin: REORG_MARGIN_BLOCKS,
+                cold_start: ColdStart::Head,
             }
         ));
     }

@@ -38,8 +38,8 @@ use alloy::primitives::{Address, B256, U256};
 use decdn_common::identity;
 use decdn_incentive::buyer_channel_table::BuyerChannelTable;
 use decdn_incentive::store::{
-    ChannelStateStore, CheckpointKey, KeyedCheckpointStore, PendingSettle, PendingSettleStore,
-    StoreError,
+    BlacklistEntryRow, BlacklistEntryStore, ChannelStateStore, CheckpointKey, KeyedCheckpointStore,
+    PendingSettle, PendingSettleStore, StoreError,
 };
 use decdn_incentive::{
     AdvanceOutcome, BuyerChannelState, BuyerChannelStore, BuyerLoad, ChannelId, ChannelState,
@@ -117,6 +117,31 @@ const BUYER_PENDING_SETTLE_TABLE: TableDefinition<&[u8; 32], u64> =
 /// carrying only `channel_opened_last_block` upgrade in place with no migration.
 const WATCHER_CHECKPOINT_TABLE: TableDefinition<&str, u64> =
     TableDefinition::new("watcher_checkpoint_v1");
+
+/// redb table holding the durable blacklist deny-set (#1181): one entry per
+/// `(region, hash)` the blacklist watcher has seen and not yet locally evicted.
+/// Lives in the same database file as [`CHANNEL_TABLE`] (redb forbids two
+/// `Database` handles on one file).
+///
+/// The key is the 64-byte concatenation `region || hash` rather than a redb tuple
+/// so that a same-hash entry under a different region is a distinct key — mirroring
+/// the contract's own `_hashEntries[region][hash]` — and so `remove_blacklist_hash`
+/// can scan for the `hash` half across regions. The value is empty: membership is
+/// the whole payload.
+///
+/// Persisting this is what makes a resume cursor safe for the blacklist watcher;
+/// see [`decdn_incentive::store::BlacklistEntryStore`] for the durability contract.
+const BLACKLIST_ENTRY_TABLE: TableDefinition<&[u8; 64], ()> =
+    TableDefinition::new("blacklist_entry_v1");
+
+/// Pack a `(region, hash)` pair into this table's 64-byte key.
+const fn blacklist_key(region: [u8; 32], hash: [u8; 32]) -> [u8; 64] {
+    let mut key = [0u8; 64];
+    let (region_half, hash_half) = key.split_at_mut(32);
+    region_half.copy_from_slice(&region);
+    hash_half.copy_from_slice(&hash);
+    key
+}
 
 // The per-watcher key strings live on [`CheckpointKey::as_str`] (frozen on-disk
 // identifiers); this table stores one `u64` block height per key (#1092/#1108).
@@ -1070,6 +1095,114 @@ impl KeyedCheckpointStore for PersistentChannelStateStore {
     }
 }
 
+impl PersistentChannelStateStore {
+    /// Open [`BLACKLIST_ENTRY_TABLE`] for writing under `Durability::Immediate`
+    /// and apply `edit`, committing (fsync) before returning. Every mutation in
+    /// this impl is a single durable transaction — the deny-set contract forbids
+    /// buffering, because the watcher advances its scan cursor past a log only
+    /// after the corresponding write has returned `Ok`.
+    fn blacklist_write(
+        &self,
+        edit: impl FnOnce(&mut redb::Table<'_, &[u8; 64], ()>) -> Result<(), StoreError>,
+    ) -> Result<(), StoreError> {
+        let mut write_txn = self
+            .db
+            .begin_write()
+            .map_err(|err| StoreError::Backend(format!("begin_write: {err}")))?;
+        write_txn
+            .set_durability(Durability::Immediate)
+            .map_err(|err| StoreError::Backend(format!("set_durability: {err}")))?;
+        {
+            let mut table = write_txn
+                .open_table(BLACKLIST_ENTRY_TABLE)
+                .map_err(|err| StoreError::Backend(format!("open_table: {err}")))?;
+            edit(&mut table)?;
+        }
+        write_txn
+            .commit()
+            .map_err(|err| StoreError::Backend(format!("commit (fsync): {err}")))?;
+        Ok(())
+    }
+}
+
+impl BlacklistEntryStore for PersistentChannelStateStore {
+    fn load_blacklist_entries(&self) -> Result<Vec<BlacklistEntryRow>, StoreError> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|err| StoreError::Backend(format!("begin_read: {err}")))?;
+        // A never-written table is a cold start, not an error — the watcher then
+        // backfills from its configured floor.
+        let table = match read_txn.open_table(BLACKLIST_ENTRY_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(err) => return Err(StoreError::Backend(format!("open_table: {err}"))),
+        };
+        let mut entries = Vec::new();
+        for row in table
+            .iter()
+            .map_err(|err| StoreError::Backend(format!("iter: {err}")))?
+        {
+            let (key, _) = row.map_err(|err| StoreError::Backend(format!("row: {err}")))?;
+            let packed = key.value();
+            let (region, hash) = packed.split_at(32);
+            let region: [u8; 32] = region
+                .try_into()
+                .map_err(|_| StoreError::Codec("blacklist entry key region half".into()))?;
+            let hash: [u8; 32] = hash
+                .try_into()
+                .map_err(|_| StoreError::Codec("blacklist entry key hash half".into()))?;
+            entries.push((region, hash));
+        }
+        Ok(entries)
+    }
+
+    fn insert_blacklist_entry(&self, region: [u8; 32], hash: [u8; 32]) -> Result<(), StoreError> {
+        let key = blacklist_key(region, hash);
+        self.blacklist_write(|table| {
+            table
+                .insert(&key, ())
+                .map(|_| ())
+                .map_err(|err| StoreError::Backend(format!("insert: {err}")))
+        })
+    }
+
+    fn remove_blacklist_entry(&self, region: [u8; 32], hash: [u8; 32]) -> Result<(), StoreError> {
+        let key = blacklist_key(region, hash);
+        self.blacklist_write(|table| {
+            table
+                .remove(&key)
+                .map(|_| ())
+                .map_err(|err| StoreError::Backend(format!("remove: {err}")))
+        })
+    }
+
+    fn remove_blacklist_hash(&self, hash: [u8; 32]) -> Result<(), StoreError> {
+        // No secondary index on the hash half, so collect the matching keys first
+        // and delete them in one durable transaction. The deny-set is bounded by
+        // the number of live blacklist entries, so a full scan here is cheap and
+        // runs only on an actual eviction.
+        let doomed: Vec<[u8; 64]> = self
+            .load_blacklist_entries()?
+            .into_iter()
+            .filter(|(_, entry_hash)| *entry_hash == hash)
+            .map(|(region, entry_hash)| blacklist_key(region, entry_hash))
+            .collect();
+        if doomed.is_empty() {
+            return Ok(());
+        }
+        self.blacklist_write(|table| {
+            for key in &doomed {
+                table
+                    .remove(key)
+                    .map(|_| ())
+                    .map_err(|err| StoreError::Backend(format!("remove: {err}")))?;
+            }
+            Ok(())
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1627,7 +1760,7 @@ mod tests {
         assert_eq!(
             CheckpointKey::Blacklist.as_str(),
             "content_blacklist_last_block",
-            "frozen on-disk key (reserved for a future durable blacklist deny-set)"
+            "frozen on-disk key — renaming forfeits the #1181 blacklist resume"
         );
         assert_eq!(
             CheckpointKey::Origin.as_str(),
@@ -1961,6 +2094,65 @@ mod tests {
         handle.record(&s)?;
         handle.forget(s.provider)?;
         anyhow::ensure!(handle.load_all()?.channels.is_empty(), "forget");
+        Ok(())
+    }
+
+    /// The durable deny-set is what makes the blacklist watcher's resume cursor
+    /// safe, so it must survive a store reopen — that is the whole point.
+    #[test]
+    fn blacklist_entries_survive_reopen() -> anyhow::Result<()> {
+        let dir = data_dir()?;
+        let region = [0x01u8; 32];
+        let other_region = [0x02u8; 32];
+        let hash = [0xABu8; 32];
+        {
+            let store = PersistentChannelStateStore::open(dir.path())?;
+            // A cold table reads as an empty set, not an error.
+            anyhow::ensure!(store.load_blacklist_entries()?.is_empty());
+            store.insert_blacklist_entry(region, hash)?;
+            // Idempotent: re-recording the same entry (a replayed scan window)
+            // must not duplicate it.
+            store.insert_blacklist_entry(region, hash)?;
+            store.insert_blacklist_entry(other_region, hash)?;
+        }
+        let store = PersistentChannelStateStore::open(dir.path())?;
+        let mut rows = store.load_blacklist_entries()?;
+        rows.sort_unstable();
+        anyhow::ensure!(
+            rows == vec![(region, hash), (other_region, hash)],
+            "{rows:?}"
+        );
+        Ok(())
+    }
+
+    /// `remove_blacklist_entry` is region-scoped (a `HashRemoved` in one region
+    /// must not disturb a surviving same-hash entry elsewhere), while
+    /// `remove_blacklist_hash` clears every region for that hash — mirroring the
+    /// sticky, region-independent local eviction.
+    #[test]
+    fn blacklist_removal_is_region_scoped_but_eviction_is_not() -> anyhow::Result<()> {
+        let dir = data_dir()?;
+        let store = PersistentChannelStateStore::open(dir.path())?;
+        let us = [0x01u8; 32];
+        let fr = [0x02u8; 32];
+        let hash = [0xABu8; 32];
+        let other_hash = [0xCDu8; 32];
+
+        store.insert_blacklist_entry(us, hash)?;
+        store.insert_blacklist_entry(fr, hash)?;
+        store.insert_blacklist_entry(fr, other_hash)?;
+
+        store.remove_blacklist_entry(fr, hash)?;
+        let mut rows = store.load_blacklist_entries()?;
+        rows.sort_unstable();
+        anyhow::ensure!(rows == vec![(us, hash), (fr, other_hash)], "{rows:?}");
+
+        // Evicting the hash clears it in every region, leaving other hashes.
+        store.remove_blacklist_hash(hash)?;
+        anyhow::ensure!(store.load_blacklist_entries()? == vec![(fr, other_hash)]);
+        // Idempotent on an absent hash.
+        store.remove_blacklist_hash(hash)?;
+        anyhow::ensure!(store.load_blacklist_entries()? == vec![(fr, other_hash)]);
         Ok(())
     }
 }
