@@ -50,12 +50,43 @@ use decdn_client_pull::{PullDeadlines, UpstreamRefused};
 
 type FetchTarget = (PublicKey, Address);
 
+/// How the initial entry target was selected. Keeping this provenance beside
+/// the target prevents reconstruction from accidentally enabling discovery for
+/// an explicit `--node-id` pull.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SelectedTarget<T> {
+    Pinned(T),
+    Discovered(T),
+}
+
+impl<T: Copy> SelectedTarget<T> {
+    const fn target(self) -> T {
+        match self {
+            Self::Pinned(target) | Self::Discovered(target) => target,
+        }
+    }
+
+    const fn is_pinned(self) -> bool {
+        matches!(self, Self::Pinned(_))
+    }
+}
+
+/// Remove the node that just refused delivery before probing fallback holders.
+/// The node id is the delivery endpoint identity; excluding it also protects
+/// against a stale duplicate registry row carrying a different provider address.
+fn fallback_candidates(candidates: &[NodeCandidate], refusing: FetchTarget) -> Vec<NodeCandidate> {
+    candidates
+        .iter()
+        .filter(|candidate| candidate.node_id != refusing.0)
+        .cloned()
+        .collect()
+}
+
 /// Fetch from `preferred`; on an auto-discovered delivery refusal only, discover
 /// a holder for this hash, retry there, and carry a successful fallback forward.
 async fn fetch_preferred<T, Fetch, FetchFut, Discover, DiscoverFut>(
     hash: [u8; 32],
-    preferred: &Cell<T>,
-    pinned: bool,
+    preferred: &Cell<SelectedTarget<T>>,
     fetch_from: Fetch,
     discover: Discover,
 ) -> anyhow::Result<Vec<u8>>
@@ -63,21 +94,22 @@ where
     T: Copy,
     Fetch: Fn([u8; 32], T) -> FetchFut,
     FetchFut: std::future::Future<Output = anyhow::Result<Vec<u8>>>,
-    Discover: FnOnce([u8; 32]) -> DiscoverFut,
+    Discover: FnOnce([u8; 32], T) -> DiscoverFut,
     DiscoverFut: std::future::Future<Output = anyhow::Result<T>>,
 {
-    let target = preferred.get();
+    let selected = preferred.get();
+    let target = selected.target();
     match fetch_from(hash, target).await {
         Ok(bytes) => Ok(bytes),
         Err(err)
-            if !pinned
+            if !selected.is_pinned()
                 && err
                     .downcast_ref::<UpstreamRefused>()
                     .is_some_and(|refused| refused.error.is_delivery_side()) =>
         {
-            let fallback = discover(hash).await?;
+            let fallback = discover(hash, target).await?;
             let bytes = fetch_from(hash, fallback).await?;
-            preferred.set(fallback);
+            preferred.set(SelectedTarget::Discovered(fallback));
             Ok(bytes)
         }
         Err(err) => Err(err),
@@ -298,14 +330,27 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
 
     /// Select the node to fetch `hash` from: the pinned explicit node, or
     /// per-entry discovery over the shared candidate list.
-    async fn pick(&self, hash: [u8; 32]) -> anyhow::Result<FetchTarget> {
+    async fn pick(&self, hash: [u8; 32]) -> anyhow::Result<SelectedTarget<FetchTarget>> {
         if let Some(pinned) = self.explicit {
-            return Ok(pinned);
+            return Ok(SelectedTarget::Pinned(pinned));
         }
+        Ok(SelectedTarget::Discovered(
+            self.pick_excluding(hash, None).await?,
+        ))
+    }
+
+    /// Select a target while omitting a node that already refused this hash.
+    async fn pick_excluding(
+        &self,
+        hash: [u8; 32],
+        excluded: Option<FetchTarget>,
+    ) -> anyhow::Result<FetchTarget> {
         let candidates = self
             .candidates
             .as_deref()
             .ok_or_else(|| anyhow!("no discovery candidates available"))?;
+        let filtered = excluded.map(|target| fallback_candidates(candidates, target));
+        let candidates = filtered.as_deref().unwrap_or(candidates);
         let picked = fetch::probe_and_rank(
             self.endpoint,
             self.store,
@@ -323,10 +368,13 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
     }
 
     /// Fetch one blob and retain the target chosen for it.
-    async fn fetch_with_target(&self, hash: [u8; 32]) -> anyhow::Result<(Vec<u8>, FetchTarget)> {
-        let target = self.pick(hash).await?;
-        let bytes = self.fetch_from(hash, target).await?;
-        Ok((bytes, target))
+    async fn fetch_with_target(
+        &self,
+        hash: [u8; 32],
+    ) -> anyhow::Result<(Vec<u8>, SelectedTarget<FetchTarget>)> {
+        let selected = self.pick(hash).await?;
+        let bytes = self.fetch_from(hash, selected.target()).await?;
+        Ok((bytes, selected))
     }
 
     /// Fetch directly from `node_id`/`provider`, bypassing discovery.
@@ -414,14 +462,13 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
     async fn fetch_manifest_chunk(
         &self,
         hash: [u8; 32],
-        preferred: &Cell<FetchTarget>,
+        preferred: &Cell<SelectedTarget<FetchTarget>>,
     ) -> anyhow::Result<Vec<u8>> {
         fetch_preferred(
             hash,
             preferred,
-            self.explicit.is_some(),
             |hash, target| self.fetch_from(hash, target),
-            |hash| self.pick(hash),
+            |hash, refusing| self.pick_excluding(hash, Some(refusing)),
         )
         .await
     }
@@ -487,7 +534,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         manifest: anyhow::Result<file_manifest::FileManifest>,
         manifest_hash: [u8; 32],
         dest: &Path,
-        target: FetchTarget,
+        target: SelectedTarget<FetchTarget>,
     ) -> anyhow::Result<u64> {
         let manifest = manifest?;
         // Two entries can name the SAME manifest blob — a bundle may hold one
@@ -691,7 +738,7 @@ mod tests {
 
     #[tokio::test]
     async fn manifest_chunks_reuse_the_preferred_target_without_discovery() {
-        let preferred = std::cell::Cell::new(1u8);
+        let preferred = std::cell::Cell::new(SelectedTarget::Discovered(1u8));
         let fetches = Rc::new(RefCell::new(Vec::new()));
         let discoveries = Rc::new(RefCell::new(0u8));
 
@@ -699,7 +746,6 @@ mod tests {
             fetch_preferred(
                 hash,
                 &preferred,
-                false,
                 {
                     let fetches = Rc::clone(&fetches);
                     move |hash, target| {
@@ -712,7 +758,7 @@ mod tests {
                 },
                 {
                     let discoveries = Rc::clone(&discoveries);
-                    move |_| {
+                    move |_, _| {
                         let discoveries = Rc::clone(&discoveries);
                         async move {
                             *discoveries.borrow_mut() += 1;
@@ -730,12 +776,12 @@ mod tests {
             &[([1u8; 32], 1), ([2u8; 32], 1)]
         );
         assert_eq!(*discoveries.borrow(), 0);
-        assert_eq!(preferred.get(), 1);
+        assert_eq!(preferred.get(), SelectedTarget::Discovered(1));
     }
 
     #[tokio::test]
     async fn delivery_refusal_discovers_once_and_carries_the_fallback_forward() {
-        let preferred = std::cell::Cell::new(1u8);
+        let preferred = std::cell::Cell::new(SelectedTarget::Discovered(1u8));
         let fetches = Rc::new(RefCell::new(Vec::new()));
         let discoveries = Rc::new(RefCell::new(0u8));
 
@@ -743,7 +789,6 @@ mod tests {
             fetch_preferred(
                 hash,
                 &preferred,
-                false,
                 {
                     let fetches = Rc::clone(&fetches);
                     move |hash, target| {
@@ -762,7 +807,7 @@ mod tests {
                 },
                 {
                     let discoveries = Rc::clone(&discoveries);
-                    move |_| {
+                    move |_, _| {
                         let discoveries = Rc::clone(&discoveries);
                         async move {
                             *discoveries.borrow_mut() += 1;
@@ -780,18 +825,77 @@ mod tests {
             &[([1u8; 32], 1), ([1u8; 32], 2), ([2u8; 32], 2),]
         );
         assert_eq!(*discoveries.borrow(), 1);
-        assert_eq!(preferred.get(), 2);
+        assert_eq!(preferred.get(), SelectedTarget::Discovered(2));
+    }
+
+    #[tokio::test]
+    async fn delivery_refusal_excludes_the_refusing_target_from_discovery() {
+        let preferred = std::cell::Cell::new(SelectedTarget::Discovered(1u8));
+        let excluded = Rc::new(RefCell::new(Vec::new()));
+
+        let bytes = fetch_preferred(
+            [1u8; 32],
+            &preferred,
+            |hash, target| async move {
+                if target == 1 {
+                    Err(anyhow::Error::new(decdn_client_pull::UpstreamRefused {
+                        error: decdn_protocol::StreamError::Overloaded,
+                    }))
+                } else {
+                    Ok(vec![hash[0]])
+                }
+            },
+            {
+                let excluded = Rc::clone(&excluded);
+                move |_, refusing_target| {
+                    let excluded = Rc::clone(&excluded);
+                    async move {
+                        excluded.borrow_mut().push(refusing_target);
+                        Ok(2u8)
+                    }
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(bytes, vec![1]);
+        assert_eq!(excluded.borrow().as_slice(), &[1]);
+        assert_eq!(preferred.get(), SelectedTarget::Discovered(2));
+    }
+
+    #[test]
+    fn fallback_candidates_omit_the_refusing_node() {
+        let refusing = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
+        let alternative = iroh::SecretKey::from_bytes(&[2u8; 32]).public();
+        let refusing_provider = Address::repeat_byte(1);
+        let candidates = vec![
+            NodeCandidate {
+                node_id: refusing,
+                eth_address: refusing_provider,
+                region_hint: "TR".to_string(),
+            },
+            NodeCandidate {
+                node_id: alternative,
+                eth_address: Address::repeat_byte(2),
+                region_hint: "TR".to_string(),
+            },
+        ];
+
+        let filtered = fallback_candidates(&candidates, (refusing, refusing_provider));
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].node_id, alternative);
     }
 
     #[tokio::test]
     async fn explicit_pin_does_not_discover_after_not_found() {
-        let preferred = std::cell::Cell::new(1u8);
+        let preferred = std::cell::Cell::new(SelectedTarget::Pinned(1u8));
         let discoveries = Rc::new(RefCell::new(0u8));
 
         let err = fetch_preferred(
             [1u8; 32],
             &preferred,
-            true,
             |_, _| async {
                 Err(anyhow::Error::new(decdn_client_pull::UpstreamRefused {
                     error: decdn_protocol::StreamError::NotFound,
@@ -799,7 +903,7 @@ mod tests {
             },
             {
                 let discoveries = Rc::clone(&discoveries);
-                move |_| {
+                move |_, _| {
                     let discoveries = Rc::clone(&discoveries);
                     async move {
                         *discoveries.borrow_mut() += 1;
@@ -820,7 +924,7 @@ mod tests {
             "{err:#}"
         );
         assert_eq!(*discoveries.borrow(), 0);
-        assert_eq!(preferred.get(), 1);
+        assert_eq!(preferred.get(), SelectedTarget::Pinned(1));
     }
 
     /// The delivery-side gate is load-bearing in the money sense, so pin it from
@@ -832,14 +936,13 @@ mod tests {
     /// once per remaining chunk.
     #[tokio::test]
     async fn voucher_rejection_does_not_fall_back() {
-        let preferred = std::cell::Cell::new(1u8);
+        let preferred = std::cell::Cell::new(SelectedTarget::Discovered(1u8));
         let fetches = Rc::new(RefCell::new(0u8));
         let discoveries = Rc::new(RefCell::new(0u8));
 
         let err = fetch_preferred(
             [1u8; 32],
             &preferred,
-            false,
             {
                 let fetches = Rc::clone(&fetches);
                 move |_, _| {
@@ -856,7 +959,7 @@ mod tests {
             },
             {
                 let discoveries = Rc::clone(&discoveries);
-                move |_| {
+                move |_, _| {
                     let discoveries = Rc::clone(&discoveries);
                     async move {
                         *discoveries.borrow_mut() += 1;
@@ -877,7 +980,7 @@ mod tests {
         );
         assert_eq!(*fetches.borrow(), 1, "the refusal must not be retried");
         assert_eq!(*discoveries.borrow(), 0);
-        assert_eq!(preferred.get(), 1);
+        assert_eq!(preferred.get(), SelectedTarget::Discovered(1));
     }
 
     #[test]
