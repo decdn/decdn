@@ -823,6 +823,131 @@ contract CapacityBondTest is Test {
         assertTrue(bond.isActive(opAddr));
     }
 
+    // ADR 003 § Node Registry — "a full exit is just `deregisterNode` followed
+    // by `unbond()`". That only holds because deregistration also clears the
+    // declared tier: `requestUnbond`'s floor is `bondRequired(declaredMbps)`
+    // and `declareMbps` cannot return the tier to 0, so an operator that had
+    // ever declared could otherwise never withdraw their last TOKEN (#1351).
+
+    /// @dev Bond up to the tier requirement, declare it, and register a node
+    ///      for a fresh operator derived from `opPk`. The deregistration tests
+    ///      all start from a registered node at a declared tier; this is the
+    ///      sequence `test_registerNode_succeedsAtCurve` spells out inline.
+    function _onboardAtTier(uint256 opPk, uint256 mbps, bytes32 nodeId) internal returns (address opAddr) {
+        opAddr = vm.addr(opPk);
+        uint256 bonded = bond.bondRequired(mbps);
+        if (bonded < MIN_BOND) bonded = MIN_BOND;
+
+        vm.prank(admin);
+        token.transfer(opAddr, bonded);
+        vm.startPrank(opAddr);
+        token.approve(address(bond), type(uint256).max);
+        bond.bond(bonded);
+        bond.declareMbps(mbps);
+        vm.stopPrank();
+
+        bytes memory bindingSig = _signRegisterNode(opPk, opAddr, nodeId, TERMS_HASH);
+        vm.prank(opAddr);
+        bond.registerNode(nodeId, hex"", "us-east", TERMS_HASH, bindingSig, hex"01");
+    }
+
+    function test_deregisterNode_clearsDeclaredMbpsAndEmits() public {
+        address opAddr = _onboardAtTier(0xDE9151, 1000, bytes32(uint256(0xDE9151)));
+        assertEq(bond.declaredMbps(opAddr), 1000);
+
+        // The clear is announced: `MbpsDeclared` is the only tier signal an
+        // indexer has, so a silent second writer would desync it.
+        vm.expectEmit(true, false, false, true, address(bond));
+        emit CapacityBond.MbpsDeclared(opAddr, 1000, 0);
+        vm.prank(opAddr);
+        bond.deregisterNode();
+
+        assertEq(bond.declaredMbps(opAddr), 0, "deregistration releases the curve floor");
+    }
+
+    function test_deregisterNode_emitsNoMbpsEventWhenNeverDeclared() public {
+        // `registerNode` does not require a prior `declareMbps` — `minBond`
+        // alone suffices when the tier is 0 — so this operator reaches
+        // deregistration having never declared.
+        uint256 opPk = 0x0DEC1;
+        address opAddr = vm.addr(opPk);
+        vm.prank(admin);
+        token.transfer(opAddr, MIN_BOND);
+        vm.startPrank(opAddr);
+        token.approve(address(bond), type(uint256).max);
+        bond.bond(MIN_BOND);
+        vm.stopPrank();
+
+        bytes32 nodeId = bytes32(uint256(0x0DEC1));
+        bytes memory bindingSig = _signRegisterNode(opPk, opAddr, nodeId, TERMS_HASH);
+        vm.prank(opAddr);
+        bond.registerNode(nodeId, hex"", "us-east", TERMS_HASH, bindingSig, hex"01");
+
+        vm.recordLogs();
+        vm.prank(opAddr);
+        bond.deregisterNode();
+
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        for (uint256 i = 0; i < logs.length; i++) {
+            assertTrue(
+                logs[i].topics[0] != CapacityBond.MbpsDeclared.selector,
+                "a never-declared operator must not log a 0 -> 0 tier change"
+            );
+        }
+    }
+
+    function test_fullExit_deregisterThenUnbondEverything() public {
+        address opAddr = _onboardAtTier(0xE811, 1000, bytes32(uint256(0xE811)));
+        uint256 bonded = bond.activeBond(opAddr);
+        uint256 balanceBefore = token.balanceOf(opAddr);
+
+        // While the tier stands, releasing the whole bond is barred by the
+        // curve — this is the state an operator was previously stuck in.
+        // `bondRequired` is read before the prank: an external call inside the
+        // `expectRevert` argument would consume it and send `requestUnbond`
+        // from the test contract instead.
+        uint256 curveFloor = bond.bondRequired(1000);
+        vm.prank(opAddr);
+        vm.expectRevert(abi.encodeWithSelector(CapacityBond.BondBelowCurve.selector, 0, curveFloor));
+        bond.requestUnbond(bonded);
+
+        vm.prank(opAddr);
+        bond.deregisterNode();
+
+        vm.startPrank(opAddr);
+        bond.requestUnbond(bonded);
+        vm.warp(block.timestamp + UNBONDING);
+        bond.unbond();
+        vm.stopPrank();
+
+        assertEq(bond.activeBond(opAddr), 0, "the last TOKEN is withdrawable once the tier is cleared");
+        assertEq(token.balanceOf(opAddr), balanceBefore + bonded, "the full bond comes back");
+    }
+
+    function test_reRegisterAfterDeregister_keepsBondAndNeedsFreshDeclare() public {
+        uint256 opPk = 0x8EE8;
+        bytes32 nodeId = bytes32(uint256(0x8EE8));
+        address opAddr = _onboardAtTier(opPk, 1000, nodeId);
+        uint256 bonded = bond.activeBond(opAddr);
+
+        vm.prank(opAddr);
+        bond.deregisterNode();
+        assertEq(bond.activeBond(opAddr), bonded, "deregistration never touches the bond");
+
+        // ADR 003: "an operator who changes their mind can re-register without
+        // re-funding" — the retained bond clears `minBond` and, with the tier
+        // now 0, the curve gate as well.
+        bytes memory reSig = _signRegisterNode(opPk, opAddr, nodeId, TERMS_HASH);
+        vm.prank(opAddr);
+        bond.registerNode(nodeId, hex"", "us-east", TERMS_HASH, reSig, hex"01");
+        assertTrue(bond.isActive(opAddr));
+        assertEq(bond.declaredMbps(opAddr), 0, "the tier does not come back with the registration");
+
+        vm.prank(opAddr);
+        bond.declareMbps(1000);
+        assertEq(bond.declaredMbps(opAddr), 1000, "re-declaring needs no further bond");
+    }
+
     function test_setK_updatesCurveAndEmits() public {
         uint256 oldK = bond.kConstant();
         vm.expectEmit(false, false, false, true, address(bond));

@@ -20,6 +20,15 @@
 //!   `minBond`. So the contract permits unbonding into an inactive state. The
 //!   three amount flags pick deliberately different floors: `--to-mbps` keeps
 //!   the operator eligible, `--all` goes to the contract's own floor.
+//!
+//! `--all` releases everything the curve permits *while the node is still
+//! registered*, which is not the same as an exit: the declared tier pins
+//! `bondRequired(declaredMbps)` in place and `declareMbps` cannot set a tier
+//! back to 0. A full exit therefore starts with `CapacityBond.deregisterNode`,
+//! which clears the tier (ADR 003 § Node Registry, ADR 026 § Capacity-bond
+//! curve); `--all` then releases the whole bond. That call has no CLI surface
+//! yet (#1359), so it is named here the way `setup`'s already-registered error
+//! names it.
 
 use std::io::{self, IsTerminal, Write};
 use std::path::Path;
