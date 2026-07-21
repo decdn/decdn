@@ -242,6 +242,27 @@ pub(crate) async fn build_plan<P: Provider + Clone, Q: Provider>(
     })
 }
 
+/// Validate a `--to-mbps` target against the currently declared tier and
+/// decide whether `declareMbps` still has to run.
+///
+/// `target == declared` is **accepted, not rejected**, and this is what makes
+/// the command converge: `execute` sends `declareMbps` then `requestUnbond` as
+/// two transactions, so a run that lands the first and loses the second leaves
+/// the tier already reduced while the bond is still high. Rejecting the equal
+/// case would strand exactly the operator this command's idempotence is for —
+/// and would point them at `decdn node bond`, which cannot release anything.
+/// The `release > 0` check downstream is what catches the genuinely-nothing-
+/// to-do case, so accepting equality here costs no safety.
+fn tier_step(target_mbps: u64, declared_mbps: u64) -> anyhow::Result<Option<u64>> {
+    anyhow::ensure!(
+        target_mbps <= declared_mbps,
+        "--to-mbps {target_mbps} is above the current declared tier \
+         ({declared_mbps} Mbps); raise capacity with `decdn node bond --mbps \
+         {target_mbps}` instead",
+    );
+    Ok((target_mbps < declared_mbps).then_some(target_mbps))
+}
+
 /// Turn the requested amount into `(release, retained, declare_to)`, rejecting
 /// anything the contract would revert on. Split out of [`build_plan`] because
 /// this is where the three flags stop agreeing: each picks a different floor,
@@ -271,12 +292,7 @@ async fn resolve_release<P: Provider + Clone>(
                 "declared capacity {target_mbps} Mbps is outside the on-chain band \
                  [{min_cap}, {max_cap}]; declareMbps would revert",
             );
-            anyhow::ensure!(
-                target < declared,
-                "--to-mbps {target_mbps} is not below the current declared tier \
-                 ({declared_mbps} Mbps); raise capacity with `decdn node bond --mbps \
-                 {target_mbps}` instead",
-            );
+            let declare_to = tier_step(target_mbps, declared_mbps)?;
             // Retain the same `max(minBond, bondRequired)` target `bond` tops up
             // to, so the operator stays eligible at the reduced tier.
             let retained = min_bond.max(curve_floor(target).await?);
@@ -286,7 +302,7 @@ async fn resolve_release<P: Provider + Clone>(
                 "nothing to release: the active bond ({prior}) is already at or below \
                  the {target_mbps} Mbps target ({retained} base units)",
             );
-            Ok((release, retained, Some(target_mbps)))
+            Ok((release, retained, declare_to))
         }
         AmountRequest::All => {
             // The contract's own floor — deliberately below `minBond`.
@@ -742,6 +758,30 @@ mod tests {
             false,
         );
         assert_eq!(p.remaining_secs(), 0);
+    }
+
+    /// The convergence case: `execute` sends `declareMbps` and `requestUnbond`
+    /// as two transactions, so a run that lands the first and loses the second
+    /// leaves `declared == target`. Re-running the identical command must pick
+    /// up where it left off — skipping the redundant declare and still
+    /// releasing the surplus — not refuse because the tier is no longer
+    /// strictly above the target.
+    #[test]
+    fn a_retry_after_the_declare_landed_still_unbonds() {
+        assert_eq!(
+            tier_step(50, 50).expect("an equal tier is a resumable retry, not an error"),
+            None,
+            "the declare already landed, so it must be skipped rather than re-sent"
+        );
+    }
+
+    #[test]
+    fn tier_step_declares_down_and_rejects_raising() {
+        assert_eq!(tier_step(50, 100).unwrap(), Some(50));
+        let err = tier_step(200, 100).expect_err("raising capacity is not this command's job");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("above the current declared tier"), "{msg}");
+        assert!(msg.contains("decdn node bond --mbps"), "{msg}");
     }
 
     /// The gate exists so an operator cannot start a window-long outage by

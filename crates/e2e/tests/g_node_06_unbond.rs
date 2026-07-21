@@ -204,6 +204,56 @@ async fn run() -> anyhow::Result<()> {
         "a rejected plan must submit nothing"
     );
 
+    // ---- 6. Convergence: `--to-mbps` sends declareMbps and requestUnbond as
+    // two transactions, so a run that lands the first and loses the second
+    // leaves the tier already reduced while the bond is still high. Re-running
+    // the identical command must resume from there.
+    //
+    // That half-done state is reachable with the shipped commands: `node bond`
+    // at a tier the operator is already over-bonded for has zero shortfall, so
+    // it submits declareMbps and nothing else — byte for byte the state a
+    // partially-failed unbond leaves behind.
+    run_node_cli(&node, &["bond", "--mbps", &START_MBPS.to_string()]).await?;
+    assert_eq!(chain.active_bond(operator).await?, start_target);
+    run_node_cli(&node, &["bond", "--mbps", &REDUCED_MBPS.to_string()]).await?;
+    assert_eq!(
+        chain.declared_mbps(operator).await?,
+        REDUCED_MBPS,
+        "the tier is down …"
+    );
+    assert_eq!(
+        chain.active_bond(operator).await?,
+        start_target,
+        "… while the bond is still high — the partial-failure state"
+    );
+
+    let out = run_node_cli(
+        &node,
+        &[
+            "unbond",
+            "--to-mbps",
+            &REDUCED_MBPS.to_string(),
+            "--yes",
+            "--json",
+        ],
+    )
+    .await?;
+    let receipt = last_json_line(&out)?;
+    assert_eq!(json_str(&receipt, "phase"), Some("request"));
+    // Explicitly present-and-null, not merely absent: `json_str` would also
+    // return `None` for a number, so a re-sent declare would slip past it.
+    assert!(
+        receipt
+            .get("declare_to_mbps")
+            .is_some_and(serde_json::Value::is_null),
+        "the declare already landed, so the retry must skip it: {receipt}"
+    );
+    assert_eq!(
+        chain.unbonding_of(operator).await?.0,
+        expected_release,
+        "the retry must still release the surplus the first run never got to"
+    );
+
     Ok(())
 }
 
