@@ -20,6 +20,20 @@
 //!   `minBond`. So the contract permits unbonding into an inactive state. The
 //!   three amount flags pick deliberately different floors: `--to-mbps` keeps
 //!   the operator eligible, `--all` goes to the contract's own floor.
+//!
+//! `--all` releases everything the curve permits *while the node is still
+//! registered*, which is not the same as an exit: the declared tier pins
+//! `bondRequired(declaredMbps)` in place and `declareMbps` cannot set a tier
+//! back to 0. A full exit therefore starts with `CapacityBond.deregisterNode`,
+//! which clears the tier (ADR 003 § Node Registry, ADR 026 § Capacity-bond
+//! curve); `--all` then releases the whole bond. That call has no CLI surface
+//! yet (#1359), so it is named here as a raw contract call — the same thing
+//! `setup` does when it tells an already-registered operator to "deregister
+//! on-chain first".
+//!
+//! Note `deregisterNode` requires an active node, so this does not rescue an
+//! operator whose tier was left standing by an ejection, or who declared a tier
+//! without ever registering; see ADR 026 § Capacity-bond curve and #1361.
 
 use std::io::{self, IsTerminal, Write};
 use std::path::Path;

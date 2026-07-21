@@ -231,11 +231,13 @@ iroh handles NAT traversal transparently via QUIC hole-punching and relay fallba
 
 ### Re-Onboarding after Deregistration or Auto-Ejection
 
-A node that voluntarily deregistered or was auto-ejected (bond dropped below 50% of the minimum bond for its declared tier due to slashing — see [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn)) must re-onboard. The flow is identical to initial onboarding with two differences:
+A node that voluntarily deregistered or was auto-ejected (bond dropped below 50% of the minimum bond for its declared tier due to slashing — see [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn)) must re-onboard. The flow is identical to initial onboarding with three differences:
 
 1. **`firstBondedAt` is preserved.** The `firstBondedAt` field in `CapacityBond` is immutable once set. The `age_ramp` ([ADR 026 § Governance](026-tokenomics.md#governance)) therefore resumes from the original bonded date, so a re-onboarding operator does not restart the age-ramp clock.
 
 2. **`registrationNonce` is incremented.** On deregistration, `registrationNonce[nodeId]` is incremented. The operator must sign fresh `ed25519Signature` and `bindingSignature` parameters with the new nonce before calling `registerNode` again.
+
+3. **`declaredMbps` is cleared — on the deregistration path only.** `deregisterNode` resets the declared capacity tier to 0, releasing the `bond_required(declaredMbps)` floor on the bond ([ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve)). The bond itself is untouched, so re-registration after a *voluntary* deregistration needs no new funds — `registerNode` is gated only by `minBond` while the tier is 0 — but Step 2.2's `declareMbps` must be repeated to serve at a tier again. **Auto-ejection does not clear the tier**: `registerNode` re-checks `bond_required(declaredMbps)`, so an auto-ejected operator must re-bond to the full tier minimum to rejoin, exactly as [ADR 003 § Node Registry](003-payments.md#node-registry)'s auto-ejection bullet states.
 
 If the node's iroh identity was replaced (key rotation), use `CapacityBond.bindNodeId()` after re-registration to associate the new `nodeId` with the same `ethAddress` — see [ADR 003 § NodeId Binding](003-payments.md#nodeid-to-ethereum-binding). The old `nodeId` mapping is cleared.
 

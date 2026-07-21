@@ -240,6 +240,14 @@ contract CapacityBond is
     ///         `requestUnbond`, `registerNode`). Slash paths intentionally do
     ///         not re-enforce it — a penalized operator may fall under the
     ///         curve and is auto-ejected below `minBond / 2`.
+    /// @dev    Invariant: every write to this mapping emits `MbpsDeclared`.
+    ///         `declareMbps` sets a tier inside the band; `deregisterNode`
+    ///         clears it back to 0, which is the only route to 0 since the band
+    ///         floor bars `declareMbps(0)`. Note `deregisterNode` requires an
+    ///         active node, while `declareMbps` does not — so a tier declared
+    ///         without registering, or left standing by an ejection, cannot be
+    ///         cleared and keeps pinning `bondRequired(mbps)` of the bond. See
+    ///         ADR 026 § Capacity-bond curve and issue #1361.
     mapping(address operator => uint256) public declaredMbps;
 
     uint256 public minBond;
@@ -836,6 +844,18 @@ contract CapacityBond is
         info.regionHint = regionHint;
     }
 
+    /// @notice Leave the active set. Deactivates the node without touching the
+    ///         bond — deactivation and bond exit stay separate operations
+    ///         (ADR 003 § Node Registry).
+    /// @dev    Clears `declaredMbps`, which is what makes the full-exit path
+    ///         ADR 003 § Node Registry describes reachable at all: the
+    ///         `requestUnbond` floor is `bondRequired(declaredMbps)` and
+    ///         `declareMbps` cannot return the tier to 0 (it enforces
+    ///         `mbps >= minCapacityMbps`, itself floored at
+    ///         `MIN_CAPACITY_FLOOR_MBPS`), so an operator that left the tier
+    ///         standing could never withdraw their last TOKEN. The bond itself
+    ///         stays put and fully slashable; re-registering needs only
+    ///         `minBond` again, but the tier must be re-declared.
     function deregisterNode() external nonReentrant whenNotPaused {
         NodeInfo storage info = _nodes[msg.sender];
         if (!info.active) revert NodeNotActive();
@@ -844,6 +864,16 @@ contract CapacityBond is
         info.active = false;
         registrationNonce[nodeId] += 1;
         _removeFromRegisteredSet(msg.sender);
+
+        // Emitted, not written silently: `MbpsDeclared` is the only log-based
+        // signal for the tier, so a second writer that stayed quiet would
+        // desync every indexer that follows it rather than polling
+        // `declaredMbps`. Skipped when no tier was ever declared.
+        uint256 oldMbps = declaredMbps[msg.sender];
+        if (oldMbps != 0) {
+            delete declaredMbps[msg.sender];
+            emit MbpsDeclared(msg.sender, oldMbps, 0);
+        }
 
         emit NodeDeregistered(nodeId);
     }
