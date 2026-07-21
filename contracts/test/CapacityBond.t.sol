@@ -823,11 +823,15 @@ contract CapacityBondTest is Test {
         assertTrue(bond.isActive(opAddr));
     }
 
-    // ADR 003 § Node Registry — "a full exit is just `deregisterNode` followed
-    // by `unbond()`". That only holds because deregistration also clears the
+    // ADR 003 § Node Registry describes a full exit as deregistration followed
+    // by unbonding. That only holds because deregistration also clears the
     // declared tier: `requestUnbond`'s floor is `bondRequired(declaredMbps)`
     // and `declareMbps` cannot return the tier to 0, so an operator that had
     // ever declared could otherwise never withdraw their last TOKEN (#1351).
+    //
+    // `deregisterNode` requires an active node, so the paths that deactivate
+    // without it leave the tier standing. `test_ejectedOperator_keepsTheTier`
+    // pins that, since it is the boundary of what this fix covers.
 
     /// @dev Bond up to the tier requirement, declare it, and register a node
     ///      for a fresh operator derived from `opPk`. The deregistration tests
@@ -835,8 +839,12 @@ contract CapacityBondTest is Test {
     ///      sequence `test_registerNode_succeedsAtCurve` spells out inline.
     function _onboardAtTier(uint256 opPk, uint256 mbps, bytes32 nodeId) internal returns (address opAddr) {
         opAddr = vm.addr(opPk);
+        // Both floors read off the contract, like `_bondForMbps` — a fixture
+        // that hardcoded `MIN_BOND` would silently under-bond after a
+        // `setMinBond` in some future shared setup.
         uint256 bonded = bond.bondRequired(mbps);
-        if (bonded < MIN_BOND) bonded = MIN_BOND;
+        uint256 floor = bond.minBond();
+        if (bonded < floor) bonded = floor;
 
         vm.prank(admin);
         token.transfer(opAddr, bonded);
@@ -946,6 +954,98 @@ contract CapacityBondTest is Test {
         vm.prank(opAddr);
         bond.declareMbps(1000);
         assertEq(bond.declaredMbps(opAddr), 1000, "re-declaring needs no further bond");
+    }
+
+    /// @notice Pins the boundary of the #1351 fix: `deregisterNode` requires an
+    ///         active node, so the involuntary deactivation paths leave the
+    ///         tier — and therefore the curve floor on the bond — standing.
+    /// @dev    Documented in ADR 026 § Capacity-bond curve as a known gap
+    ///         (issue #1361).
+    ///         This test exists so that closing it is a deliberate, visible
+    ///         change rather than an accident, and so the gap cannot widen
+    ///         unnoticed. Slashing an operator far enough to auto-eject leaves
+    ///         their active bond below `bondRequired(tier)`, at which point
+    ///         `requestUnbond` rejects EVERY non-zero amount.
+    function test_ejectedOperator_keepsTheTierAndCannotUnbond() public {
+        address opAddr = _onboardAtTier(0xE7EC7, 1000, bytes32(uint256(0xE7EC7)));
+
+        // Repeated offenses until auto-ejection trips (below `minBond / 2`).
+        // Note `isActive` would flip false at `minBond` already — `ejected` is
+        // the flag that means the node was actually removed by the contract.
+        for (uint256 i = 0; i < 20 && !bond.ejected(opAddr); i++) {
+            vm.warp(block.timestamp + 8 days);
+            vm.prank(admin);
+            bond.slash(opAddr, challenger, 1);
+        }
+        assertTrue(bond.ejected(opAddr), "the fixture must actually reach auto-ejection");
+        assertEq(bond.declaredMbps(opAddr), 1000, "ejection does not clear the tier");
+
+        uint256 remaining = bond.activeBond(opAddr);
+        assertGt(remaining, 0, "there is bond left to be stuck");
+        assertLt(remaining, bond.bondRequired(1000), "and it sits below the standing curve floor");
+
+        // The route to clearing the tier is closed: already inactive.
+        vm.prank(opAddr);
+        vm.expectRevert(CapacityBond.NodeNotActive.selector);
+        bond.deregisterNode();
+
+        // So not one wei is withdrawable.
+        uint256 floor = bond.bondRequired(1000);
+        vm.prank(opAddr);
+        vm.expectRevert(abi.encodeWithSelector(CapacityBond.BondBelowCurve.selector, remaining - 1, floor));
+        bond.requestUnbond(1);
+    }
+
+    /// @notice `deregisterNode` clears the declared tier and NOTHING else.
+    ///         Three fields must survive it, each for a different reason, and
+    ///         none of them has a test that covers the deregistration path.
+    /// @dev    A future "finish the cleanup" refactor is the threat this
+    ///         guards. `unbondingOf`: deleting it would orphan already-escrowed
+    ///         TOKEN with no withdrawal path. `_slashedAtEpoch`: clearing it
+    ///         would let an operator launder a slash out of their ADR 036
+    ///         voting weight with a deregister/re-register cycle.
+    ///         `firstBondedAt`: ADR 003 § Node Registry states it is never
+    ///         cleared by `deregisterNode`, and the age-ramp depends on it.
+    function test_deregisterNode_preservesUnbondingSlashStampAndFirstBonded() public {
+        address opAddr = _onboardAtTier(0x9A4D, 1000, bytes32(uint256(0x9A4D)));
+
+        vm.prank(admin);
+        bond.slash(opAddr, challenger, 1);
+        uint64 stamp = bond.slashedAtEpoch(opAddr);
+        assertGt(stamp, 0, "the fixture must actually record a slash");
+        uint64 firstBonded = bond.firstBondedAt(opAddr);
+
+        // The slash took the bond below the curve, so top back up: a request
+        // can only be started for what sits ABOVE `bondRequired(tier)`.
+        uint256 topUp = bond.bondRequired(1000);
+        vm.prank(admin);
+        token.transfer(opAddr, topUp);
+        vm.prank(opAddr);
+        bond.bond(topUp);
+
+        // A request in flight: the remaining bond must still clear the curve,
+        // so release only what sits above it.
+        uint256 releasable = bond.activeBond(opAddr) - bond.bondRequired(1000);
+        assertGt(releasable, 0, "the fixture must leave something releasable");
+        vm.prank(opAddr);
+        bond.requestUnbond(releasable);
+        (uint256 pending, uint256 unlockAt) = bond.unbondingOf(opAddr);
+
+        vm.prank(opAddr);
+        bond.deregisterNode();
+
+        assertEq(bond.declaredMbps(opAddr), 0, "the tier is the one thing it clears");
+        (uint256 pendingAfter, uint256 unlockAfter) = bond.unbondingOf(opAddr);
+        assertEq(pendingAfter, pending, "a pending request survives deregistration");
+        assertEq(unlockAfter, unlockAt, "and its unlock time is not extended");
+        assertEq(bond.slashedAtEpoch(opAddr), stamp, "the slash stamp is not launderable");
+        assertEq(bond.firstBondedAt(opAddr), firstBonded, "firstBondedAt is write-once");
+
+        // And the documented exit is drain-then-release while one is pending,
+        // not a second `requestUnbond`.
+        vm.prank(opAddr);
+        vm.expectRevert(CapacityBond.UnbondingInProgress.selector);
+        bond.requestUnbond(1);
     }
 
     function test_setK_updatesCurveAndEmits() public {

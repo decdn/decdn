@@ -27,8 +27,13 @@
 //! back to 0. A full exit therefore starts with `CapacityBond.deregisterNode`,
 //! which clears the tier (ADR 003 § Node Registry, ADR 026 § Capacity-bond
 //! curve); `--all` then releases the whole bond. That call has no CLI surface
-//! yet (#1359), so it is named here the way `setup`'s already-registered error
-//! names it.
+//! yet (#1359), so it is named here as a raw contract call — the same thing
+//! `setup` does when it tells an already-registered operator to "deregister
+//! on-chain first".
+//!
+//! Note `deregisterNode` requires an active node, so this does not rescue an
+//! operator whose tier was left standing by an ejection, or who declared a tier
+//! without ever registering; see ADR 026 § Capacity-bond curve and #1361.
 
 use std::io::{self, IsTerminal, Write};
 use std::path::Path;

@@ -53,6 +53,7 @@ If both keys must rotate, rotate the **iroh key first** (cheap, atomic on-chain,
 | Capacity bond | Keyed by Ethereum address ([ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve)) |
 | Open payment channels (inbound from clients) | Channel ID `keccak256(client_eth, operator_eth, nonce)` ([ADR 003](003-payments.md#adr-003-payment-model)); Ethereum address unchanged |
 | `firstBondedAt` | Write-once; never cleared by `deregisterNode` or auto-ejection, and `bindNodeId` does not touch it ([ADR 003 § Node Registry](003-payments.md#node-registry); [ADR 019 § Re-Onboarding](019-node-onboarding.md#re-onboarding-after-deregistration-or-auto-ejection)) |
+| `declaredMbps` | `bindNodeId` does not touch it, so the [§ iroh node-key rotation only](#iroh-node-key-rotation-only) path keeps the tier. The [§ EOA → EOA migration (PoC default)](#eoa--eoa-migration-poc-default) path deregisters, which clears it — re-declare after re-registering ([ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve)) |
 
 ### What does not carry over
 
@@ -61,7 +62,6 @@ If both keys must rotate, rotate the **iroh key first** (cheap, atomic on-chain,
 | Reputation observations from peers | Reports indexed by `(reporter, provider)` NodeId pair ([ADR 008](008-reputation.md#adr-008-reputation-system)); new NodeId starts at the default 0.5 neutral score |
 | Local DHT routing-table position | New NodeId reseeds the Kademlia bucket structure ([ADR 022](022-content-discovery.md#adr-022--content-discovery-at-scale)) |
 | 0-RTT session tickets cached by clients | Clients fall back to 1-RTT until they re-cache ([ADR 015](015-zero-rtt.md#adr-015-quic-0-rtt-connection-establishment)); brief P95 bump |
-| `declaredMbps` — on the `deregisterNode`-based paths only | Cleared by `deregisterNode` so leaving the active set releases the bond's curve floor ([ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve)). The bond is untouched; re-declare the tier after re-registering. The `bindNodeId`-only rotation never deregisters, so the tier survives it |
 
 ### Procedure
 
@@ -159,7 +159,7 @@ Same as [§ Safe owner / session-key rotation (production preferred path)](#safe
 
 Rotate **iroh first**, then Ethereum:
 
-1. Run [§ iroh node-key rotation only](#iroh-node-key-rotation-only) to completion. `bindNodeId` finality is one block confirmation plus the `NodeIdBound` event — no unbonding period (only `deregisterNode` triggers unbonding per [ADR 003 § Node Registry](003-payments.md#node-registry)).
+1. Run [§ iroh node-key rotation only](#iroh-node-key-rotation-only) to completion. `bindNodeId` finality is one block confirmation plus the `NodeIdBound` event — no unbonding period (nothing on this path touches the bond; bond exit is always a separate `requestUnbond` + `unbond`, per [ADR 003 § Node Registry](003-payments.md#node-registry)).
 2. Run [§ EOA → EOA migration (PoC default)](#eoa--eoa-migration-poc-default), [§ EOA → Safe migration (one-time, recommended)](#eoa--safe-migration-one-time-recommended), or [§ Safe owner / session-key rotation (production preferred path)](#safe-owner--session-key-rotation-production-preferred-path) per the account-type goal. Replay protection between the steps is the per-address `bindingNonce`, incremented when [§ iroh node-key rotation only](#iroh-node-key-rotation-only) ran ([ADR 003 § NodeId-to-Ethereum Binding](003-payments.md#nodeid-to-ethereum-binding)) — no extra cooling-off window required.
 
 Reverse order works but is wasteful: [§ Ethereum signing-key rotation only](#ethereum-signing-key-rotation-only) takes the node offline for the unbonding window anyway, so [§ iroh node-key rotation only](#iroh-node-key-rotation-only) work after [§ Ethereum signing-key rotation only](#ethereum-signing-key-rotation-only) is a no-op against an already-deregistered node.

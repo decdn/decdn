@@ -13,9 +13,10 @@
 //!
 //! **No slash/appeal gate is asserted, deliberately** (#1352). #1033's spec
 //! listed "unbond blocked while a slash/appeal is pending" as a negative case;
-//! that was wrong. ADR 026 § Unbonding window is the resolution — the window
-//! itself is the mitigation, and a gate would let a griefing challenger freeze
-//! an honest operator's exit. Do not "fix" the gap by adding an assertion.
+//! that was wrong. ADR 026 § Capacity-bond curve carries the resolution (the
+//! "No slash/appeal-pending gate" bullet) — the unbonding window itself is the
+//! mitigation, and a gate would let a griefing challenger freeze an honest
+//! operator's exit. Do not "fix" the gap by adding an assertion.
 
 #![cfg(feature = "anvil-e2e")]
 #![allow(
@@ -326,10 +327,14 @@ async fn run() -> anyhow::Result<()> {
         "the retry must still release the surplus the first run never got to"
     );
 
-    // ---- 7. Drain step 6's request so the remaining legs start clean.
+    // ---- 7. Drain step 6's request so the remaining legs start clean. The
+    // phase is asserted rather than assumed: legs 8 and 9 depend on this
+    // withdrawal, and without it a surprise here surfaces as a bare
+    // "exited non-zero" two legs later.
     let (_, unlock_at) = chain.unbonding_of(operator).await?;
     decdn_e2e::time::advance_to(chain.admin(), unlock_at).await?;
-    run_node_cli(&node, &["unbond", "--yes", "--json"]).await?;
+    let out = run_node_cli(&node, &["unbond", "--yes", "--json"]).await?;
+    assert_eq!(json_str(&last_json_line(&out)?, "phase"), Some("withdraw"));
     assert_eq!(chain.active_bond(operator).await?, reduced_target);
 
     // ---- 8. A below-crossover `--to-mbps`, where `minBond` is the operative
@@ -370,7 +375,8 @@ async fn run() -> anyhow::Result<()> {
 
     let (_, unlock_at) = chain.unbonding_of(operator).await?;
     decdn_e2e::time::advance_to(chain.admin(), unlock_at).await?;
-    run_node_cli(&node, &["unbond", "--yes", "--json"]).await?;
+    let out = run_node_cli(&node, &["unbond", "--yes", "--json"]).await?;
+    assert_eq!(json_str(&last_json_line(&out)?, "phase"), Some("withdraw"));
     assert!(
         chain.is_active(operator).await?,
         "`--to-mbps` keeps the operator eligible: minBond is still covered"
@@ -401,7 +407,8 @@ async fn run() -> anyhow::Result<()> {
     let (pending, unlock_at) = chain.unbonding_of(operator).await?;
     assert_eq!(pending, min_bond - floor_curve);
     decdn_e2e::time::advance_to(chain.admin(), unlock_at).await?;
-    run_node_cli(&node, &["unbond", "--yes", "--json"]).await?;
+    let out = run_node_cli(&node, &["unbond", "--yes", "--json"]).await?;
+    assert_eq!(json_str(&last_json_line(&out)?, "phase"), Some("withdraw"));
     assert_eq!(
         chain.token_balance(operator).await? - before,
         min_bond - floor_curve,
