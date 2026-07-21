@@ -48,12 +48,42 @@ pub async fn run(args: &cli::BondArgs, global_config: Option<&Path>) -> anyhow::
         return Ok(());
     }
 
-    let outcome = execute(&bond, &provider, &plan, operator, cb_addr, mbps).await?;
+    // The outcome is owned HERE, not inside `execute`, so a partially-applied
+    // sequence survives the error (#1355, mirroring what #1353 did for
+    // `unbond`). `execute` sends up to three transactions; if `declareMbps`
+    // fails after `bond` mined, those hashes are the operator's only record that
+    // their TOKEN moved into `CapacityBond`. Returning `Err` with the outcome
+    // still inside `execute` would drop it and print nothing at all.
+    let mut outcome = Outcome::default();
+    let result = execute(
+        &bond,
+        &provider,
+        &plan,
+        operator,
+        cb_addr,
+        mbps,
+        &mut outcome,
+    )
+    .await;
 
     let mut out = io::stdout().lock();
     write_plan(&mut out, &plan, args.chain.common.json, &outcome, false)
         .context("failed to write result")?;
-    Ok(())
+    drop(out);
+
+    result.with_context(|| match (outcome.approve, outcome.bond) {
+        (_, Some(tx)) => format!(
+            "bond ALREADY LANDED (tx {tx:#x}): the TOKEN is now held by CapacityBond and \
+             visible via `activeBond`, but the capacity tier was NOT declared. Re-run the \
+             identical command to resume — it tops up only the remaining shortfall, so it \
+             will not over-bond"
+        ),
+        (Some(tx), None) => format!(
+            "approve ALREADY LANDED (tx {tx:#x}): the allowance is granted but no TOKEN was \
+             transferred. Re-run the identical command to resume"
+        ),
+        (None, None) => "no transaction landed; on-chain state is unchanged".to_string(),
+    })
 }
 
 /// What `bond` intends to do, computed from chain state. `pub(crate)` so
@@ -125,6 +155,11 @@ pub(crate) async fn build_plan<P: Provider + Clone>(
 /// Submit the needed transactions in order: approve (if allowance short) →
 /// bond (if shortfall) → declareMbps (if not already at the tier). Each step
 /// is independently skippable, which is what makes the command idempotent.
+///
+/// `outcome` is a caller-owned accumulator rather than a return value so a
+/// partial sequence survives an error — the caller reports what landed before
+/// propagating (#1355).
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute<P: Provider + Clone>(
     bond: &CapacityBond::CapacityBondInstance<P>,
     provider: P,
@@ -132,9 +167,8 @@ pub(crate) async fn execute<P: Provider + Clone>(
     operator: Address,
     cb_addr: Address,
     mbps: U256,
-) -> anyhow::Result<Outcome> {
-    let mut outcome = Outcome::default();
-
+    outcome: &mut Outcome,
+) -> anyhow::Result<()> {
     if plan.shortfall > U256::ZERO {
         let token = Erc20::new(plan.token, provider);
         // Balance check before any send so a doomed run fails clean.
@@ -157,60 +191,21 @@ pub(crate) async fn execute<P: Provider + Clone>(
             .await
             .with_context(|| format!("failed to read TOKEN allowance from {}", plan.token))?;
         if allowance < plan.shortfall {
-            let pending = token
-                .approve(cb_addr, plan.shortfall)
-                .send()
-                .await
-                .context("approve transaction failed to send")?;
-            let receipt = pending
-                .get_receipt()
-                .await
-                .context("approve sent but the receipt could not be fetched")?;
-            anyhow::ensure!(
-                receipt.status(),
-                "approve reverted (tx {})",
-                receipt.transaction_hash
+            outcome.approve = Some(
+                chain_ctx::send(token.approve(cb_addr, plan.shortfall), "approve", None).await?,
             );
-            outcome.approve = Some(receipt.transaction_hash);
         }
 
-        let pending = bond
-            .bond(plan.shortfall)
-            .send()
-            .await
-            .context("bond transaction failed to send")?;
-        let receipt = pending
-            .get_receipt()
-            .await
-            .context("bond sent but the receipt could not be fetched")?;
-        anyhow::ensure!(
-            receipt.status(),
-            "bond reverted (tx {})",
-            receipt.transaction_hash
-        );
-        outcome.bond = Some(receipt.transaction_hash);
+        outcome.bond = Some(chain_ctx::send(bond.bond(plan.shortfall), "bond", None).await?);
     }
 
     if plan.needs_declare {
-        let pending = bond
-            .declareMbps(mbps)
-            .send()
-            .await
-            .context("declareMbps transaction failed to send")?;
-        let receipt = pending
-            .get_receipt()
-            .await
-            .context("declareMbps sent but the receipt could not be fetched")?;
-        anyhow::ensure!(
-            receipt.status(),
-            "declareMbps reverted (tx {}); is {} Mbps within the capacity band?",
-            receipt.transaction_hash,
-            plan.mbps,
-        );
-        outcome.declare = Some(receipt.transaction_hash);
+        let hint = format!("is {} Mbps within the capacity band?", plan.mbps);
+        outcome.declare =
+            Some(chain_ctx::send(bond.declareMbps(mbps), "declareMbps", Some(&hint)).await?);
     }
 
-    Ok(outcome)
+    Ok(())
 }
 
 /// Write the plan + outcome as JSON or grep-friendly `key=value` lines. Pure
@@ -313,6 +308,56 @@ mod tests {
         write_plan(&mut buf, &p, false, &Outcome::default(), true).unwrap();
         let s = String::from_utf8(buf).unwrap();
         assert!(s.contains("submitted=false dry_run=true"), "{s}");
+    }
+
+    /// #1355 — the partial-failure shape `run` now prints before propagating:
+    /// `approve` + `bond` mined, `declareMbps` did not. The operator's TOKEN has
+    /// moved, so the report must say `submitted=true` and name the two landed
+    /// hashes; reporting `declare_tx` as skipped-vs-failed is not distinguished
+    /// here (the accompanying error is what says which), but the landed hashes
+    /// must be present either way.
+    #[test]
+    fn partial_outcome_reports_the_steps_that_landed() {
+        let p = plan(0, 50_000, 50_000, true);
+        let outcome = Outcome {
+            approve: Some(B256::repeat_byte(0xa1)),
+            bond: Some(B256::repeat_byte(0xb2)),
+            declare: None,
+        };
+
+        let mut buf = Vec::new();
+        write_plan(&mut buf, &p, false, &outcome, false).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains("submitted=true dry_run=false"), "{s}");
+        assert!(
+            s.contains(&format!("approve_tx={:#x}", outcome.approve.unwrap())),
+            "{s}"
+        );
+        assert!(
+            s.contains(&format!("bond_tx={:#x}", outcome.bond.unwrap())),
+            "{s}"
+        );
+        assert!(s.contains("declare_tx=skipped"), "{s}");
+
+        let mut buf = Vec::new();
+        write_plan(&mut buf, &p, true, &outcome, false).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+        assert_eq!(
+            v.get("submitted").and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            v.get("approve_tx").and_then(serde_json::Value::as_str),
+            Some(format!("{:#x}", outcome.approve.unwrap()).as_str())
+        );
+        assert_eq!(
+            v.get("bond_tx").and_then(serde_json::Value::as_str),
+            Some(format!("{:#x}", outcome.bond.unwrap()).as_str())
+        );
+        assert!(
+            v.get("declare_tx").is_some_and(serde_json::Value::is_null),
+            "unlanded step must be present and null, got {v}"
+        );
     }
 
     #[test]

@@ -190,7 +190,7 @@ pub(crate) struct Outcome {
 /// precondition the contract enforces is checked here first, so an impossible
 /// request fails before any transaction is sent rather than as a raw revert.
 /// The exception is `whenNotPaused`, which is not pre-checked — a paused
-/// contract still surfaces as a revert from [`send`].
+/// contract still surfaces as a revert from [`chain_ctx::send`].
 pub(crate) async fn build_plan<P: Provider + Clone, Q: Provider>(
     bond: &CapacityBond::CapacityBondInstance<P>,
     provider: &Q,
@@ -416,7 +416,7 @@ pub(crate) async fn execute<P: Provider + Clone>(
             if let Some(mbps) = declare_to {
                 let hint = format!("is {mbps} Mbps within the capacity band?");
                 outcome.declare = Some(
-                    send(
+                    chain_ctx::send(
                         bond.declareMbps(U256::from(mbps)),
                         "declareMbps",
                         Some(&hint),
@@ -424,10 +424,11 @@ pub(crate) async fn execute<P: Provider + Clone>(
                     .await?,
                 );
             }
-            outcome.request = Some(send(bond.requestUnbond(release), "requestUnbond", None).await?);
+            outcome.request =
+                Some(chain_ctx::send(bond.requestUnbond(release), "requestUnbond", None).await?);
         }
         Action::Withdraw { .. } => {
-            outcome.withdraw = Some(send(bond.unbond(), "unbond", None).await?);
+            outcome.withdraw = Some(chain_ctx::send(bond.unbond(), "unbond", None).await?);
         }
         // `run` bails on `Waiting` before reaching here. Kept loud rather than a
         // no-op: a silent `Ok` would report `submitted=false` and exit 0, which
@@ -439,35 +440,6 @@ pub(crate) async fn execute<P: Provider + Clone>(
         ),
     }
     Ok(())
-}
-
-/// Send one call, await its receipt, and fail on a revert — the same
-/// send/receipt/`ensure!(status)` triple every step of `bond::execute` uses.
-///
-/// `hint` is an optional per-step diagnostic appended to a revert (`bond` has
-/// one on `declareMbps`); the tx hash is captured BEFORE awaiting the receipt so
-/// a fetch timeout still tells the operator what to look up — the transaction is
-/// in flight either way, and a hashless "could not be fetched" is unactionable.
-async fn send<C: alloy::contract::CallDecoder, P: Provider>(
-    call: alloy::contract::CallBuilder<P, C>,
-    label: &str,
-    hint: Option<&str>,
-) -> anyhow::Result<B256> {
-    let pending = call
-        .send()
-        .await
-        .with_context(|| format!("{label} transaction failed to send"))?;
-    let hash = *pending.tx_hash();
-    let receipt = pending.get_receipt().await.with_context(|| {
-        format!("{label} sent (tx {hash:#x}) but the receipt could not be fetched")
-    })?;
-    anyhow::ensure!(
-        receipt.status(),
-        "{label} reverted (tx {:#x}){}",
-        receipt.transaction_hash,
-        hint.map_or_else(String::new, |h| format!("; {h}")),
-    );
-    Ok(receipt.transaction_hash)
 }
 
 /// Head block timestamp, used to decide whether a request has matured. Read

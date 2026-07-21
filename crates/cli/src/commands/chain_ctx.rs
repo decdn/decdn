@@ -363,6 +363,37 @@ pub fn resolve_swap(
     }))
 }
 
+/// Send one call, await its receipt, and fail on a revert — the
+/// send/receipt/`ensure!(status)` triple every step of `bond`, `unbond`, and
+/// `register` needs. Shared here so all three report failures identically and
+/// none re-derives the hash-before-receipt ordering below (#1355).
+///
+/// `hint` is an optional per-step diagnostic appended to a revert (`bond` has
+/// one on `declareMbps`); the tx hash is captured BEFORE awaiting the receipt so
+/// a fetch timeout still tells the operator what to look up — the transaction is
+/// in flight either way, and a hashless "could not be fetched" is unactionable.
+pub(crate) async fn send<C: alloy::contract::CallDecoder, P: alloy::providers::Provider>(
+    call: alloy::contract::CallBuilder<P, C>,
+    label: &str,
+    hint: Option<&str>,
+) -> anyhow::Result<alloy::primitives::B256> {
+    let pending = call
+        .send()
+        .await
+        .with_context(|| format!("{label} transaction failed to send"))?;
+    let hash = *pending.tx_hash();
+    let receipt = pending.get_receipt().await.with_context(|| {
+        format!("{label} sent (tx {hash:#x}) but the receipt could not be fetched")
+    })?;
+    anyhow::ensure!(
+        receipt.status(),
+        "{label} reverted (tx {:#x}){}",
+        receipt.transaction_hash,
+        hint.map_or_else(String::new, |h| format!("; {h}")),
+    );
+    Ok(receipt.transaction_hash)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {

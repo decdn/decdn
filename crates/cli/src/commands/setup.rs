@@ -480,20 +480,28 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
     if !json {
         println!("bond:");
     }
-    let bond_outcome = bond::execute(
+    // Own the outcome so a partial bond sequence is reported even when a later
+    // step fails (#1355). `setup` is the worse case of the two callers: under
+    // `--json` the only bond output is the aggregated summary at the end, so
+    // propagating from here used to print nothing at all — the operator would
+    // see `setup` fail with no record that their TOKEN had already moved.
+    let mut bond_outcome = bond::Outcome::default();
+    let bond_result = bond::execute(
         &bond_contract,
         &provider,
         &plan,
         operator,
         cb_addr,
         U256::from(args.mbps),
+        &mut bond_outcome,
     )
-    .await?;
-    if !json {
+    .await;
+    if !json || bond_result.is_err() {
         let mut out = io::stdout().lock();
-        bond::write_plan(&mut out, &plan, false, &bond_outcome, false)
+        bond::write_plan(&mut out, &plan, json, &bond_outcome, false)
             .context("failed to write bond result")?;
     }
+    bond_result?;
 
     // ---- Phase 2.3: register (skipped only when *this* key is already bound;
     //      `terms_hash` is `Some` iff a fresh registration is due + accepted). ----

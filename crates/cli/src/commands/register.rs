@@ -182,29 +182,28 @@ pub(crate) async fn submit_registration<P: Provider + Clone>(
         return Ok(outcome);
     }
 
-    let pending = bond
-        .registerNode(
+    // Via the shared `send` (#1355) so a receipt-fetch timeout still names the
+    // in-flight tx — the bespoke code here used to lose the hash entirely on
+    // that path, leaving an operator unable to check whether they registered.
+    // The old send-failure string also advised "check RPC, gas"; that is dropped
+    // deliberately, since the wrapped transport error already says which, and
+    // the bond/curve half of it only ever applied to the revert (now the hint).
+    let tx = chain_ctx::send(
+        bond.registerNode(
             node_id,
             Bytes::from(packed_multiaddrs),
             region.to_string(),
             terms_hash,
             Bytes::from(binding_sig),
             Bytes::from(ed25519_sig),
-        )
-        .send()
-        .await
-        .context("registerNode transaction failed to send (check RPC, gas, and that the bond covers minBond / the declared-capacity curve)")?;
-    let receipt = pending
-        .get_receipt()
-        .await
-        .context("registerNode sent but the receipt could not be fetched")?;
-
-    let tx = receipt.transaction_hash;
-    anyhow::ensure!(
-        receipt.status(),
-        "registerNode reverted (tx {tx}); most likely the bond does not cover minBond / the \
-         declared-capacity curve, the nodeId/address is already bound, or a signature was rejected",
-    );
+        ),
+        "registerNode",
+        Some(
+            "most likely the bond does not cover minBond / the declared-capacity curve, the \
+             nodeId/address is already bound, or a signature was rejected",
+        ),
+    )
+    .await?;
     outcome.tx = Some(tx);
     Ok(outcome)
 }
