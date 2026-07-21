@@ -33,6 +33,9 @@ anyhow = { workspace = true }
 blake3 = { workspace = true }
 bytes = { workspace = true }
 iroh = { workspace = true }
+# Peer-cache (`peers.json`) persistence for the ADR 012 bootstrap fallback.
+serde = { workspace = true }
+serde_json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 

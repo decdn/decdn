@@ -8,21 +8,55 @@
 //! `multiaddrs` field is not decoded here; a self-contained `multiaddrs`
 //! decoder is the deferred, more-decentralized fallback (#936 § fallback).
 
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
 use alloy::primitives::{Address, U256};
 use alloy::providers::ProviderBuilder;
 use anyhow::Context;
 use decdn_incentive::capacity_bond::CapacityBond;
 use iroh::PublicKey;
+use serde::{Deserialize, Serialize};
 
 /// Page size for the paginated `getActiveNodes` read (ADR 019 § Step 3.3's
 /// worked-example limit). At `PoC` scale (tens of nodes) one page suffices; the
 /// loop preserves the pattern for production scale.
 const PAGE_SIZE: u64 = 100;
 
+/// Backoff before each retry of a failed `getActiveNodes` page call — ADR 012
+/// § Bootstrap step 3: "retry 3× exponential backoff (1 s, 5 s, 30 s)". The
+/// length of the table is the retry count.
+///
+/// Deliberately not `decdn_config_types::RetryPolicy`: that is a *doubling*
+/// policy scoped to node-side origin fetches, so reusing it here would silently
+/// produce 1 s / 2 s / 4 s, and it would drag an origin-side config type across
+/// the client's dependency edge.
+const REGISTRY_RETRY_BACKOFF: [Duration; 3] = [
+    Duration::from_secs(1),
+    Duration::from_secs(5),
+    Duration::from_secs(30),
+];
+
+/// Filename of the peer cache inside the resolved client data dir.
+const PEER_CACHE_FILE: &str = "peers.json";
+
+/// Version tag written into (and required of) the peer cache file, so a future
+/// shape change is a cache miss rather than a decode error.
+const PEER_CACHE_VERSION: u32 = 1;
+
+/// The error the client exits with when the registry is unreachable and no
+/// cached peer list exists — the exact wording pinned by ADR 012 § Bootstrap
+/// step 4.
+pub const BOOTSTRAP_UNREACHABLE: &str =
+    "Cannot reach bootstrap sources. Check network connectivity and RPC endpoint configuration.";
+
 /// A node the client may fetch from, distilled from a registry `NodeInfo`.
 /// `multiaddrs` is intentionally dropped — dialing is by `node_id` via iroh
 /// discovery (see module docs).
-#[derive(Debug, Clone)]
+///
+/// Serializable so the resolved set can be persisted to the peer cache and
+/// reloaded when the registry is unreachable (ADR 012 § Bootstrap step 4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeCandidate {
     /// iroh endpoint id — dialed via discovery, never needs an explicit addr.
     pub node_id: PublicKey,
@@ -83,11 +117,41 @@ pub async fn active_nodes(
     let mut out = Vec::new();
     let mut offset = 0u64;
     loop {
-        let page = registry
-            .getActiveNodes(U256::from(offset), U256::from(PAGE_SIZE))
-            .call()
-            .await
-            .with_context(|| format!("CapacityBond.getActiveNodes(offset={offset})"))?;
+        // ADR 012 § Bootstrap step 3: retry a failed page on the fixed backoff
+        // schedule before giving up on the whole read.
+        let mut attempt = 0usize;
+        let page = loop {
+            match registry
+                .getActiveNodes(U256::from(offset), U256::from(PAGE_SIZE))
+                .call()
+                .await
+            {
+                Ok(page) => break page,
+                Err(e) => {
+                    let Some(backoff) = REGISTRY_RETRY_BACKOFF.get(attempt).copied() else {
+                        return Err(e).with_context(|| {
+                            format!(
+                                "CapacityBond.getActiveNodes(offset={offset}) failed after {} \
+                                 retries",
+                                REGISTRY_RETRY_BACKOFF.len()
+                            )
+                        });
+                    };
+                    // The transport error is logged as-is (never the `rpc_url`,
+                    // which commonly carries an API key) — the same error text
+                    // already reaches the user through the context chain above.
+                    tracing::warn!(
+                        offset,
+                        attempt,
+                        backoff_ms = backoff.as_millis(),
+                        error = %e,
+                        "CapacityBond.getActiveNodes page failed; retrying"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    attempt = attempt.saturating_add(1);
+                }
+            }
+        };
         let page_len = page.len() as u64;
         out.extend(page.iter().filter_map(candidate_from));
         // A short page is the last page (Kademlia-style termination).
@@ -97,6 +161,121 @@ pub async fn active_nodes(
         offset = offset.saturating_add(PAGE_SIZE);
     }
     Ok(out)
+}
+
+/// On-disk shape of the peer cache. The version tag lets a later shape change
+/// be read as "no usable cache" instead of a hard decode failure.
+#[derive(Debug, Serialize, Deserialize)]
+struct PeerCache {
+    version: u32,
+    peers: Vec<NodeCandidate>,
+}
+
+/// Path of the cached peer list inside the resolved client data dir
+/// (`--data-dir` / `identity.data_dir`, defaulting to `~/.decdn/client`).
+#[must_use]
+pub fn peer_cache_path(data_dir: &Path) -> PathBuf {
+    data_dir.join(PEER_CACHE_FILE)
+}
+
+/// Read the cached peer list, or `None` when the cache is absent, unreadable,
+/// undecodable, of an unknown version, or empty. The one caller — the
+/// exhausted-retries fallback — cannot act on any of those differently, so a
+/// broken cache is deliberately collapsed into a missing one.
+fn read_peer_cache(data_dir: &Path) -> Option<Vec<NodeCandidate>> {
+    let path = peer_cache_path(data_dir);
+    let raw = std::fs::read(&path).ok()?;
+    let cache: PeerCache = serde_json::from_slice(&raw)
+        .inspect_err(|e| {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "peer cache is undecodable; ignoring it"
+            );
+        })
+        .ok()?;
+    if cache.version != PEER_CACHE_VERSION || cache.peers.is_empty() {
+        return None;
+    }
+    Some(cache.peers)
+}
+
+/// Persist `peers` to the peer cache, creating `data_dir` if needed. Written to
+/// a sibling temp file and renamed so a crash mid-write cannot truncate a
+/// previously good cache.
+///
+/// # Errors
+///
+/// Fails if the data dir cannot be created or the write/rename fails.
+fn write_peer_cache(data_dir: &Path, peers: &[NodeCandidate]) -> anyhow::Result<()> {
+    let path = peer_cache_path(data_dir);
+    let tmp = path.with_extension("json.tmp");
+    let body = serde_json::to_vec_pretty(&PeerCache {
+        version: PEER_CACHE_VERSION,
+        peers: peers.to_vec(),
+    })?;
+    std::fs::create_dir_all(data_dir)
+        .with_context(|| format!("creating client data dir {}", data_dir.display()))?;
+    std::fs::write(&tmp, &body).with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).with_context(|| format!("renaming into {}", path.display()))
+}
+
+/// Turn a registry read outcome into the bootstrap peer set (ADR 012
+/// § Bootstrap steps 4, 6, and 7): persist a successful read to the peer cache,
+/// or on failure fall back to the cache, or — with no cache — surface
+/// [`BOOTSTRAP_UNREACHABLE`] with the registry failure as its cause.
+///
+/// An empty successful read is returned as-is but does **not** overwrite the
+/// cache: an emptied registry is not a reason to discard the last known-good
+/// peer list, and the callers reject an empty set anyway.
+fn resolve_bootstrap(
+    registry: anyhow::Result<Vec<NodeCandidate>>,
+    data_dir: &Path,
+) -> anyhow::Result<Vec<NodeCandidate>> {
+    let err = match registry {
+        Ok(peers) => {
+            if !peers.is_empty()
+                && let Err(e) = write_peer_cache(data_dir, &peers)
+            {
+                // A cache we could not persist only costs us the next outage's
+                // fallback; it must not fail a fetch that already succeeded.
+                tracing::warn!(error = %e, "could not persist the peer cache");
+            }
+            return Ok(peers);
+        }
+        Err(e) => e,
+    };
+    match read_peer_cache(data_dir) {
+        Some(peers) => {
+            tracing::warn!(
+                peers = peers.len(),
+                error = %err,
+                "registry unreachable; falling back to the cached peer list"
+            );
+            Ok(peers)
+        }
+        None => Err(err.context(BOOTSTRAP_UNREACHABLE)),
+    }
+}
+
+/// Bootstrap the client's peer set (ADR 012 § Bootstrap): read the active node
+/// set from `CapacityBond` with the ADR's retry schedule, persisting it to the
+/// peer cache under `data_dir` on success and falling back to that cache when
+/// the registry cannot be reached.
+///
+/// `data_dir` is the resolved client data dir, so an explicit `--data-dir`
+/// moves the cache with the rest of the client's state.
+///
+/// # Errors
+///
+/// Fails with [`BOOTSTRAP_UNREACHABLE`] when every retry is exhausted and no
+/// cached peer list exists.
+pub async fn bootstrap_nodes(
+    rpc_url: &str,
+    capacity_bond_addr: Address,
+    data_dir: &Path,
+) -> anyhow::Result<Vec<NodeCandidate>> {
+    resolve_bootstrap(active_nodes(rpc_url, capacity_bond_addr).await, data_dir)
 }
 
 /// Candidates probed before ranking (decision 3): take the top-K by region,
@@ -277,5 +456,81 @@ mod tests {
         let holders = vec![probed(1, 30.0, false), probed(2, 12.0, false)];
         let pick = rank(&holders).unwrap();
         assert_eq!(pick.candidate.eth_address, Address::repeat_byte(2));
+    }
+
+    #[test]
+    fn retry_backoff_is_the_adr_012_schedule() {
+        // ADR 012 § Bootstrap step 3: "retry 3× exponential backoff
+        // (1 s, 5 s, 30 s)". Asserted against the table the retry loop reads so
+        // the schedule is checked without sleeping 36 s.
+        assert_eq!(
+            REGISTRY_RETRY_BACKOFF,
+            [
+                Duration::from_secs(1),
+                Duration::from_secs(5),
+                Duration::from_secs(30),
+            ]
+        );
+    }
+
+    #[test]
+    fn peer_cache_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let peers = vec![candidate(1, "DE"), candidate(2, "US")];
+        write_peer_cache(dir.path(), &peers).unwrap();
+        assert_eq!(read_peer_cache(dir.path()), Some(peers));
+    }
+
+    #[test]
+    fn absent_cache_reads_as_none() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(read_peer_cache(dir.path()).is_none());
+    }
+
+    #[test]
+    fn successful_read_persists_the_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let peers = vec![candidate(5, "FR")];
+        assert_eq!(
+            resolve_bootstrap(Ok(peers.clone()), dir.path()).unwrap(),
+            peers
+        );
+        assert_eq!(read_peer_cache(dir.path()), Some(peers));
+    }
+
+    #[test]
+    fn exhausted_retries_fall_back_to_the_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let peers = vec![candidate(3, "US"), candidate(4, "DE")];
+        write_peer_cache(dir.path(), &peers).unwrap();
+        let out = resolve_bootstrap(Err(anyhow::anyhow!("rpc down")), dir.path()).unwrap();
+        assert_eq!(out, peers);
+    }
+
+    #[test]
+    fn exhausted_retries_without_a_cache_report_the_adr_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = resolve_bootstrap(Err(anyhow::anyhow!("rpc down")), dir.path()).unwrap_err();
+        assert_eq!(format!("{err}"), BOOTSTRAP_UNREACHABLE);
+        assert_eq!(
+            BOOTSTRAP_UNREACHABLE,
+            "Cannot reach bootstrap sources. Check network connectivity and RPC endpoint \
+             configuration."
+        );
+        // The registry failure stays in the chain as the cause.
+        assert!(format!("{err:#}").contains("rpc down"));
+    }
+
+    #[test]
+    fn an_empty_registry_read_leaves_a_populated_cache_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let peers = vec![candidate(6, "US")];
+        write_peer_cache(dir.path(), &peers).unwrap();
+        assert!(
+            resolve_bootstrap(Ok(Vec::new()), dir.path())
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(read_peer_cache(dir.path()), Some(peers));
     }
 }

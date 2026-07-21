@@ -309,20 +309,21 @@ pub(crate) async fn probe_and_rank(
 /// Auto-discover a node to fetch `hash` from (#936): read the active node set
 /// from `CapacityBond`, take the region-nearest [`discovery::SELECT_K`]
 /// candidates, and [`probe_and_rank`] them. Returns the chosen candidate.
+/// `capacity_bond` is passed separately because the caller has already turned
+/// the optional `chain.capacity_bond` into the "auto-discovery needs it" error.
 async fn discover_provider(
     endpoint: &Endpoint,
     store: &RedbBuyerChannelStore,
-    rpc_url: &str,
+    chain: &ResolvedChain,
     capacity_bond: Address,
-    client_region: Option<&str>,
     relay_hint: Option<&RelayUrl>,
     hash: [u8; 32],
 ) -> anyhow::Result<NodeCandidate> {
-    let all = discovery::active_nodes(rpc_url, capacity_bond).await?;
+    let all = discovery::bootstrap_nodes(&chain.rpc_url, capacity_bond, &chain.data_dir).await?;
     if all.is_empty() {
         anyhow::bail!("no active nodes in the CapacityBond registry at {capacity_bond}");
     }
-    let selected = discovery::select_candidates(all, client_region, discovery::SELECT_K);
+    let selected = discovery::select_candidates(all, chain.region.as_deref(), discovery::SELECT_K);
     probe_and_rank(endpoint, store, &selected, relay_hint, hash).await
 }
 
@@ -359,16 +360,8 @@ pub(crate) async fn resolve_target_node(
              blockchain.capacity_bond_address), or pass --node-id to dial directly"
         )
     })?;
-    let picked = discover_provider(
-        endpoint,
-        store,
-        &chain.rpc_url,
-        capacity_bond,
-        chain.region.as_deref(),
-        relays.first(),
-        hash,
-    )
-    .await?;
+    let picked =
+        discover_provider(endpoint, store, chain, capacity_bond, relays.first(), hash).await?;
     eprintln!(
         "discovered node {} (provider {}, region {:?})",
         picked.node_id, picked.eth_address, picked.region_hint

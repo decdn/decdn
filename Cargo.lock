@@ -2690,6 +2690,8 @@ dependencies = [
  "decdn-incentive",
  "decdn-protocol",
  "iroh",
+ "serde",
+ "serde_json",
  "tempfile",
  "tokio",
  "tracing",

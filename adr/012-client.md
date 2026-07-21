@@ -47,18 +47,18 @@ Startup sequence from first launch to ready state:
      starting at offset 0, incrementing until a page returns fewer than 100
      On failure: retry 3× exponential backoff (1 s, 5 s, 30 s)
 4. If the registry cannot be reached (all retries exhausted):
-     On cached peers present: fall back to ~/.decdn/peers.json
+     On cached peers present: fall back to ~/.decdn/client/peers.json
      On no cache: exit with error —
        "Cannot reach bootstrap sources. Check network connectivity
         and RPC endpoint configuration."
 5. Connect to iroh relay (for NAT traversal)
 6. Build peer table from the resolved bootstrap peers
      (registry results, or the cached peers.json on fallback)
-7. Persist peer list to ~/.decdn/peers.json
+7. Persist peer list to ~/.decdn/client/peers.json
 8. Begin periodic registry refresh (every 10 minutes)
 ```
 
-The on-chain registry is the sole discovery source; a cached `~/.decdn/peers.json` from the last successful query covers a transient RPC outage. Clients do not join the iroh-gossip mesh — they neither subscribe to nor relay `NodeAnnounce`. Gossip propagation is the responsibility of bonded nodes, which carry economic accountability (slashing, reputation) for relay correctness and availability; a client stays online only long enough to fetch and gains nothing from mesh participation.
+The on-chain registry is the sole discovery source; a cached `~/.decdn/client/peers.json` from the last successful query covers a transient RPC outage. Clients do not join the iroh-gossip mesh — they neither subscribe to nor relay `NodeAnnounce`. Gossip propagation is the responsibility of bonded nodes, which carry economic accountability (slashing, reputation) for relay correctness and availability; a client stays online only long enough to fetch and gains nothing from mesh participation.
 
 Node-side registry interaction and bootstrap is in [ADR 019 § Step 3.3](019-node-onboarding.md#step-33--build-initial-peer-table-from-on-chain-registry).
 
@@ -145,7 +145,8 @@ All client state resides under `~/.decdn/`:
 ├── config.toml       # Client configuration
 ├── iroh_key          # Ed25519 secret key (0600)
 ├── eth_keystore      # Encrypted Ethereum keystore (Web3 Secret Storage)
-└── peers.json        # Cached peer list from last registry query
+└── client/
+    └── peers.json    # Cached peer list from last registry query
 ```
 
 Default configuration:
@@ -164,7 +165,7 @@ iroh_key_path = "~/.decdn/iroh_key"
 eth_keystore_path = "~/.decdn/eth_keystore"
 
 [cache]
-peer_cache_path = "~/.decdn/peers.json"
+peer_cache_path = "~/.decdn/client/peers.json"
 probe_cache_max_entries = 1024               # per ADR 001
 probe_cache_ttl_secs = 15                    # per ADR 001
 

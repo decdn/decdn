@@ -349,7 +349,8 @@ pub async fn bundle_pull(args: &BundlePullArgs, config_path: Option<&Path>) -> a
                  blockchain.capacity_bond_address), or pass --node-id to pull from one node"
             )
         })?;
-        let all = discovery::active_nodes(&chain.rpc_url, capacity_bond).await?;
+        let all =
+            discovery::bootstrap_nodes(&chain.rpc_url, capacity_bond, &chain.data_dir).await?;
         if all.is_empty() {
             bail!("no active nodes in the CapacityBond registry at {capacity_bond}");
         }
