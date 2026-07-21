@@ -165,10 +165,11 @@ impl core::fmt::Display for Region {
     }
 }
 
-/// Rejects with the same allowlist [`Region::parse`] applies. The error is a
-/// static `&str` so the invalid input is never echoed back — a region code
-/// reaches log fields and metric labels, and this type exists partly to keep
-/// unvalidated bytes out of them.
+/// Rejects with the same allowlist [`Region::parse`] applies. The error carries
+/// no input — a region code reaches log fields and metric labels, and this type
+/// exists partly to keep unvalidated bytes out of them. The `Deserialize` impl
+/// below upholds the same property, so it holds for every fallible construction
+/// path, not just this one.
 impl core::str::FromStr for Region {
     type Err = InvalidRegion;
 
@@ -210,12 +211,13 @@ impl serde::Serialize for Region {
 impl<'de> serde::Deserialize<'de> for Region {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let raw = String::deserialize(d)?;
-        Self::parse(&raw).ok_or_else(|| {
-            serde::de::Error::invalid_value(
-                serde::de::Unexpected::Str(&raw),
-                &"an ISO 3166-1 alpha-2 region code",
-            )
-        })
+        // `custom(InvalidRegion)`, NOT `invalid_value(Unexpected::Str(&raw))`:
+        // the rejected input must not travel in the error, for the same reason
+        // `FromStr` refuses to echo it. This path is the one that matters most —
+        // it reads the peer cache, whose contents originate from an on-chain
+        // `regionHint` any operator can set to arbitrary bytes, and the decode
+        // error surfaces to the user through `CacheRead::Unusable`.
+        Self::parse(&raw).ok_or_else(|| serde::de::Error::custom(InvalidRegion))
     }
 }
 
@@ -338,16 +340,30 @@ mod tests {
         }
     }
 
-    /// `FromStr`'s error must not echo the rejected input back: a region code
-    /// lands in log fields and metric labels, and keeping unvalidated bytes out
-    /// of those is half of why the allowlist exists.
+    /// NO fallible construction path may echo the rejected input back: a region
+    /// code lands in log fields and metric labels, and keeping unvalidated bytes
+    /// out of those is half of why the allowlist exists.
+    ///
+    /// `Deserialize` is asserted alongside `FromStr` because it is the path that
+    /// actually reads untrusted data — the peer cache, whose region strings come
+    /// from an on-chain `regionHint` any operator can set to arbitrary bytes,
+    /// and whose decode error reaches the user through `CacheRead::Unusable`.
+    /// It used to use `Unexpected::Str(&raw)`, which echoed.
     #[test]
-    fn from_str_error_does_not_echo_the_input() {
-        let err = "U\n/evil".parse::<Region>().expect_err("must reject");
-        let msg = err.to_string();
+    fn construction_errors_do_not_echo_the_input() {
+        let from_str = "U\n/evil".parse::<Region>().expect_err("must reject");
+        let msg = from_str.to_string();
         assert!(
             !msg.contains("evil"),
             "input leaked into the message: {msg}"
+        );
+        assert!(msg.contains("ISO 3166-1"), "{msg}");
+
+        let de = serde_json::from_str::<Region>("\"U\\n/evil\"").expect_err("must reject");
+        let msg = de.to_string();
+        assert!(
+            !msg.contains("evil"),
+            "input leaked through the deserializer: {msg}"
         );
         assert!(msg.contains("ISO 3166-1"), "{msg}");
     }
