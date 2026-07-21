@@ -622,6 +622,78 @@ pub struct Probed {
     pub has_live_channel: bool,
 }
 
+/// A bonded non-holder the client has a measured RTT for, and could route a
+/// warming request through (ADR 037 § Candidate pool). Distinct from
+/// [`Probed`], which is a confirmed blob-holder.
+#[derive(Debug, Clone)]
+pub struct WarmingCandidate {
+    /// The candidate proxy's iroh id.
+    pub node_id: PublicKey,
+    /// Its Ethereum address — the `--provider-address` a warming channel opens
+    /// and the `slash_sig` is verified against.
+    pub eth_address: Address,
+    /// Measured round-trip time in milliseconds, from the **live `cdn/probe/v1`
+    /// probe issued for this request**.
+    ///
+    /// Note this diverges from ADR 037 § RTT source, which specifies the
+    /// client's longitudinal per-peer RTT map. That map ([`crate::rtt_map`]) is
+    /// staged but not yet wired, so the candidate pool is presently limited to
+    /// the ≤`SELECT_K` nodes this request happened to probe rather than the full
+    /// peer table minus holders.
+    pub rtt_ms: f64,
+}
+
+/// ADR 037 § Client selection policy: the ordered list of nearby non-holders to
+/// route a warming request through, nearest-RTT first, or empty when proxy
+/// warming does not engage.
+///
+/// Proxy warming engages **only** when the best holder's RTT exceeds
+/// `rtt_threshold_ms` (the holders are all distant) **and** a candidate beats
+/// the best holder's RTT by at least `margin_ms`. Ranking is measured RTT only
+/// — self-attested region is never consulted, so a region-spoofing node simply
+/// exhibits a high measured RTT and is never selected. An empty result means
+/// "route directly to the best holder"; proxy warming is a no-op, never a
+/// gamble.
+///
+/// `candidates` must already exclude the holders — the caller does this.
+///
+/// # Contract not yet enforced
+///
+/// ADR 037 § Candidate pool also requires the pool to be filtered to
+/// reputation ≥ the client's minimum-reputation floor. **No caller does this
+/// today**; it is stated here as the intended contract, not a satisfied
+/// precondition (#1174 follow-up).
+///
+/// The full ordered list is returned so a caller *can* fall back from a proxy
+/// that declines to the next candidate and finally to the direct holder, per
+/// ADR 037 § Fallback. **The current caller uses only the first entry** — a real
+/// fallback needs a second payment channel against the fallback provider, which
+/// is deliberate follow-up work. Proxy warming is opt-in (default off) until it
+/// lands, so a declining proxy cannot regress a default fetch.
+#[must_use]
+pub fn proxy_warming_order(
+    best_holder_rtt_ms: f64,
+    rtt_threshold_ms: f64,
+    margin_ms: f64,
+    candidates: &[WarmingCandidate],
+) -> Vec<&WarmingCandidate> {
+    // Trigger 1: the best holder must be distant enough to warrant warming. The
+    // `is_finite()` guard also makes a NaN best-holder RTT fail closed (route
+    // direct) rather than sneak past a bare `>` comparison.
+    if !(best_holder_rtt_ms.is_finite() && best_holder_rtt_ms > rtt_threshold_ms) {
+        return Vec::new();
+    }
+    // Trigger 2 + ranking: keep only candidates that beat the best holder by the
+    // margin, nearest first. If none clear the margin the list is empty and the
+    // caller routes direct.
+    let mut qualifying: Vec<&WarmingCandidate> = candidates
+        .iter()
+        .filter(|c| c.rtt_ms.is_finite() && best_holder_rtt_ms - c.rtt_ms >= margin_ms)
+        .collect();
+    qualifying.sort_by(|a, b| a.rtt_ms.total_cmp(&b.rtt_ms));
+    qualifying
+}
+
 /// Pick the node to fetch from among probed blob-holders (decision 4): prefer a
 /// node the client already has a live channel with when its RTT is within
 /// [`RTT_REUSE_TOLERANCE`]× the best observed RTT; otherwise the lowest-RTT
@@ -1196,5 +1268,64 @@ mod tests {
         assert_eq!(humanize(Duration::from_hours(3)), "3 hours");
         assert_eq!(humanize(Duration::from_hours(25)), "1 day");
         assert_eq!(humanize(Duration::from_hours(24 * 60)), "60 days");
+    }
+
+    fn warming(seed: u8, rtt_ms: f64) -> WarmingCandidate {
+        WarmingCandidate {
+            node_id: iroh::SecretKey::from_bytes(&[seed; 32]).public(),
+            eth_address: Address::repeat_byte(seed),
+            rtt_ms,
+        }
+    }
+
+    #[test]
+    fn proxy_warming_no_op_when_best_holder_is_near() {
+        // Best holder RTT 40ms is below the 100ms threshold: holders aren't
+        // distant, so warming does not engage even with a fast candidate.
+        let cands = vec![warming(1, 5.0)];
+        assert!(proxy_warming_order(40.0, 100.0, 20.0, &cands).is_empty());
+    }
+
+    #[test]
+    fn proxy_warming_no_op_when_no_candidate_clears_margin() {
+        // Best holder is distant (300ms > 100ms threshold) but the nearest
+        // candidate (290ms) only beats it by 10ms, below the 20ms margin.
+        let cands = vec![warming(1, 290.0)];
+        assert!(proxy_warming_order(300.0, 100.0, 20.0, &cands).is_empty());
+    }
+
+    #[test]
+    fn proxy_warming_picks_qualifying_candidates_nearest_first() {
+        // Best holder 300ms; threshold 100, margin 20. Candidates at 30 and 80ms
+        // both clear the margin; 290ms does not. Ordered nearest-first.
+        let cands = vec![warming(1, 80.0), warming(2, 290.0), warming(3, 30.0)];
+        let order = proxy_warming_order(300.0, 100.0, 20.0, &cands);
+        assert_eq!(order.len(), 2);
+        assert_eq!(order[0].eth_address, Address::repeat_byte(3)); // 30ms first
+        assert_eq!(order[1].eth_address, Address::repeat_byte(1)); // then 80ms
+    }
+
+    /// A NaN best-holder RTT must fail closed (route direct) rather than sneak
+    /// past the trigger comparison, and must never panic the sort.
+    ///
+    /// The companion region guarantee (ADR 037 §"Ranking key is measured RTT
+    /// only") is enforced structurally, not by this test: `WarmingCandidate`
+    /// has no region field, so `proxy_warming_order` cannot consult one. Adding
+    /// such a field would require editing the struct — a visible, reviewable
+    /// change — which is the point.
+    #[test]
+    fn nan_best_holder_rtt_fails_closed() {
+        let cands = vec![warming(1, 10.0)];
+        assert!(proxy_warming_order(f64::NAN, 100.0, 20.0, &cands).is_empty());
+    }
+
+    /// A non-finite candidate RTT must be filtered out rather than sorted
+    /// first — `total_cmp` orders NaN, so an unfiltered NaN would win.
+    #[test]
+    fn non_finite_candidate_rtt_is_filtered_out() {
+        let cands = vec![warming(1, f64::NAN), warming(2, 30.0)];
+        let order = proxy_warming_order(300.0, 100.0, 20.0, &cands);
+        assert_eq!(order.len(), 1);
+        assert_eq!(order[0].eth_address, Address::repeat_byte(2));
     }
 }

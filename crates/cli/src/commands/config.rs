@@ -179,6 +179,11 @@ pub fn write_validate_summary<W: std::io::Write>(
         "  event_poll_interval_ms: {}",
         resolved.blockchain.event_poll_interval_ms
     )?;
+    writeln!(
+        w,
+        "  rate_bounds_poll_interval_sec: {}",
+        resolved.blockchain.rate_bounds_poll_interval_sec
+    )?;
     match resolved.blockchain.settlement_auto_threshold_micro_usdc {
         Some(v) => writeln!(w, "  settlement_auto_threshold_micro_usdc: {v}")?,
         None => writeln!(w, "  settlement_auto_threshold_micro_usdc: disabled")?,
@@ -206,6 +211,14 @@ pub fn write_validate_summary<W: std::io::Write>(
         0 => writeln!(w, "  gc_interval_sec:          disabled")?,
         n => writeln!(w, "  gc_interval_sec:          {n}")?,
     }
+    writeln!(
+        w,
+        "  eviction:                 high_water_pct={}, target_pct={}, per_sweep_budget={}, tick_secs={}",
+        resolved.cache.eviction_high_water_pct,
+        resolved.cache.eviction_target_pct,
+        resolved.cache.eviction_per_sweep_budget,
+        resolved.cache.eviction_tick_secs
+    )?;
     if resolved.cache.node_to_node_pull_through_enabled {
         writeln!(
             w,
@@ -431,6 +444,7 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # chain_id = 421614                  # EIP-712 chain id; default Arbitrum Sepolia
 # rpc_watchdog_interval_sec = 30     # 0 disables the connectivity watchdog
 # event_poll_interval_ms = 7000      # eth_getLogs tick cadence for chain watchers + pending-tx receipt polling (#1011/#1106); default 7000ms, min 250ms (lower for a local anvil)
+# rate_bounds_poll_interval_sec = 3600 # authoritative getRateBounds() re-read cadence, safety net beside the RateBoundsUpdated subscription (#1172); default 3600s, must be > 0
 # redeem_threshold_micro_usdc = 1000000          # seller redeems accrued vouchers on-chain at this µUSDC balance (#327); default 1 USDC
 # buyer_deposit_micro_usdc = 10000000            # deposit when the buyer opens a node-to-node PaymentChannel on a miss (#744); default 10 USDC
 # buyer_max_approve = true                       # unlimited USDC approval for PaymentChannel (#744); node default true, decdn client default false (exact deposit-sized approval); set true on the client to opt into unlimited
@@ -455,7 +469,14 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # Origin pull-through retry policy (#285); restart-required.
 # [cache.origin_retry]
 # max_retries = 3
-# gc_interval_sec = 300                    # iroh-blobs GC sweep cadence; 0 disables (#518)
+# NOTE: the keys below belong to [cache], NOT to the [cache.origin_retry] table
+# above — uncomment this header along with them or TOML will nest them wrongly.
+# [cache]
+# gc_interval_sec = 300                    # iroh-blobs GC sweep cadence; 0 disables (#518). NOTE: the eviction driver only drops GC protection, so with 0 it can never reclaim disk and cache_size_mb is unenforceable (#1173)
+# eviction_high_water_pct = 90             # LRU driver evicts above this % of cache_size_mb (#1173); bounds [60,95]
+# eviction_target_pct = 80                 # LRU driver evicts down to this % (#1173); bounds [40,90], must be <= high_water-5
+# eviction_per_sweep_budget = 16           # max LRU victims per tick before yielding (#1173); bounds [1,256]
+# eviction_tick_secs = 1                   # LRU driver wakeup cadence in seconds (#1173); bounds [1,60]
 # max_probe_holds = 256                    # probe eviction-hold budget (ADR 005 §Hold budget); 0 disables has_blob:true
 # stake_lane_reserved_holds = 0            # hold slots reserved for node-to-node probes (#757, ADR 003 §Admission); 0 = off
 # node_to_node_pull_through_enabled = false # paid cache-miss pull from upstream nodes (#831, ADR 001/022); OFF by default
@@ -468,8 +489,8 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 
 [payment]
 # rate_per_mb = 10
-# delivery_floor = 0                       # local rate-bounds clamp lower bound (ADR 005)
-# delivery_ceiling = 1000000000000         # local rate-bounds clamp upper bound; must be >= 1
+# delivery_floor = 0                       # PRE-CHAIN SEED ONLY (#1172): overwritten from on-chain getRateBounds() before serving; governance owns the live floor
+# delivery_ceiling = 1000000000000         # PRE-CHAIN SEED ONLY (#1172): overwritten from on-chain getRateBounds(); must be >= 1
 # voucher_interval_mb = 1                  # voucher cadence advertised on cdn/client/v1 (ADR 003); range 1..=MAX_VOUCHER_INTERVAL_MB
 
 [observability]

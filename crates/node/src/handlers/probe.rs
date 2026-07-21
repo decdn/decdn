@@ -142,11 +142,12 @@ pub struct ProbeHandler {
     /// `SlashJudge` EIP-712 domain, built once from
     /// `blockchain.{slash_judge_address,chain_id}`.
     slash_domain: Eip712Domain,
-    /// Lower/upper clamp bounds for `rate_per_mb` before signing (ADR 005
-    /// §Rate bounds validation). Locally enforced stand-in for on-chain
-    /// `getRateBounds()`.
-    delivery_floor: u64,
-    delivery_ceiling: u64,
+    /// Live per-MB delivery-rate bounds clamping `rate_per_mb` before signing
+    /// (ADR 005 §Rate bounds validation). Seeded from the on-chain
+    /// `getRateBounds()` at startup and updated in place by the
+    /// `RateBoundsUpdated` watcher (#1172), so a governance retune takes effect
+    /// without a restart.
+    rate_bounds: crate::rate_bounds::RateBounds,
     /// ADR 015 master switch (`network.enable_0rtt`). When `true`, this
     /// handler overrides `on_accepting` to read the probe as pre-handshake
     /// 0-RTT. When `false`, the default `on_accepting` is used. The 1-RTT
@@ -166,8 +167,7 @@ impl std::fmt::Debug for ProbeHandler {
         f.debug_struct("ProbeHandler")
             .field("node_id", &self.node_id)
             .field("rate_per_mb", &self.rate_per_mb)
-            .field("delivery_floor", &self.delivery_floor)
-            .field("delivery_ceiling", &self.delivery_ceiling)
+            .field("rate_bounds", &self.rate_bounds)
             .field("enable_0rtt", &self.enable_0rtt)
             .finish_non_exhaustive()
     }
@@ -187,8 +187,7 @@ impl ProbeHandler {
         cache: CacheEngine,
         eth_signer: Arc<PrivateKeySigner>,
         slash_domain: Eip712Domain,
-        delivery_floor: u64,
-        delivery_ceiling: u64,
+        rate_bounds: crate::rate_bounds::RateBounds,
         enable_0rtt: bool,
         stake_lane: Option<StakeLanePolicy>,
     ) -> Self {
@@ -201,8 +200,7 @@ impl ProbeHandler {
             cache,
             eth_signer,
             slash_domain,
-            delivery_floor,
-            delivery_ceiling,
+            rate_bounds,
             enable_0rtt,
             stake_lane,
         }
@@ -433,14 +431,19 @@ impl ProbeHandler {
         // signing (ADR 005 §Rate bounds validation): clamp-and-warn keeps
         // the node operational across governance transitions.
         let raw_rate = self.rate_per_mb.load(Ordering::Relaxed);
-        let rate_per_mb = raw_rate.clamp(self.delivery_floor, self.delivery_ceiling);
+        // One snapshot for both the clamp and the log: re-reading `floor()` /
+        // `ceiling()` afterwards would take two further loads and could report a
+        // pair that a concurrent governance update had already replaced — i.e.
+        // bounds that never produced this clamp decision.
+        let bounds = self.rate_bounds.snapshot();
+        let rate_per_mb = bounds.clamp(raw_rate);
         if rate_per_mb != raw_rate {
             self.metrics.rate_bounds_clamped();
             tracing::warn!(
                 raw_rate,
                 clamped = rate_per_mb,
-                floor = self.delivery_floor,
-                ceiling = self.delivery_ceiling,
+                floor = bounds.floor,
+                ceiling = bounds.ceiling,
                 "rate_per_mb clamped to delivery bounds before signing ProbeResponse"
             );
         }

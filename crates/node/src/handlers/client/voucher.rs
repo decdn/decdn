@@ -123,15 +123,16 @@ impl ClientHandler {
         // would both miss that (false accept) and reject a delta drawing down an
         // earlier overpayment surplus the chain would settle (false reject).
         //
-        // Scope follows `delivery_floor`, the local stand-in for on-chain
-        // `getRateBounds()` (ADR 005): synced from the chain it is `>=
-        // MIN_DEPOSIT_FLOOR (1)` and the check is live; at its default `0` (the
-        // deliberate free-serving config, #864) `verify_rate`'s RHS is `0`, so it
-        // is inert and the always-`>= 1` on-chain floor is authoritative.
-        // `new_bytes >= delta_bytes > 0`, so `ZeroBytes` cannot occur; match
-        // every arm anyway (#845) so a future `RateError` variant is a build
-        // failure rather than a silent accept.
-        match verify_rate(amount, new_bytes, self.delivery_floor, 0) {
+        // Scope follows the live delivery floor, sourced from on-chain
+        // `getRateBounds()` and tracked by the `RateBoundsUpdated` watcher
+        // (#1172, ADR 005). `PaymentChannel` enforces `newFloor >=
+        // MIN_DEPOSIT_FLOOR (1)`, and the runtime overwrites the config seed
+        // from chain before serving, so this check is always live — the former
+        // `0`-floor "free-serving config" (#864) is no longer reachable once
+        // the chain read lands. `new_bytes >= delta_bytes > 0`, so `ZeroBytes`
+        // cannot occur; match every arm anyway (#845) so a future `RateError`
+        // variant is a build failure rather than a silent accept.
+        match verify_rate(amount, new_bytes, self.rate_bounds.floor(), 0) {
             Ok(()) => {}
             Err(RateError::Underpayment { .. }) => {
                 self.metrics.voucher_rate_floor_rejected();

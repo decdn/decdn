@@ -107,6 +107,13 @@ mod sol_types {
             /// deposit up to the on-chain floor before opening.
             function minDeposit() external view returns (uint256);
 
+            /// Governable per-megabyte delivery-rate bounds (ADR 019 §3.1 /
+            /// ADR 003). `floor` is the settlement-enforced minimum rate a
+            /// voucher may pay per MB; `ceiling` the maximum. The node reads
+            /// these at startup and on every `RateBoundsUpdated` to clamp its
+            /// advertised `rate_per_mb`, replacing the local config stand-in.
+            function getRateBounds() external view returns (uint256 floor, uint256 ceiling);
+
             /// Per-client channel counter (public mapping getter). The *next*
             /// nonce `openChannel` will assign to `client`; the resulting
             /// `channelId` is `keccak256(client, provider, nonce)`. Reads let a
@@ -251,6 +258,13 @@ mod sol_types {
                 address indexed client,
                 uint256 clientRefund
             );
+
+            /// Governance changed the per-MB delivery-rate bounds (ADR 019
+            /// §3.1). The rate-bounds watcher decodes the new `(floor, ceiling)`
+            /// and stores them into the node's live clamp so a governance
+            /// retune reaches running nodes without a restart. No `indexed`
+            /// params — matches `setRateBounds`.
+            event RateBoundsUpdated(uint256 newDeliveryFloor, uint256 newDeliveryCeiling);
         }
     }
 }

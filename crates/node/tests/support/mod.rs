@@ -375,8 +375,7 @@ fn client_handler_deps(
         store,
         receipt_sink,
         Arc::new(AtomicU64::new(rate)),
-        0,
-        MAX_RATE_PER_MB,
+        decdn_node::rate_bounds::RateBounds::new(0, MAX_RATE_PER_MB),
         1, // voucher_interval_mb
         max_blob_size_bytes,
         max_concurrent_streams,

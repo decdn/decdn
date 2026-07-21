@@ -35,7 +35,7 @@ pub use key_gen::KeyGenArgs;
 pub use node::{
     AnnounceArgs, BondArgs, ChainArgs, ChannelsArgs, DrainArgs, EvictArgs, HealthArgs, NodeArgs,
     NodeCommand, PeersArgs, RegionStatsArgs, RegisterArgs, ReloadArgs, ReputationArgs, StatusArgs,
-    SwapVenueArg, TopArgs,
+    SwapVenueArg, TopArgs, UnbondArgs,
 };
 pub use probe::ProbeArgs;
 pub use publish::{

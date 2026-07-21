@@ -685,6 +685,79 @@ impl ChainFixture {
         Ok(entry.addedAt)
     }
 
+    /// `CapacityBond.unbondingOf(operator)` — the in-flight unbonding request
+    /// as `(amount, unlockAt)`; `amount == 0` means none. A non-zero amount
+    /// also makes `isActive` false for the whole window.
+    pub async fn unbonding_of(&self, operator: Address) -> anyhow::Result<(U256, u64)> {
+        let req = CapacityBond::new(self.addrs.capacity_bond, &self.admin)
+            .unbondingOf(operator)
+            .call()
+            .await
+            .context("read unbondingOf")?;
+        Ok((req.amount, u64::try_from(req.unlockAt).unwrap_or(u64::MAX)))
+    }
+
+    /// Governable `CapacityBond.unbondingPeriod` (seconds; 14 days by
+    /// default). Read so unbond journeys warp by the live value rather than
+    /// hardcoding the default.
+    pub async fn unbonding_period(&self) -> anyhow::Result<u64> {
+        let secs = CapacityBond::new(self.addrs.capacity_bond, &self.admin)
+            .unbondingPeriod()
+            .call()
+            .await
+            .context("read unbondingPeriod")?;
+        Ok(u64::try_from(secs).unwrap_or(u64::MAX))
+    }
+
+    /// `CapacityBond.activeBond(operator)` (TOKEN base units).
+    pub async fn active_bond(&self, operator: Address) -> anyhow::Result<U256> {
+        CapacityBond::new(self.addrs.capacity_bond, &self.admin)
+            .activeBond(operator)
+            .call()
+            .await
+            .context("read activeBond")
+    }
+
+    /// `CapacityBond.declaredMbps(operator)` — the self-attested capacity tier.
+    pub async fn declared_mbps(&self, operator: Address) -> anyhow::Result<u64> {
+        let mbps = CapacityBond::new(self.addrs.capacity_bond, &self.admin)
+            .declaredMbps(operator)
+            .call()
+            .await
+            .context("read declaredMbps")?;
+        Ok(u64::try_from(mbps).unwrap_or(u64::MAX))
+    }
+
+    /// `CapacityBond.bondRequired(mbps)` — the ADR 026 capacity-bond curve.
+    /// Read rather than recomputed so a governance retune of `k`/`α` can't
+    /// desynchronise a journey's expectations from the deployed curve.
+    pub async fn bond_required(&self, mbps: u64) -> anyhow::Result<U256> {
+        CapacityBond::new(self.addrs.capacity_bond, &self.admin)
+            .bondRequired(U256::from(mbps))
+            .call()
+            .await
+            .context("read bondRequired")
+    }
+
+    /// `CapacityBond.minBond()` — the global bond floor, independent of the
+    /// capacity curve.
+    pub async fn min_bond(&self) -> anyhow::Result<U256> {
+        CapacityBond::new(self.addrs.capacity_bond, &self.admin)
+            .minBond()
+            .call()
+            .await
+            .context("read minBond")
+    }
+
+    /// `CapacityBond.isActive(operator)` — the full active-bonder predicate.
+    pub async fn is_active(&self, operator: Address) -> anyhow::Result<bool> {
+        CapacityBond::new(self.addrs.capacity_bond, &self.admin)
+            .isActive(operator)
+            .call()
+            .await
+            .context("read isActive")
+    }
+
     /// Governable `SlashAppeal.appealBond` (TOKEN base units).
     pub async fn appeal_bond(&self) -> anyhow::Result<U256> {
         SlashAppeal::new(self.addrs.slash_appeal, &self.admin)

@@ -175,8 +175,7 @@ fn build_handler_with_probe_limiter(
         cache,
         Arc::clone(&signer),
         domain.clone(),
-        floor,
-        ceiling,
+        decdn_node::rate_bounds::RateBounds::new(floor, ceiling),
         // This suite is the pre-ADR-015 1-RTT loopback coverage; 0-RTT
         // acceptance has its own dedicated test (probe_0rtt.rs).
         false,
@@ -215,8 +214,7 @@ fn build_handler_with_lane(
         cache,
         Arc::clone(&signer),
         domain.clone(),
-        0,
-        MAX_RATE_PER_MB,
+        decdn_node::rate_bounds::RateBounds::new(0, MAX_RATE_PER_MB),
         false,
         Some(policy),
     ));

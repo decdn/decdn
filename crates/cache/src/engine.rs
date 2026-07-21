@@ -1076,6 +1076,14 @@ impl CacheEngine {
                 );
             }
         }
+        // Operator-evict (DMCA/corruption) counter — distinct from the LRU
+        // `evictions` counter the eviction driver bumps (#1173,
+        // appendix-blob-cache-eviction.md § Observability). Bumped after the
+        // durable append + logical-set commit succeeded above, so the count
+        // tracks takedowns that actually stopped serving.
+        if let Some(m) = &self.inner.metrics {
+            m.evicted_operator.inc();
+        }
         Ok(())
     }
 
@@ -1979,6 +1987,87 @@ impl CacheEngine {
         if let Ok(mut guard) = self.inner.access_times.lock() {
             guard.insert(hash, Instant::now());
         }
+    }
+
+    /// Snapshot every on-disk blob keyed by hash with its byte size
+    /// (`Complete` and `Partial` alike), the public form of the internal
+    /// `snapshot_blob_sizes` helper. This is the authoritative disk-usage
+    /// input for the capacity-eviction driver (#1173): unlike
+    /// [`Self::eviction_candidates`] — which sees only hashes *touched since
+    /// process start* — this walks the store, so a node that boots with a
+    /// disk already full measures the real usage rather than an empty
+    /// access map.
+    ///
+    /// Cost scales with the total blob set (one `status()` per blob); call
+    /// it on the eviction sweep cadence, not per request.
+    pub async fn size_snapshot(&self) -> CacheResult<HashMap<Hash, u64>> {
+        snapshot_blob_sizes(&self.inner.store).await
+    }
+
+    /// Total on-disk bytes across all blobs, the sum of
+    /// [`Self::size_snapshot`]. Saturating so an implausibly large store can
+    /// never wrap. Drives the eviction driver's high-water comparison and the
+    /// current-size cache-health reporting (#1173).
+    pub async fn total_bytes(&self) -> CacheResult<u64> {
+        Ok(self
+            .size_snapshot()
+            .await?
+            .values()
+            .fold(0u64, |acc, sz| acc.saturating_add(*sz)))
+    }
+
+    /// Release `hash` for capacity eviction: drop its protecting named tag(s)
+    /// so the bytes become eligible for the next iroh-blobs GC sweep, and
+    /// forget its [`Self::access_times_snapshot`] entry so a later LRU sweep
+    /// doesn't re-surface it. Returns the number of tags dropped.
+    ///
+    /// This is the LRU-driver counterpart to [`Self::evict`] and is
+    /// deliberately *not* the same path (#1173). `evict` is the permanent,
+    /// `fsync`'d, `evicted.log`-backed DMCA takedown: it records the hash in a
+    /// durable logical-evicted set that blocks serving forever and survives
+    /// restart. Capacity eviction must not do that — a blob dropped only for
+    /// space pressure has to be freely re-pullable, and an unbounded takedown
+    /// log per LRU eviction would be a durability leak. So this method only
+    /// releases GC protection; the blob keeps serving until GC actually
+    /// reclaims it, after which [`Self::has`] reports it absent naturally
+    /// (the bytes are gone from the store, not logically masked).
+    ///
+    /// Pinned hashes are refused (returns `Ok(0)` without touching state) as a
+    /// defense in depth — [`Self::eviction_candidates`] already excludes them,
+    /// but the caller is a background loop and the pinned set can change
+    /// between candidate selection and this call.
+    ///
+    /// Best-effort against the GC cadence: like `evict`, actual disk reclaim
+    /// only happens when periodic GC is enabled (`cache.gc_interval_sec > 0`).
+    pub async fn release_for_eviction(&self, hash: Hash) -> CacheResult<u64> {
+        if self.is_pinned(hash) {
+            return Ok(0);
+        }
+        // Drop the protecting tag(s) FIRST, and only forget the access-time
+        // entry once that succeeded. The reverse order looks tempting (it would
+        // stop a concurrent `eviction_candidates` re-picking the hash during the
+        // slower tag walk) but it loses the blob on failure: `eviction_candidates`
+        // iterates `access_times`, so a hash removed from it before an erroring
+        // tag walk can never be re-selected, leaving bytes on disk *and*
+        // GC-protected forever. A transient double-selection is harmless by
+        // comparison — the second release is a no-op `Ok(0)`.
+        let deleted = match self.drop_named_tags_for(hash).await {
+            Ok(deleted) => deleted,
+            Err(err) => {
+                // Same observability as `evict`'s tag-drop failure: without this
+                // the LRU path could burn down the candidate pool silently.
+                if let Some(m) = &self.inner.metrics {
+                    m.tag_drop_failures.inc();
+                }
+                return Err(err);
+            }
+        };
+        self.inner
+            .access_times
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&hash);
+        Ok(deleted)
     }
 
     async fn read_local(&self, hash: Hash) -> CacheResult<Bytes> {
@@ -3475,6 +3564,104 @@ mod tests {
                 });
             Box::pin(async move { result })
         }
+    }
+
+    /// `total_bytes` must sum the on-disk footprint — it is the eviction
+    /// driver's entire input, so a wrong sum silently mis-sizes every decision.
+    #[tokio::test]
+    async fn total_bytes_sums_populated_blobs() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let payload = b"total-bytes payload";
+        let hash = Hash::new(payload);
+        let engine = CacheEngine::open(
+            tmp.path(),
+            vec![Arc::new(StubOrigin::new(payload)) as Arc<dyn Origin>],
+            10,
+        )
+        .await?;
+
+        anyhow::ensure!(engine.total_bytes().await? == 0, "empty cache is 0 bytes");
+        let _ = engine.get(hash).await?;
+
+        let total = engine.total_bytes().await?;
+        anyhow::ensure!(
+            total >= payload.len() as u64,
+            "total_bytes {total} should cover the {}-byte blob",
+            payload.len()
+        );
+        let sizes = engine.size_snapshot().await?;
+        anyhow::ensure!(
+            sizes.get(&hash).copied() == Some(payload.len() as u64),
+            "size_snapshot should report the blob's exact size"
+        );
+        Ok(())
+    }
+
+    /// The load-bearing distinction from `evict`: capacity eviction must NOT
+    /// write the durable takedown log, or every LRU victim would be permanently
+    /// un-servable and the log would grow without bound (#1173).
+    #[tokio::test]
+    async fn release_for_eviction_does_not_write_the_evicted_log() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let payload = b"soft evict payload";
+        let hash = Hash::new(payload);
+        let engine = CacheEngine::open(
+            tmp.path(),
+            vec![Arc::new(StubOrigin::new(payload)) as Arc<dyn Origin>],
+            10,
+        )
+        .await?;
+        let _ = engine.get(hash).await?;
+
+        engine.release_for_eviction(hash).await?;
+
+        anyhow::ensure!(
+            !engine.is_evicted(hash),
+            "soft evict must not enter the logical-evicted set"
+        );
+        anyhow::ensure!(
+            !tmp.path().join("evicted.log").exists(),
+            "soft evict must not create the durable takedown log"
+        );
+        // The access-time entry is forgotten, so the LRU driver won't re-pick it.
+        anyhow::ensure!(
+            engine.last_accessed(hash).is_none(),
+            "soft evict should forget the access-time entry"
+        );
+        anyhow::ensure!(
+            !engine.eviction_candidates().contains_key(&hash),
+            "released hash should leave the candidate set"
+        );
+        Ok(())
+    }
+
+    /// A pinned hash must be refused with `Ok(0)` and left completely untouched.
+    /// The driver relies on the `0` to avoid crediting a no-op as freed bytes.
+    #[tokio::test]
+    async fn release_for_eviction_refuses_pinned_hash() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let payload = b"pinned payload";
+        let hash = Hash::new(payload);
+        let engine = CacheEngine::open(
+            tmp.path(),
+            vec![Arc::new(StubOrigin::new(payload)) as Arc<dyn Origin>],
+            10,
+        )
+        .await?;
+        let _ = engine.get(hash).await?;
+
+        engine.set_pinned(&PinnedHashes::new(
+            [from_store_hash(hash)].into_iter().collect(),
+        ));
+
+        let released = engine.release_for_eviction(hash).await?;
+        anyhow::ensure!(released == 0, "pinned hash must report 0 released");
+        anyhow::ensure!(
+            engine.last_accessed(hash).is_some(),
+            "pinned refusal must not forget the access-time entry"
+        );
+        anyhow::ensure!(engine.has(hash).await?, "pinned blob must still be present");
+        Ok(())
     }
 
     #[tokio::test]
