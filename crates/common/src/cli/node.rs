@@ -6,7 +6,7 @@
 use std::num::NonZeroU64;
 use std::path::PathBuf;
 
-use clap::{Args, Subcommand};
+use clap::{ArgGroup, Args, Subcommand};
 
 use super::common::CommonChainArgs;
 
@@ -155,6 +155,14 @@ pub enum NodeCommand {
     /// rather than over-bonding. Run this before `decdn node register`. Pass
     /// `--dry-run` to print the plan without submitting.
     Bond(BondArgs),
+    /// Lower the on-chain bond via `CapacityBond.requestUnbond` + `unbond`
+    /// (ADR 026 § Capacity-bond curve) — the reverse of `decdn node bond`.
+    /// State-aware: with no request in flight it declares the tier down (if
+    /// needed) and starts the unbonding window; while one is maturing it
+    /// reports the unlock time; once matured it withdraws. Note that a
+    /// request in flight makes the node INACTIVE for the whole window. Pass
+    /// `--dry-run` to print the plan without submitting.
+    Unbond(UnbondArgs),
 }
 
 /// `decdn node health` — report identity (hex `node_id`) and process
@@ -610,6 +618,52 @@ pub struct BondArgs {
     /// band or the on-chain `declareMbps` reverts.
     #[arg(long, value_name = "MBPS")]
     pub mbps: u64,
+
+    #[command(flatten)]
+    pub chain: ChainArgs,
+}
+
+/// `decdn node unbond` — lower the bond via `CapacityBond.requestUnbond` +
+/// `unbond` (ADR 026 § Capacity-bond curve). One command covers all three
+/// phases of the window; which one runs is read from chain state, not from a
+/// flag, so a re-run after a partial failure converges the same way
+/// [`BondArgs`] does.
+///
+/// The amount flags apply only when starting a request — passing one while a
+/// request is already in flight is an error rather than a silent no-op. All
+/// three are mutually exclusive; exactly one is required to start a request.
+#[derive(Args, Debug)]
+#[command(group(ArgGroup::new("unbond_amount").args(["to_mbps", "all", "amount"]).multiple(false)))]
+pub struct UnbondArgs {
+    /// Reduce the declared capacity tier to MBPS and release the surplus
+    /// bond. The released amount is derived from the on-chain
+    /// `bondRequired` curve — you do not pass a token amount. The retained
+    /// bond is `max(minBond, bondRequired(MBPS))`, so the node stays
+    /// eligible at the new tier. Must be below the current declared tier
+    /// (raise with `decdn node bond --mbps`) and inside the governable
+    /// `[minCapacityMbps, maxCapacityMbps]` band.
+    #[arg(long = "to-mbps", value_name = "MBPS")]
+    pub to_mbps: Option<u64>,
+
+    /// Release everything the bond curve permits, retaining only
+    /// `bondRequired(declaredMbps)`. This drops the active bond below
+    /// `minBond`, so the node stays inactive until it re-bonds — the
+    /// command says so before submitting.
+    #[arg(long)]
+    pub all: bool,
+
+    /// Release exactly this many TOKEN base units (1 TOKEN = 1e18).
+    /// Escape hatch for an exact figure; the curve is still pre-checked, so
+    /// an amount the contract would reject fails with the `decdn node bond
+    /// --mbps` invocation needed to make it legal.
+    #[arg(long, value_name = "BASE_UNITS")]
+    pub amount: Option<u128>,
+
+    /// Skip the interactive confirmation. Required in automation: starting
+    /// an unbonding request deactivates the node for the full window, so a
+    /// terminal run confirms first.
+    #[arg(long = "yes", short = 'y')]
+    pub yes: bool,
 
     #[command(flatten)]
     pub chain: ChainArgs,

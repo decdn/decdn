@@ -122,6 +122,36 @@ mod sol_types {
             /// bondRequired(mbps)` or `mbps` is outside the governable band.
             function declareMbps(uint256 mbps) external;
 
+            /// Start the unbonding window for `amount` base units (ADR 026
+            /// § Capacity-bond curve — lowering a bond is `requestUnbond` +
+            /// `unbond`, there is no atomic refund). Moves `amount` out of
+            /// `activeBond` immediately and locks it for `unbondingPeriod`.
+            /// Reverts if a request is already in flight, or if the remaining
+            /// active bond would fall below `bondRequired(declaredMbps)` — note
+            /// the curve, NOT `minBond`, is the floor here, so the operator can
+            /// legally unbond into an inactive state. `decdn node unbond`
+            /// pre-checks both so neither surfaces as a raw revert.
+            function requestUnbond(uint256 amount) external;
+
+            /// Withdraw a matured unbonding request (`block.timestamp >=
+            /// unlockAt`), transferring the TOKEN back to the operator and
+            /// clearing the request.
+            function unbond() external;
+
+            /// Operator's in-flight unbonding request as `(amount, unlockAt)`;
+            /// `amount == 0` means none. The auto-getter of a
+            /// `UnbondingRequest` mapping, so the static struct flattens to
+            /// this tuple — same shape treatment as `nodeIdOf` above. A
+            /// non-zero `amount` also makes `isActive` false for the whole
+            /// window, which is why `decdn node unbond` warns before starting
+            /// one.
+            function unbondingOf(address operator) external view returns (uint256 amount, uint256 unlockAt);
+
+            /// Governable unbonding window in seconds (ADR 026 § Unbonding
+            /// window — 14 days by default). Read so the CLI can report the
+            /// unlock time it is about to commit the operator to.
+            function unbondingPeriod() external view returns (uint256);
+
             /// Per-operator EIP-712 `BindNodeId` nonce. Feeds the
             /// `bindingSignature` digest at registration time (ADR 019
             /// § Step 2.3). `0` for an operator that has never bound.
