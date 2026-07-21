@@ -309,8 +309,9 @@ pub(crate) async fn probe_and_rank(
 /// Auto-discover a node to fetch `hash` from (#936): read the active node set
 /// from `CapacityBond`, take the region-nearest [`discovery::SELECT_K`]
 /// candidates, and [`probe_and_rank`] them. Returns the chosen candidate.
-/// `capacity_bond` is passed separately because the caller has already turned
-/// the optional `chain.capacity_bond` into the "auto-discovery needs it" error.
+/// Callers must have already unwrapped `chain.capacity_bond` into the
+/// "auto-discovery needs `capacity_bond_address`" error, which is why the
+/// address is a separate parameter rather than read back off `chain`.
 async fn discover_provider(
     endpoint: &Endpoint,
     store: &RedbBuyerChannelStore,
@@ -319,7 +320,15 @@ async fn discover_provider(
     relay_hint: Option<&RelayUrl>,
     hash: [u8; 32],
 ) -> anyhow::Result<NodeCandidate> {
-    let all = discovery::bootstrap_nodes(&chain.rpc_url, capacity_bond, &chain.data_dir).await?;
+    let bootstrap =
+        discovery::bootstrap_nodes(&chain.rpc_url, capacity_bond, &chain.data_dir).await?;
+    // `client-pull` cannot log this itself — `decdn` installs no tracing
+    // subscriber — and a silently stale peer list is exactly what the user
+    // needs told, so the provenance comes back in the return value.
+    if let Some(warning) = bootstrap.warning() {
+        eprintln!("{warning}");
+    }
+    let all = bootstrap.into_peers();
     if all.is_empty() {
         anyhow::bail!("no active nodes in the CapacityBond registry at {capacity_bond}");
     }

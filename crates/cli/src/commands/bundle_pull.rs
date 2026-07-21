@@ -307,6 +307,35 @@ struct PullReport {
     total_bytes: u64,
 }
 
+/// Read the registry once and keep the region-nearest candidates, which every
+/// entry in the manifest then reuses.
+async fn discover_candidates(
+    chain: &fetch::ResolvedChain,
+) -> anyhow::Result<Vec<discovery::NodeCandidate>> {
+    let capacity_bond = chain.capacity_bond.ok_or_else(|| {
+        anyhow!(
+            "auto-discovery needs capacity_bond_address (--capacity-bond-address or \
+             blockchain.capacity_bond_address), or pass --node-id to pull from one node"
+        )
+    })?;
+    let bootstrap =
+        discovery::bootstrap_nodes(&chain.rpc_url, capacity_bond, &chain.data_dir).await?;
+    // See `fetch::discover_provider`: the degraded bootstrap paths reach the
+    // user through the return value, because the CLI has no log sink.
+    if let Some(warning) = bootstrap.warning() {
+        eprintln!("{warning}");
+    }
+    let all = bootstrap.into_peers();
+    if all.is_empty() {
+        bail!("no active nodes in the CapacityBond registry at {capacity_bond}");
+    }
+    Ok(discovery::select_candidates(
+        all,
+        chain.region.as_deref(),
+        discovery::SELECT_K,
+    ))
+}
+
 /// Entry point for `decdn bundle pull`.
 pub async fn bundle_pull(args: &BundlePullArgs, config_path: Option<&Path>) -> anyhow::Result<()> {
     // Dry-run short-circuits before any network/chain/keystore activity.
@@ -340,25 +369,9 @@ pub async fn bundle_pull(args: &BundlePullArgs, config_path: Option<&Path>) -> a
     // Selection: explicit single node for every entry, or a per-entry discovery
     // candidate list read from `CapacityBond` once.
     let explicit = explicit_target(common)?;
-    let candidates = if explicit.is_some() {
-        None
-    } else {
-        let capacity_bond = chain.capacity_bond.ok_or_else(|| {
-            anyhow!(
-                "auto-discovery needs capacity_bond_address (--capacity-bond-address or \
-                 blockchain.capacity_bond_address), or pass --node-id to pull from one node"
-            )
-        })?;
-        let all =
-            discovery::bootstrap_nodes(&chain.rpc_url, capacity_bond, &chain.data_dir).await?;
-        if all.is_empty() {
-            bail!("no active nodes in the CapacityBond registry at {capacity_bond}");
-        }
-        Some(discovery::select_candidates(
-            all,
-            chain.region.as_deref(),
-            discovery::SELECT_K,
-        ))
+    let candidates = match explicit {
+        Some(_) => None,
+        None => Some(discover_candidates(&chain).await?),
     };
 
     // Buyer signer (vouchers + any openChannel tx). Prompted only once, after we

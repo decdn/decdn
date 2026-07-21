@@ -46,19 +46,29 @@ Startup sequence from first launch to ready state:
 3. Query on-chain registry: paginated getActiveNodes(offset, 100) calls,
      starting at offset 0, incrementing until a page returns fewer than 100
      On failure: retry 3× exponential backoff (1 s, 5 s, 30 s)
-4. If the registry cannot be reached (all retries exhausted):
-     On cached peers present: fall back to ~/.decdn/client/peers.json
+     Deterministic failures (no contract at the configured address, an ABI
+     mismatch, an HTTP 4xx other than 429) are reported at once rather than
+     retried — repeating them only spends the schedule.
+4. If the registry read fails (retries exhausted, or a deterministic failure):
+     On cached peers present: fall back to the peer cache, and tell the user
+       the list is cached and how old it is — those nodes may have been
+       deactivated or slashed since it was written
      On no cache: exit with error —
        "Cannot reach bootstrap sources. Check network connectivity
         and RPC endpoint configuration."
 5. Connect to iroh relay (for NAT traversal)
 6. Build peer table from the resolved bootstrap peers
      (registry results, or the cached peers.json on fallback)
-7. Persist peer list to ~/.decdn/client/peers.json
+7. Persist peer list to the peer cache
+     A successful but *empty* read is the exception: it does not overwrite the
+     cache, since an emptied registry is no reason to discard the last
+     known-good peer list.
 8. Begin periodic registry refresh (every 10 minutes)
 ```
 
-The on-chain registry is the sole discovery source; a cached `~/.decdn/client/peers.json` from the last successful query covers a transient RPC outage. Clients do not join the iroh-gossip mesh — they neither subscribe to nor relay `NodeAnnounce`. Gossip propagation is the responsibility of bonded nodes, which carry economic accountability (slashing, reputation) for relay correctness and availability; a client stays online only long enough to fetch and gains nothing from mesh participation.
+The peer cache is `peers.json` under the resolved client data dir — `--data-dir`, else `[identity] data_dir`, defaulting to `~/.decdn/client` — so it moves with the rest of the client's state rather than living at a fixed path.
+
+The on-chain registry is the sole discovery source; a cached peer list from the last successful query covers a transient RPC outage. Clients do not join the iroh-gossip mesh — they neither subscribe to nor relay `NodeAnnounce`. Gossip propagation is the responsibility of bonded nodes, which carry economic accountability (slashing, reputation) for relay correctness and availability; a client stays online only long enough to fetch and gains nothing from mesh participation.
 
 Node-side registry interaction and bootstrap is in [ADR 019 § Step 3.3](019-node-onboarding.md#step-33--build-initial-peer-table-from-on-chain-registry).
 
@@ -138,15 +148,16 @@ Client identity bindings are **ephemeral and per-connection**, per [ADR 003 — 
 
 ### Client Configuration
 
-All client state resides under `~/.decdn/`:
+All client state resides under `~/.decdn/`, with the per-client data dir (`--data-dir` / `[identity] data_dir`) defaulting to `~/.decdn/client/`:
 
 ```
 ~/.decdn/
-├── config.toml       # Client configuration
-├── iroh_key          # Ed25519 secret key (0600)
-├── eth_keystore      # Encrypted Ethereum keystore (Web3 Secret Storage)
-└── client/
-    └── peers.json    # Cached peer list from last registry query
+├── config.toml               # Client configuration
+├── iroh_key                  # Ed25519 secret key (0600)
+└── client/                   # the resolved client data dir
+    ├── keystore.json         # Encrypted Ethereum keystore (Web3 Secret Storage)
+    ├── buyer-channels.redb   # Buyer-side payment-channel store
+    └── peers.json            # Cached peer list from last registry query
 ```
 
 Default configuration:
@@ -162,9 +173,11 @@ registry_refresh_secs = 600                  # 10 minutes
 [keys]
 # Paths use ~ as shorthand; the client MUST perform home-directory expansion.
 iroh_key_path = "~/.decdn/iroh_key"
-eth_keystore_path = "~/.decdn/eth_keystore"
+eth_keystore_path = "~/.decdn/client/keystore.json"
 
 [cache]
+# NOT YET IMPLEMENTED: the peer cache is always `peers.json` inside the resolved
+# client data dir, so move it with --data-dir rather than this key.
 peer_cache_path = "~/.decdn/client/peers.json"
 probe_cache_max_entries = 1024               # per ADR 001
 probe_cache_ttl_secs = 15                    # per ADR 001
