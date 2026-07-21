@@ -555,6 +555,47 @@ mod tests {
         assert!(validate_envelope(&bytes, 1_700_000_000_000_000, AnnounceGate::Disabled).is_ok());
     }
 
+    /// [`OwnedAnnounceGate::as_gate`] must preserve the variant when projecting
+    /// the owned gate into the borrowed form [`validate_envelope`] takes: an
+    /// `Enforce` set must still gate on membership, a `Disabled` gate must still
+    /// fail open. This is the owned→borrowed step the runtime runs at every
+    /// subscriber (`subscriber_task` calls `gate.as_gate()`); the multi-node
+    /// integration tests only cover the `Enforce` arm, so pin both here.
+    #[test]
+    fn as_gate_preserves_variant() {
+        let sk = fresh_key();
+        let bytes = mk_envelope(&sk, |_| {});
+
+        // Enforce(non-member) → still rejects after projection.
+        let enforce_miss: OwnedAnnounceGate =
+            AnnounceGate::Enforce(Arc::new(StakedSet(vec![[42u8; 32]])));
+        assert_eq!(
+            validate_envelope(&bytes, 1_700_000_000_000_000, enforce_miss.as_gate()),
+            Err(AnnounceReject::NotStaked)
+        );
+
+        // Enforce(member) → still accepts after projection.
+        let enforce_hit: OwnedAnnounceGate =
+            AnnounceGate::Enforce(Arc::new(StakedSet(vec![*sk.public().as_bytes()])));
+        assert!(validate_envelope(&bytes, 1_700_000_000_000_000, enforce_hit.as_gate()).is_ok());
+
+        // Disabled → still fails open after projection.
+        let disabled: OwnedAnnounceGate = AnnounceGate::Disabled;
+        assert!(validate_envelope(&bytes, 1_700_000_000_000_000, disabled.as_gate()).is_ok());
+    }
+
+    /// The hand-written [`AnnounceGate`] `Debug` (needed because the `S` handle
+    /// isn't `Debug`) reports the variant only — never the set contents, which
+    /// would leak staked membership into logs. Pins the format strings and, by
+    /// construction, that it compiles with no `S: Debug` bound.
+    #[test]
+    fn debug_reports_variant_only() {
+        let enforce: OwnedAnnounceGate = AnnounceGate::Enforce(Arc::new(StakedSet(Vec::new())));
+        assert_eq!(format!("{enforce:?}"), "AnnounceGate::Enforce(..)");
+        let disabled: OwnedAnnounceGate = AnnounceGate::Disabled;
+        assert_eq!(format!("{disabled:?}"), "AnnounceGate::Disabled");
+    }
+
     /// Now that `GossipPayload` has a second variant, a `ReputationReport`
     /// envelope fed to the `NodeAnnounce` validator must hit the (newly
     /// reachable) `UnknownVariant` arm rather than being mis-accepted. Guards
