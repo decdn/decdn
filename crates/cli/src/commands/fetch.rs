@@ -442,16 +442,32 @@ pub(crate) async fn resolve_target_node(
              blockchain.capacity_bond_address), or pass --node-id to dial directly"
         )
     })?;
-    let picked = discover_provider(
-        endpoint,
-        store,
-        chain,
-        capacity_bond,
-        relays.first(),
-        hash,
-        ProxyWarmingParams::from_args(args),
+    // `--timeout-ms` bounds discovery too (#1349). Nothing did before: the
+    // registry read's retry schedule alone can burn 36 s, and the probe fan-out
+    // adds to it, so `decdn fetch --timeout-ms 5000` could sit for far longer
+    // than 5 s before the transfer it caps had even started.
+    let cap = args.discovery_cap();
+    let picked = tokio::time::timeout(
+        cap,
+        discover_provider(
+            endpoint,
+            store,
+            chain,
+            capacity_bond,
+            relays.first(),
+            hash,
+            ProxyWarmingParams::from_args(args),
+        ),
     )
-    .await?;
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "node discovery exceeded --timeout-ms ({} ms): the registry read and probe \
+             fan-out did not finish in time. Raise --timeout-ms, or pass --node-id with \
+             --provider-address to skip discovery entirely",
+            cap.as_millis(),
+        )
+    })??;
     eprintln!(
         "discovered node {} (provider {}, region {:?})",
         picked.node_id, picked.eth_address, picked.region_hint

@@ -46,9 +46,16 @@ Startup sequence from first launch to ready state:
 3. Query on-chain registry: paginated getActiveNodes(offset, 100) calls,
      starting at offset 0, incrementing until a page returns fewer than 100
      On failure: retry 3× exponential backoff (1 s, 5 s, 30 s)
+     The budget is for the WHOLE read, not per page: a page that retries
+     twice leaves one retry for every page after it. Per-page budgets would
+     make the worst case 36 s × page-count, which scales with the size of
+     the registry — something the caller cannot see or bound.
      Deterministic failures (no contract at the configured address, an ABI
      mismatch, an HTTP 4xx other than 429) are reported at once rather than
      retried — repeating them only spends the schedule.
+     The whole of step 3 is additionally bounded by the client's
+     `--timeout-ms`, so the retry schedule can never be the reason a fetch
+     appears to hang past the deadline the user set.
 4. If the registry read fails (retries exhausted, or a deterministic failure):
      On cached peers present: fall back to the peer cache, and tell the user
        the list is cached and how old it is — those nodes may have been

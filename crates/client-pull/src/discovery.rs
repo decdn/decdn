@@ -41,11 +41,16 @@ const PAGE_SIZE: u64 = 100;
 /// length of the table is the retry count, so a fully-failing page costs
 /// 1 + 5 + 30 = 36 s across four attempts.
 ///
-/// The budget is **per page**: [`paginate_with_retry`] resets it on each page,
-/// so a read that spans N pages can sleep up to 36 s × N. At `PoC` scale
-/// (one page, see [`PAGE_SIZE`]) that is the 36 s. Either way the wait is
-/// silent from the caller's point of view — nothing streams progress out of
-/// this loop — so it is time `decdn fetch` appears to hang.
+/// The budget is **aggregate across the whole read**, not per page:
+/// [`paginate_with_retry`] carries one attempt counter across pagination, so a
+/// multi-page read still costs at most 36 s of sleeping in total rather than
+/// 36 s × N (#1349). The ADR's "retry 3×" is read as a property of the read,
+/// which is the unit the caller waits on — a per-page reset made the worst case
+/// scale with a number the caller cannot see or bound.
+///
+/// The wait is silent from the caller's point of view — nothing streams
+/// progress out of this loop — so it is time `decdn fetch` appears to hang.
+/// `--timeout-ms` bounds it from the outside.
 ///
 /// Deliberately not `decdn_config_types::RetryPolicy`: that is a *doubling*
 /// policy with jitter, scoped to node-side origin fetches — its defaults are
@@ -195,10 +200,20 @@ fn is_permanent(err: &alloy::contract::Error) -> bool {
     }
 }
 
-/// Drive `fetch_page` across the paginated `getActiveNodes` read, retrying each
-/// page on the ADR 012 § Bootstrap step 3 schedule
-/// ([`REGISTRY_RETRY_BACKOFF`]) and distilling every entry through
-/// [`candidate_from`].
+/// Drive `fetch_page` across the paginated `getActiveNodes` read, retrying on
+/// the ADR 012 § Bootstrap step 3 schedule ([`REGISTRY_RETRY_BACKOFF`]) and
+/// distilling every entry through [`candidate_from`].
+///
+/// The retry budget is **aggregate**, spent across the whole read rather than
+/// reset per page (#1349): `attempt` is declared outside the pagination loop, so
+/// a page that succeeds after two retries leaves one for everything after it.
+/// That is what bounds the worst case at the schedule's own 36 s instead of
+/// 36 s × page-count — a figure the caller cannot see, since the page count
+/// depends on how many nodes are registered.
+///
+/// A successful page deliberately does NOT refund the budget. Refunding would
+/// restore the unbounded case exactly: a registry that fails every *other* call
+/// would alternate success and retry forever.
 ///
 /// Split out from [`active_nodes`] so the retry and pagination control flow is
 /// drivable from a test without a live RPC — the schedule alone is a `const`
@@ -206,7 +221,7 @@ fn is_permanent(err: &alloy::contract::Error) -> bool {
 ///
 /// # Errors
 ///
-/// Fails when a page's retries are exhausted, or immediately when the failure
+/// Fails when the read's retries are exhausted, or immediately when the failure
 /// is [`is_permanent`].
 async fn paginate_with_retry<F, Fut>(fetch_page: F) -> anyhow::Result<Vec<NodeCandidate>>
 where
@@ -215,9 +230,9 @@ where
 {
     let mut out = Vec::new();
     let mut offset = 0u64;
+    // Outside the pagination loop: one budget for the whole read.
+    let mut attempt = 0usize;
     loop {
-        // The retry budget is per page — see `REGISTRY_RETRY_BACKOFF`.
-        let mut attempt = 0usize;
         let page = loop {
             match fetch_page(offset).await {
                 Ok(page) => break page,
@@ -236,7 +251,7 @@ where
                         return Err(e).with_context(|| {
                             format!(
                                 "CapacityBond.getActiveNodes(offset={offset}) failed after {} \
-                                 retries",
+                                 retries across the whole registry read",
                                 REGISTRY_RETRY_BACKOFF.len()
                             )
                         });
@@ -1022,6 +1037,64 @@ mod tests {
             "slept exactly 1 + 5 + 30 s"
         );
         assert!(format!("{err:#}").contains("failed after 3 retries"));
+    }
+
+    /// The retry budget is spent across the WHOLE read, not refilled per page
+    /// (#1349). Without this, a fully-failing N-page read cost 36 s × N — a
+    /// figure the caller cannot bound, since the page count follows how many
+    /// nodes are registered.
+    ///
+    /// The fixture puts retries on both sides of a page boundary: page 0 fails
+    /// twice then succeeds with a FULL page (so pagination continues), and
+    /// page 1 fails forever. Only the third backoff step is left for page 1, so
+    /// the read ends after 5 calls having slept the schedule exactly once.
+    /// Under the old per-page reset it would be 7 calls and 42 s.
+    #[tokio::test(start_paused = true)]
+    async fn the_retry_budget_is_spent_across_pages_not_refilled() {
+        let calls = std::cell::Cell::new(0usize);
+        let start = tokio::time::Instant::now();
+
+        let err = paginate_with_retry(|offset| {
+            let n = calls.get();
+            calls.set(n.saturating_add(1));
+            async move {
+                match (offset, n) {
+                    // Page 0: two transient failures burn steps 1 and 2 …
+                    (0, 0 | 1) => Err(transient()),
+                    // … then a full page, which is what makes the loop ask for
+                    // a second page rather than terminating on a short one.
+                    (0, _) => Ok((0..PAGE_SIZE)
+                        .map(|i| {
+                            // `u8` seeds wrap past 255; PAGE_SIZE is 100, so
+                            // every id here is distinct regardless.
+                            node_info(valid_node_id(u8::try_from(i).unwrap_or(0)), true)
+                        })
+                        .collect()),
+                    // Page 1 never succeeds.
+                    _ => Err(transient()),
+                }
+            }
+        })
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            calls.get(),
+            5,
+            "3 calls for page 0 (2 failures + success), then 2 for page 1 \
+             (initial + the single remaining retry) — not 7"
+        );
+        assert_eq!(
+            tokio::time::Instant::now() - start,
+            REGISTRY_RETRY_BACKOFF.iter().sum::<Duration>(),
+            "the schedule is slept once for the whole read, not once per page"
+        );
+        let msg = format!("{err:#}");
+        assert!(msg.contains("across the whole registry read"), "{msg}");
+        assert!(
+            msg.contains(&format!("offset={PAGE_SIZE}")),
+            "the error names the page that ran the budget out: {msg}"
+        );
     }
 
     #[tokio::test(start_paused = true)]

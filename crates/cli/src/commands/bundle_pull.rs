@@ -371,7 +371,21 @@ pub async fn bundle_pull(args: &BundlePullArgs, config_path: Option<&Path>) -> a
     let explicit = explicit_target(common)?;
     let candidates = match explicit {
         Some(_) => None,
-        None => Some(discover_candidates(&chain).await?),
+        // Bounded by `--timeout-ms` (#1349), as in `fetch`. This read happens
+        // ONCE for the whole bundle, so the cap is a whole-run bound here — it
+        // does not compound with the per-entry fetch caps below.
+        None => Some(
+            tokio::time::timeout(common.discovery_cap(), discover_candidates(&chain))
+                .await
+                .map_err(|_| {
+                    anyhow!(
+                        "node discovery exceeded --timeout-ms ({} ms): the registry read and \
+                         probe fan-out did not finish in time. Raise --timeout-ms, or pass \
+                         --node-id with --provider-address to skip discovery entirely",
+                        common.discovery_cap().as_millis(),
+                    )
+                })??,
+        ),
     };
 
     // Buyer signer (vouchers + any openChannel tx). Prompted only once, after we

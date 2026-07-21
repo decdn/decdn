@@ -169,12 +169,19 @@ pub struct ClientFetchArgs {
     #[arg(long, value_name = "MS", default_value_t = 30_000, value_parser = clap::value_parser!(u64).range(1..))]
     pub stall_timeout_ms: u64,
 
-    /// Hard cap on the total wall-clock time of a single blob fetch, in milliseconds.
-    /// Defaults to 1 hour. For `bundle pull` this applies per entry.
+    /// Hard cap on the total wall-clock time of node discovery, and separately of a
+    /// single blob fetch, in milliseconds. Defaults to 1 hour. For `bundle pull` the
+    /// fetch half applies per entry.
     ///
     /// This is a leak guard, not the health signal — `--stall-timeout-ms` is what catches
     /// a dead provider. Lower it when you must bound total runtime regardless of whether
     /// the transfer is progressing.
+    ///
+    /// Discovery (the `CapacityBond` registry read, its retry schedule, and the probe
+    /// fan-out) gets its own budget of this size rather than sharing the transfer's, so
+    /// that `bundle pull`'s per-entry accounting is unaffected. Before #1349 nothing
+    /// bounded discovery at all: a failing registry read could burn its full retry
+    /// schedule with `--timeout-ms 5000` set.
     ///
     /// It must exceed TWICE `--stall-timeout-ms`. The cap bounds the whole exchange, and the
     /// open stage is bounded by the same stall budget, so both can run inside it
@@ -230,8 +237,30 @@ impl ClientFetchArgs {
     /// return was structurally always `Some`, and existed only to shape-match
     /// `PullDeadlines`'s optional cap — misinforming every reader and forcing a pointless
     /// match (#1145 review). A caller that wants the optional form wraps it.
+    ///
+    /// The same value also bounds node discovery, as a SEPARATE budget rather than a
+    /// shared one — see [`Self::discovery_cap`].
     #[must_use]
     pub const fn hard_cap(&self) -> Duration {
+        Duration::from_millis(self.timeout_ms)
+    }
+
+    /// Wall-clock cap on node discovery: the registry read (including its retry
+    /// schedule) and the probe fan-out that picks a provider (#1349).
+    ///
+    /// The same `--timeout-ms` value as [`Self::hard_cap`], deliberately not a knob of
+    /// its own. Discovery had no bound at all, and a dedicated flag would be a fifth
+    /// timeout for operators to reason about when the one they already reach for —
+    /// "how long may this command take" — is the right question. The help text names
+    /// discovery so the widened scope is not a silent reinterpretation.
+    ///
+    /// It is a separate budget, not a shared one: sharing would make
+    /// `bundle pull`'s per-entry fetch cap depend on how long discovery took, turning a
+    /// documented per-entry bound into a whole-run one. Two budgets of the same size
+    /// means the true worst case is `2 ×` the flag, which is the honest cost of not
+    /// adding a knob.
+    #[must_use]
+    pub const fn discovery_cap(&self) -> Duration {
         Duration::from_millis(self.timeout_ms)
     }
 
@@ -366,6 +395,26 @@ mod tests {
     fn hard_cap_is_overridable() {
         let c = parse(&["--timeout-ms", "5000"]);
         assert_eq!(c.hard_cap(), Duration::from_secs(5));
+    }
+
+    /// `--timeout-ms` bounds discovery as well as the transfer (#1349), from the
+    /// same value and with no separate flag. Before this, `--timeout-ms 5000`
+    /// could still sit through the registry read's full 36 s retry schedule
+    /// before the transfer it capped had started.
+    ///
+    /// Asserted as equality to `hard_cap` rather than a literal so the two
+    /// cannot silently diverge: if a future change gives discovery its own
+    /// knob, this is the test that says so out loud.
+    #[test]
+    fn discovery_is_bounded_by_the_same_flag() {
+        let c = parse(&["--timeout-ms", "5000"]);
+        assert_eq!(c.discovery_cap(), Duration::from_secs(5));
+        assert_eq!(c.discovery_cap(), c.hard_cap());
+        assert_eq!(
+            parse(&[]).discovery_cap(),
+            parse(&[]).hard_cap(),
+            "the default is shared too — discovery is never left unbounded"
+        );
     }
 
     /// The two deadlines are only meaningful in relation to each other, and the threshold
