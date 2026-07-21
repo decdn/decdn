@@ -79,6 +79,21 @@ mod sol_types {
             /// Cardinality of `_registeredAddrs`.
             function getActiveNodeCount() external view returns (uint256);
 
+            /// The operator's raw registration record. `active` here is
+            /// `_nodes[operator].active` alone — the flag `deregisterNode`
+            /// gates on — NOT the composite `isActive`, which additionally
+            /// requires bond over `minBond` and no unbonding request. An
+            /// operator mid-unbonding is `isActive == false` yet still
+            /// deregisterable, so `decdn node deregister` reads this (#1359).
+            /// Zero-valued for a never-registered address.
+            function getNodeByAddress(address ethAddress) external view returns (NodeInfo memory);
+
+            /// Whether the operator was removed by the contract rather than by
+            /// choice — auto-ejection on slashing, or a `BLACKLIST_ROLE`
+            /// `ejectNode`. Distinguishes the two inactive states, which have
+            /// different exits (#1359).
+            function ejected(address operator) external view returns (bool);
+
             // -----------------------------------------------------------------
             // Bonding views + writes (ADR 019 § Step 2.1–2.2, consumed by
             // `decdn node bond`)
@@ -190,6 +205,15 @@ mod sol_types {
                 bytes bindingSignature,
                 bytes ed25519Signature
             ) external;
+
+            /// Leave the active set: clears `_nodes[msg.sender].active`, bumps
+            /// `registrationNonce[nodeId]`, and clears `declaredMbps` —
+            /// releasing the `bondRequired(declaredMbps)` floor that
+            /// `requestUnbond` enforces, which is what makes a full bond exit
+            /// reachable (ADR 003 § Node Registry, ADR 026 § Capacity-bond
+            /// curve). Does NOT move the bond. Reverts `NodeNotActive` unless
+            /// the caller is currently registered.
+            function deregisterNode() external;
 
             // -----------------------------------------------------------------
             // Events that mutate active-set membership

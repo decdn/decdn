@@ -163,6 +163,17 @@ pub enum NodeCommand {
     /// Note that a request in flight makes the node INACTIVE for the whole
     /// window. Pass `--dry-run` to print the plan without submitting.
     Unbond(UnbondArgs),
+    /// Leave the active node set on-chain via `CapacityBond.deregisterNode`
+    /// (ADR 003 § Node Registry) — the reverse of `decdn node register`, and
+    /// the first leg of a full bond exit. Clears the declared capacity tier,
+    /// which is what releases the `bondRequired(declaredMbps)` floor that
+    /// `decdn node unbond` enforces.
+    ///
+    /// This does NOT return the bond: it stays deposited and fully slashable.
+    /// Follow with `decdn node unbond --all` to start the unbonding window,
+    /// then re-run it after the window to withdraw. Pass `--dry-run` to print
+    /// the plan without submitting.
+    Deregister(DeregisterArgs),
 }
 
 /// `decdn node health` — report identity (hex `node_id`) and process
@@ -656,6 +667,13 @@ pub struct UnbondArgs {
     /// below `minBond` and the node stays inactive until it re-bonds. Whether
     /// it does is tier-dependent; the command reports `below_min_bond` before
     /// submitting.
+    ///
+    /// For an operator that is NOT in the registered set — ejected, or bonded
+    /// and declared but never registered — this additionally clears the
+    /// declared tier (`declareMbps(0)`), making it a full exit: nothing is
+    /// retained. That is the only route to the bond those operators have, since
+    /// `decdn node deregister` requires an active registration. A registered
+    /// node exits by running `decdn node deregister` first.
     #[arg(long)]
     pub all: bool,
 
@@ -670,6 +688,34 @@ pub struct UnbondArgs {
     /// from a non-interactive shell, since that deactivates the node for the
     /// full window; the withdrawal phase never prompts. The consequences are
     /// printed either way — this suppresses the prompt, not the warning.
+    #[arg(long = "yes", short = 'y')]
+    pub yes: bool,
+
+    #[command(flatten)]
+    pub chain: ChainArgs,
+}
+
+/// `decdn node deregister` — leave the active set via
+/// `CapacityBond.deregisterNode` (ADR 003 § Node Registry, #1359).
+///
+/// Deliberately flagless beyond the confirmation gate: `deregisterNode()` takes
+/// no arguments and needs no EIP-712 or ed25519 signature — unlike
+/// [`RegisterArgs`], which builds both — so the operator signer is the whole
+/// input. There is no state-driven phase selection either, the way
+/// [`UnbondArgs`] has: deregistration is a single transaction that either
+/// applies or reverts `NodeNotActive`.
+///
+/// It is nonetheless at least as consequential as starting an unbonding window,
+/// which is why it carries the same `--yes` gate: it drops the node from the
+/// active set, bumps `registrationNonce[nodeId]` (invalidating any
+/// previously-signed registration signature), and clears the declared tier, so
+/// re-entry costs a fresh `declareMbps` + `registerNode`.
+#[derive(Args, Debug)]
+pub struct DeregisterArgs {
+    /// Skip the interactive confirmation. Required from a non-interactive
+    /// shell, since deregistration takes the node out of the active set
+    /// immediately. The consequences are printed either way — this suppresses
+    /// the prompt, not the warning.
     #[arg(long = "yes", short = 'y')]
     pub yes: bool,
 

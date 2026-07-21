@@ -59,6 +59,20 @@ alloy::sol! {
             bytes ed25519Signature
         ) external;
         function isActive(address operator) external view returns (bool);
+        // Raw registered-set membership (#1359, G-NODE-06's exit leg). `active`
+        // here is `_nodes[operator].active` alone — the flag `deregisterNode`
+        // gates on — unlike `isActive`, which also requires bond over `minBond`
+        // and no request in flight. Only `active` is read; the rest of the
+        // struct is declared because the ABI decode needs the full shape.
+        struct NodeInfo {
+            bytes32 nodeId;
+            address ethAddress;
+            bool active;
+            uint64 lastMultiaddrUpdate;
+            bytes multiaddrs;
+            string regionHint;
+        }
+        function getNodeByAddress(address ethAddress) external view returns (NodeInfo memory);
         function bindingNonce(address operator) external view returns (uint64);
         function registrationNonce(bytes32 nodeId) external view returns (uint64);
         function updateRegion(string newRegion) external;

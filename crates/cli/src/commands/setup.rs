@@ -399,7 +399,7 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
         bound.nodeId == B256::ZERO || bound.nodeId == local_node_id,
         "operator {operator:#x} is already bound on-chain to node {:#x}, but the local node key is \
          {local_node_id:#x}; setup will not register a different key. Restore the bound key under \
-         {}, or deregister on-chain first",
+         {}, or run `decdn node deregister` first",
         bound.nodeId,
         resolved.data_dir.display(),
     );
