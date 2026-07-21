@@ -364,32 +364,45 @@ pub fn resolve_swap(
 }
 
 /// Send one call, await its receipt, and fail on a revert — the
-/// send/receipt/`ensure!(status)` triple every step of `bond`, `unbond`, and
-/// `register` needs. Shared here so all three report failures identically and
-/// none re-derives the hash-before-receipt ordering below (#1355).
+/// send/receipt/`ensure!(status)` triple the on-chain operator commands need.
+/// Shared so they report failures identically and none re-derives the
+/// hash-before-receipt ordering below (#1355). `publish`, `channel` and `appeal`
+/// still hand-roll it and still lose the hash on a receipt timeout.
 ///
-/// `hint` is an optional per-step diagnostic appended to a revert (`bond` has
-/// one on `declareMbps`); the tx hash is captured BEFORE awaiting the receipt so
-/// a fetch timeout still tells the operator what to look up — the transaction is
-/// in flight either way, and a hashless "could not be fetched" is unactionable.
+/// The tx hash is captured BEFORE awaiting the receipt so a fetch timeout still
+/// tells the operator what to look up — the transaction is in flight either way,
+/// and a hashless "could not be fetched" is unactionable. Note what that implies
+/// for callers: an `Err` from here does **not** mean nothing landed.
+///
+/// `hint` is a per-step semantic diagnostic, and it is attached to **both** the
+/// send and revert arms deliberately. `build_provider` installs alloy's
+/// recommended fillers, so `send()` runs `eth_estimateGas` — which means a call
+/// that would revert usually fails *here*, before it is ever broadcast, and
+/// surfaces as a bare `execution reverted` selector. A hint attached only to the
+/// receipt arm would therefore almost never print (#1355 review).
 pub(crate) async fn send<C: alloy::contract::CallDecoder, P: alloy::providers::Provider>(
     call: alloy::contract::CallBuilder<P, C>,
     label: &str,
     hint: Option<&str>,
 ) -> anyhow::Result<alloy::primitives::B256> {
-    let pending = call
-        .send()
-        .await
-        .with_context(|| format!("{label} transaction failed to send"))?;
+    let suffix = hint.map_or_else(String::new, |h| format!("; {h}"));
+    let pending = call.send().await.with_context(|| {
+        format!(
+            "{label} transaction failed to send — a pre-flight gas estimate rejecting the \
+             call surfaces here rather than as a revert{suffix}"
+        )
+    })?;
     let hash = *pending.tx_hash();
     let receipt = pending.get_receipt().await.with_context(|| {
         format!("{label} sent (tx {hash:#x}) but the receipt could not be fetched")
     })?;
+    // `status()` coerces a pre-Byzantium `PostState` receipt to success. Not
+    // reachable on the L2s this targets; noted so the check isn't read as
+    // exhaustive over every receipt shape.
     anyhow::ensure!(
         receipt.status(),
-        "{label} reverted (tx {:#x}){}",
+        "{label} reverted (tx {:#x}){suffix}",
         receipt.transaction_hash,
-        hint.map_or_else(String::new, |h| format!("; {h}")),
     );
     Ok(receipt.transaction_hash)
 }

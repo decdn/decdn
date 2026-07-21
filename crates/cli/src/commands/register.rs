@@ -185,9 +185,9 @@ pub(crate) async fn submit_registration<P: Provider + Clone>(
     // Via the shared `send` (#1355) so a receipt-fetch timeout still names the
     // in-flight tx — the bespoke code here used to lose the hash entirely on
     // that path, leaving an operator unable to check whether they registered.
-    // The old send-failure string also advised "check RPC, gas"; that is dropped
-    // deliberately, since the wrapped transport error already says which, and
-    // the bond/curve half of it only ever applied to the revert (now the hint).
+    // The hint below reaches both the send and revert arms, which matters here:
+    // `registerNode`'s failure modes are pre-flight gas-estimate reverts, so it
+    // is the SEND arm that fires in practice.
     let tx = chain_ctx::send(
         bond.registerNode(
             node_id,

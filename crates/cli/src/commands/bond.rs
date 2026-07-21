@@ -67,23 +67,52 @@ pub async fn run(args: &cli::BondArgs, global_config: Option<&Path>) -> anyhow::
     .await;
 
     let mut out = io::stdout().lock();
-    write_plan(&mut out, &plan, args.chain.common.json, &outcome, false)
-        .context("failed to write result")?;
+    let write_result = write_plan(&mut out, &plan, args.chain.common.json, &outcome, false);
     drop(out);
+    // A failed stdout write must never displace the chain error: under
+    // `decdn node bond --json | head`, Rust ignores SIGPIPE and `writeln!`
+    // returns EPIPE, so `?`-ing this first would swallow the very
+    // "bond ALREADY LANDED" message #1355 exists to deliver. Echo it to stderr
+    // (stdout is broken by hypothesis) and let the chain error win.
+    if let Err(err) = &write_result {
+        eprintln!("warning: failed to write bond result to stdout: {err}");
+    }
+    result.with_context(|| resume_hint(&outcome))?;
+    write_result.context("failed to write result")?;
+    Ok(())
+}
 
-    result.with_context(|| match (outcome.approve, outcome.bond) {
+/// Operator-facing guidance attached to a failed [`execute`], naming what is
+/// known to have been submitted.
+///
+/// Deliberately hedged (#1355 review). [`chain_ctx::send`] returns `Err` when a
+/// receipt cannot be *fetched*, and in that case the transaction is still in
+/// flight — so an absent hash means "not confirmed", never "did not happen".
+/// The earlier wording asserted the strong negatives ("no TOKEN was
+/// transferred", "on-chain state is unchanged") and told the operator to re-run
+/// immediately, which is actively unsafe: alloy's nonce filler resolves against
+/// the *pending* block, so re-running while a `bond` tx is still in the mempool
+/// takes the next nonce, re-reads a stale `activeBond`, and submits a *second*
+/// top-up — doubling the bond rather than converging.
+fn resume_hint(outcome: &Outcome) -> String {
+    match (outcome.approve, outcome.bond) {
         (_, Some(tx)) => format!(
-            "bond ALREADY LANDED (tx {tx:#x}): the TOKEN is now held by CapacityBond and \
-             visible via `activeBond`, but the capacity tier was NOT declared. Re-run the \
-             identical command to resume — it tops up only the remaining shortfall, so it \
-             will not over-bond"
+            "bond tx {tx:#x} was submitted. If it mined, the TOKEN is held by CapacityBond \
+             (confirm with `activeBond`) and only the capacity tier is missing. Re-running \
+             tops up just the remaining shortfall — but WAIT for {tx:#x} to settle first: \
+             re-running while it is still pending submits a second bond and doubles it"
         ),
         (Some(tx), None) => format!(
-            "approve ALREADY LANDED (tx {tx:#x}): the allowance is granted but no TOKEN was \
-             transferred. Re-run the identical command to resume"
+            "approve tx {tx:#x} was submitted; no bond transaction followed. If the error \
+             below is a revert, nothing was transferred and re-running is safe. If it is a \
+             receipt-fetch timeout, wait for {tx:#x} to settle before re-running"
         ),
-        (None, None) => "no transaction landed; on-chain state is unchanged".to_string(),
-    })
+        (None, None) => "no transaction was confirmed. A send-time failure is usually a \
+             pre-flight gas estimate rejecting the call, in which case nothing was \
+             broadcast — but an RPC timeout can still leave a tx in the mempool, so check \
+             the pending nonce before re-running"
+            .to_string(),
+    }
 }
 
 /// What `bond` intends to do, computed from chain state. `pub(crate)` so
@@ -257,9 +286,13 @@ pub(crate) fn write_plan(
     writeln!(w, "submitted={submitted} dry_run={dry_run}")
 }
 
-/// One `<key>=<tx|skipped>` line. A skipped step (no shortfall, allowance
-/// already sufficient, or tier already declared) prints `skipped` so an
-/// operator can tell "no-op" from "failed to record".
+/// One `<key>=<tx|skipped>` line.
+///
+/// `skipped` means "no hash recorded", which since #1355 covers two cases: the
+/// step was a genuine no-op (no shortfall, allowance already sufficient, tier
+/// already declared), OR the run failed at or before that step — `run` now
+/// prints the outcome on the error path too. The exit status and the
+/// accompanying stderr error are the discriminator; this line alone is not.
 fn write_tx_line(w: &mut impl io::Write, key: &str, tx: Option<&B256>) -> io::Result<()> {
     match tx {
         Some(h) => writeln!(w, "{key}={h:#x}"),
@@ -358,6 +391,92 @@ mod tests {
             v.get("declare_tx").is_some_and(serde_json::Value::is_null),
             "unlanded step must be present and null, got {v}"
         );
+    }
+
+    /// #1355 — the resume guidance is what an operator acts on after a partial
+    /// failure, and its arm ordering is load-bearing: writing `(Some(tx), _)`
+    /// first would tell someone whose TOKEN is already in `CapacityBond` that
+    /// only an allowance was granted. Pin which step each state names.
+    #[test]
+    fn resume_hint_names_the_latest_step_that_was_submitted() {
+        let approve = B256::repeat_byte(0xa1);
+        let bond = B256::repeat_byte(0xb2);
+
+        // Both landed → must speak about the BOND, not the approve.
+        let both = resume_hint(&Outcome {
+            approve: Some(approve),
+            bond: Some(bond),
+            declare: None,
+        });
+        assert!(both.contains(&format!("{bond:#x}")), "{both}");
+        assert!(!both.contains(&format!("{approve:#x}")), "{both}");
+
+        // Bond landed without a separate approve (allowance already sufficient)
+        // must still select the bond arm.
+        let bond_only = resume_hint(&Outcome {
+            approve: None,
+            bond: Some(bond),
+            declare: None,
+        });
+        assert!(bond_only.contains(&format!("{bond:#x}")), "{bond_only}");
+
+        let approve_only = resume_hint(&Outcome {
+            approve: Some(approve),
+            bond: None,
+            declare: None,
+        });
+        assert!(
+            approve_only.contains(&format!("{approve:#x}")),
+            "{approve_only}"
+        );
+        assert!(
+            !approve_only.contains(&format!("{bond:#x}")),
+            "{approve_only}"
+        );
+
+        let nothing = resume_hint(&Outcome::default());
+        assert!(
+            nothing.contains("no transaction was confirmed"),
+            "{nothing}"
+        );
+    }
+
+    /// #1355 review — the guidance must not assert on-chain negatives, because
+    /// `chain_ctx::send` also errors when a receipt cannot be *fetched*, leaving
+    /// the tx in flight. Asserting "no TOKEN was transferred" there would be
+    /// false, and telling the operator to re-run immediately would double the
+    /// bond (alloy's nonce filler resolves against the pending block).
+    #[test]
+    fn resume_hint_never_claims_the_chain_is_unchanged() {
+        let hints = [
+            resume_hint(&Outcome {
+                approve: Some(B256::repeat_byte(0xa1)),
+                bond: Some(B256::repeat_byte(0xb2)),
+                declare: None,
+            }),
+            resume_hint(&Outcome {
+                approve: Some(B256::repeat_byte(0xa1)),
+                bond: None,
+                declare: None,
+            }),
+            resume_hint(&Outcome::default()),
+        ];
+        for hint in &hints {
+            for forbidden in [
+                "no TOKEN was transferred",
+                "on-chain state is unchanged",
+                "will not over-bond",
+                "no transaction landed",
+            ] {
+                assert!(
+                    !hint.contains(forbidden),
+                    "resume guidance must not assert `{forbidden}` — a receipt-fetch \
+                     timeout leaves the tx in flight; got: {hint}"
+                );
+            }
+        }
+        // The one state that can have a pending bond must say so explicitly.
+        assert!(hints[0].contains("WAIT"), "{}", hints[0]);
     }
 
     #[test]
