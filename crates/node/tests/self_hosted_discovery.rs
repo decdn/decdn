@@ -73,8 +73,8 @@ use alloy::signers::local::PrivateKeySigner;
 use decdn_cache::CacheEngine;
 use decdn_common::config::ResolvedSecurity;
 use decdn_gossip::{
-    AnnounceReject, GossipRuntimeConfig, GossipService, PeerTable, ReputationWiring, StakedNodeSet,
-    build_gossip, metrics::NoopMetrics,
+    AnnounceGate, AnnounceReject, GossipRuntimeConfig, GossipService, OwnedAnnounceGate, PeerTable,
+    ReputationWiring, StakedNodeSet, build_gossip, metrics::NoopMetrics,
 };
 use decdn_node::dispatch::ConnectionLimiter;
 use decdn_node::handlers::probe::ProbeHandler;
@@ -147,7 +147,7 @@ async fn spawn_publisher(
     peers: Arc<RwLock<PeerTable>>,
     metrics: Arc<dyn decdn_gossip::GossipMetrics>,
     shutdown: CancellationToken,
-    staked: Option<Arc<dyn StakedNodeSet>>,
+    gate: OwnedAnnounceGate,
 ) -> decdn_gossip::GossipHandles {
     GossipService::spawn(
         ep,
@@ -163,7 +163,7 @@ async fn spawn_publisher(
         peers,
         metrics,
         shutdown,
-        staked,
+        gate,
         ReputationWiring::default(),
     )
     .await
@@ -381,7 +381,7 @@ async fn two_nodes_exchange_node_announce_via_self_hosted_discovery() -> anyhow:
         Arc::clone(&a_peers),
         Arc::clone(&metrics),
         shutdown.clone(),
-        Some(Arc::new(AllStaked)),
+        AnnounceGate::Enforce(Arc::new(AllStaked)),
     )
     .await;
     let b_handles = spawn_publisher(
@@ -392,7 +392,7 @@ async fn two_nodes_exchange_node_announce_via_self_hosted_discovery() -> anyhow:
         Arc::clone(&b_peers),
         Arc::clone(&metrics),
         shutdown.clone(),
-        Some(Arc::new(AllStaked)),
+        AnnounceGate::Enforce(Arc::new(AllStaked)),
     )
     .await;
 
@@ -524,7 +524,7 @@ async fn non_staked_announce_is_dropped_at_subscriber() -> anyhow::Result<()> {
         Arc::clone(&a_peers),
         Arc::clone(&a_metrics),
         shutdown.clone(),
-        Some(Arc::new(AllStaked)),
+        AnnounceGate::Enforce(Arc::new(AllStaked)),
     )
     .await;
     // B: receiver whose gate EXCLUDES A, so B must reject every A announce.
@@ -536,7 +536,7 @@ async fn non_staked_announce_is_dropped_at_subscriber() -> anyhow::Result<()> {
         Arc::clone(&b_peers),
         b_metrics_gossip,
         shutdown.clone(),
-        Some(Arc::new(NoneStaked)),
+        AnnounceGate::Enforce(Arc::new(NoneStaked)),
     )
     .await;
 

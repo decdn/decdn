@@ -33,7 +33,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use decdn_gossip::{PeerTable, ReportDrain, ReputationSink, StakedNodeSet, ValidatedReport};
+use decdn_gossip::{
+    AnnounceGate, OwnedAnnounceGate, PeerTable, ReportDrain, ReputationSink, StakedNodeSet,
+    ValidatedReport,
+};
 use decdn_protocol::{NodeId as ProtocolNodeId, ReportMetrics};
 use decdn_reputation::{
     NetworkReputation, ObservationBuffer, RegionalCoverage, ReportInput, SettlementRecord,
@@ -77,14 +80,16 @@ impl StakedNodeSet for NodeStakedNodeSet {
 
 /// Build the `NodeAnnounce` admission gate handed to
 /// [`decdn_gossip::GossipService::spawn`]. ADR 001 rule 2: the runtime *always*
-/// enforces the gate against the live staker set, so this returns `Some`, never
-/// `None` — `None` disables rule 2 (fail-open) and exists only for tests.
+/// enforces the gate against the live staker set, so this returns
+/// [`AnnounceGate::Enforce`], never [`AnnounceGate::Disabled`] — `Disabled`
+/// fails open (accept any announce) and exists only for tests.
 ///
 /// Named and unit-tested so a future refactor cannot silently drop the runtime
-/// to `None`: that would reopen the exact hole #1170 closed while every existing
-/// test still passed (`run()` is otherwise reachable only via the anvil e2e).
-pub fn announce_staked_gate(staker_set: Arc<dyn StakerSet>) -> Option<Arc<dyn StakedNodeSet>> {
-    Some(Arc::new(NodeStakedNodeSet::new(staker_set)))
+/// to `Disabled`: that would reopen the exact hole #1170 closed while every
+/// existing test still passed (`run()` is otherwise reachable only via the anvil
+/// e2e).
+pub fn announce_staked_gate(staker_set: Arc<dyn StakerSet>) -> OwnedAnnounceGate {
+    AnnounceGate::Enforce(Arc::new(NodeStakedNodeSet::new(staker_set)))
 }
 
 /// One settlement attributed to a reporter, stored with its absolute
@@ -397,7 +402,7 @@ impl ReputationSink for NodeReputationSink {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
     use crate::dht::staker_set::ConfigStakerSet;
@@ -431,16 +436,18 @@ mod tests {
     }
 
     /// The runtime's `NodeAnnounce` gate constructor must always enforce
-    /// (ADR 001 rule 2): it returns `Some` (never the fail-open `None`) *and* the
-    /// returned gate delegates to the live staker set — not a non-`None` stub
-    /// that admits everyone (which `is_some()` alone would not catch). Guards
-    /// against a future refactor silently disabling rule 2 (the #1170 hole),
-    /// which `run()` alone would only surface under the anvil e2e (#1222).
+    /// (ADR 001 rule 2): it returns [`AnnounceGate::Enforce`] (never the
+    /// fail-open [`AnnounceGate::Disabled`]) *and* the returned gate delegates to
+    /// the live staker set — not an `Enforce` stub that admits everyone (which
+    /// the variant tag alone would not catch). Guards against a future refactor
+    /// silently disabling rule 2 (the #1170 hole), which `run()` alone would only
+    /// surface under the anvil e2e (#1222).
     #[test]
     fn announce_staked_gate_enforces_never_fails_open() {
         let member = pk();
-        let gate = announce_staked_gate(staker_set_with(member))
-            .expect("announce gate must enforce, never fail open (None)");
+        let AnnounceGate::Enforce(gate) = announce_staked_gate(staker_set_with(member)) else {
+            panic!("announce gate must enforce, never fail open (Disabled)");
+        };
         assert!(
             gate.contains(member.as_bytes()),
             "staked member must be admitted"

@@ -5,12 +5,64 @@
 //! variant maps one-to-one to a stable metric label via
 //! [`AnnounceReject::label`].
 
+use std::sync::Arc;
+
 use decdn_protocol::{
     GOSSIP_VERSION, GossipEnvelope, GossipPayload, NodeAnnounce, SIGNATURE_LEN, is_valid_region,
 };
 use thiserror::Error;
 
 use crate::reputation::StakedNodeSet;
+
+/// ADR 001 rule-2 admission gate for inbound `NodeAnnounce`, naming its two
+/// safety-opposite states so neither is the silent default: [`Self::Enforce`]
+/// gates on staked membership, [`Self::Disabled`] fails open. The generic `S` is
+/// the membership-set handle — `&dyn StakedNodeSet` on the borrowed
+/// [`validate_envelope`] path, `Arc<dyn StakedNodeSet>` on the owned spawn path
+/// (see [`OwnedAnnounceGate`]).
+// `Copy` is conditional: it applies only where `S: Copy`, i.e. the borrowed
+// `AnnounceGate<&dyn StakedNodeSet>`. The owned `OwnedAnnounceGate` (an `Arc`)
+// is `Clone`-only, so `gate.clone()` at each subscriber is a refcount bump, not
+// an `Arc` copy — do not read `Copy` as copying the set.
+#[derive(Clone, Copy)]
+pub enum AnnounceGate<S> {
+    /// Enforce rule 2: accept an announce only when its author `node_id` is a
+    /// currently-staked node in this set. Note the empty-set semantics — an
+    /// `Enforce` set with no members rejects every announce, which is correct:
+    /// an empty active registry has no staked peers to learn.
+    Enforce(S),
+    /// FAIL-OPEN: accept any signature-valid announce. Tests only — no
+    /// production path constructs this (the runtime always [`Self::Enforce`]s;
+    /// `announce_staked_gate` in the `node` crate is the unit-tested guarantee).
+    Disabled,
+}
+
+impl<S> std::fmt::Debug for AnnounceGate<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `S` (a `StakedNodeSet` handle) isn't `Debug`; report the variant only,
+        // which is all that identifies the gate's safety state.
+        match self {
+            Self::Enforce(_) => f.write_str("AnnounceGate::Enforce(..)"),
+            Self::Disabled => f.write_str("AnnounceGate::Disabled"),
+        }
+    }
+}
+
+/// Owned announce gate handed to [`crate::GossipService::spawn`] and threaded
+/// into each subscriber task; borrowed as an [`AnnounceGate<&dyn StakedNodeSet>`]
+/// for [`validate_envelope`] via [`Self::as_gate`].
+pub type OwnedAnnounceGate = AnnounceGate<Arc<dyn StakedNodeSet>>;
+
+impl OwnedAnnounceGate {
+    /// Borrow-project this owned gate into the borrowed form
+    /// [`validate_envelope`] takes, preserving the variant (`Enforce`/`Disabled`).
+    pub fn as_gate(&self) -> AnnounceGate<&dyn StakedNodeSet> {
+        match self {
+            AnnounceGate::Enforce(s) => AnnounceGate::Enforce(s.as_ref()),
+            AnnounceGate::Disabled => AnnounceGate::Disabled,
+        }
+    }
+}
 
 /// Every reason an incoming envelope can be rejected. Each variant's
 /// [`Self::label`] is stable and suitable as a Prometheus label value.
@@ -133,18 +185,17 @@ const _: () = assert!(
 /// result through the peer table, where the final monotonic/stale check
 /// (rule 4) is enforced against the latest stored entry.
 ///
-/// `staked` enforces ADR 001 rule 2: an announce is accepted only when its
-/// author `node_id` is a currently-staked node in the on-chain registry
-/// (queried through the live [`StakedNodeSet`] cache, kept fresh by the
-/// registry event tail). `None` disables the check — accept any
+/// `gate` enforces ADR 001 rule 2: [`AnnounceGate::Enforce`] accepts an announce
+/// only when its author `node_id` is a currently-staked node in the on-chain
+/// registry (queried through the live [`StakedNodeSet`] cache, kept fresh by the
+/// registry event tail). [`AnnounceGate::Disabled`] skips the check — accept any
 /// signature-valid announce — and exists only for tests; the runtime always
-/// passes `Some` (there is no production path that disables the gate). Note the
-/// empty-set semantics: a `Some` set with no members rejects every announce,
-/// which is correct — an empty active registry has no staked peers to learn.
+/// passes `Enforce` (there is no production path that disables the gate). See
+/// [`AnnounceGate::Enforce`] for the empty-set semantics.
 pub fn validate_envelope(
     bytes: &[u8],
     now_us: u64,
-    staked: Option<&dyn StakedNodeSet>,
+    gate: AnnounceGate<&dyn StakedNodeSet>,
 ) -> Result<NodeAnnounce, AnnounceReject> {
     // Check the version byte *before* deserializing the payload. Postcard
     // encodes a u8 as a single byte, so the first byte is always the
@@ -182,7 +233,7 @@ pub fn validate_envelope(
     validate_announce_fields(&announce, now_us)?;
     verify_signature(&announce)?;
 
-    if let Some(staked) = staked
+    if let AnnounceGate::Enforce(staked) = gate
         && !staked.contains(&announce.body.node_id)
     {
         return Err(AnnounceReject::NotStaked);
@@ -336,7 +387,8 @@ mod tests {
     fn happy_path() {
         let sk = fresh_key();
         let bytes = mk_envelope(&sk, |_| {});
-        let a = validate_envelope(&bytes, 1_700_000_000_000_000, None).expect("valid");
+        let a = validate_envelope(&bytes, 1_700_000_000_000_000, AnnounceGate::Disabled)
+            .expect("valid");
         assert_eq!(a.body.node_id, *sk.public().as_bytes());
     }
 
@@ -350,7 +402,7 @@ mod tests {
             payload: GossipPayload::NodeAnnounce(NodeAnnounce { body, signature }),
         });
         assert_eq!(
-            validate_envelope(&bytes, 1_700_000_000_000_000, None),
+            validate_envelope(&bytes, 1_700_000_000_000_000, AnnounceGate::Disabled),
             Err(AnnounceReject::UnknownVersion)
         );
     }
@@ -367,7 +419,7 @@ mod tests {
             }),
         });
         assert_eq!(
-            validate_envelope(&bytes, 1_700_000_000_000_000, None),
+            validate_envelope(&bytes, 1_700_000_000_000_000, AnnounceGate::Disabled),
             Err(AnnounceReject::InvalidSignature)
         );
     }
@@ -384,7 +436,7 @@ mod tests {
             }),
         });
         assert_eq!(
-            validate_envelope(&bytes, 1_700_000_000_000_000, None),
+            validate_envelope(&bytes, 1_700_000_000_000_000, AnnounceGate::Disabled),
             Err(AnnounceReject::BadSignatureLen)
         );
     }
@@ -398,7 +450,7 @@ mod tests {
         // now 61s earlier than ts
         let now = 2_000_000_000_000_000 - (61 * 1_000_000);
         assert_eq!(
-            validate_envelope(&bytes, now, None),
+            validate_envelope(&bytes, now, AnnounceGate::Disabled),
             Err(AnnounceReject::ClockSkew)
         );
     }
@@ -411,7 +463,7 @@ mod tests {
         });
         let now = 2_000_000_000_000_000 + (61 * 1_000_000);
         assert_eq!(
-            validate_envelope(&bytes, now, None),
+            validate_envelope(&bytes, now, AnnounceGate::Disabled),
             Err(AnnounceReject::ClockSkew)
         );
     }
@@ -428,7 +480,7 @@ mod tests {
         for bad in bad_inputs {
             let bytes = mk_envelope(&sk, |b| b.region = bad.to_string());
             assert_eq!(
-                validate_envelope(&bytes, 1_700_000_000_000_000, None),
+                validate_envelope(&bytes, 1_700_000_000_000_000, AnnounceGate::Disabled),
                 Err(AnnounceReject::BadRegion),
                 "region {bad:?} should be rejected"
             );
@@ -444,14 +496,14 @@ mod tests {
         for good in ["AA", "QM", "QZ", "XA", "XK", "XZ", "ZZ"] {
             let bytes = mk_envelope(&sk, |b| b.region = good.to_string());
             assert!(
-                validate_envelope(&bytes, 1_700_000_000_000_000, None).is_ok(),
+                validate_envelope(&bytes, 1_700_000_000_000_000, AnnounceGate::Disabled).is_ok(),
                 "region {good:?} should be accepted"
             );
         }
     }
 
-    /// ADR 001 rule 2: with a `Some` staked set, an announce from a non-member
-    /// is rejected (`NotStaked`) and one from a member is accepted.
+    /// ADR 001 rule 2: with an `Enforce` staked set, an announce from a
+    /// non-member is rejected (`NotStaked`) and one from a member is accepted.
     #[test]
     fn staked_node_gate_enforced() {
         let sk = fresh_key();
@@ -460,11 +512,22 @@ mod tests {
         // empty set (no staked peers to learn).
         let others = StakedSet(vec![[42u8; 32]]);
         assert_eq!(
-            validate_envelope(&bytes, 1_700_000_000_000_000, Some(&others)),
+            validate_envelope(
+                &bytes,
+                1_700_000_000_000_000,
+                AnnounceGate::Enforce(&others)
+            ),
             Err(AnnounceReject::NotStaked)
         );
         let with_announcer = StakedSet(vec![[42u8; 32], *sk.public().as_bytes()]);
-        assert!(validate_envelope(&bytes, 1_700_000_000_000_000, Some(&with_announcer)).is_ok());
+        assert!(
+            validate_envelope(
+                &bytes,
+                1_700_000_000_000_000,
+                AnnounceGate::Enforce(&with_announcer)
+            )
+            .is_ok()
+        );
     }
 
     /// The empty staked set rejects every announce — the strict rule-2 default
@@ -474,18 +537,63 @@ mod tests {
         let sk = fresh_key();
         let bytes = mk_envelope(&sk, |_| {});
         assert_eq!(
-            validate_envelope(&bytes, 1_700_000_000_000_000, Some(&StakedSet(Vec::new()))),
+            validate_envelope(
+                &bytes,
+                1_700_000_000_000_000,
+                AnnounceGate::Enforce(&StakedSet(Vec::new()))
+            ),
             Err(AnnounceReject::NotStaked)
         );
     }
 
-    /// `None` disables the gate (tests / unstaked modes): any signature-valid
-    /// announce is accepted.
+    /// [`AnnounceGate::Disabled`] fails open (tests / unstaked modes): any
+    /// signature-valid announce is accepted.
     #[test]
-    fn staked_none_accepts_any() {
+    fn disabled_gate_accepts_any() {
         let sk = fresh_key();
         let bytes = mk_envelope(&sk, |_| {});
-        assert!(validate_envelope(&bytes, 1_700_000_000_000_000, None).is_ok());
+        assert!(validate_envelope(&bytes, 1_700_000_000_000_000, AnnounceGate::Disabled).is_ok());
+    }
+
+    /// [`OwnedAnnounceGate::as_gate`] must preserve the variant when projecting
+    /// the owned gate into the borrowed form [`validate_envelope`] takes: an
+    /// `Enforce` set must still gate on membership, a `Disabled` gate must still
+    /// fail open. This is the owned→borrowed step the runtime runs at every
+    /// subscriber (`subscriber_task` calls `gate.as_gate()`); the multi-node
+    /// integration tests only cover the `Enforce` arm, so pin both here.
+    #[test]
+    fn as_gate_preserves_variant() {
+        let sk = fresh_key();
+        let bytes = mk_envelope(&sk, |_| {});
+
+        // Enforce(non-member) → still rejects after projection.
+        let enforce_miss: OwnedAnnounceGate =
+            AnnounceGate::Enforce(Arc::new(StakedSet(vec![[42u8; 32]])));
+        assert_eq!(
+            validate_envelope(&bytes, 1_700_000_000_000_000, enforce_miss.as_gate()),
+            Err(AnnounceReject::NotStaked)
+        );
+
+        // Enforce(member) → still accepts after projection.
+        let enforce_hit: OwnedAnnounceGate =
+            AnnounceGate::Enforce(Arc::new(StakedSet(vec![*sk.public().as_bytes()])));
+        assert!(validate_envelope(&bytes, 1_700_000_000_000_000, enforce_hit.as_gate()).is_ok());
+
+        // Disabled → still fails open after projection.
+        let disabled: OwnedAnnounceGate = AnnounceGate::Disabled;
+        assert!(validate_envelope(&bytes, 1_700_000_000_000_000, disabled.as_gate()).is_ok());
+    }
+
+    /// The hand-written [`AnnounceGate`] `Debug` (needed because the `S` handle
+    /// isn't `Debug`) reports the variant only — never the set contents, which
+    /// would leak staked membership into logs. Pins the format strings and, by
+    /// construction, that it compiles with no `S: Debug` bound.
+    #[test]
+    fn debug_reports_variant_only() {
+        let enforce: OwnedAnnounceGate = AnnounceGate::Enforce(Arc::new(StakedSet(Vec::new())));
+        assert_eq!(format!("{enforce:?}"), "AnnounceGate::Enforce(..)");
+        let disabled: OwnedAnnounceGate = AnnounceGate::Disabled;
+        assert_eq!(format!("{disabled:?}"), "AnnounceGate::Disabled");
     }
 
     /// Now that `GossipPayload` has a second variant, a `ReputationReport`
@@ -515,7 +623,7 @@ mod tests {
             payload: GossipPayload::ReputationReport(ReputationReport { body, signature }),
         });
         assert_eq!(
-            validate_envelope(&bytes, 1_700_000_000_000_000, None),
+            validate_envelope(&bytes, 1_700_000_000_000_000, AnnounceGate::Disabled),
             Err(AnnounceReject::UnknownVariant)
         );
     }
@@ -525,12 +633,16 @@ mod tests {
         // First byte 0xFF != GOSSIP_VERSION, so the version-first check
         // rejects before attempting deserialization.
         assert_eq!(
-            validate_envelope(&[0xFFu8, 0xFF], 1_700_000_000_000_000, None),
+            validate_envelope(
+                &[0xFFu8, 0xFF],
+                1_700_000_000_000_000,
+                AnnounceGate::Disabled
+            ),
             Err(AnnounceReject::UnknownVersion)
         );
         // Empty input has no version byte at all → DecodeFailed.
         assert_eq!(
-            validate_envelope(&[], 1_700_000_000_000_000, None),
+            validate_envelope(&[], 1_700_000_000_000_000, AnnounceGate::Disabled),
             Err(AnnounceReject::DecodeFailed)
         );
     }
@@ -560,7 +672,7 @@ mod tests {
         });
 
         assert_eq!(
-            validate_envelope(&bytes, 1_700_000_000_000_000, None),
+            validate_envelope(&bytes, 1_700_000_000_000_000, AnnounceGate::Disabled),
             Err(AnnounceReject::InvalidSignature)
         );
     }
@@ -589,7 +701,7 @@ mod tests {
         });
 
         assert_eq!(
-            validate_envelope(&bytes, 1_700_000_000_000_000, None),
+            validate_envelope(&bytes, 1_700_000_000_000_000, AnnounceGate::Disabled),
             Err(AnnounceReject::InvalidSignature)
         );
     }
@@ -606,7 +718,7 @@ mod tests {
         let mut bytes = mk_envelope(&sk, |_| {});
         bytes.extend(std::iter::repeat_n(0xAAu8, MAX_TRAILING_BYTES + 1));
         assert_eq!(
-            validate_envelope(&bytes, 1_700_000_000_000_000, None),
+            validate_envelope(&bytes, 1_700_000_000_000_000, AnnounceGate::Disabled),
             Err(AnnounceReject::OversizeTrailingBytes)
         );
     }
@@ -624,7 +736,7 @@ mod tests {
         let mut bytes = mk_envelope(&sk, |_| {});
         bytes.extend(std::iter::repeat_n(0xAAu8, MAX_TRAILING_BYTES));
         assert!(
-            validate_envelope(&bytes, 1_700_000_000_000_000, None).is_ok(),
+            validate_envelope(&bytes, 1_700_000_000_000_000, AnnounceGate::Disabled).is_ok(),
             "exactly MAX_TRAILING_BYTES of padding must be accepted"
         );
     }
@@ -653,7 +765,7 @@ mod tests {
         });
         bytes.extend(std::iter::repeat_n(0xAAu8, MAX_TRAILING_BYTES + 1));
         assert_eq!(
-            validate_envelope(&bytes, 1_700_000_000_000_000, None),
+            validate_envelope(&bytes, 1_700_000_000_000_000, AnnounceGate::Disabled),
             Err(AnnounceReject::OversizeTrailingBytes),
             "size check must run BEFORE signature verify"
         );
