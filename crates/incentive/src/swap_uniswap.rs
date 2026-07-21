@@ -505,9 +505,13 @@ mod tests {
     // the swap's own error. That property is unit-tested below against an
     // unconnected provider (the reset's send fails and is swallowed). A true
     // end-to-end test — approve succeeds, the swap *reverts on-chain*, and a
-    // follow-up reset call is then observed — needs an anvil / mock-transport
-    // harness, which this crate does not have (no anvil dev-dep, and this alloy
-    // build ships no `Asserter`/`MockProvider`). Deferred rather than faked.
+    // follow-up reset call is then observed — needs a harness this crate does
+    // not yet have (no anvil dev-dep). Note that mock transport IS available:
+    // `alloy::providers::mock::Asserter` + `connect_mocked_client` ships in the
+    // pinned alloy and is used elsewhere in the workspace — see
+    // `cli/src/commands/unbond.rs` `mod plan_computation` for the ordered
+    // response-queue idiom. An earlier version of this comment claimed
+    // otherwise and so deferred the test on a false premise (#1347).
 
     #[tokio::test]
     async fn reset_router_allowance_swallows_send_failure() {
