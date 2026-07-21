@@ -53,6 +53,7 @@ pub mod swap_balancer;
 pub mod swap_math;
 pub mod swap_uniswap;
 pub mod swap_venue;
+pub mod tx;
 pub mod voucher;
 pub mod voucher_activity;
 

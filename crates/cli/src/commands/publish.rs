@@ -205,16 +205,14 @@ async fn namespace_create(
         let (signer, provider) = signer_and_provider(&resolved, &args.chain).await?;
         outcome.operator = Some(signer.address());
         let contract = PublisherRegistry::new(registry, &provider);
-        let pending =
-            contract.createNamespace().send().await.context(
-                "createNamespace failed to send (check RPC, gas, and the registry address)",
-            )?;
-        let receipt = pending
-            .get_receipt()
-            .await
-            .context("createNamespace sent but the receipt could not be fetched")?;
+        let receipt = decdn_incentive::tx::send_for_receipt(
+            contract.createNamespace(),
+            "createNamespace",
+            Some("check the RPC, gas, and the registry address"),
+            &mut outcome.tx,
+        )
+        .await?;
         let tx = receipt.transaction_hash;
-        anyhow::ensure!(receipt.status(), "createNamespace reverted (tx {tx})");
         // The new id comes from the emitted event: the return value is not in a
         // receipt, and a static pre-call would race a concurrent create
         // (`_nextNamespaceId` is global across publishers). Match the log by
@@ -302,26 +300,16 @@ async fn claim(args: &cli::ClaimArgs, global_config: Option<&Path>) -> anyhow::R
         let (signer, provider) = signer_and_provider(&resolved, &args.chain).await?;
         outcome.operator = Some(signer.address());
         let contract = PublisherRegistry::new(registry, &provider);
-        let pending = contract
-            .claimContent(U256::from(args.namespace), B256::from(hash))
-            .send()
-            .await
-            .context(
-                "claimContent failed to send; the signer must own the namespace \
-                 (and the claim must not already exist for it)",
-            )?;
-        let receipt = pending
-            .get_receipt()
-            .await
-            .context("claimContent sent but the receipt could not be fetched")?;
-        let tx = receipt.transaction_hash;
-        anyhow::ensure!(
-            receipt.status(),
-            "claimContent reverted (tx {tx}); likely not the namespace owner, or this \
-             namespace already claimed this hash (claims are append-only; re-claiming the \
-             same hash reverts)",
-        );
-        outcome.tx = Some(tx);
+        decdn_incentive::tx::send(
+            contract.claimContent(U256::from(args.namespace), B256::from(hash)),
+            "claimContent",
+            Some(
+                "the signer must own the namespace, and claims are append-only — re-claiming \
+                 a hash this namespace already claimed reverts",
+            ),
+            &mut outcome.tx,
+        )
+        .await?;
     }
 
     let mut out = io::stdout().lock();
@@ -414,25 +402,16 @@ async fn assign(args: &cli::AssignArgs, global_config: Option<&Path>) -> anyhow:
         let (signer, provider) = signer_and_provider(&resolved, &args.chain).await?;
         outcome.operator = Some(signer.address());
         let contract = OriginAssignment::new(oa_addr, &provider);
-        let pending = contract
-            .proposeAssignment(U256::from(args.namespace), outcome.operators.clone())
-            .send()
-            .await
-            .context(
-                "proposeAssignment failed to send; the signer must own the namespace and every \
-                 operator must be an active bonded node",
-            )?;
-        let receipt = pending
-            .get_receipt()
-            .await
-            .context("proposeAssignment sent but the receipt could not be fetched")?;
-        let tx = receipt.transaction_hash;
-        anyhow::ensure!(
-            receipt.status(),
-            "proposeAssignment reverted (tx {tx}); likely not the namespace owner, an inactive \
-             or duplicate operator, or the set exceeds maxOriginsPerNamespace",
-        );
-        outcome.tx = Some(tx);
+        let receipt = decdn_incentive::tx::send_for_receipt(
+            contract.proposeAssignment(U256::from(args.namespace), outcome.operators.clone()),
+            "proposeAssignment",
+            Some(
+                "the signer must own the namespace, every operator must be an active bonded \
+                 node, and the set must not exceed maxOriginsPerNamespace",
+            ),
+            &mut outcome.tx,
+        )
+        .await?;
 
         // Surface the timelock deadline (`readyAt`), matching the honest
         // decode in `namespace_create`: match by signature, then decode.

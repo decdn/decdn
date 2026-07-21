@@ -280,20 +280,8 @@ impl UniswapV3Venue {
             .await
             .context("failed to read USDC allowance")?;
         if allowance < max_in {
-            let approve_pending = usdc
-                .approve(self.router, max_in)
-                .send()
-                .await
-                .context("USDC approve transaction failed to send")?;
-            let approve_receipt = approve_pending
-                .get_receipt()
-                .await
-                .context("USDC approve sent but the receipt could not be fetched")?;
-            anyhow::ensure!(
-                approve_receipt.status(),
-                "USDC approve reverted (tx {})",
-                approve_receipt.transaction_hash
-            );
+            crate::tx::send_unrecorded(usdc.approve(self.router, max_in), "USDC approve", None)
+                .await?;
         }
 
         let router = SwapRouter02::new(self.router, &self.provider);
@@ -310,21 +298,12 @@ impl UniswapV3Venue {
         // neither the `max_in − actual_in` remainder after a successful swap nor
         // the full `max_in` after a reverted/failed one.
         let swap_result = async {
-            let pending = router
-                .multicall(deadline, vec![Bytes::from(inner)])
-                .send()
-                .await
-                .context("exactOutputSingle (via multicall) transaction failed to send")?;
-            let receipt = pending
-                .get_receipt()
-                .await
-                .context("exactOutputSingle sent but the receipt could not be fetched")?;
-            anyhow::ensure!(
-                receipt.status(),
-                "exactOutputSingle reverted (tx {})",
-                receipt.transaction_hash
-            );
-            anyhow::Ok(receipt.transaction_hash)
+            crate::tx::send_unrecorded(
+                router.multicall(deadline, vec![Bytes::from(inner)]),
+                "exactOutputSingle (via multicall)",
+                None,
+            )
+            .await
         }
         .await;
 
@@ -343,20 +322,8 @@ impl UniswapV3Venue {
     async fn reset_router_allowance(&self) {
         let usdc = Erc20::new(self.usdc, &self.provider);
         let outcome = async {
-            let pending = usdc
-                .approve(self.router, U256::ZERO)
-                .send()
-                .await
-                .context("failed to send")?;
-            let receipt = pending
-                .get_receipt()
-                .await
-                .context("sent but the receipt could not be fetched")?;
-            anyhow::ensure!(
-                receipt.status(),
-                "reverted (tx {})",
-                receipt.transaction_hash
-            );
+            crate::tx::send_unrecorded(usdc.approve(self.router, U256::ZERO), "reset", None)
+                .await?;
             anyhow::Ok(())
         }
         .await;

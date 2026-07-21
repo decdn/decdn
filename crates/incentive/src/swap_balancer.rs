@@ -281,20 +281,12 @@ impl BalancerV3Venue {
             .await
             .context("failed to read USDC allowance for Permit2")?;
         if permit2_allowance < max_in {
-            let approve_permit2_pending = usdc
-                .approve(self.permit2, max_in)
-                .send()
-                .await
-                .context("USDC approve(Permit2) transaction failed to send")?;
-            let approve_permit2_receipt = approve_permit2_pending
-                .get_receipt()
-                .await
-                .context("USDC approve(Permit2) sent but the receipt could not be fetched")?;
-            anyhow::ensure!(
-                approve_permit2_receipt.status(),
-                "USDC approve(Permit2) reverted (tx {})",
-                approve_permit2_receipt.transaction_hash
-            );
+            crate::tx::send_unrecorded(
+                usdc.approve(self.permit2, max_in),
+                "USDC approve(Permit2)",
+                None,
+            )
+            .await?;
         }
 
         // Legs 2+3 (Permit2→Router approve, then the swap) run inside a single
@@ -317,27 +309,19 @@ impl BalancerV3Venue {
             // through what is effectively dead-code error handling.
             let max_in_u160 = U160::saturating_from(max_in);
             let expiration_u48 = U48::saturating_from(deadline);
-            let permit2_approve_pending = permit2
-                .approve(self.usdc, self.router, max_in_u160, expiration_u48)
-                .send()
-                .await
-                .context("Permit2 approve transaction failed to send")?;
-            let permit2_approve_receipt = permit2_approve_pending
-                .get_receipt()
-                .await
-                .context("Permit2 approve sent but the receipt could not be fetched")?;
-            anyhow::ensure!(
-                permit2_approve_receipt.status(),
-                "Permit2 approve reverted (tx {})",
-                permit2_approve_receipt.transaction_hash
-            );
+            crate::tx::send_unrecorded(
+                permit2.approve(self.usdc, self.router, max_in_u160, expiration_u48),
+                "Permit2 approve",
+                None,
+            )
+            .await?;
 
             // Leg 3: the swap itself.
             let args = build_exact_out_swap_args(
                 self.pool, self.usdc, self.token, amount_out, max_in, deadline,
             );
-            let pending = router
-                .swapSingleTokenExactOut(
+            crate::tx::send_unrecorded(
+                router.swapSingleTokenExactOut(
                     args.pool,
                     args.token_in,
                     args.token_out,
@@ -346,20 +330,11 @@ impl BalancerV3Venue {
                     args.deadline,
                     args.weth_is_eth,
                     args.user_data,
-                )
-                .send()
-                .await
-                .context("swapSingleTokenExactOut transaction failed to send")?;
-            let receipt = pending
-                .get_receipt()
-                .await
-                .context("swapSingleTokenExactOut sent but the receipt could not be fetched")?;
-            anyhow::ensure!(
-                receipt.status(),
-                "swapSingleTokenExactOut reverted (tx {})",
-                receipt.transaction_hash
-            );
-            anyhow::Ok(receipt.transaction_hash)
+                ),
+                "swapSingleTokenExactOut",
+                None,
+            )
+            .await
         }
         .await;
 
@@ -386,20 +361,12 @@ impl BalancerV3Venue {
     async fn reset_permit2_allowance(&self) {
         let permit2 = Permit2::new(self.permit2, &self.provider);
         let outcome = async {
-            let pending = permit2
-                .approve(self.usdc, self.router, U160::ZERO, U48::ZERO)
-                .send()
-                .await
-                .context("failed to send")?;
-            let receipt = pending
-                .get_receipt()
-                .await
-                .context("sent but the receipt could not be fetched")?;
-            anyhow::ensure!(
-                receipt.status(),
-                "reverted (tx {})",
-                receipt.transaction_hash
-            );
+            crate::tx::send_unrecorded(
+                permit2.approve(self.usdc, self.router, U160::ZERO, U48::ZERO),
+                "reset",
+                None,
+            )
+            .await?;
             anyhow::Ok(())
         }
         .await;
@@ -419,20 +386,8 @@ impl BalancerV3Venue {
     async fn reset_usdc_approval(&self) {
         let usdc = Erc20::new(self.usdc, &self.provider);
         let outcome = async {
-            let pending = usdc
-                .approve(self.permit2, U256::ZERO)
-                .send()
-                .await
-                .context("failed to send")?;
-            let receipt = pending
-                .get_receipt()
-                .await
-                .context("sent but the receipt could not be fetched")?;
-            anyhow::ensure!(
-                receipt.status(),
-                "reverted (tx {})",
-                receipt.transaction_hash
-            );
+            crate::tx::send_unrecorded(usdc.approve(self.permit2, U256::ZERO), "reset", None)
+                .await?;
             anyhow::Ok(())
         }
         .await;

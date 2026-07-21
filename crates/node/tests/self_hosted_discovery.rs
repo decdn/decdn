@@ -159,7 +159,6 @@ async fn spawn_publisher(
             announce_interval_sec: 60,
             subscribe_global: true,
             region: Some(region.to_string()),
-            subscribe_reputation: false,
             reputation_publish_interval_sec: 3600,
         },
         peers,
@@ -199,7 +198,6 @@ async fn spawn_reputation_node(
             announce_interval_sec: 60,
             subscribe_global: false,
             region: None,
-            subscribe_reputation: true,
             // Long enough that the periodic tick never fires mid-test, leaving
             // the explicit trigger as the only publish driver. NOT "one
             // broadcast per poll round": `tokio::time::interval` fires its first
@@ -211,8 +209,11 @@ async fn spawn_reputation_node(
         Arc::new(RwLock::new(PeerTable::new(60_000_000, 128))),
         metrics,
         shutdown,
-        // Irrelevant here — no `NodeAnnounce` topic is subscribed.
-        OwnedAnnounceGate::Disabled,
+        // Irrelevant here — no `NodeAnnounce` topic is subscribed, so this gate
+        // is never consulted. `Enforce` rather than `Disabled` so the fail-OPEN
+        // variant has no caller outside `decdn-gossip`'s own tests, which is
+        // what lets it be `#[cfg(test)]`-only.
+        AnnounceGate::Enforce(Arc::new(AllStaked)),
         reputation,
     )
     .await

@@ -363,70 +363,12 @@ pub fn resolve_swap(
     }))
 }
 
-/// Send one call, await its receipt, and fail on a revert — the
-/// send/receipt/status triple the on-chain operator commands need. Shared so
-/// they report failures identically and none re-derives the hash-before-receipt
-/// ordering below (#1355). Other commands still hand-roll this and still lose
-/// the hash on a receipt timeout: `publish`, `channel`, `appeal`, and both swap
-/// venues in `decdn-incentive` (the last of these spends USDC, so it is the one
-/// worth migrating first).
-///
-/// `landed` is the caller's record of whether this step may have taken effect,
-/// and is the reason an out-param exists rather than just a return value:
-///
-/// - send failed → untouched (nothing was broadcast)
-/// - broadcast, receipt unreadable → `Some(hash)` **and** `Err` — the outcome is
-///   UNKNOWN, and the caller must treat it as possibly-applied
-/// - confirmed revert → `None` and `Err` (definitively no effect)
-/// - confirmed success → `Some(hash)` and `Ok`
-///
-/// So `Some` means "may have taken effect", never merely "was broadcast", and an
-/// `Err` from here does **not** imply nothing landed.
-///
-/// `hint` is a per-step semantic diagnostic, and it is attached to **both** the
-/// send and revert arms deliberately. `build_provider` installs alloy's
-/// recommended fillers, so `send()` runs `eth_estimateGas` — which means a call
-/// that would revert usually fails *here*, before it is ever broadcast, and
-/// surfaces as a bare `execution reverted` selector. A hint attached only to the
-/// receipt arm would therefore almost never print (#1355 review).
-pub(crate) async fn send<C: alloy::contract::CallDecoder, P: alloy::providers::Provider>(
-    call: alloy::contract::CallBuilder<P, C>,
-    label: &str,
-    hint: Option<&str>,
-    landed: &mut Option<alloy::primitives::B256>,
-) -> anyhow::Result<alloy::primitives::B256> {
-    let suffix = hint.map_or_else(String::new, |h| format!("; {h}"));
-    let pending = call.send().await.with_context(|| {
-        format!(
-            "{label} transaction failed to send. A pre-flight gas estimate rejecting the call \
-             surfaces here rather than as a revert, as do transport and nonce errors — see \
-             the cause below{suffix}"
-        )
-    })?;
-    let hash = *pending.tx_hash();
-    // Recorded BEFORE the receipt is awaited, which is the whole point of the
-    // out-param (#1355 review). From here the transaction is broadcast and may
-    // take effect; if the receipt cannot be read we still return `Err`, but the
-    // caller MUST be able to see that a tx is outstanding — re-running a `bond`
-    // while one is pending is what doubles it. Returning the hash only inside
-    // the error string left callers recording `None`, so the guidance they
-    // printed named the wrong transaction.
-    *landed = Some(hash);
-    let receipt = pending.get_receipt().await.with_context(|| {
-        format!("{label} sent (tx {hash:#x}) but the receipt could not be fetched")
-    })?;
-    // `status()` coerces a pre-Byzantium `PostState` receipt to success. Not
-    // reachable on the L2s this targets; noted so the check isn't read as
-    // exhaustive over every receipt shape.
-    if !receipt.status() {
-        // A confirmed revert had no effect, so clear the slot: `Some` must mean
-        // "may have taken effect", never merely "was broadcast". The hash stays
-        // in the message for lookup.
-        *landed = None;
-        anyhow::bail!("{label} reverted (tx {hash:#x}){suffix}");
-    }
-    Ok(hash)
-}
+/// The shared transaction submitter, re-exported so the on-chain `node`
+/// subcommands keep their `chain_ctx::send(..)` call shape. It lives in
+/// `decdn-incentive` because the swap venues there need it too (#1355). See
+/// [`decdn_incentive::tx::send`] for the `landed` contract, which callers must
+/// read carefully: an `Err` does **not** imply nothing landed.
+pub(crate) use decdn_incentive::tx::send;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]

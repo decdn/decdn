@@ -76,9 +76,6 @@ pub struct GossipRuntimeConfig {
     /// reject a region-less announce at validation time. `decdn-node`
     /// enforces this at config resolution.
     pub region: Option<String>,
-    /// Subscribe to (and, when a report drain is supplied, publish on) the
-    /// global `cdn/reputation/v1` topic (ADR 008). Independent of `region`.
-    pub subscribe_reputation: bool,
     /// Interval between reputation-report publish ticks (seconds). Matches the
     /// ADR 008 1-hour per-(reporter, node) rate limit by default.
     pub reputation_publish_interval_sec: u64,
@@ -222,10 +219,9 @@ impl GossipService {
     ///
     /// `gate` admits `NodeAnnounce` per ADR 001 rule 2. The runtime always
     /// passes [`AnnounceGate::Enforce`](crate::AnnounceGate::Enforce) over the
-    /// live registry set; [`AnnounceGate::Disabled`](crate::AnnounceGate::Disabled)
-    /// (skip the staked-membership check alone, leaving the rest of
-    /// [`validate_envelope`] — signatures included — intact) is for tests only:
-    /// there is no production path that disables the gate.
+    /// live registry set. There is no production path that disables the gate:
+    /// `AnnounceGate::Disabled` is `#[cfg(test)]`, so it does not exist in this
+    /// build at all.
     #[allow(
         clippy::too_many_arguments,
         clippy::needless_pass_by_value,
@@ -436,57 +432,20 @@ async fn spawn_reputation_tasks(
     shutdown: &CancellationToken,
     reputation: ReputationWiring,
 ) -> (Vec<JoinHandle<()>>, Option<Arc<ReputationPublishTrigger>>) {
-    /// Whether this wiring would spawn the publisher, i.e. a report drain is
-    /// wired. Named rather than inlined so the `subscribe_reputation = false`
-    /// diagnostic below reads as one condition.
-    const fn drain_wired(w: &ReputationWiring) -> bool {
-        matches!(
-            w,
-            ReputationWiring::Enabled {
-                publish: Some(_),
-                ..
-            }
-        )
-    }
-
-    if !cfg.subscribe_reputation {
-        // The publisher only runs alongside the reputation topic subscription,
-        // so `subscribe_reputation = false` silently drops wired reputation
-        // gossip: a node with a drain keeps buffering outbound observations that
-        // never publish (#864). Warn so this opt-out-only inert combination is
-        // visible — it cannot arise at defaults (both live).
-        // Gated on a wired DRAIN, not merely on `Enabled` (#1355 review): the
-        // runtime always builds `Enabled`, so the broader predicate warned at
-        // every deliberate opt-out — including `publish: None`, where nothing
-        // accumulates and this advice does not apply.
-        if drain_wired(&reputation) {
-            tracing::warn!(
-                "gossip: report drain wired but subscribe_reputation = false; the topic is \
-                 not joined, so outbound reputation reports will accumulate and never \
-                 publish — enable gossip.subscribe_reputation to drain them"
-            );
-        }
-        return (Vec::new(), None);
-    }
-    // `Disabled` is a stated intent rather than a wiring accident — the type
-    // makes "sink without admission set" (and vice versa) unrepresentable, so
-    // there is no half-wired case left to diagnose. It is still worth one line:
-    // `Disabled` is this type's `Default`, and `subscribe_reputation` defaults
-    // to true, so an embedder who passes `ReputationWiring::default()` against a
-    // default config gets no reputation gossip and (before #1342) at least got a
-    // warning. `info!` rather than `warn!` because for `decdn-node` — which
-    // always builds `Enabled` — this branch is unreachable, so anyone reaching
-    // it chose to.
+    // One authority for "is reputation gossip on": the wiring variant. There
+    // used to be a second — a `subscribe_reputation` bool on
+    // `GossipRuntimeConfig`, checked just above this — which meant two ways to
+    // say "off", checked at two points, while the runtime pinned the wiring to
+    // `Enabled` permanently and let the bool do the real work. The operator knob
+    // still exists; `decdn-node` now resolves it into this variant at the one
+    // place it builds the wiring (#1355 review).
     let ReputationWiring::Enabled {
         sink,
         staked,
         publish,
     } = reputation
     else {
-        tracing::info!(
-            "gossip: subscribe_reputation is set but the wiring is ReputationWiring::Disabled; \
-             the reputation topic is not joined"
-        );
+        tracing::debug!("gossip: reputation wiring disabled; the topic is not joined");
         return (Vec::new(), None);
     };
 
@@ -1109,7 +1068,6 @@ mod tests {
             announce_interval_sec: 60,
             subscribe_global,
             region: region.map(String::from),
-            subscribe_reputation: false,
             reputation_publish_interval_sec: 3600,
         }
     }
@@ -1560,8 +1518,7 @@ mod tests {
         let peer_table = Arc::new(RwLock::new(PeerTable::new(60_000_000, 128)));
         let metrics: Arc<dyn GossipMetrics> = Arc::new(crate::metrics::NoopMetrics);
         let shutdown = CancellationToken::new();
-        let mut config = cfg(true, Some("US"));
-        config.subscribe_reputation = true;
+        let config = cfg(true, Some("US"));
         let wiring = ReputationWiring::Enabled {
             sink: Arc::new(Sink),
             staked: Arc::new(Staked),
@@ -1604,89 +1561,6 @@ mod tests {
         }
     }
 
-    /// #864 — a wired report drain with `subscribe_reputation = false` is the
-    /// one inert opt-out combination: the reputation topic is not joined, so
-    /// the publisher never spawns and the drain silently accumulates. The
-    /// bring-up path `warn!`s (not asserted here — capturing tracing output
-    /// needs a dedicated subscriber, same as the bind tests); this guards the
-    /// observable consequence: no reputation tasks and no publish trigger even
-    /// though a drain was supplied.
-    #[tokio::test]
-    async fn report_drain_with_reputation_disabled_spawns_no_publisher() {
-        use iroh::endpoint::presets;
-
-        use crate::reputation::ValidatedReport;
-
-        struct Drain;
-        impl ReportDrain for Drain {
-            fn drain(&self) -> Vec<([u8; 32], decdn_protocol::ReportMetrics)> {
-                Vec::new()
-            }
-        }
-        struct Sink;
-        impl ReputationSink for Sink {
-            fn accept(&self, _report: ValidatedReport) {}
-        }
-        struct Staked;
-        impl StakedNodeSet for Staked {
-            fn contains(&self, _node_id: &[u8; 32]) -> bool {
-                true
-            }
-        }
-
-        let ep = Endpoint::builder(presets::Minimal)
-            .bind()
-            .await
-            .expect("bind minimal endpoint");
-        let gossip = build_gossip(ep.clone());
-        let peer_table = Arc::new(RwLock::new(PeerTable::new(60_000_000, 128)));
-        let metrics: Arc<dyn GossipMetrics> = Arc::new(crate::metrics::NoopMetrics);
-        let shutdown = CancellationToken::new();
-        // `subscribe_reputation` defaults to false in `cfg`; wire reputation
-        // fully so the config flag is the only thing suppressing it.
-        let config = cfg(true, Some("US"));
-        assert!(!config.subscribe_reputation);
-        let wiring = ReputationWiring::Enabled {
-            sink: Arc::new(Sink),
-            staked: Arc::new(Staked),
-            publish: Some(Arc::new(Drain)),
-        };
-
-        let handles = GossipService::spawn(
-            ep,
-            SecretKey::generate(),
-            gossip,
-            config,
-            peer_table,
-            metrics,
-            shutdown.clone(),
-            OwnedAnnounceGate::Disabled,
-            wiring,
-        )
-        .await
-        .expect("gossip service should start");
-
-        assert!(
-            handles.reputation_publish_trigger.is_none(),
-            "drain dropped when reputation gossip is off ⇒ no publish trigger"
-        );
-        // global sub + region sub + NodeAnnounce publisher + TTL sweeper; the
-        // reputation subscriber + publisher are both absent.
-        assert_eq!(
-            handles.tasks.len(),
-            4,
-            "no reputation tasks when subscribe_reputation = false"
-        );
-
-        shutdown.cancel();
-        for handle in handles.tasks {
-            tokio::time::timeout(Duration::from_secs(2), handle)
-                .await
-                .expect("gossip task must exit promptly after cancel, not hang")
-                .expect("gossip task must exit cleanly, not panic");
-        }
-    }
-
     /// #1338 — an unwired [`ReputationWiring`] is fail-CLOSED, and that reads
     /// off the type (a named `Disabled` variant) rather than off a `None`.
     /// Asserted through `Debug` as well as by pattern match.
@@ -1710,8 +1584,8 @@ mod tests {
     /// would report every live enforcing node as fail-closed in the logs with
     /// nothing failing. That is precisely the confusion this shape exists to
     /// prevent, so it gets its own assertion. The `publish` flag is included
-    /// because the bring-up `warn!` at `subscribe_reputation = false` renders
-    /// the whole wiring, and "was a drain wired?" is the actionable part.
+    /// because a caller inspecting a wiring wants to know whether it publishes,
+    /// and that is the one thing `Enabled` does not settle on its own.
     #[test]
     fn reputation_wiring_debug_reports_variant_and_publish_only() {
         struct Staked;
@@ -1755,9 +1629,11 @@ mod tests {
         );
     }
 
-    /// #1338 — the fail-CLOSED half of the contract: a [`ReputationWiring::
-    /// Disabled`] must not join the reputation topic even with
-    /// `subscribe_reputation = true`. Nothing may admit unvetted reports.
+    /// #1338 — the fail-CLOSED half of the contract: a
+    /// [`ReputationWiring::Disabled`] joins no reputation topic and admits
+    /// nothing. This is now the *only* off-switch; `decdn-node` resolves the
+    /// operator's `gossip.subscribe_reputation` into this variant before calling
+    /// `spawn`, so there is no second authority to test against.
     ///
     /// Note what is NOT here any more (#1342): the sibling case this test used
     /// to need — an enforcing admission set with no sink — is now
@@ -1777,8 +1653,7 @@ mod tests {
         let peer_table = Arc::new(RwLock::new(PeerTable::new(60_000_000, 128)));
         let metrics: Arc<dyn GossipMetrics> = Arc::new(crate::metrics::NoopMetrics);
         let shutdown = CancellationToken::new();
-        let mut config = cfg(true, Some("US"));
-        config.subscribe_reputation = true;
+        let config = cfg(true, Some("US"));
         let wiring = ReputationWiring::Disabled;
 
         let handles = GossipService::spawn(

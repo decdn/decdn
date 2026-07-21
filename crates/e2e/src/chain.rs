@@ -739,6 +739,29 @@ impl ChainFixture {
             .context("read bondRequired")
     }
 
+    /// Emergency-multisig `CapacityBond.pause()`. The e2e deploy sets
+    /// `EMERGENCY_MULTISIG = DEPLOYER_ADDR` (anvil dev #0), so the deployer key
+    /// holds `PAUSER_ROLE`.
+    ///
+    /// Exists so a journey can make a *write* revert while every read still
+    /// succeeds: `bond`/`declareMbps` are `whenNotPaused`, but the balance,
+    /// allowance and curve views a CLI pre-flight uses are not. That is the only
+    /// deterministic way to drive a command past its pre-flight gate and into a
+    /// mid-sequence on-chain failure.
+    pub async fn pause_capacity_bond(&self) -> anyhow::Result<()> {
+        let deployer: PrivateKeySigner = DEPLOYER_KEY.parse().context("parse deployer key")?;
+        let provider = self.provider_for(&deployer);
+        let receipt = CapacityBond::new(self.addrs.capacity_bond, &provider)
+            .pause()
+            .send()
+            .await
+            .context("CapacityBond.pause send")?
+            .get_receipt()
+            .await
+            .context("CapacityBond.pause receipt")?;
+        crate::ensure_mined(&receipt, "CapacityBond.pause")
+    }
+
     /// `CapacityBond.minBond()` — the global bond floor, independent of the
     /// capacity curve.
     pub async fn min_bond(&self) -> anyhow::Result<U256> {

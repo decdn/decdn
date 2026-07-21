@@ -68,10 +68,9 @@ fn now_secs() -> u64 {
 /// open. Exporting this type would create no un-gated path — anything an
 /// external caller could build with it is the same wrapping
 /// [`announce_staked_gate`] and [`report_staked_set`] already return. The
-/// genuinely un-gated seam is `AnnounceGate::Disabled`, a `pub` variant in
-/// `decdn-gossip` that anyone can construct, and narrowing this struct does not
-/// touch it; closing that one means making the variant unconstructible outside
-/// tests.
+/// genuinely un-gated seam was `AnnounceGate::Disabled`, which narrowing this
+/// struct did not touch — that is now closed separately by making the variant
+/// `#[cfg(test)]` in `decdn-gossip`, i.e. absent from production builds.
 #[derive(Debug)]
 pub(crate) struct NodeStakedNodeSet {
     staker_set: Arc<dyn StakerSet>,
@@ -96,8 +95,9 @@ impl StakedNodeSet for NodeStakedNodeSet {
 /// Build the `NodeAnnounce` admission gate handed to
 /// [`decdn_gossip::GossipService::spawn`]. ADR 001 rule 2: the runtime *always*
 /// enforces the gate against the live staker set, so this returns
-/// [`AnnounceGate::Enforce`], never [`AnnounceGate::Disabled`] — `Disabled`
-/// fails open (accept any announce) and exists only for tests.
+/// [`AnnounceGate::Enforce`], never a disabled gate. `AnnounceGate::Disabled`
+/// fails open (skips the staked-membership check) and is `#[cfg(test)]` in
+/// `decdn-gossip`, so it cannot be named from this crate at all.
 ///
 /// Named and unit-tested so a future refactor cannot silently drop the runtime
 /// to `Disabled`: that would reopen the exact hole #1170 closed while every
@@ -464,19 +464,21 @@ mod tests {
         assert!(!gate.contains(outsider.as_bytes()));
     }
 
-    /// The runtime's `NodeAnnounce` gate constructor must always enforce
-    /// (ADR 001 rule 2): it returns [`AnnounceGate::Enforce`] (never the
-    /// fail-open [`AnnounceGate::Disabled`]) *and* the returned gate delegates to
-    /// the live staker set — not an `Enforce` stub that admits everyone (which
-    /// the variant tag alone would not catch). Guards against a future refactor
-    /// silently disabling rule 2 (the #1170 hole), which `run()` alone would only
-    /// surface under the anvil e2e (#1222).
+    /// The runtime's `NodeAnnounce` gate must admit against the *live* staker
+    /// set (ADR 001 rule 2) — not an `Enforce` stub that admits everyone, which
+    /// a variant-tag check alone would not catch. Guards against a future
+    /// refactor silently disabling rule 2 (the #1170 hole), which `run()` alone
+    /// would only surface under the anvil e2e (#1222).
+    ///
+    /// The other half of that guarantee — "never the fail-open variant" — used
+    /// to be a `let ... else { panic!() }` here. It is no longer assertable, and
+    /// that is the improvement: `AnnounceGate::Disabled` is `#[cfg(test)]` in
+    /// `decdn-gossip`, so from this crate the pattern is irrefutable and the
+    /// invariant is the compiler's rather than this test's.
     #[test]
-    fn announce_staked_gate_enforces_never_fails_open() {
+    fn announce_staked_gate_admits_against_the_live_set() {
         let member = pk();
-        let AnnounceGate::Enforce(gate) = announce_staked_gate(staker_set_with(member)) else {
-            panic!("announce gate must enforce, never fail open (Disabled)");
-        };
+        let AnnounceGate::Enforce(gate) = announce_staked_gate(staker_set_with(member));
         assert!(
             gate.contains(member.as_bytes()),
             "staked member must be admitted"
