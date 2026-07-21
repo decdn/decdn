@@ -241,13 +241,15 @@ contract CapacityBond is
     ///         not re-enforce it — a penalized operator may fall under the
     ///         curve and is auto-ejected below `minBond / 2`.
     /// @dev    Invariant: every write to this mapping emits `MbpsDeclared`.
-    ///         `declareMbps` sets a tier inside the band; `deregisterNode`
-    ///         clears it back to 0, which is the only route to 0 since the band
-    ///         floor bars `declareMbps(0)`. Note `deregisterNode` requires an
-    ///         active node, while `declareMbps` does not — so a tier declared
-    ///         without registering, or left standing by an ejection, cannot be
-    ///         cleared and keeps pinning `bondRequired(mbps)` of the bond. See
-    ///         ADR 026 § Capacity-bond curve and issue #1361.
+    ///         There are exactly two routes back to 0, split by whether the
+    ///         operator is active: `deregisterNode` (active — it reverts
+    ///         `NodeNotActive` otherwise) and `declareMbps(0)` (inactive — the
+    ///         one sub-band value it accepts, and only from an inactive
+    ///         caller). Both are needed: a tier declared without registering,
+    ///         or left standing by an ejection, has no `deregisterNode` to
+    ///         reach, and would otherwise keep pinning `bondRequired(mbps)` of
+    ///         the bond forever. See ADR 026 § Capacity-bond curve and issue
+    ///         #1361.
     mapping(address operator => uint256) public declaredMbps;
 
     uint256 public minBond;
@@ -662,13 +664,38 @@ contract CapacityBond is
     ///         bound). The bond-curve coupling is enforced here:
     ///         `activeBond ≥ bondRequired(mbps)`, so an operator cannot declare
     ///         a capacity tier it has not bonded for.
+    ///
+    ///         `mbps == 0` is the one value outside that band an operator may
+    ///         declare, and only while INACTIVE: it is the tier-release path
+    ///         (issue #1361). Active operators still get `DeclaredCapacityOutOfBand`
+    ///         for it, so the release is not a back door around the band —
+    ///         a registered node leaves via `deregisterNode`, which clears the
+    ///         tier as part of the exit.
+    /// @dev    Without this branch the tier is unclearable from every state
+    ///         `deregisterNode` cannot be called in — bonded-and-declared but
+    ///         never registered, auto-ejected by slashing, blacklist-ejected,
+    ///         or displaced by `reclaimNodeId` — and `requestUnbond`'s
+    ///         `bondRequired(declaredMbps)` floor then pins the operator's bond
+    ///         indefinitely. Where a slash already took the bond below that
+    ///         floor, NONE of the remainder was withdrawable.
+    ///
+    ///         The bond released this way stays slashable for the whole
+    ///         unbonding window — `_reduceBondAtTier` reaches bond sitting in
+    ///         the queue — so this shortens no exposure, it only stops the
+    ///         floor outliving the registration it was sized for.
     function declareMbps(uint256 mbps) external whenNotPaused {
-        if (mbps < minCapacityMbps || mbps > maxCapacityMbps) {
-            revert DeclaredCapacityOutOfBand({ mbps: mbps, floor: minCapacityMbps, ceiling: maxCapacityMbps });
-        }
-        uint256 required = bondRequired(mbps);
-        if (activeBond[msg.sender] < required) {
-            revert BondBelowCurve({ bond: activeBond[msg.sender], required: required });
+        // Checked before the band so a zero declaration from an inactive
+        // operator skips BOTH gates: the band floor (`minCapacityMbps ≥ 1`)
+        // and the curve check, which a slashed operator can no longer meet.
+        bool release = mbps == 0 && !_nodes[msg.sender].active;
+        if (!release) {
+            if (mbps < minCapacityMbps || mbps > maxCapacityMbps) {
+                revert DeclaredCapacityOutOfBand({ mbps: mbps, floor: minCapacityMbps, ceiling: maxCapacityMbps });
+            }
+            uint256 required = bondRequired(mbps);
+            if (activeBond[msg.sender] < required) {
+                revert BondBelowCurve({ bond: activeBond[msg.sender], required: required });
+            }
         }
         uint256 old = declaredMbps[msg.sender];
         declaredMbps[msg.sender] = mbps;
