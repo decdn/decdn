@@ -35,7 +35,7 @@ pub use message::{
     MAX_RATE_PER_MB, MessageValidationError, ProbeMessage, ProbeRequest, ProbeResponse,
     ProbeResponseBody, SLASH_SIG_LEN,
 };
-pub use region::is_valid_region;
+pub use region::{InvalidRegion, Region, is_valid_region};
 
 /// ALPN protocol identifier for latency and availability probing.
 pub const ALPN_PROBE: &[u8] = b"cdn/probe/v1";

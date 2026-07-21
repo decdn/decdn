@@ -274,6 +274,25 @@ pub decdn_protocol::message::ProbeResponseBody::timestamp_us: u64
 pub const decdn_protocol::message::MAX_RATE_PER_MB: u64
 pub const decdn_protocol::message::SLASH_SIG_LEN: usize
 pub mod decdn_protocol::region
+pub struct decdn_protocol::region::InvalidRegion
+impl core::error::Error for decdn_protocol::region::InvalidRegion
+impl core::fmt::Display for decdn_protocol::region::InvalidRegion
+pub fn decdn_protocol::region::InvalidRegion::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct decdn_protocol::region::Region(_)
+impl decdn_protocol::region::Region
+pub fn decdn_protocol::region::Region::as_str(&self) -> &str
+pub fn decdn_protocol::region::Region::parse(&str) -> core::option::Option<Self>
+impl core::convert::AsRef<str> for decdn_protocol::region::Region
+pub fn decdn_protocol::region::Region::as_ref(&self) -> &str
+impl core::fmt::Display for decdn_protocol::region::Region
+pub fn decdn_protocol::region::Region::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::str::traits::FromStr for decdn_protocol::region::Region
+pub type decdn_protocol::region::Region::Err = decdn_protocol::region::InvalidRegion
+pub fn decdn_protocol::region::Region::from_str(&str) -> core::result::Result<Self, Self::Err>
+impl serde_core::ser::Serialize for decdn_protocol::region::Region
+pub fn decdn_protocol::region::Region::serialize<S: serde_core::ser::Serializer>(&self, S) -> core::result::Result<<S as serde_core::ser::Serializer>::Ok, <S as serde_core::ser::Serializer>::Error>
+impl<'de> serde_core::de::Deserialize<'de> for decdn_protocol::region::Region
+pub fn decdn_protocol::region::Region::deserialize<D: serde_core::de::Deserializer<'de>>(D) -> core::result::Result<Self, <D as serde_core::de::Deserializer>::Error>
 pub fn decdn_protocol::region::is_valid_region(&str) -> bool
 pub enum decdn_protocol::ClientMessage
 pub decdn_protocol::ClientMessage::ChunkData(decdn_protocol::client::ChunkData)
@@ -412,6 +431,10 @@ pub decdn_protocol::FindValueResponse::providers: alloc::vec::Vec<decdn_protocol
 pub struct decdn_protocol::GossipEnvelope
 pub decdn_protocol::GossipEnvelope::payload: decdn_protocol::gossip::GossipPayload
 pub decdn_protocol::GossipEnvelope::version: u8
+pub struct decdn_protocol::InvalidRegion
+impl core::error::Error for decdn_protocol::region::InvalidRegion
+impl core::fmt::Display for decdn_protocol::region::InvalidRegion
+pub fn decdn_protocol::region::InvalidRegion::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct decdn_protocol::NodeAnnounce
 pub decdn_protocol::NodeAnnounce::body: decdn_protocol::gossip::NodeAnnounceBody
 pub decdn_protocol::NodeAnnounce::signature: alloc::vec::Vec<u8>
@@ -444,6 +467,21 @@ pub decdn_protocol::ProbeResponseBody::has_blob: bool
 pub decdn_protocol::ProbeResponseBody::hash: [u8; 32]
 pub decdn_protocol::ProbeResponseBody::rate_per_mb: u64
 pub decdn_protocol::ProbeResponseBody::timestamp_us: u64
+pub struct decdn_protocol::Region(_)
+impl decdn_protocol::region::Region
+pub fn decdn_protocol::region::Region::as_str(&self) -> &str
+pub fn decdn_protocol::region::Region::parse(&str) -> core::option::Option<Self>
+impl core::convert::AsRef<str> for decdn_protocol::region::Region
+pub fn decdn_protocol::region::Region::as_ref(&self) -> &str
+impl core::fmt::Display for decdn_protocol::region::Region
+pub fn decdn_protocol::region::Region::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::str::traits::FromStr for decdn_protocol::region::Region
+pub type decdn_protocol::region::Region::Err = decdn_protocol::region::InvalidRegion
+pub fn decdn_protocol::region::Region::from_str(&str) -> core::result::Result<Self, Self::Err>
+impl serde_core::ser::Serialize for decdn_protocol::region::Region
+pub fn decdn_protocol::region::Region::serialize<S: serde_core::ser::Serializer>(&self, S) -> core::result::Result<<S as serde_core::ser::Serializer>::Ok, <S as serde_core::ser::Serializer>::Error>
+impl<'de> serde_core::de::Deserialize<'de> for decdn_protocol::region::Region
+pub fn decdn_protocol::region::Region::deserialize<D: serde_core::de::Deserializer<'de>>(D) -> core::result::Result<Self, <D as serde_core::de::Deserializer>::Error>
 pub struct decdn_protocol::ReportMetrics
 pub decdn_protocol::ReportMetrics::data_correct: core::option::Option<bool>
 pub decdn_protocol::ReportMetrics::delivery_speed: core::option::Option<u32>

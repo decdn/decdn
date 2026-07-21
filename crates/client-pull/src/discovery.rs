@@ -27,6 +27,7 @@ use alloy::providers::ProviderBuilder;
 use anyhow::Context;
 use decdn_common::redact::{sanitize_err_chain, sanitize_rpc_display};
 use decdn_incentive::capacity_bond::CapacityBond;
+use decdn_protocol::Region;
 use iroh::PublicKey;
 use serde::{Deserialize, Serialize};
 
@@ -67,7 +68,11 @@ const PEER_CACHE_FILE: &str = "peers.json";
 /// [`read_peer_cache`] decodes the tag through [`CacheVersion`] *before* the
 /// body — a whole-`PeerCache` decode would fail on the changed `peers` shape
 /// and never reach the check.
-const PEER_CACHE_VERSION: u32 = 1;
+///
+/// `2` since #1348 retyped `region_hint` from `String` to `Option<Region>`: a
+/// v1 file can hold a region string the validating `Region` deserializer now
+/// rejects, which would fail the whole-file decode rather than the one field.
+const PEER_CACHE_VERSION: u32 = 2;
 
 /// The outermost context on a failed bootstrap — the wording pinned by ADR 012
 /// § Bootstrap step 4. `decdn`'s error boundary renders `{err:#}`
@@ -101,10 +106,19 @@ pub struct NodeCandidate {
     /// (the channel is opened/reused against it and the `slash_sig` verified
     /// against it).
     pub eth_address: Address,
-    /// The node's self-attested region (ISO 3166-1 alpha-2, ADR 030), used for
-    /// locality-aware selection. Always a string from the registry — empty when
-    /// the node registered without one.
-    pub region_hint: String,
+    /// The node's self-attested region (ADR 030), used for locality-aware
+    /// selection. `None` when the node registered without one, or with a code
+    /// outside [`Region`]'s accepted set.
+    ///
+    /// An unrecognized code parses to `None` and sorts into the "rest" bucket
+    /// rather than dropping the candidate: `CapacityBond` permits any string up
+    /// to 16 bytes and ADR 030 § Cross-ADR Impact explicitly declines to
+    /// tighten it, so rejecting a node over a purely advisory field would be
+    /// stricter than the source of truth and would silently shrink the
+    /// fetchable set. Parsing at this boundary is what makes the derived `Eq`
+    /// above correct and keeps an unbounded operator-submitted string off the
+    /// peer-cache read path (#1348).
+    pub region_hint: Option<Region>,
 }
 
 /// Distill a registry `NodeInfo` into a [`NodeCandidate`], or `None` if it is
@@ -122,7 +136,10 @@ fn candidate_from(info: &CapacityBond::NodeInfo) -> Option<NodeCandidate> {
     Some(NodeCandidate {
         node_id,
         eth_address: info.ethAddress,
-        region_hint: info.regionHint.clone(),
+        // Normalize once, here — see `NodeCandidate::region_hint`. An
+        // unparseable hint costs the node its locality bonus, not its place in
+        // the candidate set.
+        region_hint: Region::parse(&info.regionHint),
     })
 }
 
@@ -593,21 +610,28 @@ pub const SELECT_K: usize = 5;
 pub const RTT_REUSE_TOLERANCE: f64 = 1.5;
 
 /// Order `candidates` for probing (decision 3): same-region candidates first
-/// (case-insensitive equality on `region_hint` — locality, not geo distance),
-/// then the rest, capped at `k`. When `client_region` is `None` the region-first
-/// ordering is skipped and the first `k` candidates are returned unreordered.
+/// (equality on `region_hint` — locality, not geo distance), then the rest,
+/// capped at `k`. When `client_region` is `None`, empty, or not an accepted
+/// region code the region-first ordering is skipped and the first `k`
+/// candidates are returned unreordered.
+///
+/// Both sides are [`Region`]s, so this is a plain equality: the trim +
+/// case-fold that used to run on every comparison moved into the parse
+/// boundary (#1348).
 #[must_use]
 pub fn select_candidates(
     mut candidates: Vec<NodeCandidate>,
     client_region: Option<&str>,
     k: usize,
 ) -> Vec<NodeCandidate> {
-    if let Some(region) = client_region.map(str::trim).filter(|r| !r.is_empty()) {
+    // `client_region` stays a `&str` at this signature: the caller's value comes
+    // from `ResolvedChain::region`, which `decdn-common` has already validated
+    // against the same allowlist. Re-parsing here costs nothing and keeps the
+    // public API from forcing every caller to convert.
+    if let Some(region) = client_region.and_then(Region::parse) {
         // Stable sort by a bool key: same-region (`false`) sorts before the rest
         // (`true`), and within each group the on-chain order is preserved.
-        // `region_hint` is trimmed too — on-chain data is operator-submitted and
-        // may carry stray whitespace.
-        candidates.sort_by_key(|c| !c.region_hint.trim().eq_ignore_ascii_case(region));
+        candidates.sort_by_key(|c| c.region_hint != Some(region));
     }
     candidates.truncate(k);
     candidates
@@ -756,14 +780,30 @@ mod tests {
         let key = iroh::SecretKey::from_bytes(&[9u8; 32]).public();
         let c = candidate_from(&node_info(*key.as_bytes(), true)).unwrap();
         assert_eq!(c.eth_address, Address::repeat_byte(0xab));
-        assert_eq!(c.region_hint, "US");
+        assert_eq!(c.region_hint, Region::parse("US"));
     }
 
+    /// An unrecognized on-chain hint must cost the node its locality bonus, not
+    /// its place in the candidate set — `CapacityBond` accepts any string up to
+    /// 16 bytes and ADR 030 declines to tighten it (#1348).
+    #[test]
+    fn an_unparseable_region_keeps_the_candidate_with_no_region() {
+        let key = iroh::SecretKey::from_bytes(&[9u8; 32]).public();
+        let mut info = node_info(*key.as_bytes(), true);
+        info.regionHint = "not-a-region".to_string();
+        let c = candidate_from(&info).unwrap();
+        assert_eq!(c.region_hint, None, "unparseable, not rejected");
+        assert_eq!(c.eth_address, Address::repeat_byte(0xab));
+    }
+
+    /// `region` is parsed, not stored raw, so a fixture written with stray case
+    /// or whitespace produces the SAME candidate as its canonical spelling.
+    /// That is the property the derived `Eq` depends on.
     fn candidate(seed: u8, region: &str) -> NodeCandidate {
         NodeCandidate {
             node_id: iroh::SecretKey::from_bytes(&[seed; 32]).public(),
             eth_address: Address::repeat_byte(seed),
-            region_hint: region.to_string(),
+            region_hint: Region::parse(region),
         }
     }
 
@@ -778,8 +818,8 @@ mod tests {
     #[test]
     fn select_puts_same_region_first_and_caps_at_k() {
         // Regions are on-chain self-attested ISO 3166-1 alpha-2 codes (ADR 030);
-        // seed 4 carries stray case + whitespace to exercise the trim +
-        // case-insensitive match.
+        // seed 4 carries stray case + whitespace, which `Region::parse`
+        // normalizes at the boundary so the comparison here is plain equality.
         let cands = vec![
             candidate(1, "DE"),
             candidate(2, "US"),
@@ -794,15 +834,43 @@ mod tests {
         assert_eq!(out[2].eth_address, Address::repeat_byte(1));
     }
 
+    /// The normalization now lives in the type, so ` us ` and `US` are the same
+    /// VALUE, not merely two things a comparison happens to fold together. This
+    /// is what makes the derived `Eq` on `NodeCandidate` correct — before
+    /// #1348 the same node under two spellings compared unequal, so any future
+    /// `dedup`/`contains`/`retain` over candidates would silently fail to
+    /// dedupe.
+    #[test]
+    fn candidates_differing_only_in_region_spelling_are_equal() {
+        assert_eq!(candidate(1, " us "), candidate(1, "US"));
+        assert_ne!(candidate(1, "US"), candidate(1, "DE"));
+        assert_ne!(
+            candidate(1, "US"),
+            candidate(1, "nonsense"),
+            "an unparseable hint is None, which is not the same as any region"
+        );
+    }
+
     #[test]
     fn select_without_region_preserves_order_and_caps() {
         let cands = vec![candidate(1, "DE"), candidate(2, "US")];
-        // Unknown region (None) and blank region both skip reordering.
-        for region in [None, Some("  ")] {
+        // No region, a blank one, and an unrecognized code all skip reordering
+        // rather than reordering against a value that means nothing.
+        for region in [None, Some("  "), Some("not-a-region")] {
             let out = select_candidates(cands.clone(), region, 5);
             assert_eq!(out[0].eth_address, Address::repeat_byte(1));
             assert_eq!(out[1].eth_address, Address::repeat_byte(2));
         }
+    }
+
+    /// A candidate whose hint did not parse sorts into the "rest" bucket — it
+    /// must never be treated as matching the client's region.
+    #[test]
+    fn select_never_promotes_an_unparseable_region() {
+        let cands = vec![candidate(1, "nonsense"), candidate(2, "US")];
+        let out = select_candidates(cands, Some("US"), 5);
+        assert_eq!(out[0].eth_address, Address::repeat_byte(2));
+        assert_eq!(out[1].eth_address, Address::repeat_byte(1));
     }
 
     #[test]
@@ -1073,8 +1141,17 @@ mod tests {
         });
         std::fs::write(peer_cache_path(dir.path()), body.to_string()).unwrap();
         let why = cache_rejection(dir.path()).unwrap();
-        assert!(why.contains("is version 2"), "{why}");
-        assert!(why.contains("reads version 1"), "{why}");
+        // Derived from the constant, not hardcoded: the point of the assertion
+        // is that both numbers reach the operator, and a bump must not silently
+        // turn it into a comparison of two stale literals.
+        assert!(
+            why.contains(&format!("is version {}", PEER_CACHE_VERSION + 1)),
+            "{why}"
+        );
+        assert!(
+            why.contains(&format!("reads version {PEER_CACHE_VERSION}")),
+            "{why}"
+        );
     }
 
     #[test]
@@ -1103,7 +1180,7 @@ mod tests {
         assert!(
             cache_rejection(dir.path())
                 .unwrap()
-                .contains("is version 2")
+                .contains(&format!("is version {}", PEER_CACHE_VERSION + 1))
         );
     }
 

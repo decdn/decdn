@@ -949,6 +949,8 @@ fn report(outcomes: &[EntryOutcome], output: &Path, json: bool) -> anyhow::Resul
     clippy::panic
 )]
 mod tests {
+    use decdn_protocol::Region;
+
     use super::*;
 
     #[tokio::test]
@@ -1088,12 +1090,12 @@ mod tests {
             NodeCandidate {
                 node_id: refusing,
                 eth_address: refusing_provider,
-                region_hint: "TR".to_string(),
+                region_hint: Region::parse("TR"),
             },
             NodeCandidate {
                 node_id: alternative,
                 eth_address: Address::repeat_byte(2),
-                region_hint: "TR".to_string(),
+                region_hint: Region::parse("TR"),
             },
         ];
 

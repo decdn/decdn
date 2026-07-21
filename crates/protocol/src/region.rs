@@ -17,6 +17,12 @@
 //!
 //! Case-sensitive — callers must uppercase first. The 2-char length is
 //! implicit in the match patterns; any other length is rejected.
+//!
+//! [`Region`] is the parsed form: trim + uppercase + this allowlist, done once
+//! at the boundary so consumers compare values rather than re-normalizing at
+//! every call site (#1348). Use it wherever a validated code is carried around;
+//! [`is_valid_region`] remains for callers that only need the predicate over a
+//! string they already own.
 
 /// True iff `code` is a region the network accepts. See module docs for the
 /// accepted set.
@@ -79,7 +85,130 @@ pub fn is_valid_region(code: &str) -> bool {
     )
 }
 
+/// A region code that has already passed [`is_valid_region`], stored in the
+/// normalized (uppercase, untrimmed-of-nothing) form.
+///
+/// The point of the type is that the normalization is done ONCE, at the parse
+/// boundary, instead of at every comparison site. A raw `String` carrying "an
+/// ISO 3166-1 alpha-2 code" by doc comment alone leaves each consumer to
+/// re-derive that: `client-pull`'s candidate ranking was trimming and
+/// case-folding on every comparison because one side came normalized from
+/// config and the other raw from the chain, and structural `Eq` on the
+/// containing type was wrong as a result — `" us "` and `"US"` compared
+/// unequal (#1348).
+///
+/// Two bytes, `Copy`, and bounded by construction — which also caps what an
+/// operator-submitted `regionHint` can cost on a deserialize path, where the
+/// on-chain source permits any string up to 16 bytes.
+///
+/// Serializes as the plain 2-character string, so persisted forms stay
+/// human-readable and a `Region` field is wire-compatible with the `String` it
+/// replaces in the serialize direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Region([u8; 2]);
+
+impl Region {
+    /// Parse `raw` into a `Region`, or `None` if it is not an accepted code.
+    ///
+    /// Surrounding whitespace is trimmed and the code is uppercased before the
+    /// allowlist check, because both sources this reads from are
+    /// operator-submitted: a config file and an on-chain `regionHint` the
+    /// contract does not constrain beyond a length cap.
+    ///
+    /// `None` rather than an error type: for the advisory uses (locality-aware
+    /// node ranking) an unrecognized code means "no locality information", not
+    /// "reject this node". Callers that need it to be fatal — config
+    /// resolution, gossip envelope validation — say so at their own layer.
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        let upper = raw.trim().to_ascii_uppercase();
+        if !is_valid_region(&upper) {
+            return None;
+        }
+        // `is_valid_region` matches only 2-byte ASCII patterns, so the array
+        // conversion cannot fail; `ok()?` keeps that fact local instead of
+        // asserting it (the workspace denies `expect`/`panic`).
+        let bytes: [u8; 2] = upper.as_bytes().try_into().ok()?;
+        Some(Self(bytes))
+    }
+
+    /// The normalized code.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        // Every byte came from `to_ascii_uppercase` over an allowlisted ASCII
+        // code, so this is always valid UTF-8.
+        core::str::from_utf8(&self.0).unwrap_or("")
+    }
+}
+
+impl AsRef<str> for Region {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl core::fmt::Display for Region {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Rejects with the same allowlist [`Region::parse`] applies. The error is a
+/// static `&str` so the invalid input is never echoed back — a region code
+/// reaches log fields and metric labels, and this type exists partly to keep
+/// unvalidated bytes out of them.
+impl core::str::FromStr for Region {
+    type Err = InvalidRegion;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse(s).ok_or(InvalidRegion)
+    }
+}
+
+/// [`Region`]'s [`FromStr`](core::str::FromStr) was given something outside
+/// the accepted set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidRegion;
+
+impl core::fmt::Display for InvalidRegion {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(
+            "not an accepted ISO 3166-1 alpha-2 region code \
+             (assigned, or user-reserved AA/QM-QZ/XA-XZ/ZZ)",
+        )
+    }
+}
+
+impl core::error::Error for InvalidRegion {}
+
+impl serde::Serialize for Region {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
+    }
+}
+
+/// Deserializing re-runs the allowlist, so the invariant holds for values that
+/// arrive from a file or the wire rather than through [`Region::parse`] — a
+/// derived impl over the byte array would let any two bytes in.
+///
+/// Deserializes an owned `String` rather than a borrowed `&str` so this works
+/// against non-borrowing formats too (a `serde_json` reader, postcard over a
+/// streamed buffer); the allocation is bounded by the caller's own input and
+/// dropped immediately.
+impl<'de> serde::Deserialize<'de> for Region {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(d)?;
+        Self::parse(&raw).ok_or_else(|| {
+            serde::de::Error::invalid_value(
+                serde::de::Unexpected::Str(&raw),
+                &"an ISO 3166-1 alpha-2 region code",
+            )
+        })
+    }
+}
+
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -121,5 +250,79 @@ mod tests {
         ] {
             assert!(!is_valid_region(code), "{code:?} should be rejected");
         }
+    }
+
+    // ---- `Region` (#1348) ----
+
+    /// The whole point of the type: normalization happens once, so two
+    /// spellings of the same region are the SAME value. Before this, the
+    /// containing type's derived `Eq` compared `" us "` and `"US"` unequal.
+    #[test]
+    fn parse_normalizes_case_and_whitespace_into_one_value() {
+        let canonical = Region::parse("US").expect("US is assigned");
+        for spelling in ["us", " US ", "\tuS\n", "Us"] {
+            assert_eq!(
+                Region::parse(spelling),
+                Some(canonical),
+                "{spelling:?} must normalize to the same value as \"US\""
+            );
+        }
+        assert_eq!(canonical.as_str(), "US");
+        assert_eq!(canonical.to_string(), "US");
+    }
+
+    /// Parsing is exactly as permissive as the predicate — no more (a code the
+    /// network rejects must not become a `Region`) and no less (the
+    /// user-reserved ranges are what private deployments run on).
+    #[test]
+    fn parse_agrees_with_is_valid_region() {
+        for code in ["US", "DE", "XK", "AA", "QZ", "ZZ"] {
+            assert!(Region::parse(code).is_some(), "{code} should parse");
+        }
+        for code in ["OO", "JJ", "", "U", "USA", "U/", "U\0", "Ü1", "12"] {
+            assert!(Region::parse(code).is_none(), "{code:?} should not parse");
+        }
+    }
+
+    /// `FromStr`'s error must not echo the rejected input back: a region code
+    /// lands in log fields and metric labels, and keeping unvalidated bytes out
+    /// of those is half of why the allowlist exists.
+    #[test]
+    fn from_str_error_does_not_echo_the_input() {
+        let err = "U\n/evil".parse::<Region>().expect_err("must reject");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("evil"),
+            "input leaked into the message: {msg}"
+        );
+        assert!(msg.contains("ISO 3166-1"), "{msg}");
+    }
+
+    /// Round-trips as the plain 2-character string, so persisted forms stay
+    /// readable and stay compatible with the `String` this replaced.
+    #[test]
+    fn serializes_as_a_plain_string() {
+        let region = Region::parse("DE").expect("DE is assigned");
+        let json = serde_json::to_string(&region).expect("serialize");
+        assert_eq!(json, "\"DE\"");
+        assert_eq!(
+            serde_json::from_str::<Region>(&json).expect("round-trip"),
+            region
+        );
+    }
+
+    /// The allowlist runs on the way IN as well. A derived impl over the byte
+    /// array would let a peer cache (or any other persisted form) reintroduce
+    /// an arbitrary two bytes past the parse boundary.
+    #[test]
+    fn deserialize_rejects_an_invalid_code() {
+        assert!(serde_json::from_str::<Region>("\"OO\"").is_err());
+        assert!(serde_json::from_str::<Region>("\"USA\"").is_err());
+        // Normalization applies here too, so a lowercased persisted value is
+        // read back as the canonical one rather than rejected.
+        assert_eq!(
+            serde_json::from_str::<Region>("\"de\"").expect("normalizes on the way in"),
+            Region::parse("DE").expect("DE is assigned")
+        );
     }
 }

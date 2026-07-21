@@ -366,8 +366,8 @@ pub(crate) async fn probe_and_rank(
                 // §"Ranking key is measured RTT only" forbids region from
                 // influencing warming, and `region_hint` is only ever read by
                 // `select_candidates`' pre-probe shortlist and operator logging.
-                // Leaving it empty keeps a spoofed region from riding along.
-                region_hint: String::new(),
+                // Leaving it unset keeps a spoofed region from riding along.
+                region_hint: None,
             });
         }
     }
