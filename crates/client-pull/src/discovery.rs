@@ -194,30 +194,51 @@ fn read_peer_cache(data_dir: &Path) -> Option<Vec<NodeCandidate>> {
             );
         })
         .ok()?;
-    if cache.version != PEER_CACHE_VERSION || cache.peers.is_empty() {
+    if cache.version != PEER_CACHE_VERSION {
+        tracing::warn!(
+            path = %path.display(),
+            found = cache.version,
+            expected = PEER_CACHE_VERSION,
+            "peer cache version mismatch; ignoring it"
+        );
+        return None;
+    }
+    if cache.peers.is_empty() {
         return None;
     }
     Some(cache.peers)
 }
 
 /// Persist `peers` to the peer cache, creating `data_dir` if needed. Written to
-/// a sibling temp file and renamed so a crash mid-write cannot truncate a
-/// previously good cache.
+/// a uniquely-named sibling temp file, fsynced, and renamed, so neither a crash
+/// mid-write nor a second `decdn` process writing the same data dir can leave a
+/// truncated or interleaved cache in place.
 ///
 /// # Errors
 ///
-/// Fails if the data dir cannot be created or the write/rename fails.
+/// Fails if the data dir cannot be created or the write/sync/rename fails.
 fn write_peer_cache(data_dir: &Path, peers: &[NodeCandidate]) -> anyhow::Result<()> {
+    use std::io::Write as _;
+
     let path = peer_cache_path(data_dir);
-    let tmp = path.with_extension("json.tmp");
     let body = serde_json::to_vec_pretty(&PeerCache {
         version: PEER_CACHE_VERSION,
         peers: peers.to_vec(),
     })?;
     std::fs::create_dir_all(data_dir)
         .with_context(|| format!("creating client data dir {}", data_dir.display()))?;
-    std::fs::write(&tmp, &body).with_context(|| format!("writing {}", tmp.display()))?;
-    std::fs::rename(&tmp, &path).with_context(|| format!("renaming into {}", path.display()))
+    // Same dir as the target so `persist` is a rename, not a cross-device copy.
+    let mut tmp = tempfile::NamedTempFile::new_in(data_dir)
+        .with_context(|| format!("creating a temp file in {}", data_dir.display()))?;
+    tmp.write_all(&body)
+        .with_context(|| format!("writing {}", tmp.path().display()))?;
+    tmp.as_file()
+        .sync_all()
+        .with_context(|| format!("syncing {}", tmp.path().display()))?;
+    tmp.persist(&path)
+        .map_err(|e| e.error)
+        .with_context(|| format!("renaming into {}", path.display()))?;
+    Ok(())
 }
 
 /// Turn a registry read outcome into the bootstrap peer set (ADR 012
@@ -479,6 +500,28 @@ mod tests {
         let peers = vec![candidate(1, "DE"), candidate(2, "US")];
         write_peer_cache(dir.path(), &peers).unwrap();
         assert_eq!(read_peer_cache(dir.path()), Some(peers));
+    }
+
+    #[test]
+    fn a_cache_of_an_unknown_version_reads_as_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = serde_json::json!({
+            "version": PEER_CACHE_VERSION + 1,
+            "peers": [candidate(1, "DE")],
+        });
+        std::fs::write(peer_cache_path(dir.path()), body.to_string()).unwrap();
+        assert!(read_peer_cache(dir.path()).is_none());
+    }
+
+    #[test]
+    fn writing_the_cache_leaves_no_temp_file_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        write_peer_cache(dir.path(), &[candidate(6, "US")]).unwrap();
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from(PEER_CACHE_FILE)]);
     }
 
     #[test]

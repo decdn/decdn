@@ -36,12 +36,13 @@ iroh = { workspace = true }
 # Peer-cache (`peers.json`) persistence for the ADR 012 bootstrap fallback.
 serde = { workspace = true }
 serde_json = { workspace = true }
+# Unique temp names for the peer cache's write-and-rename: two `decdn` processes
+# can share a client data dir, and a fixed `peers.json.tmp` would let them
+# interleave into one file and rename the tear into place. Also used by
+# `endpoint`'s relay-resolution tests for throwaway TOML config files.
+tempfile = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
-
-[dev-dependencies]
-# `endpoint`'s relay-resolution tests write throwaway TOML config files.
-tempfile = { workspace = true }
 
 [lints]
 workspace = true
