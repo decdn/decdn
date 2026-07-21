@@ -74,7 +74,7 @@ use decdn_cache::CacheEngine;
 use decdn_common::config::ResolvedSecurity;
 use decdn_gossip::{
     AnnounceGate, AnnounceReject, GossipRuntimeConfig, GossipService, OwnedAnnounceGate, PeerTable,
-    ReportGate, ReputationReject, ReputationWiring, StakedNodeSet, ValidatedReport, build_gossip,
+    ReputationReject, ReputationWiring, StakedNodeSet, ValidatedReport, build_gossip,
     metrics::NoopMetrics,
 };
 use decdn_node::dispatch::ConnectionLimiter;
@@ -200,8 +200,12 @@ async fn spawn_reputation_node(
             subscribe_global: false,
             region: None,
             subscribe_reputation: true,
-            // Long enough that only the explicit trigger publishes, so a round
-            // of the poll loop below maps to exactly one broadcast.
+            // Long enough that the periodic tick never fires mid-test, leaving
+            // the explicit trigger as the only publish driver. NOT "one
+            // broadcast per poll round": `tokio::time::interval` fires its first
+            // tick immediately, so there is a publish at spawn regardless, and
+            // the trigger is a `Notify::notify_one`, which coalesces. The loop
+            // below therefore polls for a condition rather than counting.
             reputation_publish_interval_sec: 3600,
         },
         Arc::new(RwLock::new(PeerTable::new(60_000_000, 128))),
@@ -217,21 +221,38 @@ async fn spawn_reputation_node(
 
 /// Drain that yields one observation for a fixed provider on every drain, so
 /// each publish trigger emits exactly one signed report.
-#[derive(Debug)]
+///
+/// `delivery_speed` increments per drain, and that is load-bearing rather than
+/// cosmetic: iroh-gossip's plumtree dedups by `blake3(content)` and remembers
+/// ids for 90s. The publisher stamps `timestamp_secs` at one-second granularity
+/// and Ed25519 + postcard are both deterministic, so a *constant* payload would
+/// make every publish within the same wall-clock second byte-identical — the
+/// receiver would `Prune` the duplicates and the poll loop's 50 rounds would
+/// collapse to ~6 real delivery attempts. Varying the payload keeps each round a
+/// distinct message id, so the retry budget is the one the loop advertises.
+#[derive(Debug, Default)]
 struct OneReportDrain {
     provider: [u8; 32],
+    seq: AtomicU64,
 }
 impl OneReportDrain {
     const fn new(provider: [u8; 32]) -> Self {
-        Self { provider }
+        Self {
+            provider,
+            seq: AtomicU64::new(0),
+        }
     }
 }
 impl decdn_gossip::ReportDrain for OneReportDrain {
     fn drain(&self) -> Vec<([u8; 32], ReportMetrics)> {
+        // Truncation into the u32 the field holds is fine: only distinctness
+        // across the test's ~50 rounds matters, not the value.
+        #[allow(clippy::cast_possible_truncation)]
+        let nth = self.seq.fetch_add(1, Ordering::Relaxed) as u32;
         vec![(
             self.provider,
             ReportMetrics {
-                delivery_speed: Some(1_000_000),
+                delivery_speed: Some(1_000_000 + nth),
                 uptime_observed: Some(true),
                 data_correct: Some(true),
             },
@@ -798,10 +819,10 @@ async fn reputation_reports_are_gated_on_staked_reporters_at_the_subscriber() ->
         a_gossip.clone(),
         Arc::new(NoopMetrics),
         shutdown.clone(),
-        ReputationWiring {
-            sink: Some(Arc::new(CollectingSink::default())),
-            report_gate: ReportGate::Enforce(Arc::new(AllStaked)),
-            report_drain: Some(Arc::new(OneReportDrain::new(provider_id))),
+        ReputationWiring::Enabled {
+            sink: Arc::new(CollectingSink::default()),
+            staked: Arc::new(AllStaked),
+            publish: Some(Arc::new(OneReportDrain::new(provider_id))),
         },
     )
     .await;
@@ -814,10 +835,10 @@ async fn reputation_reports_are_gated_on_staked_reporters_at_the_subscriber() ->
         b_gossip.clone(),
         Arc::new(NoopMetrics),
         shutdown.clone(),
-        ReputationWiring {
-            sink: Some(b_sink.clone()),
-            report_gate: ReportGate::Enforce(Arc::new(AllStaked)),
-            report_drain: None,
+        ReputationWiring::Enabled {
+            sink: b_sink.clone(),
+            staked: Arc::new(AllStaked),
+            publish: None,
         },
     )
     .await;
@@ -832,10 +853,10 @@ async fn reputation_reports_are_gated_on_staked_reporters_at_the_subscriber() ->
         c_gossip.clone(),
         c_metrics.clone(),
         shutdown.clone(),
-        ReputationWiring {
-            sink: Some(c_sink.clone()),
-            report_gate: ReportGate::Enforce(Arc::new(NoneStaked)),
-            report_drain: None,
+        ReputationWiring::Enabled {
+            sink: c_sink.clone(),
+            staked: Arc::new(NoneStaked),
+            publish: None,
         },
     )
     .await;
@@ -895,6 +916,11 @@ async fn reputation_reports_are_gated_on_staked_reporters_at_the_subscriber() ->
     // C's reject is attributable to the gate rather than to a report that never
     // arrived: B admitting the same broadcast proves A actually published, and
     // the counter only counts `NotStakedReporter`.
+    //
+    // B's sink holds exactly one report no matter how many rounds ran: ADR 008's
+    // receiver-side rate limiter caps the (reporter, provider) pair at one admit
+    // per hour, so later rounds are dropped after validation. That is what makes
+    // `.first()` the whole story — do not read `len()` here as a publish count.
     let admitted_reports = b_sink.reports();
     let report = admitted_reports
         .first()
@@ -906,6 +932,19 @@ async fn reputation_reports_are_gated_on_staked_reporters_at_the_subscriber() ->
     assert_eq!(
         report.provider, provider_id,
         "the admitted report must name the rated provider"
+    );
+    // Payload fidelity end-to-end: `NodeReputationSink` folds exactly these
+    // fields into the score, so a publisher or validator bug that zeroed,
+    // dropped or transposed them would otherwise survive green. `delivery_speed`
+    // is range-checked rather than pinned because the drain varies it per round.
+    assert_eq!(report.uptime_observed, Some(true));
+    assert_eq!(report.data_correct, Some(true));
+    assert!(
+        report
+            .delivery_speed
+            .is_some_and(|s| (1_000_000..1_000_100).contains(&s)),
+        "delivery_speed must survive the round trip, got {:?}",
+        report.delivery_speed
     );
     assert!(
         c_sink.reports().is_empty(),

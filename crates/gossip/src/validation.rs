@@ -21,12 +21,14 @@ use crate::reputation::StakedNodeSet;
 /// [`validate_envelope`] path, `Arc<dyn StakedNodeSet>` on the owned spawn path
 /// (see [`OwnedAnnounceGate`]).
 ///
-/// **Do not confuse with [`crate::ReportGate`], whose `Disabled` means the
-/// opposite.** That is the sibling admission gate for reputation reports over
-/// the same [`StakedNodeSet`] seam: its `Disabled` is fail-**CLOSED**, while
-/// `AnnounceGate::Disabled` here is fail-**OPEN**. See [`crate::ReportGate`]
-/// for what each polarity does; distinct types keep the inversion from being
-/// copy-pasted wrong-way-round (#1338).
+/// **This is the only gate of its shape, and its `Disabled` fails OPEN.** There
+/// used to be a `ReportGate` twin over the same [`StakedNodeSet`] seam whose
+/// `Disabled` meant the *opposite* (fail-CLOSED); #1338 gave them distinct types
+/// so the inversion could not be copy-pasted wrong-way-round, and #1342 removed
+/// the hazard at the root by folding that twin into
+/// [`crate::ReputationWiring`]'s variants. Nothing of this shape is fail-closed
+/// any more — so read `Disabled` here as "permissive", without checking which
+/// gate you are looking at.
 // `Copy` is conditional: it applies only where `S: Copy`, i.e. the borrowed
 // `AnnounceGate<&dyn StakedNodeSet>`. The owned `OwnedAnnounceGate` (an `Arc`)
 // is `Clone`-only, so `gate.clone()` at each subscriber is a refcount bump, not
@@ -38,11 +40,13 @@ pub enum AnnounceGate<S> {
     /// `Enforce` set with no members rejects every announce, which is correct:
     /// an empty active registry has no staked peers to learn.
     Enforce(S),
-    /// FAIL-OPEN: skip the staked-membership check *only* — every other
-    /// [`validate_envelope`] rule (version byte, trailing bytes, payload
-    /// variant, region allowlist, clock skew) still applies. Tests only — no
-    /// production path constructs this (the runtime always [`Self::Enforce`]s;
-    /// `announce_staked_gate` in the `node` crate is the unit-tested guarantee).
+    /// FAIL-OPEN: skip the staked-membership check *only*. Every other
+    /// [`validate_envelope`] rule still applies — **signature verification
+    /// included**, since it runs before this gate is consulted — as do the
+    /// version byte, trailing bytes, payload variant, region allowlist and
+    /// clock skew. Tests only: no production path constructs this (the runtime
+    /// always [`Self::Enforce`]s; `announce_staked_gate` in the `node` crate is
+    /// the unit-tested guarantee).
     Disabled,
 }
 
@@ -198,9 +202,10 @@ const _: () = assert!(
 /// only when its author `node_id` is a currently-staked node in the on-chain
 /// registry (queried through the live [`StakedNodeSet`] cache, kept fresh by the
 /// registry event tail). [`AnnounceGate::Disabled`] skips *that check alone* —
-/// every other rule below still applies — and exists only for tests; the runtime
-/// always passes `Enforce` (there is no production path that disables the gate).
-/// See [`AnnounceGate::Enforce`] for the empty-set semantics.
+/// every other rule below still applies, signature verification included (it
+/// runs first) — and exists only for tests; the runtime always passes `Enforce`
+/// (there is no production path that disables the gate). See
+/// [`AnnounceGate::Enforce`] for the empty-set semantics.
 pub fn validate_envelope(
     bytes: &[u8],
     now_us: u64,

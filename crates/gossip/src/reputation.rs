@@ -11,7 +11,6 @@
 //! crate stays a leaf with respect to the scoring engine.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
 
 use decdn_protocol::{GOSSIP_VERSION, GossipEnvelope, GossipPayload, ReportMetrics, SIGNATURE_LEN};
 use thiserror::Error;
@@ -67,63 +66,15 @@ pub trait StakedNodeSet: Send + Sync + 'static {
     fn contains(&self, node_id: &[u8; 32]) -> bool;
 }
 
-/// ADR 008 §Gossip Protocol admission gate for inbound reputation reports,
-/// naming its two states so neither is the silent default: [`Self::Enforce`]
-/// gates on staked-reporter membership, [`Self::Disabled`] runs no reputation
-/// gossip at all. Carried by [`crate::ReputationWiring`] and resolved once at
-/// [`crate::GossipService::spawn`]: `Enforce` hands its set to the subscriber
-/// task, `Disabled` skips the topic entirely.
-///
-/// **Polarity is the inverse of [`crate::AnnounceGate`]'s, deliberately.**
-/// `ReportGate::Disabled` is fail-**CLOSED**: the reputation topic is not
-/// joined, so no report is ever admitted. `AnnounceGate::Disabled` is
-/// fail-**OPEN**: it skips the staked-membership check (all other announce
-/// validation still applies), and it exists for tests only. Keeping the two
-/// polarities in separate types is what stops one being read — or copy-pasted —
-/// as the other (#1338).
-///
-/// **The shape difference versus `AnnounceGate<S>` is deliberate too** (#1342):
-/// that sibling is generic over the membership handle because it has a borrowed
-/// form — [`crate::validate_envelope`] takes an `AnnounceGate<&dyn
-/// StakedNodeSet>`, so its conditional-`Copy` caveat is load-bearing. The
-/// reputation path has no counterpart: [`validate_reputation_envelope`] takes a
-/// bare `&dyn StakedNodeSet`, and the gate is resolved at spawn rather than
-/// re-checked per message. A concrete type here signals that the two are *not*
-/// interchangeable — do not "restore parity" by re-adding the generic.
-#[derive(Default)]
-pub enum ReportGate {
-    /// Enforce ADR 008 staked-reporter admission: accept a report only when its
-    /// signing `reporter` is a currently-staked node in this set. An `Enforce`
-    /// set with no members rejects every report — correct, since an empty
-    /// active registry has no staked reporters to trust.
-    Enforce(Arc<dyn StakedNodeSet>),
-    /// FAIL-CLOSED: reputation gossip is not wired. The subscriber and
-    /// publisher tasks are not spawned and the `cdn/reputation/v1` topic is not
-    /// joined, so no report is admitted or emitted. This is the [`Default`], so
-    /// an unwired [`crate::ReputationWiring`] runs no reputation gossip.
-    #[default]
-    Disabled,
-}
-
-impl ReportGate {
-    /// Whether this gate enforces staked-reporter admission, i.e. is
-    /// [`Self::Enforce`] rather than the fail-CLOSED [`Self::Disabled`]. Lets a
-    /// caller report the gate's safety state without consuming the gate.
-    pub const fn is_enforcing(&self) -> bool {
-        matches!(self, Self::Enforce(_))
-    }
-}
-
-impl std::fmt::Debug for ReportGate {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // The `StakedNodeSet` handle isn't `Debug`; report the variant only,
-        // which is all that identifies the gate's safety state.
-        match self {
-            Self::Enforce(_) => f.write_str("ReportGate::Enforce(..)"),
-            Self::Disabled => f.write_str("ReportGate::Disabled"),
-        }
-    }
-}
+// The ADR 008 staked-reporter admission gate used to live here as its own
+// `ReportGate` enum, mirroring `AnnounceGate`'s shape. It was folded into
+// `ReputationWiring::Enabled` in #1342: its `Enforce` payload is that variant's
+// `staked` field and its `Disabled` is `ReputationWiring::Disabled`, so the
+// "admission set without a sink" state stopped being representable rather than
+// being warned about at runtime. Note the polarity inversion that made two
+// same-shaped gates hazardous in the first place (#1338) is gone with it —
+// `AnnounceGate::Disabled` fails OPEN, and there is no longer a fail-CLOSED
+// twin of the same shape to confuse it with.
 
 /// Source of pending outbound reports for the publisher (ADR 008 §Gossip
 /// Protocol). Implemented in `decdn-node` over the observation buffer. Returns

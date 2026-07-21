@@ -1863,23 +1863,28 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
         .context("local reputation config invalid")?,
     );
     let observation_buffer = Arc::new(decdn_reputation::ObservationBuffer::new());
-    let reputation_wiring = decdn_gossip::ReputationWiring {
-        sink: Some(Arc::new(crate::reputation_wiring::NodeReputationSink::new(
+    // ADR 008: the runtime always admits reporters against the live staker set,
+    // so it always builds `Enabled` — `Disabled` exists for tests and for
+    // callers that genuinely run no reputation gossip. Whether the topic is
+    // joined at all remains `gossip.subscribe_reputation`'s call, checked in
+    // `GossipService::spawn`.
+    let reputation_wiring = decdn_gossip::ReputationWiring::Enabled {
+        sink: Arc::new(crate::reputation_wiring::NodeReputationSink::new(
             Arc::clone(&network_reputation),
             Arc::clone(&regional_coverage),
             Arc::clone(&settlement_source),
             Arc::clone(&ch.peer_table),
             Arc::clone(&ch.staker_set),
             min_counterparties,
-        ))),
-        report_gate: crate::reputation_wiring::report_staked_gate(Arc::clone(&ch.staker_set)),
+        )),
+        staked: crate::reputation_wiring::report_staked_set(Arc::clone(&ch.staker_set)),
         // Outbound report capture (#831): the `NodeOrigin` pull path feeds
         // `observation_buffer` with delivery/probe outcomes, so wire the drain —
         // which spawns the gossip publisher — whenever pull-through is enabled.
-        // With the feature off nothing writes the buffer, so we leave the drain
-        // `None` and the publisher unspawned (the node still aggregates inbound
+        // With the feature off nothing writes the buffer, so we leave it `None`
+        // and the publisher unspawned (the node still aggregates inbound
         // reports), exactly as before #831.
-        report_drain: cfg.cache.node_to_node_pull_through_enabled.then(|| {
+        publish: cfg.cache.node_to_node_pull_through_enabled.then(|| {
             Arc::new(crate::reputation_wiring::NodeReportDrain::new(Arc::clone(
                 &observation_buffer,
             ))) as Arc<dyn decdn_gossip::ReportDrain>

@@ -4,11 +4,11 @@
 //! The leaf crates define trait seams; this module implements them over the
 //! node's concrete subsystems:
 //!
-//! - the crate-private `NodeStakedNodeSet` gates inbound `NodeAnnounce` and
-//!   reputation-report admission to staked nodes via the chain [`StakerSet`];
-//!   it is reachable only through [`announce_staked_gate`] /
-//!   [`report_staked_gate`], which is what makes those the single seam where
-//!   the runtime's fail-open/fail-closed choice is made.
+//! - the crate-private `NodeStakedNodeSet` adapts the chain [`StakerSet`] to
+//!   the gossip membership seam, gating inbound `NodeAnnounce` and
+//!   reputation-report admission to staked nodes. Outside this module it is
+//!   reached through [`announce_staked_gate`] / [`report_staked_set`] (the
+//!   struct's own tests construct it directly).
 //! - [`NodeSettlementSource`] supplies reporter-credibility settlement history.
 //! - [`NodeReputationSink`] folds validated reports into the network score and
 //!   the regional-coverage map.
@@ -37,8 +37,8 @@ use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use decdn_gossip::{
-    AnnounceGate, OwnedAnnounceGate, PeerTable, ReportDrain, ReportGate, ReputationSink,
-    StakedNodeSet, ValidatedReport,
+    AnnounceGate, OwnedAnnounceGate, PeerTable, ReportDrain, ReputationSink, StakedNodeSet,
+    ValidatedReport,
 };
 use decdn_protocol::{NodeId as ProtocolNodeId, ReportMetrics};
 use decdn_reputation::{
@@ -61,12 +61,17 @@ fn now_secs() -> u64 {
 /// currently-staked nodes may announce (ADR 001 rule 2) or submit reputation
 /// reports (ADR 008 §Gossip Protocol).
 ///
-/// `pub(crate)` deliberately (#1345): the two gate constructors below are "the
-/// unit-tested guarantee" that the runtime never fails open (announce) or
-/// silently closed (report), and that claim only holds while wrapping this set
-/// in a gate is the *only* way to reach it. A `pub` raw seam would let a caller
-/// outside the crate rebuild the un-gated path the constructors exist to
-/// prevent.
+/// `pub(crate)` because nothing outside this crate needs the raw adapter; the
+/// constructors below are the only intended entry points (#1345).
+///
+/// Note what this does *not* buy: it is not what keeps the runtime from failing
+/// open. Exporting this type would create no un-gated path — the only thing an
+/// external caller could build with it is the very same
+/// `AnnounceGate::Enforce(Arc::new(NodeStakedNodeSet::new(s)))` that
+/// [`announce_staked_gate`] returns. The genuinely un-gated seam is
+/// `AnnounceGate::Disabled`, a `pub` variant in `decdn-gossip` that anyone can
+/// construct, and narrowing this struct does not touch it (see #1345's
+/// follow-up).
 #[derive(Debug)]
 pub(crate) struct NodeStakedNodeSet {
     staker_set: Arc<dyn StakerSet>,
@@ -102,18 +107,18 @@ pub fn announce_staked_gate(staker_set: Arc<dyn StakerSet>) -> OwnedAnnounceGate
     AnnounceGate::Enforce(Arc::new(NodeStakedNodeSet::new(staker_set)))
 }
 
-/// Build the reputation-report admission gate carried in
-/// [`decdn_gossip::ReputationWiring`]. ADR 008 §Gossip Protocol: the runtime
-/// always enforces reporter membership against the live staker set, so this
-/// returns [`ReportGate::Enforce`].
+/// Build the ADR 008 §Gossip Protocol staked-reporter admission set for
+/// [`decdn_gossip::ReputationWiring::Enabled`]'s `staked` field. The runtime
+/// always admits against the live staker set, never a fixed or empty one.
 ///
-/// Note the polarity inversion versus [`announce_staked_gate`]: leaving *this*
-/// gate [`ReportGate::Disabled`] fails **closed**, whereas an
-/// [`AnnounceGate::Disabled`] would fail **open** — see [`ReportGate`] for what
-/// each does. Both are named constructors so the runtime's choice is explicit
-/// and unit-testable at the seam it is made (#1338).
-pub fn report_staked_gate(staker_set: Arc<dyn StakerSet>) -> ReportGate {
-    ReportGate::Enforce(Arc::new(NodeStakedNodeSet::new(staker_set)))
+/// Named and unit-tested for the same reason as [`announce_staked_gate`]: the
+/// membership source is the whole security property, and a refactor that swapped
+/// it for a permissive set would otherwise be invisible. Since #1342 the
+/// *whether* — reputation gossip on or off — is carried by the
+/// `ReputationWiring` variant rather than by a second gate enum, so this
+/// constructor answers only *against what*.
+pub fn report_staked_set(staker_set: Arc<dyn StakerSet>) -> Arc<dyn StakedNodeSet> {
+    Arc::new(NodeStakedNodeSet::new(staker_set))
 }
 
 /// One settlement attributed to a reporter, stored with its absolute
@@ -482,24 +487,22 @@ mod tests {
         );
     }
 
-    /// #1338 — the reputation-report gate constructor's mirror of the announce
-    /// test: the runtime enforces ADR 008 reporter membership against the live
-    /// staker set, so it returns [`ReportGate::Enforce`] over the real set.
-    /// Unlike the announce gate, `Disabled` here would fail *closed* (silently
-    /// no reputation gossip) — equally a regression, and equally invisible
-    /// outside the anvil e2e without this test.
+    /// #1338 — the reputation-report set constructor's mirror of the announce
+    /// test: the runtime admits ADR 008 reporters against the *live* staker set.
+    /// Since #1342 the on/off decision is the `ReputationWiring` variant, so
+    /// what is left to pin here is the membership source — a constructor
+    /// returning a permissive or empty set would be just as much a regression
+    /// and just as invisible outside the anvil e2e.
     #[test]
-    fn report_staked_gate_enforces_over_the_live_set() {
+    fn report_staked_set_tracks_the_live_set() {
         let member = pk();
-        let ReportGate::Enforce(gate) = report_staked_gate(staker_set_with(member)) else {
-            panic!("report gate must enforce, never be left Disabled");
-        };
+        let set = report_staked_set(staker_set_with(member));
         assert!(
-            gate.contains(member.as_bytes()),
+            set.contains(member.as_bytes()),
             "staked reporter must be admitted"
         );
         assert!(
-            !gate.contains(pk().as_bytes()),
+            !set.contains(pk().as_bytes()),
             "non-member reporter must be rejected"
         );
     }

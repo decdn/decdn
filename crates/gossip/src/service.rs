@@ -20,8 +20,8 @@ use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
 
 use crate::reputation::{
-    MAX_REPORTS_PER_REPORTER_PER_HR, ReportDrain, ReportGate, ReputationRateLimiter,
-    ReputationSink, StakedNodeSet, validate_reputation_envelope,
+    MAX_REPORTS_PER_REPORTER_PER_HR, ReportDrain, ReputationRateLimiter, ReputationSink,
+    StakedNodeSet, validate_reputation_envelope,
 };
 use crate::{
     AnnounceReject, GossipMetrics, InsertOutcome, OwnedAnnounceGate, PeerTable, validate_envelope,
@@ -200,12 +200,11 @@ pub struct GossipHandles {
     /// publisher task wasn't spawned (region-less subscribe-only mode).
     pub announce_trigger: Option<Arc<AnnounceTrigger>>,
     /// Immediate-publish trigger for the reputation publisher. `None` when that
-    /// task wasn't spawned. The private `spawn_reputation_tasks` is the
-    /// authority on the conditions — currently an unset `subscribe_reputation`,
-    /// a [`ReportGate::Disabled`] gate, a missing sink or report drain, or a
-    /// failed topic subscribe. Stated as a pointer rather than an exhaustive
-    /// list on purpose (#1343): the causes live in that function and the last
-    /// enumeration here silently went stale when one was added there.
+    /// task wasn't spawned; the private `spawn_reputation_tasks` is the
+    /// authority on when that happens. Deliberately not enumerated here (#1343):
+    /// the conditions live in that function while this doc lives on the struct,
+    /// and the previous "iff" list here silently went stale — it named two
+    /// causes when there were five.
     pub reputation_publish_trigger: Option<Arc<ReputationPublishTrigger>>,
 }
 
@@ -225,8 +224,8 @@ impl GossipService {
     /// passes [`AnnounceGate::Enforce`](crate::AnnounceGate::Enforce) over the
     /// live registry set; [`AnnounceGate::Disabled`](crate::AnnounceGate::Disabled)
     /// (skip the staked-membership check alone, leaving the rest of
-    /// [`validate_envelope`] intact) is for tests only — there is no production
-    /// path that disables the gate.
+    /// [`validate_envelope`] — signatures included — intact) is for tests only:
+    /// there is no production path that disables the gate.
     #[allow(
         clippy::too_many_arguments,
         clippy::needless_pass_by_value,
@@ -370,33 +369,56 @@ impl GossipService {
     }
 }
 
-/// Optional reputation-topic wiring handed to [`GossipService::spawn`]. The
-/// [`Default`] is fully unwired — no sink, a [`ReportGate::Disabled`] gate, no
-/// drain — and runs no reputation gossip. The subscriber needs both `sink` and
-/// a [`ReportGate::Enforce`] gate to run; the publisher needs `report_drain`
-/// *on top of* those, since it is spawned on the same enforcing branch — a
-/// `Disabled` gate suppresses both halves, not just the subscriber.
+/// Reputation-topic wiring handed to [`GossipService::spawn`], as a sum type so
+/// that the only representable states are the meaningful ones (#1342).
+///
+/// The admission set and the sink it feeds are *one* decision, not two: an
+/// admission set with nowhere to put what it admits is meaningless, and a sink
+/// with no admission set would consume unvetted reports. Carrying them as
+/// separate optional fields made 4 of the 8 field combinations nonsense and
+/// pushed the check to runtime — this shape makes them unrepresentable instead,
+/// which is what #1344 previously needed a test to approximate.
+///
+/// **[`Self::Disabled`] is fail-CLOSED, and is the [`Default`]** — the inverse
+/// of [`crate::AnnounceGate`]'s fail-OPEN `Disabled`, and the reason this type
+/// can afford a `Default` at all: the derivable pole is the safe one. (An
+/// `AnnounceGate` `Default` would have to pick its *unsafe* pole, since
+/// `Enforce` carries a payload — which is why it correctly has none.)
 #[derive(Default)]
-pub struct ReputationWiring {
-    /// Consumer of validated inbound reports (the aggregator).
-    pub sink: Option<Arc<dyn ReputationSink>>,
-    /// `Disabled` is fail-CLOSED — the inverse of [`crate::AnnounceGate`]'s
-    /// `Disabled`; see [`ReportGate`] for why the two are distinct types.
-    pub report_gate: ReportGate,
-    /// Source of pending outbound reports for the publisher.
-    pub report_drain: Option<Arc<dyn ReportDrain>>,
+pub enum ReputationWiring {
+    /// FAIL-CLOSED: the `cdn/reputation/v1` topic is not joined, so no report is
+    /// admitted or emitted. Neither subscriber nor publisher is spawned.
+    #[default]
+    Disabled,
+    /// Reputation gossip is on. Both fields are required together, which is the
+    /// invariant this variant exists to hold.
+    Enabled {
+        /// Consumer of validated inbound reports (the aggregator).
+        sink: Arc<dyn ReputationSink>,
+        /// ADR 008 §Gossip Protocol staked-reporter admission set: a report is
+        /// accepted only when its signing `reporter` is a member. An empty set
+        /// rejects every report — correct, since an empty active registry has
+        /// no staked reporters to trust. `decdn-node` builds this via
+        /// `report_staked_gate` over the live registry.
+        staked: Arc<dyn StakedNodeSet>,
+        /// `Some` additionally spawns the publisher; `None` is subscribe-only.
+        /// Independent of admission, so it stays an `Option`.
+        publish: Option<Arc<dyn ReportDrain>>,
+    },
 }
 
 impl std::fmt::Debug for ReputationWiring {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // The trait-object fields don't implement Debug; report presence only.
-        // The gate reports its variant (`ReportGate`'s own hand-written Debug),
-        // which is what identifies its safety state.
-        f.debug_struct("ReputationWiring")
-            .field("sink", &self.sink.is_some())
-            .field("report_gate", &self.report_gate)
-            .field("report_drain", &self.report_drain.is_some())
-            .finish()
+        // The trait-object payloads aren't `Debug`; report the variant and the
+        // one genuinely independent choice, which is all that identifies the
+        // safety state and the publish topology.
+        match self {
+            Self::Disabled => f.write_str("ReputationWiring::Disabled"),
+            Self::Enabled { publish, .. } => f
+                .debug_struct("ReputationWiring::Enabled")
+                .field("publish", &publish.is_some())
+                .finish(),
+        }
     }
 }
 
@@ -412,41 +434,31 @@ async fn spawn_reputation_tasks(
     shutdown: &CancellationToken,
     reputation: ReputationWiring,
 ) -> (Vec<JoinHandle<()>>, Option<Arc<ReputationPublishTrigger>>) {
-    let ReputationWiring {
-        sink,
-        report_gate,
-        report_drain,
-    } = reputation;
     if !cfg.subscribe_reputation {
         // The publisher only runs alongside the reputation topic subscription,
-        // so `subscribe_reputation = false` silently drops a wired report drain:
-        // the node keeps buffering outbound observations that never publish
-        // (#864). Warn so this opt-out-only inert combination is visible — it
-        // cannot arise at defaults (both live).
-        if report_drain.is_some() {
+        // so `subscribe_reputation = false` silently drops wired reputation
+        // gossip: a node with a drain keeps buffering outbound observations that
+        // never publish (#864). Warn so this opt-out-only inert combination is
+        // visible — it cannot arise at defaults (both live).
+        if matches!(reputation, ReputationWiring::Enabled { .. }) {
             tracing::warn!(
-                "gossip: report drain wired but subscribe_reputation = false; outbound \
-                 reputation reports will accumulate and never publish — enable \
-                 gossip.subscribe_reputation to drain them"
+                ?reputation,
+                "gossip: reputation wiring supplied but subscribe_reputation = false; the \
+                 topic is not joined, and any wired report drain will accumulate outbound \
+                 reports that never publish — enable gossip.subscribe_reputation"
             );
         }
         return (Vec::new(), None);
     }
-    // Both halves are required together: a `Disabled` gate means reputation
-    // gossip is off, so a wired sink has nothing to consume, and an `Enforce`
-    // gate with no sink has nowhere to put what it admits. One combined check,
-    // one warning — but the warning names each half separately, since either
-    // alone can trip it. Captured here because the `let ... else` below moves
-    // both and its failing branch can no longer see them.
-    let sink_wired = sink.is_some();
-    let gate_enforcing = report_gate.is_enforcing();
-    let (Some(sink), ReportGate::Enforce(staked)) = (sink, report_gate) else {
-        tracing::warn!(
-            sink_wired,
-            gate_enforcing,
-            "gossip: subscribe_reputation set but reputation gossip is not fully wired; \
-             reputation topic not joined"
-        );
+    // `Disabled` is a stated intent rather than a wiring accident — the type
+    // makes "sink without admission set" (and vice versa) unrepresentable, so
+    // there is no half-wired case left to diagnose here.
+    let ReputationWiring::Enabled {
+        sink,
+        staked,
+        publish,
+    } = reputation
+    else {
         return (Vec::new(), None);
     };
 
@@ -474,7 +486,7 @@ async fn spawn_reputation_tasks(
         shutdown.clone(),
     ));
 
-    let trigger = report_drain.map(|drain| {
+    let trigger = publish.map(|drain| {
         let notify = Arc::new(Notify::new());
         tasks.push(reputation_publisher_task(
             secret_key.clone(),
@@ -813,8 +825,9 @@ fn reputation_subscriber_task(
     topic_id: TopicId,
     gossip: Gossip,
     sink: Arc<dyn ReputationSink>,
-    // The set from an already-resolved [`ReportGate::Enforce`]: this task only
-    // exists on the enforcing branch, so the gate is not re-checked per message.
+    // The admission set from an already-destructured `ReputationWiring::Enabled`:
+    // this task only exists on that branch, so membership is the only thing
+    // checked per message — never whether reputation gossip is on at all.
     staked: Arc<dyn StakedNodeSet>,
     metrics: Arc<dyn GossipMetrics>,
     shutdown: CancellationToken,
@@ -1521,10 +1534,10 @@ mod tests {
         let shutdown = CancellationToken::new();
         let mut config = cfg(true, Some("US"));
         config.subscribe_reputation = true;
-        let wiring = ReputationWiring {
-            sink: Some(Arc::new(Sink)),
-            report_gate: ReportGate::Enforce(Arc::new(Staked)),
-            report_drain: Some(Arc::new(Drain)),
+        let wiring = ReputationWiring::Enabled {
+            sink: Arc::new(Sink),
+            staked: Arc::new(Staked),
+            publish: Some(Arc::new(Drain)),
         };
 
         let handles = GossipService::spawn(
@@ -1574,10 +1587,22 @@ mod tests {
     async fn report_drain_with_reputation_disabled_spawns_no_publisher() {
         use iroh::endpoint::presets;
 
+        use crate::reputation::ValidatedReport;
+
         struct Drain;
         impl ReportDrain for Drain {
             fn drain(&self) -> Vec<([u8; 32], decdn_protocol::ReportMetrics)> {
                 Vec::new()
+            }
+        }
+        struct Sink;
+        impl ReputationSink for Sink {
+            fn accept(&self, _report: ValidatedReport) {}
+        }
+        struct Staked;
+        impl StakedNodeSet for Staked {
+            fn contains(&self, _node_id: &[u8; 32]) -> bool {
+                true
             }
         }
 
@@ -1589,13 +1614,14 @@ mod tests {
         let peer_table = Arc::new(RwLock::new(PeerTable::new(60_000_000, 128)));
         let metrics: Arc<dyn GossipMetrics> = Arc::new(crate::metrics::NoopMetrics);
         let shutdown = CancellationToken::new();
-        // `subscribe_reputation` defaults to false in `cfg`; wire only the drain.
+        // `subscribe_reputation` defaults to false in `cfg`; wire reputation
+        // fully so the config flag is the only thing suppressing it.
         let config = cfg(true, Some("US"));
         assert!(!config.subscribe_reputation);
-        let wiring = ReputationWiring {
-            sink: None,
-            report_gate: ReportGate::Disabled,
-            report_drain: Some(Arc::new(Drain)),
+        let wiring = ReputationWiring::Enabled {
+            sink: Arc::new(Sink),
+            staked: Arc::new(Staked),
+            publish: Some(Arc::new(Drain)),
         };
 
         let handles = GossipService::spawn(
@@ -1633,59 +1659,42 @@ mod tests {
         }
     }
 
-    /// #1338 — the reputation-report membership gate is a named enum, not an
-    /// `Option`, so its fail-CLOSED default reads off the type instead of off
-    /// `None`. Asserted through `Debug` (which must name the variant) as well
-    /// as by pattern match.
+    /// #1338 — an unwired [`ReputationWiring`] is fail-CLOSED, and that reads
+    /// off the type (a named `Disabled` variant) rather than off a `None`.
+    /// Asserted through `Debug` as well as by pattern match.
     #[test]
-    fn reputation_wiring_default_gate_is_disabled() {
+    fn reputation_wiring_default_is_disabled() {
         let wiring = ReputationWiring::default();
         assert!(
-            matches!(wiring.report_gate, ReportGate::Disabled),
+            matches!(wiring, ReputationWiring::Disabled),
             "an unwired ReputationWiring must be fail-CLOSED"
         );
         let rendered = format!("{wiring:?}");
-        assert!(
-            rendered.contains("ReportGate::Disabled"),
-            "default wiring must name its fail-closed gate variant, got {rendered}"
+        assert_eq!(
+            rendered, "ReputationWiring::Disabled",
+            "default wiring must name its fail-closed variant"
         );
     }
 
-    /// #1338 — mirror of `AnnounceGate`'s `debug_reports_variant_only`: pin
-    /// *both* arms of [`ReportGate`]'s hand-written `Debug`. The
-    /// `ReputationWiring` default test above only ever renders `Disabled`, so a
-    /// single mislabelled arm — `Enforce(_) => "ReportGate::Disabled"` — would
-    /// report every live enforcing gate as fail-closed in the logs with nothing
-    /// failing. That is precisely the polarity confusion this gate exists to
-    /// prevent, so it gets its own assertion.
+    /// #1338 — pin *both* arms of [`ReputationWiring`]'s hand-written `Debug`.
+    /// The default test above only ever renders `Disabled`, so a single
+    /// mislabelled arm — `Enabled { .. } => "ReputationWiring::Disabled"` —
+    /// would report every live enforcing node as fail-closed in the logs with
+    /// nothing failing. That is precisely the confusion this shape exists to
+    /// prevent, so it gets its own assertion. The `publish` flag is included
+    /// because the bring-up `warn!` at `subscribe_reputation = false` renders
+    /// the whole wiring, and "was a drain wired?" is the actionable part.
     #[test]
-    fn report_gate_debug_reports_variant_only() {
+    fn reputation_wiring_debug_reports_variant_and_publish_only() {
         struct Staked;
         impl StakedNodeSet for Staked {
             fn contains(&self, _node_id: &[u8; 32]) -> bool {
                 true
             }
         }
-
-        let enforce: ReportGate = ReportGate::Enforce(Arc::new(Staked));
-        assert_eq!(format!("{enforce:?}"), "ReportGate::Enforce(..)");
-        let disabled: ReportGate = ReportGate::Disabled;
-        assert_eq!(format!("{disabled:?}"), "ReportGate::Disabled");
-    }
-
-    /// #1338 — the fail-CLOSED half of the gate's contract, and the reason
-    /// `sink` and `report_gate` stay one combined check: a wired sink with a
-    /// [`ReportGate::Disabled`] gate must not join the reputation topic even
-    /// with `subscribe_reputation = true`. Nothing may admit unvetted reports.
-    #[tokio::test]
-    async fn disabled_report_gate_spawns_no_reputation_tasks() {
-        use iroh::endpoint::presets;
-
-        use crate::reputation::ValidatedReport;
-
         struct Sink;
         impl ReputationSink for Sink {
-            fn accept(&self, _report: ValidatedReport) {}
+            fn accept(&self, _report: crate::reputation::ValidatedReport) {}
         }
         struct Drain;
         impl ReportDrain for Drain {
@@ -1694,81 +1703,43 @@ mod tests {
             }
         }
 
-        let ep = Endpoint::builder(presets::Minimal)
-            .bind()
-            .await
-            .expect("bind minimal endpoint");
-        let gossip = build_gossip(ep.clone());
-        let peer_table = Arc::new(RwLock::new(PeerTable::new(60_000_000, 128)));
-        let metrics: Arc<dyn GossipMetrics> = Arc::new(crate::metrics::NoopMetrics);
-        let shutdown = CancellationToken::new();
-        let mut config = cfg(true, Some("US"));
-        config.subscribe_reputation = true;
-        let wiring = ReputationWiring {
-            sink: Some(Arc::new(Sink)),
-            report_gate: ReportGate::Disabled,
-            report_drain: Some(Arc::new(Drain)),
+        let subscribe_only = ReputationWiring::Enabled {
+            sink: Arc::new(Sink),
+            staked: Arc::new(Staked),
+            publish: None,
         };
-
-        let handles = GossipService::spawn(
-            ep,
-            SecretKey::generate(),
-            gossip,
-            config,
-            peer_table,
-            metrics,
-            shutdown.clone(),
-            OwnedAnnounceGate::Disabled,
-            wiring,
-        )
-        .await
-        .expect("gossip service should start");
-
-        assert!(
-            handles.reputation_publish_trigger.is_none(),
-            "a Disabled report gate must suppress the publisher too, not just the subscriber"
-        );
-        // global sub + region sub + NodeAnnounce publisher + TTL sweeper only.
         assert_eq!(
-            handles.tasks.len(),
-            4,
-            "a Disabled report gate must join no reputation topic"
+            format!("{subscribe_only:?}"),
+            "ReputationWiring::Enabled { publish: false }"
         );
-
-        shutdown.cancel();
-        for handle in handles.tasks {
-            tokio::time::timeout(Duration::from_secs(2), handle)
-                .await
-                .expect("gossip task must exit promptly after cancel, not hang")
-                .expect("gossip task must exit cleanly, not panic");
-        }
+        let publishing = ReputationWiring::Enabled {
+            sink: Arc::new(Sink),
+            staked: Arc::new(Staked),
+            publish: Some(Arc::new(Drain)),
+        };
+        assert_eq!(
+            format!("{publishing:?}"),
+            "ReputationWiring::Enabled { publish: true }"
+        );
+        assert_eq!(
+            format!("{:?}", ReputationWiring::Disabled),
+            "ReputationWiring::Disabled"
+        );
     }
 
-    /// #1344 — the other half of the combined check, and the one the code
-    /// comment justifying it actually cites: an `Enforce` gate with no sink has
-    /// nowhere to put what it admits, so it must join no topic either.
+    /// #1338 — the fail-CLOSED half of the contract: a [`ReputationWiring::
+    /// Disabled`] must not join the reputation topic even with
+    /// `subscribe_reputation = true`. Nothing may admit unvetted reports.
     ///
-    /// Without this, the `sink: None` + `Enforce` row is unexercised: line
-    /// coverage is already satisfied by the `Disabled` sibling above, so a
-    /// future split of the check — spawn the subscriber whenever the gate is
-    /// `Enforce`, guard the sink inside the task — would leave every existing
-    /// test green while admitting reports into a `None` sink.
+    /// Note what is NOT here any more (#1342): the sibling case this test used
+    /// to need — an enforcing admission set with no sink — is now
+    /// unrepresentable, since `Enabled` carries both or neither. #1344 asked for
+    /// a test of that combination; the type change deleted the combination
+    /// instead, which is the stronger outcome. Only the deliberate-off case is
+    /// left to assert.
     #[tokio::test]
-    async fn enforcing_report_gate_without_a_sink_spawns_no_reputation_tasks() {
+    async fn disabled_wiring_spawns_no_reputation_tasks() {
         use iroh::endpoint::presets;
-
-        struct Staked;
-        impl StakedNodeSet for Staked {
-            fn contains(&self, _node_id: &[u8; 32]) -> bool {
-                true
-            }
-        }
-        struct Drain;
-        impl ReportDrain for Drain {
-            fn drain(&self) -> Vec<([u8; 32], decdn_protocol::ReportMetrics)> {
-                Vec::new()
-            }
-        }
 
         let ep = Endpoint::builder(presets::Minimal)
             .bind()
@@ -1780,11 +1751,7 @@ mod tests {
         let shutdown = CancellationToken::new();
         let mut config = cfg(true, Some("US"));
         config.subscribe_reputation = true;
-        let wiring = ReputationWiring {
-            sink: None,
-            report_gate: ReportGate::Enforce(Arc::new(Staked)),
-            report_drain: Some(Arc::new(Drain)),
-        };
+        let wiring = ReputationWiring::Disabled;
 
         let handles = GossipService::spawn(
             ep,
@@ -1802,13 +1769,19 @@ mod tests {
 
         assert!(
             handles.reputation_publish_trigger.is_none(),
-            "an Enforce gate with no sink must suppress the publisher too"
+            "Disabled must suppress the publisher too, not just the subscriber"
         );
         // global sub + region sub + NodeAnnounce publisher + TTL sweeper only.
+        // NB this measures spawned tasks, which is the observable proxy for "the
+        // topic was not joined" only because the `Disabled` return sits ABOVE
+        // `gossip.subscribe`. Move that guard below the subscribe and the node
+        // would join the mesh while spawning zero tasks — green test, broken
+        // contract. There is no API to assert non-membership directly, so the
+        // ordering is the thing to preserve.
         assert_eq!(
             handles.tasks.len(),
             4,
-            "an Enforce gate with no sink must join no reputation topic"
+            "Disabled must spawn no reputation subscriber or publisher"
         );
 
         shutdown.cancel();
