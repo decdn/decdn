@@ -381,22 +381,31 @@ pub(crate) async fn probe_and_rank(
 /// Auto-discover a node to fetch `hash` from (#936): read the active node set
 /// from `CapacityBond`, take the region-nearest [`discovery::SELECT_K`]
 /// candidates, and [`probe_and_rank`] them. Returns the chosen candidate.
-#[allow(clippy::too_many_arguments)] // discovery wiring; each arg is distinct runtime state.
+/// Callers must have already unwrapped `chain.capacity_bond` into the
+/// "auto-discovery needs `capacity_bond_address`" error, which is why the
+/// address is a separate parameter rather than read back off `chain`.
 async fn discover_provider(
     endpoint: &Endpoint,
     store: &RedbBuyerChannelStore,
-    rpc_url: &str,
+    chain: &ResolvedChain,
     capacity_bond: Address,
-    client_region: Option<&str>,
     relay_hint: Option<&RelayUrl>,
     hash: [u8; 32],
     warming: ProxyWarmingParams,
 ) -> anyhow::Result<NodeCandidate> {
-    let all = discovery::active_nodes(rpc_url, capacity_bond).await?;
+    let bootstrap =
+        discovery::bootstrap_nodes(&chain.rpc_url, capacity_bond, &chain.data_dir).await?;
+    // `client-pull` cannot log this itself — `decdn` installs no tracing
+    // subscriber — and a silently stale peer list is exactly what the user
+    // needs told, so the provenance comes back in the return value.
+    if let Some(warning) = bootstrap.warning() {
+        eprintln!("{warning}");
+    }
+    let all = bootstrap.into_peers();
     if all.is_empty() {
         anyhow::bail!("no active nodes in the CapacityBond registry at {capacity_bond}");
     }
-    let selected = discovery::select_candidates(all, client_region, discovery::SELECT_K);
+    let selected = discovery::select_candidates(all, chain.region.as_deref(), discovery::SELECT_K);
     probe_and_rank(endpoint, store, &selected, relay_hint, hash, warming).await
 }
 
@@ -436,9 +445,8 @@ pub(crate) async fn resolve_target_node(
     let picked = discover_provider(
         endpoint,
         store,
-        &chain.rpc_url,
+        chain,
         capacity_bond,
-        chain.region.as_deref(),
         relays.first(),
         hash,
         ProxyWarmingParams::from_args(args),
