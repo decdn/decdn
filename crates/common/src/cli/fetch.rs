@@ -96,6 +96,35 @@ pub struct ClientFetchArgs {
     #[arg(long, value_name = "REGION")]
     pub region: Option<String>,
 
+    /// Latency-driven proxy warming (#1174, ADR 037): on a cache miss whose only
+    /// holders are distant, route the paid request through a nearer bonded
+    /// non-holder so it caches the blob and becomes the first regional copy.
+    /// Engages only when it strictly helps (see `--proxy-warming-rtt-threshold-ms`
+    /// / `--proxy-warming-margin-ms`); otherwise routes direct.
+    ///
+    /// **Opt-in (default off), deliberately diverging from ADR 037's
+    /// "defaults on" until the fallback path lands.** ADR 037 § Fallback
+    /// requires that a proxy which declines or stalls transparently falls back to
+    /// the next candidate and then to the direct holder. That is not yet wired:
+    /// a fallback would have to open a second payment channel (escrowing another
+    /// on-chain deposit) against the fallback provider, so it is a deliberate
+    /// follow-up rather than a retry loop. Until then, enabling this means a
+    /// chosen proxy that cannot serve (for instance a node running the default
+    /// `cache.node_to_node_pull_through_enabled = false`) fails the fetch
+    /// outright, where routing direct would have succeeded.
+    #[arg(long, value_name = "BOOL", default_value_t = false, action = clap::ArgAction::Set)]
+    pub proxy_warming: bool,
+
+    /// Proxy warming engages only when the best holder's RTT exceeds this many
+    /// milliseconds (the holders are all distant). Below it, route direct.
+    #[arg(long, value_name = "MS", default_value_t = 150)]
+    pub proxy_warming_rtt_threshold_ms: u64,
+
+    /// A candidate proxy must beat the best holder's RTT by at least this many
+    /// milliseconds to be chosen — proxy warming is never a gamble.
+    #[arg(long, value_name = "MS", default_value_t = 30)]
+    pub proxy_warming_margin_ms: u64,
+
     /// EIP-712 `chainId` for both domains. Overrides `blockchain.chain_id`;
     /// defaults to Arbitrum Sepolia.
     #[arg(long, value_name = "ID")]

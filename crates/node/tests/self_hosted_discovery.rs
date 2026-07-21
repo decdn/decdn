@@ -642,8 +642,7 @@ async fn probe_roundtrip_resolves_server_by_node_id_via_self_hosted_discovery() 
         cache,
         Arc::clone(&signer),
         domain.clone(),
-        0,
-        MAX_RATE_PER_MB,
+        decdn_node::rate_bounds::RateBounds::new(0, MAX_RATE_PER_MB),
         false,
         None,
     ));

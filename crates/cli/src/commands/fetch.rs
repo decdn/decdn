@@ -244,18 +244,46 @@ pub(crate) fn resolve_chain(
     })
 }
 
+/// Client-side proxy-warming knobs (#1174, ADR 037), distilled from
+/// [`cli::ClientFetchArgs`]. RTT thresholds are held as `f64` ms to compare
+/// directly against probe RTTs.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ProxyWarmingParams {
+    pub enabled: bool,
+    pub rtt_threshold_ms: f64,
+    pub margin_ms: f64,
+}
+
+impl ProxyWarmingParams {
+    pub(crate) fn from_args(args: &cli::ClientFetchArgs) -> Self {
+        // Widen through u32 so the u64 → f64 cast is lossless (ms knobs are
+        // small); saturate the implausible overflow rather than lose precision.
+        let ms = |v: u64| f64::from(u32::try_from(v).unwrap_or(u32::MAX));
+        Self {
+            enabled: args.proxy_warming,
+            rtt_threshold_ms: ms(args.proxy_warming_rtt_threshold_ms),
+            margin_ms: ms(args.proxy_warming_margin_ms),
+        }
+    }
+}
+
 /// Probe `candidates` for `hash` over `endpoint` and pick the best holder
 /// (channel-aware ranking, #936). Shared by `fetch`'s one-shot discovery and
 /// `bundle pull`'s per-entry discovery (which reads the active set once, then
 /// re-probes this list per entry). `slash_sig`/correlation are NOT validated
 /// here — selection only needs `has_blob` + RTT; the chosen node's delivery is
 /// fully verified downstream. Errors if none of the probed candidates hold it.
+///
+/// When `warming` is enabled (opt-in, #1174/ADR 037) and the best holder is
+/// distant, this may instead return a probed **non-holder** that is measurably
+/// nearer, so it serves via window-paced pull-through and seeds a regional copy.
 pub(crate) async fn probe_and_rank(
     endpoint: &Endpoint,
     store: &RedbBuyerChannelStore,
     candidates: &[NodeCandidate],
     relay_hint: Option<&RelayUrl>,
     hash: [u8; 32],
+    warming: ProxyWarmingParams,
 ) -> anyhow::Result<NodeCandidate> {
     let timestamp_us = micros_now();
     // Probe concurrently in one task (`probe_once` is not `Send` — its
@@ -285,19 +313,63 @@ pub(crate) async fn probe_and_rank(
 
     let probe_count = results.len();
     let mut holders = Vec::new();
+    // Probed bonded non-holders are the proxy-warming candidate pool (ADR 037 §
+    // Candidate pool): reachable nodes that don't hold the blob, with a measured
+    // RTT. Only collected when warming is enabled.
+    let mut warming_pool: Vec<discovery::WarmingCandidate> = Vec::new();
     for (cand, res) in results {
         let Some((resp, rtt_ms)) = res else { continue };
-        if !resp.body.has_blob {
-            continue;
+        if resp.body.has_blob {
+            let has_live_channel = store
+                .get_by_provider(cand.eth_address)?
+                .is_some_and(|s| !s.is_expired_at(unix_now()));
+            holders.push(discovery::Probed {
+                candidate: cand.clone(),
+                rtt_ms,
+                has_live_channel,
+            });
+        } else if warming.enabled {
+            warming_pool.push(discovery::WarmingCandidate {
+                node_id: cand.node_id,
+                eth_address: cand.eth_address,
+                rtt_ms,
+            });
         }
-        let has_live_channel = store
-            .get_by_provider(cand.eth_address)?
-            .is_some_and(|s| !s.is_expired_at(unix_now()));
-        holders.push(discovery::Probed {
-            candidate: cand.clone(),
-            rtt_ms,
-            has_live_channel,
-        });
+    }
+
+    // Proxy-warming pre-step (ADR 037 § Client selection policy): if the best
+    // holder is distant and a probed non-holder beats it by the margin, route the
+    // paid request through that nearer non-holder — it serves via window-paced
+    // pull-through and becomes the first regional copy. RTT-only ranking; never a
+    // gamble (empty order ⇒ fall through to the direct holder).
+    if warming.enabled && !holders.is_empty() {
+        let best_holder_rtt = holders
+            .iter()
+            .map(|h| h.rtt_ms)
+            .fold(f64::INFINITY, f64::min);
+        let order = discovery::proxy_warming_order(
+            best_holder_rtt,
+            warming.rtt_threshold_ms,
+            warming.margin_ms,
+            &warming_pool,
+        );
+        if let Some(proxy) = order.first() {
+            eprintln!(
+                "proxy-warming: routing through nearer non-holder {} ({:.1}ms) instead of the \
+                 best holder ({:.1}ms) to seed a regional copy (ADR 037)",
+                proxy.node_id, proxy.rtt_ms, best_holder_rtt
+            );
+            return Ok(NodeCandidate {
+                node_id: proxy.node_id,
+                eth_address: proxy.eth_address,
+                // Region deliberately dropped rather than carried over: ADR 037
+                // §"Ranking key is measured RTT only" forbids region from
+                // influencing warming, and `region_hint` is only ever read by
+                // `select_candidates`' pre-probe shortlist and operator logging.
+                // Leaving it empty keeps a spoofed region from riding along.
+                region_hint: String::new(),
+            });
+        }
     }
 
     let pick = discovery::rank(&holders).ok_or_else(|| {
@@ -309,6 +381,7 @@ pub(crate) async fn probe_and_rank(
 /// Auto-discover a node to fetch `hash` from (#936): read the active node set
 /// from `CapacityBond`, take the region-nearest [`discovery::SELECT_K`]
 /// candidates, and [`probe_and_rank`] them. Returns the chosen candidate.
+#[allow(clippy::too_many_arguments)] // discovery wiring; each arg is distinct runtime state.
 async fn discover_provider(
     endpoint: &Endpoint,
     store: &RedbBuyerChannelStore,
@@ -317,13 +390,14 @@ async fn discover_provider(
     client_region: Option<&str>,
     relay_hint: Option<&RelayUrl>,
     hash: [u8; 32],
+    warming: ProxyWarmingParams,
 ) -> anyhow::Result<NodeCandidate> {
     let all = discovery::active_nodes(rpc_url, capacity_bond).await?;
     if all.is_empty() {
         anyhow::bail!("no active nodes in the CapacityBond registry at {capacity_bond}");
     }
     let selected = discovery::select_candidates(all, client_region, discovery::SELECT_K);
-    probe_and_rank(endpoint, store, &selected, relay_hint, hash).await
+    probe_and_rank(endpoint, store, &selected, relay_hint, hash, warming).await
 }
 
 /// Resolve the node to fetch from: the explicit `--node-id` (requiring
@@ -367,6 +441,7 @@ pub(crate) async fn resolve_target_node(
         chain.region.as_deref(),
         relays.first(),
         hash,
+        ProxyWarmingParams::from_args(args),
     )
     .await?;
     eprintln!(
@@ -947,6 +1022,9 @@ mod tests {
             slash_judge_address: None,
             capacity_bond_address: None,
             region: None,
+            proxy_warming: false,
+            proxy_warming_rtt_threshold_ms: 150,
+            proxy_warming_margin_ms: 30,
             chain_id: None,
             keystore: None,
             data_dir: Some(PathBuf::from("/tmp/d")),

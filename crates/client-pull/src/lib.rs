@@ -46,6 +46,7 @@ mod ledger;
 pub mod probe;
 /// Wallet-filled HTTP provider builder for opening/settling payment channels.
 pub mod provider;
+pub mod rtt_map;
 
 pub use ledger::{ChannelLedger, Cumulative};
 

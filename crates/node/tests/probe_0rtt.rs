@@ -182,8 +182,7 @@ async fn spawn_core(
         cache,
         eth_signer,
         slash_domain,
-        0,
-        MAX_RATE_PER_MB,
+        decdn_node::rate_bounds::RateBounds::new(0, MAX_RATE_PER_MB),
         enable_0rtt,
         None, // no stake-lane reservation in the 0-RTT suite (#757)
     ));

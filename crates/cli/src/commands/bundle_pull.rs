@@ -497,6 +497,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             candidates,
             self.relays.first(),
             hash,
+            fetch::ProxyWarmingParams::from_args(self.common),
         )
         .await?;
         Ok((picked.node_id, picked.eth_address))

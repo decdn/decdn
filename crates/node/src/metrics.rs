@@ -1290,6 +1290,14 @@ pub struct DecdnMetrics {
     /// `decdn_reputation_indexer_last_tick_timestamp_seconds` (#1316): Unix time
     /// of the reputation-indexer watcher's last successful poll tick.
     pub reputation_indexer_last_tick_timestamp_seconds: Gauge,
+    /// `decdn_rate_bounds_watcher_last_tick_timestamp_seconds` (#1172): Unix time
+    /// of the rate-bounds watcher's last successful poll tick. Load-bearing: the
+    /// watcher's `getRateBounds()` poll failure and undecodable-log paths both
+    /// return `Ok` by design (an `Err` would stall the cursor), so a watcher stuck
+    /// in RPC backoff — or dead — is otherwise indistinguishable from a healthy
+    /// one while the node keeps signing quotes against stale, economically
+    /// load-bearing bounds. Alert on this gauge going stale.
+    pub rate_bounds_watcher_last_tick_timestamp_seconds: Gauge,
     /// `decdn_slash_watcher_task_panicked_total` (#1316): the slash watcher task
     /// unwound on a panic. Bumped from a `Drop` guard in `resumable_watcher::run`
     /// — the only thing that still runs on the unwind, since nothing awaits the
@@ -1304,6 +1312,9 @@ pub struct DecdnMetrics {
     /// `decdn_blacklist_watcher_task_panicked_total` (#1316, #1283): the
     /// blacklist watcher task unwound on a panic.
     pub blacklist_watcher_task_panicked: Counter,
+    /// `decdn_rate_bounds_watcher_task_panicked_total` (#1172): the rate-bounds
+    /// watcher task unwound on a panic. Any non-zero value is a bug in this node.
+    pub rate_bounds_watcher_task_panicked: Counter,
     /// `decdn_settlement_watcher_task_panicked_total` (#1316): the
     /// payment-settlement watcher task unwound on a panic.
     pub settlement_watcher_task_panicked: Counter,
@@ -2456,6 +2467,11 @@ recorders! {
     settlement_watcher_tick => settlement_watcher_last_tick_timestamp_seconds.set(unix_now_secs());
     /// Stamp the reputation-indexer watcher's liveness gauge (#1316).
     reputation_indexer_tick => reputation_indexer_last_tick_timestamp_seconds.set(unix_now_secs());
+    /// Stamp the rate-bounds watcher's liveness gauge (#1172). See
+    /// `slash_watcher_tick`; this one matters because the rate-bounds watcher's
+    /// failure paths deliberately return `Ok`, so this gauge is the only signal
+    /// that it is still polling.
+    rate_bounds_watcher_tick => rate_bounds_watcher_last_tick_timestamp_seconds.set(unix_now_secs());
 
     /// Record that the slash watcher task unwound on a panic (#1316). Bumped from
     /// the `Drop` guard in `resumable_watcher::run` via the `on_task_panic` hook.
@@ -2466,6 +2482,8 @@ recorders! {
     origin_directory_watcher_task_panicked => origin_directory_watcher_task_panicked.inc();
     /// Record that the blacklist watcher task unwound on a panic (#1316, #1283).
     blacklist_watcher_task_panicked => blacklist_watcher_task_panicked.inc();
+    /// Record that the rate-bounds watcher task unwound on a panic (#1172).
+    rate_bounds_watcher_task_panicked => rate_bounds_watcher_task_panicked.inc();
     /// Record that the payment-settlement watcher task unwound on a panic (#1316).
     settlement_watcher_task_panicked => settlement_watcher_task_panicked.inc();
     /// Record that the reputation-indexer watcher task unwound on a panic (#1316).
@@ -2996,10 +3014,34 @@ mod tests {
             "decdn_cache_circuit_breaker_trips_total",
             "decdn_cache_circuit_breaker_recoveries_total",
             "decdn_cache_circuit_breaker_short_circuits_total",
+            // Eviction-driver counters (#1173). Same `_total`-suffix trap as
+            // the GC pair above: the struct fields are `evictions`,
+            // `evictions_bytes`, `evictions_starved`, `size_measure_failures`,
+            // `evicted_operator`.
+            "decdn_cache_evictions_total",
+            "decdn_cache_evictions_bytes_total",
+            "decdn_cache_evictions_starved_total",
+            "decdn_cache_size_measure_failures_total",
+            "decdn_cache_evicted_operator_total",
         ] {
             assert!(
                 has_metric_line(&text, name, 0),
                 "counter {name} should be exposed at zero on a fresh registry:\n{text}"
+            );
+        }
+
+        // Cache-health GAUGES (#1173) take the opposite naming rule: the
+        // encoder appends `_total` only to counters, so these must appear
+        // WITHOUT a suffix. Asserting both families together pins the
+        // distinction that `crates/cache/src/metrics.rs`'s module doc describes.
+        for name in [
+            "decdn_cache_bytes",
+            "decdn_cache_size_limit_bytes",
+            "decdn_cache_pinned_count",
+        ] {
+            assert!(
+                has_metric_line(&text, name, 0),
+                "gauge {name} should be exposed at zero on a fresh registry:\n{text}"
             );
         }
     }
