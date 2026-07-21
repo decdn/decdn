@@ -368,6 +368,7 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
                     true,
                     Some(&readiness),
                     None,
+                    None,
                     &args.region,
                     args.multiaddrs.len(),
                 )
@@ -489,6 +490,11 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
     // is added (#1355 review).
     let mut bond_outcome = bond::Outcome::default();
     let mut register_outcome: Option<register::RegisterOutcome> = None;
+    // Separate from `register_outcome` because `submit_registration` returns its
+    // outcome by value: on an unreadable receipt the `Err` takes the outcome
+    // with it, and this slot is the only thing that survives to name the
+    // in-flight registration in the partial summary.
+    let mut register_tx: Option<B256> = None;
     let mut bond_reported = false;
     // Whether the bond phase itself completed. Gates the re-run guidance below:
     // after a successful bond, a later phase failing carries no bond hazard.
@@ -533,6 +539,7 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
                 &args.multiaddrs,
                 terms_hash,
                 false,
+                &mut register_tx,
             )
             .await?;
             if !json {
@@ -564,6 +571,7 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
             false,
             readiness,
             Some(terms_hash.is_some()),
+            register_tx,
             &args.region,
             args.multiaddrs.len(),
         )
@@ -1239,6 +1247,10 @@ fn build_summary(
     // because this key is already registered" from "owed but never completed".
     // `None` on the dry-run path, which returns before due-ness is determined.
     register_due: Option<bool>,
+    // A `registerNode` that was broadcast but whose outcome is unresolved. Only
+    // ever `Some` alongside `register_outcome: None` — a resolved registration
+    // reports its hash through the outcome instead.
+    register_tx: Option<B256>,
     region: &str,
     multiaddrs: usize,
 ) -> serde_json::Value {
@@ -1271,7 +1283,9 @@ fn build_summary(
         // `skipped` alone used to conflate three states once the partial path
         // could emit this object: not due, not reached, and attempted-and-failed
         // (#1355 review). `due` disambiguates — `skipped: true, due: true` is a
-        // registration that was owed and did not complete.
+        // registration that was owed and did not complete — and `tx` carries the
+        // hash when one was broadcast without a readable receipt, which is the
+        // case where the operator most needs it.
         "register": match register_outcome {
             Some(o) => serde_json::json!({
                 "skipped": false,
@@ -1280,7 +1294,11 @@ fn build_summary(
                 "tx": tx_hex(o.tx),
                 "node_id": format!("{:#x}", o.node_id),
             }),
-            None => serde_json::json!({ "skipped": true, "due": register_due }),
+            None => serde_json::json!({
+                "skipped": true,
+                "due": register_due,
+                "tx": tx_hex(register_tx),
+            }),
         },
         "swap": match swap {
             Some(s) => serde_json::json!({
@@ -1548,6 +1566,7 @@ mod tests {
             false,
             None,
             Some(true),
+            None,
             "US",
             1,
         );
@@ -1578,6 +1597,7 @@ mod tests {
             false,
             Some(&sample_readiness()),
             Some(true),
+            None,
             "US",
             1,
         );
@@ -1595,6 +1615,60 @@ mod tests {
         assert_eq!(keys(&v), keys(&ok), "partial and success shapes must match");
     }
 
+    /// #1355 review — a `registerNode` that was broadcast but whose receipt
+    /// could not be read must still reach the partial summary. It cannot travel
+    /// in `register_outcome`: `submit_registration` returns that by value, so
+    /// the `Err` takes it with them. The caller-owned slot is the only carrier,
+    /// and this pins that it is actually rendered rather than merely threaded.
+    #[test]
+    fn build_summary_reports_an_unresolved_registration_tx() {
+        let in_flight = B256::repeat_byte(0x7E);
+        let v = build_summary(
+            &pf_with(None, 100, 10, 100, 10),
+            false,
+            &sample_plan(),
+            &bond::Outcome::default(),
+            // No outcome: the registration did not resolve.
+            None,
+            None,
+            false,
+            None,
+            Some(true),
+            Some(in_flight),
+            "US",
+            1,
+        );
+
+        assert_eq!(v["partial"], serde_json::json!(true));
+        assert_eq!(
+            v["register"]["tx"],
+            serde_json::json!(format!("{in_flight:#x}")),
+            "the in-flight registration must be named: {v}"
+        );
+        // `due` is what separates "owed but unresolved" from "already
+        // registered", which `skipped` alone cannot express.
+        assert_eq!(v["register"]["skipped"], serde_json::json!(true));
+        assert_eq!(v["register"]["due"], serde_json::json!(true));
+
+        // The genuinely-not-due case must stay distinguishable from it.
+        let not_due = build_summary(
+            &pf_with(None, 100, 10, 100, 10),
+            false,
+            &sample_plan(),
+            &bond::Outcome::default(),
+            None,
+            None,
+            false,
+            Some(&sample_readiness()),
+            Some(false),
+            None,
+            "US",
+            1,
+        );
+        assert_eq!(not_due["register"]["due"], serde_json::json!(false));
+        assert!(not_due["register"]["tx"].is_null());
+    }
+
     #[test]
     fn build_summary_register_skipped() {
         let pf = pf_with(None, 100, 10, 100, 10);
@@ -1608,6 +1682,7 @@ mod tests {
             false,
             Some(&sample_readiness()),
             Some(true),
+            None,
             "US",
             1,
         );
@@ -1647,6 +1722,7 @@ mod tests {
             false,
             Some(&sample_readiness()),
             Some(true),
+            None,
             "DE",
             2,
         );
@@ -1680,6 +1756,7 @@ mod tests {
             false,
             Some(&sample_readiness()),
             Some(true),
+            None,
             "US",
             1,
         );

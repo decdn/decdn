@@ -31,8 +31,7 @@
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,
-    clippy::indexing_slicing,
-    clippy::duration_suboptimal_units
+    clippy::indexing_slicing
 )]
 
 use std::process::Output;
@@ -45,7 +44,7 @@ use decdn_e2e::node::{KEYSTORE_PASSWORD, NodeFixture};
 use tokio::process::Command;
 
 /// Matches the other CLI journeys (anvil launch + forge deploy dominate).
-const OVERALL_TIMEOUT: Duration = Duration::from_secs(780);
+const OVERALL_TIMEOUT: Duration = Duration::from_mins(13);
 
 /// Tier to bond up to. Must exceed what `onboard_operator` posted (`minBond`,
 /// undeclared) so the run has a real shortfall to `approve` + `bond`, and must
