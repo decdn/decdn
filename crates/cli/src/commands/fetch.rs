@@ -391,10 +391,18 @@ async fn discover_provider(
     capacity_bond: Address,
     relay_hint: Option<&RelayUrl>,
     hash: [u8; 32],
-    warming: ProxyWarmingParams,
+    // The warming params and the registry deadline are both derived from the
+    // same `args`, so they travel as `args` rather than as two more positional
+    // parameters (clippy caps this function at 7).
+    args: &cli::ClientFetchArgs,
 ) -> anyhow::Result<NodeCandidate> {
-    let bootstrap =
-        discovery::bootstrap_nodes(&chain.rpc_url, capacity_bond, &chain.data_dir).await?;
+    let bootstrap = discovery::bootstrap_nodes(
+        &chain.rpc_url,
+        capacity_bond,
+        &chain.data_dir,
+        args.discovery_cap(),
+    )
+    .await?;
     // `client-pull` cannot log this itself — `decdn` installs no tracing
     // subscriber — and a silently stale peer list is exactly what the user
     // needs told, so the provenance comes back in the return value.
@@ -406,6 +414,7 @@ async fn discover_provider(
         anyhow::bail!("no active nodes in the CapacityBond registry at {capacity_bond}");
     }
     let selected = discovery::select_candidates(all, chain.region.as_deref(), discovery::SELECT_K);
+    let warming = ProxyWarmingParams::from_args(args);
     probe_and_rank(endpoint, store, &selected, relay_hint, hash, warming).await
 }
 
@@ -442,32 +451,25 @@ pub(crate) async fn resolve_target_node(
              blockchain.capacity_bond_address), or pass --node-id to dial directly"
         )
     })?;
-    // `--timeout-ms` bounds discovery too (#1349). Nothing did before: the
-    // registry read's retry schedule alone can burn 36 s, and the probe fan-out
-    // adds to it, so `decdn fetch --timeout-ms 5000` could sit for far longer
-    // than 5 s before the transfer it caps had even started.
-    let cap = args.discovery_cap();
-    let picked = tokio::time::timeout(
-        cap,
-        discover_provider(
-            endpoint,
-            store,
-            chain,
-            capacity_bond,
-            relays.first(),
-            hash,
-            ProxyWarmingParams::from_args(args),
-        ),
+    // `--timeout-ms` bounds the registry read (#1349). Nothing did before: its
+    // retry schedule alone can burn 36 s, so `decdn fetch --timeout-ms 5000`
+    // could sit far longer than 5 s before the transfer it caps had started.
+    //
+    // The bound is applied INSIDE `bootstrap_nodes`, around the read alone,
+    // rather than wrapped around discovery from out here. Wrapping from out
+    // here also cancels the ADR 012 § Bootstrap step 4 cache fallback, so a
+    // client holding a usable `peers.json` would be handed a hard failure
+    // instead of the degraded-but-working fetch the cache exists to provide.
+    let picked = discover_provider(
+        endpoint,
+        store,
+        chain,
+        capacity_bond,
+        relays.first(),
+        hash,
+        args,
     )
-    .await
-    .map_err(|_| {
-        anyhow::anyhow!(
-            "node discovery exceeded --timeout-ms ({} ms): the registry read and probe \
-             fan-out did not finish in time. Raise --timeout-ms, or pass --node-id with \
-             --provider-address to skip discovery entirely",
-            cap.as_millis(),
-        )
-    })??;
+    .await?;
     eprintln!(
         "discovered node {} (provider {}, region {:?})",
         picked.node_id, picked.eth_address, picked.region_hint

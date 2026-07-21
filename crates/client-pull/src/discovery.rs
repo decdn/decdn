@@ -610,8 +610,27 @@ pub async fn bootstrap_nodes(
     rpc_url: &str,
     capacity_bond_addr: Address,
     data_dir: &Path,
+    registry_cap: Duration,
 ) -> anyhow::Result<Bootstrap> {
-    resolve_bootstrap(active_nodes(rpc_url, capacity_bond_addr).await, data_dir)
+    // The deadline bounds the REGISTRY READ ONLY, not the whole bootstrap
+    // (#1349). Wrapping `bootstrap_nodes` from outside would cancel
+    // `resolve_bootstrap` along with it, and that is where the ADR 012
+    // § Bootstrap step 4 cache fallback lives — so a client with a perfectly
+    // good `peers.json` and a flaky RPC would get a hard failure instead of a
+    // degraded-but-working fetch. Timing out is just another way for the
+    // registry read to fail, so it is fed in as one and the existing
+    // `Bootstrap::Cached` arm handles it, warning and all.
+    let registry =
+        match tokio::time::timeout(registry_cap, active_nodes(rpc_url, capacity_bond_addr)).await {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::anyhow!(
+                "the CapacityBond registry read did not finish within {} ms (--timeout-ms); \
+             the ADR 012 retry schedule alone can take {} s",
+                registry_cap.as_millis(),
+                REGISTRY_RETRY_BACKOFF.iter().sum::<Duration>().as_secs(),
+            )),
+        };
+    resolve_bootstrap(registry, data_dir)
 }
 
 /// Candidates probed before ranking (decision 3): take the top-K by region,
@@ -639,10 +658,13 @@ pub fn select_candidates(
     client_region: Option<&str>,
     k: usize,
 ) -> Vec<NodeCandidate> {
-    // `client_region` stays a `&str` at this signature: the caller's value comes
-    // from `ResolvedChain::region`, which `decdn-common` has already validated
-    // against the same allowlist. Re-parsing here costs nothing and keeps the
-    // public API from forcing every caller to convert.
+    // `client_region` stays a `&str` and is parsed HERE, not assumed valid.
+    // `decdn-common`'s `normalize_region` validates the node daemon's config
+    // region, but the client path does not go through it: `decdn fetch`'s
+    // `--region` / `[identity] region` reach `ResolvedChain::region` as a raw
+    // `String`. So this is the validating boundary for the client, and an
+    // unrecognized value means "no locality information" — the ordering is
+    // skipped rather than applied against a value that means nothing.
     if let Some(region) = client_region.and_then(Region::parse) {
         // Stable sort by a bool key: same-region (`false`) sorts before the rest
         // (`true`), and within each group the on-chain order is preserved.
@@ -1344,6 +1366,49 @@ mod tests {
         };
         assert!(*age < Duration::from_mins(1), "a just-written cache is new");
         assert_eq!(out.into_peers(), peers);
+    }
+
+    /// The `--timeout-ms` bound must not cost a client its outage protection
+    /// (#1349). Timing out is one more way for the registry read to fail, so it
+    /// has to land on the cache-fallback path like any other failure.
+    ///
+    /// This is the regression a naive fix reintroduces: wrapping
+    /// `bootstrap_nodes` in `tokio::time::timeout` from the CALL SITE cancels
+    /// `resolve_bootstrap` along with the read, so a client holding a perfectly
+    /// good `peers.json` gets a hard error instead of a working fetch. Any
+    /// `--timeout-ms` below the schedule's own 36 s hits this, which is exactly
+    /// the range the flag was widened for.
+    #[tokio::test(start_paused = true)]
+    async fn a_timed_out_registry_read_still_falls_back_to_the_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let peers = vec![candidate(7, "US")];
+        write_peer_cache(dir.path(), &peers).unwrap();
+
+        // An unroutable address, so the read cannot finish inside the budget.
+        // Paused time makes the 5 s deadline instant.
+        let out = bootstrap_nodes(
+            "http://127.0.0.1:1",
+            Address::repeat_byte(0x11),
+            dir.path(),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("a timeout with a usable cache must not fail the fetch");
+
+        let warning = out.warning().unwrap();
+        assert!(
+            warning.contains("did not finish within"),
+            "the warning names the deadline as the cause: {warning}"
+        );
+        assert!(
+            warning.contains("--timeout-ms"),
+            "and names the flag that set it: {warning}"
+        );
+        assert_eq!(
+            out.into_peers(),
+            peers,
+            "the cached peers are what the fetch proceeds with"
+        );
     }
 
     #[test]

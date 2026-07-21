@@ -90,8 +90,10 @@ mod sol_types {
 
             /// Whether the operator was removed by the contract rather than by
             /// choice — auto-ejection on slashing, or a `BLACKLIST_ROLE`
-            /// `ejectNode`. Distinguishes the two inactive states, which have
-            /// different exits (#1359).
+            /// `ejectNode`. Both inactive states exit the same way
+            /// (`declareMbps(0)` + unbond), but they differ on RE-ENTRY: an
+            /// ejected operator's `registerNode` reverts `OperatorEjected` until
+            /// the latch clears, so the advice has to differ (#1359).
             function ejected(address operator) external view returns (bool);
 
             // -----------------------------------------------------------------

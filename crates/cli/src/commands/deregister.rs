@@ -24,13 +24,17 @@
 //!   funds are needed; ADR 003 § Node Registry).
 //!
 //! Unlike `unbond` there is no phase to select from chain state — this is one
-//! transaction that either applies or reverts. The chain read that does happen
-//! is a pre-flight `isActive`, so the two states the operator can actually be
-//! in are named up front instead of surfacing as a bare `NodeNotActive` revert:
-//! already deregistered, or ejected. An ejected operator exits with
-//! `decdn node unbond --all` directly — `declareMbps(0)` releases their tier
-//! (#1361) and `unbond` issues it — so the error points there rather than at a
-//! call they cannot make.
+//! transaction that either applies or reverts. There is still a pre-flight
+//! read, of registry state (`getNodeByAddress` + `ejected`, NOT the composite
+//! `isActive` — see `build_plan`), so the two states the operator can be in
+//! are named up front instead of surfacing as a bare `NodeNotActive` revert:
+//! already deregistered, or ejected.
+//!
+//! Both exit the same way — `decdn node unbond --all`, which releases the tier
+//! via `declareMbps(0)` for any inactive operator (#1361) — but they need
+//! different advice about RE-ENTRY, which is why the states are distinguished:
+//! a blacklist-ejected operator's `registerNode` reverts until governance calls
+//! `unEjectNode`, so pointing them at `decdn node register` would be wrong.
 
 use std::io::{self, IsTerminal, Write};
 use std::path::Path;

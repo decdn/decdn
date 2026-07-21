@@ -104,8 +104,20 @@ pub fn is_valid_region(code: &str) -> bool {
 /// Serializes as the plain 2-character string, so persisted forms stay
 /// human-readable and a `Region` field is wire-compatible with the `String` it
 /// replaces in the serialize direction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Region([u8; 2]);
+
+/// Hand-written so the code renders as text, not as its bytes. A derived
+/// `Debug` over the `[u8; 2]` payload prints `Region([85, 83])`, and this type
+/// IS formatted with `{:?}` on an operator-facing path — `decdn fetch`'s
+/// "discovered node … (region {:?})" line — as well as into `tracing` fields
+/// and `anyhow` context. The derive turned that line's output from `"US"` into
+/// `Some(Region([85, 83]))`.
+impl core::fmt::Debug for Region {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_tuple("Region").field(&self.as_str()).finish()
+    }
+}
 
 impl Region {
     /// Parse `raw` into a `Region`, or `None` if it is not an accepted code.
@@ -269,6 +281,48 @@ mod tests {
         }
         assert_eq!(canonical.as_str(), "US");
         assert_eq!(canonical.to_string(), "US");
+    }
+
+    /// `Debug` renders the code, not the byte payload. This is not cosmetic:
+    /// `decdn fetch` prints the discovered node's region with `{:?}`, so a
+    /// derived `Debug` shows the operator `Some(Region([85, 83]))`.
+    #[test]
+    fn debug_renders_the_code_not_the_bytes() {
+        let region = Region::parse("US").expect("US is assigned");
+        assert_eq!(format!("{region:?}"), r#"Region("US")"#);
+        assert_eq!(format!("{:?}", Some(region)), r#"Some(Region("US"))"#);
+    }
+
+    /// Proves the two "unreachable" fallbacks — `parse`'s `ok()?` on the array
+    /// conversion and `as_str`'s `unwrap_or("")` — are actually unreachable,
+    /// rather than arguing it in a comment. Every code the allowlist accepts
+    /// round-trips to itself, so neither branch can fire.
+    ///
+    /// Doubles as a tripwire on the allowlist: a bad edit that collapsed the
+    /// `matches!` arms would fail the count assertion rather than silently
+    /// shrinking the set of regions the network accepts.
+    #[test]
+    fn every_accepted_code_round_trips_and_is_never_empty() {
+        let mut accepted = 0usize;
+        for a in b'A'..=b'Z' {
+            for b in b'A'..=b'Z' {
+                let code = String::from_utf8(vec![a, b]).expect("ASCII by construction");
+                if !is_valid_region(&code) {
+                    continue;
+                }
+                accepted += 1;
+                let region = Region::parse(&code).expect("the predicate accepted it");
+                assert_eq!(
+                    region.as_str(),
+                    code,
+                    "as_str must be total — never the empty fallback"
+                );
+            }
+        }
+        assert!(
+            accepted > 240,
+            "the allowlist collapsed to {accepted} codes; ISO 3166-1 assigns ~250"
+        );
     }
 
     /// Parsing is exactly as permissive as the predicate — no more (a code the

@@ -234,7 +234,9 @@ contract CapacityBond is
 
     /// @notice Operator-asserted serving capacity in Mbps (ADR 026
     ///         § Capacity-bond curve). `declareMbps` enforces the governable
-    ///         `[minCapacityMbps, maxCapacityMbps]` band; the bond-curve
+    ///         `[minCapacityMbps, maxCapacityMbps]` band, except that an
+    ///         INACTIVE operator may declare 0 to release the tier (see the
+    ///         implementation note below); the bond-curve
     ///         coupling `activeBond ≥ bondRequired(declaredMbps)` is enforced
     ///         at the operator-initiated mutation sites (`declareMbps`,
     ///         `requestUnbond`, `registerNode`). Slash paths intentionally do
@@ -674,19 +676,34 @@ contract CapacityBond is
     /// @dev    Without this branch the tier is unclearable from every state
     ///         `deregisterNode` cannot be called in — bonded-and-declared but
     ///         never registered, auto-ejected by slashing, blacklist-ejected,
-    ///         or displaced by `reclaimNodeId` — and `requestUnbond`'s
-    ///         `bondRequired(declaredMbps)` floor then pins the operator's bond
-    ///         indefinitely. Where a slash already took the bond below that
-    ///         floor, NONE of the remainder was withdrawable.
+    ///         or displaced by `reclaimNodeId` — so `requestUnbond`'s
+    ///         `bondRequired(declaredMbps)` floor outlives the registration it
+    ///         was sized for.
     ///
-    ///         The bond released this way stays slashable for the whole
-    ///         unbonding window — `_reduceBondAtTier` reaches bond sitting in
-    ///         the queue — so this shortens no exposure, it only stops the
-    ///         floor outliving the registration it was sized for.
+    ///         Be precise about the size of that: this function has never
+    ///         enforced monotonicity, so such an operator could already declare
+    ///         DOWN to `minCapacityMbps` and unbond everything above
+    ///         `bondRequired(minCapacityMbps)`. The genuinely trapped residual
+    ///         was that floor-tier cost, NOT the whole bond — measured at
+    ///         199.7 of 20,252.7 TOKEN for an operator slashed to ejection from
+    ///         the 1 Gbps tier. What this branch buys is a one-step release that
+    ///         strands nothing, in place of a two-step tier-down that strands
+    ///         `bondRequired(minCapacityMbps)`.
+    ///
+    ///         The exception is a blacklist-ejected operator: `registerNode`
+    ///         reverts `OperatorEjected` no matter how they re-bond, so for them
+    ///         this is the only exit that exists.
+    ///
+    ///         The bond released this way is exposed for the same unbonding
+    ///         window as any other exit — `_reduceBondAtTier` reaches bond
+    ///         sitting in the queue — so this shortens no exposure.
     function declareMbps(uint256 mbps) external whenNotPaused {
         // Checked before the band so a zero declaration from an inactive
-        // operator skips BOTH gates: the band floor (`minCapacityMbps ≥ 1`)
-        // and the curve check, which a slashed operator can no longer meet.
+        // operator skips BOTH gates: the band floor (bounded to
+        // `[MIN_CAPACITY_FLOOR_MBPS, MIN_CAPACITY_CEILING_MBPS]` by
+        // `_enforceMinCapacityBounds`, so governance can never lower it to 0 and
+        // collapse this branch into the normal one) and the curve check, which a
+        // slashed operator can no longer meet.
         bool release = mbps == 0 && !_nodes[msg.sender].active;
         if (!release) {
             if (mbps < minCapacityMbps || mbps > maxCapacityMbps) {
@@ -875,12 +892,12 @@ contract CapacityBond is
     ///         bond — deactivation and bond exit stay separate operations
     ///         (ADR 003 § Node Registry).
     /// @dev    Clears `declaredMbps`, which is what makes the full-exit path
-    ///         ADR 003 § Node Registry describes reachable at all: the
-    ///         `requestUnbond` floor is `bondRequired(declaredMbps)` and
-    ///         `declareMbps` cannot return the tier to 0 (it enforces
-    ///         `mbps >= minCapacityMbps`, itself floored at
-    ///         `MIN_CAPACITY_FLOOR_MBPS`), so an operator that left the tier
-    ///         standing could never withdraw their last TOKEN. The bond itself
+    ///         ADR 003 § Node Registry describes reachable: the `requestUnbond`
+    ///         floor is `bondRequired(declaredMbps)`, so an operator that left
+    ///         the tier standing would retain that much bond forever. This is
+    ///         the ONLY route to 0 for a registered node — `declareMbps(0)` is
+    ///         accepted only from an inactive caller (see `declaredMbps`), which
+    ///         a registered node by definition is not. The bond itself
     ///         stays put and fully slashable; re-registering needs only
     ///         `minBond` again, but the tier must be re-declared.
     function deregisterNode() external nonReentrant whenNotPaused {

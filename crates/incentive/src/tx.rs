@@ -151,6 +151,16 @@ pub async fn send_unrecorded<C: CallDecoder, P: Provider>(
 /// clippy's `large_futures` threshold. Constructing the cleanup future only
 /// after `work` has finished lets the two share space.
 ///
+/// # Not a `Drop` guard
+///
+/// "Every path" means every *return* path. Cleanup does NOT run if the whole
+/// future is dropped mid-flight — Ctrl-C, or an enclosing `tokio::time::timeout`
+/// — or if `work` panics and unwinds. A cancelled `decdn setup` therefore leaves
+/// the standing USDC allowance this exists to clear. Closing that would need a
+/// `Drop` impl, which cannot await, so it would have to spawn; not worth it for
+/// a one-shot CLI where the operator can re-run `setup` (the idempotent approve
+/// skip then resets the surviving allowance on the next attempt).
+///
 /// # Errors
 ///
 /// Returns `work`'s error verbatim. `cleanup` cannot introduce, mask, or

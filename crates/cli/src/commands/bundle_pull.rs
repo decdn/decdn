@@ -311,6 +311,7 @@ struct PullReport {
 /// entry in the manifest then reuses.
 async fn discover_candidates(
     chain: &fetch::ResolvedChain,
+    registry_cap: std::time::Duration,
 ) -> anyhow::Result<Vec<discovery::NodeCandidate>> {
     let capacity_bond = chain.capacity_bond.ok_or_else(|| {
         anyhow!(
@@ -319,7 +320,8 @@ async fn discover_candidates(
         )
     })?;
     let bootstrap =
-        discovery::bootstrap_nodes(&chain.rpc_url, capacity_bond, &chain.data_dir).await?;
+        discovery::bootstrap_nodes(&chain.rpc_url, capacity_bond, &chain.data_dir, registry_cap)
+            .await?;
     // See `fetch::discover_provider`: the degraded bootstrap paths reach the
     // user through the return value, because the CLI has no log sink.
     if let Some(warning) = bootstrap.warning() {
@@ -371,21 +373,12 @@ pub async fn bundle_pull(args: &BundlePullArgs, config_path: Option<&Path>) -> a
     let explicit = explicit_target(common)?;
     let candidates = match explicit {
         Some(_) => None,
-        // Bounded by `--timeout-ms` (#1349), as in `fetch`. This read happens
-        // ONCE for the whole bundle, so the cap is a whole-run bound here — it
-        // does not compound with the per-entry fetch caps below.
-        None => Some(
-            tokio::time::timeout(common.discovery_cap(), discover_candidates(&chain))
-                .await
-                .map_err(|_| {
-                    anyhow!(
-                        "node discovery exceeded --timeout-ms ({} ms): the registry read and \
-                         probe fan-out did not finish in time. Raise --timeout-ms, or pass \
-                         --node-id with --provider-address to skip discovery entirely",
-                        common.discovery_cap().as_millis(),
-                    )
-                })??,
-        ),
+        // The registry read is bounded by `--timeout-ms` (#1349), inside
+        // `bootstrap_nodes` so a timeout still falls through to the peer cache.
+        // Unlike `fetch`, no probing happens here — `discover_candidates` is
+        // the registry read plus `select_candidates`; probing is per entry, in
+        // `pick_excluding` below.
+        None => Some(discover_candidates(&chain, common.discovery_cap()).await?),
     };
 
     // Buyer signer (vouchers + any openChannel tx). Prompted only once, after we

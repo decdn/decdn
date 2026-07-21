@@ -479,19 +479,17 @@ mod tests {
     // allowance state. That needs anvil, which this crate has no dev-dep on.
     //
     // `alloy::providers::mock::Asserter` does NOT close that gap, and the reason
-    // is worth recording so it is not re-litigated: it is a FIFO transport mock
-    // with no method awareness, which makes read paths trivial to drive (see
-    // `cli/src/commands/unbond.rs` `mod plan_computation`) but a *send* path
-    // impractical. A single `send()` fans out the filler stack's
-    // estimateGas/nonce/chainId/feeHistory requests concurrently, so responses
-    // cannot be matched to methods and the queue drains unpredictably — measured:
-    // the remaining-queue length is 0 regardless of how many responses are
-    // pushed, so it cannot even distinguish "the reset ran" from "it did not".
-    // A test built on it would pin alloy's filler internals, not our logic.
+    // is worth recording so it is not re-litigated: it answers by QUEUE POSITION,
+    // not by method or calldata. That makes read paths trivial to drive (see
+    // `cli/src/commands/unbond.rs` `mod plan_computation`) and a *send* path
+    // impractical, because one `send()` issues several filler requests whose
+    // order we do not control — so a queued response cannot be tied to the call
+    // it answers, and the mock cannot report which calls were made. The same
+    // blindness is why the sibling `all_target` decision in `unbond.rs` had to be
+    // extracted to be testable at all.
     //
-    // (An earlier version of this comment claimed alloy shipped no `Asserter` at
-    // all. That was false; the correction landed in #1358, and the paragraph
-    // above is the actual reason the end-to-end test stays deferred.)
+    // A test built on it would therefore assert queue arithmetic rather than our
+    // sequencing, and would break on any alloy change to the filler stack.
 
     #[tokio::test]
     async fn reset_router_allowance_swallows_send_failure() {

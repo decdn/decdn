@@ -325,6 +325,32 @@ fn tier_step(target_mbps: u64, declared_mbps: u64) -> anyhow::Result<Option<u64>
     Ok((target_mbps < declared_mbps).then_some(target_mbps))
 }
 
+/// `--all`'s two coupled decisions: whether to clear the declared tier first,
+/// and which tier the retained-bond curve is then evaluated against.
+///
+/// An INACTIVE operator releases the tier as part of the same run (#1361):
+/// `declareMbps(0)` is accepted only from them, and it is the only route to 0
+/// they have — `deregisterNode` reverts `NodeNotActive`. `bondRequired(0) == 0`,
+/// so the retarget is what turns `--all` into a genuine full exit rather than a
+/// release down to the standing tier's floor. An ACTIVE operator keeps the old
+/// behavior: for them `declareMbps(0)` reverts, and clearing the tier is
+/// `decdn node deregister`'s job.
+///
+/// Pure, and split out for that reason. The decision is only observable through
+/// `bondRequired`'s ARGUMENT, and the `Asserter` the tests below use is a FIFO
+/// value queue with no argument awareness — it returns the same queued response
+/// whether the call was `bondRequired(0)` or `bondRequired(1000)`. So a test
+/// driving `resolve_release` cannot tell the retarget from its absence;
+/// mutating it away left every mocked test green (verified). Testing the
+/// decision directly is the only thing that actually pins it.
+fn all_target(active: bool, declared: U256) -> (Option<u64>, U256) {
+    if !active && declared != U256::ZERO {
+        (Some(0), U256::ZERO)
+    } else {
+        (None, declared)
+    }
+}
+
 /// Turn the requested amount into `(release, retained, declare_to)`, rejecting
 /// anything the contract would revert on. Split out of [`build_plan`] because
 /// this is where the three flags stop agreeing: each picks a different floor,
@@ -377,23 +403,7 @@ async fn resolve_release<P: Provider + Clone>(
             Ok((release, retained, declare_to))
         }
         AmountRequest::All => {
-            // An INACTIVE operator releases the tier as part of the same run
-            // (#1361): `declareMbps(0)` is accepted only from them, and it is
-            // the only route to 0 they have — `deregisterNode` reverts
-            // `NodeNotActive`. Without this, an ejected operator, or one who
-            // declared a tier without ever registering, has no CLI path to
-            // their bond at all: the standing curve floor is exactly what pins
-            // it, and a slash can leave them below that floor with NOTHING
-            // releasable. An active operator keeps the old behavior — for them
-            // `declareMbps(0)` reverts, and clearing the tier is
-            // `decdn node deregister`'s job.
-            let declare_to = (!active && declared != U256::ZERO).then_some(0u64);
-            // `bondRequired(0) == 0`, so a released tier makes this a full exit.
-            let target = if declare_to.is_some() {
-                U256::ZERO
-            } else {
-                declared
-            };
+            let (declare_to, target) = all_target(active, declared);
             // The contract's own floor: the bare curve, with no `min_bond.max()`.
             // That is independent of `minBond`, not below it — with the deployed
             // `k`/`α` the curve crosses above `minBond` around 1000 Mbps, so
@@ -457,7 +467,17 @@ pub(crate) async fn execute<P: Provider + Clone>(
             ..
         } => {
             if let Some(mbps) = declare_to {
-                let hint = format!("is {mbps} Mbps within the capacity band?");
+                // `0` is the release path (#1361) and is legal precisely because
+                // it bypasses the band, so the band question would be actively
+                // misleading advice there.
+                let hint = if mbps == 0 {
+                    "declareMbps(0) is accepted only from an operator that is NOT in the \
+                     registered set; if this node is still registered, use `decdn node \
+                     deregister` instead"
+                        .to_string()
+                } else {
+                    format!("is {mbps} Mbps within the capacity band?")
+                };
                 chain_ctx::send(
                     bond.declareMbps(U256::from(mbps)),
                     "declareMbps",
@@ -1084,15 +1104,11 @@ mod tests {
             );
         }
 
-        /// The #1361 exit: an operator NOT in the registered set releases their
-        /// tier as part of `--all`, because `deregisterNode` is unreachable to
-        /// them and the standing curve floor is exactly what pins their bond.
-        ///
-        /// Note the response queue is `[0]`, not `[curve_floor(declared)]` —
-        /// the target passed to `bondRequired` is 0, not the declared tier. A
-        /// regression that dropped the retarget would read the same single
-        /// response and silently retain the old floor, so the assertion that
-        /// catches it is `retained == 0` plus `declare_to == Some(0)`.
+        /// The #1361 exit end-to-end through `resolve_release`. This pins the
+        /// plumbing — the `active` flag reaches the `--all` arm, a declare is
+        /// planned, the release figure is the whole bond — but NOT the retarget
+        /// itself, which the mock cannot observe. See
+        /// `all_target_retargets_the_curve_for_an_inactive_operator`.
         #[tokio::test]
         async fn all_releases_the_tier_and_everything_for_an_inactive_operator() {
             let (release, retained, declare_to) = resolve_inactive(
@@ -1115,6 +1131,32 @@ mod tests {
                 token(10_126),
                 "the whole remaining bond, including a slashed-below-floor residual"
             );
+        }
+
+        /// The retarget itself, tested where it is observable at all.
+        ///
+        /// `resolve_release` cannot pin this: the decision shows up only in the
+        /// ARGUMENT to `bondRequired`, and `Asserter` answers by queue position,
+        /// not by calldata. Mutating the retarget away leaves every mocked test
+        /// in this module green — verified — while shipping a CLI that refuses
+        /// the #1361 exit with "nothing to release", because `retained` would be
+        /// `bondRequired(1000) > prior` and the release would floor to 0.
+        #[test]
+        fn all_target_retargets_the_curve_for_an_inactive_operator() {
+            let declared = U256::from(1000u64);
+
+            // Inactive with a standing tier: clear it, and evaluate the curve
+            // against 0 — the pair the mock cannot distinguish.
+            assert_eq!(all_target(false, declared), (Some(0), U256::ZERO));
+
+            // Active: unchanged. `declareMbps(0)` reverts for them, and the
+            // retained bond is their standing tier's floor.
+            assert_eq!(all_target(true, declared), (None, declared));
+
+            // Nothing declared: no redundant `declareMbps(0)` to pay gas for and
+            // log as a 0 -> 0 change, on either side of the registry.
+            assert_eq!(all_target(false, U256::ZERO), (None, U256::ZERO));
+            assert_eq!(all_target(true, U256::ZERO), (None, U256::ZERO));
         }
 
         /// The release is scoped to a tier that actually stands: an inactive

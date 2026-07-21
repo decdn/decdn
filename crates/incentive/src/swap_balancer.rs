@@ -474,8 +474,8 @@ mod tests {
     // on-chain*, and the two follow-up resets are observed against real
     // allowance state — stays deferred on an anvil dev-dep. See the equivalent
     // note in `swap_uniswap` for why `alloy::providers::mock::Asserter` does not
-    // substitute: it is a FIFO transport mock and a `send()` fans out the filler
-    // stack's requests concurrently, so it cannot observe which calls were made.
+    // substitute: it answers by queue position rather than by method, so it
+    // cannot observe which calls were made.
 
     #[tokio::test]
     async fn reset_helpers_swallow_send_failure() {

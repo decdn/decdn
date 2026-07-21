@@ -27,6 +27,23 @@ use std::time::Duration;
 
 use clap::Args;
 
+/// Validate `--region` at parse time, returning the NORMALIZED code so the
+/// value that reaches discovery is already canonical.
+///
+/// Only the flag goes through this — a `[identity] region` from the config file
+/// does not, so `select_candidates` still parses defensively. Rejecting there
+/// too would turn a stale config key into a hard failure of every fetch, which
+/// is a bigger behavior change than this fix is for.
+///
+/// The error names the accepted set rather than echoing the input back, matching
+/// `decdn_protocol::InvalidRegion` (a region code reaches log fields and metric
+/// labels).
+fn parse_region_flag(raw: &str) -> Result<String, String> {
+    decdn_protocol::Region::parse(raw)
+        .map(|r| r.to_string())
+        .ok_or_else(|| decdn_protocol::InvalidRegion.to_string())
+}
+
 /// The network, chain, target, and per-blob-limit flags shared by the paid
 /// client commands (`decdn fetch` and `decdn bundle pull`, #391). Flattened into
 /// each command's args so the resolution (`flag > config > default`) and
@@ -88,12 +105,17 @@ pub struct ClientFetchArgs {
     pub capacity_bond_address: Option<String>,
 
     /// Client region used to prefer same-region nodes when auto-discovering
-    /// (#936). Matched by case-insensitive equality against each node's on-chain
-    /// self-attested region (`CapacityBond` `regionHint`, ISO 3166-1 alpha-2 per
-    /// ADR 030 — e.g. `US`, `DE`), so pass the same form operators register.
-    /// Overrides `identity.region`; when unset (and no config region), discovery
-    /// skips the region-first ordering.
-    #[arg(long, value_name = "REGION")]
+    /// (#936). Matched against each node's on-chain self-attested region
+    /// (`CapacityBond` `regionHint`, ISO 3166-1 alpha-2 per ADR 030 — e.g. `US`,
+    /// `DE`); case and surrounding whitespace are normalized away, so any
+    /// spelling of a valid code works. Overrides `identity.region`; when unset
+    /// (and no config region), discovery skips the region-first ordering.
+    ///
+    /// Rejected at parse time if it is not an accepted code. Previously an
+    /// unrecognized value was accepted and then silently ignored, so a user who
+    /// asked for locality got round-robin selection with no indication their
+    /// flag had been discarded.
+    #[arg(long, value_name = "REGION", value_parser = parse_region_flag)]
     pub region: Option<String>,
 
     /// Latency-driven proxy warming (#1174, ADR 037): on a cache miss whose only
@@ -169,19 +191,22 @@ pub struct ClientFetchArgs {
     #[arg(long, value_name = "MS", default_value_t = 30_000, value_parser = clap::value_parser!(u64).range(1..))]
     pub stall_timeout_ms: u64,
 
-    /// Hard cap on the total wall-clock time of node discovery, and separately of a
-    /// single blob fetch, in milliseconds. Defaults to 1 hour. For `bundle pull` the
-    /// fetch half applies per entry.
+    /// Hard cap on the total wall-clock time of the `CapacityBond` registry read, and
+    /// separately of a single blob fetch, in milliseconds. Defaults to 1 hour. For
+    /// `bundle pull` the fetch half applies per entry.
     ///
     /// This is a leak guard, not the health signal — `--stall-timeout-ms` is what catches
     /// a dead provider. Lower it when you must bound total runtime regardless of whether
     /// the transfer is progressing.
     ///
-    /// Discovery (the `CapacityBond` registry read, its retry schedule, and the probe
-    /// fan-out) gets its own budget of this size rather than sharing the transfer's, so
-    /// that `bundle pull`'s per-entry accounting is unaffected. Before #1349 nothing
-    /// bounded discovery at all: a failing registry read could burn its full retry
-    /// schedule with `--timeout-ms 5000` set.
+    /// The registry read (including its retry schedule) gets its own budget of this size
+    /// rather than sharing the transfer's, so `bundle pull`'s per-entry accounting is
+    /// unaffected. Before #1349 nothing bounded it at all: a failing read could burn its
+    /// full retry schedule with `--timeout-ms 5000` set. Exceeding the budget is treated
+    /// as a read failure, so a cached peer list is still used if one is present.
+    ///
+    /// It does NOT bound the probe fan-out that ranks candidates. Probing is bounded per
+    /// node by the probe timeout, not by this flag.
     ///
     /// It must exceed TWICE `--stall-timeout-ms`. The cap bounds the whole exchange, and the
     /// open stage is bounded by the same stall budget, so both can run inside it
@@ -238,27 +263,30 @@ impl ClientFetchArgs {
     /// `PullDeadlines`'s optional cap — misinforming every reader and forcing a pointless
     /// match (#1145 review). A caller that wants the optional form wraps it.
     ///
-    /// The same value also bounds node discovery, as a SEPARATE budget rather than a
+    /// The same value also bounds the registry read, as a SEPARATE budget rather than a
     /// shared one — see [`Self::discovery_cap`].
     #[must_use]
     pub const fn hard_cap(&self) -> Duration {
         Duration::from_millis(self.timeout_ms)
     }
 
-    /// Wall-clock cap on node discovery: the registry read (including its retry
-    /// schedule) and the probe fan-out that picks a provider (#1349).
+    /// Wall-clock cap on the `CapacityBond` registry read, including its ADR 012 retry
+    /// schedule (#1349).
     ///
     /// The same `--timeout-ms` value as [`Self::hard_cap`], deliberately not a knob of
-    /// its own. Discovery had no bound at all, and a dedicated flag would be a fifth
+    /// its own. The read had no bound at all, and a dedicated flag would be a fifth
     /// timeout for operators to reason about when the one they already reach for —
-    /// "how long may this command take" — is the right question. The help text names
-    /// discovery so the widened scope is not a silent reinterpretation.
+    /// "how long may this command take" — is the right question.
     ///
-    /// It is a separate budget, not a shared one: sharing would make
-    /// `bundle pull`'s per-entry fetch cap depend on how long discovery took, turning a
-    /// documented per-entry bound into a whole-run one. Two budgets of the same size
-    /// means the true worst case is `2 ×` the flag, which is the honest cost of not
-    /// adding a knob.
+    /// A separate budget, not a shared one: sharing would make `bundle pull`'s per-entry
+    /// fetch cap depend on how long the read took, turning a documented per-entry bound
+    /// into a whole-run one.
+    ///
+    /// # What this does NOT bound
+    ///
+    /// The probe fan-out. `fetch` probes `SELECT_K` candidates after the read, and
+    /// `bundle pull` probes per entry; neither is inside this budget. Named here because
+    /// the obvious reading of "discovery" includes probing, and it does not.
     #[must_use]
     pub const fn discovery_cap(&self) -> Duration {
         Duration::from_millis(self.timeout_ms)
@@ -368,6 +396,27 @@ mod tests {
         let c = parse(&[]);
         assert_eq!(c.stall_timeout(), Duration::from_secs(30));
         assert_eq!(c.hard_cap(), Duration::from_hours(1));
+    }
+
+    /// `--region` is validated at parse time, not silently discarded. Before
+    /// this, `--region usa` parsed fine and then failed `Region::parse` deep in
+    /// discovery, so the user got round-robin selection with no hint that the
+    /// flag they passed had been thrown away.
+    #[test]
+    fn an_unrecognized_region_flag_is_rejected_not_ignored() {
+        let err = TestCli::try_parse_from(["test", "--region", "usa"])
+            .expect_err("`usa` is not an ISO 3166-1 alpha-2 code");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("ISO 3166-1"),
+            "the error names the format: {msg}"
+        );
+
+        // Any spelling of a valid code is accepted, and normalized on the way in
+        // so discovery compares canonical values.
+        assert_eq!(parse(&["--region", " us "]).region.as_deref(), Some("US"));
+        assert_eq!(parse(&["--region", "De"]).region.as_deref(), Some("DE"));
+        assert_eq!(parse(&[]).region, None, "the flag stays optional");
     }
 
     /// A fetch must ALWAYS terminate (#1145 review). The stall clock resets on any

@@ -284,6 +284,8 @@ pub fn decdn_protocol::region::Region::as_str(&self) -> &str
 pub fn decdn_protocol::region::Region::parse(&str) -> core::option::Option<Self>
 impl core::convert::AsRef<str> for decdn_protocol::region::Region
 pub fn decdn_protocol::region::Region::as_ref(&self) -> &str
+impl core::fmt::Debug for decdn_protocol::region::Region
+pub fn decdn_protocol::region::Region::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::fmt::Display for decdn_protocol::region::Region
 pub fn decdn_protocol::region::Region::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::str::traits::FromStr for decdn_protocol::region::Region
@@ -473,6 +475,8 @@ pub fn decdn_protocol::region::Region::as_str(&self) -> &str
 pub fn decdn_protocol::region::Region::parse(&str) -> core::option::Option<Self>
 impl core::convert::AsRef<str> for decdn_protocol::region::Region
 pub fn decdn_protocol::region::Region::as_ref(&self) -> &str
+impl core::fmt::Debug for decdn_protocol::region::Region
+pub fn decdn_protocol::region::Region::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::fmt::Display for decdn_protocol::region::Region
 pub fn decdn_protocol::region::Region::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::str::traits::FromStr for decdn_protocol::region::Region
