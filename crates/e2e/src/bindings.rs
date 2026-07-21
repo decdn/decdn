@@ -63,6 +63,14 @@ alloy::sol! {
         function declareMbps(uint256 mbps) external;
         function bondRequired(uint256 mbps) external view returns (uint256);
         function activeBond(address operator) external view returns (uint256);
+        function declaredMbps(address operator) external view returns (uint256);
+        function minBond() external view returns (uint256);
+        // Unbonding-window reads (#1033, G-NODE-06). `unbondingOf` is the
+        // public `UnbondingRequest` mapping getter, whose static struct
+        // flattens to `(amount, unlockAt)`; a non-zero `amount` makes
+        // `isActive` false for the whole window.
+        function unbondingOf(address operator) external view returns (uint256 amount, uint256 unlockAt);
+        function unbondingPeriod() external view returns (uint256);
         // Slash-appeal assertion reads (#1032, G-NODE-05). `slashedAtEpoch`
         // is the ADR-036 vote-weight watermark cleared/recomputed on a granted
         // appeal; `firstBondedAt` feeds the Governor age-ramp; `slashRecords`
