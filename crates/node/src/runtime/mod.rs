@@ -1813,7 +1813,6 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
         announce_interval_sec: cfg.gossip.announce_interval_sec,
         subscribe_global: cfg.gossip.subscribe_global,
         region: cfg.identity.region.clone(),
-        subscribe_reputation: cfg.gossip.subscribe_reputation,
         reputation_publish_interval_sec: cfg.gossip.reputation_publish_interval_sec,
     };
     // ADR 001 rule 2: a NodeAnnounce is accepted only from a currently-staked
@@ -1863,27 +1862,49 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
         .context("local reputation config invalid")?,
     );
     let observation_buffer = Arc::new(decdn_reputation::ObservationBuffer::new());
-    let reputation_wiring = decdn_gossip::ReputationWiring {
-        sink: Some(Arc::new(crate::reputation_wiring::NodeReputationSink::new(
-            Arc::clone(&network_reputation),
-            Arc::clone(&regional_coverage),
-            Arc::clone(&settlement_source),
-            Arc::clone(&ch.peer_table),
-            Arc::clone(&ch.staker_set),
-            min_counterparties,
-        ))),
-        staked: crate::reputation_wiring::report_staked_gate(Arc::clone(&ch.staker_set)),
-        // Outbound report capture (#831): the `NodeOrigin` pull path feeds
-        // `observation_buffer` with delivery/probe outcomes, so wire the drain —
-        // which spawns the gossip publisher — whenever pull-through is enabled.
-        // With the feature off nothing writes the buffer, so we leave the drain
-        // `None` and the publisher unspawned (the node still aggregates inbound
-        // reports), exactly as before #831.
-        report_drain: cfg.cache.node_to_node_pull_through_enabled.then(|| {
-            Arc::new(crate::reputation_wiring::NodeReportDrain::new(Arc::clone(
-                &observation_buffer,
-            ))) as Arc<dyn decdn_gossip::ReportDrain>
-        }),
+    // Outbound report capture (#831): the `NodeOrigin` pull path feeds
+    // `observation_buffer` with delivery/probe outcomes, so wire the drain —
+    // which spawns the gossip publisher — whenever pull-through is enabled. With
+    // the feature off nothing writes the buffer, so leave it `None` and the
+    // publisher unspawned (the node still aggregates inbound reports), exactly
+    // as before #831.
+    let report_drain = cfg.cache.node_to_node_pull_through_enabled;
+    // The operator's `gossip.subscribe_reputation` is resolved into the wiring
+    // variant HERE, and this is the only place it is consulted (#1355 review).
+    // It used to be threaded into `GossipRuntimeConfig` as well and re-checked
+    // inside `spawn`, which left two independent ways to say "off" while this
+    // site pinned the wiring to `Enabled` unconditionally.
+    let reputation_wiring = if cfg.gossip.subscribe_reputation {
+        decdn_gossip::ReputationWiring::Enabled {
+            sink: Arc::new(crate::reputation_wiring::NodeReputationSink::new(
+                Arc::clone(&network_reputation),
+                Arc::clone(&regional_coverage),
+                Arc::clone(&settlement_source),
+                Arc::clone(&ch.peer_table),
+                Arc::clone(&ch.staker_set),
+                min_counterparties,
+            )),
+            staked: crate::reputation_wiring::report_staked_set(Arc::clone(&ch.staker_set)),
+            publish: report_drain.then(|| {
+                Arc::new(crate::reputation_wiring::NodeReportDrain::new(Arc::clone(
+                    &observation_buffer,
+                ))) as Arc<dyn decdn_gossip::ReportDrain>
+            }),
+        }
+    } else {
+        // #864: the two settings are inert in combination — the buffer is
+        // written but the topic is never joined, so observations accumulate and
+        // never publish. Diagnosed here rather than in `decdn-gossip` because
+        // this is the only scope holding both knobs; the gossip crate could
+        // only ever guess which one the operator meant to change.
+        if report_drain {
+            tracing::warn!(
+                "gossip.subscribe_reputation = false with cache.node_to_node_pull_through_enabled \
+                 = true: delivery observations will accumulate in memory and never publish — \
+                 enable gossip.subscribe_reputation to drain them"
+            );
+        }
+        decdn_gossip::ReputationWiring::Disabled
     };
 
     // Buyer-side PaymentChannel bootstrap + node-to-node pull-through

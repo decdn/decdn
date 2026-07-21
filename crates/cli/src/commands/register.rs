@@ -56,6 +56,9 @@ pub async fn run(args: &cli::RegisterArgs, global_config: Option<&Path>) -> anyh
         })?;
     terms::ensure_accepted_async(terms_hash, args.accept_terms).await?;
 
+    // `decdn node register` submits a single transaction and has no partial
+    // report to print, so the slot is only consulted through the error message.
+    let mut tx_slot = None;
     let outcome = submit_registration(
         &provider,
         &signer,
@@ -66,6 +69,7 @@ pub async fn run(args: &cli::RegisterArgs, global_config: Option<&Path>) -> anyh
         &args.multiaddrs,
         terms_hash,
         args.chain.common.dry_run,
+        &mut tx_slot,
     )
     .await?;
 
@@ -101,6 +105,11 @@ pub(crate) struct RegisterOutcome {
 /// `dry_run` reads the chain for the nonces the signatures depend on but does
 /// not submit. Shared by `run` and `decdn setup` so the keystore is decrypted
 /// once across bond + register.
+///
+/// `tx_slot` is caller-owned for the same reason `bond::execute`'s `Outcome` is
+/// (#1355): on an unreadable receipt the transaction is broadcast and may take
+/// effect, and the returned [`RegisterOutcome`] is gone with the `Err`. See
+/// [`decdn_incentive::tx::send`] for the slot's contract.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn submit_registration<P: Provider + Clone>(
     provider: &P,
@@ -112,6 +121,7 @@ pub(crate) async fn submit_registration<P: Provider + Clone>(
     multiaddrs: &[String],
     terms_hash: B256,
     dry_run: bool,
+    tx_slot: &mut Option<B256>,
 ) -> anyhow::Result<RegisterOutcome> {
     // Load the iroh node key. Require it to already exist — `load_or_generate`
     // would otherwise mint a *fresh* identity and register that, silently
@@ -182,29 +192,32 @@ pub(crate) async fn submit_registration<P: Provider + Clone>(
         return Ok(outcome);
     }
 
-    let pending = bond
-        .registerNode(
+    // Via the shared `send` (#1355) so a receipt-fetch timeout still names the
+    // in-flight tx, into the CALLER's `tx_slot`. Writing it into the local
+    // `outcome` instead would not survive: `outcome` is returned by value, so
+    // the `?` below drops it and the caller — which reports the partial summary
+    // — would see nothing.
+    //
+    // The hint reaches both the send and revert arms, which matters here:
+    // `registerNode`'s failure modes are pre-flight gas-estimate reverts, so it
+    // is the SEND arm that fires in practice.
+    let tx = chain_ctx::send(
+        bond.registerNode(
             node_id,
             Bytes::from(packed_multiaddrs),
             region.to_string(),
             terms_hash,
             Bytes::from(binding_sig),
             Bytes::from(ed25519_sig),
-        )
-        .send()
-        .await
-        .context("registerNode transaction failed to send (check RPC, gas, and that the bond covers minBond / the declared-capacity curve)")?;
-    let receipt = pending
-        .get_receipt()
-        .await
-        .context("registerNode sent but the receipt could not be fetched")?;
-
-    let tx = receipt.transaction_hash;
-    anyhow::ensure!(
-        receipt.status(),
-        "registerNode reverted (tx {tx}); most likely the bond does not cover minBond / the \
-         declared-capacity curve, the nodeId/address is already bound, or a signature was rejected",
-    );
+        ),
+        "registerNode",
+        Some(
+            "most likely the bond does not cover minBond / the declared-capacity curve, the \
+             nodeId/address is already bound, or a signature was rejected",
+        ),
+        tx_slot,
+    )
+    .await?;
     outcome.tx = Some(tx);
     Ok(outcome)
 }

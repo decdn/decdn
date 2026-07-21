@@ -1,6 +1,10 @@
 //! Client-side node discovery (#936): read the active node set from
-//! `CapacityBond.getActiveNodes` so `decdn fetch`/`probe` can pick a node
-//! instead of being handed an explicit `--node-id`/`--addr`/`--provider-address`.
+//! `CapacityBond.getActiveNodes` so a client can pick a node instead of being
+//! handed an explicit `--node-id`/`--addr`/`--provider-address`. Read from
+//! `fetch::discover_provider` and from the discovery branch of
+//! `bundle_pull::bundle_pull`; the ranking half is also used by
+//! `fetch::probe_and_rank`. `decdn probe` deliberately still requires an
+//! explicit target.
 //!
 //! This is the **read + select** half. Dialing the chosen node uses its iroh
 //! `NodeId` via a discovery-enabled endpoint (`presets::N0` / configured

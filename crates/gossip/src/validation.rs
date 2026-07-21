@@ -16,17 +16,20 @@ use crate::reputation::StakedNodeSet;
 
 /// ADR 001 rule-2 admission gate for inbound `NodeAnnounce`, naming its two
 /// safety-opposite states so neither is the silent default: [`Self::Enforce`]
-/// gates on staked membership, [`Self::Disabled`] fails open. The generic `S` is
+/// gates on staked membership, `Disabled` (test-only) fails open. The generic `S` is
 /// the membership-set handle — `&dyn StakedNodeSet` on the borrowed
 /// [`validate_envelope`] path, `Arc<dyn StakedNodeSet>` on the owned spawn path
 /// (see [`OwnedAnnounceGate`]).
 ///
-/// **Do not confuse with [`crate::ReportGate`], whose `Disabled` means the
-/// opposite.** That is the sibling admission gate for reputation reports over
-/// the same [`StakedNodeSet`] seam: its `Disabled` is fail-**CLOSED**, while
-/// `AnnounceGate::Disabled` here is fail-**OPEN**. See [`crate::ReportGate`]
-/// for what each polarity does; distinct types keep the inversion from being
-/// copy-pasted wrong-way-round (#1338).
+/// **`AnnounceGate::Disabled` fails OPEN.** The inverse pole still exists —
+/// `ReputationWiring::Disabled` is fail-CLOSED — so the polarity
+/// inversion #1338 warned about has not gone away; always check which type you
+/// are holding. What #1342 removed is the *shape* collision: the fail-closed
+/// side used to be a second two-variant `*Gate` enum over this same
+/// [`StakedNodeSet`] seam, so the two could be swapped at a call site by
+/// mistaking one for the other. It is now a differently-shaped wiring enum with
+/// a different name, which is what makes them hard to confuse — not the absence
+/// of an inverted twin.
 // `Copy` is conditional: it applies only where `S: Copy`, i.e. the borrowed
 // `AnnounceGate<&dyn StakedNodeSet>`. The owned `OwnedAnnounceGate` (an `Arc`)
 // is `Clone`-only, so `gate.clone()` at each subscriber is a refcount bump, not
@@ -38,9 +41,23 @@ pub enum AnnounceGate<S> {
     /// `Enforce` set with no members rejects every announce, which is correct:
     /// an empty active registry has no staked peers to learn.
     Enforce(S),
-    /// FAIL-OPEN: accept any signature-valid announce. Tests only — no
-    /// production path constructs this (the runtime always [`Self::Enforce`]s;
-    /// `announce_staked_gate` in the `node` crate is the unit-tested guarantee).
+    /// FAIL-OPEN: skip the staked-membership check *only*. Every other
+    /// [`validate_envelope`] rule still applies — **signature verification
+    /// included**, since it runs before this gate is consulted — as do the
+    /// version byte, trailing bytes, payload variant, region allowlist and
+    /// clock skew.
+    ///
+    /// **`#[cfg(test)]`: this variant does not exist in a production build.**
+    /// It previously relied on a doc comment plus a unit test on
+    /// `announce_staked_gate` to stay out of the runtime — but nothing stopped a
+    /// future edit passing `Disabled` straight to
+    /// [`crate::GossipService::spawn`], which would reopen the hole #1170 closed
+    /// with every existing test still green (`announce_staked_gate` would keep
+    /// returning `Enforce`; it would just have no callers). Gating the variant
+    /// moves that invariant from prose to the compiler. Note the asymmetry with
+    /// `ReputationWiring::Disabled`, which is *not* gated: that one fails
+    /// CLOSED, so it is a legitimate runtime choice.
+    #[cfg(test)]
     Disabled,
 }
 
@@ -50,6 +67,7 @@ impl<S> std::fmt::Debug for AnnounceGate<S> {
         // which is all that identifies the gate's safety state.
         match self {
             Self::Enforce(_) => f.write_str("AnnounceGate::Enforce(..)"),
+            #[cfg(test)]
             Self::Disabled => f.write_str("AnnounceGate::Disabled"),
         }
     }
@@ -62,10 +80,11 @@ pub type OwnedAnnounceGate = AnnounceGate<Arc<dyn StakedNodeSet>>;
 
 impl OwnedAnnounceGate {
     /// Borrow-project this owned gate into the borrowed form
-    /// [`validate_envelope`] takes, preserving the variant (`Enforce`/`Disabled`).
+    /// [`validate_envelope`] takes, preserving the variant.
     pub fn as_gate(&self) -> AnnounceGate<&dyn StakedNodeSet> {
         match self {
             AnnounceGate::Enforce(s) => AnnounceGate::Enforce(s.as_ref()),
+            #[cfg(test)]
             AnnounceGate::Disabled => AnnounceGate::Disabled,
         }
     }
@@ -195,10 +214,11 @@ const _: () = assert!(
 /// `gate` enforces ADR 001 rule 2: [`AnnounceGate::Enforce`] accepts an announce
 /// only when its author `node_id` is a currently-staked node in the on-chain
 /// registry (queried through the live [`StakedNodeSet`] cache, kept fresh by the
-/// registry event tail). [`AnnounceGate::Disabled`] skips the check — accept any
-/// signature-valid announce — and exists only for tests; the runtime always
-/// passes `Enforce` (there is no production path that disables the gate). See
-/// [`AnnounceGate::Enforce`] for the empty-set semantics.
+/// registry event tail). The test-only `AnnounceGate::Disabled` skips *that
+/// check alone* — every other rule below still applies, signature verification
+/// included (it runs before the gate is consulted). It is `#[cfg(test)]`, so the
+/// runtime cannot pass it. See [`AnnounceGate::Enforce`] for the empty-set
+/// semantics.
 pub fn validate_envelope(
     bytes: &[u8],
     now_us: u64,
@@ -553,8 +573,11 @@ mod tests {
         );
     }
 
-    /// [`AnnounceGate::Disabled`] fails open (tests / unstaked modes): any
-    /// signature-valid announce is accepted.
+    /// [`AnnounceGate::Disabled`] fails open (tests / unstaked modes): an
+    /// otherwise-valid announce from an unstaked author is accepted. Only the
+    /// membership check is skipped — the many sibling tests in this module that
+    /// assert a rejection while passing `Disabled` are what cover the rules that
+    /// still apply.
     #[test]
     fn disabled_gate_accepts_any() {
         let sk = fresh_key();

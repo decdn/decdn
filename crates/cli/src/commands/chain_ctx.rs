@@ -363,6 +363,13 @@ pub fn resolve_swap(
     }))
 }
 
+/// The shared transaction submitter, re-exported so the on-chain `node`
+/// subcommands keep their `chain_ctx::send(..)` call shape. It lives in
+/// `decdn-incentive` because the swap venues there need it too (#1355). See
+/// [`decdn_incentive::tx::send`] for the `landed` contract, which callers must
+/// read carefully: an `Err` does **not** imply nothing landed.
+pub(crate) use decdn_incentive::tx::send;
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {

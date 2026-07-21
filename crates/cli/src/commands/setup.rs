@@ -366,7 +366,9 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
                     None,
                     swap_summary.as_ref(),
                     true,
-                    &readiness,
+                    Some(&readiness),
+                    None,
+                    None,
                     &args.region,
                     args.multiaddrs.len(),
                 )
@@ -476,76 +478,143 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
         None
     };
 
-    // ---- Phase 2.1/2.2: bond (idempotent stake-to-tier). ----
-    if !json {
-        println!("bond:");
-    }
-    let bond_outcome = bond::execute(
-        &bond_contract,
-        &provider,
-        &plan,
-        operator,
-        cb_addr,
-        U256::from(args.mbps),
-    )
-    .await?;
-    if !json {
-        let mut out = io::stdout().lock();
-        bond::write_plan(&mut out, &plan, false, &bond_outcome, false)
-            .context("failed to write bond result")?;
-    }
+    // ---- Live phases (bond → register → read-back). ----
+    //
+    // Every outcome is owned HERE, outside the fallible section, so a sequence
+    // that fails part-way is still reported (#1355). This matters most under
+    // `--json`, where the aggregated summary below is the *only* carrier of the
+    // swap and bond transaction hashes: propagating straight out of a phase
+    // printed nothing at all, leaving an operator whose USDC had been swapped
+    // and whose TOKEN had been bonded with no record of either. One reporting
+    // site rather than a bail-out per phase, so it cannot go stale when a phase
+    // is added (#1355 review).
+    let mut bond_outcome = bond::Outcome::default();
+    let mut register_outcome: Option<register::RegisterOutcome> = None;
+    // Separate from `register_outcome` because `submit_registration` returns its
+    // outcome by value: on an unreadable receipt the `Err` takes the outcome
+    // with it, and this slot is the only thing that survives to name the
+    // in-flight registration in the partial summary.
+    let mut register_tx: Option<B256> = None;
+    let mut bond_reported = false;
+    // Whether the bond phase itself completed. Gates the re-run guidance below:
+    // after a successful bond, a later phase failing carries no bond hazard.
+    let mut bond_done = false;
 
-    // ---- Phase 2.3: register (skipped only when *this* key is already bound;
-    //      `terms_hash` is `Some` iff a fresh registration is due + accepted). ----
-    let register_outcome = if let Some(terms_hash) = terms_hash {
+    let live: anyhow::Result<Readiness> = async {
+        // ---- Phase 2.1/2.2: bond (idempotent stake-to-tier). ----
         if !json {
-            println!("register:");
+            println!("bond:");
         }
-        let outcome = register::submit_registration(
+        bond::execute(
+            &bond_contract,
             &provider,
-            &signer,
-            &resolved.data_dir,
+            &plan,
+            operator,
             cb_addr,
-            resolved.chain_id,
-            &args.region,
-            &args.multiaddrs,
-            terms_hash,
-            false,
+            U256::from(args.mbps),
+            &mut bond_outcome,
         )
         .await?;
+        bond_done = true;
         if !json {
             let mut out = io::stdout().lock();
-            register::write_outcome(&mut out, &outcome, false)
-                .context("failed to write register result")?;
+            bond::write_plan(&mut out, &plan, false, &bond_outcome, false)
+                .context("failed to write bond result")?;
+            bond_reported = true;
         }
-        Some(outcome)
-    } else {
-        hline(
-            json,
-            "register: skipped (this node key already registered on-chain)",
-        );
-        None
+
+        // ---- Phase 2.3: register (skipped only when *this* key is already
+        //      bound; `terms_hash` is `Some` iff a fresh registration is due). ----
+        if let Some(terms_hash) = terms_hash {
+            if !json {
+                println!("register:");
+            }
+            let outcome = register::submit_registration(
+                &provider,
+                &signer,
+                &resolved.data_dir,
+                cb_addr,
+                resolved.chain_id,
+                &args.region,
+                &args.multiaddrs,
+                terms_hash,
+                false,
+                &mut register_tx,
+            )
+            .await?;
+            if !json {
+                let mut out = io::stdout().lock();
+                register::write_outcome(&mut out, &outcome, false)
+                    .context("failed to write register result")?;
+            }
+            register_outcome = Some(outcome);
+        } else {
+            hline(
+                json,
+                "register: skipped (this node key already registered on-chain)",
+            );
+        }
+
+        // ---- Phase 5: readiness summary (read back on-chain state). ----
+        read_readiness(&bond_contract, operator).await
+    }
+    .await;
+
+    let summary = |readiness: Option<&Readiness>| {
+        build_summary(
+            &pf,
+            keys_generated,
+            &plan,
+            &bond_outcome,
+            register_outcome.as_ref(),
+            swap_summary.as_ref(),
+            false,
+            readiness,
+            Some(terms_hash.is_some()),
+            register_tx,
+            &args.region,
+            args.multiaddrs.len(),
+        )
     };
 
-    // ---- Phase 5: readiness summary (read back on-chain state). ----
-    let readiness = read_readiness(&bond_contract, operator).await?;
+    let readiness = match live {
+        Ok(readiness) => readiness,
+        Err(err) => {
+            // The single partial-report site. In `--json` the summary carries
+            // every landed hash (swap, bond, register) with `partial: true`; in
+            // human mode each phase already printed its own result as it landed,
+            // so the only gap is a bond that failed before reaching its writer.
+            //
+            // The write is NOT `?`-ed: a broken stdout must never displace the
+            // chain error, which is the whole payload here (same discipline as
+            // `bond::run`, and `println!` is avoided because it *panics* on
+            // EPIPE — `decdn setup --json | head` would otherwise abort instead
+            // of reporting).
+            let write_result = if json {
+                writeln!(io::stdout().lock(), "{}", summary(None))
+            } else if bond_reported {
+                Ok(())
+            } else {
+                bond::write_plan(&mut io::stdout().lock(), &plan, false, &bond_outcome, false)
+            };
+            if let Err(write_err) = write_result {
+                eprintln!("warning: failed to write the partial setup report: {write_err}");
+            }
+            // Same guidance `bond::run` attaches, and only when the BOND phase
+            // failed: `setup` reuses `bond::execute` so it carries the identical
+            // re-run hazard, and it is the documented onboarding entry point
+            // people blind-retry. A later phase failing after a confirmed bond
+            // has no such hazard, and the hint would misdescribe it.
+            if bond_done {
+                return Err(err);
+            }
+            return Err(err).context(bond::resume_hint(&bond_outcome));
+        }
+    };
+
     emit_readiness(json, &readiness, &args.region, args.multiaddrs.len());
     if json {
-        println!(
-            "{}",
-            build_summary(
-                &pf,
-                keys_generated,
-                &plan,
-                &bond_outcome,
-                register_outcome.as_ref(),
-                swap_summary.as_ref(),
-                false,
-                &readiness,
-                &args.region,
-                args.multiaddrs.len(),
-            )
-        );
+        println!("{}", summary(Some(&readiness)));
     }
 
     Ok(())
@@ -1171,7 +1240,17 @@ fn build_summary(
     register_outcome: Option<&register::RegisterOutcome>,
     swap: Option<&SwapSummary>,
     dry_run: bool,
-    readiness: &Readiness,
+    // `None` when a live phase failed before the readiness read-back; the
+    // object is then flagged `partial` rather than being a different shape.
+    readiness: Option<&Readiness>,
+    // Whether a fresh registration was owed at all. Distinguishes "skipped
+    // because this key is already registered" from "owed but never completed".
+    // `None` on the dry-run path, which returns before due-ness is determined.
+    register_due: Option<bool>,
+    // A `registerNode` that was broadcast but whose outcome is unresolved. Only
+    // ever `Some` alongside `register_outcome: None` — a resolved registration
+    // reports its hash through the outcome instead.
+    register_tx: Option<B256>,
     region: &str,
     multiaddrs: usize,
 ) -> serde_json::Value {
@@ -1201,14 +1280,25 @@ fn build_summary(
             "bond_tx": tx_hex(bond_outcome.bond),
             "declare_tx": tx_hex(bond_outcome.declare),
         },
+        // `skipped` alone used to conflate three states once the partial path
+        // could emit this object: not due, not reached, and attempted-and-failed
+        // (#1355 review). `due` disambiguates — `skipped: true, due: true` is a
+        // registration that was owed and did not complete — and `tx` carries the
+        // hash when one was broadcast without a readable receipt, which is the
+        // case where the operator most needs it.
         "register": match register_outcome {
             Some(o) => serde_json::json!({
                 "skipped": false,
+                "due": true,
                 "submitted": o.tx.is_some(),
                 "tx": tx_hex(o.tx),
                 "node_id": format!("{:#x}", o.node_id),
             }),
-            None => serde_json::json!({ "skipped": true }),
+            None => serde_json::json!({
+                "skipped": true,
+                "due": register_due,
+                "tx": tx_hex(register_tx),
+            }),
         },
         "swap": match swap {
             Some(s) => serde_json::json!({
@@ -1219,14 +1309,25 @@ fn build_summary(
             }),
             None => serde_json::Value::Null,
         },
-        "readiness": {
-            "registry_active": readiness.active,
-            "active_bond_base": readiness.active_bond.to_string(),
-            "declared_mbps": readiness.declared_mbps.to_string(),
-            "node_id": format!("{:#x}", readiness.node_id),
-            "region": region,
-            "multiaddrs": multiaddrs,
+        // `null` on the partial-failure path, where the run never reached the
+        // read-back. `partial` below is the flag a consumer should branch on.
+        "readiness": match readiness {
+            Some(r) => serde_json::json!({
+                "registry_active": r.active,
+                "active_bond_base": r.active_bond.to_string(),
+                "declared_mbps": r.declared_mbps.to_string(),
+                "node_id": format!("{:#x}", r.node_id),
+                "region": region,
+                "multiaddrs": multiaddrs,
+            }),
+            None => serde_json::Value::Null,
         },
+        // True when a live phase failed part-way: the transaction fields above
+        // record what landed, and the process exits non-zero. Emitting the SAME
+        // object shape on both paths is deliberate — a `--json` consumer parses
+        // one schema and branches on this flag, rather than having to recognise
+        // a differently-shaped error object (#1355 review).
+        "partial": readiness.is_none(),
     })
 }
 
@@ -1437,6 +1538,137 @@ mod tests {
         }
     }
 
+    /// #1355 review — the partial-failure summary must be the SAME shape as the
+    /// success one, carrying whatever landed, so a `--json` consumer parses one
+    /// schema and branches on `partial`. The swap hash is the case that matters
+    /// most: it is irreversibly spent USDC, and the aggregated object is its
+    /// only machine-readable carrier (`hline` is a no-op under `--json`).
+    #[test]
+    fn build_summary_partial_keeps_the_shape_and_the_landed_hashes() {
+        let swap = SwapSummary {
+            swap_out: U256::from(50_000u64),
+            max_in: U256::from(1_030_000u64),
+            impact_bps: 42,
+            tx: Some(B256::repeat_byte(0x9A)),
+        };
+        let bond_outcome = bond::Outcome {
+            approve: Some(B256::repeat_byte(0xA1)),
+            bond: Some(B256::repeat_byte(0xB2)),
+            declare: None,
+        };
+        let v = build_summary(
+            &pf_with(None, 0, 50_000, 100, 10),
+            false,
+            &sample_plan(),
+            &bond_outcome,
+            None,
+            Some(&swap),
+            false,
+            None,
+            Some(true),
+            None,
+            "US",
+            1,
+        );
+
+        assert_eq!(v["partial"], serde_json::json!(true));
+        assert!(v["readiness"].is_null(), "no read-back on the failure path");
+        // Everything that actually happened is still reported.
+        assert_eq!(
+            v["swap"]["tx"],
+            serde_json::json!(format!("{:#x}", B256::repeat_byte(0x9A)))
+        );
+        assert_eq!(
+            v["bond"]["approve_tx"],
+            serde_json::json!(format!("{:#x}", B256::repeat_byte(0xA1)))
+        );
+        assert_eq!(
+            v["bond"]["bond_tx"],
+            serde_json::json!(format!("{:#x}", B256::repeat_byte(0xB2)))
+        );
+        // Same keys as the success shape, so one parser handles both.
+        let ok = build_summary(
+            &pf_with(None, 0, 50_000, 100, 10),
+            false,
+            &sample_plan(),
+            &bond_outcome,
+            None,
+            Some(&swap),
+            false,
+            Some(&sample_readiness()),
+            Some(true),
+            None,
+            "US",
+            1,
+        );
+        assert_eq!(ok["partial"], serde_json::json!(false));
+        let keys = |v: &serde_json::Value| {
+            let mut k: Vec<String> = v
+                .as_object()
+                .expect("summary is an object")
+                .keys()
+                .cloned()
+                .collect();
+            k.sort();
+            k
+        };
+        assert_eq!(keys(&v), keys(&ok), "partial and success shapes must match");
+    }
+
+    /// #1355 review — a `registerNode` that was broadcast but whose receipt
+    /// could not be read must still reach the partial summary. It cannot travel
+    /// in `register_outcome`: `submit_registration` returns that by value, so
+    /// the `Err` takes it with them. The caller-owned slot is the only carrier,
+    /// and this pins that it is actually rendered rather than merely threaded.
+    #[test]
+    fn build_summary_reports_an_unresolved_registration_tx() {
+        let in_flight = B256::repeat_byte(0x7E);
+        let v = build_summary(
+            &pf_with(None, 100, 10, 100, 10),
+            false,
+            &sample_plan(),
+            &bond::Outcome::default(),
+            // No outcome: the registration did not resolve.
+            None,
+            None,
+            false,
+            None,
+            Some(true),
+            Some(in_flight),
+            "US",
+            1,
+        );
+
+        assert_eq!(v["partial"], serde_json::json!(true));
+        assert_eq!(
+            v["register"]["tx"],
+            serde_json::json!(format!("{in_flight:#x}")),
+            "the in-flight registration must be named: {v}"
+        );
+        // `due` is what separates "owed but unresolved" from "already
+        // registered", which `skipped` alone cannot express.
+        assert_eq!(v["register"]["skipped"], serde_json::json!(true));
+        assert_eq!(v["register"]["due"], serde_json::json!(true));
+
+        // The genuinely-not-due case must stay distinguishable from it.
+        let not_due = build_summary(
+            &pf_with(None, 100, 10, 100, 10),
+            false,
+            &sample_plan(),
+            &bond::Outcome::default(),
+            None,
+            None,
+            false,
+            Some(&sample_readiness()),
+            Some(false),
+            None,
+            "US",
+            1,
+        );
+        assert_eq!(not_due["register"]["due"], serde_json::json!(false));
+        assert!(not_due["register"]["tx"].is_null());
+    }
+
     #[test]
     fn build_summary_register_skipped() {
         let pf = pf_with(None, 100, 10, 100, 10);
@@ -1448,7 +1680,9 @@ mod tests {
             None,
             None,
             false,
-            &sample_readiness(),
+            Some(&sample_readiness()),
+            Some(true),
+            None,
             "US",
             1,
         );
@@ -1486,7 +1720,9 @@ mod tests {
             Some(&outcome),
             None,
             false,
-            &sample_readiness(),
+            Some(&sample_readiness()),
+            Some(true),
+            None,
             "DE",
             2,
         );
@@ -1518,7 +1754,9 @@ mod tests {
             None,
             Some(&swap),
             false,
-            &sample_readiness(),
+            Some(&sample_readiness()),
+            Some(true),
+            None,
             "US",
             1,
         );

@@ -126,39 +126,25 @@ pub(crate) async fn execute<P: Provider + Clone>(
     );
 
     if plan.needs_approve {
-        let pending = token
-            .approve(sa_addr, plan.bond)
-            .send()
-            .await
-            .context("approve transaction failed to send")?;
-        let receipt = pending
-            .get_receipt()
-            .await
-            .context("approve sent but the receipt could not be fetched")?;
-        anyhow::ensure!(
-            receipt.status(),
-            "approve reverted (tx {})",
-            receipt.transaction_hash
-        );
-        outcome.approve = Some(receipt.transaction_hash);
+        decdn_incentive::tx::send(
+            token.approve(sa_addr, plan.bond),
+            "approve",
+            None,
+            &mut outcome.approve,
+        )
+        .await?;
     }
 
-    let pending = appeal
-        .openSlashAppeal(plan.slash_id, plan.evidence)
-        .send()
-        .await
-        .context("openSlashAppeal transaction failed to send")?;
-    let receipt = pending
-        .get_receipt()
-        .await
-        .context("openSlashAppeal sent but the receipt could not be fetched")?;
-    anyhow::ensure!(
-        receipt.status(),
-        "openSlashAppeal reverted (tx {}); is the caller the slashed operator, within the \
-         30-day window, with no existing appeal and no active 365-day cap?",
-        receipt.transaction_hash,
-    );
-    outcome.open = Some(receipt.transaction_hash);
+    decdn_incentive::tx::send(
+        appeal.openSlashAppeal(plan.slash_id, plan.evidence),
+        "openSlashAppeal",
+        Some(
+            "is the caller the slashed operator, within the 30-day window, with no existing \
+             appeal and no active 365-day cap?",
+        ),
+        &mut outcome.open,
+    )
+    .await?;
 
     Ok(outcome)
 }

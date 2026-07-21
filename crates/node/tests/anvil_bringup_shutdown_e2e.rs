@@ -399,7 +399,6 @@ fn build_config(
             announce_interval_sec: 60,
             peer_ttl_sec: 600,
             subscribe_global: false,
-            subscribe_reputation: true,
             reputation_publish_interval_sec: 3600,
             max_peer_entries: Some(100_000),
         },
