@@ -133,20 +133,27 @@ fn candidate_from(info: &CapacityBond::NodeInfo) -> Option<NodeCandidate> {
 /// API key (HTTP 401/403). Without this check either one makes `decdn fetch`
 /// sit silently for 36 s and then blame network connectivity.
 ///
-/// Note `TransportErrorKind::is_retry_err` is deliberately *not* used: it is an
-/// allowlist of 429/503/missing-batch, so it would classify an ordinary
-/// connection refusal as non-retryable and defeat the ADR's retry entirely.
-/// This is the complementary denylist — retry unless we know better.
+/// Note `TransportErrorKind::is_retry_err` is deliberately *not* used at the
+/// transport layer: it is an allowlist of 429/503/missing-batch, so it would
+/// classify an ordinary connection refusal as non-retryable and defeat the
+/// ADR's retry entirely. This is the complementary denylist — retry unless we
+/// know better. `ErrorPayload::is_retry_err` *is* used, because there the
+/// allowlist is the right shape: see below.
 fn is_permanent(err: &alloy::contract::Error) -> bool {
     use alloy::contract::Error as ContractError;
     use alloy::transports::{RpcError, TransportErrorKind};
 
     match err {
         ContractError::TransportError(e) => match e {
-            // The RPC answered, and the answer was an error: an unknown method,
-            // a revert, a rejected key. Asking again gets the same answer.
-            RpcError::ErrorResp(_)
-            | RpcError::UnsupportedFeature(_)
+            // A JSON-RPC error response is usually deterministic — an unknown
+            // method, a revert, a rejected key. But providers also signal rate
+            // limiting this way, over HTTP 200 with an error body, so the HTTP
+            // check below never sees it: Infura's -32005, Alchemy's -32016,
+            // QuickNode's -32007/-32012, and a plain 429 in the JSON `code`.
+            // Those are exactly what the backoff schedule is for, so defer to
+            // alloy's list of them.
+            RpcError::ErrorResp(resp) => !resp.is_retry_err(),
+            RpcError::UnsupportedFeature(_)
             | RpcError::LocalUsageError(_)
             | RpcError::SerError(_) => true,
             // 4xx other than 429 is a client-side fault — a wrong path, an
@@ -329,67 +336,59 @@ fn peer_cache_path(data_dir: &Path) -> PathBuf {
     data_dir.join(PEER_CACHE_FILE)
 }
 
-/// Read the cached peer list, or `None` when the cache is absent, unreadable,
-/// undecodable, of an unknown version, or empty. The one caller — the
-/// registry-failure fallback — cannot act on any of those differently, so a
-/// broken cache is deliberately collapsed into a missing one.
+/// Outcome of a peer-cache read.
 ///
-/// The *control flow* is collapsed; the diagnostics are not. A cache that
-/// exists but cannot be used is a fixable misconfiguration, so every case
-/// except "no file" is logged.
-fn read_peer_cache(data_dir: &Path) -> Option<PeerCache> {
+/// [`Unusable`](Self::Unusable) is kept distinct from [`Absent`](Self::Absent)
+/// because the two mean opposite things to whoever has to fix the problem: no
+/// file is the ordinary first-run state, while a file that exists and cannot be
+/// used is a misconfiguration the user can act on — and it is at its most
+/// confusing precisely when the registry is *also* down, which is the only time
+/// this is read. The reason travels back to the caller rather than into a log,
+/// for the same reason [`Bootstrap`] carries its provenance: `decdn` has no log
+/// sink.
+enum CacheRead {
+    Ok(Box<PeerCache>),
+    Absent,
+    /// Why the existing cache could not be used, phrased for the error chain.
+    Unusable(String),
+}
+
+/// Read the cached peer list.
+fn read_peer_cache(data_dir: &Path) -> CacheRead {
     let path = peer_cache_path(data_dir);
+    let at = path.display();
     let raw = match std::fs::read(&path) {
         Ok(raw) => raw,
-        // The ordinary first-run case: nothing to say about it.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        // The ordinary first-run case.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return CacheRead::Absent,
         // Anything else is a cache that is *there* and being ignored — most
         // often a root-owned `peers.json` left by an earlier `sudo` run, or a
-        // data dir that is really a file. Silently reading these as "no cache"
-        // would send the operator hunting for the wrong problem.
-        Err(e) => {
-            tracing::warn!(
-                path = %path.display(),
-                error = %e,
-                "peer cache is unreadable; ignoring it"
-            );
-            return None;
-        }
+        // data dir that is really a file.
+        Err(e) => return CacheRead::Unusable(format!("the peer cache at {at} is unreadable: {e}")),
     };
     // Version before body — see `PEER_CACHE_VERSION`.
     let version = match serde_json::from_slice::<CacheVersion>(&raw) {
         Ok(v) => v.version,
         Err(e) => {
-            tracing::warn!(
-                path = %path.display(),
-                error = %e,
-                "peer cache is undecodable; ignoring it"
-            );
-            return None;
+            return CacheRead::Unusable(format!("the peer cache at {at} is undecodable: {e}"));
         }
     };
     if version != PEER_CACHE_VERSION {
-        tracing::warn!(
-            path = %path.display(),
-            found = version,
-            expected = PEER_CACHE_VERSION,
-            "peer cache version mismatch; ignoring it"
-        );
-        return None;
+        return CacheRead::Unusable(format!(
+            "the peer cache at {at} is version {version}, but this build reads version \
+             {PEER_CACHE_VERSION}"
+        ));
     }
-    let cache: PeerCache = serde_json::from_slice(&raw)
-        .inspect_err(|e| {
-            tracing::warn!(
-                path = %path.display(),
-                error = %e,
-                "peer cache body is undecodable; ignoring it"
-            );
-        })
-        .ok()?;
+    let cache: PeerCache = match serde_json::from_slice(&raw) {
+        Ok(cache) => cache,
+        Err(e) => {
+            return CacheRead::Unusable(format!("the peer cache at {at} has a bad body: {e}"));
+        }
+    };
     if cache.peers.is_empty() {
-        return None;
+        return CacheRead::Unusable(format!("the peer cache at {at} lists no peers"));
     }
-    Some(cache)
+    CacheRead::Ok(Box::new(cache))
 }
 
 /// Persist `peers` to the peer cache, creating `data_dir` if needed. Written to
@@ -461,7 +460,7 @@ fn resolve_bootstrap(
         Err(e) => e,
     };
     match read_peer_cache(data_dir) {
-        Some(cache) => Ok(Bootstrap::Cached {
+        CacheRead::Ok(cache) => Ok(Bootstrap::Cached {
             age: cache.age(),
             peers: cache.peers,
             // Sanitized `{err:#}`, not `%err`: plain Display on an
@@ -469,7 +468,12 @@ fn resolve_bootstrap(
             // reason the registry read actually failed.
             registry_error: sanitize_err_chain(&err),
         }),
-        None => Err(err.context(BOOTSTRAP_UNREACHABLE)),
+        CacheRead::Absent => Err(err.context(BOOTSTRAP_UNREACHABLE)),
+        // Layered *under* `BOOTSTRAP_UNREACHABLE` so `{err}` still renders the
+        // ADR-pinned sentence verbatim, while `{err:#}` — what `main()` prints —
+        // names the cache that was ignored and why. Otherwise the one moment
+        // the cache matters is the one moment its failure is invisible.
+        CacheRead::Unusable(why) => Err(err.context(why).context(BOOTSTRAP_UNREACHABLE)),
     }
 }
 
@@ -780,6 +784,71 @@ mod tests {
         alloy::contract::Error::ContractNotDeployed
     }
 
+    /// A JSON-RPC error *response* — HTTP 200 with an error body, so the HTTP
+    /// status check never sees it.
+    ///
+    /// Built by deserializing the wire shape: `ErrorPayload` is not re-exported
+    /// through `alloy::transports` (only `RpcError` is), so the variant's own
+    /// type inference is what names it here.
+    fn error_resp(code: i64, message: &str) -> alloy::contract::Error {
+        alloy::contract::Error::TransportError(alloy::transports::RpcError::ErrorResp(
+            serde_json::from_value(serde_json::json!({ "code": code, "message": message }))
+                .unwrap(),
+        ))
+    }
+
+    #[test]
+    fn provider_rate_limits_stay_retryable() {
+        // Providers signal rate limiting as a JSON-RPC error response over HTTP
+        // 200, so treating every `ErrorResp` as deterministic would skip the
+        // ADR's retry for one of the most common transient failures there is.
+        for (code, message) in [
+            (429, "Too Many Requests"),
+            (-32005, "exceeded project rate limit"),
+            (-32016, "Your app has exceeded its rate limit"),
+            (-32007, "100/second request limit reached"),
+        ] {
+            assert!(
+                !is_permanent(&error_resp(code, message)),
+                "JSON-RPC {code} ({message}) is a rate limit and must be retried"
+            );
+        }
+        // A genuinely deterministic response still short-circuits.
+        assert!(is_permanent(&error_resp(-32601, "method not found")));
+        assert!(is_permanent(&error_resp(3, "execution reverted")));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_rate_limited_page_is_retried_not_abandoned() {
+        // Regression: the rate limit must consume the full 1/5/30 s schedule
+        // rather than falling through to the cache on the first response.
+        let calls = std::cell::Cell::new(0usize);
+        let start = tokio::time::Instant::now();
+
+        let out = paginate_with_retry(|_offset| {
+            let n = calls.get();
+            calls.set(n.saturating_add(1));
+            async move {
+                match n {
+                    // Rate-limited twice, then the provider lets us through.
+                    0 => Err(error_resp(429, "Too Many Requests")),
+                    1 => Err(error_resp(-32005, "exceeded project rate limit")),
+                    _ => Ok(vec![node_info(valid_node_id(3), true)]),
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(calls.get(), 3, "two rate limits were retried, not surfaced");
+        assert_eq!(
+            tokio::time::Instant::now() - start,
+            REGISTRY_RETRY_BACKOFF[0] + REGISTRY_RETRY_BACKOFF[1],
+            "backed off on the first two steps of the schedule"
+        );
+        assert_eq!(out.len(), 1);
+    }
+
     fn valid_node_id(seed: u8) -> [u8; 32] {
         *iroh::SecretKey::from_bytes(&[seed; 32]).public().as_bytes()
     }
@@ -868,7 +937,19 @@ mod tests {
     /// The cached peers alone, for the many assertions that do not care about
     /// the surrounding [`PeerCache`] metadata.
     fn cached_peers(data_dir: &Path) -> Option<Vec<NodeCandidate>> {
-        read_peer_cache(data_dir).map(|c| c.peers)
+        match read_peer_cache(data_dir) {
+            CacheRead::Ok(c) => Some(c.peers),
+            _ => None,
+        }
+    }
+
+    /// The reason an existing cache was rejected, or `None` if it was usable or
+    /// absent.
+    fn cache_rejection(data_dir: &Path) -> Option<String> {
+        match read_peer_cache(data_dir) {
+            CacheRead::Unusable(why) => Some(why),
+            _ => None,
+        }
     }
 
     #[test]
@@ -915,7 +996,9 @@ mod tests {
             "peers": [candidate(1, "DE")],
         });
         std::fs::write(peer_cache_path(dir.path()), body.to_string()).unwrap();
-        assert!(read_peer_cache(dir.path()).is_none());
+        let why = cache_rejection(dir.path()).unwrap();
+        assert!(why.contains("is version 2"), "{why}");
+        assert!(why.contains("reads version 1"), "{why}");
     }
 
     #[test]
@@ -941,7 +1024,11 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(peer_cache_path(dir.path()), &body).unwrap();
-        assert!(read_peer_cache(dir.path()).is_none());
+        assert!(
+            cache_rejection(dir.path())
+                .unwrap()
+                .contains("is version 2")
+        );
     }
 
     #[test]
@@ -951,7 +1038,7 @@ mod tests {
         // degrade to "no cache", not propagate.
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(peer_cache_path(dir.path()), b"{\"version\": 1, \"pee").unwrap();
-        assert!(read_peer_cache(dir.path()).is_none());
+        assert!(cache_rejection(dir.path()).unwrap().contains("undecodable"));
     }
 
     #[test]
@@ -966,9 +1053,11 @@ mod tests {
     }
 
     #[test]
-    fn absent_cache_reads_as_none() {
+    fn absent_cache_reads_as_absent() {
+        // Distinct from `Unusable`: no file is the ordinary first-run state and
+        // must not be reported to the user as a problem.
         let dir = tempfile::tempdir().unwrap();
-        assert!(read_peer_cache(dir.path()).is_none());
+        assert!(matches!(read_peer_cache(dir.path()), CacheRead::Absent));
     }
 
     #[test]
@@ -1045,6 +1134,44 @@ mod tests {
         // The registry failure stays in the chain as the cause, and `main()`
         // renders `{err:#}`, so this is what the user actually sees.
         assert!(format!("{err:#}").contains("rpc down"));
+    }
+
+    #[test]
+    fn an_ignored_cache_is_named_in_the_rendered_error() {
+        // The worst case for silence: the registry is down *and* the cache that
+        // would have covered it is unusable. `main()` prints `{err:#}`, so that
+        // is the rendering asserted here — the user must be told a cache
+        // existed and why it was skipped, not just that the RPC failed.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(peer_cache_path(dir.path()), b"not json at all").unwrap();
+
+        let err = resolve_bootstrap(Err(anyhow::anyhow!("rpc down")), dir.path()).unwrap_err();
+        assert_eq!(
+            format!("{err}"),
+            BOOTSTRAP_UNREACHABLE,
+            "the ADR-pinned sentence stays the outermost context"
+        );
+        let rendered = sanitize_err_chain(&err);
+        assert!(rendered.contains(BOOTSTRAP_UNREACHABLE));
+        assert!(
+            rendered.contains("undecodable"),
+            "the cache-read reason survives into the chain: {rendered}"
+        );
+        assert!(
+            rendered.contains(PEER_CACHE_FILE),
+            "and names the file to fix: {rendered}"
+        );
+        assert!(rendered.contains("rpc down"), "as does the registry cause");
+    }
+
+    #[test]
+    fn an_absent_cache_adds_nothing_to_the_error() {
+        // The mirror of the above: with no cache there is nothing to report, so
+        // the chain must not gain a spurious "cache" layer on a fresh install.
+        let dir = tempfile::tempdir().unwrap();
+        let err = resolve_bootstrap(Err(anyhow::anyhow!("rpc down")), dir.path()).unwrap_err();
+        let rendered = sanitize_err_chain(&err);
+        assert_eq!(rendered, format!("{BOOTSTRAP_UNREACHABLE}: rpc down"));
     }
 
     #[test]
