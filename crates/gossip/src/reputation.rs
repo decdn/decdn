@@ -11,6 +11,7 @@
 //! crate stays a leaf with respect to the scoring engine.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 
 use decdn_protocol::{GOSSIP_VERSION, GossipEnvelope, GossipPayload, ReportMetrics, SIGNATURE_LEN};
 use thiserror::Error;
@@ -65,6 +66,59 @@ pub trait StakedNodeSet: Send + Sync + 'static {
     /// Whether `node_id` (a `NodeId`'s 32 bytes) is a currently staked node.
     fn contains(&self, node_id: &[u8; 32]) -> bool;
 }
+
+/// ADR 008 §Gossip Protocol admission gate for inbound reputation reports,
+/// naming its two states so neither is the silent default: [`Self::Enforce`]
+/// gates on staked-reporter membership, [`Self::Disabled`] runs no reputation
+/// gossip at all. The generic `S` is the membership-set handle — in practice
+/// `Arc<dyn StakedNodeSet>` (see [`OwnedReportGate`]).
+///
+/// **Polarity is the inverse of [`crate::AnnounceGate`]'s, deliberately.**
+/// `ReportGate::Disabled` is fail-**CLOSED**: the reputation topic is not
+/// joined, so no report is ever admitted. `AnnounceGate::Disabled` is
+/// fail-**OPEN**: every signature-valid announce is admitted, and it exists for
+/// tests only. The two gates are separate types precisely so that opposite
+/// meaning can't be copy-pasted between them: neither is an
+/// `Option<Arc<dyn StakedNodeSet>>` whose `None` a reader has to interpret from
+/// context (#1338).
+#[derive(Clone, Copy)]
+pub enum ReportGate<S> {
+    /// Enforce ADR 008 staked-reporter admission: accept a report only when its
+    /// signing `reporter` is a currently-staked node in this set. An `Enforce`
+    /// set with no members rejects every report — correct, since an empty
+    /// active registry has no staked reporters to trust.
+    Enforce(S),
+    /// FAIL-CLOSED: reputation gossip is not wired. The subscriber and
+    /// publisher tasks are not spawned and the `cdn/reputation/v1` topic is not
+    /// joined, so no report is admitted or emitted. This is the [`Default`].
+    Disabled,
+}
+
+impl<S> Default for ReportGate<S> {
+    /// Unwired ⇒ [`Self::Disabled`] ⇒ no reputation gossip. `S` is a trait-
+    /// object handle with no `Default`, so this is hand-written rather than
+    /// derived (a derive would demand `S: Default`).
+    fn default() -> Self {
+        Self::Disabled
+    }
+}
+
+impl<S> std::fmt::Debug for ReportGate<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `S` (a `StakedNodeSet` handle) isn't `Debug`; report the variant only,
+        // which is all that identifies the gate's safety state.
+        match self {
+            Self::Enforce(_) => f.write_str("ReportGate::Enforce(..)"),
+            Self::Disabled => f.write_str("ReportGate::Disabled"),
+        }
+    }
+}
+
+/// Owned reputation-report gate carried by [`crate::ReputationWiring`] and
+/// resolved once at [`crate::GossipService::spawn`]: [`ReportGate::Enforce`]
+/// hands its set to the subscriber task, [`ReportGate::Disabled`] skips the
+/// topic entirely.
+pub type OwnedReportGate = ReportGate<Arc<dyn StakedNodeSet>>;
 
 /// Source of pending outbound reports for the publisher (ADR 008 §Gossip
 /// Protocol). Implemented in `decdn-node` over the observation buffer. Returns
