@@ -22,11 +22,11 @@ use crate::reputation::StakedNodeSet;
 /// (see [`OwnedAnnounceGate`]).
 ///
 /// **Do not confuse with [`crate::ReportGate`], whose `Disabled` means the
-/// opposite.** That is the sibling admission gate for reputation reports, over
-/// the same [`StakedNodeSet`] seam; its `Disabled` is fail-**CLOSED** (no
-/// reputation gossip runs at all), while `AnnounceGate::Disabled` here is
-/// fail-**OPEN**. Distinct types keep that inversion from being copy-pasted
-/// wrong-way-round (#1338).
+/// opposite.** That is the sibling admission gate for reputation reports over
+/// the same [`StakedNodeSet`] seam: its `Disabled` is fail-**CLOSED**, while
+/// `AnnounceGate::Disabled` here is fail-**OPEN**. See [`crate::ReportGate`]
+/// for what each polarity does; distinct types keep the inversion from being
+/// copy-pasted wrong-way-round (#1338).
 // `Copy` is conditional: it applies only where `S: Copy`, i.e. the borrowed
 // `AnnounceGate<&dyn StakedNodeSet>`. The owned `OwnedAnnounceGate` (an `Arc`)
 // is `Clone`-only, so `gate.clone()` at each subscriber is a refcount bump, not

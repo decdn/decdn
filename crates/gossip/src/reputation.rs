@@ -76,12 +76,11 @@ pub trait StakedNodeSet: Send + Sync + 'static {
 /// **Polarity is the inverse of [`crate::AnnounceGate`]'s, deliberately.**
 /// `ReportGate::Disabled` is fail-**CLOSED**: the reputation topic is not
 /// joined, so no report is ever admitted. `AnnounceGate::Disabled` is
-/// fail-**OPEN**: every signature-valid announce is admitted, and it exists for
-/// tests only. The two gates are separate types precisely so that opposite
-/// meaning can't be copy-pasted between them: neither is an
-/// `Option<Arc<dyn StakedNodeSet>>` whose `None` a reader has to interpret from
-/// context (#1338).
-#[derive(Clone, Copy)]
+/// fail-**OPEN**: it skips the staked-membership check (all other announce
+/// validation still applies), and it exists for tests only. Keeping the two
+/// polarities in separate types is what stops one being read — or copy-pasted —
+/// as the other (#1338).
+#[derive(Clone, Copy, Default)]
 pub enum ReportGate<S> {
     /// Enforce ADR 008 staked-reporter admission: accept a report only when its
     /// signing `reporter` is a currently-staked node in this set. An `Enforce`
@@ -90,16 +89,18 @@ pub enum ReportGate<S> {
     Enforce(S),
     /// FAIL-CLOSED: reputation gossip is not wired. The subscriber and
     /// publisher tasks are not spawned and the `cdn/reputation/v1` topic is not
-    /// joined, so no report is admitted or emitted. This is the [`Default`].
+    /// joined, so no report is admitted or emitted. This is the [`Default`], so
+    /// an unwired [`crate::ReputationWiring`] runs no reputation gossip.
+    #[default]
     Disabled,
 }
 
-impl<S> Default for ReportGate<S> {
-    /// Unwired ⇒ [`Self::Disabled`] ⇒ no reputation gossip. `S` is a trait-
-    /// object handle with no `Default`, so this is hand-written rather than
-    /// derived (a derive would demand `S: Default`).
-    fn default() -> Self {
-        Self::Disabled
+impl<S> ReportGate<S> {
+    /// Whether this gate enforces staked-reporter admission, i.e. is
+    /// [`Self::Enforce`] rather than the fail-CLOSED [`Self::Disabled`]. Lets a
+    /// caller report the gate's safety state without consuming the gate.
+    pub const fn is_enforcing(&self) -> bool {
+        matches!(self, Self::Enforce(_))
     }
 }
 

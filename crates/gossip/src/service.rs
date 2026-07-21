@@ -367,7 +367,9 @@ impl GossipService {
 /// Optional reputation-topic wiring handed to [`GossipService::spawn`]. The
 /// [`Default`] is fully unwired — no sink, a [`ReportGate::Disabled`] gate, no
 /// drain — and runs no reputation gossip. The subscriber needs both `sink` and
-/// a [`ReportGate::Enforce`] gate to run; the publisher needs `report_drain`.
+/// a [`ReportGate::Enforce`] gate to run; the publisher needs `report_drain`
+/// *on top of* those, since it is spawned on the same enforcing branch — a
+/// `Disabled` gate suppresses both halves, not just the subscriber.
 #[derive(Default)]
 pub struct ReputationWiring {
     /// Consumer of validated inbound reports (the aggregator).
@@ -425,12 +427,19 @@ async fn spawn_reputation_tasks(
         }
         return (Vec::new(), None);
     }
-    // Both halves are required together: a sink with no gate would admit
-    // unvetted reports, a gate with no sink has nowhere to put them. One
-    // combined check, one warning.
+    // Both halves are required together: a `Disabled` gate means reputation
+    // gossip is off, so a wired sink has nothing to consume, and an `Enforce`
+    // gate with no sink has nowhere to put what it admits. One combined check,
+    // one warning — but the warning names each half separately, since either
+    // alone can trip it. Captured here because the `let ... else` below moves
+    // both and its failing branch can no longer see them.
+    let sink_wired = sink.is_some();
+    let gate_enforcing = staked.is_enforcing();
     let (Some(sink), ReportGate::Enforce(staked)) = (sink, staked) else {
         tracing::warn!(
-            "gossip: subscribe_reputation set but no reputation sink/staker wired; \
+            sink_wired,
+            gate_enforcing,
+            "gossip: subscribe_reputation set but reputation gossip is not fully wired; \
              reputation topic not joined"
         );
         return (Vec::new(), None);
@@ -1635,6 +1644,28 @@ mod tests {
             rendered.contains("ReportGate::Disabled"),
             "default wiring must name its fail-closed gate variant, got {rendered}"
         );
+    }
+
+    /// #1338 — mirror of `AnnounceGate`'s `debug_reports_variant_only`: pin
+    /// *both* arms of [`ReportGate`]'s hand-written `Debug`. The
+    /// `ReputationWiring` default test above only ever renders `Disabled`, so a
+    /// single mislabelled arm — `Enforce(_) => "ReportGate::Disabled"` — would
+    /// report every live enforcing gate as fail-closed in the logs with nothing
+    /// failing. That is precisely the polarity confusion this gate exists to
+    /// prevent, so it gets its own assertion.
+    #[test]
+    fn report_gate_debug_reports_variant_only() {
+        struct Staked;
+        impl StakedNodeSet for Staked {
+            fn contains(&self, _node_id: &[u8; 32]) -> bool {
+                true
+            }
+        }
+
+        let enforce: OwnedReportGate = ReportGate::Enforce(Arc::new(Staked));
+        assert_eq!(format!("{enforce:?}"), "ReportGate::Enforce(..)");
+        let disabled: OwnedReportGate = ReportGate::Disabled;
+        assert_eq!(format!("{disabled:?}"), "ReportGate::Disabled");
     }
 
     /// #1338 — the fail-CLOSED half of the gate's contract, and the reason

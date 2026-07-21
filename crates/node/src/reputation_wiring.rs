@@ -98,10 +98,10 @@ pub fn announce_staked_gate(staker_set: Arc<dyn StakerSet>) -> OwnedAnnounceGate
 /// returns [`ReportGate::Enforce`].
 ///
 /// Note the polarity inversion versus [`announce_staked_gate`]: leaving *this*
-/// gate [`ReportGate::Disabled`] fails **closed** (the reputation topic is never
-/// joined), whereas an [`AnnounceGate::Disabled`] would fail **open**. Both are
-/// named constructors so the runtime's choice is explicit and unit-testable
-/// rather than an `Option` a reader has to interpret (#1338).
+/// gate [`ReportGate::Disabled`] fails **closed**, whereas an
+/// [`AnnounceGate::Disabled`] would fail **open** — see [`ReportGate`] for what
+/// each does. Both are named constructors so the runtime's choice is explicit
+/// and unit-testable at the seam it is made (#1338).
 pub fn report_staked_gate(staker_set: Arc<dyn StakerSet>) -> OwnedReportGate {
     ReportGate::Enforce(Arc::new(NodeStakedNodeSet::new(staker_set)))
 }
