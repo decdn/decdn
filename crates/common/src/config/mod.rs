@@ -164,6 +164,29 @@ const DEFAULT_PROBE_MAX_TRACKED_PER_PEER: usize = 4096;
 /// can tune lower; setting to `0` disables the periodic sweep entirely.
 pub const DEFAULT_GC_INTERVAL_SEC: u64 = 300;
 
+/// Default LRU eviction driver high-water percent of `cache.cache_size_mb`
+/// (#1173, appendix-blob-cache-eviction.md § Trigger and target). Above this
+/// fraction the driver actively evicts.
+pub const DEFAULT_EVICTION_HIGH_WATER_PCT: u64 = 90;
+/// Hard bounds `[60, 95]` for [`DEFAULT_EVICTION_HIGH_WATER_PCT`].
+pub const EVICTION_HIGH_WATER_PCT_BOUNDS: (u64, u64) = (60, 95);
+/// Default LRU eviction driver target percent of `cache.cache_size_mb` — the
+/// driver evicts down to this fraction before idling (#1173).
+pub const DEFAULT_EVICTION_TARGET_PCT: u64 = 80;
+/// Hard bounds `[40, 90]` for [`DEFAULT_EVICTION_TARGET_PCT`].
+pub const EVICTION_TARGET_PCT_BOUNDS: (u64, u64) = (40, 90);
+/// Structural hysteresis gap: `eviction_target_pct` must be at least this many
+/// points below `eviction_high_water_pct` (#1173).
+pub const EVICTION_HYSTERESIS_GAP_PCT: u64 = 5;
+/// Default LRU eviction driver max candidates removed per tick (#1173).
+pub const DEFAULT_EVICTION_PER_SWEEP_BUDGET: u64 = 16;
+/// Hard bounds `[1, 256]` for [`DEFAULT_EVICTION_PER_SWEEP_BUDGET`].
+pub const EVICTION_PER_SWEEP_BUDGET_BOUNDS: (u64, u64) = (1, 256);
+/// Default LRU eviction driver wakeup cadence in seconds (#1173).
+pub const DEFAULT_EVICTION_TICK_SECS: u64 = 1;
+/// Hard bounds `[1, 60]` for [`DEFAULT_EVICTION_TICK_SECS`].
+pub const EVICTION_TICK_SECS_BOUNDS: (u64, u64) = (1, 60);
+
 /// Default EIP-712 `chainId` for the `slash_sig` domain separator (ADR 014).
 /// Arbitrum Sepolia — the initial network target; matches the chain id bound
 /// on the runtime `PrivateKeySigner` (`decdn_incentive::eth_identity`). To
@@ -174,6 +197,11 @@ pub const DEFAULT_CHAIN_ID: u64 = 421_614;
 /// Default seconds between the blacklist watcher's periodic replay + re-scope
 /// pass (ADR 011 §Polling's 10-minute `getBlacklistVersion` cadence).
 pub const DEFAULT_CONTENT_BLACKLIST_POLL_INTERVAL_SEC: u64 = 600;
+
+/// Default seconds between authoritative `PaymentChannel.getRateBounds()`
+/// re-reads by the rate-bounds watcher (#1172, ADR 019 §3.1) — the safety-net
+/// cadence alongside the `RateBoundsUpdated` event subscription. One hour.
+pub const DEFAULT_RATE_BOUNDS_POLL_INTERVAL_SEC: u64 = 3600;
 
 /// Default maximum concurrently held (eviction-exempt) blobs for the
 /// probe-triggered hold (ADR 005 §Hold budget, #318). Per-blob holds: many
@@ -1201,6 +1229,20 @@ fn resolve_blockchain_into(
          reconcile interval must be non-zero; omit it for the default (600s)",
     );
 
+    let rate_bounds_poll_interval_sec = file
+        .and_then(|b| b.rate_bounds_poll_interval_sec)
+        .unwrap_or(DEFAULT_RATE_BOUNDS_POLL_INTERVAL_SEC);
+    // `0` would make the authoritative re-read run every tick (no throttle),
+    // hammering the RPC — the event subscription is already the prompt path, so
+    // the re-read is a slow safety net. Reject rather than silently over-poll.
+    bag.check(
+        rate_bounds_poll_interval_sec != 0,
+        "blockchain.rate_bounds_poll_interval_sec",
+        "blockchain.rate_bounds_poll_interval_sec must not be 0 — the \
+         authoritative getRateBounds() re-read is a slow safety net; omit it \
+         for the default (3600s)",
+    );
+
     let chain_id = cli
         .chain_id
         .or_else(|| file.and_then(|b| b.chain_id))
@@ -1340,6 +1382,7 @@ fn resolve_blockchain_into(
         chain_id,
         rpc_watchdog_interval_sec,
         event_poll_interval_ms,
+        rate_bounds_poll_interval_sec,
         redeem_threshold_micro_usdc,
         buyer_deposit_micro_usdc,
         buyer_max_approve,
@@ -1456,6 +1499,82 @@ fn resolve_cache_into(
         .and_then(|c| c.gc_interval_sec)
         .unwrap_or(DEFAULT_GC_INTERVAL_SEC);
 
+    // LRU eviction driver knobs (#1173, appendix-blob-cache-eviction.md). Each
+    // is range-checked against its structural bounds; the target/high-water
+    // hysteresis gap is a cross-field invariant enforced after both resolve.
+    let eviction_high_water_pct = file
+        .and_then(|c| c.eviction_high_water_pct)
+        .unwrap_or(DEFAULT_EVICTION_HIGH_WATER_PCT);
+    bag.check_with(
+        (EVICTION_HIGH_WATER_PCT_BOUNDS.0..=EVICTION_HIGH_WATER_PCT_BOUNDS.1)
+            .contains(&eviction_high_water_pct),
+        "cache.eviction_high_water_pct",
+        || {
+            format!(
+                "cache.eviction_high_water_pct ({eviction_high_water_pct}) must be within \
+                 [{}, {}]",
+                EVICTION_HIGH_WATER_PCT_BOUNDS.0, EVICTION_HIGH_WATER_PCT_BOUNDS.1
+            )
+        },
+    );
+    let eviction_target_pct = file
+        .and_then(|c| c.eviction_target_pct)
+        .unwrap_or(DEFAULT_EVICTION_TARGET_PCT);
+    bag.check_with(
+        (EVICTION_TARGET_PCT_BOUNDS.0..=EVICTION_TARGET_PCT_BOUNDS.1)
+            .contains(&eviction_target_pct),
+        "cache.eviction_target_pct",
+        || {
+            format!(
+                "cache.eviction_target_pct ({eviction_target_pct}) must be within [{}, {}]",
+                EVICTION_TARGET_PCT_BOUNDS.0, EVICTION_TARGET_PCT_BOUNDS.1
+            )
+        },
+    );
+    // Structural hysteresis gap: target must sit at least
+    // EVICTION_HYSTERESIS_GAP_PCT points below high-water, else the driver
+    // would thrash on writes hovering near the trigger. `saturating_sub` keeps
+    // the comparison well-defined when high-water is below the gap.
+    bag.check_with(
+        eviction_target_pct <= eviction_high_water_pct.saturating_sub(EVICTION_HYSTERESIS_GAP_PCT),
+        "cache.eviction_target_pct",
+        || {
+            format!(
+                "cache.eviction_target_pct ({eviction_target_pct}) must be at least \
+                 {EVICTION_HYSTERESIS_GAP_PCT} points below cache.eviction_high_water_pct \
+                 ({eviction_high_water_pct}): the hysteresis gap is structural"
+            )
+        },
+    );
+    let eviction_per_sweep_budget = file
+        .and_then(|c| c.eviction_per_sweep_budget)
+        .unwrap_or(DEFAULT_EVICTION_PER_SWEEP_BUDGET);
+    bag.check_with(
+        (EVICTION_PER_SWEEP_BUDGET_BOUNDS.0..=EVICTION_PER_SWEEP_BUDGET_BOUNDS.1)
+            .contains(&eviction_per_sweep_budget),
+        "cache.eviction_per_sweep_budget",
+        || {
+            format!(
+                "cache.eviction_per_sweep_budget ({eviction_per_sweep_budget}) must be within \
+                 [{}, {}]",
+                EVICTION_PER_SWEEP_BUDGET_BOUNDS.0, EVICTION_PER_SWEEP_BUDGET_BOUNDS.1
+            )
+        },
+    );
+    let eviction_tick_secs = file
+        .and_then(|c| c.eviction_tick_secs)
+        .unwrap_or(DEFAULT_EVICTION_TICK_SECS);
+    bag.check_with(
+        (EVICTION_TICK_SECS_BOUNDS.0..=EVICTION_TICK_SECS_BOUNDS.1).contains(&eviction_tick_secs),
+        "cache.eviction_tick_secs",
+        || {
+            format!(
+                "cache.eviction_tick_secs ({eviction_tick_secs}) must be within [{}, {}]",
+                EVICTION_TICK_SECS_BOUNDS.0, EVICTION_TICK_SECS_BOUNDS.1
+            )
+        },
+    );
+
     let max_probe_holds = cli
         .max_probe_holds
         .or_else(|| file.and_then(|c| c.max_probe_holds))
@@ -1553,6 +1672,10 @@ fn resolve_cache_into(
         circuit_breaker,
         user_agent,
         gc_interval_sec,
+        eviction_high_water_pct,
+        eviction_target_pct,
+        eviction_per_sweep_budget,
+        eviction_tick_secs,
         max_probe_holds,
         stake_lane_reserved_holds,
         node_to_node_pull_through_enabled,
@@ -2111,9 +2234,10 @@ pub fn resolve_payment_into(
             )
         },
     );
-    // Locally enforced stand-in for the on-chain `getRateBounds()` (ADR 005
-    // §Rate bounds validation). Defaults (`0` .. `MAX_RATE_PER_MB`) make the
-    // clamp a no-op so existing deployments see no behavior change.
+    // Pre-chain seed for the on-chain `getRateBounds()` clamp (ADR 005 §Rate
+    // bounds validation). Since #1172 the runtime overwrites both from chain
+    // before serving, so these defaults (`0` .. `MAX_RATE_PER_MB`) only shape
+    // the pre-read window; the live clamp is governance-owned on-chain.
     let delivery_floor = cli
         .delivery_floor
         .or_else(|| file.and_then(|p| p.delivery_floor))
@@ -4240,6 +4364,51 @@ mod tests {
             resolve_cache(&cli, Some(&toml), Path::new("/data-dir")).is_err(),
             "a 0 stall budget must be rejected: it would gossip every honest peer as unreachable"
         );
+    }
+
+    /// The eviction hysteresis gap is structural (#1173): `target_pct` must sit
+    /// at least 5 points below `high_water_pct`, else the driver thrashes on
+    /// writes hovering near the trigger.
+    #[test]
+    fn resolve_cache_rejects_eviction_target_above_hysteresis_gap() {
+        let cli = empty_cache_args();
+        // 88 is only 2 points below 90 — inside the 5-point gap.
+        let toml = types::CacheConfig {
+            eviction_high_water_pct: Some(90),
+            eviction_target_pct: Some(88),
+            ..Default::default()
+        };
+        assert!(
+            resolve_cache(&cli, Some(&toml), Path::new("/data-dir")).is_err(),
+            "target within 5 points of high-water must be rejected (hysteresis gap)"
+        );
+    }
+
+    /// Eviction percentages have hard bounds; an out-of-range high-water is a
+    /// governance error the resolver must catch, not clamp.
+    #[test]
+    fn resolve_cache_rejects_out_of_range_eviction_high_water() {
+        let cli = empty_cache_args();
+        let toml = types::CacheConfig {
+            eviction_high_water_pct: Some(99), // > 95 upper bound
+            ..Default::default()
+        };
+        assert!(
+            resolve_cache(&cli, Some(&toml), Path::new("/data-dir")).is_err(),
+            "high-water above the [60,95] bound must be rejected"
+        );
+    }
+
+    /// The default eviction knobs resolve and satisfy the hysteresis invariant.
+    #[test]
+    fn resolve_cache_eviction_defaults_are_valid() {
+        let cli = empty_cache_args();
+        let resolved = resolve_cache(&cli, None, Path::new("/data-dir"))
+            .expect("default eviction knobs must resolve");
+        assert_eq!(resolved.eviction_high_water_pct, 90);
+        assert_eq!(resolved.eviction_target_pct, 80);
+        assert_eq!(resolved.eviction_per_sweep_budget, 16);
+        assert_eq!(resolved.eviction_tick_secs, 1);
     }
 
     /// A zero open budget abandons every upstream before its handshake can finish,
@@ -8077,6 +8246,7 @@ swap_pool_address = \"0xPool\"
             capacity_bond_address: None,
             rpc_watchdog_interval_sec: None,
             event_poll_interval_ms: None,
+            rate_bounds_poll_interval_sec: None,
             redeem_threshold_micro_usdc: None,
             buyer_deposit_micro_usdc: None,
             buyer_max_approve: None,
@@ -8117,6 +8287,7 @@ swap_pool_address = \"0xPool\"
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             rpc_watchdog_interval_sec: None,
             event_poll_interval_ms: None,
+            rate_bounds_poll_interval_sec: None,
             redeem_threshold_micro_usdc: None,
             buyer_deposit_micro_usdc: None,
             buyer_max_approve: None,
@@ -8551,6 +8722,7 @@ swap_pool_address = \"0xPool\"
             capacity_bond_address: None,
             rpc_watchdog_interval_sec: Some(1),
             event_poll_interval_ms: None,
+            rate_bounds_poll_interval_sec: None,
             redeem_threshold_micro_usdc: None,
             buyer_deposit_micro_usdc: None,
             buyer_max_approve: None,
@@ -8602,6 +8774,7 @@ swap_pool_address = \"0xPool\"
             capacity_bond_address: None,
             rpc_watchdog_interval_sec: None,
             event_poll_interval_ms: None,
+            rate_bounds_poll_interval_sec: None,
             redeem_threshold_micro_usdc: Some(0),
             buyer_deposit_micro_usdc: None,
             buyer_max_approve: None,
@@ -8652,6 +8825,7 @@ swap_pool_address = \"0xPool\"
             capacity_bond_address: None,
             rpc_watchdog_interval_sec: None,
             event_poll_interval_ms: None,
+            rate_bounds_poll_interval_sec: None,
             redeem_threshold_micro_usdc: None,
             buyer_deposit_micro_usdc: None,
             buyer_max_approve: None,
@@ -8702,6 +8876,7 @@ swap_pool_address = \"0xPool\"
             capacity_bond_address: None,
             rpc_watchdog_interval_sec: None,
             event_poll_interval_ms: None,
+            rate_bounds_poll_interval_sec: None,
             redeem_threshold_micro_usdc: None,
             buyer_deposit_micro_usdc: None,
             buyer_max_approve: None,
@@ -8775,6 +8950,7 @@ swap_pool_address = \"0xPool\"
             capacity_bond_address: None,
             rpc_watchdog_interval_sec: None,
             event_poll_interval_ms: None,
+            rate_bounds_poll_interval_sec: None,
             redeem_threshold_micro_usdc: None,
             buyer_deposit_micro_usdc: None,
             buyer_max_approve: None,
@@ -8824,6 +9000,7 @@ swap_pool_address = \"0xPool\"
             capacity_bond_address: None,
             rpc_watchdog_interval_sec: Some(0),
             event_poll_interval_ms: None,
+            rate_bounds_poll_interval_sec: None,
             redeem_threshold_micro_usdc: None,
             buyer_deposit_micro_usdc: None,
             buyer_max_approve: None,
@@ -8868,6 +9045,7 @@ swap_pool_address = \"0xPool\"
             capacity_bond_address: None,
             rpc_watchdog_interval_sec: Some(MIN_RPC_WATCHDOG_INTERVAL_SEC),
             event_poll_interval_ms: None,
+            rate_bounds_poll_interval_sec: None,
             redeem_threshold_micro_usdc: None,
             buyer_deposit_micro_usdc: None,
             buyer_max_approve: None,
@@ -8935,6 +9113,7 @@ swap_pool_address = \"0xPool\"
         };
         let file = types::BlockchainConfig {
             event_poll_interval_ms: Some(MIN_EVENT_POLL_INTERVAL_MS - 1),
+            rate_bounds_poll_interval_sec: None,
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             slash_judge_from_block: None,
             slash_appeal_address: None,
@@ -9000,6 +9179,7 @@ swap_pool_address = \"0xPool\"
         };
         let at_min = types::BlockchainConfig {
             event_poll_interval_ms: Some(MIN_EVENT_POLL_INTERVAL_MS),
+            rate_bounds_poll_interval_sec: None,
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             slash_judge_from_block: None,
             slash_appeal_address: None,
@@ -9011,6 +9191,7 @@ swap_pool_address = \"0xPool\"
 
         let in_range = types::BlockchainConfig {
             event_poll_interval_ms: Some(1000),
+            rate_bounds_poll_interval_sec: None,
             slash_judge_address: Some(GOOD_ADDR.to_string()),
             slash_judge_from_block: None,
             slash_appeal_address: None,

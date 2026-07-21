@@ -219,12 +219,14 @@ struct PaymentSection {
     /// Last applied rate, retained across reloads for the per-section
     /// `prev_rate_per_mb` field on the success line.
     buf: std::sync::Mutex<Option<ResolvedPayment>>,
-    /// `(delivery_floor, delivery_ceiling)` as wired into the live probe
-    /// handler at startup. Only `rate_per_mb` is hot-reloadable; the
-    /// delivery bounds are copied into the handler by value, so a reload
-    /// that changes them is accepted by `resolve_payment` but cannot take
-    /// effect until restart. Retained here so the swap can emit a
-    /// restart-required warning instead of silently diverging.
+    /// `(delivery_floor, delivery_ceiling)` as seeded into the live handlers
+    /// at startup. Only `rate_per_mb` is hot-reloadable. Since #1172 the live
+    /// delivery bounds are sourced from on-chain `getRateBounds()` and tracked
+    /// by the `RateBoundsUpdated` watcher, so the config
+    /// `delivery_floor`/`delivery_ceiling` are only a pre-chain seed — a reload
+    /// that changes them is accepted by `resolve_payment` but has no effect on
+    /// the live clamp (the chain value is authoritative). Retained here so the
+    /// swap can warn instead of silently ignoring the change.
     applied_bounds: (u64, u64),
 }
 
@@ -250,11 +252,12 @@ impl ReloadableSection for PaymentSection {
         let prev = self
             .rate_per_mb
             .swap(resolved.rate_per_mb, Ordering::Relaxed);
-        // The probe handler holds `delivery_floor`/`delivery_ceiling` by
-        // value (ADR 005 §Rate bounds validation is a locally enforced
-        // seam); a changed bound is accepted by `resolve_payment` but
-        // cannot take effect until restart. Surface that rather than
-        // silently diverging.
+        // Since #1172 the live delivery bounds come from on-chain
+        // `getRateBounds()` (seeded at startup, kept current by the
+        // `RateBoundsUpdated` watcher); the config values are only the
+        // pre-chain seed. A reload that changes them has no effect on the live
+        // clamp — governance owns it on-chain. Surface that rather than
+        // silently ignoring the change.
         if (resolved.delivery_floor, resolved.delivery_ceiling) != self.applied_bounds {
             tracing::warn!(
                 section = self.name(),
@@ -262,9 +265,9 @@ impl ReloadableSection for PaymentSection {
                 applied_delivery_ceiling = self.applied_bounds.1,
                 new_delivery_floor = resolved.delivery_floor,
                 new_delivery_ceiling = resolved.delivery_ceiling,
-                "payment.delivery_floor/delivery_ceiling change ignored \
-                 (requires restart); the live probe handler keeps the \
-                 startup bounds"
+                "payment.delivery_floor/delivery_ceiling change ignored; live \
+                 delivery bounds are governed on-chain via getRateBounds() \
+                 (#1172), not this config seed"
             );
         }
         tracing::info!(
@@ -692,6 +695,7 @@ impl RuntimeReloadState {
                 capacity_bond_address: "0x0000000000000000000000000000000000000002".into(),
                 rpc_watchdog_interval_sec: 30,
                 event_poll_interval_ms: 7000,
+                rate_bounds_poll_interval_sec: 3600,
                 redeem_threshold_micro_usdc: 1_000_000,
                 buyer_deposit_micro_usdc: 10_000_000,
                 buyer_max_approve: true,
@@ -714,6 +718,10 @@ impl RuntimeReloadState {
                 circuit_breaker: decdn_cache::CircuitBreakerPolicy::default(),
                 user_agent: decdn_cache::DEFAULT_USER_AGENT.to_string(),
                 gc_interval_sec: 0,
+                eviction_high_water_pct: 90,
+                eviction_target_pct: 80,
+                eviction_per_sweep_budget: 16,
+                eviction_tick_secs: 1,
                 max_probe_holds: decdn_common::config::DEFAULT_MAX_PROBE_HOLDS,
                 stake_lane_reserved_holds: decdn_common::config::DEFAULT_STAKE_LANE_RESERVED_HOLDS,
                 node_to_node_pull_through_enabled: false,
@@ -1062,6 +1070,10 @@ const fn cache_has_restart_required_field(c: &decdn_common::config::types::Cache
         circuit_breaker,
         user_agent,
         gc_interval_sec,
+        eviction_high_water_pct,
+        eviction_target_pct,
+        eviction_per_sweep_budget,
+        eviction_tick_secs,
         max_probe_holds,
         stake_lane_reserved_holds,
         node_to_node_pull_through_enabled,
@@ -1082,6 +1094,10 @@ const fn cache_has_restart_required_field(c: &decdn_common::config::types::Cache
         || circuit_breaker.is_some()
         || user_agent.is_some()
         || gc_interval_sec.is_some()
+        || eviction_high_water_pct.is_some()
+        || eviction_target_pct.is_some()
+        || eviction_per_sweep_budget.is_some()
+        || eviction_tick_secs.is_some()
         || max_probe_holds.is_some()
         || stake_lane_reserved_holds.is_some()
         || node_to_node_pull_through_enabled.is_some()
@@ -1163,6 +1179,7 @@ mod tests {
 
     /// Minimal `ResolvedConfig` for seeding the reload state. Only the
     /// fields the reload path reads are populated meaningfully.
+    #[allow(clippy::too_many_lines)] // exhaustive struct literal, not real complexity
     fn seed_resolved(rate: u64, level: LogLevel) -> ResolvedConfig {
         ResolvedConfig {
             identity: ResolvedIdentity {
@@ -1186,6 +1203,7 @@ mod tests {
                 capacity_bond_address: "0x0000000000000000000000000000000000000002".into(),
                 rpc_watchdog_interval_sec: 30,
                 event_poll_interval_ms: 7000,
+                rate_bounds_poll_interval_sec: 3600,
                 redeem_threshold_micro_usdc: 1_000_000,
                 buyer_deposit_micro_usdc: 10_000_000,
                 buyer_max_approve: true,
@@ -1208,6 +1226,10 @@ mod tests {
                 circuit_breaker: decdn_cache::CircuitBreakerPolicy::default(),
                 user_agent: decdn_cache::DEFAULT_USER_AGENT.to_string(),
                 gc_interval_sec: 0,
+                eviction_high_water_pct: 90,
+                eviction_target_pct: 80,
+                eviction_per_sweep_budget: 16,
+                eviction_tick_secs: 1,
                 max_probe_holds: decdn_common::config::DEFAULT_MAX_PROBE_HOLDS,
                 stake_lane_reserved_holds: decdn_common::config::DEFAULT_STAKE_LANE_RESERVED_HOLDS,
                 node_to_node_pull_through_enabled: false,

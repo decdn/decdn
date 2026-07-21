@@ -1,5 +1,6 @@
 //! Node runtime: owns the iroh endpoint, metrics server, and protocol router.
 
+pub mod eviction;
 pub mod reload;
 
 pub use reload::{LogLevelSetter, ReloadSnapshot, RuntimeReloadState};
@@ -721,6 +722,7 @@ struct ChainHandlers<P: Provider + Clone + 'static> {
     pull_through_bg_shutdown: CancellationToken,
     blacklist_watcher: crate::chain_events::resumable_watcher::WatcherHandle,
     blacklist_ready_rx: oneshot::Receiver<crate::blacklist_watcher::InitialSyncResult>,
+    rate_bounds_watcher: crate::chain_events::resumable_watcher::WatcherHandle,
 }
 
 /// Middle phase extracted verbatim from [`run`] (issue #1253 PR4): parse the
@@ -889,6 +891,18 @@ async fn build_chain_and_handlers(
         Arc::clone(&infra.node_metrics),
     ));
 
+    // Live per-MB delivery-rate bounds (#1172, ADR 019 §3.1). Seed from the
+    // config stand-in (`payment.delivery_floor`/`delivery_ceiling`) so the
+    // handlers hold the shared clamp from construction; the authoritative
+    // on-chain `getRateBounds()` read below (once `payment_channel_addr` is
+    // parsed) overwrites it before serving begins, and the `RateBoundsUpdated`
+    // watcher keeps it live thereafter. The same handle is cloned into the
+    // probe handler, the client handler, and the watcher.
+    let rate_bounds = crate::rate_bounds::RateBounds::new(
+        cfg.payment.delivery_floor,
+        cfg.payment.delivery_ceiling,
+    );
+
     let probe_handler = Arc::new(ProbeHandler::new(
         infra.secret_key.public(),
         reload_state.rate_per_mb(),
@@ -898,8 +912,7 @@ async fn build_chain_and_handlers(
         infra.cache.clone(),
         Arc::clone(&infra.eth_signer),
         slash_domain.clone(),
-        cfg.payment.delivery_floor,
-        cfg.payment.delivery_ceiling,
+        rate_bounds.clone(),
         // ADR 015 master switch. Restart-required (it changes the
         // `on_accepting` wiring): the SIGHUP path reports any
         // `[network]` change as "requires restart".
@@ -1042,6 +1055,43 @@ async fn build_chain_and_handlers(
         &cfg.blockchain.payment_channel_address,
         "blockchain.payment_channel_address",
     )?;
+
+    // Authoritative on-chain delivery-rate bounds (#1172, ADR 019 §3.1 / ADR
+    // 003). Read once at startup — a fail-fast self-check in the same spirit as
+    // `PaymentChannel.usdc()` — and seed the shared clamp created above,
+    // replacing the config stand-in. The on-chain bounds are `uint256`; the
+    // node clamps in `u64`, so an out-of-range value must refuse startup rather
+    // than silently truncate. The `RateBoundsUpdated` watcher spawned below
+    // keeps the clamp live for governance retunes without a restart.
+    {
+        let contract = decdn_incentive::payment_channel::PaymentChannel::new(
+            payment_channel_addr,
+            ProviderFactory::read_only(rpc_url.clone(), event_poll_interval),
+        );
+        let bounds = contract.getRateBounds().call().await.with_context(|| {
+            format!("PaymentChannel.getRateBounds() startup read at {payment_channel_addr}")
+        })?;
+        let floor = u64::try_from(bounds.floor).map_err(|_| {
+            anyhow::anyhow!(
+                "on-chain delivery floor {} exceeds u64::MAX; refusing to start",
+                bounds.floor
+            )
+        })?;
+        let ceiling = u64::try_from(bounds.ceiling).map_err(|_| {
+            anyhow::anyhow!(
+                "on-chain delivery ceiling {} exceeds u64::MAX; refusing to start",
+                bounds.ceiling
+            )
+        })?;
+        rate_bounds.store(floor, ceiling);
+        tracing::info!(
+            floor,
+            ceiling,
+            %payment_channel_addr,
+            "seeded live delivery-rate bounds from on-chain getRateBounds()"
+        );
+    }
+
     let voucher_domain =
         decdn_incentive::voucher_domain(cfg.blockchain.chain_id, payment_channel_addr);
     let bind_domain =
@@ -1209,8 +1259,7 @@ async fn build_chain_and_handlers(
         Arc::clone(&infra.channel_state_store),
         Arc::clone(&infra.receipt_sink),
         reload_state.rate_per_mb(),
-        cfg.payment.delivery_floor,
-        cfg.payment.delivery_ceiling,
+        rate_bounds.clone(),
         cfg.payment.voucher_interval_mb,
         cfg.cache
             .max_blob_size_mb
@@ -1308,6 +1357,21 @@ async fn build_chain_and_handlers(
         Arc::clone(&infra.watcher_checkpoint_store),
     );
 
+    // Rate-bounds watcher (#1172, ADR 019 §3.1): follows `RateBoundsUpdated` off
+    // the shared-head getLogs poller and re-reads `getRateBounds()`
+    // authoritatively every `rate_bounds_poll_interval_sec` as a safety net,
+    // storing into the same shared `rate_bounds` clamp the handlers hold (seeded
+    // by the startup read above). Read-only, no durable cursor.
+    let rate_bounds_watcher = crate::rate_bounds_watcher::spawn(
+        ProviderFactory::read_only(rpc_url.clone(), event_poll_interval),
+        payment_channel_addr,
+        rate_bounds.clone(),
+        event_poll_interval,
+        Duration::from_secs(cfg.blockchain.rate_bounds_poll_interval_sec),
+        Arc::clone(&head),
+        &infra.node_metrics,
+    );
+
     // Bootstrap (ADR 022 §Bootstrap): seed the routing table from the
     // active-staker set + parallel `FindNode(self.node_id)` against a
     // fan-out of seeds. Best-effort — failures here log but don't
@@ -1361,6 +1425,7 @@ async fn build_chain_and_handlers(
         pull_through_bg_shutdown,
         blacklist_watcher,
         blacklist_ready_rx,
+        rate_bounds_watcher,
     })
 }
 
@@ -1375,6 +1440,7 @@ struct Background {
     dispatch_gc_stop_tx: oneshot::Sender<()>,
     region_log_stop_tx: Option<oneshot::Sender<()>>,
     record_store_gc_stop_tx: oneshot::Sender<()>,
+    eviction_stop_tx: oneshot::Sender<()>,
     dht_rate_limit_gc_stop_tx: oneshot::Sender<()>,
     probe_rate_limit_gc_stop_tx: oneshot::Sender<()>,
     republish_stop_tx: oneshot::Sender<()>,
@@ -1545,6 +1611,42 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
                 }
             },
         )
+    };
+
+    // LRU cache-eviction driver (#1173, appendix-blob-cache-eviction.md). Async
+    // (the sweep does `total_bytes()`/`release_for_eviction().await`), so it
+    // cannot ride `spawn_periodic`'s sync `FnMut`; it spawns directly into the
+    // JoinSet with its own oneshot stop, mirroring the metrics server. Enforces
+    // the `cache.cache_size_mb` ceiling the write path leaves unbounded.
+    let eviction_stop_tx = {
+        // The driver's actuator is `release_for_eviction`, which only drops GC
+        // protection — the iroh-blobs GC sweep is what actually reclaims disk.
+        // With the sweep disabled the ceiling is unenforceable, and the symptom
+        // (a cache pinned at 100% while the driver reports work) points at
+        // pinning/probe-holds rather than at the real cause. Say so at boot.
+        if cfg.cache.gc_interval_sec == 0 {
+            tracing::warn!(
+                cache_size_mb = cfg.cache.cache_size_mb,
+                "eviction driver is running but cache.gc_interval_sec = 0: released blobs are \
+                 never reclaimed, so cache.cache_size_mb cannot be enforced. Set a nonzero \
+                 gc_interval_sec (default 300) to make eviction reclaim disk."
+            );
+        }
+        let (eviction_stop_tx, eviction_stop_rx) = oneshot::channel::<()>();
+        let params = eviction::EvictionParams {
+            cache_size_mb: cfg.cache.cache_size_mb,
+            high_water_pct: cfg.cache.eviction_high_water_pct,
+            target_pct: cfg.cache.eviction_target_pct,
+            per_sweep_budget: cfg.cache.eviction_per_sweep_budget,
+            tick: Duration::from_secs(cfg.cache.eviction_tick_secs),
+        };
+        tasks.spawn(eviction::run(
+            infra.cache.clone(),
+            infra.node_metrics.cache_metrics(),
+            params,
+            eviction_stop_rx,
+        ));
+        eviction_stop_tx
     };
 
     // Periodic DHT rate-limiter GC (#645). The acquire path opportunistically
@@ -2183,6 +2285,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
         dispatch_gc_stop_tx,
         region_log_stop_tx,
         record_store_gc_stop_tx,
+        eviction_stop_tx,
         dht_rate_limit_gc_stop_tx,
         probe_rate_limit_gc_stop_tx,
         republish_stop_tx,
@@ -2263,11 +2366,13 @@ pub async fn run(
         buyer_bootstrap_stop_tx: bg.buyer_bootstrap_stop_tx,
         region_log_stop_tx: bg.region_log_stop_tx,
         record_store_gc_stop_tx: bg.record_store_gc_stop_tx,
+        eviction_stop_tx: bg.eviction_stop_tx,
         dht_rate_limit_gc_stop_tx: bg.dht_rate_limit_gc_stop_tx,
         probe_rate_limit_gc_stop_tx: bg.probe_rate_limit_gc_stop_tx,
         republish_stop_tx: bg.republish_stop_tx,
         bucket_refresh_stop_tx: bg.bucket_refresh_stop_tx,
         blacklist_watcher: ch.blacklist_watcher,
+        rate_bounds_watcher: ch.rate_bounds_watcher,
         origin_watcher: ch.origin_watcher,
         watcher_checkpoint_store: infra.watcher_checkpoint_store,
         admin_stop_tx: bg.admin_stop_tx,
@@ -2299,11 +2404,13 @@ struct ShutdownHandles<P: Provider + Clone + 'static> {
     buyer_bootstrap_stop_tx: oneshot::Sender<()>,
     region_log_stop_tx: Option<oneshot::Sender<()>>,
     record_store_gc_stop_tx: oneshot::Sender<()>,
+    eviction_stop_tx: oneshot::Sender<()>,
     dht_rate_limit_gc_stop_tx: oneshot::Sender<()>,
     probe_rate_limit_gc_stop_tx: oneshot::Sender<()>,
     republish_stop_tx: oneshot::Sender<()>,
     bucket_refresh_stop_tx: oneshot::Sender<()>,
     blacklist_watcher: crate::chain_events::resumable_watcher::WatcherHandle,
+    rate_bounds_watcher: crate::chain_events::resumable_watcher::WatcherHandle,
     origin_watcher: Option<Arc<crate::chain_events::resumable_watcher::WatcherHandle>>,
     watcher_checkpoint_store: Arc<dyn decdn_incentive::KeyedCheckpointStore>,
     admin_stop_tx: Option<oneshot::Sender<()>>,
@@ -2342,11 +2449,13 @@ async fn shutdown<P: Provider + Clone + 'static>(
         buyer_bootstrap_stop_tx,
         region_log_stop_tx,
         record_store_gc_stop_tx,
+        eviction_stop_tx,
         dht_rate_limit_gc_stop_tx,
         probe_rate_limit_gc_stop_tx,
         republish_stop_tx,
         bucket_refresh_stop_tx,
         blacklist_watcher,
+        rate_bounds_watcher,
         origin_watcher,
         watcher_checkpoint_store,
         mut admin_stop_tx,
@@ -2394,11 +2503,16 @@ async fn shutdown<P: Provider + Clone + 'static>(
         let _ = tx.send(());
     }
     let _ = record_store_gc_stop_tx.send(());
+    // Eviction driver (#1173): best-effort stop, same shape as the GC sweeps.
+    // The task also drains via `JoinSet::join_next` below.
+    let _ = eviction_stop_tx.send(());
     let _ = dht_rate_limit_gc_stop_tx.send(());
     let _ = probe_rate_limit_gc_stop_tx.send(());
     let _ = republish_stop_tx.send(());
     let _ = bucket_refresh_stop_tx.send(());
     blacklist_watcher.shutdown();
+    // Rate-bounds watcher (#1172): read-only, no cursor to flush — just cancel.
+    rate_bounds_watcher.shutdown();
     if let Some(watcher) = &origin_watcher {
         watcher.shutdown();
     }
@@ -3820,6 +3934,7 @@ mod tests {
                 capacity_bond_address: "0x0000000000000000000000000000000000000002".into(),
                 rpc_watchdog_interval_sec: 30,
                 event_poll_interval_ms: 7000,
+                rate_bounds_poll_interval_sec: 3600,
                 redeem_threshold_micro_usdc: 1_000_000,
                 buyer_deposit_micro_usdc: 10_000_000,
                 buyer_max_approve: true,
@@ -3842,6 +3957,10 @@ mod tests {
                 circuit_breaker: decdn_cache::CircuitBreakerPolicy::default(),
                 user_agent: decdn_cache::DEFAULT_USER_AGENT.to_string(),
                 gc_interval_sec: 0,
+                eviction_high_water_pct: 90,
+                eviction_target_pct: 80,
+                eviction_per_sweep_budget: 16,
+                eviction_tick_secs: 1,
                 max_probe_holds: decdn_common::config::DEFAULT_MAX_PROBE_HOLDS,
                 stake_lane_reserved_holds: decdn_common::config::DEFAULT_STAKE_LANE_RESERVED_HOLDS,
                 node_to_node_pull_through_enabled: false,

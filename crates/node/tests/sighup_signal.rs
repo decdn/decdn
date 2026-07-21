@@ -43,6 +43,7 @@ use decdn_node::runtime::{LogLevelSetter, RuntimeReloadState};
 use nix::sys::signal::{Signal, raise};
 
 /// Build the same minimal `ResolvedConfig` the unit tests use.
+#[allow(clippy::too_many_lines)] // exhaustive struct literal, not real complexity
 fn seed_resolved(rate: u64, level: LogLevel) -> ResolvedConfig {
     ResolvedConfig {
         identity: ResolvedIdentity {
@@ -66,6 +67,7 @@ fn seed_resolved(rate: u64, level: LogLevel) -> ResolvedConfig {
             capacity_bond_address: "0x0000000000000000000000000000000000000002".into(),
             rpc_watchdog_interval_sec: 30,
             event_poll_interval_ms: 7000,
+            rate_bounds_poll_interval_sec: 3600,
             redeem_threshold_micro_usdc: 1_000_000,
             buyer_deposit_micro_usdc: 10_000_000,
             buyer_max_approve: true,
@@ -88,6 +90,10 @@ fn seed_resolved(rate: u64, level: LogLevel) -> ResolvedConfig {
             circuit_breaker: decdn_cache::CircuitBreakerPolicy::default(),
             user_agent: decdn_cache::DEFAULT_USER_AGENT.to_string(),
             gc_interval_sec: 0,
+            eviction_high_water_pct: 90,
+            eviction_target_pct: 80,
+            eviction_per_sweep_budget: 16,
+            eviction_tick_secs: 1,
             max_probe_holds: decdn_common::config::DEFAULT_MAX_PROBE_HOLDS,
             stake_lane_reserved_holds: decdn_common::config::DEFAULT_STAKE_LANE_RESERVED_HOLDS,
             node_to_node_pull_through_enabled: false,

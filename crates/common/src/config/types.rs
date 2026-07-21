@@ -212,6 +212,14 @@ pub struct BlockchainConfig {
     /// cadence so live-RPC load is unchanged). Values below
     /// `MIN_EVENT_POLL_INTERVAL_MS` are rejected at config resolution.
     pub event_poll_interval_ms: Option<u64>,
+    /// Seconds between authoritative `PaymentChannel.getRateBounds()` re-reads
+    /// by the rate-bounds watcher (#1172, ADR 019 §3.1). This is the safety-net
+    /// cadence *in addition to* the `RateBoundsUpdated` event subscription
+    /// (which follows [`Self::event_poll_interval_ms`]); it reconciles any log
+    /// the event tail missed. Absent =>
+    /// [`super::DEFAULT_RATE_BOUNDS_POLL_INTERVAL_SEC`] (3600s / 1h). Must not
+    /// be `0` (that would poll every tick); rejected at config resolution.
+    pub rate_bounds_poll_interval_sec: Option<u64>,
     /// Accrued un-redeemed USDC (base units, `µUSDC`) at which the node
     /// submits an on-chain `withdraw` for a channel (#327, ADR 003 § Operator
     /// early withdrawal). Larger values amortize gas across more delivery;
@@ -414,6 +422,39 @@ pub struct CacheConfig {
     /// hostile-origin amplification window at the cost of more
     /// list+sweep CPU per minute.
     pub gc_interval_sec: Option<u64>,
+    /// LRU eviction driver: percent of [`Self::cache_size_mb`] above which
+    /// the driver actively evicts (#1173, appendix-blob-cache-eviction.md
+    /// § Trigger and target). Absent =>
+    /// [`crate::config::DEFAULT_EVICTION_HIGH_WATER_PCT`] (90). Hard bounds
+    /// `[60, 95]`; set above the 25% probe-hold recommendation so a full hold
+    /// budget plus in-flight writes don't trip it, below 95% for write
+    /// headroom between sweeps.
+    pub eviction_high_water_pct: Option<u64>,
+    /// LRU eviction driver: percent of [`Self::cache_size_mb`] the driver
+    /// evicts down to before returning to idle (#1173). Absent =>
+    /// [`crate::config::DEFAULT_EVICTION_TARGET_PCT`] (80). Hard bounds
+    /// `[40, 90]`, and MUST be `<= eviction_high_water_pct - 5` — the 5-point
+    /// hysteresis gap is structural (prevents thrash on writes hovering near
+    /// the trigger), not a tunable nicety.
+    pub eviction_target_pct: Option<u64>,
+    /// LRU eviction driver: maximum candidates removed per tick before the
+    /// driver yields (#1173). Absent =>
+    /// [`crate::config::DEFAULT_EVICTION_PER_SWEEP_BUDGET`] (16). Hard bounds
+    /// `[1, 256]`. Bounds worst-case driver-induced latency on the cache hot
+    /// path (~1 ms filesystem-unlink per entry); the driver continues across
+    /// consecutive ticks until below target or candidates are exhausted.
+    pub eviction_per_sweep_budget: Option<u64>,
+    /// LRU eviction driver: seconds between driver wakeups (#1173). Absent =>
+    /// [`crate::config::DEFAULT_EVICTION_TICK_SECS`] (1). Hard bounds
+    /// `[1, 60]`.
+    ///
+    /// **Cost note:** every tick measures the on-disk footprint, which walks the
+    /// blob list and issues one `status()` per blob, plus an O(n) clone of the
+    /// pinned set — latched or not. (`appendix-blob-cache-eviction.md` describes
+    /// an idle tick as "one comparison plus a yield"; that assumed a cached
+    /// footprint this driver does not keep.) On a cache holding many blobs,
+    /// raise this to trade eviction latency for steady-state store load.
+    pub eviction_tick_secs: Option<u64>,
     /// Maximum number of concurrently held (eviction-exempt) blobs for the
     /// probe-triggered hold (ADR 005 §Hold budget, #318). Holds are
     /// per-blob: multiple peers probing the same hash share one slot. When
@@ -716,16 +757,20 @@ pub enum S3Credentials {
 pub struct PaymentConfig {
     /// Rate per MB in USDC base units.
     pub rate_per_mb: Option<u64>,
-    /// Lower bound the node clamps `rate_per_mb` to before signing a
-    /// `ProbeResponse` (ADR 005 §Rate bounds validation). Locally
-    /// enforced stand-in for the on-chain `getRateBounds().deliveryFloor`.
-    /// Absent => `0` (no floor; current behavior unchanged).
+    /// Pre-chain **seed** for the lower bound the node clamps `rate_per_mb` to
+    /// before signing a `ProbeResponse` (ADR 005 §Rate bounds validation).
+    ///
+    /// Since #1172 this no longer governs the live clamp: the node reads
+    /// `PaymentChannel.getRateBounds()` at startup and overwrites this value
+    /// before it serves anything, then tracks `RateBoundsUpdated`. Setting it
+    /// only affects the window before that read completes (and a failed read
+    /// refuses startup outright), so treat the on-chain value as authoritative.
+    /// Absent => `0`.
     pub delivery_floor: Option<u64>,
-    /// Upper bound the node clamps `rate_per_mb` to before signing a
-    /// `ProbeResponse` (ADR 005 §Rate bounds validation). Locally
-    /// enforced stand-in for the on-chain `getRateBounds().deliveryCeiling`.
-    /// Absent => [`decdn_protocol::MAX_RATE_PER_MB`] (no effective ceiling;
-    /// current behavior unchanged).
+    /// Pre-chain **seed** for the upper bound the node clamps `rate_per_mb` to
+    /// before signing a `ProbeResponse`. Same as [`Self::delivery_floor`]: the
+    /// live ceiling comes from on-chain `getRateBounds()` (#1172), not from
+    /// here. Absent => [`decdn_protocol::MAX_RATE_PER_MB`].
     pub delivery_ceiling: Option<u64>,
     /// Voucher cadence the node advertises in `StreamResponse` for
     /// `cdn/client/v1` delivery (ADR 003 §Voucher Interval Negotiation): the

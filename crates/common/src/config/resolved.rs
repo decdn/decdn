@@ -141,6 +141,11 @@ pub struct ResolvedBlockchain {
     /// Defaults to 7000 ms (`DEFAULT_EVENT_POLL_INTERVAL_MS`); the resolver
     /// enforces a minimum (see `MIN_EVENT_POLL_INTERVAL_MS`).
     pub event_poll_interval_ms: u64,
+    /// Seconds between authoritative `getRateBounds()` re-reads by the
+    /// rate-bounds watcher (#1172). Safety-net cadence alongside the
+    /// `RateBoundsUpdated` event subscription. Defaults to 3600s
+    /// (`DEFAULT_RATE_BOUNDS_POLL_INTERVAL_SEC`); the resolver rejects `0`.
+    pub rate_bounds_poll_interval_sec: u64,
     /// Accrued un-redeemed USDC (base units, `µUSDC`) at which the seller
     /// settlement path submits an on-chain `withdraw` (#327). Defaults to
     /// 1 USDC (`1_000_000` `µUSDC`) when unset.
@@ -228,6 +233,22 @@ pub struct ResolvedCache {
     /// [`crate::config::DEFAULT_GC_INTERVAL_SEC`] when the TOML section
     /// omits the field.
     pub gc_interval_sec: u64,
+    /// LRU eviction driver high-water percent of [`Self::cache_size_mb`]
+    /// (#1173). Above this fraction the driver actively evicts. Validated to
+    /// `[60, 95]`. Default [`crate::config::DEFAULT_EVICTION_HIGH_WATER_PCT`].
+    pub eviction_high_water_pct: u64,
+    /// LRU eviction driver target percent of [`Self::cache_size_mb`] (#1173).
+    /// The driver evicts down to this fraction before idling. Validated to
+    /// `[40, 90]` and `<= eviction_high_water_pct - 5` (structural hysteresis
+    /// gap). Default [`crate::config::DEFAULT_EVICTION_TARGET_PCT`].
+    pub eviction_target_pct: u64,
+    /// LRU eviction driver max candidates removed per tick (#1173). Validated
+    /// to `[1, 256]`. Default
+    /// [`crate::config::DEFAULT_EVICTION_PER_SWEEP_BUDGET`].
+    pub eviction_per_sweep_budget: u64,
+    /// LRU eviction driver wakeup cadence in seconds (#1173). Validated to
+    /// `[1, 60]`. Default [`crate::config::DEFAULT_EVICTION_TICK_SECS`].
+    pub eviction_tick_secs: u64,
     /// Maximum number of concurrently held (eviction-exempt) blobs for the
     /// probe-triggered hold (ADR 005 §Hold budget, #318). Default
     /// [`crate::config::DEFAULT_MAX_PROBE_HOLDS`]; `0` disables
@@ -396,15 +417,14 @@ pub enum ResolvedS3Credentials {
 pub struct ResolvedPayment {
     /// Rate per MB in USDC base units (6 decimals).
     pub rate_per_mb: u64,
-    /// Lower clamp bound applied to `rate_per_mb` before signing a
-    /// `ProbeResponse` (ADR 005 §Rate bounds validation). Locally
-    /// enforced stand-in for on-chain `getRateBounds().deliveryFloor`;
-    /// default `0`.
+    /// Pre-chain seed for the lower clamp bound on `rate_per_mb` (ADR 005
+    /// §Rate bounds validation). **Not the live bound since #1172** — the
+    /// runtime overwrites it from on-chain `getRateBounds()` before serving and
+    /// the rate-bounds watcher keeps it current. Default `0`.
     pub delivery_floor: u64,
-    /// Upper clamp bound applied to `rate_per_mb` before signing a
-    /// `ProbeResponse`. Locally enforced stand-in for
-    /// `getRateBounds().deliveryCeiling`; default
-    /// [`decdn_protocol::MAX_RATE_PER_MB`].
+    /// Pre-chain seed for the upper clamp bound on `rate_per_mb`. Same
+    /// caveat as [`Self::delivery_floor`] — the live ceiling is on-chain
+    /// (#1172). Default [`decdn_protocol::MAX_RATE_PER_MB`].
     pub delivery_ceiling: u64,
     /// Voucher cadence advertised in `StreamResponse` for `cdn/client/v1`
     /// (ADR 003 §Voucher Interval Negotiation); default
