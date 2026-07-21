@@ -2,12 +2,14 @@
 //! output directory over the paid `cdn/client/v1` path (issue #391).
 //!
 //! The manifest comes from a local file (`-i`) or is fetched first by its own
-//! BLAKE3 hash (`--hash`); either way each entry is then fetched independently.
-//! Node selection is per-entry (#936): with an explicit `--node-id` every entry
-//! is pulled from that one node, otherwise each entry discovers its own holder
-//! among the region-nearest active nodes. A `DECDNMAN` entry reuses that holder
-//! for its chunks, discovering again only after a typed delivery refusal.
-//! Entries are fetched with `--jobs` concurrency.
+//! BLAKE3 hash (`--hash`); either way entries are then fetched per *distinct*
+//! blob hash. Entries naming the same blob (one file at two paths) are fetched —
+//! and paid for — once and hard-linked (or copied) to each path (#1306). Node selection is
+//! per blob (#936): with an explicit `--node-id` every entry is pulled from that
+//! one node, otherwise each distinct blob discovers its own holder among the
+//! region-nearest active nodes. A `DECDNMAN` entry reuses that holder for its
+//! chunks, discovering again only after a typed delivery refusal. Distinct blobs
+//! are fetched with `--jobs` concurrency.
 //!
 //! **Voucher-nonce safety.** A payment channel's vouchers use a strictly
 //! increasing nonce, so two in-flight fetches sharing one channel would race it.
@@ -82,6 +84,135 @@ fn fallback_candidates(candidates: &[NodeCandidate], refusing: FetchTarget) -> V
         .collect()
 }
 
+/// Group manifest entries by their blob `hash`, preserving first-seen order both
+/// across groups and within each group. Entries that name the same blob (one
+/// file published at two paths) land in one group so it is fetched once (#1306).
+fn group_by_hash(entries: &[ManifestEntry]) -> Vec<HashGroup<'_>> {
+    let mut index: HashMap<&str, usize> = HashMap::new();
+    let mut groups: Vec<HashGroup> = Vec::new();
+    for entry in entries {
+        let next = groups.len();
+        let at = *index.entry(entry.hash.as_str()).or_insert(next);
+        if at == next {
+            groups.push(HashGroup {
+                hash: entry.hash.as_str(),
+                entries: vec![entry],
+            });
+        } else if let Some(group) = groups.get_mut(at) {
+            group.entries.push(entry);
+        }
+    }
+    groups
+}
+
+/// Materialize `src`'s content at `dest` without re-reading it over the network:
+/// a hard link where the filesystem allows it, else a full copy (cross-device
+/// `EXDEV`, or a filesystem that can't link). Staged in `dest`'s parent and
+/// renamed into place so `dest` is only ever absent or complete — the same
+/// atomic-replace invariant `write_blob_atomic` upholds, which bundle pull's
+/// skip-existing relies on ("a present final file is verified-good").
+fn link_or_copy_atomic(src: &Path, dest: &Path) -> anyhow::Result<()> {
+    let parent = dest
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    // A duplicate path may live in a subdir the canonical path never created.
+    std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    let staged = tempfile::Builder::new()
+        .prefix(".decdn-link-")
+        .make_in(parent, |candidate| {
+            match std::fs::hard_link(src, candidate) {
+                Ok(()) => Ok(()),
+                // A fresh random candidate colliding is make_in's signal to retry.
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(e),
+                // EXDEV or an unsupported link: fall back to a full byte copy.
+                Err(_) => std::fs::copy(src, candidate).map(|_| ()),
+            }
+        })
+        .with_context(|| {
+            format!(
+                "stage link/copy of {} for {}",
+                src.display(),
+                dest.display()
+            )
+        })?;
+    staged
+        .persist(dest)
+        .map_err(|e| e.error)
+        .with_context(|| format!("write {}", dest.display()))?;
+    Ok(())
+}
+
+/// Resolve each entry's on-disk destination and classify it — a resolve failure,
+/// an already-present file to skip, or a path to write — before any fetch.
+/// Skip-existing (default): a present final file is verified-good (renamed into
+/// place only after a BLAKE3 check), so re-runs resume. Evaluated **per
+/// destination**, so one path of a duplicated blob can be skipped while another
+/// is written.
+fn plan_slots<'a>(
+    entries: &[&'a ManifestEntry],
+    out_root: &Path,
+    overwrite: bool,
+) -> Vec<Slot<'a>> {
+    entries
+        .iter()
+        .map(|en| match safe_join(out_root, &en.path) {
+            Err(e) => Slot::Failed(EntryOutcome::failed(&en.path, &e)),
+            Ok(dest) if !overwrite && dest.try_exists().unwrap_or(false) => Slot::Skip,
+            Ok(dest) => Slot::Write {
+                label: en.path.as_str(),
+                dest,
+            },
+        })
+        .collect()
+}
+
+/// Turn classified [`Slot`]s into outcomes: materialize the blob at the first
+/// writable destination and hard-link/copy it to the rest. `materialize` is the
+/// paid path (for a `DECDNMAN` entry it fetches the chunks) and runs **at most
+/// once** per group — every later destination goes through the free `link`,
+/// reported as [`EntryOutcome::Linked`] so the summary never implies a second
+/// paid fetch. If the first materialize fails, the next writable path retries it
+/// from the same in-memory bytes (no re-fetch), so one bad path can't doom the
+/// group.
+///
+/// Parameterized over the two operations so the fetch-once / link-rest invariant
+/// — the core of #1306 — is unit-testable without a live endpoint or channel.
+async fn materialize_group<MF, MFut, LF>(
+    slots: Vec<Slot<'_>>,
+    mut materialize: MF,
+    link: LF,
+) -> Vec<EntryOutcome>
+where
+    MF: FnMut(PathBuf) -> MFut,
+    MFut: std::future::Future<Output = anyhow::Result<u64>>,
+    LF: Fn(&Path, &Path) -> anyhow::Result<()>,
+{
+    let mut canonical: Option<PathBuf> = None;
+    let mut outcomes = Vec::with_capacity(slots.len());
+    for slot in slots {
+        let outcome = match slot {
+            Slot::Failed(o) => o,
+            Slot::Skip => EntryOutcome::Skipped,
+            Slot::Write { label, dest } => match &canonical {
+                Some(src) => match link(src, &dest) {
+                    Ok(()) => EntryOutcome::Linked,
+                    Err(e) => EntryOutcome::failed(label, &e),
+                },
+                None => match materialize(dest.clone()).await {
+                    Ok(n) => {
+                        canonical = Some(dest);
+                        EntryOutcome::Fetched(n)
+                    }
+                    Err(e) => EntryOutcome::failed(label, &e),
+                },
+            },
+        };
+        outcomes.push(outcome);
+    }
+    outcomes
+}
+
 /// Fetch from `preferred`; on an auto-discovered delivery refusal only, discover
 /// a holder for this hash, retry there, and carry a successful fallback forward.
 async fn fetch_preferred<T, Fetch, FetchFut, Discover, DiscoverFut>(
@@ -133,19 +264,44 @@ struct ManifestEntry {
     size: Option<u64>,
 }
 
+/// A group of manifest entries that all name the same blob `hash` — one file
+/// published at two (or more) bundle paths. Non-empty by construction; the
+/// shared `hash` is carried explicitly so consumers never re-derive it from an
+/// arbitrary member.
+struct HashGroup<'a> {
+    hash: &'a str,
+    entries: Vec<&'a ManifestEntry>,
+}
+
+/// Per-destination classification within a hash-group, resolved before any
+/// fetch: a resolve failure, an already-present file to skip, or a path to
+/// write. `label` (the entry's manifest-relative path) is retained only to tag
+/// a later failure.
+enum Slot<'a> {
+    Failed(EntryOutcome),
+    Skip,
+    Write { label: &'a str, dest: PathBuf },
+}
+
 /// Per-entry result, kept (never short-circuited) so one failure doesn't abort
-/// the others — re-running resumes via skip-existing.
+/// the others — re-running resumes via skip-existing. `Linked` is a duplicate
+/// destination materialized from an already-fetched sibling (hard link or copy),
+/// kept distinct from `Fetched` (a paid network pull) so the summary never
+/// implies a blob was paid for twice — the whole point of #1306.
 enum EntryOutcome {
     Fetched(u64),
+    Linked,
     Skipped,
     Failed { path: String, err: String },
 }
 
-/// One-line `--json` summary.
+/// One-line `--json` summary. `fetched`/`total_bytes` count only paid network
+/// pulls; `linked` counts duplicate destinations satisfied locally.
 #[derive(Serialize)]
 struct PullReport {
     output: String,
     fetched: u64,
+    linked: u64,
     skipped: u64,
     failed: u64,
     total_bytes: u64,
@@ -235,7 +391,6 @@ pub async fn bundle_pull(args: &BundlePullArgs, config_path: Option<&Path>) -> a
         candidates,
         common,
         locks: RefCell::new(HashMap::new()),
-        manifest_locks: RefCell::new(HashMap::new()),
         open_lock: tokio::sync::Mutex::new(()),
     };
 
@@ -258,15 +413,13 @@ pub async fn bundle_pull(args: &BundlePullArgs, config_path: Option<&Path>) -> a
         return Ok(());
     }
 
-    // Fetch entries concurrently. `buffer_unordered` polls up to `--jobs`
-    // futures in this one task (no `tokio::spawn`: `probe_once` is not `Send`);
-    // real parallelism comes from concurrent in-flight network I/O, while the
-    // per-provider locks inside `ctx.fetch` serialize same-channel access.
-    let jobs = args.jobs.max(1);
-    let outcomes: Vec<EntryOutcome> = futures_util::stream::iter(manifest.entries.iter())
-        .map(|entry| ctx.fetch_entry(entry, &args.output, args.overwrite))
-        .buffer_unordered(jobs)
-        .collect()
+    let outcomes = ctx
+        .pull_all(
+            &manifest.entries,
+            &args.output,
+            args.overwrite,
+            args.jobs.max(1),
+        )
         .await;
 
     report(&outcomes, &args.output, args.json)
@@ -294,10 +447,6 @@ struct PullCtx<'a, P: Provider + Clone> {
     /// Per-provider locks: serialize fetches sharing one channel's voucher
     /// nonce. Lazily created; held only across one entry's fetch.
     locks: RefCell<HashMap<Address, Rc<tokio::sync::Mutex<()>>>>,
-    /// Per-manifest locks: serialize reconstructions of the same file manifest,
-    /// which share one part directory keyed on the manifest hash. Lazily
-    /// created; held across one entry's whole reconstruction.
-    manifest_locks: RefCell<HashMap<[u8; 32], Rc<tokio::sync::Mutex<()>>>>,
     /// Serializes channel *opens* across all providers. The buyer's USDC
     /// allowance for the `PaymentChannel` is a single owner→spender slot, and the
     /// client default approves it to the exact per-open deposit (ERC-20 `approve`
@@ -315,15 +464,6 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         let mut map = self.locks.borrow_mut();
         Rc::clone(
             map.entry(provider)
-                .or_insert_with(|| Rc::new(tokio::sync::Mutex::new(()))),
-        )
-    }
-
-    /// The per-manifest lock, created on first use.
-    fn manifest_lock(&self, manifest_hash: [u8; 32]) -> Rc<tokio::sync::Mutex<()>> {
-        let mut map = self.manifest_locks.borrow_mut();
-        Rc::clone(
-            map.entry(manifest_hash)
                 .or_insert_with(|| Rc::new(tokio::sync::Mutex::new(()))),
         )
     }
@@ -473,51 +613,117 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         .await
     }
 
-    /// Fetch one manifest entry and write it under `out_root`. Never panics or
-    /// short-circuits — every failure becomes an [`EntryOutcome::Failed`].
-    async fn fetch_entry(
+    /// Fetch every entry into `out_root`, one unit of work per *distinct* blob
+    /// hash: entries sharing a hash (one file at two bundle paths) are fetched and
+    /// reconstructed once, then materialized at each path (#1306) — never fetched,
+    /// nor *paid for*, twice. `buffer_unordered` polls up to `jobs` futures in this
+    /// one task (no `tokio::spawn`: `probe_once` is not `Send`); parallelism comes
+    /// from concurrent in-flight network I/O, while the per-provider locks inside
+    /// `fetch` serialize same-channel access — now over unique blobs.
+    async fn pull_all(
         &self,
-        entry: &ManifestEntry,
+        entries: &[ManifestEntry],
         out_root: &Path,
         overwrite: bool,
-    ) -> EntryOutcome {
-        let dest = match safe_join(out_root, &entry.path) {
-            Ok(d) => d,
-            Err(e) => return EntryOutcome::failed(&entry.path, &e),
-        };
-        // Skip-existing (default): a present final file is verified-good (it was
-        // only renamed into place after a BLAKE3 check), so re-runs resume.
-        if !overwrite && dest.try_exists().unwrap_or(false) {
-            return EntryOutcome::Skipped;
-        }
-        let hash = match fetch::parse_hash(&entry.hash) {
+        jobs: usize,
+    ) -> Vec<EntryOutcome> {
+        futures_util::stream::iter(group_by_hash(entries))
+            .map(|group| self.fetch_group(group, out_root, overwrite))
+            .buffer_unordered(jobs)
+            .collect::<Vec<Vec<EntryOutcome>>>()
+            .await
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+
+    /// Fetch the blob shared by one hash-group and write it under `out_root` at
+    /// each entry's path. The blob is fetched — and paid for — **once**; the first
+    /// writable destination receives the materialized bytes and every other is a
+    /// hard link (or copy) of it (#1306). Returns one [`EntryOutcome`] per input
+    /// entry, in order. Never panics or short-circuits — every failure becomes an
+    /// [`EntryOutcome::Failed`].
+    async fn fetch_group(
+        &self,
+        group: HashGroup<'_>,
+        out_root: &Path,
+        overwrite: bool,
+    ) -> Vec<EntryOutcome> {
+        // The group's shared hash is carried explicitly; parse it once, and a bad
+        // hash fails every path in the group.
+        let hash = match fetch::parse_hash(group.hash) {
             Ok(h) => h,
-            Err(e) => return EntryOutcome::failed(&entry.path, &e),
+            Err(e) => {
+                return group
+                    .entries
+                    .iter()
+                    .map(|en| EntryOutcome::failed(&en.path, &e))
+                    .collect();
+            }
         };
+
+        let slots = plan_slots(&group.entries, out_root, overwrite);
+
+        // Every destination already present (or failed to resolve) → no fetch, no
+        // payment. This is the whole point of the group: a duplicate path that is
+        // already on disk costs nothing.
+        if !slots.iter().any(|s| matches!(s, Slot::Write { .. })) {
+            return slots
+                .into_iter()
+                .map(|s| match s {
+                    Slot::Failed(o) => o,
+                    _ => EntryOutcome::Skipped,
+                })
+                .collect();
+        }
+
         let (bytes, target) = match self.fetch_with_target(hash).await {
             Ok(fetched) => fetched,
-            Err(e) => return EntryOutcome::failed(&entry.path, &e),
+            Err(e) => {
+                return slots
+                    .into_iter()
+                    .map(|s| match s {
+                        Slot::Failed(o) => o,
+                        Slot::Skip => EntryOutcome::Skipped,
+                        Slot::Write { label, .. } => EntryOutcome::failed(label, &e),
+                    })
+                    .collect();
+            }
         };
-        if let Some(parent) = dest.parent()
-            && let Err(e) = std::fs::create_dir_all(parent)
-        {
-            return EntryOutcome::failed(&entry.path, &anyhow!("create {}: {e}", parent.display()));
+
+        // Borrow `bytes` (not move it) into the `FnMut`: `materialize` runs once,
+        // but a retry after a failed first write may call it again.
+        let bytes = &bytes;
+        materialize_group(
+            slots,
+            |dest| self.materialize(bytes, hash, dest, target),
+            link_or_copy_atomic,
+        )
+        .await
+    }
+
+    /// Write already-fetched `bytes` to `dest`, returning the byte count. A bundle
+    /// entry's blob may itself be a `DECDNMAN` file manifest — the two layers
+    /// compose (`appendix-bundles.md` § Non-relationship to ADR 012's `DECDNMAN`
+    /// chunk manifest) — in which case the real bytes are its chunks (#1183),
+    /// reconstructed here. Without the magic these ARE the bytes; write as-is.
+    async fn materialize(
+        &self,
+        bytes: &[u8],
+        hash: [u8; 32],
+        dest: PathBuf,
+        target: SelectedTarget<FetchTarget>,
+    ) -> anyhow::Result<u64> {
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create {}", parent.display()))?;
         }
-        // A bundle entry's blob may itself be a `DECDNMAN` file manifest — the
-        // two layers compose (`appendix-bundles.md` § Non-relationship to ADR
-        // 012's `DECDNMAN` chunk manifest) — in which case the entry's real bytes
-        // are its chunks (#1183). Without the magic these ARE the bytes; write
-        // them as-is.
-        if let Some(manifest) = file_manifest::sniff(&bytes) {
-            return match self.reconstruct_entry(manifest, hash, &dest, target).await {
-                Ok(n) => EntryOutcome::Fetched(n),
-                Err(e) => EntryOutcome::failed(&entry.path, &e),
-            };
+        if let Some(manifest) = file_manifest::sniff(bytes) {
+            return self.reconstruct_entry(manifest, hash, &dest, target).await;
         }
-        if let Err(e) = fetch::write_blob_atomic(&dest, &bytes) {
-            return EntryOutcome::failed(&entry.path, &anyhow!("write {}: {e}", dest.display()));
-        }
-        EntryOutcome::Fetched(bytes.len() as u64)
+        fetch::write_blob_atomic(&dest, bytes)
+            .with_context(|| format!("write {}", dest.display()))?;
+        Ok(bytes.len() as u64)
     }
 
     /// Expand a manifest entry whose blob turned out to be a file manifest:
@@ -537,25 +743,13 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         target: SelectedTarget<FetchTarget>,
     ) -> anyhow::Result<u64> {
         let manifest = manifest?;
-        // Two entries can name the SAME manifest blob — a bundle may hold one
-        // file's content at two paths, and nothing dedupes entries by hash. The
-        // part directory is keyed only on the manifest hash, so concurrent
-        // reconstructions would share it, one deleting or rewriting parts while
-        // the other is mid-concatenate. Serializing per manifest hash closes
-        // that race in both retention modes.
-        //
-        // It does NOT make the second entry free in both modes. Under the
-        // default retention it finds the first's verified parts and pays
-        // nothing; under `--no-keep-blobs` the first entry has already deleted
-        // them (ADR 012 § Blob retention: "delete immediately after
-        // reconstruction"), so the second re-fetches and re-pays. Whether that
-        // should change — by deferring the sweep or deduping entries by hash —
-        // is #1306.
-        //
-        // The lock is process-local; two concurrent `decdn` invocations sharing
-        // a data dir still race the same part directory (#1303).
-        let lock = self.manifest_lock(manifest_hash);
-        let _guard = lock.lock().await;
+        // A given manifest blob is reconstructed at most once per bundle pull:
+        // entries are grouped by hash before the fan-out (#1306), so the two
+        // paths of a file duplicated in the bundle share one reconstruction and
+        // the second is a hard link, not a second paid fetch. Cross-process
+        // serialization of the shared part directory (two `decdn` invocations on
+        // one data dir) is handled by the `flock` inside `file_manifest::
+        // reconstruct` (#1303); no process-local lock is needed here.
         let preferred = Cell::new(target);
         file_manifest::reconstruct(
             &manifest,
@@ -686,15 +880,19 @@ fn dry_run(args: &BundlePullArgs) -> anyhow::Result<()> {
 /// Summarize outcomes; return an error if any entry failed (after reporting all).
 fn report(outcomes: &[EntryOutcome], output: &Path, json: bool) -> anyhow::Result<()> {
     let mut fetched = 0u64;
+    let mut linked = 0u64;
     let mut skipped = 0u64;
     let mut failed = 0u64;
     let mut total_bytes = 0u64;
     for o in outcomes {
         match o {
+            // `total_bytes` counts only paid network pulls; a linked duplicate
+            // adds a file on disk but no wire bytes and no payment (#1306).
             EntryOutcome::Fetched(n) => {
                 fetched += 1;
                 total_bytes = total_bytes.saturating_add(*n);
             }
+            EntryOutcome::Linked => linked += 1,
             EntryOutcome::Skipped => skipped += 1,
             EntryOutcome::Failed { path, err } => {
                 failed += 1;
@@ -706,6 +904,7 @@ fn report(outcomes: &[EntryOutcome], output: &Path, json: bool) -> anyhow::Resul
     let rep = PullReport {
         output: output.display().to_string(),
         fetched,
+        linked,
         skipped,
         failed,
         total_bytes,
@@ -715,7 +914,8 @@ fn report(outcomes: &[EntryOutcome], output: &Path, json: bool) -> anyhow::Resul
         println!("{line}");
     } else {
         println!(
-            "pulled into {} ({fetched} fetched, {skipped} skipped, {failed} failed, {total_bytes} bytes)",
+            "pulled into {} ({fetched} fetched, {linked} linked, {skipped} skipped, \
+             {failed} failed, {total_bytes} bytes)",
             output.display()
         );
     }
@@ -1046,6 +1246,208 @@ mod tests {
     #[test]
     fn report_ok_when_none_failed() {
         let outcomes = vec![EntryOutcome::Fetched(10), EntryOutcome::Skipped];
+        assert!(report(&outcomes, Path::new("/out"), false).is_ok());
+    }
+
+    fn entry(path: &str, hash: &str) -> ManifestEntry {
+        ManifestEntry {
+            path: path.into(),
+            hash: hash.into(),
+            size: None,
+        }
+    }
+
+    /// The core of #1306: entries naming the same blob collapse into one group, so
+    /// the fan-out fetches (and pays for) that blob exactly once. First-seen order
+    /// is preserved both across groups and within a group.
+    #[test]
+    fn group_by_hash_collapses_duplicates_preserving_order() {
+        let entries = vec![
+            entry("a.txt", "b3:h1"),
+            entry("b.txt", "b3:h2"),
+            entry("c.txt", "b3:h1"),
+        ];
+        let paths: Vec<Vec<&str>> = group_by_hash(&entries)
+            .iter()
+            .map(|group| group.entries.iter().map(|e| e.path.as_str()).collect())
+            .collect();
+        assert_eq!(paths, vec![vec!["a.txt", "c.txt"], vec!["b.txt"]]);
+    }
+
+    /// Distinct hashes never merge — each is its own unit of work, in order.
+    #[test]
+    fn group_by_hash_keeps_distinct_hashes_separate() {
+        let entries = vec![entry("a", "b3:1"), entry("b", "b3:2"), entry("c", "b3:3")];
+        let groups = group_by_hash(&entries);
+        assert_eq!(groups.len(), 3);
+        assert!(groups.iter().all(|group| group.entries.len() == 1));
+    }
+
+    /// A duplicate destination is materialized from the canonical file (no second
+    /// paid fetch), lands with identical bytes, creates any missing parent dir,
+    /// and leaves the source in place (it is a link/copy, not a move).
+    #[test]
+    fn link_or_copy_atomic_materializes_identical_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.bin");
+        let dest = dir.path().join("nested/dest.bin");
+        std::fs::write(&src, b"the-canonical-bytes").unwrap();
+
+        link_or_copy_atomic(&src, &dest).unwrap();
+
+        assert_eq!(std::fs::read(&dest).unwrap(), b"the-canonical-bytes");
+        assert!(src.exists());
+    }
+
+    /// Materialization atomically *replaces* an existing destination, upholding the
+    /// "a present final file is verified-good" invariant skip-existing relies on.
+    #[test]
+    fn link_or_copy_atomic_replaces_existing_dest() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.bin");
+        let dest = dir.path().join("dest.bin");
+        std::fs::write(&src, b"new").unwrap();
+        std::fs::write(&dest, b"stale-and-longer").unwrap();
+
+        link_or_copy_atomic(&src, &dest).unwrap();
+
+        assert_eq!(std::fs::read(&dest).unwrap(), b"new");
+    }
+
+    /// Skip-existing / `--overwrite` are decided **per destination**: one path of a
+    /// duplicated blob can be already-present (Skip) while its twin is absent
+    /// (Write), and `--overwrite` forces both to Write.
+    #[test]
+    fn plan_slots_classifies_each_destination_independently() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path();
+        std::fs::write(out.join("present.txt"), b"x").unwrap();
+        let entries = [entry("present.txt", "b3:h"), entry("absent.txt", "b3:h")];
+        let refs: Vec<&ManifestEntry> = entries.iter().collect();
+
+        let slots = plan_slots(&refs, out, false);
+        assert!(matches!(slots[0], Slot::Skip));
+        assert!(matches!(slots[1], Slot::Write { .. }));
+
+        let slots = plan_slots(&refs, out, true);
+        assert!(matches!(slots[0], Slot::Write { .. }));
+        assert!(matches!(slots[1], Slot::Write { .. }));
+    }
+
+    /// A path that escapes `out_root` is a per-destination failure, not a fetch.
+    #[test]
+    fn plan_slots_marks_unsafe_paths_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let entries = [entry("../escape", "b3:h")];
+        let refs: Vec<&ManifestEntry> = entries.iter().collect();
+        let slots = plan_slots(&refs, dir.path(), false);
+        assert!(matches!(slots[0], Slot::Failed(_)));
+    }
+
+    /// The headline #1306 invariant, testable without a live endpoint: two
+    /// destinations for one blob → the paid `materialize` runs **once**, the second
+    /// is a free `link`, and outcomes are `[Fetched, Linked]` (never `Fetched`
+    /// twice, which would imply a double payment).
+    #[tokio::test]
+    async fn materialize_group_fetches_once_and_links_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let slots = vec![
+            Slot::Write {
+                label: "a",
+                dest: dir.path().join("a"),
+            },
+            Slot::Write {
+                label: "b",
+                dest: dir.path().join("b"),
+            },
+        ];
+        let mat_calls = std::cell::Cell::new(0u32);
+        let link_calls = std::cell::Cell::new(0u32);
+
+        let outcomes = materialize_group(
+            slots,
+            |_dest| {
+                mat_calls.set(mat_calls.get() + 1);
+                async { Ok(7u64) }
+            },
+            |_src, _dest| {
+                link_calls.set(link_calls.get() + 1);
+                Ok(())
+            },
+        )
+        .await;
+
+        assert_eq!(mat_calls.get(), 1, "the paid path runs exactly once");
+        assert_eq!(
+            link_calls.get(),
+            1,
+            "the duplicate is linked, not re-fetched"
+        );
+        assert!(matches!(outcomes[0], EntryOutcome::Fetched(7)));
+        assert!(matches!(outcomes[1], EntryOutcome::Linked));
+    }
+
+    /// If the first writable destination fails to materialize, the next one retries
+    /// from the same in-memory bytes (no re-fetch), so one bad path can't doom the
+    /// group and nothing is linked from a non-existent canonical.
+    #[tokio::test]
+    async fn materialize_group_retries_next_path_when_first_write_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let slots = vec![
+            Slot::Write {
+                label: "a",
+                dest: dir.path().join("a"),
+            },
+            Slot::Write {
+                label: "b",
+                dest: dir.path().join("b"),
+            },
+        ];
+        let mat_calls = std::cell::Cell::new(0u32);
+        let link_calls = std::cell::Cell::new(0u32);
+
+        let outcomes = materialize_group(
+            slots,
+            |_dest| {
+                let n = mat_calls.get();
+                mat_calls.set(n + 1);
+                async move {
+                    if n == 0 {
+                        Err(anyhow!("first write failed"))
+                    } else {
+                        Ok(5u64)
+                    }
+                }
+            },
+            |_src, _dest| {
+                link_calls.set(link_calls.get() + 1);
+                Ok(())
+            },
+        )
+        .await;
+
+        assert_eq!(
+            mat_calls.get(),
+            2,
+            "the second writable path retries materialize"
+        );
+        assert_eq!(
+            link_calls.get(),
+            0,
+            "no canonical to link from until one succeeds"
+        );
+        assert!(matches!(outcomes[0], EntryOutcome::Failed { .. }));
+        assert!(matches!(outcomes[1], EntryOutcome::Fetched(5)));
+    }
+
+    /// A linked duplicate is counted separately and never fails the pull.
+    #[test]
+    fn report_counts_linked_without_failing() {
+        let outcomes = vec![
+            EntryOutcome::Fetched(10),
+            EntryOutcome::Linked,
+            EntryOutcome::Skipped,
+        ];
         assert!(report(&outcomes, Path::new("/out"), false).is_ok());
     }
 }
