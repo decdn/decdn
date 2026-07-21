@@ -70,8 +70,9 @@ pub trait StakedNodeSet: Send + Sync + 'static {
 /// ADR 008 §Gossip Protocol admission gate for inbound reputation reports,
 /// naming its two states so neither is the silent default: [`Self::Enforce`]
 /// gates on staked-reporter membership, [`Self::Disabled`] runs no reputation
-/// gossip at all. The generic `S` is the membership-set handle — in practice
-/// `Arc<dyn StakedNodeSet>` (see [`OwnedReportGate`]).
+/// gossip at all. Carried by [`crate::ReputationWiring`] and resolved once at
+/// [`crate::GossipService::spawn`]: `Enforce` hands its set to the subscriber
+/// task, `Disabled` skips the topic entirely.
 ///
 /// **Polarity is the inverse of [`crate::AnnounceGate`]'s, deliberately.**
 /// `ReportGate::Disabled` is fail-**CLOSED**: the reputation topic is not
@@ -80,13 +81,22 @@ pub trait StakedNodeSet: Send + Sync + 'static {
 /// validation still applies), and it exists for tests only. Keeping the two
 /// polarities in separate types is what stops one being read — or copy-pasted —
 /// as the other (#1338).
-#[derive(Clone, Copy, Default)]
-pub enum ReportGate<S> {
+///
+/// **The shape difference versus `AnnounceGate<S>` is deliberate too** (#1342):
+/// that sibling is generic over the membership handle because it has a borrowed
+/// form — [`crate::validate_envelope`] takes an `AnnounceGate<&dyn
+/// StakedNodeSet>`, so its conditional-`Copy` caveat is load-bearing. The
+/// reputation path has no counterpart: [`validate_reputation_envelope`] takes a
+/// bare `&dyn StakedNodeSet`, and the gate is resolved at spawn rather than
+/// re-checked per message. A concrete type here signals that the two are *not*
+/// interchangeable — do not "restore parity" by re-adding the generic.
+#[derive(Default)]
+pub enum ReportGate {
     /// Enforce ADR 008 staked-reporter admission: accept a report only when its
     /// signing `reporter` is a currently-staked node in this set. An `Enforce`
     /// set with no members rejects every report — correct, since an empty
     /// active registry has no staked reporters to trust.
-    Enforce(S),
+    Enforce(Arc<dyn StakedNodeSet>),
     /// FAIL-CLOSED: reputation gossip is not wired. The subscriber and
     /// publisher tasks are not spawned and the `cdn/reputation/v1` topic is not
     /// joined, so no report is admitted or emitted. This is the [`Default`], so
@@ -95,7 +105,7 @@ pub enum ReportGate<S> {
     Disabled,
 }
 
-impl<S> ReportGate<S> {
+impl ReportGate {
     /// Whether this gate enforces staked-reporter admission, i.e. is
     /// [`Self::Enforce`] rather than the fail-CLOSED [`Self::Disabled`]. Lets a
     /// caller report the gate's safety state without consuming the gate.
@@ -104,9 +114,9 @@ impl<S> ReportGate<S> {
     }
 }
 
-impl<S> std::fmt::Debug for ReportGate<S> {
+impl std::fmt::Debug for ReportGate {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // `S` (a `StakedNodeSet` handle) isn't `Debug`; report the variant only,
+        // The `StakedNodeSet` handle isn't `Debug`; report the variant only,
         // which is all that identifies the gate's safety state.
         match self {
             Self::Enforce(_) => f.write_str("ReportGate::Enforce(..)"),
@@ -114,12 +124,6 @@ impl<S> std::fmt::Debug for ReportGate<S> {
         }
     }
 }
-
-/// Owned reputation-report gate carried by [`crate::ReputationWiring`] and
-/// resolved once at [`crate::GossipService::spawn`]: [`ReportGate::Enforce`]
-/// hands its set to the subscriber task, [`ReportGate::Disabled`] skips the
-/// topic entirely.
-pub type OwnedReportGate = ReportGate<Arc<dyn StakedNodeSet>>;
 
 /// Source of pending outbound reports for the publisher (ADR 008 §Gossip
 /// Protocol). Implemented in `decdn-node` over the observation buffer. Returns

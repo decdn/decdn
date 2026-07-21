@@ -74,7 +74,8 @@ use decdn_cache::CacheEngine;
 use decdn_common::config::ResolvedSecurity;
 use decdn_gossip::{
     AnnounceGate, AnnounceReject, GossipRuntimeConfig, GossipService, OwnedAnnounceGate, PeerTable,
-    ReputationWiring, StakedNodeSet, build_gossip, metrics::NoopMetrics,
+    ReportGate, ReputationReject, ReputationWiring, StakedNodeSet, ValidatedReport, build_gossip,
+    metrics::NoopMetrics,
 };
 use decdn_node::dispatch::ConnectionLimiter;
 use decdn_node::handlers::probe::ProbeHandler;
@@ -82,7 +83,8 @@ use decdn_node::handlers::probe_rate_limit::ProbeRateLimiter;
 use decdn_node::metrics::Metrics;
 use decdn_node::rate_limit::RateLimitConfig;
 use decdn_protocol::{
-    ALPN_PROBE, MAX_RATE_PER_MB, ProbeMessage, TOPIC_GLOBAL, decode_message, encode_message,
+    ALPN_PROBE, MAX_RATE_PER_MB, ProbeMessage, ReportMetrics, TOPIC_GLOBAL, TOPIC_REPUTATION,
+    decode_message, encode_message,
     message::{ProbeRequest, ProbeResponse},
     read_frame, write_frame,
 };
@@ -168,6 +170,120 @@ async fn spawn_publisher(
     )
     .await
     .expect("gossip service starts")
+}
+
+/// iroh-gossip topic id for the reputation topic, reconstructed the same way
+/// [`global_topic_id`] is and for the same reason.
+fn reputation_topic_id() -> TopicId {
+    TopicId::from_bytes(*blake3::hash(TOPIC_REPUTATION.as_bytes()).as_bytes())
+}
+
+/// Spawn a production [`GossipService`] wired for the reputation topic only:
+/// no region (so no `NodeAnnounce` publisher) and no global subscription, so the
+/// only tasks that can run are the reputation subscriber + publisher. That
+/// isolation is what lets the assertions attribute everything they observe to
+/// the reputation path (#1344).
+async fn spawn_reputation_node(
+    ep: Endpoint,
+    secret: SecretKey,
+    gossip: iroh_gossip::net::Gossip,
+    metrics: Arc<dyn decdn_gossip::GossipMetrics>,
+    shutdown: CancellationToken,
+    reputation: ReputationWiring,
+) -> decdn_gossip::GossipHandles {
+    GossipService::spawn(
+        ep,
+        secret,
+        gossip,
+        GossipRuntimeConfig {
+            announce_interval_sec: 60,
+            subscribe_global: false,
+            region: None,
+            subscribe_reputation: true,
+            // Long enough that only the explicit trigger publishes, so a round
+            // of the poll loop below maps to exactly one broadcast.
+            reputation_publish_interval_sec: 3600,
+        },
+        Arc::new(RwLock::new(PeerTable::new(60_000_000, 128))),
+        metrics,
+        shutdown,
+        // Irrelevant here — no `NodeAnnounce` topic is subscribed.
+        OwnedAnnounceGate::Disabled,
+        reputation,
+    )
+    .await
+    .expect("gossip service starts")
+}
+
+/// Drain that yields one observation for a fixed provider on every drain, so
+/// each publish trigger emits exactly one signed report.
+#[derive(Debug)]
+struct OneReportDrain {
+    provider: [u8; 32],
+}
+impl OneReportDrain {
+    const fn new(provider: [u8; 32]) -> Self {
+        Self { provider }
+    }
+}
+impl decdn_gossip::ReportDrain for OneReportDrain {
+    fn drain(&self) -> Vec<([u8; 32], ReportMetrics)> {
+        vec![(
+            self.provider,
+            ReportMetrics {
+                delivery_speed: Some(1_000_000),
+                uptime_observed: Some(true),
+                data_correct: Some(true),
+            },
+        )]
+    }
+}
+
+/// Sink that records every admitted report, so a test can assert on what the
+/// subscriber let through rather than only on counters.
+#[derive(Debug, Default)]
+struct CollectingSink {
+    reports: std::sync::Mutex<Vec<ValidatedReport>>,
+}
+impl CollectingSink {
+    fn reports(&self) -> Vec<ValidatedReport> {
+        self.reports
+            .lock()
+            .expect("collecting sink mutex poisoned")
+            .clone()
+    }
+}
+impl decdn_gossip::ReputationSink for CollectingSink {
+    fn accept(&self, report: ValidatedReport) {
+        self.reports
+            .lock()
+            .expect("collecting sink mutex poisoned")
+            .push(report);
+    }
+}
+
+/// Counts only `ReputationReject::NotStakedReporter`, so the assertion proves
+/// the staked-reporter gate fired rather than some unrelated rejection.
+#[derive(Debug, Default)]
+struct NotStakedReporterRejectCounter {
+    not_staked_reporter: AtomicU64,
+}
+impl NotStakedReporterRejectCounter {
+    fn not_staked_reporter(&self) -> u64 {
+        self.not_staked_reporter.load(Ordering::Relaxed)
+    }
+}
+impl decdn_gossip::GossipMetrics for NotStakedReporterRejectCounter {
+    fn inc_rejected(&self, reason: &'static str) {
+        if reason == ReputationReject::NotStakedReporter.label() {
+            self.not_staked_reporter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    fn inc_published(&self, _topic: &str) {}
+    fn inc_received(&self, _topic: &str) {}
+    fn set_peer_table_size(&self, _n: i64) {}
+    fn inc_reconnected(&self, _topic: &str) {}
+    fn add_evicted_ttl(&self, _n: u64) {}
 }
 
 /// Accept-any stub for the ADR 001 rule-2 gate — stands in for a live registry
@@ -605,6 +721,212 @@ async fn non_staked_announce_is_dropped_at_subscriber() -> anyhow::Result<()> {
     b_router.shutdown().await.ok();
     a_ep.close().await;
     b_ep.close().await;
+    Ok(())
+}
+
+/// #1344 — the ADR 008 staked-**reporter** gate, end to end. Admission
+/// semantics are covered at the validator level (`gossip::reputation`) and at
+/// the constructor level (`node::reputation_wiring`), but nothing drove a report
+/// through the *spawned* path — `GossipService::spawn` →
+/// `reputation_subscriber_task` → `validate_reputation_envelope`. That left the
+/// reputation subscriber as the one gate with no integration coverage at either
+/// polarity, even though its sibling announce gate has exactly this test.
+///
+/// Both polarities run in a single mesh: A publishes a signed report, B admits
+/// it (A is in B's staked set) and C rejects it (`NoneStaked`). Proving them
+/// together is what rules out the weak pass where the report simply never
+/// arrived — B's sink receiving it establishes the mesh delivered, so C's
+/// counter is attributable to the gate rather than to a mesh that never formed.
+#[tokio::test(flavor = "multi_thread")]
+// Three endpoints' worth of setup, all of it linear. Splitting it into helpers
+// would hide which node is wired which way, which is the point of the test.
+#[allow(clippy::too_many_lines)]
+async fn reputation_reports_are_gated_on_staked_reporters_at_the_subscriber() -> anyhow::Result<()>
+{
+    let a_secret = SecretKey::generate();
+    let b_secret = SecretKey::generate();
+    let c_secret = SecretKey::generate();
+    let a_id = *a_secret.public().as_bytes();
+    // The provider being rated. Must differ from the reporter or the validator
+    // rejects the report as a `SelfReport` before the staked check is reached.
+    let provider_id = [0x5au8; 32];
+
+    // Same self-hosted discovery wiring as the announce tests: MemoryLookup
+    // only, no n0 DNS/pkarr/relay. Bind A first, seed B and C with A, then seed
+    // A with both.
+    let (a_ep, a_addr, a_lookup) =
+        bind_discovery_endpoint(a_secret.clone(), vec![GOSSIP_ALPN.to_vec()], Vec::new()).await?;
+    let (b_ep, b_addr, _b_lookup) = bind_discovery_endpoint(
+        b_secret.clone(),
+        vec![GOSSIP_ALPN.to_vec()],
+        vec![a_addr.clone()],
+    )
+    .await?;
+    let (c_ep, c_addr, _c_lookup) = bind_discovery_endpoint(
+        c_secret.clone(),
+        vec![GOSSIP_ALPN.to_vec()],
+        vec![a_addr.clone()],
+    )
+    .await?;
+    a_lookup.add_endpoint_info(b_addr.clone());
+    a_lookup.add_endpoint_info(c_addr.clone());
+
+    let a_gossip = build_gossip(a_ep.clone());
+    let b_gossip = build_gossip(b_ep.clone());
+    let c_gossip = build_gossip(c_ep.clone());
+
+    let a_router = Router::builder(a_ep.clone())
+        .accept(GOSSIP_ALPN, a_gossip.clone())
+        .spawn();
+    let b_router = Router::builder(b_ep.clone())
+        .accept(GOSSIP_ALPN, b_gossip.clone())
+        .spawn();
+    let c_router = Router::builder(c_ep.clone())
+        .accept(GOSSIP_ALPN, c_gossip.clone())
+        .spawn();
+
+    let shutdown = CancellationToken::new();
+
+    // A: the reporter. Wired with a drain so its publisher emits one signed
+    // report per trigger; its own gate is irrelevant to what B and C decide.
+    // The sink is required even though A consumes nothing: the publisher is
+    // spawned on the same combined `sink && Enforce` branch as the subscriber,
+    // so a `None` sink here would silently leave A with no publish trigger.
+    let a_handles = spawn_reputation_node(
+        a_ep.clone(),
+        a_secret.clone(),
+        a_gossip.clone(),
+        Arc::new(NoopMetrics),
+        shutdown.clone(),
+        ReputationWiring {
+            sink: Some(Arc::new(CollectingSink::default())),
+            report_gate: ReportGate::Enforce(Arc::new(AllStaked)),
+            report_drain: Some(Arc::new(OneReportDrain::new(provider_id))),
+        },
+    )
+    .await;
+
+    // B: accepts — A is staked in B's set, so the report must reach B's sink.
+    let b_sink = Arc::new(CollectingSink::default());
+    let b_handles = spawn_reputation_node(
+        b_ep.clone(),
+        b_secret.clone(),
+        b_gossip.clone(),
+        Arc::new(NoopMetrics),
+        shutdown.clone(),
+        ReputationWiring {
+            sink: Some(b_sink.clone()),
+            report_gate: ReportGate::Enforce(Arc::new(AllStaked)),
+            report_drain: None,
+        },
+    )
+    .await;
+
+    // C: rejects — its set excludes every reporter, so the same report must be
+    // dropped with `NotStakedReporter` and never reach its sink.
+    let c_sink = Arc::new(CollectingSink::default());
+    let c_metrics = Arc::new(NotStakedReporterRejectCounter::default());
+    let c_handles = spawn_reputation_node(
+        c_ep.clone(),
+        c_secret.clone(),
+        c_gossip.clone(),
+        c_metrics.clone(),
+        shutdown.clone(),
+        ReputationWiring {
+            sink: Some(c_sink.clone()),
+            report_gate: ReportGate::Enforce(Arc::new(NoneStaked)),
+            report_drain: None,
+        },
+    )
+    .await;
+
+    // Seed the mesh on the reputation topic (same rationale as the announce
+    // tests: `GossipService` subscribes with an empty bootstrap set and cannot
+    // originate a mesh). Held for the duration to keep membership alive.
+    let rep_topic = reputation_topic_id();
+    let _a_bootstrap = a_gossip
+        .subscribe_and_join(rep_topic, vec![b_secret.public(), c_secret.public()])
+        .await
+        .map_err(|e| anyhow::anyhow!("A bootstrap subscribe_and_join: {e}"))?;
+    let _b_bootstrap = b_gossip
+        .subscribe_and_join(rep_topic, vec![a_secret.public()])
+        .await
+        .map_err(|e| anyhow::anyhow!("B bootstrap subscribe_and_join: {e}"))?;
+    let _c_bootstrap = c_gossip
+        .subscribe_and_join(rep_topic, vec![a_secret.public()])
+        .await
+        .map_err(|e| anyhow::anyhow!("C bootstrap subscribe_and_join: {e}"))?;
+
+    let a_trigger = a_handles
+        .reputation_publish_trigger
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("node A must have a reputation publisher (drain wired)"))?;
+
+    // Drive a fresh report every round until BOTH outcomes have been observed:
+    // B admitted one and C rejected one. Waiting on both is required, not just
+    // tidier — B and C join the mesh independently, so breaking as soon as B
+    // admits can leave C's membership still forming, and the reject assertion
+    // then fails on a race rather than on a defect. Both conditions are
+    // monotonic, so polling for the conjunction is stable. The invariant that
+    // must hold on EVERY round is the one that cannot be waited for: C must
+    // never admit. Bound generously (the same 50×100ms budget as the announce
+    // tests) so slow CI doesn't flake.
+    let mut observed = false;
+    for _ in 0..50 {
+        a_trigger.publish_now();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            c_sink.reports().is_empty(),
+            "receiver C must never admit a report from a non-staked reporter"
+        );
+        if !b_sink.reports().is_empty() && c_metrics.not_staked_reporter() > 0 {
+            observed = true;
+            break;
+        }
+    }
+    assert!(
+        observed,
+        "expected B (staked reporter) to admit A's report and C (non-staked) to reject it \
+         through the spawned subscriber; admitted_by_b={}, rejects_at_c={}",
+        b_sink.reports().len(),
+        c_metrics.not_staked_reporter(),
+    );
+
+    // C's reject is attributable to the gate rather than to a report that never
+    // arrived: B admitting the same broadcast proves A actually published, and
+    // the counter only counts `NotStakedReporter`.
+    let admitted_reports = b_sink.reports();
+    let report = admitted_reports
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("B admitted a report but the sink is empty"))?;
+    assert_eq!(
+        report.reporter, a_id,
+        "the admitted report must be the one A signed"
+    );
+    assert_eq!(
+        report.provider, provider_id,
+        "the admitted report must name the rated provider"
+    );
+    assert!(
+        c_sink.reports().is_empty(),
+        "receiver C must still hold no admitted reports after the reject"
+    );
+
+    shutdown.cancel();
+    join_gossip_tasks(
+        a_handles
+            .tasks
+            .into_iter()
+            .chain(b_handles.tasks)
+            .chain(c_handles.tasks),
+    )
+    .await;
+    a_router.shutdown().await.ok();
+    b_router.shutdown().await.ok();
+    c_router.shutdown().await.ok();
+    a_ep.close().await;
+    b_ep.close().await;
+    c_ep.close().await;
     Ok(())
 }
 

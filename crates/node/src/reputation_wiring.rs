@@ -4,8 +4,11 @@
 //! The leaf crates define trait seams; this module implements them over the
 //! node's concrete subsystems:
 //!
-//! - [`NodeStakedNodeSet`] gates inbound `NodeAnnounce` and reputation-report
-//!   admission to staked nodes via the chain [`StakerSet`].
+//! - the crate-private `NodeStakedNodeSet` gates inbound `NodeAnnounce` and
+//!   reputation-report admission to staked nodes via the chain [`StakerSet`];
+//!   it is reachable only through [`announce_staked_gate`] /
+//!   [`report_staked_gate`], which is what makes those the single seam where
+//!   the runtime's fail-open/fail-closed choice is made.
 //! - [`NodeSettlementSource`] supplies reporter-credibility settlement history.
 //! - [`NodeReputationSink`] folds validated reports into the network score and
 //!   the regional-coverage map.
@@ -34,8 +37,8 @@ use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use decdn_gossip::{
-    AnnounceGate, OwnedAnnounceGate, OwnedReportGate, PeerTable, ReportDrain, ReportGate,
-    ReputationSink, StakedNodeSet, ValidatedReport,
+    AnnounceGate, OwnedAnnounceGate, PeerTable, ReportDrain, ReportGate, ReputationSink,
+    StakedNodeSet, ValidatedReport,
 };
 use decdn_protocol::{NodeId as ProtocolNodeId, ReportMetrics};
 use decdn_reputation::{
@@ -57,14 +60,21 @@ fn now_secs() -> u64 {
 /// Adapts the chain [`StakerSet`] to the gossip [`StakedNodeSet`] gate: only
 /// currently-staked nodes may announce (ADR 001 rule 2) or submit reputation
 /// reports (ADR 008 §Gossip Protocol).
+///
+/// `pub(crate)` deliberately (#1345): the two gate constructors below are "the
+/// unit-tested guarantee" that the runtime never fails open (announce) or
+/// silently closed (report), and that claim only holds while wrapping this set
+/// in a gate is the *only* way to reach it. A `pub` raw seam would let a caller
+/// outside the crate rebuild the un-gated path the constructors exist to
+/// prevent.
 #[derive(Debug)]
-pub struct NodeStakedNodeSet {
+pub(crate) struct NodeStakedNodeSet {
     staker_set: Arc<dyn StakerSet>,
 }
 
 impl NodeStakedNodeSet {
     /// Wrap the runtime's staker set.
-    pub fn new(staker_set: Arc<dyn StakerSet>) -> Self {
+    pub(crate) fn new(staker_set: Arc<dyn StakerSet>) -> Self {
         Self { staker_set }
     }
 }
@@ -102,7 +112,7 @@ pub fn announce_staked_gate(staker_set: Arc<dyn StakerSet>) -> OwnedAnnounceGate
 /// [`AnnounceGate::Disabled`] would fail **open** — see [`ReportGate`] for what
 /// each does. Both are named constructors so the runtime's choice is explicit
 /// and unit-testable at the seam it is made (#1338).
-pub fn report_staked_gate(staker_set: Arc<dyn StakerSet>) -> OwnedReportGate {
+pub fn report_staked_gate(staker_set: Arc<dyn StakerSet>) -> ReportGate {
     ReportGate::Enforce(Arc::new(NodeStakedNodeSet::new(staker_set)))
 }
 

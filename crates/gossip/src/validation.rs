@@ -38,7 +38,9 @@ pub enum AnnounceGate<S> {
     /// `Enforce` set with no members rejects every announce, which is correct:
     /// an empty active registry has no staked peers to learn.
     Enforce(S),
-    /// FAIL-OPEN: accept any signature-valid announce. Tests only — no
+    /// FAIL-OPEN: skip the staked-membership check *only* — every other
+    /// [`validate_envelope`] rule (version byte, trailing bytes, payload
+    /// variant, region allowlist, clock skew) still applies. Tests only — no
     /// production path constructs this (the runtime always [`Self::Enforce`]s;
     /// `announce_staked_gate` in the `node` crate is the unit-tested guarantee).
     Disabled,
@@ -195,10 +197,10 @@ const _: () = assert!(
 /// `gate` enforces ADR 001 rule 2: [`AnnounceGate::Enforce`] accepts an announce
 /// only when its author `node_id` is a currently-staked node in the on-chain
 /// registry (queried through the live [`StakedNodeSet`] cache, kept fresh by the
-/// registry event tail). [`AnnounceGate::Disabled`] skips the check — accept any
-/// signature-valid announce — and exists only for tests; the runtime always
-/// passes `Enforce` (there is no production path that disables the gate). See
-/// [`AnnounceGate::Enforce`] for the empty-set semantics.
+/// registry event tail). [`AnnounceGate::Disabled`] skips *that check alone* —
+/// every other rule below still applies — and exists only for tests; the runtime
+/// always passes `Enforce` (there is no production path that disables the gate).
+/// See [`AnnounceGate::Enforce`] for the empty-set semantics.
 pub fn validate_envelope(
     bytes: &[u8],
     now_us: u64,
@@ -553,8 +555,11 @@ mod tests {
         );
     }
 
-    /// [`AnnounceGate::Disabled`] fails open (tests / unstaked modes): any
-    /// signature-valid announce is accepted.
+    /// [`AnnounceGate::Disabled`] fails open (tests / unstaked modes): an
+    /// otherwise-valid announce from an unstaked author is accepted. Only the
+    /// membership check is skipped — the many sibling tests in this module that
+    /// assert a rejection while passing `Disabled` are what cover the rules that
+    /// still apply.
     #[test]
     fn disabled_gate_accepts_any() {
         let sk = fresh_key();
