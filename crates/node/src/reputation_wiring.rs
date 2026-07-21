@@ -34,8 +34,8 @@ use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use decdn_gossip::{
-    AnnounceGate, OwnedAnnounceGate, PeerTable, ReportDrain, ReputationSink, StakedNodeSet,
-    ValidatedReport,
+    AnnounceGate, OwnedAnnounceGate, OwnedReportGate, PeerTable, ReportDrain, ReportGate,
+    ReputationSink, StakedNodeSet, ValidatedReport,
 };
 use decdn_protocol::{NodeId as ProtocolNodeId, ReportMetrics};
 use decdn_reputation::{
@@ -90,6 +90,20 @@ impl StakedNodeSet for NodeStakedNodeSet {
 /// e2e).
 pub fn announce_staked_gate(staker_set: Arc<dyn StakerSet>) -> OwnedAnnounceGate {
     AnnounceGate::Enforce(Arc::new(NodeStakedNodeSet::new(staker_set)))
+}
+
+/// Build the reputation-report admission gate carried in
+/// [`decdn_gossip::ReputationWiring`]. ADR 008 §Gossip Protocol: the runtime
+/// always enforces reporter membership against the live staker set, so this
+/// returns [`ReportGate::Enforce`].
+///
+/// Note the polarity inversion versus [`announce_staked_gate`]: leaving *this*
+/// gate [`ReportGate::Disabled`] fails **closed**, whereas an
+/// [`AnnounceGate::Disabled`] would fail **open** — see [`ReportGate`] for what
+/// each does. Both are named constructors so the runtime's choice is explicit
+/// and unit-testable at the seam it is made (#1338).
+pub fn report_staked_gate(staker_set: Arc<dyn StakerSet>) -> OwnedReportGate {
+    ReportGate::Enforce(Arc::new(NodeStakedNodeSet::new(staker_set)))
 }
 
 /// One settlement attributed to a reporter, stored with its absolute
@@ -455,6 +469,28 @@ mod tests {
         assert!(
             !gate.contains(pk().as_bytes()),
             "non-member must be rejected"
+        );
+    }
+
+    /// #1338 — the reputation-report gate constructor's mirror of the announce
+    /// test: the runtime enforces ADR 008 reporter membership against the live
+    /// staker set, so it returns [`ReportGate::Enforce`] over the real set.
+    /// Unlike the announce gate, `Disabled` here would fail *closed* (silently
+    /// no reputation gossip) — equally a regression, and equally invisible
+    /// outside the anvil e2e without this test.
+    #[test]
+    fn report_staked_gate_enforces_over_the_live_set() {
+        let member = pk();
+        let ReportGate::Enforce(gate) = report_staked_gate(staker_set_with(member)) else {
+            panic!("report gate must enforce, never be left Disabled");
+        };
+        assert!(
+            gate.contains(member.as_bytes()),
+            "staked reporter must be admitted"
+        );
+        assert!(
+            !gate.contains(pk().as_bytes()),
+            "non-member reporter must be rejected"
         );
     }
 

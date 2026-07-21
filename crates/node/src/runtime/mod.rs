@@ -1872,9 +1872,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
             Arc::clone(&ch.staker_set),
             min_counterparties,
         ))),
-        staked: Some(Arc::new(crate::reputation_wiring::NodeStakedNodeSet::new(
-            Arc::clone(&ch.staker_set),
-        ))),
+        staked: crate::reputation_wiring::report_staked_gate(Arc::clone(&ch.staker_set)),
         // Outbound report capture (#831): the `NodeOrigin` pull path feeds
         // `observation_buffer` with delivery/probe outcomes, so wire the drain —
         // which spawns the gossip publisher — whenever pull-through is enabled.
