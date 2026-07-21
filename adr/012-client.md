@@ -175,6 +175,11 @@ rpc_url = "https://<arb-sepolia-rpc-endpoint>"
 region = ""                                  # optional ISO 3166-1 alpha-2
 
 [bootstrap]
+# NOT YET IMPLEMENTED, unlike the removed peer_cache_path: step 8's periodic
+# refresh has no code behind it either, but it is still the intended design —
+# `decdn fetch` is one-shot today and re-reads the registry per invocation. This
+# key stays as the spec for that work rather than describing a knob the code
+# deliberately replaced.
 registry_refresh_secs = 600                  # 10 minutes
 
 [keys]
@@ -183,9 +188,9 @@ iroh_key_path = "~/.decdn/iroh_key"
 eth_keystore_path = "~/.decdn/client/keystore.json"
 
 [cache]
-# NOT YET IMPLEMENTED: the peer cache is always `peers.json` inside the resolved
-# client data dir, so move it with --data-dir rather than this key.
-peer_cache_path = "~/.decdn/client/peers.json"
+# The peer cache has no key of its own: it is always `peers.json` inside the
+# resolved client data dir (see the tree above), so it moves with --data-dir /
+# [identity] data_dir.
 probe_cache_max_entries = 1024               # per ADR 001
 probe_cache_ttl_secs = 15                    # per ADR 001
 
