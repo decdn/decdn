@@ -65,13 +65,13 @@ fn now_secs() -> u64 {
 /// constructors below are the only intended entry points (#1345).
 ///
 /// Note what this does *not* buy: it is not what keeps the runtime from failing
-/// open. Exporting this type would create no un-gated path — the only thing an
-/// external caller could build with it is the very same
-/// `AnnounceGate::Enforce(Arc::new(NodeStakedNodeSet::new(s)))` that
-/// [`announce_staked_gate`] returns. The genuinely un-gated seam is
-/// `AnnounceGate::Disabled`, a `pub` variant in `decdn-gossip` that anyone can
-/// construct, and narrowing this struct does not touch it (see #1345's
-/// follow-up).
+/// open. Exporting this type would create no un-gated path — anything an
+/// external caller could build with it is the same wrapping
+/// [`announce_staked_gate`] and [`report_staked_set`] already return. The
+/// genuinely un-gated seam is `AnnounceGate::Disabled`, a `pub` variant in
+/// `decdn-gossip` that anyone can construct, and narrowing this struct does not
+/// touch it; closing that one means making the variant unconstructible outside
+/// tests.
 #[derive(Debug)]
 pub(crate) struct NodeStakedNodeSet {
     staker_set: Arc<dyn StakerSet>,

@@ -415,20 +415,24 @@ pub(crate) async fn execute<P: Provider + Clone>(
         } => {
             if let Some(mbps) = declare_to {
                 let hint = format!("is {mbps} Mbps within the capacity band?");
-                outcome.declare = Some(
-                    chain_ctx::send(
-                        bond.declareMbps(U256::from(mbps)),
-                        "declareMbps",
-                        Some(&hint),
-                    )
-                    .await?,
-                );
+                chain_ctx::send(
+                    bond.declareMbps(U256::from(mbps)),
+                    "declareMbps",
+                    Some(&hint),
+                    &mut outcome.declare,
+                )
+                .await?;
             }
-            outcome.request =
-                Some(chain_ctx::send(bond.requestUnbond(release), "requestUnbond", None).await?);
+            chain_ctx::send(
+                bond.requestUnbond(release),
+                "requestUnbond",
+                None,
+                &mut outcome.request,
+            )
+            .await?;
         }
         Action::Withdraw { .. } => {
-            outcome.withdraw = Some(chain_ctx::send(bond.unbond(), "unbond", None).await?);
+            chain_ctx::send(bond.unbond(), "unbond", None, &mut outcome.withdraw).await?;
         }
         // `run` bails on `Waiting` before reaching here. Kept loud rather than a
         // no-op: a silent `Ok` would report `submitted=false` and exit 0, which

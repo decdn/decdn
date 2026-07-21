@@ -230,7 +230,7 @@ async fn spawn_reputation_node(
 /// receiver would `Prune` the duplicates and the poll loop's 50 rounds would
 /// collapse to ~6 real delivery attempts. Varying the payload keeps each round a
 /// distinct message id, so the retry budget is the one the loop advertises.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct OneReportDrain {
     provider: [u8; 32],
     seq: AtomicU64,
@@ -810,9 +810,9 @@ async fn reputation_reports_are_gated_on_staked_reporters_at_the_subscriber() ->
 
     // A: the reporter. Wired with a drain so its publisher emits one signed
     // report per trigger; its own gate is irrelevant to what B and C decide.
-    // The sink is required even though A consumes nothing: the publisher is
-    // spawned on the same combined `sink && Enforce` branch as the subscriber,
-    // so a `None` sink here would silently leave A with no publish trigger.
+    // A needs a sink even though it consumes nothing: the publisher is spawned
+    // on the `Enabled` branch alongside the subscriber, and `Enabled` carries
+    // sink and admission set together, so there is no publish-only wiring.
     let a_handles = spawn_reputation_node(
         a_ep.clone(),
         a_secret.clone(),
@@ -949,6 +949,28 @@ async fn reputation_reports_are_gated_on_staked_reporters_at_the_subscriber() ->
     assert!(
         c_sink.reports().is_empty(),
         "receiver C must still hold no admitted reports after the reject"
+    );
+
+    // Pin the per-round payload variation itself (#1355 review). Without it the
+    // reports would be byte-identical within a wall-clock second, plumtree would
+    // dedup them for 90s, and this test would silently fall back to ~6 delivery
+    // attempts across its whole budget — the thin margin that made an earlier
+    // version flake. C's counter is the right probe because the staked-reporter
+    // gate runs inside `validate_reputation_envelope`, i.e. BEFORE the
+    // subscriber's rate limiter, so unlike B's sink it is never throttled: it
+    // counts one per *delivered* message. Revert `OneReportDrain` to a constant
+    // payload and this drops to ~1.
+    let before = c_metrics.not_staked_reporter();
+    for _ in 0..10 {
+        a_trigger.publish_now();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let delivered = c_metrics.not_staked_reporter() - before;
+    assert!(
+        delivered >= 5,
+        "10 further publishes must deliver as distinct messages, got {delivered} — if this \
+         drops to ~1, OneReportDrain has stopped varying its payload and plumtree is \
+         deduping them"
     );
 
     shutdown.cancel();

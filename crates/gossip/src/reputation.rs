@@ -66,16 +66,6 @@ pub trait StakedNodeSet: Send + Sync + 'static {
     fn contains(&self, node_id: &[u8; 32]) -> bool;
 }
 
-// The ADR 008 staked-reporter admission gate used to live here as its own
-// `ReportGate` enum, mirroring `AnnounceGate`'s shape. It was folded into
-// `ReputationWiring::Enabled` in #1342: its `Enforce` payload is that variant's
-// `staked` field and its `Disabled` is `ReputationWiring::Disabled`, so the
-// "admission set without a sink" state stopped being representable rather than
-// being warned about at runtime. Note the polarity inversion that made two
-// same-shaped gates hazardous in the first place (#1338) is gone with it —
-// `AnnounceGate::Disabled` fails OPEN, and there is no longer a fail-CLOSED
-// twin of the same shape to confuse it with.
-
 /// Source of pending outbound reports for the publisher (ADR 008 §Gossip
 /// Protocol). Implemented in `decdn-node` over the observation buffer. Returns
 /// the latest metrics observed per rated peer since the previous drain.

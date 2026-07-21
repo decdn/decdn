@@ -375,8 +375,9 @@ impl GossipService {
 /// The admission set and the sink it feeds are *one* decision, not two: an
 /// admission set with nowhere to put what it admits is meaningless, and a sink
 /// with no admission set would consume unvetted reports. Carrying them as
-/// separate optional fields made 4 of the 8 field combinations nonsense and
-/// pushed the check to runtime — this shape makes them unrepresentable instead,
+/// separate optional fields left 8 representable combinations for what is really
+/// three states (off / subscribe-only / subscribe+publish) and pushed the check
+/// to runtime — this shape makes the nonsense ones unrepresentable instead,
 /// which is what #1344 previously needed a test to approximate.
 ///
 /// **[`Self::Disabled`] is fail-CLOSED, and is the [`Default`]** — the inverse
@@ -390,8 +391,9 @@ pub enum ReputationWiring {
     /// admitted or emitted. Neither subscriber nor publisher is spawned.
     #[default]
     Disabled,
-    /// Reputation gossip is on. Both fields are required together, which is the
-    /// invariant this variant exists to hold.
+    /// Reputation gossip is on. `sink` and `staked` are required together, which
+    /// is the invariant this variant exists to hold; `publish` is the one
+    /// genuinely independent choice.
     Enabled {
         /// Consumer of validated inbound reports (the aggregator).
         sink: Arc<dyn ReputationSink>,
@@ -399,7 +401,7 @@ pub enum ReputationWiring {
         /// accepted only when its signing `reporter` is a member. An empty set
         /// rejects every report — correct, since an empty active registry has
         /// no staked reporters to trust. `decdn-node` builds this via
-        /// `report_staked_gate` over the live registry.
+        /// `report_staked_set` over the live registry.
         staked: Arc<dyn StakedNodeSet>,
         /// `Some` additionally spawns the publisher; `None` is subscribe-only.
         /// Independent of admission, so it stays an `Option`.
@@ -434,31 +436,57 @@ async fn spawn_reputation_tasks(
     shutdown: &CancellationToken,
     reputation: ReputationWiring,
 ) -> (Vec<JoinHandle<()>>, Option<Arc<ReputationPublishTrigger>>) {
+    /// Whether this wiring would spawn the publisher, i.e. a report drain is
+    /// wired. Named rather than inlined so the `subscribe_reputation = false`
+    /// diagnostic below reads as one condition.
+    const fn drain_wired(w: &ReputationWiring) -> bool {
+        matches!(
+            w,
+            ReputationWiring::Enabled {
+                publish: Some(_),
+                ..
+            }
+        )
+    }
+
     if !cfg.subscribe_reputation {
         // The publisher only runs alongside the reputation topic subscription,
         // so `subscribe_reputation = false` silently drops wired reputation
         // gossip: a node with a drain keeps buffering outbound observations that
         // never publish (#864). Warn so this opt-out-only inert combination is
         // visible — it cannot arise at defaults (both live).
-        if matches!(reputation, ReputationWiring::Enabled { .. }) {
+        // Gated on a wired DRAIN, not merely on `Enabled` (#1355 review): the
+        // runtime always builds `Enabled`, so the broader predicate warned at
+        // every deliberate opt-out — including `publish: None`, where nothing
+        // accumulates and this advice does not apply.
+        if drain_wired(&reputation) {
             tracing::warn!(
-                ?reputation,
-                "gossip: reputation wiring supplied but subscribe_reputation = false; the \
-                 topic is not joined, and any wired report drain will accumulate outbound \
-                 reports that never publish — enable gossip.subscribe_reputation"
+                "gossip: report drain wired but subscribe_reputation = false; the topic is \
+                 not joined, so outbound reputation reports will accumulate and never \
+                 publish — enable gossip.subscribe_reputation to drain them"
             );
         }
         return (Vec::new(), None);
     }
     // `Disabled` is a stated intent rather than a wiring accident — the type
     // makes "sink without admission set" (and vice versa) unrepresentable, so
-    // there is no half-wired case left to diagnose here.
+    // there is no half-wired case left to diagnose. It is still worth one line:
+    // `Disabled` is this type's `Default`, and `subscribe_reputation` defaults
+    // to true, so an embedder who passes `ReputationWiring::default()` against a
+    // default config gets no reputation gossip and (before #1342) at least got a
+    // warning. `info!` rather than `warn!` because for `decdn-node` — which
+    // always builds `Enabled` — this branch is unreachable, so anyone reaching
+    // it chose to.
     let ReputationWiring::Enabled {
         sink,
         staked,
         publish,
     } = reputation
     else {
+        tracing::info!(
+            "gossip: subscribe_reputation is set but the wiring is ReputationWiring::Disabled; \
+             the reputation topic is not joined"
+        );
         return (Vec::new(), None);
     };
 

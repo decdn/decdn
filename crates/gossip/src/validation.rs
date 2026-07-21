@@ -21,14 +21,15 @@ use crate::reputation::StakedNodeSet;
 /// [`validate_envelope`] path, `Arc<dyn StakedNodeSet>` on the owned spawn path
 /// (see [`OwnedAnnounceGate`]).
 ///
-/// **This is the only gate of its shape, and its `Disabled` fails OPEN.** There
-/// used to be a `ReportGate` twin over the same [`StakedNodeSet`] seam whose
-/// `Disabled` meant the *opposite* (fail-CLOSED); #1338 gave them distinct types
-/// so the inversion could not be copy-pasted wrong-way-round, and #1342 removed
-/// the hazard at the root by folding that twin into
-/// [`crate::ReputationWiring`]'s variants. Nothing of this shape is fail-closed
-/// any more — so read `Disabled` here as "permissive", without checking which
-/// gate you are looking at.
+/// **`AnnounceGate::Disabled` fails OPEN.** The inverse pole still exists —
+/// [`crate::ReputationWiring::Disabled`] is fail-CLOSED — so the polarity
+/// inversion #1338 warned about has not gone away; always check which type you
+/// are holding. What #1342 removed is the *shape* collision: the fail-closed
+/// side used to be a second two-variant `*Gate` enum over this same
+/// [`StakedNodeSet`] seam, so the two could be swapped at a call site by
+/// mistaking one for the other. It is now a differently-shaped wiring enum with
+/// a different name, which is what makes them hard to confuse — not the absence
+/// of an inverted twin.
 // `Copy` is conditional: it applies only where `S: Copy`, i.e. the borrowed
 // `AnnounceGate<&dyn StakedNodeSet>`. The owned `OwnedAnnounceGate` (an `Arc`)
 // is `Clone`-only, so `gate.clone()` at each subscriber is a refcount bump, not
@@ -203,9 +204,9 @@ const _: () = assert!(
 /// registry (queried through the live [`StakedNodeSet`] cache, kept fresh by the
 /// registry event tail). [`AnnounceGate::Disabled`] skips *that check alone* —
 /// every other rule below still applies, signature verification included (it
-/// runs first) — and exists only for tests; the runtime always passes `Enforce`
-/// (there is no production path that disables the gate). See
-/// [`AnnounceGate::Enforce`] for the empty-set semantics.
+/// runs before the gate is consulted) — and exists only for tests; the runtime
+/// always passes `Enforce` (there is no production path that disables the gate).
+/// See [`AnnounceGate::Enforce`] for the empty-set semantics.
 pub fn validate_envelope(
     bytes: &[u8],
     now_us: u64,

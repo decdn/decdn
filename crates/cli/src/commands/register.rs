@@ -188,6 +188,7 @@ pub(crate) async fn submit_registration<P: Provider + Clone>(
     // The hint below reaches both the send and revert arms, which matters here:
     // `registerNode`'s failure modes are pre-flight gas-estimate reverts, so it
     // is the SEND arm that fires in practice.
+    let mut landed = None;
     let tx = chain_ctx::send(
         bond.registerNode(
             node_id,
@@ -202,6 +203,7 @@ pub(crate) async fn submit_registration<P: Provider + Clone>(
             "most likely the bond does not cover minBond / the declared-capacity curve, the \
              nodeId/address is already bound, or a signature was rejected",
         ),
+        &mut landed,
     )
     .await?;
     outcome.tx = Some(tx);

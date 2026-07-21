@@ -367,6 +367,7 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
                     swap_summary.as_ref(),
                     true,
                     Some(&readiness),
+                    None,
                     &args.region,
                     args.multiaddrs.len(),
                 )
@@ -489,6 +490,9 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
     let mut bond_outcome = bond::Outcome::default();
     let mut register_outcome: Option<register::RegisterOutcome> = None;
     let mut bond_reported = false;
+    // Whether the bond phase itself completed. Gates the re-run guidance below:
+    // after a successful bond, a later phase failing carries no bond hazard.
+    let mut bond_done = false;
 
     let live: anyhow::Result<Readiness> = async {
         // ---- Phase 2.1/2.2: bond (idempotent stake-to-tier). ----
@@ -505,6 +509,7 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
             &mut bond_outcome,
         )
         .await?;
+        bond_done = true;
         if !json {
             let mut out = io::stdout().lock();
             bond::write_plan(&mut out, &plan, false, &bond_outcome, false)
@@ -558,6 +563,7 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
             swap_summary.as_ref(),
             false,
             readiness,
+            Some(terms_hash.is_some()),
             &args.region,
             args.multiaddrs.len(),
         )
@@ -570,14 +576,31 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
             // every landed hash (swap, bond, register) with `partial: true`; in
             // human mode each phase already printed its own result as it landed,
             // so the only gap is a bond that failed before reaching its writer.
-            if json {
-                println!("{}", summary(None));
-            } else if !bond_reported {
-                let mut out = io::stdout().lock();
-                bond::write_plan(&mut out, &plan, false, &bond_outcome, false)
-                    .context("failed to write bond result")?;
+            //
+            // The write is NOT `?`-ed: a broken stdout must never displace the
+            // chain error, which is the whole payload here (same discipline as
+            // `bond::run`, and `println!` is avoided because it *panics* on
+            // EPIPE — `decdn setup --json | head` would otherwise abort instead
+            // of reporting).
+            let write_result = if json {
+                writeln!(io::stdout().lock(), "{}", summary(None))
+            } else if bond_reported {
+                Ok(())
+            } else {
+                bond::write_plan(&mut io::stdout().lock(), &plan, false, &bond_outcome, false)
+            };
+            if let Err(write_err) = write_result {
+                eprintln!("warning: failed to write the partial setup report: {write_err}");
             }
-            return Err(err);
+            // Same guidance `bond::run` attaches, and only when the BOND phase
+            // failed: `setup` reuses `bond::execute` so it carries the identical
+            // re-run hazard, and it is the documented onboarding entry point
+            // people blind-retry. A later phase failing after a confirmed bond
+            // has no such hazard, and the hint would misdescribe it.
+            if bond_done {
+                return Err(err);
+            }
+            return Err(err).context(bond::resume_hint(&bond_outcome));
         }
     };
 
@@ -1212,6 +1235,10 @@ fn build_summary(
     // `None` when a live phase failed before the readiness read-back; the
     // object is then flagged `partial` rather than being a different shape.
     readiness: Option<&Readiness>,
+    // Whether a fresh registration was owed at all. Distinguishes "skipped
+    // because this key is already registered" from "owed but never completed".
+    // `None` on the dry-run path, which returns before due-ness is determined.
+    register_due: Option<bool>,
     region: &str,
     multiaddrs: usize,
 ) -> serde_json::Value {
@@ -1241,14 +1268,19 @@ fn build_summary(
             "bond_tx": tx_hex(bond_outcome.bond),
             "declare_tx": tx_hex(bond_outcome.declare),
         },
+        // `skipped` alone used to conflate three states once the partial path
+        // could emit this object: not due, not reached, and attempted-and-failed
+        // (#1355 review). `due` disambiguates — `skipped: true, due: true` is a
+        // registration that was owed and did not complete.
         "register": match register_outcome {
             Some(o) => serde_json::json!({
                 "skipped": false,
+                "due": true,
                 "submitted": o.tx.is_some(),
                 "tx": tx_hex(o.tx),
                 "node_id": format!("{:#x}", o.node_id),
             }),
-            None => serde_json::json!({ "skipped": true }),
+            None => serde_json::json!({ "skipped": true, "due": register_due }),
         },
         "swap": match swap {
             Some(s) => serde_json::json!({
@@ -1515,6 +1547,7 @@ mod tests {
             Some(&swap),
             false,
             None,
+            Some(true),
             "US",
             1,
         );
@@ -1544,6 +1577,7 @@ mod tests {
             Some(&swap),
             false,
             Some(&sample_readiness()),
+            Some(true),
             "US",
             1,
         );
@@ -1573,6 +1607,7 @@ mod tests {
             None,
             false,
             Some(&sample_readiness()),
+            Some(true),
             "US",
             1,
         );
@@ -1611,6 +1646,7 @@ mod tests {
             None,
             false,
             Some(&sample_readiness()),
+            Some(true),
             "DE",
             2,
         );
@@ -1643,6 +1679,7 @@ mod tests {
             Some(&swap),
             false,
             Some(&sample_readiness()),
+            Some(true),
             "US",
             1,
         );

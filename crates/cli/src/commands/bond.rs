@@ -82,35 +82,58 @@ pub async fn run(args: &cli::BondArgs, global_config: Option<&Path>) -> anyhow::
     Ok(())
 }
 
-/// Operator-facing guidance attached to a failed [`execute`], naming what is
-/// known to have been submitted.
+/// Operator-facing guidance attached to a failed [`execute`], naming the latest
+/// step that may have taken effect.
 ///
-/// Deliberately hedged (#1355 review). [`chain_ctx::send`] returns `Err` when a
-/// receipt cannot be *fetched*, and in that case the transaction is still in
-/// flight — so an absent hash means "not confirmed", never "did not happen".
-/// The earlier wording asserted the strong negatives ("no TOKEN was
-/// transferred", "on-chain state is unchanged") and told the operator to re-run
-/// immediately, which is actively unsafe: alloy's nonce filler resolves against
-/// the *pending* block, so re-running while a `bond` tx is still in the mempool
-/// takes the next nonce, re-reads a stale `activeBond`, and submits a *second*
-/// top-up — doubling the bond rather than converging.
-fn resume_hint(outcome: &Outcome) -> String {
-    match (outcome.approve, outcome.bond) {
-        (_, Some(tx)) => format!(
-            "bond tx {tx:#x} was submitted. If it mined, the TOKEN is held by CapacityBond \
-             (confirm with `activeBond`) and only the capacity tier is missing. Re-running \
-             tops up just the remaining shortfall — but WAIT for {tx:#x} to settle first: \
-             re-running while it is still pending submits a second bond and doubles it"
+/// Reads [`Outcome`] as [`chain_ctx::send`] populates it: `Some` means "may have
+/// taken effect" — confirmed success OR broadcast-with-an-unreadable-receipt —
+/// and `None` means "definitively not applied" (never sent, or a confirmed
+/// revert). That distinction is the whole point (#1355 review): the earlier
+/// wording asserted strong negatives ("no TOKEN was transferred", "on-chain
+/// state is unchanged") and told the operator to re-run immediately, which is
+/// unsafe. alloy's nonce filler resolves against the *pending* block, so
+/// re-running while a `bond` tx is still in the mempool takes the next nonce,
+/// re-reads a stale `activeBond`, and submits a *second* top-up — doubling the
+/// bond rather than converging.
+///
+/// Matched over all three steps rather than the two that can be outstanding
+/// today. `declare` is currently unreachable in an `Err` (it is the last thing
+/// `execute` does), but that is a control-flow fact this function cannot see; a
+/// fourth step added later would otherwise silently make the guidance name the
+/// wrong transaction.
+pub(crate) fn resume_hint(outcome: &Outcome) -> String {
+    let pending = |step: &str, tx: B256, rest: &str| {
+        format!(
+            "{step} tx {tx:#x} may have taken effect — it was submitted, and if the error \
+             below is a receipt-fetch timeout rather than a revert its outcome is still \
+             unknown. {rest} Do NOT re-run until {tx:#x} has settled: re-running while it \
+             is pending takes the next nonce and submits a second transaction, which for a \
+             bond doubles it."
+        )
+    };
+    match (outcome.declare, outcome.bond, outcome.approve) {
+        (Some(tx), ..) => pending(
+            "declareMbps",
+            tx,
+            "The bond itself is in place; only a step after the tier declaration failed.",
         ),
-        (Some(tx), None) => format!(
-            "approve tx {tx:#x} was submitted; no bond transaction followed. If the error \
-             below is a revert, nothing was transferred and re-running is safe. If it is a \
-             receipt-fetch timeout, wait for {tx:#x} to settle before re-running"
+        (_, Some(tx), _) => pending(
+            "bond",
+            tx,
+            "If it mined, the TOKEN is held by CapacityBond (confirm with `activeBond`) and \
+             only the capacity tier is missing; a re-run then tops up just the remaining \
+             shortfall.",
         ),
-        (None, None) => "no transaction was confirmed. A send-time failure is usually a \
-             pre-flight gas estimate rejecting the call, in which case nothing was \
-             broadcast — but an RPC timeout can still leave a tx in the mempool, so check \
-             the pending nonce before re-running"
+        (_, _, Some(tx)) => pending(
+            "approve",
+            tx,
+            "It only grants an allowance — no TOKEN moves until the bond transaction \
+             itself lands, and none is recorded as having done so.",
+        ),
+        (None, None, None) => "no transaction is recorded as having taken effect: either \
+             nothing was broadcast (a pre-flight gas estimate or a pre-flight balance check \
+             rejecting the call), or one was broadcast and confirmed reverted. Check the \
+             cause below for a tx hash, and the pending nonce, before re-running"
             .to_string(),
     }
 }
@@ -220,18 +243,30 @@ pub(crate) async fn execute<P: Provider + Clone>(
             .await
             .with_context(|| format!("failed to read TOKEN allowance from {}", plan.token))?;
         if allowance < plan.shortfall {
-            outcome.approve = Some(
-                chain_ctx::send(token.approve(cb_addr, plan.shortfall), "approve", None).await?,
-            );
+            chain_ctx::send(
+                token.approve(cb_addr, plan.shortfall),
+                "approve",
+                None,
+                &mut outcome.approve,
+            )
+            .await?;
         }
 
-        outcome.bond = Some(chain_ctx::send(bond.bond(plan.shortfall), "bond", None).await?);
+        chain_ctx::send(bond.bond(plan.shortfall), "bond", None, &mut outcome.bond).await?;
     }
 
     if plan.needs_declare {
-        let hint = format!("is {} Mbps within the capacity band?", plan.mbps);
-        outcome.declare =
-            Some(chain_ctx::send(bond.declareMbps(mbps), "declareMbps", Some(&hint)).await?);
+        // The band is pre-validated in `build_plan`, so this fires only on a
+        // mid-run governance change — hence "still", to stop it reading as the
+        // first thing to suspect.
+        let hint = format!("is {} Mbps still within the capacity band?", plan.mbps);
+        chain_ctx::send(
+            bond.declareMbps(mbps),
+            "declareMbps",
+            Some(&hint),
+            &mut outcome.declare,
+        )
+        .await?;
     }
 
     Ok(())
@@ -394,89 +429,144 @@ mod tests {
     }
 
     /// #1355 — the resume guidance is what an operator acts on after a partial
-    /// failure, and its arm ordering is load-bearing: writing `(Some(tx), _)`
+    /// failure, and its arm ordering is load-bearing: putting an earlier step
     /// first would tell someone whose TOKEN is already in `CapacityBond` that
-    /// only an allowance was granted. Pin which step each state names.
+    /// only an allowance was granted. Pin which step each state names, over
+    /// every representable `Outcome`.
     #[test]
-    fn resume_hint_names_the_latest_step_that_was_submitted() {
+    fn resume_hint_names_the_latest_step_that_may_have_taken_effect() {
         let approve = B256::repeat_byte(0xa1);
         let bond = B256::repeat_byte(0xb2);
+        let declare = B256::repeat_byte(0xc3);
 
-        // Both landed → must speak about the BOND, not the approve.
-        let both = resume_hint(&Outcome {
-            approve: Some(approve),
-            bond: Some(bond),
-            declare: None,
-        });
-        assert!(both.contains(&format!("{bond:#x}")), "{both}");
-        assert!(!both.contains(&format!("{approve:#x}")), "{both}");
+        // Each row: the outcome, the hash it MUST name, and the hashes it must
+        // not name (an earlier step is never the one still outstanding).
+        let cases = [
+            (
+                Outcome {
+                    approve: Some(approve),
+                    bond: Some(bond),
+                    declare: Some(declare),
+                },
+                declare,
+                vec![approve, bond],
+            ),
+            (
+                Outcome {
+                    approve: Some(approve),
+                    bond: Some(bond),
+                    declare: None,
+                },
+                bond,
+                vec![approve],
+            ),
+            // Allowance already sufficient, so no approve tx at all.
+            (
+                Outcome {
+                    approve: None,
+                    bond: Some(bond),
+                    declare: None,
+                },
+                bond,
+                vec![],
+            ),
+            (
+                Outcome {
+                    approve: Some(approve),
+                    bond: None,
+                    declare: None,
+                },
+                approve,
+                vec![bond],
+            ),
+        ];
 
-        // Bond landed without a separate approve (allowance already sufficient)
-        // must still select the bond arm.
-        let bond_only = resume_hint(&Outcome {
-            approve: None,
-            bond: Some(bond),
-            declare: None,
-        });
-        assert!(bond_only.contains(&format!("{bond:#x}")), "{bond_only}");
-
-        let approve_only = resume_hint(&Outcome {
-            approve: Some(approve),
-            bond: None,
-            declare: None,
-        });
-        assert!(
-            approve_only.contains(&format!("{approve:#x}")),
-            "{approve_only}"
-        );
-        assert!(
-            !approve_only.contains(&format!("{bond:#x}")),
-            "{approve_only}"
-        );
+        for (outcome, must_name, must_not_name) in cases {
+            let hint = resume_hint(&outcome);
+            assert!(
+                hint.contains(&format!("{must_name:#x}")),
+                "must name {must_name:#x}: {hint}"
+            );
+            for other in must_not_name {
+                assert!(
+                    !hint.contains(&format!("{other:#x}")),
+                    "must not name the earlier step {other:#x}: {hint}"
+                );
+            }
+        }
 
         let nothing = resume_hint(&Outcome::default());
         assert!(
-            nothing.contains("no transaction was confirmed"),
+            nothing.contains("no transaction is recorded as having taken effect"),
             "{nothing}"
         );
     }
 
-    /// #1355 review — the guidance must not assert on-chain negatives, because
-    /// `chain_ctx::send` also errors when a receipt cannot be *fetched*, leaving
-    /// the tx in flight. Asserting "no TOKEN was transferred" there would be
-    /// false, and telling the operator to re-run immediately would double the
-    /// bond (alloy's nonce filler resolves against the pending block).
+    /// #1355 review — the property, not a denylist of last release's phrasing.
+    ///
+    /// `chain_ctx::send` sets its `landed` slot BEFORE awaiting the receipt, so
+    /// `Some` means "may have taken effect" — including the receipt-fetch
+    /// timeout where the tx is still in flight. Every arm that names a hash must
+    /// therefore hedge and must tell the operator to wait: advising an immediate
+    /// re-run while a bond is pending is what doubles it. The first version of
+    /// this test forbade four literal strings and missed a fifth arm that said
+    /// the same thing in different words, so assert the required content
+    /// instead.
     #[test]
-    fn resume_hint_never_claims_the_chain_is_unchanged() {
-        let hints = [
-            resume_hint(&Outcome {
-                approve: Some(B256::repeat_byte(0xa1)),
-                bond: Some(B256::repeat_byte(0xb2)),
-                declare: None,
-            }),
-            resume_hint(&Outcome {
-                approve: Some(B256::repeat_byte(0xa1)),
+    fn resume_hint_hedges_and_warns_whenever_a_step_may_be_outstanding() {
+        let tx = B256::repeat_byte(0xd4);
+        let outcomes = [
+            Outcome {
+                approve: Some(tx),
                 bond: None,
                 declare: None,
-            }),
-            resume_hint(&Outcome::default()),
+            },
+            Outcome {
+                approve: None,
+                bond: Some(tx),
+                declare: None,
+            },
+            Outcome {
+                approve: None,
+                bond: None,
+                declare: Some(tx),
+            },
         ];
-        for hint in &hints {
+
+        for outcome in outcomes {
+            let hint = resume_hint(&outcome);
+            assert!(
+                hint.contains("may have taken effect"),
+                "must hedge rather than assert an outcome: {hint}"
+            );
+            assert!(
+                hint.contains("Do NOT re-run until"),
+                "must warn against re-running while a tx is outstanding: {hint}"
+            );
+            // The unqualified negatives that made the first version unsafe.
             for forbidden in [
                 "no TOKEN was transferred",
                 "on-chain state is unchanged",
                 "will not over-bond",
                 "no transaction landed",
+                "no bond transaction followed",
+                "re-running is safe",
             ] {
                 assert!(
                     !hint.contains(forbidden),
-                    "resume guidance must not assert `{forbidden}` — a receipt-fetch \
-                     timeout leaves the tx in flight; got: {hint}"
+                    "must not assert `{forbidden}` — the tx may be in flight: {hint}"
                 );
             }
         }
-        // The one state that can have a pending bond must say so explicitly.
-        assert!(hints[0].contains("WAIT"), "{}", hints[0]);
+
+        // The all-absent state is the one place a negative is legitimate, and it
+        // still must not claim the chain is untouched.
+        let nothing = resume_hint(&Outcome::default());
+        assert!(
+            !nothing.contains("on-chain state is unchanged"),
+            "{nothing}"
+        );
+        assert!(nothing.contains("confirmed reverted"), "{nothing}");
     }
 
     #[test]
