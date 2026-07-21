@@ -42,6 +42,7 @@
 //! ≥5-point gap between the two (enforced at config resolution) is what prevents
 //! thrash on writes hovering near the trigger.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -126,6 +127,7 @@ async fn sweep(
     effective: u64,
     target_bytes: u64,
     budget: u64,
+    sizes: &HashMap<decdn_cache::Hash, u64>,
 ) -> u64 {
     let candidates = cache.eviction_candidates();
     if candidates.is_empty() {
@@ -133,20 +135,6 @@ async fn sweep(
         metrics.evictions_starved.inc();
         return 0;
     }
-
-    // One store walk per tick: the sizes map doubles as the footprint source
-    // (see `tick`), so the sweep does not re-walk. A snapshot failure skips the
-    // sweep entirely rather than releasing blind — without sizes there is no way
-    // to know when target is reached, and the previous behaviour (empty map)
-    // silently drained the full budget every tick.
-    let sizes = match cache.size_snapshot().await {
-        Ok(s) => s,
-        Err(err) => {
-            metrics.size_measure_failures.inc();
-            tracing::warn!(%err, "eviction driver: size snapshot failed; skipping sweep this tick");
-            return 0;
-        }
-    };
 
     let mut ordered: Vec<(decdn_cache::Hash, std::time::Instant)> =
         candidates.into_inner().into_iter().collect();
@@ -202,11 +190,17 @@ async fn tick(
     budget: u64,
     state: &mut DriverState,
 ) {
-    // Single store walk per tick: derive the footprint from the same snapshot
-    // the sweep will use, instead of calling `total_bytes()` (walk #1) and then
-    // `size_snapshot()` (walk #2) — which also disagreed with each other.
-    let raw = match cache.total_bytes().await {
-        Ok(t) => t,
+    // Exactly ONE store walk per tick: this snapshot is both the footprint
+    // source and the sweep's per-hash size lookup, so `sweep` takes it by
+    // reference rather than re-walking. (An earlier shape called `total_bytes()`
+    // here and `size_snapshot()` again in the sweep — two walks under sustained
+    // pressure, and the two readings could disagree.)
+    //
+    // A snapshot failure skips the whole tick rather than evicting blind:
+    // without sizes there is no way to know when target is reached, and
+    // degrading to an empty map silently drained the full budget every tick.
+    let sizes = match cache.size_snapshot().await {
+        Ok(s) => s,
         Err(err) => {
             metrics.size_measure_failures.inc();
             tracing::warn!(
@@ -218,6 +212,7 @@ async fn tick(
         }
     };
 
+    let raw = sizes.values().fold(0u64, |acc, sz| acc.saturating_add(*sz));
     let effective = reconcile(state, raw);
 
     // Gauges report honest raw usage; `pending_reclaim` is driver bookkeeping.
@@ -239,7 +234,7 @@ async fn tick(
         state.evicting = true;
     }
 
-    let freed = sweep(cache, metrics, effective, target_bytes, budget).await;
+    let freed = sweep(cache, metrics, effective, target_bytes, budget, &sizes).await;
     state.pending_reclaim = state.pending_reclaim.saturating_add(freed);
 }
 

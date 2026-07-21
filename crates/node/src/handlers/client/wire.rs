@@ -49,14 +49,18 @@ impl ClientHandler {
     /// clamp-and-warn the probe handler applies before signing a `ProbeResponse`).
     pub(super) fn clamped_rate(&self) -> u64 {
         let raw_rate = self.rate_per_mb.load(Ordering::Relaxed);
-        let rate_per_mb = self.rate_bounds.clamp(raw_rate);
+        // One snapshot for both the clamp and the log — see the identical note
+        // in `ProbeHandler`: separate `floor()`/`ceiling()` reads could log a
+        // pair that never produced this clamp decision.
+        let bounds = self.rate_bounds.snapshot();
+        let rate_per_mb = bounds.clamp(raw_rate);
         if rate_per_mb != raw_rate {
             self.metrics.rate_bounds_clamped();
             tracing::warn!(
                 raw_rate,
                 clamped = rate_per_mb,
-                floor = self.rate_bounds.floor(),
-                ceiling = self.rate_bounds.ceiling(),
+                floor = bounds.floor,
+                ceiling = bounds.ceiling,
                 "rate_per_mb clamped to delivery bounds before signing StreamResponse"
             );
         }
