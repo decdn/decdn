@@ -293,26 +293,22 @@ impl UniswapV3Venue {
         // batch if it can't execute before `deadline`, giving the swap the same
         // expiry guarantee the Balancer venue has natively.
         let inner = SwapRouter02::exactOutputSingleCall { params }.abi_encode();
-        // Run the swap but DO NOT early-return on failure: the allowance reset
-        // below must run on every path so no standing USDC allowance survives —
-        // neither the `max_in − actual_in` remainder after a successful swap nor
-        // the full `max_in` after a reverted/failed one.
-        let swap_result = async {
+        // The swap does NOT early-return on failure: the allowance reset must
+        // run on every path so no standing USDC allowance survives — neither the
+        // `max_in − actual_in` remainder after a successful swap nor the full
+        // `max_in` after a reverted/failed one. A reset failure is logged and
+        // swallowed so it never masks the swap's own error. `run_then_cleanup`
+        // is what makes that sequencing a named, tested property rather than an
+        // easily-broken local convention (see its docs).
+        crate::tx::run_then_cleanup(
             crate::tx::send_unrecorded(
                 router.multicall(deadline, vec![Bytes::from(inner)]),
                 "exactOutputSingle (via multicall)",
                 None,
-            )
-            .await
-        }
-        .await;
-
-        // Always reset the router allowance to zero (best-effort), regardless of
-        // swap outcome. A reset failure is logged and swallowed so it never
-        // masks the swap's own error.
-        self.reset_router_allowance().await;
-
-        swap_result
+            ),
+            || self.reset_router_allowance(),
+        )
+        .await
     }
 
     /// Best-effort reset of the router's USDC allowance to zero. Warns and
@@ -466,19 +462,36 @@ mod tests {
         assert!(got > U256::from(10u64).pow(U256::from(24u64)));
     }
 
-    // Issue-1 cleanup coverage note (#991): the load-bearing safety property of
-    // running the allowance reset on every path is that the reset is
-    // *best-effort* — a failed reset must never panic, abort onboarding, or mask
-    // the swap's own error. That property is unit-tested below against an
-    // unconnected provider (the reset's send fails and is swallowed). A true
-    // end-to-end test — approve succeeds, the swap *reverts on-chain*, and a
-    // follow-up reset call is then observed — needs a harness this crate does
-    // not yet have (no anvil dev-dep). Note that mock transport IS available:
-    // `alloy::providers::mock::Asserter` + `connect_mocked_client` ships in the
-    // pinned alloy and is used elsewhere in the workspace — see
-    // `cli/src/commands/unbond.rs` `mod plan_computation` for the ordered
-    // response-queue idiom. An earlier version of this comment claimed
-    // otherwise and so deferred the test on a false premise (#1347).
+    // Issue-1 cleanup coverage note (#991, reassessed under #1347). Running the
+    // allowance reset on every path rests on two properties, now covered
+    // separately:
+    //
+    // 1. The reset is *best-effort* — a failed reset must never panic, abort
+    //    onboarding, or mask the swap's own error. Unit-tested below against an
+    //    unconnected provider (the reset's send fails and is swallowed).
+    // 2. It runs on every path, after the swap, without replacing its result.
+    //    That is control flow, so it is tested as control flow:
+    //    `tx::run_then_cleanup`'s own tests drive both the Ok and Err paths with
+    //    plain closures and no RPC at all. Both venues route through it.
+    //
+    // What remains deferred is the on-chain version — approve succeeds, the swap
+    // *reverts on-chain*, and the follow-up reset is then observed against real
+    // allowance state. That needs anvil, which this crate has no dev-dep on.
+    //
+    // `alloy::providers::mock::Asserter` does NOT close that gap, and the reason
+    // is worth recording so it is not re-litigated: it is a FIFO transport mock
+    // with no method awareness, which makes read paths trivial to drive (see
+    // `cli/src/commands/unbond.rs` `mod plan_computation`) but a *send* path
+    // impractical. A single `send()` fans out the filler stack's
+    // estimateGas/nonce/chainId/feeHistory requests concurrently, so responses
+    // cannot be matched to methods and the queue drains unpredictably — measured:
+    // the remaining-queue length is 0 regardless of how many responses are
+    // pushed, so it cannot even distinguish "the reset ran" from "it did not".
+    // A test built on it would pin alloy's filler internals, not our logic.
+    //
+    // (An earlier version of this comment claimed alloy shipped no `Asserter` at
+    // all. That was false; the correction landed in #1358, and the paragraph
+    // above is the actual reason the end-to-end test stays deferred.)
 
     #[tokio::test]
     async fn reset_router_allowance_swallows_send_failure() {

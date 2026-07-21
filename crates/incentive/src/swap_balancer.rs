@@ -297,7 +297,7 @@ impl BalancerV3Venue {
         // revert) must still fall through to the two best-effort resets below, so
         // neither leg leaves a standing approval on the between-legs failure path.
         // The captured result is returned unchanged after the resets run.
-        let swap_result = async {
+        let swap = async {
             // Leg 2: grant the Router a Permit2 allowance, scoped to `deadline`
             // (see module docs — deviates from the reference's `block.timestamp`
             // expiration, which is only safe because its two calls are atomic).
@@ -335,23 +335,26 @@ impl BalancerV3Venue {
                 None,
             )
             .await
-        }
-        .await;
+        };
 
         // Reset both legs — mirrors the reference's unconditional post-swap
         // reset so no standing allowance survives. Runs on EVERY path once Leg 1
         // stood: success, a reverted/failed-to-send Permit2→Router approve, or a
         // reverted/failed swap. Best-effort: each helper warns and continues so a
         // failed reset never aborts onboarding or masks the swap's own error. The
-        // captured `swap_result` is then returned unchanged, so a successful swap
-        // yields its tx hash and a failed one propagates its error — after the
-        // resets have already run (see module docs for why the non-atomic,
-        // multi-transaction error path can't mirror the reference's automatic
-        // on-revert rollback).
-        self.reset_permit2_allowance().await;
-        self.reset_usdc_approval().await;
-
-        swap_result
+        // swap's result is returned unchanged, so a successful swap yields its tx
+        // hash and a failed one propagates its error — after the resets have
+        // already run (see module docs for why the non-atomic, multi-transaction
+        // error path can't mirror the reference's automatic on-revert rollback).
+        //
+        // `run_then_cleanup` is what makes "cleanup on every path, result
+        // untouched" a named, tested property; a stray `?` in the block above
+        // would otherwise skip both resets silently.
+        crate::tx::run_then_cleanup(swap, || async {
+            self.reset_permit2_allowance().await;
+            self.reset_usdc_approval().await;
+        })
+        .await
     }
 
     /// Best-effort reset of the Router's Permit2 allowance to zero. Warns and
@@ -454,20 +457,25 @@ mod tests {
         assert!(args.user_data.is_empty());
     }
 
-    // Issue-1 cleanup coverage note (#991): once Leg 1's USDC→Permit2 approval
-    // stands, both legs' resets now run on every subsequent path — success, a
-    // failed Leg-2 Permit2→Router approve (the between-legs path the human
-    // reviewer flagged), or a reverted/failed swap. The load-bearing property is
-    // that they are *best-effort* — a failed reset must never panic, abort
-    // onboarding, or mask the swap error. That is unit-tested below against an
-    // unconnected provider. A true end-to-end test — Leg 1 succeeds, Leg 2 or the
-    // swap *reverts on-chain*, and the two follow-up resets are then observed —
-    // needs a harness this crate does not yet have (no anvil dev-dep). Note that
-    // mock transport IS available: `alloy::providers::mock::Asserter` +
-    // `connect_mocked_client` ships in the pinned alloy and is used elsewhere in
-    // the workspace — see `cli/src/commands/unbond.rs` `mod plan_computation`
-    // for the ordered response-queue idiom. An earlier version of this comment
-    // claimed otherwise and so deferred the test on a false premise (#1347).
+    // Issue-1 cleanup coverage note (#991, reassessed under #1347). Once Leg 1's
+    // USDC→Permit2 approval stands, both legs' resets run on every subsequent
+    // path — success, a failed Leg-2 Permit2→Router approve (the between-legs
+    // path the human reviewer flagged), or a reverted/failed swap. Two
+    // properties, covered separately:
+    //
+    // 1. The resets are *best-effort* — a failure must never panic, abort
+    //    onboarding, or mask the swap error. Unit-tested below against an
+    //    unconnected provider.
+    // 2. They run on every path, after the swap, without replacing its result.
+    //    That is control flow, so `tx::run_then_cleanup` (which `swap_exact_out`
+    //    routes through) carries the test, with plain closures and no RPC.
+    //
+    // The on-chain version — Leg 1 succeeds, Leg 2 or the swap *reverts
+    // on-chain*, and the two follow-up resets are observed against real
+    // allowance state — stays deferred on an anvil dev-dep. See the equivalent
+    // note in `swap_uniswap` for why `alloy::providers::mock::Asserter` does not
+    // substitute: it is a FIFO transport mock and a `send()` fans out the filler
+    // stack's requests concurrently, so it cannot observe which calls were made.
 
     #[tokio::test]
     async fn reset_helpers_swallow_send_failure() {
