@@ -586,10 +586,23 @@ contract CapacityBondTest is Test {
         bond.declareMbps(9);
     }
 
-    function test_declareMbps_revertsZero() public {
-        vm.prank(operator);
-        vm.expectRevert(abi.encodeWithSelector(CapacityBond.DeclaredCapacityOutOfBand.selector, 0, 10, 200_000));
+    /// @notice Zero is the one sub-floor value an INACTIVE operator may
+    ///         declare — the #1361 tier-release path — so it is not a band
+    ///         violation the way `9` above is. The active-operator case still
+    ///         reverts: `test_activeOperator_cannotDeclareZero`.
+    /// @dev    `operator` is bonded but never registered, which is exactly the
+    ///         state the release exists for. The curve gate is skipped too, so
+    ///         this passes whatever the operator's bond is.
+    function test_declareMbps_zeroReleasesTierWhenInactive() public {
+        _bondForMbps(10);
+        vm.startPrank(operator);
+        bond.declareMbps(10);
+        assertEq(bond.declaredMbps(operator), 10);
         bond.declareMbps(0);
+        vm.stopPrank();
+
+        assertFalse(bond.isActive(operator), "the release path is gated on being inactive");
+        assertEq(bond.declaredMbps(operator), 0, "and it clears the tier rather than reverting");
     }
 
     function test_declareMbps_revertsAboveCeiling() public {
@@ -825,13 +838,17 @@ contract CapacityBondTest is Test {
 
     // ADR 003 § Node Registry describes a full exit as deregistration followed
     // by unbonding. That only holds because deregistration also clears the
-    // declared tier: `requestUnbond`'s floor is `bondRequired(declaredMbps)`
-    // and `declareMbps` cannot return the tier to 0, so an operator that had
-    // ever declared could otherwise never withdraw their last TOKEN (#1351).
+    // declared tier: `requestUnbond`'s floor is `bondRequired(declaredMbps)`,
+    // so an operator that had ever declared would otherwise retain that much
+    // bond forever (#1351).
     //
     // `deregisterNode` requires an active node, so the paths that deactivate
-    // without it leave the tier standing. `test_ejectedOperator_keepsTheTier`
-    // pins that, since it is the boundary of what this fix covers.
+    // without it leave the tier standing; those operators exit via
+    // `declareMbps(0)` instead (#1361). The four tests below —
+    // `test_ejectedOperator_canReleaseTheTierAndExit`,
+    // `test_neverRegistered_canReleaseTheTierAndExit`,
+    // `test_blacklistEjectedOperator_canReleaseTheTierAndExit`, and the negative
+    // `test_activeOperator_cannotDeclareZero` — pin that split.
 
     /// @dev Bond up to the tier requirement, declare it, and register a node
     ///      for a fresh operator derived from `opPk`. The deregistration tests
@@ -956,17 +973,23 @@ contract CapacityBondTest is Test {
         assertEq(bond.declaredMbps(opAddr), 1000, "re-declaring needs no further bond");
     }
 
-    /// @notice Pins the boundary of the #1351 fix: `deregisterNode` requires an
-    ///         active node, so the involuntary deactivation paths leave the
-    ///         tier — and therefore the curve floor on the bond — standing.
-    /// @dev    Documented in ADR 026 § Capacity-bond curve as a known gap
-    ///         (issue #1361).
-    ///         This test exists so that closing it is a deliberate, visible
-    ///         change rather than an accident, and so the gap cannot widen
-    ///         unnoticed. Slashing an operator far enough to auto-eject leaves
-    ///         their active bond below `bondRequired(tier)`, at which point
-    ///         `requestUnbond` rejects EVERY non-zero amount.
-    function test_ejectedOperator_keepsTheTierAndCannotUnbond() public {
+    /// @notice The #1361 tier-release path, on the state that motivated it: an
+    ///         auto-ejected operator whose slash already took their bond below
+    ///         `bondRequired(tier)`, so `requestUnbond` rejects EVERY non-zero
+    ///         amount while the tier stands.
+    /// @dev    Ejection deliberately does NOT clear the tier — `_ejectNodeEffects`
+    ///         only flips `active` — and `deregisterNode` is unreachable from
+    ///         here.
+    ///
+    ///         Read the "trapped" framing precisely. `declareMbps` enforces no
+    ///         monotonicity, so this operator could always declare DOWN to
+    ///         `minCapacityMbps` and unbond above `bondRequired(10)`; the
+    ///         genuinely stuck residual was that floor-tier cost (199.7 of
+    ///         20,252.7 TOKEN here), not the whole bond. What `declareMbps(0)`
+    ///         adds is a one-step release that strands nothing. The assertion
+    ///         below is `activeBond == 0`, which the tier-down route cannot
+    ///         reach — that is the difference this test exists to pin.
+    function test_ejectedOperator_canReleaseTheTierAndExit() public {
         address opAddr = _onboardAtTier(0xE7EC7, 1000, bytes32(uint256(0xE7EC7)));
 
         // Repeated offenses until auto-ejection trips (below `minBond / 2`).
@@ -978,22 +1001,124 @@ contract CapacityBondTest is Test {
             bond.slash(opAddr, challenger, 1);
         }
         assertTrue(bond.ejected(opAddr), "the fixture must actually reach auto-ejection");
-        assertEq(bond.declaredMbps(opAddr), 1000, "ejection does not clear the tier");
+        assertEq(bond.declaredMbps(opAddr), 1000, "ejection still does not clear the tier");
 
         uint256 remaining = bond.activeBond(opAddr);
-        assertGt(remaining, 0, "there is bond left to be stuck");
+        assertGt(remaining, 0, "there is bond left to release");
         assertLt(remaining, bond.bondRequired(1000), "and it sits below the standing curve floor");
 
-        // The route to clearing the tier is closed: already inactive.
+        // `deregisterNode` remains unreachable — the release does not restore
+        // it, it routes around it.
         vm.prank(opAddr);
         vm.expectRevert(CapacityBond.NodeNotActive.selector);
         bond.deregisterNode();
 
-        // So not one wei is withdrawable.
+        // The "before" half of the proof, restored from the test this replaced:
+        // with the bond already BELOW the floor, every non-zero amount reverts,
+        // not merely amounts that would cross it.
         uint256 floor = bond.bondRequired(1000);
         vm.prank(opAddr);
         vm.expectRevert(abi.encodeWithSelector(CapacityBond.BondBelowCurve.selector, remaining - 1, floor));
         bond.requestUnbond(1);
+
+        vm.expectEmit(true, false, false, true, address(bond));
+        emit CapacityBond.MbpsDeclared(opAddr, 1000, 0);
+        vm.prank(opAddr);
+        bond.declareMbps(0);
+        assertEq(bond.declaredMbps(opAddr), 0, "the tier is released");
+
+        // With the floor gone the whole remainder is withdrawable — before
+        // #1361 not one wei was.
+        uint256 balanceBefore = token.balanceOf(opAddr);
+        vm.startPrank(opAddr);
+        bond.requestUnbond(remaining);
+        vm.warp(block.timestamp + UNBONDING);
+        bond.unbond();
+        vm.stopPrank();
+
+        assertEq(bond.activeBond(opAddr), 0, "the slashed remainder is no longer trapped");
+        assertEq(token.balanceOf(opAddr), balanceBefore + remaining, "and it lands back with the operator");
+    }
+
+    /// @notice The second stuck state #1361 closes, and the one directly
+    ///         reachable from the shipped CLI: `decdn node bond --mbps N` runs
+    ///         approve -> `bond` -> `declareMbps` and never registers, so an
+    ///         operator who stops there holds a standing tier with no
+    ///         `deregisterNode` available.
+    /// @dev    Distinct from the ejected case: here the bond still clears the
+    ///         curve, so the operator is pinned at `bondRequired(tier)` rather
+    ///         than at everything. `requestUnbond(bonded)` is the assertion —
+    ///         the surplus was always releasable, the floor never was.
+    function test_neverRegistered_canReleaseTheTierAndExit() public {
+        address opAddr = vm.addr(0x4E4E4);
+        uint256 bonded = bond.bondRequired(1000);
+
+        vm.prank(admin);
+        token.transfer(opAddr, bonded);
+        vm.startPrank(opAddr);
+        token.approve(address(bond), type(uint256).max);
+        bond.bond(bonded);
+        bond.declareMbps(1000);
+
+        // Pinned at the curve floor, with no registration to deregister.
+        vm.expectRevert(abi.encodeWithSelector(CapacityBond.BondBelowCurve.selector, 0, bonded));
+        bond.requestUnbond(bonded);
+        vm.stopPrank();
+
+        vm.prank(opAddr);
+        vm.expectRevert(CapacityBond.NodeNotActive.selector);
+        bond.deregisterNode();
+
+        vm.startPrank(opAddr);
+        bond.declareMbps(0);
+        bond.requestUnbond(bonded);
+        vm.warp(block.timestamp + UNBONDING);
+        bond.unbond();
+        vm.stopPrank();
+
+        assertEq(bond.activeBond(opAddr), 0, "a never-registered operator can get their bond back");
+    }
+
+    /// @notice A blacklist-ejected operator can release and exit without
+    ///         governance intervention.
+    /// @dev    This is the state with no other escape at all: `registerNode`
+    ///         reverts `OperatorEjected` until governance calls `unEjectNode`,
+    ///         so the "re-bond, re-register, deregister" workaround available
+    ///         to a slash-ejected operator does not exist here.
+    function test_blacklistEjectedOperator_canReleaseTheTierAndExit() public {
+        address opAddr = _onboardAtTier(0xB1AC4, 1000, bytes32(uint256(0xB1AC4)));
+        uint256 bonded = bond.activeBond(opAddr);
+
+        vm.prank(admin);
+        bond.ejectNode(opAddr);
+        assertTrue(bond.blacklistEjected(opAddr), "the fixture must actually blacklist-eject");
+
+        vm.startPrank(opAddr);
+        bond.declareMbps(0);
+        bond.requestUnbond(bonded);
+        vm.warp(block.timestamp + UNBONDING);
+        bond.unbond();
+        vm.stopPrank();
+
+        assertEq(bond.activeBond(opAddr), 0, "no unEjectNode needed to recover the bond");
+    }
+
+    /// @notice The release is not a back door around the capacity band: an
+    ///         ACTIVE operator's `declareMbps(0)` still reverts.
+    /// @dev    Without this, `declareMbps(0)` would be a second, unlogged way
+    ///         to leave the active set at tier 0 — bypassing `deregisterNode`'s
+    ///         registered-set removal and `registrationNonce` bump.
+    function test_activeOperator_cannotDeclareZero() public {
+        address opAddr = _onboardAtTier(0xAC71E, 1000, bytes32(uint256(0xAC71E)));
+
+        uint256 floor = bond.minCapacityMbps();
+        uint256 ceiling = bond.maxCapacityMbps();
+        vm.prank(opAddr);
+        vm.expectRevert(abi.encodeWithSelector(CapacityBond.DeclaredCapacityOutOfBand.selector, 0, floor, ceiling));
+        bond.declareMbps(0);
+
+        assertEq(bond.declaredMbps(opAddr), 1000, "the tier survives the rejected release");
+        assertTrue(bond.isActive(opAddr), "and the node stays active");
     }
 
     /// @notice `deregisterNode` clears the declared tier and NOTHING else.

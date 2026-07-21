@@ -420,6 +420,185 @@ async fn run() -> anyhow::Result<()> {
          the consequence the command's below-minBond warning discloses"
     );
 
+    // ---- 10. The full exit (#1359, #1361). Legs 1–9 all end with the tier
+    // still standing, which is exactly what `bondRequired(declaredMbps)` pins
+    // in place — so no leg above has ever taken the operator's LAST TOKEN out.
+    // `decdn node deregister` clears the tier; `--all` then releases everything.
+    //
+    // The operator is still REGISTERED here even though `isActive` is false:
+    // leg 9 took the bond below `minBond`, which is a conjunct of `isActive`
+    // but not the flag `deregisterNode` gates on. That divergence is the reason
+    // the command reads `getNodeByAddress().active` rather than `isActive`.
+    assert!(
+        chain.is_registered(operator).await?,
+        "the exit leg's premise: registered, yet isActive == false"
+    );
+    assert_eq!(chain.declared_mbps(operator).await?, FLOOR_MBPS);
+
+    // 10a. `--dry-run` previews without leaving the active set.
+    let preview = run_node_cli(&node, &["deregister", "--dry-run", "--json"]).await?;
+    let receipt = last_json_line(&preview)?;
+    assert_eq!(json_bool(&receipt, "dry_run"), Some(true));
+    assert_eq!(json_bool(&receipt, "submitted"), Some(false));
+    assert_eq!(json_bool(&receipt, "active"), Some(true));
+    assert!(
+        chain.is_registered(operator).await?,
+        "a preview must not deregister"
+    );
+
+    // 10b. Headless without `--yes` refuses, and still discloses the thing an
+    // operator is most likely to get wrong: the bond does not come back here.
+    let unconfirmed = run_node_cli_raw(&node, &["deregister"]).await?;
+    assert!(
+        !unconfirmed.status.success(),
+        "an unconfirmed deregistration must exit non-zero"
+    );
+    let stderr = String::from_utf8_lossy(&unconfirmed.stderr);
+    assert!(
+        stderr.contains("NOT returned") && stderr.contains("slashable"),
+        "stderr must disclose that the bond stays put: {stderr}"
+    );
+    assert!(
+        stderr.contains("--yes"),
+        "stderr must carry the remedy: {stderr}"
+    );
+    assert!(
+        chain.is_registered(operator).await?,
+        "a refused deregistration must submit nothing"
+    );
+
+    // 10c. The real deregistration: leaves the set AND clears the tier, which
+    // is the whole reason it is the first leg of an exit rather than a bare
+    // "stop serving".
+    let retained_before = chain.active_bond(operator).await?;
+    let out = run_node_cli(&node, &["deregister", "--yes", "--json"]).await?;
+    let receipt = last_json_line(&out)?;
+    assert_eq!(json_bool(&receipt, "submitted"), Some(true));
+    assert_eq!(
+        json_str(&receipt, "retained_bond_base"),
+        Some(retained_before.to_string().as_str()),
+        "the receipt reports the bond it is NOT returning"
+    );
+    assert!(
+        !chain.is_registered(operator).await?,
+        "deregisterNode must drop the node from the registered set"
+    );
+    assert_eq!(
+        chain.declared_mbps(operator).await?,
+        0,
+        "and clear the declared tier — the release the exit depends on"
+    );
+    assert_eq!(
+        chain.active_bond(operator).await?,
+        retained_before,
+        "while the bond itself does not move"
+    );
+
+    // 10d. A second run is refused with the two routes named, rather than
+    // surfacing a bare NodeNotActive revert.
+    let again = run_node_cli_raw(&node, &["deregister", "--yes"]).await?;
+    assert!(!again.status.success());
+    let stderr = String::from_utf8_lossy(&again.stderr);
+    assert!(
+        stderr.contains("node register") && stderr.contains("unbond --all"),
+        "stderr must name re-entry and exit: {stderr}"
+    );
+
+    // 10e. `--all` now releases EVERYTHING: with the tier cleared,
+    // `bondRequired(0) == 0`, so the curve floor is gone.
+    let before = chain.token_balance(operator).await?;
+    let out = run_node_cli(&node, &["unbond", "--all", "--yes", "--json"]).await?;
+    let receipt = last_json_line(&out)?;
+    assert_eq!(json_str(&receipt, "phase"), Some("request"));
+    assert_eq!(
+        json_str(&receipt, "retained_bond_base"),
+        Some("0"),
+        "nothing is retained once the tier is cleared: {receipt}"
+    );
+    assert_eq!(
+        json_str(&receipt, "release_base"),
+        Some(retained_before.to_string().as_str())
+    );
+
+    let (pending, unlock_at) = chain.unbonding_of(operator).await?;
+    assert_eq!(pending, retained_before);
+    decdn_e2e::time::advance_to(chain.admin(), unlock_at).await?;
+    let out = run_node_cli(&node, &["unbond", "--yes", "--json"]).await?;
+    assert_eq!(json_str(&last_json_line(&out)?, "phase"), Some("withdraw"));
+
+    assert_eq!(
+        chain.active_bond(operator).await?,
+        U256::ZERO,
+        "the full exit: not one base unit of bond is left behind"
+    );
+    assert_eq!(
+        chain.token_balance(operator).await? - before,
+        retained_before,
+        "and all of it came back to the operator"
+    );
+
+    // ---- 11. `--all` releasing a tier for an INACTIVE operator on-chain
+    // (#1361). Leg 10 cleared the tier with `deregister` *before* `--all` ran,
+    // so `--all`'s own `declareMbps(0)` leg — the whole of #1361's CLI surface —
+    // has still never touched a real chain here; the mocked unit tests are its
+    // only coverage. This reaches the exact stuck state through shipped commands:
+    // `decdn node bond` bonds + declares but never registers (leg 0 relied on
+    // that too), so the operator ends up bonded-and-declared yet OUT of the
+    // registered set — `deregisterNode` reverts for them, and the tier would pin
+    // their bond with no exit but for `declareMbps(0)`.
+    let retier_target = chain
+        .min_bond()
+        .await?
+        .max(chain.bond_required(REDUCED_MBPS).await?);
+    chain.transfer_token(operator, retier_target).await?;
+    run_node_cli(&node, &["bond", "--mbps", &REDUCED_MBPS.to_string()]).await?;
+    assert_eq!(chain.declared_mbps(operator).await?, REDUCED_MBPS);
+    assert!(
+        !chain.is_registered(operator).await?,
+        "`bond` declares a tier without registering — the never-registered stuck state"
+    );
+
+    // `deregister` is unreachable from here, and its error names `--all` as the
+    // exit — the advice this leg proves is real.
+    let cannot_deregister = run_node_cli_raw(&node, &["deregister", "--yes"]).await?;
+    assert!(!cannot_deregister.status.success());
+    assert!(
+        String::from_utf8_lossy(&cannot_deregister.stderr).contains("unbond --all"),
+        "deregister must point an inactive operator at the exit that works"
+    );
+
+    let before = chain.token_balance(operator).await?;
+    let out = run_node_cli(&node, &["unbond", "--all", "--yes", "--json"]).await?;
+    let receipt = last_json_line(&out)?;
+    assert_eq!(json_str(&receipt, "phase"), Some("request"));
+    assert_eq!(
+        json_str(&receipt, "retained_bond_base"),
+        Some("0"),
+        "clearing the tier makes bondRequired(0) == 0, so nothing is retained: {receipt}"
+    );
+    // This is the assertion the mocked tests structurally cannot make: the
+    // `declareMbps(0)` actually landed on-chain and cleared the tier.
+    assert_eq!(
+        chain.declared_mbps(operator).await?,
+        0,
+        "`--all` issued declareMbps(0) for the inactive operator"
+    );
+
+    let (_, unlock_at) = chain.unbonding_of(operator).await?;
+    decdn_e2e::time::advance_to(chain.admin(), unlock_at).await?;
+    let out = run_node_cli(&node, &["unbond", "--yes", "--json"]).await?;
+    assert_eq!(json_str(&last_json_line(&out)?, "phase"), Some("withdraw"));
+    assert_eq!(
+        chain.active_bond(operator).await?,
+        U256::ZERO,
+        "a never-registered operator recovered their whole bond with `--all` alone"
+    );
+    assert_eq!(
+        chain.token_balance(operator).await? - before,
+        retier_target,
+        "every base unit came back"
+    );
+
     Ok(())
 }
 

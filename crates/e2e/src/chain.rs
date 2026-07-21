@@ -781,6 +781,20 @@ impl ChainFixture {
             .context("read isActive")
     }
 
+    /// `CapacityBond.getNodeByAddress(operator).active` — raw registered-set
+    /// membership, NOT the composite [`Self::is_active`]. An operator can be
+    /// registered while `isActive` is false (bond under `minBond`, or a request
+    /// in flight), and it is this flag that `deregisterNode` gates on, so a
+    /// deregistration journey has to assert against it (#1359).
+    pub async fn is_registered(&self, operator: Address) -> anyhow::Result<bool> {
+        Ok(CapacityBond::new(self.addrs.capacity_bond, &self.admin)
+            .getNodeByAddress(operator)
+            .call()
+            .await
+            .context("read getNodeByAddress")?
+            .active)
+    }
+
     /// Governable `SlashAppeal.appealBond` (TOKEN base units).
     pub async fn appeal_bond(&self) -> anyhow::Result<U256> {
         SlashAppeal::new(self.addrs.slash_appeal, &self.admin)

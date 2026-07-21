@@ -27,6 +27,7 @@ use alloy::providers::ProviderBuilder;
 use anyhow::Context;
 use decdn_common::redact::{sanitize_err_chain, sanitize_rpc_display};
 use decdn_incentive::capacity_bond::CapacityBond;
+use decdn_protocol::Region;
 use iroh::PublicKey;
 use serde::{Deserialize, Serialize};
 
@@ -40,11 +41,16 @@ const PAGE_SIZE: u64 = 100;
 /// length of the table is the retry count, so a fully-failing page costs
 /// 1 + 5 + 30 = 36 s across four attempts.
 ///
-/// The budget is **per page**: [`paginate_with_retry`] resets it on each page,
-/// so a read that spans N pages can sleep up to 36 s × N. At `PoC` scale
-/// (one page, see [`PAGE_SIZE`]) that is the 36 s. Either way the wait is
-/// silent from the caller's point of view — nothing streams progress out of
-/// this loop — so it is time `decdn fetch` appears to hang.
+/// The budget is **aggregate across the whole read**, not per page:
+/// [`paginate_with_retry`] carries one attempt counter across pagination, so a
+/// multi-page read still costs at most 36 s of sleeping in total rather than
+/// 36 s × N (#1349). The ADR's "retry 3×" is read as a property of the read,
+/// which is the unit the caller waits on — a per-page reset made the worst case
+/// scale with a number the caller cannot see or bound.
+///
+/// The wait is silent from the caller's point of view — nothing streams
+/// progress out of this loop — so it is time `decdn fetch` appears to hang.
+/// `--timeout-ms` bounds it from the outside.
 ///
 /// Deliberately not `decdn_config_types::RetryPolicy`: that is a *doubling*
 /// policy with jitter, scoped to node-side origin fetches — its defaults are
@@ -67,7 +73,11 @@ const PEER_CACHE_FILE: &str = "peers.json";
 /// [`read_peer_cache`] decodes the tag through [`CacheVersion`] *before* the
 /// body — a whole-`PeerCache` decode would fail on the changed `peers` shape
 /// and never reach the check.
-const PEER_CACHE_VERSION: u32 = 1;
+///
+/// `2` since #1348 retyped `region_hint` from `String` to `Option<Region>`: a
+/// v1 file can hold a region string the validating `Region` deserializer now
+/// rejects, which would fail the whole-file decode rather than the one field.
+const PEER_CACHE_VERSION: u32 = 2;
 
 /// The outermost context on a failed bootstrap — the wording pinned by ADR 012
 /// § Bootstrap step 4. `decdn`'s error boundary renders `{err:#}`
@@ -101,10 +111,19 @@ pub struct NodeCandidate {
     /// (the channel is opened/reused against it and the `slash_sig` verified
     /// against it).
     pub eth_address: Address,
-    /// The node's self-attested region (ISO 3166-1 alpha-2, ADR 030), used for
-    /// locality-aware selection. Always a string from the registry — empty when
-    /// the node registered without one.
-    pub region_hint: String,
+    /// The node's self-attested region (ADR 030), used for locality-aware
+    /// selection. `None` when the node registered without one, or with a code
+    /// outside [`Region`]'s accepted set.
+    ///
+    /// An unrecognized code parses to `None` and sorts into the "rest" bucket
+    /// rather than dropping the candidate: `CapacityBond` permits any string up
+    /// to 16 bytes and ADR 030 § Cross-ADR Impact explicitly declines to
+    /// tighten it, so rejecting a node over a purely advisory field would be
+    /// stricter than the source of truth and would silently shrink the
+    /// fetchable set. Parsing at this boundary is what makes the derived `Eq`
+    /// above correct and keeps an unbounded operator-submitted string off the
+    /// peer-cache read path (#1348).
+    pub region_hint: Option<Region>,
 }
 
 /// Distill a registry `NodeInfo` into a [`NodeCandidate`], or `None` if it is
@@ -122,7 +141,10 @@ fn candidate_from(info: &CapacityBond::NodeInfo) -> Option<NodeCandidate> {
     Some(NodeCandidate {
         node_id,
         eth_address: info.ethAddress,
-        region_hint: info.regionHint.clone(),
+        // Normalize once, here — see `NodeCandidate::region_hint`. An
+        // unparseable hint costs the node its locality bonus, not its place in
+        // the candidate set.
+        region_hint: Region::parse(&info.regionHint),
     })
 }
 
@@ -178,10 +200,20 @@ fn is_permanent(err: &alloy::contract::Error) -> bool {
     }
 }
 
-/// Drive `fetch_page` across the paginated `getActiveNodes` read, retrying each
-/// page on the ADR 012 § Bootstrap step 3 schedule
-/// ([`REGISTRY_RETRY_BACKOFF`]) and distilling every entry through
-/// [`candidate_from`].
+/// Drive `fetch_page` across the paginated `getActiveNodes` read, retrying on
+/// the ADR 012 § Bootstrap step 3 schedule ([`REGISTRY_RETRY_BACKOFF`]) and
+/// distilling every entry through [`candidate_from`].
+///
+/// The retry budget is **aggregate**, spent across the whole read rather than
+/// reset per page (#1349): `attempt` is declared outside the pagination loop, so
+/// a page that succeeds after two retries leaves one for everything after it.
+/// That is what bounds the worst case at the schedule's own 36 s instead of
+/// 36 s × page-count — a figure the caller cannot see, since the page count
+/// depends on how many nodes are registered.
+///
+/// A successful page deliberately does NOT refund the budget. Refunding would
+/// restore the unbounded case exactly: a registry that fails every *other* call
+/// would alternate success and retry forever.
 ///
 /// Split out from [`active_nodes`] so the retry and pagination control flow is
 /// drivable from a test without a live RPC — the schedule alone is a `const`
@@ -189,7 +221,7 @@ fn is_permanent(err: &alloy::contract::Error) -> bool {
 ///
 /// # Errors
 ///
-/// Fails when a page's retries are exhausted, or immediately when the failure
+/// Fails when the read's retries are exhausted, or immediately when the failure
 /// is [`is_permanent`].
 async fn paginate_with_retry<F, Fut>(fetch_page: F) -> anyhow::Result<Vec<NodeCandidate>>
 where
@@ -198,9 +230,9 @@ where
 {
     let mut out = Vec::new();
     let mut offset = 0u64;
+    // Outside the pagination loop: one budget for the whole read.
+    let mut attempt = 0usize;
     loop {
-        // The retry budget is per page — see `REGISTRY_RETRY_BACKOFF`.
-        let mut attempt = 0usize;
         let page = loop {
             match fetch_page(offset).await {
                 Ok(page) => break page,
@@ -219,7 +251,7 @@ where
                         return Err(e).with_context(|| {
                             format!(
                                 "CapacityBond.getActiveNodes(offset={offset}) failed after {} \
-                                 retries",
+                                 retries across the whole registry read",
                                 REGISTRY_RETRY_BACKOFF.len()
                             )
                         });
@@ -578,8 +610,27 @@ pub async fn bootstrap_nodes(
     rpc_url: &str,
     capacity_bond_addr: Address,
     data_dir: &Path,
+    registry_cap: Duration,
 ) -> anyhow::Result<Bootstrap> {
-    resolve_bootstrap(active_nodes(rpc_url, capacity_bond_addr).await, data_dir)
+    // The deadline bounds the REGISTRY READ ONLY, not the whole bootstrap
+    // (#1349). Wrapping `bootstrap_nodes` from outside would cancel
+    // `resolve_bootstrap` along with it, and that is where the ADR 012
+    // § Bootstrap step 4 cache fallback lives — so a client with a perfectly
+    // good `peers.json` and a flaky RPC would get a hard failure instead of a
+    // degraded-but-working fetch. Timing out is just another way for the
+    // registry read to fail, so it is fed in as one and the existing
+    // `Bootstrap::Cached` arm handles it, warning and all.
+    let registry =
+        match tokio::time::timeout(registry_cap, active_nodes(rpc_url, capacity_bond_addr)).await {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::anyhow!(
+                "the CapacityBond registry read did not finish within {} ms (--timeout-ms); \
+             the ADR 012 retry schedule alone can take {} s",
+                registry_cap.as_millis(),
+                REGISTRY_RETRY_BACKOFF.iter().sum::<Duration>().as_secs(),
+            )),
+        };
+    resolve_bootstrap(registry, data_dir)
 }
 
 /// Candidates probed before ranking (decision 3): take the top-K by region,
@@ -593,21 +644,31 @@ pub const SELECT_K: usize = 5;
 pub const RTT_REUSE_TOLERANCE: f64 = 1.5;
 
 /// Order `candidates` for probing (decision 3): same-region candidates first
-/// (case-insensitive equality on `region_hint` — locality, not geo distance),
-/// then the rest, capped at `k`. When `client_region` is `None` the region-first
-/// ordering is skipped and the first `k` candidates are returned unreordered.
+/// (equality on `region_hint` — locality, not geo distance), then the rest,
+/// capped at `k`. When `client_region` is `None`, empty, or not an accepted
+/// region code the region-first ordering is skipped and the first `k`
+/// candidates are returned unreordered.
+///
+/// Both sides are [`Region`]s, so this is a plain equality: the trim +
+/// case-fold that used to run on every comparison moved into the parse
+/// boundary (#1348).
 #[must_use]
 pub fn select_candidates(
     mut candidates: Vec<NodeCandidate>,
     client_region: Option<&str>,
     k: usize,
 ) -> Vec<NodeCandidate> {
-    if let Some(region) = client_region.map(str::trim).filter(|r| !r.is_empty()) {
+    // `client_region` stays a `&str` and is parsed HERE, not assumed valid.
+    // `decdn-common`'s `normalize_region` validates the node daemon's config
+    // region, but the client path does not go through it: `decdn fetch`'s
+    // `--region` / `[identity] region` reach `ResolvedChain::region` as a raw
+    // `String`. So this is the validating boundary for the client, and an
+    // unrecognized value means "no locality information" — the ordering is
+    // skipped rather than applied against a value that means nothing.
+    if let Some(region) = client_region.and_then(Region::parse) {
         // Stable sort by a bool key: same-region (`false`) sorts before the rest
         // (`true`), and within each group the on-chain order is preserved.
-        // `region_hint` is trimmed too — on-chain data is operator-submitted and
-        // may carry stray whitespace.
-        candidates.sort_by_key(|c| !c.region_hint.trim().eq_ignore_ascii_case(region));
+        candidates.sort_by_key(|c| c.region_hint != Some(region));
     }
     candidates.truncate(k);
     candidates
@@ -756,14 +817,30 @@ mod tests {
         let key = iroh::SecretKey::from_bytes(&[9u8; 32]).public();
         let c = candidate_from(&node_info(*key.as_bytes(), true)).unwrap();
         assert_eq!(c.eth_address, Address::repeat_byte(0xab));
-        assert_eq!(c.region_hint, "US");
+        assert_eq!(c.region_hint, Region::parse("US"));
     }
 
+    /// An unrecognized on-chain hint must cost the node its locality bonus, not
+    /// its place in the candidate set — `CapacityBond` accepts any string up to
+    /// 16 bytes and ADR 030 declines to tighten it (#1348).
+    #[test]
+    fn an_unparseable_region_keeps_the_candidate_with_no_region() {
+        let key = iroh::SecretKey::from_bytes(&[9u8; 32]).public();
+        let mut info = node_info(*key.as_bytes(), true);
+        info.regionHint = "not-a-region".to_string();
+        let c = candidate_from(&info).unwrap();
+        assert_eq!(c.region_hint, None, "unparseable, not rejected");
+        assert_eq!(c.eth_address, Address::repeat_byte(0xab));
+    }
+
+    /// `region` is parsed, not stored raw, so a fixture written with stray case
+    /// or whitespace produces the SAME candidate as its canonical spelling.
+    /// That is the property the derived `Eq` depends on.
     fn candidate(seed: u8, region: &str) -> NodeCandidate {
         NodeCandidate {
             node_id: iroh::SecretKey::from_bytes(&[seed; 32]).public(),
             eth_address: Address::repeat_byte(seed),
-            region_hint: region.to_string(),
+            region_hint: Region::parse(region),
         }
     }
 
@@ -778,8 +855,8 @@ mod tests {
     #[test]
     fn select_puts_same_region_first_and_caps_at_k() {
         // Regions are on-chain self-attested ISO 3166-1 alpha-2 codes (ADR 030);
-        // seed 4 carries stray case + whitespace to exercise the trim +
-        // case-insensitive match.
+        // seed 4 carries stray case + whitespace, which `Region::parse`
+        // normalizes at the boundary so the comparison here is plain equality.
         let cands = vec![
             candidate(1, "DE"),
             candidate(2, "US"),
@@ -794,15 +871,43 @@ mod tests {
         assert_eq!(out[2].eth_address, Address::repeat_byte(1));
     }
 
+    /// The normalization now lives in the type, so ` us ` and `US` are the same
+    /// VALUE, not merely two things a comparison happens to fold together. This
+    /// is what makes the derived `Eq` on `NodeCandidate` correct — before
+    /// #1348 the same node under two spellings compared unequal, so any future
+    /// `dedup`/`contains`/`retain` over candidates would silently fail to
+    /// dedupe.
+    #[test]
+    fn candidates_differing_only_in_region_spelling_are_equal() {
+        assert_eq!(candidate(1, " us "), candidate(1, "US"));
+        assert_ne!(candidate(1, "US"), candidate(1, "DE"));
+        assert_ne!(
+            candidate(1, "US"),
+            candidate(1, "nonsense"),
+            "an unparseable hint is None, which is not the same as any region"
+        );
+    }
+
     #[test]
     fn select_without_region_preserves_order_and_caps() {
         let cands = vec![candidate(1, "DE"), candidate(2, "US")];
-        // Unknown region (None) and blank region both skip reordering.
-        for region in [None, Some("  ")] {
+        // No region, a blank one, and an unrecognized code all skip reordering
+        // rather than reordering against a value that means nothing.
+        for region in [None, Some("  "), Some("not-a-region")] {
             let out = select_candidates(cands.clone(), region, 5);
             assert_eq!(out[0].eth_address, Address::repeat_byte(1));
             assert_eq!(out[1].eth_address, Address::repeat_byte(2));
         }
+    }
+
+    /// A candidate whose hint did not parse sorts into the "rest" bucket — it
+    /// must never be treated as matching the client's region.
+    #[test]
+    fn select_never_promotes_an_unparseable_region() {
+        let cands = vec![candidate(1, "nonsense"), candidate(2, "US")];
+        let out = select_candidates(cands, Some("US"), 5);
+        assert_eq!(out[0].eth_address, Address::repeat_byte(2));
+        assert_eq!(out[1].eth_address, Address::repeat_byte(1));
     }
 
     #[test]
@@ -956,6 +1061,64 @@ mod tests {
         assert!(format!("{err:#}").contains("failed after 3 retries"));
     }
 
+    /// The retry budget is spent across the WHOLE read, not refilled per page
+    /// (#1349). Without this, a fully-failing N-page read cost 36 s × N — a
+    /// figure the caller cannot bound, since the page count follows how many
+    /// nodes are registered.
+    ///
+    /// The fixture puts retries on both sides of a page boundary: page 0 fails
+    /// twice then succeeds with a FULL page (so pagination continues), and
+    /// page 1 fails forever. Only the third backoff step is left for page 1, so
+    /// the read ends after 5 calls having slept the schedule exactly once.
+    /// Under the old per-page reset it would be 7 calls and 42 s.
+    #[tokio::test(start_paused = true)]
+    async fn the_retry_budget_is_spent_across_pages_not_refilled() {
+        let calls = std::cell::Cell::new(0usize);
+        let start = tokio::time::Instant::now();
+
+        let err = paginate_with_retry(|offset| {
+            let n = calls.get();
+            calls.set(n.saturating_add(1));
+            async move {
+                match (offset, n) {
+                    // Page 0: two transient failures burn steps 1 and 2 …
+                    (0, 0 | 1) => Err(transient()),
+                    // … then a full page, which is what makes the loop ask for
+                    // a second page rather than terminating on a short one.
+                    (0, _) => Ok((0..PAGE_SIZE)
+                        .map(|i| {
+                            // `u8` seeds wrap past 255; PAGE_SIZE is 100, so
+                            // every id here is distinct regardless.
+                            node_info(valid_node_id(u8::try_from(i).unwrap_or(0)), true)
+                        })
+                        .collect()),
+                    // Page 1 never succeeds.
+                    _ => Err(transient()),
+                }
+            }
+        })
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            calls.get(),
+            5,
+            "3 calls for page 0 (2 failures + success), then 2 for page 1 \
+             (initial + the single remaining retry) — not 7"
+        );
+        assert_eq!(
+            tokio::time::Instant::now() - start,
+            REGISTRY_RETRY_BACKOFF.iter().sum::<Duration>(),
+            "the schedule is slept once for the whole read, not once per page"
+        );
+        let msg = format!("{err:#}");
+        assert!(msg.contains("across the whole registry read"), "{msg}");
+        assert!(
+            msg.contains(&format!("offset={PAGE_SIZE}")),
+            "the error names the page that ran the budget out: {msg}"
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_permanent_failure_is_not_retried() {
         // A typo'd capacity_bond_address must not cost the user 36 s of silence
@@ -1073,8 +1236,17 @@ mod tests {
         });
         std::fs::write(peer_cache_path(dir.path()), body.to_string()).unwrap();
         let why = cache_rejection(dir.path()).unwrap();
-        assert!(why.contains("is version 2"), "{why}");
-        assert!(why.contains("reads version 1"), "{why}");
+        // Derived from the constant, not hardcoded: the point of the assertion
+        // is that both numbers reach the operator, and a bump must not silently
+        // turn it into a comparison of two stale literals.
+        assert!(
+            why.contains(&format!("is version {}", PEER_CACHE_VERSION + 1)),
+            "{why}"
+        );
+        assert!(
+            why.contains(&format!("reads version {PEER_CACHE_VERSION}")),
+            "{why}"
+        );
     }
 
     #[test]
@@ -1103,7 +1275,7 @@ mod tests {
         assert!(
             cache_rejection(dir.path())
                 .unwrap()
-                .contains("is version 2")
+                .contains(&format!("is version {}", PEER_CACHE_VERSION + 1))
         );
     }
 
@@ -1194,6 +1366,49 @@ mod tests {
         };
         assert!(*age < Duration::from_mins(1), "a just-written cache is new");
         assert_eq!(out.into_peers(), peers);
+    }
+
+    /// The `--timeout-ms` bound must not cost a client its outage protection
+    /// (#1349). Timing out is one more way for the registry read to fail, so it
+    /// has to land on the cache-fallback path like any other failure.
+    ///
+    /// This is the regression a naive fix reintroduces: wrapping
+    /// `bootstrap_nodes` in `tokio::time::timeout` from the CALL SITE cancels
+    /// `resolve_bootstrap` along with the read, so a client holding a perfectly
+    /// good `peers.json` gets a hard error instead of a working fetch. Any
+    /// `--timeout-ms` below the schedule's own 36 s hits this, which is exactly
+    /// the range the flag was widened for.
+    #[tokio::test(start_paused = true)]
+    async fn a_timed_out_registry_read_still_falls_back_to_the_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let peers = vec![candidate(7, "US")];
+        write_peer_cache(dir.path(), &peers).unwrap();
+
+        // An unroutable address, so the read cannot finish inside the budget.
+        // Paused time makes the 5 s deadline instant.
+        let out = bootstrap_nodes(
+            "http://127.0.0.1:1",
+            Address::repeat_byte(0x11),
+            dir.path(),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("a timeout with a usable cache must not fail the fetch");
+
+        let warning = out.warning().unwrap();
+        assert!(
+            warning.contains("did not finish within"),
+            "the warning names the deadline as the cause: {warning}"
+        );
+        assert!(
+            warning.contains("--timeout-ms"),
+            "and names the flag that set it: {warning}"
+        );
+        assert_eq!(
+            out.into_peers(),
+            peers,
+            "the cached peers are what the fetch proceeds with"
+        );
     }
 
     #[test]

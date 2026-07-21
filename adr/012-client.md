@@ -46,9 +46,16 @@ Startup sequence from first launch to ready state:
 3. Query on-chain registry: paginated getActiveNodes(offset, 100) calls,
      starting at offset 0, incrementing until a page returns fewer than 100
      On failure: retry 3× exponential backoff (1 s, 5 s, 30 s)
+     The budget is for the WHOLE read, not per page: a page that retries
+     twice leaves one retry for every page after it. Per-page budgets would
+     make the worst case 36 s × page-count, which scales with the size of
+     the registry — something the caller cannot see or bound.
      Deterministic failures (no contract at the configured address, an ABI
      mismatch, an HTTP 4xx other than 429) are reported at once rather than
      retried — repeating them only spends the schedule.
+     The whole of step 3 is additionally bounded by the client's
+     `--timeout-ms`, so the retry schedule can never be the reason a fetch
+     appears to hang past the deadline the user set.
 4. If the registry read fails (retries exhausted, or a deterministic failure):
      On cached peers present: fall back to the peer cache, and tell the user
        the list is cached and how old it is — those nodes may have been
@@ -168,6 +175,11 @@ rpc_url = "https://<arb-sepolia-rpc-endpoint>"
 region = ""                                  # optional ISO 3166-1 alpha-2
 
 [bootstrap]
+# NOT YET IMPLEMENTED, unlike the removed peer_cache_path: step 8's periodic
+# refresh has no code behind it either, but it is still the intended design —
+# `decdn fetch` is one-shot today and re-reads the registry per invocation. This
+# key stays as the spec for that work rather than describing a knob the code
+# deliberately replaced.
 registry_refresh_secs = 600                  # 10 minutes
 
 [keys]
@@ -176,9 +188,9 @@ iroh_key_path = "~/.decdn/iroh_key"
 eth_keystore_path = "~/.decdn/client/keystore.json"
 
 [cache]
-# NOT YET IMPLEMENTED: the peer cache is always `peers.json` inside the resolved
-# client data dir, so move it with --data-dir rather than this key.
-peer_cache_path = "~/.decdn/client/peers.json"
+# The peer cache has no key of its own: it is always `peers.json` inside the
+# resolved client data dir (see the tree above), so it moves with --data-dir /
+# [identity] data_dir.
 probe_cache_max_entries = 1024               # per ADR 001
 probe_cache_ttl_secs = 15                    # per ADR 001
 

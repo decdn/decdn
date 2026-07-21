@@ -311,6 +311,7 @@ struct PullReport {
 /// entry in the manifest then reuses.
 async fn discover_candidates(
     chain: &fetch::ResolvedChain,
+    registry_cap: std::time::Duration,
 ) -> anyhow::Result<Vec<discovery::NodeCandidate>> {
     let capacity_bond = chain.capacity_bond.ok_or_else(|| {
         anyhow!(
@@ -319,7 +320,8 @@ async fn discover_candidates(
         )
     })?;
     let bootstrap =
-        discovery::bootstrap_nodes(&chain.rpc_url, capacity_bond, &chain.data_dir).await?;
+        discovery::bootstrap_nodes(&chain.rpc_url, capacity_bond, &chain.data_dir, registry_cap)
+            .await?;
     // See `fetch::discover_provider`: the degraded bootstrap paths reach the
     // user through the return value, because the CLI has no log sink.
     if let Some(warning) = bootstrap.warning() {
@@ -371,7 +373,12 @@ pub async fn bundle_pull(args: &BundlePullArgs, config_path: Option<&Path>) -> a
     let explicit = explicit_target(common)?;
     let candidates = match explicit {
         Some(_) => None,
-        None => Some(discover_candidates(&chain).await?),
+        // The registry read is bounded by `--timeout-ms` (#1349), inside
+        // `bootstrap_nodes` so a timeout still falls through to the peer cache.
+        // Unlike `fetch`, no probing happens here — `discover_candidates` is
+        // the registry read plus `select_candidates`; probing is per entry, in
+        // `pick_excluding` below.
+        None => Some(discover_candidates(&chain, common.discovery_cap()).await?),
     };
 
     // Buyer signer (vouchers + any openChannel tx). Prompted only once, after we
@@ -949,6 +956,8 @@ fn report(outcomes: &[EntryOutcome], output: &Path, json: bool) -> anyhow::Resul
     clippy::panic
 )]
 mod tests {
+    use decdn_protocol::Region;
+
     use super::*;
 
     #[tokio::test]
@@ -1088,12 +1097,12 @@ mod tests {
             NodeCandidate {
                 node_id: refusing,
                 eth_address: refusing_provider,
-                region_hint: "TR".to_string(),
+                region_hint: Region::parse("TR"),
             },
             NodeCandidate {
                 node_id: alternative,
                 eth_address: Address::repeat_byte(2),
-                region_hint: "TR".to_string(),
+                region_hint: Region::parse("TR"),
             },
         ];
 
