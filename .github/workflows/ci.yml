@@ -542,11 +542,11 @@ jobs:
     # `OVERALL_TIMEOUT` ceilings, so a genuinely hung test hits its per-test
     # timeout's clear message first rather than this opaque job-level kill (the
     # #785 masking this bound exists to avoid): settlement 13m, then the
-    # cross-layer journeys at --test-threads 2 — 5 tests (smoke 13m + three
-    # G-NODE-04 at 10m + slash_appeal at 20m) whose worst 2-thread schedule is
-    # 43m (one thread draws smoke + all three G-NODE-04 while the other runs
-    # slash_appeal) — plus workspace compiles and the per-fixture in-test forge
-    # deploys.
+    # cross-layer journeys at --test-threads 2 — 6 tests (smoke 13m + three
+    # G-NODE-04 at 10m + slash_appeal at 20m + G-NODE-06 at 13m) whose worst
+    # 2-thread schedule is 56m (one thread draws smoke + all three G-NODE-04 +
+    # G-NODE-06 while the other runs slash_appeal) — plus workspace compiles and
+    # the per-fixture in-test forge deploys.
     timeout-minutes: 75
     needs: changes
     if: >-

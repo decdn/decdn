@@ -141,14 +141,15 @@ mod sol_types {
             /// Operator's in-flight unbonding request as `(amount, unlockAt)`;
             /// `amount == 0` means none. The auto-getter of a
             /// `UnbondingRequest` mapping, so the static struct flattens to
-            /// this tuple — same shape treatment as `nodeIdOf` above. A
+            /// this tuple. (Unlike `nodeIdOf` above, which is a hand-written
+            /// multi-return view rather than a struct getter.) A
             /// non-zero `amount` also makes `isActive` false for the whole
             /// window, which is why `decdn node unbond` warns before starting
             /// one.
             function unbondingOf(address operator) external view returns (uint256 amount, uint256 unlockAt);
 
-            /// Governable unbonding window in seconds (ADR 026 § Unbonding
-            /// window — 14 days by default). Read so the CLI can report the
+            /// Governable unbonding window in seconds (ADR 026 § Capacity-bond
+            /// curve — 14 days by default). Read so the CLI can report the
             /// unlock time it is about to commit the operator to.
             function unbondingPeriod() external view returns (uint256);
 

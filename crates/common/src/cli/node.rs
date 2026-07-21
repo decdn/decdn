@@ -159,9 +159,9 @@ pub enum NodeCommand {
     /// (ADR 026 § Capacity-bond curve) — the reverse of `decdn node bond`.
     /// State-aware: with no request in flight it declares the tier down (if
     /// needed) and starts the unbonding window; while one is maturing it
-    /// reports the unlock time; once matured it withdraws. Note that a
-    /// request in flight makes the node INACTIVE for the whole window. Pass
-    /// `--dry-run` to print the plan without submitting.
+    /// reports the unlock time and exits non-zero; once matured it withdraws.
+    /// Note that a request in flight makes the node INACTIVE for the whole
+    /// window. Pass `--dry-run` to print the plan without submitting.
     Unbond(UnbondArgs),
 }
 
@@ -626,8 +626,10 @@ pub struct BondArgs {
 /// `decdn node unbond` — lower the bond via `CapacityBond.requestUnbond` +
 /// `unbond` (ADR 026 § Capacity-bond curve). One command covers all three
 /// phases of the window; which one runs is read from chain state, not from a
-/// flag, so a re-run after a partial failure converges the same way
-/// [`BondArgs`] does.
+/// flag. A run that lost its `requestUnbond` after `declareMbps` landed resumes
+/// on re-run, the way [`BondArgs`] converges; once `requestUnbond` HAS landed a
+/// re-run with an amount flag is a deliberate error, since the request can no
+/// longer be changed.
 ///
 /// The amount flags apply only when starting a request — passing one while a
 /// request is already in flight is an error rather than a silent no-op. All
@@ -639,16 +641,21 @@ pub struct UnbondArgs {
     /// bond. The released amount is derived from the on-chain
     /// `bondRequired` curve — you do not pass a token amount. The retained
     /// bond is `max(minBond, bondRequired(MBPS))`, so the node stays
-    /// eligible at the new tier. Must be below the current declared tier
-    /// (raise with `decdn node bond --mbps`) and inside the governable
+    /// eligible at the new tier. Must not exceed the current declared tier
+    /// (raise with `decdn node bond --mbps`); passing the tier the node is
+    /// already at is accepted and skips the redundant `declareMbps`, which is
+    /// how a partially-failed run resumes. A tier that will actually be
+    /// declared must be inside the governable
     /// `[minCapacityMbps, maxCapacityMbps]` band.
     #[arg(long = "to-mbps", value_name = "MBPS")]
     pub to_mbps: Option<u64>,
 
     /// Release everything the bond curve permits, retaining only
-    /// `bondRequired(declaredMbps)`. This drops the active bond below
-    /// `minBond`, so the node stays inactive until it re-bonds — the
-    /// command says so before submitting.
+    /// `bondRequired(declaredMbps)`. Unlike `--to-mbps` this ignores the
+    /// `minBond` floor, so at low declared tiers the retained bond can land
+    /// below `minBond` and the node stays inactive until it re-bonds. Whether
+    /// it does is tier-dependent; the command reports `below_min_bond` before
+    /// submitting.
     #[arg(long)]
     pub all: bool,
 
@@ -659,9 +666,10 @@ pub struct UnbondArgs {
     #[arg(long, value_name = "BASE_UNITS")]
     pub amount: Option<u128>,
 
-    /// Skip the interactive confirmation. Required in automation: starting
-    /// an unbonding request deactivates the node for the full window, so a
-    /// terminal run confirms first.
+    /// Skip the interactive confirmation. Required when *starting* a request
+    /// from a non-interactive shell, since that deactivates the node for the
+    /// full window; the withdrawal phase never prompts. The consequences are
+    /// printed either way — this suppresses the prompt, not the warning.
     #[arg(long = "yes", short = 'y')]
     pub yes: bool,
 

@@ -3,8 +3,11 @@
 //! The reverse of `decdn node bond`. Lowering a bond is a two-phase on-chain
 //! operation — `requestUnbond(amount)` starts a `unbondingPeriod` window and
 //! `unbond()` withdraws once it matures — with no atomic refund. Rather than
-//! exposing both calls, this command reads chain state and picks the phase, so
-//! a re-run after a partial failure converges the way `bond`'s top-up does.
+//! exposing both calls, this command reads chain state and picks the phase. A
+//! run that lost its `requestUnbond` after `declareMbps` landed resumes on
+//! re-run, the way `bond`'s top-up converges; once `requestUnbond` HAS landed,
+//! a re-run carrying an amount flag is a deliberate error rather than a resume,
+//! since the pending request can no longer be changed.
 //!
 //! Two contract facts drive the shape of this command, and both are surfaced
 //! to the operator rather than left to a revert:
@@ -45,9 +48,10 @@ pub async fn run(args: &cli::UnbondArgs, global_config: Option<&Path>) -> anyhow
     let request = AmountRequest::from_args(args)?;
     let plan = build_plan(&bond, &provider, operator, cb_addr, request).await?;
 
+    let json = args.chain.common.json;
     if args.chain.common.dry_run {
         let mut out = io::stdout().lock();
-        write_plan(&mut out, &plan, args.chain.common.json, &Outcome::default())
+        write_plan(&mut out, &plan, json, &Outcome::default(), true)
             .context("failed to write dry-run output")?;
         return Ok(());
     }
@@ -56,7 +60,7 @@ pub async fn run(args: &cli::UnbondArgs, global_config: Option<&Path>) -> anyhow
     // loop can tell "not yet" from "withdrawn".
     if let Action::Waiting { unlock_at, .. } = plan.action {
         let mut out = io::stdout().lock();
-        write_plan(&mut out, &plan, args.chain.common.json, &Outcome::default())
+        write_plan(&mut out, &plan, json, &Outcome::default(), false)
             .context("failed to write result")?;
         anyhow::bail!(
             "unbonding request is still maturing: unlocks at {unlock_at} ({}); \
@@ -67,17 +71,34 @@ pub async fn run(args: &cli::UnbondArgs, global_config: Option<&Path>) -> anyhow
 
     confirm_or_bail(&plan, args.yes)?;
 
-    let outcome = execute(&bond, &plan).await?;
+    // The outcome is owned HERE, not inside `execute`, so a partially-applied
+    // sequence survives the error. `execute` sends `declareMbps` then
+    // `requestUnbond`; if the second fails after the first mined, the operator's
+    // declared tier is already lowered and that tx hash is the only record of
+    // it. Returning `Err` with the outcome still inside `execute` would drop it
+    // and print nothing at all — leaving them to conclude "nothing happened"
+    // while their tier is halved.
+    let mut outcome = Outcome::default();
+    let result = execute(&bond, &plan, &mut outcome).await;
 
     let mut out = io::stdout().lock();
-    write_plan(&mut out, &plan, args.chain.common.json, &outcome)
-        .context("failed to write result")?;
-    Ok(())
+    write_plan(&mut out, &plan, json, &outcome, false).context("failed to write result")?;
+    drop(out);
+
+    result.with_context(|| match outcome.declare {
+        Some(tx) => format!(
+            "declareMbps ALREADY LANDED (tx {tx:#x}): the declared tier is now lowered, but \
+             NO unbonding request was started and no TOKEN was released. Re-run the identical \
+             command to resume — it skips the declare and requests the unbond"
+        ),
+        None => "no transaction landed; on-chain state is unchanged".to_string(),
+    })
 }
 
 /// How much the operator asked to release, normalised from the three mutually
-/// exclusive flags. Clap enforces the exclusivity; this enforces that exactly
-/// one is present.
+/// exclusive flags. Clap's `ArgGroup` enforces the exclusivity; this maps the
+/// absent case to `Unspecified`, which is legal only on the withdraw path —
+/// `build_plan` is what enforces that.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AmountRequest {
     /// Reduce the declared tier to this many Mbps and release the surplus.
@@ -165,9 +186,11 @@ pub(crate) struct Outcome {
     pub(crate) withdraw: Option<B256>,
 }
 
-/// Read chain state and decide the action. Every precondition the contract
-/// enforces is checked here first, so an impossible request fails before any
-/// transaction is sent rather than as a raw revert.
+/// Read chain state and decide the action. Every *operator-controllable*
+/// precondition the contract enforces is checked here first, so an impossible
+/// request fails before any transaction is sent rather than as a raw revert.
+/// The exception is `whenNotPaused`, which is not pre-checked — a paused
+/// contract still surfaces as a revert from [`send`].
 pub(crate) async fn build_plan<P: Provider + Clone, Q: Provider>(
     bond: &CapacityBond::CapacityBondInstance<P>,
     provider: &Q,
@@ -181,7 +204,17 @@ pub(crate) async fn build_plan<P: Provider + Clone, Q: Provider>(
     let declared = bond.declaredMbps(operator).call().await.with_context(ctx)?;
     let min_bond = bond.minBond().call().await.with_context(ctx)?;
     let unbonding_period = bond.unbondingPeriod().call().await.with_context(ctx)?;
-    let declared_mbps = u64::try_from(declared).unwrap_or(u64::MAX);
+    // Loud, not saturating: `declared_mbps` gates `tier_step`, so a silent
+    // clamp to `u64::MAX` would make that guard accept ANY `--to-mbps`. The
+    // contract's own `maxCapacityMbps` ceiling (1e6) guarantees this fits, so
+    // failing here means we are not talking to a `CapacityBond` at all.
+    let declared_mbps = u64::try_from(declared).with_context(|| {
+        format!(
+            "CapacityBond at {cb_addr} returned declaredMbps={declared}, far above its own \
+             maxCapacityMbps ceiling — is `capacity_bond_address` pointing at the right contract?"
+        )
+    })?;
+    // Display-only (the unlock-time report), so a clamp here cannot mis-decide.
     let period_secs = u64::try_from(unbonding_period).unwrap_or(u64::MAX);
 
     // A request in flight blocks a new one (`UnbondingInProgress`), so the
@@ -195,8 +228,12 @@ pub(crate) async fn build_plan<P: Provider + Clone, Q: Provider>(
             pending.amount,
         );
         let now = head_timestamp(provider).await?;
+        // Compare in U256 so the maturity decision doesn't depend on the
+        // saturation constant of a narrowing conversion. `unlock_at` is narrowed
+        // only afterwards, for display.
+        let matured = U256::from(now) >= pending.unlockAt;
         let unlock_at = u64::try_from(pending.unlockAt).unwrap_or(u64::MAX);
-        let action = if now >= unlock_at {
+        let action = if matured {
             Action::Withdraw {
                 amount: pending.amount,
             }
@@ -284,17 +321,26 @@ async fn resolve_release<P: Provider + Clone>(
 
     match request {
         AmountRequest::ToMbps(target_mbps) => {
-            let min_cap = bond.minCapacityMbps().call().await.with_context(ctx)?;
-            let max_cap = bond.maxCapacityMbps().call().await.with_context(ctx)?;
             let target = U256::from(target_mbps);
-            anyhow::ensure!(
-                target >= min_cap && target <= max_cap,
-                "declared capacity {target_mbps} Mbps is outside the on-chain band \
-                 [{min_cap}, {max_cap}]; declareMbps would revert",
-            );
             let declare_to = tier_step(target_mbps, declared_mbps)?;
+            // Band-check ONLY when a `declareMbps` will actually be sent. The
+            // band constrains that call and nothing else — `requestUnbond`'s only
+            // floor is the curve — so checking it unconditionally would refuse
+            // something the contract accepts: if governance raises
+            // `minCapacityMbps` above an operator's declared tier, the resume
+            // path (`declare_to == None`) is still perfectly legal.
+            if declare_to.is_some() {
+                let min_cap = bond.minCapacityMbps().call().await.with_context(ctx)?;
+                let max_cap = bond.maxCapacityMbps().call().await.with_context(ctx)?;
+                anyhow::ensure!(
+                    target >= min_cap && target <= max_cap,
+                    "declared capacity {target_mbps} Mbps is outside the on-chain band \
+                     [{min_cap}, {max_cap}]; declareMbps would revert",
+                );
+            }
             // Retain the same `max(minBond, bondRequired)` target `bond` tops up
-            // to, so the operator stays eligible at the reduced tier.
+            // to, so the operator stays eligible at the reduced tier. This is the
+            // ONLY difference from `--all`, which takes the bare curve floor.
             let retained = min_bond.max(curve_floor(target).await?);
             let release = prior.saturating_sub(retained);
             anyhow::ensure!(
@@ -305,7 +351,11 @@ async fn resolve_release<P: Provider + Clone>(
             Ok((release, retained, declare_to))
         }
         AmountRequest::All => {
-            // The contract's own floor — deliberately below `minBond`.
+            // The contract's own floor: the bare curve, with no `min_bond.max()`.
+            // That is independent of `minBond`, not below it — with the deployed
+            // `k`/`α` the curve crosses above `minBond` around 1000 Mbps, so
+            // whether this leaves the operator inactive is tier-dependent and is
+            // what `below_min_bond` reports.
             let retained = curve_floor(declared).await?;
             let release = prior.saturating_sub(retained);
             anyhow::ensure!(
@@ -333,8 +383,10 @@ async fn resolve_release<P: Provider + Clone>(
             Ok((amount, retained, None))
         }
         // `build_plan` rejects `Unspecified` before calling in, so this arm is
-        // unreachable — but return an error rather than panic (the workspace
-        // denies `panic`/`unreachable` in the anti-panic policy).
+        // unreachable. It returns an error rather than `unreachable!` because
+        // the workspace anti-panic policy (`Cargo.toml` `[workspace.lints]`
+        // denies `panic`) treats a broken assumption as something to surface at
+        // the call site, not to abort the process on.
         AmountRequest::Unspecified => {
             anyhow::bail!("internal: no amount requested for a new unbonding request")
         }
@@ -344,11 +396,17 @@ async fn resolve_release<P: Provider + Clone>(
 /// Submit the action's transactions in order. For `Request` the `declareMbps`
 /// must precede `requestUnbond`, which evaluates the curve against whatever
 /// tier is current at call time.
+///
+/// `outcome` is borrowed rather than returned so each hash is recorded in the
+/// CALLER's value as it lands. Returning it would tie the record to the happy
+/// path, and the interesting case here is the unhappy one: a `declareMbps` that
+/// mined before `requestUnbond` failed is a real, resumable state change the
+/// operator has to be told about.
 pub(crate) async fn execute<P: Provider + Clone>(
     bond: &CapacityBond::CapacityBondInstance<P>,
     plan: &Plan,
-) -> anyhow::Result<Outcome> {
-    let mut outcome = Outcome::default();
+    outcome: &mut Outcome,
+) -> anyhow::Result<()> {
     match plan.action {
         Action::Request {
             release,
@@ -356,40 +414,58 @@ pub(crate) async fn execute<P: Provider + Clone>(
             ..
         } => {
             if let Some(mbps) = declare_to {
-                let receipt = send(bond.declareMbps(U256::from(mbps)), "declareMbps").await?;
-                outcome.declare = Some(receipt);
+                let hint = format!("is {mbps} Mbps within the capacity band?");
+                outcome.declare = Some(
+                    send(
+                        bond.declareMbps(U256::from(mbps)),
+                        "declareMbps",
+                        Some(&hint),
+                    )
+                    .await?,
+                );
             }
-            let receipt = send(bond.requestUnbond(release), "requestUnbond").await?;
-            outcome.request = Some(receipt);
+            outcome.request = Some(send(bond.requestUnbond(release), "requestUnbond", None).await?);
         }
         Action::Withdraw { .. } => {
-            let receipt = send(bond.unbond(), "unbond").await?;
-            outcome.withdraw = Some(receipt);
+            outcome.withdraw = Some(send(bond.unbond(), "unbond", None).await?);
         }
-        // Filtered out in `run` before `execute` is reached.
-        Action::Waiting { .. } => {}
+        // `run` bails on `Waiting` before reaching here. Kept loud rather than a
+        // no-op: a silent `Ok` would report `submitted=false` and exit 0, which
+        // a wrapper doing `if decdn node unbond; then mark_withdrawn; fi` would
+        // read as a completed withdrawal. Same treatment as the unreachable
+        // `AmountRequest::Unspecified` arm above.
+        Action::Waiting { .. } => anyhow::bail!(
+            "internal: reached `execute` with a still-maturing request; nothing was submitted"
+        ),
     }
-    Ok(outcome)
+    Ok(())
 }
 
 /// Send one call, await its receipt, and fail on a revert — the same
 /// send/receipt/`ensure!(status)` triple every step of `bond::execute` uses.
+///
+/// `hint` is an optional per-step diagnostic appended to a revert (`bond` has
+/// one on `declareMbps`); the tx hash is captured BEFORE awaiting the receipt so
+/// a fetch timeout still tells the operator what to look up — the transaction is
+/// in flight either way, and a hashless "could not be fetched" is unactionable.
 async fn send<C: alloy::contract::CallDecoder, P: Provider>(
     call: alloy::contract::CallBuilder<P, C>,
     label: &str,
+    hint: Option<&str>,
 ) -> anyhow::Result<B256> {
     let pending = call
         .send()
         .await
         .with_context(|| format!("{label} transaction failed to send"))?;
-    let receipt = pending
-        .get_receipt()
-        .await
-        .with_context(|| format!("{label} sent but the receipt could not be fetched"))?;
+    let hash = *pending.tx_hash();
+    let receipt = pending.get_receipt().await.with_context(|| {
+        format!("{label} sent (tx {hash:#x}) but the receipt could not be fetched")
+    })?;
     anyhow::ensure!(
         receipt.status(),
-        "{label} reverted (tx {})",
-        receipt.transaction_hash
+        "{label} reverted (tx {:#x}){}",
+        receipt.transaction_hash,
+        hint.map_or_else(String::new, |h| format!("; {h}")),
     );
     Ok(receipt.transaction_hash)
 }
@@ -415,7 +491,7 @@ pub(crate) enum Confirmation {
     /// Nothing to confirm — a withdrawal only returns TOKEN, and a maturing
     /// request submits nothing.
     NotNeeded,
-    /// `--yes` supplied, or asserted-away by automation.
+    /// `--yes` supplied: disclose the consequences, but skip the prompt.
     Bypassed,
     /// Ask on the terminal.
     Prompt,
@@ -445,23 +521,31 @@ pub(crate) const fn decide_confirmation(
 
 /// Confirm before the first send on a `Request`. Starting a request costs the
 /// operator active-set membership for the whole window, which is not obvious
-/// from the flags alone — so a terminal run says so and waits for `y`.
-/// `Withdraw` needs no confirmation: it only returns TOKEN.
+/// from the flags alone — so the consequences are always disclosed, and a
+/// terminal run additionally waits for `y`. `Withdraw` needs no confirmation:
+/// it only returns TOKEN.
+///
+/// `--yes` suppresses the *prompt*, never the disclosure. A scripted
+/// `--all --yes` can leave the node permanently inactive; "don't ask" must not
+/// silently become "don't tell", so the warning is written for `Bypassed` too.
+/// Every decision here comes from [`decide_confirmation`] — nothing is
+/// re-derived from `interactive`, so the tested function IS the enforcing one.
 fn confirm_or_bail(plan: &Plan, yes: bool) -> anyhow::Result<()> {
+    // Interactive only when BOTH streams are terminals: the warning goes to
+    // stderr and the answer is read from stdin, so if either is redirected the
+    // operator can't see what they'd be agreeing to (same rule as `terms`).
+    let interactive = io::stdin().is_terminal() && io::stderr().is_terminal();
+    let decision = decide_confirmation(plan.action, yes, interactive);
+    if decision == Confirmation::NotNeeded {
+        return Ok(());
+    }
     let Action::Request {
         release, retained, ..
     } = plan.action
     else {
         return Ok(());
     };
-    // Interactive only when BOTH streams are terminals: the warning goes to
-    // stderr and the answer is read from stdin, so if either is redirected the
-    // operator can't see what they'd be agreeing to (same rule as `terms`).
-    let interactive = io::stdin().is_terminal() && io::stderr().is_terminal();
-    match decide_confirmation(plan.action, yes, interactive) {
-        Confirmation::NotNeeded | Confirmation::Bypassed => return Ok(()),
-        Confirmation::Prompt | Confirmation::NeedFlag => {}
-    }
+
     let mut err = io::stderr().lock();
     writeln!(
         err,
@@ -477,19 +561,26 @@ fn confirm_or_bail(plan: &Plan, yes: bool) -> anyhow::Result<()> {
              withdrawal until it re-bonds."
         )?;
     }
-    if !interactive {
-        anyhow::bail!(
+
+    match decision {
+        // Disclosed above; the operator asked not to be asked.
+        Confirmation::NotNeeded | Confirmation::Bypassed => Ok(()),
+        Confirmation::NeedFlag => anyhow::bail!(
             "unbond not confirmed: no interactive terminal detected — re-run with `--yes` \
              (or `--dry-run` to preview)."
-        );
+        ),
+        Confirmation::Prompt => {
+            write!(err, "Proceed? [y/N] ")?;
+            err.flush()?;
+            let mut line = String::new();
+            io::stdin().read_line(&mut line)?;
+            // Allowlist, not denylist: an empty line (Ctrl-D / EOF) lands on the
+            // deny side rather than being read as assent.
+            let answer = line.trim().to_ascii_lowercase();
+            anyhow::ensure!(answer == "y" || answer == "yes", "unbond cancelled.");
+            Ok(())
+        }
     }
-    write!(err, "Proceed? [y/N] ")?;
-    err.flush()?;
-    let mut line = String::new();
-    io::stdin().read_line(&mut line)?;
-    let answer = line.trim().to_ascii_lowercase();
-    anyhow::ensure!(answer == "y" || answer == "yes", "unbond cancelled.");
-    Ok(())
 }
 
 /// Write the plan + outcome as JSON or grep-friendly `key=value` lines. Pure
@@ -497,11 +588,17 @@ fn confirm_or_bail(plan: &Plan, yes: bool) -> anyhow::Result<()> {
 /// The `phase` key is what distinguishes the three actions for a machine
 /// consumer; the amount keys that don't apply to a phase are omitted rather
 /// than zeroed, so `release_base=0` never has to be read as "n/a".
+///
+/// `dry_run` is carried explicitly rather than inferred from `submitted`, for
+/// the reason `bond::write_plan` carries it: several real runs also submit
+/// nothing (a maturing `Waiting`, or a failed first send), so `submitted=false`
+/// alone cannot mean "preview".
 pub(crate) fn write_plan(
     w: &mut impl io::Write,
     p: &Plan,
     json: bool,
     o: &Outcome,
+    dry_run: bool,
 ) -> io::Result<()> {
     let submitted = o.declare.is_some() || o.request.is_some() || o.withdraw.is_some();
     let tx_hex = |h: Option<&B256>| h.map(|v| format!("{v:#x}"));
@@ -514,6 +611,7 @@ pub(crate) fn write_plan(
         let mut value = serde_json::json!({
             "phase": phase,
             "submitted": submitted,
+            "dry_run": dry_run,
             "capacity_bond": format!("{:#x}", p.capacity_bond),
             "prior_bond_base": p.prior.to_string(),
             "declared_mbps": p.declared_mbps,
@@ -586,7 +684,7 @@ pub(crate) fn write_plan(
     write_tx_line(w, "declare_tx", o.declare.as_ref())?;
     write_tx_line(w, "request_tx", o.request.as_ref())?;
     write_tx_line(w, "withdraw_tx", o.withdraw.as_ref())?;
-    writeln!(w, "submitted={submitted}")
+    writeln!(w, "submitted={submitted} dry_run={dry_run}")
 }
 
 /// One `<key>=<tx|skipped>` line, matching `bond`'s output vocabulary so an
@@ -600,8 +698,9 @@ fn write_tx_line(w: &mut impl io::Write, key: &str, tx: Option<&B256>) -> io::Re
 
 /// Forward-looking duration as a coarse `13d 4h` string. The counterpart to
 /// `node::format_age`, which renders elapsed time; kept local (and dependency
-/// free — the workspace has no `chrono`/`humantime`) because the unbonding
-/// window is the only place the CLI reports a future duration.
+/// free — the CLI's dependency set pulls in no `chrono`/`humantime`) because the
+/// unbonding window is the only place the CLI *formats* a future duration;
+/// `channel` reports its dispute deadline as a raw timestamp.
 pub(crate) fn format_remaining(secs: u64) -> String {
     const MIN: u64 = 60;
     const HOUR: u64 = 60 * MIN;
@@ -638,8 +737,12 @@ mod tests {
     }
 
     fn rendered(p: &Plan, json: bool, o: &Outcome) -> String {
+        render(p, json, o, false)
+    }
+
+    fn render(p: &Plan, json: bool, o: &Outcome, dry_run: bool) -> String {
         let mut buf = Vec::new();
-        write_plan(&mut buf, p, json, o).unwrap();
+        write_plan(&mut buf, p, json, o, dry_run).unwrap();
         String::from_utf8(buf).unwrap()
     }
 
@@ -663,10 +766,12 @@ mod tests {
         assert!(s.contains("submitted=false"), "{s}");
     }
 
+    /// Rendering only — the `--all` floor arithmetic itself lives in
+    /// `plan_computation::all_retains_the_bare_curve_floor_not_min_bond`.
     #[test]
-    fn all_phase_flags_the_inactive_residual() {
-        // `--all` retains only the curve floor, which sits below minBond — the
-        // operator has to know the node won't come back without re-bonding.
+    fn write_plan_reports_a_below_min_bond_residual() {
+        // The operator has to be able to see, in the receipt, that the node
+        // won't come back without re-bonding.
         let p = plan(
             Action::Request {
                 release: U256::from(59_000u64),
@@ -841,5 +946,244 @@ mod tests {
         assert_eq!(format_remaining(3600 + 1800), "1h 30m");
         assert_eq!(format_remaining(14 * 24 * 3600), "14d 0h");
         assert_eq!(format_remaining(36 * 3600), "1d 12h");
+        // Exact unit boundaries, where an off-by-one `<` would silently reclassify.
+        assert_eq!(format_remaining(60), "1m");
+        assert_eq!(format_remaining(3600), "1h 0m");
+        assert_eq!(format_remaining(86_400), "1d 0h");
+    }
+
+    /// Plan-computation coverage against a mocked provider.
+    ///
+    /// `resolve_release` decides how much TOKEN moves, and until this module
+    /// existed nothing exercised it: the `--all` arm was never executed by any
+    /// test (its only e2e use returns from `build_plan`'s pending-request branch
+    /// first), and `--to-mbps`'s `max(minBond, ·)` term was inert at the e2e's
+    /// chosen tiers — deleting it broke nothing.
+    ///
+    /// `Asserter` serves `eth_call` responses FIFO, which works here because the
+    /// call order is static: `--to-mbps` reads the capacity band only when a
+    /// `declareMbps` is actually planned, then `bondRequired`; `--all` and
+    /// `--amount` read `bondRequired` alone. Queueing exactly the expected number
+    /// of responses is therefore itself an assertion about which reads happen —
+    /// a surplus read would fail with an empty-queue error.
+    mod plan_computation {
+        use alloy::primitives::Bytes;
+        use alloy::providers::ProviderBuilder;
+        use alloy::providers::mock::Asserter;
+
+        use super::*;
+
+        /// TOKEN base units, for readable fixtures.
+        fn token(n: u64) -> U256 {
+            U256::from(n) * U256::from(1_000_000_000_000_000_000_u64)
+        }
+
+        /// Queue one ABI-encoded `uint256` return for the next `eth_call`.
+        fn push_u256(asserter: &Asserter, v: U256) {
+            asserter.push_success(&Bytes::from(v.to_be_bytes::<32>().to_vec()));
+        }
+
+        /// Run `resolve_release` against a provider serving `calls` in order.
+        async fn resolve(
+            calls: &[U256],
+            request: AmountRequest,
+            prior: U256,
+            declared: u64,
+            min_bond: U256,
+        ) -> anyhow::Result<(U256, U256, Option<u64>)> {
+            let asserter = Asserter::new();
+            for v in calls {
+                push_u256(&asserter, *v);
+            }
+            let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+            let addr = Address::repeat_byte(0x22);
+            let bond = CapacityBond::new(addr, provider);
+            resolve_release(&bond, addr, request, prior, U256::from(declared), min_bond).await
+        }
+
+        /// `--all` takes the BARE curve floor. If this ever grows a
+        /// `min_bond.max(...)` — the obvious copy-paste from the `--to-mbps` arm
+        /// one match arm up — it would retain more than promised and silently
+        /// release less TOKEN than the operator asked for.
+        #[tokio::test]
+        async fn all_retains_the_bare_curve_floor_not_min_bond() {
+            // Below the curve/minBond crossover: curve floor 100 < minBond 50_000.
+            let (release, retained, declare_to) = resolve(
+                &[token(100)],
+                AmountRequest::All,
+                token(60_000),
+                10,
+                token(50_000),
+            )
+            .await
+            .expect("a surplus above the curve floor is releasable");
+            assert_eq!(retained, token(100), "the bare curve floor, no minBond max");
+            assert_eq!(release, token(59_900));
+            assert_eq!(declare_to, None, "--all never moves the declared tier");
+            assert!(
+                retained < token(50_000),
+                "this is the case where --all leaves the node inactive"
+            );
+        }
+
+        /// A bonded-but-never-declared operator has `bondRequired(0) == 0`, so
+        /// `--all` really does mean all. This is the maximal-consequence path
+        /// through the command and had no coverage at all.
+        #[tokio::test]
+        async fn all_releases_everything_when_no_tier_was_ever_declared() {
+            let (release, retained, _) = resolve(
+                &[U256::ZERO],
+                AmountRequest::All,
+                token(60_000),
+                0,
+                token(50_000),
+            )
+            .await
+            .expect("nothing is retained when no tier is declared");
+            assert_eq!(retained, U256::ZERO);
+            assert_eq!(release, token(60_000), "the entire bond");
+        }
+
+        /// The `max(minBond, ·)` term that distinguishes `--to-mbps` from
+        /// `--all`. Below the crossover `minBond` is the operative floor, so
+        /// deleting the `max` makes this fail — which is the point.
+        #[tokio::test]
+        async fn to_mbps_below_the_crossover_retains_min_bond() {
+            // Band [10, 200_000], then bondRequired(10) = 100 TOKEN << minBond.
+            let (release, retained, declare_to) = resolve(
+                &[U256::from(10), U256::from(200_000), token(100)],
+                AmountRequest::ToMbps(10),
+                token(60_000),
+                5_000,
+                token(50_000),
+            )
+            .await
+            .expect("a surplus above minBond is releasable");
+            assert_eq!(
+                retained,
+                token(50_000),
+                "minBond is the floor here, NOT the 100 TOKEN curve value"
+            );
+            assert_eq!(release, token(10_000));
+            assert_eq!(declare_to, Some(10), "the tier must be declared down first");
+        }
+
+        /// Above the crossover the curve dominates and `minBond` is inert — the
+        /// complement of the case above, so neither term can be dropped.
+        #[tokio::test]
+        async fn to_mbps_above_the_crossover_retains_the_curve() {
+            let (_, retained, _) = resolve(
+                &[U256::from(10), U256::from(200_000), token(115_000)],
+                AmountRequest::ToMbps(2_000),
+                token(346_000),
+                5_000,
+                token(50_000),
+            )
+            .await
+            .expect("a surplus above the curve is releasable");
+            assert_eq!(retained, token(115_000), "the curve dominates minBond here");
+        }
+
+        /// The resume path: tier already at the target, so no `declareMbps` is
+        /// planned — and therefore the capacity band is never read. Queueing only
+        /// the `bondRequired` response proves the band check is gated on the
+        /// declare rather than run unconditionally; an ungated check would try to
+        /// read from an empty queue and fail.
+        #[tokio::test]
+        async fn to_mbps_at_the_current_tier_skips_the_declare_and_the_band_read() {
+            let (release, retained, declare_to) = resolve(
+                &[token(115_000)],
+                AmountRequest::ToMbps(2_000),
+                token(346_000),
+                2_000,
+                token(50_000),
+            )
+            .await
+            .expect("an equal tier is a resumable retry");
+            assert_eq!(declare_to, None, "the declare already landed");
+            assert_eq!(retained, token(115_000));
+            assert_eq!(release, token(231_000), "the surplus is still released");
+        }
+
+        /// `--amount` is bounded by the active bond. The guard is structural, not
+        /// cosmetic: `retained = prior - amount` is a raw `U256` subtraction and
+        /// alloy's `Uint` panics on overflow, in a workspace that denies `panic`.
+        #[tokio::test]
+        async fn amount_above_the_active_bond_is_rejected_before_subtracting() {
+            let err = resolve(
+                &[],
+                AmountRequest::Exact(token(60_001)),
+                token(60_000),
+                2_000,
+                token(50_000),
+            )
+            .await
+            .expect_err("releasing more than is bonded must be refused");
+            let msg = format!("{err:#}");
+            assert!(msg.contains("exceeds the active bond"), "{msg}");
+        }
+
+        /// The happy `--amount` path, and the boundary: releasing down to exactly
+        /// the curve floor is legal.
+        #[tokio::test]
+        async fn amount_down_to_exactly_the_curve_floor_is_allowed() {
+            let (release, retained, declare_to) = resolve(
+                &[token(115_000)],
+                AmountRequest::Exact(token(231_000)),
+                token(346_000),
+                2_000,
+                token(50_000),
+            )
+            .await
+            .expect("landing exactly on the curve floor is legal");
+            assert_eq!(retained, token(115_000));
+            assert_eq!(release, token(231_000));
+            assert_eq!(declare_to, None, "--amount never moves the tier");
+        }
+
+        /// One base unit past the floor must be refused with the remedy, so
+        /// `BondBelowCurve` never surfaces as a raw revert.
+        #[tokio::test]
+        async fn amount_one_unit_below_the_curve_floor_names_the_remedy() {
+            let err = resolve(
+                &[token(115_000)],
+                AmountRequest::Exact(token(231_000) + U256::from(1u64)),
+                token(346_000),
+                2_000,
+                token(50_000),
+            )
+            .await
+            .expect_err("breaching the curve floor must be refused");
+            let msg = format!("{err:#}");
+            assert!(msg.contains("BondBelowCurve"), "{msg}");
+            assert!(msg.contains("--to-mbps"), "{msg}");
+        }
+
+        /// "Nothing to release" rather than a `ZeroAmount` revert, for both
+        /// curve-derived flags.
+        #[tokio::test]
+        async fn nothing_to_release_is_refused_locally() {
+            let err = resolve(
+                &[U256::from(10), U256::from(200_000), token(115_000)],
+                AmountRequest::ToMbps(2_000),
+                token(115_000),
+                5_000,
+                token(50_000),
+            )
+            .await
+            .expect_err("already at the target");
+            assert!(format!("{err:#}").contains("nothing to release"), "{err:#}");
+
+            let err = resolve(
+                &[token(115_000)],
+                AmountRequest::All,
+                token(115_000),
+                2_000,
+                token(50_000),
+            )
+            .await
+            .expect_err("already at the curve floor");
+            assert!(format!("{err:#}").contains("nothing to release"), "{err:#}");
+        }
     }
 }
