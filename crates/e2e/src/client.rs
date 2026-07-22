@@ -225,7 +225,7 @@ impl ClientFixture {
     /// The probe timestamp is requester-generated and echoed back *inside* the
     /// signed body (ADR 005), so it is what anchors the pair on-chain: the
     /// `SlashJudge` 30s window and the evidence-staleness bound are both computed
-    /// from it. The default [`TIMESTAMP_US`] is a fixed sentinel and would read as
+    /// from it. The default `TIMESTAMP_US` is a fixed sentinel and would read as
     /// 1970 to the judge, so any journey feeding a real response to `SlashJudge`
     /// must stamp it near chain time — and any journey testing the *window* stamps
     /// it deliberately far from the stream's (#1042).
