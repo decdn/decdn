@@ -64,7 +64,11 @@ pub struct NodeFixture {
     // TempDirs kept alive for the daemon's lifetime. The data dir is also read
     // back by `data_dir()` as an isolated `HOME` for CLI subprocesses.
     data_dir: tempfile::TempDir,
-    _origin_dir: tempfile::TempDir,
+    // The node's OPAQUE backend (`[cache.origin] kind = "fs"`). Kept alive for
+    // the daemon's lifetime and writable after launch via
+    // [`NodeFixture::seed_origin_blob`], so a journey can model content the
+    // operator holds in its backend but has never cached.
+    origin_dir: tempfile::TempDir,
     operator: PrivateKeySigner,
     operator_addr: Address,
     node_id: iroh::PublicKey,
@@ -164,6 +168,110 @@ impl NodeFixture {
             "empty cache launch returned seeded hashes"
         );
         Ok(node)
+    }
+
+    /// Launch a bonded node that **owns an opaque origin backend** and gates its
+    /// reactive cache-miss fill on the chain-backed authorized-origin directory
+    /// (`cache.pull_through_require_authorized_origin`, #821 / ADR 037).
+    ///
+    /// `cached_blobs` are pre-warmed into the node's local store, so they are
+    /// served from cache regardless of what the chain says. Blobs written *after*
+    /// launch with [`Self::seed_origin_blob`] exist ONLY in the backend, so
+    /// serving them requires the gate to be open — which is the distinction
+    /// G-NODE-08 asserts.
+    ///
+    /// Note what the gate actually checks: `pull_origin_gate_blocks` asks whether
+    /// the hash's **namespace** has any currently-authorized active origin, not
+    /// whether *this* operator is one of them. A namespace ratified to a
+    /// different operator would also open this node's gate. Whether that is the
+    /// intended scope is tracked in #1368; this fixture deliberately does not
+    /// depend on either reading.
+    ///
+    /// No discovery peers, so the node has no upstream and a served backend-only
+    /// blob can only have come from its own `[cache.origin]`. Note this is
+    /// guaranteed by the empty peer set, *not* by node→node pull-through being
+    /// off: `render_config` ties `pull_through_require_authorized_origin` to
+    /// `node_to_node_pull_through_enabled`, so enabling the gate necessarily arms
+    /// node→node pull-through too.
+    pub async fn launch_authorized_origin(
+        chain: &ChainFixture,
+        region: &str,
+        cached_blobs: &[&[u8]],
+    ) -> anyhow::Result<(Self, Vec<Hash>)> {
+        Self::launch_configured(chain, region, cached_blobs, true, &[]).await
+    }
+
+    /// Write `blob` into the node's opaque origin backend **without** touching its
+    /// cache store, and return its BLAKE3 [`struct@Hash`]. The `fs` origin adapter
+    /// reads per request, so a post-launch write is visible to the running daemon.
+    ///
+    /// Models "the operator's backend holds `H`, the operator has never served
+    /// it": the only way this blob reaches a client is the reactive local-origin
+    /// pull-through (`populate_local`), which is what the authorized-origin gate
+    /// stands in front of.
+    pub fn seed_origin_blob(&self, blob: &[u8]) -> anyhow::Result<Hash> {
+        let hash = Hash::new(blob);
+        write_fs_origin_blob(self.origin_dir.path(), &hash, blob)?;
+        Ok(hash)
+    }
+
+    /// Filesystem path of the node's opaque origin backend. Journeys assert this
+    /// string never reaches the wire — origin backends are per-node config and
+    /// MUST stay invisible to clients.
+    ///
+    /// This is the *configured* path. `FilesystemOrigin::new` canonicalizes at
+    /// construction, so the daemon actually holds the resolved form (on macOS,
+    /// `/private/var/…` for a `/var/…` tempdir). A leak would carry the canonical
+    /// bytes, so an opacity scan should search both forms.
+    #[must_use]
+    pub fn origin_root(&self) -> &std::path::Path {
+        self.origin_dir.path()
+    }
+
+    /// Poll `admin_v1_channels` until the daemon's settlement watcher has
+    /// registered `channel_id` (or `timeout` elapses).
+    ///
+    /// The pre-observation window and a genuine refusal are the SAME wire
+    /// `NotFound` (`ServeRejectReason::wire_error` collapses both), so a journey
+    /// that must assert on a single refusal cannot use
+    /// [`crate::client::ClientFixture::fetch`]'s retry loop to ride the window
+    /// out. Waiting on the node's own view of the channel narrows it.
+    ///
+    /// **On its own it does not close that window.** `admin_v1_channels` reads
+    /// the *persisted* channel store, whereas `serve_stream` / `pull_authorized`
+    /// gate on `ClientHandler`'s in-memory map — and `register_open_channel`
+    /// awaits the store fsync *before* inserting into that map. So this can
+    /// return while the serve path still answers `UnknownChannel`.
+    ///
+    /// Prefer [`crate::client::ClientFixture::open_session`], which pairs this
+    /// with a retried warm-up fetch; a served blob is what actually proves the
+    /// live map is populated. Call this directly only to assert on the node's
+    /// bookkeeping itself.
+    pub async fn wait_for_channel(
+        &self,
+        channel_id: alloy::primitives::B256,
+        timeout: Duration,
+    ) -> anyhow::Result<()> {
+        let admin = self.admin_client()?;
+        let wanted = channel_id.to_string();
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let known = admin
+                .channels()
+                .await
+                .context("admin channels")?
+                .channels
+                .into_iter()
+                .any(|c| c.channel_id.eq_ignore_ascii_case(&wanted));
+            if known {
+                return Ok(());
+            }
+            anyhow::ensure!(
+                tokio::time::Instant::now() < deadline,
+                "node never observed channel {wanted} within {timeout:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
     }
 
     async fn launch_configured(
@@ -279,7 +387,7 @@ impl NodeFixture {
         let fixture = Self {
             child: NodeGuard(std::sync::Mutex::new(child)),
             data_dir,
-            _origin_dir: origin_dir,
+            origin_dir,
             operator,
             operator_addr,
             node_id,
