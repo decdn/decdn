@@ -225,25 +225,31 @@ nodeId-indexed `NodeAutoEjected`. The node's staker-set watcher follows
    DMCA/takedown action — confirm you have the right blob and catch a pinned
    hash or an idempotent re-run.
 
-2. **There is no grace window at PoC — evict the moment you learn of a global
-   entry.** [ADR 011 § Compliance Window](../adr/011-content-takedown.md#compliance-window)
-   specifies a 24-hour (2-hour emergency) buffer after `effectiveAt`, but the
-   deployed contracts implement neither: a `ContentBlacklist` entry carries only
-   `addedAt` (no `effectiveAt`), and `SlashJudge` treats blacklist violations as
-   **global-only** at PoC and slashes any delivery whose signed response
-   timestamp is strictly after the entry's `addedAt` — a delivery timestamped at
-   `addedAt` itself is not slashable — see `_checkBlacklistedBefore` in
-   `contracts/src/SlashJudge.sol`. Practical consequences:
-   - Slash exposure today comes **only from global** (`bytes32("GLOBAL")`)
-     entries. A regional-only entry is a legal/compliance obligation but is not
-     slashable until regional scope is wired (the PoC deferral is noted in
-     `contracts/src/SlashJudge.sol`, citing ADR 014 § Blacklist violation).
-   - Treat any global entry as effective immediately; do not rely on the ADR's
-     24h/2h buffer, which is not enforced.
+2. **You have a grace window, but evict immediately anyway.**
+   [ADR 011 § Compliance Window](../adr/011-content-takedown.md#compliance-window)
+   gives every entry an `effectiveAt = addedAt + window` — 24 hours for a
+   governance or regional add, 2 hours for an emergency multisig add — and
+   `SlashJudge` anchors slash eligibility to `effectiveAt`, not `addedAt` (see
+   `_checkBlacklistedBefore` in `contracts/src/SlashJudge.sol`). A delivery whose
+   signed response timestamp is at or before `effectiveAt` is not slashable.
+   Practical consequences:
+   - The window is a safety margin for poll latency and downtime, not a licence.
+     Evict on discovery; do not schedule against the deadline.
+   - Both windows are governance-tunable within `[1 hour, 7 days]`, so read
+     `complianceWindow()` / `emergencyComplianceWindow()` rather than assuming
+     24h/2h. The value is stamped on the entry at add time, so an entry keeps
+     the window that was in force when it landed — check the entry's own
+     `effectiveAt` via `getHashEntry(region, hash)`.
+   - Slash exposure comes from **global and in-scope regional** entries alike
+     (ADR 030 scope: global ∪ current region ∪ ripening previous region).
+   - An emergency entry (`emergency == true`) auto-expires — 14 days for
+     `GENERAL`, 90 for `CSAM`/`TERRORIST` — unless governance ratifies it with
+     `addHashGlobal`. It stops being slashable at that deadline whether or not
+     anyone has called `expireEmergencyEntry` to materialize the removal.
    - An entry under active appeal (`suspended == true`) is not slashable —
      `isHashBlacklisted` returns `false` and `SlashJudge` rejects the challenge —
-     but `addedAt` is preserved when the suspension clears, so re-evict before
-     serving again.
+     but `addedAt` and `effectiveAt` are both preserved when the suspension
+     clears, so the grace does **not** restart: re-evict before serving again.
 
 3. **If you believe the entry is wrong, appeal it — don't just keep serving.**
    `openBlacklistAppeal(hash, region, evidenceBundleHash, standingPath, namespaceId)`

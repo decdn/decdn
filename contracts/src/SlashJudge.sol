@@ -80,6 +80,15 @@ contract SlashJudge is ISlashJudge, AccessControl, ReentrancyGuard, SunsettingPa
     ///      § Region-stability window) — see `_checkBlacklistedBefore`.
     bytes32 internal constant GLOBAL_REGION = bytes32("GLOBAL");
 
+    /// @dev Mirrors of `ContentBlacklist`'s emergency auto-expiry terms and the
+    ///      `Category.GENERAL` ordinal (ADR 011 § Contract: ContentBlacklist).
+    ///      Duplicated as constants rather than read across the boundary because
+    ///      `getHashEntry` already returns everything the predicate needs — see
+    ///      `_emergencyExpired`. Keep in lockstep with `ContentBlacklist`.
+    uint8 internal constant EMERGENCY_CATEGORY_GENERAL = 0;
+    uint256 internal constant EMERGENCY_EXPIRY_GENERAL = 14 days;
+    uint256 internal constant EMERGENCY_EXPIRY_SEVERE = 90 days;
+
     /// @dev Commit–reveal anti-front-running bounds (ADR 014 § Challenge
     ///      front-running mitigation, #854). A reveal (`submit*Challenge`) is
     ///      valid only once its commitment has aged `MIN_REVEAL_DELAY` and before
@@ -173,7 +182,11 @@ contract SlashJudge is ISlashJudge, AccessControl, ReentrancyGuard, SunsettingPa
     error EvidenceInFuture(uint64 evidenceTsUs);
     error EvidenceTooOld(uint256 ageUs, uint256 maxAgeUs);
     error HashNotBlacklisted(bytes32 hash);
-    error BlacklistAfterResponse(uint256 addedAtUs, uint64 responseTsUs);
+    /// @notice A global entry exists but was not yet ENFORCEABLE at the served
+    ///         response — i.e. the response landed inside the ADR 011 compliance
+    ///         window. `effectiveAtUs` is `addedAt + complianceWindow`, not the
+    ///         raw add time.
+    error BlacklistAfterResponse(uint256 effectiveAtUs, uint64 responseTsUs);
     error EvidenceAlreadyUsed(bytes32 evidenceHash);
     error CommitmentExists();
     error NoCommitment();
@@ -454,20 +467,28 @@ contract SlashJudge is ISlashJudge, AccessControl, ReentrancyGuard, SunsettingPa
     ///      ∪ ripening-prev-region) strictly before the served response. A
     ///      suspended entry (fast-tracked appeal) lifts the serving restriction,
     ///      so it is not slashable — matching `ContentBlacklist._isLive`
-    ///      (`addedAt != 0 && !suspended`). The GLOBAL leg preserves the original
-    ///      two-error semantics (the richer `BlacklistAfterResponse` when a global
-    ///      entry exists but post-dates the response and no regional leg rescues
-    ///      it); the regional legs fold their before-response check into a boolean.
+    ///      (`addedAt != 0 && !suspended && !expired`). The GLOBAL leg preserves
+    ///      the original two-error semantics (the richer `BlacklistAfterResponse`
+    ///      when a global entry exists but is not yet enforceable at the response
+    ///      and no regional leg rescues it); the regional legs fold their
+    ///      before-response check into a boolean.
+    /// @dev The comparison anchor is `effectiveAt`, not `addedAt` (ADR 011
+    ///      § Compliance Window, #1169). Slashing on `addedAt` punished a node
+    ///      for a delivery served inside the grace period it is explicitly
+    ///      granted — with a 10-minute default poll interval, for content it had
+    ///      no way to know was prohibited.
     function _checkBlacklistedBefore(address operator, bytes32 blobHash, uint64 responseTsUs) internal view {
-        (uint64 gAddedAt, bool gSuspended) = contentBlacklist.getHashEntry(GLOBAL_REGION, blobHash);
-        if (gAddedAt != 0 && !gSuspended) {
+        (uint64 gAddedAt, bool gSuspended, uint64 gEffectiveAt, bool gEmergency, uint8 gCategory) =
+            contentBlacklist.getHashEntry(GLOBAL_REGION, blobHash);
+        if (gAddedAt != 0 && !gSuspended && !_emergencyExpired(gEmergency, gAddedAt, gCategory)) {
             // Effective-since (seconds → μs) must precede the served response.
-            uint256 gAddedAtUs = uint256(gAddedAt) * 1_000_000;
-            if (gAddedAtUs < uint256(responseTsUs)) return; // slashable under global scope
-            // Global entry exists but post-dates the response: only blockable if
-            // no regional leg independently makes the node slashable.
+            uint256 gEffectiveAtUs = uint256(gEffectiveAt) * 1_000_000;
+            if (gEffectiveAtUs < uint256(responseTsUs)) return; // slashable under global scope
+            // Global entry exists but is not yet enforceable at the response:
+            // only blockable if no regional leg independently makes the node
+            // slashable.
             if (!_regionalLiveBefore(operator, blobHash, responseTsUs)) {
-                revert BlacklistAfterResponse(gAddedAtUs, responseTsUs);
+                revert BlacklistAfterResponse(gEffectiveAtUs, responseTsUs);
             }
             return;
         }
@@ -511,14 +532,35 @@ contract SlashJudge is ISlashJudge, AccessControl, ReentrancyGuard, SunsettingPa
         return false;
     }
 
-    /// @dev True iff `(region, blobHash)` is a live entry (`addedAt != 0 &&
-    ///      !suspended`) whose effective-since (seconds → μs) strictly precedes
-    ///      the served response.
+    /// @dev True iff `(region, blobHash)` is an entry that was ENFORCEABLE before
+    ///      the served response — present, not suspended, not lapsed, and past
+    ///      its compliance window (`effectiveAt`, seconds → μs).
     function _liveBefore(bytes32 region, bytes32 blobHash, uint64 responseTsUs) private view returns (bool) {
-        (uint64 addedAt, bool suspended) = contentBlacklist.getHashEntry(region, blobHash);
+        (uint64 addedAt, bool suspended, uint64 effectiveAt, bool emergency, uint8 category) =
+            contentBlacklist.getHashEntry(region, blobHash);
         // Positive form (matches `ContentBlacklist._isLive`): an entry is live iff
-        // present (`addedAt != 0`) and not fast-track-suspended.
-        return addedAt != 0 && !suspended && uint256(addedAt) * 1_000_000 < uint256(responseTsUs);
+        // present (`addedAt != 0`), not fast-track-suspended, and not an expired
+        // emergency entry.
+        if (addedAt == 0 || suspended) return false;
+        if (_emergencyExpired(emergency, addedAt, category)) return false;
+        return uint256(effectiveAt) * 1_000_000 < uint256(responseTsUs);
+    }
+
+    /// @dev Mirror of `ContentBlacklist._emergencyExpired`. Duplicated rather
+    ///      than read through a view because the entry fields are already in
+    ///      hand here — one `getHashEntry` call answers the whole predicate,
+    ///      where an `isHashBlacklisted` round-trip would answer it as of NOW
+    ///      and this path must answer it as of the served response.
+    /// @dev Anchored to `block.timestamp`, not the response: an entry that has
+    ///      since lapsed is no longer enforceable, and ADR 011 makes an expired
+    ///      emergency entry unenforceable outright rather than retroactively
+    ///      valid for the window it was live. This matches the existing
+    ///      `removeHash*` behaviour — a removed entry invalidates the slash.
+    function _emergencyExpired(bool emergency, uint64 addedAt, uint8 category) private view returns (bool) {
+        if (!emergency) return false;
+        uint256 term = category == EMERGENCY_CATEGORY_GENERAL ? EMERGENCY_EXPIRY_GENERAL : EMERGENCY_EXPIRY_SEVERE;
+        // forge-lint: disable-next-line(block-timestamp)
+        return block.timestamp > uint256(addedAt) + term;
     }
 
     /// @dev Skew-safe evidence-age check (ADR 014 § Evidence staleness).
