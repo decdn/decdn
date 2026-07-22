@@ -54,6 +54,13 @@ const DEPLOYER_ADDR: &str = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
 const ADMIN_KEY: &str = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d";
 const ADMIN_ADDR: &str = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8";
 
+/// Address the fixture grants `EMERGENCY_MULTISIG_ROLE` to, purely so
+/// `registerRegionalBody` has a role-holding comparison side for its
+/// signer-disjointness check. An EOA, so the on-chain `getOwners()` probe finds
+/// nothing enumerable and registration takes ADR 011's off-chain-attestation
+/// path — the realistic bootstrap posture, where no multisig is constituted yet.
+const E2E_EMERGENCY_MULTISIG: Address = Address::new([0xE0; 20]);
+
 /// Deploy default `minBond` (50_000e18 TOKEN).
 const MIN_BOND_WEI: &str = "50000000000000000000000";
 
@@ -623,26 +630,22 @@ impl ChainFixture {
         crate::ensure_mined(&receipt, "addHashGlobal")
     }
 
-    /// Add `hash` to `region`'s blacklist as governance. The Timelock holds
-    /// `DEFAULT_ADMIN_ROLE`, so it grants itself `REGIONAL_BODY_ROLE` first (a
-    /// no-op on repeat), then adds the entry. `region` is the packed key from
-    /// [`region_key`]. Emits `HashBlacklisted(region, hash)`.
+    /// Add `hash` to `region`'s blacklist, acting as that region's registered
+    /// body. `region` is the packed key from [`region_key`]. Emits
+    /// `HashBlacklisted(region, hash)`.
+    ///
+    /// A bare `REGIONAL_BODY_ROLE` grant is NOT sufficient authority: ADR 011
+    /// § Regional Governance Bodies scopes a body to exactly one jurisdiction,
+    /// so `addHashRegional` also requires the caller to be the body registered
+    /// for the region it names. This therefore registers a distinct
+    /// region-derived body address (idempotently) and sends from it.
     pub async fn add_hash_regional(&self, region: B256, hash: B256) -> anyhow::Result<()> {
-        self.impersonate(self.addrs.timelock).await?;
+        let body = self.ensure_regional_body(region).await?;
+        self.impersonate(body).await?;
         let raw = self.raw_provider();
-        let grant = AccessControl::new(self.addrs.content_blacklist, &raw)
-            .grantRole(regional_body_role(), self.addrs.timelock)
-            .from(self.addrs.timelock)
-            .send()
-            .await
-            .context("grantRole REGIONAL_BODY_ROLE send")?
-            .get_receipt()
-            .await
-            .context("grantRole receipt")?;
-        crate::ensure_mined(&grant, "grantRole")?;
         let receipt = ContentBlacklist::new(self.addrs.content_blacklist, &raw)
             .addHashRegional(region, hash, "e2e-takedown".to_string())
-            .from(self.addrs.timelock)
+            .from(body)
             .send()
             .await
             .context("addHashRegional send")?
@@ -650,6 +653,93 @@ impl ChainFixture {
             .await
             .context("addHashRegional receipt")?;
         crate::ensure_mined(&receipt, "addHashRegional")
+    }
+
+    /// Register (once) a body for `region` and return its address.
+    ///
+    /// The body address is derived from the region so each jurisdiction gets a
+    /// distinct one — the contract enforces one-region-per-body in both
+    /// directions, so reusing a single address across regions would revert on
+    /// the second. Idempotent: a second call for the same region returns the
+    /// already-registered body rather than re-registering.
+    ///
+    /// `registerRegionalBody` also takes the `EMERGENCY_MULTISIG_ROLE` holder to
+    /// check signer-disjointness against, and verifies it actually holds the
+    /// role, so the fixture grants that role to a fixed address first. Both are
+    /// EOAs, so the on-chain `getOwners()` probe finds nothing enumerable and
+    /// registration takes the ADR's off-chain-attestation path — which is the
+    /// realistic bootstrap posture anyway.
+    async fn ensure_regional_body(&self, region: B256) -> anyhow::Result<Address> {
+        let blacklist = ContentBlacklist::new(self.addrs.content_blacklist, &self.admin);
+        let existing = blacklist
+            .getRegionalBody(region)
+            .call()
+            .await
+            .context("getRegionalBody")?;
+        if existing.body != Address::ZERO {
+            return Ok(existing.body);
+        }
+
+        // Deterministic per-region body address; the low bytes of the region key
+        // keep it distinct per jurisdiction and clear of the fixture's own
+        // accounts.
+        let mut raw = [0u8; 20];
+        raw.copy_from_slice(&region.0[..20]);
+        let body = Address::from(raw);
+
+        self.impersonate(self.addrs.timelock).await?;
+        let provider = self.raw_provider();
+        let grant = AccessControl::new(self.addrs.content_blacklist, &provider)
+            .grantRole(emergency_multisig_role(), E2E_EMERGENCY_MULTISIG)
+            .from(self.addrs.timelock)
+            .send()
+            .await
+            .context("grantRole EMERGENCY_MULTISIG_ROLE send")?
+            .get_receipt()
+            .await
+            .context("grantRole receipt")?;
+        crate::ensure_mined(&grant, "grantRole")?;
+
+        let receipt = ContentBlacklist::new(self.addrs.content_blacklist, &provider)
+            .registerRegionalBody(region, body, E2E_EMERGENCY_MULTISIG)
+            .from(self.addrs.timelock)
+            .send()
+            .await
+            .context("registerRegionalBody send")?
+            .get_receipt()
+            .await
+            .context("registerRegionalBody receipt")?;
+        crate::ensure_mined(&receipt, "registerRegionalBody")?;
+        Ok(body)
+    }
+
+    /// Advance chain time by `secs` and mine, so a test can step past a
+    /// contract-side window (e.g. the ADR 011 compliance window before a
+    /// blacklist entry becomes slashable).
+    pub async fn advance_time(&self, secs: u64) -> anyhow::Result<()> {
+        let _: serde_json::Value = self
+            .admin
+            .raw_request("evm_increaseTime".into(), (secs,))
+            .await
+            .context("evm_increaseTime")?;
+        let _: serde_json::Value = self
+            .admin
+            .raw_request("evm_mine".into(), ())
+            .await
+            .context("evm_mine")?;
+        Ok(())
+    }
+
+    /// `ContentBlacklist.complianceWindow()` — the ADR 011 grace between an
+    /// entry's `addedAt` and the moment it becomes slashable. Read rather than
+    /// hardcoded so a governance change to the default cannot silently turn
+    /// these tests into no-ops.
+    pub async fn compliance_window(&self) -> anyhow::Result<u64> {
+        ContentBlacklist::new(self.addrs.content_blacklist, &self.admin)
+            .complianceWindow()
+            .call()
+            .await
+            .context("read complianceWindow")
     }
 
     /// Change an operator's self-attested region via `CapacityBond.updateRegion`
@@ -1265,9 +1355,10 @@ pub fn region_key(region: &str) -> B256 {
     B256::right_padding_from(region.as_bytes())
 }
 
-/// `keccak256("REGIONAL_BODY_ROLE")` — the role `addHashRegional` requires.
-fn regional_body_role() -> B256 {
-    keccak256(b"REGIONAL_BODY_ROLE")
+/// `keccak256("EMERGENCY_MULTISIG_ROLE")` — `registerRegionalBody` verifies its
+/// comparison-side address holds this.
+fn emergency_multisig_role() -> B256 {
+    keccak256(b"EMERGENCY_MULTISIG_ROLE")
 }
 
 fn read_manifest(path: &Path) -> anyhow::Result<ContractAddrs> {

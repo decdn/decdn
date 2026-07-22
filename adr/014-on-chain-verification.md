@@ -194,7 +194,7 @@ The check applies at initialization too — neither contract may be deployed wit
 3. Look up `challengedNode` in `CapacityBond` — must be a registered node
 4. Decode `hash` from the response; verify it matches `blobHash`
 5. If `ProbeResponse`: verify `has_blob == true`. If `StreamResponse`: verify `ok == true`
-6. Query `ContentBlacklist.getEntry(blobHash)` — must exist and `effectiveAt` must be before the response's `timestamp_us`
+6. Query `ContentBlacklist.getHashEntry(region, blobHash)` — must exist, must not be suspended, must not be a lapsed emergency entry, and its `effectiveAt` must be before the response's `timestamp_us`
 7. **Regional scope limitation (PoC):** [ADR 011](011-content-takedown.md#slashing) specifies a node is only slashable for hashes blacklisted in its declared region. But the node's region is self-reported and not stored on-chain in `CapacityBond` for the PoC, so `SlashJudge` cannot enforce regional scope in the PoC — all blacklist violations are treated as globally scoped. Production should add a `region` field to `NodeInfo` to enable on-chain regional filtering
 
 #### Bond Handling

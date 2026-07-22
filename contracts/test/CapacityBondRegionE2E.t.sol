@@ -47,6 +47,12 @@ contract CapacityBondRegionE2ETest is Test {
     address internal challenger = address(0xC4A11E);
     bytes32 internal constant BLOB = bytes32(uint256(0xB10B));
     bytes32 internal constant US_EAST = bytes32("us-east");
+    address internal constant MULTISIG = address(0xC0DE);
+
+    /// @dev ADR 011 § Compliance Window — a regional entry is not slashable
+    ///      until `addedAt + complianceWindow` (24h by default). Every slash
+    ///      below must therefore present a response that post-dates it.
+    uint256 internal constant COMPLIANCE_WINDOW = 24 hours;
 
     // Commit–reveal (#854): mirror of SlashJudge's fixed MIN_REVEAL_DELAY and a
     // fixed salt for the challenger's blind commitment.
@@ -274,8 +280,9 @@ contract CapacityBondRegionE2ETest is Test {
         _bondAndRegister(); // node region = "us-east"
 
         _blacklistRegional(US_EAST, BLOB);
-        // Advance so the served response can post-date the entry, then slash.
-        vm.warp(block.timestamp + 10);
+        // Advance past the compliance window so the served response post-dates
+        // `effectiveAt`, then slash.
+        vm.warp(block.timestamp + COMPLIANCE_WINDOW + 10);
         _submitBlacklistSlash(judge, uint64(block.timestamp * 1_000_000 - 5_000_000));
 
         assertEq(bond.lifetimeOffenseCount(REG_OPERATOR), 1);
@@ -294,8 +301,9 @@ contract CapacityBondRegionE2ETest is Test {
         vm.prank(REG_OPERATOR);
         bond.updateRegion("eu-west");
 
-        // Still inside REGION_WINDOW: the us-east (prev) entry remains in scope.
-        vm.warp(block.timestamp + 1 days);
+        // Still inside REGION_WINDOW (7d) but past the 24h compliance window:
+        // the us-east (prev) entry remains in scope and is now enforceable.
+        vm.warp(block.timestamp + COMPLIANCE_WINDOW + 1 hours);
         _submitBlacklistSlash(judge, uint64(block.timestamp * 1_000_000 - 5_000_000));
 
         assertEq(bond.lifetimeOffenseCount(REG_OPERATOR), 1);
@@ -353,10 +361,14 @@ contract CapacityBondRegionE2ETest is Test {
             admin
         );
         bytes32 slashRole = bond.SLASH_ROLE();
-        bytes32 bodyRole = blacklist.REGIONAL_BODY_ROLE();
         vm.startPrank(admin);
         bond.grantRole(slashRole, address(judge));
-        blacklist.grantRole(bodyRole, admin);
+        // `admin` acts as the US_EAST regional body — the ADR 011 bootstrap
+        // posture, where the DEFAULT_ADMIN_ROLE holder is sole governance. A
+        // bare role grant is no longer enough: a body's write authority is
+        // scoped to the region it is registered for.
+        blacklist.grantRole(blacklist.EMERGENCY_MULTISIG_ROLE(), MULTISIG);
+        blacklist.registerRegionalBody(US_EAST, admin, MULTISIG);
         token.transfer(challenger, CHALLENGE_BOND * 10);
         vm.stopPrank();
         vm.prank(challenger);
