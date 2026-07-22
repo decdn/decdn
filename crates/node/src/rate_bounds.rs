@@ -24,8 +24,8 @@
 //!
 //! Readers that need a *consistent* `(floor, ceiling)` pair for **one** decision
 //! (e.g. the clamp, which reads both) should take a single
-//! [`RateBounds::snapshot`] rather than separate [`Self::floor`] /
-//! [`Self::ceiling`] reads that could observe a half-applied retune.
+//! [`RateBounds::snapshot`] rather than separate [`RateBounds::floor`] /
+//! [`RateBounds::ceiling`] reads that could observe a half-applied retune.
 //!
 //! Do **not**, however, pin a quote-time floor across a stream and reuse it to
 //! accept that stream's later vouchers. The hard per-byte floor enforced at
