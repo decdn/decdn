@@ -458,6 +458,15 @@ impl ReloadableSection for PinnedHashesSection {
 /// A swap is therefore always effective.
 struct ContentSection {
     deny: Arc<crate::content_deny::ContentDenylist>,
+    /// Live cache engine, for the hash half of the denylist. Same lifecycle as
+    /// [`PinnedHashesSection::engine`] — attached via
+    /// [`RuntimeReloadState::attach_cache`] before the reload loop runs.
+    ///
+    /// Hashes go to the engine rather than to `deny` because "will this node
+    /// serve/announce/acquire this hash" has four consumers and ADR 011 needs
+    /// one answer for all of them; see `CacheEngine::refuses`. `deny` keeps the
+    /// origin half, which the cache knows nothing about.
+    engine: std::sync::Mutex<Option<decdn_cache::CacheEngine>>,
     buf: std::sync::Mutex<Option<decdn_common::config::ResolvedContent>>,
 }
 
@@ -509,12 +518,27 @@ impl ReloadableSection for ContentSection {
         let Some(resolved) = drain_or_log(&self.buf, self.name()) else {
             return;
         };
-        let (diff, denied_origins) = self.deny.set_local(&resolved);
+        let denied_origins = self.deny.set_local_origins(&resolved);
+        let Ok(engine_guard) = self.engine.lock() else {
+            // Same poison handling as `PinnedHashesSection`: forfeit the swap
+            // rather than panic. Unlike pinning, a forfeited swap here leaves a
+            // takedown undischarged, so it is ERROR and says so.
+            tracing::error!(
+                section = self.name(),
+                "cache engine mutex poisoned; the denied-hash set was NOT updated and any \
+                 takedown in this reload is undischarged"
+            );
+            return;
+        };
+        let hash_diff = engine_guard
+            .as_ref()
+            .map(|engine| engine.set_denied(&resolved.denied_hashes));
         tracing::info!(
             section = self.name(),
             denied_hashes = resolved.denied_hashes.len(),
-            denied_hashes_added = diff.added,
-            denied_hashes_removed = diff.removed,
+            denied_hashes_added = hash_diff.map(|d| d.added),
+            denied_hashes_removed = hash_diff.map(|d| d.removed),
+            denied_hashes_skipped_no_cache_attached = hash_diff.is_none(),
             denied_origins,
             "config reload section applied"
         );
@@ -669,6 +693,7 @@ impl RuntimeReloadState {
         });
         let content = Arc::new(ContentSection {
             deny: Arc::new(crate::content_deny::ContentDenylist::new(&initial.content)),
+            engine: std::sync::Mutex::new(None),
             buf: std::sync::Mutex::new(None),
         });
         // Registration order is the same as the old monolithic body's
@@ -710,6 +735,7 @@ impl RuntimeReloadState {
     /// Recovery here ensures the new engine is at least stored for the
     /// (non-reload-driven) live path.
     pub fn attach_cache(&self, engine: Option<decdn_cache::CacheEngine>) {
+        attach_engine_to_section(&self.content.engine, engine.clone(), "content");
         attach_engine_to_section(&self.pinned.engine, engine, "pinned_hashes");
     }
 
@@ -1255,6 +1281,7 @@ const fn payment_has_restart_required_field(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use std::path::PathBuf;
+    use std::str::FromStr as _;
     use std::sync::Mutex;
 
     use super::*;
@@ -1856,8 +1883,12 @@ mod tests {
     /// The point of making `[content]` reloadable: an operator discharging a
     /// one-hour removal order must not have to bounce the daemon (dropping
     /// every in-flight paid stream) to do it.
+    ///
+    /// Asserts through `CacheEngine::is_denied`, not the deny-set handle,
+    /// because reaching the cache is the whole fix — that is what suppresses
+    /// probe `has_blob`, DHT republish, and `populate` alongside the serve gate.
     #[tokio::test]
-    async fn reload_applies_content_denylist_without_restart() {
+    async fn reload_applies_content_denylist_to_the_cache_lever() {
         let dir = tempfile::tempdir().unwrap();
         let h = make_hex_hash(7);
         let origin = "0x000000000000000000000000000000000000dEaD";
@@ -1868,17 +1899,21 @@ mod tests {
 
         let initial = seed_resolved(10, LogLevel::Info);
         let state = denylist_state(&initial);
+        let (engine, _tmp) = build_test_cache().await;
+        state.attach_cache(Some(engine.clone()));
         let deny = state.content_denylist();
+        let hash = decdn_cache::Hash::from_str(&h).unwrap();
 
-        let mut bytes = [0u8; 32];
-        for (i, b) in bytes.iter_mut().enumerate() {
-            *b = u8::try_from(i).unwrap_or(0).wrapping_add(7);
-        }
-        assert!(!deny.is_hash_denied(&bytes), "nothing denied before reload");
+        assert!(!engine.is_denied(hash), "nothing denied before reload");
+        assert!(!engine.refuses(hash), "and nothing refused");
 
         state.reload(&path).await.expect("reload succeeds");
 
-        assert!(deny.is_hash_denied(&bytes), "hash denied after reload");
+        assert!(engine.is_denied(hash), "hash denied after reload");
+        assert!(
+            engine.refuses(hash),
+            "and therefore refused by probe/DHT/populate too"
+        );
         assert!(
             deny.is_origin_denied(&origin.parse().unwrap()),
             "origin denied after reload"
@@ -1911,7 +1946,8 @@ mod tests {
         );
         let initial = seed_resolved(10, LogLevel::Info);
         let state = denylist_state(&initial);
-        let deny = state.content_denylist();
+        let (engine, _tmp) = build_test_cache().await;
+        state.attach_cache(Some(engine.clone()));
         state.reload(&good).await.expect("first reload succeeds");
 
         let bad = dir.path().join("bad.toml");
@@ -1922,18 +1958,15 @@ mod tests {
             "error names the field: {err:#}"
         );
 
-        let mut bytes = [0u8; 32];
-        for (i, b) in bytes.iter_mut().enumerate() {
-            *b = u8::try_from(i).unwrap_or(0).wrapping_add(7);
-        }
         assert!(
-            deny.is_hash_denied(&bytes),
+            engine.is_denied(decdn_cache::Hash::from_str(&h).unwrap()),
             "the prior denylist must survive a failed reload"
         );
     }
 
     /// Emptying the section un-denies — the operator's own lever works in both
-    /// directions (a wrongful takedown must be reversible without a restart too).
+    /// directions (a wrongful takedown must be reversible without a restart).
+    /// This is the property that rules out reusing the sticky `evict` latch.
     #[tokio::test]
     async fn reload_clears_content_denylist_when_emptied() {
         let dir = tempfile::tempdir().unwrap();
@@ -1944,18 +1977,18 @@ mod tests {
         );
         let initial = seed_resolved(10, LogLevel::Info);
         let state = denylist_state(&initial);
-        let deny = state.content_denylist();
+        let (engine, _tmp) = build_test_cache().await;
+        state.attach_cache(Some(engine.clone()));
         state.reload(&with).await.unwrap();
+        let hash = decdn_cache::Hash::from_str(&h).unwrap();
+        assert!(engine.is_denied(hash));
 
         let without = dir.path().join("empty.toml");
         std::fs::write(&without, "[content]\n").unwrap();
         state.reload(&without).await.unwrap();
 
-        let mut bytes = [0u8; 32];
-        for (i, b) in bytes.iter_mut().enumerate() {
-            *b = u8::try_from(i).unwrap_or(0).wrapping_add(7);
-        }
-        assert!(!deny.is_hash_denied(&bytes), "denylist cleared");
+        assert!(!engine.is_denied(hash), "denylist cleared");
+        assert!(!engine.refuses(hash), "and no longer refused anywhere");
     }
 
     // ----- pinned_hashes hot-reload (#276) -----

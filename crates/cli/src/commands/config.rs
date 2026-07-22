@@ -586,7 +586,7 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # cache.pinned_hashes. An invalid entry FAILS startup rather than being skipped:
 # a typo in a takedown must not silently leave content served.
 # denied_hashes = ["0000000000000000000000000000000000000000000000000000000000000000"]
-# denied_origins = ["0x0000000000000000000000000000000000000000"]   # operator addresses whose channels are refused
+# denied_origins = ["0x000000000000000000000000000000000000dEaD"]   # operator addresses whose channels are refused (the zero address is rejected)
 "#;
 
 #[cfg(test)]

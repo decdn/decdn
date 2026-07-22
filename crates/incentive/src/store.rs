@@ -335,7 +335,14 @@ pub trait BlacklistEntryStore: Send + Sync {
     /// # Errors
     ///
     /// Returns a [`StoreError`] if the backing store is unreadable.
-    fn load_blacklist_origins(&self) -> Result<Vec<[u8; 20]>, StoreError>;
+    /// `None` means the projection has never been initialised — a table that
+    /// does not exist yet, as on the first boot after upgrading to a build that
+    /// tracks origins. That is emphatically NOT the same as `Some(vec![])`
+    /// ("scanned, found nothing"), and conflating them is a silent fail-open:
+    /// the blacklist scan cursor predates this projection, so a resumed scan
+    /// starts past every origin event ever emitted and the deny-set stays empty
+    /// forever. The caller MUST treat `None` as "replay from the deploy block".
+    fn load_blacklist_origins(&self) -> Result<Option<Vec<[u8; 20]>>, StoreError>;
 
     /// Record one blacklisted origin address. Idempotent.
     ///

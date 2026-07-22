@@ -112,7 +112,8 @@ use decdn_gossip::PeerTable;
 use decdn_incentive::capacity_bond::CapacityBond;
 use decdn_incentive::content_blacklist::ContentBlacklist;
 use decdn_incentive::content_blacklist::ContentBlacklist::{
-    HashBlacklisted, HashRemoved, HashSuspensionUpdated, OriginBlacklistUpdated,
+    HashBlacklisted, HashRemoved, HashSuspensionUpdated, OperatorBlacklistCleared,
+    OperatorBlacklisted, OriginBlacklistUpdated,
 };
 use decdn_incentive::store::{BlacklistEntryStore, CheckpointKey, KeyedCheckpointStore};
 use tokio::sync::{RwLock, oneshot};
@@ -406,6 +407,72 @@ impl<P: Provider + Clone> LogSink for BlacklistSink<P> {
     }
 }
 
+/// The durable deny-set projection reloaded at bring-up, plus whether it can be
+/// trusted enough to resume from the persisted scan cursor.
+struct RestoredProjection {
+    known: HashSet<(B256, Hash)>,
+    origins: Vec<[u8; 20]>,
+    /// `true` ⇒ ignore the cursor and rescan from the deploy block. Set whenever
+    /// a projection is unreadable OR was never built, because resuming on a
+    /// projection that does not reflect everything below the cursor is a silent
+    /// fail-open on a takedown gate.
+    replay_floor: bool,
+}
+
+/// Reload both durable projections, deciding whether the persisted cursor is
+/// still safe to resume from.
+fn restore_projection(entry_store: &dyn BlacklistEntryStore) -> RestoredProjection {
+    // A read failure is not fatal: an empty set plus the resumed cursor would
+    // under-enforce, so fall back to replaying from `from_block`, which
+    // reconstructs the set from events exactly as the pre-#1181 watcher did.
+    let (entries, mut replay_floor) = match entry_store.load_blacklist_entries() {
+        Ok(rows) => (rows, false),
+        Err(err) => {
+            warn!(
+                err = %sanitize_err_chain(&err.into()),
+                "blacklist watcher: durable deny-set unreadable; replaying from the deploy \
+                 block to rebuild it rather than resuming on a partial set"
+            );
+            (Vec::new(), true)
+        }
+    };
+
+    let origins = match entry_store.load_blacklist_origins() {
+        Ok(Some(rows)) => rows,
+        // Never initialised — the first boot on a build that tracks origins.
+        // The blacklist cursor is OLDER than this projection, so resuming from
+        // it would skip every origin event ever emitted and leave the gate
+        // permanently empty with no way to notice: the events carry no version
+        // and nothing enumerates the set on-chain. Replay from the floor.
+        Ok(None) => {
+            warn!(
+                "blacklist watcher: origin deny-set has never been built (new projection on an \
+                 existing scan cursor); replaying from the deploy block to populate it"
+            );
+            replay_floor = true;
+            Vec::new()
+        }
+        Err(err) => {
+            warn!(
+                err = %sanitize_err_chain(&err.into()),
+                "blacklist watcher: durable origin deny-set unreadable; replaying from the \
+                 deploy block rather than resuming on a partial set"
+            );
+            replay_floor = true;
+            Vec::new()
+        }
+    };
+
+    RestoredProjection {
+        known: entries
+            .into_iter()
+            .map(|(region, hash)| (B256::from(region), Hash::from_bytes(hash)))
+            .collect(),
+        origins,
+        replay_floor,
+    }
+}
+
 /// The blacklist watcher's cursor policy: **resume from the durable
 /// [`CheckpointKey::Blacklist`] cursor, replaying from the deploy floor on a
 /// cold store** ([`ColdStart::FromBlock`]).
@@ -475,40 +542,11 @@ where
     // Only used to resolve a blacklisted origin address to its registered
     // NodeId for peer-table removal — this watcher reads no other bond state.
     let capacity_bond = CapacityBond::new(capacity_bond_addr, provider.clone());
-    // Rebuild the retained deny-set from disk before the first tick. A read
-    // failure is not fatal: an empty set plus the resumed cursor would under-
-    // enforce, so fall back to replaying from `from_block`, which reconstructs
-    // the set from events exactly as the pre-#1181 watcher did.
-    let (restored, replay_floor) = match entry_store.load_blacklist_entries() {
-        Ok(rows) => (rows, false),
-        Err(err) => {
-            warn!(
-                err = %sanitize_err_chain(&err.into()),
-                "blacklist watcher: durable deny-set unreadable; replaying from the deploy \
-                 block to rebuild it rather than resuming on a partial set"
-            );
-            (Vec::new(), true)
-        }
-    };
-    let known: HashSet<(B256, Hash)> = restored
-        .into_iter()
-        .map(|(region, hash)| (B256::from(region), Hash::from_bytes(hash)))
-        .collect();
-    // Same rebuild for the origin deny-set, and the same fallback: a read
-    // failure forces a replay from `from_block` rather than resuming on an empty
-    // set. Under-denying an origin means serving a blacklisted operator's
-    // channel, which is precisely what this gate exists to stop.
-    let (restored_origins, replay_floor) = match entry_store.load_blacklist_origins() {
-        Ok(rows) => (rows, replay_floor),
-        Err(err) => {
-            warn!(
-                err = %sanitize_err_chain(&err.into()),
-                "blacklist watcher: durable origin deny-set unreadable; replaying from the \
-                 deploy block to rebuild it rather than resuming on a partial set"
-            );
-            (Vec::new(), true)
-        }
-    };
+    let RestoredProjection {
+        known,
+        origins: restored_origins,
+        replay_floor,
+    } = restore_projection(entry_store.as_ref());
     let restored_origin_count = restored_origins.len();
     denylist.set_chain_origins(restored_origins.into_iter().map(Address::from).collect());
     info!(
@@ -539,6 +577,14 @@ where
             // events there is no counter to detect a missed one — the cursor
             // plus the durable origin projection are the whole guarantee.
             OriginBlacklistUpdated::SIGNATURE_HASH,
+            // `addOperator` is the PRIMARY governance origin-blacklist path —
+            // it is what ADR 011 § Hash Evasion names, and it ejects from
+            // `CapacityBond`. It writes a SEPARATE mapping and emits these two
+            // events, never `OriginBlacklistUpdated`. `OriginAssignment` unions
+            // the two mappings on-chain; watching only the first would leave the
+            // delivery gate enforcing the softer list and missing the voted one.
+            OperatorBlacklisted::SIGNATURE_HASH,
+            OperatorBlacklistCleared::SIGNATURE_HASH,
         ]),
         if replay_floor {
             CursorStart::FullReplay
@@ -700,6 +746,12 @@ where
         Some(topic) if *topic == OriginBlacklistUpdated::SIGNATURE_HASH => {
             Ok(on_origin_log(state, &log).await? == Recheck::Failed)
         }
+        Some(topic) if *topic == OperatorBlacklisted::SIGNATURE_HASH => {
+            Ok(on_operator_log(state, &log, true).await? == Recheck::Failed)
+        }
+        Some(topic) if *topic == OperatorBlacklistCleared::SIGNATURE_HASH => {
+            Ok(on_operator_log(state, &log, false).await? == Recheck::Failed)
+        }
         _ => Ok(false),
     }
 }
@@ -718,13 +770,69 @@ where
 /// is what makes `serve_stream` refuse), while the peer-table removal only stops
 /// us *selecting* that peer. Letting a `nodeIdOf` blip roll back a durable
 /// deny-set write would trade the enforcing half for the advisory one.
+/// Decode an `OperatorBlacklisted` / `OperatorBlacklistCleared` log and apply it
+/// to the same origin deny-set `OriginBlacklistUpdated` feeds.
+///
+/// One deny-set for both on-chain lists, mirroring `OriginAssignment`'s
+/// `isOriginBlacklisted(op) || isOperatorBlacklisted(op)`. The node does not need
+/// to know which list an address came from — only that governance put it on one.
+async fn on_operator_log<P>(
+    state: &mut WatcherState<P>,
+    log: &Log,
+    blacklisted: bool,
+) -> Result<Recheck>
+where
+    P: Provider + Clone,
+{
+    let operator = if blacklisted {
+        match OperatorBlacklisted::decode_log_data(&log.inner.data) {
+            Ok(event) => event.operator,
+            Err(err) => return Err(undecodable_origin_log(&err, log, "OperatorBlacklisted")),
+        }
+    } else {
+        match OperatorBlacklistCleared::decode_log_data(&log.inner.data) {
+            Ok(event) => event.operator,
+            Err(err) => {
+                return Err(undecodable_origin_log(
+                    &err,
+                    log,
+                    "OperatorBlacklistCleared",
+                ));
+            }
+        }
+    };
+    state.set_origin(operator, blacklisted)?;
+    debug!(%operator, blacklisted, "blacklist watcher: operator blacklist updated");
+    if !blacklisted {
+        return Ok(Recheck::NoAction);
+    }
+    Ok(state.drop_origin_peer(operator).await)
+}
+
+/// An origin-class log we cannot decode is an ENFORCEMENT failure, not a parse
+/// curiosity, so it aborts the tick and holds the scan cursor.
+///
+/// The hash events can afford to skip-and-continue: they are re-scoped every
+/// pass and eviction is sticky. The origin events have no such backstop — no
+/// version counter to reveal a gap, no enumeration to sweep against — so a
+/// skipped log is gone permanently and the deny-set is silently short an entry.
+/// Holding the cursor lets the readiness gate keep the router closed rather than
+/// opening on a set we know is incomplete.
+fn undecodable_origin_log(err: &alloy::sol_types::Error, log: &Log, event: &str) -> anyhow::Error {
+    anyhow::anyhow!("{err}").context(format!(
+        "undecodable {event} log at block {:?} tx {:?}; refusing to advance the scan cursor \
+         past an unreadable takedown event",
+        log.block_number, log.transaction_hash
+    ))
+}
+
 async fn on_origin_log<P>(state: &mut WatcherState<P>, log: &Log) -> Result<Recheck>
 where
     P: Provider + Clone,
 {
-    let Ok(event) = OriginBlacklistUpdated::decode_log_data(&log.inner.data) else {
-        warn!("blacklist watcher: undecodable OriginBlacklistUpdated log");
-        return Ok(Recheck::NoAction);
+    let event = match OriginBlacklistUpdated::decode_log_data(&log.inner.data) {
+        Ok(event) => event,
+        Err(err) => return Err(undecodable_origin_log(&err, log, "OriginBlacklistUpdated")),
     };
     state.set_origin(event.origin, event.blacklisted)?;
     debug!(
@@ -838,7 +946,7 @@ where
 /// Outcome of one scope re-check, so callers can distinguish an enforcement
 /// *failure* (retry promptly — the entry may be live and slashable) from a
 /// legitimately out-of-scope entry (the periodic re-scope keeps watching it).
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Recheck {
     /// The hash was in scope and its eviction succeeded.
     Evicted,
@@ -938,6 +1046,9 @@ async fn evict(cache: &CacheEngine, hash: Hash) -> bool {
 }
 
 #[cfg(test)]
+// Test-only: the assertion style below intentionally panics on the negative
+// branch. Matches the convention in `content_deny.rs` / `config/mod.rs`.
+#[allow(clippy::panic)]
 mod tests {
     use super::*;
 
@@ -951,6 +1062,9 @@ mod tests {
         rows: Mutex<HashSet<([u8; 32], [u8; 32])>>,
         origins: Mutex<HashSet<[u8; 20]>>,
         fail_writes: bool,
+        /// Models the redb table not existing yet — the first boot after
+        /// upgrading to a build that tracks origins.
+        origins_uninitialised: bool,
     }
 
     impl MemEntryStore {
@@ -959,6 +1073,15 @@ mod tests {
                 rows: Mutex::new(HashSet::new()),
                 origins: Mutex::new(HashSet::new()),
                 fail_writes: true,
+                origins_uninitialised: false,
+            }
+        }
+
+        /// A store whose origin projection has never been built.
+        fn uninitialised_origins() -> Self {
+            Self {
+                origins_uninitialised: true,
+                ..Self::default()
             }
         }
 
@@ -1022,8 +1145,11 @@ mod tests {
 
         fn load_blacklist_origins(
             &self,
-        ) -> Result<Vec<[u8; 20]>, decdn_incentive::store::StoreError> {
-            Ok(self.origin_guard().iter().copied().collect())
+        ) -> Result<Option<Vec<[u8; 20]>>, decdn_incentive::store::StoreError> {
+            if self.origins_uninitialised {
+                return Ok(None);
+            }
+            Ok(Some(self.origin_guard().iter().copied().collect()))
         }
 
         fn insert_blacklist_origin(
@@ -1422,6 +1548,169 @@ mod tests {
             },
             ..Default::default()
         }
+    }
+
+    fn origin_log(origin: Address, blacklisted: bool) -> Log {
+        let event = OriginBlacklistUpdated {
+            origin,
+            blacklisted,
+        };
+        Log {
+            inner: alloy::primitives::Log {
+                address: Address::repeat_byte(0x11),
+                data: event.encode_log_data(),
+            },
+            ..Default::default()
+        }
+    }
+
+    fn operator_log(operator: Address) -> Log {
+        let event = OperatorBlacklisted { operator };
+        Log {
+            inner: alloy::primitives::Log {
+                address: Address::repeat_byte(0x11),
+                data: event.encode_log_data(),
+            },
+            ..Default::default()
+        }
+    }
+
+    // ----- origin deny-set (ADR 011 § Hash Evasion, #1179) -----
+
+    /// The end-to-end unit property: an `OriginBlacklistUpdated` log reaches the
+    /// deny-set the delivery path reads AND the durable projection a restart
+    /// rebuilds from. Either half alone is a fail-open.
+    #[tokio::test]
+    async fn origin_log_denies_and_persists() -> Result<()> {
+        let store = Arc::new(MemEntryStore::default());
+        let deny = Arc::new(ContentDenylist::empty());
+        let mut state = state_with_denylist(Arc::clone(&store) as _, Arc::clone(&deny));
+        let origin = Address::repeat_byte(0x44);
+
+        let _ = on_origin_log(&mut state, &origin_log(origin, true)).await?;
+
+        assert!(deny.is_origin_denied(&origin), "reaches the live deny-set");
+        assert_eq!(
+            store.load_blacklist_origins()?,
+            Some(vec![origin.into()]),
+            "and the durable projection a restart rebuilds from"
+        );
+        Ok(())
+    }
+
+    /// De-listing must clear both halves, or a restart resurrects the entry.
+    #[tokio::test]
+    async fn origin_delisting_clears_both_halves() -> Result<()> {
+        let store = Arc::new(MemEntryStore::default());
+        let deny = Arc::new(ContentDenylist::empty());
+        let mut state = state_with_denylist(Arc::clone(&store) as _, Arc::clone(&deny));
+        let origin = Address::repeat_byte(0x45);
+
+        let _ = on_origin_log(&mut state, &origin_log(origin, true)).await?;
+        let _ = on_origin_log(&mut state, &origin_log(origin, false)).await?;
+
+        assert!(!deny.is_origin_denied(&origin));
+        assert_eq!(store.load_blacklist_origins()?, Some(Vec::new()));
+        Ok(())
+    }
+
+    /// `addOperator` is the primary governance path — it emits
+    /// `OperatorBlacklisted`, never `OriginBlacklistUpdated`, and writes a
+    /// different on-chain mapping. Watching only the latter left the voted,
+    /// ejecting path unenforced at the delivery gate.
+    #[tokio::test]
+    async fn operator_blacklist_log_reaches_the_same_deny_set() -> Result<()> {
+        let store = Arc::new(MemEntryStore::default());
+        let deny = Arc::new(ContentDenylist::empty());
+        let mut state = state_with_denylist(Arc::clone(&store) as _, Arc::clone(&deny));
+        let operator = Address::repeat_byte(0x46);
+
+        let _ = on_operator_log(&mut state, &operator_log(operator), true).await?;
+
+        assert!(deny.is_origin_denied(&operator));
+        assert_eq!(store.load_blacklist_origins()?, Some(vec![operator.into()]));
+        Ok(())
+    }
+
+    /// The origin twin of `durable_write_failure_aborts_the_tick`. A failed
+    /// durable write must hold the scan cursor; letting it advance loses the
+    /// event permanently, because origin events carry no version and nothing
+    /// enumerates the set on-chain.
+    #[tokio::test]
+    async fn origin_write_failure_aborts_the_tick() {
+        let store = Arc::new(MemEntryStore::failing());
+        let deny = Arc::new(ContentDenylist::empty());
+        let mut state = state_with_denylist(Arc::clone(&store) as _, Arc::clone(&deny));
+        let origin = Address::repeat_byte(0x47);
+
+        let Err(err) = on_origin_log(&mut state, &origin_log(origin, true)).await else {
+            panic!("a failed durable write must abort the tick");
+        };
+        assert!(
+            format!("{err:#}").contains("persist blacklisted origin"),
+            "{err:#}"
+        );
+        assert!(
+            !deny.is_origin_denied(&origin),
+            "and must not advance the in-memory set past a lost write"
+        );
+    }
+
+    /// An undecodable origin log must NOT be skipped. The hash events can
+    /// afford skip-and-continue (re-scoped every pass, sticky eviction); these
+    /// cannot, so the tick aborts rather than advancing the cursor past a
+    /// takedown the node could not read.
+    #[tokio::test]
+    async fn undecodable_origin_log_aborts_the_tick() {
+        let mut state = state();
+        let mut log = origin_log(Address::repeat_byte(0x48), true);
+        log.inner.data.data = vec![0x01].into();
+
+        let Err(err) = on_origin_log(&mut state, &log).await else {
+            panic!("an unreadable takedown event must not be skipped");
+        };
+        assert!(
+            format!("{err:#}").contains("refusing to advance"),
+            "{err:#}"
+        );
+    }
+
+    /// The upgrade path. The origin projection is newer than the scan cursor, so
+    /// "table absent" and "table empty" have opposite consequences: absent must
+    /// force a replay, or the resumed scan starts past every origin event ever
+    /// emitted and the gate stays permanently empty.
+    #[test]
+    fn absent_origin_projection_forces_a_replay() {
+        let store = MemEntryStore::uninitialised_origins();
+        let restored = restore_projection(&store as &dyn BlacklistEntryStore);
+        assert!(
+            restored.replay_floor,
+            "a never-built origin projection must replay from the deploy block"
+        );
+    }
+
+    /// ...whereas a genuinely empty one must NOT, or every node would rescan the
+    /// whole chain on every boot.
+    #[test]
+    fn empty_origin_projection_resumes_from_the_cursor() {
+        let store = MemEntryStore::default();
+        let restored = restore_projection(&store as &dyn BlacklistEntryStore);
+        assert!(!restored.replay_floor);
+    }
+
+    /// A restart must come up enforcing what it learned before, without waiting
+    /// for a fresh on-chain event — the durable projection is the whole
+    /// guarantee here.
+    #[test]
+    fn restored_origins_survive_a_restart() -> Result<()> {
+        let store = MemEntryStore::default();
+        let origin = Address::repeat_byte(0x49);
+        store.insert_blacklist_origin(origin.into())?;
+
+        let restored = restore_projection(&store as &dyn BlacklistEntryStore);
+        assert_eq!(restored.origins, vec![<[u8; 20]>::from(origin)]);
+        assert!(!restored.replay_floor);
+        Ok(())
     }
 
     /// #1181's load-bearing invariant. A durable deny-set write failure must

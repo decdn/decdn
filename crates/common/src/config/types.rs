@@ -1099,11 +1099,13 @@ pub struct PrefetchConfig {
 #[serde(deny_unknown_fields)]
 pub struct ContentConfig {
     /// Blob hashes this node refuses to serve. Bare 64-character lowercase hex,
-    /// the same spelling as `cache.pinned_hashes` — an invalid or duplicate
-    /// entry fails resolution rather than being skipped, so a typo in a
-    /// takedown cannot silently leave content served.
+    /// the same spelling as `cache.pinned_hashes`. An invalid entry fails
+    /// resolution rather than being skipped, so a typo in a takedown cannot
+    /// silently leave content served. Duplicates are de-duplicated, not
+    /// rejected — a repeated deny is still a deny.
     pub denied_hashes: Option<Vec<String>>,
     /// Operator addresses whose payment channels this node refuses to serve.
-    /// EIP-55 or lowercase `0x`-prefixed hex; the zero address is rejected.
+    /// `0x`-prefixed hex, checksum-agnostic (any case accepted); the zero
+    /// address is rejected.
     pub denied_origins: Option<Vec<String>>,
 }

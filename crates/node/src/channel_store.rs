@@ -1240,16 +1240,18 @@ impl BlacklistEntryStore for PersistentChannelStateStore {
         })
     }
 
-    fn load_blacklist_origins(&self) -> Result<Vec<[u8; 20]>, StoreError> {
+    fn load_blacklist_origins(&self) -> Result<Option<Vec<[u8; 20]>>, StoreError> {
         let read_txn = self
             .db
             .begin_read()
             .map_err(|err| StoreError::Backend(format!("begin_read: {err}")))?;
-        // A never-written table is a cold start, not an error — same as the
-        // entry table above.
+        // A never-written table means the projection has never been built —
+        // reported as `None`, NOT as an empty set. Unlike the entry table this
+        // one is newer than the scan cursor, so "absent" and "empty" have
+        // opposite consequences: absent must force a replay, empty must not.
         let table = match read_txn.open_table(BLACKLIST_ORIGIN_TABLE) {
             Ok(t) => t,
-            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
             Err(err) => return Err(StoreError::Backend(format!("open_table: {err}"))),
         };
         let mut origins = Vec::new();
@@ -1260,7 +1262,7 @@ impl BlacklistEntryStore for PersistentChannelStateStore {
             let (key, _) = row.map_err(|err| StoreError::Backend(format!("row: {err}")))?;
             origins.push(*key.value());
         }
-        Ok(origins)
+        Ok(Some(origins))
     }
 
     fn insert_blacklist_origin(&self, origin: [u8; 20]) -> Result<(), StoreError> {

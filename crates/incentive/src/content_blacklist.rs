@@ -164,6 +164,19 @@ mod sol_types {
             /// one — it must scan the event tail on its own block-range cursor
             /// and reconcile against `isOriginBlacklisted` at boot.
             event OriginBlacklistUpdated(address indexed origin, bool blacklisted);
+
+            /// Governance blacklisted an OPERATOR address (`addOperator`), which
+            /// also ejects it from `CapacityBond`. This is a SECOND, independent
+            /// origin-level list: `addOperator` writes `isOperatorBlacklisted`
+            /// and never touches `_isOriginBlacklisted`, so a consumer that
+            /// watches only `OriginBlacklistUpdated` misses the primary
+            /// governance path entirely. `OriginAssignment` treats the two as a
+            /// union (`isOriginBlacklisted(op) || isOperatorBlacklisted(op)`);
+            /// so must the node.
+            event OperatorBlacklisted(address indexed operator);
+
+            /// `removeOperator` — the inverse of `OperatorBlacklisted`.
+            event OperatorBlacklistCleared(address indexed operator);
         }
     }
 }

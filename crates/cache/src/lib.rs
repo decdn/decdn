@@ -50,10 +50,15 @@ pub use probe_hold::{
 // keep resolving unchanged. `decdn_config_types::Hash` is intentionally
 // NOT re-exported as `decdn_cache::Hash` — that name stays the store
 // hash above.
+/// The config-vocabulary hash type (`decdn_config_types::Hash`), re-exported so
+/// callers can build a [`DeniedHashes`] / [`PinnedHashes`] without taking a
+/// direct dependency on the leaf crate. Distinct from [`struct@Hash`], which is
+/// the iroh-blobs store hash — see the `hash_bridge` conversions.
+pub use decdn_config_types::Hash as LeafHash;
 pub use decdn_config_types::{
     Bytes, CircuitBreakerPolicy, DEFAULT_MAX_PROBE_HOLDS, DEFAULT_USER_AGENT, DecompressMode,
-    HashParseError, OriginKind, OriginUrl, Percent, PinDiff, PinnedHashes, RetryPolicy,
-    parse_origin_url, redact_for_log,
+    DeniedHashes, HashParseError, OriginKind, OriginUrl, Percent, PinDiff, PinnedHashes,
+    RetryPolicy, parse_origin_url, redact_for_log,
 };
 
 /// Convert a config-vocabulary [`decdn_config_types::Hash`] into the

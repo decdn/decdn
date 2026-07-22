@@ -347,7 +347,7 @@ pub async fn run_republish(
 /// operator-evict already removed from the local store.
 async fn cache_still_holds(cache: &decdn_cache::CacheEngine, hash: &ContentHash) -> bool {
     let h = iroh_blobs::Hash::from_bytes(*hash.as_bytes());
-    if cache.is_evicted(h) {
+    if cache.refuses(h) {
         return false;
     }
     cache.has(h).await.unwrap_or(false)

@@ -23,7 +23,7 @@ use iroh_blobs::store::{GcConfig, ProtectOutcome};
 use iroh_blobs::util::{RecvStream, RecvStreamAsyncStreamReader};
 use tokio::sync::{Notify, broadcast};
 
-use decdn_config_types::{CircuitBreakerPolicy, PinDiff, PinnedHashes, RetryPolicy};
+use decdn_config_types::{CircuitBreakerPolicy, DeniedHashes, PinDiff, PinnedHashes, RetryPolicy};
 
 use crate::circuit_breaker::{
     Admission, Clock, OriginBreaker, OriginOutcome, SystemClock, TrialGuard,
@@ -92,6 +92,25 @@ struct Inner {
     /// takedown, full stop. The pin just keeps the hash off the LRU
     /// candidate list.
     pinned: ArcSwap<HashSet<Hash>>,
+    /// Hashes this node refuses to serve, announce, or acquire, and which a
+    /// later config reload can UN-refuse (ADR 011 § Local Denylist and the
+    /// governance blacklist).
+    ///
+    /// Distinct from [`Self::evicted`] on exactly one axis: reversibility.
+    /// Eviction is a durable, sticky operator act recorded in `evicted.log`;
+    /// this set is a live policy view swapped wholesale from the current
+    /// denylist. A wrongful takedown must be reversible without editing a log
+    /// file and restarting, and ADR 011 § One-hour removal orders puts this
+    /// mechanism on a statutory clock in both directions.
+    ///
+    /// It lives HERE rather than beside the origin deny-set in `decdn-node`
+    /// because "will this node serve/announce/acquire `hash`" has four
+    /// consumers — the serve path, `try_probe_hold`, the DHT republisher, and
+    /// `populate` — and the ADR requires one answer for all of them. Keeping it
+    /// next to `evicted` is what lets [`CacheEngine::refuses`] be the single
+    /// predicate they all call, so a fifth consumer inherits the check instead
+    /// of forgetting it.
+    denied: ArcSwap<HashSet<Hash>>,
     /// Hashes the operator has explicitly evicted via [`CacheEngine::evict`]
     /// (issue #279). Membership is honored by [`CacheEngine::has`] and
     /// [`CacheEngine::get`] so an evicted blob is not served, even though
@@ -829,6 +848,7 @@ impl CacheEngine {
                         .map(|h| to_store_hash(*h))
                         .collect::<HashSet<Hash>>(),
                 )),
+                denied: ArcSwap::from(Arc::new(HashSet::new())),
                 evicted: Mutex::new(evicted),
                 probe_holds: Mutex::new(HashMap::new()),
                 max_probe_holds: AtomicUsize::new(crate::probe_hold::DEFAULT_MAX_PROBE_HOLDS),
@@ -927,6 +947,45 @@ impl CacheEngine {
         self.inner.pinned.load().contains(&hash)
     }
 
+    /// Swap in the live denied set (ADR 011). Returns the delta for the reload
+    /// log line, same shape as [`Self::set_pinned`].
+    ///
+    /// Wholesale replacement, not a merge: removing an entry from the denylist
+    /// and reloading must un-deny it.
+    pub fn set_denied(&self, new: &DeniedHashes) -> PinDiff {
+        let new_arc = Arc::new(
+            new.iter()
+                .map(|h| to_store_hash(*h))
+                .collect::<HashSet<Hash>>(),
+        );
+        let prev_arc = self.inner.denied.swap(Arc::clone(&new_arc));
+        let added = new_arc.difference(&prev_arc).count();
+        let removed = prev_arc.difference(&new_arc).count();
+        PinDiff { added, removed }
+    }
+
+    /// Is `hash` on the live denied set? Cheap O(1) lookup.
+    ///
+    /// Prefer [`Self::refuses`] unless you specifically need to tell a denial
+    /// apart from an eviction — the serve path does, to pick the right refusal
+    /// code and metric; nothing else should care.
+    pub fn is_denied(&self, hash: Hash) -> bool {
+        self.inner.denied.load().contains(&hash)
+    }
+
+    /// Does this node refuse to serve, announce, or acquire `hash`?
+    ///
+    /// The single predicate every "should I expose this blob" decision must
+    /// call. `is_evicted` alone is NOT sufficient and using it directly is the
+    /// bug this exists to prevent: a denied-but-still-held hash would keep
+    /// being probe-answered `has_blob: true` and DHT-republished while the
+    /// serve path refused it — which under ADR 005 § Probe response is exactly
+    /// the signed evidence pair that makes the operator slashable for a
+    /// takedown they were discharging.
+    pub fn refuses(&self, hash: Hash) -> bool {
+        self.is_denied(hash) || self.is_evicted(hash)
+    }
+
     /// Is this blob already present in the local store?
     ///
     /// Returns `Ok(false)` when the hash has been logically evicted (issue
@@ -934,7 +993,7 @@ impl CacheEngine {
     /// who call `evict` expect the node to stop serving immediately, so
     /// `has` reports the blob as absent.
     pub async fn has(&self, hash: Hash) -> CacheResult<bool> {
-        if self.is_evicted(hash) {
+        if self.refuses(hash) {
             return Ok(false);
         }
         self.inner
@@ -1287,9 +1346,9 @@ impl CacheEngine {
 
         // Fast path for popular re-probed blobs: a live hold already exists.
         // O(1), no sweep. Still re-check the takedown set under the lock so a
-        // refresh can't resurrect just-evicted content.
+        // refresh can't resurrect just-refused content.
         if guard.get(&hash).is_some_and(|exp| *exp > now) {
-            if self.is_evicted(hash) {
+            if self.refuses(hash) {
                 return Ok(ProbeHoldOutcome::Unavailable);
             }
             guard.insert(hash, expiry);
@@ -1298,9 +1357,12 @@ impl CacheEngine {
 
         // No live hold — sweep expired entries before consulting the budget.
         guard.retain(|_, exp| *exp > now);
-        // TOCTOU re-check: a concurrent `evict()` may have completed after
-        // the `has()` above. Under the lock, an evicted hash is never held.
-        if self.is_evicted(hash) {
+        // TOCTOU re-check: a concurrent `evict()` or denylist reload may have
+        // completed after the `has()` above. Under the lock, a refused hash is
+        // never held — a hold is what authorises signing `has_blob: true`, and
+        // signing that for a hash the serve path will refuse is the ADR 005
+        // phantom-announcement evidence pair.
+        if self.refuses(hash) {
             return Ok(ProbeHoldOutcome::Unavailable);
         }
         if guard.len() >= max {
@@ -1360,7 +1422,7 @@ impl CacheEngine {
         // sticky for the life of `<cache_dir>/evicted.log` — there is no
         // "unevict" path; an operator who needs to re-cache a previously
         // evicted hash hand-edits the log and restarts.
-        if self.is_evicted(hash) {
+        if self.refuses(hash) {
             if let Some(m) = &self.inner.metrics {
                 m.misses.inc();
             }
@@ -1467,7 +1529,7 @@ impl CacheEngine {
         }
         // Logical-eviction guard (#279): never re-pull a deliberately evicted
         // hash (mirrors `get`).
-        if self.is_evicted(hash) {
+        if self.refuses(hash) {
             if let Some(m) = &self.inner.metrics {
                 m.misses.inc();
             }
@@ -1581,7 +1643,7 @@ impl CacheEngine {
         // pull must not silently re-fetch the evicted span from the origin and
         // undo the eviction — exactly as `get` / `populate` refuse. The
         // eviction is sticky for the life of `<cache_dir>/evicted.log`.
-        if self.is_evicted(hash) {
+        if self.refuses(hash) {
             if let Some(m) = &self.inner.metrics {
                 m.misses.inc();
             }
@@ -1912,7 +1974,7 @@ impl CacheEngine {
         let mut out = Vec::new();
         while let Some(hash) = stream.next().await {
             let hash = hash.map_err(|e| CacheError::Store(anyhow::Error::from(e)))?;
-            if self.is_evicted(hash) {
+            if self.refuses(hash) {
                 continue;
             }
             let status = match blobs.status(hash).await {

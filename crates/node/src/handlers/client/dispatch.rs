@@ -186,13 +186,48 @@ impl ClientHandler {
         // statement about what is in the store, so it must be answered before
         // the store is asked.
         //
-        // Governance blacklist entries do not come through here: the blacklist
-        // watcher evicts them, and that refusal lands on the `is_evicted` arm.
-        // Both sign the same wire code, so the split is invisible to a client.
-        if self.content_deny.is_hash_denied(&req.hash) {
+        // Governance entries land here too: the blacklist watcher feeds the same
+        // set (as well as evicting, which reclaims the bytes). One set, one wire
+        // code — ADR 011 §StreamRequest Response requires that a client cannot
+        // tell a governance takedown from this operator's own denylist, and
+        // routing them through different refusals would have leaked exactly that.
+        // The operator-side metric split survives, since no client can read it.
+        if self.cache.is_denied(hash) {
             return self
                 .respond_error(&mut send, &req, ServeRejectReason::HashDenied)
                 .await;
+        }
+
+        // Origin-blacklist gate (ADR 011 §On Blacklist Event: "stops accepting
+        // any StreamRequest that presents a channel funded by that operator
+        // address"). `state.client` is that funding address — the same field the
+        // owner-mismatch gate further down reads.
+        //
+        // This must sit ABOVE the availability check, not after channel
+        // resolution: every cache-miss arm below `return`s its own refusal, so a
+        // gate placed downstream is simply never reached on a miss and the
+        // blacklisted funder gets `NotFound` instead. That is the one answer
+        // `wire_error`'s doc says must never be given here — a client told
+        // `NotFound` retries elsewhere and pays again, when in fact every node
+        // will refuse it. It also silently under-counted the operator's own
+        // compliance metric by the whole cache-miss fraction.
+        //
+        // Resolving the channel early is a `HashMap` lookup, so the cost is
+        // nil; `pull_authorized` keeps its own check as the spend-side backstop.
+        if let Some(channel) = self
+            .channels
+            .lock()
+            .await
+            .get(&ChannelId::from(req.channel_id))
+            .cloned()
+        {
+            let funder = channel.lock().await.state.client;
+            if self.content_deny.is_origin_denied(&funder) {
+                tracing::warn!(%funder, "refusing delivery on a channel funded by a blacklisted origin");
+                return self
+                    .respond_error(&mut send, &req, ServeRejectReason::OriginDenied)
+                    .await;
+            }
         }
 
         // Set by the origin-tier range pull-through below (#823) when a
@@ -481,26 +516,6 @@ impl ClientHandler {
                 .respond_error(&mut send, &req, ServeRejectReason::UnknownChannel)
                 .await;
         };
-
-        // Origin-blacklist gate (ADR 011 §On Blacklist Event: "stops accepting
-        // any StreamRequest that presents a channel funded by that operator
-        // address"). `state.client` is that funding address — the same field the
-        // owner-mismatch gate below reads.
-        //
-        // Placed before the owner-mismatch and cooperative-close gates so a
-        // blacklisted funder is refused whether or not the requester bothered to
-        // bind, and so the refusal names the real reason rather than collapsing
-        // into a `NotFound`. Serving is refused outright: unlike the miss
-        // reasons, this is not a condition that clears on retry.
-        {
-            let funder = channel.lock().await.state.client;
-            if self.content_deny.is_origin_denied(&funder) {
-                tracing::warn!(%channel_id, %funder, "refusing delivery on a channel funded by a blacklisted origin");
-                return self
-                    .respond_error(&mut send, &req, ServeRejectReason::OriginDenied)
-                    .await;
-            }
-        }
 
         // A channel with a signed cooperative-close waiver is being settled at
         // its final watermark — the node committed to serving no further bytes
