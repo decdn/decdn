@@ -176,6 +176,25 @@ impl ClientHandler {
 
         let hash = Hash::from_bytes(req.hash);
 
+        // Local-denylist gate (ADR 011 §Local Denylist, §On Blacklist Event
+        // step 2: "reject any new StreamRequest for the hash immediately").
+        //
+        // This sits ABOVE the availability check on purpose. `is_evicted` below
+        // is only consulted on the `Ok(false)` arm — it answers "we used to have
+        // this" — so a denylisted hash the node still HOLDS would sail straight
+        // past it into delivery. The denylist is a refusal to serve, not a
+        // statement about what is in the store, so it must be answered before
+        // the store is asked.
+        //
+        // Governance blacklist entries do not come through here: the blacklist
+        // watcher evicts them, and that refusal lands on the `is_evicted` arm.
+        // Both sign the same wire code, so the split is invisible to a client.
+        if self.content_deny.is_hash_denied(&req.hash) {
+            return self
+                .respond_error(&mut send, &req, ServeRejectReason::HashDenied)
+                .await;
+        }
+
         // Set by the origin-tier range pull-through below (#823) when a
         // bounded/offset cache-miss request was filled as a *partial* blob.
         // Carries the authoritative whole-blob size (from the origin size
@@ -462,6 +481,26 @@ impl ClientHandler {
                 .respond_error(&mut send, &req, ServeRejectReason::UnknownChannel)
                 .await;
         };
+
+        // Origin-blacklist gate (ADR 011 §On Blacklist Event: "stops accepting
+        // any StreamRequest that presents a channel funded by that operator
+        // address"). `state.client` is that funding address — the same field the
+        // owner-mismatch gate below reads.
+        //
+        // Placed before the owner-mismatch and cooperative-close gates so a
+        // blacklisted funder is refused whether or not the requester bothered to
+        // bind, and so the refusal names the real reason rather than collapsing
+        // into a `NotFound`. Serving is refused outright: unlike the miss
+        // reasons, this is not a condition that clears on retry.
+        {
+            let funder = channel.lock().await.state.client;
+            if self.content_deny.is_origin_denied(&funder) {
+                tracing::warn!(%channel_id, %funder, "refusing delivery on a channel funded by a blacklisted origin");
+                return self
+                    .respond_error(&mut send, &req, ServeRejectReason::OriginDenied)
+                    .await;
+            }
+        }
 
         // A channel with a signed cooperative-close waiver is being settled at
         // its final watermark — the node committed to serving no further bytes

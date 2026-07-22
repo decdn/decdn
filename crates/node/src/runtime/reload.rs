@@ -444,6 +444,83 @@ impl ReloadableSection for PinnedHashesSection {
     }
 }
 
+// ----- content ------------------------------------------------------------
+
+/// Reloadable `[content]` section — the ADR 011 local denylist.
+///
+/// Hot-reloadable is the whole point, not a convenience: ADR 011 §One-hour
+/// removal orders sizes this mechanism to the EU TCO one-hour clock, and a
+/// restart-only denylist would put a daemon bounce (dropping every in-flight
+/// paid stream) on the critical path of discharging a legal order.
+///
+/// Unlike the other sections there is no `attach_*` handle to be missing: the
+/// deny-set is constructed before the handler is, and both hold the same `Arc`.
+/// A swap is therefore always effective.
+struct ContentSection {
+    deny: Arc<crate::content_deny::ContentDenylist>,
+    buf: std::sync::Mutex<Option<decdn_common::config::ResolvedContent>>,
+}
+
+impl ReloadableSection for ContentSection {
+    fn name(&self) -> &'static str {
+        "content"
+    }
+    fn clear_buffer(&self) {
+        if let Ok(mut g) = self.buf.lock() {
+            *g = None;
+        }
+    }
+    fn resolve(&self, file: &FileConfig, bag: &mut ConfigErrorBag) {
+        // Same shape as the other sections: bag-push on parse failure, empty
+        // placeholder so later sections still run. `reload()`'s early return
+        // guarantees the placeholder never reaches swap — which matters more
+        // here than elsewhere, since swapping an empty placeholder would
+        // silently UN-deny everything the operator had denied.
+        let denied_hashes = bag
+            .try_with(
+                "content.denied_hashes",
+                decdn_common::config::parse_denied_hashes(
+                    file.content
+                        .as_ref()
+                        .and_then(|c| c.denied_hashes.as_deref()),
+                )
+                .context("invalid content.denied_hashes"),
+            )
+            .unwrap_or_default();
+        let denied_origins = bag
+            .try_with(
+                "content.denied_origins",
+                decdn_common::config::parse_denied_origins(
+                    file.content
+                        .as_ref()
+                        .and_then(|c| c.denied_origins.as_deref()),
+                )
+                .context("invalid content.denied_origins"),
+            )
+            .unwrap_or_default();
+        if let Ok(mut g) = self.buf.lock() {
+            *g = Some(decdn_common::config::ResolvedContent {
+                denied_hashes,
+                denied_origins,
+            });
+        }
+    }
+    fn infallible_swap(&self) {
+        let Some(resolved) = drain_or_log(&self.buf, self.name()) else {
+            return;
+        };
+        let (diff, denied_origins) = self.deny.set_local(&resolved);
+        tracing::info!(
+            section = self.name(),
+            denied_hashes = resolved.denied_hashes.len(),
+            denied_hashes_added = diff.added,
+            denied_hashes_removed = diff.removed,
+            denied_origins,
+            "config reload section applied"
+        );
+    }
+}
+
 // ----- security -----------------------------------------------------------
 
 /// Reloadable `[security]` section.
@@ -519,10 +596,14 @@ pub struct RuntimeReloadState {
     log_level: Arc<LogLevelSection>,
     pinned: Arc<PinnedHashesSection>,
     security: Arc<SecuritySection>,
+    content: Arc<ContentSection>,
     /// Iteration order for the three-phase reload. Matches the order
     /// the previous monolithic body used (`payment`, `log_level`,
     /// `pinned_hashes`, `security`) so the user-visible commit ordering
-    /// across sections doesn't shift behind the refactor.
+    /// across sections doesn't shift behind the refactor. `content` is
+    /// appended after them — it is new, so no prior ordering to preserve,
+    /// and it commits last because it has no `attach_*` dependency that
+    /// could make an earlier position matter.
     sections: Vec<Arc<dyn ReloadableSection>>,
     /// Serialises concurrent reloads. A SIGHUP racing an `admin_v1_reload`
     /// (both call [`Self::reload`]) waits here so the two-phase commit of
@@ -586,6 +667,10 @@ impl RuntimeReloadState {
             limiter: std::sync::Mutex::new(None),
             buf: std::sync::Mutex::new(None),
         });
+        let content = Arc::new(ContentSection {
+            deny: Arc::new(crate::content_deny::ContentDenylist::new(&initial.content)),
+            buf: std::sync::Mutex::new(None),
+        });
         // Registration order is the same as the old monolithic body's
         // commit order: payment, log_level, pinned_hashes, security.
         // The order matters for reproducibility (operator-visible
@@ -598,12 +683,14 @@ impl RuntimeReloadState {
             Arc::clone(&log_level) as _,
             Arc::clone(&pinned) as _,
             Arc::clone(&security) as _,
+            Arc::clone(&content) as _,
         ];
         Self {
             payment,
             log_level,
             pinned,
             security,
+            content,
             sections,
             reload_lock: std::sync::Mutex::new(()),
         }
@@ -624,6 +711,16 @@ impl RuntimeReloadState {
     /// (non-reload-driven) live path.
     pub fn attach_cache(&self, engine: Option<decdn_cache::CacheEngine>) {
         attach_engine_to_section(&self.pinned.engine, engine, "pinned_hashes");
+    }
+
+    /// The live ADR 011 deny-set, for wiring into the client handler.
+    ///
+    /// Deliberately a getter rather than an `attach_*`: the deny-set is owned
+    /// here and shared out, so there is no window in which the handler holds a
+    /// deny-set the reload path cannot reach. The `attach_*` pattern exists for
+    /// handles built *after* this state; this one is built *with* it.
+    pub fn content_denylist(&self) -> Arc<crate::content_deny::ContentDenylist> {
+        Arc::clone(&self.content.deny)
     }
 
     /// Attach the live `ConnectionLimiter` after it's been built. Same
@@ -774,6 +871,7 @@ impl RuntimeReloadState {
             probe: decdn_common::config::ResolvedProbe::default(),
             receipts: decdn_common::config::ResolvedReceipts::default(),
             prefetch: decdn_common::config::ResolvedPrefetch::default(),
+            content: decdn_common::config::ResolvedContent::default(),
         };
         Self::new(
             decdn_common::cli::run::PaymentArgs {
@@ -1282,6 +1380,7 @@ mod tests {
             dht: decdn_common::config::ResolvedDht::default(),
             probe: decdn_common::config::ResolvedProbe::default(),
             prefetch: decdn_common::config::ResolvedPrefetch::default(),
+            content: decdn_common::config::ResolvedContent::default(),
         }
     }
 
@@ -1730,6 +1829,133 @@ mod tests {
 
         assert_eq!(state.rate_per_mb().load(Ordering::Relaxed), 42);
         assert!(captured.lock().unwrap().is_none());
+    }
+
+    // ----- content denylist hot-reload (ADR 011 §Local Denylist, #1168) -----
+
+    fn denylist_state(initial: &decdn_common::config::ResolvedConfig) -> RuntimeReloadState {
+        RuntimeReloadState::new(
+            PaymentArgs {
+                rate_per_mb: None,
+                delivery_floor: None,
+                delivery_ceiling: None,
+            },
+            ObservabilityArgs {
+                log_level: None,
+                log_format: None,
+                metrics_port: None,
+                metrics_bind: None,
+                admin_port: None,
+                otlp_endpoint: None,
+            },
+            initial,
+            recording_setter().0,
+        )
+    }
+
+    /// The point of making `[content]` reloadable: an operator discharging a
+    /// one-hour removal order must not have to bounce the daemon (dropping
+    /// every in-flight paid stream) to do it.
+    #[tokio::test]
+    async fn reload_applies_content_denylist_without_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = make_hex_hash(7);
+        let origin = "0x000000000000000000000000000000000000dEaD";
+        let path = write_config(
+            dir.path(),
+            &format!("[content]\ndenied_hashes = [\"{h}\"]\ndenied_origins = [\"{origin}\"]\n"),
+        );
+
+        let initial = seed_resolved(10, LogLevel::Info);
+        let state = denylist_state(&initial);
+        let deny = state.content_denylist();
+
+        let mut bytes = [0u8; 32];
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = u8::try_from(i).unwrap_or(0).wrapping_add(7);
+        }
+        assert!(!deny.is_hash_denied(&bytes), "nothing denied before reload");
+
+        state.reload(&path).await.expect("reload succeeds");
+
+        assert!(deny.is_hash_denied(&bytes), "hash denied after reload");
+        assert!(
+            deny.is_origin_denied(&origin.parse().unwrap()),
+            "origin denied after reload"
+        );
+    }
+
+    /// The handler holds the same `Arc` the reload path swaps, so a reload is
+    /// effective without rebuilding the handler. If these ever diverged the
+    /// denylist would silently stop applying to live connections.
+    #[tokio::test]
+    async fn content_denylist_handle_is_shared_not_copied() {
+        let initial = seed_resolved(10, LogLevel::Info);
+        let state = denylist_state(&initial);
+        assert!(
+            Arc::ptr_eq(&state.content_denylist(), &state.content_denylist()),
+            "every caller must get the same deny-set"
+        );
+    }
+
+    /// A malformed entry must fail the whole reload rather than committing a
+    /// partial (or empty) denylist — un-denying content mid-takedown is the
+    /// failure mode the two-phase commit exists to prevent.
+    #[tokio::test]
+    async fn reload_rejects_malformed_denied_hash_and_keeps_prior_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = make_hex_hash(7);
+        let good = write_config(
+            dir.path(),
+            &format!("[content]\ndenied_hashes = [\"{h}\"]\n"),
+        );
+        let initial = seed_resolved(10, LogLevel::Info);
+        let state = denylist_state(&initial);
+        let deny = state.content_denylist();
+        state.reload(&good).await.expect("first reload succeeds");
+
+        let bad = dir.path().join("bad.toml");
+        std::fs::write(&bad, "[content]\ndenied_hashes = [\"zzz-not-hex\"]\n").unwrap();
+        let err = state.reload(&bad).await.expect_err("malformed entry fails");
+        assert!(
+            format!("{err:#}").contains("denied_hashes"),
+            "error names the field: {err:#}"
+        );
+
+        let mut bytes = [0u8; 32];
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = u8::try_from(i).unwrap_or(0).wrapping_add(7);
+        }
+        assert!(
+            deny.is_hash_denied(&bytes),
+            "the prior denylist must survive a failed reload"
+        );
+    }
+
+    /// Emptying the section un-denies — the operator's own lever works in both
+    /// directions (a wrongful takedown must be reversible without a restart too).
+    #[tokio::test]
+    async fn reload_clears_content_denylist_when_emptied() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = make_hex_hash(7);
+        let with = write_config(
+            dir.path(),
+            &format!("[content]\ndenied_hashes = [\"{h}\"]\n"),
+        );
+        let initial = seed_resolved(10, LogLevel::Info);
+        let state = denylist_state(&initial);
+        let deny = state.content_denylist();
+        state.reload(&with).await.unwrap();
+
+        let without = dir.path().join("empty.toml");
+        std::fs::write(&without, "[content]\n").unwrap();
+        state.reload(&without).await.unwrap();
+
+        let mut bytes = [0u8; 32];
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = u8::try_from(i).unwrap_or(0).wrapping_add(7);
+        }
+        assert!(!deny.is_hash_denied(&bytes), "denylist cleared");
     }
 
     // ----- pinned_hashes hot-reload (#276) -----

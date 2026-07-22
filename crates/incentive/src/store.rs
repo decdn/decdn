@@ -317,6 +317,40 @@ pub trait BlacklistEntryStore: Send + Sync {
     ///
     /// Returns a [`StoreError`] if the durable write fails.
     fn remove_blacklist_hash(&self, hash: [u8; 32]) -> Result<(), StoreError>;
+
+    /// Every persisted blacklisted origin/operator address, for rebuilding the
+    /// in-memory origin deny-set on boot (ADR 011 § Hash Evasion and Origin
+    /// Blacklisting).
+    ///
+    /// This carries the SAME durability requirement as the hash entries above,
+    /// for a sharper reason. `OriginBlacklistUpdated` is deliberately outside
+    /// the `getBlacklistVersion()` mechanism (ADR 011 § Polling) — it carries no
+    /// version, so there is no counter a consumer could compare against to
+    /// notice it missed one, and no `isOriginBlacklisted` sweep is possible
+    /// because nothing enumerates the blacklisted set on-chain. The event tail
+    /// is the only source, and the watcher's cursor is persisted; without a
+    /// durable projection, a resumed boot scans past those logs and the deny-set
+    /// silently comes back EMPTY. That fails open on a takedown gate.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`StoreError`] if the backing store is unreadable.
+    fn load_blacklist_origins(&self) -> Result<Vec<[u8; 20]>, StoreError>;
+
+    /// Record one blacklisted origin address. Idempotent.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`StoreError`] if the durable write fails. The caller MUST NOT
+    /// advance its scan cursor past the log that produced this entry.
+    fn insert_blacklist_origin(&self, origin: [u8; 20]) -> Result<(), StoreError>;
+
+    /// Drop one blacklisted origin address. Idempotent.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`StoreError`] if the durable write fails.
+    fn remove_blacklist_origin(&self, origin: [u8; 20]) -> Result<(), StoreError>;
 }
 
 /// Failure modes shared by every [`ChannelStateStore`] implementation.

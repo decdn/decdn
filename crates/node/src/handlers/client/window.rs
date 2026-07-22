@@ -50,6 +50,13 @@ impl ClientHandler {
         tee: TeeReservation,
         fault_seen: bool,
     ) -> anyhow::Result<()> {
+        // ADR 011 deny gates are already discharged on the only path that
+        // reaches here: `serve_stream` refuses a denylisted hash before the
+        // availability check, and this branch is entered only behind
+        // `pull_authorized`, which refuses a blacklisted funding origin. Keep it
+        // that way — if this function ever gains a second caller, that caller
+        // owes both checks, because this is a spend-and-serve path.
+        //
         // Resolve the owning channel (existence + ownership already proven by
         // `pull_authorized`) — needed for the deposit guard and the downstream
         // voucher collection.

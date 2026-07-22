@@ -232,7 +232,84 @@ impl Default for PinnedHashes {
     }
 }
 
-/// Cheap diff of two [`PinnedHashes`] snapshots, for the reload log line.
+/// Operator-denied blob hashes — the local denylist from ADR 011 §Local
+/// Denylist (`[content] denied_hashes`). A hash here is refused at the delivery
+/// path immediately and ungossiped, whether or not the node holds it.
+///
+/// This is the "future blocklist" [`PinnedHashes`] warns about, and it is a
+/// distinct nominal type for exactly that reason: the two are both
+/// `HashSet<Hash>` and mean opposite things, so a mix-up would silently pin the
+/// content an operator was ordered to remove. There is deliberately no
+/// conversion between them.
+///
+/// Held as `Arc<HashSet<Hash>>` so the reload path can swap the active set
+/// without cloning.
+#[derive(Debug, Clone)]
+pub struct DeniedHashes(Arc<HashSet<Hash>>);
+
+impl DeniedHashes {
+    /// Build a [`DeniedHashes`] from a freshly parsed set.
+    #[must_use]
+    pub fn new(set: HashSet<Hash>) -> Self {
+        Self(Arc::new(set))
+    }
+
+    /// The empty denylist.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self(Arc::new(HashSet::new()))
+    }
+
+    /// Number of denied hashes.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Is the denylist empty?
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Is `hash` denied?
+    #[must_use]
+    pub fn contains(&self, hash: &Hash) -> bool {
+        self.0.contains(hash)
+    }
+
+    /// Iterate over the denied hashes.
+    pub fn iter(&self) -> Iter<'_, Hash> {
+        self.0.iter()
+    }
+
+    /// Additions / removals between `prev` (older snapshot) and `self` (newer),
+    /// for the reload log line — same rationale as [`PinnedHashes::diff`].
+    #[must_use]
+    pub fn diff(&self, prev: &Self) -> PinDiff {
+        let added = self.0.iter().filter(|h| !prev.0.contains(*h)).count();
+        let removed = prev.0.iter().filter(|h| !self.0.contains(*h)).count();
+        PinDiff { added, removed }
+    }
+}
+
+impl<'a> IntoIterator for &'a DeniedHashes {
+    type Item = &'a Hash;
+    type IntoIter = Iter<'a, Hash>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
+impl Default for DeniedHashes {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+/// Cheap diff of two hash-set snapshots ([`PinnedHashes`] or
+/// [`DeniedHashes`]), for the reload log line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PinDiff {
     /// Number of hashes present in the new set but not the old.

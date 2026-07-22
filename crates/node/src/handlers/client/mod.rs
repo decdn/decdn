@@ -491,6 +491,11 @@ enum ServeRejectReason {
     UnauthorizedOrigin,
     CooperativeCloseSigned,
     RangeNotSatisfiable,
+    /// The blob is on this operator's local denylist (ADR 011 §Local Denylist).
+    HashDenied,
+    /// The channel's funding address is on the origin blacklist — the operator's
+    /// local `denied_origins` or the on-chain one (ADR 011 §On Blacklist Event).
+    OriginDenied,
 }
 
 impl ServeRejectReason {
@@ -535,6 +540,20 @@ impl ServeRejectReason {
             Self::EvictedSinceProbe => StreamError::EvictedSinceProbe,
             Self::InternalError => StreamError::InternalError,
             Self::BlobTooLarge => StreamError::BlobTooLarge,
+            // The two takedown refusals do NOT collapse to `NotFound`. ADR 011
+            // §`StreamRequest` Response names distinct codes because the retry
+            // advice differs and a miss-shaped answer would be actively
+            // misleading: a client told `NotFound` retries elsewhere and pays
+            // again, when for `OriginBlacklisted` every node will refuse it.
+            //
+            // They are still each other's privacy floor. `HashBlacklisted` does
+            // not say whether the entry is governance or local — that is the ADR's
+            // explicit requirement, since a client able to tell them apart could
+            // map an operator's private legal exposure by probing. And neither
+            // says anything about a channel's balance, which is what the
+            // `NotFound` collapse above exists to protect.
+            Self::HashDenied => StreamError::HashBlacklisted,
+            Self::OriginDenied => StreamError::OriginBlacklisted,
         }
     }
 }
@@ -650,6 +669,14 @@ pub struct ClientHandlerDeps {
     pub voucher_interval_mb: u64,
     pub max_blob_size_bytes: u64,
     pub max_concurrent_streams: usize,
+    /// Live content deny-set (ADR 011): the operator's local denylist unioned
+    /// with the on-chain origin blacklist. NOT an `Option`, unlike the wiring
+    /// hooks below — an empty deny-set is a correct steady state (most operators
+    /// deny nothing), so there is no "unwired" case to represent, and an
+    /// `Option` would only add a way to fail open on a takedown gate.
+    /// [`ClientHandlerDeps::new`] seeds it empty; the runtime overwrites it with
+    /// the resolved one.
+    pub content_deny: Arc<crate::content_deny::ContentDenylist>,
     // Optional wiring — `None` unless the deployment enables the feature.
     pub redeem_hint: Option<mpsc::Sender<ChannelId>>,
     pub voucher_activity: Option<Arc<VoucherActivity>>,
@@ -715,6 +742,7 @@ impl ClientHandlerDeps {
             voucher_interval_mb,
             max_blob_size_bytes,
             max_concurrent_streams,
+            content_deny: Arc::new(crate::content_deny::ContentDenylist::empty()),
             redeem_hint: None,
             voucher_activity: None,
             region_accountant: None,
@@ -843,6 +871,15 @@ pub struct ClientHandler {
     /// / default-open (`namespaceId == 0`) / fail-closed-on-RPC-loss semantics
     /// are identical.
     pull_origin_gate: Option<Arc<dyn OriginDirectory>>,
+    /// Live content deny-set (ADR 011). Consulted at three points, all of which
+    /// must gate or the check is bypassable: the hash gate above the
+    /// availability check in `serve_stream`, the origin gate right after channel
+    /// resolution, and the same origin gate inside `pull_authorized` — that last
+    /// one runs EARLIEST and decides whether to front upstream USDC egress, so
+    /// omitting it would have this node pay on a blacklisted origin's behalf
+    /// before ever reaching the serve refusal. The window-paced serve path
+    /// (`window.rs`) is a fourth, independent ladder.
+    pub(crate) content_deny: Arc<crate::content_deny::ContentDenylist>,
     /// Speculative-prefetch engine (#820), set at construction via
     /// [`ClientHandlerDeps`]. `None` in tests / when prefetch is off. When
     /// `Some`, the serve path credits bytes served from prefetch-acquired blobs
@@ -926,6 +963,7 @@ impl ClientHandler {
             pull_ahead_bytes: deps.pull_ahead_bytes,
             leech_governor: deps.leech_governor,
             pull_origin_gate: deps.pull_origin_gate,
+            content_deny: deps.content_deny,
             prefetch_engine: deps.prefetch_engine,
             rate_per_mb: deps.rate_per_mb,
             rate_bounds: deps.rate_bounds,
@@ -1632,6 +1670,51 @@ mod tests {
         assert!(
             encoded.contains("decdn_node_pull_through_background_succeeded_total 1"),
             "…and must record the verdict it was given. Got:\n{encoded}"
+        );
+    }
+
+    /// ADR 011 §`StreamRequest` Response names distinct refusal codes for the two
+    /// takedown reasons. They must NOT join the seven-reason `NotFound` collapse:
+    /// a client told `NotFound` retries elsewhere and pays again, which for
+    /// `OriginBlacklisted` is advice that can never succeed.
+    #[test]
+    fn takedown_reject_reasons_do_not_collapse_to_not_found() {
+        assert_eq!(
+            ServeRejectReason::HashDenied.wire_error(),
+            decdn_protocol::StreamError::HashBlacklisted
+        );
+        assert_eq!(
+            ServeRejectReason::OriginDenied.wire_error(),
+            decdn_protocol::StreamError::OriginBlacklisted
+        );
+        // The collapse itself is unchanged — it is a privacy property, not an
+        // oversight, and widening it was never the point of #1179.
+        for reason in [
+            ServeRejectReason::CacheMiss,
+            ServeRejectReason::UnknownChannel,
+            ServeRejectReason::OwnerMismatch,
+            ServeRejectReason::InsufficientDeposit,
+            ServeRejectReason::UnauthorizedOrigin,
+            ServeRejectReason::CooperativeCloseSigned,
+            ServeRejectReason::RangeNotSatisfiable,
+        ] {
+            assert_eq!(
+                reason.wire_error(),
+                decdn_protocol::StreamError::NotFound,
+                "{reason:?} must stay wire-indistinguishable"
+            );
+        }
+    }
+
+    /// A local denylist hit and a governance eviction must be indistinguishable
+    /// at the *reason* level too — they differ (`HashDenied` vs
+    /// `EvictedSinceProbe`) only so the operator's own metrics can tell them
+    /// apart, which a client cannot read.
+    #[test]
+    fn local_denylist_and_eviction_are_distinct_reasons() {
+        assert_ne!(
+            ServeRejectReason::HashDenied.wire_error(),
+            ServeRejectReason::EvictedSinceProbe.wire_error()
         );
     }
 

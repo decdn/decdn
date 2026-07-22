@@ -42,6 +42,9 @@ pub struct FileConfig {
     /// Speculative-prefetch operator policy (ADR 022 §Prefetch Decision).
     /// Absent => prefetch disabled with the ADR's recommended defaults.
     pub prefetch: Option<PrefetchConfig>,
+    /// Local content denylist (ADR 011 §Local Denylist). Absent => both lists
+    /// empty; nothing is denied locally.
+    pub content: Option<ContentConfig>,
 }
 
 /// Identity section of the config file.
@@ -1083,4 +1086,24 @@ pub struct PrefetchConfig {
     /// Wall-clock deadline (seconds) for a single prefetch acquisition's
     /// pull-through (#820). Absent => `30`. Must be `> 0`.
     pub acquisition_timeout_secs: Option<u64>,
+}
+
+/// Local content-denylist section of the config file (ADR 011 §Local Denylist).
+///
+/// The operator's own removal lever, independent of governance: entries take
+/// effect on the next reload, are never gossiped, and bind only this node. ADR
+/// 011 §One-hour removal orders makes this the only mechanism sized to a
+/// sub-day statutory deadline (the EU TCO one-hour clock), because it is the
+/// only one entirely within the order recipient's control.
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContentConfig {
+    /// Blob hashes this node refuses to serve. Bare 64-character lowercase hex,
+    /// the same spelling as `cache.pinned_hashes` — an invalid or duplicate
+    /// entry fails resolution rather than being skipped, so a typo in a
+    /// takedown cannot silently leave content served.
+    pub denied_hashes: Option<Vec<String>>,
+    /// Operator addresses whose payment channels this node refuses to serve.
+    /// EIP-55 or lowercase `0x`-prefixed hex; the zero address is rejected.
+    pub denied_origins: Option<Vec<String>>,
 }

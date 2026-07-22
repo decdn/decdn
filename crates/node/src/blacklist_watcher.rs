@@ -68,6 +68,25 @@
 //! `evict` is sticky and works on absent hashes, so a hash blacklisted while the
 //! node was offline (and not yet held) is still pre-blocked.
 //!
+//! **Origin blacklisting (ADR 011 § Hash Evasion and Origin Blacklisting).**
+//! `OriginBlacklistUpdated` rides the same scan and feeds
+//! [`crate::content_deny::ContentDenylist`], which the delivery path consults to
+//! refuse any `StreamRequest` funded by a blacklisted operator address. This
+//! half has *weaker* primitives than the hash half and the difference matters:
+//! the event carries no `version`, so there is no counter that would reveal a
+//! missed one, and `ContentBlacklist` exposes no enumeration of the blacklisted
+//! set, so there is no sweep to reconcile against either. The durable origin
+//! projection is therefore the entire guarantee — with the cursor persisted, a
+//! resumed boot that could not reload it would come up with an EMPTY deny-set
+//! and serve a blacklisted origin. Hence the same durable-write-before-cursor
+//! ordering, and the same replay-from-floor fallback on an unreadable store.
+//!
+//! On a blacklisting the operator's registered `NodeId` is also dropped from the
+//! local peer table. That removal is best-effort (it needs a `nodeIdOf` read)
+//! and is *advisory*: it stops us selecting the peer, while the deny-set is what
+//! stops us serving it. It is also not durable on its own — see
+//! `WatcherState::drop_origin_peer` for which re-entry paths are closed.
+//!
 //! **Resilience.** The re-scope pass runs on the operator's rescan cadence
 //! (checked at the end of every poll tick), pulled forward to the poll cadence
 //! whenever a live re-check or a re-scope pass fails — an enforcement failure
@@ -89,12 +108,14 @@ use alloy::sol_types::SolEvent;
 use anyhow::{Context as _, Result};
 use decdn_cache::{CacheEngine, Hash};
 use decdn_common::redact::sanitize_err_chain;
+use decdn_gossip::PeerTable;
+use decdn_incentive::capacity_bond::CapacityBond;
 use decdn_incentive::content_blacklist::ContentBlacklist;
 use decdn_incentive::content_blacklist::ContentBlacklist::{
-    HashBlacklisted, HashRemoved, HashSuspensionUpdated,
+    HashBlacklisted, HashRemoved, HashSuspensionUpdated, OriginBlacklistUpdated,
 };
 use decdn_incentive::store::{BlacklistEntryStore, CheckpointKey, KeyedCheckpointStore};
-use tokio::sync::oneshot;
+use tokio::sync::{RwLock, oneshot};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -104,6 +125,7 @@ use crate::chain_events::resumable_watcher::{
 };
 use crate::chain_events::shared_head::HeadSource;
 use crate::chain_events::{REORG_MARGIN_BLOCKS, timed};
+use crate::content_deny::ContentDenylist;
 use crate::metrics::{Metrics, metric_hook};
 
 /// Result reported exactly once when the first full replay + re-scope pass
@@ -139,7 +161,7 @@ impl InitialSyncGate {
 
 /// Mutable deny-set carried across poll ticks. The scan cursor lives on the
 /// resumable watcher; this holds only the re-scopable entry set.
-struct WatcherState {
+struct WatcherState<P: Provider + Clone> {
     /// Every blacklisted `(region, hash)` entry seen and not yet locally
     /// evicted — including out-of-scope and suspended entries — re-scoped on
     /// each `on_tick_complete` pass so a later region/ripening or appeal
@@ -155,9 +177,25 @@ struct WatcherState {
     /// failure propagates so the caller refuses to advance the cursor past the
     /// log that produced it.
     store: Arc<dyn BlacklistEntryStore>,
+    /// The live origin deny-set the delivery path reads (ADR 011 §On Blacklist
+    /// Event). Fed by `OriginBlacklistUpdated`, and restored from `store` on
+    /// boot — that restore is load-bearing, see
+    /// [`decdn_incentive::store::BlacklistEntryStore::load_blacklist_origins`]:
+    /// origin events carry no version, nothing enumerates the set on-chain, and
+    /// the scan cursor is persisted, so the durable projection is the only thing
+    /// standing between a restart and a silently empty gate.
+    denylist: Arc<ContentDenylist>,
+    /// `CapacityBond`, for resolving a blacklisted origin address to its
+    /// registered `NodeId` (ADR 011 § Hash Evasion and Origin Blacklisting: "the
+    /// operator's registered `NodeId` is excluded from peer tables"). The event
+    /// carries an address; the peer table is keyed by `NodeId`, and this contract
+    /// read is the only binding between them.
+    capacity_bond: CapacityBond::CapacityBondInstance<P>,
+    /// Local peer table, for that removal.
+    peer_table: Arc<RwLock<PeerTable>>,
 }
 
-impl WatcherState {
+impl<P: Provider + Clone> WatcherState<P> {
     /// Record a `HashBlacklisted(region, hash)` entry.
     ///
     /// Durable first: if the write fails the entry is *not* added to `known`,
@@ -201,6 +239,45 @@ impl WatcherState {
         self.known.retain(|(_, known_hash)| *known_hash != hash);
     }
 
+    /// Drop the blacklisted origin's registered `NodeId` from the local peer
+    /// table (ADR 011 § Hash Evasion and Origin Blacklisting).
+    ///
+    /// Best-effort by design — see `on_origin_log`. An operator with no
+    /// registered node (`nodeId == 0`) is a no-op, not a failure: an address can
+    /// be blacklisted before it ever registers.
+    ///
+    /// **This buys a gossip interval unless the peer is also barred from
+    /// re-entry.** `PeerTable::insert_or_refresh` re-admits on the next
+    /// announce. For the `addOperator` path that is already handled — operator
+    /// blacklisting calls `CapacityBond.ejectNode`, so the announce gate's
+    /// staked-node set stops recognising it. The origin-only path
+    /// (`setOriginBlacklist` / `emergencyAddOrigin`) does NOT eject, so a peer
+    /// blacklisted that way re-enters; the serving gate still refuses it, but it
+    /// stays selectable. Closing that needs an origin deny-set inside
+    /// `decdn_gossip`'s `AnnounceGate`.
+    async fn drop_origin_peer(&self, origin: Address) -> Recheck {
+        let node_id = match timed(None, "nodeIdOf", self.capacity_bond.nodeIdOf(origin).call())
+            .await
+        {
+            Ok(resolved) => resolved.nodeId,
+            Err(err) => {
+                warn!(
+                    %origin,
+                    err = %sanitize_err_chain(&err),
+                    "blacklist watcher: nodeIdOf failed for a blacklisted origin; peer-table entry not dropped"
+                );
+                return Recheck::Failed;
+            }
+        };
+        if node_id == B256::ZERO {
+            return Recheck::NoAction;
+        }
+        if self.peer_table.write().await.remove(&node_id.0) {
+            info!(%origin, %node_id, "blacklist watcher: dropped blacklisted origin from the peer table");
+        }
+        Recheck::NoAction
+    }
+
     /// Distinct hashes across all regions — the scope view
     /// (`isHashBlacklistedForOperator`) is per `(operator, hash)`, so each
     /// hash needs exactly one `eth_call` per pass regardless of how many
@@ -208,6 +285,30 @@ impl WatcherState {
     fn distinct_hashes(&self) -> Vec<Hash> {
         let unique: HashSet<Hash> = self.known.iter().map(|(_, hash)| *hash).collect();
         unique.into_iter().collect()
+    }
+
+    /// Apply an `OriginBlacklistUpdated(origin, blacklisted)` event.
+    ///
+    /// Durable first, exactly as [`Self::add_entry`]: a lost write while the
+    /// cursor advances is an origin the node never re-learns. `Err` aborts the
+    /// tick so the cursor stays put and the log is re-read.
+    ///
+    /// The removal direction is durable-first too, which is the conservative
+    /// order here — a failed delete leaves the address denied until the next
+    /// successful pass. Over-denying a de-listed origin is a service complaint;
+    /// under-denying a listed one is a compliance failure.
+    fn set_origin(&mut self, origin: Address, blacklisted: bool) -> Result<()> {
+        if blacklisted {
+            self.store
+                .insert_blacklist_origin(origin.into())
+                .context("persist blacklisted origin")?;
+        } else {
+            self.store
+                .remove_blacklist_origin(origin.into())
+                .context("delete blacklisted origin")?;
+        }
+        self.denylist.apply_chain_origin(origin, blacklisted);
+        Ok(())
     }
 }
 
@@ -223,7 +324,7 @@ struct BlacklistSink<P: Provider + Clone> {
     contract: ContentBlacklist::ContentBlacklistInstance<P>,
     operator: Address,
     cache: CacheEngine,
-    state: WatcherState,
+    state: WatcherState<P>,
     shutdown: CancellationToken,
     /// How often the batched full re-scope runs (the operator's
     /// `content_blacklist_poll_interval_sec`); the getLogs poll cadence itself is
@@ -363,11 +464,17 @@ pub(crate) fn spawn<P>(
     metrics: &Arc<Metrics>,
     entry_store: Arc<dyn BlacklistEntryStore>,
     checkpoint_store: Arc<dyn KeyedCheckpointStore>,
+    denylist: Arc<ContentDenylist>,
+    capacity_bond_addr: Address,
+    peer_table: Arc<RwLock<PeerTable>>,
 ) -> WatcherHandle
 where
     P: Provider + Clone + 'static,
 {
     let contract = ContentBlacklist::new(contract_addr, provider.clone());
+    // Only used to resolve a blacklisted origin address to its registered
+    // NodeId for peer-table removal — this watcher reads no other bond state.
+    let capacity_bond = CapacityBond::new(capacity_bond_addr, provider.clone());
     // Rebuild the retained deny-set from disk before the first tick. A read
     // failure is not fatal: an empty set plus the resumed cursor would under-
     // enforce, so fall back to replaying from `from_block`, which reconstructs
@@ -387,11 +494,29 @@ where
         .into_iter()
         .map(|(region, hash)| (B256::from(region), Hash::from_bytes(hash)))
         .collect();
+    // Same rebuild for the origin deny-set, and the same fallback: a read
+    // failure forces a replay from `from_block` rather than resuming on an empty
+    // set. Under-denying an origin means serving a blacklisted operator's
+    // channel, which is precisely what this gate exists to stop.
+    let (restored_origins, replay_floor) = match entry_store.load_blacklist_origins() {
+        Ok(rows) => (rows, replay_floor),
+        Err(err) => {
+            warn!(
+                err = %sanitize_err_chain(&err.into()),
+                "blacklist watcher: durable origin deny-set unreadable; replaying from the \
+                 deploy block to rebuild it rather than resuming on a partial set"
+            );
+            (Vec::new(), true)
+        }
+    };
+    let restored_origin_count = restored_origins.len();
+    denylist.set_chain_origins(restored_origins.into_iter().map(Address::from).collect());
     info!(
         %contract_addr,
         %operator,
         from_block,
         restored_entries = known.len(),
+        restored_origins = restored_origin_count,
         replay_floor,
         "blacklist compliance watcher starting"
     );
@@ -408,6 +533,12 @@ where
             HashBlacklisted::SIGNATURE_HASH,
             HashRemoved::SIGNATURE_HASH,
             HashSuspensionUpdated::SIGNATURE_HASH,
+            // Origin blacklisting rides the same scan (ADR 011 § Hash Evasion
+            // and Origin Blacklisting). It is deliberately outside the
+            // `getBlacklistVersion()` mechanism, so unlike the three hash
+            // events there is no counter to detect a missed one — the cursor
+            // plus the durable origin projection are the whole guarantee.
+            OriginBlacklistUpdated::SIGNATURE_HASH,
         ]),
         if replay_floor {
             CursorStart::FullReplay
@@ -453,6 +584,9 @@ where
         state: WatcherState {
             known: known.clone(),
             store: Arc::clone(&entry_store),
+            denylist: Arc::clone(&denylist),
+            capacity_bond: capacity_bond.clone(),
+            peer_table: Arc::clone(&peer_table),
         },
         shutdown: shutdown.clone(),
         rescan_interval: rescan_interval.max(Duration::from_secs(1)),
@@ -489,7 +623,7 @@ async fn rescan<P>(
     contract: &ContentBlacklist::ContentBlacklistInstance<P>,
     operator: Address,
     cache: &CacheEngine,
-    state: &mut WatcherState,
+    state: &mut WatcherState<P>,
     shutdown: &CancellationToken,
 ) -> RescanOutcome
 where
@@ -544,7 +678,7 @@ async fn handle_log<P>(
     contract: &ContentBlacklist::ContentBlacklistInstance<P>,
     operator: Address,
     cache: &CacheEngine,
-    state: &mut WatcherState,
+    state: &mut WatcherState<P>,
     log: Log,
 ) -> Result<bool>
 where
@@ -563,8 +697,45 @@ where
         Some(topic) if *topic == HashSuspensionUpdated::SIGNATURE_HASH => {
             Ok(on_suspension_log(contract, operator, cache, state, &log).await? == Recheck::Failed)
         }
+        Some(topic) if *topic == OriginBlacklistUpdated::SIGNATURE_HASH => {
+            Ok(on_origin_log(state, &log).await? == Recheck::Failed)
+        }
         _ => Ok(false),
     }
+}
+
+/// Decode an `OriginBlacklistUpdated` log, apply it to the origin deny-set, and
+/// — on a blacklisting — drop the operator's registered `NodeId` from the local
+/// peer table (ADR 011 § Hash Evasion and Origin Blacklisting).
+///
+/// Returns `Err` (aborting the tick, so the cursor does not advance) only if the
+/// durable deny-set write fails. An undecodable log is skipped per the `LogSink`
+/// contract, same as the hash events.
+///
+/// The peer-table removal is BEST-EFFORT and reported as [`Recheck::Failed`] on
+/// an RPC error, which pulls the next pass forward rather than aborting the
+/// tick. The ordering is deliberate: the deny-set write is the enforcement (it
+/// is what makes `serve_stream` refuse), while the peer-table removal only stops
+/// us *selecting* that peer. Letting a `nodeIdOf` blip roll back a durable
+/// deny-set write would trade the enforcing half for the advisory one.
+async fn on_origin_log<P>(state: &mut WatcherState<P>, log: &Log) -> Result<Recheck>
+where
+    P: Provider + Clone,
+{
+    let Ok(event) = OriginBlacklistUpdated::decode_log_data(&log.inner.data) else {
+        warn!("blacklist watcher: undecodable OriginBlacklistUpdated log");
+        return Ok(Recheck::NoAction);
+    };
+    state.set_origin(event.origin, event.blacklisted)?;
+    debug!(
+        origin = %event.origin,
+        blacklisted = event.blacklisted,
+        "blacklist watcher: origin blacklist updated"
+    );
+    if !event.blacklisted {
+        return Ok(Recheck::NoAction);
+    }
+    Ok(state.drop_origin_peer(event.origin).await)
 }
 
 /// Decode a `HashBlacklisted` log, record its `(region, hash)` entry, and
@@ -574,7 +745,7 @@ async fn on_blacklisted_log<P>(
     contract: &ContentBlacklist::ContentBlacklistInstance<P>,
     operator: Address,
     cache: &CacheEngine,
-    state: &mut WatcherState,
+    state: &mut WatcherState<P>,
     log: &Log,
 ) -> Result<Recheck>
 where
@@ -594,7 +765,7 @@ where
 }
 
 /// Decode a `HashRemoved` log and drop exactly that `(region, hash)` entry.
-fn on_removed_log(state: &mut WatcherState, log: &Log) -> Result<()> {
+fn on_removed_log<P: Provider + Clone>(state: &mut WatcherState<P>, log: &Log) -> Result<()> {
     match HashRemoved::decode_log_data(&log.inner.data) {
         Ok(event) => {
             let hash = Hash::from_bytes(event.hash.0);
@@ -630,7 +801,7 @@ async fn on_suspension_log<P>(
     contract: &ContentBlacklist::ContentBlacklistInstance<P>,
     operator: Address,
     cache: &CacheEngine,
-    state: &mut WatcherState,
+    state: &mut WatcherState<P>,
     log: &Log,
 ) -> Result<Recheck>
 where
@@ -686,7 +857,7 @@ async fn recheck<P>(
     contract: &ContentBlacklist::ContentBlacklistInstance<P>,
     operator: Address,
     cache: &CacheEngine,
-    state: &mut WatcherState,
+    state: &mut WatcherState<P>,
     hash: Hash,
 ) -> Recheck
 where
@@ -778,6 +949,7 @@ mod tests {
     #[derive(Default)]
     struct MemEntryStore {
         rows: Mutex<HashSet<([u8; 32], [u8; 32])>>,
+        origins: Mutex<HashSet<[u8; 20]>>,
         fail_writes: bool,
     }
 
@@ -785,8 +957,15 @@ mod tests {
         fn failing() -> Self {
             Self {
                 rows: Mutex::new(HashSet::new()),
+                origins: Mutex::new(HashSet::new()),
                 fail_writes: true,
             }
+        }
+
+        fn origin_guard(&self) -> std::sync::MutexGuard<'_, HashSet<[u8; 20]>> {
+            self.origins
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
         }
 
         fn guard(&self) -> std::sync::MutexGuard<'_, HashSet<([u8; 32], [u8; 32])>> {
@@ -840,6 +1019,30 @@ mod tests {
             self.guard().retain(|(_, row_hash)| *row_hash != hash);
             Ok(())
         }
+
+        fn load_blacklist_origins(
+            &self,
+        ) -> Result<Vec<[u8; 20]>, decdn_incentive::store::StoreError> {
+            Ok(self.origin_guard().iter().copied().collect())
+        }
+
+        fn insert_blacklist_origin(
+            &self,
+            origin: [u8; 20],
+        ) -> Result<(), decdn_incentive::store::StoreError> {
+            self.deny()?;
+            self.origin_guard().insert(origin);
+            Ok(())
+        }
+
+        fn remove_blacklist_origin(
+            &self,
+            origin: [u8; 20],
+        ) -> Result<(), decdn_incentive::store::StoreError> {
+            self.deny()?;
+            self.origin_guard().remove(&origin);
+            Ok(())
+        }
     }
 
     #[derive(Default)]
@@ -869,14 +1072,37 @@ mod tests {
         }
     }
 
-    fn state() -> WatcherState {
+    /// A provider that answers nothing. The hash-event tests never reach an
+    /// RPC through `WatcherState`; erasing to `DynProvider` keeps the fixture's
+    /// type nameable so it unifies with the sink's own contract instance.
+    fn mock_provider() -> alloy::providers::DynProvider {
+        alloy::providers::ProviderBuilder::new()
+            .connect_mocked_client(alloy::providers::mock::Asserter::new())
+            .erased()
+    }
+
+    fn state() -> WatcherState<alloy::providers::DynProvider> {
         state_with(Arc::new(MemEntryStore::default()))
     }
 
-    fn state_with(store: Arc<dyn BlacklistEntryStore>) -> WatcherState {
+    fn state_with(
+        store: Arc<dyn BlacklistEntryStore>,
+    ) -> WatcherState<alloy::providers::DynProvider> {
+        state_with_denylist(store, Arc::new(ContentDenylist::empty()))
+    }
+
+    fn state_with_denylist(
+        store: Arc<dyn BlacklistEntryStore>,
+        denylist: Arc<ContentDenylist>,
+    ) -> WatcherState<alloy::providers::DynProvider> {
         WatcherState {
             known: HashSet::new(),
             store,
+            denylist,
+            // Never called in these tests: they drive the hash-event paths,
+            // which touch neither. The origin path is covered separately.
+            capacity_bond: CapacityBond::new(Address::ZERO, mock_provider()),
+            peer_table: Arc::new(RwLock::new(PeerTable::new(0, 0))),
         }
     }
 
@@ -910,6 +1136,9 @@ mod tests {
             &Arc::new(Metrics::new()),
             Arc::new(MemEntryStore::default()),
             Arc::new(MemCheckpointStore::default()),
+            Arc::new(ContentDenylist::empty()),
+            Address::repeat_byte(0x33),
+            Arc::new(RwLock::new(PeerTable::new(0, 0))),
         );
         let readiness = tokio::time::timeout(Duration::from_secs(1), ready_rx)
             .await
@@ -966,6 +1195,9 @@ mod tests {
             &Arc::new(Metrics::new()),
             Arc::new(MemEntryStore::default()),
             Arc::new(MemCheckpointStore::default()),
+            Arc::new(ContentDenylist::empty()),
+            Address::repeat_byte(0x33),
+            Arc::new(RwLock::new(PeerTable::new(0, 0))),
         );
         let readiness = tokio::time::timeout(Duration::from_secs(1), ready_rx)
             .await
@@ -1084,7 +1316,7 @@ mod tests {
         pending_gate: bool,
         entries: u8,
         metrics: &Arc<Metrics>,
-    ) -> Result<BlacklistSink<impl Provider + Clone>> {
+    ) -> Result<BlacklistSink<alloy::providers::DynProvider>> {
         let asserter = alloy::providers::mock::Asserter::new();
         let provider = alloy::providers::ProviderBuilder::new().connect_mocked_client(asserter);
         let tmp = tempfile::tempdir()?;
@@ -1099,7 +1331,7 @@ mod tests {
             state.add_entry(US, Hash::from_bytes([n; 32]))?;
         }
         Ok(BlacklistSink {
-            contract: ContentBlacklist::new(Address::repeat_byte(0x11), provider),
+            contract: ContentBlacklist::new(Address::repeat_byte(0x11), provider.erased()),
             operator: Address::repeat_byte(0x22),
             cache,
             state,

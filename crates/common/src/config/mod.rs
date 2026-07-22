@@ -20,8 +20,8 @@ use crate::redact::redact_userinfo;
 
 pub use errors::ConfigErrorBag;
 pub use resolved::{
-    ResolvedBlockchain, ResolvedCache, ResolvedConfig, ResolvedDht, ResolvedDiscovery,
-    ResolvedDiscoveryPeer, ResolvedGossip, ResolvedIdentity, ResolvedNetwork,
+    ResolvedBlockchain, ResolvedCache, ResolvedConfig, ResolvedContent, ResolvedDht,
+    ResolvedDiscovery, ResolvedDiscoveryPeer, ResolvedGossip, ResolvedIdentity, ResolvedNetwork,
     ResolvedObservability, ResolvedOrigin, ResolvedPayment, ResolvedPrefetch, ResolvedProbe,
     ResolvedReceipts, ResolvedS3Config, ResolvedS3Credentials, ResolvedSecurity,
 };
@@ -366,6 +366,7 @@ pub fn resolve_config(config_path: Option<&Path>, cli: &RunArgs) -> anyhow::Resu
     let probe = resolve_probe_into(file.probe.as_ref(), &mut bag);
     let receipts = resolve_receipts_into(file.receipts.as_ref(), &mut bag);
     let prefetch = resolve_prefetch_into(file.prefetch.as_ref(), &mut bag);
+    let content = resolve_content_into(file.content.as_ref(), &mut bag);
 
     ensure_region_when_publishing_global_into(&identity, &gossip, &mut bag);
     validate_port_layout_into(&network, &observability, &mut bag);
@@ -385,6 +386,7 @@ pub fn resolve_config(config_path: Option<&Path>, cli: &RunArgs) -> anyhow::Resu
         probe,
         receipts,
         prefetch,
+        content,
     })
 }
 
@@ -2148,11 +2150,39 @@ pub fn resolve_circuit_breaker(
 pub fn parse_pinned_hashes(
     raw: Option<&[String]>,
 ) -> anyhow::Result<decdn_config_types::PinnedHashes> {
+    Ok(decdn_config_types::PinnedHashes::new(parse_hash_list(
+        raw,
+        "cache.pinned_hashes",
+    )?))
+}
+
+/// Parse the operator-supplied `content.denied_hashes` list (ADR 011 §Local
+/// Denylist) into a [`decdn_config_types::DeniedHashes`].
+///
+/// Same spelling as `cache.pinned_hashes` — bare 64-char lowercase hex, no
+/// `blake3:` prefix — so an operator has one hash format across the whole
+/// config file. The distinct return type is what keeps a denylist from ever
+/// being handed to the pinning slot.
+pub fn parse_denied_hashes(
+    raw: Option<&[String]>,
+) -> anyhow::Result<decdn_config_types::DeniedHashes> {
+    Ok(decdn_config_types::DeniedHashes::new(parse_hash_list(
+        raw,
+        "content.denied_hashes",
+    )?))
+}
+
+/// Shared validation behind `cache.pinned_hashes` and `content.denied_hashes`.
+/// `label` is the config key, so each list's errors name their own field.
+fn parse_hash_list(
+    raw: Option<&[String]>,
+    label: &str,
+) -> anyhow::Result<std::collections::HashSet<decdn_config_types::Hash>> {
     use std::str::FromStr;
 
     let mut out = std::collections::HashSet::new();
     let Some(entries) = raw else {
-        return Ok(decdn_config_types::PinnedHashes::empty());
+        return Ok(out);
     };
     for (idx, entry) in entries.iter().enumerate() {
         let trimmed = entry.trim();
@@ -2163,20 +2193,68 @@ pub fn parse_pinned_hashes(
         // now beats a silent "did the operator pin this or not?" later.
         anyhow::ensure!(
             trimmed.len() == 64,
-            "cache.pinned_hashes[{idx}] must be 64 hex chars (BLAKE3); got {} chars",
+            "{label}[{idx}] must be 64 hex chars (BLAKE3); got {} chars",
             trimmed.len()
         );
         anyhow::ensure!(
             trimmed.chars().all(|c| c.is_ascii_hexdigit())
                 && !trimmed.chars().any(|c| c.is_ascii_uppercase()),
-            "cache.pinned_hashes[{idx}] must be lowercase hex (0-9, a-f)"
+            "{label}[{idx}] must be lowercase hex (0-9, a-f)"
         );
-        let parsed = decdn_config_types::Hash::from_str(trimmed).with_context(|| {
-            format!("cache.pinned_hashes[{idx}] failed to parse as a BLAKE3 hash")
-        })?;
+        let parsed = decdn_config_types::Hash::from_str(trimmed)
+            .with_context(|| format!("{label}[{idx}] failed to parse as a BLAKE3 hash"))?;
         out.insert(parsed);
     }
-    Ok(decdn_config_types::PinnedHashes::new(out))
+    Ok(out)
+}
+
+/// Parse the operator-supplied `content.denied_origins` list (ADR 011 §Local
+/// Denylist) into a set of operator addresses.
+///
+/// Reuses [`crate::address::parse_nonzero_address`], so the zero address is
+/// rejected: it can never own a payment channel, and accepting it would let a
+/// stray empty string sit in the denylist reading as a real entry.
+pub fn parse_denied_origins(
+    raw: Option<&[String]>,
+) -> anyhow::Result<std::collections::HashSet<alloy::primitives::Address>> {
+    let mut out = std::collections::HashSet::new();
+    let Some(entries) = raw else {
+        return Ok(out);
+    };
+    for (idx, entry) in entries.iter().enumerate() {
+        let label = format!("content.denied_origins[{idx}]");
+        out.insert(crate::address::parse_nonzero_address(entry.trim(), &label)?);
+    }
+    Ok(out)
+}
+
+/// Resolve the local content denylist (ADR 011 §Local Denylist).
+///
+/// Both lists fail resolution on a malformed entry rather than skipping it. A
+/// denylist is discharging a legal order; "one line was ignored" is the one
+/// outcome an operator must never get silently.
+fn resolve_content_into(
+    file: Option<&types::ContentConfig>,
+    bag: &mut ConfigErrorBag,
+) -> ResolvedContent {
+    let denied_hashes = bag
+        .try_with(
+            "content.denied_hashes",
+            parse_denied_hashes(file.and_then(|c| c.denied_hashes.as_deref()))
+                .context("invalid content.denied_hashes"),
+        )
+        .unwrap_or_else(decdn_config_types::DeniedHashes::empty);
+    let denied_origins = bag
+        .try_with(
+            "content.denied_origins",
+            parse_denied_origins(file.and_then(|c| c.denied_origins.as_deref()))
+                .context("invalid content.denied_origins"),
+        )
+        .unwrap_or_default();
+    ResolvedContent {
+        denied_hashes,
+        denied_origins,
+    }
 }
 
 /// Resolve payment fields.
@@ -5318,6 +5396,87 @@ swap_pool_address = \"0xPool\"
         let raw: Vec<String> = vec![];
         anyhow::ensure!(parse_pinned_hashes(Some(&raw))?.is_empty());
         Ok(())
+    }
+
+    // --- ADR 011 local denylist (`[content]`, #1168) ------------------------
+
+    #[test]
+    fn parse_denied_hashes_accepts_bare_lowercase_hex() -> anyhow::Result<()> {
+        let raw = vec!["ab".repeat(32)];
+        let parsed = parse_denied_hashes(Some(&raw))?;
+        anyhow::ensure!(parsed.len() == 1);
+        anyhow::ensure!(parsed.contains(&decdn_config_types::Hash::from_bytes([0xab; 32])));
+        Ok(())
+    }
+
+    /// ADR 011 §Local Denylist writes the TOML with a `blake3:` prefix; the
+    /// implementation follows `cache.pinned_hashes`' bare-hex spelling instead
+    /// so an operator has ONE hash format across the config file, and the ADR
+    /// example was amended to match. Pin the rejection so the two cannot drift
+    /// back apart silently.
+    #[test]
+    fn parse_denied_hashes_rejects_the_blake3_prefix() {
+        let raw = vec![format!("blake3:{}", "ab".repeat(32))];
+        let err = parse_denied_hashes(Some(&raw)).expect_err("prefixed form must be rejected");
+        assert!(format!("{err:#}").contains("64 hex chars"), "{err:#}");
+    }
+
+    #[test]
+    fn parse_denied_hashes_rejects_uppercase_and_wrong_length() {
+        assert!(parse_denied_hashes(Some(&["AB".repeat(32)])).is_err());
+        assert!(parse_denied_hashes(Some(&["ab".repeat(31)])).is_err());
+    }
+
+    /// Errors must name `content.denied_hashes`, not `cache.pinned_hashes` —
+    /// the two share a parser, and a mislabelled error would send an operator
+    /// discharging a takedown to the wrong config key.
+    #[test]
+    fn parse_denied_hashes_errors_name_their_own_field() {
+        let err = parse_denied_hashes(Some(&["nope".to_string()])).expect_err("must reject");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("content.denied_hashes"), "{msg}");
+        assert!(!msg.contains("pinned"), "{msg}");
+    }
+
+    #[test]
+    fn parse_denied_hashes_none_and_empty_are_both_empty() -> anyhow::Result<()> {
+        anyhow::ensure!(parse_denied_hashes(None)?.is_empty());
+        let raw: Vec<String> = vec![];
+        anyhow::ensure!(parse_denied_hashes(Some(&raw))?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn parse_denied_origins_accepts_addresses_and_rejects_zero() -> anyhow::Result<()> {
+        let raw = vec!["0x000000000000000000000000000000000000dEaD".to_string()];
+        anyhow::ensure!(parse_denied_origins(Some(&raw))?.len() == 1);
+        let zero = vec!["0x0000000000000000000000000000000000000000".to_string()];
+        assert!(parse_denied_origins(Some(&zero)).is_err(), "zero rejected");
+        assert!(parse_denied_origins(Some(&["nope".to_string()])).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_content_from_file_config() -> anyhow::Result<()> {
+        let file: FileConfig = toml::from_str(&format!(
+            "[content]\ndenied_hashes = [\"{}\"]\ndenied_origins = [\"0x000000000000000000000000000000000000dEaD\"]\n",
+            "cd".repeat(32)
+        ))?;
+        let mut bag = ConfigErrorBag::new();
+        let resolved = resolve_content_into(file.content.as_ref(), &mut bag);
+        bag.into_result()?;
+        anyhow::ensure!(resolved.denied_hashes.len() == 1);
+        anyhow::ensure!(resolved.denied_origins.len() == 1);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_content_absent_section_denies_nothing() {
+        let mut bag = ConfigErrorBag::new();
+        let resolved = resolve_content_into(None, &mut bag);
+        assert!(bag.into_result().is_ok());
+        assert!(resolved.denied_hashes.is_empty());
+        assert!(resolved.denied_origins.is_empty());
     }
 
     #[test]

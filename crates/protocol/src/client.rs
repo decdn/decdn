@@ -664,10 +664,18 @@ impl CooperativeCloseAuth {
 
 /// A stream failure code (ADR 005 §Stream errors). Variant order is frozen.
 ///
-/// The delivery-side variants (`NotFound`..`EvictedSinceProbe`) ride in
+/// Every variant except `VoucherRejected` is delivery-side and rides in
 /// [`StreamResponse::error`] alongside `ok: false`; `VoucherRejected` is the
 /// only variant delivered mid-stream, inside a [`ClientMessage::StreamError`].
 /// All codes are unsigned and informational — never on-chain evidence.
+///
+/// New variants are appended at the end, never inserted: the postcard
+/// discriminant is the declaration index, so `OriginBlacklisted` and
+/// `HashBlacklisted` sit after `VoucherRejected` even though they read as
+/// delivery-side neighbours of `EvictedSinceProbe`. Moving them would silently
+/// renumber `VoucherRejected` on the wire — an ADR 013 Tier-3 break. Use
+/// [`StreamError::is_delivery_side`], not variant position, to reason about the
+/// domain split.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StreamError {
     /// Node lacks the blob and cannot reach a provider, or declines to pull
@@ -690,12 +698,24 @@ pub enum StreamError {
         /// The specific validation failure.
         reason: VoucherRejectReason,
     },
+    /// The channel funding this request is owned by a blacklisted origin
+    /// operator (ADR 011 §`StreamRequest` Response). Permanent for this channel:
+    /// opening a new one under the same address will be refused identically, so
+    /// a requester should not retry here or elsewhere with this funder.
+    OriginBlacklisted,
+    /// The blob is on the governance blacklist or this operator's local
+    /// denylist (ADR 011 §`StreamRequest` Response). Deliberately does not
+    /// distinguish the two — a local denylist entry is nobody else's business,
+    /// and a client that could tell them apart could map an operator's private
+    /// legal exposure. Retry on a different node: a local entry binds only this
+    /// one, and a governance entry will be refused everywhere.
+    HashBlacklisted,
 }
 
 impl StreamError {
     /// `true` for the delivery-side codes that ride in [`StreamResponse::error`]
-    /// alongside `ok: false` (`NotFound`..`EvictedSinceProbe`). Expresses the
-    /// enum's domain split in code rather than only in prose, and backs the
+    /// alongside `ok: false` — everything except `VoucherRejected`. Expresses
+    /// the enum's domain split in code rather than only in prose, and backs the
     /// [`StreamResponse::validate`] mid-stream-only exclusion.
     pub const fn is_delivery_side(&self) -> bool {
         !self.is_mid_stream()
@@ -1014,6 +1034,8 @@ mod tests {
             StreamError::VoucherRejected {
                 reason: VoucherRejectReason::BadSignature,
             },
+            StreamError::OriginBlacklisted,
+            StreamError::HashBlacklisted,
         ]
         .into_iter()
         .enumerate()
@@ -1565,6 +1587,11 @@ mod tests {
             StreamError::BlobTooLarge,
             StreamError::InternalError,
             StreamError::EvictedSinceProbe,
+            // Appended after `VoucherRejected` for wire-order reasons, but
+            // delivery-side all the same — this is the assertion that keeps the
+            // "everything except VoucherRejected" rule honest as the enum grows.
+            StreamError::OriginBlacklisted,
+            StreamError::HashBlacklisted,
         ] {
             assert!(e.is_delivery_side(), "{e:?} is delivery-side");
             assert!(!e.is_mid_stream(), "{e:?} is not mid-stream");

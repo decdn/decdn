@@ -134,6 +134,19 @@ const WATCHER_CHECKPOINT_TABLE: TableDefinition<&str, u64> =
 const BLACKLIST_ENTRY_TABLE: TableDefinition<&[u8; 64], ()> =
     TableDefinition::new("blacklist_entry_v1");
 
+/// Durable projection of the origin/operator blacklist (ADR 011 § Hash Evasion
+/// and Origin Blacklisting). Keyed by the raw 20-byte address; the value is
+/// unit, as with the entry table — membership is the whole record.
+///
+/// Separate from [`BLACKLIST_ENTRY_TABLE`] rather than sharing a padded key
+/// space: the two have different key widths and different removal semantics
+/// (`remove_blacklist_hash` scans the entry table for a hash across regions,
+/// which has no origin analogue), and a shared table would make a 20-byte
+/// address collide with a `(region, hash)` prefix under any padding scheme
+/// simple enough to be worth it.
+const BLACKLIST_ORIGIN_TABLE: TableDefinition<&[u8; 20], ()> =
+    TableDefinition::new("blacklist_origin_v1");
+
 /// Pack a `(region, hash)` pair into this table's 64-byte key.
 const fn blacklist_key(region: [u8; 32], hash: [u8; 32]) -> [u8; 64] {
     let mut key = [0u8; 64];
@@ -1123,6 +1136,31 @@ impl PersistentChannelStateStore {
             .map_err(|err| StoreError::Backend(format!("commit (fsync): {err}")))?;
         Ok(())
     }
+
+    /// [`Self::blacklist_write`] for the origin table. Same `Durability::Immediate`
+    /// contract: the watcher's cursor may only advance after this returns `Ok`.
+    fn blacklist_origin_write(
+        &self,
+        edit: impl FnOnce(&mut redb::Table<'_, &[u8; 20], ()>) -> Result<(), StoreError>,
+    ) -> Result<(), StoreError> {
+        let mut write_txn = self
+            .db
+            .begin_write()
+            .map_err(|err| StoreError::Backend(format!("begin_write: {err}")))?;
+        write_txn
+            .set_durability(Durability::Immediate)
+            .map_err(|err| StoreError::Backend(format!("set_durability: {err}")))?;
+        {
+            let mut table = write_txn
+                .open_table(BLACKLIST_ORIGIN_TABLE)
+                .map_err(|err| StoreError::Backend(format!("open_table: {err}")))?;
+            edit(&mut table)?;
+        }
+        write_txn
+            .commit()
+            .map_err(|err| StoreError::Backend(format!("commit (fsync): {err}")))?;
+        Ok(())
+    }
 }
 
 impl BlacklistEntryStore for PersistentChannelStateStore {
@@ -1199,6 +1237,47 @@ impl BlacklistEntryStore for PersistentChannelStateStore {
                     .map_err(|err| StoreError::Backend(format!("remove: {err}")))?;
             }
             Ok(())
+        })
+    }
+
+    fn load_blacklist_origins(&self) -> Result<Vec<[u8; 20]>, StoreError> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|err| StoreError::Backend(format!("begin_read: {err}")))?;
+        // A never-written table is a cold start, not an error — same as the
+        // entry table above.
+        let table = match read_txn.open_table(BLACKLIST_ORIGIN_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(err) => return Err(StoreError::Backend(format!("open_table: {err}"))),
+        };
+        let mut origins = Vec::new();
+        for row in table
+            .iter()
+            .map_err(|err| StoreError::Backend(format!("iter: {err}")))?
+        {
+            let (key, _) = row.map_err(|err| StoreError::Backend(format!("row: {err}")))?;
+            origins.push(*key.value());
+        }
+        Ok(origins)
+    }
+
+    fn insert_blacklist_origin(&self, origin: [u8; 20]) -> Result<(), StoreError> {
+        self.blacklist_origin_write(|table| {
+            table
+                .insert(&origin, ())
+                .map(|_| ())
+                .map_err(|err| StoreError::Backend(format!("insert: {err}")))
+        })
+    }
+
+    fn remove_blacklist_origin(&self, origin: [u8; 20]) -> Result<(), StoreError> {
+        self.blacklist_origin_write(|table| {
+            table
+                .remove(&origin)
+                .map(|_| ())
+                .map_err(|err| StoreError::Backend(format!("remove: {err}")))
         })
     }
 }

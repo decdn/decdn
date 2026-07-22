@@ -1277,6 +1277,13 @@ async fn build_chain_and_handlers(
     client_deps.pull_ahead_bytes = pull_ahead_bytes;
     client_deps.leech_governor = leech_governor;
     client_deps.pull_origin_gate = pull_origin_gate;
+    // ADR 011 deny-set. Taken from the reload state rather than built here, so
+    // the handler and the SIGHUP / `decdn node reload` path hold the SAME `Arc`
+    // — a denylist entry added to the config file takes effect on reload with no
+    // handler rebuild and no restart, which is what makes it usable against a
+    // one-hour statutory clock.
+    let content_denylist = reload_state.content_denylist();
+    client_deps.content_deny = Arc::clone(&content_denylist);
     let client_handler = Arc::new(ClientHandler::new(client_deps)?);
 
     // On-chain seller-settlement service (#327). A wallet-filled provider
@@ -1355,6 +1362,9 @@ async fn build_chain_and_handlers(
         // cursor only widens the next rescan, which is idempotent.
         infra.concrete_channel_store.clone(),
         Arc::clone(&infra.watcher_checkpoint_store),
+        Arc::clone(&content_denylist),
+        capacity_bond_addr,
+        Arc::clone(&peer_table),
     );
 
     // Rate-bounds watcher (#1172, ADR 019 §3.1): follows `RateBoundsUpdated` off
@@ -4032,6 +4042,7 @@ mod tests {
             probe: decdn_common::config::ResolvedProbe::default(),
             receipts: decdn_common::config::ResolvedReceipts::default(),
             prefetch: decdn_common::config::ResolvedPrefetch::default(),
+            content: decdn_common::config::ResolvedContent::default(),
         };
         (tmp, cfg)
     }

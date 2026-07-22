@@ -419,6 +419,7 @@ fn sample_resolved(overrides: impl FnOnce(&mut ResolvedConfig)) -> ResolvedConfi
         probe: decdn_common::config::ResolvedProbe::default(),
         receipts: decdn_common::config::ResolvedReceipts::default(),
         prefetch: decdn_common::config::ResolvedPrefetch::default(),
+        content: decdn_common::config::ResolvedContent::default(),
     };
     overrides(&mut cfg);
     cfg

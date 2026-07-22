@@ -1686,6 +1686,11 @@ enum DurableMissCause {
     EvictedSinceProbe,
     /// The blob is over the peer's ceiling — deterministic for this blob.
     BlobTooLarge,
+    /// The peer will not serve this hash: it is on the governance blacklist or
+    /// on that operator's local denylist (ADR 011). The peer does not say which,
+    /// and must not — but either way it is a policy decision, not a cache state,
+    /// so it will not change inside the TTL.
+    HashBlacklisted,
 }
 
 /// How long a (peer, hash) pair is suppressed after a refusal we cannot attribute to the
@@ -1707,6 +1712,12 @@ enum DurableMissCause {
 /// a channel — blackholed a perfectly healthy upstream for five minutes.
 const REFUSAL_SUPPRESSION_TTL: Duration = Duration::from_secs(30);
 
+// `match_same_arms`: `VoucherRejected` and `OriginBlacklisted` both map to
+// `OurFault`, and `EvictedSinceProbe`/`BlobTooLarge`/`HashBlacklisted` all map to
+// `DurableMiss`, but merging them would erase why each reaches that verdict —
+// which is the only thing that makes a future variant's arm decidable. Each arm
+// carries its own reasoning; keep them apart.
+#[allow(clippy::match_same_arms)]
 const fn classify_refusal(error: &StreamError) -> RefusalVerdict {
     match error {
         // The one code by which a node reports its OWN degradation: "unexpected
@@ -1736,6 +1747,21 @@ const fn classify_refusal(error: &StreamError) -> RefusalVerdict {
         // give it. Routing a mid-stream rejection through here alone is what let a wedged
         // channel skip its remedy entirely and be handed back on every subsequent miss.
         StreamError::VoucherRejected { .. } => RefusalVerdict::OurFault,
+        // Policy, not cache state, and it will not lapse inside the TTL. Note we
+        // cannot tell a governance entry from the peer's own local denylist —
+        // the wire code deliberately does not distinguish them (ADR 011
+        // §StreamRequest Response) — but both are durable for this pair, which
+        // is the only question this function asks.
+        StreamError::HashBlacklisted => {
+            RefusalVerdict::DurableMiss(DurableMissCause::HashBlacklisted)
+        }
+        // Says nothing about the peer and everything about us: OUR operator
+        // address is blacklisted, so every peer will refuse identically.
+        // `OurFault` — scoring the peer would punish it for reporting our own
+        // status, and suppressing the pair would waste the entry, since the next
+        // peer refuses too. There is no remedy at this layer; lifting the entry
+        // is a governance action.
+        StreamError::OriginBlacklisted => RefusalVerdict::OurFault,
     }
 }
 
@@ -2159,6 +2185,9 @@ fn classify_pull_failure(
                     // Exhaustive on the cause, not an `if ==` — a new cause added
                     // tomorrow must DECIDE its telemetry here, the same discipline
                     // `RefusalVerdict`'s own doc demands of new `StreamError`s.
+                    // Two causes emit nothing, for unrelated reasons; merging them
+                    // would lose both rationales (`clippy::match_same_arms`).
+                    #[allow(clippy::match_same_arms)]
                     match cause {
                         // ADR 001 §Probe cache mandates tracking this rate; ADR
                         // 005 says a correct hold mechanism should make it rare,
@@ -2171,6 +2200,13 @@ fn classify_pull_failure(
                         // A static fact about the blob vs. the peer's ceiling —
                         // says nothing about any hold mechanism; no telemetry.
                         DurableMissCause::BlobTooLarge => {}
+                        // A takedown the peer is complying with. Expected
+                        // behaviour, not a fault, and deliberately ambiguous
+                        // between governance and the peer's local denylist —
+                        // there is nothing here an operator could action, and a
+                        // metric would only invite reading peers' local policy
+                        // off the aggregate. No telemetry.
+                        DurableMissCause::HashBlacklisted => {}
                     }
                     suppress(None);
                     debug!(%provider_addr, ?cause, %err, "node-origin: upstream does not have this blob; negative-caching this (peer, hash) for the full TTL without tarring reputation");

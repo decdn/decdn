@@ -103,6 +103,13 @@ impl ClientHandler {
     /// the channel owner, is unauthorized and must not make this node front
     /// upstream USDC. Mirrors the post-delivery ownership check, applied *before*
     /// any spend.
+    ///
+    /// Also the earliest origin-blacklist gate (ADR 011). The serve-path gate in
+    /// `dispatch.rs` refuses the delivery, but it runs after this: without the
+    /// same check here, a blacklisted origin's request would still have made
+    /// this node front upstream USDC egress and warm its cache on that origin's
+    /// behalf, only to refuse the delivery afterwards. Refusing to *spend* is the
+    /// part that actually costs the operator.
     pub(super) async fn pull_authorized(
         &self,
         req: &StreamRequest,
@@ -111,6 +118,9 @@ impl ClientHandler {
         let Some(client) = verified_client else {
             return false;
         };
+        if self.content_deny.is_origin_denied(&client) {
+            return false;
+        }
         let chan = self
             .channels
             .lock()
