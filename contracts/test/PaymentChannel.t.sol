@@ -779,6 +779,54 @@ contract PaymentChannelTest is Test {
     }
 
     // -----------------------------------------------------------------
+    // Rate bounds uint64 upper cap (#1383): the daemon's rate clamp is `u64`,
+    // so a ratified band above `type(uint64).max` fails to decode and silently
+    // strands vouchers below the enforced on-chain floor. The chain must not be
+    // able to express a band the node cannot enforce. Each governance-gated case
+    // pranks `admin` (which holds `GOVERNANCE_ROLE`) so the revert is the bounds
+    // guard, not an access-control failure.
+    // -----------------------------------------------------------------
+
+    /// @dev A ceiling one above `type(uint64).max` reverts `RateBoundsInvalid`.
+    function test_setRateBounds_revertsWhenCeilingExceedsUint64Cap() public {
+        uint256 badCeiling = uint256(type(uint64).max) + 1;
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(PaymentChannel.RateBoundsInvalid.selector, DELIVERY_FLOOR, badCeiling));
+        channel.setRateBounds(DELIVERY_FLOOR, badCeiling);
+    }
+
+    /// @dev A floor above `type(uint64).max` reverts `RateBoundsInvalid` (the
+    ///      ceiling is set just above it so the failure is the u64 cap, not the
+    ///      `newCeiling <= newFloor` ordering check).
+    function test_setRateBounds_revertsWhenFloorExceedsUint64Cap() public {
+        uint256 badFloor = uint256(type(uint64).max) + 1;
+        uint256 badCeiling = uint256(type(uint64).max) + 2;
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(PaymentChannel.RateBoundsInvalid.selector, badFloor, badCeiling));
+        channel.setRateBounds(badFloor, badCeiling);
+    }
+
+    /// @dev In-bounds control: a ceiling at exactly `type(uint64).max` is the
+    ///      widest band the guard admits and succeeds, proving the cap is
+    ///      inclusive (`>` , not `>=`).
+    function test_setRateBounds_succeedsAtUint64Cap() public {
+        uint256 maxCeiling = uint256(type(uint64).max);
+        vm.prank(admin);
+        channel.setRateBounds(DELIVERY_FLOOR, maxCeiling);
+        (uint256 floor, uint256 ceiling) = channel.getRateBounds();
+        assertEq(floor, DELIVERY_FLOOR);
+        assertEq(ceiling, maxCeiling);
+    }
+
+    /// @dev The constructor shares the guard: deploying with a ceiling above
+    ///      `type(uint64).max` reverts `RateBoundsInvalid`.
+    function test_constructor_revertsOnRateCeilingAboveUint64Cap() public {
+        uint256 badCeiling = uint256(type(uint64).max) + 1;
+        vm.expectRevert(abi.encodeWithSelector(PaymentChannel.RateBoundsInvalid.selector, DELIVERY_FLOOR, badCeiling));
+        new PaymentChannel(usdc, bond, address(router), DISPUTE_WINDOW, MAX_DURATION, DELIVERY_FLOOR, badCeiling, admin);
+    }
+
+    // -----------------------------------------------------------------
     // Rate floor enforcement (#846): `amount * BYTES_PER_MB >= bytes * floor`
     // -----------------------------------------------------------------
 
