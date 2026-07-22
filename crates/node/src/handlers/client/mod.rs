@@ -1667,4 +1667,66 @@ mod tests {
             &OriginHash::from_bytes([9u8; 32])
         ));
     }
+
+    /// #1382 / #1388: the hard per-byte voucher floor must track the LIVE
+    /// delivery floor, NOT the floor snapshotted when the quote was signed.
+    ///
+    /// The on-chain `PaymentChannel._advanceClaimWatermark` enforces the floor
+    /// against the live `deliveryFloor` storage slot at settlement — there is no
+    /// per-channel floor snapshot (the `Channel` struct carries none), and
+    /// `setRateBounds` overwrites it globally. So a node that accepted a voucher
+    /// priced below the live floor could never redeem it (`RateFloorViolation`).
+    /// When a governance floor raise lands mid-stream, a voucher paying the old
+    /// quoted rate MUST therefore be rejected: the buyer did nothing wrong, but
+    /// the node cannot get paid for those bytes on-chain, so accepting would be
+    /// serving for free. Pinning the quote-time floor here (the reverted #1388
+    /// approach) would make the node countersign an unredeemable voucher.
+    #[tokio::test]
+    async fn voucher_floor_tracks_live_bounds_not_the_quote() {
+        let metrics = Arc::new(Metrics::new());
+        let (handler, _dir) = handler_for_warm_tests(&metrics, None).await;
+
+        // Quote-time band: floor == F, a generous ceiling. The advertised
+        // `rate_per_mb` atomic is seeded to 1 in `handler_for_warm_tests`, so
+        // set the band's floor to F and clamp will raise the quote to F.
+        let f: u64 = 500;
+        handler.rate_bounds.store(f, 10_000);
+
+        // Quote the stream at rate F (the value signed into the `StreamResponse`).
+        let quoted_rate = handler.clamped_rate();
+        assert_eq!(quoted_rate, f, "quote clamps up to the floor");
+
+        // A well-formed cumulative voucher paying exactly the quoted rate for a
+        // one-MB interval.
+        let bytes_per_mb = decdn_incentive::rate::BYTES_PER_MB;
+        let bytes = U256::from(bytes_per_mb);
+        let amount = min_payment(bytes_per_mb, quoted_rate);
+
+        // While the floor is still F, the voucher clears the live floor — this is
+        // the exact call `collect_voucher` makes (`verify_rate(amount, new_bytes,
+        // self.rate_bounds.floor(), 0)`), and on-chain redemption would succeed.
+        assert!(
+            verify_rate(amount, bytes, handler.rate_bounds.floor(), 0).is_ok(),
+            "at the quoted floor the voucher is redeemable"
+        );
+
+        // Governance raises the floor above F mid-stream (the ~1s watcher cadence
+        // spanning multiple voucher intervals — the reachable race from #1382).
+        // The chain now enforces 2F at settlement, so a voucher priced at F is
+        // unredeemable and the live-floor acceptance check MUST reject it.
+        handler.rate_bounds.store(f * 2, 10_000);
+        assert_eq!(
+            handler.rate_bounds.floor(),
+            f * 2,
+            "live floor moved above the quoted rate"
+        );
+        assert!(
+            matches!(
+                verify_rate(amount, bytes, handler.rate_bounds.floor(), 0),
+                Err(RateError::Underpayment { .. })
+            ),
+            "after the live floor rises above the quoted rate the voucher must be \
+             rejected — it would revert on-chain with RateFloorViolation"
+        );
+    }
 }
