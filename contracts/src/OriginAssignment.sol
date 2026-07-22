@@ -13,11 +13,10 @@ import { IContentBlacklistOriginView } from "./interfaces/IContentBlacklistOrigi
 /// @notice The DAO's positive origin authority (ADR 011 § Origin Assignment
 ///         Authority): which operators may act as origin backers for which
 ///         namespace. Registered namespaces follow a publisher-propose /
-///         governance-ratify flow gated by an assignment timelock; the
-///         default-open namespace (`namespaceId == 0`) is a single
-///         governance-maintained global allow-list. Authorized sets are
-///         `EnumerableSet`s — `isAuthorizedOrigin(0, op)` is the same view used
-///         for registered namespaces, no downstream special case.
+///         governance-ratify flow gated by an assignment timelock. Namespace 0
+///         (`namespaceId == 0`) has no publisher, so no set is ever seated for
+///         it — `getOrigins(0)` is empty and `isAuthorizedOrigin(0, op)` is
+///         always false. Authorized sets are `EnumerableSet`s.
 /// @dev    OZ bases per ADR 016 § Contract Inventory: `AccessControl` (governance
 ///         gating) + `ReentrancyGuard` (all cross-contract reads are views, but
 ///         the guard matches the inventory and the repo's external-call-then-write
@@ -41,15 +40,9 @@ contract OriginAssignment is AccessControl, ReentrancyGuard {
     uint256 internal constant ASSIGNMENT_TIMELOCK_CEILING = 14 days;
     uint256 internal constant MAX_ORIGINS_FLOOR = 1;
     uint256 internal constant MAX_ORIGINS_CEILING = 50;
-    uint256 internal constant DEFAULT_OPEN_MAX_FLOOR = 20;
-    uint256 internal constant DEFAULT_OPEN_MAX_CEILING = 500;
 
     uint256 internal constant DEFAULT_ASSIGNMENT_TIMELOCK = 3 days;
     uint256 internal constant DEFAULT_MAX_ORIGINS = 10;
-    uint256 internal constant DEFAULT_OPEN_MAX_ORIGINS = 100;
-
-    /// @dev The default-open allow-list lives under this namespace id.
-    uint256 internal constant DEFAULT_OPEN_NAMESPACE = 0;
 
     // -----------------------------------------------------------------
     // Immutables + governable state
@@ -67,10 +60,6 @@ contract OriginAssignment is AccessControl, ReentrancyGuard {
 
     uint256 public maxOriginsPerNamespace;
     uint256 public assignmentTimelock;
-    uint256 public defaultOpenMaxOrigins;
-
-    /// @dev Monotonic index stamped into `DefaultOpenAllowlistUpdated`.
-    uint256 internal _defaultOpenUpdateIndex;
 
     // -----------------------------------------------------------------
     // Storage — authorized sets + pending proposals
@@ -96,13 +85,9 @@ contract OriginAssignment is AccessControl, ReentrancyGuard {
     event AssignmentActivated(uint256 indexed namespaceId, address[] operators);
     event AssignmentRevoked(uint256 indexed namespaceId, address indexed operator, address indexed by);
     event BlacklistedAssignmentPruned(uint256 indexed namespaceId, address indexed operator, address indexed pruner);
-    event DefaultOpenAllowlistUpdated(address[] operators, uint256 indexed updateIndex);
-    event DefaultOpenOperatorAdded(address indexed operator);
-    event DefaultOpenOperatorRemoved(address indexed operator);
     event ContentBlacklistUpdated(address indexed oldAddr, address indexed newAddr);
     event MaxOriginsPerNamespaceUpdated(uint256 oldValue, uint256 newValue);
     event AssignmentTimelockUpdated(uint256 oldValue, uint256 newValue);
-    event DefaultOpenMaxOriginsUpdated(uint256 oldValue, uint256 newValue);
 
     // -----------------------------------------------------------------
     // Errors
@@ -146,7 +131,6 @@ contract OriginAssignment is AccessControl, ReentrancyGuard {
 
         maxOriginsPerNamespace = DEFAULT_MAX_ORIGINS;
         assignmentTimelock = DEFAULT_ASSIGNMENT_TIMELOCK;
-        defaultOpenMaxOrigins = DEFAULT_OPEN_MAX_ORIGINS;
 
         _grantRole(DEFAULT_ADMIN_ROLE, admin);
         _grantRole(GOVERNANCE_ROLE, admin);
@@ -240,9 +224,9 @@ contract OriginAssignment is AccessControl, ReentrancyGuard {
         emit AssignmentRevoked(namespaceId, operator, msg.sender);
     }
 
-    /// @notice Permissionless: remove a blacklisted operator from a namespace's set
-    ///         (works for `namespaceId == 0`). The contract checks the blacklist
-    ///         itself, so a caller cannot grief by naming a non-blacklisted operator.
+    /// @notice Permissionless: remove a blacklisted operator from a namespace's set.
+    ///         The contract checks the blacklist itself, so a caller cannot grief by
+    ///         naming a non-blacklisted operator.
     // slither-disable-next-line reentrancy-no-eth
     function pruneBlacklistedAssignment(uint256 namespaceId, address operator) external nonReentrant {
         address blacklist = contentBlacklist;
@@ -263,41 +247,6 @@ contract OriginAssignment is AccessControl, ReentrancyGuard {
     function _isBlacklisted(address blacklist, address operator) internal view returns (bool) {
         IContentBlacklistOriginView bl = IContentBlacklistOriginView(blacklist);
         return bl.isOriginBlacklisted(operator) || bl.isOperatorBlacklisted(operator);
-    }
-
-    // -----------------------------------------------------------------
-    // Default-open allow-list (namespaceId == 0; GOVERNANCE_ROLE)
-    // -----------------------------------------------------------------
-
-    /// @notice Replace the default-open allow-list atomically.
-    // slither-disable-next-line reentrancy-no-eth
-    function setDefaultOpenAllowlist(address[] calldata operators) external nonReentrant onlyRole(GOVERNANCE_ROLE) {
-        if (operators.length > defaultOpenMaxOrigins) revert TooManyOrigins(operators.length, defaultOpenMaxOrigins);
-        for (uint256 i = 0; i < operators.length; i++) {
-            // aderyn-ignore-next-line(reentrancy-state-change)
-            if (!capacityBond.isActive(operators[i])) revert OperatorNotActive(operators[i]);
-        }
-        _replaceSet(DEFAULT_OPEN_NAMESPACE, operators);
-        emit DefaultOpenAllowlistUpdated(operators, ++_defaultOpenUpdateIndex);
-    }
-
-    /// @notice Add one operator to the default-open allow-list.
-    // slither-disable-next-line reentrancy-no-eth
-    function addDefaultOpenOperator(address operator) external nonReentrant onlyRole(GOVERNANCE_ROLE) {
-        // aderyn-ignore-next-line(reentrancy-state-change)
-        if (!capacityBond.isActive(operator)) revert OperatorNotActive(operator);
-        EnumerableSet.AddressSet storage set = _origins[DEFAULT_OPEN_NAMESPACE];
-        if (set.length() + 1 > defaultOpenMaxOrigins) revert TooManyOrigins(set.length() + 1, defaultOpenMaxOrigins);
-        if (!set.add(operator)) revert DuplicateOperator(operator);
-        emit DefaultOpenOperatorAdded(operator);
-    }
-
-    /// @notice Remove one operator from the default-open allow-list.
-    function removeDefaultOpenOperator(address operator) external onlyRole(GOVERNANCE_ROLE) {
-        if (!_origins[DEFAULT_OPEN_NAMESPACE].remove(operator)) {
-            revert NotAuthorizedOrigin(DEFAULT_OPEN_NAMESPACE, operator);
-        }
-        emit DefaultOpenOperatorRemoved(operator);
     }
 
     // -----------------------------------------------------------------
@@ -332,21 +281,12 @@ contract OriginAssignment is AccessControl, ReentrancyGuard {
         emit AssignmentTimelockUpdated(old, secondsDelay);
     }
 
-    function setDefaultOpenMaxOrigins(uint256 cap) external onlyRole(GOVERNANCE_ROLE) {
-        if (cap < DEFAULT_OPEN_MAX_FLOOR || cap > DEFAULT_OPEN_MAX_CEILING) {
-            revert ParamOutOfBounds(cap, DEFAULT_OPEN_MAX_FLOOR, DEFAULT_OPEN_MAX_CEILING);
-        }
-        uint256 old = defaultOpenMaxOrigins;
-        defaultOpenMaxOrigins = cap;
-        emit DefaultOpenMaxOriginsUpdated(old, cap);
-    }
-
     // -----------------------------------------------------------------
     // Views
     // -----------------------------------------------------------------
 
-    /// @notice Strict set membership; `namespaceId == 0` reads the default-open
-    ///         allow-list. Operator-level blacklist status is NOT consulted here —
+    /// @notice Strict set membership. `namespaceId == 0` has no set, so this is
+    ///         always false. Operator-level blacklist status is NOT consulted here —
     ///         off-chain consumers filter against `ContentBlacklist`.
     function isAuthorizedOrigin(uint256 namespaceId, address operator) external view returns (bool) {
         return _origins[namespaceId].contains(operator);

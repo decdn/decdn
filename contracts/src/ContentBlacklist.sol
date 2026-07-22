@@ -24,8 +24,9 @@ import { RegionScopeLib } from "./RegionScopeLib.sol";
 ///         (ADR 031 § Function signatures and revert table, audit I-3):
 ///         `StandingPath.Operator` requires a current-region match
 ///         (ADR 011 § Standing path 2, via ADR 030); `StandingPath.Publisher`
-///         requires owning the declared namespace and that namespace having
-///         claimed the hash (via `PublisherRegistry`); `StandingPath.TokenHolder`
+///         requires owning the declared namespace (via `PublisherRegistry`;
+///         the hash→namespace tie is off-chain, so ownership is the only on-chain
+///         gate); `StandingPath.TokenHolder`
 ///         needs no extra credential — the escrowed appeal bond IS the standing,
 ///         with no separate balance threshold. Because the bond is escrowed by
 ///         the appeal it cannot be flash-loaned, so the synthetic-standing
@@ -204,7 +205,7 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     ERC20Burnable public immutable token;
 
     /// @dev `PublisherRegistry`, for the ADR 031 Publisher standing check
-    ///      (`ownerOf` + `hasClaimed`). Immutable security-critical binding —
+    ///      (`ownerOf`). Immutable security-critical binding —
     ///      cannot be left unset or re-pointed after deployment.
     // forge-lint: disable-next-line(screaming-snake-case-immutable)
     IPublisherRegistryStanding public immutable publisherRegistry;
@@ -904,24 +905,18 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         if (uint8(standingPath) > uint8(StandingPath.TokenHolder)) revert UnauthorizedStanding(standingPath);
 
         if (standingPath == StandingPath.Publisher) {
-            // Publisher: must own the declared namespace AND that namespace must
-            // have claimed the disputed hash. This proves the filer controls a
-            // namespace that claimed the hash — NOT authorship: `claimContent` is
-            // a permissionless self-assertion, so anyone can create a namespace and
-            // claim any hash. That is acceptable because the Publisher path confers
-            // no more than TokenHolder does (any bond-poster already has standing)
-            // and standing alone grants no automatic outcome (see the TokenHolder
-            // branch). `namespaceId` is a filing argument because a hash→namespace
-            // reverse lookup is ambiguous (many namespaces may claim one hash).
-            // `ownerOf` returns address(0) for unassigned ids, so a bogus
-            // `namespaceId` fails the owner check.
-            // Each read is cached on its own line so the aderyn directive is the
-            // immediate predecessor of the external call it suppresses.
+            // Publisher: must own the declared namespace. The hash→namespace
+            // association is off-chain (ADR 002 § Hash-to-namespace association),
+            // so this proves only that the filer controls the named namespace —
+            // NOT that the disputed hash falls under it, nor authorship. That is
+            // acceptable because the Publisher path confers no more than TokenHolder
+            // does (any bond-poster already has standing) and standing alone grants
+            // no automatic outcome (see the TokenHolder branch). `namespaceId` is a
+            // filing argument the filer asserts; `ownerOf` returns address(0) for
+            // unassigned ids, so a bogus `namespaceId` fails the owner check.
             // aderyn-ignore-next-line(reentrancy-state-change)
             address namespaceOwner = publisherRegistry.ownerOf(namespaceId);
-            // aderyn-ignore-next-line(reentrancy-state-change)
-            bool claimedHash = publisherRegistry.hasClaimed(namespaceId, hash);
-            if (namespaceOwner != msg.sender || !claimedHash) revert UnauthorizedStanding(standingPath);
+            if (namespaceOwner != msg.sender) revert UnauthorizedStanding(standingPath);
         } else if (standingPath == StandingPath.TokenHolder) {
             // TokenHolder: standing IS the escrowed appeal bond pulled below —
             // there is no separate balance gate. `namespaceId` is ignored on this

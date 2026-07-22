@@ -7,7 +7,7 @@ pragma solidity 0.8.28;
 ///         that the caller owns the namespace (ADR 011 § Cross-contract
 ///         integration). `ownerOf` is the `PublisherRegistry` public mapping
 ///         getter; `address(0)` denotes an unassigned id (including the reserved
-///         default-open id `0`).
+///         no-namespace id `0`).
 interface IPublisherRegistryOwnership {
     function ownerOf(uint256 namespaceId) external view returns (address);
 }

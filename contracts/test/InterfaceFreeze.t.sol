@@ -90,11 +90,6 @@ contract InterfaceFreezeTest is Test {
             "pruneBlacklistedAssignment"
         );
         assertEq(
-            OriginAssignment.setDefaultOpenAllowlist.selector,
-            bytes4(keccak256("setDefaultOpenAllowlist(address[])")),
-            "setDefaultOpenAllowlist"
-        );
-        assertEq(
             OriginAssignment.setContentBlacklist.selector,
             bytes4(keccak256("setContentBlacklist(address)")),
             "setContentBlacklist"

@@ -4,11 +4,14 @@ pragma solidity 0.8.28;
 import { AccessControl } from "@openzeppelin/contracts/access/AccessControl.sol";
 import { SafeCast } from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 
-/// @title PublisherRegistry — namespaces and content claims (ADR 002)
+/// @title PublisherRegistry — namespace ownership and lifecycle (ADR 002)
 /// @notice Permissionless namespace creation (publisher identity is implicit
-///         on first `createNamespace`), append-only content claims binding
-///         `(namespaceId, blake3Hash)`, and a timelocked 2-step namespace
-///         ownership transfer. Spec: ADR 002 § Contract: PublisherRegistry.
+///         on first `createNamespace`) and a timelocked 2-step namespace
+///         ownership transfer. The registry records who owns each namespace and
+///         stores no content hashes — the hash→namespace association is supplied
+///         off-chain by the requester at fetch time (ADR 002 §
+///         Hash-to-namespace association). Spec: ADR 002 § Contract:
+///         PublisherRegistry.
 ///
 /// @dev    OZ composition: `AccessControl` only — the two governable
 ///         parameters (`maxNamespacesPerPublisher`, `namespaceTransferTimelock`)
@@ -18,14 +21,11 @@ import { SafeCast } from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 ///         holds no funds — every function is pure storage bookkeeping, so a
 ///         reentrancy guard would be dead weight. (ADR 016's inventory row is
 ///         updated to match.) No `Pausable`: namespace creation is
-///         permissionless by design (ADR 002 § Default-open namespace).
+///         permissionless by design.
 ///
-///         `namespaceId == 0` is reserved as the default-open namespace
-///         (ADR 002 § Default-open namespace) and is never assigned — the
-///         counter starts at 1. Claims are content-immutable and append-only:
-///         once `(namespaceId, hash)` is recorded it is never moved or
-///         revoked, and multiple non-zero namespaces may claim the same hash
-///         independently (ADR 002 § Multi-claim semantics).
+///         `namespaceId == 0` is reserved for content published without a
+///         namespace (ADR 002 § Namespace 0) and is never assigned — the
+///         counter starts at 1.
 contract PublisherRegistry is AccessControl {
     using SafeCast for uint256;
 
@@ -73,14 +73,8 @@ contract PublisherRegistry is AccessControl {
     uint64 public namespaceTransferTimelock;
 
     /// @dev Monotonic namespace id allocator. Pre-incremented so the first
-    ///      assigned id is 1, leaving 0 as the reserved default-open id.
+    ///      assigned id is 1, leaving 0 as the reserved no-namespace id.
     uint64 internal _nextNamespaceId;
-
-    /// @dev hash => set of claiming namespace ids (append-only).
-    mapping(bytes32 blake3Hash => uint256[]) internal _claimingNamespaces;
-
-    /// @dev (namespaceId, hash) => claimed, for O(1) idempotency checks.
-    mapping(uint256 namespaceId => mapping(bytes32 blake3Hash => bool)) internal _hasClaimed;
 
     event NamespaceCreated(uint256 indexed namespaceId, address indexed owner);
     event NamespaceTransferInitiated(
@@ -90,7 +84,6 @@ contract PublisherRegistry is AccessControl {
     /// @dev Not in the ADR 002 interface block, but cancellation should be
     ///      observable on-chain alongside initiate/complete.
     event NamespaceTransferCancelled(uint256 indexed namespaceId, address indexed owner);
-    event ContentClaimed(uint256 indexed namespaceId, bytes32 indexed blake3Hash, address indexed claimant);
     event MaxNamespacesPerPublisherUpdated(uint256 oldValue, uint256 newValue);
     event NamespaceTransferTimelockUpdated(uint64 oldValue, uint64 newValue);
 
@@ -101,7 +94,6 @@ contract PublisherRegistry is AccessControl {
     error NoPendingTransfer(uint256 namespaceId);
     error TransferNotReady(uint256 readyAt);
     error NotPendingOwner(uint256 namespaceId, address caller);
-    error AlreadyClaimed(uint256 namespaceId, bytes32 blake3Hash);
     error ParamOutOfBounds(uint256 value, uint256 floor, uint256 ceiling);
 
     /// @param admin Initial `DEFAULT_ADMIN_ROLE` + `GOVERNANCE_ROLE` holder
@@ -179,40 +171,6 @@ contract PublisherRegistry is AccessControl {
         if (pendingTransfer[namespaceId].newOwner == address(0)) revert NoPendingTransfer(namespaceId);
         delete pendingTransfer[namespaceId];
         emit NamespaceTransferCancelled(namespaceId, msg.sender);
-    }
-
-    // -----------------------------------------------------------------
-    // Content claims
-    // -----------------------------------------------------------------
-
-    /// @notice Claim `blake3Hash` under `namespaceId` (owner only). Append-only:
-    ///         reverts only if THIS namespace already claimed THIS hash; other
-    ///         namespaces' claims never block (ADR 002 § Multi-claim semantics).
-    function claimContent(uint256 namespaceId, bytes32 blake3Hash) external {
-        _requireOwner(namespaceId);
-        if (_hasClaimed[namespaceId][blake3Hash]) revert AlreadyClaimed(namespaceId, blake3Hash);
-        _hasClaimed[namespaceId][blake3Hash] = true;
-        _claimingNamespaces[blake3Hash].push(namespaceId);
-        emit ContentClaimed(namespaceId, blake3Hash, msg.sender);
-    }
-
-    // -----------------------------------------------------------------
-    // Views
-    // -----------------------------------------------------------------
-
-    /// @notice Namespaces that have claimed `blake3Hash`. Empty array if none
-    ///         (default-open semantics); never reverts.
-    function namespaceOf(bytes32 blake3Hash) external view returns (uint256[] memory) {
-        return _claimingNamespaces[blake3Hash];
-    }
-
-    /// @notice True iff `namespaceId` has claimed `blake3Hash`. Exposes the
-    ///         internal `_hasClaimed` map for the ADR 031 Publisher-standing
-    ///         check in `ContentBlacklist` (a hash→namespace reverse lookup is
-    ///         unusable because many namespaces may claim the same hash, so the
-    ///         caller passes the namespace explicitly and this confirms the claim).
-    function hasClaimed(uint256 namespaceId, bytes32 blake3Hash) external view returns (bool) {
-        return _hasClaimed[namespaceId][blake3Hash];
     }
 
     // -----------------------------------------------------------------
