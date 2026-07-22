@@ -39,9 +39,6 @@ pub struct FileConfig {
     /// Download-receipt audit-log retention settings (#802). Absent =>
     /// defaults (128 MiB per file, 4 retained backups).
     pub receipts: Option<ReceiptsConfig>,
-    /// Speculative-prefetch operator policy (ADR 022 §Prefetch Decision).
-    /// Absent => prefetch disabled with the ADR's recommended defaults.
-    pub prefetch: Option<PrefetchConfig>,
     /// Local content denylist (ADR 011 §Local Denylist). Absent => both lists
     /// empty; nothing is denied locally.
     pub content: Option<ContentConfig>,
@@ -145,9 +142,10 @@ pub struct BlockchainConfig {
     pub capacity_bond_address: Option<String>,
     /// `OriginAssignment` contract address. Optional: when set (together with
     /// `publisher_registry_address`), the node runs the chain-backed origin
-    /// directory that gates DHT prefetch (ADR 022). Both must be set or unset
+    /// directory that backs the pull-through authorized-origin gate and the
+    /// `FIND_VALUE` last-resort fallback (ADR 022). Both must be set or unset
     /// together; unset => the origin directory is empty (deny-all) and the
-    /// prefetch authorized-origin gate finds no origins.
+    /// authorized-origin gate finds no origins.
     pub origin_assignment_address: Option<String>,
     /// `PublisherRegistry` contract address. Pairs with
     /// `origin_assignment_address` (see its docs).
@@ -562,8 +560,8 @@ pub struct CacheConfig {
     /// behavior). When `true`, the node refuses to *initiate* an upstream pull
     /// and the associated cache-warming write for a hash whose namespace has no
     /// currently-authorized origin via `OriginAssignment.getOrigins(namespaceId)`
-    /// (with `namespaceId == 0` resolving to the default-open allow-list, same as
-    /// the prefetch gate), returning `NotFound` to the requesting client. It is a
+    /// (with `namespaceId == 0` resolving to the default-open allow-list),
+    /// returning `NotFound` to the requesting client. It is a
     /// pull-*initiation* gate only: a range the node already holds is served
     /// regardless — refusing held blobs is `ContentBlacklist`'s job (ADR 011/031).
     /// Requires the origin-directory addresses (the `origin_assignment_address`
@@ -1049,43 +1047,6 @@ pub struct ReceiptsConfig {
     /// default 4. `0` keeps no backups (the live file is truncated in place on
     /// rotation). Capped at 100.
     pub retained_files: Option<u32>,
-}
-
-/// `[prefetch]` — speculative-prefetch operator policy (ADR 022 §Prefetch
-/// Decision "Recommended configuration"). Every field is optional; absent
-/// keys take the ADR's recommended defaults. The whole feature is gated off
-/// by `enabled = false` by default — operators must affirmatively opt in.
-#[derive(Debug, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PrefetchConfig {
-    /// Master switch. Absent => `false` (opt-in).
-    pub enabled: Option<bool>,
-    /// Require an authorized origin in the `FIND_VALUE` candidate set before
-    /// prefetching. Absent => `true`. Closes the demand-supply Sybil attack.
-    pub require_authorized_origin: Option<bool>,
-    /// Hard cap on aggregate prefetch spend over a rolling 1-hour window, in
-    /// micro-USDC. Absent => `0` (no budget => never prefetches; a finite cap
-    /// is the load-bearing recommendation).
-    pub budget_usdc_per_hour: Option<u64>,
-    /// `FIND_VALUE` queries for a hash within `threshold_window_secs` that trip
-    /// the prefetch trigger. Absent => `5`. Must be `> 0`.
-    pub find_value_threshold: Option<u32>,
-    /// Rolling-window length (seconds) for the `FIND_VALUE` trigger. Absent =>
-    /// `300`. Must be `> 0`.
-    pub threshold_window_secs: Option<u64>,
-    /// Auto-throttle floor on `served_bytes / acquired_bytes` over the
-    /// demand-quality window. Absent => `0.1`. Must be finite in `[0.0, 1.0]`.
-    pub demand_quality_min_ratio: Option<f64>,
-    /// Rolling-window length (seconds) for the demand-quality predicate.
-    /// Absent => `3600`. Must be `> 0`.
-    pub demand_quality_window_secs: Option<u64>,
-    /// Maximum prefetch acquisitions running concurrently (#820). Caps the
-    /// background fan-out of speculative pulls so prefetch cannot starve demand
-    /// traffic. Absent => `4`. Must be `> 0`.
-    pub max_concurrent_acquisitions: Option<u32>,
-    /// Wall-clock deadline (seconds) for a single prefetch acquisition's
-    /// pull-through (#820). Absent => `30`. Must be `> 0`.
-    pub acquisition_timeout_secs: Option<u64>,
 }
 
 /// Local content-denylist section of the config file (ADR 011 §Local Denylist).

@@ -103,9 +103,6 @@ pub struct DhtHandler {
     rate_limiter: Arc<DhtRateLimiter>,
     dispatch_limiter: Arc<ConnectionLimiter>,
     metrics: Arc<Metrics>,
-    /// Operator-policy prefetch engine (ADR 022 §Prefetch). `None` => prefetch
-    /// wiring absent (tests, and the default until the runtime attaches one).
-    prefetch: Option<Arc<crate::prefetch::PrefetchEngine>>,
 }
 
 impl std::fmt::Debug for DhtHandler {
@@ -144,7 +141,6 @@ impl DhtHandler {
             rate_limiter,
             dispatch_limiter,
             metrics,
-            prefetch: None,
         }
     }
 
@@ -170,16 +166,7 @@ impl DhtHandler {
             rate_limiter,
             dispatch_limiter,
             metrics,
-            prefetch: None,
         }
-    }
-
-    /// Attach the prefetch engine. Called by the runtime; left `None` in tests
-    /// and bootstrap paths that do not exercise prefetch.
-    #[must_use]
-    pub fn with_prefetch(mut self, engine: Arc<crate::prefetch::PrefetchEngine>) -> Self {
-        self.prefetch = Some(engine);
-        self
     }
 
     /// Shared handle to the routing table — exposed so PR 4 of #320 can
@@ -648,12 +635,6 @@ impl DhtHandler {
     /// is the requester's job; we don't apply it here.
     fn handle_find_value(&self, req: wire::FindValueRequest) -> wire::FindValueResponse {
         let now_us = now_us();
-        // Feed the inbound demand signal to the prefetch engine before building
-        // the response (ADR 022 §Prefetch Demand Signal). On a threshold-cross
-        // this may fire a live, non-blocking speculative acquisition (#820).
-        if let Some(engine) = &self.prefetch {
-            self.run_prefetch(engine, req.hash.as_bytes(), now_us / 1_000_000);
-        }
         let providers = if let Ok(mut store) = self.records.lock() {
             store.providers_at(&req.hash, now_us)
         } else {
@@ -668,41 +649,6 @@ impl DhtHandler {
             // measure routing-table peers against.
             closer_nodes: self.closest_to(req.hash.as_bytes()),
         }
-    }
-
-    /// Feed the `FIND_VALUE` demand signal to the prefetch engine, translate the
-    /// decision into metrics, and — on an `Acquire` — fire a live, bounded,
-    /// non-blocking background acquisition (#820).
-    fn run_prefetch(
-        &self,
-        engine: &Arc<crate::prefetch::PrefetchEngine>,
-        hash_bytes: &[u8; 32],
-        now_secs: u64,
-    ) {
-        use crate::prefetch::PrefetchOutcome;
-        use crate::prefetch::decision::PrefetchDecision;
-        // The common path (disabled, or below the demand threshold) does no
-        // metrics or lock work — `observe` is the only per-request cost, and a
-        // decision only runs on the rare threshold-cross. The quality gauges are
-        // seeded at startup (runtime bring-up) and refreshed only here, when the
-        // ledgers can have changed, so they never read a misleading default.
-        let PrefetchOutcome::Decided(decision) = engine.on_find_value(hash_bytes, now_secs) else {
-            return;
-        };
-        self.metrics
-            .record_prefetch_decision(PrefetchOutcome::Decided(decision));
-        if let PrefetchDecision::Acquire = decision {
-            self.metrics
-                .record_prefetch_acquire(engine.policy_requires_origin());
-            // Fire the live, bounded background acquisition (#820). Non-blocking:
-            // `try_acquire` spawns the pull and returns immediately, so the DHT
-            // serve loop is never stalled by a speculative fetch.
-            engine.try_acquire(*hash_bytes);
-        }
-        self.metrics.set_prefetch_quality(
-            engine.policy().demand_quality_ratio(now_secs),
-            engine.policy().throttle_active(now_secs),
-        );
     }
 
     fn handle_find_node(&self, req: wire::FindNodeRequest) -> wire::FindNodeResponse {

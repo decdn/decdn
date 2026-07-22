@@ -700,7 +700,6 @@ pub struct ClientHandlerDeps {
     pub pull_ahead_bytes: Option<Bytes>,
     pub leech_governor: Option<Arc<LeechGovernor>>,
     pub pull_origin_gate: Option<Arc<dyn OriginDirectory>>,
-    pub prefetch_engine: Option<Arc<crate::prefetch::PrefetchEngine>>,
     pub idle_timeout: Option<Duration>,
 }
 
@@ -762,7 +761,6 @@ impl ClientHandlerDeps {
             pull_ahead_bytes: None,
             leech_governor: None,
             pull_origin_gate: None,
-            prefetch_engine: None,
             idle_timeout: None,
         }
     }
@@ -876,9 +874,8 @@ pub struct ClientHandler {
     /// origin in this directory (`has_origin == false`) is refused with
     /// `NotFound` before any upstream pull or cache-warming write — a
     /// pull-*initiation* gate only, never consulted for a range already held.
-    /// Shares the same `OriginDirectory` the prefetch gate uses, so the namespace
-    /// / default-open (`namespaceId == 0`) / fail-closed-on-RPC-loss semantics
-    /// are identical.
+    /// Resolves against the shared `OriginDirectory` using the namespace /
+    /// default-open (`namespaceId == 0`) / fail-closed-on-RPC-loss semantics.
     pull_origin_gate: Option<Arc<dyn OriginDirectory>>,
     /// Live content deny-set (ADR 011). Consulted at three points, all of which
     /// must gate or the check is bypassable: the hash gate above the
@@ -889,11 +886,6 @@ pub struct ClientHandler {
     /// before ever reaching the serve refusal. The window-paced serve path
     /// (`window.rs`) is a fourth, independent ladder.
     pub(crate) content_deny: Arc<crate::content_deny::ContentDenylist>,
-    /// Speculative-prefetch engine (#820), set at construction via
-    /// [`ClientHandlerDeps`]. `None` in tests / when prefetch is off. When
-    /// `Some`, the serve path credits bytes served from prefetch-acquired blobs
-    /// to the demand-quality numerator.
-    prefetch_engine: Option<Arc<crate::prefetch::PrefetchEngine>>,
     rate_per_mb: Arc<AtomicU64>,
     rate_bounds: crate::rate_bounds::RateBounds,
     voucher_interval_mb: u64,
@@ -973,7 +965,6 @@ impl ClientHandler {
             leech_governor: deps.leech_governor,
             pull_origin_gate: deps.pull_origin_gate,
             content_deny: deps.content_deny,
-            prefetch_engine: deps.prefetch_engine,
             rate_per_mb: deps.rate_per_mb,
             rate_bounds: deps.rate_bounds,
             voucher_interval_mb: deps.voucher_interval_mb,

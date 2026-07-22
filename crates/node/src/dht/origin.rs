@@ -67,11 +67,9 @@ pub trait OriginDirectory: Send + Sync + std::fmt::Debug {
     fn lookup_origins(&self, hash: &Hash) -> Vec<NodeId>;
 
     /// Whether at least one authorised origin exists for `hash`, without
-    /// materialising the candidate list. The prefetch authorized-origin
-    /// gate (ADR 022 §Prefetch Decision) calls this on the threshold-cross
-    /// path purely to test emptiness; the default delegates to
-    /// `lookup_origins`, but `Vec`-backed implementations SHOULD override
-    /// to avoid the clone.
+    /// materialising the candidate list. Callers that only need an emptiness
+    /// test use this; the default delegates to `lookup_origins`, but
+    /// `Vec`-backed implementations SHOULD override to avoid the clone.
     fn has_origin(&self, hash: &Hash) -> bool {
         !self.lookup_origins(hash).is_empty()
     }
@@ -92,8 +90,6 @@ pub trait OriginDirectory: Send + Sync + std::fmt::Debug {
 ///
 /// - the FIND\_VALUE fallback resolves nothing, so a DHT miss reports the blob
 ///   unavailable on the network;
-/// - the prefetch gate (`prefetch.require_authorized_origin`) skips **every**
-///   hash as `Unauthorized`, silently disabling prefetch;
 /// - the pull-through gate (`cache.pull_through_require_authorized_origin`)
 ///   refuses **every** cache miss with a wire `NotFound`, which is
 ///   indistinguishable from a plain miss.
@@ -198,8 +194,8 @@ mod tests {
     #[test]
     fn has_origin_matches_lookup_emptiness_without_cloning() {
         // The clone-free `has_origin` override must agree with
-        // `!lookup_origins(..).is_empty()` for the prefetch gate: present,
-        // absent, and the edge case of a hash mapped to an empty vec.
+        // `!lookup_origins(..).is_empty()`: present, absent, and the edge case
+        // of a hash mapped to an empty vec.
         let mut m = HashMap::new();
         m.insert(h(1), vec![nid(0xA)]);
         m.insert(h(2), Vec::new()); // present key, no origins

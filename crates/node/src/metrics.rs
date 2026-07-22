@@ -1070,14 +1070,6 @@ pub struct DecdnMetrics {
     /// a sustained rate HERE points at disk, not peers. Field has no `_total`
     /// suffix because the `OpenMetrics` encoder appends it.
     pub node_pull_through_local_tee_failed: Counter,
-    /// `decdn_node_pull_delta_overflow_total` (#820): per-pull prefetch-ledger
-    /// spend/byte deltas that exceeded `u64` when narrowed from `U256` and were
-    /// clamped to `0` (the conservative under-count direction). A real per-pull
-    /// delta never approaches `u64::MAX`, so any nonzero value signals upstream
-    /// voucher-accounting corruption — otherwise visible only by log-grep of the
-    /// `narrow_pull_delta` warning. Field has no `_total` suffix because the
-    /// `OpenMetrics` encoder appends it.
-    pub node_pull_delta_overflow: Counter,
     /// `decdn_reputation_indexer_rpc_failures_total` (#326): failing poll ticks —
     /// the settlement indexer's `get_logs`/head RPC errored, or a `nodeIdOf`
     /// party-resolution RPC (in the sink's `apply`) failed. Both now propagate to
@@ -1105,8 +1097,8 @@ pub struct DecdnMetrics {
     /// Same semantics as `staker_set_watcher_restarts` — bumped once on the
     /// transition into the error/backoff state, not per backoff iteration.
     /// During such a window the cached `namespace → operator` directory can
-    /// drift from chain state, and the prefetch authorized-origin gate reads
-    /// that cache, so sustained restarts gate real prefetch demand. The
+    /// drift from chain state, and the pull-through authorized-origin gate reads
+    /// that cache, so sustained restarts gate real pull-through demand. The
     /// `OpenMetrics` encoder appends the `_total` suffix.
     pub origin_directory_watcher_restarts: Counter,
     /// `decdn_origin_directory_bootstrap_range_anomaly_total` (#1152): boots on
@@ -1138,56 +1130,6 @@ pub struct DecdnMetrics {
     /// mutates an authorised set, so it rises on activate/add and falls on
     /// revoke/prune/remove/replace (unlike the monotonic binding cache).
     pub origin_directory_operator_count: Gauge,
-    /// `1` if `prefetch.enabled`, else `0` (ADR 022 §Prefetch Decision;
-    /// appendix-observability §Prefetch Metrics). Stable schema across nodes:
-    /// every node reports the prefetch family regardless of whether the
-    /// feature is on. Visible name: `decdn_prefetch_enabled`.
-    pub prefetch_enabled: Gauge,
-    /// Prefetch acquisitions that passed the authorized-origin gate. Visible
-    /// name: `decdn_prefetch_acquisitions_authorized_total`. (A plain counter
-    /// field carries no label dimension, so the appendix's `{gate_result=…}`
-    /// split is realized as three sibling counters, mirroring
-    /// `dht_rate_limit_rejected_*`.)
-    pub prefetch_acquisitions_authorized: Counter,
-    /// Prefetch attempts rejected by the authorized-origin gate. Visible name:
-    /// `decdn_prefetch_acquisitions_unauthorized_total`.
-    pub prefetch_acquisitions_unauthorized: Counter,
-    /// Prefetch acquisitions where the origin gate was disabled (bypassed).
-    /// Visible name: `decdn_prefetch_acquisitions_bypassed_total`.
-    pub prefetch_acquisitions_bypassed: Counter,
-    /// Cumulative micro-USDC paid for prefetch acquisitions (#820). Incremented
-    /// on each prefetch-initiated paid pull that acked vouchers — a success OR a
-    /// paid-but-failed delivery (whose voucher watermark advanced) — so it tracks
-    /// all speculative spend, not just successes. Visible name:
-    /// `decdn_prefetch_spend_usdc_total`.
-    pub prefetch_spend_usdc: Counter,
-    /// Times the rolling-1h prefetch budget was hit, blocking acquisitions
-    /// until the window advanced. Visible name:
-    /// `decdn_prefetch_budget_exhaustion_events_total`.
-    pub prefetch_budget_exhaustion_events: Counter,
-    /// Prefetch attempts skipped by the origin gate (identical by construction
-    /// to `prefetch_acquisitions_unauthorized`; surfaced standalone for
-    /// alerting). Visible name: `decdn_prefetch_origin_gate_rejections_total`.
-    pub prefetch_origin_gate_rejections: Counter,
-    /// Current rolling-window `served / acquired` ratio scaled ×1000 (an
-    /// integer gauge — `iroh_metrics::Gauge` is integer-valued). Visible name:
-    /// `decdn_prefetch_demand_quality_ratio_milli`.
-    pub prefetch_demand_quality_ratio_milli: Gauge,
-    /// `1` while the demand-quality auto-throttle suppresses prefetch, else
-    /// `0`. Visible name: `decdn_prefetch_throttle_active`.
-    pub prefetch_throttle_active: Gauge,
-    /// Speculative acquisitions whose pull-through completed and cached the blob
-    /// (#820). Visible name: `decdn_prefetch_acquire_succeeded_total`.
-    pub prefetch_acquire_succeeded: Counter,
-    /// Speculative acquisitions whose pull-through found no source or errored
-    /// (#820). Visible name: `decdn_prefetch_acquire_failed_total`.
-    pub prefetch_acquire_failed: Counter,
-    /// Speculative acquisitions that hit their per-acquisition deadline (#820).
-    /// Visible name: `decdn_prefetch_acquire_timeout_total`.
-    pub prefetch_acquire_timeout: Counter,
-    /// Speculative acquisitions dropped because the concurrency cap was full
-    /// (#820). Visible name: `decdn_prefetch_acquire_dropped_saturated_total`.
-    pub prefetch_acquire_dropped_saturated: Counter,
     /// Paid-delivery (`serve_stream`) requests refused because the blob was
     /// deliberately evicted between probe and stream (#279). One `Counter` per
     /// reason — like the `dispatch_rejected_*` convention — because a plain counter
@@ -1562,60 +1504,6 @@ impl Metrics {
         Ok(())
     }
 
-    /// Record the outcome of a prefetch decision against the skip counters.
-    /// The would-acquire split (authorized vs bypassed) is recorded separately
-    /// by [`Self::record_prefetch_acquire`].
-    pub fn record_prefetch_decision(&self, outcome: crate::prefetch::PrefetchOutcome) {
-        use crate::prefetch::PrefetchOutcome;
-        use crate::prefetch::decision::{PrefetchDecision, SkipReason};
-        let PrefetchOutcome::Decided(PrefetchDecision::Skip(reason)) = outcome else {
-            return;
-        };
-        match reason {
-            SkipReason::Unauthorized => {
-                self.decdn.prefetch_acquisitions_unauthorized.inc();
-                self.decdn.prefetch_origin_gate_rejections.inc();
-            }
-            SkipReason::BudgetExhausted => {
-                self.decdn.prefetch_budget_exhaustion_events.inc();
-            }
-            SkipReason::Disabled | SkipReason::Throttled => {}
-        }
-    }
-
-    /// Record a would-acquire decision, split by whether the origin gate was
-    /// applied (`authorized`) or disabled (`bypassed`).
-    pub fn record_prefetch_acquire(&self, gate_applied: bool) {
-        if gate_applied {
-            self.decdn.prefetch_acquisitions_authorized.inc();
-        } else {
-            self.decdn.prefetch_acquisitions_bypassed.inc();
-        }
-    }
-
-    /// Refresh the demand-quality gauges from the policy state. `ratio` is
-    /// scaled ×1000 into the integer gauge; non-finite/negative ratios report
-    /// `0`.
-    #[allow(
-        clippy::cast_precision_loss,
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss
-    )] // ratio is a small non-negative f64; the clamp keeps `as i64` in range.
-    pub fn set_prefetch_quality(&self, ratio: f64, throttled: bool) {
-        let milli = (ratio * 1000.0).round();
-        let milli = if !milli.is_finite() || milli <= 0.0 {
-            0
-        } else if milli >= i64::MAX as f64 {
-            i64::MAX
-        } else {
-            milli as i64
-        };
-        self.decdn.prefetch_demand_quality_ratio_milli.set(milli);
-        self.decdn
-            .prefetch_throttle_active
-            .set(i64::from(throttled));
-    }
-
     /// Record a buyer `openChannel`-tx failure broken out by cause (#966): bumps
     /// the `decdn_channel_open_failures_{reason}_total` sibling counter for
     /// `reason`. Pairs with the structured `reason` field on the `warn!`/`debug!`
@@ -1934,27 +1822,6 @@ recorders! {
     /// `RateFloorViolation` settlement guard (#846).
     voucher_rate_floor_rejected => voucher_rate_floor_rejections.inc();
 
-    /// Set the `decdn_prefetch_enabled` gauge once at startup (ADR 022
-    /// §Prefetch; appendix-observability §Prefetch Metrics).
-    set_prefetch_enabled(enabled: bool) => prefetch_enabled.set(i64::from(enabled));
-
-    /// Add `micro_usdc` to the cumulative prefetch spend (#820). Called from the
-    /// acquisition observer on each prefetch-initiated paid pull that acked
-    /// vouchers, whether it ultimately succeeded or failed after paying.
-    add_prefetch_spend(micro_usdc: u64) => prefetch_spend_usdc.inc_by(micro_usdc);
-
-    /// A speculative acquisition cached the blob (#820).
-    prefetch_acquire_succeeded => prefetch_acquire_succeeded.inc();
-
-    /// A speculative acquisition found no source or errored (#820).
-    prefetch_acquire_failed => prefetch_acquire_failed.inc();
-
-    /// A speculative acquisition hit its per-acquisition deadline (#820).
-    prefetch_acquire_timeout => prefetch_acquire_timeout.inc();
-
-    /// A speculative acquisition was dropped at the concurrency cap (#820).
-    prefetch_acquire_dropped_saturated => prefetch_acquire_dropped_saturated.inc();
-
     /// An accepted voucher skipped one or more nonce values past
     /// `last_nonce + 1` (#747). Counted once per gapped voucher; the precise
     /// skip count rides the paired `tracing::warn!` in `apply_voucher`.
@@ -2252,10 +2119,6 @@ recorders! {
     /// already-paid upstream chunk failed (#856) — a store fault, not a downstream
     /// client drop.
     node_pull_through_local_tee_failed => node_pull_through_local_tee_failed.inc();
-
-    /// A per-pull prefetch-ledger delta overflowed `u64` and was clamped to `0`
-    /// (#820) — a signal of upstream voucher-accounting corruption.
-    node_pull_delta_overflow => node_pull_delta_overflow.inc();
 
     /// A buyer→upstream pull hit this node's own `pull_timeout` deadline (#857).
     /// A buyer-side condition, so it does not score the provider's reputation.
@@ -3923,42 +3786,6 @@ mod tests {
         assert!(
             has_metric_line(&text, "decdn_quic_session_ticket_peers_dropped_total", 50),
             "expected 50 dropped peers, got:\n{text}"
-        );
-    }
-
-    #[test]
-    fn prefetch_quality_gauges_clamp_and_track_throttle() {
-        let metrics = Metrics::new();
-
-        // Non-finite / negative ratios (a poisoned-lock fallback, or arithmetic
-        // upstream) must clamp the milli gauge to 0, never emit garbage — this
-        // exercises the `!is_finite()` / `<= 0.0` branch of set_prefetch_quality.
-        for bad in [f64::NAN, f64::NEG_INFINITY, -1.0] {
-            metrics.set_prefetch_quality(bad, false);
-            let text = metrics.encode().unwrap();
-            assert!(
-                has_metric_line(&text, "decdn_prefetch_demand_quality_ratio_milli", 0),
-                "ratio {bad} must clamp to 0, got:\n{text}"
-            );
-        }
-
-        // Healthy ratio scales ×1000, and the throttle gauge transitions
-        // 0 -> 1 -> 0 as `throttled` flips — no latch (level-triggered, ADR 022).
-        metrics.set_prefetch_quality(0.25, true);
-        let text = metrics.encode().unwrap();
-        assert!(
-            has_metric_line(&text, "decdn_prefetch_demand_quality_ratio_milli", 250),
-            "0.25 should scale to 250 milli, got:\n{text}"
-        );
-        assert!(
-            has_metric_line(&text, "decdn_prefetch_throttle_active", 1),
-            "throttle active should read 1, got:\n{text}"
-        );
-        metrics.set_prefetch_quality(1.0, false);
-        let text = metrics.encode().unwrap();
-        assert!(
-            has_metric_line(&text, "decdn_prefetch_throttle_active", 0),
-            "throttle must clear to 0 once recovered (no latch), got:\n{text}"
         );
     }
 

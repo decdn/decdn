@@ -896,7 +896,6 @@ impl RuntimeReloadState {
             dht: decdn_common::config::ResolvedDht::default(),
             probe: decdn_common::config::ResolvedProbe::default(),
             receipts: decdn_common::config::ResolvedReceipts::default(),
-            prefetch: decdn_common::config::ResolvedPrefetch::default(),
             content: decdn_common::config::ResolvedContent::default(),
         };
         Self::new(
@@ -1164,14 +1163,6 @@ fn warn_restart_required_sections(file: &decdn_common::config::FileConfig) {
         // restart.
         warn_ignored("receipts.* (max_file_bytes, retained_files)");
     }
-    if file.prefetch.is_some() {
-        // The prefetch scheduler wires its budget/threshold knobs once at
-        // bring-up; none are hot-reloadable.
-        warn_ignored(
-            "prefetch.* (enabled, require_authorized_origin, budget_usdc_per_hour, \
-             thresholds, concurrency, timeout)",
-        );
-    }
     // `security.*` is fully reloadable — see `RuntimeReloadState::reload`'s
     // commit step. Invalid values reject the entire reload via
     // `resolve_security` upstream rather than landing here.
@@ -1406,7 +1397,6 @@ mod tests {
             receipts: decdn_common::config::ResolvedReceipts::default(),
             dht: decdn_common::config::ResolvedDht::default(),
             probe: decdn_common::config::ResolvedProbe::default(),
-            prefetch: decdn_common::config::ResolvedPrefetch::default(),
             content: decdn_common::config::ResolvedContent::default(),
         }
     }

@@ -144,7 +144,6 @@ fn seed_resolved(rate: u64, level: LogLevel) -> ResolvedConfig {
         dht: decdn_common::config::ResolvedDht::default(),
         probe: decdn_common::config::ResolvedProbe::default(),
         receipts: decdn_common::config::ResolvedReceipts::default(),
-        prefetch: decdn_common::config::ResolvedPrefetch::default(),
         content: decdn_common::config::ResolvedContent::default(),
     }
 }
@@ -543,13 +542,13 @@ async fn sighup_applies_mutable_but_rejects_restart_required_fields() {
 
     // --- Reload #2: mutable fields change (payment/log_level, which apply)
     //     bundled with restart-required ones. network/blockchain/identity/
-    //     gossip/dht/probe/receipts/prefetch warn on presence; `[cache]`
+    //     gossip/dht/probe/receipts warn on presence; `[cache]`
     //     warns because it sets the non-reloadable `cache_dir` (a
     //     pinned_hashes-only edit would not); `[observability]` does NOT warn
     //     because it sets only the reloadable `log_level`; `[payment]` sets
     //     only the reloadable `rate_per_mb` and `[security]` is fully
     //     reloadable, so neither warns. Empty `[dht]`/`[probe]`/`[receipts]`/
-    //     `[prefetch]`/`[security]` tables are "present" so they exercise
+    //     `[security]` tables are "present" so they exercise
     //     those emitter branches.
     write_config(
         &path,
@@ -570,7 +569,6 @@ async fn sighup_applies_mutable_but_rejects_restart_required_fields() {
          [dht]\n\n\
          [probe]\n\n\
          [receipts]\n\n\
-         [prefetch]\n\n\
          [security]\n",
     );
     raise_sighup_soon();
@@ -605,7 +603,6 @@ async fn sighup_applies_mutable_but_rejects_restart_required_fields() {
         "dht",
         "probe",
         "receipts",
-        "prefetch",
     ] {
         assert_eq!(
             notice_count(&logs, section),

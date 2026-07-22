@@ -97,7 +97,7 @@ pub struct ResolvedBlockchain {
     /// `OriginAssignment` contract address. `Some` only when the operator
     /// opts into the chain-backed origin directory (paired with
     /// `publisher_registry_address`); `None` => empty deny-all directory, so
-    /// the prefetch authorized-origin gate finds no origins (ADR 022).
+    /// the pull-through authorized-origin gate finds no origins (ADR 022).
     pub origin_assignment_address: Option<String>,
     /// `PublisherRegistry` contract address. Set together with
     /// `origin_assignment_address` (both-or-neither, enforced at resolution).
@@ -604,44 +604,6 @@ impl Default for ResolvedReceipts {
     }
 }
 
-/// Resolved speculative-prefetch policy (ADR 022 §Prefetch Decision).
-///
-/// All fields validated by the resolver: `find_value_threshold > 0`,
-/// `threshold_window_secs > 0`, `demand_quality_window_secs > 0`, and
-/// `demand_quality_min_ratio` finite in `[0.0, 1.0]`. `Default` reuses the
-/// `DEFAULT_PREFETCH_*` resolver constants so hand-built `ResolvedConfig`s in
-/// tests cannot drift from production defaults.
-#[derive(Debug, Clone, Copy)]
-pub struct ResolvedPrefetch {
-    pub enabled: bool,
-    pub require_authorized_origin: bool,
-    pub budget_usdc_per_hour: u64,
-    pub find_value_threshold: u32,
-    pub threshold_window_secs: u64,
-    pub demand_quality_min_ratio: f64,
-    pub demand_quality_window_secs: u64,
-    /// Max prefetch acquisitions running concurrently (#820). `> 0`.
-    pub max_concurrent_acquisitions: u32,
-    /// Per-acquisition pull-through deadline in seconds (#820). `> 0`.
-    pub acquisition_timeout_secs: u64,
-}
-
-impl Default for ResolvedPrefetch {
-    fn default() -> Self {
-        Self {
-            enabled: super::DEFAULT_PREFETCH_ENABLED,
-            require_authorized_origin: super::DEFAULT_PREFETCH_REQUIRE_AUTHORIZED_ORIGIN,
-            budget_usdc_per_hour: super::DEFAULT_PREFETCH_BUDGET_USDC_PER_HOUR,
-            find_value_threshold: super::DEFAULT_PREFETCH_FIND_VALUE_THRESHOLD,
-            threshold_window_secs: super::DEFAULT_PREFETCH_THRESHOLD_WINDOW_SECS,
-            demand_quality_min_ratio: super::DEFAULT_PREFETCH_DEMAND_QUALITY_MIN_RATIO,
-            demand_quality_window_secs: super::DEFAULT_PREFETCH_DEMAND_QUALITY_WINDOW_SECS,
-            max_concurrent_acquisitions: super::DEFAULT_PREFETCH_MAX_CONCURRENT_ACQUISITIONS,
-            acquisition_timeout_secs: super::DEFAULT_PREFETCH_ACQUISITION_TIMEOUT_SECS,
-        }
-    }
-}
-
 /// Fully resolved node configuration.
 ///
 /// Every field has a value determined by the three-layer merge:
@@ -663,7 +625,6 @@ pub struct ResolvedConfig {
     pub dht: ResolvedDht,
     pub probe: ResolvedProbe,
     pub receipts: ResolvedReceipts,
-    pub prefetch: ResolvedPrefetch,
     pub content: ResolvedContent,
 }
 
