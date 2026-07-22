@@ -375,6 +375,21 @@ pub fn write_validate_summary<W: std::io::Write>(
         "  prefetch_acquisitions:    max {} concurrent, {}s timeout",
         resolved.prefetch.max_concurrent_acquisitions, resolved.prefetch.acquisition_timeout_secs
     )?;
+    // Counts, not contents. An operator running `config validate` after adding a
+    // takedown wants confirmation the entries were accepted — and a zero here is
+    // the tell that a `[content]` section landed in the wrong file. Printing the
+    // hashes themselves would put the subject of a legal order into terminal
+    // scrollback and any CI log that captures it.
+    writeln!(
+        w,
+        "  content.denied_hashes:    {}",
+        resolved.content.denied_hashes.len()
+    )?;
+    writeln!(
+        w,
+        "  content.denied_origins:   {}",
+        resolved.content.denied_origins.len()
+    )?;
     Ok(())
 }
 
@@ -557,6 +572,21 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # demand_quality_window_secs = 3600         # rolling-window length for the demand-quality predicate
 # max_concurrent_acquisitions = 4           # cap on background speculative pulls in flight
 # acquisition_timeout_secs = 30             # per-acquisition pull-through deadline
+
+[content]
+# ADR 011 local denylist — this operator's own removal lever, independent of
+# governance. Entries take effect on `decdn node reload` (no restart), are never
+# gossiped, and bind only this node. This is the fastest removal path the
+# protocol offers and the one sized to a sub-day statutory deadline (e.g. the EU
+# TCO one-hour clock), because it is entirely within the order recipient's
+# control. Refused requests are signed as HashBlacklisted / OriginBlacklisted,
+# which do not reveal whether the entry is local or on-chain.
+#
+# Hashes are bare 64-char lowercase hex — the same spelling as
+# cache.pinned_hashes. An invalid entry FAILS startup rather than being skipped:
+# a typo in a takedown must not silently leave content served.
+# denied_hashes = ["0000000000000000000000000000000000000000000000000000000000000000"]
+# denied_origins = ["0x000000000000000000000000000000000000dEaD"]   # operator addresses whose channels are refused (the zero address is rejected)
 "#;
 
 #[cfg(test)]
@@ -581,5 +611,6 @@ mod tests {
         assert!(parsed.dht.is_some(), "[dht.rate_limit] header parsed");
         assert!(parsed.probe.is_some(), "[probe.rate_limit] header parsed");
         assert!(parsed.receipts.is_some(), "[receipts] header parsed");
+        assert!(parsed.content.is_some(), "[content] header parsed");
     }
 }

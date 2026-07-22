@@ -189,6 +189,23 @@ impl PeerTable {
         before - self.entries.len()
     }
 
+    /// Remove one peer by `NodeId`, regardless of TTL. Returns whether an entry
+    /// was actually present.
+    ///
+    /// The eviction path for ADR 011 § Hash Evasion and Origin Blacklisting:
+    /// "the operator's registered `NodeId` is excluded from peer tables … any
+    /// existing peer-table entry is removed". [`Self::evict_expired`] cannot
+    /// serve that — it is a TTL sweep, and waiting out a TTL is not a removal.
+    ///
+    /// **Removal alone is not durable.** [`Self::insert_or_refresh`] re-admits
+    /// the peer on its very next announce, so a caller removing a peer for cause
+    /// must also refuse its re-entry at the admission gate
+    /// (`validation::AnnounceGate`). Removing without gating buys one gossip
+    /// interval and nothing more.
+    pub fn remove(&mut self, node_id: &[u8; 32]) -> bool {
+        self.entries.remove(node_id).is_some()
+    }
+
     /// Iterate over all current entries. Order is unspecified.
     pub fn iter(&self) -> impl Iterator<Item = (&[u8; 32], &PeerEntry)> {
         self.entries.iter()
@@ -219,6 +236,62 @@ mod tests {
             },
             signature: vec![0u8; 64],
         }
+    }
+
+    /// ADR 011 § Hash Evasion and Origin Blacklisting: a blacklisted origin's
+    /// `NodeId` must leave the table on demand, not on TTL expiry.
+    #[test]
+    fn remove_drops_the_named_peer_only() {
+        let mut t = PeerTable::new(0, 0);
+        t.insert_or_refresh(mk_announce([1u8; 32], 10), 100)
+            .unwrap();
+        t.insert_or_refresh(mk_announce([2u8; 32], 10), 100)
+            .unwrap();
+
+        assert!(t.remove(&[1u8; 32]));
+        assert_eq!(t.len(), 1);
+        assert!(t.get(&[1u8; 32]).is_none());
+        assert!(t.get(&[2u8; 32]).is_some(), "the other peer is untouched");
+    }
+
+    #[test]
+    fn remove_reports_absence_rather_than_panicking() {
+        let mut t = PeerTable::new(0, 0);
+        assert!(!t.remove(&[9u8; 32]));
+    }
+
+    /// `remove` works where `evict_expired` cannot: with TTL disabled
+    /// (`ttl_us == 0`, the production default when `gossip.peer_ttl_sec` is
+    /// unset) the sweep is a no-op, so removal-for-cause has no other path.
+    #[test]
+    fn remove_works_with_ttl_disabled_where_the_sweep_is_a_noop() {
+        let mut t = PeerTable::new(0, 0);
+        t.insert_or_refresh(mk_announce([3u8; 32], 10), 100)
+            .unwrap();
+        assert_eq!(t.evict_expired(u64::MAX), 0, "TTL sweep is disabled");
+        assert!(t.remove(&[3u8; 32]));
+        assert!(t.is_empty());
+    }
+
+    /// Removal alone is not durable — the peer walks back in on its next
+    /// announce. Pinned so the doc's warning cannot quietly become false, and so
+    /// anyone relying on `remove` as a ban discovers the gap here.
+    #[test]
+    fn removed_peer_is_readmitted_by_its_next_announce() {
+        let mut t = PeerTable::new(0, 0);
+        t.insert_or_refresh(mk_announce([4u8; 32], 10), 100)
+            .unwrap();
+        assert!(t.remove(&[4u8; 32]));
+
+        let outcome = t
+            .insert_or_refresh(mk_announce([4u8; 32], 11), 200)
+            .unwrap();
+        assert_eq!(
+            outcome,
+            InsertOutcome::Inserted,
+            "re-admitted, not refreshed"
+        );
+        assert_eq!(t.len(), 1);
     }
 
     #[test]

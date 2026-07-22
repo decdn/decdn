@@ -145,6 +145,7 @@ fn seed_resolved(rate: u64, level: LogLevel) -> ResolvedConfig {
         probe: decdn_common::config::ResolvedProbe::default(),
         receipts: decdn_common::config::ResolvedReceipts::default(),
         prefetch: decdn_common::config::ResolvedPrefetch::default(),
+        content: decdn_common::config::ResolvedContent::default(),
     }
 }
 

@@ -6,7 +6,11 @@
 
 #![allow(dead_code)] // Fields will be consumed by the node runtime.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
+
+use alloy::primitives::Address;
+use decdn_config_types::DeniedHashes;
 
 use crate::cli::common::{LogFormat, LogLevel};
 
@@ -660,4 +664,22 @@ pub struct ResolvedConfig {
     pub probe: ResolvedProbe,
     pub receipts: ResolvedReceipts,
     pub prefetch: ResolvedPrefetch,
+    pub content: ResolvedContent,
+}
+
+/// Resolved local content denylist (ADR 011 §Local Denylist).
+///
+/// Both sets are hot-reloadable: a takedown order with a sub-day deadline must
+/// not require a restart to discharge.
+#[derive(Debug, Clone, Default)]
+pub struct ResolvedContent {
+    /// Blob hashes refused at the delivery path. A distinct type from
+    /// [`ResolvedCache::pinned_hashes`]'s `PinnedHashes` on purpose — the two
+    /// are both hash sets meaning opposite things, and confusing them would pin
+    /// content the operator was ordered to remove.
+    pub denied_hashes: DeniedHashes,
+    /// Operator addresses whose channels are refused. Unioned with the on-chain
+    /// origin blacklist at the gate, so the wire refusal cannot distinguish a
+    /// local entry from a governance one (ADR 011 §`StreamRequest` Response).
+    pub denied_origins: HashSet<Address>,
 }

@@ -6,8 +6,8 @@
 //! - **Global compliance (`global_blacklist_compliance`):** a node holds and
 //!   serves blob `H`; governance adds `H` to `ContentBlacklist`; the node's
 //!   blacklist watcher evicts `H` (asserted via admin `evict` dry-run flipping
-//!   `was_present` true→false), then refuses paid delivery *with the eviction
-//!   reason* (`EvictedSinceProbe`, not a bare error), and its probe handler
+//!   `was_present` true→false), then refuses paid delivery *with the blacklist
+//!   reason* (`HashBlacklisted`, not a bare error), and its probe handler
 //!   reports `has_blob: false`. Eviction is durable across a daemon restart.
 //!   Finally, a signed post-entry `ProbeResponse` for `H` is driven through the
 //!   `SlashJudge` commit-reveal to prove serving-after-blacklist is slashable.
@@ -23,10 +23,10 @@
 //!   catches it.
 //!
 //! **Coverage.** The journey exercises all three serving seams end-to-end
-//! against the daemon — delivery refusal (matched to `EvictedSinceProbe`), the
+//! against the daemon — delivery refusal (matched to `HashBlacklisted`), the
 //! probe handler (`has_blob: false`), and on-chain slashability. DHT
 //! announce-suppression stays delegated to `crates/node/src/dht/publish.rs`
-//! unit tests (its `is_evicted` gate). `SlashJudge` enforces slashability from
+//! unit tests (its `refuses` gate). `SlashJudge` enforces slashability from
 //! an entry's `effectiveAt` (`addedAt + complianceWindow`, ADR 011 § Compliance
 //! Window, #1169), so the slash drive advances chain time past that window
 //! before stamping evidence — the node's *reaction* budget is now an on-chain
@@ -137,9 +137,9 @@ async fn run_global() -> anyhow::Result<()> {
         "node never evicted the blacklisted blob H"
     );
 
-    // ...the paid client path now refuses delivery for the eviction reason
+    // ...the paid client path now refuses delivery for the blacklist reason
     // specifically (not some unrelated channel/connect/payment failure).
-    assert_refused_as_evicted(&chain, &node, hash).await?;
+    assert_refused_as_blacklisted(&chain, &node, hash).await?;
 
     // ...and the probe handler stops signing `has_blob: true` (the phantom-blob
     // slash seam — distinct from the delivery path above).
@@ -149,13 +149,17 @@ async fn run_global() -> anyhow::Result<()> {
         "daemon must report has_blob:false for an evicted blacklisted blob"
     );
 
-    // Eviction is durable across a daemon restart.
+    // Eviction is durable across a daemon restart — and so is its *cause*. The
+    // refusal assertion below is the cross-layer proof of the governance deny
+    // projection: `evicted.log` alone would bring the node back up answering
+    // `EvictedSinceProbe`, silently re-opening the wire-code fingerprint that
+    // distinguishes a governance takedown from this operator's private denylist.
     node.restart().await?;
     assert!(
         !evict_was_present(&admin, hash).await?,
         "eviction must survive a restart (evicted.log)"
     );
-    assert_refused_as_evicted(&chain, &node, hash).await?;
+    assert_refused_as_blacklisted(&chain, &node, hash).await?;
 
     // Full signed-evidence drive: serving H after the entry is on-chain
     // slashable via SlashJudge.
@@ -164,10 +168,10 @@ async fn run_global() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Assert a paid fetch of `hash` from `node` is refused *for the eviction
-/// reason* — matching `EvictedSinceProbe` so a channel/connect/payment
+/// Assert a paid fetch of `hash` from `node` is refused *for the blacklist
+/// reason* — matching `HashBlacklisted` so a channel/connect/payment
 /// regression that also fails the fetch cannot green this check.
-async fn assert_refused_as_evicted(
+async fn assert_refused_as_blacklisted(
     chain: &ChainFixture,
     node: &NodeFixture,
     hash: Hash,
@@ -179,9 +183,17 @@ async fn assert_refused_as_evicted(
         .err()
         .ok_or_else(|| anyhow::anyhow!("fetch of an evicted blacklisted blob must fail"))?;
     let msg = format!("{err:#}");
+    // `HashBlacklisted`, NOT `EvictedSinceProbe`. A governance takedown and this
+    // operator's own `[content] denied_hashes` must be one wire code (ADR 011
+    // §`StreamRequest` Response) — answering governance from the eviction arm
+    // made the local-denylist code a unique fingerprint for an operator's
+    // private legal exposure. This assertion is the cross-layer half of the unit
+    // test `local_and_governance_hash_denials_share_one_wire_code`: it proves the
+    // watcher's deny actually reaches the wire on a real deployment, which is
+    // where the earlier version of this feature broke.
     anyhow::ensure!(
-        msg.contains("EvictedSinceProbe"),
-        "refusal must be the eviction reason, got: {msg}"
+        msg.contains("HashBlacklisted"),
+        "refusal must be the blacklist reason, got: {msg}"
     );
     Ok(())
 }

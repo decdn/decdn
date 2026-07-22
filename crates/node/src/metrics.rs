@@ -1253,6 +1253,43 @@ pub struct DecdnMetrics {
     /// ranges. Visible name:
     /// `decdn_serve_stream_rejected_range_not_satisfiable_total`.
     pub serve_stream_rejected_range_not_satisfiable: Counter,
+    /// Delivery refused because the blob is on this operator's local denylist
+    /// (ADR 011 §Local Denylist). Signed as `HashBlacklisted`. Deliberately
+    /// counts ONLY the local list; the governance blacklist has its own
+    /// counter, [`Self::serve_stream_rejected_chain_hash_denied`]. Splitting
+    /// them here is safe where the wire code must not: this is the operator's
+    /// own gauge of their own denylist, not something a client can probe. A
+    /// rising value after a takedown is the confirmation the order is being
+    /// discharged. Visible name:
+    /// `decdn_serve_stream_rejected_hash_denied_total`.
+    pub serve_stream_rejected_hash_denied: Counter,
+    /// Delivery refused because the blob is on the *governance* blacklist (ADR
+    /// 011 §On Blacklist Event). Also signed as `HashBlacklisted` — identically
+    /// to the local list, which is the ADR's requirement — so this counter is
+    /// the only place the two are distinguishable, and it is readable by the
+    /// operator alone. Visible name:
+    /// `decdn_serve_stream_rejected_chain_hash_denied_total`.
+    ///
+    /// Not to be confused with `serve_stream_rejected_evicted_since_probe`,
+    /// which governance refusals used to land on: that counter now sees only
+    /// evictions with no blacklist entry behind them (corruption recovery, a
+    /// manual `decdn node evict`).
+    pub serve_stream_rejected_chain_hash_denied: Counter,
+    /// Delivery refused because the channel's funding address is blacklisted as
+    /// an origin — local `denied_origins` or the on-chain `ContentBlacklist`
+    /// (ADR 011 §On Blacklist Event). Signed as `OriginBlacklisted`. Visible
+    /// name: `decdn_serve_stream_rejected_origin_denied_total`.
+    pub serve_stream_rejected_origin_denied: Counter,
+    /// An ALREADY-RUNNING delivery cut off at an MB boundary because a takedown
+    /// landed after the stream opened (ADR 011 §On Blacklist Event). Visible
+    /// name: `decdn_serve_stream_terminated_takedown_total`.
+    ///
+    /// Distinct from the `rejected_*` family above, which counts refusals at
+    /// stream open. This one is the operator's evidence that the compliance
+    /// window was honored for traffic already in flight — the case that would
+    /// otherwise keep a multi-GB blob flowing for minutes after the order took
+    /// effect, which is the slashable one.
+    pub serve_stream_terminated_takedown: Counter,
 
     // ---- Uniform watcher liveness + panic surface (#1316, #1320) ----
     //
@@ -2170,6 +2207,22 @@ recorders! {
     /// range is out of bounds for the blob (ADR 005 §Bounded byte ranges).
     serve_stream_rejected_range_not_satisfiable
         => serve_stream_rejected_range_not_satisfiable.inc();
+
+    /// Record a `serve_stream` delivery refused because the blob is on the
+    /// operator's local denylist (ADR 011 §Local Denylist).
+    serve_stream_rejected_hash_denied => serve_stream_rejected_hash_denied.inc();
+
+    /// Record a `serve_stream` delivery refused because the blob is on the
+    /// governance blacklist (ADR 011 §On Blacklist Event).
+    serve_stream_rejected_chain_hash_denied => serve_stream_rejected_chain_hash_denied.inc();
+
+    /// Record a `serve_stream` delivery refused because the channel's funding
+    /// address is a blacklisted origin (ADR 011 §On Blacklist Event).
+    serve_stream_rejected_origin_denied => serve_stream_rejected_origin_denied.inc();
+
+    /// Record an in-flight delivery cut off at an MB boundary because a takedown
+    /// landed after the stream opened (ADR 011 §On Blacklist Event).
+    serve_stream_terminated_takedown => serve_stream_terminated_takedown.inc();
 
     /// The window-paced serve loop paused the upstream pull at `pull_ahead_bytes`
     /// to wait for the downstream voucher to clear (#856).
