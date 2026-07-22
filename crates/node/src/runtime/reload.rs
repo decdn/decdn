@@ -1044,8 +1044,7 @@ fn warn_restart_required_sections(file: &decdn_common::config::FileConfig) {
         // The prefetch scheduler wires its budget/threshold knobs once at
         // bring-up; none are hot-reloadable.
         warn_ignored(
-            "prefetch.* (enabled, require_authorized_origin, budget_usdc_per_hour, \
-             thresholds, concurrency, timeout)",
+            "prefetch.* (enabled, budget_usdc_per_hour, thresholds, concurrency, timeout)",
         );
     }
     // `security.*` is fully reloadable — see `RuntimeReloadState::reload`'s

@@ -293,8 +293,6 @@ pub const RECEIPT_LOG_FILE: &str = "download_receipts.jsonl";
 
 /// Default `prefetch.enabled` (ADR 022 §Prefetch Decision): opt-in.
 pub const DEFAULT_PREFETCH_ENABLED: bool = false;
-/// Default `prefetch.require_authorized_origin`: closes the demand-supply Sybil.
-pub const DEFAULT_PREFETCH_REQUIRE_AUTHORIZED_ORIGIN: bool = true;
 /// Default `prefetch.budget_usdc_per_hour`: `0` => never prefetches.
 pub const DEFAULT_PREFETCH_BUDGET_USDC_PER_HOUR: u64 = 0;
 /// Default `prefetch.find_value_threshold` (ADR 022 §Prefetch Decision table).
@@ -1072,12 +1070,13 @@ fn resolve_blockchain_into(
         );
     }
 
-    // Optional chain-backed origin directory (ADR 022 §FIND_VALUE Flow):
-    // `OriginAssignment` + `PublisherRegistry`. Both-or-neither — the directory
-    // resolution chain needs both reads, so a lone address is an operator
-    // mistake worth catching at load rather than silently degrading. When both
-    // are unset the runtime uses an empty (deny-all) origin directory: the
-    // prefetch authorized-origin gate finds no on-chain origins.
+    // Optional chain-backed origin directory (ADR 022 §FIND_VALUE Flow): keyed
+    // solely on `OriginAssignment` — a request's namespace resolves directly to
+    // `getOrigins(namespaceId)`, with no hash→namespace lookup, so the directory
+    // needs only this one address. Unset => the runtime uses an empty (deny-all)
+    // directory: the pull-through authorized-origin gate finds no on-chain
+    // origins. `publisher_registry_address` is independent — it is the publish
+    // CLI's `namespace create` target and is not consumed by the node runtime.
     let origin_assignment_raw = cli
         .origin_assignment_address
         .clone()
@@ -1088,19 +1087,6 @@ fn resolve_blockchain_into(
         .clone()
         .or_else(|| file.and_then(|b| b.publisher_registry_address.clone()))
         .filter(|s| !s.is_empty());
-    if origin_assignment_raw.is_some() != publisher_registry_raw.is_some() {
-        let missing = if origin_assignment_raw.is_none() {
-            "blockchain.origin_assignment_address"
-        } else {
-            "blockchain.publisher_registry_address"
-        };
-        bag.push(
-            missing,
-            "blockchain.origin_assignment_address and blockchain.publisher_registry_address \
-             must be set together (the chain-backed origin directory needs both); \
-             set both or neither",
-        );
-    }
     let origin_assignment_address = origin_assignment_raw.and_then(|v| {
         bag.try_with(
             "blockchain.origin_assignment_address",
@@ -2532,9 +2518,6 @@ fn resolve_prefetch_into(
     let enabled = file
         .and_then(|p| p.enabled)
         .unwrap_or(DEFAULT_PREFETCH_ENABLED);
-    let require_authorized_origin = file
-        .and_then(|p| p.require_authorized_origin)
-        .unwrap_or(DEFAULT_PREFETCH_REQUIRE_AUTHORIZED_ORIGIN);
     let budget_usdc_per_hour = file
         .and_then(|p| p.budget_usdc_per_hour)
         .unwrap_or(DEFAULT_PREFETCH_BUDGET_USDC_PER_HOUR);
@@ -2595,7 +2578,6 @@ fn resolve_prefetch_into(
 
     ResolvedPrefetch {
         enabled,
-        require_authorized_origin,
         budget_usdc_per_hour,
         find_value_threshold,
         threshold_window_secs,
@@ -3550,7 +3532,6 @@ mod tests {
     fn prefetch_defaults_match_adr() {
         let r = resolve_prefetch(None).expect("defaults must resolve");
         assert!(!r.enabled);
-        assert!(r.require_authorized_origin);
         assert_eq!(r.budget_usdc_per_hour, 0);
         assert_eq!(r.find_value_threshold, 5);
         assert_eq!(r.threshold_window_secs, 300);
@@ -7321,10 +7302,10 @@ swap_pool_address = \"0xPool\"
     }
 
     #[test]
-    fn resolve_blockchain_origin_directory_requires_both_addresses() -> anyhow::Result<()> {
-        // A lone OriginAssignment address is an operator mistake: the directory
-        // resolution chain needs PublisherRegistry too. Resolution fails and
-        // names the *missing* field, not the one that was set.
+    fn resolve_blockchain_lone_origin_assignment_resolves() -> anyhow::Result<()> {
+        // The origin directory keys solely on OriginAssignment (a namespace
+        // resolves directly via getOrigins), so a lone origin_assignment_address
+        // is valid and enables the directory; publisher_registry is independent.
         let cli = BlockchainArgs {
             origin_assignment_address: Some(GOOD_ADDR.to_string()),
             publisher_registry_address: None,
@@ -7334,27 +7315,21 @@ swap_pool_address = \"0xPool\"
             payment_channel_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
-            content_blacklist_address: None,
+            content_blacklist_address: Some(GOOD_ADDR.to_string()),
             chain_id: None,
         };
         let dir = data_dir_with_keystore()?;
-        let Err(err) = resolve_blockchain(&cli, None, dir.path()) else {
-            anyhow::bail!("expected resolve_blockchain to fail on a lone origin-directory address");
-        };
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("publisher_registry_address"),
-            "error should name the missing publisher_registry_address: {msg}"
-        );
+        let resolved = resolve_blockchain(&cli, None, dir.path())?;
+        assert!(resolved.origin_assignment_address.is_some());
+        assert!(resolved.publisher_registry_address.is_none());
         Ok(())
     }
 
     #[test]
-    fn resolve_blockchain_origin_directory_lone_publisher_names_missing_origin()
-    -> anyhow::Result<()> {
-        // Symmetric to the above: only the publisher address is set, so the
-        // error must name the missing ORIGIN address (guards the field-naming
-        // branch in both directions).
+    fn resolve_blockchain_lone_publisher_registry_resolves() -> anyhow::Result<()> {
+        // publisher_registry_address is independent (the publish CLI's `namespace
+        // create` target); setting it alone is valid and does not enable the
+        // origin directory (origin_assignment unset => empty deny-all directory).
         let cli = BlockchainArgs {
             origin_assignment_address: None,
             publisher_registry_address: Some(GOOD_ADDR.to_string()),
@@ -7364,18 +7339,13 @@ swap_pool_address = \"0xPool\"
             payment_channel_address: Some(GOOD_ADDR.to_string()),
             capacity_bond_address: Some(GOOD_ADDR.to_string()),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
-            content_blacklist_address: None,
+            content_blacklist_address: Some(GOOD_ADDR.to_string()),
             chain_id: None,
         };
         let dir = data_dir_with_keystore()?;
-        let Err(err) = resolve_blockchain(&cli, None, dir.path()) else {
-            anyhow::bail!("expected resolve_blockchain to fail on a lone publisher address");
-        };
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("origin_assignment_address"),
-            "error should name the missing origin_assignment_address: {msg}"
-        );
+        let resolved = resolve_blockchain(&cli, None, dir.path())?;
+        assert!(resolved.origin_assignment_address.is_none());
+        assert!(resolved.publisher_registry_address.is_some());
         Ok(())
     }
 

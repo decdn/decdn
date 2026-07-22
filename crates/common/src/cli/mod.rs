@@ -39,7 +39,7 @@ pub use node::{
 };
 pub use probe::ProbeArgs;
 pub use publish::{
-    AssignArgs, ClaimArgs, NamespaceArgs, NamespaceCommand, NamespaceCreateArgs, PublishArgs,
+    AssignArgs, NamespaceArgs, NamespaceCommand, NamespaceCreateArgs, PublishArgs,
     PublishChainArgs, PublishCommand,
 };
 pub use run::RunArgs;

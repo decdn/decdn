@@ -19,7 +19,6 @@ use self::acquired::PrefetchAcquiredSet;
 use self::acquirer::{InflightSet, PrefetchAcquirer, PrefetchAcquirerDeps};
 use self::decision::{PrefetchDecision, PrefetchPolicy};
 use self::popularity::{MAX_TRACKED_HASHES, PopularityTracker};
-use crate::dht::origin::{Hash, OriginDirectory};
 
 /// Result of feeding one `FIND_VALUE` arrival to the engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,15 +31,14 @@ pub enum PrefetchOutcome {
     Decided(PrefetchDecision),
 }
 
-/// Ties the popularity tracker + decision engine + origin directory together.
-/// The DHT `FIND_VALUE` handler calls [`PrefetchEngine::on_find_value`] for
-/// every inbound request; with `enabled == false` it is inert.
+/// Ties the popularity tracker + decision engine together. The DHT `FIND_VALUE`
+/// handler calls [`PrefetchEngine::on_find_value`] for every inbound request;
+/// with `enabled == false` it is inert.
 #[derive(Debug)]
 pub struct PrefetchEngine {
     cfg: ResolvedPrefetch,
     tracker: Mutex<PopularityTracker>,
     policy: PrefetchPolicy,
-    directory: Arc<dyn OriginDirectory>,
     /// Live background acquisition (#820). Unprovisioned (no-op) until the
     /// runtime injects the cache + pull deps after bring-up.
     acquirer: PrefetchAcquirer,
@@ -53,11 +51,10 @@ pub struct PrefetchEngine {
 }
 
 impl PrefetchEngine {
-    /// Construct from resolved config and the origin directory used for the
-    /// authorized-origin gate. The acquirer starts unprovisioned; the runtime
-    /// calls [`Self::provision_acquirer`] once the pull path exists.
+    /// Construct from resolved config. The acquirer starts unprovisioned; the
+    /// runtime calls [`Self::provision_acquirer`] once the pull path exists.
     #[must_use]
-    pub fn new(cfg: ResolvedPrefetch, directory: Arc<dyn OriginDirectory>) -> Self {
+    pub fn new(cfg: ResolvedPrefetch) -> Self {
         let tracker = PopularityTracker::new(
             cfg.threshold_window_secs,
             cfg.find_value_threshold,
@@ -67,7 +64,6 @@ impl PrefetchEngine {
             cfg,
             tracker: Mutex::new(tracker),
             policy: PrefetchPolicy::new(cfg),
-            directory,
             acquirer: PrefetchAcquirer::new(),
             // Tag lifetime tracks the demand-quality window: once a blob ages
             // out of that window there is no value in attributing its serves.
@@ -146,13 +142,6 @@ impl PrefetchEngine {
         self.cfg.enabled
     }
 
-    /// Whether the authorized-origin gate is active (drives the
-    /// authorized-vs-bypassed metric split).
-    #[must_use]
-    pub const fn policy_requires_origin(&self) -> bool {
-        self.cfg.require_authorized_origin
-    }
-
     /// Borrow the decision engine (metrics readers + the follow-up acquisition
     /// path feed it via `record_*`).
     #[must_use]
@@ -177,8 +166,7 @@ impl PrefetchEngine {
         if !triggered {
             return PrefetchOutcome::BelowThreshold;
         }
-        let hash = Hash::from_bytes(*hash_bytes);
-        let decision = self.policy.decide(&hash, &*self.directory, now);
+        let decision = self.policy.decide(now);
         PrefetchOutcome::Decided(decision)
     }
 }
@@ -221,22 +209,12 @@ mod tests {
     use decdn_common::config::ResolvedPrefetch;
 
     use super::{PrefetchEngine, PrefetchOutcome};
-    use crate::dht::origin::{Hash, OriginDirectory, StaticOriginDirectory};
-    use crate::dht::routing::NodeId;
-
-    fn dir_with(hash: Hash) -> Arc<dyn OriginDirectory> {
-        let mut m = std::collections::HashMap::new();
-        m.insert(hash, vec![NodeId::from_bytes([1u8; 32])]);
-        Arc::new(StaticOriginDirectory::new(m))
-    }
 
     #[test]
     fn disabled_engine_never_triggers() {
         let cfg = ResolvedPrefetch::default(); // enabled = false
         let key = [9u8; 32];
-        let dir: Arc<dyn OriginDirectory> =
-            Arc::new(StaticOriginDirectory::new(std::collections::HashMap::new()));
-        let engine = PrefetchEngine::new(cfg, dir);
+        let engine = PrefetchEngine::new(cfg);
         for t in 0..10 {
             assert_eq!(engine.on_find_value(&key, t), PrefetchOutcome::Inert);
         }
@@ -251,8 +229,7 @@ mod tests {
             ..Default::default()
         };
         let key = [9u8; 32];
-        let dir = dir_with(Hash::from_bytes(key));
-        let engine = PrefetchEngine::new(cfg, dir);
+        let engine = PrefetchEngine::new(cfg);
         assert_eq!(
             engine.on_find_value(&key, 0),
             PrefetchOutcome::BelowThreshold
@@ -273,9 +250,7 @@ mod tests {
             budget_usdc_per_hour: 1_000_000,
             ..Default::default()
         };
-        let dir: Arc<dyn OriginDirectory> =
-            Arc::new(StaticOriginDirectory::new(std::collections::HashMap::new()));
-        PrefetchEngine::new(cfg, dir)
+        PrefetchEngine::new(cfg)
     }
 
     #[test]
@@ -307,10 +282,7 @@ mod tests {
     fn disabled_engine_try_acquire_is_noop() {
         // A disabled engine must never spawn an acquisition (and must not panic
         // outside a runtime). `try_acquire` returns before touching the acquirer.
-        let engine = PrefetchEngine::new(
-            ResolvedPrefetch::default(),
-            Arc::new(StaticOriginDirectory::new(std::collections::HashMap::new())),
-        );
+        let engine = PrefetchEngine::new(ResolvedPrefetch::default());
         engine.try_acquire([7u8; 32]);
     }
 

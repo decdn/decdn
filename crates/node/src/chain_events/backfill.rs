@@ -5,7 +5,7 @@
 //! buyer-side bootstrap reconciliation scan ([`crate::buyer_channel`], #763)
 //! reuses the same math. Kept here (rather than in any one watcher) so a new
 //! consumer picks up the shared span instead of forking a fresh one (#1092).
-//! The origin directory's genesis `ContentClaimed` replay
+//! The origin directory's genesis `AssignmentActivated` replay
 //! ([`crate::dht::chain_origin_directory`], #651) also windows through
 //! [`backfill_windows`], passing its own deliberate `REPLAY_WINDOW_BLOCKS = 9_000`
 //! span (a margin under the provider 10k `eth_getLogs` cap) rather than

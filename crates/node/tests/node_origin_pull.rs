@@ -39,7 +39,6 @@ use decdn_incentive::{
 };
 use decdn_node::buyer_channel::{ChannelOpenPending, ChannelOpener, OpenSlotReserved};
 use decdn_node::client_requester::{ChannelContext, stream_fetch};
-use decdn_node::dht::negative_cache::Hash as DhtHash;
 use decdn_node::dht::routing::{NodeId as DhtNodeId, RoutingTable};
 use decdn_node::dht::{
     ConfigStakerSet, NegativeProbeCache, NodeAddressResolver, OriginDirectory, PositiveProbeCache,
@@ -776,7 +775,7 @@ fn build_origin_with_negative_cache(
 fn build_origin_with_probe_caches(
     ep_b: &iroh::Endpoint,
     b_dht: DhtNodeId,
-    hash: Hash,
+    _hash: Hash,
     buyer: Arc<dyn ChannelOpener>,
     local_rep: &Arc<LocalReputation>,
     obs_buffer: &Arc<ObservationBuffer>,
@@ -797,7 +796,7 @@ fn build_origin_with_probe_caches(
     // before `providers` is moved into `dir`.
     let stakers = ConfigStakerSet::new(providers.iter().copied().collect());
     let mut dir = HashMap::new();
-    dir.insert(DhtHash::from_bytes(*hash.as_bytes()), providers);
+    dir.insert(U256::ZERO, providers);
 
     let origin = NodeOrigin::new();
     origin.provision(NodeOriginDeps {
@@ -858,8 +857,8 @@ fn build_origin_multi_hash(
     stall_timeout: Duration,
 ) -> NodeOrigin {
     let mut dir = HashMap::new();
-    for h in hashes {
-        dir.insert(DhtHash::from_bytes(*h.as_bytes()), providers.to_vec());
+    for _h in hashes {
+        dir.insert(U256::ZERO, providers.to_vec());
     }
     let origin = NodeOrigin::new();
     origin.provision(NodeOriginDeps {
@@ -1035,20 +1034,11 @@ async fn prefetch_acquire_pulls_and_records_spend() -> Result<()> {
     // Prefetch engine (enabled), authorized-origin directory maps the hash to A.
     let prefetch_cfg = decdn_common::config::ResolvedPrefetch {
         enabled: true,
-        require_authorized_origin: true,
         budget_usdc_per_hour: 1_000_000,
         find_value_threshold: 2,
         ..Default::default()
     };
-    let authorized_dir: Arc<dyn OriginDirectory> =
-        Arc::new(StaticOriginDirectory::new(HashMap::from([(
-            DhtHash::from_bytes(*hash.as_bytes()),
-            vec![DhtNodeId::from_bytes(*a_id.as_bytes())],
-        )])));
-    let engine = Arc::new(decdn_node::prefetch::PrefetchEngine::new(
-        prefetch_cfg,
-        authorized_dir,
-    ));
+    let engine = Arc::new(decdn_node::prefetch::PrefetchEngine::new(prefetch_cfg));
     let observer = Arc::new(decdn_node::prefetch::PrefetchAcquisitionObserver::new(
         Arc::clone(&engine),
         Arc::clone(&b_metrics),
@@ -1073,7 +1063,7 @@ async fn prefetch_acquire_pulls_and_records_spend() -> Result<()> {
         )))),
         staker_set: Arc::new(ConfigStakerSet::empty()) as Arc<dyn StakerSet>,
         origin_directory: Arc::new(StaticOriginDirectory::new(HashMap::from([(
-            DhtHash::from_bytes(*hash.as_bytes()),
+            U256::ZERO,
             providers,
         )]))) as Arc<dyn OriginDirectory>,
         addr_resolver: Arc::new(StaticNodeAddressDirectory::new(addr_map))
@@ -1480,20 +1470,11 @@ async fn prefetch_acquired_blob_credits_served_through_serve_loop() -> Result<()
 
     let prefetch_cfg = decdn_common::config::ResolvedPrefetch {
         enabled: true,
-        require_authorized_origin: true,
         budget_usdc_per_hour: 1_000_000,
         find_value_threshold: 2,
         ..Default::default()
     };
-    let authorized_dir: Arc<dyn OriginDirectory> =
-        Arc::new(StaticOriginDirectory::new(HashMap::from([(
-            DhtHash::from_bytes(hash_bytes),
-            vec![DhtNodeId::from_bytes(*a_id.as_bytes())],
-        )])));
-    let engine = Arc::new(decdn_node::prefetch::PrefetchEngine::new(
-        prefetch_cfg,
-        authorized_dir,
-    ));
+    let engine = Arc::new(decdn_node::prefetch::PrefetchEngine::new(prefetch_cfg));
     let observer = Arc::new(decdn_node::prefetch::PrefetchAcquisitionObserver::new(
         Arc::clone(&engine),
         Arc::clone(&b_metrics),
@@ -1517,10 +1498,10 @@ async fn prefetch_acquired_blob_credits_served_through_serve_loop() -> Result<()
         )))),
         staker_set: Arc::new(ConfigStakerSet::empty()) as Arc<dyn StakerSet>,
         origin_directory: Arc::new(StaticOriginDirectory::new(HashMap::from([
-            (DhtHash::from_bytes(hash_bytes), providers.clone()),
+            (U256::ZERO, providers.clone()),
             // blob2 is discoverable on A too, for the negative control's
             // reactive (non-prefetch) pull-through.
-            (DhtHash::from_bytes(hash2_bytes), providers),
+            (U256::ZERO, providers),
         ]))) as Arc<dyn OriginDirectory>,
         addr_resolver: Arc::new(StaticNodeAddressDirectory::new(addr_map))
             as Arc<dyn NodeAddressResolver>,
@@ -3276,14 +3257,17 @@ async fn node_origin_window_open_falls_through_a_stalled_candidate() -> Result<(
     );
 
     // The open loop must abandon BOTH stallers on their own budgets and open A.
-    let opened = tokio::time::timeout(Duration::from_secs(12), origin.open_progressive_pull(hash))
-        .await
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "open_progressive_pull never returned: a stalled candidate consumed the whole \
+    let opened = tokio::time::timeout(
+        Duration::from_secs(12),
+        origin.open_progressive_pull(hash, U256::ZERO),
+    )
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "open_progressive_pull never returned: a stalled candidate consumed the whole \
                  outer budget, so the honest fallback was never opened"
-            )
-        })?;
+        )
+    })?;
     let (header, _pull) = opened
         .ok_or_else(|| anyhow::anyhow!("expected an open against the honest fallback candidate"))?;
     // A quotes `RATE`; the stallers quote the cheaper `STALL_RATE` (which is why they
@@ -5029,13 +5013,13 @@ async fn node_origin_window_empty_chunk_stream_is_rejected_not_spun_on() -> Resu
 
     // The OPEN is honest (a valid signed response), so this must succeed — the
     // hostility is entirely in the frames that follow.
-    let (_header, mut pull) =
-        tokio::time::timeout(Duration::from_secs(10), origin.open_progressive_pull(hash))
-            .await
-            .map_err(|_| anyhow::anyhow!("the progressive open never returned"))?
-            .ok_or_else(|| {
-                anyhow::anyhow!("expected a clean open against the empty-chunk upstream")
-            })?;
+    let (_header, mut pull) = tokio::time::timeout(
+        Duration::from_secs(10),
+        origin.open_progressive_pull(hash, U256::ZERO),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("the progressive open never returned"))?
+    .ok_or_else(|| anyhow::anyhow!("expected a clean open against the empty-chunk upstream"))?;
 
     let drained = tokio::time::timeout(EMPTY_CHUNK_ASSERT_WINDOW, async move {
         loop {
@@ -7287,6 +7271,7 @@ async fn leaf_paced_pull(
     };
     let req = StreamRequest {
         hash: *hash.as_bytes(),
+        namespace_id: decdn_protocol::client::NO_NAMESPACE,
         channel_id: channel_id.into(),
         byte_offset: 0,
         byte_len: 0,
@@ -8032,6 +8017,7 @@ async fn window_pull_through_resumed_offset_falls_back_not_fused() -> Result<()>
     };
     let req = StreamRequest {
         hash: *hash.as_bytes(),
+        namespace_id: decdn_protocol::client::NO_NAMESPACE,
         channel_id: leaf_channel_id.into(),
         byte_offset: MB_BYTES,
         byte_len: 0,
@@ -8916,6 +8902,7 @@ async fn leaf_underpays_first_voucher(
     };
     let req = StreamRequest {
         hash: *hash.as_bytes(),
+        namespace_id: decdn_protocol::client::NO_NAMESPACE,
         channel_id: channel_id.into(),
         byte_offset: 0,
         byte_len: 0,
@@ -9442,8 +9429,8 @@ async fn two_concurrent_pulls_to_one_provider_share_the_channel_ledger() -> Resu
         )))),
         staker_set: Arc::new(ConfigStakerSet::empty()) as Arc<dyn StakerSet>,
         origin_directory: Arc::new(StaticOriginDirectory::new(HashMap::from([
-            (DhtHash::from_bytes(*hash.as_bytes()), providers.clone()),
-            (DhtHash::from_bytes(*hash2.as_bytes()), providers),
+            (U256::ZERO, providers.clone()),
+            (U256::ZERO, providers),
         ]))) as Arc<dyn OriginDirectory>,
         addr_resolver: Arc::new(StaticNodeAddressDirectory::new(addr_map))
             as Arc<dyn NodeAddressResolver>,
@@ -10601,11 +10588,13 @@ async fn a_progressive_pull_reuses_a_probe_cache_entry_written_by_a_buffered_fet
 
     // The window-paced pull for the SAME hash must hit the cache the buffered
     // fetch just wrote and send NO new probe.
-    let (header, mut pull) =
-        tokio::time::timeout(Duration::from_secs(10), origin.open_progressive_pull(hash))
-            .await
-            .map_err(|_| anyhow::anyhow!("open_progressive_pull never returned"))?
-            .ok_or_else(|| anyhow::anyhow!("expected an open against the cached candidate"))?;
+    let (header, mut pull) = tokio::time::timeout(
+        Duration::from_secs(10),
+        origin.open_progressive_pull(hash, U256::ZERO),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("open_progressive_pull never returned"))?
+    .ok_or_else(|| anyhow::anyhow!("expected an open against the cached candidate"))?;
     anyhow::ensure!(
         probes.load(Ordering::SeqCst) == 1,
         "the progressive pull re-probed A — the probe cache saved nothing, which is the \
@@ -10833,11 +10822,13 @@ async fn a_window_pull_with_a_partial_cached_budget_falls_through_cold_and_meter
     // the 3-attempt budget on N (refused again), leaving budget > 0, so the call
     // falls through — WITHIN THIS CALL — to a fresh lookup that discovers both N
     // and H, ranks H first (cheaper rate), and opens from H without retrying N.
-    let (header, mut pull) =
-        tokio::time::timeout(Duration::from_secs(10), origin.open_progressive_pull(hash))
-            .await
-            .map_err(|_| anyhow::anyhow!("open_progressive_pull never returned"))?
-            .ok_or_else(|| anyhow::anyhow!("expected an open via the cold fallthrough"))?;
+    let (header, mut pull) = tokio::time::timeout(
+        Duration::from_secs(10),
+        origin.open_progressive_pull(hash, U256::ZERO),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("open_progressive_pull never returned"))?
+    .ok_or_else(|| anyhow::anyhow!("expected an open via the cold fallthrough"))?;
     anyhow::ensure!(
         streams_n.load(Ordering::SeqCst) == 2,
         "N must be opened-against exactly twice total (once per call) — the cold path must \
@@ -11040,9 +11031,12 @@ async fn a_window_pull_shares_one_attempt_budget_and_invalidates_on_exhaustion()
     // Call #1: cold path (cache empty). Discovers, probes, and ranks all three;
     // the whole budget is spent opening-and-refused, and the ranked list is cached
     // at `probe_and_rank`'s tail regardless of the miss.
-    let first = tokio::time::timeout(Duration::from_secs(10), origin.open_progressive_pull(hash))
-        .await
-        .map_err(|_| anyhow::anyhow!("call #1 open_progressive_pull never returned"))?;
+    let first = tokio::time::timeout(
+        Duration::from_secs(10),
+        origin.open_progressive_pull(hash, U256::ZERO),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("call #1 open_progressive_pull never returned"))?;
     anyhow::ensure!(
         first.is_none(),
         "all three providers refuse; the first window pull must miss"
@@ -11064,9 +11058,12 @@ async fn a_window_pull_shares_one_attempt_budget_and_invalidates_on_exhaustion()
     // spend exactly the fetch-wide budget of 3 opening-and-refused, then hit the
     // window path's `budget == 0` short-circuit — WITHOUT re-probing and WITHOUT a
     // fresh lookup for three more opens. Three more streams (6 total), not six.
-    let second = tokio::time::timeout(Duration::from_secs(10), origin.open_progressive_pull(hash))
-        .await
-        .map_err(|_| anyhow::anyhow!("call #2 open_progressive_pull never returned"))?;
+    let second = tokio::time::timeout(
+        Duration::from_secs(10),
+        origin.open_progressive_pull(hash, U256::ZERO),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("call #2 open_progressive_pull never returned"))?;
     anyhow::ensure!(
         second.is_none(),
         "the cached candidates all refuse again; the second window pull must miss too"
@@ -11090,9 +11087,12 @@ async fn a_window_pull_shares_one_attempt_budget_and_invalidates_on_exhaustion()
     // is negative-cached or wedged, so only the invalidate stands between this call
     // and a second hit on the dead list. It must go COLD: a fresh lookup that
     // re-probes all three at the wire.
-    let third = tokio::time::timeout(Duration::from_secs(10), origin.open_progressive_pull(hash))
-        .await
-        .map_err(|_| anyhow::anyhow!("call #3 open_progressive_pull never returned"))?;
+    let third = tokio::time::timeout(
+        Duration::from_secs(10),
+        origin.open_progressive_pull(hash, U256::ZERO),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("call #3 open_progressive_pull never returned"))?;
     anyhow::ensure!(
         third.is_none(),
         "all three providers still refuse; the third window pull must miss too"
@@ -11584,31 +11584,31 @@ impl StakerSet for MutableStakerSet {
 /// under test.
 #[derive(Debug)]
 struct MutableOriginDirectory {
-    origins: Mutex<HashMap<DhtHash, Vec<DhtNodeId>>>,
+    origins: Mutex<HashMap<U256, Vec<DhtNodeId>>>,
 }
 
 impl MutableOriginDirectory {
-    const fn new(origins: HashMap<DhtHash, Vec<DhtNodeId>>) -> Self {
+    const fn new(origins: HashMap<U256, Vec<DhtNodeId>>) -> Self {
         Self {
             origins: Mutex::new(origins),
         }
     }
 
-    /// Drop `hash`'s entry — the directory half of a chain ejection.
-    fn remove(&self, hash: &DhtHash) {
+    /// Drop `namespace`'s entry — the directory half of a chain ejection.
+    fn remove(&self, namespace: U256) {
         self.origins
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(hash);
+            .remove(&namespace);
     }
 }
 
 impl OriginDirectory for MutableOriginDirectory {
-    fn lookup_origins(&self, hash: &DhtHash) -> Vec<DhtNodeId> {
+    fn lookup_origins(&self, namespace_id: U256) -> Vec<DhtNodeId> {
         self.origins
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(hash)
+            .get(&namespace_id)
             .cloned()
             .unwrap_or_default()
     }
@@ -11748,13 +11748,12 @@ async fn a_probe_cache_hit_drops_a_provider_no_longer_admitted() -> Result<()> {
     let b_metrics = Arc::new(Metrics::new());
     let a_dht = DhtNodeId::from_bytes(*a_id.as_bytes());
     let b_dht = DhtNodeId::from_bytes(*b_id.as_bytes());
-    let dht_hash = DhtHash::from_bytes(*hash.as_bytes());
 
     // A starts admitted: in the staker set AND in the directory for the hash.
     // Handles are cloned so the test can eject A between the two fetches.
     let mutable_staker = Arc::new(MutableStakerSet::new(HashSet::from([a_dht])));
     let mutable_dir = Arc::new(MutableOriginDirectory::new(HashMap::from([(
-        dht_hash,
+        U256::ZERO,
         vec![a_dht],
     )])));
 
@@ -11840,7 +11839,7 @@ async fn a_probe_cache_hit_drops_a_provider_no_longer_admitted() -> Result<()> {
     // set and the directory atomically. The probe-cache entry for [A] is untouched
     // and still live, so nothing but the hit-path `is_active` re-check can deny it.
     mutable_staker.remove(&a_dht);
-    mutable_dir.remove(&dht_hash);
+    mutable_dir.remove(U256::ZERO);
 
     // Fetch #2: the entry is still live, so the hit path walks [A] — but A is no
     // longer active, so `cached_candidates` drops it, returns None, and the fetch

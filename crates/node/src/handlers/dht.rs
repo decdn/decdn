@@ -692,8 +692,7 @@ impl DhtHandler {
         self.metrics
             .record_prefetch_decision(PrefetchOutcome::Decided(decision));
         if let PrefetchDecision::Acquire = decision {
-            self.metrics
-                .record_prefetch_acquire(engine.policy_requires_origin());
+            self.metrics.record_prefetch_acquire();
             // Fire the live, bounded background acquisition (#820). Non-blocking:
             // `try_acquire` spawns the pull and returns immediately, so the DHT
             // serve loop is never stalled by a speculative fetch.

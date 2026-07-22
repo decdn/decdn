@@ -631,6 +631,7 @@ async fn stall_delivery_at_closing_voucher(
 
     let req = StreamRequest {
         hash,
+        namespace_id: decdn_protocol::client::NO_NAMESPACE,
         channel_id: channel_id().into(),
         byte_offset: 0,
         byte_len: 0,
@@ -2101,6 +2102,7 @@ async fn client_unknown_channel_is_rejected() -> anyhow::Result<()> {
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let req = StreamRequest {
         hash: *hash.as_bytes(),
+        namespace_id: decdn_protocol::client::NO_NAMESPACE,
         channel_id: channel_id().into(),
         byte_offset: 0,
         byte_len: 0,
@@ -2724,6 +2726,7 @@ async fn client_binding_address_mismatch_resets() -> anyhow::Result<()> {
     };
     let req = StreamRequest {
         hash: *hash.as_bytes(),
+        namespace_id: decdn_protocol::client::NO_NAMESPACE,
         channel_id: channel_id().into(),
         byte_offset: 0,
         byte_len: 0,
@@ -2769,6 +2772,7 @@ async fn client_binding_for_other_owner_is_not_found() -> anyhow::Result<()> {
     };
     let req = StreamRequest {
         hash: *hash.as_bytes(),
+        namespace_id: decdn_protocol::client::NO_NAMESPACE,
         channel_id: channel_id().into(),
         byte_offset: 0,
         byte_len: 0,
@@ -3314,6 +3318,7 @@ async fn pull_through_gate_authorizes_only_channel_owner() -> anyhow::Result<()>
     let miss_hash = [0xEEu8; 32];
     let req = StreamRequest {
         hash: miss_hash,
+        namespace_id: decdn_protocol::client::NO_NAMESPACE,
         channel_id: channel_id().into(),
         byte_offset: 0,
         byte_len: 0,
@@ -3474,6 +3479,7 @@ async fn pull_through_fills_under_deadline(
 
     let req = StreamRequest {
         hash: *want.as_bytes(),
+        namespace_id: decdn_protocol::client::NO_NAMESPACE,
         channel_id: channel_id().into(),
         byte_offset: 0,
         byte_len: 0,
@@ -3645,6 +3651,7 @@ async fn cooperative_close_signs_waiver_persists_flag_and_stops_serving() -> any
     //     without the waiver it would serve; the flag makes it `ok: false`.
     let req = StreamRequest {
         hash: *hash.as_bytes(),
+        namespace_id: decdn_protocol::client::NO_NAMESPACE,
         channel_id: channel_id().0,
         byte_offset: 0,
         byte_len: 0,

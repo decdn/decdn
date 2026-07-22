@@ -187,6 +187,7 @@ async fn ranged_paid_pull(
     };
     let req = StreamRequest {
         hash: *hash.as_bytes(),
+        namespace_id: decdn_protocol::client::NO_NAMESPACE,
         channel_id: channel_id.into(),
         byte_offset,
         byte_len,
@@ -641,6 +642,7 @@ async fn unauthorized_range_request_triggers_no_origin_fetch() -> anyhow::Result
     };
     let req = StreamRequest {
         hash: *hash.as_bytes(),
+        namespace_id: decdn_protocol::client::NO_NAMESPACE,
         channel_id: channel_id.into(),
         byte_offset: 16 * 1024,
         byte_len: 32 * 1024,
@@ -826,6 +828,7 @@ async fn out_of_bounds_range_is_rejected_before_delivery() -> anyhow::Result<()>
     // `byte_offset` in bounds but `byte_offset + byte_len` past the blob end.
     let req = StreamRequest {
         hash: *hash.as_bytes(),
+        namespace_id: decdn_protocol::client::NO_NAMESPACE,
         channel_id: channel_id.into(),
         byte_offset: 16 * 1024,
         byte_len: blob_size,

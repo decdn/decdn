@@ -9,13 +9,10 @@
 //! current from these events, falling back to `getOrigins` for the bootstrap
 //! snapshot.
 //!
-//! Two surfaces, one contract:
-//! - Per-namespace assignments: `AssignmentActivated` replaces the operator
-//!   set for a namespace; `AssignmentRevoked` / `BlacklistedAssignmentPruned`
-//!   remove a single operator.
-//! - The default-open allow-list (`namespaceId == 0`): `DefaultOpenAllowlistUpdated`
-//!   replaces it wholesale; `DefaultOpenOperatorAdded` / `DefaultOpenOperatorRemoved`
-//!   move a single operator. `getOrigins(0)` reads it.
+//! Assignments are per registered namespace: `AssignmentActivated` replaces the
+//! operator set for a namespace; `AssignmentRevoked` /
+//! `BlacklistedAssignmentPruned` remove a single operator. Namespace 0 has no
+//! publisher and no authorized origins, so `getOrigins(0)` is always empty.
 
 // The `sol!`-generated bindings include macro-emitted code that uses
 // patterns workspace clippy denies (raw indexing into ABI fixed-size
@@ -43,8 +40,8 @@ mod sol_types {
             // -----------------------------------------------------------------
 
             /// Current authorized-origin operator addresses for a namespace.
-            /// `namespaceId == 0` reads the DAO-maintained default-open
-            /// allow-list. Returns the live `EnumerableSet` values.
+            /// `namespaceId == 0` has no set and always returns empty. Returns
+            /// the live `EnumerableSet` values.
             function getOrigins(uint256 namespaceId) external view returns (address[] memory);
 
             // -----------------------------------------------------------------
@@ -85,10 +82,7 @@ mod sol_types {
             event AssignmentActivated(uint256 indexed namespaceId, address[] operators);
 
             /// A single `operator` was removed from `namespaceId`'s authorized
-            /// set (by the namespace owner or governance). `namespaceId` MAY be
-            /// `0`: a governance revoke of a default-open operator targets the
-            /// default-open allow-list, not a per-namespace set — consumers must
-            /// treat namespace 0 as the default-open set.
+            /// set (by the namespace owner or governance).
             event AssignmentRevoked(
                 uint256 indexed namespaceId,
                 address indexed operator,
@@ -97,28 +91,11 @@ mod sol_types {
 
             /// A blacklisted `operator` was pruned from `namespaceId`'s
             /// authorized set. Same cache effect as a revoke (remove one).
-            /// `namespaceId` MAY be `0`: the permissionless
-            /// `pruneBlacklistedAssignment(0, op)` path targets the default-open
-            /// allow-list — consumers must treat namespace 0 as that set.
             event BlacklistedAssignmentPruned(
                 uint256 indexed namespaceId,
                 address indexed operator,
                 address indexed pruner
             );
-
-            // -----------------------------------------------------------------
-            // Default-open allow-list events (namespaceId == 0)
-            // -----------------------------------------------------------------
-
-            /// The default-open allow-list was replaced wholesale with
-            /// `operators`. `updateIndex` is a monotonic version for observers.
-            event DefaultOpenAllowlistUpdated(address[] operators, uint256 indexed updateIndex);
-
-            /// A single `operator` was added to the default-open allow-list.
-            event DefaultOpenOperatorAdded(address indexed operator);
-
-            /// A single `operator` was removed from the default-open allow-list.
-            event DefaultOpenOperatorRemoved(address indexed operator);
         }
     }
 }

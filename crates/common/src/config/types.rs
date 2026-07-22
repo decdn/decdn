@@ -140,17 +140,18 @@ pub struct BlockchainConfig {
     pub payment_channel_address: Option<String>,
     /// `CapacityBond` contract address.
     pub capacity_bond_address: Option<String>,
-    /// `OriginAssignment` contract address. Optional: when set (together with
-    /// `publisher_registry_address`), the node runs the chain-backed origin
-    /// directory that gates DHT prefetch (ADR 022). Both must be set or unset
-    /// together; unset => the origin directory is empty (deny-all) and the
-    /// prefetch authorized-origin gate finds no origins.
+    /// `OriginAssignment` contract address. Optional: when set, the node runs the
+    /// chain-backed origin directory for the cache-miss pull-through fallback,
+    /// resolving a request's namespace via `getOrigins(namespaceId)` (ADR 022).
+    /// Unset => the origin directory is empty (deny-all) and the pull-through
+    /// authorized-origin gate finds no origins.
     pub origin_assignment_address: Option<String>,
-    /// `PublisherRegistry` contract address. Pairs with
-    /// `origin_assignment_address` (see its docs).
+    /// `PublisherRegistry` contract address. Independent of the origin directory:
+    /// it is the publish CLI's `namespace create` target and is not consumed by
+    /// the node runtime.
     pub publisher_registry_address: Option<String>,
     /// Block height at which the chain-backed origin directory begins its
-    /// `ContentClaimed` log replay. SHOULD be the `PublisherRegistry`
+    /// `AssignmentActivated` log replay. SHOULD be the `OriginAssignment`
     /// deployment block; absent => `0`, which is correct but scans the entire
     /// chain history (slow / RPC-heavy on an established L2). Only consulted
     /// when the origin-directory addresses are set.
@@ -1057,9 +1058,6 @@ pub struct ReceiptsConfig {
 pub struct PrefetchConfig {
     /// Master switch. Absent => `false` (opt-in).
     pub enabled: Option<bool>,
-    /// Require an authorized origin in the `FIND_VALUE` candidate set before
-    /// prefetching. Absent => `true`. Closes the demand-supply Sybil attack.
-    pub require_authorized_origin: Option<bool>,
     /// Hard cap on aggregate prefetch spend over a rolling 1-hour window, in
     /// micro-USDC. Absent => `0` (no budget => never prefetches; a finite cap
     /// is the load-bearing recommendation).

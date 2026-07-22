@@ -446,6 +446,7 @@ async fn client_disconnect_mid_stream_leaves_channel_reusable() -> anyhow::Resul
             .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
         let req = StreamRequest {
             hash: *hash.as_bytes(),
+            namespace_id: decdn_protocol::client::NO_NAMESPACE,
             channel_id: channel_id.into(),
             byte_offset: 0,
             byte_len: 0,

@@ -1023,6 +1023,7 @@ async fn open_stream(
     slash_domain: &Eip712Domain,
     expected_signer: Address,
     hash: [u8; 32],
+    namespace_id: [u8; 32],
     byte_offset: u64,
     timestamp_us: u64,
     open: Duration,
@@ -1045,6 +1046,12 @@ async fn open_stream(
 
         let req = StreamRequest {
             hash,
+            // The serving node routes on this only for its origin-directory
+            // fallback (ADR 005 §Namespace routing). Node-to-node pulls pass
+            // `NO_NAMESPACE` (0) — the requester already discovered a holder, so
+            // the downstream node needs no namespace (ADR 002 §Retrieval by
+            // namespace). A client fetch passes the namespace it published under.
+            namespace_id,
             channel_id: ctx.channel_id.into(),
             byte_offset,
             // Whole-tail fetch; a bounded range is plumbed by the origin range-pull
@@ -1104,6 +1111,11 @@ async fn fetch_inner(
         slash_domain,
         expected_signer,
         hash,
+        // Node-to-node / client pulls send NO_NAMESPACE: the requester already
+        // discovered a holder, and the downstream node needs no namespace hint
+        // (ADR 002 §Retrieval by namespace). Client-supplied namespace routing is
+        // a follow-up when the fetch CLI grows a `--namespace` flag.
+        decdn_protocol::client::NO_NAMESPACE,
         byte_offset,
         timestamp_us,
         open,
@@ -1599,6 +1611,9 @@ pub async fn open_progressive_pull(
         slash_domain,
         expected_signer,
         hash,
+        // Node-to-node pull: NO_NAMESPACE (the requester already discovered a
+        // holder; ADR 002 §Retrieval by namespace).
+        decdn_protocol::client::NO_NAMESPACE,
         byte_offset,
         timestamp_us,
         deadlines.open,

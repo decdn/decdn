@@ -405,6 +405,7 @@ impl NodeOrigin {
     pub async fn open_progressive_pull(
         &self,
         hash: Hash,
+        namespace_id: U256,
     ) -> Option<(UpstreamPullHeader, NodeProgressivePull)> {
         let deps = self.deps.get()?;
         let hash_bytes = *hash.as_bytes();
@@ -448,7 +449,7 @@ impl NodeOrigin {
         }
 
         // ADR 001 §Probe cache: "if all fail, run a fresh DHT lookup + probe."
-        let providers = discover(deps, hash_bytes).await;
+        let providers = discover(deps, hash_bytes, namespace_id).await;
         if providers.is_empty() {
             // `node_pull_no_providers` means "the blob is unavailable on the
             // network, NOT a pull failure" — mutually exclusive with
@@ -938,7 +939,11 @@ impl Origin for NodeOrigin {
             }
 
             // ADR 001 §Probe cache: "if all fail, run a fresh DHT lookup + probe."
-            let providers = discover(deps, hash_bytes).await;
+            // This is the generic `Origin::fetch` path (buffered / prefetch / warm),
+            // a hash-only pull with no client namespace, so it takes no on-chain
+            // origin-directory fallback (`NO_NAMESPACE`). The namespace-aware
+            // client-serve path is `open_progressive_pull`.
+            let providers = discover(deps, hash_bytes, U256::ZERO).await;
             if providers.is_empty() {
                 // `node_pull_no_providers` means "the blob is unavailable on the
                 // network, NOT a pull failure" — mutually exclusive with
@@ -983,9 +988,18 @@ impl Origin for NodeOrigin {
 }
 
 /// Discover candidate providers for `hash`: the DHT iterative lookup first,
-/// falling back to the on-chain origin directory when the lookup converges
-/// empty (ADR 022 §`FIND_VALUE` Flow).
-async fn discover(deps: &NodeOriginDeps, hash_bytes: [u8; 32]) -> Vec<DhtNodeId> {
+/// falling back to the on-chain origin directory keyed on `namespace_id` when the
+/// lookup converges empty (ADR 022 §`FIND_VALUE` Flow). `namespace_id` is the
+/// namespace the serving node received on the client `StreamRequest`; it is
+/// consumed **only** here, at the fallback — DHT-discovered holders and origin
+/// backends are hash-keyed and need no namespace. `NO_NAMESPACE` (0) resolves to
+/// no authorized origins, so a hash-only pull (prefetch / warm) simply gets no
+/// directory fallback (ADR 002 §Namespace 0).
+async fn discover(
+    deps: &NodeOriginDeps,
+    hash_bytes: [u8; 32],
+    namespace_id: U256,
+) -> Vec<DhtNodeId> {
     let target = DhtHash::from_bytes(hash_bytes);
     let providers = crate::dht::find_providers(
         &deps.endpoint,
@@ -999,7 +1013,7 @@ async fn discover(deps: &NodeOriginDeps, hash_bytes: [u8; 32]) -> Vec<DhtNodeId>
     )
     .await;
     if providers.is_empty() {
-        deps.origin_directory.lookup_origins(&target)
+        deps.origin_directory.lookup_origins(namespace_id)
     } else {
         providers
     }

@@ -437,9 +437,9 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # eth_keystore = "~/.decdn/keystore.json"
 # payment_channel_address = ""       # REQUIRED: 0x-prefixed hex
 # capacity_bond_address = ""        # REQUIRED: 0x-prefixed hex
-# origin_assignment_address = ""     # OPTIONAL: 0x-prefixed hex; `decdn publish assign` target, and (paired WITH publisher_registry_address) the chain-backed origin directory for DHT prefetch (ADR 022).
-# publisher_registry_address = ""    # OPTIONAL: 0x-prefixed hex; `decdn publish namespace create` / `claim` target (#1029), and (paired WITH origin_assignment_address) the DHT-prefetch origin directory.
-# origin_directory_from_block = 0    # OPTIONAL: ContentClaimed log-replay start; set to the PublisherRegistry deploy block (default 0 scans the whole chain)
+# origin_assignment_address = ""     # OPTIONAL: 0x-prefixed hex; `decdn publish assign` target, and the chain-backed origin directory for cache-miss pull-through fallback (ADR 022).
+# publisher_registry_address = ""    # OPTIONAL: 0x-prefixed hex; `decdn publish namespace create` target (#1029).
+# origin_directory_from_block = 0    # OPTIONAL: AssignmentActivated log-replay start; set to the OriginAssignment deploy block (default 0 scans the whole chain)
 # slash_judge_address = ""           # REQUIRED: 0x-prefixed hex (EIP-712 verifyingContract, ADR 014)
 # chain_id = 421614                  # EIP-712 chain id; default Arbitrum Sepolia
 # rpc_watchdog_interval_sec = 30     # 0 disables the connectivity watchdog
@@ -546,10 +546,9 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # ADR 022 speculative-prefetch operator policy. Disabled by default. When
 # enabled, a node observing enough FIND_VALUE demand for a hash speculatively
 # acquires it (DHT lookup → probe → paid pull-through), subject to the
-# authorized-origin gate, the rolling-1h budget, and the demand-quality
-# auto-throttle. Leave disabled unless you understand the spend implications.
+# rolling-1h budget and the demand-quality auto-throttle. Leave disabled unless
+# you understand the spend implications.
 # enabled = false
-# require_authorized_origin = true          # require an authorized origin in the FIND_VALUE candidate set
 # budget_usdc_per_hour = 0                  # micro-USDC rolling-1h spend cap; 0 = never prefetch
 # find_value_threshold = 5                  # FIND_VALUE queries within the window that trip the trigger
 # threshold_window_secs = 300               # rolling-window length for the trigger

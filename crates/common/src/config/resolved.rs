@@ -90,16 +90,16 @@ pub struct ResolvedBlockchain {
     pub payment_channel_address: String,
     /// `CapacityBond` contract address.
     pub capacity_bond_address: String,
-    /// `OriginAssignment` contract address. `Some` only when the operator
-    /// opts into the chain-backed origin directory (paired with
-    /// `publisher_registry_address`); `None` => empty deny-all directory, so
-    /// the prefetch authorized-origin gate finds no origins (ADR 022).
+    /// `OriginAssignment` contract address. `Some` only when the operator opts
+    /// into the chain-backed origin directory; `None` => empty deny-all
+    /// directory, so the pull-through authorized-origin gate finds no origins
+    /// (ADR 022).
     pub origin_assignment_address: Option<String>,
-    /// `PublisherRegistry` contract address. Set together with
-    /// `origin_assignment_address` (both-or-neither, enforced at resolution).
+    /// `PublisherRegistry` contract address. Independent of the origin directory
+    /// (the publish CLI's `namespace create` target); not consumed by the node.
     pub publisher_registry_address: Option<String>,
-    /// Starting block for the chain-backed origin directory's `ContentClaimed`
-    /// log replay (the `PublisherRegistry` deployment block). Defaults to `0`.
+    /// Starting block for the chain-backed origin directory's `AssignmentActivated`
+    /// log replay (the `OriginAssignment` deployment block). Defaults to `0`.
     pub origin_directory_from_block: u64,
     /// `SlashJudge` contract address — the EIP-712 `verifyingContract` for
     /// `slash_sig` signatures (ADR 014). Required (no default).
@@ -610,7 +610,6 @@ impl Default for ResolvedReceipts {
 #[derive(Debug, Clone, Copy)]
 pub struct ResolvedPrefetch {
     pub enabled: bool,
-    pub require_authorized_origin: bool,
     pub budget_usdc_per_hour: u64,
     pub find_value_threshold: u32,
     pub threshold_window_secs: u64,
@@ -626,7 +625,6 @@ impl Default for ResolvedPrefetch {
     fn default() -> Self {
         Self {
             enabled: super::DEFAULT_PREFETCH_ENABLED,
-            require_authorized_origin: super::DEFAULT_PREFETCH_REQUIRE_AUTHORIZED_ORIGIN,
             budget_usdc_per_hour: super::DEFAULT_PREFETCH_BUDGET_USDC_PER_HOUR,
             find_value_threshold: super::DEFAULT_PREFETCH_FIND_VALUE_THRESHOLD,
             threshold_window_secs: super::DEFAULT_PREFETCH_THRESHOLD_WINDOW_SECS,

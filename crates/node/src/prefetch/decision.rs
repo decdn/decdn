@@ -1,18 +1,22 @@
 //! Speculative-prefetch decision engine (ADR 022 §Prefetch Decision). Given a
 //! hash whose `FIND_VALUE` demand crossed the trigger threshold, decide whether
 //! to acquire it, applying the operator-policy gates in order:
-//! enabled → demand-quality throttle → authorized-origin → budget.
+//! enabled → demand-quality throttle → budget.
 //!
-//! Pure: the caller injects the clock (`now`, seconds) and the
-//! [`OriginDirectory`]. Ledger state lives behind a `std::sync::Mutex`; lock
-//! poisoning fails closed (the decision becomes a skip).
+//! There is no authorized-origin gate: the `FIND_VALUE` demand signal is
+//! hash-only and carries no namespace (ADR 002 §Retrieval by namespace), so
+//! prefetch cannot resolve authorized origins and does not try. The
+//! `budget_usdc_per_hour` cap and the demand-quality throttle are the
+//! load-bearing bounds on speculative spend.
+//!
+//! Pure: the caller injects the clock (`now`, seconds). Ledger state lives
+//! behind a `std::sync::Mutex`; lock poisoning fails closed (the decision
+//! becomes a skip).
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
 use decdn_common::config::ResolvedPrefetch;
-
-use crate::dht::origin::{Hash, OriginDirectory};
 
 /// Fixed rolling-window length for the spend budget: 1 hour, in seconds. ADR
 /// 022 names the cap as `budget_usdc_per_hour`, so the window is not operator-
@@ -37,8 +41,6 @@ pub enum SkipReason {
     /// rolling `served / acquired` ratio is below the floor, cleared as soon as
     /// it recovers (no hysteresis — ADR 022 "pauses until it recovers").
     Throttled,
-    /// `require_authorized_origin` and no authorized origin for the hash.
-    Unauthorized,
     /// Rolling-1h spend has reached `budget_usdc_per_hour`.
     BudgetExhausted,
 }
@@ -78,22 +80,17 @@ impl PrefetchPolicy {
         }
     }
 
-    /// Decide whether to prefetch `hash` at `now` (seconds), consulting `dir`
-    /// for the authorized-origin gate. Gates apply in order; the first to
-    /// reject wins. Fails closed (`Skip(Throttled)` as a conservative
+    /// Decide whether to prefetch at `now` (seconds). Gates apply in order; the
+    /// first to reject wins. Fails closed (`Skip(Throttled)` as a conservative
     /// stand-in) if the ledger lock is poisoned.
     #[must_use]
-    pub fn decide(&self, hash: &Hash, dir: &dyn OriginDirectory, now: u64) -> PrefetchDecision {
+    pub fn decide(&self, now: u64) -> PrefetchDecision {
         // Gate 1: master switch.
         if !self.cfg.enabled {
             return PrefetchDecision::Skip(SkipReason::Disabled);
         }
 
-        // Gates 2 & 4 both read ledger state. Compute them under one short-lived
-        // lock and release it BEFORE the gate-3 `OriginDirectory` trait call:
-        // that call is arbitrary third-party code (a future chain-backed
-        // directory may take its own locks or do RPC), so holding `ledgers`
-        // across it would be a lock-ordering hazard.
+        // Gates 2 & 3 both read ledger state under one short-lived lock.
         let (throttled, spent) = {
             let Ok(mut led) = self.ledgers.lock() else {
                 tracing::error!("prefetch decide: ledger mutex poisoned; skipping");
@@ -112,13 +109,7 @@ impl PrefetchPolicy {
             return PrefetchDecision::Skip(SkipReason::Throttled);
         }
 
-        // Gate 3: authorized origin (ledger lock released above). `has_origin`
-        // tests presence without materialising the candidate `Vec`.
-        if self.cfg.require_authorized_origin && !dir.has_origin(hash) {
-            return PrefetchDecision::Skip(SkipReason::Unauthorized);
-        }
-
-        // Gate 4: rolling-1h budget.
+        // Gate 3: rolling-1h budget.
         if spent >= self.cfg.budget_usdc_per_hour {
             return PrefetchDecision::Skip(SkipReason::BudgetExhausted);
         }
@@ -203,34 +194,13 @@ impl PrefetchPolicy {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use decdn_common::config::ResolvedPrefetch;
 
     use super::{PrefetchDecision, PrefetchPolicy, SkipReason};
-    use crate::dht::origin::{Hash, OriginDirectory, StaticOriginDirectory};
-    use crate::dht::routing::NodeId;
-
-    fn hash() -> Hash {
-        Hash::from_bytes([7u8; 32])
-    }
-
-    /// Directory that authorizes `hash()` -> one origin.
-    fn authorized_dir() -> Arc<dyn OriginDirectory> {
-        let mut m = std::collections::HashMap::new();
-        m.insert(hash(), vec![NodeId::from_bytes([1u8; 32])]);
-        Arc::new(StaticOriginDirectory::new(m))
-    }
-
-    /// Directory that authorizes nothing.
-    fn empty_dir() -> Arc<dyn OriginDirectory> {
-        Arc::new(StaticOriginDirectory::new(std::collections::HashMap::new()))
-    }
 
     fn cfg(enabled: bool) -> ResolvedPrefetch {
         ResolvedPrefetch {
             enabled,
-            require_authorized_origin: true,
             budget_usdc_per_hour: 1_000_000,
             find_value_threshold: 5,
             threshold_window_secs: 300,
@@ -242,42 +212,15 @@ mod tests {
     }
 
     #[test]
-    fn disabled_skips_before_origin_lookup() {
+    fn disabled_skips() {
         let p = PrefetchPolicy::new(cfg(false));
-        assert_eq!(
-            p.decide(&hash(), &*empty_dir(), 0),
-            PrefetchDecision::Skip(SkipReason::Disabled)
-        );
+        assert_eq!(p.decide(0), PrefetchDecision::Skip(SkipReason::Disabled));
     }
 
     #[test]
-    fn unauthorized_when_no_origin() {
+    fn acquires_when_enabled_and_in_budget() {
         let p = PrefetchPolicy::new(cfg(true));
-        assert_eq!(
-            p.decide(&hash(), &*empty_dir(), 0),
-            PrefetchDecision::Skip(SkipReason::Unauthorized)
-        );
-    }
-
-    #[test]
-    fn acquires_when_authorized_and_in_budget() {
-        let p = PrefetchPolicy::new(cfg(true));
-        assert_eq!(
-            p.decide(&hash(), &*authorized_dir(), 0),
-            PrefetchDecision::Acquire
-        );
-    }
-
-    #[test]
-    fn origin_gate_bypassed_when_disabled() {
-        let mut c = cfg(true);
-        c.require_authorized_origin = false;
-        let p = PrefetchPolicy::new(c);
-        // No authorized origin, but the gate is off => proceeds.
-        assert_eq!(
-            p.decide(&hash(), &*empty_dir(), 0),
-            PrefetchDecision::Acquire
-        );
+        assert_eq!(p.decide(0), PrefetchDecision::Acquire);
     }
 
     #[test]
@@ -290,14 +233,11 @@ mod tests {
         // we isolate the budget gate (throttle is checked before budget).
         p.record_served(1_000, 0);
         assert_eq!(
-            p.decide(&hash(), &*authorized_dir(), 10),
+            p.decide(10),
             PrefetchDecision::Skip(SkipReason::BudgetExhausted)
         );
         // 1h (3600s) later the spend has aged out of the rolling window.
-        assert_eq!(
-            p.decide(&hash(), &*authorized_dir(), 3700),
-            PrefetchDecision::Acquire
-        );
+        assert_eq!(p.decide(3700), PrefetchDecision::Acquire);
     }
 
     #[test]
@@ -306,7 +246,7 @@ mod tests {
         c.budget_usdc_per_hour = 0;
         let p = PrefetchPolicy::new(c);
         assert_eq!(
-            p.decide(&hash(), &*authorized_dir(), 0),
+            p.decide(0),
             PrefetchDecision::Skip(SkipReason::BudgetExhausted)
         );
     }
@@ -317,26 +257,17 @@ mod tests {
         // Acquire 1000 bytes, serve only 50 => ratio 0.05 < 0.1 => throttle.
         p.record_acquisition(10, 1_000, 0);
         p.record_served(50, 0);
-        assert_eq!(
-            p.decide(&hash(), &*authorized_dir(), 1),
-            PrefetchDecision::Skip(SkipReason::Throttled)
-        );
+        assert_eq!(p.decide(1), PrefetchDecision::Skip(SkipReason::Throttled));
         // Serve 200 more => 250/1000 = 0.25 >= 0.1 => recovers.
         p.record_served(200, 2);
-        assert_eq!(
-            p.decide(&hash(), &*authorized_dir(), 3),
-            PrefetchDecision::Acquire
-        );
+        assert_eq!(p.decide(3), PrefetchDecision::Acquire);
     }
 
     #[test]
     fn no_acquisitions_means_no_throttle() {
         let p = PrefetchPolicy::new(cfg(true));
         // acquired == 0 => ratio undefined => not throttled.
-        assert_eq!(
-            p.decide(&hash(), &*authorized_dir(), 0),
-            PrefetchDecision::Acquire
-        );
+        assert_eq!(p.decide(0), PrefetchDecision::Acquire);
         assert!(!p.throttle_active(0));
     }
 }

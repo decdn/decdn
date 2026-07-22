@@ -302,27 +302,17 @@ fn log_region_snapshot(accountant: &crate::region_accounting::RegionAccountant) 
 }
 
 /// #1292: with the empty origin-directory fallback in place (no chain
-/// addresses), an armed authorized-origin gate denies every hash, and two of
-/// those denials look like ordinary operation. Given the gate config, return
-/// `Some((prefetch_gate, pull_through_gate))` when at least one gate is armed —
-/// the caller warns — else `None`.
+/// `origin_assignment_address`), an armed pull-through authorized-origin gate
+/// denies every cache-miss pull, and that denial (a wire `NotFound`) looks like
+/// ordinary operation. Return `true` when the gate is armed so the caller warns.
 ///
-/// Split out so the interaction is unit-testable: the prefetch gate needs
-/// prefetch *enabled* as well as `require_authorized_origin` (which defaults
-/// on, so the `enabled` guard is what stops the warning firing on every
-/// chain-less node), while the pull-through gate stands on its own.
-const fn armed_origin_gates_over_empty_fallback(
-    prefetch_enabled: bool,
-    prefetch_require_authorized_origin: bool,
+/// Split out so the condition is unit-testable. Prefetch has no authorized-origin
+/// gate (its `FIND_VALUE` demand signal is hash-only, carrying no namespace — ADR
+/// 002 §Retrieval by namespace), so only the pull-through gate is considered.
+const fn armed_pull_through_gate_over_empty_fallback(
     pull_through_require_authorized_origin: bool,
-) -> Option<(bool, bool)> {
-    let prefetch_gate = prefetch_enabled && prefetch_require_authorized_origin;
-    let pull_through_gate = pull_through_require_authorized_origin;
-    if prefetch_gate || pull_through_gate {
-        Some((prefetch_gate, pull_through_gate))
-    } else {
-        None
-    }
+) -> bool {
+    pull_through_require_authorized_origin
 }
 
 /// Runtime infrastructure built during the front bring-up phase of [`run`].
@@ -968,18 +958,12 @@ async fn build_chain_and_handlers(
     let (origin_directory, origin_watcher): (
         Arc<dyn crate::dht::origin::OriginDirectory>,
         Option<Arc<crate::chain_events::resumable_watcher::WatcherHandle>>,
-    ) = if let (Some(origin_addr), Some(publisher_addr)) = (
-        cfg.blockchain.origin_assignment_address.as_deref(),
-        cfg.blockchain.publisher_registry_address.as_deref(),
-    ) {
+    ) = if let Some(origin_addr) = cfg.blockchain.origin_assignment_address.as_deref() {
         let origin_assignment_addr =
             parse_nonzero_address(origin_addr, "blockchain.origin_assignment_address")?;
-        let publisher_registry_addr =
-            parse_nonzero_address(publisher_addr, "blockchain.publisher_registry_address")?;
         let directory = crate::dht::ChainOriginDirectory::bootstrap(
             ProviderFactory::read_only(rpc_url.clone(), event_poll_interval),
             origin_assignment_addr,
-            publisher_registry_addr,
             capacity_bond_addr,
             cfg.blockchain.origin_directory_from_block,
             Arc::clone(&infra.watcher_checkpoint_store),
@@ -993,31 +977,23 @@ async fn build_chain_and_handlers(
         let origin_watcher = directory.watcher();
         (Arc::new(directory), Some(origin_watcher))
     } else {
-        // The empty fallback makes every authorized-origin gate deny, and two
-        // of those denials are indistinguishable from ordinary operation (a
-        // prefetch `Unauthorized` skip; a pull-through wire `NotFound`). Warn if
-        // either gate is armed on a node with no chain directory so the dead
-        // path is diagnosable rather than silent (#1292).
-        if let Some((prefetch_gate, pull_through_gate)) = armed_origin_gates_over_empty_fallback(
-            cfg.prefetch.enabled,
-            cfg.prefetch.require_authorized_origin,
+        // The empty fallback makes the pull-through authorized-origin gate deny
+        // every request, and that denial is indistinguishable from ordinary
+        // operation (a wire `NotFound`). Warn if the gate is armed on a node with
+        // no chain directory so the dead path is diagnosable rather than silent
+        // (#1292).
+        if armed_pull_through_gate_over_empty_fallback(
             cfg.cache.pull_through_require_authorized_origin,
         ) {
             tracing::warn!(
-                prefetch_gate,
-                pull_through_gate,
-                "authorized-origin gate is armed but no chain origin directory is \
-                 configured (blockchain.origin_assignment_address / \
-                 publisher_registry_address unset); the gate will deny every hash — \
-                 prefetch skips as Unauthorized and pull-through misses return NotFound"
+                "pull_through_require_authorized_origin is armed but no chain origin \
+                 directory is configured (blockchain.origin_assignment_address unset); \
+                 the gate will deny every cache-miss pull with a wire NotFound"
             );
         }
         (Arc::new(crate::dht::origin::EmptyOriginDirectory), None)
     };
-    let prefetch_engine = Arc::new(crate::prefetch::PrefetchEngine::new(
-        cfg.prefetch,
-        Arc::clone(&origin_directory),
-    ));
+    let prefetch_engine = Arc::new(crate::prefetch::PrefetchEngine::new(cfg.prefetch));
     infra
         .node_metrics
         .set_prefetch_enabled(prefetch_engine.enabled());
@@ -3783,42 +3759,15 @@ mod tests {
         );
     }
 
-    /// #1292: the empty-fallback gate-armed warning. The load-bearing case is
-    /// the prefetch gate — `require_authorized_origin` defaults on, so without
-    /// the `enabled` guard the warning would fire on every chain-less node.
+    /// #1292: the empty-fallback gate-armed warning. Only the pull-through gate
+    /// has an authorized-origin check (prefetch's demand signal is hash-only, so
+    /// it has no such gate — ADR 002 §Retrieval by namespace).
     #[test]
-    fn armed_origin_gates_over_empty_fallback_cases() {
-        // Nothing armed: no warning.
-        assert_eq!(
-            armed_origin_gates_over_empty_fallback(false, false, false),
-            None
-        );
-        // Prefetch requires authorized origin but prefetch is disabled: the gate
-        // is inert, so no warning despite `require_authorized_origin = true`.
-        assert_eq!(
-            armed_origin_gates_over_empty_fallback(false, true, false),
-            None
-        );
-        // Prefetch enabled + requires authorized origin: prefetch gate armed.
-        assert_eq!(
-            armed_origin_gates_over_empty_fallback(true, true, false),
-            Some((true, false))
-        );
-        // Prefetch enabled but does not require an authorized origin: inert.
-        assert_eq!(
-            armed_origin_gates_over_empty_fallback(true, false, false),
-            None
-        );
-        // Pull-through gate stands alone, independent of prefetch.
-        assert_eq!(
-            armed_origin_gates_over_empty_fallback(false, false, true),
-            Some((false, true))
-        );
-        // Both armed: both flags reported for the diagnostic.
-        assert_eq!(
-            armed_origin_gates_over_empty_fallback(true, true, true),
-            Some((true, true))
-        );
+    fn armed_pull_through_gate_over_empty_fallback_cases() {
+        // Gate disarmed: no warning.
+        assert!(!armed_pull_through_gate_over_empty_fallback(false));
+        // Gate armed: warn.
+        assert!(armed_pull_through_gate_over_empty_fallback(true));
     }
 
     #[tokio::test]

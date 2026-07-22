@@ -174,7 +174,7 @@ pub enum CheckpointKey {
     /// deny-set write is committed before this cursor advances past the log that
     /// produced it.
     Blacklist,
-    /// Origin-directory watcher `ContentClaimed` scan cursor (#1108).
+    /// Origin-directory watcher `AssignmentActivated` scan cursor (#1108).
     Origin,
 }
 

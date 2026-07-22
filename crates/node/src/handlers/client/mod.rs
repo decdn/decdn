@@ -282,19 +282,17 @@ impl Drop for BgInflightGuard {
 }
 
 /// Whether the reactive pull-through authorized-origin gate (#821) refuses to
-/// initiate a pull for `hash`. Returns `true` (refuse) only when the operator
-/// opted in — a directory is wired on [`ClientHandlerDeps`] — AND that directory
-/// holds no
-/// authorized origin for the hash's namespace. An unset gate (the default)
-/// always returns `false`, preserving the permissionless cache role. Free
-/// function so the branch is unit-testable without a full handler / QUIC stream
-/// (the wire `NotFound` it produces is indistinguishable from a plain miss, so
-/// an end-to-end test cannot observe it).
-fn pull_origin_gate_blocks(
-    gate: Option<&Arc<dyn OriginDirectory>>,
-    hash: &crate::dht::origin::Hash,
-) -> bool {
-    gate.is_some_and(|dir| !dir.has_origin(hash))
+/// initiate a pull for a request under `namespace_id`. Returns `true` (refuse)
+/// only when the operator opted in — a directory is wired on
+/// [`ClientHandlerDeps`] — AND that directory holds no authorized origin for the
+/// namespace. `NO_NAMESPACE` (0) has no authorized origins (ADR 002 §Namespace
+/// 0), so an enabled gate refuses it. An unset gate (the default) always returns
+/// `false`, preserving the permissionless cache role. Free function so the branch
+/// is unit-testable without a full handler / QUIC stream (the wire `NotFound` it
+/// produces is indistinguishable from a plain miss, so an end-to-end test cannot
+/// observe it).
+fn pull_origin_gate_blocks(gate: Option<&Arc<dyn OriginDirectory>>, namespace_id: U256) -> bool {
+    gate.is_some_and(|dir| !dir.has_origin(namespace_id))
 }
 
 /// Claim `hash` for a background fill (#859), returning a [`BgInflightGuard`]
@@ -1636,36 +1634,34 @@ mod tests {
     }
 
     // #821: the reactive pull-through authorized-origin gate refuses a pull only
-    // when the operator opted in (a directory is wired) AND the hash has no
-    // authorized origin; an unset gate keeps the permissionless default.
+    // when the operator opted in (a directory is wired) AND the request's
+    // namespace has no authorized origin; an unset gate keeps the permissionless
+    // default. Namespace 0 (no namespace) always resolves to no origins.
     #[test]
     fn pull_origin_gate_decision() {
-        use crate::dht::origin::{
-            EmptyOriginDirectory, Hash as OriginHash, OriginDirectory, StaticOriginDirectory,
-        };
+        use crate::dht::origin::{EmptyOriginDirectory, OriginDirectory, StaticOriginDirectory};
         use crate::dht::routing::NodeId;
 
-        let h = OriginHash::from_bytes([7u8; 32]);
+        let ns = U256::from(7u64);
 
         // Unset gate (default): never blocks — cache role stays permissionless.
-        assert!(!pull_origin_gate_blocks(None, &h));
+        assert!(!pull_origin_gate_blocks(None, ns));
 
         // Opted in on a node with no chain addresses — the runtime's fallback
-        // shape. Blocks every hash, which is the #1292 hazard: on the wire this
+        // shape. Blocks every request, which is the #1292 hazard: on the wire this
         // is indistinguishable from a plain miss.
         let empty: Arc<dyn OriginDirectory> = Arc::new(EmptyOriginDirectory);
-        assert!(pull_origin_gate_blocks(Some(&empty), &h));
+        assert!(pull_origin_gate_blocks(Some(&empty), ns));
 
-        // Opted in, directory holds an authorized origin: allows the pull.
+        // Opted in, directory holds an authorized origin for the namespace: allows.
         let mut m = HashMap::new();
-        m.insert(h, vec![NodeId::from_bytes([1u8; 32])]);
+        m.insert(ns, vec![NodeId::from_bytes([1u8; 32])]);
         let authorized: Arc<dyn OriginDirectory> = Arc::new(StaticOriginDirectory::new(m));
-        assert!(!pull_origin_gate_blocks(Some(&authorized), &h));
-        // A different, unclaimed hash through the same directory is still blocked.
-        assert!(pull_origin_gate_blocks(
-            Some(&authorized),
-            &OriginHash::from_bytes([9u8; 32])
-        ));
+        assert!(!pull_origin_gate_blocks(Some(&authorized), ns));
+        // A different, unassigned namespace through the same directory is blocked.
+        assert!(pull_origin_gate_blocks(Some(&authorized), U256::from(9u64)));
+        // Namespace 0 (no namespace) has no authorized origins → blocked.
+        assert!(pull_origin_gate_blocks(Some(&authorized), U256::ZERO));
     }
 
     /// #1382 / #1388: the hard per-byte voucher floor must track the LIVE

@@ -1,6 +1,8 @@
 //! Window-paced pull-through serve path (#856, ADR 037).
 //! Bodies split from `mod.rs` (#1254).
 
+use alloy::primitives::U256;
+
 use super::{
     Arc, B256, Bytes, CacheError, ChannelDeliveryState, ChannelId, ChunkData, ClientHandler,
     ClientMessage, FillOutcome, Hash, MB_BYTES, Mutex, NodeOrigin, NodeProgressivePull, RecvStream,
@@ -118,8 +120,16 @@ impl ClientHandler {
         // (3) Open the progressive upstream pull, bounded by the pull-through
         // deadline so a slow/absent upstream can't pin the stream.
         let deadline = self.pull_through.unwrap_or(WINDOW_PULL_FALLBACK_DEADLINE);
+        // The client's namespace routing hint (ADR 005 §Namespace routing): the
+        // only consumer is the origin-directory fallback inside the pull's
+        // `discover` on a total DHT miss. `NO_NAMESPACE` (0) → no authorized
+        // origins (ADR 002 §Namespace 0). Converted big-endian to the on-chain
+        // `uint256` shape the directory keys on.
+        let namespace_id = U256::from_be_bytes(req.namespace_id);
         let (header, pull) =
-            match tokio::time::timeout(deadline, origin.open_progressive_pull(hash)).await {
+            match tokio::time::timeout(deadline, origin.open_progressive_pull(hash, namespace_id))
+                .await
+            {
                 Ok(Some(pair)) => pair,
                 // No upstream provider could be opened. That is a clean miss on THIS
                 // tier — but if an earlier tier faulted, the request as a whole is

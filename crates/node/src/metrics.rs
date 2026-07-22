@@ -1110,7 +1110,7 @@ pub struct DecdnMetrics {
     /// `OpenMetrics` encoder appends the `_total` suffix.
     pub origin_directory_watcher_restarts: Counter,
     /// `decdn_origin_directory_bootstrap_range_anomaly_total` (#1152): boots on
-    /// which the `ContentClaimed` replay range was inverted
+    /// which the `AssignmentActivated` replay range was inverted
     /// (`replay_from > latest`) — the persisted replay checkpoint (#1108) sat
     /// ahead of a stale / lagging RPC head (replication lag or a reorg). The
     /// genesis replay is skipped that boot (per-namespace membership absent —
@@ -1143,18 +1143,10 @@ pub struct DecdnMetrics {
     /// every node reports the prefetch family regardless of whether the
     /// feature is on. Visible name: `decdn_prefetch_enabled`.
     pub prefetch_enabled: Gauge,
-    /// Prefetch acquisitions that passed the authorized-origin gate. Visible
-    /// name: `decdn_prefetch_acquisitions_authorized_total`. (A plain counter
-    /// field carries no label dimension, so the appendix's `{gate_result=…}`
-    /// split is realized as three sibling counters, mirroring
-    /// `dht_rate_limit_rejected_*`.)
-    pub prefetch_acquisitions_authorized: Counter,
-    /// Prefetch attempts rejected by the authorized-origin gate. Visible name:
-    /// `decdn_prefetch_acquisitions_unauthorized_total`.
-    pub prefetch_acquisitions_unauthorized: Counter,
-    /// Prefetch acquisitions where the origin gate was disabled (bypassed).
-    /// Visible name: `decdn_prefetch_acquisitions_bypassed_total`.
-    pub prefetch_acquisitions_bypassed: Counter,
+    /// Prefetch acquisitions triggered by the `FIND_VALUE` demand signal that
+    /// proceeded to a pull, subject to the budget ceiling and demand-quality
+    /// throttle. Visible name: `decdn_prefetch_acquisitions_total`.
+    pub prefetch_acquisitions: Counter,
     /// Cumulative micro-USDC paid for prefetch acquisitions (#820). Incremented
     /// on each prefetch-initiated paid pull that acked vouchers — a success OR a
     /// paid-but-failed delivery (whose voucher watermark advanced) — so it tracks
@@ -1165,10 +1157,6 @@ pub struct DecdnMetrics {
     /// until the window advanced. Visible name:
     /// `decdn_prefetch_budget_exhaustion_events_total`.
     pub prefetch_budget_exhaustion_events: Counter,
-    /// Prefetch attempts skipped by the origin gate (identical by construction
-    /// to `prefetch_acquisitions_unauthorized`; surfaced standalone for
-    /// alerting). Visible name: `decdn_prefetch_origin_gate_rejections_total`.
-    pub prefetch_origin_gate_rejections: Counter,
     /// Current rolling-window `served / acquired` ratio scaled ×1000 (an
     /// integer gauge — `iroh_metrics::Gauge` is integer-valued). Visible name:
     /// `decdn_prefetch_demand_quality_ratio_milli`.
@@ -1535,10 +1523,6 @@ impl Metrics {
             return;
         };
         match reason {
-            SkipReason::Unauthorized => {
-                self.decdn.prefetch_acquisitions_unauthorized.inc();
-                self.decdn.prefetch_origin_gate_rejections.inc();
-            }
             SkipReason::BudgetExhausted => {
                 self.decdn.prefetch_budget_exhaustion_events.inc();
             }
@@ -1546,14 +1530,10 @@ impl Metrics {
         }
     }
 
-    /// Record a would-acquire decision, split by whether the origin gate was
-    /// applied (`authorized`) or disabled (`bypassed`).
-    pub fn record_prefetch_acquire(&self, gate_applied: bool) {
-        if gate_applied {
-            self.decdn.prefetch_acquisitions_authorized.inc();
-        } else {
-            self.decdn.prefetch_acquisitions_bypassed.inc();
-        }
+    /// Record a prefetch acquisition that proceeded to a pull (single counter;
+    /// there is no authorized-origin gate on the hash-only prefetch signal).
+    pub fn record_prefetch_acquire(&self) {
+        self.decdn.prefetch_acquisitions.inc();
     }
 
     /// Refresh the demand-quality gauges from the policy state. `ratio` is

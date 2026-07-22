@@ -21,13 +21,11 @@
     clippy::indexing_slicing
 )]
 
-use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 use std::sync::Mutex;
 
 use decdn_common::config::{ResolvedPrefetch, ResolvedSecurity};
-use decdn_node::dht::origin::{Hash, OriginDirectory, StaticOriginDirectory};
 use decdn_node::dht::routing::RoutingTable;
 use decdn_node::dht::{
     DhtRateLimiter, RecordStore, RecordStoreConfig, StakerSet, rate_limit::DhtRateLimitConfig,
@@ -1940,7 +1938,7 @@ mod per_hash_fallback_timeout_bail {
 /// demand threshold drives the decision engine into an `Acquire` that the
 /// handler meters (ADR 022 §Prefetch; #650). The handler decides-and-meters
 /// only — no acquisition is fired. Two requests for the same hash (threshold 2)
-/// with an authorized origin must bump `decdn_prefetch_acquisitions_authorized`.
+/// must bump `decdn_prefetch_acquisitions_total`.
 #[tokio::test(flavor = "multi_thread")]
 async fn find_value_feeds_prefetch_engine_and_meters() -> anyhow::Result<()> {
     let server_sk = fresh_key();
@@ -1952,15 +1950,10 @@ async fn find_value_feeds_prefetch_engine_and_meters() -> anyhow::Result<()> {
         *server_id.as_bytes(),
     ))));
 
-    // Authorize an origin for the target hash so the decision passes the
-    // authorized-origin gate and resolves to Acquire.
+    // Prefetch has no authorized-origin gate (the FIND_VALUE demand signal is
+    // hash-only, carrying no namespace), so a threshold-cross resolves to Acquire
+    // on the enabled + in-budget path alone.
     let target = [0xCDu8; 32];
-    let mut origins = HashMap::new();
-    origins.insert(
-        Hash::from_bytes(target),
-        vec![NodeId::from_bytes([1u8; 32])],
-    );
-    let dir: Arc<dyn OriginDirectory> = Arc::new(StaticOriginDirectory::new(origins));
 
     let cfg = ResolvedPrefetch {
         enabled: true,
@@ -1968,7 +1961,7 @@ async fn find_value_feeds_prefetch_engine_and_meters() -> anyhow::Result<()> {
         budget_usdc_per_hour: 1_000_000,
         ..Default::default()
     };
-    let engine = Arc::new(PrefetchEngine::new(cfg, dir));
+    let engine = Arc::new(PrefetchEngine::new(cfg));
 
     let handler = Arc::new(
         DhtHandler::with_routing(
@@ -2037,8 +2030,8 @@ async fn find_value_feeds_prefetch_engine_and_meters() -> anyhow::Result<()> {
         .encode()
         .map_err(|e| anyhow::anyhow!("metrics encode: {e}"))?;
     assert!(
-        text.contains("decdn_prefetch_acquisitions_authorized_total 1"),
-        "expected exactly one authorized prefetch acquisition in scrape:\n{text}"
+        text.contains("decdn_prefetch_acquisitions_total 1"),
+        "expected exactly one prefetch acquisition in scrape:\n{text}"
     );
     Ok(())
 }

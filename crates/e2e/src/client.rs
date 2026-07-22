@@ -374,6 +374,9 @@ impl ClientFixture {
             .map_err(|e| anyhow::anyhow!("open_bi for wire tap: {e}"))?;
         let req = StreamRequest {
             hash: *hash.as_bytes(),
+            // Wire-tap of the backend-fill path; no namespace routing needed
+            // (the node serves from its own origin backend by hash).
+            namespace_id: decdn_protocol::client::NO_NAMESPACE,
             channel_id: session.ctx.channel_id.into(),
             byte_offset: 0,
             byte_len: 0,
