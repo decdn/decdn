@@ -275,3 +275,45 @@ alloy::sol! {
 // `ProbeMsg`/`StreamMsg` evidence structs) rather than re-declaring it — the
 // same ABI the daemon slash watcher decodes.
 pub use decdn_incentive::slash_judge::SlashJudge;
+
+// G-GOV-03 (#1042) surface: the rate-manipulation reveal entry point and the
+// escrow-finality reads/writes. Kept in a separate `sol!` block, additive to the
+// one above, so the real-evidence journey adds no lines inside the shared
+// contract declarations.
+alloy::sol! {
+    /// `SlashJudge.submitRateChallenge` — the rate-manipulation twin of
+    /// `submitPhantomChallenge` (omitted by the production binding, which only
+    /// needs the phantom path). Bound at the `SlashJudge` address; `_verifyPair`
+    /// applies the same signature / same-hash / 30s-window / staleness checks and
+    /// then demands `stream.ratePerMb > probe.ratePerMb`.
+    #[sol(rpc)]
+    contract SlashJudgeRate {
+        function submitRateChallenge(
+            address challengedNode,
+            bytes32 nodeId,
+            bytes probeResponseData,
+            bytes probeSlashSig,
+            bytes streamResponseData,
+            bytes streamSlashSig,
+            bytes32 salt
+        ) external;
+    }
+
+    /// `CapacityBond` escrow-on-slash finality (ADR 028 / ADR 026 § Slashing and
+    /// burn): the slashed TOKEN is parked in `escrowedTotal` until the 30-day
+    /// filing window lapses, then `finalizeUnappealedSlash` distributes it 50% to
+    /// the recorded challenger and 50% to the burn.
+    #[sol(rpc)]
+    contract CapacityBondEscrow {
+        function escrowedTotal() external view returns (uint256);
+        function finalizeUnappealedSlash(uint256 slashId) external;
+    }
+
+    /// TOKEN total supply — the burn leg of the 50/50 split is only observable as
+    /// a supply reduction (`ERC20Burnable.burn`), not as a transfer to any
+    /// address, so a split assertion has to read it.
+    #[sol(rpc)]
+    contract Erc20Supply {
+        function totalSupply() external view returns (uint256);
+    }
+}

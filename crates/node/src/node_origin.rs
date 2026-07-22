@@ -2520,6 +2520,7 @@ mod tests {
         // a self-reported `InternalError` instead of folding both to Unreachable.
         let refused: anyhow::Error = anyhow::Error::new(UpstreamRefused {
             error: StreamError::NotFound,
+            response: None,
         });
         let recovered = refused
             .downcast_ref::<UpstreamRefused>()
@@ -2667,6 +2668,7 @@ mod tests {
             .context(LocalPullFault)
             .context(UpstreamRefused {
                 error: StreamError::NotFound,
+                response: None,
             });
         assert_eq!(
             pull_verdict(&refused_too),
@@ -2697,6 +2699,7 @@ mod tests {
             // find it.
             let err = anyhow::Error::new(UpstreamRefused {
                 error: error.clone(),
+                response: None,
             })
             .context("receive and pay")
             .context("pull from candidate");
