@@ -25,11 +25,11 @@ Content addressing answers "what is this blob?" — a BLAKE3 hash, intrinsic to 
 
 A **publisher** is an Ethereum address that owns at least one namespace in the `PublisherRegistry` contract ([ADR 016](016-contract-interactions.md#adr-016-smart-contract-interaction-model)). Publisher status is acquired implicitly on the first successful `createNamespace()` call — there is no separate registration transaction. Transferring a namespace is gated (see [§ Contract: PublisherRegistry](#contract-publisherregistry) for the lifecycle).
 
-A **namespace** is a publisher-owned `uint256` identifier for a content set, and it is the unit of origin addressing and governance. The DAO authorizes a set of origin operators per namespace via `OriginAssignment` (see [ADR 011 § Origin Assignment Authority](011-content-takedown.md#origin-assignment-authority)); multiple operators may serve one namespace, so redundancy is a namespace-level property with no per-hash bookkeeping. Publishers may create multiple namespaces (subject to the anti-squatting cap in [ADR 009](009-governance.md#adr-009-governance-model)) so distinct content sets are governed independently — for example, one namespace per product line, so takedowns and origin assignments for one product do not entangle the others.
+A **namespace** is a publisher-owned `uint256` identifier for a content set, and it is the unit of origin addressing and governance. The DAO authorizes a set of origin operators per namespace via `OriginAssignment` (see [ADR 011 § Origin Assignment Authority](011-content-takedown.md#origin-assignment-authority)); multiple operators may serve one namespace, so redundancy is a namespace-level property. Publishers may create multiple namespaces (subject to the anti-squatting cap in [ADR 009](009-governance.md#adr-009-governance-model)) so distinct content sets are governed independently — for example, one namespace per product line, so takedowns and origin assignments for one product do not entangle the others.
 
-### No per-hash on-chain claims
+### Hash-to-namespace association
 
-The association between a hash and its namespace is **asserted by the requester at fetch time, out of band** — the application knows which namespace its content lives under (e.g. a music app fetches a track with `namespaceId 3`). There is no on-chain `(namespaceId, blake3Hash)` record. The chain stores only namespace ownership and each namespace's authorized origin set; it never stores the (potentially unbounded) set of content hashes. This is deliberate: recording every hash on-chain would push the protocol toward indexing arbitrary content, which is both pointless (the hash→namespace tie is only ever consumed at fetch time, by an application that already knows it) and dangerous (an on-chain index of all served content).
+A request pairs the hash with the namespace its content is published under. The requester supplies this pair at fetch time — the application already knows its namespace (e.g. a music app fetches a track with `namespaceId 3`). The chain stores namespace ownership and each namespace's authorized origin set, so on-chain state is bounded by the number of namespaces, independent of how much content each one serves.
 
 The namespace on a request is a **routing hint, not a trust anchor.** A node uses it only to decide which origins to ask; BLAKE3 verification of the returned bytes is independent, so a wrong or hostile namespace hint can only cause a *failed fetch*, never corrupt or mis-attributed delivery.
 
@@ -38,13 +38,13 @@ The namespace on a request is a **routing hint, not a trust anchor.** A node use
 A `cdn/client/v1` request carries a `namespaceId` alongside the hash (see [ADR 005](005-protocol.md#cdnclientv1--paid-delivery-protocol)). The node routes on it:
 
 - **`namespaceId != 0`** — the node routes to the namespace's authorized origins (`OriginAssignment`, [ADR 011](011-content-takedown.md#origin-assignment-authority)). If none hold the bytes, or the origin fetch fails, the fetch fails.
-- **`namespaceId == 0` (unclaimed)** — there are no authorized origins. The node serves only from its local cache or from peers discovered via the DHT ([ADR 022](022-content-discovery.md#adr-022--content-discovery-at-scale)). If no peer advertises the hash, the fetch fails. Unclaimed content therefore has no durability or availability guarantee — reliable retrieval wants a namespace.
+- **`namespaceId == 0`** — the request names no namespace, so there are no authorized origins. The node serves only from its local cache or from peers discovered via the DHT ([ADR 022](022-content-discovery.md#adr-022--content-discovery-at-scale)). If no peer advertises the hash, the fetch fails. Namespace-0 content therefore has no durability or availability guarantee — reliable retrieval wants a namespace.
 
 Cache-only serving stays permissionless: any staked operator may re-serve bytes it already holds, for any hash, regardless of namespace. Only the **origin** role is namespace-gated.
 
-### Namespace 0: unclaimed content
+### Namespace 0
 
-`namespaceId == 0` is the unclaimed regime. It has no publisher, no authorized origins, and no DAO allow-list — retrieval is the best-effort cache/DHT path above. A publisher wanting durable origins, takedown accountability, or a stable origin set creates a non-zero namespace and has the DAO authorize origins for it. Nothing is claimed on-chain per hash in either regime; the difference is solely whether an authorized origin set exists for the namespace the requester names.
+`namespaceId == 0` is the default namespace, for content published without one. It has no publisher and no authorized origins; the DAO authorizes origins only for registered (non-zero) namespaces. Namespace-0 content is served best-effort from cache or DHT-discovered holders (the path above) and carries no availability guarantee. A publisher wanting durable origins, takedown accountability, or a stable origin set creates a non-zero namespace and has the DAO authorize origins for it.
 
 ### Contract: PublisherRegistry
 
@@ -86,7 +86,7 @@ interface IPublisherRegistry {
 }
 ```
 
-`PublisherRegistry` records namespace ownership and lifecycle only — no content hashes. The hash→namespace association is never stored here; it is supplied by the requester at fetch time (see [§ No per-hash on-chain claims](#no-per-hash-on-chain-claims)). Origin authorization for a namespace lives in `OriginAssignment` ([ADR 011](011-content-takedown.md#origin-assignment-authority)).
+`PublisherRegistry` records namespace ownership and lifecycle. The hash→namespace association is supplied by the requester at fetch time (see [§ Hash-to-namespace association](#hash-to-namespace-association)). Origin authorization for a namespace lives in `OriginAssignment` ([ADR 011](011-content-takedown.md#origin-assignment-authority)).
 
 The per-publisher namespace cap and the ownership-transfer timelock are governable parameters with safety bounds (see [ADR 009](009-governance.md#adr-009-governance-model)). Defaults: `maxNamespacesPerPublisher = 100` (anti-squatting; bounded `[1, 1000]`) and `namespaceTransferTimelock = 604800` seconds / 7 days (key-compromise mitigation; bounded `[86400, 2592000]` / `[24 h, 30 days]`). Both are stored on `PublisherRegistry` itself and updated via `setMaxNamespacesPerPublisher` / `setNamespaceTransferTimelock` under the standard `TimelockController` delay (`172800` seconds / 48 h); the contract enforces the safety bounds at the setter in seconds and rejects out-of-range writes regardless of caller. The `maxNamespacesPerPublisher` cap is enforced at both `createNamespace` and `finalizeNamespaceTransfer` (on the recipient; self-transfers exempt), so it cannot be bypassed by minting namespaces under throwaway addresses and transferring them to a single publisher.
 

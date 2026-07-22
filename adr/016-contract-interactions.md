@@ -299,7 +299,7 @@ graph TD
 
 #### OriginAssignment construction notes
 
-- **Namespace 0 (unclaimed content).** `namespaceId == 0` has no authorized origins: no set is seated for it, `getOrigins(0)` is empty, and `isAuthorizedOrigin(0, op)` is always false. There is no allow-list to configure.
+- **Namespace 0.** `namespaceId == 0` has no authorized origins: no set is seated for it, `getOrigins(0)` is empty, and `isAuthorizedOrigin(0, op)` is always false.
 - **ContentBlacklist binding.** Until `setContentBlacklist(address)` is called post-deploy (see [§ Post-Deployment Initialization](#post-deployment-initialization) below), `pruneBlacklistedAssignment` reverts — it cannot read `isOriginBlacklisted` against the zero address. This does not block usage: off-chain consumers of `getOrigins(...)` cross-reference `ContentBlacklist.isOriginBlacklisted` directly via RPC.
 
 #### Post-Deployment Initialization
@@ -465,7 +465,7 @@ The cross-contract call table above covers contract-to-contract interactions onl
 | Off-chain client/node | CapacityBond | `bondOf(address operator) returns (uint256)` | Current bonded TOKEN for an operator. Used by operator dashboards (`decdn_capacity_bond_amount_token` per [appendix-observability § CapacityBond Metrics](appendix-observability.md#capacitybond-metrics)) and by nodes to prioritize probe-acceptance for registered-operator (node-to-node) requesters per [ADR 003 § Admission and Priority](003-payments.md#admission-and-priority). | [ADR 003 § Admission and Priority](003-payments.md#admission-and-priority) |
 | Off-chain client/node | CapacityBond | `slashedAtEpoch(address operator) returns (uint64)` | Epoch of this operator's most recent slash; zero if never slashed. Read by `DecdnGovernor._getVotes` for the slash-aware voting-weight zero-out per [ADR 036 § Slashing zero-out](036-served-bytes-voting-weight.md#slashing-zero-out); also exposed to governance dashboards via `decdn_capacity_bond_slashed_at_epoch`. | [ADR 036 § Slashing zero-out](036-served-bytes-voting-weight.md#slashing-zero-out) |
 | Off-chain client/node | OriginAssignment | `isAuthorizedOrigin(uint256 namespaceId, address operator) returns (bool)` | Probe-time check: is this operator authorized to act as origin for this namespace | [ADR 005](005-protocol.md#adr-005-wire-protocol), [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting) |
-| Off-chain client/node | OriginAssignment | `getOrigins(uint256 namespaceId) returns (address[])` | Discovery: list of authorized origin operators for a namespace; `getOrigins(0)` is empty — unclaimed content has no authorized origins | [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting), [ADR 022](022-content-discovery.md#adr-022--content-discovery-at-scale) |
+| Off-chain client/node | OriginAssignment | `getOrigins(uint256 namespaceId) returns (address[])` | Discovery: list of authorized origin operators for a namespace; `getOrigins(0)` is empty — namespace 0 has no authorized origins | [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting), [ADR 022](022-content-discovery.md#adr-022--content-discovery-at-scale) |
 
 ##### Bootstrap pattern
 
