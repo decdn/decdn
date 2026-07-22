@@ -245,7 +245,7 @@ impl ChainOriginDirectory {
     /// bootstrap.
     ///
     /// A bootstrap RPC failure is propagated; the runtime treats it the same as
-    /// the `ChainStakerSet` bootstrap (fatal — the prefetch authorized-origin
+    /// the `ChainStakerSet` bootstrap (fatal — the pull-through authorized-origin
     /// gate cannot be trusted without a complete snapshot).
     ///
     /// The watcher owns its own shutdown token (minted by `resumable_watcher::

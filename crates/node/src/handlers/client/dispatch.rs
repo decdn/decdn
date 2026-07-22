@@ -176,6 +176,71 @@ impl ClientHandler {
 
         let hash = Hash::from_bytes(req.hash);
 
+        // Local-denylist gate (ADR 011 §Local Denylist, §On Blacklist Event
+        // step 2: "reject any new StreamRequest for the hash immediately").
+        //
+        // This sits ABOVE the availability check on purpose. `is_evicted` below
+        // is only consulted on the `Ok(false)` arm — it answers "we used to have
+        // this" — so a denylisted hash the node still HOLDS would sail straight
+        // past it into delivery. The denylist is a refusal to serve, not a
+        // statement about what is in the store, so it must be answered before
+        // the store is asked.
+        //
+        // Governance entries are gated here too, on their own set — the
+        // blacklist watcher denies before it evicts. Two sets, ONE wire code:
+        // ADR 011 §StreamRequest Response requires that a client cannot tell a
+        // governance takedown from this operator's own denylist, and answering
+        // the governance case from the eviction arm below (`EvictedSinceProbe`)
+        // leaked exactly that — it made `HashBlacklisted` a unique fingerprint
+        // for "this operator privately denied it", which is the probe the ADR
+        // forecloses. The reasons stay distinct only so the operator's own
+        // metrics can tell them apart, which no client can read.
+        //
+        // Governance is checked second because the local list is the cheaper and
+        // far more common hit; both are one atomic load and a hash-set probe.
+        if self.cache.is_denied(hash) {
+            return self
+                .respond_error(&mut send, &req, ServeRejectReason::HashDenied)
+                .await;
+        }
+        if self.cache.is_chain_denied(hash) {
+            return self
+                .respond_error(&mut send, &req, ServeRejectReason::ChainHashDenied)
+                .await;
+        }
+
+        // Origin-blacklist gate (ADR 011 §On Blacklist Event: "stops accepting
+        // any StreamRequest that presents a channel funded by that operator
+        // address"). `state.client` is that funding address — the same field the
+        // owner-mismatch gate further down reads.
+        //
+        // This must sit ABOVE the availability check, not after channel
+        // resolution: every cache-miss arm below `return`s its own refusal, so a
+        // gate placed downstream is simply never reached on a miss and the
+        // blacklisted funder gets `NotFound` instead. That is the one answer
+        // `wire_error`'s doc says must never be given here — a client told
+        // `NotFound` retries elsewhere and pays again, when in fact every node
+        // will refuse it. It also silently under-counted the operator's own
+        // compliance metric by the whole cache-miss fraction.
+        //
+        // Resolving the channel early is a `HashMap` lookup, so the cost is
+        // nil; `pull_authorized` keeps its own check as the spend-side backstop.
+        if let Some(channel) = self
+            .channels
+            .lock()
+            .await
+            .get(&ChannelId::from(req.channel_id))
+            .cloned()
+        {
+            let funder = channel.lock().await.state.client;
+            if self.content_deny.is_origin_denied(&funder) {
+                tracing::warn!(%funder, "refusing delivery on a channel funded by a blacklisted origin");
+                return self
+                    .respond_error(&mut send, &req, ServeRejectReason::OriginDenied)
+                    .await;
+            }
+        }
+
         // Set by the origin-tier range pull-through below (#823) when a
         // bounded/offset cache-miss request was filled as a *partial* blob.
         // Carries the authoritative whole-blob size (from the origin size
@@ -197,8 +262,8 @@ impl ClientHandler {
                         .respond_error(&mut send, &req, ServeRejectReason::EvictedSinceProbe)
                         .await;
                 }
-                // Content-authorization gate (#821, ADR 037 §Seed-leech caps /
-                // ADR 022 §Scope and limits). When the operator opts in
+                // Content-authorization gate (#821, ADR 037 §Seed-leech caps).
+                // When the operator opts in
                 // (`pull_through_require_authorized_origin`), refuse to INITIATE an
                 // upstream pull and its cache-warming write for a request whose
                 // namespace has no currently-authorized origin. Namespace 0 has no

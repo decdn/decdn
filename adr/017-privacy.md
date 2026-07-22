@@ -222,7 +222,7 @@ Compromising `server_secret` exposes all past and future epoch keys until rotati
 
 ## References
 
-- [ADR 001 — Network Topology and Peer Mesh](001-network.md#adr-001-network-topology-and-peer-mesh): `NodeAnnounce`, DHT-candidate probing, gossip topics, prefetch triggers
+- [ADR 001 — Network Topology and Peer Mesh](001-network.md#adr-001-network-topology-and-peer-mesh): `NodeAnnounce`, DHT-candidate probing, gossip topics
 - [ADR 002 — Content Addressing](002-content-addressing.md#adr-002-content-addressing): BLAKE3 as global content identifier
 - [ADR 003 — Payment Model](003-payments.md#adr-003-payment-model): payment channel on-chain visibility, probe fishing rate limits
 - [ADR 005 — Wire Protocol](005-protocol.md#adr-005-wire-protocol): probe publicity statement, ALPN definitions

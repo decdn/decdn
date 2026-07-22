@@ -6,7 +6,11 @@
 
 #![allow(dead_code)] // Fields will be consumed by the node runtime.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
+
+use alloy::primitives::Address;
+use decdn_config_types::DeniedHashes;
 
 use crate::cli::common::{LogFormat, LogLevel};
 
@@ -600,42 +604,6 @@ impl Default for ResolvedReceipts {
     }
 }
 
-/// Resolved speculative-prefetch policy (ADR 022 §Prefetch Decision).
-///
-/// All fields validated by the resolver: `find_value_threshold > 0`,
-/// `threshold_window_secs > 0`, `demand_quality_window_secs > 0`, and
-/// `demand_quality_min_ratio` finite in `[0.0, 1.0]`. `Default` reuses the
-/// `DEFAULT_PREFETCH_*` resolver constants so hand-built `ResolvedConfig`s in
-/// tests cannot drift from production defaults.
-#[derive(Debug, Clone, Copy)]
-pub struct ResolvedPrefetch {
-    pub enabled: bool,
-    pub budget_usdc_per_hour: u64,
-    pub find_value_threshold: u32,
-    pub threshold_window_secs: u64,
-    pub demand_quality_min_ratio: f64,
-    pub demand_quality_window_secs: u64,
-    /// Max prefetch acquisitions running concurrently (#820). `> 0`.
-    pub max_concurrent_acquisitions: u32,
-    /// Per-acquisition pull-through deadline in seconds (#820). `> 0`.
-    pub acquisition_timeout_secs: u64,
-}
-
-impl Default for ResolvedPrefetch {
-    fn default() -> Self {
-        Self {
-            enabled: super::DEFAULT_PREFETCH_ENABLED,
-            budget_usdc_per_hour: super::DEFAULT_PREFETCH_BUDGET_USDC_PER_HOUR,
-            find_value_threshold: super::DEFAULT_PREFETCH_FIND_VALUE_THRESHOLD,
-            threshold_window_secs: super::DEFAULT_PREFETCH_THRESHOLD_WINDOW_SECS,
-            demand_quality_min_ratio: super::DEFAULT_PREFETCH_DEMAND_QUALITY_MIN_RATIO,
-            demand_quality_window_secs: super::DEFAULT_PREFETCH_DEMAND_QUALITY_WINDOW_SECS,
-            max_concurrent_acquisitions: super::DEFAULT_PREFETCH_MAX_CONCURRENT_ACQUISITIONS,
-            acquisition_timeout_secs: super::DEFAULT_PREFETCH_ACQUISITION_TIMEOUT_SECS,
-        }
-    }
-}
-
 /// Fully resolved node configuration.
 ///
 /// Every field has a value determined by the three-layer merge:
@@ -657,5 +625,22 @@ pub struct ResolvedConfig {
     pub dht: ResolvedDht,
     pub probe: ResolvedProbe,
     pub receipts: ResolvedReceipts,
-    pub prefetch: ResolvedPrefetch,
+    pub content: ResolvedContent,
+}
+
+/// Resolved local content denylist (ADR 011 §Local Denylist).
+///
+/// Both sets are hot-reloadable: a takedown order with a sub-day deadline must
+/// not require a restart to discharge.
+#[derive(Debug, Clone, Default)]
+pub struct ResolvedContent {
+    /// Blob hashes refused at the delivery path. A distinct type from
+    /// [`ResolvedCache::pinned_hashes`]'s `PinnedHashes` on purpose — the two
+    /// are both hash sets meaning opposite things, and confusing them would pin
+    /// content the operator was ordered to remove.
+    pub denied_hashes: DeniedHashes,
+    /// Operator addresses whose channels are refused. Unioned with the on-chain
+    /// origin blacklist at the gate, so the wire refusal cannot distinguish a
+    /// local entry from a governance one (ADR 011 §`StreamRequest` Response).
+    pub denied_origins: HashSet<Address>,
 }

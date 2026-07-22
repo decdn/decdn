@@ -317,6 +317,89 @@ pub trait BlacklistEntryStore: Send + Sync {
     ///
     /// Returns a [`StoreError`] if the durable write fails.
     fn remove_blacklist_hash(&self, hash: [u8; 32]) -> Result<(), StoreError>;
+
+    /// Every persisted blacklisted origin/operator address, for rebuilding the
+    /// in-memory origin deny-set on boot (ADR 011 § Hash Evasion and Origin
+    /// Blacklisting).
+    ///
+    /// This carries the SAME durability requirement as the hash entries above,
+    /// for a sharper reason. `OriginBlacklistUpdated` is deliberately outside
+    /// the `getBlacklistVersion()` mechanism (ADR 011 § Polling) — it carries no
+    /// version, so there is no counter a consumer could compare against to
+    /// notice it missed one, and no `isOriginBlacklisted` sweep is possible
+    /// because nothing enumerates the blacklisted set on-chain. The event tail
+    /// is the only source, and the watcher's cursor is persisted; without a
+    /// durable projection, a resumed boot scans past those logs and the deny-set
+    /// silently comes back EMPTY. That fails open on a takedown gate.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`StoreError`] if the backing store is unreadable.
+    /// `None` means the projection has never been initialised — a table that
+    /// does not exist yet, as on the first boot after upgrading to a build that
+    /// tracks origins. That is emphatically NOT the same as `Some(vec![])`
+    /// ("scanned, found nothing"), and conflating them is a silent fail-open:
+    /// the blacklist scan cursor predates this projection, so a resumed scan
+    /// starts past every origin event ever emitted and the deny-set stays empty
+    /// forever. The caller MUST treat `None` as "replay from the deploy block".
+    fn load_blacklist_origins(&self) -> Result<Option<Vec<[u8; 20]>>, StoreError>;
+
+    /// Record one blacklisted origin address. Idempotent.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`StoreError`] if the durable write fails. The caller MUST NOT
+    /// advance its scan cursor past the log that produced this entry.
+    fn insert_blacklist_origin(&self, origin: [u8; 20]) -> Result<(), StoreError>;
+
+    /// Drop one blacklisted origin address. Idempotent.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`StoreError`] if the durable write fails.
+    fn remove_blacklist_origin(&self, origin: [u8; 20]) -> Result<(), StoreError>;
+
+    /// Every hash this node refuses under a *governance* blacklist entry, for
+    /// rebuilding the in-memory governance deny-set on boot (ADR 011
+    /// §`StreamRequest` Response).
+    ///
+    /// Distinct from [`Self::load_blacklist_entries`], which is the watcher's
+    /// re-scoping worklist and is emptied for a hash the moment that hash is
+    /// locally evicted. This projection is the opposite: it is written *at*
+    /// eviction and retained, because it answers a question that outlives the
+    /// worklist — "is this hash refused because governance said so, or because
+    /// this operator evicted it?" — which selects the wire refusal code. Without
+    /// it, a restart re-reads only `evicted.log`, which records the eviction but
+    /// not its cause, and every governance takedown silently reverts to
+    /// `EvictedSinceProbe` while local denylist entries keep answering
+    /// `HashBlacklisted`. That is the exact fingerprint ADR 011 forecloses: a
+    /// client able to tell the two apart can map an operator's private legal
+    /// exposure by probing.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`StoreError`] if the backing store is unreadable.
+    /// `None` means never initialised, and carries the same
+    /// replay-from-the-deploy-block obligation as
+    /// [`Self::load_blacklist_origins`] — see that method for why absent and
+    /// empty must not be conflated.
+    fn load_blacklist_denied_hashes(&self) -> Result<Option<Vec<[u8; 32]>>, StoreError>;
+
+    /// Record one governance-denied hash. Idempotent.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`StoreError`] if the durable write fails. The caller MUST NOT
+    /// advance its scan cursor past the log that produced this entry.
+    fn insert_blacklist_denied_hash(&self, hash: [u8; 32]) -> Result<(), StoreError>;
+
+    /// Drop one governance-denied hash — the hash is no longer blacklisted for
+    /// this operator under any region. Idempotent.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`StoreError`] if the durable write fails.
+    fn remove_blacklist_denied_hash(&self, hash: [u8; 32]) -> Result<(), StoreError>;
 }
 
 /// Failure modes shared by every [`ChannelStateStore`] implementation.

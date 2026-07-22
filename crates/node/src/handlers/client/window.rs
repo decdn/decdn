@@ -52,6 +52,18 @@ impl ClientHandler {
         tee: TeeReservation,
         fault_seen: bool,
     ) -> anyhow::Result<()> {
+        // The ADR 011 OPEN-TIME deny gates are already discharged on the only
+        // path that reaches here: `serve_stream` refuses a denylisted hash
+        // before the availability check, and this branch is entered only behind
+        // `pull_authorized`, which refuses a blacklisted funding origin. Keep it
+        // that way — if this function ever gains a second caller, that caller
+        // owes both checks, because this is a spend-and-serve path.
+        //
+        // They cover the request, not the stream: a takedown landing after this
+        // point is caught per MB boundary inside `window_forward_loop` (ADR 011
+        // §On Blacklist Event, in-flight termination), which matters most here
+        // because this path is simultaneously *acquiring* the blob upstream.
+        //
         // Resolve the owning channel (existence + ownership already proven by
         // `pull_authorized`) — needed for the deposit guard and the downstream
         // voucher collection.
@@ -247,6 +259,10 @@ impl ClientHandler {
             .unwrap_or(Bytes::new(decdn_common::config::DEFAULT_PULL_AHEAD_BYTES))
             .max(Bytes::new(interval_bytes));
         let peer = client_node_id.0;
+        // Read once: the funder is immutable for the channel's lifetime, and the
+        // per-boundary in-flight takedown check below must not re-take the
+        // channel lock every MB just to re-read it.
+        let funder = channel.lock().await.state.client;
         // Typed total so the window-budget comparisons below stay `Bytes`-vs-`Bytes`.
         // The forwarded/metered quantities are WIRE bytes (the bao verified-stream:
         // content plus interleaved proof, ADR 038), so the pull budget is the
@@ -405,6 +421,19 @@ impl ClientHandler {
                 {
                     Ok(VoucherOutcome::Accepted) => {
                         served_paid = served_paid.saturating_add(Bytes::new(delta));
+                        // ADR 011 §On Blacklist Event: terminate an in-flight
+                        // delivery at the next MB boundary once a takedown
+                        // lands. This path needs it at least as much as the
+                        // buffered one — it is simultaneously *pulling* the
+                        // blacklisted blob from upstream, so continuing would
+                        // both serve and re-acquire content under a removal
+                        // order. Abandoning the pull is what stops the
+                        // upstream spend.
+                        if self.takedown_landed(hash, Some(funder)) {
+                            self.abandon_window_serve(pull, tee);
+                            self.terminate_for_takedown(send, recv, hash);
+                            return Ok(());
+                        }
                     }
                     Ok(VoucherOutcome::Rejected) => {
                         self.abandon_window_serve(pull, tee);

@@ -134,6 +134,31 @@ const WATCHER_CHECKPOINT_TABLE: TableDefinition<&str, u64> =
 const BLACKLIST_ENTRY_TABLE: TableDefinition<&[u8; 64], ()> =
     TableDefinition::new("blacklist_entry_v1");
 
+/// Durable projection of the origin/operator blacklist (ADR 011 § Hash Evasion
+/// and Origin Blacklisting). Keyed by the raw 20-byte address; the value is
+/// unit, as with the entry table — membership is the whole record.
+///
+/// Separate from [`BLACKLIST_ENTRY_TABLE`] rather than sharing a padded key
+/// space: the two have different key widths and different removal semantics
+/// (`remove_blacklist_hash` scans the entry table for a hash across regions,
+/// which has no origin analogue), and a shared table would make a 20-byte
+/// address collide with a `(region, hash)` prefix under any padding scheme
+/// simple enough to be worth it.
+const BLACKLIST_ORIGIN_TABLE: TableDefinition<&[u8; 20], ()> =
+    TableDefinition::new("blacklist_origin_v1");
+
+/// Durable projection of the hashes refused under a *governance* blacklist
+/// entry, keyed by the raw 32-byte hash (ADR 011 §`StreamRequest` Response).
+///
+/// Not derivable from [`BLACKLIST_ENTRY_TABLE`], which is the re-scoping
+/// worklist and drops a hash as soon as it is evicted, nor from `evicted.log`,
+/// which records that a hash was evicted but not why. This table is the only
+/// thing that survives a restart knowing a refusal is *governance*-sourced,
+/// which is what keeps its wire code identical to a local denylist entry's. See
+/// [`decdn_incentive::store::BlacklistEntryStore::load_blacklist_denied_hashes`].
+const BLACKLIST_DENIED_HASH_TABLE: TableDefinition<&[u8; 32], ()> =
+    TableDefinition::new("blacklist_denied_hash_v1");
+
 /// Pack a `(region, hash)` pair into this table's 64-byte key.
 const fn blacklist_key(region: [u8; 32], hash: [u8; 32]) -> [u8; 64] {
     let mut key = [0u8; 64];
@@ -1096,15 +1121,26 @@ impl KeyedCheckpointStore for PersistentChannelStateStore {
 }
 
 impl PersistentChannelStateStore {
-    /// Open [`BLACKLIST_ENTRY_TABLE`] for writing under `Durability::Immediate`
-    /// and apply `edit`, committing (fsync) before returning. Every mutation in
-    /// this impl is a single durable transaction — the deny-set contract forbids
-    /// buffering, because the watcher advances its scan cursor past a log only
-    /// after the corresponding write has returned `Ok`.
-    fn blacklist_write(
+    /// Open one of the three blacklist projection tables for writing under
+    /// `Durability::Immediate` and apply `edit`, committing (fsync) before
+    /// returning. Every mutation in this impl is a single durable transaction —
+    /// the deny-set contract forbids buffering, because the watcher advances its
+    /// scan cursor past a log only after the corresponding write has returned
+    /// `Ok`.
+    ///
+    /// Generic over the key width because the three tables
+    /// ([`BLACKLIST_ENTRY_TABLE`], [`BLACKLIST_ORIGIN_TABLE`],
+    /// [`BLACKLIST_DENIED_HASH_TABLE`]) differ in nothing else, and a per-table
+    /// copy of this transaction dance is a place for the durability contract to
+    /// drift table-by-table.
+    fn blacklist_write<K>(
         &self,
-        edit: impl FnOnce(&mut redb::Table<'_, &[u8; 64], ()>) -> Result<(), StoreError>,
-    ) -> Result<(), StoreError> {
+        table_def: TableDefinition<'static, K, ()>,
+        edit: impl FnOnce(&mut redb::Table<'_, K, ()>) -> Result<(), StoreError>,
+    ) -> Result<(), StoreError>
+    where
+        K: redb::Key + 'static,
+    {
         let mut write_txn = self
             .db
             .begin_write()
@@ -1114,7 +1150,7 @@ impl PersistentChannelStateStore {
             .map_err(|err| StoreError::Backend(format!("set_durability: {err}")))?;
         {
             let mut table = write_txn
-                .open_table(BLACKLIST_ENTRY_TABLE)
+                .open_table(table_def)
                 .map_err(|err| StoreError::Backend(format!("open_table: {err}")))?;
             edit(&mut table)?;
         }
@@ -1122,6 +1158,40 @@ impl PersistentChannelStateStore {
             .commit()
             .map_err(|err| StoreError::Backend(format!("commit (fsync): {err}")))?;
         Ok(())
+    }
+
+    /// Read back a membership-only projection table (key = the member, value =
+    /// unit), distinguishing "never built" from "built and empty".
+    ///
+    /// That distinction is the whole point, and is why this is not folded in
+    /// with [`BlacklistEntryStore::load_blacklist_entries`]: both projections it
+    /// serves are NEWER than the persisted blacklist scan cursor, so an absent
+    /// table means a resumed scan would start past every event that would have
+    /// populated it. `None` obliges the caller to replay from the deploy block;
+    /// `Some(vec![])` obliges it not to. Conflating them fails open on a
+    /// takedown gate.
+    fn blacklist_membership_load<const N: usize>(
+        &self,
+        table_def: TableDefinition<'static, &'static [u8; N], ()>,
+    ) -> Result<Option<Vec<[u8; N]>>, StoreError> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|err| StoreError::Backend(format!("begin_read: {err}")))?;
+        let table = match read_txn.open_table(table_def) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(err) => return Err(StoreError::Backend(format!("open_table: {err}"))),
+        };
+        let mut members = Vec::new();
+        for row in table
+            .iter()
+            .map_err(|err| StoreError::Backend(format!("iter: {err}")))?
+        {
+            let (key, _) = row.map_err(|err| StoreError::Backend(format!("row: {err}")))?;
+            members.push(*key.value());
+        }
+        Ok(Some(members))
     }
 }
 
@@ -1159,7 +1229,7 @@ impl BlacklistEntryStore for PersistentChannelStateStore {
 
     fn insert_blacklist_entry(&self, region: [u8; 32], hash: [u8; 32]) -> Result<(), StoreError> {
         let key = blacklist_key(region, hash);
-        self.blacklist_write(|table| {
+        self.blacklist_write(BLACKLIST_ENTRY_TABLE, |table| {
             table
                 .insert(&key, ())
                 .map(|_| ())
@@ -1169,7 +1239,7 @@ impl BlacklistEntryStore for PersistentChannelStateStore {
 
     fn remove_blacklist_entry(&self, region: [u8; 32], hash: [u8; 32]) -> Result<(), StoreError> {
         let key = blacklist_key(region, hash);
-        self.blacklist_write(|table| {
+        self.blacklist_write(BLACKLIST_ENTRY_TABLE, |table| {
             table
                 .remove(&key)
                 .map(|_| ())
@@ -1191,7 +1261,7 @@ impl BlacklistEntryStore for PersistentChannelStateStore {
         if doomed.is_empty() {
             return Ok(());
         }
-        self.blacklist_write(|table| {
+        self.blacklist_write(BLACKLIST_ENTRY_TABLE, |table| {
             for key in &doomed {
                 table
                     .remove(key)
@@ -1199,6 +1269,50 @@ impl BlacklistEntryStore for PersistentChannelStateStore {
                     .map_err(|err| StoreError::Backend(format!("remove: {err}")))?;
             }
             Ok(())
+        })
+    }
+
+    fn load_blacklist_origins(&self) -> Result<Option<Vec<[u8; 20]>>, StoreError> {
+        self.blacklist_membership_load(BLACKLIST_ORIGIN_TABLE)
+    }
+
+    fn insert_blacklist_origin(&self, origin: [u8; 20]) -> Result<(), StoreError> {
+        self.blacklist_write(BLACKLIST_ORIGIN_TABLE, |table| {
+            table
+                .insert(&origin, ())
+                .map(|_| ())
+                .map_err(|err| StoreError::Backend(format!("insert: {err}")))
+        })
+    }
+
+    fn remove_blacklist_origin(&self, origin: [u8; 20]) -> Result<(), StoreError> {
+        self.blacklist_write(BLACKLIST_ORIGIN_TABLE, |table| {
+            table
+                .remove(&origin)
+                .map(|_| ())
+                .map_err(|err| StoreError::Backend(format!("remove: {err}")))
+        })
+    }
+
+    fn load_blacklist_denied_hashes(&self) -> Result<Option<Vec<[u8; 32]>>, StoreError> {
+        self.blacklist_membership_load(BLACKLIST_DENIED_HASH_TABLE)
+    }
+
+    fn insert_blacklist_denied_hash(&self, hash: [u8; 32]) -> Result<(), StoreError> {
+        self.blacklist_write(BLACKLIST_DENIED_HASH_TABLE, |table| {
+            table
+                .insert(&hash, ())
+                .map(|_| ())
+                .map_err(|err| StoreError::Backend(format!("insert: {err}")))
+        })
+    }
+
+    fn remove_blacklist_denied_hash(&self, hash: [u8; 32]) -> Result<(), StoreError> {
+        self.blacklist_write(BLACKLIST_DENIED_HASH_TABLE, |table| {
+            table
+                .remove(&hash)
+                .map(|_| ())
+                .map_err(|err| StoreError::Backend(format!("remove: {err}")))
         })
     }
 }
@@ -2153,6 +2267,48 @@ mod tests {
         // Idempotent on an absent hash.
         store.remove_blacklist_hash(hash)?;
         anyhow::ensure!(store.load_blacklist_entries()? == vec![(fr, other_hash)]);
+        Ok(())
+    }
+
+    /// The absent-vs-empty contract both membership projections rest on, at the
+    /// layer that actually implements it. A never-written table must read as
+    /// `None` ("replay from the deploy block"), NOT as `Some(vec![])` ("scanned,
+    /// found nothing") — these tables are newer than the persisted scan cursor,
+    /// so conflating them resumes past every event that would have populated
+    /// them and leaves a takedown gate silently empty.
+    #[test]
+    fn membership_projections_distinguish_absent_from_empty() -> anyhow::Result<()> {
+        let dir = data_dir()?;
+        let store = PersistentChannelStateStore::open(dir.path())?;
+        let hash = [0xE1u8; 32];
+        let origin = [0xE2u8; 20];
+
+        anyhow::ensure!(
+            store.load_blacklist_denied_hashes()?.is_none(),
+            "a never-written table must report absent"
+        );
+        anyhow::ensure!(store.load_blacklist_origins()?.is_none());
+
+        store.insert_blacklist_denied_hash(hash)?;
+        store.insert_blacklist_origin(origin)?;
+        anyhow::ensure!(store.load_blacklist_denied_hashes()? == Some(vec![hash]));
+        anyhow::ensure!(store.load_blacklist_origins()? == Some(vec![origin]));
+
+        // Removal empties the table but must NOT make it read as absent again —
+        // that would force a needless full-chain replay on every boot.
+        store.remove_blacklist_denied_hash(hash)?;
+        anyhow::ensure!(
+            store.load_blacklist_denied_hashes()? == Some(Vec::new()),
+            "an emptied table stays built"
+        );
+        // Idempotent.
+        store.remove_blacklist_denied_hash(hash)?;
+        anyhow::ensure!(store.load_blacklist_denied_hashes()? == Some(Vec::new()));
+
+        // The two tables are independent key spaces despite both being
+        // membership-only — a 32-byte hash must not collide with a 20-byte
+        // address.
+        anyhow::ensure!(store.load_blacklist_origins()? == Some(vec![origin]));
         Ok(())
     }
 }

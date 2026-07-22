@@ -429,6 +429,28 @@ pub struct UpstreamRefused {
     /// wire — never a server-side `ServeRejectReason`, whose seven-way collapse onto
     /// `NotFound` is deliberate and one-way (`handlers::client::wire_error`).
     pub error: StreamError,
+    /// The upstream's own signed [`StreamResponse`], preserved verbatim when the
+    /// refusal arrived at the **open stage** — `Some` for an `ok == false`
+    /// response, `None` for a mid-stream [`ClientMessage::StreamError`] frame,
+    /// which carries no signature at all (#1042).
+    ///
+    /// This is evidence, not diagnostics. `body` is exactly the field set the
+    /// `SlashJudge` EIP-712 `StreamResponse` typehash covers and `slash_sig` is
+    /// the operator's secp256k1 signature over it — already verified against
+    /// `expected_signer` by `verify_response` before this error is built, so a
+    /// present value always recovers to `expected_signer`: the operator address
+    /// the caller bound this pull to, which is what `SlashJudge._checkRegistered`
+    /// resolves `nodeId` against. Paired with the
+    /// same node's earlier `ProbeResponse` for the same hash it is the complete
+    /// on-chain phantom-announcement (`hasBlob && !ok`) or rate-manipulation
+    /// (`stream.ratePerMb > probe.ratePerMb`) evidence pair — court-admissible
+    /// as-is, with no re-signing by the observer.
+    ///
+    /// Discarding it (as the pull path did before #1042) meant the daemon
+    /// produced the signed attestation of its own misbehavior and the client
+    /// threw it away one stack frame later, leaving `SlashJudge` reachable only
+    /// with synthetic signatures from a test that holds the operator key.
+    pub response: Option<StreamResponse>,
 }
 
 impl std::fmt::Display for UpstreamRefused {
@@ -742,9 +764,17 @@ impl PullDeadlines {
 /// on a validated response and is surfaced as the protocol violation it would be
 /// — not defaulted to some invented code, which would launder a malformed refusal
 /// into a plausible-looking one.
-fn refusal(error: Option<StreamError>) -> anyhow::Error {
-    match error {
-        Some(error) => anyhow::Error::new(UpstreamRefused { error }),
+///
+/// Takes the whole `response` rather than just its `error` so the operator's own
+/// signed refusal survives on [`UpstreamRefused::response`] (#1042) — see that
+/// field's docs for why the signature, not the wire code, is the payload that
+/// matters here.
+fn refusal(response: StreamResponse) -> anyhow::Error {
+    match response.error.clone() {
+        Some(error) => anyhow::Error::new(UpstreamRefused {
+            error,
+            response: Some(response),
+        }),
         None => anyhow::anyhow!("delivery refused with no error code (unvalidated response?)"),
     }
 }
@@ -1134,7 +1164,7 @@ async fn fetch_inner(
     .await?;
 
     if !resp.body.ok {
-        return Err(refusal(resp.error));
+        return Err(refusal(resp));
     }
     if resp.body.redirect.is_some() {
         anyhow::bail!("server returned a redirect; following redirects is out of scope (#317)");
@@ -1379,7 +1409,10 @@ async fn receive_and_pay(
                 // mis-attribution #1144 fixed, reappearing one stage later. The wire code
                 // carries the same meaning here as it does in a `StreamResponse`, so let
                 // the one classifier judge both.
-                return Err(anyhow::Error::new(UpstreamRefused { error: e }));
+                return Err(anyhow::Error::new(UpstreamRefused {
+                    error: e,
+                    response: None,
+                }));
             }
             other => anyhow::bail!("unexpected message mid-delivery: {}", variant_name(&other)),
         }
@@ -1631,7 +1664,7 @@ pub async fn open_progressive_pull(
     )
     .await?;
     if !resp.body.ok {
-        return Err(refusal(resp.error));
+        return Err(refusal(resp));
     }
     if resp.body.redirect.is_some() {
         anyhow::bail!("server returned a redirect; following redirects is out of scope (#317)");
@@ -1807,7 +1840,10 @@ impl UpstreamPull {
                 // mis-attribution #1144 fixed, reappearing one stage later. The wire code
                 // carries the same meaning here as it does in a `StreamResponse`, so let
                 // the one classifier judge both.
-                Err(anyhow::Error::new(UpstreamRefused { error: e }))
+                Err(anyhow::Error::new(UpstreamRefused {
+                    error: e,
+                    response: None,
+                }))
             }
             other => anyhow::bail!("unexpected message mid-delivery: {}", variant_name(&other)),
         }
@@ -1844,7 +1880,10 @@ impl UpstreamPull {
                     // mis-attribution #1144 fixed, reappearing one stage later. The wire code
                     // carries the same meaning here as it does in a `StreamResponse`, so let
                     // the one classifier judge both.
-                    return Err(anyhow::Error::new(UpstreamRefused { error: e }));
+                    return Err(anyhow::Error::new(UpstreamRefused {
+                        error: e,
+                        response: None,
+                    }));
                 }
                 other => {
                     anyhow::bail!("unexpected message at stream end: {}", variant_name(&other))
@@ -1967,9 +2006,10 @@ async fn self_pay(
                 // receive sites do (#1145 review) — stringifying it here dropped the code
                 // through every downcast to the `Unreachable` catch-all, scoring an honest
                 // `Overloaded`/`NotFound` peer as a dead node.
-                ClientMessage::StreamError(e) => {
-                    Err(anyhow::Error::new(UpstreamRefused { error: e }))
-                }
+                ClientMessage::StreamError(e) => Err(anyhow::Error::new(UpstreamRefused {
+                    error: e,
+                    response: None,
+                })),
                 other => anyhow::bail!("expected VoucherAck, got {}", variant_name(&other)),
             }
         })
@@ -2424,6 +2464,81 @@ mod tests {
             err.downcast_ref::<HashMismatch>().is_some(),
             "wrong root must surface HashMismatch, got: {err}"
         );
+        Ok(())
+    }
+
+    /// An open-stage refusal must carry the upstream's **signed** `StreamResponse`
+    /// out with it, not just the wire code (#1042).
+    ///
+    /// This is the seam that makes real daemon output admissible on-chain. The
+    /// `slash_sig` here is produced by the same `StreamSlashData` signer the node
+    /// uses and covers the same EIP-712 digest `SlashJudge._verifyPair` checks, so
+    /// what the assertion actually proves is that the operator's self-incriminating
+    /// attestation survives the client's error path intact — byte-for-byte, still
+    /// recovering to the signer. Before #1042 `refusal()` took only
+    /// `response.error` and dropped the body and signature on the floor, leaving
+    /// `SlashJudge`'s phantom/rate paths reachable only from a test that holds the
+    /// operator's key and synthesises its own evidence.
+    ///
+    /// Deliberately routed through the private `refusal()` — the one constructor
+    /// both the buffered and progressive open stages share — rather than a
+    /// hand-built `UpstreamRefused`, which would assert nothing about production.
+    #[test]
+    fn an_open_stage_refusal_preserves_the_signed_stream_response() -> anyhow::Result<()> {
+        use alloy::signers::local::PrivateKeySigner;
+        use decdn_incentive::slash_judge_domain;
+        use decdn_incentive::stream_sig::StreamSlashData;
+        use decdn_protocol::client::{StreamError, StreamResponse, StreamResponseBody};
+
+        use super::{UpstreamRefused, refusal};
+
+        let operator = PrivateKeySigner::random();
+        let domain = slash_judge_domain(31_337, alloy::primitives::Address::repeat_byte(0x11));
+        // The wire shape of a phantom refusal: the node signed `ok = false` for a
+        // hash it had just announced.
+        let body = StreamResponseBody {
+            hash: [0x5Au8; 32],
+            ok: false,
+            rate_per_mb: 10,
+            total_bytes: 0,
+            channel_id: [0x77u8; 32],
+            timestamp_us: 1_700_000_000_000_000,
+            redirect: None,
+        };
+        let sig = StreamSlashData::from_response_body(&body).sign(&operator, &domain)?;
+        let response = StreamResponse {
+            body: body.clone(),
+            error: Some(StreamError::EvictedSinceProbe),
+            voucher_interval_mb: None,
+            slash_sig: sig.as_bytes().to_vec(),
+        };
+        // Precondition the real open stage enforces before ever calling `refusal`.
+        response.validate()?;
+
+        let err = refusal(response);
+        let refused = err
+            .downcast_ref::<UpstreamRefused>()
+            .ok_or_else(|| anyhow::anyhow!("refusal must stay a typed UpstreamRefused: {err:#}"))?;
+        anyhow::ensure!(
+            refused.error == StreamError::EvictedSinceProbe,
+            "the wire code must survive unchanged, got {:?}",
+            refused.error
+        );
+        let preserved = refused.response.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("the signed StreamResponse must survive on the refusal (#1042)")
+        })?;
+        anyhow::ensure!(
+            preserved.body == body,
+            "the preserved body must be the signed body verbatim"
+        );
+        // The whole point: the surviving signature still recovers to the operator,
+        // so it can be replayed to `SlashJudge` with no re-signing by the observer.
+        let recovered = alloy::primitives::Signature::try_from(preserved.slash_sig.as_slice())?;
+        StreamSlashData::from_response_body(&preserved.body).verify_signer(
+            &recovered,
+            operator.address(),
+            &domain,
+        )?;
         Ok(())
     }
 }

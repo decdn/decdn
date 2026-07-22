@@ -518,14 +518,29 @@ impl ClientFixture {
         node: &NodeFixture,
         hash: Hash,
     ) -> anyhow::Result<decdn_protocol::ProbeResponse> {
-        let target = EndpointAddr::new(node.node_id()).with_ip_addr(SocketAddr::V4(
-            SocketAddrV4::new(Ipv4Addr::LOCALHOST, node.bind_port()),
-        ));
+        self.probe_at(node, hash, TIMESTAMP_US).await
+    }
+
+    /// [`Self::probe`] with a caller-chosen `timestamp_us`.
+    ///
+    /// The probe timestamp is requester-generated and echoed back *inside* the
+    /// signed body (ADR 005), so it is what anchors the pair on-chain: the
+    /// `SlashJudge` 30s window and the evidence-staleness bound are both computed
+    /// from it. The default `TIMESTAMP_US` is a fixed sentinel and would read as
+    /// 1970 to the judge, so any journey feeding a real response to `SlashJudge`
+    /// must stamp it near chain time — and any journey testing the *window* stamps
+    /// it deliberately far from the stream's (#1042).
+    pub async fn probe_at(
+        &self,
+        node: &NodeFixture,
+        hash: Hash,
+        timestamp_us: u64,
+    ) -> anyhow::Result<decdn_protocol::ProbeResponse> {
         let (resp, _rtt) = decdn_client_pull::probe::probe_once(
             &self.endpoint,
-            target,
+            Self::target(node),
             *hash.as_bytes(),
-            TIMESTAMP_US,
+            timestamp_us,
             false, // full handshake keeps the probe deterministic
             None,
             Duration::from_secs(10),
@@ -533,6 +548,109 @@ impl ClientFixture {
         .await
         .context("probe daemon")?;
         Ok(resp)
+    }
+
+    /// Run **one** paid-stream open against `node` on an already-open
+    /// `channel_id` and return the daemon's signed refusal (#1042).
+    ///
+    /// Errors unless the node refused up front with an `ok == false`
+    /// `StreamResponse` — a delivery, a transport failure, or a mid-stream
+    /// (unsigned) `StreamError` are all failures of the journey's setup, not
+    /// results, and are surfaced as such rather than silently yielding no
+    /// evidence.
+    ///
+    /// Why an *existing* channel rather than a fresh one: for the ~seconds after
+    /// `openChannel` the node's chain watcher has not decoded `ChannelOpened`, so
+    /// the channel is unrecognized. That does **not** change the refusal code here
+    /// — `serve_stream` resolves the channel only *after* the blob-availability
+    /// gate (`handlers::client::dispatch`), so both refusals this helper captures
+    /// return before the lookup. What it does change is the *reason*:
+    /// `handlers::client::fill::pull_authorized` returns `false` for an
+    /// unrecognized channel, suppressing the range / local-origin / node-to-node
+    /// fill tiers — so a fresh channel can turn a fillable miss into a `NotFound`
+    /// for a reason unrelated to the journey. Reusing a channel a successful
+    /// [`Self::fetch`] already proved the node accepts removes that confound. No
+    /// voucher is exchanged on a refusal, so the zeroed `prior_*` watermark cannot
+    /// go stale here.
+    pub async fn refused_stream(
+        &self,
+        chain: &ChainFixture,
+        node: &NodeFixture,
+        channel_id: B256,
+        hash: Hash,
+        timestamp_us: u64,
+    ) -> anyhow::Result<decdn_protocol::client::StreamResponse> {
+        let ctx = self.channel_context(chain, channel_id)?;
+        let slash_domain = slash_judge_domain(chain.chain_id(), chain.addrs().slash_judge);
+        let err = match stream_fetch_tracked(
+            &self.endpoint,
+            Self::target(node),
+            &ctx,
+            &slash_domain,
+            node.operator_addr(),
+            *hash.as_bytes(),
+            // Refusal tap: the point is that the node refuses; no namespace routing.
+            decdn_protocol::client::NO_NAMESPACE,
+            0,
+            timestamp_us,
+            PullDeadlines::new(Duration::from_secs(30), Duration::from_secs(30))?,
+            0,
+            &mut VoucherProgress::default(),
+        )
+        .await
+        {
+            Ok(bytes) => anyhow::bail!(
+                "expected a refusal, but the node delivered {} bytes",
+                bytes.len()
+            ),
+            Err(e) => e,
+        };
+        let refused = err
+            .downcast_ref::<UpstreamRefused>()
+            .ok_or_else(|| anyhow::anyhow!("expected a typed refusal, got: {err:#}"))?;
+        // `response` is `None` only for a mid-stream `StreamError` frame, which is
+        // unsigned and therefore useless as evidence — a setup failure here.
+        refused.response.clone().ok_or_else(|| {
+            anyhow::anyhow!(
+                "refusal carried no signed StreamResponse (mid-stream {:?}?)",
+                refused.error
+            )
+        })
+    }
+
+    /// The loopback dial target for `node`.
+    fn target(node: &NodeFixture) -> EndpointAddr {
+        EndpointAddr::new(node.node_id()).with_ip_addr(SocketAddr::V4(SocketAddrV4::new(
+            Ipv4Addr::LOCALHOST,
+            node.bind_port(),
+        )))
+    }
+
+    /// A [`ChannelContext`] bound to an existing `channel_id`, at a zero voucher
+    /// watermark and carrying this client's identity binding.
+    fn channel_context(
+        &self,
+        chain: &ChainFixture,
+        channel_id: B256,
+    ) -> anyhow::Result<ChannelContext> {
+        let bind_domain = bind_node_id_domain(chain.chain_id(), chain.addrs().capacity_bond);
+        let own_node_id = B256::from(*self.endpoint.id().as_bytes());
+        Ok(ChannelContext {
+            channel_id,
+            token: chain.usdc(),
+            deposit: U256::from(DEPOSIT_MICRO_USDC),
+            client_signer: Arc::clone(&self.signer),
+            voucher_domain: voucher_domain(chain.chain_id(), chain.addrs().payment_channel),
+            prior_nonce: U256::ZERO,
+            prior_bytes_delivered: U256::ZERO,
+            prior_amount: U256::ZERO,
+            client_binding: None,
+        }
+        .with_client_binding(sign_client_binding(
+            &self.signer,
+            own_node_id,
+            &bind_domain,
+        )?))
     }
 }
 

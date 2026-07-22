@@ -20,10 +20,10 @@ use crate::redact::redact_userinfo;
 
 pub use errors::ConfigErrorBag;
 pub use resolved::{
-    ResolvedBlockchain, ResolvedCache, ResolvedConfig, ResolvedDht, ResolvedDiscovery,
-    ResolvedDiscoveryPeer, ResolvedGossip, ResolvedIdentity, ResolvedNetwork,
-    ResolvedObservability, ResolvedOrigin, ResolvedPayment, ResolvedPrefetch, ResolvedProbe,
-    ResolvedReceipts, ResolvedS3Config, ResolvedS3Credentials, ResolvedSecurity,
+    ResolvedBlockchain, ResolvedCache, ResolvedConfig, ResolvedContent, ResolvedDht,
+    ResolvedDiscovery, ResolvedDiscoveryPeer, ResolvedGossip, ResolvedIdentity, ResolvedNetwork,
+    ResolvedObservability, ResolvedOrigin, ResolvedPayment, ResolvedProbe, ResolvedReceipts,
+    ResolvedS3Config, ResolvedS3Credentials, ResolvedSecurity,
 };
 pub use types::FileConfig;
 
@@ -291,24 +291,6 @@ pub const MAX_RECEIPT_RETAINED_FILES: u32 = 100;
 /// the surfaced path can't drift from where the log actually lands.
 pub const RECEIPT_LOG_FILE: &str = "download_receipts.jsonl";
 
-/// Default `prefetch.enabled` (ADR 022 §Prefetch Decision): opt-in.
-pub const DEFAULT_PREFETCH_ENABLED: bool = false;
-/// Default `prefetch.budget_usdc_per_hour`: `0` => never prefetches.
-pub const DEFAULT_PREFETCH_BUDGET_USDC_PER_HOUR: u64 = 0;
-/// Default `prefetch.find_value_threshold` (ADR 022 §Prefetch Decision table).
-pub const DEFAULT_PREFETCH_FIND_VALUE_THRESHOLD: u32 = 5;
-/// Default `prefetch.threshold_window_secs` (ADR 022 §Prefetch Decision table).
-pub const DEFAULT_PREFETCH_THRESHOLD_WINDOW_SECS: u64 = 300;
-/// Default `prefetch.demand_quality_min_ratio` (ADR 022 §Prefetch Decision table).
-pub const DEFAULT_PREFETCH_DEMAND_QUALITY_MIN_RATIO: f64 = 0.1;
-/// Default `prefetch.demand_quality_window_secs` (ADR 022 §Prefetch Decision table).
-pub const DEFAULT_PREFETCH_DEMAND_QUALITY_WINDOW_SECS: u64 = 3600;
-/// Default `prefetch.max_concurrent_acquisitions` (#820): bound the speculative
-/// background fan-out so prefetch cannot starve demand traffic.
-pub const DEFAULT_PREFETCH_MAX_CONCURRENT_ACQUISITIONS: u32 = 4;
-/// Default `prefetch.acquisition_timeout_secs` (#820): per-acquisition pull deadline.
-pub const DEFAULT_PREFETCH_ACQUISITION_TIMEOUT_SECS: u64 = 30;
-
 /// Load config from file (if present) and merge with CLI args.
 ///
 /// CLI args take precedence over file values; defaults fill gaps.
@@ -363,7 +345,7 @@ pub fn resolve_config(config_path: Option<&Path>, cli: &RunArgs) -> anyhow::Resu
     let dht = resolve_dht_into(file.dht.as_ref(), &mut bag);
     let probe = resolve_probe_into(file.probe.as_ref(), &mut bag);
     let receipts = resolve_receipts_into(file.receipts.as_ref(), &mut bag);
-    let prefetch = resolve_prefetch_into(file.prefetch.as_ref(), &mut bag);
+    let content = resolve_content_into(file.content.as_ref(), &mut bag);
 
     ensure_region_when_publishing_global_into(&identity, &gossip, &mut bag);
     validate_port_layout_into(&network, &observability, &mut bag);
@@ -382,7 +364,7 @@ pub fn resolve_config(config_path: Option<&Path>, cli: &RunArgs) -> anyhow::Resu
         dht,
         probe,
         receipts,
-        prefetch,
+        content,
     })
 }
 
@@ -2134,11 +2116,39 @@ pub fn resolve_circuit_breaker(
 pub fn parse_pinned_hashes(
     raw: Option<&[String]>,
 ) -> anyhow::Result<decdn_config_types::PinnedHashes> {
+    Ok(decdn_config_types::PinnedHashes::new(parse_hash_list(
+        raw,
+        "cache.pinned_hashes",
+    )?))
+}
+
+/// Parse the operator-supplied `content.denied_hashes` list (ADR 011 §Local
+/// Denylist) into a [`decdn_config_types::DeniedHashes`].
+///
+/// Same spelling as `cache.pinned_hashes` — bare 64-char lowercase hex, no
+/// `blake3:` prefix — so an operator has one hash format across the whole
+/// config file. The distinct return type is what keeps a denylist from ever
+/// being handed to the pinning slot.
+pub fn parse_denied_hashes(
+    raw: Option<&[String]>,
+) -> anyhow::Result<decdn_config_types::DeniedHashes> {
+    Ok(decdn_config_types::DeniedHashes::new(parse_hash_list(
+        raw,
+        "content.denied_hashes",
+    )?))
+}
+
+/// Shared validation behind `cache.pinned_hashes` and `content.denied_hashes`.
+/// `label` is the config key, so each list's errors name their own field.
+fn parse_hash_list(
+    raw: Option<&[String]>,
+    label: &str,
+) -> anyhow::Result<std::collections::HashSet<decdn_config_types::Hash>> {
     use std::str::FromStr;
 
     let mut out = std::collections::HashSet::new();
     let Some(entries) = raw else {
-        return Ok(decdn_config_types::PinnedHashes::empty());
+        return Ok(out);
     };
     for (idx, entry) in entries.iter().enumerate() {
         let trimmed = entry.trim();
@@ -2149,20 +2159,68 @@ pub fn parse_pinned_hashes(
         // now beats a silent "did the operator pin this or not?" later.
         anyhow::ensure!(
             trimmed.len() == 64,
-            "cache.pinned_hashes[{idx}] must be 64 hex chars (BLAKE3); got {} chars",
+            "{label}[{idx}] must be 64 hex chars (BLAKE3); got {} chars",
             trimmed.len()
         );
         anyhow::ensure!(
             trimmed.chars().all(|c| c.is_ascii_hexdigit())
                 && !trimmed.chars().any(|c| c.is_ascii_uppercase()),
-            "cache.pinned_hashes[{idx}] must be lowercase hex (0-9, a-f)"
+            "{label}[{idx}] must be lowercase hex (0-9, a-f)"
         );
-        let parsed = decdn_config_types::Hash::from_str(trimmed).with_context(|| {
-            format!("cache.pinned_hashes[{idx}] failed to parse as a BLAKE3 hash")
-        })?;
+        let parsed = decdn_config_types::Hash::from_str(trimmed)
+            .with_context(|| format!("{label}[{idx}] failed to parse as a BLAKE3 hash"))?;
         out.insert(parsed);
     }
-    Ok(decdn_config_types::PinnedHashes::new(out))
+    Ok(out)
+}
+
+/// Parse the operator-supplied `content.denied_origins` list (ADR 011 §Local
+/// Denylist) into a set of operator addresses.
+///
+/// Reuses [`crate::address::parse_nonzero_address`], so the zero address is
+/// rejected: it can never own a payment channel, and accepting it would let a
+/// stray empty string sit in the denylist reading as a real entry.
+pub fn parse_denied_origins(
+    raw: Option<&[String]>,
+) -> anyhow::Result<std::collections::HashSet<alloy::primitives::Address>> {
+    let mut out = std::collections::HashSet::new();
+    let Some(entries) = raw else {
+        return Ok(out);
+    };
+    for (idx, entry) in entries.iter().enumerate() {
+        let label = format!("content.denied_origins[{idx}]");
+        out.insert(crate::address::parse_nonzero_address(entry.trim(), &label)?);
+    }
+    Ok(out)
+}
+
+/// Resolve the local content denylist (ADR 011 §Local Denylist).
+///
+/// Both lists fail resolution on a malformed entry rather than skipping it. A
+/// denylist is discharging a legal order; "one line was ignored" is the one
+/// outcome an operator must never get silently.
+fn resolve_content_into(
+    file: Option<&types::ContentConfig>,
+    bag: &mut ConfigErrorBag,
+) -> ResolvedContent {
+    let denied_hashes = bag
+        .try_with(
+            "content.denied_hashes",
+            parse_denied_hashes(file.and_then(|c| c.denied_hashes.as_deref()))
+                .context("invalid content.denied_hashes"),
+        )
+        .unwrap_or_else(decdn_config_types::DeniedHashes::empty);
+    let denied_origins = bag
+        .try_with(
+            "content.denied_origins",
+            parse_denied_origins(file.and_then(|c| c.denied_origins.as_deref()))
+                .context("invalid content.denied_origins"),
+        )
+        .unwrap_or_default();
+    ResolvedContent {
+        denied_hashes,
+        denied_origins,
+    }
 }
 
 /// Resolve payment fields.
@@ -2498,93 +2556,6 @@ fn resolve_receipts_into(
     ResolvedReceipts {
         max_file_bytes,
         retained_files,
-    }
-}
-
-/// Single-section shim for direct unit tests; `resolve_config` uses the
-/// `_into` worker with the shared bag.
-#[cfg(test)]
-fn resolve_prefetch(file: Option<&types::PrefetchConfig>) -> anyhow::Result<ResolvedPrefetch> {
-    one_section(|bag| resolve_prefetch_into(file, bag))
-}
-
-/// Bag-threading worker for the `[prefetch]` section (ADR 022 §Prefetch
-/// Decision). Shares a bag with the other sections during startup so an
-/// operator sees every config problem in one pass; see `resolve_payment_into`.
-fn resolve_prefetch_into(
-    file: Option<&types::PrefetchConfig>,
-    bag: &mut ConfigErrorBag,
-) -> ResolvedPrefetch {
-    let enabled = file
-        .and_then(|p| p.enabled)
-        .unwrap_or(DEFAULT_PREFETCH_ENABLED);
-    let budget_usdc_per_hour = file
-        .and_then(|p| p.budget_usdc_per_hour)
-        .unwrap_or(DEFAULT_PREFETCH_BUDGET_USDC_PER_HOUR);
-
-    let find_value_threshold = file
-        .and_then(|p| p.find_value_threshold)
-        .unwrap_or(DEFAULT_PREFETCH_FIND_VALUE_THRESHOLD);
-    bag.check(
-        find_value_threshold > 0,
-        "prefetch.find_value_threshold",
-        "prefetch.find_value_threshold must be > 0",
-    );
-
-    let threshold_window_secs = file
-        .and_then(|p| p.threshold_window_secs)
-        .unwrap_or(DEFAULT_PREFETCH_THRESHOLD_WINDOW_SECS);
-    bag.check(
-        threshold_window_secs > 0,
-        "prefetch.threshold_window_secs",
-        "prefetch.threshold_window_secs must be > 0",
-    );
-
-    let demand_quality_min_ratio = file
-        .and_then(|p| p.demand_quality_min_ratio)
-        .unwrap_or(DEFAULT_PREFETCH_DEMAND_QUALITY_MIN_RATIO);
-    bag.check(
-        demand_quality_min_ratio.is_finite() && (0.0..=1.0).contains(&demand_quality_min_ratio),
-        "prefetch.demand_quality_min_ratio",
-        "prefetch.demand_quality_min_ratio must be a finite number in [0.0, 1.0]",
-    );
-
-    let demand_quality_window_secs = file
-        .and_then(|p| p.demand_quality_window_secs)
-        .unwrap_or(DEFAULT_PREFETCH_DEMAND_QUALITY_WINDOW_SECS);
-    bag.check(
-        demand_quality_window_secs > 0,
-        "prefetch.demand_quality_window_secs",
-        "prefetch.demand_quality_window_secs must be > 0",
-    );
-
-    let max_concurrent_acquisitions = file
-        .and_then(|p| p.max_concurrent_acquisitions)
-        .unwrap_or(DEFAULT_PREFETCH_MAX_CONCURRENT_ACQUISITIONS);
-    bag.check(
-        max_concurrent_acquisitions > 0,
-        "prefetch.max_concurrent_acquisitions",
-        "prefetch.max_concurrent_acquisitions must be > 0",
-    );
-
-    let acquisition_timeout_secs = file
-        .and_then(|p| p.acquisition_timeout_secs)
-        .unwrap_or(DEFAULT_PREFETCH_ACQUISITION_TIMEOUT_SECS);
-    bag.check(
-        acquisition_timeout_secs > 0,
-        "prefetch.acquisition_timeout_secs",
-        "prefetch.acquisition_timeout_secs must be > 0",
-    );
-
-    ResolvedPrefetch {
-        enabled,
-        budget_usdc_per_hour,
-        find_value_threshold,
-        threshold_window_secs,
-        demand_quality_min_ratio,
-        demand_quality_window_secs,
-        max_concurrent_acquisitions,
-        acquisition_timeout_secs,
     }
 }
 
@@ -3526,49 +3497,6 @@ mod tests {
             err.contains("receipts.retained_files"),
             "error missing field context: {err}"
         );
-    }
-
-    #[test]
-    fn prefetch_defaults_match_adr() {
-        let r = resolve_prefetch(None).expect("defaults must resolve");
-        assert!(!r.enabled);
-        assert_eq!(r.budget_usdc_per_hour, 0);
-        assert_eq!(r.find_value_threshold, 5);
-        assert_eq!(r.threshold_window_secs, 300);
-        assert!((r.demand_quality_min_ratio - 0.1).abs() < f64::EPSILON);
-        assert_eq!(r.demand_quality_window_secs, 3600);
-    }
-
-    #[test]
-    fn prefetch_rejects_zero_threshold() {
-        let file = types::PrefetchConfig {
-            find_value_threshold: Some(0),
-            ..Default::default()
-        };
-        assert!(resolve_prefetch(Some(&file)).is_err());
-    }
-
-    #[test]
-    fn prefetch_rejects_ratio_above_one() {
-        let file = types::PrefetchConfig {
-            demand_quality_min_ratio: Some(1.5),
-            ..Default::default()
-        };
-        assert!(resolve_prefetch(Some(&file)).is_err());
-    }
-
-    #[test]
-    fn prefetch_rejects_zero_windows() {
-        let win = types::PrefetchConfig {
-            threshold_window_secs: Some(0),
-            ..Default::default()
-        };
-        assert!(resolve_prefetch(Some(&win)).is_err());
-        let dq = types::PrefetchConfig {
-            demand_quality_window_secs: Some(0),
-            ..Default::default()
-        };
-        assert!(resolve_prefetch(Some(&dq)).is_err());
     }
 
     #[test]
@@ -5299,6 +5227,87 @@ swap_pool_address = \"0xPool\"
         let raw: Vec<String> = vec![];
         anyhow::ensure!(parse_pinned_hashes(Some(&raw))?.is_empty());
         Ok(())
+    }
+
+    // --- ADR 011 local denylist (`[content]`, #1168) ------------------------
+
+    #[test]
+    fn parse_denied_hashes_accepts_bare_lowercase_hex() -> anyhow::Result<()> {
+        let raw = vec!["ab".repeat(32)];
+        let parsed = parse_denied_hashes(Some(&raw))?;
+        anyhow::ensure!(parsed.len() == 1);
+        anyhow::ensure!(parsed.contains(&decdn_config_types::Hash::from_bytes([0xab; 32])));
+        Ok(())
+    }
+
+    /// ADR 011 §Local Denylist writes the TOML with a `blake3:` prefix; the
+    /// implementation follows `cache.pinned_hashes`' bare-hex spelling instead
+    /// so an operator has ONE hash format across the config file, and the ADR
+    /// example was amended to match. Pin the rejection so the two cannot drift
+    /// back apart silently.
+    #[test]
+    fn parse_denied_hashes_rejects_the_blake3_prefix() {
+        let raw = vec![format!("blake3:{}", "ab".repeat(32))];
+        let err = parse_denied_hashes(Some(&raw)).expect_err("prefixed form must be rejected");
+        assert!(format!("{err:#}").contains("64 hex chars"), "{err:#}");
+    }
+
+    #[test]
+    fn parse_denied_hashes_rejects_uppercase_and_wrong_length() {
+        assert!(parse_denied_hashes(Some(&["AB".repeat(32)])).is_err());
+        assert!(parse_denied_hashes(Some(&["ab".repeat(31)])).is_err());
+    }
+
+    /// Errors must name `content.denied_hashes`, not `cache.pinned_hashes` —
+    /// the two share a parser, and a mislabelled error would send an operator
+    /// discharging a takedown to the wrong config key.
+    #[test]
+    fn parse_denied_hashes_errors_name_their_own_field() {
+        let err = parse_denied_hashes(Some(&["nope".to_string()])).expect_err("must reject");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("content.denied_hashes"), "{msg}");
+        assert!(!msg.contains("pinned"), "{msg}");
+    }
+
+    #[test]
+    fn parse_denied_hashes_none_and_empty_are_both_empty() -> anyhow::Result<()> {
+        anyhow::ensure!(parse_denied_hashes(None)?.is_empty());
+        let raw: Vec<String> = vec![];
+        anyhow::ensure!(parse_denied_hashes(Some(&raw))?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn parse_denied_origins_accepts_addresses_and_rejects_zero() -> anyhow::Result<()> {
+        let raw = vec!["0x000000000000000000000000000000000000dEaD".to_string()];
+        anyhow::ensure!(parse_denied_origins(Some(&raw))?.len() == 1);
+        let zero = vec!["0x0000000000000000000000000000000000000000".to_string()];
+        assert!(parse_denied_origins(Some(&zero)).is_err(), "zero rejected");
+        assert!(parse_denied_origins(Some(&["nope".to_string()])).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_content_from_file_config() -> anyhow::Result<()> {
+        let file: FileConfig = toml::from_str(&format!(
+            "[content]\ndenied_hashes = [\"{}\"]\ndenied_origins = [\"0x000000000000000000000000000000000000dEaD\"]\n",
+            "cd".repeat(32)
+        ))?;
+        let mut bag = ConfigErrorBag::new();
+        let resolved = resolve_content_into(file.content.as_ref(), &mut bag);
+        bag.into_result()?;
+        anyhow::ensure!(resolved.denied_hashes.len() == 1);
+        anyhow::ensure!(resolved.denied_origins.len() == 1);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_content_absent_section_denies_nothing() {
+        let mut bag = ConfigErrorBag::new();
+        let resolved = resolve_content_into(None, &mut bag);
+        assert!(bag.into_result().is_ok());
+        assert!(resolved.denied_hashes.is_empty());
+        assert!(resolved.denied_origins.is_empty());
     }
 
     #[test]

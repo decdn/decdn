@@ -153,21 +153,6 @@ fn record_channel_open_failure(deps: &NodeOriginDeps, provider_addr: Address, er
     );
 }
 
-/// Post-pull cost observer (#820). Invoked once per pull that acked any voucher
-/// — a successful delivery OR a paid-but-failed one (whose watermark still
-/// advanced, #852) — so the prefetch budget accounts for all spend, not just
-/// successes. It fires for ALL pulls (demand-miss and prefetch alike), so the
-/// observer itself filters to the pulls it cares about. `[u8; 32]` keeps this
-/// trait free of any cache/DHT hash type.
-pub trait AcquisitionObserver: Send + Sync + std::fmt::Debug {
-    /// `micro_usdc` and `bytes` are the deltas for *this* pull (the channel
-    /// watermark minus its prior cumulative), not the channel running totals.
-    /// One pull is one blob/stream, so `bytes` is this pull's delivered length —
-    /// bao WIRE bytes (content plus interleaved proof, ADR 038), the same unit the
-    /// voucher watermark advances in, since it is derived from that watermark.
-    fn on_pull(&self, hash: [u8; 32], micro_usdc: u64, bytes: u64);
-}
-
 /// Tuning knobs for the node-to-node pull, resolved from `[cache]` config.
 #[derive(Debug, Clone)]
 pub struct NodeOriginConfig {
@@ -302,9 +287,6 @@ pub struct NodeOriginDeps {
     pub region_accountant: Arc<crate::region_accounting::RegionAccountant>,
     /// Resolved pull tuning.
     pub config: NodeOriginConfig,
-    /// Optional post-pull cost observer (#820). `None` on a node without
-    /// prefetch; `Some` feeds the prefetch acquisition ledger.
-    pub acquisition_observer: Option<Arc<dyn AcquisitionObserver>>,
     /// The live voucher ledger of each provider's current channel, shared by every
     /// concurrent pull on it (#1145 review). Not a cache — see [`BuyerLedgers`] for
     /// why a per-pull ledger collides at `prior_nonce + 1` and what that now costs.
@@ -615,12 +597,9 @@ impl NodeOrigin {
                     hash_bytes,
                     settle: SettleOnDrop {
                         deps: SettleDeps::Shared(Arc::clone(&self.deps)),
-                        hash_bytes,
                         provider_addr,
                         channel_id: ctx.channel_id,
                         prior_nonce: ctx.prior_nonce,
-                        prior_amount: ctx.prior_amount,
-                        prior_bytes_delivered: ctx.prior_bytes_delivered,
                         ledger,
                     },
                     stream_guard,
@@ -677,9 +656,9 @@ pub struct NodeProgressivePull {
     delivered: u64,
     /// Candidate node id, for region accounting.
     node_id: [u8; 32],
-    /// Blob hash, for the prefetch acquisition-ledger feed (#820).
+    /// Blob hash, for failure classification and provider scoring.
     hash_bytes: [u8; 32],
-    /// Settles the watermark + prefetch ledger on EVERY exit, including a drop.
+    /// Settles the voucher watermark on EVERY exit, including a drop.
     ///
     /// A field rather than a `Drop` impl on this struct, because the terminal methods
     /// destructure `self` — which Rust forbids on a type that implements `Drop`. Holding the
@@ -757,8 +736,8 @@ impl NodeProgressivePull {
         let elapsed = started.elapsed();
         // Settle before scoring, and via the guard rather than by hand: it reads the
         // watermark from the channel ledger, which outlives the consumed `pull`, so a
-        // paid-but-corrupt delivery is still persisted (#852) and the prefetch ledger (#820)
-        // is still fed. Dropped here — not left to the end of the function — so the blocking
+        // paid-but-corrupt delivery is still persisted (#852). Dropped here — not left to
+        // the end of the function — so the blocking
         // store write is not folded into `elapsed`, which feeds the delivery-speed
         // reputation signal (same reason as the buffered path).
         drop(settle);
@@ -1458,12 +1437,9 @@ async fn pull_from_candidate(
     let ledger = channel_ledger(deps, provider_addr, &ctx);
     let settle = SettleOnDrop {
         deps: SettleDeps::Borrowed(deps),
-        hash_bytes,
         provider_addr,
         channel_id: ctx.channel_id,
         prior_nonce: ctx.prior_nonce,
-        prior_amount: ctx.prior_amount,
-        prior_bytes_delivered: ctx.prior_bytes_delivered,
         ledger: Arc::clone(&ledger),
     };
 
@@ -1570,12 +1546,9 @@ impl SettleDeps<'_> {
 /// (#1145 review). See the comment at its construction in [`pull_from_candidate`]
 /// for which cancellations are reachable and why each one is by design.
 ///
-/// Both things it does are settlement of a completed payment, so both belong here:
-///
-/// - the voucher watermark, so the next reuse of this channel signs the nonce the
-///   upstream actually committed to (#852);
-/// - the prefetch ledger's view of the pull's cost (#820), which is just as real on
-///   a cancelled pull as on a returned one — the bytes were bought either way.
+/// It settles the voucher watermark, so the next reuse of this channel signs the
+/// nonce the upstream actually committed to (#852) — just as real on a cancelled
+/// pull as on a returned one, since the bytes were bought either way.
 ///
 /// It deliberately does NOT record a reputation outcome. Reputation is a judgement
 /// about the peer and needs the pull's result to make it; a drop has no result, and
@@ -1592,12 +1565,9 @@ impl SettleDeps<'_> {
 /// runs (#1145 review).
 struct SettleOnDrop<'a> {
     deps: SettleDeps<'a>,
-    hash_bytes: [u8; 32],
     provider_addr: Address,
     channel_id: B256,
     prior_nonce: U256,
-    prior_amount: U256,
-    prior_bytes_delivered: U256,
     ledger: Arc<ChannelLedger>,
 }
 
@@ -1624,13 +1594,6 @@ impl Drop for SettleOnDrop<'_> {
         // now retires the channel — so the old choice ended in a stranded deposit.
         let progress = VoucherProgress::from_cumulative(self.ledger.settlement(), self.prior_nonce);
         persist_buyer_progress(deps, self.provider_addr, self.channel_id, &progress);
-        feed_acquisition_observer(
-            deps,
-            self.hash_bytes,
-            &progress,
-            self.prior_amount,
-            self.prior_bytes_delivered,
-        );
     }
 }
 
@@ -1700,6 +1663,11 @@ enum DurableMissCause {
     EvictedSinceProbe,
     /// The blob is over the peer's ceiling — deterministic for this blob.
     BlobTooLarge,
+    /// The peer will not serve this hash: it is on the governance blacklist or
+    /// on that operator's local denylist (ADR 011). The peer does not say which,
+    /// and must not — but either way it is a policy decision, not a cache state,
+    /// so it will not change inside the TTL.
+    HashBlacklisted,
 }
 
 /// How long a (peer, hash) pair is suppressed after a refusal we cannot attribute to the
@@ -1721,6 +1689,12 @@ enum DurableMissCause {
 /// a channel — blackholed a perfectly healthy upstream for five minutes.
 const REFUSAL_SUPPRESSION_TTL: Duration = Duration::from_secs(30);
 
+// `match_same_arms`: `VoucherRejected` and `OriginBlacklisted` both map to
+// `OurFault`, and `EvictedSinceProbe`/`BlobTooLarge`/`HashBlacklisted` all map to
+// `DurableMiss`, but merging them would erase why each reaches that verdict —
+// which is the only thing that makes a future variant's arm decidable. Each arm
+// carries its own reasoning; keep them apart.
+#[allow(clippy::match_same_arms)]
 const fn classify_refusal(error: &StreamError) -> RefusalVerdict {
     match error {
         // The one code by which a node reports its OWN degradation: "unexpected
@@ -1750,6 +1724,21 @@ const fn classify_refusal(error: &StreamError) -> RefusalVerdict {
         // give it. Routing a mid-stream rejection through here alone is what let a wedged
         // channel skip its remedy entirely and be handed back on every subsequent miss.
         StreamError::VoucherRejected { .. } => RefusalVerdict::OurFault,
+        // Policy, not cache state, and it will not lapse inside the TTL. Note we
+        // cannot tell a governance entry from the peer's own local denylist —
+        // the wire code deliberately does not distinguish them (ADR 011
+        // §StreamRequest Response) — but both are durable for this pair, which
+        // is the only question this function asks.
+        StreamError::HashBlacklisted => {
+            RefusalVerdict::DurableMiss(DurableMissCause::HashBlacklisted)
+        }
+        // Says nothing about the peer and everything about us: OUR operator
+        // address is blacklisted, so every peer will refuse identically.
+        // `OurFault` — scoring the peer would punish it for reporting our own
+        // status, and suppressing the pair would waste the entry, since the next
+        // peer refuses too. There is no remedy at this layer; lifting the entry
+        // is a governance action.
+        StreamError::OriginBlacklisted => RefusalVerdict::OurFault,
     }
 }
 
@@ -2173,6 +2162,9 @@ fn classify_pull_failure(
                     // Exhaustive on the cause, not an `if ==` — a new cause added
                     // tomorrow must DECIDE its telemetry here, the same discipline
                     // `RefusalVerdict`'s own doc demands of new `StreamError`s.
+                    // Two causes emit nothing, for unrelated reasons; merging them
+                    // would lose both rationales (`clippy::match_same_arms`).
+                    #[allow(clippy::match_same_arms)]
                     match cause {
                         // ADR 001 §Probe cache mandates tracking this rate; ADR
                         // 005 says a correct hold mechanism should make it rare,
@@ -2185,6 +2177,13 @@ fn classify_pull_failure(
                         // A static fact about the blob vs. the peer's ceiling —
                         // says nothing about any hold mechanism; no telemetry.
                         DurableMissCause::BlobTooLarge => {}
+                        // A takedown the peer is complying with. Expected
+                        // behaviour, not a fault, and deliberately ambiguous
+                        // between governance and the peer's local denylist —
+                        // there is nothing here an operator could action, and a
+                        // metric would only invite reading peers' local policy
+                        // off the aggregate. No telemetry.
+                        DurableMissCause::HashBlacklisted => {}
                     }
                     suppress(None);
                     debug!(%provider_addr, ?cause, %err, "node-origin: upstream does not have this blob; negative-caching this (peer, hash) for the full TTL without tarring reputation");
@@ -2231,65 +2230,6 @@ fn combined_reputation(deps: &NodeOriginDeps, pk: PublicKey, now_secs: u64) -> f
     let local = deps.local_rep.score(pk);
     let network = deps.network_rep.score(pk, now_secs);
     combined_score(Some(local), network, &deps.rep_cfg) as f32
-}
-
-/// Feed the prefetch acquisition ledger (#820) with THIS pull's spend/byte
-/// deltas, for BOTH a successful and a paid-but-failed delivery (the watermark —
-/// and thus real spend — can advance even on a mid-stream failure #852, and the
-/// rolling-1h budget must account for every micro-USDC spent, not just the
-/// successes, or the gate silently under-counts and can be overspent). Deltas are
-/// the acked watermark minus the channel's prior cumulative (the delta for THIS
-/// pull, not the running total). No-op when no observer is attached or nothing
-/// was acked.
-///
-/// Fires for ALL pull paths — the buffered `pull_from_candidate` AND the
-/// window-paced `NodeProgressivePull` finalize — so the ledger never silently
-/// misses spend that a future routing change pushes onto the window path. The
-/// observer itself filters to prefetch-initiated pulls; a demand-miss pull (the
-/// entire window-paced serve path today) is a harmless no-op inside `on_pull`.
-// KNOWN LIMITATION (#1145 review, tracked with #1122): `progress` carries the CHANNEL-WIDE
-// cumulative, and `prior_*` is the channel watermark captured when THIS pull opened/reused the
-// channel. With the shared `BuyerLedgers`, two concurrent pulls on one channel read the same
-// `prior_*` and settle against the same shared watermark, so each reports ≈ the SUM of both
-// pulls' spend, attributed to its own hash. This is a prefetch-budget OVER-count, not a money
-// bug: the observer feeds a rolling throttle, and over-counting sheds prefetch EARLY (the safe
-// direction, matching `narrow_pull_delta`'s under-count-on-overflow). A precise per-pull figure
-// would need this pull's OWN issued-voucher deltas accumulated through `self_pay` — a per-stream
-// accounting channel that `VoucherProgress` (channel-cumulative by design, for persistence) does
-// not carry — so it is deliberately left for a follow-up rather than risk the voucher path here.
-fn feed_acquisition_observer(
-    deps: &NodeOriginDeps,
-    hash_bytes: [u8; 32],
-    progress: &VoucherProgress,
-    prior_amount: U256,
-    prior_bytes_delivered: U256,
-) {
-    if let Some(obs) = &deps.acquisition_observer
-        && let Some((_, bytes_delivered, amount)) = progress.acked()
-    {
-        let spent = narrow_pull_delta(amount.saturating_sub(prior_amount), "spend", &deps.metrics);
-        let acquired = narrow_pull_delta(
-            bytes_delivered.saturating_sub(prior_bytes_delivered),
-            "bytes",
-            &deps.metrics,
-        );
-        obs.on_pull(hash_bytes, spent, acquired);
-    }
-}
-
-/// Narrow a per-pull `U256` micro-USDC / byte delta to `u64` for the prefetch
-/// ledger (#820). A real per-pull delta never approaches `u64::MAX`; an overflow
-/// signals upstream voucher-accounting corruption, so log it loudly, bump
-/// `node_pull_delta_overflow` so it is alertable (not just log-grep-able), and
-/// fall back to `0` — the same under-count-not-over-count direction the rest of
-/// the prefetch ledger uses. Clamping HIGH (`u64::MAX`) would instead poison the
-/// rolling budget sum and silently pin the gate to permanent exhaustion.
-fn narrow_pull_delta(value: U256, field: &str, metrics: &Metrics) -> u64 {
-    u64::try_from(value).unwrap_or_else(|_| {
-        metrics.node_pull_delta_overflow();
-        warn!(%value, field, "node-origin: per-pull prefetch {field} delta exceeds u64; recording 0");
-        0
-    })
 }
 
 /// Fold a pull/probe outcome into BOTH the local EWMA score and the outbound
@@ -2534,6 +2474,7 @@ mod tests {
         // a self-reported `InternalError` instead of folding both to Unreachable.
         let refused: anyhow::Error = anyhow::Error::new(UpstreamRefused {
             error: StreamError::NotFound,
+            response: None,
         });
         let recovered = refused
             .downcast_ref::<UpstreamRefused>()
@@ -2681,6 +2622,7 @@ mod tests {
             .context(LocalPullFault)
             .context(UpstreamRefused {
                 error: StreamError::NotFound,
+                response: None,
             });
         assert_eq!(
             pull_verdict(&refused_too),
@@ -2711,6 +2653,7 @@ mod tests {
             // find it.
             let err = anyhow::Error::new(UpstreamRefused {
                 error: error.clone(),
+                response: None,
             })
             .context("receive and pay")
             .context("pull from candidate");

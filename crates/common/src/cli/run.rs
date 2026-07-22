@@ -93,10 +93,11 @@ pub struct BlockchainArgs {
     pub capacity_bond_address: Option<String>,
 
     /// `OriginAssignment` contract address (0x-prefixed hex). Optional:
-    /// enables the chain-backed origin directory that gates DHT prefetch
-    /// (ADR 022). Must be set together with `publisher_registry_address`.
-    /// When both are unset the origin directory is empty (deny-all): the
-    /// prefetch authorized-origin gate finds no on-chain origins.
+    /// enables the chain-backed origin directory backing the pull-through gate
+    /// and `FIND_VALUE` fallback (ADR 022). Must be set together with
+    /// `publisher_registry_address`. When both are unset the origin directory is
+    /// empty (deny-all): the pull-through authorized-origin gate and the
+    /// `FIND_VALUE` last-resort origin fallback both find no on-chain origins.
     #[arg(long, value_name = "ADDR", env = "DECDN_ORIGIN_ASSIGNMENT_ADDRESS")]
     pub origin_assignment_address: Option<String>,
 

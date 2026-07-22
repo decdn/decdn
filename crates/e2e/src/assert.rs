@@ -1,13 +1,69 @@
 //! On-chain assertion helpers: typed reads of the state journeys check
-//! (channel records, operator bond activity). Daemon-side assertions go through
-//! the admin RPC client on [`crate::node::NodeFixture`]; delivered-bytes
-//! assertions come from [`crate::client::FetchOutcome`].
+//! (channel records, operator bond activity) and typed revert matching.
+//! Daemon-side assertions go through the admin RPC client on
+//! [`crate::node::NodeFixture`]; delivered-bytes assertions come from
+//! [`crate::client::FetchOutcome`].
 
 use alloy::primitives::{Address, B256, U256};
 use alloy::providers::Provider;
+use alloy::sol_types::SolError;
 use anyhow::Context;
 
 use crate::bindings::{CapacityBond, PaymentChannel, PaymentChannelOpen};
+
+/// Assert an alloy contract call reverted with exactly `E`, matching on the
+/// 4-byte selector. Distinguishes the guard under test from a transport fault
+/// (no revert data at all) and from a *different* revert — both of which an
+/// `is_err()` check would happily accept.
+pub fn expect_revert<T, E: SolError>(
+    result: Result<T, alloy::contract::Error>,
+    what: &str,
+) -> anyhow::Result<()> {
+    match result {
+        Ok(_) => anyhow::bail!("{what} must revert with {}, but succeeded", E::SIGNATURE),
+        Err(err) => assert_revert_data::<E>(err.as_revert_data(), what, &err),
+    }
+}
+
+/// [`expect_revert`] for a call whose typed error has already been wrapped in an
+/// `anyhow` chain — the shape every `ChainFixture` write helper returns.
+///
+/// `anyhow`'s `.context()` preserves the source, so the typed
+/// `alloy::contract::Error` is still reachable by downcast and its revert data
+/// can be matched on `E::SELECTOR`. That is what keeps the assertion pinned to
+/// the ABI rather than to a hand-copied selector literal or to whatever
+/// `ErrorPayload::Display` happens to render (#1042).
+pub fn expect_revert_anyhow<E: SolError>(err: &anyhow::Error, what: &str) -> anyhow::Result<()> {
+    let data = err
+        .chain()
+        .find_map(|source| source.downcast_ref::<alloy::contract::Error>())
+        .and_then(alloy::contract::Error::as_revert_data);
+    assert_revert_data::<E>(data, what, err)
+}
+
+/// Shared selector check. `rendered` is only used to build the failure message.
+fn assert_revert_data<E: SolError>(
+    data: Option<alloy::primitives::Bytes>,
+    what: &str,
+    rendered: &dyn std::fmt::Display,
+) -> anyhow::Result<()> {
+    let data = data.with_context(|| {
+        format!(
+            "{what}: expected a {} revert, got no revert data: {rendered}",
+            E::SIGNATURE
+        )
+    })?;
+    let selector = data
+        .get(..4)
+        .context("revert payload too short to carry a selector")?;
+    anyhow::ensure!(
+        selector == E::SELECTOR,
+        "{what}: expected {}, got revert data 0x{}",
+        E::SIGNATURE,
+        alloy::hex::encode(data)
+    );
+    Ok(())
+}
 
 /// Full on-chain `Channel` record (reuses the production seller-path binding's
 /// struct, the single source of truth for the ABI layout).
@@ -61,35 +117,6 @@ pub async fn client_channel_nonce<P: Provider>(
         .call()
         .await
         .context("clientChannelNonce")
-}
-
-/// Assert an alloy contract call reverted with exactly `E`, matching on the
-/// 4-byte selector. Distinguishes the guard under test from a transport fault
-/// (no revert data at all) and from a *different* revert — both of which an
-/// `is_err()` check would happily accept.
-pub fn expect_revert<T, E: alloy::sol_types::SolError>(
-    result: Result<T, alloy::contract::Error>,
-    what: &str,
-) -> anyhow::Result<()> {
-    let Err(err) = result else {
-        anyhow::bail!("{what} must revert with {}, but succeeded", E::SIGNATURE)
-    };
-    let data = err.as_revert_data().with_context(|| {
-        format!(
-            "{what}: expected a {} revert, got no revert data: {err}",
-            E::SIGNATURE
-        )
-    })?;
-    let selector = data
-        .get(..4)
-        .context("revert payload too short to carry a selector")?;
-    anyhow::ensure!(
-        selector == E::SELECTOR,
-        "{what}: expected {}, got revert data 0x{}",
-        E::SIGNATURE,
-        alloy::hex::encode(&data)
-    );
-    Ok(())
 }
 
 #[cfg(test)]

@@ -1025,6 +1025,7 @@ mod tests {
                             if hash == [1u8; 32] && target == 1 {
                                 Err(anyhow::Error::new(decdn_client_pull::UpstreamRefused {
                                     error: decdn_protocol::StreamError::EvictedSinceProbe,
+                                    response: None,
                                 }))
                             } else {
                                 Ok(vec![hash[0]])
@@ -1067,6 +1068,7 @@ mod tests {
                 if target == 1 {
                     Err(anyhow::Error::new(decdn_client_pull::UpstreamRefused {
                         error: decdn_protocol::StreamError::Overloaded,
+                        response: None,
                     }))
                 } else {
                     Ok(vec![hash[0]])
@@ -1126,6 +1128,7 @@ mod tests {
             |_, _| async {
                 Err(anyhow::Error::new(decdn_client_pull::UpstreamRefused {
                     error: decdn_protocol::StreamError::NotFound,
+                    response: None,
                 }))
             },
             {
@@ -1180,6 +1183,7 @@ mod tests {
                             error: decdn_protocol::StreamError::VoucherRejected {
                                 reason: decdn_protocol::VoucherRejectReason::WrongSigner,
                             },
+                            response: None,
                         }))
                     }
                 }

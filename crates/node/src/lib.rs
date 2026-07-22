@@ -18,6 +18,7 @@ pub mod channel_store;
 /// integration tests keep their `client_requester::…` paths.
 pub use decdn_client_pull as client_requester;
 pub mod commands;
+pub mod content_deny;
 pub mod dht;
 pub mod dispatch;
 pub mod handlers;
@@ -26,7 +27,6 @@ pub mod metrics;
 pub mod node_origin;
 pub mod onchain_tx;
 pub mod payment_settlement;
-pub mod prefetch;
 pub mod probe_client;
 pub(crate) mod prune_guard;
 pub mod rate_bounds;

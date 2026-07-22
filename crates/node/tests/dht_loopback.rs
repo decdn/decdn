@@ -25,7 +25,7 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use decdn_common::config::{ResolvedPrefetch, ResolvedSecurity};
+use decdn_common::config::ResolvedSecurity;
 use decdn_node::dht::routing::RoutingTable;
 use decdn_node::dht::{
     DhtRateLimiter, RecordStore, RecordStoreConfig, StakerSet, rate_limit::DhtRateLimitConfig,
@@ -33,7 +33,6 @@ use decdn_node::dht::{
 use decdn_node::dispatch::ConnectionLimiter;
 use decdn_node::handlers::dht::DhtHandler;
 use decdn_node::metrics::Metrics;
-use decdn_node::prefetch::PrefetchEngine;
 use decdn_protocol::{
     ALPN_DHT, ContentHash, NodeId, decode_message, dht as wire, encode_message, read_frame,
     write_frame,
@@ -1932,106 +1931,4 @@ mod per_hash_fallback_timeout_bail {
         accept_task.abort();
         Ok(())
     }
-}
-
-/// `FIND_VALUE` traffic feeds the prefetch popularity oracle, and crossing the
-/// demand threshold drives the decision engine into an `Acquire` that the
-/// handler meters (ADR 022 §Prefetch; #650). The handler decides-and-meters
-/// only — no acquisition is fired. Two requests for the same hash (threshold 2)
-/// must bump `decdn_prefetch_acquisitions_total`.
-#[tokio::test(flavor = "multi_thread")]
-async fn find_value_feeds_prefetch_engine_and_meters() -> anyhow::Result<()> {
-    let server_sk = fresh_key();
-    let server_id = server_sk.public();
-    let metrics = Arc::new(Metrics::new());
-    let limiter = permissive_limiter(&metrics);
-    let rate_limiter = permissive_dht_rate_limiter(&metrics);
-    let routing = Arc::new(Mutex::new(RoutingTable::new(NodeId::from_bytes(
-        *server_id.as_bytes(),
-    ))));
-
-    // Prefetch has no authorized-origin gate (the FIND_VALUE demand signal is
-    // hash-only, carrying no namespace), so a threshold-cross resolves to Acquire
-    // on the enabled + in-budget path alone.
-    let target = [0xCDu8; 32];
-
-    let cfg = ResolvedPrefetch {
-        enabled: true,
-        find_value_threshold: 2,
-        budget_usdc_per_hour: 1_000_000,
-        ..Default::default()
-    };
-    let engine = Arc::new(PrefetchEngine::new(cfg));
-
-    let handler = Arc::new(
-        DhtHandler::with_routing(
-            server_id,
-            routing,
-            rate_limiter,
-            limiter,
-            Arc::clone(&metrics),
-            Arc::new(AllStaked::new()),
-            empty_record_store(),
-        )
-        .with_prefetch(engine),
-    );
-
-    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_DHT.to_vec()]).await?;
-    let server_ep_bg = server_ep.clone();
-    let accept_task = tokio::spawn(async move {
-        if let Some(incoming) = server_ep_bg.accept().await {
-            let connecting = incoming
-                .accept()
-                .map_err(|e| anyhow::anyhow!("accept: {e}"))?;
-            let conn = connecting
-                .await
-                .map_err(|e| anyhow::anyhow!("handshake: {e}"))?;
-            handler
-                .accept(conn)
-                .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-        }
-        Ok::<_, anyhow::Error>(())
-    });
-
-    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
-    let target_addr = EndpointAddr::new(server_id).with_ip_addr(server_addr);
-    let conn = client_ep
-        .connect(target_addr, ALPN_DHT)
-        .await
-        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
-
-    // Two FIND_VALUE requests for the same hash on the one connection: the
-    // second crosses the demand threshold (2) and triggers the decision.
-    for _ in 0..2 {
-        let (mut send, mut recv) = conn
-            .open_bi()
-            .await
-            .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
-        let req = wire::FindValueRequest {
-            hash: ContentHash::from_bytes(target),
-            requester: NodeId::from_bytes(*client_ep.id().as_bytes()),
-        };
-        let payload = encode_message(&wire::DhtMessage::FindValue(req))?;
-        write_frame(&mut send, &payload).await?;
-        send.finish()?;
-        let frame = read_frame(&mut recv).await?;
-        let (_msg, _) = decode_message::<wire::DhtMessage>(&frame)?;
-    }
-
-    conn.close(0u32.into(), b"bye");
-    client_ep.close().await;
-    accept_task
-        .await
-        .map_err(|e| anyhow::anyhow!("accept task join: {e}"))??;
-    server_ep.close().await;
-
-    let text = metrics
-        .encode()
-        .map_err(|e| anyhow::anyhow!("metrics encode: {e}"))?;
-    assert!(
-        text.contains("decdn_prefetch_acquisitions_total 1"),
-        "expected exactly one prefetch acquisition in scrape:\n{text}"
-    );
-    Ok(())
 }

@@ -489,6 +489,16 @@ enum ServeRejectReason {
     UnauthorizedOrigin,
     CooperativeCloseSigned,
     RangeNotSatisfiable,
+    /// The blob is on this operator's local denylist (ADR 011 §Local Denylist).
+    HashDenied,
+    /// The blob is on the governance blacklist (ADR 011 §On Blacklist Event).
+    /// Separate from [`Self::HashDenied`] for the operator's metrics ONLY — the
+    /// two are deliberately one and the same on the wire, see
+    /// [`Self::wire_error`].
+    ChainHashDenied,
+    /// The channel's funding address is on the origin blacklist — the operator's
+    /// local `denied_origins` or the on-chain one (ADR 011 §On Blacklist Event).
+    OriginDenied,
 }
 
 impl ServeRejectReason {
@@ -533,6 +543,24 @@ impl ServeRejectReason {
             Self::EvictedSinceProbe => StreamError::EvictedSinceProbe,
             Self::InternalError => StreamError::InternalError,
             Self::BlobTooLarge => StreamError::BlobTooLarge,
+            // The two takedown refusals do NOT collapse to `NotFound`. ADR 011
+            // §`StreamRequest` Response names distinct codes because the retry
+            // advice differs and a miss-shaped answer would be actively
+            // misleading: a client told `NotFound` retries elsewhere and pays
+            // again, when for `OriginBlacklisted` every node will refuse it.
+            //
+            // They are still each other's privacy floor. `HashBlacklisted` does
+            // not say whether the entry is governance or local — that is the ADR's
+            // explicit requirement, since a client able to tell them apart could
+            // map an operator's private legal exposure by probing. It is why the
+            // two reasons below converge here and why the governance one is NOT
+            // allowed to fall through to `EvictedSinceProbe`: a hash refused
+            // under a code no on-chain entry explains is a hash this operator
+            // denied privately, which is that map. And neither says anything
+            // about a channel's balance, which is what the `NotFound` collapse
+            // above exists to protect.
+            Self::HashDenied | Self::ChainHashDenied => StreamError::HashBlacklisted,
+            Self::OriginDenied => StreamError::OriginBlacklisted,
         }
     }
 }
@@ -648,6 +676,14 @@ pub struct ClientHandlerDeps {
     pub voucher_interval_mb: u64,
     pub max_blob_size_bytes: u64,
     pub max_concurrent_streams: usize,
+    /// Live content deny-set (ADR 011): the operator's local denylist unioned
+    /// with the on-chain origin blacklist. NOT an `Option`, unlike the wiring
+    /// hooks below — an empty deny-set is a correct steady state (most operators
+    /// deny nothing), so there is no "unwired" case to represent, and an
+    /// `Option` would only add a way to fail open on a takedown gate.
+    /// [`ClientHandlerDeps::new`] seeds it empty; the runtime overwrites it with
+    /// the resolved one.
+    pub content_deny: Arc<crate::content_deny::ContentDenylist>,
     // Optional wiring — `None` unless the deployment enables the feature.
     pub redeem_hint: Option<mpsc::Sender<ChannelId>>,
     pub voucher_activity: Option<Arc<VoucherActivity>>,
@@ -662,7 +698,6 @@ pub struct ClientHandlerDeps {
     pub pull_ahead_bytes: Option<Bytes>,
     pub leech_governor: Option<Arc<LeechGovernor>>,
     pub pull_origin_gate: Option<Arc<dyn OriginDirectory>>,
-    pub prefetch_engine: Option<Arc<crate::prefetch::PrefetchEngine>>,
     pub idle_timeout: Option<Duration>,
 }
 
@@ -713,6 +748,7 @@ impl ClientHandlerDeps {
             voucher_interval_mb,
             max_blob_size_bytes,
             max_concurrent_streams,
+            content_deny: Arc::new(crate::content_deny::ContentDenylist::empty()),
             redeem_hint: None,
             voucher_activity: None,
             region_accountant: None,
@@ -723,7 +759,6 @@ impl ClientHandlerDeps {
             pull_ahead_bytes: None,
             leech_governor: None,
             pull_origin_gate: None,
-            prefetch_engine: None,
             idle_timeout: None,
         }
     }
@@ -829,7 +864,7 @@ pub struct ClientHandler {
     /// leaves only the per-request window.
     leech_governor: Option<Arc<LeechGovernor>>,
     /// Optional content-authorization gate on the reactive pull-through path
-    /// (#821, ADR 037 §Seed-leech caps / ADR 022 §Scope and limits), set at
+    /// (#821, ADR 037 §Seed-leech caps / ADR 022 §`FIND_VALUE` Flow), set at
     /// construction via [`ClientHandlerDeps`] only when the operator sets
     /// `cache.pull_through_require_authorized_origin = true`. `None` (the default
     /// and in tests) keeps the permissionless cache role: misses pull through
@@ -837,15 +872,18 @@ pub struct ClientHandler {
     /// origin in this directory (`has_origin == false`) is refused with
     /// `NotFound` before any upstream pull or cache-warming write — a
     /// pull-*initiation* gate only, never consulted for a range already held.
-    /// Shares the same `OriginDirectory` the prefetch gate uses, so the namespace
-    /// / default-open (`namespaceId == 0`) / fail-closed-on-RPC-loss semantics
-    /// are identical.
+    /// Resolves against the shared `OriginDirectory` using the namespace /
+    /// default-open (`namespaceId == 0`) / fail-closed-on-RPC-loss semantics.
     pull_origin_gate: Option<Arc<dyn OriginDirectory>>,
-    /// Speculative-prefetch engine (#820), set at construction via
-    /// [`ClientHandlerDeps`]. `None` in tests / when prefetch is off. When
-    /// `Some`, the serve path credits bytes served from prefetch-acquired blobs
-    /// to the demand-quality numerator.
-    prefetch_engine: Option<Arc<crate::prefetch::PrefetchEngine>>,
+    /// Live content deny-set (ADR 011). Consulted at three points, all of which
+    /// must gate or the check is bypassable: the hash gate above the
+    /// availability check in `serve_stream`, the origin gate right after channel
+    /// resolution, and the same origin gate inside `pull_authorized` — that last
+    /// one runs EARLIEST and decides whether to front upstream USDC egress, so
+    /// omitting it would have this node pay on a blacklisted origin's behalf
+    /// before ever reaching the serve refusal. The window-paced serve path
+    /// (`window.rs`) is a fourth, independent ladder.
+    pub(crate) content_deny: Arc<crate::content_deny::ContentDenylist>,
     rate_per_mb: Arc<AtomicU64>,
     rate_bounds: crate::rate_bounds::RateBounds,
     voucher_interval_mb: u64,
@@ -924,7 +962,7 @@ impl ClientHandler {
             pull_ahead_bytes: deps.pull_ahead_bytes,
             leech_governor: deps.leech_governor,
             pull_origin_gate: deps.pull_origin_gate,
-            prefetch_engine: deps.prefetch_engine,
+            content_deny: deps.content_deny,
             rate_per_mb: deps.rate_per_mb,
             rate_bounds: deps.rate_bounds,
             voucher_interval_mb: deps.voucher_interval_mb,
@@ -998,6 +1036,52 @@ impl ClientHandler {
         tokio::task::spawn_blocking(move || store.forget(channel_id))
             .await
             .map_err(|e| StoreError::Backend(format!("forget_channel join: {e}")))?
+    }
+
+    /// Has a takedown landed on this stream since it opened (ADR 011 §On
+    /// Blacklist Event: "In-flight streams for a blacklisted hash are terminated
+    /// at the next MB boundary")?
+    ///
+    /// The open-time gates in `dispatch.rs` are not enough on their own: a
+    /// multi-GB blob can still be streaming minutes after a one-hour removal
+    /// order took effect, and serving past the compliance window is slashable
+    /// (ADR 026 §Slashing and burn). Both halves are re-checked because both can
+    /// land mid-stream — a hash via the local denylist reload, the governance
+    /// blacklist, or an eviction; a funder via either origin list.
+    ///
+    /// Cheap enough for a per-MB call: three atomic loads and a hash-set probe
+    /// each, against a boundary that already takes a channel lock and a network
+    /// round trip to collect a voucher.
+    pub(super) fn takedown_landed(&self, hash: Hash, funder: Option<Address>) -> bool {
+        self.cache.refuses(hash)
+            || funder.is_some_and(|addr| self.content_deny.is_origin_denied(&addr))
+    }
+
+    /// Cut off an in-flight delivery whose hash or funder was taken down
+    /// mid-stream, by resetting both directions.
+    ///
+    /// A reset, not a `StreamError` frame: ADR 005's stream-error domain split
+    /// makes `VoucherRejected` the only code that travels mid-stream, and the
+    /// client's cue here is the absence of the `StreamEnd` sentinel — the same
+    /// convention every other mid-stream fault uses. The QUIC code is
+    /// [`APP_ERR_NO_ERROR`] because this is a compliance action, not a protocol
+    /// fault by either party, and ADR 013 §Application Error Codes reserves
+    /// `0x03` for peers that misbehaved; coding it as a fault would have the
+    /// client penalise this node's reputation for discharging a takedown. A
+    /// client that re-requests the hash gets the signed `HashBlacklisted`
+    /// refusal from the open-time gate, which is where the reason belongs.
+    pub(super) fn terminate_for_takedown(
+        &self,
+        send: &mut SendStream,
+        recv: &mut RecvStream,
+        hash: Hash,
+    ) {
+        self.metrics.serve_stream_terminated_takedown();
+        tracing::warn!(
+            %hash,
+            "terminating an in-flight delivery: a takedown landed after the stream opened"
+        );
+        reset_stream(send, recv, APP_ERR_NO_ERROR);
     }
 
     /// Raise a tracked channel's on-chain deposit after a `ChannelToppedUp`
@@ -1630,6 +1714,71 @@ mod tests {
         assert!(
             encoded.contains("decdn_node_pull_through_background_succeeded_total 1"),
             "…and must record the verdict it was given. Got:\n{encoded}"
+        );
+    }
+
+    /// ADR 011 §`StreamRequest` Response names distinct refusal codes for the two
+    /// takedown reasons. They must NOT join the seven-reason `NotFound` collapse:
+    /// a client told `NotFound` retries elsewhere and pays again, which for
+    /// `OriginBlacklisted` is advice that can never succeed.
+    #[test]
+    fn takedown_reject_reasons_do_not_collapse_to_not_found() {
+        assert_eq!(
+            ServeRejectReason::HashDenied.wire_error(),
+            decdn_protocol::StreamError::HashBlacklisted
+        );
+        assert_eq!(
+            ServeRejectReason::OriginDenied.wire_error(),
+            decdn_protocol::StreamError::OriginBlacklisted
+        );
+        // The collapse itself is unchanged — it is a privacy property, not an
+        // oversight, and widening it was never the point of #1179.
+        for reason in [
+            ServeRejectReason::CacheMiss,
+            ServeRejectReason::UnknownChannel,
+            ServeRejectReason::OwnerMismatch,
+            ServeRejectReason::InsufficientDeposit,
+            ServeRejectReason::UnauthorizedOrigin,
+            ServeRejectReason::CooperativeCloseSigned,
+            ServeRejectReason::RangeNotSatisfiable,
+        ] {
+            assert_eq!(
+                reason.wire_error(),
+                decdn_protocol::StreamError::NotFound,
+                "{reason:?} must stay wire-indistinguishable"
+            );
+        }
+    }
+
+    /// The privacy invariant ADR 011 §`StreamRequest` Response actually asks
+    /// for: a governance takedown and this operator's own denylist entry are one
+    /// wire code. They stay distinct *reasons* only so the operator's own
+    /// metrics can tell them apart, which no client can read.
+    ///
+    /// The failure this pins is not hypothetical — it shipped. Governance
+    /// entries used to reach the serve path only as cache evictions and answered
+    /// `EvictedSinceProbe`, which made `HashBlacklisted` a unique fingerprint for
+    /// "this operator privately denied it": exactly the map of an operator's
+    /// legal exposure the ADR forecloses.
+    #[test]
+    fn local_and_governance_hash_denials_share_one_wire_code() {
+        assert_eq!(
+            ServeRejectReason::HashDenied.wire_error(),
+            ServeRejectReason::ChainHashDenied.wire_error(),
+            "a client must not be able to tell a governance takedown from a local one"
+        );
+    }
+
+    /// ...while an eviction with no blacklist entry behind it (corruption
+    /// recovery, a manual `decdn node evict`) keeps its own code. Collapsing
+    /// that one too would cost the probe-then-gone race its distinct answer for
+    /// no privacy gain: nobody can infer a legal exposure from a hash this node
+    /// simply no longer holds.
+    #[test]
+    fn plain_eviction_keeps_its_own_wire_code() {
+        assert_ne!(
+            ServeRejectReason::EvictedSinceProbe.wire_error(),
+            ServeRejectReason::HashDenied.wire_error()
         );
     }
 

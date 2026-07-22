@@ -153,7 +153,7 @@ pub fn write_validate_summary<W: std::io::Write>(
             .blockchain
             .origin_assignment_address
             .as_deref()
-            .unwrap_or("(unset — origin directory empty: prefetch gate finds no origins)")
+            .unwrap_or("(unset — origin directory empty: pull-through gate and FIND_VALUE fallback find no origins)")
     )?;
     writeln!(
         w,
@@ -162,7 +162,7 @@ pub fn write_validate_summary<W: std::io::Write>(
             .blockchain
             .publisher_registry_address
             .as_deref()
-            .unwrap_or("(unset — origin directory empty: prefetch gate finds no origins)")
+            .unwrap_or("(unset — origin directory empty: pull-through gate and FIND_VALUE fallback find no origins)")
     )?;
     writeln!(
         w,
@@ -365,15 +365,20 @@ pub fn write_validate_summary<W: std::io::Write>(
         "  receipts.retained_files:  {}",
         resolved.receipts.retained_files
     )?;
+    // Counts, not contents. An operator running `config validate` after adding a
+    // takedown wants confirmation the entries were accepted — and a zero here is
+    // the tell that a `[content]` section landed in the wrong file. Printing the
+    // hashes themselves would put the subject of a legal order into terminal
+    // scrollback and any CI log that captures it.
     writeln!(
         w,
-        "  prefetch_enabled:         {}",
-        resolved.prefetch.enabled
+        "  content.denied_hashes:    {}",
+        resolved.content.denied_hashes.len()
     )?;
     writeln!(
         w,
-        "  prefetch_acquisitions:    max {} concurrent, {}s timeout",
-        resolved.prefetch.max_concurrent_acquisitions, resolved.prefetch.acquisition_timeout_secs
+        "  content.denied_origins:   {}",
+        resolved.content.denied_origins.len()
     )?;
     Ok(())
 }
@@ -542,20 +547,20 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # max_file_bytes = 134217728                # rotate the download-receipt log at this size (#802); default 128 MiB
 # retained_files = 4                        # rotated backup receipt files retained (#802); 0 keeps none
 
-[prefetch]
-# ADR 022 speculative-prefetch operator policy. Disabled by default. When
-# enabled, a node observing enough FIND_VALUE demand for a hash speculatively
-# acquires it (DHT lookup → probe → paid pull-through), subject to the
-# rolling-1h budget and the demand-quality auto-throttle. Leave disabled unless
-# you understand the spend implications.
-# enabled = false
-# budget_usdc_per_hour = 0                  # micro-USDC rolling-1h spend cap; 0 = never prefetch
-# find_value_threshold = 5                  # FIND_VALUE queries within the window that trip the trigger
-# threshold_window_secs = 300               # rolling-window length for the trigger
-# demand_quality_min_ratio = 0.1            # served/acquired auto-throttle floor
-# demand_quality_window_secs = 3600         # rolling-window length for the demand-quality predicate
-# max_concurrent_acquisitions = 4           # cap on background speculative pulls in flight
-# acquisition_timeout_secs = 30             # per-acquisition pull-through deadline
+[content]
+# ADR 011 local denylist — this operator's own removal lever, independent of
+# governance. Entries take effect on `decdn node reload` (no restart), are never
+# gossiped, and bind only this node. This is the fastest removal path the
+# protocol offers and the one sized to a sub-day statutory deadline (e.g. the EU
+# TCO one-hour clock), because it is entirely within the order recipient's
+# control. Refused requests are signed as HashBlacklisted / OriginBlacklisted,
+# which do not reveal whether the entry is local or on-chain.
+#
+# Hashes are bare 64-char lowercase hex — the same spelling as
+# cache.pinned_hashes. An invalid entry FAILS startup rather than being skipped:
+# a typo in a takedown must not silently leave content served.
+# denied_hashes = ["0000000000000000000000000000000000000000000000000000000000000000"]
+# denied_origins = ["0x000000000000000000000000000000000000dEaD"]   # operator addresses whose channels are refused (the zero address is rejected)
 "#;
 
 #[cfg(test)]
@@ -580,5 +585,6 @@ mod tests {
         assert!(parsed.dht.is_some(), "[dht.rate_limit] header parsed");
         assert!(parsed.probe.is_some(), "[probe.rate_limit] header parsed");
         assert!(parsed.receipts.is_some(), "[receipts] header parsed");
+        assert!(parsed.content.is_some(), "[content] header parsed");
     }
 }

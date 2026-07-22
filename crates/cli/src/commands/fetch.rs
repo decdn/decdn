@@ -1104,7 +1104,10 @@ mod tests {
     /// `anyhow!("delivery refused: …")` — the annotation downcasts, so a look-alike string
     /// would exercise nothing and pass against a hint that never fires in production.
     fn refusal(error: StreamError) -> anyhow::Error {
-        anyhow::Error::new(UpstreamRefused { error })
+        anyhow::Error::new(UpstreamRefused {
+            error,
+            response: None,
+        })
     }
 
     /// An unbound (no `capacity_bond_address`) fetch refused with `NotFound` gets

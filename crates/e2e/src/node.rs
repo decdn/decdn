@@ -132,6 +132,52 @@ impl NodeFixture {
         &self.config_path
     }
 
+    /// Rewrite `payment.rate_per_mb` in the daemon's config and hot-reload it via
+    /// `admin_v1_reload`, returning the rate the daemon reports post-reload.
+    ///
+    /// `payment.rate_per_mb` is in the reloadable set (`runtime::reload`), and the
+    /// probe and client handlers both read it through the atomic the reload swaps
+    /// — so this changes the quoted rate of a *running* daemon between two
+    /// requests, with no restart and no reconnect. That is precisely the
+    /// rate bait-and-switch a `SlashJudge` rate challenge exists to punish
+    /// (#1042), induced through the operator's real config surface rather than
+    /// simulated.
+    ///
+    /// The returned value is the daemon's post-reload **configured** rate — a bare
+    /// load of the atomic the reload swapped (`runtime::reload`'s `ReloadSnapshot`),
+    /// read back over the admin RPC. It proves the hot-swap landed; it is *not* the
+    /// rate the node will sign. Clamping into the on-chain `[floor, ceiling]` band
+    /// happens later and per-response, off that same atomic
+    /// (`handlers::client::wire::clamped_rate`, and its probe twin). So a caller
+    /// that needs `stream > probe` must assert on the `rate_per_mb` inside the
+    /// captured `StreamResponse`/`ProbeResponse` — the signed bytes that become
+    /// evidence — never on this return value, which would happily report an
+    /// out-of-band rate the daemon then clamps away.
+    pub async fn set_rate_per_mb(&self, rate: u64) -> anyhow::Result<u64> {
+        let config = std::fs::read_to_string(&self.config_path).context("read node config")?;
+        let mut doc: toml::Table = config.parse().context("parse node config")?;
+        let payment = doc
+            .get_mut("payment")
+            .and_then(toml::Value::as_table_mut)
+            .ok_or_else(|| anyhow::anyhow!("node config has no [payment] table"))?;
+        payment.insert(
+            "rate_per_mb".to_string(),
+            toml::Value::Integer(i64::try_from(rate).context("rate_per_mb overflows i64")?),
+        );
+        std::fs::write(
+            &self.config_path,
+            toml::to_string(&doc).context("render node config")?,
+        )
+        .context("write node config")?;
+
+        let resp = self
+            .admin_client()?
+            .reload()
+            .await
+            .context("admin_v1_reload")?;
+        Ok(resp.rate_per_mb)
+    }
+
     /// The daemon's data dir (`0o700` on Unix). Doubles as the `HOME` a journey hands
     /// [`crate::cli::decdn_command`] when it drives the `decdn` CLI against
     /// this node's config + keystore (#1332).

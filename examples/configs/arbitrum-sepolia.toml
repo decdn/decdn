@@ -43,9 +43,9 @@ payment_channel_address = "0xb4bcA0AbF679212708164dCAb98eFa621Fa0F4d3"
 capacity_bond_address   = "0x2aF490628579c08DC6D0B013090cDC11D4d60Dd4"
 slash_judge_address     = "0x20abcCC80F595a586f4Bd906a1b00c4196416EB7"
 
-# Optional — chain-backed origin directory that gates DHT prefetch (ADR 022).
-# Set BOTH or NEITHER; unset => the directory is empty (deny-all) and prefetch
-# finds no authorized origins.
+# Optional — chain-backed origin directory backing the pull-through gate and
+# FIND_VALUE fallback (ADR 022). Set BOTH or NEITHER; unset => the directory is
+# empty (deny-all) and the pull-through gate finds no authorized origins.
 origin_assignment_address  = "0x06b394f497481c33FB5ae164d5FbB0307299546c"
 publisher_registry_address = "0x32c811eA20326B911B518c2Cf38f9f172aC02e6c"
 

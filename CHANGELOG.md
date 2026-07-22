@@ -109,6 +109,15 @@ since project inception and will roll into the first tagged release.
   dropped (`12.5`, `12.501`). Numerically identical to any JSON parser;
   operator scripts that match a `\.\d{3}` regex must update to
   `\.\d+`.
+- **Config** Speculative prefetch removed (#1396, #1399). The entire
+  `[prefetch]` config section is gone. Because `FileConfig` uses
+  `deny_unknown_fields`, a config that still carries a `[prefetch]`
+  table now **fails at startup** — and on `decdn node reload` — with an
+  `unknown field` parse error instead of being silently ignored.
+  Operators upgrading MUST delete any `[prefetch]` block from their
+  config. Content propagation now relies solely on reactive cache-miss
+  pull-through ([ADR 037](adr/037-regional-proxy-warming.md)) plus
+  explicit operator pinning ([ADR 022](adr/022-content-discovery.md)).
 
 ### Fixed
 

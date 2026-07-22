@@ -41,6 +41,11 @@ alloy::sol! {
         function approve(address spender, uint256 amount) external returns (bool);
         function transfer(address to, uint256 amount) external returns (bool);
         function balanceOf(address account) external view returns (uint256);
+        // The burn leg of a 50/50 slash split (#1042) increases no account's
+        // balance, so a balance-diff assertion cannot see it — it is observable
+        // only as a `totalSupply` reduction (or as a `Transfer` to `address(0)`,
+        // which OZ `ERC20._burn` does still emit).
+        function totalSupply() external view returns (uint256);
     }
 
     /// `CapacityBond` operator-onboarding writes + activation reads.
@@ -97,6 +102,12 @@ alloy::sol! {
             external
             view
             returns (address operator, uint64 slashedAt, uint256 slashAmount);
+        // Escrow-on-slash finality (#1042, ADR 028 / ADR 026 § Slashing and burn):
+        // the slashed TOKEN is parked in `escrowedTotal` until the 30-day filing
+        // window lapses, then the permissionless `finalizeUnappealedSlash`
+        // distributes it 50% to the recorded challenger and 50% to the burn.
+        function escrowedTotal() external view returns (uint256);
+        function finalizeUnappealedSlash(uint256 slashId) external;
     }
 
     /// Buyer-side `openChannel` (omitted by the seller-only production binding)
@@ -270,3 +281,39 @@ alloy::sol! {
 // `ProbeMsg`/`StreamMsg` evidence structs) rather than re-declaring it — the
 // same ABI the daemon slash watcher decodes.
 pub use decdn_incentive::slash_judge::SlashJudge;
+
+// G-GOV-03 (#1042): the rate-manipulation reveal entry point, plus the two
+// `_verifyPair` custom errors the journey's negatives assert on. A separate block
+// because `SlashJudge` itself is `pub use`-d from `decdn-incentive` above rather
+// than declared here, so there is no local block to extend — unlike the escrow
+// reads and `totalSupply`, which fold into `CapacityBond` / `Erc20`.
+alloy::sol! {
+    /// `SlashJudge.submitRateChallenge` — the rate-manipulation twin of
+    /// `submitPhantomChallenge` (omitted by the production binding, which only
+    /// needs the phantom path). Bound at the `SlashJudge` address; `_verifyPair`
+    /// applies the same signature / same-hash / 30s-window / staleness checks and
+    /// then demands `stream.ratePerMb > probe.ratePerMb`.
+    ///
+    /// The two errors are declared so a reverted reveal decodes to a *named*
+    /// error rather than an opaque selector, and so
+    /// [`crate::assert::expect_revert_anyhow`] can match on `E::SELECTOR` —
+    /// compiler-checked against the ABI instead of hand-copied hex.
+    #[sol(rpc)]
+    contract SlashJudgeRate {
+        /// The 30s probe↔stream window, computed between the two evidence
+        /// timestamps (not against `block.timestamp`).
+        error TimestampWindowViolated(uint64 probeTsUs, uint64 streamTsUs);
+        /// The probe `slash_sig` did not recover to the challenged operator.
+        error InvalidProbeSignature();
+
+        function submitRateChallenge(
+            address challengedNode,
+            bytes32 nodeId,
+            bytes probeResponseData,
+            bytes probeSlashSig,
+            bytes streamResponseData,
+            bytes streamSlashSig,
+            bytes32 salt
+        ) external;
+    }
+}

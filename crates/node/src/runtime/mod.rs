@@ -301,20 +301,6 @@ fn log_region_snapshot(accountant: &crate::region_accounting::RegionAccountant) 
     }
 }
 
-/// #1292: with the empty origin-directory fallback in place (no chain
-/// `origin_assignment_address`), an armed pull-through authorized-origin gate
-/// denies every cache-miss pull, and that denial (a wire `NotFound`) looks like
-/// ordinary operation. Return `true` when the gate is armed so the caller warns.
-///
-/// Split out so the condition is unit-testable. Prefetch has no authorized-origin
-/// gate (its `FIND_VALUE` demand signal is hash-only, carrying no namespace — ADR
-/// 002 §Retrieval by namespace), so only the pull-through gate is considered.
-const fn armed_pull_through_gate_over_empty_fallback(
-    pull_through_require_authorized_origin: bool,
-) -> bool {
-    pull_through_require_authorized_origin
-}
-
 /// Runtime infrastructure built during the front bring-up phase of [`run`].
 ///
 /// A plain by-value bundle of the long-lived handles the rest of `run` (and the
@@ -700,7 +686,6 @@ struct ChainHandlers<P: Provider + Clone + 'static> {
     record_store: Arc<std::sync::Mutex<RecordStore>>,
     origin_directory: Arc<dyn crate::dht::origin::OriginDirectory>,
     origin_watcher: Option<Arc<crate::chain_events::resumable_watcher::WatcherHandle>>,
-    prefetch_engine: Arc<crate::prefetch::PrefetchEngine>,
     dht_handler: Arc<DhtHandler>,
     dht_routing: Arc<std::sync::Mutex<crate::dht::RoutingTable>>,
     peer_table: Arc<RwLock<PeerTable>>,
@@ -708,7 +693,6 @@ struct ChainHandlers<P: Provider + Clone + 'static> {
     client_handler: Arc<ClientHandler>,
     payment_service: PaymentChannelService<P>,
     voucher_activity: Arc<decdn_incentive::VoucherActivity>,
-    prefetch_shutdown: CancellationToken,
     pull_through_bg_shutdown: CancellationToken,
     blacklist_watcher: crate::chain_events::resumable_watcher::WatcherHandle,
     blacklist_ready_rx: oneshot::Receiver<crate::blacklist_watcher::InitialSyncResult>,
@@ -933,23 +917,17 @@ async fn build_chain_and_handlers(
     let record_store = Arc::new(std::sync::Mutex::new(RecordStore::new(
         RecordStoreConfig::default(),
     )));
-    // Origin directory shared by three consumers so "authorized origin" means
-    // the same thing everywhere: the prefetch authorized-origin gate (ADR 022
-    // §Prefetch Decision; #650/#651), the reactive pull-through authorized-origin
+    // Origin directory shared by two consumers so "authorized origin" means
+    // the same thing everywhere: the reactive pull-through authorized-origin
     // gate (#821, ADR 037), and the node-origin FIND_VALUE last-resort fallback
     // used when the DHT returns no providers (ADR 022 §FIND_VALUE Flow; #912).
-    // All consume one `Arc` so the chain directory backs the fallback for every
-    // node, independent of whether prefetch is enabled. When the operator
-    // configures the OriginAssignment + PublisherRegistry addresses, use the
-    // chain-backed `ChainOriginDirectory` — a live, event-fed cache resolving
-    // hash → namespace → authorized origin → active NodeId, reusing the
-    // already-bootstrapped `staker_set` for operator liveness. Without those
-    // addresses this is an `EmptyOriginDirectory`: both gates reject every hash
-    // (the prefetch gate only matters once an operator sets `prefetch.enabled`)
-    // and the FIND_VALUE fallback resolves nothing (same prior behavior).
-    // The prefetch enabled gauge is published regardless so
-    // dashboards have a uniform schema across enabled/disabled nodes
-    // (appendix-observability §Prefetch).
+    // Both consume one `Arc` so the chain directory backs the fallback for every
+    // node. When the operator configures the OriginAssignment + PublisherRegistry
+    // addresses, use the chain-backed `ChainOriginDirectory` — a live, event-fed
+    // cache resolving hash → namespace → authorized origin → active NodeId,
+    // reusing the already-bootstrapped `staker_set` for operator liveness.
+    // Without those addresses this is an `EmptyOriginDirectory`: the gate rejects
+    // every hash and the FIND_VALUE fallback resolves nothing (same prior behavior).
     // The chain-backed directory's watcher handle, captured before the `Arc<dyn>`
     // coercion so the ordered graceful stop below can `shutdown()` it and *then*
     // flush the debounced `CheckpointKey::Origin` cursor (an abort-only teardown
@@ -982,39 +960,23 @@ async fn build_chain_and_handlers(
         // operation (a wire `NotFound`). Warn if the gate is armed on a node with
         // no chain directory so the dead path is diagnosable rather than silent
         // (#1292).
-        if armed_pull_through_gate_over_empty_fallback(
-            cfg.cache.pull_through_require_authorized_origin,
-        ) {
+        if cfg.cache.pull_through_require_authorized_origin {
             tracing::warn!(
-                "pull_through_require_authorized_origin is armed but no chain origin \
+                "cache.pull_through_require_authorized_origin is set but no chain origin \
                  directory is configured (blockchain.origin_assignment_address unset); \
                  the gate will deny every cache-miss pull with a wire NotFound"
             );
         }
         (Arc::new(crate::dht::origin::EmptyOriginDirectory), None)
     };
-    let prefetch_engine = Arc::new(crate::prefetch::PrefetchEngine::new(cfg.prefetch));
-    infra
-        .node_metrics
-        .set_prefetch_enabled(prefetch_engine.enabled());
-    // Seed the demand-quality gauges once so they read a sane baseline
-    // (ratio = 1.0, throttle = false) rather than a misleading `0` on nodes that
-    // never hit a threshold-cross; the handler refreshes them only on a decision.
-    infra.node_metrics.set_prefetch_quality(
-        prefetch_engine.policy().demand_quality_ratio(0),
-        prefetch_engine.policy().throttle_active(0),
-    );
-    let dht_handler = Arc::new(
-        DhtHandler::new(
-            infra.secret_key.public(),
-            Arc::clone(&dht_rate_limiter),
-            Arc::clone(&infra.limiter),
-            Arc::clone(&infra.node_metrics),
-            Arc::clone(&staker_set),
-            Arc::clone(&record_store),
-        )
-        .with_prefetch(Arc::clone(&prefetch_engine)),
-    );
+    let dht_handler = Arc::new(DhtHandler::new(
+        infra.secret_key.public(),
+        Arc::clone(&dht_rate_limiter),
+        Arc::clone(&infra.limiter),
+        Arc::clone(&infra.node_metrics),
+        Arc::clone(&staker_set),
+        Arc::clone(&record_store),
+    ));
 
     // The DHT handler builds its own routing table internally; grab a
     // shared handle so the bootstrap path + republish + bucket-refresh
@@ -1113,9 +1075,6 @@ async fn build_chain_and_handlers(
     // a restart resets it and channels report "no activity yet" until their
     // next voucher (see `decdn_incentive::VoucherActivity`).
     let voucher_activity = Arc::new(decdn_incentive::VoucherActivity::new());
-    // Cancels in-flight prefetch acquisitions on shutdown; cancelled below
-    // alongside `pull_through_bg_shutdown`.
-    let prefetch_shutdown = CancellationToken::new();
     // Cancels the detached background cache-fill tasks (#859) the handler spawns
     // when the foreground deadline fires; cancelled in the shutdown sequence below
     // alongside `gossip_shutdown`.
@@ -1210,10 +1169,9 @@ async fn build_chain_and_handlers(
         // Optional content-authorization gate on the reactive pull-through path
         // (#821, ADR 037 §Seed-leech caps). Off by default — the cache role stays
         // permissionless. When the operator opts in, the handler refuses to initiate
-        // an upstream pull for a hash with no authorized origin, reusing the same
-        // directory the prefetch gate consults so "authorized" means the same thing on
-        // both paths (and fails closed when the origin-directory addresses are unset,
-        // since the directory is then empty).
+        // an upstream pull for a hash with no authorized origin, resolved against the
+        // shared origin directory (and fails closed when the origin-directory
+        // addresses are unset, since the directory is then empty).
         if cfg.cache.pull_through_require_authorized_origin {
             pull_origin_gate = Some(Arc::clone(&origin_directory));
         }
@@ -1221,8 +1179,6 @@ async fn build_chain_and_handlers(
 
     // Build the paid-delivery handler from a single deps literal (#1254): every
     // optional wiring hook above is supplied at construction, not via a setter chain.
-    // Crediting the serve path from `prefetch_engine` is harmless when prefetch is off
-    // — the acquired-set is never populated, so the lookup always misses.
     let mut client_deps = crate::handlers::client::ClientHandlerDeps::new(
         infra.secret_key.public(),
         Arc::clone(&infra.node_metrics),
@@ -1245,7 +1201,6 @@ async fn build_chain_and_handlers(
     client_deps.redeem_hint = Some(redeem_tx.clone());
     client_deps.voucher_activity = Some(Arc::clone(&voucher_activity));
     client_deps.region_accountant = Some(Arc::clone(&region_accountant));
-    client_deps.prefetch_engine = Some(Arc::clone(&prefetch_engine));
     client_deps.local_populate = local_populate;
     client_deps.pull_through = pull_through;
     client_deps.background_fill = background_fill;
@@ -1253,6 +1208,13 @@ async fn build_chain_and_handlers(
     client_deps.pull_ahead_bytes = pull_ahead_bytes;
     client_deps.leech_governor = leech_governor;
     client_deps.pull_origin_gate = pull_origin_gate;
+    // ADR 011 deny-set. Taken from the reload state rather than built here, so
+    // the handler and the SIGHUP / `decdn node reload` path hold the SAME `Arc`
+    // — a denylist entry added to the config file takes effect on reload with no
+    // handler rebuild and no restart, which is what makes it usable against a
+    // one-hour statutory clock.
+    let content_denylist = reload_state.content_denylist();
+    client_deps.content_deny = Arc::clone(&content_denylist);
     let client_handler = Arc::new(ClientHandler::new(client_deps)?);
 
     // On-chain seller-settlement service (#327). A wallet-filled provider
@@ -1331,6 +1293,9 @@ async fn build_chain_and_handlers(
         // cursor only widens the next rescan, which is idempotent.
         infra.concrete_channel_store.clone(),
         Arc::clone(&infra.watcher_checkpoint_store),
+        Arc::clone(&content_denylist),
+        capacity_bond_addr,
+        Arc::clone(&peer_table),
     );
 
     // Rate-bounds watcher (#1172, ADR 019 §3.1): follows `RateBoundsUpdated` off
@@ -1389,7 +1354,6 @@ async fn build_chain_and_handlers(
         record_store,
         origin_directory,
         origin_watcher,
-        prefetch_engine,
         dht_handler,
         dht_routing,
         peer_table,
@@ -1397,7 +1361,6 @@ async fn build_chain_and_handlers(
         client_handler,
         payment_service,
         voucher_activity,
-        prefetch_shutdown,
         pull_through_bg_shutdown,
         blacklist_watcher,
         blacklist_ready_rx,
@@ -1923,7 +1886,6 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
         // (#1177); `None` disables it (nothing to compare a peer's claim against).
         own_region: cfg.identity.region.clone(),
     };
-    let node_origin_prefetch_enabled = cfg.prefetch.enabled;
     let node_origin_reputation_cfg = reputation_cfg.clone();
     // Arc/handle clones for the task — the originals are used later in `run()`.
     let ep_for_buyer = infra.ep.clone();
@@ -1937,10 +1899,8 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
     let observation_buffer_c = Arc::clone(&observation_buffer);
     let network_reputation_c = Arc::clone(&network_reputation);
     let region_accountant_c = Arc::clone(&ch.region_accountant);
-    let prefetch_engine_c = Arc::clone(&ch.prefetch_engine);
     let node_metrics_for_buyer = Arc::clone(&infra.node_metrics);
     let node_metrics_for_origin = Arc::clone(&infra.node_metrics);
-    let node_metrics_for_observer = Arc::clone(&infra.node_metrics);
     let mut buyer_bootstrap_stop_rx = buyer_bootstrap_stop_rx;
     let payment_channel_addr_for_buyer = ch.payment_channel_addr;
     tasks.spawn(async move {
@@ -2006,14 +1966,10 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
                     staker_set: staker_set_c,
                     // FIND_VALUE last-resort fallback when the DHT returns no
                     // providers (ADR 022 §FIND_VALUE Flow; #912). Shares the
-                    // single origin directory built above with the prefetch and
-                    // reactive pull-through gates, so a configured
-                    // `ChainOriginDirectory` backs this fallback for every node,
-                    // not just prefetch-enabled ones. Absent chain addresses it
-                    // is empty (same prior behavior). NOTE: if a future decision
-                    // ever drops speculative prefetch, this `Arc` must be
-                    // repointed here, not deleted — it is independently required
-                    // by ADR 022.
+                    // single origin directory built above with the reactive
+                    // pull-through gate, so a configured `ChainOriginDirectory`
+                    // backs this fallback for every node. Absent chain addresses
+                    // it is empty (same prior behavior).
                     origin_directory: origin_directory_c,
                     addr_resolver: Arc::clone(resolver),
                     buyer: Arc::clone(&service) as Arc<dyn crate::buyer_channel::ChannelOpener>,
@@ -2041,15 +1997,6 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
                     wedged_providers: Arc::new(std::sync::Mutex::new(
                         std::collections::HashMap::new(),
                     )),
-                    // Feed the prefetch ledger when prefetch is enabled (#820);
-                    // the observer records only prefetch-initiated pulls.
-                    acquisition_observer: node_origin_prefetch_enabled.then(|| {
-                        Arc::new(crate::prefetch::PrefetchAcquisitionObserver::new(
-                            prefetch_engine_c,
-                            node_metrics_for_observer,
-                        ))
-                            as Arc<dyn crate::node_origin::AcquisitionObserver>
-                    }),
                 });
                 tracing::info!(
                     "node-to-node cache-miss pull-through provisioned and enabled (#831)"
@@ -2070,24 +2017,6 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
         let _service = service;
         let _ = buyer_bootstrap_stop_rx.await;
     });
-
-    // Provision the live prefetch acquirer (#820) once the cache exists. Gated on
-    // `prefetch.enabled` — a disabled engine never reaches `try_acquire`, so an
-    // unprovisioned acquirer is the inert default. Acquisitions drive
-    // `cache.populate`, which uses the node-origin pull path provisioned above;
-    // with pull-through off the populate just misses (no network spend).
-    if cfg.prefetch.enabled {
-        ch.prefetch_engine.provision_acquirer(
-            infra.cache.clone(),
-            Arc::clone(&infra.node_metrics),
-            ch.prefetch_shutdown.clone(),
-        );
-        tracing::info!(
-            max_concurrent = cfg.prefetch.max_concurrent_acquisitions,
-            timeout_secs = cfg.prefetch.acquisition_timeout_secs,
-            "speculative-prefetch acquisition provisioned and enabled (#820)"
-        );
-    }
 
     // GossipService owns its own shutdown via this token (#805): cancelling
     // it makes the publisher / subscriber / TTL-sweeper loops return at a
@@ -2377,7 +2306,6 @@ pub async fn run(
         slash_watcher: ch.slash_watcher,
         settlement_indexer: bg.settlement_indexer,
         pull_through_bg_shutdown: ch.pull_through_bg_shutdown,
-        prefetch_shutdown: ch.prefetch_shutdown,
         receipt_writer_shutdown: infra.receipt_writer_shutdown,
         payment_service: ch.payment_service,
         gossip_handles: bg.gossip_handles,
@@ -2415,7 +2343,6 @@ struct ShutdownHandles<P: Provider + Clone + 'static> {
     slash_watcher: crate::slash_watcher::SlashWatcher,
     settlement_indexer: Option<crate::reputation_indexer::SettlementIndexer>,
     pull_through_bg_shutdown: CancellationToken,
-    prefetch_shutdown: CancellationToken,
     receipt_writer_shutdown: CancellationToken,
     payment_service: PaymentChannelService<P>,
     gossip_handles: Vec<tokio::task::JoinHandle<()>>,
@@ -2460,7 +2387,6 @@ async fn shutdown<P: Provider + Clone + 'static>(
         slash_watcher,
         settlement_indexer,
         pull_through_bg_shutdown,
-        prefetch_shutdown,
         receipt_writer_shutdown,
         payment_service,
         gossip_handles,
@@ -2615,10 +2541,6 @@ async fn shutdown<P: Provider + Clone + 'static>(
     // already drained above), so a late warm write either lands intact or is
     // dropped, never corrupting the store.
     pull_through_bg_shutdown.cancel();
-    // Cancel any in-flight speculative prefetch acquisitions (#820): the router
-    // has drained, so warming the cache speculatively is moot. Advisory, like the
-    // background cache-fill tasks above — observed at the next await, not joined.
-    prefetch_shutdown.cancel();
     // The router has drained, so no further vouchers — and therefore no further
     // receipts — will be produced. Signal the receipt writer to flush whatever
     // is already enqueued and exit; it is awaited in the drain phase below so
@@ -3759,17 +3681,6 @@ mod tests {
         );
     }
 
-    /// #1292: the empty-fallback gate-armed warning. Only the pull-through gate
-    /// has an authorized-origin check (prefetch's demand signal is hash-only, so
-    /// it has no such gate — ADR 002 §Retrieval by namespace).
-    #[test]
-    fn armed_pull_through_gate_over_empty_fallback_cases() {
-        // Gate disarmed: no warning.
-        assert!(!armed_pull_through_gate_over_empty_fallback(false));
-        // Gate armed: warn.
-        assert!(armed_pull_through_gate_over_empty_fallback(true));
-    }
-
     #[tokio::test]
     async fn listener_waits_for_successful_initial_blacklist_sync() {
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -3980,7 +3891,7 @@ mod tests {
             dht: decdn_common::config::ResolvedDht::default(),
             probe: decdn_common::config::ResolvedProbe::default(),
             receipts: decdn_common::config::ResolvedReceipts::default(),
-            prefetch: decdn_common::config::ResolvedPrefetch::default(),
+            content: decdn_common::config::ResolvedContent::default(),
         };
         (tmp, cfg)
     }
