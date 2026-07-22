@@ -38,10 +38,20 @@ pub const DEPOSIT_MICRO_USDC: u64 = 10_000_000;
 /// path; a constant keeps the voucher deterministic (matches the settlement
 /// e2e).
 const TIMESTAMP_US: u64 = 0x00c0_ffe1;
-/// How long [`ClientFixture::capture_delivery_wire`] waits for the next frame
+/// How long [`ClientFixture::capture_delivery_wire`] waits *between* frames
 /// before deciding the node has finished speaking. The tap never pays, so the
 /// node's closing-voucher pause is the terminator on a successful delivery.
+///
+/// Load-bearing coupling: this must stay below the node's `VOUCHER_READ_TIMEOUT`
+/// (10s, `crates/node/src/handlers/client/mod.rs`), or the node gives up on the
+/// voucher and resets the stream before the tap decides it has gone idle.
 const WIRE_TAP_IDLE: Duration = Duration::from_secs(5);
+/// How long the tap waits for the *first* frame. Far larger than
+/// [`WIRE_TAP_IDLE`] because the first frame is gated on the node's entire
+/// reactive backend fill (`try_local_populate`, budgeted at
+/// `cache.node_pull_timeout_sec`), not on an idle pause — a tapped blob is
+/// deliberately absent from the store.
+const WIRE_TAP_FIRST_FRAME: Duration = Duration::from_secs(30);
 
 /// One open payment channel to one node, reusable across several single-shot
 /// fetches ([`ClientFixture::fetch_once`]) and the raw wire tap
@@ -51,21 +61,52 @@ const WIRE_TAP_IDLE: Duration = Duration::from_secs(5);
 /// node's pre-observation window by retrying — which is exactly what a journey
 /// asserting on a *refusal* cannot do, since the window and a real refusal are
 /// the same wire `NotFound`. A session pays that cost once, up front.
+///
+/// Never derive `Clone`: two sessions sharing one channel would fork the voucher
+/// watermark and replay nonces against the node.
 #[derive(Debug)]
 pub struct ChannelSession {
     ctx: ChannelContext,
     target: EndpointAddr,
     slash_domain: Eip712Domain,
-    /// The delivering node's Ethereum address; verifies the response `slash_sig`.
-    provider: Address,
-    channel_id: B256,
+    /// The delivering node's operator address — the `expected_signer` that
+    /// verifies the response `slash_sig`. Deliberately *not* called `provider`:
+    /// in an alloy-facing file that word means the RPC handle.
+    operator_addr: Address,
 }
 
 impl ChannelSession {
     /// On-chain `channelId` this session's vouchers are signed against.
     #[must_use]
     pub const fn channel_id(&self) -> B256 {
-        self.channel_id
+        self.ctx.channel_id
+    }
+
+    /// Fold whatever the node acked into the session's voucher watermark, so the
+    /// next fetch signs the following nonce rather than replaying a stale one.
+    ///
+    /// `acked()` is `None` when nothing was acked (the common refusal path),
+    /// which correctly leaves the watermark untouched.
+    ///
+    /// # Errors
+    ///
+    /// If the watermark would go backwards. That should be unreachable — the
+    /// ledger only commits on ack — but a silent rewind would resurface much
+    /// later as an opaque `UpstreamVoucherRejected { StaleNonce }` on an
+    /// unrelated fetch, so it is worth naming at the point it happens.
+    fn record_progress(&mut self, progress: &VoucherProgress) -> anyhow::Result<()> {
+        let Some((nonce, bytes_delivered, amount)) = progress.acked() else {
+            return Ok(());
+        };
+        anyhow::ensure!(
+            nonce >= self.ctx.prior_nonce,
+            "voucher watermark regressed: acked nonce {nonce} < prior {}",
+            self.ctx.prior_nonce
+        );
+        self.ctx.prior_nonce = nonce;
+        self.ctx.prior_bytes_delivered = bytes_delivered;
+        self.ctx.prior_amount = amount;
+        Ok(())
     }
 }
 
@@ -135,10 +176,8 @@ impl ClientFixture {
         hash: Hash,
     ) -> anyhow::Result<FetchOutcome> {
         let mut session = self.open_channel(chain, node).await?;
-        let cid = session.channel_id;
+        let cid = session.channel_id();
         let target = session.target.clone();
-        let ctx = &mut session.ctx;
-        let slash_domain = &session.slash_domain;
 
         // The node accepts vouchers only once its chain watcher has decoded the
         // ChannelOpened event (poll cadence ~500ms). Retry the paid fetch until
@@ -154,9 +193,9 @@ impl ClientFixture {
             match stream_fetch_tracked(
                 &self.endpoint,
                 target.clone(),
-                ctx,
-                slash_domain,
-                node.operator_addr(),
+                &session.ctx,
+                &session.slash_domain,
+                session.operator_addr,
                 *hash.as_bytes(),
                 0,
                 TIMESTAMP_US,
@@ -181,15 +220,10 @@ impl ClientFixture {
                     });
                 }
                 Err(e) if tokio::time::Instant::now() < deadline && is_retryable(&e) => {
-                    // Fold whatever the node acked back into `ctx` so the next attempt
-                    // signs the next nonce rather than replaying a stale one. `acked()`
-                    // is `None` for the common pre-observation failure, leaving `ctx` at
-                    // zero (correct for a never-observed channel).
-                    if let Some((nonce, bytes_delivered, amount)) = progress.acked() {
-                        ctx.prior_nonce = nonce;
-                        ctx.prior_bytes_delivered = bytes_delivered;
-                        ctx.prior_amount = amount;
-                    }
+                    // `acked()` is `None` for the common pre-observation failure,
+                    // leaving the watermark at zero (correct for a never-observed
+                    // channel).
+                    session.record_progress(&progress)?;
                     tracing::debug!("paid fetch not ready ({e}); retrying after watcher catch-up");
                     tokio::time::sleep(Duration::from_millis(500)).await;
                 }
@@ -201,16 +235,25 @@ impl ClientFixture {
         }
     }
 
-    /// Open a funded [`ChannelSession`] to `node` and wait until the daemon's
-    /// settlement watcher has registered it, so every later single-shot fetch on
-    /// the session is unambiguous — see [`Self::fetch_once`].
+    /// Open a funded [`ChannelSession`] to `node` and wait until the daemon has
+    /// registered it, so a later single-shot fetch on the session is
+    /// unambiguous — see [`Self::fetch_once`].
+    ///
+    /// **Caveat — this narrows the pre-observation window but does not close
+    /// it.** [`crate::node::NodeFixture::wait_for_channel`] polls the admin API,
+    /// which reads the *persisted* channel store, whereas the serve path gates
+    /// on `ClientHandler`'s in-memory map — and `register_open_channel` fsyncs to
+    /// the store before inserting into the map. A journey that asserts on a bare
+    /// refusal should therefore keep a successful control fetch (a blob the node
+    /// holds in cache) *before* the refusal: the control can only succeed once
+    /// the live map is populated, which is the state the refusal needs ruled out.
     pub async fn open_session(
         &self,
         chain: &ChainFixture,
         node: &NodeFixture,
     ) -> anyhow::Result<ChannelSession> {
         let session = self.open_channel(chain, node).await?;
-        node.wait_for_channel(session.channel_id, Duration::from_secs(60))
+        node.wait_for_channel(session.channel_id(), Duration::from_secs(60))
             .await?;
         Ok(session)
     }
@@ -221,15 +264,22 @@ impl ClientFixture {
     ///
     /// The refusal is the point: [`Self::fetch`] retries a wire `NotFound` for 45s
     /// because it cannot tell the pre-observation window from a real refusal.
-    /// `open_session` has already ruled the window out, so an error here is the
-    /// node's actual verdict and reaches the caller typed (e.g. downcast to
-    /// [`UpstreamRefused`]).
+    /// [`Self::open_session`] has narrowed that window (see its caveat), so an
+    /// error here is the node's verdict and reaches the caller typed (e.g.
+    /// downcast to [`UpstreamRefused`]).
     ///
     /// # Errors
     ///
-    /// Propagates whatever `stream_fetch_tracked` returns; the session's voucher
-    /// watermark is advanced first on every path, so a later fetch on the same
-    /// session signs the next nonce rather than replaying a stale one.
+    /// Propagates whatever `stream_fetch_tracked` returns. The session's voucher
+    /// watermark is folded in first on every path — but only *advances* when the
+    /// node actually acked a voucher, so a refusal leaves it untouched.
+    ///
+    /// Note the residual hazard on the error path: `stream_fetch_tracked` reports
+    /// the **acked** watermark, and the node commits a voucher before writing its
+    /// ack (ADR 003). If an ack is lost mid-stream the session falls one nonce
+    /// behind the node, and the *next* fetch on this session fails as
+    /// `UpstreamVoucherRejected { StaleNonce }`. Open a fresh session after any
+    /// mid-delivery failure rather than reusing this one.
     pub async fn fetch_once(
         &self,
         session: &mut ChannelSession,
@@ -242,7 +292,7 @@ impl ClientFixture {
             session.target.clone(),
             &session.ctx,
             &session.slash_domain,
-            session.provider,
+            session.operator_addr,
             *hash.as_bytes(),
             byte_offset,
             TIMESTAMP_US,
@@ -251,26 +301,31 @@ impl ClientFixture {
             &mut progress,
         )
         .await;
-        if let Some((nonce, bytes_delivered, amount)) = progress.acked() {
-            session.ctx.prior_nonce = nonce;
-            session.ctx.prior_bytes_delivered = bytes_delivered;
-            session.ctx.prior_amount = amount;
-        }
+        session.record_progress(&progress)?;
         Ok(result?.as_ref().to_vec())
     }
 
     /// Drive a raw `cdn/client/v1` delivery for `hash` on `session` and return
     /// every framed message the node sent, verbatim.
     ///
-    /// This is the wire tap G-NODE-08 needs: no client-side decoding, no
-    /// interpretation — the exact bytes a delivering node put on the QUIC stream,
-    /// so a journey can assert an opaque backend's location is not among them.
+    /// This is the wire tap G-NODE-08 needs: no client-side interpretation — the
+    /// frame payloads a delivering node put on the QUIC stream, so a journey can
+    /// assert an opaque backend's location is not among them. (Payloads, not raw
+    /// stream bytes: `read_frame` consumes the varint length prefix.)
     ///
-    /// Deliberately never pays: the node streams `StreamResponse` + every
-    /// `ChunkData` up to the voucher interval before pausing for payment, so for a
-    /// sub-interval blob this captures the complete node→client message set. The
-    /// capture ends when the node falls silent for `WIRE_TAP_IDLE` (the pause
-    /// waiting for the voucher that never comes) or the stream closes.
+    /// Deliberately never pays, which bounds what it can see. The node streams
+    /// `StreamResponse` + every `ChunkData` up to the voucher interval and then
+    /// blocks on payment, so for a sub-interval blob this captures **every
+    /// message the node emits before it blocks** — but never `VoucherAck` or
+    /// `StreamEnd`, which are emitted only after a voucher arrives. The capture
+    /// ends when the node falls silent for a few seconds (that payment pause) or
+    /// the stream closes cleanly.
+    ///
+    /// Side effect: tapping a blob the node does not hold drives a real reactive
+    /// backend fill, leaving the blob **warmed in the node's store**. Run this
+    /// after any assertion that depends on the blob being absent, and treat it as
+    /// the last operation on `session` — the node is left blocked awaiting a
+    /// voucher that never comes.
     pub async fn capture_delivery_wire(
         &self,
         session: &ChannelSession,
@@ -292,8 +347,11 @@ impl ClientFixture {
             byte_len: 0,
             timestamp_us: TIMESTAMP_US,
         };
-        // The binding is what authorizes the node to spend on a cache-miss fill
-        // (`pull_authorized`); without it the tap would only ever capture a refusal.
+        // `pull_authorized` gates every backend-fill tier on the client binding;
+        // without it the tap would only ever capture a refusal. (It is framed
+        // upstream as authorizing the node to *spend* on the fill — true of a
+        // metered origin like S3; a local `fs` backend costs nothing, but the
+        // same gate still has to pass.)
         let ext = StreamRequestExt {
             voucher_interval_mb: None,
             binding: session.ctx.client_binding.clone(),
@@ -304,19 +362,45 @@ impl ClientFixture {
             .await
             .context("write wire-tap StreamRequest")?;
 
-        // Reads until the stream closes (a refusal, then `finish`) or the node
-        // goes idle waiting for the voucher we never send: either way it has said
-        // everything it is going to say.
-        let mut frames = Vec::new();
-        while let Ok(Ok(frame)) =
-            tokio::time::timeout(WIRE_TAP_IDLE, decdn_protocol::read_frame(&mut recv)).await
-        {
-            frames.push(frame);
+        // Reads until the stream closes cleanly (a refusal, then `finish`) or the
+        // node goes idle waiting for the voucher we never send: either way it has
+        // said everything it is going to say.
+        //
+        // A genuine transport/framing fault is NOT a terminator — folding it into
+        // the idle case would silently return a truncated capture, and every
+        // "the backend is absent from these frames" assertion downstream would be
+        // that much weaker without saying so.
+        let mut frames: Vec<Vec<u8>> = Vec::new();
+        loop {
+            let budget = if frames.is_empty() {
+                WIRE_TAP_FIRST_FRAME
+            } else {
+                WIRE_TAP_IDLE
+            };
+            match tokio::time::timeout(budget, decdn_protocol::read_frame(&mut recv)).await {
+                Ok(Ok(frame)) => frames.push(frame),
+                // Idle: the expected terminator on a successful delivery.
+                Err(_) => break,
+                // Clean end of stream.
+                Ok(Err(decdn_protocol::FrameError::Io(e)))
+                    if e.kind() == std::io::ErrorKind::UnexpectedEof =>
+                {
+                    break;
+                }
+                Ok(Err(e)) => {
+                    let captured: usize = frames.iter().map(Vec::len).sum();
+                    conn.close(0u32.into(), b"wire tap failed");
+                    return Err(anyhow::anyhow!(
+                        "wire tap read failed after {} frames ({captured} bytes): {e}",
+                        frames.len()
+                    ));
+                }
+            }
         }
         conn.close(0u32.into(), b"wire tap complete");
         anyhow::ensure!(
             !frames.is_empty(),
-            "node sent nothing on the delivery stream"
+            "node sent nothing on the delivery stream within {WIRE_TAP_FIRST_FRAME:?}"
         );
         Ok(frames)
     }
@@ -380,8 +464,7 @@ impl ClientFixture {
             ctx,
             target,
             slash_domain,
-            provider: node.operator_addr(),
-            channel_id: cid,
+            operator_addr: node.operator_addr(),
         })
     }
 

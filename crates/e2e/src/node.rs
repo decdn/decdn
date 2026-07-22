@@ -175,13 +175,24 @@ impl NodeFixture {
     /// (`cache.pull_through_require_authorized_origin`, #821 / ADR 037).
     ///
     /// `cached_blobs` are pre-warmed into the node's local store, so they are
-    /// served from cache regardless of what the chain says about the operator.
-    /// Blobs written *after* launch with [`Self::seed_origin_blob`] exist ONLY in
-    /// the backend, so serving them requires the node to be a recognized origin —
-    /// which is exactly the distinction G-NODE-08 asserts.
+    /// served from cache regardless of what the chain says. Blobs written *after*
+    /// launch with [`Self::seed_origin_blob`] exist ONLY in the backend, so
+    /// serving them requires the gate to be open — which is the distinction
+    /// G-NODE-08 asserts.
     ///
-    /// No discovery peers: the node has no upstream to pull from, so a served
-    /// backend-only blob can only have come from its own `[cache.origin]`.
+    /// Note what the gate actually checks: `pull_origin_gate_blocks` asks whether
+    /// the hash's **namespace** has any currently-authorized active origin, not
+    /// whether *this* operator is one of them. A namespace ratified to a
+    /// different operator would also open this node's gate. Whether that is the
+    /// intended scope is tracked in #1368; this fixture deliberately does not
+    /// depend on either reading.
+    ///
+    /// No discovery peers, so the node has no upstream and a served backend-only
+    /// blob can only have come from its own `[cache.origin]`. Note this is
+    /// guaranteed by the empty peer set, *not* by node→node pull-through being
+    /// off: `render_config` ties `pull_through_require_authorized_origin` to
+    /// `node_to_node_pull_through_enabled`, so enabling the gate necessarily arms
+    /// node→node pull-through too.
     pub async fn launch_authorized_origin(
         chain: &ChainFixture,
         region: &str,
@@ -207,6 +218,11 @@ impl NodeFixture {
     /// Filesystem path of the node's opaque origin backend. Journeys assert this
     /// string never reaches the wire — origin backends are per-node config and
     /// MUST stay invisible to clients.
+    ///
+    /// This is the *configured* path. `FilesystemOrigin::new` canonicalizes at
+    /// construction, so the daemon actually holds the resolved form (on macOS,
+    /// `/private/var/…` for a `/var/…` tempdir). A leak would carry the canonical
+    /// bytes, so an opacity scan should search both forms.
     #[must_use]
     pub fn origin_root(&self) -> &std::path::Path {
         self.origin_dir.path()
@@ -219,7 +235,15 @@ impl NodeFixture {
     /// `NotFound` (`ServeRejectReason::wire_error` collapses both), so a journey
     /// that must assert on a single refusal cannot use
     /// [`crate::client::ClientFixture::fetch`]'s retry loop to ride the window
-    /// out. Waiting on the node's own view of the channel separates them.
+    /// out. Waiting on the node's own view of the channel narrows it.
+    ///
+    /// **It does not close it.** `admin_v1_channels` reads the *persisted*
+    /// channel store, whereas `serve_stream` / `pull_authorized` gate on
+    /// `ClientHandler`'s in-memory map — and `register_open_channel` awaits the
+    /// store fsync *before* inserting into that map. So this can return while the
+    /// serve path still answers `UnknownChannel`. A journey asserting on a bare
+    /// refusal should keep a successful control fetch of a cached blob ahead of
+    /// it; the control cannot succeed until the live map is populated.
     pub async fn wait_for_channel(
         &self,
         channel_id: alloy::primitives::B256,
