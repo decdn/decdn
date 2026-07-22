@@ -5,8 +5,8 @@
 //!
 //! The node runs with `cache.pull_through_require_authorized_origin`, so its
 //! reactive cache-miss fill sits behind the chain-backed authorized-origin
-//! directory (`ContentClaimed` → `OriginAssignment.getOrigins` → active
-//! operator). Before the publisher claims `H` and the DAO ratifies the operator
+//! directory (request namespace → `OriginAssignment.getOrigins` → active
+//! operator). Before the DAO ratifies the namespace's operator
 //! set, the node is a plain cache: it serves what it already holds and refuses to
 //! reach into its own backend for anything else. After ratification the gate
 //! opens: a client miss makes the same node fetch `H` opaquely from that backend
@@ -221,9 +221,8 @@ async fn run() -> anyhow::Result<()> {
     let (mut authorized, _) = client.open_session(&chain, &node, cached_hash).await?;
 
     // Ordering is load-bearing: the successful `fetch` above proves the watcher
-    // has applied `AssignmentActivated`, and since all three `ContentClaimed`
-    // were mined in earlier blocks and the sink applies logs in block order, it
-    // transitively proves `range_hash`'s claim is in the directory too. Together
+    // has applied `AssignmentActivated` (a single activation covers the whole
+    // namespace, so every hash served under it resolves at once). Together
     // with the warm-up (which covers channel registration — a separate fact),
     // that is what lets the ranged fetch below use `fetch_once` (no retry)
     // safely. Do not reorder these two blocks.
