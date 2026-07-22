@@ -51,6 +51,14 @@ interface IContentBlacklist {
     // legal duty — see ADR 009, Emergency Multisig (capability-split sunset).
     // Only the protocol-wide pause sunsets at 12 months, not this path.
     // Emergency adds are GLOBAL by construction, hence no region parameter.
+    // ONE-WAY: both revert if the target is already blacklisted by governance
+    // (a hash entry with emergency == false, or an origin with no expiry
+    // record). The emergency path may only ADD enforcement, never weaken it —
+    // otherwise re-adding a governance entry would arm auto-expiry on it and
+    // hand the multisig a delayed removeHashGlobal, which is GOVERNANCE_ROLE
+    // only and reachable by no other multisig route. Re-adding over an existing
+    // EMERGENCY entry stays permitted (category escalation, or re-arming one
+    // that lapsed) — that sustains a takedown rather than undoing one.
     // Category determines emergency entry expiry:
     //   GENERAL — 14-day auto-expiry (default)
     //   CSAM, TERRORIST — 90-day auto-expiry (severe content must not be re-exposed due to governance latency)
@@ -367,6 +375,8 @@ One rule governs every path: an entry becomes slashable at `effectiveAt = addedA
 | Standard governance vote (global) | 24 hours | `complianceWindow` |
 | Regional governance body | 24 hours | `complianceWindow` |
 | Emergency multisig add | 2 hours | `emergencyComplianceWindow` |
+
+The emergency path is deliberately one-way with respect to governance: `emergencyAdd` / `emergencyAddOrigin` revert on a target governance has already blacklisted permanently. The multisig can always make enforcement stricter and never looser — `removeHashGlobal` is `GOVERNANCE_ROLE` only, and without this rule a re-add through the emergency path would arm auto-expiry on a standing governance decision and accomplish the same removal on a 14-day delay with no vote.
 
 The 24-hour window accounts for nodes that are offline or have a long poll interval. The 2-hour emergency window is tight enough to matter for active illegal content while giving online nodes time to act. The emergency multisig blacklist path is permanent (no sunset): it discharges an ongoing legal duty to remove unlawful content. Under the capability-split sunset, only the protocol-wide pause expires at 12 months, not this path — see [ADR 009 § Emergency Multisig](009-governance.md#emergency-multisig).
 

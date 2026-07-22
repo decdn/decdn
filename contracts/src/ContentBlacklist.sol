@@ -532,6 +532,14 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     ///         side does not hold `EMERGENCY_MULTISIG_ROLE`, so a probe against
     ///         it would prove nothing.
     error NotEmergencyMultisig(address account);
+    /// @notice `emergencyAdd` was aimed at a hash that governance has already
+    ///         blacklisted permanently. Re-adding it through the emergency path
+    ///         would arm auto-expiry on a standing governance decision, handing
+    ///         the multisig a delayed removal it has no authority to perform.
+    error EmergencyCannotOverrideGovernance(bytes32 hash);
+    /// @notice The `emergencyAddOrigin` counterpart of
+    ///         `EmergencyCannotOverrideGovernance`.
+    error EmergencyCannotOverrideGovernanceOrigin(address origin);
     /// @notice The suspension's 14-day ratification window has elapsed, so
     ///         governance can no longer ratify it — the suspension has already
     ///         lapsed and the body is writing again. Re-suspend to restart.
@@ -632,6 +640,17 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         external
         onlyRole(EMERGENCY_MULTISIG_ROLE)
     {
+        // The emergency path may only ADD enforcement, never weaken it. Without
+        // this guard, re-adding a governance entry would flip it to
+        // `emergency = true` and arm auto-expiry — giving the multisig a delayed
+        // `removeHashGlobal`, which is `GOVERNANCE_ROLE`-only and reachable by no
+        // other multisig route. Re-adding over the multisig's OWN entry stays
+        // allowed: escalating the category, or re-arming one that lapsed,
+        // sustains a takedown rather than undoing one.
+        HashEntry storage existing = _hashEntries[GLOBAL_REGION][hash];
+        if (existing.addedAt != 0 && !existing.emergency) {
+            revert EmergencyCannotOverrideGovernance(hash);
+        }
         _addHash(GLOBAL_REGION, hash, reason, true, _toCategory(category));
     }
 
@@ -647,6 +666,13 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         onlyRole(EMERGENCY_MULTISIG_ROLE)
     {
         if (operator == address(0)) revert ZeroAddress();
+        // Same one-way rule as `emergencyAdd`. A governance origin entry is
+        // marked by `_isOriginBlacklisted && _emergencyOrigins.addedAt == 0`
+        // (`setOriginBlacklist` clears the expiry record precisely so it reads
+        // as permanent); re-stamping it here would convert it to an expiring one.
+        if (_isOriginBlacklisted[operator] && _emergencyOrigins[operator].addedAt == 0) {
+            revert EmergencyCannotOverrideGovernanceOrigin(operator);
+        }
         Category cat = _toCategory(category);
         _isOriginBlacklisted[operator] = true;
         _emergencyOrigins[operator] = EmergencyOrigin({ addedAt: uint64(block.timestamp), category: uint8(cat) });

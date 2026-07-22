@@ -1921,6 +1921,80 @@ contract ContentBlacklistTest is Test {
         assertTrue(blacklist.isOriginBlacklisted(origin));
     }
 
+    /// @notice REGRESSION: the emergency multisig must not be able to weaken a
+    ///         standing governance decision. Re-adding a governance-blacklisted
+    ///         hash through the emergency path would arm auto-expiry on it,
+    ///         handing the multisig a delayed removal it otherwise has no
+    ///         authority to perform (`removeHashGlobal` is GOVERNANCE_ROLE).
+    function test_emergencyAdd_cannotDowngradeGovernanceEntry() public {
+        vm.prank(admin);
+        blacklist.addHashGlobal(SAMPLE_HASH, "DMCA-TEST");
+
+        vm.prank(multisig);
+        vm.expectRevert(
+            abi.encodeWithSelector(ContentBlacklist.EmergencyCannotOverrideGovernance.selector, SAMPLE_HASH)
+        );
+        blacklist.emergencyAdd(SAMPLE_HASH, uint8(ContentBlacklist.Category.GENERAL), "CSAM");
+
+        // The governance entry is untouched and still permanent.
+        assertFalse(blacklist.getHashEntry(GLOBAL_REGION, SAMPLE_HASH).emergency);
+        vm.warp(block.timestamp + 365 days);
+        assertTrue(blacklist.isHashBlacklisted(SAMPLE_HASH));
+    }
+
+    /// @notice The multisig may still re-add over its OWN emergency entry — to
+    ///         escalate the category, or to re-arm one that lapsed. That
+    ///         sustains a takedown rather than weakening one, which is the
+    ///         multisig's mandate.
+    function test_emergencyAdd_mayReAddOverItsOwnEntry() public {
+        vm.startPrank(multisig);
+        blacklist.emergencyAdd(SAMPLE_HASH, uint8(ContentBlacklist.Category.GENERAL), "DMCA");
+        blacklist.emergencyAdd(SAMPLE_HASH, uint8(ContentBlacklist.Category.CSAM), "CSAM");
+        vm.stopPrank();
+        assertEq(blacklist.getHashEntry(GLOBAL_REGION, SAMPLE_HASH).category, uint8(ContentBlacklist.Category.CSAM));
+    }
+
+    /// @notice Ratification still works in the other direction: governance
+    ///         re-adding over an emergency entry makes it permanent. The guard
+    ///         constrains only the emergency entry point.
+    function test_addHashGlobal_stillRatifiesAnEmergencyEntry() public {
+        vm.prank(multisig);
+        blacklist.emergencyAdd(SAMPLE_HASH, uint8(ContentBlacklist.Category.GENERAL), "DMCA");
+        vm.prank(admin);
+        blacklist.addHashGlobal(SAMPLE_HASH, "DMCA-RATIFIED");
+        assertFalse(blacklist.getHashEntry(GLOBAL_REGION, SAMPLE_HASH).emergency);
+    }
+
+    /// @notice REGRESSION, origin side: same escalation via
+    ///         `emergencyAddOrigin` over a governance-set origin entry.
+    function test_emergencyAddOrigin_cannotDowngradeGovernanceEntry() public {
+        address origin = address(0x0121E);
+        vm.prank(admin);
+        blacklist.setOriginBlacklist(origin, true);
+
+        vm.prank(multisig);
+        vm.expectRevert(
+            abi.encodeWithSelector(ContentBlacklist.EmergencyCannotOverrideGovernanceOrigin.selector, origin)
+        );
+        blacklist.emergencyAddOrigin(origin, uint8(ContentBlacklist.Category.GENERAL), "DMCA");
+
+        vm.warp(block.timestamp + 365 days);
+        assertTrue(blacklist.isOriginBlacklisted(origin), "governance entry stays permanent");
+    }
+
+    /// @notice ...but re-adding over its own (or a lapsed) emergency origin
+    ///         entry stays available.
+    function test_emergencyAddOrigin_mayReAddOverItsOwnEntry() public {
+        address origin = address(0x0121F);
+        vm.startPrank(multisig);
+        blacklist.emergencyAddOrigin(origin, uint8(ContentBlacklist.Category.GENERAL), "DMCA");
+        vm.warp(block.timestamp + 14 days + 1);
+        assertFalse(blacklist.isOriginBlacklisted(origin), "lapsed");
+        blacklist.emergencyAddOrigin(origin, uint8(ContentBlacklist.Category.CSAM), "CSAM");
+        vm.stopPrank();
+        assertTrue(blacklist.isOriginBlacklisted(origin), "re-armed");
+    }
+
     // =================================================================
     // ADR 011 § Regional Governance Bodies (#1178)
     // =================================================================
