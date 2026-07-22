@@ -97,7 +97,8 @@ pub struct ResolvedBlockchain {
     /// `OriginAssignment` contract address. `Some` only when the operator
     /// opts into the chain-backed origin directory (paired with
     /// `publisher_registry_address`); `None` => empty deny-all directory, so
-    /// the pull-through authorized-origin gate finds no origins (ADR 022).
+    /// the pull-through authorized-origin gate and the `FIND_VALUE` last-resort
+    /// origin fallback both find no origins (ADR 022).
     pub origin_assignment_address: Option<String>,
     /// `PublisherRegistry` contract address. Set together with
     /// `origin_assignment_address` (both-or-neither, enforced at resolution).

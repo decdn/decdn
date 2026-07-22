@@ -153,7 +153,7 @@ pub fn write_validate_summary<W: std::io::Write>(
             .blockchain
             .origin_assignment_address
             .as_deref()
-            .unwrap_or("(unset — origin directory empty: pull-through gate finds no origins)")
+            .unwrap_or("(unset — origin directory empty: pull-through gate and FIND_VALUE fallback find no origins)")
     )?;
     writeln!(
         w,
@@ -162,7 +162,7 @@ pub fn write_validate_summary<W: std::io::Write>(
             .blockchain
             .publisher_registry_address
             .as_deref()
-            .unwrap_or("(unset — origin directory empty: pull-through gate finds no origins)")
+            .unwrap_or("(unset — origin directory empty: pull-through gate and FIND_VALUE fallback find no origins)")
     )?;
     writeln!(
         w,
