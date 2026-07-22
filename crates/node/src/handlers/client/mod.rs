@@ -866,7 +866,7 @@ pub struct ClientHandler {
     /// leaves only the per-request window.
     leech_governor: Option<Arc<LeechGovernor>>,
     /// Optional content-authorization gate on the reactive pull-through path
-    /// (#821, ADR 037 §Seed-leech caps / ADR 022 §Scope and limits), set at
+    /// (#821, ADR 037 §Seed-leech caps / ADR 022 §`FIND_VALUE` Flow), set at
     /// construction via [`ClientHandlerDeps`] only when the operator sets
     /// `cache.pull_through_require_authorized_origin = true`. `None` (the default
     /// and in tests) keeps the permissionless cache role: misses pull through

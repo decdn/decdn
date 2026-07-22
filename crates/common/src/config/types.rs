@@ -555,7 +555,7 @@ pub struct CacheConfig {
     /// `0` pins a peer to only the opening window.
     pub pull_share_ratio_percent: Option<decdn_config_types::Percent>,
     /// Content-authorization gate on the reactive cache-miss pull-through path
-    /// (#821, ADR 037 §Seed-leech caps / ADR 022 §Scope and limits). Absent =>
+    /// (#821, ADR 037 §Seed-leech caps / ADR 022 §`FIND_VALUE` Flow). Absent =>
     /// `false` (the cache role stays permissionless, unchanged network
     /// behavior). When `true`, the node refuses to *initiate* an upstream pull
     /// and the associated cache-warming write for a hash whose namespace has no
