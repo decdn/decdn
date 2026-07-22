@@ -949,6 +949,38 @@ contract PaymentChannelTest is Test {
         channel.closeChannel(idNew, 1, 1, BYTES_PER_MB, sig);
     }
 
+    /// @dev The `setRateBounds` guard `newFloor < MIN_DEPOSIT_FLOOR` fires. The
+    ///      floor is 1, so 0 is the only sub-floor value. Pranked as `admin`
+    ///      (the `GOVERNANCE_ROLE` holder) so the revert is the bounds guard and
+    ///      not the access-control check.
+    function test_setRateBounds_revertsWhenFloorBelowMinimum() public {
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(PaymentChannel.RateBoundsInvalid.selector, uint256(0), uint256(5)));
+        channel.setRateBounds(0, 5);
+    }
+
+    /// @dev The `setRateBounds` guard `newCeiling <= newFloor` fires on an equal
+    ///      ceiling and floor. Pranked as `admin` so the revert is the bounds
+    ///      guard, not the `GOVERNANCE_ROLE` check.
+    function test_setRateBounds_revertsWhenCeilingNotAboveFloor() public {
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(PaymentChannel.RateBoundsInvalid.selector, uint256(100), uint256(100)));
+        channel.setRateBounds(100, 100);
+    }
+
+    /// @dev The constructor enforces the same invariant as `setRateBounds`: a
+    ///      sub-floor `deliveryFloor_` reverts at deploy time.
+    function test_constructor_revertsWhenFloorBelowMinimum() public {
+        vm.expectRevert(abi.encodeWithSelector(PaymentChannel.RateBoundsInvalid.selector, uint256(0), uint256(5)));
+        new PaymentChannel(usdc, bond, address(router), DISPUTE_WINDOW, MAX_DURATION, 0, 5, admin);
+    }
+
+    /// @dev The constructor rejects `deliveryCeiling_ <= deliveryFloor_`.
+    function test_constructor_revertsWhenCeilingNotAboveFloor() public {
+        vm.expectRevert(abi.encodeWithSelector(PaymentChannel.RateBoundsInvalid.selector, uint256(100), uint256(100)));
+        new PaymentChannel(usdc, bond, address(router), DISPUTE_WINDOW, MAX_DURATION, 100, 100, admin);
+    }
+
     /// @dev Routed served bytes can never exceed `amount * BYTES_PER_MB / floor`,
     ///      so vote-weight inflation (ADR 036) costs proportional real USDC. Settle
     ///      at the maximum the floor permits for the paid amount and assert the
