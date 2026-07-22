@@ -1,5 +1,6 @@
 ---
 source: crates/protocol/tests/public_api.rs
+assertion_line: 54
 expression: public_api.to_string()
 ---
 pub mod decdn_protocol
@@ -68,8 +69,10 @@ pub decdn_protocol::client::StreamRequest::byte_len: u64
 pub decdn_protocol::client::StreamRequest::byte_offset: u64
 pub decdn_protocol::client::StreamRequest::channel_id: [u8; 32]
 pub decdn_protocol::client::StreamRequest::hash: [u8; 32]
+pub decdn_protocol::client::StreamRequest::namespace_id: [u8; 32]
 pub decdn_protocol::client::StreamRequest::timestamp_us: u64
 impl decdn_protocol::client::StreamRequest
+pub fn decdn_protocol::client::StreamRequest::has_namespace(&self) -> bool
 pub const fn decdn_protocol::client::StreamRequest::requested_len(&self) -> core::option::Option<core::num::nonzero::NonZeroU64>
 pub struct decdn_protocol::client::StreamRequestExt
 pub decdn_protocol::client::StreamRequestExt::binding: core::option::Option<decdn_protocol::client::ClientBinding>
@@ -103,6 +106,7 @@ pub const decdn_protocol::client::COOPERATIVE_CLOSE_SIG_LEN: usize
 pub const decdn_protocol::client::DEFAULT_VOUCHER_INTERVAL_MB: u64
 pub const decdn_protocol::client::MAX_VOUCHER_INTERVAL_MB: u64
 pub const decdn_protocol::client::MB_BYTES: u64
+pub const decdn_protocol::client::NO_NAMESPACE: [u8; 32]
 pub const decdn_protocol::client::VOUCHER_SIG_LEN: usize
 pub fn decdn_protocol::client::encode_stream_request(&decdn_protocol::client::StreamRequest, core::option::Option<&decdn_protocol::client::StreamRequestExt>) -> core::result::Result<alloc::vec::Vec<u8>, postcard::error::Error>
 pub fn decdn_protocol::client::parse_stream_request_ext(&[u8]) -> core::result::Result<decdn_protocol::client::StreamRequestExt, postcard::error::Error>
@@ -515,8 +519,10 @@ pub decdn_protocol::StreamRequest::byte_len: u64
 pub decdn_protocol::StreamRequest::byte_offset: u64
 pub decdn_protocol::StreamRequest::channel_id: [u8; 32]
 pub decdn_protocol::StreamRequest::hash: [u8; 32]
+pub decdn_protocol::StreamRequest::namespace_id: [u8; 32]
 pub decdn_protocol::StreamRequest::timestamp_us: u64
 impl decdn_protocol::client::StreamRequest
+pub fn decdn_protocol::client::StreamRequest::has_namespace(&self) -> bool
 pub const fn decdn_protocol::client::StreamRequest::requested_len(&self) -> core::option::Option<core::num::nonzero::NonZeroU64>
 pub struct decdn_protocol::StreamRequestExt
 pub decdn_protocol::StreamRequestExt::binding: core::option::Option<decdn_protocol::client::ClientBinding>
