@@ -11,7 +11,8 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 use std::time::Duration;
 
-use alloy::primitives::{B256, U256};
+use alloy::dyn_abi::Eip712Domain;
+use alloy::primitives::{Address, B256, U256};
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::Context;
 use decdn_cache::Hash;
@@ -21,6 +22,7 @@ use decdn_client_pull::{
 };
 use decdn_incentive::{bind_node_id_domain, slash_judge_domain, voucher_domain};
 use decdn_protocol::client::StreamError;
+use decdn_protocol::{ALPN_CLIENT, StreamRequest, StreamRequestExt, encode_stream_request};
 use iroh::endpoint::presets;
 use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey};
 
@@ -36,6 +38,36 @@ pub const DEPOSIT_MICRO_USDC: u64 = 10_000_000;
 /// path; a constant keeps the voucher deterministic (matches the settlement
 /// e2e).
 const TIMESTAMP_US: u64 = 0x00c0_ffe1;
+/// How long [`ClientFixture::capture_delivery_wire`] waits for the next frame
+/// before deciding the node has finished speaking. The tap never pays, so the
+/// node's closing-voucher pause is the terminator on a successful delivery.
+const WIRE_TAP_IDLE: Duration = Duration::from_secs(5);
+
+/// One open payment channel to one node, reusable across several single-shot
+/// fetches ([`ClientFixture::fetch_once`]) and the raw wire tap
+/// ([`ClientFixture::capture_delivery_wire`]).
+///
+/// [`ClientFixture::fetch`] opens a throwaway channel per call and rides out the
+/// node's pre-observation window by retrying — which is exactly what a journey
+/// asserting on a *refusal* cannot do, since the window and a real refusal are
+/// the same wire `NotFound`. A session pays that cost once, up front.
+#[derive(Debug)]
+pub struct ChannelSession {
+    ctx: ChannelContext,
+    target: EndpointAddr,
+    slash_domain: Eip712Domain,
+    /// The delivering node's Ethereum address; verifies the response `slash_sig`.
+    provider: Address,
+    channel_id: B256,
+}
+
+impl ChannelSession {
+    /// On-chain `channelId` this session's vouchers are signed against.
+    #[must_use]
+    pub const fn channel_id(&self) -> B256 {
+        self.channel_id
+    }
+}
 
 /// Result of a paid fetch: the delivered bytes and the channel they were paid
 /// through.
@@ -102,51 +134,11 @@ impl ClientFixture {
         node: &NodeFixture,
         hash: Hash,
     ) -> anyhow::Result<FetchOutcome> {
-        let client_addr = self.signer.address();
-        let provider = chain.provider_for(&self.signer);
-        let pc = PaymentChannelOpen::new(chain.addrs().payment_channel, &provider);
-
-        let nonce = client_channel_nonce(&provider, chain.addrs().payment_channel, client_addr)
-            .await
-            .context("read client channel nonce")?;
-        let deposit = U256::from(DEPOSIT_MICRO_USDC);
-        let open_receipt = pc
-            .openChannel(node.operator_addr(), deposit)
-            .send()
-            .await
-            .context("openChannel send")?
-            .get_receipt()
-            .await
-            .context("openChannel receipt")?;
-        crate::ensure_mined(&open_receipt, "openChannel")?;
-        let cid = channel_id(
-            client_addr,
-            node.operator_addr(),
-            u64::try_from(nonce).context("channel nonce overflow")?,
-        );
-
-        let ctx = ChannelContext {
-            channel_id: cid,
-            token: chain.usdc(),
-            deposit,
-            client_signer: Arc::clone(&self.signer),
-            voucher_domain: voucher_domain(chain.chain_id(), chain.addrs().payment_channel),
-            prior_nonce: U256::ZERO,
-            prior_bytes_delivered: U256::ZERO,
-            prior_amount: U256::ZERO,
-            client_binding: None,
-        };
-        let bind_domain = bind_node_id_domain(chain.chain_id(), chain.addrs().capacity_bond);
-        let own_node_id = B256::from(*self.endpoint.id().as_bytes());
-        let mut ctx = ctx.with_client_binding(sign_client_binding(
-            &self.signer,
-            own_node_id,
-            &bind_domain,
-        )?);
-        let slash_domain = slash_judge_domain(chain.chain_id(), chain.addrs().slash_judge);
-        let target = EndpointAddr::new(node.node_id()).with_ip_addr(SocketAddr::V4(
-            SocketAddrV4::new(Ipv4Addr::LOCALHOST, node.bind_port()),
-        ));
+        let mut session = self.open_channel(chain, node).await?;
+        let cid = session.channel_id;
+        let target = session.target.clone();
+        let ctx = &mut session.ctx;
+        let slash_domain = &session.slash_domain;
 
         // The node accepts vouchers only once its chain watcher has decoded the
         // ChannelOpened event (poll cadence ~500ms). Retry the paid fetch until
@@ -162,8 +154,8 @@ impl ClientFixture {
             match stream_fetch_tracked(
                 &self.endpoint,
                 target.clone(),
-                &ctx,
-                &slash_domain,
+                ctx,
+                slash_domain,
                 node.operator_addr(),
                 *hash.as_bytes(),
                 0,
@@ -207,6 +199,190 @@ impl ClientFixture {
                 Err(e) => return Err(e).context("paid fetch failed"),
             }
         }
+    }
+
+    /// Open a funded [`ChannelSession`] to `node` and wait until the daemon's
+    /// settlement watcher has registered it, so every later single-shot fetch on
+    /// the session is unambiguous — see [`Self::fetch_once`].
+    pub async fn open_session(
+        &self,
+        chain: &ChainFixture,
+        node: &NodeFixture,
+    ) -> anyhow::Result<ChannelSession> {
+        let session = self.open_channel(chain, node).await?;
+        node.wait_for_channel(session.channel_id, Duration::from_secs(60))
+            .await?;
+        Ok(session)
+    }
+
+    /// Run **one** paid fetch on `session` — no readiness retry loop — and return
+    /// the delivered bytes (`byte_offset > 0` requests the tail from that offset,
+    /// bao-verified against the whole-blob hash by the requester).
+    ///
+    /// The refusal is the point: [`Self::fetch`] retries a wire `NotFound` for 45s
+    /// because it cannot tell the pre-observation window from a real refusal.
+    /// `open_session` has already ruled the window out, so an error here is the
+    /// node's actual verdict and reaches the caller typed (e.g. downcast to
+    /// [`UpstreamRefused`]).
+    ///
+    /// # Errors
+    ///
+    /// Propagates whatever `stream_fetch_tracked` returns; the session's voucher
+    /// watermark is advanced first on every path, so a later fetch on the same
+    /// session signs the next nonce rather than replaying a stale one.
+    pub async fn fetch_once(
+        &self,
+        session: &mut ChannelSession,
+        hash: Hash,
+        byte_offset: u64,
+    ) -> anyhow::Result<Vec<u8>> {
+        let mut progress = VoucherProgress::default();
+        let result = stream_fetch_tracked(
+            &self.endpoint,
+            session.target.clone(),
+            &session.ctx,
+            &session.slash_domain,
+            session.provider,
+            *hash.as_bytes(),
+            byte_offset,
+            TIMESTAMP_US,
+            PullDeadlines::new(Duration::from_secs(30), Duration::from_secs(30))?,
+            0,
+            &mut progress,
+        )
+        .await;
+        if let Some((nonce, bytes_delivered, amount)) = progress.acked() {
+            session.ctx.prior_nonce = nonce;
+            session.ctx.prior_bytes_delivered = bytes_delivered;
+            session.ctx.prior_amount = amount;
+        }
+        Ok(result?.as_ref().to_vec())
+    }
+
+    /// Drive a raw `cdn/client/v1` delivery for `hash` on `session` and return
+    /// every framed message the node sent, verbatim.
+    ///
+    /// This is the wire tap G-NODE-08 needs: no client-side decoding, no
+    /// interpretation — the exact bytes a delivering node put on the QUIC stream,
+    /// so a journey can assert an opaque backend's location is not among them.
+    ///
+    /// Deliberately never pays: the node streams `StreamResponse` + every
+    /// `ChunkData` up to the voucher interval before pausing for payment, so for a
+    /// sub-interval blob this captures the complete node→client message set. The
+    /// capture ends when the node falls silent for `WIRE_TAP_IDLE` (the pause
+    /// waiting for the voucher that never comes) or the stream closes.
+    pub async fn capture_delivery_wire(
+        &self,
+        session: &ChannelSession,
+        hash: Hash,
+    ) -> anyhow::Result<Vec<Vec<u8>>> {
+        let conn = self
+            .endpoint
+            .connect(session.target.clone(), ALPN_CLIENT)
+            .await
+            .map_err(|e| anyhow::anyhow!("connect for wire tap: {e}"))?;
+        let (mut send, mut recv) = conn
+            .open_bi()
+            .await
+            .map_err(|e| anyhow::anyhow!("open_bi for wire tap: {e}"))?;
+        let req = StreamRequest {
+            hash: *hash.as_bytes(),
+            channel_id: session.ctx.channel_id.into(),
+            byte_offset: 0,
+            byte_len: 0,
+            timestamp_us: TIMESTAMP_US,
+        };
+        // The binding is what authorizes the node to spend on a cache-miss fill
+        // (`pull_authorized`); without it the tap would only ever capture a refusal.
+        let ext = StreamRequestExt {
+            voucher_interval_mb: None,
+            binding: session.ctx.client_binding.clone(),
+        };
+        let payload =
+            encode_stream_request(&req, Some(&ext)).context("encode wire-tap StreamRequest")?;
+        decdn_protocol::write_frame(&mut send, &payload)
+            .await
+            .context("write wire-tap StreamRequest")?;
+
+        // Reads until the stream closes (a refusal, then `finish`) or the node
+        // goes idle waiting for the voucher we never send: either way it has said
+        // everything it is going to say.
+        let mut frames = Vec::new();
+        while let Ok(Ok(frame)) =
+            tokio::time::timeout(WIRE_TAP_IDLE, decdn_protocol::read_frame(&mut recv)).await
+        {
+            frames.push(frame);
+        }
+        conn.close(0u32.into(), b"wire tap complete");
+        anyhow::ensure!(
+            !frames.is_empty(),
+            "node sent nothing on the delivery stream"
+        );
+        Ok(frames)
+    }
+
+    /// Open and fund a payment channel to `node`, returning the session state a
+    /// paid fetch needs. Does **not** wait for the node to observe the channel —
+    /// [`Self::fetch`] rides that window out by retrying, [`Self::open_session`]
+    /// waits it out explicitly.
+    async fn open_channel(
+        &self,
+        chain: &ChainFixture,
+        node: &NodeFixture,
+    ) -> anyhow::Result<ChannelSession> {
+        let client_addr = self.signer.address();
+        let provider = chain.provider_for(&self.signer);
+        let pc = PaymentChannelOpen::new(chain.addrs().payment_channel, &provider);
+
+        let nonce = client_channel_nonce(&provider, chain.addrs().payment_channel, client_addr)
+            .await
+            .context("read client channel nonce")?;
+        let deposit = U256::from(DEPOSIT_MICRO_USDC);
+        let open_receipt = pc
+            .openChannel(node.operator_addr(), deposit)
+            .send()
+            .await
+            .context("openChannel send")?
+            .get_receipt()
+            .await
+            .context("openChannel receipt")?;
+        crate::ensure_mined(&open_receipt, "openChannel")?;
+        let cid = channel_id(
+            client_addr,
+            node.operator_addr(),
+            u64::try_from(nonce).context("channel nonce overflow")?,
+        );
+
+        let ctx = ChannelContext {
+            channel_id: cid,
+            token: chain.usdc(),
+            deposit,
+            client_signer: Arc::clone(&self.signer),
+            voucher_domain: voucher_domain(chain.chain_id(), chain.addrs().payment_channel),
+            prior_nonce: U256::ZERO,
+            prior_bytes_delivered: U256::ZERO,
+            prior_amount: U256::ZERO,
+            client_binding: None,
+        };
+        let bind_domain = bind_node_id_domain(chain.chain_id(), chain.addrs().capacity_bond);
+        let own_node_id = B256::from(*self.endpoint.id().as_bytes());
+        let ctx = ctx.with_client_binding(sign_client_binding(
+            &self.signer,
+            own_node_id,
+            &bind_domain,
+        )?);
+        let slash_domain = slash_judge_domain(chain.chain_id(), chain.addrs().slash_judge);
+        let target = EndpointAddr::new(node.node_id()).with_ip_addr(SocketAddr::V4(
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, node.bind_port()),
+        ));
+
+        Ok(ChannelSession {
+            ctx,
+            target,
+            slash_domain,
+            provider: node.operator_addr(),
+            channel_id: cid,
+        })
     }
 
     /// Probe `node` for `hash` over `cdn/probe/v1` and return the signed
