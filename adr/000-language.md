@@ -5,39 +5,44 @@
 
 ## Context
 
-We are building a decentralized CDN with two participant roles: **nodes** (providers) that cache and deliver content to clients — some configured with an origin backend (e.g., S3/R2/NFS/local disk) as the canonical source for specific content — and **clients** that consume content. The network requires:
+The network has two participant roles:
 
-- High-throughput, low-latency blob transfer between all node types over peer-to-peer connections
-- Concurrent handling of many inbound connections per node
-- Safe memory management without a garbage collector introducing latency spikes under load
-- A QUIC-based transport with content-addressed verified transfer
-- Two statically linked binaries — a `decdn-node` daemon and a `decdn` CLI — sharing a common config schema and identity model (see [Appendix: deCDN Binaries](appendix-binaries.md#appendix-decdn-binaries--decdn-node--decdn-split))
+- **Nodes** (providers) cache and deliver content. Some are configured with an origin backend (S3/R2/NFS/local disk) as the canonical source for specific content.
+- **Clients** consume content.
+
+Requirements:
+
+- High-throughput, low-latency peer-to-peer blob transfer.
+- Concurrent handling of many inbound connections per node.
+- Memory safety without GC-induced latency spikes under load.
+- QUIC transport with content-addressed verified transfer.
+- Two statically linked binaries — a `decdn-node` daemon and a `decdn` CLI — that share a config schema and identity model (see [Appendix: deCDN Binaries](appendix-binaries.md#appendix-decdn-binaries--decdn-node--decdn-split)).
 
 ## Decision
 
 Use **Rust** as the implementation language and **iroh** as the core networking library.
 
-iroh versioning policy: pin to a specific version in `Cargo.toml` (e.g. `iroh = "1"`) rather than an open range. The current evaluated baseline is **1.0** (iroh 1.0, iroh-blobs 0.103, iroh-gossip 0.101, iroh-metrics 1.0; bumped from the 0.98 baseline in #918). Upgrades are deliberate — evaluate API compatibility, update `Cargo.toml`, and record the new baseline here before merging. The committed `Cargo.lock` is the true pin within a given version constraint, so a caret requirement (`iroh = "1"`) is acceptable: the lock holds the exact version and upgrades happen only on a deliberate `cargo update` plus a baseline bump here.
+Components:
 
-Specifically:
+- `iroh::Endpoint` — QUIC peer-to-peer connectivity and ALPN protocol negotiation.
+- `iroh-blobs` with the `fs-store` backend — content-addressed blob storage and verified transfer.
+- `iroh-gossip` — topic-based epidemic broadcast for node discovery and metadata (`NodeAnnounce`).
 
-- `iroh::Endpoint` for QUIC-based peer-to-peer connectivity and ALPN protocol negotiation
-- `iroh-blobs` with `fs-store` backend for content-addressed blob storage and verified transfer
-- `iroh-gossip` for topic-based epidemic broadcast (node discovery and metadata announcements via `NodeAnnounce`)
+**iroh versioning policy.** Pin a caret requirement in `Cargo.toml` (e.g. `iroh = "1"`); the committed `Cargo.lock` is the true pin. Current baseline: **iroh 1.0**, iroh-blobs 0.103, iroh-gossip 0.101, iroh-metrics 1.0 (bumped from the 0.98 baseline in #918). Upgrade only on a deliberate `cargo update`: evaluate API compatibility, then record the new baseline here before merging.
 
 ## Consequences
 
 ### Positive
 
-- Memory safety without GC pauses — predictable tail latency under concurrent delivery load
-- Rust's async runtime (tokio) handles thousands of concurrent connections per node efficiently
-- iroh bundles QUIC, NAT traversal, content-addressed transfer, and verified streaming — fewer moving parts than assembling these from separate libraries
-- BLAKE3 is native to iroh's content model; blob IDs and transport layer use the same hash with no translation layer
-- Statically linked binaries simplify deployment with no runtime dependency management
+- Memory safety without GC pauses — predictable tail latency under concurrent delivery load.
+- tokio handles thousands of concurrent connections per node efficiently.
+- iroh bundles QUIC, NAT traversal, content-addressed transfer, and verified streaming — fewer moving parts than assembling separate libraries.
+- BLAKE3 is native to iroh's content model; blob IDs and transport share one hash with no translation layer.
+- Statically linked binaries simplify deployment.
 
 ### Negative
 
-- Rust's compile times slow the development feedback loop compared to interpreted or JVM languages
-- The team needs Rust proficiency; onboarding contributors takes longer
-- iroh is a relatively young library; its APIs have changed across versions and may continue to do so — mitigated by pinning policy above
-- Fewer off-the-shelf libraries for EVM interaction compared to TypeScript or Python — `alloy-rs` covers the gap but with less community documentation
+- Rust compile times slow the development feedback loop.
+- The team needs Rust proficiency; onboarding takes longer.
+- iroh is young and its APIs change across versions — mitigated by the pinning policy above.
+- Fewer off-the-shelf EVM libraries than TypeScript or Python; `alloy-rs` covers the gap with less community documentation.
