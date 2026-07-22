@@ -542,12 +542,30 @@ jobs:
     # `OVERALL_TIMEOUT` ceilings, so a genuinely hung test hits its per-test
     # timeout's clear message first rather than this opaque job-level kill (the
     # #785 masking this bound exists to avoid): settlement 13m, then the
-    # cross-layer journeys at --test-threads 2 — 6 tests (smoke 13m + three
-    # G-NODE-04 at 10m + slash_appeal at 20m + G-NODE-06 at 13m) whose worst
-    # 2-thread schedule is 56m (one thread draws smoke + all three G-NODE-04 +
-    # G-NODE-06 while the other runs slash_appeal) — plus workspace compiles and
-    # the per-fixture in-test forge deploys.
-    timeout-minutes: 75
+    # cross-layer journeys at --test-threads 2 — 14 tests across 11 files whose
+    # per-test `OVERALL_TIMEOUT` ceilings sum to 183m:
+    #   13m x6  smoke, cli_publish, cli_fetch_manifest, cli_fetch_topup,
+    #           cli_setup_partial, G-NODE-06
+    #   10m x5  G-NODE-04 (3 tests), G-ORIGIN-01 (2 tests)
+    #   15m x1  G-ORIGIN-04
+    #   20m x2  slash_appeal, G-GOV-03
+    # A balanced 2-thread schedule is ~92m (183/2, no single test exceeding it),
+    # so the bound must clear that plus the 13m settlement step, the workspace
+    # compiles and the per-fixture in-test forge deploys. Keep this comment and
+    # the inventory in sync when adding a journey — it went stale once already
+    # (it still described 6 tests after the cli_* and G-ORIGIN-* journeys
+    # landed), which silently inverted the ordering this bound depends on.
+    # In practice the job finishes in ~10m; these are ceilings, not estimates.
+    #
+    # Deliberate tradeoff in raising this from 75m: the bound is now a *generous*
+    # backstop, so the two things NOT covered by any per-test `OVERALL_TIMEOUT` —
+    # a wedged workspace compile, and an in-test `forge` deploy that hangs before
+    # a test's own timer is armed — will burn the full 130m before failing red.
+    # Accepted because the alternative is worse: a bound tight enough to catch
+    # those quickly also kills legitimate runs, and a bound *below* the per-test
+    # ceilings reintroduces exactly the opaque job-level kill (#785) that masks
+    # the clear per-test message this ordering exists to surface.
+    timeout-minutes: 130
     needs: changes
     if: >-
       needs.changes.outputs.rust == 'true' ||

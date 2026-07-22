@@ -79,6 +79,61 @@ const DEPLOY_ATTEMPTS: usize = 3;
 /// startup (the `free_port` TOCTOU: another process claimed the port first).
 const ANVIL_ATTEMPTS: usize = 3;
 
+/// The two `SlashJudge._verifyPair` offenses a signed probe/stream pair can
+/// prove (#1042). Mirrors the leading entries of `ISlashJudge.OffenseType`;
+/// `Blacklist` is excluded because it takes a single response, not a pair, and
+/// has its own entry point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Offense {
+    /// `probe.hasBlob && !stream.ok` — announced the blob, then refused it.
+    Phantom,
+    /// `stream.ratePerMb > probe.ratePerMb` within the 30s window — bait-and-switch.
+    RateManipulation,
+}
+
+impl Offense {
+    /// The generated, contract-canonical `OffenseType`. Going through the `sol!`
+    /// enum rather than a hand-written ordinal keeps this pinned to the one
+    /// declaration a Solidity reorder would have to touch anyway
+    /// (`decdn_incentive::slash_judge`) — a stale literal here would instead
+    /// corrupt `evidenceHash` and surface as a misleading `NoCommitment()`.
+    const fn offense_type(self) -> SlashJudge::OffenseType {
+        match self {
+            Self::Phantom => SlashJudge::OffenseType::Phantom,
+            Self::RateManipulation => SlashJudge::OffenseType::RateManipulation,
+        }
+    }
+
+    /// Contract-canonical `OffenseType` discriminant, folded into `evidenceHash`.
+    const fn discriminant(self) -> u8 {
+        self.offense_type() as u8
+    }
+
+    /// The reveal entry point, for error context.
+    const fn entry_point(self) -> &'static str {
+        match self {
+            Self::Phantom => "submitPhantomChallenge",
+            Self::RateManipulation => "submitRateChallenge",
+        }
+    }
+}
+
+/// The two signed wire messages a `_verifyPair` challenge is built from, exactly
+/// as the daemon emitted them — `slash_sig` included and never re-signed. Borrowed
+/// so a negative case can perturb one field of a clone and resubmit (#1042).
+///
+/// Deliberately **unvalidated**: no same-hash, same-signer, or window check. The
+/// judge is the only arbiter, and the negative journeys submit deliberately
+/// incoherent pairs (a 41s-apart pair, a probe re-signed by an impostor), so a
+/// validating constructor would make half the coverage unwritable.
+#[derive(Debug, Clone, Copy)]
+pub struct EvidencePair<'a> {
+    /// The signed `cdn/probe/v1` response.
+    pub probe: &'a decdn_protocol::ProbeResponse,
+    /// The signed `cdn/client/v1` open-stage response.
+    pub stream: &'a decdn_protocol::client::StreamResponse,
+}
+
 /// Deployed protocol contract addresses, read from the forge-script manifest.
 #[derive(Debug, Clone, Copy)]
 pub struct ContractAddrs {
@@ -941,26 +996,8 @@ impl ChainFixture {
         node_id: B256,
         blob_hash: B256,
     ) -> anyhow::Result<U256> {
-        // Arm the challenger: gas + the refundable challenge bond, approved to
-        // the judge (any funded EOA may challenge).
-        self.fund_eth(challenger.address(), 10).await?;
-        let judge_read = SlashJudge::new(self.addrs.slash_judge, &self.admin);
-        let bond = judge_read
-            .challengeBond()
-            .call()
-            .await
-            .context("read challengeBond")?;
-        self.transfer_token(challenger.address(), bond).await?;
+        self.arm_challenger(challenger).await?;
         let ch_provider = self.provider_for(challenger);
-        let approve = Erc20::new(self.addrs.token, &ch_provider)
-            .approve(self.addrs.slash_judge, bond)
-            .send()
-            .await
-            .context("challenger token.approve send")?
-            .get_receipt()
-            .await
-            .context("challenger token.approve receipt")?;
-        crate::ensure_mined(&approve, "challenger token.approve")?;
 
         // Evidence timestamps anchored just behind the current chain time
         // (within the 5-day age bound and the 30s probe↔stream window).
@@ -1002,7 +1039,7 @@ impl ChainFixture {
         // streamStructHash)); commitment binds it to (salt, challenger).
         // `abi.encode(uint8 v)` right-aligns `v` in a 32-byte word — byte-
         // identical to `uint256(v)`, which alloy's `SolValue` encodes directly.
-        let offense = U256::from(0u8); // OffenseType.Phantom
+        let offense = U256::from(Offense::Phantom.discriminant());
         let evidence_hash =
             keccak256((offense, probe.struct_hash(), stream.struct_hash()).abi_encode());
         let salt = B256::repeat_byte(0x99);
@@ -1061,6 +1098,228 @@ impl ChainFixture {
             }
         }
         anyhow::bail!("submitPhantomChallenge mined but emitted no Slashed event")
+    }
+
+    /// Governable `SlashJudge.challengeBond` (TOKEN base units) — pulled and
+    /// returned inside a successful reveal, and per ADR 014 § Bond Handling never
+    /// transferred at all when verification fails.
+    pub async fn challenge_bond(&self) -> anyhow::Result<U256> {
+        SlashJudge::new(self.addrs.slash_judge, &self.admin)
+            .challengeBond()
+            .call()
+            .await
+            .context("read challengeBond")
+    }
+
+    /// Fund `challenger` with gas + the `SlashJudge.challengeBond`, approved to
+    /// the judge, and return the bond amount. Any funded EOA may challenge; the
+    /// bond is pulled and returned inside the same reveal transaction.
+    async fn arm_challenger(&self, challenger: &PrivateKeySigner) -> anyhow::Result<U256> {
+        self.fund_eth(challenger.address(), 10).await?;
+        let bond = SlashJudge::new(self.addrs.slash_judge, &self.admin)
+            .challengeBond()
+            .call()
+            .await
+            .context("read challengeBond")?;
+        self.transfer_token(challenger.address(), bond).await?;
+        let approve = Erc20::new(self.addrs.token, &self.provider_for(challenger))
+            .approve(self.addrs.slash_judge, bond)
+            .send()
+            .await
+            .context("challenger token.approve send")?
+            .get_receipt()
+            .await
+            .context("challenger token.approve receipt")?;
+        crate::ensure_mined(&approve, "challenger token.approve")?;
+        Ok(bond)
+    }
+
+    /// Drive a `SlashJudge` commit-reveal challenge from **caller-supplied**
+    /// evidence — the real signed `ProbeResponse` / `StreamResponse` a live
+    /// daemon produced (#1042, G-GOV-03).
+    ///
+    /// The sibling of [`Self::slash_operator_via_judge`], which synthesises its
+    /// own evidence and signs it with the operator key the test happens to hold.
+    /// That is exactly what `SlashJudge.t.sol` can already do; what it cannot do
+    /// is prove the *daemon's* signing path emits court-admissible bytes. So this
+    /// one takes the wire messages verbatim — including `slash_sig`, which it
+    /// never re-signs — and is therefore also the entry point for the negatives
+    /// (forged signature, out-of-window pair), which are just the same call with
+    /// one field of the real evidence perturbed.
+    ///
+    /// Handles both `_verifyPair` offenses: [`Offense::Phantom`]
+    /// (`probe.has_blob && !stream.ok`) and [`Offense::RateManipulation`]
+    /// (`stream.rate_per_mb > probe.rate_per_mb`). `salt` is caller-supplied so
+    /// two challenges in one journey cannot collide on a commitment slot.
+    ///
+    /// Returns the minted `slashId`. An `Err` here is the *whole point* for the
+    /// negative cases: a challenge that fails verification reverts, and per
+    /// [ADR 014 § Bond Handling](../../../adr/014-on-chain-verification.md) the
+    /// bond is never transferred on a failed verification — assert the
+    /// challenger's TOKEN balance directly.
+    ///
+    /// **Side effect:** advances chain time ~65s on *every* call, including ones
+    /// that revert, to mature the commitment past `MIN_REVEAL_DELAY`. A journey
+    /// that captures evidence *between* challenges is working against a drifted
+    /// clock; anchor every capture with a fresh [`Self::head_timestamp`].
+    pub async fn challenge_with_real_evidence(
+        &self,
+        challenger: &PrivateKeySigner,
+        operator: Address,
+        node_id: B256,
+        offense: Offense,
+        evidence: EvidencePair<'_>,
+        salt: B256,
+    ) -> anyhow::Result<U256> {
+        let EvidencePair { probe, stream } = evidence;
+        let bond = self.arm_challenger(challenger).await?;
+        anyhow::ensure!(bond > U256::ZERO, "challenge bond must be non-zero");
+        let ch_provider = self.provider_for(challenger);
+
+        // Rebuild the EIP-712 struct hashes from the wire bodies with the same
+        // production signers the daemon used, so the commitment binds the exact
+        // messages the reveal submits.
+        let probe_data = ProbeSlashData {
+            hash: B256::from(probe.body.hash),
+            has_blob: probe.body.has_blob,
+            rate_per_mb: probe.body.rate_per_mb,
+            timestamp_us: probe.body.timestamp_us,
+        };
+        let stream_data = StreamSlashData::from_response_body(&stream.body);
+        let evidence_hash = keccak256(
+            (
+                U256::from(offense.discriminant()),
+                probe_data.struct_hash(),
+                stream_data.struct_hash(),
+            )
+                .abi_encode(),
+        );
+        let commitment = keccak256((evidence_hash, salt, challenger.address()).abi_encode());
+
+        let judge = SlashJudge::new(self.addrs.slash_judge, &ch_provider);
+        let commit = judge
+            .commitChallenge(commitment)
+            .send()
+            .await
+            .context("commitChallenge send")?
+            .get_receipt()
+            .await
+            .context("commitChallenge receipt")?;
+        crate::ensure_mined(&commit, "commitChallenge")?;
+
+        // Mature past MIN_REVEAL_DELAY (1 minute) with margin.
+        crate::time::increase_time(&self.admin, 65).await?;
+
+        let probe_msg = SlashJudge::ProbeMsg {
+            hash: probe_data.hash,
+            hasBlob: probe_data.has_blob,
+            ratePerMb: probe_data.rate_per_mb,
+            timestampUs: probe_data.timestamp_us,
+        };
+        let stream_msg = SlashJudge::StreamMsg {
+            hash: stream_data.hash,
+            ok: stream_data.ok,
+            ratePerMb: stream_data.rate_per_mb,
+            totalBytes: stream_data.total_bytes,
+            channelId: stream_data.channel_id,
+            timestampUs: stream_data.timestamp_us,
+            redirect: stream_data.redirect,
+        };
+        // The daemon's own signatures, forwarded byte-for-byte.
+        let probe_sig = Bytes::from(probe.slash_sig.clone());
+        let stream_sig = Bytes::from(stream.slash_sig.clone());
+        let probe_bytes = Bytes::from(probe_msg.abi_encode());
+        let stream_bytes = Bytes::from(stream_msg.abi_encode());
+
+        let pending = match offense {
+            Offense::Phantom => {
+                judge
+                    .submitPhantomChallenge(
+                        operator,
+                        node_id,
+                        probe_bytes,
+                        probe_sig,
+                        stream_bytes,
+                        stream_sig,
+                        salt,
+                    )
+                    .send()
+                    .await
+            }
+            Offense::RateManipulation => {
+                crate::bindings::SlashJudgeRate::new(self.addrs.slash_judge, &ch_provider)
+                    .submitRateChallenge(
+                        operator,
+                        node_id,
+                        probe_bytes,
+                        probe_sig,
+                        stream_bytes,
+                        stream_sig,
+                        salt,
+                    )
+                    .send()
+                    .await
+            }
+        };
+        let what = offense.entry_point();
+        let receipt = pending
+            .with_context(|| format!("{what} send"))?
+            .get_receipt()
+            .await
+            .with_context(|| format!("{what} receipt"))?;
+        crate::ensure_mined(&receipt, what)?;
+
+        for log in receipt.inner.logs() {
+            if let Ok(ev) = SlashJudge::Slashed::decode_log_data(&log.inner.data) {
+                return Ok(ev.slashId);
+            }
+        }
+        anyhow::bail!("{what} mined but emitted no Slashed event")
+    }
+
+    /// `CapacityBond.escrowedTotal()` — TOKEN currently parked in slash escrow.
+    pub async fn escrowed_total(&self) -> anyhow::Result<U256> {
+        CapacityBond::new(self.addrs.capacity_bond, &self.admin)
+            .escrowedTotal()
+            .call()
+            .await
+            .context("read escrowedTotal")
+    }
+
+    /// `CapacityBond.slashRecords(slashId)` → `(operator, slashedAt, slashAmount)`.
+    pub async fn slash_record(&self, slash_id: U256) -> anyhow::Result<(Address, u64, U256)> {
+        let rec = CapacityBond::new(self.addrs.capacity_bond, &self.admin)
+            .slashRecords(slash_id)
+            .call()
+            .await
+            .context("read slashRecords")?;
+        Ok((rec.operator, rec.slashedAt, rec.slashAmount))
+    }
+
+    /// Permissionless `CapacityBond.finalizeUnappealedSlash` — distributes an
+    /// escrowed slash whose 30-day filing window lapsed, 50% to the recorded
+    /// challenger and 50% burned. Sent by the admin EOA (the caller is not part
+    /// of the split; the challenger is read from the record).
+    pub async fn finalize_unappealed_slash(&self, slash_id: U256) -> anyhow::Result<()> {
+        let receipt = CapacityBond::new(self.addrs.capacity_bond, &self.admin)
+            .finalizeUnappealedSlash(slash_id)
+            .send()
+            .await
+            .context("finalizeUnappealedSlash send")?
+            .get_receipt()
+            .await
+            .context("finalizeUnappealedSlash receipt")?;
+        crate::ensure_mined(&receipt, "finalizeUnappealedSlash")
+    }
+
+    /// TOKEN `totalSupply()` — reads the burn leg of a 50/50 slash split, which
+    /// no account's balance reflects.
+    pub async fn token_total_supply(&self) -> anyhow::Result<U256> {
+        Erc20::new(self.addrs.token, &self.admin)
+            .totalSupply()
+            .call()
+            .await
+            .context("read TOKEN totalSupply")
     }
 
     /// Emergency-multisig `fastTrackAppeal`. The e2e deploy sets
