@@ -555,7 +555,16 @@ jobs:
     # the inventory in sync when adding a journey — it went stale once already
     # (it still described 6 tests after the cli_* and G-ORIGIN-* journeys
     # landed), which silently inverted the ordering this bound depends on.
-    # In practice the job finishes in ~20m; these are ceilings, not estimates.
+    # In practice the job finishes in ~10m; these are ceilings, not estimates.
+    #
+    # Deliberate tradeoff in raising this from 75m: the bound is now a *generous*
+    # backstop, so the two things NOT covered by any per-test `OVERALL_TIMEOUT` —
+    # a wedged workspace compile, and an in-test `forge` deploy that hangs before
+    # a test's own timer is armed — will burn the full 130m before failing red.
+    # Accepted because the alternative is worse: a bound tight enough to catch
+    # those quickly also kills legitimate runs, and a bound *below* the per-test
+    # ceilings reintroduces exactly the opaque job-level kill (#785) that masks
+    # the clear per-test message this ordering exists to surface.
     timeout-minutes: 130
     needs: changes
     if: >-

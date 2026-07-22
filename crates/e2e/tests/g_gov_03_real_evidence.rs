@@ -232,6 +232,13 @@ async fn run() -> anyhow::Result<()> {
     let stream_b = client
         .refused_stream(&chain, &node_b, channel_b, unheld, now_b_us + 1_000_000)
         .await?;
+    // Symmetric with the node-A capture: pin the answered hash at the capture so a
+    // mismatch localizes here rather than surfacing later as the judge's same-hash
+    // check inside the challenge.
+    anyhow::ensure!(
+        stream_b.body.hash == *unheld.as_bytes(),
+        "the refusal must answer for the probed hash"
+    );
     anyhow::ensure!(
         stream_b.body.rate_per_mb > probe_b.body.rate_per_mb,
         "the daemon must have signed the raised rate: probe {} vs stream {}",
@@ -433,6 +440,15 @@ async fn assert_fifty_fifty_split(chain: &ChainFixture, slash: &LandedSlash) -> 
 
     chain.finalize_unappealed_slash(slash.slash_id).await?;
 
+    // Rounding matches the contract exactly, odd amounts included — and the
+    // direction matters, so spell out why. `SlashEscrowLib._distribute` computes
+    // `challengerShare = amount * CHALLENGER_BPS / BPS_DENOMINATOR` (= `amount *
+    // 5000 / 10_000`, integer division, so the *challenger* leg floors) and gives
+    // the remainder to the burn. Since 5000/10_000 is exactly 1/2, that is
+    // `amount / 2` for every `amount`; an odd 7 splits 3 challenger / 4 burn under
+    // both. Deliberately not read off the `SlashUpheld` event: asserting against
+    // the contract's own emitted shares would only prove internal consistency,
+    // where hard-coding 50/50 pins the ADR 026 policy itself.
     let challenger_share = slash.amount / U256::from(2u64);
     let burn_share = slash.amount - challenger_share;
     anyhow::ensure!(
