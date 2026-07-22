@@ -46,6 +46,7 @@ use decdn_e2e::chain::ChainFixture;
 use decdn_e2e::cli::decdn_command;
 use decdn_e2e::client::ClientFixture;
 use decdn_e2e::node::{KEYSTORE_PASSWORD, NodeFixture};
+use decdn_e2e::poll;
 use decdn_e2e::time;
 
 const MIB: usize = 1024 * 1024;
@@ -286,24 +287,4 @@ fn run_appeal_cli(node: &NodeFixture, slash_id: U256, evidence: B256) -> anyhow:
         "`decdn appeal slash` exited non-zero: {status}"
     );
     Ok(())
-}
-
-/// Poll `f` until it yields `Some` or `timeout` elapses; a closure error aborts
-/// immediately with that error (real RPC/contract failures surface, not a
-/// generic timeout). Mirrors the smoke test's helper.
-async fn poll<T, F, Fut>(timeout: Duration, mut f: F) -> anyhow::Result<Option<T>>
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = anyhow::Result<Option<T>>>,
-{
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        if let Some(v) = f().await? {
-            return Ok(Some(v));
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Ok(None);
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
 }

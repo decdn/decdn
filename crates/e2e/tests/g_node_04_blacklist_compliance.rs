@@ -56,6 +56,7 @@ use decdn_e2e::bindings::{Erc20, SlashJudge, SlashJudgeBlacklist};
 use decdn_e2e::chain::{ChainFixture, region_key};
 use decdn_e2e::client::ClientFixture;
 use decdn_e2e::node::NodeFixture;
+use decdn_e2e::poll;
 use decdn_e2e::time;
 use decdn_incentive::{ProbeSlashData, slash_judge_domain};
 use jsonrpsee::http_client::HttpClient;
@@ -438,23 +439,4 @@ async fn drive_blacklist_slash(
 
 fn to_b256(hash: Hash) -> B256 {
     B256::from(*hash.as_bytes())
-}
-
-/// Poll `f` until it yields `Some`, or `timeout` elapses. A closure error aborts
-/// immediately with that error rather than a generic timeout.
-async fn poll<T, F, Fut>(timeout: Duration, mut f: F) -> anyhow::Result<Option<T>>
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = anyhow::Result<Option<T>>>,
-{
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        if let Some(v) = f().await? {
-            return Ok(Some(v));
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Ok(None);
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
 }

@@ -63,6 +63,35 @@ pub async fn client_channel_nonce<P: Provider>(
         .context("clientChannelNonce")
 }
 
+/// Assert an alloy contract call reverted with exactly `E`, matching on the
+/// 4-byte selector. Distinguishes the guard under test from a transport fault
+/// (no revert data at all) and from a *different* revert — both of which an
+/// `is_err()` check would happily accept.
+pub fn expect_revert<T, E: alloy::sol_types::SolError>(
+    result: Result<T, alloy::contract::Error>,
+    what: &str,
+) -> anyhow::Result<()> {
+    let Err(err) = result else {
+        anyhow::bail!("{what} must revert with {}, but succeeded", E::SIGNATURE)
+    };
+    let data = err.as_revert_data().with_context(|| {
+        format!(
+            "{what}: expected a {} revert, got no revert data: {err}",
+            E::SIGNATURE
+        )
+    })?;
+    let selector = data
+        .get(..4)
+        .context("revert payload too short to carry a selector")?;
+    anyhow::ensure!(
+        selector == E::SELECTOR,
+        "{what}: expected {}, got revert data 0x{}",
+        E::SIGNATURE,
+        alloy::hex::encode(&data)
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {

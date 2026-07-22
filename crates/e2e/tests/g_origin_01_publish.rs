@@ -49,6 +49,7 @@ use alloy::providers::Provider;
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::Context;
 use decdn_cache::Hash;
+use decdn_e2e::assert::expect_revert;
 use decdn_e2e::bindings::PublisherRegistry;
 use decdn_e2e::chain::ChainFixture;
 use decdn_e2e::cli::decdn_command;
@@ -458,36 +459,6 @@ impl Publisher {
             )
         })
     }
-}
-
-/// Assert an alloy contract call reverted with exactly `E`, matching on the
-/// 4-byte selector. Distinguishes the guard under test from a transport fault
-/// (no revert data at all) and from a *different* revert — both of which an
-/// `is_err()` check would happily accept.
-fn expect_revert<T, E: alloy::sol_types::SolError>(
-    result: Result<T, alloy::contract::Error>,
-    what: &str,
-) -> anyhow::Result<()> {
-    let err = match result {
-        Ok(_) => anyhow::bail!("{what} must revert with {}, but succeeded", E::SIGNATURE),
-        Err(err) => err,
-    };
-    let data = err.as_revert_data().with_context(|| {
-        format!(
-            "{what}: expected a {} revert, got no revert data: {err}",
-            E::SIGNATURE
-        )
-    })?;
-    let selector = data
-        .get(..4)
-        .context("revert payload too short to carry a selector")?;
-    anyhow::ensure!(
-        selector == E::SELECTOR,
-        "{what}: expected {}, got revert data 0x{}",
-        E::SIGNATURE,
-        alloy::hex::encode(&data)
-    );
-    Ok(())
 }
 
 /// The timestamp of block `number`.
