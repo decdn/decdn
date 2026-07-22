@@ -1667,4 +1667,65 @@ mod tests {
             &OriginHash::from_bytes([9u8; 32])
         ));
     }
+
+    /// #1382: the voucher-acceptance floor must be the one pinned when the
+    /// `StreamResponse` was signed, not a value re-read live at settlement.
+    ///
+    /// A governance floor raise that lands between the signed quote and a
+    /// voucher for that stream must not reject a voucher paying exactly the rate
+    /// the node itself quoted. `clamped_rate` now returns `(rate, quote_floor)`
+    /// from ONE snapshot, and `collect_voucher` enforces the hard per-byte floor
+    /// with `verify_rate(amount, new_bytes, quote_floor, 0)` — the same call this
+    /// test drives — rather than `self.rate_bounds.floor()`.
+    #[tokio::test]
+    async fn voucher_floor_uses_quote_snapshot_not_live_bounds() {
+        let metrics = Arc::new(Metrics::new());
+        let (handler, _dir) = handler_for_warm_tests(&metrics, None).await;
+
+        // Quote-time band: floor == F, a generous ceiling. The advertised
+        // `rate_per_mb` atomic is seeded to 1 in `handler_for_warm_tests`, so
+        // set the band's floor to F and clamp will raise the quote to F.
+        let f: u64 = 500;
+        handler.rate_bounds.store(f, 10_000);
+
+        // Quote the stream: this is the value that would be signed into the
+        // `StreamResponse` and threaded to `collect_voucher`.
+        let (quoted_rate, quote_floor) = handler.clamped_rate();
+        assert_eq!(quoted_rate, f, "quote clamps up to the floor");
+        assert_eq!(quote_floor, f, "quote floor is the snapshot floor");
+
+        // A well-formed cumulative voucher paying exactly the quoted rate for a
+        // one-MB interval.
+        let bytes_per_mb = decdn_incentive::rate::BYTES_PER_MB;
+        let bytes = U256::from(bytes_per_mb);
+        let amount = min_payment(bytes_per_mb, quoted_rate);
+
+        // Governance raises the floor above F mid-stream (the ~1s watcher
+        // cadence spanning multiple voucher intervals — the reachable race).
+        handler.rate_bounds.store(f * 2, 10_000);
+        assert_eq!(
+            handler.rate_bounds.floor(),
+            f * 2,
+            "live floor moved above the quoted rate"
+        );
+
+        // Post-fix: the acceptance check reads the pinned quote floor, so the
+        // voucher paying the quoted rate clears the hard per-byte floor.
+        assert!(
+            verify_rate(amount, bytes, quote_floor, 0).is_ok(),
+            "a voucher paying the quoted rate must clear the quote-time floor"
+        );
+
+        // Pre-fix behaviour, reproduced for contrast: reading the LIVE floor
+        // (what `self.rate_bounds.floor()` returned before #1382) rejects the
+        // exact same correct voucher as an underpayment — the buyer did nothing
+        // wrong. This is the failure the fix removes.
+        assert!(
+            matches!(
+                verify_rate(amount, bytes, handler.rate_bounds.floor(), 0),
+                Err(RateError::Underpayment { .. })
+            ),
+            "the live-floor read would wrongly reject the quoted-rate voucher"
+        );
+    }
 }

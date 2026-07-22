@@ -24,6 +24,7 @@ impl ClientHandler {
         channel: Option<&Arc<Mutex<ChannelDeliveryState>>>,
         client_node_id: B256,
         rate_per_mb: u64,
+        quote_floor: u64,
         interval_mb: u64,
     ) -> anyhow::Result<()> {
         // The client-facing `cdn/client/v1` payload is ALWAYS the bao interleaved
@@ -77,6 +78,7 @@ impl ClientHandler {
                         channel,
                         client_node_id,
                         rate_per_mb,
+                        quote_floor,
                         unvouchered,
                     )
                     .await?
@@ -97,6 +99,7 @@ impl ClientHandler {
                     channel,
                     client_node_id,
                     rate_per_mb,
+                    quote_floor,
                     unvouchered,
                 )
                 .await?,

@@ -501,7 +501,7 @@ impl ClientHandler {
         };
 
         // Build and sign the success response.
-        let rate_per_mb = self.clamped_rate();
+        let (rate_per_mb, quote_floor) = self.clamped_rate();
         let body = StreamResponseBody {
             hash: req.hash,
             ok: true,
@@ -527,6 +527,7 @@ impl ClientHandler {
             Some(&channel),
             client_node_id,
             rate_per_mb,
+            quote_floor,
             interval_mb,
         )
         .await
