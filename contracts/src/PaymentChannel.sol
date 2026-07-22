@@ -306,7 +306,10 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, SunsettingPausable, E
         if (maxChannelDuration_ < MAX_CHANNEL_DURATION_FLOOR || maxChannelDuration_ > MAX_CHANNEL_DURATION_CEILING) {
             revert ParamOutOfBounds(maxChannelDuration_, MAX_CHANNEL_DURATION_FLOOR, MAX_CHANNEL_DURATION_CEILING);
         }
-        if (deliveryFloor_ < MIN_DEPOSIT_FLOOR || deliveryCeiling_ <= deliveryFloor_) {
+        if (
+            deliveryFloor_ < MIN_DEPOSIT_FLOOR || deliveryCeiling_ <= deliveryFloor_
+                || deliveryFloor_ > type(uint64).max || deliveryCeiling_ > type(uint64).max
+        ) {
             revert RateBoundsInvalid(deliveryFloor_, deliveryCeiling_);
         }
 
@@ -767,7 +770,16 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, SunsettingPausable, E
     }
 
     function setRateBounds(uint256 newFloor, uint256 newCeiling) external onlyRole(GOVERNANCE_ROLE) {
-        if (newFloor < MIN_DEPOSIT_FLOOR || newCeiling <= newFloor) revert RateBoundsInvalid(newFloor, newCeiling);
+        // Cap both bounds at `type(uint64).max`: the daemon's rate clamp decodes
+        // these as `u64` (`crates/node/src/rate_bounds.rs`), so a band the chain
+        // can express but the node cannot enforce would silently strand every
+        // voucher below the on-chain floor (#1383).
+        if (
+            newFloor < MIN_DEPOSIT_FLOOR || newCeiling <= newFloor || newFloor > type(uint64).max
+                || newCeiling > type(uint64).max
+        ) {
+            revert RateBoundsInvalid(newFloor, newCeiling);
+        }
         deliveryFloor = newFloor;
         deliveryCeiling = newCeiling;
         emit RateBoundsUpdated(newFloor, newCeiling);
