@@ -358,6 +358,48 @@ pub trait BlacklistEntryStore: Send + Sync {
     ///
     /// Returns a [`StoreError`] if the durable write fails.
     fn remove_blacklist_origin(&self, origin: [u8; 20]) -> Result<(), StoreError>;
+
+    /// Every hash this node refuses under a *governance* blacklist entry, for
+    /// rebuilding the in-memory governance deny-set on boot (ADR 011
+    /// §`StreamRequest` Response).
+    ///
+    /// Distinct from [`Self::load_blacklist_entries`], which is the watcher's
+    /// re-scoping worklist and is emptied for a hash the moment that hash is
+    /// locally evicted. This projection is the opposite: it is written *at*
+    /// eviction and retained, because it answers a question that outlives the
+    /// worklist — "is this hash refused because governance said so, or because
+    /// this operator evicted it?" — which selects the wire refusal code. Without
+    /// it, a restart re-reads only `evicted.log`, which records the eviction but
+    /// not its cause, and every governance takedown silently reverts to
+    /// `EvictedSinceProbe` while local denylist entries keep answering
+    /// `HashBlacklisted`. That is the exact fingerprint ADR 011 forecloses: a
+    /// client able to tell the two apart can map an operator's private legal
+    /// exposure by probing.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`StoreError`] if the backing store is unreadable.
+    /// `None` means never initialised, and carries the same
+    /// replay-from-the-deploy-block obligation as
+    /// [`Self::load_blacklist_origins`] — see that method for why absent and
+    /// empty must not be conflated.
+    fn load_blacklist_denied_hashes(&self) -> Result<Option<Vec<[u8; 32]>>, StoreError>;
+
+    /// Record one governance-denied hash. Idempotent.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`StoreError`] if the durable write fails. The caller MUST NOT
+    /// advance its scan cursor past the log that produced this entry.
+    fn insert_blacklist_denied_hash(&self, hash: [u8; 32]) -> Result<(), StoreError>;
+
+    /// Drop one governance-denied hash — the hash is no longer blacklisted for
+    /// this operator under any region. Idempotent.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`StoreError`] if the durable write fails.
+    fn remove_blacklist_denied_hash(&self, hash: [u8; 32]) -> Result<(), StoreError>;
 }
 
 /// Failure modes shared by every [`ChannelStateStore`] implementation.

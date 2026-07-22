@@ -596,7 +596,7 @@ The publish-first ordering is critical: continuing to publish DHT records and pr
 
 When a node receives a blacklisted origin address, it additionally stops accepting any `StreamRequest` that presents a channel funded by that operator address, and removes all of that origin's NodeIds from its local peer table.
 
-In-flight streams for a blacklisted hash are terminated at the next MB boundary. The client receives a `HashBlacklisted` error and can request a refund of the unused channel balance.
+In-flight streams for a blacklisted hash — or on a channel funded by a newly blacklisted origin — are terminated at the next MB boundary, after the voucher for the bytes already delivered is collected. Termination is a stream reset with no `StreamEnd` sentinel, not an error frame: [ADR 005 § Stream errors](005-protocol.md#adr-005-wire-protocol) makes `VoucherRejected` the only `StreamError` that travels mid-stream, and the QUIC code is `NO_ERROR` so the client does not score the node as faulty for discharging a takedown ([ADR 013 § Application Error Codes](013-wire-format.md#application-error-codes)). A client that re-requests the hash gets the signed `HashBlacklisted` refusal from the open-time gate, and can request a refund of the unused channel balance.
 
 ### Regional Scope
 
@@ -640,7 +640,7 @@ enum StreamError {
 }
 ```
 
-The response does not distinguish between governance and local denylist sources — a client able to tell them apart could map an operator's private legal exposure by probing. The distinction survives only in the operator's own metrics (`decdn_serve_stream_rejected_hash_denied_total` for the local list, `…_evicted_since_probe_total` for a governance entry the blacklist watcher evicted), which no client can read.
+The response does not distinguish between governance and local denylist sources — a client able to tell them apart could map an operator's private legal exposure by probing. Both answer `HashBlacklisted`, which requires the governance half to be gated on its own deny-set rather than falling through to the eviction arm: a hash refused as `EvictedSinceProbe` while no on-chain entry explains it is a hash the operator denied privately, so leaving governance on the eviction code would have made the *local* code the fingerprint. `EvictedSinceProbe` therefore now means an eviction with no blacklist entry behind it (corruption recovery, a manual `decdn node evict`). The governance/local distinction survives only in the operator's own metrics (`decdn_serve_stream_rejected_hash_denied_total` for the local list, `…_chain_hash_denied_total` for a governance entry), which no client can read.
 
 Clients should retry on a different node for `HashBlacklisted`: a local entry binds only that node. `OriginBlacklisted` is not worth retrying anywhere — it is a statement about the requester's own funding address, so every node refuses identically until governance lifts the entry. `UnauthorizedOrigin` is distinct: the node is reachable and may have the blob, but cannot act as the canonical origin. Requesters that strictly require an origin source (rather than a cache copy) should retry against the namespace's authorized operator set (`OriginAssignment.getOrigins(namespaceId)`); requesters that accept cache delivery should retry the same node with the origin-only flag cleared.
 

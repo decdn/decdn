@@ -59,14 +59,25 @@
 //! (`check_rpc_reachability`) remains the backstop for a persistently throttled
 //! endpoint.
 //!
-//! Eviction is the single lever, and it cascades to every serving surface:
+//! Enforcement is two writes per hash, in this order: the *deny* records that
+//! the refusal is governance-sourced, then the *eviction* reclaims the bytes.
+//!
 //! [`decdn_cache::CacheEngine::evict`] durably records the takedown (survives
-//! restart via `evicted.log`), the DHT republisher drops the hash on its next
-//! tick (its `is_evicted` gate), the probe handler stops signing
-//! `has_blob: true` once the blob leaves the store, and the client handler
-//! refuses delivery with `EvictedSinceProbe` while never re-pull-filling it.
-//! `evict` is sticky and works on absent hashes, so a hash blacklisted while the
-//! node was offline (and not yet held) is still pre-blocked.
+//! restart via `evicted.log`) and cascades to every serving surface through
+//! [`decdn_cache::CacheEngine::refuses`]: the DHT republisher drops the hash on
+//! its next tick, the probe handler stops signing `has_blob: true`, and the
+//! client handler never re-pull-fills it. `evict` is sticky and works on absent
+//! hashes, so a hash blacklisted while the node was offline (and not yet held)
+//! is still pre-blocked.
+//!
+//! The deny is what `evicted.log` cannot express: *why*. Without it the client
+//! handler answers a governance takedown with `EvictedSinceProbe` and a local
+//! `[content] denied_hashes` entry with `HashBlacklisted`, so one request tells a
+//! client which list a hash is on — the probe ADR 011 §`StreamRequest` Response
+//! forecloses, since only the local list is private. Both now answer
+//! `HashBlacklisted`. It has its own durable projection because neither of the
+//! other two records survives a restart usefully: `evicted.log` carries no cause,
+//! and `known` drops a hash the moment it is evicted.
 //!
 //! **Origin blacklisting (ADR 011 § Hash Evasion and Origin Blacklisting).**
 //! `OriginBlacklistUpdated` rides the same scan and feeds
@@ -219,6 +230,57 @@ impl<P: Provider + Clone> WatcherState<P> {
             .context("delete blacklist deny-set entry")?;
         self.known.remove(&(region, hash));
         Ok(())
+    }
+
+    /// Record that `hash` is refused because *governance* blacklisted it, and
+    /// publish that to the live deny-set the delivery path reads.
+    ///
+    /// Durable first, exactly as [`Self::add_entry`] — and for a sharper reason
+    /// than the worklist has. This projection is what a restart reloads to know
+    /// a refusal is governance-sourced; `evicted.log` records the eviction but
+    /// not its cause, and [`Self::known`] is emptied for the hash the moment it
+    /// is evicted. Lose this write and the takedown silently starts answering
+    /// `EvictedSinceProbe` after the next restart while local denylist entries
+    /// keep answering `HashBlacklisted`, which is the fingerprint ADR 011
+    /// §`StreamRequest` Response forecloses.
+    ///
+    /// An `Err` does not abort the tick: [`Self::add_entry`] has already durably
+    /// recorded the entry in `known`, so the next re-scope retries this. That
+    /// only holds because the caller refuses to evict past a failed deny — see
+    /// `recheck`.
+    fn deny_hash(&self, cache: &CacheEngine, hash: Hash) -> Result<()> {
+        self.store
+            .insert_blacklist_denied_hash(*hash.as_bytes())
+            .context("persist governance-denied hash")?;
+        cache.set_chain_denied_one(hash, true);
+        Ok(())
+    }
+
+    /// Stop treating `hash` as governance-denied: governance removed the last
+    /// entry that covered this operator.
+    ///
+    /// The hash stays *refused* — eviction is sticky and one-way — so this only
+    /// moves its wire code from `HashBlacklisted` back to `EvictedSinceProbe`,
+    /// which is what any other evicted hash answers. It leaks nothing: a hash no
+    /// longer on the public blacklist is indistinguishable from one this
+    /// operator evicted for corruption, which is the point.
+    ///
+    /// Durable first, like every write here. Unlike [`Self::deny_hash`] a
+    /// failure is not tick-aborting: over-denying costs nothing but a wire code
+    /// on a hash that is refused either way, so the row is left standing and
+    /// retried by the next removal that arrives.
+    fn undeny_hash(&self, cache: &CacheEngine, hash: Hash) {
+        if let Err(err) = self.store.remove_blacklist_denied_hash(*hash.as_bytes()) {
+            warn!(
+                err = %sanitize_err_chain(&err.into()),
+                %hash,
+                "blacklist watcher: could not drop a de-listed hash from the durable \
+                 governance deny-set; it stays refused, so this is a stale refusal code, \
+                 not an enforcement gap"
+            );
+            return;
+        }
+        cache.set_chain_denied_one(hash, false);
     }
 
     /// Drop every entry for `hash` (once locally evicted, the sticky eviction
@@ -412,6 +474,9 @@ impl<P: Provider + Clone> LogSink for BlacklistSink<P> {
 struct RestoredProjection {
     known: HashSet<(B256, Hash)>,
     origins: Vec<[u8; 20]>,
+    /// Hashes refused under a governance entry, restored so their wire refusal
+    /// code survives the restart (ADR 011 §`StreamRequest` Response).
+    denied_hashes: Vec<[u8; 32]>,
     /// `true` ⇒ ignore the cursor and rescan from the deploy block. Set whenever
     /// a projection is unreadable OR was never built, because resuming on a
     /// projection that does not reflect everything below the cursor is a silent
@@ -419,7 +484,48 @@ struct RestoredProjection {
     replay_floor: bool,
 }
 
-/// Reload both durable projections, deciding whether the persisted cursor is
+/// Unwrap one membership projection, translating its two bad cases into the
+/// replay obligation they carry.
+///
+/// Both cases set `replay_floor`, for the same reason and with the same
+/// consequence if they did not. These projections are NEWER than the persisted
+/// scan cursor, so a never-built (`None`) or unreadable one cannot be resumed
+/// past: the cursor would start beyond every event that would have populated it,
+/// the events carry no version to reveal the gap, and nothing enumerates the set
+/// on-chain to sweep against. The gate would come up empty, permanently, with no
+/// way to notice. `Some(vec![])` is the opposite and must NOT replay — it means
+/// the projection is built and genuinely empty, and treating that as a gap would
+/// rescan the whole chain on every boot.
+fn restore_membership<T>(
+    loaded: Result<Option<Vec<T>>, decdn_incentive::store::StoreError>,
+    label: &str,
+    replay_floor: &mut bool,
+) -> Vec<T> {
+    match loaded {
+        Ok(Some(rows)) => rows,
+        Ok(None) => {
+            warn!(
+                projection = label,
+                "blacklist watcher: projection has never been built (new projection on an \
+                 existing scan cursor); replaying from the deploy block to populate it"
+            );
+            *replay_floor = true;
+            Vec::new()
+        }
+        Err(err) => {
+            warn!(
+                projection = label,
+                err = %sanitize_err_chain(&err.into()),
+                "blacklist watcher: durable projection unreadable; replaying from the deploy \
+                 block rather than resuming on a partial set"
+            );
+            *replay_floor = true;
+            Vec::new()
+        }
+    }
+}
+
+/// Reload every durable projection, deciding whether the persisted cursor is
 /// still safe to resume from.
 fn restore_projection(entry_store: &dyn BlacklistEntryStore) -> RestoredProjection {
     // A read failure is not fatal: an empty set plus the resumed cursor would
@@ -437,31 +543,16 @@ fn restore_projection(entry_store: &dyn BlacklistEntryStore) -> RestoredProjecti
         }
     };
 
-    let origins = match entry_store.load_blacklist_origins() {
-        Ok(Some(rows)) => rows,
-        // Never initialised — the first boot on a build that tracks origins.
-        // The blacklist cursor is OLDER than this projection, so resuming from
-        // it would skip every origin event ever emitted and leave the gate
-        // permanently empty with no way to notice: the events carry no version
-        // and nothing enumerates the set on-chain. Replay from the floor.
-        Ok(None) => {
-            warn!(
-                "blacklist watcher: origin deny-set has never been built (new projection on an \
-                 existing scan cursor); replaying from the deploy block to populate it"
-            );
-            replay_floor = true;
-            Vec::new()
-        }
-        Err(err) => {
-            warn!(
-                err = %sanitize_err_chain(&err.into()),
-                "blacklist watcher: durable origin deny-set unreadable; replaying from the \
-                 deploy block rather than resuming on a partial set"
-            );
-            replay_floor = true;
-            Vec::new()
-        }
-    };
+    let origins = restore_membership(
+        entry_store.load_blacklist_origins(),
+        "origin deny-set",
+        &mut replay_floor,
+    );
+    let denied_hashes = restore_membership(
+        entry_store.load_blacklist_denied_hashes(),
+        "governance hash deny-set",
+        &mut replay_floor,
+    );
 
     RestoredProjection {
         known: entries
@@ -469,6 +560,7 @@ fn restore_projection(entry_store: &dyn BlacklistEntryStore) -> RestoredProjecti
             .map(|(region, hash)| (B256::from(region), Hash::from_bytes(hash)))
             .collect(),
         origins,
+        denied_hashes,
         replay_floor,
     }
 }
@@ -545,16 +637,25 @@ where
     let RestoredProjection {
         known,
         origins: restored_origins,
+        denied_hashes: restored_denied_hashes,
         replay_floor,
     } = restore_projection(entry_store.as_ref());
     let restored_origin_count = restored_origins.len();
+    let restored_denied_count = restored_denied_hashes.len();
     denylist.set_chain_origins(restored_origins.into_iter().map(Address::from).collect());
+    cache.set_chain_denied(
+        restored_denied_hashes
+            .into_iter()
+            .map(Hash::from_bytes)
+            .collect(),
+    );
     info!(
         %contract_addr,
         %operator,
         from_block,
         restored_entries = known.len(),
         restored_origins = restored_origin_count,
+        restored_denied_hashes = restored_denied_count,
         replay_floor,
         "blacklist compliance watcher starting"
     );
@@ -737,7 +838,7 @@ where
         .await?
             == Recheck::Failed),
         Some(topic) if *topic == HashRemoved::SIGNATURE_HASH => {
-            on_removed_log(state, &log)?;
+            on_removed_log(contract, operator, cache, state, &log).await?;
             Ok(false)
         }
         Some(topic) if *topic == HashSuspensionUpdated::SIGNATURE_HASH => {
@@ -873,11 +974,30 @@ where
 }
 
 /// Decode a `HashRemoved` log and drop exactly that `(region, hash)` entry.
-fn on_removed_log<P: Provider + Clone>(state: &mut WatcherState<P>, log: &Log) -> Result<()> {
+///
+/// Also retires the hash from the governance deny-set, but only on a definitive
+/// out-of-scope read: `HashRemoved` is per-region, and a same-hash entry under
+/// another region can still cover this operator. `isHashBlacklistedForOperator`
+/// is the authoritative union, so it — not the event — decides. An RPC failure
+/// keeps the hash denied, which is the conservative direction: the hash stays
+/// evicted regardless, so the cost is a stale refusal *code*, not a stale
+/// refusal.
+async fn on_removed_log<P: Provider + Clone>(
+    contract: &ContentBlacklist::ContentBlacklistInstance<P>,
+    operator: Address,
+    cache: &CacheEngine,
+    state: &mut WatcherState<P>,
+    log: &Log,
+) -> Result<()> {
     match HashRemoved::decode_log_data(&log.inner.data) {
         Ok(event) => {
             let hash = Hash::from_bytes(event.hash.0);
             state.remove_entry(event.region, hash)?;
+            if cache.is_chain_denied(hash)
+                && scope_check(contract, operator, hash).await == Some(false)
+            {
+                state.undeny_hash(cache, hash);
+            }
             debug!(
                 region = %event.region,
                 %hash,
@@ -972,11 +1092,49 @@ where
     P: Provider + Clone,
 {
     if cache.is_evicted(hash) {
+        // Back-fill the governance deny-set for a hash that is already evicted
+        // but not yet recorded as governance-denied. This is the upgrade path:
+        // `evicted.log` predates the deny projection and records no cause, so
+        // takedowns discharged by an older build would otherwise keep answering
+        // `EvictedSinceProbe` forever. Costs one scope read per already-evicted
+        // entry on the replay that rebuilds the projection, and nothing after —
+        // steady state drops evicted hashes from `known`, and a re-denied hash
+        // short-circuits on `is_chain_denied`.
+        if !cache.is_chain_denied(hash)
+            && scope_check(contract, operator, hash).await == Some(true)
+            && let Err(err) = state.deny_hash(cache, hash)
+        {
+            warn!(
+                %hash,
+                err = %sanitize_err_chain(&err),
+                "blacklist watcher: could not back-fill a governance-denied hash; \
+                 retrying on the next pass"
+            );
+            return Recheck::Failed;
+        }
         state.drop_hash(hash);
         return Recheck::NoAction;
     }
     match scope_check(contract, operator, hash).await {
         Some(true) => {
+            // Deny before evicting, and do NOT evict if the deny failed.
+            // Eviction is what retires the hash from `known` (via `drop_hash`),
+            // and `known` is the retry backstop: evicting past a failed deny
+            // would drop the only worklist entry that would have retried it,
+            // leaving the hash permanently refused under the wrong wire code.
+            // Failing here is therefore safe but must be terminal for this pass.
+            // Denying first also means an eviction that fails on a disk error
+            // still stops the serving, since `CacheEngine::refuses` honors this
+            // set too.
+            if let Err(err) = state.deny_hash(cache, hash) {
+                warn!(
+                    %hash,
+                    err = %sanitize_err_chain(&err),
+                    "blacklist watcher: could not persist a governance-denied hash; \
+                     retrying on the next pass"
+                );
+                return Recheck::Failed;
+            }
             if evict(cache, hash).await {
                 state.drop_hash(hash);
                 Recheck::Evicted
@@ -1061,19 +1219,20 @@ mod tests {
     struct MemEntryStore {
         rows: Mutex<HashSet<([u8; 32], [u8; 32])>>,
         origins: Mutex<HashSet<[u8; 20]>>,
+        denied_hashes: Mutex<HashSet<[u8; 32]>>,
         fail_writes: bool,
         /// Models the redb table not existing yet — the first boot after
         /// upgrading to a build that tracks origins.
         origins_uninitialised: bool,
+        /// Same, for the governance hash deny-set projection.
+        denied_hashes_uninitialised: bool,
     }
 
     impl MemEntryStore {
         fn failing() -> Self {
             Self {
-                rows: Mutex::new(HashSet::new()),
-                origins: Mutex::new(HashSet::new()),
                 fail_writes: true,
-                origins_uninitialised: false,
+                ..Self::default()
             }
         }
 
@@ -1083,6 +1242,20 @@ mod tests {
                 origins_uninitialised: true,
                 ..Self::default()
             }
+        }
+
+        /// A store whose governance hash deny-set has never been built.
+        fn uninitialised_denied_hashes() -> Self {
+            Self {
+                denied_hashes_uninitialised: true,
+                ..Self::default()
+            }
+        }
+
+        fn denied_hash_guard(&self) -> std::sync::MutexGuard<'_, HashSet<[u8; 32]>> {
+            self.denied_hashes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
         }
 
         fn origin_guard(&self) -> std::sync::MutexGuard<'_, HashSet<[u8; 20]>> {
@@ -1167,6 +1340,33 @@ mod tests {
         ) -> Result<(), decdn_incentive::store::StoreError> {
             self.deny()?;
             self.origin_guard().remove(&origin);
+            Ok(())
+        }
+
+        fn load_blacklist_denied_hashes(
+            &self,
+        ) -> Result<Option<Vec<[u8; 32]>>, decdn_incentive::store::StoreError> {
+            if self.denied_hashes_uninitialised {
+                return Ok(None);
+            }
+            Ok(Some(self.denied_hash_guard().iter().copied().collect()))
+        }
+
+        fn insert_blacklist_denied_hash(
+            &self,
+            hash: [u8; 32],
+        ) -> Result<(), decdn_incentive::store::StoreError> {
+            self.deny()?;
+            self.denied_hash_guard().insert(hash);
+            Ok(())
+        }
+
+        fn remove_blacklist_denied_hash(
+            &self,
+            hash: [u8; 32],
+        ) -> Result<(), decdn_incentive::store::StoreError> {
+            self.deny()?;
+            self.denied_hash_guard().remove(&hash);
             Ok(())
         }
     }
@@ -1469,6 +1669,291 @@ mod tests {
         })
     }
 
+    /// [`failing_sink`]'s counterpart: a sink whose `isHashBlacklistedForOperator`
+    /// calls answer `scope_results` in order, so a test can drive the *enforcing*
+    /// path rather than the failure path. `store` is the caller's so it can
+    /// assert on the durable projection.
+    async fn enforcing_sink(
+        scope_results: &[bool],
+        store: Arc<dyn BlacklistEntryStore>,
+        metrics: &Arc<Metrics>,
+    ) -> Result<BlacklistSink<alloy::providers::DynProvider>> {
+        let asserter = alloy::providers::mock::Asserter::new();
+        for in_scope in scope_results {
+            asserter.push_success(&abi_bool(*in_scope));
+        }
+        let provider = alloy::providers::ProviderBuilder::new().connect_mocked_client(asserter);
+        let tmp = tempfile::tempdir()?;
+        let cache = CacheEngine::open(tmp.path(), Vec::new(), 1).await?;
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let initial_sync = InitialSyncGate::new(tx);
+        initial_sync.signal(Ok(()));
+        Ok(BlacklistSink {
+            contract: ContentBlacklist::new(Address::repeat_byte(0x11), provider.erased()),
+            operator: Address::repeat_byte(0x22),
+            cache,
+            state: state_with(store),
+            shutdown: CancellationToken::new(),
+            rescan_interval: Duration::from_secs(1),
+            last_rescan: None,
+            initial_sync,
+            metrics: Arc::clone(metrics),
+        })
+    }
+
+    /// One ABI-encoded `bool` return word, as an `eth_call` result.
+    fn abi_bool(value: bool) -> alloy::primitives::Bytes {
+        let mut word = [0u8; 32];
+        if value && let Some(last) = word.last_mut() {
+            *last = 1;
+        }
+        alloy::primitives::Bytes::from(word.to_vec())
+    }
+
+    // ----- governance hash deny-set (ADR 011 §StreamRequest Response) -----
+
+    /// Enforcement is TWO writes, and the deny is the one that is easy to forget
+    /// because eviction alone already stops the serving. Without it the client
+    /// handler answers a governance takedown with `EvictedSinceProbe` while a
+    /// local `[content] denied_hashes` entry answers `HashBlacklisted`, so one
+    /// request tells a client which list a hash is on — and since the governance
+    /// list is public on-chain, that identifies the operator's PRIVATE entries by
+    /// elimination.
+    #[tokio::test]
+    async fn enforcement_denies_and_evicts_and_persists() -> Result<()> {
+        let metrics = Arc::new(Metrics::new());
+        let store = Arc::new(MemEntryStore::default());
+        let mut sink = enforcing_sink(&[true], Arc::clone(&store) as _, &metrics).await?;
+        let hash = Hash::from_bytes([0x51; 32]);
+        sink.state.add_entry(US, hash)?;
+
+        let outcome = recheck(
+            &sink.contract,
+            sink.operator,
+            &sink.cache,
+            &mut sink.state,
+            hash,
+        )
+        .await;
+
+        assert!(outcome == Recheck::Evicted);
+        assert!(
+            sink.cache.is_chain_denied(hash),
+            "the live deny-set the delivery path reads must carry the reason"
+        );
+        assert!(
+            sink.cache.is_evicted(hash),
+            "and the bytes still get reclaimed"
+        );
+        assert_eq!(
+            store.load_blacklist_denied_hashes()?,
+            Some(vec![*hash.as_bytes()]),
+            "and the durable projection a restart rebuilds the reason from"
+        );
+        Ok(())
+    }
+
+    /// A failed deny must NOT be followed by the eviction. Eviction is what
+    /// retires the hash from `known` (`drop_hash`), and `known` is the retry
+    /// backstop — evicting past a failed deny would drop the only worklist entry
+    /// that would have retried it, stranding the hash under the wrong wire code
+    /// permanently.
+    #[tokio::test]
+    async fn a_failed_deny_leaves_the_hash_retryable() -> Result<()> {
+        let metrics = Arc::new(Metrics::new());
+        let store = Arc::new(MemEntryStore::failing());
+        let mut sink = enforcing_sink(&[true], Arc::clone(&store) as _, &metrics).await?;
+        let hash = Hash::from_bytes([0x52; 32]);
+        // Inserted directly: `add_entry` would hit the same injected failure.
+        sink.state.known.insert((US, hash));
+
+        let outcome = recheck(
+            &sink.contract,
+            sink.operator,
+            &sink.cache,
+            &mut sink.state,
+            hash,
+        )
+        .await;
+
+        assert!(outcome == Recheck::Failed);
+        assert!(
+            !sink.cache.is_evicted(hash),
+            "evicting past a failed deny would drop the retry"
+        );
+        assert!(
+            sink.state.known.contains(&(US, hash)),
+            "the entry stays on the worklist for the next re-scope"
+        );
+        Ok(())
+    }
+
+    /// The upgrade path. `evicted.log` predates this projection and records that
+    /// a hash was evicted, never *why*, so takedowns discharged by an older build
+    /// would answer `EvictedSinceProbe` forever. The replay that rebuilds the
+    /// projection has to back-fill them.
+    #[tokio::test]
+    async fn an_already_evicted_hash_is_back_filled_into_the_deny_set() -> Result<()> {
+        let metrics = Arc::new(Metrics::new());
+        let store = Arc::new(MemEntryStore::default());
+        let mut sink = enforcing_sink(&[true], Arc::clone(&store) as _, &metrics).await?;
+        let hash = Hash::from_bytes([0x53; 32]);
+        sink.cache.evict(hash).await?;
+        sink.state.add_entry(US, hash)?;
+
+        let outcome = recheck(
+            &sink.contract,
+            sink.operator,
+            &sink.cache,
+            &mut sink.state,
+            hash,
+        )
+        .await;
+
+        assert!(
+            outcome == Recheck::NoAction,
+            "already evicted, nothing to evict"
+        );
+        assert!(
+            sink.cache.is_chain_denied(hash),
+            "but the reason must still be recorded, or the wire code stays wrong"
+        );
+        Ok(())
+    }
+
+    /// ...and it costs nothing once recorded: a second pass must not re-spend a
+    /// scope read on a hash already known to be governance-denied. (The sink is
+    /// built with ONE queued response, so a second `eth_call` would error and the
+    /// outcome would be `Failed`.)
+    #[tokio::test]
+    async fn back_fill_does_not_repeat_once_recorded() -> Result<()> {
+        let metrics = Arc::new(Metrics::new());
+        let store = Arc::new(MemEntryStore::default());
+        let mut sink = enforcing_sink(&[true], Arc::clone(&store) as _, &metrics).await?;
+        let hash = Hash::from_bytes([0x54; 32]);
+        sink.cache.evict(hash).await?;
+
+        for _ in 0..2 {
+            sink.state.add_entry(US, hash)?;
+            let outcome = recheck(
+                &sink.contract,
+                sink.operator,
+                &sink.cache,
+                &mut sink.state,
+                hash,
+            )
+            .await;
+            assert!(outcome == Recheck::NoAction);
+        }
+        Ok(())
+    }
+
+    /// A `HashRemoved` lifts the governance deny — but only on a definitive
+    /// out-of-scope read, since the event is per-region and a same-hash entry
+    /// under another region can still cover this operator. The hash stays
+    /// evicted either way; only the refusal *code* moves.
+    #[tokio::test]
+    async fn hash_removal_lifts_the_deny_when_out_of_scope() -> Result<()> {
+        let metrics = Arc::new(Metrics::new());
+        let store = Arc::new(MemEntryStore::default());
+        // Two scope reads: one to enforce, one on the removal.
+        let mut sink = enforcing_sink(&[true, false], Arc::clone(&store) as _, &metrics).await?;
+        let hash = Hash::from_bytes([0x55; 32]);
+        sink.state.add_entry(US, hash)?;
+        let _ = recheck(
+            &sink.contract,
+            sink.operator,
+            &sink.cache,
+            &mut sink.state,
+            hash,
+        )
+        .await;
+        assert!(
+            sink.cache.is_chain_denied(hash),
+            "denied before the removal"
+        );
+
+        on_removed_log(
+            &sink.contract,
+            sink.operator,
+            &sink.cache,
+            &mut sink.state,
+            &removed_log(US, *hash.as_bytes()),
+        )
+        .await?;
+
+        assert!(
+            !sink.cache.is_chain_denied(hash),
+            "de-listed hashes stop being blacklist-coded"
+        );
+        assert_eq!(store.load_blacklist_denied_hashes()?, Some(Vec::new()));
+        assert!(
+            sink.cache.is_evicted(hash),
+            "...but the eviction is sticky and one-way"
+        );
+        Ok(())
+    }
+
+    /// ...whereas a hash still in scope under another region keeps its deny. The
+    /// conservative direction: over-denying costs a wire code on a hash that is
+    /// refused regardless, under-denying re-opens the fingerprint.
+    #[tokio::test]
+    async fn hash_removal_keeps_the_deny_when_still_in_scope() -> Result<()> {
+        let metrics = Arc::new(Metrics::new());
+        let store = Arc::new(MemEntryStore::default());
+        let mut sink = enforcing_sink(&[true, true], Arc::clone(&store) as _, &metrics).await?;
+        let hash = Hash::from_bytes([0x56; 32]);
+        sink.state.add_entry(US, hash)?;
+        let _ = recheck(
+            &sink.contract,
+            sink.operator,
+            &sink.cache,
+            &mut sink.state,
+            hash,
+        )
+        .await;
+
+        on_removed_log(
+            &sink.contract,
+            sink.operator,
+            &sink.cache,
+            &mut sink.state,
+            &removed_log(FR, *hash.as_bytes()),
+        )
+        .await?;
+
+        assert!(sink.cache.is_chain_denied(hash));
+        Ok(())
+    }
+
+    /// The restart property. The projection is the only record of *why* a hash
+    /// is refused that survives a process restart, so a reboot must come up with
+    /// the same wire code it went down with.
+    #[test]
+    fn restored_denied_hashes_survive_a_restart() -> Result<()> {
+        let store = MemEntryStore::default();
+        let hash = [0x57u8; 32];
+        store.insert_blacklist_denied_hash(hash)?;
+
+        let restored = restore_projection(&store as &dyn BlacklistEntryStore);
+        assert_eq!(restored.denied_hashes, vec![hash]);
+        assert!(!restored.replay_floor);
+        Ok(())
+    }
+
+    /// Same absent-vs-empty trap as the origin projection: this table is newer
+    /// than the scan cursor, so resuming on an absent one would leave every
+    /// pre-existing takedown answering the distinguishing code forever.
+    #[test]
+    fn absent_denied_hash_projection_forces_a_replay() {
+        let store = MemEntryStore::uninitialised_denied_hashes();
+        let restored = restore_projection(&store as &dyn BlacklistEntryStore);
+        assert!(
+            restored.replay_floor,
+            "a never-built governance deny-set must replay from the deploy block"
+        );
+    }
+
     /// #1319: after the initial-sync gate has fired, a re-scope that cannot
     /// enforce every entry must NOT bail (so the loop reads healthy), but MUST
     /// bump `blacklist_enforcement_failures_total` — the slashable exposure gets
@@ -1540,6 +2025,21 @@ mod tests {
             hash: B256::from(hash_bytes),
             version: alloy::primitives::U256::from(version),
             reason: String::new(),
+        };
+        Log {
+            inner: alloy::primitives::Log {
+                address: Address::repeat_byte(0x11),
+                data: event.encode_log_data(),
+            },
+            ..Default::default()
+        }
+    }
+
+    fn removed_log(region: B256, hash_bytes: [u8; 32]) -> Log {
+        let event = HashRemoved {
+            region,
+            hash: B256::from(hash_bytes),
+            version: alloy::primitives::U256::from(1u64),
         };
         Log {
             inner: alloy::primitives::Log {

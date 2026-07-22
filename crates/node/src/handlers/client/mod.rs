@@ -493,6 +493,11 @@ enum ServeRejectReason {
     RangeNotSatisfiable,
     /// The blob is on this operator's local denylist (ADR 011 §Local Denylist).
     HashDenied,
+    /// The blob is on the governance blacklist (ADR 011 §On Blacklist Event).
+    /// Separate from [`Self::HashDenied`] for the operator's metrics ONLY — the
+    /// two are deliberately one and the same on the wire, see
+    /// [`Self::wire_error`].
+    ChainHashDenied,
     /// The channel's funding address is on the origin blacklist — the operator's
     /// local `denied_origins` or the on-chain one (ADR 011 §On Blacklist Event).
     OriginDenied,
@@ -549,10 +554,14 @@ impl ServeRejectReason {
             // They are still each other's privacy floor. `HashBlacklisted` does
             // not say whether the entry is governance or local — that is the ADR's
             // explicit requirement, since a client able to tell them apart could
-            // map an operator's private legal exposure by probing. And neither
-            // says anything about a channel's balance, which is what the
-            // `NotFound` collapse above exists to protect.
-            Self::HashDenied => StreamError::HashBlacklisted,
+            // map an operator's private legal exposure by probing. It is why the
+            // two reasons below converge here and why the governance one is NOT
+            // allowed to fall through to `EvictedSinceProbe`: a hash refused
+            // under a code no on-chain entry explains is a hash this operator
+            // denied privately, which is that map. And neither says anything
+            // about a channel's balance, which is what the `NotFound` collapse
+            // above exists to protect.
+            Self::HashDenied | Self::ChainHashDenied => StreamError::HashBlacklisted,
             Self::OriginDenied => StreamError::OriginBlacklisted,
         }
     }
@@ -1038,6 +1047,52 @@ impl ClientHandler {
         tokio::task::spawn_blocking(move || store.forget(channel_id))
             .await
             .map_err(|e| StoreError::Backend(format!("forget_channel join: {e}")))?
+    }
+
+    /// Has a takedown landed on this stream since it opened (ADR 011 §On
+    /// Blacklist Event: "In-flight streams for a blacklisted hash are terminated
+    /// at the next MB boundary")?
+    ///
+    /// The open-time gates in `dispatch.rs` are not enough on their own: a
+    /// multi-GB blob can still be streaming minutes after a one-hour removal
+    /// order took effect, and serving past the compliance window is slashable
+    /// (ADR 026 §Slashing and burn). Both halves are re-checked because both can
+    /// land mid-stream — a hash via the local denylist reload, the governance
+    /// blacklist, or an eviction; a funder via either origin list.
+    ///
+    /// Cheap enough for a per-MB call: three atomic loads and a hash-set probe
+    /// each, against a boundary that already takes a channel lock and a network
+    /// round trip to collect a voucher.
+    pub(super) fn takedown_landed(&self, hash: Hash, funder: Option<Address>) -> bool {
+        self.cache.refuses(hash)
+            || funder.is_some_and(|addr| self.content_deny.is_origin_denied(&addr))
+    }
+
+    /// Cut off an in-flight delivery whose hash or funder was taken down
+    /// mid-stream, by resetting both directions.
+    ///
+    /// A reset, not a `StreamError` frame: ADR 005's stream-error domain split
+    /// makes `VoucherRejected` the only code that travels mid-stream, and the
+    /// client's cue here is the absence of the `StreamEnd` sentinel — the same
+    /// convention every other mid-stream fault uses. The QUIC code is
+    /// [`APP_ERR_NO_ERROR`] because this is a compliance action, not a protocol
+    /// fault by either party, and ADR 013 §Application Error Codes reserves
+    /// `0x03` for peers that misbehaved; coding it as a fault would have the
+    /// client penalise this node's reputation for discharging a takedown. A
+    /// client that re-requests the hash gets the signed `HashBlacklisted`
+    /// refusal from the open-time gate, which is where the reason belongs.
+    pub(super) fn terminate_for_takedown(
+        &self,
+        send: &mut SendStream,
+        recv: &mut RecvStream,
+        hash: Hash,
+    ) {
+        self.metrics.serve_stream_terminated_takedown();
+        tracing::warn!(
+            %hash,
+            "terminating an in-flight delivery: a takedown landed after the stream opened"
+        );
+        reset_stream(send, recv, APP_ERR_NO_ERROR);
     }
 
     /// Raise a tracked channel's on-chain deposit after a `ChannelToppedUp`
@@ -1706,15 +1761,35 @@ mod tests {
         }
     }
 
-    /// A local denylist hit and a governance eviction must be indistinguishable
-    /// at the *reason* level too — they differ (`HashDenied` vs
-    /// `EvictedSinceProbe`) only so the operator's own metrics can tell them
-    /// apart, which a client cannot read.
+    /// The privacy invariant ADR 011 §`StreamRequest` Response actually asks
+    /// for: a governance takedown and this operator's own denylist entry are one
+    /// wire code. They stay distinct *reasons* only so the operator's own
+    /// metrics can tell them apart, which no client can read.
+    ///
+    /// The failure this pins is not hypothetical — it shipped. Governance
+    /// entries used to reach the serve path only as cache evictions and answered
+    /// `EvictedSinceProbe`, which made `HashBlacklisted` a unique fingerprint for
+    /// "this operator privately denied it": exactly the map of an operator's
+    /// legal exposure the ADR forecloses.
     #[test]
-    fn local_denylist_and_eviction_are_distinct_reasons() {
-        assert_ne!(
+    fn local_and_governance_hash_denials_share_one_wire_code() {
+        assert_eq!(
             ServeRejectReason::HashDenied.wire_error(),
-            ServeRejectReason::EvictedSinceProbe.wire_error()
+            ServeRejectReason::ChainHashDenied.wire_error(),
+            "a client must not be able to tell a governance takedown from a local one"
+        );
+    }
+
+    /// ...while an eviction with no blacklist entry behind it (corruption
+    /// recovery, a manual `decdn node evict`) keeps its own code. Collapsing
+    /// that one too would cost the probe-then-gone race its distinct answer for
+    /// no privacy gain: nobody can infer a legal exposure from a hash this node
+    /// simply no longer holds.
+    #[test]
+    fn plain_eviction_keeps_its_own_wire_code() {
+        assert_ne!(
+            ServeRejectReason::EvictedSinceProbe.wire_error(),
+            ServeRejectReason::HashDenied.wire_error()
         );
     }
 

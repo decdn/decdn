@@ -57,6 +57,14 @@ impl ClientHandler {
         let interval_bytes = interval_mb.saturating_mul(MB_BYTES);
         let mut unvouchered: u64 = 0;
 
+        // Resolved once: a channel's funder is fixed for its lifetime, and the
+        // per-boundary takedown re-check below must not take the channel lock
+        // every MB just to re-read an immutable field.
+        let funder = match channel {
+            Some(chan) => Some(chan.lock().await.state.client),
+            None => None,
+        };
+
         // `slice::chunks` yields no items for an empty slice and never a zero-length
         // chunk, so `ChunkData::new` cannot reject one here — the empty blob goes
         // straight to `StreamEnd` (#1054). The `?` is the type carrying the invariant,
@@ -83,6 +91,15 @@ impl ClientHandler {
                 {
                     VoucherOutcome::Accepted => unvouchered = 0,
                     VoucherOutcome::Rejected => return Ok(()),
+                }
+                // ADR 011 §On Blacklist Event: in-flight streams for a
+                // blacklisted hash are terminated at the next MB boundary. The
+                // check sits AFTER the voucher so the bytes already on the wire
+                // are still paid for — the takedown stops further delivery, it
+                // does not retroactively make the last interval free.
+                if self.takedown_landed(hash, funder) {
+                    self.terminate_for_takedown(send, recv, hash);
+                    return Ok(());
                 }
             }
         }

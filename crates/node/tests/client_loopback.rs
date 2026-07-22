@@ -2768,6 +2768,157 @@ async fn denylisted_hash_is_refused_even_when_held() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// ADR 011 §`StreamRequest` Response: a GOVERNANCE takedown must answer the
+/// same wire code as the operator's own denylist entry above.
+///
+/// The failure this pins shipped once already. Governance entries reached the
+/// serve path only as cache evictions, so they answered `EvictedSinceProbe`
+/// while local entries answered `HashBlacklisted` — one request told a client
+/// which list a hash was on, and since the governance list is public on-chain,
+/// that made `HashBlacklisted` a unique fingerprint for "this operator denied it
+/// privately". Precisely the map of an operator's legal exposure the ADR
+/// forecloses.
+///
+/// The metric split is the part that MAY differ, and does: it is the operator's
+/// own gauge and no client can read it.
+#[tokio::test(flavor = "multi_thread")]
+async fn governance_denied_hash_is_refused_as_hash_blacklisted() -> anyhow::Result<()> {
+    let payload = b"content under a governance takedown".to_vec();
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+
+    // The watcher denies *and* evicts; deny only, so the test proves the deny
+    // gate is what produced the code rather than the eviction arm below it.
+    cache.set_chain_denied_one(hash, true);
+    anyhow::ensure!(!cache.is_denied(hash), "not on the LOCAL list");
+
+    let (store, signer, deposit) = seeded_store()?;
+    let (target, server_eth, server_ep, server_task, metrics) =
+        spawn_handler_server_with_metrics(cache, store, RATE_PER_MB, 0, 16).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let ctx = channel_context(signer, deposit);
+    let err = stream_fetch(
+        &client_ep,
+        target,
+        &ctx,
+        &slash_domain(),
+        server_eth.address(),
+        *hash.as_bytes(),
+        0,
+        0x00e4,
+        Duration::from_secs(10),
+    )
+    .await
+    .err()
+    .ok_or_else(|| anyhow::anyhow!("a governance-blacklisted blob must be refused"))?;
+    anyhow::ensure!(
+        err.to_string().contains("HashBlacklisted") || err.to_string().contains("refused"),
+        "a governance takedown must sign HashBlacklisted, NOT EvictedSinceProbe: {err}"
+    );
+    let encoded = metrics.encode()?;
+    anyhow::ensure!(
+        metric_line_present(
+            &encoded,
+            "decdn_serve_stream_rejected_chain_hash_denied_total 1"
+        ),
+        "the governance refusal has its own operator-side counter"
+    );
+    anyhow::ensure!(
+        metric_line_present(&encoded, "decdn_serve_stream_rejected_hash_denied_total 0"),
+        "...and must not be miscounted as a local denylist hit"
+    );
+    anyhow::ensure!(
+        metric_line_present(
+            &encoded,
+            "decdn_serve_stream_rejected_evicted_since_probe_total 0"
+        ),
+        "...nor land on the eviction counter, which is now non-takedown evictions only"
+    );
+
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
+/// ADR 011 §On Blacklist Event: "In-flight streams for a blacklisted hash are
+/// terminated at the next MB boundary."
+///
+/// The open-time gates cannot cover this: a takedown that lands *after* a stream
+/// opens would otherwise let a multi-GB blob run to completion minutes into a
+/// one-hour removal order, and serving past the compliance window is slashable
+/// (ADR 026 §Slashing and burn).
+///
+/// The takedown is landed only once a voucher has been accepted, which is what
+/// makes this test exercise the mid-stream path rather than racing the open-time
+/// gate: a voucher proves the request was already admitted and bytes are
+/// flowing. The blob is sized to many voucher intervals so boundaries remain
+/// after the flip.
+#[tokio::test(flavor = "multi_thread")]
+async fn takedown_mid_stream_terminates_the_delivery() -> anyhow::Result<()> {
+    // 16 intervals at the harness's 1 MB `voucher_interval_mb`.
+    let payload = vec![0x5Au8; 16 * 1024 * 1024];
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+    let (store, signer, deposit) = seeded_store()?;
+    let deny_cache = cache.clone();
+    let (target, server_eth, server_ep, server_task, metrics) =
+        spawn_handler_server_with_metrics(cache, Arc::clone(&store), RATE_PER_MB, 0, 16).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let ctx = channel_context(signer, deposit);
+    let fetch_ep = client_ep.clone();
+    let server_addr = server_eth.address();
+    let hash_bytes = *hash.as_bytes();
+    let fetch = tokio::spawn(async move {
+        stream_fetch(
+            &fetch_ep,
+            target,
+            &ctx,
+            &slash_domain(),
+            server_addr,
+            hash_bytes,
+            0,
+            0x00e5,
+            Duration::from_secs(30),
+        )
+        .await
+    });
+
+    // Wait for the first accepted voucher — the store is written durably on
+    // every acceptance, so a non-zero `last_amount` means delivery is under way.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !store
+        .load_all()?
+        .iter()
+        .any(|state| state.last_amount() > U256::ZERO)
+    {
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "no voucher was ever accepted; the test never reached the mid-stream path"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    deny_cache.set_chain_denied_one(hash, true);
+
+    let err = fetch
+        .await?
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("delivery must not complete through a takedown"))?;
+    anyhow::ensure!(
+        metric_line_present(
+            &metrics.encode()?,
+            "decdn_serve_stream_terminated_takedown_total 1"
+        ),
+        "the cut-off must be metered as an in-flight termination, not a completed \
+         delivery ({err})"
+    );
+
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
 /// ADR 011 §On Blacklist Event. A channel funded by a blacklisted origin is
 /// refused with `OriginBlacklisted` — including on a CACHE MISS, which is the
 /// path that previously fell through to a plain `NotFound` because every miss

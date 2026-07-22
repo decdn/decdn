@@ -186,15 +186,26 @@ impl ClientHandler {
         // statement about what is in the store, so it must be answered before
         // the store is asked.
         //
-        // Governance entries land here too: the blacklist watcher feeds the same
-        // set (as well as evicting, which reclaims the bytes). One set, one wire
-        // code — ADR 011 §StreamRequest Response requires that a client cannot
-        // tell a governance takedown from this operator's own denylist, and
-        // routing them through different refusals would have leaked exactly that.
-        // The operator-side metric split survives, since no client can read it.
+        // Governance entries are gated here too, on their own set — the
+        // blacklist watcher denies before it evicts. Two sets, ONE wire code:
+        // ADR 011 §StreamRequest Response requires that a client cannot tell a
+        // governance takedown from this operator's own denylist, and answering
+        // the governance case from the eviction arm below (`EvictedSinceProbe`)
+        // leaked exactly that — it made `HashBlacklisted` a unique fingerprint
+        // for "this operator privately denied it", which is the probe the ADR
+        // forecloses. The reasons stay distinct only so the operator's own
+        // metrics can tell them apart, which no client can read.
+        //
+        // Governance is checked second because the local list is the cheaper and
+        // far more common hit; both are one atomic load and a hash-set probe.
         if self.cache.is_denied(hash) {
             return self
                 .respond_error(&mut send, &req, ServeRejectReason::HashDenied)
+                .await;
+        }
+        if self.cache.is_chain_denied(hash) {
+            return self
+                .respond_error(&mut send, &req, ServeRejectReason::ChainHashDenied)
                 .await;
         }
 

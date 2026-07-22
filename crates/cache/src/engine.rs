@@ -92,9 +92,10 @@ struct Inner {
     /// takedown, full stop. The pin just keeps the hash off the LRU
     /// candidate list.
     pinned: ArcSwap<HashSet<Hash>>,
-    /// Hashes this node refuses to serve, announce, or acquire, and which a
-    /// later config reload can UN-refuse (ADR 011 § Local Denylist and the
-    /// governance blacklist).
+    /// Hashes this node refuses to serve, announce, or acquire because the
+    /// operator's own `[content] denied_hashes` names them, and which a later
+    /// config reload can UN-refuse (ADR 011 § Local Denylist). The governance
+    /// half lives in [`Self::chain_denied`].
     ///
     /// Distinct from [`Self::evicted`] on exactly one axis: reversibility.
     /// Eviction is a durable, sticky operator act recorded in `evicted.log`;
@@ -104,13 +105,35 @@ struct Inner {
     /// mechanism on a statutory clock in both directions.
     ///
     /// It lives HERE rather than beside the origin deny-set in `decdn-node`
-    /// because "will this node serve/announce/acquire `hash`" has four
-    /// consumers — the serve path, `try_probe_hold`, the DHT republisher, and
-    /// `populate` — and the ADR requires one answer for all of them. Keeping it
-    /// next to `evicted` is what lets [`CacheEngine::refuses`] be the single
-    /// predicate they all call, so a fifth consumer inherits the check instead
-    /// of forgetting it.
+    /// because "will this node serve/announce/acquire `hash`" has five
+    /// consumers — the serve path, `try_probe_hold`, the DHT republisher,
+    /// `populate`, and the per-MB in-flight re-check that terminates a stream
+    /// already running when a takedown lands — and the ADR requires one answer
+    /// for all of them. Keeping it next to `evicted` is what lets
+    /// [`CacheEngine::refuses`] be the single predicate they all call, so the
+    /// next consumer inherits the check instead of forgetting it. The in-flight
+    /// one is exactly that: it was added later and needed no wiring of its own.
     denied: ArcSwap<HashSet<Hash>>,
+    /// Hashes refused because *governance* blacklisted them — the blacklist
+    /// watcher's live projection of `ContentBlacklist`, kept in its own slot
+    /// beside [`Self::denied`] for the same reason the node keeps local and
+    /// on-chain origins apart: the two have independent lifecycles, and a config
+    /// reload calling [`CacheEngine::set_denied`] must not clobber what the
+    /// chain watcher learned (nor the reverse).
+    ///
+    /// Membership is not what stops the serving — the watcher also
+    /// [`CacheEngine::evict`]s, which is sticky and durable. What this set adds
+    /// is the *reason*, and the reason picks the wire refusal code. ADR 011
+    /// §`StreamRequest` Response requires a governance takedown and this
+    /// operator's own denylist to be indistinguishable on the wire, so both must
+    /// answer `HashBlacklisted`; without this slot a governance entry falls
+    /// through to the eviction arm and answers `EvictedSinceProbe` instead,
+    /// which uniquely fingerprints a local entry by elimination.
+    ///
+    /// It is also the earlier of the two gates: the watcher denies *before* it
+    /// evicts, so a takedown whose durable eviction fails still stops serving on
+    /// the same tick rather than waiting for the retry.
+    chain_denied: ArcSwap<HashSet<Hash>>,
     /// Hashes the operator has explicitly evicted via [`CacheEngine::evict`]
     /// (issue #279). Membership is honored by [`CacheEngine::has`] and
     /// [`CacheEngine::get`] so an evicted blob is not served, even though
@@ -849,6 +872,7 @@ impl CacheEngine {
                         .collect::<HashSet<Hash>>(),
                 )),
                 denied: ArcSwap::from(Arc::new(HashSet::new())),
+                chain_denied: ArcSwap::from(Arc::new(HashSet::new())),
                 evicted: Mutex::new(evicted),
                 probe_holds: Mutex::new(HashMap::new()),
                 max_probe_holds: AtomicUsize::new(crate::probe_hold::DEFAULT_MAX_PROBE_HOLDS),
@@ -947,11 +971,13 @@ impl CacheEngine {
         self.inner.pinned.load().contains(&hash)
     }
 
-    /// Swap in the live denied set (ADR 011). Returns the delta for the reload
-    /// log line, same shape as [`Self::set_pinned`].
+    /// Swap in the live *local* denied set from `[content] denied_hashes` (ADR
+    /// 011 § Local Denylist). Returns the delta for the reload log line, same
+    /// shape as [`Self::set_pinned`].
     ///
     /// Wholesale replacement, not a merge: removing an entry from the denylist
-    /// and reloading must un-deny it.
+    /// and reloading must un-deny it. Touches only the local slot — a reload
+    /// must not drop what the blacklist watcher put in [`Self::set_chain_denied`].
     pub fn set_denied(&self, new: &DeniedHashes) -> PinDiff {
         let new_arc = Arc::new(
             new.iter()
@@ -973,6 +999,54 @@ impl CacheEngine {
         self.inner.denied.load().contains(&hash)
     }
 
+    /// Replace the governance deny-set wholesale — the blacklist watcher's boot
+    /// restore from its durable projection.
+    ///
+    /// Deliberately NOT derived from a chain read or from `evicted.log`:
+    /// `ContentBlacklist` exposes no enumeration of the blacklisted set, and the
+    /// eviction log records *that* a hash was evicted, never *why*. The
+    /// watcher's durable projection is the only thing that survives a restart
+    /// knowing a refusal was governance-sourced. See
+    /// `BlacklistEntryStore::load_blacklist_denied_hashes`.
+    pub fn set_chain_denied(&self, hashes: HashSet<Hash>) {
+        self.inner.chain_denied.store(Arc::new(hashes));
+    }
+
+    /// Add or drop one governance-denied hash, returning whether the set
+    /// actually changed so a caller can skip logging a no-op replay (the watcher
+    /// re-scans a block range after a restart and re-delivers events it has
+    /// already applied).
+    ///
+    /// Read-modify-write rather than in-place mutation, because [`ArcSwap`] has
+    /// no such thing. Blacklist events are governance actions and therefore
+    /// rare, so the clone costs nothing next to keeping the read side — which is
+    /// on the request hot path — lock-free.
+    pub fn set_chain_denied_one(&self, hash: Hash, denied: bool) -> bool {
+        let current = self.inner.chain_denied.load();
+        if current.contains(&hash) == denied {
+            return false;
+        }
+        let mut next = HashSet::clone(&current);
+        if denied {
+            next.insert(hash);
+        } else {
+            next.remove(&hash);
+        }
+        self.inner.chain_denied.store(Arc::new(next));
+        true
+    }
+
+    /// Is `hash` on the live governance deny-set? Cheap O(1) lookup.
+    ///
+    /// Prefer [`Self::refuses`] unless you specifically need to tell a
+    /// governance takedown apart from an eviction or a local denylist entry —
+    /// the serve path does, to pick the operator-side metric; nothing else
+    /// should care, and the *wire* code deliberately cannot tell this apart from
+    /// [`Self::is_denied`].
+    pub fn is_chain_denied(&self, hash: Hash) -> bool {
+        self.inner.chain_denied.load().contains(&hash)
+    }
+
     /// Does this node refuse to serve, announce, or acquire `hash`?
     ///
     /// The single predicate every "should I expose this blob" decision must
@@ -983,7 +1057,7 @@ impl CacheEngine {
     /// the signed evidence pair that makes the operator slashable for a
     /// takedown they were discharging.
     pub fn refuses(&self, hash: Hash) -> bool {
-        self.is_denied(hash) || self.is_evicted(hash)
+        self.is_denied(hash) || self.is_chain_denied(hash) || self.is_evicted(hash)
     }
 
     /// Is this blob already present in the local store?
@@ -5098,6 +5172,123 @@ mod tests {
             "misses should bump by exactly 1 on an evicted-hash get"
         );
         Ok(())
+    }
+
+    // ---- Governance deny-set (ADR 011 §StreamRequest Response) ----
+
+    async fn empty_engine(tmp: &std::path::Path) -> anyhow::Result<CacheEngine> {
+        Ok(
+            CacheEngine::open_with_pinned(tmp, Vec::new(), 10, crate::PinnedHashes::empty())
+                .await?,
+        )
+    }
+
+    /// The governance set has to feed `refuses`, or the takedown suppresses
+    /// nothing before the (separate, slower) eviction lands.
+    #[tokio::test]
+    async fn chain_denied_hash_is_refused() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let engine = empty_engine(tmp.path()).await?;
+        let hash = Hash::new(b"governance takedown");
+
+        anyhow::ensure!(!engine.refuses(hash), "nothing refused before the deny");
+        anyhow::ensure!(engine.set_chain_denied_one(hash, true), "set changed");
+        anyhow::ensure!(engine.is_chain_denied(hash));
+        anyhow::ensure!(engine.refuses(hash), "a governance deny must refuse");
+        anyhow::ensure!(
+            !engine.is_denied(hash),
+            "and must NOT masquerade as a local denylist entry — the two feed \
+             different operator metrics"
+        );
+        anyhow::ensure!(!engine.has(hash).await?, "refused hashes report absent");
+        Ok(())
+    }
+
+    /// A no-op replay must be reported as such: the watcher re-scans a block
+    /// range after a restart and re-delivers events it already applied, and
+    /// every one of those would otherwise log as a fresh takedown.
+    #[tokio::test]
+    async fn set_chain_denied_one_reports_whether_it_changed_anything() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let engine = empty_engine(tmp.path()).await?;
+        let hash = Hash::new(b"replayed");
+
+        anyhow::ensure!(engine.set_chain_denied_one(hash, true));
+        anyhow::ensure!(
+            !engine.set_chain_denied_one(hash, true),
+            "replay is a no-op"
+        );
+        anyhow::ensure!(engine.set_chain_denied_one(hash, false));
+        anyhow::ensure!(!engine.set_chain_denied_one(hash, false));
+        anyhow::ensure!(
+            !engine.refuses(hash),
+            "a de-listed hash stops being refused"
+        );
+        Ok(())
+    }
+
+    /// The reason the two deny-sets are separate slots: their lifecycles are
+    /// independent. A config reload must not drop a governance takedown, and the
+    /// watcher must not drop the operator's own list.
+    #[tokio::test]
+    async fn local_and_chain_deny_sets_do_not_clobber_each_other() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let engine = empty_engine(tmp.path()).await?;
+        let local = Hash::new(b"local entry");
+        let governance = Hash::new(b"governance entry");
+
+        engine.set_denied(&denied(&[local]));
+        engine.set_chain_denied_one(governance, true);
+
+        // A reload that drops the local entry leaves the governance one standing.
+        engine.set_denied(&crate::DeniedHashes::empty());
+        anyhow::ensure!(!engine.refuses(local), "local entry lifted by the reload");
+        anyhow::ensure!(
+            engine.refuses(governance),
+            "a config reload must not lift a governance takedown"
+        );
+
+        // ...and a governance removal leaves a re-added local entry standing.
+        engine.set_denied(&denied(&[local]));
+        engine.set_chain_denied_one(governance, false);
+        anyhow::ensure!(engine.refuses(local));
+        anyhow::ensure!(!engine.refuses(governance));
+        Ok(())
+    }
+
+    /// A hash on BOTH lists must survive removal from one. A single shared set
+    /// would drop it and silently resume serving content still under a takedown.
+    #[tokio::test]
+    async fn hash_on_both_deny_sets_survives_removal_from_one() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let engine = empty_engine(tmp.path()).await?;
+        let hash = Hash::new(b"both lists");
+
+        engine.set_denied(&denied(&[hash]));
+        engine.set_chain_denied_one(hash, true);
+        engine.set_chain_denied_one(hash, false);
+        anyhow::ensure!(engine.refuses(hash), "the local entry still stands");
+        Ok(())
+    }
+
+    /// The watcher's boot restore replaces wholesale — it is reloading a
+    /// projection, not merging events into one.
+    #[tokio::test]
+    async fn set_chain_denied_replaces_wholesale() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let engine = empty_engine(tmp.path()).await?;
+        let stale = Hash::new(b"stale");
+        let restored = Hash::new(b"restored");
+
+        engine.set_chain_denied_one(stale, true);
+        engine.set_chain_denied([restored].into_iter().collect());
+        anyhow::ensure!(!engine.refuses(stale));
+        anyhow::ensure!(engine.refuses(restored));
+        Ok(())
+    }
+
+    fn denied(hashes: &[Hash]) -> crate::DeniedHashes {
+        crate::DeniedHashes::new(hashes.iter().map(|h| from_store_hash(*h)).collect())
     }
 
     // ---- Probe-triggered eviction hold (#318, ADR 005) ----

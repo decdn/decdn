@@ -126,6 +126,9 @@ impl ClientHandler {
                 self.metrics.serve_stream_rejected_range_not_satisfiable();
             }
             ServeRejectReason::HashDenied => self.metrics.serve_stream_rejected_hash_denied(),
+            ServeRejectReason::ChainHashDenied => {
+                self.metrics.serve_stream_rejected_chain_hash_denied();
+            }
             ServeRejectReason::OriginDenied => self.metrics.serve_stream_rejected_origin_denied(),
         }
         let error = reason.wire_error();
