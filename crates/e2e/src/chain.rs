@@ -84,24 +84,22 @@ pub enum Offense {
     RateManipulation,
 }
 
-/// The two signed wire messages a `_verifyPair` challenge is built from, exactly
-/// as the daemon emitted them — `slash_sig` included and never re-signed. Borrowed
-/// so a negative case can perturb one field of a clone and resubmit (#1042).
-#[derive(Debug, Clone, Copy)]
-pub struct EvidencePair<'a> {
-    /// The signed `cdn/probe/v1` response.
-    pub probe: &'a decdn_protocol::ProbeResponse,
-    /// The signed `cdn/client/v1` open-stage response.
-    pub stream: &'a decdn_protocol::client::StreamResponse,
-}
-
 impl Offense {
+    /// The generated, contract-canonical `OffenseType`. Going through the `sol!`
+    /// enum rather than a hand-written ordinal keeps this pinned to the one
+    /// declaration a Solidity reorder would have to touch anyway
+    /// (`decdn_incentive::slash_judge`) — a stale literal here would instead
+    /// corrupt `evidenceHash` and surface as a misleading `NoCommitment()`.
+    const fn offense_type(self) -> SlashJudge::OffenseType {
+        match self {
+            Self::Phantom => SlashJudge::OffenseType::Phantom,
+            Self::RateManipulation => SlashJudge::OffenseType::RateManipulation,
+        }
+    }
+
     /// Contract-canonical `OffenseType` discriminant, folded into `evidenceHash`.
     const fn discriminant(self) -> u8 {
-        match self {
-            Self::Phantom => 0,
-            Self::RateManipulation => 1,
-        }
+        self.offense_type() as u8
     }
 
     /// The reveal entry point, for error context.
@@ -111,6 +109,22 @@ impl Offense {
             Self::RateManipulation => "submitRateChallenge",
         }
     }
+}
+
+/// The two signed wire messages a `_verifyPair` challenge is built from, exactly
+/// as the daemon emitted them — `slash_sig` included and never re-signed. Borrowed
+/// so a negative case can perturb one field of a clone and resubmit (#1042).
+///
+/// Deliberately **unvalidated**: no same-hash, same-signer, or window check. The
+/// judge is the only arbiter, and the negative journeys submit deliberately
+/// incoherent pairs (a 41s-apart pair, a probe re-signed by an impostor), so a
+/// validating constructor would make half the coverage unwritable.
+#[derive(Debug, Clone, Copy)]
+pub struct EvidencePair<'a> {
+    /// The signed `cdn/probe/v1` response.
+    pub probe: &'a decdn_protocol::ProbeResponse,
+    /// The signed `cdn/client/v1` open-stage response.
+    pub stream: &'a decdn_protocol::client::StreamResponse,
 }
 
 /// Deployed protocol contract addresses, read from the forge-script manifest.
@@ -892,26 +906,8 @@ impl ChainFixture {
         node_id: B256,
         blob_hash: B256,
     ) -> anyhow::Result<U256> {
-        // Arm the challenger: gas + the refundable challenge bond, approved to
-        // the judge (any funded EOA may challenge).
-        self.fund_eth(challenger.address(), 10).await?;
-        let judge_read = SlashJudge::new(self.addrs.slash_judge, &self.admin);
-        let bond = judge_read
-            .challengeBond()
-            .call()
-            .await
-            .context("read challengeBond")?;
-        self.transfer_token(challenger.address(), bond).await?;
+        self.arm_challenger(challenger).await?;
         let ch_provider = self.provider_for(challenger);
-        let approve = Erc20::new(self.addrs.token, &ch_provider)
-            .approve(self.addrs.slash_judge, bond)
-            .send()
-            .await
-            .context("challenger token.approve send")?
-            .get_receipt()
-            .await
-            .context("challenger token.approve receipt")?;
-        crate::ensure_mined(&approve, "challenger token.approve")?;
 
         // Evidence timestamps anchored just behind the current chain time
         // (within the 5-day age bound and the 30s probe↔stream window).
@@ -953,7 +949,7 @@ impl ChainFixture {
         // streamStructHash)); commitment binds it to (salt, challenger).
         // `abi.encode(uint8 v)` right-aligns `v` in a 32-byte word — byte-
         // identical to `uint256(v)`, which alloy's `SolValue` encodes directly.
-        let offense = U256::from(0u8); // OffenseType.Phantom
+        let offense = U256::from(Offense::Phantom.discriminant());
         let evidence_hash =
             keccak256((offense, probe.struct_hash(), stream.struct_hash()).abi_encode());
         let salt = B256::repeat_byte(0x99);
@@ -1068,8 +1064,14 @@ impl ChainFixture {
     ///
     /// Returns the minted `slashId`. An `Err` here is the *whole point* for the
     /// negative cases: a challenge that fails verification reverts, and per
-    /// [ADR 014 § Bond Handling] the bond is never transferred on a failed
-    /// verification — assert the challenger's TOKEN balance directly.
+    /// [ADR 014 § Bond Handling](../../../adr/014-on-chain-verification.md) the
+    /// bond is never transferred on a failed verification — assert the
+    /// challenger's TOKEN balance directly.
+    ///
+    /// **Side effect:** advances chain time ~65s on *every* call, including ones
+    /// that revert, to mature the commitment past `MIN_REVEAL_DELAY`. A journey
+    /// that captures evidence *between* challenges is working against a drifted
+    /// clock; anchor every capture with a fresh [`Self::head_timestamp`].
     pub async fn challenge_with_real_evidence(
         &self,
         challenger: &PrivateKeySigner,
@@ -1187,7 +1189,7 @@ impl ChainFixture {
 
     /// `CapacityBond.escrowedTotal()` — TOKEN currently parked in slash escrow.
     pub async fn escrowed_total(&self) -> anyhow::Result<U256> {
-        crate::bindings::CapacityBondEscrow::new(self.addrs.capacity_bond, &self.admin)
+        CapacityBond::new(self.addrs.capacity_bond, &self.admin)
             .escrowedTotal()
             .call()
             .await
@@ -1209,22 +1211,21 @@ impl ChainFixture {
     /// challenger and 50% burned. Sent by the admin EOA (the caller is not part
     /// of the split; the challenger is read from the record).
     pub async fn finalize_unappealed_slash(&self, slash_id: U256) -> anyhow::Result<()> {
-        let receipt =
-            crate::bindings::CapacityBondEscrow::new(self.addrs.capacity_bond, &self.admin)
-                .finalizeUnappealedSlash(slash_id)
-                .send()
-                .await
-                .context("finalizeUnappealedSlash send")?
-                .get_receipt()
-                .await
-                .context("finalizeUnappealedSlash receipt")?;
+        let receipt = CapacityBond::new(self.addrs.capacity_bond, &self.admin)
+            .finalizeUnappealedSlash(slash_id)
+            .send()
+            .await
+            .context("finalizeUnappealedSlash send")?
+            .get_receipt()
+            .await
+            .context("finalizeUnappealedSlash receipt")?;
         crate::ensure_mined(&receipt, "finalizeUnappealedSlash")
     }
 
     /// TOKEN `totalSupply()` — reads the burn leg of a 50/50 slash split, which
-    /// is invisible as a transfer.
+    /// no account's balance reflects.
     pub async fn token_total_supply(&self) -> anyhow::Result<U256> {
-        crate::bindings::Erc20Supply::new(self.addrs.token, &self.admin)
+        Erc20::new(self.addrs.token, &self.admin)
             .totalSupply()
             .call()
             .await

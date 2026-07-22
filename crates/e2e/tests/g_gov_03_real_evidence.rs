@@ -76,6 +76,8 @@ use alloy::signers::local::PrivateKeySigner;
 use anyhow::Context;
 use decdn_cache::Hash;
 use decdn_common::admin::{AdminRpcClient, EvictRequest};
+use decdn_e2e::assert::expect_revert_anyhow;
+use decdn_e2e::bindings::SlashJudgeRate;
 use decdn_e2e::chain::{ChainFixture, EvidencePair, Offense};
 use decdn_e2e::client::ClientFixture;
 use decdn_e2e::node::NodeFixture;
@@ -92,14 +94,6 @@ const BASE_RATE_PER_MB: u64 = 10;
 /// The switched-to rate. Comfortably inside the deployed `[1, 1000]` on-chain
 /// delivery band, so the daemon signs it unclamped.
 const SWITCHED_RATE_PER_MB: u64 = 40;
-
-/// `SlashJudge.TimestampWindowViolated(uint64,uint64)` selector — the 30s
-/// probe↔stream window. Asserted by selector rather than by message text: an
-/// `is_err()` alone would also be satisfied by a fixture bug (unfunded
-/// challenger, bad nonce) that never reached the judge's checks at all.
-const ERR_TIMESTAMP_WINDOW_VIOLATED: &str = "0xdd5f3562";
-/// `SlashJudge.InvalidProbeSignature()` selector.
-const ERR_INVALID_PROBE_SIGNATURE: &str = "0xa138dc81";
 
 /// Overall ceiling so an unbounded await fails fast with a clear message.
 /// Cleanup (anvil kill, daemon kill) runs on drop even on timeout. The journey
@@ -146,8 +140,11 @@ async fn run() -> anyhow::Result<()> {
     );
     let channel_a = delivered.channel_id;
 
-    // Anchor evidence timestamps to chain time: the judge's staleness bound and
-    // the 30s window are both computed against `block.timestamp`.
+    // Anchor evidence timestamps to chain time. The judge's staleness bound (and
+    // its future-skew guard) are what compare against `block.timestamp`; the 30s
+    // window is computed purely between the two evidence timestamps and is
+    // chain-time-independent. Anchoring both keeps the pair fresh as well as
+    // in-window.
     let now_us = chain.head_timestamp().await? * 1_000_000;
     let probe_ts = now_us;
     let stream_ts = now_us + 1_000_000; // +1s, well inside the 30s window
@@ -275,7 +272,10 @@ async fn run() -> anyhow::Result<()> {
         .await
         .err()
         .ok_or_else(|| anyhow::anyhow!("a 40s-apart probe/stream pair must not be slashable"))?;
-    assert_reverted_with(&err, ERR_TIMESTAMP_WINDOW_VIOLATED, "out-of-window pair")?;
+    // Pinning the *typed* error is what makes a negative meaningful: an `is_err()`
+    // alone would also be satisfied by a fixture bug (unfunded challenger, bad
+    // nonce) that never reached the judge's checks at all.
+    expect_revert_anyhow::<SlashJudgeRate::TimestampWindowViolated>(&err, "out-of-window pair")?;
     assert_challenge_cost_nothing(&chain, out_of_window.address(), bond).await?;
 
     // (2) Forged signature: the real probe body, re-signed by a key that is not
@@ -298,7 +298,7 @@ async fn run() -> anyhow::Result<()> {
         .await
         .err()
         .ok_or_else(|| anyhow::anyhow!("a probe signed by a non-operator must not be slashable"))?;
-    assert_reverted_with(&err, ERR_INVALID_PROBE_SIGNATURE, "forged probe signature")?;
+    expect_revert_anyhow::<SlashJudgeRate::InvalidProbeSignature>(&err, "forged probe signature")?;
     assert_challenge_cost_nothing(&chain, forger.address(), bond).await?;
 
     // (3) Neither failed challenge minted anything: A is still unslashed.
@@ -391,6 +391,9 @@ async fn drive_slash(
         "slash record names {rec_operator}, expected {operator}"
     );
     anyhow::ensure!(amount > U256::ZERO, "a slash must reduce a non-zero amount");
+    // `slashAmount` is the *combined* reduction across active + unbonding bond,
+    // and `_reduceBondAtTier` takes from active first — so this equality holds
+    // because these fixture operators have no unbonding request in flight.
     anyhow::ensure!(
         chain.active_bond(operator).await? == bond_before - amount,
         "the operator's active bond must fall by exactly the slashed amount"
@@ -470,19 +473,6 @@ fn forge_probe_signature(
         "the forged signature must differ from the daemon's"
     );
     Ok(forged)
-}
-
-/// Assert a challenge reverted with a specific Solidity custom error, matched by
-/// its 4-byte selector in the RPC error's revert data. Pinning the selector is
-/// what makes a negative meaningful: it proves the judge reached the check under
-/// test and rejected on *that* rule.
-fn assert_reverted_with(err: &anyhow::Error, selector: &str, what: &str) -> anyhow::Result<()> {
-    let rendered = format!("{err:#}");
-    anyhow::ensure!(
-        rendered.contains(selector),
-        "{what}: expected a revert with custom error {selector}, got: {rendered}"
-    );
-    Ok(())
 }
 
 /// A challenge that fails on-chain verification must move no TOKEN: the bond is

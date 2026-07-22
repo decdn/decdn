@@ -260,11 +260,17 @@ impl ClientFixture {
     ///
     /// Why an *existing* channel rather than a fresh one: for the ~seconds after
     /// `openChannel` the node's chain watcher has not decoded `ChannelOpened`, so
-    /// it refuses with `UnknownChannel` → wire `NotFound`, which is
-    /// indistinguishable from the refusal a journey is actually trying to
-    /// provoke. Reusing a channel a successful [`Self::fetch`] already proved the
-    /// node accepts removes that race entirely. No voucher is exchanged on a
-    /// refusal, so the zeroed `prior_*` watermark cannot go stale here.
+    /// the channel is unrecognized. That does **not** change the refusal code here
+    /// — `serve_stream` resolves the channel only *after* the blob-availability
+    /// gate (`handlers::client::dispatch`), so both refusals this helper captures
+    /// return before the lookup. What it does change is the *reason*:
+    /// `handlers::client::fill::pull_authorized` returns `false` for an
+    /// unrecognized channel, suppressing the range / local-origin / node-to-node
+    /// fill tiers — so a fresh channel can turn a fillable miss into a `NotFound`
+    /// for a reason unrelated to the journey. Reusing a channel a successful
+    /// [`Self::fetch`] already proved the node accepts removes that confound. No
+    /// voucher is exchanged on a refusal, so the zeroed `prior_*` watermark cannot
+    /// go stale here.
     pub async fn refused_stream(
         &self,
         chain: &ChainFixture,

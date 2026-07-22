@@ -139,10 +139,16 @@ impl NodeFixture {
     /// (#1042), induced through the operator's real config surface rather than
     /// simulated.
     ///
-    /// The returned value is the daemon's own report, not the requested one: the
-    /// node clamps its quote into the on-chain `[floor, ceiling]` band before
-    /// signing, so a caller that needs `stream > probe` must assert on what came
-    /// back.
+    /// The returned value is the daemon's post-reload **configured** rate — a bare
+    /// load of the atomic the reload swapped (`runtime::reload`'s `ReloadSnapshot`),
+    /// read back over the admin RPC. It proves the hot-swap landed; it is *not* the
+    /// rate the node will sign. Clamping into the on-chain `[floor, ceiling]` band
+    /// happens later and per-response, off that same atomic
+    /// (`handlers::client::wire::clamped_rate`, and its probe twin). So a caller
+    /// that needs `stream > probe` must assert on the `rate_per_mb` inside the
+    /// captured `StreamResponse`/`ProbeResponse` — the signed bytes that become
+    /// evidence — never on this return value, which would happily report an
+    /// out-of-band rate the daemon then clamps away.
     pub async fn set_rate_per_mb(&self, rate: u64) -> anyhow::Result<u64> {
         let config = std::fs::read_to_string(&self.config_path).context("read node config")?;
         let mut doc: toml::Table = config.parse().context("parse node config")?;

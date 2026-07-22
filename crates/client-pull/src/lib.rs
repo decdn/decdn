@@ -438,7 +438,9 @@ pub struct UpstreamRefused {
     /// `SlashJudge` EIP-712 `StreamResponse` typehash covers and `slash_sig` is
     /// the operator's secp256k1 signature over it — already verified against
     /// `expected_signer` by `verify_response` before this error is built, so a
-    /// present value always recovers to the delivering node. Paired with the
+    /// present value always recovers to `expected_signer`: the operator address
+    /// the caller bound this pull to, which is what `SlashJudge._checkRegistered`
+    /// resolves `nodeId` against. Paired with the
     /// same node's earlier `ProbeResponse` for the same hash it is the complete
     /// on-chain phantom-announcement (`hasBlob && !ok`) or rate-manipulation
     /// (`stream.ratePerMb > probe.ratePerMb`) evidence pair — court-admissible
