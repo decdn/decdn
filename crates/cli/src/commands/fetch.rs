@@ -516,6 +516,7 @@ pub(crate) async fn fetch_blob(
     provider: Address,
     store: &RedbBuyerChannelStore,
     hash: [u8; 32],
+    namespace_id: [u8; 32],
     deadlines: PullDeadlines,
     max_blob_bytes: u64,
     on_progress: Option<&ProgressCallback>,
@@ -535,6 +536,7 @@ pub(crate) async fn fetch_blob(
         slash_dom,
         provider,
         hash,
+        namespace_id,
         0,
         timestamp_us,
         deadlines,
@@ -574,6 +576,7 @@ pub(crate) async fn fetch_blob(
 /// auto-discovers (#936): read the active set from `CapacityBond`, probe the
 /// region-nearest candidates, pick a holder (channel-aware ranking), and derive
 /// `--provider-address` from its registry entry.
+#[allow(clippy::too_many_lines)]
 pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow::Result<()> {
     let hash = parse_hash(&args.hash)?;
     let common = &args.common;
@@ -659,6 +662,15 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
     // fetch stays silent. The bar starts length-less; the first callback (which
     // fires once the signed `StreamResponse` fixes the total) sets its length.
     let (bar, on_progress) = delivery_progress();
+    // The namespace routing hint (ADR 005 § Namespace routing): `--namespace <id>`
+    // → big-endian `uint256`; absent => `NO_NAMESPACE` (best-effort cache/DHT).
+    // A `DECDNMAN` manifest's chunk pulls inherit it (the chunks are that
+    // namespace's content), threaded through `ChunkFetcher` below.
+    let namespace_id = args
+        .namespace
+        .map_or(decdn_protocol::client::NO_NAMESPACE, |n| {
+            alloy::primitives::U256::from(n).to_be_bytes()
+        });
     let blob = fetch_blob(
         &endpoint,
         // Cloned, not moved: a `DECDNMAN` manifest expands into per-chunk pulls
@@ -669,6 +681,7 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
         provider,
         &store,
         hash,
+        namespace_id,
         // A node that accepts the connection and never answers is as dead as one that
         // stops mid-stream, so the same budget answers both (#1134). `capped` enforces
         // that the hard cap outlasts them both — `ClientFetchArgs::validate` has already
@@ -710,6 +723,7 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
                 common.hard_cap(),
             )?,
             max_blob_bytes,
+            namespace_id,
         };
         return chunks
             .reconstruct(&manifest?, hash, &args.output, !common.no_keep_blobs)
@@ -767,6 +781,10 @@ struct ChunkFetcher<'a, P: alloy::providers::Provider + Clone> {
     /// documented to apply per entry for `bundle pull`.
     deadlines: PullDeadlines,
     max_blob_bytes: u64,
+    /// The namespace the manifest's content is published under (ADR 002 §
+    /// Retrieval by namespace); every chunk pull routes on it. `NO_NAMESPACE`
+    /// when `--namespace` was omitted.
+    namespace_id: [u8; 32],
 }
 
 impl<P: alloy::providers::Provider + Clone> ChunkFetcher<'_, P> {
@@ -792,6 +810,7 @@ impl<P: alloy::providers::Provider + Clone> ChunkFetcher<'_, P> {
             self.provider,
             self.store,
             hash,
+            self.namespace_id,
             self.deadlines,
             self.max_blob_bytes,
             // No per-chunk byte bar: it would reset once per chunk and read as a

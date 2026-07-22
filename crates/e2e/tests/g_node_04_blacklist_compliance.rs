@@ -119,7 +119,9 @@ async fn run_global() -> anyhow::Result<()> {
         "node must hold H before blacklisting"
     );
     let client = ClientFixture::new(&chain).await?;
-    let outcome = client.fetch(&chain, &node, hash).await?;
+    let outcome = client
+        .fetch(&chain, &node, hash, alloy::primitives::U256::ZERO)
+        .await?;
     assert_eq!(outcome.bytes, payload, "delivered bytes must match H");
 
     // Governance blacklists H globally; advance a while to model the compliance
@@ -174,7 +176,7 @@ async fn assert_refused_as_evicted(
 ) -> anyhow::Result<()> {
     let err = ClientFixture::new(chain)
         .await?
-        .fetch(chain, node, hash)
+        .fetch(chain, node, hash, alloy::primitives::U256::ZERO)
         .await
         .err()
         .ok_or_else(|| anyhow::anyhow!("fetch of an evicted blacklisted blob must fail"))?;
@@ -252,7 +254,7 @@ async fn run_regional() -> anyhow::Result<()> {
     );
     let outcome = ClientFixture::new(&chain)
         .await?
-        .fetch(&chain, &de_node, hash)
+        .fetch(&chain, &de_node, hash, alloy::primitives::U256::ZERO)
         .await?;
     assert_eq!(
         outcome.bytes, payload,

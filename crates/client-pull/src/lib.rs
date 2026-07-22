@@ -785,6 +785,9 @@ pub async fn stream_fetch(
         slash_domain,
         expected_signer,
         hash,
+        // `stream_fetch` is a test/loopback convenience for node-to-node pulls; a
+        // client that routes on a namespace calls `stream_fetch_tracked` directly.
+        decdn_protocol::client::NO_NAMESPACE,
         byte_offset,
         timestamp_us,
         // The legacy single-deadline shape (#1134): this helper's callers are
@@ -823,6 +826,7 @@ pub async fn stream_fetch_tracked(
     slash_domain: &Eip712Domain,
     expected_signer: Address,
     hash: [u8; 32],
+    namespace_id: [u8; 32],
     byte_offset: u64,
     timestamp_us: u64,
     deadlines: PullDeadlines,
@@ -836,6 +840,7 @@ pub async fn stream_fetch_tracked(
         slash_domain,
         expected_signer,
         hash,
+        namespace_id,
         byte_offset,
         timestamp_us,
         deadlines,
@@ -872,6 +877,7 @@ pub async fn stream_fetch_tracked_with_progress(
     slash_domain: &Eip712Domain,
     expected_signer: Address,
     hash: [u8; 32],
+    namespace_id: [u8; 32],
     byte_offset: u64,
     timestamp_us: u64,
     deadlines: PullDeadlines,
@@ -896,6 +902,7 @@ pub async fn stream_fetch_tracked_with_progress(
             slash_domain,
             expected_signer,
             hash,
+            namespace_id,
             byte_offset,
             timestamp_us,
             max_blob_size_bytes,
@@ -978,6 +985,9 @@ pub async fn stream_fetch_shared(
             slash_domain,
             expected_signer,
             hash,
+            // Shared-channel pulls are node-to-node cache-miss fills (the daemon
+            // as buyer); the requester already discovered the holder.
+            decdn_protocol::client::NO_NAMESPACE,
             byte_offset,
             timestamp_us,
             max_blob_size_bytes,
@@ -1096,6 +1106,7 @@ async fn fetch_inner(
     slash_domain: &Eip712Domain,
     expected_signer: Address,
     hash: [u8; 32],
+    namespace_id: [u8; 32],
     byte_offset: u64,
     timestamp_us: u64,
     max_blob_size_bytes: u64,
@@ -1111,11 +1122,11 @@ async fn fetch_inner(
         slash_domain,
         expected_signer,
         hash,
-        // Node-to-node / client pulls send NO_NAMESPACE: the requester already
-        // discovered a holder, and the downstream node needs no namespace hint
-        // (ADR 002 §Retrieval by namespace). Client-supplied namespace routing is
-        // a follow-up when the fetch CLI grows a `--namespace` flag.
-        decdn_protocol::client::NO_NAMESPACE,
+        // A client fetch routes on the namespace it published under (ADR 005
+        // §Namespace routing); node-to-node pulls pass NO_NAMESPACE (the
+        // requester already discovered a holder, so the downstream node needs no
+        // hint — ADR 002 §Retrieval by namespace).
+        namespace_id,
         byte_offset,
         timestamp_us,
         open,

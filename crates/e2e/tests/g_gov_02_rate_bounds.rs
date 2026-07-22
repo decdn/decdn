@@ -192,7 +192,9 @@ async fn run() -> anyhow::Result<()> {
     // `RateFloorViolation` check, so a voucher priced at the old rate must land
     // on-chain while the old floor is still in force.
     time::increase_time(chain.admin(), 185 * DAY).await?;
-    let outcome = client.fetch(&chain, &node, hash).await?;
+    let outcome = client
+        .fetch(&chain, &node, hash, alloy::primitives::U256::ZERO)
+        .await?;
     assert_eq!(outcome.bytes, payload, "the node must deliver the blob");
     let served = poll(Duration::from_secs(120), || async {
         let b = chain.served_bytes(node.operator_addr()).await?;
@@ -284,7 +286,9 @@ async fn run() -> anyhow::Result<()> {
     // honest client, which is why this leg asserts on price rather than trying to
     // provoke `RateFloorViolation`.
     let served_before = chain.served_bytes(node.operator_addr()).await?;
-    let paid = client.fetch(&chain, &node, hash).await?;
+    let paid = client
+        .fetch(&chain, &node, hash, alloy::primitives::U256::ZERO)
+        .await?;
     assert_eq!(
         paid.bytes, payload,
         "the node must still deliver the blob under the ratified band"

@@ -85,7 +85,9 @@ async fn run() -> anyhow::Result<()> {
 
     // ---- Layer 3 (delivery): the paid client path delivers the exact blob.
     let client = ClientFixture::new(&chain).await?;
-    let outcome = client.fetch(&chain, &node, hash).await?;
+    let outcome = client
+        .fetch(&chain, &node, hash, alloy::primitives::U256::ZERO)
+        .await?;
     assert_eq!(
         outcome.bytes, payload,
         "delivered bytes must match the blob"

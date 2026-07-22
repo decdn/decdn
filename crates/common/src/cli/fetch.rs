@@ -357,8 +357,27 @@ pub struct FetchArgs {
     #[arg(short = 'o', long, value_name = "PATH")]
     pub output: PathBuf,
 
+    /// Namespace the content is published under (ADR 002 § Retrieval by
+    /// namespace). When set, the serving node routes a cache-miss origin pull to
+    /// that namespace's DAO-authorized origins. Absent => no namespace: served
+    /// best-effort from cache / DHT only, with no authorized origins.
+    #[arg(long, value_name = "ID", value_parser = parse_fetch_namespace_id)]
+    pub namespace: Option<u64>,
+
     #[command(flatten)]
     pub common: ClientFetchArgs,
+}
+
+/// Parse a `--namespace` id for `decdn fetch`, rejecting the reserved `0`
+/// (namespace 0 is "no namespace"; omit the flag for best-effort retrieval).
+fn parse_fetch_namespace_id(s: &str) -> Result<u64, String> {
+    let id: u64 = s
+        .parse()
+        .map_err(|_| format!("invalid namespace id: {s}"))?;
+    if id == 0 {
+        return Err("namespace id must be >= 1 (omit --namespace for no namespace)".to_string());
+    }
+    Ok(id)
 }
 
 #[cfg(test)]

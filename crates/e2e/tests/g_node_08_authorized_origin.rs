@@ -206,7 +206,7 @@ async fn run() -> anyhow::Result<()> {
     // channel as a side effect. That is incidental, not required — the 3-day
     // assignment timelock is far short of the 90-day channel duration, so the
     // `unauthorized` session is still perfectly usable here.)
-    let served = client.fetch(&chain, &node, origin_hash).await?;
+    let served = client.fetch(&chain, &node, origin_hash, namespace).await?;
     assert_eq!(
         served.bytes, origin_payload,
         "a recognized origin must serve the backend's bytes verbatim"
@@ -232,7 +232,7 @@ async fn run() -> anyhow::Result<()> {
     // Byte-exact against the backend's copy. (Which fill tier serves it — range
     // vs whole-blob — is discussed at `RANGE_OFFSET`.)
     let tail = client
-        .fetch_once(&mut authorized, range_hash, RANGE_OFFSET)
+        .fetch_once(&mut authorized, range_hash, RANGE_OFFSET, namespace)
         .await
         .context("ranged origin fetch")?;
     assert_eq!(
@@ -416,7 +416,7 @@ async fn assert_refused_not_found(
     label: &str,
 ) -> anyhow::Result<()> {
     let refused = client
-        .fetch_once(session, hash, byte_offset)
+        .fetch_once(session, hash, byte_offset, alloy::primitives::U256::ZERO)
         .await
         .err()
         .with_context(|| {

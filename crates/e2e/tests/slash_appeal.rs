@@ -87,7 +87,9 @@ async fn run() -> anyhow::Result<()> {
     // ---- B serves real bytes → its FeeRouter served-bytes advance, giving it
     // Governor vote weight in the trailing window.
     let client = ClientFixture::new(&chain).await?;
-    let outcome = client.fetch(&chain, &node_b, hash_b).await?;
+    let outcome = client
+        .fetch(&chain, &node_b, hash_b, alloy::primitives::U256::ZERO)
+        .await?;
     assert_eq!(outcome.bytes, payload, "B must deliver the blob");
     let served = poll(Duration::from_secs(120), || async {
         let b = chain.served_bytes(node_b.operator_addr()).await?;
