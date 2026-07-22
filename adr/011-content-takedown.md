@@ -50,6 +50,15 @@ interface IContentBlacklist {
     // Permanent (no sunset): unlawful-content removal discharges an ongoing
     // legal duty — see ADR 009, Emergency Multisig (capability-split sunset).
     // Only the protocol-wide pause sunsets at 12 months, not this path.
+    // Emergency adds are GLOBAL by construction, hence no region parameter.
+    // ONE-WAY: both revert if the target is already blacklisted by governance
+    // (a hash entry with emergency == false, or an origin with no expiry
+    // record). The emergency path may only ADD enforcement, never weaken it —
+    // otherwise re-adding a governance entry would arm auto-expiry on it and
+    // hand the multisig a delayed removeHashGlobal, which is GOVERNANCE_ROLE
+    // only and reachable by no other multisig route. Re-adding over an existing
+    // EMERGENCY entry stays permitted (category escalation, or re-arming one
+    // that lapsed) — that sustains a takedown rather than undoing one.
     // Category determines emergency entry expiry:
     //   GENERAL — 14-day auto-expiry (default)
     //   CSAM, TERRORIST — 90-day auto-expiry (severe content must not be re-exposed due to governance latency)
@@ -60,13 +69,35 @@ interface IContentBlacklist {
     // Emergency entries expire after their category-specific deadline unless ratified by governance.
     // Expiry is derived from the entry's addedAt timestamp: addedAt + expiryForCategory(category).
     // isBlacklisted returns false after this deadline unless a governance addHashGlobal
-    // has been called for the same hash.
+    // has been called for the same hash — re-adding under governance clears the
+    // `emergency` flag, which is what makes the entry permanent.
+    //
+    // Permissionless materialization of that expiry. Reverts unless the entry is
+    // an emergency entry past its deadline. Deleting the entry is what advances
+    // getBlacklistVersion() and emits HashRemoved — without it the enforced set
+    // would shrink with the counter frozen, and a delta-polling node would never
+    // learn (see § Blacklist version). The origin variant is the only signal at
+    // all on its side, since OriginBlacklistUpdated carries no version.
+    function expireEmergencyEntry(bytes32 region, bytes32 blake3Hash) external;
+    function expireEmergencyOrigin(address operatorAddress) external;
 
-    // Regional body registry — global governance only
-    function registerRegionalBody(string calldata region, address body) external;
-    function deregisterRegionalBody(string calldata region) external;
-    function suspendRegionalBody(string calldata region) external;
-    function unsuspendRegionalBody(string calldata region) external;
+    // Compliance-window governance (see § Compliance Window). Both bounded to
+    // [1 hour, 7 days]; the value is stamped onto an entry at add time, so a
+    // change never moves the boundary for entries already added.
+    function setComplianceWindow(uint64 newWindow) external;
+    function setEmergencyComplianceWindow(uint64 newWindow) external;
+
+    // Regional body registry — global governance only, except suspendRegionalBody
+    // (emergency multisig). A body is bound to exactly one region and may only
+    // write entries for that region: REGIONAL_BODY_ROLE alone is not authority.
+    // `emergencyMultisig` names the EMERGENCY_MULTISIG_ROLE holder to check
+    // signer-disjointness against; it is verified to hold the role, so it cannot
+    // be pointed at a decoy (see § Signer non-overlap).
+    function registerRegionalBody(bytes32 region, address body, address emergencyMultisig) external;
+    function deregisterRegionalBody(bytes32 region) external;
+    function suspendRegionalBody(bytes32 region) external;          // emergency multisig only
+    function ratifyRegionalBodySuspension(bytes32 region) external; // within 14 days
+    function unsuspendRegionalBody(bytes32 region) external;
 
     // Per-entry appeal flow (see § Blacklist Entry Appeals). Regional entries are
     // the primary case; global entries are filable by naming GLOBAL_REGION.
@@ -132,10 +163,17 @@ interface IContentBlacklist {
 struct BlacklistEntry {
     bytes32 blake3Hash;
     uint256 addedAt;          // block timestamp when added
-    uint256 effectiveAt;      // addedAt + compliance window (0 for emergency adds)
+    uint256 effectiveAt;      // addedAt + the compliance window in force AT ADD TIME
+                              // (emergencyComplianceWindow for emergency adds).
+                              // Stamped, never derived: a later governance change
+                              // to the window must not move the slash boundary
+                              // under deliveries already served, and the original
+                              // value must survive an appeal suspension.
     string  region;           // ISO 3166-1 alpha-2, or "" for global
     string  reason;           // free-form, e.g. "DMCA-2026-001", "CSAM", "DSA-DE-001"
     bool    emergency;        // true if added via emergency multisig path
+    uint8   category;         // Category; determines the emergency auto-expiry term.
+                              // Meaningless when emergency == false.
     bool    suspended;        // true while a regional appeal is in interim-relief
                               // or pending ratification; isBlacklisted views return
                               // false during this window. See § Blacklist Entry Appeals.
@@ -150,7 +188,9 @@ struct BlacklistEntry {
 
 ### Blacklist version
 
-`getBlacklistVersion()` returns a monotonically increasing counter incremented on every change to the enforced hash set, across all paths: every hash add, every hash removal, and every appeal-driven suspend/resume. Suspension belongs in the counter because it flips what `isBlacklisted` reports — [§ Compliance Window](#compliance-window) and [§ Authority and flow](#authority-and-flow) both have operators detect appeal resumption off this poll cycle, which only holds if the toggle advances the version. A terminal appeal path acting on an entry that governance already removed mid-appeal ([§ Global Override](#global-override)) does **not** bump: nothing enforceable changed, and a spurious advance costs every node a wasted delta fetch. Nodes cache the last-seen version and only re-fetch deltas when the version advances, minimising RPC load.
+`getBlacklistVersion()` returns a monotonically increasing counter incremented on every change to the enforced hash set, across all paths: every hash add, every hash removal, every appeal-driven suspend/resume, and every `expireEmergencyEntry`.
+
+Emergency auto-expiry is the one set change that is not caused by a transaction, so it is the one that could break the counter's contract: the entry simply stops being enforceable when its deadline passes, with no write and no log. Views honour that deadline immediately — an expired entry is unenforceable whether or not anyone cleans it up — but a node that only fetches deltas when the counter advances would keep enforcing it forever. `expireEmergencyEntry` (and `expireEmergencyOrigin` on the origin side) closes the gap: permissionless, callable by anyone once the deadline passes, and it deletes the entry through the ordinary removal path so the counter advances and a `HashRemoved` lands in the log like any other removal. Suspension belongs in the counter because it flips what `isBlacklisted` reports — [§ Compliance Window](#compliance-window) and [§ Authority and flow](#authority-and-flow) both have operators detect appeal resumption off this poll cycle, which only holds if the toggle advances the version. A terminal appeal path acting on an entry that governance already removed mid-appeal ([§ Global Override](#global-override)) does **not** bump: nothing enforceable changed, and a spurious advance costs every node a wasted delta fetch. Nodes cache the last-seen version and only re-fetch deltas when the version advances, minimising RPC load.
 
 ### Reason field
 
@@ -164,13 +204,19 @@ Empty string means the entry applies globally. An ISO 3166-1 alpha-2 code scopes
 
 A regional body is an address (multisig or governance contract) registered by global governance for a specific jurisdiction. It can issue region-scoped blacklist entries for its jurisdiction without a global vote, but cannot issue global entries or blacklist origins — those remain global governance only.
 
+**Registration binds a body to exactly one region, and that binding is the authority.** Holding `REGIONAL_BODY_ROLE` is necessary but not sufficient: `addHashRegional` / `removeHashRegional` additionally require the caller to be the body registered for the region named in the call. Without that, any one registered body could write entries for every other jurisdiction, which would make the whole regional split decorative. The one-region-per-body rule is enforced in both directions (a region has at most one body; a body serves at most one region) so a suspension in one jurisdiction cannot be routed around by the same body acting in another.
+
 **At launch:** No regional bodies are registered. The `DEFAULT_ADMIN_ROLE` holder (deployer pre-handover, `TimelockController` post-handover) acts as sole governance. The contract surface supports regional bodies from day one so they can be added by governance vote without a contract redeploy.
 
 **Production-scale operation:** Regional bodies are expected for at minimum EU (DSA compliance) and US (DMCA). Each body is a 3-of-5 multisig constituted with signers who have legal presence in the relevant jurisdiction.
 
-**Signer non-overlap with the emergency multisig.** The emergency multisig hears appeals against regional-body entries (see [§ Blacklist Entry Appeals](#blacklist-entry-appeals)), so a signer on both a regional body and the emergency multisig would grade their own homework. `registerRegionalBody(region, body)` requires (and SHOULD verify on-chain where the candidate body exposes an enumerable signer view) that the candidate body's signer set is disjoint from the current emergency multisig signer set; registration reverts on overlap. Where on-chain enumeration is infeasible for a body implementation, governance MUST verify disjointness off-chain before passing the registration proposal and document it in the proposal. Subsequent rotations on either side that introduce overlap are a governance obligation to detect and resolve — either rotate the overlapping signer out of the body or deregister the body before it issues another entry.
+**Signer non-overlap with the emergency multisig.** The emergency multisig hears appeals against regional-body entries (see [§ Blacklist Entry Appeals](#blacklist-entry-appeals)), so a signer on both a regional body and the emergency multisig would grade their own homework. `registerRegionalBody(region, body, emergencyMultisig)` requires that the candidate body's signer set is disjoint from the current emergency multisig signer set; registration reverts on overlap.
 
-**Suspension:** The emergency multisig can suspend a regional body immediately via `suspendRegionalBody(region)`. Suspended bodies cannot issue new entries but existing entries remain active. Suspension must be ratified or reversed by governance vote within 14 days (same ratification window as emergency blacklist entries).
+Disjointness is verified on-chain where both sides expose a Safe-shaped `getOwners()` view: the two owner sets are compared pairwise, and a candidate owner that holds `EMERGENCY_MULTISIG_ROLE` directly is an overlap regardless of whether the multisig side turned out to be enumerable. The `emergencyMultisig` argument is checked to actually hold the role, so the probe cannot be aimed at a decoy address to manufacture a clean result. Where on-chain enumeration is infeasible for either implementation, registration still succeeds and the `RegionalBodyRegistered` event carries `signersVerified = false`; governance MUST then verify disjointness off-chain before passing the registration proposal and document it in the proposal. The event is the on-chain record of which of the two regimes applied to a given registration. Subsequent rotations on either side that introduce overlap are a governance obligation to detect and resolve — either rotate the overlapping signer out of the body or deregister the body before it issues another entry.
+
+**Suspension:** The emergency multisig can suspend a regional body immediately via `suspendRegionalBody(region)`. Suspended bodies cannot issue new entries but existing entries remain active — suspension bounds the body's future authority, it is not a mass retraction of the jurisdiction's takedowns. Suspension must be ratified (`ratifyRegionalBodySuspension`) or reversed (`unsuspendRegionalBody`) by governance vote within 14 days, the same ratification window as emergency blacklist entries.
+
+Governance silence past that window **lapses the suspension** and the body resumes writing, exactly as an unratified emergency entry expires. Both are unilateral multisig acts taken without a vote, and neither is a standing act of governance; sustaining one indefinitely on silence alone would let the multisig disable a jurisdiction permanently with no vote ever taken. Where a body genuinely must stay out, the durable instrument is `deregisterRegionalBody`, which is a governance act.
 
 Regional bodies operate independently within their scope. A hash blacklisted by the EU body is a compliance obligation only for nodes that declare an EU region. A hash blacklisted globally is a compliance obligation for all nodes regardless of region.
 
@@ -322,15 +368,21 @@ If `removeHashGlobal` or `removeHashRegional` fires while an appeal is open agai
 
 ## Compliance Window
 
-| Path | Compliance window |
-|------|-------------------|
-| Standard governance vote (global) | 24 hours after `effectiveAt` |
-| Regional governance body | 24 hours after `effectiveAt` |
-| Emergency multisig add | `effectiveAt = addedAt` — slash applies after 2 hours |
+One rule governs every path: an entry becomes slashable at `effectiveAt = addedAt + window`, where `window` is the parameter for the path that added it. Serving before `effectiveAt` is never an offense.
+
+| Path | `window` | Parameter |
+|------|----------|-----------|
+| Standard governance vote (global) | 24 hours | `complianceWindow` |
+| Regional governance body | 24 hours | `complianceWindow` |
+| Emergency multisig add | 2 hours | `emergencyComplianceWindow` |
+
+The emergency path is deliberately one-way with respect to governance: `emergencyAdd` / `emergencyAddOrigin` revert on a target governance has already blacklisted permanently. The multisig can always make enforcement stricter and never looser — `removeHashGlobal` is `GOVERNANCE_ROLE` only, and without this rule a re-add through the emergency path would arm auto-expiry on a standing governance decision and accomplish the same removal on a 14-day delay with no vote.
 
 The 24-hour window accounts for nodes that are offline or have a long poll interval. The 2-hour emergency window is tight enough to matter for active illegal content while giving online nodes time to act. The emergency multisig blacklist path is permanent (no sunset): it discharges an ongoing legal duty to remove unlawful content. Under the capability-split sunset, only the protocol-wide pause expires at 12 months, not this path — see [ADR 009 § Emergency Multisig](009-governance.md#emergency-multisig).
 
-The compliance window is a governable parameter (hardcoded bounds: minimum 1 hour, maximum 7 days).
+Both windows are governable parameters sharing one set of hardcoded bounds: minimum 1 hour, maximum 7 days. The floor is what keeps the emergency path honest — governance cannot compress the window below a single default poll cycle and slash nodes for content they had no opportunity to learn about.
+
+`effectiveAt` is stamped onto the entry at add time from the window then in force. Changing a window therefore affects only subsequent adds; it can neither retroactively expose already-served deliveries to a slash nor retroactively immunize them. `SlashJudge` anchors its slash-eligibility comparison to `effectiveAt`, not `addedAt`.
 
 Entries with `suspended == true` (see [§ Blacklist Entry Appeals](#blacklist-entry-appeals)) accrue no compliance obligation while suspended: `isBlacklisted` and `isBlacklistedInRegion` return `false` and slashes for the suspended hash cannot be opened. On reversal or lapse the original `effectiveAt` is preserved — operators detect resumption via the next `getBlacklistVersion()` poll cycle (default 10 minutes; see [§ Polling](#polling)) and must evict before serving any new request. Honest operators who served during the suspension window are protected at the evidence layer, not via a compliance-window extension — see [§ Interaction with active slashes](#interaction-with-active-slashes).
 

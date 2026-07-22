@@ -109,21 +109,43 @@ contract MockBlacklistView is IContentBlacklistHashView {
     struct Entry {
         uint64 addedAt;
         bool suspended;
+        uint64 effectiveAt;
+        bool emergency;
+        uint8 category;
     }
 
     mapping(bytes32 => mapping(bytes32 => Entry)) internal _entries;
 
+    /// @dev Seeds an entry that is already past its compliance window
+    ///      (`effectiveAt == addedAt`), which is what the pre-#1169 tests
+    ///      implicitly assumed. Use `setEntryEffectiveAt` to exercise the grace.
     function setEntry(bytes32 region, bytes32 hash, uint64 addedAt) external {
-        _entries[region][hash] = Entry(addedAt, false);
+        _entries[region][hash] = Entry(addedAt, false, addedAt, false, 0);
     }
 
     function setEntrySuspended(bytes32 region, bytes32 hash, uint64 addedAt, bool suspended) external {
-        _entries[region][hash] = Entry(addedAt, suspended);
+        _entries[region][hash] = Entry(addedAt, suspended, addedAt, false, 0);
     }
 
-    function getHashEntry(bytes32 region, bytes32 hash) external view override returns (uint64, bool) {
+    /// @dev ADR 011 § Compliance Window: `effectiveAt = addedAt + window`.
+    function setEntryEffectiveAt(bytes32 region, bytes32 hash, uint64 addedAt, uint64 effectiveAt) external {
+        _entries[region][hash] = Entry(addedAt, false, effectiveAt, false, 0);
+    }
+
+    function setEmergencyEntry(bytes32 region, bytes32 hash, uint64 addedAt, uint64 effectiveAt, uint8 category)
+        external
+    {
+        _entries[region][hash] = Entry(addedAt, false, effectiveAt, true, category);
+    }
+
+    function getHashEntry(bytes32 region, bytes32 hash)
+        external
+        view
+        override
+        returns (uint64, bool, uint64, bool, uint8)
+    {
         Entry memory e = _entries[region][hash];
-        return (e.addedAt, e.suspended);
+        return (e.addedAt, e.suspended, e.effectiveAt, e.emergency, e.category);
     }
 }
 
@@ -444,6 +466,68 @@ contract SlashJudgeTest is Test {
             )
         );
         judge.submitBlacklistChallenge(node, NODE_ID, BLOB, abi.encode(s), _signStream(s), true, SALT);
+    }
+
+    // --- ADR 011 § Compliance Window (#1169) --------------------------------
+
+    /// @notice The entry was ADDED before the response but its compliance window
+    ///         had not elapsed, so the node had no cycle in which it could have
+    ///         learned of it. Not slashable — this is the regression #1169
+    ///         describes, where anchoring on `addedAt` punished a node for a
+    ///         delivery it could not have known was prohibited.
+    function test_blacklist_revertsWhenResponseInsideComplianceWindow() public {
+        uint64 addedAt = uint64(block.timestamp - 1000);
+        uint64 effectiveAt = addedAt + 24 hours; // still in the future
+        blacklist.setEntryEffectiveAt(GLOBAL_REGION, BLOB, addedAt, effectiveAt);
+        SlashJudge.StreamMsg memory s = _stream(true, 10, streamTs);
+        vm.prank(challenger);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                SlashJudge.BlacklistAfterResponse.selector, uint256(effectiveAt) * 1_000_000, streamTs
+            )
+        );
+        judge.submitBlacklistChallenge(node, NODE_ID, BLOB, abi.encode(s), _signStream(s), true, SALT);
+    }
+
+    /// @notice Same entry, same node — once `effectiveAt` precedes the response,
+    ///         the slash lands. Pins that the window is a delay, not an immunity.
+    function test_blacklist_slashesOnceComplianceWindowElapsed() public {
+        uint64 addedAt = uint64(block.timestamp - 25 hours);
+        blacklist.setEntryEffectiveAt(GLOBAL_REGION, BLOB, addedAt, addedAt + 24 hours);
+        SlashJudge.StreamMsg memory s = _stream(true, 10, streamTs);
+        _commitAndMature(_blacklistHash(_streamStructHash(s), true));
+        vm.prank(challenger);
+        judge.submitBlacklistChallenge(node, NODE_ID, BLOB, abi.encode(s), _signStream(s), true, SALT);
+        assertEq(slasher.lastOffense(), uint8(ISlashJudge.OffenseType.Blacklist));
+    }
+
+    // --- ADR 011 emergency auto-expiry (#1167) ------------------------------
+
+    /// @notice A GENERAL emergency entry past its 14-day deadline is no longer
+    ///         enforceable, so it cannot ground a slash even though the response
+    ///         post-dates `effectiveAt`.
+    function test_blacklist_revertsWhenEmergencyEntryExpired() public {
+        vm.warp(block.timestamp + 15 days);
+        uint64 addedAt = uint64(block.timestamp - 15 days);
+        blacklist.setEmergencyEntry(GLOBAL_REGION, BLOB, addedAt, addedAt + 2 hours, 0);
+        SlashJudge.StreamMsg memory s = _stream(true, 10, uint64(block.timestamp * 1_000_000 - 1_000_000));
+        vm.prank(challenger);
+        vm.expectRevert(abi.encodeWithSelector(SlashJudge.HashNotBlacklisted.selector, BLOB));
+        judge.submitBlacklistChallenge(node, NODE_ID, BLOB, abi.encode(s), _signStream(s), true, SALT);
+    }
+
+    /// @notice A CSAM emergency entry at the same age is still inside its 90-day
+    ///         deadline and remains slashable — the category, not the elapsed
+    ///         time alone, decides.
+    function test_blacklist_slashesOnUnexpiredSevereEmergencyEntry() public {
+        vm.warp(block.timestamp + 15 days);
+        uint64 addedAt = uint64(block.timestamp - 15 days);
+        blacklist.setEmergencyEntry(GLOBAL_REGION, BLOB, addedAt, addedAt + 2 hours, 1); // Category.CSAM
+        SlashJudge.StreamMsg memory s = _stream(true, 10, uint64(block.timestamp * 1_000_000 - 1_000_000));
+        _commitAndMature(_blacklistHash(_streamStructHash(s), true));
+        vm.prank(challenger);
+        judge.submitBlacklistChallenge(node, NODE_ID, BLOB, abi.encode(s), _signStream(s), true, SALT);
+        assertEq(slasher.lastOffense(), uint8(ISlashJudge.OffenseType.Blacklist));
     }
 
     function test_blacklist_revertsWhenSuspended() public {

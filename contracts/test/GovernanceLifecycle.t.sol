@@ -90,6 +90,7 @@ contract GovernanceLifecycleTest is Test, BaseProtocolDeploy {
     address internal voter1 = address(0xBBBB);
     address internal voter2 = address(0xCCCC);
     address internal multisig = address(0xC0DE);
+    bytes32 internal constant REGION_DE = bytes32("DE");
     address internal challengerPool = address(0xCCEE);
 
     // Counter used to make each proposal description unique so identical
@@ -662,13 +663,22 @@ contract GovernanceLifecycleTest is Test, BaseProtocolDeploy {
 
     function test_lifecycle_ContentBlacklist_registerRegionalBody_happy() public {
         address regionalBody = address(0xEEEE01);
-        _runLifecycle(address(blacklist), abi.encodeCall(ContentBlacklist.registerRegionalBody, (regionalBody)));
+        _runLifecycle(
+            address(blacklist),
+            abi.encodeCall(ContentBlacklist.registerRegionalBody, (REGION_DE, regionalBody, multisig))
+        );
         assertTrue(blacklist.hasRole(blacklist.REGIONAL_BODY_ROLE(), regionalBody));
+        assertEq(blacklist.getRegionalBody(REGION_DE).body, regionalBody);
+        assertEq(blacklist.regionOfBody(regionalBody), REGION_DE);
     }
 
-    // `registerRegionalBody` does not validate its argument (OZ AccessControl
-    // permits granting a role to `address(0)` — a no-op for permissioning),
-    // so there's no revert path to exercise.
+    function test_lifecycle_ContentBlacklist_registerRegionalBody_outOfBounds() public {
+        _runLifecycleExpectExecuteRevert(
+            address(blacklist),
+            abi.encodeCall(ContentBlacklist.registerRegionalBody, (REGION_DE, address(0), multisig)),
+            abi.encodeWithSelector(ContentBlacklist.ZeroAddress.selector)
+        );
+    }
 
     // =================================================================
     // SlashAppeal (2 setters)

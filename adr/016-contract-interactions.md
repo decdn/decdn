@@ -356,8 +356,15 @@ After all contracts are deployed, the deployer must execute these transactions b
 7. **Register regional governance bodies** (when jurisdictional bodies are constituted):
 
    ```solidity
-   contentBlacklist.registerRegionalBody(regionCode, bodyAddress);
+   contentBlacklist.registerRegionalBody(regionCode, bodyAddress, emergencyMultisig);
    ```
+
+   The body is bound to `regionCode` and may only write entries for it. The third
+   argument names the `EMERGENCY_MULTISIG_ROLE` holder to check signer
+   disjointness against — see [ADR 011 § Signer non-overlap](011-content-takedown.md#regional-governance-bodies).
+   The call reverts on overlap; where either side is not signer-enumerable it
+   succeeds with `RegionalBodyRegistered.signersVerified == false`, and the
+   proposal must document the off-chain disjointness check.
 
 8. **Transfer admin roles** to `TimelockController`:
 
