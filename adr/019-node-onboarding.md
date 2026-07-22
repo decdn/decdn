@@ -51,10 +51,10 @@ Before any on-chain or protocol activity:
    at the protocol layer — any staked node may serve cached blobs and pass them on for
    payment. To be recognised as an *authorized origin* for a registered namespace, the
    namespace's publisher must propose the operator via `OriginAssignment.proposeAssignment`
-   and the DAO must ratify after timelock ([ADR 011 § Origin Assignment Authority](011-content-takedown.md#origin-assignment-authority));
-   for default-open content (`namespaceId == 0`), the operator must be in the
-   DAO-maintained allow-list (see
-   [ADR 011 § Default-open allow-list](011-content-takedown.md#default-open-allow-list)).
+   and the DAO must ratify after timelock ([ADR 011 § Origin Assignment Authority](011-content-takedown.md#origin-assignment-authority)).
+   Content served under namespace 0 (`namespaceId == 0`) has no origin role — no operator can be an
+   authorized origin for it (see
+   [ADR 011 § Namespace 0](011-content-takedown.md#namespace-0)).
    These steps run on the publisher's or governance's timeline, independent of node
    onboarding.
 

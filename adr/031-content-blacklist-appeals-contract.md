@@ -38,7 +38,7 @@ enum AppealStatus {
 
 enum StandingPath {
     None,           // 0 — invalid sentinel
-    Publisher,      // 1 — publisherRegistry.ownerOf(namespaceId) == filer AND that namespace hasClaimed the hash
+    Publisher,      // 1 — publisherRegistry.ownerOf(namespaceId) == filer (hash->namespace is off-chain, ADR 002)
     Operator,       // 2 — operator with node.region matching entry.region
     TokenHolder     // 3 — no extra credential: the escrowed appeal bond is the standing (no balance threshold, no synthetic-standing clawback)
 }
@@ -104,7 +104,7 @@ uint256 public totalBondsEscrowed;
 
 **`TOKEN` reference** is the existing immutable `IERC20 public immutable TOKEN` already required by `ContentBlacklist` for the bond pull; no additional constructor argument.
 
-**`PublisherRegistry` reference** is an immutable `IPublisherRegistryStanding` constructor argument (audit I-3): the Publisher standing check needs `ownerOf` + `hasClaimed`, and a security-critical standing gate must not be left unset or re-pointed. The deployment builds `PublisherRegistry` (which needs only `admin`) before `ContentBlacklist`. The TokenHolder path carries no threshold parameter: standing is the escrowed appeal bond, so there is no `appealFilerTokenThreshold` to configure or govern.
+**`PublisherRegistry` reference** is an immutable `IPublisherRegistryStanding` constructor argument (audit I-3): the Publisher standing check needs `ownerOf`, and a security-critical standing gate must not be left unset or re-pointed. The deployment builds `PublisherRegistry` (which needs only `admin`) before `ContentBlacklist`. The TokenHolder path carries no threshold parameter: standing is the escrowed appeal bond, so there is no `appealFilerTokenThreshold` to configure or govern.
 
 ### Function signatures and revert table
 
@@ -126,7 +126,7 @@ function openBlacklistAppeal(
 | `EntryNotFound()` | No `BlacklistEntry` exists for `(blake3Hash, region)` |
 | `FilingWindowClosed()` | `block.timestamp ≥ entry.addedAt + BLACKLIST_APPEAL_FILING_WINDOW` |
 | `InvalidStandingPath()` | `standingPath` is not in `{Publisher, Operator, TokenHolder}` |
-| `StandingCheckFailed()` | The filer fails the declared `standingPath` check: **Publisher** — `publisherRegistry.ownerOf(namespaceId) != msg.sender` OR the namespace has not `hasClaimed` the hash; **Operator** — region mismatch; **TokenHolder** — never fails a standing check (the escrowed appeal bond is the standing, so the only gate is the bond `safeTransferFrom` itself). As-built, Publisher/Operator failures collapse to a single `UnauthorizedStanding(standingPath)` (Operator region mismatch additionally surfaces `OperatorRegionMismatch`). |
+| `StandingCheckFailed()` | The filer fails the declared `standingPath` check: **Publisher** — `publisherRegistry.ownerOf(namespaceId) != msg.sender`; **Operator** — region mismatch; **TokenHolder** — never fails a standing check (the escrowed appeal bond is the standing, so the only gate is the bond `safeTransferFrom` itself). As-built, Publisher/Operator failures collapse to a single `UnauthorizedStanding(standingPath)` (Operator region mismatch additionally surfaces `OperatorRegionMismatch`). |
 | `FilerPerjuryDenylisted()` | `perjuryDenylistUntilAt[msg.sender] > block.timestamp` |
 | `FilerInRejectionCooldown()` | `filerRejections[msg.sender].cooldownUntilAt > block.timestamp` |
 | `EmptyEvidenceBundleHash()` | `evidenceBundleHash == bytes32(0)` |

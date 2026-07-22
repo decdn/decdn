@@ -7,7 +7,7 @@
 
 A decentralized CDN with two participant roles:
 
-- **Nodes** (providers) cache and serve content. They bond TOKEN proportional to declared capacity (`bond = k × Mbps^α` per [ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve)) to participate in the peer mesh and compete on price and latency. Some nodes are configured with an origin backend (S3, NFS, local disk) making them the canonical source for specific content. The **cache role** is permissionless — any bonded operator may pull cached blobs from authorized origins and re-serve them. The **origin role** is DAO-governed: registered namespaces have publisher-proposed operator sets, and a global allow-list covers unregistered content. No external origin URL is ever exposed.
+- **Nodes** (providers) cache and serve content. They bond TOKEN proportional to declared capacity (`bond = k × Mbps^α` per [ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve)) to participate in the peer mesh and compete on price and latency. Some nodes are configured with an origin backend (S3, NFS, local disk) making them the canonical source for specific content. The **cache role** is permissionless — any bonded operator may pull cached blobs from authorized origins and re-serve them. The **origin role** is DAO-governed: registered namespaces have publisher-proposed operator sets, and namespace 0 (content published without a namespace) has no authorized origins. No external origin URL is ever exposed.
 
 - **Clients** consume content. They pay nodes per MB via off-chain payment channels.
 

@@ -337,7 +337,7 @@ A node bonds, responds to probes with `has_blob: true`, but refuses to serve —
 
 **Withholding is not a slashable offense** — operators may legitimately take content offline for maintenance, migration, or business reasons, and slashing for availability creates perverse incentives. The protocol does not guarantee availability; publishers who want fault tolerance opt into it by proposing multiple operators, and the network deprioritizes flaky nodes through reputation:
 
-- **Publisher-chosen operator sets.** Content owners hold a publisher identity ([ADR 002 § Publisher Identity and Namespaces](002-content-addressing.md#publisher-identity-and-namespaces)) and propose an origin operator set per namespace. Governance ratifies the proposal via the standard timelock path ([ADR 011 § Origin Assignment Authority](011-content-takedown.md#origin-assignment-authority)). Set size is the publisher's call — a single trusted operator works for hobbyist publishers, multi-operator sets defuse single-point withholding for publishers who want it. Default-open content uses the DAO-maintained allow-list ([ADR 011 § Default-open allow-list](011-content-takedown.md#default-open-allow-list)) instead, with the same shape — governance picks how many operators to seat.
+- **Publisher-chosen operator sets.** Content owners hold a publisher identity ([ADR 002 § Publisher Identity and Namespaces](002-content-addressing.md#publisher-identity-and-namespaces)) and propose an origin operator set per namespace. Governance ratifies the proposal via the standard timelock path ([ADR 011 § Origin Assignment Authority](011-content-takedown.md#origin-assignment-authority)). Set size is the publisher's call — a single trusted operator works for hobbyist publishers, multi-operator sets defuse single-point withholding for publishers who want it. Content served under namespace 0 has no authorized origins — it is served best-effort from cache/DHT only ([ADR 002 § Namespace 0](002-content-addressing.md#namespace-0)).
 - **Reputation fast-path.** Nodes that respond `has_blob: true` to probes but fail to deliver accumulate reputation penalties at a steeper rate. A node with consistently poor availability is deprioritized in provider selection and loses delivery revenue. Publishers may use the reputation signal as input when proposing or revoking operators in their namespace's assignment.
 
 Note: the probe-triggered eviction hold ([ADR 005](005-protocol.md#probe-triggered-eviction-hold)) addresses a related but distinct problem. Withholding is a node that has the blob but refuses to serve it (behavioral — handled by reputation). The eviction hold addresses a node that signed `has_blob: true` but lost the blob to cache pressure before the stream request (mechanical — prevented by the hold and, if the hold fails, treated as a slashable phantom announcement).
@@ -858,7 +858,7 @@ function nodeIdOf(address operator) external view returns (bytes32 nodeId, bool 
 // (per [ADR 011 § Interaction with ContentBlacklist](011-content-takedown.md#interaction-with-contentblacklist)).
 // Equivalent to `(_, active) = nodeIdOf(operator)` without reading the binding
 // slot. Consumed by `OriginAssignment.proposeAssignment` / `activateAssignment`
-// / default-open allow-list setters per [ADR 011 § Origin Assignment
+// per [ADR 011 § Origin Assignment
 // Authority](011-content-takedown.md#origin-assignment-authority).
 function isActive(address operator) external view returns (bool);
 

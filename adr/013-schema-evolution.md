@@ -192,8 +192,10 @@ use postcard::take_from_bytes;
 #[derive(Serialize, Deserialize)]
 struct StreamRequestBase {
     hash: Hash,
+    namespace_id: U256,
     channel_id: ChannelId,
     byte_offset: u64,
+    byte_len: u64,
     timestamp_us: u64,
 }
 
