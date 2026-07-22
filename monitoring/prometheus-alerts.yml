@@ -256,7 +256,7 @@ groups:
           summary: "Origin-directory watcher not ticking on {{ $labels.instance }}"
           description: |
             The cached namespace → operator directory is no longer refreshed; the
-            prefetch authorized-origin gate reads that cache. Restart and check the
+            pull-through authorized-origin gate reads that cache. Restart and check the
             RPC provider.
 
       # NOTE: /health 503 detection requires an external prober (e.g.

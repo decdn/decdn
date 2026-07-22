@@ -54,7 +54,7 @@
 //! # Failure model
 //!
 //! Bootstrap RPC failure → propagated (the runtime treats it as fatal; the
-//! prefetch authorized-origin gate cannot be trusted without a complete
+//! pull-through authorized-origin gate cannot be trusted without a complete
 //! snapshot). Mirrors `ChainStakerSet::bootstrap`.
 //!
 //! The live tail runs on the shared `resumable_watcher` `eth_getLogs` poller
@@ -194,8 +194,8 @@ impl DirectoryCache {
 
     /// Whether at least one active authorised origin exists for `hash`. Iterates
     /// the underlying sets directly and short-circuits on the first hit — no
-    /// allocation, since the prefetch authorized-origin gate only tests
-    /// emptiness on the (uncommon) lookup-miss path.
+    /// allocation, since the authorized-origin gate only tests emptiness on the
+    /// (uncommon) lookup-miss path.
     fn has_any(&self, hash: &Hash, staker_set: &dyn StakerSet) -> bool {
         match self.namespaces_of.get(hash) {
             Some(namespaces) if !namespaces.is_empty() => namespaces
@@ -216,9 +216,10 @@ impl DirectoryCache {
 const LABEL: &str = "ChainOriginDirectory cache";
 
 /// Chain-backed origin directory. Cheap to clone via the shared inner [`Arc`];
-/// the runtime holds one `Arc<dyn OriginDirectory>` and the prefetch engine
-/// resolves through it. The background watcher task is owned via the projection
-/// so a node-restart cycle never leaks chain-poll tasks.
+/// the runtime holds one `Arc<dyn OriginDirectory>` and its consumers (the
+/// pull-through gate and the `FIND_VALUE` fallback) resolve through it. The
+/// background watcher task is owned via the projection so a node-restart cycle
+/// never leaks chain-poll tasks.
 #[derive(Debug)]
 pub struct ChainOriginDirectory {
     proj: ChainProjection<DirectoryCache>,
@@ -276,7 +277,7 @@ impl ChainOriginDirectory {
     /// bootstrap.
     ///
     /// A bootstrap RPC failure is propagated; the runtime treats it the same as
-    /// the `ChainStakerSet` bootstrap (fatal — the prefetch authorized-origin
+    /// the `ChainStakerSet` bootstrap (fatal — the pull-through authorized-origin
     /// gate cannot be trusted without a complete snapshot).
     ///
     /// The watcher owns its own shutdown token (minted by `resumable_watcher::

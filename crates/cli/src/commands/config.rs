@@ -153,7 +153,7 @@ pub fn write_validate_summary<W: std::io::Write>(
             .blockchain
             .origin_assignment_address
             .as_deref()
-            .unwrap_or("(unset — origin directory empty: prefetch gate finds no origins)")
+            .unwrap_or("(unset — origin directory empty: pull-through gate and FIND_VALUE fallback find no origins)")
     )?;
     writeln!(
         w,
@@ -162,7 +162,7 @@ pub fn write_validate_summary<W: std::io::Write>(
             .blockchain
             .publisher_registry_address
             .as_deref()
-            .unwrap_or("(unset — origin directory empty: prefetch gate finds no origins)")
+            .unwrap_or("(unset — origin directory empty: pull-through gate and FIND_VALUE fallback find no origins)")
     )?;
     writeln!(
         w,
@@ -365,16 +365,6 @@ pub fn write_validate_summary<W: std::io::Write>(
         "  receipts.retained_files:  {}",
         resolved.receipts.retained_files
     )?;
-    writeln!(
-        w,
-        "  prefetch_enabled:         {}",
-        resolved.prefetch.enabled
-    )?;
-    writeln!(
-        w,
-        "  prefetch_acquisitions:    max {} concurrent, {}s timeout",
-        resolved.prefetch.max_concurrent_acquisitions, resolved.prefetch.acquisition_timeout_secs
-    )?;
     // Counts, not contents. An operator running `config validate` after adding a
     // takedown wants confirmation the entries were accepted — and a zero here is
     // the tell that a `[content]` section landed in the wrong file. Printing the
@@ -452,8 +442,8 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # eth_keystore = "~/.decdn/keystore.json"
 # payment_channel_address = ""       # REQUIRED: 0x-prefixed hex
 # capacity_bond_address = ""        # REQUIRED: 0x-prefixed hex
-# origin_assignment_address = ""     # OPTIONAL: 0x-prefixed hex; `decdn publish assign` target, and (paired WITH publisher_registry_address) the chain-backed origin directory for DHT prefetch (ADR 022).
-# publisher_registry_address = ""    # OPTIONAL: 0x-prefixed hex; `decdn publish namespace create` / `claim` target (#1029), and (paired WITH origin_assignment_address) the DHT-prefetch origin directory.
+# origin_assignment_address = ""     # OPTIONAL: 0x-prefixed hex; `decdn publish assign` target, and (paired WITH publisher_registry_address) the chain-backed origin directory (ADR 022).
+# publisher_registry_address = ""    # OPTIONAL: 0x-prefixed hex; `decdn publish namespace create` / `claim` target (#1029), and (paired WITH origin_assignment_address) the origin directory.
 # origin_directory_from_block = 0    # OPTIONAL: ContentClaimed log-replay start; set to the PublisherRegistry deploy block (default 0 scans the whole chain)
 # slash_judge_address = ""           # REQUIRED: 0x-prefixed hex (EIP-712 verifyingContract, ADR 014)
 # chain_id = 421614                  # EIP-712 chain id; default Arbitrum Sepolia
@@ -556,22 +546,6 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 [receipts]
 # max_file_bytes = 134217728                # rotate the download-receipt log at this size (#802); default 128 MiB
 # retained_files = 4                        # rotated backup receipt files retained (#802); 0 keeps none
-
-[prefetch]
-# ADR 022 speculative-prefetch operator policy. Disabled by default. When
-# enabled, a node observing enough FIND_VALUE demand for a hash speculatively
-# acquires it (DHT lookup → probe → paid pull-through), subject to the
-# authorized-origin gate, the rolling-1h budget, and the demand-quality
-# auto-throttle. Leave disabled unless you understand the spend implications.
-# enabled = false
-# require_authorized_origin = true          # require an authorized origin in the FIND_VALUE candidate set
-# budget_usdc_per_hour = 0                  # micro-USDC rolling-1h spend cap; 0 = never prefetch
-# find_value_threshold = 5                  # FIND_VALUE queries within the window that trip the trigger
-# threshold_window_secs = 300               # rolling-window length for the trigger
-# demand_quality_min_ratio = 0.1            # served/acquired auto-throttle floor
-# demand_quality_window_secs = 3600         # rolling-window length for the demand-quality predicate
-# max_concurrent_acquisitions = 4           # cap on background speculative pulls in flight
-# acquisition_timeout_secs = 30             # per-acquisition pull-through deadline
 
 [content]
 # ADR 011 local denylist — this operator's own removal lever, independent of

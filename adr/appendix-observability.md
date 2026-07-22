@@ -85,25 +85,6 @@ Early warning for the three slashable offenses in [ADR 026 § Slashing and burn]
 | `decdn_cache_pinned_count` | Gauge | R | Size of the operator-pinned set (LRU-exempt). See [appendix-blob-cache-eviction.md § Operator pinning overrides LRU](appendix-blob-cache-eviction.md#operator-pinning-overrides-lru). |
 | `decdn_probe_post_eviction_failures_total` | Counter | R | `EvictedSinceProbe` responses from remote nodes during cache-hit stream requests. A sustained rate above ~1% of cache-hit attempts suggests remote hold mechanism failures ([ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh), [ADR 005](005-protocol.md#adr-005-wire-protocol)). |
 
-#### Prefetch Metrics
-
-Operator-policy prefetch from popularity signals per [ADR 022 § Prefetch Decision](022-content-discovery.md#prefetch-decision). All metrics are exposed regardless of whether `prefetch.enabled` is true — a node with prefetch disabled reports zero counters and `decdn_prefetch_enabled` as `0`, giving operators a uniform schema to scrape against and the DAO an off-chain signal for outlier behavior.
-
-The metrics backend (`iroh_metrics`) carries no label dimension, so the per-`gate_result` breakdown of acquisitions is realized as three sibling counters (the same pattern as `decdn_dht_rate_limit_rejected_{per_peer,per_ip,global}_total`), and `demand_quality_ratio` is an integer gauge scaled ×1000 (`…_milli`).
-
-| Metric | Type | Tier | Labels | Description |
-|--------|------|------|--------|-------------|
-| `decdn_prefetch_enabled` | Gauge | M | — | `1` if `prefetch.enabled` is true, `0` otherwise. Provides a stable schema across enabled/disabled nodes. |
-| `decdn_prefetch_acquisitions_total` | Counter | M | — | Prefetch acquisitions triggered by the FIND_VALUE demand signal that proceeded to a pull, subject to the budget ceiling and demand-quality auto-throttle. |
-| `decdn_prefetch_spend_usdc_total` | Counter | M | — | Cumulative USDC paid out for prefetch acquisitions. Pairs with `decdn_prefetch_acquisitions_total` to derive average spend per acquisition. |
-| `decdn_prefetch_budget_exhaustion_events_total` | Counter | M | — | Times `prefetch.budget_usdc_per_hour` was hit, preventing further acquisitions until the rolling window advanced. Non-zero values indicate the operator should raise the budget or investigate elevated demand-signal volume. |
-| `decdn_prefetch_demand_quality_ratio_milli` | Gauge | R | — | Current rolling-window `served_bytes / acquired_bytes` for prefetched content, scaled ×1000 (the gauge backend is integer-valued). Below `prefetch.demand_quality_min_ratio` triggers the auto-throttle described in [ADR 022 § Prefetch Decision](022-content-discovery.md#prefetch-decision). |
-| `decdn_prefetch_throttle_active` | Gauge | R | — | `1` while the demand-quality auto-throttle is suppressing prefetch; `0` otherwise. |
-| `decdn_prefetch_acquire_succeeded_total` | Counter | R | — | Speculative acquisitions whose pull-through completed and cached the blob. Pairs with `decdn_prefetch_spend_usdc_total` to derive average spend per successful acquisition. |
-| `decdn_prefetch_acquire_failed_total` | Counter | R | — | Speculative acquisitions whose pull-through found no source or errored. A sustained non-zero rate suggests demand signals for content with no reachable authorized origin. |
-| `decdn_prefetch_acquire_timeout_total` | Counter | R | — | Speculative acquisitions that hit `prefetch.acquisition_timeout_secs` before completing. |
-| `decdn_prefetch_acquire_dropped_saturated_total` | Counter | R | — | Speculative acquisitions dropped because `prefetch.max_concurrent_acquisitions` were already in flight. Non-zero values indicate the operator should raise the cap or that demand is bursting faster than the node can pull. |
-
 #### Probe Metrics (`cdn/probe/v1`)
 
 | Metric | Type | Tier | Labels | Description |

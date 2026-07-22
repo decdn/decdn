@@ -262,14 +262,13 @@ impl ClientHandler {
                         .respond_error(&mut send, &req, ServeRejectReason::EvictedSinceProbe)
                         .await;
                 }
-                // Content-authorization gate (#821, ADR 037 §Seed-leech caps /
-                // ADR 022 §Scope and limits). When the operator opts in
+                // Content-authorization gate (#821, ADR 037 §Seed-leech caps).
+                // When the operator opts in
                 // (`pull_through_require_authorized_origin`), refuse to INITIATE an
                 // upstream pull and its cache-warming write for a hash whose
-                // namespace has no currently-authorized origin — the reactive-path
-                // analogue of the prefetch authorized-origin gate, sharing the same
-                // `OriginDirectory` (namespace / default-open / fail-closed
-                // semantics included). It is a pull-*initiation* gate only: a range
+                // namespace has no currently-authorized origin, resolved against the
+                // shared `OriginDirectory` (namespace / default-open / fail-closed
+                // semantics). It is a pull-*initiation* gate only: a range
                 // already held is served from the `Ok(true)` arm above, so refusing
                 // held blobs stays `ContentBlacklist`'s job (ADR 011/031). The
                 // directory is wired only when the gate is enabled, so an unset

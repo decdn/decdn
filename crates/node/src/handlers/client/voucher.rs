@@ -203,17 +203,6 @@ impl ClientHandler {
                 if let Some(gov) = self.leech_governor.as_ref() {
                     gov.record_served(&client_node_id.0, delta_bytes);
                 }
-                // Demand-quality feedback (#820): if this blob was obtained by
-                // speculative prefetch, credit the served bytes to the policy's
-                // `served / acquired` ratio so the auto-throttle reflects whether
-                // prefetched content is actually being consumed.
-                if let Some(pf) = self.prefetch_engine.as_ref() {
-                    pf.note_served_if_prefetched(
-                        *hash.as_bytes(),
-                        delta_bytes,
-                        crate::payment_settlement::unix_now(),
-                    );
-                }
                 // Nonce-gap signal (#747): the voucher was accepted, but its
                 // nonce skipped values past the prior `last_nonce + 1`. The
                 // structured `tracing::warn!` already fired inside

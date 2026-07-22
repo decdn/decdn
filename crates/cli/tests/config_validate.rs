@@ -418,7 +418,6 @@ fn sample_resolved(overrides: impl FnOnce(&mut ResolvedConfig)) -> ResolvedConfi
         dht: decdn_common::config::ResolvedDht::default(),
         probe: decdn_common::config::ResolvedProbe::default(),
         receipts: decdn_common::config::ResolvedReceipts::default(),
-        prefetch: decdn_common::config::ResolvedPrefetch::default(),
         content: decdn_common::config::ResolvedContent::default(),
     };
     overrides(&mut cfg);
@@ -429,23 +428,6 @@ fn render(source: Option<&Path>, cfg: &ResolvedConfig) -> anyhow::Result<String>
     let mut buf = Vec::new();
     commands::write_validate_summary(&mut buf, source, cfg)?;
     Ok(String::from_utf8(buf)?)
-}
-
-#[test]
-fn summary_includes_prefetch_enabled() -> anyhow::Result<()> {
-    let cfg = sample_resolved(|c| {
-        c.prefetch.enabled = true;
-    });
-    let out = render(None, &cfg)?;
-    anyhow::ensure!(
-        out.contains("prefetch_enabled:"),
-        "summary should report prefetch_enabled: {out}"
-    );
-    anyhow::ensure!(
-        out.contains("prefetch_enabled:         true"),
-        "prefetch_enabled should reflect the resolved value: {out}"
-    );
-    Ok(())
 }
 
 /// The node→node pull-through summary is gated on the feature being ENABLED, so with the

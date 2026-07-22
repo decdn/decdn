@@ -68,7 +68,7 @@ use decdn_common::cli::run::{ObservabilityArgs, PaymentArgs};
 use decdn_common::config::{
     ResolvedBlockchain, ResolvedCache, ResolvedConfig, ResolvedDht, ResolvedDiscovery,
     ResolvedGossip, ResolvedIdentity, ResolvedNetwork, ResolvedObservability, ResolvedPayment,
-    ResolvedPrefetch, ResolvedProbe, ResolvedReceipts, ResolvedSecurity,
+    ResolvedProbe, ResolvedReceipts, ResolvedSecurity,
 };
 use decdn_incentive::eth_identity;
 use decdn_node::runtime::{LogLevelSetter, RuntimeReloadState};
@@ -411,7 +411,6 @@ fn build_config(
         dht: ResolvedDht::default(),
         probe: ResolvedProbe::default(),
         receipts: ResolvedReceipts::default(),
-        prefetch: ResolvedPrefetch::default(),
     }
 }
 
