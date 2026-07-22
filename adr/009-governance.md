@@ -126,7 +126,6 @@ The α range upper-bounds at 1.8 to prevent a concentration penalty so steep tha
 | Compliance window | ContentBlacklist | 1 hour | 7 days |
 | Assignment timelock | OriginAssignment | 24 hours | 14 days |
 | Max origins per namespace | OriginAssignment | 1 | 50 |
-| Default-open max origins | OriginAssignment | 20 | 500 |
 | Max namespaces per publisher | PublisherRegistry | 1 | 1000 |
 | Namespace transfer timelock | PublisherRegistry | 24 hours | 30 days |
 | Max evidence age | SlashJudge | 1 day | 30 days |
@@ -149,7 +148,6 @@ CapacityBond parameters are defined in [ADR 026 § Capacity-bond curve](026-toke
 - **Min deposit floor ≥ 1 base unit:** prevents dust channels that cost more in gas to settle than they contain.
 - **Assignment timelock 24 hours–14 days:** Lower bound ensures publishers and the broader community have at least one full business day to surface concerns about a proposed origin set. Upper bound prevents governance from making assignments effectively unusable through delay.
 - **Max origins per namespace 1–50:** Upper bound prevents storage-cost griefing and unbounded gas in `getOrigins` view calls.
-- **Default-open max origins 20–500 (default 100):** The default-open allow-list authorizes operators to serve as origin for any unclaimed hash; the cap is correspondingly larger than the per-namespace cap to allow geographic and operator-class diversity.
 - **Max namespaces per publisher 1–1000:** Anti-squatting limit.
 - **Namespace transfer timelock 24 hours–30 days:** Lower bound prevents instant key-compromise transfers; upper bound prevents governance from blocking legitimate ownership changes.
 - **α range 1.0–1.8 and k bounded by 1G-tier bond [10K, 200K TOKEN]:** The α floor at 1.0 (linear) prevents disabling decentralization pressure entirely. The α ceiling at 1.8 prevents a concentration penalty so steep that mid-tier operators face >5× per-Mbps capital cost vs entry-tier and effectively cannot upgrade. The k bound is parameterized via the 1G-tier bond to constrain governance volatility — k=12.6 gives ≈50K TOKEN at 1 Gbps; the [10K, 200K] range allows governance to halve or quadruple the entry-tier bond without rewriting the curve from scratch.

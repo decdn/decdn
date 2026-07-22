@@ -17,14 +17,14 @@ No existing ADR addressed either question. This ADR establishes:
 4. An emergency fast-path for time-critical removals
 5. The slashing regime for non-compliance
 6. The known limitations of hash-based blacklisting and the mitigations available
-7. A governance-controlled positive authority for origin assignment across all namespaces (`OriginAssignment`) — per-namespace publisher-propose / DAO-ratify for registered namespaces, single global DAO-maintained allow-list for the default-open namespace — built on the publisher/namespace identity primitive defined in [ADR 002](002-content-addressing.md#publisher-identity-and-namespaces)
+7. A governance-controlled positive authority for origin assignment (`OriginAssignment`) — publisher-propose / DAO-ratify per registered namespace; unclaimed content (`namespaceId == 0`) has no authorized origins — built on the publisher/namespace identity primitive defined in [ADR 002](002-content-addressing.md#publisher-identity-and-namespaces)
 
 ## Decision
 
 Content governance over origins has two symmetric authorities, both DAO-controlled:
 
 - **Negative authority — `ContentBlacklist`.** Removes hashes and operators via two governance paths: a global path (network-wide removal) and a regional path (jurisdiction-scoped removal via a designated regional governance body). Nodes must evict blacklisted content and stop announcing it within a defined compliance window; serving a blacklisted hash after the compliance window is a slashable offense. Origin nodes that repeatedly source blacklisted content can themselves be blacklisted by NodeId or operator address, independent of any specific hash — the primary mitigation for hash evasion via trivial re-encoding.
-- **Positive authority — `OriginAssignment`.** Authorizes specific operators to act as origins for specific namespaces (defined in [ADR 002 § Publisher Identity and Namespaces](002-content-addressing.md#publisher-identity-and-namespaces)). For registered namespaces, publishers propose operator sets. Governance ratifies each proposal via the standard timelock path. For default-open content (`namespaceId == 0`), the DAO maintains a single global allow-list (see [§ Default-open allow-list](#default-open-allow-list)). `ContentBlacklist` and `OriginAssignment` integrate via runtime checks with lazy storage cleanup — see [§ Interaction with ContentBlacklist](#interaction-with-contentblacklist).
+- **Positive authority — `OriginAssignment`.** Authorizes specific operators to act as origins for specific namespaces (defined in [ADR 002 § Publisher Identity and Namespaces](002-content-addressing.md#publisher-identity-and-namespaces)). Publishers propose operator sets; governance ratifies each proposal via the standard timelock path. Unclaimed content (`namespaceId == 0`) has no authorized origins — it is served best-effort from cache/DHT per [ADR 002 § Retrieval by namespace](002-content-addressing.md#retrieval-by-namespace). `ContentBlacklist` and `OriginAssignment` integrate via runtime checks with lazy storage cleanup — see [§ Interaction with ContentBlacklist](#interaction-with-contentblacklist).
 
 Each node also maintains a local denylist for operator-initiated removal without waiting for governance.
 
@@ -111,7 +111,7 @@ interface IContentBlacklist {
         string  calldata region,
         bytes32 evidenceBundleHash,
         uint8   standingPath,
-        uint256 namespaceId    // Publisher path: the claiming namespace; ignored on other paths
+        uint256 namespaceId    // Publisher path: the asserted namespace; ignored on other paths
     ) external returns (uint256 appealId);
     function fastTrackAppeal(uint256 appealId) external;        // emergency multisig only
     function unFastTrackAppeal(uint256 appealId) external;      // emergency multisig only — escape hatch, see § Contract surface
@@ -247,9 +247,9 @@ Grounds for appeal:
 
 The filer declares one standing path at filing time via the `standingPath` parameter to `openBlacklistAppeal` (`uint8` enum: `Publisher = 1`, `Operator = 2`, `TokenHolder = 3`). The contract verifies eligibility under the declared path only and does not auto-select among paths a filer might qualify under, keeping the on-chain standing record unambiguous and verification single-branch per appeal.
 
-1. **The affected publisher** per [ADR 002 § Publisher Identity and Namespaces](002-content-addressing.md#publisher-identity-and-namespaces) — the on-chain `PublisherRegistry.ownerOf(namespaceId)` for the namespace whose content the disputed hash falls under. Path 1 is restricted to registered namespaces because the contract has no on-chain way to verify "publisher of record" claims for default-open content; default-open publishers, content advocates, and end-user proxies use path 3 instead. The filer passes the claiming `namespaceId` explicitly as a filing argument — a hash→namespace reverse lookup is ambiguous because many namespaces may claim the same hash — and the contract requires both `ownerOf(namespaceId) == filer` and that the namespace `hasClaimed` the disputed hash (see [ADR 002](002-content-addressing.md#publisher-identity-and-namespaces)); either check failing reverts path 1. Because `claimContent` is a permissionless self-assertion, this proves the filer controls a namespace that claimed the hash, not authorship — acceptable because path 1 confers no more than path 3 (any bond-poster already has standing) and standing alone grants no automatic outcome.
+1. **The affected publisher** per [ADR 002 § Publisher Identity and Namespaces](002-content-addressing.md#publisher-identity-and-namespaces) — the on-chain `PublisherRegistry.ownerOf(namespaceId)` for the namespace the disputed hash is published under. Path 1 is restricted to registered namespaces because the contract has no on-chain way to verify a "publisher of record" for unclaimed content; publishers of unclaimed content, content advocates, and end-user proxies use path 3 instead. The filer passes the `namespaceId` explicitly as a filing argument and the contract requires `ownerOf(namespaceId) == filer`. Because the hash→namespace association is off-chain ([ADR 002 § No per-hash on-chain claims](002-content-addressing.md#no-per-hash-on-chain-claims)), this proves only that the filer controls the named namespace, not that the hash belongs to it or who authored it — acceptable because path 1 confers no more than path 3 (any bond-poster already has standing) and standing alone grants no automatic outcome.
 2. **Any operator currently in compliance scope.** An operator whose declared `node.region` matches the entry's region — i.e., one whose bond is exposed to slashing under the entry. On a **global** entry the region-match check does not apply: a global entry binds every region, so any in-scope operator has standing without a matching region. This catches operator-side disputes (compliance burden, jurisdictional mismatch with the operator's own legal posture). Because `node.region` is self-attested in `NodeAnnounce` (see [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh) and [ADR 030](030-node-region-self-attestation.md#adr-030-node-region-self-attestation)), an operator could in principle flip their `regionHint` immediately before filing to gain standing in any region. [ADR 030 § Region-stability window](030-node-region-self-attestation.md#region-stability-window) closes this surface: operator standing under path 2 additionally requires `block.timestamp - effective >= REGION_STABILITY_WINDOW` (where `effective` falls back to gate activation for pre-upgrade records; default 7 days, governable `[3d, 30d]` per the [ADR 009](009-governance.md#adr-009-governance-model) safety-bound pattern). Filings inside the window are not auto-rejected — they remain admissible at multisig discretion only, the soft-norm heightened-scrutiny fallback for legitimate post-relocation filers. The 1,000 TOKEN bond, the 90-day per-address frequency cap on successful appeals, and the perjury denylist are the additional deterrents on this path; there is no synthetic-standing clawback analogue because the operator bond is unbond-locked under [ADR 026 § Operator economics](026-tokenomics.md#operator-economics) and cannot be flash-acquired.
-3. **Any TOKEN holder** who posts the appeal bond. Standing on this path is the escrowed appeal bond itself — there is no separate balance threshold. This opens a proxy path for end users, content advocates, and default-open publishers without requiring on-chain content ownership. Because the bond is escrowed by the appeal it cannot be flash-loaned, so the deterrents against frivolous filings are the bond (fully burned on rejection), the perjury denylist, the per-address rejection cooldown, and the frequency cap below. A balance gate protects nothing these do not already protect (see [§ Bond and frequency caps](#bond-and-frequency-caps)).
+3. **Any TOKEN holder** who posts the appeal bond. Standing on this path is the escrowed appeal bond itself — there is no separate balance threshold. This opens a proxy path for end users, content advocates, and publishers of unclaimed content without requiring on-chain content ownership. Because the bond is escrowed by the appeal it cannot be flash-loaned, so the deterrents against frivolous filings are the bond (fully burned on rejection), the perjury denylist, the per-address rejection cooldown, and the frequency cap below. A balance gate protects nothing these do not already protect (see [§ Bond and frequency caps](#bond-and-frequency-caps)).
 
 Standing is verified at the filing transaction under the declared path. An operator who unbonds after filing does not lose standing for an already-open appeal — but cannot file new ones until standing is restored. Path 3 has no post-filing balance requirement: once the bond is escrowed the standing is settled, so there is nothing to re-check mid-flow. The declared path is fixed at filing.
 
@@ -427,8 +427,8 @@ Without positive authority, origin assignment is purely off-protocol — content
 The publisher and namespace primitives are defined in [ADR 002 § Publisher Identity and Namespaces](002-content-addressing.md#publisher-identity-and-namespaces). Recap:
 
 - A **publisher** is an Ethereum address that owns at least one namespace in `PublisherRegistry` (acquired implicitly on the first successful `createNamespace()` call; no separate registration step).
-- A **namespace** is a publisher-owned `uint256` identifier under which blob hashes are claimed.
-- The **default-open namespace** (`namespaceId == 0`) governs all unclaimed content; only operators in the DAO-maintained default-open allow-list may serve as origin for it (see [§ Default-open allow-list](#default-open-allow-list)). Origin assignment authority applies to all namespaces — registered namespaces follow the publisher-propose / DAO-ratify flow, while the default-open namespace is governed by a single DAO-set global allow-list.
+- A **namespace** is a publisher-owned `uint256` identifier for a content set and the unit of origin addressing; a request names the namespace its content is published under. There are no per-hash on-chain claims.
+- **Unclaimed content** (`namespaceId == 0`) has no publisher and no authorized origins; it is served best-effort from cache/DHT ([ADR 002 § Namespace 0](002-content-addressing.md#namespace-0-unclaimed-content)). Origin assignment applies only to registered namespaces, via the publisher-propose / DAO-ratify flow.
 
 ### Contract: OriginAssignment
 
@@ -476,24 +476,17 @@ interface IOriginAssignment {
     // does not affect security.
     function pruneBlacklistedAssignment(uint256 namespaceId, address operator) external;
 
-    // Default-open allow-list (namespaceId == 0). GOVERNANCE_ROLE only; see
-    // "Default-open allow-list" below for the lifecycle and validation
-    // invariants.
-    function setDefaultOpenAllowlist(address[] calldata operators) external;
-    function addDefaultOpenOperator(address operator) external;
-    function removeDefaultOpenOperator(address operator) external;
-
     // Wires the read-direction integration with ContentBlacklist for
     // pruneBlacklistedAssignment. Called once during post-deploy initialization
     // (see ADR 016) and not expected to change thereafter; GOVERNANCE_ROLE only.
     function setContentBlacklist(address contentBlacklist) external;
 
     // Governable parameters with safety bounds (see ADR 009)
-    function setMaxOriginsPerNamespace(uint256 cap) external;      // non-zero namespaces
-    function setAssignmentTimelock(uint256 secondsDelay) external; // non-zero namespaces
-    function setDefaultOpenMaxOrigins(uint256 cap) external;
+    function setMaxOriginsPerNamespace(uint256 cap) external;
+    function setAssignmentTimelock(uint256 secondsDelay) external;
 
-    // Views. For namespaceId == 0 these read the default-open allow-list.
+    // Views. For namespaceId == 0 these return empty / false — unclaimed
+    // content has no authorized origins.
     function isAuthorizedOrigin(uint256 namespaceId, address operator) external view returns (bool);
     function getOrigins(uint256 namespaceId) external view returns (address[] memory);
     function getPendingAssignment(uint256 namespaceId)
@@ -505,9 +498,6 @@ interface IOriginAssignment {
     event AssignmentActivated(uint256 indexed namespaceId, address[] operators);
     event AssignmentRevoked(uint256 indexed namespaceId, address indexed operator, address indexed by);
     event BlacklistedAssignmentPruned(uint256 indexed namespaceId, address indexed operator, address indexed pruner);
-    event DefaultOpenAllowlistUpdated(address[] operators, uint256 indexed updateIndex);
-    event DefaultOpenOperatorAdded(address indexed operator);
-    event DefaultOpenOperatorRemoved(address indexed operator);
 }
 ```
 
@@ -529,17 +519,13 @@ interface IOriginAssignment {
 
 The two-step propose-then-ratify flow is deliberate: it gives publishers agency over which operators they trust (publishers know their content best) while keeping the DAO as the authority that confirms the assignment is consistent with protocol-wide policy (e.g., not concentrating too many namespaces on a small operator set, not assigning to operators with poor reputation). Either party can refuse to advance the flow — publishers by not proposing, governance by not ratifying — and the namespace simply continues with its existing assignment (or remains unassigned).
 
-### Default-open allow-list
+### Namespace 0 (unclaimed content)
 
-The default-open namespace has no publisher, so the per-namespace propose / ratify flow does not apply. Instead the DAO directly maintains a single global allow-list of operators authorized to serve as origin for *any* default-open hash, held in `OriginAssignment` under the same per-namespace `EnumerableSet` storage used for registered namespaces, keyed by `namespaceId == 0` — `isAuthorizedOrigin(0, op)` is the same view used everywhere else, no special case downstream.
-
-**Lifecycle.** Allow-list updates are GOVERNANCE_ROLE-only single-step proposals under the Governor's standard timelock. `setDefaultOpenAllowlist(operators)` replaces the active set atomically; `addDefaultOpenOperator` / `removeDefaultOpenOperator` are convenience deltas with the same authority and delay. Each transition appends a checkpoint per affected operator. The contract enforces `operators.length <= defaultOpenMaxOrigins`, that every operator is `CapacityBond.isActive` at activation time, and rejects duplicate addresses. `isAuthorizedOrigin(0, op)` returns set membership from the first deployment — the allow-list starts empty and default-open content has no authorized origin until governance seats one.
-
-**Parameters and bounds.** `defaultOpenMaxOrigins` (default 100) is bounded by [ADR 009](009-governance.md#adr-009-governance-model) within `[20, 500]` — a gas-and-storage cap on `getOrigins(0)` view calls and on default-open allow-list growth, larger than the per-registered cap to allow geographic and operator-class diversity at the cost of bounded view gas.
+`namespaceId == 0` has no publisher and no authorized origins. `OriginAssignment` holds no set for it: `getOrigins(0)` is empty and `isAuthorizedOrigin(0, op)` is always false. Unclaimed content is served best-effort from cache or DHT-discovered holders ([ADR 002 § Namespace 0](002-content-addressing.md#namespace-0-unclaimed-content)); there is no DAO allow-list and no origin role for it.
 
 ### Unassigned namespaces
 
-A registered namespace with no activated assignment is **unassigned**. No operator is authorized as origin for unassigned content, but the protocol still permits cache-only serving from any bonded operator that happens to hold the blob — see [ADR 005 § cdn/probe/v1](005-protocol.md#cdnprobev1--latency-probe). Publishers who claim content but never propose an assignment effectively prevent any new origin from picking up the content from canonical storage; cached copies eventually expire. This is by design — it lets a publisher delete their content set from the network by claiming the hashes and refusing to assign origins.
+A registered namespace with no activated assignment is **unassigned**. No operator is authorized as origin for its content, but the protocol still permits cache-only serving from any bonded operator that happens to hold the blob — see [ADR 005 § cdn/probe/v1](005-protocol.md#cdnprobev1--latency-probe). A publisher who never proposes an assignment prevents any new origin from picking up the namespace's content from canonical storage; cached copies eventually expire. This is by design — it lets a publisher withdraw a content set from the network by leaving its namespace unassigned or revoking its origins.
 
 ### Duplicate-address rejection
 
@@ -562,7 +548,7 @@ Net: blacklisting an operator is O(1) on-chain (one ejection call) and storage c
 
 ### Permissionless property
 
-This authority extends the DAO's role from negative-only (blacklisting) to positive-and-negative (assignment + blacklisting) for all namespaces, including default-open. Cache-only serving remains permissionless — any bonded operator may fetch cached blobs from authorized origins and re-serve them regardless of `OriginAssignment` membership; only the *origin* role becomes DAO-gated, via publisher-proposed sets for registered namespaces and the global allow-list for default-open content. See [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh) for the updated permissionless-role model.
+This authority extends the DAO's role from negative-only (blacklisting) to positive-and-negative (assignment + blacklisting) for registered namespaces. Cache-only serving remains permissionless — any bonded operator may fetch cached blobs from authorized origins and re-serve them regardless of `OriginAssignment` membership; only the *origin* role becomes DAO-gated, via publisher-proposed sets. Unclaimed content (`namespaceId == 0`) has no authorized origins at all. See [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh) for the updated permissionless-role model.
 
 ## Node Behavior
 
@@ -672,7 +658,7 @@ Slash challenges cannot be opened against operators while the disputed entry is 
 - Local denylist preserves operator autonomy for direct legal notices
 - Origin assignment authority gives publishers a protocol-level way to commit specific operators to serving their content; the operator-set size is a publisher/governance decision, not a contract-enforced floor
 - Symmetric blacklist/assignment infrastructure: a blacklisted operator is treated as unauthorized at every runtime check across every namespace they were authorized to serve, with lazy storage cleanup (see [§ Interaction with ContentBlacklist](#interaction-with-contentblacklist))
-- Default-open content is governed by a single DAO-maintained allow-list, with a uniform `OriginAssignment` storage and view model across registered namespaces and the default-open namespace
+- Unclaimed content (`namespaceId == 0`) has no authorized origins and is served best-effort from cache/DHT; only registered namespaces carry a DAO-authorized origin set, so on-chain state is bounded by the number of namespaces rather than by content volume
 - Per-entry appeals (see [§ Blacklist Entry Appeals](#blacklist-entry-appeals)) close the regional-blacklist due-process gap with a bounded fast-track, so a wrongly served takedown can be challenged without `suspendRegionalBody` freezing every other entry the body issued
 - Appeal standing extends to publishers, affected operators, and TOKEN holders above a threshold — content advocates and end-user proxies can file without on-chain content ownership, while the bond and frequency caps deter pro-forma filings
 - Disjoint evidence sets across the two appeal paths (see [§ Blacklist Entry Appeals](#blacklist-entry-appeals)) map a single grievance cleanly to a single path
@@ -685,7 +671,7 @@ Slash challenges cannot be opened against operators while the disputed entry is 
 - Multiple regional bodies add governance coordination overhead; regional bodies can disagree on scope
 - Blacklisted content remains content-addressable and verifiable off-network; eviction stops CDN serving but does not prevent redistribution by other means
 - Origin assignment authority places positive node-role authorization in governance scope alongside the existing negative authority (blacklisting). Capture risk and operator-concentration risk are governance concerns, not just off-protocol coordination concerns
-- Cache-only role is permissionless per [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh); the origin role is governance-gated for all content — per-namespace `OriginAssignment` for registered namespaces and the default-open allow-list for unregistered content
+- Cache-only role is permissionless per [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh); the origin role is governance-gated for registered namespaces via per-namespace `OriginAssignment`, and unclaimed content has no origin role at all — reliable retrieval requires the requester to know the namespace
 - The appeal flow adds seven entry points (`openBlacklistAppeal` / `fastTrackAppeal` / `unFastTrackAppeal` / `rejectAppeal` / `ratifyAppealRemoval` / `reverseAppeal` / `cleanupExpiredAppeal`), per-appeal escrow accounting, a per-address perjury denylist, and a per-address rejection-cooldown counter to `ContentBlacklist`, increasing the contract's surface area and audit cost — same trade-off acknowledged in [ADR 028 § Contract surface](028-slashing-appeals.md#contract-surface)
 - Filers must front `BLACKLIST_APPEAL_BOND` (1,000 TOKEN default) at filing time. For cold-start participants and small-balance TOKEN holders this is a real frictional cost. The bond is governance-bounded `[100, 10,000]` so governance can reduce it if observed filing volumes warrant
 - The concurrent interim-relief caps and per-filer 90-day frequency cap trade off coverage for griefing resistance: a coordinated good-faith dispute against many entries in a single region can be queued behind the caps. Mitigations are observable on-chain (cap-reached events should be surfaced in operator tooling) and the slow-path DecdnGovernor override remains available for cases that overflow the fast-track

@@ -118,7 +118,7 @@ sequenceDiagram
     participant P as Payer
     participant D as Delivering Node
 
-    P->>D: StreamRequest {hash, channel_id, byte_offset, timestamp_us, voucher_interval_mb?}
+    P->>D: StreamRequest {hash, namespace_id, channel_id, byte_offset, timestamp_us, voucher_interval_mb?}
     D->>P: StreamResponse {ok, rate_per_mb, total_bytes, timestamp_us, redirect?, error?, voucher_interval_mb?, slash_sig}
 
     alt ok = true
@@ -140,6 +140,7 @@ For clients using ephemeral (off-chain) NodeId-to-Ethereum-address bindings (see
 ```rust
 struct StreamRequest {
     hash: Hash,
+    namespace_id: U256,  // 0 = unclaimed (cache/DHT only); non-zero routes to that namespace's authorized origins
     channel_id: ChannelId,
     byte_offset: u64,
     byte_len: u64,       // 0 = to end-of-blob; else bound the range to [byte_offset, byte_offset + byte_len)
@@ -156,6 +157,17 @@ The client includes `ethereum_address` and `binding_signature` in the first `Str
 **Voucher wire format:** `Voucher {sig, amt, nonce}` above is shorthand. The EIP-712 signed data covers the full structure from [ADR 003](003-payments.md#adr-003-payment-model): `{channelId, amount, nonce, bytesDelivered, token}`. The fields `signature`, `amount`, and `nonce` are transmitted on the wire; the rest are derived from stream context — `channel_id` is in `StreamRequest`, `token` is fixed at channel open, and `bytesDelivered` is the node's per-channel cumulative byte counter. Including `nonce` explicitly (rather than an implicit incrementing counter) prevents desynchronization if a `VoucherAck` is dropped. The receiver reconstructs the full typed data to verify the signature.
 
 The delivering node advertises its `rate_per_mb` in `StreamResponse`. The payer accepts by sending the first voucher or disconnects and tries another node — no surprise pricing. `timestamp_us` in `StreamResponse` is the requester-generated microsecond timestamp from `StreamRequest`, echoed back unchanged — same pattern as `ProbeResponse`. `slash_sig` is an EIP-712 secp256k1 signature over `{hash, ok, rate_per_mb, total_bytes, channel_id, timestamp_us, redirect}`, signed with the operator's Ethereum key and verifiable via `ecrecover` — see [ADR 014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence). It is mandatory and non-empty on every `StreamResponse`. Signing the full response prevents a malicious party from altering unsigned fields while reusing a valid signature — in particular, `ok` is needed for phantom announcement evidence (proving a node signed `ok: false` after claiming `has_blob: true` in a probe), and `redirect` ensures a node cannot silently alter routing without accountability. A rate mismatch where `stream_response.rate_per_mb > probe_response.rate_per_mb` is slashable if `stream_response.timestamp_us >= probe_response.timestamp_us` and `stream_response.timestamp_us - probe_response.timestamp_us < 30_000_000` (30 seconds); the ordering check prevents unsigned integer underflow in the on-chain verifier, which computes this delta from the signed messages alone (both `timestamp_us` requester-generated) with no wall-clock reference, external time oracle, or clock-skew sensitivity. The `redirect` field in `StreamResponse` is used when a node cannot serve — it contains the NodeId of another node that can, never an external URL. The network is fully opaque.
+
+#### Namespace routing
+
+`StreamRequest` carries `namespace_id`, the namespace the content is published under (see [ADR 002 § Retrieval by namespace](002-content-addressing.md#retrieval-by-namespace)). The delivering node routes on it:
+
+- **`namespace_id != 0`** — the node resolves the namespace's authorized origins via `OriginAssignment.getOrigins(namespace_id)` ([ADR 011 § Origin Assignment Authority](011-content-takedown.md#origin-assignment-authority)) and, on a cache miss, pulls from one of them. If none hold the bytes, the fetch fails.
+- **`namespace_id == 0` (unclaimed)** — there are no authorized origins. The node serves only from its local cache or from DHT-discovered holders ([ADR 022](022-content-discovery.md#adr-022--content-discovery-at-scale)); a cache miss with no DHT holder fails.
+
+`namespace_id` is a **routing hint, not a trust anchor**: the returned bytes are verified against the BLAKE3 `hash` independently ([ADR 002](002-content-addressing.md#adr-002-content-addressing)), so a wrong or hostile `namespace_id` can only cause a failed fetch, never corrupt or mis-attributed delivery. There is no on-chain `(namespace_id, hash)` claim — the requester supplies the association, which the application already knows.
+
+Like `byte_len`, `namespace_id` is part of the base `StreamRequest` (every node routes on it), and because `cdn/client/v1` is pre-finalisation it is a straight in-place addition with no version bump or compatibility shim.
 
 #### Redirect loop prevention
 
