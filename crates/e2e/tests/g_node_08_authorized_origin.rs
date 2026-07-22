@@ -33,7 +33,7 @@
 
 use std::time::Duration;
 
-use alloy::primitives::{B256, U256};
+use alloy::primitives::U256;
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::Context;
 use decdn_cache::Hash;
@@ -117,16 +117,11 @@ async fn run() -> anyhow::Result<()> {
     let client = ClientFixture::new(&chain).await?;
 
     // ---------------------------------------------------------------- negative
-    // Chain truth first: nothing claims H, and namespace 0's default-open
-    // allow-list is empty, so the directory resolves NO authorized origin for it.
-    // This is what the gate reads — assert it rather than assume it.
+    // Chain truth first: the client fetches under namespace 0 (no namespace),
+    // which has no authorized origins (ADR 002 § Namespace 0), so the directory
+    // resolves NO authorized origin for the request. This is what the gate reads
+    // — assert it rather than assume it.
     assert!(chain.origins(U256::ZERO).await?.is_empty());
-    assert!(
-        chain
-            .content_namespaces(b256(origin_hash))
-            .await?
-            .is_empty()
-    );
 
     // The cache role is untouched by the gate: a blob the node already holds is
     // served exactly as before. That serve doubles as this session's warm-up, so
@@ -177,23 +172,21 @@ async fn run() -> anyhow::Result<()> {
     );
 
     // -------------------------------------------------------------- ratification
-    // Publisher claims the three backend-only hashes into its namespace and
-    // proposes this operator as their origin; the DAO ratifies through the
-    // assignment timelock.
+    // The publisher creates a namespace and proposes this operator as its origin;
+    // the DAO ratifies through the assignment timelock. There is no per-hash claim
+    // (ADR 002 § Hash-to-namespace association) — the namespace is the unit of
+    // origin authority, and a request carries the namespace its content is
+    // published under.
     let publisher = PrivateKeySigner::random();
     let namespace = chain.create_namespace(&publisher).await?;
-    for hash in [origin_hash, range_hash, tapped_hash] {
-        chain
-            .claim_content(&publisher, namespace, b256(hash))
-            .await?;
-    }
     chain
         .propose_assignment(&publisher, namespace, &[node.operator_addr()])
         .await?;
     chain.activate_assignment_after_timelock(namespace).await?;
     assert_eq!(
-        chain.content_namespaces(b256(origin_hash)).await?,
-        vec![namespace]
+        chain.origins(namespace).await?,
+        vec![node.operator_addr()],
+        "the DAO-ratified assignment must list this operator as the namespace's origin"
     );
     // Confirms the assignment activated and names this operator. Note the node's
     // gate does not itself read operator identity (#1368) — this asserts the
@@ -452,8 +445,4 @@ fn payload(seed: u8, len: usize) -> Vec<u8> {
             0x80 | (seed ^ step).wrapping_mul(7) >> 1
         })
         .collect()
-}
-
-fn b256(hash: Hash) -> B256 {
-    B256::from_slice(hash.as_bytes())
 }

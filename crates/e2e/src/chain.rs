@@ -452,38 +452,14 @@ impl ChainFixture {
         Ok(id)
     }
 
-    /// Governance-seat one active operator in namespace 0's default-open set.
-    pub async fn add_default_open_operator(&self, operator: Address) -> anyhow::Result<()> {
-        self.impersonate(self.addrs.timelock).await?;
-        let raw = self.raw_provider();
-        let receipt = OriginAssignment::new(self.addrs.origin_assignment, &raw)
-            .addDefaultOpenOperator(operator)
-            .from(self.addrs.timelock)
-            .send()
-            .await
-            .context("addDefaultOpenOperator send")?
-            .get_receipt()
-            .await
-            .context("addDefaultOpenOperator receipt")?;
-        crate::ensure_mined(&receipt, "addDefaultOpenOperator")
-    }
-
-    /// Current authorized-origin addresses for `namespace` (0 = default-open).
+    /// Current authorized-origin addresses for `namespace` (namespace 0 has no
+    /// authorized origins, so `getOrigins(0)` is always empty).
     pub async fn origins(&self, namespace: U256) -> anyhow::Result<Vec<Address>> {
         OriginAssignment::new(self.addrs.origin_assignment, &self.admin)
             .getOrigins(namespace)
             .call()
             .await
             .context("getOrigins")
-    }
-
-    /// Publisher namespaces currently claiming `hash` (empty means default-open).
-    pub async fn content_namespaces(&self, hash: B256) -> anyhow::Result<Vec<U256>> {
-        PublisherRegistry::new(self.addrs.publisher_registry, &self.admin)
-            .namespaceOf(hash)
-            .call()
-            .await
-            .context("namespaceOf")
     }
 
     /// Whether `operator` is authorized for `namespace` in chain truth.
@@ -497,25 +473,6 @@ impl ChainFixture {
             .call()
             .await
             .context("isAuthorizedOrigin")
-    }
-
-    /// Claim `hash` into `namespace` as its publisher owner.
-    pub async fn claim_content(
-        &self,
-        owner: &PrivateKeySigner,
-        namespace: U256,
-        hash: B256,
-    ) -> anyhow::Result<()> {
-        let provider = self.provider_for(owner);
-        let receipt = PublisherRegistry::new(self.addrs.publisher_registry, &provider)
-            .claimContent(namespace, hash)
-            .send()
-            .await
-            .context("claimContent send")?
-            .get_receipt()
-            .await
-            .context("claimContent receipt")?;
-        crate::ensure_mined(&receipt, "claimContent")
     }
 
     /// Propose the registered namespace's replacement origin set as its owner.

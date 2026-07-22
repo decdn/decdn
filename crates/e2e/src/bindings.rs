@@ -115,15 +115,12 @@ alloy::sol! {
         function bytesPerEpoch(address operator, uint64 epoch) external view returns (uint256);
     }
 
-    /// `PublisherRegistry` namespace/claim control plane (ADR 002) — the write
+    /// `PublisherRegistry` namespace control plane (ADR 002) — the write
     /// surface the origin-publisher journeys (#1038/#1039) drive.
     #[sol(rpc)]
     contract PublisherRegistry {
         function createNamespace() external returns (uint256 namespaceId);
-        function claimContent(uint256 namespaceId, bytes32 blake3Hash) external;
-        function namespaceOf(bytes32 blake3Hash) external view returns (uint256[] memory);
         function ownerOf(uint256 namespaceId) external view returns (address);
-        function hasClaimed(uint256 namespaceId, bytes32 blake3Hash) external view returns (bool);
         // Timelocked 2-step namespace ownership transfer (ADR 002). No CLI
         // subcommand drives these yet, so the G-ORIGIN-01 transfer leg (#1038)
         // calls them directly. `pendingTransfer` is the public mapping getter.
@@ -142,7 +139,6 @@ alloy::sol! {
         error NoPendingTransfer(uint256 namespaceId);
         error TransferNotReady(uint256 readyAt);
         error NotPendingOwner(uint256 namespaceId, address caller);
-        error AlreadyClaimed(uint256 namespaceId, bytes32 blake3Hash);
     }
 
     /// `OriginAssignment` propose (publisher) + activate (governance) + reads
@@ -154,7 +150,6 @@ alloy::sol! {
         function assignmentTimelock() external view returns (uint256);
         function proposeAssignment(uint256 namespaceId, address[] operators) external;
         function activateAssignment(uint256 namespaceId) external;
-        function addDefaultOpenOperator(address operator) external;
         function getOrigins(uint256 namespaceId) external view returns (address[] memory);
         function isAuthorizedOrigin(uint256 namespaceId, address operator) external view returns (bool);
         // Pending (proposed, not-yet-activated) assignment read — the state
