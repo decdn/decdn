@@ -38,9 +38,31 @@ mod sol_types {
         contract ContentBlacklist {
             /// Per-(region, hash) entry. `addedAt == 0` means "not blacklisted";
             /// `suspended` is set while a fast-tracked appeal lifts enforcement.
+            ///
+            /// MUST match `ContentBlacklist.HashEntry` field-for-field and in
+            /// order — a static struct return is ABI-identical to the flattened
+            /// tuple, so a missing field silently mis-decodes rather than
+            /// failing loudly.
+            ///
+            /// `effectiveAt` (`addedAt + complianceWindow`, ADR 011 § Compliance
+            /// Window) is the slashability boundary, NOT `addedAt`: an entry is
+            /// unenforceable during the grace period a node needs to learn of it.
+            /// `emergency` + `category` carry the auto-expiry term for entries
+            /// added by the emergency multisig.
             struct HashEntry {
                 uint64 addedAt;
                 bool suspended;
+                uint64 effectiveAt;
+                bool emergency;
+                uint8 category;
+            }
+
+            /// Region-scoped regional-body record (ADR 011 § Regional Governance
+            /// Bodies). `body == address(0)` means no body is registered.
+            struct RegionalBody {
+                address body;
+                uint64 suspendedAt;
+                bool suspensionRatified;
             }
 
             // -----------------------------------------------------------------
@@ -79,6 +101,20 @@ mod sol_types {
 
             /// Remove `hash` from the global blacklist (`GOVERNANCE_ROLE`).
             function removeHashGlobal(bytes32 hash) external;
+
+            /// Bind `body` to `region` and grant it `REGIONAL_BODY_ROLE`
+            /// (`GOVERNANCE_ROLE`). `emergencyMultisig` is the
+            /// `EMERGENCY_MULTISIG_ROLE` holder to check signer-disjointness
+            /// against; it is verified to hold the role.
+            function registerRegionalBody(bytes32 region, address body, address emergencyMultisig)
+                external;
+
+            /// The body registered for `region`, plus its suspension state.
+            function getRegionalBody(bytes32 region) external view returns (RegionalBody memory);
+
+            /// Grace (seconds) between a standard/regional add and the moment the
+            /// entry becomes slashable (ADR 011 § Compliance Window).
+            function complianceWindow() external view returns (uint64);
 
             // -----------------------------------------------------------------
             // Membership events (watcher re-read signals)

@@ -26,12 +26,12 @@
 //! against the daemon — delivery refusal (matched to `EvictedSinceProbe`), the
 //! probe handler (`has_blob: false`), and on-chain slashability. DHT
 //! announce-suppression stays delegated to `crates/node/src/dht/publish.rs`
-//! unit tests (its `is_evicted` gate). The as-built `SlashJudge` enforces
-//! slashability from an entry's `addedAt` (no on-chain compliance-window grace —
-//! that window is the node's *reaction* budget, ADR 011 "target spec vs
-//! as-built"), so "after the window" is modeled by stamping evidence after
-//! `addedAt`. Appeal-driven un-eviction and the explicit probe-hold interplay
-//! are follow-ups (see `blacklist_watcher` docs).
+//! unit tests (its `is_evicted` gate). `SlashJudge` enforces slashability from
+//! an entry's `effectiveAt` (`addedAt + complianceWindow`, ADR 011 § Compliance
+//! Window, #1169), so the slash drive advances chain time past that window
+//! before stamping evidence — the node's *reaction* budget is now an on-chain
+//! grace, not just a prose target. Appeal-driven un-eviction and the explicit
+//! probe-hold interplay are follow-ups (see `blacklist_watcher` docs).
 
 #![cfg(feature = "anvil-e2e")]
 // Test scaffolding legitimately uses unwrap/expect/panic; the workspace
@@ -327,8 +327,18 @@ async fn drive_blacklist_slash(
     hash: Hash,
 ) -> anyhow::Result<()> {
     let hash_key = to_b256(hash);
-    // Evidence timestamp: current chain time (µs), strictly after the entry's
-    // `addedAt` and fresh enough to pass the staleness check.
+    // ADR 011 § Compliance Window: the entry is not slashable until
+    // `effectiveAt = addedAt + complianceWindow`, so step past it before
+    // stamping evidence. Without this the challenge reverts with
+    // `BlacklistAfterResponse` — which is the correct behaviour and exactly what
+    // #1169 added, so the drive has to respect it rather than route around it.
+    // The window is read from the contract, not hardcoded, so a governance
+    // change to the default can't turn this into a no-op.
+    let window = chain.compliance_window().await?;
+    chain.advance_time(window + 60).await?;
+
+    // Evidence timestamp: current chain time (µs), now strictly after the
+    // entry's `effectiveAt` and fresh enough to pass the staleness check.
     let response_ts_us = chain.head_timestamp().await? * 1_000_000;
 
     // The signed `slash_sig` — the production probe signer produces exactly the
