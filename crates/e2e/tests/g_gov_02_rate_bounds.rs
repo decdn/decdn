@@ -26,9 +26,10 @@
 //!    `rate_per_mb` moves 10 → 50, the new floor. That is the whole point — the
 //!    quote is now outside the *old* band and inside the new one.
 //! 6. **Paid path.** The reprice must also govern what the daemon *sells* at,
-//!    not just what it advertises: a fresh paid fetch settles on-chain at the
-//!    new floor. A voucher still priced at the stale 10 would be rejected by
-//!    `RateFloorViolation` and never advance served-bytes.
+//!    not just what it advertises. A fresh paid fetch settles on-chain, and the
+//!    settled voucher is read back to confirm the blob was sold at the new floor
+//!    — settling alone proves little, since the on-chain floor check rejects only
+//!    *under*-payment and a node selling at the ceiling would settle cleanly.
 //! 7. **Negative — out-of-safety-bounds.** `setRateBounds` reverts with
 //!    `RateBoundsInvalid` for `floor < MIN_DEPOSIT_FLOOR` and for
 //!    `ceiling <= floor`, proven as `from = Timelock` static calls for both (so
@@ -50,8 +51,9 @@
 //! ```
 //!
 //! Select the binary, not the file stem: nextest's positional filter matches the
-//! *test name*, so a bare `g_gov_02` matches nothing and exits 0 having run zero
-//! tests.
+//! *test name*, so a bare `g_gov_02` matches nothing. Since nextest 0.9.85 that
+//! is at least loud — `--no-tests` defaults to `fail`, so it exits 4 rather than
+//! reporting a zero-test success.
 
 #![cfg(feature = "anvil-e2e")]
 #![allow(
@@ -77,11 +79,12 @@ use decdn_e2e::node::NodeFixture;
 use decdn_e2e::time;
 
 /// `PaymentChannel`'s governance write + safety-bound error. The production
-/// `decdn_incentive` binding covers the channel-lifecycle and settlement surface
-/// but declares no governance setters and no custom errors — `getRateBounds()`
-/// is the only rate-bounds member it carries. The Timelock-executed setter and
-/// the error it reverts with are declared here rather than widening the shared
-/// fixture bindings — this journey is their only consumer.
+/// `decdn_incentive` binding covers the channel-lifecycle and settlement surface,
+/// and carries the two rate-bounds members the daemon needs — `getRateBounds()`
+/// and the `RateBoundsUpdated` event its watcher subscribes to — but declares no
+/// governance setters and no custom errors at all. The Timelock-executed setter
+/// and the error it reverts with are therefore declared here rather than widening
+/// the shared fixture bindings — this journey is their only consumer.
 mod gov_abi {
     #![allow(
         clippy::expect_used,
@@ -112,6 +115,8 @@ use gov_abi::PaymentChannelGov;
 
 const MIB: usize = 1024 * 1024;
 const DAY: u64 = 24 * 60 * 60;
+/// `PaymentChannel.BYTES_PER_MB` — the divisor in the per-byte price floor.
+const BYTES_PER_MB: u64 = 1_048_576;
 
 /// The band the deploy script ships (`BaseProtocolDeploy.PAYMENT_DELIVERY_*`).
 const OLD_FLOOR: u64 = 1;
@@ -207,12 +212,8 @@ async fn run() -> anyhow::Result<()> {
         set_rate_bounds_calldata(NEW_FLOOR, NEW_CEILING),
         format!("retune delivery rate bounds to [{NEW_FLOOR}, {NEW_CEILING}]"),
     );
+    // `propose_and_queue` asserts the proposal reached `Queued` itself.
     retune.propose_and_queue(&chain, node.operator()).await?;
-    assert_eq!(
-        retune.state(&chain).await?,
-        PROPOSAL_STATE_QUEUED,
-        "the retune must reach Queued (quorum met, timelock scheduled)"
-    );
 
     // ---- Negative: pre-timelock, the OLD bounds still apply. The proposal is
     // queued but the Timelock delay has not elapsed, so neither chain state nor
@@ -264,16 +265,24 @@ async fn run() -> anyhow::Result<()> {
          floor ({NEW_FLOOR}) — outside the old band, inside the new one"
     );
 
-    // ---- The retune must reach the *paid* path too, not just the probe quote.
-    // The daemon clamps in three independent places — the `ProbeResponse`, the
-    // signed `StreamResponse` a buyer actually acts on, and voucher settlement —
-    // so observing only the probe would miss a regression that advertises 50 and
-    // then sells at the stale 10. Settlement is the discriminator: a voucher
-    // priced at 10 for a 2 MiB blob yields `maxBytes = 20 * 1048576 / 50`, far
-    // below the bytes delivered, so `PaymentChannel` would reject it with
-    // `RateFloorViolation` and the operator's served-bytes would never advance.
-    // Paying the honest 50 lands exactly on the boundary (`maxBytes ==
-    // bytesDelivered`), which the contract admits because it rejects only `>`.
+    // ---- The retune must reach the *sell* path too, not just the probe quote.
+    // The clamp has separate call sites for the `ProbeResponse`
+    // (`handlers/probe.rs`) and the signed `StreamResponse` a buyer actually acts
+    // on (`handlers/client/wire.rs`), so observing only the probe would miss a
+    // regression where the two disagree.
+    //
+    // Settling is necessary but NOT sufficient to prove that: the on-chain floor
+    // check (`PaymentChannel._advanceClaimWatermark` → `RateFloorViolation`) is
+    // one-sided — it rejects paying too *little*, so a node that sold at the
+    // ceiling would settle perfectly cleanly. The price itself is therefore the
+    // observable, read back off the channel the vouchers were signed against.
+    //
+    // Note the under-pricing direction never reaches the chain at all: the node
+    // applies the same floor check at zero tolerance before countersigning
+    // (`handlers/client/voucher.rs`), so a stale-rate voucher fails the fetch
+    // outright rather than settling short. That guard is not observable from an
+    // honest client, which is why this leg asserts on price rather than trying to
+    // provoke `RateFloorViolation`.
     let served_before = chain.served_bytes(node.operator_addr()).await?;
     let paid = client.fetch(&chain, &node, hash).await?;
     assert_eq!(
@@ -287,8 +296,33 @@ async fn run() -> anyhow::Result<()> {
     .await?;
     assert!(
         advanced.is_some(),
-        "a delivery paid at the ratified floor must settle on-chain — served-bytes never advanced, \
-         which is what a voucher still priced at the stale {CONFIGURED_RATE} would look like"
+        "a delivery paid at the ratified floor must settle on-chain — served-bytes never advanced"
+    );
+
+    // The rate the blob was actually sold at, recovered from the settled voucher.
+    // Measured: 100 micro-USDC against 2 MiB of claimed bytes, i.e. exactly the
+    // floor. That also means the settlement sits exactly on the contract's own
+    // limit — `maxBytes = mulDiv(100, BYTES_PER_MB, 50) == bytesDelivered` — which
+    // `_advanceClaimWatermark` admits only because it rejects on `>` rather than
+    // `>=`. Worth knowing: there is no headroom on the under-payment side, so a
+    // future change to voucher pricing or blob size will surface here first.
+    //
+    // The `+1` tolerance is for the over-payment side only: each voucher interval
+    // prices its delta with `div_ceil`, so a different interval split could round
+    // a micro-USDC up. The regression this leg exists to catch — selling at the
+    // ceiling — is an order of magnitude away and nowhere near the tolerance.
+    let (amount, billed_bytes) = settled_amount_and_bytes(&chain, paid.channel_id).await?;
+    assert!(
+        billed_bytes >= U256::from(2 * MIB),
+        "the settled voucher must cover the whole blob, got {billed_bytes} billed bytes"
+    );
+    let implied_rate = amount * U256::from(BYTES_PER_MB) / billed_bytes;
+    assert!(
+        (U256::from(NEW_FLOOR)..=U256::from(NEW_FLOOR + 1)).contains(&implied_rate),
+        "the blob must be sold at the ratified floor ({NEW_FLOOR}/MB): settled {amount} \
+         micro-USDC for {billed_bytes} billed bytes = {implied_rate}/MB. A quote clamped to the \
+         ceiling ({NEW_CEILING}) would settle just as cleanly on-chain, which is why this \
+         asserts the price and not merely that settlement happened."
     );
 
     // Cross an epoch so the bytes just served sit in a fully-elapsed epoch, and
@@ -303,9 +337,7 @@ async fn run() -> anyhow::Result<()> {
     let timelock = chain.addrs().timelock;
     simulate_set_rate_bounds(&chain, timelock, 2, 3)
         .await
-        .map_err(|e| {
-            anyhow::anyhow!("an in-bounds pair must simulate cleanly from the Timelock: {e}")
-        })?;
+        .context("an in-bounds pair must simulate cleanly from the Timelock")?;
     expect_revert::<_, PaymentChannelGov::RateBoundsInvalid>(
         simulate_set_rate_bounds(&chain, timelock, 0, 5).await,
         "setRateBounds below MIN_DEPOSIT_FLOOR",
@@ -330,14 +362,11 @@ async fn run() -> anyhow::Result<()> {
         set_rate_bounds_calldata(0, 5),
         "retune delivery rate bounds below the safety floor".to_owned(),
     );
+    // `propose_and_queue` pins the *Governor* state at `Queued`, so "never
+    // reached Queued" (lost quorum, a bad warp) is already distinguishable from
+    // the safety-bounds rejection under test. That says nothing about Timelock
+    // readiness — a separate state machine, warped inside the call below.
     bad.propose_and_queue(&chain, node.operator()).await?;
-    // Pin readiness *before* executing, so a failure to reach `Ready` is
-    // distinguishable from the safety-bounds rejection under test.
-    assert_eq!(
-        bad.state(&chain).await?,
-        PROPOSAL_STATE_QUEUED,
-        "the out-of-bounds proposal must reach Queued before its execute is judged"
-    );
     expect_revert::<_, PaymentChannelGov::RateBoundsInvalid>(
         bad.try_execute_after_timelock(&chain, node.operator())
             .await?,
@@ -506,7 +535,19 @@ impl Proposal {
             .context("queue receipt")?
             .status(),
             "queue",
-        )
+        )?;
+
+        // Every caller needs this, so assert it once here rather than at each
+        // site: reaching `Queued` is what proves quorum was met and the timelock
+        // op was scheduled, and it localizes a lost-vote-weight failure to the
+        // proposal that lost it instead of to whatever runs next.
+        let state = self.state(chain).await?;
+        anyhow::ensure!(
+            state == PROPOSAL_STATE_QUEUED,
+            "proposal must reach Queued after queue() (quorum met, timelock scheduled), got \
+             state {state}"
+        );
+        Ok(())
     }
 
     /// Warp past the Timelock `minDelay` and `execute`, requiring success.
@@ -520,17 +561,21 @@ impl Proposal {
             .map_err(|e| anyhow::anyhow!("execute reverted: {e}"))
     }
 
-    /// Warp past the Timelock `minDelay` and `execute`. The outer `Result` is a
-    /// harness failure (RPC, missing role, bad warp); the inner one is the
-    /// on-chain outcome, so the out-of-bounds negative can assert on a revert
-    /// without conflating it with a broken fixture.
+    /// Warp past the Timelock `minDelay` and `execute`.
     ///
-    /// The inner error stays the typed `alloy::contract::Error` rather than a
-    /// string so callers can selector-match it through `expect_revert`. That is
-    /// what keeps the out-of-bounds negative honest: only a rejection that
-    /// actually carries revert data reaches the inner arm, so a transport fault
-    /// or an unready Timelock can no longer masquerade as the safety-bounds
-    /// guard firing.
+    /// The split is by *what the caller can conclude*, not by where the failure
+    /// physically happened: the outer `Result` means this fixture could not put
+    /// the question to the chain (RPC down, bad warp, or a rejection carrying no
+    /// revert payload to match), while the inner one means the chain rejected it
+    /// and said why in decodable form.
+    ///
+    /// The inner error is the typed `alloy::contract::Error` rather than a string
+    /// so callers can selector-match it through `expect_revert`. Note that the
+    /// routing alone does not identify the guard under test — a missing role or
+    /// an unready Timelock also revert *with* data and so also land in the inner
+    /// arm. It is `expect_revert`'s selector check that separates those from
+    /// `RateBoundsInvalid`; the routing's job is only to keep payload-less
+    /// failures from ever reaching that check.
     async fn try_execute_after_timelock(
         &self,
         chain: &ChainFixture,
@@ -613,6 +658,22 @@ fn mined(status: bool, what: &str) -> anyhow::Result<()> {
 // ---------------------------------------------------------------------------
 // Contract-side assertions
 // ---------------------------------------------------------------------------
+
+/// The settled `(claimedAmount, claimedBytes)` watermark for `channel_id` — what
+/// the node actually charged, in micro-USDC against bao wire bytes. Read after a
+/// paid fetch so the leg above can assert on price rather than on the mere fact
+/// that settlement succeeded.
+async fn settled_amount_and_bytes(
+    chain: &ChainFixture,
+    channel_id: B256,
+) -> anyhow::Result<(U256, U256)> {
+    let ch = PaymentChannel::new(chain.addrs().payment_channel, chain.admin())
+        .getChannel(channel_id)
+        .call()
+        .await
+        .context("getChannel")?;
+    Ok((ch.claimedAmount, ch.claimedBytes))
+}
 
 async fn read_rate_bounds(chain: &ChainFixture) -> anyhow::Result<(U256, U256)> {
     let b = PaymentChannel::new(chain.addrs().payment_channel, chain.admin())
