@@ -34,7 +34,10 @@ pub mod chain;
 pub mod cli;
 pub mod client;
 pub mod node;
+mod poll;
 pub mod time;
+
+pub use poll::poll;
 
 /// Grab `N` distinct ephemeral TCP ports, then release them for spawned
 /// processes (anvil or the daemon) to claim. Shared by [`chain`] and [`node`] so
@@ -73,7 +76,7 @@ pub(crate) fn free_port() -> anyhow::Result<u16> {
 /// for a transaction that was *mined but reverted* (`status == false`), so every
 /// write helper must inspect the status or a revert passes silently. `what`
 /// names the call for the error message.
-pub(crate) fn ensure_mined(
+pub fn ensure_mined(
     receipt: &alloy::rpc::types::TransactionReceipt,
     what: &str,
 ) -> anyhow::Result<()> {
