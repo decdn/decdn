@@ -823,9 +823,7 @@ contract PaymentChannelTest is Test {
     function test_constructor_revertsOnRateCeilingAboveUint64Cap() public {
         uint256 badCeiling = uint256(type(uint64).max) + 1;
         vm.expectRevert(abi.encodeWithSelector(PaymentChannel.RateBoundsInvalid.selector, DELIVERY_FLOOR, badCeiling));
-        new PaymentChannel(
-            usdc, bond, address(router), DISPUTE_WINDOW, MAX_DURATION, DELIVERY_FLOOR, badCeiling, admin
-        );
+        new PaymentChannel(usdc, bond, address(router), DISPUTE_WINDOW, MAX_DURATION, DELIVERY_FLOOR, badCeiling, admin);
     }
 
     // -----------------------------------------------------------------
