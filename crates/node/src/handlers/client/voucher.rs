@@ -26,7 +26,6 @@ impl ClientHandler {
         channel: Option<&Arc<Mutex<ChannelDeliveryState>>>,
         client_node_id: B256,
         rate_per_mb: u64,
-        quote_floor: u64,
         delta_bytes: u64,
     ) -> anyhow::Result<VoucherOutcome> {
         let wire = read_voucher(recv).await?;
@@ -124,24 +123,16 @@ impl ClientHandler {
         // would both miss that (false accept) and reject a delta drawing down an
         // earlier overpayment surplus the chain would settle (false reject).
         //
-        // Scope follows the delivery floor sourced from on-chain `getRateBounds()`
-        // and tracked by the `RateBoundsUpdated` watcher (#1172, ADR 005), but
-        // pinned to the value snapshotted when this stream's `StreamResponse` was
-        // signed (`quote_floor`, threaded from `clamped_rate`) rather than re-read
-        // live here (#1382). Quote and acceptance must agree by construction: a
-        // governance floor raise landing between the signed quote and a voucher
-        // for it would otherwise reject a voucher paying exactly the rate this
-        // node itself quoted, failing an in-flight paid stream the buyer paid
-        // correctly (`rate_bounds.rs` §quote-then-verify). The watcher's ~1s
-        // cadence and multi-interval streams make that race reachable in practice.
-        // `PaymentChannel` enforces `newFloor >= MIN_DEPOSIT_FLOOR (1)`, and the
-        // runtime overwrites the config seed from chain before serving, so the
-        // quoted floor is always live — the former `0`-floor "free-serving config"
-        // (#864) is no longer reachable once the chain read lands. `new_bytes >=
-        // delta_bytes > 0`, so `ZeroBytes` cannot occur; match every arm anyway
-        // (#845) so a future `RateError` variant is a build failure rather than a
-        // silent accept.
-        match verify_rate(amount, new_bytes, quote_floor, 0) {
+        // Scope follows the live delivery floor, sourced from on-chain
+        // `getRateBounds()` and tracked by the `RateBoundsUpdated` watcher
+        // (#1172, ADR 005). `PaymentChannel` enforces `newFloor >=
+        // MIN_DEPOSIT_FLOOR (1)`, and the runtime overwrites the config seed
+        // from chain before serving, so this check is always live — the former
+        // `0`-floor "free-serving config" (#864) is no longer reachable once
+        // the chain read lands. `new_bytes >= delta_bytes > 0`, so `ZeroBytes`
+        // cannot occur; match every arm anyway (#845) so a future `RateError`
+        // variant is a build failure rather than a silent accept.
+        match verify_rate(amount, new_bytes, self.rate_bounds.floor(), 0) {
             Ok(()) => {}
             Err(RateError::Underpayment { .. }) => {
                 self.metrics.voucher_rate_floor_rejected();

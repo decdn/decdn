@@ -22,11 +22,22 @@
 //! - [`Bounds::new`] normalises `ceiling` up to `floor`, so a degenerate pair is
 //!   never stored in the first place.
 //!
-//! Readers that need a *consistent* pair across several decisions (quote now,
-//! verify the matching voucher later) should take one [`RateBounds::snapshot`]
-//! and thread the returned [`Bounds`] through, rather than re-reading — a
-//! governance move between a signed quote and its voucher would otherwise make
-//! the node reject a voucher paying the rate it itself quoted.
+//! Readers that need a *consistent* `(floor, ceiling)` pair for **one** decision
+//! (e.g. the clamp, which reads both) should take a single
+//! [`RateBounds::snapshot`] rather than separate [`Self::floor`] /
+//! [`Self::ceiling`] reads that could observe a half-applied retune.
+//!
+//! Do **not**, however, pin a quote-time floor across a stream and reuse it to
+//! accept that stream's later vouchers. The hard per-byte floor enforced at
+//! voucher acceptance (`handlers/client/voucher.rs`) mirrors the on-chain
+//! `PaymentChannel._advanceClaimWatermark` check, which reads the **live**
+//! `deliveryFloor` at settlement — there is no per-channel floor snapshot on
+//! chain. A voucher priced below the live floor is unredeemable
+//! (`RateFloorViolation`), so the acceptance check must read the live floor too;
+//! pinning the quote-time floor would make the node countersign vouchers it
+//! cannot redeem (see #1382 / #1388). Honouring the buyer across a governance
+//! floor raise is a separate concern — it needs a graceful re-quote signal, not
+//! a stale floor.
 
 use std::sync::Arc;
 

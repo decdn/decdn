@@ -61,7 +61,7 @@ impl ClientHandler {
                 .await;
         };
 
-        let (rate_per_mb, quote_floor) = self.clamped_rate();
+        let rate_per_mb = self.clamped_rate();
 
         // (1) Pre-flight deposit guard: refuse the speculative pull if the channel
         // provably cannot pay the cost it would front. With a finite
@@ -185,7 +185,6 @@ impl ClientHandler {
             &channel,
             client_node_id,
             rate_per_mb,
-            quote_floor,
             interval_mb,
             total_bytes,
             pull,
@@ -224,7 +223,6 @@ impl ClientHandler {
         channel: &Arc<Mutex<ChannelDeliveryState>>,
         client_node_id: B256,
         rate_per_mb: u64,
-        quote_floor: u64,
         interval_mb: u64,
         total_bytes: u64,
         mut pull: NodeProgressivePull,
@@ -391,7 +389,6 @@ impl ClientHandler {
                         Some(channel),
                         client_node_id,
                         rate_per_mb,
-                        quote_floor,
                         delta,
                     )
                     .await

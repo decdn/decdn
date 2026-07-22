@@ -47,19 +47,11 @@ impl ClientHandler {
     /// signing a `StreamResponse`, logging a warning and incrementing
     /// `rate_bounds_clamp_events` on any clamp (ADR 005 §Rate bounds — the same
     /// clamp-and-warn the probe handler applies before signing a `ProbeResponse`).
-    ///
-    /// Returns `(clamped_rate, quote_floor)` where `quote_floor` is the floor of
-    /// the very snapshot the rate was clamped against. The floor is threaded down
-    /// to `collect_voucher` so a stream's voucher-acceptance check enforces the
-    /// floor as of the quote, not a live re-read — a governance floor raise landing
-    /// mid-stream must not reject a voucher paying exactly the rate this node just
-    /// quoted (`rate_bounds.rs` §quote-then-verify).
-    pub(super) fn clamped_rate(&self) -> (u64, u64) {
+    pub(super) fn clamped_rate(&self) -> u64 {
         let raw_rate = self.rate_per_mb.load(Ordering::Relaxed);
-        // One snapshot for the clamp, the log, AND the returned floor — separate
-        // `floor()`/`ceiling()` reads could log a pair that never produced this
-        // clamp decision, and a separate floor read could disagree with the
-        // snapshot this quote was clamped against.
+        // One snapshot for both the clamp and the log — see the identical note
+        // in `ProbeHandler`: separate `floor()`/`ceiling()` reads could log a
+        // pair that never produced this clamp decision.
         let bounds = self.rate_bounds.snapshot();
         let rate_per_mb = bounds.clamp(raw_rate);
         if rate_per_mb != raw_rate {
@@ -72,7 +64,7 @@ impl ClientHandler {
                 "rate_per_mb clamped to delivery bounds before signing StreamResponse"
             );
         }
-        (rate_per_mb, bounds.floor)
+        rate_per_mb
     }
 
     /// Sign a `StreamResponse` body and assemble the full message.
@@ -135,8 +127,7 @@ impl ClientHandler {
             }
         }
         let error = reason.wire_error();
-        // No delivery follows an error response, so the quote-time floor is unused.
-        let (rate_per_mb, _quote_floor) = self.clamped_rate();
+        let rate_per_mb = self.clamped_rate();
         let body = StreamResponseBody {
             hash: req.hash,
             ok: false,
