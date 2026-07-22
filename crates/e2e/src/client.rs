@@ -235,27 +235,58 @@ impl ClientFixture {
         }
     }
 
-    /// Open a funded [`ChannelSession`] to `node` and wait until the daemon has
-    /// registered it, so a later single-shot fetch on the session is
-    /// unambiguous — see [`Self::fetch_once`].
+    /// Open a funded [`ChannelSession`] to `node` and return it only once the
+    /// node's **serve path** has registered it, so every later
+    /// [`Self::fetch_once`] on the session is unambiguous.
     ///
-    /// **Caveat — this narrows the pre-observation window but does not close
-    /// it.** [`crate::node::NodeFixture::wait_for_channel`] polls the admin API,
-    /// which reads the *persisted* channel store, whereas the serve path gates
-    /// on `ClientHandler`'s in-memory map — and `register_open_channel` fsyncs to
-    /// the store before inserting into the map. A journey that asserts on a bare
-    /// refusal should therefore keep a successful control fetch (a blob the node
-    /// holds in cache) *before* the refusal: the control can only succeed once
-    /// the live map is populated, which is the state the refusal needs ruled out.
+    /// Two separate facts have to hold, and only the second one matters to a
+    /// refusal assertion:
+    ///
+    /// 1. [`crate::node::NodeFixture::wait_for_channel`] polls the admin API,
+    ///    which reads the *persisted* channel store.
+    /// 2. `serve_stream` / `pull_authorized` gate on `ClientHandler`'s in-memory
+    ///    map, which `register_open_channel` populates only *after* awaiting the
+    ///    store fsync. So (1) can be true while the serve path still answers
+    ///    `UnknownChannel` → wire `NotFound`.
+    ///
+    /// Waiting on (1) alone would leave every session's first single-shot fetch
+    /// riding that gap. So this also fetches `warmup` — a blob the node is known
+    /// to hold in cache — retrying until it succeeds. A served blob is proof the
+    /// live map is populated, because the serve path had to read it. The warm-up
+    /// bytes are returned so a caller can keep asserting on them rather than
+    /// paying for a throwaway delivery.
+    ///
+    /// # Errors
+    ///
+    /// If the channel never reaches the store, or the warm-up fetch never
+    /// succeeds within the readiness budget (or fails terminally — a
+    /// non-retryable error is returned immediately with its real cause).
     pub async fn open_session(
         &self,
         chain: &ChainFixture,
         node: &NodeFixture,
-    ) -> anyhow::Result<ChannelSession> {
-        let session = self.open_channel(chain, node).await?;
+        warmup: Hash,
+    ) -> anyhow::Result<(ChannelSession, Vec<u8>)> {
+        let mut session = self.open_channel(chain, node).await?;
         node.wait_for_channel(session.channel_id(), Duration::from_secs(60))
             .await?;
-        Ok(session)
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+        loop {
+            match self.fetch_once(&mut session, warmup, 0).await {
+                Ok(bytes) => return Ok((session, bytes)),
+                Err(e) if tokio::time::Instant::now() < deadline && is_retryable(&e) => {
+                    tracing::debug!("session warm-up not ready ({e}); retrying");
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+                Err(e) => {
+                    return Err(e).context(
+                        "session warm-up fetch never succeeded; the node's serve path \
+                         never registered this channel",
+                    );
+                }
+            }
+        }
     }
 
     /// Run **one** paid fetch on `session` — no readiness retry loop — and return
@@ -264,9 +295,10 @@ impl ClientFixture {
     ///
     /// The refusal is the point: [`Self::fetch`] retries a wire `NotFound` for 45s
     /// because it cannot tell the pre-observation window from a real refusal.
-    /// [`Self::open_session`] has narrowed that window (see its caveat), so an
-    /// error here is the node's verdict and reaches the caller typed (e.g.
-    /// downcast to [`UpstreamRefused`]).
+    /// [`Self::open_session`] has already ruled that window out — its warm-up
+    /// fetch proves the serve path holds the channel — so an error here is the
+    /// node's verdict and reaches the caller typed (e.g. downcast to
+    /// [`UpstreamRefused`]).
     ///
     /// # Errors
     ///

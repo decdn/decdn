@@ -237,13 +237,16 @@ impl NodeFixture {
     /// [`crate::client::ClientFixture::fetch`]'s retry loop to ride the window
     /// out. Waiting on the node's own view of the channel narrows it.
     ///
-    /// **It does not close it.** `admin_v1_channels` reads the *persisted*
-    /// channel store, whereas `serve_stream` / `pull_authorized` gate on
-    /// `ClientHandler`'s in-memory map — and `register_open_channel` awaits the
-    /// store fsync *before* inserting into that map. So this can return while the
-    /// serve path still answers `UnknownChannel`. A journey asserting on a bare
-    /// refusal should keep a successful control fetch of a cached blob ahead of
-    /// it; the control cannot succeed until the live map is populated.
+    /// **On its own it does not close that window.** `admin_v1_channels` reads
+    /// the *persisted* channel store, whereas `serve_stream` / `pull_authorized`
+    /// gate on `ClientHandler`'s in-memory map — and `register_open_channel`
+    /// awaits the store fsync *before* inserting into that map. So this can
+    /// return while the serve path still answers `UnknownChannel`.
+    ///
+    /// Prefer [`crate::client::ClientFixture::open_session`], which pairs this
+    /// with a retried warm-up fetch; a served blob is what actually proves the
+    /// live map is populated. Call this directly only to assert on the node's
+    /// bookkeeping itself.
     pub async fn wait_for_channel(
         &self,
         channel_id: alloy::primitives::B256,

@@ -128,17 +128,17 @@ async fn run() -> anyhow::Result<()> {
             .is_empty()
     );
 
-    let mut unauthorized = client.open_session(&chain, &node).await?;
-
     // The cache role is untouched by the gate: a blob the node already holds is
-    // served exactly as before. This is the control for the refusal below — it
-    // proves the channel is live and the node is willing to deliver, so the
-    // refusal cannot be a channel or liveness artifact.
-    let from_cache = client
-        .fetch_once(&mut unauthorized, cached_hash, 0)
-        .await
-        .context("an unauthorized node must still serve blobs it holds in cache")?;
-    assert_eq!(from_cache, cached_payload);
+    // served exactly as before. That serve doubles as this session's warm-up, so
+    // it is the control for every refusal below — it proves the node's serve path
+    // holds the channel and is willing to deliver, which is exactly what a
+    // refusal needs ruled out. `open_session` retries it, so the pre-observation
+    // window cannot masquerade as a refusal later.
+    let (mut unauthorized, from_cache) = client.open_session(&chain, &node, cached_hash).await?;
+    assert_eq!(
+        from_cache, cached_payload,
+        "an unauthorized node must still serve blobs it holds in cache"
+    );
 
     // The origin role is not: the gate refuses to INITIATE the backend fill for a
     // hash with no authorized origin, and the refusal is signed as the wire
@@ -223,14 +223,17 @@ async fn run() -> anyhow::Result<()> {
         "the reactive backend fill must land the blob in the local store"
     );
 
-    let mut authorized = client.open_session(&chain, &node).await?;
+    // Warmed on the cached blob, so this fresh channel is registered in the
+    // node's serve path before the single-shot fetch below depends on it.
+    let (mut authorized, _) = client.open_session(&chain, &node, cached_hash).await?;
 
     // Ordering is load-bearing: the successful `fetch` above proves the watcher
     // has applied `AssignmentActivated`, and since all three `ContentClaimed`
     // were mined in earlier blocks and the sink applies logs in block order, it
-    // transitively proves `range_hash`'s claim is in the directory too. That is
-    // what lets the ranged fetch below use `fetch_once` (no retry) safely. Do not
-    // reorder these two blocks.
+    // transitively proves `range_hash`'s claim is in the directory too. Together
+    // with the warm-up (which covers channel registration — a separate fact),
+    // that is what lets the ranged fetch below use `fetch_once` (no retry)
+    // safely. Do not reorder these two blocks.
     //
     // `range_hash` has never been in the store, so the span is produced by a
     // backend fill and bao-verified against the whole-blob hash by the requester.
