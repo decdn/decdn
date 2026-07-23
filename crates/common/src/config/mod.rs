@@ -8532,8 +8532,9 @@ swap_pool_address = \"0xPool\"
 
     #[test]
     fn resolve_blockchain_rejects_zero_origin_assignment_address() -> anyhow::Result<()> {
-        // Both-or-neither with publisher_registry, so set both with only
-        // origin_assignment zeroed to exercise its guard in isolation.
+        // Only origin_assignment is zeroed, to exercise its zero-address guard in
+        // isolation; publisher_registry carries a valid address (the two are now
+        // independent — the both-or-neither pairing was removed).
         let dir = data_dir_with_keystore()?;
         let cli = BlockchainArgs {
             origin_assignment_address: Some(

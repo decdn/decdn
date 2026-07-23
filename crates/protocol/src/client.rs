@@ -206,7 +206,8 @@ pub struct StreamRequest {
     /// corrupt delivery. The node layer converts this to an alloy `U256`;
     /// keeping it `[u8; 32]` here (like `hash`/`channel_id`) leaves `protocol`
     /// alloy-free. Billing-agnostic but load-bearing for routing, so it lives in
-    /// the frozen base — every node routes on it.
+    /// the frozen base — every node reads it for origin routing (a node with no
+    /// chain origin directory configured resolves nothing from it).
     pub namespace_id: [u8; 32],
     /// `channelId = keccak256(client, provider, channelNonce)` (ADR 003).
     pub channel_id: [u8; 32],
@@ -230,13 +231,6 @@ pub struct StreamRequest {
 pub const NO_NAMESPACE: [u8; 32] = [0u8; 32];
 
 impl StreamRequest {
-    /// True when the request names a routable namespace (non-zero id). A `false`
-    /// value means [`NO_NAMESPACE`]: cache/DHT-only serving, no authorized origins.
-    #[must_use]
-    pub fn has_namespace(&self) -> bool {
-        self.namespace_id != NO_NAMESPACE
-    }
-
     /// The bounded range length as an explicit option, decoding the `byte_len`
     /// sentinel in one place: `None` ⇒ whole tail from `byte_offset`; `Some(n)` ⇒
     /// exactly `n` bytes. Consumers should read the range through this rather than

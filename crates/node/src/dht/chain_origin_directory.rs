@@ -131,8 +131,10 @@ struct DirectoryCache {
     /// and kept current by authoritative `getOrigins` re-reads on each assignment
     /// event — never incremental deltas (see the module header). The only
     /// per-operator delete is the fail-closed [`delta_remove_origin`] fallback
-    /// when a removal-triggered re-read errors. Namespace 0 is never inserted
-    /// (it has no publisher and no origins), so it resolves to empty.
+    /// when a removal-triggered re-read errors. Namespace 0 is never inserted (it
+    /// has no publisher and no origins), so it resolves to empty — enforced
+    /// defensively at both insert sites (`bootstrap_cache`, `resync_namespace`), not
+    /// merely trusted from the ABI-decoded event field.
     origins_of_ns: HashMap<U256, HashSet<Address>>,
     /// `operator address → bound NodeId` (from `CapacityBond.nodeIdOf`).
     /// Liveness is intentionally NOT stored — it is read live from the
@@ -439,7 +441,16 @@ impl<P: Provider + Clone> OriginSink<P> {
                         )
                         .await;
                     }
-                    Err(err) => warn!(%err, "skipping undecodable AssignmentActivated log"),
+                    Err(err) => {
+                        // A signature-matched log that fails to decode is the
+                        // symptom of the hand-written `sol!` binding drifting from
+                        // the deployed contract (memory: "contract ABI drift is
+                        // e2e-only"). Meter it so a systematic decode storm —
+                        // silently dropping every event of a type — is observable on
+                        // dashboards, not warn-log-only.
+                        self.metrics.origin_directory_watcher_resolve_failure();
+                        warn!(%err, "skipping undecodable AssignmentActivated log");
+                    }
                 }
             }
             Some(sig) if sig == AssignmentRevoked::SIGNATURE_HASH => {
@@ -455,7 +466,13 @@ impl<P: Provider + Clone> OriginSink<P> {
                         )
                         .await;
                     }
-                    Err(err) => warn!(%err, "skipping undecodable AssignmentRevoked log"),
+                    Err(err) => {
+                        // See the AssignmentActivated arm: meter decode failures so
+                        // an ABI-drift storm that silently stops applying revokes is
+                        // visible, not warn-log-only.
+                        self.metrics.origin_directory_watcher_resolve_failure();
+                        warn!(%err, "skipping undecodable AssignmentRevoked log");
+                    }
                 }
             }
             Some(sig) if sig == BlacklistedAssignmentPruned::SIGNATURE_HASH => {
@@ -471,7 +488,13 @@ impl<P: Provider + Clone> OriginSink<P> {
                         )
                         .await;
                     }
-                    Err(err) => warn!(%err, "skipping undecodable BlacklistedAssignmentPruned log"),
+                    Err(err) => {
+                        // See the AssignmentActivated arm: meter decode failures so
+                        // an ABI-drift storm that silently stops applying prunes is
+                        // visible, not warn-log-only.
+                        self.metrics.origin_directory_watcher_resolve_failure();
+                        warn!(%err, "skipping undecodable BlacklistedAssignmentPruned log");
+                    }
                 }
             }
             _ => {
@@ -633,6 +656,14 @@ where
     //    current set; avoids replaying assignment-mutation ordering). A namespace
     //    whose set was revoked to empty simply caches empty.
     for ns in namespaces {
+        // Namespace 0 has no authorized origins by construction (`ownerOf(0) == 0`,
+        // so `AssignmentActivated(0, …)` is unreachable). Defend the invariant here
+        // rather than trust the ABI-decoded event field to never be 0 — a decode
+        // drift must not be able to seat operators under `NO_NAMESPACE` and open the
+        // gate for every request (ADR 002 §Namespace 0).
+        if ns == U256::ZERO {
+            continue;
+        }
         let operators = contracts
             .origin
             .getOrigins(ns)
@@ -732,6 +763,14 @@ async fn resync_namespace<R: OriginChainReads>(
     metrics: &Arc<Metrics>,
     namespace: U256,
 ) -> Result<()> {
+    // Namespace 0 authorizes nothing by construction (`ownerOf(0) == 0`), so an
+    // `AssignmentActivated/Revoked(0, …)` is unreachable on-chain. Defend it here
+    // rather than trust the decoded event field to never be 0 — seating operators
+    // under `NO_NAMESPACE` would open the pull-through gate for every request
+    // (ADR 002 §Namespace 0).
+    if namespace == U256::ZERO {
+        return Ok(());
+    }
     let operators = reads.get_origins(namespace).await?;
     resolve_and_store_operators(reads, cache, metrics, &operators).await;
     write_cache(cache, |c| {

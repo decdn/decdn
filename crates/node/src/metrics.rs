@@ -1172,11 +1172,11 @@ pub struct DecdnMetrics {
     pub serve_stream_rejected_insufficient_deposit: Counter,
     /// `serve_stream` cache-miss requests refused before any upstream pull
     /// because the operator's `pull_through_require_authorized_origin` gate is on
-    /// and the hash's namespace has no currently-authorized origin (#821, ADR 037
+    /// and the request's namespace has no currently-authorized origin (#821, ADR 037
     /// §Seed-leech caps). Wire-indistinguishable from `cache_miss` (signed as
     /// `NotFound`), so this server-side counter is the only place the distinction
-    /// lives — a rising value shows how much unclaimed-content warming the gate is
-    /// shedding. Visible name:
+    /// lives — a rising value shows how much unauthorized-namespace warming the gate
+    /// is shedding. Visible name:
     /// `decdn_serve_stream_rejected_unauthorized_origin_total`.
     pub serve_stream_rejected_unauthorized_origin: Counter,
     /// New delivery refused because the channel has a signed cooperative-close
@@ -2061,7 +2061,7 @@ recorders! {
     serve_stream_rejected_insufficient_deposit => serve_stream_rejected_insufficient_deposit.inc();
 
     /// Record a `serve_stream` cache-miss refused by the authorized-origin gate
-    /// (#821): `pull_through_require_authorized_origin` is on and the hash's
+    /// (#821): `pull_through_require_authorized_origin` is on and the request's
     /// namespace has no authorized origin, so no upstream pull was started.
     serve_stream_rejected_unauthorized_origin => serve_stream_rejected_unauthorized_origin.inc();
 

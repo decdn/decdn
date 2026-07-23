@@ -1086,11 +1086,13 @@ async fn open_stream(
 
         let req = StreamRequest {
             hash,
-            // The serving node routes on this only for its origin-directory
-            // fallback (ADR 005 §Namespace routing). Node-to-node pulls pass
-            // `NO_NAMESPACE` (0) — the requester already discovered a holder, so
-            // the downstream node needs no namespace (ADR 002 §Retrieval by
-            // namespace). A client fetch passes the namespace it published under.
+            // The serving node routes on this for its pull-through authorized-origin
+            // gate and origin-directory fallback (ADR 005 §Namespace routing). A
+            // client fetch passes the namespace it published under; a node-to-node
+            // pull to a DHT-discovered holder passes `NO_NAMESPACE` (0) — the holder
+            // already has the bytes (ADR 002 §Retrieval by namespace) — while a pull
+            // to a directory-discovered cold origin passes the served namespace so
+            // that origin's gate resolves and it can fill from its own backend.
             namespace_id,
             channel_id: ctx.channel_id.into(),
             byte_offset,
@@ -1642,6 +1644,7 @@ pub async fn open_progressive_pull(
     slash_domain: &Eip712Domain,
     expected_signer: Address,
     hash: [u8; 32],
+    namespace_id: [u8; 32],
     byte_offset: u64,
     timestamp_us: u64,
     max_blob_size_bytes: u64,
@@ -1655,9 +1658,14 @@ pub async fn open_progressive_pull(
         slash_domain,
         expected_signer,
         hash,
-        // Node-to-node pull: NO_NAMESPACE (the requester already discovered a
-        // holder; ADR 002 §Retrieval by namespace).
-        decdn_protocol::client::NO_NAMESPACE,
+        // Node-to-node pull. `NO_NAMESPACE` (0) for a DHT-discovered *holder* — it
+        // already holds the bytes, so the downstream node needs no namespace (ADR
+        // 002 §Retrieval by namespace). But a directory-discovered *cold origin* is
+        // reached with the served request's namespace: it must fill from its own
+        // backend, and its pull-through authorized-origin gate resolves on that
+        // namespace (ADR 005 §Namespace routing). The caller passes whichever
+        // applies.
+        namespace_id,
         byte_offset,
         timestamp_us,
         deadlines.open,

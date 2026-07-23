@@ -868,12 +868,17 @@ pub struct ClientHandler {
     /// construction via [`ClientHandlerDeps`] only when the operator sets
     /// `cache.pull_through_require_authorized_origin = true`. `None` (the default
     /// and in tests) keeps the permissionless cache role: misses pull through
-    /// unconditionally. When `Some`, a cache miss whose hash has no authorized
-    /// origin in this directory (`has_origin == false`) is refused with
+    /// unconditionally. When `Some`, a cache miss whose request namespace has no
+    /// authorized origin in this directory (`has_origin == false`) is refused with
     /// `NotFound` before any upstream pull or cache-warming write — a
     /// pull-*initiation* gate only, never consulted for a range already held.
-    /// Resolves against the shared `OriginDirectory` using the namespace /
-    /// default-open (`namespaceId == 0`) / fail-closed-on-RPC-loss semantics.
+    /// Resolves against the shared `OriginDirectory` keyed on the request's
+    /// `namespace_id`: namespace 0 (`NO_NAMESPACE`) has no authorized origins (ADR
+    /// 002 §Namespace 0), so an armed gate refuses it — the opposite of the removed
+    /// default-open allow-list. Fail-closed on RPC loss. Note the namespace is
+    /// client-asserted: under namespace-as-origin-addressing there is no on-chain
+    /// hash→namespace claim, so this gate scopes on the namespace the requester
+    /// names, not on proven hash membership.
     pull_origin_gate: Option<Arc<dyn OriginDirectory>>,
     /// Live content deny-set (ADR 011). Consulted at three points, all of which
     /// must gate or the check is bypassable: the hash gate above the

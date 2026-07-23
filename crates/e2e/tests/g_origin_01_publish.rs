@@ -315,7 +315,6 @@ impl Publisher {
             .context("namespace create output carried no numeric namespace_id")
     }
 
-    /// `decdn publish claim <hash> --namespace <id>`.
     /// Run the `decdn` binary with this publisher's keystore and the fixture's
     /// chain coordinates, returning the parsed `--json` stdout. A non-zero exit
     /// is an error carrying stderr (the CLI's `Context` chain).

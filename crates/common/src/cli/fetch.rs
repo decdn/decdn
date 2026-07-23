@@ -407,6 +407,27 @@ mod tests {
         TestCli::parse_from(with_bin).common
     }
 
+    /// `--namespace` accepts a non-zero id, rejects the reserved `0` (the
+    /// `NO_NAMESPACE` sentinel — users omit the flag instead), and rejects
+    /// non-numeric input. Mirrors the publish-side `assign` parser's coverage.
+    #[test]
+    fn parse_fetch_namespace_id_validates() {
+        assert_eq!(super::parse_fetch_namespace_id("7"), Ok(7));
+        assert_eq!(super::parse_fetch_namespace_id("1"), Ok(1));
+
+        let zero = super::parse_fetch_namespace_id("0").expect_err("0 must be rejected");
+        assert!(
+            zero.contains(">= 1"),
+            "0 error should point to the floor: {zero}"
+        );
+
+        let nan = super::parse_fetch_namespace_id("abc").expect_err("non-numeric must be rejected");
+        assert!(
+            nan.contains("invalid namespace id"),
+            "non-numeric error should name the field: {nan}"
+        );
+    }
+
     /// The headline of #1134: the default deadlines are sized so that blob size and
     /// link speed cannot kill a healthy transfer. Liveness comes from the STALL bound;
     /// the overall cap is a leak guard set far above any honest transfer.

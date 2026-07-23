@@ -158,6 +158,28 @@ contract OriginAssignmentTest is Test {
     }
 
     // -----------------------------------------------------------------
+    // namespace 0 (NO_NAMESPACE) is unassignable and authorizes nothing
+    // -----------------------------------------------------------------
+
+    /// Namespace 0 is the `NO_NAMESPACE` sentinel: it has no publisher
+    /// (`ownerOf(0) == address(0)`), so it can never be assigned an origin, and both
+    /// origin views resolve to empty for it. This is the on-chain half of the
+    /// invariant the node's pull-through gate and origin directory rely on (ADR 002
+    /// §Namespace 0) — the inverse of the removed default-open allow-list, and the
+    /// guarantee that replaced the deleted `test_defaultOpen_*` suite.
+    function test_namespaceZero_isUnassignableAndHasNoOrigins() public {
+        // No caller can own namespace 0 (registry returns address(0)), so a propose
+        // against it always reverts NotNamespaceOwner — it can never be seated.
+        vm.prank(publisher);
+        vm.expectRevert(abi.encodeWithSelector(OriginAssignment.NotNamespaceOwner.selector, uint256(0), publisher));
+        oa.proposeAssignment(0, _ops2());
+
+        // And both origin views are empty/false for namespace 0.
+        assertEq(oa.getOrigins(0).length, 0);
+        assertFalse(oa.isAuthorizedOrigin(0, opA));
+    }
+
+    // -----------------------------------------------------------------
     // activateAssignment
     // -----------------------------------------------------------------
 

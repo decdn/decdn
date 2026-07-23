@@ -761,6 +761,9 @@ fn build_origin_with_negative_cache(
         max_blob_size_bytes,
         negative_cache,
         PositiveProbeCache::new(),
+        // Buffered/generic path: the directory is keyed under `NO_NAMESPACE`,
+        // matching the hash-only `Origin::fetch` lookup (node_origin.rs discover).
+        U256::ZERO,
     )
 }
 
@@ -788,15 +791,21 @@ fn build_origin_with_probe_caches(
     max_blob_size_bytes: u64,
     negative_cache: NegativeProbeCache,
     probe_cache: PositiveProbeCache,
+    // Namespace the directory keys the provider set under. Buffered/generic callers
+    // pass `U256::ZERO` (the generic `Origin::fetch` path looks the directory up
+    // under `NO_NAMESPACE`); a namespace-aware progressive test passes a non-zero id
+    // so a lookup under `NO_NAMESPACE` resolves nothing (proving the request's
+    // namespace actually threads through `discover`).
+    directory_namespace: U256,
 ) -> NodeOrigin {
     // Providers are active stakers, matching production (a probe-cache HIT
     // re-checks `is_active`, so an empty set would make every cached provider
     // un-servable on a hit). `find_providers` still returns empty for them — no
-    // routing entries — so fetch #1 resolves via the directory as before. Built
-    // before `providers` is moved into `dir`.
+    // routing entries — so fetch #1 resolves via the directory under
+    // `directory_namespace`. Built before `providers` is moved into `dir`.
     let stakers = ConfigStakerSet::new(providers.iter().copied().collect());
     let mut dir = HashMap::new();
-    dir.insert(U256::ZERO, providers);
+    dir.insert(directory_namespace, providers);
 
     let origin = NodeOrigin::new();
     origin.provision(NodeOriginDeps {
@@ -9165,6 +9174,8 @@ async fn a_fetch_past_the_ttl_probes_again() -> Result<()> {
         0,
         NegativeProbeCache::new(),
         PositiveProbeCache::with_capacity_and_ttl(16, Duration::from_millis(300)),
+        // Buffered `Origin::fetch` path — directory keyed under `NO_NAMESPACE`.
+        U256::ZERO,
     );
 
     let first = Origin::fetch(&origin, hash, u64::MAX)
@@ -9198,6 +9209,159 @@ async fn a_fetch_past_the_ttl_probes_again() -> Result<()> {
     );
     assert_counter(&b_metrics, "probe_cache_misses_total", 2)?;
     assert_counter(&b_metrics, "probe_cache_hits_total", 0)?;
+
+    ep_b.close().await;
+    ep_a.close().await;
+    task_a.await?;
+    Ok(())
+}
+
+/// The request's `namespace_id` is load-bearing on the progressive client-serve leg
+/// (#1401): `open_progressive_pull(hash, ns)` must route the directory fallback on
+/// `ns`, so an authorized origin resolves under its published namespace and NOT under
+/// `NO_NAMESPACE`. The directory here is keyed ONLY under a non-zero namespace, so:
+///   - a pull under `NO_NAMESPACE` (0) resolves no origin (the fallback finds nothing),
+///   - a pull under that namespace resolves the origin and opens the upstream.
+/// A regression that dropped the namespace argument (routing everything as
+/// `NO_NAMESPACE`, as the leg did before this change) would flip the first assertion
+/// from `None` to `Some` and fail here — which the prior symmetric-`ZERO` tests could
+/// not catch.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::expect_used, clippy::too_many_lines)] // test setup; failures should panic loudly
+async fn a_progressive_pull_routes_the_fallback_on_the_request_namespace() -> Result<()> {
+    const NS: u64 = 7; // any non-zero namespace; the directory is keyed only under it.
+    let payload = vec![0x4Bu8; PAYLOAD_LEN];
+    let hash = Hash::new(&payload);
+    let total_bytes = u64::try_from(PAYLOAD_LEN).unwrap_or(u64::MAX);
+
+    // --- Node A: holds the blob; serves probe + client. -----------------------
+    let (cache_a, hash_a, _tmp_a) = cache_with_blob(&payload).await?;
+    anyhow::ensure!(hash_a == hash, "fixture hash mismatch");
+    let a_sk = fresh_key();
+    let a_id = a_sk.public();
+    let a_eth = Arc::new(PrivateKeySigner::random());
+    let b_buyer = Arc::new(PrivateKeySigner::random());
+    let channel_id = B256::repeat_byte(0x4B);
+    let store_a = Arc::new(MemoryChannelStateStore::new());
+    store_a.record(&ChannelState::new(
+        channel_id,
+        b_buyer.address(),
+        TOKEN,
+        U256::from(DEPOSIT_MICRO_USDC),
+    ))?;
+    let metrics_a = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics_a);
+    let domains = HandlerDomains {
+        slash: slash_domain(),
+        voucher: voucher_dom(),
+        binding: binding_dom(),
+    };
+    let handler_a = build_handler_full(
+        a_id,
+        &a_eth,
+        &metrics_a,
+        limiter,
+        cache_a,
+        store_a as Arc<dyn ChannelStateStore>,
+        RATE,
+        &domains,
+        0,
+        16,
+    )?;
+    let (ep_a, addr_a) =
+        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    let probes = Arc::new(AtomicUsize::new(0));
+    let task_a = spawn_a_probe_counting_server(
+        ep_a.clone(),
+        handler_a,
+        Arc::clone(&a_eth),
+        slash_domain(),
+        total_bytes,
+        RATE,
+        Arc::clone(&probes),
+    );
+
+    // --- Node B: dial-only endpoint hosting the NodeOrigin. -------------------
+    let b_sk = fresh_key();
+    let b_id = b_sk.public();
+    let (ep_b, _addr_b) = local_endpoint(b_sk, vec![]).await?;
+    // Prime B's address book with A's endpoint so subsequent NodeId-only dials
+    // (channel open + stream) resolve — same priming as `a_fetch_past_the_ttl`.
+    let _ = probe_once(
+        &ep_b,
+        EndpointAddr::new(a_id).with_ip_addr(addr_a),
+        *hash.as_bytes(),
+        1,
+        false,
+        None,
+        Duration::from_secs(10),
+    )
+    .await?;
+
+    let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
+    let obs_buffer = Arc::new(ObservationBuffer::new());
+    let b_metrics = Arc::new(Metrics::new());
+    let (providers, addr_map) =
+        one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
+    let buyer = Arc::new(StubOpener {
+        channel_id,
+        token: TOKEN,
+        deposit: U256::from(DEPOSIT_MICRO_USDC),
+        signer: Arc::clone(&b_buyer),
+        voucher_domain: voucher_dom(),
+        recorded: Arc::new(Mutex::new(Vec::new())),
+        retired: Arc::new(Mutex::new(Vec::new())),
+    }) as Arc<dyn ChannelOpener>;
+    // Directory keyed ONLY under namespace NS (no `NO_NAMESPACE` entry).
+    let origin = build_origin_with_probe_caches(
+        &ep_b,
+        DhtNodeId::from_bytes(*b_id.as_bytes()),
+        hash,
+        buyer,
+        &local_rep,
+        &obs_buffer,
+        &b_metrics,
+        &empty_region_accountant(),
+        providers,
+        addr_map,
+        Duration::from_secs(20),
+        Duration::from_secs(20),
+        0,
+        NegativeProbeCache::new(),
+        PositiveProbeCache::new(),
+        U256::from(NS),
+    );
+
+    // Negative control FIRST (before any pull warms the hash-keyed probe cache):
+    // a `NO_NAMESPACE` pull finds no directory origin and no cached candidate, so
+    // it resolves nothing. This is the assertion a namespace-dropping regression
+    // would break.
+    let no_ns = tokio::time::timeout(
+        Duration::from_secs(20),
+        origin.open_progressive_pull(hash, U256::ZERO),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("NO_NAMESPACE open_progressive_pull never returned"))?;
+    anyhow::ensure!(
+        no_ns.is_none(),
+        "a NO_NAMESPACE progressive pull must resolve no authorized origin — the \
+         directory has nothing under namespace 0"
+    );
+
+    // The request's namespace routes the fallback to the authorized origin and the
+    // upstream opens.
+    let opened = tokio::time::timeout(
+        Duration::from_secs(20),
+        origin.open_progressive_pull(hash, U256::from(NS)),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("namespaced open_progressive_pull never returned"))?;
+    anyhow::ensure!(
+        opened.is_some(),
+        "a pull under the published namespace must resolve the authorized origin and \
+         open the upstream"
+    );
+    drop(opened); // no bytes forwarded — nothing to settle on drop.
 
     ep_b.close().await;
     ep_a.close().await;

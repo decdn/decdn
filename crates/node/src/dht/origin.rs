@@ -49,11 +49,6 @@ use alloy::primitives::U256;
 
 use crate::dht::routing::NodeId;
 
-/// 32-byte content hash. Re-exported from [`crate::dht::records::Hash`] as a
-/// convenience for the origin-directory call sites (probe/pull paths) that pair
-/// a hash with a namespace; the directory itself keys only on the namespace.
-pub use crate::dht::records::Hash;
-
 /// Read-only view of the on-chain origin directory, keyed by the namespace a
 /// request is published under (ADR 002 §Retrieval by namespace).
 ///

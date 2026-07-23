@@ -132,11 +132,14 @@ impl ClientHandler {
         // (3) Open the progressive upstream pull, bounded by the pull-through
         // deadline so a slow/absent upstream can't pin the stream.
         let deadline = self.pull_through.unwrap_or(WINDOW_PULL_FALLBACK_DEADLINE);
-        // The client's namespace routing hint (ADR 005 §Namespace routing): the
-        // only consumer is the origin-directory fallback inside the pull's
-        // `discover` on a total DHT miss. `NO_NAMESPACE` (0) → no authorized
-        // origins (ADR 002 §Namespace 0). Converted big-endian to the on-chain
-        // `uint256` shape the directory keys on.
+        // The client's namespace routing hint (ADR 005 §Namespace routing). On this
+        // progressive serve path it drives the origin-directory fallback inside the
+        // pull's `discover` on a total DHT miss, and is threaded onto the resulting
+        // node-to-node leg so a directory-discovered cold origin's own pull-through
+        // gate resolves (#1401). (The pull-through authorized-origin gate in
+        // `dispatch` also reads `req.namespace_id`, upstream of this path.)
+        // `NO_NAMESPACE` (0) → no authorized origins (ADR 002 §Namespace 0).
+        // Converted big-endian to the on-chain `uint256` shape the directory keys on.
         let namespace_id = U256::from_be_bytes(req.namespace_id);
         let (header, pull) =
             match tokio::time::timeout(deadline, origin.open_progressive_pull(hash, namespace_id))
