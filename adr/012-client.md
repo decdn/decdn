@@ -7,12 +7,12 @@
 
 Clients are referenced throughout ADRs 001–011 — they pay for content, hold Ethereum keys that authorize fund movement, maintain peer tables, and decrypt content envelopes — but no ADR defines the client as a coherent entity. Four gaps block PoC functionality:
 
-1. **Bootstrap** — how does a client discover initial peers? [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh) specifies registry query and retry but interleaves it with node-specific concerns and is incomplete for clients (no identity loading).
+1. **Bootstrap** — how a client discovers initial peers. [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh) specifies registry query and retry, but interleaves it with node-specific concerns and omits client identity loading.
 2. **Key management** — clients hold an iroh Ed25519 key (NodeId) and an Ethereum secp256k1 key (voucher signing, channel operations). Generation, storage, and rotation are unspecified.
 3. **Identity lifecycle** — [ADR 005](005-protocol.md#adr-005-wire-protocol) defines ephemeral NodeId-to-Ethereum bindings in `StreamRequest` but does not specify creation, rotation, or expiry.
-4. **Trust boundary** — what does the client verify vs. trust? Implied across multiple ADRs but never stated explicitly.
+4. **Trust boundary** — what the client verifies vs. trusts. Implied across multiple ADRs, never stated explicitly.
 
-This ADR consolidates all client-specific behavior into a single canonical specification.
+This ADR consolidates all client-specific behavior into one canonical specification.
 
 ## Decision
 
@@ -32,7 +32,7 @@ A client is a lightweight QUIC endpoint that streams content and pays per MB. It
 
 - Opens `cdn/client/v1` connections to nodes for paid content delivery
 - Uses `cdn/dht/v1` FIND_VALUE for content discovery; falls back to `cdn/probe/v1` broadcast during bootstrap (see [ADR 022](022-content-discovery.md#adr-022--content-discovery-at-scale))
-- Contributes only local reputation observations ([ADR 008](008-reputation.md#adr-008-reputation-system)); it is not a bonded node and publishes nothing to the mesh
+- Contributes only local reputation observations ([ADR 008](008-reputation.md#adr-008-reputation-system)); publishes nothing to the mesh
 - Maintains a local peer table (from the on-chain registry) and reputation scores
 - Signs vouchers authorizing off-chain USDC payments
 
@@ -75,7 +75,7 @@ Startup sequence from first launch to ready state:
 
 The peer cache is `peers.json` under the resolved client data dir — `--data-dir`, else `[identity] data_dir`, defaulting to `~/.decdn/client` — so it moves with the rest of the client's state rather than living at a fixed path.
 
-The on-chain registry is the sole discovery source; a cached peer list from the last successful query covers a transient RPC outage. Clients do not join the iroh-gossip mesh — they neither subscribe to nor relay `NodeAnnounce`. Gossip propagation is the responsibility of bonded nodes, which carry economic accountability (slashing, reputation) for relay correctness and availability; a client stays online only long enough to fetch and gains nothing from mesh participation.
+The on-chain registry is the sole discovery source; a cached peer list from the last successful query covers a transient RPC outage. Clients do not join the iroh-gossip mesh: they neither subscribe to nor relay `NodeAnnounce`. Gossip propagation is the job of bonded nodes, which carry economic accountability (slashing, reputation) for relay correctness and availability. A client stays online only long enough to fetch and gains nothing from mesh participation.
 
 Node-side registry interaction and bootstrap is in [ADR 019 § Step 3.3](019-node-onboarding.md#step-33--build-initial-peer-table-from-on-chain-registry).
 
@@ -99,7 +99,7 @@ Clients manage two independent cryptographic keys.
 - **PoC:** Either an encrypted keystore file at `~/.decdn/eth_keystore` (Web3 Secret Storage format, EOA) or a Safe smart wallet address. The client supports both — all contracts use `SignatureChecker`, which transparently handles EOA and smart account signatures.
 - **Production:** Safe smart wallet (recommended). 1-of-1 for simplicity, 2-of-3 for high-value accounts. A **session key** authorized via the Safe's Session Key Module handles high-frequency voucher signing — see [ADR 024 § Session Keys — Deferred to Production via ERC-7579 smartsessions](024-account-abstraction.md#session-keys--deferred-to-production-via-erc-7579-smartsessions).
 
-**Voucher signing with session keys:** At the default 1 MB voucher cadence, a 100 MB download requires 100 EIP-712 voucher signatures. Hardware wallets require physical confirmation per signature (2–5 seconds each), making them infeasible. Session keys solve this: a lightweight secp256k1 key generated at session start, authorized by the Safe owners (one approval), held in memory for the session, signing vouchers at wire speed. It is time-bounded, scope-limited to voucher signatures, and revocable by the Safe owners. See [ADR 024](024-account-abstraction.md#adr-024-account-abstraction-and-safe-smart-wallet-support) for the full design.
+**Voucher signing with session keys:** At the default 1 MB voucher cadence, a 100 MB download requires 100 EIP-712 voucher signatures. Hardware wallets require physical confirmation per signature (2–5 seconds each), which is infeasible. A session key solves this: a lightweight secp256k1 key generated at session start, authorized once by the Safe owners, held in memory for the session, signing vouchers at wire speed. It is time-bounded, scope-limited to voucher signatures, and revocable by the Safe owners. See [ADR 024](024-account-abstraction.md#adr-024-account-abstraction-and-safe-smart-wallet-support) for the full design.
 
 #### Key Summary
 
@@ -120,7 +120,7 @@ Client identity bindings are **ephemeral and per-connection**, per [ADR 003 — 
 4. **Session:** The node verifies the signature via `SignatureChecker` semantics (`ecrecover` for EOA clients, ERC-1271 `isValidSignature` RPC call for smart account clients — see [ADR 024](024-account-abstraction.md#off-chain-erc-1271-verification)), caches the binding for the connection's lifetime, and uses the verified address for voucher attribution. Subsequent requests on the same connection omit these fields.
 5. **Disconnect:** The node discards the cached binding. No on-chain state to clean up.
 
-**Security properties of `nonce=0`:** The ephemeral binding is not a replay vulnerability because the node only uses it for the authenticated QUIC connection on which it was received — a binding from connection A is never applied to connection B. On-chain `bindNodeId` ([ADR 003](003-payments.md#adr-003-payment-model)) also starts at nonce 0 (`bindingNonce[msg.sender]` is initially 0), so the nonce value alone does not distinguish off-chain from on-chain bindings. Protection against on-chain replay is the EIP-712 domain separator: the node verifies the off-chain binding via `SignatureChecker` semantics (locally, not on-chain), while on-chain `bindNodeId` verifies against `DOMAIN_SEPARATOR` (which includes the `CapacityBond` contract address and chain ID). A signature produced for off-chain use cannot pass the on-chain domain check unless the client uses the exact same domain parameters — and if it does, the on-chain binding consumes the nonce, preventing reuse.
+**Security properties of `nonce=0`:** The ephemeral binding is not a replay vulnerability: the node uses it only for the authenticated QUIC connection on which it arrived — a binding from connection A is never applied to connection B. On-chain `bindNodeId` ([ADR 003](003-payments.md#adr-003-payment-model)) also starts at nonce 0 (`bindingNonce[msg.sender]` is initially 0), so the nonce value alone does not distinguish off-chain from on-chain bindings. Protection against on-chain replay is the EIP-712 domain separator: the node verifies the off-chain binding via `SignatureChecker` semantics locally (not on-chain), while on-chain `bindNodeId` verifies against `DOMAIN_SEPARATOR` (which includes the `CapacityBond` contract address and chain ID). A signature produced for off-chain use cannot pass the on-chain domain check unless the client uses the exact same domain parameters — and if it does, the on-chain binding consumes the nonce, preventing reuse.
 
 **Key rotation:** Generating a new iroh key and reconnecting produces a new NodeId. The client signs a fresh `BindNodeId` with the same Ethereum key and the new NodeId. Open payment channels remain valid — channels are keyed by `(client_ethereum_address, provider_ethereum_address, nonce)`, not by NodeId.
 
@@ -232,7 +232,7 @@ Large files are split into chunks at ingest. A **manifest blob** describes the o
 
 #### Chunking is the coarse answer for ranged access
 
-Splitting a large file into 256 MiB chunk-blobs, each its own BLAKE3 hash, is the **sanctioned, zero-new-surface answer for ranged access against an origin**. A client wanting "the second GB" of a multi-gigabyte manifest-published file fetches only the ~4 chunk-blobs that cover it (`StreamRequest{hash: chunk.hash}` per chunk, [§ Download flow](#download-flow)); a node filling those from origin on a cache miss pulls only those chunk objects whole — never the entire file — and verifies each whole against its own hash with no bao tree or outboard needed. Chunking bounds origin egress to chunk granularity for the common case at the cost of nothing new.
+Splitting a large file into 256 MiB chunk-blobs, each its own BLAKE3 hash, is the **sanctioned, zero-new-surface answer for ranged access against an origin**. A client wanting "the second GB" of a multi-gigabyte manifest-published file fetches only the ~4 chunk-blobs that cover it (`StreamRequest{hash: chunk.hash}` per chunk, [§ Download flow](#download-flow)); a node filling those from origin on a cache miss pulls only those chunk objects whole — never the entire file — and verifies each whole against its own hash with no bao tree or outboard needed. Chunking bounds origin egress to chunk granularity for the common case at no new cost.
 
 Two residual cases chunking does not cover: (a) a **single-blob publish** that skips the manifest (one giant BLAKE3-addressed object), and (b) **sub-256-MiB precision** within a chunk. Both are addressed by the finer-grained range-scoped origin pull in [ADR 037 § Origin-tier pull-through](037-regional-proxy-warming.md#origin-tier-pull-through-ranged-fetch--external-outboard), which fetches a bounded `[a, b)` plus the `{H}.obao4` outboard and verifies the range against the root. Publishers SHOULD prefer the manifest/chunk path for large files; the origin-tier range pull is the fallback for content that is not chunked.
 
@@ -264,7 +264,7 @@ The manifest blob is pushed to the CDN like any other blob. It is typically < 1 
 
 `<data_dir>` is the resolved client data dir — `--data-dir`/`identity.data_dir`, defaulting to `~/.decdn/client` — so parts share a root with the buyer-channel store rather than sitting in a fixed location an explicit `--data-dir` would not move.
 
-A manifest is rejected at decode if it declares more than 1,000,000 chunks, any zero-size chunk, a `filename` that is not a bare basename, or trailing bytes after the record. Each chunk is a separate paid pull and a separate part file, so the chunk cap bounds spending and file count; it is not an allocation bound, since the chunk list is decoded before the cap is applied (an over-large list implies an over-large manifest blob, which `--max-blob-mb` already caps).
+A manifest is rejected at decode if it declares more than 1,000,000 chunks, any zero-size chunk, a `filename` that is not a bare basename, or trailing bytes after the record. Each chunk is a separate paid pull and a separate part file, so the chunk cap bounds spending and file count. It is not an allocation bound, since the chunk list is decoded before the cap is applied (an over-large list implies an over-large manifest blob, which `--max-blob-mb` already caps).
 
 ### Blob retention
 
