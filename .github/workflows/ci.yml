@@ -334,7 +334,7 @@ jobs:
       # non-blocking `coverage-tooling-tests` job so a regression in the
       # helper surfaces as a red X without blocking PRs.
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: '3.12'
 
@@ -1221,7 +1221,7 @@ jobs:
     if: needs.changes.outputs.scripts == 'true' || github.event_name != 'pull_request'
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
       - name: Test CI tooling
