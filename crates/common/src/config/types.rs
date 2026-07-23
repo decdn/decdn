@@ -794,13 +794,6 @@ pub struct GossipConfig {
     /// Whether to subscribe to and publish on the global topic
     /// (`cdn/global/v1`). Default true.
     pub subscribe_global: Option<bool>,
-    /// Whether to join the global `cdn/reputation/v1` topic (ADR 008) to
-    /// exchange signed reputation reports. Independent of `region`.
-    /// Default true.
-    pub subscribe_reputation: Option<bool>,
-    /// Seconds between reputation-report publish ticks. Default 3600 (matches
-    /// the ADR 008 1-hour per-(reporter, node) rate limit). Must be `> 0`.
-    pub reputation_publish_interval_sec: Option<u64>,
     /// Optional hard cap on `PeerTable` entry count
     /// (appendix-peer-table-eviction § No hard size cap). Once the table is
     /// at the cap, new announces from previously-unseen node IDs are

@@ -30,8 +30,8 @@
 /// The argument is kept because it is meaningful at the call site and is what
 /// such a breakdown would key on. Callers should not assume the resulting
 /// series distinguish topics — in practice they do not, and the
-/// publish/receive/reconnect counters merge at least two topic families
-/// (per-`NodeAnnounce` topic names and the reputation topic).
+/// publish/receive/reconnect counters merge the per-`NodeAnnounce` topic names
+/// (global + region).
 pub trait GossipMetrics: Send + Sync + 'static {
     /// Called once per successful publish. Backs the unlabeled
     /// `decdn_gossip_announces_published_total` counter; `topic` is accepted

@@ -96,11 +96,6 @@ const DEFAULT_BUYER_DEPOSIT_MICRO_USDC: u64 = 10_000_000;
 const DEFAULT_ANNOUNCE_INTERVAL_SEC: u64 = 60;
 /// Default peer-table entry TTL after which a stale entry is evicted.
 const DEFAULT_PEER_TTL_SEC: u64 = 600;
-/// Default for subscribing to the global `cdn/reputation/v1` topic (ADR 008).
-const DEFAULT_SUBSCRIBE_REPUTATION: bool = true;
-/// Default interval between reputation-report publish ticks. Matches the ADR
-/// 008 1-hour per-(reporter, node) rate-limit window.
-const DEFAULT_REPUTATION_PUBLISH_INTERVAL_SEC: u64 = 3600;
 /// Default global cap on concurrent in-flight QUIC handler tasks.
 const DEFAULT_MAX_CONCURRENT_HANDLERS: u32 = 256;
 /// Default per-source rate-limit refill (cells/second). A single source
@@ -2482,25 +2477,10 @@ fn resolve_gossip_into(
 
     let subscribe_global = file.and_then(|g| g.subscribe_global).unwrap_or(true);
 
-    let subscribe_reputation = file
-        .and_then(|g| g.subscribe_reputation)
-        .unwrap_or(DEFAULT_SUBSCRIBE_REPUTATION);
-
-    let reputation_publish_interval_sec = file
-        .and_then(|g| g.reputation_publish_interval_sec)
-        .unwrap_or(DEFAULT_REPUTATION_PUBLISH_INTERVAL_SEC);
-    bag.check(
-        reputation_publish_interval_sec > 0,
-        "gossip.reputation_publish_interval_sec",
-        "gossip.reputation_publish_interval_sec must be > 0",
-    );
-
     ResolvedGossip {
         announce_interval_sec,
         peer_ttl_sec,
         subscribe_global,
-        subscribe_reputation,
-        reputation_publish_interval_sec,
         max_peer_entries,
     }
 }
@@ -3336,8 +3316,6 @@ mod tests {
             announce_interval_sec: 60,
             peer_ttl_sec: 600,
             subscribe_global,
-            subscribe_reputation: true,
-            reputation_publish_interval_sec: 3600,
             max_peer_entries: None,
         }
     }
@@ -3373,7 +3351,6 @@ mod tests {
             peer_ttl_sec: Some(123),
             subscribe_global: Some(false),
             max_peer_entries: Some(7),
-            ..Default::default()
         };
         let g = resolve_gossip(Some(&cfg))?;
         assert_eq!(g.announce_interval_sec, 42);
@@ -3389,35 +3366,8 @@ mod tests {
         assert_eq!(g.announce_interval_sec, DEFAULT_ANNOUNCE_INTERVAL_SEC);
         assert_eq!(g.peer_ttl_sec, DEFAULT_PEER_TTL_SEC);
         assert!(g.subscribe_global);
-        assert!(g.subscribe_reputation);
-        assert_eq!(
-            g.reputation_publish_interval_sec,
-            DEFAULT_REPUTATION_PUBLISH_INTERVAL_SEC
-        );
         assert_eq!(g.max_peer_entries, None);
         Ok(())
-    }
-
-    #[test]
-    fn resolve_gossip_reputation_fields_file_override() -> anyhow::Result<()> {
-        let cfg = types::GossipConfig {
-            subscribe_reputation: Some(false),
-            reputation_publish_interval_sec: Some(120),
-            ..Default::default()
-        };
-        let g = resolve_gossip(Some(&cfg))?;
-        assert!(!g.subscribe_reputation);
-        assert_eq!(g.reputation_publish_interval_sec, 120);
-        Ok(())
-    }
-
-    #[test]
-    fn resolve_gossip_rejects_zero_reputation_publish_interval() {
-        let cfg = types::GossipConfig {
-            reputation_publish_interval_sec: Some(0),
-            ..Default::default()
-        };
-        assert!(resolve_gossip(Some(&cfg)).is_err());
     }
 
     #[test]

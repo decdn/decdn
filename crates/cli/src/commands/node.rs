@@ -15,7 +15,7 @@ use serde::Deserialize;
 use decdn_common::admin::{
     AdminRpcClient, AnnounceResponse, ChannelSnapshot, ChannelsResponse, DrainRequest,
     DrainResponse, EvictRequest, EvictResponse, HealthResponse, PeerView, PeersResponse,
-    RegionStatsResponse, ReloadResponse, ReputationRequest, ReputationResponse, StatusResponse,
+    RegionStatsResponse, ReloadResponse, StatusResponse,
 };
 use decdn_common::cli;
 use decdn_common::cli::ConfigPathSource;
@@ -56,7 +56,6 @@ pub async fn node_dispatch(
         cli::NodeCommand::Status(s) => status(s, global_config).await,
         cli::NodeCommand::Channels(c) => channels(c, global_config).await,
         cli::NodeCommand::RegionStats(r) => region_stats(r, global_config).await,
-        cli::NodeCommand::Reputation(r) => reputation(r, global_config).await,
         cli::NodeCommand::Evict(e) => evict(e, global_config).await,
         cli::NodeCommand::Announce(a) => announce(a, global_config).await,
         cli::NodeCommand::Reload(r) => reload(r, global_config).await,
@@ -733,61 +732,6 @@ pub async fn region_stats(
             .context("failed to write region stats table")?;
     }
 
-    Ok(())
-}
-
-/// `decdn node reputation <node-id>`: call `admin_v1_reputation` and print the
-/// queried peer's network score, scored-flag, and per-region coverage (#326).
-pub async fn reputation(
-    args: &cli::ReputationArgs,
-    global_config: Option<&Path>,
-) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        args.timeout_ms > 0,
-        "--timeout-ms must be > 0 (jsonrpsee treats Duration::ZERO as \
-         'never' rather than 'sub-millisecond deadline')"
-    );
-
-    let config_path = args.config.as_deref().or(global_config);
-    let url = resolve_admin_url(args.admin_url.as_deref(), config_path)?;
-
-    let client = HttpClientBuilder::default()
-        .request_timeout(Duration::from_millis(args.timeout_ms))
-        .build(&url)
-        .with_context(|| format!("failed to build admin JSON-RPC client for {url}"))?;
-
-    let parsed: ReputationResponse = client
-        .reputation(ReputationRequest {
-            node_id: args.node_id.clone(),
-        })
-        .await
-        .map_err(|err| classify_client_error(&url, args.timeout_ms, err))?;
-
-    if args.json {
-        let pretty =
-            serde_json::to_string_pretty(&parsed).context("failed to encode reputation as JSON")?;
-        println!("{pretty}");
-    } else {
-        let mut stdout = io::stdout().lock();
-        write_reputation(&mut stdout, &parsed).context("failed to write reputation report")?;
-    }
-
-    Ok(())
-}
-
-/// Write the reputation report to `w`. Pure function so the formatting is
-/// unit-testable without an HTTP hop.
-fn write_reputation(w: &mut impl io::Write, resp: &ReputationResponse) -> io::Result<()> {
-    writeln!(w, "network_score={:.6}", resp.network_score)?;
-    writeln!(w, "scored={}", resp.scored)?;
-    writeln!(w, "regions={}", resp.regions.len())?;
-    if resp.regions.is_empty() {
-        return writeln!(w, "(no coverage signal)");
-    }
-    writeln!(w, "{:<8} {:>10}", "REGION", "COVERAGE")?;
-    for r in &resp.regions {
-        writeln!(w, "{:<8} {:>10.6}", r.region, r.score)?;
-    }
     Ok(())
 }
 
@@ -1712,61 +1656,6 @@ mod tests {
             .expect("write empty");
         let out = String::from_utf8(empty).expect("utf8");
         assert!(out.contains("(no region data)"), "empty sentinel: {out}");
-    }
-
-    #[test]
-    fn write_reputation_renders_score_and_regions() {
-        use decdn_common::admin::ReputationCoverage;
-        let mut buf = Vec::new();
-        write_reputation(
-            &mut buf,
-            &ReputationResponse {
-                network_score: 0.625,
-                scored: true,
-                regions: vec![
-                    ReputationCoverage {
-                        region: "DE".to_string(),
-                        score: 0.8,
-                    },
-                    ReputationCoverage {
-                        region: "US".to_string(),
-                        score: 0.55,
-                    },
-                ],
-            },
-        )
-        .expect("write reputation");
-        let out = String::from_utf8(buf).expect("utf8");
-        assert!(out.contains("network_score=0.625000"), "score line: {out}");
-        assert!(out.contains("scored=true"), "scored line: {out}");
-        assert!(out.contains("regions=2"), "region count: {out}");
-        assert!(
-            out.contains("REGION") && out.contains("COVERAGE"),
-            "headers: {out}"
-        );
-        assert!(
-            out.contains("DE") && out.contains("US"),
-            "region rows: {out}"
-        );
-    }
-
-    #[test]
-    fn write_reputation_empty_emits_sentinel() {
-        let mut buf = Vec::new();
-        write_reputation(
-            &mut buf,
-            &ReputationResponse {
-                network_score: 0.5,
-                scored: false,
-                regions: vec![],
-            },
-        )
-        .expect("write reputation");
-        let out = String::from_utf8(buf).expect("utf8");
-        assert!(
-            out.contains("(no coverage signal)"),
-            "empty sentinel: {out}"
-        );
     }
 
     #[test]

@@ -446,12 +446,6 @@ pub struct ResolvedGossip {
     pub peer_ttl_sec: u64,
     /// Whether to subscribe to and publish on `cdn/global/v1`.
     pub subscribe_global: bool,
-    /// Whether to subscribe to (and publish on) the global
-    /// `cdn/reputation/v1` topic (ADR 008). Independent of `region`.
-    pub subscribe_reputation: bool,
-    /// Interval between reputation-report publish ticks (seconds). Matches the
-    /// ADR 008 1-hour per-(reporter, node) rate limit by default.
-    pub reputation_publish_interval_sec: u64,
     /// Optional hard cap on `PeerTable` entry count
     /// (appendix-peer-table-eviction § No hard size cap). `None` => no cap
     /// (unlimited); `Some(n)` is always positive (the resolver rejects `0`).

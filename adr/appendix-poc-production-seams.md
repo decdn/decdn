@@ -7,7 +7,7 @@
 Several ADRs describe PoC-vs-production differences. They fall into three kinds:
 
 - **Network-scale operational choices:** single RPC endpoint, clients holding ETH for gas, simplified peer bootstrap.
-- **Component implementations:** file-based vs platform-keychain key storage, local-only vs gossip-weighted reputation.
+- **Component implementations:** file-based vs platform-keychain key storage.
 - **Governance process:** admin key vs capacity-weighted Governor, with the bootstrap-multisig transition phase per [ADR 009](009-governance.md#adr-009-governance-model).
 
 None of these is a *contract-surface* difference. Per [ADR 016 § Contract Inventory](016-contract-interactions.md#contract-inventory), the full on-chain surface ships in a single audit pass with governance-tunable economics from day one. "PoC" is a network-scale milestone (tens of nodes on a testnet), not a reduced contract surface. There are no contract-surface scope reductions, only the non-contract differences this appendix addresses.
@@ -18,7 +18,7 @@ This appendix answers one question: **how does the codebase express the non-cont
 
 **Mode selection lives only at the composition boundary: the `node` binary's wiring layer. Domain crates are leaf. They contain no mode-conditional logic.**
 
-- **Trait seams at crate boundaries.** Each mode-varying capability is a trait owned by its crate: key storage, reputation scoring, the payment-channel client, the governance/parameter reader, and the on-chain contract clients (`FeeRouter`, `CapacityBond`, `BuybackBurner`, `SlashAppeal`). PoC and production concrete implementations sit behind that trait. The wiring layer constructs the right one.
+- **Trait seams at crate boundaries.** Each mode-varying capability is a trait owned by its crate: key storage, the payment-channel client, the governance/parameter reader, and the on-chain contract clients (`FeeRouter`, `CapacityBond`, `BuybackBurner`, `SlashAppeal`). PoC and production concrete implementations sit behind that trait. The wiring layer constructs the right one.
 - **Leaf crates stay pure.** Domain crates carry no mode branching. The two-binary split (`node` daemon, `decdn` CLI) shares config schema and identity loading via `common`. Mode selection is a `node`-wiring concern. The workspace `CLAUDE.md` and [appendix-binaries.md](appendix-binaries.md#appendix-decdn-binaries--decdn-node--decdn-split) define the current crate/binary layout and are the source of truth. This appendix does not restate a crate list that would rot.
 - **One source of truth for numeric differences.** Mode-dependent constants live in a single constants type with a per-mode constructor, never as magic numbers in domain logic: challenge bond, announce interval, dispute window, bootstrap-peer minimum.
 - **Compile-time, not runtime.** No `NetworkMode` enum is threaded through call sites. Selection resolves once, at wiring, so a PoC build cannot run production logic or vice versa. The compile-time mechanism (feature, build profile, or cfg) is a wiring-layer detail kept out of every other crate.

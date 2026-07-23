@@ -7,8 +7,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use arc_swap::ArcSwap;
 use bytes::Bytes;
 use decdn_protocol::{
-    GOSSIP_VERSION, GossipEnvelope, GossipPayload, NodeAnnounce, NodeAnnounceBody,
-    ReputationReport, ReputationReportBody, TOPIC_GLOBAL, TOPIC_REGION_PREFIX, TOPIC_REPUTATION,
+    GOSSIP_VERSION, GossipEnvelope, GossipPayload, NodeAnnounce, NodeAnnounceBody, TOPIC_GLOBAL,
+    TOPIC_REGION_PREFIX,
 };
 use iroh::{Endpoint, SecretKey};
 use iroh_gossip::api::{GossipReceiver, GossipSender};
@@ -19,10 +19,6 @@ use tokio::task::JoinHandle;
 use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
 
-use crate::reputation::{
-    MAX_REPORTS_PER_REPORTER_PER_HR, ReportDrain, ReputationRateLimiter, ReputationSink,
-    StakedNodeSet, validate_reputation_envelope,
-};
 use crate::{
     AnnounceReject, GossipMetrics, InsertOutcome, OwnedAnnounceGate, PeerTable, validate_envelope,
 };
@@ -76,9 +72,6 @@ pub struct GossipRuntimeConfig {
     /// reject a region-less announce at validation time. `decdn-node`
     /// enforces this at config resolution.
     pub region: Option<String>,
-    /// Interval between reputation-report publish ticks (seconds). Matches the
-    /// ADR 008 1-hour per-(reporter, node) rate limit by default.
-    pub reputation_publish_interval_sec: u64,
 }
 
 /// Operator-facing handle to fire an immediate `NodeAnnounce` outside the
@@ -114,28 +107,6 @@ impl AnnounceTrigger {
     /// notify without spinning up a real gossip publisher. Outside of
     /// tests, callers should use [`GossipService::spawn`] which returns
     /// a fully-wired trigger.
-    #[doc(hidden)]
-    pub const fn for_test(notify: Arc<Notify>) -> Self {
-        Self { notify }
-    }
-}
-
-/// Handle to force an immediate reputation-report publish outside the
-/// publisher's normal interval (admin / testing). Mirrors [`AnnounceTrigger`];
-/// `None` when the reputation publisher isn't running (no report drain wired).
-#[derive(Debug)]
-pub struct ReputationPublishTrigger {
-    notify: Arc<Notify>,
-}
-
-impl ReputationPublishTrigger {
-    /// Ask the reputation publisher to drain and broadcast pending reports on
-    /// its next select boundary. Coalesces like [`AnnounceTrigger::announce_now`].
-    pub fn publish_now(&self) {
-        self.notify.notify_one();
-    }
-
-    /// Construct around a caller-supplied [`Notify`] (test seam).
     #[doc(hidden)]
     pub const fn for_test(notify: Arc<Notify>) -> Self {
         Self { notify }
@@ -196,13 +167,6 @@ pub struct GossipHandles {
     /// One-shot announce trigger for the publisher. `None` iff the
     /// publisher task wasn't spawned (region-less subscribe-only mode).
     pub announce_trigger: Option<Arc<AnnounceTrigger>>,
-    /// Immediate-publish trigger for the reputation publisher. `None` when that
-    /// task wasn't spawned; the private `spawn_reputation_tasks` is the
-    /// authority on when that happens. Deliberately not enumerated here (#1343):
-    /// the conditions live in that function while this doc lives on the struct,
-    /// and the previous "iff" list here silently went stale — it named two
-    /// causes when there were five.
-    pub reputation_publish_trigger: Option<Arc<ReputationPublishTrigger>>,
 }
 
 impl GossipService {
@@ -236,27 +200,16 @@ impl GossipService {
         metrics: Arc<dyn GossipMetrics>,
         shutdown: CancellationToken,
         gate: OwnedAnnounceGate,
-        reputation: ReputationWiring,
     ) -> Result<GossipHandles, GossipSpawnError> {
         let topics = build_topic_list(&cfg);
-        // The reputation topic is a single global topic independent of the
-        // NodeAnnounce topology; spawn it on its own so the NodeAnnounce path
-        // (and its `AllSubscribesFailed` contract) is untouched.
-        let (reputation_tasks, reputation_publish_trigger) =
-            spawn_reputation_tasks(&secret_key, &gossip, &cfg, &metrics, &shutdown, reputation)
-                .await;
 
         if topics.is_empty() {
             // Caller configured neither global nor region — intentional
-            // subscribe-only mode for NodeAnnounce. The reputation tasks (if
-            // any) still run.
-            if reputation_tasks.is_empty() {
-                tracing::warn!("gossip: no topics to subscribe; service is idle");
-            }
+            // subscribe-only mode for NodeAnnounce.
+            tracing::warn!("gossip: no topics to subscribe; service is idle");
             return Ok(GossipHandles {
-                tasks: reputation_tasks,
+                tasks: Vec::new(),
                 announce_trigger: None,
-                reputation_publish_trigger,
             });
         }
 
@@ -355,139 +308,11 @@ impl GossipService {
             shutdown.clone(),
         ));
 
-        handles.extend(reputation_tasks);
-
         Ok(GossipHandles {
             tasks: handles,
             announce_trigger,
-            reputation_publish_trigger,
         })
     }
-}
-
-/// Reputation-topic wiring handed to [`GossipService::spawn`], as a sum type so
-/// that the only representable states are the meaningful ones (#1342).
-///
-/// The admission set and the sink it feeds are *one* decision, not two: an
-/// admission set with nowhere to put what it admits is meaningless, and a sink
-/// with no admission set would consume unvetted reports. Carrying them as
-/// separate optional fields left 8 representable combinations for what is really
-/// three states (off / subscribe-only / subscribe+publish) and pushed the check
-/// to runtime — this shape makes the nonsense ones unrepresentable instead,
-/// which is what #1344 previously needed a test to approximate.
-///
-/// **[`Self::Disabled`] is fail-CLOSED, and is the [`Default`]** — the inverse
-/// of [`crate::AnnounceGate`]'s fail-OPEN `Disabled`, and the reason this type
-/// can afford a `Default` at all: the derivable pole is the safe one. (An
-/// `AnnounceGate` `Default` would have to pick its *unsafe* pole, since
-/// `Enforce` carries a payload — which is why it correctly has none.)
-#[derive(Default)]
-pub enum ReputationWiring {
-    /// FAIL-CLOSED: the `cdn/reputation/v1` topic is not joined, so no report is
-    /// admitted or emitted. Neither subscriber nor publisher is spawned.
-    #[default]
-    Disabled,
-    /// Reputation gossip is on. `sink` and `staked` are required together, which
-    /// is the invariant this variant exists to hold; `publish` is the one
-    /// genuinely independent choice.
-    Enabled {
-        /// Consumer of validated inbound reports (the aggregator).
-        sink: Arc<dyn ReputationSink>,
-        /// ADR 008 §Gossip Protocol staked-reporter admission set: a report is
-        /// accepted only when its signing `reporter` is a member. An empty set
-        /// rejects every report — correct, since an empty active registry has
-        /// no staked reporters to trust. `decdn-node` builds this via
-        /// `report_staked_set` over the live registry.
-        staked: Arc<dyn StakedNodeSet>,
-        /// `Some` additionally spawns the publisher; `None` is subscribe-only.
-        /// Independent of admission, so it stays an `Option`.
-        publish: Option<Arc<dyn ReportDrain>>,
-    },
-}
-
-impl std::fmt::Debug for ReputationWiring {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // The trait-object payloads aren't `Debug`; report the variant and the
-        // one genuinely independent choice, which is all that identifies the
-        // safety state and the publish topology.
-        match self {
-            Self::Disabled => f.write_str("ReputationWiring::Disabled"),
-            Self::Enabled { publish, .. } => f
-                .debug_struct("ReputationWiring::Enabled")
-                .field("publish", &publish.is_some())
-                .finish(),
-        }
-    }
-}
-
-/// Subscribe to the reputation topic and spawn its subscriber (+ publisher when
-/// a report drain is wired). Returns the spawned tasks and an optional publish
-/// trigger. Failures to subscribe are logged + metered and yield no tasks —
-/// reputation gossip is best-effort and never blocks node startup.
-async fn spawn_reputation_tasks(
-    secret_key: &SecretKey,
-    gossip: &Gossip,
-    cfg: &GossipRuntimeConfig,
-    metrics: &Arc<dyn GossipMetrics>,
-    shutdown: &CancellationToken,
-    reputation: ReputationWiring,
-) -> (Vec<JoinHandle<()>>, Option<Arc<ReputationPublishTrigger>>) {
-    // One authority for "is reputation gossip on": the wiring variant. There
-    // used to be a second — a `subscribe_reputation` bool on
-    // `GossipRuntimeConfig`, checked just above this — which meant two ways to
-    // say "off", checked at two points, while the runtime pinned the wiring to
-    // `Enabled` permanently and let the bool do the real work. The operator knob
-    // still exists; `decdn-node` now resolves it into this variant at the one
-    // place it builds the wiring (#1355 review).
-    let ReputationWiring::Enabled {
-        sink,
-        staked,
-        publish,
-    } = reputation
-    else {
-        tracing::debug!("gossip: reputation wiring disabled; the topic is not joined");
-        return (Vec::new(), None);
-    };
-
-    let id = topic_id(TOPIC_REPUTATION);
-    let topic = match gossip.subscribe(id, Vec::new()).await {
-        Ok(t) => t,
-        Err(err) => {
-            metrics.inc_rejected(SUBSCRIBE_FAILED_LABEL);
-            tracing::error!(%err, topic = TOPIC_REPUTATION, "gossip reputation subscribe failed");
-            return (Vec::new(), None);
-        }
-    };
-    let (sender, receiver) = topic.split();
-    let slot = Arc::new(ArcSwap::from_pointee(sender));
-
-    let mut tasks = Vec::new();
-    tasks.push(reputation_subscriber_task(
-        receiver,
-        Arc::clone(&slot),
-        id,
-        gossip.clone(),
-        sink,
-        staked,
-        Arc::clone(metrics),
-        shutdown.clone(),
-    ));
-
-    let trigger = publish.map(|drain| {
-        let notify = Arc::new(Notify::new());
-        tasks.push(reputation_publisher_task(
-            secret_key.clone(),
-            Duration::from_secs(cfg.reputation_publish_interval_sec),
-            slot,
-            drain,
-            Arc::clone(metrics),
-            Arc::clone(&notify),
-            shutdown.clone(),
-        ));
-        Arc::new(ReputationPublishTrigger { notify })
-    });
-
-    (tasks, trigger)
 }
 
 /// Whether `announce` is this node's own announce echoed back to it (#845).
@@ -800,185 +625,6 @@ fn publisher_task(
     })
 }
 
-/// Subscriber for the `cdn/reputation/v1` topic. Mirrors [`subscriber_task`]'s
-/// receive + reconnect structure, but validates with
-/// [`validate_reputation_envelope`], receiver-enforces the ADR 008 rate limits
-/// via a task-owned [`ReputationRateLimiter`], and forwards accepted reports to
-/// the [`ReputationSink`] instead of the peer table.
-#[allow(clippy::too_many_arguments)]
-fn reputation_subscriber_task(
-    initial_receiver: GossipReceiver,
-    sender_slot: Arc<ArcSwap<GossipSender>>,
-    topic_id: TopicId,
-    gossip: Gossip,
-    sink: Arc<dyn ReputationSink>,
-    // The admission set from an already-destructured `ReputationWiring::Enabled`:
-    // this task only exists on that branch, so membership is the only thing
-    // checked per message — never whether reputation gossip is on at all.
-    staked: Arc<dyn StakedNodeSet>,
-    metrics: Arc<dyn GossipMetrics>,
-    shutdown: CancellationToken,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut receiver = initial_receiver;
-        let mut backoff = RECONNECT_INITIAL_BACKOFF;
-        let mut rate_limiter = ReputationRateLimiter::new();
-
-        loop {
-            loop {
-                let event = tokio::select! {
-                    biased;
-                    () = shutdown.cancelled() => {
-                        tracing::debug!(topic = TOPIC_REPUTATION, "reputation subscriber stopping on shutdown");
-                        return;
-                    }
-                    ev = receiver.next() => ev,
-                };
-                let Some(event) = event else { break };
-                backoff = RECONNECT_INITIAL_BACKOFF;
-
-                let msg = match event {
-                    Ok(iroh_gossip::api::Event::Received(m)) => m,
-                    Ok(
-                        iroh_gossip::api::Event::NeighborUp(_)
-                        | iroh_gossip::api::Event::NeighborDown(_)
-                        | iroh_gossip::api::Event::Lagged,
-                    ) => continue,
-                    Err(err) => {
-                        tracing::debug!(%err, topic = TOPIC_REPUTATION, "reputation receive error");
-                        continue;
-                    }
-                };
-                metrics.inc_received(TOPIC_REPUTATION);
-                let now = now_secs();
-                match validate_reputation_envelope(&msg.content, now, staked.as_ref()) {
-                    Ok(report) => {
-                        // ADR 008 §Rate Limiting: enforce on the receiver before
-                        // the report reaches the aggregator. Dropped reports are
-                        // metered, never forwarded.
-                        match rate_limiter.check_and_record(report.reporter, report.provider, now) {
-                            Ok(()) => sink.accept(report),
-                            Err(reject) => metrics.inc_rejected(reject.label()),
-                        }
-                    }
-                    Err(reject) => metrics.inc_rejected(reject.label()),
-                }
-            }
-
-            tracing::warn!(
-                topic = TOPIC_REPUTATION,
-                "reputation subscription stream ended; reconnecting"
-            );
-            loop {
-                tokio::select! {
-                    biased;
-                    () = shutdown.cancelled() => {
-                        tracing::debug!(topic = TOPIC_REPUTATION, "reputation subscriber stopping during reconnect backoff");
-                        return;
-                    }
-                    () = tokio::time::sleep(backoff) => {}
-                }
-                backoff = (backoff * 2).min(RECONNECT_MAX_BACKOFF);
-                match gossip.subscribe(topic_id, Vec::new()).await {
-                    Ok(topic) => {
-                        let (new_sender, new_receiver) = topic.split();
-                        sender_slot.store(Arc::new(new_sender));
-                        receiver = new_receiver;
-                        metrics.inc_reconnected(TOPIC_REPUTATION);
-                        tracing::info!(
-                            topic = TOPIC_REPUTATION,
-                            "reputation subscription reconnected"
-                        );
-                        break;
-                    }
-                    Err(err) => {
-                        metrics.inc_rejected(RESUBSCRIBE_FAILED_LABEL);
-                        tracing::error!(%err, topic = TOPIC_REPUTATION, "reputation resubscribe failed; will retry");
-                    }
-                }
-            }
-        }
-    })
-}
-
-/// Publisher for the `cdn/reputation/v1` topic. On each interval tick or
-/// immediate trigger it drains the [`ReportDrain`], caps the batch to the ADR
-/// 008 per-reporter hourly limit, signs each [`ReputationReportBody`], and
-/// broadcasts it. Mirrors [`publisher_task`]'s load-through-slot reconnect
-/// behaviour (#577 H2).
-fn reputation_publisher_task(
-    secret_key: SecretKey,
-    interval: Duration,
-    sender_slot: Arc<ArcSwap<GossipSender>>,
-    drain: Arc<dyn ReportDrain>,
-    metrics: Arc<dyn GossipMetrics>,
-    publish_now: Arc<Notify>,
-    shutdown: CancellationToken,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        let reporter = *secret_key.public().as_bytes();
-        let mut ticker = tokio::time::interval(interval);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            tokio::select! {
-                biased;
-                () = shutdown.cancelled() => {
-                    tracing::debug!("reputation publisher stopping on shutdown");
-                    return;
-                }
-                _ = ticker.tick() => {}
-                () = publish_now.notified() => {}
-            }
-            let mut pending = drain.drain();
-            if pending.len() > MAX_REPORTS_PER_REPORTER_PER_HR {
-                // Honour the 10/reporter/hr cap when the tick equals the 1h
-                // window; surface the drop so a saturated buffer is observable.
-                let dropped = pending.len() - MAX_REPORTS_PER_REPORTER_PER_HR;
-                tracing::warn!(
-                    dropped,
-                    cap = MAX_REPORTS_PER_REPORTER_PER_HR,
-                    "reputation publisher capped outbound batch"
-                );
-                pending.truncate(MAX_REPORTS_PER_REPORTER_PER_HR);
-            }
-            let ts = now_secs();
-            for (provider, metrics_payload) in pending {
-                let body = ReputationReportBody {
-                    provider,
-                    reporter,
-                    metrics: metrics_payload,
-                    timestamp_secs: ts,
-                };
-                let signing_bytes = match body.signing_bytes() {
-                    Ok(b) => b,
-                    Err(err) => {
-                        tracing::warn!(%err, "reputation publisher body encode failed");
-                        continue;
-                    }
-                };
-                let signature = secret_key.sign(&signing_bytes).to_bytes().to_vec();
-                let env = GossipEnvelope {
-                    version: GOSSIP_VERSION,
-                    payload: GossipPayload::ReputationReport(ReputationReport { body, signature }),
-                };
-                let encoded = match postcard::to_allocvec(&env) {
-                    Ok(b) => Bytes::from(b),
-                    Err(err) => {
-                        tracing::warn!(%err, "reputation publisher envelope encode failed");
-                        continue;
-                    }
-                };
-                let sender = sender_slot.load_full();
-                if let Err(err) = sender.broadcast(encoded).await {
-                    tracing::warn!(%err, topic = TOPIC_REPUTATION, "reputation publish failed");
-                } else {
-                    metrics.inc_published(TOPIC_REPUTATION);
-                }
-            }
-        }
-    })
-}
-
 fn ttl_sweeper_task(
     peer_table: Arc<RwLock<PeerTable>>,
     metrics: Arc<dyn GossipMetrics>,
@@ -1035,24 +681,6 @@ fn now_us() -> u64 {
     }
 }
 
-/// Wall-clock seconds since the Unix epoch, for reputation report timestamps
-/// and the receiver-side recency / rate-limit windows (ADR 008 works in
-/// seconds, unlike `NodeAnnounce`'s microseconds).
-fn now_secs() -> u64 {
-    match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(d) => d.as_secs(),
-        Err(err) => {
-            if !CLOCK_ERROR_LOGGED.swap(true, Ordering::Relaxed) {
-                tracing::warn!(
-                    %err,
-                    "gossip: system clock is before UNIX epoch; reputation reports will be rejected by peers"
-                );
-            }
-            0
-        }
-    }
-}
-
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -1068,7 +696,6 @@ mod tests {
             announce_interval_sec: 60,
             subscribe_global,
             region: region.map(String::from),
-            reputation_publish_interval_sec: 3600,
         }
     }
 
@@ -1441,7 +1068,6 @@ mod tests {
             metrics,
             shutdown.clone(),
             OwnedAnnounceGate::Disabled,
-            ReputationWiring::default(),
         )
         .await
         .expect("gossip service should start")
@@ -1481,219 +1107,6 @@ mod tests {
             spawned >= 3,
             "expected a subscriber per topic + publisher + TTL sweeper, got {spawned}"
         );
-    }
-
-    /// Reputation wiring spawns the subscriber + publisher tasks alongside the
-    /// `NodeAnnounce` topology, returns a publish trigger, and every task drains
-    /// cooperatively on cancel (#805 discipline extended to the reputation
-    /// tasks). Stub sink/staker/drain stand in for the node-side impls.
-    #[tokio::test]
-    async fn reputation_tasks_spawn_and_drain() {
-        use iroh::endpoint::presets;
-
-        use crate::reputation::ValidatedReport;
-
-        struct Sink;
-        impl ReputationSink for Sink {
-            fn accept(&self, _report: ValidatedReport) {}
-        }
-        struct Staked;
-        impl StakedNodeSet for Staked {
-            fn contains(&self, _node_id: &[u8; 32]) -> bool {
-                true
-            }
-        }
-        struct Drain;
-        impl ReportDrain for Drain {
-            fn drain(&self) -> Vec<([u8; 32], decdn_protocol::ReportMetrics)> {
-                Vec::new()
-            }
-        }
-
-        let ep = Endpoint::builder(presets::Minimal)
-            .bind()
-            .await
-            .expect("bind minimal endpoint");
-        let gossip = build_gossip(ep.clone());
-        let peer_table = Arc::new(RwLock::new(PeerTable::new(60_000_000, 128)));
-        let metrics: Arc<dyn GossipMetrics> = Arc::new(crate::metrics::NoopMetrics);
-        let shutdown = CancellationToken::new();
-        let config = cfg(true, Some("US"));
-        let wiring = ReputationWiring::Enabled {
-            sink: Arc::new(Sink),
-            staked: Arc::new(Staked),
-            publish: Some(Arc::new(Drain)),
-        };
-
-        let handles = GossipService::spawn(
-            ep,
-            SecretKey::generate(),
-            gossip,
-            config,
-            peer_table,
-            metrics,
-            shutdown.clone(),
-            OwnedAnnounceGate::Disabled,
-            wiring,
-        )
-        .await
-        .expect("gossip service should start");
-
-        assert!(
-            handles.reputation_publish_trigger.is_some(),
-            "publisher wired ⇒ trigger returned"
-        );
-        // global sub + region sub + publisher + TTL sweeper + reputation sub +
-        // reputation publisher.
-        assert_eq!(
-            handles.tasks.len(),
-            6,
-            "expected the two reputation tasks alongside the NodeAnnounce topology"
-        );
-
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        shutdown.cancel();
-        for handle in handles.tasks {
-            tokio::time::timeout(Duration::from_secs(2), handle)
-                .await
-                .expect("gossip task must exit promptly after cancel, not hang")
-                .expect("gossip task must exit cleanly, not panic");
-        }
-    }
-
-    /// #1338 — an unwired [`ReputationWiring`] is fail-CLOSED, and that reads
-    /// off the type (a named `Disabled` variant) rather than off a `None`.
-    /// Asserted through `Debug` as well as by pattern match.
-    #[test]
-    fn reputation_wiring_default_is_disabled() {
-        let wiring = ReputationWiring::default();
-        assert!(
-            matches!(wiring, ReputationWiring::Disabled),
-            "an unwired ReputationWiring must be fail-CLOSED"
-        );
-        let rendered = format!("{wiring:?}");
-        assert_eq!(
-            rendered, "ReputationWiring::Disabled",
-            "default wiring must name its fail-closed variant"
-        );
-    }
-
-    /// #1338 — pin *both* arms of [`ReputationWiring`]'s hand-written `Debug`.
-    /// The default test above only ever renders `Disabled`, so a single
-    /// mislabelled arm — `Enabled { .. } => "ReputationWiring::Disabled"` —
-    /// would report every live enforcing node as fail-closed in the logs with
-    /// nothing failing. That is precisely the confusion this shape exists to
-    /// prevent, so it gets its own assertion. The `publish` flag is included
-    /// because a caller inspecting a wiring wants to know whether it publishes,
-    /// and that is the one thing `Enabled` does not settle on its own.
-    #[test]
-    fn reputation_wiring_debug_reports_variant_and_publish_only() {
-        struct Staked;
-        impl StakedNodeSet for Staked {
-            fn contains(&self, _node_id: &[u8; 32]) -> bool {
-                true
-            }
-        }
-        struct Sink;
-        impl ReputationSink for Sink {
-            fn accept(&self, _report: crate::reputation::ValidatedReport) {}
-        }
-        struct Drain;
-        impl ReportDrain for Drain {
-            fn drain(&self) -> Vec<([u8; 32], decdn_protocol::ReportMetrics)> {
-                Vec::new()
-            }
-        }
-
-        let subscribe_only = ReputationWiring::Enabled {
-            sink: Arc::new(Sink),
-            staked: Arc::new(Staked),
-            publish: None,
-        };
-        assert_eq!(
-            format!("{subscribe_only:?}"),
-            "ReputationWiring::Enabled { publish: false }"
-        );
-        let publishing = ReputationWiring::Enabled {
-            sink: Arc::new(Sink),
-            staked: Arc::new(Staked),
-            publish: Some(Arc::new(Drain)),
-        };
-        assert_eq!(
-            format!("{publishing:?}"),
-            "ReputationWiring::Enabled { publish: true }"
-        );
-        assert_eq!(
-            format!("{:?}", ReputationWiring::Disabled),
-            "ReputationWiring::Disabled"
-        );
-    }
-
-    /// #1338 — the fail-CLOSED half of the contract: a
-    /// [`ReputationWiring::Disabled`] joins no reputation topic and admits
-    /// nothing. This is now the *only* off-switch; `decdn-node` resolves the
-    /// operator's `gossip.subscribe_reputation` into this variant before calling
-    /// `spawn`, so there is no second authority to test against.
-    ///
-    /// Note what is NOT here any more (#1342): the sibling case this test used
-    /// to need — an enforcing admission set with no sink — is now
-    /// unrepresentable, since `Enabled` carries both or neither. #1344 asked for
-    /// a test of that combination; the type change deleted the combination
-    /// instead, which is the stronger outcome. Only the deliberate-off case is
-    /// left to assert.
-    #[tokio::test]
-    async fn disabled_wiring_spawns_no_reputation_tasks() {
-        use iroh::endpoint::presets;
-
-        let ep = Endpoint::builder(presets::Minimal)
-            .bind()
-            .await
-            .expect("bind minimal endpoint");
-        let gossip = build_gossip(ep.clone());
-        let peer_table = Arc::new(RwLock::new(PeerTable::new(60_000_000, 128)));
-        let metrics: Arc<dyn GossipMetrics> = Arc::new(crate::metrics::NoopMetrics);
-        let shutdown = CancellationToken::new();
-        let config = cfg(true, Some("US"));
-        let wiring = ReputationWiring::Disabled;
-
-        let handles = GossipService::spawn(
-            ep,
-            SecretKey::generate(),
-            gossip,
-            config,
-            peer_table,
-            metrics,
-            shutdown.clone(),
-            OwnedAnnounceGate::Disabled,
-            wiring,
-        )
-        .await
-        .expect("gossip service should start");
-
-        assert!(
-            handles.reputation_publish_trigger.is_none(),
-            "Disabled must suppress the publisher too, not just the subscriber"
-        );
-        // global sub + region sub + NodeAnnounce publisher + TTL sweeper only.
-        // NB this measures spawned tasks, which is the observable proxy for "the
-        // topic was not joined" only because the `Disabled` return sits ABOVE
-        // `gossip.subscribe`. Move that guard below the subscribe and the node
-        // would join the mesh while spawning zero tasks — green test, broken
-        // contract. There is no API to assert non-membership directly, so the
-        // ordering is the thing to preserve.
-        assert_eq!(
-            handles.tasks.len(),
-            4,
-            "Disabled must spawn no reputation subscriber or publisher"
-        );
-
-        shutdown.cancel();
-        for handle in handles.tasks {
-            tokio::time::timeout(Duration::from_secs(2), handle)
-                .await
-                .expect("gossip task must exit promptly after cancel, not hang")
-                .expect("gossip task must exit cleanly, not panic");
-        }
     }
 
     /// #805 — cooperative shutdown of the subscribe-only topology

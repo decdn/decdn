@@ -1070,28 +1070,6 @@ pub struct DecdnMetrics {
     /// a sustained rate HERE points at disk, not peers. Field has no `_total`
     /// suffix because the `OpenMetrics` encoder appends it.
     pub node_pull_through_local_tee_failed: Counter,
-    /// `decdn_reputation_indexer_rpc_failures_total` (#326): failing poll ticks —
-    /// the settlement indexer's `get_logs`/head RPC errored, or a `nodeIdOf`
-    /// party-resolution RPC (in the sink's `apply`) failed. Both now propagate to
-    /// the same per-tick backoff path (`on_backoff`): a resolution failure no
-    /// longer skips a party in place, and the un-credited settlement is retried,
-    /// so a persistently flaky RPC can bump this once per retry cycle. A
-    /// sustained nonzero rate means the indexer is not ingesting settlements, so
-    /// reporter weights silently stay 0 and network scores never leave neutral —
-    /// exactly the dead-indexer condition that is otherwise log-only. Field has
-    /// no `_total` suffix because the `OpenMetrics` encoder appends it.
-    pub reputation_indexer_rpc_failures: Counter,
-    /// `decdn_reputation_indexer_settlements_credited_total` (#326): party
-    /// creditings applied to the settlement source (two per fully-resolved
-    /// settlement). A flat-zero counter alongside live `ChannelSettled` traffic
-    /// indicates a binding-resolution or correlation problem.
-    pub reputation_indexer_settlements_credited: Counter,
-    /// `decdn_reputation_indexer_amount_overflows_total` (#326): `ChannelSettled`
-    /// events whose `routedAmount` exceeded `u128` and were skipped rather than
-    /// saturated (a saturated value would poison the node-local credibility
-    /// denominator). Expected to stay 0; a nonzero value flags malformed/hostile
-    /// on-chain data.
-    pub reputation_indexer_amount_overflows: Counter,
     /// `decdn_origin_directory_watcher_restarts_total` (#651): distinct drift
     /// windows the [`crate::dht::chain_origin_directory`] watcher has entered.
     /// Same semantics as `staker_set_watcher_restarts` — bumped once on the
@@ -1270,9 +1248,6 @@ pub struct DecdnMetrics {
     /// `decdn_settlement_watcher_last_tick_timestamp_seconds` (#1316): Unix time
     /// of the payment-settlement watcher's last successful poll tick.
     pub settlement_watcher_last_tick_timestamp_seconds: Gauge,
-    /// `decdn_reputation_indexer_last_tick_timestamp_seconds` (#1316): Unix time
-    /// of the reputation-indexer watcher's last successful poll tick.
-    pub reputation_indexer_last_tick_timestamp_seconds: Gauge,
     /// `decdn_rate_bounds_watcher_last_tick_timestamp_seconds` (#1172): Unix time
     /// of the rate-bounds watcher's last successful poll tick. Load-bearing: the
     /// watcher's `getRateBounds()` poll failure and undecodable-log paths both
@@ -1301,11 +1276,8 @@ pub struct DecdnMetrics {
     /// `decdn_settlement_watcher_task_panicked_total` (#1316): the
     /// payment-settlement watcher task unwound on a panic.
     pub settlement_watcher_task_panicked: Counter,
-    /// `decdn_reputation_indexer_task_panicked_total` (#1316): the
-    /// reputation-indexer watcher task unwound on a panic.
-    pub reputation_indexer_task_panicked: Counter,
 
-    // ---- Down-family parity for the three watchers that lacked it (#1283, #1316) ----
+    // ---- Down-family parity for the watchers that lacked it (#1283, #1316) ----
     /// `decdn_blacklist_watcher_restarts_total` (#1283): distinct drift windows
     /// the blacklist watcher entered, bumped once on the edge into the
     /// error/backoff state. Mirrors `slash_watcher_restarts`.
@@ -1323,15 +1295,6 @@ pub struct DecdnMetrics {
     /// watcher has been failing its chain read, recomputed at scrape from
     /// `settlement_watcher_down_since`.
     pub settlement_watcher_down_seconds: Gauge,
-    /// `decdn_reputation_indexer_restarts_total` (#1316): distinct drift windows
-    /// the reputation indexer entered. Distinct from
-    /// `reputation_indexer_rpc_failures` (which counts every failing tick, not
-    /// just the healthy→error edge). Mirrors `slash_watcher_restarts`.
-    pub reputation_indexer_restarts: Counter,
-    /// `decdn_reputation_indexer_down_seconds` (#1316): seconds the reputation
-    /// indexer has been failing its chain read, recomputed at scrape from
-    /// `reputation_indexer_down_since`.
-    pub reputation_indexer_down_seconds: Gauge,
 
     /// `decdn_blacklist_enforcement_failures_total` (#1319): distinct hashes a
     /// batched re-scope could NOT re-verify or evict this pass (`Recheck::Failed`
@@ -1400,11 +1363,6 @@ pub struct Metrics {
     /// `settlement_watcher_down_seconds` gauge. Mirrors
     /// `staker_set_watcher_down_since`.
     settlement_watcher_down_since: Mutex<Option<Instant>>,
-    /// `Instant` the reputation-indexer watcher entered its current error/backoff
-    /// window (#1316). `None` whenever a cycle is established. Backs the
-    /// `reputation_indexer_down_seconds` gauge. Mirrors
-    /// `staker_set_watcher_down_since`.
-    reputation_indexer_down_since: Mutex<Option<Instant>>,
 }
 
 impl Default for Metrics {
@@ -1476,7 +1434,6 @@ impl Metrics {
             slash_watcher_down_since: Mutex::new(None),
             blacklist_watcher_down_since: Mutex::new(None),
             settlement_watcher_down_since: Mutex::new(None),
-            reputation_indexer_down_since: Mutex::new(None),
         }
     }
 
@@ -2209,20 +2166,6 @@ recorders! {
     /// counted so `spawned == succeeded + missed + failed + cancelled + panicked` balances.
     node_pull_through_background_cancelled => node_pull_through_background_cancelled.inc();
 
-    /// Bump `reputation_indexer_rpc_failures_total` (#326): an indexer event
-    /// stream errored or a `nodeIdOf` resolution RPC failed. Pairs with the
-    /// per-failure `warn!` in `crate::reputation_indexer`.
-    reputation_indexer_rpc_failure => reputation_indexer_rpc_failures.inc();
-
-    /// Bump `reputation_indexer_settlements_credited_total` (#326) by `n` party
-    /// creditings applied for one settlement (0, 1, or 2).
-    reputation_indexer_settlements_credited(n: u64)
-        => reputation_indexer_settlements_credited.inc_by(n);
-
-    /// Bump `reputation_indexer_amount_overflows_total` (#326): a settlement
-    /// amount exceeded `u128` and was skipped (not saturated).
-    reputation_indexer_amount_overflow => reputation_indexer_amount_overflows.inc();
-
     /// A `getOrigins` / `nodeIdOf` resolution failed, leaving an operator
     /// unmapped in the origin directory (#651). Bumps
     /// `origin_directory_watcher_resolve_failures_total`.
@@ -2385,8 +2328,6 @@ recorders! {
     blacklist_watcher_tick => blacklist_watcher_last_tick_timestamp_seconds.set(unix_now_secs());
     /// Stamp the payment-settlement watcher's liveness gauge (#1316).
     settlement_watcher_tick => settlement_watcher_last_tick_timestamp_seconds.set(unix_now_secs());
-    /// Stamp the reputation-indexer watcher's liveness gauge (#1316).
-    reputation_indexer_tick => reputation_indexer_last_tick_timestamp_seconds.set(unix_now_secs());
     /// Stamp the rate-bounds watcher's liveness gauge (#1172). See
     /// `slash_watcher_tick`; this one matters because the rate-bounds watcher's
     /// failure paths deliberately return `Ok`, so this gauge is the only signal
@@ -2406,8 +2347,6 @@ recorders! {
     rate_bounds_watcher_task_panicked => rate_bounds_watcher_task_panicked.inc();
     /// Record that the payment-settlement watcher task unwound on a panic (#1316).
     settlement_watcher_task_panicked => settlement_watcher_task_panicked.inc();
-    /// Record that the reputation-indexer watcher task unwound on a panic (#1316).
-    reputation_indexer_task_panicked => reputation_indexer_task_panicked.inc();
 
     /// Record `count` hashes a blacklist re-scope could not enforce this pass
     /// (#1319 — `Recheck::Failed`). One aggregated bump per pass, not per hash.
@@ -2493,19 +2432,6 @@ watcher_downtime_recorders! {
     down_since: settlement_watcher_down_since,
     restarts: settlement_watcher_restarts,
     down_seconds: settlement_watcher_down_seconds;
-
-    /// The reputation-indexer watcher's poll tick errored and the loop is about
-    /// to back off (#1316). Stamps `reputation_indexer_down_since` once per drift
-    /// window. Distinct from `reputation_indexer_rpc_failures`, which counts every
-    /// failing tick rather than the healthy→error edge. Mirrors
-    /// [`Self::slash_watcher_backoff_started`].
-    reputation_indexer_backoff_started,
-    /// Mark the reputation-indexer watcher cycle established (#1316): clear
-    /// `reputation_indexer_down_since`. Mirrors [`Self::slash_watcher_cycle_established`].
-    reputation_indexer_cycle_established,
-    down_since: reputation_indexer_down_since,
-    restarts: reputation_indexer_restarts,
-    down_seconds: reputation_indexer_down_seconds;
 }
 
 /// Which side of a `PaymentChannel` the shared settle-finalization helper
@@ -3647,12 +3573,11 @@ mod tests {
             has_metric_line(&text, "decdn_origin_directory_watcher_down_seconds", 0),
             "a poisoned slash lock must not perturb the origin-directory gauge:\n{text}"
         );
-        // The three watchers brought to down-family parity (#1283/#1316) share
+        // The watchers brought to down-family parity (#1283/#1316) share
         // the same recompute row, so they too read a clean 0 under the poison.
         for name in [
             "decdn_blacklist_watcher_down_seconds",
             "decdn_settlement_watcher_down_seconds",
-            "decdn_reputation_indexer_down_seconds",
         ] {
             assert!(
                 has_metric_line(&text, name, 0),
@@ -3675,7 +3600,6 @@ mod tests {
         metrics.origin_directory_watcher_tick();
         metrics.blacklist_watcher_tick();
         metrics.settlement_watcher_tick();
-        metrics.reputation_indexer_tick();
 
         let text = metrics.encode().unwrap();
         for name in [
@@ -3684,7 +3608,6 @@ mod tests {
             "decdn_origin_directory_watcher_last_tick_timestamp_seconds",
             "decdn_blacklist_watcher_last_tick_timestamp_seconds",
             "decdn_settlement_watcher_last_tick_timestamp_seconds",
-            "decdn_reputation_indexer_last_tick_timestamp_seconds",
         ] {
             let floor = u64::try_from(before).unwrap();
             assert!(
@@ -3697,11 +3620,11 @@ mod tests {
     #[test]
     #[allow(clippy::type_complexity)] // a compact table of (recorder, recorder, gauge, counter).
     fn new_watchers_down_seconds_track_true_downtime() {
-        // The three watchers brought to down-family parity (#1283/#1316) share
+        // The watchers brought to down-family parity (#1283/#1316) share
         // the `watcher_downtime_recorders!` template, so one compact pass per
         // watcher confirms the wiring: healthy reads 0, backoff climbs, one
         // restart per drift window, re-establish clears.
-        let cases: [(fn(&Metrics), fn(&Metrics), &str, &str); 3] = [
+        let cases: [(fn(&Metrics), fn(&Metrics), &str, &str); 2] = [
             (
                 Metrics::blacklist_watcher_cycle_established,
                 Metrics::blacklist_watcher_backoff_started,
@@ -3713,12 +3636,6 @@ mod tests {
                 Metrics::settlement_watcher_backoff_started,
                 "decdn_settlement_watcher_down_seconds",
                 "decdn_settlement_watcher_restarts_total",
-            ),
-            (
-                Metrics::reputation_indexer_cycle_established,
-                Metrics::reputation_indexer_backoff_started,
-                "decdn_reputation_indexer_down_seconds",
-                "decdn_reputation_indexer_restarts_total",
             ),
         ];
         for (established, backoff, down_seconds, restarts) in cases {

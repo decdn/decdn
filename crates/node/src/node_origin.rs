@@ -49,15 +49,11 @@ use alloy::primitives::{Address, B256, U256};
 use bytes::Bytes;
 use decdn_cache::origin::{Origin, OriginFetch};
 use decdn_cache::{Hash, OriginKind, OriginPullError};
-use decdn_protocol::ReportMetrics;
 use decdn_protocol::client::{StreamError, VoucherRejectReason};
 use iroh::{Endpoint, EndpointAddr, PublicKey};
 use tracing::{debug, warn};
 
-use decdn_reputation::{
-    LocalReputation, NetworkReputation, NetworkReputationConfig, ObservationBuffer, Outcome,
-    combined_score,
-};
+use decdn_reputation::{LocalReputation, Outcome};
 
 use decdn_incentive::ChannelOpenFailureReason;
 
@@ -264,12 +260,6 @@ pub struct NodeOriginDeps {
     pub bind_domain: Eip712Domain,
     /// Local per-peer reputation score store (folded on each pull outcome).
     pub local_rep: Arc<LocalReputation>,
-    /// Outbound observation buffer the gossip publisher drains.
-    pub obs_buffer: Arc<ObservationBuffer>,
-    /// Aggregated network reputation (read for the combined selection score).
-    pub network_rep: Arc<NetworkReputation>,
-    /// Reputation blend weights for `combined_score`.
-    pub rep_cfg: NetworkReputationConfig,
     /// Requester-side negative-probe cache (drops known-absent providers).
     pub negative_cache: NegativeProbeCache,
     /// Requester-side positive probe cache (ADR 001 §Probe cache): lets a repeat
@@ -1046,7 +1036,7 @@ async fn probe_and_rank(
         // different hash and re-wedged — burning a candidate slot each time.
         .filter(|peer| !deps.provider_is_wedged(peer, now_secs))
         .take(deps.config.probe_fanout)
-        .map(|peer| probe_candidate(deps, peer, hash_bytes, now_secs));
+        .map(|peer| probe_candidate(deps, peer, hash_bytes));
     let candidates: Vec<Candidate> = futures_util::future::join_all(probes)
         .await
         .into_iter()
@@ -1099,7 +1089,6 @@ async fn probe_candidate(
     deps: &NodeOriginDeps,
     peer: DhtNodeId,
     hash_bytes: [u8; 32],
-    now_secs: u64,
 ) -> Option<Candidate> {
     let Ok(pk) = PublicKey::from_bytes(peer.as_bytes()) else {
         // A staker-filtered routing entry should always decode; a failure
@@ -1172,7 +1161,7 @@ async fn probe_candidate(
         node_id: *peer.as_bytes(),
         rate_per_mb: resp.body.rate_per_mb,
         rtt_ms: rtt,
-        reputation: combined_reputation(deps, pk, now_secs),
+        reputation: peer_reputation(deps, pk),
         // Drives the geo-diversity tie-break tier (selection.rs) and the
         // latency-vs-claim penalty above.
         region,
@@ -1250,7 +1239,7 @@ async fn cached_candidates(deps: &NodeOriginDeps, target: DhtHash) -> Option<Vec
             node_id: *provider.node_id.as_bytes(),
             rate_per_mb: provider.rate_per_mb,
             rtt_ms: provider.rtt_ms,
-            reputation: combined_reputation(deps, pk, now_secs),
+            reputation: peer_reputation(deps, pk),
             region,
             stake: None,
         });
@@ -2235,81 +2224,29 @@ fn classify_pull_failure(
     }
 }
 
-/// The combined local+network reputation for `pk` at `now_secs`, as the `f32`
-/// the selection score consumes. An unseen peer scores neutral (local
-/// `initial_score`), so a cold provider ranks neither favoured nor excluded
-/// (ADR 008 §Cold-Start).
+/// The local reputation for `pk`, as the `f32` the selection score consumes.
+/// Reputation is local-only (ADR 008): each node ranks peers from its own
+/// observations, with no network aggregation. An unseen peer scores neutral
+/// (local `initial_score`), so a cold provider ranks neither favoured nor
+/// excluded (ADR 008 §Cold-Start).
 #[allow(clippy::cast_possible_truncation)] // reputation ∈ [0,1]; f32 has ample precision for a ranking weight.
-fn combined_reputation(deps: &NodeOriginDeps, pk: PublicKey, now_secs: u64) -> f32 {
-    let local = deps.local_rep.score(pk);
-    let network = deps.network_rep.score(pk, now_secs);
-    combined_score(Some(local), network, &deps.rep_cfg) as f32
+fn peer_reputation(deps: &NodeOriginDeps, pk: PublicKey) -> f32 {
+    deps.local_rep.score(pk) as f32
 }
 
-/// Fold a pull/probe outcome into BOTH the local EWMA score and the outbound
-/// observation buffer (ADR 008 §Local Score + §Gossip Protocol). The buffer
-/// feed is what makes the node *emit* reports about its upstreams.
+/// Fold a pull/probe outcome into the local EWMA reputation score (ADR 008
+/// §Local Score Calculation) and bump the matching delivery metric.
 fn record_outcome(deps: &NodeOriginDeps, pk: PublicKey, outcome: &Outcome) {
     deps.local_rep.record(pk, *outcome);
-    let report = match *outcome {
-        Outcome::Delivered { bytes, elapsed } => {
-            deps.metrics.node_pull_success();
-            ReportMetrics {
-                delivery_speed: Some(bytes_per_sec(bytes, elapsed)),
-                uptime_observed: Some(true),
-                data_correct: Some(true),
-            }
-        }
-        Outcome::Corruption => {
-            deps.metrics.node_pull_corruption();
-            ReportMetrics {
-                delivery_speed: None,
-                uptime_observed: Some(true),
-                data_correct: Some(false),
-            }
-        }
-        Outcome::Unreachable => {
-            deps.metrics.node_pull_unreachable();
-            ReportMetrics {
-                delivery_speed: None,
-                uptime_observed: Some(false),
-                data_correct: None,
-            }
-        }
-        // Local-only signal (ADR 030 region penalty): the local EWMA was already
-        // updated above; it must NOT reach the observation buffer / gossip. Return
-        // before `observe` rather than emitting a no-signal report — which would
-        // also clobber this peer's pending Delivered/Corruption/Unreachable report
-        // for the tick, since `ObservationBuffer` coalesces by overwrite. This
-        // keeps the `Outcome::RegionLatencyMismatch` "never gossiped" invariant
-        // true structurally, not just by the probe path's call-site choice.
-        Outcome::RegionLatencyMismatch => return,
-        // `Outcome` is `#[non_exhaustive]`: a future variant defaults to an
-        // all-`None` (no-signal) report rather than mis-attributing one of the
-        // three known shapes. Add an explicit arm when such a variant lands.
-        _ => ReportMetrics {
-            delivery_speed: None,
-            uptime_observed: None,
-            data_correct: None,
-        },
-    };
-    deps.obs_buffer.observe(pk, report);
-}
-
-/// Bytes-per-second as a saturating `u32`, with a 1 ms floor on elapsed so a
-/// sub-millisecond local-loopback delivery can't divide by ~zero.
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::cast_precision_loss
-)] // throughput metric; saturation + sign-safe (bytes ≥ 0, secs > 0) by construction.
-fn bytes_per_sec(bytes: u64, elapsed: Duration) -> u32 {
-    let secs = elapsed.as_secs_f64().max(0.001);
-    let bps = bytes as f64 / secs;
-    if bps >= f64::from(u32::MAX) {
-        u32::MAX
-    } else {
-        bps as u32
+    match *outcome {
+        Outcome::Delivered { .. } => deps.metrics.node_pull_success(),
+        Outcome::Corruption => deps.metrics.node_pull_corruption(),
+        Outcome::Unreachable => deps.metrics.node_pull_unreachable(),
+        // Region-latency mismatch (ADR 030) folds into the local score above but
+        // has no delivery metric; `Outcome` is `#[non_exhaustive]`, so any future
+        // variant likewise records into the score without a metric until an
+        // explicit arm lands.
+        _ => {}
     }
 }
 
@@ -2412,21 +2349,6 @@ mod tests {
         let got = origin.fetch(Hash::new(b"anything"), 1 << 20).await.unwrap();
         assert!(matches!(got, OriginFetch::NotFound));
         assert_eq!(origin.kind(), OriginKind::Peer);
-    }
-
-    /// Delivered → speed reported, reachable + correct.
-    #[test]
-    fn delivered_maps_to_full_positive_metrics() {
-        // 1 MiB in 100 ms ≈ 10.5 MB/s.
-        let speed = bytes_per_sec(1_048_576, Duration::from_millis(100));
-        assert!(speed > 9_000_000 && speed < 12_000_000, "speed = {speed}");
-    }
-
-    /// A sub-millisecond elapsed can't divide by zero; the 1 ms floor bounds it.
-    #[test]
-    fn bytes_per_sec_floors_tiny_elapsed() {
-        let speed = bytes_per_sec(1024, Duration::from_nanos(1));
-        assert_eq!(speed, bytes_per_sec(1024, Duration::from_millis(1)));
     }
 
     #[test]

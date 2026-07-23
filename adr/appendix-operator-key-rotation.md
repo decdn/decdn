@@ -59,7 +59,7 @@ If both keys must rotate, rotate the **iroh key first** (cheap, atomic on-chain,
 
 | Resets on rotation | Impact |
 |--------------------|--------|
-| Reputation observations from peers | Reports indexed by `(reporter, provider)` NodeId pair ([ADR 008](008-reputation.md#adr-008-reputation-system)); new NodeId starts at the default 0.5 neutral score |
+| Reputation observations | Each peer scores this operator locally, keyed on the observed NodeId ([ADR 008](008-reputation.md#adr-008-reputation-system)); a new NodeId starts at the default 0.5 neutral score |
 | Local DHT routing-table position | New NodeId reseeds the Kademlia bucket structure ([ADR 022](022-content-discovery.md#adr-022--content-discovery-at-scale)) |
 | 0-RTT session tickets cached by clients | Clients fall back to 1-RTT until they re-cache ([ADR 015](015-zero-rtt.md#adr-015-quic-0-rtt-connection-establishment)); brief P95 bump |
 
@@ -116,7 +116,7 @@ Procedure:
 9. **Restart** the node with config pointing at the new EVM keystore. Confirm `/health` reports `ready` and `decdn_channel_deposit_usdc` is zero (no channels yet).
 10. **Re-open outbound channels** as needed for cache-miss pulls — no carry-over.
 
-**Real cost:** `firstBondedAt` resets to the new registration timestamp; the operator's `age_ramp` resets to zero and rebuilds to full weight at 6 months per [ADR 026 § Governance](026-tokenomics.md#governance); reputation observations on the old NodeId↔Ethereum-address pair are stranded — peers' caches time out per [ADR 008 § Score Decay](008-reputation.md#score-decay-production-only).
+**Real cost:** `firstBondedAt` resets to the new registration timestamp; the operator's `age_ramp` resets to zero and rebuilds to full weight at 6 months per [ADR 026 § Governance](026-tokenomics.md#governance); reputation observations against the old NodeId are stranded — each peer's local score for it decays back to neutral per [ADR 008 § Score Decay](008-reputation.md#score-decay).
 
 > **Recommendation.** Treat EOA rotation as a last resort. Prefer the **one-time migration to a Safe** ([§ EOA → Safe migration (one-time, recommended)](#eoa--safe-migration-one-time-recommended)) — once on a Safe, all future "rotations" are owner/session-key swaps with no on-chain identity change.
 
@@ -179,14 +179,14 @@ Exception: **emergency compromise of the Ethereum key.** Run [§ Ethereum signin
 
 - **Client-side iroh-key rotation.** See [ADR 012](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model), inline "Key rotation": open client→node channels survive client iroh-key rotation (keyed by the client's Ethereum address), mirroring the operator-side carry-over in [§ iroh node-key rotation only](#iroh-node-key-rotation-only).
 - **Out-of-scope production hot-signing alternatives.** Hardware-wallet and HSM-backed voucher signing are infeasible per [ADR 012 § Consequences](012-client.md#consequences) — 2–5s confirmation latencies cannot keep the per-MB voucher cadence. A separate delegated-voucher-signer contract path is similarly superseded. The sole production hot-signing path is [ADR 024 § Session Keys — Deferred to Production via ERC-7579 smartsessions](024-account-abstraction.md#session-keys--deferred-to-production-via-erc-7579-smartsessions).
-- **Compromised-key incident response.** This runbook describes mechanics. If a key is *believed compromised*, the operator should also: alert peer operators via reputation gossip and rotate before any further wire-level signature under the compromised key. There is no protocol-funded incident reserve (the `SafetyReserve` was retired — see [ADR 026 § Incident recourse](026-tokenomics.md#incident-recourse-no-standing-reserve)); any discretionary restitution for losses is a DAO Treasury governance matter.
+- **Compromised-key incident response.** This runbook describes mechanics. If a key is *believed compromised*, the operator should also: alert peer operators out-of-band and rotate before any further wire-level signature under the compromised key. There is no protocol-funded incident reserve (the `SafetyReserve` was retired — see [ADR 026 § Incident recourse](026-tokenomics.md#incident-recourse-no-standing-reserve)); any discretionary restitution for losses is a DAO Treasury governance matter.
 
 ## Cross-ADR Impact
 
 - [ADR 001 — On-chain registry, `registerNode`, NodeId ownership verification](001-network.md#adr-001-network-topology-and-peer-mesh)
 - [ADR 003 — `bindNodeId` rebinding, `nodeIdToAddress`, EIP-712 `BindNodeId` schema](003-payments.md#nodeid-to-ethereum-binding)
 - [ADR 005 — Probe-triggered eviction hold (drain prerequisite)](005-protocol.md#probe-triggered-eviction-hold)
-- [ADR 008 — Reputation per `(reporter, provider)` NodeId pair](008-reputation.md#adr-008-reputation-system)
+- [ADR 008 — Local per-peer reputation](008-reputation.md#adr-008-reputation-system)
 - [ADR 012 — Client iroh-key rotation analogue](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model)
 - [ADR 019 — `registerNode`, `deregisterNode`, re-onboarding flow](019-node-onboarding.md#adr-019-node-onboarding-and-bootstrapping-flow)
 - [ADR 024 — Smart-account session keys via `erc7579/smartsessions`](024-account-abstraction.md#adr-024-account-abstraction-and-safe-smart-wallet-support)

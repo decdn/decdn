@@ -129,13 +129,11 @@ These give early warning for the three slashable offenses in [ADR 026 § Slashin
 
 #### Reputation Metrics
 
-The metrics below apply once the reputation gossip layer in [ADR 008](008-reputation.md#adr-008-reputation-system) is implemented; local-only-scoring nodes expose only `decdn_reputation_score`.
+Reputation is local-only per [ADR 008](008-reputation.md#adr-008-reputation-system) — no gossip, so the only reputation metric is the local score gauge.
 
 | Metric | Type | Tier | Description |
 |--------|------|------|-------------|
-| `decdn_reputation_reports_sent_total` | Counter | R | `ReputationReport` messages published to `cdn/reputation/v1`. |
-| `decdn_reputation_reports_received_total` | Counter | R | `ReputationReport` messages accepted from peers. |
-| `decdn_reputation_score` | Gauge | R | This node's current `final_score` (0.0–1.0) as computed locally — local observations (70%) + gossip (30%) per [ADR 008](008-reputation.md#adr-008-reputation-system). |
+| `decdn_reputation_score` | Gauge | R | This node's current local reputation score (0.0–1.0) for a peer, computed from its own delivery observations per [ADR 008](008-reputation.md#adr-008-reputation-system). |
 
 #### QUIC / 0-RTT Metrics
 
@@ -226,13 +224,13 @@ The shared `capacity-bond` watcher follows `CapacityBond` membership events to k
 
 ##### Watcher Liveness, Panic, and Enforcement Metrics
 
-All six chain-event watchers run through one shared `resumable_watcher::run` loop. The `*_down_seconds` / `*_restarts_total` down-family above is **error-triggered**: it moves only when a poll tick returns `Err`. A task that panics while healthy, wedges in an await the per-call timeout does not cover, or exits cleanly on shutdown leaves the down-since state unset, so `*_down_seconds` reads a healthy `0` — a dead watcher is byte-identical to a live one (#1316, #1320). Two additive families close that gap uniformly across all six, and #1283/#1316 also brought `blacklist`, `settlement`, and `reputation_indexer` to full down-family parity: they now expose `restarts_total` / `down_seconds` matching the staker-set rows above, and `reputation_indexer` additionally keeps its separate `reputation_indexer_rpc_failures_total` (which counts every failing tick rather than the healthy→error edge).
+All five chain-event watchers run through one shared `resumable_watcher::run` loop. The `*_down_seconds` / `*_restarts_total` down-family above is **error-triggered**: it moves only when a poll tick returns `Err`. A task that panics while healthy, wedges in an await the per-call timeout does not cover, or exits cleanly on shutdown leaves the down-since state unset, so `*_down_seconds` reads a healthy `0` — a dead watcher is byte-identical to a live one (#1316, #1320). Two additive families close that gap uniformly across all five, and #1283/#1316 also brought `blacklist` and `settlement` to full down-family parity: they now expose `restarts_total` / `down_seconds` matching the staker-set rows above.
 
-In the metric names below, `<watcher>` expands to one of **`slash_watcher`**, **`staker_set_watcher`**, **`origin_directory_watcher`**, **`blacklist_watcher`**, **`settlement_watcher`**, or **`reputation_indexer`** — note the last carries **no** `_watcher_` infix (e.g. the real series is `decdn_reputation_indexer_last_tick_timestamp_seconds` / `decdn_reputation_indexer_restarts_total`, not `decdn_reputation_indexer_watcher_*`).
+In the metric names below, `<watcher>` expands to one of **`slash_watcher`**, **`staker_set_watcher`**, **`origin_directory_watcher`**, **`blacklist_watcher`**, or **`settlement_watcher`**.
 
 | Metric | Type | Tier | Labels | Description |
 |--------|------|------|--------|-------------|
-| `decdn_<watcher>_last_tick_timestamp_seconds` | Gauge | M | — | **Positive liveness signal** (#1316): Unix wall-clock time of the last *successful* poll tick, stamped every tick (including idle ticks — a successful head read is proof of life). Unlike the error-triggered down-family, a panicked, wedged, or cleanly-exited task stops advancing this, so staleness is detectable. One series per watcher (`slash`, `staker_set`, `origin_directory`, `blacklist`, `settlement`, `reputation_indexer`). Reads `0` until the first successful tick. |
+| `decdn_<watcher>_last_tick_timestamp_seconds` | Gauge | M | — | **Positive liveness signal** (#1316): Unix wall-clock time of the last *successful* poll tick, stamped every tick (including idle ticks — a successful head read is proof of life). Unlike the error-triggered down-family, a panicked, wedged, or cleanly-exited task stops advancing this, so staleness is detectable. One series per watcher (`slash`, `staker_set`, `origin_directory`, `blacklist`, `settlement`). Reads `0` until the first successful tick. |
 | `decdn_<watcher>_task_panicked_total` | Counter | M | — | The watcher task unwound on a panic (#1316). Bumped from a `Drop` guard in `resumable_watcher::run` — the only thing that runs on the unwind, since the detached task is never awaited. **Any non-zero value is a bug in this node.** One series per watcher. |
 | `decdn_blacklist_enforcement_failures_total` | Counter | M | — | Distinct hashes a batched re-scope could not re-verify or evict this pass (`Recheck::Failed` — a disk error or a scope `eth_call` failure) (#1319). Non-zero means the deny-set is **not fully enforced** and a blacklisted blob may still be servable and slashable (`SlashJudge.submitBlacklistChallenge`), even while `decdn_blacklist_watcher_down_seconds` reads `0` — the two answer different questions (deny-set enforced vs chain readable). Pairs with the aggregate `warn!` (`"blacklist re-scope could not enforce every entry"`). |
 
@@ -240,7 +238,7 @@ In the metric names below, `<watcher>` expands to one of **`slash_watcher`**, **
 
 | Metric | Warning | Critical | Action |
 |--------|---------|----------|--------|
-| `(decdn_<watcher>_last_tick_timestamp_seconds > 0) and (time() - decdn_<watcher>_last_tick_timestamp_seconds > 3 × poll_interval)` | ✓ | sustained | The watcher has not completed a tick — panicked, wedged, or exited. For `blacklist` this means the node may be serving content blacklisted after the failure (slashable); for the others, the corresponding cache/projection is drifting. Restart the daemon and check the RPC provider. **The `> 0` guard is required:** the gauge reads `0` until the first successful tick, so an unguarded `time() - gauge` fires forever on a fresh boot and permanently on a node that never enables a conditionally-spawned watcher (`origin_directory`, `reputation_indexer`). A watcher that never establishes at all is caught by its down-family / the blacklist readiness gate, not here. |
+| `(decdn_<watcher>_last_tick_timestamp_seconds > 0) and (time() - decdn_<watcher>_last_tick_timestamp_seconds > 3 × poll_interval)` | ✓ | sustained | The watcher has not completed a tick — panicked, wedged, or exited. For `blacklist` this means the node may be serving content blacklisted after the failure (slashable); for the others, the corresponding cache/projection is drifting. Restart the daemon and check the RPC provider. **The `> 0` guard is required:** the gauge reads `0` until the first successful tick, so an unguarded `time() - gauge` fires forever on a fresh boot and permanently on a node that never enables a conditionally-spawned watcher (`origin_directory`). A watcher that never establishes at all is caught by its down-family / the blacklist readiness gate, not here. |
 | `decdn_<watcher>_task_panicked_total` (rate) | > 0 | > 0 | A watcher task panicked. Never expected — capture the `error!` log line and file a bug. |
 | `decdn_blacklist_enforcement_failures_total` (rate) | > 0 | > 0 sustained | The blacklist deny-set is not fully enforced — a blacklisted blob may be servable and slashable. Check disk health and the `ContentBlacklist` RPC; correlate with the `unenforced` `warn!`. |
 
@@ -327,8 +325,6 @@ Earlier ADRs used informal metric names; this table maps them to canonical repla
 | `streams_failed` | `decdn_streams_failed_total` | architecture.md |
 | `vouchers_signed` | `decdn_vouchers_signed_total` | architecture.md |
 | `vouchers_received` | `decdn_vouchers_received_total` | architecture.md |
-| `reputation_reports_sent` | `decdn_reputation_reports_sent_total` | architecture.md |
-| `reputation_reports_received` | `decdn_reputation_reports_received_total` | architecture.md |
 | `channels_open` | `decdn_channels_open` | architecture.md |
 | `channels_settled` | `decdn_channels_settled_total` | architecture.md |
 | `cache_hits` | `decdn_cache_hits_total` | architecture.md |
@@ -354,7 +350,7 @@ Add the file via Prometheus `rule_files:` and reload. Validate with `promtool ch
 
 #### Scope
 
-Covers M-tier slash-safety metrics and the most common R-tier panels for a first dashboard. Deliberately not exhaustive: [§ Tokenomics Metrics](#tokenomics-metrics) tokenomics, reputation, and 0-RTT panels are left to deployment-specific dashboards.
+Covers M-tier slash-safety metrics and the most common R-tier panels for a first dashboard. Deliberately not exhaustive: [§ Tokenomics Metrics](#tokenomics-metrics) tokenomics and 0-RTT panels are left to deployment-specific dashboards.
 
 ## Consequences
 
@@ -374,4 +370,4 @@ Covers M-tier slash-safety metrics and the most common R-tier panels for a first
 ## Deferred & Open
 
 - **OpenMetrics migration.** Prometheus text format 0.0.4 is the current default; the OpenMetrics exposition format (used by `prometheus_client` crate's `MetricsEncoder`) adds exemplars and native histograms — evaluate once tooling support is broader.
-- **Tokenomics + reputation dashboard panels.** The reference dashboard in [`monitoring/grafana-dashboard.json`](../monitoring/grafana-dashboard.json) is deliberately scoped to M-tier core operations. [§ Reputation Metrics](#reputation-metrics) reputation and [§ Tokenomics Metrics](#tokenomics-metrics) tokenomics metrics warrant their own dedicated dashboards (served-bytes voting weight + quorum-denominator tracking per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight), bootstrap-multisig transition tracking) — these are deployment-specific and belong outside the reference set.
+- **Tokenomics dashboard panels.** The reference dashboard in [`monitoring/grafana-dashboard.json`](../monitoring/grafana-dashboard.json) is deliberately scoped to M-tier core operations. [§ Tokenomics Metrics](#tokenomics-metrics) tokenomics metrics warrant their own dedicated dashboard (served-bytes voting weight + quorum-denominator tracking per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight), bootstrap-multisig transition tracking) — these are deployment-specific and belong outside the reference set.

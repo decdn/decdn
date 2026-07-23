@@ -155,7 +155,6 @@ Subscribe to:
 
 - `cdn/global/v1` — all staked nodes publish and subscribe.
 - `cdn/region/{cc}/v1` — subscribe to the node's own declared region topic.
-- `cdn/reputation/v1` — reputation reports (production only; see [ADR 008](008-reputation.md#adr-008-reputation-system)).
 
 Topic names are string literals used as iroh-gossip topic IDs.
 

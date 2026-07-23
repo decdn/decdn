@@ -12,7 +12,15 @@ use decdn_protocol::{
 };
 use thiserror::Error;
 
-use crate::reputation::StakedNodeSet;
+/// Membership test for the live staked-node set. Implemented in `decdn-node`
+/// over the chain staker set (kept fresh by the `NodeRegistered` /
+/// `NodeDeregistered` / `NodeAutoEjected` event tail). Gates `NodeAnnounce`
+/// admission (ADR 001 rule 2 — see [`validate_envelope`]). Called on the
+/// subscriber hot path — implementations must be cheap and non-blocking.
+pub trait StakedNodeSet: Send + Sync + 'static {
+    /// Whether `node_id` (a `NodeId`'s 32 bytes) is a currently staked node.
+    fn contains(&self, node_id: &[u8; 32]) -> bool;
+}
 
 /// ADR 001 rule-2 admission gate for inbound `NodeAnnounce`, naming its two
 /// safety-opposite states so neither is the silent default: [`Self::Enforce`]
@@ -21,15 +29,8 @@ use crate::reputation::StakedNodeSet;
 /// [`validate_envelope`] path, `Arc<dyn StakedNodeSet>` on the owned spawn path
 /// (see [`OwnedAnnounceGate`]).
 ///
-/// **`AnnounceGate::Disabled` fails OPEN.** The inverse pole still exists —
-/// `ReputationWiring::Disabled` is fail-CLOSED — so the polarity
-/// inversion #1338 warned about has not gone away; always check which type you
-/// are holding. What #1342 removed is the *shape* collision: the fail-closed
-/// side used to be a second two-variant `*Gate` enum over this same
-/// [`StakedNodeSet`] seam, so the two could be swapped at a call site by
-/// mistaking one for the other. It is now a differently-shaped wiring enum with
-/// a different name, which is what makes them hard to confuse — not the absence
-/// of an inverted twin.
+/// **`AnnounceGate::Disabled` fails OPEN**, and is `#[cfg(test)]` so the runtime
+/// cannot select it — the production wiring always passes `Enforce`.
 // `Copy` is conditional: it applies only where `S: Copy`, i.e. the borrowed
 // `AnnounceGate<&dyn StakedNodeSet>`. The owned `OwnedAnnounceGate` (an `Arc`)
 // is `Clone`-only, so `gate.clone()` at each subscriber is a refcount bump, not
@@ -54,9 +55,7 @@ pub enum AnnounceGate<S> {
     /// [`crate::GossipService::spawn`], which would reopen the hole #1170 closed
     /// with every existing test still green (`announce_staked_gate` would keep
     /// returning `Enforce`; it would just have no callers). Gating the variant
-    /// moves that invariant from prose to the compiler. Note the asymmetry with
-    /// `ReputationWiring::Disabled`, which is *not* gated: that one fails
-    /// CLOSED, so it is a legitimate runtime choice.
+    /// moves that invariant from prose to the compiler.
     #[cfg(test)]
     Disabled,
 }
@@ -98,10 +97,11 @@ pub enum AnnounceReject {
     DecodeFailed,
     #[error("unknown envelope version")]
     UnknownVersion,
-    /// The envelope decoded to a [`GossipPayload`] variant other than
-    /// `NodeAnnounce` (e.g. a `ReputationReport`, which has its own
-    /// [`crate::reputation::validate_reputation_envelope`] path). Reached now
-    /// that the enum has more than one variant.
+    /// The envelope decoded to a future [`GossipPayload`] variant this node
+    /// does not understand. `GossipPayload` currently has a single variant
+    /// (`NodeAnnounce`), so this is unreachable today; it is kept as
+    /// forward-compat scaffolding for when a new variant is appended (ADR 013
+    /// §Protocol Enums), and so the metric label stays stable.
     #[error("unknown gossip payload variant")]
     UnknownVariant,
     #[error("signature length != {SIGNATURE_LEN}")]
@@ -250,12 +250,12 @@ pub fn validate_envelope(
         return Err(AnnounceReject::OversizeTrailingBytes);
     }
 
-    // This validator handles only `NodeAnnounce`; a `ReputationReport`
-    // envelope on this path is the wrong variant (the reputation topic has its
-    // own `validate_reputation_envelope`).
-    let GossipPayload::NodeAnnounce(announce) = env.payload else {
-        return Err(AnnounceReject::UnknownVariant);
-    };
+    // This validator handles only `NodeAnnounce`. `GossipPayload` currently has a
+    // single variant, so this destructure is irrefutable; when a future variant
+    // is appended (ADR 013 §Protocol Enums) this line becomes a compile error,
+    // forcing the new variant to be handled explicitly. `AnnounceReject::
+    // UnknownVariant` and its stable metric label are kept for that future path.
+    let GossipPayload::NodeAnnounce(announce) = env.payload;
 
     validate_announce_fields(&announce, now_us)?;
     verify_signature(&announce)?;
@@ -624,38 +624,6 @@ mod tests {
         assert_eq!(format!("{enforce:?}"), "AnnounceGate::Enforce(..)");
         let disabled: OwnedAnnounceGate = AnnounceGate::Disabled;
         assert_eq!(format!("{disabled:?}"), "AnnounceGate::Disabled");
-    }
-
-    /// Now that `GossipPayload` has a second variant, a `ReputationReport`
-    /// envelope fed to the `NodeAnnounce` validator must hit the (newly
-    /// reachable) `UnknownVariant` arm rather than being mis-accepted. Guards
-    /// the two validators against cross-accepting each other's payloads.
-    #[test]
-    fn reputation_report_envelope_rejected_as_unknown_variant() {
-        use decdn_protocol::{ReportMetrics, ReputationReport, ReputationReportBody};
-        let sk = fresh_key();
-        let body = ReputationReportBody {
-            provider: [2u8; 32],
-            reporter: *sk.public().as_bytes(),
-            metrics: ReportMetrics {
-                delivery_speed: None,
-                uptime_observed: Some(true),
-                data_correct: Some(true),
-            },
-            timestamp_secs: 1_700_000_000,
-        };
-        let signature = sk
-            .sign(&body.signing_bytes().expect("body encode"))
-            .to_bytes()
-            .to_vec();
-        let bytes = encode(&GossipEnvelope {
-            version: GOSSIP_VERSION,
-            payload: GossipPayload::ReputationReport(ReputationReport { body, signature }),
-        });
-        assert_eq!(
-            validate_envelope(&bytes, 1_700_000_000_000_000, AnnounceGate::Disabled),
-            Err(AnnounceReject::UnknownVariant)
-        );
     }
 
     #[test]

@@ -35,10 +35,9 @@
 //! `backfill`'s `REORG_MARGIN_BLOCKS`, which carries the sizing rationale for an
 //! Arbitrum-Sepolia-class L2 and is the single place that claim lives), and
 //! because the sinks holding an authoritative on-chain enumeration source
-//! re-read it and self-heal. The two without one are where an orphan sticks:
+//! re-read it and self-heal. The one without one is where an orphan sticks:
 //! settlement's `register_open_channel` (durable — an fsynced phantom channel,
-//! reclaimed only by the expiry sweep) and reputation's settlement accumulator
-//! (in-memory, so a reboot clears it). Both predate #1227 and are unchanged by
+//! reclaimed only by the expiry sweep). It predates #1227 and is unchanged by
 //! it — deleting an always-zero field cannot alter what a lag never did.
 //!
 //! For the settlement watcher specifically, a lag also carries a concrete cost,
@@ -115,15 +114,13 @@ pub(crate) const DEFAULT_RPC_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 ///
 /// This helper guarantees only that a call is *bounded*. What a timeout **means**
 /// is the call site's decision, and each documents its own — the two live shapes
-/// being fail-the-tick-and-back-off (`getChannel`, reputation's `nodeIdOf`,
-/// origin's `getOrigins`) and degrade-and-continue (`slash`'s `get_block`, the
-/// registry's `nodeIdOf`, origin's `nodeIdOf`).
+/// being fail-the-tick-and-back-off (`getChannel`, origin's `getOrigins`) and
+/// degrade-and-continue (`slash`'s `get_block`, the registry's `nodeIdOf`,
+/// origin's `nodeIdOf`).
 ///
-/// `nodeIdOf` is the same read at three sites under two policies, which is
-/// deliberate and not a bug to unify: reputation fails the tick because a
-/// skipped settlement is a silent accounting gap nothing re-derives, while the
-/// registry and origin count-and-skip because their projections self-heal on
-/// the operator's next event. See `reputation_indexer::resolve_binding`.
+/// `nodeIdOf` is the same read at two sites under one policy: the registry and
+/// origin both count-and-skip because their projections self-heal on the
+/// operator's next event.
 ///
 /// Takes `IntoFuture`, not `Future`, so an alloy `.call()` (which returns an
 /// `EthCall`, not a future) can be wrapped directly rather than each caller
