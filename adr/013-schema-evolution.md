@@ -26,7 +26,7 @@ Every message on every QUIC stream (all ALPNs) is length-prefixed:
 └─────────────────────┴──────────────────────────────┘
 ```
 
-The varint uses postcard's native varint encoding (continuation-bit scheme similar to LEB128). `MAX_MESSAGE_SIZE = 16 MiB` (16,777,216 bytes) — a single global protocol-level limit applied uniformly across all ALPNs; messages exceeding it are rejected before allocation. Per-ALPN protocol-level caps are rejected: typical messages are orders of magnitude below 16 MiB (see *DoS note*), and a future ALPN requiring >16 MiB would itself be a major-version change. **DoS note:** `read_frame` allocates `len` bytes, so a malicious peer could send a large length prefix to force allocation. The 16 MiB cap bounds per-stream allocation; QUIC's `MAX_STREAMS` transport parameter ([ADR 005](005-protocol.md#adr-005-wire-protocol)) bounds concurrent streams per connection — together limiting per-peer memory exposure. Operators on memory-constrained nodes SHOULD set a lower `MAX_MESSAGE_SIZE` as local policy; `cdn/probe/v1` messages never exceed ~200 bytes, and `cdn/client/v1` messages (excluding `ChunkData`) never exceed ~1 KiB.
+The varint uses postcard's native varint encoding (continuation-bit scheme similar to LEB128). `MAX_MESSAGE_SIZE = 16 MiB` (16,777,216 bytes) — a single global protocol-level limit applied uniformly across all ALPNs; messages exceeding it are rejected before allocation. The cap is global, not per-ALPN: typical messages are orders of magnitude below 16 MiB (see *DoS note*), and a future ALPN requiring >16 MiB would itself be a major-version change. **DoS note:** `read_frame` allocates `len` bytes, so a malicious peer could send a large length prefix to force allocation. The 16 MiB cap bounds per-stream allocation; QUIC's `MAX_STREAMS` transport parameter ([ADR 005](005-protocol.md#adr-005-wire-protocol)) bounds concurrent streams per connection — together limiting per-peer memory exposure. Operators on memory-constrained nodes SHOULD set a lower `MAX_MESSAGE_SIZE` as local policy; `cdn/probe/v1` messages never exceed ~200 bytes, and `cdn/client/v1` messages (excluding `ChunkData`) never exceed ~1 KiB.
 
 The receiver reads the varint length, allocates and reads exactly that many bytes, then deserializes with `postcard::take_from_bytes` on the bounded slice. `take_from_bytes` succeeds even if the sender's struct has more fields than the receiver's definition — unconsumed trailing bytes are returned as a remainder. This is the key mechanism for forward-compatible minor evolution.
 
@@ -81,7 +81,7 @@ The upstream default (`DEFAULT_MAX_MESSAGE_SIZE = 4096`) is **insufficient**: it
 
 **Operator-policy scope.** The note above ("Operators on memory-constrained nodes SHOULD set a lower `MAX_MESSAGE_SIZE` as local policy") applies only to deCDN-owned ALPNs whose framing is decoded inside this node and cannot affect a peer; it does NOT apply to `GOSSIP_MAX_FRAME`.
 
-**iroh-gossip dependency.** The cap is wired via `iroh_gossip::net::Gossip::builder().max_message_size(N)` (iroh-gossip ≥ 0.98). The minimum allowed value is `MIN_MAX_MESSAGE_SIZE = 512`; the 4 KiB upstream default is too small for our envelope shape and is deliberately overridden.
+**iroh-gossip dependency.** The cap is wired via `iroh_gossip::net::Gossip::builder().max_message_size(N)` (iroh-gossip ≥ 0.98). The minimum allowed value is `MIN_MAX_MESSAGE_SIZE = 512`.
 
 ### Protocol Enums
 
@@ -433,7 +433,7 @@ A node MUST support at least the current and previous major version simultaneous
 | Old version removal | T+12 weeks | Old version support MAY be removed. Nodes that have not upgraded become unreachable by new clients |
 | Gossip topic removal | T+12 weeks | Old gossip topic subscriptions MAY be dropped. Peers on old topics become invisible |
 
-Deprecation schedules are announced via governance ([ADR 009](009-governance.md#adr-009-governance-model)). An on-chain `ProtocolVersions` registry contract is explicitly out of scope — off-chain governance announcement plus QUIC ALPN negotiation already covers the runtime path (clients try the newest version first, fall back on `no_application_protocol`), and a registry contract adds governance and integration complexity without operational payoff at the expected network scale. If a future scale or trust profile changes the calculus, the registry warrants its own ADR rather than a deferred follow-up here.
+Deprecation schedules are announced via governance ([ADR 009](009-governance.md#adr-009-governance-model)). An on-chain `ProtocolVersions` registry contract is out of scope: off-chain governance announcement plus QUIC ALPN negotiation already covers the runtime path (clients try the newest version first, fall back on `no_application_protocol`). If a future scale or trust profile changes the calculus, the registry warrants its own ADR.
 
 > **See also:** [`appendix-operator-upgrade-path.md`](appendix-operator-upgrade-path.md#appendix-operator-protocol-upgrade-runbook) sequences the operator-side actions for each tier — Tier 1/2 checklists, the Tier 3 rolling-upgrade procedure, and client / governance coordination touchpoints.
 
