@@ -1,11 +1,14 @@
 //! Local reputation scoring (ADR 008 §3 with the §14a scope reductions).
 //!
-//! Folds delivery outcomes into a per-peer EWMA score in `[0.0, 1.0]`.
-//! In-memory only; persistence is deferred per ADR 008 §14a.3.
+//! Folds delivery outcomes into a per-peer EWMA score in `[0.0, 1.0]`, and
+//! decays idle scores back toward neutral over time (ADR 008 §Score Decay) so
+//! a peer that stops being used drifts back to unopinionated rather than
+//! holding a stale high or low score. In-memory only; persistence is deferred
+//! per ADR 008 §14a.3.
 
 use iroh::PublicKey as NodeId;
 use std::collections::HashMap;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use thiserror::Error;
 
@@ -15,6 +18,19 @@ const DEFAULT_EXPECTED_BPS: u64 = 10 * 1024 * 1024;
 const DEFAULT_SPEED_WEIGHT: f64 = 0.4;
 const DEFAULT_CORRECTNESS_WEIGHT: f64 = 0.4;
 const DEFAULT_REACHABILITY_WEIGHT: f64 = 0.2;
+/// ADR 008 §Score Decay: idle scores decay 10% per week toward neutral.
+const DEFAULT_DECAY_RATE_PER_WEEK: f64 = 0.10;
+
+/// Seconds in a week — the decay unit (ADR 008 §Score Decay).
+const SECONDS_PER_WEEK: f64 = 7.0 * 24.0 * 3600.0;
+
+/// Eviction candidates must be within this band of neutral (ADR 008
+/// §Score Decay: converge within 0.05 of neutral).
+const EVICT_NEUTRAL_BAND: f64 = 0.05;
+/// …and idle for longer than this many weeks. 26 weeks (~½ year) leaves ample
+/// margin over the ~30 weeks a score needs to decay within the neutral band,
+/// so eviction only ever drops entries that already read as neutral.
+const EVICT_IDLE_WEEKS: f64 = 26.0;
 // ADR 008 §14a excludes per-report clamping from the local scoring rule. The
 // clamp logic is kept so callers can opt into §8's ±0.05 cap by overriding this
 // field, but the default is `1.0` — a no-op cap given EWMA delta cannot exceed
@@ -97,6 +113,9 @@ pub struct LocalReputationConfig {
     pub correctness_weight: f64,
     pub reachability_weight: f64,
     pub max_delta_per_update: f64,
+    /// Weekly decay toward neutral for an idle peer (ADR 008 §Score Decay).
+    /// Defaults to `0.10` (10% per week). A value of `0.0` disables decay.
+    pub decay_rate_per_week: f64,
 }
 
 impl Default for LocalReputationConfig {
@@ -109,6 +128,7 @@ impl Default for LocalReputationConfig {
             correctness_weight: DEFAULT_CORRECTNESS_WEIGHT,
             reachability_weight: DEFAULT_REACHABILITY_WEIGHT,
             max_delta_per_update: DEFAULT_MAX_DELTA_PER_UPDATE,
+            decay_rate_per_week: DEFAULT_DECAY_RATE_PER_WEEK,
         }
     }
 }
@@ -127,73 +147,174 @@ impl LocalReputationConfig {
     }
 }
 
+/// A source of wall-clock time in whole seconds since the Unix epoch, driving
+/// idle-score decay (ADR 008 §Score Decay). Injected so tests can advance time
+/// deterministically instead of sleeping.
+pub trait Clock: std::fmt::Debug + Send + Sync {
+    /// Current time as seconds since the Unix epoch.
+    fn now_secs(&self) -> u64;
+}
+
+/// Production clock reading the system wall clock.
+///
+/// A clock before the Unix epoch (or a `duration_since` error) reads as `0`,
+/// which the decay math treats as maximal age; a genuine pre-1970 host is not
+/// a real deployment, so this can only ever over-decay a freshly seeded score
+/// toward neutral — never inflate one.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now_secs(&self) -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs())
+    }
+}
+
+/// A stored per-peer score plus the wall-clock second it was last written, so
+/// reads can lazily decay it toward neutral (ADR 008 §Score Decay).
+#[derive(Debug, Clone, Copy)]
+struct Entry {
+    score: f64,
+    last_update_secs: u64,
+}
+
 /// In-memory store of per-peer EWMA reputation scores keyed by [`NodeId`].
 ///
 /// Cheap to share across tasks via [`std::sync::Arc`]; reads use a
-/// read-lock, writes a write-lock. No persistence and no network
+/// read-lock, writes a write-lock. Idle scores decay toward neutral lazily at
+/// read time (ADR 008 §Score Decay). No persistence and no network
 /// aggregation per ADR 008 §14a.
 #[derive(Debug)]
 pub struct LocalReputation {
     config: LocalReputationConfig,
-    scores: RwLock<HashMap<NodeId, f64>>,
+    clock: Arc<dyn Clock>,
+    scores: RwLock<HashMap<NodeId, Entry>>,
 }
 
 impl LocalReputation {
-    /// Build a new score store, validating the config.
+    /// Build a new score store backed by the system clock, validating the config.
     ///
     /// Validation rejects non-finite or out-of-range parameters so a single
     /// bad config write cannot poison every future score with NaN.
     pub fn new(config: LocalReputationConfig) -> Result<Self, ConfigError> {
+        Self::with_clock(config, Arc::new(SystemClock))
+    }
+
+    /// Build a new score store driven by an explicit [`Clock`], validating the
+    /// config. Tests inject a controllable clock to exercise decay without
+    /// sleeping; production uses [`Self::new`] (the system clock).
+    pub fn with_clock(
+        config: LocalReputationConfig,
+        clock: Arc<dyn Clock>,
+    ) -> Result<Self, ConfigError> {
         validate(&config)?;
         Ok(Self {
             config,
+            clock,
             scores: RwLock::new(HashMap::new()),
         })
     }
 
     /// Fold an outcome into the peer's score and return the new value.
     ///
-    /// The returned value matches a subsequent [`Self::score`] call so
-    /// callers logging both can avoid a re-lock.
+    /// The stored score is first decayed to now (ADR 008 §Score Decay), then
+    /// EWMA-folded with this interaction's sample. The returned value matches a
+    /// subsequent [`Self::score`] call taken at the same instant so callers
+    /// logging both can avoid a re-lock.
     pub fn record(&self, peer: NodeId, outcome: Outcome) -> f64 {
         let sample = self.interaction_score(outcome);
-        // Poison recovery: the only writer is this method, and the HashMap
-        // is mutated only by the final `insert` after all arithmetic. A
-        // panic earlier in the function leaves the map structurally intact.
+        let now = self.clock.now_secs();
+        // Poison recovery: the only writer is this method, and the map entry
+        // is mutated only after all arithmetic. A panic earlier in the
+        // function leaves the map structurally intact.
         let mut guard = self
             .scores
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let prev = guard
-            .get(&peer)
-            .copied()
-            .unwrap_or(self.config.initial_score);
-        let next = self.fold(prev, sample);
-        guard.insert(peer, next);
+        let entry = guard.entry(peer).or_insert(Entry {
+            score: self.config.initial_score,
+            last_update_secs: now,
+        });
+        // Clamp the effective "now" so a backward clock read never rewinds
+        // `last_update_secs`, which would make a later `score()` apply extra
+        // decay. `decay_to` also saturates elapsed at 0; this keeps the stored
+        // timestamp monotonic too.
+        let effective_now = now.max(entry.last_update_secs);
+        let decayed = self.decay(entry.score, entry.last_update_secs, effective_now);
+        let next = self.fold(decayed, sample);
+        entry.score = next;
+        entry.last_update_secs = effective_now;
         next
     }
 
-    /// Current score for `peer`, or [`LocalReputationConfig::initial_score`] if unseen.
+    /// Current score for `peer`, decayed toward neutral for idle time (ADR 008
+    /// §Score Decay), or [`LocalReputationConfig::initial_score`] if unseen.
     pub fn score(&self, peer: NodeId) -> f64 {
+        let now = self.clock.now_secs();
         // Poison recovery: read-only path; cannot itself corrupt state.
         let guard = self
             .scores
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard
-            .get(&peer)
-            .copied()
-            .unwrap_or(self.config.initial_score)
+        guard.get(&peer).map_or(self.config.initial_score, |e| {
+            self.decay(e.score, e.last_update_secs, now)
+        })
     }
 
-    /// Snapshot of all observed `(peer, score)` pairs. Allocates.
+    /// Snapshot of all observed `(peer, score)` pairs, each decayed to now
+    /// (ADR 008 §Score Decay). Allocates.
     pub fn snapshot(&self) -> Vec<(NodeId, f64)> {
+        let now = self.clock.now_secs();
         // Poison recovery: read-only path; same reasoning as `score`.
         let guard = self
             .scores
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.iter().map(|(k, v)| (*k, *v)).collect()
+        guard
+            .iter()
+            .map(|(k, e)| (*k, self.decay(e.score, e.last_update_secs, now)))
+            .collect()
+    }
+
+    /// Drop entries whose decayed score has converged within `EVICT_NEUTRAL_BAND`
+    /// (0.05) of neutral AND that have been idle for more than `EVICT_IDLE_WEEKS`
+    /// (26), so the map stays bounded under peer churn without
+    /// discarding any opinion that still reads as non-neutral. A re-seen peer
+    /// simply re-inserts at neutral, so eviction is information-lossless for
+    /// anything that has already decayed to neutral. Best-effort maintenance —
+    /// call periodically; correctness never depends on it.
+    pub fn evict(&self) {
+        let now = self.clock.now_secs();
+        let neutral = self.config.initial_score;
+        let mut guard = self
+            .scores
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.retain(|_, e| {
+            let decayed = self.decay(e.score, e.last_update_secs, now);
+            #[allow(clippy::cast_precision_loss)]
+            let idle_weeks = now.saturating_sub(e.last_update_secs) as f64 / SECONDS_PER_WEEK;
+            let near_neutral = (decayed - neutral).abs() <= EVICT_NEUTRAL_BAND;
+            !(near_neutral && idle_weeks > EVICT_IDLE_WEEKS)
+        });
+    }
+
+    /// Closed-form decay of a stored score toward neutral (ADR 008 §Score
+    /// Decay): `neutral + (score - neutral) * (1 - rate)^weeks_elapsed`, with
+    /// `weeks_elapsed` fractional. A backward clock yields no decay (elapsed
+    /// saturates at 0). The iterative weekly form in the ADR is exactly this
+    /// closed form sampled at whole weeks.
+    fn decay(&self, score: f64, last_update_secs: u64, now_secs: u64) -> f64 {
+        let elapsed_secs = now_secs.saturating_sub(last_update_secs);
+        if elapsed_secs == 0 {
+            return score;
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let weeks = elapsed_secs as f64 / SECONDS_PER_WEEK;
+        let neutral = self.config.initial_score;
+        neutral + (score - neutral) * (1.0 - self.config.decay_rate_per_week).powf(weeks)
     }
 
     fn interaction_score(&self, outcome: Outcome) -> f64 {
@@ -241,6 +362,7 @@ fn validate(c: &LocalReputationConfig) -> Result<(), ConfigError> {
     require_unit_interval(c.correctness_weight, "correctness_weight")?;
     require_unit_interval(c.reachability_weight, "reachability_weight")?;
     require_unit_interval(c.max_delta_per_update, "max_delta_per_update")?;
+    require_unit_interval(c.decay_rate_per_week, "decay_rate_per_week")?;
     if c.expected_bps == 0 {
         return Err(ConfigError::ZeroExpectedBps);
     }
@@ -270,7 +392,41 @@ mod tests {
     use anyhow::{Context, ensure};
     use iroh::SecretKey;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::thread;
+
+    /// Whole seconds in a week, for advancing [`ManualClock`] in the decay tests.
+    const WEEK_SECS: u64 = 7 * 24 * 3600;
+
+    /// A test clock whose "now" is set explicitly, so decay is exercised by
+    /// advancing simulated weeks rather than sleeping.
+    #[derive(Debug)]
+    struct ManualClock(AtomicU64);
+
+    impl ManualClock {
+        fn new(secs: u64) -> Self {
+            Self(AtomicU64::new(secs))
+        }
+        fn set(&self, secs: u64) {
+            self.0.store(secs, Ordering::SeqCst);
+        }
+    }
+
+    impl Clock for ManualClock {
+        fn now_secs(&self) -> u64 {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    /// Build a store on a [`ManualClock`] starting at t=0, returning both so the
+    /// test can advance time.
+    fn with_manual_clock(
+        config: LocalReputationConfig,
+    ) -> anyhow::Result<(LocalReputation, Arc<ManualClock>)> {
+        let clock = Arc::new(ManualClock::new(0));
+        let r = LocalReputation::with_clock(config, Arc::clone(&clock) as Arc<dyn Clock>)?;
+        Ok((r, clock))
+    }
 
     fn fresh_peer() -> NodeId {
         SecretKey::generate().public()
@@ -278,6 +434,28 @@ mod tests {
 
     fn approx(a: f64, b: f64) -> bool {
         (a - b).abs() < 1e-9
+    }
+
+    /// Looser comparison for closed-form decay values (`powf` rounding).
+    fn approx_eps(a: f64, b: f64, eps: f64) -> bool {
+        (a - b).abs() < eps
+    }
+
+    /// A config that writes an interaction's sample straight through (alpha=1,
+    /// no clamp), so a single record seeds an exact score to decay from.
+    fn seeding_config() -> LocalReputationConfig {
+        LocalReputationConfig {
+            alpha: 1.0,
+            max_delta_per_update: 1.0,
+            ..LocalReputationConfig::default()
+        }
+    }
+
+    fn delivered_full() -> Outcome {
+        Outcome::Delivered {
+            bytes: 10 * 1024 * 1024,
+            elapsed: Duration::from_secs(1),
+        }
     }
 
     #[test]
@@ -295,6 +473,12 @@ mod tests {
         ensure!(c.expected_bps == 10 * 1024 * 1024);
         // §14a defers clamping; default is no-op (1.0).
         ensure!(approx(c.max_delta_per_update, 1.0));
+        // §Score Decay: 10% per idle week toward neutral.
+        ensure!(
+            approx(c.decay_rate_per_week, 0.10),
+            "decay drift: {}",
+            c.decay_rate_per_week
+        );
         let sum = c.speed_weight + c.correctness_weight + c.reachability_weight;
         ensure!((sum - 1.0).abs() < 1e-9, "weight sum drift: {sum}");
         Ok(())
@@ -666,5 +850,207 @@ mod tests {
         // lost update from a torn read-modify-write.
         ensure!(s < 1e-4, "expected near-zero score, got {s}");
         Ok(())
+    }
+
+    #[test]
+    fn high_score_decays_toward_neutral_matching_adr_examples() -> anyhow::Result<()> {
+        // Seed a peer at exactly 1.0 (alpha=1, full-quality delivery), then read
+        // it back at successive idle weeks. ADR 008 §Score Decay: the iterative
+        // 10%/week rule is the closed form 0.5 + 0.5·0.9^weeks sampled at whole
+        // weeks. (The ADR's tabulated 0.65/0.53 at weeks 10/20 are loose
+        // roundings; the exact rule gives 0.6743/0.5608.)
+        let (r, clock) = with_manual_clock(seeding_config())?;
+        let p = fresh_peer();
+        ensure!(approx(r.record(p, delivered_full()), 1.0), "seed != 1.0");
+        for (week, expected) in [
+            (1u64, 0.95),
+            (5, 0.795_245),
+            (10, 0.674_339),
+            (20, 0.560_788),
+            (30, 0.521_195),
+        ] {
+            clock.set(week * WEEK_SECS);
+            let got = r.score(p);
+            ensure!(
+                approx_eps(got, expected, 1e-6),
+                "week {week}: got {got}, want {expected}"
+            );
+        }
+        // ADR: "within 0.05 of neutral after ~30 weeks."
+        ensure!((r.score(p) - 0.5).abs() <= 0.05, "week 30 not within band");
+        Ok(())
+    }
+
+    #[test]
+    fn low_score_decays_up_toward_neutral() -> anyhow::Result<()> {
+        // Symmetric to the high-score case: a peer seeded at 0.0 rehabilitates
+        // toward 0.5 (0.5 − 0.5·0.9^weeks).
+        let (r, clock) = with_manual_clock(seeding_config())?;
+        let p = fresh_peer();
+        ensure!(
+            approx(r.record(p, Outcome::Unreachable), 0.0),
+            "seed != 0.0"
+        );
+        for (week, expected) in [(1u64, 0.05), (5, 0.204_755), (30, 0.478_804)] {
+            clock.set(week * WEEK_SECS);
+            let got = r.score(p);
+            ensure!(
+                approx_eps(got, expected, 1e-6),
+                "week {week}: got {got}, want {expected}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn record_decays_stored_score_before_folding() -> anyhow::Result<()> {
+        // With alpha=0.1, one full delivery at t=0 lands the peer at 0.55. After
+        // 5 idle weeks the *stored* 0.55 has decayed to 0.5 + 0.05·0.9^5 =
+        // 0.529524; the next Unreachable must fold from that decayed value
+        // (0.9·0.529524 = 0.476572), not from the stale 0.55 (→ 0.495).
+        let (r, clock) = with_manual_clock(LocalReputationConfig::default())?;
+        let p = fresh_peer();
+        ensure!(approx(r.record(p, delivered_full()), 0.55), "seed != 0.55");
+        clock.set(5 * WEEK_SECS);
+        let next = r.record(p, Outcome::Unreachable);
+        ensure!(
+            approx_eps(next, 0.476_572, 1e-6),
+            "expected fold from decayed base, got {next}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn decay_disabled_when_rate_zero() -> anyhow::Result<()> {
+        let cfg = LocalReputationConfig {
+            decay_rate_per_week: 0.0,
+            ..seeding_config()
+        };
+        let (r, clock) = with_manual_clock(cfg)?;
+        let p = fresh_peer();
+        ensure!(approx(r.record(p, delivered_full()), 1.0), "seed != 1.0");
+        clock.set(100 * WEEK_SECS);
+        ensure!(approx(r.score(p), 1.0), "rate 0 should freeze the score");
+        Ok(())
+    }
+
+    #[test]
+    fn backward_clock_neither_decays_nor_rewinds_the_timestamp() -> anyhow::Result<()> {
+        // Seed at week 10, then rewind the clock to week 5. A read at the earlier
+        // time must not "decay" (elapsed saturates at 0), and a record at the
+        // earlier time must not rewind `last_update_secs` — otherwise a later
+        // forward read would over-decay.
+        let (r, clock) = with_manual_clock(seeding_config())?;
+        let p = fresh_peer();
+        clock.set(10 * WEEK_SECS);
+        ensure!(approx(r.record(p, delivered_full()), 1.0), "seed != 1.0");
+
+        clock.set(5 * WEEK_SECS); // clock goes backwards
+        ensure!(
+            approx(r.score(p), 1.0),
+            "backward read decayed: {}",
+            r.score(p)
+        );
+        // A record while the clock is behind keeps the stored timestamp at week 10.
+        ensure!(
+            approx(r.record(p, delivered_full()), 1.0),
+            "backward record moved score"
+        );
+
+        // Forward to week 12: only 2 weeks of decay from the pinned week-10
+        // timestamp, i.e. 0.5 + 0.5·0.9^2 = 0.905 — not decay measured from week 5.
+        clock.set(12 * WEEK_SECS);
+        let got = r.score(p);
+        ensure!(
+            approx_eps(got, 0.905, 1e-6),
+            "timestamp rewound: got {got}, want 0.905"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn evict_drops_only_idle_neutralised_entries() -> anyhow::Result<()> {
+        // Eviction requires BOTH: decayed within the neutral band AND idle
+        // longer than EVICT_IDLE_WEEKS (26). The three peers each break exactly
+        // one leg of that AND, or satisfy both.
+        let (r, clock) = with_manual_clock(seeding_config())?;
+        let evictable = fresh_peer(); // near-neutral AND idle > 26 wk → dropped
+        let recent = fresh_peer(); // non-neutral, idle 0 → kept
+        let not_idle_enough = fresh_peer(); // near-neutral but idle < 26 wk → kept
+
+        // t=0: seed the peer that will age fully into neutrality by week 40.
+        r.record(evictable, Outcome::Unreachable);
+        // Week 16: seed the peer that, at week 40, is idle only 24 weeks — near
+        // neutral (≈0.46, within the band) but below the 26-week idle floor.
+        clock.set(16 * WEEK_SECS);
+        r.record(not_idle_enough, Outcome::Unreachable);
+        // Week 40: refresh `recent` (idle 0, score 0.0), then evict.
+        clock.set(40 * WEEK_SECS);
+        r.record(recent, Outcome::Unreachable);
+
+        // Preconditions the eviction predicate keys on: two are inside the band,
+        // one is not; ages are 40 wk / 24 wk / 0 wk respectively.
+        ensure!(
+            (r.score(evictable) - 0.5).abs() <= EVICT_NEUTRAL_BAND,
+            "evictable not within band: {}",
+            r.score(evictable)
+        );
+        ensure!(
+            (r.score(not_idle_enough) - 0.5).abs() <= EVICT_NEUTRAL_BAND,
+            "not_idle_enough not within band: {}",
+            r.score(not_idle_enough)
+        );
+        ensure!(
+            (r.score(recent) - 0.5).abs() > EVICT_NEUTRAL_BAND,
+            "recent unexpectedly near neutral: {}",
+            r.score(recent)
+        );
+
+        r.evict();
+
+        let present: HashMap<NodeId, f64> = r.snapshot().into_iter().collect();
+        ensure!(
+            !present.contains_key(&evictable),
+            "idle+neutral entry should have been evicted"
+        );
+        ensure!(
+            present.contains_key(&recent),
+            "recently-updated (non-neutral) entry should be retained"
+        );
+        ensure!(
+            present.contains_key(&not_idle_enough),
+            "near-neutral but not-idle-enough entry should be retained"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_reflects_decay() -> anyhow::Result<()> {
+        let (r, clock) = with_manual_clock(seeding_config())?;
+        let p = fresh_peer();
+        r.record(p, delivered_full()); // 1.0 at t=0
+        clock.set(5 * WEEK_SECS);
+        let snap: HashMap<NodeId, f64> = r.snapshot().into_iter().collect();
+        let s = *snap.get(&p).context("peer missing from snapshot")?;
+        ensure!(
+            approx_eps(s, 0.795_245, 1e-6),
+            "snapshot did not decay: got {s}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_decay_rate_rejected() {
+        let bad = LocalReputationConfig {
+            decay_rate_per_week: 1.5,
+            ..LocalReputationConfig::default()
+        };
+        assert!(matches!(
+            LocalReputation::new(bad),
+            Err(ConfigError::OutOfUnitInterval {
+                field: "decay_rate_per_week",
+                ..
+            })
+        ));
     }
 }
