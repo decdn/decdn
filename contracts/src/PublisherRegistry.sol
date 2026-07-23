@@ -50,7 +50,7 @@ contract PublisherRegistry is AccessControl {
     }
 
     /// @notice Owner of each namespace. `address(0)` for unassigned ids
-    ///         (including the reserved default-open id 0).
+    ///         (including the reserved no-namespace id 0).
     mapping(uint256 namespaceId => address) public ownerOf;
 
     /// @notice Number of namespaces a publisher currently owns.

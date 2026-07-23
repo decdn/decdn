@@ -1408,6 +1408,46 @@ mod tests {
         });
     }
 
+    #[tokio::test]
+    async fn namespace_zero_event_never_seats_operators() {
+        // Defense-in-depth guard (`resync_namespace`): even if a decode drift
+        // produced an `AssignmentActivated(0, …)` and `getOrigins(0)` answered
+        // with operators, namespace 0 (`NO_NAMESPACE`) must NEVER gain a cached
+        // set — seating one would open the pull-through gate for every
+        // unnamespaced request (ADR 002 §Namespace 0). This asserts the guard,
+        // not the on-chain unreachability the contract test already pins.
+        let metrics = Arc::new(Metrics::new());
+        // Hostile stub: namespace 0 "resolves" to an operator with a live binding.
+        let reads = StubReads::new()
+            .origins(&[(0, &[addr(0xA)])])
+            .bindings(&[(addr(0xA), nid(0xA))]);
+        let cache = shared(DirectoryCache::default());
+        let mut deferred = HashSet::new();
+
+        on_namespace_changed(&reads, &cache, &metrics, &mut deferred, ns(0)).await;
+
+        let stakers = StubStakers::new(&[nid(0xA)]);
+        read_cache(&cache, |c| {
+            assert!(
+                !c.origins_of_ns.contains_key(&ns(0)),
+                "namespace 0 must never be seated in the directory cache"
+            );
+            // The load-bearing consequence: the gate stays closed for NO_NAMESPACE.
+            assert!(
+                c.resolve(U256::ZERO, &stakers).is_empty(),
+                "NO_NAMESPACE must resolve to no origins"
+            );
+            assert!(
+                !c.has_any(U256::ZERO, &stakers),
+                "NO_NAMESPACE must not authorize any origin"
+            );
+        });
+        assert!(
+            deferred.is_empty(),
+            "the ns-0 guard short-circuits with Ok(()), so nothing is deferred/retried"
+        );
+    }
+
     /// POLICY PIN: the origin watcher seeds the live tail from its bootstrap
     /// snapshot block and persists `CheckpointKey::Origin` forward. The historical
     /// range is covered by the enumeration `bootstrap` runs first; the

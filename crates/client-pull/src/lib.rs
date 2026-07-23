@@ -1155,9 +1155,12 @@ async fn fetch_inner(
         expected_signer,
         hash,
         // A client fetch routes on the namespace it published under (ADR 005
-        // §Namespace routing); node-to-node pulls pass NO_NAMESPACE (the
+        // §Namespace routing). The node-to-node callers that reach *this*
+        // function (shared-channel / loopback fills) pass NO_NAMESPACE — the
         // requester already discovered a holder, so the downstream node needs no
-        // hint — ADR 002 §Retrieval by namespace).
+        // hint (ADR 002 §Retrieval by namespace). The directory-discovered
+        // cold-origin leg, which *does* carry a real namespace, goes through
+        // `open_progressive_pull` → `open_stream` directly, not here.
         namespace_id,
         byte_offset,
         timestamp_us,

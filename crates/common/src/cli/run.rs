@@ -94,16 +94,18 @@ pub struct BlockchainArgs {
 
     /// `OriginAssignment` contract address (0x-prefixed hex). Optional:
     /// enables the chain-backed origin directory backing the pull-through gate
-    /// and `FIND_VALUE` fallback (ADR 022). Must be set together with
-    /// `publisher_registry_address`. When both are unset the origin directory is
-    /// empty (deny-all): the pull-through authorized-origin gate and the
-    /// `FIND_VALUE` last-resort origin fallback both find no on-chain origins.
+    /// and `FIND_VALUE` fallback (ADR 022), resolving a request's namespace via
+    /// `getOrigins`. When unset the origin directory is empty (deny-all): the
+    /// pull-through authorized-origin gate and the `FIND_VALUE` last-resort origin
+    /// fallback both find no on-chain origins. `publisher_registry_address` is
+    /// independent and not consumed by the node runtime.
     #[arg(long, value_name = "ADDR", env = "DECDN_ORIGIN_ASSIGNMENT_ADDRESS")]
     pub origin_assignment_address: Option<String>,
 
-    /// `PublisherRegistry` contract address (0x-prefixed hex). Optional;
-    /// pairs with `origin_assignment_address` for the chain-backed origin
-    /// directory (ADR 022).
+    /// `PublisherRegistry` contract address (0x-prefixed hex). Optional; the
+    /// publish CLI's `namespace create`/transfer target (ADR 022). Not consumed
+    /// by the node runtime's origin directory, which keys solely on
+    /// `origin_assignment_address`.
     #[arg(long, value_name = "ADDR", env = "DECDN_PUBLISHER_REGISTRY_ADDRESS")]
     pub publisher_registry_address: Option<String>,
 
