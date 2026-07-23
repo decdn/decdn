@@ -524,53 +524,44 @@ jobs:
               throw e;
             }
 
-  # Live anvil-backed on-chain settlement e2e (issue #745). Gated behind the
-  # `anvil-e2e` cargo feature so the default `test` job stays fast and needs no
-  # Foundry; this job is the only one that compiles + runs it. Needs BOTH
-  # toolchains: the Rust test spawns `anvil` and shells out to `forge`
-  # (DeployProtocol.s.sol + the mintable-USDC mock), then drives the
-  # `PaymentChannelService` settlement path against the live chain. Runs when
-  # either Rust or Solidity paths changed; accepted via ci-success allowed-skips
-  # otherwise.
-  anvil-e2e:
-    name: anvil e2e
+  # Live anvil-backed on-chain e2e (issue #745). Gated behind the `anvil-e2e`
+  # cargo feature so the default `test` job stays fast and needs no Foundry. Split
+  # into two parallel jobs — settlement and cross-layer journeys — so their
+  # (independent, build-context-distinct) workspace compiles run concurrently
+  # instead of back-to-back; the split overlaps the two compiles to cut
+  # wall-clock (most on a cold cache) at the cost of a duplicated setup + compile
+  # per job. Both need BOTH toolchains: the Rust tests
+  # spawn `anvil` and shell out to `forge` (DeployProtocol.s.sol + the
+  # mintable-USDC mock). Both run when either Rust or Solidity paths changed;
+  # accepted via ci-success allowed-skips otherwise.
+  #
+  # Build-flag env (RUSTFLAGS/CARGO_INCREMENTAL) is JOB-LEVEL, not step-level, so
+  # Swatinem/rust-cache hashes it into the cache key — step-level scoping restores
+  # a stale-flag target and rebuilds from scratch (see the `test` job's PR #484
+  # note). mold + reduced debuginfo mirror that job: this path links the
+  # settlement test / 13 journey binaries / the two bins, and `line-tables-only`
+  # keeps panic-backtrace line numbers for flaky-journey triage.
+  anvil-e2e-settlement:
+    name: anvil e2e (settlement)
     runs-on: ubuntu-latest
-    # Bound the job so a stalled in-test `forge script --broadcast` (issue #785)
-    # fails red quickly instead of squatting the runner until GitHub's 6-hour
-    # default — or masquerading as "cancelled" when a later push pre-empts it.
-    # Sized ABOVE the sum of the sequential steps' worst-case in-test
-    # `OVERALL_TIMEOUT` ceilings, so a genuinely hung test hits its per-test
-    # timeout's clear message first rather than this opaque job-level kill (the
-    # #785 masking this bound exists to avoid): settlement 13m, then the
-    # cross-layer journeys at --test-threads 2 — 14 tests across 11 files whose
-    # per-test `OVERALL_TIMEOUT` ceilings sum to 183m:
-    #   13m x6  smoke, cli_publish, cli_fetch_manifest, cli_fetch_topup,
-    #           cli_setup_partial, G-NODE-06
-    #   10m x5  G-NODE-04 (3 tests), G-ORIGIN-01 (2 tests)
-    #   15m x1  G-ORIGIN-04
-    #   20m x2  slash_appeal, G-GOV-03
-    # A balanced 2-thread schedule is ~92m (183/2, no single test exceeding it),
-    # so the bound must clear that plus the 13m settlement step, the workspace
-    # compiles and the per-fixture in-test forge deploys. Keep this comment and
-    # the inventory in sync when adding a journey — it went stale once already
-    # (it still described 6 tests after the cli_* and G-ORIGIN-* journeys
-    # landed), which silently inverted the ordering this bound depends on.
-    # In practice the job finishes in ~10m; these are ceilings, not estimates.
-    #
-    # Deliberate tradeoff in raising this from 75m: the bound is now a *generous*
-    # backstop, so the two things NOT covered by any per-test `OVERALL_TIMEOUT` —
-    # a wedged workspace compile, and an in-test `forge` deploy that hangs before
-    # a test's own timer is armed — will burn the full 130m before failing red.
-    # Accepted because the alternative is worse: a bound tight enough to catch
-    # those quickly also kills legitimate runs, and a bound *below* the per-test
-    # ceilings reintroduces exactly the opaque job-level kill (#785) that masks
-    # the clear per-test message this ordering exists to surface.
-    timeout-minutes: 130
+    # Bound above settlement's 13m in-test `OVERALL_TIMEOUT` ceiling plus the
+    # workspace compile and the in-test forge deploy, so a genuinely hung test
+    # hits its own clear per-test message before this opaque job-level kill
+    # (#785). Sized for the worst case — a cold cache: this job's `shared-key`
+    # is new, so the introducing PR (and any branch cut before it merges) runs a
+    # from-scratch full-workspace compile with nothing to restore, before the
+    # 13m test. Once main warms the key it finishes in a few minutes; this is a
+    # generous backstop, deliberately letting a wedged compile or a pre-timer
+    # forge hang burn the bound rather than reintroduce a sub-ceiling kill.
+    timeout-minutes: 60
     needs: changes
     if: >-
       needs.changes.outputs.rust == 'true' ||
       needs.changes.outputs.solidity == 'true' ||
       github.event_name != 'pull_request'
+    env:
+      RUSTFLAGS: "-C link-arg=-fuse-ld=mold -C debuginfo=line-tables-only -C split-debuginfo=unpacked"
+      CARGO_INCREMENTAL: "0"
     steps:
       # submodules: recursive — the in-test `forge build` needs the forge-std +
       # openzeppelin-contracts submodules under contracts/lib/.
@@ -594,6 +585,10 @@ jobs:
           sudo docker image prune --all --force || true
           df -h /
       - uses: dtolnay/rust-toolchain@1.95.0
+      # mold shortens the link phase of the workspace's test binaries; installed
+      # before rust-cache so `-fuse-ld=mold` in RUSTFLAGS resolves at link time.
+      - name: Install mold linker
+        run: sudo apt-get update && sudo apt-get install -y mold
       # Installs the pinned Foundry (anvil + forge on PATH) and warms the solc
       # cache. cache-profile: none — the test drives its own `forge build`.
       - uses: ./.github/actions/foundry-setup
@@ -601,13 +596,84 @@ jobs:
           cache-profile: none
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: anvil-e2e
+          shared-key: anvil-e2e-settlement
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
+      # In-process settlement e2e: spawns anvil + shells out to forge, then drives
+      # the PaymentChannelService settlement path against the live chain. Needs no
+      # daemon/CLI binary on disk (that's why the split can drop the bin build).
       - name: Run on-chain settlement e2e
         run: cargo nextest run -p decdn-node --features anvil-e2e --test anvil_settlement_e2e
+
+  anvil-e2e-journeys:
+    name: anvil e2e (journeys)
+    runs-on: ubuntu-latest
+    # Bound above the ~109m balanced journeys schedule (below) plus the bin build
+    # and workspace compile, so a genuinely hung test hits its own clear per-test
+    # message before this opaque job-level kill (#785). The cross-layer journeys
+    # run at --test-threads 2 — 16 tests across 13 files whose per-test
+    # `OVERALL_TIMEOUT` ceilings sum to 218m:
+    #   13m x6  smoke, cli_publish, cli_fetch_manifest, cli_fetch_topup,
+    #           cli_setup_partial, G-NODE-06
+    #   10m x5  G-NODE-04 (3 tests), G-ORIGIN-01 (2 tests)
+    #   15m x2  G-NODE-08 (authorized-origin), G-NODE-08 (revocation)
+    #   20m x3  slash_appeal, G-GOV-02, G-GOV-03
+    # A balanced 2-thread schedule is ~109m (218/2, no single test exceeding it),
+    # so the bound must clear that plus the bin build, the workspace compile and
+    # the per-fixture in-test forge deploys. Keep this inventory in sync when
+    # adding a journey — it has gone stale twice already (it once described 6
+    # tests after the cli_* and G-ORIGIN-* journeys landed, and later named a
+    # nonexistent G-ORIGIN-04 while missing the G-GOV-02 / G-NODE-08 journeys).
+    # In practice the job finishes in ~10m; these are ceilings, not
+    # estimates. The generous backstop deliberately lets a wedged compile or a
+    # pre-timer forge hang burn the full bound rather than reintroduce the opaque
+    # sub-ceiling kill (#785) that masks the clear per-test message this ordering
+    # exists to surface.
+    timeout-minutes: 130
+    needs: changes
+    if: >-
+      needs.changes.outputs.rust == 'true' ||
+      needs.changes.outputs.solidity == 'true' ||
+      github.event_name != 'pull_request'
+    env:
+      RUSTFLAGS: "-C link-arg=-fuse-ld=mold -C debuginfo=line-tables-only -C split-debuginfo=unpacked"
+      CARGO_INCREMENTAL: "0"
+    steps:
+      # submodules: recursive — the in-test `forge build` needs the forge-std +
+      # openzeppelin-contracts submodules under contracts/lib/.
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      # Reclaim ~20 GB of preinstalled toolchains this job never uses (see the
+      # settlement job above for the full ENOSPC rationale).
+      - name: Free disk space
+        run: |
+          sudo rm -rf /opt/hostedtoolcache/CodeQL \
+                      /usr/local/lib/android \
+                      /usr/share/dotnet \
+                      /opt/ghc \
+                      /usr/local/.ghcup
+          sudo docker image prune --all --force || true
+          df -h /
+      - uses: dtolnay/rust-toolchain@1.95.0
+      # mold shortens the link phase of the journey + bin binaries; installed
+      # before rust-cache so `-fuse-ld=mold` in RUSTFLAGS resolves at link time.
+      - name: Install mold linker
+        run: sudo apt-get update && sudo apt-get install -y mold
+      # Installs the pinned Foundry (anvil + forge on PATH) and warms the solc
+      # cache. cache-profile: none — the fixtures drive their own `forge build`.
+      - uses: ./.github/actions/foundry-setup
+        with:
+          cache-profile: none
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: anvil-e2e-journeys
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
       # The cross-layer `decdn-e2e` fixtures spawn the built `decdn-node`
       # binary, and the slash-appeal journey additionally shells out to the
       # user CLI `decdn` (package `decdn-cli`), so both must exist on disk
@@ -1174,7 +1240,7 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     needs: [fmt, clippy, changes, test, doctest, deny, doc, public-api, markdownlint, adr-book-list,
-            pr-title, anvil-e2e,
+            pr-title, anvil-e2e-settlement, anvil-e2e-journeys,
             solidity-fmt, solidity-build-test, solidity-coverage,
             solidity-solhint, solidity-slither, solidity-aderyn, ed25519-vectors]
     steps:
@@ -1189,6 +1255,6 @@ jobs:
           # here. `changes` is intentionally omitted — it always runs, so a
           # skip from it signals a misconfiguration that should fail the gate.
           allowed-skips: fmt, clippy, test, doctest, deny, doc, public-api, adr-book-list,
-                         pr-title, markdownlint, anvil-e2e,
+                         pr-title, markdownlint, anvil-e2e-settlement, anvil-e2e-journeys,
                          solidity-fmt, solidity-build-test, solidity-coverage,
                          solidity-solhint, solidity-slither, solidity-aderyn, ed25519-vectors
