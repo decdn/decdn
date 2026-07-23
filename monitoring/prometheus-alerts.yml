@@ -222,7 +222,7 @@ groups:
       # sentinel (gauge reads 0 until the first success), so a fresh boot — and a
       # node that never enables a conditionally-spawned watcher — doesn't
       # self-fire. Blacklist has its own (slash-risk) rule in decdn-slash-safety;
-      # settlement/reputation are in decdn-delivery.
+      # settlement is in decdn-delivery.
       - alert: DecdnSlashWatcherStalled
         expr: (decdn_slash_watcher_last_tick_timestamp_seconds > 0) and (time() - decdn_slash_watcher_last_tick_timestamp_seconds > 180)
         for: 5m
@@ -318,11 +318,10 @@ groups:
             losing revenue. Increase max_probe_holds proportional to cache
             size (recommended: ≥25% of cache capacity).
 
-      # Chain-event watcher liveness (#1316) for the two settlement/reputation
-      # watchers — staleness of their last successful poll tick. 180s ≈ several
-      # poll intervals; tune to your event_poll_interval. The `> 0` guard skips
-      # the pre-first-tick sentinel; reputation_indexer is only spawned when
-      # subscribe_reputation is set, so the guard also silences it when disabled.
+      # Chain-event watcher liveness (#1316) for the payment-settlement watcher
+      # — staleness of its last successful poll tick. 180s ≈ several poll
+      # intervals; tune to your event_poll_interval. The `> 0` guard skips the
+      # pre-first-tick sentinel (gauge reads 0 until the first success).
       - alert: DecdnSettlementWatcherStalled
         expr: (decdn_settlement_watcher_last_tick_timestamp_seconds > 0) and (time() - decdn_settlement_watcher_last_tick_timestamp_seconds > 180)
         for: 5m
@@ -335,15 +334,3 @@ groups:
             channel open/settle/close events are not being ingested, so
             voucher redemption and reconciliation stall. Restart and check the
             RPC provider.
-
-      - alert: DecdnReputationIndexerStalled
-        expr: (decdn_reputation_indexer_last_tick_timestamp_seconds > 0) and (time() - decdn_reputation_indexer_last_tick_timestamp_seconds > 180)
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Reputation indexer not ticking on {{ $labels.instance }}"
-          description: |
-            No successful reputation-indexer poll tick for several intervals — no
-            settlements are being ingested, so reporter weights stay 0 and network
-            scores never leave neutral. Restart and check the RPC provider.
