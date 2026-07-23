@@ -65,14 +65,11 @@ noun the command operates on.
 
 ### Why a single shared `decdn-common`, not per-binary common crates
 
-A two-crate split (`decdn-config` + `decdn-admin-types`) would buy a
-tighter dep graph, but everything in `decdn-common` is consumed by
-both binaries already, so fragmenting `decdn-common` itself has no
-payoff. The cache-typed `config` fields *were* split out — into the
-`decdn-config-types` leaf crate — which is the realized form of
-the remedy this section anticipated: extract the shared value types,
-not the crate. `decdn-common` keeps its single-crate shape; the leaf
-just owns the vocabulary types so the CLI links no blob store.
+`decdn-common` stays a single crate: everything in it is consumed by
+both binaries, so fragmenting it has no payoff. The cache-typed
+`config` value types were instead split into the `decdn-config-types`
+leaf crate — extract the shared value types, not the crate — so the
+CLI links no blob store.
 
 ### Why the metric prefix and OTLP `service.name` stay `decdn`
 
