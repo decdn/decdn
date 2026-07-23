@@ -22,7 +22,8 @@
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,
-    clippy::indexing_slicing
+    clippy::indexing_slicing,
+    clippy::duration_suboptimal_units
 )]
 
 use std::time::Duration;
