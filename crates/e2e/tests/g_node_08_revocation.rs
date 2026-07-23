@@ -207,7 +207,7 @@ async fn wait_for_gate_to_reclose(
             Err(e) => {
                 let code = e
                     .downcast_ref::<UpstreamRefused>()
-                    .map(|r| r.error.clone())
+                    .map(|r| r.error().clone())
                     .with_context(|| {
                         format!("re-close probe failed for a non-refusal reason: {e:#}")
                     })?;

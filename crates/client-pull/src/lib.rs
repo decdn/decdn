@@ -324,6 +324,120 @@ impl std::fmt::Display for BlobTooLargeClaim {
 
 impl std::error::Error for BlobTooLargeClaim {}
 
+/// Typed sentinel for a server that signed an open-stage `StreamResponse`
+/// (`ok == true`) quoting a per-MB `rate_per_mb` above the buyer's effective
+/// ceiling (#1375). The buyer aborts **before paying**, so the profitable
+/// "quote low on the probe, quote high on the stream, then deliver" bait-and-switch
+/// never gets paid.
+///
+/// The ceiling is the lower of two bounds the caller supplies: the probe rate the
+/// candidate was selected on (a stream quote may not exceed what the probe
+/// advertised) and an optional absolute buyer config (`max_rate_per_mb`). Because
+/// the probe-relative bound is always applied by the node pull path, a *completed*
+/// delivery is by construction priced at or below the probe rate — so it can never
+/// be rate-manipulation (`SlashJudge` requires `stream.ratePerMb > probe.ratePerMb`),
+/// and the challengeable case is exactly this abort.
+///
+/// Carries the operator's own signed `response` — already verified against
+/// `expected_signer` by `verify_response` before construction, so it still
+/// recovers to the delivering node and a caller could replay it (paired with the
+/// same node's `ProbeResponse`) to `SlashJudge` with no re-signing.
+///
+/// **Slashability caveat.** The evidence is only rate-*manipulation* evidence when
+/// the **probe-relative** bound was the one exceeded: `SlashJudge` requires
+/// `stream.ratePerMb > probe.ratePerMb`. The ceiling here is
+/// `min(probe_rate, config_absolute)` ([`effective_rate_ceiling`]), so when the
+/// buyer's absolute `config` bound is the binding one the quote may sit at or below
+/// the probe rate and be perfectly honest. A challenger must therefore still
+/// confirm `quote > probeRate` before submitting; this type does not assert it.
+///
+/// **Consumption.** The signed response is retained *on the error* so a caller can
+/// act on it, but the node's pull-failure handler does not itself submit a
+/// challenge — auto-slashing is deferred (the same footing as the daemon never
+/// auto-challenging an [`UpstreamRefused`], whose evidence is exercised only by the
+/// e2e harness today). `evidence()` is the only accessor; the field is private and
+/// the sole constructor derives it from the verified response, so the
+/// verified-signature invariant cannot be bypassed by a hand-built value.
+pub struct RateAboveCeiling {
+    quoted_rate_per_mb: u64,
+    ceiling_rate_per_mb: u64,
+    response: StreamResponse,
+}
+
+impl RateAboveCeiling {
+    /// Build the abort error for an open-stage quote above `ceiling`. Crate-private
+    /// and the SINGLE construction path (both `fetch_inner` and
+    /// `open_progressive_pull` route through it), so `quoted_rate_per_mb` is always
+    /// *derived* from `response.body.rate_per_mb` and cannot desync from the
+    /// retained evidence — the same "derive, don't trust the caller to set it
+    /// consistently" discipline as [`UpstreamRefused::open`]. Callers MUST have run
+    /// `verify_response` on `response` first (the field docs' signature invariant).
+    fn over_ceiling(response: StreamResponse, ceiling_rate_per_mb: u64) -> anyhow::Error {
+        anyhow::Error::new(Self {
+            quoted_rate_per_mb: response.body.rate_per_mb,
+            ceiling_rate_per_mb,
+            response,
+        })
+    }
+
+    /// The per-MB rate the server quoted in the signed `StreamResponse`.
+    #[must_use]
+    pub const fn quoted_rate_per_mb(&self) -> u64 {
+        self.quoted_rate_per_mb
+    }
+
+    /// The effective ceiling the quote exceeded (min of probe rate and config).
+    #[must_use]
+    pub const fn ceiling_rate_per_mb(&self) -> u64 {
+        self.ceiling_rate_per_mb
+    }
+
+    /// The operator's own signed `StreamResponse`, verified against
+    /// `expected_signer` before this value was built. See the type docs for the
+    /// slashability caveat (only `quote > probeRate` is manipulation).
+    #[must_use]
+    pub const fn evidence(&self) -> &StreamResponse {
+        &self.response
+    }
+}
+
+impl std::fmt::Debug for RateAboveCeiling {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Elide the signed body + 65-byte `slash_sig` to a length, as `UpstreamRefused`
+        // does, so a logged abort stays readable.
+        f.debug_struct("RateAboveCeiling")
+            .field("quoted_rate_per_mb", &self.quoted_rate_per_mb)
+            .field("ceiling_rate_per_mb", &self.ceiling_rate_per_mb)
+            .field("evidence_slash_sig_len", &self.response.slash_sig.len())
+            .finish()
+    }
+}
+
+impl std::fmt::Display for RateAboveCeiling {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "server quoted {} per MB, exceeding the buyer ceiling {} per MB (RateAboveCeiling)",
+            self.quoted_rate_per_mb, self.ceiling_rate_per_mb
+        )
+    }
+}
+
+impl std::error::Error for RateAboveCeiling {}
+
+/// Combine the two buyer rate ceilings into one effective bound, treating `0` as
+/// "unbounded" on each input (the probe-relative bound and the absolute config
+/// bound are both optional). Returns `0` only when BOTH are unbounded.
+#[must_use]
+pub const fn effective_rate_ceiling(probe_relative: u64, config_absolute: u64) -> u64 {
+    match (probe_relative, config_absolute) {
+        (0, c) => c,
+        (p, 0) => p,
+        (p, c) if p < c => p,
+        (_, c) => c,
+    }
+}
+
 /// Typed sentinel for the buyer's own per-candidate pull deadline firing (#857).
 /// Returned (not a bare string) so the pull orchestrator can `downcast_ref` and
 /// recognize that the timeout is OUR local deadline — a possibly mis-sized
@@ -423,34 +537,146 @@ impl std::error::Error for UpstreamVoucherRejected {}
 /// `ServeRejectReason` — that collapse is intentional and must not be reversed.
 /// `Display` keeps the stable `delivery refused: {code}` text that logs, the CLI's
 /// cache-miss annotation, and the loopback tests match on.
-#[derive(Debug)]
+/// The two refusal shapes are a private inner enum, not `pub` variants: enum
+/// variant fields cannot be made private, so exposing them would let any caller
+/// build an `Open { .. }` directly and bypass the crate-private `open`
+/// constructor's error-from-response derivation — reintroducing exactly the
+/// doc-comment-only invariant this type exists to remove (#1377). The newtype
+/// keeps the only paths to a value the two constructors, so the "present response
+/// ⇒ open-stage, verified" invariant is a property of the type rather than a
+/// convention.
 pub struct UpstreamRefused {
-    /// The wire code the upstream signed. Always a `StreamError` as it appeared on the
-    /// wire — never a server-side `ServeRejectReason`, whose seven-way collapse onto
-    /// `NotFound` is deliberate and one-way (`handlers::client::wire_error`).
-    pub error: StreamError,
-    /// The upstream's own signed [`StreamResponse`], preserved verbatim when the
-    /// refusal arrived at the **open stage** — `Some` for an `ok == false`
-    /// response, `None` for a mid-stream [`ClientMessage::StreamError`] frame,
-    /// which carries no signature at all (#1042).
+    kind: Kind,
+}
+
+enum Kind {
+    /// Open-stage refusal: the upstream signed a [`StreamResponse`] with
+    /// `body.ok == false`, already verified against `expected_signer` by
+    /// [`verify_response`] before the value is built, so `error` is derived
+    /// *from* `response.error` and `response` always recovers to
+    /// `expected_signer`.
+    Open {
+        error: StreamError,
+        response: StreamResponse,
+    },
+    /// Mid-stream refusal: a bare [`ClientMessage::StreamError`] frame that
+    /// arrived after the open stage. It carries no signature (#1042), so there
+    /// is never a signed `StreamResponse` to retain — `None` by construction.
+    MidStream { error: StreamError },
+}
+
+impl UpstreamRefused {
+    /// Build the open-stage refusal for a `body.ok == false` response, deriving
+    /// the wire `error` *from* `response.error` so the two can never disagree
+    /// (#1377 invariant 2). Shared by the buffered [`fetch_inner`] and
+    /// progressive [`open_progressive_pull`] open stages so they cannot drift in
+    /// how they classify a refusal.
     ///
-    /// This is evidence, not diagnostics. `body` is exactly the field set the
-    /// `SlashJudge` EIP-712 `StreamResponse` typehash covers and `slash_sig` is
-    /// the operator's secp256k1 signature over it — already verified against
-    /// `expected_signer` by `verify_response` before this error is built, so a
+    /// Returns `anyhow::Error` rather than `Self` because the `None`-error arm is
+    /// a protocol violation, not a refusal: callers MUST have run
+    /// [`verify_response`] first, whose `StreamResponse::validate` rejects
+    /// `ok == false` with no error code (`MissingStreamError`). Reaching the
+    /// `None` arm means that invariant was bypassed, so it is surfaced as the
+    /// violation it is rather than defaulted to an invented code — which would
+    /// launder a malformed refusal into a plausible-looking one.
+    ///
+    /// Takes the whole `response` rather than just its `error` so the operator's
+    /// own signed refusal survives as evidence ([`Self::evidence`], #1042) —
+    /// `body` is exactly the field set the `SlashJudge` EIP-712 `StreamResponse`
+    /// typehash covers and `slash_sig` is the operator's secp256k1 signature over
+    /// it. Paired with the same node's earlier `ProbeResponse` for the same hash
+    /// it is the complete on-chain phantom-announcement (`hasBlob && !ok`) or
+    /// rate-manipulation (`stream.ratePerMb > probe.ratePerMb`) evidence pair —
+    /// court-admissible as-is, with no re-signing by the observer.
+    fn open(response: StreamResponse) -> anyhow::Error {
+        // `ok == true` is not a refusal at all — building an `Open` from it would
+        // mint an evidence-carrying refusal with `ok == true`, violating invariant
+        // 3. `validate` already rejects `(ok: true, error: Some)` as
+        // `StreamErrorWithOk`, so reaching here with `ok == true` means that
+        // invariant was bypassed; surface it as the protocol violation it is rather
+        // than fold it into a typed refusal. Makes invariant 3 a construction
+        // property, not just a call-site precondition (#1377 review).
+        if response.body.ok {
+            return anyhow::anyhow!(
+                "open-stage refusal constructed from an ok == true response \
+                 (StreamResponse::validate invariant bypassed)"
+            );
+        }
+        match response.error.clone() {
+            Some(error) => anyhow::Error::new(Self {
+                kind: Kind::Open { error, response },
+            }),
+            None => anyhow::anyhow!(
+                "delivery refused but the validated response carried no error code \
+                 (StreamResponse::validate invariant bypassed)"
+            ),
+        }
+    }
+
+    /// Build the refusal for a **mid-stream** [`ClientMessage::StreamError`]
+    /// frame — the refusal that arrives *after* the open stage, in reply to a
+    /// delivery chunk or a voucher.
+    ///
+    /// Such a frame carries no signature (#1042), so [`Self::evidence`] is `None`
+    /// here **by construction** and this is the only place that decision is made.
+    /// The four mid-stream receive sites route through it so none can drift into
+    /// synthesising a `StreamResponse` — which would hand an observer an unsigned
+    /// artifact the evidence contract promises always recovers to the delivering
+    /// node (#1378). The open-stage counterpart is the crate-private `open`.
+    ///
+    /// Public because callers outside the crate (and their tests) legitimately
+    /// build mid-stream refusals; it is safe to expose precisely because it
+    /// *cannot* carry evidence — the encapsulation that matters guards the
+    /// evidence-carrying `open`, which stays crate-private.
+    #[must_use]
+    pub const fn mid_stream(error: StreamError) -> Self {
+        Self {
+            kind: Kind::MidStream { error },
+        }
+    }
+
+    /// The wire code the upstream signed. Always a `StreamError` as it appeared
+    /// on the wire — never a server-side `ServeRejectReason`, whose seven-way
+    /// collapse onto `NotFound` is deliberate and one-way
+    /// (`handlers::client::wire_error`). Total over both shapes.
+    #[must_use]
+    pub const fn error(&self) -> &StreamError {
+        match &self.kind {
+            Kind::Open { error, .. } | Kind::MidStream { error } => error,
+        }
+    }
+
+    /// The upstream's own signed [`StreamResponse`], present iff the refusal
+    /// arrived at the **open stage**. `None` for a mid-stream frame.
+    ///
+    /// This is evidence, not diagnostics — already verified against
+    /// `expected_signer` by `verify_response` before this value is built, so a
     /// present value always recovers to `expected_signer`: the operator address
     /// the caller bound this pull to, which is what `SlashJudge._checkRegistered`
-    /// resolves `nodeId` against. Paired with the
-    /// same node's earlier `ProbeResponse` for the same hash it is the complete
-    /// on-chain phantom-announcement (`hasBlob && !ok`) or rate-manipulation
-    /// (`stream.ratePerMb > probe.ratePerMb`) evidence pair — court-admissible
-    /// as-is, with no re-signing by the observer.
-    ///
-    /// Discarding it (as the pull path did before #1042) meant the daemon
-    /// produced the signed attestation of its own misbehavior and the client
-    /// threw it away one stack frame later, leaving `SlashJudge` reachable only
-    /// with synthetic signatures from a test that holds the operator key.
-    pub response: Option<StreamResponse>,
+    /// resolves `nodeId` against. A challenger may replay it to `SlashJudge`
+    /// with no re-signing.
+    #[must_use]
+    pub const fn evidence(&self) -> Option<&StreamResponse> {
+        match &self.kind {
+            Kind::Open { response, .. } => Some(response),
+            Kind::MidStream { .. } => None,
+        }
+    }
+}
+
+impl std::fmt::Debug for UpstreamRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Elide the 65-byte `slash_sig` (and the full signed body) to a length so
+        // `tracing::error!(?err)` stays readable — the derived `Debug` would dump
+        // the entire attestation on every logged refusal.
+        let mut dbg = f.debug_struct("UpstreamRefused");
+        dbg.field("error", self.error());
+        match self.evidence() {
+            Some(resp) => dbg.field("evidence_slash_sig_len", &resp.slash_sig.len()),
+            None => dbg.field("evidence", &Option::<()>::None),
+        };
+        dbg.finish()
+    }
 }
 
 impl std::fmt::Display for UpstreamRefused {
@@ -462,7 +688,7 @@ impl std::fmt::Display for UpstreamRefused {
         // `ServeRejectReason` such as `UnknownChannel`, which collapses to
         // `NotFound` before it leaves the server (see `wire_error`). Matching on a
         // reject-reason name would therefore never fire.
-        write!(f, "delivery refused: {:?}", self.error)
+        write!(f, "delivery refused: {:?}", self.error())
     }
 }
 
@@ -754,56 +980,6 @@ impl PullDeadlines {
     }
 }
 
-/// Build the [`UpstreamRefused`] error for a `body.ok == false` response, shared
-/// by the buffered [`fetch_inner`] and progressive [`open_progressive_pull`] open
-/// stages so the two cannot drift in how they classify a refusal.
-///
-/// Callers MUST have run [`verify_response`] first: its `StreamResponse::validate`
-/// rejects `ok == false` with no error code (`MissingStreamError`), which is what
-/// makes `error` guaranteed `Some` here. The `None` arm is therefore unreachable
-/// on a validated response and is surfaced as the protocol violation it would be
-/// — not defaulted to some invented code, which would launder a malformed refusal
-/// into a plausible-looking one.
-///
-/// Takes the whole `response` rather than just its `error` so the operator's own
-/// signed refusal survives on [`UpstreamRefused::response`] (#1042) — see that
-/// field's docs for why the signature, not the wire code, is the payload that
-/// matters here.
-fn refusal(response: StreamResponse) -> anyhow::Error {
-    match response.error.clone() {
-        Some(error) => anyhow::Error::new(UpstreamRefused {
-            error,
-            response: Some(response),
-        }),
-        // Unreachable on a validated response: every caller runs `verify_response`
-        // (hence `validate`) first, which rejects `ok == false` with no error as
-        // `MissingStreamError`. Reaching here means that invariant was bypassed —
-        // the response *was* validated yet carries no code — so name it as the
-        // protocol violation it is rather than blaming an unvalidated response.
-        None => anyhow::anyhow!(
-            "delivery refused but the validated response carried no error code \
-             (StreamResponse::validate invariant bypassed)"
-        ),
-    }
-}
-
-/// Build the [`UpstreamRefused`] error for a **mid-stream** `ClientMessage::StreamError`
-/// frame — the refusal that arrives *after* the open stage, in reply to a delivery
-/// chunk or a voucher.
-///
-/// Such a frame carries no signature (it is a bare wire code, #1042), so
-/// [`UpstreamRefused::response`] is `None` here **by construction** and this is the
-/// only place that decision is made. The four mid-stream receive sites route through
-/// it so none can drift into synthesising a `StreamResponse` — which would hand an
-/// observer an unsigned artifact the `response` field's docs promise always recovers
-/// to the delivering node (#1378). The open-stage counterpart is [`refusal`].
-const fn mid_stream_refusal(error: StreamError) -> UpstreamRefused {
-    UpstreamRefused {
-        error,
-        response: None,
-    }
-}
-
 /// Fetch `hash` from `target` over `cdn/client/v1`, paying as bytes arrive.
 ///
 /// `expected_signer` is the delivering node's Ethereum address, used to verify
@@ -850,10 +1026,11 @@ pub async fn stream_fetch(
         // the overall cap and the stall bound is harmless. Production paths take
         // `PullDeadlines` directly and split the two.
         PullDeadlines::whole_transfer(timeout),
-        // No buyer-side blob-size ceiling on this test/loopback helper. The
+        // No buyer-side blob-size or rate ceiling on this test/loopback helper. The
         // production pull path does not go through here — it calls
         // `stream_fetch_tracked` directly (`node_origin::pull_from_candidate`)
-        // with its configured `max_blob_size_bytes`.
+        // with its configured `max_blob_size_bytes` / `max_rate_per_mb`.
+        0,
         0,
         &mut VoucherProgress::default(),
     )
@@ -886,6 +1063,7 @@ pub async fn stream_fetch_tracked(
     timestamp_us: u64,
     deadlines: PullDeadlines,
     max_blob_size_bytes: u64,
+    max_rate_per_mb: u64,
     progress: &mut VoucherProgress,
 ) -> anyhow::Result<Bytes> {
     stream_fetch_tracked_with_progress(
@@ -900,6 +1078,7 @@ pub async fn stream_fetch_tracked(
         timestamp_us,
         deadlines,
         max_blob_size_bytes,
+        max_rate_per_mb,
         progress,
         None,
     )
@@ -937,6 +1116,7 @@ pub async fn stream_fetch_tracked_with_progress(
     timestamp_us: u64,
     deadlines: PullDeadlines,
     max_blob_size_bytes: u64,
+    max_rate_per_mb: u64,
     progress: &mut VoucherProgress,
     on_progress: Option<&ProgressCallback>,
 ) -> anyhow::Result<Bytes> {
@@ -961,6 +1141,7 @@ pub async fn stream_fetch_tracked_with_progress(
             byte_offset,
             timestamp_us,
             max_blob_size_bytes,
+            max_rate_per_mb,
             deadlines.open,
             deadlines.stall,
             &ledger,
@@ -1030,6 +1211,7 @@ pub async fn stream_fetch_shared(
     timestamp_us: u64,
     deadlines: PullDeadlines,
     max_blob_size_bytes: u64,
+    max_rate_per_mb: u64,
 ) -> anyhow::Result<Bytes> {
     with_hard_cap(
         deadlines.hard_cap,
@@ -1046,6 +1228,7 @@ pub async fn stream_fetch_shared(
             byte_offset,
             timestamp_us,
             max_blob_size_bytes,
+            max_rate_per_mb,
             deadlines.open,
             deadlines.stall,
             ledger,
@@ -1167,6 +1350,7 @@ async fn fetch_inner(
     byte_offset: u64,
     timestamp_us: u64,
     max_blob_size_bytes: u64,
+    max_rate_per_mb: u64,
     open: Duration,
     stall: Duration,
     ledger: &ChannelLedger,
@@ -1194,7 +1378,7 @@ async fn fetch_inner(
     .await?;
 
     if !resp.body.ok {
-        return Err(refusal(resp));
+        return Err(UpstreamRefused::open(resp));
     }
     if resp.body.redirect.is_some() {
         anyhow::bail!("server returned a redirect; following redirects is out of scope (#317)");
@@ -1212,6 +1396,13 @@ async fn fetch_inner(
             claimed: resp.body.total_bytes,
             ceiling: max_blob_size_bytes,
         }));
+    }
+    // Reject an over-ceiling rate before paying a single voucher (#1375). `resp`
+    // is `ok == true` and already verified against `expected_signer`, so it is
+    // the operator's own signed quote — carry it into the error as replayable
+    // rate-manipulation evidence. `0` = unbounded.
+    if max_rate_per_mb > 0 && resp.body.rate_per_mb > max_rate_per_mb {
+        return Err(RateAboveCeiling::over_ceiling(resp, max_rate_per_mb));
     }
     // A `total_bytes` below `byte_offset` would underflow the wire bound to `0`
     // (saturating), so the loop ends on the first `StreamEnd` and returns an
@@ -1439,7 +1630,7 @@ async fn receive_and_pay(
                 // mis-attribution #1144 fixed, reappearing one stage later. The wire code
                 // carries the same meaning here as it does in a `StreamResponse`, so let
                 // the one classifier judge both.
-                return Err(anyhow::Error::new(mid_stream_refusal(e)));
+                return Err(anyhow::Error::new(UpstreamRefused::mid_stream(e)));
             }
             other => anyhow::bail!("unexpected message mid-delivery: {}", variant_name(&other)),
         }
@@ -1673,6 +1864,7 @@ pub async fn open_progressive_pull(
     byte_offset: u64,
     timestamp_us: u64,
     max_blob_size_bytes: u64,
+    max_rate_per_mb: u64,
     deadlines: PullDeadlines,
 ) -> anyhow::Result<(UpstreamPullHeader, UpstreamPull)> {
     let stall = deadlines.stall;
@@ -1697,7 +1889,7 @@ pub async fn open_progressive_pull(
     )
     .await?;
     if !resp.body.ok {
-        return Err(refusal(resp));
+        return Err(UpstreamRefused::open(resp));
     }
     if resp.body.redirect.is_some() {
         anyhow::bail!("server returned a redirect; following redirects is out of scope (#317)");
@@ -1710,6 +1902,12 @@ pub async fn open_progressive_pull(
             claimed: resp.body.total_bytes,
             ceiling: max_blob_size_bytes,
         }));
+    }
+    // Same buyer-side rate ceiling as `fetch_inner` (#1375): refuse an over-ceiling
+    // quote before the first paid interval, carrying the signed quote out as
+    // rate-manipulation evidence. `0` = unbounded.
+    if max_rate_per_mb > 0 && resp.body.rate_per_mb > max_rate_per_mb {
+        return Err(RateAboveCeiling::over_ceiling(resp, max_rate_per_mb));
     }
     if resp.body.total_bytes < byte_offset {
         anyhow::bail!(
@@ -1873,7 +2071,7 @@ impl UpstreamPull {
                 // mis-attribution #1144 fixed, reappearing one stage later. The wire code
                 // carries the same meaning here as it does in a `StreamResponse`, so let
                 // the one classifier judge both.
-                Err(anyhow::Error::new(mid_stream_refusal(e)))
+                Err(anyhow::Error::new(UpstreamRefused::mid_stream(e)))
             }
             other => anyhow::bail!("unexpected message mid-delivery: {}", variant_name(&other)),
         }
@@ -1910,7 +2108,7 @@ impl UpstreamPull {
                     // mis-attribution #1144 fixed, reappearing one stage later. The wire code
                     // carries the same meaning here as it does in a `StreamResponse`, so let
                     // the one classifier judge both.
-                    return Err(anyhow::Error::new(mid_stream_refusal(e)));
+                    return Err(anyhow::Error::new(UpstreamRefused::mid_stream(e)));
                 }
                 other => {
                     anyhow::bail!("unexpected message at stream end: {}", variant_name(&other))
@@ -2033,7 +2231,9 @@ async fn self_pay(
                 // receive sites do (#1145 review) — stringifying it here dropped the code
                 // through every downcast to the `Unreachable` catch-all, scoring an honest
                 // `Overloaded`/`NotFound` peer as a dead node.
-                ClientMessage::StreamError(e) => Err(anyhow::Error::new(mid_stream_refusal(e))),
+                ClientMessage::StreamError(e) => {
+                    Err(anyhow::Error::new(UpstreamRefused::mid_stream(e)))
+                }
                 other => anyhow::bail!("expected VoucherAck, got {}", variant_name(&other)),
             }
         })
@@ -2504,9 +2704,10 @@ mod tests {
     /// `SlashJudge`'s phantom/rate paths reachable only from a test that holds the
     /// operator's key and synthesises its own evidence.
     ///
-    /// Deliberately routed through the private `refusal()` — the one constructor
-    /// both the buffered and progressive open stages share — rather than a
-    /// hand-built `UpstreamRefused`, which would assert nothing about production.
+    /// Deliberately routed through the private [`UpstreamRefused::open`] — the one
+    /// constructor both the buffered and progressive open stages share — rather
+    /// than a hand-built value, which #1377's newtype now makes impossible outside
+    /// this crate anyway.
     #[test]
     fn an_open_stage_refusal_preserves_the_signed_stream_response() -> anyhow::Result<()> {
         use alloy::signers::local::PrivateKeySigner;
@@ -2514,7 +2715,7 @@ mod tests {
         use decdn_incentive::stream_sig::StreamSlashData;
         use decdn_protocol::client::{StreamError, StreamResponse, StreamResponseBody};
 
-        use super::{UpstreamRefused, refusal};
+        use super::UpstreamRefused;
 
         let operator = PrivateKeySigner::random();
         let domain = slash_judge_domain(31_337, alloy::primitives::Address::repeat_byte(0x11));
@@ -2536,33 +2737,31 @@ mod tests {
             voucher_interval_mb: None,
             slash_sig: sig.as_bytes().to_vec(),
         };
-        // Precondition the real open stage enforces before ever calling `refusal`.
+        // Precondition the real open stage enforces before ever calling `open`.
         response.validate()?;
 
-        let err = refusal(response);
+        let err = UpstreamRefused::open(response);
         let refused = err
             .downcast_ref::<UpstreamRefused>()
-            .ok_or_else(|| anyhow::anyhow!("refusal must stay a typed UpstreamRefused: {err:#}"))?;
+            .ok_or_else(|| anyhow::anyhow!("open() must stay a typed UpstreamRefused: {err:#}"))?;
         anyhow::ensure!(
-            refused.error == StreamError::EvictedSinceProbe,
+            *refused.error() == StreamError::EvictedSinceProbe,
             "the wire code must survive unchanged, got {:?}",
-            refused.error
+            refused.error()
         );
-        let preserved = refused.response.as_ref().ok_or_else(|| {
+        let preserved = refused.evidence().ok_or_else(|| {
             anyhow::anyhow!("the signed StreamResponse must survive on the refusal (#1042)")
         })?;
         anyhow::ensure!(
             preserved.body == body,
             "the preserved body must be the signed body verbatim"
         );
-        // The wire code lives in two places now — `refused.error` (cloned out by
-        // `refusal`) and `preserved.error` (inside the evidence the reputation
-        // layer reads). Nothing structural keeps them in sync until #1377, so pin
-        // it here: a future edit that reclassified one leg would desync them.
+        // #1377: `error()` is now DERIVED from the evidence by `open()`, so the two
+        // legs cannot desync by construction. This pins that they agree.
         anyhow::ensure!(
-            preserved.error.as_ref() == Some(&refused.error),
-            "the cloned wire code {:?} must match the code inside the preserved evidence {:?}",
-            refused.error,
+            preserved.error.as_ref() == Some(refused.error()),
+            "the derived wire code {:?} must match the code inside the preserved evidence {:?}",
+            refused.error(),
             preserved.error,
         );
         // The whole point: the surviving signature still recovers to the operator,
@@ -2576,25 +2775,82 @@ mod tests {
         Ok(())
     }
 
+    /// #1377: `open()` on a `body.ok == false` response that carries no error code
+    /// is a protocol violation (the `validate` invariant was bypassed), so it does
+    /// NOT produce a typed `UpstreamRefused` that a challenger could act on — it
+    /// surfaces as a plain error instead of laundering a malformed refusal.
+    #[test]
+    fn open_on_a_response_without_an_error_code_is_not_a_typed_refusal() {
+        use decdn_protocol::client::{StreamResponse, StreamResponseBody};
+
+        use super::UpstreamRefused;
+
+        let response = StreamResponse {
+            body: StreamResponseBody {
+                hash: [0x5Au8; 32],
+                ok: false,
+                rate_per_mb: 10,
+                total_bytes: 0,
+                channel_id: [0x77u8; 32],
+                timestamp_us: 1_700_000_000_000_000,
+                redirect: None,
+            },
+            error: None,
+            voucher_interval_mb: None,
+            slash_sig: vec![0u8; decdn_protocol::message::SLASH_SIG_LEN],
+        };
+        let err = UpstreamRefused::open(response);
+        assert!(
+            err.downcast_ref::<UpstreamRefused>().is_none(),
+            "a response with no error code must not become a typed refusal"
+        );
+    }
+
+    /// #1375: the two buyer ceilings combine as a min with `0` meaning "unbounded"
+    /// on each input, so a completed pull is always bounded by the LOWER of the
+    /// probe-relative and absolute bounds — and unbounded only when both are.
+    #[test]
+    fn effective_rate_ceiling_is_min_with_zero_as_unbounded() {
+        use super::effective_rate_ceiling;
+        assert_eq!(
+            effective_rate_ceiling(0, 0),
+            0,
+            "both unbounded => unbounded"
+        );
+        assert_eq!(
+            effective_rate_ceiling(10, 0),
+            10,
+            "config unbounded => probe"
+        );
+        assert_eq!(
+            effective_rate_ceiling(0, 900),
+            900,
+            "probe unbounded => config"
+        );
+        assert_eq!(effective_rate_ceiling(10, 900), 10, "min: probe binds");
+        assert_eq!(effective_rate_ceiling(900, 10), 10, "min: config binds");
+        assert_eq!(effective_rate_ceiling(42, 42), 42, "equal bounds");
+    }
+
     /// A **mid-stream** refusal carries no signature, so it must never carry a
-    /// `StreamResponse` either: the `response` field's docs promise a present
-    /// value always recovers to the delivering node, and a synthesised one would
-    /// hand an observer an unsigned artifact that breaks that promise (#1378).
-    /// Routing all four mid-stream sites through `mid_stream_refusal` makes
-    /// `response == None` a one-place decision; this pins it.
+    /// `StreamResponse` either: the evidence contract promises a present value
+    /// always recovers to the delivering node, and a synthesised one would hand an
+    /// observer an unsigned artifact that breaks that promise (#1378). Routing all
+    /// four mid-stream sites through [`UpstreamRefused::mid_stream`] makes
+    /// `evidence() == None` a one-place decision; #1377 makes it a type property.
     #[test]
     fn a_mid_stream_refusal_never_carries_a_response() {
         use decdn_protocol::client::StreamError;
 
-        use super::mid_stream_refusal;
+        use super::UpstreamRefused;
 
-        let refused = mid_stream_refusal(StreamError::Overloaded);
+        let refused = UpstreamRefused::mid_stream(StreamError::Overloaded);
         assert!(
-            refused.response.is_none(),
+            refused.evidence().is_none(),
             "a mid-stream refusal has no signed response to carry"
         );
         assert_eq!(
-            refused.error,
+            *refused.error(),
             StreamError::Overloaded,
             "the mid-stream wire code must survive unchanged"
         );

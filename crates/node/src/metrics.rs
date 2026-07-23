@@ -790,6 +790,17 @@ pub struct DecdnMetrics {
     /// ceiling), so it does not tar the provider's reputation. A sustained rate
     /// means this node's ceiling is below the content it is trying to warm.
     pub node_pull_too_large: Counter,
+    /// `decdn_node_pull_rate_above_ceiling_total` (#1375): a selected upstream
+    /// signed an open-stage `StreamResponse` quoting a per-MB rate above this
+    /// node's effective buyer ceiling (the lower of the candidate's probe rate and
+    /// the configured `cache.max_rate_per_mb`), so the buyer refused before paying
+    /// any voucher. Sibling of [`Self::node_pull_too_large`]: a buyer-side policy
+    /// decision that does NOT tar the provider (an over-*config* quote is our tight
+    /// policy; an over-*probe* quote is a possible bait-and-switch we do not
+    /// adjudicate here). A sustained rate is the operator's signal that nodes are
+    /// being probed for rate manipulation — the one refusal on this path that
+    /// guards a slashable offense, so it earns a counter of its own.
+    pub node_pull_rate_above_ceiling: Counter,
     /// `decdn_node_pull_timeout_total` (#857): a buyer→upstream pull hit one of this node's
     /// own deadlines. Like a channel-open failure this is a buyer-side condition (a possibly
     /// mis-sized local budget), NOT evidence the provider is unreachable, so it does NOT tar
@@ -1992,6 +2003,11 @@ recorders! {
     /// `max_blob_size` ceiling and the buyer rejected it before buffering
     /// (#840). A buyer-side policy decision, so it does not score the provider.
     node_pull_too_large => node_pull_too_large.inc();
+
+    /// A selected upstream quoted a per-MB rate above this node's effective buyer
+    /// ceiling and the buyer refused before paying (#1375). A buyer-side policy
+    /// decision, so it does not score the provider.
+    node_pull_rate_above_ceiling => node_pull_rate_above_ceiling.inc();
 
     /// Record a paid-delivery (`serve_stream`) request refused because the
     /// blob was evicted between probe and stream (#876).

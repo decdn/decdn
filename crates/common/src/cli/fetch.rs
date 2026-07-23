@@ -179,6 +179,16 @@ pub struct ClientFetchArgs {
     #[arg(long, value_name = "MB", default_value_t = 1024)]
     pub max_blob_mb: u64,
 
+    /// Refuse a provider that quotes a per-MB rate above this many USDC base units
+    /// **before** paying any voucher (#1375). Guards against a provider that quotes
+    /// low on the probe then high on the stream. `0` (the default) = no ceiling.
+    /// For `bundle pull` this applies per entry. Note: unlike the node's automatic
+    /// node-to-node pull (which also caps at the candidate's own probe rate), the
+    /// CLI applies only this absolute value — set it to opt into buyer rate
+    /// protection on the client path.
+    #[arg(long, value_name = "UNITS", default_value_t = 0)]
+    pub max_rate_per_mb: u64,
+
     /// Abandon a fetch when the provider sends no data for this long, in
     /// milliseconds. This is the primary timeout (#1134): the clock resets on
     /// every byte received, so it catches a dead or stalled provider — what a

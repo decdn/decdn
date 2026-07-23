@@ -206,6 +206,7 @@ impl ClientFixture {
                 // the `ZeroBudget` arm is unreachable here — propagate rather than unwrap.
                 PullDeadlines::new(Duration::from_secs(30), Duration::from_secs(30))?,
                 0,
+                0,
                 &mut progress,
             )
             .await
@@ -336,6 +337,7 @@ impl ClientFixture {
             byte_offset,
             TIMESTAMP_US,
             PullDeadlines::new(Duration::from_secs(30), Duration::from_secs(30))?,
+            0,
             0,
             &mut progress,
         )
@@ -599,6 +601,7 @@ impl ClientFixture {
             timestamp_us,
             PullDeadlines::new(Duration::from_secs(30), Duration::from_secs(30))?,
             0,
+            0,
             &mut VoucherProgress::default(),
         )
         .await
@@ -624,12 +627,14 @@ impl ClientFixture {
             }
             anyhow::bail!("expected a typed refusal, got: {err:#}");
         };
-        // `response` is `None` only for a mid-stream `StreamError` frame, which is
-        // unsigned and therefore useless as evidence — a setup failure here.
-        refused.response.clone().ok_or_else(|| {
+        // `evidence()` is `None` only for a mid-stream `StreamError` frame, which is
+        // unsigned and therefore useless as evidence — a setup failure here. #1377
+        // makes this the ONLY way to obtain the signed response, so an unsigned
+        // mid-stream refusal can no longer be mistaken for on-chain evidence.
+        refused.evidence().cloned().ok_or_else(|| {
             anyhow::anyhow!(
                 "refusal carried no signed StreamResponse (mid-stream {:?}?)",
-                refused.error
+                refused.error()
             )
         })
     }
@@ -718,7 +723,7 @@ fn is_retryable(err: &anyhow::Error) -> bool {
         // reports itself degraded, or the blob as over its ceiling, will say the
         // same thing on every attempt.
         return !matches!(
-            refused.error,
+            refused.error(),
             StreamError::InternalError | StreamError::BlobTooLarge
         );
     }

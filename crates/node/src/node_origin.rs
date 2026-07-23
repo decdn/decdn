@@ -61,9 +61,9 @@ use crate::buyer_channel::{ChannelOpenPending, ChannelOpener, OpenReported, Open
 use crate::buyer_ledgers::BuyerLedgers;
 use crate::client_requester::{
     BlobTooLargeClaim, ChannelContext, ChannelLedger, Cumulative, HashMismatch, LocalPullFault,
-    PullDeadlines, PullStalled, PullTimeout, UpstreamPull, UpstreamPullHeader, UpstreamRefused,
-    UpstreamVoucherRejected, VoucherProgress, open_progressive_pull as open_progressive_upstream,
-    sign_client_binding, stream_fetch_shared,
+    PullDeadlines, PullStalled, PullTimeout, RateAboveCeiling, UpstreamPull, UpstreamPullHeader,
+    UpstreamRefused, UpstreamVoucherRejected, VoucherProgress, effective_rate_ceiling,
+    open_progressive_pull as open_progressive_upstream, sign_client_binding, stream_fetch_shared,
 };
 use crate::dht::negative_cache::Hash as DhtHash;
 use crate::dht::routing::{NodeId as DhtNodeId, RoutingTable};
@@ -172,6 +172,12 @@ pub struct NodeOriginConfig {
     /// Mirrors the serving-side `BlobTooLarge` gate; rejects an oversized server
     /// `total_bytes` claim before buffering (#840).
     pub max_blob_size_bytes: u64,
+    /// Buyer-side ABSOLUTE per-MB rate ceiling (`cache.max_rate_per_mb`), `0` =
+    /// unlimited (#1375). Combined via [`effective_rate_ceiling`] with the
+    /// probe-relative bound (the rate the chosen candidate advertised) so the node
+    /// refuses a stream quote that exceeds the lower of the two before paying — and
+    /// retains the signed over-quote as rate-manipulation evidence.
+    pub max_rate_per_mb: u64,
     /// ADR 015 master switch (`network.enable_0rtt`) for the probe handshake.
     pub enable_0rtt: bool,
     /// Desired deposit for a freshly-opened buyer channel
@@ -580,6 +586,14 @@ impl NodeOrigin {
             0,
             now_micros(),
             deps.config.max_blob_size_bytes,
+            // Refuse a stream quote above the lower of the candidate's probe rate
+            // and the configured absolute ceiling, before paying (#1375).
+            // `candidate.rate_per_mb >= 1` always: `ProbeResponse::validate`
+            // rejects a zero rate (`RateIsZero`) and `probe_candidate` drops any
+            // candidate that fails `validate`, so `effective_rate_ceiling` never
+            // treats the probe bound as unbounded here — a probe-rate-0
+            // bait-and-switch cannot select through this path.
+            effective_rate_ceiling(candidate.rate_per_mb, deps.config.max_rate_per_mb),
             deadlines,
         )
         .await
@@ -1474,6 +1488,11 @@ async fn pull_from_candidate(
         now_micros(),
         deadlines,
         deps.config.max_blob_size_bytes,
+        // Refuse a stream quote above the lower of the candidate's probe rate and the
+        // configured absolute ceiling, before paying (#1375). `candidate.rate_per_mb >= 1`
+        // always (`ProbeResponse::validate` rejects a zero rate and `probe_candidate` drops
+        // it), so `effective_rate_ceiling` never treats the probe bound as unbounded here.
+        effective_rate_ceiling(candidate.rate_per_mb, deps.config.max_rate_per_mb),
     )
     .await;
     // Capture the delivery duration BEFORE the guard settles: `record_progress` does
@@ -1760,6 +1779,18 @@ const fn classify_refusal(error: &StreamError) -> RefusalVerdict {
 enum PullVerdict {
     /// The blob is over OUR configured ceiling (#840) — it may be fine for other nodes.
     OversizeClaim,
+    /// The provider quoted a per-MB rate above the buyer's effective ceiling — the lower
+    /// of its own probe rate and our configured absolute cap (#1375). We refused before
+    /// paying; the signed over-quote is retained on the `RateAboveCeiling` error for a
+    /// caller to replay to `SlashJudge`, but this node does not auto-submit a challenge
+    /// (deferred). Reputation-neutral, and metered + suppressed: an over-*config* quote is
+    /// our tight policy, not proof the provider is bad; an over-*probe* quote is a possible
+    /// bait-and-switch we do not adjudicate here (and it is only slashable when the probe
+    /// bound, not the config bound, was exceeded). Either way the rate is durable for this
+    /// (peer, hash) — re-probing gets the same quote — so we suppress the pair (like
+    /// [`Self::OurDeadline`]) rather than tar the peer, and count it (like
+    /// [`Self::OversizeClaim`], which meters but does not suppress).
+    RateCeiling,
     /// OUR deadline fired: a possibly mis-sized local budget, not evidence about the peer.
     OurDeadline,
     /// The peer went SILENT mid-stream (#1134). Unlike [`Self::OurDeadline`] this IS about
@@ -1794,10 +1825,13 @@ enum PullVerdict {
     /// its cooperative close signed, so there is no remainder to reclaim and nothing the
     /// local row can still buy us. The one case where forgetting it is safe (#1145 review).
     OurSettledChannel(VoucherRejectReason),
-    /// The peer rejected a voucher we presented, but the channel is FINE: a transient
-    /// node-side persist fault upstream (`RetryLater`). ADR 003 has the upstream's state
-    /// not advance in this case, so the SAME voucher can be resent on a fresh stream —
-    /// nothing to rotate, nothing to top up (#1145 review).
+    /// The peer rejected a voucher we presented, but the channel is FINE — nothing to
+    /// rotate, nothing to top up (#1145 review). Two reasons land here: `RetryLater` (a
+    /// transient node-side persist fault upstream; ADR 003 has its state not advance, so the
+    /// SAME voucher can be resent on a fresh stream) and `RateFloorRaised` (a governance
+    /// delivery-floor raise made the quoted rate stale, #1382, so the client re-probes and
+    /// re-quotes at the new floor on a fresh stream). Different client remedy, same action
+    /// here: keep the healthy channel and retry.
     OurVoucherRetryable(VoucherRejectReason),
     /// The peer refused delivery, carrying the wire code's own verdict (#1144).
     Refused(RefusalVerdict),
@@ -1952,14 +1986,21 @@ fn forget_settled_channel(
 ///   escrowed remainder survives it, and the local row is this node's only handle on that.
 /// - **The channel is settled.** `CooperativeCloseSigned` alone: the upstream holds a signed
 ///   cooperative close, so the channel is finalised on-chain and there is no remainder.
-/// - **Try again.** `RetryLater` alone: the voucher was valid and the upstream's state did
-///   not advance (ADR 003), so the same voucher can go out on a fresh stream.
+/// - **Try again.** `RetryLater` (the voucher was valid and the upstream's state did not
+///   advance, ADR 003, so the same voucher can go out on a fresh stream) and
+///   `RateFloorRaised` (a governance floor raise made the quoted rate stale, #1382, so the
+///   client re-probes/re-quotes at the new floor on a fresh stream). Different remedies,
+///   same action here: the channel is healthy, so leave it alone and retry.
 const fn voucher_verdict(reason: VoucherRejectReason) -> PullVerdict {
     match reason {
         VoucherRejectReason::BadSignature | VoucherRejectReason::WrongSigner => {
             PullVerdict::OurLocalFault
         }
-        VoucherRejectReason::RetryLater => PullVerdict::OurVoucherRetryable(reason),
+        // Channel and signer both fine — resend (`RetryLater`) or re-quote at the new floor
+        // (`RateFloorRaised`, #1382); either way keep the channel and try again.
+        VoucherRejectReason::RetryLater | VoucherRejectReason::RateFloorRaised => {
+            PullVerdict::OurVoucherRetryable(reason)
+        }
         // Settled on-chain: the deposit is already divided, so the row buys us nothing.
         VoucherRejectReason::CooperativeCloseSigned => PullVerdict::OurSettledChannel(reason),
         // Everything else is terminal for this channel while its deposit is STILL ESCROWED.
@@ -1993,6 +2034,9 @@ fn pull_verdict(err: &anyhow::Error) -> PullVerdict {
     if err.downcast_ref::<BlobTooLargeClaim>().is_some() {
         return PullVerdict::OversizeClaim;
     }
+    if err.downcast_ref::<RateAboveCeiling>().is_some() {
+        return PullVerdict::RateCeiling;
+    }
     if err.downcast_ref::<PullTimeout>().is_some() {
         return PullVerdict::OurDeadline;
     }
@@ -2025,10 +2069,10 @@ fn pull_verdict(err: &anyhow::Error) -> PullVerdict {
         // Unwrap it here rather than in `classify_refusal`, because the answer is not a
         // refusal verdict at all: it is a statement about our CHANNEL, and `voucher_verdict`
         // is the one place that decides what a rejected voucher costs.
-        if let StreamError::VoucherRejected { reason } = refused.error {
-            return voucher_verdict(reason);
+        if let StreamError::VoucherRejected { reason } = refused.error() {
+            return voucher_verdict(*reason);
         }
-        return PullVerdict::Refused(classify_refusal(&refused.error));
+        return PullVerdict::Refused(classify_refusal(refused.error()));
     }
     if err.downcast_ref::<HashMismatch>().is_some() {
         return PullVerdict::Corruption;
@@ -2075,6 +2119,20 @@ fn classify_pull_failure(
         PullVerdict::OversizeClaim => {
             deps.metrics.node_pull_too_large();
             debug!(%provider_addr, %err, "node-origin: upstream claimed an oversized blob; rejected before buffering");
+        }
+        // The provider quoted above our effective rate ceiling (#1375). We refused before
+        // paying; the signed over-quote is retained ON the `RateAboveCeiling` error for a
+        // caller to act on, though this handler does not itself submit a challenge
+        // (auto-slashing is deferred). Metered like `OversizeClaim` so the refusal is
+        // operator-visible, then suppressed for the full durable TTL (as `OurDeadline` does,
+        // NOT `OversizeClaim`, which only meters): the quote is a lasting fact about this
+        // (peer, hash) — re-probing gets the same rate. Reputation-neutral: whether it is a
+        // bait-and-switch or just our tight config we do not adjudicate here, so we do not
+        // tar the peer.
+        PullVerdict::RateCeiling => {
+            deps.metrics.node_pull_rate_above_ceiling();
+            suppress(Some(REFUSAL_SUPPRESSION_TTL));
+            debug!(%provider_addr, %err, "node-origin: upstream quoted above our rate ceiling; refused before paying, suppressing the pair");
         }
         // A possibly mis-sized local budget, not evidence the provider is unreachable
         // (#857). Unscored — but NOT ignored (#1145 review).
@@ -2131,15 +2189,17 @@ fn classify_pull_failure(
             deps.metrics.node_pull_voucher_rejected();
             forget_settled_channel(deps, provider_addr, reason, channel);
         }
-        // The channel is fine: the upstream hit a transient persist fault and its state did
-        // not advance (ADR 003), so the same voucher can be resent on a fresh stream. Skip
-        // the candidate this once and leave the channel alone — rotating here would throw
-        // away a healthy channel over a hiccup.
+        // The channel is fine: either the upstream hit a transient persist fault and its
+        // state did not advance (`RetryLater`, ADR 003, so the same voucher can be resent) or
+        // a governance floor raise made the quote stale (`RateFloorRaised`, #1382, so a retry
+        // re-probes and re-quotes at the new floor). Skip the candidate this once and leave
+        // the channel alone — rotating here would throw away a healthy channel over a hiccup.
         PullVerdict::OurVoucherRetryable(reason) => {
             deps.metrics.node_pull_voucher_rejected();
             debug!(
                 %provider_addr, ?reason, %err,
-                "node-origin: upstream asked us to retry the voucher; channel left intact"
+                "node-origin: upstream rejected the voucher but the channel is healthy; \
+                 left intact for a retry"
             );
         }
         // A refusal proves the peer is reachable and answering, so it is not `Unreachable`
@@ -2408,13 +2468,11 @@ mod tests {
         // The refusal sentinel (#1144) carries the wire code through the same
         // channel, so `classify_pull_failure` can split an honest `NotFound` from
         // a self-reported `InternalError` instead of folding both to Unreachable.
-        let refused: anyhow::Error = anyhow::Error::new(UpstreamRefused {
-            error: StreamError::NotFound,
-            response: None,
-        });
+        let refused: anyhow::Error =
+            anyhow::Error::new(UpstreamRefused::mid_stream(StreamError::NotFound));
         let recovered = refused
             .downcast_ref::<UpstreamRefused>()
-            .map(|r| r.error.clone());
+            .map(|r| r.error().clone());
         assert_eq!(recovered, Some(StreamError::NotFound));
         assert!(refused.downcast_ref::<UpstreamVoucherRejected>().is_none());
     }
@@ -2452,6 +2510,22 @@ mod tests {
         assert_eq!(
             classify_refusal(&StreamError::InternalError),
             RefusalVerdict::NodeFault
+        );
+    }
+
+    /// #1382: a `RateFloorRaised` rejection is the honest-buyer re-quote signal —
+    /// a governance delivery-floor raise made the stream's quote stale, so its
+    /// voucher is unredeemable at that rate. The buyer did nothing wrong, so this
+    /// must be judged retryable with the channel KEPT — not an `OurDeadChannel`
+    /// (which would strand a perfectly good deposit) nor an `OurLocalFault` (which
+    /// would tar the peer for our own stale quote). Re-probing at the new floor is
+    /// the fix, which is exactly what `OurVoucherRetryable` drives.
+    #[test]
+    fn a_rate_floor_raise_is_a_retryable_requote_not_a_dead_channel() {
+        assert_eq!(
+            voucher_verdict(VoucherRejectReason::RateFloorRaised),
+            PullVerdict::OurVoucherRetryable(VoucherRejectReason::RateFloorRaised),
+            "an honest buyer whose quote went stale keeps its channel and retries"
         );
     }
 
@@ -2556,10 +2630,7 @@ mod tests {
         // `node_pull_local_fault_total` an operator needs to see that this node is broken.
         let refused_too = anyhow::anyhow!("encode failed")
             .context(LocalPullFault)
-            .context(UpstreamRefused {
-                error: StreamError::NotFound,
-                response: None,
-            });
+            .context(UpstreamRefused::mid_stream(StreamError::NotFound));
         assert_eq!(
             pull_verdict(&refused_too),
             PullVerdict::OurLocalFault,
@@ -2587,12 +2658,9 @@ mod tests {
             // Exactly what the receive loops now raise — wrapped, because a real one comes
             // up through the pull path's `.context` layers and `downcast_ref` must still
             // find it.
-            let err = anyhow::Error::new(UpstreamRefused {
-                error: error.clone(),
-                response: None,
-            })
-            .context("receive and pay")
-            .context("pull from candidate");
+            let err = anyhow::Error::new(UpstreamRefused::mid_stream(error.clone()))
+                .context("receive and pay")
+                .context("pull from candidate");
             assert_eq!(
                 pull_verdict(&err),
                 PullVerdict::Refused(want),

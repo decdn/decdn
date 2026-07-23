@@ -757,15 +757,18 @@ impl StreamError {
 /// The first eight variants mirror `decdn_incentive::ChannelError` ∪
 /// `VoucherError` one-to-one; the handler-side conversion `voucher_reject_reason`
 /// matches those exhaustively so a new `ChannelError` variant fails to compile
-/// until this enum is extended (ADR 005 §Mirror obligation). The last two have
-/// no validation-enum counterpart and are emitted directly by the
-/// `cdn/client/v1` handler: the ninth, [`Self::RetryLater`], is the wire
-/// expression of a transient persist-write failure (`ChannelError::Store`,
+/// until this enum is extended (ADR 005 §Mirror obligation). The remaining
+/// variants have no validation-enum counterpart and are emitted directly by the
+/// `cdn/client/v1` handler: [`Self::RetryLater`] is the wire expression of a
+/// transient persist-write failure (`ChannelError::Store`,
 /// `decdn_incentive::RetrySignal`), the one rejection where the client should
 /// resend the **same** voucher rather than treat the failure as permanent
-/// (ADR 003 §Off-chain voucher state persistence); the tenth, [`Self::Expired`],
-/// is the on-chain channel-expiry serve-gate refusal (#751). Variant order is
-/// frozen.
+/// (ADR 003 §Off-chain voucher state persistence); [`Self::Expired`] is the
+/// on-chain channel-expiry serve-gate refusal (#751); [`Self::CooperativeCloseSigned`]
+/// is the coop-close waiver refusal (ADR 003 §Cooperative close); and
+/// [`Self::RateFloorRaised`] is the honest-buyer re-quote signal when the live
+/// delivery floor rose above a stream's quoted rate (#1382). Variant order is
+/// frozen — new handler-direct reasons append at the end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VoucherRejectReason {
     /// Signature malformed (corrupted bytes, non-canonical `s`, invalid
@@ -815,6 +818,20 @@ pub enum VoucherRejectReason {
     /// counterpart — `voucher_reject_reason` never returns this; the
     /// `cdn/client/v1` handler emits it directly, like `Expired`/`RetryLater`.
     CooperativeCloseSigned,
+    /// The live on-chain delivery floor (`getRateBounds().deliveryFloor`, tracked
+    /// by the `RateBoundsUpdated` watcher) rose **above** the per-MB rate this
+    /// stream was quoted at, after the signed `StreamResponse` but before this
+    /// voucher. The cumulative watermark the voucher carries now prices bytes
+    /// below the live floor, so the node cannot redeem it: `PaymentChannel`
+    /// `_advanceClaimWatermark` would revert `RateFloorViolation` at settlement
+    /// (the chain keeps no per-channel floor snapshot — #1388). Refusing is the
+    /// node's correct self-protection, and the buyer did nothing wrong: the fix
+    /// is to **re-probe/re-quote** at the new floor and open a fresh stream, not
+    /// to resend this voucher (which would be rejected identically) or top up.
+    /// No validation-enum counterpart — `voucher_reject_reason` never returns
+    /// this; the `cdn/client/v1` handler emits it directly (ADR 005
+    /// §`VoucherRejected` semantics, #1382).
+    RateFloorRaised,
 }
 
 #[cfg(test)]
@@ -1092,6 +1109,7 @@ mod tests {
             VoucherRejectReason::RetryLater,
             VoucherRejectReason::Expired,
             VoucherRejectReason::CooperativeCloseSigned,
+            VoucherRejectReason::RateFloorRaised,
         ]
         .into_iter()
         .enumerate()

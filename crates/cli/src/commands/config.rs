@@ -207,6 +207,10 @@ pub fn write_validate_summary<W: std::io::Write>(
         "  max_blob_size_mb:         {}",
         resolved.cache.max_blob_size_mb
     )?;
+    match resolved.cache.max_rate_per_mb {
+        0 => writeln!(w, "  max_rate_per_mb:          unlimited (buyer)")?,
+        n => writeln!(w, "  max_rate_per_mb:          {n} (buyer ceiling)")?,
+    }
     match resolved.cache.gc_interval_sec {
         0 => writeln!(w, "  gc_interval_sec:          disabled")?,
         n => writeln!(w, "  gc_interval_sec:          {n}")?,
@@ -450,6 +454,7 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # cache_dir = "~/.decdn/cache"
 # cache_size_mb = 10240
 # max_blob_size_mb = 1024
+# max_rate_per_mb = 0                      # buyer-side per-MB rate ceiling for paid cache-miss pulls (USDC base units); 0 = unlimited (#1375). Refuses a provider quote above the lower of this and the candidate's probe rate, before paying. Distinct from the seller-side [payment] delivery_ceiling clamp
 # pinned_hashes = []                       # blob hashes (hex) exempted from LRU eviction (#276)
 # user_agent = "decdn-node/<version>"      # User-Agent on HTTP origin pull-through (#435); default embeds the crate version
 # Pull-through origin (singular). Mutually exclusive with the plural [[cache.origins]] form below.

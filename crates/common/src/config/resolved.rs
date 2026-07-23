@@ -188,6 +188,14 @@ pub struct ResolvedCache {
     pub cache_size_mb: u64,
     /// Maximum single blob size in megabytes.
     pub max_blob_size_mb: u64,
+    /// Buyer-side ABSOLUTE per-MB rate ceiling for paid pulls (#1375), in the same
+    /// per-MB units as the wire `StreamResponse.rate_per_mb`; `0` = unlimited
+    /// (the default). Distinct from the seller-side `delivery_ceiling` clamp: this
+    /// bounds what this node, acting as a BUYER on a cache-miss pull, will accept a
+    /// provider to quote. The node also always applies a probe-relative bound (a
+    /// quote may not exceed the rate the chosen candidate advertised at probe), so
+    /// this is the additional absolute backstop.
+    pub max_rate_per_mb: u64,
     /// Resolved ordered list of origin backends (#437, #284). Empty
     /// vec => no pull-through; cache misses return `NoOrigin`. A
     /// single-element vec preserves the pre-#284 single-origin

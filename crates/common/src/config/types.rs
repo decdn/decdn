@@ -315,6 +315,12 @@ pub struct CacheConfig {
     pub cache_size_mb: Option<u64>,
     /// Maximum single blob size in megabytes.
     pub max_blob_size_mb: Option<u64>,
+    /// Buyer-side ABSOLUTE per-MB rate ceiling for paid pulls (#1375), in the same
+    /// per-MB units as the wire `StreamResponse.rate_per_mb`. Absent / `0` =
+    /// unlimited. Bounds what this node, as a BUYER on a cache-miss pull, will
+    /// accept a provider to quote — on top of the always-applied probe-relative
+    /// bound. Distinct from the seller-side `delivery_ceiling` clamp.
+    pub max_rate_per_mb: Option<u64>,
     /// Single origin backend for cache pull-through (#437). Absent =>
     /// no pull-through (unless [`Self::origins`] is set); cache misses
     /// fail with `NoOrigin`. The variant (`http`, `fs`, or `s3`) is

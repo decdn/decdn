@@ -494,7 +494,7 @@ pub(crate) async fn resolve_target_node(
 fn annotate_unbound_cache_miss(err: anyhow::Error, ctx: &ChannelContext) -> anyhow::Error {
     let refused_not_found = err
         .downcast_ref::<UpstreamRefused>()
-        .is_some_and(|refused| matches!(refused.error, StreamError::NotFound));
+        .is_some_and(|refused| matches!(refused.error(), StreamError::NotFound));
     if ctx.client_binding.is_none() && refused_not_found {
         err.context(
             "no client identity binding was sent because \
@@ -519,6 +519,7 @@ pub(crate) async fn fetch_blob(
     namespace_id: [u8; 32],
     deadlines: PullDeadlines,
     max_blob_bytes: u64,
+    max_rate_per_mb: u64,
     on_progress: Option<&ProgressCallback>,
 ) -> anyhow::Result<Vec<u8>> {
     let channel_id = ctx.channel_id;
@@ -541,6 +542,7 @@ pub(crate) async fn fetch_blob(
         timestamp_us,
         deadlines,
         max_blob_bytes,
+        max_rate_per_mb,
         &mut progress,
         on_progress,
     )
@@ -693,6 +695,7 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
             common.hard_cap(),
         )?,
         max_blob_bytes,
+        common.max_rate_per_mb,
         Some(&on_progress),
     )
     .await;
@@ -723,6 +726,7 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
                 common.hard_cap(),
             )?,
             max_blob_bytes,
+            max_rate_per_mb: common.max_rate_per_mb,
             namespace_id,
         };
         return chunks
@@ -781,6 +785,8 @@ struct ChunkFetcher<'a, P: alloy::providers::Provider + Clone> {
     /// documented to apply per entry for `bundle pull`.
     deadlines: PullDeadlines,
     max_blob_bytes: u64,
+    /// Buyer-side per-MB rate ceiling applied per chunk (#1375); `0` = unlimited.
+    max_rate_per_mb: u64,
     /// The namespace the manifest's content is published under (ADR 002 §
     /// Retrieval by namespace); every chunk pull routes on it. `NO_NAMESPACE`
     /// when `--namespace` was omitted.
@@ -813,6 +819,7 @@ impl<P: alloy::providers::Provider + Clone> ChunkFetcher<'_, P> {
             self.namespace_id,
             self.deadlines,
             self.max_blob_bytes,
+            self.max_rate_per_mb,
             // No per-chunk byte bar: it would reset once per chunk and read as a
             // stuttering restart. Chunk progress is the printed lines here plus
             // the per-chunk error context from `file_manifest::reconstruct`.
@@ -1075,6 +1082,7 @@ mod tests {
             data_dir: Some(PathBuf::from("/tmp/d")),
             deposit_micro_usdc: None,
             max_blob_mb: 1024,
+            max_rate_per_mb: 0,
             stall_timeout_ms: 30_000,
             timeout_ms: 3_600_000,
             no_keep_blobs: false,
@@ -1104,10 +1112,7 @@ mod tests {
     /// `anyhow!("delivery refused: …")` — the annotation downcasts, so a look-alike string
     /// would exercise nothing and pass against a hint that never fires in production.
     fn refusal(error: StreamError) -> anyhow::Error {
-        anyhow::Error::new(UpstreamRefused {
-            error,
-            response: None,
-        })
+        anyhow::Error::new(UpstreamRefused::mid_stream(error))
     }
 
     /// An unbound (no `capacity_bond_address`) fetch refused with `NotFound` gets

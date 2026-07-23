@@ -236,7 +236,7 @@ where
             if !selected.is_pinned()
                 && err
                     .downcast_ref::<UpstreamRefused>()
-                    .is_some_and(|refused| refused.error.is_delivery_side()) =>
+                    .is_some_and(|refused| refused.error().is_delivery_side()) =>
         {
             let fallback = discover(hash, target).await?;
             let bytes = fetch_from(hash, fallback).await?;
@@ -614,6 +614,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
                 self.common.hard_cap(),
             )?,
             max_blob_bytes,
+            self.common.max_rate_per_mb,
             // Per-entry byte bars would interleave illegibly across a manifest's
             // many concurrent pulls; `bundle pull` reports at entry granularity
             // instead (#1118 scopes the byte bar to single-blob `fetch`).
@@ -1023,10 +1024,11 @@ mod tests {
                         async move {
                             fetches.borrow_mut().push((hash, target));
                             if hash == [1u8; 32] && target == 1 {
-                                Err(anyhow::Error::new(decdn_client_pull::UpstreamRefused {
-                                    error: decdn_protocol::StreamError::EvictedSinceProbe,
-                                    response: None,
-                                }))
+                                Err(anyhow::Error::new(
+                                    decdn_client_pull::UpstreamRefused::mid_stream(
+                                        decdn_protocol::StreamError::EvictedSinceProbe,
+                                    ),
+                                ))
                             } else {
                                 Ok(vec![hash[0]])
                             }
@@ -1066,10 +1068,11 @@ mod tests {
             &preferred,
             |hash, target| async move {
                 if target == 1 {
-                    Err(anyhow::Error::new(decdn_client_pull::UpstreamRefused {
-                        error: decdn_protocol::StreamError::Overloaded,
-                        response: None,
-                    }))
+                    Err(anyhow::Error::new(
+                        decdn_client_pull::UpstreamRefused::mid_stream(
+                            decdn_protocol::StreamError::Overloaded,
+                        ),
+                    ))
                 } else {
                     Ok(vec![hash[0]])
                 }
@@ -1126,10 +1129,11 @@ mod tests {
             [1u8; 32],
             &preferred,
             |_, _| async {
-                Err(anyhow::Error::new(decdn_client_pull::UpstreamRefused {
-                    error: decdn_protocol::StreamError::NotFound,
-                    response: None,
-                }))
+                Err(anyhow::Error::new(
+                    decdn_client_pull::UpstreamRefused::mid_stream(
+                        decdn_protocol::StreamError::NotFound,
+                    ),
+                ))
             },
             {
                 let discoveries = Rc::clone(&discoveries);
@@ -1149,7 +1153,7 @@ mod tests {
             matches!(
                 err.downcast_ref::<decdn_client_pull::UpstreamRefused>(),
                 Some(refused)
-                    if matches!(refused.error, decdn_protocol::StreamError::NotFound)
+                    if matches!(refused.error(), decdn_protocol::StreamError::NotFound)
             ),
             "{err:#}"
         );
@@ -1179,12 +1183,13 @@ mod tests {
                     let fetches = Rc::clone(&fetches);
                     async move {
                         *fetches.borrow_mut() += 1;
-                        Err(anyhow::Error::new(decdn_client_pull::UpstreamRefused {
-                            error: decdn_protocol::StreamError::VoucherRejected {
-                                reason: decdn_protocol::VoucherRejectReason::WrongSigner,
-                            },
-                            response: None,
-                        }))
+                        Err(anyhow::Error::new(
+                            decdn_client_pull::UpstreamRefused::mid_stream(
+                                decdn_protocol::StreamError::VoucherRejected {
+                                    reason: decdn_protocol::VoucherRejectReason::WrongSigner,
+                                },
+                            ),
+                        ))
                     }
                 }
             },
@@ -1205,7 +1210,7 @@ mod tests {
         assert!(
             matches!(
                 err.downcast_ref::<decdn_client_pull::UpstreamRefused>(),
-                Some(refused) if refused.error.is_mid_stream()
+                Some(refused) if refused.error().is_mid_stream()
             ),
             "{err:#}"
         );

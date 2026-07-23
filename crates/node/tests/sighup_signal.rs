@@ -84,6 +84,7 @@ fn seed_resolved(rate: u64, level: LogLevel) -> ResolvedConfig {
             cache_dir: PathBuf::from("/tmp/cache"),
             cache_size_mb: 1024,
             max_blob_size_mb: 128,
+            max_rate_per_mb: 0,
             origins: Vec::new(),
             pinned_hashes: decdn_cache::PinnedHashes::empty(),
             origin_retry: decdn_cache::RetryPolicy::default(),

@@ -13,9 +13,17 @@ impl ClientHandler {
     /// delivered bytes. A permanent voucher rejection writes a `StreamError` and
     /// finishes the stream cleanly (no reset). A transient store-write failure
     /// is likewise surfaced cleanly as `VoucherRejectReason::RetryLater` so the
-    /// client resends the same voucher on a fresh stream (ADR 003 §332). Only an
-    /// underpayment fails the stream: no wire reason exists for it, and the
-    /// client is blocked awaiting `VoucherAck` so it cannot resend mid-stream.
+    /// client resends the same voucher on a fresh stream (ADR 003 §332).
+    ///
+    /// Two distinct rate checks below, only one of which fails the stream:
+    /// - the per-delta **advertised-rate** check (vs the quote) `bail!`s on a
+    ///   genuine buyer *underpayment* — no wire reason exists for it and the client
+    ///   is blocked awaiting `VoucherAck`, so it cannot resend mid-stream;
+    /// - the cumulative **live-floor** check rejects cleanly with
+    ///   `VoucherRejectReason::RateFloorRaised` when a governance floor raise made
+    ///   the quote stale (#1382) — the buyer is honest and should re-quote, so this
+    ///   does NOT fail the stream, it writes the wire reason like the other
+    ///   handler-direct rejections.
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub(super) async fn collect_voucher(
         &self,
@@ -132,13 +140,39 @@ impl ClientHandler {
         // the chain read lands. `new_bytes >= delta_bytes > 0`, so `ZeroBytes`
         // cannot occur; match every arm anyway (#845) so a future `RateError`
         // variant is a build failure rather than a silent accept.
-        match verify_rate(amount, new_bytes, self.rate_bounds.floor(), 0) {
+        // Snapshot the live floor once: reused both for the check and to classify a
+        // rejection below, so the two reads cannot disagree.
+        let live_floor = self.rate_bounds.floor();
+        match verify_rate(amount, new_bytes, live_floor, 0) {
             Ok(()) => {}
             Err(RateError::Underpayment { .. }) => {
+                // The cumulative watermark prices bytes below the LIVE delivery
+                // floor, so this voucher is unredeemable on-chain
+                // (`_advanceClaimWatermark` → `RateFloorViolation`). Refusing is
+                // correct self-protection either way, but the CAUSE — and so the
+                // right signal to the buyer — splits on whether the floor rose
+                // above what this stream was quoted:
                 self.metrics.voucher_rate_floor_rejected();
                 drop(guard);
+                if live_floor > rate_per_mb {
+                    // A governance floor raise landed between the signed quote and
+                    // this voucher (#1382): the buyer is honest, its quote is just
+                    // stale. Surface the typed re-quote signal in-band rather than
+                    // an opaque `bail!` — the client should re-probe/re-quote at the
+                    // new floor, not resend this voucher.
+                    self.write_reject(send, VoucherRejectReason::RateFloorRaised)
+                        .await?;
+                    return Ok(VoucherOutcome::Rejected);
+                }
+                // The floor did NOT rise above the quote, yet the cumulative payment
+                // is still under it — a genuine underpayment the per-delta check's
+                // tolerance let through (e.g. paying ~0.99× the floor each delta, or
+                // an earlier under-floor voucher dragging the watermark). That is the
+                // buyer's fault, NOT a stale quote, so it must not read as a
+                // "floor raised — re-quote" signal; fail the stream like the
+                // per-delta underpayment above.
                 anyhow::bail!(
-                    "voucher below protocol rate floor for {delta_bytes} delivered bytes"
+                    "voucher below the cumulative rate floor for {delta_bytes} delivered bytes"
                 );
             }
             Err(e @ (RateError::ZeroBytes | RateError::Overflow)) => {

@@ -1398,6 +1398,13 @@ fn resolve_cache_into(
         .or_else(|| file.and_then(|c| c.max_blob_size_mb))
         .unwrap_or(DEFAULT_MAX_BLOB_SIZE_MB);
 
+    // Buyer-side absolute per-MB rate ceiling (#1375); `0` = unlimited (the
+    // default). CLI/env override wins over the file, matching every other knob.
+    let max_rate_per_mb = cli
+        .max_rate_per_mb
+        .or_else(|| file.and_then(|c| c.max_rate_per_mb))
+        .unwrap_or(0);
+
     bag.check_with(
         max_blob_size_mb < cache_size_mb,
         "cache.max_blob_size_mb",
@@ -1629,6 +1636,7 @@ fn resolve_cache_into(
         cache_dir,
         cache_size_mb,
         max_blob_size_mb,
+        max_rate_per_mb,
         origins,
         pinned_hashes,
         origin_retry,
@@ -5035,6 +5043,7 @@ swap_pool_address = \"0xPool\"
             cache_dir: None,
             cache_size_mb,
             max_blob_size_mb,
+            max_rate_per_mb: None,
             max_probe_holds: None,
             stake_lane_reserved_holds: None,
         }
@@ -5422,6 +5431,7 @@ swap_pool_address = \"0xPool\"
             cache_dir: None,
             cache_size_mb: None,
             max_blob_size_mb: None,
+            max_rate_per_mb: None,
             max_probe_holds: None,
             stake_lane_reserved_holds: Some(3),
         };
@@ -7101,6 +7111,7 @@ swap_pool_address = \"0xPool\"
             ("cache_dir", "DECDN_CACHE_DIR"),
             ("cache_size_mb", "DECDN_CACHE_SIZE_MB"),
             ("max_blob_size_mb", "DECDN_MAX_BLOB_SIZE_MB"),
+            ("max_rate_per_mb", "DECDN_MAX_RATE_PER_MB"),
             ("max_probe_holds", "DECDN_MAX_PROBE_HOLDS"),
             (
                 "stake_lane_reserved_holds",
@@ -7432,6 +7443,7 @@ swap_pool_address = \"0xPool\"
             cache_dir: None,
             cache_size_mb: None,
             max_blob_size_mb: None,
+            max_rate_per_mb: None,
             max_probe_holds: None,
             stake_lane_reserved_holds: None,
         }

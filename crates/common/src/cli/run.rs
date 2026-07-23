@@ -148,6 +148,14 @@ pub struct CacheArgs {
     #[arg(long, value_name = "MB", env = "DECDN_MAX_BLOB_SIZE_MB")]
     pub max_blob_size_mb: Option<u64>,
 
+    /// Buyer-side ABSOLUTE per-MB rate ceiling for paid cache-miss pulls, in USDC
+    /// base units (same units as `--rate-per-mb`) [default: 0 = unlimited]. This
+    /// node refuses a provider quote above the lower of this and the rate the
+    /// chosen candidate advertised at probe, before paying (#1375). Distinct from
+    /// the seller-side `--delivery-ceiling` clamp.
+    #[arg(long, value_name = "UNITS", env = "DECDN_MAX_RATE_PER_MB")]
+    pub max_rate_per_mb: Option<u64>,
+
     /// Max concurrently held (eviction-exempt) blobs for the probe hold
     /// (ADR 005 §Hold budget) [default: 256]. `0` disables `has_blob: true`.
     #[arg(long, value_name = "N", env = "DECDN_MAX_PROBE_HOLDS")]
