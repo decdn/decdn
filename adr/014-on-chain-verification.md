@@ -23,7 +23,7 @@ Phantom, rate, and blacklist all require verifying cryptographic signatures from
 
 Each slashing-participating message (`ProbeResponse`, `StreamResponse`) carries a single message-body signature, `slash_sig`, produced with the node's Ethereum key. Connection-level peer identity is authenticated separately by the iroh QUIC handshake against the registered Ed25519 NodeId; the body signature makes message contents portable evidence verifiable both off-chain and on-chain.
 
-The Ethereum key is the same secp256k1 key the node already holds for staking and channels. `CapacityBond.registerNode` ([ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh)) atomically binds the operator's Ethereum address to the Ed25519 NodeId, so `ecrecover` on a `slash_sig` plus a `CapacityBond.nodeIdOf(recovered)` lookup attributes the message to a NodeId. EVM-native verification costs ~3,000 gas, making routine slashing economically viable; a Solidity Ed25519 wire signature would cost ~500k–1M gas.
+The Ethereum key is the same secp256k1 key the node already holds for staking and channels. `CapacityBond.registerNode` ([ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh)) atomically binds the operator's Ethereum address to the Ed25519 NodeId, so `ecrecover` on a `slash_sig` plus a `CapacityBond.nodeIdOf(recovered)` lookup attributes the message to a NodeId. EVM-native verification costs ~3,000 gas, making routine slashing economically viable; verifying an Ed25519 wire signature in a Solidity library would cost ~500k–1M gas.
 
 ##### Wire protocol
 
