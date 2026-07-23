@@ -490,6 +490,13 @@ impl NodeFixture {
     /// single unlabelled counter/gauge by name, or `0` if it is absent (a
     /// registered-but-never-incremented counter is reported as `0`).
     ///
+    /// Because a **missing** metric reads as `0`, assert on this only as a
+    /// *delta* (`after == before + 1`), never as an absolute (`== 0`): a typo'd
+    /// or unregistered name returns `0` for both reads, so a delta assertion
+    /// still fails loudly (`0 == 0 + 1`) whereas `assert_eq!(…, 0)` would pass
+    /// vacuously. All reject counters are eagerly registered, so a correct name
+    /// never actually hits the absent-reads-as-zero path.
+    ///
     /// This reads a **per-reason** signal directly, which the wire protocol
     /// deliberately hides: `ServeRejectReason::wire_error` collapses seven
     /// distinct reject reasons onto one `StreamError::NotFound`, so an
