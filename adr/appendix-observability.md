@@ -1,14 +1,22 @@
 # Appendix: Observability and Metrics
 
-> **This is an appendix, not a core protocol ADR.** Metric implementation is consumer-side — operators choose their own monitoring stack, dashboards, and alerting. This appendix specifies a recommended naming convention, the canonical metric registry, and slash-risk alert thresholds, so that monitoring tooling and operator runbooks can converge on a common vocabulary.
+> **This is an appendix, not a core protocol ADR.** Metric implementation is consumer-side. Operators choose their own monitoring stack, dashboards, and alerting. This appendix specifies a recommended naming convention, the canonical metric registry, and slash-risk alert thresholds. Monitoring tooling and operator runbooks then share a common vocabulary.
 
 ## Context
 
-Metrics are referenced throughout the protocol ADRs and listed informally in `architecture.md § Observability`, but no single document defines: the canonical naming convention; the complete registry of names, types, and labels; which metrics are **mandatory** vs. **recommended**; alert thresholds for slash-risk metrics; and the HTTP export format and endpoint contract. Without this, operators cannot build dashboards, detect slashable conditions before they occur, or compare metrics across nodes — instrumentation becomes ad-hoc.
+Protocol ADRs reference metrics, and `architecture.md § Observability` lists them informally. No single document defines these:
+
+- the canonical naming convention;
+- the complete registry of names, types, and labels;
+- which metrics are **mandatory** vs. **recommended**;
+- alert thresholds for slash-risk metrics;
+- the HTTP export format and endpoint contract.
+
+Without this document, operators cannot build dashboards, detect slashable conditions before they occur, or compare metrics across nodes. Instrumentation becomes ad-hoc.
 
 ### Note on existing ADR names
 
-Several ADRs reference informal metric names (e.g., `gossip_messages_rejected_clock_skew`, `probe_hold_violations`, `blacklist_sync_lag_seconds` — from ADRs 001, 005, 011). This appendix is the authoritative canonical registry; the names below are the canonical forms of those informal references, with identical semantic intent.
+Several ADRs reference informal metric names (e.g., `gossip_messages_rejected_clock_skew`, `probe_hold_violations`, `blacklist_sync_lag_seconds` — from ADRs 001, 005, 011). This appendix is the authoritative canonical registry. The names below are the canonical forms of those informal references, with identical semantic intent.
 
 ## Decision
 
@@ -36,7 +44,7 @@ Metrics are grouped into **mandatory** (M) and **recommended** (R) tiers.
 
 #### Slash-Safety Metrics (all Mandatory)
 
-Early warning for the three slashable offenses in [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn), grouped here with the closely-related probe-hold capacity metrics. A sustained non-zero value for the slash-evidence and blacklist-lag **counters** requires immediate operator attention. The **gauges** (`decdn_probe_hold_slots_used`/`_max`, `decdn_blacklist_version_behind`) are normally non-zero — alert on the thresholds/rates in the table below, not on presence. `decdn_probe_hold_violations_total` is an availability/budget-pressure signal (raise `max_probe_holds`), not a slash risk — see its row.
+These give early warning for the three slashable offenses in [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn), grouped here with the closely-related probe-hold capacity metrics. A sustained non-zero value for the slash-evidence and blacklist-lag **counters** requires immediate operator attention. The **gauges** (`decdn_probe_hold_slots_used`/`_max`, `decdn_blacklist_version_behind`) are normally non-zero — alert on the thresholds/rates in the table below, not on presence. `decdn_probe_hold_violations_total` is an availability/budget-pressure signal (raise `max_probe_holds`), not a slash risk — see its row.
 
 | Metric | Type | Tier | Description |
 |--------|------|------|-------------|
@@ -139,7 +147,7 @@ Per [ADR 015](015-zero-rtt.md#adr-015-quic-0-rtt-connection-establishment). All 
 | `decdn_quic_0rtt_accepted_total` | Counter | R | 0-RTT connections accepted by server. |
 | `decdn_quic_0rtt_rejected_total` | Counter | R | 0-RTT rejected, fell back to 1-RTT. |
 
-These are the canonical forms of the identical names in [ADR 015](015-zero-rtt.md#adr-015-quic-0-rtt-connection-establishment) — identical semantics under the canonical naming regime.
+These are the canonical forms of the identically-named metrics in [ADR 015](015-zero-rtt.md#adr-015-quic-0-rtt-connection-establishment); semantics are unchanged under the canonical naming regime.
 
 #### Node / Process Metrics
 
@@ -151,7 +159,7 @@ These are the canonical forms of the identical names in [ADR 015](015-zero-rtt.m
 
 Per [ADR 026](026-tokenomics.md#adr-026-tokenomics). These metrics expose the `FeeRouter`, `CapacityBond`, and `SlashAppeal` contract surfaces to operator dashboards, keeper monitoring, and governance dashboards ([ADR 009](009-governance.md#adr-009-governance-model)).
 
-A subset is sourced from on-chain contract state (`FeeRouter`, `CapacityBond`, `SlashAppeal`, `BuybackBurner`) via the same RPC client used for blacklist polling and channel-state queries ([ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting), [ADR 003](003-payments.md#adr-003-payment-model)). They use the **same Prometheus text-format `/metrics` endpoint, scrape interval, and retention defaults** defined in Section 1 — no separate export pipeline. Contract-sourced gauges sample at the existing RPC-poll cadence; counters tracking on-chain events advance only when the node observes the corresponding event log.
+A subset comes from on-chain contract state (`FeeRouter`, `CapacityBond`, `SlashAppeal`, `BuybackBurner`) via the same RPC client used for blacklist polling and channel-state queries ([ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting), [ADR 003](003-payments.md#adr-003-payment-model)). They use the **same Prometheus text-format `/metrics` endpoint, scrape interval, and retention defaults** defined in Section 1 — no separate export pipeline. Contract-sourced gauges sample at the existing RPC-poll cadence. Counters tracking on-chain events advance only when the node observes the corresponding event log.
 
 ##### FeeRouter Metrics
 
@@ -279,7 +287,7 @@ HTTP status codes: `200` for `ready` and `degraded`; `503` for `not_ready`. Moni
 
 ### Structured Logging
 
-Metrics cover aggregates; structured logs cover per-event detail. Complementary — logs are not a substitute for metrics.
+Metrics cover aggregates; structured logs cover per-event detail. Logs complement metrics; they do not replace them.
 
 - **Library:** `tracing` crate (standard in the iroh ecosystem).
 - **Format:** JSON (`tracing-subscriber` `json` formatter) for production machine consumption. Human-readable (`pretty`) available via config flag for local development.
@@ -360,7 +368,7 @@ Covers M-tier slash-safety metrics and the most common R-tier panels for a first
 
 ### Negative
 
-- Existing ADRs reference informal names differing from the canonical ones here. The cross-reference table (Section 6) documents all renames; no ADR is retroactively edited (avoids draft-document churn), but implementations must use this appendix's canonical names.
+- Existing ADRs reference informal names differing from the canonical ones here. The cross-reference table (Section 6) documents all renames. No ADR is retroactively edited, but implementations must use this appendix's canonical names.
 - Mandatory metrics add startup complexity — all M-tier collectors must initialize before accepting connections. Small overhead for guaranteed observability.
 
 ## Deferred & Open

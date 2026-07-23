@@ -14,7 +14,7 @@ A node operator routinely holds three keys:
 
 Rotation reasons: (1) **compromise** — suspected leak, revoke **today**; (2) **scheduled hygiene** — routine annual, no time pressure; (3) **hardware migration** — host replacement, HSM enrolment, or PoC EOA → production Safe.
 
-The path differs by key and account type. This runbook is a sequenced checklist.
+The path differs by key and account type.
 
 ## Decision tree
 
