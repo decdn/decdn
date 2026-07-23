@@ -835,13 +835,20 @@ fn build_origin_with_probe_caches(
 /// their relative order. A test that needs a SPECIFIC order — cheap stallers strictly
 /// ahead of a pricier honest fallback — is otherwise racy (a staller ranked BEHIND the
 /// honest node is never tried, so its per-candidate timeout never fires). Seeding every
-/// provider at the SAME `rtt_ms` makes the recomputed rank rate-only and load-independent;
-/// the real channel-open + stream fallthrough it exercises is untouched — only probe+rank
-/// is bypassed.
+/// provider at the SAME `rtt_ms` collapses the RTT factor to a shared constant, so with
+/// the OTHER two score terms also uniform here — every candidate is at the cold-start
+/// neutral reputation (no delivery has scored anyone yet), and `1/rep²` is therefore the
+/// same for all — the score reduces to `rate_per_mb` alone and the order is
+/// load-independent. Equal-rate candidates (the stallers) still tie, and the ranker's geo
+/// / RNG tie-break decides their MUTUAL order, but a distinctly pricier fallback lands in
+/// its own higher-score group and stays strictly last regardless. The real channel-open +
+/// stream fallthrough these tests exercise is untouched — only probe+rank is bypassed.
 ///
-/// `ranked` lists `(provider, quoted rate)`; the cached path re-ranks from rate at the
-/// fixed RTT, so the slice order is just the provider set (also used to build the active
-/// staker set the cached path re-checks).
+/// `ranked` lists `(provider, quoted rate)`. On a cache hit `cached_candidates` does NOT
+/// re-probe: it rebuilds reputation and region fresh but reuses the cached
+/// `(rate_per_mb, rtt_ms)`, then re-runs `rank_candidates` — so the seeded rate + fixed
+/// RTT are what feed the score. The slice order is only the provider set (also used to
+/// build the active staker set the cached path re-checks); the rank is recomputed.
 #[allow(clippy::too_many_arguments, clippy::expect_used)]
 fn build_origin_seeded_ranking(
     ep_b: &iroh::Endpoint,
