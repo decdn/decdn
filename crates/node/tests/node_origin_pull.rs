@@ -42,7 +42,7 @@ use decdn_node::client_requester::ChannelContext;
 use decdn_node::dht::routing::{NodeId as DhtNodeId, RoutingTable};
 use decdn_node::dht::{
     ConfigStakerSet, NegativeProbeCache, NodeAddressResolver, OriginDirectory, PositiveProbeCache,
-    StakerSet, StaticNodeAddressDirectory, StaticOriginDirectory,
+    ProbedProvider, StakerSet, StaticNodeAddressDirectory, StaticOriginDirectory,
 };
 use decdn_node::leech_governor::{LeechCaps, LeechCapsConfig, LeechGovernor};
 use decdn_node::metrics::Metrics;
@@ -56,8 +56,8 @@ use decdn_protocol::client::{
 };
 use decdn_protocol::message::{ProbeResponse, ProbeResponseBody};
 use decdn_protocol::{
-    ALPN_CLIENT, ALPN_PROBE, CHUNK_SIZE, DEFAULT_VOUCHER_INTERVAL_MB, MB_BYTES, ProbeMessage,
-    decode_message, encode_message, encode_stream_request, read_frame, write_frame,
+    ALPN_CLIENT, ALPN_PROBE, CHUNK_SIZE, ContentHash, DEFAULT_VOUCHER_INTERVAL_MB, MB_BYTES,
+    ProbeMessage, decode_message, encode_message, encode_stream_request, read_frame, write_frame,
 };
 use decdn_reputation::{LocalReputation, LocalReputationConfig};
 use iroh::EndpointAddr;
@@ -823,6 +823,71 @@ fn build_origin_with_probe_caches(
         wedged_providers: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     });
     origin
+}
+
+/// [`build_origin_with_timeout`] with a DETERMINISTIC ranked order, by pre-seeding
+/// the positive probe cache so the pull takes the cached-candidates path instead of
+/// live probing.
+///
+/// The live probe measures a real localhost RTT, and RTT is a MULTIPLICATIVE term in
+/// the selection score (`rate_per_mb × rtt_ms × 1/rep²`, `selection::compute_score`):
+/// on a loaded CI runner one candidate's probe RTT can inflate past another's and flip
+/// their relative order. A test that needs a SPECIFIC order — cheap stallers strictly
+/// ahead of a pricier honest fallback — is otherwise racy (a staller ranked BEHIND the
+/// honest node is never tried, so its per-candidate timeout never fires). Seeding every
+/// provider at the SAME `rtt_ms` makes the recomputed rank rate-only and load-independent;
+/// the real channel-open + stream fallthrough it exercises is untouched — only probe+rank
+/// is bypassed.
+///
+/// `ranked` lists `(provider, quoted rate)`; the cached path re-ranks from rate at the
+/// fixed RTT, so the slice order is just the provider set (also used to build the active
+/// staker set the cached path re-checks).
+#[allow(clippy::too_many_arguments, clippy::expect_used)]
+fn build_origin_seeded_ranking(
+    ep_b: &iroh::Endpoint,
+    b_dht: DhtNodeId,
+    hash: Hash,
+    buyer: Arc<dyn ChannelOpener>,
+    local_rep: &Arc<LocalReputation>,
+    metrics: &Arc<Metrics>,
+    region_accountant: &Arc<RegionAccountant>,
+    ranked: &[(DhtNodeId, u64)],
+    addr_map: HashMap<DhtNodeId, Address>,
+    pull_timeout: Duration,
+    stall_timeout: Duration,
+) -> NodeOrigin {
+    let probe_cache = PositiveProbeCache::new();
+    probe_cache.insert(
+        ContentHash::from_bytes(*hash.as_bytes()),
+        ranked
+            .iter()
+            .map(|&(node_id, rate_per_mb)| ProbedProvider {
+                node_id,
+                rate_per_mb,
+                // Identical across candidates: the ranker's RTT term must not vary,
+                // or a loaded runner's live-probe jitter reappears through the cache.
+                rtt_ms: 1,
+            })
+            .collect(),
+    );
+    let providers = ranked.iter().map(|&(id, _)| id).collect();
+    build_origin_with_probe_caches(
+        ep_b,
+        b_dht,
+        hash,
+        buyer,
+        local_rep,
+        metrics,
+        region_accountant,
+        providers,
+        addr_map,
+        pull_timeout,
+        stall_timeout,
+        0,
+        NegativeProbeCache::new(),
+        probe_cache,
+        U256::ZERO,
+    )
 }
 
 /// Build a `NodeOrigin` whose directory maps SEVERAL hashes to the same provider set, so a
@@ -2075,7 +2140,12 @@ async fn node_origin_pull_falls_through_a_stalled_candidate() -> Result<()> {
             (*a_id.as_bytes(), "DE".to_string()),
         ]),
     ))));
-    let origin = build_origin_with_timeout(
+    // The staller quotes the cheaper `STALL_RATE` so it ranks ahead of A (`RATE`).
+    // Order is PINNED via a seeded probe cache: RTT is a multiplicative ranker term, so
+    // a loaded runner's live-probe jitter could otherwise float A ahead of the staller,
+    // deliver from A first, and leave the staller untried (no timeout, flake). See
+    // `build_origin_seeded_ranking`.
+    let origin = build_origin_seeded_ranking(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -2083,7 +2153,7 @@ async fn node_origin_pull_falls_through_a_stalled_candidate() -> Result<()> {
         &local_rep,
         &b_metrics,
         &region_accountant,
-        vec![s_dht, a_dht],
+        &[(s_dht, STALL_RATE), (a_dht, RATE)],
         addr_map,
         // Short per-candidate budget so the stall is abandoned quickly. With the
         // pre-#859 wiring an equal outer deadline would have cancelled the whole
@@ -2094,7 +2164,6 @@ async fn node_origin_pull_falls_through_a_stalled_candidate() -> Result<()> {
         // `StreamResponse`), so it must be the 1 s open budget above that abandons
         // the candidate, not the streaming inactivity bound (#1134).
         Duration::from_secs(20),
-        0,
     );
 
     // The orchestration must abandon the staller and deliver from A.
@@ -2576,7 +2645,12 @@ async fn node_origin_window_open_falls_through_a_stalled_candidate() -> Result<(
     // `open_or_reuse_channel` + verified-header exchange. At 1s a loaded CI runner
     // could abandon A too and fail the test for an unrelated reason.
     let per_candidate = Duration::from_secs(3);
-    let origin = build_origin_with_timeout(
+    // Both stallers quote the cheaper `STALL_RATE` so they rank strictly ahead of A
+    // (`RATE`). Order is PINNED via a seeded probe cache rather than a live probe: RTT
+    // is a multiplicative term in the ranker, so a loaded runner's probe jitter could
+    // otherwise float A ahead of a staller and leave it untried (only one timeout, flake).
+    // See `build_origin_seeded_ranking`.
+    let origin = build_origin_seeded_ranking(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -2584,11 +2658,10 @@ async fn node_origin_window_open_falls_through_a_stalled_candidate() -> Result<(
         &local_rep,
         &b_metrics,
         &region_accountant,
-        vec![s1_dht, s2_dht, a_dht],
+        &[(s1_dht, STALL_RATE), (s2_dht, STALL_RATE), (a_dht, RATE)],
         addr_map,
         per_candidate,
         Duration::from_secs(20),
-        0,
     );
 
     // The open loop must abandon BOTH stallers on their own budgets and open A.
