@@ -835,6 +835,7 @@ impl RuntimeReloadState {
                 cache_dir: PathBuf::from("/tmp/cache"),
                 cache_size_mb: 1024,
                 max_blob_size_mb: 128,
+                max_rate_per_mb: 0,
                 origins: Vec::new(),
                 pinned_hashes: decdn_cache::PinnedHashes::empty(),
                 origin_retry: decdn_cache::RetryPolicy::default(),
@@ -1174,6 +1175,7 @@ const fn cache_has_restart_required_field(c: &decdn_common::config::types::Cache
         cache_dir,
         cache_size_mb,
         max_blob_size_mb,
+        max_rate_per_mb,
         origin,
         origins,
         origin_retry,
@@ -1198,6 +1200,7 @@ const fn cache_has_restart_required_field(c: &decdn_common::config::types::Cache
     cache_dir.is_some()
         || cache_size_mb.is_some()
         || max_blob_size_mb.is_some()
+        || max_rate_per_mb.is_some()
         || origin.is_some()
         || origins.is_some()
         || origin_retry.is_some()
@@ -1331,6 +1334,7 @@ mod tests {
                 cache_dir: PathBuf::from("/tmp/cache"),
                 cache_size_mb: 1024,
                 max_blob_size_mb: 128,
+                max_rate_per_mb: 0,
                 origins: Vec::new(),
                 pinned_hashes: decdn_cache::PinnedHashes::empty(),
                 origin_retry: decdn_cache::RetryPolicy::default(),

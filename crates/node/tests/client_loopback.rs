@@ -45,12 +45,13 @@ use decdn_cache::{
 use decdn_incentive::{
     ChannelState, ChannelStateStore, CooperativeClose, EPHEMERAL_BINDING_NONCE,
     MemoryChannelStateStore, SignedCooperativeClose, Voucher, bind_node_id_domain,
-    binding_signing_hash, min_payment, signed_to_wire_voucher, slash_judge_domain, voucher_domain,
+    binding_signing_hash, min_payment, signed_to_wire_voucher, slash_judge_domain,
+    stream_sig::StreamSlashData, voucher_domain,
 };
 use decdn_node::client_requester::{
-    ChannelContext, ChannelLedger, Cumulative, PullDeadlines, UpstreamVoucherRejected,
-    VoucherProgress, sign_client_binding, stream_fetch, stream_fetch_shared, stream_fetch_tracked,
-    stream_fetch_tracked_with_progress,
+    ChannelContext, ChannelLedger, Cumulative, PullDeadlines, RateAboveCeiling,
+    UpstreamVoucherRejected, VoucherProgress, sign_client_binding, stream_fetch,
+    stream_fetch_shared, stream_fetch_tracked, stream_fetch_tracked_with_progress,
 };
 use decdn_node::dispatch::ConnectionLimiter;
 use decdn_node::handlers::client::{ClientHandler, ClientHandlerDeps};
@@ -1192,6 +1193,7 @@ async fn tracked_watermark_survives_post_ack_error() -> anyhow::Result<()> {
         0,
         0x00c0_ffee,
         PullDeadlines::whole_transfer(Duration::from_secs(20)),
+        0,
         0,
         &mut progress,
     )
@@ -2508,6 +2510,7 @@ async fn buyer_rejects_oversized_total_bytes() -> anyhow::Result<()> {
         0x00c1,
         PullDeadlines::whole_transfer(Duration::from_secs(10)),
         4096,
+        0,
         &mut progress,
     )
     .await
@@ -2521,6 +2524,84 @@ async fn buyer_rejects_oversized_total_bytes() -> anyhow::Result<()> {
     anyhow::ensure!(
         progress.acked().is_none(),
         "no voucher should be paid when the buyer rejects up front: {:?}",
+        progress.acked()
+    );
+
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
+/// Buyer-side RATE gate (#1375): the rate analogue of `buyer_rejects_oversized_total_bytes`.
+/// The server quotes `RATE_PER_MB` in a valid, signed `ok == true` `StreamResponse`, but the
+/// buyer's ceiling is below it. The buyer must refuse BEFORE paying a single voucher, and the
+/// abort must carry the server's OWN signed quote out as `RateAboveCeiling` evidence — that is
+/// the rate-manipulation attestation a challenger replays to `SlashJudge` with no re-signing.
+#[tokio::test(flavor = "multi_thread")]
+async fn buyer_rejects_over_ceiling_rate() -> anyhow::Result<()> {
+    let payload = vec![0x5Au8; 4096];
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+    let (store, signer, deposit) = seeded_store()?;
+    // Server quotes RATE_PER_MB (10); no size ceiling.
+    let (target, server_eth, server_ep, server_task) =
+        spawn_handler_server(cache, store, RATE_PER_MB, 0, 16).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let ctx = channel_context(signer, deposit);
+    let mut progress = VoucherProgress::default();
+    // Buyer ceiling below the quoted rate → refuse before the first paid interval.
+    let buyer_ceiling = RATE_PER_MB - 1;
+    let err = stream_fetch_tracked(
+        &client_ep,
+        target,
+        &ctx,
+        &slash_domain(),
+        server_eth.address(),
+        *hash.as_bytes(),
+        decdn_protocol::client::NO_NAMESPACE,
+        0,
+        0x00c4,
+        PullDeadlines::whole_transfer(Duration::from_secs(10)),
+        0,
+        buyer_ceiling,
+        &mut progress,
+    )
+    .await
+    .err()
+    .ok_or_else(|| anyhow::anyhow!("an over-ceiling rate must be refused by the buyer"))?;
+
+    let refused = err
+        .downcast_ref::<RateAboveCeiling>()
+        .ok_or_else(|| anyhow::anyhow!("must surface a typed RateAboveCeiling, got: {err:#}"))?;
+    anyhow::ensure!(
+        refused.quoted_rate_per_mb() == RATE_PER_MB
+            && refused.ceiling_rate_per_mb() == buyer_ceiling,
+        "the error must record the quoted rate {} and the ceiling {}, got {} / {}",
+        RATE_PER_MB,
+        buyer_ceiling,
+        refused.quoted_rate_per_mb(),
+        refused.ceiling_rate_per_mb(),
+    );
+    // The retained evidence is the server's own signed quote and still recovers to it, so a
+    // challenger can replay it to `SlashJudge` unchanged.
+    let evidence = refused.evidence();
+    anyhow::ensure!(
+        evidence.body.rate_per_mb == RATE_PER_MB && evidence.body.ok,
+        "the retained evidence must be the signed ok:true over-quote"
+    );
+    // The whole value proposition of retaining the response: its `slash_sig` still
+    // ecrecovers to the delivering operator, so it is replayable with no re-signing.
+    // (Mirrors `an_open_stage_refusal_preserves_the_signed_stream_response`.)
+    let recovered = alloy::primitives::Signature::try_from(evidence.slash_sig.as_slice())?;
+    StreamSlashData::from_response_body(&evidence.body).verify_signer(
+        &recovered,
+        server_eth.address(),
+        &slash_domain(),
+    )?;
+    anyhow::ensure!(
+        progress.acked().is_none(),
+        "no voucher may be paid when the buyer refuses the rate up front: {:?}",
         progress.acked()
     );
 
@@ -2558,12 +2639,57 @@ async fn buyer_accepts_blob_at_exact_ceiling() -> anyhow::Result<()> {
         0x00c2,
         PullDeadlines::whole_transfer(Duration::from_secs(10)),
         8192,
+        0,
         &mut progress,
     )
     .await?;
     anyhow::ensure!(
         got.as_ref() == payload.as_slice(),
         "exact-ceiling blob must deliver intact"
+    );
+
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
+/// Boundary of the buyer-side RATE gate (#1375): inclusive, like the blob-size
+/// gate above. A quote EXACTLY equal to the buyer ceiling must be accepted and
+/// deliver in full (the gate is `rate_per_mb > ceiling`, strict) — guards against
+/// a `>` → `>=` regression that would reject an honest node quoting right at the
+/// buyer's ceiling. The sibling of `buyer_accepts_blob_at_exact_ceiling`.
+#[tokio::test(flavor = "multi_thread")]
+async fn buyer_accepts_rate_at_exact_ceiling() -> anyhow::Result<()> {
+    let payload = vec![0x5Au8; 4096];
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+    let (store, signer, deposit) = seeded_store()?;
+    // Server quotes RATE_PER_MB; buyer ceiling set to EXACTLY RATE_PER_MB.
+    let (target, server_eth, server_ep, server_task) =
+        spawn_handler_server(cache, store, RATE_PER_MB, 0, 16).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let ctx = channel_context(signer, deposit);
+    let mut progress = VoucherProgress::default();
+    let got = stream_fetch_tracked(
+        &client_ep,
+        target,
+        &ctx,
+        &slash_domain(),
+        server_eth.address(),
+        *hash.as_bytes(),
+        decdn_protocol::client::NO_NAMESPACE,
+        0,
+        0x00c5,
+        PullDeadlines::whole_transfer(Duration::from_secs(10)),
+        0,
+        RATE_PER_MB, // ceiling == quote → accepted
+        &mut progress,
+    )
+    .await?;
+    anyhow::ensure!(
+        got.as_ref() == payload.as_slice(),
+        "a quote exactly at the buyer ceiling must deliver intact"
     );
 
     client_ep.close().await;
@@ -2610,7 +2736,8 @@ async fn progress_callback_reports_monotonic_delivery() -> anyhow::Result<()> {
         0,
         0x00c3,
         PullDeadlines::whole_transfer(Duration::from_secs(10)),
-        0, // unlimited buyer ceiling
+        0, // unlimited buyer blob-size ceiling
+        0, // unlimited buyer rate ceiling
         &mut progress,
         Some(&record),
     )
@@ -3214,6 +3341,7 @@ async fn client_concurrent_same_channel_both_succeed() -> anyhow::Result<()> {
             0x00aa,
             PullDeadlines::whole_transfer(Duration::from_secs(15)),
             0,
+            0,
         ),
         stream_fetch_shared(
             &client_ep,
@@ -3226,6 +3354,7 @@ async fn client_concurrent_same_channel_both_succeed() -> anyhow::Result<()> {
             0,
             0x00bb,
             PullDeadlines::whole_transfer(Duration::from_secs(15)),
+            0,
             0,
         ),
     );

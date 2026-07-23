@@ -469,7 +469,7 @@ async fn assert_refused_not_found(
         })?;
     let code = refused
         .downcast_ref::<UpstreamRefused>()
-        .map(|r| r.error.clone())
+        .map(|r| r.error().clone())
         .with_context(|| format!("{label}: expected a signed refusal, got: {refused:#}"))?;
     assert_eq!(code, StreamError::NotFound, "{label}: refusal code");
     let after = node.scrape_metric(UNAUTHORIZED_ORIGIN_METRIC).await?;

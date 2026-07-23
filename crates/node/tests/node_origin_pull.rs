@@ -813,6 +813,7 @@ fn build_origin_with_probe_caches(
             pull_timeout,
             stall_timeout,
             max_blob_size_bytes,
+            max_rate_per_mb: 0,
             enable_0rtt: false,
             deposit_hint: U256::from(DEPOSIT_MICRO_USDC),
             lookup: decdn_node::dht::LookupConfig::default(),
@@ -872,6 +873,7 @@ fn build_origin_multi_hash(
             pull_timeout,
             stall_timeout,
             max_blob_size_bytes: 0,
+            max_rate_per_mb: 0,
             enable_0rtt: false,
             deposit_hint: U256::from(DEPOSIT_MICRO_USDC),
             lookup: decdn_node::dht::LookupConfig::default(),
@@ -6082,6 +6084,134 @@ async fn node_origin_oversized_claim_is_rejected_without_scoring() -> Result<()>
     Ok(())
 }
 
+/// #1375: the buyer-side rate ceiling on the real node pull path — and specifically
+/// its PROBE-RELATIVE bound, with the absolute config ceiling left unbounded (`0`).
+/// Node A probes cheap (`RATE/2`) but its `ClientHandler` signs a stream quote at
+/// the full `RATE` — the "quote low on the probe, quote high on the stream"
+/// bait-and-switch. The buyer's effective ceiling is
+/// `effective_rate_ceiling(candidate.rate = RATE/2, config = 0) = RATE/2`, so the
+/// `RATE` quote is refused BEFORE any voucher, classified `PullVerdict::RateCeiling`.
+///
+/// This is the only test that pins `candidate.rate_per_mb` is actually bound as the
+/// ceiling (the loopback test passes an explicit ceiling and bypasses
+/// `effective_rate_ceiling`/`node_origin`). Like the oversized-claim sibling it
+/// asserts the provider is NOT scored (buyer policy, not provider fault) and the
+/// dedicated counter moves.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::expect_used, clippy::too_many_lines)] // test setup; failures should panic loudly
+async fn node_origin_over_ceiling_rate_is_rejected_without_scoring() -> Result<()> {
+    let payload = vec![0xABu8; PAYLOAD_LEN];
+    let hash = Hash::new(&payload);
+    let total_bytes = u64::try_from(PAYLOAD_LEN).unwrap_or(u64::MAX);
+    let probe_rate = RATE / 2; // A advertises cheap at probe...
+
+    // --- Node A: holds the blob, probes at `probe_rate` but its handler quotes `RATE`.
+    let (cache_a, hash_a, _tmp_a) = cache_with_blob(&payload).await?;
+    anyhow::ensure!(hash_a == hash, "fixture hash mismatch");
+    let a_sk = fresh_key();
+    let a_id = a_sk.public();
+    let a_eth = Arc::new(PrivateKeySigner::random());
+    let b_buyer = Arc::new(PrivateKeySigner::random());
+    let channel_id = B256::repeat_byte(0xA2);
+    let store_a = Arc::new(MemoryChannelStateStore::new());
+    store_a.record(&ChannelState::new(
+        channel_id,
+        b_buyer.address(),
+        TOKEN,
+        U256::from(DEPOSIT_MICRO_USDC),
+    ))?;
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let domains = HandlerDomains {
+        slash: slash_domain(),
+        voucher: voucher_dom(),
+        binding: binding_dom(),
+    };
+    // Handler advertises the full RATE, so its signed stream quote is RATE.
+    let handler_a = build_handler_full(
+        a_id,
+        &a_eth,
+        &metrics,
+        limiter,
+        cache_a,
+        store_a as Arc<dyn ChannelStateStore>,
+        RATE,
+        &domains,
+        0, // server blob ceiling unlimited — isolate the RATE gate.
+        16,
+    )?;
+    let (ep_a, addr_a) =
+        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    // The probe leg answers at the LOWER probe_rate, so the candidate is selected on RATE/2.
+    let task_a = spawn_a_server(
+        ep_a.clone(),
+        handler_a,
+        Arc::clone(&a_eth),
+        slash_domain(),
+        total_bytes,
+        probe_rate,
+    );
+
+    // --- Node B: dial-only buyer with an UNBOUNDED absolute rate ceiling (default 0).
+    let b_sk = fresh_key();
+    let b_id = b_sk.public();
+    let (ep_b, _addr_b) = local_endpoint(b_sk, vec![]).await?;
+    let _ = probe_once(
+        &ep_b,
+        EndpointAddr::new(a_id).with_ip_addr(addr_a),
+        *hash.as_bytes(),
+        1,
+        false,
+        None,
+        Duration::from_secs(10),
+    )
+    .await?;
+
+    let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
+    let b_metrics = Arc::new(Metrics::new());
+    let (providers, addr_map) =
+        one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
+    // `0` ceiling => unlimited blob size, so the blob gate cannot fire; the origin's
+    // NodeOriginConfig.max_rate_per_mb defaults to 0, so only the probe-relative
+    // bound applies — exactly what we are exercising.
+    let origin = provisioned_origin_with_ceiling(
+        &ep_b,
+        DhtNodeId::from_bytes(*b_id.as_bytes()),
+        hash,
+        channel_id,
+        &b_buyer,
+        &local_rep,
+        &b_metrics,
+        providers,
+        addr_map,
+        0,
+    );
+
+    let got = Origin::fetch(&origin, hash, u64::MAX)
+        .await
+        .map_err(|e| anyhow::anyhow!("fetch: {e}"))?;
+    anyhow::ensure!(
+        matches!(got, OriginFetch::NotFound),
+        "an over-ceiling quote must not surface bytes (NotFound)"
+    );
+    // Buyer policy, not provider fault: the provider's local score stays neutral.
+    anyhow::ensure!(
+        (local_rep.score(a_id) - 0.5).abs() < f64::EPSILON,
+        "provider score must stay neutral after a rate-ceiling rejection, got {}",
+        local_rep.score(a_id)
+    );
+    assert_counter(&b_metrics, "node_pull_attempts_total", 1)?;
+    assert_counter(&b_metrics, "node_pull_rate_above_ceiling_total", 1)?;
+    assert_counter(&b_metrics, "node_pull_success_total", 0)?;
+    assert_counter(&b_metrics, "node_pull_unreachable_total", 0)?;
+    assert_counter(&b_metrics, "node_pull_corruption_total", 0)?;
+
+    ep_b.close().await;
+    ep_a.close().await;
+    task_a.await?;
+    Ok(())
+}
+
 /// The #852 regression: a second cache-miss pull to the same provider **reuses**
 /// the buyer channel and resumes from the persisted voucher watermark, so it
 /// signs `nonce = 3, 4 …` (not a stale `nonce = 1`) and the upstream accepts it.
@@ -8629,6 +8759,7 @@ async fn two_concurrent_pulls_to_one_provider_share_the_channel_ledger() -> Resu
             pull_timeout: Duration::from_secs(20),
             stall_timeout: Duration::from_secs(20),
             max_blob_size_bytes: 0,
+            max_rate_per_mb: 0,
             enable_0rtt: false,
             deposit_hint: U256::from(DEPOSIT_MICRO_USDC),
             lookup: decdn_node::dht::LookupConfig::default(),
@@ -11101,6 +11232,7 @@ async fn a_probe_cache_hit_drops_a_provider_no_longer_admitted() -> Result<()> {
             pull_timeout: Duration::from_secs(20),
             stall_timeout: Duration::from_secs(20),
             max_blob_size_bytes: 0,
+            max_rate_per_mb: 0,
             enable_0rtt: false,
             deposit_hint: U256::from(DEPOSIT_MICRO_USDC),
             lookup: decdn_node::dht::LookupConfig::default(),

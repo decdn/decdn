@@ -1802,6 +1802,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
             .cache
             .max_blob_size_mb
             .saturating_mul(decdn_protocol::MB_BYTES),
+        max_rate_per_mb: cfg.cache.max_rate_per_mb,
         enable_0rtt: cfg.network.enable_0rtt,
         deposit_hint: U256::from(cfg.blockchain.buyer_deposit_micro_usdc),
         lookup: crate::dht::LookupConfig::default(),
@@ -3666,6 +3667,7 @@ mod tests {
                 cache_dir,
                 cache_size_mb: 1024,
                 max_blob_size_mb: 128,
+                max_rate_per_mb: 0,
                 origins,
                 pinned_hashes: decdn_cache::PinnedHashes::empty(),
                 origin_retry: decdn_cache::RetryPolicy::default(),
