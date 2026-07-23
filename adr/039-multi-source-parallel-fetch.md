@@ -5,60 +5,60 @@
 
 ## Context
 
-[ADR 038](038-bao-verified-range-streaming.md#adr-038-bao-verified-range-streaming-on-cdnclientv1) makes any byte range of a blob independently verifiable against the BLAKE3 content-hash root: a range fetched from one node is checked against the root on its own, and a lying source corrupts only the range it served. That property is the safety precondition for fetching a single blob from **several sources at once** — but that ADR deliberately stops at verification and defers the orchestration that exploits it. This ADR specifies that orchestration.
+[ADR 038](038-bao-verified-range-streaming.md#adr-038-bao-verified-range-streaming-on-cdnclientv1) makes any byte range of a blob verifiable against the BLAKE3 content-hash root on its own. A lying source corrupts only the range it served. This property is the safety precondition for fetching one blob from **several sources at once**. That ADR stops at verification and defers the orchestration. This ADR specifies that orchestration.
 
-A client today fetches a blob over a single `cdn/client/v1` stream to a single node, sequentially from `byte_offset` to the end ([ADR 005 § `cdn/client/v1`](005-protocol.md#cdnclientv1--paid-delivery-protocol)). Throughput is therefore bounded by one peer's upload bandwidth and one path's latency, even when many nodes hold the blob. The orchestration problem — who fetches which bytes from whom, with what concurrency, and what happens when a source is slow, drops, or serves bad bytes — is unsolved and is what a scheduler owns.
+Today a client fetches a blob over one `cdn/client/v1` stream to one node, sequentially from `byte_offset` to the end ([ADR 005 § `cdn/client/v1`](005-protocol.md#cdnclientv1--paid-delivery-protocol)). Throughput is therefore bounded by one peer's upload bandwidth and one path's latency, even when many nodes hold the blob. The scheduler owns the unsolved problem: who fetches which bytes from whom, at what concurrency, and what happens when a source is slow, drops, or serves bad bytes.
 
 Two constraints shape the design:
 
-- **Discovery is hash-level.** A node publishes a `cdn/dht/v1` STORE for a blob only when it holds the blob **in full** ([ADR 037 § DHT advertising stays whole-blob](037-regional-proxy-warming.md#dht-advertising-stays-whole-blob)); range-addressed availability is deferred. So every discoverable source is a **full holder** that can serve any range. Partial copies (e.g. warmed fragments under [ADR 037](037-regional-proxy-warming.md#adr-037-latency-driven-proxy-warming-for-regional-locality)) are not range-discoverable and are out of the source set for this ADR.
-- **Delivery is self-enforcing.** Payment and delivery are coupled per stream: the payer stops sending vouchers → the node stops sending chunks, and vice versa ([ADR 005 § Voucher interval negotiation](005-protocol.md#voucher-interval-negotiation)). A bounded sub-range is obtained by requesting from its start offset and ceasing payment at its end, with no end-offset field on the wire.
+- **Discovery is hash-level.** A node publishes a `cdn/dht/v1` STORE for a blob only when it holds the blob **in full** ([ADR 037 § DHT advertising stays whole-blob](037-regional-proxy-warming.md#dht-advertising-stays-whole-blob)); range-addressed availability is deferred. So every discoverable source is a **full holder** that can serve any range. Partial copies (for example warmed fragments under [ADR 037](037-regional-proxy-warming.md#adr-037-latency-driven-proxy-warming-for-regional-locality)) are not range-discoverable and are out of the source set for this ADR.
+- **Delivery is self-enforcing.** Payment and delivery are coupled per stream: the payer stops sending vouchers → the node stops sending chunks, and the reverse ([ADR 005 § Voucher interval negotiation](005-protocol.md#voucher-interval-negotiation)). To obtain a bounded sub-range, request from its start offset and cease payment at its end. There is no end-offset field on the wire.
 
-Because every source is a full holder serving from its own store rather than pulling through, parallel fetch reduces to partitioning `[0, total_bytes)` across full holders, verifying each part against the root ([ADR 038](038-bao-verified-range-streaming.md#adr-038-bao-verified-range-streaming-on-cdnclientv1)), and reassembling — with the failure handling that any untrusted-multi-peer transfer requires. This is the BitTorrent model with a Merkle-verified content address in place of a piece-hash list.
+Every source is a full holder that serves from its own store rather than pulling through. So parallel fetch reduces to partitioning `[0, total_bytes)` across full holders, verifying each part against the root ([ADR 038](038-bao-verified-range-streaming.md#adr-038-bao-verified-range-streaming-on-cdnclientv1)), and reassembling — plus the failure handling that any untrusted-multi-peer transfer requires. This is the BitTorrent model with a Merkle-verified content address in place of a piece-hash list.
 
 ## Decision
 
-A client fetching a blob it expects to be large enough to benefit MAY run a **multi-source scheduler**: it selects a set of full holders, partitions the blob into bao-aligned work units, assigns units to sources dynamically, verifies each completed unit against the content-hash root, re-dispatches failed units, and hedges the final stragglers. Each source is driven by an ordinary `cdn/client/v1` paid stream, so the mechanism introduces **no new wire surface** — it is a client-side orchestration policy over the existing protocol.
+A client fetching a blob it expects to be large enough to benefit MAY run a **multi-source scheduler**. The scheduler selects a set of full holders, partitions the blob into bao-aligned work units, assigns units to sources dynamically, verifies each completed unit against the content-hash root, re-dispatches failed units, and hedges the final stragglers. Each source is driven by an ordinary `cdn/client/v1` paid stream. The mechanism adds **no new wire surface**: it is a client-side orchestration policy over the existing protocol.
 
 ### Source set and selection
 
-The candidate set is the full holders returned by `cdn/dht/v1` FIND_VALUE for the hash ([ADR 022 § FIND_VALUE Flow](022-content-discovery.md#find_value-flow-cache-miss--dht-lookup)), filtered to reputation ≥ the client's minimum-reputation floor ([ADR 001 § Minimum-reputation rejection floor](001-network.md#minimum-reputation-rejection-floor)) and probed for live availability, RTT, and `rate_per_mb` ([ADR 005 § `cdn/probe/v1`](005-protocol.md#cdnprobev1--latency-probe)). The client admits up to `max_sources` of them, preferring lower RTT and lower rate, and — where the candidate metadata allows — spreading across distinct operators and regions ([§ Source diversity](#source-diversity-and-reputation)). A blob with fewer than two admissible holders falls back to single-source delivery.
+The candidate set is the full holders that `cdn/dht/v1` FIND_VALUE returns for the hash ([ADR 022 § FIND_VALUE Flow](022-content-discovery.md#find_value-flow-cache-miss--dht-lookup)). The client filters this set to reputation ≥ its minimum-reputation floor ([ADR 001 § Minimum-reputation rejection floor](001-network.md#minimum-reputation-rejection-floor)) and probes each for live availability, RTT, and `rate_per_mb` ([ADR 005 § `cdn/probe/v1`](005-protocol.md#cdnprobev1--latency-probe)). The client admits up to `max_sources`, preferring lower RTT and lower rate. Where candidate metadata allows, it spreads the set across distinct operators and regions ([§ Source diversity](#source-diversity-and-reputation)). A blob with fewer than two admissible holders falls back to single-source delivery.
 
 ### Work-unit partitioning and dynamic assignment
 
-The blob is divided into fixed-size **work units** aligned to bao chunk-group boundaries (`work_unit_bytes`, a small multiple of the 16 KiB group size — e.g. a few MB), so each unit is independently verifiable. Assignment is **dynamic, not a static split**: units sit in a work queue, and each source is handed the next unit when it has capacity. A faster source naturally completes more units; the client never needs to know peer bandwidth in advance, and a source that slows down simply stops drawing new units. This work-stealing discipline adapts to heterogeneous and time-varying source speed without re-planning.
+The blob is divided into fixed-size **work units** aligned to bao chunk-group boundaries (`work_unit_bytes`, a small multiple of the 16 KiB group size — for example a few MB), so each unit is independently verifiable. Assignment is **dynamic, not a static split**: units sit in a work queue, and each source is handed the next unit when it has capacity. A faster source completes more units; the client never needs to know peer bandwidth in advance, and a source that slows down stops drawing new units. This work-stealing discipline adapts to heterogeneous and time-varying source speed without re-planning.
 
-Each source runs up to `per_source_inflight` units concurrently, and the scheduler caps total concurrency at `max_inflight_units`. A source serves a unit by a `cdn/client/v1` `StreamRequest` at the unit's start offset; the client accepts `work_unit_bytes` of verified data, ceases vouchers, and closes — the unit's end is enforced by stopping payment, not by a wire bound. Because full holders serve from disk, over-read past the unit boundary is at most the in-flight voucher window, not a speculative whole-blob pull.
+Each source runs up to `per_source_inflight` units concurrently, and the scheduler caps total concurrency at `max_inflight_units`. A source serves a unit by a `cdn/client/v1` `StreamRequest` at the unit's start offset; the client accepts `work_unit_bytes` of verified data, ceases vouchers, and closes. The unit's end is enforced by stopping payment, not by a wire bound. Because full holders serve from disk, over-read past the unit boundary is at most the in-flight voucher window, not a speculative whole-blob pull.
 
 ### Reassembly
 
-Verified units are written into the local partial blob at their offsets; `iroh-blobs` partial blobs track which ranges are held and verified, so out-of-order arrival is first-class. The blob is complete when every unit is verified and stored. On completion the node may publish its own STORE per the existing cache-commit loop ([ADR 022 § STORE Flow](022-content-discovery.md#store-flow-cache-event--dht-publish)).
+Verified units are written into the local partial blob at their offsets. `iroh-blobs` partial blobs track which ranges are held and verified, so out-of-order arrival is first-class. The blob is complete when every unit is verified and stored. On completion the node may publish its own STORE per the existing cache-commit loop ([ADR 022 § STORE Flow](022-content-discovery.md#store-flow-cache-event--dht-publish)).
 
 ### Failure handling and re-dispatch
 
 A unit is re-queued — and reassigned to a **different** source — when its source:
 
-- **Fails verification.** The bao decoder rejects the unit against the root ([ADR 038](038-bao-verified-range-streaming.md#adr-038-bao-verified-range-streaming-on-cdnclientv1)). This is cryptographic proof the bytes do not match the committed content and is recorded as a reputation penalty and a slashing-evidence candidate against the signed `StreamResponse` ([ADR 014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence)).
+- **Fails verification.** The bao decoder rejects the unit against the root ([ADR 038](038-bao-verified-range-streaming.md#adr-038-bao-verified-range-streaming-on-cdnclientv1)). This is cryptographic proof the bytes do not match the committed content. It is recorded as a reputation penalty and a slashing-evidence candidate against the signed `StreamResponse` ([ADR 014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence)).
 - **Stalls.** No verified progress within `unit_deadline_ms`.
 - **Drops or errors.** The stream closes or returns `ok: false`.
 
-Re-dispatch is unit-scoped: only the failed unit is reassigned; verified units already stored are untouched, so a bad or vanished source never restarts the download. A source that accumulates failures is dropped from the set and MAY be backfilled from the remaining FIND_VALUE candidates.
+Re-dispatch is unit-scoped: only the failed unit is reassigned; verified units already stored are untouched. So a bad or vanished source never restarts the download. A source that accumulates failures is dropped from the set and MAY be backfilled from the remaining FIND_VALUE candidates.
 
 ### Endgame hedging
 
-When the queue is empty but a few units remain outstanding on slow sources, the scheduler enters **endgame**: it re-requests each outstanding unit from one or more idle, faster sources in parallel. The first source to return a verified copy wins; the duplicate request is cancelled. This bounds tail latency — one slow source cannot hold up completion — at the cost of paying more than once for the racing units (each source is paid for the verified bytes it delivered before cancellation). Hedging is confined to the endgame phase and to at most `endgame_hedge` duplicates per unit, so the double-pay is bounded and small relative to the blob.
+When the queue is empty but a few units remain outstanding on slow sources, the scheduler enters **endgame**: it re-requests each outstanding unit from one or more idle, faster sources in parallel. The first source to return a verified copy wins, and every remaining duplicate request for that unit is cancelled. This bounds tail latency — one slow source cannot hold up completion — at the cost of paying more than once for the racing units. Each source is paid for the verified bytes it delivered before cancellation. Hedging is confined to the endgame phase and to at most `endgame_hedge` duplicates per unit, so the double-pay is bounded and small relative to the blob.
 
 ### Payment and channels
 
-Each source is paid over its own payment channel with cumulative per-channel vouchers ([ADR 003 § Payment Model](003-payments.md#adr-003-payment-model)); a source is paid only for the verified bytes it delivered. The client must hold, per admitted source, a channel whose remaining deposit covers the bytes it expects to assign that source — mirroring the node-side pre-flight deposit guard ([ADR 037 § Implementation status](037-regional-proxy-warming.md#implementation-status-856)) from the payer's side. Sources price independently via `rate_per_mb`; the selection preference for cheaper sources and the work-stealing bias toward faster ones together steer spend, with no cross-source settlement — each channel is independent.
+Each source is paid over its own payment channel with cumulative per-channel vouchers ([ADR 003 § Payment Model](003-payments.md#adr-003-payment-model)), and only for the verified bytes it delivered. Per admitted source, the client must hold a channel whose remaining deposit covers the bytes it expects to assign to that source. This mirrors the node-side pre-flight deposit guard ([ADR 037 § Implementation status](037-regional-proxy-warming.md#implementation-status-856)) from the payer's side. Sources price independently via `rate_per_mb`. The selection preference for cheaper sources and the work-stealing bias toward faster ones together steer spend. There is no cross-source settlement — each channel is independent.
 
 ### Engagement gate
 
-Multi-source fetch engages only when it pays for itself: the blob's advertised `total_bytes` exceeds `multi_source_min_bytes` **and** at least two holders clear the selection floor. Otherwise the client uses the single-source path unchanged. The gate keeps the channel-setup and coordination overhead off small fetches, where one fast source is already optimal.
+Multi-source fetch engages only when it pays for itself: the blob's advertised `total_bytes` exceeds `multi_source_min_bytes` **and** at least two holders clear the selection floor. Otherwise the client uses the single-source path unchanged. The gate keeps channel-setup and coordination overhead off small fetches, where one fast source is already optimal.
 
 ### Source diversity and reputation
 
-Per-source outcomes feed the local reputation EWMA ([ADR 008](008-reputation.md#adr-008-reputation-system)): verified delivery raises a source's score; stalls, drops, and verification failures lower it. Where holder metadata permits, the scheduler prefers a set spread across distinct operators and regions, so that no single operator serves all units — bounding the blast radius of a misbehaving operator to re-dispatchable units and avoiding a self-inflicted eclipse onto one party.
+Per-source outcomes feed the local reputation EWMA ([ADR 008](008-reputation.md#adr-008-reputation-system)): verified delivery raises a source's score; stalls, drops, and verification failures lower it. Where holder metadata permits, the scheduler prefers a set spread across distinct operators and regions, so that no single operator serves all units. This bounds the blast radius of a misbehaving operator to re-dispatchable units and avoids a self-inflicted eclipse onto one party.
 
 ### Scope boundary
 
@@ -77,13 +77,13 @@ This ADR schedules across **full holders only**. Composing a blob from **partial
 | `unit_deadline_ms` | client-set | Verified-progress deadline before a unit is re-dispatched. |
 | `endgame_hedge` | small finite (e.g. 1–2) | Max duplicate requests per outstanding unit during endgame. |
 
-Concrete defaults are modeled before locking; the load-bearing commitments are that `max_sources`, `max_inflight_units`, and `endgame_hedge` are finite (bounding channel count, concurrency, and double-pay) and that `work_unit_bytes` is bao-group-aligned (so every unit is independently verifiable).
+Concrete defaults are modeled before locking. The load-bearing commitments are that `max_sources`, `max_inflight_units`, and `endgame_hedge` are finite (bounding channel count, concurrency, and double-pay), and that `work_unit_bytes` is bao-group-aligned (so every unit is independently verifiable).
 
 ## Consequences
 
 ### Positive
 
-- Aggregate download throughput scales with the number of admitted sources rather than one peer's upload bandwidth; tail latency is bounded by endgame hedging rather than the slowest source.
+- Aggregate download throughput scales with the number of admitted sources rather than one peer's upload bandwidth; endgame hedging bounds tail latency rather than the slowest source.
 - No new wire surface: each source is an ordinary `cdn/client/v1` paid stream, bounded by the existing voucher backpressure. The mechanism is a pure client-side policy.
 - A corrupt or vanished source costs only a unit re-dispatch, never a restart — the verified-range property ([ADR 038](038-bao-verified-range-streaming.md#adr-038-bao-verified-range-streaming-on-cdnclientv1)) localizes every failure.
 - Verification failures yield cryptographic slashing evidence and reputation signal, so multi-source fetch hardens the network against bad sources rather than merely tolerating them.
@@ -98,9 +98,9 @@ Concrete defaults are modeled before locking; the load-bearing commitments are t
 
 ### Risks
 
-- **Parameter drift.** `max_sources` or `max_inflight_units` set too high wastes connections and deposit on marginal throughput; `work_unit_bytes` too small inflates proof overhead and request count, too large coarsens load-balancing and re-dispatch cost. Defaults are modeled and client-tunable.
-- **Source collusion / eclipse.** A set dominated by one operator concentrates failure and pricing power. Mitigated by the diversity preference and reputation floor, but the client depends on accurate holder metadata to spread the set.
-- **Deposit fragmentation.** Spreading deposit across many channels can leave each too thin if assignment shifts; mitigated by sizing channels to expected assignment and backfilling from the candidate set rather than over-committing up front.
+- **Parameter drift.** `max_sources` or `max_inflight_units` set too high wastes connections and deposit on marginal throughput. `work_unit_bytes` too small inflates proof overhead and request count; too large coarsens load-balancing and re-dispatch cost. Defaults are modeled and client-tunable.
+- **Source collusion / eclipse.** A set dominated by one operator concentrates failure and pricing power. The diversity preference and reputation floor mitigate this, but the client depends on accurate holder metadata to spread the set.
+- **Deposit fragmentation.** Spreading deposit across many channels can leave each too thin if assignment shifts. Mitigated by sizing channels to expected assignment and backfilling from the candidate set rather than over-committing up front.
 
 ## Cross-ADR Impact
 
