@@ -344,6 +344,7 @@ pub fn resolve_config(config_path: Option<&Path>, cli: &RunArgs) -> anyhow::Resu
 
     ensure_region_when_publishing_global_into(&identity, &gossip, &mut bag);
     validate_port_layout_into(&network, &observability, &mut bag);
+    ensure_no_hash_pinned_and_denied_into(&cache, &content, &mut bag);
 
     bag.into_result()?;
 
@@ -400,6 +401,53 @@ fn ensure_region_when_publishing_global_into(
          (it signs every NodeAnnounce); set identity.region or disable the \
          global topic by setting gossip.subscribe_global = false",
     );
+}
+
+/// Reject a hash that is simultaneously **pinned** (`cache.pinned_hashes`, held
+/// forever and excluded from LRU eviction) and **denied**
+/// (`content.denied_hashes`, which the serve gate refuses) — arguably the worst
+/// combination on a takedown: the pin keeps the bytes on disk indefinitely while
+/// the deny-set makes them unservable, so the operator pays storage for content
+/// they cannot serve. An operator almost certainly meant one or the other.
+///
+/// Cross-section because the two lists live in different config sections, so it
+/// belongs at the resolver boundary alongside the port-layout check rather than
+/// inside either single-section resolver.
+///
+/// Scope: this is a *static local-config* check only. The on-chain governance
+/// deny-set (fed at runtime through `CacheEngine::set_chain_denied`) can still
+/// collide with a pinned hash after startup; no static check can catch that.
+// Single-section shim preserving the `anyhow::Result` API for the unit tests;
+// `resolve_config` uses the `*_into` worker with the shared bag instead.
+#[cfg(test)]
+fn ensure_no_hash_pinned_and_denied(
+    cache: &ResolvedCache,
+    content: &ResolvedContent,
+) -> anyhow::Result<()> {
+    one_section(|bag| ensure_no_hash_pinned_and_denied_into(cache, content, bag))
+}
+
+fn ensure_no_hash_pinned_and_denied_into(
+    cache: &ResolvedCache,
+    content: &ResolvedContent,
+    bag: &mut ConfigErrorBag,
+) {
+    let mut both: Vec<String> = cache
+        .pinned_hashes
+        .iter()
+        .filter(|&h| content.denied_hashes.contains(h))
+        .map(ToString::to_string)
+        .collect();
+    both.sort();
+    bag.check_with(both.is_empty(), "content.denied_hashes", || {
+        format!(
+            "hash(es) appear in both cache.pinned_hashes and \
+             content.denied_hashes: {}. A pinned hash is held forever (excluded \
+             from eviction) while a denied hash is refused by the serve gate — \
+             remove each from one of the two lists",
+            both.join(", ")
+        )
+    });
 }
 
 /// Cross-section check on the running node's port assignments. Lives at the
@@ -2180,9 +2228,13 @@ fn parse_hash_list(
 /// Parse the operator-supplied `content.denied_origins` list (ADR 011 §Local
 /// Denylist) into a set of operator addresses.
 ///
-/// Reuses [`crate::address::parse_nonzero_address`], so the zero address is
-/// rejected: it can never own a payment channel, and accepting it would let a
-/// stray empty string sit in the denylist reading as a real entry.
+/// These are operator **EOAs**, not contract addresses, so this does NOT use
+/// [`crate::address::parse_nonzero_address`] — that helper's zero-address hint
+/// ("set it to the deployed contract address") is wrong advice for a denylist of
+/// operator accounts (see the note on that fn). The zero address is still
+/// rejected — it can never own a payment channel, and accepting it would let a
+/// stray empty string sit in the denylist reading as a real entry — but with an
+/// operator-appropriate message.
 pub fn parse_denied_origins(
     raw: Option<&[String]>,
 ) -> anyhow::Result<std::collections::HashSet<alloy::primitives::Address>> {
@@ -2192,7 +2244,13 @@ pub fn parse_denied_origins(
     };
     for (idx, entry) in entries.iter().enumerate() {
         let label = format!("content.denied_origins[{idx}]");
-        out.insert(crate::address::parse_nonzero_address(entry.trim(), &label)?);
+        let addr = crate::address::parse_address(entry.trim(), &label)?;
+        anyhow::ensure!(
+            addr != alloy::primitives::Address::ZERO,
+            "{label} must not be the zero address — list a real operator address, \
+             or remove the entry"
+        );
+        out.insert(addr);
     }
     Ok(out)
 }
@@ -5243,6 +5301,72 @@ swap_pool_address = \"0xPool\"
         let zero = vec!["0x0000000000000000000000000000000000000000".to_string()];
         assert!(parse_denied_origins(Some(&zero)).is_err(), "zero rejected");
         assert!(parse_denied_origins(Some(&["nope".to_string()])).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn parse_denied_origins_zero_error_advises_an_operator_not_a_contract() {
+        let zero = vec!["0x0000000000000000000000000000000000000000".to_string()];
+        let err = parse_denied_origins(Some(&zero))
+            .expect_err("zero rejected")
+            .to_string();
+        assert!(
+            err.contains("operator address"),
+            "denylist zero-address advice should be operator-oriented: {err}"
+        );
+        assert!(
+            !err.contains("deployed contract address"),
+            "denylist must not reuse the contract-address hint: {err}"
+        );
+    }
+
+    #[test]
+    fn pinned_and_denied_hash_collision_is_rejected() -> anyhow::Result<()> {
+        let shared = "cd".repeat(32);
+        let cli = cache_cli(None, None);
+        let cache_file = types::CacheConfig {
+            pinned_hashes: Some(vec![shared.clone(), "ab".repeat(32)]),
+            ..types::CacheConfig::default()
+        };
+        let content_file = types::ContentConfig {
+            denied_hashes: Some(vec![shared.clone()]),
+            ..types::ContentConfig::default()
+        };
+        let mut bag = ConfigErrorBag::new();
+        let cache = resolve_cache_into(&cli, Some(&cache_file), Path::new("/tmp"), &mut bag);
+        let content = resolve_content_into(Some(&content_file), &mut bag);
+        bag.into_result()?; // each section parses fine on its own
+
+        let err = ensure_no_hash_pinned_and_denied(&cache, &content)
+            .expect_err("a hash in both lists must be rejected")
+            .to_string();
+        assert!(
+            err.contains(&shared),
+            "error should name the colliding hash: {err}"
+        );
+        assert!(
+            err.contains("content.denied_hashes"),
+            "error should name the field: {err}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn disjoint_pinned_and_denied_hashes_are_accepted() -> anyhow::Result<()> {
+        let cli = cache_cli(None, None);
+        let cache_file = types::CacheConfig {
+            pinned_hashes: Some(vec!["ab".repeat(32)]),
+            ..types::CacheConfig::default()
+        };
+        let content_file = types::ContentConfig {
+            denied_hashes: Some(vec!["cd".repeat(32)]),
+            ..types::ContentConfig::default()
+        };
+        let mut bag = ConfigErrorBag::new();
+        let cache = resolve_cache_into(&cli, Some(&cache_file), Path::new("/tmp"), &mut bag);
+        let content = resolve_content_into(Some(&content_file), &mut bag);
+        bag.into_result()?;
+        ensure_no_hash_pinned_and_denied(&cache, &content)?;
         Ok(())
     }
 

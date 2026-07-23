@@ -680,9 +680,12 @@ pub struct ClientHandlerDeps {
     /// with the on-chain origin blacklist. NOT an `Option`, unlike the wiring
     /// hooks below — an empty deny-set is a correct steady state (most operators
     /// deny nothing), so there is no "unwired" case to represent, and an
-    /// `Option` would only add a way to fail open on a takedown gate.
-    /// [`ClientHandlerDeps::new`] seeds it empty; the runtime overwrites it with
-    /// the resolved one.
+    /// `Option` would only add a way to fail open on a takedown gate. It is a
+    /// required [`ClientHandlerDeps::new`] parameter: seeding it empty and
+    /// relying on the runtime to overwrite it was itself a silent fail-open — a
+    /// construction site that forgot the wiring was indistinguishable from an
+    /// operator who denies nothing. Callers with no deny-set (tests) pass
+    /// `ContentDenylist::empty()` explicitly.
     pub content_deny: Arc<crate::content_deny::ContentDenylist>,
     // Optional wiring — `None` unless the deployment enables the feature.
     pub redeem_hint: Option<mpsc::Sender<ChannelId>>,
@@ -731,6 +734,7 @@ impl ClientHandlerDeps {
         voucher_interval_mb: u64,
         max_blob_size_bytes: u64,
         max_concurrent_streams: usize,
+        content_deny: Arc<crate::content_deny::ContentDenylist>,
     ) -> Self {
         Self {
             node_id,
@@ -748,7 +752,7 @@ impl ClientHandlerDeps {
             voucher_interval_mb,
             max_blob_size_bytes,
             max_concurrent_streams,
-            content_deny: Arc::new(crate::content_deny::ContentDenylist::empty()),
+            content_deny,
             redeem_hint: None,
             voucher_activity: None,
             region_accountant: None,
@@ -1488,6 +1492,7 @@ mod tests {
             1,
             0,
             16,
+            Arc::new(crate::content_deny::ContentDenylist::empty()),
         );
         deps.background_fill = background_fill;
         let handler = ClientHandler::new(deps).expect("handler");

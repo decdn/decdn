@@ -87,12 +87,6 @@ mod sol_types {
                 view
                 returns (HashEntry memory);
 
-            /// True iff `origin` is blacklisted at the operator/origin level
-            /// (ADR 011 § Hash Evasion and Origin Blacklisting). Read at boot to
-            /// reconcile the deny-set, since the event tail alone cannot answer
-            /// "was this address already blacklisted before my scan window".
-            function isOriginBlacklisted(address origin) external view returns (bool);
-
             // -----------------------------------------------------------------
             // Write functions (governance — driven by the e2e harness)
             // -----------------------------------------------------------------
@@ -161,8 +155,13 @@ mod sol_types {
             /// Deliberately carries NO `version` and is deliberately OUTSIDE the
             /// `getBlacklistVersion()` poll cycle (ADR 011 § Polling). A consumer
             /// therefore cannot use the version counter to detect that it missed
-            /// one — it must scan the event tail on its own block-range cursor
-            /// and reconcile against `isOriginBlacklisted` at boot.
+            /// one — it must scan the event tail on its own block-range cursor.
+            /// There is no boot reconcile: the set is not enumerable on-chain
+            /// (nothing lists the blacklisted origins), so the durable projection
+            /// the watcher builds from this event tail — resumed from a persisted
+            /// cursor — is the whole guarantee. A per-address `isOriginBlacklisted`
+            /// view once existed for a boot reconcile that is impossible to drive,
+            /// and was removed as dead surface.
             event OriginBlacklistUpdated(address indexed origin, bool blacklisted);
 
             /// Governance blacklisted an OPERATOR address (`addOperator`), which

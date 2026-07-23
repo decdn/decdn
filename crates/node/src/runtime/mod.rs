@@ -686,6 +686,7 @@ struct ChainHandlers<P: Provider + Clone + 'static> {
     dht_handler: Arc<DhtHandler>,
     dht_routing: Arc<std::sync::Mutex<crate::dht::RoutingTable>>,
     peer_table: Arc<RwLock<PeerTable>>,
+    announce_origin_deny: Arc<crate::announce_gate::AnnounceOriginDenySet>,
     region_accountant: Arc<crate::region_accounting::RegionAccountant>,
     client_handler: Arc<ClientHandler>,
     payment_service: PaymentChannelService<P>,
@@ -1047,6 +1048,13 @@ async fn build_chain_and_handlers(
             .map_or(0, |n| usize::try_from(n).unwrap_or(usize::MAX)),
     )));
 
+    // Origin-blacklist announce deny-set (#1398). Shared (via Arc) between the
+    // blacklist watcher, which feeds it the `NodeId`s of origin-blacklisted
+    // operators, and the `NodeAnnounce` admission gate below, which refuses
+    // them — closing the re-entry gap the advisory peer-table removal leaves,
+    // since `setOriginBlacklist`/`emergencyAddOrigin` do not eject.
+    let announce_origin_deny = Arc::new(crate::announce_gate::AnnounceOriginDenySet::new());
+
     // Per-region bandwidth accountant (#750). Resolves regions from the shared
     // peer table; shared (via Arc) with the client handler (records served
     // bytes) and the admin surface (admin_v1_regionStats reads the snapshot,
@@ -1173,6 +1181,14 @@ async fn build_chain_and_handlers(
 
     // Build the paid-delivery handler from a single deps literal (#1254): every
     // optional wiring hook above is supplied at construction, not via a setter chain.
+    // ADR 011 deny-set. Taken from the reload state rather than built here, so
+    // the handler and the SIGHUP / `decdn node reload` path hold the SAME `Arc`
+    // — a denylist entry added to the config file takes effect on reload with no
+    // handler rebuild and no restart, which is what makes it usable against a
+    // one-hour statutory clock. Passed into `new()` as a required argument: it
+    // is a compliance gate, so a construction site that forgets to wire it must
+    // not silently degrade to "deny nothing".
+    let content_denylist = reload_state.content_denylist();
     let mut client_deps = crate::handlers::client::ClientHandlerDeps::new(
         infra.secret_key.public(),
         Arc::clone(&infra.node_metrics),
@@ -1191,6 +1207,7 @@ async fn build_chain_and_handlers(
             .max_blob_size_mb
             .saturating_mul(decdn_protocol::MB_BYTES),
         MAX_CLIENT_STREAMS,
+        Arc::clone(&content_denylist),
     );
     client_deps.redeem_hint = Some(redeem_tx.clone());
     client_deps.voucher_activity = Some(Arc::clone(&voucher_activity));
@@ -1202,13 +1219,6 @@ async fn build_chain_and_handlers(
     client_deps.pull_ahead_bytes = pull_ahead_bytes;
     client_deps.leech_governor = leech_governor;
     client_deps.pull_origin_gate = pull_origin_gate;
-    // ADR 011 deny-set. Taken from the reload state rather than built here, so
-    // the handler and the SIGHUP / `decdn node reload` path hold the SAME `Arc`
-    // — a denylist entry added to the config file takes effect on reload with no
-    // handler rebuild and no restart, which is what makes it usable against a
-    // one-hour statutory clock.
-    let content_denylist = reload_state.content_denylist();
-    client_deps.content_deny = Arc::clone(&content_denylist);
     let client_handler = Arc::new(ClientHandler::new(client_deps)?);
 
     // On-chain seller-settlement service (#327). A wallet-filled provider
@@ -1290,6 +1300,7 @@ async fn build_chain_and_handlers(
         Arc::clone(&content_denylist),
         capacity_bond_addr,
         Arc::clone(&peer_table),
+        Arc::clone(&announce_origin_deny),
     );
 
     // Rate-bounds watcher (#1172, ADR 019 §3.1): follows `RateBoundsUpdated` off
@@ -1348,6 +1359,7 @@ async fn build_chain_and_handlers(
         dht_handler,
         dht_routing,
         peer_table,
+        announce_origin_deny,
         region_accountant,
         client_handler,
         payment_service,
@@ -1749,7 +1761,10 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
     // failure already aborted startup above, so this is always
     // `AnnounceGate::Enforce` (`announce_staked_gate` is the unit-tested
     // guarantee of that).
-    let announce_gate = crate::announce_gate::announce_staked_gate(Arc::clone(&ch.staker_set));
+    let announce_gate = crate::announce_gate::announce_staked_gate(
+        Arc::clone(&ch.staker_set),
+        Arc::clone(&ch.announce_origin_deny),
+    );
     let gossip_metrics: Arc<dyn GossipMetrics> =
         Arc::new(NodeGossipMetrics::new(Arc::clone(&infra.node_metrics)));
 

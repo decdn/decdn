@@ -28,8 +28,8 @@ use decdn_incentive::{
 };
 
 use crate::bindings::{
-    AccessControl, CapacityBond, ContentBlacklist, DecdnGovernor, Erc20, OriginAssignment,
-    PublisherRegistry, SlashAppeal, SlashJudge, TimelockController,
+    AccessControl, CapacityBond, ContentBlacklist, ContentBlacklistOrigin, DecdnGovernor, Erc20,
+    OriginAssignment, PublisherRegistry, SlashAppeal, SlashJudge, TimelockController,
 };
 
 /// Base for the per-fixture chain id. Each `ChainFixture` derives its chain id
@@ -663,6 +663,42 @@ impl ChainFixture {
             .await
             .context("addHashGlobal receipt")?;
         crate::ensure_mined(&receipt, "addHashGlobal")
+    }
+
+    /// Blacklist (or un-blacklist) an origin operator as governance —
+    /// `ContentBlacklist.setOriginBlacklist` (ADR 011 § Hash Evasion and Origin
+    /// Blacklisting). Impersonates the Timelock (which holds `GOVERNANCE_ROLE`
+    /// after handoff) and blocks until mined. Emits
+    /// `OriginBlacklistUpdated(origin, blacklisted)`, which the node's blacklist
+    /// watcher projects into its origin deny-set + announce-gate bar (#1398).
+    pub async fn set_origin_blacklist(
+        &self,
+        origin: Address,
+        blacklisted: bool,
+    ) -> anyhow::Result<()> {
+        self.impersonate(self.addrs.timelock).await?;
+        let raw = self.raw_provider();
+        let receipt = ContentBlacklistOrigin::new(self.addrs.content_blacklist, &raw)
+            .setOriginBlacklist(origin, blacklisted)
+            .from(self.addrs.timelock)
+            .send()
+            .await
+            .context("setOriginBlacklist send")?
+            .get_receipt()
+            .await
+            .context("setOriginBlacklist receipt")?;
+        crate::ensure_mined(&receipt, "setOriginBlacklist")
+    }
+
+    /// Read the on-chain `isOriginBlacklisted(origin)` view — the fixture-side
+    /// confirmation that [`Self::set_origin_blacklist`] landed, independent of
+    /// the node's event-tail projection.
+    pub async fn is_origin_blacklisted(&self, origin: Address) -> anyhow::Result<bool> {
+        ContentBlacklistOrigin::new(self.addrs.content_blacklist, &self.admin)
+            .isOriginBlacklisted(origin)
+            .call()
+            .await
+            .context("isOriginBlacklisted")
     }
 
     /// Add `hash` to `region`'s blacklist, acting as that region's registered

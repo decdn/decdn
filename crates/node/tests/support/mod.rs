@@ -379,6 +379,9 @@ fn client_handler_deps(
         1, // voucher_interval_mb
         max_blob_size_bytes,
         max_concurrent_streams,
+        // Empty by default; a test needing a populated deny-set overwrites the
+        // `content_deny` field via the `configure` closure of `build_handler_with`.
+        Arc::new(decdn_node::content_deny::ContentDenylist::empty()),
     )
 }
 
