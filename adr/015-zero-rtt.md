@@ -5,7 +5,7 @@
 
 ## Context
 
-Every QUIC connection begins with a TLS 1.3 handshake that costs one round trip (1-RTT) before application data flows. Probing is the critical latency path: a cache miss runs DHT FIND_VALUE for 3-5 candidate NodeIds, then sends `ProbeRequest` to each in parallel. Each probe needs a separate QUIC connection when none to that peer exists. At inter-continental RTTs (250-300ms), the handshake alone can consume half the 500ms probe collection window ([ADR 001](001-network.md#content-discovery-dht--probe)).
+Every QUIC connection begins with a TLS 1.3 handshake that costs one round trip (1-RTT) before application data flows. Probing is the critical latency path: a cache miss runs DHT FIND_VALUE for 3-5 candidate NodeIds, then sends `ProbeRequest` to each in parallel. Each probe needs a separate QUIC connection when no connection to that peer exists. At inter-continental RTTs (250-300ms), the handshake alone can consume half the 500ms probe collection window ([ADR 001](001-network.md#content-discovery-dht--probe)).
 
 TLS 1.3 defines a **0-RTT** mode. After a successful 1-RTT handshake, the server issues a session ticket. On the next connection to that server, the client sends early data (application bytes) with the TLS ClientHello, removing the round-trip wait. The trade-off is that 0-RTT data is **replayable**: a network adversary can capture and resend the early-data packet, making the server process the same request twice. This is acceptable for idempotent, read-only operations but dangerous for state-changing ones.
 
