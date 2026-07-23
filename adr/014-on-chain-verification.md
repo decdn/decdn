@@ -23,7 +23,7 @@ Phantom, rate, and blacklist all require verifying cryptographic signatures from
 
 Each slashing-participating message (`ProbeResponse`, `StreamResponse`) carries a single message-body signature, `slash_sig`, produced with the node's Ethereum key. Connection-level peer identity is authenticated separately by the iroh QUIC handshake against the registered Ed25519 NodeId; the body signature makes message contents portable evidence verifiable both off-chain and on-chain.
 
-The Ethereum key is the same secp256k1 key the node already holds for staking and channels: `CapacityBond.registerNode` ([ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh)) atomically binds the operator's Ethereum address to the Ed25519 NodeId, so `ecrecover` on a `slash_sig` followed by a `CapacityBond.nodeIdOf(recovered)` lookup attributes the message to a NodeId. EVM-native verification costs ~3,000 gas, making routine slashing economically viable; an Ed25519 wire signature would have cost ~500k–1M gas via Solidity library and was rejected for this reason.
+The Ethereum key is the same secp256k1 key the node already holds for staking and channels. `CapacityBond.registerNode` ([ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh)) atomically binds the operator's Ethereum address to the Ed25519 NodeId, so `ecrecover` on a `slash_sig` plus a `CapacityBond.nodeIdOf(recovered)` lookup attributes the message to a NodeId. EVM-native verification costs ~3,000 gas, making routine slashing economically viable; a Solidity Ed25519 wire signature would cost ~500k–1M gas.
 
 ##### Wire protocol
 
@@ -71,7 +71,7 @@ EIP712Domain({
 
 #### Node Implementation
 
-When constructing a `ProbeResponse` or `StreamResponse`, the node signs the security-relevant fields with its Ethereum private key using EIP-712 typed data and emits the result as `slash_sig`. Peer authentication is handled separately by the iroh QUIC handshake (against the registered Ed25519 NodeId); `slash_sig` is purely message-body attribution/evidence, never used for connection establishment.
+When constructing a `ProbeResponse` or `StreamResponse`, the node signs the security-relevant fields with its Ethereum private key using EIP-712 typed data and emits the result as `slash_sig`. Peer authentication is separate (the iroh QUIC handshake against the registered Ed25519 NodeId); `slash_sig` is message-body attribution/evidence only, never used for connection establishment.
 
 > **Note:** [ADR 003 § NodeId Ownership Verification](003-payments.md#nodeid-ownership-verification) uses direct ed25519 verification (Solidity library, ~500k–1M gas) for node registration ownership proof. This is acceptable because registration is a one-time cost per node lifetime, unlike slash evidence which may be submitted frequently.
 
@@ -201,7 +201,7 @@ The check applies at initialization too — neither contract may be deployed wit
 
 - Challengers must `TOKEN.approve(slashJudge, bondAmount)` before calling any `submit*Challenge()` reveal. The contract transfers the bond on the reveal (not on `commitChallenge`, which moves no funds — see [§ Challenge front-running mitigation](#challenge-front-running-mitigation-commitreveal)).
 - **Successful challenge:** bond returned to challenger; node slashed via `CapacityBond.slash()`.
-- **All three offenses** (phantom, rate manipulation, blacklist): if on-chain verification passes, the slash executes synchronously at reveal time (inside the `submit*Challenge` call, after a prior `commitChallenge`) — no counter-evidence window. Each offense's evidence is cryptographically dispositive: phantom and rate manipulation rely on two contradictory signed messages from the same node within 30 s; blacklist relies on a signed response for an already-blacklisted hash. The node's recourse is to not commit the offense; for rate changes, honor the last probe-quoted rate for the 30-second slashing window before serving streams at a new rate.
+- **All three offenses** (phantom, rate manipulation, blacklist): if on-chain verification passes, the slash executes synchronously at reveal time (inside the `submit*Challenge` call, after a prior `commitChallenge`) — no counter-evidence window. Each offense's evidence is cryptographically dispositive: phantom and rate manipulation rely on two contradictory signed messages from the same node within 30 s; blacklist relies on a signed response for an already-blacklisted hash. The node's recourse is to not commit the offense (for rate changes, honor the last probe-quoted rate for the 30-second slashing window per the rate-manipulation flow above).
 - **Frivolous-challenge bond loss.** A `submit*Challenge` that fails on-chain verification (signature mismatch, timestamp out of window, hash mismatch, etc.) reverts and the challenger pays only gas; the bond is not transferred for failed verifications. A challenge that *passes* verification always slashes the node — there is no second-stage dispute that could forfeit the bond after-the-fact.
 
 #### Challenge front-running mitigation (commit–reveal)
@@ -242,8 +242,6 @@ The companion `SlashAppeal` events (`AppealOpened`, `AppealGranted`, etc.) are s
 | `submitRateChallenge` | ~65k–90k | 2× `SignatureChecker` (6k EOA / ~30k Safe) + calldata + storage for pending challenge + bond transfer + `Slashed` emit on success |
 | `submitBlacklistChallenge` | ~55k–70k | 1× `SignatureChecker` (3k EOA / ~15k Safe) + `ContentBlacklist` lookup + bond transfer + `Slashed` emit on success |
 | `Slashed` event emit | ~5k–7k | `nextSlashId++` (cold SLOAD + non-zero→non-zero SSTORE on first emit per tx, ~5k post-EIP-2929) + LOG3 base + 3 stack topics (event signature + 2 indexed) + 96 bytes non-indexed data (~2k); negligible vs the surrounding `CapacityBond.slash()`. The very first `Slashed` ever emitted on a fresh deployment pays an additional ~17k for the 0→non-zero `nextSlashId` SSTORE. |
-
-Using secp256k1 EIP-712 for `slash_sig` keeps per-signature verification at ~3k gas via `ecrecover`, against the ~500k–1M gas a Solidity Ed25519 library would require — making routine slashing economically viable.
 
 #### Governable Parameters with Safety Bounds
 
