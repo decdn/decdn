@@ -775,7 +775,32 @@ fn refusal(response: StreamResponse) -> anyhow::Error {
             error,
             response: Some(response),
         }),
-        None => anyhow::anyhow!("delivery refused with no error code (unvalidated response?)"),
+        // Unreachable on a validated response: every caller runs `verify_response`
+        // (hence `validate`) first, which rejects `ok == false` with no error as
+        // `MissingStreamError`. Reaching here means that invariant was bypassed —
+        // the response *was* validated yet carries no code — so name it as the
+        // protocol violation it is rather than blaming an unvalidated response.
+        None => anyhow::anyhow!(
+            "delivery refused but the validated response carried no error code \
+             (StreamResponse::validate invariant bypassed)"
+        ),
+    }
+}
+
+/// Build the [`UpstreamRefused`] error for a **mid-stream** `ClientMessage::StreamError`
+/// frame — the refusal that arrives *after* the open stage, in reply to a delivery
+/// chunk or a voucher.
+///
+/// Such a frame carries no signature (it is a bare wire code, #1042), so
+/// [`UpstreamRefused::response`] is `None` here **by construction** and this is the
+/// only place that decision is made. The four mid-stream receive sites route through
+/// it so none can drift into synthesising a `StreamResponse` — which would hand an
+/// observer an unsigned artifact the `response` field's docs promise always recovers
+/// to the delivering node (#1378). The open-stage counterpart is [`refusal`].
+const fn mid_stream_refusal(error: StreamError) -> UpstreamRefused {
+    UpstreamRefused {
+        error,
+        response: None,
     }
 }
 
@@ -1414,10 +1439,7 @@ async fn receive_and_pay(
                 // mis-attribution #1144 fixed, reappearing one stage later. The wire code
                 // carries the same meaning here as it does in a `StreamResponse`, so let
                 // the one classifier judge both.
-                return Err(anyhow::Error::new(UpstreamRefused {
-                    error: e,
-                    response: None,
-                }));
+                return Err(anyhow::Error::new(mid_stream_refusal(e)));
             }
             other => anyhow::bail!("unexpected message mid-delivery: {}", variant_name(&other)),
         }
@@ -1851,10 +1873,7 @@ impl UpstreamPull {
                 // mis-attribution #1144 fixed, reappearing one stage later. The wire code
                 // carries the same meaning here as it does in a `StreamResponse`, so let
                 // the one classifier judge both.
-                Err(anyhow::Error::new(UpstreamRefused {
-                    error: e,
-                    response: None,
-                }))
+                Err(anyhow::Error::new(mid_stream_refusal(e)))
             }
             other => anyhow::bail!("unexpected message mid-delivery: {}", variant_name(&other)),
         }
@@ -1891,10 +1910,7 @@ impl UpstreamPull {
                     // mis-attribution #1144 fixed, reappearing one stage later. The wire code
                     // carries the same meaning here as it does in a `StreamResponse`, so let
                     // the one classifier judge both.
-                    return Err(anyhow::Error::new(UpstreamRefused {
-                        error: e,
-                        response: None,
-                    }));
+                    return Err(anyhow::Error::new(mid_stream_refusal(e)));
                 }
                 other => {
                     anyhow::bail!("unexpected message at stream end: {}", variant_name(&other))
@@ -2017,10 +2033,7 @@ async fn self_pay(
                 // receive sites do (#1145 review) — stringifying it here dropped the code
                 // through every downcast to the `Unreachable` catch-all, scoring an honest
                 // `Overloaded`/`NotFound` peer as a dead node.
-                ClientMessage::StreamError(e) => Err(anyhow::Error::new(UpstreamRefused {
-                    error: e,
-                    response: None,
-                })),
+                ClientMessage::StreamError(e) => Err(anyhow::Error::new(mid_stream_refusal(e))),
                 other => anyhow::bail!("expected VoucherAck, got {}", variant_name(&other)),
             }
         })
@@ -2542,6 +2555,16 @@ mod tests {
             preserved.body == body,
             "the preserved body must be the signed body verbatim"
         );
+        // The wire code lives in two places now — `refused.error` (cloned out by
+        // `refusal`) and `preserved.error` (inside the evidence the reputation
+        // layer reads). Nothing structural keeps them in sync until #1377, so pin
+        // it here: a future edit that reclassified one leg would desync them.
+        anyhow::ensure!(
+            preserved.error.as_ref() == Some(&refused.error),
+            "the cloned wire code {:?} must match the code inside the preserved evidence {:?}",
+            refused.error,
+            preserved.error,
+        );
         // The whole point: the surviving signature still recovers to the operator,
         // so it can be replayed to `SlashJudge` with no re-signing by the observer.
         let recovered = alloy::primitives::Signature::try_from(preserved.slash_sig.as_slice())?;
@@ -2551,5 +2574,29 @@ mod tests {
             &domain,
         )?;
         Ok(())
+    }
+
+    /// A **mid-stream** refusal carries no signature, so it must never carry a
+    /// `StreamResponse` either: the `response` field's docs promise a present
+    /// value always recovers to the delivering node, and a synthesised one would
+    /// hand an observer an unsigned artifact that breaks that promise (#1378).
+    /// Routing all four mid-stream sites through `mid_stream_refusal` makes
+    /// `response == None` a one-place decision; this pins it.
+    #[test]
+    fn a_mid_stream_refusal_never_carries_a_response() {
+        use decdn_protocol::client::StreamError;
+
+        use super::mid_stream_refusal;
+
+        let refused = mid_stream_refusal(StreamError::Overloaded);
+        assert!(
+            refused.response.is_none(),
+            "a mid-stream refusal has no signed response to carry"
+        );
+        assert_eq!(
+            refused.error,
+            StreamError::Overloaded,
+            "the mid-stream wire code must survive unchanged"
+        );
     }
 }

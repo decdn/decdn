@@ -82,12 +82,18 @@ use decdn_e2e::chain::{ChainFixture, EvidencePair, Offense};
 use decdn_e2e::client::ClientFixture;
 use decdn_e2e::node::NodeFixture;
 use decdn_e2e::time;
+use decdn_incentive::stream_sig::StreamSlashData;
 use decdn_incentive::{ProbeSlashData, slash_judge_domain};
 use decdn_protocol::ProbeResponse;
-use decdn_protocol::client::StreamError;
+use decdn_protocol::client::{StreamError, StreamResponse};
 
 const MIB: usize = 1024 * 1024;
 const DAY: u64 = 24 * 60 * 60;
+
+/// The per-reason reject counter for a genuine cache miss. Reading it pins node
+/// B's refusal to an honest miss rather than one of the other six reasons
+/// `ServeRejectReason::wire_error` collapses onto `NotFound` (#1379).
+const CACHE_MISS_METRIC: &str = "decdn_serve_stream_rejected_cache_miss_total";
 
 /// The rendered fixture config's `payment.rate_per_mb`. The bait rate.
 const BASE_RATE_PER_MB: u64 = 10;
@@ -233,9 +239,17 @@ async fn run() -> anyhow::Result<()> {
         "daemon reported rate {reloaded} after reload, expected {SWITCHED_RATE_PER_MB}"
     );
 
+    // Read node B's cache-miss reject counter across the refusal. `NotFound` on
+    // its own cannot establish an honest miss — `ServeRejectReason::wire_error`
+    // collapses seven reasons (UnknownChannel, OwnerMismatch, InsufficientDeposit,
+    // …) onto it — so a future regression that dropped `channel_b` would keep this
+    // green while the rate predicate tested something weaker. The per-reason
+    // counter, bumped before the wire write, discriminates the miss directly (#1379).
+    let miss_before = node_b.scrape_metric(CACHE_MISS_METRIC).await?;
     let stream_b = client
         .refused_stream(&chain, &node_b, channel_b, unheld, now_b_us + 1_000_000)
         .await?;
+    let miss_after = node_b.scrape_metric(CACHE_MISS_METRIC).await?;
     // Symmetric with the node-A capture: pin the answered hash at the capture so a
     // mismatch localizes here rather than surfacing later as the judge's same-hash
     // check inside the challenge.
@@ -251,10 +265,17 @@ async fn run() -> anyhow::Result<()> {
     );
     // The refusal is the honest cache miss, not an eviction or a channel fault —
     // so the rate really is the only thing that moved between the two messages.
+    // The signed wire code says `NotFound`; the counter step proves it was the
+    // *cache-miss* reason specifically, not `UnknownChannel`/`OwnerMismatch`/etc.
     anyhow::ensure!(
         stream_b.error == Some(StreamError::NotFound),
         "the refusal must be a plain miss, got {:?}",
         stream_b.error
+    );
+    anyhow::ensure!(
+        miss_after == miss_before + 1,
+        "node B's refusal must bump the cache-miss reject counter (0→1), ruling out \
+         the six other reasons NotFound collapses onto"
     );
 
     // ================================================================
@@ -312,6 +333,40 @@ async fn run() -> anyhow::Result<()> {
     expect_revert_anyhow::<SlashJudgeRate::InvalidProbeSignature>(&err, "forged probe signature")?;
     assert_challenge_cost_nothing(&chain, forger.address(), bond).await?;
 
+    // (2b) Forged STREAM signature: the real probe with the real stream body, but
+    // the stream `slash_sig` re-signed by a non-operator. `_verifyPair` checks the
+    // probe leg first, so a real probe reaches — and fails at — the stream-leg
+    // check `InvalidStreamSignature`, which no test (Solidity or e2e) covered
+    // before (#1378). The forged stream carries the same body, so its evidenceHash
+    // matches the real pair — but the signature check reverts before `_resolve`
+    // ever consults `usedEvidenceHash`, so this leaves the real evidence spendable
+    // by the positive path below.
+    let stream_impostor = PrivateKeySigner::random();
+    let forged_stream = forge_stream_signature(&chain, &stream_a, &stream_impostor)?;
+    let stream_forger = PrivateKeySigner::random();
+    let err = chain
+        .challenge_with_real_evidence(
+            &stream_forger,
+            node_a.operator_addr(),
+            node_a_id,
+            Offense::Phantom,
+            EvidencePair {
+                probe: &probe_a,
+                stream: &forged_stream,
+            },
+            B256::repeat_byte(0x06),
+        )
+        .await
+        .err()
+        .ok_or_else(|| {
+            anyhow::anyhow!("a stream signed by a non-operator must not be slashable")
+        })?;
+    expect_revert_anyhow::<SlashJudgeRate::InvalidStreamSignature>(
+        &err,
+        "forged stream signature",
+    )?;
+    assert_challenge_cost_nothing(&chain, stream_forger.address(), bond).await?;
+
     // (3) Neither failed challenge minted anything: A is still unslashed.
     anyhow::ensure!(
         chain.slashed_at_epoch(node_a.operator_addr()).await? == 0,
@@ -349,6 +404,35 @@ async fn run() -> anyhow::Result<()> {
     )
     .await
     .context("rate challenge from real daemon evidence")?;
+
+    // ================================================================
+    // Replay — the same real phantom pair cannot slash twice.
+    // ================================================================
+    // Resubmitting node A's exact phantom pair under a *fresh* salt is rejected by
+    // `EvidenceAlreadyUsed` — the dedup guard that lives in `SlashJudge` itself
+    // (keyed on the offense/probe/stream triple), not in `CapacityBond`. This is
+    // what stops a griefer ratcheting `lifetimeOffenseCount` off one captured
+    // refusal. The fresh salt rules out the commit-reveal replay guard as the
+    // cause, isolating the evidence-level dedup (#1378). It reverts at
+    // `usedEvidenceHash` before the challenge bond is pulled, so it costs nothing.
+    let replayer = PrivateKeySigner::random();
+    let err = chain
+        .challenge_with_real_evidence(
+            &replayer,
+            node_a.operator_addr(),
+            node_a_id,
+            Offense::Phantom,
+            EvidencePair {
+                probe: &probe_a,
+                stream: &stream_a,
+            },
+            B256::repeat_byte(0x07),
+        )
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("a replayed phantom pair must not slash a second time"))?;
+    expect_revert_anyhow::<SlashJudgeRate::EvidenceAlreadyUsed>(&err, "replayed evidence")?;
+    assert_challenge_cost_nothing(&chain, replayer.address(), bond).await?;
 
     // ================================================================
     // Finality — the 30-day filing window lapses with no appeal, and the escrow
@@ -491,6 +575,29 @@ fn forge_probe_signature(
     anyhow::ensure!(
         forged.slash_sig != real.slash_sig,
         "the forged signature must differ from the daemon's"
+    );
+    Ok(forged)
+}
+
+/// The stream-leg twin of [`forge_probe_signature`]: re-sign the *real*
+/// `StreamResponse` body with `impostor`'s key, leaving every other byte
+/// untouched. The body (hence its EIP-712 struct hash and the pair's
+/// `evidenceHash`) is unchanged — only `slash_sig` recovers to the wrong address,
+/// which is exactly what `_verifyPair`'s stream-leg check must reject (#1378).
+fn forge_stream_signature(
+    chain: &ChainFixture,
+    real: &StreamResponse,
+    impostor: &PrivateKeySigner,
+) -> anyhow::Result<StreamResponse> {
+    let domain = slash_judge_domain(chain.chain_id(), chain.addrs().slash_judge);
+    let sig = StreamSlashData::from_response_body(&real.body)
+        .sign(impostor, &domain)
+        .context("forge stream sig")?;
+    let mut forged = real.clone();
+    forged.slash_sig = sig.as_bytes().to_vec();
+    anyhow::ensure!(
+        forged.slash_sig != real.slash_sig,
+        "the forged stream signature must differ from the daemon's"
     );
     Ok(forged)
 }

@@ -2735,6 +2735,8 @@ version = "0.1.0"
 dependencies = [
  "alloy",
  "anyhow",
+ "bao-tree",
+ "decdn-bao-range",
  "decdn-cache",
  "decdn-client-pull",
  "decdn-common",

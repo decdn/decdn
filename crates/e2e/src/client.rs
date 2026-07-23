@@ -609,9 +609,21 @@ impl ClientFixture {
             ),
             Err(e) => e,
         };
-        let refused = err
-            .downcast_ref::<UpstreamRefused>()
-            .ok_or_else(|| anyhow::anyhow!("expected a typed refusal, got: {err:#}"))?;
+        let Some(refused) = err.downcast_ref::<UpstreamRefused>() else {
+            // A voucher rejection here is a *different* finding than a wrong
+            // error type: it means the induced condition did not take — the node
+            // served the open stage, then rejected the zeroed nonce-1 voucher
+            // this helper replays. Name that precisely (#1379), so a no-op
+            // eviction or an unexpectedly-present hash surfaces as "served when
+            // it should have refused" rather than "expected a typed refusal".
+            if let Some(rejected) = err.downcast_ref::<UpstreamVoucherRejected>() {
+                anyhow::bail!(
+                    "node served when it should have refused: the open stage \
+                     succeeded and the replayed voucher was rejected ({rejected})"
+                );
+            }
+            anyhow::bail!("expected a typed refusal, got: {err:#}");
+        };
         // `response` is `None` only for a mid-stream `StreamError` frame, which is
         // unsigned and therefore useless as evidence — a setup failure here.
         refused.response.clone().ok_or_else(|| {
