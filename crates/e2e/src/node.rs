@@ -73,6 +73,10 @@ pub struct NodeFixture {
     operator_addr: Address,
     node_id: iroh::PublicKey,
     bind_port: u16,
+    // Prometheus scrape port (loopback), retained so a journey can read a
+    // per-reason reject counter directly (`scrape_metric`) rather than infer it
+    // from the collapsed wire `NotFound` (#1371).
+    metrics_port: u16,
     admin_url: String,
     // Rendered `node.toml`: respawns the daemon on `restart` against the same
     // state; `config_path()` lets a journey point the `decdn` CLI at the same
@@ -155,20 +159,8 @@ impl NodeFixture {
     /// out-of-band rate the daemon then clamps away.
     pub async fn set_rate_per_mb(&self, rate: u64) -> anyhow::Result<u64> {
         let config = std::fs::read_to_string(&self.config_path).context("read node config")?;
-        let mut doc: toml::Table = config.parse().context("parse node config")?;
-        let payment = doc
-            .get_mut("payment")
-            .and_then(toml::Value::as_table_mut)
-            .ok_or_else(|| anyhow::anyhow!("node config has no [payment] table"))?;
-        payment.insert(
-            "rate_per_mb".to_string(),
-            toml::Value::Integer(i64::try_from(rate).context("rate_per_mb overflows i64")?),
-        );
-        std::fs::write(
-            &self.config_path,
-            toml::to_string(&doc).context("render node config")?,
-        )
-        .context("write node config")?;
+        let rewritten = rewrite_rate_per_mb(&config, rate)?;
+        std::fs::write(&self.config_path, rewritten).context("write node config")?;
 
         let resp = self
             .admin_client()?
@@ -197,7 +189,7 @@ impl NodeFixture {
         region: &str,
         serve_blobs: &[&[u8]],
     ) -> anyhow::Result<(Self, Vec<Hash>)> {
-        Self::launch_configured(chain, region, serve_blobs, false, &[]).await
+        Self::launch_configured(chain, region, serve_blobs, false, false, &[]).await
     }
 
     /// Launch an empty bonded cache node whose misses use paid node-to-node
@@ -208,7 +200,7 @@ impl NodeFixture {
         discovery_peers: &[&NodeFixture],
     ) -> anyhow::Result<Self> {
         let (node, hashes) =
-            Self::launch_configured(chain, region, &[], true, discovery_peers).await?;
+            Self::launch_configured(chain, region, &[], true, true, discovery_peers).await?;
         anyhow::ensure!(
             hashes.is_empty(),
             "empty cache launch returned seeded hashes"
@@ -234,17 +226,18 @@ impl NodeFixture {
     /// depend on either reading.
     ///
     /// No discovery peers, so the node has no upstream and a served backend-only
-    /// blob can only have come from its own `[cache.origin]`. Note this is
-    /// guaranteed by the empty peer set, *not* by node→node pull-through being
-    /// off: `render_config` ties `pull_through_require_authorized_origin` to
-    /// `node_to_node_pull_through_enabled`, so enabling the gate necessarily arms
-    /// node→node pull-through too.
+    /// blob can only have come from its own `[cache.origin]`. `render_config`
+    /// exposes the two knobs independently (#1376), but this helper still arms
+    /// both: `pull_through_require_authorized_origin` is only *wired* by the
+    /// daemon inside `if node_to_node_pull_through_enabled` (`runtime::mod`), so
+    /// the gate needs node→node pull-through on to take effect. The no-upstream
+    /// guarantee therefore rests on the empty peer set, not on the flag being off.
     pub async fn launch_authorized_origin(
         chain: &ChainFixture,
         region: &str,
         cached_blobs: &[&[u8]],
     ) -> anyhow::Result<(Self, Vec<Hash>)> {
-        Self::launch_configured(chain, region, cached_blobs, true, &[]).await
+        Self::launch_configured(chain, region, cached_blobs, true, true, &[]).await
     }
 
     /// Write `blob` into the node's opaque origin backend **without** touching its
@@ -258,6 +251,21 @@ impl NodeFixture {
     pub fn seed_origin_blob(&self, blob: &[u8]) -> anyhow::Result<Hash> {
         let hash = Hash::new(blob);
         write_fs_origin_blob(self.origin_dir.path(), &hash, blob)?;
+        Ok(hash)
+    }
+
+    /// Like [`Self::seed_origin_blob`], but also writes the sibling `{H}.obao4`
+    /// pre-order outboard so a ranged origin fetch reaches the **range tier**.
+    ///
+    /// `FilesystemOrigin::fetch_range` treats a missing outboard as `Unsupported`
+    /// by design, so a blob seeded by `seed_origin_blob` alone declines the range
+    /// path and falls through to a whole-blob fill — the origin range tier and
+    /// `bao-range`'s chunk-group handling are then never exercised (#1372). Seed
+    /// with this variant when a journey asserts on the range path itself.
+    pub fn seed_origin_blob_with_outboard(&self, blob: &[u8]) -> anyhow::Result<Hash> {
+        let hash = Hash::new(blob);
+        write_fs_origin_blob(self.origin_dir.path(), &hash, blob)?;
+        write_fs_origin_outboard(self.origin_dir.path(), &hash, blob)?;
         Ok(hash)
     }
 
@@ -325,6 +333,7 @@ impl NodeFixture {
         region: &str,
         serve_blobs: &[&[u8]],
         node_to_node_pull_through: bool,
+        require_authorized_origin: bool,
         discovery_peers: &[&NodeFixture],
     ) -> anyhow::Result<(Self, Vec<Hash>)> {
         let data_dir = tempfile::tempdir().context("create node data dir")?;
@@ -397,6 +406,7 @@ impl NodeFixture {
             chain_id: chain.chain_id(),
             addrs: chain.addrs(),
             node_to_node_pull_through,
+            require_authorized_origin,
             discovery_peers: &discovery_peers,
         });
         let config_path = data_dir.path().join("node.toml");
@@ -438,6 +448,7 @@ impl NodeFixture {
             operator_addr,
             node_id,
             bind_port,
+            metrics_port,
             admin_url: format!("http://127.0.0.1:{admin_port}"),
             config_path,
         };
@@ -473,6 +484,75 @@ impl NodeFixture {
         self.wait_healthy(Duration::from_secs(30))
             .await
             .context("node never became healthy after restart")
+    }
+
+    /// Scrape the daemon's Prometheus endpoint and return the current value of a
+    /// single unlabelled counter/gauge by name, or `0` if it is absent (a
+    /// registered-but-never-incremented counter is reported as `0`).
+    ///
+    /// Because a **missing** metric reads as `0`, assert on this only as a
+    /// *delta* (`after == before + 1`), never as an absolute (`== 0`): a typo'd
+    /// or unregistered name returns `0` for both reads, so a delta assertion
+    /// still fails loudly (`0 == 0 + 1`) whereas `assert_eq!(…, 0)` would pass
+    /// vacuously. All reject counters are eagerly registered, so a correct name
+    /// never actually hits the absent-reads-as-zero path.
+    ///
+    /// This reads a **per-reason** signal directly, which the wire protocol
+    /// deliberately hides: `ServeRejectReason::wire_error` collapses seven
+    /// distinct reject reasons onto one `StreamError::NotFound`, so an
+    /// end-to-end refusal is otherwise indistinguishable from a plain cache miss
+    /// (#1371). The counters bump *before* the network write, so a 0→1 step
+    /// across a single fetch pins the refusal to its exact cause.
+    ///
+    /// Assert on a **delta** (`after == before + 1`), never an absolute value.
+    /// Because a missing metric reads as `0`, a `0→1` delta catches a misspelled
+    /// name (`0 == 0 + 1` fails), but an absence check `assert_eq!(scrape(X), 0)`
+    /// would pass *vacuously* for a typo'd `X`. An absolute-value assertion is
+    /// also unnecessary here: the reject counters are exposed-at-zero on a fresh
+    /// registry, so a delta of 0 already proves non-increment.
+    ///
+    /// Values are summed across every matching sample; the integer part of each
+    /// value is parsed (the Prometheus text format renders a `_total` counter
+    /// without a fraction), so a metric that later gains labels still totals up.
+    pub async fn scrape_metric(&self, name: &str) -> anyhow::Result<u64> {
+        let url = format!("http://127.0.0.1:{}/metrics", self.metrics_port);
+        let body = reqwest::get(&url)
+            .await
+            .with_context(|| format!("scrape {url}"))?
+            .error_for_status()
+            .context("metrics endpoint status")?
+            .text()
+            .await
+            .context("read metrics body")?;
+        let mut total: u64 = 0;
+        for line in body.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            // `metric_name value` or `metric_name{labels...} value`. Match the
+            // series name up to the first `{` or whitespace.
+            let series = line.split_whitespace().next().unwrap_or_default();
+            let series_name = series.split('{').next().unwrap_or_default();
+            if series_name != name {
+                continue;
+            }
+            let value = line
+                .rsplit_once(char::is_whitespace)
+                .map(|(_, v)| v)
+                .unwrap_or_default();
+            // Counters render as bare integers; tolerate a `.0`-style fraction
+            // by taking the integer part rather than pulling in float parsing.
+            let integer_part = value.split('.').next().unwrap_or_default();
+            total = total.saturating_add(
+                integer_part
+                    .parse::<u64>()
+                    .with_context(|| format!("parse metric value {value:?} for {name}"))?,
+            );
+        }
+        // A missing counter reads as 0 (registered-but-never-incremented), which
+        // is exactly what a 0→1 assertion across the first refusal wants.
+        Ok(total)
     }
 
     /// Build a loopback admin JSON-RPC client for this node.
@@ -545,6 +625,7 @@ struct RenderConfig<'a> {
     chain_id: u64,
     addrs: ContractAddrs,
     node_to_node_pull_through: bool,
+    require_authorized_origin: bool,
     discovery_peers: &'a [(iroh::PublicKey, u16)],
 }
 
@@ -586,7 +667,7 @@ redeem_threshold_micro_usdc = 10
 cache_dir = '{cache_dir}'
 cache_size_mb = 4096
 node_to_node_pull_through_enabled = {node_to_node_pull_through}
-pull_through_require_authorized_origin = {node_to_node_pull_through}
+pull_through_require_authorized_origin = {require_authorized_origin}
 
 [cache.origin]
 kind = "fs"
@@ -617,6 +698,7 @@ metrics_bind = "127.0.0.1"
         origin_assignment = a.origin_assignment,
         cache_dir = c.cache_dir.display(),
         node_to_node_pull_through = c.node_to_node_pull_through,
+        require_authorized_origin = c.require_authorized_origin,
         origin_dir = c.origin_dir.display(),
         admin_port = c.admin_port,
         metrics_port = c.metrics_port,
@@ -630,6 +712,26 @@ metrics_bind = "127.0.0.1"
     rendered
 }
 
+/// Rewrite `payment.rate_per_mb` in a node TOML config, preserving every other
+/// key. Split out of [`NodeFixture::set_rate_per_mb`] so its parse → mutate →
+/// `toml::to_string` round-trip is testable without a live daemon (#1378): the
+/// serializer's `ValueAfterTable` hazard (a scalar written after a sub-table in
+/// `[cache]`) is handled today because each table gets its own buffer, but a
+/// `toml` bump could silently break it — this is the plain-`cargo nextest`
+/// guard, mirroring `render_config_emits_parseable_toml`.
+fn rewrite_rate_per_mb(config: &str, rate: u64) -> anyhow::Result<String> {
+    let mut doc: toml::Table = config.parse().context("parse node config")?;
+    let payment = doc
+        .get_mut("payment")
+        .and_then(toml::Value::as_table_mut)
+        .ok_or_else(|| anyhow::anyhow!("node config has no [payment] table"))?;
+    payment.insert(
+        "rate_per_mb".to_string(),
+        toml::Value::Integer(i64::try_from(rate).context("rate_per_mb overflows i64")?),
+    );
+    toml::to_string(&doc).context("render node config")
+}
+
 /// Write `blob` into a filesystem-origin shard layout (`{root}/{hex[..2]}/{hex}`).
 fn write_fs_origin_blob(root: &std::path::Path, hash: &Hash, blob: &[u8]) -> anyhow::Result<()> {
     let hex = hash.to_hex();
@@ -637,6 +739,29 @@ fn write_fs_origin_blob(root: &std::path::Path, hash: &Hash, blob: &[u8]) -> any
     let dir = root.join(shard);
     std::fs::create_dir_all(&dir).context("create origin shard dir")?;
     std::fs::write(dir.join(hex.as_str()), blob).context("write origin blob")?;
+    Ok(())
+}
+
+/// Sibling suffix of a filesystem origin's pre-order outboard. Mirrors the
+/// `pub(super)` `OBAO4_SUFFIX` in `decdn_cache::origin::fs`, kept in sync by the
+/// `FilesystemOrigin::fetch_range` range-tier assertions the e2e journeys run.
+const OBAO4_SUFFIX: &str = ".obao4";
+
+/// Write the sibling `{hex}.obao4` pre-order outboard next to the data object.
+/// Mirrors `decdn_cache`'s test-only `seed_blob_with_outboard`.
+fn write_fs_origin_outboard(
+    root: &std::path::Path,
+    hash: &Hash,
+    blob: &[u8],
+) -> anyhow::Result<()> {
+    use bao_tree::io::outboard::PreOrderMemOutboard;
+    let ob = PreOrderMemOutboard::create(blob, decdn_bao_range::IROH_BLOCK_SIZE);
+    let hex = hash.to_hex();
+    let shard = hex.as_str().get(..2).context("blob hex too short")?;
+    let dir = root.join(shard);
+    std::fs::create_dir_all(&dir).context("create origin shard dir")?;
+    std::fs::write(dir.join(format!("{}{OBAO4_SUFFIX}", hex.as_str())), ob.data)
+        .context("write origin outboard")?;
     Ok(())
 }
 
@@ -738,6 +863,9 @@ mod tests {
             chain_id: 31_337,
             addrs,
             node_to_node_pull_through: true,
+            // Distinct value from `node_to_node_pull_through` so a template that
+            // wrongly re-tied the two keys (the pre-#1376 bug) is caught here.
+            require_authorized_origin: false,
             discovery_peers: &discovery_peers,
         });
 
@@ -757,13 +885,17 @@ mod tests {
         );
         assert_eq!(doc["cache"]["origin"]["kind"].as_str(), Some("fs"));
         assert!(doc["cache"]["origin"].get("path").is_some());
+        // The two knobs render independently (#1376): the fixture set them to
+        // distinct values above, so this also guards against a regression that
+        // re-ties `pull_through_require_authorized_origin` to
+        // `node_to_node_pull_through_enabled`.
         assert_eq!(
             doc["cache"]["node_to_node_pull_through_enabled"].as_bool(),
             Some(true)
         );
         assert_eq!(
             doc["cache"]["pull_through_require_authorized_origin"].as_bool(),
-            Some(true)
+            Some(false)
         );
         assert_eq!(
             doc["network"]["discovery"]["peers"]
@@ -777,5 +909,65 @@ mod tests {
             doc["observability"]["metrics_port"].as_integer(),
             Some(9100)
         );
+    }
+
+    /// Build a representative rendered node config for the TOML-round-trip tests.
+    fn sample_rendered_config() -> String {
+        let addrs = ContractAddrs {
+            capacity_bond: Address::from([0x11; 20]),
+            payment_channel: Address::from([0x22; 20]),
+            fee_router: Address::from([0x33; 20]),
+            token: Address::from([0x44; 20]),
+            slash_judge: Address::from([0x55; 20]),
+            slash_appeal: Address::from([0x66; 20]),
+            governor: Address::from([0x77; 20]),
+            timelock: Address::from([0x88; 20]),
+            publisher_registry: Address::from([0x99; 20]),
+            origin_assignment: Address::from([0xAA; 20]),
+            content_blacklist: Address::from([0xBB; 20]),
+        };
+        render_config(&RenderConfig {
+            data_dir: PathBuf::from("/var/lib/decdn"),
+            region: "US",
+            bind_port: 4433,
+            admin_port: 9944,
+            metrics_port: 9100,
+            rpc_url: "http://127.0.0.1:8545",
+            keystore: std::path::Path::new("/var/lib/decdn/keystore.json"),
+            cache_dir: std::path::Path::new("/var/lib/decdn/cache"),
+            origin_dir: std::path::Path::new("/var/lib/decdn/origin"),
+            chain_id: 31_337,
+            addrs,
+            node_to_node_pull_through: true,
+            require_authorized_origin: true,
+            discovery_peers: &[],
+        })
+    }
+
+    /// `set_rate_per_mb`'s parse → mutate → serialize step (`rewrite_rate_per_mb`)
+    /// must round-trip: the new rate lands and every other section survives. The
+    /// `[cache]` block is the one at risk — it holds a scalar
+    /// (`node_to_node_pull_through_enabled`) after a sub-table (`[cache.origin]`),
+    /// the `ValueAfterTable` shape a `toml` serializer bug would mangle (#1378).
+    #[test]
+    fn set_rate_per_mb_round_trips_through_toml() {
+        let rewritten = rewrite_rate_per_mb(&sample_rendered_config(), 4242)
+            .expect("rewrite_rate_per_mb must succeed");
+        let doc: toml::Value =
+            toml::from_str(&rewritten).expect("rewritten config must be valid TOML");
+
+        assert_eq!(doc["payment"]["rate_per_mb"].as_integer(), Some(4242));
+        // Everything around the mutation is intact — notably the `[cache]`
+        // scalar-after-subtable that trips the serializer hazard.
+        assert_eq!(doc["cache"]["origin"]["kind"].as_str(), Some("fs"));
+        assert_eq!(
+            doc["cache"]["node_to_node_pull_through_enabled"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            doc["cache"]["pull_through_require_authorized_origin"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(doc["blockchain"]["chain_id"].as_integer(), Some(31_337));
     }
 }

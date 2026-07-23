@@ -55,14 +55,19 @@ const TAPPED_LEN: usize = 128 * KIB;
 /// Not chunk-group aligned, so the served tail must be the exact requested one
 /// rather than a conveniently rounded span.
 ///
-/// Note this does *not* currently exercise `bao-range`'s alignment handling:
-/// [`NodeFixture::seed_origin_blob`] writes no `{H}.obao4`, so
-/// `FilesystemOrigin::fetch_range` reports `Unsupported`, the origin *range*
-/// tier declines, and the request degrades to a whole-blob fill plus a
-/// server-side `export_range`. Seeding the outboard to reach the range tier is
-/// tracked separately.
+/// The ranged blob is seeded with its `{H}.obao4` outboard
+/// ([`NodeFixture::seed_origin_blob_with_outboard`]), so `FilesystemOrigin::fetch_range`
+/// returns `Ranged` and the request reaches the origin **range** tier — exercising
+/// `bao-range`'s chunk-group handling against this deliberately non-aligned offset,
+/// which the earlier outboard-free seeding never did (#1372). The tier is pinned by
+/// the partial-presence control after the positive ranged fetch below: a range-tier
+/// serve imports only the requested span, so the whole blob stays absent.
 const RANGE_OFFSET: u64 = 40_001;
 const OVERALL_TIMEOUT: Duration = Duration::from_secs(900);
+/// The per-reason reject counter the gate bumps *before* the wire write. Reading
+/// it directly discriminates a gated refusal from the plain `NotFound` that
+/// `ServeRejectReason::wire_error` collapses seven reasons onto (#1371).
+const UNAUTHORIZED_ORIGIN_METRIC: &str = "decdn_serve_stream_rejected_unauthorized_origin_total";
 /// Shortest path component the wire-opacity scan treats as a location leak.
 /// See the rationale at its use site in [`assert_backend_never_on_the_wire`].
 const MIN_DISTINCTIVE_COMPONENT: usize = 6;
@@ -103,7 +108,9 @@ async fn run() -> anyhow::Result<()> {
     // store — so serving any of them requires the origin gate to be open, and
     // cannot be satisfied by the node's cache role.
     let origin_hash = node.seed_origin_blob(&origin_payload)?;
-    let range_hash = node.seed_origin_blob(&range_payload)?;
+    // Seeded WITH its `{H}.obao4` outboard so the positive ranged fetch reaches
+    // the origin range tier rather than degrading to a whole-blob fill (#1372).
+    let range_hash = node.seed_origin_blob_with_outboard(&range_payload)?;
     let tapped_hash = node.seed_origin_blob(&tapped_payload)?;
     for (a, b) in [
         (cached_hash, origin_hash),
@@ -144,7 +151,15 @@ async fn run() -> anyhow::Result<()> {
     // shape: same node, same backend, same config, and the identical fetch
     // succeeds below once the chain changes. The cached control above rules out a
     // dead channel; the store probe below rules out a fill that happened anyway.
-    assert_refused_not_found(&client, &mut unauthorized, origin_hash, 0, "whole-blob").await?;
+    assert_refused_not_found(
+        &client,
+        &node,
+        &mut unauthorized,
+        origin_hash,
+        0,
+        "whole-blob",
+    )
+    .await?;
 
     // ...and it really was a *pull-initiation* refusal: nothing was written to the
     // store, so the node did not quietly warm itself off the back of the request.
@@ -160,6 +175,7 @@ async fn run() -> anyhow::Result<()> {
     // merely failed on its own.
     assert_refused_not_found(
         &client,
+        &node,
         &mut unauthorized,
         range_hash,
         RANGE_OFFSET,
@@ -229,8 +245,8 @@ async fn run() -> anyhow::Result<()> {
     //
     // `range_hash` has never been in the store, so the span is produced by a
     // backend fill and bao-verified against the whole-blob hash by the requester.
-    // Byte-exact against the backend's copy. (Which fill tier serves it — range
-    // vs whole-blob — is discussed at `RANGE_OFFSET`.)
+    // Byte-exact against the backend's copy. With the outboard seeded this reaches
+    // the origin range tier (see `RANGE_OFFSET`).
     let tail = client
         .fetch_once(&mut authorized, range_hash, RANGE_OFFSET, namespace)
         .await
@@ -239,6 +255,16 @@ async fn run() -> anyhow::Result<()> {
         tail.as_slice(),
         &range_payload[usize::try_from(RANGE_OFFSET)?..],
         "a ranged origin fetch must return the exact requested tail"
+    );
+
+    // Tier control (#1372): a range-tier serve imports only the requested span, so
+    // the whole blob is still ABSENT afterwards. The pre-#1372 whole-blob-degrade
+    // path would instead have fully imported it (`has_blob == true`) — this is what
+    // distinguishes the two, and is the dual of the `origin_hash` whole-blob probe
+    // above which asserts full presence.
+    assert!(
+        !client.probe(&node, range_hash).await?.body.has_blob,
+        "a range-tier serve must leave the blob only partially present, not fully imported"
     );
 
     // ------------------------------------------------------------ wire opacity
@@ -417,14 +443,23 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 
 /// Assert a single-shot fetch of `hash` is refused with a *signed* wire
 /// `NotFound`, rather than failing for some unrelated reason (transport error,
-/// stale nonce, timeout). `label` names the shape under test in the failure.
+/// stale nonce, timeout), AND that the refusal was the authorized-origin gate —
+/// not one of the six other reasons `NotFound` collapses. `label` names the shape
+/// under test in the failure.
+///
+/// The gate identity is pinned by the `unauthorized_origin` reject counter
+/// stepping 0→1 across this fetch (#1371): it is bumped before the network write,
+/// so a wire `NotFound` with no matching counter step would be a plain miss, not
+/// a gated refusal — which the structural reasoning alone could not rule out.
 async fn assert_refused_not_found(
     client: &ClientFixture,
+    node: &NodeFixture,
     session: &mut ChannelSession,
     hash: Hash,
     byte_offset: u64,
     label: &str,
 ) -> anyhow::Result<()> {
+    let before = node.scrape_metric(UNAUTHORIZED_ORIGIN_METRIC).await?;
     let refused = client
         .fetch_once(session, hash, byte_offset, alloy::primitives::U256::ZERO)
         .await
@@ -437,6 +472,13 @@ async fn assert_refused_not_found(
         .map(|r| r.error.clone())
         .with_context(|| format!("{label}: expected a signed refusal, got: {refused:#}"))?;
     assert_eq!(code, StreamError::NotFound, "{label}: refusal code");
+    let after = node.scrape_metric(UNAUTHORIZED_ORIGIN_METRIC).await?;
+    assert_eq!(
+        after,
+        before + 1,
+        "{label}: the refusal must bump the unauthorized-origin reject counter \
+         (0→1), pinning it to the gate rather than a plain cache miss"
+    );
     Ok(())
 }
 

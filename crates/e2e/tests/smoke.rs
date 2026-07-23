@@ -120,27 +120,46 @@ async fn run() -> anyhow::Result<()> {
     );
 
     // ---- Cross-layer: delivery landed on-chain — the seller redeemed the
-    // voucher(s), so FeeRouter accumulates the delivered-bytes (ADR 036). The
-    // client pays a cumulative voucher at each `voucher_interval_mb` boundary
-    // plus a closing voucher, so a payload spanning multiple intervals is
-    // redeemed on-chain in more than one step: served-bytes climbs to the exact
-    // payload total but is briefly observable at an intermediate boundary. Poll
-    // until it *reaches* the expected total (not merely past zero — that races
-    // the first interval's redemption), then assert exact equality to still
-    // catch accounting drift that would overshoot the payload size.
-    let expected_served = U256::from(payload.len());
+    // voucher(s), so FeeRouter accumulates the paid byte count (ADR 036 makes
+    // this the canonical vote-weight source). Paid bytes are WIRE bytes — content
+    // plus interleaved bao proof nodes (ADR 038 §Payment metering) — so a fully
+    // settled 2 MiB delivery lands `align_range(0, 0, len).wire_len()`: the
+    // content total plus ~0.4% proof overhead.
+    //
+    // The figure observable at read time sits in `[content_bytes, wire_bytes]`.
+    // The client pays a cumulative voucher at each `voucher_interval_mb` boundary
+    // (each ≥ the node's `redeem_threshold_micro_usdc`, so each redeems) plus a
+    // final closing voucher for the last partial group. That closing delta is the
+    // ~8 KiB of trailing proof — far below the redeem threshold — so whether it
+    // has settled on-chain by the time we read is a race: not yet → the content
+    // total, settled → the full wire total. Both are correct transient states of
+    // the *same* delivery, so asserting either exact value is the #1381 flake
+    // (observed content-total locally, wire-total on CI). Bound it on both sides
+    // instead — `< content` means redemption never landed; `> wire` means the
+    // accounting over-reported past the paid wire bytes.
+    let content_bytes = U256::from(payload.len());
+    let wire_bytes = U256::from(
+        decdn_bao_range::align_range(0, 0, u64::try_from(payload.len())?)
+            .context("align whole-blob payload for its wire length")?
+            .wire_len(),
+    );
+    // Poll until the full content has settled (proving redemption landed), not
+    // merely past zero — that races the first interval's redemption.
     let served = poll(Duration::from_secs(90), || async {
         let b = chain
             .served_bytes(node.operator_addr())
             .await
             .context("read served bytes")?;
-        Ok(if b >= expected_served { Some(b) } else { None })
+        Ok((b >= content_bytes).then_some(b))
     })
     .await?
-    .context("on-chain served-bytes never reached the payload size (seller redeem did not land)")?;
-    assert_eq!(
-        served, expected_served,
-        "on-chain served-bytes must equal the delivered payload size"
+    .context(
+        "on-chain served-bytes never reached the content total (seller redeem did not land)",
+    )?;
+    assert!(
+        served >= content_bytes && served <= wire_bytes,
+        "on-chain served-bytes {served} must land in [{content_bytes}, {wire_bytes}] \
+         (content total .. full wire total incl. bao proof) — outside means under- or over-accounting"
     );
 
     // ---- Time control: advancing the chain clock works (used by window

@@ -161,6 +161,9 @@ alloy::sol! {
         function assignmentTimelock() external view returns (uint256);
         function proposeAssignment(uint256 namespaceId, address[] operators) external;
         function activateAssignment(uint256 namespaceId) external;
+        // Publisher (own namespace) or governance removes one operator, closing
+        // the authorized-origin gate for a fresh backend-only hash (#1373).
+        function revokeAssignment(uint256 namespaceId, address operator) external;
         function getOrigins(uint256 namespaceId) external view returns (address[] memory);
         function isAuthorizedOrigin(uint256 namespaceId, address operator) external view returns (bool);
         // Pending (proposed, not-yet-activated) assignment read — the state
@@ -305,6 +308,14 @@ alloy::sol! {
         error TimestampWindowViolated(uint64 probeTsUs, uint64 streamTsUs);
         /// The probe `slash_sig` did not recover to the challenged operator.
         error InvalidProbeSignature();
+        /// The stream `slash_sig` did not recover to the challenged operator —
+        /// the stream-leg twin of `InvalidProbeSignature`, exercised by the
+        /// forged-stream negative (#1378).
+        error InvalidStreamSignature();
+        /// The (offense, probe, stream) triple was already spent by an earlier
+        /// slash. The dedup guard that lives in `SlashJudge` itself (not
+        /// `CapacityBond`), replayed under a fresh salt by the #1378 negative.
+        error EvidenceAlreadyUsed(bytes32 evidenceHash);
 
         function submitRateChallenge(
             address challengedNode,

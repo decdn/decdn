@@ -549,6 +549,29 @@ impl ChainFixture {
         crate::ensure_mined(&receipt, "proposeAssignment")
     }
 
+    /// Revoke one operator from `namespace`'s active origin set as the namespace
+    /// owner. Unlike `proposeAssignment`, revocation takes effect immediately (no
+    /// timelock) and emits `AssignmentRevoked` — the event `ChainOriginDirectory`
+    /// consumes to re-close the authorized-origin gate for a fresh backend-only
+    /// hash (#1373).
+    pub async fn revoke_assignment(
+        &self,
+        owner: &PrivateKeySigner,
+        namespace: U256,
+        operator: Address,
+    ) -> anyhow::Result<()> {
+        let provider = self.provider_for(owner);
+        let receipt = OriginAssignment::new(self.addrs.origin_assignment, &provider)
+            .revokeAssignment(namespace, operator)
+            .send()
+            .await
+            .context("revokeAssignment send")?
+            .get_receipt()
+            .await
+            .context("revokeAssignment receipt")?;
+        crate::ensure_mined(&receipt, "revokeAssignment")
+    }
+
     /// Advance past the assignment delay, then activate as the governance Timelock.
     pub async fn activate_assignment_after_timelock(&self, namespace: U256) -> anyhow::Result<()> {
         let assignment = OriginAssignment::new(self.addrs.origin_assignment, &self.admin);
@@ -1049,12 +1072,59 @@ impl ChainFixture {
             .context("submitPhantomChallenge receipt")?;
         crate::ensure_mined(&receipt, "submitPhantomChallenge")?;
 
-        for log in receipt.inner.logs() {
-            if let Ok(ev) = SlashJudge::Slashed::decode_log_data(&log.inner.data) {
-                return Ok(ev.slashId);
+        self.extract_slash_id(
+            receipt.inner.logs(),
+            "submitPhantomChallenge",
+            Some((Offense::Phantom, evidence_hash)),
+        )
+    }
+
+    /// Extract the `SlashJudge.Slashed` `slashId` from a reveal receipt's logs,
+    /// failing loudly on the pathologies the old inline scan hid (#1379):
+    ///
+    ///  * a `Slashed` log emitted by `SlashJudge` whose body fails to decode is
+    ///    surfaced as the ABI mismatch it is — the old `if let Ok(..)` swallowed
+    ///    the decode error and bailed "emitted no Slashed event", pointing at the
+    ///    contract when the cause was a stale hand-written binding;
+    ///  * when `expected` is supplied, the decoded `offenseType` and
+    ///    `evidenceHash` must match, pinning "slashed for the reason we induced"
+    ///    inside the fixture instead of leaving it to each journey.
+    ///
+    /// `CapacityBond.Slashed` is emitted in the same tx but under a different
+    /// address+topic0, so the filter never confuses the two.
+    fn extract_slash_id(
+        &self,
+        logs: &[alloy::rpc::types::Log],
+        what: &str,
+        expected: Option<(Offense, B256)>,
+    ) -> anyhow::Result<U256> {
+        for log in logs {
+            if log.address() != self.addrs.slash_judge
+                || log.topic0() != Some(&SlashJudge::Slashed::SIGNATURE_HASH)
+            {
+                continue;
             }
+            let ev = SlashJudge::Slashed::decode_log_data(&log.inner.data).with_context(|| {
+                format!("{what}: a SlashJudge Slashed log failed to decode (ABI drift?)")
+            })?;
+            if let Some((offense, evidence_hash)) = expected {
+                // `OffenseType` (a generated `sol!` enum) derives neither
+                // `PartialEq` nor `Debug`, so compare the canonical u8
+                // discriminants — the same encoding folded into `evidenceHash`.
+                let got = ev.offenseType as u8;
+                let want = offense.discriminant();
+                anyhow::ensure!(
+                    got == want,
+                    "{what}: slashed for offenseType {got}, but induced {want}",
+                );
+                anyhow::ensure!(
+                    ev.evidenceHash == evidence_hash,
+                    "{what}: slashed on a different evidenceHash than the one induced",
+                );
+            }
+            return Ok(ev.slashId);
         }
-        anyhow::bail!("submitPhantomChallenge mined but emitted no Slashed event")
+        anyhow::bail!("{what} mined but emitted no SlashJudge Slashed event")
     }
 
     /// Governable `SlashJudge.challengeBond` (TOKEN base units) — pulled and
@@ -1226,12 +1296,7 @@ impl ChainFixture {
             .with_context(|| format!("{what} receipt"))?;
         crate::ensure_mined(&receipt, what)?;
 
-        for log in receipt.inner.logs() {
-            if let Ok(ev) = SlashJudge::Slashed::decode_log_data(&log.inner.data) {
-                return Ok(ev.slashId);
-            }
-        }
-        anyhow::bail!("{what} mined but emitted no Slashed event")
+        self.extract_slash_id(receipt.inner.logs(), what, Some((offense, evidence_hash)))
     }
 
     /// `CapacityBond.escrowedTotal()` — TOKEN currently parked in slash escrow.
