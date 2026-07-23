@@ -174,6 +174,7 @@ impl ClientFixture {
         chain: &ChainFixture,
         node: &NodeFixture,
         hash: Hash,
+        namespace_id: alloy::primitives::U256,
     ) -> anyhow::Result<FetchOutcome> {
         let mut session = self.open_channel(chain, node).await?;
         let cid = session.channel_id();
@@ -197,6 +198,7 @@ impl ClientFixture {
                 &session.slash_domain,
                 session.operator_addr,
                 *hash.as_bytes(),
+                namespace_id.to_be_bytes(),
                 0,
                 TIMESTAMP_US,
                 // Loopback fixture: wall clock on the open, inactivity on the
@@ -273,7 +275,10 @@ impl ClientFixture {
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
         loop {
-            match self.fetch_once(&mut session, warmup, 0).await {
+            match self
+                .fetch_once(&mut session, warmup, 0, alloy::primitives::U256::ZERO)
+                .await
+            {
                 Ok(bytes) => return Ok((session, bytes)),
                 Err(e) if tokio::time::Instant::now() < deadline && is_retryable(&e) => {
                     tracing::debug!("session warm-up not ready ({e}); retrying");
@@ -317,6 +322,7 @@ impl ClientFixture {
         session: &mut ChannelSession,
         hash: Hash,
         byte_offset: u64,
+        namespace_id: alloy::primitives::U256,
     ) -> anyhow::Result<Vec<u8>> {
         let mut progress = VoucherProgress::default();
         let result = stream_fetch_tracked(
@@ -326,6 +332,7 @@ impl ClientFixture {
             &session.slash_domain,
             session.operator_addr,
             *hash.as_bytes(),
+            namespace_id.to_be_bytes(),
             byte_offset,
             TIMESTAMP_US,
             PullDeadlines::new(Duration::from_secs(30), Duration::from_secs(30))?,
@@ -362,6 +369,7 @@ impl ClientFixture {
         &self,
         session: &ChannelSession,
         hash: Hash,
+        namespace_id: alloy::primitives::U256,
     ) -> anyhow::Result<Vec<Vec<u8>>> {
         let conn = self
             .endpoint
@@ -374,6 +382,12 @@ impl ClientFixture {
             .map_err(|e| anyhow::anyhow!("open_bi for wire tap: {e}"))?;
         let req = StreamRequest {
             hash: *hash.as_bytes(),
+            // The backend-fill gate keys on the request namespace, so the tap must
+            // carry the ratified namespace the blob is published under — otherwise
+            // the authorized-origin gate refuses and the tap captures a refusal
+            // instead of a delivery. The origin backend itself remains hash-keyed
+            // and opaque (it never sees the namespace).
+            namespace_id: namespace_id.to_be_bytes(),
             channel_id: session.ctx.channel_id.into(),
             byte_offset: 0,
             byte_len: 0,
@@ -579,6 +593,8 @@ impl ClientFixture {
             &slash_domain,
             node.operator_addr(),
             *hash.as_bytes(),
+            // Refusal tap: the point is that the node refuses; no namespace routing.
+            decdn_protocol::client::NO_NAMESPACE,
             0,
             timestamp_us,
             PullDeadlines::new(Duration::from_secs(30), Duration::from_secs(30))?,

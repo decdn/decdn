@@ -815,6 +815,9 @@ pub async fn stream_fetch(
         slash_domain,
         expected_signer,
         hash,
+        // `stream_fetch` is a test/loopback convenience for node-to-node pulls; a
+        // client that routes on a namespace calls `stream_fetch_tracked` directly.
+        decdn_protocol::client::NO_NAMESPACE,
         byte_offset,
         timestamp_us,
         // The legacy single-deadline shape (#1134): this helper's callers are
@@ -853,6 +856,7 @@ pub async fn stream_fetch_tracked(
     slash_domain: &Eip712Domain,
     expected_signer: Address,
     hash: [u8; 32],
+    namespace_id: [u8; 32],
     byte_offset: u64,
     timestamp_us: u64,
     deadlines: PullDeadlines,
@@ -866,6 +870,7 @@ pub async fn stream_fetch_tracked(
         slash_domain,
         expected_signer,
         hash,
+        namespace_id,
         byte_offset,
         timestamp_us,
         deadlines,
@@ -902,6 +907,7 @@ pub async fn stream_fetch_tracked_with_progress(
     slash_domain: &Eip712Domain,
     expected_signer: Address,
     hash: [u8; 32],
+    namespace_id: [u8; 32],
     byte_offset: u64,
     timestamp_us: u64,
     deadlines: PullDeadlines,
@@ -926,6 +932,7 @@ pub async fn stream_fetch_tracked_with_progress(
             slash_domain,
             expected_signer,
             hash,
+            namespace_id,
             byte_offset,
             timestamp_us,
             max_blob_size_bytes,
@@ -1008,6 +1015,9 @@ pub async fn stream_fetch_shared(
             slash_domain,
             expected_signer,
             hash,
+            // Shared-channel pulls are node-to-node cache-miss fills (the daemon
+            // as buyer); the requester already discovered the holder.
+            decdn_protocol::client::NO_NAMESPACE,
             byte_offset,
             timestamp_us,
             max_blob_size_bytes,
@@ -1053,6 +1063,7 @@ async fn open_stream(
     slash_domain: &Eip712Domain,
     expected_signer: Address,
     hash: [u8; 32],
+    namespace_id: [u8; 32],
     byte_offset: u64,
     timestamp_us: u64,
     open: Duration,
@@ -1075,6 +1086,14 @@ async fn open_stream(
 
         let req = StreamRequest {
             hash,
+            // The serving node routes on this for its pull-through authorized-origin
+            // gate and origin-directory fallback (ADR 005 §Namespace routing). A
+            // client fetch passes the namespace it published under; a node-to-node
+            // pull to a DHT-discovered holder passes `NO_NAMESPACE` (0) — the holder
+            // already has the bytes (ADR 002 §Retrieval by namespace) — while a pull
+            // to a directory-discovered cold origin passes the served namespace so
+            // that origin's gate resolves and it can fill from its own backend.
+            namespace_id,
             channel_id: ctx.channel_id.into(),
             byte_offset,
             // Whole-tail fetch; a bounded range is plumbed by the origin range-pull
@@ -1119,6 +1138,7 @@ async fn fetch_inner(
     slash_domain: &Eip712Domain,
     expected_signer: Address,
     hash: [u8; 32],
+    namespace_id: [u8; 32],
     byte_offset: u64,
     timestamp_us: u64,
     max_blob_size_bytes: u64,
@@ -1134,6 +1154,14 @@ async fn fetch_inner(
         slash_domain,
         expected_signer,
         hash,
+        // A client fetch routes on the namespace it published under (ADR 005
+        // §Namespace routing). The node-to-node callers that reach *this*
+        // function (shared-channel / loopback fills) pass NO_NAMESPACE — the
+        // requester already discovered a holder, so the downstream node needs no
+        // hint (ADR 002 §Retrieval by namespace). The directory-discovered
+        // cold-origin leg, which *does* carry a real namespace, goes through
+        // `open_progressive_pull` → `open_stream` directly, not here.
+        namespace_id,
         byte_offset,
         timestamp_us,
         open,
@@ -1619,6 +1647,7 @@ pub async fn open_progressive_pull(
     slash_domain: &Eip712Domain,
     expected_signer: Address,
     hash: [u8; 32],
+    namespace_id: [u8; 32],
     byte_offset: u64,
     timestamp_us: u64,
     max_blob_size_bytes: u64,
@@ -1632,6 +1661,14 @@ pub async fn open_progressive_pull(
         slash_domain,
         expected_signer,
         hash,
+        // Node-to-node pull. `NO_NAMESPACE` (0) for a DHT-discovered *holder* — it
+        // already holds the bytes, so the downstream node needs no namespace (ADR
+        // 002 §Retrieval by namespace). But a directory-discovered *cold origin* is
+        // reached with the served request's namespace: it must fill from its own
+        // backend, and its pull-through authorized-origin gate resolves on that
+        // namespace (ADR 005 §Namespace routing). The caller passes whichever
+        // applies.
+        namespace_id,
         byte_offset,
         timestamp_us,
         deadlines.open,

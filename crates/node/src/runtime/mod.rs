@@ -936,18 +936,12 @@ async fn build_chain_and_handlers(
     let (origin_directory, origin_watcher): (
         Arc<dyn crate::dht::origin::OriginDirectory>,
         Option<Arc<crate::chain_events::resumable_watcher::WatcherHandle>>,
-    ) = if let (Some(origin_addr), Some(publisher_addr)) = (
-        cfg.blockchain.origin_assignment_address.as_deref(),
-        cfg.blockchain.publisher_registry_address.as_deref(),
-    ) {
+    ) = if let Some(origin_addr) = cfg.blockchain.origin_assignment_address.as_deref() {
         let origin_assignment_addr =
             parse_nonzero_address(origin_addr, "blockchain.origin_assignment_address")?;
-        let publisher_registry_addr =
-            parse_nonzero_address(publisher_addr, "blockchain.publisher_registry_address")?;
         let directory = crate::dht::ChainOriginDirectory::bootstrap(
             ProviderFactory::read_only(rpc_url.clone(), event_poll_interval),
             origin_assignment_addr,
-            publisher_registry_addr,
             capacity_bond_addr,
             cfg.blockchain.origin_directory_from_block,
             Arc::clone(&infra.watcher_checkpoint_store),
@@ -962,16 +956,15 @@ async fn build_chain_and_handlers(
         (Arc::new(directory), Some(origin_watcher))
     } else {
         // The empty fallback makes the pull-through authorized-origin gate deny
-        // every hash, and that denial is indistinguishable from ordinary
+        // every request, and that denial is indistinguishable from ordinary
         // operation (a wire `NotFound`). Warn if the gate is armed on a node with
         // no chain directory so the dead path is diagnosable rather than silent
         // (#1292).
         if cfg.cache.pull_through_require_authorized_origin {
             tracing::warn!(
                 "cache.pull_through_require_authorized_origin is set but no chain origin \
-                 directory is configured (blockchain.origin_assignment_address / \
-                 publisher_registry_address unset); the gate will deny every hash — \
-                 pull-through misses return NotFound"
+                 directory is configured (blockchain.origin_assignment_address unset); \
+                 the gate will deny every cache-miss pull with a wire NotFound"
             );
         }
         (Arc::new(crate::dht::origin::EmptyOriginDirectory), None)

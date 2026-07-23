@@ -196,6 +196,19 @@ impl ClientMessage {
 pub struct StreamRequest {
     /// BLAKE3 hash of the requested blob (iroh `Hash`, 32 bytes).
     pub hash: [u8; 32],
+    /// Namespace the content is published under, as a big-endian `uint256`
+    /// (ADR 002 §Retrieval by namespace, ADR 005 §Namespace routing). All-zero
+    /// = no namespace: the node serves best-effort from local cache / DHT only,
+    /// with no authorized origins. A non-zero value routes cache-miss origin
+    /// pulls to that namespace's `OriginAssignment` set. It is a **routing hint,
+    /// not a trust anchor** — returned bytes are verified against `hash`
+    /// independently, so a wrong/hostile value can only fail the fetch, never
+    /// corrupt delivery. The node layer converts this to an alloy `U256`;
+    /// keeping it `[u8; 32]` here (like `hash`/`channel_id`) leaves `protocol`
+    /// alloy-free. Billing-agnostic but load-bearing for routing, so it lives in
+    /// the frozen base — every node reads it for origin routing (a node with no
+    /// chain origin directory configured resolves nothing from it).
+    pub namespace_id: [u8; 32],
     /// `channelId = keccak256(client, provider, channelNonce)` (ADR 003).
     pub channel_id: [u8; 32],
     /// Resume position in bytes; `0` for a full-blob fetch.
@@ -211,6 +224,11 @@ pub struct StreamRequest {
     /// Requester-generated microseconds since the Unix epoch, echoed back.
     pub timestamp_us: u64,
 }
+
+/// The reserved "no namespace" [`StreamRequest::namespace_id`] value (all-zero
+/// big-endian `uint256`): content published without a namespace, served
+/// best-effort from cache / DHT with no authorized origins (ADR 002 §Namespace 0).
+pub const NO_NAMESPACE: [u8; 32] = [0u8; 32];
 
 impl StreamRequest {
     /// The bounded range length as an explicit option, decoding the `byte_len`
@@ -828,6 +846,7 @@ mod tests {
     fn sample_request() -> StreamRequest {
         StreamRequest {
             hash: [1u8; 32],
+            namespace_id: [3u8; 32],
             channel_id: [2u8; 32],
             byte_offset: 0,
             byte_len: 0,

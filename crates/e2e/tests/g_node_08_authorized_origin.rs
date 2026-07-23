@@ -5,8 +5,8 @@
 //!
 //! The node runs with `cache.pull_through_require_authorized_origin`, so its
 //! reactive cache-miss fill sits behind the chain-backed authorized-origin
-//! directory (`ContentClaimed` → `OriginAssignment.getOrigins` → active
-//! operator). Before the publisher claims `H` and the DAO ratifies the operator
+//! directory (request namespace → `OriginAssignment.getOrigins` → active
+//! operator). Before the DAO ratifies the namespace's operator
 //! set, the node is a plain cache: it serves what it already holds and refuses to
 //! reach into its own backend for anything else. After ratification the gate
 //! opens: a client miss makes the same node fetch `H` opaquely from that backend
@@ -33,7 +33,7 @@
 
 use std::time::Duration;
 
-use alloy::primitives::{B256, U256};
+use alloy::primitives::U256;
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::Context;
 use decdn_cache::Hash;
@@ -117,16 +117,11 @@ async fn run() -> anyhow::Result<()> {
     let client = ClientFixture::new(&chain).await?;
 
     // ---------------------------------------------------------------- negative
-    // Chain truth first: nothing claims H, and namespace 0's default-open
-    // allow-list is empty, so the directory resolves NO authorized origin for it.
-    // This is what the gate reads — assert it rather than assume it.
+    // Chain truth first: the client fetches under namespace 0 (no namespace),
+    // which has no authorized origins (ADR 002 § Namespace 0), so the directory
+    // resolves NO authorized origin for the request. This is what the gate reads
+    // — assert it rather than assume it.
     assert!(chain.origins(U256::ZERO).await?.is_empty());
-    assert!(
-        chain
-            .content_namespaces(b256(origin_hash))
-            .await?
-            .is_empty()
-    );
 
     // The cache role is untouched by the gate: a blob the node already holds is
     // served exactly as before. That serve doubles as this session's warm-up, so
@@ -177,23 +172,21 @@ async fn run() -> anyhow::Result<()> {
     );
 
     // -------------------------------------------------------------- ratification
-    // Publisher claims the three backend-only hashes into its namespace and
-    // proposes this operator as their origin; the DAO ratifies through the
-    // assignment timelock.
+    // The publisher creates a namespace and proposes this operator as its origin;
+    // the DAO ratifies through the assignment timelock. There is no per-hash claim
+    // (ADR 002 § Hash-to-namespace association) — the namespace is the unit of
+    // origin authority, and a request carries the namespace its content is
+    // published under.
     let publisher = PrivateKeySigner::random();
     let namespace = chain.create_namespace(&publisher).await?;
-    for hash in [origin_hash, range_hash, tapped_hash] {
-        chain
-            .claim_content(&publisher, namespace, b256(hash))
-            .await?;
-    }
     chain
         .propose_assignment(&publisher, namespace, &[node.operator_addr()])
         .await?;
     chain.activate_assignment_after_timelock(namespace).await?;
     assert_eq!(
-        chain.content_namespaces(b256(origin_hash)).await?,
-        vec![namespace]
+        chain.origins(namespace).await?,
+        vec![node.operator_addr()],
+        "the DAO-ratified assignment must list this operator as the namespace's origin"
     );
     // Confirms the assignment activated and names this operator. Note the node's
     // gate does not itself read operator identity (#1368) — this asserts the
@@ -213,7 +206,7 @@ async fn run() -> anyhow::Result<()> {
     // channel as a side effect. That is incidental, not required — the 3-day
     // assignment timelock is far short of the 90-day channel duration, so the
     // `unauthorized` session is still perfectly usable here.)
-    let served = client.fetch(&chain, &node, origin_hash).await?;
+    let served = client.fetch(&chain, &node, origin_hash, namespace).await?;
     assert_eq!(
         served.bytes, origin_payload,
         "a recognized origin must serve the backend's bytes verbatim"
@@ -228,9 +221,8 @@ async fn run() -> anyhow::Result<()> {
     let (mut authorized, _) = client.open_session(&chain, &node, cached_hash).await?;
 
     // Ordering is load-bearing: the successful `fetch` above proves the watcher
-    // has applied `AssignmentActivated`, and since all three `ContentClaimed`
-    // were mined in earlier blocks and the sink applies logs in block order, it
-    // transitively proves `range_hash`'s claim is in the directory too. Together
+    // has applied `AssignmentActivated` (a single activation covers the whole
+    // namespace, so every hash served under it resolves at once). Together
     // with the warm-up (which covers channel registration — a separate fact),
     // that is what lets the ranged fetch below use `fetch_once` (no retry)
     // safely. Do not reorder these two blocks.
@@ -240,7 +232,7 @@ async fn run() -> anyhow::Result<()> {
     // Byte-exact against the backend's copy. (Which fill tier serves it — range
     // vs whole-blob — is discussed at `RANGE_OFFSET`.)
     let tail = client
-        .fetch_once(&mut authorized, range_hash, RANGE_OFFSET)
+        .fetch_once(&mut authorized, range_hash, RANGE_OFFSET, namespace)
         .await
         .context("ranged origin fetch")?;
     assert_eq!(
@@ -250,8 +242,15 @@ async fn run() -> anyhow::Result<()> {
     );
 
     // ------------------------------------------------------------ wire opacity
-    assert_backend_never_on_the_wire(&client, &node, &authorized, tapped_hash, &tapped_payload)
-        .await?;
+    assert_backend_never_on_the_wire(
+        &client,
+        &node,
+        &authorized,
+        tapped_hash,
+        namespace,
+        &tapped_payload,
+    )
+    .await?;
 
     Ok(())
 }
@@ -279,13 +278,16 @@ async fn assert_backend_never_on_the_wire(
     node: &NodeFixture,
     session: &ChannelSession,
     hash: Hash,
+    namespace: U256,
     payload: &[u8],
 ) -> anyhow::Result<()> {
     assert!(
         !client.probe(node, hash).await?.body.has_blob,
         "the tapped blob must start absent, so the tap covers a real backend fill"
     );
-    let frames = client.capture_delivery_wire(session, hash).await?;
+    let frames = client
+        .capture_delivery_wire(session, hash, namespace)
+        .await?;
 
     // The tap captured a real delivery, not a refusal: an `ok` response promising
     // the blob's true size, followed by every chunk of it.
@@ -424,7 +426,7 @@ async fn assert_refused_not_found(
     label: &str,
 ) -> anyhow::Result<()> {
     let refused = client
-        .fetch_once(session, hash, byte_offset)
+        .fetch_once(session, hash, byte_offset, alloy::primitives::U256::ZERO)
         .await
         .err()
         .with_context(|| {
@@ -452,8 +454,4 @@ fn payload(seed: u8, len: usize) -> Vec<u8> {
             0x80 | (seed ^ step).wrapping_mul(7) >> 1
         })
         .collect()
-}
-
-fn b256(hash: Hash) -> B256 {
-    B256::from_slice(hash.as_bytes())
 }

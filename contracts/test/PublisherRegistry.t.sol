@@ -56,7 +56,7 @@ contract PublisherRegistryTest is Test {
         vm.prank(alice);
         uint256 id = reg.createNamespace();
         assertGt(id, 0);
-        // default-open namespace 0 has no owner
+        // namespace 0 (no namespace) has no owner
         assertEq(reg.ownerOf(0), address(0));
     }
 
@@ -71,74 +71,6 @@ contract PublisherRegistryTest is Test {
         vm.prank(alice);
         vm.expectRevert(abi.encodeWithSelector(PublisherRegistry.NamespaceCapReached.selector, 2));
         reg.createNamespace();
-    }
-
-    // -----------------------------------------------------------------
-    // Content claims
-    // -----------------------------------------------------------------
-
-    function test_claimContent_recordsClaim() public {
-        vm.prank(alice);
-        uint256 id = reg.createNamespace();
-
-        bytes32 hash = keccak256("blob");
-        vm.prank(alice);
-        reg.claimContent(id, hash);
-
-        uint256[] memory claims = reg.namespaceOf(hash);
-        assertEq(claims.length, 1);
-        assertEq(claims[0], id);
-    }
-
-    function test_claimContent_multiClaimAcrossNamespaces() public {
-        vm.prank(alice);
-        uint256 aliceNs = reg.createNamespace();
-        vm.prank(bob);
-        uint256 bobNs = reg.createNamespace();
-
-        bytes32 hash = keccak256("shared-blob");
-        vm.prank(alice);
-        reg.claimContent(aliceNs, hash);
-        vm.prank(bob);
-        reg.claimContent(bobNs, hash);
-
-        uint256[] memory claims = reg.namespaceOf(hash);
-        assertEq(claims.length, 2, "independent multi-claim is allowed");
-        assertEq(claims[0], aliceNs);
-        assertEq(claims[1], bobNs);
-    }
-
-    function test_claimContent_revertsOnDuplicateSameNamespace() public {
-        vm.prank(alice);
-        uint256 id = reg.createNamespace();
-        bytes32 hash = keccak256("blob");
-
-        vm.prank(alice);
-        reg.claimContent(id, hash);
-        vm.prank(alice);
-        vm.expectRevert(abi.encodeWithSelector(PublisherRegistry.AlreadyClaimed.selector, id, hash));
-        reg.claimContent(id, hash);
-    }
-
-    function test_claimContent_revertsIfNotOwner() public {
-        vm.prank(alice);
-        uint256 id = reg.createNamespace();
-        bytes32 hash = keccak256("blob");
-
-        vm.prank(bob);
-        vm.expectRevert(abi.encodeWithSelector(PublisherRegistry.NotNamespaceOwner.selector, id, bob));
-        reg.claimContent(id, hash);
-    }
-
-    function test_claimContent_revertsForDefaultOpenNamespace() public {
-        // No one owns namespace 0, so claiming under it reverts.
-        vm.prank(alice);
-        vm.expectRevert(abi.encodeWithSelector(PublisherRegistry.NotNamespaceOwner.selector, uint256(0), alice));
-        reg.claimContent(0, keccak256("blob"));
-    }
-
-    function test_namespaceOf_emptyForUnclaimed() public view {
-        assertEq(reg.namespaceOf(keccak256("never-claimed")).length, 0);
     }
 
     // -----------------------------------------------------------------

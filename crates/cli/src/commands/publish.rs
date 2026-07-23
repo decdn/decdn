@@ -1,7 +1,10 @@
 //! `decdn publish` — origin-publisher control plane (issue #1029).
 //!
-//! Submits the `PublisherRegistry` / `OriginAssignment` writes that map
-//! content to namespaces and propose authorized origins. Mirrors the
+//! Submits the `PublisherRegistry` / `OriginAssignment` writes that create
+//! namespaces and propose their authorized origins. Content is bound to a
+//! namespace off-chain by the requester at fetch time (ADR 002 §
+//! Hash-to-namespace association), so there is no per-hash on-chain claim.
+//! Mirrors the
 //! on-chain-write pattern of `super::register`: resolve chain coordinates and
 //! parse the target contract address, then — on the submit path only — load
 //! the keystore signer, build a wallet-filled provider, submit, and print a
@@ -22,7 +25,6 @@ use decdn_incentive::publisher_registry::PublisherRegistry;
 
 use crate::commands::chain_ctx;
 use crate::commands::chain_ctx::ResolvedPublish;
-use crate::commands::fetch::parse_hash;
 
 /// Entry point for `decdn publish`.
 pub async fn publish_dispatch(
@@ -33,7 +35,6 @@ pub async fn publish_dispatch(
         cli::PublishCommand::Namespace(ns) => match &ns.command {
             cli::NamespaceCommand::Create(a) => namespace_create(a, global_config).await,
         },
-        cli::PublishCommand::Claim(a) => claim(a, global_config).await,
         cli::PublishCommand::Assign(a) => assign(a, global_config).await,
     }
 }
@@ -245,80 +246,6 @@ async fn namespace_create(
 }
 
 // -------------------------------------------------------------------------
-// claim
-// -------------------------------------------------------------------------
-
-pub(crate) struct ClaimOutcome {
-    pub(crate) operator: Option<Address>,
-    pub(crate) registry: Address,
-    pub(crate) namespace_id: u64,
-    pub(crate) hash: [u8; 32],
-    pub(crate) tx: Option<B256>,
-}
-
-pub(crate) fn write_claim_outcome(
-    w: &mut impl io::Write,
-    o: &ClaimOutcome,
-    json: bool,
-) -> io::Result<()> {
-    let hash_hex = format!("0x{}", alloy::hex::encode(o.hash));
-    if json {
-        let value = serde_json::json!({
-            "submitted": o.tx.is_some(),
-            "tx": o.tx.map(|h| format!("{h:#x}")),
-            "operator": o.operator.map(|a| format!("{a:#x}")),
-            "publisher_registry": format!("{:#x}", o.registry),
-            "namespace_id": o.namespace_id,
-            "hash": hash_hex,
-        });
-        return writeln!(w, "{value}");
-    }
-    if let Some(op) = o.operator {
-        writeln!(w, "operator={op:#x}")?;
-    }
-    writeln!(w, "publisher_registry={:#x}", o.registry)?;
-    writeln!(w, "namespace_id={}", o.namespace_id)?;
-    writeln!(w, "hash={hash_hex}")?;
-    match o.tx {
-        Some(h) => writeln!(w, "submitted=true tx={h:#x}"),
-        None => writeln!(w, "submitted=false dry_run=true"),
-    }
-}
-
-async fn claim(args: &cli::ClaimArgs, global_config: Option<&Path>) -> anyhow::Result<()> {
-    let hash = parse_hash(&args.hash)?;
-    let (resolved, registry) = registry_ctx(&args.chain, global_config)?;
-    let mut outcome = ClaimOutcome {
-        operator: None,
-        registry,
-        namespace_id: args.namespace,
-        hash,
-        tx: None,
-    };
-
-    if !args.chain.common.dry_run {
-        let (signer, provider) = signer_and_provider(&resolved, &args.chain).await?;
-        outcome.operator = Some(signer.address());
-        let contract = PublisherRegistry::new(registry, &provider);
-        decdn_incentive::tx::send(
-            contract.claimContent(U256::from(args.namespace), B256::from(hash)),
-            "claimContent",
-            Some(
-                "the signer must own the namespace, and claims are append-only — re-claiming \
-                 a hash this namespace already claimed reverts",
-            ),
-            &mut outcome.tx,
-        )
-        .await?;
-    }
-
-    let mut out = io::stdout().lock();
-    write_claim_outcome(&mut out, &outcome, args.chain.common.json)
-        .context("failed to write claim output")?;
-    Ok(())
-}
-
-// -------------------------------------------------------------------------
 // assign (propose-only)
 // -------------------------------------------------------------------------
 
@@ -498,23 +425,6 @@ mod tests {
     }
 
     #[test]
-    fn claim_output_formats() {
-        let o = ClaimOutcome {
-            operator: Some(Address::repeat_byte(0xCD)),
-            registry: Address::repeat_byte(0x01),
-            namespace_id: 7,
-            hash: [0xAB; 32],
-            tx: Some(B256::repeat_byte(0x55)),
-        };
-        let mut buf = Vec::new();
-        write_claim_outcome(&mut buf, &o, false).unwrap();
-        let s = String::from_utf8(buf).unwrap();
-        assert!(s.contains("namespace_id=7"), "{s}");
-        assert!(s.contains("hash=0xabab"), "{s}");
-        assert!(s.contains("submitted=true tx=0x5555"), "{s}");
-    }
-
-    #[test]
     fn assign_output_states_propose_only() {
         let o = AssignOutcome {
             operator: Some(Address::repeat_byte(0xCD)),
@@ -592,26 +502,6 @@ mod tests {
         assert_eq!(
             v["operator"],
             serde_json::json!(format!("{:#x}", done.operator.unwrap()))
-        );
-    }
-
-    #[test]
-    fn claim_json_round_trips() {
-        let o = ClaimOutcome {
-            operator: Some(Address::repeat_byte(0xCD)),
-            registry: Address::repeat_byte(0x01),
-            namespace_id: 7,
-            hash: [0xAB; 32],
-            tx: Some(B256::repeat_byte(0x55)),
-        };
-        let mut buf = Vec::new();
-        write_claim_outcome(&mut buf, &o, true).unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
-        assert_eq!(v["submitted"], serde_json::json!(true));
-        assert_eq!(v["namespace_id"], serde_json::json!(7));
-        assert_eq!(
-            v["hash"],
-            serde_json::json!(format!("0x{}", "ab".repeat(32)))
         );
     }
 

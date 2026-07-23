@@ -387,6 +387,7 @@ impl NodeOrigin {
     pub async fn open_progressive_pull(
         &self,
         hash: Hash,
+        namespace_id: U256,
     ) -> Option<(UpstreamPullHeader, NodeProgressivePull)> {
         let deps = self.deps.get()?;
         let hash_bytes = *hash.as_bytes();
@@ -406,7 +407,7 @@ impl NodeOrigin {
             deps.metrics.node_pull_attempt();
             attempt_metered = true;
             let outcome = self
-                .open_from_candidates(deps, &cached, hash_bytes, budget)
+                .open_from_candidates(deps, &cached, hash_bytes, namespace_id, budget)
                 .await;
             if let Some(opened) = outcome.payload {
                 return Some(opened);
@@ -430,7 +431,7 @@ impl NodeOrigin {
         }
 
         // ADR 001 §Probe cache: "if all fail, run a fresh DHT lookup + probe."
-        let providers = discover(deps, hash_bytes).await;
+        let providers = discover(deps, hash_bytes, namespace_id).await;
         if providers.is_empty() {
             // `node_pull_no_providers` means "the blob is unavailable on the
             // network, NOT a pull failure" — mutually exclusive with
@@ -448,7 +449,7 @@ impl NodeOrigin {
         }
         // Writes the probe cache at its tail.
         let ranked = probe_and_rank(deps, providers, hash_bytes).await;
-        self.open_from_candidates(deps, &ranked, hash_bytes, budget)
+        self.open_from_candidates(deps, &ranked, hash_bytes, namespace_id, budget)
             .await
             .payload
     }
@@ -462,12 +463,16 @@ impl NodeOrigin {
         deps: &NodeOriginDeps,
         ranked: &[Candidate],
         hash_bytes: [u8; 32],
+        namespace_id: U256,
         budget: usize,
     ) -> PullOutcome<(UpstreamPullHeader, NodeProgressivePull)> {
         let mut attempts = 0;
         for candidate in ranked.iter().take(budget) {
             attempts += 1;
-            if let Some(opened) = self.open_from_candidate(deps, candidate, hash_bytes).await {
+            if let Some(opened) = self
+                .open_from_candidate(deps, candidate, hash_bytes, namespace_id)
+                .await
+            {
                 return PullOutcome {
                     payload: Some(opened),
                     attempts,
@@ -494,6 +499,7 @@ impl NodeOrigin {
         deps: &NodeOriginDeps,
         candidate: &Candidate,
         hash_bytes: [u8; 32],
+        namespace_id: U256,
     ) -> Option<(UpstreamPullHeader, NodeProgressivePull)> {
         let Ok(pk) = PublicKey::from_bytes(&candidate.node_id) else {
             return None;
@@ -575,6 +581,12 @@ impl NodeOrigin {
             &deps.slash_domain,
             provider_addr,
             hash_bytes,
+            // The served client's namespace, threaded onto this leg so a
+            // directory-discovered cold origin's pull-through authorized-origin gate
+            // resolves and it fills from its own backend (#1401 review). A
+            // DHT-discovered holder ignores it — it serves from cache. Converted to
+            // the wire's big-endian `[u8; 32]` at this node/protocol boundary.
+            namespace_id.to_be_bytes(),
             0,
             now_micros(),
             deps.config.max_blob_size_bytes,
@@ -917,7 +929,11 @@ impl Origin for NodeOrigin {
             }
 
             // ADR 001 §Probe cache: "if all fail, run a fresh DHT lookup + probe."
-            let providers = discover(deps, hash_bytes).await;
+            // This is the generic `Origin::fetch` path (buffered / prefetch / warm),
+            // a hash-only pull with no client namespace, so it takes no on-chain
+            // origin-directory fallback (`NO_NAMESPACE`). The namespace-aware
+            // client-serve path is `open_progressive_pull`.
+            let providers = discover(deps, hash_bytes, U256::ZERO).await;
             if providers.is_empty() {
                 // `node_pull_no_providers` means "the blob is unavailable on the
                 // network, NOT a pull failure" — mutually exclusive with
@@ -962,9 +978,21 @@ impl Origin for NodeOrigin {
 }
 
 /// Discover candidate providers for `hash`: the DHT iterative lookup first,
-/// falling back to the on-chain origin directory when the lookup converges
-/// empty (ADR 022 §`FIND_VALUE` Flow).
-async fn discover(deps: &NodeOriginDeps, hash_bytes: [u8; 32]) -> Vec<DhtNodeId> {
+/// falling back to the on-chain origin directory keyed on `namespace_id` when the
+/// lookup converges empty (ADR 022 §`FIND_VALUE` Flow). `namespace_id` is the
+/// namespace the serving node received on the client `StreamRequest`. Within the
+/// pull it is consumed here, at the directory fallback; a DHT-discovered *holder*
+/// already has the bytes and needs no namespace, but a directory-discovered *cold
+/// origin* is then reached with this same namespace so its own pull-through gate
+/// resolves (#1401, threaded by the progressive client-serve path). Origin backends
+/// (S3/HTTP/FS) are hash-keyed and never see it. `NO_NAMESPACE` (0) resolves to no
+/// authorized origins, so a hash-only pull (prefetch / warm) simply gets no
+/// directory fallback (ADR 002 §Namespace 0).
+async fn discover(
+    deps: &NodeOriginDeps,
+    hash_bytes: [u8; 32],
+    namespace_id: U256,
+) -> Vec<DhtNodeId> {
     let target = DhtHash::from_bytes(hash_bytes);
     let providers = crate::dht::find_providers(
         &deps.endpoint,
@@ -978,7 +1006,7 @@ async fn discover(deps: &NodeOriginDeps, hash_bytes: [u8; 32]) -> Vec<DhtNodeId>
     )
     .await;
     if providers.is_empty() {
-        deps.origin_directory.lookup_origins(&target)
+        deps.origin_directory.lookup_origins(namespace_id)
     } else {
         providers
     }

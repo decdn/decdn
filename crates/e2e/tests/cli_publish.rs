@@ -1,16 +1,17 @@
 //! Live anvil-backed e2e for the `decdn publish` control-plane binary paths
-//! (issue #1073, follow-up to #1029). Drives the three on-chain `decdn publish`
+//! (issue #1073, follow-up to #1029). Drives the on-chain `decdn publish`
 //! subcommands end-to-end against the deployed `PublisherRegistry` /
 //! `OriginAssignment` and asserts the writes landed:
 //!
 //! 1. `publish namespace create` mints a namespace owned by the signer; the id
 //!    is parsed from the `--json` receipt and confirmed via `ownerOf`.
-//! 2. `publish claim <hash> --namespace <id>` records the claim, so
-//!    `namespaceOf(hash)` now lists exactly that namespace.
-//! 3. `publish assign <id> <operator>` is **propose-only** (it calls
+//! 2. `publish assign <id> <operator>` is **propose-only** (it calls
 //!    `proposeAssignment`, not `activateAssignment`), so `getPendingAssignment`
 //!    reflects the proposed set with a non-zero timelock `readyAt` while
 //!    `getOrigins` stays empty until governance ratifies.
+//!
+//! There is no per-hash on-chain claim (ADR 002 § Hash-to-namespace
+//! association) — content is bound to a namespace off-chain at fetch time.
 //!
 //! This covers the on-chain submit path the `crates/cli` `publish.rs` unit tests
 //! intentionally skip — they cover output formatting only, matching the
@@ -43,7 +44,7 @@
 
 use std::time::Duration;
 
-use alloy::primitives::{B256, U256};
+use alloy::primitives::U256;
 use anyhow::Context;
 use decdn_e2e::bindings::{OriginAssignment, PublisherRegistry};
 use decdn_e2e::chain::ChainFixture;
@@ -57,7 +58,7 @@ use tokio::process::Command;
 const OVERALL_TIMEOUT: Duration = Duration::from_secs(780);
 
 #[tokio::test(flavor = "multi_thread")]
-async fn publish_namespace_claim_assign_land_on_chain() -> anyhow::Result<()> {
+async fn publish_namespace_and_assign_land_on_chain() -> anyhow::Result<()> {
     tokio::time::timeout(OVERALL_TIMEOUT, Box::pin(run()))
         .await
         .context("cli publish e2e exceeded the overall timeout")??;
@@ -98,28 +99,7 @@ async fn run() -> anyhow::Result<()> {
         "the CLI signer must own the namespace it created on-chain",
     );
 
-    // ---- 2. `publish claim <hash> --namespace <id>` records the claim, so
-    // `namespaceOf(hash)` now lists exactly this namespace. Any 32 bytes is a
-    // well-formed claim key; the `0x…` 64-hex form maps verbatim to the on-chain
-    // `bytes32` (`parse_hash` → `blake3::Hash::from_hex`).
-    let claim_hash = B256::repeat_byte(0x42);
-    run_publish(
-        &node,
-        &[
-            "claim",
-            &format!("{claim_hash:#x}"),
-            "--namespace",
-            &namespace_id.to_string(),
-        ],
-    )
-    .await?;
-    assert_eq!(
-        registry.namespaceOf(claim_hash).call().await?,
-        vec![U256::from(namespace_id)],
-        "namespaceOf(hash) must list exactly the claiming namespace",
-    );
-
-    // ---- 3. `publish assign <id> <operator>` is propose-only: it calls
+    // ---- 2. `publish assign <id> <operator>` is propose-only: it calls
     // `proposeAssignment`, not `activateAssignment`. So the *pending* proposal
     // carries the proposed set + a non-zero timelock deadline, while the active
     // (`getOrigins`) set stays empty until governance ratifies.

@@ -738,11 +738,9 @@ contract ContentBlacklistTest is Test {
         // Publisher standing is not region-gated even on a mismatched region.
         vm.prank(euBody);
         blacklist.addHashRegional(REGION_EU, SAMPLE_HASH, "DMCA-TEST"); // filer region is "US"
-        // Establish Publisher standing: filer owns a namespace that claimed the hash.
+        // Establish Publisher standing: filer owns the namespace it declares.
         vm.prank(filer);
         uint256 nsId = registry.createNamespace();
-        vm.prank(filer);
-        registry.claimContent(nsId, SAMPLE_HASH);
         vm.prank(filer);
         blacklist.openBlacklistAppeal(
             SAMPLE_HASH, REGION_EU, bytes32("e"), ContentBlacklist.StandingPath.Publisher, nsId
@@ -1224,20 +1222,19 @@ contract ContentBlacklistTest is Test {
     // filing (audit I-3)
     // -----------------------------------------------------------------
 
-    /// @dev Give `who` a namespace that has claimed `hash`, returning the id.
-    function _publisherStanding(address who, bytes32 hash) internal returns (uint256 nsId) {
+    /// @dev Give `who` a namespace, returning the id. Standing is namespace
+    ///      ownership only — the hash→namespace tie is off-chain (ADR 002).
+    function _publisherStanding(address who) internal returns (uint256 nsId) {
         vm.prank(who);
         nsId = registry.createNamespace();
-        vm.prank(who);
-        registry.claimContent(nsId, hash);
     }
 
     // --- Publisher path ---
 
-    function test_publisherStanding_ownerOfClaimingNamespace_succeeds() public {
+    function test_publisherStanding_ownerOfNamespace_succeeds() public {
         vm.prank(regionalBody);
         blacklist.addHashRegional(REGION_US, SAMPLE_HASH, "DMCA-TEST");
-        uint256 nsId = _publisherStanding(filer, SAMPLE_HASH);
+        uint256 nsId = _publisherStanding(filer);
         vm.prank(filer);
         blacklist.openBlacklistAppeal(
             SAMPLE_HASH, REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Publisher, nsId
@@ -1248,25 +1245,8 @@ contract ContentBlacklistTest is Test {
     function test_publisherStanding_nonOwner_reverts() public {
         vm.prank(regionalBody);
         blacklist.addHashRegional(REGION_US, SAMPLE_HASH, "DMCA-TEST");
-        // Namespace owned by someone else (admin), even though it claimed the hash.
-        uint256 nsId = _publisherStanding(admin, SAMPLE_HASH);
-        vm.prank(filer);
-        vm.expectRevert(
-            abi.encodeWithSelector(
-                ContentBlacklist.UnauthorizedStanding.selector, ContentBlacklist.StandingPath.Publisher
-            )
-        );
-        blacklist.openBlacklistAppeal(
-            SAMPLE_HASH, REGION_US, bytes32("e"), ContentBlacklist.StandingPath.Publisher, nsId
-        );
-    }
-
-    function test_publisherStanding_ownerButHashNotClaimed_reverts() public {
-        vm.prank(regionalBody);
-        blacklist.addHashRegional(REGION_US, SAMPLE_HASH, "DMCA-TEST");
-        // Filer owns a namespace, but it never claimed SAMPLE_HASH.
-        vm.prank(filer);
-        uint256 nsId = registry.createNamespace();
+        // Namespace owned by someone else (admin).
+        uint256 nsId = _publisherStanding(admin);
         vm.prank(filer);
         vm.expectRevert(
             abi.encodeWithSelector(
@@ -1281,7 +1261,7 @@ contract ContentBlacklistTest is Test {
     function test_publisherStanding_wrongNamespaceId_reverts() public {
         vm.prank(regionalBody);
         blacklist.addHashRegional(REGION_US, SAMPLE_HASH, "DMCA-TEST");
-        _publisherStanding(filer, SAMPLE_HASH);
+        _publisherStanding(filer);
         // A namespaceId the filer does not own (unassigned id 999 → ownerOf == 0).
         vm.prank(filer);
         vm.expectRevert(

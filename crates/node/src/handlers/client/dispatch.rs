@@ -5,8 +5,8 @@ use super::{
     APP_ERR_MALFORMED_MESSAGE, APP_ERR_NO_ERROR, APP_ERR_RATE_LIMITED, APP_IDLE_TIMEOUT, Address,
     Arc, B256, ChannelId, ClientHandler, ClientMessage, Connection, FillOutcome, FirstMessage,
     Hash, Mutex, OwnedSemaphorePermit, REJECTION_CLOSE_TIMEOUT, RecvStream, RejectReason,
-    Semaphore, SendStream, ServeRejectReason, StreamReadError, StreamResponseBody, TeeOpen, VarInt,
-    pull_origin_gate_blocks, read_first_message, reset_stream, verify_binding,
+    Semaphore, SendStream, ServeRejectReason, StreamReadError, StreamResponseBody, TeeOpen, U256,
+    VarInt, pull_origin_gate_blocks, read_first_message, reset_stream, verify_binding,
 };
 use futures_util::StreamExt as _;
 
@@ -265,17 +265,17 @@ impl ClientHandler {
                 // Content-authorization gate (#821, ADR 037 §Seed-leech caps).
                 // When the operator opts in
                 // (`pull_through_require_authorized_origin`), refuse to INITIATE an
-                // upstream pull and its cache-warming write for a hash whose
-                // namespace has no currently-authorized origin, resolved against the
-                // shared `OriginDirectory` (namespace / default-open / fail-closed
-                // semantics). It is a pull-*initiation* gate only: a range
-                // already held is served from the `Ok(true)` arm above, so refusing
-                // held blobs stays `ContentBlacklist`'s job (ADR 011/031). The
-                // directory is wired only when the gate is enabled, so an unset
-                // gate keeps the permissionless cache-role default.
+                // upstream pull and its cache-warming write for a request whose
+                // namespace has no currently-authorized origin. Namespace 0 has no
+                // authorized origins (ADR 002 §Namespace 0), so an enabled gate
+                // refuses it. It is a pull-*initiation* gate only: a range already
+                // held is served from the `Ok(true)` arm above, so refusing held
+                // blobs stays `ContentBlacklist`'s job (ADR 011/031). The directory
+                // is wired only when the gate is enabled, so an unset gate keeps the
+                // permissionless cache-role default.
                 if pull_origin_gate_blocks(
                     self.pull_origin_gate.as_ref(),
-                    &crate::dht::origin::Hash::from_bytes(req.hash),
+                    U256::from_be_bytes(req.namespace_id),
                 ) {
                     return self
                         .respond_error(&mut send, &req, ServeRejectReason::UnauthorizedOrigin)

@@ -133,7 +133,9 @@ async fn run() -> anyhow::Result<()> {
     // capture depends on — leaves behind a channel A's chain watcher has already
     // accepted, so the refusal below cannot be the pre-observation `UnknownChannel`
     // masquerading as evidence.
-    let delivered = client.fetch(&chain, &node_a, hash_a).await?;
+    let delivered = client
+        .fetch(&chain, &node_a, hash_a, alloy::primitives::U256::ZERO)
+        .await?;
     anyhow::ensure!(
         delivered.bytes == payload_a,
         "node A must deliver H before we induce the phantom"
@@ -201,7 +203,9 @@ async fn run() -> anyhow::Result<()> {
     // Capture 2 — rate bait-and-switch from node B.
     // ================================================================
 
-    let delivered_b = client.fetch(&chain, &node_b, hash_b).await?;
+    let delivered_b = client
+        .fetch(&chain, &node_b, hash_b, alloy::primitives::U256::ZERO)
+        .await?;
     anyhow::ensure!(
         delivered_b.bytes == payload_b,
         "node B must deliver its blob before we induce the switch"

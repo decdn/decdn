@@ -357,8 +357,27 @@ pub struct FetchArgs {
     #[arg(short = 'o', long, value_name = "PATH")]
     pub output: PathBuf,
 
+    /// Namespace the content is published under (ADR 002 § Retrieval by
+    /// namespace). When set, the serving node routes a cache-miss origin pull to
+    /// that namespace's DAO-authorized origins. Absent => no namespace: served
+    /// best-effort from cache / DHT only, with no authorized origins.
+    #[arg(long, value_name = "ID", value_parser = parse_fetch_namespace_id)]
+    pub namespace: Option<u64>,
+
     #[command(flatten)]
     pub common: ClientFetchArgs,
+}
+
+/// Parse a `--namespace` id for `decdn fetch`, rejecting the reserved `0`
+/// (namespace 0 is "no namespace"; omit the flag for best-effort retrieval).
+fn parse_fetch_namespace_id(s: &str) -> Result<u64, String> {
+    let id: u64 = s
+        .parse()
+        .map_err(|_| format!("invalid namespace id: {s}"))?;
+    if id == 0 {
+        return Err("namespace id must be >= 1 (omit --namespace for no namespace)".to_string());
+    }
+    Ok(id)
 }
 
 #[cfg(test)]
@@ -386,6 +405,27 @@ mod tests {
         let mut with_bin = vec!["test"];
         with_bin.extend_from_slice(args);
         TestCli::parse_from(with_bin).common
+    }
+
+    /// `--namespace` accepts a non-zero id, rejects the reserved `0` (the
+    /// `NO_NAMESPACE` sentinel — users omit the flag instead), and rejects
+    /// non-numeric input. Mirrors the publish-side `assign` parser's coverage.
+    #[test]
+    fn parse_fetch_namespace_id_validates() {
+        assert_eq!(super::parse_fetch_namespace_id("7"), Ok(7));
+        assert_eq!(super::parse_fetch_namespace_id("1"), Ok(1));
+
+        let zero = super::parse_fetch_namespace_id("0").expect_err("0 must be rejected");
+        assert!(
+            zero.contains(">= 1"),
+            "0 error should point to the floor: {zero}"
+        );
+
+        let nan = super::parse_fetch_namespace_id("abc").expect_err("non-numeric must be rejected");
+        assert!(
+            nan.contains("invalid namespace id"),
+            "non-numeric error should name the field: {nan}"
+        );
     }
 
     /// The headline of #1134: the default deadlines are sized so that blob size and

@@ -1102,17 +1102,17 @@ pub struct DecdnMetrics {
     /// `OpenMetrics` encoder appends the `_total` suffix.
     pub origin_directory_watcher_restarts: Counter,
     /// `decdn_origin_directory_bootstrap_range_anomaly_total` (#1152): boots on
-    /// which the `ContentClaimed` replay range was inverted
+    /// which the `AssignmentActivated` replay range was inverted
     /// (`replay_from > latest`) — the persisted replay checkpoint (#1108) sat
     /// ahead of a stale / lagging RPC head (replication lag or a reorg). The
-    /// genesis replay is skipped that boot (per-namespace membership absent —
-    /// claimed hashes fall back to the default-open set until the live tail
-    /// re-surfaces claims), so without this counter the anomaly would move no
+    /// genesis replay is skipped that boot (the namespace set is empty that boot,
+    /// so affected namespaces resolve to no origins until the live tail re-emits
+    /// their assignment events), so without this counter the anomaly would move no
     /// metric. Pairs with the
     /// warn! in `bootstrap_cache`. The `OpenMetrics` encoder appends `_total`.
     pub origin_directory_bootstrap_range_anomaly: Counter,
     /// `decdn_origin_directory_watcher_resolve_failures_total` (#651): times a
-    /// `getOrigins` for a newly-claimed namespace OR a `nodeIdOf(operator)`
+    /// `getOrigins` for a newly-activated namespace OR a `nodeIdOf(operator)`
     /// binding lookup failed, leaving an operator unmapped (and so unresolvable
     /// as an origin) until a later event re-surfaces it. Does not trip a
     /// backoff, so without this counter it would move no metric. Pairs with the
@@ -1125,10 +1125,10 @@ pub struct DecdnMetrics {
     /// poisoned lock reports `i64::MAX` (alerting direction).
     pub origin_directory_watcher_down_seconds: Gauge,
     /// `decdn_origin_directory_operator_count` (#651): distinct operator
-    /// addresses currently authorised as origins across all namespaces plus the
-    /// default-open allow-list. Recomputed and sampled after every event that
-    /// mutates an authorised set, so it rises on activate/add and falls on
-    /// revoke/prune/remove/replace (unlike the monotonic binding cache).
+    /// addresses currently authorised as origins — the union of every namespace's
+    /// operator set. Recomputed and sampled after every event that
+    /// mutates an authorised set, so it rises on activate and falls on
+    /// revoke/prune/replace (unlike the monotonic binding cache).
     pub origin_directory_operator_count: Gauge,
     /// Paid-delivery (`serve_stream`) requests refused because the blob was
     /// deliberately evicted between probe and stream (#279). One `Counter` per
@@ -1172,11 +1172,15 @@ pub struct DecdnMetrics {
     pub serve_stream_rejected_insufficient_deposit: Counter,
     /// `serve_stream` cache-miss requests refused before any upstream pull
     /// because the operator's `pull_through_require_authorized_origin` gate is on
-    /// and the hash's namespace has no currently-authorized origin (#821, ADR 037
-    /// §Seed-leech caps). Wire-indistinguishable from `cache_miss` (signed as
+    /// and the request's namespace has no currently-authorized origin (#821, ADR 037
+    /// §Seed-leech caps). The gate scopes on the namespace the requester *names*,
+    /// not on proven hash membership — under namespace-as-origin-addressing there
+    /// is no on-chain hash→namespace claim, so this sheds only requests naming a
+    /// namespace with no authorized origin, not arbitrary-hash warming behind a
+    /// live namespace. Wire-indistinguishable from `cache_miss` (signed as
     /// `NotFound`), so this server-side counter is the only place the distinction
-    /// lives — a rising value shows how much unclaimed-content warming the gate is
-    /// shedding. Visible name:
+    /// lives — a rising value shows how much unauthorized-namespace warming the gate
+    /// is shedding. Visible name:
     /// `decdn_serve_stream_rejected_unauthorized_origin_total`.
     pub serve_stream_rejected_unauthorized_origin: Counter,
     /// New delivery refused because the channel has a signed cooperative-close
@@ -2061,7 +2065,7 @@ recorders! {
     serve_stream_rejected_insufficient_deposit => serve_stream_rejected_insufficient_deposit.inc();
 
     /// Record a `serve_stream` cache-miss refused by the authorized-origin gate
-    /// (#821): `pull_through_require_authorized_origin` is on and the hash's
+    /// (#821): `pull_through_require_authorized_origin` is on and the request's
     /// namespace has no authorized origin, so no upstream pull was started.
     serve_stream_rejected_unauthorized_origin => serve_stream_rejected_unauthorized_origin.inc();
 
@@ -2226,17 +2230,17 @@ recorders! {
 
     /// The origin-directory bootstrap replay range was inverted
     /// (`replay_from > latest`) — a stale / lagging RPC head vs. the persisted
-    /// replay checkpoint (#1152). The genesis replay was skipped this boot;
-    /// claimed hashes fall back to the default-open set until the live tail
-    /// re-surfaces claims. Bumps
+    /// replay checkpoint (#1152). The genesis replay was skipped this boot; the
+    /// namespace set is empty until the live tail re-emits their assignment
+    /// events. Bumps
     /// `origin_directory_bootstrap_range_anomaly_total`. Pairs with the warn! in
     /// `bootstrap_cache`.
     origin_directory_bootstrap_range_anomaly => origin_directory_bootstrap_range_anomaly.inc();
 
     /// Publish the count of distinct operator addresses currently authorised as
-    /// origins — the union of every namespace's operator set and the
-    /// default-open allow-list (#651). Falls on revoke/prune/remove/replace,
-    /// unlike the monotonic `operator → NodeId` binding cache. The caller
+    /// origins — the union of every namespace's operator set (#651). Falls on
+    /// revoke/prune/replace, unlike the monotonic `operator → NodeId` binding
+    /// cache. The caller
     /// recomputes this (`authorized_operator_count`) after each set mutation.
     origin_directory_operator_count(count: usize)
         => origin_directory_operator_count.set(sat(count));

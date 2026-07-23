@@ -140,21 +140,21 @@ pub struct BlockchainConfig {
     pub payment_channel_address: Option<String>,
     /// `CapacityBond` contract address.
     pub capacity_bond_address: Option<String>,
-    /// `OriginAssignment` contract address. Optional: when set (together with
-    /// `publisher_registry_address`), the node runs the chain-backed origin
-    /// directory that backs the pull-through authorized-origin gate and the
-    /// `FIND_VALUE` last-resort fallback (ADR 022). Both must be set or unset
-    /// together; unset => the origin directory is empty (deny-all) and the
+    /// `OriginAssignment` contract address. Optional: when set, the node runs the
+    /// chain-backed origin directory for the cache-miss pull-through fallback,
+    /// resolving a request's namespace via `getOrigins(namespaceId)` (ADR 022).
+    /// Unset => the origin directory is empty (deny-all) and the pull-through
     /// authorized-origin gate finds no origins.
     pub origin_assignment_address: Option<String>,
-    /// `PublisherRegistry` contract address. Pairs with
-    /// `origin_assignment_address` (see its docs).
+    /// `PublisherRegistry` contract address. Independent of the origin directory:
+    /// it is the publish CLI's `namespace create` target and is not consumed by
+    /// the node runtime.
     pub publisher_registry_address: Option<String>,
     /// Block height at which the chain-backed origin directory begins its
-    /// `ContentClaimed` log replay. SHOULD be the `PublisherRegistry`
+    /// `AssignmentActivated` log replay. SHOULD be the `OriginAssignment`
     /// deployment block; absent => `0`, which is correct but scans the entire
     /// chain history (slow / RPC-heavy on an established L2). Only consulted
-    /// when the origin-directory addresses are set.
+    /// when the `origin_assignment_address` is set.
     pub origin_directory_from_block: Option<u64>,
     /// `SlashJudge` contract address — the EIP-712 `verifyingContract` for
     /// `ProbeResponse` / `StreamResponse` `slash_sig` signatures (ADR 014
@@ -558,15 +558,15 @@ pub struct CacheConfig {
     /// (#821, ADR 037 §Seed-leech caps / ADR 022 §`FIND_VALUE` Flow). Absent =>
     /// `false` (the cache role stays permissionless, unchanged network
     /// behavior). When `true`, the node refuses to *initiate* an upstream pull
-    /// and the associated cache-warming write for a hash whose namespace has no
+    /// and the associated cache-warming write for a request whose namespace has no
     /// currently-authorized origin via `OriginAssignment.getOrigins(namespaceId)`
-    /// (with `namespaceId == 0` resolving to the default-open allow-list),
-    /// returning `NotFound` to the requesting client. It is a
-    /// pull-*initiation* gate only: a range the node already holds is served
-    /// regardless — refusing held blobs is `ContentBlacklist`'s job (ADR 011/031).
-    /// Requires the origin-directory addresses (the `origin_assignment_address`
-    /// and `publisher_registry_address` blockchain keys); without them the
-    /// directory is empty and the gate fails closed (every pull is refused).
+    /// (`namespaceId == 0`/`NO_NAMESPACE` has no authorized origins, so the gate
+    /// refuses it — ADR 002 §Namespace 0), returning `NotFound` to the requesting
+    /// client. It is a pull-*initiation* gate only: a range the node already holds
+    /// is served regardless — refusing held blobs is `ContentBlacklist`'s job
+    /// (ADR 011/031). Requires the `origin_assignment_address` blockchain key;
+    /// without it the directory is empty and the gate fails closed (every pull is
+    /// refused).
     /// Only affects the node-to-node reactive pull-through path, so it is a no-op
     /// unless `node_to_node_pull_through_enabled` is also `true` — with
     /// pull-through off, a cache miss already returns `NotFound`.
