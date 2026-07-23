@@ -5,20 +5,20 @@
 
 ## Context
 
-Three independent design pressures converge on the need for smart-account support from the PoC:
+Three independent design pressures require smart-account support from the PoC:
 
-1. **High-frequency signing needs a hot key.** At the default 1 MB voucher cadence, a 100 MB download requires 100 EIP-712 signatures, each requiring physical confirmation on a hardware wallet (2–5 seconds); nodes sign a `slash_sig` on every `ProbeResponse` / `StreamResponse`. Hardware-wallet-only operation is infeasible at that cadence regardless of wallet model. [ADR 012](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model) identified this and explored a derived hot key (HKDF from hardware wallet signature) as a narrow workaround.
+1. **High-frequency signing needs a hot key.** At the default 1 MB voucher cadence, a 100 MB download needs 100 EIP-712 signatures. A hardware wallet requires a physical confirmation (2–5 seconds) per signature, and nodes sign a `slash_sig` on every `ProbeResponse` / `StreamResponse`. Hardware-wallet-only operation is infeasible at this cadence, whatever the wallet model. [ADR 012](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model) identified this and explored a derived hot key (HKDF from a hardware-wallet signature) as a narrow workaround.
 
-2. **Node operators need multisig security.** Nodes stake significant TOKEN and accumulate USDC earnings. A single EOA controlling staked funds is a single point of compromise. Safe multisig wallets are the industry standard for securing protocol-managed funds — most DeFi operators use them. Deferring this to production means the PoC cannot demonstrate the intended security model.
+2. **Node operators need multisig security.** Nodes stake significant TOKEN and accumulate USDC earnings. A single EOA controlling staked funds is a single point of compromise. Safe multisig wallets are the industry standard for protocol-managed funds; most DeFi operators use them. Deferring multisig to Production means the PoC cannot demonstrate the intended security model.
 
-3. **All signature verification should support smart accounts.** The current contract designs use `ECDSA.recover` / `ecrecover` exclusively, which only works with EOAs. Any smart account (Safe, Kernel, Biconomy, etc.) produces signatures that must be verified via ERC-1271 (`isValidSignature`). Baking in EOA-only verification now means retrofitting every verification site later.
+3. **All signature verification should support smart accounts.** Current contracts use `ECDSA.recover` / `ecrecover` only, which works with EOAs only. Any smart account (Safe, Kernel, Biconomy, etc.) produces signatures that must be verified via ERC-1271 (`isValidSignature`). EOA-only verification now forces a retrofit of every verification site later.
 
 This ADR splits the response along a sharp PoC vs Production line:
 
-- **PoC:** solve problems 2 and 3 now — adopt `SignatureChecker` across every contract (problem 3) and make Safe the recommended wallet for node operators and clients (problem 2). Leave problem 1 on the existing footing: a software-held signing key on the signing host (same trust posture as today's `eth_keystore`), wrapped by a 1-of-1 Safe or used as a plain EOA.
-- **Production:** solve problem 1 cleanly by migrating to ERC-7579 smart accounts (Safe via the Safe-7579 adapter) and installing [`erc7579/smartsessions`](https://github.com/erc7579/smartsessions) — a standardized session-key module with native ERC-1271 validation, policy enforcement (time windows, allowed selectors/domains, spending caps), and first-class revocation.
+- **PoC:** solve problems 2 and 3 now. Adopt `SignatureChecker` across every contract (problem 3) and make Safe the recommended wallet for node operators and clients (problem 2). Leave problem 1 on its existing footing: a software-held signing key on the signing host (same trust posture as today's `eth_keystore`), wrapped by a 1-of-1 Safe or used as a plain EOA.
+- **Production:** solve problem 1 by migrating to ERC-7579 smart accounts (Safe via the Safe-7579 adapter) and installing [`erc7579/smartsessions`](https://github.com/erc7579/smartsessions) — a standardized session-key module with native ERC-1271 validation, policy enforcement (time windows, allowed selectors/domains, spending caps), and first-class revocation.
 
-Deferring session keys to Production keeps the PoC PR small and avoids shipping bespoke security-critical contract code for a problem that has a standardized upstream solution.
+Deferring session keys to Production keeps the PoC PR small and avoids bespoke security-critical contract code for a problem that has a standardized upstream solution.
 
 ## Decision
 
@@ -58,7 +58,7 @@ This is a mechanical replacement. The EIP-712 domain separators, typed data hash
 | `submitRateChallenge` | `ecrecover` → address A, `ecrecover` → address B, verify A == B | `SignatureChecker.isValidSignatureNow(challengedNode, probeDigest, probeSig)` + `SignatureChecker.isValidSignatureNow(challengedNode, streamDigest, streamSig)` |
 | `submitBlacklistChallenge` | `ecrecover` → address, verify registered | `SignatureChecker.isValidSignatureNow(challengedNode, digest, sig)` |
 
-**Note on SlashJudge pattern change:** The current design recovers an address from `ecrecover` and then looks it up in `CapacityBond`. With `SignatureChecker`, the pattern becomes: the challenger provides the `challengedNode` address (the node's Ethereum address / Safe address), the contract verifies the signature against that address, then confirms the address is registered. This is equivalent but avoids the "recover then lookup" pattern which does not work for ERC-1271 (there is no "recovery" from a smart account signature — only validation).
+**Note on SlashJudge pattern change:** The current design recovers an address via `ecrecover`, then looks it up in `CapacityBond`. With `SignatureChecker`, the challenger provides the `challengedNode` address (the node's Ethereum address / Safe address); the contract verifies the signature against that address, then confirms the address is registered. This is equivalent and avoids the recover-then-lookup pattern, which does not work for ERC-1271: a smart-account signature has no recovery, only validation.
 
 #### Gas Impact
 
@@ -87,11 +87,11 @@ Safe smart wallets are the **recommended** wallet type for both node operators a
 **Recommended PoC configuration: 1-of-1 Safe or plain EOA.** High-value client accounts migrate to 2-of-3 + session keys in Production ([§ Session Keys — Deferred to Production via ERC-7579 smartsessions](#session-keys--deferred-to-production-via-erc-7579-smartsessions)); the same threshold constraint that applies to node operators applies here.
 
 - **Channel operations:** The Safe (or EOA) deposits USDC into `PaymentChannel.openChannel()`. That address is the `channel.client`. Client software supports both wallet types — `SignatureChecker` makes the choice transparent to every contract.
-- **Voucher signing:** EIP-712 vouchers are signed with the `channel.client` key. `SignatureChecker` on the channel contract validates against `channel.client` (EOA → ECDSA; 1-of-1 Safe → `checkSignatures` via stock handler). The session-key path (signing at delivery speed via `erc7579/smartsessions` without exposing the Safe owner key) lands when [§ Session Keys — Deferred to Production via ERC-7579 smartsessions](#session-keys--deferred-to-production-via-erc-7579-smartsessions) ships.
+- **Voucher signing:** EIP-712 vouchers are signed with the `channel.client` key. `SignatureChecker` on the channel contract validates against `channel.client` (EOA → ECDSA; 1-of-1 Safe → `checkSignatures` via stock handler). The session-key path — signing at delivery speed via `erc7579/smartsessions` without exposing the Safe owner key — lands with the Production plan below.
 
 ### Session Keys — Deferred to Production via ERC-7579 smartsessions
 
-**Session keys are out of scope for the PoC.** The PoC uses the direct owner-signature path described in [§ Safe as Recommended Wallet](#safe-as-recommended-wallet) (1-of-1 Safe or EOA, software-held key on the signing host). This matches today's `eth_keystore` trust posture and keeps the PoC from shipping bespoke security-critical contract code.
+**Session keys are out of scope for the PoC.** The PoC uses the direct owner-signature path from [§ Safe as Recommended Wallet](#safe-as-recommended-wallet) (1-of-1 Safe or EOA, software-held key on the signing host).
 
 #### Production plan
 
@@ -144,7 +144,7 @@ async fn verify_binding_signature(
 
 **Performance:** The `EXTCODESIZE` + potential `isValidSignature` RPC call adds one round-trip to the L2 RPC endpoint. This happens once per client connection (at binding time), not per message. Acceptable latency.
 
-**Caching:** Nodes SHOULD cache the result of `get_code_at` for known client addresses to avoid repeated RPC calls. The code at an address does not change after deployment (ignoring `SELFDESTRUCT`, which is deprecated and irrelevant for Safe wallets).
+**Caching:** Nodes SHOULD cache the `get_code_at` result for known client addresses to avoid repeated RPC calls. The code at an address does not change after deployment (ignoring `SELFDESTRUCT`, which is deprecated and irrelevant for Safe wallets).
 
 ### Safe Infrastructure on the Canonical Testnet
 
