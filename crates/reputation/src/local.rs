@@ -46,16 +46,6 @@ pub enum ConfigError {
         reachability: f64,
         sum: f64,
     },
-    /// A `u32` parameter fell below its required minimum (network config).
-    #[error("{field} must be >= {min}, got {value}")]
-    BelowMinimum {
-        field: &'static str,
-        min: u32,
-        value: u32,
-    },
-    /// The local/network blend weights did not sum to 1.0 (network config).
-    #[error("local_weight + network_weight must sum to 1.0; got {local} + {network} = {sum}")]
-    SplitDoesNotSumToOne { local: f64, network: f64, sum: f64 },
 }
 
 /// Outcome of a single delivery interaction with a peer.

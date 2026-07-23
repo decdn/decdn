@@ -17,6 +17,7 @@ pub mod channel_store;
 /// Re-exported under the original module path so node call sites and the
 /// integration tests keep their `client_requester::…` paths.
 pub use decdn_client_pull as client_requester;
+pub mod announce_gate;
 pub mod commands;
 pub mod content_deny;
 pub mod dht;
@@ -34,8 +35,6 @@ pub mod rate_bounds_watcher;
 pub mod rate_limit;
 pub mod receipt_log;
 pub mod region_accounting;
-pub mod reputation_indexer;
-pub mod reputation_wiring;
 pub mod runtime;
 pub mod selection;
 pub mod slash_watcher;

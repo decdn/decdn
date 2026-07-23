@@ -67,12 +67,11 @@ The local registry cache, when implemented per [ADR 001 § Registry cache](001-n
 
 ### Reputation does not factor into eviction
 
-Reputation governs *selection* (the `selection_score` formula in [ADR 001 § Node Selection Algorithm](001-network.md#node-selection-algorithm) and the local/network blend in [ADR 008](008-reputation.md#adr-008-reputation-system)), not retention. A peer whose reputation falls to the 0.1 floor stays in the peer table until TTL or deregistration removes it. The selection-score formula already makes such a node ~100× less likely to be selected (see [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh) reputation table), the appropriate response.
+Reputation governs *selection* (the `selection_score` formula in [ADR 001 § Node Selection Algorithm](001-network.md#node-selection-algorithm), fed by the local reputation score in [ADR 008](008-reputation.md#adr-008-reputation-system)), not retention. A peer whose reputation falls to the 0.1 floor stays in the peer table until TTL or deregistration removes it. The selection-score formula already makes such a node ~100× less likely to be selected (see [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh) reputation table), the appropriate response.
 
 **Why not reputation-priority eviction.**
 
 - It conflates discovery and selection. The peer table is a discovery surface; selection is the trust-weighted decision built on top of it.
-- It creates a collusive-eviction vector: a coalition sending negative `ReputationReport` messages could push a competitor below an "eviction threshold" and remove them from peer tables network-wide, bypassing the hard floor in [ADR 008](008-reputation.md#adr-008-reputation-system).
 - Reputation is noisy in the tail; a transient bad-luck dip should not erase a peer from discovery.
 
 This appendix therefore excludes reputation from the eviction decision. Reputation-system changes ([ADR 008](008-reputation.md#adr-008-reputation-system)) need not consider peer-table side effects.

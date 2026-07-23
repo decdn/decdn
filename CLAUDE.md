@@ -4,7 +4,7 @@
 
 Decentralized CDN (deCDN) — nodes cache and serve content-addressed blobs over iroh QUIC, clients pay per-MB via off-chain USDC payment channels. Rust implementation; the initial network deployment targets tens of nodes on an Arbitrum Sepolia testnet. "PoC" in code and ADR comments refers to that network-scale milestone, not contract-surface scope — the on-chain surface ships at full production shape with governance-tunable economics from day one (see [ADR 016 § Contract Inventory](adr/016-contract-interactions.md) and [§ Tunable Economics](adr/016-contract-interactions.md#tunable-economics)).
 
-**Status: Early implementation.** Cargo workspace with 12 crates. Two binaries (#421): `node` produces the `decdn-node` daemon with the runtime bring-up, admin RPC server, dispatch limiter, and probe handler; `cli` produces the user-facing `decdn` binary carrying `probe`, `node {peers,…}`, `key-gen`, `config {…}`, `bundle {create}`. `common` holds the shared config schema, identity loading, and AdminRpc trait + DTOs both binaries import. `protocol` has varint framing, `ProbeMessage` (ADR 013), and `NodeAnnounce` gossip types; `cache` has the pull-through engine + HTTP/filesystem origin adapters; `gossip` has the `NodeAnnounce` pub/sub service with peer table. `incentive` has implemented payment-channel, staking, and voucher logic (alloy); `reputation` has ADR-008-conformant local per-peer EWMA scoring (in-memory; network gossip aggregation and Sybil resistance deferred per ADR 008 §14a). Neither crate is a stub. ADRs in `adr/` remain the primary design artifacts.
+**Status: Early implementation.** Cargo workspace with 12 crates. Two binaries (#421): `node` produces the `decdn-node` daemon with the runtime bring-up, admin RPC server, dispatch limiter, and probe handler; `cli` produces the user-facing `decdn` binary carrying `probe`, `node {peers,…}`, `key-gen`, `config {…}`, `bundle {create}`. `common` holds the shared config schema, identity loading, and AdminRpc trait + DTOs both binaries import. `protocol` has varint framing, `ProbeMessage` (ADR 013), and `NodeAnnounce` gossip types; `cache` has the pull-through engine + HTTP/filesystem origin adapters; `gossip` has the `NodeAnnounce` pub/sub service with peer table. `incentive` has implemented payment-channel, staking, and voucher logic (alloy); `reputation` has ADR-008-conformant local per-peer EWMA scoring (in-memory; local-only by design — reputation is not gossiped or aggregated across nodes, per ADR 008). Neither crate is a stub. ADRs in `adr/` remain the primary design artifacts.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for build commands, ADR conventions, pre-commit hooks, and development environment setup.
 
@@ -81,7 +81,7 @@ crates/
   client-pull/  — reusable `cdn/client/v1` paid-pull requester (`stream_fetch`) + buyer-side channel open: signs the request, verifies the signed `StreamResponse`, pays cumulative vouchers at each interval, assembles the blob. Shared by `node` (node-to-node miss pulls, #317) and `cli` (client fetch / bundle pull)
   gossip/       — NodeAnnounce pub/sub over iroh-gossip, peer table, envelope validation
   incentive/    — payment channels, staking, vouchers (alloy for Ethereum)
-  reputation/   — reputation scoring (ADR 008): local EWMA now, gossip aggregation deferred
+  reputation/   — reputation scoring (ADR 008): local per-peer EWMA only; no gossip aggregation
   e2e/          — test-only (`publish = false`) cross-layer Rust↔contract fixtures (#1028): `ChainFixture` (anvil + the production `DeployProtocol` script), `NodeFixture` (daemon subprocess + admin RPC), `ClientFixture` (real paid client path). Test targets are gated behind the `anvil-e2e` feature
 contracts/      — Solidity contracts + Foundry (repo root, excluded from workspace; ships Token, CapacityBond, FeeRouter, PaymentChannel, SlashAppeal, SlashJudge, OriginAssignment, BuybackBurner, ContentBlacklist, PublisherRegistry, DecdnGovernor with test suites, plus Ed25519Verifier + BondMath helpers)
 ```
@@ -100,7 +100,6 @@ The two binaries share `common` for config schema, identity, and admin wire type
 | `cdn/client/v1` | All paid delivery (client→node and node→node) |
 | `cdn/dht/v1` | Content discovery via Kademlia DHT (see ADR 022) |
 | iroh-gossip (built-in) | Node metadata broadcast (`NodeAnnounce`), node discovery |
-| `cdn/reputation/v1` (gossip topic) | Reputation reports over iroh-gossip |
 
 ### Key Design Decisions
 

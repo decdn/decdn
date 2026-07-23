@@ -112,7 +112,7 @@ Inbound probes are limited to 5 requests per peer per second (token bucket); exc
 
 All gossip bandwidth scales O(N²) across the network (each of N nodes publishes to N−1 receivers); per-node cost scales O(N), linear in network size. The `NodeAnnounce` interval is the dominant variable.
 
-**Assumptions:** PlumTree delivers each unique message to each subscriber once. `NodeAnnounce` worst case is 800 bytes. `ReputationReport` is ~200 bytes (2×NodeId + ReportMetrics + timestamp + signature + framing). Egress ≈ ingress (PlumTree tree-forwarding).
+**Assumptions:** PlumTree delivers each unique message to each subscriber once. `NodeAnnounce` worst case is 800 bytes. Egress ≈ ingress (PlumTree tree-forwarding).
 
 #### NodeAnnounce (`cdn/global/v1`, 60-second interval)
 
@@ -127,26 +127,16 @@ Per-node ingress: `(N−1) × 800 bytes × (3600 / interval_s)` per hour.
 
 Regional topics (`cdn/region/{cc}/v1`) add per-region bandwidth but do not reduce global topic traffic — all staked nodes publish to and subscribe to `cdn/global/v1`.
 
-#### ReputationReport (`cdn/reputation/v1`, production only)
-
-Per [ADR 008](008-reputation.md#adr-008-reputation-system) rate limits: max 10 reports per reporter per hour, max 1 per (reporter, target) pair per hour. Worst case: all N nodes send 10 reports/hr, each delivered to N−1 subscribers.
-
-| Nodes | Reports received/node/hr | Ingress/node/hr |
-| --- | --- | --- |
-| 100 | ~1,000 | ~0.2 MB |
-| 500 | ~5,000 | ~1.0 MB |
-| 1,000 | ~10,000 | ~2.0 MB |
-
-The strict rate limits (Section 11 of [ADR 008](008-reputation.md#adr-008-reputation-system)) keep reputation gossip modest vs. `NodeAnnounce`.
-
 #### Combined per-node budget (60-second announce interval)
 
-| Nodes | NodeAnnounce | ReputationReport | Combined/node/hr | Sustained rate | ed25519 verify/s |
-| --- | --- | --- | --- | --- | --- |
-| 30 | ~1.4 MB | ~0.0 MB | ~1.4 MB | ~3 Kbps | <1 |
-| 100 | ~4.8 MB | ~0.2 MB | ~5.0 MB | ~11 Kbps | ~2 |
-| 500 | ~24.0 MB | ~1.0 MB | ~25.0 MB | ~56 Kbps | ~10 |
-| 1,000 | ~48.0 MB | ~2.0 MB | ~50.0 MB | ~112 Kbps | ~19 |
+Gossip carries only `NodeAnnounce` (reputation is local-only per [ADR 008](008-reputation.md#adr-008-reputation-system) — no reputation gossip topic), so the combined budget equals the `NodeAnnounce` budget above.
+
+| Nodes | NodeAnnounce | Combined/node/hr | Sustained rate | ed25519 verify/s |
+| --- | --- | --- | --- | --- |
+| 30 | ~1.4 MB | ~1.4 MB | ~3 Kbps | <1 |
+| 100 | ~4.8 MB | ~4.8 MB | ~11 Kbps | ~2 |
+| 500 | ~24.0 MB | ~24.0 MB | ~53 Kbps | ~10 |
+| 1,000 | ~48.0 MB | ~48.0 MB | ~107 Kbps | ~19 |
 
 **CPU cost:** Modern hardware handles ~50,000–100,000 ed25519 verifications/sec/core. At 1,000 nodes, ~19 verify/sec is negligible — CPU is not the gossip bottleneck.
 
@@ -179,7 +169,7 @@ Lower is better. Reputation is clamped to a minimum of 0.1 to prevent division b
 
 For new nodes with the initial reputation of 0.5 ([ADR 008](008-reputation.md#adr-008-reputation-system)), the 4× multiplier means they must be ~4× cheaper or faster to compete with established nodes — a bootstrap barrier they clear by pricing or performing competitively until they accrue reputation.
 
-**Inputs:** `rate_per_mb` and `rtt_ms` come from `ProbeResponse` (see [ADR 005](005-protocol.md#adr-005-wire-protocol)). `reputation` is the node's `final_score` from [ADR 008 § Combined Score](008-reputation.md#combined-score).
+**Inputs:** `rate_per_mb` and `rtt_ms` come from `ProbeResponse` (see [ADR 005](005-protocol.md#adr-005-wire-protocol)). `reputation` is the client's own local score for the node from [ADR 008 § Local Score Calculation](008-reputation.md#local-score-calculation) (a never-interacted node is treated as the neutral 0.5).
 
 #### Minimum-reputation rejection floor
 

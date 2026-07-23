@@ -324,16 +324,6 @@ pub fn write_validate_summary<W: std::io::Write>(
     )?;
     writeln!(
         w,
-        "  gossip.subscribe_reputation: {}",
-        resolved.gossip.subscribe_reputation
-    )?;
-    writeln!(
-        w,
-        "  gossip.reputation_publish_interval_sec: {}",
-        resolved.gossip.reputation_publish_interval_sec
-    )?;
-    writeln!(
-        w,
         "  gossip.max_peer_entries: {}",
         resolved
             .gossip
@@ -511,8 +501,6 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # announce_interval_sec = 60                # seconds between outgoing NodeAnnounce messages (ADR 001)
 # peer_ttl_sec = 600                        # evict a peer-table entry after this long unrefreshed
 # subscribe_global = true                   # subscribe/publish on cdn/global/v1
-# subscribe_reputation = true               # subscribe/publish on cdn/reputation/v1 (ADR 008)
-# reputation_publish_interval_sec = 3600    # reputation-report publish cadence; matches the ADR 008 1-hour rate limit
 # max_peer_entries = 100000                 # optional hard cap on PeerTable entries; omit = unlimited; must be > 0 when set
 
 [security]

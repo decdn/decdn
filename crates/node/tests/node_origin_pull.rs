@@ -59,10 +59,7 @@ use decdn_protocol::{
     ALPN_CLIENT, ALPN_PROBE, CHUNK_SIZE, DEFAULT_VOUCHER_INTERVAL_MB, MB_BYTES, ProbeMessage,
     decode_message, encode_message, encode_stream_request, read_frame, write_frame,
 };
-use decdn_reputation::{
-    LocalReputation, LocalReputationConfig, NetworkReputation, NetworkReputationConfig,
-    ObservationBuffer,
-};
+use decdn_reputation::{LocalReputation, LocalReputationConfig};
 use iroh::EndpointAddr;
 use iroh::endpoint::Connection;
 
@@ -544,7 +541,6 @@ fn provisioned_origin(
     channel_id: B256,
     buyer_signer: &Arc<PrivateKeySigner>,
     local_rep: &Arc<LocalReputation>,
-    obs_buffer: &Arc<ObservationBuffer>,
     metrics: &Arc<Metrics>,
     providers: Vec<DhtNodeId>,
     addr_map: HashMap<DhtNodeId, Address>,
@@ -556,7 +552,6 @@ fn provisioned_origin(
         channel_id,
         buyer_signer,
         local_rep,
-        obs_buffer,
         metrics,
         &empty_region_accountant(),
         providers,
@@ -574,7 +569,6 @@ fn provisioned_origin_with_accountant(
     channel_id: B256,
     buyer_signer: &Arc<PrivateKeySigner>,
     local_rep: &Arc<LocalReputation>,
-    obs_buffer: &Arc<ObservationBuffer>,
     metrics: &Arc<Metrics>,
     region_accountant: &Arc<RegionAccountant>,
     providers: Vec<DhtNodeId>,
@@ -596,7 +590,6 @@ fn provisioned_origin_with_accountant(
         hash,
         buyer,
         local_rep,
-        obs_buffer,
         metrics,
         region_accountant,
         providers,
@@ -616,7 +609,6 @@ fn provisioned_origin_with_ceiling(
     channel_id: B256,
     buyer_signer: &Arc<PrivateKeySigner>,
     local_rep: &Arc<LocalReputation>,
-    obs_buffer: &Arc<ObservationBuffer>,
     metrics: &Arc<Metrics>,
     providers: Vec<DhtNodeId>,
     addr_map: HashMap<DhtNodeId, Address>,
@@ -638,7 +630,6 @@ fn provisioned_origin_with_ceiling(
         hash,
         buyer,
         local_rep,
-        obs_buffer,
         metrics,
         &empty_region_accountant(),
         providers,
@@ -659,7 +650,6 @@ fn build_origin(
     hash: Hash,
     buyer: Arc<dyn ChannelOpener>,
     local_rep: &Arc<LocalReputation>,
-    obs_buffer: &Arc<ObservationBuffer>,
     metrics: &Arc<Metrics>,
     region_accountant: &Arc<RegionAccountant>,
     providers: Vec<DhtNodeId>,
@@ -671,7 +661,6 @@ fn build_origin(
         hash,
         buyer,
         local_rep,
-        obs_buffer,
         metrics,
         region_accountant,
         providers,
@@ -692,7 +681,6 @@ fn build_origin_with_timeout(
     hash: Hash,
     buyer: Arc<dyn ChannelOpener>,
     local_rep: &Arc<LocalReputation>,
-    obs_buffer: &Arc<ObservationBuffer>,
     metrics: &Arc<Metrics>,
     region_accountant: &Arc<RegionAccountant>,
     providers: Vec<DhtNodeId>,
@@ -707,7 +695,6 @@ fn build_origin_with_timeout(
         hash,
         buyer,
         local_rep,
-        obs_buffer,
         metrics,
         region_accountant,
         providers,
@@ -735,7 +722,6 @@ fn build_origin_with_negative_cache(
     hash: Hash,
     buyer: Arc<dyn ChannelOpener>,
     local_rep: &Arc<LocalReputation>,
-    obs_buffer: &Arc<ObservationBuffer>,
     metrics: &Arc<Metrics>,
     region_accountant: &Arc<RegionAccountant>,
     providers: Vec<DhtNodeId>,
@@ -751,7 +737,6 @@ fn build_origin_with_negative_cache(
         hash,
         buyer,
         local_rep,
-        obs_buffer,
         metrics,
         region_accountant,
         providers,
@@ -781,7 +766,6 @@ fn build_origin_with_probe_caches(
     _hash: Hash,
     buyer: Arc<dyn ChannelOpener>,
     local_rep: &Arc<LocalReputation>,
-    obs_buffer: &Arc<ObservationBuffer>,
     metrics: &Arc<Metrics>,
     region_accountant: &Arc<RegionAccountant>,
     providers: Vec<DhtNodeId>,
@@ -820,12 +804,6 @@ fn build_origin_with_probe_caches(
         slash_domain: slash_domain(),
         bind_domain: binding_dom(),
         local_rep: Arc::clone(local_rep),
-        obs_buffer: Arc::clone(obs_buffer),
-        network_rep: Arc::new(
-            NetworkReputation::new(NetworkReputationConfig::default())
-                .expect("network reputation config"),
-        ),
-        rep_cfg: NetworkReputationConfig::default(),
         negative_cache,
         probe_cache,
         metrics: Arc::clone(metrics),
@@ -856,7 +834,6 @@ fn build_origin_multi_hash(
     hashes: &[Hash],
     buyer: Arc<dyn ChannelOpener>,
     local_rep: &Arc<LocalReputation>,
-    obs_buffer: &Arc<ObservationBuffer>,
     metrics: &Arc<Metrics>,
     region_accountant: &Arc<RegionAccountant>,
     providers: &[DhtNodeId],
@@ -886,12 +863,6 @@ fn build_origin_multi_hash(
         slash_domain: slash_domain(),
         bind_domain: binding_dom(),
         local_rep: Arc::clone(local_rep),
-        obs_buffer: Arc::clone(obs_buffer),
-        network_rep: Arc::new(
-            NetworkReputation::new(NetworkReputationConfig::default())
-                .expect("network reputation config"),
-        ),
-        rep_cfg: NetworkReputationConfig::default(),
         negative_cache: NegativeProbeCache::new(),
         probe_cache: PositiveProbeCache::new(),
         metrics: Arc::clone(metrics),
@@ -1108,7 +1079,6 @@ async fn node_origin_pull_chains_reactive_origin_via_client_binding() -> Result<
     .await?;
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
-    let obs_buffer = Arc::new(ObservationBuffer::new());
     let b_metrics = Arc::new(Metrics::new());
     let (providers, addr_map) =
         one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
@@ -1119,7 +1089,6 @@ async fn node_origin_pull_chains_reactive_origin_via_client_binding() -> Result<
         channel_id,
         &b_buyer,
         &local_rep,
-        &obs_buffer,
         &b_metrics,
         providers,
         addr_map,
@@ -1223,7 +1192,6 @@ async fn node_origin_pull_fills_and_records_reputation() -> Result<()> {
     .await?;
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
-    let obs_buffer = Arc::new(ObservationBuffer::new());
     let b_metrics = Arc::new(Metrics::new());
     let (providers, addr_map) =
         one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
@@ -1239,7 +1207,6 @@ async fn node_origin_pull_fills_and_records_reputation() -> Result<()> {
         channel_id,
         &b_buyer,
         &local_rep,
-        &obs_buffer,
         &b_metrics,
         &region_accountant,
         providers,
@@ -1259,22 +1226,7 @@ async fn node_origin_pull_fills_and_records_reputation() -> Result<()> {
         "pulled bytes mismatch"
     );
 
-    // Outbound capture (T3): exactly one positive observation about A, and A's
-    // local score rose above the 0.5 neutral after a clean delivery.
-    let drained = obs_buffer.drain();
-    anyhow::ensure!(
-        drained.len() == 1,
-        "expected one observation, got {}",
-        drained.len()
-    );
-    let (peer, m) = drained
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("no observation drained"))?;
-    anyhow::ensure!(*peer == a_id, "observation recorded about the wrong peer");
-    anyhow::ensure!(
-        m.data_correct == Some(true) && m.uptime_observed == Some(true),
-        "expected positive delivery metrics, got {m:?}"
-    );
+    // A's local score rose above the 0.5 neutral after a clean delivery.
     anyhow::ensure!(
         local_rep.score(a_id) > 0.5,
         "local score should rise after a clean delivery, got {}",
@@ -2094,7 +2046,6 @@ async fn node_origin_pull_falls_through_a_stalled_candidate() -> Result<()> {
     }
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
-    let obs_buffer = Arc::new(ObservationBuffer::new());
     let b_metrics = Arc::new(Metrics::new());
 
     let s_dht = DhtNodeId::from_bytes(*s_id.as_bytes());
@@ -2128,7 +2079,6 @@ async fn node_origin_pull_falls_through_a_stalled_candidate() -> Result<()> {
         hash,
         buyer,
         &local_rep,
-        &obs_buffer,
         &b_metrics,
         &region_accountant,
         vec![s_dht, a_dht],
@@ -2161,34 +2111,19 @@ async fn node_origin_pull_falls_through_a_stalled_candidate() -> Result<()> {
     // Only ONE observation: the honest fallback's clean delivery. The staller hit
     // OUR per-candidate `pull_timeout`, which is a buyer-side deadline (a possibly
     // mis-sized local config), not evidence the provider is unreachable — so it
-    // records NO reputation observation, local or gossiped (#857). That it was
-    // attempted at all is proven by the `node_pull_timeout` counter below.
-    let drained = obs_buffer.drain();
-    anyhow::ensure!(
-        drained.len() == 1,
-        "expected one observation (honest fallback only; the timed-out staller is exonerated), got {}",
-        drained.len()
-    );
-    anyhow::ensure!(
-        !drained.iter().any(|(p, _)| *p == s_id),
-        "the timed-out staller must NOT be gossiped about (#857)"
-    );
-    // The other half of the fix: no LOCAL EWMA hit either. `record_outcome` writes
-    // the gossip buffer and the local score together, so a future split that
-    // re-introduced a local-only timeout penalty would pass the obs-buffer check
-    // above but fail here. The staller stays at the neutral cold-start 0.5.
+    // records NO local reputation observation (#857). That it was attempted at
+    // all is proven by the `node_pull_timeout` counter below. The staller stays
+    // at the neutral cold-start 0.5.
     anyhow::ensure!(
         (local_rep.score(s_id) - 0.5).abs() < f64::EPSILON,
         "the timed-out staller's local score must stay neutral, got {}",
         local_rep.score(s_id)
     );
-    let (_, honest_m) = drained
-        .iter()
-        .find(|(p, _)| *p == a_id)
-        .ok_or_else(|| anyhow::anyhow!("no observation about the honest provider"))?;
+    // The honest fallback A delivered cleanly, so its local score rose.
     anyhow::ensure!(
-        honest_m.data_correct == Some(true) && honest_m.uptime_observed == Some(true),
-        "honest provider should score a clean delivery, got {honest_m:?}"
+        local_rep.score(a_id) > 0.5,
+        "honest provider should score a clean delivery, got {}",
+        local_rep.score(a_id)
     );
     assert_counter(&b_metrics, "node_pull_success_total", 1)?;
     assert_counter(&b_metrics, "node_pull_timeout_total", 1)?;
@@ -2348,7 +2283,6 @@ async fn wedged_open_does_not_starve_the_candidate_loop(stall: OpenStall) -> Res
     }
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
-    let obs_buffer = Arc::new(ObservationBuffer::new());
     let b_metrics = Arc::new(Metrics::new());
 
     let w_dht = DhtNodeId::from_bytes(*w_id.as_bytes());
@@ -2388,7 +2322,6 @@ async fn wedged_open_does_not_starve_the_candidate_loop(stall: OpenStall) -> Res
         hash,
         buyer,
         &local_rep,
-        &obs_buffer,
         &b_metrics,
         &region_accountant,
         vec![w_dht, w2_dht, a_dht],
@@ -2445,12 +2378,7 @@ async fn wedged_open_does_not_starve_the_candidate_loop(stall: OpenStall) -> Res
     // A wedged open is OUR chain lane, not the peer's fault: neither wedged provider
     // may take a reputation hit, locally or over gossip. This is the same exoneration
     // `PullTimeout` gets, and for the same reason.
-    let drained = obs_buffer.drain();
     for (wedged_id, label) in [(w_id, "W1"), (w2_id, "W2")] {
-        anyhow::ensure!(
-            !drained.iter().any(|(p, _)| *p == wedged_id),
-            "{label}: a provider whose channel open wedged must not be gossiped about (#1143)"
-        );
         anyhow::ensure!(
             (local_rep.score(wedged_id) - 0.5).abs() < f64::EPSILON,
             "{label}: the wedged provider's local score must stay neutral, got {}",
@@ -2614,7 +2542,6 @@ async fn node_origin_window_open_falls_through_a_stalled_candidate() -> Result<(
     }
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
-    let obs_buffer = Arc::new(ObservationBuffer::new());
     let b_metrics = Arc::new(Metrics::new());
 
     let s1_dht = DhtNodeId::from_bytes(*s1_id.as_bytes());
@@ -2653,7 +2580,6 @@ async fn node_origin_window_open_falls_through_a_stalled_candidate() -> Result<(
         hash,
         buyer,
         &local_rep,
-        &obs_buffer,
         &b_metrics,
         &region_accountant,
         vec![s1_dht, s2_dht, a_dht],
@@ -2694,12 +2620,7 @@ async fn node_origin_window_open_falls_through_a_stalled_candidate() -> Result<(
     // Each staller hit OUR per-candidate deadline — a buyer-side budget, not evidence
     // the provider is bad — so both are exonerated: no local EWMA hit, nothing
     // gossiped (#857). Identical to the buffered path's contract.
-    let drained = obs_buffer.drain();
     for (label, s_id) in [("S1", s1_id), ("S2", s2_id)] {
-        anyhow::ensure!(
-            !drained.iter().any(|(p, _)| *p == s_id),
-            "the timed-out staller {label} must NOT be gossiped about (#857)"
-        );
         anyhow::ensure!(
             (local_rep.score(s_id) - 0.5).abs() < f64::EPSILON,
             "the timed-out staller {label}'s local score must stay neutral, got {}",
@@ -2749,7 +2670,6 @@ async fn node_origin_no_providers_is_clean_miss() -> Result<()> {
     let (ep_b, _) = local_endpoint(fresh_key(), vec![]).await?;
     let b_id = fresh_key().public();
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
-    let obs_buffer = Arc::new(ObservationBuffer::new());
     let b_metrics = Arc::new(Metrics::new());
     let (origin, recorded) = provisioned_origin(
         &ep_b,
@@ -2758,7 +2678,6 @@ async fn node_origin_no_providers_is_clean_miss() -> Result<()> {
         B256::repeat_byte(0xA1),
         &Arc::new(PrivateKeySigner::random()),
         &local_rep,
-        &obs_buffer,
         &b_metrics,
         Vec::new(),
         HashMap::new(),
@@ -2770,10 +2689,6 @@ async fn node_origin_no_providers_is_clean_miss() -> Result<()> {
     anyhow::ensure!(
         matches!(got, OriginFetch::NotFound),
         "no providers must yield NotFound"
-    );
-    anyhow::ensure!(
-        obs_buffer.drain().is_empty(),
-        "no reputation on a no-provider miss"
     );
     anyhow::ensure!(
         progress_log(&recorded)?.is_empty(),
@@ -2828,7 +2743,6 @@ async fn node_origin_unresolvable_address_skips_without_scoring() -> Result<()> 
     )
     .await?;
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
-    let obs_buffer = Arc::new(ObservationBuffer::new());
     let b_metrics = Arc::new(Metrics::new());
     // Provider discovered, but addr_map is EMPTY → unresolvable.
     let (origin, recorded) = provisioned_origin(
@@ -2838,7 +2752,6 @@ async fn node_origin_unresolvable_address_skips_without_scoring() -> Result<()> 
         B256::repeat_byte(0xA1),
         &Arc::new(PrivateKeySigner::random()),
         &local_rep,
-        &obs_buffer,
         &b_metrics,
         vec![DhtNodeId::from_bytes(*a_id.as_bytes())],
         HashMap::new(),
@@ -2850,10 +2763,6 @@ async fn node_origin_unresolvable_address_skips_without_scoring() -> Result<()> 
     anyhow::ensure!(
         matches!(got, OriginFetch::NotFound),
         "unresolvable provider must yield NotFound"
-    );
-    anyhow::ensure!(
-        obs_buffer.drain().is_empty(),
-        "an unresolvable provider must NOT be scored (not its fault)"
     );
     anyhow::ensure!(
         progress_log(&recorded)?.is_empty(),
@@ -2876,7 +2785,6 @@ async fn node_origin_probe_unreachable_is_scored() -> Result<()> {
     let (ep_b, _) = local_endpoint(fresh_key(), vec![]).await?;
     let b_id = fresh_key().public();
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
-    let obs_buffer = Arc::new(ObservationBuffer::new());
     let b_metrics = Arc::new(Metrics::new());
     let mut addr_map = HashMap::new();
     addr_map.insert(
@@ -2890,7 +2798,6 @@ async fn node_origin_probe_unreachable_is_scored() -> Result<()> {
         B256::repeat_byte(0xA1),
         &Arc::new(PrivateKeySigner::random()),
         &local_rep,
-        &obs_buffer,
         &b_metrics,
         vec![DhtNodeId::from_bytes(*a_id.as_bytes())],
         addr_map,
@@ -2902,15 +2809,6 @@ async fn node_origin_probe_unreachable_is_scored() -> Result<()> {
     anyhow::ensure!(
         matches!(got, OriginFetch::NotFound),
         "an unreachable provider must yield NotFound"
-    );
-    let drained = obs_buffer.drain();
-    let (peer, m) = drained
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("expected an Unreachable observation"))?;
-    anyhow::ensure!(*peer == a_id, "observation about wrong peer");
-    anyhow::ensure!(
-        m.uptime_observed == Some(false) && m.data_correct.is_none(),
-        "probe failure must score Unreachable, got {m:?}"
     );
     anyhow::ensure!(
         progress_log(&recorded)?.is_empty(),
@@ -2961,7 +2859,6 @@ async fn node_origin_corruption_is_classified_and_scored() -> Result<()> {
     .await?;
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
-    let obs_buffer = Arc::new(ObservationBuffer::new());
     let b_metrics = Arc::new(Metrics::new());
     let b_buyer = Arc::new(PrivateKeySigner::random());
     let (providers, addr_map) =
@@ -2973,7 +2870,6 @@ async fn node_origin_corruption_is_classified_and_scored() -> Result<()> {
         B256::repeat_byte(0xA1),
         &b_buyer,
         &local_rep,
-        &obs_buffer,
         &b_metrics,
         providers,
         addr_map,
@@ -2985,15 +2881,6 @@ async fn node_origin_corruption_is_classified_and_scored() -> Result<()> {
     anyhow::ensure!(
         matches!(got, OriginFetch::NotFound),
         "corrupt delivery must not surface bytes (NotFound)"
-    );
-    let drained = obs_buffer.drain();
-    let (peer, m) = drained
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("expected a Corruption observation"))?;
-    anyhow::ensure!(*peer == a_id, "observation about wrong peer");
-    anyhow::ensure!(
-        m.data_correct == Some(false) && m.uptime_observed == Some(true),
-        "wrong bytes must score Corruption (reachable, incorrect), got {m:?}"
     );
     anyhow::ensure!(
         local_rep.score(a_id) < 0.5,
@@ -3069,7 +2956,6 @@ async fn node_origin_voucher_rejection_does_not_tar_upstream() -> Result<()> {
     .await?;
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
-    let obs_buffer = Arc::new(ObservationBuffer::new());
     let b_metrics = Arc::new(Metrics::new());
     let b_buyer = Arc::new(PrivateKeySigner::random());
     let (providers, addr_map) =
@@ -3081,7 +2967,6 @@ async fn node_origin_voucher_rejection_does_not_tar_upstream() -> Result<()> {
         B256::repeat_byte(0xA1),
         &b_buyer,
         &local_rep,
-        &obs_buffer,
         &b_metrics,
         providers,
         addr_map,
@@ -3095,10 +2980,6 @@ async fn node_origin_voucher_rejection_does_not_tar_upstream() -> Result<()> {
         "a rejected voucher must not surface bytes (NotFound)"
     );
     // The provider is NOT tarred: no observation, score stays neutral at 0.5.
-    anyhow::ensure!(
-        obs_buffer.drain().is_empty(),
-        "a buyer-side voucher rejection must not emit a reputation observation (#857)"
-    );
     anyhow::ensure!(
         (local_rep.score(a_id) - 0.5).abs() < f64::EPSILON,
         "provider score must stay neutral after a voucher rejection, got {}",
@@ -3134,7 +3015,6 @@ async fn pull_against_a_voucher_rejecting_upstream_n(
 ) -> Result<(
     Arc<Mutex<Vec<(Address, B256)>>>,
     Arc<Metrics>,
-    Arc<ObservationBuffer>,
     Arc<LocalReputation>,
     iroh::PublicKey,
     B256,
@@ -3173,7 +3053,6 @@ async fn pull_against_a_voucher_rejecting_upstream_n(
     .await?;
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
-    let obs_buffer = Arc::new(ObservationBuffer::new());
     let b_metrics = Arc::new(Metrics::new());
     let b_buyer = Arc::new(PrivateKeySigner::random());
     let (providers, addr_map) =
@@ -3194,7 +3073,6 @@ async fn pull_against_a_voucher_rejecting_upstream_n(
         hash,
         buyer,
         &local_rep,
-        &obs_buffer,
         &b_metrics,
         &empty_region_accountant(),
         providers,
@@ -3217,7 +3095,7 @@ async fn pull_against_a_voucher_rejecting_upstream_n(
     ep_b.close().await;
     ep_a.close().await;
     task_a.await?;
-    Ok((retired, b_metrics, obs_buffer, local_rep, a_id, channel_id))
+    Ok((retired, b_metrics, local_rep, a_id, channel_id))
 }
 
 /// The single-fetch shape, which is what most of these tests want.
@@ -3226,7 +3104,6 @@ async fn pull_against_a_voucher_rejecting_upstream(
 ) -> Result<(
     Arc<Mutex<Vec<(Address, B256)>>>,
     Arc<Metrics>,
-    Arc<ObservationBuffer>,
     Arc<LocalReputation>,
     iroh::PublicKey,
     B256,
@@ -3262,7 +3139,7 @@ async fn node_origin_a_drained_channel_keeps_its_row_so_the_deposit_can_be_recla
 {
     // Two fetches: the second is how suppression is observed. A wedged provider must be
     // filtered out of ranking, so the second miss must not re-present a voucher to it.
-    let (retired, metrics, obs, local_rep, a_id, _channel_id) =
+    let (retired, metrics, local_rep, a_id, _channel_id) =
         pull_against_a_voucher_rejecting_upstream_n(VoucherRejectReason::InsufficientDeposit, 2)
             .await?;
 
@@ -3292,10 +3169,6 @@ async fn node_origin_a_drained_channel_keeps_its_row_so_the_deposit_can_be_recla
     // survive the fix.
     assert_counter(&metrics, "node_pull_unreachable_total", 0)?;
     anyhow::ensure!(
-        obs.drain().is_empty(),
-        "a drained deposit is our payment fault; the provider must not be scored for it"
-    );
-    anyhow::ensure!(
         (local_rep.score(a_id) - 0.5).abs() < f64::EPSILON,
         "provider score must stay neutral, got {}",
         local_rep.score(a_id)
@@ -3314,7 +3187,7 @@ async fn node_origin_a_drained_channel_keeps_its_row_so_the_deposit_can_be_recla
 #[tokio::test(flavor = "multi_thread")]
 async fn node_origin_a_cooperatively_closed_channel_is_the_one_that_may_be_forgotten() -> Result<()>
 {
-    let (retired, metrics, obs, local_rep, a_id, channel_id) =
+    let (retired, metrics, local_rep, a_id, channel_id) =
         pull_against_a_voucher_rejecting_upstream(VoucherRejectReason::CooperativeCloseSigned)
             .await?;
 
@@ -3337,10 +3210,6 @@ async fn node_origin_a_cooperatively_closed_channel_is_the_one_that_may_be_forgo
     assert_counter(&metrics, "node_pull_channel_wedged_total", 0)?;
     assert_counter(&metrics, "node_pull_voucher_rejected_total", 1)?;
     assert_counter(&metrics, "node_pull_unreachable_total", 0)?;
-    anyhow::ensure!(
-        obs.drain().is_empty(),
-        "a cooperative close is not misconduct; the provider must not be scored for it"
-    );
     anyhow::ensure!(
         (local_rep.score(a_id) - 0.5).abs() < f64::EPSILON,
         "provider score must stay neutral, got {}",
@@ -3367,7 +3236,7 @@ async fn node_origin_a_cooperatively_closed_channel_is_the_one_that_may_be_forgo
 /// fail against just as fast.
 #[tokio::test(flavor = "multi_thread")]
 async fn node_origin_an_unverifiable_voucher_is_a_local_fault_not_a_payment_one() -> Result<()> {
-    let (retired, metrics, obs, local_rep, a_id, _) =
+    let (retired, metrics, local_rep, a_id, _) =
         pull_against_a_voucher_rejecting_upstream(VoucherRejectReason::BadSignature).await?;
 
     assert_counter(&metrics, "node_pull_local_fault_total", 1)?;
@@ -3382,11 +3251,6 @@ async fn node_origin_an_unverifiable_voucher_is_a_local_fault_not_a_payment_one(
     );
     // And still not the provider's fault: it was right to reject what we sent.
     assert_counter(&metrics, "node_pull_unreachable_total", 0)?;
-    anyhow::ensure!(
-        obs.drain().is_empty(),
-        "a broken local signer must not tar the peer — it would tar EVERY peer, since the \
-         binding is signed before the stream opens, on every candidate"
-    );
     anyhow::ensure!(
         (local_rep.score(a_id) - 0.5).abs() < f64::EPSILON,
         "provider score must stay neutral, got {}",
@@ -3435,7 +3299,6 @@ async fn node_origin_transport_failure_still_scores_unreachable() -> Result<()> 
     .await?;
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
-    let obs_buffer = Arc::new(ObservationBuffer::new());
     let b_metrics = Arc::new(Metrics::new());
     let b_buyer = Arc::new(PrivateKeySigner::random());
     let (providers, addr_map) =
@@ -3447,7 +3310,6 @@ async fn node_origin_transport_failure_still_scores_unreachable() -> Result<()> 
         B256::repeat_byte(0xA1),
         &b_buyer,
         &local_rep,
-        &obs_buffer,
         &b_metrics,
         providers,
         addr_map,
@@ -3462,15 +3324,6 @@ async fn node_origin_transport_failure_still_scores_unreachable() -> Result<()> 
     );
     // The transport failure IS scored against the provider: an observation with
     // uptime_observed:false is emitted and the local score drops below neutral.
-    let drained = obs_buffer.drain();
-    let (peer, m) = drained
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("expected an Unreachable observation"))?;
-    anyhow::ensure!(*peer == a_id, "observation about wrong peer");
-    anyhow::ensure!(
-        m.uptime_observed == Some(false) && m.data_correct.is_none(),
-        "a real transport failure must score Unreachable, got {m:?}"
-    );
     anyhow::ensure!(
         local_rep.score(a_id) < 0.5,
         "a transport failure must drop the local score below neutral, got {}",
@@ -3922,7 +3775,6 @@ async fn node_origin_cancelled_pull_still_persists_the_acked_watermark() -> Resu
     .await?;
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
-    let obs_buffer = Arc::new(ObservationBuffer::new());
     let b_metrics = Arc::new(Metrics::new());
     let b_buyer = Arc::new(PrivateKeySigner::random());
     let (providers, addr_map) =
@@ -3943,7 +3795,6 @@ async fn node_origin_cancelled_pull_still_persists_the_acked_watermark() -> Resu
         hash,
         buyer,
         &local_rep,
-        &obs_buffer,
         &b_metrics,
         &empty_region_accountant(),
         providers,
@@ -4286,7 +4137,6 @@ async fn node_origin_empty_chunk_stream_is_rejected_not_spun_on() -> Result<()> 
     .await?;
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
-    let obs_buffer = Arc::new(ObservationBuffer::new());
     let b_metrics = Arc::new(Metrics::new());
     let b_buyer = Arc::new(PrivateKeySigner::random());
     let (providers, addr_map) =
@@ -4306,7 +4156,6 @@ async fn node_origin_empty_chunk_stream_is_rejected_not_spun_on() -> Result<()> 
         hash,
         buyer,
         &local_rep,
-        &obs_buffer,
         &b_metrics,
         &empty_region_accountant(),
         providers,
@@ -4388,7 +4237,6 @@ async fn node_origin_window_empty_chunk_stream_is_rejected_not_spun_on() -> Resu
     .await?;
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
-    let obs_buffer = Arc::new(ObservationBuffer::new());
     let b_metrics = Arc::new(Metrics::new());
     let b_buyer = Arc::new(PrivateKeySigner::random());
     let (providers, addr_map) =
@@ -4408,7 +4256,6 @@ async fn node_origin_window_empty_chunk_stream_is_rejected_not_spun_on() -> Resu
         hash,
         buyer,
         &local_rep,
-        &obs_buffer,
         &b_metrics,
         &empty_region_accountant(),
         providers,
@@ -4512,7 +4359,6 @@ async fn node_origin_mid_stream_silence_scores_stalled_upstream() -> Result<()> 
     .await?;
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
-    let obs_buffer = Arc::new(ObservationBuffer::new());
     let b_metrics = Arc::new(Metrics::new());
     let b_buyer = Arc::new(PrivateKeySigner::random());
     let (providers, addr_map) =
@@ -4532,7 +4378,6 @@ async fn node_origin_mid_stream_silence_scores_stalled_upstream() -> Result<()> 
         hash,
         buyer,
         &local_rep,
-        &obs_buffer,
         &b_metrics,
         &empty_region_accountant(),
         providers,
@@ -4567,15 +4412,6 @@ async fn node_origin_mid_stream_silence_scores_stalled_upstream() -> Result<()> 
     assert_counter(&b_metrics, "node_pull_voucher_rejected_total", 0)?;
     assert_counter(&b_metrics, "node_pull_corruption_total", 0)?;
 
-    let drained = obs_buffer.drain();
-    let (peer, m) = drained
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("a mid-stream stall must be gossiped (#1134)"))?;
-    anyhow::ensure!(*peer == a_id, "observation recorded about the wrong peer");
-    anyhow::ensure!(
-        m.uptime_observed == Some(false) && m.data_correct.is_none(),
-        "a mid-stream stall must score Unreachable, got {m:?}"
-    );
     anyhow::ensure!(
         local_rep.score(a_id) < 0.5,
         "a mid-stream stall must drop the local score below neutral, got {}",
@@ -4647,7 +4483,6 @@ async fn node_origin_a_silent_first_byte_is_our_deadline_not_the_peers_fault() -
     .await?;
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
-    let obs_buffer = Arc::new(ObservationBuffer::new());
     let b_metrics = Arc::new(Metrics::new());
     let b_buyer = Arc::new(PrivateKeySigner::random());
     let (providers, addr_map) =
@@ -4667,7 +4502,6 @@ async fn node_origin_a_silent_first_byte_is_our_deadline_not_the_peers_fault() -
         hash,
         buyer,
         &local_rep,
-        &obs_buffer,
         &b_metrics,
         &empty_region_accountant(),
         providers,
@@ -4717,12 +4551,6 @@ async fn node_origin_a_silent_first_byte_is_our_deadline_not_the_peers_fault() -
     // And still NOT scored — the assertion that matters. This peer answered honestly and
     // may simply be a slow disk with a big blob.
     assert_counter(&b_metrics, "node_pull_unreachable_total", 0)?;
-    anyhow::ensure!(
-        obs_buffer.drain().is_empty(),
-        "a peer that has not yet sent its first byte must not be gossiped as unreachable — \
-         time-to-first-byte scales with blob size, so this defames honest servers for \
-         serving large blobs"
-    );
     anyhow::ensure!(
         (local_rep.score(a_id) - 0.5).abs() < f64::EPSILON,
         "the local score must stay neutral, got {}",
@@ -4785,7 +4613,6 @@ async fn node_origin_mid_stream_refusal_is_metered_not_scored() -> Result<()> {
     .await?;
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
-    let obs_buffer = Arc::new(ObservationBuffer::new());
     let b_metrics = Arc::new(Metrics::new());
     let b_buyer = Arc::new(PrivateKeySigner::random());
     let (providers, addr_map) =
@@ -4805,7 +4632,6 @@ async fn node_origin_mid_stream_refusal_is_metered_not_scored() -> Result<()> {
         hash,
         buyer,
         &local_rep,
-        &obs_buffer,
         &b_metrics,
         &empty_region_accountant(),
         providers,
@@ -4839,10 +4665,6 @@ async fn node_origin_mid_stream_refusal_is_metered_not_scored() -> Result<()> {
     assert_counter(&b_metrics, "node_pull_stalled_total", 0)?;
 
     // Nothing gossiped, and the local score untouched: the peer answered honestly.
-    anyhow::ensure!(
-        obs_buffer.drain().is_empty(),
-        "an honest mid-stream refusal must not be gossiped as an observation"
-    );
     // The mirror of the stall test's `< 0.5`: a stall drops the score below neutral, an
     // honest refusal must not touch it.
     anyhow::ensure!(
@@ -4910,7 +4732,6 @@ async fn node_origin_an_ack_wait_refusal_is_metered_not_scored() -> Result<()> {
     .await?;
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
-    let obs_buffer = Arc::new(ObservationBuffer::new());
     let b_metrics = Arc::new(Metrics::new());
     let b_buyer = Arc::new(PrivateKeySigner::random());
     let (providers, addr_map) =
@@ -4930,7 +4751,6 @@ async fn node_origin_an_ack_wait_refusal_is_metered_not_scored() -> Result<()> {
         hash,
         buyer,
         &local_rep,
-        &obs_buffer,
         &b_metrics,
         &empty_region_accountant(),
         providers,
@@ -5026,7 +4846,6 @@ async fn node_origin_a_wedged_provider_is_skipped_for_other_hashes() -> Result<(
     }
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
-    let obs_buffer = Arc::new(ObservationBuffer::new());
     let b_metrics = Arc::new(Metrics::new());
     let b_buyer = Arc::new(PrivateKeySigner::random());
     let buyer = Arc::new(StubOpener {
@@ -5046,7 +4865,6 @@ async fn node_origin_a_wedged_provider_is_skipped_for_other_hashes() -> Result<(
         &[hash1, hash2],
         buyer,
         &local_rep,
-        &obs_buffer,
         &b_metrics,
         &empty_region_accountant(),
         &[a_dht],
@@ -5149,7 +4967,6 @@ async fn node_origin_a_mid_stream_voucher_rejection_still_reaches_the_channel_re
     .await?;
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
-    let obs_buffer = Arc::new(ObservationBuffer::new());
     let b_metrics = Arc::new(Metrics::new());
     let b_buyer = Arc::new(PrivateKeySigner::random());
     let (providers, addr_map) =
@@ -5170,7 +4987,6 @@ async fn node_origin_a_mid_stream_voucher_rejection_still_reaches_the_channel_re
         hash,
         buyer,
         &local_rep,
-        &obs_buffer,
         &b_metrics,
         &empty_region_accountant(),
         providers,
@@ -5212,10 +5028,6 @@ async fn node_origin_a_mid_stream_voucher_rejection_still_reaches_the_channel_re
 
     // Our payment fault, not the peer's: it is not scored, here or over gossip.
     assert_counter(&b_metrics, "node_pull_unreachable_total", 0)?;
-    anyhow::ensure!(
-        obs_buffer.drain().is_empty(),
-        "a voucher rejection is our payment fault; the provider must not be gossiped"
-    );
     anyhow::ensure!(
         (local_rep.score(a_id) - 0.5).abs() < f64::EPSILON,
         "the provider's score must stay neutral, got {}",
@@ -5364,7 +5176,6 @@ async fn silent_upstreams_do_not_starve_the_candidate_loop() -> Result<()> {
     }
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
-    let obs_buffer = Arc::new(ObservationBuffer::new());
     let b_metrics = Arc::new(Metrics::new());
     let s1_dht = DhtNodeId::from_bytes(*s1_id.as_bytes());
     let s2_dht = DhtNodeId::from_bytes(*s2_id.as_bytes());
@@ -5390,7 +5201,6 @@ async fn silent_upstreams_do_not_starve_the_candidate_loop() -> Result<()> {
         hash,
         buyer,
         &local_rep,
-        &obs_buffer,
         &b_metrics,
         &empty_region_accountant(),
         vec![s1_dht, s2_dht, a_dht],
@@ -5506,7 +5316,6 @@ async fn node_origin_slow_but_healthy_transfer_completes_past_pull_timeout() -> 
     .await?;
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
-    let obs_buffer = Arc::new(ObservationBuffer::new());
     let b_metrics = Arc::new(Metrics::new());
     let b_buyer = Arc::new(PrivateKeySigner::random());
     let (providers, addr_map) =
@@ -5526,7 +5335,6 @@ async fn node_origin_slow_but_healthy_transfer_completes_past_pull_timeout() -> 
         hash,
         buyer,
         &local_rep,
-        &obs_buffer,
         &b_metrics,
         &empty_region_accountant(),
         providers,
@@ -5702,7 +5510,6 @@ async fn node_origin_not_found_refusal_does_not_tar_upstream() -> Result<()> {
     }
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
-    let obs_buffer = Arc::new(ObservationBuffer::new());
     let b_metrics = Arc::new(Metrics::new());
     let n_dht = DhtNodeId::from_bytes(*n_id.as_bytes());
     let a_dht = DhtNodeId::from_bytes(*a_id.as_bytes());
@@ -5724,7 +5531,6 @@ async fn node_origin_not_found_refusal_does_not_tar_upstream() -> Result<()> {
         hash,
         buyer,
         &local_rep,
-        &obs_buffer,
         &b_metrics,
         &empty_region_accountant(),
         vec![n_dht, a_dht],
@@ -5755,21 +5561,17 @@ async fn node_origin_not_found_refusal_does_not_tar_upstream() -> Result<()> {
     // the `UpstreamRefused` arm is reverted to an unconditional
     // `record_outcome(Unreachable)`.
     assert_counter(&b_metrics, "node_pull_unreachable_total", 0)?;
-    let drained = obs_buffer.drain();
-    anyhow::ensure!(
-        !drained.iter().any(|(p, _)| *p == n_id),
-        "a node that honestly refused with NotFound must not be gossiped about (#1144)"
-    );
     anyhow::ensure!(
         (local_rep.score(n_id) - 0.5).abs() < f64::EPSILON,
         "an honest NotFound must leave the refusing node's local score neutral, got {}",
         local_rep.score(n_id)
     );
-    // The one observation is the honest delivery from A — the refusal did not
-    // suppress scoring in general, it is only NotFound that is exonerated.
+    // The refusal did not suppress scoring in general — A's clean delivery still
+    // raised its local score; it is only NotFound that is exonerated.
     anyhow::ensure!(
-        drained.len() == 1 && drained.iter().any(|(p, _)| *p == a_id),
-        "expected exactly one observation (A's clean delivery), got {drained:?}"
+        local_rep.score(a_id) > 0.5,
+        "A's clean delivery must raise its local score, got {}",
+        local_rep.score(a_id)
     );
 
     // …but exonerating N must not mean FORGETTING about it (#1145 review). N answered
@@ -5866,7 +5668,6 @@ async fn refusal_suppression_after(error: StreamError, wait: Duration) -> Result
     .await?;
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
-    let obs_buffer = Arc::new(ObservationBuffer::new());
     let b_metrics = Arc::new(Metrics::new());
     let b_buyer = Arc::new(PrivateKeySigner::random());
     let (providers, addr_map) =
@@ -5886,7 +5687,6 @@ async fn refusal_suppression_after(error: StreamError, wait: Duration) -> Result
         hash,
         buyer,
         &local_rep,
-        &obs_buffer,
         &b_metrics,
         &empty_region_accountant(),
         providers,
@@ -6015,7 +5815,6 @@ async fn post_eviction_failures_after_a_refusal(error: StreamError) -> Result<u6
     .await?;
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
-    let obs_buffer = Arc::new(ObservationBuffer::new());
     let b_metrics = Arc::new(Metrics::new());
     let b_buyer = Arc::new(PrivateKeySigner::random());
     let (providers, addr_map) =
@@ -6035,7 +5834,6 @@ async fn post_eviction_failures_after_a_refusal(error: StreamError) -> Result<u6
         hash,
         buyer,
         &local_rep,
-        &obs_buffer,
         &b_metrics,
         &empty_region_accountant(),
         providers,
@@ -6122,7 +5920,6 @@ async fn node_origin_internal_error_refusal_scores_unreachable() -> Result<()> {
     .await?;
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
-    let obs_buffer = Arc::new(ObservationBuffer::new());
     let b_metrics = Arc::new(Metrics::new());
     let b_buyer = Arc::new(PrivateKeySigner::random());
     let (providers, addr_map) =
@@ -6134,7 +5931,6 @@ async fn node_origin_internal_error_refusal_scores_unreachable() -> Result<()> {
         B256::repeat_byte(0x1E),
         &b_buyer,
         &local_rep,
-        &obs_buffer,
         &b_metrics,
         providers,
         addr_map,
@@ -6151,15 +5947,6 @@ async fn node_origin_internal_error_refusal_scores_unreachable() -> Result<()> {
     // Metered as a refusal (it IS one) AND scored (this one is the peer's fault).
     assert_counter(&b_metrics, "node_pull_refused_total", 1)?;
     assert_counter(&b_metrics, "node_pull_unreachable_total", 1)?;
-    let drained = obs_buffer.drain();
-    let (peer, m) = drained.first().ok_or_else(|| {
-        anyhow::anyhow!("a self-reported InternalError must be gossiped, not exonerated (#1144)")
-    })?;
-    anyhow::ensure!(*peer == a_id, "observation recorded about the wrong peer");
-    anyhow::ensure!(
-        m.uptime_observed == Some(false) && m.data_correct.is_none(),
-        "an InternalError refusal must score Unreachable, got {m:?}"
-    );
     anyhow::ensure!(
         local_rep.score(a_id) < 0.5,
         "an InternalError refusal must drop the local score below neutral, got {}",
@@ -6252,7 +6039,6 @@ async fn node_origin_oversized_claim_is_rejected_without_scoring() -> Result<()>
     .await?;
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
-    let obs_buffer = Arc::new(ObservationBuffer::new());
     let b_metrics = Arc::new(Metrics::new());
     let (providers, addr_map) =
         one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
@@ -6263,7 +6049,6 @@ async fn node_origin_oversized_claim_is_rejected_without_scoring() -> Result<()>
         channel_id,
         &b_buyer,
         &local_rep,
-        &obs_buffer,
         &b_metrics,
         providers,
         addr_map,
@@ -6278,10 +6063,6 @@ async fn node_origin_oversized_claim_is_rejected_without_scoring() -> Result<()>
         "an over-ceiling claim must not surface bytes (NotFound)"
     );
     // The provider is NOT tarred: no observation, score stays at the neutral 0.5.
-    anyhow::ensure!(
-        obs_buffer.drain().is_empty(),
-        "a buyer-side ceiling rejection must not emit a reputation observation"
-    );
     anyhow::ensure!(
         (local_rep.score(a_id) - 0.5).abs() < f64::EPSILON,
         "provider score must stay neutral after a ceiling rejection, got {}",
@@ -6377,7 +6158,6 @@ async fn node_origin_reused_channel_resumes_voucher_progress() -> Result<()> {
     .await?;
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
-    let obs_buffer = Arc::new(ObservationBuffer::new());
     let b_metrics = Arc::new(Metrics::new());
     let (providers, addr_map) =
         one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
@@ -6388,7 +6168,6 @@ async fn node_origin_reused_channel_resumes_voucher_progress() -> Result<()> {
         channel_id,
         &b_buyer,
         &local_rep,
-        &obs_buffer,
         &b_metrics,
         providers,
         addr_map,
@@ -6530,7 +6309,6 @@ async fn node_origin_persist_failure_still_delivers_and_is_counted() -> Result<(
     .await?;
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
-    let obs_buffer = Arc::new(ObservationBuffer::new());
     let b_metrics = Arc::new(Metrics::new());
     let (providers, addr_map) =
         one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
@@ -6547,7 +6325,6 @@ async fn node_origin_persist_failure_still_delivers_and_is_counted() -> Result<(
         hash,
         buyer,
         &local_rep,
-        &obs_buffer,
         &b_metrics,
         &empty_region_accountant(),
         providers,
@@ -6869,7 +6646,6 @@ async fn build_node_b_with_leaves(
     .await?;
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
-    let obs_buffer = Arc::new(ObservationBuffer::new());
     let b_metrics = Arc::new(Metrics::new());
     let (providers, addr_map) = one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth_addr);
     let (origin, recorded) = provisioned_origin(
@@ -6879,7 +6655,6 @@ async fn build_node_b_with_leaves(
         ab_channel_id,
         b_buyer,
         &local_rep,
-        &obs_buffer,
         &b_metrics,
         providers,
         addr_map,
@@ -8811,7 +8586,6 @@ async fn two_concurrent_pulls_to_one_provider_share_the_channel_ledger() -> Resu
     }
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
-    let obs_buffer = Arc::new(ObservationBuffer::new());
     let b_metrics = Arc::new(Metrics::new());
     let a_dht = DhtNodeId::from_bytes(*a_id.as_bytes());
     let (providers, addr_map) = one_provider(a_dht, a_eth.address());
@@ -8846,12 +8620,6 @@ async fn two_concurrent_pulls_to_one_provider_share_the_channel_ledger() -> Resu
         slash_domain: slash_domain(),
         bind_domain: binding_dom(),
         local_rep: Arc::clone(&local_rep),
-        obs_buffer: Arc::clone(&obs_buffer),
-        network_rep: Arc::new(
-            NetworkReputation::new(NetworkReputationConfig::default())
-                .expect("network reputation config"),
-        ),
-        rep_cfg: NetworkReputationConfig::default(),
         negative_cache: NegativeProbeCache::new(),
         probe_cache: PositiveProbeCache::new(),
         metrics: Arc::clone(&b_metrics),
@@ -9010,7 +8778,6 @@ async fn a_second_fetch_inside_the_ttl_skips_the_probe_entirely() -> Result<()> 
     probes.store(0, Ordering::SeqCst);
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
-    let obs_buffer = Arc::new(ObservationBuffer::new());
     let b_metrics = Arc::new(Metrics::new());
     let (providers, addr_map) =
         one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
@@ -9021,7 +8788,6 @@ async fn a_second_fetch_inside_the_ttl_skips_the_probe_entirely() -> Result<()> 
         channel_id,
         &b_buyer,
         &local_rep,
-        &obs_buffer,
         &b_metrics,
         providers,
         addr_map,
@@ -9141,7 +8907,6 @@ async fn a_fetch_past_the_ttl_probes_again() -> Result<()> {
     probes.store(0, Ordering::SeqCst);
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
-    let obs_buffer = Arc::new(ObservationBuffer::new());
     let b_metrics = Arc::new(Metrics::new());
     let (providers, addr_map) =
         one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
@@ -9164,7 +8929,6 @@ async fn a_fetch_past_the_ttl_probes_again() -> Result<()> {
         hash,
         buyer,
         &local_rep,
-        &obs_buffer,
         &b_metrics,
         &empty_region_accountant(),
         providers,
@@ -9299,7 +9063,6 @@ async fn a_progressive_pull_routes_the_fallback_on_the_request_namespace() -> Re
     .await?;
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
-    let obs_buffer = Arc::new(ObservationBuffer::new());
     let b_metrics = Arc::new(Metrics::new());
     let (providers, addr_map) =
         one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
@@ -9319,7 +9082,6 @@ async fn a_progressive_pull_routes_the_fallback_on_the_request_namespace() -> Re
         hash,
         buyer,
         &local_rep,
-        &obs_buffer,
         &b_metrics,
         &empty_region_accountant(),
         providers,
@@ -9466,7 +9228,6 @@ async fn cached_candidates_and_the_cold_path_share_one_attempt_budget() -> Resul
     probes.store(0, Ordering::SeqCst);
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
-    let obs_buffer = Arc::new(ObservationBuffer::new());
     let b_metrics = Arc::new(Metrics::new());
     let b_buyer = Arc::new(PrivateKeySigner::random());
 
@@ -9494,7 +9255,6 @@ async fn cached_candidates_and_the_cold_path_share_one_attempt_budget() -> Resul
         hash,
         buyer,
         &local_rep,
-        &obs_buffer,
         &b_metrics,
         &empty_region_accountant(),
         vec![n0_dht, n1_dht, n2_dht],
@@ -9661,7 +9421,6 @@ async fn a_partial_cached_budget_falls_through_to_the_cold_path_and_meters_once(
     streams_n.store(0, Ordering::SeqCst);
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
-    let obs_buffer = Arc::new(ObservationBuffer::new());
     let b_metrics = Arc::new(Metrics::new());
     let b_buyer = Arc::new(PrivateKeySigner::random());
     let channel_id = B256::repeat_byte(0x1B);
@@ -9688,7 +9447,6 @@ async fn a_partial_cached_budget_falls_through_to_the_cold_path_and_meters_once(
         hash,
         buyer,
         &local_rep,
-        &obs_buffer,
         &b_metrics,
         &empty_region_accountant(),
         vec![n_dht, h_dht],
@@ -9941,7 +9699,6 @@ async fn a_probe_cache_hit_still_honours_the_negative_cache() -> Result<()> {
     a_probes.store(0, Ordering::SeqCst);
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
-    let obs_buffer = Arc::new(ObservationBuffer::new());
     let b_metrics = Arc::new(Metrics::new());
     let n_dht = DhtNodeId::from_bytes(*n_id.as_bytes());
     let a_dht = DhtNodeId::from_bytes(*a_id.as_bytes());
@@ -9963,7 +9720,6 @@ async fn a_probe_cache_hit_still_honours_the_negative_cache() -> Result<()> {
         hash,
         buyer,
         &local_rep,
-        &obs_buffer,
         &b_metrics,
         &empty_region_accountant(),
         vec![n_dht, a_dht],
@@ -10113,7 +9869,6 @@ async fn a_progressive_pull_reuses_a_probe_cache_entry_written_by_a_buffered_fet
     probes.store(0, Ordering::SeqCst);
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
-    let obs_buffer = Arc::new(ObservationBuffer::new());
     let b_metrics = Arc::new(Metrics::new());
     let (providers, addr_map) =
         one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
@@ -10124,7 +9879,6 @@ async fn a_progressive_pull_reuses_a_probe_cache_entry_written_by_a_buffered_fet
         channel_id,
         &b_buyer,
         &local_rep,
-        &obs_buffer,
         &b_metrics,
         providers,
         addr_map,
@@ -10267,7 +10021,6 @@ async fn a_window_pull_with_a_partial_cached_budget_falls_through_cold_and_meter
     streams_n.store(0, Ordering::SeqCst);
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
-    let obs_buffer = Arc::new(ObservationBuffer::new());
     let b_metrics = Arc::new(Metrics::new());
     let b_buyer = Arc::new(PrivateKeySigner::random());
     let channel_id = B256::repeat_byte(0x6E);
@@ -10294,7 +10047,6 @@ async fn a_window_pull_with_a_partial_cached_budget_falls_through_cold_and_meter
         hash,
         buyer,
         &local_rep,
-        &obs_buffer,
         &b_metrics,
         &empty_region_accountant(),
         vec![n_dht, h_dht],
@@ -10551,7 +10303,6 @@ async fn a_window_pull_shares_one_attempt_budget_and_invalidates_on_exhaustion()
     streams.store(0, Ordering::SeqCst);
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
-    let obs_buffer = Arc::new(ObservationBuffer::new());
     let b_metrics = Arc::new(Metrics::new());
     let b_buyer = Arc::new(PrivateKeySigner::random());
 
@@ -10579,7 +10330,6 @@ async fn a_window_pull_shares_one_attempt_budget_and_invalidates_on_exhaustion()
         hash,
         buyer,
         &local_rep,
-        &obs_buffer,
         &b_metrics,
         &empty_region_accountant(),
         vec![n0_dht, n1_dht, n2_dht],
@@ -10750,7 +10500,6 @@ async fn an_entry_whose_every_provider_is_suppressed_is_a_miss_not_a_hit() -> Re
     streams_n.store(0, Ordering::SeqCst);
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
-    let obs_buffer = Arc::new(ObservationBuffer::new());
     let b_metrics = Arc::new(Metrics::new());
     let b_buyer = Arc::new(PrivateKeySigner::random());
     let (providers, addr_map) =
@@ -10770,7 +10519,6 @@ async fn an_entry_whose_every_provider_is_suppressed_is_a_miss_not_a_hit() -> Re
         hash,
         buyer,
         &local_rep,
-        &obs_buffer,
         &b_metrics,
         &empty_region_accountant(),
         providers,
@@ -10966,7 +10714,6 @@ async fn a_probe_cache_hit_still_honours_the_wedged_provider_filter() -> Result<
     probes_h.store(0, Ordering::SeqCst);
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
-    let obs_buffer = Arc::new(ObservationBuffer::new());
     let b_metrics = Arc::new(Metrics::new());
     let a_dht = DhtNodeId::from_bytes(*a_id.as_bytes());
     let h_dht = DhtNodeId::from_bytes(*h_id.as_bytes());
@@ -10988,7 +10735,6 @@ async fn a_probe_cache_hit_still_honours_the_wedged_provider_filter() -> Result<
         &[hash1, hash2],
         buyer,
         &local_rep,
-        &obs_buffer,
         &b_metrics,
         &empty_region_accountant(),
         &[a_dht, h_dht],
@@ -11305,7 +11051,6 @@ async fn a_probe_cache_hit_drops_a_provider_no_longer_admitted() -> Result<()> {
     a_streams.store(0, Ordering::SeqCst);
 
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
-    let obs_buffer = Arc::new(ObservationBuffer::new());
     let b_metrics = Arc::new(Metrics::new());
     let a_dht = DhtNodeId::from_bytes(*a_id.as_bytes());
     let b_dht = DhtNodeId::from_bytes(*b_id.as_bytes());
@@ -11347,12 +11092,6 @@ async fn a_probe_cache_hit_drops_a_provider_no_longer_admitted() -> Result<()> {
         slash_domain: slash_domain(),
         bind_domain: binding_dom(),
         local_rep: Arc::clone(&local_rep),
-        obs_buffer: Arc::clone(&obs_buffer),
-        network_rep: Arc::new(
-            NetworkReputation::new(NetworkReputationConfig::default())
-                .expect("network reputation config"),
-        ),
-        rep_cfg: NetworkReputationConfig::default(),
         negative_cache: NegativeProbeCache::new(),
         probe_cache: PositiveProbeCache::new(),
         metrics: Arc::clone(&b_metrics),

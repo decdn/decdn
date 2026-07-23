@@ -27,8 +27,7 @@ pub use framing::{
     read_frame, write_frame,
 };
 pub use gossip::{
-    GOSSIP_VERSION, GossipEnvelope, GossipPayload, NodeAnnounce, NodeAnnounceBody, ReportMetrics,
-    ReputationReport, ReputationReportBody, SIGNATURE_LEN,
+    GOSSIP_VERSION, GossipEnvelope, GossipPayload, NodeAnnounce, NodeAnnounceBody, SIGNATURE_LEN,
 };
 pub use identity::{ContentHash, ID_LEN, NodeId};
 pub use message::{
@@ -62,9 +61,6 @@ pub const TOPIC_GLOBAL: &str = "cdn/global/v1";
 
 /// Gossip topic prefix for regional node announcements.
 pub const TOPIC_REGION_PREFIX: &str = "cdn/region/";
-
-/// Gossip topic for reputation reports.
-pub const TOPIC_REPUTATION: &str = "cdn/reputation/v1";
 
 /// Connection rejected by the per-source or global rate limiter (ADR 013 §0x10).
 ///

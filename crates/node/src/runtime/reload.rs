@@ -883,8 +883,6 @@ impl RuntimeReloadState {
                 announce_interval_sec: 60,
                 peer_ttl_sec: 600,
                 subscribe_global: false,
-                subscribe_reputation: true,
-                reputation_publish_interval_sec: 3600,
                 max_peer_entries: Some(100_000),
             },
             security: ResolvedSecurity {
@@ -1129,10 +1127,7 @@ fn warn_restart_required_sections(file: &decdn_common::config::FileConfig) {
         warn_ignored("payment.* (voucher_interval_mb)");
     }
     if file.gossip.is_some() {
-        warn_ignored(
-            "gossip.* (announce_interval, peer_ttl, subscribe_global, \
-             subscribe_reputation, reputation_publish_interval_sec)",
-        );
+        warn_ignored("gossip.* (announce_interval, peer_ttl, subscribe_global)");
     }
     if file
         .observability
@@ -1384,8 +1379,6 @@ mod tests {
                 announce_interval_sec: 60,
                 peer_ttl_sec: 600,
                 subscribe_global: false,
-                subscribe_reputation: true,
-                reputation_publish_interval_sec: 3600,
                 max_peer_entries: Some(100_000),
             },
             security: ResolvedSecurity {

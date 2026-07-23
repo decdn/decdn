@@ -667,14 +667,11 @@ async fn serve_until_shutdown(
 /// `P` at the call site and hands it to [`ShutdownHandles`].
 struct ChainHandlers<P: Provider + Clone + 'static> {
     rpc_url: HttpUrl,
-    reputation_rpc_url: HttpUrl,
     event_poll_interval: Duration,
     slash_domain: alloy::dyn_abi::Eip712Domain,
     voucher_domain: alloy::dyn_abi::Eip712Domain,
     bind_domain: alloy::dyn_abi::Eip712Domain,
-    capacity_bond_addr: alloy::primitives::Address,
     payment_channel_addr: alloy::primitives::Address,
-    head: Arc<dyn HeadSource>,
     staker_set: Arc<dyn StakerSet>,
     capacity_bond_watcher: Arc<crate::chain_events::resumable_watcher::WatcherHandle>,
     slash_watcher: crate::slash_watcher::SlashWatcher,
@@ -740,9 +737,6 @@ async fn build_chain_and_handlers(
         &cfg.blockchain.capacity_bond_address,
         "blockchain.capacity_bond_address",
     )?;
-    // Reserved for the settlement indexer's read-only provider (#326); cloned
-    // here before `rpc_url` is moved into the wallet providers below.
-    let reputation_rpc_url = rpc_url.clone();
     // Mandatory for paid delivery. Config resolution rejects absence; this
     // runtime guard preserves fail-closed behavior for directly constructed
     // `ResolvedConfig` values as well.
@@ -1335,14 +1329,11 @@ async fn build_chain_and_handlers(
 
     Ok(ChainHandlers {
         rpc_url,
-        reputation_rpc_url,
         event_poll_interval,
         slash_domain,
         voucher_domain,
         bind_domain,
-        capacity_bond_addr,
         payment_channel_addr,
-        head,
         staker_set,
         capacity_bond_watcher,
         slash_watcher,
@@ -1388,7 +1379,6 @@ struct Background {
     rpc_watchdog: Option<(oneshot::Sender<()>, tokio::task::JoinHandle<()>)>,
     gossip_shutdown: CancellationToken,
     gossip_handles: Vec<tokio::task::JoinHandle<()>>,
-    settlement_indexer: Option<crate::reputation_indexer::SettlementIndexer>,
     admin_stop_tx: Option<oneshot::Sender<()>>,
     drain_trigger: Arc<admin::DrainTrigger>,
     tasks: JoinSet<()>,
@@ -1396,12 +1386,12 @@ struct Background {
 
 /// Background-tasks phase extracted verbatim from the middle of [`run`] (issue
 /// #1253 PR5): construct the buyer-side provider/stores, spawn every periodic
-/// GC / DHT / gossip / reputation / metrics / admin task, and emit the startup
+/// GC / DHT / gossip / metrics / admin task, and emit the startup
 /// banner. Borrows [`Infra`] and [`ChainHandlers`]; the by-value `ch` moves the
-/// region performed on owned locals (`rpc_url`, the three EIP-712 domains, and
-/// `reputation_rpc_url`) become `.clone()`s here since they are read through a
-/// shared reference — each field is consumed exactly once and never read again,
-/// so the clone is behavior-identical. Returns the [`Background`] handles [`run`]
+/// region performed on owned locals (`rpc_url` and the three EIP-712 domains)
+/// become `.clone()`s here since they are read through a shared reference — each
+/// field is consumed exactly once and never read again, so the clone is
+/// behavior-identical. Returns the [`Background`] handles [`run`]
 /// threads into the serve call and [`ShutdownHandles`].
 #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
 async fn spawn_background_tasks<P: Provider + Clone + 'static>(
@@ -1752,7 +1742,6 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
         announce_interval_sec: cfg.gossip.announce_interval_sec,
         subscribe_global: cfg.gossip.subscribe_global,
         region: cfg.identity.region.clone(),
-        reputation_publish_interval_sec: cfg.gossip.reputation_publish_interval_sec,
     };
     // ADR 001 rule 2: a NodeAnnounce is accepted only from a currently-staked
     // node. Enforced against the live on-chain registry (`staker_set`, kept
@@ -1760,38 +1749,17 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
     // failure already aborted startup above, so this is always
     // `AnnounceGate::Enforce` (`announce_staked_gate` is the unit-tested
     // guarantee of that).
-    let announce_gate = crate::reputation_wiring::announce_staked_gate(Arc::clone(&ch.staker_set));
+    let announce_gate = crate::announce_gate::announce_staked_gate(Arc::clone(&ch.staker_set));
     let gossip_metrics: Arc<dyn GossipMetrics> =
         Arc::new(NodeGossipMetrics::new(Arc::clone(&infra.node_metrics)));
 
-    // Network reputation aggregation (ADR 008, #326). The settlement indexer
-    // (spawned after the gossip service below) feeds `settlement_source` with
-    // network-wide `ChannelSettled` value so reporter weights are live; the
-    // `network_reputation` / `regional_coverage` handles are retained for the
-    // `admin_v1_reputation` read API and for the combined selection score used
-    // by the node-to-node pull (#831).
-    let reputation_cfg = decdn_reputation::NetworkReputationConfig::default();
-    let min_counterparties = reputation_cfg.min_counterparties;
-    let network_reputation = Arc::new(
-        decdn_reputation::NetworkReputation::new(reputation_cfg.clone())
-            .context("network reputation config invalid")?,
-    );
-    let regional_coverage = Arc::new(
-        decdn_reputation::RegionalCoverage::new(reputation_cfg.clone())
-            .context("regional coverage config invalid")?,
-    );
-    let settlement_source = Arc::new(crate::reputation_wiring::NodeSettlementSource::new(
-        min_counterparties,
-    ));
-    // Local per-peer EWMA score store and the outbound observation buffer (ADR
-    // 008 §Local Score / §Gossip Protocol, #831). The buffer is written only by
-    // the `NodeOrigin` pull path (provisioned below); `local_reputation` also
-    // feeds the combined selection score. Both constructed unconditionally (they
-    // are cheap and the admin API may read the local score), but the publisher
-    // that drains the buffer is only spawned when pull-through is enabled — see
-    // `report_drain` below.
-    // Opt into ADR 008 §8's ±0.05 per-report clamp (the library default is a
-    // no-op cap per §14a) so one bad interaction cannot over-penalize an
+    // Local per-peer EWMA reputation score store (ADR 008 §Local Score
+    // Calculation). Reputation is local-only: a node ranks its peers solely from
+    // its own delivery observations — there is no gossip propagation or
+    // cross-node aggregation. The store feeds node selection via the
+    // `NodeOrigin` pull path (provisioned below).
+    // Opt into ADR 008 §Score Clamping's ±0.05 per-report clamp (the library
+    // default is a no-op cap) so one bad interaction cannot over-penalize an
     // otherwise good peer (#1176).
     let local_reputation = Arc::new(
         decdn_reputation::LocalReputation::new(
@@ -1800,51 +1768,6 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
         )
         .context("local reputation config invalid")?,
     );
-    let observation_buffer = Arc::new(decdn_reputation::ObservationBuffer::new());
-    // Outbound report capture (#831): the `NodeOrigin` pull path feeds
-    // `observation_buffer` with delivery/probe outcomes, so wire the drain —
-    // which spawns the gossip publisher — whenever pull-through is enabled. With
-    // the feature off nothing writes the buffer, so leave it `None` and the
-    // publisher unspawned (the node still aggregates inbound reports), exactly
-    // as before #831.
-    let report_drain = cfg.cache.node_to_node_pull_through_enabled;
-    // The operator's `gossip.subscribe_reputation` is resolved into the wiring
-    // variant HERE, and this is the only place it is consulted (#1355 review).
-    // It used to be threaded into `GossipRuntimeConfig` as well and re-checked
-    // inside `spawn`, which left two independent ways to say "off" while this
-    // site pinned the wiring to `Enabled` unconditionally.
-    let reputation_wiring = if cfg.gossip.subscribe_reputation {
-        decdn_gossip::ReputationWiring::Enabled {
-            sink: Arc::new(crate::reputation_wiring::NodeReputationSink::new(
-                Arc::clone(&network_reputation),
-                Arc::clone(&regional_coverage),
-                Arc::clone(&settlement_source),
-                Arc::clone(&ch.peer_table),
-                Arc::clone(&ch.staker_set),
-                min_counterparties,
-            )),
-            staked: crate::reputation_wiring::report_staked_set(Arc::clone(&ch.staker_set)),
-            publish: report_drain.then(|| {
-                Arc::new(crate::reputation_wiring::NodeReportDrain::new(Arc::clone(
-                    &observation_buffer,
-                ))) as Arc<dyn decdn_gossip::ReportDrain>
-            }),
-        }
-    } else {
-        // #864: the two settings are inert in combination — the buffer is
-        // written but the topic is never joined, so observations accumulate and
-        // never publish. Diagnosed here rather than in `decdn-gossip` because
-        // this is the only scope holding both knobs; the gossip crate could
-        // only ever guess which one the operator meant to change.
-        if report_drain {
-            tracing::warn!(
-                "gossip.subscribe_reputation = false with cache.node_to_node_pull_through_enabled \
-                 = true: delivery observations will accumulate in memory and never publish — \
-                 enable gossip.subscribe_reputation to drain them"
-            );
-        }
-        decdn_gossip::ReputationWiring::Disabled
-    };
 
     // Buyer-side PaymentChannel bootstrap + node-to-node pull-through
     // provisioning (#831), fully backgrounded off the startup critical path
@@ -1886,7 +1809,6 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
         // (#1177); `None` disables it (nothing to compare a peer's claim against).
         own_region: cfg.identity.region.clone(),
     };
-    let node_origin_reputation_cfg = reputation_cfg.clone();
     // Arc/handle clones for the task — the originals are used later in `run()`.
     let ep_for_buyer = infra.ep.clone();
     let eth_signer_for_buyer = Arc::clone(&infra.eth_signer);
@@ -1896,8 +1818,6 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
     let staker_set_c = Arc::clone(&ch.staker_set);
     let origin_directory_c = Arc::clone(&ch.origin_directory);
     let local_reputation_c = Arc::clone(&local_reputation);
-    let observation_buffer_c = Arc::clone(&observation_buffer);
-    let network_reputation_c = Arc::clone(&network_reputation);
     let region_accountant_c = Arc::clone(&ch.region_accountant);
     let node_metrics_for_buyer = Arc::clone(&infra.node_metrics);
     let node_metrics_for_origin = Arc::clone(&infra.node_metrics);
@@ -1977,9 +1897,6 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
                     slash_domain: node_origin_slash_domain,
                     bind_domain: node_origin_bind_domain,
                     local_rep: local_reputation_c,
-                    obs_buffer: observation_buffer_c,
-                    network_rep: network_reputation_c,
-                    rep_cfg: node_origin_reputation_cfg,
                     negative_cache: crate::dht::NegativeProbeCache::new(),
                     probe_cache: crate::dht::PositiveProbeCache::new(),
                     metrics: node_metrics_for_origin,
@@ -2028,12 +1945,6 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
     let decdn_gossip::GossipHandles {
         tasks: gossip_handles,
         announce_trigger,
-        // No publisher runs while `report_drain` is `None` above: the
-        // reputation publisher task (and therefore this immediate-publish
-        // trigger) is only spawned once outbound capture wires the observation
-        // buffer to the delivery/probe hot paths (#831). Until then the node
-        // aggregates inbound reports but emits none.
-        reputation_publish_trigger: _,
     } = GossipService::spawn(
         infra.ep.clone(),
         infra.secret_key.clone(),
@@ -2043,70 +1954,9 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
         gossip_metrics,
         gossip_shutdown.clone(),
         announce_gate,
-        reputation_wiring,
     )
     .await
     .context("gossip service failed to start")?;
-
-    // Network-wide settlement indexer (ADR 008, #326): feeds `settlement_source`
-    // so reporter weights are live. Held for the process lifetime; `shutdown()`
-    // stops its chain watcher in the graceful sequence, its `WatcherHandle`'s
-    // `AbortOnDrop` the backstop. Only runs when reputation gossip is enabled. A
-    // bootstrap RPC failure is non-fatal — reputation is best-effort, so the node
-    // still starts (weights stay 0).
-    let settlement_indexer = if cfg.gossip.subscribe_reputation {
-        match crate::reputation_indexer::SettlementIndexer::bootstrap(
-            ProviderFactory::read_only(ch.reputation_rpc_url.clone(), ch.event_poll_interval),
-            ch.payment_channel_addr,
-            ch.capacity_bond_addr,
-            Arc::clone(&settlement_source),
-            ch.event_poll_interval,
-            Arc::clone(&ch.head),
-            Arc::clone(&infra.node_metrics),
-        )
-        .await
-        {
-            Ok(indexer) => Some(indexer),
-            Err(err) => {
-                tracing::warn!(
-                    err = %sanitize_rpc_display(&err),
-                    "settlement indexer bootstrap failed; reputation reporter weights will stay 0"
-                );
-                None
-            }
-        }
-    } else {
-        None
-    };
-
-    // Periodic reputation-map eviction sweep (ADR 008 §Decay; #326 review I3):
-    // bound the in-memory network-score and regional-coverage maps by dropping
-    // entries that have decayed to neutral and been idle past the horizon. A
-    // cheap retain pass at a slow cadence; only runs with reputation enabled,
-    // and exits cleanly on the gossip shutdown token.
-    if cfg.gossip.subscribe_reputation {
-        let net = Arc::clone(&network_reputation);
-        let cov = Arc::clone(&regional_coverage);
-        let sweep_shutdown = gossip_shutdown.clone();
-        tasks.spawn(async move {
-            // 6h: entries are only eligible once idle > 26 weeks, so the sweep
-            // cadence is non-critical; this keeps the retain cost negligible.
-            let mut ticker = tokio::time::interval(std::time::Duration::from_hours(6));
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            loop {
-                tokio::select! {
-                    biased;
-                    () = sweep_shutdown.cancelled() => return,
-                    _ = ticker.tick() => {}
-                }
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_or(0, |d| d.as_secs());
-                net.evict(now);
-                cov.evict(now);
-            }
-        });
-    }
 
     // Drain trigger for `admin_v1_drain` (issue #244). Constructed
     // unconditionally so the admin handler always has a live target —
@@ -2162,12 +2012,6 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
             redeem_threshold_micro_usdc: cfg.blockchain.redeem_threshold_micro_usdc,
         })
         .with_region_accountant(Arc::clone(&ch.region_accountant))
-        // Reputation introspection for `admin_v1_reputation` (#326). Shares the
-        // same aggregation state the gossip reputation sink updates.
-        .with_reputation(admin::ReputationStatusHandles {
-            network: Arc::clone(&network_reputation),
-            coverage: Arc::clone(&regional_coverage),
-        })
         // Slash-detection introspection for `admin_v1_slashes` (#1032). Shares
         // the in-memory store the watcher appends to — read-only here.
         .with_slash_detection(admin::SlashStatusHandles {
@@ -2218,7 +2062,6 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
         rpc_watchdog,
         gossip_shutdown,
         gossip_handles,
-        settlement_indexer,
         admin_stop_tx,
         drain_trigger,
         tasks,
@@ -2304,7 +2147,6 @@ pub async fn run(
         gossip_shutdown: bg.gossip_shutdown,
         capacity_bond_watcher: ch.capacity_bond_watcher,
         slash_watcher: ch.slash_watcher,
-        settlement_indexer: bg.settlement_indexer,
         pull_through_bg_shutdown: ch.pull_through_bg_shutdown,
         receipt_writer_shutdown: infra.receipt_writer_shutdown,
         payment_service: ch.payment_service,
@@ -2341,7 +2183,6 @@ struct ShutdownHandles<P: Provider + Clone + 'static> {
     gossip_shutdown: CancellationToken,
     capacity_bond_watcher: Arc<crate::chain_events::resumable_watcher::WatcherHandle>,
     slash_watcher: crate::slash_watcher::SlashWatcher,
-    settlement_indexer: Option<crate::reputation_indexer::SettlementIndexer>,
     pull_through_bg_shutdown: CancellationToken,
     receipt_writer_shutdown: CancellationToken,
     payment_service: PaymentChannelService<P>,
@@ -2385,7 +2226,6 @@ async fn shutdown<P: Provider + Clone + 'static>(
         gossip_shutdown,
         capacity_bond_watcher,
         slash_watcher,
-        settlement_indexer,
         pull_through_bg_shutdown,
         receipt_writer_shutdown,
         payment_service,
@@ -2517,20 +2357,16 @@ async fn shutdown<P: Provider + Clone + 'static>(
     // admission and decides which probes the stake-lane reservation sheds.
     // Cancelling it before the drain would freeze that set while the router is
     // still serving, so a membership change landing mid-drain would be missed
-    // by exactly the requests still in flight. Slash and the reputation indexer
-    // are not consulted by the serve path and could stop earlier, but they stop
-    // here too — one cancel site for the shared `capacity-bond`-era watchers is
-    // easier to keep correct than three orderings each justified separately.
+    // by exactly the requests still in flight. Slash is not consulted by the
+    // serve path and could stop earlier, but it stops here too — one cancel site
+    // for the shared `capacity-bond`-era watchers is easier to keep correct than
+    // two orderings each justified separately.
     //
-    // None of the three persists a cursor, so unlike the origin watcher above
-    // there is no checkpoint to flush and no deadline this must beat: the cancel
-    // buys a clean exit, and each `WatcherHandle`'s `AbortOnDrop` remains the
-    // backstop.
+    // Neither persists a cursor, so unlike the origin watcher above there is no
+    // checkpoint to flush and no deadline this must beat: the cancel buys a clean
+    // exit, and each `WatcherHandle`'s `AbortOnDrop` remains the backstop.
     capacity_bond_watcher.shutdown();
     slash_watcher.shutdown();
-    if let Some(indexer) = &settlement_indexer {
-        indexer.shutdown();
-    }
     // Cancel any in-flight background cache-fill tasks (#859): the router has
     // drained, so warming the cache for future requests is moot. They observe
     // the token at their next await and exit; being advisory, they are not
@@ -3878,8 +3714,6 @@ mod tests {
                 announce_interval_sec: 60,
                 peer_ttl_sec: 600,
                 subscribe_global: false,
-                subscribe_reputation: true,
-                reputation_publish_interval_sec: 3600,
                 max_peer_entries: Some(100_000),
             },
             security: ResolvedSecurity {

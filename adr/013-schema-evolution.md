@@ -7,7 +7,7 @@
 
 All wire messages are serialized with [postcard](https://docs.rs/postcard) — a compact, no-std, serde-based binary format standard in the iroh ecosystem ([ADR 005](005-protocol.md#adr-005-wire-protocol)). Postcard is positional: fields are encoded in declaration order with no field tags, no per-field length delimiters, no schema versioning. `postcard::from_bytes` silently ignores trailing bytes; `postcard::take_from_bytes` returns the unconsumed remainder. Neither fails on trailing bytes — but on a QUIC byte stream with no message boundaries, the receiver cannot find where one message ends without explicit framing. [ADR 005](005-protocol.md#adr-005-wire-protocol) noted the limitation: "Postcard has no schema evolution story — adding fields requires a new ALPN version (`cdn/client/v2`); version negotiation must be planned before the first breaking change."
 
-The codebase already has an ad-hoc pattern: `StreamRequest` appends `ethereum_address: Option<Address>` and `binding_signature: Option<Bytes>` with `#[serde(default)]` ([ADR 005](005-protocol.md#adr-005-wire-protocol)). [ADR 005](005-protocol.md#adr-005-wire-protocol) called this a "one-time workaround" and stated "any future mandatory field addition still requires `cdn/client/v2`." It is unscalable. Gossip messages (`NodeAnnounce`, `ReputationReport`) have no ALPN negotiation — published to iroh-gossip topics whose names embed a version (`cdn/global/v1`), and changing a topic name partitions the gossip network.
+The codebase already has an ad-hoc pattern: `StreamRequest` appends `ethereum_address: Option<Address>` and `binding_signature: Option<Bytes>` with `#[serde(default)]` ([ADR 005](005-protocol.md#adr-005-wire-protocol)). [ADR 005](005-protocol.md#adr-005-wire-protocol) called this a "one-time workaround" and stated "any future mandatory field addition still requires `cdn/client/v2`." It is unscalable. Gossip messages (`NodeAnnounce`) have no ALPN negotiation — published to iroh-gossip topics whose names embed a version (`cdn/global/v1`), and changing a topic name partitions the gossip network.
 
 Several messages contain cryptographically signed fields ([ADR 005](005-protocol.md#adr-005-wire-protocol)). Signatures are a byte-level commitment: appending a field to a signed struct makes old verifiers compute the signature over fewer bytes than the signer intended, causing verification failure. Signed field sets must be explicitly frozen per protocol version.
 
@@ -136,7 +136,8 @@ struct GossipEnvelope {
 #[derive(Serialize, Deserialize)]
 enum GossipPayload {
     NodeAnnounce(NodeAnnounce),             // 0
-    ReputationReport(ReputationReport),     // 1
+    // Future variants take discriminant 1, 2, … — old peers drop unknown
+    // discriminants per the deserialization rule below.
 }
 ```
 
@@ -146,7 +147,7 @@ Peers deserialize `GossipEnvelope` using `take_from_bytes`. If `version != 1` (u
 
 #### Topic names vs. envelope version
 
-Topic names (`cdn/global/v1`, `cdn/reputation/v1`) embed a version referring to the topic's semantic contract — its purpose, membership rules, validation semantics. `GossipEnvelope.version` handles wire format evolution independently. A topic name version bump (e.g., `cdn/global/v2`) is the gossip equivalent of a major ALPN bump and requires dual-subscription during transition.
+Topic names (`cdn/global/v1`, `cdn/region/{cc}/v1`) embed a version referring to the topic's semantic contract — its purpose, membership rules, validation semantics. `GossipEnvelope.version` handles wire format evolution independently. A topic name version bump (e.g., `cdn/global/v2`) is the gossip equivalent of a major ALPN bump and requires dual-subscription during transition.
 
 ##### Rule for choosing between envelope evolution and topic bump
 
@@ -357,7 +358,6 @@ Signatures are computed over a specific byte sequence produced by postcard seria
 | `ProbeResponse` | `hash`, `has_blob`, `rate_per_mb`, `timestamp_us` | `total_bytes` |
 | `StreamResponse` | `hash`, `ok`, `rate_per_mb`, `total_bytes`, `channel_id`, `timestamp_us`, `redirect` | `error`, `voucher_interval_mb` |
 | `NodeAnnounce` | `node_id`, `region`, `timestamp_us` | *(none currently — see implementation note)* |
-| `ReputationReport` | `provider`, `reporter`, `metrics`, `timestamp` | *(none currently)* |
 
 #### Implementation note — separating signed and unsigned fields
 
@@ -386,7 +386,7 @@ struct NodeAnnounceExt {
 }
 ```
 
-This separates the frozen signed region from the evolvable unsigned region via two-phase deserialization (see [Tier 1](#tier-1--minor-no-coordination)). The same pattern applies to `ProbeResponse`, `StreamResponse`, and `ReputationReport`.
+This separates the frozen signed region from the evolvable unsigned region via two-phase deserialization (see [Tier 1](#tier-1--minor-no-coordination)). The same pattern applies to `ProbeResponse` and `StreamResponse`.
 
 #### Cross-ADR struct alignment
 

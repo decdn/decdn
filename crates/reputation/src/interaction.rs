@@ -1,9 +1,8 @@
 //! Shared interaction-score arithmetic (ADR 008 §Local Score Calculation).
 //!
-//! Both the local scorer ([`crate::local`]) and the network-report aggregator
-//! ([`crate::network`], [`crate::coverage`]) score a single interaction as
+//! The local scorer ([`crate::local`]) scores a single interaction as
 //! `0.4 * speed + 0.4 * correctness + 0.2 * reachability`. This module is the
-//! one place that arithmetic lives so the two paths cannot drift.
+//! one place that arithmetic lives.
 
 use std::time::Duration;
 
@@ -54,30 +53,6 @@ pub(crate) fn interaction_score(
     w.speed * speed + w.correctness * correctness + w.reachability * reachability
 }
 
-/// Map gossip [`decdn_protocol::ReportMetrics`] to an interaction score using
-/// the same formula as the local path (ADR 008 §Update rule step 3).
-///
-/// A missing `delivery_speed` scores speed `0`; a missing or `false`
-/// `data_correct` / `uptime_observed` scores its component `0`.
-pub(crate) fn interaction_score_from_metrics(
-    w: InteractionWeights,
-    expected_bps: u64,
-    delivery_speed: Option<u32>,
-    uptime_observed: Option<bool>,
-    data_correct: Option<bool>,
-) -> f64 {
-    let speed = delivery_speed.map_or(0.0, |bps| {
-        speed_score_from_bps(f64::from(bps), expected_bps)
-    });
-    let correctness = if data_correct == Some(true) { 1.0 } else { 0.0 };
-    let reachability = if uptime_observed == Some(true) {
-        1.0
-    } else {
-        0.0
-    };
-    interaction_score(w, speed, correctness, reachability)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -87,12 +62,6 @@ mod tests {
     }
 
     const BPS: u64 = 10 * 1024 * 1024;
-    const BPS_U32: u32 = 10 * 1024 * 1024;
-    const W: InteractionWeights = InteractionWeights {
-        speed: 0.4,
-        correctness: 0.4,
-        reachability: 0.2,
-    };
 
     #[test]
     fn speed_from_transfer_matches_expected() {
@@ -106,31 +75,5 @@ mod tests {
             0.0
         ));
         assert!(approx(speed_score_from_transfer(1, one, 0), 0.0));
-    }
-
-    #[test]
-    fn metrics_full_delivery_scores_one() {
-        let s = interaction_score_from_metrics(W, BPS, Some(BPS_U32), Some(true), Some(true));
-        assert!(approx(s, 1.0), "got {s}");
-    }
-
-    #[test]
-    fn metrics_unreachable_scores_zero() {
-        let s = interaction_score_from_metrics(W, BPS, None, Some(false), None);
-        assert!(approx(s, 0.0), "got {s}");
-    }
-
-    #[test]
-    fn metrics_reachable_but_corrupt_scores_reachability_only() {
-        // up=true, data_correct=false, no speed → 0.2.
-        let s = interaction_score_from_metrics(W, BPS, None, Some(true), Some(false));
-        assert!(approx(s, 0.2), "got {s}");
-    }
-
-    #[test]
-    fn metrics_missing_speed_scores_correctness_and_reachability() {
-        // up=true, correct=true, speed absent → 0.4 + 0.2 = 0.6.
-        let s = interaction_score_from_metrics(W, BPS, None, Some(true), Some(true));
-        assert!(approx(s, 0.6), "got {s}");
     }
 }
