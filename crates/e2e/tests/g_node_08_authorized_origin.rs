@@ -242,8 +242,15 @@ async fn run() -> anyhow::Result<()> {
     );
 
     // ------------------------------------------------------------ wire opacity
-    assert_backend_never_on_the_wire(&client, &node, &authorized, tapped_hash, &tapped_payload)
-        .await?;
+    assert_backend_never_on_the_wire(
+        &client,
+        &node,
+        &authorized,
+        tapped_hash,
+        namespace,
+        &tapped_payload,
+    )
+    .await?;
 
     Ok(())
 }
@@ -271,13 +278,16 @@ async fn assert_backend_never_on_the_wire(
     node: &NodeFixture,
     session: &ChannelSession,
     hash: Hash,
+    namespace: U256,
     payload: &[u8],
 ) -> anyhow::Result<()> {
     assert!(
         !client.probe(node, hash).await?.body.has_blob,
         "the tapped blob must start absent, so the tap covers a real backend fill"
     );
-    let frames = client.capture_delivery_wire(session, hash).await?;
+    let frames = client
+        .capture_delivery_wire(session, hash, namespace)
+        .await?;
 
     // The tap captured a real delivery, not a refusal: an `ok` response promising
     // the blob's true size, followed by every chunk of it.

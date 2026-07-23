@@ -369,6 +369,7 @@ impl ClientFixture {
         &self,
         session: &ChannelSession,
         hash: Hash,
+        namespace_id: alloy::primitives::U256,
     ) -> anyhow::Result<Vec<Vec<u8>>> {
         let conn = self
             .endpoint
@@ -381,9 +382,12 @@ impl ClientFixture {
             .map_err(|e| anyhow::anyhow!("open_bi for wire tap: {e}"))?;
         let req = StreamRequest {
             hash: *hash.as_bytes(),
-            // Wire-tap of the backend-fill path; no namespace routing needed
-            // (the node serves from its own origin backend by hash).
-            namespace_id: decdn_protocol::client::NO_NAMESPACE,
+            // The backend-fill gate keys on the request namespace, so the tap must
+            // carry the ratified namespace the blob is published under — otherwise
+            // the authorized-origin gate refuses and the tap captures a refusal
+            // instead of a delivery. The origin backend itself remains hash-keyed
+            // and opaque (it never sees the namespace).
+            namespace_id: namespace_id.to_be_bytes(),
             channel_id: session.ctx.channel_id.into(),
             byte_offset: 0,
             byte_len: 0,
