@@ -98,8 +98,11 @@
 //! `nodeIdOf` read, so they are best-effort and retried through
 //! `WatcherState::pending_origin_peer_ops` on failure. The peer-table removal is
 //! *advisory* on its own (`insert_or_refresh` re-admits on the next announce);
-//! the deny-set is what durably keeps a blacklisted origin out of the announce
-//! gate — see `WatcherState::apply_origin_peer`.
+//! the deny-set is what reliably keeps a blacklisted origin out of the announce
+//! gate for the lifetime of the blacklist. The deny-set is in-memory, not
+//! persisted — it is reconstructed on boot by seeding
+//! `pending_origin_peer_ops` from the durable origin projection. See
+//! `WatcherState::apply_origin_peer`.
 //!
 //! **Resilience.** The re-scope pass runs on the operator's rescan cadence
 //! (checked at the end of every poll tick), pulled forward to the poll cadence
@@ -364,17 +367,38 @@ impl<P: Provider + Clone> WatcherState<P> {
         // a retry pass.
         self.pending_origin_peer_ops.remove(&origin);
         if node_id == B256::ZERO {
+            // No registered node to bar. Known bounded limitation (pre-existing,
+            // shared with the old `drop_origin_peer`): an address blacklisted
+            // BEFORE it registers resolves to ZERO here and is dropped from the
+            // retry queue, and no later `OriginBlacklistUpdated` fires to re-trigger
+            // — so if it registers and announces afterward it is announce-selectable
+            // until the next restart re-seeds the rebuild. It cannot transact,
+            // though: the serving/pull gate refuses it by ADDRESS
+            // (`ContentDenylist::is_origin_denied`) independent of NodeId. Closing
+            // it would need an `addOperator`-time cross-check against the origin
+            // deny-set (a gossip-crate feature), out of scope here.
             return Recheck::NoAction;
         }
-        if blacklisted {
-            self.announce_deny.insert(node_id.0);
-            if self.peer_table.write().await.remove(&node_id.0) {
-                info!(%origin, %node_id, "blacklist watcher: dropped blacklisted origin from the peer table and barred its re-announce");
-            }
-        } else {
-            self.announce_deny.remove(&node_id.0);
-        }
+        self.apply_resolved_origin(origin, node_id, blacklisted)
+            .await;
         Recheck::NoAction
+    }
+
+    /// Apply a RESOLVED (non-`ZERO`) origin blacklist change to the peer table and
+    /// the shared announce-gate deny-set: bar on a blacklisting, un-bar on a clear.
+    /// `&self` — it touches only the shared `Arc` handles, not the pending map.
+    async fn apply_resolved_origin(&self, origin: Address, node_id: B256, blacklisted: bool) {
+        // The `insert`/`remove` "changed" return gates the log so a no-op replay
+        // (the watcher re-reads block ranges after a restart) stays quiet.
+        if blacklisted {
+            let newly_barred = self.announce_deny.insert(node_id.0);
+            let dropped = self.peer_table.write().await.remove(&node_id.0);
+            if newly_barred || dropped {
+                info!(%origin, %node_id, newly_barred, dropped, "blacklist watcher: barred a blacklisted origin from the announce gate / peer table");
+            }
+        } else if self.announce_deny.remove(&node_id.0) {
+            info!(%origin, %node_id, "blacklist watcher: un-barred a de-listed origin from the announce gate");
+        }
     }
 
     /// Distinct hashes across all regions — the scope view
@@ -1818,6 +1842,28 @@ mod tests {
 
     // ----- origin blacklist → announce-gate deny-set (#1398) -----
 
+    /// A `WatcherState` over a mocked `capacity_bond` whose `nodeIdOf` calls
+    /// answer from `asserter`, sharing `deny` so the announce-gate feed can be
+    /// asserted. Origin-path only — `store`/`denylist`/`known` are the empty
+    /// defaults these tests do not drive.
+    fn origin_watcher_state(
+        asserter: alloy::providers::mock::Asserter,
+        deny: Arc<AnnounceOriginDenySet>,
+    ) -> WatcherState<alloy::providers::DynProvider> {
+        let provider = alloy::providers::ProviderBuilder::new()
+            .connect_mocked_client(asserter)
+            .erased();
+        WatcherState {
+            known: HashSet::new(),
+            store: Arc::new(MemEntryStore::default()),
+            denylist: Arc::new(ContentDenylist::empty()),
+            capacity_bond: CapacityBond::new(Address::repeat_byte(0x33), provider),
+            peer_table: Arc::new(RwLock::new(PeerTable::new(0, 0))),
+            announce_deny: deny,
+            pending_origin_peer_ops: HashMap::new(),
+        }
+    }
+
     /// A blacklisting bars the operator's `NodeId` from the announce gate, and a
     /// clear un-bars it — closing the re-entry gap the advisory peer-table drop
     /// leaves, since `setOriginBlacklist` does not eject.
@@ -1829,18 +1875,7 @@ mod tests {
         // Two `nodeIdOf` calls: the blacklisting, then the clear.
         asserter.push_success(&abi_node_id(node_id, true));
         asserter.push_success(&abi_node_id(node_id, true));
-        let provider = alloy::providers::ProviderBuilder::new()
-            .connect_mocked_client(asserter)
-            .erased();
-        let mut state = WatcherState {
-            known: HashSet::new(),
-            store: Arc::new(MemEntryStore::default()),
-            denylist: Arc::new(ContentDenylist::empty()),
-            capacity_bond: CapacityBond::new(Address::repeat_byte(0x33), provider),
-            peer_table: Arc::new(RwLock::new(PeerTable::new(0, 0))),
-            announce_deny: Arc::clone(&deny),
-            pending_origin_peer_ops: HashMap::new(),
-        };
+        let mut state = origin_watcher_state(asserter, Arc::clone(&deny));
         let op = Address::repeat_byte(0xAB);
 
         assert_eq!(state.apply_origin_peer(op, true).await, Recheck::NoAction);
@@ -1868,18 +1903,7 @@ mod tests {
         // First `nodeIdOf` errors; the retry succeeds.
         asserter.push_failure_msg("rpc down");
         asserter.push_success(&abi_node_id(node_id, true));
-        let provider = alloy::providers::ProviderBuilder::new()
-            .connect_mocked_client(asserter)
-            .erased();
-        let mut state = WatcherState {
-            known: HashSet::new(),
-            store: Arc::new(MemEntryStore::default()),
-            denylist: Arc::new(ContentDenylist::empty()),
-            capacity_bond: CapacityBond::new(Address::repeat_byte(0x33), provider),
-            peer_table: Arc::new(RwLock::new(PeerTable::new(0, 0))),
-            announce_deny: Arc::clone(&deny),
-            pending_origin_peer_ops: HashMap::new(),
-        };
+        let mut state = origin_watcher_state(asserter, Arc::clone(&deny));
         let op = Address::repeat_byte(0xCD);
 
         assert_eq!(state.apply_origin_peer(op, true).await, Recheck::Failed);
@@ -1897,6 +1921,116 @@ mod tests {
         assert_eq!(state.apply_origin_peer(op, true).await, Recheck::NoAction);
         assert!(deny.contains(&node_id));
         assert!(state.pending_origin_peer_ops.is_empty());
+        Ok(())
+    }
+
+    /// The clear direction is symmetric: a `nodeIdOf` blip on an un-blacklist is
+    /// also queued and retried, so a de-listed operator is not left barred from
+    /// announcing forever (the hazard the retry queue's clear leg exists for).
+    #[tokio::test]
+    async fn failed_nodeidof_on_clear_queues_a_retry_that_later_unbars() -> Result<()> {
+        let node_id = [0x3Cu8; 32];
+        let deny = Arc::new(AnnounceOriginDenySet::new());
+        let asserter = alloy::providers::mock::Asserter::new();
+        asserter.push_success(&abi_node_id(node_id, true)); // bar
+        asserter.push_failure_msg("rpc down"); // clear attempt fails
+        asserter.push_success(&abi_node_id(node_id, true)); // clear retry succeeds
+        let mut state = origin_watcher_state(asserter, Arc::clone(&deny));
+        let op = Address::repeat_byte(0x4D);
+
+        assert_eq!(state.apply_origin_peer(op, true).await, Recheck::NoAction);
+        assert!(deny.contains(&node_id), "barred first");
+
+        assert_eq!(state.apply_origin_peer(op, false).await, Recheck::Failed);
+        assert_eq!(
+            state.pending_origin_peer_ops.get(&op),
+            Some(&false),
+            "a failed clear is queued as the clear direction"
+        );
+        assert!(
+            deny.contains(&node_id),
+            "still barred until the clear lands"
+        );
+
+        assert_eq!(state.apply_origin_peer(op, false).await, Recheck::NoAction);
+        assert!(!deny.contains(&node_id), "the clear retry un-bars");
+        assert!(state.pending_origin_peer_ops.is_empty());
+        Ok(())
+    }
+
+    /// An address with no registered node (`nodeIdOf → ZERO`) is a SETTLED no-op:
+    /// it drains the pending entry (not a retry-forever) and bars nothing. This is
+    /// the ZERO branch the origin-blacklist e2e silently exercises (its funder has
+    /// no node).
+    #[tokio::test]
+    async fn zero_node_id_is_a_settled_no_op_that_clears_pending() -> Result<()> {
+        let deny = Arc::new(AnnounceOriginDenySet::new());
+        let asserter = alloy::providers::mock::Asserter::new();
+        asserter.push_failure_msg("rpc down"); // first attempt fails → queued
+        asserter.push_success(&abi_node_id([0u8; 32], false)); // retry resolves to ZERO
+        let mut state = origin_watcher_state(asserter, Arc::clone(&deny));
+        let op = Address::repeat_byte(0x5E);
+
+        assert_eq!(state.apply_origin_peer(op, true).await, Recheck::Failed);
+        assert_eq!(state.pending_origin_peer_ops.get(&op), Some(&true));
+
+        assert_eq!(state.apply_origin_peer(op, true).await, Recheck::NoAction);
+        assert!(
+            state.pending_origin_peer_ops.is_empty(),
+            "a ZERO resolution drains the pending entry (settled, not retried forever)"
+        );
+        assert!(deny.is_empty(), "a ZERO nodeId bars nothing");
+        Ok(())
+    }
+
+    /// The actual retry DRIVER — `on_tick_complete` → `drain_pending_origin_peer_ops`
+    /// — reconstructs the announce deny-set from the pending map, which is exactly
+    /// the boot-rebuild path (`spawn` seeds `pending_origin_peer_ops` from the
+    /// restored durable origin projection so the first tick re-derives the `NodeId`
+    /// deny-set). Seeding the pending map directly here stands in for that seed and
+    /// covers the drain end to end (the other origin tests call `apply_origin_peer`
+    /// directly, bypassing the tick).
+    #[tokio::test]
+    async fn on_tick_complete_drains_pending_ops_into_the_deny_set() -> Result<()> {
+        let node_id = [0x5Au8; 32];
+        let deny = Arc::new(AnnounceOriginDenySet::new());
+        let asserter = alloy::providers::mock::Asserter::new();
+        asserter.push_success(&abi_node_id(node_id, true)); // answered on the drain
+        let mut state = origin_watcher_state(asserter, Arc::clone(&deny));
+        // Seed a pending op exactly as `spawn`'s boot rebuild does for a restored
+        // origin, then let the tick drain resolve it.
+        state
+            .pending_origin_peer_ops
+            .insert(Address::repeat_byte(0x7C), true);
+
+        let tmp = tempfile::tempdir()?;
+        let cache = CacheEngine::open(tmp.path(), Vec::new(), 1).await?;
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let initial_sync = InitialSyncGate::new(tx);
+        initial_sync.signal(Ok(()));
+        let mut sink = BlacklistSink {
+            // No hashes in `known`, so the re-scope leg makes no contract call —
+            // the only RPC this tick issues is the drain's `nodeIdOf`.
+            contract: ContentBlacklist::new(Address::repeat_byte(0x11), mock_provider()),
+            operator: Address::repeat_byte(0x22),
+            cache,
+            state,
+            shutdown: CancellationToken::new(),
+            rescan_interval: Duration::from_secs(1),
+            last_rescan: None,
+            initial_sync,
+            metrics: Arc::new(Metrics::new()),
+        };
+
+        sink.on_tick_complete().await?;
+        assert!(
+            deny.contains(&node_id),
+            "the tick drain must reconstruct the announce deny-set from pending ops"
+        );
+        assert!(
+            sink.state.pending_origin_peer_ops.is_empty(),
+            "a resolved op must drain from the pending map"
+        );
         Ok(())
     }
 

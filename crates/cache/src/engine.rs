@@ -2092,6 +2092,17 @@ impl CacheEngine {
     /// node with no probe traffic still releases stale holds.
     pub fn eviction_candidates(&self) -> EvictionCandidates {
         let pinned = self.inner.pinned.load();
+        // Hoisted once, like `pinned`: a deny-listed hash stays an eviction
+        // candidate even when pinned, so "deny wins over pin" holds on the space
+        // path too, not only the takedown `evict()` actuator — otherwise a pinned
+        // + governance-denied hash would sit on disk (unservable, since `refuses`
+        // blocks it) until the watcher's `evict()` happened to run. These are the
+        // lock-free deny halves of `refuses`; `is_evicted` is deliberately NOT
+        // consulted — it would take a second mutex under the `access_times` guard
+        // below for nothing, since `evict` removes the `access_times` entry, so an
+        // already-evicted hash is never in this map to begin with.
+        let denied = self.inner.denied.load();
+        let chain_denied = self.inner.chain_denied.load();
         let now = Instant::now();
         let held: HashSet<Hash> = {
             let mut g = self
@@ -2108,17 +2119,13 @@ impl CacheEngine {
         let map = guard
             .iter()
             .filter_map(|(h, t)| {
-                // A deny-listed hash stays an eviction candidate even when pinned:
-                // "deny wins over pin" must hold on the space path too, not only
-                // the takedown `evict()` actuator. The pin otherwise shields it
-                // from space reclaim, so a pinned + governance-denied hash would
-                // sit on disk (unservable, since `refuses` blocks it) until the
-                // watcher's takedown `evict()` happened to run. Use the lock-free
-                // deny checks rather than `refuses`: `is_evicted` locks a distinct
-                // mutex and calling it under this `access_times` guard would invert
-                // `evict`'s lock order — and an already-evicted hash has no
-                // `access_times` entry to be a candidate anyway.
-                let deny_listed = self.is_denied(*h) || self.is_chain_denied(*h);
+                // `held` short-circuits BEFORE the deny carve-out, so a probe-held
+                // hash stays excluded even when denied: a probe-hold is transient
+                // (seconds, self-expiring) and the takedown `evict()` is the
+                // reclaim actuator for a denied hash regardless, so the space path
+                // need not race the hold. The carve-out targets the *pin* (the
+                // hold-forever case), which is the actual "worst combination".
+                let deny_listed = denied.contains(h) || chain_denied.contains(h);
                 if held.contains(h) || (pinned.contains(h) && !deny_listed) {
                     None
                 } else {
@@ -4669,6 +4676,31 @@ mod tests {
         anyhow::ensure!(
             engine.is_pinned(denied_hash) && engine.is_pinned(clean_hash),
             "the pin flag itself is unchanged — only the eviction carve-out differs"
+        );
+        Ok(())
+    }
+
+    /// The carve-out fires for the LOCAL (`content.denied_hashes` → `set_denied`)
+    /// deny half too, not only the on-chain half — the `is_denied` side of the
+    /// `is_denied || is_chain_denied` disjunction in `eviction_candidates`.
+    #[tokio::test]
+    async fn local_denied_pinned_hash_is_also_an_eviction_candidate() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let hash = Hash::new(b"pinned + locally denied");
+        let engine = CacheEngine::open_with_pinned(
+            tmp.path(),
+            Vec::new(),
+            10,
+            PinnedHashes::new([from_store_hash(hash)].into_iter().collect()),
+        )
+        .await?;
+        if let Ok(mut g) = engine.inner.access_times.lock() {
+            g.insert(hash, Instant::now());
+        }
+        engine.set_denied(&denied(&[hash]));
+        anyhow::ensure!(
+            engine.eviction_candidates().contains_key(&hash),
+            "a pinned + locally-denied hash must also be an eviction candidate"
         );
         Ok(())
     }

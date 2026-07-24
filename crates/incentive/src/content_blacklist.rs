@@ -159,9 +159,12 @@ mod sol_types {
             /// There is no boot reconcile: the set is not enumerable on-chain
             /// (nothing lists the blacklisted origins), so the durable projection
             /// the watcher builds from this event tail — resumed from a persisted
-            /// cursor — is the whole guarantee. A per-address `isOriginBlacklisted`
-            /// view once existed for a boot reconcile that is impossible to drive,
-            /// and was removed as dead surface.
+            /// cursor — is the whole guarantee. This crate's `sol!` binding to the
+            /// on-chain `isOriginBlacklisted(address)` view was dropped as dead
+            /// node-side surface — it was added for a per-address boot reconcile
+            /// that is impossible to drive (nothing enumerates the set). The
+            /// on-chain view itself remains and is still load-bearing elsewhere
+            /// (`OriginAssignment` unions against it; the e2e fixture binds it).
             event OriginBlacklistUpdated(address indexed origin, bool blacklisted);
 
             /// Governance blacklisted an OPERATOR address (`addOperator`), which

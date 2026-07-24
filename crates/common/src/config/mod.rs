@@ -403,12 +403,16 @@ fn ensure_region_when_publishing_global_into(
     );
 }
 
-/// Reject a hash that is simultaneously **pinned** (`cache.pinned_hashes`, held
-/// forever and excluded from LRU eviction) and **denied**
-/// (`content.denied_hashes`, which the serve gate refuses) — arguably the worst
-/// combination on a takedown: the pin keeps the bytes on disk indefinitely while
-/// the deny-set makes them unservable, so the operator pays storage for content
-/// they cannot serve. An operator almost certainly meant one or the other.
+/// Reject a hash that is simultaneously **pinned** (`cache.pinned_hashes`) and
+/// **denied** (`content.denied_hashes`, which the serve gate refuses) —
+/// contradictory operator intent. A plain pinned hash is held forever and
+/// excluded from LRU eviction; a denied one is unservable, so pinning it means
+/// paying storage for content the node will never serve. (At runtime the cache's
+/// "deny wins over pin" carve-out — see [`decdn_config_types::DeniedHashes`] and
+/// `CacheEngine::eviction_candidates` — makes a denied + pinned hash reclaimable
+/// under space pressure, so the bytes are not *strictly* held forever; that is a
+/// safety net, not a reason to configure the combination.) An operator almost
+/// certainly meant one or the other.
 ///
 /// Cross-section because the two lists live in different config sections, so it
 /// belongs at the resolver boundary alongside the port-layout check rather than
@@ -442,9 +446,10 @@ fn ensure_no_hash_pinned_and_denied_into(
     bag.check_with(both.is_empty(), "content.denied_hashes", || {
         format!(
             "hash(es) appear in both cache.pinned_hashes and \
-             content.denied_hashes: {}. A pinned hash is held forever (excluded \
-             from eviction) while a denied hash is refused by the serve gate — \
-             remove each from one of the two lists",
+             content.denied_hashes: {}. Pinning a denied hash is contradictory — \
+             a denied hash is refused by the serve gate, so pinning it only pays \
+             storage for content the node will never serve. Remove each from one \
+             of the two lists",
             both.join(", ")
         )
     });
@@ -9679,6 +9684,44 @@ capacity_bond_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
         assert!(
             msg.contains("network.bind_port") && msg.contains("metrics_port"),
             "error should name both colliding ports: {msg}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_config_errors_when_a_hash_is_pinned_and_denied() -> anyhow::Result<()> {
+        // Drive the pinned∩denied cross-section check through resolve_config
+        // end-to-end — the helper-level tests above call the `#[cfg(test)]` shim,
+        // so this is what guards the `ensure_no_hash_pinned_and_denied_into` wiring
+        // line (deleting it would leave those shim tests green).
+        let shared = "cd".repeat(32);
+        let body = format!(
+            r#"
+[identity]
+region = "US"
+
+[blockchain]
+rpc_url = "https://example/rpc"
+payment_channel_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+capacity_bond_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+
+[cache]
+pinned_hashes = ["{shared}"]
+
+[content]
+denied_hashes = ["{shared}"]
+"#
+        );
+        let dir = data_dir_with_keystore()?;
+        let path = write_minimal_toml(&dir, &body)?;
+        let args = run_args_with_data_dir(dir.path());
+        let Err(err) = resolve_config(Some(&path), &args) else {
+            anyhow::bail!("expected resolve_config to reject a pinned+denied hash");
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(&shared) && msg.contains("content.denied_hashes"),
+            "error should name the colliding hash and field: {msg}"
         );
         Ok(())
     }
