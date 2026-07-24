@@ -161,8 +161,6 @@ Total tokens consumed: `k`, matching what the per-hash equivalent would have cha
 
 **Interaction with the per-publisher quota.** STORE admission additionally consumes one slot from the publisher's record quota ([§ Content Records and TTL](#content-records-and-ttl)); the rate limit fires first, so a rate-limited STORE never consumes a quota slot. FIND_VALUE responses that route the requester onward (via `closer_nodes`) do not multiply rate-limit consumption on the responder — one inbound request, one bucket token, regardless of response size.
 
-**Trusted-IP exemption.** Operators MAY configure a list of trusted source IPs that bypass the per-IP layer only — typical use is peer operators with predictable cross-peer DHT traffic, or in-cluster monitoring. The trusted-IP list does NOT bypass the per-peer or global layers. Configuration key: `dht.rate_limit.trusted_ips`. The mechanism mirrors the probe-side equivalent in [ADR 005 § Probe rate limiting](005-protocol.md#probe-rate-limiting).
-
 **Observability.** `decdn_dht_rate_limit_rejections_total{layer={per_peer, per_ip, global}}` counter, same shape as the probe-side metric.
 
 #### FIND_VALUE Flow (Cache Miss → DHT Lookup)

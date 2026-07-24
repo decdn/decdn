@@ -1141,12 +1141,12 @@ fn warn_restart_required_sections(file: &decdn_common::config::FileConfig) {
         );
     }
     if file.dht.is_some() {
-        // `dht.*` (rate-limit caps, trusted IPs) is not currently
-        // hot-reloadable — the limiter is constructed once at startup.
+        // `dht.*` (rate-limit caps) is not currently hot-reloadable — the
+        // limiter is constructed once at startup.
         // Reloadability would follow the dispatch-limiter pattern
         // (`security.*`) once the limiter grows an ArcSwap on its inner
         // state.
-        warn_ignored("dht.* (rate-limit, trusted_ips)");
+        warn_ignored("dht.* (rate-limit)");
     }
     if file.probe.is_some() {
         // `probe.rate_limit` is read once at startup; changing it requires

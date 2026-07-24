@@ -544,7 +544,6 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # per_ip_burst = 200                        # per-IP burst capacity
 # global_rate_per_sec = 1000.0              # global inbound DHT sustained rate; 0.0 disables
 # global_burst = 2000                       # global inbound DHT burst capacity
-# trusted_ips = []                          # IPs that bypass the per-IP layer only (ADR 022 §Trusted-IP exemption)
 # max_tracked_per_ip = 4096                 # cap on the per-IP keyed-limiter map (#645); 0 = unbounded
 # max_tracked_per_peer = 4096               # cap on the per-peer keyed-limiter map (#645); 0 = unbounded
 
@@ -555,7 +554,6 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # per_ip_burst = 200                        # per-IP burst capacity
 # global_rate_per_sec = 1000.0              # global inbound probe sustained rate; 0.0 disables
 # global_burst = 2000                       # global inbound probe burst capacity
-# trusted_ips = []                          # IPs that bypass the per-IP layer only (ADR 005 §Trusted-IP exemption)
 # max_tracked_per_ip = 4096                 # cap on the per-IP keyed-limiter map (#645); 0 = unbounded
 # max_tracked_per_peer = 4096               # cap on the per-peer keyed-limiter map (#645); 0 = unbounded
 

@@ -486,8 +486,7 @@ pub struct ResolvedObservability {
 /// Resolved `cdn/dht/v1` settings (ADR 022).
 ///
 /// Each `*_rate_per_sec == 0.0` and matching `*_burst == 0` disables that
-/// layer. `trusted_ips` is the parsed-and-deduplicated IP set; the
-/// resolver rejects malformed entries.
+/// layer.
 ///
 /// `Default` returns the ADR 022 §DHT Rate Limiting defaults so test sites
 /// that build a `ResolvedConfig` by hand can write `ResolvedDht::default()`
@@ -502,7 +501,6 @@ pub struct ResolvedDht {
     pub per_ip_burst: u32,
     pub global_rate_per_sec: f64,
     pub global_burst: u32,
-    pub trusted_ips: std::collections::HashSet<std::net::IpAddr>,
     /// Hard cap on the per-IP keyed-limiter map (#645). `0` => unbounded.
     pub max_tracked_per_ip: usize,
     /// Hard cap on the per-peer (`NodeId`) keyed-limiter map (#645). `0`
@@ -519,7 +517,6 @@ impl Default for ResolvedDht {
             per_ip_burst: 200,
             global_rate_per_sec: 1000.0,
             global_burst: 2000,
-            trusted_ips: std::collections::HashSet::new(),
             max_tracked_per_ip: 4096,
             max_tracked_per_peer: 4096,
         }
@@ -541,7 +538,6 @@ pub struct ResolvedProbe {
     pub per_ip_burst: u32,
     pub global_rate_per_sec: f64,
     pub global_burst: u32,
-    pub trusted_ips: std::collections::HashSet<std::net::IpAddr>,
     /// Hard cap on the per-IP keyed-limiter map (#645). `0` => unbounded.
     pub max_tracked_per_ip: usize,
     /// Hard cap on the per-peer (`NodeId`) keyed-limiter map (#645). `0`
@@ -558,7 +554,6 @@ impl Default for ResolvedProbe {
             per_ip_burst: 200,
             global_rate_per_sec: 1000.0,
             global_burst: 2000,
-            trusted_ips: std::collections::HashSet::new(),
             max_tracked_per_ip: 4096,
             max_tracked_per_peer: 4096,
         }

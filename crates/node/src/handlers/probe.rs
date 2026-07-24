@@ -129,8 +129,8 @@ pub struct ProbeHandler {
     metrics: Arc<Metrics>,
     limiter: Arc<ConnectionLimiter>,
     /// ADR 005 §Probe rate limiting three-layer token-bucket limiter
-    /// (global → per-IP → per-peer, trusted-IP exempting per-IP only). Runs in
-    /// addition to `limiter` (the connection-level [`ConnectionLimiter`]) — see
+    /// (global → per-IP → per-peer). Runs in addition to `limiter` (the
+    /// connection-level [`ConnectionLimiter`]) — see
     /// [`crate::handlers::probe_rate_limit`] for why both layers run.
     probe_rate_limiter: Arc<ProbeRateLimiter>,
     /// Cache engine — queried for blob presence and the probe-triggered

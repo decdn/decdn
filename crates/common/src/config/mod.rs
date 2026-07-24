@@ -2716,8 +2716,7 @@ pub fn resolve_security_into(
 /// fast under the bag pattern.
 #[allow(clippy::cognitive_complexity)] // linear "default-or-file → validate" rows.
 pub fn resolve_dht_into(file: Option<&types::DhtConfig>, bag: &mut ConfigErrorBag) -> ResolvedDht {
-    // ADR 022 nests the rate-limit knobs under `dht.rate_limit.*` (see
-    // §Trusted-IP exemption — "Configuration key: dht.rate_limit.trusted_ips").
+    // ADR 022 nests the rate-limit knobs under `dht.rate_limit.*`.
     // The file shape mirrors that; an absent `[dht.rate_limit]` collapses
     // to "all defaults" through the same `.and_then` chain the other
     // resolvers use.
@@ -2773,12 +2772,6 @@ pub fn resolve_dht_into(file: Option<&types::DhtConfig>, bag: &mut ConfigErrorBa
         "dht.rate_limit.global_burst must be > 0 when global_rate_per_sec > 0 (set both to 0 to disable)",
     );
 
-    let trusted_ips = parse_trusted_ips(
-        rate_limit.and_then(|r| r.trusted_ips.as_deref()),
-        "dht.rate_limit.trusted_ips",
-        bag,
-    );
-
     let max_tracked_per_ip = rate_limit
         .and_then(|r| r.max_tracked_per_ip)
         .unwrap_or(DEFAULT_DHT_MAX_TRACKED_PER_IP);
@@ -2808,7 +2801,6 @@ pub fn resolve_dht_into(file: Option<&types::DhtConfig>, bag: &mut ConfigErrorBa
         per_ip_burst,
         global_rate_per_sec,
         global_burst,
-        trusted_ips,
         max_tracked_per_ip,
         max_tracked_per_peer,
     }
@@ -2824,16 +2816,15 @@ pub fn resolve_dht(file: Option<&types::DhtConfig>) -> anyhow::Result<ResolvedDh
 /// Resolve the `[probe.rate_limit]` section into [`ResolvedProbe`], applying
 /// the ADR 005 §Probe rate limiting defaults and the same validation the DHT
 /// layer uses: each `*_rate_per_sec` finite and `>= 0` (0 disables the layer),
-/// the matching `*_burst > 0` whenever its rate is `> 0` (no deny-all), and
-/// trusted IPs parsed fail-fast. Mirrors [`resolve_dht_into`]; only the
+/// and the matching `*_burst > 0` whenever its rate is `> 0` (no deny-all).
+/// Mirrors [`resolve_dht_into`]; only the
 /// defaults and the `probe.rate_limit.*` field keys differ.
 #[allow(clippy::cognitive_complexity)] // linear "default-or-file → validate" rows.
 pub fn resolve_probe_into(
     file: Option<&types::ProbeConfig>,
     bag: &mut ConfigErrorBag,
 ) -> ResolvedProbe {
-    // ADR 005 nests the rate-limit knobs under `probe.rate_limit.*` (see
-    // §Trusted-IP exemption — "Configuration key: probe.rate_limit.trusted_ips").
+    // ADR 005 nests the rate-limit knobs under `probe.rate_limit.*`.
     let rate_limit = file.and_then(|p| p.rate_limit.as_ref());
     let per_peer_rate_per_sec = rate_limit
         .and_then(|r| r.per_peer_rate_per_sec)
@@ -2886,12 +2877,6 @@ pub fn resolve_probe_into(
         "probe.rate_limit.global_burst must be > 0 when global_rate_per_sec > 0 (set both to 0 to disable)",
     );
 
-    let trusted_ips = parse_trusted_ips(
-        rate_limit.and_then(|r| r.trusted_ips.as_deref()),
-        "probe.rate_limit.trusted_ips",
-        bag,
-    );
-
     let max_tracked_per_ip = rate_limit
         .and_then(|r| r.max_tracked_per_ip)
         .unwrap_or(DEFAULT_PROBE_MAX_TRACKED_PER_IP);
@@ -2920,7 +2905,6 @@ pub fn resolve_probe_into(
         per_ip_burst,
         global_rate_per_sec,
         global_burst,
-        trusted_ips,
         max_tracked_per_ip,
         max_tracked_per_peer,
     }
@@ -2931,34 +2915,6 @@ pub fn resolve_probe_into(
 #[cfg(test)]
 pub fn resolve_probe(file: Option<&types::ProbeConfig>) -> anyhow::Result<ResolvedProbe> {
     one_section(|bag| resolve_probe_into(file, bag))
-}
-
-/// Parse a trusted-IP list shared by the DHT and probe rate-limit resolvers.
-/// `field_key` is the config path of the offending list (e.g.
-/// `dht.rate_limit.trusted_ips` or `probe.rate_limit.trusted_ips`) so a
-/// malformed entry reports the right key under the bag pattern.
-fn parse_trusted_ips(
-    raw: Option<&[String]>,
-    field_key: &'static str,
-    bag: &mut ConfigErrorBag,
-) -> std::collections::HashSet<std::net::IpAddr> {
-    let mut out = std::collections::HashSet::new();
-    let Some(entries) = raw else {
-        return out;
-    };
-    for entry in entries {
-        match entry.parse::<std::net::IpAddr>() {
-            Ok(ip) => {
-                out.insert(ip);
-            }
-            Err(e) => {
-                bag.check_with(false, field_key, || {
-                    format!("{field_key} entry {entry:?} is not a valid IP address: {e}")
-                });
-            }
-        }
-    }
-    out
 }
 
 /// Load a [`FileConfig`] from disk.
@@ -10419,7 +10375,6 @@ bind_port = 12345
             resolved.max_tracked_per_peer,
             DEFAULT_PROBE_MAX_TRACKED_PER_PEER
         );
-        assert!(resolved.trusted_ips.is_empty());
     }
 
     #[test]
@@ -10454,13 +10409,6 @@ bind_port = 12345
         });
         let err = resolve_probe(Some(&p)).expect_err("rate>0+burst=0 must reject");
         assert!(format!("{err:#}").contains("probe.rate_limit.per_peer_burst"));
-    }
-
-    #[test]
-    fn resolve_probe_malformed_trusted_ip_reports_probe_key() {
-        let p = probe_rl_with(|r| r.trusted_ips = Some(vec!["not-an-ip".to_string()]));
-        let err = resolve_probe(Some(&p)).expect_err("malformed IP must reject");
-        assert!(format!("{err:#}").contains("probe.rate_limit.trusted_ips"));
     }
 
     #[test]

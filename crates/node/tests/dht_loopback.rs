@@ -101,7 +101,6 @@ fn permissive_dht_rate_limiter(metrics: &Arc<Metrics>) -> Arc<DhtRateLimiter> {
         per_ip_burst: u32::MAX,
         global_rate_per_sec: 1e6,
         global_burst: u32::MAX,
-        trusted_ips: std::collections::HashSet::new(),
         max_tracked_per_ip: 4096,
         max_tracked_per_peer: 4096,
     };
@@ -718,7 +717,7 @@ mod adr_013_error_codes {
         let limiter = permissive_limiter(&metrics);
         // burst=1 on global so the second request on the same connection
         // hits the cap; per-peer and per-IP loose so we test the global
-        // path. trusted_ips empty.
+        // path.
         let rate_cfg = DhtRateLimitConfig {
             per_peer_rate_per_sec: 1e6,
             per_peer_burst: u32::MAX,
@@ -726,7 +725,6 @@ mod adr_013_error_codes {
             per_ip_burst: u32::MAX,
             global_rate_per_sec: 1.0,
             global_burst: 1,
-            trusted_ips: std::collections::HashSet::new(),
             max_tracked_per_ip: 4096,
             max_tracked_per_peer: 4096,
         };
@@ -1207,7 +1205,7 @@ mod batch_store_admission {
         Ok((ack, records, metrics_handle))
     }
 
-    fn permissive_rate_cfg() -> DhtRateLimitConfig {
+    const fn permissive_rate_cfg() -> DhtRateLimitConfig {
         DhtRateLimitConfig {
             per_peer_rate_per_sec: 1e6,
             per_peer_burst: u32::MAX,
@@ -1215,7 +1213,6 @@ mod batch_store_admission {
             per_ip_burst: u32::MAX,
             global_rate_per_sec: 1e6,
             global_burst: u32::MAX,
-            trusted_ips: std::collections::HashSet::new(),
             max_tracked_per_ip: 4096,
             max_tracked_per_peer: 4096,
         }
@@ -1460,7 +1457,6 @@ mod batch_store_admission {
             per_ip_burst: u32::MAX,
             global_rate_per_sec: 1e9,
             global_burst: u32::MAX,
-            trusted_ips: std::collections::HashSet::new(),
             max_tracked_per_ip: 4096,
             max_tracked_per_peer: 4096,
         };

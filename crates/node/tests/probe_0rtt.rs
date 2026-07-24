@@ -82,7 +82,6 @@ fn permissive_probe_rate_limiter(metrics: &Arc<Metrics>) -> Arc<ProbeRateLimiter
         per_ip_burst: u32::MAX,
         global_rate_per_sec: 1e9,
         global_burst: u32::MAX,
-        trusted_ips: std::collections::HashSet::new(),
         max_tracked_per_ip: 4096,
         max_tracked_per_peer: 4096,
     };

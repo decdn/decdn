@@ -100,8 +100,6 @@ Checks fire cheapest-first (global → per-IP → per-peer) so a probe rejected 
 
 **Interaction with the hold budget.** Because the rate limiter fires before the hold-allocation path, a rate-limited probe never consumes a hold slot. The hold-budget exhaustion concern in [§ Hold budget](#hold-budget) is therefore bounded by the **admitted** probe rate, not the offered load — a probe flood exceeding the rate limits cannot exhaust the hold budget.
 
-**Trusted-IP exemption.** Operators MAY configure a list of trusted source IPs that bypass the per-IP layer only — typical use is peer operators with predictable cache-miss traffic, or in-cluster monitoring. The trusted-IP list does NOT bypass the per-peer or global layers. Configuration key: `probe.rate_limit.trusted_ips`.
-
 **Metrics.** Naming follows [appendix-observability.md](appendix-observability.md#appendix-observability-and-metrics).
 
 | Metric | Type | Description |
