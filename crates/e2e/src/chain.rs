@@ -73,8 +73,16 @@ const EPOCH_LENGTH_SECS: u64 = 7 * 24 * 60 * 60;
 // retry). A real compile error still fails fast — only a timeout is retried.
 const FORGE_BUILD_TIMEOUT: Duration = Duration::from_secs(300);
 const BUILD_ATTEMPTS: usize = 3;
-const DEPLOY_TIMEOUT: Duration = Duration::from_secs(45);
-const DEPLOY_ATTEMPTS: usize = 3;
+// The deploy script broadcasts against a live anvil while the runner is running
+// two journeys at once (`--test-threads 2` on a 4-core box), so give each attempt
+// more wall-clock headroom and one extra attempt. `run_deploy_script` reverts
+// anvil to a pre-deploy snapshot between attempts, so a widened budget buys real
+// recovery chances rather than doomed nonce-colliding retries (#785).
+const DEPLOY_TIMEOUT: Duration = Duration::from_secs(60);
+const DEPLOY_ATTEMPTS: usize = 4;
+/// Linear backoff between deploy retries (`n * attempt`), giving a transient
+/// runner-contention spike time to clear before the next forge process spawns.
+const DEPLOY_RETRY_BACKOFF: Duration = Duration::from_secs(3);
 /// Re-pick the ephemeral port and re-spawn anvil this many times when it dies at
 /// startup (the `free_port` TOCTOU: another process claimed the port first).
 const ANVIL_ATTEMPTS: usize = 3;
@@ -273,7 +281,7 @@ impl ChainFixture {
         // by the admin EOA so it can distribute bond stake to N operators.
         let usdc = deploy_mock_usdc(&admin, &contracts).await?;
         let admin_token_holder: Address = ADMIN_ADDR.parse().context("parse admin addr")?;
-        run_deploy_script(&contracts, &rpc_url, usdc, admin_token_holder).await?;
+        run_deploy_script(&admin, &contracts, &rpc_url, usdc, admin_token_holder).await?;
         let addrs = read_manifest(&manifest)?;
 
         Ok(Self {
@@ -1589,12 +1597,23 @@ async fn deploy_mock_usdc<P: Provider>(provider: &P, contracts: &Path) -> anyhow
 /// Run `forge script DeployProtocol.s.sol` against the anvil RPC, retrying the
 /// two transient failure classes (stall #785, broadcast-phase non-zero exit
 /// #883) and failing fast on a deterministic revert.
+///
+/// Between retries the chain is reverted to a snapshot taken *before* the first
+/// attempt. This is load-bearing: a stalled `--broadcast` run is SIGKILLed
+/// mid-flight, having already advanced deployer dev-#0's nonce and mined a
+/// partial deploy, so a naive re-run re-broadcasts the same nonces and dies with
+/// `-32003 replacement transaction underpriced`. The revert rolls that back to a
+/// clean nonce. It's safe because anvil auto-mines (no killed tx lingers in the
+/// mempool) and mock USDC was deployed *before* the snapshot, so it survives the
+/// revert. `admin` (anvil dev #1) sends no tx between the snapshot and the loop.
 async fn run_deploy_script(
+    admin: &DynProvider,
     contracts: &Path,
     rpc_url: &str,
     usdc: Address,
     initial_token_holder: Address,
 ) -> anyhow::Result<()> {
+    let mut snapshot = evm_snapshot(admin).await?;
     for attempt in 1..=DEPLOY_ATTEMPTS {
         let mut cmd = tokio::process::Command::new("forge");
         cmd.current_dir(contracts)
@@ -1653,8 +1672,36 @@ async fn run_deploy_script(
                 );
             }
         }
+        // Reached only on a retryable, non-final attempt (the branches above
+        // either returned, bailed, or warned). Roll the killed attempt's partial
+        // deploy back to a clean deployer nonce, then let a transient contention
+        // spike on the shared runner clear before spawning the next forge.
+        snapshot = evm_revert_and_snapshot(admin, snapshot).await?;
+        tokio::time::sleep(DEPLOY_RETRY_BACKOFF * u32::try_from(attempt).unwrap_or(u32::MAX)).await;
     }
     anyhow::bail!("DEPLOY_ATTEMPTS must be >= 1 (was {DEPLOY_ATTEMPTS})")
+}
+
+/// Take an `evm_snapshot`, returning the anvil snapshot id (a hex quantity).
+async fn evm_snapshot(provider: &DynProvider) -> anyhow::Result<String> {
+    provider
+        .raw_request("evm_snapshot".into(), ())
+        .await
+        .context("evm_snapshot")
+}
+
+/// Revert anvil to `snapshot` (dropping everything mined since it was taken) and
+/// return a fresh snapshot id, since `evm_revert` invalidates the id it consumes.
+async fn evm_revert_and_snapshot(
+    provider: &DynProvider,
+    snapshot: String,
+) -> anyhow::Result<String> {
+    let reverted: bool = provider
+        .raw_request("evm_revert".into(), (snapshot,))
+        .await
+        .context("evm_revert")?;
+    anyhow::ensure!(reverted, "evm_revert returned false (unknown snapshot id)");
+    evm_snapshot(provider).await
 }
 
 /// Read the protocol contract addresses from the deploy manifest.
