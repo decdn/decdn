@@ -128,7 +128,7 @@ A fully decentralized storage model was evaluated: nodes would commit to durable
 
 ## Encrypted Content Publishing (appendix)
 
-Source: [Appendix: Encrypted Content Publishing](../appendix-encrypted-content-publishing.md).
+Source: [Appendix: Encrypted Content Publishing](appendix-encrypted-content-publishing.md) (retired 2026-07-24 — archived alongside this file).
 
 ### Client-enforced expiry (timestamp in envelope, no epoch keys)
 

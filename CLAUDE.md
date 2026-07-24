@@ -11,7 +11,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for build commands, ADR conventions, pre-
 **ADR note:**
 
 - **Next ADR number: 040.** File naming: `NNN-topic.md` (zero-padded 3-digit prefix). Always verify by listing `adr/` for the highest number before creating a new ADR.
-- **Do not reuse numbers:** 004, 010, 027, 029, 032, 033, 034, 035 (retired or reclassified — see history below).
+- **Do not reuse numbers:** 004, 006, 010, 027, 029, 032, 033, 034, 035 (retired or reclassified — see history below).
 - **Canonical ADRs (recent):** 028, 030, 031, 036, 037, 038, 039.
 - **History:**
   - 026 (tokenomics) — **Genesis Bond Credit removal:** the on-chain Genesis Bond Credit mechanism (the `CapacityBond` grant/vest/claim/forfeit surface, `GENESIS_GRANTOR_ROLE`, `PendingCredit`, the credit leg of slashing/escrow, and `claimSlashGateEpochs`) is gone. Its 5pp earmark folds back into the operational DAO Treasury (group 2, now a flat 15% — 30% at TGE, then 48-month linear); any retroactive testnet-operator recognition is a discretionary off-chain Treasury TGE-unlock with no contract surface. Slashing and granted-appeal refunds are now bond-only. Touched ADRs 026, 016, 028, 036, 008, architecture, glossary, and observability/key-rotation appendices.
@@ -25,7 +25,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for build commands, ADR conventions, pre-
   - 028 (`028-slashing-appeals.md`): status unlocked from "Locked-for-implementation" to "Draft" pending CapacityBond rebase.
   - 027 (Distinct-Client Diversity Gating / Delivery Receipts): collapsed into ADR 026 §3 per-operator gauge-share cap (itself now retired).
   - 010 (Multi-Token Payment Support): dropped for a single immutable USDC token set at deployment; rationale archived in `adr/_history/alternatives-pre-launch.md`.
-  - 006: dropped; its encryption-agnostic content-addressing note lives in ADR 002. 020/021/023/025: demoted to appendices in a pre-launch cleanup (`appendix-observability.md`, `appendix-l2-deployment.md`, `appendix-poc-production-seams.md`, `appendix-local-admin-http.md`).
+  - 006: retired; encrypted publishing and key distribution are application concerns, so the appendix and its prose-only `cdn/keys/v1` ALPN are gone (no replacement ALPN reserved) and the application-level P-19/P-20 privacy rows are struck from ADR 017. The encryption-agnostic guarantee survives as one paragraph in ADR 002; the appendix is archived in `adr/_history/appendix-encrypted-content-publishing.md`. 020/021/023/025: demoted to appendices in a pre-launch cleanup (`appendix-observability.md`, `appendix-l2-deployment.md`, `appendix-poc-production-seams.md`, `appendix-local-admin-http.md`).
   - 004 (tokenomics): superseded by ADR 026, which was rewritten to the work-token model and again to the no-emission variant (App Incentives in place of OperatorEmissions; the interim Genesis Bond Credits mechanism was later removed — see the ADR 026 note above).
 
 ## Common Commands
