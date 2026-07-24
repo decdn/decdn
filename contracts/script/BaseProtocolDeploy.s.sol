@@ -295,10 +295,11 @@ abstract contract BaseProtocolDeploy is Script {
     ///         otherwise silent — shipping a dead slash trigger, an unroutable
     ///         payment path, or no live pauser.
     error PeerRoleNotWired(address target, bytes32 role, address grantee);
-    /// @notice Post-deploy invariant — a deployer-only address binding set in
-    ///         phase 4 (`OriginAssignment.contentBlacklist`, the slash-appeal
-    ///         challenger pool) does not point where wiring intended. Catches a
-    ///         skipped setter that would silently leave a security check unwired.
+    /// @notice Post-deploy invariant — an address binding (such as
+    ///         `CapacityBond.slashJudge` or
+    ///         `OriginAssignment.contentBlacklist`) does not match the intended
+    ///         deployment target. Catches a setter or constructor binding error
+    ///         that would silently leave a security check unwired.
     error BindingNotWired(address target, address expected, address actual);
 
     /// @notice Genesis buyback activation was requested without a keeper — the
