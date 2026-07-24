@@ -22,7 +22,7 @@ A client fetching a blob it expects to be large enough to benefit MAY run a **mu
 
 ### Source set and selection
 
-The candidate set is the full holders that `cdn/dht/v1` FIND_VALUE returns for the hash ([ADR 022 § FIND_VALUE Flow](022-content-discovery.md#find_value-flow-cache-miss--dht-lookup)). The client filters this set to reputation ≥ its minimum-reputation floor ([ADR 001 § Minimum-reputation rejection floor](001-network.md#minimum-reputation-rejection-floor)) and probes each for live availability, RTT, and `rate_per_mb` ([ADR 005 § `cdn/probe/v1`](005-protocol.md#cdnprobev1--latency-probe)). The client admits up to `max_sources`, preferring lower RTT and lower rate. Where candidate metadata allows, it spreads the set across distinct operators and regions ([§ Source diversity](#source-diversity-and-reputation)). A blob with fewer than two admissible holders falls back to single-source delivery.
+The candidate set is the full holders that `cdn/dht/v1` FIND_VALUE returns for the hash ([ADR 022 § FIND_VALUE Flow](022-content-discovery.md#find_value-flow-cache-miss--dht-lookup)). The client probes each for live availability, RTT, and `rate_per_mb` ([ADR 005 § `cdn/probe/v1`](005-protocol.md#cdnprobev1--latency-probe)). The client admits up to `max_sources`, preferring lower RTT and lower rate. Where candidate metadata allows, it spreads the set across distinct operators and regions ([§ Source diversity](#source-diversity-and-reputation)). A blob with fewer than two admissible holders falls back to single-source delivery.
 
 ### Work-unit partitioning and dynamic assignment
 
