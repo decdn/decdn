@@ -22,7 +22,7 @@ A client fetching a blob it expects to be large enough to benefit MAY run a **mu
 
 ### Source set and selection
 
-The candidate set is the full holders that `cdn/dht/v1` FIND_VALUE returns for the hash ([ADR 022 § FIND_VALUE Flow](022-content-discovery.md#find_value-flow-cache-miss--dht-lookup)). The client filters this set to reputation ≥ its minimum-reputation floor ([ADR 001 § Minimum-reputation rejection floor](001-network.md#minimum-reputation-rejection-floor)) and probes each for live availability, RTT, and `rate_per_mb` ([ADR 005 § `cdn/probe/v1`](005-protocol.md#cdnprobev1--latency-probe)). The client admits up to `max_sources`, preferring lower RTT and lower rate. Where candidate metadata allows, it spreads the set across distinct operators and regions ([§ Source diversity](#source-diversity-and-reputation)). A blob with fewer than two admissible holders falls back to single-source delivery.
+The candidate set is the full holders that `cdn/dht/v1` FIND_VALUE returns for the hash ([ADR 022 § FIND_VALUE Flow](022-content-discovery.md#find_value-flow-cache-miss--dht-lookup)). The client probes each for live availability, RTT, and `rate_per_mb` ([ADR 005 § `cdn/probe/v1`](005-protocol.md#cdnprobev1--latency-probe)). The client admits up to `max_sources`, preferring lower RTT and lower rate. Where candidate metadata allows, it spreads the set across distinct operators and regions ([§ Source diversity](#source-diversity-and-reputation)). A blob with fewer than two admissible holders falls back to single-source delivery.
 
 ### Work-unit partitioning and dynamic assignment
 
@@ -54,7 +54,7 @@ Each source is paid over its own payment channel with cumulative per-channel vou
 
 ### Engagement gate
 
-Multi-source fetch engages only when it pays for itself: the blob's advertised `total_bytes` exceeds `multi_source_min_bytes` **and** at least two holders clear the selection floor. Otherwise the client uses the single-source path unchanged. The gate keeps channel-setup and coordination overhead off small fetches, where one fast source is already optimal.
+Multi-source fetch engages only when it pays for itself: the blob's advertised `total_bytes` exceeds `multi_source_min_bytes` **and** at least two holders are admissible. Otherwise the client uses the single-source path unchanged. The gate keeps channel-setup and coordination overhead off small fetches, where one fast source is already optimal.
 
 ### Source diversity and reputation
 
@@ -99,7 +99,7 @@ Concrete defaults are modeled before locking. The load-bearing commitments are t
 ### Risks
 
 - **Parameter drift.** `max_sources` or `max_inflight_units` set too high wastes connections and deposit on marginal throughput. `work_unit_bytes` too small inflates proof overhead and request count; too large coarsens load-balancing and re-dispatch cost. Defaults are modeled and client-tunable.
-- **Source collusion / eclipse.** A set dominated by one operator concentrates failure and pricing power. The diversity preference and reputation floor mitigate this, but the client depends on accurate holder metadata to spread the set.
+- **Source collusion / eclipse.** A set dominated by one operator concentrates failure and pricing power. The diversity preference mitigates this, but the client depends on accurate holder metadata to spread the set.
 - **Deposit fragmentation.** Spreading deposit across many channels can leave each too thin if assignment shifts. Mitigated by sizing channels to expected assignment and backfilling from the candidate set rather than over-committing up front.
 
 ## Cross-ADR Impact
@@ -114,7 +114,7 @@ Concrete defaults are modeled before locking. The load-bearing commitments are t
 
 ## Acceptance Criteria
 
-1. For a blob above `multi_source_min_bytes` with at least two holders clearing the selection floor, the client fetches it as bao-aligned work units assigned dynamically across up to `max_sources` full holders; below the gate it uses single-source delivery unchanged.
+1. For a blob above `multi_source_min_bytes` with at least two admissible holders, the client fetches it as bao-aligned work units assigned dynamically across up to `max_sources` full holders; below the gate it uses single-source delivery unchanged.
 2. Each work unit is verified against the content-hash root on receipt; a unit failing verification is re-queued to a different source, and the failing source is penalized in reputation and recorded as slashing-evidence eligible.
 3. A source that stalls past `unit_deadline_ms`, drops, or returns `ok: false` has only its outstanding unit re-dispatched; verified units already stored are not refetched and the download does not restart.
 4. With the queue drained and units still outstanding, the scheduler hedges each to at most `endgame_hedge` additional idle sources; the first verified copy completes the unit and the duplicates are cancelled.

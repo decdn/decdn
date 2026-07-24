@@ -23,6 +23,18 @@ since project inception and will roll into the first tagged release.
 
 ### Changed (BREAKING)
 
+- **Trusted-IP rate-limit exemption removed (#1440).** The `cdn/probe/v1`
+  and `cdn/dht/v1` three-layer limiters no longer support an allow-list that
+  bypasses the per-IP layer; every source IP is now bounded by that layer.
+  - **Config-breaking:** the `probe.rate_limit.trusted_ips` and
+    `dht.rate_limit.trusted_ips` fields are removed. Because both
+    `[probe.rate_limit]` and `[dht.rate_limit]` use `deny_unknown_fields`, a
+    config file that still sets either key now fails `decdn config validate`
+    and node startup — delete the key. If the exemption was providing needed
+    headroom, raise `per_ip_rate_per_sec` / `per_ip_burst` instead; that keeps
+    the layer's invariant that no source IP is ever unbounded. Note the
+    exemption never bypassed the per-peer or global layers, nor the always-on
+    `security.per_source_*` bucket in front of the probe path.
 - **`cdn/probe/v1` content-availability + slashing evidence (#318).**
   `cdn/probe/v1` is now a content-availability query, not just a
   latency/rate probe (ADR 005, ADR 014). Wire changes (same ALPN —
@@ -238,12 +250,6 @@ since project inception and will roll into the first tagged release.
 - `cdn/probe/v1` ALPN with ADR-013 varint framing and `ProbeMessage`
   request/response (#225).
 - Compile-time guardrail on `MAX_MESSAGE_SIZE = 16 MiB` per ADR 013 (#287).
-- Minimum-reputation rejection floor for node selection: the new
-  `rank_candidates_with_floor` / `top_n_with_floor` selection APIs drop
-  sub-floor candidates before scoring so price/RTT cannot override a
-  poor reputation (#441, ADR 001). API-configurable only for now —
-  **no config/env/CLI knob yet**; per-client wiring is deferred until
-  the client fetch path lands. Default `0.0` keeps prior behavior.
 
 #### Cache
 

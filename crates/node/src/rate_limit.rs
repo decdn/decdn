@@ -31,16 +31,7 @@
 //! counters; see the per-path `Metrics` methods for the deviation rationale
 //! from each ADR's labeled-counter shape and the rolled-up Prometheus query
 //! operators can use).
-//!
-//! # Trusted-IP exemption
-//!
-//! Operators MAY exempt source IPs from the per-IP layer only — peer
-//! operators with predictable cross-peer traffic, in-cluster monitoring, etc.
-//! The exemption explicitly does NOT bypass per-peer or global; a single
-//! misbehaving `NodeId` at a trusted IP is still rate limited, and a global
-//! flood from many trusted IPs still hits the global cap.
 
-use std::collections::HashSet;
 use std::net::IpAddr;
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -85,8 +76,6 @@ pub struct RateLimitConfig {
     pub global_rate_per_sec: f64,
     /// Global inbound burst capacity.
     pub global_burst: u32,
-    /// IPs that bypass the per-IP layer only (per-peer + global still apply).
-    pub trusted_ips: HashSet<IpAddr>,
     /// Hard cap on the per-IP keyed-limiter map (#645). `0` => unbounded
     /// (operator opt-in, the resolver warns).
     pub max_tracked_per_ip: usize,
@@ -103,7 +92,6 @@ impl Default for RateLimitConfig {
             per_ip_burst: 200,
             global_rate_per_sec: 1000.0,
             global_burst: 2000,
-            trusted_ips: HashSet::new(),
             max_tracked_per_ip: 4096,
             max_tracked_per_peer: 4096,
         }
@@ -111,11 +99,15 @@ impl Default for RateLimitConfig {
 }
 
 // The resolved DHT/probe config (in `decdn-common`) and this engine config
-// hold the identical nine fields, but `common` can't depend on `node`, so the
+// hold the identical eight fields, but `common` can't depend on `node`, so the
 // engine config lives here. These `From` impls are the single mapping point
-// the runtime uses to build a limiter from resolved config — centralizing it
-// (rather than hand-copying nine fields at each call site) lets the compiler
-// catch a field transposition between the two parallel representations.
+// the runtime uses to build a limiter from resolved config, so a field added
+// on one side has exactly one place to be threaded through on the other.
+//
+// The compiler catches an added/dropped field (the literals are exhaustive,
+// no `..Default::default()`) but NOT a transposition: all eight fields are
+// `f64`/`u32`/`usize`, so swapping `per_peer_burst` with `per_ip_burst` still
+// compiles. Neither impl is covered by a test — see #1457.
 impl From<&decdn_common::config::ResolvedDht> for RateLimitConfig {
     fn from(r: &decdn_common::config::ResolvedDht) -> Self {
         Self {
@@ -125,7 +117,6 @@ impl From<&decdn_common::config::ResolvedDht> for RateLimitConfig {
             per_ip_burst: r.per_ip_burst,
             global_rate_per_sec: r.global_rate_per_sec,
             global_burst: r.global_burst,
-            trusted_ips: r.trusted_ips.clone(),
             max_tracked_per_ip: r.max_tracked_per_ip,
             max_tracked_per_peer: r.max_tracked_per_peer,
         }
@@ -141,7 +132,6 @@ impl From<&decdn_common::config::ResolvedProbe> for RateLimitConfig {
             per_ip_burst: r.per_ip_burst,
             global_rate_per_sec: r.global_rate_per_sec,
             global_burst: r.global_burst,
-            trusted_ips: r.trusted_ips.clone(),
             max_tracked_per_ip: r.max_tracked_per_ip,
             max_tracked_per_peer: r.max_tracked_per_peer,
         }
@@ -222,7 +212,6 @@ pub struct ThreeLayerRateLimiter {
     pruning_per_ip: AtomicBool,
     /// Single-flight guard for `retain_recent` on the per-peer keyed map.
     pruning_per_peer: AtomicBool,
-    trusted_ips: HashSet<IpAddr>,
     metrics: Arc<dyn RateLimitMetricsSink>,
 }
 
@@ -238,10 +227,6 @@ impl ThreeLayerRateLimiter {
             cap_per_peer: cfg.max_tracked_per_peer,
             pruning_per_ip: AtomicBool::new(false),
             pruning_per_peer: AtomicBool::new(false),
-            // Store trusted entries under the same /64 mask the lookup applies
-            // (#841), so a configured IPv6 trusted address still matches a
-            // masked inbound key. IPv4 entries are unchanged.
-            trusted_ips: cfg.trusted_ips.iter().copied().map(source_key).collect(),
             metrics,
         }
     }
@@ -299,20 +284,18 @@ impl ThreeLayerRateLimiter {
             return Err(RejectLayer::Global);
         }
 
-        // Layer 2 — per-IP. Skipped for relay-only connections and for trusted
-        // IPs. The key is masked to its /64 prefix for IPv6 (#841) — the same
-        // mask the dispatch limiter applies — so an attacker rotating within
-        // one IPv6 allocation can't mint a fresh bucket per request.
+        // Layer 2 — per-IP. Skipped for relay-only connections. The key is
+        // masked to its /64 prefix for IPv6 (#841) — the same mask the dispatch
+        // limiter applies — so an attacker rotating within one IPv6 allocation
+        // can't mint a fresh bucket per request.
         if let (Some(ip), Some(limiter)) = (peer_ip, self.per_ip.as_ref()) {
             let ip = source_key(ip);
-            if !self.trusted_ips.contains(&ip) {
-                let result = limiter.check_key(&ip);
-                if prune {
-                    self.maybe_prune_per_ip(limiter);
-                }
-                if result.is_err() {
-                    return Err(RejectLayer::PerIp);
-                }
+            let result = limiter.check_key(&ip);
+            if prune {
+                self.maybe_prune_per_ip(limiter);
+            }
+            if result.is_err() {
+                return Err(RejectLayer::PerIp);
             }
         }
 

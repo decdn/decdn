@@ -722,13 +722,6 @@ pub struct WarmingCandidate {
 ///
 /// `candidates` must already exclude the holders — the caller does this.
 ///
-/// # Contract not yet enforced
-///
-/// ADR 037 § Candidate pool also requires the pool to be filtered to
-/// reputation ≥ the client's minimum-reputation floor. **No caller does this
-/// today**; it is stated here as the intended contract, not a satisfied
-/// precondition (#1174 follow-up).
-///
 /// The full ordered list is returned so a caller *can* fall back from a proxy
 /// that declines to the next candidate and finally to the direct holder, per
 /// ADR 037 § Fallback. **The current caller uses only the first entry** — a real

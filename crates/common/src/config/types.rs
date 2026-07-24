@@ -892,8 +892,7 @@ pub struct SecurityConfig {
 /// The Kademlia routing-table parameters (k, α, bucket count, refresh
 /// interval) are pinned by the protocol and not exposed here. The
 /// rate-limit knobs nest under `[dht.rate_limit]` to match ADR 022 §DHT
-/// Rate Limiting "Trusted-IP exemption" (`dht.rate_limit.trusted_ips`)
-/// and to leave room for other future `dht.*` top-level knobs (e.g.
+/// Rate Limiting and to leave room for other future `dht.*` top-level knobs (e.g.
 /// bootstrap peers, republish overrides) without breaking the operator
 /// key path.
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -935,10 +934,6 @@ pub struct DhtRateLimitConfig {
     pub global_rate_per_sec: Option<f64>,
     /// Global inbound DHT burst capacity. Absent => 2000.
     pub global_burst: Option<u32>,
-    /// IPs that bypass the per-IP layer only (per-peer + global still
-    /// apply). Format: dotted IPv4 or RFC 5952 IPv6. Absent or empty =>
-    /// no trusted IPs. ADR 022 §Trusted-IP exemption.
-    pub trusted_ips: Option<Vec<String>>,
     /// Hard cap on the per-IP keyed-limiter map. Absent => 4096. `0`
     /// makes the map unbounded — operator opt-in (#645). Mirrors
     /// `security.max_tracked_sources` for the dispatch layer.
@@ -951,8 +946,7 @@ pub struct DhtRateLimitConfig {
 /// `[probe]` section — `cdn/probe/v1` settings (ADR 005).
 ///
 /// The rate-limit knobs nest under `[probe.rate_limit]` to match ADR 005
-/// §Probe rate limiting "Trusted-IP exemption" (`probe.rate_limit.trusted_ips`)
-/// and to leave room for other future `probe.*` top-level knobs without
+/// §Probe rate limiting and to leave room for other future `probe.*` top-level knobs without
 /// breaking the operator key path.
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -989,10 +983,6 @@ pub struct ProbeRateLimitConfig {
     pub global_rate_per_sec: Option<f64>,
     /// Global inbound probe burst capacity. Absent => 2000.
     pub global_burst: Option<u32>,
-    /// IPs that bypass the per-IP layer only (per-peer + global still
-    /// apply). Format: dotted IPv4 or RFC 5952 IPv6. Absent or empty =>
-    /// no trusted IPs. ADR 005 §Trusted-IP exemption.
-    pub trusted_ips: Option<Vec<String>>,
     /// Hard cap on the per-IP keyed-limiter map. Absent => 4096. `0`
     /// makes the map unbounded — operator opt-in (#645).
     pub max_tracked_per_ip: Option<usize>,
