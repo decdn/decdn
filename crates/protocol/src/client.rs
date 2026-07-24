@@ -56,10 +56,9 @@ pub const MB_BYTES: u64 = 1_048_576;
 /// interval negotiation).
 pub const DEFAULT_VOUCHER_INTERVAL_MB: u64 = 1;
 
-/// Hardcoded safety ceiling on `voucher_interval_mb` (ADR 003 §Voucher Interval
-/// Negotiation). The *governable* parameter is `maxVoucherIntervalMb` (default
-/// 1 MB), which MUST stay ≤ this ceiling; the negotiated range is 1..=1024 MB.
-/// Enforced at the wire boundary by [`StreamResponse::validate`] and
+/// Hardcoded wire safety ceiling on `voucher_interval_mb` (ADR 003 §Voucher
+/// Interval Negotiation). The negotiated range is 1..=1024 MB. Enforced at the
+/// wire boundary by [`StreamResponse::validate`] and
 /// [`StreamRequestExt::validate`].
 pub const MAX_VOUCHER_INTERVAL_MB: u64 = 1024;
 
