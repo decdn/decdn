@@ -1,12 +1,12 @@
 # Appendix: Operator Protocol-Upgrade Runbook
 
-> **Appendix, not a core protocol ADR.** Operator-facing companion to [ADR 013 — Schema Evolution](013-schema-evolution.md#adr-013-schema-evolution). This appendix sequences the operator actions for compatible Tier 1 and Tier 2 changes. A future Tier 3 change defines its own migration.
+> **Appendix, not a core protocol ADR.** Operator-facing companion to [ADR 013 — Schema Evolution](013-schema-evolution.md#adr-013-schema-evolution). This appendix sequences the safe-restart procedure every release shares and the operator actions for compatible Tier 1 and Tier 2 changes. A future Tier 3 change defines its own migration.
 
 ## Context
 
-The protocol evolves under the [ADR 013](013-schema-evolution.md#adr-013-schema-evolution) three-tier scheme (Tier 1 minor, Tier 2 medium, Tier 3 major). Tier 1 and Tier 2 keep the current ALPN and have useful standing operator procedures. Tier 3 changes the ALPN or topic contract and therefore needs a migration designed around the concrete break.
+The protocol evolves under the [ADR 013](013-schema-evolution.md#adr-013-schema-evolution) three-tier scheme (Tier 1 minor, Tier 2 medium, Tier 3 major), which specifies the wire mechanics but not the operator question — *what do I do when a release ships?*
 
-This runbook fills that gap. It does not redefine any protocol mechanism.
+This runbook answers that question for Tier 1 and Tier 2, which keep the current ALPN and have stable standing procedures, plus the restart hygiene every release shares. Tier 3 changes the ALPN or topic contract, so its rollout is designed around the concrete break and defined by the ADR that ships it. Nothing here redefines a protocol mechanism.
 
 ## Tier overview
 
@@ -16,7 +16,22 @@ Per [ADR 013 § Decision](013-schema-evolution.md#adr-013-schema-evolution), eac
 |------|---------|------|-----------------|
 | **1 — Minor** | Append optional fields to an existing struct via two-phase deserialization | Same (e.g. `cdn/client/v1`) | None — see [§ Tier 1 — minor evolution](#tier-1--minor-evolution) |
 | **2 — Medium** | Add new optional protocol or gossip payload variants, no ALPN bump | Same | Config-only (opt-in flags), see [§ Tier 2 — medium evolution](#tier-2--medium-evolution) |
-| **3 — Major** | Remove a field; change a type; reorder enum variants; add a mandatory field; change signed-field set; change framing | Bumped ALPN or topic | Follow the focused migration ADR shipped with the breaking change |
+| **3 — Major** | Remove a field; change a type; reorder enum variants; add a mandatory field; change signed-field set; change framing; bump `GossipEnvelope.version` | Bumped ALPN or topic | Follow the focused migration ADR shipped with the breaking change — see [§ Tier 3 — major break](#tier-3--major-break-alpn-or-topic-bump) |
+
+## Restarting a node safely
+
+Tier-independent: this applies to every restart — a Tier 1 pull-and-restart, a config change, host maintenance — not just to protocol upgrades.
+
+A node that answered `has_blob: true` to a probe and then answers the follow-up `StreamRequest` with a signed `StreamResponse { ok: false }` inside the 30-second window produces valid phantom-announcement slash evidence. The `EvictedSinceProbe` error code does **not** make that refusal safe — it is unsigned and invisible to the on-chain verifier ([ADR 005 § Probe-Triggered Eviction Hold](005-protocol.md#probe-triggered-eviction-hold)). Eviction holds are in-process state and do not survive a restart, while the positive `ProbeResponse` you already signed stays valid evidence in the peer's hands.
+
+1. **Stop new inbound connections** at your load balancer or firewall. This is the step `decdn node drain` cannot do for you — drain is graceful *shutdown* (the `admin_v1_drain` call in [`appendix-local-admin-http.md`](appendix-local-admin-http.md#appendix-local-admin-http-surface), equivalent to SIGTERM), not a stop-accepting mode, so anything it takes down is already committed.
+2. **Wait for both gauges to reach zero** on `/metrics` (canonical registry: [`appendix-observability.md`](appendix-observability.md#appendix-observability-and-metrics)):
+   - `decdn_probe_hold_slots_used == 0` — every outstanding probe commitment has aged out, so the restart breaks none of them. This is the gauge that matters; it has no admin-RPC equivalent.
+   - `decdn_streams_active{direction="inbound"} == 0` — no delivery in flight.
+3. **Shut down** with `decdn node drain --wait`, which polls `admin_v1_health` for `in_flight_streams == 0` rather than returning the moment the trigger fires.
+4. **Upgrade and restart.** Confirm with `decdn node health`, then re-enable inbound at the load balancer.
+
+Stopping without step 1 is not itself slashable — an unanswered connection is not evidence — but it leaves the window above open for as long as a peer holds a fresh positive probe result for a blob you come back without.
 
 ## Tier 1 and Tier 2 operator checklists
 
@@ -29,7 +44,7 @@ A Tier 1 release adds optional fields to existing structs. By construction:
 - Signed field set unchanged ([ADR 013 § Signed Field Freezing](013-schema-evolution.md#signed-field-freezing)) — slash evidence stays verifiable across versions.
 - Payment channels and on-chain bindings unaffected.
 
-**Operator action:** Pull and restart at your normal cadence. No drain, flag day, or client coordination. Skipping a Tier 1 release entirely keeps you interoperable indefinitely — peers on the new version just won't see the optional fields you don't emit.
+**Operator action:** Pull and restart at your normal cadence, following [§ Restarting a node safely](#restarting-a-node-safely). No flag day, no client coordination, and no upgrade-specific drain beyond the standing restart procedure. Skipping a Tier 1 release entirely keeps you interoperable indefinitely — peers on the new version just won't see the optional fields you don't emit.
 
 ### Tier 2 — medium evolution
 
@@ -38,19 +53,21 @@ A Tier 2 release adds new optional message variants (e.g. a `Ping`/`Pong` keepal
 **Operator checklist:**
 
 1. **Read the release notes** for new operator-config flags introduced with the variant. Typically opt-in (e.g. `enable_keepalive = true`); defaults are conservative.
-2. **Pull and restart at your normal cadence.** Drain only if the release notes say so — most Tier 2 releases need none.
+2. **Pull and restart at your normal cadence,** per [§ Restarting a node safely](#restarting-a-node-safely). No Tier 2 release needs coordination beyond that standing procedure.
 3. **Monitor `decdn_streams_failed_total{reason="protocol_error"}`** for one rolling window after restart. A spike means a peer is rejecting the new variant — expected and benign for legacy peers, but a sustained rate from your own outbound streams suggests config drift.
 4. **Configure new metrics** in your dashboard if the release exposes them (canonical registry: [`appendix-observability.md`](appendix-observability.md#appendix-observability-and-metrics)).
 
 Payment channels and stake state are unaffected.
 
-## Tier 3 — major ALPN bump
+## Tier 3 — major break (ALPN or topic bump)
 
-Tier 3 is a classification boundary, not a standing rollout procedure. The ALPN string changes (`cdn/client/v1` → `cdn/client/v2`), or a gossip topic's semantic contract changes. The accompanying ADR MUST define the supported-version set, deployment order, client behavior, channel or signature migration, rollback conditions, observability, and retirement criteria that the actual break requires.
+Tier 3 is a classification boundary, not a standing rollout procedure. The ALPN string changes (`cdn/client/v1` → `cdn/client/v2`), a gossip topic's semantic contract changes, or the gossip envelope format itself changes. The accompanying ADR MUST define the supported-version set, deployment order, client behavior, channel or signature migration, rollback conditions, observability, and retirement criteria that the actual break requires.
 
 The current runtime supports the `…/v1` identifiers documented by the protocol ADRs. No transition guarantee exists until a concrete Tier 3 ADR defines and implements it.
 
 ## Cross-ADR Impact
 
 - [ADR 013 — Schema Evolution: framing, enum discipline, evolution tiers, and signed-field freezing](013-schema-evolution.md#adr-013-schema-evolution)
-- [`appendix-observability.md` — metrics referenced in the Tier 2 checklist](appendix-observability.md#appendix-observability-and-metrics)
+- [ADR 005 — Probe-Triggered Eviction Hold (drain prerequisite)](005-protocol.md#probe-triggered-eviction-hold)
+- [`appendix-local-admin-http.md` — `admin_v1_drain` invocation](appendix-local-admin-http.md#appendix-local-admin-http-surface)
+- [`appendix-observability.md` — metrics referenced in the restart and Tier 2 checklists](appendix-observability.md#appendix-observability-and-metrics)

@@ -290,9 +290,9 @@ DHT STORE and FIND_VALUE operations carry no protocol-level fee. The incentive t
 - **Tier 2 — Medium** (new optional `DhtMessage` enum variants): same ALPN.
 - **Tier 3 — Major** (new mandatory fields or other incompatible changes): new ALPN. The focused ADR for the concrete breaking change defines its migration guarantees.
 
-`DhtMessage` uses a top-level enum consistent with the per-ALPN protocol enum pattern in [ADR 013 — Protocol Enums](013-schema-evolution.md#protocol-enums). Unknown variants are silently dropped.
+`DhtMessage` uses a top-level enum consistent with the per-ALPN protocol enum pattern in [ADR 013 — Protocol Enums](013-schema-evolution.md#protocol-enums). `cdn/dht/v1` is a QUIC stream protocol, so a receiver that does not know a variant closes that individual stream with `UNSUPPORTED_MESSAGE` (`0x01`) per [ADR 013 § Unknown variant handling](013-schema-evolution.md#unknown-variant-handling); silent drop is the gossip rule and does not apply here.
 
-New optional variants (e.g., `BatchStore` / `BatchStoreAck` added for publishing optimization in [§ STORE Flow (Cache Event → DHT Publish)](#store-flow-cache-event--dht-publish)) are Tier 2 changes — no ALPN bump. Publishers detect receiver support by issuing the new variant and falling back to the per-hash equivalent on stream-close-without-ack, the natural signal under "unknown variants are silently dropped." This negotiation pattern relies on the variant being a pure optimization with an existing per-hash equivalent; variants without a fallback path require an ALPN bump.
+New optional variants (e.g., `BatchStore` / `BatchStoreAck` added for publishing optimization in [§ STORE Flow (Cache Event → DHT Publish)](#store-flow-cache-event--dht-publish)) are Tier 2 changes — no ALPN bump. Publishers detect receiver support by issuing the new variant and falling back to the per-hash equivalent on stream-close-without-ack, which is precisely that `UNSUPPORTED_MESSAGE` close. This negotiation pattern relies on the variant being a pure optimization with an existing per-hash equivalent; variants without a fallback path require an ALPN bump.
 
 ### Acceptance Criteria
 

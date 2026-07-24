@@ -151,7 +151,7 @@ Topic names (`cdn/global/v1`, `cdn/region/{cc}/v1`) embed a version referring to
 
 ##### Rule for choosing between envelope evolution and topic bump
 
-- *Payload-shape changes* — new optional fields, new `GossipPayload` enum variants, additional unsigned outer fields → **envelope evolution**. Bump `GossipEnvelope.version` only if the envelope wire format itself changes; otherwise append to `GossipPayload` (Tier 2) or extend an inner message via the `Body` + outer fields pattern (Tier 1). The topic name does **not** change. Old peers safely ignore unknown payload variants per the [Deserialization rule](#deserialization-rule).
+- *Payload-shape changes* — new optional fields, new `GossipPayload` enum variants, additional unsigned outer fields → **envelope evolution**: append to `GossipPayload` (Tier 2) or extend an inner message via the `Body` + outer fields pattern (Tier 1). The topic name does **not** change. Old peers safely ignore unknown payload variants per the [Deserialization rule](#deserialization-rule). Bumping `GossipEnvelope.version` is reserved for a change to the envelope wire format itself and is [Tier 3](#tier-3--major-alpn-version-bump) — old peers drop the message entirely rather than degrading, so it is a break, not evolution.
 - *Topic-level changes* — who may publish, what registry/membership rule applies, what validation semantics gate acceptance, the topic's purpose → **topic name bump** (`cdn/global/v2`). Envelope-version evolution cannot express these because they alter the topic's trust contract; an old subscriber would accept messages under semantics it no longer enforces. The concrete change defines its own migration plan.
 
 This dichotomy is load-bearing: topic bumps require network coordination and are unnecessary for payload-shape changes that two-phase deserialization absorbs. The default for any backwards-compatible message change MUST be envelope evolution; topic bumps are reserved for genuine trust-contract changes.
@@ -315,8 +315,9 @@ Required for changes that cannot be handled by minor or medium evolution:
 - Adding a mandatory (non-optional) field
 - Modifying the set of signed fields
 - Changing the framing format itself
+- Bumping `GossipEnvelope.version` — old peers silently drop every message under the [Deserialization rule](#deserialization-rule) rather than degrading gracefully, so an envelope-format change is a break even though the topic name is unchanged
 
-The ALPN string is bumped: `cdn/client/v1` → `cdn/client/v2`. This ADR does not prescribe version coexistence, selection, rollout, rollback, or retirement. The concrete breaking change requires a focused ADR that defines the migration against the runtime that exists at that time.
+The ALPN string is bumped: `cdn/client/v1` → `cdn/client/v2`; for gossip, the topic name or the envelope version is bumped instead. This ADR does not prescribe version coexistence, selection, rollout, rollback, or retirement. The concrete breaking change requires a focused ADR that defines the migration against the runtime that exists at that time.
 
 ### Signed Field Freezing
 
@@ -351,7 +352,6 @@ struct NodeAnnounce {
     body: NodeAnnounceBody,
     signature: Bytes,
 }
-
 ```
 
 Future unsigned extension fields trail `body + signature` and are decoded via two-phase deserialization (see [Tier 1](#tier-1--minor-no-coordination)). The same pattern applies to `ProbeResponse` and `StreamResponse`.
