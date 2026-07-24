@@ -384,7 +384,7 @@ Additional application error codes defined by other ADRs are unaffected. The cod
 
 - Formalizes the optional-trailing-fields pattern from [ADR 005](005-protocol.md#adr-005-wire-protocol) as a standard, repeatable mechanism — no longer a one-time workaround
 - Length-prefixed framing enables forward-compatible deserialization: receivers skip unknown trailing bytes without connection failure
-- Protocol enums give explicit, type-safe message discrimination on every ALPN, replacing [Appendix: Encrypted Content Publishing](appendix-encrypted-content-publishing.md#appendix-encrypted-content-publishing-on-decdn)'s ad-hoc 1-byte prefix with a uniform pattern
+- Protocol enums give explicit, type-safe message discrimination on every ALPN instead of ad-hoc discriminator bytes
 - The three-tier model provides a clear decision framework for every future protocol change
 - The gossip envelope provides a format sentinel and safe unknown-payload handling for messages outside deCDN's ALPN-routed protocols
 - Signed field freezing makes implicit constraints explicit, preventing accidental signature-breaking changes

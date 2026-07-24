@@ -25,7 +25,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for build commands, ADR conventions, pre-
   - 028 (`028-slashing-appeals.md`): status unlocked from "Locked-for-implementation" to "Draft" pending CapacityBond rebase.
   - 027 (Distinct-Client Diversity Gating / Delivery Receipts): collapsed into ADR 026 §3 per-operator gauge-share cap (itself now retired).
   - 010 (Multi-Token Payment Support): dropped for a single immutable USDC token set at deployment; rationale archived in `adr/_history/alternatives-pre-launch.md`.
-  - 006/020/021/023/025: demoted to appendices in a pre-launch cleanup (`appendix-encrypted-content-publishing.md`, `appendix-observability.md`, `appendix-l2-deployment.md`, `appendix-poc-production-seams.md`, `appendix-local-admin-http.md`).
+  - 006: dropped; its encryption-agnostic content-addressing note lives in ADR 002. 020/021/023/025: demoted to appendices in a pre-launch cleanup (`appendix-observability.md`, `appendix-l2-deployment.md`, `appendix-poc-production-seams.md`, `appendix-local-admin-http.md`).
   - 004 (tokenomics): superseded by ADR 026, which was rewritten to the work-token model and again to the no-emission variant (App Incentives in place of OperatorEmissions; the interim Genesis Bond Credits mechanism was later removed — see the ADR 026 note above).
 
 ## Common Commands
