@@ -157,10 +157,11 @@ pub trait Clock: std::fmt::Debug + Send + Sync {
 
 /// Production clock reading the system wall clock.
 ///
-/// A clock before the Unix epoch (or a `duration_since` error) reads as `0`,
-/// which the decay math treats as maximal age; a genuine pre-1970 host is not
-/// a real deployment, so this can only ever over-decay a freshly seeded score
-/// toward neutral — never inflate one.
+/// A clock before the Unix epoch (or a `duration_since` error) reads as `0`.
+/// Since `decay` saturates elapsed time at 0, a `0` read is never *after* a
+/// stored `last_update_secs`, so it yields no decay rather than corrupting a
+/// score — the conservative outcome for a host whose clock is not a real
+/// deployment.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SystemClock;
 
@@ -239,7 +240,7 @@ impl LocalReputation {
         });
         // Clamp the effective "now" so a backward clock read never rewinds
         // `last_update_secs`, which would make a later `score()` apply extra
-        // decay. `decay_to` also saturates elapsed at 0; this keeps the stored
+        // decay. `decay` also saturates elapsed at 0; this keeps the stored
         // timestamp monotonic too.
         let effective_now = now.max(entry.last_update_secs);
         let decayed = self.decay(entry.score, entry.last_update_secs, effective_now);
