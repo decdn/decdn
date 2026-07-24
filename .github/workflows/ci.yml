@@ -221,6 +221,9 @@ jobs:
             adr:
               - 'adr/**/*.md'
               - 'adr/Makefile'
+              # Guard helpers driven by adr/Makefile (check-anchor-targets), so
+              # a change to the guard itself re-runs it against the whole set.
+              - 'adr/_build/*.awk'
               - '.github/workflows/ci.yml'
             solidity_dependencies:
               - '.gitmodules'
@@ -1204,6 +1207,7 @@ jobs:
       - run: make -C adr check-book-list
       - run: make -C adr check-bare-refs
       - run: make -C adr check-md-anchors
+      - run: make -C adr check-anchor-targets
       - run: make -C adr check-no-section-numbers
 
   # Pytest suite for CI helper and path-filter regressions. Non-blocking by design
