@@ -29,10 +29,12 @@
 use std::time::Duration;
 
 use anyhow::Context;
+use decdn_client_pull::UpstreamRefused;
 use decdn_e2e::chain::ChainFixture;
 use decdn_e2e::client::ClientFixture;
 use decdn_e2e::node::NodeFixture;
 use decdn_e2e::poll;
+use decdn_protocol::client::StreamError;
 
 const MIB: usize = 1024 * 1024;
 
@@ -95,10 +97,18 @@ async fn run() -> anyhow::Result<()> {
         {
             Ok(_) => Ok(None),
             Err(err) => {
-                let msg = format!("{err:#}");
+                // Assert on the TYPED refusal, not a formatted-string match: a
+                // channel/connect/payment regression that also fails the fetch
+                // must not green this check. `client.fetch` wraps the error in
+                // `.context(..)`, but anyhow preserves `downcast_ref` to the inner
+                // `UpstreamRefused` (same shape g_node_08_namespace_scope uses).
+                let code = err
+                    .downcast_ref::<UpstreamRefused>()
+                    .map(|r| r.error().clone())
+                    .with_context(|| format!("expected a signed refusal, got: {err:#}"))?;
                 anyhow::ensure!(
-                    msg.contains("OriginBlacklisted"),
-                    "refusal must be the origin-blacklist reason, got: {msg}"
+                    code == StreamError::OriginBlacklisted,
+                    "refusal must be the origin-blacklist reason, got: {code:?}"
                 );
                 Ok(Some(()))
             }

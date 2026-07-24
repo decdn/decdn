@@ -844,7 +844,9 @@ where
             capacity_bond: capacity_bond.clone(),
             peer_table: Arc::clone(&peer_table),
             announce_deny: Arc::clone(&announce_deny),
-            pending_origin_peer_ops: pending_origin_peer_ops.clone(),
+            // Moved, not cloned: the factory is `FnOnce` (constructed once), and
+            // this map is not used after (unlike the shared `Arc` handles).
+            pending_origin_peer_ops,
         },
         shutdown: shutdown.clone(),
         rescan_interval: rescan_interval.max(Duration::from_secs(1)),
