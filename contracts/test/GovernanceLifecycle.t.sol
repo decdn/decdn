@@ -91,7 +91,6 @@ contract GovernanceLifecycleTest is Test, BaseProtocolDeploy {
     address internal voter2 = address(0xCCCC);
     address internal multisig = address(0xC0DE);
     bytes32 internal constant REGION_DE = bytes32("DE");
-    address internal challengerPool = address(0xCCEE);
 
     // Counter used to make each proposal description unique so identical
     // setter calls don't collide on `proposalId`.
@@ -113,7 +112,6 @@ contract GovernanceLifecycleTest is Test, BaseProtocolDeploy {
             // Token is minted entirely to the test harness so it can fund
             // operators + FeeRouter bucket destinations downstream.
             initialTokenHolder: address(this),
-            challengerIncentivePool: challengerPool,
             timelockDelay: TIMELOCK_DELAY,
             minBond: MIN_BOND,
             unbondingPeriod: UNBONDING_PERIOD,
@@ -681,22 +679,8 @@ contract GovernanceLifecycleTest is Test, BaseProtocolDeploy {
     }
 
     // =================================================================
-    // SlashAppeal (2 setters)
+    // SlashAppeal
     // =================================================================
-
-    function test_lifecycle_SlashAppeal_setChallengerIncentivePool_happy() public {
-        address pool = address(0xCC02);
-        _runLifecycle(address(slashAppeal), abi.encodeCall(SlashAppeal.setChallengerIncentivePool, (pool)));
-        assertEq(slashAppeal.challengerIncentivePool(), pool);
-    }
-
-    function test_lifecycle_SlashAppeal_setChallengerIncentivePool_outOfBounds() public {
-        _runLifecycleExpectExecuteRevert(
-            address(slashAppeal),
-            abi.encodeCall(SlashAppeal.setChallengerIncentivePool, (address(0))),
-            abi.encodeWithSelector(SlashAppeal.ZeroAddress.selector)
-        );
-    }
 
     function test_lifecycle_SlashAppeal_setAppealBond_happy() public {
         _runLifecycle(address(slashAppeal), abi.encodeCall(SlashAppeal.setAppealBond, (uint256(5000e18))));

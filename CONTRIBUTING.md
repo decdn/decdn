@@ -249,15 +249,15 @@ USDC=$(forge create test/mocks/MintableUSDC.sol:MintableUSDC \
   --private-key 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80 \
   --broadcast --json | jq -r .deployedTo)
 
-# 3. Deploy the protocol. The four addresses are required; for local testing any
-#    EOA works. EMERGENCY_MULTISIG is account #1 and CHALLENGER_INCENTIVE_POOL is
-#    account #2; INITIAL_TOKEN_HOLDER is the deployer (account #0, the `--sender`)
+# 3. Deploy the protocol. The three addresses are required; for local testing any
+#    EOA works. EMERGENCY_MULTISIG is account #1; INITIAL_TOKEN_HOLDER is the
+#    deployer (account #0, the `--sender`)
 #    so it holds the genesis TOKEN and can later fund the faucet. The deployer
 #    must NOT be forge's default sender, so always pass `--sender` explicitly.
 USDC_ADDRESS=$USDC \
 EMERGENCY_MULTISIG=0x70997970C51812dc3A010C7d01b50e0d17dc79C8 \
 INITIAL_TOKEN_HOLDER=0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 \
-CHALLENGER_INCENTIVE_POOL=0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC \
+CURRENT_TERMS_HASH=0x0000000000000000000000000000000000000000000000000000000000000001 \
 forge script script/DeployProtocol.s.sol:DeployProtocol \
   --rpc-url http://127.0.0.1:8545 \
   --sender 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 \
@@ -271,7 +271,7 @@ jq . deployments/31337.json
 Notes and common snags:
 
 - **Drop `--broadcast` for a dry run** — the script simulates against the fork and prints addresses without sending transactions.
-- **Required env vars:** `USDC_ADDRESS`, `EMERGENCY_MULTISIG`, `INITIAL_TOKEN_HOLDER`, `CHALLENGER_INCENTIVE_POOL`. Every economic parameter (`MIN_BOND`, `TIMELOCK_DELAY`, `FEE_ROUTER_WINDOW_EPOCHS`, the slash/blacklist bonds, …) has a production-shaped default and is overridable via env var — see `_readConfig` in `DeployProtocol.s.sol` for the full list and defaults.
+- **Required env vars:** `USDC_ADDRESS`, `EMERGENCY_MULTISIG`, `INITIAL_TOKEN_HOLDER`, `CURRENT_TERMS_HASH`. Every economic parameter (`MIN_BOND`, `TIMELOCK_DELAY`, `FEE_ROUTER_WINDOW_EPOCHS`, the slash/blacklist bonds, …) has a production-shaped default and is overridable via env var — see `_readConfig` in `DeployProtocol.s.sol` for the full list and defaults.
 - **`--sender` becomes the deployer.** The script reverts (`DeployerIsForgeDefaultSender`) if you let forge use its default sender, so always pass `--sender`. The deployer's roles are granted to the Timelock and then revoked as the final step; the script reverts if any privileged role is left on the deployer.
 - **Re-running on the same chain reverts** with `ManifestAlreadyExists` (the guard fires before any gas is spent). Either `rm deployments/31337.json`, restart Anvil for a clean slate, or set `FORCE_OVERWRITE_MANIFEST=true`.
 - **`BuybackBurner` is recorded as the zero address** — it ships unwired at launch (operators take 90%, treasury 10%); its 30% buyback share activates by governance once a concrete Balancer V3 subclass is deployed.

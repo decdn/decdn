@@ -1952,7 +1952,6 @@ async fn run_deploy_script(
             .env("USDC_ADDRESS", usdc.to_string())
             .env("INITIAL_TOKEN_HOLDER", initial_token_holder.to_string())
             .env("EMERGENCY_MULTISIG", DEPLOYER_ADDR)
-            .env("CHALLENGER_INCENTIVE_POOL", DEPLOYER_ADDR)
             // ADR 019 § Terms Acceptance — DeployProtocol.s.sol requires a
             // non-zero genesis terms hash (CapacityBond rejects the zero
             // sentinel). The registration path reads it back from the contract.

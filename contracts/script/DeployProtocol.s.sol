@@ -45,7 +45,6 @@ import { Ed25519Verifier } from "../src/Ed25519Verifier.sol";
 ///                                            Sepolia USDC `0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d`)
 ///           - `EMERGENCY_MULTISIG`        — 3-of-5 multisig per ADR 009
 ///           - `INITIAL_TOKEN_HOLDER`      — 1B TOKEN recipient at genesis
-///           - `CHALLENGER_INCENTIVE_POOL` — SlashAppeal failed-appeal-bond pool
 ///
 ///         The FeeRouter treasury bucket is NOT an env var: it is the
 ///         `TimelockController` this script deploys (step 7 sets it as the
@@ -155,7 +154,6 @@ contract DeployProtocol is BaseProtocolDeploy {
         // any caller that forgets to set it.
         cfg.emergencyMultisig = vm.envAddress("EMERGENCY_MULTISIG");
         cfg.initialTokenHolder = vm.envAddress("INITIAL_TOKEN_HOLDER");
-        cfg.challengerIncentivePool = vm.envAddress("CHALLENGER_INCENTIVE_POOL");
         // `--sender` on the command line becomes `tx.origin` for the script;
         // use that as the deployer so the role grants the constructors emit
         // are attributable to the broadcasting EOA, not this script contract.

@@ -77,9 +77,9 @@ import { IPublisherRegistryStanding } from "../src/interfaces/IPublisherRegistry
 ///                                          Pausable target,
 ///                                          router-caller → PaymentChannel,
 ///                                          SLASH_ROLE → SlashJudge) plus the
-///                                          deployer-only `setChallengerIncentivePool`
-///                                          and `OriginAssignment.setContentBlacklist`
-///                                          setters that MUST run before the
+///                                          deployer-only
+///                                          `OriginAssignment.setContentBlacklist`
+///                                          setter that MUST run before the
 ///                                          GOVERNANCE_ROLE handoff because they
 ///                                          become Timelock-gated post-handoff.
 ///           5. `_handOffGovernance`      — grant-before-revoke loop over every
@@ -98,8 +98,8 @@ import { IPublisherRegistryStanding } from "../src/interfaces/IPublisherRegistry
 ///           7. `_assertPeerRolesWired`   — reverts if any phase-4 peer-role grant
 ///                                          or address binding (slash trigger,
 ///                                          router-caller, pausers, emergency
-///                                          multisig, blacklist
-///                                          binding, challenger pool) did not land.
+///                                          multisig, blacklist binding) did not
+///                                          land.
 ///                                          `grantRole` to a wrong address does not
 ///                                          revert, so without this a half-wired
 ///                                          protocol would ship silently.
@@ -232,7 +232,6 @@ abstract contract BaseProtocolDeploy is Script {
         address deployer;
         address emergencyMultisig;
         address initialTokenHolder;
-        address challengerIncentivePool;
         // Governance / Timelock
         uint256 timelockDelay;
         // CapacityBond economic params (ADR 026 defaults)
@@ -379,11 +378,10 @@ abstract contract BaseProtocolDeploy is Script {
     {
         d.timelock = timelock;
 
-        // Fail-fast on the six fields whose absence either reverts a
+        // Fail-fast on the five fields whose absence either reverts a
         // constructor with an opaque error (`usdc`, `ed25519Verifier`,
         // `initialTokenHolder`) or silently no-ops a role grant downstream
-        // (`emergencyMultisig` skips SlashAppeal's constructor grant;
-        // `challengerIncentivePool` would brick `setChallengerIncentivePool`;
+        // (`emergencyMultisig` skips SlashAppeal's constructor grant and
         // ContentBlacklist would grant EMERGENCY_MULTISIG_ROLE to `address(0)`).
         // The treasury is not validated here: it is `address(timelock)`, always
         // non-zero.
@@ -392,7 +390,6 @@ abstract contract BaseProtocolDeploy is Script {
         if (cfg.deployer == address(0)) revert ZeroAddress("deployer");
         if (cfg.emergencyMultisig == address(0)) revert ZeroAddress("emergencyMultisig");
         if (cfg.initialTokenHolder == address(0)) revert ZeroAddress("initialTokenHolder");
-        if (cfg.challengerIncentivePool == address(0)) revert ZeroAddress("challengerIncentivePool");
 
         d.token = new Token(cfg.initialTokenHolder);
 
@@ -500,15 +497,6 @@ abstract contract BaseProtocolDeploy is Script {
         d.bond.grantRole(d.bond.SLASH_APPEAL_ROLE(), address(d.slashAppeal));
         // ContentBlacklist ejects operators via CapacityBond on blacklist add.
         d.bond.grantRole(d.bond.BLACKLIST_ROLE(), address(d.blacklist));
-
-        // SlashAppeal.upholdAppeal routes the non-burn half of a failed appeal
-        // bond to a challenger-incentive pool when one is wired (otherwise that
-        // half is also burned — `upholdAppeal` degrades gracefully, it does NOT
-        // revert on an unset pool). The `setChallengerIncentivePool` setter,
-        // however, reverts on address(0), and post-handoff it is governance-gated,
-        // so wiring here is the only path that doesn't require a Timelock proposal
-        // to give the slash-appeal lifecycle a live pool.
-        d.slashAppeal.setChallengerIncentivePool(cfg.challengerIncentivePool);
 
         // EMERGENCY_MULTISIG_ROLE: SlashAppeal already has it from its
         // constructor (when emergencyMultisig != 0); ContentBlacklist has no
@@ -680,10 +668,6 @@ abstract contract BaseProtocolDeploy is Script {
         address boundRegistry = address(d.blacklist.publisherRegistry());
         if (boundRegistry != address(d.registry)) {
             revert BindingNotWired(address(d.blacklist), address(d.registry), boundRegistry);
-        }
-        address boundPool = d.slashAppeal.challengerIncentivePool();
-        if (boundPool != cfg.challengerIncentivePool) {
-            revert BindingNotWired(address(d.slashAppeal), cfg.challengerIncentivePool, boundPool);
         }
     }
 
