@@ -64,11 +64,13 @@ Gas abstraction via ERC-2771 or ERC-4337 paymasters is targeted at production.
 
 At the default 1 MB cadence, a 10 GB blob requires 10,000 vouchers — each involving a sign, transmit, verify, and ack cycle. This overhead is unnecessary when the unacknowledged exposure per interval is negligible at typical rates.
 
+**Wire bounds:** `voucher_interval_mb` MUST be in `1..=1024` (`MAX_VOUCHER_INTERVAL_MB`) wherever it appears, in both `StreamRequest` and `StreamResponse`. The bound is hardcoded in the wire schema, not governable — there is no on-chain counterpart, because vouchers carry no interval field and the contract therefore cannot verify what cadence was used during off-chain delivery. A peer that proposes or accepts a value outside the range commits a protocol error: the message is rejected, not clamped.
+
 **Negotiation semantics:**
 
 1. The client proposes a `voucher_interval_mb` in `StreamRequest` (see [ADR 005](005-protocol.md#adr-005-wire-protocol)).
 2. The node responds with its accepted `voucher_interval_mb` in `StreamResponse`. The node may accept the client's proposal, reduce it, or omit the field to fall back to 1 MB.
-3. The effective interval for the stream is `min(client_proposed, node_accepted)`.
+3. The effective interval for the stream is `min(client_proposed, node_accepted)` — computed over values that have each already passed the wire-bounds check above, so the `min` narrows the cadence but never rescues an out-of-range message.
 
 **Default:** `voucher_interval_mb` is optional in both `StreamRequest` and `StreamResponse`; if absent, the default is 1 MB.
 
