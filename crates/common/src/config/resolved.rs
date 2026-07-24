@@ -486,7 +486,8 @@ pub struct ResolvedObservability {
 /// Resolved `cdn/dht/v1` settings (ADR 022).
 ///
 /// Each `*_rate_per_sec == 0.0` and matching `*_burst == 0` disables that
-/// layer.
+/// layer. The resolver guarantees every rate is finite and `>= 0`, and that
+/// each `*_burst > 0` whenever its rate is `> 0` (no deny-all).
 ///
 /// `Default` returns the ADR 022 §DHT Rate Limiting defaults so test sites
 /// that build a `ResolvedConfig` by hand can write `ResolvedDht::default()`

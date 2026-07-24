@@ -385,8 +385,13 @@ fn tie_group_end(ranked: &[RankedCandidate], start: usize) -> usize {
 /// ranked candidates, where the caller will iterate them in order and stop
 /// after the first successful pull.
 ///
-/// For the standard fetch path use `n = MAX_PROVIDER_ATTEMPTS`. The function
-/// returns fewer than `n` results when the candidate pool is smaller.
+/// Returns fewer than `n` results when the candidate pool is smaller.
+///
+/// Note this is **not** how the node's pull path bounds its work:
+/// [`MAX_PROVIDER_ATTEMPTS`] is a fetch-wide budget spent across every
+/// candidate list a fetch consults, not a per-list cap (#1165), so
+/// `node_origin`'s ranker deliberately does not truncate. Do not reach for
+/// `top_n(candidates, MAX_PROVIDER_ATTEMPTS)` on that path.
 pub fn top_n(candidates: Vec<Candidate>, n: usize) -> Vec<RankedCandidate> {
     let mut ranked = rank_candidates(candidates);
     ranked.truncate(n);
@@ -552,6 +557,24 @@ mod tests {
         // bug produces a negative we must still not panic and must clamp.
         let s = compute_score(100, 10, -0.5);
         let at_floor = compute_score(100, 10, 0.1);
+        assert!((s - at_floor).abs() < 1e-9);
+    }
+
+    #[test]
+    fn score_nan_reputation_clamps_to_floor() {
+        // Defensive, and load-bearing on a subtle IEEE detail: `f32::max`
+        // implements `maxNum`, which *ignores* NaN and returns the other
+        // operand — so `NaN.max(0.1)` is `0.1` and no NaN can reach the
+        // score. That matters because a NaN score would sort last under
+        // `total_cmp` and then be swept into the preceding tie group by
+        // `tie_group_end` (`next > pivot` is false for NaN), letting a
+        // garbage candidate win a tie-break tier. Note `f32::clamp` does
+        // NOT have this property — it propagates NaN — so a future
+        // "cleanup" to `.clamp(REPUTATION_FLOOR, 1.0)` would silently
+        // reintroduce the hazard. This test is what catches that.
+        let s = compute_score(100, 10, f32::NAN);
+        let at_floor = compute_score(100, 10, 0.1);
+        assert!(s.is_finite(), "NaN reputation must not produce a NaN score");
         assert!((s - at_floor).abs() < 1e-9);
     }
 

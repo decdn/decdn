@@ -160,7 +160,7 @@ The window-paced handler (#856) introduces no wire-format change: its `StreamReq
 ## Acceptance Criteria
 
 1. A client whose probed holders all exceed `proxy_warming.rtt_threshold_ms`, and whose RTT map contains a bonded node beating the best holder by `proxy_warming.margin_ms`, routes its `StreamRequest` to that nearer non-holder; with no qualifying candidate it routes directly to the best holder.
-2. Proxy candidate ranking is invariant to peers' self-attested `region` values — selection depends only on measured RTT and the reputation floor.
+2. Proxy candidate ranking is invariant to peers' self-attested `region` values — selection depends only on measured RTT.
 3. A node filling a request for an unheld blob pulls ahead of cleared payment in a pipeline, pausing when `pulled − paid` for the request reaches `pull_ahead_bytes`; on client abandonment its unrecouped speculative spend is at most `pull_ahead_bytes`, and the upstream pull is not serialized to one round-trip per chunk.
 4. Speculative pull-through pauses when the global unrecouped-leech counter exceeds `max_unrecouped_leech_bytes` and resumes after the node recoups; it pauses for a peer that has exceeded its `share_ratio` (beyond the initial allowance of at most `pull_ahead_bytes`) while continuing to serve ranges already held.
 5. After a warming serve completes the blob, the node publishes a DHT STORE for `H`, and a subsequent regional FIND_VALUE returns the node as a holder.

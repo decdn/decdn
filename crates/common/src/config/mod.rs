@@ -2711,9 +2711,6 @@ pub fn resolve_security_into(
 /// layer (operator opt-out). Mixing `rate > 0` with `burst == 0` is
 /// rejected as a deny-all corner case — the resolver treats it the same
 /// way [`resolve_security_into`] handles the `per_source` pairing.
-///
-/// Trusted IPs are parsed once at resolution; malformed entries fail
-/// fast under the bag pattern.
 #[allow(clippy::cognitive_complexity)] // linear "default-or-file → validate" rows.
 pub fn resolve_dht_into(file: Option<&types::DhtConfig>, bag: &mut ConfigErrorBag) -> ResolvedDht {
     // ADR 022 nests the rate-limit knobs under `dht.rate_limit.*`.

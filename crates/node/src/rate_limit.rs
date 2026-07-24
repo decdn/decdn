@@ -101,9 +101,13 @@ impl Default for RateLimitConfig {
 // The resolved DHT/probe config (in `decdn-common`) and this engine config
 // hold the identical eight fields, but `common` can't depend on `node`, so the
 // engine config lives here. These `From` impls are the single mapping point
-// the runtime uses to build a limiter from resolved config — centralizing it
-// (rather than hand-copying eight fields at each call site) lets the compiler
-// catch a field transposition between the two parallel representations.
+// the runtime uses to build a limiter from resolved config, so a field added
+// on one side has exactly one place to be threaded through on the other.
+//
+// The compiler catches an added/dropped field (the literals are exhaustive,
+// no `..Default::default()`) but NOT a transposition: all eight fields are
+// `f64`/`u32`/`usize`, so swapping `per_peer_burst` with `per_ip_burst` still
+// compiles. Neither impl is covered by a test — see #1457.
 impl From<&decdn_common::config::ResolvedDht> for RateLimitConfig {
     fn from(r: &decdn_common::config::ResolvedDht) -> Self {
         Self {
