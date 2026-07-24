@@ -44,7 +44,7 @@ A unit is re-queued — and reassigned to a **different** source — when its so
 
 Re-dispatch is unit-scoped: only the failed unit is reassigned; verified units already stored are untouched. So a bad or vanished source never restarts the download. A source that accumulates failures is dropped from the set and MAY be backfilled from the remaining FIND_VALUE candidates.
 
-At most one source owns a unit at a time. Because every delivered byte is paid, the scheduler controls completion latency through source selection and deadline-based re-dispatch rather than speculative duplicate requests.
+At most one source owns a unit at a time. Because every delivered byte is paid, the scheduler bounds completion latency through source selection and deadline-based re-dispatch rather than speculative duplicate requests. Re-dispatch preempts a source that has stopped making verified progress; a source that keeps delivering, only slowly, holds its unit to completion.
 
 ### Payment and channels
 
@@ -61,6 +61,8 @@ Per-source outcomes feed the local reputation EWMA ([ADR 008](008-reputation.md#
 ### Scope boundary
 
 This ADR schedules across **full holders only**. Composing a blob from **partial holders** — nodes that each hold only some ranges — requires range-addressed discovery (advertising "I hold bytes `[a, b)` of `H`" on `cdn/dht/v1`), which remains deferred per [ADR 037 § DHT advertising stays whole-blob](037-regional-proxy-warming.md#dht-advertising-stays-whole-blob) and [ADR 038 § Scope boundary](038-bao-verified-range-streaming.md#scope-boundary). When that lands, partial holders become additional sources with no change to the scheduling, verification, or payment logic here — only the candidate-discovery step gains range awareness. An optional bounded-range request field (an end offset on `StreamRequest`) is likewise deferred: it is unnecessary for full holders serving from disk and becomes useful only for pull-through sources, which arrive with partial-holder support.
+
+Speculative duplicate requests are out of scope **by decision, not by sequencing**. Racing an outstanding unit against idle sources — BitTorrent's endgame mode — shortens the tail only by paying for the copies that lose the race. BitTorrent needs it because a leecher has no cost signal; here every byte is paid, so the tail belongs to source selection and re-dispatch. If measured tail latency on large blobs proves that insufficient, the option that returns is a **capped, opt-in hedge** — a small finite duplicate count per outstanding unit once the queue is drained — designed against real data rather than pre-committed here.
 
 ### Parameters
 
@@ -89,6 +91,7 @@ Concrete defaults are modeled before locking. The load-bearing commitments are t
 ### Negative
 
 - The client maintains a payment channel per admitted source, raising the number of open channels and the deposit spread for a single large fetch.
+- Tail latency is bounded against stalled and failing sources, not against merely slow ones: `unit_deadline_ms` triggers on absent verified progress, so a source delivering steadily below the set's rate keeps its unit and sets the finish time of the last unit it owns.
 - Coordination state (work queue, per-source in-flight tracking, re-dispatch) is new always-on client complexity that the single-source path does not carry.
 - Restricting sources to full holders leaves warmed partial copies unused until range-addressed discovery lands.
 
@@ -114,6 +117,6 @@ Concrete defaults are modeled before locking. The load-bearing commitments are t
 2. Each work unit is verified against the content-hash root on receipt; a unit failing verification is re-queued to a different source, and the failing source is penalized in reputation and recorded as slashing-evidence eligible.
 3. A source that stalls past `unit_deadline_ms`, drops, or returns `ok: false` has only its outstanding unit re-dispatched; verified units already stored are not refetched and the download does not restart.
 4. Each source is driven by an ordinary `cdn/client/v1` stream and paid over its own channel for verified delivered bytes only; no end-offset field is added to `StreamRequest`, and bounded ranges are enforced by ceasing vouchers at the unit boundary.
-5. Concurrency is bounded by `per_source_inflight` and `max_inflight_units`, and the admitted source set is bounded by `max_sources`.
+5. Concurrency is bounded by `per_source_inflight` and `max_inflight_units`, the admitted source set is bounded by `max_sources`, and no unit is outstanding at more than one source at a time.
 6. The reassembled blob verifies against the content hash and is byte-identical to a single-source fetch of the same hash.
 7. Partial-holder composition and range-addressed discovery are out of scope; the scheduler operates only over full holders returned by FIND_VALUE.
