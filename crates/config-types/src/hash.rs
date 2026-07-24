@@ -282,15 +282,6 @@ impl DeniedHashes {
     pub fn iter(&self) -> Iter<'_, Hash> {
         self.0.iter()
     }
-
-    /// Additions / removals between `prev` (older snapshot) and `self` (newer),
-    /// for the reload log line — same rationale as [`PinnedHashes::diff`].
-    #[must_use]
-    pub fn diff(&self, prev: &Self) -> PinDiff {
-        let added = self.0.iter().filter(|h| !prev.0.contains(*h)).count();
-        let removed = prev.0.iter().filter(|h| !self.0.contains(*h)).count();
-        PinDiff { added, removed }
-    }
 }
 
 impl<'a> IntoIterator for &'a DeniedHashes {

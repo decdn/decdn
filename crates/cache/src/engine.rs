@@ -2092,6 +2092,17 @@ impl CacheEngine {
     /// node with no probe traffic still releases stale holds.
     pub fn eviction_candidates(&self) -> EvictionCandidates {
         let pinned = self.inner.pinned.load();
+        // Hoisted once, like `pinned`: a deny-listed hash stays an eviction
+        // candidate even when pinned, so "deny wins over pin" holds on the space
+        // path too, not only the takedown `evict()` actuator — otherwise a pinned
+        // + governance-denied hash would sit on disk (unservable, since `refuses`
+        // blocks it) until the watcher's `evict()` happened to run. These are the
+        // lock-free deny halves of `refuses`; `is_evicted` is deliberately NOT
+        // consulted — it would take a second mutex under the `access_times` guard
+        // below for nothing, since `evict` removes the `access_times` entry, so an
+        // already-evicted hash is never in this map to begin with.
+        let denied = self.inner.denied.load();
+        let chain_denied = self.inner.chain_denied.load();
         let now = Instant::now();
         let held: HashSet<Hash> = {
             let mut g = self
@@ -2108,7 +2119,14 @@ impl CacheEngine {
         let map = guard
             .iter()
             .filter_map(|(h, t)| {
-                if pinned.contains(h) || held.contains(h) {
+                // `held` short-circuits BEFORE the deny carve-out, so a probe-held
+                // hash stays excluded even when denied: a probe-hold is transient
+                // (seconds, self-expiring) and the takedown `evict()` is the
+                // reclaim actuator for a denied hash regardless, so the space path
+                // need not race the hold. The carve-out targets the *pin* (the
+                // hold-forever case), which is the actual "worst combination".
+                let deny_listed = denied.contains(h) || chain_denied.contains(h);
+                if held.contains(h) || (pinned.contains(h) && !deny_listed) {
                     None
                 } else {
                     Some((*h, *t))
@@ -2173,10 +2191,16 @@ impl CacheEngine {
     /// but the caller is a background loop and the pinned set can change
     /// between candidate selection and this call.
     ///
+    /// The pin exemption is itself carved out for a **deny-listed** hash
+    /// ([`Self::refuses`]): "deny wins over pin" on every path, so a pinned +
+    /// governance/local-denied hash is still reclaimable here rather than being
+    /// held on disk (unservable) until the takedown `evict()` runs. This only
+    /// drops GC protection — the durable takedown record stays `evict`'s job.
+    ///
     /// Best-effort against the GC cadence: like `evict`, actual disk reclaim
     /// only happens when periodic GC is enabled (`cache.gc_interval_sec > 0`).
     pub async fn release_for_eviction(&self, hash: Hash) -> CacheResult<u64> {
-        if self.is_pinned(hash) {
+        if self.is_pinned(hash) && !self.refuses(hash) {
             return Ok(0);
         }
         // Drop the protecting tag(s) FIRST, and only forget the access-time
@@ -3800,6 +3824,50 @@ mod tests {
         Ok(())
     }
 
+    /// The pin exemption is carved out for a deny-listed hash: "deny wins over
+    /// pin" on the space path too, so a pinned + governance-denied hash is
+    /// reclaimable here rather than held on disk (unservable) until the takedown
+    /// `evict()` runs.
+    #[tokio::test]
+    async fn release_for_eviction_reclaims_a_deny_listed_pinned_hash() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let payload = b"pinned then denied";
+        let hash = Hash::new(payload);
+        let engine = CacheEngine::open(
+            tmp.path(),
+            vec![Arc::new(StubOrigin::new(payload)) as Arc<dyn Origin>],
+            10,
+        )
+        .await?;
+        let _ = engine.get(hash).await?;
+        engine.set_pinned(&PinnedHashes::new(
+            [from_store_hash(hash)].into_iter().collect(),
+        ));
+
+        // Pinned + clean: still exempt from space reclaim.
+        anyhow::ensure!(
+            engine.release_for_eviction(hash).await? == 0,
+            "a pinned clean hash stays exempt"
+        );
+        anyhow::ensure!(
+            engine.last_accessed(hash).is_some(),
+            "the clean exemption must keep the access-time entry"
+        );
+
+        // Governance denies it → the pin no longer exempts it.
+        anyhow::ensure!(
+            engine.set_chain_denied_one(hash, true),
+            "deny must change the set"
+        );
+        engine.release_for_eviction(hash).await?;
+        anyhow::ensure!(
+            engine.last_accessed(hash).is_none(),
+            "a pinned + governance-denied hash must go through the reclaim path (which \
+             forgets the access-time entry), not the pin early-return"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn get_cache_hit_records_access_time() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
@@ -4564,6 +4632,76 @@ mod tests {
         );
         anyhow::ensure!(engine.is_pinned(pinned_hash));
         anyhow::ensure!(!engine.is_pinned(evictable_hash));
+        Ok(())
+    }
+
+    /// A pinned hash that is ALSO governance-denied stays an eviction candidate —
+    /// "deny wins over pin" on the LRU path, not only the takedown `evict()`. A
+    /// pinned clean hash is still excluded. The pin flag itself is unchanged.
+    #[tokio::test]
+    async fn deny_listed_pinned_hash_is_an_eviction_candidate() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let clean_hash = Hash::new(b"pinned clean blob");
+        let denied_hash = Hash::new(b"pinned denied blob");
+
+        let pinned_set = [from_store_hash(clean_hash), from_store_hash(denied_hash)]
+            .into_iter()
+            .collect();
+        let engine = CacheEngine::open_with_pinned(
+            tmp.path(),
+            Vec::new(),
+            10,
+            PinnedHashes::new(pinned_set),
+        )
+        .await?;
+        if let Ok(mut g) = engine.inner.access_times.lock() {
+            g.insert(clean_hash, Instant::now());
+            g.insert(denied_hash, Instant::now());
+        }
+
+        anyhow::ensure!(
+            engine.set_chain_denied_one(denied_hash, true),
+            "deny must change the set"
+        );
+
+        let candidates = engine.eviction_candidates();
+        anyhow::ensure!(
+            candidates.contains_key(&denied_hash),
+            "a pinned + governance-denied hash must remain an eviction candidate"
+        );
+        anyhow::ensure!(
+            !candidates.contains_key(&clean_hash),
+            "a pinned clean hash must still be excluded"
+        );
+        anyhow::ensure!(
+            engine.is_pinned(denied_hash) && engine.is_pinned(clean_hash),
+            "the pin flag itself is unchanged — only the eviction carve-out differs"
+        );
+        Ok(())
+    }
+
+    /// The carve-out fires for the LOCAL (`content.denied_hashes` → `set_denied`)
+    /// deny half too, not only the on-chain half — the `is_denied` side of the
+    /// `is_denied || is_chain_denied` disjunction in `eviction_candidates`.
+    #[tokio::test]
+    async fn local_denied_pinned_hash_is_also_an_eviction_candidate() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let hash = Hash::new(b"pinned + locally denied");
+        let engine = CacheEngine::open_with_pinned(
+            tmp.path(),
+            Vec::new(),
+            10,
+            PinnedHashes::new([from_store_hash(hash)].into_iter().collect()),
+        )
+        .await?;
+        if let Ok(mut g) = engine.inner.access_times.lock() {
+            g.insert(hash, Instant::now());
+        }
+        engine.set_denied(&denied(&[hash]));
+        anyhow::ensure!(
+            engine.eviction_candidates().contains_key(&hash),
+            "a pinned + locally-denied hash must also be an eviction candidate"
+        );
         Ok(())
     }
 

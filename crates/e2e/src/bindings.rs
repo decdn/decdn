@@ -199,6 +199,26 @@ alloy::sol! {
         ) external;
     }
 
+    /// `ContentBlacklist` origin/operator blacklist writes (ADR 011 § Hash
+    /// Evasion and Origin Blacklisting), absent from the re-exported production
+    /// binding — the watcher only READS the `OriginBlacklistUpdated` /
+    /// `OperatorBlacklisted` events these emit. Bound at the `ContentBlacklist`
+    /// address. `setOriginBlacklist` / `addOperator` are `GOVERNANCE_ROLE`
+    /// (driven under Timelock impersonation, like `addHashGlobal`).
+    ///
+    /// Declaring these here is also the ABI-drift guard for the hand-written
+    /// origin declarations the node watcher decodes (#1398): the origin-blacklist
+    /// journey is the only test that exercises the on-chain write → event →
+    /// watcher path end to end, so a signature drift surfaces here rather than
+    /// silently mis-decoding in production.
+    #[sol(rpc)]
+    contract ContentBlacklistOrigin {
+        function setOriginBlacklist(address origin, bool blacklisted) external;
+        function addOperator(address operator) external;
+        function removeOperator(address operator) external;
+        function isOriginBlacklisted(address origin) external view returns (bool);
+    }
+
     /// OpenZeppelin `AccessControl` surface, bound at a governed contract's
     /// address so the fixture can grant `REGIONAL_BODY_ROLE` (impersonating the
     /// role admin) for the regional-blacklist journey.
