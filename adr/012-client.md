@@ -169,34 +169,31 @@ All client state resides under `~/.decdn/`, with the per-client data dir (`--dat
 
 Default configuration:
 
-```toml
-[network]
-rpc_url = "https://<arb-sepolia-rpc-endpoint>"
-region = ""                                  # optional ISO 3166-1 alpha-2
+The canonical, always-current client config lives at
+[`examples/configs/arbitrum-sepolia-client.toml`](../examples/configs/arbitrum-sepolia-client.toml) —
+CI-validated against the live schema (`decdn_common::config::FileConfig`), so it cannot drift from
+the implementation the way an inline copy here would. Per the workspace single-source-of-truth rule
+this ADR points at that file rather than restating the schema (and risking the two disagreeing). The
+client-relevant shape, in current schema terms:
 
-[bootstrap]
-# NOT YET IMPLEMENTED, unlike the removed peer_cache_path: step 8's periodic
-# refresh has no code behind it either, but it is still the intended design —
-# `decdn fetch` is one-shot today and re-reads the registry per invocation. This
-# key stays as the spec for that work rather than describing a knob the code
-# deliberately replaced.
-registry_refresh_secs = 600                  # 10 minutes
+- `[identity]` — `data_dir` (holds the buyer payment-channel store and, by default, the ETH
+  keystore) and an optional ISO 3166-1 alpha-2 `region`.
+- `[blockchain]` — `rpc_url`, `eth_keystore`, `chain_id`, plus the `payment_channel_address` /
+  `slash_judge_address` (and `capacity_bond_address` for auto-discovery) a client needs to pay for
+  and verify delivery. The RPC URL and keystore live here, **not** under `[network]`/`[keys]`.
 
-[keys]
-# Paths use ~ as shorthand; the client MUST perform home-directory expansion.
-iroh_key_path = "~/.decdn/iroh_key"
-eth_keystore_path = "~/.decdn/client/keystore.json"
+A client does not configure the voucher cadence: it sends no `voucher_interval_mb` and follows the
+cadence the seller advertises on `cdn/client/v1`
+([ADR 003 § Voucher Interval Negotiation](003-payments.md#voucher-interval-negotiation)), which is
+why the cited example carries no `[payment]` section.
 
-[cache]
-# The peer cache has no key of its own: it is always `peers.json` inside the
-# resolved client data dir (see the tree above), so it moves with --data-dir /
-# [identity] data_dir.
-probe_cache_max_entries = 1024               # per ADR 001
-probe_cache_ttl_secs = 15                    # per ADR 001
+The Ed25519 node key and the `peers.json` cache have no config keys of their own: both live inside
+the resolved data dir (see the tree above), so they move with `--data-dir` / `[identity] data_dir`.
 
-[payment]
-voucher_interval_mb = 1                      # per ADR 003
-```
+**Registry refresh (not yet implemented).** The bootstrap step-8 periodic registry refresh has no
+code behind it: `decdn fetch` is one-shot today and re-reads the registry per invocation. When
+implemented it will be a client knob (a `registry_refresh_secs`-style ~10-minute cadence); it is
+recorded here as intended design, not a live config key.
 
 ## Consequences
 
