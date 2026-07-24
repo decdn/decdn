@@ -39,8 +39,8 @@ interface IContentBlacklist {
     // Regional governance path — REGIONAL_BODY_ROLE, callable only by a
     // registered regional body. Both revert on the global sentinel, so a
     // regional body can never reach a global entry.
-    function addHashRegional(string calldata region, bytes32 blake3Hash, string calldata reason) external;
-    function removeHashRegional(string calldata region, bytes32 blake3Hash) external;
+    function addHashRegional(bytes32 region, bytes32 blake3Hash, string calldata reason) external;
+    function removeHashRegional(bytes32 region, bytes32 blake3Hash) external;
 
     // Operator blacklisting — global governance only
     function addOperator(address operator) external;
@@ -68,7 +68,7 @@ interface IContentBlacklist {
 
     // Emergency entries expire after their category-specific deadline unless ratified by governance.
     // Expiry is derived from the entry's addedAt timestamp: addedAt + expiryForCategory(category).
-    // isBlacklisted returns false after this deadline unless a governance addHashGlobal
+    // isHashBlacklisted* views return false after this deadline unless a governance addHashGlobal
     // has been called for the same hash — re-adding under governance clears the
     // `emergency` flag, which is what makes the entry permanent.
     //
@@ -108,7 +108,7 @@ interface IContentBlacklist {
     // on the appeal and fixed for its lifetime. Bond pulled via TOKEN.transferFrom.
     function openBlacklistAppeal(
         bytes32 blake3Hash,
-        string  calldata region,
+        bytes32 region,
         bytes32 evidenceBundleHash,
         uint8   standingPath,
         uint256 namespaceId    // Publisher path: the asserted namespace; ignored on other paths
@@ -132,11 +132,18 @@ interface IContentBlacklist {
     // entered interim-relief). Mirrors OriginAssignment.pruneBlacklistedAssignment.
     function cleanupExpiredAppeal(uint256 appealId) external;
 
-    // Views
-    function isBlacklisted(bytes32 blake3Hash) external view returns (bool);
-    function isBlacklistedInRegion(bytes32 blake3Hash, string calldata region) external view returns (bool);
+    // Views. The three hash views answer progressively wider scopes:
+    // global only, global ∪ one named region, and the full per-operator
+    // predicate of § Regional Scope (global ∪ current region ∪ previous region
+    // while the change is unripened), which reads the operator's region fields
+    // from CapacityBond. The per-operator view is the serve-time counterpart of
+    // the slash-eligibility gate in ADR 014 § Blacklist violation — same three
+    // legs, evaluated at block.timestamp rather than at a served response.
+    function isHashBlacklisted(bytes32 blake3Hash) external view returns (bool);
+    function isHashBlacklistedInRegion(bytes32 blake3Hash, bytes32 region) external view returns (bool);
+    function isHashBlacklistedForOperator(bytes32 blake3Hash, address operator) external view returns (bool);
     function isOriginBlacklisted(address operatorAddress) external view returns (bool);
-    function getEntry(bytes32 blake3Hash) external view returns (BlacklistEntry memory);
+    function getHashEntry(bytes32 region, bytes32 blake3Hash) external view returns (BlacklistEntry memory);
     function getBlacklistVersion() external view returns (uint256);
 
     // Events. `version` is the getBlacklistVersion() value AFTER the change, so a
@@ -151,7 +158,10 @@ interface IContentBlacklist {
     // mechanism: it carries no version and is enforced via OriginAssignment
     // cross-reference (§ Permissionless property), not the hash version poll.
     event OriginBlacklistUpdated(address indexed operatorAddress, bool blacklisted);
-    event BlacklistAppealOpened(uint256 indexed appealId, bytes32 indexed blake3Hash, string region, address indexed filer, bytes32 evidenceBundleHash, uint8 standingPath);
+    // `region` takes the third topic slot rather than `filer`: reconciling an
+    // appeal against its parent entry needs the (hash, region) pair, and a
+    // bytes32 region is a topic-native value. Filer is recovered from the data.
+    event BlacklistAppealOpened(uint256 indexed appealId, bytes32 indexed blake3Hash, bytes32 indexed region, address filer, bytes32 evidenceBundleHash, uint8 standingPath);
     event BlacklistAppealFastTracked(uint256 indexed appealId);
     event BlacklistAppealUnFastTracked(uint256 indexed appealId);
     event BlacklistAppealRejected(uint256 indexed appealId);
@@ -169,13 +179,13 @@ struct BlacklistEntry {
                               // to the window must not move the slash boundary
                               // under deliveries already served, and the original
                               // value must survive an appeal suspension.
-    string  region;           // ISO 3166-1 alpha-2, or "" for global
+    bytes32 region;           // packed region key; bytes32("GLOBAL") for global
     string  reason;           // free-form, e.g. "DMCA-2026-001", "CSAM", "DSA-DE-001"
     bool    emergency;        // true if added via emergency multisig path
     uint8   category;         // Category; determines the emergency auto-expiry term.
                               // Meaningless when emergency == false.
     bool    suspended;        // true while a regional appeal is in interim-relief
-                              // or pending ratification; isBlacklisted views return
+                              // or pending ratification; the isHashBlacklisted* views return
                               // false during this window. See § Blacklist Entry Appeals.
     uint256 suspendedAtUs;    // microsecond timestamp (block.timestamp * 1_000_000) at which
                               // suspended last flipped to true. Stored in microseconds to align
@@ -184,13 +194,19 @@ struct BlacklistEntry {
 }
 ```
 
-> **Region representation.** The `region` field is **stored as `bytes2`** — ISO 3166-1 alpha-2 codes are always exactly 2 ASCII characters, with `bytes2(0)` as the global sentinel. The `string` form shown in the interface signatures, events, and the `BlacklistEntry` struct above is the external-boundary representation only; it is canonicalized to `bytes2` for storage (a `_toBytes2(string)` helper reverts on length ≠ 2 or non-ASCII-alpha input). The `BlacklistEntry` layout is the struct above; the gas-packed appeal-record storage layout is pinned in [ADR 031 § Storage layout](031-content-blacklist-appeals-contract.md#storage-layout).
+> **Region representation.** `region` is **`bytes32` at every layer** — the external signatures, the events, the mapping keys, and the `BlacklistEntry` struct above. There is no `string` boundary form and no canonicalization step: callers pass the packed key directly, so the value written by a regional body is byte-identical to the one a scope check reads back.
+>
+> A region key is the region string packed left-aligned and zero-padded into `bytes32`, matching Solidity's own `bytes32("literal")` packing. Two sentinels are reserved: `bytes32("GLOBAL")` marks a global entry, and `bytes32(0)` is *unset* — never a valid region. `addHashRegional`, `removeHashRegional`, and `registerRegionalBody` all reject both sentinels, so a regional body can neither reach a global entry nor write against an unset key; `openBlacklistAppeal` rejects only `bytes32(0)`, because global entries are filable by naming `GLOBAL_REGION` explicitly (see [§ Scope](#scope)).
+>
+> `bytes32` rather than a narrower `bytes2` — one word is the smallest representation that holds every region a node can declare. A node's region is a self-attested string of up to 16 bytes ([ADR 030 § Region-stability window](030-node-region-self-attestation.md#region-stability-window)), not necessarily an ISO 3166-1 alpha-2 code, and scope matching compares a blacklist entry's key against that declared value ([ADR 014 § Blacklist violation](014-on-chain-verification.md#blacklist-violation)). A two-byte key could not represent most of that space, so narrowing it would silently put regions out of reach of takedown coverage. A `bytes32` key is also topic-native, which is what lets `HashBlacklisted` / `HashRemoved` / `BlacklistAppealOpened` index `region` directly.
+>
+> The `BlacklistEntry` layout is the struct above; the gas-packed appeal-record storage layout is pinned in [ADR 031 § Storage layout](031-content-blacklist-appeals-contract.md#storage-layout).
 
 ### Blacklist version
 
 `getBlacklistVersion()` returns a monotonically increasing counter incremented on every change to the enforced hash set, across all paths: every hash add, every hash removal, every appeal-driven suspend/resume, and every `expireEmergencyEntry`.
 
-Emergency auto-expiry is the one set change that is not caused by a transaction, so it is the one that could break the counter's contract: the entry simply stops being enforceable when its deadline passes, with no write and no log. Views honour that deadline immediately — an expired entry is unenforceable whether or not anyone cleans it up — but a node that only fetches deltas when the counter advances would keep enforcing it forever. `expireEmergencyEntry` (and `expireEmergencyOrigin` on the origin side) closes the gap: permissionless, callable by anyone once the deadline passes, and it deletes the entry through the ordinary removal path so the counter advances and a `HashRemoved` lands in the log like any other removal. Suspension belongs in the counter because it flips what `isBlacklisted` reports — [§ Compliance Window](#compliance-window) and [§ Authority and flow](#authority-and-flow) both have operators detect appeal resumption off this poll cycle, which only holds if the toggle advances the version. A terminal appeal path acting on an entry that governance already removed mid-appeal ([§ Global Override](#global-override)) does **not** bump: nothing enforceable changed, and a spurious advance costs every node a wasted delta fetch. Nodes cache the last-seen version and only re-fetch deltas when the version advances, minimising RPC load.
+Emergency auto-expiry is the one set change that is not caused by a transaction, so it is the one that could break the counter's contract: the entry simply stops being enforceable when its deadline passes, with no write and no log. Views honour that deadline immediately — an expired entry is unenforceable whether or not anyone cleans it up — but a node that only fetches deltas when the counter advances would keep enforcing it forever. `expireEmergencyEntry` (and `expireEmergencyOrigin` on the origin side) closes the gap: permissionless, callable by anyone once the deadline passes, and it deletes the entry through the ordinary removal path so the counter advances and a `HashRemoved` lands in the log like any other removal. Suspension belongs in the counter because it flips what the `isHashBlacklisted*` views report — [§ Compliance Window](#compliance-window) and [§ Authority and flow](#authority-and-flow) both have operators detect appeal resumption off this poll cycle, which only holds if the toggle advances the version. A terminal appeal path acting on an entry that governance already removed mid-appeal ([§ Global Override](#global-override)) does **not** bump: nothing enforceable changed, and a spurious advance costs every node a wasted delta fetch. Nodes cache the last-seen version and only re-fetch deltas when the version advances, minimising RPC load.
 
 ### Reason field
 
@@ -198,7 +214,7 @@ Free-form string, stored on-chain for auditability. Operators can reference lega
 
 ### `region` field
 
-Empty string means the entry applies globally. An ISO 3166-1 alpha-2 code scopes the entry to nodes that declare that region. A node is in scope if its declared region matches the entry's region or the entry is global.
+`bytes32("GLOBAL")` means the entry applies to every node. Any other key scopes the entry to nodes that declare that region — an ISO 3166-1 alpha-2 code in the ordinary case, though the declared region is a self-attested string of up to 16 bytes and the key holds whatever the operator declared. A node is in scope if the entry is global, if its declared region matches the entry's region, or — while a region change has not yet ripened — if its previous region matches (see [§ Regional Scope](#regional-scope)).
 
 ## Regional Governance Bodies
 
@@ -281,7 +297,7 @@ sequenceDiagram
     alt multisig acts within window
         EM->>CB: fastTrackAppeal(appealId) or rejectAppeal(appealId)
         alt fast-tracked
-            CB->>CB: entry.suspended = true (isBlacklisted views return false)
+            CB->>CB: entry.suspended = true (hash views return false)
             Note over CB: BLACKLIST_RATIFICATION_WINDOW = 14d
             alt DecdnGovernor ratifies
                 Gov->>CB: ratifyAppealRemoval(appealId)
@@ -301,7 +317,7 @@ sequenceDiagram
     end
 ```
 
-The original `effectiveAt` is preserved across suspension. Resetting it to `block.timestamp + complianceWindow` on resumption was rejected because it would shield operators who never evicted: a dishonest operator already past the original compliance window when suspension began would get a fresh window on resumption, retroactively immunizing pre-suspension delivery. Evidence-age semantics handle the honest-operator case instead: the `MAX_EVIDENCE_AGE_US` clock from [ADR 014 § Evidence Staleness](014-on-chain-verification.md#evidence-staleness) is computed relative to `entry.suspendedAtUs` rather than the current block while a post-resumption challenge replays, so suspension neither retroactively immunizes pre-suspension evidence nor requires challengers to re-witness. Honest operators who continued serving during suspension (relying on `isBlacklisted == false`) are protected directly: deliveries timestamped inside the suspension window are inadmissible as slash evidence, because the views correctly returned `false` at delivery time. Operators detect resumption via the standard `getBlacklistVersion()` polling cycle (default 10 minutes — see [§ Polling](#polling)).
+The original `effectiveAt` is preserved across suspension. Resetting it to `block.timestamp + complianceWindow` on resumption was rejected because it would shield operators who never evicted: a dishonest operator already past the original compliance window when suspension began would get a fresh window on resumption, retroactively immunizing pre-suspension delivery. Evidence-age semantics handle the honest-operator case instead: the `MAX_EVIDENCE_AGE_US` clock from [ADR 014 § Evidence Staleness](014-on-chain-verification.md#evidence-staleness) is computed relative to `entry.suspendedAtUs` rather than the current block while a post-resumption challenge replays, so suspension neither retroactively immunizes pre-suspension evidence nor requires challengers to re-witness. Honest operators who continued serving during suspension (relying on the hash views returning `false`) are protected directly: deliveries timestamped inside the suspension window are inadmissible as slash evidence, because the views correctly returned `false` at delivery time. Operators detect resumption via the standard `getBlacklistVersion()` polling cycle (default 10 minutes — see [§ Polling](#polling)).
 
 ### Bond and frequency caps
 
@@ -344,7 +360,7 @@ The sworn declaration is an EIP-712-signed statement (secp256k1, signed by the f
 
 While `entry.suspended == true`:
 
-- `isBlacklisted(hash)` and `isBlacklistedInRegion(hash, region)` return `false`. This short-circuits `SlashJudge` per [ADR 014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence): a blacklist-offense challenge submitted during interim-relief reverts with `BlacklistEntrySuspended`, distinct from `HashNotBlacklisted`, so challengers can distinguish a never-blacklisted hash from a temporarily suspended one.
+- All three hash views return `false`. This short-circuits `SlashJudge`: suspension is folded into the entry-liveness predicate ([ADR 014 § Blacklist violation](014-on-chain-verification.md#blacklist-violation) item 6), so a blacklist-offense challenge submitted during interim-relief reverts with `HashNotBlacklisted` — the same error a never-blacklisted hash produces. The revert does not distinguish the two cases; a challenger who needs the distinction reads the entry's `suspended` flag directly via `getHashEntry(region, hash)`, or follows the `HashSuspensionUpdated` log.
 - New slash challenges for the disputed hash cannot be opened.
 - Pre-suspension evidence is preserved across resumption. `BlacklistEntry.suspendedAtUs` records the microsecond timestamp (`block.timestamp * 1_000_000`) at which fast-track flipped `suspended = true`. On reversal or lapse, `SlashJudge` admits challenges whose `evidence.timestamp_us` falls in the half-open window `[(entry.addedAt + complianceWindow) * 1_000_000, entry.suspendedAtUs)` for `MAX_EVIDENCE_AGE_US` after resumption — the evidence-age clock is computed as `entry.suspendedAtUs - evidence.timestamp_us`, not `nowUs - evidence.timestamp_us`, so a multi-week appeal lifecycle does not retroactively immunize pre-suspension delivery whose evidence would otherwise age past [ADR 014 § Evidence Staleness](014-on-chain-verification.md#evidence-staleness)'s 5-day default. Evidence with `timestamp_us ≥ entry.suspendedAtUs` and predating the resumption block is **not** admissible — the views returned `false` at that delivery time, and operators relying on the suspended view must be protected. All comparisons use the microsecond unit established in [ADR 014 § Evidence Staleness](014-on-chain-verification.md#evidence-staleness) (`nowUs = block.timestamp * 1_000_000`).
 - Already-resolved slashes against operators for the disputed hash are **not** auto-reversed. Operators in that position seek individual restitution via [ADR 028](028-slashing-appeals.md#adr-028-slashing-appeals-and-dispute-escalation) using the `slashId` of their original slash. The heightened-scrutiny guidance from [ADR 028 § Scope](028-slashing-appeals.md#scope) for blacklist appeals is somewhat relaxed when the underlying entry has been removed via the path here, since the operational-failure rationale is no longer the only viable defense.
@@ -384,7 +400,7 @@ Both windows are governable parameters sharing one set of hardcoded bounds: mini
 
 `effectiveAt` is stamped onto the entry at add time from the window then in force. Changing a window therefore affects only subsequent adds; it can neither retroactively expose already-served deliveries to a slash nor retroactively immunize them. `SlashJudge` anchors its slash-eligibility comparison to `effectiveAt`, not `addedAt`.
 
-Entries with `suspended == true` (see [§ Blacklist Entry Appeals](#blacklist-entry-appeals)) accrue no compliance obligation while suspended: `isBlacklisted` and `isBlacklistedInRegion` return `false` and slashes for the suspended hash cannot be opened. On reversal or lapse the original `effectiveAt` is preserved — operators detect resumption via the next `getBlacklistVersion()` poll cycle (default 10 minutes; see [§ Polling](#polling)) and must evict before serving any new request. Honest operators who served during the suspension window are protected at the evidence layer, not via a compliance-window extension — see [§ Interaction with active slashes](#interaction-with-active-slashes).
+Entries with `suspended == true` (see [§ Blacklist Entry Appeals](#blacklist-entry-appeals)) accrue no compliance obligation while suspended: the hash views return `false` and slashes for the suspended hash cannot be opened. On reversal or lapse the original `effectiveAt` is preserved — operators detect resumption via the next `getBlacklistVersion()` poll cycle (default 10 minutes; see [§ Polling](#polling)) and must evict before serving any new request. Honest operators who served during the suspension window are protected at the evidence layer, not via a compliance-window extension — see [§ Interaction with active slashes](#interaction-with-active-slashes).
 
 ### One-hour removal orders
 
@@ -562,11 +578,11 @@ If a node has been offline or missed multiple version bumps, delta fetching may 
 
 1. If the gap between `last_seen_version` and `current_version` is ≤ 100 versions: fetch deltas normally via contract events.
 2. If the gap exceeds 100 versions (or the delta fetch fails): perform a full re-sync by calling `getBlacklistVersion()` and iterating all events from the contract's deployment block. This is expensive but correct.
-3. As a fallback, if the full event log is unavailable (RPC provider pruned old events): the node fetches the current blacklist state by calling `isBlacklisted` for all hashes in its local cache. This is O(cache_size) RPC calls but ensures no stale content is served.
+3. As a fallback, if the full event log is unavailable (RPC provider pruned old events): the node fetches the current blacklist state by calling `isHashBlacklistedForOperator(hash, ownOperatorAddress)` for all hashes in its local cache. This is O(cache_size) RPC calls but ensures no stale content is served. The per-operator view is the right one here — it resolves the node's full scope (global, current region, and an unripened previous region) in a single call, where `isHashBlacklisted` would see only global entries.
 
 The node MUST NOT accept connections until its blacklist is synced to the current version.
 
-**Pre-cache check:** Before caching any newly-fetched blob (whether from origin pull-through or peer pull), the node MUST check `isBlacklisted(hash)` and reject the blob if blacklisted. This enables proactive blacklisting of known-bad hashes before any node caches them.
+**Pre-cache check:** Before caching any newly-fetched blob (whether from origin pull-through or peer pull), the node MUST check `isHashBlacklistedForOperator(hash, ownOperatorAddress)` and reject the blob if blacklisted. This enables proactive blacklisting of known-bad hashes before any node caches them, and resolves the node's own regional scope rather than global entries alone.
 
 On startup, nodes always fetch the full current blacklist (global + their region) before accepting connections.
 
@@ -652,7 +668,7 @@ A slash requires an active challenger submitting evidence of a post-window deliv
 
 ### Interaction with appeals
 
-Slash challenges cannot be opened against operators while the disputed entry is in interim-relief (see [§ Blacklist Entry Appeals](#blacklist-entry-appeals)) — `SlashJudge` reads `isBlacklisted == false` from `ContentBlacklist` during the suspension window and rejects the challenge on that basis. Operators slashed under an entry that is *later* removed via the appeals path are not auto-restituted; the separate-filing rule and its rationale are stated in [§ Interaction with active slashes](#interaction-with-active-slashes).
+Slash challenges cannot be opened against operators while the disputed entry is in interim-relief (see [§ Blacklist Entry Appeals](#blacklist-entry-appeals)) — `SlashJudge` sees a suspended entry as not live during the suspension window and rejects the challenge on that basis. Operators slashed under an entry that is *later* removed via the appeals path are not auto-restituted; the separate-filing rule and its rationale are stated in [§ Interaction with active slashes](#interaction-with-active-slashes).
 
 ## Consequences
 
