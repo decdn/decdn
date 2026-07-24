@@ -165,7 +165,7 @@ Modeled abuse paths and counters:
 ### Positive
 
 - Closes the issue-403 gap with a bounded, documented mechanism — no ad-hoc multisig discretion for legitimate-outage cases.
-- Reuses existing primitives: `CapacityBond` escrow, emergency multisig, DecdnGovernor, [ADR 014 § Bond Handling](014-on-chain-verification.md#bond-handling) bond economics, [ADR 011](011-content-takedown.md#regional-governance-bodies) ratification pattern. No new governance body; one small new contract (`SlashAppeal`).
+- Reuses existing primitives: `CapacityBond` escrow, emergency multisig, DecdnGovernor, [ADR 011](011-content-takedown.md#regional-governance-bodies) ratification pattern. No new governance body; one small new contract (`SlashAppeal`). The appeal bond is deliberately *not* modeled on [ADR 014 § Bond Handling](014-on-chain-verification.md#bond-handling): a challenger bond there is returned whenever verification passes and is never forfeited after the fact, whereas an appeal bond is burned in full on every slash-standing terminal path.
 - Every failed appeal bond has one deterministic disposition: 100% burn. No counter-evidence identity, claim path, disbursement path, or incentive-pool fund sink is required.
 - Operator relief is bounded and predictable: the multisig fast-track decision lands within `APPEAL_REVIEW_WINDOW` (14 days) and the operator's escrowed TOKEN is refunded on `grantAppeal` within at most another 14 days (`APPEAL_RATIFICATION_WINDOW`), vs. the ~9-day minimum + indefinite proposal-drafting latency of a Governor-only path.
 - Operator trust improves — onboarding pitches can point to a documented appeal path rather than "trust the multisig."

@@ -80,8 +80,8 @@ import { IPublisherRegistryStanding } from "../src/interfaces/IPublisherRegistry
 ///                                          deployer-only
 ///                                          `OriginAssignment.setContentBlacklist`
 ///                                          setter that MUST run before the
-///                                          GOVERNANCE_ROLE handoff because they
-///                                          become Timelock-gated post-handoff.
+///                                          GOVERNANCE_ROLE handoff because it
+///                                          becomes Timelock-gated post-handoff.
 ///           5. `_handOffGovernance`      — grant-before-revoke loop over every
 ///                                          target for both GOVERNANCE_ROLE and
 ///                                          DEFAULT_ADMIN_ROLE, then renounce the
@@ -382,8 +382,9 @@ abstract contract BaseProtocolDeploy is Script {
         // Fail-fast on the five fields whose absence either reverts a
         // constructor with an opaque error (`usdc`, `ed25519Verifier`,
         // `initialTokenHolder`) or silently no-ops a role grant downstream
-        // (`emergencyMultisig` skips SlashAppeal's constructor grant and
-        // ContentBlacklist would grant EMERGENCY_MULTISIG_ROLE to `address(0)`).
+        // (`emergencyMultisig` skips SlashAppeal's constructor grant; on
+        // ContentBlacklist it would grant EMERGENCY_MULTISIG_ROLE to
+        // `address(0)`).
         // The treasury is not validated here: it is `address(timelock)`, always
         // non-zero.
         if (address(cfg.usdc) == address(0)) revert ZeroAddress("usdc");

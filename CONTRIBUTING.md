@@ -251,9 +251,11 @@ USDC=$(forge create test/mocks/MintableUSDC.sol:MintableUSDC \
 
 # 3. Deploy the protocol. The three addresses are required; for local testing any
 #    EOA works. EMERGENCY_MULTISIG is account #1; INITIAL_TOKEN_HOLDER is the
-#    deployer (account #0, the `--sender`)
-#    so it holds the genesis TOKEN and can later fund the faucet. The deployer
-#    must NOT be forge's default sender, so always pass `--sender` explicitly.
+#    deployer (account #0, the `--sender`) so it holds the genesis TOKEN and can
+#    later fund the faucet. The deployer must NOT be forge's default sender, so
+#    always pass `--sender` explicitly. CURRENT_TERMS_HASH is any non-zero
+#    bytes32 for local testing — CapacityBond rejects the zero sentinel, so an
+#    accidental terms-disabled deployment is forbidden.
 USDC_ADDRESS=$USDC \
 EMERGENCY_MULTISIG=0x70997970C51812dc3A010C7d01b50e0d17dc79C8 \
 INITIAL_TOKEN_HOLDER=0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 \

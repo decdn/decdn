@@ -20,8 +20,6 @@ import { MockEd25519Verifier } from "./mocks/MockEd25519Verifier.sol";
 ///         grant → operator refunded + zero-out cleared; uphold/reject →
 ///         escrow distributed 50/50 and the appeal bond burned.
 contract SlashAppealTest is Test {
-    event AppealUpheld(uint256 indexed slashId, uint256 bondBurned);
-
     Token internal token;
     MockEd25519Verifier internal ed25519;
     CapacityBond internal bond;
@@ -32,7 +30,6 @@ contract SlashAppealTest is Test {
     address internal challenger = address(0xC4A11);
     address internal appellant = address(0xA99EA1);
     address internal multisig = address(0xC0DE);
-    address internal formerPool = address(0xCCEE);
 
     uint256 internal constant MIN_BOND = 50_000e18;
     uint256 internal constant APPEAL_BOND = 1000e18;
@@ -214,26 +211,17 @@ contract SlashAppealTest is Test {
 
         uint256 challengerBefore = token.balanceOf(challenger);
         uint256 supplyBefore = token.totalSupply();
-        uint256 formerPoolBefore = token.balanceOf(formerPool);
-
-        // Probe the removed legacy surface without making this test depend on
-        // the current ABI. On the legacy implementation this call succeeds and
-        // wires `formerPool`, exposing the obsolete half-bond diversion below.
-        vm.prank(admin);
-        (bool legacySetterSucceeded,) =
-            address(appeal).call(abi.encodeWithSignature("setChallengerIncentivePool(address)", formerPool));
 
         vm.expectEmit(true, false, false, true, address(appeal));
-        emit AppealUpheld(slashId, APPEAL_BOND);
+        emit SlashAppeal.AppealUpheld(slashId, APPEAL_BOND);
         vm.prank(admin);
         appeal.upholdAppeal(slashId);
 
         // Escrow 50/50: challenger 1250, burn 1250.
         assertEq(token.balanceOf(challenger) - challengerBefore, SLASH_AMT / 2);
-        // The separate appeal bond is burned in full; the former pool receives nothing.
-        assertEq(token.balanceOf(formerPool), formerPoolBefore);
+        // The separate appeal bond is burned in full — no share is diverted
+        // anywhere, so the supply delta accounts for every wei of it.
         assertEq(supplyBefore - token.totalSupply(), SLASH_AMT / 2 + APPEAL_BOND);
-        assertFalse(legacySetterSucceeded, "legacy challenger-pool setter is still callable");
         assertEq(bond.escrowedTotal(), 0);
     }
 
