@@ -71,15 +71,26 @@ const EPOCH_LENGTH_SECS: u64 = 7 * 24 * 60 * 60;
 // with no retry made an over-budget-but-progressing build a hard failure. Give
 // it headroom plus a bounded retry for a transient stall (mirrors the deploy
 // retry). A real compile error still fails fast — only a timeout is retried.
+// The base budget is scaled up under CI via `ci_scaled` (see #1384).
 const FORGE_BUILD_TIMEOUT: Duration = Duration::from_secs(300);
 const BUILD_ATTEMPTS: usize = 3;
 // The deploy script broadcasts against a live anvil while the runner is running
 // two journeys at once (`--test-threads 2` on a 4-core box), so give each attempt
 // more wall-clock headroom and one extra attempt. `run_deploy_script` reverts
 // anvil to a pre-deploy snapshot between attempts, so a widened budget buys real
-// recovery chances rather than doomed nonce-colliding retries (#785).
+// recovery chances rather than doomed nonce-colliding retries (#785). The base
+// budget is comfortable locally; on a contended CI runner it is scaled up via
+// `ci_scaled` because the failure mode is CPU starvation, not slowness (#1384).
 const DEPLOY_TIMEOUT: Duration = Duration::from_secs(60);
 const DEPLOY_ATTEMPTS: usize = 4;
+// The anvil-e2e deploy flakiness (#1384) is starvation, not slowness: under
+// `--test-threads 2` on the 4-core CI runner (see `.github/workflows/ci.yml`),
+// each journey spawns its own anvil + `forge script` (and often a `decdn-node`),
+// so a forge budget that is ample on an idle dev box can still time out
+// mid-progress under that contention. Scale the forge wall-clock budgets up when
+// running under CI, leaving local runs at the tighter budget so a genuine local
+// hang still fails fast.
+const CI_TIMEOUT_MULTIPLIER: u32 = 2;
 /// Linear backoff between deploy retries (`n * attempt`), giving a transient
 /// runner-contention spike time to clear before the next forge process spawns.
 const DEPLOY_RETRY_BACKOFF: Duration = Duration::from_secs(3);
@@ -1517,6 +1528,24 @@ fn contracts_dir() -> anyhow::Result<PathBuf> {
         .context("resolve contracts dir")
 }
 
+/// Scale a forge wall-clock budget for the runtime environment: `base` locally,
+/// `base * CI_TIMEOUT_MULTIPLIER` under CI. GitHub Actions sets `CI`; we only
+/// read the environment here — `set_var` is forbidden repo-wide (and is
+/// `unsafe` in edition 2024). See [`scale_for_ci`] for the pure decision.
+fn ci_scaled(base: Duration) -> Duration {
+    scale_for_ci(base, std::env::var_os("CI").is_some())
+}
+
+/// Pure timeout-scaling decision, split out from the environment read so it can
+/// be unit-tested without touching global process state.
+fn scale_for_ci(base: Duration, is_ci: bool) -> Duration {
+    if is_ci {
+        base * CI_TIMEOUT_MULTIPLIER
+    } else {
+        base
+    }
+}
+
 /// Run a `forge` subprocess under a wall-clock `timeout`, SIGKILLing it on
 /// overrun. `Ok(Ok)` = process exited (inspect status); `Ok(Err)` = stalled and
 /// killed (retryable); `Err` = could not spawn (deterministic, fail fast).
@@ -1545,7 +1574,7 @@ async fn forge_build(contracts: &Path) -> anyhow::Result<()> {
     for attempt in 1..=BUILD_ATTEMPTS {
         let mut build_cmd = tokio::process::Command::new("forge");
         build_cmd.current_dir(contracts).args(["build"]);
-        match forge_output(build_cmd, FORGE_BUILD_TIMEOUT, "forge build").await? {
+        match forge_output(build_cmd, ci_scaled(FORGE_BUILD_TIMEOUT), "forge build").await? {
             Ok(out) if out.status.success() => return Ok(()),
             // A non-zero exit is a deterministic compile error — retrying wastes
             // attempts, so surface it immediately with diagnostics.
@@ -1640,7 +1669,13 @@ async fn run_deploy_script(
                 "0x0000000000000000000000000000000000000000000000000000000000000001",
             )
             .env("FORCE_OVERWRITE_MANIFEST", "true");
-        match forge_output(cmd, DEPLOY_TIMEOUT, "forge script DeployProtocol").await? {
+        match forge_output(
+            cmd,
+            ci_scaled(DEPLOY_TIMEOUT),
+            "forge script DeployProtocol",
+        )
+        .await?
+        {
             Ok(out) if out.status.success() => return Ok(()),
             Ok(out) if forge_script_body_completed(&out.stdout) => {
                 if attempt == DEPLOY_ATTEMPTS {
@@ -1770,5 +1805,14 @@ mod tests {
             b"Error: script failed: revert: Ownable: caller is not the owner"
         ));
         assert!(!forge_script_body_completed(b""));
+    }
+
+    #[test]
+    fn ci_scaling_widens_the_budget_only_under_ci() {
+        // Local runs keep the tighter base budget so a genuine hang fails fast;
+        // CI multiplies it to absorb runner contention (#1384).
+        let base = Duration::from_secs(60);
+        assert_eq!(scale_for_ci(base, false), base);
+        assert_eq!(scale_for_ci(base, true), base * CI_TIMEOUT_MULTIPLIER);
     }
 }

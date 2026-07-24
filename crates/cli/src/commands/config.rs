@@ -405,7 +405,30 @@ pub fn config_init(args: &cli::ConfigInitArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Default TOML config file content.
+/// Default TOML config file content, written by `decdn config init`.
+///
+/// This is the **canonical, fully-commented node config template** — the one
+/// place that enumerates every section and knob. The other hand-maintained
+/// copies (the `examples/configs/*.toml` samples and the e2e `render_config`
+/// template) are not derived from it, so CI guards them against drift instead:
+///
+/// - `default_config_template_parses_with_every_section` — this template
+///   parses under `deny_unknown_fields` (no stale/typo'd section headers) and
+///   carries a header for *every* top-level `FileConfig` section, so adding a
+///   schema section without surfacing it here fails CI.
+/// - `examples_use_only_template_sections` — the shipped example configs use
+///   only sections that also exist here (a sample can't reference a section the
+///   canonical template lacks).
+/// - `arbitrum_sepolia_{operator,client}_sample_config_matches_schema` (via the
+///   `assert_sample_config_matches_schema` helper in `decdn_common::config`) —
+///   the samples parse against the live `FileConfig` schema and pass the
+///   resolver's chain-id / EIP-55 address checks.
+/// - `render_config_emits_parseable_toml` (in `decdn_e2e`) — the e2e template
+///   parses as valid TOML and spot-checks the daemon-critical keys.
+///
+/// When adding a config knob, update this template first (see CLAUDE.md's
+/// "config knob surfacing" convention), then the samples; the guards above keep
+/// them honest.
 const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # CLI flags override values in this file.
 
@@ -561,23 +584,105 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 mod tests {
     use super::*;
 
-    // The shipped template must parse under `deny_unknown_fields`: every
-    // uncommented line is a real section header or field. Locks the four
-    // new sections' header names (`[gossip]`, `[security]`,
-    // `[dht.rate_limit]`, `[receipts]`) against typos that would only
-    // surface when an operator uncommented a knob.
+    // The shipped template must parse under `deny_unknown_fields` (every
+    // uncommented line is a real section header, so a typo'd header fails
+    // here) AND carry a header for *every* top-level schema section. The
+    // exhaustive destructure below is the load-bearing part: adding a section
+    // to `FileConfig` fails to compile until it is named here, and the
+    // matching `is_some` assertion then fails until the template gains the
+    // header — so "add a schema section but forget the canonical template"
+    // is caught at CI, not left to drift (#1402).
     #[test]
-    fn default_config_template_parses() {
+    fn default_config_template_parses_with_every_section() {
         let parsed: config::FileConfig = toml::from_str(DEFAULT_CONFIG)
             .expect("DEFAULT_CONFIG template must parse as FileConfig");
-        // Only bare section headers are uncommented, so every section is
-        // Some but each field stays at its built-in default (None on the
-        // wire form). Spot-check the four added sections are recognized.
-        assert!(parsed.gossip.is_some(), "[gossip] header parsed");
-        assert!(parsed.security.is_some(), "[security] header parsed");
-        assert!(parsed.dht.is_some(), "[dht.rate_limit] header parsed");
-        assert!(parsed.probe.is_some(), "[probe.rate_limit] header parsed");
-        assert!(parsed.receipts.is_some(), "[receipts] header parsed");
-        assert!(parsed.content.is_some(), "[content] header parsed");
+        // Exhaustive (no `..`): a new `FileConfig` field breaks this line
+        // until the author accounts for it in the template + list below.
+        let config::FileConfig {
+            identity,
+            network,
+            blockchain,
+            cache,
+            payment,
+            observability,
+            gossip,
+            security,
+            dht,
+            probe,
+            receipts,
+            content,
+        } = &parsed;
+        // Every uncommented line is a section header with no field values —
+        // some nested (`[dht.rate_limit]`, `[probe.rate_limit]`) but each
+        // mapping to a top-level section — so every section parses to `Some`
+        // with its fields left at their built-in defaults.
+        for (section, present) in [
+            ("identity", identity.is_some()),
+            ("network", network.is_some()),
+            ("blockchain", blockchain.is_some()),
+            ("cache", cache.is_some()),
+            ("payment", payment.is_some()),
+            ("observability", observability.is_some()),
+            ("gossip", gossip.is_some()),
+            ("security", security.is_some()),
+            ("dht", dht.is_some()),
+            ("probe", probe.is_some()),
+            ("receipts", receipts.is_some()),
+            ("content", content.is_some()),
+        ] {
+            assert!(
+                present,
+                "DEFAULT_CONFIG is missing a header for the [{section}] schema section"
+            );
+        }
+    }
+
+    /// The `examples/configs/*.toml` samples are hand-maintained copies of the
+    /// schema, separate from `DEFAULT_CONFIG`. Each is parse-guarded in
+    /// isolation (this test + `assert_sample_config_matches_schema` in
+    /// `decdn_common`), but nothing otherwise asserts the samples and the
+    /// canonical template agree on which sections exist. Guard that here:
+    /// every top-level section a sample uses must also appear in
+    /// `DEFAULT_CONFIG`, so adding a schema section to a sample without
+    /// surfacing it in the template fails CI instead of drifting silently.
+    ///
+    /// Compared as raw `toml::Value` tables (the section headers literally
+    /// present in the text), not `FileConfig` (whose fields are all-`Option`
+    /// and so always "present"). Nested headers like `[dht.rate_limit]` and
+    /// `[[cache.origins]]` collapse to their top-level key (`dht`, `cache`).
+    #[test]
+    fn examples_use_only_template_sections() {
+        use std::collections::BTreeSet;
+
+        fn top_level_sections(toml_src: &str) -> BTreeSet<String> {
+            let value: toml::Value =
+                toml::from_str(toml_src).expect("config must parse as a TOML table");
+            value
+                .as_table()
+                .expect("config must be a TOML table")
+                .keys()
+                .cloned()
+                .collect()
+        }
+
+        let template = top_level_sections(DEFAULT_CONFIG);
+        for (label, sample) in [
+            (
+                "arbitrum-sepolia.toml",
+                include_str!("../../../../examples/configs/arbitrum-sepolia.toml"),
+            ),
+            (
+                "arbitrum-sepolia-client.toml",
+                include_str!("../../../../examples/configs/arbitrum-sepolia-client.toml"),
+            ),
+        ] {
+            let sample_sections = top_level_sections(sample);
+            let missing: Vec<&String> = sample_sections.difference(&template).collect();
+            assert!(
+                missing.is_empty(),
+                "example {label} uses section(s) absent from DEFAULT_CONFIG: {missing:?} \
+                 (add them to the canonical template)"
+            );
+        }
     }
 }
