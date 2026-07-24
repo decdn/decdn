@@ -89,7 +89,7 @@ Every `ProbeResponse` carries a `slash_sig` — an EIP-712 secp256k1 signature b
 
 ##### Cross-session client tracking (P-21)
 
-A persistent client NodeId exposes a stable transport identifier across sessions. Rotating it does not provide cross-session unlinkability: each serving node learns the client's stable Ethereum address from `StreamRequest`, and a T1 observer correlates that address across public payment-channel activity. Rotation only obscures the client from non-serving T2 probers and passive observers that cannot inspect TLS-encrypted request bytes, a narrow residual benefit that overlaps the accepted P-02, P-08, and P-10 correlation surfaces.
+A persistent client NodeId exposes a stable transport identifier to every node the client connects to. Rotating it does not provide cross-session unlinkability: the serving node must resolve the client's Ethereum address to attribute vouchers and to settle or dispute the channel on-chain, and a T1 observer correlates that same address across public payment-channel activity (P-02). Rotation only obscures the client from non-serving T2 probers — participants that learn a NodeId by completing a handshake but are never selected for delivery — and that residual is already leaked as content demand through the accepted P-08 and P-10 surfaces. Details in [§ Client NodeId Rotation (P-21)](#client-nodeid-rotation-p-21).
 
 #### T3: Infrastructure Operator
 
@@ -138,7 +138,7 @@ Compromising `server_secret` exposes all past and future epoch keys until rotati
 | P-18 | Unencrypted iroh key | Mitigate | Already planned: platform keychain in production | Pre-mainnet |
 | P-19 | Offline lease blast radius | Accept | Industry-standard tradeoff; operational mitigations in [Appendix: Encrypted Content Publishing](appendix-encrypted-content-publishing.md#appendix-encrypted-content-publishing-on-decdn) | — |
 | P-20 | No epoch key forward secrecy | Mitigate | HSM-backed derivation and rotation already specified in [Appendix: Encrypted Content Publishing](appendix-encrypted-content-publishing.md#appendix-encrypted-content-publishing-on-decdn) | Pre-mainnet |
-| P-21 | Permanent client NodeId | Accept | Serving nodes and T1 observers link sessions by stable Ethereum address; the residual benefit overlaps accepted P-02, P-08, and P-10 | — |
+| P-21 | Permanent client NodeId | Accept | Serving nodes and T1 observers link sessions by the stable Ethereum address the payment model requires (P-02); the residual non-serving-prober benefit is already leaked through accepted P-08 and P-10 | — |
 | P-22 | Settlement volume leakage | Accept | Inherent to on-chain settlement; settlement amount must be public for dispute resolution | — |
 | P-23 | `slash_sig` content inventory | Accept | Required for on-chain accountability; removing `slash_sig` eliminates slashability | — |
 
@@ -146,13 +146,13 @@ Compromising `server_secret` exposes all past and future epoch keys until rotati
 
 #### Client NodeId Rotation (P-21)
 
-**Available capability:** [ADR 012](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model) documents production rotation by generating a new Ed25519 key and reconnecting. Open payment channels remain valid because they are keyed by Ethereum address, not NodeId. PoC rotation still requires deleting the key file and restarting.
+**Available capability:** [ADR 012](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model) documents production rotation: generate a new iroh key, reconnect, and sign a fresh `BindNodeId` with the same Ethereum key. Open payment channels remain valid because they are keyed by `(client_ethereum_address, provider_ethereum_address, nonce)`, not by NodeId. Rotation is not supported for PoC — deleting the key file and restarting generates a new identity, but that is a side effect, not a rotation procedure.
 
-**Privacy effect:** Rotation replaces the stable transport identifier, obscuring cross-session correlation by non-serving T2 probers and passive observers that cannot inspect TLS-encrypted `StreamRequest` contents.
+**Privacy effect:** Rotation replaces the stable transport identifier, obscuring cross-session correlation by non-serving T2 probers — participants that learn a NodeId by completing a handshake but are never selected for delivery, and so never see a `StreamRequest`. It does not help against a T1 passive observer: P-21 is a T2 surface because the iroh identity is exchanged under TLS handshake encryption, leaving only the ALPN visible in the clear (P-04), so a passive observer correlates by IP regardless of rotation.
 
-**Limitation:** Rotation does not provide cross-session unlinkability. A serving T2 node learns the same Ethereum address via the `ethereum_address` field in `StreamRequest` ([ADR 005](005-protocol.md#adr-005-wire-protocol)), while a T1 observer correlates that address across public payment-channel activity. This limitation is scale-independent because every serving relationship exposes the stable payment identity regardless of node count.
+**Limitation:** Rotation does not provide cross-session unlinkability. Every request carries `channel_id = keccak256(client, provider, channelNonce)` ([ADR 003](003-payments.md#adr-003-payment-model)) in the base `StreamRequest`, and the serving node must resolve the client's Ethereum address to attribute vouchers and to settle or dispute the channel on-chain — from the on-chain binding for a registered client, or from the `ethereum_address` field in `StreamRequestExt` for an off-chain one ([ADR 005](005-protocol.md#adr-005-wire-protocol)). A T1 observer then correlates that address across public payment-channel activity. This limitation is scale-independent because every serving relationship exposes the stable payment identity regardless of node count.
 
-**Disposition:** Accept. The residual defense-in-depth benefit is a subset of the accepted P-02, P-08, and P-10 correlation surfaces and does not justify a ranked mitigation. Production rotation remains an optional identity-lifecycle capability, not a privacy roadmap commitment.
+**Disposition:** Accept. P-02 is what defeats rotation — the payment model requires a stable client address visible to both the serving node and any on-chain observer — and the remaining non-serving-prober benefit is already leaked as content demand through the accepted P-08 and P-10 surfaces. Production rotation remains an optional identity-lifecycle capability, not a privacy roadmap commitment.
 
 #### Operational RPC Guidance (P-15)
 
