@@ -612,8 +612,10 @@ mod tests {
             receipts,
             content,
         } = &parsed;
-        // Only bare section headers are uncommented, so every section is
-        // `Some` with each field left at its built-in default.
+        // Every uncommented line is a section header with no field values —
+        // some nested (`[dht.rate_limit]`, `[probe.rate_limit]`) but each
+        // mapping to a top-level section — so every section parses to `Some`
+        // with its fields left at their built-in defaults.
         for (section, present) in [
             ("identity", identity.is_some()),
             ("network", network.is_some()),
