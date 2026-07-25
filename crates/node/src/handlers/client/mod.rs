@@ -1230,6 +1230,16 @@ async fn read_first_message(recv: &mut RecvStream) -> Result<FirstMessage, Strea
                     app_code: APP_ERR_MALFORMED_MESSAGE,
                 }
             })?;
+            // Value checks are kept out of the parse so forward-compatible
+            // trailing bytes don't couple to them (ADR 005 two-phase). Gate here
+            // rather than at each use: an out-of-range `voucher_interval_mb` is a
+            // protocol error per ADR 003 §Voucher Interval Negotiation, and this
+            // wire boundary is its only enforcement point — `PaymentChannel`
+            // holds no cadence parameter to check it against.
+            ext.validate().map_err(|e| StreamReadError {
+                err: anyhow::anyhow!("stream request ext rejected: {e}"),
+                app_code: APP_ERR_MALFORMED_MESSAGE,
+            })?;
             Ok(FirstMessage::Delivery(req, ext))
         }
         Ok((ClientMessage::CooperativeCloseRequest(req), _)) => {
