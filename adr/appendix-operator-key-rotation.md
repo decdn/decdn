@@ -61,7 +61,7 @@ If both keys must rotate, rotate the **iroh key first** (cheap, atomic on-chain,
 |--------------------|--------|
 | Reputation observations | Each peer scores this operator locally, keyed on the observed NodeId ([ADR 008](008-reputation.md#adr-008-reputation-system)); a new NodeId starts at the default 0.5 neutral score |
 | Local DHT routing-table position | New NodeId reseeds the Kademlia bucket structure ([ADR 022](022-content-discovery.md#adr-022--content-discovery-at-scale)) |
-| 0-RTT session tickets cached by clients | Clients fall back to 1-RTT until they re-cache ([ADR 015](015-zero-rtt.md#adr-015-quic-0-rtt-connection-establishment)); brief P95 bump |
+| TLS session tickets cached by clients | Resumption is keyed on the endpoint id, so clients pay a full handshake until they re-cache; brief P95 bump |
 
 ### Procedure
 

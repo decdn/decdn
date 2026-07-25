@@ -535,7 +535,6 @@ pub const decdn_protocol::MAX_PROVIDERS_PER_HASH: usize
 pub const decdn_protocol::MAX_RATE_PER_MB: u64
 pub const decdn_protocol::MAX_VOUCHER_INTERVAL_MB: u64
 pub const decdn_protocol::MB_BYTES: u64
-pub const decdn_protocol::SESSION_TICKET_CACHE_SIZE: usize
 pub const decdn_protocol::SIGNATURE_LEN: usize
 pub const decdn_protocol::SLASH_SIG_LEN: usize
 pub const decdn_protocol::TOPIC_GLOBAL: &str

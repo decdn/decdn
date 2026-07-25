@@ -96,7 +96,7 @@ impl<H: ProtocolHandler> ProtocolHandler for LimitedHandler<H> {
     /// Forward the accept-time interception point. The trait default just
     /// awaits the `Accepting` future, which is also what most handlers do —
     /// but forwarding makes the wrapper transparent to any inner handler that
-    /// implements `on_accepting` for early rejection or 0-RTT setup.
+    /// implements `on_accepting` for early rejection.
     async fn on_accepting(&self, accepting: Accepting) -> Result<Connection, AcceptError> {
         self.inner.on_accepting(accepting).await
     }

@@ -814,7 +814,6 @@ fn build_origin_with_probe_caches(
             stall_timeout,
             max_blob_size_bytes,
             max_rate_per_mb: 0,
-            enable_0rtt: false,
             deposit_hint: U256::from(DEPOSIT_MICRO_USDC),
             lookup: decdn_node::dht::LookupConfig::default(),
             own_region: None,
@@ -946,7 +945,6 @@ fn build_origin_multi_hash(
             stall_timeout,
             max_blob_size_bytes: 0,
             max_rate_per_mb: 0,
-            enable_0rtt: false,
             deposit_hint: U256::from(DEPOSIT_MICRO_USDC),
             lookup: decdn_node::dht::LookupConfig::default(),
             own_region: None,
@@ -1146,8 +1144,6 @@ async fn node_origin_pull_chains_reactive_origin_via_client_binding() -> Result<
         EndpointAddr::new(a_id).with_ip_addr(addr_a),
         *hash.as_bytes(),
         1,
-        false,
-        None,
         Duration::from_secs(10),
     )
     .await?;
@@ -1259,8 +1255,6 @@ async fn node_origin_pull_fills_and_records_reputation() -> Result<()> {
         EndpointAddr::new(a_id).with_ip_addr(addr_a),
         *hash.as_bytes(),
         1,
-        false,
-        None,
         Duration::from_secs(10),
     )
     .await?;
@@ -2112,8 +2106,6 @@ async fn node_origin_pull_falls_through_a_stalled_candidate() -> Result<()> {
             EndpointAddr::new(id).with_ip_addr(addr),
             *hash.as_bytes(),
             1,
-            false,
-            None,
             Duration::from_secs(10),
         )
         .await?;
@@ -2353,8 +2345,6 @@ async fn wedged_open_does_not_starve_the_candidate_loop(stall: OpenStall) -> Res
             EndpointAddr::new(id).with_ip_addr(addr),
             *hash.as_bytes(),
             1,
-            false,
-            None,
             Duration::from_secs(10),
         )
         .await?;
@@ -2612,8 +2602,6 @@ async fn node_origin_window_open_falls_through_a_stalled_candidate() -> Result<(
             EndpointAddr::new(id).with_ip_addr(addr),
             *hash.as_bytes(),
             1,
-            false,
-            None,
             Duration::from_secs(10),
         )
         .await?;
@@ -2819,8 +2807,6 @@ async fn node_origin_unresolvable_address_skips_without_scoring() -> Result<()> 
         EndpointAddr::new(a_id).with_ip_addr(addr_a),
         *hash.as_bytes(),
         1,
-        false,
-        None,
         Duration::from_secs(10),
     )
     .await?;
@@ -2934,8 +2920,6 @@ async fn node_origin_corruption_is_classified_and_scored() -> Result<()> {
         EndpointAddr::new(a_id).with_ip_addr(addr_a),
         *hash.as_bytes(),
         1,
-        false,
-        None,
         Duration::from_secs(10),
     )
     .await?;
@@ -3031,8 +3015,6 @@ async fn node_origin_voucher_rejection_does_not_tar_upstream() -> Result<()> {
         EndpointAddr::new(a_id).with_ip_addr(addr_a),
         *hash.as_bytes(),
         1,
-        false,
-        None,
         Duration::from_secs(10),
     )
     .await?;
@@ -3128,8 +3110,6 @@ async fn pull_against_a_voucher_rejecting_upstream_n(
         EndpointAddr::new(a_id).with_ip_addr(addr_a),
         *hash.as_bytes(),
         1,
-        false,
-        None,
         Duration::from_secs(10),
     )
     .await?;
@@ -3374,8 +3354,6 @@ async fn node_origin_transport_failure_still_scores_unreachable() -> Result<()> 
         EndpointAddr::new(a_id).with_ip_addr(addr_a),
         *hash.as_bytes(),
         1,
-        false,
-        None,
         Duration::from_secs(10),
     )
     .await?;
@@ -3850,8 +3828,6 @@ async fn node_origin_cancelled_pull_still_persists_the_acked_watermark() -> Resu
         EndpointAddr::new(a_id).with_ip_addr(addr_a),
         *hash.as_bytes(),
         1,
-        false,
-        None,
         Duration::from_secs(10),
     )
     .await?;
@@ -4212,8 +4188,6 @@ async fn node_origin_empty_chunk_stream_is_rejected_not_spun_on() -> Result<()> 
         EndpointAddr::new(a_id).with_ip_addr(addr_a),
         *hash.as_bytes(),
         1,
-        false,
-        None,
         Duration::from_secs(10),
     )
     .await?;
@@ -4312,8 +4286,6 @@ async fn node_origin_window_empty_chunk_stream_is_rejected_not_spun_on() -> Resu
         EndpointAddr::new(a_id).with_ip_addr(addr_a),
         *hash.as_bytes(),
         1,
-        false,
-        None,
         Duration::from_secs(10),
     )
     .await?;
@@ -4434,8 +4406,6 @@ async fn node_origin_mid_stream_silence_scores_stalled_upstream() -> Result<()> 
         EndpointAddr::new(a_id).with_ip_addr(addr_a),
         *hash.as_bytes(),
         1,
-        false,
-        None,
         Duration::from_secs(10),
     )
     .await?;
@@ -4558,8 +4528,6 @@ async fn node_origin_a_silent_first_byte_is_our_deadline_not_the_peers_fault() -
         EndpointAddr::new(a_id).with_ip_addr(addr_a),
         *hash.as_bytes(),
         1,
-        false,
-        None,
         Duration::from_secs(10),
     )
     .await?;
@@ -4688,8 +4656,6 @@ async fn node_origin_mid_stream_refusal_is_metered_not_scored() -> Result<()> {
         EndpointAddr::new(a_id).with_ip_addr(addr_a),
         *hash.as_bytes(),
         1,
-        false,
-        None,
         Duration::from_secs(10),
     )
     .await?;
@@ -4807,8 +4773,6 @@ async fn node_origin_an_ack_wait_refusal_is_metered_not_scored() -> Result<()> {
         EndpointAddr::new(a_id).with_ip_addr(addr_a),
         *hash.as_bytes(),
         1,
-        false,
-        None,
         Duration::from_secs(10),
     )
     .await?;
@@ -4920,8 +4884,6 @@ async fn node_origin_a_wedged_provider_is_skipped_for_other_hashes() -> Result<(
             EndpointAddr::new(a_id).with_ip_addr(addr_a),
             *h.as_bytes(),
             1,
-            false,
-            None,
             Duration::from_secs(10),
         )
         .await?;
@@ -5042,8 +5004,6 @@ async fn node_origin_a_mid_stream_voucher_rejection_still_reaches_the_channel_re
         EndpointAddr::new(a_id).with_ip_addr(addr_a),
         *hash.as_bytes(),
         1,
-        false,
-        None,
         Duration::from_secs(10),
     )
     .await?;
@@ -5250,8 +5210,6 @@ async fn silent_upstreams_do_not_starve_the_candidate_loop() -> Result<()> {
             EndpointAddr::new(id).with_ip_addr(addr),
             *hash.as_bytes(),
             1,
-            false,
-            None,
             Duration::from_secs(10),
         )
         .await?;
@@ -5391,8 +5349,6 @@ async fn node_origin_slow_but_healthy_transfer_completes_past_pull_timeout() -> 
         EndpointAddr::new(a_id).with_ip_addr(addr_a),
         *hash.as_bytes(),
         1,
-        false,
-        None,
         Duration::from_secs(10),
     )
     .await?;
@@ -5584,8 +5540,6 @@ async fn node_origin_not_found_refusal_does_not_tar_upstream() -> Result<()> {
             EndpointAddr::new(id).with_ip_addr(addr),
             *hash.as_bytes(),
             1,
-            false,
-            None,
             Duration::from_secs(10),
         )
         .await?;
@@ -5743,8 +5697,6 @@ async fn refusal_suppression_after(error: StreamError, wait: Duration) -> Result
         EndpointAddr::new(a_id).with_ip_addr(addr_a),
         *hash.as_bytes(),
         1,
-        false,
-        None,
         Duration::from_secs(10),
     )
     .await?;
@@ -5890,8 +5842,6 @@ async fn post_eviction_failures_after_a_refusal(error: StreamError) -> Result<u6
         EndpointAddr::new(a_id).with_ip_addr(addr_a),
         *hash.as_bytes(),
         1,
-        false,
-        None,
         Duration::from_secs(10),
     )
     .await?;
@@ -5995,8 +5945,6 @@ async fn node_origin_internal_error_refusal_scores_unreachable() -> Result<()> {
         EndpointAddr::new(a_id).with_ip_addr(addr_a),
         *hash.as_bytes(),
         1,
-        false,
-        None,
         Duration::from_secs(10),
     )
     .await?;
@@ -6114,8 +6062,6 @@ async fn node_origin_oversized_claim_is_rejected_without_scoring() -> Result<()>
         EndpointAddr::new(a_id).with_ip_addr(addr_a),
         *hash.as_bytes(),
         1,
-        false,
-        None,
         Duration::from_secs(10),
     )
     .await?;
@@ -6241,8 +6187,6 @@ async fn node_origin_over_ceiling_rate_is_rejected_without_scoring() -> Result<(
         EndpointAddr::new(a_id).with_ip_addr(addr_a),
         *hash.as_bytes(),
         1,
-        false,
-        None,
         Duration::from_secs(10),
     )
     .await?;
@@ -6361,8 +6305,6 @@ async fn node_origin_reused_channel_resumes_voucher_progress() -> Result<()> {
         EndpointAddr::new(a_id).with_ip_addr(addr_a),
         *hash.as_bytes(),
         1,
-        false,
-        None,
         Duration::from_secs(10),
     )
     .await?;
@@ -6512,8 +6454,6 @@ async fn node_origin_persist_failure_still_delivers_and_is_counted() -> Result<(
         EndpointAddr::new(a_id).with_ip_addr(addr_a),
         *hash.as_bytes(),
         1,
-        false,
-        None,
         Duration::from_secs(10),
     )
     .await?;
@@ -6849,8 +6789,6 @@ async fn build_node_b_with_leaves(
         EndpointAddr::new(a_id).with_ip_addr(a_addr),
         *hash.as_bytes(),
         1,
-        false,
-        None,
         Duration::from_secs(10),
     )
     .await?;
@@ -8788,8 +8726,6 @@ async fn two_concurrent_pulls_to_one_provider_share_the_channel_ledger() -> Resu
             EndpointAddr::new(a_id).with_ip_addr(addr_a),
             *h.as_bytes(),
             1,
-            false,
-            None,
             Duration::from_secs(10),
         )
         .await?;
@@ -8840,7 +8776,6 @@ async fn two_concurrent_pulls_to_one_provider_share_the_channel_ledger() -> Resu
             stall_timeout: Duration::from_secs(20),
             max_blob_size_bytes: 0,
             max_rate_per_mb: 0,
-            enable_0rtt: false,
             deposit_hint: U256::from(DEPOSIT_MICRO_USDC),
             lookup: decdn_node::dht::LookupConfig::default(),
             own_region: None,
@@ -8979,8 +8914,6 @@ async fn a_second_fetch_inside_the_ttl_skips_the_probe_entirely() -> Result<()> 
         EndpointAddr::new(a_id).with_ip_addr(addr_a),
         *hash.as_bytes(),
         1,
-        false,
-        None,
         Duration::from_secs(10),
     )
     .await?;
@@ -9108,8 +9041,6 @@ async fn a_fetch_past_the_ttl_probes_again() -> Result<()> {
         EndpointAddr::new(a_id).with_ip_addr(addr_a),
         *hash.as_bytes(),
         1,
-        false,
-        None,
         Duration::from_secs(10),
     )
     .await?;
@@ -9267,8 +9198,6 @@ async fn a_progressive_pull_routes_the_fallback_on_the_request_namespace() -> Re
         EndpointAddr::new(a_id).with_ip_addr(addr_a),
         *hash.as_bytes(),
         1,
-        false,
-        None,
         Duration::from_secs(10),
     )
     .await?;
@@ -9428,8 +9357,6 @@ async fn cached_candidates_and_the_cold_path_share_one_attempt_budget() -> Resul
             EndpointAddr::new(id).with_ip_addr(addr),
             *hash.as_bytes(),
             1,
-            false,
-            None,
             Duration::from_secs(10),
         )
         .await?;
@@ -9621,8 +9548,6 @@ async fn a_partial_cached_budget_falls_through_to_the_cold_path_and_meters_once(
         EndpointAddr::new(n_id).with_ip_addr(addr_n),
         *hash.as_bytes(),
         1,
-        false,
-        None,
         Duration::from_secs(10),
     )
     .await?;
@@ -9750,8 +9675,6 @@ async fn a_partial_cached_budget_falls_through_to_the_cold_path_and_meters_once(
         EndpointAddr::new(h_id).with_ip_addr(addr_h),
         *hash.as_bytes(),
         1,
-        false,
-        None,
         Duration::from_secs(10),
     )
     .await?;
@@ -9898,8 +9821,6 @@ async fn a_probe_cache_hit_still_honours_the_negative_cache() -> Result<()> {
             EndpointAddr::new(id).with_ip_addr(addr),
             *hash.as_bytes(),
             1,
-            false,
-            None,
             Duration::from_secs(10),
         )
         .await?;
@@ -10070,8 +9991,6 @@ async fn a_progressive_pull_reuses_a_probe_cache_entry_written_by_a_buffered_fet
         EndpointAddr::new(a_id).with_ip_addr(addr_a),
         *hash.as_bytes(),
         1,
-        false,
-        None,
         Duration::from_secs(10),
     )
     .await?;
@@ -10221,8 +10140,6 @@ async fn a_window_pull_with_a_partial_cached_budget_falls_through_cold_and_meter
         EndpointAddr::new(n_id).with_ip_addr(addr_n),
         *hash.as_bytes(),
         1,
-        false,
-        None,
         Duration::from_secs(10),
     )
     .await?;
@@ -10333,8 +10250,6 @@ async fn a_window_pull_with_a_partial_cached_budget_falls_through_cold_and_meter
         EndpointAddr::new(h_id).with_ip_addr(addr_h),
         *hash.as_bytes(),
         1,
-        false,
-        None,
         Duration::from_secs(10),
     )
     .await?;
@@ -10502,8 +10417,6 @@ async fn a_window_pull_shares_one_attempt_budget_and_invalidates_on_exhaustion()
             EndpointAddr::new(id).with_ip_addr(addr),
             *hash.as_bytes(),
             1,
-            false,
-            None,
             Duration::from_secs(10),
         )
         .await?;
@@ -10700,8 +10613,6 @@ async fn an_entry_whose_every_provider_is_suppressed_is_a_miss_not_a_hit() -> Re
         EndpointAddr::new(n_id).with_ip_addr(addr_n),
         *hash.as_bytes(),
         1,
-        false,
-        None,
         Duration::from_secs(10),
     )
     .await?;
@@ -10912,8 +10823,6 @@ async fn a_probe_cache_hit_still_honours_the_wedged_provider_filter() -> Result<
             EndpointAddr::new(id).with_ip_addr(addr),
             *hash2.as_bytes(),
             1,
-            false,
-            None,
             Duration::from_secs(10),
         )
         .await?;
@@ -11253,8 +11162,6 @@ async fn a_probe_cache_hit_drops_a_provider_no_longer_admitted() -> Result<()> {
         EndpointAddr::new(a_id).with_ip_addr(addr_a),
         *hash.as_bytes(),
         1,
-        false,
-        None,
         Duration::from_secs(10),
     )
     .await?;
@@ -11313,7 +11220,6 @@ async fn a_probe_cache_hit_drops_a_provider_no_longer_admitted() -> Result<()> {
             stall_timeout: Duration::from_secs(20),
             max_blob_size_bytes: 0,
             max_rate_per_mb: 0,
-            enable_0rtt: false,
             deposit_hint: U256::from(DEPOSIT_MICRO_USDC),
             lookup: decdn_node::dht::LookupConfig::default(),
             own_region: None,

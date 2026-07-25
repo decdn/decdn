@@ -84,11 +84,6 @@ pub fn write_validate_summary<W: std::io::Write>(
         "  bind_port:                {}",
         resolved.network.bind_port
     )?;
-    writeln!(
-        w,
-        "  enable_0rtt:              {}",
-        resolved.network.enable_0rtt
-    )?;
     // One line per configured relay; nothing when the list is empty (the node
     // then falls back to the n0 default relays). Relay URLs can carry
     // `user:pass@` userinfo, so redact it (host stays visible) — the same
@@ -438,7 +433,6 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 
 [network]
 # bind_port = 4433
-# enable_0rtt = true                 # QUIC 0-RTT for cdn/probe/v1 (ADR 015); set false to require a full handshake
 # Multiple relays give redundancy/failover; reachability is probed at bring-up
 # and logged but never fatal (the node proceeds and iroh retries in the background).
 # relay_urls = ["https://relay-a.example.", "https://relay-b.example."]

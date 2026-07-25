@@ -18,15 +18,9 @@ fn parse_hash(s: &str) -> anyhow::Result<[u8; 32]> {
 /// Send a `cdn/probe/v1` content-availability request to a running node and
 /// print the signed response.
 ///
-/// The transport path (0-RTT attempt + 1-RTT fallback, ADR 015) lives in
-/// [`probe_once`]; response correlation and the mandatory `slash_sig` check
-/// (ADR 014 §1) are applied here on the returned response. 0-RTT is always
-/// attempted (`enable_0rtt = true`): a probe is read-only and idempotent, so
-/// early data is safe, and there is no per-invocation reason to disable it. A
-/// one-shot `decdn probe` starts cold — iroh's session cache is per-endpoint
-/// and this process builds a fresh endpoint — so the first (and only)
-/// attempt resolves 1-RTT; the machinery exists for the node's long-lived
-/// reuse, not the CLI's.
+/// The transport path lives in [`probe_once`]; response correlation and the
+/// mandatory `slash_sig` check (ADR 014 §1) are applied here on the returned
+/// response.
 pub async fn probe(
     args: &cli::ProbeArgs,
     config_path: Option<&std::path::Path>,
@@ -77,10 +71,8 @@ pub async fn probe(
     )
     .unwrap_or(u64::MAX);
 
-    // Transport (0-RTT attempt + 1-RTT fallback, ADR 015) and RTT
-    // measurement live in `probe_once`. The CLI passes no `ProbeMetrics`
-    // sink — the one-shot `decdn` binary has no metrics registry.
-    let result = probe_once(&endpoint, target, hash, timestamp_us, true, None, timeout).await;
+    // Transport and RTT measurement live in `probe_once`.
+    let result = probe_once(&endpoint, target, hash, timestamp_us, timeout).await;
     endpoint.close().await;
     let (resp, rtt_ms) = result?;
 

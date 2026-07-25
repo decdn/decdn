@@ -17,7 +17,7 @@ pub const MAX_PROVIDER_ATTEMPTS: usize = 3;
 
 /// Per-candidate probe timeout. Because candidates are probed concurrently, this also
 /// bounds the whole probe-collection phase. The budget covers connection setup plus one
-/// unpaid probe request/response; warm or 0-RTT connections (ADR 015) complete in a single
+/// unpaid probe request/response; warm connections complete in a single
 /// round trip, so the 500 ms ceiling accommodates inter-continental RTTs while still
 /// dropping a slow or unreachable candidate before it burns the caller's miss-latency
 /// budget (ADR 001 § Probe response collection).

@@ -261,7 +261,7 @@ where
         let part = part_dir.join(format!("chunk-{index}.part"));
         // Hashing a whole chunk is far too long to sit on the executor: `bundle
         // pull` polls every entry from ONE task (`buffer_unordered`, no
-        // `tokio::spawn` because `probe_once` is not `Send`), so blocking here
+        // `tokio::spawn`), so blocking here
         // stalls every sibling entry — and their stall deadlines are wall-clock
         // timers that elapse unpolled and fire the instant we yield.
         let verified = {

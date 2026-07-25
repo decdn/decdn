@@ -45,17 +45,6 @@ pub const ALPN_CLIENT: &[u8] = b"cdn/client/v1";
 /// ALPN protocol identifier for Kademlia-based content discovery (ADR 022).
 pub const ALPN_DHT: &[u8] = b"cdn/dht/v1";
 
-/// QUIC 0-RTT session-ticket budget (ADR 015 §Session Ticket
-/// Management). Passed to `Endpoint::builder().max_tls_tickets(..)`,
-/// which in iroh sizes only the **client-side** rustls
-/// `ClientSessionMemoryCache` (the server-side ticket store is
-/// rustls-internal at its own default and is *not* sized by this knob).
-/// Reused as the saturation ceiling for the approximate
-/// `decdn_quic_session_ticket_cache_size` gauge so the node's whole
-/// 0-RTT memory budget is one number — not because the gauge mirrors a
-/// rustls cache of this size.
-pub const SESSION_TICKET_CACHE_SIZE: usize = 1000;
-
 /// Gossip topic for global node announcements and rate changes.
 pub const TOPIC_GLOBAL: &str = "cdn/global/v1";
 

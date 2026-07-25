@@ -77,7 +77,6 @@ Architecture decision records live in [`adr/`](adr/), with [`adr/architecture.md
 - **Client architecture:** Lightweight QUIC endpoints; gossip subscribe (no publish); registry bootstrap with fallback; per-connection ephemeral identity binding
 - **Schema evolution:** Varint-length framing, protocol enums, three-tier evolution model (minor/medium/major)
 - **On-chain verification:** Single secp256k1 EIP-712 slash signature (`slash_sig`) per message with optimistic challenge-response; the Ed25519 NodeId is connection identity only, authenticated separately by the QUIC handshake
-- **0-RTT probing:** QUIC 0-RTT for `cdn/probe/v1` repeat connections, eliminating TLS handshake round trip
 - **Liquidity:** Protocol-owned liquidity via Balancer V3 80/20 TOKEN/USDC weighted pool
 - **Production L2:** Arbitrum One for all on-chain contracts (PoC on Arbitrum Sepolia)
 
