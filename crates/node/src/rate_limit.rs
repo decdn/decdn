@@ -104,10 +104,18 @@ impl Default for RateLimitConfig {
 // the runtime uses to build a limiter from resolved config, so a field added
 // on one side has exactly one place to be threaded through on the other.
 //
-// The compiler catches an added/dropped field (the literals are exhaustive,
-// no `..Default::default()`) but NOT a transposition: all eight fields are
-// `f64`/`u32`/`usize`, so swapping `per_peer_burst` with `per_ip_burst` still
-// compiles. Neither impl is covered by a test — see #1457.
+// Two mechanisms guard the mapping, and they cover different failure modes
+// (#1457):
+//
+// * **Arity** — the compiler. Both literals are exhaustive (no
+//   `..Default::default()`), so a field added or dropped on either side fails
+//   the build here.
+// * **Transposition** — the `*_mapping_is_not_transposed` tests below. The
+//   compiler cannot help: all eight fields are `f64`/`u32`/`usize`, so
+//   swapping `per_peer_burst` with `per_ip_burst` still compiles. The tests
+//   feed eight pairwise-distinct sentinels through each impl and pin every
+//   landing slot. Review-by-diff cannot substitute — the two bodies are
+//   byte-identical, so a swap in one reads as plausible next to the other.
 impl From<&decdn_common::config::ResolvedDht> for RateLimitConfig {
     fn from(r: &decdn_common::config::ResolvedDht) -> Self {
         Self {
@@ -512,9 +520,79 @@ fn make_quota(rate_per_sec: f64, burst: u32) -> Option<Quota> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::float_cmp
+)]
 mod tests {
     use super::*;
+
+    /// Eight pairwise-distinct sentinels, one per mapped field, so no two
+    /// fields can be confused for each other by a transposed assignment.
+    /// Shared by both `From` tests: the sentinel identifies the *slot*, and
+    /// the two `Resolved*` types are what select the impl under test.
+    const S_PER_PEER_RATE: f64 = 11.0;
+    const S_PER_PEER_BURST: u32 = 22;
+    const S_PER_IP_RATE: f64 = 33.0;
+    const S_PER_IP_BURST: u32 = 44;
+    const S_GLOBAL_RATE: f64 = 55.0;
+    const S_GLOBAL_BURST: u32 = 66;
+    const S_MAX_TRACKED_PER_IP: usize = 77;
+    const S_MAX_TRACKED_PER_PEER: usize = 88;
+
+    /// Assert the sentinels landed in their matching `RateLimitConfig` slots.
+    fn assert_sentinels_in_place(cfg: &RateLimitConfig) {
+        assert_eq!(cfg.per_peer_rate_per_sec, S_PER_PEER_RATE);
+        assert_eq!(cfg.per_peer_burst, S_PER_PEER_BURST);
+        assert_eq!(cfg.per_ip_rate_per_sec, S_PER_IP_RATE);
+        assert_eq!(cfg.per_ip_burst, S_PER_IP_BURST);
+        assert_eq!(cfg.global_rate_per_sec, S_GLOBAL_RATE);
+        assert_eq!(cfg.global_burst, S_GLOBAL_BURST);
+        assert_eq!(cfg.max_tracked_per_ip, S_MAX_TRACKED_PER_IP);
+        assert_eq!(cfg.max_tracked_per_peer, S_MAX_TRACKED_PER_PEER);
+    }
+
+    /// `From<&ResolvedDht>` must not transpose same-typed siblings. The
+    /// compiler only catches an added/dropped field; every one of the eight is
+    /// `f64`/`u32`/`usize` and so is swappable with a sibling while still
+    /// compiling (#1457).
+    #[test]
+    fn dht_mapping_is_not_transposed() {
+        let resolved = decdn_common::config::ResolvedDht {
+            per_peer_rate_per_sec: S_PER_PEER_RATE,
+            per_peer_burst: S_PER_PEER_BURST,
+            per_ip_rate_per_sec: S_PER_IP_RATE,
+            per_ip_burst: S_PER_IP_BURST,
+            global_rate_per_sec: S_GLOBAL_RATE,
+            global_burst: S_GLOBAL_BURST,
+            max_tracked_per_ip: S_MAX_TRACKED_PER_IP,
+            max_tracked_per_peer: S_MAX_TRACKED_PER_PEER,
+        };
+        assert_sentinels_in_place(&RateLimitConfig::from(&resolved));
+    }
+
+    /// Sibling of `dht_mapping_is_not_transposed` for `From<&ResolvedProbe>`.
+    /// Load-bearing independently of the DHT test: the two impl bodies are
+    /// byte-identical, so a transposition in one is invisible to review, and
+    /// the probe defaults are deliberately tighter per-peer (ADR 005: 5 req/s
+    /// vs the per-IP 50) — a `per_peer`/`per_ip` swap here would silently
+    /// loosen the per-peer cap 10x on an unauthenticated path.
+    #[test]
+    fn probe_mapping_is_not_transposed() {
+        let resolved = decdn_common::config::ResolvedProbe {
+            per_peer_rate_per_sec: S_PER_PEER_RATE,
+            per_peer_burst: S_PER_PEER_BURST,
+            per_ip_rate_per_sec: S_PER_IP_RATE,
+            per_ip_burst: S_PER_IP_BURST,
+            global_rate_per_sec: S_GLOBAL_RATE,
+            global_burst: S_GLOBAL_BURST,
+            max_tracked_per_ip: S_MAX_TRACKED_PER_IP,
+            max_tracked_per_peer: S_MAX_TRACKED_PER_PEER,
+        };
+        assert_sentinels_in_place(&RateLimitConfig::from(&resolved));
+    }
 
     /// Mirrors `dispatch.rs::prune_guard_resets_flag_on_panic`: a panic inside
     /// the guarded section must still release the single-flight flag via
