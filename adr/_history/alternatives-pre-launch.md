@@ -260,7 +260,7 @@ Source: [Appendix: Blob Cache Eviction Policy](../appendix-blob-cache-eviction.m
 - **Size-weighted (largest-first).** Rejected. Penalizes the legitimate large-blob use case (video, datasets) the network is designed for. A 1 GB blob would always evict before a 1 MB blob even when both are equally hot, defeating the purpose of a CDN cache for large content.
 - **Hybrid LRU + LFU (e.g. SLRU, ARC, W-TinyLFU).** Rejected for PoC. The bookkeeping overhead and parameter-tuning burden ("how do we set the segment ratio?") buy a marginal hit-rate gain at scales orders of magnitude larger than the PoC. Revisit at production hardening if cache-hit telemetry shows a clear miss-rate floor LRU is responsible for.
 - **No eviction (rely on `cache_size_mb` as a soft hint).** Rejected. The cache is bounded storage; unbounded growth either wedges the disk or relies on the operator manually evicting via `decdn node evict` — neither acceptable. The driver loop is deferred (see *Negative consequences*) but the policy is mandatory.
-- **Reputation-priority eviction.** Rejected, mirrors [appendix-peer-table-eviction.md § Reputation does not factor into eviction](../appendix-peer-table-eviction.md#reputation-does-not-factor-into-eviction). Conflates retention with selection; creates a collusive-reporting vector against ADR 008's hard floor; the cache layer should not consult reputation at all.
+- **Reputation-priority eviction.** Rejected, mirrors [appendix-peer-table-eviction.md § Reputation does not factor into eviction](../appendix-peer-table-eviction.md#reputation-does-not-factor-into-eviction). Conflates retention with selection; the cache layer should not consult reputation at all.
 - **Refresh `last_accessed` on every probe / `has` check.** Rejected. A coordinated probe flood from many peers would refresh every cached hash to "recent" and turn the LRU policy into approximate FIFO. Refresh on `get` only — the paid-delivery path — ties recency to the operator's revenue signal, which is the right alignment.
 
 ---
@@ -269,7 +269,7 @@ Source: [Appendix: Blob Cache Eviction Policy](../appendix-blob-cache-eviction.m
 
 Source: [Appendix: Peer Table Eviction Policy](../appendix-peer-table-eviction.md).
 
-- **Reputation-priority eviction.** Rejected. Conflates discovery with selection (§4); creates a collusive-reporting vector against ADR 008's hard reputation floor; punishes transient noise. Reputation already governs selection via the score formula, the right place for it.
+- **Reputation-priority eviction.** Rejected. Conflates discovery with selection (§4); punishes transient noise. Reputation already governs selection via the score formula, the right place for it.
 - **Lazy deregistration (TTL-only, no active evict).** Rejected. The registry-cache subscriber already runs on every event; marginal cost is one `HashMap::remove`. Lazy handling would leave a deregistered node visible to operators and analytics for up to TTL with no benefit.
 - **LRU under a hard size cap.** Rejected. Adds eviction-priority bookkeeping for a problem the staking registry already bounds. If observed `peer_table_size` exceeds `registered_node_count × 1.5` in production, revisit — but the right next step is a registry-validation audit, not an LRU layer.
 - **Persisting the peer table across restarts.** Rejected. Restart cost is < one announce interval (~60 s) of cold gossip; durability machinery is not justified.
