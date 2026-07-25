@@ -176,8 +176,13 @@ pub struct RankedCandidate {
 ///
 /// `score = rate_per_mb × rtt_ms × (1 / max(reputation, 0.1)²)`
 ///
-/// Reputation is clamped to [`REPUTATION_FLOOR`] before squaring; this both
-/// prevents division by zero and caps the worst-case multiplier at 100×.
+/// Reputation is clamped to `[REPUTATION_FLOOR, 1.0]` before squaring — both
+/// ends, and both ends matter. The floor prevents division by zero and caps the
+/// worst-case penalty multiplier at 100×; the ceiling of 1.0 (the documented top
+/// of [`Candidate::reputation`]'s domain) stops an out-of-domain value from
+/// buying an unearned *bonus* (#1458). Without it, `reputation = 10.0` divides
+/// the score by 100 and outranks a perfect-reputation peer by 100×, and
+/// `f32::INFINITY` yields score `0.0` — first place, unconditionally.
 #[allow(clippy::cast_precision_loss)]
 // f64 has 53-bit mantissa; ULP-level imprecision on huge u64 rates does not
 // affect ordering decisions here.
@@ -187,7 +192,21 @@ fn compute_score(rate_per_mb: u64, rtt_ms: u32, reputation: f32) -> f64 {
     // Clamp in f32 (input's domain), then promote once for the f64 score
     // arithmetic. Promoting first would let `f32(0.1)` slip just above the
     // floor (it rounds to ~0.10000000149f64), an unintuitive boundary.
-    let rep = f64::from(reputation.max(REPUTATION_FLOOR));
+    //
+    // `.max().min()` rather than `.clamp(REPUTATION_FLOOR, 1.0)`: `f32::max`
+    // and `f32::min` implement IEEE `maxNum`/`minNum` and IGNORE NaN, so a NaN
+    // reputation lands on the floor instead of poisoning the score.
+    // `f32::clamp` propagates NaN (and panics if `min > max`) — see
+    // `score_nan_reputation_clamps_to_floor` for why that would be a
+    // regression.
+    //
+    // The `manual_clamp` waiver is the whole point, not a shortcut: clippy's own
+    // lint note concedes both hazards ("clamp will panic if max < min […]",
+    // "clamp returns NaN if the input is NaN"), and the second one is exactly
+    // what this expression is written to avoid. Taking the suggestion would turn
+    // a NaN-total function into a NaN-propagating one and fail that test.
+    #[allow(clippy::manual_clamp)]
+    let rep = f64::from(reputation.max(REPUTATION_FLOOR).min(1.0));
     rate * rtt / (rep * rep)
 }
 
@@ -576,6 +595,40 @@ mod tests {
         let at_floor = compute_score(100, 10, 0.1);
         assert!(s.is_finite(), "NaN reputation must not produce a NaN score");
         assert!((s - at_floor).abs() < 1e-9);
+    }
+
+    #[test]
+    fn score_reputation_above_1_0_clamps_to_ceiling() {
+        // Defensive, and the mirror of the floor clamp (#1458). `Candidate.
+        // reputation` is documented as `[0.0, 1.0]`, but nothing in the type
+        // enforces it — `peer_reputation` in `node_origin` narrows the
+        // reputation engine's f64 with an unchecked `as f32`. Without the
+        // ceiling, rep = 10.0 divides the score by 100 and beats a
+        // perfect-reputation node by 100×: a candidate could buy the top slot
+        // by reporting a domain violation.
+        let baseline = compute_score(100, 10, 1.0);
+        let above = compute_score(100, 10, 10.0);
+        assert!((above - baseline).abs() < 1e-9, "got {above} vs {baseline}");
+    }
+
+    #[test]
+    fn score_infinite_reputation_clamps_to_ceiling() {
+        // The degenerate end of the same hole: `INFINITY` squared is
+        // `INFINITY`, so an unclamped score is `x / inf` = `0.0` — the
+        // smallest score representable, which sorts FIRST under `total_cmp`
+        // unconditionally. Clamped, it must be indistinguishable from a
+        // perfect-reputation candidate. Like the NaN test above, this relies
+        // on `f32::min` implementing `minNum`; `.clamp(REPUTATION_FLOOR, 1.0)`
+        // would satisfy this test but regress
+        // `score_nan_reputation_clamps_to_floor`.
+        let baseline = compute_score(100, 10, 1.0);
+        let s = compute_score(100, 10, f32::INFINITY);
+        assert!(s.is_finite(), "got {s}");
+        assert!(
+            s > 0.0,
+            "infinite reputation must not score 0.0 and sort first"
+        );
+        assert!((s - baseline).abs() < 1e-9, "got {s} vs {baseline}");
     }
 
     #[test]
