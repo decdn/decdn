@@ -89,7 +89,7 @@ Every `ProbeResponse` carries a `slash_sig` — an EIP-712 secp256k1 signature b
 
 ##### Cross-session client tracking (P-21)
 
-A persistent client NodeId lets any node that served the client correlate all past and future requests. Payment channels are keyed by Ethereum address ([ADR 012](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model)), not NodeId, so rotation would not break the payment model. Most actionable privacy improvement at lowest implementation cost.
+A persistent client NodeId exposes a stable transport identifier to every node the client connects to. Rotating it does not provide cross-session unlinkability: the serving node must resolve the client's Ethereum address to attribute vouchers and to settle or dispute the channel on-chain, and a T1 observer correlates that same address across public payment-channel activity (P-02). Rotation only obscures the client from non-serving T2 probers — participants that learn a NodeId by completing a handshake but are never selected for delivery — and that residual is already leaked as content demand through the accepted P-08 and P-10 surfaces. Details in [§ Client NodeId Rotation (P-21)](#client-nodeid-rotation-p-21).
 
 #### T3: Infrastructure Operator
 
@@ -138,7 +138,7 @@ Compromising `server_secret` exposes all past and future epoch keys until rotati
 | P-18 | Unencrypted iroh key | Mitigate | Already planned: platform keychain in production | Pre-mainnet |
 | P-19 | Offline lease blast radius | Accept | Industry-standard tradeoff; operational mitigations in [Appendix: Encrypted Content Publishing](appendix-encrypted-content-publishing.md#appendix-encrypted-content-publishing-on-decdn) | — |
 | P-20 | No epoch key forward secrecy | Mitigate | HSM-backed derivation and rotation already specified in [Appendix: Encrypted Content Publishing](appendix-encrypted-content-publishing.md#appendix-encrypted-content-publishing-on-decdn) | Pre-mainnet |
-| P-21 | Permanent client NodeId | Mitigate | Breaks cross-session linkability at low cost | Pre-mainnet |
+| P-21 | Permanent client NodeId | Accept | Serving nodes and T1 observers link sessions by the stable Ethereum address the payment model requires (P-02); the residual non-serving-prober benefit is already leaked through accepted P-08 and P-10 | — |
 | P-22 | Settlement volume leakage | Accept | Inherent to on-chain settlement; settlement amount must be public for dispute resolution | — |
 | P-23 | `slash_sig` content inventory | Accept | Required for on-chain accountability; removing `slash_sig` eliminates slashability | — |
 
@@ -146,13 +146,13 @@ Compromising `server_secret` exposes all past and future epoch keys until rotati
 
 #### Client NodeId Rotation (P-21)
 
-**Current state:** [ADR 012](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model) says rotation is "not supported" for PoC; a new key requires deleting the key file and restarting. Production rotation is described but not prioritized.
+**Available capability:** [ADR 012](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model) documents production rotation: generate a new iroh key, reconnect, and sign a fresh `BindNodeId` with the same Ethereum key. Open payment channels remain valid because they are keyed by `(client_ethereum_address, provider_ethereum_address, nonce)`, not by NodeId. Rotation is not supported for PoC — deleting the key file and restarting generates a new identity, but that is a side effect, not a rotation procedure.
 
-**Proposal:** Periodic rotation (configurable interval, e.g., every N connections or every T minutes): client generates a new Ed25519 key, reconnects, discards the old key. Payment channels are keyed by Ethereum address ([ADR 012](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model)), so rotation does not affect open channels. The Ethereum key and on-chain identity stay stable — rotation breaks correlation at the transport layer only.
+**Privacy effect:** Rotation replaces the stable transport identifier, obscuring cross-session correlation by non-serving T2 probers — participants that learn a NodeId by completing a handshake but are never selected for delivery, and so never see a `StreamRequest`. It does not help against a T1 passive observer: P-21 is a T2 surface because the iroh identity is exchanged under TLS handshake encryption, leaving only the ALPN visible in the clear (P-04), so a passive observer correlates by IP regardless of rotation.
 
-**Limitation:** A T1 adversary correlating the Ethereum address across channels can still link sessions. A T2 node operator that serves the client learns the Ethereum address via the `ethereum_address` field in `StreamRequest` ([ADR 005](005-protocol.md#adr-005-wire-protocol)), so rotation does NOT prevent a serving node from linking sessions. It primarily mitigates correlation by non-serving T2 participants (nodes that probe but are not selected for delivery) and T1 passive observers who see QUIC metadata but not TLS-encrypted `StreamRequest` contents.
+**Limitation:** Rotation does not provide cross-session unlinkability. Every request carries `channel_id = keccak256(client, provider, channelNonce)` ([ADR 003](003-payments.md#adr-003-payment-model)) in the base `StreamRequest`, and the serving node must resolve the client's Ethereum address to attribute vouchers and to settle or dispute the channel on-chain — from the on-chain binding for a registered client, or from the `ethereum_address` field in `StreamRequestExt` for an off-chain one ([ADR 005](005-protocol.md#adr-005-wire-protocol)). A T1 observer then correlates that address across public payment-channel activity. This limitation is scale-independent because every serving relationship exposes the stable payment identity regardless of node count.
 
-**Effort:** Low. Key generation is cheap; no protocol message changes; no on-chain interaction.
+**Disposition:** Accept. P-02 is what defeats rotation — the payment model requires a stable client address visible to both the serving node and any on-chain observer — and the remaining non-serving-prober benefit is already leaked as content demand through the accepted P-08 and P-10 surfaces. Production rotation remains an optional identity-lifecycle capability, not a privacy roadmap commitment.
 
 #### Operational RPC Guidance (P-15)
 
@@ -188,12 +188,11 @@ Compromising `server_secret` exposes all past and future epoch keys until rotati
 
 | Priority | Mitigation | Phase | Effort | Impact |
 |----------|-----------|-------|--------|--------|
-| 1 | Client NodeId rotation ([§ Client NodeId Rotation (P-21)](#client-nodeid-rotation-p-21)) | Pre-mainnet | Low | High — breaks cross-session correlation at transport layer |
-| 2 | Client iroh key encryption ([§ Client iroh Key Encryption (P-18)](#client-iroh-key-encryption-p-18)) | Pre-mainnet | Low | Medium — protects identity from T4 on client devices |
-| 3 | Operational RPC guidance ([§ Operational RPC Guidance (P-15)](#operational-rpc-guidance-p-15)) | Pre-mainnet | Minimal | Medium — documents trust boundary as privacy concern |
-| 4 | Epoch key forward secrecy ([§ Epoch Key Forward Secrecy (P-20)](#epoch-key-forward-secrecy-p-20)) | Pre-mainnet | Medium | High — but already specified in the encrypted-content-publishing appendix; implementation priority |
-| 5 | Dummy probes ([§ Dummy Probes (Not Recommended)](#dummy-probes-not-recommended)) | Post-mainnet | Medium | Low — probes are public by design |
-| 6 | Payment channel mixing ([§ Payment Channel Mixing (Not Recommended)](#payment-channel-mixing-not-recommended)) | Post-mainnet | High | Medium — requires regulatory analysis first |
+| 1 | Client iroh key encryption ([§ Client iroh Key Encryption (P-18)](#client-iroh-key-encryption-p-18)) | Pre-mainnet | Low | Medium — protects identity from T4 on client devices |
+| 2 | Operational RPC guidance ([§ Operational RPC Guidance (P-15)](#operational-rpc-guidance-p-15)) | Pre-mainnet | Minimal | Medium — documents trust boundary as privacy concern |
+| 3 | Epoch key forward secrecy ([§ Epoch Key Forward Secrecy (P-20)](#epoch-key-forward-secrecy-p-20)) | Pre-mainnet | Medium | High — but already specified in the encrypted-content-publishing appendix; implementation priority |
+| 4 | Dummy probes ([§ Dummy Probes (Not Recommended)](#dummy-probes-not-recommended)) | Post-mainnet | Medium | Low — probes are public by design |
+| 5 | Payment channel mixing ([§ Payment Channel Mixing (Not Recommended)](#payment-channel-mixing-not-recommended)) | Post-mainnet | High | Medium — requires regulatory analysis first |
 
 ## Consequences
 
@@ -203,7 +202,7 @@ Compromising `server_secret` exposes all past and future epoch keys until rotati
 - Explicit disposition for every privacy surface prevents implicit acceptance of unanalyzed risks
 - Prioritized roadmap focuses engineering effort on highest-impact, lowest-cost items first
 - Adversary-tier framing maps threats to real-world actors, avoiding over- or under-engineering
-- Documents fundamental protocol limitations (delivering node must know the hash) versus implementation choices (NodeId rotation cadence, RPC provider trust)
+- Distinguishes fundamental protocol limitations (delivering nodes learn requested hashes and stable payment identities), optional defense-in-depth capabilities (production NodeId rotation), and prioritized operational mitigations (RPC provider trust)
 
 ### Negative
 
