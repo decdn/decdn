@@ -2148,6 +2148,51 @@ async fn client_unknown_channel_is_rejected() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Wire-bounds gate on the client's proposed voucher cadence (ADR 003 §Voucher
+/// Interval Negotiation): `voucher_interval_mb` outside `1..=1024` is a protocol
+/// error, so the node resets the stream instead of clamping the value into range
+/// and serving. Both endpoints of the illegal set are covered — `0` (which a
+/// clamp would silently lift to 1 MB) and `MAX + 1` (which a clamp would silently
+/// drop to the node's configured cadence), the two cases indistinguishable from
+/// an honest proposal once normalized. Driven raw because `stream_fetch` always
+/// proposes `None`.
+#[tokio::test(flavor = "multi_thread")]
+async fn client_out_of_range_voucher_interval_is_refused() -> anyhow::Result<()> {
+    let payload = b"an out-of-range cadence never reaches the serve path".to_vec();
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+    let (store, _owner, _deposit) = seeded_store()?;
+    let (target, _server_eth, server_ep, server_task) =
+        spawn_handler_server(cache, store, RATE_PER_MB, 0, 16).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let req = StreamRequest {
+        hash: *hash.as_bytes(),
+        namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        channel_id: channel_id().into(),
+        byte_offset: 0,
+        byte_len: 0,
+        timestamp_us: 0x00ca_de00,
+    };
+
+    for interval in [0, decdn_protocol::MAX_VOUCHER_INTERVAL_MB + 1] {
+        let ext = StreamRequestExt {
+            voucher_interval_mb: Some(interval),
+            ..Default::default()
+        };
+        let res = raw_request(&client_ep, target.clone(), &req, Some(&ext)).await;
+        anyhow::ensure!(
+            res.is_err(),
+            "voucher_interval_mb {interval} is out of range and must reset the stream, \
+             not be clamped into range; got {res:?}"
+        );
+    }
+
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
 /// A `ChannelStateStore` that hydrates its seeded channels (so vouchers reach
 /// the apply path) but fails every `record` with a transient I/O error —
 /// exercises the `ChannelError::Store` → `RetryLater` in-band rejection.

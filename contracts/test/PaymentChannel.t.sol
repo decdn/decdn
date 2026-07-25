@@ -699,6 +699,17 @@ contract PaymentChannelTest is Test {
     // Governance setters
     // -----------------------------------------------------------------
 
+    function test_maxVoucherInterval_getterRemoved() public view {
+        (bool ok,) = address(channel).staticcall(abi.encodeWithSignature("maxVoucherIntervalMb()"));
+        assertFalse(ok, "on-chain max voucher interval state must be absent");
+    }
+
+    function test_setMaxVoucherInterval_governanceEntryPointRemoved() public {
+        vm.prank(admin);
+        (bool ok,) = address(channel).call(abi.encodeWithSignature("setMaxVoucherIntervalMb(uint256)", 2));
+        assertFalse(ok, "on-chain max voucher interval setter must be absent");
+    }
+
     function test_setFeeRouter_updatesTarget() public {
         MockSettlementRouter router2 = new MockSettlementRouter(usdc);
         vm.prank(admin);

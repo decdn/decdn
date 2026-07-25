@@ -119,7 +119,6 @@ The α range upper-bounds at 1.8 to prevent a concentration penalty so steep tha
 | Max multiaddr size | CapacityBond | 64 bytes | 1024 bytes |
 | Dispute window (default: 48h) | PaymentChannel | 48 hours | 72 hours (3 days) |
 | Rate floor/ceiling | PaymentChannel | Floor ≥ 1 base unit | Ceiling > floor |
-| Max voucher interval | PaymentChannel | 1 MB | 1024 MB (~1 GB) |
 | Min deposit | PaymentChannel | 1 base unit | No max |
 | Challenge bond | SlashJudge | 1 TOKEN | 1,000 TOKEN |
 | Base slash reset period | CapacityBond | 30 days | 365 days |

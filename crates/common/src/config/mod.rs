@@ -2390,14 +2390,15 @@ pub fn resolve_payment_into(
         },
     );
     // Voucher cadence advertised in `StreamResponse` (ADR 003 §Voucher Interval
-    // Negotiation). Default 1 MB; governable range 1..=1024. File-only (no CLI
-    // override) — it is read once at handler construction, not hot-reloadable.
+    // Negotiation). Default 1 MB; hardcoded wire range 1..=1024 (no on-chain
+    // counterpart). File-only (no CLI override) — it is read once at handler
+    // construction, not hot-reloadable.
     let voucher_interval_mb = file
         .and_then(|p| p.voucher_interval_mb)
         .unwrap_or(decdn_protocol::DEFAULT_VOUCHER_INTERVAL_MB);
     // Lower bound is the literal minimum cadence (1 MB), not the default const:
     // a future change to DEFAULT_VOUCHER_INTERVAL_MB must not narrow the valid
-    // governable range (ADR 003 §Voucher Interval Negotiation: 1..=1024).
+    // wire range (ADR 003 §Voucher Interval Negotiation: 1..=1024).
     bag.check_with(
         (1..=decdn_protocol::MAX_VOUCHER_INTERVAL_MB).contains(&voucher_interval_mb),
         "payment.voucher_interval_mb",

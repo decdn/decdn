@@ -26,7 +26,7 @@ A channel is opened by depositing the payment token into the `PaymentChannel` co
 
 Key parameters:
 
-- Voucher cadence: 1 MB delivered per voucher (default; negotiable up to `maxVoucherIntervalMb` for large transfers — see [Voucher Interval Negotiation](#voucher-interval-negotiation))
+- Voucher cadence: 1 MB delivered per voucher (default; negotiable up to the 1024 MB wire ceiling for large transfers — see [Voucher Interval Negotiation](#voucher-interval-negotiation))
 - Minimum deposit: 1 USDC (contract floor, governable); recommended practical minimum: 10 USDC (see [Deposit Economics](#deposit-economics))
 - Fee routing: the operator payment-token balance is forwarded to `FeeRouter.routeSettlement(operator, bytesDelivered, amount)` — at final settlement, and incrementally on each `withdraw` — and the three-bucket split (60% operator base, 30% buyback, 10% treasury) is dispatched same-tx per [ADR 026](026-tokenomics.md#adr-026-tokenomics). The per-call deltas partition the channel's lifetime claim, so each byte and USDC unit is split exactly once. See [FeeRouter Integration](#feerouter-integration).
 - Operator return is differentiated through the `CapacityBond` lock-to-capacity curve per [ADR 026](026-tokenomics.md#adr-026-tokenomics), not via a fee-discount mechanic on the channel contract.
@@ -64,19 +64,17 @@ Gas abstraction via ERC-2771 or ERC-4337 paymasters is targeted at production.
 
 At the default 1 MB cadence, a 10 GB blob requires 10,000 vouchers — each involving a sign, transmit, verify, and ack cycle. This overhead is unnecessary when the unacknowledged exposure per interval is negligible at typical rates.
 
-**Parameter:** `maxVoucherIntervalMb` is a governable parameter on `PaymentChannel` defining the maximum allowed voucher interval in MB. Default: 1 MB. Hardcoded safety bounds: minimum 1 MB, maximum 1024 MB (~1 GB).
+**Wire bounds:** `voucher_interval_mb` MUST be in `1..=1024` (`MAX_VOUCHER_INTERVAL_MB`) wherever it appears, in both `StreamRequest` and `StreamResponse`. The bound is hardcoded in the wire schema, not governable — there is no on-chain counterpart, because vouchers carry no interval field and the contract therefore cannot verify what cadence was used during off-chain delivery. A peer that proposes or accepts a value outside the range commits a protocol error: the message is rejected, not clamped.
 
 **Negotiation semantics:**
 
 1. The client proposes a `voucher_interval_mb` in `StreamRequest` (see [ADR 005](005-protocol.md#adr-005-wire-protocol)).
 2. The node responds with its accepted `voucher_interval_mb` in `StreamResponse`. The node may accept the client's proposal, reduce it, or omit the field to fall back to 1 MB.
-3. The effective interval for the stream is `min(client_proposed, node_accepted, on-chain maxVoucherIntervalMb)`.
+3. The effective interval for the stream is `min(client_proposed, node_accepted)` — computed over values that have each already passed the wire-bounds check above, so the `min` narrows the cadence but never rescues an out-of-range message.
 
 **Default:** `voucher_interval_mb` is optional in both `StreamRequest` and `StreamResponse`; if absent, the default is 1 MB.
 
 **Node sovereignty:** A node can always enforce a smaller interval than the negotiated value by stopping delivery after that many MB without receiving a voucher. This uses the existing self-enforcing mechanism — no protocol change needed beyond the negotiation field.
-
-**Enforcement model:** The on-chain `maxVoucherIntervalMb` parameter is advisory — vouchers contain no interval field, so the contract cannot verify what interval was used during off-chain delivery. Enforcement depends on honest client and node software querying the on-chain parameter and capping their negotiation accordingly. This is consistent with other off-chain protocol parameters (e.g., `rate_per_mb` is advertised off-chain and only becomes enforceable when both signed messages are submitted as slash evidence). The governance parameter serves as a coordination point and a signal to implementations, not a contract-level invariant.
 
 **Risk analysis at negotiated intervals:**
 
@@ -188,7 +186,7 @@ Surfacing these reasons off-chain saves both parties the gas of a doomed on-chai
 - On-chain costs are amortized across an entire channel lifetime — open + close + settle = three transactions regardless of how many MB are delivered (settle can be called by any address, allowing third-party settlement bots)
 - USDC denomination gives node operators predictable unit economics: delivery revenue covers infrastructure costs without exposure to TOKEN price movements
 - The voucher is the payment receipt; the BLAKE3 hash is the delivery receipt. Together they provide mutual protection: the client doesn't sign a voucher for bytes that fail hash verification; the node stops delivering if vouchers stop arriving
-- Maximum risk per voucher interval at default cadence (1 MB) is $0.00001 at market rate — negligible. At the governance maximum interval (1024 MB) and ceiling rate ($0.001/MB), worst-case risk is $1.024 per interval — still small relative to the recommended 10 USDC minimum deposit (see [Voucher Interval Negotiation](#voucher-interval-negotiation))
+- Maximum risk per voucher interval at default cadence (1 MB) is $0.00001 at market rate — negligible. At the wire ceiling (1024 MB) and ceiling rate ($0.001/MB), worst-case risk is $1.024 per interval — still small relative to the recommended 10 USDC minimum deposit (see [Voucher Interval Negotiation](#voucher-interval-negotiation))
 - Market-driven rate setting means replication happens organically: profitable content gets cached by more nodes, driving prices down without any coordination protocol
 - The `PaymentChannel` contract is functionally separated from the `CapacityBond`, keeping the audit surface for each contract's core logic bounded
 
@@ -206,7 +204,7 @@ Surfacing these reasons off-chain saves both parties the gas of a doomed on-chai
 
 Client receives bytes but stops signing vouchers, getting content for free up to the last signed interval.
 
-The self-enforcing stop is sufficient. Maximum loss is one voucher interval at the negotiated cadence: default cadence (1 MB × market rate ≈ $0.00001) is negligible; 100 MB at market rate is ~$0.001; governance maximum (1024 MB) at ceiling rate is ~$1.024 — still negligible relative to channel deposits. Nodes serving high-value content can unilaterally enforce smaller intervals regardless of what was negotiated.
+The self-enforcing stop is sufficient. Maximum loss is one voucher interval at the negotiated cadence: default cadence (1 MB × market rate ≈ $0.00001) is negligible; 100 MB at market rate is ~$0.001; the wire ceiling (1024 MB) at the ceiling rate is ~$1.024 — still negligible relative to channel deposits. Nodes serving high-value content can unilaterally enforce smaller intervals regardless of what was negotiated.
 
 #### Channel griefing
 
@@ -408,7 +406,6 @@ struct Channel {
 | Governance | `setMinDeposit(amount)` | Minimum channel deposit. |
 | Governance | `setDisputeWindow(seconds)` | Dispute window (bounded 172800–259200 — 48h–72h). |
 | Governance | `setRateBounds(floor, ceiling)` | Rate floor and ceiling in payment-token base units. |
-| Governance | `setMaxVoucherIntervalMb(mb)` | Max negotiable voucher interval (bounded 1–1024 MB). |
 
 Bucket shares (60/30/10) are governed on `FeeRouter`, not on `PaymentChannel`; the treasury share (10%) is configured on `FeeRouter`.
 
@@ -455,7 +452,7 @@ Because `withdraw` advances `claimedNonce` above zero, the zero-voucher close ca
 
 #### Initial deployment values
 
-The constructor takes `(usdc, capacityBond, feeRouter, disputeWindow, maxChannelDuration, deliveryFloor, deliveryCeiling, admin)` per [ADR 016 § step 8](016-contract-interactions.md#post-deployment-initialization) and defaults the parameters not passed as args: `minDeposit = 1_000_000` (1 USDC) and `maxVoucherIntervalMb = 1` (1 MB). `disputeWindow` and `maxChannelDuration` are constructor arguments validated against the hardcoded safety bounds (deployment defaults: 48h and 90d respectively — see the bounds table below and [ADR 009](009-governance.md#adr-009-governance-model) for governance ranges). The constructor MUST reject any zero address among `(usdc, capacityBond, feeRouter, admin)` and a `feeRouter` whose code size is zero (EOA / undeployed address).
+The constructor takes `(usdc, capacityBond, feeRouter, disputeWindow, maxChannelDuration, deliveryFloor, deliveryCeiling, admin)` per [ADR 016 § step 8](016-contract-interactions.md#post-deployment-initialization) and defaults the parameter not passed as an argument: `minDeposit = 1_000_000` (1 USDC). `disputeWindow` and `maxChannelDuration` are constructor arguments validated against the hardcoded safety bounds (deployment defaults: 48h and 90d respectively — see the bounds table below and [ADR 009](009-governance.md#adr-009-governance-model) for governance ranges). The constructor MUST reject any zero address among `(usdc, capacityBond, feeRouter, admin)` and a `feeRouter` whose code size is zero (EOA / undeployed address).
 
 Default deployment value for `disputeWindow`: **172800 seconds (48 hours)** — sized to guarantee effective dispute response time under L2 sequencer censorship (see [§ L2 sequencer censorship](#l2-sequencer-censorship) below). Safety bounds per [ADR 009](009-governance.md#adr-009-governance-model): 172800–259200 seconds (48h–72h). Under [ADR 026](026-tokenomics.md#adr-026-tokenomics) the constructor carries no `feePercentage` / `discountedFeePercentage` / treasury-address parameters; bucket shares are governed on `FeeRouter`, and the treasury bucket is one of `FeeRouter`'s three buckets (see [FeeRouter Integration](#feerouter-integration)).
 
@@ -501,7 +498,6 @@ All events use indexed `channelId` plus an indexed actor field where applicable.
 | Min deposit | 1 base unit | No max |
 | Rate floor | 1 base unit | Must be < ceiling |
 | Rate ceiling | Must be > floor | No max |
-| Max voucher interval | 1 MB | 1024 MB (~1 GB) |
 | Max channel duration | 604800 seconds (7 days) | 31536000 seconds (365 days) |
 
 `PaymentChannel` does not hold a fee-percentage parameter. Bucket-share bounds (60/30/10 with per-share bounds 40–90 / 5–50 / 0–30) are owned by `FeeRouter` per [ADR 026 § Governable parameters with safety bounds](026-tokenomics.md#governable-parameters-with-safety-bounds).

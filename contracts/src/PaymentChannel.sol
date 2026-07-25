@@ -69,8 +69,6 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, SunsettingPausable, E
     uint256 internal constant DISPUTE_WINDOW_CEILING = 72 hours;
     uint256 internal constant MAX_CHANNEL_DURATION_FLOOR = 7 days;
     uint256 internal constant MAX_CHANNEL_DURATION_CEILING = 365 days;
-    uint256 internal constant MAX_VOUCHER_INTERVAL_FLOOR = 1;
-    uint256 internal constant MAX_VOUCHER_INTERVAL_CEILING = 1024;
     uint256 internal constant MIN_DEPOSIT_FLOOR = 1;
 
     /// @dev 1 MB in bytes (binary MB, ADR 005 / `rate::BYTES_PER_MB`). Used to
@@ -78,12 +76,10 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, SunsettingPausable, E
     ///      floor enforced at settlement (`_advanceClaimWatermark`).
     uint256 internal constant BYTES_PER_MB = 1_048_576;
 
-    /// @dev Deployment defaults for the governable params ADR 016 § step 8 does
-    ///      not pass as constructor args. `minDeposit` = 1 USDC (6 decimals) —
-    ///      the dust floor of ADR 003 § Deposit Economics; `maxVoucherIntervalMb`
-    ///      = 1 MB cadence default.
+    /// @dev Deployment default for the governable param ADR 016 § step 8 does
+    ///      not pass as a constructor arg. `minDeposit` = 1 USDC (6 decimals) —
+    ///      the dust floor of ADR 003 § Deposit Economics.
     uint256 internal constant DEFAULT_MIN_DEPOSIT = 1_000_000;
-    uint256 internal constant DEFAULT_MAX_VOUCHER_INTERVAL_MB = 1;
 
     // -----------------------------------------------------------------
     // EIP-712 voucher typing (ADR 003 § EIP-712 Voucher Signature)
@@ -130,9 +126,6 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, SunsettingPausable, E
 
     /// @notice Minimum opening deposit in USDC base units (default 1 USDC).
     uint256 public minDeposit;
-
-    /// @notice Advisory max negotiable voucher interval in MB (bounded [1, 1024]).
-    uint256 public maxVoucherIntervalMb;
 
     /// @dev Rate bounds in USDC base units per MB, exposed via `getRateBounds`.
     ///      `deliveryFloor` is the per-byte price floor ENFORCED at settlement
@@ -234,7 +227,6 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, SunsettingPausable, E
     event FeeRouterUpdated(address indexed oldRouter, address indexed newRouter);
     event MinDepositUpdated(uint256 oldValue, uint256 newValue);
     event DisputeWindowUpdated(uint256 oldValue, uint256 newValue);
-    event MaxVoucherIntervalUpdated(uint256 oldValue, uint256 newValue);
     event RateBoundsUpdated(uint256 newDeliveryFloor, uint256 newDeliveryCeiling);
 
     // -----------------------------------------------------------------
@@ -321,7 +313,6 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, SunsettingPausable, E
         deliveryFloor = deliveryFloor_;
         deliveryCeiling = deliveryCeiling_;
         minDeposit = DEFAULT_MIN_DEPOSIT;
-        maxVoucherIntervalMb = DEFAULT_MAX_VOUCHER_INTERVAL_MB;
 
         _grantRole(DEFAULT_ADMIN_ROLE, admin);
         _grantRole(GOVERNANCE_ROLE, admin);
@@ -783,15 +774,6 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, SunsettingPausable, E
         deliveryFloor = newFloor;
         deliveryCeiling = newCeiling;
         emit RateBoundsUpdated(newFloor, newCeiling);
-    }
-
-    function setMaxVoucherIntervalMb(uint256 newMaxMb) external onlyRole(GOVERNANCE_ROLE) {
-        if (newMaxMb < MAX_VOUCHER_INTERVAL_FLOOR || newMaxMb > MAX_VOUCHER_INTERVAL_CEILING) {
-            revert ParamOutOfBounds(newMaxMb, MAX_VOUCHER_INTERVAL_FLOOR, MAX_VOUCHER_INTERVAL_CEILING);
-        }
-        uint256 old = maxVoucherIntervalMb;
-        maxVoucherIntervalMb = newMaxMb;
-        emit MaxVoucherIntervalUpdated(old, newMaxMb);
     }
 
     // -----------------------------------------------------------------
