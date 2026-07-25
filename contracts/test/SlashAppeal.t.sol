@@ -3,6 +3,7 @@ pragma solidity 0.8.28;
 
 import { Test } from "forge-std/Test.sol";
 import { IAccessControl } from "@openzeppelin/contracts/access/IAccessControl.sol";
+import { ERC20Burnable } from "@openzeppelin/contracts/token/ERC20/extensions/ERC20Burnable.sol";
 
 import { SlashAppeal } from "../src/SlashAppeal.sol";
 import { SunsettingPausable } from "../src/SunsettingPausable.sol";
@@ -93,6 +94,59 @@ contract SlashAppealTest is Test {
     function _open(uint256 slashId) internal {
         vm.prank(operator);
         appeal.openSlashAppeal(slashId, keccak256("evidence"));
+    }
+
+    // -----------------------------------------------------------------
+    // constructor
+    // -----------------------------------------------------------------
+
+    /// @dev The guard is a three-way `||`, so each clause needs its own case —
+    ///      dropping one still compiles and still passes every other test here.
+    function test_constructor_revertsOnZeroToken() public {
+        vm.expectRevert(SlashAppeal.ZeroAddress.selector);
+        new SlashAppeal({
+            token_: ERC20Burnable(address(0)),
+            capacityBond_: ICapacityBond(address(bond)),
+            admin: admin,
+            emergencyMultisig: multisig,
+            appealBond_: APPEAL_BOND
+        });
+    }
+
+    function test_constructor_revertsOnZeroCapacityBond() public {
+        vm.expectRevert(SlashAppeal.ZeroAddress.selector);
+        new SlashAppeal({
+            token_: token,
+            capacityBond_: ICapacityBond(address(0)),
+            admin: admin,
+            emergencyMultisig: multisig,
+            appealBond_: APPEAL_BOND
+        });
+    }
+
+    function test_constructor_revertsOnZeroAdmin() public {
+        vm.expectRevert(SlashAppeal.ZeroAddress.selector);
+        new SlashAppeal({
+            token_: token,
+            capacityBond_: ICapacityBond(address(bond)),
+            admin: address(0),
+            emergencyMultisig: multisig,
+            appealBond_: APPEAL_BOND
+        });
+    }
+
+    /// @dev `emergencyMultisig` is explicitly allowed to be zero (the role is
+    ///      simply left ungranted), so it must NOT trip the guard.
+    function test_constructor_allowsZeroEmergencyMultisig() public {
+        SlashAppeal noMultisig = new SlashAppeal({
+            token_: token,
+            capacityBond_: ICapacityBond(address(bond)),
+            admin: admin,
+            emergencyMultisig: address(0),
+            appealBond_: APPEAL_BOND
+        });
+        assertFalse(noMultisig.hasRole(noMultisig.EMERGENCY_MULTISIG_ROLE(), address(0)));
+        assertTrue(noMultisig.hasRole(noMultisig.DEFAULT_ADMIN_ROLE(), admin));
     }
 
     // -----------------------------------------------------------------

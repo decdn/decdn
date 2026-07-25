@@ -45,6 +45,9 @@ import { Ed25519Verifier } from "../src/Ed25519Verifier.sol";
 ///                                            Sepolia USDC `0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d`)
 ///           - `EMERGENCY_MULTISIG`        — 3-of-5 multisig per ADR 009
 ///           - `INITIAL_TOKEN_HOLDER`      — 1B TOKEN recipient at genesis
+///           - `CURRENT_TERMS_HASH`        — genesis terms hash per ADR 019
+///                                            § Terms Acceptance; no default, and
+///                                            `CapacityBond` rejects the zero sentinel
 ///
 ///         The FeeRouter treasury bucket is NOT an env var: it is the
 ///         `TimelockController` this script deploys (step 7 sets it as the
