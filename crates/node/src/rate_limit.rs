@@ -529,10 +529,10 @@ fn make_quota(rate_per_sec: f64, burst: u32) -> Option<Quota> {
 mod tests {
     use super::*;
 
-    /// Eight pairwise-distinct sentinels, one per mapped field, so no two
-    /// fields can be confused for each other by a transposed assignment.
-    /// Shared by both `From` tests: the sentinel identifies the *slot*, and
-    /// the two `Resolved*` types are what select the impl under test.
+    // Eight pairwise-distinct sentinels, one per mapped field, so no two
+    // fields can be confused for each other by a transposed assignment.
+    // Shared by both `From` tests: the sentinel identifies the *slot*, and
+    // the two `Resolved*` types are what select the impl under test.
     const S_PER_PEER_RATE: f64 = 11.0;
     const S_PER_PEER_BURST: u32 = 22;
     const S_PER_IP_RATE: f64 = 33.0;
@@ -543,15 +543,40 @@ mod tests {
     const S_MAX_TRACKED_PER_PEER: usize = 88;
 
     /// Assert the sentinels landed in their matching `RateLimitConfig` slots.
+    ///
+    /// The destructure is exhaustive (no `..`) so this helper joins the arity
+    /// guard rather than opting out of it: a ninth field fails to compile here
+    /// until it is given an assertion below. Without it the impl literals would
+    /// force the field to be *mapped* while leaving it unpinned — a slot that
+    /// silently reverts to #1457's starting state.
     fn assert_sentinels_in_place(cfg: &RateLimitConfig) {
-        assert_eq!(cfg.per_peer_rate_per_sec, S_PER_PEER_RATE);
-        assert_eq!(cfg.per_peer_burst, S_PER_PEER_BURST);
-        assert_eq!(cfg.per_ip_rate_per_sec, S_PER_IP_RATE);
-        assert_eq!(cfg.per_ip_burst, S_PER_IP_BURST);
-        assert_eq!(cfg.global_rate_per_sec, S_GLOBAL_RATE);
-        assert_eq!(cfg.global_burst, S_GLOBAL_BURST);
-        assert_eq!(cfg.max_tracked_per_ip, S_MAX_TRACKED_PER_IP);
-        assert_eq!(cfg.max_tracked_per_peer, S_MAX_TRACKED_PER_PEER);
+        let RateLimitConfig {
+            per_peer_rate_per_sec,
+            per_peer_burst,
+            per_ip_rate_per_sec,
+            per_ip_burst,
+            global_rate_per_sec,
+            global_burst,
+            max_tracked_per_ip,
+            max_tracked_per_peer,
+        } = cfg;
+        assert_eq!(
+            *per_peer_rate_per_sec, S_PER_PEER_RATE,
+            "per_peer_rate_per_sec"
+        );
+        assert_eq!(*per_peer_burst, S_PER_PEER_BURST, "per_peer_burst");
+        assert_eq!(*per_ip_rate_per_sec, S_PER_IP_RATE, "per_ip_rate_per_sec");
+        assert_eq!(*per_ip_burst, S_PER_IP_BURST, "per_ip_burst");
+        assert_eq!(*global_rate_per_sec, S_GLOBAL_RATE, "global_rate_per_sec");
+        assert_eq!(*global_burst, S_GLOBAL_BURST, "global_burst");
+        assert_eq!(
+            *max_tracked_per_ip, S_MAX_TRACKED_PER_IP,
+            "max_tracked_per_ip"
+        );
+        assert_eq!(
+            *max_tracked_per_peer, S_MAX_TRACKED_PER_PEER,
+            "max_tracked_per_peer"
+        );
     }
 
     /// `From<&ResolvedDht>` must not transpose same-typed siblings. The
