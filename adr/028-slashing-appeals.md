@@ -13,7 +13,7 @@ Without a documented escalation path, every legitimate-outage slash (network out
 
 The slashed **operator** (and only the operator — `msg.sender` must equal the operator recorded in the slash) may file a **slashing appeal** within 30 days of a `SlashJudge` resolution. The appeal lives in the standalone **`SlashAppeal`** contract; opening one posts a TOKEN appeal bond and locks the slash's escrow on `CapacityBond` (`markAppealOpen`). The appeal slot is one-shot per `slashId`, so filing is operator-restricted: a permissionless filer would let anyone — notably the recorded challenger, who earns 50% of an upheld slash — burn the operator's only chance at recourse with a junk appeal (the bond, perjury re-slash, and frequency cap do not deter a throwaway/Sybil griefer). See [§ Eligibility and evidence standard](#eligibility-and-evidence-standard). Appeals are heard by the existing emergency multisig under a fast-track authority mirroring [ADR 011 § Regional Governance Bodies](011-content-takedown.md#regional-governance-bodies)' suspension pattern: interim relief granted by the multisig (3-of-5), then granted or upheld by the operator-weighted Governor within 14 days (post-transition; bootstrap-multisig phase rules per [ADR 009 § Bootstrap-multisig phase](009-governance.md#bootstrap-multisig-phase)).
 
-A **successful** appeal (`grantAppeal`) calls `CapacityBond.settleAppealGranted`, which **refunds the full escrowed TOKEN to the operator** — their own slashed capital, in TOKEN, with no USDC conversion, no TWAP oracle, and no restitution cap — and releases this slash from the `slashedAtEpoch` zero-out, recomputing the watermark over the operator's remaining still-standing slashes — cleared to zero only when none remain ([ADR 036 § Slashing zero-out](036-served-bytes-voting-weight.md#slashing-zero-out)). A **failed** appeal (`upholdAppeal` / `rejectAppeal`, or lapse) distributes the escrow 50% challenger / 50% burn, identical to the no-appeal `finalizeUnappealedSlash` path. The operator's lifetime offense counter is **not** modified in either case (see [§ Reputation handling](#reputation-handling)) — an appeal restitutes capital, not standing.
+A **successful** appeal (`grantAppeal`) calls `CapacityBond.settleAppealGranted`, which **refunds the full escrowed TOKEN to the operator** — their own slashed capital, in TOKEN, with no USDC conversion, no TWAP oracle, and no restitution cap — and releases this slash from the `slashedAtEpoch` zero-out, recomputing the watermark over the operator's remaining still-standing slashes — cleared to zero only when none remain ([ADR 036 § Slashing zero-out](036-served-bytes-voting-weight.md#slashing-zero-out)). A **failed** appeal (`upholdAppeal`, `rejectAppeal`, or review-window lapse) distributes the slash escrow 50% challenger / 50% burn, identical to the no-appeal `finalizeUnappealedSlash` path, and burns the separate appeal bond in full. The operator's lifetime offense counter is **not** modified in either case (see [§ Reputation handling](#reputation-handling)) — an appeal restitutes capital, not standing.
 
 ### Scope
 
@@ -46,7 +46,7 @@ sequenceDiagram
             else DecdnGovernor upholds (slash stands)
                 Gov->>SA: upholdAppeal(slashId)
                 SA->>CB: settleAppealUpheld — escrow 50% challenger / 50% burn
-                SA->>SA: 50% bond burned, 50% to challenger-incentive pool
+                SA->>SA: 100% of APPEAL_BOND burned
             else governance silent past APPEAL_RATIFICATION_WINDOW
                 Op->>SA: cleanupExpiredAppeal(slashId) — operator-favorable grant, APPEAL_BOND refunded
             end
@@ -56,7 +56,7 @@ sequenceDiagram
             SA->>SA: 100% of bond burned
         end
     else multisig silent past APPEAL_REVIEW_WINDOW
-        Op->>SA: cleanupExpiredAppeal(slashId) — upheld, bond burned, escrow 50/50
+        Op->>SA: cleanupExpiredAppeal(slashId) — upheld, 100% of APPEAL_BOND burned, escrow 50/50
     end
 ```
 
@@ -82,12 +82,10 @@ Evidence type (b) is the on-chain-verifiable path; (a) and (c) are off-chain-roo
 
 ### Appeal bond
 
-The appellant posts `APPEAL_BOND` in TOKEN at the time of filing. Default 1,000 TOKEN; governable with hard bounds `[100, 10,000]` per [ADR 009](009-governance.md#adr-009-governance-model) safety-bound pattern. Bond economics mirror [ADR 014 § Bond Handling](014-on-chain-verification.md#bond-handling):
+The appellant posts `APPEAL_BOND` in TOKEN at the time of filing. Default 1,000 TOKEN; governable with hard bounds `[100, 10,000]` per [ADR 009](009-governance.md#adr-009-governance-model) safety-bound pattern.
 
 - **Granted appeal (Governor `grantAppeal`):** bond refunded to the appellant in full.
-- **Multisig rejects at intake (`rejectAppeal`, no fast-track granted):** 100% of bond burned.
-- **Upheld appeal (Governor `upholdAppeal` after fast-track):** 50% of bond burned, 50% credited to the `SlashAppeal` challenger-incentive pool used to compensate parties who file successful counter-evidence in future appeals.
-- **Review-window lapse (multisig silent past `APPEAL_REVIEW_WINDOW`):** `cleanupExpiredAppeal` upholds the slash and burns the bond (the appellant cleared no scrutiny gate).
+- **Failed appeal (multisig `rejectAppeal`, Governor `upholdAppeal`, or review-window lapse):** 100% of the bond is burned. The disposition is identical for every slash-standing terminal path because there is no neutral counterparty to receive it.
 - **Ratification-window lapse (Governor silent past `APPEAL_RATIFICATION_WINDOW`):** `cleanupExpiredAppeal` grants operator-favorably and refunds the bond — the operator already cleared the multisig fast-track, so governance inaction is not the appellant's fault.
 
 The bond is the primary economic deterrent against pro-forma appeals filed hoping for multisig sympathy. The 365-day frequency cap ([§ Hard caps and frequency limits](#hard-caps-and-frequency-limits)) and the perjury re-slash ([§ Eligibility and evidence standard](#eligibility-and-evidence-standard)) are secondary deterrents.
@@ -118,9 +116,9 @@ This ADR specifies the contract surface at the semantic level — function signa
 // three offense types. `evidenceBundleHash` references the off-chain bundle.
 function openSlashAppeal(uint256 slashId, bytes32 evidenceBundleHash) external; // posts APPEAL_BOND, calls markAppealOpen
 function fastTrackAppeal(uint256 slashId) external onlyEmergencyMultisig;
-function rejectAppeal(uint256 slashId) external onlyEmergencyMultisig;   // uphold, burn bond
+function rejectAppeal(uint256 slashId) external onlyEmergencyMultisig;   // uphold, burn full appeal bond
 function grantAppeal(uint256 slashId) external onlyGovernor;             // operator vindicated → settleAppealGranted
-function upholdAppeal(uint256 slashId) external onlyGovernor;            // slash stands → settleAppealUpheld
+function upholdAppeal(uint256 slashId) external onlyGovernor;            // slash stands → settleAppealUpheld + burn full appeal bond
 function cleanupExpiredAppeal(uint256 slashId) external;                 // permissionless lapse handler
 
 // On CapacityBond (SLASH_APPEAL_ROLE — held by SlashAppeal).
@@ -155,19 +153,20 @@ Modeled abuse paths and counters:
 
 | Abuse path | Counter |
 | --- | --- |
-| Operator A is slashed legitimately, files appeal hoping multisig sympathy. | `APPEAL_BOND` forfeit on reversal; perjury re-slash ([§ Eligibility and evidence standard](#eligibility-and-evidence-standard)) if sworn declaration is contradicted by the multisig's review; reputation cost stands ([§ Reputation handling](#reputation-handling)). |
+| Operator A is slashed legitimately, files appeal hoping multisig sympathy. | Full `APPEAL_BOND` burn on every failed path; perjury re-slash ([§ Eligibility and evidence standard](#eligibility-and-evidence-standard)) if sworn declaration is contradicted by the multisig's review; reputation cost stands ([§ Reputation handling](#reputation-handling)). |
 | Operator commits a real offense, fabricates an outage to escape consequences. | Each [§ Eligibility and evidence standard](#eligibility-and-evidence-standard) evidence type is cryptographically bound to a third party whose own signing identity is at risk on perjury: (a) requires a verifiable third-party signature (ISP, cloud provider, NTP source); (b) requires peer-gossip telemetry that other parties have signed; (c) requires an EIP-712 signature from a peer operator whose reputation and bond are themselves on the line. The ≥2-of-3 requirement therefore forces collusion across at least two independent signing parties, and fabrication of any source is provable post-hoc by the original signer disclaiming the signature — triggering the perjury re-slash. |
 | Operator games the 365-day frequency cap by spreading offenses across calendar years. | Cap is rolling, not calendar-bound — measured from the previous successful ratification date. |
 | Sybil operator network co-signs each other's (c) attestations. | Each qualifying co-signer must be a separately staked, capacity-bonded operator ([ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve)), so a sybil ring of witnesses means funding multiple real bonds — the cost scales with the number of fake identities, not the ease of spinning them up. |
 | Multisig grants interim relief, but ratification fails — operator could withdraw restitution before the reversal lands. | Structurally impossible: the slashed TOKEN never leaves `CapacityBond` escrow until finality. `grantAppeal` refunds it to the operator; `upholdAppeal` distributes it 50/50. There is no intermediate operator-held capital to claw back. |
-| Sybil ring files appeals to drain a shared reserve. | No shared reserve exists. Each appeal can only ever release the escrow of its own `slashId` back to that slash's operator — there is no pool to drain and no cross-appeal fund flow. The `APPEAL_BOND` + ≥2-evidence-source bar still gate frivolous filings. |
+| Sybil ring files appeals to drain a shared reserve. | No shared reserve or appeal-bond incentive pool exists. Each appeal can only ever release the escrow of its own `slashId` back to that slash's operator — there is no pool to drain and no cross-appeal fund flow. The `APPEAL_BOND` + ≥2-evidence-source bar still gate frivolous filings. |
 
 ## Consequences
 
 ### Positive
 
 - Closes the issue-403 gap with a bounded, documented mechanism — no ad-hoc multisig discretion for legitimate-outage cases.
-- Reuses existing primitives: `CapacityBond` escrow, emergency multisig, DecdnGovernor, [ADR 014 § Bond Handling](014-on-chain-verification.md#bond-handling) bond economics, [ADR 011](011-content-takedown.md#regional-governance-bodies) ratification pattern. No new governance body; one small new contract (`SlashAppeal`).
+- Reuses existing primitives: `CapacityBond` escrow, emergency multisig, DecdnGovernor, [ADR 011](011-content-takedown.md#regional-governance-bodies) ratification pattern. No new governance body; one small new contract (`SlashAppeal`). The appeal bond is deliberately *not* modeled on [ADR 014 § Bond Handling](014-on-chain-verification.md#bond-handling): a challenger bond there is returned whenever verification passes and is never forfeited after the fact, whereas an appeal bond is burned in full on every slash-standing terminal path.
+- Every failed appeal bond has one deterministic disposition: 100% burn. No counter-evidence identity, claim path, disbursement path, or incentive-pool fund sink is required.
 - Operator relief is bounded and predictable: the multisig fast-track decision lands within `APPEAL_REVIEW_WINDOW` (14 days) and the operator's escrowed TOKEN is refunded on `grantAppeal` within at most another 14 days (`APPEAL_RATIFICATION_WINDOW`), vs. the ~9-day minimum + indefinite proposal-drafting latency of a Governor-only path.
 - Operator trust improves — onboarding pitches can point to a documented appeal path rather than "trust the multisig."
 - Reputation and offense-count are preserved, so the repeat-behavior deterrent is intact.

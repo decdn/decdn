@@ -36,7 +36,6 @@ contract DeployProtocolScriptTest is Test, DeployProtocol {
     address internal constant TEST_ED25519 = address(0xeD25);
     address internal constant TEST_MULTISIG = address(0xC0DE);
     address internal constant TEST_INITIAL_HOLDER = address(0xbEEF);
-    address internal constant TEST_CHALLENGER_POOL = address(0xccEE);
 
     // Test-only chain ids so manifest writes never collide with a real
     // `deployments/<realChain>.json`. Each test uses a distinct id to avoid
@@ -56,7 +55,6 @@ contract DeployProtocolScriptTest is Test, DeployProtocol {
         vm.setEnv("USDC_ADDRESS", vm.toString(TEST_USDC));
         vm.setEnv("EMERGENCY_MULTISIG", vm.toString(TEST_MULTISIG));
         vm.setEnv("INITIAL_TOKEN_HOLDER", vm.toString(TEST_INITIAL_HOLDER));
-        vm.setEnv("CHALLENGER_INCENTIVE_POOL", vm.toString(TEST_CHALLENGER_POOL));
         vm.setEnv("CURRENT_TERMS_HASH", vm.toString(TEST_TERMS_HASH));
         vm.setEnv("FORCE_OVERWRITE_MANIFEST", "false");
     }
@@ -89,7 +87,6 @@ contract DeployProtocolScriptTest is Test, DeployProtocol {
         assertEq(address(cfg.ed25519Verifier), address(0), "ed25519 resolved at deploy time");
         assertEq(cfg.emergencyMultisig, TEST_MULTISIG, "multisig");
         assertEq(cfg.initialTokenHolder, TEST_INITIAL_HOLDER, "holder");
-        assertEq(cfg.challengerIncentivePool, TEST_CHALLENGER_POOL, "challenger");
         assertEq(cfg.timelockDelay, DEFAULT_TIMELOCK_DELAY, "timelockDelay");
         assertEq(cfg.minBond, DEFAULT_MIN_BOND, "minBond");
         assertEq(cfg.unbondingPeriod, DEFAULT_UNBONDING_PERIOD, "unbondingPeriod");
