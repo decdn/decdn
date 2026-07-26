@@ -18,7 +18,7 @@ This directory is the protocol's canonical specification. Each numbered file is 
 For first-time readers, follow this thematic order rather than the numeric one. Each chapter assumes the previous chapters are read. The full chapter-by-chapter ADR list lives in [`architecture.md` § Reading Order](architecture.md#reading-order).
 
 1. **Foundations** — language stack, network topology, content addressing, wire protocol.
-2. **Discovery** — DHT-based content lookup, QUIC 0-RTT.
+2. **Discovery** — DHT-based content lookup, regional proxy warming, multi-source fetch.
 3. **Payments** — channels, vouchers, client architecture, smart-wallet support.
 4. **Tokenomics & incentives** — work-token tokenomics, liquidity strategy, deferred follow-ups.
 5. **Verification & enforcement** — on-chain slashing evidence, reputation, content takedown.

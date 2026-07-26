@@ -97,7 +97,8 @@ These give early warning for the three slashable offenses in [ADR 026 § Slashin
 
 | Metric | Type | Tier | Labels | Description |
 |--------|------|------|--------|-------------|
-| `decdn_probe_collection_latency_seconds` | Histogram | M | `outcome={0rtt_warm,1rtt_cold}` | Duration of a complete probe collection window, send to collection end. The `outcome` label measures 0-RTT impact per [ADR 015](015-zero-rtt.md#adr-015-quic-0-rtt-connection-establishment). Buckets: `[0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5]`. |
+| `decdn_probe_collection_latency_seconds` | Histogram | M | — | Duration of a complete probe collection window, send to collection end, bounding the window in [ADR 001 § Probe response collection](001-network.md#probe-response-collection). Buckets: `[0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5]`. |
+| `decdn_probe_requests_total` | Counter | R | — | Probe requests served by this node, incremented once the response frame is written. The serve-side counterpart to `decdn_probe_responses_total` (which counts probes this node *sent* and got answers to). Flat while a node is reachable but unprobed; the first signal that a restarted or re-keyed node is being found again. |
 | `decdn_probe_responses_total` | Counter | R | `result={has_blob,no_blob,timeout}` | Probe responses received, by result. |
 | `decdn_probe_holds_disabled_total` | Counter | M | — | Probes answered `has_blob: false` for a *present* blob because the eviction-hold path is disabled by config (`max_probe_holds == 0`). An intentional operator decision, not budget pressure — split out from `decdn_probe_hold_violations_total` so a deliberate disable does not trip its "increase `max_probe_holds`" alert ([ADR 005](005-protocol.md#probe-triggered-eviction-hold)). |
 | `decdn_probe_cache_hits_total` | Counter | R | — | Cache-miss pulls whose candidate walk started from a live [ADR 001 § Probe cache](001-network.md#adr-001-network-topology-and-peer-mesh) entry. DHT lookup and probe fanout are skipped, unless every cached provider fails — the fetch then either falls through to a fresh lookup + probe (if attempt budget remains) or returns a clean miss (if the cached providers exhausted the budget first, the common case since an entry holds up to 10 providers but the budget is 3), and stays counted here either way (the hit measures "the cache had something worth trying", not delivery). With `decdn_probe_cache_misses_total` this is the hit ratio the TTL exists to buy (`probe_cache_ttl = PROBE_SLASH_WINDOW / 2`, [ADR 005 § Derived constants](005-protocol.md#adr-005-wire-protocol)); a ratio near zero means the TTL is shorter than the inter-arrival time for hot blobs and the cache is pure overhead. |
@@ -134,18 +135,6 @@ Reputation is local-only per [ADR 008](008-reputation.md#adr-008-reputation-syst
 | Metric | Type | Tier | Description |
 |--------|------|------|-------------|
 | `decdn_reputation_score` | Gauge | R | This node's current local reputation score (0.0–1.0) for a peer, computed from its own delivery observations per [ADR 008](008-reputation.md#adr-008-reputation-system). |
-
-#### QUIC / 0-RTT Metrics
-
-Per [ADR 015](015-zero-rtt.md#adr-015-quic-0-rtt-connection-establishment). All labeled by `alpn`.
-
-| Metric | Type | Tier | Description |
-|--------|------|------|-------------|
-| `decdn_quic_0rtt_attempts_total` | Counter | R | 0-RTT connection attempts. |
-| `decdn_quic_0rtt_accepted_total` | Counter | R | 0-RTT connections accepted by server. |
-| `decdn_quic_0rtt_rejected_total` | Counter | R | 0-RTT rejected, fell back to 1-RTT. |
-
-These are the canonical forms of the identically-named metrics in [ADR 015](015-zero-rtt.md#adr-015-quic-0-rtt-connection-establishment); semantics are unchanged under the canonical naming regime.
 
 #### Node / Process Metrics
 
@@ -238,7 +227,7 @@ In the metric names below, `<watcher>` expands to one of **`slash_watcher`**, **
 | `status` | Meaning |
 |----------|---------|
 | `ready` | All Phase 5 acceptance criteria satisfied ([ADR 019](019-node-onboarding.md#phase-5--accepting-paid-delivery)); serving traffic. |
-| `degraded` | Running but one or more non-critical conditions impaired (e.g., gossip mesh thin, 0-RTT cache cold). Traffic still accepted. |
+| `degraded` | Running but one or more non-critical conditions impaired (e.g., gossip mesh thin, peer table sparse). Traffic still accepted. |
 | `not_ready` | A mandatory startup check failed or is incomplete (blacklist un-synced, rate bounds not loaded, not registered). Not accepting traffic. |
 
 HTTP status codes: `200` for `ready` and `degraded`; `503` for `not_ready`. Monitoring systems SHOULD alert on `503` responses.
@@ -276,10 +265,7 @@ Earlier ADRs used informal metric names; this table maps them to canonical repla
 | `blacklist_sync_lag_seconds` | `decdn_blacklist_sync_lag_seconds` | [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting) |
 | `blacklist_version_behind` | `decdn_blacklist_version_behind` | [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting) |
 | `slash_evidence_exposure` | `decdn_slash_evidence_exposure_total` | architecture.md |
-| `quic_0rtt_attempts_total` | `decdn_quic_0rtt_attempts_total` | [ADR 015](015-zero-rtt.md#adr-015-quic-0-rtt-connection-establishment) |
-| `quic_0rtt_accepted_total` | `decdn_quic_0rtt_accepted_total` | [ADR 015](015-zero-rtt.md#adr-015-quic-0-rtt-connection-establishment) |
-| `quic_0rtt_rejected_total` | `decdn_quic_0rtt_rejected_total` | [ADR 015](015-zero-rtt.md#adr-015-quic-0-rtt-connection-establishment) |
-| `probe_collection_latency_seconds` | `decdn_probe_collection_latency_seconds` | [ADR 015](015-zero-rtt.md#adr-015-quic-0-rtt-connection-establishment) |
+| `probe_collection_latency_seconds` | `decdn_probe_collection_latency_seconds` | [ADR 001 § Probe response collection](001-network.md#probe-response-collection) |
 | `streams_active` | `decdn_streams_active` | architecture.md |
 | `streams_completed` | `decdn_streams_completed_total` | architecture.md |
 | `streams_failed` | `decdn_streams_failed_total` | architecture.md |
@@ -310,7 +296,7 @@ Add the file via Prometheus `rule_files:` and reload. Validate with `promtool ch
 
 #### Scope
 
-Covers M-tier slash-safety metrics and the most common R-tier panels for a first dashboard. Deliberately not exhaustive: 0-RTT panels are left to deployment-specific dashboards.
+Covers M-tier slash-safety metrics and the most common R-tier panels for a first dashboard. Deliberately not exhaustive.
 
 ## Consequences
 

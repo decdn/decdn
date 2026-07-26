@@ -319,7 +319,6 @@ fn build_config(
             bind_port: 0,
             relay_urls: Vec::new(),
             discovery: ResolvedDiscovery::default(),
-            enable_0rtt: true,
         },
         blockchain: ResolvedBlockchain {
             origin_assignment_address: None,

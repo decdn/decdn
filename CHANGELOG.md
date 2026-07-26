@@ -23,6 +23,39 @@ since project inception and will roll into the first tagged release.
 
 ### Changed (BREAKING)
 
+- **QUIC 0-RTT probe establishment removed (#1429).** `cdn/probe/v1`
+  connections always complete a full TLS 1.3 handshake before the request is
+  sent; no ALPN transmits application bytes as replayable early data. The
+  optimization saved one round trip, and only on a warm reconnection to an
+  already-probed peer, at the cost of a replay-safety surface no server-side
+  gate could enforce. TLS session resumption is retained — a client
+  reconnecting to a known node still skips certificate transmission and
+  signature verification, though the ECDHE key exchange still runs — and so is
+  stream multiplexing on open connections (ADR 005).
+  - **Resumption cache shrinks:** dropping the `max_tls_tickets` call with
+    `SESSION_TICKET_CACHE_SIZE` leaves the client-side `rustls` session cache
+    at iroh's default of 256 entries, down from 1000. That cache backs the
+    retained 1-RTT resumption, not just early data, so a node probing more
+    than 256 distinct peers between reconnections now re-handshakes in full
+    where it previously resumed. Re-tune with `Endpoint::max_tls_tickets` if
+    peer fan-out warrants it.
+  - **Config-breaking:** the `network.enable_0rtt` field is removed. Since
+    `[network]` uses `deny_unknown_fields`, a config that still sets it now
+    fails `decdn config validate` and node startup — delete the line. The
+    resulting behaviour equals the previously supported
+    `network.enable_0rtt = false`, so no other config change is needed.
+  - **Metrics removed:** `decdn_quic_0rtt_attempts_total`,
+    `decdn_quic_0rtt_accepted_total`, `decdn_quic_0rtt_rejected_total`,
+    `decdn_quic_session_ticket_cache_size`,
+    `decdn_quic_session_ticket_peers_dropped_total`. All were label-free, so
+    no dashboard query loses a dimension; panels referencing them go blank.
+    Separately, `decdn_probe_collection_latency_seconds` — specified in
+    `adr/appendix-observability.md` but never implemented — loses the
+    `outcome={0rtt_warm,1rtt_cold}` label it was planned to carry. No
+    deployed series is affected.
+  - **API:** `decdn_protocol::SESSION_TICKET_CACHE_SIZE` is gone, and both
+    `probe_once` requesters drop their 0-RTT switch and metrics-sink
+    parameters.
 - **Trusted-IP rate-limit exemption removed (#1440).** The `cdn/probe/v1`
   and `cdn/dht/v1` three-layer limiters no longer support an allow-list that
   bypasses the per-IP layer; every source IP is now bounded by that layer.
@@ -390,6 +423,9 @@ since project inception and will roll into the first tagged release.
 
 ### Security
 
+- `quinn-proto` → 0.11.16 (GHSA-4w2j-m93h-cj5j: remote memory exhaustion in
+  the QUIC state machine, fixed in 0.11.15) (#1465). Lockfile-only bump; no
+  dependency requirement changed.
 - **Gossip rule-2 enforced against the live registry, not a static allowlist
   (#1170).** `NodeAnnounce` admission (ADR 001 rule 2) now checks the announcer
   against the live on-chain staker set (`CapacityBond`, kept fresh by the

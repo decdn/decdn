@@ -204,7 +204,7 @@ One QUIC connection per `(local_node, remote_node, ALPN)` tuple. Multiple reques
 
 Different ALPNs require separate connections (TLS ALPN is negotiated at connection establishment); a `cdn/probe/v1` connection and a `cdn/client/v1` connection to the same node are always distinct.
 
-**0-RTT early data** is permitted on `cdn/probe/v1` only (idempotent, read-only probes). `cdn/client/v1` rejects 0-RTT to prevent replay-based accounting confusion. See [ADR 015](015-zero-rtt.md#adr-015-quic-0-rtt-connection-establishment) for the full replay safety analysis and session ticket management.
+Every deCDN implementation completes its full TLS 1.3 handshake before application bytes flow, on every ALPN: no request is ever sent as replayable early data. This binds implementations, not the wire — iroh accepts early data on any ALPN regardless of what the handler does, so the property is held on the emitter side (no code asks for early data) rather than enforced on receipt. TLS session resumption still applies — a client reconnecting to a node it has already spoken to skips certificate transmission and signature verification, though the ECDHE key exchange still runs — and steady-state cost is dominated by stream multiplexing on connections that stay open.
 
 #### Concurrent stream limits
 

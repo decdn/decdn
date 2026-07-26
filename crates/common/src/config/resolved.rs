@@ -39,8 +39,6 @@ pub struct ResolvedNetwork {
     /// pkarr/DNS default (`presets::N0`); otherwise the node builds on
     /// `presets::Minimal` and composes only the providers configured here.
     pub discovery: ResolvedDiscovery,
-    /// QUIC 0-RTT master switch for `cdn/probe/v1` (ADR 015). Default `true`.
-    pub enable_0rtt: bool,
 }
 
 /// Resolved discovery providers (#818). Strings are already shape-validated at

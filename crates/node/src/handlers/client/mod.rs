@@ -21,12 +21,6 @@
 //! accepting a voucher the handler emits a redeem hint (via the `redeem_hint`
 //! sender wired on [`ClientHandlerDeps`]) so the settlement service can
 //! withdraw the accrued claim once it crosses its threshold.
-//!
-//! # 0-RTT
-//!
-//! Unlike `cdn/probe/v1`, `cdn/client/v1` **rejects** 0-RTT (ADR 015): paid
-//! accounting must not run on replayable early data, so `on_accepting` always
-//! takes the full handshake.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -54,7 +48,7 @@ use decdn_protocol::{
     is_unknown_variant, read_frame, write_frame,
 };
 use iroh::PublicKey;
-use iroh::endpoint::{Accepting, Connection, RecvStream, SendStream, VarInt};
+use iroh::endpoint::{Connection, RecvStream, SendStream, VarInt};
 use iroh::protocol::{AcceptError, ProtocolHandler};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
@@ -1155,12 +1149,6 @@ enum VoucherOutcome {
 }
 
 impl ProtocolHandler for ClientHandler {
-    /// ADR 015: `cdn/client/v1` MUST reject 0-RTT — always take the full
-    /// handshake, never `into_0rtt()`. This is the inverse of `ProbeHandler`.
-    async fn on_accepting(&self, accepting: Accepting) -> Result<Connection, AcceptError> {
-        accepting.await.map_err(AcceptError::from_err)
-    }
-
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
         self.serve(connection)
             .await

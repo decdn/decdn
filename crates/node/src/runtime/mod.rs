@@ -882,10 +882,6 @@ async fn build_chain_and_handlers(
         Arc::clone(&infra.eth_signer),
         slash_domain.clone(),
         rate_bounds.clone(),
-        // ADR 015 master switch. Restart-required (it changes the
-        // `on_accepting` wiring): the SIGHUP path reports any
-        // `[network]` change as "requires restart".
-        cfg.network.enable_0rtt,
         stake_lane_policy,
     ));
 
@@ -1817,7 +1813,6 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
             .max_blob_size_mb
             .saturating_mul(decdn_protocol::MB_BYTES),
         max_rate_per_mb: cfg.cache.max_rate_per_mb,
-        enable_0rtt: cfg.network.enable_0rtt,
         deposit_hint: U256::from(cfg.blockchain.buyer_deposit_micro_usdc),
         lookup: crate::dht::LookupConfig::default(),
         // Own self-attested region for the ADR 030 latency-vs-claim penalty
@@ -2580,16 +2575,7 @@ async fn build_endpoint(
 
     builder = builder
         .secret_key(secret_key.clone())
-        .transport_config(transport_config)
-        // ADR 015 §Session Ticket Management. In iroh this knob sizes
-        // only the *client-side* `ClientSessionMemoryCache` — i.e. the
-        // tickets THIS node caches when it probes others (default 256;
-        // we raise it). The inbound/serving side's ticket store is
-        // rustls-internal and unaffected by this. Set unconditionally:
-        // it only matters when this node resumes outbound, and
-        // `network.enable_0rtt` gates whether the probe handler accepts
-        // inbound resumption.
-        .max_tls_tickets(decdn_protocol::SESSION_TICKET_CACHE_SIZE);
+        .transport_config(transport_config);
 
     // A configured `network.relay_urls` list swaps the n0 default relay map for
     // the operator's self-hosted relays (`RelayMode::Custom`). The relay leg is
@@ -3651,7 +3637,6 @@ mod tests {
                 bind_port: 4433,
                 relay_urls: Vec::new(),
                 discovery: decdn_common::config::ResolvedDiscovery::default(),
-                enable_0rtt: true,
             },
             blockchain: ResolvedBlockchain {
                 origin_assignment_address: None,

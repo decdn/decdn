@@ -65,12 +65,11 @@ The implementation language, the peer mesh's shape, the content-addressing primi
 
 ### Chapter 2 — Discovery
 
-How a client or node finds the right peer for a given hash. The DHT is the primary mechanism; 0-RTT is the latency optimization for repeat probes; proxy warming bootstraps the first regional copy when discovery returns only distant holders.
+How a client or node finds the right peer for a given hash. The DHT is the primary mechanism; proxy warming bootstraps the first regional copy when discovery returns only distant holders.
 
 1. [ADR 022 — Content Discovery at Scale (DHT)](022-content-discovery.md#adr-022--content-discovery-at-scale)
-2. [ADR 015 — QUIC 0-RTT Connection Establishment](015-zero-rtt.md#adr-015-quic-0-rtt-connection-establishment)
-3. [ADR 037 — Latency-Driven Proxy Warming for Regional Locality](037-regional-proxy-warming.md#adr-037-latency-driven-proxy-warming-for-regional-locality)
-4. [ADR 039 — Multi-Source Parallel Fetch Scheduling on cdn/client/v1](039-multi-source-parallel-fetch.md#adr-039-multi-source-parallel-fetch-scheduling-on-cdnclientv1)
+2. [ADR 037 — Latency-Driven Proxy Warming for Regional Locality](037-regional-proxy-warming.md#adr-037-latency-driven-proxy-warming-for-regional-locality)
+3. [ADR 039 — Multi-Source Parallel Fetch Scheduling on cdn/client/v1](039-multi-source-parallel-fetch.md#adr-039-multi-source-parallel-fetch-scheduling-on-cdnclientv1)
 
 ### Chapter 3 — Payments
 
@@ -153,7 +152,6 @@ Numeric per-ADR index.
 - **[ADR 012 — Client Architecture, Bootstrap, and Trust Model](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model)** — Client bootstrap, key management, identity lifecycle, trust boundary, and file manifests.
 - **[ADR 013 — Schema Evolution](013-schema-evolution.md#adr-013-schema-evolution)** — Varint-length framing and bounds, protocol-enum discipline, the gossip version sentinel, two-phase deserialization, three evolution tiers, and signed-field freezing. A concrete Tier 3 break defines its own migration.
 - **[ADR 014 — On-Chain Verification for Slashing Evidence](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence)** — secp256k1 EIP-712 `slash_sig` on `ProbeResponse`/`StreamResponse`; unified `SlashJudge` contract for the three signature-dependent offenses (phantom, rate, blacklist). Content corruption is absorbed at the wire (no on-chain path) — see [ADR 003 § Corrupted delivery](003-payments.md#corrupted-delivery).
-- **[ADR 015 — QUIC 0-RTT Connection Establishment](015-zero-rtt.md#adr-015-quic-0-rtt-connection-establishment)** — 0-RTT early data for `cdn/probe/v1` only; `cdn/client/v1` (paid delivery) and `cdn/dht/v1` (multiplexes state-changing `StoreRequest`) stay 1-RTT.
 - **[ADR 016 — Smart Contract Interaction Model](016-contract-interactions.md#adr-016-smart-contract-interaction-model)** — Cross-contract call graph, fund custody, access control matrix, and reentrancy analysis.
 - **[ADR 017 — Privacy Analysis](017-privacy.md#adr-017-privacy-analysis)** — Unified privacy surface inventory, adversary model, and mitigation roadmap.
 - **[ADR 018 — Liquidity Strategy (Balancer 80/20 POL)](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol)** — Protocol-Owned Liquidity in a Balancer V3 80/20 TOKEN/USDC weighted pool, seeded from the genesis liquidity allocation.
@@ -165,7 +163,7 @@ Numeric per-ADR index.
 - **[ADR 028 — Slashing Appeals and Dispute Escalation](028-slashing-appeals.md#adr-028-slashing-appeals-and-dispute-escalation)** — 30-day post-slash appeal window; escrow-on-slash restitution (a granted appeal refunds the operator's own escrowed TOKEN) via the standalone `SlashAppeal` contract driving `CapacityBond`'s settle hooks; failed appeals burn the separate appeal bond in full; emergency multisig fast-track + 14-day DecdnGovernor ratification; one accepted appeal per operator per 365 days.
 - **[ADR 030 — Node Region Self-Attestation](030-node-region-self-attestation.md#adr-030-node-region-self-attestation)** — Region claims in `NodeAnnounce` and `CapacityBond` are accepted at face value; the IP-geolocation oracle / third-party attestation path is explicitly rejected. Appeals-standing flipping and reactive blacklist-scope flipping are closed by a 7-day `regionLastChanged` stability window on `CapacityBond` (governable `[3d, 30d]`; [ADR 011 § Standing](011-content-takedown.md#standing) path 2 and [§ Regional Scope](011-content-takedown.md#regional-scope)). Latency-vs.-claim reputation penalty from [ADR 001 § Consequences](001-network.md#consequences) is the canonical soft mitigation for residual pre-positioned misdeclaration.
 - **[ADR 031 — ContentBlacklist Appeal-Contract Surface](031-content-blacklist-appeals-contract.md#adr-031-contentblacklist-appeal-contract-surface)** — Pins the contract surface for [ADR 011 § Blacklist Entry Appeals](011-content-takedown.md#blacklist-entry-appeals): per-appeal storage layout, event-topic ordering, state machine, and integration with `ContentBlacklist` core.
-(ADRs 032, 033, 034, and 035 are retired to [`adr/_history/`](_history/): 032/033 under the SafetyReserve removal — the slash-appeal surface moved to `SlashAppeal` and restitution is now escrow-on-slash per [ADR 028](028-slashing-appeals.md#adr-028-slashing-appeals-and-dispute-escalation) / [ADR 026](026-tokenomics.md#slashing-and-burn) — and 034/035 under the work-token rewrite. Do not link to them from canonical ADRs.)
+(ADRs 015, 032, 033, 034, and 035 are retired to [`adr/_history/`](_history/): 015 under the protocol simplification audit — QUIC 0-RTT is gone, and every connection now completes a full handshake before application bytes flow per [ADR 005 § Connection Management](005-protocol.md#connection-management); 032/033 under the SafetyReserve removal — the slash-appeal surface moved to `SlashAppeal` and restitution is now escrow-on-slash per [ADR 028](028-slashing-appeals.md#adr-028-slashing-appeals-and-dispute-escalation) / [ADR 026](026-tokenomics.md#slashing-and-burn) — and 034/035 under the work-token rewrite. Do not link to them from canonical ADRs.)
 
 ## Key Invariants
 

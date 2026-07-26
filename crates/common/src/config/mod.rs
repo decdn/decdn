@@ -29,10 +29,6 @@ pub use types::FileConfig;
 
 /// Default QUIC bind port.
 const DEFAULT_BIND_PORT: u16 = 4433;
-/// Default for the QUIC 0-RTT master switch (ADR 015). 0-RTT for
-/// `cdn/probe/v1` is on by default; operators kill it via
-/// `network.enable_0rtt = false`.
-const DEFAULT_ENABLE_0RTT: bool = true;
 /// Default maximum cache size in megabytes (10 GB).
 const DEFAULT_CACHE_SIZE_MB: u64 = 10_240;
 /// Default maximum single blob size in megabytes (1 GB).
@@ -718,17 +714,10 @@ fn resolve_network_into(
 
     let discovery = resolve_discovery_into(file, bag);
 
-    // No CLI flag: 0-RTT is an operational kill switch, not a per-invocation
-    // tuning knob. File `network.enable_0rtt` > built-in default (`true`).
-    let enable_0rtt = file
-        .and_then(|n| n.enable_0rtt)
-        .unwrap_or(DEFAULT_ENABLE_0RTT);
-
     ResolvedNetwork {
         bind_port,
         relay_urls,
         discovery,
-        enable_0rtt,
     }
 }
 
@@ -3714,7 +3703,6 @@ mod tests {
                 ]),
                 relay_url: None,
                 discovery: None,
-                enable_0rtt: None,
             }),
             ..Default::default()
         };
@@ -3756,7 +3744,6 @@ mod tests {
                     dns_origin: Some("${HOME}/dns".to_string()),
                     peers: Some(peers),
                 }),
-                enable_0rtt: None,
             }),
             ..Default::default()
         };
@@ -3816,7 +3803,6 @@ mod tests {
                     dns_origin: None,
                     peers: Some(peers),
                 }),
-                enable_0rtt: None,
             }),
             ..Default::default()
         };
@@ -4045,7 +4031,6 @@ mod tests {
                     relay_urls: None,
                     relay_url: Some(v.to_string()),
                     discovery: None,
-                    enable_0rtt: None,
                 });
             }),
             ("network.relay_urls", |c, v| {
@@ -4054,7 +4039,6 @@ mod tests {
                     relay_urls: Some(vec![v.to_string()]),
                     relay_url: None,
                     discovery: None,
-                    enable_0rtt: None,
                 });
             }),
             ("blockchain.rpc_url", |c, v| {
@@ -6834,7 +6818,6 @@ swap_pool_address = \"0xPool\"
             bind_port: port,
             relay_urls: Vec::new(),
             discovery: ResolvedDiscovery::default(),
-            enable_0rtt: true,
         }
     }
 
@@ -7604,7 +7587,6 @@ swap_pool_address = \"0xPool\"
             relay_urls: None,
             relay_url: None,
             discovery: None,
-            enable_0rtt: None,
         };
         let resolved = resolve_network(&cli, Some(&file));
         assert_eq!(resolved.bind_port, 5555);
@@ -7619,7 +7601,6 @@ swap_pool_address = \"0xPool\"
             // Deprecated singular alias folds into the resolved list.
             relay_url: Some("https://relay.example".to_string()),
             discovery: None,
-            enable_0rtt: None,
         };
         let resolved = resolve_network(&cli, Some(&file));
         assert_eq!(resolved.bind_port, 6666);
@@ -7640,7 +7621,6 @@ swap_pool_address = \"0xPool\"
             ]),
             relay_url: None,
             discovery: None,
-            enable_0rtt: None,
         };
         let resolved = resolve_network(&cli, Some(&file));
         assert_eq!(
@@ -7661,7 +7641,6 @@ swap_pool_address = \"0xPool\"
             relay_urls: Some(vec!["https://list.example".to_string()]),
             relay_url: Some("https://alias.example".to_string()),
             discovery: None,
-            enable_0rtt: None,
         };
         let resolved = resolve_network(&cli, Some(&file));
         assert_eq!(
@@ -7684,7 +7663,6 @@ swap_pool_address = \"0xPool\"
             relay_urls: Some(vec!["https://list.example".to_string()]),
             relay_url: Some("https://alias.example".to_string()),
             discovery: None,
-            enable_0rtt: None,
         };
         let resolved = resolve_network(&cli, Some(&file));
         assert_eq!(resolved.relay_urls, vec!["https://cli.example".to_string()]);
@@ -7699,7 +7677,6 @@ swap_pool_address = \"0xPool\"
             relay_urls: Some(Vec::new()),
             relay_url: Some("https://alias.example".to_string()),
             discovery: None,
-            enable_0rtt: None,
         };
         let resolved = resolve_network(&cli, Some(&file));
         assert_eq!(
@@ -7708,30 +7685,24 @@ swap_pool_address = \"0xPool\"
         );
     }
 
+    /// `[network]` carries no 0-RTT knob, and the section denies unknown
+    /// fields, so a config still setting one fails to load rather than
+    /// being silently ignored — the operator has to delete the line.
     #[test]
-    fn resolve_network_enable_0rtt_defaults_true_and_file_overrides() {
-        let cli = empty_network_args();
-
-        // Absent in file => built-in default (0-RTT on).
-        let none = types::NetworkConfig {
-            bind_port: None,
-            relay_urls: None,
-            relay_url: None,
-            discovery: None,
-            enable_0rtt: None,
-        };
-        assert!(resolve_network(&cli, Some(&none)).enable_0rtt);
-        assert!(resolve_network(&cli, None).enable_0rtt);
-
-        // Explicit `false` in file is the operational kill switch.
-        let off = types::NetworkConfig {
-            bind_port: None,
-            relay_urls: None,
-            relay_url: None,
-            discovery: None,
-            enable_0rtt: Some(false),
-        };
-        assert!(!resolve_network(&cli, Some(&off)).enable_0rtt);
+    fn network_rejects_removed_0rtt_key() -> anyhow::Result<()> {
+        let toml = "
+            bind_port = 4433
+            enable_0rtt = true
+        ";
+        let err = toml::from_str::<types::NetworkConfig>(toml)
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("expected unknown-field error"))?;
+        let msg = format!("{err}");
+        anyhow::ensure!(
+            msg.contains("unknown field") && msg.contains("enable_0rtt"),
+            "got: {msg}"
+        );
+        Ok(())
     }
 
     #[test]
@@ -7759,7 +7730,6 @@ swap_pool_address = \"0xPool\"
             ]),
             relay_url: None,
             discovery: None,
-            enable_0rtt: None,
         };
         let mut bag = ConfigErrorBag::new();
         let resolved = resolve_network_into(&cli, Some(&file), &mut bag);
@@ -7778,7 +7748,6 @@ swap_pool_address = \"0xPool\"
             relay_urls: Some(vec!["not a url".to_string()]),
             relay_url: None,
             discovery: None,
-            enable_0rtt: None,
         };
         let mut bag = ConfigErrorBag::new();
         let _ = resolve_network_into(&cli, Some(&file), &mut bag);
@@ -7803,7 +7772,6 @@ swap_pool_address = \"0xPool\"
             ]),
             relay_url: None,
             discovery: None,
-            enable_0rtt: None,
         };
         let mut bag = ConfigErrorBag::new();
         let _ = resolve_network_into(&cli, Some(&file), &mut bag);
@@ -7826,7 +7794,6 @@ swap_pool_address = \"0xPool\"
             relay_urls: Some(vec!["https://user:s3cret@host:notaport".to_string()]),
             relay_url: None,
             discovery: None,
-            enable_0rtt: None,
         };
         let mut bag = ConfigErrorBag::new();
         let _ = resolve_network_into(&cli, Some(&file), &mut bag);
@@ -7853,7 +7820,6 @@ swap_pool_address = \"0xPool\"
             relay_urls: None,
             relay_url: Some("not a url".to_string()),
             discovery: None,
-            enable_0rtt: None,
         };
         let mut bag = ConfigErrorBag::new();
         let _ = resolve_network_into(&cli, Some(&file), &mut bag);
@@ -7896,7 +7862,6 @@ swap_pool_address = \"0xPool\"
             relay_urls: None,
             relay_url: None,
             discovery: Some(discovery),
-            enable_0rtt: None,
         }
     }
 

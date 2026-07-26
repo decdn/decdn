@@ -805,7 +805,6 @@ impl RuntimeReloadState {
                 bind_port: 4433,
                 relay_urls: Vec::new(),
                 discovery: decdn_common::config::ResolvedDiscovery::default(),
-                enable_0rtt: true,
             },
             blockchain: ResolvedBlockchain {
                 origin_assignment_address: None,
@@ -1103,7 +1102,7 @@ fn warn_restart_required_sections(file: &decdn_common::config::FileConfig) {
         warn_ignored("identity.* (data_dir, region)");
     }
     if file.network.is_some() {
-        warn_ignored("network.* (bind_port, relay_urls, relay_url, discovery, enable_0rtt)");
+        warn_ignored("network.* (bind_port, relay_urls, relay_url, discovery)");
     }
     if file.blockchain.is_some() {
         warn_ignored("blockchain.* (rpc_url, eth_keystore, contract addresses)");
@@ -1304,7 +1303,6 @@ mod tests {
                 bind_port: 4433,
                 relay_urls: Vec::new(),
                 discovery: decdn_common::config::ResolvedDiscovery::default(),
-                enable_0rtt: true,
             },
             blockchain: ResolvedBlockchain {
                 origin_assignment_address: None,
