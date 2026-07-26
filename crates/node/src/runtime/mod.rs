@@ -40,7 +40,6 @@ use crate::handlers::probe::{ProbeHandler, StakeLanePolicy as ProbeStakeLanePoli
 use crate::handlers::probe_rate_limit::ProbeRateLimiter;
 use crate::metrics;
 use crate::payment_settlement::PaymentChannelService;
-use crate::rate_limit::RateLimitConfig;
 use alloy::network::EthereumWallet;
 use alloy::primitives::U256;
 use alloy::providers::{Provider, ProviderBuilder};
@@ -854,9 +853,10 @@ async fn build_chain_and_handlers(
     // `cdn/probe/v1`. Built from `[probe.rate_limit]` and run *in addition* to
     // the shared `ConnectionLimiter` (see `probe_rate_limit` module docs); the
     // per-peer (NodeId) layer it adds is the gap #982 closed.
-    let probe_rate_limit_cfg = RateLimitConfig::from(&cfg.probe);
-    let probe_rate_limiter = Arc::new(ProbeRateLimiter::new(
-        &probe_rate_limit_cfg,
+    // `from_resolved` rather than `new`: both limiter configs are aliases of
+    // the same struct, so passing `&cfg.dht` here would compile (#1457).
+    let probe_rate_limiter = Arc::new(ProbeRateLimiter::from_resolved(
+        &cfg.probe,
         Arc::clone(&infra.node_metrics),
     ));
 
@@ -899,9 +899,8 @@ async fn build_chain_and_handlers(
     // Store all wired up; iterative requester-side lookup and the
     // republish scheduler land in PR 4 of #320. Three-layer rate limiter
     // operates at the full ADR 022 spec.
-    let dht_rate_limit_cfg = RateLimitConfig::from(&cfg.dht);
-    let dht_rate_limiter = Arc::new(DhtRateLimiter::new(
-        &dht_rate_limit_cfg,
+    let dht_rate_limiter = Arc::new(DhtRateLimiter::from_resolved(
+        &cfg.dht,
         Arc::clone(&infra.node_metrics),
     ));
     // Record store sized from the ADR 022 defaults; per-publisher /

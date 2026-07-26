@@ -10298,6 +10298,71 @@ bind_port = 12345
     }
 
     #[test]
+    fn resolve_dht_absent_yields_adr022_defaults() {
+        // No `[dht.rate_limit]` section at all => every ADR 022 default.
+        // Counterpart to `resolve_probe_absent_yields_adr005_defaults`: the six
+        // rate/burst rows of `resolve_dht_into` are otherwise unpinned, so a
+        // wrong `DEFAULT_DHT_*` on the right-hand side of any `unwrap_or` ships
+        // silently. Rates and bursts are spelled as literals on purpose —
+        // asserting against the same constant the resolver reads would pin
+        // nothing. `max_tracked_*` has no ADR literal (it is a #645
+        // implementation cap), so those two go through the constants.
+        let resolved = resolve_dht(None).expect("absent section is valid");
+        assert!((resolved.per_peer_rate_per_sec - 20.0).abs() < f64::EPSILON);
+        assert_eq!(resolved.per_peer_burst, 40);
+        assert!((resolved.per_ip_rate_per_sec - 100.0).abs() < f64::EPSILON);
+        assert_eq!(resolved.per_ip_burst, 200);
+        assert!((resolved.global_rate_per_sec - 1000.0).abs() < f64::EPSILON);
+        assert_eq!(resolved.global_burst, 2000);
+        assert_eq!(resolved.max_tracked_per_ip, DEFAULT_DHT_MAX_TRACKED_PER_IP);
+        assert_eq!(
+            resolved.max_tracked_per_peer,
+            DEFAULT_DHT_MAX_TRACKED_PER_PEER
+        );
+    }
+
+    /// `ResolvedDht::default()` must agree with what the resolver produces for
+    /// an absent section.
+    ///
+    /// The two are independent copies of the same eight values —
+    /// `DEFAULT_DHT_*` is what production resolves through, while
+    /// `ResolvedDht::default()` is what hand-built `ResolvedConfig` fixtures
+    /// across `node`, `cli`, and the e2e suite use. Nothing in the type system
+    /// ties them together, so drift would leave every one of those fixtures
+    /// exercising a configuration the resolver never emits.
+    #[test]
+    fn resolved_dht_default_matches_resolver() {
+        let resolved = resolve_dht(None).expect("absent section is valid");
+        let hand = ResolvedDht::default();
+        assert!((resolved.per_peer_rate_per_sec - hand.per_peer_rate_per_sec).abs() < f64::EPSILON);
+        assert_eq!(resolved.per_peer_burst, hand.per_peer_burst);
+        assert!((resolved.per_ip_rate_per_sec - hand.per_ip_rate_per_sec).abs() < f64::EPSILON);
+        assert_eq!(resolved.per_ip_burst, hand.per_ip_burst);
+        assert!((resolved.global_rate_per_sec - hand.global_rate_per_sec).abs() < f64::EPSILON);
+        assert_eq!(resolved.global_burst, hand.global_burst);
+        assert_eq!(resolved.max_tracked_per_ip, hand.max_tracked_per_ip);
+        assert_eq!(resolved.max_tracked_per_peer, hand.max_tracked_per_peer);
+    }
+
+    /// Probe counterpart of `resolved_dht_default_matches_resolver`.
+    /// `resolve_probe_absent_yields_adr005_defaults` pins `DEFAULT_PROBE_*`
+    /// against the ADR but says nothing about `ResolvedProbe::default()`, which
+    /// is the copy the fixtures use.
+    #[test]
+    fn resolved_probe_default_matches_resolver() {
+        let resolved = resolve_probe(None).expect("absent section is valid");
+        let hand = ResolvedProbe::default();
+        assert!((resolved.per_peer_rate_per_sec - hand.per_peer_rate_per_sec).abs() < f64::EPSILON);
+        assert_eq!(resolved.per_peer_burst, hand.per_peer_burst);
+        assert!((resolved.per_ip_rate_per_sec - hand.per_ip_rate_per_sec).abs() < f64::EPSILON);
+        assert_eq!(resolved.per_ip_burst, hand.per_ip_burst);
+        assert!((resolved.global_rate_per_sec - hand.global_rate_per_sec).abs() < f64::EPSILON);
+        assert_eq!(resolved.global_burst, hand.global_burst);
+        assert_eq!(resolved.max_tracked_per_ip, hand.max_tracked_per_ip);
+        assert_eq!(resolved.max_tracked_per_peer, hand.max_tracked_per_peer);
+    }
+
+    #[test]
     fn resolve_dht_max_tracked_per_ip_file_override() {
         let d = dht_rl_with(|r| r.max_tracked_per_ip = Some(8192));
         let resolved = resolve_dht(Some(&d)).expect("valid override");

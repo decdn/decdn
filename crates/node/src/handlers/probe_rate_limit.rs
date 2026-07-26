@@ -88,6 +88,22 @@ impl ProbeRateLimiter {
         ))
     }
 
+    /// Build a limiter straight from the resolved `[probe.rate_limit]` section.
+    ///
+    /// Prefer this over [`Self::new`] at wiring sites. `ProbeRateLimitConfig`
+    /// is an alias of the shared [`RateLimitConfig`], so `new` accepts a config
+    /// mapped from *either* protocol's resolved section — building the probe
+    /// limiter from `[dht.rate_limit]` type-checks fine and would quietly
+    /// quadruple the per-peer probe cap (ADR 022's 20/sec in place of ADR 005's
+    /// 5/sec). Taking `&ResolvedProbe` makes that a type error instead (#1457).
+    #[must_use]
+    pub fn from_resolved(
+        resolved: &decdn_common::config::ResolvedProbe,
+        metrics: Arc<Metrics>,
+    ) -> Self {
+        Self::new(&RateLimitConfig::from(resolved), metrics)
+    }
+
     /// Try to admit one inbound probe. See [`ThreeLayerRateLimiter::check`].
     pub fn check(
         &self,
@@ -146,17 +162,14 @@ mod tests {
     /// the DHT wrapper's suite; here we pin the probe-specific behaviour — that
     /// the per-peer burst of 5 fires on the 6th same-peer probe — to catch a
     /// regression in how the probe defaults are wired through this newtype.
+    ///
+    /// Routed through `ResolvedProbe::default()` and the real `From` mapping
+    /// rather than restating the eight literals, so these behavioural tests
+    /// exercise the same path production takes. A default that drifted out of
+    /// ADR 005 shows up as a burst assertion failing here, not as a fixture
+    /// that quietly disagrees with the resolver.
     fn adr005_default_cfg() -> ProbeRateLimitConfig {
-        ProbeRateLimitConfig {
-            per_peer_rate_per_sec: 5.0,
-            per_peer_burst: 5,
-            per_ip_rate_per_sec: 50.0,
-            per_ip_burst: 200,
-            global_rate_per_sec: 1000.0,
-            global_burst: 2000,
-            max_tracked_per_ip: 4096,
-            max_tracked_per_peer: 4096,
-        }
+        ProbeRateLimitConfig::from(&decdn_common::config::ResolvedProbe::default())
     }
 
     #[test]

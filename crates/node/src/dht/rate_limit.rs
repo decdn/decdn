@@ -82,6 +82,23 @@ impl DhtRateLimiter {
         ))
     }
 
+    /// Build a limiter straight from the resolved `[dht.rate_limit]` section.
+    ///
+    /// Prefer this over [`Self::new`] at wiring sites: `DhtRateLimitConfig` is
+    /// an alias of the shared [`RateLimitConfig`], so `new` cannot tell a config
+    /// mapped from `[dht.rate_limit]` from one mapped out of
+    /// `[probe.rate_limit]`. Taking `&ResolvedDht` makes the wrong pairing a
+    /// type error (#1457); see
+    /// [`crate::handlers::probe_rate_limit::ProbeRateLimiter::from_resolved`]
+    /// for the direction that actually loosens a cap.
+    #[must_use]
+    pub fn from_resolved(
+        resolved: &decdn_common::config::ResolvedDht,
+        metrics: Arc<Metrics>,
+    ) -> Self {
+        Self::new(&RateLimitConfig::from(resolved), metrics)
+    }
+
     /// Try to admit one inbound DHT request. See
     /// [`ThreeLayerRateLimiter::check`].
     pub fn check(
