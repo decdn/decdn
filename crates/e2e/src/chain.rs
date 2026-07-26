@@ -1735,15 +1735,35 @@ async fn run_deploy_script(
 /// `transaction already imported`, burning the whole retry budget (#785). Draining
 /// until the pool stays empty, and only then reverting, wipes both the pending
 /// stragglers and any that mined while we waited.
+///
+/// A pool that will not drain within the budget warns rather than bails. It is
+/// tempting to fail fast — a straggler that outlives the drain can still poison
+/// the snapshot — but that trades a *maybe* for a certain failure. The condition
+/// means extreme runner contention, which is transient and exactly what the
+/// caller's escalating backoff exists to ride out; bailing here would forfeit
+/// the remaining attempts instead. It is also not proof of poisoning: a
+/// straggler that mines *before* the revert is rolled back by it, which is the
+/// common case. So make it loud enough to explain a later `nonce too low`, and
+/// let the retry budget do its job.
 async fn reset_broadcast_lane(provider: &DynProvider, snapshot: String) -> anyhow::Result<String> {
+    let mut drained = false;
     for _ in 0..POOL_DRAIN_POLLS {
         drop_all_transactions(provider).await?;
         // SIGKILL stops forge writing more, but bytes already in the socket are
         // still being parsed; let them land so the next drop catches them.
         tokio::time::sleep(POOL_DRAIN_SETTLE).await;
         if pool_is_empty(provider).await? {
+            drained = true;
             break;
         }
+    }
+    if !drained {
+        // Deliberately not fatal — see this function's doc comment.
+        tracing::warn!(
+            "anvil's pool still had transactions after {POOL_DRAIN_POLLS} drops; if one of \
+             them mines after the snapshot below, the next attempt will fail fast with \
+             `nonce too low`"
+        );
     }
     evm_revert_and_snapshot(provider, snapshot).await
 }
