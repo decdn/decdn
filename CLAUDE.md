@@ -11,8 +11,8 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for build commands, ADR conventions, pre-
 **ADR note:**
 
 - **Next ADR number: 040.** File naming: `NNN-topic.md` (zero-padded 3-digit prefix). Always verify by listing `adr/` for the highest number before creating a new ADR.
-- **Do not reuse numbers:** 004, 006, 010, 015, 027, 029, 032, 033, 034, 035 (retired or reclassified — see history below).
-- **Canonical ADRs (recent):** 028, 030, 031, 036, 037, 038, 039.
+- **Do not reuse numbers:** 004, 006, 010, 015, 027, 029, 031, 032, 033, 034, 035 (retired or reclassified — see history below).
+- **Canonical ADRs (recent):** 028, 030, 036, 037, 038, 039.
 - **History:**
   - 026 (tokenomics) — **Genesis Bond Credit removal:** the on-chain Genesis Bond Credit mechanism (the `CapacityBond` grant/vest/claim/forfeit surface, `GENESIS_GRANTOR_ROLE`, `PendingCredit`, the credit leg of slashing/escrow, and `claimSlashGateEpochs`) is gone. Its 5pp earmark folds back into the operational DAO Treasury (group 2, now a flat 15% — 30% at TGE, then 48-month linear); any retroactive testnet-operator recognition is a discretionary off-chain Treasury TGE-unlock with no contract surface. Slashing and granted-appeal refunds are now bond-only. Touched ADRs 026, 016, 028, 036, 008, architecture, glossary, and observability/key-rotation appendices.
   - 036 (`036-served-bytes-voting-weight.md`): supersedes voting-weight clauses of ADR 009 §Production and ADR 026 §Governance; promotes `FeeRouter.bytesPerEpoch` from analytics-only to governance-canonical, adds `windowEpochs` governable parameter, adds `slashedAtEpoch` zero-out on `CapacityBond`.
@@ -20,7 +20,8 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for build commands, ADR conventions, pre-
   - 034 (`034-gauge-boost-voting-escrow.md`): retired under the work-token rewrite; archived in `adr/_history/034-gauge-boost-voting-escrow.md`.
   - 033 (`033-safety-insurance-reserve.md`): retired under the **SafetyReserve removal** — the `SafetyReserve` contract, its 5% FeeRouter bucket, and the 30% slash-redirect are gone; slash restitution is now **escrow-on-slash** in ADR 026 §Slashing and burn (the FeeRouter split drops to 60/30/10 and the slash distribution at finality to 50 challenger / 50 burn). Archived in `adr/_history/033-safety-insurance-reserve.md`.
   - 032 (`032-safety-reserve-appeals-contract.md`): retired under the SafetyReserve removal — the slash-appeal state machine moved to the standalone `SlashAppeal` contract; the canonical surface is now ADR 028 §Contract surface. Archived in `adr/_history/032-safety-reserve-appeals-contract.md`.
-  - 031 (`031-content-blacklist-appeals-contract.md`); 030 (`030-node-region-self-attestation.md`, #400).
+  - 031 (`031-content-blacklist-appeals-contract.md`): retired under the **blacklist-entry appeals removal** — the second appeal state machine layered on `ContentBlacklist` (the six appeal entry points, `StandingPath`, the per-filer rejection cooldown / perjury denylist, the interim-relief caps, `setAppealBond` / `setRejectionCooldownWindow`, and `entry.suspended` end to end) is gone. Enforcement is untouched; a wrongful entry comes off via `removeHashRegional` or a DecdnGovernor `removeHashGlobal` proposal, and `SlashAppeal` (ADR 028) is now the protocol's only appeal surface. `IPublisherRegistryStanding` was deleted with it. A minimal interim-relief primitive is a named follow-up for the vote that registers the first regional body. Touched ADRs 011, 009, 016, 028, 030, architecture, and `docs/runbook.md`; archived in `adr/_history/031-content-blacklist-appeals-contract.md`.
+  - 030 (`030-node-region-self-attestation.md`, #400): `REGION_STABILITY_WINDOW` is retained, but its **appeals-standing leg is gone** with ADR 031 — the window now serves only the reactive blacklist-scope evasion.
   - 029: reclassified as `appendix-peer-table-eviction.md`.
   - 028 (`028-slashing-appeals.md`): status unlocked from "Locked-for-implementation" to "Draft" pending CapacityBond rebase.
   - 027 (Distinct-Client Diversity Gating / Delivery Receipts): collapsed into ADR 026 §3 per-operator gauge-share cap (itself now retired).

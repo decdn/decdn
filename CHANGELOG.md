@@ -23,6 +23,78 @@ since project inception and will roll into the first tagged release.
 
 ### Changed (BREAKING)
 
+- **Blacklist-entry appeals removed (#1432).** `ContentBlacklist` no longer
+  carries a second appeal state machine on top of enforcement. The six appeal
+  entry points (`openBlacklistAppeal`, `fastTrackBlacklistAppeal`,
+  `rejectBlacklistAppeal`, `rejectAppealAsPerjury`,
+  `ratifyBlacklistAppealRemoval`, `reverseBlacklistAppeal`,
+  `cleanupExpiredBlacklistAppeal`), the `StandingPath` enum, the per-filer
+  rejection cooldown and perjury denylist, the interim-relief caps, and the
+  `setAppealBond` / `setRejectionCooldownWindow` governance knobs are gone.
+  Enforcement is untouched: adding hashes/origins/operators (global, regional,
+  emergency), the compliance window, emergency auto-expiry, regional-body
+  registration and suspension, and slashing for serving blacklisted content all
+  behave exactly as before. A wrongful entry comes off via `removeHashRegional`
+  (the issuing body) or a DecdnGovernor `removeHashGlobal` proposal; restitution
+  for a slash already taken remains `SlashAppeal` (ADR 028), now the protocol's
+  only appeal surface.
+  - **ABI:** the `ContentBlacklist` constructor drops `publisherRegistry_` and
+    `appealBond_`. `getHashEntry` and `IContentBlacklistHashView` lose the
+    `suspended` tuple slot — a node built against the old ABI mis-decodes the
+    entry and must be upgraded in lockstep with the deployment.
+    `HashSuspensionUpdated` and the seven `BlacklistAppeal*` events are removed,
+    as is the `IPublisherRegistryStanding` interface. `PublisherRegistry` itself
+    is unchanged; `OriginAssignment` reaches it through
+    `IPublisherRegistryOwnership`.
+  - **Deploy:** `BLACKLIST_APPEAL_BOND` is no longer read.
+  - **Size:** `ContentBlacklist` deployed bytecode drops 24,576 → 11,193 bytes.
+  - ADR 031 is archived to `adr/_history/`; ADR 011 § Blacklist Entry Appeals is
+    replaced by § Removing a Wrongful Entry. ADR 030's `REGION_STABILITY_WINDOW`
+    is retained — only its appeals-standing leg is cut, since the window also
+    forecloses a reactive blacklist-scope flip.
+- **Settlement-weighted bootstrap ranking removed (#1434).**
+  `FeeRouter.routeSettlement` no longer calls
+  `CapacityBond.recordSettlement(operator)` on every settlement and mid-channel
+  withdraw. Nothing consumed the resulting `SettlementRecorded` log: the
+  client's bootstrap ranker reads `getActiveNodes`, orders region-first, and
+  ranks by probe result, which is a strictly fresher signal than a historical
+  settlement record. An external indexer that wants settlement recency should
+  read `FeeRouter.Settled`, already emitted on the same path with the same
+  operator address.
+  - **ABI:** `CapacityBond.recordSettlement(address)`,
+    `SettlementRecorded(address)` and `SETTLEMENT_REPORTER_ROLE()` are removed;
+    `ICapacityBondReporter` is renamed `ICapacityBondEpoch` and narrowed to
+    `epochLength()`. No Rust binding referenced any of them, so nodes need no
+    change.
+  - **Deploy:** one fewer post-deploy `grantRole` and one fewer cross-contract
+    trust edge. `FeeRouter`'s `capacityBond_` constructor arg **stays** — it
+    backs the `bondEpoch == epochLength_` assertion that stops a mismatched
+    deployment mis-anchoring `DecdnGovernor` epoch arithmetic.
+  - **Size:** `CapacityBond` gains 1,396 bytes of EIP-170 margin.
+- **Advisory `deliveryCeiling` rate bound removed (#1441).** The enforced
+  `deliveryFloor` is unchanged and still gates settlement in
+  `_advanceClaimWatermark`. The ceiling enforced nothing — it appeared in no
+  `require`/`revert` on the settlement path — and asked a seller to self-clamp
+  its own advertised rate downward, which buys no on-chain safety. The absolute
+  upper bound remains the wire constant `MAX_RATE_PER_MB`, enforced in
+  `ProbeResponse` validation; it simply stops being governance-tunable.
+  - **Config-breaking:** `payment.delivery_ceiling` is removed, along with
+    `--delivery-ceiling` and `DECDN_DELIVERY_CEILING`. `[payment]` uses
+    `deny_unknown_fields`, so a TOML that still sets the key now fails startup
+    and `decdn config validate` rather than ignoring it. Delete the key; nothing
+    replaces it.
+  - **ABI:** `setRateBounds(uint256,uint256)` → `setRateBounds(uint256)`
+    (selector changes), `RateBoundsUpdated` drops `newDeliveryCeiling` (topic0
+    changes), `RateBoundsInvalid` drops its second parameter, `getRateBounds()`
+    returns a single `uint256`, and the `PaymentChannel` constructor drops
+    `deliveryCeiling_`. A node built against the old ABI mis-decodes the event
+    and must be upgraded in lockstep with the deployment.
+  - **API:** `decdn_node::rate_bounds::Bounds` is gone and `RateBounds` collapses
+    to a single atomic floor — `RateBounds::new` and `store` take one argument,
+    and `snapshot()` / `ceiling()` are removed. The `ArcSwap`-for-pair-consistency
+    machinery went with it: with one value there is no half-applied-retune state
+    to defend against.
+
 - **QUIC 0-RTT probe establishment removed (#1429).** `cdn/probe/v1`
   connections always complete a full TLS 1.3 handshake before the request is
   sent; no ALPN transmits application bytes as replayable early data. The
