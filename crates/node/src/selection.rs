@@ -179,7 +179,7 @@ pub struct Candidate {
     /// included — see the tier 2 comment in `pick_best_in_group`. A lookup that
     /// errors must therefore not fall back to `None`; decide the failure
     /// policy at the lookup layer, where the distinction is still visible
-    /// (#1459).
+    /// (#1470).
     pub stake: Option<u64>,
 }
 
@@ -370,7 +370,7 @@ fn pick_best_in_group(
     // that will populate `Candidate.stake`). When that lookup lands, a
     // *failed* read must not be encoded as `None` alongside successful ones,
     // or one flaky RPC call silently sinks a well-staked peer below a
-    // zero-stake one. Resolve the failure at the lookup layer (#1459).
+    // zero-stake one. Resolve the failure at the lookup layer (#1470).
     let max_stake = pool
         .iter()
         .filter_map(|i| group.get(*i).and_then(|r| r.candidate.stake))
