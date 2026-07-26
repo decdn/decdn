@@ -78,8 +78,7 @@ contract E2EProtocolTest is Test, BaseProtocolDeploy {
             feeRouterWindowEpochs: 13,
             feeRouterShares: [uint256(9000), uint256(0), uint256(1000)],
             buybackBurner: address(0),
-            slashAppealBond: 1000e18,
-            blacklistAppealBond: 100e18
+            slashAppealBond: 1000e18
         });
         d = _runFullDeploy(cfg);
 

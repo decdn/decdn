@@ -1486,7 +1486,7 @@ mod tests {
                 crate::receipt_log::NoopReceiptLog,
             ))) as Arc<dyn ReceiptSink>,
             Arc::new(AtomicU64::new(1)),
-            crate::rate_bounds::RateBounds::new(0, u64::MAX),
+            crate::rate_bounds::RateBounds::new(0),
             1,
             0,
             16,
@@ -1843,7 +1843,7 @@ mod tests {
         // `rate_per_mb` atomic is seeded to 1 in `handler_for_warm_tests`, so
         // set the band's floor to F and clamp will raise the quote to F.
         let f: u64 = 500;
-        handler.rate_bounds.store(f, 10_000);
+        handler.rate_bounds.store(f);
 
         // Quote the stream at rate F (the value signed into the `StreamResponse`).
         let quoted_rate = handler.clamped_rate();
@@ -1867,7 +1867,7 @@ mod tests {
         // spanning multiple voucher intervals — the reachable race from #1382).
         // The chain now enforces 2F at settlement, so a voucher priced at F is
         // unredeemable and the live-floor acceptance check MUST reject it.
-        handler.rate_bounds.store(f * 2, 10_000);
+        handler.rate_bounds.store(f * 2);
         assert_eq!(
             handler.rate_bounds.floor(),
             f * 2,

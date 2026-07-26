@@ -107,12 +107,13 @@ mod sol_types {
             /// deposit up to the on-chain floor before opening.
             function minDeposit() external view returns (uint256);
 
-            /// Governable per-megabyte delivery-rate bounds (ADR 019 §3.1 /
-            /// ADR 003). `floor` is the settlement-enforced minimum rate a
-            /// voucher may pay per MB; `ceiling` the maximum. The node reads
-            /// these at startup and on every `RateBoundsUpdated` to clamp its
-            /// advertised `rate_per_mb`, replacing the local config stand-in.
-            function getRateBounds() external view returns (uint256 floor, uint256 ceiling);
+            /// Governable per-megabyte delivery-rate floor (ADR 019 §3.1 /
+            /// ADR 003) — the settlement-enforced minimum rate a voucher may
+            /// pay per MB. The node reads it at startup and on every
+            /// `RateBoundsUpdated` to clamp its advertised `rate_per_mb`. There
+            /// is no governance ceiling; the wire constant `MAX_RATE_PER_MB` is
+            /// the absolute upper bound.
+            function getRateBounds() external view returns (uint256 floor);
 
             /// Per-client channel counter (public mapping getter). The *next*
             /// nonce `openChannel` will assign to `client`; the resulting
@@ -259,12 +260,12 @@ mod sol_types {
                 uint256 clientRefund
             );
 
-            /// Governance changed the per-MB delivery-rate bounds (ADR 019
-            /// §3.1). The rate-bounds watcher decodes the new `(floor, ceiling)`
-            /// and stores them into the node's live clamp so a governance
-            /// retune reaches running nodes without a restart. No `indexed`
-            /// params — matches `setRateBounds`.
-            event RateBoundsUpdated(uint256 newDeliveryFloor, uint256 newDeliveryCeiling);
+            /// Governance changed the per-MB delivery-rate floor (ADR 019
+            /// §3.1). The rate-bounds watcher decodes the new floor and stores
+            /// it into the node's live clamp so a governance retune reaches
+            /// running nodes without a restart. No `indexed` params — matches
+            /// `setRateBounds`.
+            event RateBoundsUpdated(uint256 newDeliveryFloor);
         }
     }
 }

@@ -108,7 +108,6 @@ contract MockSlasher is ICapacityBondSlasher, ICapacityBondRegionView {
 contract MockBlacklistView is IContentBlacklistHashView {
     struct Entry {
         uint64 addedAt;
-        bool suspended;
         uint64 effectiveAt;
         bool emergency;
         uint8 category;
@@ -120,32 +119,23 @@ contract MockBlacklistView is IContentBlacklistHashView {
     ///      (`effectiveAt == addedAt`), which is what the pre-#1169 tests
     ///      implicitly assumed. Use `setEntryEffectiveAt` to exercise the grace.
     function setEntry(bytes32 region, bytes32 hash, uint64 addedAt) external {
-        _entries[region][hash] = Entry(addedAt, false, addedAt, false, 0);
-    }
-
-    function setEntrySuspended(bytes32 region, bytes32 hash, uint64 addedAt, bool suspended) external {
-        _entries[region][hash] = Entry(addedAt, suspended, addedAt, false, 0);
+        _entries[region][hash] = Entry(addedAt, addedAt, false, 0);
     }
 
     /// @dev ADR 011 § Compliance Window: `effectiveAt = addedAt + window`.
     function setEntryEffectiveAt(bytes32 region, bytes32 hash, uint64 addedAt, uint64 effectiveAt) external {
-        _entries[region][hash] = Entry(addedAt, false, effectiveAt, false, 0);
+        _entries[region][hash] = Entry(addedAt, effectiveAt, false, 0);
     }
 
     function setEmergencyEntry(bytes32 region, bytes32 hash, uint64 addedAt, uint64 effectiveAt, uint8 category)
         external
     {
-        _entries[region][hash] = Entry(addedAt, false, effectiveAt, true, category);
+        _entries[region][hash] = Entry(addedAt, effectiveAt, true, category);
     }
 
-    function getHashEntry(bytes32 region, bytes32 hash)
-        external
-        view
-        override
-        returns (uint64, bool, uint64, bool, uint8)
-    {
+    function getHashEntry(bytes32 region, bytes32 hash) external view override returns (uint64, uint64, bool, uint8) {
         Entry memory e = _entries[region][hash];
-        return (e.addedAt, e.suspended, e.effectiveAt, e.emergency, e.category);
+        return (e.addedAt, e.effectiveAt, e.emergency, e.category);
     }
 }
 
@@ -530,15 +520,6 @@ contract SlashJudgeTest is Test {
         assertEq(slasher.lastOffense(), uint8(ISlashJudge.OffenseType.Blacklist));
     }
 
-    function test_blacklist_revertsWhenSuspended() public {
-        // Live (addedAt set) but fast-track-suspended → restriction lifted, not slashable.
-        blacklist.setEntrySuspended(GLOBAL_REGION, BLOB, uint64(block.timestamp - 1000), true);
-        SlashJudge.StreamMsg memory s = _stream(true, 10, streamTs);
-        vm.prank(challenger);
-        vm.expectRevert(abi.encodeWithSelector(SlashJudge.HashNotBlacklisted.selector, BLOB));
-        judge.submitBlacklistChallenge(node, NODE_ID, BLOB, abi.encode(s), _signStream(s), true, SALT);
-    }
-
     function test_blacklist_revertsOnHashMismatch() public {
         blacklist.setEntry(GLOBAL_REGION, BLOB, uint64(block.timestamp - 1000));
         SlashJudge.StreamMsg memory s = _stream(true, 10, streamTs); // s.hash == BLOB
@@ -634,17 +615,6 @@ contract SlashJudgeTest is Test {
                 SlashJudge.BlacklistAfterResponse.selector, uint256(block.timestamp + 1000) * 1_000_000, streamTs
             )
         );
-        judge.submitBlacklistChallenge(node, NODE_ID, BLOB, abi.encode(s), _signStream(s), true, SALT);
-    }
-
-    function test_blacklist_suspendedRegionalEntryDoesNotSlash() public {
-        // A fast-track-suspended REGIONAL entry lifts slashability (mirrors the
-        // global suspended case; the regional leg re-checks `suspended`).
-        slasher.setRegion(node, "us-east", "", 0);
-        blacklist.setEntrySuspended(bytes32("us-east"), BLOB, uint64(block.timestamp - 1000), true);
-        SlashJudge.StreamMsg memory s = _stream(true, 10, streamTs);
-        vm.prank(challenger);
-        vm.expectRevert(abi.encodeWithSelector(SlashJudge.HashNotBlacklisted.selector, BLOB));
         judge.submitBlacklistChallenge(node, NODE_ID, BLOB, abi.encode(s), _signStream(s), true, SALT);
     }
 

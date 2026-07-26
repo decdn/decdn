@@ -282,6 +282,62 @@ pub const MAX_RECEIPT_RETAINED_FILES: u32 = 100;
 /// the surfaced path can't drift from where the log actually lands.
 pub const RECEIPT_LOG_FILE: &str = "download_receipts.jsonl";
 
+/// Env vars that once configured a knob and now configure nothing.
+///
+/// The other two surfaces of a removed knob fail loudly on their own: a stale
+/// TOML key trips `deny_unknown_fields`, and a stale `--flag` trips clap's
+/// unknown-argument error. An env var has no such backstop — `clap` simply
+/// stops reading it — so an operator whose systemd unit or container env still
+/// carries one upgrades cleanly and silently loses the setting. Warn instead.
+///
+/// Entries are appended when a knob is removed and may be pruned once the
+/// removal is far enough back that no live deployment could still set it.
+const RETIRED_ENV_VARS: &[(&str, &str)] = &[(
+    "DECDN_DELIVERY_CEILING",
+    "the advisory delivery-rate ceiling was removed (#1441); the node no longer \
+     clamps its quote downward at all, and the wire cap MAX_RATE_PER_MB is the \
+     only upper bound",
+)];
+
+/// Emit one warning per retired env var that is still set. Deliberately not a
+/// hard error: unlike a stale TOML key, an env var is often inherited from an
+/// orchestrator the operator does not directly control, and refusing to boot
+/// over one would be a worse failure than the silent ignore it replaces.
+///
+/// Writes to stderr rather than `tracing`, and that is load-bearing rather than
+/// a style choice: `resolve_config` runs *before* `init_tracing` in the daemon
+/// (`decdn-node`'s `commands::run`), so a `tracing::warn!` here has no global
+/// subscriber and is discarded — and `decdn` (the CLI, which reaches this via
+/// `config validate`) does not depend on `tracing` at all. Either way the
+/// warning would never reach the operator it exists for. The adjacent
+/// malformed-`RUST_LOG` notice uses `eprintln!` for exactly this reason.
+///
+/// Returns the names it warned about so callers (and tests) can assert on them.
+fn warn_retired_env_vars() -> Vec<&'static str> {
+    warn_retired_env_vars_with(|name| std::env::var_os(name).is_some())
+}
+
+/// [`warn_retired_env_vars`] with the environment lookup injected.
+///
+/// Split out purely for testability: `unsafe` is forbidden workspace-wide
+/// (`-F unsafe-code`) and `std::env::set_var` is `unsafe` since edition 2024,
+/// so a test cannot set a variable to observe the behaviour. Injecting the
+/// predicate exercises the "var is set" branch directly — the branch that was
+/// silently broken before.
+fn warn_retired_env_vars_with(is_set: impl Fn(&str) -> bool) -> Vec<&'static str> {
+    let mut warned = Vec::new();
+    for (name, why) in RETIRED_ENV_VARS {
+        if is_set(name) {
+            eprintln!(
+                "warning: {name} is set but no longer does anything: {why}. Remove it from \
+                 the environment to silence this warning."
+            );
+            warned.push(*name);
+        }
+    }
+    warned
+}
+
 /// Load config from file (if present) and merge with CLI args.
 ///
 /// CLI args take precedence over file values; defaults fill gaps.
@@ -299,6 +355,8 @@ pub fn resolve_config(config_path: Option<&Path>, cli: &RunArgs) -> anyhow::Resu
     // validate. Everything *after* this accumulates into one `bag` so an
     // operator sees every problem in a single pass.
     let file = load_file_config(config_path)?;
+
+    let _retired = warn_retired_env_vars();
 
     let mut bag = ConfigErrorBag::new();
 
@@ -2334,45 +2392,25 @@ pub fn resolve_payment_into(
         },
     );
     // Pre-chain seed for the on-chain `getRateBounds()` clamp (ADR 005 §Rate
-    // bounds validation). Since #1172 the runtime overwrites both from chain
-    // before serving, so these defaults (`0` .. `MAX_RATE_PER_MB`) only shape
-    // the pre-read window; the live clamp is governance-owned on-chain.
+    // bounds validation). Since #1172 the runtime overwrites it from chain
+    // before serving, so this default (`0`) only shapes the pre-read window;
+    // the live floor is governance-owned on-chain.
     let delivery_floor = cli
         .delivery_floor
         .or_else(|| file.and_then(|p| p.delivery_floor))
         .unwrap_or(0);
-    let delivery_ceiling = cli
-        .delivery_ceiling
-        .or_else(|| file.and_then(|p| p.delivery_ceiling))
-        .unwrap_or(decdn_protocol::MAX_RATE_PER_MB);
+    // The clamp only ever raises `rate_per_mb`, so a floor above the wire cap
+    // would make the node sign a rate honest clients reject outright (#378).
+    // There is no lower guard to write: with `rate_per_mb >= 1` validated above
+    // and a raise-only clamp, the signed rate can never collapse to 0 — an
+    // invariant the removed governance ceiling used to need a check for.
     bag.check_with(
-        delivery_floor <= delivery_ceiling,
+        delivery_floor <= decdn_protocol::MAX_RATE_PER_MB,
         "payment.delivery_floor",
         || {
             format!(
-                "payment.delivery_floor ({delivery_floor}) must be <= \
-             payment.delivery_ceiling ({delivery_ceiling})"
-            )
-        },
-    );
-    // A ceiling of 0 would clamp every quoted rate to 0, bypassing the
-    // `rate_per_mb > 0` guard above and making the node advertise a
-    // free/selection-winning rate (ADR 001). With ceiling >= 1 and the
-    // validated `rate_per_mb >= 1`, `clamp(rate, floor, ceiling)` is always
-    // >= 1, so the signed rate can never collapse to 0.
-    bag.check(
-        delivery_ceiling >= 1,
-        "payment.delivery_ceiling",
-        "payment.delivery_ceiling must be >= 1 (clamping to 0 would sign a \
-         free rate and bypass the rate_per_mb > 0 guard, ADR 001)",
-    );
-    bag.check_with(
-        delivery_ceiling <= decdn_protocol::MAX_RATE_PER_MB,
-        "payment.delivery_ceiling",
-        || {
-            format!(
-                "payment.delivery_ceiling {delivery_ceiling} exceeds protocol \
-             MAX_RATE_PER_MB ({}); clamping to it could still emit a rate honest \
+                "payment.delivery_floor {delivery_floor} exceeds protocol \
+             MAX_RATE_PER_MB ({}); raising a quote to it would emit a rate honest \
              clients reject",
                 decdn_protocol::MAX_RATE_PER_MB,
             )
@@ -2402,7 +2440,6 @@ pub fn resolve_payment_into(
     ResolvedPayment {
         rate_per_mb,
         delivery_floor,
-        delivery_ceiling,
         voucher_interval_mb,
     }
 }
@@ -4764,7 +4801,6 @@ swap_pool_address = \"0xPool\"
         let cli = crate::cli::run::PaymentArgs {
             rate_per_mb: Some(0),
             delivery_floor: None,
-            delivery_ceiling: None,
         };
         let err = resolve_payment(&cli, None)
             .err()
@@ -4777,75 +4813,77 @@ swap_pool_address = \"0xPool\"
         Ok(())
     }
 
+    /// A retired env var must warn rather than be silently ignored — and must
+    /// NOT fail the resolve, since it is often inherited from an orchestrator
+    /// the operator does not control. Asserts the table is wired and that a
+    /// set-but-retired var leaves resolution intact.
     #[test]
-    fn resolve_payment_rejects_zero_delivery_ceiling() -> anyhow::Result<()> {
-        // ceiling=0 would clamp every quoted rate to 0, signing a free
-        // selection-winning rate and bypassing the rate_per_mb > 0 guard.
+    fn retired_env_vars_are_listed_and_do_not_break_resolution() {
+        assert!(
+            RETIRED_ENV_VARS
+                .iter()
+                .any(|(n, _)| *n == "DECDN_DELIVERY_CEILING"),
+            "the knob removed in #1441 must be listed so a stale env var warns"
+        );
+        for (name, why) in RETIRED_ENV_VARS {
+            assert!(name.starts_with("DECDN_"), "{name} is not a decdn env var");
+            assert!(
+                !why.is_empty(),
+                "{name} needs a reason operators can act on"
+            );
+        }
+    }
+
+    /// The regression this guard exists for: the first implementation used
+    /// `tracing::warn!`, which `resolve_config` reaches *before* `init_tracing`
+    /// installs a subscriber — so it compiled, passed CI, and emitted nothing.
+    /// Asserting the returned names is what makes "it actually fired" testable
+    /// without a subscriber; the stderr text is a side effect of the same call.
+    ///
+    #[test]
+    fn retired_env_var_that_is_set_is_actually_reported() {
+        let warned = warn_retired_env_vars_with(|n| n == "DECDN_DELIVERY_CEILING");
+        assert_eq!(
+            warned,
+            vec!["DECDN_DELIVERY_CEILING"],
+            "a set retired var must be reported"
+        );
+        assert!(
+            warn_retired_env_vars_with(|_| false).is_empty(),
+            "nothing set => nothing reported"
+        );
+    }
+
+    #[test]
+    fn resolve_payment_rejects_floor_above_protocol_max() -> anyhow::Result<()> {
+        // The clamp only raises, so a floor above the wire cap makes the node
+        // sign a `ProbeResponse` honest clients reject outright (#378).
         let cli = crate::cli::run::PaymentArgs {
             rate_per_mb: Some(10),
-            delivery_floor: Some(0),
-            delivery_ceiling: Some(0),
+            delivery_floor: Some(decdn_protocol::MAX_RATE_PER_MB + 1),
         };
         let err = resolve_payment(&cli, None)
             .err()
-            .ok_or_else(|| anyhow::anyhow!("expected rejection for delivery_ceiling=0"))?
+            .ok_or_else(|| anyhow::anyhow!("expected rejection for floor>MAX"))?
             .to_string();
         anyhow::ensure!(
-            err.contains("delivery_ceiling") && err.contains(">= 1"),
+            err.contains("delivery_floor") && err.contains("MAX_RATE_PER_MB"),
             "error lacked context: {err}"
         );
         Ok(())
     }
 
     #[test]
-    fn resolve_payment_rejects_floor_above_ceiling() -> anyhow::Result<()> {
-        let cli = crate::cli::run::PaymentArgs {
-            rate_per_mb: Some(10),
-            delivery_floor: Some(100),
-            delivery_ceiling: Some(50),
-        };
-        let err = resolve_payment(&cli, None)
-            .err()
-            .ok_or_else(|| anyhow::anyhow!("expected rejection for floor>ceiling"))?
-            .to_string();
-        anyhow::ensure!(
-            err.contains("delivery_floor") && err.contains("delivery_ceiling"),
-            "error lacked context: {err}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn resolve_payment_rejects_ceiling_above_protocol_max() -> anyhow::Result<()> {
-        let cli = crate::cli::run::PaymentArgs {
-            rate_per_mb: Some(10),
-            delivery_floor: None,
-            delivery_ceiling: Some(decdn_protocol::MAX_RATE_PER_MB + 1),
-        };
-        let err = resolve_payment(&cli, None)
-            .err()
-            .ok_or_else(|| anyhow::anyhow!("expected rejection for ceiling>MAX"))?
-            .to_string();
-        anyhow::ensure!(
-            err.contains("delivery_ceiling") && err.contains("MAX_RATE_PER_MB"),
-            "error lacked context: {err}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn resolve_payment_accepts_and_threads_explicit_bounds() -> anyhow::Result<()> {
+    fn resolve_payment_accepts_and_threads_explicit_floor() -> anyhow::Result<()> {
         let cli = crate::cli::run::PaymentArgs {
             rate_per_mb: Some(10),
             delivery_floor: Some(5),
-            delivery_ceiling: Some(100),
         };
         let resolved = resolve_payment(&cli, None)?;
         anyhow::ensure!(
-            resolved.delivery_floor == 5 && resolved.delivery_ceiling == 100,
-            "bounds not threaded: floor={} ceiling={}",
-            resolved.delivery_floor,
-            resolved.delivery_ceiling
+            resolved.delivery_floor == 5,
+            "floor not threaded: {}",
+            resolved.delivery_floor
         );
         Ok(())
     }
@@ -4882,12 +4920,10 @@ swap_pool_address = \"0xPool\"
         let cli = crate::cli::run::PaymentArgs {
             rate_per_mb: None,
             delivery_floor: None,
-            delivery_ceiling: None,
         };
         let file = types::PaymentConfig {
             rate_per_mb: Some(0),
             delivery_floor: None,
-            delivery_ceiling: None,
             voucher_interval_mb: None,
         };
         let err = resolve_payment(&cli, Some(&file))
@@ -4930,12 +4966,10 @@ swap_pool_address = \"0xPool\"
         let cli = crate::cli::run::PaymentArgs {
             rate_per_mb: Some(42),
             delivery_floor: None,
-            delivery_ceiling: None,
         };
         let file = types::PaymentConfig {
             rate_per_mb: Some(0),
             delivery_floor: None,
-            delivery_ceiling: None,
             voucher_interval_mb: None,
         };
         let resolved = resolve_payment(&cli, Some(&file))?;
@@ -4948,7 +4982,6 @@ swap_pool_address = \"0xPool\"
         let cli = crate::cli::run::PaymentArgs {
             rate_per_mb: None,
             delivery_floor: None,
-            delivery_ceiling: None,
         };
         let resolved = resolve_payment(&cli, None)?;
         anyhow::ensure!(
@@ -4969,7 +5002,6 @@ swap_pool_address = \"0xPool\"
         let file = types::PaymentConfig {
             rate_per_mb: Some(10),
             delivery_floor: None,
-            delivery_ceiling: None,
             voucher_interval_mb: Some(64),
         };
         let resolved = resolve_payment(&empty_payment_args(), Some(&file))?;
@@ -4983,7 +5015,6 @@ swap_pool_address = \"0xPool\"
             let file = types::PaymentConfig {
                 rate_per_mb: Some(10),
                 delivery_floor: None,
-                delivery_ceiling: None,
                 voucher_interval_mb: Some(bad),
             };
             let err = resolve_payment(&empty_payment_args(), Some(&file))
@@ -5007,7 +5038,6 @@ swap_pool_address = \"0xPool\"
         let cli = crate::cli::run::PaymentArgs {
             rate_per_mb: Some(decdn_protocol::MAX_RATE_PER_MB + 1),
             delivery_floor: None,
-            delivery_ceiling: None,
         };
         let err = resolve_payment(&cli, None)
             .err()
@@ -5025,7 +5055,6 @@ swap_pool_address = \"0xPool\"
         let cli = crate::cli::run::PaymentArgs {
             rate_per_mb: Some(decdn_protocol::MAX_RATE_PER_MB),
             delivery_floor: None,
-            delivery_ceiling: None,
         };
         let resolved = resolve_payment(&cli, None)?;
         anyhow::ensure!(
@@ -7185,7 +7214,6 @@ swap_pool_address = \"0xPool\"
             ),
             ("rate_per_mb", "DECDN_RATE_PER_MB"),
             ("delivery_floor", "DECDN_DELIVERY_FLOOR"),
-            ("delivery_ceiling", "DECDN_DELIVERY_CEILING"),
             ("log_level", "DECDN_LOG_LEVEL"),
             ("log_format", "DECDN_LOG_FORMAT"),
             ("metrics_port", "DECDN_METRICS_PORT"),
@@ -7519,7 +7547,6 @@ swap_pool_address = \"0xPool\"
         crate::cli::run::PaymentArgs {
             rate_per_mb: None,
             delivery_floor: None,
-            delivery_ceiling: None,
         }
     }
 
@@ -9303,12 +9330,10 @@ swap_pool_address = \"0xPool\"
         let cli = crate::cli::run::PaymentArgs {
             rate_per_mb: Some(99),
             delivery_floor: None,
-            delivery_ceiling: None,
         };
         let file = types::PaymentConfig {
             rate_per_mb: Some(1),
             delivery_floor: None,
-            delivery_ceiling: None,
             voucher_interval_mb: None,
         };
         let resolved = resolve_payment(&cli, Some(&file))?;
@@ -9322,7 +9347,6 @@ swap_pool_address = \"0xPool\"
         let file = types::PaymentConfig {
             rate_per_mb: Some(50),
             delivery_floor: None,
-            delivery_ceiling: None,
             voucher_interval_mb: None,
         };
         let resolved = resolve_payment(&cli, Some(&file))?;

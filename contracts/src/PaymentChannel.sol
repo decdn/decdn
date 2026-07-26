@@ -71,12 +71,25 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, SunsettingPausable, E
     uint256 internal constant MAX_CHANNEL_DURATION_CEILING = 365 days;
     uint256 internal constant MIN_DEPOSIT_FLOOR = 1;
 
+    /// @dev Mirrors `decdn_protocol::MAX_RATE_PER_MB` (ADR 005 §Wire protocol),
+    ///      the largest `rate_per_mb` the wire schema will decode. A floor above
+    ///      it is not merely useless, it is network-isolating: nodes raise every
+    ///      quote to the floor before signing, so every `ProbeResponse` and
+    ///      `StreamResponse` they emit would be rejected at decode by every
+    ///      honest peer, and settlement would revert `RateFloorViolation` on
+    ///      essentially every voucher — while the node's only local signal is a
+    ///      clamp warning indistinguishable from a routine retune. Capping here
+    ///      makes that state unrepresentable at the source; the node also
+    ///      refuses to start against, and refuses to install, an over-cap floor
+    ///      (`crates/node/src/rate_bounds.rs`) for deployments predating this.
+    uint256 internal constant MAX_RATE_PER_MB = 1_000_000_000_000;
+
     /// @dev 1 MB in bytes (binary MB, ADR 005 / `rate::BYTES_PER_MB`). Used to
     ///      convert the MB-denominated `deliveryFloor` into the per-byte price
     ///      floor enforced at settlement (`_advanceClaimWatermark`).
     uint256 internal constant BYTES_PER_MB = 1_048_576;
 
-    /// @dev Deployment default for the governable param ADR 016 § step 8 does
+    /// @dev Deployment default for the governable param ADR 016 § Contract Inventory does
     ///      not pass as a constructor arg. `minDeposit` = 1 USDC (6 decimals) —
     ///      the dust floor of ADR 003 § Deposit Economics.
     uint256 internal constant DEFAULT_MIN_DEPOSIT = 1_000_000;
@@ -127,15 +140,16 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, SunsettingPausable, E
     /// @notice Minimum opening deposit in USDC base units (default 1 USDC).
     uint256 public minDeposit;
 
-    /// @dev Rate bounds in USDC base units per MB, exposed via `getRateBounds`.
-    ///      `deliveryFloor` is the per-byte price floor ENFORCED at settlement
-    ///      (`_advanceClaimWatermark` requires `amount * BYTES_PER_MB >=
-    ///      bytesDelivered * deliveryFloor`), closing the served-byte
-    ///      vote-weight inflation of ADR 036 (#846). `deliveryCeiling` stays
-    ///      advisory — a coordination ceiling nodes self-apply, not enforced
-    ///      on-chain (ADR 003 § Rate Bounds Refresh).
+    /// @dev Per-MB delivery-rate floor in USDC base units, exposed via
+    ///      `getRateBounds`. ENFORCED at settlement (`_advanceClaimWatermark`
+    ///      requires `amount * BYTES_PER_MB >= bytesDelivered * deliveryFloor`),
+    ///      closing the served-byte vote-weight inflation of ADR 036 (#846).
+    ///      There is no governance ceiling: a seller self-clamping its own
+    ///      advertised rate downward buys no on-chain safety, and the buyer
+    ///      protection is seeing the signed rate before paying. The floor is
+    ///      itself capped at `MAX_RATE_PER_MB` so it can never exceed what the
+    ///      wire schema will carry.
     uint256 internal deliveryFloor;
-    uint256 internal deliveryCeiling;
 
     /// @notice Per-client monotonic channel counter used in `channelId` derivation.
     mapping(address client => uint256) public clientChannelNonce;
@@ -227,7 +241,7 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, SunsettingPausable, E
     event FeeRouterUpdated(address indexed oldRouter, address indexed newRouter);
     event MinDepositUpdated(uint256 oldValue, uint256 newValue);
     event DisputeWindowUpdated(uint256 oldValue, uint256 newValue);
-    event RateBoundsUpdated(uint256 newDeliveryFloor, uint256 newDeliveryCeiling);
+    event RateBoundsUpdated(uint256 newDeliveryFloor);
 
     // -----------------------------------------------------------------
     // Errors
@@ -257,7 +271,7 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, SunsettingPausable, E
     error ByteAdvanceWithoutPayment(uint256 byteDelta);
     error ZeroAmount();
     error RouterUnchanged();
-    error RateBoundsInvalid(uint256 deliveryFloor, uint256 deliveryCeiling);
+    error RateBoundsInvalid(uint256 deliveryFloor);
     error ParamOutOfBounds(uint256 value, uint256 floor, uint256 ceiling);
 
     // -----------------------------------------------------------------
@@ -271,7 +285,6 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, SunsettingPausable, E
     /// @param maxChannelDuration_ Initial channel lifetime (seconds; bounded [7d, 365d]).
     /// @param deliveryFloor_      Per-byte price floor enforced at settlement
     ///                            (USDC base units per MB; >= 1).
-    /// @param deliveryCeiling_    Advisory rate ceiling (USDC base units per MB; > floor).
     /// @param admin               `DEFAULT_ADMIN_ROLE` + `GOVERNANCE_ROLE` holder
     ///                            (the deployer; handed to the Timelock post-deploy).
     constructor(
@@ -281,7 +294,6 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, SunsettingPausable, E
         uint256 disputeWindow_,
         uint256 maxChannelDuration_,
         uint256 deliveryFloor_,
-        uint256 deliveryCeiling_,
         address admin
     ) EIP712("PaymentChannel", "1") {
         if (
@@ -298,11 +310,8 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, SunsettingPausable, E
         if (maxChannelDuration_ < MAX_CHANNEL_DURATION_FLOOR || maxChannelDuration_ > MAX_CHANNEL_DURATION_CEILING) {
             revert ParamOutOfBounds(maxChannelDuration_, MAX_CHANNEL_DURATION_FLOOR, MAX_CHANNEL_DURATION_CEILING);
         }
-        if (
-            deliveryFloor_ < MIN_DEPOSIT_FLOOR || deliveryCeiling_ <= deliveryFloor_
-                || deliveryFloor_ > type(uint64).max || deliveryCeiling_ > type(uint64).max
-        ) {
-            revert RateBoundsInvalid(deliveryFloor_, deliveryCeiling_);
+        if (deliveryFloor_ < MIN_DEPOSIT_FLOOR || deliveryFloor_ > MAX_RATE_PER_MB) {
+            revert RateBoundsInvalid(deliveryFloor_);
         }
 
         usdc = usdc_;
@@ -311,7 +320,6 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, SunsettingPausable, E
         disputeWindow = disputeWindow_;
         maxChannelDuration = maxChannelDuration_;
         deliveryFloor = deliveryFloor_;
-        deliveryCeiling = deliveryCeiling_;
         minDeposit = DEFAULT_MIN_DEPOSIT;
 
         _grantRole(DEFAULT_ADMIN_ROLE, admin);
@@ -710,8 +718,8 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, SunsettingPausable, E
         return channels[channelId];
     }
 
-    function getRateBounds() external view returns (uint256 floor, uint256 ceiling) {
-        return (deliveryFloor, deliveryCeiling);
+    function getRateBounds() external view returns (uint256 floor) {
+        return deliveryFloor;
     }
 
     // -----------------------------------------------------------------
@@ -760,20 +768,15 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, SunsettingPausable, E
         emit DisputeWindowUpdated(old, newWindow);
     }
 
-    function setRateBounds(uint256 newFloor, uint256 newCeiling) external onlyRole(GOVERNANCE_ROLE) {
-        // Cap both bounds at `type(uint64).max`: the daemon's rate clamp decodes
-        // these as `u64` (`crates/node/src/rate_bounds.rs`), so a band the chain
-        // can express but the node cannot enforce would silently strand every
-        // voucher below the on-chain floor (#1383).
-        if (
-            newFloor < MIN_DEPOSIT_FLOOR || newCeiling <= newFloor || newFloor > type(uint64).max
-                || newCeiling > type(uint64).max
-        ) {
-            revert RateBoundsInvalid(newFloor, newCeiling);
+    function setRateBounds(uint256 newFloor) external onlyRole(GOVERNANCE_ROLE) {
+        // Cap at MAX_RATE_PER_MB, not `type(uint64).max`: the daemon decodes the
+        // floor as `u64` (#1383), but `u64` is ~18M× the wire cap, and every
+        // value in that gap is quietly network-isolating (see the constant).
+        if (newFloor < MIN_DEPOSIT_FLOOR || newFloor > MAX_RATE_PER_MB) {
+            revert RateBoundsInvalid(newFloor);
         }
         deliveryFloor = newFloor;
-        deliveryCeiling = newCeiling;
-        emit RateBoundsUpdated(newFloor, newCeiling);
+        emit RateBoundsUpdated(newFloor);
     }
 
     // -----------------------------------------------------------------

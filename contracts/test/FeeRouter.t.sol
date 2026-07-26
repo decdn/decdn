@@ -7,7 +7,7 @@ import { IAccessControl } from "@openzeppelin/contracts/access/IAccessControl.so
 
 import { FeeRouter } from "../src/FeeRouter.sol";
 import { SunsettingPausable } from "../src/SunsettingPausable.sol";
-import { ICapacityBondReporter } from "../src/interfaces/ICapacityBondReporter.sol";
+import { ICapacityBondEpoch } from "../src/interfaces/ICapacityBondEpoch.sol";
 
 contract MockUSDC is ERC20 {
     constructor() ERC20("USDC", "USDC") {
@@ -19,20 +19,11 @@ contract MockUSDC is ERC20 {
     }
 }
 
-contract MockBondReporter is ICapacityBondReporter {
-    address[] public reported;
+contract MockBondEpoch is ICapacityBondEpoch {
     uint64 public epochLengthValue;
 
     constructor(uint64 epochLengthValue_) {
         epochLengthValue = epochLengthValue_;
-    }
-
-    function recordSettlement(address operator) external override {
-        reported.push(operator);
-    }
-
-    function reportedCount() external view returns (uint256) {
-        return reported.length;
     }
 
     function epochLength() external view override returns (uint64) {
@@ -42,7 +33,7 @@ contract MockBondReporter is ICapacityBondReporter {
 
 contract FeeRouterTest is Test {
     MockUSDC internal usdc;
-    MockBondReporter internal bondReporter;
+    MockBondEpoch internal bondEpoch;
     FeeRouter internal router;
 
     address internal admin = address(0xA11CE);
@@ -55,21 +46,11 @@ contract FeeRouterTest is Test {
 
     function setUp() public {
         usdc = new MockUSDC();
-        bondReporter = new MockBondReporter(EPOCH);
+        bondEpoch = new MockBondEpoch(EPOCH);
 
-        // 6000 / 3000 / 1000 — ADR 026 steady-state default.
-        uint256[3] memory shares = [uint256(6000), uint256(3000), uint256(1000)];
-
-        router = new FeeRouter({
-            usdc_: usdc,
-            capacityBond_: bondReporter,
-            treasury_: treasury,
-            epochLength_: EPOCH,
-            windowEpochs_: 13,
-            admin: admin,
-            initialShares: shares,
-            buybackBurner_: buyback
-        });
+        // Same construction the constructor-guard tests use, so the shared
+        // values (shares, windowEpochs) live in exactly one place.
+        router = _deployRouter(bondEpoch, EPOCH);
 
         vm.startPrank(admin);
         router.grantRole(router.ROUTER_CALLER_ROLE(), channel);
@@ -79,6 +60,59 @@ contract FeeRouterTest is Test {
         usdc.transfer(channel, 1_000_000e6);
         vm.prank(channel);
         usdc.approve(address(router), type(uint256).max);
+    }
+
+    // -----------------------------------------------------------------
+    // Constructor guards. Since `recordSettlement` was removed (#1434) the
+    // `capacityBond_` argument has exactly ONE remaining purpose: proving at
+    // deploy time that the bond's epoch length matches the router's. Both
+    // `CapacityBond.EPOCH_LENGTH` and `FeeRouter.epochLength` are
+    // constant/immutable, so this one-shot check is a permanent guarantee — and
+    // it is now the sole justification for the argument existing, which is why
+    // it needs its own coverage rather than riding on the deploy fixtures.
+    // A mismatch would silently mis-anchor `DecdnGovernor` epoch arithmetic by
+    // mixing epoch indices derived from two different lengths.
+    // -----------------------------------------------------------------
+
+    function _deployRouter(ICapacityBondEpoch bond_, uint64 epochLength_) internal returns (FeeRouter) {
+        uint256[3] memory shares = [uint256(6000), uint256(3000), uint256(1000)];
+        return new FeeRouter({
+            usdc_: usdc,
+            capacityBond_: bond_,
+            treasury_: treasury,
+            epochLength_: epochLength_,
+            windowEpochs_: 13,
+            admin: admin,
+            initialShares: shares,
+            buybackBurner_: buyback
+        });
+    }
+
+    function test_constructor_revertsOnEpochLengthMismatch() public {
+        MockBondEpoch mismatched = new MockBondEpoch(EPOCH + 1 days);
+        vm.expectRevert(abi.encodeWithSelector(FeeRouter.EpochLengthMismatch.selector, EPOCH + 1 days, EPOCH));
+        _deployRouter(mismatched, EPOCH);
+    }
+
+    /// Passing `epochLength_ = 0` against a 7-day bond leaves BOTH guards live,
+    /// so this only proves the zero check is ordered first.
+    function test_constructor_revertsOnZeroEpochLength() public {
+        vm.expectRevert(FeeRouter.ZeroEpochLength.selector);
+        _deployRouter(bondEpoch, 0);
+    }
+
+    /// The case the zero guard uniquely defends, and the one the test above
+    /// cannot reach: a misdeployed `CapacityBond` that itself reports `0`. The
+    /// mismatch check passes cleanly (0 == 0), so without `ZeroEpochLength` the
+    /// router deploys with `epochLength() == 0` and every downstream epoch
+    /// computation divides by zero.
+    function test_constructor_revertsOnZeroEpochLengthEvenWhenBondAgrees() public {
+        // Deploy the mock BEFORE `expectRevert`: a `new` in the argument list is
+        // itself a CREATE, and `expectRevert` latches onto the next call — it
+        // would target the mock's construction, which succeeds.
+        MockBondEpoch zeroBond = new MockBondEpoch(0);
+        vm.expectRevert(FeeRouter.ZeroEpochLength.selector);
+        _deployRouter(zeroBond, 0);
     }
 
     function test_routeSettlement_distributesThreeLegs() public {
@@ -93,10 +127,6 @@ contract FeeRouterTest is Test {
         assertEq(usdc.balanceOf(operator), 600e6);
         assertEq(usdc.balanceOf(buyback), 300e6);
         assertEq(usdc.balanceOf(treasury), 100e6);
-
-        // Settlement reporter invoked.
-        assertEq(bondReporter.reportedCount(), 1);
-        assertEq(bondReporter.reported(0), operator);
     }
 
     function test_routeSettlement_incrementsBytesPerEpoch() public {

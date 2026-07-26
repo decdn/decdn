@@ -25,8 +25,8 @@ use decdn_node::handlers::probe_rate_limit::{ProbeRateLimiter, ProbeRejectLayer}
 use decdn_node::metrics::Metrics;
 use decdn_node::rate_limit::RateLimitConfig;
 use decdn_protocol::{
-    ALPN_PROBE, APP_ERR_RATE_LIMITED, MAX_MESSAGE_SIZE, MAX_RATE_PER_MB, ProbeMessage,
-    SLASH_SIG_LEN, decode_message, encode_message,
+    ALPN_PROBE, APP_ERR_RATE_LIMITED, MAX_MESSAGE_SIZE, ProbeMessage, SLASH_SIG_LEN,
+    decode_message, encode_message,
     message::{ProbeRequest, ProbeResponse, ProbeResponseBody},
     read_frame, write_frame,
 };
@@ -133,7 +133,6 @@ fn build_handler_bounds(
     limiter: Arc<ConnectionLimiter>,
     cache: CacheEngine,
     floor: u64,
-    ceiling: u64,
 ) -> (Arc<ProbeHandler>, Arc<PrivateKeySigner>, Eip712Domain) {
     // Most tests don't exercise the ADR 005 probe rate limiter — wire a
     // permissive one so only the layer under test (the `ConnectionLimiter`,
@@ -146,7 +145,6 @@ fn build_handler_bounds(
         permissive_probe_rate_limiter(metrics),
         cache,
         floor,
-        ceiling,
     )
 }
 
@@ -162,7 +160,6 @@ fn build_handler_with_probe_limiter(
     probe_limiter: Arc<ProbeRateLimiter>,
     cache: CacheEngine,
     floor: u64,
-    ceiling: u64,
 ) -> (Arc<ProbeHandler>, Arc<PrivateKeySigner>, Eip712Domain) {
     let signer = Arc::new(PrivateKeySigner::random());
     let domain = test_slash_domain();
@@ -175,7 +172,7 @@ fn build_handler_with_probe_limiter(
         cache,
         Arc::clone(&signer),
         domain.clone(),
-        decdn_node::rate_bounds::RateBounds::new(floor, ceiling),
+        decdn_node::rate_bounds::RateBounds::new(floor),
         // No stake-lane reservation for the general-purpose builder; the
         // dedicated reservation tests use `build_handler_with_lane` (#757).
         None,
@@ -211,7 +208,7 @@ fn build_handler_with_lane(
         cache,
         Arc::clone(&signer),
         domain.clone(),
-        decdn_node::rate_bounds::RateBounds::new(0, MAX_RATE_PER_MB),
+        decdn_node::rate_bounds::RateBounds::new(0),
         Some(policy),
     ));
     (handler, signer, domain)
@@ -225,7 +222,7 @@ fn build_handler(
     limiter: Arc<ConnectionLimiter>,
     cache: CacheEngine,
 ) -> (Arc<ProbeHandler>, Arc<PrivateKeySigner>, Eip712Domain) {
-    build_handler_bounds(server_id, rate, metrics, limiter, cache, 0, MAX_RATE_PER_MB)
+    build_handler_bounds(server_id, rate, metrics, limiter, cache, 0)
 }
 
 /// Build a permissive `ConnectionLimiter` suitable for tests that don't
@@ -866,7 +863,6 @@ async fn probe_three_layer_limiter_rejects_per_peer() -> anyhow::Result<()> {
         Arc::clone(&probe_limiter),
         cache,
         0,
-        MAX_RATE_PER_MB,
     );
 
     let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_PROBE.to_vec()]).await?;
@@ -1246,19 +1242,20 @@ async fn probe_stake_lane_requester_keeps_reserved_headroom() -> anyhow::Result<
     Ok(())
 }
 
-/// `rate_per_mb` is clamped to the configured delivery ceiling before
-/// signing, and the `slash_sig` covers the clamped value (ADR 005 §Rate
-/// bounds validation, #318).
+/// `rate_per_mb` is raised to the governance delivery floor before signing,
+/// and the `slash_sig` covers the clamped value (ADR 005 §Rate bounds
+/// validation, #318). The clamp is raise-only — there is no governance
+/// ceiling to clamp down to.
 #[tokio::test(flavor = "multi_thread")]
-async fn probe_rate_clamped_to_ceiling_before_signing() -> anyhow::Result<()> {
+async fn probe_rate_raised_to_floor_before_signing() -> anyhow::Result<()> {
     let server_sk = fresh_key();
     let server_id = server_sk.public();
     let metrics = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics);
     let (cache, _cache_tmp) = empty_cache().await?;
-    // Configured rate 42 but a ceiling of 5 → response must quote 5.
+    // Configured rate 5 but a floor of 42 → response must quote 42.
     let (handler, signer, domain) =
-        build_handler_bounds(server_id, 42, &metrics, limiter, cache, 0, 5);
+        build_handler_bounds(server_id, 5, &metrics, limiter, cache, 42);
 
     let req = ProbeRequest {
         hash: [9u8; 32],
@@ -1267,11 +1264,11 @@ async fn probe_rate_clamped_to_ceiling_before_signing() -> anyhow::Result<()> {
     let resp = run_one_probe(server_sk, handler, req).await?;
 
     anyhow::ensure!(
-        resp.body.rate_per_mb == 5,
-        "rate must be clamped to ceiling 5, got {}",
+        resp.body.rate_per_mb == 42,
+        "rate must be raised to floor 42, got {}",
         resp.body.rate_per_mb
     );
-    // slash_sig must verify over the clamped rate, not the raw 42.
+    // slash_sig must verify over the clamped rate, not the raw 5.
     assert_slash_sig_valid(&resp, &signer, &domain)?;
     Ok(())
 }

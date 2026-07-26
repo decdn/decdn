@@ -34,7 +34,7 @@ use decdn_node::handlers::probe::ProbeHandler;
 use decdn_node::handlers::probe_rate_limit::ProbeRateLimiter;
 use decdn_node::metrics::Metrics;
 use decdn_node::rate_limit::RateLimitConfig;
-use decdn_protocol::{ALPN_PROBE, MAX_RATE_PER_MB, SLASH_SIG_LEN, message::ProbeResponse};
+use decdn_protocol::{ALPN_PROBE, SLASH_SIG_LEN, message::ProbeResponse};
 use iroh::endpoint::presets;
 use iroh::protocol::Router;
 use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey};
@@ -142,7 +142,7 @@ async fn spawn_probe_server(
         cache,
         Arc::clone(&signer),
         domain.clone(),
-        decdn_node::rate_bounds::RateBounds::new(0, MAX_RATE_PER_MB),
+        decdn_node::rate_bounds::RateBounds::new(0),
         None, // no stake-lane reservation (#757)
     ));
     let router = Router::builder(ep.clone())

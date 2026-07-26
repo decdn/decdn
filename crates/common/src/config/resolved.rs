@@ -188,9 +188,10 @@ pub struct ResolvedCache {
     pub max_blob_size_mb: u64,
     /// Buyer-side ABSOLUTE per-MB rate ceiling for paid pulls (#1375), in the same
     /// per-MB units as the wire `StreamResponse.rate_per_mb`; `0` = unlimited
-    /// (the default). Distinct from the seller-side `delivery_ceiling` clamp: this
-    /// bounds what this node, acting as a BUYER on a cache-miss pull, will accept a
-    /// provider to quote. The node also always applies a probe-relative bound (a
+    /// (the default). Distinct from the seller-side `delivery_floor` clamp, which
+    /// raises this node's own quote: this bounds what this node, acting as a BUYER
+    /// on a cache-miss pull, will accept a provider to quote. The node also always
+    /// applies a probe-relative bound (a
     /// quote may not exceed the rate the chosen candidate advertised at probe), so
     /// this is the additional absolute backstop.
     pub max_rate_per_mb: u64,
@@ -432,10 +433,6 @@ pub struct ResolvedPayment {
     /// runtime overwrites it from on-chain `getRateBounds()` before serving and
     /// the rate-bounds watcher keeps it current. Default `0`.
     pub delivery_floor: u64,
-    /// Pre-chain seed for the upper clamp bound on `rate_per_mb`. Same
-    /// caveat as [`Self::delivery_floor`] — the live ceiling is on-chain
-    /// (#1172). Default [`decdn_protocol::MAX_RATE_PER_MB`].
-    pub delivery_ceiling: u64,
     /// Voucher cadence advertised in `StreamResponse` for `cdn/client/v1`
     /// (ADR 003 §Voucher Interval Negotiation); default
     /// [`decdn_protocol::DEFAULT_VOUCHER_INTERVAL_MB`], range

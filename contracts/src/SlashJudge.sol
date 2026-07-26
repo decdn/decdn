@@ -464,10 +464,9 @@ contract SlashJudge is ISlashJudge, AccessControl, ReentrancyGuard, SunsettingPa
 
     /// @dev Confirm `blobHash` was an enforceable blacklist entry IN SCOPE for
     ///      `operator` (ADR 030 § Region-stability window: global ∪ current-region
-    ///      ∪ ripening-prev-region) strictly before the served response. A
-    ///      suspended entry (fast-tracked appeal) lifts the serving restriction,
-    ///      so it is not slashable — matching `ContentBlacklist._isLive`
-    ///      (`addedAt != 0 && !suspended && !expired`). The GLOBAL leg preserves
+    ///      ∪ ripening-prev-region) strictly before the served response —
+    ///      matching `ContentBlacklist._isLive` (`addedAt != 0 && !expired`).
+    ///      The GLOBAL leg preserves
     ///      the original two-error semantics (the richer `BlacklistAfterResponse`
     ///      when a global entry exists but is not yet enforceable at the response
     ///      and no regional leg rescues it); the regional legs fold their
@@ -478,9 +477,9 @@ contract SlashJudge is ISlashJudge, AccessControl, ReentrancyGuard, SunsettingPa
     ///      granted — with a 10-minute default poll interval, for content it had
     ///      no way to know was prohibited.
     function _checkBlacklistedBefore(address operator, bytes32 blobHash, uint64 responseTsUs) internal view {
-        (uint64 gAddedAt, bool gSuspended, uint64 gEffectiveAt, bool gEmergency, uint8 gCategory) =
+        (uint64 gAddedAt, uint64 gEffectiveAt, bool gEmergency, uint8 gCategory) =
             contentBlacklist.getHashEntry(GLOBAL_REGION, blobHash);
-        if (gAddedAt != 0 && !gSuspended && !_emergencyExpired(gEmergency, gAddedAt, gCategory)) {
+        if (gAddedAt != 0 && !_emergencyExpired(gEmergency, gAddedAt, gCategory)) {
             // Effective-since (seconds → μs) must precede the served response.
             uint256 gEffectiveAtUs = uint256(gEffectiveAt) * 1_000_000;
             if (gEffectiveAtUs < uint256(responseTsUs)) return; // slashable under global scope
@@ -533,15 +532,14 @@ contract SlashJudge is ISlashJudge, AccessControl, ReentrancyGuard, SunsettingPa
     }
 
     /// @dev True iff `(region, blobHash)` is an entry that was ENFORCEABLE before
-    ///      the served response — present, not suspended, not lapsed, and past
-    ///      its compliance window (`effectiveAt`, seconds → μs).
+    ///      the served response — present, not lapsed, and past its compliance
+    ///      window (`effectiveAt`, seconds → μs).
     function _liveBefore(bytes32 region, bytes32 blobHash, uint64 responseTsUs) private view returns (bool) {
-        (uint64 addedAt, bool suspended, uint64 effectiveAt, bool emergency, uint8 category) =
+        (uint64 addedAt, uint64 effectiveAt, bool emergency, uint8 category) =
             contentBlacklist.getHashEntry(region, blobHash);
         // Positive form (matches `ContentBlacklist._isLive`): an entry is live iff
-        // present (`addedAt != 0`), not fast-track-suspended, and not an expired
-        // emergency entry.
-        if (addedAt == 0 || suspended) return false;
+        // present (`addedAt != 0`) and not an expired emergency entry.
+        if (addedAt == 0) return false;
         if (_emergencyExpired(emergency, addedAt, category)) return false;
         return uint256(effectiveAt) * 1_000_000 < uint256(responseTsUs);
     }

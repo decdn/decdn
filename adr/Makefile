@@ -70,7 +70,7 @@ BOOK_SRCS := \
   026-tokenomics.md 018-liquidity-strategy.md \
   _build/part-5-verification.md \
   014-on-chain-verification.md 008-reputation.md 011-content-takedown.md \
-  028-slashing-appeals.md 031-content-blacklist-appeals-contract.md \
+  028-slashing-appeals.md \
   030-node-region-self-attestation.md \
   _build/part-6-governance.md \
   009-governance.md 036-served-bytes-voting-weight.md 016-contract-interactions.md \

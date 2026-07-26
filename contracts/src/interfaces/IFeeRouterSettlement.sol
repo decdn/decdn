@@ -7,7 +7,7 @@ pragma solidity 0.8.28;
 ///         ADR 016 § Cross-Contract Call Graph). Kept minimal — and separate
 ///         from the full `IFeeRouter` — so `PaymentChannel` links only the
 ///         settlement selector it calls, mirroring the focused
-///         `ICapacityBondReporter` consumer interface.
+///         `ICapacityBondEpoch` consumer interface.
 /// @dev    `PaymentChannel.settleChannel` / `withdraw` `approve` the router for
 ///         the routed delta, then call `routeSettlement` in the same
 ///         transaction. The router pulls the USDC via `safeTransferFrom`,

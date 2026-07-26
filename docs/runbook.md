@@ -132,9 +132,7 @@ slashed by an external adversary.
 - Alerts in `monitoring/prometheus-alerts.yml` (verbatim names):
   - `DecdnProbeHoldViolations` (critical) — hold budget exhausted, so
     present blobs are being answered `has_blob: false`. Budget pressure and
-    lost revenue, not slash evidence (the alert's own annotation still
-    describes this as phantom evidence — it is wrong; see step 4 and
-    issue #1471).
+    lost revenue, not slash evidence; see step 4.
   - `DecdnSlashEvidenceExposure` (critical) — node served bytes for a hash
     inside the slash window after `has_blob: true`.
   - `DecdnBlacklistSyncLagCritical` (critical) — blacklist > 30 minutes
@@ -143,8 +141,11 @@ slashed by an external adversary.
     versions missed. (Both blacklist alerts above are pre-wired but not yet
     emitted by the node — see
     [ContentBlacklist compliance](#contentblacklist-compliance).)
-  - `DecdnRateBoundsClamp` (warning) — `rate_per_mb` outside governance
-    bounds; not directly slashable but indicates configuration drift.
+  - `DecdnRateBoundsClamp` (warning) — your configured `rate_per_mb` sits
+    *below* the governance `deliveryFloor`, so every quote is being raised to
+    the floor before signing. The clamp is raise-only; there is no ceiling. Not
+    directly slashable, but it means you are not charging what you configured.
+    Raise `payment.rate_per_mb` to at least the on-chain floor.
 - Grafana: the slash-safety row in `monitoring/grafana-dashboard.json`.
 
 **Remediate:**
@@ -212,8 +213,7 @@ slashed by an external adversary.
 hash on-chain via `ContentBlacklist`, and this node may still be caching,
 announcing, or serving it. Serving a globally blocked hash is a slashable
 offense (see [Slashing risk](#slashing-risk)). Protocol semantics:
-[ADR 011](../adr/011-content-takedown.md),
-[ADR 031](../adr/031-content-blacklist-appeals-contract.md).
+[ADR 011](../adr/011-content-takedown.md).
 
 **How a node is meant to learn about a blocked hash.**
 [ADR 011 § Node Behavior](../adr/011-content-takedown.md#node-behavior)
@@ -293,40 +293,44 @@ nodeId-indexed `NodeAutoEjected`. The node's staker-set watcher follows
      `GENERAL`, 90 for `CSAM`/`TERRORIST` — unless governance ratifies it with
      `addHashGlobal`. It stops being slashable at that deadline whether or not
      anyone has called `expireEmergencyEntry` to materialize the removal.
-   - An entry under active appeal (`suspended == true`) is not slashable —
-     `isHashBlacklisted` returns `false` and `SlashJudge` rejects the challenge —
-     but `addedAt` and `effectiveAt` are both preserved when the suspension
-     clears, so the grace does **not** restart: re-evict before serving again.
 
-3. **If you believe the entry is wrong, appeal it — don't just keep serving.**
-   `openBlacklistAppeal(hash, region, evidenceBundleHash, standingPath, namespaceId)`
-   opens an appeal against an `appealBond` deposit (governance-set; testnet deploy
-   default **100 TOKEN**, bounds `[50, 5000]`) within a 14-day filing window from
-   `addedAt`. The emergency multisig (`EMERGENCY_MULTISIG_ROLE`) fast-tracks —
-   suspending the entry for interim relief — or rejects; DecdnGovernor
-   (`GOVERNANCE_ROLE`) then ratifies the removal or reverses. Bond outcomes in
-   the deployed contract: **refunded only on ratification**; **burned on
-   rejection, reversal, and lapse** (`cleanupExpiredBlacklistAppeal`). The
-   declared `standingPath` is **verified at filing** (audit I-3): **`Publisher`**
-   requires that `namespaceId` is a namespace you own which has claimed the hash
-   (ignored on the other paths); **`Operator`** requires your current attested
-   region to match the entry's region; **`TokenHolder`** needs no extra
-   credential — the escrowed appeal bond is the standing, so there is no balance
-   threshold and no synthetic-standing clawback. PoC caveat vs. the ADR 011/031
-   design: any non-zero `region` is appealable (global included — the
-   regional-only restriction is not enforced). Global entries also remain
-   removable via the slow-path DecdnGovernor `removeHashGlobal` override. Design
-   intent:
-   [ADR 011 § Blacklist Entry Appeals](../adr/011-content-takedown.md#blacklist-entry-appeals),
-   [ADR 031](../adr/031-content-blacklist-appeals-contract.md).
+3. **If you believe the entry is wrong, escalate it — don't just keep serving.**
+   There is no per-entry appeal contract; the entry comes off through the
+   ordinary removal path, and **which path depends on the entry's scope.**
 
-4. **A slash you already took is a separate matter.** Appealing the blacklist
-   *entry* (step 3) removes the entry; it does **not** refund a slash you
-   already incurred for serving the hash. Restitution for the slash itself —
-   e.g. you were offline during the window — is the
-   [ADR 028 SlashAppeal](../adr/028-slashing-appeals.md) path, with its own
-   bond and evidence rules. Operational-failure evidence is inadmissible on
-   the content-policy path and vice versa.
+   - **Global entry** (`region == GLOBAL`): a DecdnGovernor `removeHashGlobal`
+     proposal through the standard timelock (~10 days).
+   - **Regional entry**: only the registered body for that region can remove it.
+     `removeHashRegional` is `REGIONAL_BODY_ROLE`-gated *and* requires the
+     caller to be that region's currently-registered, unsuspended body — so
+     `removeHashGlobal` cannot reach it and neither can governance directly.
+     Raise it with the body: for them it is one transaction, no vote.
+   - **Regional entry, body will not act**: governance must replace the body —
+     `deregisterRegionalBody(region)` then `registerRegionalBody(region, …)`
+     with a body that will act, which then calls `removeHashRegional`. Two
+     governance actions, so budget more than one timelock cycle.
+
+   **Do not reach for `suspendRegionalBody` here.** It is the right tool for a
+   body that is issuing bad entries, and the wrong one for a body that will not
+   remove them: `_requireActiveBodyFor` gates `addHashRegional` **and**
+   `removeHashRegional`, so suspending closes the only route by which that
+   body's existing entries could come off. Suspension also retracts nothing —
+   every entry already issued stays live, enforceable and slashable, because
+   `_bodySuspended` is not consulted by `_isLive` or by `SlashJudge`. If a
+   suspension is already in place and you need an entry removed, governance must
+   first `unsuspendRegionalBody` or replace the body outright.
+
+   In every case, keep the hash evicted until the removal actually lands: the
+   entry is enforceable, and therefore slashable, right up to that point.
+   Semantics:
+   [ADR 011 § Removing a Wrongful Entry](../adr/011-content-takedown.md#removing-a-wrongful-entry).
+
+4. **A slash you already took is a separate matter.** Getting the entry removed
+   (step 3) stops future exposure; it does **not** refund a slash you already
+   incurred for serving the hash. Restitution for the slash itself — e.g. you
+   were offline during the window — is the
+   [ADR 028 SlashAppeal](../adr/028-slashing-appeals.md) path, with its own bond
+   and evidence rules, and it is the only appeal surface the protocol carries.
 
 ## Gossip / peer table degraded
 

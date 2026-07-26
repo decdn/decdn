@@ -55,7 +55,7 @@ These give early warning for the three slashable offenses in [ADR 026 § Slashin
 | `decdn_probe_hold_slots_max` | Gauge | M | Configured `max_probe_holds`. Paired with `decdn_probe_hold_slots_used` for a saturation ratio. |
 | `decdn_blacklist_sync_lag_seconds` | Gauge | M | Seconds since the last successful `getBlacklistVersion()` poll. Exceeding the compliance window makes serving any recently-blacklisted hash slashable ([ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting)). |
 | `decdn_blacklist_version_behind` | Gauge | M | `on_chain_version − local_version`. Positive means new blacklist entries not yet fetched. |
-| `decdn_rate_bounds_clamp_events_total` | Counter | M | Times `rate_per_mb` was clamped to governance bounds before signing a `ProbeResponse` — configured rate is outside the current governance window ([ADR 003](003-payments.md#adr-003-payment-model), [ADR 005](005-protocol.md#adr-005-wire-protocol)). |
+| `decdn_rate_bounds_clamp_events_total` | Counter | M | Times `rate_per_mb` was raised to the governance `deliveryFloor` before signing a `ProbeResponse` / `StreamResponse` — the configured rate sits below the current floor ([ADR 003](003-payments.md#adr-003-payment-model), [ADR 005](005-protocol.md#adr-005-wire-protocol)). |
 | `decdn_slash_evidence_exposure_total` | Counter | M | Self-detected `has_blob: true` probe followed by a stream response within the 30-second slashing window — valid phantom slash evidence ([ADR 005](005-protocol.md#adr-005-wire-protocol)). Non-zero is a critical bug signal. |
 
 **Recommended alert thresholds:**
@@ -65,7 +65,7 @@ These give early warning for the three slashable offenses in [ADR 026 § Slashin
 | `decdn_probe_hold_violations_total` (rate) | > 0 | > 0 sustained | Reduce load or increase `max_probe_holds`; check for OOM. |
 | `decdn_blacklist_sync_lag_seconds` | > 600s (1 poll interval) | > 1800s | Check RPC provider; manual sync if needed. |
 | `decdn_blacklist_version_behind` | > 0 | > 1 | Investigate RPC / poll failure. |
-| `decdn_rate_bounds_clamp_events_total` (rate) | > 0 | — | Update `rate_per_mb` config to within governance bounds. |
+| `decdn_rate_bounds_clamp_events_total` (rate) | > 0 | — | Raise the `rate_per_mb` config to at least the governance `deliveryFloor`. |
 | `decdn_slash_evidence_exposure_total` (rate) | — | > 0 | File a bug; stop node immediately if rate is sustained. |
 
 #### Delivery Metrics (`cdn/client/v1`)
@@ -235,7 +235,7 @@ In the metric names below, `<watcher>` expands to one of **`slash_watcher`**, **
 |----------|---------|
 | `ready` | All Phase 5 acceptance criteria satisfied ([ADR 019](019-node-onboarding.md#phase-5--accepting-paid-delivery)); serving traffic. |
 | `degraded` | Running but one or more non-critical conditions impaired (e.g., gossip mesh thin, peer table sparse). Traffic still accepted. |
-| `not_ready` | A mandatory startup check failed or is incomplete (blacklist un-synced, rate bounds not loaded, not registered). Not accepting traffic. |
+| `not_ready` | A mandatory startup check failed or is incomplete (blacklist un-synced, rate floor not loaded, not registered). Not accepting traffic. |
 
 HTTP status codes: `200` for `ready` and `degraded`; `503` for `not_ready`. Monitoring systems SHOULD alert on `503` responses.
 

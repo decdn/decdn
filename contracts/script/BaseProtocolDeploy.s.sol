@@ -31,12 +31,11 @@ import { IEd25519Verifier } from "../src/interfaces/IEd25519Verifier.sol";
 import { ISlashJudgeEvidenceView } from "../src/interfaces/ISlashJudgeEvidenceView.sol";
 import { ICapacityBond } from "../src/interfaces/ICapacityBond.sol";
 import { ICapacityBondEjector } from "../src/interfaces/ICapacityBondEjector.sol";
-import { ICapacityBondReporter } from "../src/interfaces/ICapacityBondReporter.sol";
+import { ICapacityBondEpoch } from "../src/interfaces/ICapacityBondEpoch.sol";
 import { ICapacityBondActivity } from "../src/interfaces/ICapacityBondActivity.sol";
 import { ICapacityBondSlasher } from "../src/interfaces/ICapacityBondSlasher.sol";
 import { IContentBlacklistHashView } from "../src/interfaces/IContentBlacklistHashView.sol";
 import { IPublisherRegistryOwnership } from "../src/interfaces/IPublisherRegistryOwnership.sol";
-import { IPublisherRegistryStanding } from "../src/interfaces/IPublisherRegistryStanding.sol";
 
 /// @title BaseProtocolDeploy
 /// @notice Abstract deploy primitive for the v3 contract surface. Performs the
@@ -71,8 +70,8 @@ import { IPublisherRegistryStanding } from "../src/interfaces/IPublisherRegistry
 ///           3. `_deployGovernor`        — DecdnGovernor; grant Timelock's
 ///                                         PROPOSER + CANCELLER roles to the
 ///                                         Governor.
-///           4. `_wireCrossContractRoles` — peer role grants (settlement reporter,
-///                                          slash-appeal driver, blacklist ejector,
+///           4. `_wireCrossContractRoles` — peer role grants (slash-appeal driver,
+///                                          blacklist ejector,
 ///                                          emergency multisig, PAUSER_ROLE on every
 ///                                          Pausable target,
 ///                                          router-caller → PaymentChannel,
@@ -213,7 +212,6 @@ abstract contract BaseProtocolDeploy is Script {
     uint256 internal constant PAYMENT_DISPUTE_WINDOW = 48 hours;
     uint256 internal constant PAYMENT_MAX_CHANNEL_DURATION = 90 days;
     uint256 internal constant PAYMENT_DELIVERY_FLOOR = 1;
-    uint256 internal constant PAYMENT_DELIVERY_CEILING = 1000;
 
     // SlashJudge launch params (ADR 014 § Governable Parameters). `maxEvidenceAge`
     // (5 days) must stay `< unbondingPeriod` (14 days default) — the SlashJudge
@@ -253,9 +251,8 @@ abstract contract BaseProtocolDeploy is Script {
         uint64 feeRouterWindowEpochs;
         uint256[3] feeRouterShares;
         address buybackBurner;
-        // Appeal-bond params (ADR 028)
+        // Appeal-bond param (ADR 028)
         uint256 slashAppealBond;
-        uint256 blacklistAppealBond;
     }
 
     struct Deployment {
@@ -417,7 +414,7 @@ abstract contract BaseProtocolDeploy is Script {
 
         d.router = new FeeRouter({
             usdc_: cfg.usdc,
-            capacityBond_: ICapacityBondReporter(address(d.bond)),
+            capacityBond_: ICapacityBondEpoch(address(d.bond)),
             treasury_: address(timelock),
             epochLength_: cfg.feeRouterEpochLength,
             windowEpochs_: cfg.feeRouterWindowEpochs,
@@ -426,19 +423,14 @@ abstract contract BaseProtocolDeploy is Script {
             buybackBurner_: cfg.buybackBurner
         });
 
-        // PublisherRegistry deploys BEFORE ContentBlacklist: the blacklist binds
-        // it as a constructor immutable for the ADR 031 Publisher standing check
-        // (security-critical, cannot be left unset). The registry needs only
-        // `admin`, so the ordering is free.
+        // PublisherRegistry — consumed by `OriginAssignment` below, which binds
+        // it as a constructor immutable. Needs only `admin`.
         d.registry = new PublisherRegistry({ admin: cfg.deployer });
 
-        d.blacklist = new ContentBlacklist({
-            capacityBond_: ICapacityBondEjector(address(d.bond)),
-            token_: d.token,
-            publisherRegistry_: IPublisherRegistryStanding(address(d.registry)),
-            admin: cfg.deployer,
-            appealBond_: cfg.blacklistAppealBond
-        });
+        // `ContentBlacklist` takes no token: it custodies no funds (ADR 016
+        // § Contract Inventory) now that the appeal-bond escrow is gone.
+        d.blacklist =
+            new ContentBlacklist({ capacityBond_: ICapacityBondEjector(address(d.bond)), admin: cfg.deployer });
 
         // PaymentChannel (ADR 003): USDC settlement gateway. `feeRouter` must be
         // a deployed contract (constructor checks code size) — `d.router` above.
@@ -449,7 +441,6 @@ abstract contract BaseProtocolDeploy is Script {
             disputeWindow_: PAYMENT_DISPUTE_WINDOW,
             maxChannelDuration_: PAYMENT_MAX_CHANNEL_DURATION,
             deliveryFloor_: PAYMENT_DELIVERY_FLOOR,
-            deliveryCeiling_: PAYMENT_DELIVERY_CEILING,
             admin: cfg.deployer
         });
 
@@ -492,8 +483,6 @@ abstract contract BaseProtocolDeploy is Script {
     // configure mutable state before the handoff puts every setter behind the
     // 48h Timelock.
     function _wireCrossContractRoles(DeployConfig memory cfg, Deployment memory d) internal {
-        // FeeRouter writes settlement state on CapacityBond.
-        d.bond.grantRole(d.bond.SETTLEMENT_REPORTER_ROLE(), address(d.router));
         // SlashAppeal drives the escrow-on-slash appeal hooks on CapacityBond
         // (markAppealOpen / settleAppealUpheld / settleAppealGranted) — ADR 028.
         d.bond.grantRole(d.bond.SLASH_APPEAL_ROLE(), address(d.slashAppeal));
@@ -637,7 +626,6 @@ abstract contract BaseProtocolDeploy is Script {
     // fails the deploy loudly instead of shipping a half-wired protocol.
     function _assertPeerRolesWired(DeployConfig memory cfg, Deployment memory d) internal view {
         // CapacityBond peer roles.
-        _requireRole(d.bond, d.bond.SETTLEMENT_REPORTER_ROLE(), address(d.router));
         _requireRole(d.bond, d.bond.SLASH_APPEAL_ROLE(), address(d.slashAppeal));
         _requireRole(d.bond, d.bond.BLACKLIST_ROLE(), address(d.blacklist));
         _requireRole(d.bond, d.bond.SLASH_ROLE(), address(d.slashJudge));
@@ -663,13 +651,6 @@ abstract contract BaseProtocolDeploy is Script {
         address boundBlacklist = d.originAssignment.contentBlacklist();
         if (boundBlacklist != address(d.blacklist)) {
             revert BindingNotWired(address(d.originAssignment), address(d.blacklist), boundBlacklist);
-        }
-        // The Publisher standing check is security-critical and the binding is a
-        // constructor immutable — verify a constructor-arg mix-up didn't point it
-        // at the wrong registry.
-        address boundRegistry = address(d.blacklist.publisherRegistry());
-        if (boundRegistry != address(d.registry)) {
-            revert BindingNotWired(address(d.blacklist), address(d.registry), boundRegistry);
         }
     }
 

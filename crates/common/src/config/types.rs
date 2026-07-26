@@ -182,8 +182,8 @@ pub struct BlockchainConfig {
     pub content_blacklist_from_block: Option<u64>,
     /// Seconds between the blacklist watcher's periodic replay + re-scope pass
     /// (ADR 011 §Polling cadence). This backstop is what catches scope changes
-    /// with no `ContentBlacklist` event — an operator region/ripening transition
-    /// or an appeal reversal/lapse re-enabling a suspended entry. Absent =>
+    /// with no `ContentBlacklist` event — an operator region/ripening
+    /// transition. Absent =>
     /// [`super::DEFAULT_CONTENT_BLACKLIST_POLL_INTERVAL_SEC`] (600s). Only
     /// consulted when `content_blacklist_address` is set.
     pub content_blacklist_poll_interval_sec: Option<u64>,
@@ -312,7 +312,8 @@ pub struct CacheConfig {
     /// per-MB units as the wire `StreamResponse.rate_per_mb`. Absent / `0` =
     /// unlimited. Bounds what this node, as a BUYER on a cache-miss pull, will
     /// accept a provider to quote — on top of the always-applied probe-relative
-    /// bound. Distinct from the seller-side `delivery_ceiling` clamp.
+    /// bound. Distinct from the seller-side `delivery_floor` clamp, which raises
+    /// this node's own quote rather than bounding what it will pay.
     pub max_rate_per_mb: Option<u64>,
     /// Single origin backend for cache pull-through (#437). Absent =>
     /// no pull-through (unless [`Self::origins`] is set); cache misses
@@ -767,20 +768,15 @@ pub struct PaymentConfig {
     /// refuses startup outright), so treat the on-chain value as authoritative.
     /// Absent => `0`.
     pub delivery_floor: Option<u64>,
-    /// Pre-chain **seed** for the upper bound the node clamps `rate_per_mb` to
-    /// before signing a `ProbeResponse`. Same as [`Self::delivery_floor`]: the
-    /// live ceiling comes from on-chain `getRateBounds()` (#1172), not from
-    /// here. Absent => [`decdn_protocol::MAX_RATE_PER_MB`].
-    pub delivery_ceiling: Option<u64>,
     /// Voucher cadence the node advertises in `StreamResponse` for
     /// `cdn/client/v1` delivery (ADR 003 §Voucher Interval Negotiation): the
     /// node pauses delivery once outstanding unvouchered bytes exceed
     /// `voucher_interval_mb * 1_048_576`. Absent =>
     /// [`decdn_protocol::DEFAULT_VOUCHER_INTERVAL_MB`] (1 MB). Range
     /// `1..=`[`decdn_protocol::MAX_VOUCHER_INTERVAL_MB`] — unlike
-    /// [`Self::delivery_floor`] / [`Self::delivery_ceiling`], that bound is
-    /// hardcoded in the wire schema, not governance-owned: no contract holds a
-    /// cadence parameter (ADR 003 §Voucher Interval Negotiation).
+    /// [`Self::delivery_floor`], that bound is hardcoded in the wire schema,
+    /// not governance-owned: no contract holds a cadence parameter (ADR 003
+    /// §Voucher Interval Negotiation).
     pub voucher_interval_mb: Option<u64>,
 }
 

@@ -99,7 +99,6 @@ contract DeployProtocolScriptTest is Test, DeployProtocol {
         assertEq(uint256(cfg.feeRouterEpochLength), uint256(FEE_ROUTER_EPOCH_LENGTH), "epochLen");
         assertEq(uint256(cfg.feeRouterWindowEpochs), uint256(DEFAULT_FEE_ROUTER_WINDOW_EPOCHS), "windowEpochs");
         assertEq(cfg.slashAppealBond, DEFAULT_SLASH_APPEAL_BOND, "slashAppealBond");
-        assertEq(cfg.blacklistAppealBond, DEFAULT_BLACKLIST_APPEAL_BOND, "blacklistAppealBond");
 
         // Launch shares are hard-coded in the script, not env-driven.
         assertEq(cfg.feeRouterShares[0], LAUNCH_OPERATOR_SHARE, "operator share");

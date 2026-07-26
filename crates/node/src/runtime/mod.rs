@@ -860,17 +860,14 @@ async fn build_chain_and_handlers(
         Arc::clone(&infra.node_metrics),
     ));
 
-    // Live per-MB delivery-rate bounds (#1172, ADR 019 §3.1). Seed from the
-    // config stand-in (`payment.delivery_floor`/`delivery_ceiling`) so the
-    // handlers hold the shared clamp from construction; the authoritative
-    // on-chain `getRateBounds()` read below (once `payment_channel_addr` is
-    // parsed) overwrites it before serving begins, and the `RateBoundsUpdated`
-    // watcher keeps it live thereafter. The same handle is cloned into the
-    // probe handler, the client handler, and the watcher.
-    let rate_bounds = crate::rate_bounds::RateBounds::new(
-        cfg.payment.delivery_floor,
-        cfg.payment.delivery_ceiling,
-    );
+    // Live per-MB delivery-rate floor (#1172, ADR 019 §3.1). Seed from the
+    // config stand-in (`payment.delivery_floor`) so the handlers hold the shared
+    // clamp from construction; the authoritative on-chain `getRateBounds()` read
+    // below (once `payment_channel_addr` is parsed) overwrites it before serving
+    // begins, and the `RateBoundsUpdated` watcher keeps it live thereafter. The
+    // same handle is cloned into the probe handler, the client handler, and the
+    // watcher.
+    let rate_bounds = crate::rate_bounds::RateBounds::new(cfg.payment.delivery_floor);
 
     let probe_handler = Arc::new(ProbeHandler::new(
         infra.secret_key.public(),
@@ -984,39 +981,33 @@ async fn build_chain_and_handlers(
         "blockchain.payment_channel_address",
     )?;
 
-    // Authoritative on-chain delivery-rate bounds (#1172, ADR 019 §3.1 / ADR
+    // Authoritative on-chain delivery-rate floor (#1172, ADR 019 §3.1 / ADR
     // 003). Read once at startup — a fail-fast self-check in the same spirit as
     // `PaymentChannel.usdc()` — and seed the shared clamp created above,
-    // replacing the config stand-in. The on-chain bounds are `uint256`; the
-    // node clamps in `u64`, so an out-of-range value must refuse startup rather
-    // than silently truncate. The `RateBoundsUpdated` watcher spawned below
-    // keeps the clamp live for governance retunes without a restart.
+    // replacing the config stand-in. The on-chain floor is `uint256`; the node
+    // clamps in `u64`, so an out-of-range value must refuse startup rather than
+    // silently truncate. The `RateBoundsUpdated` watcher spawned below keeps the
+    // clamp live for governance retunes without a restart.
     {
         let contract = decdn_incentive::payment_channel::PaymentChannel::new(
             payment_channel_addr,
             ProviderFactory::read_only(rpc_url.clone(), event_poll_interval),
         );
-        let bounds = contract.getRateBounds().call().await.with_context(|| {
+        let on_chain_floor = contract.getRateBounds().call().await.with_context(|| {
             format!("PaymentChannel.getRateBounds() startup read at {payment_channel_addr}")
         })?;
-        let floor = u64::try_from(bounds.floor).map_err(|_| {
-            anyhow::anyhow!(
-                "on-chain delivery floor {} exceeds u64::MAX; refusing to start",
-                bounds.floor
-            )
-        })?;
-        let ceiling = u64::try_from(bounds.ceiling).map_err(|_| {
-            anyhow::anyhow!(
-                "on-chain delivery ceiling {} exceeds u64::MAX; refusing to start",
-                bounds.ceiling
-            )
-        })?;
-        rate_bounds.store(floor, ceiling);
+        // Both rejection arms live in `rate_bounds::on_chain_floor_to_u64` so a
+        // unit test can reach them; inline here they sat behind an async chain
+        // read no fixture could drive to a bad value.
+        let floor = crate::rate_bounds::on_chain_floor_to_u64(
+            on_chain_floor,
+            &payment_channel_addr.to_string(),
+        )?;
+        rate_bounds.store(floor);
         tracing::info!(
             floor,
-            ceiling,
             %payment_channel_addr,
-            "seeded live delivery-rate bounds from on-chain getRateBounds()"
+            "seeded live delivery-rate floor from on-chain getRateBounds()"
         );
     }
 
@@ -3698,7 +3689,6 @@ mod tests {
             payment: ResolvedPayment {
                 rate_per_mb: 10,
                 delivery_floor: 0,
-                delivery_ceiling: decdn_protocol::MAX_RATE_PER_MB,
                 voucher_interval_mb: decdn_protocol::DEFAULT_VOUCHER_INTERVAL_MB,
             },
             observability: ResolvedObservability {

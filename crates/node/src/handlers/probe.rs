@@ -417,24 +417,18 @@ impl ProbeHandler {
             self.cache.probe_hold_slots_used()
         });
 
-        // Clamp the quoted rate to the configured delivery bounds before
-        // signing (ADR 005 §Rate bounds validation): clamp-and-warn keeps
-        // the node operational across governance transitions.
+        // Raise the quoted rate to the governance delivery floor before signing
+        // (ADR 005 §Rate bounds validation): clamp-and-warn keeps the node
+        // operational across governance transitions.
         let raw_rate = self.rate_per_mb.load(Ordering::Relaxed);
-        // One snapshot for both the clamp and the log: re-reading `floor()` /
-        // `ceiling()` afterwards would take two further loads and could report a
-        // pair that a concurrent governance update had already replaced — i.e.
-        // bounds that never produced this clamp decision.
-        let bounds = self.rate_bounds.snapshot();
-        let rate_per_mb = bounds.clamp(raw_rate);
+        let (rate_per_mb, floor) = self.rate_bounds.raise_to_floor(raw_rate);
         if rate_per_mb != raw_rate {
             self.metrics.rate_bounds_clamped();
             tracing::warn!(
                 raw_rate,
                 clamped = rate_per_mb,
-                floor = bounds.floor,
-                ceiling = bounds.ceiling,
-                "rate_per_mb clamped to delivery bounds before signing ProbeResponse"
+                floor,
+                "rate_per_mb raised to the delivery floor before signing ProbeResponse"
             );
         }
 

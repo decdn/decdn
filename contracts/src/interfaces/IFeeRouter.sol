@@ -9,8 +9,7 @@ pragma solidity 0.8.28;
 ///         full USDC balance to `routeSettlement`, which performs the
 ///         default 60% operator / 30% buyback / 10% treasury split inline
 ///         (governance-mutable within per-bucket bounds via `setShares`),
-///         updates per-operator + global byte counters, and notifies
-///         `CapacityBond.recordSettlement`.
+///         and updates per-operator + global byte counters.
 ///
 ///         Vote weight: `DecdnGovernor._getVotes` calls `bytesInWindow` and
 ///         `totalBytesInWindow` over the trailing `windowEpochs`-long window

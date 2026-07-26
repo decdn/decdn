@@ -7,12 +7,15 @@ pragma solidity 0.8.28;
 ///         enforceable before the challenged response time (ADR 014 § Blacklist
 ///         violation, step 6).
 /// @dev    `ContentBlacklist.getHashEntry` returns a static `HashEntry` struct
-///         `{uint64 addedAt; bool suspended; uint64 effectiveAt; bool emergency;
-///         uint8 category}`; a static struct return is ABI-identical to the
-///         flattened tuple, so this tuple-returning declaration shares the same
-///         selector and decodes correctly. The field order here must track that
-///         struct exactly. `addedAt == 0` means the (region, hash) pair is not
-///         blacklisted.
+///         `{uint64 addedAt; uint64 effectiveAt; bool emergency; uint8
+///         category}`; a static struct return is ABI-identical to the
+///         flattened tuple, so this tuple-returning declaration decodes
+///         correctly. **The selector is derived from the INPUTS only, so it is
+///         unaffected by the return shape — a mismatch here does not revert, it
+///         silently mis-decodes, shifting every word after the dropped field.**
+///         That is why the field order must track the struct exactly, and why
+///         a matching selector is not evidence that it does. `addedAt == 0`
+///         means the (region, hash) pair is not blacklisted.
 /// @dev    Slash eligibility is anchored to `effectiveAt`, NOT `addedAt`: ADR
 ///         011 § Compliance Window gives a node a grace period after an add in
 ///         which it cannot yet be expected to know the entry exists. `addedAt`
@@ -23,5 +26,5 @@ interface IContentBlacklistHashView {
     function getHashEntry(bytes32 region, bytes32 hash)
         external
         view
-        returns (uint64 addedAt, bool suspended, uint64 effectiveAt, bool emergency, uint8 category);
+        returns (uint64 addedAt, uint64 effectiveAt, bool emergency, uint8 category);
 }

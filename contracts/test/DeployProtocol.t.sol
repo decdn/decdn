@@ -66,8 +66,7 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
             feeRouterWindowEpochs: 13,
             feeRouterShares: [uint256(9000), uint256(0), uint256(1000)],
             buybackBurner: address(0),
-            slashAppealBond: 1000e18,
-            blacklistAppealBond: 100e18
+            slashAppealBond: 1000e18
         });
     }
 
@@ -153,7 +152,6 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
     // -----------------------------------------------------------------
 
     function test_crossContractWiring_capacityBondPeerRoles() public view {
-        assertTrue(d.bond.hasRole(d.bond.SETTLEMENT_REPORTER_ROLE(), address(d.router)), "router to bond settlement");
         assertTrue(d.bond.hasRole(d.bond.SLASH_APPEAL_ROLE(), address(d.slashAppeal)), "slashAppeal to bond appeal");
         assertTrue(d.bond.hasRole(d.bond.BLACKLIST_ROLE(), address(d.blacklist)), "blacklist to bond eject");
     }

@@ -114,7 +114,6 @@ fn seed_resolved(rate: u64, level: LogLevel) -> ResolvedConfig {
         payment: ResolvedPayment {
             rate_per_mb: rate,
             delivery_floor: 0,
-            delivery_ceiling: decdn_protocol::MAX_RATE_PER_MB,
             voucher_interval_mb: decdn_protocol::DEFAULT_VOUCHER_INTERVAL_MB,
         },
         observability: ResolvedObservability {
@@ -241,7 +240,6 @@ async fn persistent_sighup_observes_both_signals() {
         PaymentArgs {
             rate_per_mb: None,
             delivery_floor: None,
-            delivery_ceiling: None,
         },
         ObservabilityArgs {
             log_level: None,
@@ -331,7 +329,6 @@ async fn sighup_applies_security_changes() {
         PaymentArgs {
             rate_per_mb: None,
             delivery_floor: None,
-            delivery_ceiling: None,
         },
         ObservabilityArgs {
             log_level: None,
@@ -446,7 +443,6 @@ async fn sighup_applies_mutable_but_rejects_restart_required_fields() {
         PaymentArgs {
             rate_per_mb: None,
             delivery_floor: None,
-            delivery_ceiling: None,
         },
         ObservabilityArgs {
             log_level: None,
