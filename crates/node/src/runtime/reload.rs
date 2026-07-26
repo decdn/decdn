@@ -1112,7 +1112,7 @@ fn warn_restart_required_sections(file: &decdn_common::config::FileConfig) {
         .as_ref()
         .is_some_and(cache_has_restart_required_field)
     {
-        warn_ignored("cache.* (cache_dir, sizes, origin, decompress)");
+        warn_ignored("cache.* (cache_dir, sizes, origin, decompress, max_probe_holds)");
     }
     if file
         .payment

@@ -132,9 +132,7 @@ slashed by an external adversary.
 - Alerts in `monitoring/prometheus-alerts.yml` (verbatim names):
   - `DecdnProbeHoldViolations` (critical) — hold budget exhausted, so
     present blobs are being answered `has_blob: false`. Budget pressure and
-    lost revenue, not slash evidence (the alert's own annotation still
-    describes this as phantom evidence — it is wrong; see step 4 and
-    issue #1471).
+    lost revenue, not slash evidence; see step 4.
   - `DecdnSlashEvidenceExposure` (critical) — node served bytes for a hash
     inside the slash window after `has_blob: true`.
   - `DecdnBlacklistSyncLagCritical` (critical) — blacklist > 30 minutes
