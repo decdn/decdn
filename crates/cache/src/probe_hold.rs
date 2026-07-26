@@ -46,16 +46,18 @@ pub enum ProbeHoldOutcome {
     Unavailable,
     /// Blob present but **all hold slots are in use** (`max_probe_holds > 0`
     /// and the live-hold count has reached it) — sign `has_blob: false` and
-    /// count it as a `probe_hold_violations` availability degradation (ADR
-    /// 005 §Hold budget). Genuine budget pressure: the operator-actionable
+    /// count it as a `probe_hold_unavailable{reason="exhausted"}` availability
+    /// degradation (ADR 005 §Hold budget). Genuine budget pressure: the
+    /// operator-actionable
     /// remedy is to raise `max_probe_holds`. Never a safety fault — the node
     /// loses revenue but is never falsely slashed.
     BudgetExhausted,
     /// Blob present but the eviction-hold path is **disabled by config**
     /// (`max_probe_holds == 0`) — sign `has_blob: false`. Operationally
     /// distinct from [`Self::BudgetExhausted`] (#739): this is an intentional
-    /// operator decision, not load, so it must NOT inflate
-    /// `probe_hold_violations` (whose alert remedy is "increase
-    /// `max_probe_holds`", nonsensical when holds are deliberately off).
+    /// operator decision, not load, so it must NOT be counted as
+    /// `probe_hold_unavailable{reason="exhausted"}` (whose alert remedy is
+    /// "increase `max_probe_holds`", nonsensical when holds are deliberately
+    /// off).
     HoldsDisabled,
 }

@@ -32,7 +32,7 @@
 //! EOA-only off-chain signing stance of [`crate::probe_sig`] and
 //! [`crate::voucher`]. ERC-1271 smart-account bindings (ADR 024 §Off-Chain
 //! ERC-1271 Verification) require an on-chain `isValidSignature` RPC call and
-//! are deferred.
+//! are deferred to Production.
 
 use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::{Address, B256, Signature};
@@ -165,7 +165,8 @@ pub fn verify_binding(
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum BindError {
     /// Signature is not the 65-byte EOA form. ERC-1271 smart-account bindings
-    /// (variable length) are not yet supported off-chain (ADR 024).
+    /// (variable length) are not supported off-chain; that path is deferred to
+    /// Production (ADR 024 §Off-Chain ERC-1271 Verification).
     #[error("binding signature has invalid length {len} (EOA form is 65 bytes)")]
     BadLength { len: usize },
     /// Signature is 65 bytes but malformed — non-canonical `s` or invalid

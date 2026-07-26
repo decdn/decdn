@@ -1062,11 +1062,18 @@ async fn probe_holds_disabled_signs_has_blob_false_and_counts_disabled() -> anyh
     // max_probe_holds" alert fires on a config the operator chose.
     let text = metrics.encode()?;
     anyhow::ensure!(
-        metric_value(&text, "decdn_probe_holds_disabled_total") == Some(1),
-        "holds-disabled probe must bump decdn_probe_holds_disabled_total:\n{text}"
+        metric_value(
+            &text,
+            "decdn_probe_hold_unavailable_total{reason=\"disabled\"}"
+        ) == Some(1),
+        "holds-disabled probe must bump the reason=disabled child of \
+         decdn_probe_hold_unavailable_total:\n{text}"
     );
     anyhow::ensure!(
-        metric_value(&text, "decdn_probe_hold_violations_total") == Some(0),
+        metric_value(
+            &text,
+            "decdn_probe_hold_unavailable_total{reason=\"exhausted\"}"
+        ) == Some(0),
         "an intentional disable must NOT inflate the budget-pressure counter:\n{text}"
     );
     Ok(())
@@ -1074,7 +1081,7 @@ async fn probe_holds_disabled_signs_has_blob_false_and_counts_disabled() -> anyh
 
 /// A node with a positive but fully-occupied hold budget answers
 /// `has_blob: false` and counts the event as genuine budget pressure
-/// (`probe_hold_violations`), NOT as a config disable (#739). This is the
+/// (`reason="exhausted"`), NOT as a config disable (#739). This is the
 /// signal whose alert remedy is "increase `max_probe_holds`".
 #[tokio::test(flavor = "multi_thread")]
 async fn probe_budget_exhausted_counts_violation_not_disabled() -> anyhow::Result<()> {
@@ -1109,11 +1116,18 @@ async fn probe_budget_exhausted_counts_violation_not_disabled() -> anyhow::Resul
 
     let text = metrics.encode()?;
     anyhow::ensure!(
-        metric_value(&text, "decdn_probe_hold_violations_total") == Some(1),
-        "genuine budget exhaustion must bump decdn_probe_hold_violations_total:\n{text}"
+        metric_value(
+            &text,
+            "decdn_probe_hold_unavailable_total{reason=\"exhausted\"}"
+        ) == Some(1),
+        "genuine budget exhaustion must bump the reason=exhausted child of \
+         decdn_probe_hold_unavailable_total:\n{text}"
     );
     anyhow::ensure!(
-        metric_value(&text, "decdn_probe_holds_disabled_total") == Some(0),
+        metric_value(
+            &text,
+            "decdn_probe_hold_unavailable_total{reason=\"disabled\"}"
+        ) == Some(0),
         "budget pressure must NOT be counted as a config disable:\n{text}"
     );
     Ok(())
@@ -1125,8 +1139,8 @@ async fn probe_budget_exhausted_counts_violation_not_disabled() -> anyhow::Resul
 /// Here `max_holds=1, reserved=1` gives a ceiling of `0`, so the end-client
 /// is shed immediately even though the blob is cached and the budget is free.
 /// The event is counted as a stake-lane reservation — never as budget
-/// exhaustion (`probe_hold_violations`) or a config disable
-/// (`probe_holds_disabled`), whose alerts have different remedies.
+/// exhaustion (`reason="exhausted"`) or a config disable
+/// (`reason="disabled"`), whose alerts have different remedies.
 #[tokio::test(flavor = "multi_thread")]
 async fn probe_end_client_reserved_out_signs_has_blob_false() -> anyhow::Result<()> {
     let payload = b"reserved-for-stake-lane content";
@@ -1171,15 +1185,25 @@ async fn probe_end_client_reserved_out_signs_has_blob_false() -> anyhow::Result<
 
     let text = metrics.encode()?;
     anyhow::ensure!(
-        metric_value(&text, "decdn_probe_stake_lane_reserved_total") == Some(1),
-        "reservation refusal must bump decdn_probe_stake_lane_reserved_total:\n{text}"
+        metric_value(
+            &text,
+            "decdn_probe_hold_unavailable_total{reason=\"stake_lane_reserved\"}"
+        ) == Some(1),
+        "reservation refusal must bump the reason=stake_lane_reserved child of \
+         decdn_probe_hold_unavailable_total:\n{text}"
     );
     anyhow::ensure!(
-        metric_value(&text, "decdn_probe_hold_violations_total") == Some(0),
+        metric_value(
+            &text,
+            "decdn_probe_hold_unavailable_total{reason=\"exhausted\"}"
+        ) == Some(0),
         "a stake-lane reservation must NOT be counted as budget pressure:\n{text}"
     );
     anyhow::ensure!(
-        metric_value(&text, "decdn_probe_holds_disabled_total") == Some(0),
+        metric_value(
+            &text,
+            "decdn_probe_hold_unavailable_total{reason=\"disabled\"}"
+        ) == Some(0),
         "a stake-lane reservation must NOT be counted as a config disable:\n{text}"
     );
     Ok(())
@@ -1236,7 +1260,12 @@ async fn probe_stake_lane_requester_keeps_reserved_headroom() -> anyhow::Result<
 
     let text = metrics.encode()?;
     anyhow::ensure!(
-        metric_value(&text, "decdn_probe_stake_lane_reserved_total").unwrap_or(0) == 0,
+        metric_value(
+            &text,
+            "decdn_probe_hold_unavailable_total{reason=\"stake_lane_reserved\"}"
+        )
+        .unwrap_or(0)
+            == 0,
         "a stake-lane requester must NOT trip the reservation counter:\n{text}"
     );
     Ok(())

@@ -69,7 +69,7 @@ Naming follows [appendix-observability.md § Cache Metrics](appendix-observabili
 | `decdn_cache_pinned_count` | gauge | New: size of the operator-pinned set. |
 | `decdn_cache_tag_drop_failures_total` | counter, unlabeled | New: best-effort named-tag deletions that failed, on the `evict()` (#860) and drain-path hash-mismatch (#837) paths. Serving is unaffected; a sustained nonzero rate means disk reclaim is stuck (an `evict()` failure is a DMCA/compliance concern, the drain path a hostile-origin disk leak). Not auto-retried. |
 
-[ADR 005](005-protocol.md#adr-005-wire-protocol) owns the `decdn_probe_hold_*` metrics ([appendix § Slash-Safety Metrics (all Mandatory)](appendix-observability.md#slash-safety-metrics-all-mandatory)); this appendix does not redefine them. A sustained non-zero `decdn_probe_hold_violations_total` rate, paired with `decdn_cache_bytes ≈ decdn_cache_size_limit_bytes`, indicates the eviction driver is racing the hold layer. The operator response is to raise `cache.cache_size_mb` or lower `max_probe_holds`, not to disable the hold.
+[ADR 005](005-protocol.md#adr-005-wire-protocol) owns the `decdn_probe_hold_*` metrics ([appendix § Slash-Safety Metrics (all Mandatory)](appendix-observability.md#slash-safety-metrics-all-mandatory)); this appendix does not redefine them. A sustained non-zero `decdn_probe_hold_unavailable_total{reason="exhausted"}` rate, paired with `decdn_cache_bytes ≈ decdn_cache_size_limit_bytes`, indicates the eviction driver is racing the hold layer. The operator response is to raise `cache.cache_size_mb` or lower `max_probe_holds`, not to disable the hold.
 
 [§ Eviction driver loop](#eviction-driver-loop) below lists the driver-loop-specific counters alongside the driver mechanism they instrument.
 

@@ -5580,7 +5580,8 @@ mod tests {
         // the `has()` check, so an absent blob is a true negative
         // (`Unavailable`), never a `HoldsDisabled` config-disable event. Guards
         // against a future reorder that moves the cheap `max == 0` load above
-        // the store lookup and silently inflates `probe_holds_disabled` with
+        // the store lookup and silently inflates
+        // `probe_hold_unavailable{reason="disabled"}` with
         // probes for content the node never had.
         let tmp = tempfile::tempdir()?;
         let absent = Hash::new(b"never fetched");

@@ -56,6 +56,56 @@ struct StreamLabels {
     direction: StreamDirection,
 }
 
+/// Why a probe could not be answered from a guaranteed eviction hold, as the
+/// `reason` label on `decdn_probe_hold_unavailable_total`.
+///
+/// The three values are not interchangeable — each has a different operator
+/// remedy, which is why they were three separate counters before #1443 and why
+/// the alert in `monitoring/prometheus-alerts.yml` filters on
+/// `reason="exhausted"` alone. The derive renders variants in `snake_case`, so
+/// these encode as `reason="exhausted"` / `"disabled"` / `"stake_lane_reserved"`.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Hash,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Serialize,
+    Deserialize,
+    EncodeLabelValue,
+)]
+pub enum ProbeHoldUnavailableReason {
+    /// Blob present, but **all** hold slots were live (`max_probe_holds`
+    /// reached) — genuine budget pressure. The node answers `has_blob: false`
+    /// and forgoes the delivery. This is the "raise `max_probe_holds`" signal
+    /// and the only value the `DecdnProbeHoldViolations` alert fires on.
+    Exhausted,
+    /// Blob present, but the eviction-hold path is **disabled by config**
+    /// (`max_probe_holds == 0`) — an intentional operator choice, not budget
+    /// pressure (#739). Raising `max_probe_holds` is the remedy only if the
+    /// disable was unintended; alerting on it would be nonsensical.
+    Disabled,
+    /// An end-client probe (a requester that is *not* a registered operator)
+    /// hit the stake-lane-reserved end-client ceiling
+    /// (`max_probe_holds - cache.stake_lane_reserved_holds`), keeping headroom
+    /// for node-to-node cache-miss probes per ADR 003 §Admission and Priority
+    /// (#757). Unlike the two above this fires *before* the hold attempt, so
+    /// the cache is **not consulted** — the blob may or may not be present;
+    /// the reservation is a content-independent admission decision. Zero
+    /// unless `cache.stake_lane_reserved_holds > 0`.
+    StakeLaneReserved,
+}
+
+#[derive(
+    Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, EncodeLabelSet,
+)]
+struct ProbeHoldUnavailableLabels {
+    reason: ProbeHoldUnavailableReason,
+}
+
 /// Build a [`WatcherHook`] that invokes one `&self` recorder on a shared
 /// `Metrics`, deduping the per-watcher `Box::new(move || metrics.foo())`
 /// closures each watcher site would otherwise define (#1251). Since #1316 all
@@ -103,10 +153,12 @@ pub struct DecdnMetrics {
     pub gossip_announces_rejected_total: Counter,
     /// Incoming gossip envelopes rejected specifically for clock skew
     /// (ADR 001 § Clock synchronization). A sibling of the generic
-    /// `gossip_announces_rejected_total` — since `iroh_metrics` carries no
-    /// label dimension, the ADR-named `reason=clock_skew` breakdown is
-    /// realized as this distinct counter (same pattern as
-    /// `dispatch_rejected_{global,per_source}`). Field has no `_total`
+    /// `gossip_announces_rejected_total`: the ADR-named `reason=clock_skew`
+    /// breakdown is realized as this distinct counter rather than a label,
+    /// matching the `dispatch_rejected_{global,per_source}` convention. That
+    /// is a choice, not a backend limit — `iroh_metrics` does support labels
+    /// via `Family<L, M>`, which `probe_hold_unavailable` uses. Field has no
+    /// `_total`
     /// suffix because the `OpenMetrics` encoder appends it; operator-visible
     /// name: `decdn_gossip_messages_rejected_clock_skew_total`. Lets
     /// operators alert on NTP-drift-induced peer invisibility without it
@@ -145,46 +197,29 @@ pub struct DecdnMetrics {
     /// applicable." Operator-visible name:
     /// `decdn_dispatch_per_source_skipped_no_addr_total`.
     pub dispatch_per_source_skipped_no_addr: Counter,
-    /// `decdn_probe_hold_violations_total` per the canonical metric registry
-    /// (`adr/appendix-observability.md` — the authoritative naming source,
-    /// superseding informal ADR-005 references). The registry's alert
-    /// remediation for this counter is "reduce load or increase
-    /// `max_probe_holds`", i.e. it is the budget-pressure signal: this code
-    /// increments it when the blob is present but the
-    /// [`crate::handlers::probe`] hold could not be guaranteed (budget
-    /// exhausted), so the node answers `has_blob: false`. That is an
-    /// availability degradation, never a safety fault — the node loses
-    /// revenue but never signs a phantom announcement (the hold mechanism
-    /// makes the registry's literal "evicted after signing `has_blob:true`"
-    /// case unreachable by construction, so this counter surfaces the
-    /// budget-pressure cause the operator can actually act on).
-    pub probe_hold_violations: Counter,
-    /// `decdn_probe_holds_disabled_total` (#739): probes answered
-    /// `has_blob: false` for a *present* blob because the eviction-hold path
-    /// is **disabled by config** (`max_probe_holds == 0`), as opposed to
-    /// genuine slot exhaustion. Split out from `probe_hold_violations` so an
-    /// intentional operator disable does not trip that counter's "increase
-    /// `max_probe_holds`" alert — a nonsensical remedy when holds are
-    /// deliberately off. Field has no `_total` suffix because the
-    /// `OpenMetrics` encoder appends it.
-    pub probe_holds_disabled: Counter,
-    /// `decdn_probe_stake_lane_reserved_total` (#757): an end-client probe
-    /// (a requester that is *not* a registered operator) answered
-    /// `has_blob: false` because the hold budget had reached the end-client
-    /// ceiling (`max_probe_holds - cache.stake_lane_reserved_holds`),
-    /// reserving the remaining slots for stake-lane (node-to-node
-    /// cache-miss) probes per ADR 003 §Admission and Priority. Unlike the
-    /// two counters above, this fires *before* `try_probe_hold`, so the
-    /// cache is **not consulted** — the blob may or may not be present; the
-    /// reservation is a content-independent admission decision. Distinct
-    /// from `probe_hold_violations` (genuine exhaustion of the *whole*
-    /// budget, checked after a confirmed-present blob) and
-    /// `probe_holds_disabled` (`max_probe_holds == 0`): this is a deliberate
-    /// priority decision, not budget pressure or a disable, so it must not
-    /// trip either of those counters' alerts. Zero whenever the reservation
-    /// is unconfigured (`stake_lane_reserved_holds == 0`). Field has no
+    /// `decdn_probe_hold_unavailable_total{reason}` per the canonical metric
+    /// registry (`adr/appendix-observability.md` — the authoritative naming
+    /// source, superseding informal ADR-005 references): a probe that could
+    /// not be answered from a guaranteed eviction hold, broken out by cause
+    /// on the `reason` label (#1443, collapsing the former
+    /// `probe_hold_violations` / `probe_holds_disabled` /
+    /// `probe_stake_lane_reserved` counters).
+    ///
+    /// Every value is an availability degradation, never a safety fault — the
+    /// node loses revenue but never signs a phantom announcement, because the
+    /// hold mechanism makes the registry's literal "evicted after signing
+    /// `has_blob: true`" case unreachable by construction. See
+    /// [`ProbeHoldUnavailableReason`] for what each value means and which one
+    /// the "raise `max_probe_holds`" alert fires on; all three children are
+    /// materialized at startup by [`Metrics::new`] so each series is exported
+    /// at zero rather than appearing only on first increment. Field has no
     /// `_total` suffix because the `OpenMetrics` encoder appends it.
-    pub probe_stake_lane_reserved: Counter,
+    ///
+    /// This is the one labeled `Counter` in this group; the other
+    /// reason-style splits (`dispatch_rejected_*`,
+    /// `probe_rate_limit_rejected_*`, `channel_open_failures_*`) remain
+    /// sibling counters pending a decision on unifying the convention.
+    probe_hold_unavailable: Family<ProbeHoldUnavailableLabels, Counter>,
     /// `decdn_probe_hold_slots_used` (registry): current active
     /// probe-triggered eviction holds (distinct held blobs), ADR 005
     /// §Probe-triggered eviction hold. Sampled from the cache engine on
@@ -1289,6 +1324,16 @@ pub struct Metrics {
     cache: Arc<CacheMetrics>,
     inbound_streams: Arc<Gauge>,
     outbound_streams: Arc<Gauge>,
+    /// Materialized `probe_hold_unavailable` children, one per
+    /// [`ProbeHoldUnavailableReason`]. Held here for the same reason as the
+    /// stream gauges: `Family` creates a child series lazily on first
+    /// `get_or_create`, so without this each `reason` would be absent from
+    /// `/metrics` until it first fired — an operator's dashboard and alert
+    /// would show a gap rather than a zero. Creating them at startup keeps
+    /// the pre-#1443 property that all three series are exported at zero.
+    probe_hold_exhausted: Arc<Counter>,
+    probe_hold_disabled: Arc<Counter>,
+    probe_hold_stake_lane_reserved: Arc<Counter>,
     started_at: Instant,
     /// Monotonic instant at which the staker-set watcher entered its current
     /// error/backoff window (#783, downtime semantics #788). `None` whenever a
@@ -1371,6 +1416,17 @@ impl Metrics {
         let outbound_streams = decdn.streams_active.get_or_create(&StreamLabels {
             direction: StreamDirection::Outbound,
         });
+        // Materialize every `reason` child up front so all three series export
+        // at zero from a fresh registry (see the field docs on `Metrics`).
+        let probe_hold_child = |reason| {
+            decdn
+                .probe_hold_unavailable
+                .get_or_create(&ProbeHoldUnavailableLabels { reason })
+        };
+        let probe_hold_exhausted = probe_hold_child(ProbeHoldUnavailableReason::Exhausted);
+        let probe_hold_disabled = probe_hold_child(ProbeHoldUnavailableReason::Disabled);
+        let probe_hold_stake_lane_reserved =
+            probe_hold_child(ProbeHoldUnavailableReason::StakeLaneReserved);
         let cache = Arc::new(CacheMetrics::default());
         let mut registry = Registry::default();
         registry.register(decdn.clone() as Arc<dyn MetricsGroup>);
@@ -1385,6 +1441,9 @@ impl Metrics {
             cache,
             inbound_streams,
             outbound_streams,
+            probe_hold_exhausted,
+            probe_hold_disabled,
+            probe_hold_stake_lane_reserved,
             started_at: Instant::now(),
             staker_set_watcher_down_since: Mutex::new(None),
             origin_directory_watcher_down_since: Mutex::new(None),
@@ -1441,6 +1500,23 @@ impl Metrics {
                 self.decdn.channel_open_failures_rpc_error.inc();
             }
         }
+    }
+
+    /// Record a probe that could not be answered from a guaranteed eviction
+    /// hold, broken out by cause on the `reason` label of
+    /// `decdn_probe_hold_unavailable_total` (#1443). Hand-written rather than
+    /// a `recorders!` entry because the pre-materialized child handles live on
+    /// `Metrics`, not on `self.decdn` — the same shape as
+    /// [`Self::channel_open_failure_by_reason`]. Pairs with the structured
+    /// `debug!` at each call site in [`crate::handlers::probe`].
+    pub fn probe_hold_unavailable(&self, reason: ProbeHoldUnavailableReason) {
+        match reason {
+            ProbeHoldUnavailableReason::Exhausted => self.probe_hold_exhausted.inc(),
+            ProbeHoldUnavailableReason::Disabled => self.probe_hold_disabled.inc(),
+            ProbeHoldUnavailableReason::StakeLaneReserved => {
+                self.probe_hold_stake_lane_reserved.inc()
+            }
+        };
     }
 
     pub fn gossip_rejected(&self, reason: &'static str) {
@@ -1670,24 +1746,6 @@ macro_rules! watcher_downtime_recorders {
 
 recorders! {
     probe_request => probe_requests.inc();
-
-    /// A probe answered `has_blob: false` despite the bytes being present,
-    /// because the eviction hold could not be guaranteed (ADR 005 §Hold
-    /// budget).
-    probe_hold_violation => probe_hold_violations.inc();
-
-    /// A probe answered `has_blob: false` for a present blob because the
-    /// eviction-hold path is disabled by config (`max_probe_holds == 0`) —
-    /// an intentional operator decision, not budget pressure (#739, ADR 005
-    /// §Hold budget).
-    probe_holds_disabled => probe_holds_disabled.inc();
-
-    /// An end-client probe answered `has_blob: false` because the hold
-    /// budget reached the stake-lane-reserved end-client ceiling, before any
-    /// cache lookup (#757, ADR 003 §Admission and Priority). A deliberate,
-    /// content-independent priority decision — not budget pressure or a
-    /// config disable.
-    probe_stake_lane_reserved => probe_stake_lane_reserved.inc();
 
     /// Publish the current count of active probe holds (ADR 005).
     probe_hold_slots(used: usize) => probe_hold_slots_used.set(sat(used));
@@ -2679,6 +2737,69 @@ mod tests {
                 .any(|line| line.starts_with("decdn_uptime_seconds ")),
             "retired uptime name must not be exported:\n{text}"
         );
+    }
+
+    #[test]
+    fn probe_hold_unavailable_exports_every_reason_at_zero() {
+        // Pins the pre-materialization in `Metrics::new` (#1443). A `Family`
+        // creates each child series lazily on `get_or_create`, so without that
+        // step a `reason` would be missing from `/metrics` until it first
+        // fired — a dashboard gap where the three pre-collapse counters showed
+        // a zero, and a silent hole in the `DecdnProbeHoldViolations` alert's
+        // input. Also pins the rendered series text (label name, snake_case
+        // value encoding, and the `_total` suffix the encoder appends), which
+        // `monitoring/prometheus-alerts.yml` and the Grafana dashboard hard-code.
+        let metrics = Metrics::new();
+        let text = metrics.encode().unwrap();
+
+        for reason in ["exhausted", "disabled", "stake_lane_reserved"] {
+            let name = format!("decdn_probe_hold_unavailable_total{{reason=\"{reason}\"}}");
+            assert!(
+                has_metric_line(&text, &name, 0),
+                "{name} should be exposed at zero from a fresh registry:\n{text}"
+            );
+        }
+
+        // The collapsed counters must not linger under their old names.
+        for retired in [
+            "decdn_probe_hold_violations_total",
+            "decdn_probe_holds_disabled_total",
+            "decdn_probe_stake_lane_reserved_total",
+        ] {
+            assert!(
+                !text.lines().any(|line| line.starts_with(retired)),
+                "retired metric name {retired} must not be exported:\n{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn probe_hold_unavailable_increments_only_the_named_reason() {
+        // The whole point of the label is that each value keeps its own
+        // remedy: `exhausted` drives "raise max_probe_holds", `disabled` is an
+        // intentional operator choice, and `stake_lane_reserved` is a priority
+        // decision taken before the cache is even consulted. Bumping one must
+        // never move another, or the alert filter re-fires on the deliberate
+        // cases the #739/#757 split existed to keep out.
+        let metrics = Metrics::new();
+        metrics.probe_hold_unavailable(ProbeHoldUnavailableReason::Exhausted);
+        let text = metrics.encode().unwrap();
+
+        assert!(
+            has_metric_line(
+                &text,
+                "decdn_probe_hold_unavailable_total{reason=\"exhausted\"}",
+                1
+            ),
+            "the named reason must increment:\n{text}"
+        );
+        for untouched in ["disabled", "stake_lane_reserved"] {
+            let name = format!("decdn_probe_hold_unavailable_total{{reason=\"{untouched}\"}}");
+            assert!(
+                has_metric_line(&text, &name, 0),
+                "{name} must stay at zero:\n{text}"
+            );
+        }
     }
 
     #[test]
