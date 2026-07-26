@@ -55,13 +55,15 @@ repos:
         pass_filenames: false
 
       # Mirrors the adr-book-check CI job: every ADR cross-reference must be a
-      # markdown link, every cross-ADR *.md link must carry a #heading anchor,
-      # and § spacing must follow §3 / § Word. Same `files:` scope as above.
+      # markdown link, every cross-ADR *.md link must carry a #heading anchor
+      # that resolves to a heading in the target file, and § spacing must follow
+      # §3 / § Word. Same `files:` scope as above, plus the awk guard helpers the
+      # Makefile drives (editing one must re-run it).
       - id: adr-ref-hygiene
         name: adr reference hygiene (links, anchors, section spacing)
         entry: make -C adr check-refs
         language: system
-        files: ^adr/(.*\.md|Makefile)$
+        files: ^adr/(.*\.md|Makefile|_build/.*\.awk)$
         pass_filenames: false
 
       # --- Solidity ----------------------------------------------------
