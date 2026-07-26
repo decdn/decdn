@@ -140,6 +140,12 @@ pub fn outer_pull_deadline(per_candidate: Duration, stall: Duration) -> Duration
 /// Reputation floor in the score denominator (ADR 001).
 const REPUTATION_FLOOR: f32 = 0.1;
 
+/// Reputation ceiling in the score denominator — the top of
+/// [`Candidate::reputation`]'s documented domain (#1458). Named rather than
+/// written inline so the code, the doc prose, and the tests that pin it move
+/// together, the way [`REPUTATION_FLOOR`] already does.
+const REPUTATION_CEILING: f32 = 1.0;
+
 /// Score-equivalence threshold for tie-break activation (ADR 001 — "scores
 /// within 1% of each other").
 const TIE_THRESHOLD: f64 = 0.01;
@@ -174,10 +180,20 @@ pub struct RankedCandidate {
 
 /// Compute the unified selection score (ADR 001). Lower is better.
 ///
-/// `score = rate_per_mb × rtt_ms × (1 / max(reputation, 0.1)²)`
+/// `score = rate_per_mb × rtt_ms × (1 / clamp(reputation, 0.1, 1.0)²)`
 ///
-/// Reputation is clamped to [`REPUTATION_FLOOR`] before squaring; this both
-/// prevents division by zero and caps the worst-case multiplier at 100×.
+/// ADR 001 § Node Selection Algorithm states the denominator as
+/// `max(reputation, 0.1)`; the upper bound here is a defensive extension
+/// (#1458), a no-op for any input inside the ADR's `[0.0, 1.0]` domain.
+///
+/// Reputation is clamped between [`REPUTATION_FLOOR`] and
+/// [`REPUTATION_CEILING`] before squaring — both ends, and both ends matter.
+/// The floor prevents division by zero and caps the worst-case penalty
+/// multiplier at 100×; the ceiling stops an out-of-domain value from buying an
+/// unearned *bonus*. Without it, `reputation = 10.0` divides the score by 100
+/// and outranks a perfect-reputation peer by 100×, and `f32::INFINITY` yields
+/// score `0.0` — which [`tie_group_end`] treats as a tie group of one, so it
+/// takes the top slot outright, beyond the reach of every tie-break tier.
 #[allow(clippy::cast_precision_loss)]
 // f64 has 53-bit mantissa; ULP-level imprecision on huge u64 rates does not
 // affect ordering decisions here.
@@ -187,7 +203,16 @@ fn compute_score(rate_per_mb: u64, rtt_ms: u32, reputation: f32) -> f64 {
     // Clamp in f32 (input's domain), then promote once for the f64 score
     // arithmetic. Promoting first would let `f32(0.1)` slip just above the
     // floor (it rounds to ~0.10000000149f64), an unintuitive boundary.
-    let rep = f64::from(reputation.max(REPUTATION_FLOOR));
+    //
+    // `.max().min()` rather than `.clamp(..)`, and floor FIRST: `f32::max` and
+    // `f32::min` are documented to ignore NaN and return the other operand, so
+    // a NaN reputation lands on the floor. `f32::clamp` propagates NaN instead,
+    // and `.min()` first would send NaN to the CEILING — either way a garbage
+    // reputation becomes a perfect peer. Hence the waiver below: taking clippy's
+    // `manual_clamp` suggestion would turn a NaN-total function into a
+    // NaN-propagating one and fail `score_nan_reputation_clamps_to_floor`.
+    #[allow(clippy::manual_clamp)]
+    let rep = f64::from(reputation.max(REPUTATION_FLOOR).min(REPUTATION_CEILING));
     rate * rtt / (rep * rep)
 }
 
@@ -576,6 +601,51 @@ mod tests {
         let at_floor = compute_score(100, 10, 0.1);
         assert!(s.is_finite(), "NaN reputation must not produce a NaN score");
         assert!((s - at_floor).abs() < 1e-9);
+    }
+
+    #[test]
+    fn score_reputation_above_1_0_clamps_to_ceiling() {
+        // Defensive, and the mirror of the floor clamp (#1458). `Candidate.
+        // reputation` is documented as `[0.0, 1.0]`, but the field is a plain
+        // `f32` — the domain is a convention, not a type. Today's only producer
+        // (`peer_reputation` → `LocalReputation::score`) is in-range by
+        // construction; a future one need not be, and without the ceiling an
+        // out-of-domain value buys rank instead of losing it.
+        let baseline = compute_score(100, 10, 1.0);
+        let above = compute_score(100, 10, 10.0);
+        assert!((above - baseline).abs() < 1e-9, "got {above} vs {baseline}");
+    }
+
+    #[test]
+    fn score_reputation_one_ulp_above_domain_clamps_to_ceiling() {
+        // `f32::EPSILON` is exactly one ULP at 1.0, so unclamped this scores
+        // ~999.99976 — outside the 1e-9 tolerance. Pins the ceiling as exact at
+        // 1.0 with no tolerance band, which a sloppier guard (`if rep > 2.0`)
+        // would not give.
+        let baseline = compute_score(100, 10, 1.0);
+        let above = compute_score(100, 10, 1.0 + f32::EPSILON);
+        assert!((above - baseline).abs() < 1e-9, "got {above} vs {baseline}");
+    }
+
+    #[test]
+    fn score_infinite_reputation_clamps_to_ceiling() {
+        // The degenerate end of the same hole: `INFINITY` squared is
+        // `INFINITY`, so an unclamped score is `x / inf` = `0.0` — the minimum
+        // achievable score, which sorts first under `total_cmp` AND which
+        // `tie_group_end` gives a group of its own (the `pivot == 0.0` branch),
+        // so no tie-break tier can dislodge it. Clamped, it must be
+        // indistinguishable from a perfect-reputation candidate.
+        let baseline = compute_score(100, 10, 1.0);
+        let s = compute_score(100, 10, f32::INFINITY);
+        // Note `is_finite` alone would NOT have caught the bug — `0.0` is
+        // finite. It guards a future impl that yields NaN; `s > 0.0` is what
+        // fails against the unclamped version.
+        assert!(s.is_finite(), "got {s}");
+        assert!(
+            s > 0.0,
+            "infinite reputation must not score 0.0 and sort first"
+        );
+        assert!((s - baseline).abs() < 1e-9, "got {s} vs {baseline}");
     }
 
     #[test]
@@ -995,5 +1065,24 @@ mod tests {
         let out = rank_candidates(vec![neg]);
         assert_eq!(out.len(), 1);
         assert_eq!(out.first().map(|r| r.candidate.node_id[0]), Some(1));
+    }
+
+    #[test]
+    fn rank_candidates_denies_out_of_domain_reputation_the_top_slot() {
+        // The list-membership/ordering half of the ceiling clamp (#1458), the
+        // mirror of `rank_candidates_keeps_negative_reputation_candidate`
+        // above. `score_infinite_reputation_clamps_to_ceiling` covers the
+        // arithmetic; this covers what no `compute_score` test can reach —
+        // pre-clamp, rep = INFINITY scored 0.0, which `total_cmp` sorts first
+        // and `tie_group_end` then hands a tie group of its own, so the bogus
+        // candidate took the top slot outright. Post-clamp it is scored on its
+        // price and latency like anyone else: 1000 vs the honest peer's 500,
+        // far outside TIE_THRESHOLD, so the order is deterministic and the
+        // random tie-break tier never runs.
+        let bogus = make_candidate(1, 100, 10, f32::INFINITY);
+        let honest = make_candidate(2, 50, 10, 1.0);
+        let out = rank_candidates(vec![bogus, honest]);
+        assert_eq!(out.len(), 2, "reputation is a weight, never a veto");
+        assert_eq!(out.first().map(|r| r.candidate.node_id[0]), Some(2));
     }
 }
