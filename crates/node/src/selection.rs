@@ -172,6 +172,14 @@ pub struct Candidate {
     /// On-chain stake in TOKEN base units. `None` until on-chain stake
     /// lookup is wired (out of scope for issue #322); when populated,
     /// higher stake wins the stake tie-break tier.
+    ///
+    /// The `Option` carries two distinct meanings, and the tie-break relies
+    /// on the distinction: `Some(0)` is *known* to hold no bond, `None` has
+    /// *not been looked up*. Unknown loses to every known value, `Some(0)`
+    /// included — see the tier 2 comment in `pick_best_in_group`. A lookup that
+    /// errors must therefore not fall back to `None`; decide the failure
+    /// policy at the lookup layer, where the distinction is still visible
+    /// (#1470).
     pub stake: Option<u64>,
 }
 
@@ -348,10 +356,21 @@ fn pick_best_in_group(
         });
     }
 
-    // Tier 2: higher stake wins. `None` is treated as the lowest possible
-    // stake (since on-chain integration is deferred — see ADR 001 "Contract
+    // Tier 2: higher stake wins, and an *unknown* stake ranks below every
+    // known one — including `Some(0)`. `filter_map` drops `None` before
+    // `max`, so a provably-zero-stake node outranks an unlooked-up one.
+    // That is deliberate, not an accident of the combinator: `Some(0)` means
+    // "queried, holds no bond"; `None` means "not queried yet". Pinned by
+    // `some_stake_beats_none_stake`, `some_zero_stake_beats_none_stake`, and
+    // `three_way_zero_stake_falls_through_to_random_tier` below.
+    //
+    // The tier is a uniform no-op today — every construction site passes
+    // `None` (on-chain integration is deferred; see ADR 001 "Contract
     // Interface: Node Registry" / ADR 019 for the capacity-bond interface
-    // that will populate `Candidate.stake`).
+    // that will populate `Candidate.stake`). When that lookup lands, a
+    // *failed* read must not be encoded as `None` alongside successful ones,
+    // or one flaky RPC call silently sinks a well-staked peer below a
+    // zero-stake one. Resolve the failure at the lookup layer (#1470).
     let max_stake = pool
         .iter()
         .filter_map(|i| group.get(*i).and_then(|r| r.candidate.stake))
@@ -582,8 +601,8 @@ mod tests {
 
     #[test]
     fn score_negative_reputation_clamps_to_floor() {
-        // Defensive: ReputationEngine::score() returns f32 in [0,1], but if a
-        // bug produces a negative we must still not panic and must clamp.
+        // Defensive: LocalReputation::score() is in [0,1] by construction, but
+        // if a bug produces a negative we must still not panic and must clamp.
         let s = compute_score(100, 10, -0.5);
         let at_floor = compute_score(100, 10, 0.1);
         assert!((s - at_floor).abs() < 1e-9);
