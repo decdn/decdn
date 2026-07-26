@@ -421,11 +421,7 @@ impl ProbeHandler {
         // (ADR 005 §Rate bounds validation): clamp-and-warn keeps the node
         // operational across governance transitions.
         let raw_rate = self.rate_per_mb.load(Ordering::Relaxed);
-        // One read for both the clamp and the log: re-reading `floor()`
-        // afterwards could report a value a concurrent governance update had
-        // already replaced — i.e. a floor that never produced this decision.
-        let floor = self.rate_bounds.floor();
-        let rate_per_mb = raw_rate.max(floor);
+        let (rate_per_mb, floor) = self.rate_bounds.raise_to_floor(raw_rate);
         if rate_per_mb != raw_rate {
             self.metrics.rate_bounds_clamped();
             tracing::warn!(

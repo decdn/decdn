@@ -182,8 +182,8 @@ pub struct BlockchainConfig {
     pub content_blacklist_from_block: Option<u64>,
     /// Seconds between the blacklist watcher's periodic replay + re-scope pass
     /// (ADR 011 §Polling cadence). This backstop is what catches scope changes
-    /// with no `ContentBlacklist` event — an operator region/ripening transition
-    /// or an appeal reversal/lapse re-enabling a suspended entry. Absent =>
+    /// with no `ContentBlacklist` event — an operator region/ripening
+    /// transition. Absent =>
     /// [`super::DEFAULT_CONTENT_BLACKLIST_POLL_INTERVAL_SEC`] (600s). Only
     /// consulted when `content_blacklist_address` is set.
     pub content_blacklist_poll_interval_sec: Option<u64>,

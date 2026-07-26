@@ -32,8 +32,8 @@
 //!    only *under*-payment, so an over-priced sale would settle just as cleanly.
 //! 7. **Negative — out-of-safety-bounds.** `setRateBounds` reverts with
 //!    `RateBoundsInvalid` for `floor < MIN_DEPOSIT_FLOOR` and for a floor above
-//!    `type(uint64).max` — the value the daemon's `u64` clamp cannot represent
-//!    (#1383) — proven as `from = Timelock` static calls for both (so the
+//!    `MAX_RATE_PER_MB`, the ADR 005 wire cap the schema will carry — proven as
+//!    `from = Timelock` static calls for both (so the
 //!    `GOVERNANCE_ROLE` gate is passed and the bounds check is the only thing
 //!    that can reject), and — for the sub-floor case — as a full ratified
 //!    proposal whose `execute` reverts with the same selector. The daemon keeps
@@ -130,6 +130,8 @@ const NEW_FLOOR: u64 = 50;
 /// floor at its high-water mark instead of storing the newest value would pass
 /// unnoticed.
 const RELEASED_FLOOR: u64 = 1;
+/// The ADR 005 wire cap, mirrored on-chain as `PaymentChannel.MAX_RATE_PER_MB`.
+const MAX_RATE_PER_MB: u64 = 1_000_000_000_000;
 /// `NodeFixture::render_config`'s `[payment] rate_per_mb`.
 const CONFIGURED_RATE: u64 = 10;
 
@@ -344,12 +346,24 @@ async fn run() -> anyhow::Result<()> {
         simulate_set_rate_bounds(&chain, timelock, U256::ZERO).await,
         "setRateBounds below MIN_DEPOSIT_FLOOR",
     )?;
-    // The daemon's clamp is `u64`, so a floor the chain can express but the node
-    // cannot enforce would silently strand every voucher below the on-chain
-    // floor (#1383). The contract refuses to store one.
+    // The floor is capped at the ADR 005 wire constant `MAX_RATE_PER_MB`, not at
+    // `type(uint64).max`. Every value in the gap between them is quietly
+    // network-isolating: nodes raise every quote to the floor before signing, so
+    // such a floor makes every response undecodable to every honest peer while
+    // looking locally like a routine clamp. Test both ends of that gap — one
+    // above the wire cap, and `u64::MAX` itself, which an earlier guard allowed.
     expect_revert::<_, PaymentChannelGov::RateBoundsInvalid>(
-        simulate_set_rate_bounds(&chain, timelock, U256::from(u64::MAX) + U256::from(1)).await,
-        "setRateBounds above the u64 clamp cap",
+        simulate_set_rate_bounds(
+            &chain,
+            timelock,
+            U256::from(MAX_RATE_PER_MB) + U256::from(1),
+        )
+        .await,
+        "setRateBounds above the MAX_RATE_PER_MB wire cap",
+    )?;
+    expect_revert::<_, PaymentChannelGov::RateBoundsInvalid>(
+        simulate_set_rate_bounds(&chain, timelock, U256::from(u64::MAX)).await,
+        "setRateBounds at the u64 cap, far above the wire cap",
     )?;
 
     // ---- ...and the Governor cannot smuggle one past that check either: a

@@ -18,7 +18,7 @@ Deployable contracts in [`src/`](src/):
 | `SlashAppeal` | Slash-appeal state machine (open → ratify/reverse) holding a per-appeal TOKEN bond | [028](../adr/028-slashing-appeals.md) |
 | `OriginAssignment` | The DAO's positive origin authority — namespace-based origin allow-lists | [011](../adr/011-content-takedown.md) |
 | `BuybackBurner` | Swaps the 30% USDC buyback bucket for TOKEN and burns the proceeds; venue-neutral (concrete Balancer V3 or Uniswap V3 subclass, selected at deploy) | [018](../adr/018-liquidity-strategy.md), [026](../adr/026-tokenomics.md) |
-| `ContentBlacklist` | Global + regional content-hash blacklist with an appeal surface | [011](../adr/011-content-takedown.md), [031](../adr/031-content-blacklist-appeals-contract.md) |
+| `ContentBlacklist` | Global + regional content-hash blacklist, operator- and origin-level blacklists | [011](../adr/011-content-takedown.md) |
 | `PublisherRegistry` | Permissionless namespace creation and append-only content claims | [002](../adr/002-content-addressing.md) |
 | `DecdnGovernor` | Served-bytes-weighted on-chain governor with a Timelock executor | [036](../adr/036-served-bytes-voting-weight.md) |
 | `Ed25519Verifier` | RFC 8032 PureEdDSA verifier (crypto-lib EIP-6565) with strict canonicalization guards | — |

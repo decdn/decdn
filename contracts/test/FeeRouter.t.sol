@@ -72,6 +72,48 @@ contract FeeRouterTest is Test {
         usdc.approve(address(router), type(uint256).max);
     }
 
+    // -----------------------------------------------------------------
+    // Constructor guards. Since `recordSettlement` was removed (#1434) the
+    // `capacityBond_` argument has exactly ONE remaining purpose: proving at
+    // deploy time that the bond's epoch length matches the router's. Both
+    // `CapacityBond.EPOCH_LENGTH` and `FeeRouter.epochLength` are
+    // constant/immutable, so this one-shot check is a permanent guarantee — and
+    // it is now the sole justification for the argument existing, which is why
+    // it needs its own coverage rather than riding on the deploy fixtures.
+    // A mismatch would silently mis-anchor `DecdnGovernor` epoch arithmetic by
+    // mixing epoch indices derived from two different lengths.
+    // -----------------------------------------------------------------
+
+    function _deployRouter(ICapacityBondEpoch bond_, uint64 epochLength_) internal returns (FeeRouter) {
+        uint256[3] memory shares = [uint256(6000), uint256(3000), uint256(1000)];
+        return new FeeRouter({
+            usdc_: usdc,
+            capacityBond_: bond_,
+            treasury_: treasury,
+            epochLength_: epochLength_,
+            windowEpochs_: 13,
+            admin: admin,
+            initialShares: shares,
+            buybackBurner_: buyback
+        });
+    }
+
+    function test_constructor_revertsOnEpochLengthMismatch() public {
+        MockBondEpoch mismatched = new MockBondEpoch(EPOCH + 1 days);
+        vm.expectRevert(abi.encodeWithSelector(FeeRouter.EpochLengthMismatch.selector, EPOCH + 1 days, EPOCH));
+        _deployRouter(mismatched, EPOCH);
+    }
+
+    function test_constructor_revertsOnZeroEpochLength() public {
+        vm.expectRevert(FeeRouter.ZeroEpochLength.selector);
+        _deployRouter(bondEpoch, 0);
+    }
+
+    function test_constructor_acceptsMatchingEpochLength() public {
+        FeeRouter r = _deployRouter(bondEpoch, EPOCH);
+        assertEq(r.epochLength(), EPOCH);
+    }
+
     function test_routeSettlement_distributesThreeLegs() public {
         uint256 amount = 1000e6;
         uint256 bytesDelivered = 100_000_000;

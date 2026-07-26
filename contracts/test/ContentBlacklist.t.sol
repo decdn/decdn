@@ -122,7 +122,7 @@ contract ContentBlacklistTest is Test {
     function setUp() public {
         token = new Token(admin);
         bondMock = new MockEjector();
-        blacklist = new ContentBlacklist(ICapacityBondEjector(address(bondMock)), token, admin);
+        blacklist = new ContentBlacklist(ICapacityBondEjector(address(bondMock)), admin);
 
         // Grant the multisig role, then register the regional body FOR ITS
         // REGION. A bare `grantRole(REGIONAL_BODY_ROLE, …)` is no longer
@@ -399,6 +399,34 @@ contract ContentBlacklistTest is Test {
     function test_complianceWindow_defaults() public view {
         assertEq(blacklist.complianceWindow(), 24 hours);
         assertEq(blacklist.emergencyComplianceWindow(), 2 hours);
+    }
+
+    /// @notice The counter tracks the ENFORCED hash set and nothing else. Admin
+    ///         actions that change no hash entry — operator blacklisting, origin
+    ///         blacklisting, compliance-window retunes — must not bump it, and
+    ///         neither must any read. A spurious bump is not cosmetic:
+    ///         `blacklist_watcher.rs` uses the counter as its missed-log
+    ///         detector, so every phantom advance costs every node on the
+    ///         network a full delta re-fetch.
+    function test_getBlacklistVersion_unaffectedByNonEntryOperations() public {
+        vm.prank(regionalBody);
+        blacklist.addHashRegional(REGION_US, SAMPLE_HASH, "DMCA-TEST");
+        uint256 versionAfterAdd = blacklist.getBlacklistVersion();
+        assertEq(versionAfterAdd, 1);
+
+        vm.startPrank(admin);
+        blacklist.addOperator(operator);
+        blacklist.removeOperator(operator);
+        blacklist.setOriginBlacklist(address(0xBEEF), true);
+        blacklist.setComplianceWindow(12 hours);
+        blacklist.setEmergencyComplianceWindow(1 hours);
+        vm.stopPrank();
+        assertEq(blacklist.getBlacklistVersion(), versionAfterAdd, "non-entry writes must not bump");
+
+        // Reads never bump.
+        blacklist.isHashBlacklistedInRegion(SAMPLE_HASH, REGION_US);
+        blacklist.getHashEntry(REGION_US, SAMPLE_HASH);
+        assertEq(blacklist.getBlacklistVersion(), versionAfterAdd, "reads must not bump");
     }
 
     function test_addHashGlobal_stampsEffectiveAt() public {

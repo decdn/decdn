@@ -233,7 +233,7 @@ contract CapacityBondRegionE2ETest is Test {
     function test_crossContractEject_viaContentBlacklist() public {
         _bondAndRegister();
 
-        ContentBlacklist blacklist = new ContentBlacklist(bond, token, admin);
+        ContentBlacklist blacklist = new ContentBlacklist(bond, admin);
         // Cache the role getter before pranking: a nested external call inside
         // the pranked statement would otherwise consume the prank.
         bytes32 blacklistRole = bond.BLACKLIST_ROLE();
@@ -343,7 +343,7 @@ contract CapacityBondRegionE2ETest is Test {
     /// @dev Deploy a real `ContentBlacklist` + `SlashJudge` wired to `bond`, grant
     ///      the cross-contract roles, and fund the challenger's bond.
     function _deployBlacklistAndJudge() internal returns (ContentBlacklist blacklist, SlashJudge judge) {
-        blacklist = new ContentBlacklist(bond, token, admin);
+        blacklist = new ContentBlacklist(bond, admin);
         deployedBlacklist = blacklist;
         judge = new SlashJudge(
             ICapacityBondSlasher(address(bond)),

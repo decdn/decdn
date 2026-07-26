@@ -282,6 +282,39 @@ pub const MAX_RECEIPT_RETAINED_FILES: u32 = 100;
 /// the surfaced path can't drift from where the log actually lands.
 pub const RECEIPT_LOG_FILE: &str = "download_receipts.jsonl";
 
+/// Env vars that once configured a knob and now configure nothing.
+///
+/// The other two surfaces of a removed knob fail loudly on their own: a stale
+/// TOML key trips `deny_unknown_fields`, and a stale `--flag` trips clap's
+/// unknown-argument error. An env var has no such backstop — `clap` simply
+/// stops reading it — so an operator whose systemd unit or container env still
+/// carries one upgrades cleanly and silently loses the setting. Warn instead.
+///
+/// Entries are appended when a knob is removed and may be pruned once the
+/// removal is far enough back that no live deployment could still set it.
+const RETIRED_ENV_VARS: &[(&str, &str)] = &[(
+    "DECDN_DELIVERY_CEILING",
+    "the advisory delivery-rate ceiling was removed (#1441); the node no longer \
+     clamps its quote downward at all, and the wire cap MAX_RATE_PER_MB is the \
+     only upper bound",
+)];
+
+/// Emit one warning per retired env var that is still set. Deliberately not a
+/// hard error: unlike a stale TOML key, an env var is often inherited from an
+/// orchestrator the operator does not directly control, and refusing to boot
+/// over one would be a worse failure than the silent ignore it replaces.
+fn warn_retired_env_vars() {
+    for (name, why) in RETIRED_ENV_VARS {
+        if std::env::var_os(name).is_some() {
+            tracing::warn!(
+                env_var = name,
+                "{name} is set but no longer does anything: {why}. Remove it from the \
+                 environment to silence this warning."
+            );
+        }
+    }
+}
+
 /// Load config from file (if present) and merge with CLI args.
 ///
 /// CLI args take precedence over file values; defaults fill gaps.
@@ -299,6 +332,8 @@ pub fn resolve_config(config_path: Option<&Path>, cli: &RunArgs) -> anyhow::Resu
     // validate. Everything *after* this accumulates into one `bag` so an
     // operator sees every problem in a single pass.
     let file = load_file_config(config_path)?;
+
+    warn_retired_env_vars();
 
     let mut bag = ConfigErrorBag::new();
 
@@ -4753,6 +4788,29 @@ swap_pool_address = \"0xPool\"
             "error lacked context: {err}"
         );
         Ok(())
+    }
+
+    /// A retired env var must warn rather than be silently ignored — and must
+    /// NOT fail the resolve, since it is often inherited from an orchestrator
+    /// the operator does not control. Asserts the table is wired and that a
+    /// set-but-retired var leaves resolution intact.
+    #[test]
+    fn retired_env_vars_are_listed_and_do_not_break_resolution() {
+        assert!(
+            RETIRED_ENV_VARS
+                .iter()
+                .any(|(n, _)| *n == "DECDN_DELIVERY_CEILING"),
+            "the knob removed in #1441 must be listed so a stale env var warns"
+        );
+        for (name, why) in RETIRED_ENV_VARS {
+            assert!(name.starts_with("DECDN_"), "{name} is not a decdn env var");
+            assert!(
+                !why.is_empty(),
+                "{name} needs a reason operators can act on"
+            );
+        }
+        // Idempotent and side-effect-free when nothing is set.
+        warn_retired_env_vars();
     }
 
     #[test]

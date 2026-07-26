@@ -262,8 +262,8 @@ pub type BlacklistEntryRow = ([u8; 32], [u8; 32]);
 ///
 /// **Why this has to be durable.** `ContentBlacklist` exposes no enumeration
 /// view, so the deny-set can only be built from events. The watcher must retain
-/// entries that are currently *out of scope* — wrong region, or appeal-suspended
-/// — because either can become live and in scope again with **no** new
+/// entries that are currently *out of scope* — wrong region — because they can
+/// become live and in scope again with **no** new
 /// `HashBlacklisted` log (an operator `CapacityBond.updateRegion` emits nothing on
 /// this contract at all). While that projection was in-memory only, a persisted
 /// scan cursor was unsafe: resuming past those logs would drop the still-retained

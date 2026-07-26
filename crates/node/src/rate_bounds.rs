@@ -56,13 +56,18 @@ impl RateBounds {
         self.floor.load(Ordering::Relaxed)
     }
 
-    /// Raise `rate` to the current floor. Total by construction — there is no
-    /// upper bound to invert against, so no panic path (`u64::clamp` is
-    /// `assert!(min <= max)`, which the workspace anti-panic policy forbids on
-    /// the request-serving path).
+    /// Raise `rate` to the current floor, returning `(clamped, floor)`.
+    ///
+    /// Both values come from **one** load: every caller needs the floor as well
+    /// as the result — to log which floor produced the decision — and a second
+    /// `floor()` read could report a value a concurrent governance update had
+    /// already replaced, i.e. a floor that never produced this clamp. Returning
+    /// the pair is what stops the signing paths open-coding `raw.max(floor())`
+    /// and drifting from each other.
     #[must_use]
-    pub fn clamp(&self, rate: u64) -> u64 {
-        rate.max(self.floor())
+    pub fn raise_to_floor(&self, rate: u64) -> (u64, u64) {
+        let floor = self.floor();
+        (rate.max(floor), floor)
     }
 
     /// Publish a new floor — called by the rate-bounds watcher on a
@@ -77,11 +82,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn clamp_raises_rate_to_the_floor() {
+    fn raise_to_floor_lifts_rate_and_reports_the_floor_it_used() {
         let b = RateBounds::new(10);
-        assert_eq!(b.clamp(5), 10, "below floor clamps up");
-        assert_eq!(b.clamp(50), 50, "at or above floor unchanged");
-        assert_eq!(b.clamp(u64::MAX), u64::MAX, "no upper bound to clamp to");
+        assert_eq!(b.raise_to_floor(5), (10, 10), "below floor lifts up");
+        assert_eq!(
+            b.raise_to_floor(50),
+            (50, 10),
+            "at or above floor unchanged"
+        );
+        assert_eq!(
+            b.raise_to_floor(u64::MAX),
+            (u64::MAX, 10),
+            "no upper bound to clamp down to"
+        );
     }
 
     #[test]
@@ -91,7 +104,26 @@ mod tests {
         b.store(25);
         // A clone shares the same cell, so the update through `b` is visible.
         assert_eq!(clone.floor(), 25);
-        assert_eq!(clone.clamp(10), 25);
-        assert_eq!(clone.clamp(90), 90);
+        assert_eq!(clone.raise_to_floor(10), (25, 25));
+        assert_eq!(clone.raise_to_floor(90), (90, 25));
+    }
+
+    /// `store` must write the newest value, not the largest. A `fetch_max`
+    /// implementation would pass every other test here while latching the floor
+    /// at a high-water mark, so a governance *reduction* would never reach the
+    /// signing path — the exact bug `g_gov_02_rate_bounds` step 8 exists to
+    /// catch end-to-end, pinned here as an instant unit assertion instead of a
+    /// 60-second anvil poll.
+    #[test]
+    fn store_lowers_the_floor_as_well_as_raising_it() {
+        let b = RateBounds::new(50);
+        assert_eq!(b.raise_to_floor(10), (50, 50));
+        b.store(1);
+        assert_eq!(b.floor(), 1, "a lowered floor must replace, not max()");
+        assert_eq!(
+            b.raise_to_floor(10),
+            (10, 1),
+            "the configured rate governs again once the floor drops below it"
+        );
     }
 }

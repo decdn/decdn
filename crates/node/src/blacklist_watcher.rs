@@ -176,8 +176,8 @@ impl InitialSyncGate {
 struct WatcherState<P: Provider + Clone> {
     /// Every blacklisted `(region, hash)` entry seen and not yet locally
     /// evicted — including out-of-scope entries — re-scoped on
-    /// each `on_tick_complete` pass so a later region/ripening or appeal
-    /// transition (which emits no `HashBlacklisted`) still leads to eviction.
+    /// each `on_tick_complete` pass so a later region/ripening transition
+    /// (which emits no `HashBlacklisted`) still leads to eviction.
     /// Keyed like the contract's `_hashEntries[region][hash]` so a `HashRemoved`
     /// drops exactly the removed entry.
     ///
@@ -513,7 +513,7 @@ impl<P: Provider + Clone> LogSink for BlacklistSink<P> {
         self.drain_pending_origin_peer_ops().await;
 
         // Re-scope the whole deny-set on the operator's cadence (not every poll
-        // tick): catches a region/ripening/appeal transition that emits no event.
+        // tick): catches a region/ripening transition that emits no event.
         // An apply-time enforcement failure clears `last_rescan` (see `apply`),
         // pulling the next pass forward to the poll cadence.
         let due = self

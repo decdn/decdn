@@ -71,6 +71,17 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, SunsettingPausable, E
     uint256 internal constant MAX_CHANNEL_DURATION_CEILING = 365 days;
     uint256 internal constant MIN_DEPOSIT_FLOOR = 1;
 
+    /// @dev Mirrors `decdn_protocol::MAX_RATE_PER_MB` (ADR 005 §Wire protocol),
+    ///      the largest `rate_per_mb` the wire schema will decode. A floor above
+    ///      it is not merely useless, it is network-isolating: nodes raise every
+    ///      quote to the floor before signing, so every `ProbeResponse` and
+    ///      `StreamResponse` they emit would be rejected at decode by every
+    ///      honest peer, and settlement would revert `RateFloorViolation` on
+    ///      essentially every voucher — while the node's only local signal is a
+    ///      clamp warning indistinguishable from a routine retune. Capping here
+    ///      is the one place that can make that state unrepresentable.
+    uint256 internal constant MAX_RATE_PER_MB = 1_000_000_000_000;
+
     /// @dev 1 MB in bytes (binary MB, ADR 005 / `rate::BYTES_PER_MB`). Used to
     ///      convert the MB-denominated `deliveryFloor` into the per-byte price
     ///      floor enforced at settlement (`_advanceClaimWatermark`).
@@ -133,8 +144,9 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, SunsettingPausable, E
     ///      closing the served-byte vote-weight inflation of ADR 036 (#846).
     ///      There is no governance ceiling: a seller self-clamping its own
     ///      advertised rate downward buys no on-chain safety, and the buyer
-    ///      protection is seeing the signed rate before paying. The absolute
-    ///      upper bound is the wire constant `MAX_RATE_PER_MB` (ADR 005).
+    ///      protection is seeing the signed rate before paying. The floor is
+    ///      itself capped at `MAX_RATE_PER_MB` so it can never exceed what the
+    ///      wire schema will carry.
     uint256 internal deliveryFloor;
 
     /// @notice Per-client monotonic channel counter used in `channelId` derivation.
@@ -296,7 +308,7 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, SunsettingPausable, E
         if (maxChannelDuration_ < MAX_CHANNEL_DURATION_FLOOR || maxChannelDuration_ > MAX_CHANNEL_DURATION_CEILING) {
             revert ParamOutOfBounds(maxChannelDuration_, MAX_CHANNEL_DURATION_FLOOR, MAX_CHANNEL_DURATION_CEILING);
         }
-        if (deliveryFloor_ < MIN_DEPOSIT_FLOOR || deliveryFloor_ > type(uint64).max) {
+        if (deliveryFloor_ < MIN_DEPOSIT_FLOOR || deliveryFloor_ > MAX_RATE_PER_MB) {
             revert RateBoundsInvalid(deliveryFloor_);
         }
 
@@ -755,11 +767,10 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, SunsettingPausable, E
     }
 
     function setRateBounds(uint256 newFloor) external onlyRole(GOVERNANCE_ROLE) {
-        // Cap the floor at `type(uint64).max`: the daemon's rate clamp decodes
-        // it as `u64` (`crates/node/src/rate_bounds.rs`), so a floor the chain
-        // can express but the node cannot enforce would silently strand every
-        // voucher below the on-chain floor (#1383).
-        if (newFloor < MIN_DEPOSIT_FLOOR || newFloor > type(uint64).max) {
+        // Cap at MAX_RATE_PER_MB, not `type(uint64).max`: the daemon decodes the
+        // floor as `u64` (#1383), but `u64` is ~18M× the wire cap, and every
+        // value in that gap is quietly network-isolating (see the constant).
+        if (newFloor < MIN_DEPOSIT_FLOOR || newFloor > MAX_RATE_PER_MB) {
             revert RateBoundsInvalid(newFloor);
         }
         deliveryFloor = newFloor;

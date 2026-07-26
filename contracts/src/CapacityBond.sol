@@ -25,8 +25,9 @@ import { SlashEscrowLib, SlashRecord } from "./SlashEscrowLib.sol";
 ///         from ADR 026 § Slashing and burn (the slashed TOKEN is held in
 ///         per-slashId escrow until the appeal window resolves, then either
 ///         distributed 50% challenger / 50% burn or refunded to the operator
-///         on a successful appeal), is the canonical settlement reporter sink
-///         for `FeeRouter`, is the registry for iroh-NodeId ↔ Ethereum-address
+///         on a successful appeal), exposes `epochLength()` so `FeeRouter` can
+///         prove at deploy time that both contracts agree on epoch length, is
+///         the registry for iroh-NodeId ↔ Ethereum-address
 ///         bindings, and is the source of `firstBondedAt` / `slashedAtEpoch`
 ///         for `DecdnGovernor`'s served-bytes voting weight per ADR 036.
 /// @dev    Renamed from `StakingRegistry` per ADR 026 v2.2 vocabulary. The

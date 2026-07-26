@@ -70,7 +70,7 @@ import { IPublisherRegistryOwnership } from "../src/interfaces/IPublisherRegistr
 ///           3. `_deployGovernor`        — DecdnGovernor; grant Timelock's
 ///                                         PROPOSER + CANCELLER roles to the
 ///                                         Governor.
-///           4. `_wireCrossContractRoles` — peer role grants (settlement reporter,
+///           4. `_wireCrossContractRoles` — peer role grants (slash-appeal driver,
 ///                                          slash-appeal driver, blacklist ejector,
 ///                                          emergency multisig, PAUSER_ROLE on every
 ///                                          Pausable target,
@@ -427,9 +427,10 @@ abstract contract BaseProtocolDeploy is Script {
         // it as a constructor immutable. Needs only `admin`.
         d.registry = new PublisherRegistry({ admin: cfg.deployer });
 
-        d.blacklist = new ContentBlacklist({
-            capacityBond_: ICapacityBondEjector(address(d.bond)), token_: d.token, admin: cfg.deployer
-        });
+        // `ContentBlacklist` takes no token: it custodies no funds (ADR 016
+        // § Contract Inventory) now that the appeal-bond escrow is gone.
+        d.blacklist =
+            new ContentBlacklist({ capacityBond_: ICapacityBondEjector(address(d.bond)), admin: cfg.deployer });
 
         // PaymentChannel (ADR 003): USDC settlement gateway. `feeRouter` must be
         // a deployed contract (constructor checks code size) — `d.router` above.

@@ -3,9 +3,6 @@ pragma solidity 0.8.28;
 
 import { AccessControl } from "@openzeppelin/contracts/access/AccessControl.sol";
 import { ReentrancyGuard } from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
-import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import { ERC20Burnable } from "@openzeppelin/contracts/token/ERC20/extensions/ERC20Burnable.sol";
 
 import { ICapacityBondEjector } from "./interfaces/ICapacityBondEjector.sol";
 import { ICapacityBondRegionView } from "./interfaces/ICapacityBondRegionView.sol";
@@ -21,8 +18,6 @@ import { RegionScopeLib } from "./RegionScopeLib.sol";
 ///         slashed under an entry later found wrongful is made whole through
 ///         `SlashAppeal` (ADR 028), a separate contract.
 contract ContentBlacklist is AccessControl, ReentrancyGuard {
-    using SafeERC20 for IERC20;
-
     // -----------------------------------------------------------------
     // Roles
     // -----------------------------------------------------------------
@@ -102,7 +97,6 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     ICapacityBondRegionView public immutable capacityBondRegion;
 
     // forge-lint: disable-next-line(screaming-snake-case-immutable)
-    ERC20Burnable public immutable token;
 
     /// @notice Grace between a standard or regional add and the moment the entry
     ///         becomes slashable (ADR 011 § Compliance Window). Stamped onto
@@ -308,13 +302,12 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     // Constructor
     // -----------------------------------------------------------------
 
-    constructor(ICapacityBondEjector capacityBond_, ERC20Burnable token_, address admin) {
-        if (address(capacityBond_) == address(0) || address(token_) == address(0) || admin == address(0)) {
+    constructor(ICapacityBondEjector capacityBond_, address admin) {
+        if (address(capacityBond_) == address(0) || admin == address(0)) {
             revert ZeroAddress();
         }
         capacityBond = capacityBond_;
         capacityBondRegion = ICapacityBondRegionView(address(capacityBond_));
-        token = token_;
         complianceWindow = COMPLIANCE_WINDOW_DEFAULT;
         emergencyComplianceWindow = EMERGENCY_COMPLIANCE_WINDOW_DEFAULT;
         _grantRole(DEFAULT_ADMIN_ROLE, admin);

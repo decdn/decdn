@@ -141,8 +141,11 @@ slashed by an external adversary.
     versions missed. (Both blacklist alerts above are pre-wired but not yet
     emitted by the node — see
     [ContentBlacklist compliance](#contentblacklist-compliance).)
-  - `DecdnRateBoundsClamp` (warning) — `rate_per_mb` outside governance
-    bounds; not directly slashable but indicates configuration drift.
+  - `DecdnRateBoundsClamp` (warning) — your configured `rate_per_mb` sits
+    *below* the governance `deliveryFloor`, so every quote is being raised to
+    the floor before signing. The clamp is raise-only; there is no ceiling. Not
+    directly slashable, but it means you are not charging what you configured.
+    Raise `payment.rate_per_mb` to at least the on-chain floor.
 - Grafana: the slash-safety row in `monitoring/grafana-dashboard.json`.
 
 **Remediate:**
@@ -299,10 +302,14 @@ nodeId-indexed `NodeAutoEjected`. The node's staker-set watcher follows
    regional body that will not act, the route is a DecdnGovernor
    `removeHashGlobal` proposal through the standard timelock (~10 days). If the
    body is systemically misbehaving rather than wrong about one entry, the
-   emergency multisig can `suspendRegionalBody(region)`, which freezes every
-   entry that body issued pending governance ratification within 14 days. In all
-   three cases you must keep the hash evicted until the removal actually lands:
-   the entry is enforceable, and therefore slashable, right up to that point.
+   emergency multisig can `suspendRegionalBody(region)` — but be clear on what
+   that does and does not buy you: it stops that body issuing *further* entries,
+   pending governance ratification within 14 days. It is **not** a mass
+   retraction. Every entry the body already issued stays live, enforceable and
+   slashable (`_bodySuspended` gates writes only; it is not consulted by
+   `_isLive` or by `SlashJudge`). In all three cases you must keep the hash
+   evicted until the removal actually lands: the entry is enforceable, and
+   therefore slashable, right up to that point.
    Semantics:
    [ADR 011 § Removing a Wrongful Entry](../adr/011-content-takedown.md#removing-a-wrongful-entry).
 

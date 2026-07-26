@@ -163,6 +163,9 @@ contract PaymentChannelTest is Test {
     uint256 internal constant DISPUTE_WINDOW = 48 hours;
     uint256 internal constant MAX_DURATION = 90 days;
     uint256 internal constant DELIVERY_FLOOR = 1;
+    /// @dev Mirrors `PaymentChannel.MAX_RATE_PER_MB` (internal, so restated here)
+    ///      and `decdn_protocol::MAX_RATE_PER_MB`.
+    uint256 internal constant MAX_RATE_PER_MB = 1_000_000_000_000;
     uint256 internal constant DEPOSIT = 1000e6;
     uint256 internal constant BYTES_PER_MB = 1_048_576;
 
@@ -784,36 +787,49 @@ contract PaymentChannelTest is Test {
     }
 
     // -----------------------------------------------------------------
-    // Rate floor uint64 upper cap (#1383): the daemon's rate clamp is `u64`,
-    // so a ratified floor above `type(uint64).max` fails to decode and silently
-    // strands vouchers below the enforced on-chain floor. The chain must not be
-    // able to express a floor the node cannot enforce. Each governance-gated
-    // case pranks `admin` (which holds `GOVERNANCE_ROLE`) so the revert is the
-    // bounds guard, not an access-control failure.
+    // Rate floor upper cap: the floor is capped at MAX_RATE_PER_MB (1e12), the
+    // wire schema's own limit, NOT at `type(uint64).max`. Every value in the
+    // ~18-million-fold gap between them is network-isolating: nodes raise every
+    // quote to the floor before signing, so a floor above the wire cap makes
+    // every response undecodable to every honest peer while looking locally
+    // like a routine clamp. The daemon still decodes the floor as `u64`
+    // (#1383), so the u64 bound remains necessary — it is just far from
+    // sufficient. Each governance-gated case pranks `admin` (which holds
+    // `GOVERNANCE_ROLE`) so the revert is the bounds guard, not access control.
     // -----------------------------------------------------------------
 
-    /// @dev A floor one above `type(uint64).max` reverts `RateBoundsInvalid`.
-    function test_setRateBounds_revertsWhenFloorExceedsUint64Cap() public {
-        uint256 badFloor = uint256(type(uint64).max) + 1;
+    /// @dev A floor one above `MAX_RATE_PER_MB` reverts `RateBoundsInvalid` —
+    ///      well below `type(uint64).max`, which an earlier guard allowed.
+    function test_setRateBounds_revertsWhenFloorExceedsWireCap() public {
+        uint256 badFloor = MAX_RATE_PER_MB + 1;
         vm.prank(admin);
         vm.expectRevert(abi.encodeWithSelector(PaymentChannel.RateBoundsInvalid.selector, badFloor));
         channel.setRateBounds(badFloor);
     }
 
-    /// @dev In-bounds control: a floor at exactly `type(uint64).max` is the
-    ///      highest the guard admits and succeeds, proving the cap is
-    ///      inclusive (`>` , not `>=`).
-    function test_setRateBounds_succeedsAtUint64Cap() public {
-        uint256 maxFloor = uint256(type(uint64).max);
+    /// @dev The whole point of the cap: a floor the `u64` clamp can represent
+    ///      but the wire schema cannot carry must be rejected. `type(uint64).max`
+    ///      is ~18M× `MAX_RATE_PER_MB`, and accepting it would let one
+    ///      governance vote silently isolate every node on the network.
+    function test_setRateBounds_revertsAtUint64Cap() public {
         vm.prank(admin);
-        channel.setRateBounds(maxFloor);
-        assertEq(channel.getRateBounds(), maxFloor);
+        vm.expectRevert(abi.encodeWithSelector(PaymentChannel.RateBoundsInvalid.selector, uint256(type(uint64).max)));
+        channel.setRateBounds(uint256(type(uint64).max));
+    }
+
+    /// @dev In-bounds control: a floor at exactly `MAX_RATE_PER_MB` is the
+    ///      highest the guard admits and succeeds, proving the cap is
+    ///      inclusive (`>`, not `>=`).
+    function test_setRateBounds_succeedsAtWireCap() public {
+        vm.prank(admin);
+        channel.setRateBounds(MAX_RATE_PER_MB);
+        assertEq(channel.getRateBounds(), MAX_RATE_PER_MB);
     }
 
     /// @dev The constructor shares the guard: deploying with a floor above
-    ///      `type(uint64).max` reverts `RateBoundsInvalid`.
-    function test_constructor_revertsOnRateFloorAboveUint64Cap() public {
-        uint256 badFloor = uint256(type(uint64).max) + 1;
+    ///      `MAX_RATE_PER_MB` reverts `RateBoundsInvalid`.
+    function test_constructor_revertsOnRateFloorAboveWireCap() public {
+        uint256 badFloor = MAX_RATE_PER_MB + 1;
         vm.expectRevert(abi.encodeWithSelector(PaymentChannel.RateBoundsInvalid.selector, badFloor));
         new PaymentChannel(usdc, bond, address(router), DISPUTE_WINDOW, MAX_DURATION, badFloor, admin);
     }

@@ -46,8 +46,10 @@ since project inception and will roll into the first tagged release.
     as is the `IPublisherRegistryStanding` interface. `PublisherRegistry` itself
     is unchanged; `OriginAssignment` reaches it through
     `IPublisherRegistryOwnership`.
-  - **Deploy:** `BLACKLIST_APPEAL_BOND` is no longer read.
-  - **Size:** `ContentBlacklist` deployed bytecode drops 24,576 → 11,193 bytes.
+  - **Deploy:** `BLACKLIST_APPEAL_BOND` is no longer read, and the
+    `ContentBlacklist` constructor no longer takes a token: with the appeal-bond
+    escrow gone it custodies no funds at all.
+  - **Size:** `ContentBlacklist` deployed bytecode drops 19,723 → 11,143 bytes.
   - ADR 031 is archived to `adr/_history/`; ADR 011 § Blacklist Entry Appeals is
     replaced by § Removing a Wrongful Entry. ADR 030's `REGION_STABILITY_WINDOW`
     is retained — only its appeals-standing leg is cut, since the window also
@@ -70,7 +72,7 @@ since project inception and will roll into the first tagged release.
     trust edge. `FeeRouter`'s `capacityBond_` constructor arg **stays** — it
     backs the `bondEpoch == epochLength_` assertion that stops a mismatched
     deployment mis-anchoring `DecdnGovernor` epoch arithmetic.
-  - **Size:** `CapacityBond` gains 1,396 bytes of EIP-170 margin.
+  - **Size:** `CapacityBond` gains 231 bytes of EIP-170 margin (1,165 → 1,396 free).
 - **Advisory `deliveryCeiling` rate bound removed (#1441).** The enforced
   `deliveryFloor` is unchanged and still gates settlement in
   `_advanceClaimWatermark`. The ceiling enforced nothing — it appeared in no
@@ -79,10 +81,22 @@ since project inception and will roll into the first tagged release.
   upper bound remains the wire constant `MAX_RATE_PER_MB`, enforced in
   `ProbeResponse` validation; it simply stops being governance-tunable.
   - **Config-breaking:** `payment.delivery_ceiling` is removed, along with
-    `--delivery-ceiling` and `DECDN_DELIVERY_CEILING`. `[payment]` uses
+    `--delivery-ceiling` and `DECDN_DELIVERY_CEILING`. The TOML key and the CLI
+    flag both fail loudly (`deny_unknown_fields` / clap); a stale
+    `DECDN_DELIVERY_CEILING` in the environment cannot, so the node now logs a
+    startup warning naming it rather than ignoring it in silence. `[payment]` uses
     `deny_unknown_fields`, so a TOML that still sets the key now fails startup
     and `decdn config validate` rather than ignoring it. Delete the key; nothing
     replaces it.
+  - **Governance bound tightened:** the floor is now capped at
+    `MAX_RATE_PER_MB` (10^12, the ADR 005 wire cap) rather than
+    `type(uint64).max`. Every value in the ~18-million-fold gap between them was
+    silently network-isolating — nodes raise every quote to the floor before
+    signing, so a floor above the wire cap makes every `ProbeResponse` and
+    `StreamResponse` undecodable to every honest peer and reverts essentially
+    every voucher at settlement, while the node's only local signal is a clamp
+    warning indistinguishable from a routine retune. The node now also refuses
+    to start against such a floor rather than serving into the void.
   - **ABI:** `setRateBounds(uint256,uint256)` → `setRateBounds(uint256)`
     (selector changes), `RateBoundsUpdated` drops `newDeliveryCeiling` (topic0
     changes), `RateBoundsInvalid` drops its second parameter, `getRateBounds()`
