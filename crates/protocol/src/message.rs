@@ -55,9 +55,10 @@ pub const MAX_RATE_PER_MB: u64 = 1_000_000_000_000;
 ///
 /// ADR 014 §1 mandates `slash_sig` is **non-empty** and that requesters MUST
 /// reject missing/zero-length signatures — it does not itself fix a byte
-/// length. Off-chain `slash_sig` producers are EOA-only (ADR 024 §Off-Chain
-/// ERC-1271 Verification: "a software-held signing key … used as a plain
-/// EOA"), which is always exactly this 65-byte form. Variable-length
+/// length. Off-chain `slash_sig` producers are EOA-only — ADR 024 §Off-Chain
+/// ERC-1271 Verification: "Every signature deCDN produces or verifies
+/// off-chain … is the fixed 65-byte secp256k1 `r‖s‖v` form" — which is always
+/// exactly this length. Variable-length
 /// **ERC-1271** smart-account signatures are verified on-chain by
 /// `SlashJudge` via `SignatureChecker.isValidSignatureNow` (ADR 014
 /// §On-Chain Verification); enforcing exactly this length off-chain is the

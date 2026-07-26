@@ -64,6 +64,12 @@ struct StreamLabels {
 /// the alert in `monitoring/prometheus-alerts.yml` filters on
 /// `reason="exhausted"` alone. The derive renders variants in `snake_case`, so
 /// these encode as `reason="exhausted"` / `"disabled"` / `"stake_lane_reserved"`.
+///
+/// Not to be confused with [`decdn_cache::ProbeHoldOutcome::Unavailable`],
+/// which is the one probe-hold outcome that emits **no** metric at all — a
+/// blob genuinely absent is a true negative, not a refusal. The shared word is
+/// inverted between the two types: here it selects *for* the counter, there it
+/// selects *against* it.
 #[derive(
     Debug,
     Clone,
@@ -97,6 +103,23 @@ pub enum ProbeHoldUnavailableReason {
     /// the reservation is a content-independent admission decision. Zero
     /// unless `cache.stake_lane_reserved_holds > 0`.
     StakeLaneReserved,
+}
+
+impl ProbeHoldUnavailableReason {
+    /// Every variant, in the order [`Metrics::new`] materializes them.
+    ///
+    /// This is what makes "every reason exports at zero" structural rather
+    /// than a convention. [`Metrics::new`] destructures `ALL.map(…)` into its
+    /// three cached handles, so adding a variant here changes the array length
+    /// and **fails to compile** at that pattern — you cannot add a reason
+    /// without materializing its child. The recorder's exhaustive `match` is
+    /// the second gate; without this array a fourth variant could satisfy the
+    /// compiler with a `_ =>` arm calling `get_or_create`, silently
+    /// reintroducing the lazily-created series this design exists to prevent.
+    ///
+    /// Order is load-bearing (it binds handles positionally); a reorder is
+    /// caught by `probe_hold_unavailable_increments_only_the_named_reason`.
+    const ALL: [Self; 3] = [Self::Exhausted, Self::Disabled, Self::StakeLaneReserved];
 }
 
 #[derive(
@@ -218,7 +241,7 @@ pub struct DecdnMetrics {
     /// This is the one labeled `Counter` in this group; the other
     /// reason-style splits (`dispatch_rejected_*`,
     /// `probe_rate_limit_rejected_*`, `channel_open_failures_*`) remain
-    /// sibling counters pending a decision on unifying the convention.
+    /// sibling counters pending the decision tracked in #1475.
     probe_hold_unavailable: Family<ProbeHoldUnavailableLabels, Counter>,
     /// `decdn_probe_hold_slots_used` (registry): current active
     /// probe-triggered eviction holds (distinct held blobs), ADR 005
@@ -1418,15 +1441,17 @@ impl Metrics {
         });
         // Materialize every `reason` child up front so all three series export
         // at zero from a fresh registry (see the field docs on `Metrics`).
-        let probe_hold_child = |reason| {
+        // Driven off `ALL` and destructured positionally so a new variant
+        // cannot compile without being materialized here — see `ALL`'s docs.
+        let [
+            probe_hold_exhausted,
+            probe_hold_disabled,
+            probe_hold_stake_lane_reserved,
+        ] = ProbeHoldUnavailableReason::ALL.map(|reason| {
             decdn
                 .probe_hold_unavailable
                 .get_or_create(&ProbeHoldUnavailableLabels { reason })
-        };
-        let probe_hold_exhausted = probe_hold_child(ProbeHoldUnavailableReason::Exhausted);
-        let probe_hold_disabled = probe_hold_child(ProbeHoldUnavailableReason::Disabled);
-        let probe_hold_stake_lane_reserved =
-            probe_hold_child(ProbeHoldUnavailableReason::StakeLaneReserved);
+        });
         let cache = Arc::new(CacheMetrics::default());
         let mut registry = Registry::default();
         registry.register(decdn.clone() as Arc<dyn MetricsGroup>);
@@ -1506,9 +1531,10 @@ impl Metrics {
     /// hold, broken out by cause on the `reason` label of
     /// `decdn_probe_hold_unavailable_total` (#1443). Hand-written rather than
     /// a `recorders!` entry because the pre-materialized child handles live on
-    /// `Metrics`, not on `self.decdn` — the same shape as
-    /// [`Self::channel_open_failure_by_reason`]. Pairs with the structured
-    /// `debug!` at each call site in [`crate::handlers::probe`].
+    /// `Metrics`, whereas `recorders!` only reaches `self.decdn.$field`. Same
+    /// enum-dispatch shape as [`Self::channel_open_failure_by_reason`], though
+    /// that one's counters *are* siblings on `self.decdn`. Pairs with the
+    /// structured `debug!` at each call site in [`crate::handlers::probe`].
     pub fn probe_hold_unavailable(&self, reason: ProbeHoldUnavailableReason) {
         match reason {
             ProbeHoldUnavailableReason::Exhausted => self.probe_hold_exhausted.inc(),
@@ -2690,6 +2716,8 @@ impl Drop for StreamGuard {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use std::fs;
+    use std::path::Path;
     use std::time::Duration;
 
     use super::*;
@@ -2747,8 +2775,10 @@ mod tests {
         // fired — a dashboard gap where the three pre-collapse counters showed
         // a zero, and a silent hole in the `DecdnProbeHoldViolations` alert's
         // input. Also pins the rendered series text (label name, snake_case
-        // value encoding, and the `_total` suffix the encoder appends), which
-        // `monitoring/prometheus-alerts.yml` and the Grafana dashboard hard-code.
+        // value encoding, and the `_total` suffix the encoder appends). Note
+        // that pinning it *here* does not tie it to the copies in
+        // `monitoring/` — that is what
+        // `alert_and_dashboard_selectors_match_the_exported_series` below does.
         let metrics = Metrics::new();
         let text = metrics.encode().unwrap();
 
@@ -2771,6 +2801,57 @@ mod tests {
                 "retired metric name {retired} must not be exported:\n{text}"
             );
         }
+    }
+
+    #[test]
+    fn alert_and_dashboard_selectors_match_the_exported_series() {
+        // Nothing in CI validates `monitoring/` against the code — there is no
+        // promtool step and no reference to the directory in any workflow — so
+        // the alert and the dashboard hard-code a series name that only this
+        // test ties back to the encoder. Without it, renaming the metric, the
+        // `reason` label key, or the `Exhausted` variant updates the tests
+        // above, passes CI green, and leaves `DecdnProbeHoldViolations`
+        // querying a series that no longer exists: the page for probe-hold
+        // budget pressure then silently never fires again.
+        //
+        // Deliberately scoped to the one series this collapse renamed. A
+        // blanket "every `decdn_*` in monitoring/ is exported" assertion is a
+        // worthwhile follow-up but cannot land here — 13 names in those files
+        // are already stale, 10 of which exist nowhere in `crates/`.
+        const SELECTOR: &str = "decdn_probe_hold_unavailable_total{reason=\"exhausted\"";
+
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let alerts = fs::read_to_string(root.join("monitoring/prometheus-alerts.yml")).unwrap();
+        let dashboard = fs::read_to_string(root.join("monitoring/grafana-dashboard.json")).unwrap();
+
+        // Match the query line specifically, not the file. Both files also
+        // name the series in prose (the alert's `description`, the dashboard's
+        // `legendFormat`), and a whole-file `contains` would let that prose
+        // mask a rename of the actual query — verified: mutating only the
+        // `expr:` left a file-wide check green.
+        assert!(
+            alerts
+                .lines()
+                .any(|line| line.contains("expr:") && line.contains(SELECTOR)),
+            "no `expr:` in monitoring/prometheus-alerts.yml queries {SELECTOR}"
+        );
+        // Grafana stores the query inside a JSON string, so the quotes around
+        // the label value arrive backslash-escaped.
+        let escaped = SELECTOR.replace('"', "\\\"");
+        assert!(
+            dashboard
+                .lines()
+                .any(|line| line.contains("\"expr\":") && line.contains(&escaped)),
+            "no `expr` in monitoring/grafana-dashboard.json queries {SELECTOR}"
+        );
+        assert!(
+            Metrics::new()
+                .encode()
+                .unwrap()
+                .lines()
+                .any(|line| line.starts_with(SELECTOR)),
+            "the exporter no longer produces {SELECTOR}"
+        );
     }
 
     #[test]

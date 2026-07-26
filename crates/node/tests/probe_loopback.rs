@@ -1084,7 +1084,7 @@ async fn probe_holds_disabled_signs_has_blob_false_and_counts_disabled() -> anyh
 /// (`reason="exhausted"`), NOT as a config disable (#739). This is the
 /// signal whose alert remedy is "increase `max_probe_holds`".
 #[tokio::test(flavor = "multi_thread")]
-async fn probe_budget_exhausted_counts_violation_not_disabled() -> anyhow::Result<()> {
+async fn probe_budget_exhausted_counts_exhausted_not_disabled() -> anyhow::Result<()> {
     let a: &[u8] = b"first popular blob";
     let b: &[u8] = b"second popular blob";
     let (cache, ha, hb, _cache_tmp) = cache_with_two_blobs(a, b).await?;
@@ -1263,10 +1263,9 @@ async fn probe_stake_lane_requester_keeps_reserved_headroom() -> anyhow::Result<
         metric_value(
             &text,
             "decdn_probe_hold_unavailable_total{reason=\"stake_lane_reserved\"}"
-        )
-        .unwrap_or(0)
-            == 0,
-        "a stake-lane requester must NOT trip the reservation counter:\n{text}"
+        ) == Some(0),
+        "a stake-lane requester must NOT trip the reservation counter, and the \
+         series must be present at zero rather than absent:\n{text}"
     );
     Ok(())
 }

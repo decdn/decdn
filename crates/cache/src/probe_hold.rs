@@ -43,6 +43,13 @@ pub enum ProbeHoldOutcome {
     Held,
     /// Blob absent or operator-evicted — sign `has_blob: false`. Not a
     /// degradation: the node simply does not have the content.
+    ///
+    /// Deliberately the one outcome with **no** metric. The
+    /// `probe_hold_unavailable` counter records hold *refusals* for content the
+    /// node has; a true negative is not a refusal, and counting it would swamp
+    /// the signal every alert on that metric depends on. Despite the shared
+    /// word, this is not `ProbeHoldUnavailableReason` — that enum's values all
+    /// mean "we have it but would not hold it".
     Unavailable,
     /// Blob present but **all hold slots are in use** (`max_probe_holds > 0`
     /// and the live-hold count has reached it) — sign `has_blob: false` and
@@ -55,9 +62,9 @@ pub enum ProbeHoldOutcome {
     /// Blob present but the eviction-hold path is **disabled by config**
     /// (`max_probe_holds == 0`) — sign `has_blob: false`. Operationally
     /// distinct from [`Self::BudgetExhausted`] (#739): this is an intentional
-    /// operator decision, not load, so it must NOT be counted as
-    /// `probe_hold_unavailable{reason="exhausted"}` (whose alert remedy is
-    /// "increase `max_probe_holds`", nonsensical when holds are deliberately
-    /// off).
+    /// operator decision, not load. Counted as
+    /// `probe_hold_unavailable{reason="disabled"}`, never as
+    /// `{reason="exhausted"}` (whose alert remedy is "increase
+    /// `max_probe_holds`", nonsensical when holds are deliberately off).
     HoldsDisabled,
 }
