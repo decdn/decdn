@@ -7,8 +7,8 @@ pragma solidity 0.8.28;
 ///         enforceable before the challenged response time (ADR 014 § Blacklist
 ///         violation, step 6).
 /// @dev    `ContentBlacklist.getHashEntry` returns a static `HashEntry` struct
-///         `{uint64 addedAt; bool suspended; uint64 effectiveAt; bool emergency;
-///         uint8 category}`; a static struct return is ABI-identical to the
+///         `{uint64 addedAt; uint64 effectiveAt; bool emergency; uint8
+///         category}`; a static struct return is ABI-identical to the
 ///         flattened tuple, so this tuple-returning declaration shares the same
 ///         selector and decodes correctly. The field order here must track that
 ///         struct exactly. `addedAt == 0` means the (region, hash) pair is not
@@ -23,5 +23,5 @@ interface IContentBlacklistHashView {
     function getHashEntry(bytes32 region, bytes32 hash)
         external
         view
-        returns (uint64 addedAt, bool suspended, uint64 effectiveAt, bool emergency, uint8 category);
+        returns (uint64 addedAt, uint64 effectiveAt, bool emergency, uint8 category);
 }

@@ -210,8 +210,7 @@ slashed by an external adversary.
 hash on-chain via `ContentBlacklist`, and this node may still be caching,
 announcing, or serving it. Serving a globally blocked hash is a slashable
 offense (see [Slashing risk](#slashing-risk)). Protocol semantics:
-[ADR 011](../adr/011-content-takedown.md),
-[ADR 031](../adr/031-content-blacklist-appeals-contract.md).
+[ADR 011](../adr/011-content-takedown.md).
 
 **How a node is meant to learn about a blocked hash.**
 [ADR 011 § Node Behavior](../adr/011-content-takedown.md#node-behavior)
@@ -291,40 +290,28 @@ nodeId-indexed `NodeAutoEjected`. The node's staker-set watcher follows
      `GENERAL`, 90 for `CSAM`/`TERRORIST` — unless governance ratifies it with
      `addHashGlobal`. It stops being slashable at that deadline whether or not
      anyone has called `expireEmergencyEntry` to materialize the removal.
-   - An entry under active appeal (`suspended == true`) is not slashable —
-     `isHashBlacklisted` returns `false` and `SlashJudge` rejects the challenge —
-     but `addedAt` and `effectiveAt` are both preserved when the suspension
-     clears, so the grace does **not** restart: re-evict before serving again.
 
-3. **If you believe the entry is wrong, appeal it — don't just keep serving.**
-   `openBlacklistAppeal(hash, region, evidenceBundleHash, standingPath, namespaceId)`
-   opens an appeal against an `appealBond` deposit (governance-set; testnet deploy
-   default **100 TOKEN**, bounds `[50, 5000]`) within a 14-day filing window from
-   `addedAt`. The emergency multisig (`EMERGENCY_MULTISIG_ROLE`) fast-tracks —
-   suspending the entry for interim relief — or rejects; DecdnGovernor
-   (`GOVERNANCE_ROLE`) then ratifies the removal or reverses. Bond outcomes in
-   the deployed contract: **refunded only on ratification**; **burned on
-   rejection, reversal, and lapse** (`cleanupExpiredBlacklistAppeal`). The
-   declared `standingPath` is **verified at filing** (audit I-3): **`Publisher`**
-   requires that `namespaceId` is a namespace you own which has claimed the hash
-   (ignored on the other paths); **`Operator`** requires your current attested
-   region to match the entry's region; **`TokenHolder`** needs no extra
-   credential — the escrowed appeal bond is the standing, so there is no balance
-   threshold and no synthetic-standing clawback. PoC caveat vs. the ADR 011/031
-   design: any non-zero `region` is appealable (global included — the
-   regional-only restriction is not enforced). Global entries also remain
-   removable via the slow-path DecdnGovernor `removeHashGlobal` override. Design
-   intent:
-   [ADR 011 § Blacklist Entry Appeals](../adr/011-content-takedown.md#blacklist-entry-appeals),
-   [ADR 031](../adr/031-content-blacklist-appeals-contract.md).
+3. **If you believe the entry is wrong, escalate it — don't just keep serving.**
+   There is no per-entry appeal contract; the entry comes off through the
+   ordinary removal path. For a **regional** entry, the issuing body can call
+   `removeHashRegional(region, hash)` itself — raise it with that body first,
+   since it is a single transaction with no vote. For a **global** entry, or a
+   regional body that will not act, the route is a DecdnGovernor
+   `removeHashGlobal` proposal through the standard timelock (~10 days). If the
+   body is systemically misbehaving rather than wrong about one entry, the
+   emergency multisig can `suspendRegionalBody(region)`, which freezes every
+   entry that body issued pending governance ratification within 14 days. In all
+   three cases you must keep the hash evicted until the removal actually lands:
+   the entry is enforceable, and therefore slashable, right up to that point.
+   Semantics:
+   [ADR 011 § Removing a Wrongful Entry](../adr/011-content-takedown.md#removing-a-wrongful-entry).
 
-4. **A slash you already took is a separate matter.** Appealing the blacklist
-   *entry* (step 3) removes the entry; it does **not** refund a slash you
-   already incurred for serving the hash. Restitution for the slash itself —
-   e.g. you were offline during the window — is the
-   [ADR 028 SlashAppeal](../adr/028-slashing-appeals.md) path, with its own
-   bond and evidence rules. Operational-failure evidence is inadmissible on
-   the content-policy path and vice versa.
+4. **A slash you already took is a separate matter.** Getting the entry removed
+   (step 3) stops future exposure; it does **not** refund a slash you already
+   incurred for serving the hash. Restitution for the slash itself — e.g. you
+   were offline during the window — is the
+   [ADR 028 SlashAppeal](../adr/028-slashing-appeals.md) path, with its own bond
+   and evidence rules, and it is the only appeal surface the protocol carries.
 
 ## Gossip / peer table degraded
 

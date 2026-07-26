@@ -71,7 +71,6 @@ import { Ed25519Verifier } from "../src/Ed25519Verifier.sol";
 ///           - `REGION_STABILITY_WINDOW`    (default 7 days)
 ///           - `FEE_ROUTER_WINDOW_EPOCHS`   (default 13; bounded [4, 26] per ADR 036)
 ///           - `SLASH_APPEAL_BOND`          (default 1000e18)
-///           - `BLACKLIST_APPEAL_BOND`      (default 100e18)
 contract DeployProtocol is BaseProtocolDeploy {
     // Defaults — ADR 026 / 028 / 009 values.
     uint256 internal constant DEFAULT_TIMELOCK_DELAY = 48 hours;
@@ -91,7 +90,6 @@ contract DeployProtocol is BaseProtocolDeploy {
     uint64 internal constant FEE_ROUTER_EPOCH_LENGTH = 7 days;
     uint64 internal constant DEFAULT_FEE_ROUTER_WINDOW_EPOCHS = 13;
     uint256 internal constant DEFAULT_SLASH_APPEAL_BOND = 1000e18;
-    uint256 internal constant DEFAULT_BLACKLIST_APPEAL_BOND = 100e18;
 
     // Launch fee-router shares: 90% operator / 0% buyback / 10% treasury
     // (3-bucket split, ADR 026 § FeeRouter). The buyback bucket is dormant
@@ -189,7 +187,6 @@ contract DeployProtocol is BaseProtocolDeploy {
         cfg.buybackBurner = address(0);
 
         cfg.slashAppealBond = vm.envOr("SLASH_APPEAL_BOND", DEFAULT_SLASH_APPEAL_BOND);
-        cfg.blacklistAppealBond = vm.envOr("BLACKLIST_APPEAL_BOND", DEFAULT_BLACKLIST_APPEAL_BOND);
     }
 
     // -----------------------------------------------------------------

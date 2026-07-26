@@ -65,7 +65,6 @@ contract GovernanceLifecycleTest is Test, BaseProtocolDeploy {
     uint256 internal constant MIN_BOND = 50_000e18;
     uint256 internal constant UNBONDING_PERIOD = 7 days;
     uint256 internal constant SLASH_APPEAL_BOND = 1000e18;
-    uint256 internal constant BLACKLIST_APPEAL_BOND = 100e18;
 
     // -----------------------------------------------------------------
     // Deployments
@@ -126,8 +125,7 @@ contract GovernanceLifecycleTest is Test, BaseProtocolDeploy {
             // state, not the launch dormancy that DeployProtocol.s.sol ships.
             feeRouterShares: [uint256(6000), uint256(3000), uint256(1000)],
             buybackBurner: address(0xBB),
-            slashAppealBond: SLASH_APPEAL_BOND,
-            blacklistAppealBond: BLACKLIST_APPEAL_BOND
+            slashAppealBond: SLASH_APPEAL_BOND
         });
 
         Deployment memory d = _runFullDeploy(cfg);
@@ -641,21 +639,6 @@ contract GovernanceLifecycleTest is Test, BaseProtocolDeploy {
             address(blacklist),
             abi.encodeCall(ContentBlacklist.setOriginBlacklist, (address(0), true)),
             abi.encodeWithSelector(ContentBlacklist.ZeroAddress.selector)
-        );
-    }
-
-    function test_lifecycle_ContentBlacklist_setAppealBond_happy() public {
-        _runLifecycle(address(blacklist), abi.encodeCall(ContentBlacklist.setAppealBond, (uint256(2000e18))));
-        assertEq(blacklist.appealBond(), 2000e18);
-    }
-
-    function test_lifecycle_ContentBlacklist_setAppealBond_outOfBounds() public {
-        _runLifecycleExpectExecuteRevert(
-            address(blacklist),
-            abi.encodeCall(ContentBlacklist.setAppealBond, (uint256(10_000e18))),
-            abi.encodeWithSelector(
-                ContentBlacklist.ParamOutOfBounds.selector, uint256(10_000e18), uint256(50e18), uint256(5000e18)
-            )
         );
     }
 

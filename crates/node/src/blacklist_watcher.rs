@@ -1,4 +1,4 @@
-//! Blacklist compliance watcher (ADR 011 § Content Takedown, ADR 031).
+//! Blacklist compliance watcher (ADR 011 § Content Takedown).
 //!
 //! Every paid-delivery node runs this task after resolving the mandatory
 //! `blockchain.content_blacklist_address`. It keeps the local blob store
@@ -17,19 +17,11 @@
 //! (`_hashEntries[region][hash]`) — so a `HashRemoved` for one region's entry
 //! never drops a surviving same-hash entry in another region. Every
 //! seen-but-not-yet-evicted entry is retained in `known` — *including* ones
-//! currently out of scope (wrong region) or fast-track suspended — and
-//! re-scoped on a periodic (`on_tick_complete`) pass. This is essential: a hash
-//! can become live + in scope with **no** `HashBlacklisted` event — an operator
-//! region/ripening change (`CapacityBond.updateRegion`) or an appeal
-//! reversal/lapse that clears `suspended`. Re-scoping `known` is what catches
-//! those.
-//!
-//! The appeal half of that also has a prompt path: `HashSuspensionUpdated`
-//! (#1300) is emitted on every suspend/resume, so a resume re-checks scope
-//! immediately instead of waiting out the rescan cadence with the hash servable
-//! and slashable. The periodic re-scope remains the backstop — it is still the
-//! only thing that catches a region/ripening transition, which emits no event at
-//! all — so the two are complementary, not redundant.
+//! currently out of scope (wrong region) — and re-scoped on a periodic
+//! (`on_tick_complete`) pass. This is essential: a hash can become live + in
+//! scope with **no** `HashBlacklisted` event, via an operator region/ripening
+//! change (`CapacityBond.updateRegion`), which emits nothing on this contract at
+//! all. Re-scoping `known` is what catches those.
 //!
 //! **Durable deny-set, resumable cursor (#1181).** `known` is mirrored to a
 //! durable [`BlacklistEntryStore`] and reloaded on boot, so the scan cursor is
@@ -38,8 +30,8 @@
 //!
 //! That ordering is the whole safety argument, because the contract exposes no
 //! enumeration view. This watcher deliberately retains entries that are out of
-//! scope (wrong region) or appeal-suspended, since either can become enforceable
-//! again with no new `HashBlacklisted` log. While that set lived only in memory a
+//! scope (wrong region), since they can become enforceable again with no new
+//! `HashBlacklisted` log. While that set lived only in memory a
 //! resume would skip past those logs and silently drop the entries from
 //! re-scoping — a slashable compliance gap, and the reason the watcher used to
 //! full-replay. Persisting the set removes the premise.
@@ -131,8 +123,8 @@ use crate::announce_gate::AnnounceOriginDenySet;
 use decdn_incentive::capacity_bond::CapacityBond;
 use decdn_incentive::content_blacklist::ContentBlacklist;
 use decdn_incentive::content_blacklist::ContentBlacklist::{
-    HashBlacklisted, HashRemoved, HashSuspensionUpdated, OperatorBlacklistCleared,
-    OperatorBlacklisted, OriginBlacklistUpdated,
+    HashBlacklisted, HashRemoved, OperatorBlacklistCleared, OperatorBlacklisted,
+    OriginBlacklistUpdated,
 };
 use decdn_incentive::store::{BlacklistEntryStore, CheckpointKey, KeyedCheckpointStore};
 use tokio::sync::{RwLock, oneshot};
@@ -183,7 +175,7 @@ impl InitialSyncGate {
 /// resumable watcher; this holds only the re-scopable entry set.
 struct WatcherState<P: Provider + Clone> {
     /// Every blacklisted `(region, hash)` entry seen and not yet locally
-    /// evicted — including out-of-scope and suspended entries — re-scoped on
+    /// evicted — including out-of-scope entries — re-scoped on
     /// each `on_tick_complete` pass so a later region/ripening or appeal
     /// transition (which emits no `HashBlacklisted`) still leads to eviction.
     /// Keyed like the contract's `_hashEntries[region][hash]` so a `HashRemoved`
@@ -780,10 +772,9 @@ where
         Filter::new().address(contract_addr).event_signature(vec![
             HashBlacklisted::SIGNATURE_HASH,
             HashRemoved::SIGNATURE_HASH,
-            HashSuspensionUpdated::SIGNATURE_HASH,
             // Origin blacklisting rides the same scan (ADR 011 § Hash Evasion
             // and Origin Blacklisting). It is deliberately outside the
-            // `getBlacklistVersion()` mechanism, so unlike the three hash
+            // `getBlacklistVersion()` mechanism, so unlike the two hash
             // events there is no counter to detect a missed one — the cursor
             // plus the durable origin projection are the whole guarantee.
             OriginBlacklistUpdated::SIGNATURE_HASH,
@@ -954,9 +945,6 @@ where
             on_removed_log(contract, operator, cache, state, &log).await?;
             Ok(false)
         }
-        Some(topic) if *topic == HashSuspensionUpdated::SIGNATURE_HASH => {
-            Ok(on_suspension_log(contract, operator, cache, state, &log).await? == Recheck::Failed)
-        }
         Some(topic) if *topic == OriginBlacklistUpdated::SIGNATURE_HASH => {
             Ok(on_origin_log(state, &log).await? == Recheck::Failed)
         }
@@ -1124,60 +1112,6 @@ async fn on_removed_log<P: Provider + Clone>(
     Ok(())
 }
 
-/// Decode a `HashSuspensionUpdated` log and react to the appeal-driven
-/// suspend/resume toggle.
-///
-/// The entry is retained in `known` either way — as it already is for
-/// out-of-scope entries — because suspension does not delete it and the periodic
-/// re-scope must keep watching it. What this event buys is *latency* on the
-/// resume edge: a reversal/lapse that clears `suspended` re-arms enforcement
-/// while emitting no `HashBlacklisted`, so without this handler the hash stays
-/// servable until the next batched re-scope (up to a full rescan cadence) — and
-/// serving a re-enforced hash is slashable. On resume we therefore re-check
-/// immediately, exactly as [`on_blacklisted_log`] does for a fresh entry.
-///
-/// The suspend edge needs no eviction: suspension only ever *narrows* what is
-/// enforced (`isHashBlacklistedForOperator` starts returning false), and local
-/// eviction is deliberately sticky and one-way — the node never un-evicts, which
-/// stays conservative if it had already acted.
-async fn on_suspension_log<P>(
-    contract: &ContentBlacklist::ContentBlacklistInstance<P>,
-    operator: Address,
-    cache: &CacheEngine,
-    state: &mut WatcherState<P>,
-    log: &Log,
-) -> Result<Recheck>
-where
-    P: Provider + Clone,
-{
-    match HashSuspensionUpdated::decode_log_data(&log.inner.data) {
-        Ok(event) => {
-            let hash = Hash::from_bytes(event.hash.0);
-            state.add_entry(event.region, hash)?;
-            if event.suspended {
-                debug!(
-                    region = %event.region,
-                    %hash,
-                    "blacklist entry suspended on-chain (retained for re-scoping; \
-                     local eviction stays sticky)"
-                );
-                Ok(Recheck::NoAction)
-            } else {
-                debug!(
-                    region = %event.region,
-                    %hash,
-                    "blacklist entry resumed on-chain; re-checking scope immediately"
-                );
-                Ok(recheck(contract, operator, cache, state, hash).await)
-            }
-        }
-        Err(err) => {
-            warn!(err = %err, "blacklist watcher: undecodable HashSuspensionUpdated log");
-            Ok(Recheck::NoAction)
-        }
-    }
-}
-
 /// Outcome of one scope re-check, so callers can distinguish an enforcement
 /// *failure* (retry promptly — the entry may be live and slashable) from a
 /// legitimately out-of-scope entry (the periodic re-scope keeps watching it).
@@ -1185,15 +1119,15 @@ where
 enum Recheck {
     /// The hash was in scope and its eviction succeeded.
     Evicted,
-    /// Nothing to do: already evicted, or currently out of scope / suspended.
+    /// Nothing to do: already evicted, or currently out of scope.
     NoAction,
     /// The scope read or the eviction failed (RPC error/timeout, cache error) —
     /// the entry is retained and must be re-checked promptly.
     Failed,
 }
 
-/// Evict `hash` if in scope. Out-of-scope/suspended (`Some(false)`) and
-/// RPC-error (`None`) hashes keep their `known` entries for the next re-scope
+/// Evict `hash` if in scope. Out-of-scope (`Some(false)`) and RPC-error
+/// (`None`) hashes keep their `known` entries for the next re-scope
 /// (callers insert before calling); evicted hashes drop *all* their regional
 /// entries — eviction is sticky and region-independent.
 async fn recheck<P>(
@@ -2598,84 +2532,6 @@ mod tests {
         assert!(
             store.load_blacklist_entries()?.is_empty(),
             "a removed entry must not survive into the next boot"
-        );
-        Ok(())
-    }
-
-    fn suspension_log(region: B256, hash_bytes: [u8; 32], version: u64, suspended: bool) -> Log {
-        let event = HashSuspensionUpdated {
-            region,
-            hash: B256::from(hash_bytes),
-            version: alloy::primitives::U256::from(version),
-            suspended,
-        };
-        Log {
-            inner: alloy::primitives::Log {
-                address: Address::repeat_byte(0x11),
-                data: event.encode_log_data(),
-            },
-            ..Default::default()
-        }
-    }
-
-    /// #1300, resume edge. A reversal/lapse clears `suspended` and re-arms
-    /// enforcement while emitting no `HashBlacklisted`, so the handler must
-    /// re-check scope *immediately* instead of leaving the hash servable (and
-    /// slashable) until the next batched re-scope. The mocked provider has no
-    /// queued response, so a re-check that is genuinely attempted surfaces as
-    /// `Recheck::Failed` — which is exactly the proof that it ran.
-    #[tokio::test]
-    async fn resume_rechecks_immediately() -> Result<()> {
-        let metrics = Arc::new(Metrics::new());
-        let mut sink = failing_sink(false, 0, &metrics).await?;
-        let bytes = [0x07u8; 32];
-
-        let outcome = on_suspension_log(
-            &sink.contract,
-            sink.operator,
-            &sink.cache,
-            &mut sink.state,
-            &suspension_log(US, bytes, 9, false),
-        )
-        .await?;
-
-        assert!(
-            outcome == Recheck::Failed,
-            "a resume must attempt an immediate scope re-check"
-        );
-        assert!(
-            sink.state.known.contains(&(US, Hash::from_bytes(bytes))),
-            "the resumed entry must stay known for re-scoping"
-        );
-        Ok(())
-    }
-
-    /// #1300, suspend edge. Suspension only ever *narrows* what is enforced, so
-    /// it must not spend an RPC on a re-check — but the entry must stay in
-    /// `known` so the periodic re-scope keeps watching it for the eventual
-    /// resume. (Local eviction is sticky and one-way, so nothing is un-evicted.)
-    #[tokio::test]
-    async fn suspend_retains_entry_without_recheck() -> Result<()> {
-        let metrics = Arc::new(Metrics::new());
-        let mut sink = failing_sink(false, 0, &metrics).await?;
-        let bytes = [0x08u8; 32];
-
-        let outcome = on_suspension_log(
-            &sink.contract,
-            sink.operator,
-            &sink.cache,
-            &mut sink.state,
-            &suspension_log(US, bytes, 10, true),
-        )
-        .await?;
-
-        assert!(
-            outcome == Recheck::NoAction,
-            "a suspend must not attempt a scope re-check"
-        );
-        assert!(
-            sink.state.known.contains(&(US, Hash::from_bytes(bytes))),
-            "the suspended entry must stay known for re-scoping"
         );
         Ok(())
     }
