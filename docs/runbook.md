@@ -105,17 +105,25 @@ blacklist updates and stop being able to settle channels. Once
 
 ## Slashing risk
 
-**Triggers** (per [ADR 008](../adr/008-reputation.md),
+**Triggers** — the three, and only three, offenses `SlashJudge` adjudicates,
+one per `submit*Challenge` entry point (per
+[ADR 008](../adr/008-reputation.md),
 [ADR 011](../adr/011-content-takedown.md),
 [ADR 014](../adr/014-on-chain-verification.md)):
 
 - **Phantom announce** — claiming a hash you don't actually hold (signed
   `has_blob: true` then evicted within `probe_hold_duration`, or refused to
   serve when the stream request arrived).
-- **Missed challenge response** — failure to respond to a slash challenge
-  within the 24-hour window (ADR 014).
+- **Rate manipulation** — two signed messages from this NodeId disagreeing
+  about this node's own `rate_per_mb` inside the 30-second slashing window.
+  The last probe-quoted rate is binding for that window, so a legitimate
+  reprice must wait it out before serving a stream at the new rate.
 - **Blacklist violation** — serving content after the on-chain blacklist
   added it.
+
+There is no "missed response" offense: every slash is driven by the
+operator's own signed messages, so a node that stays silent cannot be
+slashed by an external adversary.
 
 **Detect:**
 
@@ -136,26 +144,36 @@ blacklist updates and stop being able to settle channels. Once
 
 **Remediate:**
 
-1. **If the trigger was a missed challenge response:** investigate the root
-   cause first (RPC outage, dispute monitor down, signing host crash, clock
-   skew). Fix that before submitting evidence — counter-evidence filed while
-   the underlying problem persists will not stop the next strike.
-2. **Submit counter-evidence on-chain within the 24-hour challenge window.**
-   The procedure is defined in
-   [ADR 014](../adr/014-on-chain-verification.md); deadlines are absolute
-   wall-clock — once the window closes the slash is final.
-3. **For phantom announces (`DecdnProbeHoldViolations`):** investigate OOM
+1. **Fix the root cause before anything else** (RPC outage, dispute monitor
+   down, signing host crash, clock skew). A slash you appeal while the
+   underlying problem persists will not stop the next strike, and you get
+   only one accepted appeal per 365 days
+   (`APPEAL_FREQUENCY_WINDOW`) — spend it on the most clear-cut case.
+2. **There is no counter-evidence window.** If on-chain verification passes,
+   the slash executes synchronously inside the challenger's
+   `submit*Challenge` reveal — see
+   [ADR 014 § Bond Handling](../adr/014-on-chain-verification.md#bond-handling).
+   Nothing you send afterwards can undo it in-protocol, and there is no
+   deadline to race.
+3. **The recourse is a slash appeal.** Call
+   `SlashAppeal.openSlashAppeal(slashId, evidenceBundleHash)` within
+   `APPEAL_FILING_WINDOW` — **30 days from the slash block**, enforced by
+   `CapacityBond.markAppealOpen`, which reverts once it lapses. Filing is
+   operator-only and costs `APPEAL_BOND` (1,000 TOKEN by default, governable
+   within `[100, 10,000]`); the bond is burned in full if the appeal fails.
+   The evidence bundle is assembled off-chain and committed by hash. Flow,
+   windows, and what counts as evidence:
+   [ADR 028](../adr/028-slashing-appeals.md#adr-028-slashing-appeals-and-dispute-escalation).
+4. **For phantom announces (`DecdnProbeHoldViolations`):** investigate OOM
    and resource pressure on the node — the violations indicate that signed
    `has_blob: true` answers are not being honoured by the eviction-hold
-   mechanism. There is no operator-tunable knob for hold capacity in
-   `crates/node/src/config/types.rs` today; the alert annotations reference
-   `max_probe_holds` but it is not yet a config field. Until that lands,
-   the practical levers are reducing offered load, increasing host
-   memory, and following
-   [ADR 005 § Probe-Triggered Eviction Hold](../adr/005-protocol.md#probe-triggered-eviction-hold)
-   for context. See also
-   [ADR 008](../adr/008-reputation.md) for reputation impact.
-4. **For self-detected exposure (`DecdnSlashEvidenceExposure`):** stop the
+   mechanism. Raise the hold budget with `[cache] max_probe_holds`
+   (`--max-probe-holds` / `DECDN_MAX_PROBE_HOLDS`, default 256), keeping it
+   at ≤25% of cache capacity, and reduce offered load or add host memory if
+   the pressure is genuine. Background:
+   [ADR 005 § Probe-Triggered Eviction Hold](../adr/005-protocol.md#probe-triggered-eviction-hold).
+   See also [ADR 008](../adr/008-reputation.md) for reputation impact.
+5. **For self-detected exposure (`DecdnSlashEvidenceExposure`):** stop the
    node immediately and file a bug — this signals a code-path defect, not an
    operator misconfiguration.
 
