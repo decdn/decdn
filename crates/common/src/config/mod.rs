@@ -2334,45 +2334,25 @@ pub fn resolve_payment_into(
         },
     );
     // Pre-chain seed for the on-chain `getRateBounds()` clamp (ADR 005 §Rate
-    // bounds validation). Since #1172 the runtime overwrites both from chain
-    // before serving, so these defaults (`0` .. `MAX_RATE_PER_MB`) only shape
-    // the pre-read window; the live clamp is governance-owned on-chain.
+    // bounds validation). Since #1172 the runtime overwrites it from chain
+    // before serving, so this default (`0`) only shapes the pre-read window;
+    // the live floor is governance-owned on-chain.
     let delivery_floor = cli
         .delivery_floor
         .or_else(|| file.and_then(|p| p.delivery_floor))
         .unwrap_or(0);
-    let delivery_ceiling = cli
-        .delivery_ceiling
-        .or_else(|| file.and_then(|p| p.delivery_ceiling))
-        .unwrap_or(decdn_protocol::MAX_RATE_PER_MB);
+    // The clamp only ever raises `rate_per_mb`, so a floor above the wire cap
+    // would make the node sign a rate honest clients reject outright (#378).
+    // There is no lower guard to write: with `rate_per_mb >= 1` validated above
+    // and a raise-only clamp, the signed rate can never collapse to 0 — an
+    // invariant the removed governance ceiling used to need a check for.
     bag.check_with(
-        delivery_floor <= delivery_ceiling,
+        delivery_floor <= decdn_protocol::MAX_RATE_PER_MB,
         "payment.delivery_floor",
         || {
             format!(
-                "payment.delivery_floor ({delivery_floor}) must be <= \
-             payment.delivery_ceiling ({delivery_ceiling})"
-            )
-        },
-    );
-    // A ceiling of 0 would clamp every quoted rate to 0, bypassing the
-    // `rate_per_mb > 0` guard above and making the node advertise a
-    // free/selection-winning rate (ADR 001). With ceiling >= 1 and the
-    // validated `rate_per_mb >= 1`, `clamp(rate, floor, ceiling)` is always
-    // >= 1, so the signed rate can never collapse to 0.
-    bag.check(
-        delivery_ceiling >= 1,
-        "payment.delivery_ceiling",
-        "payment.delivery_ceiling must be >= 1 (clamping to 0 would sign a \
-         free rate and bypass the rate_per_mb > 0 guard, ADR 001)",
-    );
-    bag.check_with(
-        delivery_ceiling <= decdn_protocol::MAX_RATE_PER_MB,
-        "payment.delivery_ceiling",
-        || {
-            format!(
-                "payment.delivery_ceiling {delivery_ceiling} exceeds protocol \
-             MAX_RATE_PER_MB ({}); clamping to it could still emit a rate honest \
+                "payment.delivery_floor {delivery_floor} exceeds protocol \
+             MAX_RATE_PER_MB ({}); raising a quote to it would emit a rate honest \
              clients reject",
                 decdn_protocol::MAX_RATE_PER_MB,
             )
@@ -2402,7 +2382,6 @@ pub fn resolve_payment_into(
     ResolvedPayment {
         rate_per_mb,
         delivery_floor,
-        delivery_ceiling,
         voucher_interval_mb,
     }
 }
@@ -4764,7 +4743,6 @@ swap_pool_address = \"0xPool\"
         let cli = crate::cli::run::PaymentArgs {
             rate_per_mb: Some(0),
             delivery_floor: None,
-            delivery_ceiling: None,
         };
         let err = resolve_payment(&cli, None)
             .err()
@@ -4778,74 +4756,35 @@ swap_pool_address = \"0xPool\"
     }
 
     #[test]
-    fn resolve_payment_rejects_zero_delivery_ceiling() -> anyhow::Result<()> {
-        // ceiling=0 would clamp every quoted rate to 0, signing a free
-        // selection-winning rate and bypassing the rate_per_mb > 0 guard.
+    fn resolve_payment_rejects_floor_above_protocol_max() -> anyhow::Result<()> {
+        // The clamp only raises, so a floor above the wire cap makes the node
+        // sign a `ProbeResponse` honest clients reject outright (#378).
         let cli = crate::cli::run::PaymentArgs {
             rate_per_mb: Some(10),
-            delivery_floor: Some(0),
-            delivery_ceiling: Some(0),
+            delivery_floor: Some(decdn_protocol::MAX_RATE_PER_MB + 1),
         };
         let err = resolve_payment(&cli, None)
             .err()
-            .ok_or_else(|| anyhow::anyhow!("expected rejection for delivery_ceiling=0"))?
+            .ok_or_else(|| anyhow::anyhow!("expected rejection for floor>MAX"))?
             .to_string();
         anyhow::ensure!(
-            err.contains("delivery_ceiling") && err.contains(">= 1"),
+            err.contains("delivery_floor") && err.contains("MAX_RATE_PER_MB"),
             "error lacked context: {err}"
         );
         Ok(())
     }
 
     #[test]
-    fn resolve_payment_rejects_floor_above_ceiling() -> anyhow::Result<()> {
-        let cli = crate::cli::run::PaymentArgs {
-            rate_per_mb: Some(10),
-            delivery_floor: Some(100),
-            delivery_ceiling: Some(50),
-        };
-        let err = resolve_payment(&cli, None)
-            .err()
-            .ok_or_else(|| anyhow::anyhow!("expected rejection for floor>ceiling"))?
-            .to_string();
-        anyhow::ensure!(
-            err.contains("delivery_floor") && err.contains("delivery_ceiling"),
-            "error lacked context: {err}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn resolve_payment_rejects_ceiling_above_protocol_max() -> anyhow::Result<()> {
-        let cli = crate::cli::run::PaymentArgs {
-            rate_per_mb: Some(10),
-            delivery_floor: None,
-            delivery_ceiling: Some(decdn_protocol::MAX_RATE_PER_MB + 1),
-        };
-        let err = resolve_payment(&cli, None)
-            .err()
-            .ok_or_else(|| anyhow::anyhow!("expected rejection for ceiling>MAX"))?
-            .to_string();
-        anyhow::ensure!(
-            err.contains("delivery_ceiling") && err.contains("MAX_RATE_PER_MB"),
-            "error lacked context: {err}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn resolve_payment_accepts_and_threads_explicit_bounds() -> anyhow::Result<()> {
+    fn resolve_payment_accepts_and_threads_explicit_floor() -> anyhow::Result<()> {
         let cli = crate::cli::run::PaymentArgs {
             rate_per_mb: Some(10),
             delivery_floor: Some(5),
-            delivery_ceiling: Some(100),
         };
         let resolved = resolve_payment(&cli, None)?;
         anyhow::ensure!(
-            resolved.delivery_floor == 5 && resolved.delivery_ceiling == 100,
-            "bounds not threaded: floor={} ceiling={}",
-            resolved.delivery_floor,
-            resolved.delivery_ceiling
+            resolved.delivery_floor == 5,
+            "floor not threaded: {}",
+            resolved.delivery_floor
         );
         Ok(())
     }
@@ -4882,12 +4821,10 @@ swap_pool_address = \"0xPool\"
         let cli = crate::cli::run::PaymentArgs {
             rate_per_mb: None,
             delivery_floor: None,
-            delivery_ceiling: None,
         };
         let file = types::PaymentConfig {
             rate_per_mb: Some(0),
             delivery_floor: None,
-            delivery_ceiling: None,
             voucher_interval_mb: None,
         };
         let err = resolve_payment(&cli, Some(&file))
@@ -4930,12 +4867,10 @@ swap_pool_address = \"0xPool\"
         let cli = crate::cli::run::PaymentArgs {
             rate_per_mb: Some(42),
             delivery_floor: None,
-            delivery_ceiling: None,
         };
         let file = types::PaymentConfig {
             rate_per_mb: Some(0),
             delivery_floor: None,
-            delivery_ceiling: None,
             voucher_interval_mb: None,
         };
         let resolved = resolve_payment(&cli, Some(&file))?;
@@ -4948,7 +4883,6 @@ swap_pool_address = \"0xPool\"
         let cli = crate::cli::run::PaymentArgs {
             rate_per_mb: None,
             delivery_floor: None,
-            delivery_ceiling: None,
         };
         let resolved = resolve_payment(&cli, None)?;
         anyhow::ensure!(
@@ -4969,7 +4903,6 @@ swap_pool_address = \"0xPool\"
         let file = types::PaymentConfig {
             rate_per_mb: Some(10),
             delivery_floor: None,
-            delivery_ceiling: None,
             voucher_interval_mb: Some(64),
         };
         let resolved = resolve_payment(&empty_payment_args(), Some(&file))?;
@@ -4983,7 +4916,6 @@ swap_pool_address = \"0xPool\"
             let file = types::PaymentConfig {
                 rate_per_mb: Some(10),
                 delivery_floor: None,
-                delivery_ceiling: None,
                 voucher_interval_mb: Some(bad),
             };
             let err = resolve_payment(&empty_payment_args(), Some(&file))
@@ -5007,7 +4939,6 @@ swap_pool_address = \"0xPool\"
         let cli = crate::cli::run::PaymentArgs {
             rate_per_mb: Some(decdn_protocol::MAX_RATE_PER_MB + 1),
             delivery_floor: None,
-            delivery_ceiling: None,
         };
         let err = resolve_payment(&cli, None)
             .err()
@@ -5025,7 +4956,6 @@ swap_pool_address = \"0xPool\"
         let cli = crate::cli::run::PaymentArgs {
             rate_per_mb: Some(decdn_protocol::MAX_RATE_PER_MB),
             delivery_floor: None,
-            delivery_ceiling: None,
         };
         let resolved = resolve_payment(&cli, None)?;
         anyhow::ensure!(
@@ -7185,7 +7115,6 @@ swap_pool_address = \"0xPool\"
             ),
             ("rate_per_mb", "DECDN_RATE_PER_MB"),
             ("delivery_floor", "DECDN_DELIVERY_FLOOR"),
-            ("delivery_ceiling", "DECDN_DELIVERY_CEILING"),
             ("log_level", "DECDN_LOG_LEVEL"),
             ("log_format", "DECDN_LOG_FORMAT"),
             ("metrics_port", "DECDN_METRICS_PORT"),
@@ -7519,7 +7448,6 @@ swap_pool_address = \"0xPool\"
         crate::cli::run::PaymentArgs {
             rate_per_mb: None,
             delivery_floor: None,
-            delivery_ceiling: None,
         }
     }
 
@@ -9303,12 +9231,10 @@ swap_pool_address = \"0xPool\"
         let cli = crate::cli::run::PaymentArgs {
             rate_per_mb: Some(99),
             delivery_floor: None,
-            delivery_ceiling: None,
         };
         let file = types::PaymentConfig {
             rate_per_mb: Some(1),
             delivery_floor: None,
-            delivery_ceiling: None,
             voucher_interval_mb: None,
         };
         let resolved = resolve_payment(&cli, Some(&file))?;
@@ -9322,7 +9248,6 @@ swap_pool_address = \"0xPool\"
         let file = types::PaymentConfig {
             rate_per_mb: Some(50),
             delivery_floor: None,
-            delivery_ceiling: None,
             voucher_interval_mb: None,
         };
         let resolved = resolve_payment(&cli, Some(&file))?;

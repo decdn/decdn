@@ -43,25 +43,24 @@ impl ClientHandler {
         self.receipt_sink.record(receipt);
     }
 
-    /// Load the configured rate and clamp it to the delivery bounds before
+    /// Load the configured rate and raise it to the delivery floor before
     /// signing a `StreamResponse`, logging a warning and incrementing
     /// `rate_bounds_clamp_events` on any clamp (ADR 005 §Rate bounds — the same
     /// clamp-and-warn the probe handler applies before signing a `ProbeResponse`).
     pub(super) fn clamped_rate(&self) -> u64 {
         let raw_rate = self.rate_per_mb.load(Ordering::Relaxed);
-        // One snapshot for both the clamp and the log — see the identical note
-        // in `ProbeHandler`: separate `floor()`/`ceiling()` reads could log a
-        // pair that never produced this clamp decision.
-        let bounds = self.rate_bounds.snapshot();
-        let rate_per_mb = bounds.clamp(raw_rate);
+        // One read for both the clamp and the log — see the identical note in
+        // `ProbeHandler`: a second read could log a floor that never produced
+        // this clamp decision.
+        let floor = self.rate_bounds.floor();
+        let rate_per_mb = raw_rate.max(floor);
         if rate_per_mb != raw_rate {
             self.metrics.rate_bounds_clamped();
             tracing::warn!(
                 raw_rate,
                 clamped = rate_per_mb,
-                floor = bounds.floor,
-                ceiling = bounds.ceiling,
-                "rate_per_mb clamped to delivery bounds before signing StreamResponse"
+                floor,
+                "rate_per_mb raised to the delivery floor before signing StreamResponse"
             );
         }
         rate_per_mb

@@ -163,7 +163,6 @@ contract PaymentChannelTest is Test {
     uint256 internal constant DISPUTE_WINDOW = 48 hours;
     uint256 internal constant MAX_DURATION = 90 days;
     uint256 internal constant DELIVERY_FLOOR = 1;
-    uint256 internal constant DELIVERY_CEILING = 1000;
     uint256 internal constant DEPOSIT = 1000e6;
     uint256 internal constant BYTES_PER_MB = 1_048_576;
 
@@ -216,7 +215,6 @@ contract PaymentChannelTest is Test {
             disputeWindow_: DISPUTE_WINDOW,
             maxChannelDuration_: MAX_DURATION,
             deliveryFloor_: DELIVERY_FLOOR,
-            deliveryCeiling_: DELIVERY_CEILING,
             admin: admin
         });
 
@@ -757,9 +755,7 @@ contract PaymentChannelTest is Test {
     function test_constructor_revertsOnRouterMissingPausedView() public {
         NoPauseRouter bad = new NoPauseRouter();
         vm.expectRevert(abi.encodeWithSelector(PaymentChannel.FeeRouterMissingPausedView.selector, address(bad)));
-        new PaymentChannel(
-            usdc, bond, address(bad), DISPUTE_WINDOW, MAX_DURATION, DELIVERY_FLOOR, DELIVERY_CEILING, admin
-        );
+        new PaymentChannel(usdc, bond, address(bad), DISPUTE_WINDOW, MAX_DURATION, DELIVERY_FLOOR, admin);
     }
 
     function test_setDisputeWindow_enforcesBounds() public {
@@ -784,57 +780,42 @@ contract PaymentChannelTest is Test {
     }
 
     function test_getRateBounds_returnsConfigured() public view {
-        (uint256 floor, uint256 ceiling) = channel.getRateBounds();
-        assertEq(floor, DELIVERY_FLOOR);
-        assertEq(ceiling, DELIVERY_CEILING);
+        assertEq(channel.getRateBounds(), DELIVERY_FLOOR);
     }
 
     // -----------------------------------------------------------------
-    // Rate bounds uint64 upper cap (#1383): the daemon's rate clamp is `u64`,
-    // so a ratified band above `type(uint64).max` fails to decode and silently
+    // Rate floor uint64 upper cap (#1383): the daemon's rate clamp is `u64`,
+    // so a ratified floor above `type(uint64).max` fails to decode and silently
     // strands vouchers below the enforced on-chain floor. The chain must not be
-    // able to express a band the node cannot enforce. Each governance-gated case
-    // pranks `admin` (which holds `GOVERNANCE_ROLE`) so the revert is the bounds
-    // guard, not an access-control failure.
+    // able to express a floor the node cannot enforce. Each governance-gated
+    // case pranks `admin` (which holds `GOVERNANCE_ROLE`) so the revert is the
+    // bounds guard, not an access-control failure.
     // -----------------------------------------------------------------
 
-    /// @dev A ceiling one above `type(uint64).max` reverts `RateBoundsInvalid`.
-    function test_setRateBounds_revertsWhenCeilingExceedsUint64Cap() public {
-        uint256 badCeiling = uint256(type(uint64).max) + 1;
-        vm.prank(admin);
-        vm.expectRevert(abi.encodeWithSelector(PaymentChannel.RateBoundsInvalid.selector, DELIVERY_FLOOR, badCeiling));
-        channel.setRateBounds(DELIVERY_FLOOR, badCeiling);
-    }
-
-    /// @dev A floor above `type(uint64).max` reverts `RateBoundsInvalid` (the
-    ///      ceiling is set just above it so the failure is the u64 cap, not the
-    ///      `newCeiling <= newFloor` ordering check).
+    /// @dev A floor one above `type(uint64).max` reverts `RateBoundsInvalid`.
     function test_setRateBounds_revertsWhenFloorExceedsUint64Cap() public {
         uint256 badFloor = uint256(type(uint64).max) + 1;
-        uint256 badCeiling = uint256(type(uint64).max) + 2;
         vm.prank(admin);
-        vm.expectRevert(abi.encodeWithSelector(PaymentChannel.RateBoundsInvalid.selector, badFloor, badCeiling));
-        channel.setRateBounds(badFloor, badCeiling);
+        vm.expectRevert(abi.encodeWithSelector(PaymentChannel.RateBoundsInvalid.selector, badFloor));
+        channel.setRateBounds(badFloor);
     }
 
-    /// @dev In-bounds control: a ceiling at exactly `type(uint64).max` is the
-    ///      widest band the guard admits and succeeds, proving the cap is
+    /// @dev In-bounds control: a floor at exactly `type(uint64).max` is the
+    ///      highest the guard admits and succeeds, proving the cap is
     ///      inclusive (`>` , not `>=`).
     function test_setRateBounds_succeedsAtUint64Cap() public {
-        uint256 maxCeiling = uint256(type(uint64).max);
+        uint256 maxFloor = uint256(type(uint64).max);
         vm.prank(admin);
-        channel.setRateBounds(DELIVERY_FLOOR, maxCeiling);
-        (uint256 floor, uint256 ceiling) = channel.getRateBounds();
-        assertEq(floor, DELIVERY_FLOOR);
-        assertEq(ceiling, maxCeiling);
+        channel.setRateBounds(maxFloor);
+        assertEq(channel.getRateBounds(), maxFloor);
     }
 
-    /// @dev The constructor shares the guard: deploying with a ceiling above
+    /// @dev The constructor shares the guard: deploying with a floor above
     ///      `type(uint64).max` reverts `RateBoundsInvalid`.
-    function test_constructor_revertsOnRateCeilingAboveUint64Cap() public {
-        uint256 badCeiling = uint256(type(uint64).max) + 1;
-        vm.expectRevert(abi.encodeWithSelector(PaymentChannel.RateBoundsInvalid.selector, DELIVERY_FLOOR, badCeiling));
-        new PaymentChannel(usdc, bond, address(router), DISPUTE_WINDOW, MAX_DURATION, DELIVERY_FLOOR, badCeiling, admin);
+    function test_constructor_revertsOnRateFloorAboveUint64Cap() public {
+        uint256 badFloor = uint256(type(uint64).max) + 1;
+        vm.expectRevert(abi.encodeWithSelector(PaymentChannel.RateBoundsInvalid.selector, badFloor));
+        new PaymentChannel(usdc, bond, address(router), DISPUTE_WINDOW, MAX_DURATION, badFloor, admin);
     }
 
     // -----------------------------------------------------------------
@@ -923,7 +904,7 @@ contract PaymentChannelTest is Test {
     ///      rational boundary lies between them.
     function test_rateFloor_truncatesDownAtNonUnitFloor() public {
         vm.prank(admin);
-        channel.setRateBounds(3, DELIVERY_CEILING);
+        channel.setRateBounds(3);
 
         uint256 amount = 100;
         // 100 * 1_048_576 / 3 = 34_952_533 (rounded down from 34_952_533.33).
@@ -951,7 +932,7 @@ contract PaymentChannelTest is Test {
 
         // Raise the floor to 2: the same voucher now exceeds the per-byte price.
         vm.prank(admin);
-        channel.setRateBounds(2, DELIVERY_CEILING);
+        channel.setRateBounds(2);
 
         bytes32 idNew = _open();
         bytes memory sig = _sign(idNew, 1, 1, BYTES_PER_MB);
@@ -966,30 +947,15 @@ contract PaymentChannelTest is Test {
     ///      not the access-control check.
     function test_setRateBounds_revertsWhenFloorBelowMinimum() public {
         vm.prank(admin);
-        vm.expectRevert(abi.encodeWithSelector(PaymentChannel.RateBoundsInvalid.selector, uint256(0), uint256(5)));
-        channel.setRateBounds(0, 5);
-    }
-
-    /// @dev The `setRateBounds` guard `newCeiling <= newFloor` fires on an equal
-    ///      ceiling and floor. Pranked as `admin` so the revert is the bounds
-    ///      guard, not the `GOVERNANCE_ROLE` check.
-    function test_setRateBounds_revertsWhenCeilingNotAboveFloor() public {
-        vm.prank(admin);
-        vm.expectRevert(abi.encodeWithSelector(PaymentChannel.RateBoundsInvalid.selector, uint256(100), uint256(100)));
-        channel.setRateBounds(100, 100);
+        vm.expectRevert(abi.encodeWithSelector(PaymentChannel.RateBoundsInvalid.selector, uint256(0)));
+        channel.setRateBounds(0);
     }
 
     /// @dev The constructor enforces the same invariant as `setRateBounds`: a
     ///      sub-floor `deliveryFloor_` reverts at deploy time.
     function test_constructor_revertsWhenFloorBelowMinimum() public {
-        vm.expectRevert(abi.encodeWithSelector(PaymentChannel.RateBoundsInvalid.selector, uint256(0), uint256(5)));
-        new PaymentChannel(usdc, bond, address(router), DISPUTE_WINDOW, MAX_DURATION, 0, 5, admin);
-    }
-
-    /// @dev The constructor rejects `deliveryCeiling_ <= deliveryFloor_`.
-    function test_constructor_revertsWhenCeilingNotAboveFloor() public {
-        vm.expectRevert(abi.encodeWithSelector(PaymentChannel.RateBoundsInvalid.selector, uint256(100), uint256(100)));
-        new PaymentChannel(usdc, bond, address(router), DISPUTE_WINDOW, MAX_DURATION, 100, 100, admin);
+        vm.expectRevert(abi.encodeWithSelector(PaymentChannel.RateBoundsInvalid.selector, uint256(0)));
+        new PaymentChannel(usdc, bond, address(router), DISPUTE_WINDOW, MAX_DURATION, 0, admin);
     }
 
     /// @dev Routed served bytes can never exceed `amount * BYTES_PER_MB / floor`,
@@ -1654,14 +1620,12 @@ contract PaymentChannelTest is Test {
 
     function test_constructor_revertsOnZeroAdmin() public {
         vm.expectRevert(PaymentChannel.ZeroAddress.selector);
-        new PaymentChannel(
-            usdc, bond, address(router), DISPUTE_WINDOW, MAX_DURATION, DELIVERY_FLOOR, DELIVERY_CEILING, address(0)
-        );
+        new PaymentChannel(usdc, bond, address(router), DISPUTE_WINDOW, MAX_DURATION, DELIVERY_FLOOR, address(0));
     }
 
     function test_constructor_revertsOnEoaFeeRouter() public {
         vm.expectRevert(abi.encodeWithSelector(PaymentChannel.FeeRouterHasNoCode.selector, stranger));
-        new PaymentChannel(usdc, bond, stranger, DISPUTE_WINDOW, MAX_DURATION, DELIVERY_FLOOR, DELIVERY_CEILING, admin);
+        new PaymentChannel(usdc, bond, stranger, DISPUTE_WINDOW, MAX_DURATION, DELIVERY_FLOOR, admin);
     }
 
     function test_constructor_revertsOnDisputeWindowOutOfBounds() public {
@@ -1670,7 +1634,7 @@ contract PaymentChannelTest is Test {
                 PaymentChannel.ParamOutOfBounds.selector, uint256(1 hours), uint256(48 hours), uint256(72 hours)
             )
         );
-        new PaymentChannel(usdc, bond, address(router), 1 hours, MAX_DURATION, DELIVERY_FLOOR, DELIVERY_CEILING, admin);
+        new PaymentChannel(usdc, bond, address(router), 1 hours, MAX_DURATION, DELIVERY_FLOOR, admin);
     }
 
     // -----------------------------------------------------------------

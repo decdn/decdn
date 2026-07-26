@@ -213,7 +213,6 @@ abstract contract BaseProtocolDeploy is Script {
     uint256 internal constant PAYMENT_DISPUTE_WINDOW = 48 hours;
     uint256 internal constant PAYMENT_MAX_CHANNEL_DURATION = 90 days;
     uint256 internal constant PAYMENT_DELIVERY_FLOOR = 1;
-    uint256 internal constant PAYMENT_DELIVERY_CEILING = 1000;
 
     // SlashJudge launch params (ADR 014 § Governable Parameters). `maxEvidenceAge`
     // (5 days) must stay `< unbondingPeriod` (14 days default) — the SlashJudge
@@ -449,7 +448,6 @@ abstract contract BaseProtocolDeploy is Script {
             disputeWindow_: PAYMENT_DISPUTE_WINDOW,
             maxChannelDuration_: PAYMENT_MAX_CHANNEL_DURATION,
             deliveryFloor_: PAYMENT_DELIVERY_FLOOR,
-            deliveryCeiling_: PAYMENT_DELIVERY_CEILING,
             admin: cfg.deployer
         });
 

@@ -380,7 +380,6 @@ fn build_config(
         payment: ResolvedPayment {
             rate_per_mb: 10,
             delivery_floor: 0,
-            delivery_ceiling: decdn_protocol::MAX_RATE_PER_MB,
             voucher_interval_mb: decdn_protocol::DEFAULT_VOUCHER_INTERVAL_MB,
         },
         observability: ResolvedObservability {
@@ -528,7 +527,6 @@ async fn anvil_bringup_shutdown_runtime_graceful_drain() -> anyhow::Result<()> {
         PaymentArgs {
             rate_per_mb: None,
             delivery_floor: None,
-            delivery_ceiling: None,
         },
         ObservabilityArgs {
             log_level: None,

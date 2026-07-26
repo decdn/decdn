@@ -471,7 +471,7 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # cache_dir = "~/.decdn/cache"
 # cache_size_mb = 10240
 # max_blob_size_mb = 1024
-# max_rate_per_mb = 0                      # buyer-side per-MB rate ceiling for paid cache-miss pulls (USDC base units); 0 = unlimited (#1375). Refuses a provider quote above the lower of this and the candidate's probe rate, before paying. Distinct from the seller-side [payment] delivery_ceiling clamp
+# max_rate_per_mb = 0                      # buyer-side per-MB rate ceiling for paid cache-miss pulls (USDC base units); 0 = unlimited (#1375). Refuses a provider quote above the lower of this and the candidate's probe rate, before paying. Distinct from the seller-side [payment] delivery_floor clamp, which raises this node's own quote
 # pinned_hashes = []                       # blob hashes (hex) exempted from LRU eviction (#276)
 # user_agent = "decdn-node/<version>"      # User-Agent on HTTP origin pull-through (#435); default embeds the crate version
 # Pull-through origin (singular). Mutually exclusive with the plural [[cache.origins]] form below.
@@ -507,7 +507,6 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 [payment]
 # rate_per_mb = 10
 # delivery_floor = 0                       # PRE-CHAIN SEED ONLY (#1172): overwritten from on-chain getRateBounds() before serving; governance owns the live floor
-# delivery_ceiling = 1000000000000         # PRE-CHAIN SEED ONLY (#1172): overwritten from on-chain getRateBounds(); must be >= 1
 # voucher_interval_mb = 1                  # voucher cadence advertised on cdn/client/v1 (ADR 003); range 1..=MAX_VOUCHER_INTERVAL_MB
 
 [observability]

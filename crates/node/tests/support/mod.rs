@@ -28,7 +28,7 @@ use decdn_node::handlers::client::{ClientHandler, ClientHandlerDeps};
 use decdn_node::metrics::Metrics;
 use decdn_node::receipt_log::{DirectReceiptSink, DownloadReceipt, ReceiptLog, ReceiptSink};
 use decdn_protocol::client::ClientMessage;
-use decdn_protocol::{MAX_RATE_PER_MB, decode_message, encode_message, read_frame, write_frame};
+use decdn_protocol::{decode_message, encode_message, read_frame, write_frame};
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use iroh::protocol::ProtocolHandler;
 use iroh::{Endpoint, RelayMode, SecretKey, endpoint::presets};
@@ -375,7 +375,7 @@ fn client_handler_deps(
         store,
         receipt_sink,
         Arc::new(AtomicU64::new(rate)),
-        decdn_node::rate_bounds::RateBounds::new(0, MAX_RATE_PER_MB),
+        decdn_node::rate_bounds::RateBounds::new(0),
         1, // voucher_interval_mb
         max_blob_size_bytes,
         max_concurrent_streams,

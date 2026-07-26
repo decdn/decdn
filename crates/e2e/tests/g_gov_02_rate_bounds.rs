@@ -1,46 +1,47 @@
 //! G-GOV-02 end-to-end: a ratified governance parameter reaches a live daemon
 //! (#1041).
 //!
-//! The parameter under test is `PaymentChannel`'s delivery-rate band
-//! (`getRateBounds()` → `[floor, ceiling]`). The daemon seeds its clamp from an
+//! The parameter under test is `PaymentChannel`'s delivery-rate floor
+//! (`getRateBounds()`). The daemon seeds its clamp from an
 //! authoritative startup read and then tracks `RateBoundsUpdated`
 //! (`crates/node/src/rate_bounds_watcher.rs`, #1172), so a governance retune is
 //! supposed to reach a *running* node with no restart and no config edit. This
 //! journey asserts exactly that, end to end, through the real Governor:
 //!
-//! 1. **Baseline.** Chain deploys with `[1, 1000]`; the node fixture's config
-//!    quotes `rate_per_mb = 10`, which is inside the band, so the daemon's
+//! 1. **Baseline.** Chain deploys with a floor of `1`; the node fixture's config
+//!    quotes `rate_per_mb = 10`, which is already above it, so the daemon's
 //!    `ProbeResponse` advertises the configured 10 verbatim.
 //! 2. **Vote weight.** Age the chain past the ~180-day ramp and have the
 //!    operator serve real bytes, so it carries nonzero Governor weight
 //!    (ADR-036 served bytes × age ramp) at the proposal snapshot.
 //! 3. **Ratify.** propose → warp `votingDelay` → `castVote(For)` → warp
 //!    `votingPeriod` → `queue`, with the executed action
-//!    `PaymentChannel.setRateBounds(50, 500)`.
+//!    `PaymentChannel.setRateBounds(50)`.
 //! 4. **Negative — pre-timelock.** With the proposal queued but the Timelock
 //!    delay not yet elapsed, chain state *and* the live daemon must still be on
-//!    the old band: `getRateBounds()` is `[1, 1000]` and the probe still quotes
-//!    10, held stably across several watcher ticks.
+//!    the old floor: `getRateBounds()` is `1` and the probe still quotes 10,
+//!    held stably across several watcher ticks.
 //! 5. **Happy path.** Warp the Timelock delay, `execute`, and assert the live
 //!    daemon reprices: with no restart and no config change its advertised
 //!    `rate_per_mb` moves 10 → 50, the new floor. That is the whole point — the
-//!    quote is now outside the *old* band and inside the new one.
+//!    quote is now governed by a value that arrived over the wire, not config.
 //! 6. **Paid path.** The reprice must also govern what the daemon *sells* at,
 //!    not just what it advertises. A fresh paid fetch settles on-chain, and the
 //!    settled voucher is read back to confirm the blob was sold at the new floor
-//!    — settling alone proves little, since the on-chain floor check rejects only
-//!    *under*-payment and a node selling at the ceiling would settle cleanly.
+//!    — settling alone proves little, since the on-chain floor check rejects
+//!    only *under*-payment, so an over-priced sale would settle just as cleanly.
 //! 7. **Negative — out-of-safety-bounds.** `setRateBounds` reverts with
-//!    `RateBoundsInvalid` for `floor < MIN_DEPOSIT_FLOOR` and for
-//!    `ceiling <= floor`, proven as `from = Timelock` static calls for both (so
-//!    the `GOVERNANCE_ROLE` gate is passed and the bounds check is the only
-//!    thing that can reject), and — for the sub-floor case — as a full ratified
+//!    `RateBoundsInvalid` for `floor < MIN_DEPOSIT_FLOOR` and for a floor above
+//!    `type(uint64).max` — the value the daemon's `u64` clamp cannot represent
+//!    (#1383) — proven as `from = Timelock` static calls for both (so the
+//!    `GOVERNANCE_ROLE` gate is passed and the bounds check is the only thing
+//!    that can reject), and — for the sub-floor case — as a full ratified
 //!    proposal whose `execute` reverts with the same selector. The daemon keeps
-//!    quoting under the last valid band.
-//! 8. **Ceiling.** Every step above moves the floor, so a last proposal ratifies
-//!    `[1, 5]`, a band whose *ceiling* is below the configured rate. The live
-//!    quote must clamp the other direction, 50 → 5, which only holds if the
-//!    event's ceiling field reached the clamp alongside its floor.
+//!    quoting under the last valid floor.
+//! 8. **Release.** Every step above tightens. A last proposal ratifies a floor
+//!    of `1`, back below the configured rate, and the live quote must fall back
+//!    to the configured 10 — proving the clamp releases as well as binds, and
+//!    that a lowered floor is not latched at its previous high-water mark.
 //!
 //! Gated behind the `anvil-e2e` feature (off by default). Requires `anvil` +
 //! `forge` on `PATH` and a built `decdn-node` binary:
@@ -103,10 +104,10 @@ mod gov_abi {
         #[sol(rpc)]
         contract PaymentChannelGov {
             /// Thrown by `setRateBounds` (and the constructor) when
-            /// `newFloor < MIN_DEPOSIT_FLOOR` or `newCeiling <= newFloor`.
-            error RateBoundsInvalid(uint256 deliveryFloor, uint256 deliveryCeiling);
+            /// `newFloor < MIN_DEPOSIT_FLOOR` or `newFloor > type(uint64).max`.
+            error RateBoundsInvalid(uint256 deliveryFloor);
 
-            function setRateBounds(uint256 newFloor, uint256 newCeiling) external;
+            function setRateBounds(uint256 newFloor) external;
         }
     }
 }
@@ -118,21 +119,17 @@ const DAY: u64 = 24 * 60 * 60;
 /// `PaymentChannel.BYTES_PER_MB` — the divisor in the per-byte price floor.
 const BYTES_PER_MB: u64 = 1_048_576;
 
-/// The band the deploy script ships (`BaseProtocolDeploy.PAYMENT_DELIVERY_*`).
+/// The floor the deploy script ships (`BaseProtocolDeploy.PAYMENT_DELIVERY_FLOOR`).
 const OLD_FLOOR: u64 = 1;
-const OLD_CEILING: u64 = 1000;
-/// The band this journey ratifies. The floor is deliberately above the fixture's
-/// configured `rate_per_mb = 10`, so "the daemon picked it up" is observable as a
-/// changed quote rather than as an unchanged one.
+/// The floor this journey ratifies. Deliberately above the fixture's configured
+/// `rate_per_mb = 10`, so "the daemon picked it up" is observable as a changed
+/// quote rather than as an unchanged one.
 const NEW_FLOOR: u64 = 50;
-const NEW_CEILING: u64 = 500;
-/// A third band, ratified last, whose *ceiling* sits below the configured rate
-/// so the daemon must clamp **down**. Without this leg every daemon-side
-/// observation in the journey is a floor clamp, and a watcher that decoded
-/// `newDeliveryFloor` correctly while dropping `newDeliveryCeiling` would pass
-/// unnoticed — the two fields have to move as one value.
-const TIGHT_FLOOR: u64 = 1;
-const TIGHT_CEILING: u64 = 5;
+/// A third floor, ratified last, back below the configured rate. Every step
+/// before it tightens the clamp; without this leg a watcher that latched the
+/// floor at its high-water mark instead of storing the newest value would pass
+/// unnoticed.
+const RELEASED_FLOOR: u64 = 1;
 /// `NodeFixture::render_config`'s `[payment] rate_per_mb`.
 const CONFIGURED_RATE: u64 = 10;
 
@@ -170,12 +167,12 @@ async fn run() -> anyhow::Result<()> {
     let payload = vec![0x9Au8; 2 * MIB];
     let (node, hash) = NodeFixture::launch(&chain, "US", &payload).await?;
 
-    // ---- Baseline: chain ships `[1, 1000]`, and the daemon quotes its
-    // configured rate verbatim because it already sits inside that band.
+    // ---- Baseline: chain ships a floor of `1`, and the daemon quotes its
+    // configured rate verbatim because it already sits above that floor.
     assert_eq!(
         read_rate_bounds(&chain).await?,
-        (U256::from(OLD_FLOOR), U256::from(OLD_CEILING)),
-        "the deploy script's launch band must be the starting point"
+        U256::from(OLD_FLOOR),
+        "the deploy script's launch floor must be the starting point"
     );
     let client = ClientFixture::new(&chain).await?;
     assert_eq!(
@@ -207,17 +204,17 @@ async fn run() -> anyhow::Result<()> {
     );
     time::increase_time(chain.admin(), 8 * DAY).await?;
 
-    // ---- Ratify the new band: propose → vote → queue. Stops short of
+    // ---- Ratify the new floor: propose → vote → queue. Stops short of
     // `execute` so the pre-timelock negative below is a real observation.
     let mut retune = Proposal::new(
         payment_channel,
-        set_rate_bounds_calldata(NEW_FLOOR, NEW_CEILING),
-        format!("retune delivery rate bounds to [{NEW_FLOOR}, {NEW_CEILING}]"),
+        set_rate_bounds_calldata(U256::from(NEW_FLOOR)),
+        format!("retune the delivery rate floor to {NEW_FLOOR}"),
     );
     // `propose_and_queue` asserts the proposal reached `Queued` itself.
     retune.propose_and_queue(&chain, node.operator()).await?;
 
-    // ---- Negative: pre-timelock, the OLD bounds still apply. The proposal is
+    // ---- Negative: pre-timelock, the OLD floor still applies. The proposal is
     // queued but the Timelock delay has not elapsed, so neither chain state nor
     // the live daemon may have moved. Held across several watcher ticks so this
     // is a stability claim, not a single lucky read that merely beat the
@@ -227,8 +224,8 @@ async fn run() -> anyhow::Result<()> {
     // loop spans covers roughly three ticks rather than six.
     assert_eq!(
         read_rate_bounds(&chain).await?,
-        (U256::from(OLD_FLOOR), U256::from(OLD_CEILING)),
-        "queueing alone must not move the on-chain band"
+        U256::from(OLD_FLOOR),
+        "queueing alone must not move the on-chain floor"
     );
     for _ in 0..6u32 {
         assert_eq!(
@@ -252,8 +249,8 @@ async fn run() -> anyhow::Result<()> {
     );
     assert_eq!(
         read_rate_bounds(&chain).await?,
-        (U256::from(NEW_FLOOR), U256::from(NEW_CEILING)),
-        "the executed proposal must have written the new band"
+        U256::from(NEW_FLOOR),
+        "the executed proposal must have written the new floor"
     );
     let repriced = poll(Duration::from_secs(60), || async {
         let quote = client.probe(&node, hash).await?.body.rate_per_mb;
@@ -275,8 +272,8 @@ async fn run() -> anyhow::Result<()> {
     //
     // Settling is necessary but NOT sufficient to prove that: the on-chain floor
     // check (`PaymentChannel._advanceClaimWatermark` → `RateFloorViolation`) is
-    // one-sided — it rejects paying too *little*, so a node that sold at the
-    // ceiling would settle perfectly cleanly. The price itself is therefore the
+    // one-sided — it rejects paying too *little*, so a node that sold above the
+    // floor would settle perfectly cleanly. The price itself is therefore the
     // observable, read back off the channel the vouchers were signed against.
     //
     // Note the under-pricing direction never reaches the chain at all: the node
@@ -291,7 +288,7 @@ async fn run() -> anyhow::Result<()> {
         .await?;
     assert_eq!(
         paid.bytes, payload,
-        "the node must still deliver the blob under the ratified band"
+        "the node must still deliver the blob under the ratified floor"
     );
     let advanced = poll(Duration::from_secs(120), || async {
         let b = chain.served_bytes(node.operator_addr()).await?;
@@ -314,7 +311,7 @@ async fn run() -> anyhow::Result<()> {
     // The `+1` tolerance is for the over-payment side only: each voucher interval
     // prices its delta with `div_ceil`, so a different interval split could round
     // a micro-USDC up. The regression this leg exists to catch — selling at the
-    // ceiling — is an order of magnitude away and nowhere near the tolerance.
+    // unclamped configured rate — is nowhere near the tolerance.
     let (amount, billed_bytes) = settled_amount_and_bytes(&chain, paid.channel_id).await?;
     assert!(
         billed_bytes >= U256::from(2 * MIB),
@@ -324,9 +321,10 @@ async fn run() -> anyhow::Result<()> {
     assert!(
         (U256::from(NEW_FLOOR)..=U256::from(NEW_FLOOR + 1)).contains(&implied_rate),
         "the blob must be sold at the ratified floor ({NEW_FLOOR}/MB): settled {amount} \
-         micro-USDC for {billed_bytes} billed bytes = {implied_rate}/MB. A quote clamped to the \
-         ceiling ({NEW_CEILING}) would settle just as cleanly on-chain, which is why this \
-         asserts the price and not merely that settlement happened."
+         micro-USDC for {billed_bytes} billed bytes = {implied_rate}/MB. A sale at the unclamped \
+         configured rate ({CONFIGURED_RATE}/MB) would be rejected, but any price *above* the \
+         floor would settle just as cleanly on-chain, which is why this asserts the price and \
+         not merely that settlement happened."
     );
 
     // Cross an epoch so the bytes just served sit in a fully-elapsed epoch, and
@@ -339,16 +337,19 @@ async fn run() -> anyhow::Result<()> {
     // proves that framing: an in-bounds pair simulates cleanly from the same
     // sender, so the two rejections below are about the values, not the caller.
     let timelock = chain.addrs().timelock;
-    simulate_set_rate_bounds(&chain, timelock, 2, 3)
+    simulate_set_rate_bounds(&chain, timelock, U256::from(2))
         .await
-        .context("an in-bounds pair must simulate cleanly from the Timelock")?;
+        .context("an in-bounds floor must simulate cleanly from the Timelock")?;
     expect_revert::<_, PaymentChannelGov::RateBoundsInvalid>(
-        simulate_set_rate_bounds(&chain, timelock, 0, 5).await,
+        simulate_set_rate_bounds(&chain, timelock, U256::ZERO).await,
         "setRateBounds below MIN_DEPOSIT_FLOOR",
     )?;
+    // The daemon's clamp is `u64`, so a floor the chain can express but the node
+    // cannot enforce would silently strand every voucher below the on-chain
+    // floor (#1383). The contract refuses to store one.
     expect_revert::<_, PaymentChannelGov::RateBoundsInvalid>(
-        simulate_set_rate_bounds(&chain, timelock, 100, 100).await,
-        "setRateBounds with ceiling <= floor",
+        simulate_set_rate_bounds(&chain, timelock, U256::from(u64::MAX) + U256::from(1)).await,
+        "setRateBounds above the u64 clamp cap",
     )?;
 
     // ---- ...and the Governor cannot smuggle one past that check either: a
@@ -363,8 +364,8 @@ async fn run() -> anyhow::Result<()> {
     // transaction never landed", so `is_err()` alone would prove nothing.
     let mut bad = Proposal::new(
         payment_channel,
-        set_rate_bounds_calldata(0, 5),
-        "retune delivery rate bounds below the safety floor".to_owned(),
+        set_rate_bounds_calldata(U256::ZERO),
+        "retune the delivery rate floor below the safety floor".to_owned(),
     );
     // `propose_and_queue` pins the *Governor* state at `Queued`, so "never
     // reached Queued" (lost quorum, a bad warp) is already distinguishable from
@@ -383,45 +384,46 @@ async fn run() -> anyhow::Result<()> {
     );
     assert_eq!(
         read_rate_bounds(&chain).await?,
-        (U256::from(NEW_FLOOR), U256::from(NEW_CEILING)),
-        "a reverted execution must leave the last ratified band in place"
+        U256::from(NEW_FLOOR),
+        "a reverted execution must leave the last ratified floor in place"
     );
     assert_eq!(
         client.probe(&node, hash).await?.body.rate_per_mb,
         NEW_FLOOR,
-        "the daemon must keep quoting under the last valid band"
+        "the daemon must keep quoting under the last valid floor"
     );
 
-    // ---- Finally, the ceiling half of the band. Everything above moved the
-    // *floor*, so a watcher that decoded `newDeliveryFloor` and dropped
-    // `newDeliveryCeiling` — storing `(50, u64::MAX)` — would have passed every
-    // assertion so far. Ratifying a band whose ceiling sits below the configured
-    // rate forces the opposite clamp direction: the quote must come *down* to
-    // the ceiling, which is only observable if both fields survived the event.
-    let mut tighten = Proposal::new(
+    // ---- Finally, the release direction. Every step above raised the floor, so
+    // a watcher that latched it at its high-water mark — or a clamp that only
+    // ever moved a quote up — would have passed every assertion so far.
+    // Ratifying a floor back *below* the configured rate is the only leg that
+    // separates "the newest value is stored" from "the largest value is stored":
+    // the quote must fall back to the configured rate the clamp no longer binds.
+    let mut release = Proposal::new(
         payment_channel,
-        set_rate_bounds_calldata(TIGHT_FLOOR, TIGHT_CEILING),
-        format!("retune delivery rate bounds to [{TIGHT_FLOOR}, {TIGHT_CEILING}]"),
+        set_rate_bounds_calldata(U256::from(RELEASED_FLOOR)),
+        format!("retune the delivery rate floor to {RELEASED_FLOOR}"),
     );
-    tighten.propose_and_queue(&chain, node.operator()).await?;
-    tighten
+    release.propose_and_queue(&chain, node.operator()).await?;
+    release
         .execute_after_timelock(&chain, node.operator())
         .await?;
     assert_eq!(
         read_rate_bounds(&chain).await?,
-        (U256::from(TIGHT_FLOOR), U256::from(TIGHT_CEILING)),
-        "the tightening proposal must have written the third band"
+        U256::from(RELEASED_FLOOR),
+        "the releasing proposal must have written the third floor"
     );
-    let clamped_down = poll(Duration::from_secs(60), || async {
+    let released = poll(Duration::from_secs(60), || async {
         let quote = client.probe(&node, hash).await?.body.rate_per_mb;
         Ok((quote != NEW_FLOOR).then_some(quote))
     })
     .await?;
     assert_eq!(
-        clamped_down,
-        Some(TIGHT_CEILING),
-        "the live daemon must clamp its configured rate ({CONFIGURED_RATE}) down to the ratified \
-         ceiling ({TIGHT_CEILING}) — proving the event's ceiling field reached the clamp too"
+        released,
+        Some(CONFIGURED_RATE),
+        "with the ratified floor ({RELEASED_FLOOR}) back below the configured rate, the live \
+         daemon must quote the configured {CONFIGURED_RATE} again — proving the clamp releases \
+         and does not latch at its high-water mark"
     );
 
     Ok(())
@@ -643,14 +645,11 @@ impl Proposal {
     }
 }
 
-/// ABI-encoded `PaymentChannel.setRateBounds(floor, ceiling)`.
-fn set_rate_bounds_calldata(floor: u64, ceiling: u64) -> Bytes {
-    PaymentChannelGov::setRateBoundsCall {
-        newFloor: U256::from(floor),
-        newCeiling: U256::from(ceiling),
-    }
-    .abi_encode()
-    .into()
+/// ABI-encoded `PaymentChannel.setRateBounds(floor)`.
+fn set_rate_bounds_calldata(floor: U256) -> Bytes {
+    PaymentChannelGov::setRateBoundsCall { newFloor: floor }
+        .abi_encode()
+        .into()
 }
 
 /// Bail if a mined transaction reverted (alloy resolves those as `Ok`).
@@ -679,13 +678,12 @@ async fn settled_amount_and_bytes(
     Ok((ch.claimedAmount, ch.claimedBytes))
 }
 
-async fn read_rate_bounds(chain: &ChainFixture) -> anyhow::Result<(U256, U256)> {
-    let b = PaymentChannel::new(chain.addrs().payment_channel, chain.admin())
+async fn read_rate_bounds(chain: &ChainFixture) -> anyhow::Result<U256> {
+    PaymentChannel::new(chain.addrs().payment_channel, chain.admin())
         .getRateBounds()
         .call()
         .await
-        .context("getRateBounds")?;
-    Ok((b.floor, b.ceiling))
+        .context("getRateBounds")
 }
 
 /// `eth_call` `setRateBounds` as `caller`. No state is written either way; the
@@ -699,11 +697,10 @@ async fn read_rate_bounds(chain: &ChainFixture) -> anyhow::Result<(U256, U256)> 
 async fn simulate_set_rate_bounds(
     chain: &ChainFixture,
     caller: Address,
-    floor: u64,
-    ceiling: u64,
+    floor: U256,
 ) -> Result<(), alloy::contract::Error> {
     PaymentChannelGov::new(chain.addrs().payment_channel, chain.admin())
-        .setRateBounds(U256::from(floor), U256::from(ceiling))
+        .setRateBounds(floor)
         .from(caller)
         .call()
         .await
