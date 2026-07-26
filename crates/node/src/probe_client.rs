@@ -6,11 +6,13 @@
 //! measure `rate_per_mb` + RTT before [`crate::selection::rank_candidates`]
 //! picks one.
 //!
-//! **Duplication note (#831).** This is a verbatim copy of
-//! `cli::commands::probe_client::probe_once`. The `node` crate cannot depend on
-//! `cli`, and `protocol` is a minimal-deps leaf with no `iroh` connect surface,
-//! so neither is a viable shared home; a future shared internal transport crate
-//! should host the single copy. Keep the two in sync until then.
+//! **Duplication note (#831).** This duplicates
+//! [`decdn_client_pull::probe::probe_once`], whose body it currently matches
+//! line for line. The original blocker is gone: the shared transport crate
+//! this note once deferred to now exists, and `node` already takes it as a
+//! normal dependency, re-exported as [`crate::client_requester`]. The copy is
+//! therefore redundant rather than forced, and collapsing it is a follow-up.
+//! Keep the two in sync until then.
 //!
 //! The reused mechanism is **transport-only**: echoed-field correlation (ADR
 //! 005) and `slash_sig` validation (ADR 014 §1) are the caller's

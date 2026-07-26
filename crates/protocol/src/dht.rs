@@ -15,8 +15,7 @@
 //! directly by the holder to the K-closest nodes and never relayed
 //! peer-to-peer — if a future scheme introduces peer relay of records, a
 //! per-record signature MUST be reintroduced together with an in-scope sender
-//! timestamp in the signed body (ADR 022 §STORE Flow, ADR 015 §Replay Safety
-//! Analysis).
+//! timestamp in the signed body (ADR 022 §STORE Flow).
 //!
 //! # `BatchStore` wire types
 //!

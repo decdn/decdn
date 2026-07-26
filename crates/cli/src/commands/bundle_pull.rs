@@ -642,10 +642,11 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
     /// Fetch every entry into `out_root`, one unit of work per *distinct* blob
     /// hash: entries sharing a hash (one file at two bundle paths) are fetched and
     /// reconstructed once, then materialized at each path (#1306) — never fetched,
-    /// nor *paid for*, twice. `buffer_unordered` polls up to `jobs` futures in this
-    /// one task (no `tokio::spawn`); parallelism comes
-    /// from concurrent in-flight network I/O, while the per-provider locks inside
-    /// `fetch` serialize same-channel access — now over unique blobs.
+    /// nor *paid for*, twice. `buffer_unordered` polls up to `jobs` futures in
+    /// this one task (no `tokio::spawn`, by choice — nothing here is `!Send`);
+    /// parallelism comes from concurrent in-flight network I/O, while the
+    /// per-provider locks inside `fetch` serialize same-channel access — now
+    /// over unique blobs.
     async fn pull_all(
         &self,
         entries: &[ManifestEntry],

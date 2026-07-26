@@ -286,8 +286,10 @@ pub(crate) async fn probe_and_rank(
     warming: ProxyWarmingParams,
 ) -> anyhow::Result<NodeCandidate> {
     let timestamp_us = micros_now();
-    // Probe concurrently in one task: `join_all` over a shared `&endpoint`
-    // needs no per-probe clone. `probe_once`'s internal timeout bounds each leg.
+    // Probe concurrently in one task. `probe_once`'s future is `Send`, so
+    // `tokio::spawn` would work too; `join_all` over a shared `&endpoint` is
+    // kept because it needs no per-probe clone. `probe_once`'s internal
+    // timeout bounds each leg.
     let probes = candidates.iter().map(|cand| {
         let relay = relay_hint.cloned();
         async move {

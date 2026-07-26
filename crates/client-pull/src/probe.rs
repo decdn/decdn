@@ -2,9 +2,11 @@
 //!
 //! [`probe_once`](crate::probe::probe_once) performs one probe round trip against a remote node
 //! over a plain QUIC handshake. The transport lives here rather than inline
-//! in the `decdn probe` command so the node's future cache-miss
-//! probe-collection loop (DHT `FIND_VALUE` → parallel probes, [ADR 001]) can
-//! reuse the exact mechanism. The reused mechanism is **transport-only**:
+//! in the `decdn probe` command so the node's cache-miss probe-collection loop
+//! (DHT `FIND_VALUE` → parallel probes, [ADR 001]) can reuse it; that loop
+//! runs today in `decdn_node::node_origin`, though it currently calls the
+//! node-side copy of this function rather than this module (#831). The reused
+//! mechanism is **transport-only**:
 //! echoed-field correlation (ADR 005) and `slash_sig` validation (ADR 014
 //! §1) are the caller's responsibility, not performed here — see
 //! [`probe_once`](crate::probe::probe_once).

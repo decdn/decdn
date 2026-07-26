@@ -2814,6 +2814,12 @@ mod tests {
         // classification and no session-ticket working-set proxy, so no
         // metric may name either. A partial revert that reintroduces one
         // counter but not its recorder shows up here.
+        //
+        // The needles are matched against the whole exposition, which also
+        // carries iroh's transport metrics — so an upstream series named
+        // `*0rtt*` would trip this too. That breadth is deliberate: this
+        // node claims to expose no early-data accounting at all, whoever
+        // registered it.
         let metrics = Metrics::new();
         let text = metrics.encode().unwrap();
         for needle in ["0rtt", "session_ticket"] {

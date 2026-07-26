@@ -427,9 +427,9 @@ async fn answer_probe(
         .await
         .map_err(|e| anyhow::anyhow!("write probe response: {e}"))?;
     let _ = send.finish();
-    // Hold the connection so the requester reads the response + lingers (ADR
-    // 015) before it collapses; spawned per-connection, so this never stalls the
-    // accept loop.
+    // Hold the connection until the requester has read the response and closed
+    // it, rather than collapsing it out from under the read; spawned
+    // per-connection, so this never stalls the accept loop.
     conn.closed().await;
     Ok(())
 }
