@@ -53,14 +53,35 @@ impl<P: Provider + Clone> RateBoundsSink<P> {
     /// charge, and keeping the previous one is the only safe move.
     fn store_bounds(&self, floor: U256, source: &str) {
         let Ok(floor) = u64::try_from(floor) else {
-            tracing::warn!(
+            tracing::error!(
                 %floor,
                 source,
                 "rate-bounds watcher: on-chain delivery floor exceeds u64::MAX; \
-                 keeping current floor"
+                 keeping current floor — governance must lower it"
             );
             return;
         };
+        // Same bound the startup read enforces (`rate_bounds::on_chain_floor_to_u64`).
+        // Without it the value that refuses to boot is installed silently at
+        // runtime one event later: the node would raise every quote above the
+        // wire cap, so no peer could decode its responses and every voucher
+        // would revert at settlement — while it looked healthy locally. Keeping
+        // the previous floor is the lesser evil, but it is NOT safe: the node is
+        // now quoting under a floor the chain will not honour, so anything it
+        // serves accrues vouchers that revert at redemption. `error!` because an
+        // operator must escalate to governance, not because it is self-healing.
+        if floor > decdn_protocol::MAX_RATE_PER_MB {
+            tracing::error!(
+                floor,
+                max = decdn_protocol::MAX_RATE_PER_MB,
+                source,
+                "rate-bounds watcher: on-chain delivery floor exceeds the wire cap \
+                 MAX_RATE_PER_MB; keeping the previous floor, but this node is now \
+                 quoting under a floor the chain will not honour and its vouchers will \
+                 revert at settlement — governance must lower the floor"
+            );
+            return;
+        }
         self.bounds.store(floor);
         tracing::info!(floor, source, "delivery-rate floor updated from chain");
     }

@@ -145,11 +145,15 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: "rate_per_mb being clamped to governance bounds on {{ $labels.instance }}"
+          summary: "rate_per_mb being raised to the delivery floor on {{ $labels.instance }}"
           description: |
-            The configured rate_per_mb is outside the current governance
-            window and is being clamped before signing ProbeResponse.
-            Update operator config to within bounds.
+            The configured rate_per_mb sits BELOW the governance deliveryFloor,
+            so every quote is being raised to the floor before signing a
+            ProbeResponse or StreamResponse. The clamp is raise-only — there is
+            no governance ceiling — so this never lowers your rate; it means you
+            are not charging what you configured. Raise payment.rate_per_mb to
+            at least the on-chain floor (hot-reloadable via SIGHUP).
+            See adr/003-payments.md#rate-bounds-refresh.
 
       - alert: DecdnSlashEvidenceExposure
         expr: rate(decdn_slash_evidence_exposure_total[5m]) > 0

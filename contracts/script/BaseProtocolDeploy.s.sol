@@ -71,7 +71,7 @@ import { IPublisherRegistryOwnership } from "../src/interfaces/IPublisherRegistr
 ///                                         PROPOSER + CANCELLER roles to the
 ///                                         Governor.
 ///           4. `_wireCrossContractRoles` — peer role grants (slash-appeal driver,
-///                                          slash-appeal driver, blacklist ejector,
+///                                          blacklist ejector,
 ///                                          emergency multisig, PAUSER_ROLE on every
 ///                                          Pausable target,
 ///                                          router-caller → PaymentChannel,

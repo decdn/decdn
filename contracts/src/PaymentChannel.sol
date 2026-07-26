@@ -79,7 +79,9 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, SunsettingPausable, E
     ///      honest peer, and settlement would revert `RateFloorViolation` on
     ///      essentially every voucher — while the node's only local signal is a
     ///      clamp warning indistinguishable from a routine retune. Capping here
-    ///      is the one place that can make that state unrepresentable.
+    ///      makes that state unrepresentable at the source; the node also
+    ///      refuses to start against, and refuses to install, an over-cap floor
+    ///      (`crates/node/src/rate_bounds.rs`) for deployments predating this.
     uint256 internal constant MAX_RATE_PER_MB = 1_000_000_000_000;
 
     /// @dev 1 MB in bytes (binary MB, ADR 005 / `rate::BYTES_PER_MB`). Used to
@@ -87,7 +89,7 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, SunsettingPausable, E
     ///      floor enforced at settlement (`_advanceClaimWatermark`).
     uint256 internal constant BYTES_PER_MB = 1_048_576;
 
-    /// @dev Deployment default for the governable param ADR 016 § step 8 does
+    /// @dev Deployment default for the governable param ADR 016 § Contract Inventory does
     ///      not pass as a constructor arg. `minDeposit` = 1 USDC (6 decimals) —
     ///      the dust floor of ADR 003 § Deposit Economics.
     uint256 internal constant DEFAULT_MIN_DEPOSIT = 1_000_000;

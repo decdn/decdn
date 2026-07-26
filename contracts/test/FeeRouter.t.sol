@@ -48,19 +48,9 @@ contract FeeRouterTest is Test {
         usdc = new MockUSDC();
         bondEpoch = new MockBondEpoch(EPOCH);
 
-        // 6000 / 3000 / 1000 — ADR 026 steady-state default.
-        uint256[3] memory shares = [uint256(6000), uint256(3000), uint256(1000)];
-
-        router = new FeeRouter({
-            usdc_: usdc,
-            capacityBond_: bondEpoch,
-            treasury_: treasury,
-            epochLength_: EPOCH,
-            windowEpochs_: 13,
-            admin: admin,
-            initialShares: shares,
-            buybackBurner_: buyback
-        });
+        // Same construction the constructor-guard tests use, so the shared
+        // values (shares, windowEpochs) live in exactly one place.
+        router = _deployRouter(bondEpoch, EPOCH);
 
         vm.startPrank(admin);
         router.grantRole(router.ROUTER_CALLER_ROLE(), channel);
@@ -104,14 +94,25 @@ contract FeeRouterTest is Test {
         _deployRouter(mismatched, EPOCH);
     }
 
+    /// Passing `epochLength_ = 0` against a 7-day bond leaves BOTH guards live,
+    /// so this only proves the zero check is ordered first.
     function test_constructor_revertsOnZeroEpochLength() public {
         vm.expectRevert(FeeRouter.ZeroEpochLength.selector);
         _deployRouter(bondEpoch, 0);
     }
 
-    function test_constructor_acceptsMatchingEpochLength() public {
-        FeeRouter r = _deployRouter(bondEpoch, EPOCH);
-        assertEq(r.epochLength(), EPOCH);
+    /// The case the zero guard uniquely defends, and the one the test above
+    /// cannot reach: a misdeployed `CapacityBond` that itself reports `0`. The
+    /// mismatch check passes cleanly (0 == 0), so without `ZeroEpochLength` the
+    /// router deploys with `epochLength() == 0` and every downstream epoch
+    /// computation divides by zero.
+    function test_constructor_revertsOnZeroEpochLengthEvenWhenBondAgrees() public {
+        // Deploy the mock BEFORE `expectRevert`: a `new` in the argument list is
+        // itself a CREATE, and `expectRevert` latches onto the next call — it
+        // would target the mock's construction, which succeeds.
+        MockBondEpoch zeroBond = new MockBondEpoch(0);
+        vm.expectRevert(FeeRouter.ZeroEpochLength.selector);
+        _deployRouter(zeroBond, 0);
     }
 
     function test_routeSettlement_distributesThreeLegs() public {

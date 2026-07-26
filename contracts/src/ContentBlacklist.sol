@@ -96,8 +96,6 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     // forge-lint: disable-next-line(screaming-snake-case-immutable)
     ICapacityBondRegionView public immutable capacityBondRegion;
 
-    // forge-lint: disable-next-line(screaming-snake-case-immutable)
-
     /// @notice Grace between a standard or regional add and the moment the entry
     ///         becomes slashable (ADR 011 § Compliance Window). Stamped onto
     ///         `HashEntry.effectiveAt` at add time; changing it never moves the
@@ -584,7 +582,7 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     // -----------------------------------------------------------------
 
     /// @notice Bind `body` to `region` and grant it `REGIONAL_BODY_ROLE`
-    ///         (ADR 016 § Post-Deployment, step 8).
+    ///         (ADR 016 § Post-Deployment, step 6).
     /// @dev    Attempts the ADR 011 § Signer non-overlap check on-chain: the
     ///         emergency multisig can suspend this body's
     ///         entries, so a shared signer would grade their own homework. Where

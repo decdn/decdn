@@ -130,8 +130,6 @@ const NEW_FLOOR: u64 = 50;
 /// floor at its high-water mark instead of storing the newest value would pass
 /// unnoticed.
 const RELEASED_FLOOR: u64 = 1;
-/// The ADR 005 wire cap, mirrored on-chain as `PaymentChannel.MAX_RATE_PER_MB`.
-const MAX_RATE_PER_MB: u64 = 1_000_000_000_000;
 /// `NodeFixture::render_config`'s `[payment] rate_per_mb`.
 const CONFIGURED_RATE: u64 = 10;
 
@@ -352,11 +350,23 @@ async fn run() -> anyhow::Result<()> {
     // such a floor makes every response undecodable to every honest peer while
     // looking locally like a routine clamp. Test both ends of that gap — one
     // above the wire cap, and `u64::MAX` itself, which an earlier guard allowed.
+    //
+    // The bound comes from `decdn_protocol::MAX_RATE_PER_MB`, NOT a local
+    // literal: the Solidity constant is `internal` and must mirror the Rust one,
+    // and this is the only place that can turn a divergence between them into a
+    // test failure rather than a comment nobody re-reads.
+    simulate_set_rate_bounds(
+        &chain,
+        timelock,
+        U256::from(decdn_protocol::MAX_RATE_PER_MB),
+    )
+    .await
+    .context("the wire cap itself must be accepted — the guard is `>`, not `>=`")?;
     expect_revert::<_, PaymentChannelGov::RateBoundsInvalid>(
         simulate_set_rate_bounds(
             &chain,
             timelock,
-            U256::from(MAX_RATE_PER_MB) + U256::from(1),
+            U256::from(decdn_protocol::MAX_RATE_PER_MB) + U256::from(1),
         )
         .await,
         "setRateBounds above the MAX_RATE_PER_MB wire cap",

@@ -296,20 +296,32 @@ nodeId-indexed `NodeAutoEjected`. The node's staker-set watcher follows
 
 3. **If you believe the entry is wrong, escalate it — don't just keep serving.**
    There is no per-entry appeal contract; the entry comes off through the
-   ordinary removal path. For a **regional** entry, the issuing body can call
-   `removeHashRegional(region, hash)` itself — raise it with that body first,
-   since it is a single transaction with no vote. For a **global** entry, or a
-   regional body that will not act, the route is a DecdnGovernor
-   `removeHashGlobal` proposal through the standard timelock (~10 days). If the
-   body is systemically misbehaving rather than wrong about one entry, the
-   emergency multisig can `suspendRegionalBody(region)` — but be clear on what
-   that does and does not buy you: it stops that body issuing *further* entries,
-   pending governance ratification within 14 days. It is **not** a mass
-   retraction. Every entry the body already issued stays live, enforceable and
-   slashable (`_bodySuspended` gates writes only; it is not consulted by
-   `_isLive` or by `SlashJudge`). In all three cases you must keep the hash
-   evicted until the removal actually lands: the entry is enforceable, and
-   therefore slashable, right up to that point.
+   ordinary removal path, and **which path depends on the entry's scope.**
+
+   - **Global entry** (`region == GLOBAL`): a DecdnGovernor `removeHashGlobal`
+     proposal through the standard timelock (~10 days).
+   - **Regional entry**: only the registered body for that region can remove it.
+     `removeHashRegional` is `REGIONAL_BODY_ROLE`-gated *and* requires the
+     caller to be that region's currently-registered, unsuspended body — so
+     `removeHashGlobal` cannot reach it and neither can governance directly.
+     Raise it with the body: for them it is one transaction, no vote.
+   - **Regional entry, body will not act**: governance must replace the body —
+     `deregisterRegionalBody(region)` then `registerRegionalBody(region, …)`
+     with a body that will act, which then calls `removeHashRegional`. Two
+     governance actions, so budget more than one timelock cycle.
+
+   **Do not reach for `suspendRegionalBody` here.** It is the right tool for a
+   body that is issuing bad entries, and the wrong one for a body that will not
+   remove them: `_requireActiveBodyFor` gates `addHashRegional` **and**
+   `removeHashRegional`, so suspending closes the only route by which that
+   body's existing entries could come off. Suspension also retracts nothing —
+   every entry already issued stays live, enforceable and slashable, because
+   `_bodySuspended` is not consulted by `_isLive` or by `SlashJudge`. If a
+   suspension is already in place and you need an entry removed, governance must
+   first `unsuspendRegionalBody` or replace the body outright.
+
+   In every case, keep the hash evicted until the removal actually lands: the
+   entry is enforceable, and therefore slashable, right up to that point.
    Semantics:
    [ADR 011 § Removing a Wrongful Entry](../adr/011-content-takedown.md#removing-a-wrongful-entry).
 

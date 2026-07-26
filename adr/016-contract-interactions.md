@@ -594,7 +594,7 @@ The three FeeRouter shares (with bounds 40–90 / 5–50 / 0–30 and defaults 6
 #### Emergency Multisig (Production)
 
 - 3-of-5 threshold multisig
-- Can pause every `SunsettingPausable` contract (`pause()`) — that is, every fund-holding contract except `ContentBlacklist`, which is deliberately not pausable
+- Can pause every `SunsettingPausable` contract (`pause()`). `ContentBlacklist` is deliberately not pausable
 - Can add emergency blacklist entries (hashes and origins)
 - Can suspend regional governance bodies
 - **Cannot** withdraw treasury funds, modify fee parameters, or grant roles

@@ -303,16 +303,39 @@ const RETIRED_ENV_VARS: &[(&str, &str)] = &[(
 /// hard error: unlike a stale TOML key, an env var is often inherited from an
 /// orchestrator the operator does not directly control, and refusing to boot
 /// over one would be a worse failure than the silent ignore it replaces.
-fn warn_retired_env_vars() {
+///
+/// Writes to stderr rather than `tracing`, and that is load-bearing rather than
+/// a style choice: `resolve_config` runs *before* `init_tracing` in the daemon
+/// (`decdn-node`'s `commands::run`), so a `tracing::warn!` here has no global
+/// subscriber and is discarded — and `decdn` (the CLI, which reaches this via
+/// `config validate`) does not depend on `tracing` at all. Either way the
+/// warning would never reach the operator it exists for. The adjacent
+/// malformed-`RUST_LOG` notice uses `eprintln!` for exactly this reason.
+///
+/// Returns the names it warned about so callers (and tests) can assert on them.
+fn warn_retired_env_vars() -> Vec<&'static str> {
+    warn_retired_env_vars_with(|name| std::env::var_os(name).is_some())
+}
+
+/// [`warn_retired_env_vars`] with the environment lookup injected.
+///
+/// Split out purely for testability: `unsafe` is forbidden workspace-wide
+/// (`-F unsafe-code`) and `std::env::set_var` is `unsafe` since edition 2024,
+/// so a test cannot set a variable to observe the behaviour. Injecting the
+/// predicate exercises the "var is set" branch directly — the branch that was
+/// silently broken before.
+fn warn_retired_env_vars_with(is_set: impl Fn(&str) -> bool) -> Vec<&'static str> {
+    let mut warned = Vec::new();
     for (name, why) in RETIRED_ENV_VARS {
-        if std::env::var_os(name).is_some() {
-            tracing::warn!(
-                env_var = name,
-                "{name} is set but no longer does anything: {why}. Remove it from the \
-                 environment to silence this warning."
+        if is_set(name) {
+            eprintln!(
+                "warning: {name} is set but no longer does anything: {why}. Remove it from \
+                 the environment to silence this warning."
             );
+            warned.push(*name);
         }
     }
+    warned
 }
 
 /// Load config from file (if present) and merge with CLI args.
@@ -333,7 +356,7 @@ pub fn resolve_config(config_path: Option<&Path>, cli: &RunArgs) -> anyhow::Resu
     // operator sees every problem in a single pass.
     let file = load_file_config(config_path)?;
 
-    warn_retired_env_vars();
+    let _retired = warn_retired_env_vars();
 
     let mut bag = ConfigErrorBag::new();
 
@@ -4809,8 +4832,26 @@ swap_pool_address = \"0xPool\"
                 "{name} needs a reason operators can act on"
             );
         }
-        // Idempotent and side-effect-free when nothing is set.
-        warn_retired_env_vars();
+    }
+
+    /// The regression this guard exists for: the first implementation used
+    /// `tracing::warn!`, which `resolve_config` reaches *before* `init_tracing`
+    /// installs a subscriber — so it compiled, passed CI, and emitted nothing.
+    /// Asserting the returned names is what makes "it actually fired" testable
+    /// without a subscriber; the stderr text is a side effect of the same call.
+    ///
+    #[test]
+    fn retired_env_var_that_is_set_is_actually_reported() {
+        let warned = warn_retired_env_vars_with(|n| n == "DECDN_DELIVERY_CEILING");
+        assert_eq!(
+            warned,
+            vec!["DECDN_DELIVERY_CEILING"],
+            "a set retired var must be reported"
+        );
+        assert!(
+            warn_retired_env_vars_with(|_| false).is_empty(),
+            "nothing set => nothing reported"
+        );
     }
 
     #[test]

@@ -77,9 +77,86 @@ impl RateBounds {
     }
 }
 
+/// Narrow the on-chain `uint256` delivery floor to the `u64` the clamp uses,
+/// rejecting anything the node could not honour.
+///
+/// Two arms, both fail-closed, both unreachable against a correctly-deployed
+/// `PaymentChannel` (which caps the floor at `MAX_RATE_PER_MB` itself) — so
+/// reaching either means the deployment predates that cap, and the only remedy
+/// is a governance `setRateBounds`. Lives here as a free function rather than
+/// inline in bring-up so both arms are reachable from a unit test; inline they
+/// sat behind an async chain read that no fixture could drive to a bad value.
+///
+/// `addr` appears in both messages because an operator seeing this cannot fix it
+/// locally and needs to know which contract to point governance at.
+pub fn on_chain_floor_to_u64(raw: alloy::primitives::U256, addr: &str) -> anyhow::Result<u64> {
+    let floor = u64::try_from(raw).map_err(|_| {
+        anyhow::anyhow!(
+            "on-chain delivery floor {raw} at {addr} exceeds u64::MAX; refusing to start — \
+             governance must call setRateBounds with a value <= MAX_RATE_PER_MB ({})",
+            decdn_protocol::MAX_RATE_PER_MB
+        )
+    })?;
+    anyhow::ensure!(
+        floor <= decdn_protocol::MAX_RATE_PER_MB,
+        "on-chain delivery floor {floor} at {addr} exceeds the wire cap MAX_RATE_PER_MB ({}); \
+         every quote would be raised above what the wire schema carries, so no peer could \
+         decode this node's responses. Refusing to start — governance must lower the floor.",
+        decdn_protocol::MAX_RATE_PER_MB
+    );
+    Ok(floor)
+}
+
 #[cfg(test)]
 mod tests {
+    use alloy::primitives::U256;
+
     use super::*;
+
+    const ADDR: &str = "0xabc";
+
+    #[test]
+    fn on_chain_floor_accepts_up_to_the_wire_cap() -> anyhow::Result<()> {
+        assert_eq!(on_chain_floor_to_u64(U256::from(1u64), ADDR)?, 1);
+        let cap = decdn_protocol::MAX_RATE_PER_MB;
+        assert_eq!(
+            on_chain_floor_to_u64(U256::from(cap), ADDR)?,
+            cap,
+            "the cap itself must be accepted — the contract guard is `>`, not `>=`"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn on_chain_floor_rejects_above_the_wire_cap() -> anyhow::Result<()> {
+        let over = U256::from(decdn_protocol::MAX_RATE_PER_MB + 1);
+        let err = on_chain_floor_to_u64(over, ADDR)
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("a floor above the wire cap must refuse startup"))?
+            .to_string();
+        assert!(err.contains(ADDR), "must name the contract: {err}");
+        assert!(err.contains("MAX_RATE_PER_MB"), "must name the cap: {err}");
+        assert!(err.contains("governance"), "must name the remedy: {err}");
+        Ok(())
+    }
+
+    /// The `u64::try_from` arm. Distinct from the cap arm above: a value beyond
+    /// `u64::MAX` cannot even be narrowed, so it must be caught before the
+    /// comparison rather than wrapping into an in-range floor.
+    #[test]
+    fn on_chain_floor_rejects_above_u64_max() -> anyhow::Result<()> {
+        let over = U256::from(u64::MAX) + U256::from(1u64);
+        let err = on_chain_floor_to_u64(over, ADDR)
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("a floor beyond u64::MAX must refuse startup"))?
+            .to_string();
+        assert!(
+            err.contains("u64::MAX"),
+            "must say why it could not narrow: {err}"
+        );
+        assert!(err.contains(ADDR), "must name the contract: {err}");
+        Ok(())
+    }
 
     #[test]
     fn raise_to_floor_lifts_rate_and_reports_the_floor_it_used() {

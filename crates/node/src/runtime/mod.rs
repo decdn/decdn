@@ -996,26 +996,13 @@ async fn build_chain_and_handlers(
         let on_chain_floor = contract.getRateBounds().call().await.with_context(|| {
             format!("PaymentChannel.getRateBounds() startup read at {payment_channel_addr}")
         })?;
-        // Fail closed, and name both the contract and the remedy: an operator
-        // reading this cannot fix it locally — only a governance `setRateBounds`
-        // can. `PaymentChannel` caps the floor at `MAX_RATE_PER_MB`, so reaching
-        // either arm means the deployed contract predates that cap.
-        let floor = u64::try_from(on_chain_floor).map_err(|_| {
-            anyhow::anyhow!(
-                "on-chain delivery floor {on_chain_floor} at {payment_channel_addr} exceeds \
-                 u64::MAX; refusing to start — governance must call setRateBounds with a \
-                 value <= MAX_RATE_PER_MB ({})",
-                decdn_protocol::MAX_RATE_PER_MB
-            )
-        })?;
-        anyhow::ensure!(
-            floor <= decdn_protocol::MAX_RATE_PER_MB,
-            "on-chain delivery floor {floor} at {payment_channel_addr} exceeds the wire cap \
-             MAX_RATE_PER_MB ({}); every quote would be raised above what the wire schema \
-             carries, so no peer could decode this node's responses. Refusing to start — \
-             governance must lower the floor.",
-            decdn_protocol::MAX_RATE_PER_MB
-        );
+        // Both rejection arms live in `rate_bounds::on_chain_floor_to_u64` so a
+        // unit test can reach them; inline here they sat behind an async chain
+        // read no fixture could drive to a bad value.
+        let floor = crate::rate_bounds::on_chain_floor_to_u64(
+            on_chain_floor,
+            &payment_channel_addr.to_string(),
+        )?;
         rate_bounds.store(floor);
         tracing::info!(
             floor,
