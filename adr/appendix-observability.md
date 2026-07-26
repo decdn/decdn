@@ -100,9 +100,16 @@ These give early warning for the three slashable offenses in [ADR 026 § Slashin
 | `decdn_probe_collection_latency_seconds` | Histogram | M | — | Duration of a complete probe collection window, send to collection end, bounding the window in [ADR 001 § Probe response collection](001-network.md#probe-response-collection). Buckets: `[0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5]`. |
 | `decdn_probe_requests_total` | Counter | R | — | Probe requests served by this node, incremented once the response frame is written. The serve-side counterpart to `decdn_probe_responses_total` (which counts probes this node *sent* and got answers to). Flat while a node is reachable but unprobed; the first signal that a restarted or re-keyed node is being found again. |
 | `decdn_probe_responses_total` | Counter | R | `result={has_blob,no_blob,timeout}` | Probe responses received, by result. |
-| `decdn_probe_holds_disabled_total` | Counter | M | — | Probes answered `has_blob: false` for a *present* blob because the eviction-hold path is disabled by config (`max_probe_holds == 0`). An intentional operator decision, not budget pressure — split out from `decdn_probe_hold_violations_total` so a deliberate disable does not trip its "increase `max_probe_holds`" alert ([ADR 005](005-protocol.md#probe-triggered-eviction-hold)). |
 | `decdn_probe_cache_hits_total` | Counter | R | — | Cache-miss pulls whose candidate walk started from a live [ADR 001 § Probe cache](001-network.md#adr-001-network-topology-and-peer-mesh) entry. DHT lookup and probe fanout are skipped, unless every cached provider fails — the fetch then either falls through to a fresh lookup + probe (if attempt budget remains) or returns a clean miss (if the cached providers exhausted the budget first, the common case since an entry holds up to 10 providers but the budget is 3), and stays counted here either way (the hit measures "the cache had something worth trying", not delivery). With `decdn_probe_cache_misses_total` this is the hit ratio the TTL exists to buy (`probe_cache_ttl = PROBE_SLASH_WINDOW / 2`, [ADR 005 § Derived constants](005-protocol.md#adr-005-wire-protocol)); a ratio near zero means the TTL is shorter than the inter-arrival time for hot blobs and the cache is pure overhead. |
 | `decdn_probe_cache_misses_total` | Counter | R | — | Cache-miss pulls that ran a fresh DHT lookup + probe. Counts an entry that was absent, expired, **or fully suppressed** (every cached provider negative-cached, wedged, no longer an active staker, or otherwise unselectable) — all three cost the same network work, which is what this measures. |
+
+> The three probe-hold capacity counters — `decdn_probe_hold_violations_total`,
+> `decdn_probe_holds_disabled_total` and `decdn_probe_stake_lane_reserved_total` —
+> plus the `decdn_probe_hold_slots_used` / `_max` gauges live in
+> [§ Slash-Safety Metrics](#slash-safety-metrics-all-mandatory), not here. They
+> are grouped there deliberately, alongside the slash-evidence counters they sit
+> next to on an operator's dashboard. Documenting them twice is how the two
+> copies drifted apart.
 
 #### Payment Channel Metrics
 

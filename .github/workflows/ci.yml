@@ -604,11 +604,22 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
-      # In-process settlement e2e: spawns anvil + shells out to forge, then drives
-      # the PaymentChannelService settlement path against the live chain. Needs no
+      # In-process anvil e2e targets: each spawns anvil + shells out to forge,
+      # then drives real node code against the live chain — settlement through
+      # `PaymentChannelService`, bring-up through `runtime::run`. Neither needs a
       # daemon/CLI binary on disk (that's why the split can drop the bin build).
-      - name: Run on-chain settlement e2e
-        run: cargo nextest run -p decdn-node --features anvil-e2e --test anvil_settlement_e2e
+      #
+      # Both targets are named EXPLICITLY. A bare `-p decdn-node --features
+      # anvil-e2e` would drag the whole unit suite in behind the feature flag and
+      # duplicate the `test` job, but a single `--test` filter is how
+      # `anvil_bringup_shutdown_e2e` silently rotted: it was never built by any
+      # job, so it stopped compiling for three days without a red build and was
+      # even edited in that state. Any new `anvil_*` target must be added here.
+      - name: Run on-chain anvil e2e
+        run: |
+          cargo nextest run -p decdn-node --features anvil-e2e \
+            --test anvil_settlement_e2e \
+            --test anvil_bringup_shutdown_e2e
 
   anvil-e2e-journeys:
     name: anvil e2e (journeys)
