@@ -7,7 +7,7 @@ pragma solidity 0.8.28;
 ///         slash entrypoint, the NodeId-binding lookup used to confirm the
 ///         challenged address is a registered operator, and the unbonding-period
 ///         read for the paired `MAX_EVIDENCE_AGE_US < unbondingPeriod` invariant.
-///         Focused — mirroring `ICapacityBondReporter` / `ICapacityBondEjector`.
+///         Focused — mirroring `ICapacityBondEpoch` / `ICapacityBondEjector`.
 interface ICapacityBondSlasher {
     /// @notice Slash `operator`, escrowing the slashed TOKEN under `slashId` and
     ///         recording `challenger` for the 50% finality leg (escrow-on-slash,

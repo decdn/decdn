@@ -7,7 +7,7 @@ pragma solidity 0.8.28;
 ///         `PaymentChannel.openChannel` reads it to refuse channels against an
 ///         operator that is not a currently-bonded, active node; `OriginAssignment`
 ///         reads the same predicate for origin authorization. Kept focused —
-///         mirroring `ICapacityBondReporter` / `ICapacityBondEjector` — so
+///         mirroring `ICapacityBondEpoch` / `ICapacityBondEjector` — so
 ///         consumers link only the read they need.
 /// @dev    Returns `true` iff `operator` is registered with an active
 ///         (non-unbonding) bond at or above the tier minimum; `false` for

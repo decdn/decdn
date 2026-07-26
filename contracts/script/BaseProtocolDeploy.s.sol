@@ -31,7 +31,7 @@ import { IEd25519Verifier } from "../src/interfaces/IEd25519Verifier.sol";
 import { ISlashJudgeEvidenceView } from "../src/interfaces/ISlashJudgeEvidenceView.sol";
 import { ICapacityBond } from "../src/interfaces/ICapacityBond.sol";
 import { ICapacityBondEjector } from "../src/interfaces/ICapacityBondEjector.sol";
-import { ICapacityBondReporter } from "../src/interfaces/ICapacityBondReporter.sol";
+import { ICapacityBondEpoch } from "../src/interfaces/ICapacityBondEpoch.sol";
 import { ICapacityBondActivity } from "../src/interfaces/ICapacityBondActivity.sol";
 import { ICapacityBondSlasher } from "../src/interfaces/ICapacityBondSlasher.sol";
 import { IContentBlacklistHashView } from "../src/interfaces/IContentBlacklistHashView.sol";
@@ -416,7 +416,7 @@ abstract contract BaseProtocolDeploy is Script {
 
         d.router = new FeeRouter({
             usdc_: cfg.usdc,
-            capacityBond_: ICapacityBondReporter(address(d.bond)),
+            capacityBond_: ICapacityBondEpoch(address(d.bond)),
             treasury_: address(timelock),
             epochLength_: cfg.feeRouterEpochLength,
             windowEpochs_: cfg.feeRouterWindowEpochs,
@@ -490,8 +490,6 @@ abstract contract BaseProtocolDeploy is Script {
     // configure mutable state before the handoff puts every setter behind the
     // 48h Timelock.
     function _wireCrossContractRoles(DeployConfig memory cfg, Deployment memory d) internal {
-        // FeeRouter writes settlement state on CapacityBond.
-        d.bond.grantRole(d.bond.SETTLEMENT_REPORTER_ROLE(), address(d.router));
         // SlashAppeal drives the escrow-on-slash appeal hooks on CapacityBond
         // (markAppealOpen / settleAppealUpheld / settleAppealGranted) — ADR 028.
         d.bond.grantRole(d.bond.SLASH_APPEAL_ROLE(), address(d.slashAppeal));
@@ -635,7 +633,6 @@ abstract contract BaseProtocolDeploy is Script {
     // fails the deploy loudly instead of shipping a half-wired protocol.
     function _assertPeerRolesWired(DeployConfig memory cfg, Deployment memory d) internal view {
         // CapacityBond peer roles.
-        _requireRole(d.bond, d.bond.SETTLEMENT_REPORTER_ROLE(), address(d.router));
         _requireRole(d.bond, d.bond.SLASH_APPEAL_ROLE(), address(d.slashAppeal));
         _requireRole(d.bond, d.bond.BLACKLIST_ROLE(), address(d.blacklist));
         _requireRole(d.bond, d.bond.SLASH_ROLE(), address(d.slashJudge));

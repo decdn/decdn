@@ -7,7 +7,7 @@ import { IAccessControl } from "@openzeppelin/contracts/access/IAccessControl.so
 
 import { FeeRouter } from "../src/FeeRouter.sol";
 import { SunsettingPausable } from "../src/SunsettingPausable.sol";
-import { ICapacityBondReporter } from "../src/interfaces/ICapacityBondReporter.sol";
+import { ICapacityBondEpoch } from "../src/interfaces/ICapacityBondEpoch.sol";
 
 contract MockUSDC is ERC20 {
     constructor() ERC20("USDC", "USDC") {
@@ -19,20 +19,11 @@ contract MockUSDC is ERC20 {
     }
 }
 
-contract MockBondReporter is ICapacityBondReporter {
-    address[] public reported;
+contract MockBondEpoch is ICapacityBondEpoch {
     uint64 public epochLengthValue;
 
     constructor(uint64 epochLengthValue_) {
         epochLengthValue = epochLengthValue_;
-    }
-
-    function recordSettlement(address operator) external override {
-        reported.push(operator);
-    }
-
-    function reportedCount() external view returns (uint256) {
-        return reported.length;
     }
 
     function epochLength() external view override returns (uint64) {
@@ -42,7 +33,7 @@ contract MockBondReporter is ICapacityBondReporter {
 
 contract FeeRouterTest is Test {
     MockUSDC internal usdc;
-    MockBondReporter internal bondReporter;
+    MockBondEpoch internal bondEpoch;
     FeeRouter internal router;
 
     address internal admin = address(0xA11CE);
@@ -55,14 +46,14 @@ contract FeeRouterTest is Test {
 
     function setUp() public {
         usdc = new MockUSDC();
-        bondReporter = new MockBondReporter(EPOCH);
+        bondEpoch = new MockBondEpoch(EPOCH);
 
         // 6000 / 3000 / 1000 — ADR 026 steady-state default.
         uint256[3] memory shares = [uint256(6000), uint256(3000), uint256(1000)];
 
         router = new FeeRouter({
             usdc_: usdc,
-            capacityBond_: bondReporter,
+            capacityBond_: bondEpoch,
             treasury_: treasury,
             epochLength_: EPOCH,
             windowEpochs_: 13,
@@ -93,10 +84,6 @@ contract FeeRouterTest is Test {
         assertEq(usdc.balanceOf(operator), 600e6);
         assertEq(usdc.balanceOf(buyback), 300e6);
         assertEq(usdc.balanceOf(treasury), 100e6);
-
-        // Settlement reporter invoked.
-        assertEq(bondReporter.reportedCount(), 1);
-        assertEq(bondReporter.reported(0), operator);
     }
 
     function test_routeSettlement_incrementsBytesPerEpoch() public {

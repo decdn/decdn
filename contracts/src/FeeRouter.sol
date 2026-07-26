@@ -11,7 +11,7 @@ import { SafeCast } from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 import { Time } from "@openzeppelin/contracts/utils/types/Time.sol";
 
 import { IFeeRouter } from "./interfaces/IFeeRouter.sol";
-import { ICapacityBondReporter } from "./interfaces/ICapacityBondReporter.sol";
+import { ICapacityBondEpoch } from "./interfaces/ICapacityBondEpoch.sol";
 
 /// @title FeeRouter
 /// @notice Three-bucket settlement distributor + canonical served-bytes
@@ -71,9 +71,6 @@ contract FeeRouter is IFeeRouter, AccessControl, ReentrancyGuard, SunsettingPaus
     // forge-lint: disable-next-line(screaming-snake-case-immutable)
     IERC20 public immutable usdc;
 
-    // forge-lint: disable-next-line(screaming-snake-case-immutable)
-    ICapacityBondReporter public immutable capacityBond;
-
     /// @inheritdoc IFeeRouter
     /// @dev Immutable; changing it would shift every stored epoch index.
     // forge-lint: disable-next-line(screaming-snake-case-immutable)
@@ -132,7 +129,8 @@ contract FeeRouter is IFeeRouter, AccessControl, ReentrancyGuard, SunsettingPaus
     // -----------------------------------------------------------------
 
     /// @param usdc_              USDC token address.
-    /// @param capacityBond_      `CapacityBond` (settlement reporter sink).
+    /// @param capacityBond_      `CapacityBond`, read once in the constructor
+    ///                           to assert the epoch lengths agree. Not retained.
     /// @param treasury_          Treasury / `TimelockController` address.
     /// @param epochLength_       Constructor-immutable epoch length (1 week
     ///                           in production). Must be non-zero.
@@ -147,7 +145,7 @@ contract FeeRouter is IFeeRouter, AccessControl, ReentrancyGuard, SunsettingPaus
     ///                           iff `initialShares[BUCKET_BUYBACK] == 0`.
     constructor(
         IERC20 usdc_,
-        ICapacityBondReporter capacityBond_,
+        ICapacityBondEpoch capacityBond_,
         address treasury_,
         uint64 epochLength_,
         uint64 windowEpochs_,
@@ -166,7 +164,6 @@ contract FeeRouter is IFeeRouter, AccessControl, ReentrancyGuard, SunsettingPaus
         _enforceWindowBounds(windowEpochs_);
 
         usdc = usdc_;
-        capacityBond = capacityBond_;
         treasury = treasury_;
         epochLength = epochLength_;
         // Seed the checkpoint at clock()=now so any subsequent
@@ -228,8 +225,6 @@ contract FeeRouter is IFeeRouter, AccessControl, ReentrancyGuard, SunsettingPaus
         if (opShare != 0) usdc.safeTransfer(operator, opShare);
         if (buybackShare != 0) usdc.safeTransfer(buybackBurner, buybackShare);
         if (treasuryShare != 0) usdc.safeTransfer(treasury, treasuryShare);
-
-        capacityBond.recordSettlement(operator);
 
         emit Settled(operator, bytesDelivered, amount, epoch);
     }
