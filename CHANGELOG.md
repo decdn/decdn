@@ -23,6 +23,26 @@ since project inception and will roll into the first tagged release.
 
 ### Changed (BREAKING)
 
+- **Payment-channel funder and voucher signer are now separate roles.**
+  `openChannel` takes a third argument pinning the channel's `voucherSigner` —
+  the address every voucher signature is verified against, on all four
+  settlement paths (`closeChannel`, `disputeChannel`, `withdraw`,
+  `cooperativeClose`). It is fixed at open and has no setter. Passing the zero
+  address resolves it to `msg.sender`, so a funder that signs its own vouchers
+  keeps today's behaviour. `ch.client` keeps the funder role — it deposits and
+  tops up, receives the refund, owns the `channelId` nonce, and is the address
+  the ADR 011 compliance gates check — but its signature no longer authorizes
+  anything on its own.
+  - **ABI:** `openChannel(address,uint256)` →
+    `openChannel(address,uint256,address)`, so the **selector changes** and an
+    integrator built against the old ABI reverts on every open. `ChannelOpened`
+    gains a sixth parameter (`voucherSigner`), so **topic0 changes** — a log
+    subscriber still filtering the old event hash sees zero events and silently
+    registers no channels, which fails quietly rather than loudly. `getChannel`
+    returns a `Channel` tuple with `voucherSigner` inserted at index 3, so an
+    old-ABI consumer mis-decodes `provider`, `expiresAt`, `token`,
+    `disputeDeadline` and every field after them. All three must be upgraded in
+    lockstep with the deployment.
 - **Blacklist-entry appeals removed (#1432).** `ContentBlacklist` no longer
   carries a second appeal state machine on top of enforcement. The six appeal
   entry points (`openBlacklistAppeal`, `fastTrackBlacklistAppeal`,
@@ -299,6 +319,17 @@ since project inception and will roll into the first tagged release.
 
 ### Changed
 
+#### Contracts
+
+- **`closeChannel`'s voucher-less path now works at any watermark.** Calling it
+  with `amount == 0`, `nonce == 0`, `bytesDelivered == 0` and an empty signature
+  skips voucher verification and closes at the recorded `claimed*`; the extra
+  `claimedNonce == 0` condition that restricted it to channels no `withdraw` had
+  ever touched is gone. The safety argument is unchanged — the path advances no
+  watermark — and the old condition only forced a party with no newer voucher to
+  wait for `expiresAt`. Observable change for anyone who built around the old
+  revert: the call now succeeds where it used to fail.
+
 #### Documentation
 
 - **Safe-as-recommended-wallet and the node-side off-chain ERC-1271 path are
@@ -445,6 +476,15 @@ since project inception and will roll into the first tagged release.
   ownership only; no steady-state behavior change.
 
 ### Added
+
+#### Contracts
+
+- `PaymentChannel.closeChannelWithoutVoucher(bytes32)` — a named entry point for
+  the voucher-less close, callable by either party. It takes the same path as
+  `closeChannel` with all-zero arguments and an empty signature: no signature
+  check, no watermark advance, the channel enters `Closing` at its recorded
+  `claimed*` and emits the same `ChannelCloseInitiated`. Purely additive; the
+  all-zero `closeChannel` spelling still works.
 
 #### Node runtime & wire protocol
 
