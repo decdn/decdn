@@ -6531,6 +6531,7 @@ async fn node_origin_persist_failure_still_delivers_and_is_counted() -> Result<(
 // ---------------------------------------------------------------------------
 
 /// What a `leaf_paced_pull` observed.
+#[derive(Debug)]
 struct LeafOutcome {
     received: u64,
     acks: u64,
@@ -6746,10 +6747,11 @@ async fn build_node_b(
         hash,
         ab_channel_id,
         b_buyer,
-        &[(leaf_channel_id, leaf_eth_addr, leaf_deposit)],
+        &[(leaf_channel_id, leaf_eth_addr, leaf_eth_addr, leaf_deposit)],
         max_blob_size_bytes,
         64,
         leech_caps,
+        None,
     )
     .await
 }
@@ -6765,6 +6767,15 @@ async fn build_node_b(
 /// leaving the handler cap permissive lets a test force `tee.finish()` to reject
 /// the promote on an otherwise-successful delivery (#896). Most callers pass the
 /// default `64`.
+///
+/// Each leaf is `(channel_id, funder, voucher_signer, deposit)`. The two address
+/// legs are distinct on purpose: an on-chain `openChannel` may pin a delegate
+/// `voucher_signer` that is not the funder, and the ADR 011 compliance gates key
+/// on the FUNDER. Passing the same address twice is the undelegated default.
+///
+/// `content_deny` wires B's ADR 011 deny-set. `None` means "deny nothing" (the
+/// steady state for every other caller); a shared `Arc` lets a test flip an entry
+/// on mid-stream.
 #[allow(clippy::too_many_arguments)]
 async fn build_node_b_with_leaves(
     a_id: iroh::PublicKey,
@@ -6773,13 +6784,14 @@ async fn build_node_b_with_leaves(
     hash: Hash,
     ab_channel_id: B256,
     b_buyer: &Arc<PrivateKeySigner>,
-    leaves: &[(B256, Address, U256)],
+    leaves: &[(B256, Address, Address, U256)],
     max_blob_size_bytes: u64,
     engine_max_blob_mb: u64,
     // Seed-leech caps to enable the governor on node B; the governor is built
     // over B's own `Metrics` (so leech counters land where tests assert them) and
     // returned so a test can pre-exhaust it before serving (#1254).
     leech_caps: Option<LeechCaps>,
+    content_deny: Option<Arc<decdn_node::content_deny::ContentDenylist>>,
 ) -> Result<(
     Arc<decdn_node::handlers::client::ClientHandler>,
     EndpointAddr,
@@ -6829,11 +6841,11 @@ async fn build_node_b_with_leaves(
     // engine's open store anyway).
     std::mem::forget(cache_tmp);
     let store_b = Arc::new(MemoryChannelStateStore::new());
-    for (leaf_channel_id, leaf_eth_addr, leaf_deposit) in leaves {
+    for (leaf_channel_id, leaf_funder, leaf_voucher_signer, leaf_deposit) in leaves {
         store_b.record(&ChannelState::new(
             *leaf_channel_id,
-            *leaf_eth_addr,
-            *leaf_eth_addr,
+            *leaf_funder,
+            *leaf_voucher_signer,
             TOKEN,
             *leaf_deposit,
         ))?;
@@ -6869,6 +6881,9 @@ async fn build_node_b_with_leaves(
                 decdn_cache::Bytes::new(decdn_common::config::DEFAULT_PULL_AHEAD_BYTES),
             );
             deps.leech_governor = leech_governor;
+            if let Some(deny) = content_deny {
+                deps.content_deny = deny;
+            }
         },
     )?;
 
@@ -7043,6 +7058,117 @@ async fn window_pull_through_serves_and_caches_full_blob() -> Result<()> {
     Ok(())
 }
 
+/// COMPLIANCE REGRESSION GUARD (ADR 011 §On Blacklist Event), WINDOW half.
+///
+/// `client_loopback.rs`'s `blacklisting_the_funder_mid_stream_cuts_off_a_
+/// delegated_delivery` pins the same property on the buffered `delivery.rs`
+/// path, but it structurally cannot reach this one: its harness wires no
+/// `pull_through_origin`, and `serve_via_window_pull_through` is only entered
+/// when that provider is `Some`. So the window loop's per-interval re-check —
+/// which reads the funder ONCE at the top of the serve and re-consults it after
+/// every accepted voucher — was guarded by a comment and nothing else.
+///
+/// Here the leaf's channel is funded by one address and signed by a DIFFERENT,
+/// never-blacklisted delegate. Nothing is denied at open time, so the request is
+/// admitted, B starts fusing the upstream pull with downstream delivery, and only
+/// then does the FUNDER go on the deny-set. If the re-check were re-keyed onto
+/// `voucher_signer`, the clean delegate would launder the blacklisted funder and
+/// the 12 MiB delivery would run to completion — which is what this test fails on.
+#[tokio::test(flavor = "multi_thread")]
+async fn window_pull_through_funder_blacklisted_mid_stream_cuts_off_a_delegated_delivery()
+-> Result<()> {
+    // Many 1-MiB voucher intervals, so plenty of re-check boundaries remain
+    // after the deny-set flip lands. Kept under node A's 16 MiB engine cap.
+    let payload = vec![0x6Bu8; 12 * 1024 * 1024];
+    let hash = Hash::new(&payload);
+
+    let ab_channel_id = B256::repeat_byte(0xA7);
+    let b_buyer = Arc::new(PrivateKeySigner::random());
+    let (a_id, a_addr, a_eth, ep_a, task_a) =
+        spawn_node_a(&payload, ab_channel_id, b_buyer.address()).await?;
+
+    // The leaf funds with `leaf_funder` but signs every voucher (and its client
+    // binding) with `leaf_delegate` — the split this test exists to police.
+    let leaf_funder = Arc::new(PrivateKeySigner::random());
+    let leaf_delegate = Arc::new(PrivateKeySigner::random());
+    let leaf_channel_id = B256::repeat_byte(0x2F);
+    // Starts empty: the open-time gates (`dispatch.rs`, `pull_authorized`) must
+    // admit the request, so the cut-off can only come from the mid-stream check.
+    let deny = Arc::new(decdn_node::content_deny::ContentDenylist::empty());
+    let (handler_b, b_target, ep_b, _recorded, _cache_b, b_metrics, _local_rep, _leech_gov) =
+        build_node_b_with_leaves(
+            a_id,
+            a_addr,
+            a_eth.address(),
+            hash,
+            ab_channel_id,
+            &b_buyer,
+            &[(
+                leaf_channel_id,
+                leaf_funder.address(),
+                leaf_delegate.address(),
+                U256::from(DEPOSIT_MICRO_USDC),
+            )],
+            0,
+            64,
+            None,
+            Some(Arc::clone(&deny)),
+        )
+        .await?;
+    let task_b = spawn_server(ep_b.clone(), handler_b);
+
+    let leaf_sk = fresh_key();
+    let leaf_node_id = B256::from(*leaf_sk.public().as_bytes());
+    let (leaf_ep, _) = local_endpoint(leaf_sk, vec![]).await?;
+    let pull_ep = leaf_ep.clone();
+    let leaf_signer = Arc::clone(&leaf_delegate);
+    let leaf = tokio::spawn(async move {
+        leaf_paced_pull(
+            &pull_ep,
+            b_target,
+            leaf_node_id,
+            &leaf_signer,
+            leaf_channel_id,
+            hash,
+            RATE,
+            None,
+        )
+        .await
+    });
+
+    // Wait until the window loop is demonstrably running: the pause counter only
+    // ticks inside it, past the funder read at the top of the serve. Flipping the
+    // deny-set before this would race the open-time gates and prove nothing.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while counter_value(&b_metrics, "node_pull_through_window_paused_total")? == 0 {
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "the window pull-through loop never engaged; the test never reached the \
+             mid-stream re-check"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    // Only the FUNDER is blacklisted; the delegate signer stays clean.
+    deny.apply_chain_origin(leaf_funder.address(), true);
+
+    let outcome = tokio::time::timeout(Duration::from_secs(45), leaf)
+        .await
+        .map_err(|_| anyhow::anyhow!("the leaf pull never returned"))??;
+    anyhow::ensure!(
+        outcome.is_err(),
+        "delivery completed for a blacklisted funder — the window loop's mid-stream \
+         re-check has been re-keyed onto the voucher signer: {outcome:?}"
+    );
+    assert_counter(&b_metrics, "serve_stream_terminated_takedown_total", 1)?;
+
+    leaf_ep.close().await;
+    ep_b.close().await;
+    ep_a.close().await;
+    task_a.await?;
+    task_b.await?;
+    Ok(())
+}
+
 /// #1054: an empty (0-byte) blob served via the fused window pull-through path.
 /// This exercises the progressive/tee triangle — `open_progressive_pull` →
 /// `UpstreamPull::finish` → tee promote → downstream `leaf_paced_pull` verify —
@@ -7172,16 +7298,19 @@ async fn window_pull_through_concurrent_same_hash_single_upstream_pull() -> Resu
                 (
                     leaf1_channel_id,
                     leaf1_eth.address(),
+                    leaf1_eth.address(),
                     U256::from(DEPOSIT_MICRO_USDC),
                 ),
                 (
                     leaf2_channel_id,
+                    leaf2_eth.address(),
                     leaf2_eth.address(),
                     U256::from(DEPOSIT_MICRO_USDC),
                 ),
             ],
             0,
             64,
+            None,
             None,
         )
         .await?;
@@ -8143,10 +8272,12 @@ async fn window_pull_through_tee_finalize_failure_serves_but_does_not_cache() ->
             &[(
                 leaf_channel_id,
                 leaf_eth.address(),
+                leaf_eth.address(),
                 U256::from(DEPOSIT_MICRO_USDC),
             )],
             0, // handler cap: unlimited, so the serve proceeds and `pull.finish()` is Ok
             1, // engine cap: 1 MiB = total - 1, so `tee.finish()` rejects the promote
+            None,
             None,
         )
         .await?;
