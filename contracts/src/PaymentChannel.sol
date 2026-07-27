@@ -625,12 +625,13 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, SunsettingPausable, E
     ///      stranded — the caller retries post-unpause or falls back to the
     ///      `closeChannel` path. So no defer branch (and no deferred-settlement
     ///      bookkeeping) is warranted.
-    /// @dev The pinned `voucherSigner` may call this. It cannot do so alone — the call
-    ///      also requires `providerCloseSig`, verified against `ch.provider` — but a
-    ///      compromised hot signing key combined with a provider waiver can force
-    ///      settlement at the current watermark. This is bounded — it redirects no funds,
-    ///      since the refund still pays `ch.client` and the settlement still pays
-    ///      `ch.provider` — but it is not zero authority.
+    /// @dev The pinned `voucherSigner` may call this. Being a permitted caller confers no
+    ///      authority beyond holding the two signatures: both are verified independently
+    ///      of `msg.sender`, so whoever assembles a voucher and a matching provider waiver
+    ///      can already have the provider — which holds the voucher and signs its own
+    ///      waiver — submit the same call. Widening the party check only moves who pays
+    ///      the gas. The signer's real power is the one the pin makes legible: its
+    ///      signature is what authorizes vouchers at all, up to `deposit`.
     /// @dev The signer is deliberately NOT a party to the other lifecycle entry points:
     ///      `closeChannel` and `closeChannelWithoutVoucher` remain open to either the
     ///      client or the provider; `topUp` remains client-only (see `topUp`'s caller
@@ -932,22 +933,26 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, SunsettingPausable, E
         }
     }
 
-    /// @dev Verify a client EIP-712 voucher signature (EOA or ERC-1271) over the
+    /// @dev Verify an EIP-712 voucher signature (EOA or ERC-1271) over the
     ///      canonical typed data. `token` is pinned to `usdc` — vouchers for a
     ///      different token never validate.
+    /// @param signer The address the signature must recover to. Every call site passes
+    ///        `ch.voucherSigner`, never `ch.client`: the funder role authorizes nothing
+    ///        by signature, so recovering against it here would accept vouchers the
+    ///        channel never delegated (and reject the ones it did).
     function _verifyVoucher(
         bytes32 channelId,
         uint256 amount,
         uint256 nonce,
         uint256 bytesDelivered,
-        address client,
+        address signer,
         bytes calldata signature
     ) internal view {
         bytes32 structHash = keccak256(
             abi.encode(VOUCHER_TYPEHASH, channelId, amount, nonce, bytesDelivered, address(usdc))
         );
         bytes32 digest = _hashTypedDataV4(structHash);
-        if (!SignatureChecker.isValidSignatureNow(client, digest, signature)) revert InvalidVoucherSignature();
+        if (!SignatureChecker.isValidSignatureNow(signer, digest, signature)) revert InvalidVoucherSignature();
     }
 
     /// @dev Verify the provider's EIP-712 cooperative-close waiver (EOA or
