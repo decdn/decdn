@@ -39,8 +39,8 @@ interface IContentBlacklist {
     // Regional governance path — REGIONAL_BODY_ROLE, callable only by a
     // registered regional body. Both revert on the global sentinel, so a
     // regional body can never reach a global entry.
-    function addHashRegional(string calldata region, bytes32 blake3Hash, string calldata reason) external;
-    function removeHashRegional(string calldata region, bytes32 blake3Hash) external;
+    function addHashRegional(bytes32 region, bytes32 blake3Hash, string calldata reason) external;
+    function removeHashRegional(bytes32 region, bytes32 blake3Hash) external;
 
     // Operator blacklisting — global governance only
     function addOperator(address operator) external;
@@ -68,7 +68,7 @@ interface IContentBlacklist {
 
     // Emergency entries expire after their category-specific deadline unless ratified by governance.
     // Expiry is derived from the entry's addedAt timestamp: addedAt + expiryForCategory(category).
-    // isBlacklisted returns false after this deadline unless a governance addHashGlobal
+    // isHashBlacklisted* views return false after this deadline unless a governance addHashGlobal
     // has been called for the same hash — re-adding under governance clears the
     // `emergency` flag, which is what makes the entry permanent.
     //
@@ -100,10 +100,18 @@ interface IContentBlacklist {
     function unsuspendRegionalBody(bytes32 region) external;
 
     // Views
-    function isBlacklisted(bytes32 blake3Hash) external view returns (bool);
-    function isBlacklistedInRegion(bytes32 blake3Hash, string calldata region) external view returns (bool);
+    // The three hash views answer progressively wider scopes: global only,
+    // global ∪ one named region, and the full per-operator predicate of
+    // § Regional Scope (global ∪ current region ∪ previous region while a region
+    // change is unripened), which reads the operator's region fields from
+    // CapacityBond. The per-operator view is the serve-time counterpart of the
+    // slash-eligibility gate in ADR 014 § Blacklist violation — same three legs,
+    // evaluated at block.timestamp rather than at a served response.
+    function isHashBlacklisted(bytes32 blake3Hash) external view returns (bool);
+    function isHashBlacklistedInRegion(bytes32 blake3Hash, bytes32 region) external view returns (bool);
+    function isHashBlacklistedForOperator(bytes32 blake3Hash, address operator) external view returns (bool);
     function isOriginBlacklisted(address operatorAddress) external view returns (bool);
-    function getEntry(bytes32 blake3Hash) external view returns (BlacklistEntry memory);
+    function getHashEntry(bytes32 region, bytes32 blake3Hash) external view returns (BlacklistEntry memory);
     function getBlacklistVersion() external view returns (uint256);
 
     // Events. `version` is the getBlacklistVersion() value AFTER the change, so a
@@ -127,7 +135,7 @@ struct BlacklistEntry {
                               // Stamped, never derived: a later governance change
                               // to the window must not move the slash boundary
                               // under deliveries already served.
-    string  region;           // ISO 3166-1 alpha-2, or "" for global
+    bytes32 region;           // packed region key; bytes32("GLOBAL") for global
     string  reason;           // free-form, e.g. "DMCA-2026-001", "CSAM", "DSA-DE-001"
     bool    emergency;        // true if added via emergency multisig path
     uint8   category;         // Category; determines the emergency auto-expiry term.
@@ -135,7 +143,11 @@ struct BlacklistEntry {
 }
 ```
 
-> **Region representation.** The `region` field is **stored as `bytes2`** — ISO 3166-1 alpha-2 codes are always exactly 2 ASCII characters, with `bytes2(0)` as the global sentinel. The `string` form shown in the interface signatures, events, and the `BlacklistEntry` struct above is the external-boundary representation only; it is canonicalized to `bytes2` for storage (a `_toBytes2(string)` helper reverts on length ≠ 2 or non-ASCII-alpha input). The `BlacklistEntry` layout is the struct above.
+> **Region representation.** `region` is **`bytes32` at every layer** — the external signatures, the events, the mapping keys, and the `BlacklistEntry` struct above. There is no `string` boundary form and no canonicalization step: callers pass the packed key directly, so the value written by a regional body is byte-identical to the one a scope check reads back.
+>
+> A region key is the region string packed left-aligned and zero-padded into `bytes32`, matching Solidity's own `bytes32("literal")` packing. Two sentinels are reserved: `bytes32("GLOBAL")` marks a global entry, and `bytes32(0)` is *unset* — never a valid region. `addHashRegional`, `removeHashRegional`, and `registerRegionalBody` all reject both sentinels, so a regional body can neither reach a global entry nor write against an unset key.
+>
+> `bytes32` rather than a narrower `bytes2` — the key must be comparable against the value scope matching reads, which is the operator's **on-chain `regionHint`**, and `CapacityBond` caps that field at 16 bytes, not 2 (`MAX_REGION_HINT_BYTES`; [ADR 014 § Blacklist violation](014-on-chain-verification.md#blacklist-violation) is where the slash path performs the comparison). Gossip separately constrains the *gossiped* region to an ISO 3166-1 alpha-2 code, but that is a different field on a different layer — the on-chain `regionHint` the scope check reads is not gossip-validated, so a two-byte entry key could not represent every region the registry admits. A `bytes32` key is also topic-native, which is what lets `HashBlacklisted` / `HashRemoved` index `region` directly. The `BlacklistEntry` layout is the struct above.
 
 ### Blacklist version
 
@@ -149,7 +161,7 @@ Free-form string, stored on-chain for auditability. Operators can reference lega
 
 ### `region` field
 
-Empty string means the entry applies globally. An ISO 3166-1 alpha-2 code scopes the entry to nodes that declare that region. A node is in scope if its declared region matches the entry's region or the entry is global.
+`bytes32("GLOBAL")` means the entry applies to every node. Any other key scopes the entry to nodes that declare that region — an ISO 3166-1 alpha-2 code in the ordinary case, though the key is packed from the operator's on-chain `regionHint`, which `CapacityBond` caps at 16 bytes. A node is in scope if the entry is global, if its declared region matches the entry's region, or — while a region change has not yet ripened — if its previous region matches (see [§ Regional Scope](#regional-scope)).
 
 ## Regional Governance Bodies
 
@@ -375,11 +387,11 @@ If a node has been offline or missed multiple version bumps, delta fetching may 
 
 1. If the gap between `last_seen_version` and `current_version` is ≤ 100 versions: fetch deltas normally via contract events.
 2. If the gap exceeds 100 versions (or the delta fetch fails): perform a full re-sync by calling `getBlacklistVersion()` and iterating all events from the contract's deployment block. This is expensive but correct.
-3. As a fallback, if the full event log is unavailable (RPC provider pruned old events): the node fetches the current blacklist state by calling `isBlacklisted` for all hashes in its local cache. This is O(cache_size) RPC calls but ensures no stale content is served.
+3. As a fallback, if the full event log is unavailable (RPC provider pruned old events): the node fetches the current blacklist state by calling `isHashBlacklistedForOperator(hash, ownOperatorAddress)` for all hashes in its local cache. This is O(cache_size) RPC calls but ensures no stale content is served. The per-operator view is the right one here — it resolves the node's full scope (global, current region, and an unripened previous region) in a single call, where `isHashBlacklisted` would see only global entries.
 
 The node MUST NOT accept connections until its blacklist is synced to the current version.
 
-**Pre-cache check:** Before caching any newly-fetched blob (whether from origin pull-through or peer pull), the node MUST check `isBlacklisted(hash)` and reject the blob if blacklisted. This enables proactive blacklisting of known-bad hashes before any node caches them.
+**Pre-cache check:** Before caching any newly-fetched blob (whether from origin pull-through or peer pull), the node MUST check `isHashBlacklistedForOperator(hash, ownOperatorAddress)` and reject the blob if blacklisted. This enables proactive blacklisting of known-bad hashes before any node caches them, and resolves the node's own regional scope rather than global entries alone.
 
 On startup, nodes always fetch the full current blacklist (global + their region) before accepting connections.
 
