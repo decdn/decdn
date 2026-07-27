@@ -142,6 +142,12 @@ impl ClientHandler {
                 // channel funded by a blacklisted address, even when a clean
                 // delegate key is doing the signing. The `is_origin_denied`
                 // early return above covers the blacklisted *signer* case.
+                //
+                // Unreachable by construction today: every `pull_authorized`
+                // call site sits below the `dispatch.rs` funder gate, which
+                // already refuses a blacklisted funder. It stays as a backstop
+                // so a future caller wired in *above* that gate cannot spend
+                // upstream USDC on a blacklisted funder.
                 !self.content_deny.is_origin_denied(&state.client)
             }
             None => false,

@@ -206,8 +206,8 @@ const fn blacklist_key(region: [u8; 32], hash: [u8; 32]) -> [u8; 64] {
 /// additive trailing segments, in that order. The signer segment MUST stay
 /// last: being untagged and fixed-width, it is indistinguishable from any
 /// other >= 20-byte trailer at that position (see `decode_record`'s
-/// signer-segment gate) —
-/// any future additive segment has to be appended after it, not before.
+/// signer-segment gate), so any future additive segment has to be appended
+/// after it, not before.
 #[derive(Debug, Serialize, Deserialize)]
 struct StoredChannelState {
     schema_version: u32,
