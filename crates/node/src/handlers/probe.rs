@@ -22,7 +22,7 @@ use crate::dht::routing::NodeId;
 use crate::dht::staker_set::StakerSet;
 use crate::dispatch::{ConnectionLimiter, RejectReason};
 use crate::handlers::probe_rate_limit::{ProbeRateLimiter, ProbeRejectLayer};
-use crate::metrics::Metrics;
+use crate::metrics::{Metrics, ProbeHoldUnavailableReason};
 
 // Server-side timeouts. Each ceiling exists so a single peer cannot pin a
 // handler task indefinitely by stalling at one of the protocol's ordered
@@ -342,7 +342,8 @@ impl ProbeHandler {
             // non-guaranteed hold must never risk a phantom slash — ADR
             // 005) and count the reservation distinctly from genuine
             // budget exhaustion / config disable (#757).
-            self.metrics.probe_stake_lane_reserved();
+            self.metrics
+                .probe_hold_unavailable(ProbeHoldUnavailableReason::StakeLaneReserved);
             tracing::debug!(
                 hash = %hash,
                 "probe hold refused: stake-lane reservation (end-client under \
@@ -364,9 +365,10 @@ impl ProbeHandler {
                     // Present but un-holdable because every hold slot is live: an
                     // availability degradation under genuine load, never a safety
                     // fault (ADR 005 §Hold budget). The actionable remedy is to
-                    // raise `max_probe_holds`, so this is the counter that drives
+                    // raise `max_probe_holds`, so this is the reason that drives
                     // that alert (#739).
-                    self.metrics.probe_hold_violation();
+                    self.metrics
+                        .probe_hold_unavailable(ProbeHoldUnavailableReason::Exhausted);
                     // Don't log `probe_hold_slots_used()` here: it re-acquires the
                     // `probe_holds` lock and sweeps, and on this hot refusal path
                     // the value is a foregone ~`max` anyway. The gauge is published
@@ -382,7 +384,8 @@ impl ProbeHandler {
                     // (`max_probe_holds == 0`). Counted separately from budget
                     // pressure (#739) so an intentional disable does not trip the
                     // "increase max_probe_holds" alert.
-                    self.metrics.probe_holds_disabled();
+                    self.metrics
+                        .probe_hold_unavailable(ProbeHoldUnavailableReason::Disabled);
                     tracing::debug!(
                         hash = %hash,
                         "probe hold refused: holds disabled (max_probe_holds=0); signing has_blob:false"

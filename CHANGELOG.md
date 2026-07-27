@@ -163,7 +163,8 @@ since project inception and will roll into the first tagged release.
   rate_per_mb, timestamp_us }, total_bytes: Option<u64>, slash_sig }`
   (was `{ nonce, measured_at_unix_ms, node_id, rate_per_mb }`).
   `slash_sig` is a mandatory, non-empty EIP-712 secp256k1 signature
-  (65-byte EOA `r‖s‖v` form in the PoC, ADR 024 §18); requesters reject
+  (65-byte EOA `r‖s‖v` form in the PoC, ADR 024 §Off-Chain ERC-1271
+  Verification); requesters reject
   missing/zero-length or wrong-length signatures.
   - **CLI** `decdn probe` now requires `--hash <BLAKE3>` (64 hex
     chars, the `cache.pinned_hashes` form). `--json` keys changed:
@@ -298,7 +299,87 @@ since project inception and will roll into the first tagged release.
 
 ### Changed
 
+#### Documentation
+
+- **Safe-as-recommended-wallet and the node-side off-chain ERC-1271 path are
+  dropped from the PoC surface (#1431).** ADR 024 keeps the piece that shipped
+  — OpenZeppelin `SignatureChecker` at every on-chain verification site — and
+  stops recommending a wallet. The encrypted EOA keystore is now the documented
+  default for node operators and clients; a Safe, or any other ERC-1271 smart
+  account, stays **supported** on the on-chain paths precisely because
+  `SignatureChecker` is retained, but deCDN neither recommends one nor commits
+  to tooling for one. By ADR 024's own words a 1-of-1 Safe carries "the same
+  trust posture as today's `eth_keystore`", and the multi-owner threshold that
+  would buy real security cannot be reached at `slash_sig` wire speed — so the
+  recommendation delivered nothing the retained contract-level piece does not
+  already enable, at the cost of a Safe-deployment step on every operator's
+  critical path. The node-side off-chain ERC-1271 verifier (an address-code
+  probe plus an `isValidSignature` RPC per client connection, behind a code
+  cache) is relabelled from a PoC deliverable to Production-deferred, which is
+  what the Rust has said all along. The Production session-key design
+  (Safe-7579 + `erc7579/smartsessions`) is untouched and remains the answer to
+  hot-path multisig and to smart-account clients.
+  - **Contracts:** unchanged. `SignatureChecker` stays wired in
+    `PaymentChannel` (voucher + provider waiver), `CapacityBond`
+    (`registerNode` / `bindNodeId`), `SlashJudge` (phantom / rate / blacklist
+    evidence), and `DecdnGovernor` (EIP-712 delegation); the
+    `MockERC1271Wallet` fixtures and ERC-1271 branch tests stay with them. No
+    ABI, deploy, or bytecode change. This is the insurance against a
+    coordinated on-chain retrofit and is exactly why deferring the node-side
+    path is cheap.
+  - **Node:** no code removed — the off-chain ERC-1271 path was never built.
+    `bind_sig::verify_binding`, voucher and `slash_sig` verification, and the
+    65-byte length checks are unchanged. Only the deferral comments move to a
+    stable citation: the `ADR 024 §18` **line**-number references in
+    `crates/protocol` become `ADR 024 §Off-Chain ERC-1271 Verification`, the
+    heading `crates/incentive` already cited, so a reworded ADR can no longer
+    silently rot them.
+  - **Config / CLI:** nothing removed. There is no Safe, smart-account, or
+    wallet-type config surface, and `decdn setup` never grew the Safe-creation
+    flow ADR 024 § Consequences promised — dropping that obligation retires an
+    unmet promise rather than deleting a feature.
+  - **Newly documented constraint:** a Safe-addressed *node operator* cannot
+    serve traffic today. Requesters verify `slash_sig` off-chain by recovery
+    against the registered address, and a Safe owner-key signature recovers to
+    the owner, not the Safe. ADR 024 § Node Operators and
+    `appendix-operator-key-rotation.md` now state this; the appendix's EOA →
+    Safe migration is retained in full but is *optional* rather than
+    *recommended*.
+  - ADR 024 keeps its number and title — Safe is still supported. § Safe as
+    Recommended Wallet becomes § Wallet Support — EOA Default, Safe Supported;
+    § Off-Chain ERC-1271 Verification keeps its heading and both inbound
+    anchors but loses its `alloy` implementation sketch and now reads as
+    Production-deferred; § Session Keys is unchanged. ADR 003 § Smart Account
+    Support and § Off-Chain (Ephemeral) Binding, ADR 012 § Ethereum Key and
+    § Identity Lifecycle, ADR 019, `appendix-operator-key-rotation.md`, and
+    `architecture.md`'s ADR 024 summary follow.
+
 #### Runtime (observability)
+
+- **The three probe-hold refusal counters are collapsed onto one `reason`
+  label (#1443).** `decdn_probe_hold_violations_total`,
+  `decdn_probe_holds_disabled_total` and `decdn_probe_stake_lane_reserved_total`
+  answered one question — "could not hold, by cause" — under three names. They
+  are now `decdn_probe_hold_unavailable_total{reason="exhausted"|"disabled"|
+  "stake_lane_reserved"}`. Every semantic distinction is preserved as a label
+  value, including that `stake_lane_reserved` fires *before* the hold attempt
+  and so never consults the cache. All three children are materialized at
+  startup, so each series is exported at zero from a fresh registry rather than
+  appearing on first increment — the property the three separate counters had,
+  and one a `Family` does not give for free. **Migration:** replace
+  `decdn_probe_hold_violations_total` with
+  `decdn_probe_hold_unavailable_total{reason="exhausted"}`,
+  `decdn_probe_holds_disabled_total` with `{reason="disabled"}`, and
+  `decdn_probe_stake_lane_reserved_total` with `{reason="stake_lane_reserved"}`.
+  The shipped `monitoring/prometheus-alerts.yml` and
+  `monitoring/grafana-dashboard.json` are updated in place; the
+  `DecdnProbeHoldViolations` alert keeps its name and now filters on
+  `reason="exhausted"`, which is what keeps a deliberate disable or a
+  stake-lane reservation from tripping a "raise `max_probe_holds`" page. Custom
+  dashboards querying the old names go blank. Note this makes
+  `probe_hold_unavailable` the one labeled counter in `decdn-node`; the other
+  reason-style splits (`dispatch_rejected_*`, `probe_rate_limit_rejected_*`,
+  `channel_open_failures_*`) remain sibling counters for now.
 
 - **The `decdn_node_address_watcher_*` metrics are removed (#1231).** Gone:
   `decdn_node_address_watcher_restarts_total` and

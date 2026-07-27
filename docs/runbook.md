@@ -188,7 +188,9 @@ slashed by an external adversary.
    windows, and what counts as evidence:
    [ADR 028](../adr/028-slashing-appeals.md#adr-028-slashing-appeals-and-dispute-escalation).
 4. **For `DecdnProbeHoldViolations`:** this is lost revenue, not slash
-   evidence. The counter fires when a blob is present but *un-holdable*
+   evidence. The alert watches
+   `decdn_probe_hold_unavailable_total{reason="exhausted"}` and fires when a
+   blob is present but *un-holdable*
    because every hold slot is live, so the node signs `has_blob: false` and
    forgoes the delivery rather than risk a phantom slash — the literal
    "evicted after signing `has_blob: true`" case is unreachable by
@@ -198,7 +200,11 @@ slashed by an external adversary.
    should scale it up proportionally, while a node with a *small* cache
    should keep it under ~25% of cache capacity. **This field is
    restart-required** — a config reload logs "requires restart" and keeps the
-   old value. Add host memory or shed load if the pressure is genuine.
+   old value. Add host memory or shed load if the pressure is genuine. If the
+   series is flat but `reason="disabled"` or `reason="stake_lane_reserved"` is
+   climbing, the refusals are deliberate — a `max_probe_holds` of 0, or
+   end-client probes shed to keep stake-lane headroom — and neither calls for
+   this remedy.
    Background:
    [ADR 005 § Hold budget](../adr/005-protocol.md#hold-budget) and
    [Appendix: Observability](../adr/appendix-observability.md#slash-safety-metrics-all-mandatory).

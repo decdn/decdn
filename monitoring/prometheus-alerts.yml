@@ -26,21 +26,25 @@ groups:
     interval: 30s
     rules:
       - alert: DecdnProbeHoldViolations
-        expr: rate(decdn_probe_hold_violations_total[5m]) > 0
+        expr: rate(decdn_probe_hold_unavailable_total{reason="exhausted"}[5m]) > 0
         for: 5m
         labels:
           severity: critical
         annotations:
           summary: "Probe-hold budget exhausted on {{ $labels.instance }}"
           description: |
-            decdn_probe_hold_violations_total has been incrementing for 5m on
-            {{ $labels.instance }}. Each increment is a blob that IS present but
-            could not be held because every probe-hold slot was live, so the node
-            answered has_blob: false and forwent the delivery. This is lost
+            decdn_probe_hold_unavailable_total{reason="exhausted"} has been
+            incrementing for 5m on {{ $labels.instance }}. Each increment is a
+            blob that IS present but could not be held because every probe-hold
+            slot was live, so the node answered has_blob: false and forwent the
+            delivery. This is lost
             revenue under budget pressure, not slash evidence — a held hash is
             invisible to the LRU driver, so the "evicted after signing
             has_blob: true" case is unreachable by construction. Reduce load or
-            raise max_probe_holds; investigate OOM. Note max_probe_holds is
+            raise max_probe_holds; investigate OOM. The reason filter is
+            load-bearing: reason="disabled" (max_probe_holds=0) and
+            reason="stake_lane_reserved" are deliberate operator decisions and
+            must not fire this alert. Note max_probe_holds is
             restart-required — editing it and reloading logs "requires restart"
             and changes nothing. See
             adr/005-protocol.md#probe-triggered-eviction-hold.

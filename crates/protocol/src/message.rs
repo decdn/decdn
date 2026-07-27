@@ -55,9 +55,10 @@ pub const MAX_RATE_PER_MB: u64 = 1_000_000_000_000;
 ///
 /// ADR 014 §1 mandates `slash_sig` is **non-empty** and that requesters MUST
 /// reject missing/zero-length signatures — it does not itself fix a byte
-/// length. Off-chain `slash_sig` producers are EOA-only (ADR 024 §18: "a
-/// software-held signing key … used as a plain EOA" or wrapped by a 1-of-1
-/// Safe), which is always exactly this 65-byte form. Variable-length
+/// length. Off-chain `slash_sig` producers are EOA-only — ADR 024 §Off-Chain
+/// ERC-1271 Verification: "Every signature deCDN produces or verifies
+/// off-chain … is the fixed 65-byte secp256k1 `r‖s‖v` form" — which is always
+/// exactly this length. Variable-length
 /// **ERC-1271** smart-account signatures are verified on-chain by
 /// `SlashJudge` via `SignatureChecker.isValidSignatureNow` (ADR 014
 /// §On-Chain Verification); enforcing exactly this length off-chain is the
@@ -89,8 +90,9 @@ pub enum MessageValidationError {
     RateIsZero,
     /// `slash_sig` is missing or not [`SLASH_SIG_LEN`] bytes. ADR 014 §1
     /// mandates a non-empty signature on every `ProbeResponse`; the
-    /// EOA-only off-chain signing path (ADR 024 §18) makes that exactly
-    /// [`SLASH_SIG_LEN`], which requesters MUST reject deviations from.
+    /// EOA-only off-chain signing path (ADR 024 §Off-Chain ERC-1271
+    /// Verification) makes that exactly [`SLASH_SIG_LEN`], which requesters
+    /// MUST reject deviations from.
     #[error(
         "slash_sig has invalid length {len} \
          (ADR 014 §1: mandatory non-empty; EOA form is {expected} bytes)",
@@ -99,21 +101,24 @@ pub enum MessageValidationError {
     InvalidSlashSigLen { len: usize },
     /// A wire [`crate::client::Voucher`]'s `signature` is not
     /// [`crate::client::VOUCHER_SIG_LEN`] bytes. The EOA off-chain voucher
-    /// signing form (ADR 024 §18) is exactly that length; receivers reject
-    /// deviations before reconstructing the EIP-712 typed data.
+    /// signing form (ADR 024 §Off-Chain ERC-1271 Verification) is exactly that
+    /// length; receivers reject deviations before reconstructing the EIP-712
+    /// typed data.
     #[error("Voucher.signature has invalid length {len} (EOA form is 65 bytes)")]
     InvalidVoucherSigLen { len: usize },
     /// A wire [`crate::client::ClientBinding`]'s `binding_signature` is not
     /// [`crate::client::BINDING_SIG_LEN`] bytes. The `BindNodeId` attestation
-    /// is the same EOA off-chain signing form (ADR 024 §18); receivers reject
-    /// deviations before `decdn_incentive` recovers the bound address.
+    /// is the same EOA off-chain signing form (ADR 024 §Off-Chain ERC-1271
+    /// Verification); receivers reject deviations before `decdn_incentive`
+    /// recovers the bound address.
     #[error("ClientBinding.binding_signature has invalid length {len} (EOA form is 65 bytes)")]
     InvalidBindingSigLen { len: usize },
     /// A wire [`crate::client::CooperativeCloseAuth`]'s `signature` is not
     /// [`crate::client::COOPERATIVE_CLOSE_SIG_LEN`] bytes. The provider's
     /// cooperative-close waiver is the same EOA off-chain signing form (ADR 024
-    /// §18); receivers reject deviations before `decdn_incentive` recovers the
-    /// provider address (ADR 003 §Cooperative close).
+    /// §Off-Chain ERC-1271 Verification); receivers reject deviations before
+    /// `decdn_incentive` recovers the provider address (ADR 003 §Cooperative
+    /// close).
     #[error("CooperativeCloseAuth.signature has invalid length {len} (EOA form is 65 bytes)")]
     InvalidCooperativeCloseSigLen { len: usize },
     /// A negotiated `voucher_interval_mb` is outside `1..=MAX_VOUCHER_INTERVAL_MB`
