@@ -60,6 +60,11 @@ impl ClientHandler {
         // Resolved once: a channel's funder is fixed for its lifetime, and the
         // per-boundary takedown re-check below must not take the channel lock
         // every MB just to re-read an immutable field.
+        //
+        // This is the FUNDER (ADR 011 compliance), never the channel's
+        // `voucher_signer`, and must not be re-keyed onto it: a blacklisted
+        // funder can pin a clean throwaway key as its signer, so checking the
+        // signer here would silently stop enforcing takedowns.
         let funder = match channel {
             Some(chan) => Some(chan.lock().await.state.client),
             None => None,

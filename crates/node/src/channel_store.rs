@@ -205,7 +205,8 @@ const fn blacklist_key(region: [u8; 32], hash: [u8; 32]) -> [u8; 64] {
 /// (`bool`) and the pinned voucher signer (`[u8; 20]`) follow as two further
 /// additive trailing segments, in that order. The signer segment MUST stay
 /// last: being untagged and fixed-width, it is indistinguishable from any
-/// other >= 20-byte trailer at that position (see `decode_record`, ~:648) —
+/// other >= 20-byte trailer at that position (see `decode_record`'s
+/// signer-segment gate) —
 /// any future additive segment has to be appended after it, not before.
 #[derive(Debug, Serialize, Deserialize)]
 struct StoredChannelState {
@@ -663,7 +664,8 @@ fn decode_record(key_bytes: [u8; 32], value_bytes: &[u8]) -> Result<ChannelState
     // segment MUST be appended strictly after this one — a segment placed here
     // instead would be silently misread as an address. A wrong `voucher_signer`
     // moves the signature-recovery target, so this can fail *open*; `record`
-    // (~:783) and the `StoredChannelState` doc (~:205) restate this briefly.
+    // (where it appends the segment) and the `StoredChannelState` doc restate
+    // this briefly.
     // Absent → `None`, and `into_state` falls back to the stored `client` (the
     // on-chain default when `voucherSigner` is zero).
     let (voucher_signer, leftover): (Option<Address>, &[u8]) =
@@ -801,7 +803,8 @@ impl ChannelStateStore for PersistentChannelStateStore {
         // 20 bytes keeps the record well under `SANE_TRAILER_MAX_BYTES`. This
         // MUST stay the last segment: it is untagged and fixed-width, so any
         // future additive segment placed before it would be silently misread as
-        // an address by `decode_record` (~:648) — append new segments after it.
+        // an address by `decode_record`'s signer-segment gate — append new
+        // segments after it.
         let signer_bytes: [u8; SIGNER_SEGMENT_BYTES] = state.voucher_signer.into();
         let signer_encoded = postcard::to_allocvec(&signer_bytes).map_err(|err| {
             StoreError::Codec(format!("postcard encode of voucher signer: {err}"))
@@ -1888,7 +1891,7 @@ mod tests {
         // Self-referential on its own: if the decoder misparsed `client`, both
         // sides move together and the assertion above would still pass. Pin
         // `client` against the fixture independently, plus the fuller record
-        // equality `voucher_signer_persists_across_reopen` (~:1820) uses.
+        // equality `voucher_signer_persists_across_reopen` uses.
         anyhow::ensure!(
             loaded.client == s.client,
             "client must decode unchanged (got {})",

@@ -97,19 +97,20 @@ impl ClientHandler {
 
     /// Whether `req` is authorized to trigger a paid pull-through (#831): it must
     /// carry a verified client binding (`verified_client`) whose recovered
-    /// address is the named channel's authorized client. Channel *existence* is
-    /// public (on-chain `ChannelOpened`), so it cannot authorize spend — only
-    /// proven ownership can. An unbound request, or a binding that does not match
-    /// the channel owner, is unauthorized and must not make this node front
-    /// upstream USDC. Mirrors the post-delivery ownership check, applied *before*
-    /// any spend.
+    /// address is the named channel's pinned `voucher_signer`. Channel
+    /// *existence* is public (on-chain `ChannelOpened`), so it cannot authorize
+    /// spend — only proof of *voucher authority* can, since only the pinned
+    /// signer can produce a voucher this channel will accept. An unbound
+    /// request, or a binding that does not match that signer, must not make this
+    /// node front upstream USDC. Mirrors the binding gate in `dispatch.rs`,
+    /// applied *before* any spend.
     ///
-    /// Also the earliest origin-blacklist gate (ADR 011). The serve-path gate in
-    /// `dispatch.rs` refuses the delivery, but it runs after this: without the
-    /// same check here, a blacklisted origin's request would still have made
-    /// this node front upstream USDC egress and warm its cache on that origin's
-    /// behalf, only to refuse the delivery afterwards. Refusing to *spend* is the
-    /// part that actually costs the operator.
+    /// Also the earliest origin-blacklist gate (ADR 011), on BOTH addresses. The
+    /// serve-path gate in `dispatch.rs` refuses the delivery, but it runs after
+    /// this: without the same check here, a blacklisted origin's request would
+    /// still have made this node front upstream USDC egress and warm its cache
+    /// on that origin's behalf, only to refuse the delivery afterwards. Refusing
+    /// to *spend* is the part that actually costs the operator.
     pub(super) async fn pull_authorized(
         &self,
         req: &StreamRequest,
@@ -128,7 +129,21 @@ impl ClientHandler {
             .get(&ChannelId::from(req.channel_id))
             .cloned();
         match chan {
-            Some(chan) => chan.lock().await.state.client == client,
+            Some(chan) => {
+                let state = &chan.lock().await.state;
+                // Ownership is a *signer* question: only the pinned voucher
+                // signer can pay for this upstream pull, so only it can
+                // authorize the spend.
+                if state.voucher_signer != client {
+                    return false;
+                }
+                // Compliance is a *funder* question (ADR 011), and must NEVER be
+                // re-keyed onto the signer: never front upstream USDC on a
+                // channel funded by a blacklisted address, even when a clean
+                // delegate key is doing the signing. The `is_origin_denied`
+                // early return above covers the blacklisted *signer* case.
+                !self.content_deny.is_origin_denied(&state.client)
+            }
             None => false,
         }
     }
