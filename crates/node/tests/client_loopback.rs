@@ -235,6 +235,7 @@ async fn client_delivery_roundtrip_advances_channel_state() -> anyhow::Result<()
     store.record(&ChannelState::new(
         channel_id(),
         client_signer.address(),
+        client_signer.address(),
         TOKEN,
         deposit,
     ))?;
@@ -552,6 +553,7 @@ async fn idle_fixture_with_cache(
     let store = Arc::new(MemoryChannelStateStore::new());
     store.record(&ChannelState::new(
         channel_id(),
+        client_signer.address(),
         client_signer.address(),
         TOKEN,
         U256::from(10_000_000u64),
@@ -1066,6 +1068,7 @@ async fn client_delivers_empty_blob() -> anyhow::Result<()> {
     store.record(&ChannelState::new(
         channel_id(),
         client_signer.address(),
+        client_signer.address(),
         TOKEN,
         deposit,
     ))?;
@@ -1153,6 +1156,7 @@ async fn tracked_watermark_survives_post_ack_error() -> anyhow::Result<()> {
     let store = Arc::new(MemoryChannelStateStore::new());
     store.record(&ChannelState::new(
         channel_id(),
+        client_signer.address(),
         client_signer.address(),
         TOKEN,
         deposit,
@@ -1253,6 +1257,7 @@ async fn accepted_voucher_advances_shared_activity_clock() -> anyhow::Result<()>
     store.record(&ChannelState::new(
         channel_id(),
         client_signer.address(),
+        client_signer.address(),
         TOKEN,
         deposit,
     ))?;
@@ -1349,6 +1354,7 @@ async fn accepted_voucher_records_served_bytes_by_region() -> anyhow::Result<()>
     let store = Arc::new(MemoryChannelStateStore::new());
     store.record(&ChannelState::new(
         channel_id(),
+        client_signer.address(),
         client_signer.address(),
         TOKEN,
         deposit,
@@ -1447,6 +1453,7 @@ async fn voucher_acceptance_appends_download_receipt() -> anyhow::Result<()> {
     let store = Arc::new(MemoryChannelStateStore::new());
     store.record(&ChannelState::new(
         channel_id(),
+        client_signer.address(),
         client_signer.address(),
         TOKEN,
         deposit,
@@ -1562,6 +1569,7 @@ async fn delivery_completes_while_receipt_writer_is_stalled() -> anyhow::Result<
     store.record(&ChannelState::new(
         channel_id(),
         client_signer.address(),
+        client_signer.address(),
         TOKEN,
         deposit,
     ))?;
@@ -1664,6 +1672,7 @@ async fn receipt_log_write_failure_does_not_fail_delivery() -> anyhow::Result<()
     store.record(&ChannelState::new(
         channel_id(),
         client_signer.address(),
+        client_signer.address(),
         TOKEN,
         deposit,
     ))?;
@@ -1746,6 +1755,7 @@ async fn client_reused_channel_resumes() -> anyhow::Result<()> {
     let store = Arc::new(MemoryChannelStateStore::new());
     store.record(&ChannelState::new(
         channel_id(),
+        client_signer.address(),
         client_signer.address(),
         TOKEN,
         deposit,
@@ -1860,6 +1870,7 @@ async fn client_byte_offset_returns_suffix_multi_group() -> anyhow::Result<()> {
     store.record(&ChannelState::new(
         channel_id(),
         client_signer.address(),
+        client_signer.address(),
         TOKEN,
         deposit,
     ))?;
@@ -1949,6 +1960,7 @@ async fn client_byte_offset_returns_suffix() -> anyhow::Result<()> {
     store.record(&ChannelState::new(
         channel_id(),
         client_signer.address(),
+        client_signer.address(),
         TOKEN,
         deposit,
     ))?;
@@ -2029,6 +2041,7 @@ async fn client_rejects_zero_rate_response() -> anyhow::Result<()> {
     let store = Arc::new(MemoryChannelStateStore::new());
     store.record(&ChannelState::new(
         channel_id(),
+        client_signer.address(),
         client_signer.address(),
         TOKEN,
         deposit,
@@ -2242,6 +2255,7 @@ async fn client_transient_store_failure_is_retry_later() -> anyhow::Result<()> {
     inner.record(&ChannelState::new(
         channel_id(),
         client_signer.address(),
+        client_signer.address(),
         TOKEN,
         deposit,
     ))?;
@@ -2307,7 +2321,13 @@ async fn client_expired_channel_is_rejected_with_expired() -> anyhow::Result<()>
     let store = Arc::new(MemoryChannelStateStore::new());
     // Seed a channel whose on-chain expiry is already in the past (Unix second
     // `1`), so the serve-gate refuses the first voucher.
-    let mut expired = ChannelState::new(channel_id(), client_signer.address(), TOKEN, deposit);
+    let mut expired = ChannelState::new(
+        channel_id(),
+        client_signer.address(),
+        client_signer.address(),
+        TOKEN,
+        deposit,
+    );
     expired.expires_at = 1;
     store.record(&expired)?;
     let store_dyn: Arc<dyn ChannelStateStore> = store;
@@ -2367,6 +2387,7 @@ fn seeded_store() -> anyhow::Result<(Arc<dyn ChannelStateStore>, Arc<PrivateKeyS
     let store = Arc::new(MemoryChannelStateStore::new());
     store.record(&ChannelState::new(
         channel_id(),
+        signer.address(),
         signer.address(),
         TOKEN,
         deposit,
@@ -3457,6 +3478,7 @@ async fn client_not_found_is_refused() -> anyhow::Result<()> {
     store.record(&ChannelState::new(
         channel_id(),
         client_signer.address(),
+        client_signer.address(),
         TOKEN,
         deposit,
     ))?;
@@ -3536,6 +3558,7 @@ async fn register_open_channel_is_idempotent_and_preserves_watermark() -> anyhow
     let advanced = ChannelState::hydrate(
         channel_id(),
         client,
+        client,
         TOKEN,
         U256::from(10_000_000u64),
         U256::from(4_321u64),
@@ -3566,6 +3589,7 @@ async fn register_open_channel_is_idempotent_and_preserves_watermark() -> anyhow
         .register_open_channel(ChannelState::new(
             channel_id(),
             client,
+            client,
             TOKEN,
             U256::from(10_000_000u64),
         ))
@@ -3593,6 +3617,7 @@ async fn update_channel_deposit_raises_and_is_idempotent() -> anyhow::Result<()>
     let client = PrivateKeySigner::random().address();
     store.record(&ChannelState::new(
         channel_id(),
+        client,
         client,
         TOKEN,
         U256::from(10_000_000u64),
@@ -3657,6 +3682,7 @@ async fn channel_metrics_follow_lifecycle_without_replay_double_count() -> anyho
     store.record(&ChannelState::new(
         channel_id(),
         client,
+        client,
         TOKEN,
         U256::from(10_000_000u64),
     ))?;
@@ -3695,6 +3721,7 @@ async fn channel_metrics_follow_lifecycle_without_replay_double_count() -> anyho
         .register_open_channel(ChannelState::new(
             channel_id(),
             client,
+            client,
             TOKEN,
             U256::from(1u64),
         ))
@@ -3705,6 +3732,7 @@ async fn channel_metrics_follow_lifecycle_without_replay_double_count() -> anyho
     handler
         .register_open_channel(ChannelState::new(
             second,
+            client,
             client,
             TOKEN,
             U256::from(7_000_000u64),
@@ -4081,6 +4109,7 @@ async fn cooperative_close_signs_waiver_persists_flag_and_stops_serving() -> any
     let store_inner = Arc::new(MemoryChannelStateStore::new());
     store_inner.record(&ChannelState::hydrate(
         channel_id(),
+        signer.address(),
         signer.address(),
         TOKEN,
         deposit,

@@ -211,6 +211,7 @@ async fn node_to_node_pull_through_two_hops() -> anyhow::Result<()> {
     store_a.record(&ChannelState::new(
         a_channel_id,
         b_buyer.address(),
+        b_buyer.address(),
         TOKEN,
         U256::from(DEPOSIT_MICRO_USDC),
     ))?;
@@ -261,6 +262,7 @@ async fn node_to_node_pull_through_two_hops() -> anyhow::Result<()> {
     let store_b = Arc::new(MemoryChannelStateStore::new());
     store_b.record(&ChannelState::new(
         b_channel_id,
+        client_signer.address(),
         client_signer.address(),
         TOKEN,
         U256::from(DEPOSIT_MICRO_USDC),
@@ -423,6 +425,7 @@ async fn client_disconnect_mid_stream_leaves_channel_reusable() -> anyhow::Resul
     let store = Arc::new(MemoryChannelStateStore::new());
     store.record(&ChannelState::new(
         channel_id,
+        client_signer.address(),
         client_signer.address(),
         TOKEN,
         U256::from(DEPOSIT_MICRO_USDC),

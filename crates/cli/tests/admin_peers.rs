@@ -313,6 +313,7 @@ async fn channels_round_trips_seeded_store() -> anyhow::Result<()> {
         ChannelState::hydrate(
             id.into(),
             Address::from(client),
+            Address::from(client),
             token,
             U256::from(deposit),
             U256::from(amount),

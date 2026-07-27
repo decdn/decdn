@@ -278,6 +278,8 @@ impl StoredChannelState {
         Ok(ChannelState::hydrate(
             channel_id,
             Address::from(self.client),
+            // TODO(task 5): decode the persisted signer segment
+            Address::from(self.client),
             Address::from(self.token),
             U256::from_be_bytes(self.deposit),
             U256::from_be_bytes(self.last_amount),
@@ -1339,6 +1341,7 @@ mod tests {
         ChannelState::hydrate(
             id.into(),
             address!("00000000000000000000000000000000000000aa"),
+            address!("00000000000000000000000000000000000000aa"),
             address!("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"),
             U256::from(10_000_000u64),
             U256::from(byte) * U256::from(1_000u64),
@@ -1754,6 +1757,7 @@ mod tests {
         let s = ChannelState::hydrate(
             base.channel_id,
             base.client,
+            base.voucher_signer,
             base.token,
             base.deposit,
             base.last_amount(),

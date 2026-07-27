@@ -791,7 +791,14 @@ async fn apply_channel_opened(
     if event.provider != self_address {
         return Ok(());
     }
-    let mut state = ChannelState::new(event.channelId, event.client, usdc_token, event.deposit);
+    // TODO(task 7): hydrate the signer from `event.voucherSigner`.
+    let mut state = ChannelState::new(
+        event.channelId,
+        event.client,
+        event.client,
+        usdc_token,
+        event.deposit,
+    );
     // Track on-chain expiry so the sweep can close (and the handler can stop
     // serving) before `reclaimExpired` opens. A value past u64 is clamped to
     // "never" — safe, since the only effect of a too-far expiry is we never

@@ -2118,6 +2118,7 @@ mod tests {
         ChannelState::hydrate(
             id.into(),
             Address::from(client),
+            Address::from(client),
             CHANNEL_TOKEN,
             U256::from(deposit),
             U256::from(last_amount),

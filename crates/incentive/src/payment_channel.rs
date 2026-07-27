@@ -75,6 +75,11 @@ mod sol_types {
                 address client;
                 uint64 openedAt;
                 Status status;
+                /// Address whose EIP-712 signature authorizes vouchers on this
+                /// channel. Pinned at `openChannel`, never mutable, and the
+                /// recovery target at every settlement path. Distinct from
+                /// `client` (the funder / refund destination).
+                address voucherSigner;
                 address provider;
                 uint64 expiresAt;
                 address token;
@@ -148,6 +153,14 @@ mod sol_types {
                 bytes calldata signature
             ) external;
 
+            /// Initiate close without presenting a voucher — the claim stays at
+            /// whatever is already recorded on-chain — and start the dispute
+            /// window, during which the counterparty can still dispute in a
+            /// higher voucher. Callable by client or provider. This is the
+            /// escape hatch for a party holding no voucher at all (e.g. a funder
+            /// whose pinned `voucherSigner` never signed one).
+            function closeChannelWithoutVoucher(bytes32 channelId) external;
+
             /// Finalize after the dispute window expires; routes the
             /// un-withdrawn remainder through `FeeRouter` and refunds the
             /// client. Callable by anyone.
@@ -181,7 +194,12 @@ mod sol_types {
             /// allowance). Caller becomes `channel.client`. The buyer learns the
             /// `channelId` + `expiresAt` by decoding the `ChannelOpened` event
             /// from this tx's receipt (atomic with the open — no follow-up read).
-            function openChannel(address provider, uint256 deposit) external returns (bytes32 channelId);
+            /// `voucherSigner` pins the address allowed to sign this channel's
+            /// vouchers and is immutable thereafter; passing the zero address
+            /// resolves it on-chain to the caller (the self-signing default).
+            function openChannel(address provider, uint256 deposit, address voucherSigner)
+                external
+                returns (bytes32 channelId);
 
             /// Client-only: add `additionalDeposit` USDC to an open channel.
             /// Does not extend `expiresAt`.
@@ -203,7 +221,8 @@ mod sol_types {
                 address indexed client,
                 address indexed provider,
                 uint256 deposit,
-                uint256 expiresAt
+                uint256 expiresAt,
+                address voucherSigner
             );
 
             /// Client increased the channel deposit. The watcher updates the

@@ -1099,6 +1099,7 @@ async fn node_origin_pull_chains_reactive_origin_via_client_binding() -> Result<
     store_a.record(&ChannelState::new(
         channel_id,
         b_buyer.address(),
+        b_buyer.address(),
         TOKEN,
         U256::from(DEPOSIT_MICRO_USDC),
     ))?;
@@ -1209,6 +1210,7 @@ async fn node_origin_pull_fills_and_records_reputation() -> Result<()> {
     let store_a = Arc::new(MemoryChannelStateStore::new());
     store_a.record(&ChannelState::new(
         channel_id,
+        b_buyer.address(),
         b_buyer.address(),
         TOKEN,
         U256::from(DEPOSIT_MICRO_USDC),
@@ -2046,6 +2048,7 @@ async fn node_origin_pull_falls_through_a_stalled_candidate() -> Result<()> {
     store_a.record(&ChannelState::new(
         channel_id,
         b_buyer.address(),
+        b_buyer.address(),
         TOKEN,
         U256::from(DEPOSIT_MICRO_USDC),
     ))?;
@@ -2265,6 +2268,7 @@ async fn wedged_open_does_not_starve_the_candidate_loop(stall: OpenStall) -> Res
     let store_a = Arc::new(MemoryChannelStateStore::new());
     store_a.record(&ChannelState::new(
         channel_id,
+        b_buyer.address(),
         b_buyer.address(),
         TOKEN,
         U256::from(DEPOSIT_MICRO_USDC),
@@ -2529,6 +2533,7 @@ async fn node_origin_window_open_falls_through_a_stalled_candidate() -> Result<(
     let store_a = Arc::new(MemoryChannelStateStore::new());
     store_a.record(&ChannelState::new(
         channel_id,
+        b_buyer.address(),
         b_buyer.address(),
         TOKEN,
         U256::from(DEPOSIT_MICRO_USDC),
@@ -5167,6 +5172,7 @@ async fn silent_upstreams_do_not_starve_the_candidate_loop() -> Result<()> {
     store_a.record(&ChannelState::new(
         channel_id,
         b_buyer.address(),
+        b_buyer.address(),
         TOKEN,
         U256::from(DEPOSIT_MICRO_USDC),
     ))?;
@@ -5466,6 +5472,7 @@ async fn node_origin_not_found_refusal_does_not_tar_upstream() -> Result<()> {
     store_n.record(&ChannelState::new(
         channel_id,
         b_buyer.address(),
+        b_buyer.address(),
         TOKEN,
         U256::from(DEPOSIT_MICRO_USDC),
     ))?;
@@ -5502,6 +5509,7 @@ async fn node_origin_not_found_refusal_does_not_tar_upstream() -> Result<()> {
     let store_a = Arc::new(MemoryChannelStateStore::new());
     store_a.record(&ChannelState::new(
         channel_id,
+        b_buyer.address(),
         b_buyer.address(),
         TOKEN,
         U256::from(DEPOSIT_MICRO_USDC),
@@ -6020,6 +6028,7 @@ async fn node_origin_oversized_claim_is_rejected_without_scoring() -> Result<()>
     store_a.record(&ChannelState::new(
         channel_id,
         b_buyer.address(),
+        b_buyer.address(),
         TOKEN,
         U256::from(DEPOSIT_MICRO_USDC),
     ))?;
@@ -6143,6 +6152,7 @@ async fn node_origin_over_ceiling_rate_is_rejected_without_scoring() -> Result<(
     store_a.record(&ChannelState::new(
         channel_id,
         b_buyer.address(),
+        b_buyer.address(),
         TOKEN,
         U256::from(DEPOSIT_MICRO_USDC),
     ))?;
@@ -6262,6 +6272,7 @@ async fn node_origin_reused_channel_resumes_voucher_progress() -> Result<()> {
     let store_a = Arc::new(MemoryChannelStateStore::new());
     store_a.record(&ChannelState::new(
         channel_id,
+        b_buyer.address(),
         b_buyer.address(),
         TOKEN,
         U256::from(DEPOSIT_MICRO_USDC),
@@ -6411,6 +6422,7 @@ async fn node_origin_persist_failure_still_delivers_and_is_counted() -> Result<(
     let store_a = Arc::new(MemoryChannelStateStore::new());
     store_a.record(&ChannelState::new(
         channel_id,
+        b_buyer.address(),
         b_buyer.address(),
         TOKEN,
         U256::from(DEPOSIT_MICRO_USDC),
@@ -6821,6 +6833,7 @@ async fn build_node_b_with_leaves(
         store_b.record(&ChannelState::new(
             *leaf_channel_id,
             *leaf_eth_addr,
+            *leaf_eth_addr,
             TOKEN,
             *leaf_deposit,
         ))?;
@@ -6896,6 +6909,7 @@ async fn spawn_node_a(
     let store_a = Arc::new(MemoryChannelStateStore::new());
     store_a.record(&ChannelState::new(
         ab_channel_id,
+        b_buyer_addr,
         b_buyer_addr,
         TOKEN,
         U256::from(DEPOSIT_MICRO_USDC),
@@ -8683,6 +8697,7 @@ async fn two_concurrent_pulls_to_one_provider_share_the_channel_ledger() -> Resu
     store_a.record(&ChannelState::new(
         channel_id,
         b_buyer.address(),
+        b_buyer.address(),
         TOKEN,
         U256::from(DEPOSIT_MICRO_USDC),
     ))?;
@@ -8870,6 +8885,7 @@ async fn a_second_fetch_inside_the_ttl_skips_the_probe_entirely() -> Result<()> 
     store_a.record(&ChannelState::new(
         channel_id,
         b_buyer.address(),
+        b_buyer.address(),
         TOKEN,
         U256::from(DEPOSIT_MICRO_USDC),
     ))?;
@@ -8996,6 +9012,7 @@ async fn a_fetch_past_the_ttl_probes_again() -> Result<()> {
     let store_a = Arc::new(MemoryChannelStateStore::new());
     store_a.record(&ChannelState::new(
         channel_id,
+        b_buyer.address(),
         b_buyer.address(),
         TOKEN,
         U256::from(DEPOSIT_MICRO_USDC),
@@ -9151,6 +9168,7 @@ async fn a_progressive_pull_routes_the_fallback_on_the_request_namespace() -> Re
     let store_a = Arc::new(MemoryChannelStateStore::new());
     store_a.record(&ChannelState::new(
         channel_id,
+        b_buyer.address(),
         b_buyer.address(),
         TOKEN,
         U256::from(DEPOSIT_MICRO_USDC),
@@ -9633,6 +9651,7 @@ async fn a_partial_cached_budget_falls_through_to_the_cold_path_and_meters_once(
     store_h.record(&ChannelState::new(
         channel_id,
         b_buyer.address(),
+        b_buyer.address(),
         TOKEN,
         U256::from(DEPOSIT_MICRO_USDC),
     ))?;
@@ -9775,6 +9794,7 @@ async fn a_probe_cache_hit_still_honours_the_negative_cache() -> Result<()> {
     let store_a = Arc::new(MemoryChannelStateStore::new());
     store_a.record(&ChannelState::new(
         channel_id,
+        b_buyer.address(),
         b_buyer.address(),
         TOKEN,
         U256::from(DEPOSIT_MICRO_USDC),
@@ -9946,6 +9966,7 @@ async fn a_progressive_pull_reuses_a_probe_cache_entry_written_by_a_buffered_fet
     let store_a = Arc::new(MemoryChannelStateStore::new());
     store_a.record(&ChannelState::new(
         channel_id,
+        b_buyer.address(),
         b_buyer.address(),
         TOKEN,
         U256::from(DEPOSIT_MICRO_USDC),
@@ -10207,6 +10228,7 @@ async fn a_window_pull_with_a_partial_cached_budget_falls_through_cold_and_meter
     let store_h = Arc::new(MemoryChannelStateStore::new());
     store_h.record(&ChannelState::new(
         channel_id,
+        b_buyer.address(),
         b_buyer.address(),
         TOKEN,
         U256::from(DEPOSIT_MICRO_USDC),
@@ -10777,6 +10799,7 @@ async fn a_probe_cache_hit_still_honours_the_wedged_provider_filter() -> Result<
     store_h.record(&ChannelState::new(
         channel_id,
         b_buyer.address(),
+        b_buyer.address(),
         TOKEN,
         U256::from(DEPOSIT_MICRO_USDC),
     ))?;
@@ -11113,6 +11136,7 @@ async fn a_probe_cache_hit_drops_a_provider_no_longer_admitted() -> Result<()> {
     let store_a = Arc::new(MemoryChannelStateStore::new());
     store_a.record(&ChannelState::new(
         channel_id,
+        b_buyer.address(),
         b_buyer.address(),
         TOKEN,
         U256::from(DEPOSIT_MICRO_USDC),

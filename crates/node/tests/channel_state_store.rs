@@ -42,6 +42,7 @@ fn make_state(signer: &PrivateKeySigner) -> ChannelState {
     ChannelState::new(
         b256!("11223344556677889900aabbccddeeff00112233445566778899aabbccddeeff"),
         signer.address(),
+        signer.address(),
         TOKEN,
         U256::from(10_000_000u64), // 10 USDC deposit
     )
@@ -210,8 +211,20 @@ async fn concurrent_vouchers_across_distinct_channels() -> anyhow::Result<()> {
     let chan_b = b256!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
 
     let deposit = U256::from(1_000_000_000u64);
-    let state_a = ChannelState::new(chan_a, signer_a.address(), TOKEN, deposit);
-    let state_b = ChannelState::new(chan_b, signer_b.address(), TOKEN, deposit);
+    let state_a = ChannelState::new(
+        chan_a,
+        signer_a.address(),
+        signer_a.address(),
+        TOKEN,
+        deposit,
+    );
+    let state_b = ChannelState::new(
+        chan_b,
+        signer_b.address(),
+        signer_b.address(),
+        TOKEN,
+        deposit,
+    );
 
     // Drive 50 monotonic vouchers per channel concurrently. Each task runs
     // its `apply_voucher` calls inside `spawn_blocking` because the store
@@ -319,6 +332,7 @@ fn truncated_file_refuses_to_start() -> anyhow::Result<()> {
         // Force one commit so the file has real redb structure.
         store.record(&ChannelState::new(
             b256!("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
+            address!("00000000000000000000000000000000000000aa"),
             address!("00000000000000000000000000000000000000aa"),
             TOKEN,
             U256::from(1_000_000u64),

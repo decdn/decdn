@@ -1506,6 +1506,7 @@ mod tests {
             state: ChannelState::new(
                 old_id,
                 Address::repeat_byte(0x11),
+                Address::repeat_byte(0x11),
                 Address::repeat_byte(0x22),
                 U256::from(10u64),
             ),
@@ -1539,6 +1540,7 @@ mod tests {
             Arc::new(Mutex::new(ChannelDeliveryState {
                 state: ChannelState::new(
                     new_id,
+                    Address::repeat_byte(0x33),
                     Address::repeat_byte(0x33),
                     Address::repeat_byte(0x44),
                     U256::from(20u64),
