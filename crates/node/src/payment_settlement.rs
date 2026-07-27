@@ -819,7 +819,6 @@ async fn apply_channel_opened(
     event: &PaymentChannel::ChannelOpened,
     from_backfill: bool,
 ) -> Result<()> {
-    // Only channels where this node is the provider concern us.
     let Some(state) = opened_channel_state(self_address, usdc_token, event) else {
         return Ok(());
     };
