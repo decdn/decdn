@@ -658,12 +658,13 @@ fn write_channels_table(w: &mut impl io::Write, resp: &ChannelsResponse) -> io::
     if resp.channels.is_empty() {
         return writeln!(w, "(no open channels)");
     }
-    // Fixed-column layout: channel preview | counterparty preview | nonce |
-    // outstanding | deposit | last-voucher age | eligible.
+    // Fixed-column layout: channel preview | counterparty preview | voucher
+    // signer preview | nonce | outstanding | deposit | last-voucher age |
+    // eligible.
     writeln!(
         w,
-        "{:<14} {:<14} {:>6} {:>12} {:>12} {:>12} ELIGIBLE",
-        "CHANNEL", "COUNTERPARTY", "NONCE", "OUTSTANDING", "DEPOSIT", "LAST_VOUCHER",
+        "{:<14} {:<14} {:<14} {:>6} {:>12} {:>12} {:>12} ELIGIBLE",
+        "CHANNEL", "COUNTERPARTY", "SIGNER", "NONCE", "OUTSTANDING", "DEPOSIT", "LAST_VOUCHER",
     )?;
     for c in &resp.channels {
         write_channel_row(w, c)?;
@@ -676,6 +677,14 @@ fn write_channels_table(w: &mut impl io::Write, resp: &ChannelsResponse) -> io::
 fn write_channel_row(w: &mut impl io::Write, c: &ChannelSnapshot) -> io::Result<()> {
     let channel = short_node_id(&c.channel_id);
     let counterparty = short_node_id(&c.counterparty);
+    // A pre-delegation server omits `voucher_signer` entirely (the DTO field is
+    // `#[serde(default)]`), so an empty string means "this node cannot tell" —
+    // rendered as `?` rather than silently echoing the funder.
+    let signer = if c.voucher_signer.is_empty() {
+        "?".to_string()
+    } else {
+        short_node_id(&c.voucher_signer)
+    };
     let last_voucher = match c.seconds_since_last_voucher {
         // No voucher seen since this process started — distinct from
         // "<1s ago" so operators know the activity clock has no record
@@ -690,7 +699,8 @@ fn write_channel_row(w: &mut impl io::Write, c: &ChannelSnapshot) -> io::Result<
     let eligible = if c.settlement_eligible { "yes" } else { "no" };
     writeln!(
         w,
-        "{channel:<14} {counterparty:<14} {:>6} {:>12} {:>12} {last_voucher:>12} {eligible}",
+        "{channel:<14} {counterparty:<14} {signer:<14} {:>6} {:>12} {:>12} {last_voucher:>12} \
+         {eligible}",
         c.last_nonce,
         format_usdc(c.outstanding_micro_usdc),
         format_usdc(c.deposit_micro_usdc),
@@ -1608,6 +1618,9 @@ mod tests {
         ChannelSnapshot {
             channel_id: channel_id.to_string(),
             counterparty: counterparty.to_string(),
+            // Self-signing default; the delegated and legacy-empty renderings
+            // get their own dedicated test rather than an eighth parameter.
+            voucher_signer: counterparty.to_string(),
             last_nonce,
             outstanding_micro_usdc: outstanding,
             deposit_micro_usdc: deposit,
@@ -1745,6 +1758,65 @@ mod tests {
         );
         // Second row: no activity → "never", not eligible → "no".
         assert!(s.contains("never"), "never sentinel missing: {s}");
+        Ok(())
+    }
+
+    /// The SIGNER column: a delegated channel renders the delegate (not the
+    /// funder), and a pre-delegation server — which omits `voucher_signer`
+    /// entirely — renders `?` rather than echoing the funder.
+    #[test]
+    fn write_channels_table_renders_the_voucher_signer_column() -> anyhow::Result<()> {
+        let funder = format!("0x{}", "1".repeat(40));
+        let delegate = format!("0x{}", "2".repeat(40));
+        let mut delegated = mk_channel(
+            &format!("0x{}", "a".repeat(64)),
+            &funder,
+            1,
+            1,
+            2,
+            Some(1),
+            false,
+        );
+        delegated.voucher_signer = delegate.clone();
+        let mut legacy = mk_channel(
+            &format!("0x{}", "b".repeat(64)),
+            &funder,
+            1,
+            1,
+            2,
+            Some(1),
+            false,
+        );
+        legacy.voucher_signer = String::new();
+
+        let mut buf = Vec::<u8>::new();
+        write_channels_table(
+            &mut buf,
+            &ChannelsResponse {
+                redeem_threshold_micro_usdc: 1_000_000,
+                channels: vec![delegated, legacy],
+            },
+        )?;
+        let s = String::from_utf8(buf)?;
+        assert!(s.contains("SIGNER"), "SIGNER header missing: {s}");
+        assert!(
+            s.contains(&short_node_id(&delegate)),
+            "delegate signer preview missing: {s}"
+        );
+        let legacy_row = s
+            .lines()
+            .find(|l| l.starts_with("0xbbbbbbbbbb"))
+            .unwrap_or_default();
+        assert!(
+            legacy_row.contains(" ? "),
+            "an omitted voucher_signer must render as `?`: {legacy_row}"
+        );
+        assert_eq!(
+            legacy_row.matches(&short_node_id(&funder)).count(),
+            1,
+            "the funder must appear once (COUNTERPARTY only) — an omitted \
+             voucher_signer must not be echoed into SIGNER: {legacy_row}"
+        );
         Ok(())
     }
 

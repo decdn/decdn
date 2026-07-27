@@ -305,29 +305,35 @@ async fn channels_round_trips_seeded_store() -> anyhow::Result<()> {
     use alloy::primitives::{Address, U256};
 
     let token: Address = "a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48".parse()?;
-    let mk = |id_byte: u8, amount: u64, deposit: u64, nonce: u64| -> ChannelState {
-        let mut id = [0u8; 32];
-        id[31] = id_byte;
-        let mut client = [0u8; 20];
-        client[19] = id_byte;
-        ChannelState::hydrate(
-            id.into(),
-            Address::from(client),
-            Address::from(client),
-            token,
-            U256::from(deposit),
-            U256::from(amount),
-            U256::from(nonce),
-            U256::from(amount),
-            None,
-            0,
-            false,
-        )
-    };
+    // `signer_byte` distinguishes the pinned voucher signer from the funder so
+    // the admin surface is proven to report both, not the funder twice.
+    let mk =
+        |id_byte: u8, signer_byte: u8, amount: u64, deposit: u64, nonce: u64| -> ChannelState {
+            let mut id = [0u8; 32];
+            id[31] = id_byte;
+            let mut client = [0u8; 20];
+            client[19] = id_byte;
+            let mut signer = [0u8; 20];
+            signer[19] = signer_byte;
+            ChannelState::hydrate(
+                id.into(),
+                Address::from(client),
+                Address::from(signer),
+                token,
+                U256::from(deposit),
+                U256::from(amount),
+                U256::from(nonce),
+                U256::from(amount),
+                None,
+                0,
+                false,
+            )
+        };
 
     let store = Arc::new(MemoryChannelStateStore::new());
-    store.record(&mk(1, 2_000_000, 10_000_000, 5))?;
-    store.record(&mk(2, 100_000, 5_000_000, 2))?;
+    // Channel 1 delegates signing to a distinct key; channel 2 self-signs.
+    store.record(&mk(1, 0xAA, 2_000_000, 10_000_000, 5))?;
+    store.record(&mk(2, 2, 100_000, 5_000_000, 2))?;
 
     let peer_table = Arc::new(RwLock::new(PeerTable::new(0, 0)));
     let (cache, _tmp) = test_cache().await?;
@@ -363,6 +369,18 @@ async fn channels_round_trips_seeded_store() -> anyhow::Result<()> {
     assert!(first.settlement_eligible, "2 USDC >= 1 USDC threshold");
     assert!(first.channel_id.starts_with("0x"));
     assert!(first.counterparty.starts_with("0x"));
+    assert_eq!(
+        first.voucher_signer,
+        Address::from([
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xAA
+        ])
+        .to_string(),
+        "the delegated voucher signer must reach the admin surface"
+    );
+    assert_ne!(
+        first.voucher_signer, first.counterparty,
+        "funder and signer must not collapse onto one address"
+    );
     assert_eq!(first.seconds_since_last_voucher, None);
     let second = resp
         .channels
@@ -370,6 +388,10 @@ async fn channels_round_trips_seeded_store() -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("missing second channel"))?;
     assert_eq!(second.outstanding_micro_usdc, 100_000);
     assert!(!second.settlement_eligible, "0.1 USDC < 1 USDC threshold");
+    assert_eq!(
+        second.voucher_signer, second.counterparty,
+        "a self-signing channel reports the funder as its signer"
+    );
 
     let _ = stop_tx.send(());
     join.await?;

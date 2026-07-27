@@ -839,6 +839,7 @@ fn build_channel_snapshots(
             ChannelSnapshot {
                 channel_id: state.channel_id.to_string(),
                 counterparty: state.client.to_string(),
+                voucher_signer: state.voucher_signer.to_string(),
                 last_nonce: u64::try_from(state.last_nonce()).unwrap_or(u64::MAX),
                 outstanding_micro_usdc: u64::try_from(outstanding).unwrap_or(u64::MAX),
                 deposit_micro_usdc: u64::try_from(state.deposit).unwrap_or(u64::MAX),
