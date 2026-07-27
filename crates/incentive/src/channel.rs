@@ -45,8 +45,7 @@ pub type ChannelId = B256;
 ///
 /// The remaining fields stay `pub` deliberately, and the asymmetry is
 /// intentional: `channel_id`/`client`/`voucher_signer`/`token` are immutable
-/// identity set once at
-/// construction; `deposit` is raised by on-chain top-ups
+/// identity set once at construction; `deposit` is raised by on-chain top-ups
 /// ([`crate::ChannelState`] consumers via `ChannelOpened`/`ChannelToppedUp`) and
 /// `expires_at` by the lifecycle watcher — both mutated only by trusted node-side
 /// writers under the same clone-record-swap discipline. They are not
@@ -160,10 +159,12 @@ impl ChannelState {
     /// transposition compiles. Swapping `client` and `voucher_signer` in
     /// particular is silent *and* security-relevant — it moves both the voucher
     /// verification target and the ADR-011 blacklist subject.
-    /// It has a single caller — the `channels.redb` decoder — whose
-    /// record→load round-trip tests would catch a swap; do not add callers
-    /// without the same coverage (a field-named init struct would be the move if
-    /// a second one ever appears).
+    /// It has a single caller — the `channels.redb` decoder — which persists
+    /// `client` and `voucher_signer` as separate on-disk segments, so its
+    /// record→load round-trip tests (which pin a signer distinct from the
+    /// funder) catch a swap of that pair. Do not add callers without the same
+    /// coverage (a field-named init struct would be the move if a second one
+    /// ever appears).
     #[must_use]
     #[allow(clippy::too_many_arguments)]
     pub const fn hydrate(
@@ -832,10 +833,10 @@ mod tests {
     /// distinct delegate key: the delegate's voucher must be accepted.
     #[test]
     fn voucher_signed_by_delegate_is_accepted() -> anyhow::Result<()> {
-        let (funder, _state, domain, store) = fixture();
+        let (funder, base, domain, store) = fixture();
         let delegate = PrivateKeySigner::random();
         let mut state = ChannelState::new(
-            b256!("11223344556677889900aabbccddeeff00112233445566778899aabbccddeeff"),
+            base.channel_id,
             funder.address(),
             delegate.address(),
             TOKEN,
@@ -854,10 +855,10 @@ mod tests {
     /// verification target actually moved off `client`.
     #[test]
     fn voucher_signed_by_funder_is_rejected_when_a_delegate_is_pinned() -> anyhow::Result<()> {
-        let (funder, _state, domain, store) = fixture();
+        let (funder, base, domain, store) = fixture();
         let delegate = PrivateKeySigner::random();
         let mut state = ChannelState::new(
-            b256!("11223344556677889900aabbccddeeff00112233445566778899aabbccddeeff"),
+            base.channel_id,
             funder.address(),
             delegate.address(),
             TOKEN,
