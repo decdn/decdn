@@ -353,7 +353,11 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, SunsettingPausable, E
     ///      `nonReentrant` against the immutable, trusted `CapacityBond`.
     /// @param voucherSigner Address authorized to sign vouchers for this channel.
     ///        Pass `address(0)` for the default self-signing behaviour (`msg.sender`).
-    ///        Pinned permanently at open; there is no setter.
+    ///        Pinned permanently at open; there is no setter. Must not be the
+    ///        counterparty: passing `provider` here hands the provider unilateral
+    ///        authority to sign vouchers draining the full deposit. Callers are
+    ///        responsible for this — it is not enforced on-chain, since any address may
+    ///        legitimately be delegated.
     // slither-disable-next-line reentrancy-no-eth
     function openChannel(address provider, uint256 deposit, address voucherSigner)
         external
@@ -465,7 +469,12 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, SunsettingPausable, E
 
     /// @notice Client or provider: initiate close with the latest voucher; starts
     ///         the dispute window. A zero-voucher close (all-zero args + empty
-    ///         signature, only while `claimedNonce == 0`) skips signature checks.
+    ///         signature) skips signature checks and closes at the recorded
+    ///         watermark.
+    /// @dev A party may always close at the recorded watermark without holding a
+    ///      voucher; a voucher is required only to *raise* the watermark. The
+    ///      zero-voucher call advances nothing, so the counterparty retains its full
+    ///      `disputeChannel` ratchet-up right for the whole dispute window.
     /// @dev `_verifyVoucher` may staticcall an ERC-1271 client before the close-state
     ///      writes; safe under `nonReentrant` + checks-effects-interactions.
     // slither-disable-next-line reentrancy-no-eth
@@ -483,8 +492,7 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, SunsettingPausable, E
         _requireOpenAndUnexpired(ch);
         if (msg.sender != ch.client && msg.sender != ch.provider) revert NotChannelParty();
 
-        bool zeroVoucher =
-            amount == 0 && nonce == 0 && bytesDelivered == 0 && signature.length == 0 && ch.claimedNonce == 0;
+        bool zeroVoucher = amount == 0 && nonce == 0 && bytesDelivered == 0 && signature.length == 0;
 
         if (!zeroVoucher) {
             _verifyVoucher(channelId, amount, nonce, bytesDelivered, ch.voucherSigner, signature);
@@ -494,12 +502,21 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, SunsettingPausable, E
             _requireBytesTrackPayment(ch);
         }
 
-        ch.status = Status.Closing;
-        ch.disputeDeadline = uint64(block.timestamp + disputeWindow);
+        _initiateClose(ch, channelId);
+    }
 
-        emit ChannelCloseInitiated(
-            channelId, msg.sender, ch.claimedAmount, ch.claimedNonce, ch.claimedBytes, ch.disputeDeadline
-        );
+    /// @notice Client or provider: close at the channel's recorded claim watermark
+    ///         without presenting a voucher.
+    /// @dev A thin alias over the same close path `closeChannel` takes with an empty
+    ///      voucher. It advances no watermark, so the counterparty keeps its full
+    ///      `disputeChannel` ratchet-up right for the dispute window. Exists so a
+    ///      party that never received (or has lost) a voucher is not forced to wait
+    ///      out `expiresAt`.
+    function closeChannelWithoutVoucher(bytes32 channelId) external nonReentrant {
+        Channel storage ch = channels[channelId];
+        _requireOpenAndUnexpired(ch);
+        if (msg.sender != ch.client && msg.sender != ch.provider) revert NotChannelParty();
+        _initiateClose(ch, channelId);
     }
 
     /// @notice Any address: submit a strictly-higher-nonce voucher during the
@@ -608,10 +625,16 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, SunsettingPausable, E
     ///      stranded — the caller retries post-unpause or falls back to the
     ///      `closeChannel` path. So no defer branch (and no deferred-settlement
     ///      bookkeeping) is warranted.
-    /// @dev The pinned `voucherSigner` may call this. A compromised hot signing key
-    ///      can therefore force settlement at the current watermark. This is bounded — it
-    ///      redirects no funds, since the refund still pays `ch.client` and the settlement
-    ///      still pays `ch.provider` — but it is not zero authority.
+    /// @dev The pinned `voucherSigner` may call this. It cannot do so alone — the call
+    ///      also requires `providerCloseSig`, verified against `ch.provider` — but a
+    ///      compromised hot signing key combined with a provider waiver can force
+    ///      settlement at the current watermark. This is bounded — it redirects no funds,
+    ///      since the refund still pays `ch.client` and the settlement still pays
+    ///      `ch.provider` — but it is not zero authority.
+    /// @dev The signer is deliberately NOT a party to the other lifecycle entry points:
+    ///      `closeChannel`, `closeChannelWithoutVoucher`, `topUp`, and `withdraw` remain
+    ///      client/provider-only. The asymmetry is intentional — the delegate's authority
+    ///      is confined to what it can already do by signing a voucher.
     /// @param clientVoucherSig The client-side voucher, signed by the channel's pinned
     ///        `voucherSigner` (which defaults to `ch.client` when none was delegated).
     // slither-disable-next-line reentrancy-no-eth
@@ -830,6 +853,18 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, SunsettingPausable, E
     // -----------------------------------------------------------------
     // Internal
     // -----------------------------------------------------------------
+
+    /// @dev Shared close tail: move the channel into the dispute window at its
+    ///      current watermark. Callers do the party/state checks and any watermark
+    ///      advance first.
+    function _initiateClose(Channel storage ch, bytes32 channelId) internal {
+        ch.status = Status.Closing;
+        ch.disputeDeadline = uint64(block.timestamp + disputeWindow);
+
+        emit ChannelCloseInitiated(
+            channelId, msg.sender, ch.claimedAmount, ch.claimedNonce, ch.claimedBytes, ch.disputeDeadline
+        );
+    }
 
     function _requireOpenAndUnexpired(Channel storage ch) internal view {
         if (ch.status != Status.Open) revert ChannelNotOpen();

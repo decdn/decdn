@@ -34,6 +34,11 @@ contract InterfaceFreezeTest is Test {
             "closeChannel"
         );
         assertEq(
+            PaymentChannel.closeChannelWithoutVoucher.selector,
+            bytes4(keccak256("closeChannelWithoutVoucher(bytes32)")),
+            "closeChannelWithoutVoucher"
+        );
+        assertEq(
             PaymentChannel.disputeChannel.selector,
             bytes4(keccak256("disputeChannel(bytes32,uint256,uint256,uint256,bytes)")),
             "disputeChannel"
