@@ -399,6 +399,16 @@ since project inception and will roll into the first tagged release.
 
 #### CLI
 
+- **`decdn node channels` gained a `SIGNER` column.** It reports the channel's
+  pinned `voucherSigner` — the key whose signature is required on every voucher —
+  next to `COUNTERPARTY` (the funder, and the address the ADR 011 compliance
+  gates check). For every channel opened today the two are equal, because a zero
+  `voucherSigner` argument to `openChannel` resolves on-chain to `msg.sender`;
+  they diverge only when a funder pins a delegate. **Output-breaking for scripts:**
+  the table is ~15 characters wider and column positions after `COUNTERPARTY`
+  have shifted, so positional parsers (`awk '{print $N}'`, fixed-offset `cut`)
+  need updating.
+
 - **The CLI now rejects the zero address for the four addresses resolved by
   `resolve` / `resolve_appeal` / `resolve_publish`, not just the appeal address
   (#1153).** Those four (`capacity_bond_address`, `slash_appeal_address`,
