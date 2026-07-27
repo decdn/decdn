@@ -110,11 +110,21 @@ alloy::sol! {
         function finalizeUnappealedSlash(uint256 slashId) external;
     }
 
-    /// Buyer-side `openChannel` (omitted by the seller-only production binding)
-    /// plus the channel-derivation reads.
+    /// Buyer-side `openChannel` plus the channel-derivation reads.
+    ///
+    /// NOTE: `openChannel` is now **duplicated** — the production binding in
+    /// `decdn_incentive::payment_channel::PaymentChannel` grew the buyer write
+    /// too (#744), so this declaration is redundant and must be kept in sync
+    /// with `contracts/src/PaymentChannel.sol` by hand. Collapsing onto the
+    /// production binding is worthwhile cleanup, but out of scope here.
+    ///
+    /// `voucherSigner` pins the voucher-signing address; the contract resolves
+    /// the zero address to `msg.sender` (self-signing).
     #[sol(rpc)]
     contract PaymentChannelOpen {
-        function openChannel(address provider, uint256 deposit) external returns (bytes32 channelId);
+        function openChannel(address provider, uint256 deposit, address voucherSigner)
+            external
+            returns (bytes32 channelId);
         function minDeposit() external view returns (uint256);
         function clientChannelNonce(address client) external view returns (uint256);
     }

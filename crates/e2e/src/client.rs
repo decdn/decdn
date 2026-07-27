@@ -471,7 +471,8 @@ impl ClientFixture {
             .context("read client channel nonce")?;
         let deposit = U256::from(DEPOSIT_MICRO_USDC);
         let open_receipt = pc
-            .openChannel(node.operator_addr(), deposit)
+            // self-signing: the contract resolves zero to msg.sender
+            .openChannel(node.operator_addr(), deposit, Address::ZERO)
             .send()
             .await
             .context("openChannel send")?

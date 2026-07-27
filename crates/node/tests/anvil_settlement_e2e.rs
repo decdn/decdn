@@ -318,7 +318,11 @@ alloy::sol! {
 
     #[sol(rpc)]
     contract PaymentChannelOpen {
-        function openChannel(address provider, uint256 deposit) external returns (bytes32 channelId);
+        // `voucherSigner` pins the voucher-signing address; the contract
+        // resolves the zero address to `msg.sender` (self-signing).
+        function openChannel(address provider, uint256 deposit, address voucherSigner)
+            external
+            returns (bytes32 channelId);
     }
 
     #[sol(rpc)]
@@ -618,7 +622,8 @@ async fn run_e2e() -> anyhow::Result<()> {
     // ============================================================
     let deposit = U256::from(DEPOSIT_MICRO_USDC);
     pc_client
-        .openChannel(node_addr, deposit)
+        // self-signing: the contract resolves zero to msg.sender
+        .openChannel(node_addr, deposit, Address::ZERO)
         .send()
         .await?
         .get_receipt()
@@ -723,7 +728,7 @@ async fn run_e2e() -> anyhow::Result<()> {
     // CHANNEL 2 — below-threshold claim, shutdown close, then settle.
     // ============================================================
     pc_client
-        .openChannel(node_addr, deposit)
+        .openChannel(node_addr, deposit, Address::ZERO)
         .send()
         .await?
         .get_receipt()
@@ -1099,7 +1104,7 @@ async fn run_e2e() -> anyhow::Result<()> {
     let auto_nonce = pc_read.clientChannelNonce(client_addr).call().await?;
     let id3 = derive_channel_id(client_addr, node_addr, auto_nonce.to::<u64>());
     pc_client
-        .openChannel(node_addr, deposit)
+        .openChannel(node_addr, deposit, Address::ZERO)
         .send()
         .await?
         .get_receipt()
@@ -1276,7 +1281,7 @@ async fn run_e2e() -> anyhow::Result<()> {
     let down_nonce = pc_read.clientChannelNonce(client_addr).call().await?;
     let down_id = derive_channel_id(client_addr, node_addr, down_nonce.to::<u64>());
     pc_client
-        .openChannel(node_addr, U256::from(DEPOSIT_MICRO_USDC))
+        .openChannel(node_addr, U256::from(DEPOSIT_MICRO_USDC), Address::ZERO)
         .send()
         .await?
         .get_receipt()
@@ -1358,7 +1363,7 @@ async fn run_e2e() -> anyhow::Result<()> {
     let close_nonce = pc_read.clientChannelNonce(client_addr).call().await?;
     let close_id = derive_channel_id(client_addr, node_addr, close_nonce.to::<u64>());
     pc_client
-        .openChannel(node_addr, U256::from(DEPOSIT_MICRO_USDC))
+        .openChannel(node_addr, U256::from(DEPOSIT_MICRO_USDC), Address::ZERO)
         .send()
         .await?
         .get_receipt()
@@ -1479,7 +1484,7 @@ async fn run_e2e() -> anyhow::Result<()> {
     let live_nonce = pc_read.clientChannelNonce(client_addr).call().await?;
     let live_id = derive_channel_id(client_addr, node_addr, live_nonce.to::<u64>());
     pc_client
-        .openChannel(node_addr, U256::from(DEPOSIT_MICRO_USDC))
+        .openChannel(node_addr, U256::from(DEPOSIT_MICRO_USDC), Address::ZERO)
         .send()
         .await?
         .get_receipt()
@@ -1694,7 +1699,7 @@ async fn run_e2e() -> anyhow::Result<()> {
     // re-hydrate it so the reclaim sweep can recover the deposit.
     let pc_buyer = PaymentChannelOpen::new(payment_channel, buyer_provider.clone());
     pc_buyer
-        .openChannel(node_addr, U256::from(DEPOSIT_MICRO_USDC))
+        .openChannel(node_addr, U256::from(DEPOSIT_MICRO_USDC), Address::ZERO)
         .send()
         .await?
         .get_receipt()
@@ -1750,7 +1755,7 @@ async fn run_e2e() -> anyhow::Result<()> {
     let pconcrete = Arc::new(PersistentChannelStateStore::open(pstore_dir.path())?);
     // A real on-chain channel whose local row got corrupted by a downgrade.
     pc_buyer
-        .openChannel(node_addr, U256::from(DEPOSIT_MICRO_USDC))
+        .openChannel(node_addr, U256::from(DEPOSIT_MICRO_USDC), Address::ZERO)
         .send()
         .await?
         .get_receipt()
@@ -1827,7 +1832,7 @@ async fn run_e2e() -> anyhow::Result<()> {
     // expired (every prior scenario warped chain time past the max lifetime).
     let pc_buyer_full = PaymentChannel::new(payment_channel, buyer_provider.clone());
     let open_receipt = pc_buyer
-        .openChannel(node_addr, U256::from(DEPOSIT_MICRO_USDC))
+        .openChannel(node_addr, U256::from(DEPOSIT_MICRO_USDC), Address::ZERO)
         .send()
         .await?
         .get_receipt()
@@ -1861,7 +1866,7 @@ async fn run_e2e() -> anyhow::Result<()> {
     // tight bound turns the regression into a fast, named failure.
     let followup = tokio::time::timeout(Duration::from_secs(20), async {
         let receipt = pc_buyer
-            .openChannel(node_addr, U256::from(DEPOSIT_MICRO_USDC))
+            .openChannel(node_addr, U256::from(DEPOSIT_MICRO_USDC), Address::ZERO)
             .send()
             .await?
             .get_receipt()
