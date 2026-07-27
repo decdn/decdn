@@ -628,6 +628,11 @@ contract PaymentChannelTest is Test {
 
     function test_closeChannelWithoutVoucher_byProvider() public {
         bytes32 id = _open();
+        uint256 expectedDeadline = block.timestamp + channel.disputeWindow();
+
+        vm.expectEmit(true, true, false, true, address(channel));
+        emit PaymentChannel.ChannelCloseInitiated(id, provider, 0, 0, 0, expectedDeadline);
+
         vm.prank(provider);
         channel.closeChannelWithoutVoucher(id);
         assertEq(uint8(channel.getChannel(id).status), uint8(PaymentChannel.Status.Closing));
@@ -657,6 +662,29 @@ contract PaymentChannelTest is Test {
         channel.closeChannelWithoutVoucher(id);
     }
 
+    /// @dev `closeChannelWithoutVoucher` is a distinct entry point with its own
+    ///      `_requireOpenAndUnexpired` guard; pin it independently so a future
+    ///      refactor that drops the guard here (while leaving `closeChannel`
+    ///      guarded) does not pass silently.
+    function test_closeChannelWithoutVoucher_revertsWhenAlreadyClosing() public {
+        bytes32 id = _open();
+        vm.prank(provider);
+        channel.closeChannelWithoutVoucher(id);
+
+        vm.prank(client);
+        vm.expectRevert(PaymentChannel.ChannelNotOpen.selector);
+        channel.closeChannelWithoutVoucher(id);
+    }
+
+    function test_closeChannelWithoutVoucher_revertsAfterExpiry() public {
+        bytes32 id = _open();
+        vm.warp(block.timestamp + MAX_DURATION);
+
+        vm.prank(provider);
+        vm.expectRevert(PaymentChannel.ChannelExpired.selector);
+        channel.closeChannelWithoutVoucher(id);
+    }
+
     function test_closeChannelWithoutVoucher_disputeStillRatchets() public {
         bytes32 id = _open();
         vm.prank(provider);
@@ -667,6 +695,14 @@ contract PaymentChannelTest is Test {
 
         channel.disputeChannel(id, 300e6, 2, 30_000_000, _sign(id, 300e6, 2, 30_000_000));
         assertEq(channel.getChannel(id).claimedAmount, 300e6, "counterparty ratcheted up post-close");
+
+        // The ratchet is not just bookkeeping: settlement must actually route the
+        // delta above what `withdraw` already paid out.
+        vm.warp(block.timestamp + channel.disputeWindow() + 1);
+        channel.settleChannel(id);
+        assertEq(
+            router.totalRouted(), 300e6, "withdraw's 100e6 plus settle's 200e6 delta land at the ratcheted watermark"
+        );
     }
 
     function test_closeChannelWithoutVoucher_settlesAtWatermark() public {

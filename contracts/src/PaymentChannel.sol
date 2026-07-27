@@ -632,9 +632,12 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, SunsettingPausable, E
     ///      since the refund still pays `ch.client` and the settlement still pays
     ///      `ch.provider` — but it is not zero authority.
     /// @dev The signer is deliberately NOT a party to the other lifecycle entry points:
-    ///      `closeChannel`, `closeChannelWithoutVoucher`, `topUp`, and `withdraw` remain
-    ///      client/provider-only. The asymmetry is intentional — the delegate's authority
-    ///      is confined to what it can already do by signing a voucher.
+    ///      `closeChannel` and `closeChannelWithoutVoucher` remain open to either the
+    ///      client or the provider; `topUp` remains client-only (see `topUp`'s caller
+    ///      gate) and `withdraw` remains provider-only (see `withdraw`'s caller gate).
+    ///      The signer is a party to none of them. The asymmetry is intentional — the
+    ///      delegate's authority is confined to what it can already do by signing a
+    ///      voucher.
     /// @param clientVoucherSig The client-side voucher, signed by the channel's pinned
     ///        `voucherSigner` (which defaults to `ch.client` when none was delegated).
     // slither-disable-next-line reentrancy-no-eth
