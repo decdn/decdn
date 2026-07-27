@@ -203,7 +203,10 @@ const fn blacklist_key(region: [u8; 32], hash: [u8; 32]) -> [u8; 64] {
 /// segments when `schema_version >= 2`; a v1 record (no trailing segments)
 /// hydrates with an empty signature and `0` expiry. The cooperative-close flag
 /// (`bool`) and the pinned voucher signer (`[u8; 20]`) follow as two further
-/// additive trailing segments, in that order.
+/// additive trailing segments, in that order. The signer segment MUST stay
+/// last: being untagged and fixed-width, it is indistinguishable from any
+/// other >= 20-byte trailer at that position (see `decode_record`, ~:648) —
+/// any future additive segment has to be appended after it, not before.
 #[derive(Debug, Serialize, Deserialize)]
 struct StoredChannelState {
     schema_version: u32,
@@ -648,14 +651,30 @@ fn decode_record(key_bytes: [u8; 32], value_bytes: &[u8]) -> Result<ChannelState
     // Pinned voucher signer (ADR 003 §Voucher authority): an optional trailing
     // `[u8; 20]` segment after the coop-close flag, with the same v2+ gate. It is
     // a fixed 20 raw bytes on the wire (postcard encodes a byte array without a
-    // length prefix), so anything shorter cannot be this segment — that length
-    // check is what keeps a future writer's smaller additive trailer, and the
-    // junk bytes `extra_trailing_bytes_are_tolerated` appends, from being
-    // misread as an address. Absent → `None`, and `into_state` falls back to the
-    // stored `client` (the on-chain default when `voucherSigner` is zero).
+    // length prefix), so the only test this decode can apply is a length check.
+    //
+    // **Invariant, not a guarantee:** this segment is untagged and fixed-width,
+    // so `postcard::take_from_bytes::<[u8; SIGNER_SEGMENT_BYTES]>` succeeds iff
+    // the remainder is >= `SIGNER_SEGMENT_BYTES` — the `len() >= SIGNER_SEGMENT_BYTES`
+    // gate below and the decode attempt are the *same predicate*. Nothing here
+    // distinguishes "the real signer segment" from any other >= 20-byte trailer
+    // that happens to land at this position (`extra_trailing_bytes_are_tolerated`
+    // only stays green because its junk is 8 bytes wide). Any future additive
+    // segment MUST be appended strictly after this one — a segment placed here
+    // instead would be silently misread as an address. A wrong `voucher_signer`
+    // moves the signature-recovery target, so this can fail *open*; `record`
+    // (~:783) and the `StoredChannelState` doc (~:205) restate this briefly.
+    // Absent → `None`, and `into_state` falls back to the stored `client` (the
+    // on-chain default when `voucherSigner` is zero).
     let (voucher_signer, leftover): (Option<Address>, &[u8]) =
         if stored.schema_version >= 2 && leftover.len() >= SIGNER_SEGMENT_BYTES {
             let taken = postcard::take_from_bytes::<[u8; SIGNER_SEGMENT_BYTES]>(leftover);
+            // `taken` cannot actually be `Err` here: the gate above already
+            // establishes `leftover.len() >= SIGNER_SEGMENT_BYTES`, which is the
+            // exact condition `take_from_bytes` on a fixed-width array checks.
+            // Kept as a guard (rather than collapsed to `.ok()`) in case the gate
+            // above is ever loosened or the segment type changes shape, and to
+            // preserve the `StoreError::Corrupt` plumbing without a `.ok_or`.
             let (bytes, rest) = taken.map_err(|err| StoreError::Corrupt {
                 channel_id: Some(channel_id),
                 detail: format!("postcard decode of voucher signer failed: {err}"),
@@ -779,7 +798,10 @@ impl ChannelStateStore for PersistentChannelStateStore {
         // additive reasons — a record written before delegated signers existed
         // has no such segment and `decode_record` falls back to `client`, the
         // on-chain default when `openChannel` is passed a zero `voucherSigner`.
-        // 20 bytes keeps the record well under `SANE_TRAILER_MAX_BYTES`.
+        // 20 bytes keeps the record well under `SANE_TRAILER_MAX_BYTES`. This
+        // MUST stay the last segment: it is untagged and fixed-width, so any
+        // future additive segment placed before it would be silently misread as
+        // an address by `decode_record` (~:648) — append new segments after it.
         let signer_bytes: [u8; SIGNER_SEGMENT_BYTES] = state.voucher_signer.into();
         let signer_encoded = postcard::to_allocvec(&signer_bytes).map_err(|err| {
             StoreError::Codec(format!("postcard encode of voucher signer: {err}"))
@@ -1424,6 +1446,25 @@ mod tests {
         )
     }
 
+    /// Hand-encodes the segments common to every "record written before a
+    /// later segment existed" fixture below: the `StoredChannelState` prefix,
+    /// then the two `TrailerV2` fields (signature, expiry) encoded the same
+    /// way `record` appends them. Named for its callers' shared purpose —
+    /// building the pre-signer-segment shape — even though not every caller
+    /// stops there: `record_without_cooperative_close_segment_decodes_false`
+    /// stops right here, while `extra_trailing_bytes_are_tolerated` and
+    /// `record_without_voucher_signer_segment_hydrates_to_client` append a
+    /// coop-close `bool` (and, for the former, junk bytes) on top. Extracting
+    /// just the truly-shared three segments keeps that layout from drifting
+    /// independently at three call sites as more segments accrue.
+    fn encode_pre_signer(s: &ChannelState) -> anyhow::Result<Vec<u8>> {
+        let mut encoded = postcard::to_allocvec(&StoredChannelState::from(s))?;
+        let sig_vec = s.last_signature().map_or_else(Vec::new, |x| x.to_vec());
+        encoded.extend_from_slice(&postcard::to_allocvec(&sig_vec)?);
+        encoded.extend_from_slice(&postcard::to_allocvec(&s.expires_at)?);
+        Ok(encoded)
+    }
+
     #[test]
     fn open_empty_store_returns_no_entries() -> anyhow::Result<()> {
         let dir = data_dir()?;
@@ -1700,14 +1741,14 @@ mod tests {
         // Encode the real v2 record (prefix + signature + expiry segments),
         // then append plausible *further* additive-field bytes (simulating
         // what a future schema beyond v2 would write after the known segments).
-        let mut encoded = postcard::to_allocvec(&StoredChannelState::from(&s))?;
-        let sig_vec = s.last_signature().map_or_else(Vec::new, |x| x.to_vec());
-        encoded.extend_from_slice(&postcard::to_allocvec(&sig_vec)?);
-        encoded.extend_from_slice(&postcard::to_allocvec(&s.expires_at)?);
+        let mut encoded = encode_pre_signer(&s)?;
         // The cooperative-close flag is now a known trailing segment; the
         // "further additive-field bytes" a future schema would write come after
         // it, so encode a valid flag first, then the junk a newer writer appended.
         encoded.extend_from_slice(&postcard::to_allocvec(&s.cooperative_close_signed())?);
+        // NB: this junk MUST stay under `SIGNER_SEGMENT_BYTES` (20 bytes) to
+        // still land as "unknown trailer" rather than being consumed as the
+        // voucher-signer segment — see `decode_record`'s signer-segment gate.
         encoded.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01, 0x02, 0x03]);
 
         let mut tx = store.db.begin_write()?;
@@ -1765,10 +1806,7 @@ mod tests {
         let store = PersistentChannelStateStore::open(dir.path())?;
         let s = sample(0x66);
         let key: [u8; 32] = s.channel_id.into();
-        let mut encoded = postcard::to_allocvec(&StoredChannelState::from(&s))?;
-        let sig_vec = s.last_signature().map_or_else(Vec::new, |x| x.to_vec());
-        encoded.extend_from_slice(&postcard::to_allocvec(&sig_vec)?);
-        encoded.extend_from_slice(&postcard::to_allocvec(&s.expires_at)?);
+        let encoded = encode_pre_signer(&s)?;
         // Deliberately stop here — no coop-flag segment.
         let mut tx = store.db.begin_write()?;
         tx.set_durability(Durability::Immediate)?;
@@ -1830,10 +1868,7 @@ mod tests {
         let store = PersistentChannelStateStore::open(dir.path())?;
         let s = delegated_sample(0x88);
         let key: [u8; 32] = s.channel_id.into();
-        let mut encoded = postcard::to_allocvec(&StoredChannelState::from(&s))?;
-        let sig_vec = s.last_signature().map_or_else(Vec::new, |x| x.to_vec());
-        encoded.extend_from_slice(&postcard::to_allocvec(&sig_vec)?);
-        encoded.extend_from_slice(&postcard::to_allocvec(&s.expires_at)?);
+        let mut encoded = encode_pre_signer(&s)?;
         encoded.extend_from_slice(&postcard::to_allocvec(&s.cooperative_close_signed())?);
         // Deliberately stop here — no voucher-signer segment.
         let mut tx = store.db.begin_write()?;
@@ -1849,6 +1884,15 @@ mod tests {
         anyhow::ensure!(
             loaded.voucher_signer == loaded.client,
             "a record with no signer segment must hydrate the signer as the client",
+        );
+        // Self-referential on its own: if the decoder misparsed `client`, both
+        // sides move together and the assertion above would still pass. Pin
+        // `client` against the fixture independently, plus the fuller record
+        // equality `voucher_signer_persists_across_reopen` (~:1820) uses.
+        anyhow::ensure!(
+            loaded.client == s.client,
+            "client must decode unchanged (got {})",
+            loaded.client,
         );
         anyhow::ensure!(
             loaded.voucher_signer != s.voucher_signer,
