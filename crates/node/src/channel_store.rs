@@ -97,10 +97,17 @@ const SANE_TRAILER_MAX_BYTES: usize = 256;
 /// the excess-trailer warning.
 const SIGNER_SEGMENT_BYTES: usize = 20;
 
-/// redb table holding the per-channel voucher state. The table name is
-/// version-tagged so a future breaking on-disk layout change can ship as
-/// `channel_state_v2` with a one-shot migration on open; additive changes
-/// stay on `_v1` (postcard skips unknown trailing bytes).
+/// redb table holding the per-channel voucher state. The table name tracks
+/// key/value *shape* (raw key type, postcard envelope), not segment content:
+/// a future breaking change to that shape ships as `channel_state_v2` with a
+/// one-shot migration on open. Segment presence within the `_v1` shape is
+/// instead gated by `schema_version` (see [`SUPPORTED_SCHEMA_VERSION`]) — and
+/// a new segment can be either additive (older readers skip unknown trailing
+/// bytes, e.g. the v2 trailer / coop-close flag) or mandatory (a v3+ reader
+/// requires it and rejects its absence as corrupt, e.g. the voucher-signer
+/// segment — see `decode_record`). A mandatory segment is reader-breaking and
+/// bumps `SUPPORTED_SCHEMA_VERSION`; it does not by itself require a table
+/// rename.
 ///
 /// Key: raw `ChannelId` bytes (`[u8; 32]`).
 /// Value: postcard-encoded [`StoredChannelState`] (variable length).
@@ -686,6 +693,18 @@ fn decode_record(key_bytes: [u8; 32], value_bytes: &[u8]) -> Result<ChannelState
     // - v3 record: `record` always emits the segment, so it is mandatory. Its
     //   absence (or truncation) is genuine corruption and surfaces as
     //   `StoreError::Corrupt` rather than silently defaulting to `client`.
+    //
+    // The `<= SUPPORTED_SCHEMA_VERSION` half of this guard is defensive, not
+    // load-bearing: `into_state` unconditionally rejects any
+    // `schema_version > SUPPORTED_SCHEMA_VERSION` as `UnsupportedSchema`
+    // before this decoded value is ever used, so it is the authoritative
+    // version gate. It is still checked here, deliberately: without it, a
+    // future schema (v4+, unknown segment layout to this binary) would still
+    // attempt to parse this position as a 20-byte address, and on a short or
+    // differently-shaped trailer that surfaces as a confusing
+    // `StoreError::Corrupt` instead of the clean `UnsupportedSchema` the
+    // caller should see (see `future_schema_version_refuses_to_load`, which
+    // pins exactly this).
     let (voucher_signer, leftover): (Option<Address>, &[u8]) =
         if stored.schema_version >= 3 && stored.schema_version <= SUPPORTED_SCHEMA_VERSION {
             let (bytes, rest) = postcard::take_from_bytes::<[u8; SIGNER_SEGMENT_BYTES]>(leftover)

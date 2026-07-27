@@ -321,6 +321,14 @@ fn sign_client_voucher(
 /// buyer holds a voucher worth presenting at close. A channel opened but never
 /// drawn sits at all-zero; re-signing that as a voucher advances nothing the
 /// contract has not already recorded.
+///
+/// Residual gap: this is a proxy for "we hold a key this channel's
+/// `voucherSigner` accepts", not that predicate itself — `BuyerChannelState`
+/// (`crates/incentive/src/buyer_channel.rs`) does not carry the pinned signer,
+/// so the CLI cannot check it directly. A funder-run CLI with a non-zero
+/// watermark it did not itself sign (i.e. a delegated-signer channel) would
+/// still take the `closeChannel` branch and revert. Unreachable today — no
+/// delegation CLI surface exists — and left as-is.
 fn has_claim_watermark(state: &BuyerChannelState) -> bool {
     !(state.last_amount.is_zero()
         && state.last_nonce.is_zero()
@@ -365,12 +373,12 @@ async fn submit_close<P: Provider + Clone>(
     let pending = match sent {
         Ok(pending) => pending,
         Err(e) if e.as_revert_data().is_some() => return Ok(TxOutcome::Reverted),
-        Err(e) => return Err(anyhow::anyhow!("closeChannel send failed: {e}")),
+        Err(e) => return Err(anyhow::anyhow!("channel close send failed: {e}")),
     };
     let receipt = pending
         .get_receipt()
         .await
-        .map_err(|e| anyhow::anyhow!("closeChannel receipt failed: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("channel close receipt failed: {e}"))?;
     Ok(receipt_outcome(receipt.status()))
 }
 
