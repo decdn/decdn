@@ -317,25 +317,52 @@ fn sign_client_voucher(
     Ok(Bytes::from(sig.as_bytes().to_vec()))
 }
 
-/// `closeChannel` with the re-signed latest voucher (opens the dispute window).
+/// Whether the persisted watermark carries anything to claim, i.e. whether this
+/// buyer holds a voucher worth presenting at close. A channel opened but never
+/// drawn sits at all-zero; re-signing that as a voucher advances nothing the
+/// contract has not already recorded.
+fn has_claim_watermark(state: &BuyerChannelState) -> bool {
+    !(state.last_amount.is_zero()
+        && state.last_nonce.is_zero()
+        && state.last_bytes_delivered.is_zero())
+}
+
+/// Initiate close, opening the dispute window. With a claim on the persisted
+/// watermark this is `closeChannel` over the re-signed latest voucher; with
+/// nothing to claim it is `closeChannelWithoutVoucher`, which reaches the same
+/// close path without the signature check.
+///
+/// The empty case is not merely cheaper. `closeChannel` treats a signature of
+/// any length as a voucher to verify, so a zero-amount voucher is still checked
+/// against the channel's pinned `voucherSigner` — and on a channel whose signer
+/// is a *delegate*, the funder's own signature does not recover to it and the
+/// close reverts. `closeChannelWithoutVoucher` is exactly the escape hatch for
+/// a funder holding no voucher at all.
 async fn submit_close<P: Provider + Clone>(
     contract: &PaymentChannel::PaymentChannelInstance<P>,
     state: &BuyerChannelState,
     signer: &PrivateKeySigner,
     domain: &Eip712Domain,
 ) -> anyhow::Result<TxOutcome> {
-    let sig = sign_client_voucher(state, signer, domain)?;
-    let pending = match contract
-        .closeChannel(
-            state.channel_id,
-            state.last_amount,
-            state.last_nonce,
-            state.last_bytes_delivered,
-            sig,
-        )
-        .send()
-        .await
-    {
+    let sent = if has_claim_watermark(state) {
+        let sig = sign_client_voucher(state, signer, domain)?;
+        contract
+            .closeChannel(
+                state.channel_id,
+                state.last_amount,
+                state.last_nonce,
+                state.last_bytes_delivered,
+                sig,
+            )
+            .send()
+            .await
+    } else {
+        contract
+            .closeChannelWithoutVoucher(state.channel_id)
+            .send()
+            .await
+    };
+    let pending = match sent {
         Ok(pending) => pending,
         Err(e) if e.as_revert_data().is_some() => return Ok(TxOutcome::Reverted),
         Err(e) => return Err(anyhow::anyhow!("closeChannel send failed: {e}")),
@@ -1119,6 +1146,30 @@ mod tests {
             short_hex("0x1111111111111111111111111111111111111111"),
             "0x1111111111…"
         );
+    }
+
+    /// The close-form selector: an all-zero watermark has nothing to present,
+    /// so the close goes through `closeChannelWithoutVoucher`. Any non-zero
+    /// component means a voucher exists worth re-signing. All three are checked
+    /// independently — a watermark carrying bytes but no payment (or the
+    /// reverse) is still a claim the contract has recorded.
+    #[test]
+    fn has_claim_watermark_is_false_only_for_an_all_zero_watermark() {
+        let mut st = mk_state(0x11, 0, 10_000_000);
+        st.last_amount = U256::ZERO;
+        st.last_nonce = U256::ZERO;
+        st.last_bytes_delivered = U256::ZERO;
+        assert!(!has_claim_watermark(&st), "never-drawn channel");
+
+        for field in [0usize, 1, 2] {
+            let mut drawn = st.clone();
+            match field {
+                0 => drawn.last_amount = U256::from(1u64),
+                1 => drawn.last_nonce = U256::from(1u64),
+                _ => drawn.last_bytes_delivered = U256::from(1u64),
+            }
+            assert!(has_claim_watermark(&drawn), "field {field} is a claim");
+        }
     }
 
     #[test]

@@ -158,7 +158,11 @@ mod sol_types {
             /// window, during which the counterparty can still dispute in a
             /// higher voucher. Callable by client or provider. This is the
             /// escape hatch for a party holding no voucher at all (e.g. a funder
-            /// whose pinned `voucherSigner` never signed one).
+            /// whose pinned `voucherSigner` never signed one). The node's own
+            /// close paths (seller `send_close`, buyer `close_unilateral`) never
+            /// reach it — both are guarded on holding a voucher — so the callers
+            /// are the CLI `decdn channel close`/`clean` on a never-drawn
+            /// channel, and tests opening a dispute window without one.
             function closeChannelWithoutVoucher(bytes32 channelId) external;
 
             /// Finalize after the dispute window expires; routes the
