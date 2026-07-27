@@ -3535,6 +3535,156 @@ async fn blacklisted_funder_is_refused_even_behind_a_clean_delegate() -> anyhow:
     Ok(())
 }
 
+/// The full delegated round trip: a channel whose `voucher_signer` is NOT the
+/// funder is served end to end on delegate-signed vouchers, and the persisted
+/// state keeps the two addresses apart.
+///
+/// Every other delegated-channel test stops at the open-time gate's verdict.
+/// This one crosses the whole seam — request admitted, delegate-signed vouchers
+/// accepted at each interval, bytes assembled and hash-verified — so a
+/// regression that accepted the open but rejected the delegate's vouchers
+/// mid-stream cannot hide.
+#[tokio::test(flavor = "multi_thread")]
+async fn delegate_signed_vouchers_carry_a_delivery_to_completion() -> anyhow::Result<()> {
+    // 1.5 MiB crosses one voucher-interval boundary plus a closing voucher, so
+    // at least two delegate-signed vouchers are verified.
+    let payload = vec![0xC3u8; 1_572_864];
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+    let (store, funder, delegate) = delegate_signer_store()?;
+    let (target, server_eth, server_ep, server_task, _metrics) =
+        spawn_handler_server_with_metrics(cache, Arc::clone(&store), RATE_PER_MB, 0, 16).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    // The requester signs with the DELEGATE — the funder's key never appears.
+    let ctx = channel_context(Arc::clone(&delegate), U256::from(10_000_000u64));
+    let got = stream_fetch(
+        &client_ep,
+        target,
+        &ctx,
+        &slash_domain(),
+        server_eth.address(),
+        *hash.as_bytes(),
+        0,
+        0x00de_1e05,
+        Duration::from_secs(30),
+    )
+    .await?;
+    anyhow::ensure!(
+        got.as_ref() == payload.as_slice(),
+        "delegate-signed delivery returned {} bytes, expected {}",
+        got.len(),
+        payload.len()
+    );
+
+    let states = store.load_all()?;
+    let state = states
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("the channel must still be persisted"))?;
+    anyhow::ensure!(
+        state.last_nonce() >= U256::from(2u64),
+        "expected at least two accepted delegate-signed vouchers, got nonce {}",
+        state.last_nonce()
+    );
+    // ADR 038: the metered quantity is bao wire bytes, not payload bytes.
+    let wire = support::bao_wire_len_whole(payload.len() as u64);
+    anyhow::ensure!(
+        state.last_bytes_delivered() == U256::from(wire),
+        "the persisted byte count must cover the whole blob: {} (expected {wire})",
+        state.last_bytes_delivered()
+    );
+    anyhow::ensure!(
+        state.client == funder.address() && state.voucher_signer == delegate.address(),
+        "funder and signer must stay distinct across a completed delivery"
+    );
+
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
+/// COMPLIANCE REGRESSION GUARD (ADR 011 §On Blacklist Event), mid-stream half.
+///
+/// The per-MB in-flight takedown re-checks in `window.rs` / `delivery.rs` are
+/// keyed on the FUNDER. Only a comment stops them being re-keyed onto
+/// `voucher_signer`, and the open-time delegated-funder test passes either way
+/// because it never reaches a voucher boundary. This one blacklists the funder
+/// AFTER delivery is under way on a channel whose signer is a clean, never-
+/// blacklisted delegate: if the re-check moved to the signer, the stream would
+/// run to completion and this test fails.
+#[tokio::test(flavor = "multi_thread")]
+async fn blacklisting_the_funder_mid_stream_cuts_off_a_delegated_delivery() -> anyhow::Result<()> {
+    // 16 intervals at the harness's 1 MB `voucher_interval_mb`, so plenty of
+    // boundaries remain after the deny-set flip.
+    let payload = vec![0x6Bu8; 16 * 1024 * 1024];
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+    let (store, funder, delegate) = delegate_signer_store()?;
+    // Starts empty — nothing is denied at open time, so the request is admitted
+    // and the cut-off can only come from the mid-stream re-check.
+    let deny = Arc::new(decdn_node::content_deny::ContentDenylist::empty());
+    let (target, server_eth, server_ep, server_task, metrics) =
+        spawn_handler_server_with_deny(cache, Arc::clone(&store), Arc::clone(&deny)).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let ctx = channel_context(Arc::clone(&delegate), U256::from(10_000_000u64));
+    let fetch_ep = client_ep.clone();
+    let server_addr = server_eth.address();
+    let hash_bytes = *hash.as_bytes();
+    let fetch = tokio::spawn(async move {
+        stream_fetch(
+            &fetch_ep,
+            target,
+            &ctx,
+            &slash_domain(),
+            server_addr,
+            hash_bytes,
+            0,
+            0x00de_1e06,
+            Duration::from_secs(30),
+        )
+        .await
+    });
+
+    // Wait for the first accepted (delegate-signed) voucher: proof the request
+    // was admitted and bytes are flowing, so the flip lands mid-stream rather
+    // than racing the open-time gate.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !store
+        .load_all()?
+        .iter()
+        .any(|state| state.last_amount() > U256::ZERO)
+    {
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "no delegate-signed voucher was ever accepted; the test never reached the \
+             mid-stream path"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    // Only the FUNDER goes on the deny-set; the delegate signer stays clean.
+    deny.apply_chain_origin(funder.address(), true);
+
+    let err = fetch.await?.err().ok_or_else(|| {
+        anyhow::anyhow!(
+            "delivery must not complete once the funder is blacklisted — the mid-stream \
+             re-check has been re-keyed onto the voucher signer"
+        )
+    })?;
+    anyhow::ensure!(
+        metric_line_present(
+            &metrics.encode()?,
+            "decdn_serve_stream_terminated_takedown_total 1"
+        ),
+        "the cut-off must be metered as an in-flight termination, not a completed \
+         delivery ({err})"
+    );
+
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
 /// Open a cache pre-seeded with TWO distinct blobs (via a shared filesystem
 /// origin, dropped after population), mirroring [`cache_with_blob`] for the
 /// concurrent-pull test that requests two different hashes at once.
