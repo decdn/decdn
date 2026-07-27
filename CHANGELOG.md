@@ -43,6 +43,19 @@ since project inception and will roll into the first tagged release.
     old-ABI consumer mis-decodes `provider`, `expiresAt`, `token`,
     `disputeDeadline` and every field after them. All three must be upgraded in
     lockstep with the deployment.
+  - **On-disk (runtime):** the node's seller channel-state record in
+    `<data_dir>/channels.redb` (`channel_state_v1`) goes to `schema_version` 3,
+    which appends the channel's pinned `voucher_signer` as a trailing segment.
+    The version — not the trailer's byte width — is what tells the decoder the
+    segment is there, so unknown trailing bytes on an older record can never be
+    misread as a signer address and silently move the voucher
+    signature-recovery target. Upgrade is transparent: a v1/v2 record hydrates
+    `voucher_signer` from the stored `client`, correct by construction because
+    those channels predate the funder/signer split and are self-signing.
+    **Rollback is not supported** — an older binary reading a v3 record raises
+    `UnsupportedSchema`, and the seller table is fail-closed, so node startup
+    aborts. Downgrading means restoring `channels.redb` from a pre-upgrade
+    backup.
 - **Blacklist-entry appeals removed (#1432).** `ContentBlacklist` no longer
   carries a second appeal state machine on top of enforcement. The six appeal
   entry points (`openBlacklistAppeal`, `fastTrackBlacklistAppeal`,
