@@ -12,12 +12,12 @@ import { ERC20Permit } from "@openzeppelin/contracts/token/ERC20/extensions/ERC2
 ///         `Ownable` authority, and no upgrade hook.
 /// @dev    Composition per ADR 016 § Contract Inventory:
 ///           - `ERC20` + `ERC20Burnable`: base + `burn` / `burnFrom`,
-///             consumed by the slashing path's 20% burn leg
+///             consumed by the slashing path's 50% burn leg
 ///             (ADR 026 § Slashing and burn).
-///           - `ERC20Permit`: EIP-2612 gasless approvals. Used by
-///             `CapacityBond.bond` so operators can sign approval +
-///             state-changing call as a single user op (ADR 024 § ERC-4337
-///             path).
+///           - `ERC20Permit`: EIP-2612 gasless approvals
+///             (ADR 016 § Contract Inventory). Available to holders; no
+///             protocol contract consumes it today — `CapacityBond.bond`
+///             takes a plain `safeTransferFrom` against a prior `approve`.
 ///
 ///         `ERC20Votes` is intentionally omitted. Governance vote weight is
 ///         sourced from `FeeRouter.bytesInWindow` per ADR 036 § Formula —

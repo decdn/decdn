@@ -41,7 +41,6 @@ contract E2EProtocolTest is Test, BaseProtocolDeploy {
     address internal challenger = address(0xCA11E2);
     address internal emergencyMultisig = address(0xC0DE);
     address internal tokenHolder = address(0x70);
-    address internal challengerPool = address(0xCCEE);
 
     uint256 internal constant MIN_BOND = 50_000e18;
     uint256 internal constant DEPOSIT = 1000e6;
@@ -68,7 +67,6 @@ contract E2EProtocolTest is Test, BaseProtocolDeploy {
             deployer: address(this),
             emergencyMultisig: emergencyMultisig,
             initialTokenHolder: tokenHolder,
-            challengerIncentivePool: challengerPool,
             timelockDelay: 48 hours,
             minBond: MIN_BOND,
             unbondingPeriod: 14 days,
@@ -80,8 +78,7 @@ contract E2EProtocolTest is Test, BaseProtocolDeploy {
             feeRouterWindowEpochs: 13,
             feeRouterShares: [uint256(9000), uint256(0), uint256(1000)],
             buybackBurner: address(0),
-            slashAppealBond: 1000e18,
-            blacklistAppealBond: 100e18
+            slashAppealBond: 1000e18
         });
         d = _runFullDeploy(cfg);
 

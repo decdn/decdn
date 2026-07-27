@@ -26,7 +26,7 @@ A channel is opened by depositing the payment token into the `PaymentChannel` co
 
 Key parameters:
 
-- Voucher cadence: 1 MB delivered per voucher (default; negotiable up to `maxVoucherIntervalMb` for large transfers — see [Voucher Interval Negotiation](#voucher-interval-negotiation))
+- Voucher cadence: 1 MB delivered per voucher (default; negotiable up to the 1024 MB wire ceiling for large transfers — see [Voucher Interval Negotiation](#voucher-interval-negotiation))
 - Minimum deposit: 1 USDC (contract floor, governable); recommended practical minimum: 10 USDC (see [Deposit Economics](#deposit-economics))
 - Fee routing: the operator payment-token balance is forwarded to `FeeRouter.routeSettlement(operator, bytesDelivered, amount)` — at final settlement, and incrementally on each `withdraw` — and the three-bucket split (60% operator base, 30% buyback, 10% treasury) is dispatched same-tx per [ADR 026](026-tokenomics.md#adr-026-tokenomics). The per-call deltas partition the channel's lifetime claim, so each byte and USDC unit is split exactly once. See [FeeRouter Integration](#feerouter-integration).
 - Operator return is differentiated through the `CapacityBond` lock-to-capacity curve per [ADR 026](026-tokenomics.md#adr-026-tokenomics), not via a fee-discount mechanic on the channel contract.
@@ -51,7 +51,7 @@ The overhead percentages above represent worst-case single-session economics. Lo
 
 #### Smart Account Support and Gasless Channel Opens
 
-All deCDN contracts use OpenZeppelin `SignatureChecker` for signature verification, supporting both EOA (via `ecrecover`) and smart account wallets (via ERC-1271 `isValidSignature`). Safe smart wallets are the recommended wallet type for both node operators and clients — see [ADR 024](024-account-abstraction.md#adr-024-account-abstraction-and-safe-smart-wallet-support).
+All deCDN contracts use OpenZeppelin `SignatureChecker` for signature verification, supporting both EOA (via `ecrecover`) and smart account wallets (via ERC-1271 `isValidSignature`). Safe and other ERC-1271 smart accounts are supported wallet types for node operators and clients; the encrypted EOA keystore is the documented default — see [ADR 024](024-account-abstraction.md#adr-024-account-abstraction-and-safe-smart-wallet-support).
 
 Two standards can further eliminate the requirement for clients to hold the L2's native gas currency:
 
@@ -64,19 +64,17 @@ Gas abstraction via ERC-2771 or ERC-4337 paymasters is targeted at production.
 
 At the default 1 MB cadence, a 10 GB blob requires 10,000 vouchers — each involving a sign, transmit, verify, and ack cycle. This overhead is unnecessary when the unacknowledged exposure per interval is negligible at typical rates.
 
-**Parameter:** `maxVoucherIntervalMb` is a governable parameter on `PaymentChannel` defining the maximum allowed voucher interval in MB. Default: 1 MB. Hardcoded safety bounds: minimum 1 MB, maximum 1024 MB (~1 GB).
+**Wire bounds:** `voucher_interval_mb` MUST be in `1..=1024` (`MAX_VOUCHER_INTERVAL_MB`) wherever it appears, in both `StreamRequest` and `StreamResponse`. The bound is hardcoded in the wire schema, not governable — there is no on-chain counterpart, because vouchers carry no interval field and the contract therefore cannot verify what cadence was used during off-chain delivery. A peer that proposes or accepts a value outside the range commits a protocol error: the message is rejected, not clamped.
 
 **Negotiation semantics:**
 
 1. The client proposes a `voucher_interval_mb` in `StreamRequest` (see [ADR 005](005-protocol.md#adr-005-wire-protocol)).
 2. The node responds with its accepted `voucher_interval_mb` in `StreamResponse`. The node may accept the client's proposal, reduce it, or omit the field to fall back to 1 MB.
-3. The effective interval for the stream is `min(client_proposed, node_accepted, on-chain maxVoucherIntervalMb)`.
+3. The effective interval for the stream is `min(client_proposed, node_accepted)` — computed over values that have each already passed the wire-bounds check above, so the `min` narrows the cadence but never rescues an out-of-range message.
 
 **Default:** `voucher_interval_mb` is optional in both `StreamRequest` and `StreamResponse`; if absent, the default is 1 MB.
 
 **Node sovereignty:** A node can always enforce a smaller interval than the negotiated value by stopping delivery after that many MB without receiving a voucher. This uses the existing self-enforcing mechanism — no protocol change needed beyond the negotiation field.
-
-**Enforcement model:** The on-chain `maxVoucherIntervalMb` parameter is advisory — vouchers contain no interval field, so the contract cannot verify what interval was used during off-chain delivery. Enforcement depends on honest client and node software querying the on-chain parameter and capping their negotiation accordingly. This is consistent with other off-chain protocol parameters (e.g., `rate_per_mb` is advertised off-chain and only becomes enforceable when both signed messages are submitted as slash evidence). The governance parameter serves as a coordination point and a signal to implementations, not a contract-level invariant.
 
 **Risk analysis at negotiated intervals:**
 
@@ -188,7 +186,7 @@ Surfacing these reasons off-chain saves both parties the gas of a doomed on-chai
 - On-chain costs are amortized across an entire channel lifetime — open + close + settle = three transactions regardless of how many MB are delivered (settle can be called by any address, allowing third-party settlement bots)
 - USDC denomination gives node operators predictable unit economics: delivery revenue covers infrastructure costs without exposure to TOKEN price movements
 - The voucher is the payment receipt; the BLAKE3 hash is the delivery receipt. Together they provide mutual protection: the client doesn't sign a voucher for bytes that fail hash verification; the node stops delivering if vouchers stop arriving
-- Maximum risk per voucher interval at default cadence (1 MB) is $0.00001 at market rate — negligible. At the governance maximum interval (1024 MB) and ceiling rate ($0.001/MB), worst-case risk is $1.024 per interval — still small relative to the recommended 10 USDC minimum deposit (see [Voucher Interval Negotiation](#voucher-interval-negotiation))
+- Maximum risk per voucher interval at default cadence (1 MB) is $0.00001 at market rate — negligible. At the wire ceiling (1024 MB) and ceiling rate ($0.001/MB), worst-case risk is $1.024 per interval — still small relative to the recommended 10 USDC minimum deposit (see [Voucher Interval Negotiation](#voucher-interval-negotiation))
 - Market-driven rate setting means replication happens organically: profitable content gets cached by more nodes, driving prices down without any coordination protocol
 - The `PaymentChannel` contract is functionally separated from the `CapacityBond`, keeping the audit surface for each contract's core logic bounded
 
@@ -206,7 +204,7 @@ Surfacing these reasons off-chain saves both parties the gas of a doomed on-chai
 
 Client receives bytes but stops signing vouchers, getting content for free up to the last signed interval.
 
-The self-enforcing stop is sufficient. Maximum loss is one voucher interval at the negotiated cadence: default cadence (1 MB × market rate ≈ $0.00001) is negligible; 100 MB at market rate is ~$0.001; governance maximum (1024 MB) at ceiling rate is ~$1.024 — still negligible relative to channel deposits. Nodes serving high-value content can unilaterally enforce smaller intervals regardless of what was negotiated.
+The self-enforcing stop is sufficient. Maximum loss is one voucher interval at the negotiated cadence: default cadence (1 MB × market rate ≈ $0.00001) is negligible; 100 MB at market rate is ~$0.001; the wire ceiling (1024 MB) at the ceiling rate is ~$1.024 — still negligible relative to channel deposits. Nodes serving high-value content can unilaterally enforce smaller intervals regardless of what was negotiated.
 
 #### Channel griefing
 
@@ -275,7 +273,7 @@ Node announces a blob as cached (`has_blob: true` in a signed `ProbeResponse`) t
 
 **Resolved: slashable offense.** A same-NodeId signed `ProbeResponse(has_blob: true)` paired with a signed `StreamResponse(ok: false)` or redirect for the same hash within a 30-second requester-anchored timestamp window is on-chain-verifiable evidence. The bare timeout / non-response case is reputation-only (no second signed message → not slashable on-chain). Slash schedule per [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn); on-chain verifier per [ADR 014 § Slash Signatures — secp256k1 EIP-712](014-on-chain-verification.md#slash-signatures--secp256k1-eip-712); slash executes at reveal time (the `submit*Challenge` call, after a prior `commitChallenge`) per [ADR 014 § Bond Handling](014-on-chain-verification.md#bond-handling).
 
-To prevent legitimate cache eviction from producing false slash evidence inside the 30-second window, nodes MUST honor a **probe-triggered eviction hold** (35s, 30s slash window + 5s margin) — see [ADR 005 § Probe-Triggered Eviction Hold](005-protocol.md#probe-triggered-eviction-hold) for the requirement and dependent parameters (probe cache TTL, `probe_hold_duration`). Hold violations under OOM / under-provisioning fall to the same 24-hour counter-window; eviction logs are not on-chain verifiable, so only delivery-receipt counter-evidence rebuts. The protocol does not subsidize under-provisioning.
+To prevent legitimate cache eviction from producing false slash evidence inside the 30-second window, nodes MUST honor a **probe-triggered eviction hold** (35s, 30s slash window + 5s margin) — see [ADR 005 § Probe-Triggered Eviction Hold](005-protocol.md#probe-triggered-eviction-hold) for the requirement and dependent parameters (probe cache TTL, `probe_hold_duration`). Under OOM / under-provisioning the safe failure is silence: a bare timeout produces no second signed message and is reputation-only, per the paragraph above. But a node that *signs* a `StreamResponse(ok: false)` for a hash it had announced emits evidence indistinguishable from a deliberate phantom announce, and slashes at reveal time like any other — there is no counter-evidence window to rebut it in. Eviction logs are not on-chain verifiable, so the operator's only recourse is an off-chain evidence bundle filed as a slash appeal ([ADR 028](028-slashing-appeals.md#adr-028-slashing-appeals-and-dispute-escalation)). The protocol does not subsidize under-provisioning.
 
 #### Channel close front-running
 
@@ -322,7 +320,7 @@ Attacker bonds many cheap nodes to dominate probe responses for popular content,
 The core weakness is governance-token-price dependency: at $0.001/TOKEN, the 1 Gbps entry-tier capacity bond (~50,000 TOKEN at default `k=12.6`, `α=1.2` per [ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve)) costs $50 per sybil node. Higher tiers are super-linearly more expensive (10 Gbps ≈ 795K TOKEN; 100 Gbps ≈ 12.6M TOKEN), but a sybil fleet can be dominated by many entry-tier nodes. The unified selection score `rate_per_mb × rtt_ms × (1 / max(reputation, 0.1)²)` (see [ADR 001](001-network.md#node-selection-algorithm)) helps — a sybil fleet must be real hardware in the right geography, competitively priced, and build reputation over time — but does not eliminate the risk when the token is cheap. Options:
 
 - **Option A — Governance raises the 1 Gbps-tier bond via the `k`-bound mechanism in [ADR 026 § Governable parameters with safety bounds](026-tokenomics.md#governable-parameters-with-safety-bounds).** The 1G-tier bond is governable within [10K, 200K TOKEN]; raising it lifts the whole curve. Governance is incentivised to do so when TOKEN price is low, since a sybil-dominated network reduces usage and TOKEN value. Reactive but aligned.
-- **Option B — Bond denominated in USD equivalent via oracle.** Requires a price oracle, which introduces oracle dependency, manipulation, and downtime risks (see rate bounds discussion above). The same concerns apply here, but the impact of oracle failure is lower (new operators temporarily blocked, not payments broken).
+- **Option B — Bond denominated in USD equivalent via oracle.** Requires a price oracle, which introduces oracle dependency, manipulation, and downtime risks (see the rate-floor discussion above). The same concerns apply here, but the impact of oracle failure is lower (new operators temporarily blocked, not payments broken).
 - **Option C — Reputation as a second filter.** New nodes (low reputation, few settled channels) are deprioritised in client selection even if their `rate_per_mb × rtt_ms × (1 / max(reputation, 0.1)²)` score is competitive. A sybil fleet takes time to build reputation, limiting its effectiveness during that window.
 
 #### Rate manipulation cartel
@@ -402,13 +400,12 @@ struct Channel {
 | Lifecycle | `cooperativeClose(channelId, amount, nonce, bytesDelivered, clientVoucherSig, providerCloseSig)` | Client or provider: settle in one tx with **no dispute window**, given a client voucher and a matching provider `CooperativeClose` waiver over the same final tuple. See [§ Cooperative close](#cooperative-close-fast-settle). |
 | Lifecycle | `reclaimExpired(channelId)` | Client or provider: refund `deposit - withdrawnAmount` on an expired channel that was never closed. |
 | View | `getChannel(channelId) → Channel` | Read the on-chain `Channel` struct. |
-| View | `getRateBounds() → (floor, ceiling)` | Current `RateBounds` in payment-token base units. |
+| View | `getRateBounds() → floor` | Current `deliveryFloor` in payment-token base units. |
 | View | `feeRouter() → address` | Configured `FeeRouter` target ([ADR 026](026-tokenomics.md#adr-026-tokenomics)). |
 | Governance | `setFeeRouter(addr)` | Replace router target. `GOVERNANCE_ROLE`-gated; routed through the standard 48h `TimelockController` delay; emits `FeeRouterUpdated(address oldRouter, address newRouter)`. See [§ Governance setter: setFeeRouter](#governance-setter-setfeerouter) below. |
 | Governance | `setMinDeposit(amount)` | Minimum channel deposit. |
 | Governance | `setDisputeWindow(seconds)` | Dispute window (bounded 172800–259200 — 48h–72h). |
-| Governance | `setRateBounds(floor, ceiling)` | Rate floor and ceiling in payment-token base units. |
-| Governance | `setMaxVoucherIntervalMb(mb)` | Max negotiable voucher interval (bounded 1–1024 MB). |
+| Governance | `setRateBounds(floor)` | Per-MB delivery-rate floor in payment-token base units. Capped at `MAX_RATE_PER_MB`. |
 
 Bucket shares (60/30/10) are governed on `FeeRouter`, not on `PaymentChannel`; the treasury share (10%) is configured on `FeeRouter`.
 
@@ -445,7 +442,7 @@ event FeeRouterUpdated(address indexed oldRouter, address indexed newRouter);
 - **Status precondition:** MUST require status `Open` and `block.timestamp < expiresAt` (reverts on `Closing`, `Closed`, or expired), matching `topUp`. Does NOT extend `expiresAt`.
 - **Caller:** provider only (`require(msg.sender == channel.provider)`).
 - **Voucher validation (identical monotonicity to `disputeChannel`):** verify the EIP-712 client signature (see [EIP-712 Voucher Signature](#eip-712-voucher-signature)); require `nonce > claimedNonce`, `amount >= claimedAmount`, `bytesDelivered >= claimedBytes`, and `amount <= deposit` (invariant 1). These advance the same best-voucher watermark (`claimedAmount` / `claimedNonce` / `claimedBytes`) that `closeChannel` and `disputeChannel` use — so a withdrawal can never regress below an already-recorded voucher, and a later close/dispute can never regress below a withdrawal.
-- **Effects (checks-effects-interactions):** advance the watermark (`claimedAmount = amount`, `claimedNonce = nonce`, `claimedBytes = bytesDelivered`); compute `delta = amount - withdrawnAmount` and `bytesDelta = bytesDelivered - withdrawnBytes`; require `delta > 0` (reverts otherwise — there is nothing to withdraw and `FeeRouter` rejects a zero amount); set `withdrawnAmount = amount` and `withdrawnBytes = bytesDelivered`; then `approve(feeRouter, delta)` and call `FeeRouter.routeSettlement(channel.provider, bytesDelta, delta)` in the same transaction (the same approve-then-route pattern `settleChannel` uses). The router applies the three-bucket split, pays the operator's base share same-tx, and increments `bytesPerEpoch[operator][epoch]` by `bytesDelta` — `routeSettlement` is purely additive (`+=`) with no per-channel guard, so calling it once per withdrawal plus once at settlement counts each byte and each USDC unit **exactly once** (the per-call amounts and bytes telescope to the final `claimedAmount` / `claimedBytes`). As a side effect, each `withdraw` (via `routeSettlement`) also calls `CapacityBond.recordSettlement(operator)`, refreshing the operator's settlement-activity liveness signal ([ADR 016 § Settlement-Weighted Bootstrap Ranking](016-contract-interactions.md#settlement-weighted-bootstrap-ranking)) more often than the close-only path did — benign and, if anything, a fresher proof-of-delivery signal.
+- **Effects (checks-effects-interactions):** advance the watermark (`claimedAmount = amount`, `claimedNonce = nonce`, `claimedBytes = bytesDelivered`); compute `delta = amount - withdrawnAmount` and `bytesDelta = bytesDelivered - withdrawnBytes`; require `delta > 0` (reverts otherwise — there is nothing to withdraw and `FeeRouter` rejects a zero amount); set `withdrawnAmount = amount` and `withdrawnBytes = bytesDelivered`; then `approve(feeRouter, delta)` and call `FeeRouter.routeSettlement(channel.provider, bytesDelta, delta)` in the same transaction (the same approve-then-route pattern `settleChannel` uses). The router applies the three-bucket split, pays the operator's base share same-tx, and increments `bytesPerEpoch[operator][epoch]` by `bytesDelta` — `routeSettlement` is purely additive (`+=`) with no per-channel guard, so calling it once per withdrawal plus once at settlement counts each byte and each USDC unit **exactly once** (the per-call amounts and bytes telescope to the final `claimedAmount` / `claimedBytes`).
 - **Modifiers:** `nonReentrant`.
 - **Emits:** `ChannelWithdrawn(channelId, provider, withdrawnDelta, bytesDelta, newWithdrawnAmount)` (where `withdrawnDelta` is the just-routed `delta`).
 
@@ -455,7 +452,7 @@ Because `withdraw` advances `claimedNonce` above zero, the zero-voucher close ca
 
 #### Initial deployment values
 
-The constructor takes `(usdc, capacityBond, feeRouter, disputeWindow, maxChannelDuration, deliveryFloor, deliveryCeiling, admin)` per [ADR 016 § step 8](016-contract-interactions.md#post-deployment-initialization) and defaults the parameters not passed as args: `minDeposit = 1_000_000` (1 USDC) and `maxVoucherIntervalMb = 1` (1 MB). `disputeWindow` and `maxChannelDuration` are constructor arguments validated against the hardcoded safety bounds (deployment defaults: 48h and 90d respectively — see the bounds table below and [ADR 009](009-governance.md#adr-009-governance-model) for governance ranges). The constructor MUST reject any zero address among `(usdc, capacityBond, feeRouter, admin)` and a `feeRouter` whose code size is zero (EOA / undeployed address).
+The constructor takes `(usdc, capacityBond, feeRouter, disputeWindow, maxChannelDuration, deliveryFloor, admin)` per [ADR 016 § Contract Inventory](016-contract-interactions.md#contract-inventory) and defaults the parameter not passed as an argument: `minDeposit = 1_000_000` (1 USDC). `disputeWindow` and `maxChannelDuration` are constructor arguments validated against the hardcoded safety bounds (deployment defaults: 48h and 90d respectively — see the bounds table below and [ADR 009](009-governance.md#adr-009-governance-model) for governance ranges). The constructor MUST reject any zero address among `(usdc, capacityBond, feeRouter, admin)` and a `feeRouter` whose code size is zero (EOA / undeployed address).
 
 Default deployment value for `disputeWindow`: **172800 seconds (48 hours)** — sized to guarantee effective dispute response time under L2 sequencer censorship (see [§ L2 sequencer censorship](#l2-sequencer-censorship) below). Safety bounds per [ADR 009](009-governance.md#adr-009-governance-model): 172800–259200 seconds (48h–72h). Under [ADR 026](026-tokenomics.md#adr-026-tokenomics) the constructor carries no `feePercentage` / `discountedFeePercentage` / treasury-address parameters; bucket shares are governed on `FeeRouter`, and the treasury bucket is one of `FeeRouter`'s three buckets (see [FeeRouter Integration](#feerouter-integration)).
 
@@ -478,7 +475,7 @@ All events use indexed `channelId` plus an indexed actor field where applicable.
 | `ChannelExpiredReclaimed(channelId, client, …)` | `reclaimExpired` | `clientRefund` (= `deposit - withdrawnAmount`) |
 | `ChannelToppedUp(channelId, …)` | `topUp` | `additionalDeposit, newDeposit` |
 | `ChannelWithdrawn(channelId, provider, …)` | `withdraw` | `withdrawnDelta`, `bytesDelta`, `newWithdrawnAmount` |
-| `RateBoundsUpdated` | `setRateBounds` | `newDeliveryFloor, newDeliveryCeiling` |
+| `RateBoundsUpdated` | `setRateBounds` | `newDeliveryFloor` |
 
 `ChannelOpened` is the entry point for off-chain channel enumeration: a client lists their channels via `eth_getLogs(topics=[ChannelOpened, *, paddedClientAddress])`; a provider does the same with their address in the third topic; an indexer keys on `channelId`. This ensures channels are discoverable via log scans even if they have not yet had any subsequent on-chain activity (no `topUp`, `withdraw`, `closeChannel`, or `disputeChannel`).
 
@@ -499,23 +496,20 @@ All events use indexed `channelId` plus an indexed actor field where applicable.
 | --- | --- | --- |
 | Dispute window | 172800 seconds (48 hours) | 259200 seconds (3 days) |
 | Min deposit | 1 base unit | No max |
-| Rate floor | 1 base unit | Must be < ceiling |
-| Rate ceiling | Must be > floor | No max |
-| Max voucher interval | 1 MB | 1024 MB (~1 GB) |
+| Rate floor | 1 base unit | `MAX_RATE_PER_MB` (10^12) |
 | Max channel duration | 604800 seconds (7 days) | 31536000 seconds (365 days) |
 
 `PaymentChannel` does not hold a fee-percentage parameter. Bucket-share bounds (60/30/10 with per-share bounds 40–90 / 5–50 / 0–30) are owned by `FeeRouter` per [ADR 026 § Governable parameters with safety bounds](026-tokenomics.md#governable-parameters-with-safety-bounds).
 
-**Rate bounds are in USDC base units (6 decimals) per MB.** The contract stores `deliveryFloor` and `deliveryCeiling`. `deliveryFloor` is the per-byte price floor **enforced at settlement** (see [Rate-floor enforcement](#rate-floor-enforcement) below); `deliveryCeiling` is an advisory coordination ceiling nodes self-apply (a node would not knowingly overpay, so a hard maximum buys no on-chain safety and risks rejecting legitimate high-egress pricing).
+**The rate floor is in USDC base units (6 decimals) per MB.** The contract stores `deliveryFloor`, the per-byte price floor **enforced at settlement** (see [Rate-floor enforcement](#rate-floor-enforcement) below). There is no governance ceiling: a seller self-clamping its own advertised rate downward buys no on-chain safety — a seller never wants to charge less — and the buyer's protection is seeing the signed rate in `StreamResponse` before it pays. The absolute upper bound is the wire constant `MAX_RATE_PER_MB` ([ADR 005](005-protocol.md#adr-005-wire-protocol)), which honest requesters reject above.
 
-**Initial rate bounds:**
+**Initial rate floor:**
 
 | Parameter | Value (USD/MB) | USDC base units | Rationale |
 | --- | --- | --- | --- |
 | `deliveryFloor` | $0.000001/MB | 1 | Anti-abuse minimum; 10× below expected market rate. **Enforced at settlement** (#846) — the contract rejects any voucher whose cumulative `amount / bytesDelivered` falls below this floor, so claiming served bytes always costs proportional USDC. Prevents zero-rate free-riding and the served-byte vote-weight inflation of [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight), while imposing no practical constraint on legitimate pricing (nodes set rates well above it; the floor is an anti-zero safeguard, not a recommended price). |
-| `deliveryCeiling` | $0.001/MB | 1,000 | 100× expected market rate. Accommodates origin-backed nodes with high-egress backends (e.g., S3 at $0.09/GB) while remaining well above any legitimate pricing scenario ($1.00/GB vs Akamai's ~$0.12–0.20/GB). |
 
-The expected market rate is $0.00001/MB (10 USDC base units per MB, or $0.01/GB). This positions deCDN ~4–9× cheaper than major traditional CDNs (CloudFront at $0.085/GB, KeyCDN at $0.04/GB) and at parity with budget providers (Bunny.net at $0.01/GB). Both bounds are governance-tunable from day one within the hardcoded safety constraints above — admin-key-gated in the PoC, DecdnGovernor in production (see [ADR 009](009-governance.md#adr-009-governance-model)).
+The expected market rate is $0.00001/MB (10 USDC base units per MB, or $0.01/GB). This positions deCDN ~4–9× cheaper than major traditional CDNs (CloudFront at $0.085/GB, KeyCDN at $0.04/GB) and at parity with budget providers (Bunny.net at $0.01/GB). The floor is governance-tunable from day one within the hardcoded safety constraints above — admin-key-gated in the PoC, DecdnGovernor in production (see [ADR 009](009-governance.md#adr-009-governance-model)). Node pricing is otherwise a market outcome: nodes compete on the rate they advertise, and a node that overprices loses selection ([ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh)).
 
 ### Rate-floor enforcement
 
@@ -527,29 +521,29 @@ require:  amount * BYTES_PER_MB >= bytesDelivered * deliveryFloor      (BYTES_PE
 
 evaluated overflow-safely as `bytesDelivered <= Math.mulDiv(amount, BYTES_PER_MB, deliveryFloor)` so a voucher carrying `bytesDelivered` near `type(uint256).max` reverts with `RateFloorViolation` rather than an arithmetic panic. Because `deliveryFloor >= 1` the divisor is non-zero, and `amount == 0` admits only `bytesDelivered == 0` (the zero-voucher close still works). The check uses **zero tolerance** — the floor sits 10× below the expected market rate, so honest traffic clears it by ≥10× and needs no rounding headroom (the off-chain 1% tolerance applies to the *advertised* `rate_per_mb`, not this floor).
 
-This binds served bytes to real USDC: stamping `B` bytes requires cumulatively claiming `>= B / 1_048_576` base units, restoring the proportional-cost assumption [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight) relies on (#846). Serving nodes mirror the same floor off-chain (a zero-tolerance `verify_rate` against `delivery_floor`) before countersigning, so an honest node never accepts a voucher the chain would reject. The earlier design treated rate bounds as purely advisory; this is the one bound promoted to binding.
+This binds served bytes to real USDC: stamping `B` bytes requires cumulatively claiming `>= B / 1_048_576` base units, restoring the proportional-cost assumption [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight) relies on (#846). Serving nodes mirror the same floor off-chain (a zero-tolerance `verify_rate` against `delivery_floor`) before countersigning, so an honest node never accepts a voucher the chain would reject. The floor is the only rate bound the protocol carries, and it is binding.
 
 ### Rate Bounds Refresh
 
-Nodes must keep their local `RateBounds` copy current so advertised `rate_per_mb` stays within governance-set bounds. The contract enforces only the `deliveryFloor` (as the per-byte price floor at settlement, above); `deliveryCeiling` remains an advisory coordination parameter the contract does not verify. The refresh strategy is therefore lighter-touch than the content blacklist ([ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting)), where serving blacklisted content is a slashable offense.
+Nodes must keep their local copy of `deliveryFloor` current so an advertised `rate_per_mb` never falls below it. Staleness is a revenue risk rather than a safety one — a node quoting under a raised floor signs vouchers the chain will reject at settlement — so the refresh strategy is lighter-touch than the content blacklist ([ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting)), where serving blacklisted content is a slashable offense.
 
 **Primary mechanism: event listening.** Nodes SHOULD subscribe to `RateBoundsUpdated` events on the `PaymentChannel` contract and update the local cache immediately. Governance actions are infrequent (days to weeks), so high-frequency polling would be wasteful.
 
-**Fallback mechanism: periodic polling.** Nodes MUST poll `getRateBounds()` at a configurable interval (`rate_bounds_poll_interval`, default **1 hour**), guarding against missed events from RPC provider issues, WebSocket disconnections, or chain reorganizations. The 1-hour default is deliberately longer than the 10-minute registry ([ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh)) / blacklist ([ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting)) intervals: registry freshness is connectivity-critical and blacklist freshness slashing-critical, but rate-bounds staleness only risks counterparties rejecting the node's advertised rate.
+**Fallback mechanism: periodic polling.** Nodes MUST poll `getRateBounds()` at a configurable interval (`rate_bounds_poll_interval`, default **1 hour**), guarding against missed events from RPC provider issues, WebSocket disconnections, or chain reorganizations. The 1-hour default is deliberately longer than the 10-minute registry ([ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh)) / blacklist ([ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting)) intervals: registry freshness is connectivity-critical and blacklist freshness slashing-critical, but a stale rate floor only risks the node quoting below it and signing unredeemable vouchers.
 
 #### Startup
 
-Nodes MUST call `getRateBounds()` before accepting connections, never operating without rate bounds (same pattern as the content blacklist initial sync, [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting)). Because `getRateBounds()` returns `uint256` but the wire protocol represents `rate_per_mb` as `u64` ([ADR 005](005-protocol.md#adr-005-wire-protocol)), nodes MUST verify both `deliveryFloor` and `deliveryCeiling` fit within `u64` on every refresh (startup and subsequent polls/events). If either bound exceeds `u64::MAX`, the node MUST refuse to start (or, on a mid-operation refresh, continue with its last valid bounds and log an error). Unreachable in practice — default ceiling is 1,000 base units — but the check guards against governance misconfiguration.
+Nodes MUST call `getRateBounds()` before accepting connections, never operating without a floor (same pattern as the content blacklist initial sync, [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting)). Because `getRateBounds()` returns `uint256` but the wire protocol represents `rate_per_mb` as `u64` ([ADR 005](005-protocol.md#adr-005-wire-protocol)), nodes MUST verify `deliveryFloor` fits within `u64` on every refresh (startup and subsequent polls/events). If it exceeds `u64::MAX`, the node MUST refuse to start (or, on a mid-operation refresh, continue with its last valid floor and log an error). Unreachable against a correctly-deployed contract — `setRateBounds` caps the floor at `MAX_RATE_PER_MB` (10^12), far below `u64::MAX` — but the check guards against a contract deployed without that cap.
 
 #### Stale bounds
 
-If the event subscription is lost and RPC polling fails, the node SHOULD continue operating with its last-known bounds and log a warning. No service interruption is required. The worst-case consequence of stale bounds is that counterparties running compliant software reject the node's `rate_per_mb` as out-of-bounds — a revenue impact, not a safety violation.
+If the event subscription is lost and RPC polling fails, the node SHOULD continue operating with its last-known floor and log a warning. No service interruption is required. The worst-case consequence of a stale floor is that the node quotes below a raised floor and its vouchers are unredeemable at settlement — a revenue impact, not a safety violation.
 
 #### No version-based delta pattern
 
-Unlike the content blacklist (which uses `getBlacklistVersion()` for cheap change detection and incremental delta fetching), rate bounds are a single struct containing two `uint256` values. A version counter adds no value — the full state is readable in a single `eth_call` with negligible overhead. This is an intentional divergence from the [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting) pattern.
+Unlike the content blacklist (which uses `getBlacklistVersion()` for cheap change detection and incremental delta fetching), the rate floor is a single `uint256`. A version counter adds no value — the full state is readable in a single `eth_call` with negligible overhead. This is an intentional divergence from the [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting) pattern.
 
-For how nodes validate `rate_per_mb` against cached bounds before signing protocol messages, see [ADR 005 — Rate Bounds Validation](005-protocol.md#rate-bounds-validation).
+For how nodes validate `rate_per_mb` against the cached floor before signing protocol messages, see [ADR 005 — Rate Bounds Validation](005-protocol.md#rate-bounds-validation).
 
 ### BuybackBurner
 
@@ -923,7 +917,7 @@ function resolveNodeId(bytes32 nodeId) external view returns (address) {
 
 ### Off-Chain (Ephemeral) Binding for Clients
 
-Clients without on-chain registration MAY include a signed binding in their `StreamRequest` to attest a NodeId↔Ethereum-address mapping for the connection's lifetime. The node verifies the EIP-712 signature over `BindNodeId(nodeId, nonce=0)` using `SignatureChecker` semantics: `ecrecover` for EOA clients, or an RPC call to `isValidSignature` for smart account clients ([ADR 024](024-account-abstraction.md#off-chain-erc-1271-verification)). The verified address is cached for the connection's lifetime and used for voucher attribution. This ephemeral binding is not stored on-chain and is valid only for the session. Wire-format details are in [ADR 005](005-protocol.md#client-identity-binding).
+Clients without on-chain registration MAY include a signed binding in their `StreamRequest` to attest a NodeId↔Ethereum-address mapping for the connection's lifetime. The node verifies the EIP-712 signature over `BindNodeId(nodeId, nonce=0)` by recovering the signer from the fixed 65-byte form and comparing it against the claimed address. Smart-account clients are rejected fail-closed: off-chain ERC-1271 verification is deferred to Production ([ADR 024](024-account-abstraction.md#off-chain-erc-1271-verification)). The verified address is cached for the connection's lifetime and used for voucher attribution. This ephemeral binding is not stored on-chain and is valid only for the session. Wire-format details are in [ADR 005](005-protocol.md#client-identity-binding).
 
 ### Binding Requirements by Role
 

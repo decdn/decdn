@@ -25,8 +25,8 @@ use decdn_node::handlers::probe_rate_limit::{ProbeRateLimiter, ProbeRejectLayer}
 use decdn_node::metrics::Metrics;
 use decdn_node::rate_limit::RateLimitConfig;
 use decdn_protocol::{
-    ALPN_PROBE, APP_ERR_RATE_LIMITED, MAX_MESSAGE_SIZE, MAX_RATE_PER_MB, ProbeMessage,
-    SLASH_SIG_LEN, decode_message, encode_message,
+    ALPN_PROBE, APP_ERR_RATE_LIMITED, MAX_MESSAGE_SIZE, ProbeMessage, SLASH_SIG_LEN,
+    decode_message, encode_message,
     message::{ProbeRequest, ProbeResponse, ProbeResponseBody},
     read_frame, write_frame,
 };
@@ -133,7 +133,6 @@ fn build_handler_bounds(
     limiter: Arc<ConnectionLimiter>,
     cache: CacheEngine,
     floor: u64,
-    ceiling: u64,
 ) -> (Arc<ProbeHandler>, Arc<PrivateKeySigner>, Eip712Domain) {
     // Most tests don't exercise the ADR 005 probe rate limiter — wire a
     // permissive one so only the layer under test (the `ConnectionLimiter`,
@@ -146,7 +145,6 @@ fn build_handler_bounds(
         permissive_probe_rate_limiter(metrics),
         cache,
         floor,
-        ceiling,
     )
 }
 
@@ -162,7 +160,6 @@ fn build_handler_with_probe_limiter(
     probe_limiter: Arc<ProbeRateLimiter>,
     cache: CacheEngine,
     floor: u64,
-    ceiling: u64,
 ) -> (Arc<ProbeHandler>, Arc<PrivateKeySigner>, Eip712Domain) {
     let signer = Arc::new(PrivateKeySigner::random());
     let domain = test_slash_domain();
@@ -175,10 +172,7 @@ fn build_handler_with_probe_limiter(
         cache,
         Arc::clone(&signer),
         domain.clone(),
-        decdn_node::rate_bounds::RateBounds::new(floor, ceiling),
-        // This suite is the pre-ADR-015 1-RTT loopback coverage; 0-RTT
-        // acceptance has its own dedicated test (probe_0rtt.rs).
-        false,
+        decdn_node::rate_bounds::RateBounds::new(floor),
         // No stake-lane reservation for the general-purpose builder; the
         // dedicated reservation tests use `build_handler_with_lane` (#757).
         None,
@@ -214,8 +208,7 @@ fn build_handler_with_lane(
         cache,
         Arc::clone(&signer),
         domain.clone(),
-        decdn_node::rate_bounds::RateBounds::new(0, MAX_RATE_PER_MB),
-        false,
+        decdn_node::rate_bounds::RateBounds::new(0),
         Some(policy),
     ));
     (handler, signer, domain)
@@ -229,7 +222,7 @@ fn build_handler(
     limiter: Arc<ConnectionLimiter>,
     cache: CacheEngine,
 ) -> (Arc<ProbeHandler>, Arc<PrivateKeySigner>, Eip712Domain) {
-    build_handler_bounds(server_id, rate, metrics, limiter, cache, 0, MAX_RATE_PER_MB)
+    build_handler_bounds(server_id, rate, metrics, limiter, cache, 0)
 }
 
 /// Build a permissive `ConnectionLimiter` suitable for tests that don't
@@ -254,7 +247,6 @@ fn permissive_probe_rate_limiter(metrics: &Arc<Metrics>) -> Arc<ProbeRateLimiter
         per_ip_burst: u32::MAX,
         global_rate_per_sec: 1e9,
         global_burst: u32::MAX,
-        trusted_ips: std::collections::HashSet::new(),
         max_tracked_per_ip: 4096,
         max_tracked_per_peer: 4096,
     };
@@ -847,7 +839,6 @@ async fn probe_three_layer_limiter_rejects_per_peer() -> anyhow::Result<()> {
         per_ip_burst: u32::MAX,
         global_rate_per_sec: 1e9,
         global_burst: u32::MAX,
-        trusted_ips: std::collections::HashSet::new(),
         max_tracked_per_ip: 4096,
         max_tracked_per_peer: 4096,
     };
@@ -872,7 +863,6 @@ async fn probe_three_layer_limiter_rejects_per_peer() -> anyhow::Result<()> {
         Arc::clone(&probe_limiter),
         cache,
         0,
-        MAX_RATE_PER_MB,
     );
 
     let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_PROBE.to_vec()]).await?;
@@ -1072,11 +1062,18 @@ async fn probe_holds_disabled_signs_has_blob_false_and_counts_disabled() -> anyh
     // max_probe_holds" alert fires on a config the operator chose.
     let text = metrics.encode()?;
     anyhow::ensure!(
-        metric_value(&text, "decdn_probe_holds_disabled_total") == Some(1),
-        "holds-disabled probe must bump decdn_probe_holds_disabled_total:\n{text}"
+        metric_value(
+            &text,
+            "decdn_probe_hold_unavailable_total{reason=\"disabled\"}"
+        ) == Some(1),
+        "holds-disabled probe must bump the reason=disabled child of \
+         decdn_probe_hold_unavailable_total:\n{text}"
     );
     anyhow::ensure!(
-        metric_value(&text, "decdn_probe_hold_violations_total") == Some(0),
+        metric_value(
+            &text,
+            "decdn_probe_hold_unavailable_total{reason=\"exhausted\"}"
+        ) == Some(0),
         "an intentional disable must NOT inflate the budget-pressure counter:\n{text}"
     );
     Ok(())
@@ -1084,10 +1081,10 @@ async fn probe_holds_disabled_signs_has_blob_false_and_counts_disabled() -> anyh
 
 /// A node with a positive but fully-occupied hold budget answers
 /// `has_blob: false` and counts the event as genuine budget pressure
-/// (`probe_hold_violations`), NOT as a config disable (#739). This is the
+/// (`reason="exhausted"`), NOT as a config disable (#739). This is the
 /// signal whose alert remedy is "increase `max_probe_holds`".
 #[tokio::test(flavor = "multi_thread")]
-async fn probe_budget_exhausted_counts_violation_not_disabled() -> anyhow::Result<()> {
+async fn probe_budget_exhausted_counts_exhausted_not_disabled() -> anyhow::Result<()> {
     let a: &[u8] = b"first popular blob";
     let b: &[u8] = b"second popular blob";
     let (cache, ha, hb, _cache_tmp) = cache_with_two_blobs(a, b).await?;
@@ -1119,11 +1116,18 @@ async fn probe_budget_exhausted_counts_violation_not_disabled() -> anyhow::Resul
 
     let text = metrics.encode()?;
     anyhow::ensure!(
-        metric_value(&text, "decdn_probe_hold_violations_total") == Some(1),
-        "genuine budget exhaustion must bump decdn_probe_hold_violations_total:\n{text}"
+        metric_value(
+            &text,
+            "decdn_probe_hold_unavailable_total{reason=\"exhausted\"}"
+        ) == Some(1),
+        "genuine budget exhaustion must bump the reason=exhausted child of \
+         decdn_probe_hold_unavailable_total:\n{text}"
     );
     anyhow::ensure!(
-        metric_value(&text, "decdn_probe_holds_disabled_total") == Some(0),
+        metric_value(
+            &text,
+            "decdn_probe_hold_unavailable_total{reason=\"disabled\"}"
+        ) == Some(0),
         "budget pressure must NOT be counted as a config disable:\n{text}"
     );
     Ok(())
@@ -1135,8 +1139,8 @@ async fn probe_budget_exhausted_counts_violation_not_disabled() -> anyhow::Resul
 /// Here `max_holds=1, reserved=1` gives a ceiling of `0`, so the end-client
 /// is shed immediately even though the blob is cached and the budget is free.
 /// The event is counted as a stake-lane reservation — never as budget
-/// exhaustion (`probe_hold_violations`) or a config disable
-/// (`probe_holds_disabled`), whose alerts have different remedies.
+/// exhaustion (`reason="exhausted"`) or a config disable
+/// (`reason="disabled"`), whose alerts have different remedies.
 #[tokio::test(flavor = "multi_thread")]
 async fn probe_end_client_reserved_out_signs_has_blob_false() -> anyhow::Result<()> {
     let payload = b"reserved-for-stake-lane content";
@@ -1181,15 +1185,25 @@ async fn probe_end_client_reserved_out_signs_has_blob_false() -> anyhow::Result<
 
     let text = metrics.encode()?;
     anyhow::ensure!(
-        metric_value(&text, "decdn_probe_stake_lane_reserved_total") == Some(1),
-        "reservation refusal must bump decdn_probe_stake_lane_reserved_total:\n{text}"
+        metric_value(
+            &text,
+            "decdn_probe_hold_unavailable_total{reason=\"stake_lane_reserved\"}"
+        ) == Some(1),
+        "reservation refusal must bump the reason=stake_lane_reserved child of \
+         decdn_probe_hold_unavailable_total:\n{text}"
     );
     anyhow::ensure!(
-        metric_value(&text, "decdn_probe_hold_violations_total") == Some(0),
+        metric_value(
+            &text,
+            "decdn_probe_hold_unavailable_total{reason=\"exhausted\"}"
+        ) == Some(0),
         "a stake-lane reservation must NOT be counted as budget pressure:\n{text}"
     );
     anyhow::ensure!(
-        metric_value(&text, "decdn_probe_holds_disabled_total") == Some(0),
+        metric_value(
+            &text,
+            "decdn_probe_hold_unavailable_total{reason=\"disabled\"}"
+        ) == Some(0),
         "a stake-lane reservation must NOT be counted as a config disable:\n{text}"
     );
     Ok(())
@@ -1246,25 +1260,30 @@ async fn probe_stake_lane_requester_keeps_reserved_headroom() -> anyhow::Result<
 
     let text = metrics.encode()?;
     anyhow::ensure!(
-        metric_value(&text, "decdn_probe_stake_lane_reserved_total").unwrap_or(0) == 0,
-        "a stake-lane requester must NOT trip the reservation counter:\n{text}"
+        metric_value(
+            &text,
+            "decdn_probe_hold_unavailable_total{reason=\"stake_lane_reserved\"}"
+        ) == Some(0),
+        "a stake-lane requester must NOT trip the reservation counter, and the \
+         series must be present at zero rather than absent:\n{text}"
     );
     Ok(())
 }
 
-/// `rate_per_mb` is clamped to the configured delivery ceiling before
-/// signing, and the `slash_sig` covers the clamped value (ADR 005 §Rate
-/// bounds validation, #318).
+/// `rate_per_mb` is raised to the governance delivery floor before signing,
+/// and the `slash_sig` covers the clamped value (ADR 005 §Rate bounds
+/// validation, #318). The clamp is raise-only — there is no governance
+/// ceiling to clamp down to.
 #[tokio::test(flavor = "multi_thread")]
-async fn probe_rate_clamped_to_ceiling_before_signing() -> anyhow::Result<()> {
+async fn probe_rate_raised_to_floor_before_signing() -> anyhow::Result<()> {
     let server_sk = fresh_key();
     let server_id = server_sk.public();
     let metrics = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics);
     let (cache, _cache_tmp) = empty_cache().await?;
-    // Configured rate 42 but a ceiling of 5 → response must quote 5.
+    // Configured rate 5 but a floor of 42 → response must quote 42.
     let (handler, signer, domain) =
-        build_handler_bounds(server_id, 42, &metrics, limiter, cache, 0, 5);
+        build_handler_bounds(server_id, 5, &metrics, limiter, cache, 42);
 
     let req = ProbeRequest {
         hash: [9u8; 32],
@@ -1273,11 +1292,11 @@ async fn probe_rate_clamped_to_ceiling_before_signing() -> anyhow::Result<()> {
     let resp = run_one_probe(server_sk, handler, req).await?;
 
     anyhow::ensure!(
-        resp.body.rate_per_mb == 5,
-        "rate must be clamped to ceiling 5, got {}",
+        resp.body.rate_per_mb == 42,
+        "rate must be raised to floor 42, got {}",
         resp.body.rate_per_mb
     );
-    // slash_sig must verify over the clamped rate, not the raw 42.
+    // slash_sig must verify over the clamped rate, not the raw 5.
     assert_slash_sig_valid(&resp, &signer, &domain)?;
     Ok(())
 }

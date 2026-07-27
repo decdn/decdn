@@ -10,9 +10,7 @@
 //! (ADR 014 §1).
 //!
 //! Mirrors [`probe::probe_once`] in spirit, but for the paid path: it signs
-//! vouchers (so it needs the incentive layer and a signer)
-//! and, unlike probe, **never** attempts 0-RTT (ADR 015 forbids 0-RTT on
-//! `cdn/client/v1`).
+//! vouchers, so it needs the incentive layer and a signer.
 //!
 //! # Scope
 //!
@@ -42,7 +40,7 @@ pub mod discovery;
 /// the `cdn/client/v1` and `cdn/probe/v1` dial paths (#935/#936).
 pub mod endpoint;
 mod ledger;
-/// Reusable `cdn/probe/v1` client with QUIC 0-RTT (ADR 015).
+/// Reusable `cdn/probe/v1` client.
 pub mod probe;
 /// Wallet-filled HTTP provider builder for opening/settling payment channels.
 pub mod provider;
@@ -1282,7 +1280,6 @@ async fn open_stream(
     StreamResponse,
 )> {
     tokio::time::timeout(open, async move {
-        // Full handshake — no 0-RTT on cdn/client/v1 (ADR 015).
         let conn = endpoint
             .connect(target, ALPN_CLIENT)
             .await

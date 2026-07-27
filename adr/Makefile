@@ -11,8 +11,9 @@
 #                          # the reading-order list — or listed but not on disk
 #   make check-bare-refs        # fail on any bare (un-linked) ADR reference
 #   make check-md-anchors       # fail on ADR cross-links missing a #anchor
+#   make check-anchor-targets   # fail on #anchors resolving to no heading
 #   make check-no-section-numbers # fail on numeric §N refs or numbered headings
-#   make check-refs             # all three reference-hygiene guards above
+#   make check-refs             # all four reference-hygiene guards above
 #
 # This Makefile is the single source of truth for the build invocation;
 # README.md documents *what* the builds are and points here for *how*.
@@ -61,7 +62,7 @@ BOOK_SRCS := \
   000-language.md 001-network.md 002-content-addressing.md 005-protocol.md \
   038-bao-verified-range-streaming.md \
   _build/part-2-discovery.md \
-  022-content-discovery.md 015-zero-rtt.md 037-regional-proxy-warming.md \
+  022-content-discovery.md 037-regional-proxy-warming.md \
   039-multi-source-parallel-fetch.md \
   _build/part-3-payments.md \
   003-payments.md 012-client.md 024-account-abstraction.md \
@@ -69,7 +70,7 @@ BOOK_SRCS := \
   026-tokenomics.md 018-liquidity-strategy.md \
   _build/part-5-verification.md \
   014-on-chain-verification.md 008-reputation.md 011-content-takedown.md \
-  028-slashing-appeals.md 031-content-blacklist-appeals-contract.md \
+  028-slashing-appeals.md \
   030-node-region-self-attestation.md \
   _build/part-6-governance.md \
   009-governance.md 036-served-bytes-voting-weight.md 016-contract-interactions.md \
@@ -78,8 +79,8 @@ BOOK_SRCS := \
   _build/part-8-supporting.md \
   013-schema-evolution.md 017-privacy.md \
   _build/part-9-appendices.md \
-  appendix-encrypted-content-publishing.md appendix-bundles.md \
-  appendix-observability.md appendix-peer-table-eviction.md \
+  appendix-bundles.md appendix-observability.md \
+  appendix-peer-table-eviction.md \
   appendix-blob-cache-eviction.md appendix-l2-deployment.md \
   appendix-poc-production-seams.md appendix-binaries.md \
   appendix-local-admin-http.md appendix-operator-key-rotation.md \
@@ -89,7 +90,7 @@ BOOK_SRCS := \
 DENSITY_CFG := _build/book-density.typ _build/book-margins.yaml _build/table-autofit.lua
 
 .DEFAULT_GOAL := all
-.PHONY: all numeric book clean help check-book-list check-bare-refs check-md-anchors check-no-section-numbers check-refs
+.PHONY: all numeric book clean help check-book-list check-bare-refs check-md-anchors check-anchor-targets check-no-section-numbers check-refs
 
 all: adrs.pdf adrs-book.pdf
 
@@ -144,10 +145,22 @@ check-book-list:
 #   check-md-anchors     : every cross-ADR *.md link must carry a #heading
 #                          anchor, so a retitled/renamed ADR breaks the link
 #                          (drift caught) vs silently pointing at the wrong file.
+#   check-anchor-targets : every #anchor carried above must name a heading that
+#                          exists in the target file. Carrying an anchor only
+#                          makes drift *catchable*; GitHub renders the top of
+#                          the page for a fragment it cannot resolve, so
+#                          without this the retitle the rule guards against
+#                          still reads as a working link (#1455).
 #   check-no-section-numbers: no numeric §N refs and no numbered headings
 #                          (### N. Title) anywhere — sections are referenced
 #                          by NAME only. Scans code too; RFC/EIP/BIP § exempt.
 SRCS_REF := architecture.md $(NUMERIC_SRCS) $(APPENDIX_SRCS) glossary.md
+
+# check-anchor-targets also reads README.md: it links into the ADRs (and out to
+# CONTRIBUTING.md) with anchors that rot the same way. It is deliberately not in
+# SRCS_REF — the other guards police ADR *prose* conventions, which README, as
+# build/reading documentation, does not follow.
+ANCHOR_SRCS := $(SRCS_REF) README.md
 
 check-bare-refs:
 	@bad=""; for f in $(SRCS_REF); do \
@@ -172,6 +185,16 @@ check-md-anchors:
 	  exit 1; \
 	else echo "all ADR cross-links carry a #anchor"; fi
 
+# The resolver needs a heading index per target file, so it is one awk program
+# over the whole set rather than a per-file grep like its siblings; it lives in
+# _build/ for the same reason the lua filters do. LC_ALL=C keeps the slug
+# character class byte-oriented across awk implementations.
+check-anchor-targets: _build/check-anchor-targets.awk
+	@LC_ALL=C awk -f _build/check-anchor-targets.awk $(ANCHOR_SRCS) || { \
+	  echo "ERROR: ADR #anchor(s) above name no heading in the file they point at — GitHub silently renders the top of the page instead. Fix the anchor to the target's current heading slug (lowercase, punctuation dropped, spaces to hyphens)"; \
+	  exit 1; \
+	}
+
 check-no-section-numbers:
 	@bad=""; for f in $(SRCS_REF); do \
 	  hits=$$( { grep -nE '§ ?[0-9]' "$$f" \
@@ -185,7 +208,7 @@ check-no-section-numbers:
 	  exit 1; \
 	else echo "no numeric §N refs or numbered headings (RFC/EIP/BIP § exempt)"; fi
 
-check-refs: check-bare-refs check-md-anchors check-no-section-numbers
+check-refs: check-bare-refs check-md-anchors check-anchor-targets check-no-section-numbers
 
 help:
 	@echo "make            build both PDFs (mermaid-rendered)"
@@ -196,5 +219,6 @@ help:
 	@echo "make check-book-list   verify the reading-order list is complete"
 	@echo "make check-bare-refs        fail on any bare (un-linked) ADR reference"
 	@echo "make check-md-anchors       fail on ADR links missing a #anchor"
+	@echo "make check-anchor-targets   fail on #anchors that resolve to no heading"
 	@echo "make check-no-section-numbers  fail on numeric §N refs / numbered headings"
 	@echo "make check-refs             run all reference-hygiene guards"

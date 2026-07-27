@@ -51,7 +51,7 @@ Paid bytes are the bytes on the wire — content data **plus** interleaved proof
 
 ### Scope boundary
 
-This ADR specifies **verification only** — that any range is independently checkable against the content address. The **multi-source fetch scheduler** (range splitting across peers, concurrency and reassembly, straggler hedging and re-dispatch, voucher accounting across channels) is a separate, larger subsystem in [ADR 039](039-multi-source-parallel-fetch.md#adr-039-multi-source-parallel-fetch-scheduling-on-cdnclientv1). Verified ranges are its safety prerequisite but are independently valuable, since they also close the resumed-tail gap on the single-source path.
+This ADR specifies **verification only** — that any range is independently checkable against the content address. The **multi-source fetch scheduler** (range splitting across peers, concurrency and reassembly, deadline-based re-dispatch, voucher accounting across channels) is a separate, larger subsystem in [ADR 039](039-multi-source-parallel-fetch.md#adr-039-multi-source-parallel-fetch-scheduling-on-cdnclientv1). Verified ranges are its safety prerequisite but are independently valuable, since they also close the resumed-tail gap on the single-source path.
 
 Range-addressed discovery — advertising "I hold bytes `[a, b)` of `H`" on `cdn/dht/v1` — stays deferred per [ADR 037 § DHT advertising stays whole-blob](037-regional-proxy-warming.md#dht-advertising-stays-whole-blob); discovery stays hash-level.
 

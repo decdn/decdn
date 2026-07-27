@@ -82,7 +82,7 @@ use decdn_node::handlers::probe_rate_limit::ProbeRateLimiter;
 use decdn_node::metrics::Metrics;
 use decdn_node::rate_limit::RateLimitConfig;
 use decdn_protocol::{
-    ALPN_PROBE, MAX_RATE_PER_MB, ProbeMessage, TOPIC_GLOBAL, decode_message, encode_message,
+    ALPN_PROBE, ProbeMessage, TOPIC_GLOBAL, decode_message, encode_message,
     message::{ProbeRequest, ProbeResponse},
     read_frame, write_frame,
 };
@@ -257,7 +257,6 @@ fn permissive_probe_rate_limiter(metrics: &Arc<Metrics>) -> Arc<ProbeRateLimiter
         per_ip_burst: u32::MAX,
         global_rate_per_sec: 1e9,
         global_burst: u32::MAX,
-        trusted_ips: std::collections::HashSet::new(),
         max_tracked_per_ip: 4096,
         max_tracked_per_peer: 4096,
     };
@@ -639,8 +638,7 @@ async fn probe_roundtrip_resolves_server_by_node_id_via_self_hosted_discovery() 
         cache,
         Arc::clone(&signer),
         domain.clone(),
-        decdn_node::rate_bounds::RateBounds::new(0, MAX_RATE_PER_MB),
-        false,
+        decdn_node::rate_bounds::RateBounds::new(0),
         None,
     ));
 

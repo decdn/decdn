@@ -44,28 +44,26 @@ Metrics are grouped into **mandatory** (M) and **recommended** (R) tiers.
 
 #### Slash-Safety Metrics (all Mandatory)
 
-These give early warning for the three slashable offenses in [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn), grouped here with the closely-related probe-hold capacity metrics. A sustained non-zero value for the slash-evidence and blacklist-lag **counters** requires immediate operator attention. The **gauges** (`decdn_probe_hold_slots_used`/`_max`, `decdn_blacklist_version_behind`) are normally non-zero — alert on the thresholds/rates in the table below, not on presence. `decdn_probe_hold_violations_total` is an availability/budget-pressure signal (raise `max_probe_holds`), not a slash risk — see its row.
+These give early warning for the three slashable offenses in [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn), grouped here with the closely-related probe-hold capacity metrics. A sustained non-zero value for the slash-evidence and blacklist-lag **counters** requires immediate operator attention. The **gauges** (`decdn_probe_hold_slots_used`/`_max`, `decdn_blacklist_version_behind`) are normally non-zero — alert on the thresholds/rates in the table below, not on presence. `decdn_probe_hold_unavailable_total` is an availability signal, not a slash risk — see its row, and alert only on `reason="exhausted"`, the budget-pressure value.
 
 | Metric | Type | Tier | Description |
 |--------|------|------|-------------|
-| `decdn_probe_hold_violations_total` | Counter | M | Blob present but un-holdable because **all** hold slots were live (`max_probe_holds` reached) — the node signs `has_blob: false` and forgoes revenue under genuine budget pressure ([ADR 005](005-protocol.md#probe-triggered-eviction-hold)). The literal "evicted after signing `has_blob: true`" case is unreachable by construction (held hashes are invisible to the LRU driver). The config-disabled case (`max_probe_holds == 0`) is counted separately as `decdn_probe_holds_disabled_total` (#739), and the stake-lane reservation case as `decdn_probe_stake_lane_reserved_total` (#757), so this counter is a clean "raise `max_probe_holds`" signal. |
-| `decdn_probe_holds_disabled_total` | Counter | M | Blob present but un-holdable because the eviction-hold path is **disabled by config** (`max_probe_holds == 0`) — an intentional operator choice, not budget pressure (#739, [ADR 005](005-protocol.md#probe-triggered-eviction-hold)). Split from `decdn_probe_hold_violations_total` so the "raise `max_probe_holds`" alert never fires on a deliberate disable. |
-| `decdn_probe_stake_lane_reserved_total` | Counter | M | End-client probe answered `has_blob: false` because hold usage reached the stake-lane-reserved end-client ceiling (`max_probe_holds − cache.stake_lane_reserved_holds`), keeping headroom for registered node-to-node cache-miss probes (#757, [ADR 003 § Admission and Priority](003-payments.md#admission-and-priority)). Fires *before* the hold attempt, so the cache is not consulted — a content-independent admission decision, unlike the two rows above. A deliberate priority decision — distinct from budget pressure (`decdn_probe_hold_violations_total`) and config disable (`decdn_probe_holds_disabled_total`). Zero unless `cache.stake_lane_reserved_holds > 0`. |
+| `decdn_probe_hold_unavailable_total{reason}` | Counter | M | A probe that could not be answered from a guaranteed eviction hold, so the node signed `has_blob: false` ([ADR 005](005-protocol.md#probe-triggered-eviction-hold)). Always an availability degradation, never a safety fault — the literal "evicted after signing `has_blob: true`" case is unreachable by construction (held hashes are invisible to the LRU driver). The `reason` label carries the cause, because each has a different operator remedy: **`exhausted`** — blob present but **all** hold slots were live (`max_probe_holds` reached); genuine budget pressure and the only value the "raise `max_probe_holds`" alert fires on. **`disabled`** — blob present but the hold path is **off by config** (`max_probe_holds == 0`); an intentional operator choice, so alerting on it would be nonsensical (#739). **`stake_lane_reserved`** — an end-client probe hit the stake-lane-reserved end-client ceiling (`max_probe_holds − cache.stake_lane_reserved_holds`), keeping headroom for registered node-to-node cache-miss probes (#757, [ADR 003 § Admission and Priority](003-payments.md#admission-and-priority)); fires *before* the hold attempt, so the cache is not consulted — a content-independent admission decision — and stays zero unless `cache.stake_lane_reserved_holds > 0`. All three children are exported at zero from startup, so a missing series means a broken exporter, not an idle node. |
 | `decdn_probe_hold_slots_used` | Gauge | M | Eviction-hold slots in use out of `max_probe_holds`. Saturation forces `has_blob: false` at probe time. |
 | `decdn_probe_hold_slots_max` | Gauge | M | Configured `max_probe_holds`. Paired with `decdn_probe_hold_slots_used` for a saturation ratio. |
 | `decdn_blacklist_sync_lag_seconds` | Gauge | M | Seconds since the last successful `getBlacklistVersion()` poll. Exceeding the compliance window makes serving any recently-blacklisted hash slashable ([ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting)). |
 | `decdn_blacklist_version_behind` | Gauge | M | `on_chain_version − local_version`. Positive means new blacklist entries not yet fetched. |
-| `decdn_rate_bounds_clamp_events_total` | Counter | M | Times `rate_per_mb` was clamped to governance bounds before signing a `ProbeResponse` — configured rate is outside the current governance window ([ADR 003](003-payments.md#adr-003-payment-model), [ADR 005](005-protocol.md#adr-005-wire-protocol)). |
+| `decdn_rate_bounds_clamp_events_total` | Counter | M | Times `rate_per_mb` was raised to the governance `deliveryFloor` before signing a `ProbeResponse` / `StreamResponse` — the configured rate sits below the current floor ([ADR 003](003-payments.md#adr-003-payment-model), [ADR 005](005-protocol.md#adr-005-wire-protocol)). |
 | `decdn_slash_evidence_exposure_total` | Counter | M | Self-detected `has_blob: true` probe followed by a stream response within the 30-second slashing window — valid phantom slash evidence ([ADR 005](005-protocol.md#adr-005-wire-protocol)). Non-zero is a critical bug signal. |
 
 **Recommended alert thresholds:**
 
 | Metric | Warning | Critical | Action |
 |--------|---------|----------|--------|
-| `decdn_probe_hold_violations_total` (rate) | > 0 | > 0 sustained | Reduce load or increase `max_probe_holds`; check for OOM. |
+| `decdn_probe_hold_unavailable_total{reason="exhausted"}` (rate) | > 0 | > 0 sustained | Reduce load or increase `max_probe_holds`; check for OOM. Filter on `reason="exhausted"` — the `disabled` and `stake_lane_reserved` values are deliberate operator decisions and must not trip this alert. |
 | `decdn_blacklist_sync_lag_seconds` | > 600s (1 poll interval) | > 1800s | Check RPC provider; manual sync if needed. |
 | `decdn_blacklist_version_behind` | > 0 | > 1 | Investigate RPC / poll failure. |
-| `decdn_rate_bounds_clamp_events_total` (rate) | > 0 | — | Update `rate_per_mb` config to within governance bounds. |
+| `decdn_rate_bounds_clamp_events_total` (rate) | > 0 | — | Raise the `rate_per_mb` config to at least the governance `deliveryFloor`. |
 | `decdn_slash_evidence_exposure_total` (rate) | — | > 0 | File a bug; stop node immediately if rate is sustained. |
 
 #### Delivery Metrics (`cdn/client/v1`)
@@ -97,11 +95,18 @@ These give early warning for the three slashable offenses in [ADR 026 § Slashin
 
 | Metric | Type | Tier | Labels | Description |
 |--------|------|------|--------|-------------|
-| `decdn_probe_collection_latency_seconds` | Histogram | M | `outcome={0rtt_warm,1rtt_cold}` | Duration of a complete probe collection window, send to collection end. The `outcome` label measures 0-RTT impact per [ADR 015](015-zero-rtt.md#adr-015-quic-0-rtt-connection-establishment). Buckets: `[0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5]`. |
+| `decdn_probe_collection_latency_seconds` | Histogram | M | — | Duration of a complete probe collection window, send to collection end, bounding the window in [ADR 001 § Probe response collection](001-network.md#probe-response-collection). Buckets: `[0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5]`. |
+| `decdn_probe_requests_total` | Counter | R | — | Probe requests served by this node, incremented once the response frame is written. The serve-side counterpart to `decdn_probe_responses_total` (which counts probes this node *sent* and got answers to). Flat while a node is reachable but unprobed; the first signal that a restarted or re-keyed node is being found again. |
 | `decdn_probe_responses_total` | Counter | R | `result={has_blob,no_blob,timeout}` | Probe responses received, by result. |
-| `decdn_probe_holds_disabled_total` | Counter | M | — | Probes answered `has_blob: false` for a *present* blob because the eviction-hold path is disabled by config (`max_probe_holds == 0`). An intentional operator decision, not budget pressure — split out from `decdn_probe_hold_violations_total` so a deliberate disable does not trip its "increase `max_probe_holds`" alert ([ADR 005](005-protocol.md#probe-triggered-eviction-hold)). |
 | `decdn_probe_cache_hits_total` | Counter | R | — | Cache-miss pulls whose candidate walk started from a live [ADR 001 § Probe cache](001-network.md#adr-001-network-topology-and-peer-mesh) entry. DHT lookup and probe fanout are skipped, unless every cached provider fails — the fetch then either falls through to a fresh lookup + probe (if attempt budget remains) or returns a clean miss (if the cached providers exhausted the budget first, the common case since an entry holds up to 10 providers but the budget is 3), and stays counted here either way (the hit measures "the cache had something worth trying", not delivery). With `decdn_probe_cache_misses_total` this is the hit ratio the TTL exists to buy (`probe_cache_ttl = PROBE_SLASH_WINDOW / 2`, [ADR 005 § Derived constants](005-protocol.md#adr-005-wire-protocol)); a ratio near zero means the TTL is shorter than the inter-arrival time for hot blobs and the cache is pure overhead. |
 | `decdn_probe_cache_misses_total` | Counter | R | — | Cache-miss pulls that ran a fresh DHT lookup + probe. Counts an entry that was absent, expired, **or fully suppressed** (every cached provider negative-cached, wedged, no longer an active staker, or otherwise unselectable) — all three cost the same network work, which is what this measures. |
+
+> The probe-hold capacity counter `decdn_probe_hold_unavailable_total{reason}`
+> and the `decdn_probe_hold_slots_used` / `_max` gauges live in
+> [§ Slash-Safety Metrics](#slash-safety-metrics-all-mandatory), not here. They
+> are grouped there deliberately, alongside the slash-evidence counters they sit
+> next to on an operator's dashboard. Documenting them twice is how the two
+> copies drifted apart.
 
 #### Payment Channel Metrics
 
@@ -135,63 +140,11 @@ Reputation is local-only per [ADR 008](008-reputation.md#adr-008-reputation-syst
 |--------|------|------|-------------|
 | `decdn_reputation_score` | Gauge | R | This node's current local reputation score (0.0–1.0) for a peer, computed from its own delivery observations per [ADR 008](008-reputation.md#adr-008-reputation-system). |
 
-#### QUIC / 0-RTT Metrics
-
-Per [ADR 015](015-zero-rtt.md#adr-015-quic-0-rtt-connection-establishment). All labeled by `alpn`.
-
-| Metric | Type | Tier | Description |
-|--------|------|------|-------------|
-| `decdn_quic_0rtt_attempts_total` | Counter | R | 0-RTT connection attempts. |
-| `decdn_quic_0rtt_accepted_total` | Counter | R | 0-RTT connections accepted by server. |
-| `decdn_quic_0rtt_rejected_total` | Counter | R | 0-RTT rejected, fell back to 1-RTT. |
-
-These are the canonical forms of the identically-named metrics in [ADR 015](015-zero-rtt.md#adr-015-quic-0-rtt-connection-establishment); semantics are unchanged under the canonical naming regime.
-
 #### Node / Process Metrics
 
 | Metric | Type | Tier | Description |
 |--------|------|------|-------------|
 | `decdn_node_uptime_seconds` | Gauge | R | Seconds since the node process started. Used by the `/health` endpoint and operator dashboards to correlate events with restarts. |
-
-#### Tokenomics Metrics
-
-Per [ADR 026](026-tokenomics.md#adr-026-tokenomics). These metrics expose the `FeeRouter`, `CapacityBond`, and `SlashAppeal` contract surfaces to operator dashboards, keeper monitoring, and governance dashboards ([ADR 009](009-governance.md#adr-009-governance-model)).
-
-A subset comes from on-chain contract state (`FeeRouter`, `CapacityBond`, `SlashAppeal`, `BuybackBurner`) via the same RPC client used for blacklist polling and channel-state queries ([ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting), [ADR 003](003-payments.md#adr-003-payment-model)). They use the **same Prometheus text-format `/metrics` endpoint, scrape interval, and retention defaults** defined in Section 1 — no separate export pipeline. Contract-sourced gauges sample at the existing RPC-poll cadence. Counters tracking on-chain events advance only when the node observes the corresponding event log.
-
-##### FeeRouter Metrics
-
-| Metric | Type | Tier | Labels | Source | Consumer | Description |
-|--------|------|------|--------|--------|----------|-------------|
-| `decdn_fee_router_inflow_usdc_total` | Counter | R | `bucket={operator_base,burn,treasury}` | `FeeRouter` settlement events (RPC) | Operator + governance dashboards | Cumulative per-bucket USDC inflow at `FeeRouter.routeSettlement`. All three legs transfer same-tx ([ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split)). |
-| `decdn_fee_router_inflow_usdc_rate` | Gauge | R | `bucket={operator_base,burn,treasury}` | Derived (rolling 7-epoch avg over `..._inflow_usdc_total`) | Governance + capacity-planning dashboards | Rolling-average per-bucket USDC inflow per epoch. |
-
-##### Served-Bytes Voting Metrics
-
-Per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight): the per-operator `bytesPerEpoch` and trailing-window sums on `FeeRouter` are the governance vote-weight source.
-
-| Metric | Type | Tier | Labels | Source | Consumer | Description |
-|--------|------|------|--------|--------|----------|-------------|
-| `decdn_operator_bytes_delivered` | Gauge | R | `epoch` | `FeeRouter.bytesPerEpoch(operator, epoch)` (RPC) | Operator dashboard, governance dashboard | This operator's served-bytes share for the labeled epoch — input to the trailing-window vote-weight numerator per [ADR 036 § Formula](036-served-bytes-voting-weight.md#formula). |
-| `decdn_operator_bytes_in_window` | Gauge | R | `window={windowEpochs}` | `FeeRouter.bytesInWindow(operator, currentEpoch, windowEpochs)` (RPC) | Operator dashboard, governance dashboard | This operator's trailing-window served-bytes sum — the pre-cap, pre-`age_ramp` numerator of the vote-weight formula per [ADR 036 § Formula](036-served-bytes-voting-weight.md#formula). |
-| `decdn_capacity_bond_slashed_at_epoch` | Gauge | R | — | `CapacityBond.slashedAtEpoch(operator)` (RPC) | Governance dashboard, operator alerting | The epoch of this operator's most recent slash; zero if never slashed. Vote weight is zero while this watermark falls inside the trailing window per [ADR 036 § Slashing zero-out](036-served-bytes-voting-weight.md#slashing-zero-out). |
-
-##### CapacityBond Metrics
-
-| Metric | Type | Tier | Labels | Source | Consumer | Description |
-|--------|------|------|--------|--------|----------|-------------|
-| `decdn_capacity_bond_amount_token` | Gauge | R | — | `CapacityBond.bondOf(operator)` (RPC) | Operator dashboard, governance | This operator's current bonded TOKEN; used to compute the operator's tier and bond-curve position. |
-| `decdn_capacity_bond_declared_mbps` | Gauge | R | — | `CapacityBond.declaredMbps(operator)` (RPC) | Operator dashboard | This operator's declared bandwidth capacity in Mbps; used for capacity-tier checks and bond-curve calculations. Does not feed voting weight directly under [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight). |
-| `decdn_fee_router_total_bytes_in_window` | Gauge | R | `window={windowEpochs}` | `FeeRouter.totalBytesInWindow(currentEpoch, windowEpochs)` (RPC) | Governance dashboard | Network-wide sum of served bytes over the trailing `windowEpochs` window — the quorum / proposal-threshold denominator per [ADR 036 § Formula](036-served-bytes-voting-weight.md#formula). |
-| `decdn_capacity_bond_active_operator_count` | Gauge | R | — | `CapacityBond.getActiveNodeCount()` (RPC) | Governance dashboard, bootstrap-multisig transition tracking | Active operator count; informs the multisig's bootstrap → DAO transition decision (per [ADR 009](009-governance.md#bootstrap-multisig-phase)). The NodeId↔Ethereum-address binding is 1:1 ([ADR 003 § NodeId-to-Ethereum Binding](003-payments.md#nodeid-to-ethereum-binding)), so active-node count and active-operator count coincide. |
-
-##### Slash-Escrow / SlashAppeal Metrics
-
-| Metric | Type | Tier | Labels | Source | Consumer | Description |
-|--------|------|------|--------|--------|----------|-------------|
-| `decdn_slash_escrow_total_token` | Gauge | R | — | `CapacityBond.escrowedTotal()` (RPC) | Governance dashboard, keeper monitoring | Total slashed TOKEN currently held in escrow (status `Escrowed` or `AppealOpen`), awaiting finality or appeal resolution per [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn). |
-| `decdn_slash_appeals` | Gauge | R | `state={open,fastTracked,resolved}` | `SlashAppeal` records (RPC) | Public dashboard, governance | Slash-appeal count per state. `open` = filed, awaiting multisig review; `fastTracked` = multisig granted interim relief, awaiting Governor; `resolved` = granted/upheld/lapsed. |
-| `decdn_slash_finalized_total` | Counter | R | `outcome={upheld,granted}` | `CapacityBond` `SlashUpheld` / `SlashReversed` events | Public dashboard, governance reporting | Cumulative finalized slashes by outcome (upheld → 50/50 distributed; granted → refunded to operator). |
 
 #### DHT / Content-Discovery Metrics
 
@@ -278,8 +231,8 @@ In the metric names below, `<watcher>` expands to one of **`slash_watcher`**, **
 | `status` | Meaning |
 |----------|---------|
 | `ready` | All Phase 5 acceptance criteria satisfied ([ADR 019](019-node-onboarding.md#phase-5--accepting-paid-delivery)); serving traffic. |
-| `degraded` | Running but one or more non-critical conditions impaired (e.g., gossip mesh thin, 0-RTT cache cold). Traffic still accepted. |
-| `not_ready` | A mandatory startup check failed or is incomplete (blacklist un-synced, rate bounds not loaded, not registered). Not accepting traffic. |
+| `degraded` | Running but one or more non-critical conditions impaired (e.g., gossip mesh thin, peer table sparse). Traffic still accepted. |
+| `not_ready` | A mandatory startup check failed or is incomplete (blacklist un-synced, rate floor not loaded, not registered). Not accepting traffic. |
 
 HTTP status codes: `200` for `ready` and `degraded`; `503` for `not_ready`. Monitoring systems SHOULD alert on `503` responses.
 
@@ -309,17 +262,15 @@ Earlier ADRs used informal metric names; this table maps them to canonical repla
 | Informal name (prior ADR) | Canonical name (this appendix) | Source ADR |
 |---------------------------|---------------------------|------------|
 | `gossip_messages_rejected_clock_skew` | `decdn_gossip_messages_rejected_total{reason="clock_skew"}` | [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh) |
-| `probe_hold_violations` | `decdn_probe_hold_violations_total` | [ADR 005](005-protocol.md#adr-005-wire-protocol), architecture.md |
-| `probe_holds_disabled` | `decdn_probe_holds_disabled_total` | [ADR 005](005-protocol.md#adr-005-wire-protocol), #739 |
+| `probe_hold_violations` | `decdn_probe_hold_unavailable_total{reason="exhausted"}` | [ADR 005](005-protocol.md#adr-005-wire-protocol), architecture.md |
+| `probe_holds_disabled` | `decdn_probe_hold_unavailable_total{reason="disabled"}` | [ADR 005](005-protocol.md#adr-005-wire-protocol), #739 |
+| `probe_stake_lane_reserved` | `decdn_probe_hold_unavailable_total{reason="stake_lane_reserved"}` | [ADR 003 § Admission and Priority](003-payments.md#admission-and-priority), #757 |
 | `probe_hold_slots_used` | `decdn_probe_hold_slots_used` | [ADR 005](005-protocol.md#adr-005-wire-protocol), architecture.md |
 | `rate_bounds_clamp_events` | `decdn_rate_bounds_clamp_events_total` | architecture.md |
 | `blacklist_sync_lag_seconds` | `decdn_blacklist_sync_lag_seconds` | [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting) |
 | `blacklist_version_behind` | `decdn_blacklist_version_behind` | [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting) |
 | `slash_evidence_exposure` | `decdn_slash_evidence_exposure_total` | architecture.md |
-| `quic_0rtt_attempts_total` | `decdn_quic_0rtt_attempts_total` | [ADR 015](015-zero-rtt.md#adr-015-quic-0-rtt-connection-establishment) |
-| `quic_0rtt_accepted_total` | `decdn_quic_0rtt_accepted_total` | [ADR 015](015-zero-rtt.md#adr-015-quic-0-rtt-connection-establishment) |
-| `quic_0rtt_rejected_total` | `decdn_quic_0rtt_rejected_total` | [ADR 015](015-zero-rtt.md#adr-015-quic-0-rtt-connection-establishment) |
-| `probe_collection_latency_seconds` | `decdn_probe_collection_latency_seconds` | [ADR 015](015-zero-rtt.md#adr-015-quic-0-rtt-connection-establishment) |
+| `probe_collection_latency_seconds` | `decdn_probe_collection_latency_seconds` | [ADR 001 § Probe response collection](001-network.md#probe-response-collection) |
 | `streams_active` | `decdn_streams_active` | architecture.md |
 | `streams_completed` | `decdn_streams_completed_total` | architecture.md |
 | `streams_failed` | `decdn_streams_failed_total` | architecture.md |
@@ -350,7 +301,7 @@ Add the file via Prometheus `rule_files:` and reload. Validate with `promtool ch
 
 #### Scope
 
-Covers M-tier slash-safety metrics and the most common R-tier panels for a first dashboard. Deliberately not exhaustive: [§ Tokenomics Metrics](#tokenomics-metrics) tokenomics and 0-RTT panels are left to deployment-specific dashboards.
+Covers M-tier slash-safety metrics and the most common R-tier panels for a first dashboard. Deliberately not exhaustive.
 
 ## Consequences
 
@@ -370,4 +321,3 @@ Covers M-tier slash-safety metrics and the most common R-tier panels for a first
 ## Deferred & Open
 
 - **OpenMetrics migration.** Prometheus text format 0.0.4 is the current default; the OpenMetrics exposition format (used by `prometheus_client` crate's `MetricsEncoder`) adds exemplars and native histograms — evaluate once tooling support is broader.
-- **Tokenomics dashboard panels.** The reference dashboard in [`monitoring/grafana-dashboard.json`](../monitoring/grafana-dashboard.json) is deliberately scoped to M-tier core operations. [§ Tokenomics Metrics](#tokenomics-metrics) tokenomics metrics warrant their own dedicated dashboard (served-bytes voting weight + quorum-denominator tracking per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight), bootstrap-multisig transition tracking) — these are deployment-specific and belong outside the reference set.

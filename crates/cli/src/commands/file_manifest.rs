@@ -261,9 +261,10 @@ where
         let part = part_dir.join(format!("chunk-{index}.part"));
         // Hashing a whole chunk is far too long to sit on the executor: `bundle
         // pull` polls every entry from ONE task (`buffer_unordered`, no
-        // `tokio::spawn` because `probe_once` is not `Send`), so blocking here
-        // stalls every sibling entry — and their stall deadlines are wall-clock
-        // timers that elapse unpolled and fire the instant we yield.
+        // `tokio::spawn` — a deliberate choice, not a `Send` constraint), so
+        // blocking here stalls every sibling entry — and their stall deadlines
+        // are wall-clock timers that elapse unpolled and fire the instant we
+        // yield.
         let verified = {
             let (owned_part, chunk) = (part.clone(), chunk.clone());
             tokio::task::spawn_blocking(move || part_is_verified(&owned_part, &chunk))

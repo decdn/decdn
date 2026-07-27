@@ -13,7 +13,7 @@ import { ERC20Burnable } from "@openzeppelin/contracts/token/ERC20/extensions/ER
 import { ICapacityBond } from "./interfaces/ICapacityBond.sol";
 import { ICapacityBondSlashEscrow } from "./interfaces/ICapacityBondSlashEscrow.sol";
 import { ICapacityBondEjector } from "./interfaces/ICapacityBondEjector.sol";
-import { ICapacityBondReporter } from "./interfaces/ICapacityBondReporter.sol";
+import { ICapacityBondEpoch } from "./interfaces/ICapacityBondEpoch.sol";
 import { ICapacityBondRegionView } from "./interfaces/ICapacityBondRegionView.sol";
 import { ISlashJudgeEvidenceView } from "./interfaces/ISlashJudgeEvidenceView.sol";
 import { IEd25519Verifier } from "./interfaces/IEd25519Verifier.sol";
@@ -25,8 +25,9 @@ import { SlashEscrowLib, SlashRecord } from "./SlashEscrowLib.sol";
 ///         from ADR 026 § Slashing and burn (the slashed TOKEN is held in
 ///         per-slashId escrow until the appeal window resolves, then either
 ///         distributed 50% challenger / 50% burn or refunded to the operator
-///         on a successful appeal), is the canonical settlement reporter sink
-///         for `FeeRouter`, is the registry for iroh-NodeId ↔ Ethereum-address
+///         on a successful appeal), exposes `epochLength()` so `FeeRouter` can
+///         prove at deploy time that both contracts agree on epoch length, is
+///         the registry for iroh-NodeId ↔ Ethereum-address
 ///         bindings, and is the source of `firstBondedAt` / `slashedAtEpoch`
 ///         for `DecdnGovernor`'s served-bytes voting weight per ADR 036.
 /// @dev    Renamed from `StakingRegistry` per ADR 026 v2.2 vocabulary. The
@@ -56,7 +57,7 @@ contract CapacityBond is
     ICapacityBond,
     ICapacityBondSlashEscrow,
     ICapacityBondEjector,
-    ICapacityBondReporter,
+    ICapacityBondEpoch,
     ICapacityBondRegionView,
     AccessControl,
     ReentrancyGuard,
@@ -72,7 +73,6 @@ contract CapacityBond is
     bytes32 public constant GOVERNANCE_ROLE = keccak256("GOVERNANCE_ROLE");
     bytes32 public constant SLASH_ROLE = keccak256("SLASH_ROLE");
     bytes32 public constant BLACKLIST_ROLE = keccak256("BLACKLIST_ROLE");
-    bytes32 public constant SETTLEMENT_REPORTER_ROLE = keccak256("SETTLEMENT_REPORTER_ROLE");
     bytes32 public constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
 
     /// @notice Authority to drive the escrow-on-slash appeal hooks
@@ -167,7 +167,7 @@ contract CapacityBond is
     uint64 public constant EPOCH_LENGTH = 7 days;
 
     /// @notice Lowercase accessor for `EPOCH_LENGTH` — exists so
-    ///         `ICapacityBondReporter` can declare it without tripping
+    ///         `ICapacityBondEpoch` can declare it without tripping
     ///         solhint `func-name-mixedcase` on the SCREAMING_SNAKE auto-getter.
     function epochLength() external pure override returns (uint64) {
         return EPOCH_LENGTH;
@@ -427,7 +427,6 @@ contract CapacityBond is
     event EjectedByBlacklist(address indexed operator);
     event BlacklistEjectionCleared(address indexed operator);
     event Reinstated(address indexed operator);
-    event SettlementRecorded(address indexed operator);
     event MinBondUpdated(uint256 oldValue, uint256 newValue);
     event KUpdated(uint256 oldValue, uint256 newValue);
     event AlphaUpdated(uint256 oldValue, uint256 newValue);
@@ -1193,15 +1192,6 @@ contract CapacityBond is
             blacklistEjected[operator] = false;
             emit BlacklistEjectionCleared(operator);
         }
-    }
-
-    // -----------------------------------------------------------------
-    // Settlement reporter callback (FeeRouter)
-    // -----------------------------------------------------------------
-
-    function recordSettlement(address operator) external override onlyRole(SETTLEMENT_REPORTER_ROLE) {
-        if (operator == address(0)) revert ZeroAddress();
-        emit SettlementRecorded(operator);
     }
 
     // -----------------------------------------------------------------

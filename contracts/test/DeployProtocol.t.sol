@@ -37,7 +37,6 @@ contract DeployUSDC is ERC20 {
 contract DeployProtocolTest is Test, BaseProtocolDeploy {
     address internal emergencyMultisig = address(0xC0DE);
     address internal initialTokenHolder = address(0xBEEF);
-    address internal challengerPool = address(0xCCEE);
 
     Deployment internal d;
     DeployConfig internal cfg;
@@ -56,7 +55,6 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
             deployer: address(this),
             emergencyMultisig: emergencyMultisig,
             initialTokenHolder: initialTokenHolder,
-            challengerIncentivePool: challengerPool,
             timelockDelay: 48 hours,
             minBond: 50_000e18,
             unbondingPeriod: 14 days,
@@ -68,8 +66,7 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
             feeRouterWindowEpochs: 13,
             feeRouterShares: [uint256(9000), uint256(0), uint256(1000)],
             buybackBurner: address(0),
-            slashAppealBond: 1000e18,
-            blacklistAppealBond: 100e18
+            slashAppealBond: 1000e18
         });
     }
 
@@ -155,7 +152,6 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
     // -----------------------------------------------------------------
 
     function test_crossContractWiring_capacityBondPeerRoles() public view {
-        assertTrue(d.bond.hasRole(d.bond.SETTLEMENT_REPORTER_ROLE(), address(d.router)), "router to bond settlement");
         assertTrue(d.bond.hasRole(d.bond.SLASH_APPEAL_ROLE(), address(d.slashAppeal)), "slashAppeal to bond appeal");
         assertTrue(d.bond.hasRole(d.bond.BLACKLIST_ROLE(), address(d.blacklist)), "blacklist to bond eject");
     }
@@ -171,10 +167,6 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
         assertTrue(d.bond.hasRole(d.bond.SLASH_ROLE(), address(d.slashJudge)), "slashJudge holds SLASH_ROLE on bond");
         assertEq(d.originAssignment.contentBlacklist(), address(d.blacklist), "originAssignment blacklist binding");
         assertEq(address(d.bond.slashJudge()), address(d.slashJudge), "bond slashJudge binding");
-    }
-
-    function test_crossContractWiring_slashAppealChallengerPool() public view {
-        assertEq(d.slashAppeal.challengerIncentivePool(), challengerPool, "slashAppeal.challengerIncentivePool");
     }
 
     // -----------------------------------------------------------------
@@ -336,11 +328,5 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
         DeployConfig memory bad = _testConfig();
         bad.initialTokenHolder = address(0);
         _expectZeroAddressRevert(bad, "initialTokenHolder");
-    }
-
-    function test_deployTargets_revertsOnZeroChallengerIncentivePool() public {
-        DeployConfig memory bad = _testConfig();
-        bad.challengerIncentivePool = address(0);
-        _expectZeroAddressRevert(bad, "challengerIncentivePool");
     }
 }

@@ -75,13 +75,6 @@ pub struct NetworkConfig {
     /// providers configured here (the wiring layer builds on `presets::Minimal`).
     /// Relay selection ([`Self::relay_urls`]) is an independent, orthogonal knob.
     pub discovery: Option<DiscoveryConfig>,
-    /// Master switch for QUIC 0-RTT on `cdn/probe/v1` (ADR 015). Absent =>
-    /// default (`true`). When `false`, probe clients fall back to plain
-    /// 1-RTT `connect` (the effective downgrade — they emit no early
-    /// data) and the probe handler keeps the default `on_accepting`. An
-    /// operational kill switch; replay safety for non-probe ALPNs is
-    /// client-side (only the probe client emits 0-RTT), not gated here.
-    pub enable_0rtt: Option<bool>,
 }
 
 /// Operator-configurable address-discovery providers (#818 scope 1).
@@ -189,8 +182,8 @@ pub struct BlockchainConfig {
     pub content_blacklist_from_block: Option<u64>,
     /// Seconds between the blacklist watcher's periodic replay + re-scope pass
     /// (ADR 011 §Polling cadence). This backstop is what catches scope changes
-    /// with no `ContentBlacklist` event — an operator region/ripening transition
-    /// or an appeal reversal/lapse re-enabling a suspended entry. Absent =>
+    /// with no `ContentBlacklist` event — an operator region/ripening
+    /// transition. Absent =>
     /// [`super::DEFAULT_CONTENT_BLACKLIST_POLL_INTERVAL_SEC`] (600s). Only
     /// consulted when `content_blacklist_address` is set.
     pub content_blacklist_poll_interval_sec: Option<u64>,
@@ -319,7 +312,8 @@ pub struct CacheConfig {
     /// per-MB units as the wire `StreamResponse.rate_per_mb`. Absent / `0` =
     /// unlimited. Bounds what this node, as a BUYER on a cache-miss pull, will
     /// accept a provider to quote — on top of the always-applied probe-relative
-    /// bound. Distinct from the seller-side `delivery_ceiling` clamp.
+    /// bound. Distinct from the seller-side `delivery_floor` clamp, which raises
+    /// this node's own quote rather than bounding what it will pay.
     pub max_rate_per_mb: Option<u64>,
     /// Single origin backend for cache pull-through (#437). Absent =>
     /// no pull-through (unless [`Self::origins`] is set); cache misses
@@ -774,17 +768,15 @@ pub struct PaymentConfig {
     /// refuses startup outright), so treat the on-chain value as authoritative.
     /// Absent => `0`.
     pub delivery_floor: Option<u64>,
-    /// Pre-chain **seed** for the upper bound the node clamps `rate_per_mb` to
-    /// before signing a `ProbeResponse`. Same as [`Self::delivery_floor`]: the
-    /// live ceiling comes from on-chain `getRateBounds()` (#1172), not from
-    /// here. Absent => [`decdn_protocol::MAX_RATE_PER_MB`].
-    pub delivery_ceiling: Option<u64>,
     /// Voucher cadence the node advertises in `StreamResponse` for
     /// `cdn/client/v1` delivery (ADR 003 §Voucher Interval Negotiation): the
     /// node pauses delivery once outstanding unvouchered bytes exceed
     /// `voucher_interval_mb * 1_048_576`. Absent =>
-    /// [`decdn_protocol::DEFAULT_VOUCHER_INTERVAL_MB`] (1 MB). Governable range
-    /// `1..=`[`decdn_protocol::MAX_VOUCHER_INTERVAL_MB`].
+    /// [`decdn_protocol::DEFAULT_VOUCHER_INTERVAL_MB`] (1 MB). Range
+    /// `1..=`[`decdn_protocol::MAX_VOUCHER_INTERVAL_MB`] — unlike
+    /// [`Self::delivery_floor`], that bound is hardcoded in the wire schema,
+    /// not governance-owned: no contract holds a cadence parameter (ADR 003
+    /// §Voucher Interval Negotiation).
     pub voucher_interval_mb: Option<u64>,
 }
 
@@ -892,8 +884,7 @@ pub struct SecurityConfig {
 /// The Kademlia routing-table parameters (k, α, bucket count, refresh
 /// interval) are pinned by the protocol and not exposed here. The
 /// rate-limit knobs nest under `[dht.rate_limit]` to match ADR 022 §DHT
-/// Rate Limiting "Trusted-IP exemption" (`dht.rate_limit.trusted_ips`)
-/// and to leave room for other future `dht.*` top-level knobs (e.g.
+/// Rate Limiting and to leave room for other future `dht.*` top-level knobs (e.g.
 /// bootstrap peers, republish overrides) without breaking the operator
 /// key path.
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -935,10 +926,6 @@ pub struct DhtRateLimitConfig {
     pub global_rate_per_sec: Option<f64>,
     /// Global inbound DHT burst capacity. Absent => 2000.
     pub global_burst: Option<u32>,
-    /// IPs that bypass the per-IP layer only (per-peer + global still
-    /// apply). Format: dotted IPv4 or RFC 5952 IPv6. Absent or empty =>
-    /// no trusted IPs. ADR 022 §Trusted-IP exemption.
-    pub trusted_ips: Option<Vec<String>>,
     /// Hard cap on the per-IP keyed-limiter map. Absent => 4096. `0`
     /// makes the map unbounded — operator opt-in (#645). Mirrors
     /// `security.max_tracked_sources` for the dispatch layer.
@@ -951,8 +938,7 @@ pub struct DhtRateLimitConfig {
 /// `[probe]` section — `cdn/probe/v1` settings (ADR 005).
 ///
 /// The rate-limit knobs nest under `[probe.rate_limit]` to match ADR 005
-/// §Probe rate limiting "Trusted-IP exemption" (`probe.rate_limit.trusted_ips`)
-/// and to leave room for other future `probe.*` top-level knobs without
+/// §Probe rate limiting and to leave room for other future `probe.*` top-level knobs without
 /// breaking the operator key path.
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -989,10 +975,6 @@ pub struct ProbeRateLimitConfig {
     pub global_rate_per_sec: Option<f64>,
     /// Global inbound probe burst capacity. Absent => 2000.
     pub global_burst: Option<u32>,
-    /// IPs that bypass the per-IP layer only (per-peer + global still
-    /// apply). Format: dotted IPv4 or RFC 5952 IPv6. Absent or empty =>
-    /// no trusted IPs. ADR 005 §Trusted-IP exemption.
-    pub trusted_ips: Option<Vec<String>>,
     /// Hard cap on the per-IP keyed-limiter map. Absent => 4096. `0`
     /// makes the map unbounded — operator opt-in (#645).
     pub max_tracked_per_ip: Option<usize>,

@@ -57,7 +57,6 @@ contract GenesisBuybackActivationBalancerForkTest is Test, BaseProtocolDeploy {
     uint256 internal constant EXPECTED_SPOT = 100e18; // TOKEN per USDC, 1e18 fixed point
 
     address internal emergencyMultisig = address(0xC0DE);
-    address internal challengerPool = address(0xCCEE);
     address internal keeper = address(0xCAFE);
 
     MintableUSDC internal usdc;
@@ -90,7 +89,6 @@ contract GenesisBuybackActivationBalancerForkTest is Test, BaseProtocolDeploy {
             deployer: address(this),
             emergencyMultisig: emergencyMultisig,
             initialTokenHolder: address(this),
-            challengerIncentivePool: challengerPool,
             timelockDelay: 48 hours,
             minBond: 50_000e18,
             unbondingPeriod: 14 days,
@@ -102,8 +100,7 @@ contract GenesisBuybackActivationBalancerForkTest is Test, BaseProtocolDeploy {
             feeRouterWindowEpochs: 13,
             feeRouterShares: [uint256(9000), uint256(0), uint256(1000)],
             buybackBurner: address(0),
-            slashAppealBond: 1000e18,
-            blacklistAppealBond: 100e18
+            slashAppealBond: 1000e18
         });
     }
 

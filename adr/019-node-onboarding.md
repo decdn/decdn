@@ -41,7 +41,7 @@ Before any on-chain or protocol activity:
    - **Native gas token:** ~$0.50–$1.00 for the Phase 2 transactions at typical L2 gas prices.
    - **Optional USDC:** only required if the operator intends to open outbound payment channels immediately (e.g., to pay origin-backed nodes for cache-miss pulls). Clients open inbound channels to the node without any USDC on the node side.
 
-   - **Wallet, gas sponsorship, and session keys.** PoC accepts a plain EOA. Production migrates the operator wallet to a Safe (2-of-3 recommended) with ERC-7579 session keys for the high-frequency `slash_sig` signing path and an ERC-4337 paymaster for gas-in-USDC; see [ADR 024](024-account-abstraction.md#adr-024-account-abstraction-and-safe-smart-wallet-support) for the full design and the [Operator Key-Rotation Runbook](appendix-operator-key-rotation.md#appendix-operator-key-rotation-runbook) for the EOA → Safe migration.
+   - **Wallet, gas sponsorship, and session keys.** A plain EOA keystore is the documented default, and it is the only wallet that can sign `slash_sig` acceptably today — a paying client verifies the `StreamResponse` signature off-chain by recovering the signer against the node's registered address, so a Safe-addressed operator cannot complete a paid delivery. Production migrates the operator wallet to a Safe (2-of-3) with ERC-7579 session keys for the high-frequency `slash_sig` signing path and an ERC-4337 paymaster for gas-in-USDC; see [ADR 024](024-account-abstraction.md#adr-024-account-abstraction-and-safe-smart-wallet-support) for the full design and the [Operator Key-Rotation Runbook](appendix-operator-key-rotation.md#appendix-operator-key-rotation-runbook) for the optional EOA → Safe migration and its constraints.
 
 5. **Choose region.** Determine the ISO 3166-1 alpha-2 country code best representing the node's physical location. Self-reported, accepted at face value as the production posture ([ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh), [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting), [ADR 030](030-node-region-self-attestation.md#adr-030-node-region-self-attestation)). Submitted on-chain as `regionHint` and broadcast in `NodeAnnounce` — it affects which gossip topics the node publishes to and which regional blacklists it must enforce.
 
@@ -121,9 +121,9 @@ Both signing operations are supported by the `decdn` CLI (`decdn node register` 
 
 The node process MUST complete all of the following steps before opening any QUIC listener or accepting incoming connections.
 
-#### Step 3.1 — Fetch rate bounds
+#### Step 3.1 — Fetch the rate floor
 
-Call `PaymentChannel.getRateBounds()`. Verify that both `deliveryFloor` and `deliveryCeiling` fit in `u64` (see [ADR 003 § Startup](003-payments.md#rate-bounds-refresh)). If either value exceeds `u64::MAX`, the node MUST refuse to start and log an error.
+Call `PaymentChannel.getRateBounds()`. Verify that `deliveryFloor` fits in `u64` (see [ADR 003 § Startup](003-payments.md#rate-bounds-refresh)). If it exceeds `u64::MAX`, the node MUST refuse to start and log an error.
 
 The node SHOULD subscribe to on-chain `RateBoundsUpdated` events for real-time updates. Periodic polling (`rate_bounds_poll_interval`, default 1 hour) is the fallback ([ADR 003](003-payments.md#adr-003-payment-model)).
 
@@ -143,7 +143,7 @@ If the RPC endpoint is unavailable, retry with exponential backoff (3 attempts a
 
 #### Step 3.4 — Configure local rate
 
-Set the node's `rate_per_mb` within the bounds fetched in Step 3.1, satisfying `deliveryFloor ≤ rate_per_mb ≤ deliveryCeiling`. This rate is advertised in `ProbeResponse` messages. Probes are the canonical rate-discovery channel; rate changes propagate through fresh probe responses ([ADR 005](005-protocol.md#adr-005-wire-protocol)).
+Set the node's `rate_per_mb` at or above the floor fetched in Step 3.1, satisfying `deliveryFloor ≤ rate_per_mb ≤ MAX_RATE_PER_MB`. This rate is advertised in `ProbeResponse` messages. Probes are the canonical rate-discovery channel; rate changes propagate through fresh probe responses ([ADR 005](005-protocol.md#adr-005-wire-protocol)).
 
 ### Phase 4 — Joining the Mesh (Gossip Subscription)
 
@@ -190,7 +190,7 @@ After Phases 1–4, the node is fully operational and should accept traffic.
 | # | Check | How to verify |
 |---|-------|---------------|
 | 1 | Node is active in the on-chain registry | `CapacityBond.isActiveNode(nodeId)` returns `true` |
-| 2 | Rate bounds loaded | Node has `deliveryFloor` and `deliveryCeiling` in memory |
+| 2 | Rate floor loaded | Node has `deliveryFloor` in memory |
 | 3 | Blacklist synced | Local blacklist is at the current `blacklistVersion` |
 | 4 | QUIC listener open | `iroh::Endpoint` bound and listening on configured port(s) |
 | 5 | Gossip subscribed | Node is subscribed to `cdn/global/v1` and regional topic |
@@ -203,7 +203,7 @@ A node satisfying all seven criteria is ready to:
 - Accept `StreamRequest` messages on `cdn/client/v1`
 - Earn USDC via voucher-based payment channels opened by clients and other nodes
 
-**Startup readiness log:** The node SHOULD emit a structured log line (e.g., `INFO node_ready registry=true rate_bounds=true blacklist_version=42 peers=12`) once all seven criteria hold, so operators can confirm correct startup without grepping multiple log sources.
+**Startup readiness log:** The node SHOULD emit a structured log line (e.g., `INFO node_ready registry=true rate_floor=true blacklist_version=42 peers=12`) once all seven criteria hold, so operators can confirm correct startup without grepping multiple log sources.
 
 ### NAT and Multiaddr Handling
 
@@ -272,7 +272,7 @@ Mechanism-specific guidance — particular hash-match databases, reporting endpo
 ### Positive
 
 - Operators have a single, ordered reference for joining the PoC testnet.
-- All startup prerequisites (rate bounds, blacklist, registry) are explicitly ordered, eliminating the previously identified silent-failure class.
+- All startup prerequisites (rate floor, blacklist, registry) are explicitly ordered, eliminating the previously identified silent-failure class.
 - The acceptance criteria table (Phase 5) provides a machine-checkable health signal for readiness probes and operational monitoring.
 - Re-onboarding (post-ejection) is explicitly covered, preventing nonce confusion.
 - Onboarding records an explicit operator-duty floor, foreclosing the unaware-operator posture without adding any on-chain content gate.

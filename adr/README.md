@@ -18,7 +18,7 @@ This directory is the protocol's canonical specification. Each numbered file is 
 For first-time readers, follow this thematic order rather than the numeric one. Each chapter assumes the previous chapters are read. The full chapter-by-chapter ADR list lives in [`architecture.md` § Reading Order](architecture.md#reading-order).
 
 1. **Foundations** — language stack, network topology, content addressing, wire protocol.
-2. **Discovery** — DHT-based content lookup, QUIC 0-RTT.
+2. **Discovery** — DHT-based content lookup, regional proxy warming, multi-source fetch.
 3. **Payments** — channels, vouchers, client architecture, smart-wallet support.
 4. **Tokenomics & incentives** — work-token tokenomics, liquidity strategy, deferred follow-ups.
 5. **Verification & enforcement** — on-chain slashing evidence, reputation, content takedown.
@@ -26,7 +26,7 @@ For first-time readers, follow this thematic order rather than the numeric one. 
 7. **Operations** — node onboarding.
 8. **Supporting infrastructure** — schema evolution, privacy analysis.
 
-Plus a set of **appendices** documenting reference patterns, operator runbooks, and operational layers built on top of the protocol (encrypted content publishing, observability, L2 deployment selection, PoC/production seam architecture, local admin HTTP surface, operator key rotation, operator protocol-upgrade runbook, permissionless fraud detection).
+Plus a set of **appendices** documenting reference patterns, operator runbooks, and operational layers built on top of the protocol (observability, L2 deployment selection, PoC/production seam architecture, local admin HTTP surface, operator key rotation, operator protocol-upgrade runbook, permissionless fraud detection).
 
 The numeric index in [`architecture.md` § Architectural Decisions](architecture.md#architectural-decisions) stays as the canonical per-ADR reference.
 
@@ -39,7 +39,7 @@ Terms used across multiple ADRs are defined in [`glossary.md`](glossary.md), gro
 This directory contains two kinds of documents:
 
 - **Core protocol ADRs** (`NNN-name.md`) — invariants every conforming node, client, or contract must implement the same way for the network to function. These are the canonical specification.
-- **Appendices** (`appendix-name.md`) — patterns, reference implementations, operational guidance, and optional layers built **on top of** the protocol. Alternative implementations are acceptable. Examples: encrypted content publishing (companion app server, `cdn/keys/v1`), the recommended observability metric registry, the Arbitrum One deployment selection, the Rust implementation pattern for PoC/production seams, the local admin HTTP surface, the operator key-rotation runbook, the operator protocol-upgrade runbook, and the permissionless fraud-detection layer.
+- **Appendices** (`appendix-name.md`) — patterns, reference implementations, operational guidance, and optional layers built **on top of** the protocol. Alternative implementations are acceptable. Examples: the recommended observability metric registry, the Arbitrum One deployment selection, the Rust implementation pattern for PoC/production seams, the local admin HTTP surface, the operator key-rotation runbook, the operator protocol-upgrade runbook, and the permissionless fraud-detection layer.
 
 Appendices are listed in [`architecture.md` § Appendices — Reference Patterns](architecture.md#appendices--reference-patterns). They are deliberately **not** numbered as ADRs because they document optional patterns rather than core protocol decisions.
 

@@ -45,7 +45,9 @@ import { Ed25519Verifier } from "../src/Ed25519Verifier.sol";
 ///                                            Sepolia USDC `0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d`)
 ///           - `EMERGENCY_MULTISIG`        — 3-of-5 multisig per ADR 009
 ///           - `INITIAL_TOKEN_HOLDER`      — 1B TOKEN recipient at genesis
-///           - `CHALLENGER_INCENTIVE_POOL` — SlashAppeal failed-appeal-bond pool
+///           - `CURRENT_TERMS_HASH`        — genesis terms hash per ADR 019
+///                                            § Terms Acceptance; no default, and
+///                                            `CapacityBond` rejects the zero sentinel
 ///
 ///         The FeeRouter treasury bucket is NOT an env var: it is the
 ///         `TimelockController` this script deploys (step 7 sets it as the
@@ -69,7 +71,6 @@ import { Ed25519Verifier } from "../src/Ed25519Verifier.sol";
 ///           - `REGION_STABILITY_WINDOW`    (default 7 days)
 ///           - `FEE_ROUTER_WINDOW_EPOCHS`   (default 13; bounded [4, 26] per ADR 036)
 ///           - `SLASH_APPEAL_BOND`          (default 1000e18)
-///           - `BLACKLIST_APPEAL_BOND`      (default 100e18)
 contract DeployProtocol is BaseProtocolDeploy {
     // Defaults — ADR 026 / 028 / 009 values.
     uint256 internal constant DEFAULT_TIMELOCK_DELAY = 48 hours;
@@ -89,7 +90,6 @@ contract DeployProtocol is BaseProtocolDeploy {
     uint64 internal constant FEE_ROUTER_EPOCH_LENGTH = 7 days;
     uint64 internal constant DEFAULT_FEE_ROUTER_WINDOW_EPOCHS = 13;
     uint256 internal constant DEFAULT_SLASH_APPEAL_BOND = 1000e18;
-    uint256 internal constant DEFAULT_BLACKLIST_APPEAL_BOND = 100e18;
 
     // Launch fee-router shares: 90% operator / 0% buyback / 10% treasury
     // (3-bucket split, ADR 026 § FeeRouter). The buyback bucket is dormant
@@ -155,7 +155,6 @@ contract DeployProtocol is BaseProtocolDeploy {
         // any caller that forgets to set it.
         cfg.emergencyMultisig = vm.envAddress("EMERGENCY_MULTISIG");
         cfg.initialTokenHolder = vm.envAddress("INITIAL_TOKEN_HOLDER");
-        cfg.challengerIncentivePool = vm.envAddress("CHALLENGER_INCENTIVE_POOL");
         // `--sender` on the command line becomes `tx.origin` for the script;
         // use that as the deployer so the role grants the constructors emit
         // are attributable to the broadcasting EOA, not this script contract.
@@ -188,7 +187,6 @@ contract DeployProtocol is BaseProtocolDeploy {
         cfg.buybackBurner = address(0);
 
         cfg.slashAppealBond = vm.envOr("SLASH_APPEAL_BOND", DEFAULT_SLASH_APPEAL_BOND);
-        cfg.blacklistAppealBond = vm.envOr("BLACKLIST_APPEAL_BOND", DEFAULT_BLACKLIST_APPEAL_BOND);
     }
 
     // -----------------------------------------------------------------

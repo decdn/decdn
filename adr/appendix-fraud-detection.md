@@ -47,7 +47,7 @@ The detector consumes only public on-chain data — channel close events. No nod
 
 ## Why this is an appendix, not an ADR
 
-A protocol decision establishes a participant role with a defined wire interface, on-chain registration, fee/payment economics, or off-chain coordination protocol. The fraud-detection layer has none — it is a permissionless side-effect of `disputeChannel` access from [ADR 003](003-payments.md#adr-003-payment-model), like [Encrypted Content Publishing](appendix-encrypted-content-publishing.md#appendix-encrypted-content-publishing-on-decdn) or [Observability](appendix-observability.md#appendix-observability-and-metrics): operationally relevant, but not a protocol primitive.
+A protocol decision establishes a participant role with a defined wire interface, on-chain registration, fee/payment economics, or off-chain coordination protocol. The fraud-detection layer has none — it is a permissionless side-effect of `disputeChannel` access from [ADR 003](003-payments.md#adr-003-payment-model), like [Observability](appendix-observability.md#appendix-observability-and-metrics): operationally relevant, but not a protocol primitive.
 
 ## Cross-ADR Impact
 

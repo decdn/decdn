@@ -4,7 +4,6 @@
 //! `decdn_*` counters and iroh's own transport metrics through a single
 //! endpoint. Output is `OpenMetrics` text, which Prometheus scrapers accept.
 
-use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
@@ -57,6 +56,79 @@ struct StreamLabels {
     direction: StreamDirection,
 }
 
+/// Why a probe could not be answered from a guaranteed eviction hold, as the
+/// `reason` label on `decdn_probe_hold_unavailable_total`.
+///
+/// The three values are not interchangeable — each has a different operator
+/// remedy, which is why they were three separate counters before #1443 and why
+/// the alert in `monitoring/prometheus-alerts.yml` filters on
+/// `reason="exhausted"` alone. The derive renders variants in `snake_case`, so
+/// these encode as `reason="exhausted"` / `"disabled"` / `"stake_lane_reserved"`.
+///
+/// Not to be confused with [`decdn_cache::ProbeHoldOutcome::Unavailable`],
+/// which is the one probe-hold outcome that emits **no** metric at all — a
+/// blob genuinely absent is a true negative, not a refusal. The shared word is
+/// inverted between the two types: here it selects *for* the counter, there it
+/// selects *against* it.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Hash,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Serialize,
+    Deserialize,
+    EncodeLabelValue,
+)]
+pub enum ProbeHoldUnavailableReason {
+    /// Blob present, but **all** hold slots were live (`max_probe_holds`
+    /// reached) — genuine budget pressure. The node answers `has_blob: false`
+    /// and forgoes the delivery. This is the "raise `max_probe_holds`" signal
+    /// and the only value the `DecdnProbeHoldViolations` alert fires on.
+    Exhausted,
+    /// Blob present, but the eviction-hold path is **disabled by config**
+    /// (`max_probe_holds == 0`) — an intentional operator choice, not budget
+    /// pressure (#739). Raising `max_probe_holds` is the remedy only if the
+    /// disable was unintended; alerting on it would be nonsensical.
+    Disabled,
+    /// An end-client probe (a requester that is *not* a registered operator)
+    /// hit the stake-lane-reserved end-client ceiling
+    /// (`max_probe_holds - cache.stake_lane_reserved_holds`), keeping headroom
+    /// for node-to-node cache-miss probes per ADR 003 §Admission and Priority
+    /// (#757). Unlike the two above this fires *before* the hold attempt, so
+    /// the cache is **not consulted** — the blob may or may not be present;
+    /// the reservation is a content-independent admission decision. Zero
+    /// unless `cache.stake_lane_reserved_holds > 0`.
+    StakeLaneReserved,
+}
+
+impl ProbeHoldUnavailableReason {
+    /// Every variant, in the order [`Metrics::new`] materializes them.
+    ///
+    /// This is what makes "every reason exports at zero" structural rather
+    /// than a convention. [`Metrics::new`] destructures `ALL.map(…)` into its
+    /// three cached handles, so adding a variant here changes the array length
+    /// and **fails to compile** at that pattern — you cannot add a reason
+    /// without materializing its child. The recorder's exhaustive `match` is
+    /// the second gate; without this array a fourth variant could satisfy the
+    /// compiler with a `_ =>` arm calling `get_or_create`, silently
+    /// reintroducing the lazily-created series this design exists to prevent.
+    ///
+    /// Order is load-bearing (it binds handles positionally); a reorder is
+    /// caught by `probe_hold_unavailable_increments_only_the_named_reason`.
+    const ALL: [Self; 3] = [Self::Exhausted, Self::Disabled, Self::StakeLaneReserved];
+}
+
+#[derive(
+    Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, EncodeLabelSet,
+)]
+struct ProbeHoldUnavailableLabels {
+    reason: ProbeHoldUnavailableReason,
+}
+
 /// Build a [`WatcherHook`] that invokes one `&self` recorder on a shared
 /// `Metrics`, deduping the per-watcher `Box::new(move || metrics.foo())`
 /// closures each watcher site would otherwise define (#1251). Since #1316 all
@@ -104,10 +176,12 @@ pub struct DecdnMetrics {
     pub gossip_announces_rejected_total: Counter,
     /// Incoming gossip envelopes rejected specifically for clock skew
     /// (ADR 001 § Clock synchronization). A sibling of the generic
-    /// `gossip_announces_rejected_total` — since `iroh_metrics` carries no
-    /// label dimension, the ADR-named `reason=clock_skew` breakdown is
-    /// realized as this distinct counter (same pattern as
-    /// `dispatch_rejected_{global,per_source}`). Field has no `_total`
+    /// `gossip_announces_rejected_total`: the ADR-named `reason=clock_skew`
+    /// breakdown is realized as this distinct counter rather than a label,
+    /// matching the `dispatch_rejected_{global,per_source}` convention. That
+    /// is a choice, not a backend limit — `iroh_metrics` does support labels
+    /// via `Family<L, M>`, which `probe_hold_unavailable` uses. Field has no
+    /// `_total`
     /// suffix because the `OpenMetrics` encoder appends it; operator-visible
     /// name: `decdn_gossip_messages_rejected_clock_skew_total`. Lets
     /// operators alert on NTP-drift-induced peer invisibility without it
@@ -146,81 +220,29 @@ pub struct DecdnMetrics {
     /// applicable." Operator-visible name:
     /// `decdn_dispatch_per_source_skipped_no_addr_total`.
     pub dispatch_per_source_skipped_no_addr: Counter,
-    /// QUIC 0-RTT connection attempts on `cdn/probe/v1` — a cached
-    /// session ticket existed and early data was sent (ADR 015
-    /// §Observability). Operator-visible name:
-    /// `decdn_quic_0rtt_attempts_total`.
-    pub quic_0rtt_attempts: Counter,
-    /// 0-RTT attempts the server accepted (early data processed without a
-    /// full handshake). Operator-visible name:
-    /// `decdn_quic_0rtt_accepted_total`.
-    pub quic_0rtt_accepted: Counter,
-    /// 0-RTT attempts the server rejected; the client fell back to a
-    /// 1-RTT handshake and re-sent the request. Operator-visible name:
-    /// `decdn_quic_0rtt_rejected_total`.
-    pub quic_0rtt_rejected: Counter,
-    /// Approximate 0-RTT working-set size (ADR 015 §Observability).
-    /// rustls owns the real session stores and exposes no size API, so
-    /// this is a *proxy*: the number of distinct remote endpoints that
-    /// completed a probe handshake on the 0-RTT-enabled server path —
-    /// cold clients included, since the server still issues a
-    /// `NewSessionTicket` to each. It is **not** a mirror of any specific
-    /// rustls cache: server-side resumption state lives in rustls's
-    /// internal, default-sized server store (iroh's `max_tls_tickets`
-    /// knob sizes only the *client* `ClientSessionMemoryCache`). The
-    /// value saturates at `SESSION_TICKET_CACHE_CEILING` because the
-    /// backing set is bounded there for memory safety, not because it
-    /// tracks a cache of that size — close enough at deployment scales
-    /// where the cap is rarely hit organically.
-    pub quic_session_ticket_cache_size: Gauge,
-    /// Distinct *new* peers dropped from the tracking set because it hit
-    /// `SESSION_TICKET_CACHE_CEILING`. Zero under organic load at
-    /// expected deployment scales; a rising value means the
-    /// unauthenticated probe handler is being fed many distinct node ids
-    /// — i.e. it distinguishes a Sybil-style saturation from the gauge
-    /// legitimately reaching the ceiling. Operator-visible name:
-    /// `decdn_quic_session_ticket_peers_dropped_total`.
-    pub quic_session_ticket_peers_dropped: Counter,
-    /// `decdn_probe_hold_violations_total` per the canonical metric registry
-    /// (`adr/appendix-observability.md` — the authoritative naming source,
-    /// superseding informal ADR-005 references). The registry's alert
-    /// remediation for this counter is "reduce load or increase
-    /// `max_probe_holds`", i.e. it is the budget-pressure signal: this code
-    /// increments it when the blob is present but the
-    /// [`crate::handlers::probe`] hold could not be guaranteed (budget
-    /// exhausted), so the node answers `has_blob: false`. That is an
-    /// availability degradation, never a safety fault — the node loses
-    /// revenue but never signs a phantom announcement (the hold mechanism
-    /// makes the registry's literal "evicted after signing `has_blob:true`"
-    /// case unreachable by construction, so this counter surfaces the
-    /// budget-pressure cause the operator can actually act on).
-    pub probe_hold_violations: Counter,
-    /// `decdn_probe_holds_disabled_total` (#739): probes answered
-    /// `has_blob: false` for a *present* blob because the eviction-hold path
-    /// is **disabled by config** (`max_probe_holds == 0`), as opposed to
-    /// genuine slot exhaustion. Split out from `probe_hold_violations` so an
-    /// intentional operator disable does not trip that counter's "increase
-    /// `max_probe_holds`" alert — a nonsensical remedy when holds are
-    /// deliberately off. Field has no `_total` suffix because the
-    /// `OpenMetrics` encoder appends it.
-    pub probe_holds_disabled: Counter,
-    /// `decdn_probe_stake_lane_reserved_total` (#757): an end-client probe
-    /// (a requester that is *not* a registered operator) answered
-    /// `has_blob: false` because the hold budget had reached the end-client
-    /// ceiling (`max_probe_holds - cache.stake_lane_reserved_holds`),
-    /// reserving the remaining slots for stake-lane (node-to-node
-    /// cache-miss) probes per ADR 003 §Admission and Priority. Unlike the
-    /// two counters above, this fires *before* `try_probe_hold`, so the
-    /// cache is **not consulted** — the blob may or may not be present; the
-    /// reservation is a content-independent admission decision. Distinct
-    /// from `probe_hold_violations` (genuine exhaustion of the *whole*
-    /// budget, checked after a confirmed-present blob) and
-    /// `probe_holds_disabled` (`max_probe_holds == 0`): this is a deliberate
-    /// priority decision, not budget pressure or a disable, so it must not
-    /// trip either of those counters' alerts. Zero whenever the reservation
-    /// is unconfigured (`stake_lane_reserved_holds == 0`). Field has no
+    /// `decdn_probe_hold_unavailable_total{reason}` per the canonical metric
+    /// registry (`adr/appendix-observability.md` — the authoritative naming
+    /// source, superseding informal ADR-005 references): a probe that could
+    /// not be answered from a guaranteed eviction hold, broken out by cause
+    /// on the `reason` label (#1443, collapsing the former
+    /// `probe_hold_violations` / `probe_holds_disabled` /
+    /// `probe_stake_lane_reserved` counters).
+    ///
+    /// Every value is an availability degradation, never a safety fault — the
+    /// node loses revenue but never signs a phantom announcement, because the
+    /// hold mechanism makes the registry's literal "evicted after signing
+    /// `has_blob: true`" case unreachable by construction. See
+    /// [`ProbeHoldUnavailableReason`] for what each value means and which one
+    /// the "raise `max_probe_holds`" alert fires on; all three children are
+    /// materialized at startup by [`Metrics::new`] so each series is exported
+    /// at zero rather than appearing only on first increment. Field has no
     /// `_total` suffix because the `OpenMetrics` encoder appends it.
-    pub probe_stake_lane_reserved: Counter,
+    ///
+    /// This is the one labeled `Counter` in this group; the other
+    /// reason-style splits (`dispatch_rejected_*`,
+    /// `probe_rate_limit_rejected_*`, `channel_open_failures_*`) remain
+    /// sibling counters pending the decision tracked in #1475.
+    probe_hold_unavailable: Family<ProbeHoldUnavailableLabels, Counter>,
     /// `decdn_probe_hold_slots_used` (registry): current active
     /// probe-triggered eviction holds (distinct held blobs), ADR 005
     /// §Probe-triggered eviction hold. Sampled from the cache engine on
@@ -1317,16 +1339,6 @@ pub struct DecdnMetrics {
     pub blacklist_enforcement_failures: Counter,
 }
 
-/// Self-imposed cap on the distinct-peer tracking set (and hence the
-/// `quic_session_ticket_cache_size` gauge). It is **not** a rustls cache
-/// size — the server-side ticket store is rustls-internal and untouched
-/// by iroh's `max_tls_tickets`. We reuse
-/// [`decdn_protocol::SESSION_TICKET_CACHE_SIZE`] (the value that *does*
-/// size the client-side `ClientSessionMemoryCache`) purely so the node's
-/// 0-RTT memory budget is described by one number across client and
-/// server roles.
-const SESSION_TICKET_CACHE_CEILING: usize = decdn_protocol::SESSION_TICKET_CACHE_SIZE;
-
 /// Aggregated deCDN node metrics.
 #[derive(Debug)]
 pub struct Metrics {
@@ -1335,14 +1347,17 @@ pub struct Metrics {
     cache: Arc<CacheMetrics>,
     inbound_streams: Arc<Gauge>,
     outbound_streams: Arc<Gauge>,
+    /// Materialized `probe_hold_unavailable` children, one per
+    /// [`ProbeHoldUnavailableReason`]. Held here for the same reason as the
+    /// stream gauges: `Family` creates a child series lazily on first
+    /// `get_or_create`, so without this each `reason` would be absent from
+    /// `/metrics` until it first fired — an operator's dashboard and alert
+    /// would show a gap rather than a zero. Creating them at startup keeps
+    /// the pre-#1443 property that all three series are exported at zero.
+    probe_hold_exhausted: Arc<Counter>,
+    probe_hold_disabled: Arc<Counter>,
+    probe_hold_stake_lane_reserved: Arc<Counter>,
     started_at: Instant,
-    /// Distinct remote endpoint ids with a completed 0-RTT-eligible
-    /// handshake. Backs the approximate `quic_session_ticket_cache_size`
-    /// gauge (rustls exposes no session-store size API). Bounded at
-    /// `SESSION_TICKET_CACHE_CEILING` entries by `note_session_ticket_peer`
-    /// — the insert path is fed by the unauthenticated probe handler, so
-    /// the cap is what stops an unbounded-distinct-peer memory leak.
-    session_ticket_peers: Mutex<HashSet<[u8; 32]>>,
     /// Monotonic instant at which the staker-set watcher entered its current
     /// error/backoff window (#783, downtime semantics #788). `None` whenever a
     /// cycle is established (healthy) — including from bootstrap until the
@@ -1424,6 +1439,19 @@ impl Metrics {
         let outbound_streams = decdn.streams_active.get_or_create(&StreamLabels {
             direction: StreamDirection::Outbound,
         });
+        // Materialize every `reason` child up front so all three series export
+        // at zero from a fresh registry (see the field docs on `Metrics`).
+        // Driven off `ALL` and destructured positionally so a new variant
+        // cannot compile without being materialized here — see `ALL`'s docs.
+        let [
+            probe_hold_exhausted,
+            probe_hold_disabled,
+            probe_hold_stake_lane_reserved,
+        ] = ProbeHoldUnavailableReason::ALL.map(|reason| {
+            decdn
+                .probe_hold_unavailable
+                .get_or_create(&ProbeHoldUnavailableLabels { reason })
+        });
         let cache = Arc::new(CacheMetrics::default());
         let mut registry = Registry::default();
         registry.register(decdn.clone() as Arc<dyn MetricsGroup>);
@@ -1438,8 +1466,10 @@ impl Metrics {
             cache,
             inbound_streams,
             outbound_streams,
+            probe_hold_exhausted,
+            probe_hold_disabled,
+            probe_hold_stake_lane_reserved,
             started_at: Instant::now(),
-            session_ticket_peers: Mutex::new(HashSet::new()),
             staker_set_watcher_down_since: Mutex::new(None),
             origin_directory_watcher_down_since: Mutex::new(None),
             slash_watcher_down_since: Mutex::new(None),
@@ -1497,6 +1527,24 @@ impl Metrics {
         }
     }
 
+    /// Record a probe that could not be answered from a guaranteed eviction
+    /// hold, broken out by cause on the `reason` label of
+    /// `decdn_probe_hold_unavailable_total` (#1443). Hand-written rather than
+    /// a `recorders!` entry because the pre-materialized child handles live on
+    /// `Metrics`, whereas `recorders!` only reaches `self.decdn.$field`. Same
+    /// enum-dispatch shape as [`Self::channel_open_failure_by_reason`], though
+    /// that one's counters *are* siblings on `self.decdn`. Pairs with the
+    /// structured `debug!` at each call site in [`crate::handlers::probe`].
+    pub fn probe_hold_unavailable(&self, reason: ProbeHoldUnavailableReason) {
+        match reason {
+            ProbeHoldUnavailableReason::Exhausted => self.probe_hold_exhausted.inc(),
+            ProbeHoldUnavailableReason::Disabled => self.probe_hold_disabled.inc(),
+            ProbeHoldUnavailableReason::StakeLaneReserved => {
+                self.probe_hold_stake_lane_reserved.inc()
+            }
+        };
+    }
+
     pub fn gossip_rejected(&self, reason: &'static str) {
         self.decdn.gossip_announces_rejected_total.inc();
         // Break out the clock-skew signal into its own counter (ADR 001
@@ -1541,41 +1589,6 @@ impl Metrics {
              underlying accounting bug is fixed."
         );
         0
-    }
-
-    /// Note a remote endpoint with which a 0-RTT-eligible handshake
-    /// completed, refreshing the approximate
-    /// `quic_session_ticket_cache_size` gauge. Idempotent per peer; a
-    /// poisoned lock is treated as "skip the update" rather than
-    /// panicking (anti-panic policy).
-    ///
-    /// The tracking set is itself bounded at `SESSION_TICKET_CACHE_CEILING`,
-    /// not just the gauge value: this is called from the *unauthenticated*
-    /// probe handler, so a peer presenting many distinct node ids (cheap
-    /// to generate) would otherwise grow the set without limit — a slow
-    /// memory-exhaustion vector on untrusted input. Once the set is full
-    /// new peers are no longer tracked (re-noting an already-tracked peer
-    /// stays a no-op) and `quic_session_ticket_peers_dropped` is bumped so
-    /// the saturation is distinguishable from organic growth; the gauge
-    /// then sits at the ceiling. The ceiling is the node's own memory
-    /// bound, not a rustls cache size (see `SESSION_TICKET_CACHE_CEILING`).
-    pub fn note_session_ticket_peer(&self, remote_id: [u8; 32]) {
-        let Ok(mut peers) = self.session_ticket_peers.lock() else {
-            return;
-        };
-        if peers.len() < SESSION_TICKET_CACHE_CEILING {
-            peers.insert(remote_id);
-        } else if !peers.contains(&remote_id) {
-            // Set is full AND this is a genuinely new peer: the memory
-            // bound is engaging on (untrusted) input. Surface it so a
-            // Sybil-style flood is distinguishable from organic
-            // saturation. Re-noting an already-tracked peer is a
-            // legitimate no-op and must NOT count as a drop, or the
-            // counter becomes noise.
-            self.decdn.quic_session_ticket_peers_dropped.inc();
-        }
-        let size = peers.len();
-        self.decdn.quic_session_ticket_cache_size.set(sat(size));
     }
 
     /// Read the current value of the `rpc_healthy` gauge. Test-only —
@@ -1759,24 +1772,6 @@ macro_rules! watcher_downtime_recorders {
 
 recorders! {
     probe_request => probe_requests.inc();
-
-    /// A probe answered `has_blob: false` despite the bytes being present,
-    /// because the eviction hold could not be guaranteed (ADR 005 §Hold
-    /// budget).
-    probe_hold_violation => probe_hold_violations.inc();
-
-    /// A probe answered `has_blob: false` for a present blob because the
-    /// eviction-hold path is disabled by config (`max_probe_holds == 0`) —
-    /// an intentional operator decision, not budget pressure (#739, ADR 005
-    /// §Hold budget).
-    probe_holds_disabled => probe_holds_disabled.inc();
-
-    /// An end-client probe answered `has_blob: false` because the hold
-    /// budget reached the stake-lane-reserved end-client ceiling, before any
-    /// cache lookup (#757, ADR 003 §Admission and Priority). A deliberate,
-    /// content-independent priority decision — not budget pressure or a
-    /// config disable.
-    probe_stake_lane_reserved => probe_stake_lane_reserved.inc();
 
     /// Publish the current count of active probe holds (ADR 005).
     probe_hold_slots(used: usize) => probe_hold_slots_used.set(sat(used));
@@ -2321,17 +2316,6 @@ recorders! {
     dht_batch_store_hashes_deferred_rate_limit(count: u64)
         => dht_batch_store_hashes_deferred_rate_limit.inc_by(count);
 
-    /// Record a 0-RTT connection attempt (ADR 015): a cached session
-    /// ticket existed and early data was sent.
-    record_0rtt_attempt => quic_0rtt_attempts.inc();
-
-    /// Record that the server accepted a 0-RTT attempt.
-    record_0rtt_accepted => quic_0rtt_accepted.inc();
-
-    /// Record that the server rejected a 0-RTT attempt and the client
-    /// fell back to a 1-RTT handshake.
-    record_0rtt_rejected => quic_0rtt_rejected.inc();
-
     /// Stamp the slash watcher's `*_last_tick_timestamp_seconds` liveness gauge
     /// with the current wall-clock time (#1316). The `on_tick_success` hook,
     /// fired on EVERY successful poll tick so a dead task's gauge goes stale.
@@ -2732,6 +2716,8 @@ impl Drop for StreamGuard {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use std::fs;
+    use std::path::Path;
     use std::time::Duration;
 
     use super::*;
@@ -2779,6 +2765,122 @@ mod tests {
                 .any(|line| line.starts_with("decdn_uptime_seconds ")),
             "retired uptime name must not be exported:\n{text}"
         );
+    }
+
+    #[test]
+    fn probe_hold_unavailable_exports_every_reason_at_zero() {
+        // Pins the pre-materialization in `Metrics::new` (#1443). A `Family`
+        // creates each child series lazily on `get_or_create`, so without that
+        // step a `reason` would be missing from `/metrics` until it first
+        // fired — a dashboard gap where the three pre-collapse counters showed
+        // a zero, and a silent hole in the `DecdnProbeHoldViolations` alert's
+        // input. Also pins the rendered series text (label name, snake_case
+        // value encoding, and the `_total` suffix the encoder appends). Note
+        // that pinning it *here* does not tie it to the copies in
+        // `monitoring/` — that is what
+        // `alert_and_dashboard_selectors_match_the_exported_series` below does.
+        let metrics = Metrics::new();
+        let text = metrics.encode().unwrap();
+
+        for reason in ["exhausted", "disabled", "stake_lane_reserved"] {
+            let name = format!("decdn_probe_hold_unavailable_total{{reason=\"{reason}\"}}");
+            assert!(
+                has_metric_line(&text, &name, 0),
+                "{name} should be exposed at zero from a fresh registry:\n{text}"
+            );
+        }
+
+        // The collapsed counters must not linger under their old names.
+        for retired in [
+            "decdn_probe_hold_violations_total",
+            "decdn_probe_holds_disabled_total",
+            "decdn_probe_stake_lane_reserved_total",
+        ] {
+            assert!(
+                !text.lines().any(|line| line.starts_with(retired)),
+                "retired metric name {retired} must not be exported:\n{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn alert_and_dashboard_selectors_match_the_exported_series() {
+        // Nothing in CI validates `monitoring/` against the code — there is no
+        // promtool step and no reference to the directory in any workflow — so
+        // the alert and the dashboard hard-code a series name that only this
+        // test ties back to the encoder. Without it, renaming the metric, the
+        // `reason` label key, or the `Exhausted` variant updates the tests
+        // above, passes CI green, and leaves `DecdnProbeHoldViolations`
+        // querying a series that no longer exists: the page for probe-hold
+        // budget pressure then silently never fires again.
+        //
+        // Deliberately scoped to the one series this collapse renamed. A
+        // blanket "every `decdn_*` in monitoring/ is exported" assertion is a
+        // worthwhile follow-up but cannot land here — 13 names in those files
+        // are already stale, 10 of which exist nowhere in `crates/`.
+        const SELECTOR: &str = "decdn_probe_hold_unavailable_total{reason=\"exhausted\"";
+
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let alerts = fs::read_to_string(root.join("monitoring/prometheus-alerts.yml")).unwrap();
+        let dashboard = fs::read_to_string(root.join("monitoring/grafana-dashboard.json")).unwrap();
+
+        // Match the query line specifically, not the file. Both files also
+        // name the series in prose (the alert's `description`, the dashboard's
+        // `legendFormat`), and a whole-file `contains` would let that prose
+        // mask a rename of the actual query — verified: mutating only the
+        // `expr:` left a file-wide check green.
+        assert!(
+            alerts
+                .lines()
+                .any(|line| line.contains("expr:") && line.contains(SELECTOR)),
+            "no `expr:` in monitoring/prometheus-alerts.yml queries {SELECTOR}"
+        );
+        // Grafana stores the query inside a JSON string, so the quotes around
+        // the label value arrive backslash-escaped.
+        let escaped = SELECTOR.replace('"', "\\\"");
+        assert!(
+            dashboard
+                .lines()
+                .any(|line| line.contains("\"expr\":") && line.contains(&escaped)),
+            "no `expr` in monitoring/grafana-dashboard.json queries {SELECTOR}"
+        );
+        assert!(
+            Metrics::new()
+                .encode()
+                .unwrap()
+                .lines()
+                .any(|line| line.starts_with(SELECTOR)),
+            "the exporter no longer produces {SELECTOR}"
+        );
+    }
+
+    #[test]
+    fn probe_hold_unavailable_increments_only_the_named_reason() {
+        // The whole point of the label is that each value keeps its own
+        // remedy: `exhausted` drives "raise max_probe_holds", `disabled` is an
+        // intentional operator choice, and `stake_lane_reserved` is a priority
+        // decision taken before the cache is even consulted. Bumping one must
+        // never move another, or the alert filter re-fires on the deliberate
+        // cases the #739/#757 split existed to keep out.
+        let metrics = Metrics::new();
+        metrics.probe_hold_unavailable(ProbeHoldUnavailableReason::Exhausted);
+        let text = metrics.encode().unwrap();
+
+        assert!(
+            has_metric_line(
+                &text,
+                "decdn_probe_hold_unavailable_total{reason=\"exhausted\"}",
+                1
+            ),
+            "the named reason must increment:\n{text}"
+        );
+        for untouched in ["disabled", "stake_lane_reserved"] {
+            let name = format!("decdn_probe_hold_unavailable_total{{reason=\"{untouched}\"}}");
+            assert!(
+                has_metric_line(&text, &name, 0),
+                "{name} must stay at zero:\n{text}"
+            );
+        }
     }
 
     #[test]
@@ -2909,37 +3011,25 @@ mod tests {
     }
 
     #[test]
-    fn quic_0rtt_metrics_start_at_zero_and_increment() {
+    fn quic_0rtt_and_session_ticket_series_are_not_exposed() {
+        // The probe path is a plain QUIC handshake: no early-data
+        // classification and no session-ticket working-set proxy, so no
+        // metric may name either. A partial revert that reintroduces one
+        // counter but not its recorder shows up here.
+        //
+        // The needles are matched against the whole exposition, which also
+        // carries iroh's transport metrics — so an upstream series named
+        // `*0rtt*` would trip this too. That breadth is deliberate: this
+        // node claims to expose no early-data accounting at all, whoever
+        // registered it.
         let metrics = Metrics::new();
-
-        // Fresh registry: ADR 015 §Observability metrics exposed at zero
-        // so dashboards don't render `(no data)` before the first probe.
         let text = metrics.encode().unwrap();
-        for name in [
-            "decdn_quic_0rtt_attempts_total",
-            "decdn_quic_0rtt_accepted_total",
-            "decdn_quic_0rtt_rejected_total",
-            "decdn_quic_session_ticket_peers_dropped_total",
-        ] {
+        for needle in ["0rtt", "session_ticket"] {
             assert!(
-                has_metric_line(&text, name, 0),
-                "0-RTT counter {name} should start at zero:\n{text}"
+                !text.contains(needle),
+                "exposition must not carry a {needle} series:\n{text}"
             );
         }
-        assert!(
-            has_metric_line(&text, "decdn_quic_session_ticket_cache_size", 0),
-            "session-ticket gauge should start at zero:\n{text}"
-        );
-
-        metrics.record_0rtt_attempt();
-        metrics.record_0rtt_attempt();
-        metrics.record_0rtt_accepted();
-        metrics.record_0rtt_rejected();
-
-        let text = metrics.encode().unwrap();
-        assert!(has_metric_line(&text, "decdn_quic_0rtt_attempts_total", 2));
-        assert!(has_metric_line(&text, "decdn_quic_0rtt_accepted_total", 1));
-        assert!(has_metric_line(&text, "decdn_quic_0rtt_rejected_total", 1));
     }
 
     #[test]
@@ -3676,54 +3766,6 @@ mod tests {
                 "{down_seconds} must reset to 0 once re-established:\n{text}"
             );
         }
-    }
-
-    #[test]
-    fn session_ticket_gauge_counts_distinct_peers_and_is_idempotent() {
-        let metrics = Metrics::new();
-
-        metrics.note_session_ticket_peer([1u8; 32]);
-        metrics.note_session_ticket_peer([2u8; 32]);
-        // Re-noting the same peer must not double-count (the real rustls
-        // cache holds one ticket entry per peer).
-        metrics.note_session_ticket_peer([1u8; 32]);
-
-        let text = metrics.encode().unwrap();
-        assert!(
-            has_metric_line(&text, "decdn_quic_session_ticket_cache_size", 2),
-            "expected 2 distinct peers, got:\n{text}"
-        );
-    }
-
-    #[test]
-    fn session_ticket_set_is_bounded_against_unbounded_distinct_peers() {
-        // Regression: the insert path is fed by the unauthenticated probe
-        // handler, so the tracking set MUST stay bounded under a flood of
-        // distinct node ids — not just the gauge value.
-        let metrics = Metrics::new();
-        for i in 0..(SESSION_TICKET_CACHE_CEILING + 50) {
-            let mut id = [0u8; 32];
-            let tag = u64::try_from(i).unwrap().to_le_bytes();
-            id.iter_mut().zip(tag).for_each(|(dst, src)| *dst = src);
-            metrics.note_session_ticket_peer(id);
-        }
-
-        let ceiling = u64::try_from(SESSION_TICKET_CACHE_CEILING).unwrap();
-        let text = metrics.encode().unwrap();
-        assert!(
-            has_metric_line(&text, "decdn_quic_session_ticket_cache_size", ceiling),
-            "gauge must saturate at the ceiling, got:\n{text}"
-        );
-        // The set itself stopped growing at the ceiling (the leak fix),
-        // not merely the reported gauge.
-        let len = metrics.session_ticket_peers.lock().unwrap().len();
-        assert_eq!(len, SESSION_TICKET_CACHE_CEILING);
-        // The 50 distinct peers beyond the ceiling were each counted as a
-        // drop, so the saturation is observable (not silent).
-        assert!(
-            has_metric_line(&text, "decdn_quic_session_ticket_peers_dropped_total", 50),
-            "expected 50 dropped peers, got:\n{text}"
-        );
     }
 
     #[tokio::test]

@@ -39,7 +39,6 @@ FUNDING_AMOUNT="${FUNDING_AMOUNT:-1000000000000000000000000}"
 ACC0_ADDR="0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
 ACC0_KEY="0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
 ACC1_ADDR="0x70997970C51812dc3A010C7d01b50e0d17dc79C8" # EMERGENCY_MULTISIG
-ACC2_ADDR="0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC" # CHALLENGER_INCENTIVE_POOL
 
 # --- Clean stale manifest ----------------------------------------------------
 # Anvil starts fresh each run, so a manifest from a prior run is meaningless
@@ -93,7 +92,6 @@ log "deploying protocol suite (DeployProtocol)"
 USDC_ADDRESS="$USDC" \
 EMERGENCY_MULTISIG="$ACC1_ADDR" \
 INITIAL_TOKEN_HOLDER="$ACC0_ADDR" \
-CHALLENGER_INCENTIVE_POOL="$ACC2_ADDR" \
 CURRENT_TERMS_HASH="${CURRENT_TERMS_HASH:-0x0000000000000000000000000000000000000000000000000000000000000001}" \
 forge script script/DeployProtocol.s.sol:DeployProtocol \
   --rpc-url "$RPC_URL" --sender "$ACC0_ADDR" --private-key "$ACC0_KEY" --broadcast

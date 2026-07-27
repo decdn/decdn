@@ -44,43 +44,46 @@ struct RateBoundsSink<P: Provider + Clone> {
 }
 
 impl<P: Provider + Clone> RateBoundsSink<P> {
-    /// Convert a `(floor, ceiling)` `uint256` pair to the node's `u64` clamp and
-    /// store it. A value beyond `u64::MAX` cannot be applied — unlike startup
-    /// (which refuses to boot), a running node cannot bail, so it logs and keeps
-    /// the current bounds rather than truncating to a wrong clamp.
-    fn store_bounds(&self, floor: U256, ceiling: U256, source: &str) {
-        // The floor is enforced at settlement, so it must be represented exactly
-        // or not at all: an out-of-range floor means we cannot know what we are
-        // obliged to charge, and keeping the previous one is the only safe move.
+    /// Convert the on-chain `uint256` floor to the node's `u64` clamp and store
+    /// it. A value beyond `u64::MAX` cannot be applied — unlike startup (which
+    /// refuses to boot), a running node cannot bail, so it logs and keeps the
+    /// current floor rather than truncating to a wrong clamp. The floor is
+    /// enforced at settlement, so it must be represented exactly or not at all:
+    /// an out-of-range floor means we cannot know what we are obliged to
+    /// charge, and keeping the previous one is the only safe move.
+    fn store_bounds(&self, floor: U256, source: &str) {
         let Ok(floor) = u64::try_from(floor) else {
-            tracing::warn!(
+            tracing::error!(
                 %floor,
                 source,
                 "rate-bounds watcher: on-chain delivery floor exceeds u64::MAX; \
-                 keeping current bounds"
+                 keeping current floor — governance must lower it"
             );
             return;
         };
-        // The ceiling is only an upper clamp, so an out-of-range value is
-        // semantically "no ceiling" and saturates cleanly. Discarding the whole
-        // update because of it would also drop a perfectly representable floor
-        // change — the node would then keep enforcing a stale floor indefinitely.
-        let ceiling = u64::try_from(ceiling).unwrap_or_else(|_| {
-            tracing::warn!(
-                %ceiling,
+        // Same bound the startup read enforces (`rate_bounds::on_chain_floor_to_u64`).
+        // Without it the value that refuses to boot is installed silently at
+        // runtime one event later: the node would raise every quote above the
+        // wire cap, so no peer could decode its responses and every voucher
+        // would revert at settlement — while it looked healthy locally. Keeping
+        // the previous floor is the lesser evil, but it is NOT safe: the node is
+        // now quoting under a floor the chain will not honour, so anything it
+        // serves accrues vouchers that revert at redemption. `error!` because an
+        // operator must escalate to governance, not because it is self-healing.
+        if floor > decdn_protocol::MAX_RATE_PER_MB {
+            tracing::error!(
+                floor,
+                max = decdn_protocol::MAX_RATE_PER_MB,
                 source,
-                "rate-bounds watcher: on-chain delivery ceiling exceeds u64::MAX; \
-                 saturating to u64::MAX (effectively no ceiling)"
+                "rate-bounds watcher: on-chain delivery floor exceeds the wire cap \
+                 MAX_RATE_PER_MB; keeping the previous floor, but this node is now \
+                 quoting under a floor the chain will not honour and its vouchers will \
+                 revert at settlement — governance must lower the floor"
             );
-            u64::MAX
-        });
-        self.bounds.store(floor, ceiling);
-        tracing::info!(
-            floor,
-            ceiling,
-            source,
-            "delivery-rate bounds updated from chain"
-        );
+            return;
+        }
+        self.bounds.store(floor);
+        tracing::info!(floor, source, "delivery-rate floor updated from chain");
     }
 }
 
@@ -91,7 +94,7 @@ impl<P: Provider + Clone + 'static> LogSink for RateBoundsSink<P> {
         if log.topic0() == Some(&PaymentChannel::RateBoundsUpdated::SIGNATURE_HASH) {
             match PaymentChannel::RateBoundsUpdated::decode_log_data(&log.inner.data) {
                 Ok(ev) => {
-                    self.store_bounds(ev.newDeliveryFloor, ev.newDeliveryCeiling, "event");
+                    self.store_bounds(ev.newDeliveryFloor, "event");
                 }
                 Err(err) => {
                     // Undecodable log: log-and-skip (never Err — a deterministic
@@ -118,15 +121,15 @@ impl<P: Provider + Clone + 'static> LogSink for RateBoundsSink<P> {
         // exists to prevent, plus a warn line each time.
         self.last_poll = Some(now);
         match self.contract.getRateBounds().call().await {
-            Ok(b) => {
-                self.store_bounds(b.floor, b.ceiling, "poll");
+            Ok(floor) => {
+                self.store_bounds(floor, "poll");
             }
             Err(err) => {
                 // Best-effort safety net: the event path is primary, so a failed
-                // re-read logs and keeps the current bounds rather than backing
+                // re-read logs and keeps the current floor rather than backing
                 // off the whole watcher (which would also stall event pickup).
                 // Returning Ok keeps the cursor advancing.
-                tracing::warn!(%err, "rate-bounds watcher: authoritative getRateBounds() poll failed; keeping current bounds");
+                tracing::warn!(%err, "rate-bounds watcher: authoritative getRateBounds() poll failed; keeping current floor");
             }
         }
         Ok(())

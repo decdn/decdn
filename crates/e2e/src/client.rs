@@ -547,8 +547,6 @@ impl ClientFixture {
             Self::target(node),
             *hash.as_bytes(),
             timestamp_us,
-            false, // full handshake keeps the probe deterministic
-            None,
             Duration::from_secs(10),
         )
         .await

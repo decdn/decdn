@@ -77,12 +77,8 @@ contract SlashAppeal is ISlashAppeal, AccessControl, ReentrancyGuard, Sunsetting
     ICapacityBond public immutable capacityBond;
 
     // -----------------------------------------------------------------
-    // Governance-mutable wiring
+    // Governance-mutable parameters
     // -----------------------------------------------------------------
-
-    /// @notice Destination for the 50% non-burn leg of a failed (upheld) appeal
-    ///         bond — funds parties who file successful counter-evidence.
-    address public challengerIncentivePool;
 
     uint256 public appealBond;
 
@@ -127,12 +123,11 @@ contract SlashAppeal is ISlashAppeal, AccessControl, ReentrancyGuard, Sunsetting
     event AppealFastTracked(uint256 indexed slashId);
     event AppealRejected(uint256 indexed slashId, uint256 bondBurned);
     event AppealGranted(uint256 indexed slashId, address indexed operator, uint256 bondRefunded);
-    event AppealUpheld(uint256 indexed slashId, uint256 bondBurned, uint256 toChallengerPool);
+    event AppealUpheld(uint256 indexed slashId, uint256 bondBurned);
     /// @notice `reason` 1 = review-window lapse (upheld); 2 = ratification-window
     ///         lapse (granted, operator-favorable).
     event AppealLapsed(uint256 indexed slashId, uint8 reason);
     event AppealBondUpdated(uint256 oldValue, uint256 newValue);
-    event ChallengerIncentivePoolUpdated(address indexed oldAddr, address indexed newAddr);
 
     // -----------------------------------------------------------------
     // Errors
@@ -244,7 +239,7 @@ contract SlashAppeal is ISlashAppeal, AccessControl, ReentrancyGuard, Sunsetting
     ///      `Open` appeals — once an appeal is `FastTracked`, only the Governor
     ///      may resolve it (`grantAppeal` / `upholdAppeal`), preserving the
     ///      two-stage governance process. A fast-tracked appeal that fails goes
-    ///      through `upholdAppeal` (50/50 bond split), not `rejectAppeal`.
+    ///      through `upholdAppeal`.
     function rejectAppeal(uint256 slashId)
         external
         override
@@ -284,42 +279,18 @@ contract SlashAppeal is ISlashAppeal, AccessControl, ReentrancyGuard, Sunsetting
 
     /// @inheritdoc ISlashAppeal
     /// @dev Governor upholds the slash — the fast-tracked appeal fails.
-    ///      Distribute the escrow 50/50 and split the bond 50% burn / 50% to the
-    ///      challenger-incentive pool. If the pool is unwired (`address(0)`),
-    ///      degrade gracefully to a 100% bond burn — matching `rejectAppeal` —
-    ///      rather than reverting; otherwise a misconfiguration would block the
-    ///      uphold and let `cleanupExpiredAppeal` flip it to an operator-
-    ///      favorable grant after the ratification window (ADR 028 § Appeal flow).
+    ///      Distribute the slash escrow 50/50 between the original challenger
+    ///      and burn, then burn the separate appeal bond in full.
     function upholdAppeal(uint256 slashId) external override nonReentrant whenNotPaused onlyRole(GOVERNANCE_ROLE) {
         Appeal storage a = _appeals[slashId];
         if (a.status != AppealStatus.FastTracked) revert AppealNotFastTracked(slashId);
-        uint256 bondTotal = a.bond;
+        uint256 bondBurned = a.bond;
         a.bond = 0;
         a.status = AppealStatus.Resolved;
 
         ICapacityBondSlashEscrow(address(capacityBond)).settleAppealUpheld(slashId);
-
-        address pool = challengerIncentivePool;
-        uint256 toPool = pool == address(0) ? 0 : bondTotal / 2;
-        uint256 toBurn = bondTotal - toPool;
-        if (toPool != 0) {
-            // Degrade to burn if the pool transfer fails — a reverting or
-            // blocklisting `challengerIncentivePool` must not be able to block
-            // the uphold and let `cleanupExpiredAppeal` flip it to an
-            // operator-favorable grant after the ratification window (ADR 028
-            // §3). Mirrors the `address(0)` degrade above, defensively.
-            try IERC20(address(token)).transfer(pool, toPool) returns (bool ok) {
-                if (!ok) {
-                    toBurn += toPool;
-                    toPool = 0;
-                }
-            } catch {
-                toBurn += toPool;
-                toPool = 0;
-            }
-        }
-        if (toBurn != 0) token.burn(toBurn);
-        emit AppealUpheld(slashId, toBurn, toPool);
+        if (bondBurned != 0) token.burn(bondBurned);
+        emit AppealUpheld(slashId, bondBurned);
     }
 
     /// @inheritdoc ISlashAppeal
@@ -382,13 +353,6 @@ contract SlashAppeal is ISlashAppeal, AccessControl, ReentrancyGuard, Sunsetting
         uint256 old = appealBond;
         appealBond = newBond;
         emit AppealBondUpdated(old, newBond);
-    }
-
-    function setChallengerIncentivePool(address newPool) external onlyRole(GOVERNANCE_ROLE) {
-        if (newPool == address(0)) revert ZeroAddress();
-        address old = challengerIncentivePool;
-        challengerIncentivePool = newPool;
-        emit ChallengerIncentivePoolUpdated(old, newPool);
     }
 
     function pause() external onlyRole(PAUSER_ROLE) {

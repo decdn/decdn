@@ -179,8 +179,7 @@ Arbitrum One fee markets at deployment. Three MUST gates:
    `FeeRouter.routeSettlement(operator, bytesDelivered, amount)` — three
    `safeTransfer` legs (60/30/10 same-tx per [ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split)),
    one inline write to the FeeRouter-internal `bytesPerEpoch[operator][epoch]`
-   served-bytes counter (epoch derived from `block.timestamp`) consumed by `DecdnGovernor._getVotes` per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight), and a single
-   `CapacityBond.recordSettlement` call emitting `SettlementRecorded(operator)` (event only, no storage write).
+   served-bytes counter (epoch derived from `block.timestamp`) consumed by `DecdnGovernor._getVotes` per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight).
    Overhead **~5–10K gas** atop the settlement tx (dominated by the `bytesPerEpoch` counter SSTOREs); at 100K settlements/year
    (medium operator) a small fraction of total cost. Aggregate per-settlement gas
    (USDC-equivalent, incl. this overhead) MUST stay within the operator P&L

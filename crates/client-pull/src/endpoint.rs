@@ -110,11 +110,7 @@ pub async fn client_endpoint(
     } else {
         add_resolution_lookups(Endpoint::builder(presets::Minimal), discovery)?
     };
-    builder = builder
-        .secret_key(fresh_secret_key())
-        // ADR 015 §Session Ticket Management: matches the node's endpoint so the
-        // 0-RTT mechanism is identical; harmless for the one-shot CLI.
-        .max_tls_tickets(decdn_protocol::SESSION_TICKET_CACHE_SIZE);
+    builder = builder.secret_key(fresh_secret_key());
     builder = if !relays.is_empty() {
         builder.relay_mode(relay_mode(relays))
     } else if discovery.is_empty() {

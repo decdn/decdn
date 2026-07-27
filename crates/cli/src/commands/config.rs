@@ -84,11 +84,6 @@ pub fn write_validate_summary<W: std::io::Write>(
         "  bind_port:                {}",
         resolved.network.bind_port
     )?;
-    writeln!(
-        w,
-        "  enable_0rtt:              {}",
-        resolved.network.enable_0rtt
-    )?;
     // One line per configured relay; nothing when the list is empty (the node
     // then falls back to the n0 default relays). Relay URLs can carry
     // `user:pass@` userinfo, so redact it (host stays visible) — the same
@@ -438,7 +433,6 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 
 [network]
 # bind_port = 4433
-# enable_0rtt = true                 # QUIC 0-RTT for cdn/probe/v1 (ADR 015); set false to require a full handshake
 # Multiple relays give redundancy/failover; reachability is probed at bring-up
 # and logged but never fatal (the node proceeds and iroh retries in the background).
 # relay_urls = ["https://relay-a.example.", "https://relay-b.example."]
@@ -477,7 +471,7 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # cache_dir = "~/.decdn/cache"
 # cache_size_mb = 10240
 # max_blob_size_mb = 1024
-# max_rate_per_mb = 0                      # buyer-side per-MB rate ceiling for paid cache-miss pulls (USDC base units); 0 = unlimited (#1375). Refuses a provider quote above the lower of this and the candidate's probe rate, before paying. Distinct from the seller-side [payment] delivery_ceiling clamp
+# max_rate_per_mb = 0                      # buyer-side per-MB rate ceiling for paid cache-miss pulls (USDC base units); 0 = unlimited (#1375). Refuses a provider quote above the lower of this and the candidate's probe rate, before paying. Distinct from the seller-side [payment] delivery_floor clamp, which raises this node's own quote
 # pinned_hashes = []                       # blob hashes (hex) exempted from LRU eviction (#276)
 # user_agent = "decdn-node/<version>"      # User-Agent on HTTP origin pull-through (#435); default embeds the crate version
 # Pull-through origin (singular). Mutually exclusive with the plural [[cache.origins]] form below.
@@ -513,7 +507,6 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 [payment]
 # rate_per_mb = 10
 # delivery_floor = 0                       # PRE-CHAIN SEED ONLY (#1172): overwritten from on-chain getRateBounds() before serving; governance owns the live floor
-# delivery_ceiling = 1000000000000         # PRE-CHAIN SEED ONLY (#1172): overwritten from on-chain getRateBounds(); must be >= 1
 # voucher_interval_mb = 1                  # voucher cadence advertised on cdn/client/v1 (ADR 003); range 1..=MAX_VOUCHER_INTERVAL_MB
 
 [observability]
@@ -544,7 +537,6 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # per_ip_burst = 200                        # per-IP burst capacity
 # global_rate_per_sec = 1000.0              # global inbound DHT sustained rate; 0.0 disables
 # global_burst = 2000                       # global inbound DHT burst capacity
-# trusted_ips = []                          # IPs that bypass the per-IP layer only (ADR 022 §Trusted-IP exemption)
 # max_tracked_per_ip = 4096                 # cap on the per-IP keyed-limiter map (#645); 0 = unbounded
 # max_tracked_per_peer = 4096               # cap on the per-peer keyed-limiter map (#645); 0 = unbounded
 
@@ -555,7 +547,6 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # per_ip_burst = 200                        # per-IP burst capacity
 # global_rate_per_sec = 1000.0              # global inbound probe sustained rate; 0.0 disables
 # global_burst = 2000                       # global inbound probe burst capacity
-# trusted_ips = []                          # IPs that bypass the per-IP layer only (ADR 005 §Trusted-IP exemption)
 # max_tracked_per_ip = 4096                 # cap on the per-IP keyed-limiter map (#645); 0 = unbounded
 # max_tracked_per_peer = 4096               # cap on the per-peer keyed-limiter map (#645); 0 = unbounded
 

@@ -92,7 +92,6 @@ async fn request_inner(
     target: EndpointAddr,
     channel_id: B256,
 ) -> anyhow::Result<Option<CooperativeCloseAuth>> {
-    // Full handshake — no 0-RTT on cdn/client/v1 (ADR 015), mirroring the pull path.
     let conn = endpoint
         .connect(target, ALPN_CLIENT)
         .await

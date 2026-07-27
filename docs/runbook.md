@@ -105,23 +105,34 @@ blacklist updates and stop being able to settle channels. Once
 
 ## Slashing risk
 
-**Triggers** (per [ADR 008](../adr/008-reputation.md),
+**Triggers** — the three, and only three, offenses `SlashJudge` adjudicates,
+one per `submit*Challenge` entry point (per
 [ADR 011](../adr/011-content-takedown.md),
 [ADR 014](../adr/014-on-chain-verification.md)):
 
 - **Phantom announce** — claiming a hash you don't actually hold (signed
   `has_blob: true` then evicted within `probe_hold_duration`, or refused to
   serve when the stream request arrived).
-- **Missed challenge response** — failure to respond to a slash challenge
-  within the 24-hour window (ADR 014).
-- **Blacklist violation** — serving content after the on-chain blacklist
-  added it.
+- **Rate manipulation** — charging a *higher* stream rate than this node
+  itself probe-quoted, inside the 30-second slashing window. The direction
+  matters: `SlashJudge` reverts `NotRateManipulation` unless the signed
+  `StreamResponse` rate strictly exceeds the signed `ProbeResponse` rate, so
+  quoting high and serving cheap is never an offense. Only a reprice
+  *upward* has to wait out the window before you serve at the new rate.
+- **Blacklist violation** — serving content after the blacklist entry's
+  `effectiveAt` (`addedAt` plus the compliance window), not after `addedAt`
+  — see [ContentBlacklist compliance](#contentblacklist-compliance).
+
+There is no "missed response" offense: every slash is driven by the
+operator's own signed messages, so a node that stays silent cannot be
+slashed by an external adversary.
 
 **Detect:**
 
 - Alerts in `monitoring/prometheus-alerts.yml` (verbatim names):
-  - `DecdnProbeHoldViolations` (critical) — phantom-announcement evidence
-    is being produced.
+  - `DecdnProbeHoldViolations` (critical) — hold budget exhausted, so
+    present blobs are being answered `has_blob: false`. Budget pressure and
+    lost revenue, not slash evidence; see step 4.
   - `DecdnSlashEvidenceExposure` (critical) — node served bytes for a hash
     inside the slash window after `has_blob: true`.
   - `DecdnBlacklistSyncLagCritical` (critical) — blacklist > 30 minutes
@@ -130,32 +141,75 @@ blacklist updates and stop being able to settle channels. Once
     versions missed. (Both blacklist alerts above are pre-wired but not yet
     emitted by the node — see
     [ContentBlacklist compliance](#contentblacklist-compliance).)
-  - `DecdnRateBoundsClamp` (warning) — `rate_per_mb` outside governance
-    bounds; not directly slashable but indicates configuration drift.
+  - `DecdnRateBoundsClamp` (warning) — your configured `rate_per_mb` sits
+    *below* the governance `deliveryFloor`, so every quote is being raised to
+    the floor before signing. The clamp is raise-only; there is no ceiling. Not
+    directly slashable, but it means you are not charging what you configured.
+    Raise `payment.rate_per_mb` to at least the on-chain floor.
 - Grafana: the slash-safety row in `monitoring/grafana-dashboard.json`.
 
 **Remediate:**
 
-1. **If the trigger was a missed challenge response:** investigate the root
-   cause first (RPC outage, dispute monitor down, signing host crash, clock
-   skew). Fix that before submitting evidence — counter-evidence filed while
-   the underlying problem persists will not stop the next strike.
-2. **Submit counter-evidence on-chain within the 24-hour challenge window.**
-   The procedure is defined in
-   [ADR 014](../adr/014-on-chain-verification.md); deadlines are absolute
-   wall-clock — once the window closes the slash is final.
-3. **For phantom announces (`DecdnProbeHoldViolations`):** investigate OOM
-   and resource pressure on the node — the violations indicate that signed
-   `has_blob: true` answers are not being honoured by the eviction-hold
-   mechanism. There is no operator-tunable knob for hold capacity in
-   `crates/node/src/config/types.rs` today; the alert annotations reference
-   `max_probe_holds` but it is not yet a config field. Until that lands,
-   the practical levers are reducing offered load, increasing host
-   memory, and following
-   [ADR 005 § Probe-Triggered Eviction Hold](../adr/005-protocol.md#probe-triggered-eviction-hold)
-   for context. See also
-   [ADR 008](../adr/008-reputation.md) for reputation impact.
-4. **For self-detected exposure (`DecdnSlashEvidenceExposure`):** stop the
+1. **Fix the root cause before anything else.** Each offense has its own:
+   eviction-hold pressure or a crashed signing host (phantom), blacklist
+   watcher lag or a stale RPC endpoint (blacklist violation), a rate
+   reconfiguration applied inside the 30-second window (rate manipulation).
+   A slash you appeal while the underlying problem persists will not stop
+   the next strike.
+2. **There is no counter-evidence window.** If on-chain verification passes,
+   the slash executes synchronously inside the challenger's
+   `submit*Challenge` reveal — see
+   [ADR 014 § Bond Handling](../adr/014-on-chain-verification.md#bond-handling).
+   Nothing you send afterwards can undo it in-protocol; there is no
+   counter-evidence deadline to race, only the appeal window in step 3.
+3. **The recourse is a slash appeal.** File it with the CLI, which reads the
+   governable bond, sets the TOKEN allowance for you, and surfaces the
+   contract reverts verbatim:
+
+   ```bash
+   # Get the slashId — admin RPC on the loopback admin port (default 9191).
+   curl -sS -H 'content-type: application/json' \
+     -d '{"jsonrpc":"2.0","method":"admin_v1_slashes","params":[],"id":1}' \
+     http://127.0.0.1:9191/
+
+   decdn appeal slash <SLASH_ID> <EVIDENCE_BUNDLE_HASH> --dry-run
+   ```
+
+   Drop `--dry-run` to send. Under the hood this is
+   `SlashAppeal.openSlashAppeal(slashId, evidenceBundleHash)`, callable only
+   by the slashed operator, within `APPEAL_FILING_WINDOW` — **30 days from
+   the slash**, enforced by `CapacityBond.markAppealOpen`, which reverts once
+   it lapses (a protocol pause extends it by the paused duration). It costs
+   `APPEAL_BOND` (1,000 TOKEN by default, governable within `[100, 10,000]`),
+   burned in full if the appeal fails. The evidence bundle is assembled
+   off-chain and committed by hash. You may appeal every slash in a cluster,
+   but only **one appeal per 365 days can be granted**
+   (`APPEAL_FREQUENCY_WINDOW`), so lead with the most clear-cut case. Flow,
+   windows, and what counts as evidence:
+   [ADR 028](../adr/028-slashing-appeals.md#adr-028-slashing-appeals-and-dispute-escalation).
+4. **For `DecdnProbeHoldViolations`:** this is lost revenue, not slash
+   evidence. The alert watches
+   `decdn_probe_hold_unavailable_total{reason="exhausted"}` and fires when a
+   blob is present but *un-holdable*
+   because every hold slot is live, so the node signs `has_blob: false` and
+   forgoes the delivery rather than risk a phantom slash — the literal
+   "evicted after signing `has_blob: true`" case is unreachable by
+   construction (held hashes are invisible to the LRU driver). Raise the
+   budget with `[cache] max_probe_holds` (`--max-probe-holds` /
+   `DECDN_MAX_PROBE_HOLDS`, default 256); a busy node serving many peers
+   should scale it up proportionally, while a node with a *small* cache
+   should keep it under ~25% of cache capacity. **This field is
+   restart-required** — a config reload logs "requires restart" and keeps the
+   old value. Add host memory or shed load if the pressure is genuine. If the
+   series is flat but `reason="disabled"` or `reason="stake_lane_reserved"` is
+   climbing, the refusals are deliberate — a `max_probe_holds` of 0, or
+   end-client probes shed to keep stake-lane headroom — and neither calls for
+   this remedy.
+   Background:
+   [ADR 005 § Hold budget](../adr/005-protocol.md#hold-budget) and
+   [Appendix: Observability](../adr/appendix-observability.md#slash-safety-metrics-all-mandatory).
+   See also [ADR 008](../adr/008-reputation.md) for reputation impact.
+5. **For self-detected exposure (`DecdnSlashEvidenceExposure`):** stop the
    node immediately and file a bug — this signals a code-path defect, not an
    operator misconfiguration.
 
@@ -165,8 +219,7 @@ blacklist updates and stop being able to settle channels. Once
 hash on-chain via `ContentBlacklist`, and this node may still be caching,
 announcing, or serving it. Serving a globally blocked hash is a slashable
 offense (see [Slashing risk](#slashing-risk)). Protocol semantics:
-[ADR 011](../adr/011-content-takedown.md),
-[ADR 031](../adr/031-content-blacklist-appeals-contract.md).
+[ADR 011](../adr/011-content-takedown.md).
 
 **How a node is meant to learn about a blocked hash.**
 [ADR 011 § Node Behavior](../adr/011-content-takedown.md#node-behavior)
@@ -246,40 +299,44 @@ nodeId-indexed `NodeAutoEjected`. The node's staker-set watcher follows
      `GENERAL`, 90 for `CSAM`/`TERRORIST` — unless governance ratifies it with
      `addHashGlobal`. It stops being slashable at that deadline whether or not
      anyone has called `expireEmergencyEntry` to materialize the removal.
-   - An entry under active appeal (`suspended == true`) is not slashable —
-     `isHashBlacklisted` returns `false` and `SlashJudge` rejects the challenge —
-     but `addedAt` and `effectiveAt` are both preserved when the suspension
-     clears, so the grace does **not** restart: re-evict before serving again.
 
-3. **If you believe the entry is wrong, appeal it — don't just keep serving.**
-   `openBlacklistAppeal(hash, region, evidenceBundleHash, standingPath, namespaceId)`
-   opens an appeal against an `appealBond` deposit (governance-set; testnet deploy
-   default **100 TOKEN**, bounds `[50, 5000]`) within a 14-day filing window from
-   `addedAt`. The emergency multisig (`EMERGENCY_MULTISIG_ROLE`) fast-tracks —
-   suspending the entry for interim relief — or rejects; DecdnGovernor
-   (`GOVERNANCE_ROLE`) then ratifies the removal or reverses. Bond outcomes in
-   the deployed contract: **refunded only on ratification**; **burned on
-   rejection, reversal, and lapse** (`cleanupExpiredBlacklistAppeal`). The
-   declared `standingPath` is **verified at filing** (audit I-3): **`Publisher`**
-   requires that `namespaceId` is a namespace you own which has claimed the hash
-   (ignored on the other paths); **`Operator`** requires your current attested
-   region to match the entry's region; **`TokenHolder`** needs no extra
-   credential — the escrowed appeal bond is the standing, so there is no balance
-   threshold and no synthetic-standing clawback. PoC caveat vs. the ADR 011/031
-   design: any non-zero `region` is appealable (global included — the
-   regional-only restriction is not enforced). Global entries also remain
-   removable via the slow-path DecdnGovernor `removeHashGlobal` override. Design
-   intent:
-   [ADR 011 § Blacklist Entry Appeals](../adr/011-content-takedown.md#blacklist-entry-appeals),
-   [ADR 031](../adr/031-content-blacklist-appeals-contract.md).
+3. **If you believe the entry is wrong, escalate it — don't just keep serving.**
+   There is no per-entry appeal contract; the entry comes off through the
+   ordinary removal path, and **which path depends on the entry's scope.**
 
-4. **A slash you already took is a separate matter.** Appealing the blacklist
-   *entry* (step 3) removes the entry; it does **not** refund a slash you
-   already incurred for serving the hash. Restitution for the slash itself —
-   e.g. you were offline during the window — is the
-   [ADR 028 SlashAppeal](../adr/028-slashing-appeals.md) path, with its own
-   bond and evidence rules. Operational-failure evidence is inadmissible on
-   the content-policy path and vice versa.
+   - **Global entry** (`region == GLOBAL`): a DecdnGovernor `removeHashGlobal`
+     proposal through the standard timelock (~10 days).
+   - **Regional entry**: only the registered body for that region can remove it.
+     `removeHashRegional` is `REGIONAL_BODY_ROLE`-gated *and* requires the
+     caller to be that region's currently-registered, unsuspended body — so
+     `removeHashGlobal` cannot reach it and neither can governance directly.
+     Raise it with the body: for them it is one transaction, no vote.
+   - **Regional entry, body will not act**: governance must replace the body —
+     `deregisterRegionalBody(region)` then `registerRegionalBody(region, …)`
+     with a body that will act, which then calls `removeHashRegional`. Two
+     governance actions, so budget more than one timelock cycle.
+
+   **Do not reach for `suspendRegionalBody` here.** It is the right tool for a
+   body that is issuing bad entries, and the wrong one for a body that will not
+   remove them: `_requireActiveBodyFor` gates `addHashRegional` **and**
+   `removeHashRegional`, so suspending closes the only route by which that
+   body's existing entries could come off. Suspension also retracts nothing —
+   every entry already issued stays live, enforceable and slashable, because
+   `_bodySuspended` is not consulted by `_isLive` or by `SlashJudge`. If a
+   suspension is already in place and you need an entry removed, governance must
+   first `unsuspendRegionalBody` or replace the body outright.
+
+   In every case, keep the hash evicted until the removal actually lands: the
+   entry is enforceable, and therefore slashable, right up to that point.
+   Semantics:
+   [ADR 011 § Removing a Wrongful Entry](../adr/011-content-takedown.md#removing-a-wrongful-entry).
+
+4. **A slash you already took is a separate matter.** Getting the entry removed
+   (step 3) stops future exposure; it does **not** refund a slash you already
+   incurred for serving the hash. Restitution for the slash itself — e.g. you
+   were offline during the window — is the
+   [ADR 028 SlashAppeal](../adr/028-slashing-appeals.md) path, with its own bond
+   and evidence rules, and it is the only appeal surface the protocol carries.
 
 ## Gossip / peer table degraded
 

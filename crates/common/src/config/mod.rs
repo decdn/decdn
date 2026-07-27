@@ -29,10 +29,6 @@ pub use types::FileConfig;
 
 /// Default QUIC bind port.
 const DEFAULT_BIND_PORT: u16 = 4433;
-/// Default for the QUIC 0-RTT master switch (ADR 015). 0-RTT for
-/// `cdn/probe/v1` is on by default; operators kill it via
-/// `network.enable_0rtt = false`.
-const DEFAULT_ENABLE_0RTT: bool = true;
 /// Default maximum cache size in megabytes (10 GB).
 const DEFAULT_CACHE_SIZE_MB: u64 = 10_240;
 /// Default maximum single blob size in megabytes (1 GB).
@@ -286,6 +282,62 @@ pub const MAX_RECEIPT_RETAINED_FILES: u32 = 100;
 /// the surfaced path can't drift from where the log actually lands.
 pub const RECEIPT_LOG_FILE: &str = "download_receipts.jsonl";
 
+/// Env vars that once configured a knob and now configure nothing.
+///
+/// The other two surfaces of a removed knob fail loudly on their own: a stale
+/// TOML key trips `deny_unknown_fields`, and a stale `--flag` trips clap's
+/// unknown-argument error. An env var has no such backstop — `clap` simply
+/// stops reading it — so an operator whose systemd unit or container env still
+/// carries one upgrades cleanly and silently loses the setting. Warn instead.
+///
+/// Entries are appended when a knob is removed and may be pruned once the
+/// removal is far enough back that no live deployment could still set it.
+const RETIRED_ENV_VARS: &[(&str, &str)] = &[(
+    "DECDN_DELIVERY_CEILING",
+    "the advisory delivery-rate ceiling was removed (#1441); the node no longer \
+     clamps its quote downward at all, and the wire cap MAX_RATE_PER_MB is the \
+     only upper bound",
+)];
+
+/// Emit one warning per retired env var that is still set. Deliberately not a
+/// hard error: unlike a stale TOML key, an env var is often inherited from an
+/// orchestrator the operator does not directly control, and refusing to boot
+/// over one would be a worse failure than the silent ignore it replaces.
+///
+/// Writes to stderr rather than `tracing`, and that is load-bearing rather than
+/// a style choice: `resolve_config` runs *before* `init_tracing` in the daemon
+/// (`decdn-node`'s `commands::run`), so a `tracing::warn!` here has no global
+/// subscriber and is discarded — and `decdn` (the CLI, which reaches this via
+/// `config validate`) does not depend on `tracing` at all. Either way the
+/// warning would never reach the operator it exists for. The adjacent
+/// malformed-`RUST_LOG` notice uses `eprintln!` for exactly this reason.
+///
+/// Returns the names it warned about so callers (and tests) can assert on them.
+fn warn_retired_env_vars() -> Vec<&'static str> {
+    warn_retired_env_vars_with(|name| std::env::var_os(name).is_some())
+}
+
+/// [`warn_retired_env_vars`] with the environment lookup injected.
+///
+/// Split out purely for testability: `unsafe` is forbidden workspace-wide
+/// (`-F unsafe-code`) and `std::env::set_var` is `unsafe` since edition 2024,
+/// so a test cannot set a variable to observe the behaviour. Injecting the
+/// predicate exercises the "var is set" branch directly — the branch that was
+/// silently broken before.
+fn warn_retired_env_vars_with(is_set: impl Fn(&str) -> bool) -> Vec<&'static str> {
+    let mut warned = Vec::new();
+    for (name, why) in RETIRED_ENV_VARS {
+        if is_set(name) {
+            eprintln!(
+                "warning: {name} is set but no longer does anything: {why}. Remove it from \
+                 the environment to silence this warning."
+            );
+            warned.push(*name);
+        }
+    }
+    warned
+}
+
 /// Load config from file (if present) and merge with CLI args.
 ///
 /// CLI args take precedence over file values; defaults fill gaps.
@@ -303,6 +355,8 @@ pub fn resolve_config(config_path: Option<&Path>, cli: &RunArgs) -> anyhow::Resu
     // validate. Everything *after* this accumulates into one `bag` so an
     // operator sees every problem in a single pass.
     let file = load_file_config(config_path)?;
+
+    let _retired = warn_retired_env_vars();
 
     let mut bag = ConfigErrorBag::new();
 
@@ -718,17 +772,10 @@ fn resolve_network_into(
 
     let discovery = resolve_discovery_into(file, bag);
 
-    // No CLI flag: 0-RTT is an operational kill switch, not a per-invocation
-    // tuning knob. File `network.enable_0rtt` > built-in default (`true`).
-    let enable_0rtt = file
-        .and_then(|n| n.enable_0rtt)
-        .unwrap_or(DEFAULT_ENABLE_0RTT);
-
     ResolvedNetwork {
         bind_port,
         relay_urls,
         discovery,
-        enable_0rtt,
     }
 }
 
@@ -2345,59 +2392,40 @@ pub fn resolve_payment_into(
         },
     );
     // Pre-chain seed for the on-chain `getRateBounds()` clamp (ADR 005 §Rate
-    // bounds validation). Since #1172 the runtime overwrites both from chain
-    // before serving, so these defaults (`0` .. `MAX_RATE_PER_MB`) only shape
-    // the pre-read window; the live clamp is governance-owned on-chain.
+    // bounds validation). Since #1172 the runtime overwrites it from chain
+    // before serving, so this default (`0`) only shapes the pre-read window;
+    // the live floor is governance-owned on-chain.
     let delivery_floor = cli
         .delivery_floor
         .or_else(|| file.and_then(|p| p.delivery_floor))
         .unwrap_or(0);
-    let delivery_ceiling = cli
-        .delivery_ceiling
-        .or_else(|| file.and_then(|p| p.delivery_ceiling))
-        .unwrap_or(decdn_protocol::MAX_RATE_PER_MB);
+    // The clamp only ever raises `rate_per_mb`, so a floor above the wire cap
+    // would make the node sign a rate honest clients reject outright (#378).
+    // There is no lower guard to write: with `rate_per_mb >= 1` validated above
+    // and a raise-only clamp, the signed rate can never collapse to 0 — an
+    // invariant the removed governance ceiling used to need a check for.
     bag.check_with(
-        delivery_floor <= delivery_ceiling,
+        delivery_floor <= decdn_protocol::MAX_RATE_PER_MB,
         "payment.delivery_floor",
         || {
             format!(
-                "payment.delivery_floor ({delivery_floor}) must be <= \
-             payment.delivery_ceiling ({delivery_ceiling})"
-            )
-        },
-    );
-    // A ceiling of 0 would clamp every quoted rate to 0, bypassing the
-    // `rate_per_mb > 0` guard above and making the node advertise a
-    // free/selection-winning rate (ADR 001). With ceiling >= 1 and the
-    // validated `rate_per_mb >= 1`, `clamp(rate, floor, ceiling)` is always
-    // >= 1, so the signed rate can never collapse to 0.
-    bag.check(
-        delivery_ceiling >= 1,
-        "payment.delivery_ceiling",
-        "payment.delivery_ceiling must be >= 1 (clamping to 0 would sign a \
-         free rate and bypass the rate_per_mb > 0 guard, ADR 001)",
-    );
-    bag.check_with(
-        delivery_ceiling <= decdn_protocol::MAX_RATE_PER_MB,
-        "payment.delivery_ceiling",
-        || {
-            format!(
-                "payment.delivery_ceiling {delivery_ceiling} exceeds protocol \
-             MAX_RATE_PER_MB ({}); clamping to it could still emit a rate honest \
+                "payment.delivery_floor {delivery_floor} exceeds protocol \
+             MAX_RATE_PER_MB ({}); raising a quote to it would emit a rate honest \
              clients reject",
                 decdn_protocol::MAX_RATE_PER_MB,
             )
         },
     );
     // Voucher cadence advertised in `StreamResponse` (ADR 003 §Voucher Interval
-    // Negotiation). Default 1 MB; governable range 1..=1024. File-only (no CLI
-    // override) — it is read once at handler construction, not hot-reloadable.
+    // Negotiation). Default 1 MB; hardcoded wire range 1..=1024 (no on-chain
+    // counterpart). File-only (no CLI override) — it is read once at handler
+    // construction, not hot-reloadable.
     let voucher_interval_mb = file
         .and_then(|p| p.voucher_interval_mb)
         .unwrap_or(decdn_protocol::DEFAULT_VOUCHER_INTERVAL_MB);
     // Lower bound is the literal minimum cadence (1 MB), not the default const:
     // a future change to DEFAULT_VOUCHER_INTERVAL_MB must not narrow the valid
-    // governable range (ADR 003 §Voucher Interval Negotiation: 1..=1024).
+    // wire range (ADR 003 §Voucher Interval Negotiation: 1..=1024).
     bag.check_with(
         (1..=decdn_protocol::MAX_VOUCHER_INTERVAL_MB).contains(&voucher_interval_mb),
         "payment.voucher_interval_mb",
@@ -2412,7 +2440,6 @@ pub fn resolve_payment_into(
     ResolvedPayment {
         rate_per_mb,
         delivery_floor,
-        delivery_ceiling,
         voucher_interval_mb,
     }
 }
@@ -2711,13 +2738,9 @@ pub fn resolve_security_into(
 /// layer (operator opt-out). Mixing `rate > 0` with `burst == 0` is
 /// rejected as a deny-all corner case — the resolver treats it the same
 /// way [`resolve_security_into`] handles the `per_source` pairing.
-///
-/// Trusted IPs are parsed once at resolution; malformed entries fail
-/// fast under the bag pattern.
 #[allow(clippy::cognitive_complexity)] // linear "default-or-file → validate" rows.
 pub fn resolve_dht_into(file: Option<&types::DhtConfig>, bag: &mut ConfigErrorBag) -> ResolvedDht {
-    // ADR 022 nests the rate-limit knobs under `dht.rate_limit.*` (see
-    // §Trusted-IP exemption — "Configuration key: dht.rate_limit.trusted_ips").
+    // ADR 022 nests the rate-limit knobs under `dht.rate_limit.*`.
     // The file shape mirrors that; an absent `[dht.rate_limit]` collapses
     // to "all defaults" through the same `.and_then` chain the other
     // resolvers use.
@@ -2773,12 +2796,6 @@ pub fn resolve_dht_into(file: Option<&types::DhtConfig>, bag: &mut ConfigErrorBa
         "dht.rate_limit.global_burst must be > 0 when global_rate_per_sec > 0 (set both to 0 to disable)",
     );
 
-    let trusted_ips = parse_trusted_ips(
-        rate_limit.and_then(|r| r.trusted_ips.as_deref()),
-        "dht.rate_limit.trusted_ips",
-        bag,
-    );
-
     let max_tracked_per_ip = rate_limit
         .and_then(|r| r.max_tracked_per_ip)
         .unwrap_or(DEFAULT_DHT_MAX_TRACKED_PER_IP);
@@ -2808,7 +2825,6 @@ pub fn resolve_dht_into(file: Option<&types::DhtConfig>, bag: &mut ConfigErrorBa
         per_ip_burst,
         global_rate_per_sec,
         global_burst,
-        trusted_ips,
         max_tracked_per_ip,
         max_tracked_per_peer,
     }
@@ -2824,16 +2840,15 @@ pub fn resolve_dht(file: Option<&types::DhtConfig>) -> anyhow::Result<ResolvedDh
 /// Resolve the `[probe.rate_limit]` section into [`ResolvedProbe`], applying
 /// the ADR 005 §Probe rate limiting defaults and the same validation the DHT
 /// layer uses: each `*_rate_per_sec` finite and `>= 0` (0 disables the layer),
-/// the matching `*_burst > 0` whenever its rate is `> 0` (no deny-all), and
-/// trusted IPs parsed fail-fast. Mirrors [`resolve_dht_into`]; only the
+/// and the matching `*_burst > 0` whenever its rate is `> 0` (no deny-all).
+/// Mirrors [`resolve_dht_into`]; only the
 /// defaults and the `probe.rate_limit.*` field keys differ.
 #[allow(clippy::cognitive_complexity)] // linear "default-or-file → validate" rows.
 pub fn resolve_probe_into(
     file: Option<&types::ProbeConfig>,
     bag: &mut ConfigErrorBag,
 ) -> ResolvedProbe {
-    // ADR 005 nests the rate-limit knobs under `probe.rate_limit.*` (see
-    // §Trusted-IP exemption — "Configuration key: probe.rate_limit.trusted_ips").
+    // ADR 005 nests the rate-limit knobs under `probe.rate_limit.*`.
     let rate_limit = file.and_then(|p| p.rate_limit.as_ref());
     let per_peer_rate_per_sec = rate_limit
         .and_then(|r| r.per_peer_rate_per_sec)
@@ -2886,12 +2901,6 @@ pub fn resolve_probe_into(
         "probe.rate_limit.global_burst must be > 0 when global_rate_per_sec > 0 (set both to 0 to disable)",
     );
 
-    let trusted_ips = parse_trusted_ips(
-        rate_limit.and_then(|r| r.trusted_ips.as_deref()),
-        "probe.rate_limit.trusted_ips",
-        bag,
-    );
-
     let max_tracked_per_ip = rate_limit
         .and_then(|r| r.max_tracked_per_ip)
         .unwrap_or(DEFAULT_PROBE_MAX_TRACKED_PER_IP);
@@ -2920,7 +2929,6 @@ pub fn resolve_probe_into(
         per_ip_burst,
         global_rate_per_sec,
         global_burst,
-        trusted_ips,
         max_tracked_per_ip,
         max_tracked_per_peer,
     }
@@ -2931,34 +2939,6 @@ pub fn resolve_probe_into(
 #[cfg(test)]
 pub fn resolve_probe(file: Option<&types::ProbeConfig>) -> anyhow::Result<ResolvedProbe> {
     one_section(|bag| resolve_probe_into(file, bag))
-}
-
-/// Parse a trusted-IP list shared by the DHT and probe rate-limit resolvers.
-/// `field_key` is the config path of the offending list (e.g.
-/// `dht.rate_limit.trusted_ips` or `probe.rate_limit.trusted_ips`) so a
-/// malformed entry reports the right key under the bag pattern.
-fn parse_trusted_ips(
-    raw: Option<&[String]>,
-    field_key: &'static str,
-    bag: &mut ConfigErrorBag,
-) -> std::collections::HashSet<std::net::IpAddr> {
-    let mut out = std::collections::HashSet::new();
-    let Some(entries) = raw else {
-        return out;
-    };
-    for entry in entries {
-        match entry.parse::<std::net::IpAddr>() {
-            Ok(ip) => {
-                out.insert(ip);
-            }
-            Err(e) => {
-                bag.check_with(false, field_key, || {
-                    format!("{field_key} entry {entry:?} is not a valid IP address: {e}")
-                });
-            }
-        }
-    }
-    out
 }
 
 /// Load a [`FileConfig`] from disk.
@@ -3760,7 +3740,6 @@ mod tests {
                 ]),
                 relay_url: None,
                 discovery: None,
-                enable_0rtt: None,
             }),
             ..Default::default()
         };
@@ -3802,7 +3781,6 @@ mod tests {
                     dns_origin: Some("${HOME}/dns".to_string()),
                     peers: Some(peers),
                 }),
-                enable_0rtt: None,
             }),
             ..Default::default()
         };
@@ -3862,7 +3840,6 @@ mod tests {
                     dns_origin: None,
                     peers: Some(peers),
                 }),
-                enable_0rtt: None,
             }),
             ..Default::default()
         };
@@ -4091,7 +4068,6 @@ mod tests {
                     relay_urls: None,
                     relay_url: Some(v.to_string()),
                     discovery: None,
-                    enable_0rtt: None,
                 });
             }),
             ("network.relay_urls", |c, v| {
@@ -4100,7 +4076,6 @@ mod tests {
                     relay_urls: Some(vec![v.to_string()]),
                     relay_url: None,
                     discovery: None,
-                    enable_0rtt: None,
                 });
             }),
             ("blockchain.rpc_url", |c, v| {
@@ -4826,7 +4801,6 @@ swap_pool_address = \"0xPool\"
         let cli = crate::cli::run::PaymentArgs {
             rate_per_mb: Some(0),
             delivery_floor: None,
-            delivery_ceiling: None,
         };
         let err = resolve_payment(&cli, None)
             .err()
@@ -4839,75 +4813,77 @@ swap_pool_address = \"0xPool\"
         Ok(())
     }
 
+    /// A retired env var must warn rather than be silently ignored — and must
+    /// NOT fail the resolve, since it is often inherited from an orchestrator
+    /// the operator does not control. Asserts the table is wired and that a
+    /// set-but-retired var leaves resolution intact.
     #[test]
-    fn resolve_payment_rejects_zero_delivery_ceiling() -> anyhow::Result<()> {
-        // ceiling=0 would clamp every quoted rate to 0, signing a free
-        // selection-winning rate and bypassing the rate_per_mb > 0 guard.
+    fn retired_env_vars_are_listed_and_do_not_break_resolution() {
+        assert!(
+            RETIRED_ENV_VARS
+                .iter()
+                .any(|(n, _)| *n == "DECDN_DELIVERY_CEILING"),
+            "the knob removed in #1441 must be listed so a stale env var warns"
+        );
+        for (name, why) in RETIRED_ENV_VARS {
+            assert!(name.starts_with("DECDN_"), "{name} is not a decdn env var");
+            assert!(
+                !why.is_empty(),
+                "{name} needs a reason operators can act on"
+            );
+        }
+    }
+
+    /// The regression this guard exists for: the first implementation used
+    /// `tracing::warn!`, which `resolve_config` reaches *before* `init_tracing`
+    /// installs a subscriber — so it compiled, passed CI, and emitted nothing.
+    /// Asserting the returned names is what makes "it actually fired" testable
+    /// without a subscriber; the stderr text is a side effect of the same call.
+    ///
+    #[test]
+    fn retired_env_var_that_is_set_is_actually_reported() {
+        let warned = warn_retired_env_vars_with(|n| n == "DECDN_DELIVERY_CEILING");
+        assert_eq!(
+            warned,
+            vec!["DECDN_DELIVERY_CEILING"],
+            "a set retired var must be reported"
+        );
+        assert!(
+            warn_retired_env_vars_with(|_| false).is_empty(),
+            "nothing set => nothing reported"
+        );
+    }
+
+    #[test]
+    fn resolve_payment_rejects_floor_above_protocol_max() -> anyhow::Result<()> {
+        // The clamp only raises, so a floor above the wire cap makes the node
+        // sign a `ProbeResponse` honest clients reject outright (#378).
         let cli = crate::cli::run::PaymentArgs {
             rate_per_mb: Some(10),
-            delivery_floor: Some(0),
-            delivery_ceiling: Some(0),
+            delivery_floor: Some(decdn_protocol::MAX_RATE_PER_MB + 1),
         };
         let err = resolve_payment(&cli, None)
             .err()
-            .ok_or_else(|| anyhow::anyhow!("expected rejection for delivery_ceiling=0"))?
+            .ok_or_else(|| anyhow::anyhow!("expected rejection for floor>MAX"))?
             .to_string();
         anyhow::ensure!(
-            err.contains("delivery_ceiling") && err.contains(">= 1"),
+            err.contains("delivery_floor") && err.contains("MAX_RATE_PER_MB"),
             "error lacked context: {err}"
         );
         Ok(())
     }
 
     #[test]
-    fn resolve_payment_rejects_floor_above_ceiling() -> anyhow::Result<()> {
-        let cli = crate::cli::run::PaymentArgs {
-            rate_per_mb: Some(10),
-            delivery_floor: Some(100),
-            delivery_ceiling: Some(50),
-        };
-        let err = resolve_payment(&cli, None)
-            .err()
-            .ok_or_else(|| anyhow::anyhow!("expected rejection for floor>ceiling"))?
-            .to_string();
-        anyhow::ensure!(
-            err.contains("delivery_floor") && err.contains("delivery_ceiling"),
-            "error lacked context: {err}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn resolve_payment_rejects_ceiling_above_protocol_max() -> anyhow::Result<()> {
-        let cli = crate::cli::run::PaymentArgs {
-            rate_per_mb: Some(10),
-            delivery_floor: None,
-            delivery_ceiling: Some(decdn_protocol::MAX_RATE_PER_MB + 1),
-        };
-        let err = resolve_payment(&cli, None)
-            .err()
-            .ok_or_else(|| anyhow::anyhow!("expected rejection for ceiling>MAX"))?
-            .to_string();
-        anyhow::ensure!(
-            err.contains("delivery_ceiling") && err.contains("MAX_RATE_PER_MB"),
-            "error lacked context: {err}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn resolve_payment_accepts_and_threads_explicit_bounds() -> anyhow::Result<()> {
+    fn resolve_payment_accepts_and_threads_explicit_floor() -> anyhow::Result<()> {
         let cli = crate::cli::run::PaymentArgs {
             rate_per_mb: Some(10),
             delivery_floor: Some(5),
-            delivery_ceiling: Some(100),
         };
         let resolved = resolve_payment(&cli, None)?;
         anyhow::ensure!(
-            resolved.delivery_floor == 5 && resolved.delivery_ceiling == 100,
-            "bounds not threaded: floor={} ceiling={}",
-            resolved.delivery_floor,
-            resolved.delivery_ceiling
+            resolved.delivery_floor == 5,
+            "floor not threaded: {}",
+            resolved.delivery_floor
         );
         Ok(())
     }
@@ -4944,12 +4920,10 @@ swap_pool_address = \"0xPool\"
         let cli = crate::cli::run::PaymentArgs {
             rate_per_mb: None,
             delivery_floor: None,
-            delivery_ceiling: None,
         };
         let file = types::PaymentConfig {
             rate_per_mb: Some(0),
             delivery_floor: None,
-            delivery_ceiling: None,
             voucher_interval_mb: None,
         };
         let err = resolve_payment(&cli, Some(&file))
@@ -4992,12 +4966,10 @@ swap_pool_address = \"0xPool\"
         let cli = crate::cli::run::PaymentArgs {
             rate_per_mb: Some(42),
             delivery_floor: None,
-            delivery_ceiling: None,
         };
         let file = types::PaymentConfig {
             rate_per_mb: Some(0),
             delivery_floor: None,
-            delivery_ceiling: None,
             voucher_interval_mb: None,
         };
         let resolved = resolve_payment(&cli, Some(&file))?;
@@ -5010,7 +4982,6 @@ swap_pool_address = \"0xPool\"
         let cli = crate::cli::run::PaymentArgs {
             rate_per_mb: None,
             delivery_floor: None,
-            delivery_ceiling: None,
         };
         let resolved = resolve_payment(&cli, None)?;
         anyhow::ensure!(
@@ -5031,7 +5002,6 @@ swap_pool_address = \"0xPool\"
         let file = types::PaymentConfig {
             rate_per_mb: Some(10),
             delivery_floor: None,
-            delivery_ceiling: None,
             voucher_interval_mb: Some(64),
         };
         let resolved = resolve_payment(&empty_payment_args(), Some(&file))?;
@@ -5045,7 +5015,6 @@ swap_pool_address = \"0xPool\"
             let file = types::PaymentConfig {
                 rate_per_mb: Some(10),
                 delivery_floor: None,
-                delivery_ceiling: None,
                 voucher_interval_mb: Some(bad),
             };
             let err = resolve_payment(&empty_payment_args(), Some(&file))
@@ -5069,7 +5038,6 @@ swap_pool_address = \"0xPool\"
         let cli = crate::cli::run::PaymentArgs {
             rate_per_mb: Some(decdn_protocol::MAX_RATE_PER_MB + 1),
             delivery_floor: None,
-            delivery_ceiling: None,
         };
         let err = resolve_payment(&cli, None)
             .err()
@@ -5087,7 +5055,6 @@ swap_pool_address = \"0xPool\"
         let cli = crate::cli::run::PaymentArgs {
             rate_per_mb: Some(decdn_protocol::MAX_RATE_PER_MB),
             delivery_floor: None,
-            delivery_ceiling: None,
         };
         let resolved = resolve_payment(&cli, None)?;
         anyhow::ensure!(
@@ -6880,7 +6847,6 @@ swap_pool_address = \"0xPool\"
             bind_port: port,
             relay_urls: Vec::new(),
             discovery: ResolvedDiscovery::default(),
-            enable_0rtt: true,
         }
     }
 
@@ -7248,7 +7214,6 @@ swap_pool_address = \"0xPool\"
             ),
             ("rate_per_mb", "DECDN_RATE_PER_MB"),
             ("delivery_floor", "DECDN_DELIVERY_FLOOR"),
-            ("delivery_ceiling", "DECDN_DELIVERY_CEILING"),
             ("log_level", "DECDN_LOG_LEVEL"),
             ("log_format", "DECDN_LOG_FORMAT"),
             ("metrics_port", "DECDN_METRICS_PORT"),
@@ -7582,7 +7547,6 @@ swap_pool_address = \"0xPool\"
         crate::cli::run::PaymentArgs {
             rate_per_mb: None,
             delivery_floor: None,
-            delivery_ceiling: None,
         }
     }
 
@@ -7650,7 +7614,6 @@ swap_pool_address = \"0xPool\"
             relay_urls: None,
             relay_url: None,
             discovery: None,
-            enable_0rtt: None,
         };
         let resolved = resolve_network(&cli, Some(&file));
         assert_eq!(resolved.bind_port, 5555);
@@ -7665,7 +7628,6 @@ swap_pool_address = \"0xPool\"
             // Deprecated singular alias folds into the resolved list.
             relay_url: Some("https://relay.example".to_string()),
             discovery: None,
-            enable_0rtt: None,
         };
         let resolved = resolve_network(&cli, Some(&file));
         assert_eq!(resolved.bind_port, 6666);
@@ -7686,7 +7648,6 @@ swap_pool_address = \"0xPool\"
             ]),
             relay_url: None,
             discovery: None,
-            enable_0rtt: None,
         };
         let resolved = resolve_network(&cli, Some(&file));
         assert_eq!(
@@ -7707,7 +7668,6 @@ swap_pool_address = \"0xPool\"
             relay_urls: Some(vec!["https://list.example".to_string()]),
             relay_url: Some("https://alias.example".to_string()),
             discovery: None,
-            enable_0rtt: None,
         };
         let resolved = resolve_network(&cli, Some(&file));
         assert_eq!(
@@ -7730,7 +7690,6 @@ swap_pool_address = \"0xPool\"
             relay_urls: Some(vec!["https://list.example".to_string()]),
             relay_url: Some("https://alias.example".to_string()),
             discovery: None,
-            enable_0rtt: None,
         };
         let resolved = resolve_network(&cli, Some(&file));
         assert_eq!(resolved.relay_urls, vec!["https://cli.example".to_string()]);
@@ -7745,7 +7704,6 @@ swap_pool_address = \"0xPool\"
             relay_urls: Some(Vec::new()),
             relay_url: Some("https://alias.example".to_string()),
             discovery: None,
-            enable_0rtt: None,
         };
         let resolved = resolve_network(&cli, Some(&file));
         assert_eq!(
@@ -7754,30 +7712,24 @@ swap_pool_address = \"0xPool\"
         );
     }
 
+    /// `[network]` carries no 0-RTT knob, and the section denies unknown
+    /// fields, so a config still setting one fails to load rather than
+    /// being silently ignored — the operator has to delete the line.
     #[test]
-    fn resolve_network_enable_0rtt_defaults_true_and_file_overrides() {
-        let cli = empty_network_args();
-
-        // Absent in file => built-in default (0-RTT on).
-        let none = types::NetworkConfig {
-            bind_port: None,
-            relay_urls: None,
-            relay_url: None,
-            discovery: None,
-            enable_0rtt: None,
-        };
-        assert!(resolve_network(&cli, Some(&none)).enable_0rtt);
-        assert!(resolve_network(&cli, None).enable_0rtt);
-
-        // Explicit `false` in file is the operational kill switch.
-        let off = types::NetworkConfig {
-            bind_port: None,
-            relay_urls: None,
-            relay_url: None,
-            discovery: None,
-            enable_0rtt: Some(false),
-        };
-        assert!(!resolve_network(&cli, Some(&off)).enable_0rtt);
+    fn network_rejects_removed_0rtt_key() -> anyhow::Result<()> {
+        let toml = "
+            bind_port = 4433
+            enable_0rtt = true
+        ";
+        let err = toml::from_str::<types::NetworkConfig>(toml)
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("expected unknown-field error"))?;
+        let msg = format!("{err}");
+        anyhow::ensure!(
+            msg.contains("unknown field") && msg.contains("enable_0rtt"),
+            "got: {msg}"
+        );
+        Ok(())
     }
 
     #[test]
@@ -7805,7 +7757,6 @@ swap_pool_address = \"0xPool\"
             ]),
             relay_url: None,
             discovery: None,
-            enable_0rtt: None,
         };
         let mut bag = ConfigErrorBag::new();
         let resolved = resolve_network_into(&cli, Some(&file), &mut bag);
@@ -7824,7 +7775,6 @@ swap_pool_address = \"0xPool\"
             relay_urls: Some(vec!["not a url".to_string()]),
             relay_url: None,
             discovery: None,
-            enable_0rtt: None,
         };
         let mut bag = ConfigErrorBag::new();
         let _ = resolve_network_into(&cli, Some(&file), &mut bag);
@@ -7849,7 +7799,6 @@ swap_pool_address = \"0xPool\"
             ]),
             relay_url: None,
             discovery: None,
-            enable_0rtt: None,
         };
         let mut bag = ConfigErrorBag::new();
         let _ = resolve_network_into(&cli, Some(&file), &mut bag);
@@ -7872,7 +7821,6 @@ swap_pool_address = \"0xPool\"
             relay_urls: Some(vec!["https://user:s3cret@host:notaport".to_string()]),
             relay_url: None,
             discovery: None,
-            enable_0rtt: None,
         };
         let mut bag = ConfigErrorBag::new();
         let _ = resolve_network_into(&cli, Some(&file), &mut bag);
@@ -7899,7 +7847,6 @@ swap_pool_address = \"0xPool\"
             relay_urls: None,
             relay_url: Some("not a url".to_string()),
             discovery: None,
-            enable_0rtt: None,
         };
         let mut bag = ConfigErrorBag::new();
         let _ = resolve_network_into(&cli, Some(&file), &mut bag);
@@ -7942,7 +7889,6 @@ swap_pool_address = \"0xPool\"
             relay_urls: None,
             relay_url: None,
             discovery: Some(discovery),
-            enable_0rtt: None,
         }
     }
 
@@ -9384,12 +9330,10 @@ swap_pool_address = \"0xPool\"
         let cli = crate::cli::run::PaymentArgs {
             rate_per_mb: Some(99),
             delivery_floor: None,
-            delivery_ceiling: None,
         };
         let file = types::PaymentConfig {
             rate_per_mb: Some(1),
             delivery_floor: None,
-            delivery_ceiling: None,
             voucher_interval_mb: None,
         };
         let resolved = resolve_payment(&cli, Some(&file))?;
@@ -9403,7 +9347,6 @@ swap_pool_address = \"0xPool\"
         let file = types::PaymentConfig {
             rate_per_mb: Some(50),
             delivery_floor: None,
-            delivery_ceiling: None,
             voucher_interval_mb: None,
         };
         let resolved = resolve_payment(&cli, Some(&file))?;
@@ -10344,6 +10287,71 @@ bind_port = 12345
     }
 
     #[test]
+    fn resolve_dht_absent_yields_adr022_defaults() {
+        // No `[dht.rate_limit]` section at all => every ADR 022 default.
+        // Counterpart to `resolve_probe_absent_yields_adr005_defaults`: the six
+        // rate/burst rows of `resolve_dht_into` are otherwise unpinned, so a
+        // wrong `DEFAULT_DHT_*` on the right-hand side of any `unwrap_or` ships
+        // silently. Rates and bursts are spelled as literals on purpose —
+        // asserting against the same constant the resolver reads would pin
+        // nothing. `max_tracked_*` has no ADR literal (it is a #645
+        // implementation cap), so those two go through the constants.
+        let resolved = resolve_dht(None).expect("absent section is valid");
+        assert!((resolved.per_peer_rate_per_sec - 20.0).abs() < f64::EPSILON);
+        assert_eq!(resolved.per_peer_burst, 40);
+        assert!((resolved.per_ip_rate_per_sec - 100.0).abs() < f64::EPSILON);
+        assert_eq!(resolved.per_ip_burst, 200);
+        assert!((resolved.global_rate_per_sec - 1000.0).abs() < f64::EPSILON);
+        assert_eq!(resolved.global_burst, 2000);
+        assert_eq!(resolved.max_tracked_per_ip, DEFAULT_DHT_MAX_TRACKED_PER_IP);
+        assert_eq!(
+            resolved.max_tracked_per_peer,
+            DEFAULT_DHT_MAX_TRACKED_PER_PEER
+        );
+    }
+
+    /// `ResolvedDht::default()` must agree with what the resolver produces for
+    /// an absent section.
+    ///
+    /// The two are independent copies of the same eight values —
+    /// `DEFAULT_DHT_*` is what production resolves through, while
+    /// `ResolvedDht::default()` is what hand-built `ResolvedConfig` fixtures
+    /// across `node`, `cli`, and the e2e suite use. Nothing in the type system
+    /// ties them together, so drift would leave every one of those fixtures
+    /// exercising a configuration the resolver never emits.
+    #[test]
+    fn resolved_dht_default_matches_resolver() {
+        let resolved = resolve_dht(None).expect("absent section is valid");
+        let hand = ResolvedDht::default();
+        assert!((resolved.per_peer_rate_per_sec - hand.per_peer_rate_per_sec).abs() < f64::EPSILON);
+        assert_eq!(resolved.per_peer_burst, hand.per_peer_burst);
+        assert!((resolved.per_ip_rate_per_sec - hand.per_ip_rate_per_sec).abs() < f64::EPSILON);
+        assert_eq!(resolved.per_ip_burst, hand.per_ip_burst);
+        assert!((resolved.global_rate_per_sec - hand.global_rate_per_sec).abs() < f64::EPSILON);
+        assert_eq!(resolved.global_burst, hand.global_burst);
+        assert_eq!(resolved.max_tracked_per_ip, hand.max_tracked_per_ip);
+        assert_eq!(resolved.max_tracked_per_peer, hand.max_tracked_per_peer);
+    }
+
+    /// Probe counterpart of `resolved_dht_default_matches_resolver`.
+    /// `resolve_probe_absent_yields_adr005_defaults` pins `DEFAULT_PROBE_*`
+    /// against the ADR but says nothing about `ResolvedProbe::default()`, which
+    /// is the copy the fixtures use.
+    #[test]
+    fn resolved_probe_default_matches_resolver() {
+        let resolved = resolve_probe(None).expect("absent section is valid");
+        let hand = ResolvedProbe::default();
+        assert!((resolved.per_peer_rate_per_sec - hand.per_peer_rate_per_sec).abs() < f64::EPSILON);
+        assert_eq!(resolved.per_peer_burst, hand.per_peer_burst);
+        assert!((resolved.per_ip_rate_per_sec - hand.per_ip_rate_per_sec).abs() < f64::EPSILON);
+        assert_eq!(resolved.per_ip_burst, hand.per_ip_burst);
+        assert!((resolved.global_rate_per_sec - hand.global_rate_per_sec).abs() < f64::EPSILON);
+        assert_eq!(resolved.global_burst, hand.global_burst);
+        assert_eq!(resolved.max_tracked_per_ip, hand.max_tracked_per_ip);
+        assert_eq!(resolved.max_tracked_per_peer, hand.max_tracked_per_peer);
+    }
+
+    #[test]
     fn resolve_dht_max_tracked_per_ip_file_override() {
         let d = dht_rl_with(|r| r.max_tracked_per_ip = Some(8192));
         let resolved = resolve_dht(Some(&d)).expect("valid override");
@@ -10419,7 +10427,6 @@ bind_port = 12345
             resolved.max_tracked_per_peer,
             DEFAULT_PROBE_MAX_TRACKED_PER_PEER
         );
-        assert!(resolved.trusted_ips.is_empty());
     }
 
     #[test]
@@ -10454,13 +10461,6 @@ bind_port = 12345
         });
         let err = resolve_probe(Some(&p)).expect_err("rate>0+burst=0 must reject");
         assert!(format!("{err:#}").contains("probe.rate_limit.per_peer_burst"));
-    }
-
-    #[test]
-    fn resolve_probe_malformed_trusted_ip_reports_probe_key() {
-        let p = probe_rl_with(|r| r.trusted_ips = Some(vec!["not-an-ip".to_string()]));
-        let err = resolve_probe(Some(&p)).expect_err("malformed IP must reject");
-        assert!(format!("{err:#}").contains("probe.rate_limit.trusted_ips"));
     }
 
     #[test]

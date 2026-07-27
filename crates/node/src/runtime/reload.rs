@@ -219,15 +219,15 @@ struct PaymentSection {
     /// Last applied rate, retained across reloads for the per-section
     /// `prev_rate_per_mb` field on the success line.
     buf: std::sync::Mutex<Option<ResolvedPayment>>,
-    /// `(delivery_floor, delivery_ceiling)` as seeded into the live handlers
-    /// at startup. Only `rate_per_mb` is hot-reloadable. Since #1172 the live
-    /// delivery bounds are sourced from on-chain `getRateBounds()` and tracked
-    /// by the `RateBoundsUpdated` watcher, so the config
-    /// `delivery_floor`/`delivery_ceiling` are only a pre-chain seed — a reload
-    /// that changes them is accepted by `resolve_payment` but has no effect on
-    /// the live clamp (the chain value is authoritative). Retained here so the
-    /// swap can warn instead of silently ignoring the change.
-    applied_bounds: (u64, u64),
+    /// `delivery_floor` as seeded into the live handlers at startup. Only
+    /// `rate_per_mb` is hot-reloadable. Since #1172 the live delivery floor is
+    /// sourced from on-chain `getRateBounds()` and tracked by the
+    /// `RateBoundsUpdated` watcher, so the config `delivery_floor` is only a
+    /// pre-chain seed — a reload that changes it is accepted by
+    /// `resolve_payment` but has no effect on the live clamp (the chain value
+    /// is authoritative). Retained here so the swap can warn instead of
+    /// silently ignoring the change.
+    applied_floor: u64,
 }
 
 impl ReloadableSection for PaymentSection {
@@ -252,22 +252,20 @@ impl ReloadableSection for PaymentSection {
         let prev = self
             .rate_per_mb
             .swap(resolved.rate_per_mb, Ordering::Relaxed);
-        // Since #1172 the live delivery bounds come from on-chain
+        // Since #1172 the live delivery floor comes from on-chain
         // `getRateBounds()` (seeded at startup, kept current by the
-        // `RateBoundsUpdated` watcher); the config values are only the
-        // pre-chain seed. A reload that changes them has no effect on the live
-        // clamp — governance owns it on-chain. Surface that rather than
-        // silently ignoring the change.
-        if (resolved.delivery_floor, resolved.delivery_ceiling) != self.applied_bounds {
+        // `RateBoundsUpdated` watcher); the config value is only the pre-chain
+        // seed. A reload that changes it has no effect on the live clamp —
+        // governance owns it on-chain. Surface that rather than silently
+        // ignoring the change.
+        if resolved.delivery_floor != self.applied_floor {
             tracing::warn!(
                 section = self.name(),
-                applied_delivery_floor = self.applied_bounds.0,
-                applied_delivery_ceiling = self.applied_bounds.1,
+                applied_delivery_floor = self.applied_floor,
                 new_delivery_floor = resolved.delivery_floor,
-                new_delivery_ceiling = resolved.delivery_ceiling,
-                "payment.delivery_floor/delivery_ceiling change ignored; live \
-                 delivery bounds are governed on-chain via getRateBounds() \
-                 (#1172), not this config seed"
+                "payment.delivery_floor change ignored; the live delivery floor \
+                 is governed on-chain via getRateBounds() (#1172), not this \
+                 config seed"
             );
         }
         tracing::info!(
@@ -671,10 +669,7 @@ impl RuntimeReloadState {
             cli: payment_cli,
             rate_per_mb: Arc::new(AtomicU64::new(initial.payment.rate_per_mb)),
             buf: std::sync::Mutex::new(None),
-            applied_bounds: (
-                initial.payment.delivery_floor,
-                initial.payment.delivery_ceiling,
-            ),
+            applied_floor: initial.payment.delivery_floor,
         });
         let log_level = Arc::new(LogLevelSection {
             cli: observability_cli,
@@ -805,7 +800,6 @@ impl RuntimeReloadState {
                 bind_port: 4433,
                 relay_urls: Vec::new(),
                 discovery: decdn_common::config::ResolvedDiscovery::default(),
-                enable_0rtt: true,
             },
             blockchain: ResolvedBlockchain {
                 origin_assignment_address: None,
@@ -867,7 +861,6 @@ impl RuntimeReloadState {
             payment: ResolvedPayment {
                 rate_per_mb,
                 delivery_floor: 0,
-                delivery_ceiling: decdn_protocol::MAX_RATE_PER_MB,
                 voucher_interval_mb: decdn_protocol::DEFAULT_VOUCHER_INTERVAL_MB,
             },
             observability: ResolvedObservability {
@@ -901,7 +894,6 @@ impl RuntimeReloadState {
             decdn_common::cli::run::PaymentArgs {
                 rate_per_mb: None,
                 delivery_floor: None,
-                delivery_ceiling: None,
             },
             decdn_common::cli::run::ObservabilityArgs {
                 log_level: None,
@@ -1103,7 +1095,7 @@ fn warn_restart_required_sections(file: &decdn_common::config::FileConfig) {
         warn_ignored("identity.* (data_dir, region)");
     }
     if file.network.is_some() {
-        warn_ignored("network.* (bind_port, relay_urls, relay_url, discovery, enable_0rtt)");
+        warn_ignored("network.* (bind_port, relay_urls, relay_url, discovery)");
     }
     if file.blockchain.is_some() {
         warn_ignored("blockchain.* (rpc_url, eth_keystore, contract addresses)");
@@ -1113,7 +1105,7 @@ fn warn_restart_required_sections(file: &decdn_common::config::FileConfig) {
         .as_ref()
         .is_some_and(cache_has_restart_required_field)
     {
-        warn_ignored("cache.* (cache_dir, sizes, origin, decompress)");
+        warn_ignored("cache.* (cache_dir, sizes, origin, decompress, max_probe_holds)");
     }
     if file
         .payment
@@ -1121,10 +1113,10 @@ fn warn_restart_required_sections(file: &decdn_common::config::FileConfig) {
         .is_some_and(payment_has_restart_required_field)
     {
         // Only `voucher_interval_mb` lands here: `rate_per_mb` reloads, and
-        // `delivery_floor`/`delivery_ceiling` get a *change-based* notice
-        // from `PaymentSection::infallible_swap` (which holds the applied
-        // bounds to diff against). `voucher_interval_mb` has no such applied
-        // value to diff, so the presence-based notice is its only home.
+        // `delivery_floor` gets a *change-based* notice from
+        // `PaymentSection::infallible_swap` (which holds the applied floor to
+        // diff against). `voucher_interval_mb` has no such applied value to
+        // diff, so the presence-based notice is its only home.
         warn_ignored("payment.* (voucher_interval_mb)");
     }
     if file.gossip.is_some() {
@@ -1141,12 +1133,12 @@ fn warn_restart_required_sections(file: &decdn_common::config::FileConfig) {
         );
     }
     if file.dht.is_some() {
-        // `dht.*` (rate-limit caps, trusted IPs) is not currently
-        // hot-reloadable — the limiter is constructed once at startup.
+        // `dht.*` (rate-limit caps) is not currently hot-reloadable — the
+        // limiter is constructed once at startup.
         // Reloadability would follow the dispatch-limiter pattern
         // (`security.*`) once the limiter grows an ArcSwap on its inner
         // state.
-        warn_ignored("dht.* (rate-limit, trusted_ips)");
+        warn_ignored("dht.* (rate-limit)");
     }
     if file.probe.is_some() {
         // `probe.rate_limit` is read once at startup; changing it requires
@@ -1248,8 +1240,8 @@ const fn observability_has_restart_required_field(
 }
 
 /// Whether the file's `[payment]` section sets a field whose restart notice
-/// belongs here. `rate_per_mb` reloads and `delivery_floor`/
-/// `delivery_ceiling` are warned change-based in
+/// belongs here. `rate_per_mb` reloads and `delivery_floor` is warned
+/// change-based in
 /// [`PaymentSection::infallible_swap`], so only `voucher_interval_mb` — read
 /// once into the client handler at bring-up, with no applied value to diff —
 /// trips this gate. Exhaustively destructured for the same
@@ -1258,9 +1250,8 @@ const fn payment_has_restart_required_field(
     p: &decdn_common::config::types::PaymentConfig,
 ) -> bool {
     let decdn_common::config::types::PaymentConfig {
-        rate_per_mb: _,      // hot-reloadable
-        delivery_floor: _,   // warned change-based in PaymentSection::infallible_swap
-        delivery_ceiling: _, // warned change-based in PaymentSection::infallible_swap
+        rate_per_mb: _,    // hot-reloadable
+        delivery_floor: _, // warned change-based in PaymentSection::infallible_swap
         voucher_interval_mb,
     } = p;
     voucher_interval_mb.is_some()
@@ -1304,7 +1295,6 @@ mod tests {
                 bind_port: 4433,
                 relay_urls: Vec::new(),
                 discovery: decdn_common::config::ResolvedDiscovery::default(),
-                enable_0rtt: true,
             },
             blockchain: ResolvedBlockchain {
                 origin_assignment_address: None,
@@ -1366,7 +1356,6 @@ mod tests {
             payment: ResolvedPayment {
                 rate_per_mb: rate,
                 delivery_floor: 0,
-                delivery_ceiling: decdn_protocol::MAX_RATE_PER_MB,
                 voucher_interval_mb: decdn_protocol::DEFAULT_VOUCHER_INTERVAL_MB,
             },
             observability: ResolvedObservability {
@@ -1418,7 +1407,6 @@ mod tests {
             PaymentArgs {
                 rate_per_mb: None,
                 delivery_floor: None,
-                delivery_ceiling: None,
             },
             ObservabilityArgs {
                 log_level: None,
@@ -1457,7 +1445,6 @@ mod tests {
             PaymentArgs {
                 rate_per_mb: None,
                 delivery_floor: None,
-                delivery_ceiling: None,
             },
             ObservabilityArgs {
                 log_level: None,
@@ -1505,7 +1492,6 @@ mod tests {
             PaymentArgs {
                 rate_per_mb: None,
                 delivery_floor: None,
-                delivery_ceiling: None,
             },
             ObservabilityArgs {
                 log_level: None,
@@ -1547,7 +1533,6 @@ mod tests {
             PaymentArgs {
                 rate_per_mb: None,
                 delivery_floor: None,
-                delivery_ceiling: None,
             },
             ObservabilityArgs {
                 log_level: None,
@@ -1583,7 +1568,6 @@ mod tests {
             PaymentArgs {
                 rate_per_mb: None,
                 delivery_floor: None,
-                delivery_ceiling: None,
             },
             ObservabilityArgs {
                 log_level: None,
@@ -1634,7 +1618,6 @@ mod tests {
             PaymentArgs {
                 rate_per_mb: None,
                 delivery_floor: None,
-                delivery_ceiling: None,
             },
             ObservabilityArgs {
                 log_level: None,
@@ -1688,7 +1671,6 @@ mod tests {
             PaymentArgs {
                 rate_per_mb: None,
                 delivery_floor: None,
-                delivery_ceiling: None,
             },
             ObservabilityArgs {
                 log_level: None,
@@ -1723,7 +1705,6 @@ mod tests {
             PaymentArgs {
                 rate_per_mb: None,
                 delivery_floor: None,
-                delivery_ceiling: None,
             },
             ObservabilityArgs {
                 log_level: None,
@@ -1754,7 +1735,6 @@ mod tests {
             PaymentArgs {
                 rate_per_mb: None,
                 delivery_floor: None,
-                delivery_ceiling: None,
             },
             ObservabilityArgs {
                 log_level: None,
@@ -1785,7 +1765,6 @@ mod tests {
             PaymentArgs {
                 rate_per_mb: Some(50),
                 delivery_floor: None,
-                delivery_ceiling: None,
             },
             ObservabilityArgs {
                 log_level: None,
@@ -1822,7 +1801,6 @@ mod tests {
             PaymentArgs {
                 rate_per_mb: None,
                 delivery_floor: None,
-                delivery_ceiling: None,
             },
             ObservabilityArgs {
                 log_level: None,
@@ -1852,7 +1830,6 @@ mod tests {
             PaymentArgs {
                 rate_per_mb: None,
                 delivery_floor: None,
-                delivery_ceiling: None,
             },
             ObservabilityArgs {
                 log_level: None,
@@ -2021,7 +1998,6 @@ mod tests {
             PaymentArgs {
                 rate_per_mb: None,
                 delivery_floor: None,
-                delivery_ceiling: None,
             },
             ObservabilityArgs {
                 log_level: None,
@@ -2063,7 +2039,6 @@ mod tests {
             PaymentArgs {
                 rate_per_mb: None,
                 delivery_floor: None,
-                delivery_ceiling: None,
             },
             ObservabilityArgs {
                 log_level: None,
@@ -2112,7 +2087,6 @@ mod tests {
             PaymentArgs {
                 rate_per_mb: None,
                 delivery_floor: None,
-                delivery_ceiling: None,
             },
             ObservabilityArgs {
                 log_level: None,
@@ -2150,7 +2124,6 @@ mod tests {
             PaymentArgs {
                 rate_per_mb: None,
                 delivery_floor: None,
-                delivery_ceiling: None,
             },
             ObservabilityArgs {
                 log_level: None,
@@ -2195,7 +2168,6 @@ mod tests {
             PaymentArgs {
                 rate_per_mb: None,
                 delivery_floor: None,
-                delivery_ceiling: None,
             },
             ObservabilityArgs {
                 log_level: None,
@@ -2274,7 +2246,6 @@ mod tests {
             PaymentArgs {
                 rate_per_mb: None,
                 delivery_floor: None,
-                delivery_ceiling: None,
             },
             ObservabilityArgs {
                 log_level: None,
@@ -2319,7 +2290,6 @@ mod tests {
             PaymentArgs {
                 rate_per_mb: None,
                 delivery_floor: None,
-                delivery_ceiling: None,
             },
             ObservabilityArgs {
                 log_level: None,
@@ -2358,7 +2328,6 @@ mod tests {
             PaymentArgs {
                 rate_per_mb: None,
                 delivery_floor: None,
-                delivery_ceiling: None,
             },
             ObservabilityArgs {
                 log_level: None,
@@ -2407,7 +2376,6 @@ mod tests {
             PaymentArgs {
                 rate_per_mb: None,
                 delivery_floor: None,
-                delivery_ceiling: None,
             },
             ObservabilityArgs {
                 log_level: None,
@@ -2459,7 +2427,7 @@ mod tests {
             dir.path(),
             "[payment]\n\
              rate_per_mb = 0\n\
-             delivery_ceiling = 0\n",
+             voucher_interval_mb = 0\n",
         );
 
         let initial = seed_resolved(42, LogLevel::Info);
@@ -2468,7 +2436,6 @@ mod tests {
             PaymentArgs {
                 rate_per_mb: None,
                 delivery_floor: None,
-                delivery_ceiling: None,
             },
             ObservabilityArgs {
                 log_level: None,
@@ -2493,8 +2460,8 @@ mod tests {
             "missing rate_per_mb: {msg}"
         );
         assert!(
-            msg.contains("payment.delivery_ceiling"),
-            "missing delivery_ceiling: {msg}"
+            msg.contains("payment.voucher_interval_mb"),
+            "missing voucher_interval_mb: {msg}"
         );
         assert_eq!(state.rate_per_mb().load(Ordering::Relaxed), 42);
     }
@@ -2518,7 +2485,6 @@ mod tests {
             PaymentArgs {
                 rate_per_mb: None,
                 delivery_floor: None,
-                delivery_ceiling: None,
             },
             ObservabilityArgs {
                 log_level: None,
@@ -2563,7 +2529,6 @@ mod tests {
             PaymentArgs {
                 rate_per_mb: None,
                 delivery_floor: None,
-                delivery_ceiling: None,
             },
             ObservabilityArgs {
                 log_level: None,
@@ -2617,7 +2582,6 @@ mod tests {
             PaymentArgs {
                 rate_per_mb: None,
                 delivery_floor: None,
-                delivery_ceiling: None,
             },
             ObservabilityArgs {
                 log_level: None,
@@ -2697,7 +2661,6 @@ mod tests {
         // Delivery bounds are warned change-based elsewhere -> not here.
         let bounds_only = PaymentConfig {
             delivery_floor: Some(1),
-            delivery_ceiling: Some(2),
             ..PaymentConfig::default()
         };
         assert!(!payment_has_restart_required_field(&bounds_only));

@@ -23,6 +23,137 @@ since project inception and will roll into the first tagged release.
 
 ### Changed (BREAKING)
 
+- **Blacklist-entry appeals removed (#1432).** `ContentBlacklist` no longer
+  carries a second appeal state machine on top of enforcement. The six appeal
+  entry points (`openBlacklistAppeal`, `fastTrackBlacklistAppeal`,
+  `rejectBlacklistAppeal`, `rejectAppealAsPerjury`,
+  `ratifyBlacklistAppealRemoval`, `reverseBlacklistAppeal`,
+  `cleanupExpiredBlacklistAppeal`), the `StandingPath` enum, the per-filer
+  rejection cooldown and perjury denylist, the interim-relief caps, and the
+  `setAppealBond` / `setRejectionCooldownWindow` governance knobs are gone.
+  Enforcement is untouched: adding hashes/origins/operators (global, regional,
+  emergency), the compliance window, emergency auto-expiry, regional-body
+  registration and suspension, and slashing for serving blacklisted content all
+  behave exactly as before. A wrongful entry comes off via `removeHashRegional`
+  (the issuing body) or a DecdnGovernor `removeHashGlobal` proposal; restitution
+  for a slash already taken remains `SlashAppeal` (ADR 028), now the protocol's
+  only appeal surface.
+  - **ABI:** the `ContentBlacklist` constructor drops `publisherRegistry_` and
+    `appealBond_`. `getHashEntry` and `IContentBlacklistHashView` lose the
+    `suspended` tuple slot — a node built against the old ABI mis-decodes the
+    entry and must be upgraded in lockstep with the deployment.
+    `HashSuspensionUpdated` and the seven `BlacklistAppeal*` events are removed,
+    as is the `IPublisherRegistryStanding` interface. `PublisherRegistry` itself
+    is unchanged; `OriginAssignment` reaches it through
+    `IPublisherRegistryOwnership`.
+  - **Deploy:** `BLACKLIST_APPEAL_BOND` is no longer read, and the
+    `ContentBlacklist` constructor no longer takes a token: with the appeal-bond
+    escrow gone it custodies no funds at all.
+  - **Size:** `ContentBlacklist` deployed bytecode drops 19,723 → 11,143 bytes.
+  - ADR 031 is archived to `adr/_history/`; ADR 011 § Blacklist Entry Appeals is
+    replaced by § Removing a Wrongful Entry. ADR 030's `REGION_STABILITY_WINDOW`
+    is retained — only its appeals-standing leg is cut, since the window also
+    forecloses a reactive blacklist-scope flip.
+- **Settlement-weighted bootstrap ranking removed (#1434).**
+  `FeeRouter.routeSettlement` no longer calls
+  `CapacityBond.recordSettlement(operator)` on every settlement and mid-channel
+  withdraw. Nothing consumed the resulting `SettlementRecorded` log: the
+  client's bootstrap ranker reads `getActiveNodes`, orders region-first, and
+  ranks by probe result, which is a strictly fresher signal than a historical
+  settlement record. An external indexer that wants settlement recency should
+  read `FeeRouter.Settled`, already emitted on the same path with the same
+  operator address.
+  - **ABI:** `CapacityBond.recordSettlement(address)`,
+    `SettlementRecorded(address)` and `SETTLEMENT_REPORTER_ROLE()` are removed;
+    `ICapacityBondReporter` is renamed `ICapacityBondEpoch` and narrowed to
+    `epochLength()`. No Rust binding referenced any of them, so nodes need no
+    change.
+  - **Deploy:** one fewer post-deploy `grantRole` and one fewer cross-contract
+    trust edge. `FeeRouter`'s `capacityBond_` constructor arg **stays** — it
+    backs the `bondEpoch == epochLength_` assertion that stops a mismatched
+    deployment mis-anchoring `DecdnGovernor` epoch arithmetic.
+  - **Size:** `CapacityBond` gains 231 bytes of EIP-170 margin (1,165 → 1,396 free).
+- **Advisory `deliveryCeiling` rate bound removed (#1441).** The enforced
+  `deliveryFloor` is unchanged and still gates settlement in
+  `_advanceClaimWatermark`. The ceiling enforced nothing — it appeared in no
+  `require`/`revert` on the settlement path — and asked a seller to self-clamp
+  its own advertised rate downward, which buys no on-chain safety. The absolute
+  upper bound remains the wire constant `MAX_RATE_PER_MB`, enforced in
+  `ProbeResponse` validation; it simply stops being governance-tunable.
+  - **Config-breaking:** `payment.delivery_ceiling` is removed, along with
+    `--delivery-ceiling` and `DECDN_DELIVERY_CEILING`. The TOML key and the CLI
+    flag both fail loudly (`deny_unknown_fields` / clap); a stale
+    `DECDN_DELIVERY_CEILING` in the environment cannot, so the node now logs a
+    startup warning naming it rather than ignoring it in silence. `[payment]` uses
+    `deny_unknown_fields`, so a TOML that still sets the key now fails startup
+    and `decdn config validate` rather than ignoring it. Delete the key; nothing
+    replaces it.
+  - **Governance bound tightened:** the floor is now capped at
+    `MAX_RATE_PER_MB` (10^12, the ADR 005 wire cap) rather than
+    `type(uint64).max`. Every value in the ~18-million-fold gap between them was
+    silently network-isolating — nodes raise every quote to the floor before
+    signing, so a floor above the wire cap makes every `ProbeResponse` and
+    `StreamResponse` undecodable to every honest peer and reverts essentially
+    every voucher at settlement, while the node's only local signal is a clamp
+    warning indistinguishable from a routine retune. The node now also refuses
+    to start against such a floor rather than serving into the void.
+  - **ABI:** `setRateBounds(uint256,uint256)` → `setRateBounds(uint256)`
+    (selector changes), `RateBoundsUpdated` drops `newDeliveryCeiling` (topic0
+    changes), `RateBoundsInvalid` drops its second parameter, `getRateBounds()`
+    returns a single `uint256`, and the `PaymentChannel` constructor drops
+    `deliveryCeiling_`. A node built against the old ABI mis-decodes the event
+    and must be upgraded in lockstep with the deployment.
+  - **API:** `decdn_node::rate_bounds::Bounds` is gone and `RateBounds` collapses
+    to a single atomic floor — `RateBounds::new` and `store` take one argument,
+    and `snapshot()` / `ceiling()` are removed. The `ArcSwap`-for-pair-consistency
+    machinery went with it: with one value there is no half-applied-retune state
+    to defend against.
+
+- **QUIC 0-RTT probe establishment removed (#1429).** `cdn/probe/v1`
+  connections always complete a full TLS 1.3 handshake before the request is
+  sent; no ALPN transmits application bytes as replayable early data. The
+  optimization saved one round trip, and only on a warm reconnection to an
+  already-probed peer, at the cost of a replay-safety surface no server-side
+  gate could enforce. TLS session resumption is retained — a client
+  reconnecting to a known node still skips certificate transmission and
+  signature verification, though the ECDHE key exchange still runs — and so is
+  stream multiplexing on open connections (ADR 005).
+  - **Resumption cache shrinks:** dropping the `max_tls_tickets` call with
+    `SESSION_TICKET_CACHE_SIZE` leaves the client-side `rustls` session cache
+    at iroh's default of 256 entries, down from 1000. That cache backs the
+    retained 1-RTT resumption, not just early data, so a node probing more
+    than 256 distinct peers between reconnections now re-handshakes in full
+    where it previously resumed. Re-tune with `Endpoint::max_tls_tickets` if
+    peer fan-out warrants it.
+  - **Config-breaking:** the `network.enable_0rtt` field is removed. Since
+    `[network]` uses `deny_unknown_fields`, a config that still sets it now
+    fails `decdn config validate` and node startup — delete the line. The
+    resulting behaviour equals the previously supported
+    `network.enable_0rtt = false`, so no other config change is needed.
+  - **Metrics removed:** `decdn_quic_0rtt_attempts_total`,
+    `decdn_quic_0rtt_accepted_total`, `decdn_quic_0rtt_rejected_total`,
+    `decdn_quic_session_ticket_cache_size`,
+    `decdn_quic_session_ticket_peers_dropped_total`. All were label-free, so
+    no dashboard query loses a dimension; panels referencing them go blank.
+    Separately, `decdn_probe_collection_latency_seconds` — specified in
+    `adr/appendix-observability.md` but never implemented — loses the
+    `outcome={0rtt_warm,1rtt_cold}` label it was planned to carry. No
+    deployed series is affected.
+  - **API:** `decdn_protocol::SESSION_TICKET_CACHE_SIZE` is gone, and both
+    `probe_once` requesters drop their 0-RTT switch and metrics-sink
+    parameters.
+- **Trusted-IP rate-limit exemption removed (#1440).** The `cdn/probe/v1`
+  and `cdn/dht/v1` three-layer limiters no longer support an allow-list that
+  bypasses the per-IP layer; every source IP is now bounded by that layer.
+  - **Config-breaking:** the `probe.rate_limit.trusted_ips` and
+    `dht.rate_limit.trusted_ips` fields are removed. Because both
+    `[probe.rate_limit]` and `[dht.rate_limit]` use `deny_unknown_fields`, a
+    config file that still sets either key now fails `decdn config validate`
+    and node startup — delete the key. If the exemption was providing needed
+    headroom, raise `per_ip_rate_per_sec` / `per_ip_burst` instead; that keeps
+    the layer's invariant that no source IP is ever unbounded. Note the
+    exemption never bypassed the per-peer or global layers, nor the always-on
+    `security.per_source_*` bucket in front of the probe path.
 - **`cdn/probe/v1` content-availability + slashing evidence (#318).**
   `cdn/probe/v1` is now a content-availability query, not just a
   latency/rate probe (ADR 005, ADR 014). Wire changes (same ALPN —
@@ -32,7 +163,8 @@ since project inception and will roll into the first tagged release.
   rate_per_mb, timestamp_us }, total_bytes: Option<u64>, slash_sig }`
   (was `{ nonce, measured_at_unix_ms, node_id, rate_per_mb }`).
   `slash_sig` is a mandatory, non-empty EIP-712 secp256k1 signature
-  (65-byte EOA `r‖s‖v` form in the PoC, ADR 024 §18); requesters reject
+  (65-byte EOA `r‖s‖v` form in the PoC, ADR 024 §Off-Chain ERC-1271
+  Verification); requesters reject
   missing/zero-length or wrong-length signatures.
   - **CLI** `decdn probe` now requires `--hash <BLAKE3>` (64 hex
     chars, the `cache.pinned_hashes` form). `--json` keys changed:
@@ -167,7 +299,87 @@ since project inception and will roll into the first tagged release.
 
 ### Changed
 
+#### Documentation
+
+- **Safe-as-recommended-wallet and the node-side off-chain ERC-1271 path are
+  dropped from the PoC surface (#1431).** ADR 024 keeps the piece that shipped
+  — OpenZeppelin `SignatureChecker` at every on-chain verification site — and
+  stops recommending a wallet. The encrypted EOA keystore is now the documented
+  default for node operators and clients; a Safe, or any other ERC-1271 smart
+  account, stays **supported** on the on-chain paths precisely because
+  `SignatureChecker` is retained, but deCDN neither recommends one nor commits
+  to tooling for one. By ADR 024's own words a 1-of-1 Safe carries "the same
+  trust posture as today's `eth_keystore`", and the multi-owner threshold that
+  would buy real security cannot be reached at `slash_sig` wire speed — so the
+  recommendation delivered nothing the retained contract-level piece does not
+  already enable, at the cost of a Safe-deployment step on every operator's
+  critical path. The node-side off-chain ERC-1271 verifier (an address-code
+  probe plus an `isValidSignature` RPC per client connection, behind a code
+  cache) is relabelled from a PoC deliverable to Production-deferred, which is
+  what the Rust has said all along. The Production session-key design
+  (Safe-7579 + `erc7579/smartsessions`) is untouched and remains the answer to
+  hot-path multisig and to smart-account clients.
+  - **Contracts:** unchanged. `SignatureChecker` stays wired in
+    `PaymentChannel` (voucher + provider waiver), `CapacityBond`
+    (`registerNode` / `bindNodeId`), `SlashJudge` (phantom / rate / blacklist
+    evidence), and `DecdnGovernor` (EIP-712 delegation); the
+    `MockERC1271Wallet` fixtures and ERC-1271 branch tests stay with them. No
+    ABI, deploy, or bytecode change. This is the insurance against a
+    coordinated on-chain retrofit and is exactly why deferring the node-side
+    path is cheap.
+  - **Node:** no code removed — the off-chain ERC-1271 path was never built.
+    `bind_sig::verify_binding`, voucher and `slash_sig` verification, and the
+    65-byte length checks are unchanged. Only the deferral comments move to a
+    stable citation: the `ADR 024 §18` **line**-number references in
+    `crates/protocol` become `ADR 024 §Off-Chain ERC-1271 Verification`, the
+    heading `crates/incentive` already cited, so a reworded ADR can no longer
+    silently rot them.
+  - **Config / CLI:** nothing removed. There is no Safe, smart-account, or
+    wallet-type config surface, and `decdn setup` never grew the Safe-creation
+    flow ADR 024 § Consequences promised — dropping that obligation retires an
+    unmet promise rather than deleting a feature.
+  - **Newly documented constraint:** a Safe-addressed *node operator* cannot
+    serve traffic today. Requesters verify `slash_sig` off-chain by recovery
+    against the registered address, and a Safe owner-key signature recovers to
+    the owner, not the Safe. ADR 024 § Node Operators and
+    `appendix-operator-key-rotation.md` now state this; the appendix's EOA →
+    Safe migration is retained in full but is *optional* rather than
+    *recommended*.
+  - ADR 024 keeps its number and title — Safe is still supported. § Safe as
+    Recommended Wallet becomes § Wallet Support — EOA Default, Safe Supported;
+    § Off-Chain ERC-1271 Verification keeps its heading and both inbound
+    anchors but loses its `alloy` implementation sketch and now reads as
+    Production-deferred; § Session Keys is unchanged. ADR 003 § Smart Account
+    Support and § Off-Chain (Ephemeral) Binding, ADR 012 § Ethereum Key and
+    § Identity Lifecycle, ADR 019, `appendix-operator-key-rotation.md`, and
+    `architecture.md`'s ADR 024 summary follow.
+
 #### Runtime (observability)
+
+- **The three probe-hold refusal counters are collapsed onto one `reason`
+  label (#1443).** `decdn_probe_hold_violations_total`,
+  `decdn_probe_holds_disabled_total` and `decdn_probe_stake_lane_reserved_total`
+  answered one question — "could not hold, by cause" — under three names. They
+  are now `decdn_probe_hold_unavailable_total{reason="exhausted"|"disabled"|
+  "stake_lane_reserved"}`. Every semantic distinction is preserved as a label
+  value, including that `stake_lane_reserved` fires *before* the hold attempt
+  and so never consults the cache. All three children are materialized at
+  startup, so each series is exported at zero from a fresh registry rather than
+  appearing on first increment — the property the three separate counters had,
+  and one a `Family` does not give for free. **Migration:** replace
+  `decdn_probe_hold_violations_total` with
+  `decdn_probe_hold_unavailable_total{reason="exhausted"}`,
+  `decdn_probe_holds_disabled_total` with `{reason="disabled"}`, and
+  `decdn_probe_stake_lane_reserved_total` with `{reason="stake_lane_reserved"}`.
+  The shipped `monitoring/prometheus-alerts.yml` and
+  `monitoring/grafana-dashboard.json` are updated in place; the
+  `DecdnProbeHoldViolations` alert keeps its name and now filters on
+  `reason="exhausted"`, which is what keeps a deliberate disable or a
+  stake-lane reservation from tripping a "raise `max_probe_holds`" page. Custom
+  dashboards querying the old names go blank. Note this makes
+  `probe_hold_unavailable` the one labeled counter in `decdn-node`; the other
+  reason-style splits (`dispatch_rejected_*`, `probe_rate_limit_rejected_*`,
+  `channel_open_failures_*`) remain sibling counters for now.
 
 - **The `decdn_node_address_watcher_*` metrics are removed (#1231).** Gone:
   `decdn_node_address_watcher_restarts_total` and
@@ -238,12 +450,6 @@ since project inception and will roll into the first tagged release.
 - `cdn/probe/v1` ALPN with ADR-013 varint framing and `ProbeMessage`
   request/response (#225).
 - Compile-time guardrail on `MAX_MESSAGE_SIZE = 16 MiB` per ADR 013 (#287).
-- Minimum-reputation rejection floor for node selection: the new
-  `rank_candidates_with_floor` / `top_n_with_floor` selection APIs drop
-  sub-floor candidates before scoring so price/RTT cannot override a
-  poor reputation (#441, ADR 001). API-configurable only for now —
-  **no config/env/CLI knob yet**; per-client wiring is deferred until
-  the client fetch path lands. Default `0.0` keeps prior behavior.
 
 #### Cache
 
@@ -384,6 +590,9 @@ since project inception and will roll into the first tagged release.
 
 ### Security
 
+- `quinn-proto` → 0.11.16 (GHSA-4w2j-m93h-cj5j: remote memory exhaustion in
+  the QUIC state machine, fixed in 0.11.15) (#1465). Lockfile-only bump; no
+  dependency requirement changed.
 - **Gossip rule-2 enforced against the live registry, not a static allowlist
   (#1170).** `NodeAnnounce` admission (ADR 001 rule 2) now checks the announcer
   against the live on-chain staker set (`CapacityBond`, kept fresh by the

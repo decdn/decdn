@@ -40,7 +40,6 @@ use crate::handlers::probe::{ProbeHandler, StakeLanePolicy as ProbeStakeLanePoli
 use crate::handlers::probe_rate_limit::ProbeRateLimiter;
 use crate::metrics;
 use crate::payment_settlement::PaymentChannelService;
-use crate::rate_limit::RateLimitConfig;
 use alloy::network::EthereumWallet;
 use alloy::primitives::U256;
 use alloy::providers::{Provider, ProviderBuilder};
@@ -854,23 +853,21 @@ async fn build_chain_and_handlers(
     // `cdn/probe/v1`. Built from `[probe.rate_limit]` and run *in addition* to
     // the shared `ConnectionLimiter` (see `probe_rate_limit` module docs); the
     // per-peer (NodeId) layer it adds is the gap #982 closed.
-    let probe_rate_limit_cfg = RateLimitConfig::from(&cfg.probe);
-    let probe_rate_limiter = Arc::new(ProbeRateLimiter::new(
-        &probe_rate_limit_cfg,
+    // `from_resolved` rather than `new`: both limiter configs are aliases of
+    // the same struct, so passing `&cfg.dht` here would compile (#1457).
+    let probe_rate_limiter = Arc::new(ProbeRateLimiter::from_resolved(
+        &cfg.probe,
         Arc::clone(&infra.node_metrics),
     ));
 
-    // Live per-MB delivery-rate bounds (#1172, ADR 019 §3.1). Seed from the
-    // config stand-in (`payment.delivery_floor`/`delivery_ceiling`) so the
-    // handlers hold the shared clamp from construction; the authoritative
-    // on-chain `getRateBounds()` read below (once `payment_channel_addr` is
-    // parsed) overwrites it before serving begins, and the `RateBoundsUpdated`
-    // watcher keeps it live thereafter. The same handle is cloned into the
-    // probe handler, the client handler, and the watcher.
-    let rate_bounds = crate::rate_bounds::RateBounds::new(
-        cfg.payment.delivery_floor,
-        cfg.payment.delivery_ceiling,
-    );
+    // Live per-MB delivery-rate floor (#1172, ADR 019 §3.1). Seed from the
+    // config stand-in (`payment.delivery_floor`) so the handlers hold the shared
+    // clamp from construction; the authoritative on-chain `getRateBounds()` read
+    // below (once `payment_channel_addr` is parsed) overwrites it before serving
+    // begins, and the `RateBoundsUpdated` watcher keeps it live thereafter. The
+    // same handle is cloned into the probe handler, the client handler, and the
+    // watcher.
+    let rate_bounds = crate::rate_bounds::RateBounds::new(cfg.payment.delivery_floor);
 
     let probe_handler = Arc::new(ProbeHandler::new(
         infra.secret_key.public(),
@@ -882,10 +879,6 @@ async fn build_chain_and_handlers(
         Arc::clone(&infra.eth_signer),
         slash_domain.clone(),
         rate_bounds.clone(),
-        // ADR 015 master switch. Restart-required (it changes the
-        // `on_accepting` wiring): the SIGHUP path reports any
-        // `[network]` change as "requires restart".
-        cfg.network.enable_0rtt,
         stake_lane_policy,
     ));
 
@@ -899,9 +892,8 @@ async fn build_chain_and_handlers(
     // Store all wired up; iterative requester-side lookup and the
     // republish scheduler land in PR 4 of #320. Three-layer rate limiter
     // operates at the full ADR 022 spec.
-    let dht_rate_limit_cfg = RateLimitConfig::from(&cfg.dht);
-    let dht_rate_limiter = Arc::new(DhtRateLimiter::new(
-        &dht_rate_limit_cfg,
+    let dht_rate_limiter = Arc::new(DhtRateLimiter::from_resolved(
+        &cfg.dht,
         Arc::clone(&infra.node_metrics),
     ));
     // Record store sized from the ADR 022 defaults; per-publisher /
@@ -989,39 +981,33 @@ async fn build_chain_and_handlers(
         "blockchain.payment_channel_address",
     )?;
 
-    // Authoritative on-chain delivery-rate bounds (#1172, ADR 019 §3.1 / ADR
+    // Authoritative on-chain delivery-rate floor (#1172, ADR 019 §3.1 / ADR
     // 003). Read once at startup — a fail-fast self-check in the same spirit as
     // `PaymentChannel.usdc()` — and seed the shared clamp created above,
-    // replacing the config stand-in. The on-chain bounds are `uint256`; the
-    // node clamps in `u64`, so an out-of-range value must refuse startup rather
-    // than silently truncate. The `RateBoundsUpdated` watcher spawned below
-    // keeps the clamp live for governance retunes without a restart.
+    // replacing the config stand-in. The on-chain floor is `uint256`; the node
+    // clamps in `u64`, so an out-of-range value must refuse startup rather than
+    // silently truncate. The `RateBoundsUpdated` watcher spawned below keeps the
+    // clamp live for governance retunes without a restart.
     {
         let contract = decdn_incentive::payment_channel::PaymentChannel::new(
             payment_channel_addr,
             ProviderFactory::read_only(rpc_url.clone(), event_poll_interval),
         );
-        let bounds = contract.getRateBounds().call().await.with_context(|| {
+        let on_chain_floor = contract.getRateBounds().call().await.with_context(|| {
             format!("PaymentChannel.getRateBounds() startup read at {payment_channel_addr}")
         })?;
-        let floor = u64::try_from(bounds.floor).map_err(|_| {
-            anyhow::anyhow!(
-                "on-chain delivery floor {} exceeds u64::MAX; refusing to start",
-                bounds.floor
-            )
-        })?;
-        let ceiling = u64::try_from(bounds.ceiling).map_err(|_| {
-            anyhow::anyhow!(
-                "on-chain delivery ceiling {} exceeds u64::MAX; refusing to start",
-                bounds.ceiling
-            )
-        })?;
-        rate_bounds.store(floor, ceiling);
+        // Both rejection arms live in `rate_bounds::on_chain_floor_to_u64` so a
+        // unit test can reach them; inline here they sat behind an async chain
+        // read no fixture could drive to a bad value.
+        let floor = crate::rate_bounds::on_chain_floor_to_u64(
+            on_chain_floor,
+            &payment_channel_addr.to_string(),
+        )?;
+        rate_bounds.store(floor);
         tracing::info!(
             floor,
-            ceiling,
             %payment_channel_addr,
-            "seeded live delivery-rate bounds from on-chain getRateBounds()"
+            "seeded live delivery-rate floor from on-chain getRateBounds()"
         );
     }
 
@@ -1818,7 +1804,6 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
             .max_blob_size_mb
             .saturating_mul(decdn_protocol::MB_BYTES),
         max_rate_per_mb: cfg.cache.max_rate_per_mb,
-        enable_0rtt: cfg.network.enable_0rtt,
         deposit_hint: U256::from(cfg.blockchain.buyer_deposit_micro_usdc),
         lookup: crate::dht::LookupConfig::default(),
         // Own self-attested region for the ADR 030 latency-vs-claim penalty
@@ -2581,16 +2566,7 @@ async fn build_endpoint(
 
     builder = builder
         .secret_key(secret_key.clone())
-        .transport_config(transport_config)
-        // ADR 015 §Session Ticket Management. In iroh this knob sizes
-        // only the *client-side* `ClientSessionMemoryCache` — i.e. the
-        // tickets THIS node caches when it probes others (default 256;
-        // we raise it). The inbound/serving side's ticket store is
-        // rustls-internal and unaffected by this. Set unconditionally:
-        // it only matters when this node resumes outbound, and
-        // `network.enable_0rtt` gates whether the probe handler accepts
-        // inbound resumption.
-        .max_tls_tickets(decdn_protocol::SESSION_TICKET_CACHE_SIZE);
+        .transport_config(transport_config);
 
     // A configured `network.relay_urls` list swaps the n0 default relay map for
     // the operator's self-hosted relays (`RelayMode::Custom`). The relay leg is
@@ -3652,7 +3628,6 @@ mod tests {
                 bind_port: 4433,
                 relay_urls: Vec::new(),
                 discovery: decdn_common::config::ResolvedDiscovery::default(),
-                enable_0rtt: true,
             },
             blockchain: ResolvedBlockchain {
                 origin_assignment_address: None,
@@ -3714,7 +3689,6 @@ mod tests {
             payment: ResolvedPayment {
                 rate_per_mb: 10,
                 delivery_floor: 0,
-                delivery_ceiling: decdn_protocol::MAX_RATE_PER_MB,
                 voucher_interval_mb: decdn_protocol::DEFAULT_VOUCHER_INTERVAL_MB,
             },
             observability: ResolvedObservability {

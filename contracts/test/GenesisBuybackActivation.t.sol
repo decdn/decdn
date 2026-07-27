@@ -115,7 +115,6 @@ contract GenesisBuybackActivationTest is Test, BaseProtocolDeploy {
     MockEd25519Verifier internal ed;
 
     address internal emergencyMultisig = address(0xC0DE);
-    address internal challengerPool = address(0xCCEE);
     address internal keeper = address(0xCAFE);
     // A nonzero SwapRouter02 stand-in — the burner constructor only checks it is
     // nonzero; no swap is executed in a deploy test.
@@ -141,7 +140,6 @@ contract GenesisBuybackActivationTest is Test, BaseProtocolDeploy {
             deployer: address(this),
             emergencyMultisig: emergencyMultisig,
             initialTokenHolder: address(this),
-            challengerIncentivePool: challengerPool,
             timelockDelay: 48 hours,
             minBond: 50_000e18,
             unbondingPeriod: 14 days,
@@ -153,8 +151,7 @@ contract GenesisBuybackActivationTest is Test, BaseProtocolDeploy {
             feeRouterWindowEpochs: 13,
             feeRouterShares: [uint256(9000), uint256(0), uint256(1000)],
             buybackBurner: address(0),
-            slashAppealBond: 1000e18,
-            blacklistAppealBond: 100e18
+            slashAppealBond: 1000e18
         });
     }
 

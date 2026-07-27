@@ -65,7 +65,6 @@ contract GovernanceLifecycleTest is Test, BaseProtocolDeploy {
     uint256 internal constant MIN_BOND = 50_000e18;
     uint256 internal constant UNBONDING_PERIOD = 7 days;
     uint256 internal constant SLASH_APPEAL_BOND = 1000e18;
-    uint256 internal constant BLACKLIST_APPEAL_BOND = 100e18;
 
     // -----------------------------------------------------------------
     // Deployments
@@ -91,7 +90,6 @@ contract GovernanceLifecycleTest is Test, BaseProtocolDeploy {
     address internal voter2 = address(0xCCCC);
     address internal multisig = address(0xC0DE);
     bytes32 internal constant REGION_DE = bytes32("DE");
-    address internal challengerPool = address(0xCCEE);
 
     // Counter used to make each proposal description unique so identical
     // setter calls don't collide on `proposalId`.
@@ -113,7 +111,6 @@ contract GovernanceLifecycleTest is Test, BaseProtocolDeploy {
             // Token is minted entirely to the test harness so it can fund
             // operators + FeeRouter bucket destinations downstream.
             initialTokenHolder: address(this),
-            challengerIncentivePool: challengerPool,
             timelockDelay: TIMELOCK_DELAY,
             minBond: MIN_BOND,
             unbondingPeriod: UNBONDING_PERIOD,
@@ -128,8 +125,7 @@ contract GovernanceLifecycleTest is Test, BaseProtocolDeploy {
             // state, not the launch dormancy that DeployProtocol.s.sol ships.
             feeRouterShares: [uint256(6000), uint256(3000), uint256(1000)],
             buybackBurner: address(0xBB),
-            slashAppealBond: SLASH_APPEAL_BOND,
-            blacklistAppealBond: BLACKLIST_APPEAL_BOND
+            slashAppealBond: SLASH_APPEAL_BOND
         });
 
         Deployment memory d = _runFullDeploy(cfg);
@@ -646,21 +642,6 @@ contract GovernanceLifecycleTest is Test, BaseProtocolDeploy {
         );
     }
 
-    function test_lifecycle_ContentBlacklist_setAppealBond_happy() public {
-        _runLifecycle(address(blacklist), abi.encodeCall(ContentBlacklist.setAppealBond, (uint256(2000e18))));
-        assertEq(blacklist.appealBond(), 2000e18);
-    }
-
-    function test_lifecycle_ContentBlacklist_setAppealBond_outOfBounds() public {
-        _runLifecycleExpectExecuteRevert(
-            address(blacklist),
-            abi.encodeCall(ContentBlacklist.setAppealBond, (uint256(10_000e18))),
-            abi.encodeWithSelector(
-                ContentBlacklist.ParamOutOfBounds.selector, uint256(10_000e18), uint256(50e18), uint256(5000e18)
-            )
-        );
-    }
-
     function test_lifecycle_ContentBlacklist_registerRegionalBody_happy() public {
         address regionalBody = address(0xEEEE01);
         _runLifecycle(
@@ -681,22 +662,8 @@ contract GovernanceLifecycleTest is Test, BaseProtocolDeploy {
     }
 
     // =================================================================
-    // SlashAppeal (2 setters)
+    // SlashAppeal
     // =================================================================
-
-    function test_lifecycle_SlashAppeal_setChallengerIncentivePool_happy() public {
-        address pool = address(0xCC02);
-        _runLifecycle(address(slashAppeal), abi.encodeCall(SlashAppeal.setChallengerIncentivePool, (pool)));
-        assertEq(slashAppeal.challengerIncentivePool(), pool);
-    }
-
-    function test_lifecycle_SlashAppeal_setChallengerIncentivePool_outOfBounds() public {
-        _runLifecycleExpectExecuteRevert(
-            address(slashAppeal),
-            abi.encodeCall(SlashAppeal.setChallengerIncentivePool, (address(0))),
-            abi.encodeWithSelector(SlashAppeal.ZeroAddress.selector)
-        );
-    }
 
     function test_lifecycle_SlashAppeal_setAppealBond_happy() public {
         _runLifecycle(address(slashAppeal), abi.encodeCall(SlashAppeal.setAppealBond, (uint256(5000e18))));

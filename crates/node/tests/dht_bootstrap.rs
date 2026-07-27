@@ -59,7 +59,6 @@ fn permissive_dht_rate_limiter(metrics: &Arc<Metrics>) -> Arc<DhtRateLimiter> {
         per_ip_burst: u32::MAX,
         global_rate_per_sec: 1e6,
         global_burst: u32::MAX,
-        trusted_ips: std::collections::HashSet::new(),
         max_tracked_per_ip: 4096,
         max_tracked_per_peer: 4096,
     };

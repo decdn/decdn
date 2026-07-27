@@ -21,12 +21,6 @@
 //! accepting a voucher the handler emits a redeem hint (via the `redeem_hint`
 //! sender wired on [`ClientHandlerDeps`]) so the settlement service can
 //! withdraw the accrued claim once it crosses its threshold.
-//!
-//! # 0-RTT
-//!
-//! Unlike `cdn/probe/v1`, `cdn/client/v1` **rejects** 0-RTT (ADR 015): paid
-//! accounting must not run on replayable early data, so `on_accepting` always
-//! takes the full handshake.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -54,7 +48,7 @@ use decdn_protocol::{
     is_unknown_variant, read_frame, write_frame,
 };
 use iroh::PublicKey;
-use iroh::endpoint::{Accepting, Connection, RecvStream, SendStream, VarInt};
+use iroh::endpoint::{Connection, RecvStream, SendStream, VarInt};
 use iroh::protocol::{AcceptError, ProtocolHandler};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
@@ -1155,12 +1149,6 @@ enum VoucherOutcome {
 }
 
 impl ProtocolHandler for ClientHandler {
-    /// ADR 015: `cdn/client/v1` MUST reject 0-RTT — always take the full
-    /// handshake, never `into_0rtt()`. This is the inverse of `ProbeHandler`.
-    async fn on_accepting(&self, accepting: Accepting) -> Result<Connection, AcceptError> {
-        accepting.await.map_err(AcceptError::from_err)
-    }
-
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
         self.serve(connection)
             .await
@@ -1229,6 +1217,16 @@ async fn read_first_message(recv: &mut RecvStream) -> Result<FirstMessage, Strea
                     err: anyhow::anyhow!("stream request ext decode failed: {e}"),
                     app_code: APP_ERR_MALFORMED_MESSAGE,
                 }
+            })?;
+            // Value checks are kept out of the parse so forward-compatible
+            // trailing bytes don't couple to them (ADR 005 two-phase). Gate here
+            // rather than at each use: an out-of-range `voucher_interval_mb` is a
+            // protocol error per ADR 003 §Voucher Interval Negotiation, and this
+            // wire boundary is its only enforcement point — `PaymentChannel`
+            // holds no cadence parameter to check it against.
+            ext.validate().map_err(|e| StreamReadError {
+                err: anyhow::anyhow!("stream request ext rejected: {e}"),
+                app_code: APP_ERR_MALFORMED_MESSAGE,
             })?;
             Ok(FirstMessage::Delivery(req, ext))
         }
@@ -1488,7 +1486,7 @@ mod tests {
                 crate::receipt_log::NoopReceiptLog,
             ))) as Arc<dyn ReceiptSink>,
             Arc::new(AtomicU64::new(1)),
-            crate::rate_bounds::RateBounds::new(0, u64::MAX),
+            crate::rate_bounds::RateBounds::new(0),
             1,
             0,
             16,
@@ -1845,7 +1843,7 @@ mod tests {
         // `rate_per_mb` atomic is seeded to 1 in `handler_for_warm_tests`, so
         // set the band's floor to F and clamp will raise the quote to F.
         let f: u64 = 500;
-        handler.rate_bounds.store(f, 10_000);
+        handler.rate_bounds.store(f);
 
         // Quote the stream at rate F (the value signed into the `StreamResponse`).
         let quoted_rate = handler.clamped_rate();
@@ -1869,7 +1867,7 @@ mod tests {
         // spanning multiple voucher intervals — the reachable race from #1382).
         // The chain now enforces 2F at settlement, so a voucher priced at F is
         // unredeemable and the live-floor acceptance check MUST reject it.
-        handler.rate_bounds.store(f * 2, 10_000);
+        handler.rate_bounds.store(f * 2);
         assert_eq!(
             handler.rate_bounds.floor(),
             f * 2,

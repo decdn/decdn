@@ -4,9 +4,9 @@
 //! A thin probe-flavoured wrapper over the shared
 //! [`crate::rate_limit::ThreeLayerRateLimiter`] engine: it pins the
 //! probe-specific operator-visible metric names (via a private metrics sink)
-//! and re-exports the config/reject types under probe names. The layering,
-//! cheapest-first ordering (global → per-IP → per-peer), and trusted-IP
-//! exemption (per-IP only) all live in the shared engine — see its module docs.
+//! and re-exports the config/reject types under probe names. The layering and
+//! cheapest-first ordering (global → per-IP → per-peer) live in the shared
+//! engine — see its module docs.
 //!
 //! ## Relationship to [`crate::dispatch::ConnectionLimiter`]
 //!
@@ -20,11 +20,6 @@
 //! probe layer dominates, and the per-peer (`NodeId`) layer ADR 005 mandates
 //! exists **only** here. `cdn/probe/v1` is one connection / one stream / one
 //! probe, so a single `check` per accepted connection is the whole budget.
-//!
-//! One operator note: `probe.rate_limit.trusted_ips` exempts an IP from *this*
-//! limiter's per-IP layer only. The always-on `ConnectionLimiter`
-//! per-source bucket still applies, so a trusted monitoring host is uncapped
-//! by the probe per-IP layer but remains bounded at `security.per_source_*`.
 
 use std::sync::Arc;
 
@@ -93,6 +88,22 @@ impl ProbeRateLimiter {
         ))
     }
 
+    /// Build a limiter straight from the resolved `[probe.rate_limit]` section.
+    ///
+    /// Prefer this over [`Self::new`] at wiring sites. `ProbeRateLimitConfig`
+    /// is an alias of the shared [`RateLimitConfig`], so `new` accepts a config
+    /// mapped from *either* protocol's resolved section — building the probe
+    /// limiter from `[dht.rate_limit]` type-checks fine and would quietly
+    /// quadruple the per-peer probe cap (ADR 022's 20/sec in place of ADR 005's
+    /// 5/sec). Taking `&ResolvedProbe` makes that a type error instead (#1457).
+    #[must_use]
+    pub fn from_resolved(
+        resolved: &decdn_common::config::ResolvedProbe,
+        metrics: Arc<Metrics>,
+    ) -> Self {
+        Self::new(&RateLimitConfig::from(resolved), metrics)
+    }
+
     /// Try to admit one inbound probe. See [`ThreeLayerRateLimiter::check`].
     pub fn check(
         &self,
@@ -132,7 +143,6 @@ impl ProbeRateLimiter {
 mod tests {
     use super::*;
     use crate::dht::routing::NodeId;
-    use std::collections::HashSet;
     use std::net::{IpAddr, Ipv4Addr};
 
     fn metrics() -> Arc<Metrics> {
@@ -152,18 +162,14 @@ mod tests {
     /// the DHT wrapper's suite; here we pin the probe-specific behaviour — that
     /// the per-peer burst of 5 fires on the 6th same-peer probe — to catch a
     /// regression in how the probe defaults are wired through this newtype.
+    ///
+    /// Routed through `ResolvedProbe::default()` and the real `From` mapping
+    /// rather than restating the eight literals, so these behavioural tests
+    /// exercise the same path production takes. A default that drifted out of
+    /// ADR 005 shows up as a burst assertion failing here, not as a fixture
+    /// that quietly disagrees with the resolver.
     fn adr005_default_cfg() -> ProbeRateLimitConfig {
-        ProbeRateLimitConfig {
-            per_peer_rate_per_sec: 5.0,
-            per_peer_burst: 5,
-            per_ip_rate_per_sec: 50.0,
-            per_ip_burst: 200,
-            global_rate_per_sec: 1000.0,
-            global_burst: 2000,
-            trusted_ips: HashSet::new(),
-            max_tracked_per_ip: 4096,
-            max_tracked_per_peer: 4096,
-        }
+        ProbeRateLimitConfig::from(&decdn_common::config::ResolvedProbe::default())
     }
 
     #[test]
@@ -208,29 +214,22 @@ mod tests {
         );
     }
 
-    /// Trusted IP exempts the per-IP layer only — a probe from a trusted IP
-    /// using a fresh `NodeId` each time is admitted past the per-IP burst, but
-    /// the per-peer layer still bounds a single `NodeId`. Also pins the per-IP
-    /// scrape counter: the `ProbeRateLimitMetrics::rejected` match is
-    /// hand-written, so a copy-paste swap of its `PerIp` arm would otherwise go
-    /// uncaught (the per-peer arm is pinned by the test above).
+    /// Pins the per-IP scrape counter: the `ProbeRateLimitMetrics::rejected`
+    /// match is hand-written, so a copy-paste swap of its `PerIp` arm would
+    /// otherwise go uncaught (the per-peer arm is pinned by the test above,
+    /// the global arm by the test below).
     #[test]
-    fn trusted_ip_exempts_per_ip_only() {
+    fn per_ip_rejection_drives_probe_per_ip_counter() {
         let mut cfg = adr005_default_cfg();
+        // Per-IP burst=1 with ~zero refill: the second distinct peer from the
+        // same IP can only fail the per-IP layer.
         cfg.per_ip_burst = 1;
         cfg.per_ip_rate_per_sec = 1e-9;
-        cfg.trusted_ips.insert(ip(10, 0, 0, 1));
         let metrics = metrics();
         let lim = ProbeRateLimiter::new(&cfg, Arc::clone(&metrics));
-        let trusted = Some(ip(10, 0, 0, 1));
-        // Distinct peers from the trusted IP all pass (per-IP bypassed).
-        assert_eq!(lim.check(&peer(1), trusted), Ok(()));
-        assert_eq!(lim.check(&peer(2), trusted), Ok(()));
-        // An untrusted IP hits the per-IP burst of 1 on the second distinct
-        // peer.
-        let untrusted = Some(ip(10, 0, 0, 2));
-        assert_eq!(lim.check(&peer(3), untrusted), Ok(()));
-        assert_eq!(lim.check(&peer(4), untrusted), Err(ProbeRejectLayer::PerIp));
+        let i = Some(ip(10, 0, 0, 2));
+        assert_eq!(lim.check(&peer(3), i), Ok(()));
+        assert_eq!(lim.check(&peer(4), i), Err(ProbeRejectLayer::PerIp));
         let text = metrics.encode().unwrap();
         assert!(
             text.contains("decdn_probe_rate_limit_rejected_per_ip_total 1"),

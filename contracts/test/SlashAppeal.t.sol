@@ -3,6 +3,7 @@ pragma solidity 0.8.28;
 
 import { Test } from "forge-std/Test.sol";
 import { IAccessControl } from "@openzeppelin/contracts/access/IAccessControl.sol";
+import { ERC20Burnable } from "@openzeppelin/contracts/token/ERC20/extensions/ERC20Burnable.sol";
 
 import { SlashAppeal } from "../src/SlashAppeal.sol";
 import { SunsettingPausable } from "../src/SunsettingPausable.sol";
@@ -18,7 +19,7 @@ import { MockEd25519Verifier } from "./mocks/MockEd25519Verifier.sol";
 /// @notice Drives the full appeal state machine against a real `CapacityBond`,
 ///         asserting the escrow settle hooks move the slashed TOKEN correctly:
 ///         grant → operator refunded + zero-out cleared; uphold/reject →
-///         escrow distributed 50/50 and the appeal bond burned (or split).
+///         escrow distributed 50/50 and the appeal bond burned.
 contract SlashAppealTest is Test {
     Token internal token;
     MockEd25519Verifier internal ed25519;
@@ -30,7 +31,6 @@ contract SlashAppealTest is Test {
     address internal challenger = address(0xC4A11);
     address internal appellant = address(0xA99EA1);
     address internal multisig = address(0xC0DE);
-    address internal pool = address(0xCCEE);
 
     uint256 internal constant MIN_BOND = 50_000e18;
     uint256 internal constant APPEAL_BOND = 1000e18;
@@ -63,7 +63,6 @@ contract SlashAppealTest is Test {
         vm.startPrank(admin);
         bond.grantRole(bond.SLASH_ROLE(), admin);
         bond.grantRole(bond.SLASH_APPEAL_ROLE(), address(appeal));
-        appeal.setChallengerIncentivePool(pool);
         token.transfer(operator, 100_000e18);
         token.transfer(appellant, 10_000e18);
         vm.stopPrank();
@@ -95,6 +94,59 @@ contract SlashAppealTest is Test {
     function _open(uint256 slashId) internal {
         vm.prank(operator);
         appeal.openSlashAppeal(slashId, keccak256("evidence"));
+    }
+
+    // -----------------------------------------------------------------
+    // constructor
+    // -----------------------------------------------------------------
+
+    /// @dev The guard is a three-way `||`, so each clause needs its own case —
+    ///      dropping one still compiles and still passes every other test here.
+    function test_constructor_revertsOnZeroToken() public {
+        vm.expectRevert(SlashAppeal.ZeroAddress.selector);
+        new SlashAppeal({
+            token_: ERC20Burnable(address(0)),
+            capacityBond_: ICapacityBond(address(bond)),
+            admin: admin,
+            emergencyMultisig: multisig,
+            appealBond_: APPEAL_BOND
+        });
+    }
+
+    function test_constructor_revertsOnZeroCapacityBond() public {
+        vm.expectRevert(SlashAppeal.ZeroAddress.selector);
+        new SlashAppeal({
+            token_: token,
+            capacityBond_: ICapacityBond(address(0)),
+            admin: admin,
+            emergencyMultisig: multisig,
+            appealBond_: APPEAL_BOND
+        });
+    }
+
+    function test_constructor_revertsOnZeroAdmin() public {
+        vm.expectRevert(SlashAppeal.ZeroAddress.selector);
+        new SlashAppeal({
+            token_: token,
+            capacityBond_: ICapacityBond(address(bond)),
+            admin: address(0),
+            emergencyMultisig: multisig,
+            appealBond_: APPEAL_BOND
+        });
+    }
+
+    /// @dev `emergencyMultisig` is explicitly allowed to be zero (the role is
+    ///      simply left ungranted), so it must NOT trip the guard.
+    function test_constructor_allowsZeroEmergencyMultisig() public {
+        SlashAppeal noMultisig = new SlashAppeal({
+            token_: token,
+            capacityBond_: ICapacityBond(address(bond)),
+            admin: admin,
+            emergencyMultisig: address(0),
+            appealBond_: APPEAL_BOND
+        });
+        assertFalse(noMultisig.hasRole(noMultisig.EMERGENCY_MULTISIG_ROLE(), address(0)));
+        assertTrue(noMultisig.hasRole(noMultisig.DEFAULT_ADMIN_ROLE(), admin));
     }
 
     // -----------------------------------------------------------------
@@ -205,7 +257,7 @@ contract SlashAppealTest is Test {
     // uphold / reject (slash stands)
     // -----------------------------------------------------------------
 
-    function test_uphold_distributesEscrowAndSplitsBond() public {
+    function test_uphold_distributesEscrowAndBurnsFullBond() public {
         uint256 slashId = _bondAndSlash();
         _open(slashId);
         vm.prank(multisig);
@@ -213,16 +265,17 @@ contract SlashAppealTest is Test {
 
         uint256 challengerBefore = token.balanceOf(challenger);
         uint256 supplyBefore = token.totalSupply();
-        uint256 poolBefore = token.balanceOf(pool);
 
+        vm.expectEmit(true, false, false, true, address(appeal));
+        emit SlashAppeal.AppealUpheld(slashId, APPEAL_BOND);
         vm.prank(admin);
         appeal.upholdAppeal(slashId);
 
         // Escrow 50/50: challenger 1250, burn 1250.
         assertEq(token.balanceOf(challenger) - challengerBefore, SLASH_AMT / 2);
-        // Bond 50/50: 500 burned, 500 to pool. Total burned = 1250 + 500.
-        assertEq(token.balanceOf(pool) - poolBefore, APPEAL_BOND / 2);
-        assertEq(supplyBefore - token.totalSupply(), SLASH_AMT / 2 + APPEAL_BOND / 2);
+        // The separate appeal bond is burned in full — no share is diverted
+        // anywhere, so the supply delta accounts for every wei of it.
+        assertEq(supplyBefore - token.totalSupply(), SLASH_AMT / 2 + APPEAL_BOND);
         assertEq(bond.escrowedTotal(), 0);
     }
 
@@ -362,44 +415,6 @@ contract SlashAppealTest is Test {
         vm.prank(admin);
         appeal.grantAppeal(s2);
         assertEq(bond.slashedAtEpoch(operator), stamp1);
-    }
-
-    // -----------------------------------------------------------------
-    // ADR 028 § Appeal flow — upholdAppeal degrades gracefully when pool unset
-    // -----------------------------------------------------------------
-
-    function test_uphold_poolUnset_burnsFullBond() public {
-        // Fresh SlashAppeal with no challenger-incentive pool wired.
-        SlashAppeal noPool = new SlashAppeal({
-            token_: token,
-            capacityBond_: ICapacityBond(address(bond)),
-            admin: admin,
-            emergencyMultisig: multisig,
-            appealBond_: APPEAL_BOND
-        });
-        bytes32 appealRole = bond.SLASH_APPEAL_ROLE();
-        vm.prank(admin);
-        bond.grantRole(appealRole, address(noPool));
-        vm.prank(operator);
-        token.approve(address(noPool), type(uint256).max);
-
-        vm.prank(operator);
-        bond.bond(MIN_BOND);
-        vm.prank(admin);
-        (uint256 slashId,) = bond.slash(operator, challenger, 1);
-        vm.prank(operator);
-        noPool.openSlashAppeal(slashId, keccak256("e"));
-        vm.prank(multisig);
-        noPool.fastTrackAppeal(slashId);
-
-        uint256 supplyBefore = token.totalSupply();
-        uint256 challengerBefore = token.balanceOf(challenger);
-        vm.prank(admin);
-        noPool.upholdAppeal(slashId);
-
-        // Pool unset → 100% bond burned (no revert); escrow still splits 50/50.
-        assertEq(token.balanceOf(challenger) - challengerBefore, SLASH_AMT / 2);
-        assertEq(supplyBefore - token.totalSupply(), APPEAL_BOND + SLASH_AMT / 2);
     }
 
     // -----------------------------------------------------------------

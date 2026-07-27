@@ -5,8 +5,6 @@ import { Test } from "forge-std/Test.sol";
 
 import { CapacityBond } from "../src/CapacityBond.sol";
 import { ContentBlacklist } from "../src/ContentBlacklist.sol";
-import { PublisherRegistry } from "../src/PublisherRegistry.sol";
-import { IPublisherRegistryStanding } from "../src/interfaces/IPublisherRegistryStanding.sol";
 import { Ed25519Verifier } from "../src/Ed25519Verifier.sol";
 import { SlashJudge } from "../src/SlashJudge.sol";
 import { ISlashJudge } from "../src/interfaces/ISlashJudge.sol";
@@ -39,7 +37,6 @@ contract CapacityBondRegionE2ETest is Test {
     uint256 internal constant MIN_BOND = 50_000e18;
     uint256 internal constant UNBONDING = 7 days;
     uint256 internal constant REGION_WINDOW = 7 days;
-    uint256 internal constant APPEAL_BOND = 100e18;
 
     // SlashJudge wiring for the cross-contract regional/ripening slash path.
     uint256 internal constant CHALLENGE_BOND = 100e18;
@@ -236,9 +233,7 @@ contract CapacityBondRegionE2ETest is Test {
     function test_crossContractEject_viaContentBlacklist() public {
         _bondAndRegister();
 
-        ContentBlacklist blacklist = new ContentBlacklist(
-            bond, token, IPublisherRegistryStanding(address(new PublisherRegistry(admin))), admin, APPEAL_BOND
-        );
+        ContentBlacklist blacklist = new ContentBlacklist(bond, admin);
         // Cache the role getter before pranking: a nested external call inside
         // the pranked statement would otherwise consume the prank.
         bytes32 blacklistRole = bond.BLACKLIST_ROLE();
@@ -348,9 +343,7 @@ contract CapacityBondRegionE2ETest is Test {
     /// @dev Deploy a real `ContentBlacklist` + `SlashJudge` wired to `bond`, grant
     ///      the cross-contract roles, and fund the challenger's bond.
     function _deployBlacklistAndJudge() internal returns (ContentBlacklist blacklist, SlashJudge judge) {
-        blacklist = new ContentBlacklist(
-            bond, token, IPublisherRegistryStanding(address(new PublisherRegistry(admin))), admin, APPEAL_BOND
-        );
+        blacklist = new ContentBlacklist(bond, admin);
         deployedBlacklist = blacklist;
         judge = new SlashJudge(
             ICapacityBondSlasher(address(bond)),

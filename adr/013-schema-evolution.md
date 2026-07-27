@@ -5,13 +5,13 @@
 
 ## Context
 
-All wire messages are serialized with [postcard](https://docs.rs/postcard) — a compact, no-std, serde-based binary format standard in the iroh ecosystem ([ADR 005](005-protocol.md#adr-005-wire-protocol)). Postcard is positional: fields are encoded in declaration order with no field tags, no per-field length delimiters, no schema versioning. `postcard::from_bytes` silently ignores trailing bytes; `postcard::take_from_bytes` returns the unconsumed remainder. Neither fails on trailing bytes — but on a QUIC byte stream with no message boundaries, the receiver cannot find where one message ends without explicit framing. [ADR 005](005-protocol.md#adr-005-wire-protocol) noted the limitation: "Postcard has no schema evolution story — adding fields requires a new ALPN version (`cdn/client/v2`); version negotiation must be planned before the first breaking change."
+All wire messages are serialized with [postcard](https://docs.rs/postcard) — a compact, no-std, serde-based binary format standard in the iroh ecosystem ([ADR 005](005-protocol.md#adr-005-wire-protocol)). Postcard is positional: fields are encoded in declaration order with no field tags, per-field length delimiters, or schema versioning. `postcard::from_bytes` silently ignores trailing bytes; `postcard::take_from_bytes` returns the unconsumed remainder. Neither fails on trailing bytes, but a QUIC byte stream has no message boundaries from which a receiver can determine where one message ends. Explicit framing is required.
 
-The codebase already has an ad-hoc pattern: `StreamRequest` appends `ethereum_address: Option<Address>` and `binding_signature: Option<Bytes>` with `#[serde(default)]` ([ADR 005](005-protocol.md#adr-005-wire-protocol)). [ADR 005](005-protocol.md#adr-005-wire-protocol) called this a "one-time workaround" and stated "any future mandatory field addition still requires `cdn/client/v2`." It is unscalable. Gossip messages (`NodeAnnounce`) have no ALPN negotiation — published to iroh-gossip topics whose names embed a version (`cdn/global/v1`), and changing a topic name partitions the gossip network.
+`StreamRequest` already separates its frozen base from a separately encoded trailing `StreamRequestExt` ([ADR 005](005-protocol.md#adr-005-wire-protocol)). That two-phase pattern handles compatible optional growth and needs to be uniform across protocols. Gossip messages (`NodeAnnounce`) use iroh-gossip rather than a deCDN ALPN selector; their topic names embed a version (`cdn/global/v1`), and changing a topic name partitions the gossip network.
 
 Several messages contain cryptographically signed fields ([ADR 005](005-protocol.md#adr-005-wire-protocol)). Signatures are a byte-level commitment: appending a field to a signed struct makes old verifiers compute the signature over fewer bytes than the signer intended, causing verification failure. Signed field sets must be explicitly frozen per protocol version.
 
-The project is pre-implementation. Defining framing and evolution conventions now avoids retrofitting after v1 — itself a breaking change.
+The protocol therefore defines framing, compatible in-version changes, and the boundary at which a new ALPN or topic is required.
 
 ## Decision
 
@@ -120,7 +120,7 @@ When a peer receives a message with an unknown enum discriminant:
 
 ### Gossip Envelope
 
-Gossip messages are published to iroh-gossip topics without ALPN negotiation. To enable schema evolution, all gossip payloads are wrapped in a `GossipEnvelope`:
+Gossip messages are published through iroh-gossip rather than a deCDN ALPN selector. All gossip payloads are wrapped in a `GossipEnvelope`; its version byte is a reserved sentinel and guard, not a capability advertisement or negotiation mechanism:
 
 ```rust
 /// Outermost wrapper for all gossip messages.
@@ -147,14 +147,14 @@ Peers deserialize `GossipEnvelope` using `take_from_bytes`. If `version != 1` (u
 
 #### Topic names vs. envelope version
 
-Topic names (`cdn/global/v1`, `cdn/region/{cc}/v1`) embed a version referring to the topic's semantic contract — its purpose, membership rules, validation semantics. `GossipEnvelope.version` handles wire format evolution independently. A topic name version bump (e.g., `cdn/global/v2`) is the gossip equivalent of a major ALPN bump and requires dual-subscription during transition.
+Topic names (`cdn/global/v1`, `cdn/region/{cc}/v1`) embed a version referring to the topic's semantic contract — its purpose, membership rules, and validation semantics. `GossipEnvelope.version` guards the envelope wire format independently. A topic name version bump (e.g., `cdn/global/v2`) is the gossip equivalent of a major ALPN bump.
 
 ##### Rule for choosing between envelope evolution and topic bump
 
-- *Payload-shape changes* — new optional fields, new `GossipPayload` enum variants, additional unsigned outer fields → **envelope evolution**. Bump `GossipEnvelope.version` only if the envelope wire format itself changes; otherwise append to `GossipPayload` (Tier 2) or extend an inner message via the `Body` + outer fields pattern (Tier 1). The topic name does **not** change; no dual-subscription cost. Old peers safely ignore unknown payload variants per the [Deserialization rule](#deserialization-rule).
-- *Topic-level changes* — who may publish, what registry/membership rule applies, what validation semantics gate acceptance, the topic's purpose → **topic name bump** (`cdn/global/v2`) with dual-subscription during the [Deprecation Timeline](#deprecation-timeline). Envelope-version evolution cannot express these because they alter the topic's trust contract; an old subscriber would accept messages under semantics it no longer enforces.
+- *Payload-shape changes* — new optional fields, new `GossipPayload` enum variants, additional unsigned outer fields → **envelope evolution**: append to `GossipPayload` (Tier 2) or extend an inner message via the `Body` + outer fields pattern (Tier 1). The topic name does **not** change. Old peers safely ignore unknown payload variants per the [Deserialization rule](#deserialization-rule). Bumping `GossipEnvelope.version` is reserved for a change to the envelope wire format itself and is [Tier 3](#tier-3--major-alpn-version-bump) — old peers drop the message entirely rather than degrading, so it is a break, not evolution.
+- *Topic-level changes* — who may publish, what registry/membership rule applies, what validation semantics gate acceptance, the topic's purpose → **topic name bump** (`cdn/global/v2`). Envelope-version evolution cannot express these because they alter the topic's trust contract; an old subscriber would accept messages under semantics it no longer enforces. The concrete change defines its own migration plan.
 
-This dichotomy is load-bearing: topic bumps are expensive (every node and validating client dual-subscribes for the full deprecation window) and unnecessary for payload-shape changes that two-phase deserialization absorbs. The default for any backwards-compatible message change MUST be envelope evolution; topic bumps are reserved for genuine trust-contract changes.
+This dichotomy is load-bearing: topic bumps require network coordination and are unnecessary for payload-shape changes that two-phase deserialization absorbs. The default for any backwards-compatible message change MUST be envelope evolution; topic bumps are reserved for genuine trust-contract changes.
 
 #### Gossip validation interaction
 
@@ -171,7 +171,7 @@ flowchart TD
 
     C --> F["Append to extensions struct.\nTwo-phase deserialization.\nOld peers ignore trailing bytes via take_from_bytes."]
     D --> G["Append enum variant.\nOld peers see unknown discriminant →\nclose stream or drop gossip message."]
-    E --> H["Bump ALPN: cdn/client/v2.\nQUIC TLS negotiation picks highest shared version."]
+    E --> H["Bump ALPN: cdn/client/v2.\nDefine migration with the breaking change."]
 ```
 
 #### Tier 1 — Minor (no coordination)
@@ -204,8 +204,7 @@ struct StreamRequestBase {
 #[derive(Serialize, Deserialize, Default)]
 struct StreamRequestExt {
     voucher_interval_mb: Option<u64>,
-    ethereum_address: Option<Address>,
-    binding_signature: Option<Bytes>,
+    binding: Option<ClientBinding>,
 }
 
 fn deserialize_stream_request(buf: &[u8]) -> Result<(StreamRequestBase, StreamRequestExt)> {
@@ -276,33 +275,7 @@ Messages without extensions (e.g., `VoucherAck`, `StreamEnd`, `ChunkData`) have 
 - New fields MUST NOT be included in any existing signature computation (see [Signed Field Freezing](#signed-field-freezing)).
 - The base struct is frozen at the protocol version that introduced it. Moving fields between base and extensions is a major change.
 
-This formalizes the pattern already used for `ethereum_address`, `binding_signature`, and `voucher_interval_mb` in `StreamRequest` ([ADR 005](005-protocol.md#adr-005-wire-protocol)) — no longer a one-time workaround but the standard minor evolution mechanism. The existing `Option<T>` fields with default semantics (`ethereum_address`/`binding_signature` with `#[serde(default)]`, `voucher_interval_mb` defaulting to 1 MB when absent) go in the extensions struct from the start, since the project is pre-implementation.
-
-##### Example — adding `supported_versions` to `NodeAnnounce`
-
-```rust
-#[derive(Serialize, Deserialize)]
-struct NodeAnnounceBody {
-    node_id: NodeId,
-    region: String,  // ISO 3166-1 alpha-2
-    timestamp_us: u64,
-}
-
-#[derive(Serialize, Deserialize, Default)]
-struct NodeAnnounceExt {
-    // Added via minor evolution
-    supported_versions: Option<Vec<String>>,
-}
-
-#[derive(Serialize, Deserialize)]
-struct NodeAnnounce {
-    body: NodeAnnounceBody,
-    signature: Bytes,
-    // Extensions follow — deserialized via two-phase pattern
-}
-```
-
-Old peers deserialize `NodeAnnounce` without extensions — `take_from_bytes` on body + signature succeeds with no remainder, and the receiver fills `NodeAnnounceExt::default()`. New peers receiving old `NodeAnnounce` messages see `supported_versions: None`. The signature covers only `NodeAnnounceBody`, so extensions are freely evolvable (see [Signed Field Freezing](#signed-field-freezing)).
+This formalizes the pattern used for `voucher_interval_mb` and the optional client identity `binding` in `StreamRequestExt` ([ADR 005](005-protocol.md#adr-005-wire-protocol)) as the standard minor evolution mechanism. The frozen `StreamRequest` base and its separately encoded trailing extensions implement the two-phase layout.
 
 #### Tier 2 — Medium (new message types, no ALPN bump)
 
@@ -342,8 +315,9 @@ Required for changes that cannot be handled by minor or medium evolution:
 - Adding a mandatory (non-optional) field
 - Modifying the set of signed fields
 - Changing the framing format itself
+- Bumping `GossipEnvelope.version` — old peers silently drop every message under the [Deserialization rule](#deserialization-rule) rather than degrading gracefully, so an envelope-format change is a break even though the topic name is unchanged
 
-The ALPN string is bumped: `cdn/client/v1` → `cdn/client/v2`. Version coexistence is handled by QUIC ALPN negotiation (see [ALPN Version Negotiation](#alpn-version-negotiation)).
+The ALPN string is bumped: `cdn/client/v1` → `cdn/client/v2`; for gossip, the topic name or the envelope version is bumped instead. This ADR does not prescribe version coexistence, selection, rollout, rollback, or retirement. The concrete breaking change requires a focused ADR that defines the migration against the runtime that exists at that time.
 
 ### Signed Field Freezing
 
@@ -378,64 +352,13 @@ struct NodeAnnounce {
     body: NodeAnnounceBody,
     signature: Bytes,
 }
-
-/// Extension fields — appended via Tier 1 minor evolution.
-#[derive(Serialize, Deserialize, Default)]
-struct NodeAnnounceExt {
-    supported_versions: Option<Vec<String>>,
-}
 ```
 
-This separates the frozen signed region from the evolvable unsigned region via two-phase deserialization (see [Tier 1](#tier-1--minor-no-coordination)). The same pattern applies to `ProbeResponse` and `StreamResponse`.
+Future unsigned extension fields trail `body + signature` and are decoded via two-phase deserialization (see [Tier 1](#tier-1--minor-no-coordination)). The same pattern applies to `ProbeResponse` and `StreamResponse`.
 
 #### Cross-ADR struct alignment
 
-The `Body` + extensions pattern and type definitions here are the canonical reference for implementation. Struct definitions in [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh), [ADR 005](005-protocol.md#adr-005-wire-protocol), and [ADR 008](008-reputation.md#adr-008-reputation-system) retain their flat-struct representations for readability; implementations MUST follow the body/extensions split defined here. Those flat-struct definitions will be updated when implementation begins.
-
-### ALPN Version Negotiation
-
-QUIC ALPN negotiation is built into TLS 1.3 (RFC 7301). The client proposes supported ALPNs in `ClientHello`; the server selects the highest mutually supported version.
-
-```mermaid
-sequenceDiagram
-    participant C as Client (supports v1, v2)
-    participant N as Node (supports v1, v2)
-
-    C->>N: QUIC ClientHello [cdn/client/v2, cdn/client/v1]
-    N->>C: ServerHello (selected: cdn/client/v2)
-    Note over C,N: Connection uses v2 protocol enum and message formats
-```
-
-```mermaid
-sequenceDiagram
-    participant C as Client (supports v1, v2)
-    participant N as Old Node (supports v1 only)
-
-    C->>N: QUIC ClientHello [cdn/client/v2, cdn/client/v1]
-    N->>C: ServerHello (selected: cdn/client/v1)
-    Note over C,N: Connection falls back to v1 — fully functional
-```
-
-**Convention:** Clients propose versions in descending order (newest first). The server selects the highest version it supports. If the server supports none of the proposed versions, the TLS handshake fails with `no_application_protocol` alert and the client falls back to the next candidate node from probe results.
-
-#### Multi-version support
-
-A node MUST support at least the current and previous major version simultaneously during a transition period (see [Deprecation Timeline](#deprecation-timeline)). Both versions run as independent protocol handlers on the same `iroh::Endpoint`, which supports registering multiple ALPN handlers — each runs independently with no in-process version translation.
-
-**Gossip has no ALPN negotiation.** Gossip evolution is handled entirely by the `GossipEnvelope` version field and the `GossipPayload` enum. Topic name version bumps are the gossip equivalent of a major ALPN bump and require dual-subscription during the transition period (nodes subscribe to both old and new topic names).
-
-### Deprecation Timeline
-
-| Milestone | Timeframe | Action |
-| --- | --- | --- |
-| New version released | T+0 | Nodes begin supporting both old and new versions |
-| Adoption target | T+4 weeks | All nodes SHOULD support the new version. Clients begin preferring the new version |
-| Old version removal | T+12 weeks | Old version support MAY be removed. Nodes that have not upgraded become unreachable by new clients |
-| Gossip topic removal | T+12 weeks | Old gossip topic subscriptions MAY be dropped. Peers on old topics become invisible |
-
-Deprecation schedules are announced via governance ([ADR 009](009-governance.md#adr-009-governance-model)). An on-chain `ProtocolVersions` registry contract is out of scope: off-chain governance announcement plus QUIC ALPN negotiation already covers the runtime path (clients try the newest version first, fall back on `no_application_protocol`). If a future scale or trust profile changes the calculus, the registry warrants its own ADR.
-
-> **See also:** [`appendix-operator-upgrade-path.md`](appendix-operator-upgrade-path.md#appendix-operator-protocol-upgrade-runbook) sequences the operator-side actions for each tier — Tier 1/2 checklists, the Tier 3 rolling-upgrade procedure, and client / governance coordination touchpoints.
+The `Body` + extensions pattern and type definitions here are the canonical implementation reference. Struct definitions in [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh), [ADR 005](005-protocol.md#adr-005-wire-protocol), and [ADR 008](008-reputation.md#adr-008-reputation-system) retain flat representations for readability; wire implementations MUST follow the body/extensions split defined here.
 
 ### Application Error Codes
 
@@ -461,13 +384,11 @@ Additional application error codes defined by other ADRs are unaffected. The cod
 
 - Formalizes the optional-trailing-fields pattern from [ADR 005](005-protocol.md#adr-005-wire-protocol) as a standard, repeatable mechanism — no longer a one-time workaround
 - Length-prefixed framing enables forward-compatible deserialization: receivers skip unknown trailing bytes without connection failure
-- Protocol enums give explicit, type-safe message discrimination on every ALPN, replacing [Appendix: Encrypted Content Publishing](appendix-encrypted-content-publishing.md#appendix-encrypted-content-publishing-on-decdn)'s ad-hoc 1-byte prefix with a uniform pattern
+- Protocol enums give explicit, type-safe message discrimination on every ALPN instead of ad-hoc discriminator bytes
 - The three-tier model provides a clear decision framework for every future protocol change
-- Gossip envelope provides schema evolution for messages lacking ALPN negotiation, filling the gap identified in [ADR 005](005-protocol.md#adr-005-wire-protocol)
-- ALPN negotiation is already supported by QUIC/TLS 1.3 and iroh — no custom handshake needed for major version transitions
+- The gossip envelope provides a format sentinel and safe unknown-payload handling for messages outside deCDN's ALPN-routed protocols
 - Signed field freezing makes implicit constraints explicit, preventing accidental signature-breaking changes
 - The signed body / unsigned outer fields pattern enables minor evolution of messages that currently sign all fields, without an ALPN bump
-- All conventions are defined before v1 implementation — no migration cost
 
 ### Negative
 
@@ -476,5 +397,4 @@ Additional application error codes defined by other ADRs are unaffected. The cod
 - Minor evolution can accumulate "dead weight" — added fields no longer useful, with no removal mechanism short of a major version bump. Unlikely to matter at this protocol's message sizes
 - Signed field freezing means even minor improvements to signed structs (e.g., adding a field to `ProbeResponse`'s signed set) require a full ALPN version bump. Conservative by design — the unsigned outer fields pattern mitigates this for fields that need not be signed
 - The `GossipEnvelope` wrapper adds 2–3 bytes (version byte + enum discriminant) per gossip message. For `NodeAnnounce` (~800 bytes), <0.4%
-- Multi-version support during deprecation requires nodes to maintain two protocol handler codepaths simultaneously, increasing code complexity during transitions. The 12-week deprecation window bounds this cost
-- Refactoring signed messages to the `Body` + outer fields pattern changes the struct layout relative to [ADR 005](005-protocol.md#adr-005-wire-protocol)'s current definitions. Pre-implementation, so a design change not a migration — but it MUST be reflected in the `protocol` crate's type definitions from day one
+- The signed `Body` + unsigned outer-fields split is more complex than the flat message sketches used in other ADRs; wire implementations must preserve the split

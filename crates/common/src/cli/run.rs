@@ -182,11 +182,6 @@ pub struct PaymentArgs {
     /// `ProbeResponse` (ADR 005 §Rate bounds validation) [default: 0].
     #[arg(long, value_name = "UNITS", env = "DECDN_DELIVERY_FLOOR")]
     pub delivery_floor: Option<u64>,
-
-    /// Upper bound `rate_per_mb` is clamped to before signing a
-    /// `ProbeResponse` [default: protocol `MAX_RATE_PER_MB`].
-    #[arg(long, value_name = "UNITS", env = "DECDN_DELIVERY_CEILING")]
-    pub delivery_ceiling: Option<u64>,
 }
 
 /// Observability settings (logging, metrics).

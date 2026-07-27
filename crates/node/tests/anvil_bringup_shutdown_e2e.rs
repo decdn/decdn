@@ -226,7 +226,6 @@ async fn run_deploy_script(
             .env("USDC_ADDRESS", usdc.to_string())
             .env("INITIAL_TOKEN_HOLDER", initial_token_holder.to_string())
             .env("EMERGENCY_MULTISIG", DEPLOYER_ADDR)
-            .env("CHALLENGER_INCENTIVE_POOL", DEPLOYER_ADDR)
             // ADR 019 § Terms Acceptance — DeployProtocol requires a non-zero
             // genesis terms hash (CapacityBond rejects the zero sentinel).
             .env(
@@ -320,7 +319,6 @@ fn build_config(
             bind_port: 0,
             relay_urls: Vec::new(),
             discovery: ResolvedDiscovery::default(),
-            enable_0rtt: true,
         },
         blockchain: ResolvedBlockchain {
             origin_assignment_address: None,
@@ -352,6 +350,7 @@ fn build_config(
             cache_dir,
             cache_size_mb: 1024,
             max_blob_size_mb: 128,
+            max_rate_per_mb: 0,
             origins: Vec::new(),
             pinned_hashes: decdn_cache::PinnedHashes::empty(),
             origin_retry: decdn_cache::RetryPolicy::default(),
@@ -382,7 +381,6 @@ fn build_config(
         payment: ResolvedPayment {
             rate_per_mb: 10,
             delivery_floor: 0,
-            delivery_ceiling: decdn_protocol::MAX_RATE_PER_MB,
             voucher_interval_mb: decdn_protocol::DEFAULT_VOUCHER_INTERVAL_MB,
         },
         observability: ResolvedObservability {
@@ -407,6 +405,7 @@ fn build_config(
             per_source_burst: 200,
             max_tracked_sources: 4096,
         },
+        content: decdn_common::config::ResolvedContent::default(),
         dht: ResolvedDht::default(),
         probe: ResolvedProbe::default(),
         receipts: ResolvedReceipts::default(),
@@ -530,7 +529,6 @@ async fn anvil_bringup_shutdown_runtime_graceful_drain() -> anyhow::Result<()> {
         PaymentArgs {
             rate_per_mb: None,
             delivery_floor: None,
-            delivery_ceiling: None,
         },
         ObservabilityArgs {
             log_level: None,

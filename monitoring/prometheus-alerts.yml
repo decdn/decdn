@@ -16,25 +16,38 @@
 groups:
   # ---------------------------------------------------------------
   # Slash-safety — copied from appendix-observability §2.1.
-  # A sustained alert here means the operator is at slash risk.
+  # A sustained alert here means the operator is at slash risk, with one
+  # deliberate exception: DecdnProbeHoldViolations is grouped here because it
+  # is a probe-hold capacity metric, but it signals lost revenue rather than
+  # slash exposure (see its annotation and appendix-observability §Slash-Safety
+  # Metrics). Carries no slash_risk label for that reason.
   # ---------------------------------------------------------------
   - name: decdn-slash-safety
     interval: 30s
     rules:
       - alert: DecdnProbeHoldViolations
-        expr: rate(decdn_probe_hold_violations_total[5m]) > 0
+        expr: rate(decdn_probe_hold_unavailable_total{reason="exhausted"}[5m]) > 0
         for: 5m
         labels:
           severity: critical
-          slash_risk: phantom_announcement
         annotations:
-          summary: "Phantom-announcement slash risk on {{ $labels.instance }}"
+          summary: "Probe-hold budget exhausted on {{ $labels.instance }}"
           description: |
-            decdn_probe_hold_violations_total has been incrementing for 5m on
-            {{ $labels.instance }}. Each increment is a blob evicted within
-            probe_hold_duration after signing has_blob: true — valid phantom
-            slash evidence. Reduce load or raise max_probe_holds; investigate
-            OOM. See adr/005-protocol.md#probe-triggered-eviction-hold.
+            decdn_probe_hold_unavailable_total{reason="exhausted"} has been
+            incrementing for 5m on {{ $labels.instance }}. Each increment is a
+            blob that IS present but could not be held because every probe-hold
+            slot was live, so the node answered has_blob: false and forwent the
+            delivery. This is lost
+            revenue under budget pressure, not slash evidence — a held hash is
+            invisible to the LRU driver, so the "evicted after signing
+            has_blob: true" case is unreachable by construction. Reduce load or
+            raise max_probe_holds; investigate OOM. The reason filter is
+            load-bearing: reason="disabled" (max_probe_holds=0) and
+            reason="stake_lane_reserved" are deliberate operator decisions and
+            must not fire this alert. Note max_probe_holds is
+            restart-required — editing it and reloading logs "requires restart"
+            and changes nothing. See
+            adr/005-protocol.md#probe-triggered-eviction-hold.
 
       - alert: DecdnBlacklistSyncLagWarning
         expr: decdn_blacklist_sync_lag_seconds > 600
@@ -136,11 +149,15 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: "rate_per_mb being clamped to governance bounds on {{ $labels.instance }}"
+          summary: "rate_per_mb being raised to the delivery floor on {{ $labels.instance }}"
           description: |
-            The configured rate_per_mb is outside the current governance
-            window and is being clamped before signing ProbeResponse.
-            Update operator config to within bounds.
+            The configured rate_per_mb sits BELOW the governance deliveryFloor,
+            so every quote is being raised to the floor before signing a
+            ProbeResponse or StreamResponse. The clamp is raise-only — there is
+            no governance ceiling — so this never lowers your rate; it means you
+            are not charging what you configured. Raise payment.rate_per_mb to
+            at least the on-chain floor (hot-reloadable via SIGHUP).
+            See adr/003-payments.md#rate-bounds-refresh.
 
       - alert: DecdnSlashEvidenceExposure
         expr: rate(decdn_slash_evidence_exposure_total[5m]) > 0
@@ -315,8 +332,10 @@ groups:
           summary: "Probe-hold slots >90% used on {{ $labels.instance }}"
           description: |
             Saturation forces has_blob: false answers for cached content,
-            losing revenue. Increase max_probe_holds proportional to cache
-            size (recommended: ≥25% of cache capacity).
+            losing revenue. Raise max_probe_holds — on a small cache keep it
+            proportional to cache size (recommended: no more than 25% of cache
+            capacity); a production node serving many peers should scale the
+            default up instead. max_probe_holds is restart-required.
 
       # Chain-event watcher liveness (#1316) for the payment-settlement watcher
       # — staleness of its last successful poll tick. 180s ≈ several poll

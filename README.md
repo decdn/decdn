@@ -67,7 +67,7 @@ Architecture decision records live in [`adr/`](adr/), with [`adr/architecture.md
 - **Content addressing:** BLAKE3 hashes; clients verify on receipt
 - **Dual currency:** USDC for payments, TOKEN for staking/governance
 - **No exposed origins:** Origin backends (S3/R2/B2) are opaque per-node config
-- **Encryption-agnostic protocol:** the CDN shuttles bytes; ciphertext vs plaintext is the publisher's choice. An optional [encrypted-content publishing](adr/appendix-encrypted-content-publishing.md) appendix documents one deployment pattern (companion app server, epoch-rotated keys).
+- **Encryption-agnostic protocol:** publishers may encrypt content before upload; the CDN content-addresses and delivers the resulting bytes, while key distribution stays outside the protocol ([ADR 002](adr/002-content-addressing.md#adr-002-content-addressing)).
 - **Stale-close defense:** in-process dispute monitor + permissionless `disputeChannel` submission; optional [fraud-detection layer](adr/appendix-fraud-detection.md) anyone can run for `SlashJudge`-bonded challenges
 - **Discovery:** `cdn/dht/v1` Kademlia DHT for content discovery from PoC onward; broadcast probe fan-out as bootstrap fallback
 - **Reputation:** Interaction-weighted scoring ([ADR 008](adr/008-reputation.md)); local per-peer EWMA today, gossip aggregation deferred
@@ -77,7 +77,6 @@ Architecture decision records live in [`adr/`](adr/), with [`adr/architecture.md
 - **Client architecture:** Lightweight QUIC endpoints; gossip subscribe (no publish); registry bootstrap with fallback; per-connection ephemeral identity binding
 - **Schema evolution:** Varint-length framing, protocol enums, three-tier evolution model (minor/medium/major)
 - **On-chain verification:** Single secp256k1 EIP-712 slash signature (`slash_sig`) per message with optimistic challenge-response; the Ed25519 NodeId is connection identity only, authenticated separately by the QUIC handshake
-- **0-RTT probing:** QUIC 0-RTT for `cdn/probe/v1` repeat connections, eliminating TLS handshake round trip
 - **Liquidity:** Protocol-owned liquidity via Balancer V3 80/20 TOKEN/USDC weighted pool
 - **Production L2:** Arbitrum One for all on-chain contracts (PoC on Arbitrum Sepolia)
 

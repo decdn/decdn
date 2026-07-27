@@ -17,10 +17,14 @@ pub const MAX_PROVIDER_ATTEMPTS: usize = 3;
 
 /// Per-candidate probe timeout. Because candidates are probed concurrently, this also
 /// bounds the whole probe-collection phase. The budget covers connection setup plus one
-/// unpaid probe request/response; warm or 0-RTT connections (ADR 015) complete in a single
-/// round trip, so the 500 ms ceiling accommodates inter-continental RTTs while still
-/// dropping a slow or unreachable candidate before it burns the caller's miss-latency
-/// budget (ADR 001 § Probe response collection).
+/// unpaid probe request/response. `probe_once` dials a fresh connection every call, and
+/// since 0-RTT was removed (#1429) even a resumable session still pays a handshake round
+/// trip before the request goes out — so every probe costs two RTTs, not one. Against the
+/// 250-300 ms inter-continental figure in ADR 015's context, that puts the furthest
+/// candidates at or past this ceiling. Dropping them is the intended trade (a slow
+/// candidate must not burn the caller's miss-latency budget, ADR 001 § Probe response
+/// collection), but this is the first term to revisit if distant-region selection looks
+/// too sparse.
 ///
 /// Lives here, beside the deadline arithmetic that has to budget for it, rather than in
 /// `node_origin` where it is used (#1145 review). Every term of [`outer_pull_deadline`] is
@@ -140,18 +144,11 @@ pub fn outer_pull_deadline(per_candidate: Duration, stall: Duration) -> Duration
 /// Reputation floor in the score denominator (ADR 001).
 const REPUTATION_FLOOR: f32 = 0.1;
 
-/// Default minimum-reputation rejection floor (issue #441). At this value —
-/// and at any non-positive value, since reputation is domain `[0.0, 1.0]` —
-/// filtering is disabled: every candidate is ranked, preserving pre-#441
-/// semantics including the defensive negative-reputation clamp in
-/// `compute_score`.
-///
-/// This is distinct from `REPUTATION_FLOOR`: that only clamps the score
-/// *denominator* (capping the worst-case multiplier at 100×), whereas this is
-/// a hard pre-filter that removes sub-floor candidates outright so price and
-/// RTT can never override a poor reputation (ADR 001 §Node Selection
-/// Algorithm).
-pub const DEFAULT_MIN_REPUTATION: f32 = 0.0;
+/// Reputation ceiling in the score denominator — the top of
+/// [`Candidate::reputation`]'s documented domain (#1458). Named rather than
+/// written inline so the code, the doc prose, and the tests that pin it move
+/// together, the way [`REPUTATION_FLOOR`] already does.
+const REPUTATION_CEILING: f32 = 1.0;
 
 /// Score-equivalence threshold for tie-break activation (ADR 001 — "scores
 /// within 1% of each other").
@@ -175,6 +172,14 @@ pub struct Candidate {
     /// On-chain stake in TOKEN base units. `None` until on-chain stake
     /// lookup is wired (out of scope for issue #322); when populated,
     /// higher stake wins the stake tie-break tier.
+    ///
+    /// The `Option` carries two distinct meanings, and the tie-break relies
+    /// on the distinction: `Some(0)` is *known* to hold no bond, `None` has
+    /// *not been looked up*. Unknown loses to every known value, `Some(0)`
+    /// included — see the tier 2 comment in `pick_best_in_group`. A lookup that
+    /// errors must therefore not fall back to `None`; decide the failure
+    /// policy at the lookup layer, where the distinction is still visible
+    /// (#1470).
     pub stake: Option<u64>,
 }
 
@@ -187,10 +192,20 @@ pub struct RankedCandidate {
 
 /// Compute the unified selection score (ADR 001). Lower is better.
 ///
-/// `score = rate_per_mb × rtt_ms × (1 / max(reputation, 0.1)²)`
+/// `score = rate_per_mb × rtt_ms × (1 / clamp(reputation, 0.1, 1.0)²)`
 ///
-/// Reputation is clamped to [`REPUTATION_FLOOR`] before squaring; this both
-/// prevents division by zero and caps the worst-case multiplier at 100×.
+/// ADR 001 § Node Selection Algorithm states the denominator as
+/// `max(reputation, 0.1)`; the upper bound here is a defensive extension
+/// (#1458), a no-op for any input inside the ADR's `[0.0, 1.0]` domain.
+///
+/// Reputation is clamped between [`REPUTATION_FLOOR`] and
+/// [`REPUTATION_CEILING`] before squaring — both ends, and both ends matter.
+/// The floor prevents division by zero and caps the worst-case penalty
+/// multiplier at 100×; the ceiling stops an out-of-domain value from buying an
+/// unearned *bonus*. Without it, `reputation = 10.0` divides the score by 100
+/// and outranks a perfect-reputation peer by 100×, and `f32::INFINITY` yields
+/// score `0.0` — which [`tie_group_end`] treats as a tie group of one, so it
+/// takes the top slot outright, beyond the reach of every tie-break tier.
 #[allow(clippy::cast_precision_loss)]
 // f64 has 53-bit mantissa; ULP-level imprecision on huge u64 rates does not
 // affect ordering decisions here.
@@ -200,7 +215,16 @@ fn compute_score(rate_per_mb: u64, rtt_ms: u32, reputation: f32) -> f64 {
     // Clamp in f32 (input's domain), then promote once for the f64 score
     // arithmetic. Promoting first would let `f32(0.1)` slip just above the
     // floor (it rounds to ~0.10000000149f64), an unintuitive boundary.
-    let rep = f64::from(reputation.max(REPUTATION_FLOOR));
+    //
+    // `.max().min()` rather than `.clamp(..)`, and floor FIRST: `f32::max` and
+    // `f32::min` are documented to ignore NaN and return the other operand, so
+    // a NaN reputation lands on the floor. `f32::clamp` propagates NaN instead,
+    // and `.min()` first would send NaN to the CEILING — either way a garbage
+    // reputation becomes a perfect peer. Hence the waiver below: taking clippy's
+    // `manual_clamp` suggestion would turn a NaN-total function into a
+    // NaN-propagating one and fail `score_nan_reputation_clamps_to_floor`.
+    #[allow(clippy::manual_clamp)]
+    let rep = f64::from(reputation.max(REPUTATION_FLOOR).min(REPUTATION_CEILING));
     rate * rtt / (rep * rep)
 }
 
@@ -211,53 +235,8 @@ fn compute_score(rate_per_mb: u64, rtt_ms: u32, reputation: f32) -> f64 {
 /// thread-local RNG; tests inside this module use the private
 /// `rank_candidates_with_rng` variant for determinism.
 pub fn rank_candidates(candidates: Vec<Candidate>) -> Vec<RankedCandidate> {
-    rank_candidates_with_floor(candidates, DEFAULT_MIN_REPUTATION)
-}
-
-/// Drop candidates whose reputation is below `min_reputation` (issue #441).
-///
-/// Applied *before* scoring so a cheap, low-latency node can never win on
-/// price when its reputation is below the client's floor. Any non-positive
-/// `min_reputation` (the default `0.0` ([`DEFAULT_MIN_REPUTATION`]), or an
-/// out-of-domain negative) disables filtering entirely — no candidate is
-/// removed, preserving pre-#441 ranking semantics including the defensive
-/// negative-reputation clamp in [`compute_score`]. The boundary is inclusive
-/// (`reputation >= min_reputation`): a node exactly at the floor is kept. With
-/// an active floor the comparison alone decides membership, so a `NaN`
-/// reputation is rejected (any `NaN` comparison is false) while `+∞` would be
-/// kept; symmetrically a `NaN` *floor* is fail-closed (drops every
-/// candidate). Non-finite values cannot reach this from config today —
-/// per-client wiring is deferred (issue #441).
-fn apply_reputation_floor(candidates: Vec<Candidate>, min_reputation: f32) -> Vec<Candidate> {
-    if min_reputation <= 0.0 {
-        return candidates;
-    }
-    candidates
-        .into_iter()
-        .filter(|c| c.reputation >= min_reputation)
-        .collect()
-}
-
-/// [`rank_candidates`] with a configurable minimum-reputation rejection floor
-/// (issue #441). Candidates below `min_reputation` are removed before ranking;
-/// `0.0` disables the floor. See `apply_reputation_floor` for the exact
-/// boundary semantics.
-pub fn rank_candidates_with_floor(
-    candidates: Vec<Candidate>,
-    min_reputation: f32,
-) -> Vec<RankedCandidate> {
     let mut rng = rand::rng();
-    rank_candidates_with_floor_and_rng(candidates, min_reputation, &mut rng)
-}
-
-/// Floor-filtering variant taking an explicit RNG. Internal — used by tests
-/// for deterministic random tie-breaking on the surviving candidates.
-fn rank_candidates_with_floor_and_rng(
-    candidates: Vec<Candidate>,
-    min_reputation: f32,
-    rng: &mut impl rand::Rng,
-) -> Vec<RankedCandidate> {
-    rank_candidates_with_rng(apply_reputation_floor(candidates, min_reputation), rng)
+    rank_candidates_with_rng(candidates, &mut rng)
 }
 
 /// Variant of [`rank_candidates`] taking an explicit RNG. Internal — used by
@@ -377,10 +356,21 @@ fn pick_best_in_group(
         });
     }
 
-    // Tier 2: higher stake wins. `None` is treated as the lowest possible
-    // stake (since on-chain integration is deferred — see ADR 001 "Contract
+    // Tier 2: higher stake wins, and an *unknown* stake ranks below every
+    // known one — including `Some(0)`. `filter_map` drops `None` before
+    // `max`, so a provably-zero-stake node outranks an unlooked-up one.
+    // That is deliberate, not an accident of the combinator: `Some(0)` means
+    // "queried, holds no bond"; `None` means "not queried yet". Pinned by
+    // `some_stake_beats_none_stake`, `some_zero_stake_beats_none_stake`, and
+    // `three_way_zero_stake_falls_through_to_random_tier` below.
+    //
+    // The tier is a uniform no-op today — every construction site passes
+    // `None` (on-chain integration is deferred; see ADR 001 "Contract
     // Interface: Node Registry" / ADR 019 for the capacity-bond interface
-    // that will populate `Candidate.stake`).
+    // that will populate `Candidate.stake`). When that lookup lands, a
+    // *failed* read must not be encoded as `None` alongside successful ones,
+    // or one flaky RPC call silently sinks a well-staked peer below a
+    // zero-stake one. Resolve the failure at the lookup layer (#1470).
     let max_stake = pool
         .iter()
         .filter_map(|i| group.get(*i).and_then(|r| r.candidate.stake))
@@ -443,22 +433,15 @@ fn tie_group_end(ranked: &[RankedCandidate], start: usize) -> usize {
 /// ranked candidates, where the caller will iterate them in order and stop
 /// after the first successful pull.
 ///
-/// For the standard fetch path use `n = MAX_PROVIDER_ATTEMPTS`. The function
-/// returns fewer than `n` results when the candidate pool is smaller.
+/// Returns fewer than `n` results when the candidate pool is smaller.
+///
+/// Note this is **not** how the node's pull path bounds its work:
+/// [`MAX_PROVIDER_ATTEMPTS`] is a fetch-wide budget spent across every
+/// candidate list a fetch consults, not a per-list cap (#1165), so
+/// `node_origin`'s ranker deliberately does not truncate. Do not reach for
+/// `top_n(candidates, MAX_PROVIDER_ATTEMPTS)` on that path.
 pub fn top_n(candidates: Vec<Candidate>, n: usize) -> Vec<RankedCandidate> {
-    top_n_with_floor(candidates, n, DEFAULT_MIN_REPUTATION)
-}
-
-/// [`top_n`] with a configurable minimum-reputation rejection floor (issue
-/// #441). The floor is applied first, then the survivors are ranked and
-/// truncated to `n` — so `n` bounds the *reputable* result set, not the raw
-/// candidate pool.
-pub fn top_n_with_floor(
-    candidates: Vec<Candidate>,
-    n: usize,
-    min_reputation: f32,
-) -> Vec<RankedCandidate> {
-    let mut ranked = rank_candidates_with_floor(candidates, min_reputation);
+    let mut ranked = rank_candidates(candidates);
     ranked.truncate(n);
     ranked
 }
@@ -618,11 +601,74 @@ mod tests {
 
     #[test]
     fn score_negative_reputation_clamps_to_floor() {
-        // Defensive: ReputationEngine::score() returns f32 in [0,1], but if a
-        // bug produces a negative we must still not panic and must clamp.
+        // Defensive: LocalReputation::score() is in [0,1] by construction, but
+        // if a bug produces a negative we must still not panic and must clamp.
         let s = compute_score(100, 10, -0.5);
         let at_floor = compute_score(100, 10, 0.1);
         assert!((s - at_floor).abs() < 1e-9);
+    }
+
+    #[test]
+    fn score_nan_reputation_clamps_to_floor() {
+        // Defensive, and load-bearing on a subtle IEEE detail: `f32::max`
+        // implements `maxNum`, which *ignores* NaN and returns the other
+        // operand — so `NaN.max(0.1)` is `0.1` and no NaN can reach the
+        // score. That matters because a NaN score would sort last under
+        // `total_cmp` and then be swept into the preceding tie group by
+        // `tie_group_end` (`next > pivot` is false for NaN), letting a
+        // garbage candidate win a tie-break tier. Note `f32::clamp` does
+        // NOT have this property — it propagates NaN — so a future
+        // "cleanup" to `.clamp(REPUTATION_FLOOR, 1.0)` would silently
+        // reintroduce the hazard. This test is what catches that.
+        let s = compute_score(100, 10, f32::NAN);
+        let at_floor = compute_score(100, 10, 0.1);
+        assert!(s.is_finite(), "NaN reputation must not produce a NaN score");
+        assert!((s - at_floor).abs() < 1e-9);
+    }
+
+    #[test]
+    fn score_reputation_above_1_0_clamps_to_ceiling() {
+        // Defensive, and the mirror of the floor clamp (#1458). `Candidate.
+        // reputation` is documented as `[0.0, 1.0]`, but the field is a plain
+        // `f32` — the domain is a convention, not a type. Today's only producer
+        // (`peer_reputation` → `LocalReputation::score`) is in-range by
+        // construction; a future one need not be, and without the ceiling an
+        // out-of-domain value buys rank instead of losing it.
+        let baseline = compute_score(100, 10, 1.0);
+        let above = compute_score(100, 10, 10.0);
+        assert!((above - baseline).abs() < 1e-9, "got {above} vs {baseline}");
+    }
+
+    #[test]
+    fn score_reputation_one_ulp_above_domain_clamps_to_ceiling() {
+        // `f32::EPSILON` is exactly one ULP at 1.0, so unclamped this scores
+        // ~999.99976 — outside the 1e-9 tolerance. Pins the ceiling as exact at
+        // 1.0 with no tolerance band, which a sloppier guard (`if rep > 2.0`)
+        // would not give.
+        let baseline = compute_score(100, 10, 1.0);
+        let above = compute_score(100, 10, 1.0 + f32::EPSILON);
+        assert!((above - baseline).abs() < 1e-9, "got {above} vs {baseline}");
+    }
+
+    #[test]
+    fn score_infinite_reputation_clamps_to_ceiling() {
+        // The degenerate end of the same hole: `INFINITY` squared is
+        // `INFINITY`, so an unclamped score is `x / inf` = `0.0` — the minimum
+        // achievable score, which sorts first under `total_cmp` AND which
+        // `tie_group_end` gives a group of its own (the `pivot == 0.0` branch),
+        // so no tie-break tier can dislodge it. Clamped, it must be
+        // indistinguishable from a perfect-reputation candidate.
+        let baseline = compute_score(100, 10, 1.0);
+        let s = compute_score(100, 10, f32::INFINITY);
+        // Note `is_finite` alone would NOT have caught the bug — `0.0` is
+        // finite. It guards a future impl that yields NaN; `s > 0.0` is what
+        // fails against the unclamped version.
+        assert!(s.is_finite(), "got {s}");
+        assert!(
+            s > 0.0,
+            "infinite reputation must not score 0.0 and sort first"
+        );
+        assert!((s - baseline).abs() < 1e-9, "got {s} vs {baseline}");
     }
 
     #[test]
@@ -1032,34 +1078,12 @@ mod tests {
         );
     }
 
-    // --- Minimum-reputation rejection floor (issue #441) ---
-
     #[test]
-    fn floor_drops_cheapest_subfloor_node() {
-        // `bad` has the lowest raw score by far (rate 1, rtt 1) but a poor
-        // reputation; `good` is expensive/slow but reputable. Without a floor
-        // `bad` wins on price; with a 0.5 floor it must be rejected outright.
-        let bad = make_candidate(1, 1, 1, 0.1);
-        let good = make_candidate(2, 100, 10, 0.9);
-
-        let unfiltered = rank_candidates(vec![bad.clone(), good.clone()]);
-        assert_eq!(
-            unfiltered.first().map(|r| r.candidate.node_id[0]),
-            Some(1),
-            "without a floor the cheap low-rep node wins"
-        );
-
-        let filtered = rank_candidates_with_floor(vec![bad, good], 0.5);
-        let ids: Vec<u8> = filtered.iter().map(|r| r.candidate.node_id[0]).collect();
-        assert_eq!(ids, vec![2], "sub-floor node must be dropped entirely");
-    }
-
-    #[test]
-    fn default_rank_candidates_preserves_negative_reputation() {
-        // Default path (DEFAULT_MIN_REPUTATION == 0.0) disables filtering, so
-        // the pre-#441 defensive negative-reputation clamp behavior is intact:
-        // the candidate is still ranked, not dropped.
-        assert_eq!(DEFAULT_MIN_REPUTATION, 0.0);
+    fn rank_candidates_keeps_negative_reputation_candidate() {
+        // Reputation is a graded weight, never a veto (ADR 001): a candidate
+        // is only ever penalized by the `compute_score` clamp, never removed
+        // from the pool. `score_negative_reputation_clamps_to_floor` covers
+        // the clamp itself; this pins the list-membership half.
         let neg = make_candidate(1, 100, 10, -0.5);
         let out = rank_candidates(vec![neg]);
         assert_eq!(out.len(), 1);
@@ -1067,139 +1091,21 @@ mod tests {
     }
 
     #[test]
-    fn floor_boundary_is_inclusive() {
-        // reputation exactly at the floor is kept (>=).
-        let at = make_candidate(1, 100, 10, 0.5);
-        let out = rank_candidates_with_floor(vec![at], 0.5);
-        assert_eq!(out.len(), 1);
-        assert_eq!(out.first().map(|r| r.candidate.node_id[0]), Some(1));
-    }
-
-    #[test]
-    fn floor_drops_just_below() {
-        let below = make_candidate(1, 100, 10, 0.49);
-        let out = rank_candidates_with_floor(vec![below], 0.5);
-        assert!(out.is_empty());
-    }
-
-    #[test]
-    fn floor_all_below_returns_empty() {
-        let a = make_candidate(1, 100, 10, 0.1);
-        let b = make_candidate(2, 100, 10, 0.2);
-        assert!(rank_candidates_with_floor(vec![a.clone(), b.clone()], 0.5).is_empty());
-        assert!(top_n_with_floor(vec![a, b], MAX_PROVIDER_ATTEMPTS, 0.5).is_empty());
-    }
-
-    #[test]
-    fn floor_rejects_nan_reputation() {
-        // A NaN reputation is unusable; an active floor must reject it
-        // (NaN >= x is false).
-        let nan_rep = make_candidate(1, 100, 10, f32::NAN);
-        let out = rank_candidates_with_floor(vec![nan_rep], 0.5);
-        assert!(out.is_empty());
-    }
-
-    #[test]
-    fn top_n_with_floor_truncates_after_filtering() {
-        // Five reputable candidates plus two sub-floor ones; n = 3 must yield
-        // exactly the three lowest-score reputable candidates. Rates double
-        // each step so scores are >1% apart — no within-tie random reordering,
-        // making the survivor order deterministic.
-        let mut cs: Vec<Candidate> = (0..5)
-            .map(|i| make_candidate(i, 100u64 << i, 10, 0.9))
-            .collect();
-        cs.push(make_candidate(10, 1, 1, 0.1));
-        cs.push(make_candidate(11, 2, 1, 0.2));
-        let out = top_n_with_floor(cs, 3, 0.5);
-        let ids: Vec<u8> = out.iter().map(|r| r.candidate.node_id[0]).collect();
-        assert_eq!(ids, vec![0, 1, 2]);
-    }
-
-    #[test]
-    fn floor_preserves_survivor_ordering() {
-        // Among survivors the usual ascending-score order still holds.
-        let cheap = make_candidate(1, 1, 10, 0.9); // score ~12.3
-        let mid = make_candidate(2, 10, 10, 0.9); // score ~123
-        let subfloor = make_candidate(3, 1, 1, 0.1); // cheapest raw, dropped
-        let out = rank_candidates_with_floor(vec![mid, subfloor, cheap], 0.5);
-        let ids: Vec<u8> = out.iter().map(|r| r.candidate.node_id[0]).collect();
-        assert_eq!(ids, vec![1, 2]);
-    }
-
-    #[test]
-    fn negative_floor_disables_filtering_like_zero() {
-        // Pins the `min_reputation <= 0.0` disable branch for the negative
-        // case. Two assertions, two distinct paths:
-        //   - disabled path (floor -0.5): out-of-domain negative behaves like
-        //     the `0.0` default — no filtering, so even the sub-zero-reputation
-        //     candidate is retained.
-        //   - active path (floor 0.5): the same sub-floor candidate IS dropped.
-        // Together they guard against a future `== 0.0` / `< 0.0` guard
-        // regression that would conflate the two.
-        let poor = make_candidate(1, 100, 10, -0.5);
-        let good = make_candidate(2, 100, 10, 0.9);
-
-        let disabled = rank_candidates_with_floor(vec![poor.clone(), good.clone()], -0.5);
-        let mut ids: Vec<u8> = disabled.iter().map(|r| r.candidate.node_id[0]).collect();
-        ids.sort_unstable();
-        assert_eq!(ids, vec![1, 2], "negative floor must keep every candidate");
-
-        let active = rank_candidates_with_floor(vec![poor, good], 0.5);
-        let ids: Vec<u8> = active.iter().map(|r| r.candidate.node_id[0]).collect();
-        assert_eq!(
-            ids,
-            vec![2],
-            "an active floor still drops the sub-floor node"
-        );
-    }
-
-    #[test]
-    fn floor_then_tiebreak_runs_deterministically() {
-        // Covers `rank_candidates_with_floor_and_rng` directly and the
-        // floor↔tie-break interaction: after the sub-floor node is removed,
-        // two fully score-tied survivors must still flow through the
-        // three-tier breaker. They differ only by stake, so the stake tier
-        // decides deterministically (independent of the RNG seed) — the
-        // higher-stake node ranks first and the sub-floor node is absent,
-        // for every seed.
-        let poor = with_stake(make_candidate(1, 100, 10, 0.9), Some(1_000));
-        let rich = with_stake(make_candidate(2, 100, 10, 0.9), Some(10_000));
-        let subfloor = make_candidate(3, 1, 1, 0.1); // cheapest raw, below floor
-        for seed in 0u64..8 {
-            let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-            let out = rank_candidates_with_floor_and_rng(
-                vec![poor.clone(), subfloor.clone(), rich.clone()],
-                0.5,
-                &mut rng,
-            );
-            let ids: Vec<u8> = out.iter().map(|r| r.candidate.node_id[0]).collect();
-            assert_eq!(
-                ids,
-                vec![2, 1],
-                "seed {seed}: floor drops #3, stake tier orders #2<#1"
-            );
-        }
-    }
-
-    #[test]
-    fn floor_above_domain_rejects_all() {
-        // Documented contract: a floor above the [0.0, 1.0] reputation domain
-        // rejects every candidate, including a perfectly-reputable one.
-        let perfect = make_candidate(1, 100, 10, 1.0);
-        assert!(rank_candidates_with_floor(vec![perfect], 1.5).is_empty());
-    }
-
-    #[test]
-    fn nan_floor_is_fail_closed() {
-        // A `NaN` floor must drop every candidate, not silently disable
-        // filtering. This relies on two subtle facts: `NaN <= 0.0` is false
-        // (so the disable early-return is skipped) and `reputation >= NaN` is
-        // false for all reputations (so the filter retains nothing). Pins the
-        // documented fail-closed contract against a future guard change (e.g.
-        // `min_reputation <= 0.0 || min_reputation.is_nan()`) that would flip
-        // a malformed floor into disabled filtering.
-        let perfect = make_candidate(1, 100, 10, 1.0);
-        let neutral = make_candidate(2, 100, 10, 0.5);
-        assert!(rank_candidates_with_floor(vec![perfect, neutral], f32::NAN).is_empty());
+    fn rank_candidates_denies_out_of_domain_reputation_the_top_slot() {
+        // The list-membership/ordering half of the ceiling clamp (#1458), the
+        // mirror of `rank_candidates_keeps_negative_reputation_candidate`
+        // above. `score_infinite_reputation_clamps_to_ceiling` covers the
+        // arithmetic; this covers what no `compute_score` test can reach —
+        // pre-clamp, rep = INFINITY scored 0.0, which `total_cmp` sorts first
+        // and `tie_group_end` then hands a tie group of its own, so the bogus
+        // candidate took the top slot outright. Post-clamp it is scored on its
+        // price and latency like anyone else: 1000 vs the honest peer's 500,
+        // far outside TIE_THRESHOLD, so the order is deterministic and the
+        // random tie-break tier never runs.
+        let bogus = make_candidate(1, 100, 10, f32::INFINITY);
+        let honest = make_candidate(2, 50, 10, 1.0);
+        let out = rank_candidates(vec![bogus, honest]);
+        assert_eq!(out.len(), 2, "reputation is a weight, never a veto");
+        assert_eq!(out.first().map(|r| r.candidate.node_id[0]), Some(2));
     }
 }

@@ -94,6 +94,12 @@ const CI_TIMEOUT_MULTIPLIER: u32 = 2;
 /// Linear backoff between deploy retries (`n * attempt`), giving a transient
 /// runner-contention spike time to clear before the next forge process spawns.
 const DEPLOY_RETRY_BACKOFF: Duration = Duration::from_secs(3);
+/// How many times to drop anvil's pool while waiting for it to stay empty, and
+/// how long to let stragglers land between drops. `kill_on_drop` SIGKILLs the
+/// stalled forge but cannot unsend the transactions it already wrote to the
+/// socket, so the pool has to be observed quiet, not merely dropped once.
+const POOL_DRAIN_POLLS: usize = 5;
+const POOL_DRAIN_SETTLE: Duration = Duration::from_millis(250);
 /// Re-pick the ephemeral port and re-spawn anvil this many times when it dies at
 /// startup (the `free_port` TOCTOU: another process claimed the port first).
 const ANVIL_ATTEMPTS: usize = 3;
@@ -1627,14 +1633,14 @@ async fn deploy_mock_usdc<P: Provider>(provider: &P, contracts: &Path) -> anyhow
 /// two transient failure classes (stall #785, broadcast-phase non-zero exit
 /// #883) and failing fast on a deterministic revert.
 ///
-/// Between retries the chain is reverted to a snapshot taken *before* the first
-/// attempt. This is load-bearing: a stalled `--broadcast` run is SIGKILLed
-/// mid-flight, having already advanced deployer dev-#0's nonce and mined a
-/// partial deploy, so a naive re-run re-broadcasts the same nonces and dies with
-/// `-32003 replacement transaction underpriced`. The revert rolls that back to a
-/// clean nonce. It's safe because anvil auto-mines (no killed tx lingers in the
-/// mempool) and mock USDC was deployed *before* the snapshot, so it survives the
-/// revert. `admin` (anvil dev #1) sends no tx between the snapshot and the loop.
+/// Between retries the broadcast lane is reset: anvil's pool is drained and the
+/// chain reverted to a snapshot taken *before* the first attempt. This is
+/// load-bearing: a stalled `--broadcast` run is SIGKILLed mid-flight, having
+/// already advanced deployer dev-#0's nonce and mined a partial deploy, so a
+/// naive re-run re-broadcasts the same nonces and dies with `-32003 replacement
+/// transaction underpriced`. Mock USDC is deployed *before* the snapshot, so it
+/// survives the revert, and `admin` (anvil dev #1) sends no tx between the
+/// snapshot and the loop.
 async fn run_deploy_script(
     admin: &DynProvider,
     contracts: &Path,
@@ -1660,7 +1666,6 @@ async fn run_deploy_script(
             .env("USDC_ADDRESS", usdc.to_string())
             .env("INITIAL_TOKEN_HOLDER", initial_token_holder.to_string())
             .env("EMERGENCY_MULTISIG", DEPLOYER_ADDR)
-            .env("CHALLENGER_INCENTIVE_POOL", DEPLOYER_ADDR)
             // ADR 019 § Terms Acceptance — DeployProtocol.s.sol requires a
             // non-zero genesis terms hash (CapacityBond rejects the zero
             // sentinel); registration reads it back from the contract.
@@ -1711,10 +1716,84 @@ async fn run_deploy_script(
         // either returned, bailed, or warned). Roll the killed attempt's partial
         // deploy back to a clean deployer nonce, then let a transient contention
         // spike on the shared runner clear before spawning the next forge.
-        snapshot = evm_revert_and_snapshot(admin, snapshot).await?;
+        snapshot = reset_broadcast_lane(admin, snapshot).await?;
         tokio::time::sleep(DEPLOY_RETRY_BACKOFF * u32::try_from(attempt).unwrap_or(u32::MAX)).await;
     }
     anyhow::bail!("DEPLOY_ATTEMPTS must be >= 1 (was {DEPLOY_ATTEMPTS})")
+}
+
+/// Give the next deploy attempt a genuinely clean broadcast lane: drain anvil's
+/// transaction pool, then revert to `snapshot` and re-snapshot.
+///
+/// The drain has to come first, and has to be *observed* rather than assumed.
+/// `evm_revert` rewinds chain state but leaves the pool untouched, so a
+/// transaction the SIGKILLed forge had already put on the wire is still pending
+/// afterwards: it reads as a clean nonce immediately after the revert, then
+/// mines into the reverted chain and re-advances the deployer nonce — after the
+/// fresh snapshot was taken. Every later attempt then broadcasts against a nonce
+/// anvil has already passed and dies fast with `-32003 nonce too low` /
+/// `transaction already imported`, burning the whole retry budget (#785). Draining
+/// until the pool stays empty, and only then reverting, wipes both the pending
+/// stragglers and any that mined while we waited.
+///
+/// A pool that will not drain within the budget warns rather than bails. It is
+/// tempting to fail fast — a straggler that outlives the drain can still poison
+/// the snapshot — but that trades a *maybe* for a certain failure. The condition
+/// means extreme runner contention, which is transient and exactly what the
+/// caller's escalating backoff exists to ride out; bailing here would forfeit
+/// the remaining attempts instead. It is also not proof of poisoning: a
+/// straggler that mines *before* the revert is rolled back by it, which is the
+/// common case. So make it loud enough to explain a later `nonce too low`, and
+/// let the retry budget do its job.
+async fn reset_broadcast_lane(provider: &DynProvider, snapshot: String) -> anyhow::Result<String> {
+    let mut drained = false;
+    for _ in 0..POOL_DRAIN_POLLS {
+        drop_all_transactions(provider).await?;
+        // SIGKILL stops forge writing more, but bytes already in the socket are
+        // still being parsed; let them land so the next drop catches them.
+        tokio::time::sleep(POOL_DRAIN_SETTLE).await;
+        if pool_is_empty(provider).await? {
+            drained = true;
+            break;
+        }
+    }
+    if !drained {
+        // Deliberately not fatal — see this function's doc comment.
+        tracing::warn!(
+            "anvil's pool still had transactions after {POOL_DRAIN_POLLS} drops; if one of \
+             them mines after the snapshot below, the next attempt will fail fast with \
+             `nonce too low`"
+        );
+    }
+    evm_revert_and_snapshot(provider, snapshot).await
+}
+
+/// Drop every transaction currently in anvil's pool (pending and queued).
+async fn drop_all_transactions(provider: &DynProvider) -> anyhow::Result<()> {
+    provider
+        .raw_request::<_, ()>("anvil_dropAllTransactions".into(), ())
+        .await
+        .context("anvil_dropAllTransactions")
+}
+
+/// `true` when anvil's pool holds no pending or queued transactions.
+async fn pool_is_empty(provider: &DynProvider) -> anyhow::Result<bool> {
+    let status: serde_json::Value = provider
+        .raw_request("txpool_status".into(), ())
+        .await
+        .context("txpool_status")?;
+    Ok(hex_quantity(&status, "pending")? == 0 && hex_quantity(&status, "queued")? == 0)
+}
+
+/// Read `field` from a `txpool_status` response as a hex quantity (`"0x1"`).
+fn hex_quantity(status: &serde_json::Value, field: &str) -> anyhow::Result<u64> {
+    let raw = status
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .with_context(|| format!("txpool_status missing string field `{field}`"))?;
+    let digits = raw.strip_prefix("0x").unwrap_or(raw);
+    u64::from_str_radix(digits, 16)
+        .with_context(|| format!("txpool_status `{field}` is not a hex quantity: {raw}"))
 }
 
 /// Take an `evm_snapshot`, returning the anvil snapshot id (a hex quantity).
@@ -1805,6 +1884,110 @@ mod tests {
             b"Error: script failed: revert: Ownable: caller is not the owner"
         ));
         assert!(!forge_script_body_completed(b""));
+    }
+
+    /// Regression test for the deploy-retry death spiral (#785).
+    ///
+    /// Models the state a SIGKILLed `forge script` leaves behind: a transaction
+    /// already on the wire but *not yet mined*. Before the drain, `evm_revert`
+    /// left that straggler in the pool, so the deployer nonce read clean at
+    /// snapshot time and then advanced once the straggler mined — poisoning the
+    /// fresh snapshot and making every later attempt fail fast with `nonce too
+    /// low` / `transaction already imported`.
+    ///
+    /// anvil runs on a fixed block time so the straggler is *provably* still
+    /// pending while the lane is reset. That is the deterministic stand-in for
+    /// the CI condition: a starved anvil that has not drained its pool by the
+    /// time the stalled forge is SIGKILLed. The block time must exceed the drain
+    /// budget, or the straggler mines before the revert and the revert alone
+    /// would clean it up — which is precisely the case that never reproduced.
+    #[cfg(feature = "anvil-e2e")]
+    #[tokio::test]
+    // Test scaffolding legitimately uses expect/panic; the workspace anti-panic
+    // policy targets runtime code (matches the journey files' crate-level allow).
+    #[allow(clippy::expect_used, clippy::panic)]
+    async fn reset_broadcast_lane_survives_a_straggler_from_a_killed_forge() {
+        // Must stay comfortably above the drain budget (POOL_DRAIN_POLLS *
+        // POOL_DRAIN_SETTLE) so the straggler is still pending through the reset.
+        const BLOCK_TIME: u64 = 4;
+
+        let port = crate::free_port().expect("free port");
+        let mut anvil = Command::new("anvil")
+            .args([
+                "--port",
+                &port.to_string(),
+                "--block-time",
+                &BLOCK_TIME.to_string(),
+                "--silent",
+            ])
+            .spawn()
+            .expect("spawn anvil (is foundry installed?)");
+
+        let url: reqwest::Url = format!("http://127.0.0.1:{port}")
+            .parse()
+            .expect("parse anvil rpc url");
+        let deployer: PrivateKeySigner = DEPLOYER_KEY.parse().expect("parse deployer key");
+        let deployer_addr = deployer.address();
+        let provider: DynProvider = ProviderBuilder::new()
+            .wallet(EthereumWallet::from(deployer))
+            .connect_http(url)
+            .erased();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while provider.get_chain_id().await.is_err() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "anvil RPC never came up"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        let snapshot = evm_snapshot(&provider).await.expect("snapshot");
+        let before = provider
+            .get_transaction_count(deployer_addr)
+            .await
+            .expect("nonce before");
+
+        // Submit without awaiting the receipt: on a fixed block time this leaves
+        // the transaction sitting in the pool — exactly what a SIGKILLed forge
+        // leaves behind.
+        let pending = provider
+            .send_transaction(
+                TransactionRequest::default()
+                    .with_to(Address::ZERO)
+                    .with_value(U256::from(1)),
+            )
+            .await
+            .expect("submit straggler");
+        drop(pending);
+        assert!(
+            !pool_is_empty(&provider).await.expect("pool status"),
+            "straggler was mined before the reset — the test is not exercising the race"
+        );
+
+        let _fresh = reset_broadcast_lane(&provider, snapshot)
+            .await
+            .expect("reset broadcast lane");
+
+        // Past the next block: if the straggler survived the reset it has mined
+        // by now and the nonce has moved past the fresh snapshot.
+        tokio::time::sleep(Duration::from_secs(BLOCK_TIME * 2)).await;
+        let after = provider
+            .get_transaction_count(deployer_addr)
+            .await
+            .expect("nonce after");
+        assert_eq!(
+            after, before,
+            "a straggler from the killed forge advanced the deployer nonce past the \
+             fresh snapshot — every retry will now die with `nonce too low`"
+        );
+        assert!(
+            pool_is_empty(&provider).await.expect("pool status"),
+            "anvil's pool still holds transactions after the lane reset"
+        );
+
+        let _ = anvil.kill();
+        let _ = anvil.wait();
     }
 
     #[test]

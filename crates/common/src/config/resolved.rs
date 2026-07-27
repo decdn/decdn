@@ -39,8 +39,6 @@ pub struct ResolvedNetwork {
     /// pkarr/DNS default (`presets::N0`); otherwise the node builds on
     /// `presets::Minimal` and composes only the providers configured here.
     pub discovery: ResolvedDiscovery,
-    /// QUIC 0-RTT master switch for `cdn/probe/v1` (ADR 015). Default `true`.
-    pub enable_0rtt: bool,
 }
 
 /// Resolved discovery providers (#818). Strings are already shape-validated at
@@ -190,9 +188,10 @@ pub struct ResolvedCache {
     pub max_blob_size_mb: u64,
     /// Buyer-side ABSOLUTE per-MB rate ceiling for paid pulls (#1375), in the same
     /// per-MB units as the wire `StreamResponse.rate_per_mb`; `0` = unlimited
-    /// (the default). Distinct from the seller-side `delivery_ceiling` clamp: this
-    /// bounds what this node, acting as a BUYER on a cache-miss pull, will accept a
-    /// provider to quote. The node also always applies a probe-relative bound (a
+    /// (the default). Distinct from the seller-side `delivery_floor` clamp, which
+    /// raises this node's own quote: this bounds what this node, acting as a BUYER
+    /// on a cache-miss pull, will accept a provider to quote. The node also always
+    /// applies a probe-relative bound (a
     /// quote may not exceed the rate the chosen candidate advertised at probe), so
     /// this is the additional absolute backstop.
     pub max_rate_per_mb: u64,
@@ -434,10 +433,6 @@ pub struct ResolvedPayment {
     /// runtime overwrites it from on-chain `getRateBounds()` before serving and
     /// the rate-bounds watcher keeps it current. Default `0`.
     pub delivery_floor: u64,
-    /// Pre-chain seed for the upper clamp bound on `rate_per_mb`. Same
-    /// caveat as [`Self::delivery_floor`] — the live ceiling is on-chain
-    /// (#1172). Default [`decdn_protocol::MAX_RATE_PER_MB`].
-    pub delivery_ceiling: u64,
     /// Voucher cadence advertised in `StreamResponse` for `cdn/client/v1`
     /// (ADR 003 §Voucher Interval Negotiation); default
     /// [`decdn_protocol::DEFAULT_VOUCHER_INTERVAL_MB`], range
@@ -486,8 +481,8 @@ pub struct ResolvedObservability {
 /// Resolved `cdn/dht/v1` settings (ADR 022).
 ///
 /// Each `*_rate_per_sec == 0.0` and matching `*_burst == 0` disables that
-/// layer. `trusted_ips` is the parsed-and-deduplicated IP set; the
-/// resolver rejects malformed entries.
+/// layer. The resolver guarantees every rate is finite and `>= 0`, and that
+/// each `*_burst > 0` whenever its rate is `> 0` (no deny-all).
 ///
 /// `Default` returns the ADR 022 §DHT Rate Limiting defaults so test sites
 /// that build a `ResolvedConfig` by hand can write `ResolvedDht::default()`
@@ -502,7 +497,6 @@ pub struct ResolvedDht {
     pub per_ip_burst: u32,
     pub global_rate_per_sec: f64,
     pub global_burst: u32,
-    pub trusted_ips: std::collections::HashSet<std::net::IpAddr>,
     /// Hard cap on the per-IP keyed-limiter map (#645). `0` => unbounded.
     pub max_tracked_per_ip: usize,
     /// Hard cap on the per-peer (`NodeId`) keyed-limiter map (#645). `0`
@@ -519,7 +513,6 @@ impl Default for ResolvedDht {
             per_ip_burst: 200,
             global_rate_per_sec: 1000.0,
             global_burst: 2000,
-            trusted_ips: std::collections::HashSet::new(),
             max_tracked_per_ip: 4096,
             max_tracked_per_peer: 4096,
         }
@@ -541,7 +534,6 @@ pub struct ResolvedProbe {
     pub per_ip_burst: u32,
     pub global_rate_per_sec: f64,
     pub global_burst: u32,
-    pub trusted_ips: std::collections::HashSet<std::net::IpAddr>,
     /// Hard cap on the per-IP keyed-limiter map (#645). `0` => unbounded.
     pub max_tracked_per_ip: usize,
     /// Hard cap on the per-peer (`NodeId`) keyed-limiter map (#645). `0`
@@ -558,7 +550,6 @@ impl Default for ResolvedProbe {
             per_ip_burst: 200,
             global_rate_per_sec: 1000.0,
             global_burst: 2000,
-            trusted_ips: std::collections::HashSet::new(),
             max_tracked_per_ip: 4096,
             max_tracked_per_peer: 4096,
         }

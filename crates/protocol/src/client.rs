@@ -56,28 +56,29 @@ pub const MB_BYTES: u64 = 1_048_576;
 /// interval negotiation).
 pub const DEFAULT_VOUCHER_INTERVAL_MB: u64 = 1;
 
-/// Hardcoded safety ceiling on `voucher_interval_mb` (ADR 003 §Voucher Interval
-/// Negotiation). The *governable* parameter is `maxVoucherIntervalMb` (default
-/// 1 MB), which MUST stay ≤ this ceiling; the negotiated range is 1..=1024 MB.
-/// Enforced at the wire boundary by [`StreamResponse::validate`] and
+/// Hardcoded wire safety ceiling on `voucher_interval_mb` (ADR 003 §Voucher
+/// Interval Negotiation). The negotiated range is 1..=1024 MB. Enforced at the
+/// wire boundary by [`StreamResponse::validate`] and
 /// [`StreamRequestExt::validate`].
 pub const MAX_VOUCHER_INTERVAL_MB: u64 = 1024;
 
 /// Exact byte length of an EOA secp256k1 voucher signature (`r‖s‖v`, 32+32+1).
 /// Mirrors [`SLASH_SIG_LEN`]; both are the EOA off-chain signing form (ADR 024
-/// §18). Carried as a `Vec<u8>` on the wire (serde derives array impls only up
-/// to `[T; 32]`), with the length pinned by [`Voucher::validate`].
+/// §Off-Chain ERC-1271 Verification). Carried as a `Vec<u8>` on the wire (serde
+/// derives array impls only up to `[T; 32]`), with the length pinned by
+/// [`Voucher::validate`].
 pub const VOUCHER_SIG_LEN: usize = 65;
 
 /// Exact byte length of a `BindNodeId` client-binding signature (`r‖s‖v`,
 /// 32+32+1). The same EOA off-chain EIP-712 signing form as [`SLASH_SIG_LEN`] /
-/// [`VOUCHER_SIG_LEN`] (ADR 024 §18); pinned by [`ClientBinding::validate`].
+/// [`VOUCHER_SIG_LEN`] (ADR 024 §Off-Chain ERC-1271 Verification); pinned by
+/// [`ClientBinding::validate`].
 pub const BINDING_SIG_LEN: usize = 65;
 
 /// Exact byte length of a provider's `CooperativeClose` waiver signature
 /// (`r‖s‖v`, 32+32+1). Same EOA off-chain EIP-712 signing form as the others
-/// (ADR 024 §18); pinned by [`CooperativeCloseAuth::validate`]. ADR 003
-/// §Cooperative close.
+/// (ADR 024 §Off-Chain ERC-1271 Verification); pinned by
+/// [`CooperativeCloseAuth::validate`]. ADR 003 §Cooperative close.
 pub const COOPERATIVE_CLOSE_SIG_LEN: usize = 65;
 
 /// Top-level protocol enum for `cdn/client/v1`. Variant order is frozen per

@@ -15,7 +15,7 @@ It is the blacklist-side analogue of the slash-appeal entry points on the `Slash
 
 This ADR does **not** re-litigate most [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting) semantic decisions — bond size, filing windows, standing paths, evidence rules, regional-only scope, or the interaction with `SlashJudge`. Restatements here are for self-containedness; the canonical decision authority remains [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting). The one departure: the synthetic-standing clawback it specifies is **dropped** here — `StandingPath.TokenHolder` standing is the escrowed appeal bond itself (no balance threshold), and an escrowed bond cannot be flash-loaned, so there is nothing for a clawback to defend against.
 
-> **Target spec, not a 1:1 as-built ABI reference.** This document pins the *intended* contract surface. The deployed `contracts/src/ContentBlacklist.sol` ships a deliberate subset, with the simplifications enumerated in its contract header. Storage and signature blocks below describe the destination, not the current deployment — the as-built contract notably uses a 0-indexed `_appeals` array (no `None` sentinel) rather than the `appeals` mapping + `appealCounter` shown here, review/ratification deadlines computed from `openedAt` / `fastTrackedAt` + window constants rather than a stored `reviewWindowEndsAt` and enforced only on the permissionless cleanup path (see § Deadline enforcement is permissionless-only — a deliberate design point, not a gap), and lapse paths that currently burn the bond. Standing is enforced at filing for all three paths (audit I-3): Publisher and Operator each prove a credential, while TokenHolder standing is the escrowed appeal bond itself — there is no `appealFilerTokenThreshold` balance gate and no synthetic-standing clawback. The clawback is **dropped, not deferred**: an escrowed bond cannot be flash-loaned, so there is nothing to fake, and a balance gate would protect nothing the bond + `hasActiveAppeal` + rejection cooldown + perjury denylist do not already protect. The perjury denylist also ships, but records the bad-faith adjudication through the `BlacklistAppealRejectedAsPerjury` event rather than the struct's `perjuryFlagged` flag (still a target-only field).
+> **Target spec, not a 1:1 as-built ABI reference.** This document pins the *intended* contract surface. The deployed `contracts/src/ContentBlacklist.sol` ships a deliberate subset, with the simplifications enumerated in its contract header. Storage and signature blocks below describe the destination, not the current deployment — the as-built contract notably uses a 0-indexed `_appeals` array (no `None` sentinel) rather than the `appeals` mapping + `appealCounter` shown here, a `bytes32 region` rather than `bytes2`/`string`, review/ratification deadlines computed from `openedAt` / `fastTrackedAt` + window constants rather than a stored `reviewWindowEndsAt` and enforced only on the permissionless cleanup path (see § Deadline enforcement is permissionless-only — a deliberate design point, not a gap), and lapse paths that currently burn the bond. Standing is enforced at filing for all three paths (audit I-3): Publisher and Operator each prove a credential, while TokenHolder standing is the escrowed appeal bond itself — there is no `appealFilerTokenThreshold` balance gate and no synthetic-standing clawback. The clawback is **dropped, not deferred**: an escrowed bond cannot be flash-loaned, so there is nothing to fake, and a balance gate would protect nothing the bond + `hasActiveAppeal` + rejection cooldown + perjury denylist do not already protect. The perjury denylist also ships, but records the bad-faith adjudication through the `BlacklistAppealRejectedAsPerjury` event rather than the struct's `perjuryFlagged` flag (still a target-only field).
 
 ## Decision
 
@@ -60,16 +60,15 @@ struct BlacklistAppeal {
     // ─── Slot 4 (32 bytes, packed) ─────────────────────────────
     uint64  fastTrackedAt;          // 8 bytes — non-zero iff entered FastTracked
     uint64  reviewWindowEndsAt;     // 8 bytes — running deadline for the active review window (multisig pre-fast-track, DecdnGovernor post-fast-track)
-    bytes16 _pad1;                  // 16 bytes — explicit padding for slot completion
-    // ─── Slot 5 (32 bytes) ─────────────────────────────────────
-    bytes32 region;                 // packed region key per ADR 011 § Region representation; never bytes32(0)
+    bytes2  region;                 // 2 bytes — ISO 3166-1 alpha-2 per ADR 011's bytes2 gas-optimization
+    bytes14 _pad1;                  // 14 bytes — explicit padding for slot completion
 }
 
 mapping(uint256 => BlacklistAppeal) public appeals;
 uint256 public appealCounter;   // monotonic; appeals[0] reserved as None sentinel; first real id is 1
 ```
 
-**Region representation.** `region` is a `bytes32` packed region key, identical at every layer to [ADR 011 § Region representation](011-content-takedown.md#contract-contentblacklist) — no `string` boundary form and no canonicalization step. The unset sentinel `bytes32(0)` is invalid for an appeal (`openBlacklistAppeal` reverts on `region == bytes32(0)`); the global sentinel `bytes32("GLOBAL")` is valid, since global entries are filable by naming it explicitly.
+**Region representation.** `region` is stored as `bytes2` per the [ADR 011 gas-optimization note](011-content-takedown.md#contract-contentblacklist). The mapping is `bytes2 ↔ ISO 3166-1 alpha-2`; the global sentinel `bytes2(0)` is invalid for an appeal (`openBlacklistAppeal` reverts on `region == bytes2(0)`).
 
 **Auxiliary mappings:**
 
@@ -94,8 +93,8 @@ mapping(address => uint64) public perjuryDenylistUntilAt;
 //   slots. (The earlier per-region-only key assumed one body per region; the
 //   per-filer sub-cap drops that assumption and bounds an adversarial filer
 //   directly. The region ceiling is retained as a second backstop.)
-mapping(bytes32 => uint8) public regionActiveReliefCount;
-mapping(bytes32 => mapping(address => uint8)) public filerRegionActiveRelief;
+mapping(bytes2 => uint8) public regionActiveReliefCount;
+mapping(bytes2 => mapping(address => uint8)) public filerRegionActiveRelief;
 
 // Bond escrow accounting — TOKEN held by the contract for active appeals.
 // Public view; not used in cap arithmetic. Auxiliary to per-appeal `bond` field above
@@ -114,7 +113,7 @@ The five entry points from `IContentBlacklist`, plus permissionless `cleanupExpi
 ```solidity
 function openBlacklistAppeal(
     bytes32 blake3Hash,
-    bytes32 region,                      // packed region key; see ADR 011 § Region representation
+    string  calldata region,             // hot-path canonicalized to bytes2 internally; see ADR 011
     bytes32 evidenceBundleHash,
     uint8   standingPath,
     uint256 namespaceId                  // Publisher path: the claiming namespace; ignored on other paths
@@ -123,7 +122,7 @@ function openBlacklistAppeal(
 
 | Revert | Trigger |
 | --- | --- |
-| `MissingRegion()` | `region == bytes32(0)`, the unset sentinel. Callers must name a scope explicitly — including `bytes32("GLOBAL")` for a global entry (see [ADR 011 § Scope](011-content-takedown.md#scope)) |
+| `EmptyRegion()` | `region` canonicalizes to `bytes2(0)` (global entries are out of scope per [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting)) |
 | `EntryNotFound()` | No `BlacklistEntry` exists for `(blake3Hash, region)` |
 | `FilingWindowClosed()` | `block.timestamp ≥ entry.addedAt + BLACKLIST_APPEAL_FILING_WINDOW` |
 | `InvalidStandingPath()` | `standingPath` is not in `{Publisher, Operator, TokenHolder}` |
@@ -231,7 +230,7 @@ This is intentional. The trusted roles are the appeal's adjudicators, not advers
 
 | Event | Topic 1 (indexed) | Topic 2 (indexed) | Topic 3 (indexed) | Non-indexed data |
 | --- | --- | --- | --- | --- |
-| `BlacklistAppealOpened` | `appealId` | `blake3Hash` | `region` (bytes32) | `filer` (address), `evidenceBundleHash` (bytes32), `standingPath` (uint8) |
+| `BlacklistAppealOpened` | `appealId` | `blake3Hash` | `filer` | `region` (bytes2), `evidenceBundleHash` (bytes32), `standingPath` (uint8) |
 | `BlacklistAppealFastTracked` | `appealId` | — | — | (none) |
 | `BlacklistAppealRejected` | `appealId` | — | — | (none) |
 | `BlacklistAppealRejectedAsPerjury` | `appealId` | `filer` | — | `until` (uint64) |
@@ -239,7 +238,7 @@ This is intentional. The trusted roles are the appeal's adjudicators, not advers
 | `BlacklistAppealReversed` | `appealId` | — | — | (none) |
 | `BlacklistAppealLapsed` | `appealId` | `reason` (uint8) | — | (none) |
 
-Indexer convention: clients keying on `(appealId)` use topic 1 across all events; clients reconciling appeals against parent entries key on `(blake3Hash, region)` from `BlacklistAppealOpened` and follow the lifecycle by `appealId`. That reconciliation is why `region` takes the third topic slot ahead of `filer`: a `bytes32` region is topic-native and matches how the parent-entry side indexes it on `HashBlacklisted` / `HashRemoved`. `filer` is recovered from the event data.
+Indexer convention: clients keying on `(appealId)` use topic 1 across all events; clients reconciling appeals against parent entries key on `(blake3Hash, region)` from `BlacklistAppealOpened` and follow the lifecycle by `appealId`. `region` is non-indexed because `bytes2` topics would force `keccak256` matching for a 2-byte value — wasteful — and the parent-entry side `HashBlacklisted` already indexes the hash.
 
 ### State machine
 
@@ -274,8 +273,8 @@ stateDiagram-v2
 
 ### Gas-optimization notes
 
-- **`region` as `bytes32`.** Per [ADR 011 § Contract: ContentBlacklist](011-content-takedown.md#contract-contentblacklist), the canonical region representation is `bytes32` at every layer. `openBlacklistAppeal` takes the packed key directly, so there is no canonicalization helper and no boundary conversion to get wrong — the appeal record's key is byte-identical to the parent entry's mapping key. The cost is one full slot for `region` rather than a packed 2 bytes, which is what a 16-byte declarable region requires.
-- **Struct packing.** The `BlacklistAppeal` struct is laid out across 6 slots (192 bytes total) with explicit padding fields marking unused slot space. Future field additions append to slot 4 (which has 16 bytes of free padding) or open a slot 6; `region` occupies slot 5 alone, since a full-word key cannot share one.
+- **`region` as `bytes2`.** Per [ADR 011 § Contract: ContentBlacklist](011-content-takedown.md#contract-contentblacklist), the canonical region storage representation is `bytes2`. The `openBlacklistAppeal` external entry takes `string calldata region` for ADR-conformant interface stability but canonicalizes internally to `bytes2` for storage. Helpers (`_toBytes2(string)`) revert on length ≠ 2 or non-ASCII-alpha characters per ISO 3166-1 alpha-2.
+- **Struct packing.** The `BlacklistAppeal` struct is laid out across 5 slots (160 bytes total) with explicit padding fields marking unused slot space. Future field additions append to slot 4 (which has 14 bytes of free padding) or open a slot 5.
 - **`RejectionWindow` packing.** The fixed-length `uint64[3]` plus `uint64 cooldownUntilAt` fit in a single 32-byte slot, so `filerRejections` is one SLOAD per cap check.
 - **`appeals[0]` reserved.** Reading uninitialized appeal records (`appealId == 0` or unallocated) returns `status == None`; functions revert with `AppealNotFound()` on `status == None`. The contract does not store `0`-indexed entries.
 
@@ -294,7 +293,7 @@ stateDiagram-v2
 ### Risks
 
 - **`_pad0` / `_pad1` field accuracy.** Packed slot calculations assume Solidity's standard packing rules; a compiler version change altering slot semantics could silently relocate fields. The implementation MUST include a Foundry storage-layout test (`forge inspect ContentBlacklist storageLayout`) pinned to expected slot offsets.
-- **Region key provenance.** `region` is `bytes32` end to end with no canonicalization step, so the appeal record and the parent entry cannot drift in format. A reviewer should instead confirm that callers derive the key the same way the scope predicate does — left-aligned zero-padded packing, matching `bytes32("literal")` — since a mis-packed key silently files against a region no entry uses.
+- **`region` canonicalization at the function boundary.** `openBlacklistAppeal` taking `string calldata region` and canonicalizing to `bytes2` diverges from the rest of `ContentBlacklist`'s internal API. A reviewer should confirm every internal write site uses the `bytes2` form to avoid silent format mismatch between the appeal record and the parent entry.
 
 ## References
 

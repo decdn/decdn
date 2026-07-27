@@ -70,9 +70,8 @@ reqwest = { workspace = true }
 # source without new bloat.
 alloy = { workspace = true }
 # `decdn fetch` auto-discovery (#936) probes its top-K candidates concurrently
-# via `join_all`; `probe_once` is not `Send` (its `&dyn ProbeMetrics` param), so
-# single-task `join_all` is used over `tokio::spawn`. Combinators only — no
-# iroh-blobs, so the #578 invariant holds.
+# via `join_all`, which borrows one shared `&endpoint` instead of cloning it
+# per probe. Combinators only — no iroh-blobs, so the #578 invariant holds.
 futures-util = { workspace = true }
 
 [dev-dependencies]

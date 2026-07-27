@@ -5,8 +5,8 @@
 //! [`crate::rate_limit::ThreeLayerRateLimiter`] engine: it pins the
 //! DHT-specific operator-visible metric names (via a private metrics sink)
 //! and re-exports the config/reject types under their historical DHT names.
-//! The layering, cheapest-first ordering, trusted-IP exemption, keyspace
-//! bound, and batch-token accounting all live in the shared engine — see its
+//! The layering, cheapest-first ordering, keyspace bound, and batch-token
+//! accounting all live in the shared engine — see its
 //! module docs.
 
 use std::sync::Arc;
@@ -16,8 +16,6 @@ use crate::rate_limit::{
     RateLimitConfig, RateLimitMetricsSink, RejectLayer, ThreeLayerRateLimiter,
 };
 
-#[cfg(test)]
-use std::collections::HashSet;
 #[cfg(test)]
 use std::net::IpAddr;
 #[cfg(test)]
@@ -82,6 +80,23 @@ impl DhtRateLimiter {
             cfg,
             Arc::new(DhtRateLimitMetrics(metrics)),
         ))
+    }
+
+    /// Build a limiter straight from the resolved `[dht.rate_limit]` section.
+    ///
+    /// Prefer this over [`Self::new`] at wiring sites: `DhtRateLimitConfig` is
+    /// an alias of the shared [`RateLimitConfig`], so `new` cannot tell a config
+    /// mapped from `[dht.rate_limit]` from one mapped out of
+    /// `[probe.rate_limit]`. Taking `&ResolvedDht` makes the wrong pairing a
+    /// type error (#1457); see
+    /// [`crate::handlers::probe_rate_limit::ProbeRateLimiter::from_resolved`]
+    /// for the direction that actually loosens a cap.
+    #[must_use]
+    pub fn from_resolved(
+        resolved: &decdn_common::config::ResolvedDht,
+        metrics: Arc<Metrics>,
+    ) -> Self {
+        Self::new(&RateLimitConfig::from(resolved), metrics)
     }
 
     /// Try to admit one inbound DHT request. See
@@ -157,7 +172,6 @@ mod tests {
             per_ip_burst: 1,
             global_rate_per_sec: 1.0,
             global_burst: 1,
-            trusted_ips: HashSet::new(),
             max_tracked_per_ip: 4096,
             max_tracked_per_peer: 4096,
         }
@@ -243,45 +257,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn trusted_ip_bypasses_per_ip_layer_only() {
-        // Strict per-IP. Different peers from the same IP normally would
-        // hit per-IP on the second call; if the IP is trusted they pass.
-        let mut cfg = strict_cfg();
-        cfg.global_burst = u32::MAX;
-        cfg.global_rate_per_sec = 1e9;
-        cfg.per_peer_burst = u32::MAX;
-        cfg.per_peer_rate_per_sec = 1e9;
-        cfg.trusted_ips.insert(ip(10, 0, 0, 1));
-        let lim = DhtRateLimiter::new(&cfg, metrics());
-        assert_eq!(lim.check(&peer(1), Some(ip(10, 0, 0, 1))), Ok(()));
-        assert_eq!(lim.check(&peer(2), Some(ip(10, 0, 0, 1))), Ok(()));
-        // Untrusted IP still rejects.
-        assert_eq!(lim.check(&peer(3), Some(ip(10, 0, 0, 2))), Ok(()));
-        assert_eq!(
-            lim.check(&peer(4), Some(ip(10, 0, 0, 2))),
-            Err(DhtRejectLayer::PerIp)
-        );
-    }
-
-    #[test]
-    fn trusted_ip_does_not_bypass_per_peer_or_global() {
-        let mut cfg = strict_cfg();
-        cfg.trusted_ips.insert(ip(10, 0, 0, 1));
-        let lim = DhtRateLimiter::new(&cfg, metrics());
-        assert_eq!(lim.check(&peer(1), Some(ip(10, 0, 0, 1))), Ok(()));
-        // The trusted IP burned global=1; the second request fails on global.
-        assert_eq!(
-            lim.check(&peer(2), Some(ip(10, 0, 0, 1))),
-            Err(DhtRejectLayer::Global)
-        );
-    }
-
-    // ---- #969: explicit evaluation-order + trusted-IP-scope coverage. ADR
-    // 005 §Probe rate limiting (and the mirroring ADR 022 §DHT Rate Limiting
-    // this limiter implements) specify cheapest-first ordering
-    // (global → per-IP → per-peer) and a trusted-IP list that exempts ONLY
-    // the per-IP layer. ----
+    // ---- #969: explicit evaluation-order coverage. ADR 005 §Probe rate
+    // limiting (and the mirroring ADR 022 §DHT Rate Limiting this limiter
+    // implements) specify cheapest-first ordering
+    // (global → per-IP → per-peer). ----
 
     /// The global cap is the cheapest (first-checked) layer, so when both the
     /// global bucket and the per-IP bucket are exhausted, the rejection must
@@ -351,40 +330,6 @@ mod tests {
         );
     }
 
-    /// A trusted IP bypasses the per-IP layer but remains fully subject to the
-    /// per-peer layer. With per-IP and global loosened so neither can fire,
-    /// repeated requests from a trusted IP using the SAME `NodeId` must still
-    /// be rejected by the per-peer bucket — proving the exemption is scoped to
-    /// per-IP only and does not leak into per-peer.
-    #[test]
-    fn trusted_ip_still_subject_to_per_peer_layer() {
-        let mut cfg = strict_cfg();
-        // Per-peer burst=1 (from strict_cfg) is the only layer that can fire.
-        // Pin its refill to no-refill (1e-9 req/sec) so a slow CI scheduler
-        // can't refill a per-peer token between the two same-peer `check`
-        // calls; burst=1 is the entire per-peer budget.
-        cfg.per_peer_rate_per_sec = 1e-9;
-        cfg.per_ip_burst = u32::MAX;
-        cfg.per_ip_rate_per_sec = 1e9;
-        cfg.global_burst = u32::MAX;
-        cfg.global_rate_per_sec = 1e9;
-        cfg.trusted_ips.insert(ip(10, 0, 0, 1));
-        let lim = DhtRateLimiter::new(&cfg, metrics());
-        let trusted = Some(ip(10, 0, 0, 1));
-        let p = peer(1);
-        // First request from the trusted IP + peer admits.
-        assert_eq!(lim.check(&p, trusted), Ok(()));
-        // Second request — same trusted IP, same peer — must reject on the
-        // per-peer layer. If the trust exemption wrongly bypassed per-peer
-        // this would erroneously return `Ok(())`.
-        assert_eq!(lim.check(&p, trusted), Err(DhtRejectLayer::PerPeer));
-        // A different peer from the same trusted IP is admitted: the per-peer
-        // bucket is keyed by NodeId, and the per-IP layer that *would* have
-        // limited a second distinct peer from one IP is the one the trust
-        // exemption legitimately bypasses.
-        assert_eq!(lim.check(&peer(2), trusted), Ok(()));
-    }
-
     fn ip6(segments: [u16; 8]) -> IpAddr {
         IpAddr::V6(std::net::Ipv6Addr::new(
             segments[0],
@@ -420,24 +365,6 @@ mod tests {
     }
 
     #[test]
-    fn trusted_ipv6_matches_masked_inbound_key() {
-        // #841: a trusted IPv6 address must exempt any address in its /64, since
-        // the lookup key is masked — store the trusted entry under the same mask.
-        let mut cfg = strict_cfg();
-        cfg.global_burst = u32::MAX;
-        cfg.global_rate_per_sec = 1e9;
-        cfg.per_peer_burst = u32::MAX;
-        cfg.per_peer_rate_per_sec = 1e9;
-        cfg.trusted_ips
-            .insert(ip6([0x2001, 0xdb8, 0, 0, 0, 0, 0, 1]));
-        let lim = DhtRateLimiter::new(&cfg, metrics());
-        // A different host in the trusted /64 is still exempt.
-        let other = Some(ip6([0x2001, 0xdb8, 0, 0, 0xaaaa, 0, 0, 9]));
-        assert_eq!(lim.check(&peer(1), other), Ok(()));
-        assert_eq!(lim.check(&peer(2), other), Ok(()));
-    }
-
-    #[test]
     fn rejection_increments_layer_metric_in_scrape() {
         // ADR 022 §Observability specifies a single labeled counter
         // (`decdn_dht_rate_limit_rejections_total{layer=...}`), but the
@@ -469,7 +396,6 @@ mod tests {
             per_ip_burst: 0,
             global_rate_per_sec: 0.0,
             global_burst: 0,
-            trusted_ips: HashSet::new(),
             max_tracked_per_ip: 0,
             max_tracked_per_peer: 0,
         };
@@ -618,7 +544,6 @@ mod tests {
             per_ip_burst: 1,
             global_rate_per_sec: 1e6,
             global_burst: u32::MAX,
-            trusted_ips: HashSet::new(),
             // 0 so lazy-prune in `check` is out of scope here — the GC
             // method is the only path that can drop refilled buckets.
             max_tracked_per_ip: 0,
@@ -647,7 +572,6 @@ mod tests {
             per_ip_burst: u32::MAX,
             global_rate_per_sec: 1e6,
             global_burst: u32::MAX,
-            trusted_ips: HashSet::new(),
             max_tracked_per_ip: 0,
             max_tracked_per_peer: 0,
         };
@@ -681,7 +605,6 @@ mod tests {
             per_ip_burst: 1,
             global_rate_per_sec: 1e6,
             global_burst: u32::MAX,
-            trusted_ips: HashSet::new(),
             max_tracked_per_ip: cap,
             max_tracked_per_peer: 0,
         };
@@ -729,7 +652,6 @@ mod tests {
             per_ip_burst: u32::MAX,
             global_rate_per_sec: 1e6,
             global_burst: u32::MAX,
-            trusted_ips: HashSet::new(),
             max_tracked_per_ip: 0,
             max_tracked_per_peer: 0,
         };
@@ -751,7 +673,6 @@ mod tests {
             per_ip_burst: u32::MAX,
             global_rate_per_sec: 1e6,
             global_burst: u32::MAX,
-            trusted_ips: HashSet::new(),
             max_tracked_per_ip: 0,
             max_tracked_per_peer: 0,
         };
@@ -778,7 +699,6 @@ mod tests {
             per_ip_burst: u32::MAX,
             global_rate_per_sec: 1e6,
             global_burst: u32::MAX,
-            trusted_ips: HashSet::new(),
             max_tracked_per_ip: 0,
             max_tracked_per_peer: cap,
         };
@@ -823,7 +743,6 @@ mod tests {
             per_ip_burst: 1,
             global_rate_per_sec: 1e6,
             global_burst: u32::MAX,
-            trusted_ips: HashSet::new(),
             max_tracked_per_ip: 0,
             max_tracked_per_peer: 0,
         };

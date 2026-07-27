@@ -178,8 +178,6 @@ pub struct NodeOriginConfig {
     /// refuses a stream quote that exceeds the lower of the two before paying — and
     /// retains the signed over-quote as rate-manipulation evidence.
     pub max_rate_per_mb: u64,
-    /// ADR 015 master switch (`network.enable_0rtt`) for the probe handshake.
-    pub enable_0rtt: bool,
     /// Desired deposit for a freshly-opened buyer channel
     /// (`blockchain.buyer_deposit_micro_usdc`); ignored when a channel is reused.
     pub deposit_hint: U256,
@@ -1114,8 +1112,6 @@ async fn probe_candidate(
         EndpointAddr::new(pk),
         hash_bytes,
         now_micros(),
-        deps.config.enable_0rtt,
-        None,
         PROBE_TIMEOUT,
     )
     .await

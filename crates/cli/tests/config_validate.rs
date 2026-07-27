@@ -328,7 +328,6 @@ fn sample_resolved(overrides: impl FnOnce(&mut ResolvedConfig)) -> ResolvedConfi
             bind_port: 4433,
             relay_urls: Vec::new(),
             discovery: decdn_common::config::ResolvedDiscovery::default(),
-            enable_0rtt: true,
         },
         blockchain: ResolvedBlockchain {
             origin_assignment_address: None,
@@ -389,7 +388,6 @@ fn sample_resolved(overrides: impl FnOnce(&mut ResolvedConfig)) -> ResolvedConfi
         payment: ResolvedPayment {
             rate_per_mb: 10,
             delivery_floor: 0,
-            delivery_ceiling: decdn_protocol::MAX_RATE_PER_MB,
             voucher_interval_mb: decdn_protocol::DEFAULT_VOUCHER_INTERVAL_MB,
         },
         observability: ResolvedObservability {
