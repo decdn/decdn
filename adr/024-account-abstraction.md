@@ -37,11 +37,11 @@ This is a mechanical replacement. The EIP-712 domain separators, typed data hash
 
 **PaymentChannel ([ADR 003](003-payments.md#adr-003-payment-model)):**
 
-| Function | Current | After |
-| --- | --- | --- |
-| `closeChannel` — voucher signature | `ECDSA.recover(digest, sig) == channel.voucherSigner` | `SignatureChecker.isValidSignatureNow(channel.voucherSigner, digest, sig)` |
+| Function | Verification |
+| --- | --- |
+| `closeChannel` — voucher signature | `SignatureChecker.isValidSignatureNow(channel.voucherSigner, digest, sig)` |
 
-`withdraw`, `disputeChannel`, and `cooperativeClose` validate the voucher signature using the same scheme as `closeChannel` and migrate the same way. `channel.voucherSigner` is the address the funder pinned at `openChannel` ([ADR 003 § PaymentChannel](003-payments.md#paymentchannel)); it equals `channel.client` where no delegate was named.
+`withdraw`, `disputeChannel`, and `cooperativeClose` validate the voucher signature using the same scheme as `closeChannel`. `channel.voucherSigner` is the address the funder pinned at `openChannel` ([ADR 003 § PaymentChannel](003-payments.md#paymentchannel)); it equals `channel.client` where no delegate was named.
 
 **CapacityBond ([ADR 003](003-payments.md#adr-003-payment-model)):**
 
