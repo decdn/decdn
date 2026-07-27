@@ -4340,6 +4340,137 @@ async fn pull_through_authorizes_the_delegate_not_the_funder() -> anyhow::Result
     Ok(())
 }
 
+/// Build a pull-through-armed handler over a `CountingOrigin` with an ADR 011
+/// origin deny-set wired in, and return the dialable target plus the hit
+/// counter. Shared by the two blacklist-subject tests below, which differ only
+/// in which address is on the deny-set.
+async fn spawn_counting_pull_server_with_deny(
+    store: Arc<dyn ChannelStateStore>,
+    denied: &[alloy::primitives::Address],
+) -> anyhow::Result<(
+    EndpointAddr,
+    Arc<std::sync::atomic::AtomicUsize>,
+    Endpoint,
+    tokio::task::JoinHandle<()>,
+    tempfile::TempDir,
+)> {
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let cache_tmp = tempfile::tempdir()?;
+    let cache = CacheEngine::open(
+        cache_tmp.path(),
+        vec![Arc::new(CountingOrigin {
+            hits: Arc::clone(&hits),
+        }) as Arc<dyn decdn_cache::Origin>],
+        16,
+    )
+    .await?;
+    let deny = Arc::new(decdn_node::content_deny::ContentDenylist::new(
+        &content_with_origins(denied),
+    ));
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = Arc::new(PrivateKeySigner::random());
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let handler = build_handler_full_configured(
+        server_id,
+        &server_eth,
+        &metrics,
+        limiter,
+        cache,
+        store,
+        RATE_PER_MB,
+        &loopback_domains(),
+        0,
+        16,
+        |deps| {
+            deps.pull_through = Some(std::time::Duration::from_secs(10));
+            deps.content_deny = deny;
+        },
+    )?;
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+    Ok((target, hits, server_ep, server_task, cache_tmp))
+}
+
+/// ADR 011 keys compliance on the FUNDER, so a blacklisted funder must not make
+/// this node front upstream USDC even when a perfectly clean delegate key is
+/// doing the signing. The delegate's binding satisfies the *spend-authority*
+/// half of `pull_authorized`; the funder check is the only thing standing
+/// between a sanctioned address and this operator's egress bill.
+#[tokio::test(flavor = "multi_thread")]
+async fn pull_through_refuses_a_blacklisted_funder_behind_a_clean_delegate() -> anyhow::Result<()> {
+    let (store, funder, delegate) = delegate_signer_store()?;
+    let (target, hits, server_ep, server_task, _cache_tmp) =
+        spawn_counting_pull_server_with_deny(store, &[funder.address()]).await?;
+
+    let delegate_sk = fresh_key();
+    let delegate_node_id = B256::from(*delegate_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(delegate_sk, vec![]).await?;
+    let ext = binding_ext(&delegate, delegate_node_id)?;
+    let req = StreamRequest {
+        hash: [0xB1u8; 32], // never cached — a miss that would trigger the pull
+        namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        channel_id: channel_id().into(),
+        byte_offset: 0,
+        byte_len: 0,
+        timestamp_us: 0x00b1_ac11,
+    };
+    let _ = raw_request(&client_ep, target, &req, Some(&ext)).await?;
+    anyhow::ensure!(
+        hits.load(std::sync::atomic::Ordering::SeqCst) == 0,
+        "a blacklisted funder must NOT trigger a paid pull, clean delegate or not"
+    );
+
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
+/// The mirror image, and the deliberate behaviour change: a CLEAN funder whose
+/// pinned `voucher_signer` happens to be on the deny-set IS authorized to pull.
+/// A takedown sanctions the money, not whichever throwaway key signs the
+/// vouchers, so the signer's deny-set membership is not a compliance event here.
+///
+/// This test fails the moment anyone re-adds an `is_origin_denied` check on the
+/// bound (signer) address — the pre-split check that silently became a signer
+/// check when the funder/signer roles were split. It also pins the agreement
+/// with `dispatch.rs`, whose serve gate is funder-only: without this, the two
+/// paths could drift apart unnoticed, since with `voucher_signer == client` on
+/// every channel that exists today no other test can tell them apart.
+#[tokio::test(flavor = "multi_thread")]
+async fn pull_through_allows_a_clean_funder_with_a_blacklisted_delegate() -> anyhow::Result<()> {
+    let (store, _funder, delegate) = delegate_signer_store()?;
+    let (target, hits, server_ep, server_task, _cache_tmp) =
+        spawn_counting_pull_server_with_deny(store, &[delegate.address()]).await?;
+
+    let delegate_sk = fresh_key();
+    let delegate_node_id = B256::from(*delegate_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(delegate_sk, vec![]).await?;
+    let ext = binding_ext(&delegate, delegate_node_id)?;
+    let req = StreamRequest {
+        hash: [0xB2u8; 32], // never cached — a miss that would trigger the pull
+        namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        channel_id: channel_id().into(),
+        byte_offset: 0,
+        byte_len: 0,
+        timestamp_us: 0x00b2_ac11,
+    };
+    let _ = raw_request(&client_ep, target, &req, Some(&ext)).await?;
+    anyhow::ensure!(
+        hits.load(std::sync::atomic::Ordering::SeqCst) == 1,
+        "a clean funder's delegated request MUST trigger the pull exactly once, got {}",
+        hits.load(std::sync::atomic::Ordering::SeqCst)
+    );
+
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
 // ===========================================================================
 // #859 — handler-level outer-deadline regression. `ClientHandler::try_pull_through`
 // wraps the whole pull in ONE `tokio::time::timeout`. Before #859 that outer

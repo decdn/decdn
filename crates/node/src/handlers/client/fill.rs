@@ -105,12 +105,19 @@ impl ClientHandler {
     /// node front upstream USDC. Mirrors the binding gate in `dispatch.rs`,
     /// applied *before* any spend.
     ///
-    /// Also the earliest origin-blacklist gate (ADR 011), on BOTH addresses. The
-    /// serve-path gate in `dispatch.rs` refuses the delivery, but it runs after
-    /// this: without the same check here, a blacklisted origin's request would
-    /// still have made this node front upstream USDC egress and warm its cache
-    /// on that origin's behalf, only to refuse the delivery afterwards. Refusing
-    /// to *spend* is the part that actually costs the operator.
+    /// Also a spend-side origin-blacklist gate (ADR 011), keyed on the channel's
+    /// FUNDER — the same subject `dispatch.rs`'s serve gate uses, so the two
+    /// paths agree. ADR 011 sanctions the *money*: a takedown names the address
+    /// that funded the delivery, not whichever throwaway key happened to sign
+    /// the vouchers. The two questions are deliberately not conflated — spend
+    /// authority is a *signer* question, compliance is a *funder* question — so
+    /// a blacklisted delegate signer over a clean funder is NOT refused here,
+    /// and a clean delegate signer never launders a blacklisted funder.
+    ///
+    /// Refusing the *spend* is the part that actually costs the operator:
+    /// without this check a blacklisted funder's request could still make this
+    /// node front upstream USDC egress and warm its cache on that funder's
+    /// behalf, only for the delivery to be refused afterwards.
     pub(super) async fn pull_authorized(
         &self,
         req: &StreamRequest,
@@ -119,9 +126,6 @@ impl ClientHandler {
         let Some(client) = verified_client else {
             return false;
         };
-        if self.content_deny.is_origin_denied(&client) {
-            return false;
-        }
         let chan = self
             .channels
             .lock()
@@ -140,8 +144,11 @@ impl ClientHandler {
                 // Compliance is a *funder* question (ADR 011), and must NEVER be
                 // re-keyed onto the signer: never front upstream USDC on a
                 // channel funded by a blacklisted address, even when a clean
-                // delegate key is doing the signing. The `is_origin_denied`
-                // early return above covers the blacklisted *signer* case.
+                // delegate key is doing the signing. Equally, a blacklisted
+                // signer over a clean funder is not a compliance event — the
+                // deny-set names the funding address, so that is the only
+                // address this checks. `dispatch.rs`'s serve gate keys on the
+                // same funder; the two gates agree on the subject.
                 //
                 // Unreachable by construction today: every `pull_authorized`
                 // call site sits below the `dispatch.rs` funder gate, which
