@@ -2340,6 +2340,8 @@ async fn run_open<P: Provider + Clone>(
         self_address,
         provider_addr,
         deposit,
+        // ZERO => self-signing (funder signs); publisher-pays passes a delegate via `channel open`.
+        Address::ZERO,
     )
     .await;
 

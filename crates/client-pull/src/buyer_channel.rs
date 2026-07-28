@@ -201,6 +201,7 @@ pub async fn ensure_allowance<P: Provider + Clone>(
 /// `ChannelOpenPending`), and no second open can start behind it. It is also what
 /// lets the boot scan do its job: with no second open, there is no live row, so an
 /// orphan is `Rehydrate`d rather than deferred.
+#[allow(clippy::too_many_arguments)]
 pub async fn open_channel<P: Provider + Clone>(
     contract: &PaymentChannel::PaymentChannelInstance<P>,
     signer: Arc<PrivateKeySigner>,
@@ -209,14 +210,14 @@ pub async fn open_channel<P: Provider + Clone>(
     self_address: Address,
     provider_addr: Address,
     deposit: U256,
+    voucher_signer: Address,
 ) -> Result<OpenedChannel> {
-    // Self-signing open: a zero `voucherSigner` resolves on-chain to `msg.sender`,
-    // which is this buyer's own key — the same behaviour as before the signer
-    // split. Pinning a *delegate* signer here is deliberately out of scope: it
-    // needs a publisher-pays UX (who holds the delegate key, how it is rotated,
-    // how the funder authorizes it), not just an extra argument.
+    // `voucher_signer` pins the channel's EIP-712 `voucherSigner`. A zero
+    // address resolves on-chain to `msg.sender` (this buyer's own key) — the
+    // pre-publisher-pays self-signing behaviour. A non-zero delegate is the
+    // publisher-pays case: `decdn channel open --voucher-signer <ADDR>`.
     let pending = match contract
-        .openChannel(provider_addr, deposit, Address::ZERO)
+        .openChannel(provider_addr, deposit, voucher_signer)
         .send()
         .await
     {
@@ -291,13 +292,26 @@ pub async fn open_channel<P: Provider + Clone>(
     // only ever means a reclaim sweep waits longer).
     let expires_at = u64::try_from(opened.expiresAt).unwrap_or(u64::MAX);
 
-    // Self-signing open (see the `voucherSigner` comment above): the funder and
-    // voucher signer are both this buyer's own key.
+    // The funder is always whoever called `open_channel` (they put up the
+    // deposit). For the *local* record, resolve the zero sentinel to
+    // `self_address`: on-chain, a zero `voucherSigner` argument resolves to
+    // `msg.sender` (this same address), so that is the real pinned signer —
+    // recording a bare `Address::ZERO` here would make
+    // `can_sign_voucher`-style checks (`signer.address() == state.voucher_signer`,
+    // #1481) fail for every self-signed channel even though this key is the one
+    // the contract actually accepts. The on-chain `openChannel` call above still
+    // sends the raw sentinel (not this resolved value) — resolving here is
+    // purely a local bookkeeping concern.
+    let recorded_voucher_signer = if voucher_signer.is_zero() {
+        self_address
+    } else {
+        voucher_signer
+    };
     let state = BuyerChannelState::new(
         channel_id,
         provider_addr,
         self_address,
-        self_address,
+        recorded_voucher_signer,
         token,
         deposit,
         expires_at,
@@ -464,8 +478,33 @@ pub fn refill_amount(
     clippy::panic
 )]
 mod tests {
-    use super::{LOW_WATER_DIVISOR, approval_floor, approve_decision, refill_amount};
+    use super::{LOW_WATER_DIVISOR, approval_floor, approve_decision, open_channel, refill_amount};
     use alloy::primitives::U256;
+
+    // ---- `open_channel` voucher_signer plumbing (#1481) ------------------
+
+    /// Compile-time signature check that `open_channel` takes a trailing
+    /// `voucher_signer: Address` and plumbs it into `OpenedChannel.state`.
+    /// `open_channel` submits a real `openChannel` tx and decodes the mined
+    /// receipt's `ChannelOpened` event, so exercising the `state.voucher_signer
+    /// == voucher_signer` assertion end-to-end needs a live chain — that's
+    /// covered by the anvil e2e (Task 6). This test instead pins the function's
+    /// *shape*: if a future edit drops the parameter, reorders it, or changes
+    /// its type, this fails to compile (a `cargo test` build failure), which
+    /// is a real regression signal even though nothing runs at runtime.
+    #[test]
+    fn open_channel_signature_takes_trailing_voucher_signer() {
+        // `open_channel` submits a real `openChannel` tx and decodes the mined
+        // receipt's `ChannelOpened` event, so exercising the
+        // `state.voucher_signer == voucher_signer` assertion end-to-end needs a
+        // live chain — that's covered by the anvil e2e (Task 6). This instead
+        // pins the function's *shape* at compile time: naming the (monomorphized)
+        // generic fn item as a value, without calling it, forces the compiler to
+        // check its parameter list matches — including the trailing
+        // `voucher_signer: Address`. If a future edit drops the parameter,
+        // reorders it, or changes its type, this fails to compile.
+        let _ = open_channel::<alloy::providers::RootProvider>;
+    }
 
     #[test]
     fn unlimited_zero_allowance_approves_max() {

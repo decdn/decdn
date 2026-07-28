@@ -23,6 +23,7 @@ use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::{Address, B256, Bytes, U256};
 use alloy::providers::Provider;
 use alloy::signers::local::PrivateKeySigner;
+use decdn_client_pull::buyer_channel::{ensure_allowance, open_channel};
 use decdn_client_pull::cooperative_close::{
     AuthorizedWatermark, CooperativeCloseOutcome, cooperative_close,
 };
@@ -51,6 +52,7 @@ pub async fn channel_dispatch(
         cli::ChannelCommand::Close(a) => close(a, config_path).await,
         cli::ChannelCommand::Settle(a) => settle(a, config_path).await,
         cli::ChannelCommand::Clean(a) => clean(a, config_path).await,
+        cli::ChannelCommand::Open(a) => open(a, config_path).await,
     }
 }
 
@@ -522,6 +524,95 @@ async fn close(args: &cli::ChannelCloseArgs, config_path: Option<&Path>) -> anyh
             state.channel_id
         ),
     }
+}
+
+/// Resolve `--voucher-signer`: absent means self-sign (`Address::ZERO`, which
+/// resolves on-chain to the funder); present is parsed via
+/// [`chain_ctx::parse_address`] (the zero address is a valid *explicit* input
+/// too — it just means the same thing as omitting the flag).
+fn resolve_voucher_signer(voucher_signer: Option<&str>) -> anyhow::Result<Address> {
+    voucher_signer.map_or(Ok(Address::ZERO), |raw| {
+        chain_ctx::parse_address(raw, "--voucher-signer")
+    })
+}
+
+/// `decdn channel open` (#1481): open a payment channel against a provider,
+/// optionally pinning a delegate as the channel's `voucherSigner` — the
+/// publisher-pays case, where the caller (funder) escrows the deposit but a
+/// wallet-less delegate signs vouchers for delivery. Mirrors the auto-open
+/// path in `decdn fetch` ([`crate::commands::fetch::open_or_reuse`]): read
+/// `usdc()`/`minDeposit()` off the contract, clamp the deposit up to the
+/// on-chain floor, ensure the allowance, then submit `openChannel`.
+async fn open(args: &cli::ChannelOpenArgs, config_path: Option<&Path>) -> anyhow::Result<()> {
+    let file = load_file_config(config_path)?;
+    let chain = resolve_chain(&args.chain, &file)?;
+    let provider_addr = chain_ctx::parse_address(&args.provider_address, "--provider-address")?;
+    let voucher_signer = resolve_voucher_signer(args.voucher_signer.as_deref())?;
+
+    let store = RedbBuyerChannelStore::open(&chain.data_dir)?;
+    let signer = Arc::new(load_buyer_signer(&chain.keystore)?);
+    let self_address = signer.address();
+    let rpc = provider::build_provider(&chain.rpc_url, &signer)?;
+    let contract = PaymentChannel::new(chain.payment_channel, rpc.clone());
+    let domain = voucher_domain(chain.chain_id, chain.payment_channel);
+
+    let token = contract
+        .usdc()
+        .call()
+        .await
+        .map_err(|e| anyhow::anyhow!("read PaymentChannel.usdc(): {e}"))?;
+    let min_deposit = contract
+        .minDeposit()
+        .call()
+        .await
+        .map_err(|e| anyhow::anyhow!("read PaymentChannel.minDeposit(): {e}"))?;
+    let deposit = U256::from(args.deposit_micro_usdc).max(min_deposit);
+
+    ensure_allowance(
+        &rpc,
+        token,
+        self_address,
+        chain.payment_channel,
+        Some(deposit),
+    )
+    .await?;
+
+    let opened = open_channel(
+        &contract,
+        Arc::clone(&signer),
+        &domain,
+        token,
+        self_address,
+        provider_addr,
+        deposit,
+        voucher_signer,
+    )
+    .await?;
+
+    // The deposit is escrowed on-chain; a failed local record leaves it
+    // untracked (reconcile against the tx), matching `open_or_reuse`'s handling.
+    store.record(&opened.state).map_err(|e| {
+        anyhow::anyhow!(
+            "buyer channel opened on-chain (tx {}) but persisting it failed; the deposit is \
+             escrowed but untracked — reconcile manually: {e}",
+            opened.tx
+        )
+    })?;
+
+    let out = ChannelOpenJson {
+        channel_id: format!("{:#x}", opened.state.channel_id),
+    };
+    serde_json::to_writer_pretty(std::io::stdout(), &out)?;
+    println!();
+    Ok(())
+}
+
+/// `decdn channel open` machine-readable output — mirrors the `list --json`
+/// pattern ([`ChannelListJson`]).
+#[derive(Serialize)]
+struct ChannelOpenJson {
+    #[serde(rename = "channelId")]
+    channel_id: String,
 }
 
 /// `decdn channel settle` (#1136): finalize the channel tracked for a provider —
@@ -1061,6 +1152,30 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("payment_channel_address"), "{err}");
         assert!(msg.contains("must not be the zero address"), "{err}");
+    }
+
+    // ---- `decdn channel open --voucher-signer` resolution (#1481) --------
+
+    #[test]
+    fn voucher_signer_absent_resolves_to_zero_for_self_signing() {
+        // Omitting the flag means self-sign: the on-chain `openChannel` call
+        // resolves a zero `voucherSigner` to `msg.sender` (the funder).
+        assert_eq!(resolve_voucher_signer(None).unwrap(), Address::ZERO);
+    }
+
+    #[test]
+    fn voucher_signer_present_is_parsed() {
+        let delegate = "0x2222222222222222222222222222222222222222";
+        assert_eq!(
+            resolve_voucher_signer(Some(delegate)).unwrap(),
+            Address::from_str(delegate).unwrap()
+        );
+    }
+
+    #[test]
+    fn voucher_signer_unparseable_errors() {
+        let err = resolve_voucher_signer(Some("not-an-address")).unwrap_err();
+        assert!(err.to_string().contains("--voucher-signer"), "{err}");
     }
 
     /// Build a `BuyerChannelState` for the formatter tests. Fields chosen so the

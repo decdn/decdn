@@ -1017,6 +1017,8 @@ where
         self_address,
         provider,
         deposit,
+        // ZERO => self-signing (funder signs); publisher-pays passes a delegate via `channel open`.
+        Address::ZERO,
     )
     .await?;
     // The deposit is escrowed on-chain; a failed local record leaves it

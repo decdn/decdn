@@ -23,7 +23,7 @@ pub use appeal::{AppealArgs, AppealCommand, AppealSlashArgs};
 pub use bundle::{BundleArgs, BundleCommand, BundleCreateArgs, BundlePullArgs};
 pub use channel::{
     ChannelArgs, ChannelChainArgs, ChannelCleanArgs, ChannelCloseArgs, ChannelCommand,
-    ChannelListArgs, ChannelSettleArgs, CoopCloseArgs,
+    ChannelListArgs, ChannelOpenArgs, ChannelSettleArgs, CoopCloseArgs,
 };
 pub use common::{
     CommonChainArgs, ConfigPathSource, LogFormat, default_client_data_dir, default_config_path,

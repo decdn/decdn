@@ -43,6 +43,27 @@ pub enum ChannelCommand {
     /// unilateral close -> dispute-window -> settle/reclaim sweep. Idempotent:
     /// re-run to advance channels whose windows have since elapsed.
     Clean(ChannelCleanArgs),
+    /// Open a payment channel against a provider, optionally pinning a
+    /// delegate as the channel's `voucherSigner` (publisher-pays, #1481) —
+    /// the caller funds the deposit but a wallet-less delegate signs vouchers.
+    Open(ChannelOpenArgs),
+}
+
+/// `decdn channel open` flags.
+#[derive(Debug, clap::Args)]
+pub struct ChannelOpenArgs {
+    /// Provider's Ethereum address — the channel's counterparty.
+    #[arg(long, value_name = "ADDRESS")]
+    pub provider_address: String,
+    /// Deposit to escrow, in micro-USDC (USDC base units).
+    #[arg(long, value_name = "MICRO_USDC")]
+    pub deposit_micro_usdc: u64,
+    /// Delegate address to pin as the channel's voucherSigner. Omit to
+    /// self-sign (funder signs its own vouchers).
+    #[arg(long, value_name = "ADDRESS")]
+    pub voucher_signer: Option<String>,
+    #[command(flatten)]
+    pub chain: ChannelChainArgs,
 }
 
 /// `decdn channel close` flags.
