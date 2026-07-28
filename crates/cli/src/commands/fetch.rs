@@ -35,9 +35,9 @@ use decdn_client_pull::buyer_channel::{
     LOW_WATER_DIVISOR, ensure_allowance, open_channel, refill_amount, top_up,
 };
 use decdn_client_pull::{
-    ChannelContext, ChannelLedger, Cumulative, ProgressCallback, PullDeadlines, UpstreamRefused,
-    UpstreamVoucherRejected, VoucherProgress, open_progressive_pull, sign_client_binding,
-    stream_fetch_tracked_with_progress,
+    ChannelContext, ChannelLedger, Cumulative, ProgressCallback, PullDeadlines,
+    ResumeOffsetPastEnd, UpstreamRefused, UpstreamVoucherRejected, VoucherProgress,
+    open_progressive_pull, sign_client_binding, stream_fetch_tracked_with_progress,
 };
 use decdn_common::cli::{self, common::expand_tilde};
 use decdn_common::config::{DEFAULT_CHAIN_ID, FileConfig, load_file_config};
@@ -878,13 +878,11 @@ async fn fetch_blob_streaming(
     let mut attempt = 0u32;
     let mut restarted = false;
     loop {
-        // Rewind to the verified prefix. On the first pass this is a no-op; on a
-        // retry it discards whatever the failed attempt wrote.
-        file.set_len(byte_offset)
-            .map_err(|e| anyhow::anyhow!("truncate {}: {e}", partial.display()))?;
-        file.seek(SeekFrom::Start(byte_offset))
-            .map_err(|e| anyhow::anyhow!("seek {}: {e}", partial.display()))?;
-
+        // Open BEFORE touching the file. The rewind below is destructive, and an
+        // open can fail for reasons that have nothing to do with the partial (the
+        // node has evicted the blob, the channel is unknown, the link is down) —
+        // truncating first would destroy a verified, paid-for prefix and then
+        // fail anyway, leaving the user worse off than when they started.
         let opened = open_progressive_pull(
             endpoint,
             target.clone(),
@@ -905,6 +903,13 @@ async fn fetch_blob_streaming(
         let result = match opened {
             Ok((header, pull)) => {
                 total_bytes = header.total_bytes;
+                // The open succeeded, so this attempt is really going to write.
+                // Rewind to the verified prefix: a no-op on the first pass, and on
+                // a retry it discards whatever the failed attempt left behind.
+                file.set_len(byte_offset)
+                    .map_err(|e| anyhow::anyhow!("truncate {}: {e}", partial.display()))?;
+                file.seek(SeekFrom::Start(byte_offset))
+                    .map_err(|e| anyhow::anyhow!("seek {}: {e}", partial.display()))?;
                 let mut writer = BufWriter::new(&mut file);
                 let pulled = decdn_client_pull::sink::pull_to_sink(
                     pull,
@@ -941,26 +946,20 @@ async fn fetch_blob_streaming(
                 resumed_from: byte_offset,
             });
         };
-        // Only ONE signal proves the partial does not belong to this blob: the
-        // node reporting that the offset is at or past the blob's end
-        // (`ResumeOffsetPastEnd`). Classifying by exclusion instead — "anything
-        // that is not a resumable voucher rejection" — would sweep in every
-        // ordinary stall, reset, refusal and local flush failure, and each of
-        // those would truncate a perfectly good prefix the user has already paid
-        // for and re-pay for the whole blob. That is the waste this feature
-        // exists to prevent, so the test is positive and narrow.
+        // Retry from the start when the refusal is consistent with the resume
+        // offset being wrong (see `resume_may_be_stale`). At most once per
+        // invocation, and it is a restart rather than a retry, so it does not
+        // spend the resume budget.
         //
-        // At most once per invocation: `byte_offset` is 0 afterwards, and this is
-        // a restart rather than a retry, so it does not spend the resume budget.
-        if !restarted
-            && byte_offset > 0
-            && err
-                .downcast_ref::<decdn_client_pull::ResumeOffsetPastEnd>()
-                .is_some()
-        {
+        // This is safe to attempt on an ambiguous signal ONLY because the rewind
+        // now happens after a successful open: if the node simply does not have
+        // the blob, the from-zero open fails too and the prefix is still on disk,
+        // untouched, for a later run against a node that does.
+        if !restarted && byte_offset > 0 && resume_may_be_stale(&err) {
             eprintln!(
-                "note: the partial download at {} does not belong to this blob \
-                 ({err}); discarding it and fetching from the start",
+                "note: the node would not serve a resume at byte {byte_offset} of {}; \
+                 retrying from the start in case the partial belongs to another blob \
+                 ({err})",
                 partial.display()
             );
             restarted = true;
@@ -1031,6 +1030,37 @@ fn read_if_manifest(path: &Path) -> anyhow::Result<Option<Vec<u8>>> {
     file.read_to_end(&mut out)
         .map_err(|e| anyhow::anyhow!("read {}: {e}", path.display()))?;
     Ok(Some(out))
+}
+
+/// Whether a failed open is consistent with the resume offset being wrong — i.e.
+/// the `.partial` on disk belonging to a different (or larger) blob.
+///
+/// Two signals qualify, and the second is unavoidably ambiguous:
+///
+/// - [`ResumeOffsetPastEnd`] — the node signed a response whose `total_bytes` is
+///   at or below our offset. Unambiguous, but only reachable against a
+///   non-conforming server.
+/// - `NotFound` — what an honest node actually sends. Its range gate refuses
+///   `byte_offset >= total_bytes` with `RangeNotSatisfiable` *before* signing,
+///   and that **deliberately collapses to `NotFound` on the wire** alongside a
+///   cache miss and an unknown channel (`ServeRejectReason::wire_error`): telling
+///   a client its range was bad is a reputation-benign refusal, and the codes are
+///   kept indistinguishable on purpose. So the client cannot separate "your
+///   offset is past the end" from "I don't have this blob".
+///
+/// Acting on the ambiguous one is safe here only because the caller rewinds the
+/// partial *after* a successful open: a genuine cache miss fails the from-zero
+/// open too, and the prefix survives untouched.
+///
+/// Everything else — stalls, resets, hash mismatches, local flush failures — must
+/// NOT qualify. Those say nothing about the offset, and treating them as stale
+/// would discard a verified prefix the user has already paid for.
+fn resume_may_be_stale(err: &anyhow::Error) -> bool {
+    if err.downcast_ref::<ResumeOffsetPastEnd>().is_some() {
+        return true;
+    }
+    err.downcast_ref::<UpstreamRefused>()
+        .is_some_and(|refused| matches!(refused.error(), StreamError::NotFound))
 }
 
 /// Combine a pull result with the flush of the bytes it wrote.
@@ -2126,41 +2156,57 @@ mod tests {
     /// The partial lives beside `--output` with a suffix, not in a temp dir: the
     /// promote step is a rename, which is only atomic within one filesystem, and
     /// a later invocation has to be able to find it to resume.
-    /// The stale-partial restart must fire on ONE signal and nothing else.
+    /// The stale-partial restart must fire on the refusals that say something
+    /// about the OFFSET, and on nothing else.
     ///
     /// The predicate this replaced was `resumable_watermark(..).is_none()` — i.e.
     /// "anything that is not a resumable voucher rejection" — which is true of
-    /// every ordinary stall, reset, refusal and local flush failure. Each of those
-    /// would have truncated a verified prefix the user already paid for and
-    /// re-fetched the whole blob: the exact waste resume exists to prevent, and
-    /// invisible to every other test because they all drive the happy path.
+    /// every ordinary stall, reset and local flush failure. Each of those would
+    /// have truncated a verified prefix the user already paid for and re-fetched
+    /// the whole blob: the exact waste resume exists to prevent, and invisible to
+    /// every other test because they all drive the happy path.
+    ///
+    /// `NotFound` has to be in the accepted set even though it is ambiguous: an
+    /// honest node refuses an out-of-bounds range with `RangeNotSatisfiable`,
+    /// which collapses to `NotFound` on the wire by design, so it is the only
+    /// signal a real resume-past-the-end ever produces.
     #[test]
-    fn only_a_past_end_offset_counts_as_a_stale_partial() {
-        use decdn_client_pull::{PullStalled, ResumeOffsetPastEnd};
+    fn only_offset_shaped_refusals_count_as_a_stale_partial() {
+        use decdn_client_pull::{HashMismatch, PullStalled};
 
         let past_end = anyhow::Error::new(ResumeOffsetPastEnd {
             total_bytes: 100,
             byte_offset: 500_000,
         });
         assert!(
-            past_end.downcast_ref::<ResumeOffsetPastEnd>().is_some(),
-            "the one signal that proves the partial is not this blob's"
+            resume_may_be_stale(&past_end),
+            "an explicit past-end response must restart"
         );
 
-        // Everything below must NOT trigger a restart. A resumed transfer that
-        // merely hiccups has to keep its prefix.
+        // `mid_stream` is just the no-evidence constructor; `resume_may_be_stale`
+        // reads only the error code, which is the same on both refusal shapes.
+        let refused_not_found =
+            anyhow::Error::new(UpstreamRefused::mid_stream(StreamError::NotFound));
+        assert!(
+            resume_may_be_stale(&refused_not_found),
+            "NotFound is what an honest node's range refusal collapses to"
+        );
+
+        // Everything below must NOT restart. A resumed transfer that merely
+        // hiccups has to keep its prefix.
         let transient: Vec<anyhow::Error> = vec![
             anyhow::Error::new(PullStalled {
                 after: Duration::from_secs(30),
             }),
-            anyhow::Error::new(decdn_client_pull::HashMismatch),
+            anyhow::Error::new(HashMismatch),
             anyhow::anyhow!("flush /tmp/out.partial: No space left on device"),
             anyhow::anyhow!("connection reset"),
+            anyhow::Error::new(UpstreamRefused::mid_stream(StreamError::InternalError)),
         ];
         for err in &transient {
             assert!(
-                err.downcast_ref::<ResumeOffsetPastEnd>().is_none(),
-                "a transient failure must not be read as a stale partial: {err:#}"
+                !resume_may_be_stale(err),
+                "this says nothing about the offset and must not discard the prefix: {err:#}"
             );
         }
     }
