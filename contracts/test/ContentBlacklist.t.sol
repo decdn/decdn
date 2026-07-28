@@ -936,4 +936,224 @@ contract ContentBlacklistTest is Test {
         vm.expectRevert(abi.encodeWithSelector(ContentBlacklist.RegionalBodyNotRegistered.selector, bytes32("FR")));
         blacklist.deregisterRegionalBody(bytes32("FR"));
     }
+
+    // ── Enumeration views ───────────────────────────────────────────────────
+    //
+    // These are what let a consumer READ the deny-set instead of rebuilding it
+    // from the event log. Before them, `ContentBlacklist` exposed no enumeration
+    // at all, so a node had to replay `HashBlacklisted` from the deploy block and
+    // keep a durable projection of everything it had ever seen.
+
+    /// Empty region enumerates as empty rather than reverting — the cold-start
+    /// case a consumer hits before governance has blacklisted anything.
+    function test_blacklistedHashes_emptyRegion() public view {
+        assertEq(blacklist.blacklistedHashCount(REGION_US), 0);
+        assertEq(blacklist.blacklistedHashes(REGION_US, 0, 10).length, 0);
+    }
+
+    /// An add indexes the hash under its own region only, and a remove withdraws
+    /// it — so the index tracks the entry mapping rather than accumulating.
+    function test_blacklistedHashes_tracksAddAndRemove() public {
+        vm.prank(admin);
+        blacklist.addHashGlobal(SAMPLE_HASH, "DMCA");
+
+        assertEq(blacklist.blacklistedHashCount(GLOBAL_REGION), 1);
+        assertEq(blacklist.blacklistedHashes(GLOBAL_REGION, 0, 10)[0], SAMPLE_HASH);
+        // Indexed under GLOBAL, not under an unrelated region.
+        assertEq(blacklist.blacklistedHashCount(REGION_US), 0);
+
+        vm.prank(admin);
+        blacklist.removeHashGlobal(SAMPLE_HASH);
+        assertEq(blacklist.blacklistedHashCount(GLOBAL_REGION), 0);
+    }
+
+    /// Re-adding an existing entry restamps it without duplicating the index
+    /// entry — otherwise the count would drift from the real set size.
+    function test_blacklistedHashes_reAddDoesNotDuplicate() public {
+        vm.startPrank(admin);
+        blacklist.addHashGlobal(SAMPLE_HASH, "DMCA");
+        blacklist.addHashGlobal(SAMPLE_HASH, "DMCA-again");
+        vm.stopPrank();
+        assertEq(blacklist.blacklistedHashCount(GLOBAL_REGION), 1);
+    }
+
+    /// Pagination: pages reassemble to the whole set, a `limit` of zero and an
+    /// offset past the end return empty, and `type(uint256).max` clamps rather
+    /// than reverting on `offset + limit` overflow.
+    function test_blacklistedHashes_pagination() public {
+        vm.startPrank(admin);
+        for (uint256 i = 1; i <= 5; ++i) {
+            blacklist.addHashGlobal(bytes32(i), "DMCA");
+        }
+        vm.stopPrank();
+
+        assertEq(blacklist.blacklistedHashCount(GLOBAL_REGION), 5);
+        assertEq(blacklist.blacklistedHashes(GLOBAL_REGION, 0, 2).length, 2);
+        assertEq(blacklist.blacklistedHashes(GLOBAL_REGION, 4, 2).length, 1); // short final page
+        assertEq(blacklist.blacklistedHashes(GLOBAL_REGION, 5, 2).length, 0); // offset == len
+        assertEq(blacklist.blacklistedHashes(GLOBAL_REGION, 0, 0).length, 0); // limit == 0
+        // Must clamp, not overflow `offset + limit`.
+        assertEq(blacklist.blacklistedHashes(GLOBAL_REGION, 1, type(uint256).max).length, 4);
+
+        // Multi-page reassembly covers exactly the full set.
+        bytes32[] memory a = blacklist.blacklistedHashes(GLOBAL_REGION, 0, 3);
+        bytes32[] memory b = blacklist.blacklistedHashes(GLOBAL_REGION, 3, 3);
+        uint256 seen;
+        for (uint256 i = 1; i <= 5; ++i) {
+            for (uint256 j = 0; j < a.length; ++j) {
+                if (a[j] == bytes32(i)) ++seen;
+            }
+            for (uint256 j = 0; j < b.length; ++j) {
+                if (b[j] == bytes32(i)) ++seen;
+            }
+        }
+        assertEq(seen, 5);
+    }
+
+    /// An expired emergency entry stays in the RAW enumeration while
+    /// `isHashBlacklistedInRegion` already reports it dead. Deliberate: filtering
+    /// would hole a paginated view, and dropping it is the fail-open direction.
+    function test_blacklistedHashes_retainsExpiredEmergencyEntry() public {
+        vm.prank(multisig);
+        blacklist.emergencyAdd(SAMPLE_HASH, 0, "urgent");
+        assertEq(blacklist.blacklistedHashCount(GLOBAL_REGION), 1);
+
+        vm.warp(block.timestamp + 15 days); // past the 14-day GENERAL term
+        assertFalse(blacklist.isHashBlacklisted(SAMPLE_HASH), "live predicate must expire it");
+        assertEq(blacklist.blacklistedHashCount(GLOBAL_REGION), 1, "raw enumeration retains it");
+
+        // The permissionless poke materializes the expiry into the index.
+        blacklist.expireEmergencyEntry(GLOBAL_REGION, SAMPLE_HASH);
+        assertEq(blacklist.blacklistedHashCount(GLOBAL_REGION), 0);
+    }
+
+    /// The address index is the UNION of the origin and operator lists, and
+    /// clearing one while the other still holds must NOT drop the address —
+    /// the two are written independently, so a mirror-the-last-write index
+    /// would fail open here.
+    function test_blacklistedAddresses_unionSemantics() public {
+        assertEq(blacklist.blacklistedAddressCount(), 0);
+
+        vm.startPrank(admin);
+        blacklist.setOriginBlacklist(operator, true); // origin only
+        assertEq(blacklist.blacklistedAddressCount(), 1);
+        assertEq(blacklist.blacklistedAddresses(0, 10)[0], operator);
+
+        blacklist.addOperator(operator); // now on both lists
+        assertEq(blacklist.blacklistedAddressCount(), 1, "union must not double-count");
+
+        blacklist.removeOperator(operator); // operator cleared, origin still set
+        assertEq(blacklist.blacklistedAddressCount(), 1, "origin leg still holds it");
+
+        blacklist.setOriginBlacklist(operator, false); // neither list holds it
+        assertEq(blacklist.blacklistedAddressCount(), 0);
+        vm.stopPrank();
+    }
+
+    /// The operator-only path (`addOperator`, which is the primary governance
+    /// route and never touches the origin mapping) must also index.
+    function test_blacklistedAddresses_operatorOnlyPath() public {
+        vm.prank(admin);
+        blacklist.addOperator(operator);
+        assertEq(blacklist.blacklistedAddressCount(), 1);
+        assertEq(blacklist.blacklistedAddresses(0, 10)[0], operator);
+    }
+
+    /// Same pagination contract as the hash view.
+    function test_blacklistedAddresses_pagination() public {
+        vm.startPrank(admin);
+        for (uint160 i = 1; i <= 4; ++i) {
+            blacklist.setOriginBlacklist(address(i), true);
+        }
+        vm.stopPrank();
+
+        assertEq(blacklist.blacklistedAddressCount(), 4);
+        assertEq(blacklist.blacklistedAddresses(0, 3).length, 3);
+        assertEq(blacklist.blacklistedAddresses(3, 3).length, 1);
+        assertEq(blacklist.blacklistedAddresses(4, 1).length, 0);
+        assertEq(blacklist.blacklistedAddresses(0, type(uint256).max).length, 4);
+    }
+
+    /// `getScopeRegions` always yields GLOBAL first, adds the declared region,
+    /// and adds the previous one only while the ripening window is open.
+    function test_getScopeRegions_globalOnlyWhenNoRegionDeclared() public view {
+        bytes32[] memory regions = blacklist.getScopeRegions(operator);
+        assertEq(regions.length, 1);
+        assertEq(regions[0], GLOBAL_REGION);
+    }
+
+    function test_getScopeRegions_includesCurrentAndRipeningPrev() public {
+        vm.warp(100 days);
+        bondMock.setRegion(operator, "US", "EU", uint64(block.timestamp));
+
+        // Inside the ripening window: GLOBAL + US + EU.
+        bytes32[] memory regions = blacklist.getScopeRegions(operator);
+        assertEq(regions.length, 3);
+        assertEq(regions[0], GLOBAL_REGION);
+        assertEq(regions[1], REGION_US);
+        assertEq(regions[2], REGION_EU);
+
+        // Past it, the previous region drops out.
+        vm.warp(block.timestamp + 8 days); // window is 7 days
+        regions = blacklist.getScopeRegions(operator);
+        assertEq(regions.length, 2);
+        assertEq(regions[0], GLOBAL_REGION);
+        assertEq(regions[1], REGION_US);
+    }
+
+    /// The property the whole enumeration path rests on: paging every region
+    /// `getScopeRegions` returns and taking the union must give the SAME answer
+    /// as the point query, for any hash and any region configuration. If the
+    /// extracted `_scopeRegions` ever drifts from `isHashBlacklistedForOperator`,
+    /// a node silently under-enforces; this is what catches that.
+    ///
+    /// Holds modulo expired emergency entries, which the raw enumeration retains
+    /// and the live predicate rejects — asserted explicitly rather than skirted.
+    function testFuzz_scopeEnumeration_matchesPointQuery(
+        uint8 whichRegion,
+        uint64 elapsed,
+        bytes32 hash,
+        bool declareRegion
+    ) public {
+        vm.assume(hash != bytes32(0));
+        vm.warp(100 days);
+
+        if (declareRegion) {
+            bondMock.setRegion(operator, "US", "EU", uint64(block.timestamp));
+        }
+
+        // Seat the hash in exactly one of GLOBAL / US / EU.
+        uint8 pick = whichRegion % 3;
+        if (pick == 0) {
+            vm.prank(admin);
+            blacklist.addHashGlobal(hash, "fuzz");
+        } else if (pick == 1) {
+            vm.prank(regionalBody);
+            blacklist.addHashRegional(REGION_US, hash, "fuzz");
+        } else {
+            vm.prank(euBody);
+            blacklist.addHashRegional(REGION_EU, hash, "fuzz");
+        }
+
+        vm.warp(block.timestamp + (uint256(elapsed) % 30 days));
+
+        bool viaEnumeration;
+        bytes32[] memory regions = blacklist.getScopeRegions(operator);
+        for (uint256 i = 0; i < regions.length; ++i) {
+            bytes32[] memory page = blacklist.blacklistedHashes(regions[i], 0, type(uint256).max);
+            for (uint256 j = 0; j < page.length; ++j) {
+                // Raw membership is enumerated; apply the liveness predicate the
+                // point query uses, so the two sides are compared like for like.
+                if (page[j] == hash && blacklist.isHashBlacklistedInRegion(hash, regions[i])) {
+                    viaEnumeration = true;
+                }
+            }
+        }
+
+        assertEq(
+            viaEnumeration,
+            blacklist.isHashBlacklistedForOperator(hash, operator),
+            "enumeration union must equal the point query"
+        );
+    }
 }
