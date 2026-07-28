@@ -1221,7 +1221,7 @@ pub async fn lookup(args: &cli::LookupArgs, global_config: Option<&Path>) -> any
     };
 
     let mut out = io::stdout().lock();
-    if args.json {
+    if args.chain.common.json {
         let json_rows: Vec<LookupJson> = rows.iter().map(LookupJson::from).collect();
         serde_json::to_writer_pretty(&mut out, &json_rows)
             .context("failed to encode lookup result as JSON")?;

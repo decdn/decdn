@@ -727,15 +727,13 @@ pub struct LookupArgs {
     #[arg(long)]
     pub probe: bool,
 
-    /// Emit the result as a JSON array instead of a human table.
-    #[arg(long)]
-    pub json: bool,
-
     /// Roundtrip timeout in milliseconds for each `--probe` probe. Ignored
     /// without `--probe`.
     #[arg(long, value_name = "MS", default_value_t = 5_000)]
     pub timeout_ms: u64,
 
+    // `--json` is supplied by the flattened `ChainArgs` (`CommonChainArgs.json`);
+    // declaring it here too would collide (clap requires unique arg names).
     #[command(flatten)]
     pub chain: ChainArgs,
 }
