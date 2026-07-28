@@ -4682,3 +4682,155 @@ async fn export_bao_range_empty_blob_evicted_errors() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// The streaming export (#1132) and the buffered one must produce the SAME wire
+/// bytes — the buffered form is now literally a drain of the stream, and every
+/// existing ADR 038 round-trip test above exercises only the buffered form. This
+/// is what keeps those tests meaningful proof for the path the node actually
+/// serves from.
+///
+/// It also asserts the stream really is chunked: a multi-group blob must arrive
+/// as MANY items, not one. A regression that collected internally and yielded a
+/// single item would pass a bytes-equality check alone while reintroducing the
+/// whole-blob allocation this exists to remove.
+#[tokio::test]
+async fn export_bao_range_stream_matches_the_buffered_form_and_is_chunked() -> anyhow::Result<()> {
+    use futures_util::StreamExt;
+
+    // Several 16 KiB groups with a partial final group, matching the round-trip
+    // test above.
+    let mut payload = vec![0u8; 200 * 1024 + 1234];
+    let mut x: u32 = 0x1234_5678;
+    for b in &mut payload {
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        *b = x.to_le_bytes().first().copied().unwrap_or(0);
+    }
+    let hash = Hash::new(&payload);
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{}", hash.to_hex())))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(payload.clone()))
+        .mount(&server)
+        .await;
+    let (engine, _tmp) = build_engine(&server.uri()).await?;
+    engine.get(hash).await?;
+
+    let blob_size = u64::try_from(payload.len())?;
+    // Both a whole-blob serve and an interior range: the offset-0 case is what
+    // every client fetch takes, the interior case is the resume path.
+    for (offset, len) in [(0u64, 0u64), (64 * 1024, 32 * 1024)] {
+        let buffered = engine
+            .export_bao_range(hash, offset, len, blob_size)
+            .await?;
+
+        let mut stream = engine
+            .export_bao_range_stream(hash, offset, len, blob_size)
+            .await?;
+        let mut streamed = Vec::new();
+        let mut items = 0usize;
+        let mut largest = 0usize;
+        while let Some(item) = stream.next().await {
+            let bytes = item?;
+            anyhow::ensure!(
+                !bytes.is_empty(),
+                "export stream must never yield an empty item at ({offset}, {len})"
+            );
+            largest = largest.max(bytes.len());
+            items += 1;
+            streamed.extend_from_slice(&bytes);
+        }
+
+        anyhow::ensure!(
+            streamed == buffered.as_ref(),
+            "streamed export differs from the buffered export at ({offset}, {len})"
+        );
+        anyhow::ensure!(
+            items > 1,
+            "export stream collapsed to {items} item(s) at ({offset}, {len}) — it must yield \
+             per-bao-item so the serve path holds O(chunk group), not O(blob)"
+        );
+        // A leaf is one 16 KiB chunk group; nothing may exceed that.
+        anyhow::ensure!(
+            largest <= 16 * 1024,
+            "export stream yielded a {largest}-byte item at ({offset}, {len}); items must stay \
+             bounded by one chunk group"
+        );
+    }
+    Ok(())
+}
+
+/// The 0-byte blob (#1054) must yield NO items, not one empty item: `ChunkData`
+/// cannot carry an empty payload (#1088), so a zero-length item would be
+/// unsendable and the serve path must go straight to `StreamEnd`.
+#[tokio::test]
+async fn export_bao_range_stream_empty_blob_yields_no_items() -> anyhow::Result<()> {
+    use futures_util::StreamExt;
+
+    let payload: Vec<u8> = Vec::new();
+    let hash = Hash::new(&payload);
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{}", hash.to_hex())))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(payload.clone()))
+        .mount(&server)
+        .await;
+    let (engine, _tmp) = build_engine(&server.uri()).await?;
+    engine.get(hash).await?;
+
+    let mut stream = engine.export_bao_range_stream(hash, 0, 0, 0).await?;
+    let mut items = 0usize;
+    while let Some(item) = stream.next().await {
+        item?;
+        items += 1;
+    }
+    anyhow::ensure!(items == 0, "empty blob must yield no items, got {items}");
+    Ok(())
+}
+
+/// `populate` must fill a blob that takes the STREAMING commit path — the one
+/// whose post-commit read-back was removed (#1132). The blob is well above
+/// `buffered_max_bytes`, so `should_buffer` routes it to `import_and_verify_stream`
+/// and the new `PullThroughOutcome::Committed` arm is what carries the result
+/// back. That variant holds no payload, so "the whole blob was not re-read" is
+/// enforced by the type; this test is the end-to-end proof that the arm is wired
+/// correctly and still fills the cache.
+#[tokio::test]
+async fn populate_fills_via_the_streaming_commit_without_reading_back() -> anyhow::Result<()> {
+    // Comfortably over the 8 MiB `buffered_max_bytes` default.
+    let mut payload = vec![0u8; 12 * 1024 * 1024];
+    let mut x: u32 = 0x9E37_79B9;
+    for b in &mut payload {
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        *b = x.to_le_bytes().first().copied().unwrap_or(0);
+    }
+    let hash = Hash::new(&payload);
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{}", hash.to_hex())))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(payload.clone()))
+        .mount(&server)
+        .await;
+    let (engine, _tmp) = build_engine(&server.uri()).await?;
+
+    anyhow::ensure!(!engine.has(hash).await?, "blob must start absent");
+    engine.populate(hash).await?;
+    anyhow::ensure!(
+        engine.has(hash).await?,
+        "populate must commit the blob to the local store"
+    );
+    // And the bytes are genuinely there and correct — a commit-only outcome must
+    // not mean a half-imported blob.
+    let got = engine.get(hash).await?;
+    anyhow::ensure!(
+        got.as_ref() == payload.as_slice(),
+        "populated blob does not match the origin payload"
+    );
+    Ok(())
+}
