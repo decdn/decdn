@@ -262,6 +262,31 @@ pub const DEFAULT_PULL_AHEAD_BYTES: u64 = 1_048_576;
 /// ([`DEFAULT_PULL_AHEAD_BYTES`]); the client's exposure stays zero because
 /// vouchers are cumulative over bytes already delivered.
 pub const DEFAULT_CREDIT_WINDOW_BYTES: u64 = 8 * 1024 * 1024;
+/// Default group-commit interval in milliseconds when
+/// `payment.voucher_commit_interval_ms` is unset (ADR 003 §Off-chain voucher
+/// state persistence, #1483): 5 ms.
+///
+/// The serve loop amortizes the per-voucher fsynced redb commit (~3 ms on local
+/// SSD) across a batch — one fsync for several vouchers, each acknowledged only
+/// *after* the commit is durable, so the replay guard is preserved verbatim. The
+/// batch is gathered by delivering ahead within the [credit
+/// window](DEFAULT_CREDIT_WINDOW_BYTES) and collecting the vouchers that arrive;
+/// this interval bounds how long the loop waits for a straggling batch-mate
+/// before committing what it has, so a client that pauses payment is never
+/// stalled longer than this. It is bounded above by the window: at most
+/// `credit_window / voucher_interval` vouchers can be outstanding, so the batch
+/// never exceeds that regardless of this value.
+///
+/// **Sizing constraint.** The interval spends credit-window headroom, not
+/// throughput: to keep the link saturated while acknowledgements lag one commit
+/// interval, size the window so that
+/// `credit_window ≥ throughput × (RTT + commit_interval)`. At the 8 MiB default
+/// window and a 50 ms RTT, a 5–20 ms interval is comfortable. `0` disables the
+/// gather wait (commit each blocking-read batch immediately); a stop-and-wait
+/// window (≤ one interval) ignores it entirely, since only one voucher is ever
+/// outstanding. Node-local policy, not a wire or governance parameter — like the
+/// voucher interval and the credit window it has no on-chain counterpart.
+pub const DEFAULT_VOUCHER_COMMIT_INTERVAL_MS: u64 = 5;
 /// Default voucher cadence a node advertises in `StreamResponse` when
 /// `payment.voucher_interval_mb` is unset (ADR 003 §Voucher Interval
 /// Negotiation): 4 MiB. Coarser than the protocol's wire-level
@@ -2465,11 +2490,19 @@ pub fn resolve_payment_into(
     let credit_window_bytes = file
         .and_then(|p| p.credit_window_bytes.as_ref())
         .map_or(DEFAULT_CREDIT_WINDOW_BYTES, |b| b.get());
+    // Group-commit interval (ADR 003 §Off-chain voucher state persistence,
+    // #1483). Default 5 ms; `0` (commit each blocking-read batch immediately) is
+    // a valid setting, so it merges as a first-class value rather than falling
+    // back to the default.
+    let voucher_commit_interval_ms = file
+        .and_then(|p| p.voucher_commit_interval_ms)
+        .unwrap_or(DEFAULT_VOUCHER_COMMIT_INTERVAL_MS);
     ResolvedPayment {
         rate_per_mb,
         delivery_floor,
         voucher_interval_mb,
         credit_window_bytes,
+        voucher_commit_interval_ms,
     }
 }
 
@@ -4955,6 +4988,7 @@ swap_pool_address = \"0xPool\"
             delivery_floor: None,
             voucher_interval_mb: None,
             credit_window_bytes: None,
+            voucher_commit_interval_ms: None,
         };
         let err = resolve_payment(&cli, Some(&file))
             .err()
@@ -5002,6 +5036,7 @@ swap_pool_address = \"0xPool\"
             delivery_floor: None,
             voucher_interval_mb: None,
             credit_window_bytes: None,
+            voucher_commit_interval_ms: None,
         };
         let resolved = resolve_payment(&cli, Some(&file))?;
         anyhow::ensure!(resolved.rate_per_mb == 42, "got: {}", resolved.rate_per_mb);
@@ -5030,6 +5065,33 @@ swap_pool_address = \"0xPool\"
             "credit_window_bytes default, got: {}",
             resolved.credit_window_bytes
         );
+        anyhow::ensure!(
+            resolved.voucher_commit_interval_ms == DEFAULT_VOUCHER_COMMIT_INTERVAL_MS,
+            "voucher_commit_interval_ms default, got: {}",
+            resolved.voucher_commit_interval_ms
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_payment_threads_explicit_commit_interval() -> anyhow::Result<()> {
+        // Explicit values thread through, including `0` (commit each batch
+        // immediately) which must NOT fall back to the default.
+        for set in [Some(0u64), Some(20)] {
+            let file = types::PaymentConfig {
+                rate_per_mb: Some(10),
+                delivery_floor: None,
+                voucher_interval_mb: None,
+                credit_window_bytes: None,
+                voucher_commit_interval_ms: set,
+            };
+            let resolved = resolve_payment(&empty_payment_args(), Some(&file))?;
+            anyhow::ensure!(
+                resolved.voucher_commit_interval_ms == set.unwrap_or_default(),
+                "explicit commit interval threaded, got: {}",
+                resolved.voucher_commit_interval_ms
+            );
+        }
         Ok(())
     }
 
@@ -5040,6 +5102,7 @@ swap_pool_address = \"0xPool\"
             delivery_floor: None,
             voucher_interval_mb: Some(64),
             credit_window_bytes: None,
+            voucher_commit_interval_ms: None,
         };
         let resolved = resolve_payment(&empty_payment_args(), Some(&file))?;
         anyhow::ensure!(resolved.voucher_interval_mb == 64);
@@ -5053,6 +5116,7 @@ swap_pool_address = \"0xPool\"
             delivery_floor: None,
             voucher_interval_mb: None,
             credit_window_bytes: Some(decdn_config_types::Bytes::new(32 * 1024 * 1024)),
+            voucher_commit_interval_ms: None,
         };
         let resolved = resolve_payment(&empty_payment_args(), Some(&file))?;
         anyhow::ensure!(
@@ -5071,6 +5135,7 @@ swap_pool_address = \"0xPool\"
                 delivery_floor: None,
                 voucher_interval_mb: Some(bad),
                 credit_window_bytes: None,
+                voucher_commit_interval_ms: None,
             };
             let err = resolve_payment(&empty_payment_args(), Some(&file))
                 .err()
@@ -9391,6 +9456,7 @@ swap_pool_address = \"0xPool\"
             delivery_floor: None,
             voucher_interval_mb: None,
             credit_window_bytes: None,
+            voucher_commit_interval_ms: None,
         };
         let resolved = resolve_payment(&cli, Some(&file))?;
         assert_eq!(resolved.rate_per_mb, 99);
@@ -9405,6 +9471,7 @@ swap_pool_address = \"0xPool\"
             delivery_floor: None,
             voucher_interval_mb: None,
             credit_window_bytes: None,
+            voucher_commit_interval_ms: None,
         };
         let resolved = resolve_payment(&cli, Some(&file))?;
         assert_eq!(resolved.rate_per_mb, 50);

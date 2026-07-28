@@ -2,8 +2,8 @@
 //! Bodies split from `mod.rs` (#1254).
 
 use super::{
-    Arc, B256, ChannelDeliveryState, ChannelId, ChunkData, ClientHandler, ClientMessage, Hash,
-    MB_BYTES, Mutex, RecvStream, SendStream, VecDeque, VoucherOutcome,
+    Arc, B256, BatchStop, BufferedVoucherReader, ChannelDeliveryState, ChannelId, ChunkData,
+    ClientHandler, ClientMessage, Hash, MB_BYTES, Mutex, RecvStream, SendStream, VecDeque,
 };
 
 impl ClientHandler {
@@ -68,6 +68,15 @@ impl ClientHandler {
         // always make progress and — for the unconfigured default — collapses to
         // stop-and-wait. See [`ClientHandler::credit_window`].
         let window = self.credit_window(interval_bytes);
+        // Group-commit cap (#1483): at most this many vouchers share one fsync.
+        // Bounded by how many intervals fit in the window — the window caps the
+        // in-flight (delivered-but-unpaid) intervals — so at the one-interval
+        // stop-and-wait floor this is 1 and each recoup collects a single voucher,
+        // exactly the pre-batch cadence. `interval_bytes >= 1` (floored in
+        // `credit_window`), so the division never divides by zero.
+        let batch_cap = usize::try_from(window / interval_bytes.max(1))
+            .unwrap_or(usize::MAX)
+            .max(1);
 
         // Resolved once: a channel's funder is fixed for its lifetime, and the
         // per-boundary takedown re-check below must not take the channel lock
@@ -91,6 +100,10 @@ impl ClientHandler {
         // collection — together they are exactly `delivered − paid`.
         let mut unvouchered: u64 = 0;
         let mut pending: VecDeque<u64> = VecDeque::new();
+        // One buffered voucher reader for the whole stream (#1483): it buffers
+        // pipelined vouchers across recoup calls, so every voucher read MUST go
+        // through it — a second reader would lose bytes it read ahead.
+        let mut reader = BufferedVoucherReader::default();
 
         // `slice::chunks` yields no items for an empty slice and never a zero-length
         // chunk, so `ChunkData::new` cannot reject one here — the empty blob makes
@@ -130,41 +143,59 @@ impl ClientHandler {
             }
             let done_delivering = next_chunk.is_none();
 
-            // --- recoup phase: collect ONE voucher per outer iteration to free
-            // the window — a completed interval (drained in order), else the
-            // closing partial once the whole blob is on the wire. When the window
-            // blocks the deliver phase there is always a completed interval to
-            // collect (the one-interval floor guarantees it), so the loop never
-            // spins without an await. #1483 SEAM: `collect_voucher` reads +
-            // verifies + durably commits + acks one voucher; group-commit will
-            // split its commit-and-ack tail (see `commit_and_ack_voucher`) to
-            // fsync a batch once and ack after, spending window headroom rather
-            // than re-plumbing this loop. ---
-            let to_collect = if let Some(delta) = pending.pop_front() {
-                Some(delta)
-            } else if done_delivering && unvouchered > 0 {
-                let closing = unvouchered;
+            // Once the whole blob is on the wire, fold the closing sub-interval
+            // remainder into `pending` as a final delta so the recoup batch drains
+            // it uniformly with the completed intervals.
+            if done_delivering && unvouchered > 0 {
+                pending.push_back(unvouchered);
                 unvouchered = 0;
-                Some(closing)
-            } else {
-                None
-            };
-            if let Some(delta) = to_collect {
-                match self
-                    .collect_voucher(
+            }
+
+            // --- recoup phase: batch up to `batch_cap` completed intervals into
+            // ONE fsynced commit, acking each voucher only after the commit is
+            // durable (#1483, group commit). When the window blocks the deliver
+            // phase there is always a completed interval to collect (the
+            // one-interval floor guarantees it), so the loop never spins without an
+            // await. At `batch_cap == 1` (stop-and-wait) this is one voucher per
+            // recoup — the pre-batch cadence. ---
+            let mut deltas: Vec<u64> = Vec::with_capacity(batch_cap);
+            while deltas.len() < batch_cap {
+                match pending.pop_front() {
+                    Some(delta) => deltas.push(delta),
+                    None => break,
+                }
+            }
+            let collected_any = !deltas.is_empty();
+            if collected_any {
+                let outcome = self
+                    .collect_voucher_batch(
                         send,
                         recv,
+                        &mut reader,
                         hash,
                         channel_id,
                         channel,
                         client_node_id,
                         rate_per_mb,
-                        delta,
+                        &deltas,
                     )
-                    .await?
+                    .await?;
+                // Advance `paid` by exactly the committed prefix's bytes.
+                let paid_bytes: u64 = deltas.iter().take(outcome.committed).sum();
+                paid = paid.saturating_add(paid_bytes);
+                // Re-queue deltas the client had not yet paid (a short batch — it
+                // has not sent those vouchers yet), preserving order at the front.
+                for &delta in deltas
+                    .get(outcome.committed..)
+                    .unwrap_or_default()
+                    .iter()
+                    .rev()
                 {
-                    VoucherOutcome::Accepted => paid = paid.saturating_add(delta),
-                    VoucherOutcome::Rejected => return Ok(()),
+                    pending.push_front(delta);
+                }
+                match outcome.stop {
+                    BatchStop::Rejected => return Ok(()),
+                    BatchStop::Continue => {}
                 }
             }
 
@@ -178,17 +209,19 @@ impl ClientHandler {
             // ~one interval, since each later iteration delivers roughly one
             // interval before recouping), so detection latency is window-bounded,
             // not per-MB — the one-interval floor caps it, and even a full window is
-            // negligible against the takedown compliance window. The check sits
-            // AFTER a voucher so the bytes already on the wire are still paid for —
-            // the takedown stops FURTHER delivery, it does not retroactively make
-            // the last interval free. Only meaningful while bytes remain to
-            // withhold: a takedown landing at the final voucher has nothing left to
-            // stop, and terminating there would turn a complete, fully-paid delivery
-            // into a reset (no `StreamEnd`) — hence the `!done` guard. (The fused
-            // `window_forward_loop` deliberately omits that guard: it is acquiring
-            // the blob, so a final-voucher takedown must still abandon the pull to
-            // avoid promoting a taken-down blob into cache.)
-            if !done && to_collect.is_some() && self.takedown_landed(hash, funder) {
+            // negligible against the takedown compliance window. Gated on
+            // `collected_any` so it runs only after a committed batch — mirroring
+            // `window_forward_loop`, which nests the equivalent check under its own
+            // `collected_any`. The check sits AFTER a voucher so the bytes already
+            // on the wire are still paid for — the takedown stops FURTHER delivery,
+            // it does not retroactively make the last interval free. Only meaningful
+            // while bytes remain to withhold: a takedown landing at the final
+            // voucher has nothing left to stop, and terminating there would turn a
+            // complete, fully-paid delivery into a reset (no `StreamEnd`) — hence the
+            // `!done` guard. (The fused `window_forward_loop` deliberately omits that
+            // guard: it is acquiring the blob, so a final-voucher takedown must still
+            // abandon the pull to avoid promoting a taken-down blob into cache.)
+            if collected_any && !done && self.takedown_landed(hash, funder) {
                 self.terminate_for_takedown(send, recv, hash);
                 return Ok(());
             }

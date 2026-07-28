@@ -1206,6 +1206,12 @@ async fn build_chain_and_handlers(
     // Downstream paid-delivery credit window (ADR 003 §Credit window, #1477).
     client_deps.credit_window_bytes =
         Some(decdn_cache::Bytes::new(cfg.payment.credit_window_bytes));
+    // Group-commit interval (ADR 003 §Off-chain voucher state persistence, #1483):
+    // amortize the per-voucher fsync across a batch, acking each only after the
+    // durable commit.
+    client_deps.voucher_commit_interval = Some(std::time::Duration::from_millis(
+        cfg.payment.voucher_commit_interval_ms,
+    ));
     client_deps.leech_governor = leech_governor;
     client_deps.pull_origin_gate = pull_origin_gate;
     let client_handler = Arc::new(ClientHandler::new(client_deps)?);
@@ -3694,6 +3700,8 @@ mod tests {
                 delivery_floor: 0,
                 voucher_interval_mb: decdn_protocol::DEFAULT_VOUCHER_INTERVAL_MB,
                 credit_window_bytes: decdn_common::config::DEFAULT_CREDIT_WINDOW_BYTES,
+                voucher_commit_interval_ms:
+                    decdn_common::config::DEFAULT_VOUCHER_COMMIT_INTERVAL_MS,
             },
             observability: ResolvedObservability {
                 log_level: decdn_common::cli::common::LogLevel::Info,

@@ -1,64 +1,139 @@
 //! Voucher collection / payment loop + cooperative-close authorization.
-//! Bodies split from `mod.rs` (#1254).
+//! Bodies split from `mod.rs` (#1254). Group-commit batching added in #1483.
 
 use super::{
-    Arc, B256, ChannelDeliveryState, ChannelId, ClientHandler, ClientMessage, CooperativeClose,
-    CooperativeCloseAuth, CooperativeCloseRequest, DEFAULT_TOLERANCE_BPS, Hash, Mutex, RateError,
-    RecvStream, SendStream, SignedVoucher, U256, VoucherOutcome, VoucherRejectReason,
-    WatermarkBundle, read_voucher, verify_rate, voucher_reject_reason, wire_voucher_to_signed,
+    Arc, B256, BatchOutcome, BatchStop, BufferedVoucherReader, ChannelDeliveryState, ChannelId,
+    ChannelState, ClientHandler, ClientMessage, CooperativeClose, CooperativeCloseAuth,
+    CooperativeCloseRequest, DEFAULT_TOLERANCE_BPS, Hash, Mutex, RateError, RecvStream, SendStream,
+    SignedVoucher, U256, VOUCHER_READ_TIMEOUT, VoucherRejectReason, WatermarkBundle, verify_rate,
+    voucher_reject_reason, wire_voucher_to_signed,
 };
 
+/// A voucher that passed the node-side verify half against the advancing
+/// candidate and is awaiting the batch's single durable commit (#1483).
+struct StagedVoucher {
+    /// Bytes this voucher pays for (its interval delta) — for `paid` accounting,
+    /// the audit receipt, and per-region / seed-leech crediting.
+    delta_bytes: u64,
+    /// The client's wire nonce (big-endian), for the audit receipt (#248/#803).
+    wire_nonce: [u8; 32],
+    /// Whether accepting this voucher skipped nonce values (#747 gap metric).
+    gapped: bool,
+}
+
+/// A voucher that passed the node-side verify half, carrying the advanced
+/// candidate state, its cumulative byte watermark, and the staged bookkeeping.
+struct VerifiedVoucher {
+    next_state: ChannelState,
+    new_bytes: U256,
+    staged: StagedVoucher,
+}
+
+/// Why the node-side verify half stopped the batch at a voucher (#1483). The
+/// valid prefix is committed + acked before this is acted on.
+enum VerifyStop {
+    /// Reject cleanly with this wire reason, then finish the stream (#751).
+    /// The optional [`WatermarkBundle`] rides the wallet-less-resume path
+    /// (#1481 §5): it is `Some` only for a watermark-gated regression/exhaustion
+    /// reason whose rejected voucher recovers to the channel's pinned
+    /// `voucher_signer`, and carries the node's true watermark so an authorized
+    /// funder can re-seed and resume. Every other reason carries `None`.
+    Reject(VoucherRejectReason, Option<WatermarkBundle>),
+    /// Fail the stream — there is no wire reason for this fault (a buyer
+    /// underpayment), and the client is blocked awaiting `VoucherAck` so it
+    /// cannot resend mid-stream (ADR 003 §Voucher withholding).
+    Bail(String),
+}
+
 impl ClientHandler {
-    /// Read and apply one cumulative voucher covering `delta_bytes` of newly
-    /// delivered bytes. A permanent voucher rejection writes a `StreamError` and
-    /// finishes the stream cleanly (no reset). A transient store-write failure
-    /// is likewise surfaced cleanly as `VoucherRejectReason::RetryLater` so the
-    /// client resends the same voucher on a fresh stream (ADR 003 §332).
+    /// Collect, durably commit, and acknowledge a **batch** of cumulative
+    /// vouchers with a single fsync (#1483, group commit).
     ///
-    /// Two distinct rate checks below, only one of which fails the stream:
-    /// - the per-delta **advertised-rate** check (vs the quote) `bail!`s on a
-    ///   genuine buyer *underpayment* — no wire reason exists for it and the client
-    ///   is blocked awaiting `VoucherAck`, so it cannot resend mid-stream;
-    /// - the cumulative **live-floor** check rejects cleanly with
-    ///   `VoucherRejectReason::RateFloorRaised` when a governance floor raise made
-    ///   the quote stale (#1382) — the buyer is honest and should re-quote, so this
-    ///   does NOT fail the stream, it writes the wire reason like the other
-    ///   handler-direct rejections.
+    /// `deltas` are the completed interval sizes the serve loop has delivered and
+    /// not yet recouped, drained front-to-back (a closing partial is just the
+    /// last entry). The batch reads at most `deltas.len()` vouchers: the first
+    /// blocking (so the loop makes progress and parks awaiting a voucher exactly
+    /// as before), the rest gathered under [`ClientHandler::commit_interval`] so
+    /// a client that pauses payment is never waited on longer than that. Each
+    /// voucher is verified against an advancing candidate; because vouchers are
+    /// cumulative, the whole batch commits as ONE `store.record` of the final
+    /// candidate — the highest voucher supersedes every earlier one, so a single
+    /// fsync amortizes across the batch with no loss.
+    ///
+    /// **Durability ordering (ADR 003 §Off-chain voucher state persistence).**
+    /// Nothing is acknowledged before it is durable: the fsynced commit runs
+    /// first, then a `VoucherAck` is written per committed voucher. A commit
+    /// failure fails the WHOLE batch — every voucher gets `RetryLater`, none an
+    /// ack — and in-memory state is left unchanged, so the client resends the
+    /// batch on a fresh stream. Delaying the ack by one commit interval is free
+    /// throughput-wise because #1477's credit window keeps it off the delivery
+    /// critical path; it spends window headroom, sized by
+    /// `credit_window >= throughput * (RTT + commit_interval)`.
+    ///
+    /// On a mid-batch verify rejection, the valid prefix is committed + acked
+    /// first (one fsync), then the offending voucher's rejection is written —
+    /// faithful to the pre-batch per-voucher order. Returns the number of
+    /// committed vouchers (so the loop advances `paid` and re-queues any deltas
+    /// the client had not yet sent) and whether the stream must end.
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-    pub(super) async fn collect_voucher(
+    pub(super) async fn collect_voucher_batch(
         &self,
         send: &mut SendStream,
         recv: &mut RecvStream,
+        reader: &mut BufferedVoucherReader,
         hash: Hash,
         channel_id: ChannelId,
         channel: Option<&Arc<Mutex<ChannelDeliveryState>>>,
         client_node_id: B256,
         rate_per_mb: u64,
-        delta_bytes: u64,
-    ) -> anyhow::Result<VoucherOutcome> {
-        let wire = read_voucher(recv).await?;
-
-        // Unknown channel (#327 boundary). Since #848, `serve_stream` refuses an
-        // unknown channel pre-serve, so this arm is unreachable from the sole
-        // caller (`deliver` always forwards `Some`); kept as a defensive backstop
-        // — reject with the closest mid-stream reason.
+        deltas: &[u64],
+    ) -> anyhow::Result<BatchOutcome> {
+        // Unknown channel (#327 boundary): `serve_stream` refuses an unknown
+        // channel pre-serve, so this arm is unreachable from the sole callers
+        // (which always forward `Some`); kept as a defensive backstop.
         let Some(channel) = channel else {
             self.write_reject(send, VoucherRejectReason::WrongChannel, None)
                 .await?;
-            return Ok(VoucherOutcome::Rejected);
+            return Ok(BatchOutcome {
+                committed: 0,
+                stop: BatchStop::Rejected,
+            });
         };
 
+        // (1) GATHER — read up to `deltas.len()` wire vouchers WITHOUT holding
+        // the per-channel lock (a network read must not block same-channel
+        // streams). The first read blocks under `VOUCHER_READ_TIMEOUT` (a stalled
+        // client still errors out); the rest wait only `commit_interval`, so a
+        // client that stops paying flushes the batch it has instead of stalling.
+        // The reader is cancellation-safe, so a `commit_interval` timeout mid-frame
+        // buffers the partial for the next call rather than tearing the stream.
+        let mut wires = Vec::with_capacity(deltas.len());
+        {
+            let first = tokio::time::timeout(VOUCHER_READ_TIMEOUT, reader.read(recv))
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!("voucher read timed out after {VOUCHER_READ_TIMEOUT:?}")
+                })??;
+            wires.push(first);
+        }
+        let commit_interval = self.commit_interval();
+        while wires.len() < deltas.len() {
+            match tokio::time::timeout(commit_interval, reader.read(recv)).await {
+                Ok(Ok(v)) => wires.push(v),
+                Ok(Err(e)) => return Err(e),
+                Err(_elapsed) => break,
+            }
+        }
+
+        // (2) VERIFY under the per-channel lock (so the watermark checked is the
+        // watermark committed) against an advancing candidate. The candidate is a
+        // CLONE — `guard.state` is only swapped after the durable commit below,
+        // preserving the #527 invariant.
         let guard = channel.lock().await;
 
-        // Expiry gate (#327): once the channel has passed its on-chain
-        // `expiresAt`, `withdraw`/`closeChannel` revert and the client can
-        // `reclaimExpired` for a full refund — any further delivery would be
-        // unpaid. Refuse rather than accept a voucher we could never redeem.
-        // (The settlement sweep normally closes + retires channels well before
-        // this; this is the defense-in-depth for a node that was down through
-        // the close window.) Surface it in-band as `VoucherRejectReason::Expired`
-        // and finish the stream cleanly (#751) so the client sees an actionable
-        // reason instead of an opaque connection drop.
+        // Channel-level gates, checked once for the batch (ADR 003). A batch spans
+        // milliseconds, so a mid-batch expiry / cooperative-close race is bounded
+        // exactly as the pre-batch per-interval check bounded it.
         if crate::payment_settlement::is_expired(
             crate::payment_settlement::unix_now(),
             guard.state.expires_at,
@@ -66,40 +141,127 @@ impl ClientHandler {
             drop(guard);
             self.write_reject(send, VoucherRejectReason::Expired, None)
                 .await?;
-            return Ok(VoucherOutcome::Rejected);
+            return Ok(BatchOutcome {
+                committed: 0,
+                stop: BatchStop::Rejected,
+            });
         }
-
-        // Cooperative-close gate (ADR 003 §Cooperative close): if the node signed
-        // a waiver for this channel (possibly on a separate stream while this one
-        // was mid-flight), it committed to settling at the watermark as of that
-        // moment and must serve no further bytes. Reject in-band so the client
-        // stops and settles, rather than delivering past the amount waived to.
-        // Bounds the loss from signing mid-stream to one voucher interval, so no
-        // "don't sign while delivering" interlock is needed.
         if guard.state.cooperative_close_signed() {
             drop(guard);
             self.write_reject(send, VoucherRejectReason::CooperativeCloseSigned, None)
                 .await?;
-            return Ok(VoucherOutcome::Rejected);
+            return Ok(BatchOutcome {
+                committed: 0,
+                stop: BatchStop::Rejected,
+            });
         }
 
-        let new_bytes = guard
-            .bytes_delivered_cumulative
-            .saturating_add(U256::from(delta_bytes));
-        let amount = U256::from_be_bytes(wire.amount);
-        let amount_delta = amount.saturating_sub(guard.state.last_amount());
+        let mut candidate = guard.state.clone();
+        let mut candidate_bytes = guard.bytes_delivered_cumulative;
+        let mut staged: Vec<StagedVoucher> = Vec::with_capacity(wires.len());
+        // A verify rejection/bail encountered mid-batch — the valid prefix in
+        // `staged` is committed first, then this is emitted.
+        let mut pending_stop: Option<VerifyStop> = None;
 
-        // Rate enforcement (ADR 003 §Voucher withholding). There is no wire
-        // reason code for underpayment, so an underpaying voucher fails the
-        // stream rather than looping — looping would deadlock, since the client
-        // is blocked awaiting `VoucherAck` and cannot send a corrected voucher.
-        //
-        // Match every `RateError` arm explicitly (#845): a non-`Underpayment`
-        // result was previously treated as acceptable and silently passed to
-        // `apply_voucher` (the only backstop). An exhaustive `match` makes a
-        // future variant a build failure here instead. `ZeroBytes`/`Overflow`
-        // cannot occur at this call site — `collect_voucher` runs only when
-        // `unvouchered > 0`, so `delta_bytes > 0` — but are rejected defensively.
+        for (wire, &delta_bytes) in wires.iter().zip(deltas.iter()) {
+            match self.verify_voucher(&candidate, candidate_bytes, wire, rate_per_mb, delta_bytes) {
+                Ok(v) => {
+                    candidate = v.next_state;
+                    candidate_bytes = v.new_bytes;
+                    staged.push(v.staged);
+                }
+                Err(stop) => {
+                    pending_stop = Some(stop);
+                    break;
+                }
+            }
+        }
+
+        // (3) COMMIT the verified prefix with ONE fsync, then ack after.
+        let committed = staged.len();
+        if committed > 0 {
+            match self
+                .commit_batch(
+                    send,
+                    guard,
+                    channel_id,
+                    hash,
+                    client_node_id,
+                    candidate,
+                    candidate_bytes,
+                    &staged,
+                )
+                .await?
+            {
+                // Durable commit failed → the WHOLE batch is RetryLater; nothing
+                // was acked and in-memory state did not advance. A pending verify
+                // rejection is overridden — durability failure is the actionable
+                // signal, and the client must resend the same vouchers.
+                CommitOutcome::StoreFailed => {
+                    // `RetryLater` is never a watermark-gated reason, so no
+                    // bundle is ever attached here (#1481 §5).
+                    self.write_reject(send, VoucherRejectReason::RetryLater, None)
+                        .await?;
+                    return Ok(BatchOutcome {
+                        committed: 0,
+                        stop: BatchStop::Rejected,
+                    });
+                }
+                CommitOutcome::Committed => {}
+            }
+        } else {
+            // No voucher verified (the first one was rejected/bailed): drop the
+            // lock before emitting the rejection, matching the committed path.
+            drop(guard);
+        }
+
+        // (4) Emit any pending verify rejection/bail AFTER the prefix is durable.
+        match pending_stop {
+            None => Ok(BatchOutcome {
+                committed,
+                stop: BatchStop::Continue,
+            }),
+            Some(VerifyStop::Reject(reason, bundle)) => {
+                // The wallet-less-resume bundle (if any) was built inside
+                // `verify_voucher` while the per-channel guard was still held —
+                // it reports the committed-prefix watermark for a gated reason
+                // whose voucher recovered to the pinned signer (#1481 §5).
+                self.write_reject(send, reason, bundle).await?;
+                Ok(BatchOutcome {
+                    committed,
+                    stop: BatchStop::Rejected,
+                })
+            }
+            Some(VerifyStop::Bail(msg)) => Err(anyhow::anyhow!(msg)),
+        }
+    }
+
+    /// The node-side verify half for ONE voucher, evaluated against the advancing
+    /// candidate (`state` / `cumulative_bytes`) with no durable side effect. Two
+    /// distinct rate checks, mirroring the pre-batch `collect_voucher`:
+    /// - the per-delta **advertised-rate** check bails on a genuine underpayment
+    ///   (no wire reason, the client is blocked awaiting an ack so cannot resend);
+    /// - the cumulative **live-floor** check rejects cleanly with
+    ///   `RateFloorRaised` when a governance floor raise made the quote stale
+    ///   (#1382), else bails.
+    ///
+    /// See [`Self::collect_voucher_batch`] for the durable-commit half.
+    fn verify_voucher(
+        &self,
+        state: &ChannelState,
+        cumulative_bytes: U256,
+        wire: &decdn_protocol::client::Voucher,
+        rate_per_mb: u64,
+        delta_bytes: u64,
+    ) -> Result<VerifiedVoucher, VerifyStop> {
+        let new_bytes = cumulative_bytes.saturating_add(U256::from(delta_bytes));
+        let amount = U256::from_be_bytes(wire.amount);
+        let amount_delta = amount.saturating_sub(state.last_amount());
+
+        // Advertised-rate check (ADR 003 §Voucher withholding). Match every
+        // `RateError` arm (#845) so a future variant is a build failure here.
+        // `ZeroBytes`/`Overflow` cannot occur (`delta_bytes > 0`) but are rejected
+        // defensively.
         match verify_rate(
             amount_delta,
             U256::from(delta_bytes),
@@ -108,263 +270,202 @@ impl ClientHandler {
         ) {
             Ok(()) => {}
             Err(RateError::Underpayment { .. }) => {
-                drop(guard);
-                anyhow::bail!("voucher underpays for {delta_bytes} delivered bytes");
+                return Err(VerifyStop::Bail(format!(
+                    "voucher underpays for {delta_bytes} delivered bytes"
+                )));
             }
             Err(e @ (RateError::ZeroBytes | RateError::Overflow)) => {
-                drop(guard);
-                anyhow::bail!("voucher fails rate check for {delta_bytes} delivered bytes: {e}");
+                return Err(VerifyStop::Bail(format!(
+                    "voucher fails rate check for {delta_bytes} delivered bytes: {e}"
+                )));
             }
         }
 
         // Hard per-byte price floor (#846), checked on the CUMULATIVE watermark
-        // the voucher carries (`amount` / `new_bytes`) — not the per-voucher
-        // delta — so it mirrors the on-chain `PaymentChannel`
-        // `_advanceClaimWatermark` `RateFloorViolation` guard exactly: the chain
-        // floors `bytesDelivered <= mulDiv(amount, BYTES_PER_MB, deliveryFloor)`
-        // on the cumulative claim, never on a single delta. The advertised check
-        // above is per-delta at 1% tolerance; this is the cumulative floor at
-        // ZERO tolerance, so a synced node never countersigns a voucher it then
-        // cannot redeem — including the case where an earlier under-floor voucher
-        // (accepted while the floor was 0) drags the watermark below the floor
-        // even though the latest delta alone would clear it. A per-delta check
-        // would both miss that (false accept) and reject a delta drawing down an
-        // earlier overpayment surplus the chain would settle (false reject).
-        //
-        // Scope follows the live delivery floor, sourced from on-chain
-        // `getRateBounds()` and tracked by the `RateBoundsUpdated` watcher
-        // (#1172, ADR 005). `PaymentChannel` enforces `newFloor >=
-        // MIN_DEPOSIT_FLOOR (1)`, and the runtime overwrites the config seed
-        // from chain before serving, so this check is always live — the former
-        // `0`-floor "free-serving config" (#864) is no longer reachable once
-        // the chain read lands. `new_bytes >= delta_bytes > 0`, so `ZeroBytes`
-        // cannot occur; match every arm anyway (#845) so a future `RateError`
-        // variant is a build failure rather than a silent accept.
-        // Snapshot the live floor once: reused both for the check and to classify a
-        // rejection below, so the two reads cannot disagree.
+        // the voucher carries (mirrors the on-chain `_advanceClaimWatermark`
+        // `RateFloorViolation` guard at ZERO tolerance). Snapshot the live floor
+        // once so the check and the rejection classification cannot disagree.
         let live_floor = self.rate_bounds.floor();
         match verify_rate(amount, new_bytes, live_floor, 0) {
             Ok(()) => {}
             Err(RateError::Underpayment { .. }) => {
-                // The cumulative watermark prices bytes below the LIVE delivery
-                // floor, so this voucher is unredeemable on-chain
-                // (`_advanceClaimWatermark` → `RateFloorViolation`). Refusing is
-                // correct self-protection either way, but the CAUSE — and so the
-                // right signal to the buyer — splits on whether the floor rose
-                // above what this stream was quoted:
                 self.metrics.voucher_rate_floor_rejected();
-                drop(guard);
                 if live_floor > rate_per_mb {
                     // A governance floor raise landed between the signed quote and
-                    // this voucher (#1382): the buyer is honest, its quote is just
-                    // stale. Surface the typed re-quote signal in-band rather than
-                    // an opaque `bail!` — the client should re-probe/re-quote at the
-                    // new floor, not resend this voucher.
-                    self.write_reject(send, VoucherRejectReason::RateFloorRaised, None)
-                        .await?;
-                    return Ok(VoucherOutcome::Rejected);
+                    // this voucher (#1382): the buyer is honest, its quote is
+                    // stale. Surface the typed re-quote signal in-band.
+                    // `RateFloorRaised` is not a watermark-gated reason (#1481 §5),
+                    // so no bundle is attached.
+                    return Err(VerifyStop::Reject(
+                        VoucherRejectReason::RateFloorRaised,
+                        None,
+                    ));
                 }
-                // The floor did NOT rise above the quote, yet the cumulative payment
-                // is still under it — a genuine underpayment the per-delta check's
-                // tolerance let through (e.g. paying ~0.99× the floor each delta, or
-                // an earlier under-floor voucher dragging the watermark). That is the
-                // buyer's fault, NOT a stale quote, so it must not read as a
-                // "floor raised — re-quote" signal; fail the stream like the
-                // per-delta underpayment above.
-                anyhow::bail!(
+                // The floor did NOT rise above the quote, yet the cumulative
+                // payment is still under it — a genuine underpayment the per-delta
+                // tolerance let through. The buyer's fault; fail the stream.
+                return Err(VerifyStop::Bail(format!(
                     "voucher below the cumulative rate floor for {delta_bytes} delivered bytes"
-                );
+                )));
             }
             Err(e @ (RateError::ZeroBytes | RateError::Overflow)) => {
-                drop(guard);
-                anyhow::bail!("voucher fails floor check for {delta_bytes} delivered bytes: {e}");
+                return Err(VerifyStop::Bail(format!(
+                    "voucher fails floor check for {delta_bytes} delivered bytes: {e}"
+                )));
             }
         }
 
-        let Ok(signed) = wire_voucher_to_signed(&wire, channel_id, guard.state.token, new_bytes)
+        let Ok(signed) = wire_voucher_to_signed(wire, state.channel_id, state.token, new_bytes)
         else {
-            drop(guard);
-            self.write_reject(send, VoucherRejectReason::BadSignature, None)
-                .await?;
-            return Ok(VoucherOutcome::Rejected);
+            // `BadSignature` is not a watermark-gated reason (#1481 §5).
+            return Err(VerifyStop::Reject(VoucherRejectReason::BadSignature, None));
         };
 
-        // Everything above is the VERIFY half — it takes no durable action. The
-        // COMMIT-AND-ACK half is delegated so the two are separable (#1483 seam):
-        // group-commit will call the verify half for several vouchers, then a
-        // batched form of the commit half that fsyncs once and acks after,
-        // without touching this verify path or the deliver loop that calls it.
-        self.commit_and_ack_voucher(
-            send,
-            guard,
-            hash,
-            channel_id,
-            client_node_id,
-            delta_bytes,
-            wire.nonce,
-            signed,
-            new_bytes,
-        )
-        .await
+        // Validate + advance the candidate in memory only (no store). Cumulative
+        // vouchers mean the returned `next_state` supersedes `state`, so the batch
+        // records only the final candidate (one fsync). A validation error maps to
+        // its wire reject reason; `stage_voucher` never touches a store, so it can
+        // never surface `RetryLater` here (that is reserved for the commit).
+        match state.stage_voucher(&signed, &self.voucher_domain) {
+            Ok((next_state, applied)) => Ok(VerifiedVoucher {
+                next_state,
+                new_bytes,
+                staged: StagedVoucher {
+                    delta_bytes,
+                    wire_nonce: wire.nonce,
+                    gapped: applied.is_gapped(),
+                },
+            }),
+            Err(e) => {
+                // Map to the wire reject reason; a non-mappable store/validation
+                // error falls back to `RetryLater` (never watermark-gated). This
+                // preserves the pre-batch `voucher_reject_reason` classification.
+                let reason = voucher_reject_reason(&e).unwrap_or(VoucherRejectReason::RetryLater);
+                // Wallet-less resume (#1481 §5): for a gated regression/exhaustion
+                // reason whose rejected voucher recovers to the pinned signer,
+                // attach the node's true watermark so an authorized funder can
+                // re-seed and resume. `signed` is the SAME reconstructed voucher
+                // just validated above; `state` is the advancing candidate under
+                // the still-held per-channel guard, so its `last_*` is exactly the
+                // committed-prefix watermark the client should resume from.
+                let bundle = self.watermark_bundle_for_reject(reason, &signed, state);
+                Err(VerifyStop::Reject(reason, bundle))
+            }
+        }
     }
 
-    /// Durably commit an already-verified voucher and acknowledge it — the
-    /// commit-and-ack half of [`Self::collect_voucher`], factored out as the
-    /// group-commit seam (#1483).
+    /// Build the wallet-less-resume [`WatermarkBundle`] for a rejected voucher
+    /// (#1481 §5), or `None` when the voucher is not eligible. Returns `Some`
+    /// only when ALL hold:
+    /// - `reason` is one of the four watermark-gated regression/exhaustion
+    ///   reasons (`StaleNonce` / `AmountRegression` / `BytesRegression` /
+    ///   `InsufficientDeposit`) — every other reason is never gated;
+    /// - the `rejected` voucher's signature recovers to `state.voucher_signer`,
+    ///   the channel's pinned signer — otherwise anyone who guessed the
+    ///   chain-derivable `channel_id` could pull a channel's private watermark
+    ///   with a garbage voucher;
+    /// - the channel has a prior accepted voucher (`last_signature` is `Some`)
+    ///   to echo back.
+    ///
+    /// The watermark reported is `state`'s last-accepted amount / nonce / bytes.
+    /// In the batched flow `state` is the advancing candidate, so this is the
+    /// committed-prefix watermark; the caller reads it while still holding the
+    /// per-channel guard, before the commit swaps it into the live state.
+    fn watermark_bundle_for_reject(
+        &self,
+        reason: VoucherRejectReason,
+        rejected: &SignedVoucher,
+        state: &ChannelState,
+    ) -> Option<WatermarkBundle> {
+        if !reason.is_watermark_gated() {
+            return None;
+        }
+        let recovered = rejected.recover_signer(&self.voucher_domain).ok()?;
+        if recovered != state.voucher_signer {
+            return None;
+        }
+        let last_signature = state.last_signature()?;
+        Some(WatermarkBundle {
+            amount: state.last_amount().to_be_bytes(),
+            nonce: state.last_nonce().to_be_bytes(),
+            bytes_delivered: state.last_bytes_delivered().to_be_bytes(),
+            last_signature: last_signature.to_vec(),
+        })
+    }
+
+    /// Durably commit the advanced `candidate` (ONE fsynced `store.record`, held
+    /// on the blocking pool so it never blocks a runtime worker), swap it into
+    /// the live channel state, then write one `VoucherAck` per staged voucher and
+    /// run each voucher's post-commit bookkeeping (#1483).
     ///
     /// `guard` is the per-channel lock, still held from verification so no
-    /// concurrent voucher can advance the watermark between the value that was
-    /// checked and the value committed here; it is moved in and dropped once the
-    /// commit lands. `signed` / `new_bytes` are the verified voucher and the
-    /// cumulative byte watermark it advances to.
-    ///
-    /// # The #1483 seam
-    ///
-    /// The fsync and the `VoucherAck` are the two things group-commit reorders:
-    /// today this method performs one fsynced `ChannelState::apply_voucher` and
-    /// then acks, so nothing is ever acked before it is durable (ADR 003 §Off-chain
-    /// voucher state persistence). Group-commit will batch the fsync across several
-    /// verified vouchers and ack the batch after the single commit returns — the
-    /// credit window (#1477) is what takes that delayed ack off the critical path,
-    /// so it spends window headroom rather than stalling delivery. Keeping the
-    /// commit-and-ack in one method, distinct from verification, is what lets that
-    /// land without re-plumbing the deliver loop or the verify path.
+    /// concurrent voucher advances the watermark between the value checked and
+    /// the value committed; it is dropped once the commit lands, before any
+    /// network write. On a store failure `guard.state` is NOT advanced and
+    /// [`CommitOutcome::StoreFailed`] is returned so the caller rejects the whole
+    /// batch with `RetryLater` — never acking un-durable state (#527, ADR 003).
     #[allow(clippy::too_many_arguments)]
-    pub(super) async fn commit_and_ack_voucher(
+    async fn commit_batch(
         &self,
         send: &mut SendStream,
         mut guard: tokio::sync::MutexGuard<'_, ChannelDeliveryState>,
-        hash: Hash,
         channel_id: ChannelId,
+        hash: Hash,
         client_node_id: B256,
-        delta_bytes: u64,
-        wire_nonce: [u8; 32],
-        signed: SignedVoucher,
-        new_bytes: U256,
-    ) -> anyhow::Result<VoucherOutcome> {
-        // `apply_voucher` performs a synchronous fsynced redb write (store
-        // trait §Durability), which must not block a runtime worker — run it on
-        // the blocking pool against a clone. The per-channel guard is held
-        // across the await so same-channel streams still serialize (ADR 003
-        // §concurrent streams); the clone is committed back to in-memory state
-        // only on `Ok`, preserving the strict-durability invariant (#527).
-        let mut candidate = guard.state.clone();
-        let signed_c = signed.clone();
-        let domain = self.voucher_domain.clone();
+        candidate: ChannelState,
+        candidate_bytes: U256,
+        staged: &[StagedVoucher],
+    ) -> anyhow::Result<CommitOutcome> {
         let store = Arc::clone(&self.channel_state_store);
-        let (apply_res, candidate) = tokio::task::spawn_blocking(move || {
-            let res = candidate.apply_voucher(&signed_c, &domain, &*store);
+        let (record_res, candidate) = tokio::task::spawn_blocking(move || {
+            let res = store.record(&candidate);
             (res, candidate)
         })
         .await
-        .map_err(|e| anyhow::anyhow!("voucher apply task failed: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("voucher batch commit task failed: {e}"))?;
 
-        match apply_res {
-            Ok(applied) => {
-                guard.state = candidate;
-                guard.bytes_delivered_cumulative = new_bytes;
-                drop(guard);
-                // Stamp the in-memory last-voucher clock for
-                // `admin_v1_channels` (issue #749). Best-effort: an
-                // unset clock (no admin surface) just skips. Done
-                // after the guard drop — the activity map has its own
-                // lock and doesn't need the per-channel guard.
-                if let Some(activity) = self.voucher_activity.as_ref() {
-                    activity.touch(channel_id);
-                }
-                // Audit receipt for this served-and-paid interval (issues #248,
-                // #803): a non-blocking enqueue before `VoucherAck`; the write
-                // happens off the hot path in the background receipt writer.
-                self.record_receipt(hash, delta_bytes, client_node_id, wire_nonce);
-                // Per-region bandwidth accounting (#750). Best-effort: an
-                // unset accountant (tests / no admin surface) skips.
-                // `delta_bytes` is exactly the bytes paid for this interval.
-                if let Some(acc) = self.region_accountant.as_ref() {
-                    acc.record_served(&client_node_id.0, delta_bytes).await;
-                }
-                // Credit the served bytes against the seed-leech caps (#856) for
-                // BOTH cache-hit and window-paced pull-through serves: this
-                // recoups the node-wide unrecouped-leech budget and raises the
-                // paying peer's per-peer share-ratio allowance. Best-effort —
-                // unset (tests / feature off) just skips.
-                if let Some(gov) = self.leech_governor.as_ref() {
-                    gov.record_served(&client_node_id.0, delta_bytes);
-                }
-                // Nonce-gap signal (#747): the voucher was accepted, but its
-                // nonce skipped values past the prior `last_nonce + 1`. The
-                // structured `tracing::warn!` already fired inside
-                // `apply_voucher`; here we surface the rate to operators via
-                // `decdn_voucher_nonce_gaps_total` for alerting.
-                if applied.is_gapped() {
-                    self.metrics.voucher_nonce_gap();
-                }
-                // Hint the on-chain settlement service that this channel's
-                // accrued claim advanced (#327). Best-effort: an unset or
-                // full hint channel just skips — the next voucher re-hints, the
-                // redeemer self-tick sweeps, and shutdown closes any residual
-                // claim. Only `Full` is counted (a saturated queue is a real
-                // dropped hint; a sustained rate is the signal worth watching,
-                // #751). `Closed` — the redeemer aborted during shutdown
-                // `quiesce_redeemer` — is expected, not a fault, so it is
-                // deliberately left uncounted; don't "fix" this to count both.
-                if let Some(tx) = self.redeem_hint.as_ref()
-                    && let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) =
-                        tx.try_send(channel_id)
-                {
-                    self.metrics.redeem_hint_dropped();
-                }
-                self.write_message(send, &ClientMessage::VoucherAck).await?;
-                Ok(VoucherOutcome::Accepted)
-            }
-            Err(e) => {
-                let reason_result = voucher_reject_reason(&e);
-                // Wallet-less resume (issue #1481 §5): on a gated regression/
-                // exhaustion reject, attach the node's true watermark ONLY when
-                // the rejected voucher's signature recovers to this channel's
-                // pinned `voucher_signer` — otherwise anyone who guessed the
-                // chain-derivable `channel_id` could pull the watermark by
-                // sending a garbage voucher. `apply_voucher`'s regression checks
-                // fire BEFORE its signature check, so the reject reason alone
-                // does not prove signer identity; recovery must be run
-                // explicitly, here, before the guard (and its `last_*` state)
-                // drops. `signed` is the SAME reconstructed voucher already
-                // validated above (`wire_voucher_to_signed`) — no need to
-                // rebuild it.
-                let bundle = reason_result.ok().and_then(|reason| {
-                    if !reason.is_watermark_gated() {
-                        return None;
-                    }
-                    let recovered = signed.recover_signer(&self.voucher_domain).ok()?;
-                    if recovered != guard.state.voucher_signer {
-                        return None;
-                    }
-                    let last_signature = guard.state.last_signature()?;
-                    Some(WatermarkBundle {
-                        amount: guard.state.last_amount().to_be_bytes(),
-                        nonce: guard.state.last_nonce().to_be_bytes(),
-                        bytes_delivered: guard.state.last_bytes_delivered().to_be_bytes(),
-                        last_signature: last_signature.to_vec(),
-                    })
-                });
-                drop(guard);
-                if let Ok(reason) = reason_result {
-                    self.write_reject(send, reason, bundle).await?;
-                    Ok(VoucherOutcome::Rejected)
-                } else {
-                    // Transient store failure (#527, `RetrySignal`): in-memory
-                    // state did not advance. Surface it in-band as `RetryLater`
-                    // and finish the stream cleanly (MUST NOT `VoucherAck`, ADR
-                    // 003 §332) so the client resends the same voucher on a
-                    // fresh stream rather than seeing an opaque connection drop.
-                    // `RetryLater` is never a gated reason, so `bundle` is
-                    // always `None` here regardless of what was computed above.
-                    tracing::warn!(error = %e, "channel store write failed; rejecting with RetryLater");
-                    self.write_reject(send, VoucherRejectReason::RetryLater, None)
-                        .await?;
-                    Ok(VoucherOutcome::Rejected)
-                }
-            }
+        if let Err(e) = record_res {
+            // Transient store failure (#527): in-memory state did not advance.
+            // Surface `RetryLater` to the caller (which finishes the stream
+            // cleanly); MUST NOT `VoucherAck` (ADR 003 §355).
+            drop(guard);
+            tracing::warn!(error = %e, "channel store batch commit failed; rejecting with RetryLater");
+            return Ok(CommitOutcome::StoreFailed);
         }
+
+        // Durable. Advance in-memory state to the final cumulative watermark and
+        // release the lock before any network write.
+        guard.state = candidate;
+        guard.bytes_delivered_cumulative = candidate_bytes;
+        drop(guard);
+
+        // Post-commit, per-voucher bookkeeping + one `VoucherAck` each. All
+        // side effects here are best-effort and off the durability path.
+        for s in staged {
+            self.record_receipt(hash, s.delta_bytes, client_node_id, s.wire_nonce);
+            if let Some(acc) = self.region_accountant.as_ref() {
+                acc.record_served(&client_node_id.0, s.delta_bytes).await;
+            }
+            if let Some(gov) = self.leech_governor.as_ref() {
+                gov.record_served(&client_node_id.0, s.delta_bytes);
+            }
+            if s.gapped {
+                self.metrics.voucher_nonce_gap();
+            }
+            self.write_message(send, &ClientMessage::VoucherAck).await?;
+        }
+
+        // Channel-level, once per batch: stamp the admin last-voucher clock and
+        // hint the settlement service that the accrued claim advanced (#749/#327).
+        if let Some(activity) = self.voucher_activity.as_ref() {
+            activity.touch(channel_id);
+        }
+        if let Some(tx) = self.redeem_hint.as_ref()
+            && let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) = tx.try_send(channel_id)
+        {
+            self.metrics.redeem_hint_dropped();
+        }
+        Ok(CommitOutcome::Committed)
     }
 
     /// Answer a [`CooperativeCloseRequest`] (ADR 003 §Cooperative close): sign a
@@ -380,7 +481,7 @@ impl ClientHandler {
     /// the auth is sent — so a store failure leaves the channel still serveable
     /// and the node has not handed out a waiver it won't remember. Once flagged,
     /// the node serves no further bytes on the channel (the `serve_stream` and
-    /// `collect_voucher` gates).
+    /// `collect_voucher_batch` gates).
     pub(super) async fn handle_cooperative_close(
         &self,
         mut send: SendStream,
@@ -492,4 +593,13 @@ impl ClientHandler {
         let _ = send.finish();
         Ok(())
     }
+}
+
+/// Outcome of the durable half of a voucher batch ([`ClientHandler::commit_batch`]).
+enum CommitOutcome {
+    /// The batch fsynced, state advanced, and every voucher was acked.
+    Committed,
+    /// The fsynced `store.record` failed; in-memory state is unchanged and no
+    /// voucher was acked. The caller rejects the whole batch with `RetryLater`.
+    StoreFailed,
 }
