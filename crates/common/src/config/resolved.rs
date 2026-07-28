@@ -435,9 +435,15 @@ pub struct ResolvedPayment {
     pub delivery_floor: u64,
     /// Voucher cadence advertised in `StreamResponse` for `cdn/client/v1`
     /// (ADR 003 §Voucher Interval Negotiation); default
-    /// [`decdn_protocol::DEFAULT_VOUCHER_INTERVAL_MB`], range
+    /// [`crate::config::DEFAULT_VOUCHER_INTERVAL_MB`], range
     /// `1..=`[`decdn_protocol::MAX_VOUCHER_INTERVAL_MB`].
     pub voucher_interval_mb: u64,
+    /// Downstream paid-delivery credit window in bytes (ADR 003 §Credit window):
+    /// how far past cleared payment the serve loop streams before collecting a
+    /// voucher. Default [`crate::config::DEFAULT_CREDIT_WINDOW_BYTES`] (8 MiB);
+    /// floored at one voucher interval by the serve loop, so a value at or below
+    /// one interval is stop-and-wait.
+    pub credit_window_bytes: u64,
 }
 
 /// Resolved gossip fields (ADR 001).

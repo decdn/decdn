@@ -3,14 +3,23 @@
 
 use super::{
     Arc, B256, ChannelDeliveryState, ChannelId, ChunkData, ClientHandler, ClientMessage, Hash,
-    MB_BYTES, Mutex, RecvStream, SendStream, VoucherOutcome,
+    MB_BYTES, Mutex, RecvStream, SendStream, VecDeque, VoucherOutcome,
 };
 
 impl ClientHandler {
-    /// Stream blob bytes in `voucher_interval_mb`-sized batches, pausing to
-    /// collect a cumulative voucher at each boundary and a closing voucher for
-    /// the final partial batch. Returns `Ok(())` on a clean rejection or a
-    /// completed delivery.
+    /// Stream blob bytes to the paying client behind a credit window (ADR 003
+    /// §Credit window): keep delivering `voucher_interval_mb`-sized batches while
+    /// `delivered − paid ≤ credit_window`, collecting cumulative vouchers as they
+    /// arrive instead of stalling a full round trip at every interval boundary. A
+    /// closing voucher settles the final partial batch. Returns `Ok(())` on a
+    /// clean rejection or a completed delivery.
+    ///
+    /// The window bounds the node's credit exposure to exactly
+    /// [`ClientHandler::credit_window`] — unbilled egress already on the wire —
+    /// and nowhere else; the client's exposure stays at zero because vouchers are
+    /// cumulative over bytes already delivered, so it never pays ahead. With the
+    /// window at one interval (the unconfigured default) this reduces to the
+    /// pre-credit-window stop-and-wait cadence exactly.
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn deliver(
         &self,
@@ -55,7 +64,10 @@ impl ClientHandler {
             .map_err(|e| anyhow::anyhow!("cache export_bao_range failed: {e}"))?;
 
         let interval_bytes = interval_mb.saturating_mul(MB_BYTES);
-        let mut unvouchered: u64 = 0;
+        // The downstream credit window, floored at one interval so the loop can
+        // always make progress and — for the unconfigured default — collapses to
+        // stop-and-wait. See [`ClientHandler::credit_window`].
+        let window = self.credit_window(interval_bytes);
 
         // Resolved once: a channel's funder is fixed for its lifetime, and the
         // per-boundary takedown re-check below must not take the channel lock
@@ -70,17 +82,74 @@ impl ClientHandler {
             None => None,
         };
 
+        // Bytes written to the wire, and bytes covered by an accepted voucher.
+        // Their gap `delivered − paid` is the unrecouped credit the window caps.
+        let mut delivered: u64 = 0;
+        let mut paid: u64 = 0;
+        // Bytes forwarded since the last COMPLETED interval (the sub-interval
+        // remainder), and the completed-but-unpaid interval deltas awaiting
+        // collection — together they are exactly `delivered − paid`.
+        let mut unvouchered: u64 = 0;
+        let mut pending: VecDeque<u64> = VecDeque::new();
+
         // `slice::chunks` yields no items for an empty slice and never a zero-length
-        // chunk, so `ChunkData::new` cannot reject one here — the empty blob goes
-        // straight to `StreamEnd` (#1054). The `?` is the type carrying the invariant,
-        // not a live failure mode.
-        for chunk in data.chunks(decdn_protocol::CHUNK_SIZE) {
-            let frame = ChunkData::new(chunk.to_vec())
-                .map_err(|e| anyhow::anyhow!("refusing to serve an invalid chunk: {e}"))?;
-            self.write_message(send, &ClientMessage::ChunkData(frame))
-                .await?;
-            unvouchered = unvouchered.saturating_add(chunk.len() as u64);
-            if unvouchered >= interval_bytes {
+        // chunk, so `ChunkData::new` cannot reject one here — the empty blob makes
+        // no pass through the deliver phase and goes straight to `StreamEnd`
+        // (#1054). The `?` is the type carrying the invariant, not a live failure
+        // mode.
+        let mut chunks = data.chunks(decdn_protocol::CHUNK_SIZE);
+        let mut next_chunk = chunks.next();
+
+        loop {
+            // --- deliver phase: stream chunks while the window has room. The
+            // window is checked BEFORE each send, so the frontier
+            // `delivered − paid` can overshoot by at most the one chunk that
+            // crosses the threshold: the credit exposure is "≤ window + one
+            // chunk", exact to within a chunk — the same bound the fused
+            // `window_forward_loop` documents. The check must stay pre-send, not
+            // anticipatory (would-this-chunk-cross): an anticipatory check can
+            // stop short of a full interval, and at the one-interval floor
+            // (`window == interval`) it would never complete one, starving the
+            // recoup phase of a voucher to collect and deadlocking the loop. ---
+            while let Some(chunk) = next_chunk {
+                if delivered.saturating_sub(paid) >= window {
+                    break;
+                }
+                let frame = ChunkData::new(chunk.to_vec())
+                    .map_err(|e| anyhow::anyhow!("refusing to serve an invalid chunk: {e}"))?;
+                self.write_message(send, &ClientMessage::ChunkData(frame))
+                    .await?;
+                let len = chunk.len() as u64;
+                delivered = delivered.saturating_add(len);
+                unvouchered = unvouchered.saturating_add(len);
+                if unvouchered >= interval_bytes {
+                    pending.push_back(unvouchered);
+                    unvouchered = 0;
+                }
+                next_chunk = chunks.next();
+            }
+            let done_delivering = next_chunk.is_none();
+
+            // --- recoup phase: collect ONE voucher per outer iteration to free
+            // the window — a completed interval (drained in order), else the
+            // closing partial once the whole blob is on the wire. When the window
+            // blocks the deliver phase there is always a completed interval to
+            // collect (the one-interval floor guarantees it), so the loop never
+            // spins without an await. #1483 SEAM: `collect_voucher` reads +
+            // verifies + durably commits + acks one voucher; group-commit will
+            // split its commit-and-ack tail (see `commit_and_ack_voucher`) to
+            // fsync a batch once and ack after, spending window headroom rather
+            // than re-plumbing this loop. ---
+            let to_collect = if let Some(delta) = pending.pop_front() {
+                Some(delta)
+            } else if done_delivering && unvouchered > 0 {
+                let closing = unvouchered;
+                unvouchered = 0;
+                Some(closing)
+            } else {
+                None
+            };
+            if let Some(delta) = to_collect {
                 match self
                     .collect_voucher(
                         send,
@@ -90,42 +159,43 @@ impl ClientHandler {
                         channel,
                         client_node_id,
                         rate_per_mb,
-                        unvouchered,
+                        delta,
                     )
                     .await?
                 {
-                    VoucherOutcome::Accepted => unvouchered = 0,
+                    VoucherOutcome::Accepted => paid = paid.saturating_add(delta),
                     VoucherOutcome::Rejected => return Ok(()),
                 }
-                // ADR 011 §On Blacklist Event: in-flight streams for a
-                // blacklisted hash are terminated at the next MB boundary. The
-                // check sits AFTER the voucher so the bytes already on the wire
-                // are still paid for — the takedown stops further delivery, it
-                // does not retroactively make the last interval free.
-                if self.takedown_landed(hash, funder) {
-                    self.terminate_for_takedown(send, recv, hash);
-                    return Ok(());
-                }
             }
-        }
-        // Closing voucher for the final partial batch.
-        if unvouchered > 0
-            && matches!(
-                self.collect_voucher(
-                    send,
-                    recv,
-                    hash,
-                    channel_id,
-                    channel,
-                    client_node_id,
-                    rate_per_mb,
-                    unvouchered,
-                )
-                .await?,
-                VoucherOutcome::Rejected
-            )
-        {
-            return Ok(());
+
+            // Done when the whole blob is on the wire and every interval, closing
+            // partial included, has been paid.
+            let done = done_delivering && pending.is_empty() && unvouchered == 0;
+
+            // ADR 011 §On Blacklist Event: in-flight streams for a blacklisted hash
+            // are terminated at the next voucher boundary. Under the credit window
+            // that first check lands up to one WINDOW into the stream (steady state
+            // ~one interval, since each later iteration delivers roughly one
+            // interval before recouping), so detection latency is window-bounded,
+            // not per-MB — the one-interval floor caps it, and even a full window is
+            // negligible against the takedown compliance window. The check sits
+            // AFTER a voucher so the bytes already on the wire are still paid for —
+            // the takedown stops FURTHER delivery, it does not retroactively make
+            // the last interval free. Only meaningful while bytes remain to
+            // withhold: a takedown landing at the final voucher has nothing left to
+            // stop, and terminating there would turn a complete, fully-paid delivery
+            // into a reset (no `StreamEnd`) — hence the `!done` guard. (The fused
+            // `window_forward_loop` deliberately omits that guard: it is acquiring
+            // the blob, so a final-voucher takedown must still abandon the pull to
+            // avoid promoting a taken-down blob into cache.)
+            if !done && to_collect.is_some() && self.takedown_landed(hash, funder) {
+                self.terminate_for_takedown(send, recv, hash);
+                return Ok(());
+            }
+
+            if done {
+                break;
+            }
         }
 
         self.write_message(send, &ClientMessage::StreamEnd).await?;

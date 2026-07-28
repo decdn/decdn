@@ -251,6 +251,27 @@ pub const DEFAULT_NODE_PULL_STALL_TIMEOUT_SEC: u64 = 20;
 /// abandoned request costs at most this window of upstream spend, not the whole
 /// blob.
 pub const DEFAULT_PULL_AHEAD_BYTES: u64 = 1_048_576;
+/// Default downstream paid-delivery credit window (ADR 003 §Credit window): 8
+/// MiB. The serve loop keeps streaming while `delivered − paid ≤ credit_window`,
+/// so paid delivery pipelines behind this bound instead of stalling a full round
+/// trip at every voucher interval. At the 4 MiB default interval this is two
+/// intervals of headroom, which keeps ~150 MiB/s reachable at a 50 ms RTT (a
+/// stop-and-wait 1 MiB interval caps at ~19 MiB/s there). It is the node's whole
+/// credit exposure — unbilled egress already on the wire — and is strictly
+/// cheaper than the speculative USDC the node already fronts on an upstream pull
+/// ([`DEFAULT_PULL_AHEAD_BYTES`]); the client's exposure stays zero because
+/// vouchers are cumulative over bytes already delivered.
+pub const DEFAULT_CREDIT_WINDOW_BYTES: u64 = 8 * 1024 * 1024;
+/// Default voucher cadence a node advertises in `StreamResponse` when
+/// `payment.voucher_interval_mb` is unset (ADR 003 §Voucher Interval
+/// Negotiation): 4 MiB. Coarser than the protocol's wire-level
+/// [`decdn_protocol::DEFAULT_VOUCHER_INTERVAL_MB`] (the "neither peer proposed"
+/// fallback, 1 MiB) because per-channel vouchers serialize on one fsynced redb
+/// commit (~3 ms): a larger interval lifts that per-channel throughput cap
+/// linearly without raising the credit exposure, which is the window, not the
+/// interval. Independent of [`DEFAULT_CREDIT_WINDOW_BYTES`]; both are set from
+/// config and floored so the window is always at least one interval.
+pub const DEFAULT_VOUCHER_INTERVAL_MB: u64 = 4;
 /// Default node-wide unrecouped-leech budget (#856, ADR 037
 /// `max_unrecouped_leech_bytes`): 256 MiB. Aggregate speculative pull-through
 /// spend above this pauses until the node serves and recoups. Finite by ADR
@@ -2417,12 +2438,12 @@ pub fn resolve_payment_into(
         },
     );
     // Voucher cadence advertised in `StreamResponse` (ADR 003 §Voucher Interval
-    // Negotiation). Default 1 MB; hardcoded wire range 1..=1024 (no on-chain
-    // counterpart). File-only (no CLI override) — it is read once at handler
-    // construction, not hot-reloadable.
+    // Negotiation). Default `DEFAULT_VOUCHER_INTERVAL_MB` (4 MB); hardcoded wire
+    // range 1..=1024 (no on-chain counterpart). File-only (no CLI override) — it
+    // is read once at handler construction, not hot-reloadable.
     let voucher_interval_mb = file
         .and_then(|p| p.voucher_interval_mb)
-        .unwrap_or(decdn_protocol::DEFAULT_VOUCHER_INTERVAL_MB);
+        .unwrap_or(DEFAULT_VOUCHER_INTERVAL_MB);
     // Lower bound is the literal minimum cadence (1 MB), not the default const:
     // a future change to DEFAULT_VOUCHER_INTERVAL_MB must not narrow the valid
     // wire range (ADR 003 §Voucher Interval Negotiation: 1..=1024).
@@ -2437,10 +2458,18 @@ pub fn resolve_payment_into(
             )
         },
     );
+    // Downstream credit window (ADR 003 §Credit window). Default 8 MiB; no upper
+    // bound beyond the runtime deposit guard — a larger window is more unbilled
+    // egress the node fronts, which the operator owns. Floored to one interval by
+    // the serve loop, so no lower bound is enforced here.
+    let credit_window_bytes = file
+        .and_then(|p| p.credit_window_bytes.as_ref())
+        .map_or(DEFAULT_CREDIT_WINDOW_BYTES, |b| b.get());
     ResolvedPayment {
         rate_per_mb,
         delivery_floor,
         voucher_interval_mb,
+        credit_window_bytes,
     }
 }
 
@@ -4925,6 +4954,7 @@ swap_pool_address = \"0xPool\"
             rate_per_mb: Some(0),
             delivery_floor: None,
             voucher_interval_mb: None,
+            credit_window_bytes: None,
         };
         let err = resolve_payment(&cli, Some(&file))
             .err()
@@ -4971,6 +5001,7 @@ swap_pool_address = \"0xPool\"
             rate_per_mb: Some(0),
             delivery_floor: None,
             voucher_interval_mb: None,
+            credit_window_bytes: None,
         };
         let resolved = resolve_payment(&cli, Some(&file))?;
         anyhow::ensure!(resolved.rate_per_mb == 42, "got: {}", resolved.rate_per_mb);
@@ -4990,9 +5021,14 @@ swap_pool_address = \"0xPool\"
             resolved.rate_per_mb
         );
         anyhow::ensure!(
-            resolved.voucher_interval_mb == decdn_protocol::DEFAULT_VOUCHER_INTERVAL_MB,
+            resolved.voucher_interval_mb == DEFAULT_VOUCHER_INTERVAL_MB,
             "voucher_interval_mb default, got: {}",
             resolved.voucher_interval_mb
+        );
+        anyhow::ensure!(
+            resolved.credit_window_bytes == DEFAULT_CREDIT_WINDOW_BYTES,
+            "credit_window_bytes default, got: {}",
+            resolved.credit_window_bytes
         );
         Ok(())
     }
@@ -5003,9 +5039,27 @@ swap_pool_address = \"0xPool\"
             rate_per_mb: Some(10),
             delivery_floor: None,
             voucher_interval_mb: Some(64),
+            credit_window_bytes: None,
         };
         let resolved = resolve_payment(&empty_payment_args(), Some(&file))?;
         anyhow::ensure!(resolved.voucher_interval_mb == 64);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_payment_threads_explicit_credit_window() -> anyhow::Result<()> {
+        let file = types::PaymentConfig {
+            rate_per_mb: Some(10),
+            delivery_floor: None,
+            voucher_interval_mb: None,
+            credit_window_bytes: Some(decdn_config_types::Bytes::new(32 * 1024 * 1024)),
+        };
+        let resolved = resolve_payment(&empty_payment_args(), Some(&file))?;
+        anyhow::ensure!(
+            resolved.credit_window_bytes == 32 * 1024 * 1024,
+            "credit_window_bytes threaded, got: {}",
+            resolved.credit_window_bytes
+        );
         Ok(())
     }
 
@@ -5016,6 +5070,7 @@ swap_pool_address = \"0xPool\"
                 rate_per_mb: Some(10),
                 delivery_floor: None,
                 voucher_interval_mb: Some(bad),
+                credit_window_bytes: None,
             };
             let err = resolve_payment(&empty_payment_args(), Some(&file))
                 .err()
@@ -9335,6 +9390,7 @@ swap_pool_address = \"0xPool\"
             rate_per_mb: Some(1),
             delivery_floor: None,
             voucher_interval_mb: None,
+            credit_window_bytes: None,
         };
         let resolved = resolve_payment(&cli, Some(&file))?;
         assert_eq!(resolved.rate_per_mb, 99);
@@ -9348,6 +9404,7 @@ swap_pool_address = \"0xPool\"
             rate_per_mb: Some(50),
             delivery_floor: None,
             voucher_interval_mb: None,
+            credit_window_bytes: None,
         };
         let resolved = resolve_payment(&cli, Some(&file))?;
         assert_eq!(resolved.rate_per_mb, 50);

@@ -4,8 +4,8 @@
 use super::{
     Arc, B256, ChannelDeliveryState, ChannelId, ClientHandler, ClientMessage, CooperativeClose,
     CooperativeCloseAuth, CooperativeCloseRequest, DEFAULT_TOLERANCE_BPS, Hash, Mutex, RateError,
-    RecvStream, SendStream, U256, VoucherOutcome, VoucherRejectReason, read_voucher, verify_rate,
-    voucher_reject_reason, wire_voucher_to_signed,
+    RecvStream, SendStream, SignedVoucher, U256, VoucherOutcome, VoucherRejectReason, read_voucher,
+    verify_rate, voucher_reject_reason, wire_voucher_to_signed,
 };
 
 impl ClientHandler {
@@ -48,7 +48,7 @@ impl ClientHandler {
             return Ok(VoucherOutcome::Rejected);
         };
 
-        let mut guard = channel.lock().await;
+        let guard = channel.lock().await;
 
         // Expiry gate (#327): once the channel has passed its on-chain
         // `expiresAt`, `withdraw`/`closeChannel` revert and the client can
@@ -189,6 +189,59 @@ impl ClientHandler {
             return Ok(VoucherOutcome::Rejected);
         };
 
+        // Everything above is the VERIFY half — it takes no durable action. The
+        // COMMIT-AND-ACK half is delegated so the two are separable (#1483 seam):
+        // group-commit will call the verify half for several vouchers, then a
+        // batched form of the commit half that fsyncs once and acks after,
+        // without touching this verify path or the deliver loop that calls it.
+        self.commit_and_ack_voucher(
+            send,
+            guard,
+            hash,
+            channel_id,
+            client_node_id,
+            delta_bytes,
+            wire.nonce,
+            signed,
+            new_bytes,
+        )
+        .await
+    }
+
+    /// Durably commit an already-verified voucher and acknowledge it — the
+    /// commit-and-ack half of [`Self::collect_voucher`], factored out as the
+    /// group-commit seam (#1483).
+    ///
+    /// `guard` is the per-channel lock, still held from verification so no
+    /// concurrent voucher can advance the watermark between the value that was
+    /// checked and the value committed here; it is moved in and dropped once the
+    /// commit lands. `signed` / `new_bytes` are the verified voucher and the
+    /// cumulative byte watermark it advances to.
+    ///
+    /// # The #1483 seam
+    ///
+    /// The fsync and the `VoucherAck` are the two things group-commit reorders:
+    /// today this method performs one fsynced `ChannelState::apply_voucher` and
+    /// then acks, so nothing is ever acked before it is durable (ADR 003 §Off-chain
+    /// voucher state persistence). Group-commit will batch the fsync across several
+    /// verified vouchers and ack the batch after the single commit returns — the
+    /// credit window (#1477) is what takes that delayed ack off the critical path,
+    /// so it spends window headroom rather than stalling delivery. Keeping the
+    /// commit-and-ack in one method, distinct from verification, is what lets that
+    /// land without re-plumbing the deliver loop or the verify path.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn commit_and_ack_voucher(
+        &self,
+        send: &mut SendStream,
+        mut guard: tokio::sync::MutexGuard<'_, ChannelDeliveryState>,
+        hash: Hash,
+        channel_id: ChannelId,
+        client_node_id: B256,
+        delta_bytes: u64,
+        wire_nonce: [u8; 32],
+        signed: SignedVoucher,
+        new_bytes: U256,
+    ) -> anyhow::Result<VoucherOutcome> {
         // `apply_voucher` performs a synchronous fsynced redb write (store
         // trait §Durability), which must not block a runtime worker — run it on
         // the blocking pool against a clone. The per-channel guard is held
@@ -222,7 +275,7 @@ impl ClientHandler {
                 // Audit receipt for this served-and-paid interval (issues #248,
                 // #803): a non-blocking enqueue before `VoucherAck`; the write
                 // happens off the hot path in the background receipt writer.
-                self.record_receipt(hash, delta_bytes, client_node_id, wire.nonce);
+                self.record_receipt(hash, delta_bytes, client_node_id, wire_nonce);
                 // Per-region bandwidth accounting (#750). Best-effort: an
                 // unset accountant (tests / no admin surface) skips.
                 // `delta_bytes` is exactly the bytes paid for this interval.
