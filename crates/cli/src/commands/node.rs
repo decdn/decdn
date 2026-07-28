@@ -5,13 +5,19 @@ use std::io;
 use std::io::Write as _;
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::time::Duration;
 
+use alloy::primitives::Address;
 use anyhow::Context;
+use iroh::{EndpointAddr, PublicKey};
 use jsonrpsee::core::client::Error as JsonRpcClientError;
 use jsonrpsee::http_client::HttpClientBuilder;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
+use decdn_client_pull::discovery::{self, NodeCandidate, SELECT_K, select_candidates};
+use decdn_client_pull::endpoint as client_endpoint;
+use decdn_client_pull::probe::probe_once;
 use decdn_common::admin::{
     AdminRpcClient, AnnounceResponse, ChannelSnapshot, ChannelsResponse, DrainRequest,
     DrainResponse, EvictRequest, EvictResponse, HealthResponse, PeerView, PeersResponse,
@@ -21,6 +27,9 @@ use decdn_common::cli;
 use decdn_common::cli::ConfigPathSource;
 use decdn_common::cli::common::expand_tilde;
 use decdn_common::config::DEFAULT_ADMIN_PORT;
+use decdn_protocol::Region;
+
+use crate::commands::chain_ctx;
 
 /// Partial deserializer for the TOML config — only the path
 /// `observability.admin_port` is interesting to `decdn node peers`.
@@ -65,6 +74,7 @@ pub async fn node_dispatch(
         cli::NodeCommand::Bond(b) => crate::commands::bond::run(b, global_config).await,
         cli::NodeCommand::Unbond(u) => crate::commands::unbond::run(u, global_config).await,
         cli::NodeCommand::Deregister(d) => crate::commands::deregister::run(d, global_config).await,
+        cli::NodeCommand::Lookup(l) => lookup(l, global_config).await,
     }
 }
 
@@ -1155,6 +1165,254 @@ fn format_interval(secs: u64) -> String {
     format!("{secs}s")
 }
 
+/// `decdn node lookup` — unpaid client-side discovery of active nodes via
+/// `CapacityBond.getActiveNodes` (#1481). Unlike `register`/`bond`/`unbond`/
+/// `deregister`, this never loads a keystore: [`discovery::active_nodes`]
+/// builds its own signer-less read-only provider, so `chain_ctx::resolve`'s
+/// `keystore`/`data_dir` outputs are simply unused here.
+///
+/// Filters (`--node-id`, `--region`) are applied by the pure, network-free
+/// `filter_candidates`. With `--probe`, the (region-shortlisted) result is
+/// ranked by measured `cdn/probe/v1` round-trip time via `probe_and_rank`;
+/// without it, candidates are printed as listed, with no RTT.
+pub async fn lookup(args: &cli::LookupArgs, global_config: Option<&Path>) -> anyhow::Result<()> {
+    let config_path = args.chain.common.config.as_deref().or(global_config);
+    let file = chain_ctx::load_optional_config(config_path)?;
+    let resolved = chain_ctx::resolve(&args.chain, &file)?;
+
+    let node_id = args
+        .node_id
+        .as_deref()
+        .map(|s| {
+            PublicKey::from_str(s).map_err(|e| anyhow::anyhow!("invalid --node-id {s:?}: {e}"))
+        })
+        .transpose()?;
+    let region = args
+        .region
+        .as_deref()
+        .map(|raw| {
+            Region::parse(raw).ok_or_else(|| {
+                anyhow::anyhow!("invalid --region {raw:?}: not an accepted ISO 3166-1 alpha-2 code")
+            })
+        })
+        .transpose()?;
+
+    let candidates = discovery::active_nodes(&resolved.rpc_url, resolved.capacity_bond_address)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to read active nodes from CapacityBond at {}",
+                resolved.capacity_bond_address
+            )
+        })?;
+    let filtered = filter_candidates(candidates, node_id, region);
+
+    let rows = if args.probe {
+        // Cap probe fan-out the same way the paid discovery path does
+        // (`select_candidates`, `SELECT_K`) — probing every active node on
+        // the network does not scale. The region reorder is a no-op here
+        // when `--region` was also passed (already exact-filtered above);
+        // it only matters when `--node-id`/`--region` left more than
+        // `SELECT_K` candidates.
+        let shortlisted = select_candidates(filtered, args.region.as_deref(), SELECT_K);
+        probe_and_rank(shortlisted, config_path, args.timeout_ms).await?
+    } else {
+        filtered.into_iter().map(LookupRow::from).collect()
+    };
+
+    let mut out = io::stdout().lock();
+    if args.json {
+        let json_rows: Vec<LookupJson> = rows.iter().map(LookupJson::from).collect();
+        serde_json::to_writer_pretty(&mut out, &json_rows)
+            .context("failed to encode lookup result as JSON")?;
+        writeln!(out)?;
+    } else {
+        write_lookup_table(&mut out, &rows).context("failed to write lookup table")?;
+    }
+    Ok(())
+}
+
+/// Network-free filter over active-node candidates: exact `node_id` match
+/// and/or exact `region` match. `None` on either axis means "no filter on
+/// that axis" — with both `None` every candidate passes through unchanged.
+/// Kept pure and separate from [`lookup`] so it is unit-testable without a
+/// chain or network (#1481).
+fn filter_candidates(
+    candidates: Vec<NodeCandidate>,
+    node_id: Option<PublicKey>,
+    region: Option<Region>,
+) -> Vec<NodeCandidate> {
+    candidates
+        .into_iter()
+        .filter(|c| node_id.is_none_or(|id| c.node_id == id))
+        .filter(|c| region.is_none_or(|r| c.region_hint == Some(r)))
+        .collect()
+}
+
+/// One row of `decdn node lookup` output: a candidate plus its measured RTT,
+/// when probed. `rtt_ms` is `None` both for the unprobed listing path and for
+/// a probed candidate that did not answer.
+struct LookupRow {
+    node_id: PublicKey,
+    eth_address: Address,
+    region_hint: Option<Region>,
+    rtt_ms: Option<f64>,
+}
+
+impl From<NodeCandidate> for LookupRow {
+    fn from(c: NodeCandidate) -> Self {
+        Self {
+            node_id: c.node_id,
+            eth_address: c.eth_address,
+            region_hint: c.region_hint,
+            rtt_ms: None,
+        }
+    }
+}
+
+/// Probe each of `candidates` over `cdn/probe/v1` for a fixed sentinel hash
+/// and sort ascending by measured RTT (decision per task brief: no blob needs
+/// to exist at the sentinel hash — an absent-hash probe still returns a full
+/// signed response, so any hash works for RTT). A candidate that cannot be
+/// reached (offline, no route, timeout) is kept at the end with `rtt_ms:
+/// None` and a warning on stderr rather than dropped or failing the whole
+/// lookup — the point of `--probe` is to rank the reachable subset, not to
+/// require every candidate to answer.
+async fn probe_and_rank(
+    candidates: Vec<NodeCandidate>,
+    config_path: Option<&Path>,
+    timeout_ms: u64,
+) -> anyhow::Result<Vec<LookupRow>> {
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Same client-endpoint construction as `decdn probe`: discovery-enabled,
+    // so a target resolves by node-id via `[network.discovery]` / the n0
+    // default even without an explicit relay/addr.
+    let relays = client_endpoint::resolve_relays(None, config_path)?;
+    let discovery_cfg = client_endpoint::client_discovery(config_path)?;
+    let endpoint = client_endpoint::client_endpoint(&relays, &discovery_cfg).await?;
+    let timeout = Duration::from_millis(timeout_ms);
+    let hash = *blake3::hash(b"decdn-node-lookup-sentinel/v1").as_bytes();
+
+    let mut rows = Vec::with_capacity(candidates.len());
+    for c in candidates {
+        let mut target = EndpointAddr::new(c.node_id);
+        if let Some(url) = relays.first() {
+            target = target.with_relay_url(url.clone());
+        }
+        let timestamp_us = wall_clock_us();
+        match probe_once(&endpoint, target, hash, timestamp_us, timeout).await {
+            Ok((_, rtt_ms)) => rows.push(LookupRow {
+                node_id: c.node_id,
+                eth_address: c.eth_address,
+                region_hint: c.region_hint,
+                rtt_ms: Some(rtt_ms),
+            }),
+            Err(e) => {
+                eprintln!(
+                    "warning: probe of node {} failed: {e}",
+                    short_node_id(&node_id_hex(&c.node_id))
+                );
+                rows.push(LookupRow {
+                    node_id: c.node_id,
+                    eth_address: c.eth_address,
+                    region_hint: c.region_hint,
+                    rtt_ms: None,
+                });
+            }
+        }
+    }
+    endpoint.close().await;
+
+    // Ascending by RTT; unreachable candidates (`None`) sort last, ties among
+    // them preserving probe order.
+    rows.sort_by(|a, b| match (a.rtt_ms, b.rtt_ms) {
+        (Some(x), Some(y)) => x.total_cmp(&y),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    });
+    Ok(rows)
+}
+
+/// `0x`-prefixed hex encoding of an iroh node id, matching the `0x…` shape
+/// [`LookupJson::node_id`] emits.
+fn node_id_hex(node_id: &PublicKey) -> String {
+    format!("0x{}", alloy::primitives::hex::encode(node_id.as_bytes()))
+}
+
+/// Write the `decdn node lookup` result as a human table. Pure (`&mut impl
+/// Write`) so the layout is unit-testable without a chain or network,
+/// mirroring [`write_peers_table`] / [`write_channels_table`]. The RTT column
+/// is only rendered when at least one row was probed, so the unprobed listing
+/// path doesn't show a column of nothing.
+fn write_lookup_table(w: &mut impl io::Write, rows: &[LookupRow]) -> io::Result<()> {
+    writeln!(w, "nodes={}", rows.len())?;
+    if rows.is_empty() {
+        return writeln!(w, "(no matching active nodes)");
+    }
+    let probed = rows.iter().any(|r| r.rtt_ms.is_some());
+    if probed {
+        writeln!(
+            w,
+            "{:<14} {:<44} {:<8} {:>12}",
+            "NODE_ID", "ETH_ADDRESS", "REGION", "RTT_MS"
+        )?;
+    } else {
+        writeln!(w, "{:<14} {:<44} {:<8}", "NODE_ID", "ETH_ADDRESS", "REGION")?;
+    }
+    for r in rows {
+        let node_preview = short_node_id(&node_id_hex(&r.node_id));
+        let region = r
+            .region_hint
+            .map_or_else(|| "?".to_string(), |x| x.to_string());
+        if probed {
+            let rtt = r
+                .rtt_ms
+                .map_or_else(|| "unreachable".to_string(), |ms| format!("{ms:.1}"));
+            writeln!(
+                w,
+                "{node_preview:<14} {:<44} {region:<8} {rtt:>12}",
+                r.eth_address
+            )?;
+        } else {
+            writeln!(w, "{node_preview:<14} {:<44} {region:<8}", r.eth_address)?;
+        }
+    }
+    Ok(())
+}
+
+/// `--json` array element for `decdn node lookup` — mirrors the
+/// `channel list --json` convention (stable string encoding, one Serialize
+/// view per row). `node_id`/`eth_address` are `0x…` hex strings;
+/// `region_hint` is `null` for a node with no (or unparseable) region hint;
+/// `rtt_ms` is omitted entirely from the object whenever it is unknown — both
+/// the unprobed listing path and a probed-but-unreachable candidate leave it
+/// unset, so a consumer cannot distinguish "not probed" from "probed and
+/// didn't answer" from the JSON alone (both print a stderr warning in the
+/// latter case on the human path; there is currently no JSON-side signal).
+#[derive(Serialize)]
+struct LookupJson {
+    node_id: String,
+    eth_address: String,
+    region_hint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rtt_ms: Option<f64>,
+}
+
+impl From<&LookupRow> for LookupJson {
+    fn from(r: &LookupRow) -> Self {
+        Self {
+            node_id: node_id_hex(&r.node_id),
+            eth_address: r.eth_address.to_string(),
+            region_hint: r.region_hint.map(|region| region.to_string()),
+            rtt_ms: r.rtt_ms,
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -2041,5 +2299,55 @@ mod tests {
             "expected ordered comma-separated chain, got: {s}"
         );
         Ok(())
+    }
+
+    /// `filter_candidates` (#1481): network-free filtering behind `decdn node
+    /// lookup`, unit-tested without a chain or network per the task brief.
+    fn lookup_candidate(seed: u8, region: &str) -> decdn_client_pull::discovery::NodeCandidate {
+        decdn_client_pull::discovery::NodeCandidate {
+            node_id: iroh::SecretKey::from_bytes(&[seed; 32]).public(),
+            eth_address: alloy::primitives::Address::repeat_byte(seed),
+            region_hint: decdn_protocol::Region::parse(region),
+        }
+    }
+
+    #[test]
+    fn filter_candidates_no_filter_returns_all() {
+        let cands = vec![lookup_candidate(1, "US"), lookup_candidate(2, "EU")];
+        let out = filter_candidates(cands.clone(), None, None);
+        assert_eq!(out, cands);
+    }
+
+    #[test]
+    fn filter_candidates_exact_node_id_match() {
+        let a = lookup_candidate(1, "US");
+        let b = lookup_candidate(2, "EU");
+        let out = filter_candidates(vec![a.clone(), b], Some(a.node_id), None);
+        assert_eq!(out, vec![a]);
+    }
+
+    #[test]
+    fn filter_candidates_region_match() {
+        let a = lookup_candidate(1, "US");
+        let b = lookup_candidate(2, "EU");
+        let c = lookup_candidate(3, "US");
+        let out = filter_candidates(
+            vec![a.clone(), b, c.clone()],
+            None,
+            decdn_protocol::Region::parse("US"),
+        );
+        assert_eq!(out, vec![a, c]);
+    }
+
+    #[test]
+    fn filter_candidates_node_id_and_region_combine() {
+        let a = lookup_candidate(1, "US");
+        let b = lookup_candidate(2, "US");
+        let out = filter_candidates(
+            vec![a.clone(), b],
+            Some(a.node_id),
+            decdn_protocol::Region::parse("US"),
+        );
+        assert_eq!(out, vec![a]);
     }
 }

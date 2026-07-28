@@ -34,8 +34,8 @@ pub use fetch::{ClientFetchArgs, FetchArgs};
 pub use key_gen::KeyGenArgs;
 pub use node::{
     AnnounceArgs, BondArgs, ChainArgs, ChannelsArgs, DeregisterArgs, DrainArgs, EvictArgs,
-    HealthArgs, NodeArgs, NodeCommand, PeersArgs, RegionStatsArgs, RegisterArgs, ReloadArgs,
-    StatusArgs, SwapVenueArg, TopArgs, UnbondArgs,
+    HealthArgs, LookupArgs, NodeArgs, NodeCommand, PeersArgs, RegionStatsArgs, RegisterArgs,
+    ReloadArgs, StatusArgs, SwapVenueArg, TopArgs, UnbondArgs,
 };
 pub use probe::ProbeArgs;
 pub use publish::{
