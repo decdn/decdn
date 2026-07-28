@@ -117,6 +117,75 @@ fn leading_varint_u32(frame: &[u8]) -> Option<u32> {
     None
 }
 
+/// Try to locate one complete length-prefixed frame at the front of `buf`
+/// without consuming it, returning `(header_len, payload_len)` — the byte
+/// counts of the varint prefix and the payload it announces. Returns `Ok(None)`
+/// when `buf` does not yet hold a complete frame (the varint is truncated, or
+/// fewer than `payload_len` payload bytes have arrived).
+///
+/// This is the synchronous, non-consuming counterpart to [`read_frame`], for a
+/// caller that fills a byte buffer incrementally with **cancellation-safe**
+/// reads and must split frames off it after each top-up — e.g. the group-commit
+/// voucher gather (#1483), which reads ahead under a timeout that [`read_frame`]
+/// (built on `read_exact`) could not survive without losing partial bytes. The
+/// caller slices the payload as `buf[header_len..header_len + payload_len]`,
+/// decodes it with [`decode_message`], then drains `header_len + payload_len`
+/// bytes.
+///
+/// The announced length is validated against [`MAX_MESSAGE_SIZE`] as soon as the
+/// varint is complete — before the caller waits for (or allocates) the payload —
+/// mirroring [`read_frame`]'s pre-allocation denial-of-service bound.
+///
+/// # Errors
+///
+/// [`FrameError::Varint`] for a malformed length prefix (a non-terminating
+/// continuation run within the first 5 bytes, or a 5th byte overflowing `u32`);
+/// [`FrameError::TooLarge`] when the announced length exceeds
+/// [`MAX_MESSAGE_SIZE`].
+pub fn parse_frame(buf: &[u8]) -> Result<Option<(usize, usize)>, FrameError> {
+    let Some((len, header_len)) = decode_varint_prefix(buf)? else {
+        return Ok(None);
+    };
+    if len > MAX_MESSAGE_SIZE {
+        return Err(FrameError::TooLarge(len));
+    }
+    let payload_len = len as usize;
+    if buf.len().saturating_sub(header_len) < payload_len {
+        return Ok(None);
+    }
+    Ok(Some((header_len, payload_len)))
+}
+
+/// Decode a postcard `u32` varint from the front of `buf`, returning
+/// `(value, bytes_consumed)`, `Ok(None)` when the varint is truncated (fewer
+/// than its continuation bytes have arrived), or [`FrameError::Varint`] when the
+/// bytes present are already malformed. The synchronous mirror of
+/// [`read_varint_u32`].
+fn decode_varint_prefix(buf: &[u8]) -> Result<Option<(u32, usize)>, FrameError> {
+    let mut result: u32 = 0;
+    for (i, &byte) in buf.iter().take(5).enumerate() {
+        let data = u32::from(byte & 0x7F);
+        // On the 5th byte (i == 4) only the low 4 bits are valid; reject overflow.
+        if i == 4 && byte & 0x70 != 0 {
+            return Err(FrameError::Varint);
+        }
+        let shift = u32::try_from(i)
+            .map_err(|_| FrameError::Varint)?
+            .saturating_mul(7);
+        let shifted = data.checked_shl(shift).ok_or(FrameError::Varint)?;
+        result |= shifted;
+        if byte & 0x80 == 0 {
+            return Ok(Some((result, i + 1)));
+        }
+    }
+    // Ran out of buffer mid-varint (< 5 bytes, all continuations) → truncated;
+    // exactly 5 continuation bytes with the terminator missing is malformed.
+    if buf.len() >= 5 {
+        return Err(FrameError::Varint);
+    }
+    Ok(None)
+}
+
 /// Read one length-prefixed frame from an async reader.
 ///
 /// The length prefix is validated against [`MAX_MESSAGE_SIZE`] *before* any
@@ -268,6 +337,42 @@ mod proptests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn parse_frame_incomplete_header_and_body_return_none() -> Result<(), FrameError> {
+        // A complete frame: varint(len) || payload.
+        let payload = b"batched-voucher".to_vec();
+        let payload_len = u32::try_from(payload.len()).map_err(|_| FrameError::Varint)?;
+        let mut hdr = Vec::new();
+        write_varint_u32(&mut hdr, payload_len).await?;
+        let mut framed = hdr.clone();
+        framed.extend_from_slice(&payload);
+
+        // Empty buffer: no varint yet.
+        assert_eq!(parse_frame(&[])?, None);
+        // Header present but body short by one byte: incomplete.
+        let short = framed.get(..framed.len() - 1).unwrap_or_default();
+        assert_eq!(parse_frame(short)?, None);
+        // Complete frame: exact split point (header_len, payload_len).
+        let got = parse_frame(&framed)?.ok_or(FrameError::Varint)?;
+        assert_eq!(got, (hdr.len(), payload.len()));
+        // Extra trailing bytes (a second frame's start) do not confuse the split.
+        let mut with_tail = framed.clone();
+        with_tail.extend_from_slice(b"\x03ab");
+        assert_eq!(parse_frame(&with_tail)?, Some((hdr.len(), payload.len())));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn parse_frame_rejects_oversized_length() -> Result<(), FrameError> {
+        let mut hdr = Vec::new();
+        write_varint_u32(&mut hdr, MAX_MESSAGE_SIZE + 1).await?;
+        assert!(matches!(
+            parse_frame(&hdr),
+            Err(FrameError::TooLarge(n)) if n == MAX_MESSAGE_SIZE + 1
+        ));
+        Ok(())
+    }
 
     async fn roundtrip_varint(v: u32) -> Result<(), FrameError> {
         let mut buf = Vec::new();

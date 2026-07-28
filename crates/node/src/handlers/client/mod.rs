@@ -36,8 +36,8 @@ use decdn_cache::{
 use decdn_incentive::rate::{DEFAULT_TOLERANCE_BPS, RateError, min_payment, verify_rate};
 use decdn_incentive::store::StoreError;
 use decdn_incentive::{
-    ChannelId, ChannelState, ChannelStateStore, CooperativeClose, SignedVoucher, StreamSlashData,
-    VoucherActivity, verify_binding, voucher_reject_reason, wire_voucher_to_signed,
+    ChannelId, ChannelState, ChannelStateStore, CooperativeClose, StreamSlashData, VoucherActivity,
+    verify_binding, voucher_reject_reason, wire_voucher_to_signed,
 };
 use decdn_protocol::client::{
     ChunkData, ClientMessage, CooperativeCloseAuth, CooperativeCloseRequest, StreamError,
@@ -50,6 +50,7 @@ use decdn_protocol::{
 use iroh::PublicKey;
 use iroh::endpoint::{Connection, RecvStream, SendStream, VarInt};
 use iroh::protocol::{AcceptError, ProtocolHandler};
+use tokio::io::AsyncReadExt;
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
 
@@ -83,6 +84,14 @@ pub const MAX_CLIENT_STREAMS: usize = 100;
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const VOUCHER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const REJECTION_CLOSE_TIMEOUT: Duration = Duration::from_millis(250);
+/// Group-commit interval when the handler is built without an explicit one
+/// (`voucher_commit_interval == None`, i.e. tests and any construction that does
+/// not thread `payment.voucher_commit_interval_ms`). Mirrors the config default
+/// [`decdn_common::config::DEFAULT_VOUCHER_COMMIT_INTERVAL_MS`]; the runtime
+/// always sets an explicit value from resolved config, so this only backs the
+/// `None` case. See [`ClientHandler::commit_interval`] (#1483).
+const DEFAULT_COMMIT_INTERVAL: Duration =
+    Duration::from_millis(decdn_common::config::DEFAULT_VOUCHER_COMMIT_INTERVAL_MS);
 /// Fallback overall deadline for opening a window-paced pull (#856) when no
 /// pull-through deadline is configured. In practice the runtime always sets
 /// one alongside the window provider, so this only guards a misconfiguration.
@@ -702,6 +711,12 @@ pub struct ClientHandlerDeps {
     /// bounds the *downstream* unbilled-egress exposure. Both are floored at one
     /// interval so the serve loop can always make progress.
     pub credit_window_bytes: Option<Bytes>,
+    /// Group-commit interval (ADR 003 §Off-chain voucher state persistence,
+    /// #1483): how long the serve loop waits to gather more vouchers into one
+    /// fsynced commit before committing what it has. `None` (the default, and in
+    /// tests) reads as the `DEFAULT_VOUCHER_COMMIT_INTERVAL_MS` config default
+    /// (5 ms). The runtime sets it from `payment.voucher_commit_interval_ms`.
+    pub voucher_commit_interval: Option<Duration>,
     pub leech_governor: Option<Arc<LeechGovernor>>,
     pub pull_origin_gate: Option<Arc<dyn OriginDirectory>>,
     pub idle_timeout: Option<Duration>,
@@ -765,6 +780,7 @@ impl ClientHandlerDeps {
             pull_through_origin: None,
             pull_ahead_bytes: None,
             credit_window_bytes: None,
+            voucher_commit_interval: None,
             leech_governor: None,
             pull_origin_gate: None,
             idle_timeout: None,
@@ -873,6 +889,14 @@ pub struct ClientHandler {
     /// interval. `None` reads as one voucher interval (stop-and-wait). Read
     /// through [`Self::credit_window`], which applies the one-interval floor.
     credit_window_bytes: Option<Bytes>,
+    /// Group-commit interval (ADR 003 §Off-chain voucher state persistence,
+    /// #1483), set at construction via [`ClientHandlerDeps`]. The serve loop
+    /// waits at most this long to gather additional vouchers into one fsynced
+    /// commit before committing the batch it has, amortizing the per-voucher
+    /// fsync while still acknowledging each voucher only after it is durable.
+    /// `None` reads as [`DEFAULT_COMMIT_INTERVAL`]. Read through
+    /// [`Self::commit_interval`].
+    voucher_commit_interval: Option<Duration>,
     /// Node-wide seed-leech caps (#856, ADR 037), set at construction via
     /// [`ClientHandlerDeps`]. Consulted before/while a speculative pull-through
     /// proceeds and credited from the voucher path. `None` (tests / feature off)
@@ -981,6 +1005,7 @@ impl ClientHandler {
             pull_through_origin: deps.pull_through_origin,
             pull_ahead_bytes: deps.pull_ahead_bytes,
             credit_window_bytes: deps.credit_window_bytes,
+            voucher_commit_interval: deps.voucher_commit_interval,
             leech_governor: deps.leech_governor,
             pull_origin_gate: deps.pull_origin_gate,
             content_deny: deps.content_deny,
@@ -1076,6 +1101,19 @@ impl ClientHandler {
             .as_ref()
             .map_or(0, |b| b.get())
             .max(interval_bytes)
+    }
+
+    /// The group-commit interval for this handler (ADR 003 §Off-chain voucher
+    /// state persistence, #1483): the most the recoup phase waits to gather
+    /// another voucher into the current fsynced batch before committing what it
+    /// has. `None` reads as [`DEFAULT_COMMIT_INTERVAL`]. Zero is a valid setting
+    /// (commit each blocking-read batch immediately) and is preserved. The batch
+    /// is bounded above by the credit window regardless — at most
+    /// `credit_window / interval` vouchers are ever outstanding — so this only
+    /// governs the *wait* for a straggler, never grows the batch past the window.
+    pub(super) fn commit_interval(&self) -> Duration {
+        self.voucher_commit_interval
+            .unwrap_or(DEFAULT_COMMIT_INTERVAL)
     }
 
     /// Has a takedown landed on this stream since it opened (ADR 011 §On
@@ -1179,9 +1217,26 @@ impl ClientHandler {
     }
 }
 
-/// Outcome of a single batch-boundary voucher exchange.
-enum VoucherOutcome {
-    Accepted,
+/// How far a group-commit voucher batch got, returned by
+/// [`ClientHandler::collect_voucher_batch`] (#1483).
+struct BatchOutcome {
+    /// Number of vouchers durably committed AND acknowledged this call. The
+    /// serve loop advances its `paid` counter by the sum of the corresponding
+    /// deltas and re-queues any deltas beyond this — a *short* batch, meaning the
+    /// client had not sent those vouchers yet — for the next recoup.
+    committed: usize,
+    /// Whether the stream must end now.
+    stop: BatchStop,
+}
+
+/// Terminal disposition of a voucher batch.
+enum BatchStop {
+    /// Every gathered voucher committed and acked; keep serving.
+    Continue,
+    /// A voucher was rejected, or the batch commit failed (`RetryLater`). The
+    /// rejection frame was already written and the stream finished cleanly (any
+    /// valid prefix was committed + acked first, reflected in
+    /// [`BatchOutcome::committed`]); the loop returns `Ok(())`.
     Rejected,
 }
 
@@ -1292,16 +1347,76 @@ async fn read_first_message(recv: &mut RecvStream) -> Result<FirstMessage, Strea
     }
 }
 
-/// Read one framed [`ClientMessage::Voucher`] with a timeout.
-async fn read_voucher(recv: &mut RecvStream) -> anyhow::Result<decdn_protocol::client::Voucher> {
-    let frame = tokio::time::timeout(VOUCHER_READ_TIMEOUT, read_frame(recv))
-        .await
-        .map_err(|_| anyhow::anyhow!("voucher read timed out after {VOUCHER_READ_TIMEOUT:?}"))?
-        .map_err(|e| anyhow::anyhow!("voucher frame read failed: {e}"))?;
-    match decode_message::<ClientMessage>(&frame) {
-        Ok((ClientMessage::Voucher(v), _)) => Ok(v),
-        Ok((_, _)) => anyhow::bail!("expected ClientMessage::Voucher"),
-        Err(e) => anyhow::bail!("voucher decode failed: {e}"),
+/// Cancellation-safe, buffered reader for `cdn/client/v1` voucher frames
+/// (#1483 group commit). Owns a byte buffer that PERSISTS across [`Self::read`]
+/// calls, so a `read` future cancelled by an outer `timeout` — the batch gather
+/// waits on stragglers under [`ClientHandler::commit_interval`] — loses no bytes:
+/// any partial frame stays buffered for the next call.
+///
+/// This is what makes the group-commit gather safe. [`read_frame`] is built on
+/// `read_exact` and is NOT cancellation-safe — a `timeout` firing mid-frame
+/// would drop already-consumed bytes and desync the stream. Reading instead via
+/// the cancel-safe [`tokio::io::AsyncReadExt::read`] into an owned buffer, then
+/// splitting whole frames off it with [`decdn_protocol::framing::parse_frame`],
+/// keeps every byte. Borrows the `RecvStream` per call so the caller retains it
+/// for stream teardown.
+///
+/// All voucher reads on a given stream MUST go through ONE instance: it may read
+/// ahead (buffering the next pipelined voucher, #1486) while a batch commits, and
+/// a second reader on the same `RecvStream` would lose those buffered bytes.
+#[derive(Default)]
+pub(super) struct BufferedVoucherReader {
+    /// Unconsumed bytes read from the stream, at a frame boundary or partway
+    /// into the next frame's header/body.
+    buf: Vec<u8>,
+}
+
+impl BufferedVoucherReader {
+    /// Read one framed [`ClientMessage::Voucher`], filling the buffer
+    /// incrementally. **Cancellation-safe:** if the returned future is dropped
+    /// (a gather `timeout` elapsed), bytes already read stay in `self.buf` for
+    /// the next call — no frame is torn.
+    pub(super) async fn read(
+        &mut self,
+        recv: &mut RecvStream,
+    ) -> anyhow::Result<decdn_protocol::client::Voucher> {
+        loop {
+            if let Some((header_len, payload_len)) = decdn_protocol::framing::parse_frame(&self.buf)
+                .map_err(|e| anyhow::anyhow!("voucher frame parse failed: {e}"))?
+            {
+                let total = header_len.saturating_add(payload_len);
+                let payload = self
+                    .buf
+                    .get(header_len..total)
+                    .ok_or_else(|| anyhow::anyhow!("voucher frame bounds out of range"))?;
+                let decoded = decode_message::<ClientMessage>(payload);
+                // Consume the frame's bytes regardless of decode outcome so a
+                // single bad frame cannot wedge the buffer.
+                let result = match decoded {
+                    Ok((ClientMessage::Voucher(v), _)) => Ok(v),
+                    Ok((_, _)) => Err(anyhow::anyhow!("expected ClientMessage::Voucher")),
+                    Err(e) => Err(anyhow::anyhow!("voucher decode failed: {e}")),
+                };
+                self.buf.drain(..total);
+                return result;
+            }
+            // Need more bytes. Use tokio's `AsyncReadExt::read` (explicitly, since
+            // iroh's inherent Quinn `read` shadows it) — it is documented
+            // cancel-safe: a dropped future consumes nothing, and on `Ready(n)` we
+            // append to `self.buf` before the next await, so no bytes are ever lost
+            // to a gather timeout. `0` is EOF.
+            let mut scratch = [0u8; 4096];
+            let n = AsyncReadExt::read(recv, &mut scratch)
+                .await
+                .map_err(|e| anyhow::anyhow!("voucher stream read failed: {e}"))?;
+            if n == 0 {
+                anyhow::bail!("voucher stream closed mid-frame");
+            }
+            let chunk = scratch
+                .get(..n)
+                .ok_or_else(|| anyhow::anyhow!("short read length out of range"))?;
+            self.buf.extend_from_slice(chunk);
+        }
     }
 }
 

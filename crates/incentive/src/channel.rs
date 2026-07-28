@@ -327,6 +327,47 @@ impl ChannelState {
         domain: &Eip712Domain,
         store: &dyn ChannelStateStore,
     ) -> Result<VoucherApplied, ChannelError> {
+        // INVARIANT (#527): validate + advance on a CLONE, record the clone,
+        // swap on `Ok` only. `stage_voucher` produces the advanced successor
+        // without persisting; the record-then-swap here is the durable-commit
+        // point. Do NOT swap before the `?` on `record`: that's the literal
+        // #527 replay window in code form.
+        let (next, applied) = self.stage_voucher(signed, domain)?;
+        store.record(&next)?;
+        *self = next;
+        Ok(applied)
+    }
+
+    /// Validate `signed` against this state's invariants and return the advanced
+    /// successor state plus its [`VoucherApplied`] — the pure, in-memory half of
+    /// [`Self::apply_voucher`], persisting nothing.
+    ///
+    /// Exposed for **group commit** (#1483): a caller stages several vouchers
+    /// against an advancing candidate clone, then makes ONE durable
+    /// `store.record` of the final candidate and swaps it into the live channel.
+    /// Because vouchers are cumulative — each carries the running `amount` /
+    /// `bytes_delivered` / `nonce` — the final staged state supersedes every
+    /// intermediate one, so a single record commits the whole batch (one fsync)
+    /// with no loss: the batch's highest voucher is exactly what the on-chain
+    /// settlement path submits. No per-voucher store method is needed.
+    ///
+    /// **Durability obligation.** The returned state MUST be persisted
+    /// (`store.record`) before it is swapped into a live channel or used to send
+    /// `VoucherAck` / deliver further bytes — the #527 replay guard requires
+    /// durability before acknowledgement, and staging alone advances nothing
+    /// durable. `stage_voucher` takes `&self` (never mutates the caller's state)
+    /// precisely so an un-persisted candidate can be discarded on a mid-batch
+    /// rejection without touching the committed prefix.
+    ///
+    /// # Errors
+    ///
+    /// The same validation taxonomy as [`Self::apply_voucher`] **minus**
+    /// [`ChannelError::Store`] — no store is touched here.
+    pub fn stage_voucher(
+        &self,
+        signed: &SignedVoucher,
+        domain: &Eip712Domain,
+    ) -> Result<(Self, VoucherApplied), ChannelError> {
         if signed.voucher.channel_id != self.channel_id {
             return Err(ChannelError::WrongChannel {
                 expected: self.channel_id,
@@ -384,11 +425,6 @@ impl ChannelState {
             .verify_signer(self.voucher_signer, domain)
             .map_err(ChannelError::Signature)?;
 
-        // INVARIANT (#527): clone after validation, record on the clone, swap
-        // on `Ok` only. Do NOT move the clone earlier — a `record` failure
-        // between a pre-validation clone and the swap below would persist a
-        // state we never accepted. Do NOT advance `*self = next` before the
-        // `?` either: that's the literal #527 replay window in code form.
         let mut next = self.clone();
         next.last_amount = signed.voucher.amount;
         next.last_nonce = signed.voucher.nonce;
@@ -398,7 +434,6 @@ impl ChannelState {
         // `r‖s‖v` encoding as the wire form in `client_bridge`;
         // `Signature::as_bytes` is exactly 65 bytes.
         next.last_signature = Some(signed.signature.as_bytes());
-        store.record(&next)?;
 
         // Nonce-gap detection (#747). The monotonicity guard above rejected
         // `voucher.nonce <= self.last_nonce`, so the step from the prior
@@ -429,8 +464,7 @@ impl ChannelState {
             );
         }
 
-        *self = next;
-        Ok(VoucherApplied { nonce_gap })
+        Ok((next, VoucherApplied { nonce_gap }))
     }
 }
 
@@ -1068,6 +1102,78 @@ mod tests {
         // succeed and advance state normally.
         state.apply_voucher(&signed, &domain, &store)?;
         anyhow::ensure!(state.last_nonce == U256::from(1u64));
+        Ok(())
+    }
+
+    /// Group-commit primitive (#1483): staging a batch of vouchers against an
+    /// advancing candidate and recording ONLY the final state once yields the
+    /// same in-memory result AND the same single persisted row as applying each
+    /// voucher through `apply_voucher` — because vouchers are cumulative, the
+    /// final staged state supersedes every intermediate one, so one `record`
+    /// commits the whole batch with no loss.
+    #[test]
+    fn stage_batch_then_record_once_equals_sequential_apply() -> anyhow::Result<()> {
+        let (signer, base, domain, batch_store) = fixture();
+
+        // Reference: apply three vouchers one-by-one (three records).
+        let mut seq_state = base.clone();
+        let seq_store = MemoryChannelStateStore::new();
+        let vouchers = [
+            (1_000u64, 1u64, 1_048_576u64),
+            (2_000, 2, 2_097_152),
+            (3_000, 3, 3_145_728),
+        ];
+        for (amount, nonce, bytes) in vouchers {
+            let signed =
+                build(base.channel_id, amount, nonce, bytes, TOKEN).sign(&signer, &domain)?;
+            seq_state.apply_voucher(&signed, &domain, &seq_store)?;
+        }
+
+        // Batched: stage each against an advancing candidate, record ONCE.
+        let mut candidate = base.clone();
+        let mut gaps = Vec::new();
+        for (amount, nonce, bytes) in vouchers {
+            let signed =
+                build(base.channel_id, amount, nonce, bytes, TOKEN).sign(&signer, &domain)?;
+            let (next, applied) = candidate.stage_voucher(&signed, &domain)?;
+            candidate = next;
+            gaps.push(applied.nonce_gap());
+        }
+        batch_store.record(&candidate)?;
+
+        anyhow::ensure!(
+            candidate == seq_state,
+            "batched state must equal sequential"
+        );
+        anyhow::ensure!(candidate.last_nonce() == U256::from(3u64));
+        anyhow::ensure!(gaps == vec![0, 0, 0], "contiguous batch has no gaps");
+        // One persisted row, holding the final cumulative watermark.
+        anyhow::ensure!(batch_store.len() == 1, "batch persists exactly one row");
+        let persisted = batch_store.load_all()?;
+        let only = persisted.first().ok_or_else(|| anyhow::anyhow!("no row"))?;
+        anyhow::ensure!(*only == seq_state, "one record commits the whole batch");
+        Ok(())
+    }
+
+    /// Staging is pure: a rejected voucher leaves the candidate that produced it
+    /// untouched (returns `Err`, advances nothing), so a caller can commit the
+    /// valid prefix and reject the offender — the group-commit mid-batch split.
+    #[test]
+    fn stage_voucher_rejects_without_advancing_candidate() -> anyhow::Result<()> {
+        let (signer, base, domain, _store) = fixture();
+        let v1 = build(base.channel_id, 1_000, 1, 1_048_576, TOKEN).sign(&signer, &domain)?;
+        let (after_v1, _) = base.stage_voucher(&v1, &domain)?;
+
+        // A stale-nonce voucher against the advanced candidate must reject.
+        let bad = build(base.channel_id, 2_000, 1, 2_097_152, TOKEN).sign(&signer, &domain)?;
+        let err = err_of(after_v1.stage_voucher(&bad, &domain))?;
+        anyhow::ensure!(
+            matches!(err, ChannelError::NonceNotIncreasing { .. }),
+            "{err:?}"
+        );
+        // `stage_voucher` takes `&self`; the candidate it was called on is
+        // unchanged by construction — assert the prefix state still holds.
+        anyhow::ensure!(after_v1.last_nonce() == U256::from(1u64));
         Ok(())
     }
 }
