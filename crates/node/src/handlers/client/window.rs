@@ -4,11 +4,11 @@
 use alloy::primitives::U256;
 
 use super::{
-    Arc, B256, Bytes, CacheError, ChannelDeliveryState, ChannelId, ChunkData, ClientHandler,
-    ClientMessage, FillOutcome, Hash, MB_BYTES, Mutex, NodeOrigin, NodeProgressivePull, RecvStream,
-    SendStream, ServeRejectReason, StreamRequest, StreamRequestExt, StreamResponseBody,
-    TeeReservation, TeeSink, TeeVerdict, VecDeque, VoucherOutcome, WINDOW_PULL_FALLBACK_DEADLINE,
-    min_payment,
+    Arc, B256, BatchStop, BufferedVoucherReader, Bytes, CacheError, ChannelDeliveryState,
+    ChannelId, ChunkData, ClientHandler, ClientMessage, FillOutcome, Hash, MB_BYTES, Mutex,
+    NodeOrigin, NodeProgressivePull, RecvStream, SendStream, ServeRejectReason, StreamRequest,
+    StreamRequestExt, StreamResponseBody, TeeReservation, TeeSink, TeeVerdict, VecDeque,
+    WINDOW_PULL_FALLBACK_DEADLINE, min_payment,
 };
 
 impl ClientHandler {
@@ -272,6 +272,12 @@ impl ClientHandler {
             .unwrap_or(Bytes::new(decdn_common::config::DEFAULT_PULL_AHEAD_BYTES))
             .max(Bytes::new(interval_bytes))
             .max(Bytes::new(self.credit_window(interval_bytes)));
+        // Group-commit cap (#1483): at most this many downstream vouchers share
+        // one fsync. Bounded by how many intervals fit in the window, so at a
+        // one-interval window it is 1 and each recoup collects a single voucher.
+        let batch_cap = usize::try_from(window.get() / interval_bytes.max(1))
+            .unwrap_or(usize::MAX)
+            .max(1);
         let peer = client_node_id.0;
         // Read once: the funder is immutable for the channel's lifetime, and the
         // per-boundary in-flight takedown check below must not re-take the
@@ -302,6 +308,10 @@ impl ClientHandler {
         let mut unvouchered: u64 = 0;
         let mut pending: VecDeque<u64> = VecDeque::new();
         let mut upstream_done = false;
+        // One buffered voucher reader for the whole stream (#1483): every voucher
+        // read goes through it so pipelined vouchers buffered ahead of a batch
+        // commit are not lost.
+        let mut reader = BufferedVoucherReader::default();
 
         loop {
             let pulled_at_iter_start = pulled;
@@ -410,53 +420,75 @@ impl ClientHandler {
                 self.metrics.node_pull_through_window_paused();
             }
 
-            // --- recoup phase: collect ONE downstream voucher per outer
-            // iteration to free the window — a completed interval (drained in
-            // order), else the closing partial once the whole blob is pulled. A
-            // short upstream never earns a closing voucher from the client. ---
+            // --- recoup phase: batch up to `batch_cap` completed downstream
+            // intervals into ONE fsynced commit, acking each voucher only after
+            // the commit is durable (#1483, group commit) — a completed interval
+            // (drained in order), else the closing partial once the whole blob is
+            // pulled. A short upstream never earns a closing voucher. ---
             let done_pulling = upstream_done || pulled >= total;
-            let to_collect = if let Some(delta) = pending.pop_front() {
-                Some(delta)
-            } else if done_pulling && pulled >= total && unvouchered > 0 {
-                let closing = unvouchered;
+            if done_pulling && pulled >= total && unvouchered > 0 {
+                // Fold the closing partial into `pending` so the batch drains it
+                // uniformly with the completed intervals.
+                pending.push_back(unvouchered);
                 unvouchered = 0;
-                Some(closing)
-            } else {
-                None
-            };
-            if let Some(delta) = to_collect {
+            }
+            let mut deltas: Vec<u64> = Vec::with_capacity(batch_cap);
+            while deltas.len() < batch_cap {
+                match pending.pop_front() {
+                    Some(delta) => deltas.push(delta),
+                    None => break,
+                }
+            }
+            let collected_any = !deltas.is_empty();
+            if collected_any {
                 match self
-                    .collect_voucher(
+                    .collect_voucher_batch(
                         send,
                         recv,
+                        &mut reader,
                         hash,
                         channel_id,
                         Some(channel),
                         client_node_id,
                         rate_per_mb,
-                        delta,
+                        &deltas,
                     )
                     .await
                 {
-                    Ok(VoucherOutcome::Accepted) => {
-                        served_paid = served_paid.saturating_add(Bytes::new(delta));
-                        // ADR 011 §On Blacklist Event: terminate an in-flight
-                        // delivery at the next MB boundary once a takedown
-                        // lands. This path needs it at least as much as the
-                        // buffered one — it is simultaneously *pulling* the
-                        // blacklisted blob from upstream, so continuing would
-                        // both serve and re-acquire content under a removal
-                        // order. Abandoning the pull is what stops the
-                        // upstream spend.
-                        if self.takedown_landed(hash, Some(funder)) {
-                            self.abandon_window_serve(pull, tee);
-                            self.terminate_for_takedown(send, recv, hash);
-                            return Ok(());
+                    Ok(outcome) => {
+                        let paid_bytes: u64 = deltas.iter().take(outcome.committed).sum();
+                        served_paid = served_paid.saturating_add(Bytes::new(paid_bytes));
+                        // Re-queue deltas the client had not paid yet (short batch),
+                        // preserving order at the front of `pending`.
+                        for &delta in deltas
+                            .get(outcome.committed..)
+                            .unwrap_or_default()
+                            .iter()
+                            .rev()
+                        {
+                            pending.push_front(delta);
                         }
-                    }
-                    Ok(VoucherOutcome::Rejected) => {
-                        self.abandon_window_serve(pull, tee);
-                        return Ok(());
+                        match outcome.stop {
+                            BatchStop::Rejected => {
+                                self.abandon_window_serve(pull, tee);
+                                return Ok(());
+                            }
+                            BatchStop::Continue => {
+                                // ADR 011 §On Blacklist Event: terminate an
+                                // in-flight delivery at the next boundary once a
+                                // takedown lands. This path needs it at least as
+                                // much as the buffered one — it is simultaneously
+                                // *pulling* the blacklisted blob from upstream, so
+                                // continuing would both serve and re-acquire content
+                                // under a removal order. Abandoning the pull is what
+                                // stops the upstream spend.
+                                if self.takedown_landed(hash, Some(funder)) {
+                                    self.abandon_window_serve(pull, tee);
+                                    self.terminate_for_takedown(send, recv, hash);
+                                    return Ok(());
+                                }
+                            }
+                        }
                     }
                     Err(e) => {
                         // A transport drop (the #856 client-disconnect shape) or an
@@ -479,7 +511,7 @@ impl ClientHandler {
             // bounded by the window). The pause cause is already metered by
             // `may_pull`.
             let made_pull_progress = pulled > pulled_at_iter_start;
-            if !made_pull_progress && to_collect.is_none() && !done_pulling {
+            if !made_pull_progress && !collected_any && !done_pulling {
                 // A seed-leech cap is denying the pull with nothing to recoup. Drop
                 // the partial fill and reset the stream (no `StreamEnd`); the pause
                 // cause is already metered by `may_pull`. Log the partial progress

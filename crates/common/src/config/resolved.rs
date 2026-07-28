@@ -444,6 +444,13 @@ pub struct ResolvedPayment {
     /// floored at one voucher interval by the serve loop, so a value at or below
     /// one interval is stop-and-wait.
     pub credit_window_bytes: u64,
+    /// Group-commit interval in milliseconds (ADR 003 §Off-chain voucher state
+    /// persistence, #1483): how long the serve loop waits to batch more vouchers
+    /// into one fsynced commit before committing what it has. Default
+    /// [`crate::config::DEFAULT_VOUCHER_COMMIT_INTERVAL_MS`] (5 ms); `0` commits
+    /// each blocking-read batch immediately. Bounded above by
+    /// [`Self::credit_window_bytes`].
+    pub voucher_commit_interval_ms: u64,
 }
 
 /// Resolved gossip fields (ADR 001).

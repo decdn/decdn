@@ -559,6 +559,273 @@ async fn paying_a_voucher_slides_the_credit_window_forward() -> anyhow::Result<(
     Ok(())
 }
 
+/// A `ChannelStateStore` that records through to an inner memory store while
+/// counting `record` calls — the direct proof that group commit (#1483)
+/// amortizes the fsync: N cumulative vouchers durably commit with ONE `record`,
+/// not N. Seed the INNER store directly so only voucher-commit records count.
+#[derive(Debug)]
+struct CountingRecordStore {
+    inner: MemoryChannelStateStore,
+    records: std::sync::atomic::AtomicUsize,
+}
+
+impl CountingRecordStore {
+    fn record_count(&self) -> usize {
+        self.records.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl ChannelStateStore for CountingRecordStore {
+    fn load_all(&self) -> Result<Vec<ChannelState>, decdn_incentive::StoreError> {
+        self.inner.load_all()
+    }
+    fn record(&self, state: &ChannelState) -> Result<(), decdn_incentive::StoreError> {
+        self.records
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.record(state)
+    }
+    fn forget(
+        &self,
+        channel_id: decdn_incentive::ChannelId,
+    ) -> Result<(), decdn_incentive::StoreError> {
+        self.inner.forget(channel_id)
+    }
+    fn get(
+        &self,
+        channel_id: decdn_incentive::ChannelId,
+    ) -> Result<Option<ChannelState>, decdn_incentive::StoreError> {
+        self.inner.get(channel_id)
+    }
+}
+
+/// Build a pipelined serving handler with an explicit credit window AND
+/// group-commit interval (#1483). A generous `commit_interval_ms` lets the batch
+/// gather a whole burst of vouchers into one fsync deterministically, rather than
+/// flushing on a straggler timeout.
+async fn spawn_batching_server(
+    cache: CacheEngine,
+    store: Arc<dyn ChannelStateStore>,
+    credit_window: u64,
+    commit_interval_ms: u64,
+) -> anyhow::Result<(
+    EndpointAddr,
+    Arc<PrivateKeySigner>,
+    Endpoint,
+    tokio::task::JoinHandle<()>,
+)> {
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = Arc::new(PrivateKeySigner::random());
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let handler = build_handler_full_configured(
+        server_id,
+        &server_eth,
+        &metrics,
+        limiter,
+        cache,
+        store,
+        RATE_PER_MB,
+        &loopback_domains(),
+        0,
+        16,
+        |deps| {
+            deps.credit_window_bytes = Some(decdn_cache::Bytes::new(credit_window));
+            deps.voucher_commit_interval = Some(Duration::from_millis(commit_interval_ms));
+        },
+    )?;
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+    Ok((target, server_eth, server_ep, server_task))
+}
+
+/// Sign the `count` cumulative vouchers that pay for the first `count` completed
+/// 1 MiB intervals of a stream (nonce `k`, `bytes_delivered = k * interval`,
+/// `amount = min_payment(...)`), for a client that bursts them at the server.
+fn burst_vouchers(
+    signer: &PrivateKeySigner,
+    count: u64,
+) -> anyhow::Result<Vec<decdn_incentive::SignedVoucher>> {
+    (1..=count)
+        .map(|k| {
+            let bytes = HARNESS_INTERVAL_BYTES.saturating_mul(k);
+            Voucher {
+                channel_id: channel_id(),
+                amount: min_payment(bytes, RATE_PER_MB),
+                nonce: U256::from(k),
+                bytes_delivered: U256::from(bytes),
+                token: TOKEN,
+            }
+            .sign(signer, &payment_domain())
+            .map_err(|e| anyhow::anyhow!("sign voucher {k}: {e}"))
+        })
+        .collect()
+}
+
+/// #1483: with a credit window several intervals wide, the vouchers that pay for
+/// a window's worth of already-delivered bytes are committed with a SINGLE
+/// fsynced `record` instead of one per voucher — the throughput win. The window
+/// equals the blob (eight 1 MiB intervals); the client reads the whole window,
+/// bursts all eight cumulative vouchers, and the server group-commits them once.
+#[tokio::test(flavor = "multi_thread")]
+async fn group_commit_amortises_the_fsync_across_a_batch() -> anyhow::Result<()> {
+    const WINDOW: u64 = 8 * 1024 * 1024;
+    let intervals = WINDOW / HARNESS_INTERVAL_BYTES; // 8
+    // Blob larger than the window so the WINDOW (not the blob) bounds the first
+    // batch; the wire delivered up to the window is exactly `intervals` intervals.
+    let payload = vec![0x77u8; 16 * 1024 * 1024];
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+
+    let signer = Arc::new(PrivateKeySigner::random());
+    let deposit = U256::from(10_000_000u64);
+    let inner = MemoryChannelStateStore::new();
+    inner.record(&ChannelState::new(
+        channel_id(),
+        signer.address(),
+        signer.address(),
+        TOKEN,
+        deposit,
+    ))?;
+    let counting = Arc::new(CountingRecordStore {
+        inner,
+        records: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let store: Arc<dyn ChannelStateStore> = Arc::clone(&counting) as Arc<dyn ChannelStateStore>;
+
+    // A generous commit interval so the whole eight-voucher burst is gathered into
+    // ONE commit rather than flushed early on a straggler timeout.
+    let (target, _server_eth, server_ep, server_task) =
+        spawn_batching_server(cache, store, WINDOW, 1_000).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let conn = client_ep
+        .connect(target, ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    let (mut send, mut recv) = open_paid_stream(&conn, *hash.as_bytes()).await?;
+
+    // Read the full window ahead of any payment — the server has now delivered
+    // exactly `intervals` completed intervals and parks awaiting their vouchers.
+    read_exact_chunks(&mut recv, WINDOW).await?;
+
+    // Burst all eight cumulative vouchers, THEN read their acks — so the gather
+    // sees the whole batch buffered and commits it once.
+    for voucher in burst_vouchers(&signer, intervals)? {
+        write_client_msg(
+            &mut send,
+            &ClientMessage::Voucher(signed_to_wire_voucher(&voucher)),
+        )
+        .await?;
+    }
+    for k in 0..intervals {
+        match read_client_msg(&mut recv).await? {
+            ClientMessage::VoucherAck => {}
+            other => anyhow::bail!("expected VoucherAck #{k}, got {other:?}"),
+        }
+    }
+
+    // The eight vouchers committed with ONE fsync — the group-commit invariant.
+    anyhow::ensure!(
+        counting.record_count() == 1,
+        "expected exactly ONE record for {intervals} vouchers, got {}",
+        counting.record_count()
+    );
+    // And the persisted watermark advanced to the batch's highest voucher.
+    let persisted = counting
+        .get(channel_id())?
+        .ok_or_else(|| anyhow::anyhow!("channel row missing after commit"))?;
+    anyhow::ensure!(
+        persisted.last_nonce() == U256::from(intervals),
+        "persisted nonce must be the batch's highest, got {}",
+        persisted.last_nonce()
+    );
+
+    conn.close(0u32.into(), b"done");
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
+/// #1483 crash/rollback guard: when the batched commit's fsync fails, the WHOLE
+/// batch is rejected with `RetryLater` and NO voucher is acknowledged — nothing
+/// is ever acked without a durable record (ADR 003 §Off-chain voucher state
+/// persistence). The client bursts eight vouchers; the failing store rejects the
+/// commit; the client sees one `RetryLater` and zero acks, and the watermark
+/// never advances.
+#[tokio::test(flavor = "multi_thread")]
+async fn group_commit_failure_rejects_whole_batch_with_retry_later() -> anyhow::Result<()> {
+    const WINDOW: u64 = 8 * 1024 * 1024;
+    let intervals = WINDOW / HARNESS_INTERVAL_BYTES; // 8
+    let payload = vec![0x33u8; 16 * 1024 * 1024];
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+
+    let signer = Arc::new(PrivateKeySigner::random());
+    let deposit = U256::from(10_000_000u64);
+    let inner = MemoryChannelStateStore::new();
+    inner.record(&ChannelState::new(
+        channel_id(),
+        signer.address(),
+        signer.address(),
+        TOKEN,
+        deposit,
+    ))?;
+    let store: Arc<dyn ChannelStateStore> = Arc::new(FailingRecordStore { inner });
+
+    let (target, _server_eth, server_ep, server_task) =
+        spawn_batching_server(cache, Arc::clone(&store), WINDOW, 1_000).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let conn = client_ep
+        .connect(target, ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    let (mut send, mut recv) = open_paid_stream(&conn, *hash.as_bytes()).await?;
+
+    read_exact_chunks(&mut recv, WINDOW).await?;
+
+    for voucher in burst_vouchers(&signer, intervals)? {
+        write_client_msg(
+            &mut send,
+            &ClientMessage::Voucher(signed_to_wire_voucher(&voucher)),
+        )
+        .await?;
+    }
+
+    // The batch commit failed, so the server's FIRST response is a single
+    // `RetryLater` — never an ack — and the stream then finishes.
+    match read_client_msg(&mut recv).await? {
+        ClientMessage::StreamError(decdn_protocol::client::StreamError::VoucherRejected {
+            reason,
+        }) => {
+            anyhow::ensure!(
+                reason == VoucherRejectReason::RetryLater,
+                "expected RetryLater, got {reason:?}"
+            );
+        }
+        ClientMessage::VoucherAck => {
+            anyhow::bail!("a voucher was acked despite the commit failing (ADR 003 §355 violation)")
+        }
+        other => anyhow::bail!("expected VoucherRejected {{ RetryLater }}, got {other:?}"),
+    }
+    // The persisted watermark never advanced past the seed (nonce 0).
+    let persisted = store
+        .get(channel_id())?
+        .ok_or_else(|| anyhow::anyhow!("channel row missing"))?;
+    anyhow::ensure!(
+        persisted.last_nonce() == U256::ZERO,
+        "a failed commit must not advance the watermark, got {}",
+        persisted.last_nonce()
+    );
+
+    conn.close(0u32.into(), b"done");
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
 /// ADR 005 §Connection lifetime (#1193): a connection with no active stream is
 /// closed by the application layer after `APP_IDLE_TIMEOUT`. A short timeout is
 /// injected via `ClientHandlerDeps.idle_timeout` so the test need not wait the production 30s.

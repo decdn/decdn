@@ -863,6 +863,8 @@ impl RuntimeReloadState {
                 delivery_floor: 0,
                 voucher_interval_mb: decdn_protocol::DEFAULT_VOUCHER_INTERVAL_MB,
                 credit_window_bytes: decdn_common::config::DEFAULT_CREDIT_WINDOW_BYTES,
+                voucher_commit_interval_ms:
+                    decdn_common::config::DEFAULT_VOUCHER_COMMIT_INTERVAL_MS,
             },
             observability: ResolvedObservability {
                 log_level: level,
@@ -1242,11 +1244,12 @@ const fn observability_has_restart_required_field(
 
 /// Whether the file's `[payment]` section sets a field whose restart notice
 /// belongs here. `rate_per_mb` reloads and `delivery_floor` is warned
-/// change-based in
-/// [`PaymentSection::infallible_swap`], so only `voucher_interval_mb` — read
-/// once into the client handler at bring-up, with no applied value to diff —
-/// trips this gate. Exhaustively destructured for the same
-/// compile-time-classification reason as [`cache_has_restart_required_field`].
+/// change-based in [`PaymentSection::infallible_swap`], so the read-once serve
+/// knobs — `voucher_interval_mb`, `credit_window_bytes`, and
+/// `voucher_commit_interval_ms`, each read into the client handler at bring-up
+/// with no applied value to diff — are the ones that trip this gate.
+/// Exhaustively destructured for the same compile-time-classification reason as
+/// [`cache_has_restart_required_field`].
 const fn payment_has_restart_required_field(
     p: &decdn_common::config::types::PaymentConfig,
 ) -> bool {
@@ -1257,8 +1260,13 @@ const fn payment_has_restart_required_field(
         // Read once at handler construction (like `voucher_interval_mb`); a change
         // needs a restart to take effect (ADR 003 §Credit window).
         credit_window_bytes,
+        // Read once at handler construction (#1483 group commit); a change needs a
+        // restart to take effect (ADR 003 §Off-chain voucher state persistence).
+        voucher_commit_interval_ms,
     } = p;
-    voucher_interval_mb.is_some() || credit_window_bytes.is_some()
+    voucher_interval_mb.is_some()
+        || credit_window_bytes.is_some()
+        || voucher_commit_interval_ms.is_some()
 }
 
 #[cfg(test)]
@@ -1362,6 +1370,8 @@ mod tests {
                 delivery_floor: 0,
                 voucher_interval_mb: decdn_protocol::DEFAULT_VOUCHER_INTERVAL_MB,
                 credit_window_bytes: decdn_common::config::DEFAULT_CREDIT_WINDOW_BYTES,
+                voucher_commit_interval_ms:
+                    decdn_common::config::DEFAULT_VOUCHER_COMMIT_INTERVAL_MS,
             },
             observability: ResolvedObservability {
                 log_level: level,
