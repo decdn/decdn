@@ -38,3 +38,33 @@ updates:
     # @1.95.0 refs in ci.yml / release.yml), so all refs should bump in
     # lockstep. Re-add a version-specific ignore here if MSRV later drops below
     # the stable pin.
+    ignore:
+      # `github/gh-aw-actions/setup` belongs to the gh-aw compiler that
+      # generated .github/workflows/*.lock.yml: one `gh aw compile` emits both
+      # the setup pin and the `compiler_version` stamped in each lock's
+      # `# gh-aw-metadata:` header. Nothing at run time enforces that they
+      # agree — this repo ran an 11-minor-version gap for months without
+      # complaint — but Dependabot cannot recompile, so a bare pin bump leaves
+      # the lock's embedded `gh-aw-manifest` describing actions the file no
+      # longer uses. #1093, #1239 and #1423 are examples (there are more from
+      # #568 onward). The supported upgrade path is `gh extension upgrade aw`
+      # then `gh aw compile`, and the `agentic-lock` job in ci.yml is what
+      # actually enforces that the two move together.
+      #
+      # Two entries on purpose. The `/*` glob is the one that bites: from
+      # #1059 onward Dependabot names this dependency by its full action path
+      # (`github/gh-aw-actions/setup`, per the #1423 title), which an exact
+      # match no longer catches. The bare name is defensive — `gh aw compile
+      # --dependabot` reconciles exactly that string into this block, and when
+      # it does not find it verbatim (inline comment included) it re-marshals
+      # the whole file from parsed YAML and drops every block comment here,
+      # including the cargo rationale above. Plain `gh aw compile` leaves this
+      # file alone; verified against v0.83.4. Do not reword the trailing
+      # comment on the next line: it is copied from gh-aw's own
+      # `managedDependabotIgnoreComment` constant and is compared byte-for-byte.
+      - dependency-name: "github/gh-aw-actions" # Managed by gh aw compile. Version-locked to the gh-aw compiler; do not bump.
+      - dependency-name: "github/gh-aw-actions/*"
+      # Deliberately NOT ignored: actions/checkout, actions/setup-node, and the
+      # rest appear in both ci.yml and the generated locks, and their ci.yml
+      # bumps are wanted. When such a bump also rewrites a lock (#1240 did),
+      # `agentic-lock` fails the PR and a `gh aw compile` commit clears it.
