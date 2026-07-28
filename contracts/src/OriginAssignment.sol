@@ -25,6 +25,7 @@ import { IContentBlacklistOriginView } from "./interfaces/IContentBlacklistOrigi
 ///         validates against `CapacityBond.isActive` only and `prune` reverts.
 contract OriginAssignment is AccessControl, ReentrancyGuard {
     using EnumerableSet for EnumerableSet.AddressSet;
+    using EnumerableSet for EnumerableSet.UintSet;
 
     // -----------------------------------------------------------------
     // Roles
@@ -73,6 +74,16 @@ contract OriginAssignment is AccessControl, ReentrancyGuard {
     }
 
     mapping(uint256 namespaceId => PendingAssignment) internal _pending;
+
+    /// @notice Every namespace whose authorized set is currently non-empty.
+    /// @dev    Membership within a namespace was always readable via `getOrigins`;
+    ///         the KEY SET was not, which is the sole reason a consumer had to
+    ///         replay `AssignmentActivated` from the deploy block just to learn
+    ///         which namespaces exist. Maintained alongside every `_origins`
+    ///         mutation: seated on activation, withdrawn once the last operator
+    ///         is revoked or pruned, so `contains(ns)` matches
+    ///         `getOrigins(ns).length > 0` exactly.
+    EnumerableSet.UintSet internal _assignedNamespaces;
 
     // -----------------------------------------------------------------
     // Events (ADR 011 § Contract: OriginAssignment)
@@ -221,6 +232,7 @@ contract OriginAssignment is AccessControl, ReentrancyGuard {
             }
         }
         if (!_origins[namespaceId].remove(operator)) revert NotAuthorizedOrigin(namespaceId, operator);
+        _pruneEmptyNamespace(namespaceId);
         emit AssignmentRevoked(namespaceId, operator, msg.sender);
     }
 
@@ -236,6 +248,7 @@ contract OriginAssignment is AccessControl, ReentrancyGuard {
             revert OperatorNotBlacklisted(operator);
         }
         if (!_origins[namespaceId].remove(operator)) revert NotAuthorizedOrigin(namespaceId, operator);
+        _pruneEmptyNamespace(namespaceId);
         emit BlacklistedAssignmentPruned(namespaceId, operator, msg.sender);
     }
 
@@ -296,6 +309,31 @@ contract OriginAssignment is AccessControl, ReentrancyGuard {
         return _origins[namespaceId].values();
     }
 
+    /// @notice How many namespaces currently have a non-empty authorized set.
+    function assignedNamespaceCount() external view returns (uint256) {
+        return _assignedNamespaces.length();
+    }
+
+    /// @notice A page of the namespaces that currently have origins, so a
+    ///         consumer can bootstrap by paging this and calling `getOrigins` per
+    ///         id, instead of replaying `AssignmentActivated` from the deploy
+    ///         block to discover which ids exist.
+    /// @dev    Order is NOT stable across mutations (swap-and-pop on removal), so
+    ///         page every offset at ONE pinned block height and re-check
+    ///         `assignedNamespaceCount` there. `limit` is clamped against the
+    ///         remaining length rather than compared as `offset + limit`, which
+    ///         can overflow.
+    function assignedNamespaces(uint256 offset, uint256 limit) external view returns (uint256[] memory page) {
+        uint256 len = _assignedNamespaces.length();
+        if (offset >= len) return new uint256[](0);
+        uint256 n = len - offset;
+        if (n > limit) n = limit;
+        page = new uint256[](n);
+        for (uint256 i = 0; i < n; ++i) {
+            page[i] = _assignedNamespaces.at(offset + i);
+        }
+    }
+
     function getPendingAssignment(uint256 namespaceId)
         external
         view
@@ -322,6 +360,21 @@ contract OriginAssignment is AccessControl, ReentrancyGuard {
         }
         for (uint256 i = 0; i < operators.length; i++) {
             if (!set.add(operators[i])) revert DuplicateOperator(operators[i]);
+        }
+        // `operators` is non-empty (propose rejects `EmptyOperatorSet`), so the
+        // namespace is necessarily seated here.
+        // slither-disable-next-line unused-return
+        _assignedNamespaces.add(namespaceId);
+    }
+
+    /// @dev Withdraw `namespaceId` from the key set once its last authorized
+    ///      operator is gone, keeping `_assignedNamespaces` equal to
+    ///      "namespaces with a non-empty set" rather than "namespaces ever
+    ///      assigned". Called after every single-operator removal.
+    function _pruneEmptyNamespace(uint256 namespaceId) internal {
+        if (_origins[namespaceId].length() == 0) {
+            // slither-disable-next-line unused-return
+            _assignedNamespaces.remove(namespaceId);
         }
     }
 }
