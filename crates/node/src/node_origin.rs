@@ -1987,6 +1987,20 @@ fn forget_settled_channel(
 ///   `RateFloorRaised` (a governance floor raise made the quoted rate stale, #1382, so the
 ///   client re-probes/re-quotes at the new floor on a fresh stream). Different remedies,
 ///   same action here: the channel is healthy, so leave it alone and retry.
+///
+/// Wallet-less resume (issue #1481 §5 review item 2): this classifier does NOT special-case a
+/// bundled `StaleNonce`/`AmountRegression`/`BytesRegression`/`InsufficientDeposit`, and it does
+/// not need to. `stream_fetch_shared` (the entrypoint this node's own cache-miss buyer leg
+/// always calls, `byte_offset == 0`, see `pull_from_candidate` above) already retries a
+/// resumable rejection ENTIRELY inside `decdn-client-pull::fetch_inner` before it can ever
+/// surface here: the caller reseeds the channel's ledger and reopens the pull, transparently,
+/// and this classifier — like every other caller of `stream_fetch_shared` — sees only the
+/// FINAL outcome. So by the time `pull_verdict` downcasts an error to `UpstreamVoucherRejected`
+/// and reaches this function, the rejection is genuinely terminal: either the reason was never
+/// gated, it carried no bundle, the bundle failed shape validation, or the bounded resume
+/// attempts were exhausted. `OurDeadChannel` remains the correct verdict for all four reasons
+/// below in that case — the channel really is unusable and its deposit really is what needs
+/// reclaiming, not resuming.
 const fn voucher_verdict(reason: VoucherRejectReason) -> PullVerdict {
     match reason {
         VoucherRejectReason::BadSignature | VoucherRejectReason::WrongSigner => {
@@ -2065,7 +2079,7 @@ fn pull_verdict(err: &anyhow::Error) -> PullVerdict {
         // Unwrap it here rather than in `classify_refusal`, because the answer is not a
         // refusal verdict at all: it is a statement about our CHANNEL, and `voucher_verdict`
         // is the one place that decides what a rejected voucher costs.
-        if let StreamError::VoucherRejected { reason } = refused.error() {
+        if let StreamError::VoucherRejected { reason, .. } = refused.error() {
             return voucher_verdict(*reason);
         }
         return PullVerdict::Refused(classify_refusal(refused.error()));
@@ -2433,6 +2447,7 @@ mod tests {
 
         let rejected: anyhow::Error = anyhow::Error::new(UpstreamVoucherRejected {
             reason: decdn_protocol::client::VoucherRejectReason::StaleNonce,
+            bundle: None,
         });
         assert!(rejected.downcast_ref::<UpstreamVoucherRejected>().is_some());
         assert!(rejected.downcast_ref::<PullTimeout>().is_none());
@@ -2493,6 +2508,7 @@ mod tests {
             StreamError::BlobTooLarge,
             StreamError::VoucherRejected {
                 reason: VoucherRejectReason::RetryLater,
+                bundle: None,
             },
         ] {
             assert_ne!(
@@ -2573,6 +2589,7 @@ mod tests {
         assert_eq!(
             classify_refusal(&StreamError::VoucherRejected {
                 reason: VoucherRejectReason::BadSignature,
+                bundle: None,
             }),
             RefusalVerdict::OurFault
         );

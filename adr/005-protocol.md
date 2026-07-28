@@ -264,7 +264,19 @@ enum StreamError {
     BlobTooLarge,      // Blob exceeds this node's configured max_blob_size; do not retry this node
     InternalError,     // Unexpected failure; do not retry this node
     EvictedSinceProbe, // Blob was evicted between probe and stream request — WARNING: still slashable after a signed has_blob:true probe (see below)
-    VoucherRejected { reason: VoucherRejectReason }, // Mid-stream payment-voucher rejection (carried in a StreamError message, not in the initial StreamResponse) — see VoucherRejected semantics below
+    VoucherRejected { reason: VoucherRejectReason, bundle: Option<WatermarkBundle> }, // Mid-stream payment-voucher rejection (carried in a StreamError message, not in the initial StreamResponse) — see VoucherRejected semantics below; `bundle` carries the node's true watermark on a gated regression/exhaustion reject
+}
+
+// Attached to a regression/exhaustion VoucherRejected so a client that cannot
+// reconstruct its watermark from chain (the on-chain claim watermark stays 0
+// until settlement — the delegated / publisher-pays case especially) can
+// self-heal. Present only when the rejected voucher's signature recovered to
+// the channel's pinned voucherSigner (below).
+struct WatermarkBundle {
+    amount: [u8; 32],          // node's cumulative accepted amount (channel watermark, NOT a blob byte position)
+    nonce: [u8; 32],           // node's last accepted nonce
+    bytes_delivered: [u8; 32], // node's cumulative accepted bytes_delivered
+    last_signature: Vec<u8>,   // r‖s‖v (65 bytes) of the client's own last-accepted voucher, echoed back for authentication
 }
 
 enum VoucherRejectReason {
@@ -295,6 +307,13 @@ The other `StreamError` variants (`NotFound`, `Overloaded`, `BlobTooLarge`, `Int
 
 The first eight `VoucherRejectReason` variants mirror the off-chain validation enums `ChannelError` / `VoucherError` (in `crates/incentive/`) one-to-one. Each of those corresponds to an on-chain `closeChannel` / `disputeChannel` revert that would otherwise cost gas (see [ADR 003 § Fee Routing on Disputed Closes](003-payments.md#fee-routing-on-disputed-closes) for the on-chain invariants and [ADR 003 § Off-chain Voucher Rejections](003-payments.md#off-chain-voucher-rejections-wire-encoding) for the per-reason mapping). The remaining variants have no validation-enum counterpart and are emitted by the `cdn/client/v1` handler directly: `RetryLater` signals a transient node-side persist-write failure (`ChannelError::Store`, surfaced as `RetrySignal`) where the voucher is valid and in-memory state did not advance, so the client resends the same voucher rather than refreshing state (see [ADR 003 § Off-chain voucher state persistence](003-payments.md#off-chain-voucher-state-persistence)); `Expired` is the on-chain channel-expiry serve-gate refusal (#751); `CooperativeCloseSigned` is the cooperative-close-waiver refusal ([ADR 003 §Cooperative close](003-payments.md#cooperative-close-fast-settle)); and `RateFloorRaised` is the honest-buyer re-quote signal when a governance delivery-floor raise lands between a stream's signed quote and its voucher (#1382) — the voucher is now unredeemable at the quoted rate (`PaymentChannel._advanceClaimWatermark` reads the live `deliveryFloor` with no per-channel snapshot), so refusing is the node's correct self-protection and the client must re-probe/re-quote at the new floor rather than resend.
 
+**Watermark bundle (self-heal on regression/exhaustion).** A client whose channel is signed by a delegate — the publisher-pays case, where the publisher funds the channel and pins the client's key as `voucherSigner` — cannot reconstruct its off-chain watermark from the contract: the on-chain claim watermark stays 0 until settlement. A `StaleNonce`/`AmountRegression`/`BytesRegression`/`InsufficientDeposit` rejection would otherwise be a dead end. On exactly those four reasons, the node attaches a `WatermarkBundle` carrying its true cumulative `amount`/`nonce`/`bytes_delivered` plus `last_signature` — the `r‖s‖v` of the client's own last-accepted voucher. Two signature gates keep the bundle from leaking a watermark or corrupting client state:
+
+- **Node attaches it only when the rejected voucher's signature recovers to the channel's pinned `voucherSigner`.** The regression checks fire before the signature check, so the node recovers the signature explicitly at the reject site; a party who merely guessed the chain-derivable `channelId` and sent an unsigned or wrong-key voucher gets no bundle. This keeps a channel's watermark private to the key that funds it.
+- **Client trusts it only when `last_signature` recovers to its own signing key** over the bundle's `(channelId, token, amount, nonce, bytes_delivered)`. The bundle rides in an unsigned mid-stream `StreamError`, so its numeric fields are otherwise attacker-controllable; without this gate a malicious upstream could return an inflated `amount` and induce the paying client to over-sign and drain the deposit. Because `last_signature` is the client's *own* prior signature, only a watermark the client itself already authorized passes.
+
+On a passing bundle the client re-seeds its payment ledger to the node's watermark and re-signs from `nonce + 1`; the blob fetch resumes from its existing `byte_offset` (a per-blob position — distinct from the channel-cumulative `bytes_delivered`). Resumes are bounded per stream. A rejection with no bundle stays terminal.
+
 **Retry semantics by reason:**
 
 | Reason | Client action |
@@ -303,10 +322,10 @@ The first eight `VoucherRejectReason` variants mirror the off-chain validation e
 | `WrongSigner` | Client bug. Do not retry; surface to caller. |
 | `WrongChannel` | Client bug (channel_id mis-bind). Do not retry; surface to caller. |
 | `WrongToken` | Client bug or cross-token replay attempt (see [ADR 003 § Replay attack on vouchers](003-payments.md#replay-attack-on-vouchers)). Do not retry; surface to caller. |
-| `StaleNonce` | Likely client-side bookkeeping desync (e.g., reconnect after crash, lost `VoucherAck`). Refresh channel state from the contract or the last received `VoucherAck`; reissue voucher with the correct nonce. **Maximum 1 retry per stream.** |
+| `StaleNonce` | Client-side bookkeeping desync (e.g., reconnect after crash, lost `VoucherAck`). If the reject carries a `WatermarkBundle` that authenticates (above), re-seed to the node's watermark and reissue from `nonce + 1` — this is the self-heal path for a delegated client that cannot refresh from chain. Otherwise refresh channel state from the contract or the last `VoucherAck` and reissue. **Bounded retries per stream.** |
 | `AmountRegression` | Client bug — cumulative `amount` regressed. Do not retry; surface to caller. |
 | `BytesRegression` | Client bug — cumulative `bytes_delivered` regressed. Do not retry; surface to caller. |
-| `InsufficientDeposit` | Channel funds exhausted ([ADR 003 invariant 1](003-payments.md#fee-routing-on-disputed-closes): `voucher.amount > channel.deposit`). Open a new channel or top up on-chain; do not retry on this channel. |
+| `InsufficientDeposit` | Channel funds exhausted ([ADR 003 invariant 1](003-payments.md#fee-routing-on-disputed-closes): `voucher.amount > channel.deposit`). A self-funded client tops up on-chain or opens a new channel. A delegated client cannot top up — `topUp` is funder-only — so it surfaces exhaustion to the application, which asks the funder (publisher) to top up before resuming. Do not retry on this channel until the deposit rises. |
 | `RetryLater` | Transient node-side store failure ([ADR 003 §Off-chain voucher state persistence](003-payments.md#off-chain-voucher-state-persistence)); the voucher was valid and unaccepted. Resend the **same** voucher (unchanged nonce/amount/bytes) on a fresh stream. **Bounded retries with backoff** (the node may be briefly degraded); after exhausting them, fall back to another provider. |
 | `Expired` | Channel passed its on-chain `expiresAt` (#751); any further delivery would be unpaid. Stop streaming on this channel; `reclaimExpired` refunds the remainder. Do not resend. |
 | `CooperativeCloseSigned` | Node signed a cooperative-close waiver ([ADR 003 §Cooperative close](003-payments.md#cooperative-close-fast-settle)); the channel is settling at the current watermark. Stop streaming and submit the cooperative close (or fall back to `closeChannel`). Do not resend. |
@@ -316,7 +335,7 @@ These per-reason rules apply only to `VoucherRejected`. The delivery-side errors
 
 Like all `StreamError` codes, `VoucherRejected` is **unsigned** and is not used as on-chain evidence. A malicious node could falsely return `VoucherRejected` to refuse delivery, which is indistinguishable on-wire from `Overloaded` and is subject to the same reputation/redundancy mitigations as other refusal modes.
 
-**Schema-evolution constraints.** Adding a new `VoucherRejectReason` or new top-level `StreamError` variant is a Tier-2 minor evolution per [ADR 013](013-schema-evolution.md#adr-013-schema-evolution); old peers will close the stream with `0x01 UNSUPPORTED_MESSAGE` on the unknown discriminant rather than receive the new reason, so deployments MUST roll out client-side support before nodes start emitting it. Adding a field to the struct variant `VoucherRejected { … }` is a Tier-3 (major) change requiring an ALPN bump, since the postcard frame ends at the `reason` byte with no extension-bytes tail to skip past.
+**Schema-evolution constraints.** Adding a new `VoucherRejectReason` or new top-level `StreamError` variant is a Tier-2 minor evolution per [ADR 013](013-schema-evolution.md#adr-013-schema-evolution); old peers will close the stream with `0x01 UNSUPPORTED_MESSAGE` on the unknown discriminant rather than receive the new reason, so deployments MUST roll out client-side support before nodes start emitting it. The `VoucherRejected { reason, bundle }` frame is positional postcard with no extension-bytes tail, so its fields are append-only and a further field is a Tier-3 (major) change requiring an ALPN bump: a peer built against the two-field shape decodes a third field's bytes as a trailing frame error. The `bundle` field itself is append-only-compatible with a `reason`-only decoder only within a coordinated deploy — mixed one-field/two-field peers do not interoperate — which is why it is introduced as a single pre-deployment wire cut rather than a staged rollout.
 
 **Mirror obligation with `crates/incentive/`.** The first eight `VoucherRejectReason` variants are structurally mirrored to `ChannelError ∪ VoucherError` minus the `Signature` wrapper; `RetryLater` is exempt — it is the wire expression of the transient `RetrySignal`, not a validation variant, and is emitted by the handler directly rather than by the mirror conversion. Any new *permanent* `ChannelError` / `VoucherError` variant therefore requires (a) a corresponding `VoucherRejectReason` variant — Tier-2 per the rule above — and (b) a row in the retry-semantics table. The handler-side conversion `fn voucher_reject_reason(&ChannelError) -> Result<VoucherRejectReason, RetrySignal>` MUST `match` exhaustively without a wildcard arm, so adding a `ChannelError` variant fails to compile until the wire enum and this section are updated.
 

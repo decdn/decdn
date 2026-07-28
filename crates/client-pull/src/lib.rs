@@ -61,12 +61,12 @@ use bao_tree::io::{BaoContentItem, DecodeError};
 use bytes::{Bytes, BytesMut};
 use decdn_bao_range::{IROH_BLOCK_SIZE, align_range};
 use decdn_incentive::{
-    BuyerChannelState, EPHEMERAL_BINDING_NONCE, StreamSlashData, Voucher, binding_signing_hash,
-    signed_to_wire_voucher,
+    BuyerChannelState, EPHEMERAL_BINDING_NONCE, SignedVoucher, StreamSlashData, Voucher,
+    binding_signing_hash, signed_to_wire_voucher,
 };
 use decdn_protocol::client::{
     ClientBinding, ClientMessage, StreamError, StreamRequest, StreamRequestExt, StreamResponse,
-    VoucherRejectReason,
+    VoucherRejectReason, WatermarkBundle,
 };
 use decdn_protocol::{
     ALPN_CLIENT, DEFAULT_VOUCHER_INTERVAL_MB, MB_BYTES, decode_message, encode_message, read_frame,
@@ -486,9 +486,22 @@ impl std::error::Error for PullTimeout {}
 /// (the `Copy` `VoucherRejectReason`, not a lossy stringification) so a future
 /// caller can branch on retry-vs-top-up-vs-abandon without re-parsing a message.
 /// `Display` keeps the stable `voucher rejected` text for logs.
+///
+/// `bundle` mirrors the wire [`WatermarkBundle`] verbatim (issue #1481): `Some`
+/// only for the gated regression/exhaustion reasons, and only when the node
+/// verified the rejected voucher recovered to the channel's pinned
+/// `voucher_signer` before attaching it. A caller that sees `Some` alongside
+/// `StaleNonce`/`AmountRegression`/`BytesRegression` can self-heal — re-seed
+/// its ledger to the bundle's watermark ([`crate::ledger::Cumulative::from`])
+/// and resume from `bytes_delivered` — rather than treating the rejection as
+/// terminal. `InsufficientDeposit` with `bundle: None` means there is no
+/// signer-verified watermark to resume from (or, more commonly, that a
+/// wallet-less delegate simply has no local means to add deposit) — the
+/// caller must surface that to the app rather than loop.
 #[derive(Debug)]
 pub struct UpstreamVoucherRejected {
     pub reason: VoucherRejectReason,
+    pub bundle: Option<WatermarkBundle>,
 }
 
 impl std::fmt::Display for UpstreamVoucherRejected {
@@ -555,7 +568,10 @@ enum Kind {
     /// `expected_signer`.
     Open {
         error: StreamError,
-        response: StreamResponse,
+        // Boxed (issue #1481 review): `StreamError::VoucherRejected` grew an
+        // optional `WatermarkBundle`, which pushed the unboxed variant past
+        // clippy's `large_enum_variant` threshold relative to `MidStream`.
+        response: Box<StreamResponse>,
     },
     /// Mid-stream refusal: a bare [`ClientMessage::StreamError`] frame that
     /// arrived after the open stage. It carries no signature (#1042), so there
@@ -602,7 +618,10 @@ impl UpstreamRefused {
         }
         match response.error.clone() {
             Some(error) => anyhow::Error::new(Self {
-                kind: Kind::Open { error, response },
+                kind: Kind::Open {
+                    error,
+                    response: Box::new(response),
+                },
             }),
             None => anyhow::anyhow!(
                 "delivery refused but the validated response carried no error code \
@@ -654,9 +673,9 @@ impl UpstreamRefused {
     /// resolves `nodeId` against. A challenger may replay it to `SlashJudge`
     /// with no re-signing.
     #[must_use]
-    pub const fn evidence(&self) -> Option<&StreamResponse> {
+    pub fn evidence(&self) -> Option<&StreamResponse> {
         match &self.kind {
-            Kind::Open { response, .. } => Some(response),
+            Kind::Open { response, .. } => Some(response.as_ref()),
             Kind::MidStream { .. } => None,
         }
     }
@@ -1337,8 +1356,180 @@ async fn open_stream(
     .map_err(|_| anyhow::Error::new(PullTimeout { after: open }))?
 }
 
+/// Wallet-less resume (issue #1481 §5): the maximum number of times
+/// [`fetch_inner`] will reopen a fresh stream after a gated, bundled
+/// `StaleNonce`/`AmountRegression`/`BytesRegression`/`InsufficientDeposit`
+/// rejection. Bounds a node that keeps rejecting (a buggy or adversarial
+/// peer echoing a bundle that never lets the client catch up) to a handful
+/// of round trips rather than looping forever; a healthy self-heal needs
+/// exactly one.
+const MAX_RESUME_ATTEMPTS: u32 = 3;
+
+/// Buffered fetch with wallet-less resume (issue #1481 §5): if a mid-stream
+/// voucher rejection carries a signer-verified [`WatermarkBundle`] for one of
+/// the four regression/exhaustion reasons, reseed `ledger` from it and reopen
+/// the pull — at the **same** `byte_offset` the caller originally requested,
+/// not `bundle.bytes_delivered` — instead of surfacing the rejection as
+/// terminal.
+///
+/// `bundle.bytes_delivered` is deliberately NOT used as the retry's wire
+/// `byte_offset`, even though that is what makes a `WatermarkBundle` look
+/// resumable at a glance. The two are different axes: `bytes_delivered` is
+/// the CHANNEL's cumulative payment counter (used to reconstruct each
+/// voucher's EIP-712 `bytesDelivered`, ADR 005 — [`Voucher`] carries no such
+/// field on the wire), not a position within THIS blob's byte range. A
+/// channel can fund many blobs; jumping the wire offset ahead to the
+/// channel's cumulative would, for every caller that requested
+/// `byte_offset == 0` (every production caller today — `stream_fetch_shared`
+/// always passes `0`, `crates/node/src/node_origin.rs`), silently return a
+/// TRUNCATED tail instead of the full blob the caller is relying on getting
+/// back. The bytes already streamed in the failed attempt were never decoded
+/// (the error path never reaches `decode_verified_range`), so there is
+/// nothing to legitimately splice a jump with. Retrying at the caller's
+/// original offset is always safe and is the only thing this bundle field
+/// is actually needed for: fixing the ledger's amount/nonce/bytes BASELINE
+/// so the resumed stream's vouchers verify against what the node now
+/// expects, not re-deriving where in the blob to resume.
+///
+/// This is the ONLY retry loop in the crate for this case —
+/// [`UpstreamPull::pay_one`]/[`receive_and_pay`] never retry themselves, because the
+/// stream they hold is already dead by the time a mid-stream
+/// `VoucherRejected` reaches them (the node finishes its send side before
+/// replying, `handlers/client/wire.rs::write_reject`); a fresh stream can
+/// only be opened by whoever owns the connection, which is here.
+///
+/// Every existing caller — `stream_fetch` (test-only), [`stream_fetch_tracked`],
+/// [`stream_fetch_tracked_with_progress`], and, importantly,
+/// [`stream_fetch_shared`] (the daemon's own node-to-node cache-miss buyer
+/// leg, ADR 002/037) — goes through this wrapper, so a resumable rejection
+/// on any of those paths is retried transparently: `pull_verdict` /
+/// `voucher_verdict` in `decdn-node`'s `node_origin.rs` only ever see the
+/// FINAL outcome (success, or the original terminal error once
+/// [`MAX_RESUME_ATTEMPTS`] is exhausted or the reason/bundle isn't
+/// eligible) — the `OurDeadChannel` classification there stays correct as
+/// the terminal fallback and needs no change.
+///
+/// A bundle-less rejection, a non-gated reason, or a bundle that fails
+/// [`WatermarkBundle::validate`] (malformed `last_signature` length) is
+/// never treated as resumable and is returned to the caller unchanged on
+/// the first attempt, exactly as before this feature existed.
 #[allow(clippy::too_many_arguments)]
 async fn fetch_inner(
+    endpoint: &Endpoint,
+    target: EndpointAddr,
+    ctx: &ChannelContext,
+    slash_domain: &Eip712Domain,
+    expected_signer: Address,
+    hash: [u8; 32],
+    namespace_id: [u8; 32],
+    byte_offset: u64,
+    timestamp_us: u64,
+    max_blob_size_bytes: u64,
+    max_rate_per_mb: u64,
+    open: Duration,
+    stall: Duration,
+    ledger: &ChannelLedger,
+    on_progress: Option<&ProgressCallback>,
+) -> anyhow::Result<Bytes> {
+    for attempt in 0..=MAX_RESUME_ATTEMPTS {
+        let result = fetch_inner_once(
+            endpoint,
+            target.clone(),
+            ctx,
+            slash_domain,
+            expected_signer,
+            hash,
+            namespace_id,
+            byte_offset,
+            timestamp_us,
+            max_blob_size_bytes,
+            max_rate_per_mb,
+            open,
+            stall,
+            ledger,
+            on_progress,
+        )
+        .await;
+        let Err(e) = result else {
+            return result;
+        };
+        if attempt == MAX_RESUME_ATTEMPTS {
+            return Err(e);
+        }
+        match resumable_watermark(&e, ctx) {
+            Some(bundle) => {
+                ledger.reseed(Cumulative::from(bundle));
+                tracing::debug!(
+                    attempt,
+                    byte_offset,
+                    "voucher rejection carried an authenticated watermark bundle; reseeded and \
+                     retrying at the same byte_offset"
+                );
+            }
+            None => return Err(e),
+        }
+    }
+    // Unreachable: the loop above always returns on both the `Ok` and every `Err`
+    // branch (either directly or after `attempt == MAX_RESUME_ATTEMPTS`
+    // triggers on the final iteration). Kept as a typed bail rather than
+    // `unreachable!()`/`panic!()` per the workspace anti-panic policy.
+    Err(anyhow::anyhow!("resume loop exited without returning"))
+}
+
+/// Extract a resumable, AUTHENTICATED [`WatermarkBundle`] from a pull error, or `None` if the
+/// error is not an `UpstreamVoucherRejected`, its reason is not
+/// [`VoucherRejectReason::is_watermark_gated`], it carries no bundle, the bundle fails
+/// [`WatermarkBundle::validate`] (malformed `last_signature` length), or — the security-critical
+/// check — `last_signature` does not recover to this client's OWN voucher-signing address over
+/// the bundle's `amount`/`nonce`/`bytes_delivered`.
+///
+/// The bundle rides inside a mid-stream `StreamError`, which carries no signature of its own
+/// (#1042) — the upstream node is unauthenticated at this layer, so `amount`/`nonce`/
+/// `bytes_delivered` are otherwise attacker-controllable. Without this check, a malicious or
+/// buggy upstream could hand back an inflated watermark, have this client `reseed` its ledger
+/// to it, and the RETRIED pull would sign a voucher for `bundle.amount + delta` — a voucher this
+/// client genuinely holds the key to sign and the node can redeem on-chain up to the deposit,
+/// draining the channel while delivering ~nothing. `last_signature` closes that hole: it is
+/// supposed to be the client's OWN last-accepted voucher signature, echoed back so the client
+/// can confirm the watermark corresponds to a voucher IT ITSELF signed (see the field's doc on
+/// [`WatermarkBundle`]) — this is the client-side half of exactly the check the node's own gate
+/// performs before it ever attaches a bundle (`crates/node/src/handlers/client/voucher.rs`:
+/// `signed.recover_signer(&self.voucher_domain) == guard.state.voucher_signer`). A bundle whose
+/// signature does not recover to `ctx.client_signer.address()` is treated as a hostile/corrupt
+/// echo, not a legitimate watermark, and is never reseeded from.
+fn resumable_watermark<'a>(
+    err: &'a anyhow::Error,
+    ctx: &ChannelContext,
+) -> Option<&'a WatermarkBundle> {
+    let rejected = err.downcast_ref::<UpstreamVoucherRejected>()?;
+    if !rejected.reason.is_watermark_gated() {
+        return None;
+    }
+    let bundle = rejected.bundle.as_ref()?;
+    if bundle.validate().is_err() {
+        return None;
+    }
+    let signature = Signature::try_from(bundle.last_signature.as_slice()).ok()?;
+    let recovered = SignedVoucher {
+        voucher: Voucher {
+            channel_id: ctx.channel_id,
+            amount: U256::from_be_bytes(bundle.amount),
+            nonce: U256::from_be_bytes(bundle.nonce),
+            bytes_delivered: U256::from_be_bytes(bundle.bytes_delivered),
+            token: ctx.token,
+        },
+        signature,
+    }
+    .recover_signer(&ctx.voucher_domain)
+    .ok()?;
+    if recovered != ctx.client_signer.address() {
+        return None;
+    }
+    Some(bundle)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn fetch_inner_once(
     endpoint: &Endpoint,
     target: EndpointAddr,
     ctx: &ChannelContext,
@@ -2240,10 +2431,16 @@ fn resolve_voucher_slot(ledger: &ChannelLedger, ack: ClientMessage) -> anyhow::R
         }
         // A `VoucherRejected` is OUR payment-side fault. Disarm the rejected voucher
         // (known-not-taken, so it must not be settled optimistically) and carry its
-        // typed reason so the orchestrator can exonerate the provider (#857).
-        ClientMessage::StreamError(StreamError::VoucherRejected { reason }) => {
+        // typed reason — plus the wallet-less-resume `bundle` (#1481) — so the
+        // orchestrator can exonerate the provider (#857) and `fetch_inner` can
+        // self-heal from an authenticated watermark instead of treating the rejection
+        // as terminal.
+        ClientMessage::StreamError(StreamError::VoucherRejected { reason, bundle }) => {
             ledger.resolve_reject();
-            Err(anyhow::Error::new(UpstreamVoucherRejected { reason }))
+            Err(anyhow::Error::new(UpstreamVoucherRejected {
+                reason,
+                bundle,
+            }))
         }
         // Any OTHER `StreamError` is the upstream refusing mid-stream. Carry the typed
         // wire code as `UpstreamRefused`, exactly as the mid-stream receive sites do
@@ -2323,7 +2520,11 @@ mod tests {
     use bao_tree::io::outboard::PreOrderMemOutboard;
     use decdn_bao_range::{IROH_BLOCK_SIZE, align_range, encode_verified_range};
 
-    use super::{HashMismatch, LocalPullFault, aligned_wire_len, decode_verified_range};
+    use super::{
+        ChannelContext, HashMismatch, LocalPullFault, U256, UpstreamVoucherRejected, Voucher,
+        VoucherRejectReason, WatermarkBundle, aligned_wire_len, decode_verified_range,
+        resumable_watermark,
+    };
 
     /// The `LocalPullFault` marker must ride out on the errors the range helpers ACTUALLY
     /// raise — not on one a test hand-built (#1145 review).
@@ -2501,6 +2702,178 @@ mod tests {
             ext.binding == Some(binding),
             "ext must carry the exact binding"
         );
+        Ok(())
+    }
+
+    /// Build a test [`ChannelContext`] signing with `signer`, sharing the shape
+    /// `client_binding_ext_reflects_binding_presence` already uses.
+    fn resume_test_ctx(
+        channel_id: alloy::primitives::B256,
+        token: alloy::primitives::Address,
+        signer: &std::sync::Arc<alloy::signers::local::PrivateKeySigner>,
+        domain: &alloy::dyn_abi::Eip712Domain,
+    ) -> ChannelContext {
+        ChannelContext {
+            channel_id,
+            token,
+            deposit: U256::ZERO,
+            client_signer: std::sync::Arc::clone(signer),
+            voucher_domain: domain.clone(),
+            prior_nonce: U256::ZERO,
+            prior_bytes_delivered: U256::ZERO,
+            prior_amount: U256::ZERO,
+            client_binding: None,
+        }
+    }
+
+    /// Build a `WatermarkBundle` whose `last_signature` is `signer`'s real EIP-712 voucher
+    /// signature over `(channel_id, amount, nonce, bytes_delivered, token)` — i.e. a
+    /// genuinely-signed bundle, the shape a caller must construct one from.
+    fn signed_bundle(
+        channel_id: alloy::primitives::B256,
+        token: alloy::primitives::Address,
+        signer: &alloy::signers::local::PrivateKeySigner,
+        domain: &alloy::dyn_abi::Eip712Domain,
+        amount: U256,
+        nonce: U256,
+        bytes_delivered: U256,
+    ) -> anyhow::Result<WatermarkBundle> {
+        let voucher_signature = Voucher {
+            channel_id,
+            amount,
+            nonce,
+            bytes_delivered,
+            token,
+        }
+        .sign(signer, domain)
+        .map_err(|e| anyhow::anyhow!("voucher signing failed: {e}"))?;
+        Ok(WatermarkBundle {
+            amount: amount.to_be_bytes(),
+            nonce: nonce.to_be_bytes(),
+            bytes_delivered: bytes_delivered.to_be_bytes(),
+            last_signature: voucher_signature.signature.as_bytes().to_vec(),
+        })
+    }
+
+    /// The security property this module exists to guard (post-review-round-2, #1481 §5): a
+    /// mid-stream `StreamError` carries no signature of its own, so `WatermarkBundle.amount`/
+    /// `nonce`/`bytes_delivered` are otherwise attacker-controllable by the upstream node.
+    /// `resumable_watermark` MUST refuse to reseed the ledger from a bundle whose
+    /// `last_signature` does not recover to THIS client's own `ctx.client_signer` — otherwise a
+    /// malicious/buggy upstream could hand back an inflated watermark and have this client sign
+    /// (and the node redeem) a voucher for money it never delivered.
+    #[test]
+    fn resumable_watermark_rejects_a_bundle_not_signed_by_our_own_key() -> anyhow::Result<()> {
+        use alloy::primitives::{Address, B256};
+        use alloy::signers::local::PrivateKeySigner;
+
+        let channel_id = B256::repeat_byte(0x11);
+        let token = Address::repeat_byte(0x22);
+        let domain = decdn_incentive::voucher_domain(1, Address::repeat_byte(0x33));
+        let our_signer = std::sync::Arc::new(PrivateKeySigner::random());
+        let attacker_signer = PrivateKeySigner::random();
+        let ctx = resume_test_ctx(channel_id, token, &our_signer, &domain);
+
+        // The upstream (or an attacker impersonating it) signs the SAME tuple with a
+        // DIFFERENT key — exactly what a malicious node echoing a fabricated watermark
+        // would have to do, since it does not hold our key.
+        let bundle = signed_bundle(
+            channel_id,
+            token,
+            &attacker_signer,
+            &domain,
+            U256::from(1_000_000u64), // an inflated amount our ledger never earned
+            U256::from(1u64),
+            U256::from(4096u64),
+        )?;
+        let err = anyhow::Error::new(UpstreamVoucherRejected {
+            reason: VoucherRejectReason::StaleNonce,
+            bundle: Some(bundle),
+        });
+
+        anyhow::ensure!(
+            resumable_watermark(&err, &ctx).is_none(),
+            "a bundle signed by a key other than ours must never be treated as resumable"
+        );
+        Ok(())
+    }
+
+    /// The companion attack shape: the SAME rejected-voucher signature bytes replayed
+    /// alongside a TAMPERED `amount` field. Recovery is over the whole tuple, so any field
+    /// mismatch (not just a wrong key) must also fail the check — `last_signature` binds the
+    /// exact `(amount, nonce, bytes_delivered)` triple, not just "some voucher we once signed".
+    #[test]
+    fn resumable_watermark_rejects_a_bundle_with_a_tampered_amount() -> anyhow::Result<()> {
+        use alloy::primitives::{Address, B256};
+        use alloy::signers::local::PrivateKeySigner;
+
+        let channel_id = B256::repeat_byte(0x11);
+        let token = Address::repeat_byte(0x22);
+        let domain = decdn_incentive::voucher_domain(1, Address::repeat_byte(0x33));
+        let our_signer = std::sync::Arc::new(PrivateKeySigner::random());
+        let ctx = resume_test_ctx(channel_id, token, &our_signer, &domain);
+
+        // Genuinely our own signature — but over amount 100, not the 1_000_000 the bundle
+        // claims. A node that recorded 100 and echoes 1_000_000 (bug or malice) must not
+        // slip through just because SOME real signature accompanies it.
+        let mut bundle = signed_bundle(
+            channel_id,
+            token,
+            &our_signer,
+            &domain,
+            U256::from(100u64),
+            U256::from(1u64),
+            U256::from(4096u64),
+        )?;
+        bundle.amount = U256::from(1_000_000u64).to_be_bytes();
+        let err = anyhow::Error::new(UpstreamVoucherRejected {
+            reason: VoucherRejectReason::StaleNonce,
+            bundle: Some(bundle),
+        });
+
+        anyhow::ensure!(
+            resumable_watermark(&err, &ctx).is_none(),
+            "a bundle whose signature does not cover the claimed amount must never be treated \
+             as resumable"
+        );
+        Ok(())
+    }
+
+    /// The positive twin: a bundle genuinely signed by OUR OWN key, over the tuple it claims,
+    /// for a gated reason, passes every check and is returned so the caller can reseed.
+    #[test]
+    fn resumable_watermark_accepts_a_bundle_genuinely_signed_by_our_own_key() -> anyhow::Result<()>
+    {
+        use alloy::primitives::{Address, B256};
+        use alloy::signers::local::PrivateKeySigner;
+
+        let channel_id = B256::repeat_byte(0x11);
+        let token = Address::repeat_byte(0x22);
+        let domain = decdn_incentive::voucher_domain(1, Address::repeat_byte(0x33));
+        let our_signer = std::sync::Arc::new(PrivateKeySigner::random());
+        let ctx = resume_test_ctx(channel_id, token, &our_signer, &domain);
+
+        let bundle = signed_bundle(
+            channel_id,
+            token,
+            &our_signer,
+            &domain,
+            U256::from(500u64),
+            U256::from(3u64),
+            U256::from(4096u64),
+        )?;
+        let expected_bytes = bundle.bytes_delivered;
+        let err = anyhow::Error::new(UpstreamVoucherRejected {
+            reason: VoucherRejectReason::StaleNonce,
+            bundle: Some(bundle),
+        });
+
+        let got = resumable_watermark(&err, &ctx).ok_or_else(|| {
+            anyhow::anyhow!(
+                "a bundle genuinely signed by our own key over the claimed tuple must resolve"
+            )
+        })?;
+        assert_eq!(got.bytes_delivered, expected_bytes);
         Ok(())
     }
 

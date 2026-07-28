@@ -7,8 +7,9 @@
 //! channel is **auto-opened and reused** (#940): `fetch` looks up a live channel
 //! with `--provider-address` in its persistent buyer-channel store, resuming
 //! that channel's voucher watermark; if none exists it opens (and funds) one
-//! on-chain and records it. So there is no `--channel-id` — the channel is
-//! derived.
+//! on-chain and records it. `--channel-id` (#1481) is the escape hatch for
+//! publisher-pays: it adopts an existing channel by id instead of deriving one
+//! from `--provider-address`.
 //!
 //! The on-chain coordinates (RPC, contract addresses, chain id, keystore, data
 //! dir) resolve **flag > `[blockchain]`/`[identity]` config > default**, so a
@@ -81,6 +82,11 @@ pub struct ClientFetchArgs {
     /// Pairs with `--node-id`, so it requires it.
     #[arg(long, value_name = "0xADDR", requires = "node_id")]
     pub provider_address: Option<String>,
+
+    /// Adopt an existing channel by id (publisher-pays); skips auto-open. The
+    /// channel's voucherSigner must be a key in your keystore.
+    #[arg(long, value_name = "0xHASH")]
+    pub channel_id: Option<String>,
 
     /// JSON-RPC endpoint for on-chain channel open. Overrides
     /// `blockchain.rpc_url` from config.
@@ -589,5 +595,16 @@ mod tests {
         let huge = parse(&["--max-blob-mb", "1048576"]);
         assert_eq!(small.stall_timeout(), huge.stall_timeout());
         assert_eq!(small.hard_cap(), huge.hard_cap());
+    }
+
+    /// `--channel-id` (#1481, publisher-pays adopt-by-id) is optional and stands
+    /// alone — unlike `--provider-address` it does not `requires` `--node-id`,
+    /// since the adopt path can derive the node to dial from the channel's
+    /// on-chain provider instead.
+    #[test]
+    fn channel_id_is_optional_and_stands_alone() {
+        assert_eq!(parse(&[]).channel_id, None, "the flag stays optional");
+        let id = "0x1111111111111111111111111111111111111111111111111111111111111111"; // 66 chars, arbitrary opaque string at the clap layer
+        assert_eq!(parse(&["--channel-id", id]).channel_id.as_deref(), Some(id));
     }
 }

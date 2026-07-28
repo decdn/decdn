@@ -368,7 +368,7 @@ async fn build_infra(
     // Keep the concrete store `Arc` so it can back the seller
     // `ChannelStateStore` (channel_state_v1 table), the pending-settle store
     // (pending_settle_v1 table, PR #743 review), and the buyer
-    // `BuyerChannelStore` (buyer_channel_state_v1 table, #744) — redb forbids a
+    // `BuyerChannelStore` (buyer_channel_state_v2 table, #744) — redb forbids a
     // second `Database` handle to the same file, so one shared store owns all.
     let concrete_channel_store: Arc<PersistentChannelStateStore> = Arc::new(
         tokio::task::spawn_blocking(move || {
@@ -1413,7 +1413,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
     // upstream provider on a cache miss it pays via the same channel mechanism,
     // acting as the client: a separate wallet-filled provider signs `approve` /
     // `openChannel` / `reclaimExpired`. It shares the persistent store (a
-    // distinct `buyer_channel_state_v1` table) and re-derives the voucher domain
+    // distinct `buyer_channel_state_v2` table) and re-derives the voucher domain
     // the handler consumed above. The cache-miss hook that *calls*
     // `open_or_reuse_channel` is the `NodeOrigin` provisioned below (#831), gated
     // on `cache.node_to_node_pull_through_enabled`; the service is also held for

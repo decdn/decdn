@@ -4,7 +4,7 @@
 use super::{
     B256, ClientHandler, ClientMessage, DownloadReceipt, Hash, Ordering, SendStream,
     ServeRejectReason, StreamError, StreamRequest, StreamResponse, StreamResponseBody,
-    StreamSlashData, U256, VoucherRejectReason, encode_message, write_frame,
+    StreamSlashData, U256, VoucherRejectReason, WatermarkBundle, encode_message, write_frame,
 };
 
 impl ClientHandler {
@@ -146,15 +146,21 @@ impl ClientHandler {
 
     /// Write a mid-stream `StreamError { VoucherRejected }` and finish the
     /// stream **cleanly** — no QUIC reset — so the client can read the reason
-    /// (ADR 005 §`VoucherRejected` semantics).
+    /// (ADR 005 §`VoucherRejected` semantics). `bundle` is the wallet-less
+    /// resume watermark (issue #1481): callers pass `Some` only for the four
+    /// gated regression/exhaustion reasons, and only after verifying the
+    /// rejected voucher's signature recovered to the channel's pinned
+    /// `voucher_signer` — this method does not re-derive or re-check that
+    /// gate, it trusts the caller.
     pub(super) async fn write_reject(
         &self,
         send: &mut SendStream,
         reason: VoucherRejectReason,
+        bundle: Option<WatermarkBundle>,
     ) -> anyhow::Result<()> {
         self.write_message(
             send,
-            &ClientMessage::StreamError(StreamError::VoucherRejected { reason }),
+            &ClientMessage::StreamError(StreamError::VoucherRejected { reason, bundle }),
         )
         .await?;
         let _ = send.finish();

@@ -36,12 +36,13 @@ use decdn_cache::{
 use decdn_incentive::rate::{DEFAULT_TOLERANCE_BPS, RateError, min_payment, verify_rate};
 use decdn_incentive::store::StoreError;
 use decdn_incentive::{
-    ChannelId, ChannelState, ChannelStateStore, CooperativeClose, StreamSlashData, VoucherActivity,
-    verify_binding, voucher_reject_reason, wire_voucher_to_signed,
+    ChannelId, ChannelState, ChannelStateStore, CooperativeClose, SignedVoucher, StreamSlashData,
+    VoucherActivity, verify_binding, voucher_reject_reason, wire_voucher_to_signed,
 };
 use decdn_protocol::client::{
     ChunkData, ClientMessage, CooperativeCloseAuth, CooperativeCloseRequest, StreamError,
     StreamRequest, StreamRequestExt, StreamResponse, StreamResponseBody, VoucherRejectReason,
+    WatermarkBundle,
 };
 use decdn_protocol::{
     ALPN_CLIENT, APP_ERR_RATE_LIMITED, FrameError, MB_BYTES, decode_message, encode_message,

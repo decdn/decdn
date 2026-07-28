@@ -40,7 +40,7 @@ use decdn_client_pull::{
 };
 use decdn_common::cli::{self, common::expand_tilde};
 use decdn_common::config::{DEFAULT_CHAIN_ID, FileConfig, load_file_config};
-use decdn_incentive::buyer_channel::{AdvanceOutcome, BuyerChannelStore};
+use decdn_incentive::buyer_channel::{AdvanceOutcome, BuyerChannelState, BuyerChannelStore};
 use decdn_incentive::buyer_channel_redb::RedbBuyerChannelStore;
 use decdn_incentive::eth_identity::{self, PasswordSource, load_signer, read_password};
 use decdn_incentive::payment_channel::PaymentChannel;
@@ -78,6 +78,15 @@ pub(crate) fn parse_hash(s: &str) -> anyhow::Result<[u8; 32]> {
         )
     })?;
     Ok(*h.as_bytes())
+}
+
+/// Parse a user-supplied `--channel-id`: 64 hex chars, optionally `0x`-prefixed
+/// (the on-chain `channelId` is `keccak256(client, provider, channelNonce)`, a
+/// `bytes32`).
+pub(crate) fn parse_channel_id(s: &str) -> anyhow::Result<B256> {
+    B256::from_str(s).map_err(|e| {
+        anyhow::anyhow!("invalid --channel-id {s:?}: expected a 32-byte hex hash: {e}")
+    })
 }
 
 /// Current unix time in seconds (for channel-expiry checks).
@@ -476,6 +485,250 @@ pub(crate) async fn resolve_target_node(
     Ok((picked.node_id, picked.eth_address))
 }
 
+/// Resolve the iroh node id that serves `provider`, for the `--channel-id`
+/// adopt path (#1481): an explicit `--node-id` is used directly (the same flag
+/// the auto-open path accepts), otherwise the `CapacityBond` registry is
+/// searched for the entry whose `eth_address` matches `provider` — there is no
+/// discovered-node ranking to derive it from, since adopt-by-id skips the
+/// probe/select step entirely.
+async fn resolve_node_for_provider(
+    args: &cli::ClientFetchArgs,
+    chain: &ResolvedChain,
+    provider: Address,
+) -> anyhow::Result<PublicKey> {
+    if let Some(raw) = &args.node_id {
+        return PublicKey::from_str(raw)
+            .map_err(|e| anyhow::anyhow!("invalid --node-id {raw:?}: {e}"));
+    }
+    let capacity_bond = chain.capacity_bond.ok_or_else(|| {
+        anyhow::anyhow!(
+            "--channel-id without --node-id needs capacity_bond_address (--capacity-bond-address \
+             or blockchain.capacity_bond_address) to look up the provider's node id, or pass \
+             --node-id to dial it directly"
+        )
+    })?;
+    let bootstrap = discovery::bootstrap_nodes(
+        &chain.rpc_url,
+        capacity_bond,
+        &chain.data_dir,
+        args.discovery_cap(),
+    )
+    .await?;
+    if let Some(warning) = bootstrap.warning() {
+        eprintln!("{warning}");
+    }
+    bootstrap
+        .into_peers()
+        .into_iter()
+        .find(|c| c.eth_address == provider)
+        .map(|c| c.node_id)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "provider {provider} not found in the CapacityBond registry; pass --node-id to \
+                 dial it directly"
+            )
+        })
+}
+
+/// Authoritative on-chain view of a channel (a `getChannel` read), distilled
+/// into just the fields [`adopt_decision`] needs. Keeping it scalar (rather
+/// than the alloy `Channel` binding) lets the decision be unit-tested without
+/// constructing contract types — mirrors `decdn-node`'s `OnChainOpen`
+/// (`crates/node/src/buyer_channel.rs`), plus `status` (the CLI adopt path
+/// must itself distinguish `Closing`/`Closed`, unlike the node reconcile,
+/// which only cares whether the channel is still `Open`).
+// No `Debug` derive: the generated `PaymentChannel::Status` doesn't implement
+// it (see `status_label` for the printable form used in error messages).
+#[derive(Clone)]
+pub(crate) struct OnChainChannelView {
+    pub(crate) channel_id: B256,
+    /// On-chain `channel.client` — the funder / refund destination. Distinct
+    /// from `voucher_signer`.
+    pub(crate) client: Address,
+    pub(crate) provider: Address,
+    /// On-chain `channel.voucherSigner` — the pinned EIP-712 signer (#1481).
+    pub(crate) voucher_signer: Address,
+    pub(crate) token: Address,
+    pub(crate) deposit: U256,
+    pub(crate) expires_at: u64,
+    pub(crate) claimed_nonce: U256,
+    pub(crate) claimed_bytes: U256,
+    pub(crate) claimed_amount: U256,
+    pub(crate) status: PaymentChannel::Status,
+}
+
+/// Outcome of the pure adopt-by-id decision (#1481). Naming the reject reasons
+/// (rather than collapsing to a bare `Option`) lets [`hydrate_channel_by_id`]
+/// give the user an actionable, specific error for each one.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum AdoptOutcome {
+    /// Adoptable: `voucherSigner` is a key we hold, the channel is `Open`, and
+    /// unexpired. Carries the buyer-store row to persist, watermark already
+    /// seeded from the on-chain claimed totals. Boxed to keep the enum small
+    /// (the other variants are unit), mirroring the node reconcile's
+    /// `ReconcileOutcome::Rehydrate`.
+    Adopt(Box<BuyerChannelState>),
+    /// This process cannot sign vouchers `ch.voucherSigner` would accept.
+    NotSignable,
+    /// `ch.status` is `Closing` or `Closed`.
+    NotOpen,
+    /// `now >= ch.expiresAt`.
+    Expired,
+}
+
+/// Printable form of `PaymentChannel::Status` — the alloy-generated enum
+/// doesn't implement `Debug` (see the `OnChainChannelView` note), so error
+/// messages that name the status go through this instead of `{:?}`.
+const fn status_label(s: PaymentChannel::Status) -> &'static str {
+    match s {
+        PaymentChannel::Status::Open => "Open",
+        PaymentChannel::Status::Closing => "Closing",
+        PaymentChannel::Status::Closed => "Closed",
+        // `Status` is a Solidity `enum`, decoded from a `uint8`; alloy's binding
+        // is not proven exhaustive against a future on-chain discriminant.
+        _ => "unknown",
+    }
+}
+
+/// Decide whether to adopt an on-chain channel by id (#1481, `decdn fetch
+/// --channel-id`). Pure (no I/O) so the policy is unit-testable; the network
+/// `getChannel` read lives in [`hydrate_channel_by_id`].
+///
+/// Checked in order: can this process sign for `voucherSigner` (else the
+/// channel is useless to us no matter its status), is it still `Open`, is it
+/// unexpired. On success, the returned [`BuyerChannelState`] has its
+/// watermark seeded from the on-chain claimed totals via
+/// [`BuyerChannelState::advance`] — mirroring the node reconcile's
+/// `reconcile_decision` — so a channel that already saw deliveries resumes at
+/// the right nonce instead of re-signing from zero (which the provider would
+/// reject). `advance` cannot regress here (`new()` zeroes `last_*` and
+/// on-chain claimed totals are `>= 0`); on the impossible error the
+/// un-advanced (zero-watermark) state is kept rather than panicking.
+pub(crate) fn adopt_decision(ch: &OnChainChannelView, my_key: Address, now: u64) -> AdoptOutcome {
+    if ch.voucher_signer != my_key {
+        return AdoptOutcome::NotSignable;
+    }
+    if !matches!(ch.status, PaymentChannel::Status::Open) {
+        return AdoptOutcome::NotOpen;
+    }
+    if ch.expires_at != 0 && now >= ch.expires_at {
+        return AdoptOutcome::Expired;
+    }
+    let mut state = BuyerChannelState::new(
+        ch.channel_id,
+        ch.provider,
+        ch.client,
+        ch.voucher_signer,
+        ch.token,
+        ch.deposit,
+        ch.expires_at,
+    );
+    if let Err(err) = state.advance(ch.claimed_nonce, ch.claimed_bytes, ch.claimed_amount) {
+        eprintln!(
+            "warning: channel {} on-chain claimed totals could not seed the watermark ({err}); \
+             adopting with a zero watermark",
+            ch.channel_id
+        );
+    }
+    AdoptOutcome::Adopt(Box::new(state))
+}
+
+/// Adopt a delegated channel by id (publisher-pays, #1481): first use hydrates
+/// a buyer-store row from chain; later uses reuse it. `store.get_by_channel_id`
+/// is tried first — if a row is already tracked, its provider is trusted (no
+/// re-verification against chain on every fetch) and reused as-is. Otherwise
+/// `getChannel` is read, [`adopt_decision`] is applied, and on `Adopt` the row
+/// is persisted before returning.
+///
+/// `expected_provider` is `Some` when the caller also passed
+/// `--provider-address`; a mismatch against the channel's actual provider is a
+/// hard error rather than silently overriding the flag.
+///
+/// Returns the built [`ChannelContext`] plus the resolved provider address (so
+/// the caller can dial it) or a clear, actionable error — never lets an
+/// unadoptable channel fall through to a confusing on-chain revert.
+async fn hydrate_channel_by_id<P>(
+    store: &RedbBuyerChannelStore,
+    contract: &PaymentChannel::PaymentChannelInstance<P>,
+    channel_id: B256,
+    my_key: Address,
+    voucher_domain: &Eip712Domain,
+    signer: &Arc<PrivateKeySigner>,
+    expected_provider: Option<Address>,
+) -> anyhow::Result<(ChannelContext, Address)>
+where
+    P: alloy::providers::Provider + Clone,
+{
+    if let Some(state) = store.get_by_channel_id(channel_id)? {
+        if let Some(expected) = expected_provider {
+            anyhow::ensure!(
+                expected == state.provider,
+                "channel {channel_id} is tracked for provider {}, not --provider-address {expected}",
+                state.provider
+            );
+        }
+        let provider = state.provider;
+        return Ok((
+            ChannelContext::for_buyer_channel(&state, Arc::clone(signer), voucher_domain.clone()),
+            provider,
+        ));
+    }
+
+    let ch = contract
+        .getChannel(channel_id)
+        .call()
+        .await
+        .map_err(|e| anyhow::anyhow!("read PaymentChannel.getChannel({channel_id}): {e}"))?;
+    if let Some(expected) = expected_provider {
+        anyhow::ensure!(
+            expected == ch.provider,
+            "channel {channel_id} provider is {}, not --provider-address {expected}",
+            ch.provider
+        );
+    }
+    let view = OnChainChannelView {
+        channel_id,
+        client: ch.client,
+        provider: ch.provider,
+        voucher_signer: ch.voucherSigner,
+        token: ch.token,
+        deposit: ch.deposit,
+        expires_at: ch.expiresAt,
+        claimed_nonce: ch.claimedNonce,
+        claimed_bytes: ch.claimedBytes,
+        claimed_amount: ch.claimedAmount,
+        status: ch.status,
+    };
+    match adopt_decision(&view, my_key, unix_now()) {
+        AdoptOutcome::Adopt(state) => {
+            store
+                .record(&state)
+                .map_err(|e| anyhow::anyhow!("persist adopted channel {channel_id}: {e}"))?;
+            let provider = state.provider;
+            Ok((
+                ChannelContext::for_buyer_channel(
+                    &state,
+                    Arc::clone(signer),
+                    voucher_domain.clone(),
+                ),
+                provider,
+            ))
+        }
+        AdoptOutcome::NotSignable => anyhow::bail!(
+            "channel {channel_id} voucherSigner ({}) is not in your keystore ({my_key})",
+            view.voucher_signer
+        ),
+        AdoptOutcome::NotOpen => anyhow::bail!(
+            "channel {channel_id} is not Open (status: {}) — nothing to adopt",
+            status_label(view.status)
+        ),
+        AdoptOutcome::Expired => anyhow::bail!(
+            "channel {channel_id} expired at {} — nothing to adopt",
+            view.expires_at
+        ),
+    }
+}
+
 /// Fetch one blob over `cdn/client/v1` against an already-resolved channel
 /// `ctx` + dial `target`, persisting the voucher watermark afterwards. Returns
 /// the verified blob bytes. The caller is responsible for serializing concurrent
@@ -603,49 +856,116 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
     // One discovery-enabled endpoint, reused for probing and the delivery dial.
     let endpoint = client_endpoint::client_endpoint(&relays, &disc).await?;
 
-    // Resolve the node to fetch from: explicit `--node-id`, or auto-discover.
-    let (node_id, provider) =
-        resolve_target_node(common, &chain, &endpoint, &store, &relays, hash).await?;
+    // `--channel-id` (#1481, publisher-pays): adopt an existing channel by id
+    // instead of deriving/auto-opening one from `--provider-address`. Bypasses
+    // `resolve_target_node`/`open_or_reuse` entirely — the target node is
+    // derived from the adopted channel's on-chain `provider`, and there is no
+    // discovery/probe/select step to run before prompting for the keystore
+    // password.
+    let (node_id, provider, ctx, signer, self_address, rpc, contract, voucher_dom, slash_dom) =
+        if let Some(raw_channel_id) = &common.channel_id {
+            let channel_id = parse_channel_id(raw_channel_id)?;
+            let expected_provider = common
+                .provider_address
+                .as_deref()
+                .map(|p| chain_ctx::parse_address(p, "--provider-address"))
+                .transpose()?;
 
-    // Buyer signer (vouchers + the openChannel tx). Loaded after selection so a
-    // failed discovery never prompts for a keystore password. Password from env,
-    // else TTY.
-    let password = read_password(
-        &[
-            PasswordSource::Env(eth_identity::KEYSTORE_PASSWORD_ENV),
-            PasswordSource::Prompt { confirm: false },
-        ],
-        "eth keystore password",
-    )?;
-    let signer = Arc::new(load_signer(&chain.keystore, &password)?);
-    let self_address = signer.address();
+            let password = read_password(
+                &[
+                    PasswordSource::Env(eth_identity::KEYSTORE_PASSWORD_ENV),
+                    PasswordSource::Prompt { confirm: false },
+                ],
+                "eth keystore password",
+            )?;
+            let signer = Arc::new(load_signer(&chain.keystore, &password)?);
+            let self_address = signer.address();
+            let rpc = provider::build_provider(&chain.rpc_url, &signer)?;
+            let contract = PaymentChannel::new(chain.payment_channel, rpc.clone());
+            let voucher_dom = voucher_domain(chain.chain_id, chain.payment_channel);
+            let slash_dom = slash_judge_domain(chain.chain_id, chain.slash_judge);
 
-    let rpc = provider::build_provider(&chain.rpc_url, &signer)?;
-    let contract = PaymentChannel::new(chain.payment_channel, rpc.clone());
-    let voucher_dom = voucher_domain(chain.chain_id, chain.payment_channel);
-    let slash_dom = slash_judge_domain(chain.chain_id, chain.slash_judge);
+            let (ctx, provider) = hydrate_channel_by_id(
+                &store,
+                &contract,
+                channel_id,
+                self_address,
+                &voucher_dom,
+                &signer,
+                expected_provider,
+            )
+            .await?;
+            let ctx = attach_client_binding(ctx, &chain, &endpoint, &signer)?;
+            let node_id = resolve_node_for_provider(common, &chain, provider).await?;
 
-    // Reuse a live channel for this provider (resuming its watermark), else open
-    // and persist a new one, with the ADR 005 client binding attached.
-    //
-    // Rebuilt before EVERY blob rather than hoisted: the context snapshots the
-    // channel's voucher watermark (`prior_nonce`), which `fetch_blob` advances in
-    // the store as it pays. A chunked-manifest fetch (#1183) issues many
-    // sequential pulls on one channel, and reusing a stale context would re-sign
-    // an already-spent nonce. It also gives each chunk a fresh low-deposit
-    // refill check (#1103).
-    let ctx = build_channel_ctx(
-        &store,
-        &contract,
-        &rpc,
-        &signer,
-        &voucher_dom,
-        provider,
-        self_address,
-        &chain,
-        &endpoint,
-    )
-    .await?;
+            (
+                node_id,
+                provider,
+                ctx,
+                signer,
+                self_address,
+                rpc,
+                contract,
+                voucher_dom,
+                slash_dom,
+            )
+        } else {
+            // Resolve the node to fetch from: explicit `--node-id`, or auto-discover.
+            let (node_id, provider) =
+                resolve_target_node(common, &chain, &endpoint, &store, &relays, hash).await?;
+
+            // Buyer signer (vouchers + the openChannel tx). Loaded after selection so a
+            // failed discovery never prompts for a keystore password. Password from env,
+            // else TTY.
+            let password = read_password(
+                &[
+                    PasswordSource::Env(eth_identity::KEYSTORE_PASSWORD_ENV),
+                    PasswordSource::Prompt { confirm: false },
+                ],
+                "eth keystore password",
+            )?;
+            let signer = Arc::new(load_signer(&chain.keystore, &password)?);
+            let self_address = signer.address();
+
+            let rpc = provider::build_provider(&chain.rpc_url, &signer)?;
+            let contract = PaymentChannel::new(chain.payment_channel, rpc.clone());
+            let voucher_dom = voucher_domain(chain.chain_id, chain.payment_channel);
+            let slash_dom = slash_judge_domain(chain.chain_id, chain.slash_judge);
+
+            // Reuse a live channel for this provider (resuming its watermark), else open
+            // and persist a new one, with the ADR 005 client binding attached.
+            //
+            // Rebuilt before EVERY blob rather than hoisted: the context snapshots the
+            // channel's voucher watermark (`prior_nonce`), which `fetch_blob` advances in
+            // the store as it pays. A chunked-manifest fetch (#1183) issues many
+            // sequential pulls on one channel, and reusing a stale context would re-sign
+            // an already-spent nonce. It also gives each chunk a fresh low-deposit
+            // refill check (#1103).
+            let ctx = build_channel_ctx(
+                &store,
+                &contract,
+                &rpc,
+                &signer,
+                &voucher_dom,
+                provider,
+                self_address,
+                &chain,
+                &endpoint,
+            )
+            .await?;
+
+            (
+                node_id,
+                provider,
+                ctx,
+                signer,
+                self_address,
+                rpc,
+                contract,
+                voucher_dom,
+                slash_dom,
+            )
+        };
 
     let mut target = EndpointAddr::new(node_id);
     // `--addr` requires `--node-id` (clap), so it only pins the explicit-node
@@ -896,12 +1216,61 @@ where
         chain.max_approve,
     )
     .await?;
+    attach_client_binding(ctx, chain, endpoint, signer)
+}
+
+/// Attach the ADR 005 client identity binding to an already-built
+/// [`ChannelContext`] (#1481): sign our OWN iroh `NodeId` with the buyer key so
+/// the serving node can prove we own the channel and reactively pull a
+/// cache-missed blob from its configured origin. Split out of
+/// [`build_channel_ctx`] so the `--channel-id` adopt path — which builds its
+/// context via [`hydrate_channel_by_id`] instead of [`open_or_reuse`] — can
+/// attach the same binding without going through the auto-open kernel.
+///
+/// No binding when `chain.capacity_bond` is unset — see
+/// [`build_channel_ctx`]'s docs for why that is silent.
+fn attach_client_binding(
+    ctx: ChannelContext,
+    chain: &ResolvedChain,
+    endpoint: &Endpoint,
+    signer: &Arc<PrivateKeySigner>,
+) -> anyhow::Result<ChannelContext> {
     let Some(capacity_bond) = chain.capacity_bond else {
         return Ok(ctx);
     };
     let bind_dom = bind_node_id_domain(chain.chain_id, capacity_bond);
     let own_node_id = B256::from(*endpoint.id().as_bytes());
     Ok(ctx.with_client_binding(sign_client_binding(signer, own_node_id, &bind_dom)?))
+}
+
+/// Decision for the reuse-time deposit refill, gated on the on-chain
+/// `topUp`-is-funder-only rule (`PaymentChannel.sol:379`, #1481). Pure (no I/O)
+/// so the funder gate is unit-testable without a live contract; reused by any
+/// future caller of the refill policy, not just `open_or_reuse`.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum TopUpDecision {
+    /// The channel's remaining deposit is above the low-water mark; nothing to do.
+    NotNeeded,
+    /// Refill `additional` (`µUSDC`) on-chain — the local key is the channel's funder.
+    TopUp(U256),
+    /// The deposit is low/exhausted but the local key is not the funder (a
+    /// delegated, publisher-pays channel, #1481) and so cannot `topUp`. The
+    /// caller must fail fast with an actionable message rather than attempt
+    /// (and let revert) an unauthorized `topUp`.
+    Exhausted,
+}
+
+/// Gate [`refill_amount`]'s policy on funder ownership: only the on-chain
+/// `client` (the funder) may call `topUp`; a delegate signing vouchers on a
+/// publisher-pays channel cannot, no matter how depleted the deposit is.
+pub(crate) fn top_up_decision(additional: U256, is_funder: bool) -> TopUpDecision {
+    if additional.is_zero() {
+        TopUpDecision::NotNeeded
+    } else if is_funder {
+        TopUpDecision::TopUp(additional)
+    } else {
+        TopUpDecision::Exhausted
+    }
 }
 
 /// Reuse the live channel tracked for `provider` (resuming its watermark), or
@@ -936,37 +1305,52 @@ where
             // a near-expiry channel is still replaced below, never topped up.
             let low_water = deposit / U256::from(LOW_WATER_DIVISOR);
             let additional = refill_amount(state.deposit, state.last_amount, deposit, low_water);
-            let state = if additional.is_zero() {
-                state
-            } else {
-                eprintln!(
-                    "buyer channel {} (provider {provider}) low on deposit ({} µUSDC remaining); \
-                     topping up {additional} µUSDC",
+            let state = match top_up_decision(additional, state.funder == self_address) {
+                TopUpDecision::NotNeeded => state,
+                // `topUp` is funder-only on-chain (`PaymentChannel.sol:379`); this key
+                // is a delegate (publisher-pays, #1481) holding only the
+                // voucher-signing key, so attempting it would revert. Fail fast with
+                // an actionable message instead of letting that opaque revert surface.
+                TopUpDecision::Exhausted => anyhow::bail!(
+                    "buyer channel {} (provider {provider}) is low on deposit ({} µUSDC \
+                     remaining of {} deposited) and this key ({self_address}) is not the \
+                     funder ({}); channel exhausted — ask the publisher to top up (the \
+                     delegate cannot)",
                     state.channel_id,
-                    state.deposit.saturating_sub(state.last_amount)
-                );
-                // `topUp` pulls `additional` USDC via `transferFrom`, so the
-                // channel's standing allowance must cover it first. A pre-existing
-                // channel DB reused under a wallet whose allowance was revoked (or
-                // an exact-approve open, which leaves zero residual allowance after
-                // `openChannel` consumes it) would otherwise revert. Ensure it in
-                // the caller's mode: unlimited under `--max-approve`, else exactly
-                // `additional`.
-                ensure_allowance(
-                    rpc,
-                    state.token,
-                    self_address,
-                    payment_channel_addr,
-                    if max_approve { None } else { Some(additional) },
-                )
-                .await?;
-                // The escrowed-but-untracked outcomes are logged inside `top_up`;
-                // the CLI re-reads the row below and reflects whatever landed.
-                let _ = top_up(contract, store, provider, additional).await?;
-                // Re-read so the returned context's deposit reflects the top-up
-                // (and any concurrent watermark advance the store folded in);
-                // fall back to the pre-top-up state if the row vanished.
-                store.get_by_provider(provider)?.unwrap_or(state)
+                    state.deposit.saturating_sub(state.last_amount),
+                    state.deposit,
+                    state.funder,
+                ),
+                TopUpDecision::TopUp(additional) => {
+                    eprintln!(
+                        "buyer channel {} (provider {provider}) low on deposit ({} µUSDC remaining); \
+                         topping up {additional} µUSDC",
+                        state.channel_id,
+                        state.deposit.saturating_sub(state.last_amount)
+                    );
+                    // `topUp` pulls `additional` USDC via `transferFrom`, so the
+                    // channel's standing allowance must cover it first. A pre-existing
+                    // channel DB reused under a wallet whose allowance was revoked (or
+                    // an exact-approve open, which leaves zero residual allowance after
+                    // `openChannel` consumes it) would otherwise revert. Ensure it in
+                    // the caller's mode: unlimited under `--max-approve`, else exactly
+                    // `additional`.
+                    ensure_allowance(
+                        rpc,
+                        state.token,
+                        self_address,
+                        payment_channel_addr,
+                        if max_approve { None } else { Some(additional) },
+                    )
+                    .await?;
+                    // The escrowed-but-untracked outcomes are logged inside `top_up`;
+                    // the CLI re-reads the row below and reflects whatever landed.
+                    let _ = top_up(contract, store, provider, additional).await?;
+                    // Re-read so the returned context's deposit reflects the top-up
+                    // (and any concurrent watermark advance the store folded in);
+                    // fall back to the pre-top-up state if the row vanished.
+                    store.get_by_provider(provider)?.unwrap_or(state)
+                }
             };
             return Ok(ChannelContext::for_buyer_channel(
                 &state,
@@ -1017,6 +1401,8 @@ where
         self_address,
         provider,
         deposit,
+        // ZERO => self-signing (funder signs); publisher-pays passes a delegate via `channel open`.
+        Address::ZERO,
     )
     .await?;
     // The deposit is escrowed on-chain; a failed local record leaves it
@@ -1068,6 +1454,7 @@ mod tests {
             addr: None,
             relay_url: None,
             provider_address: Some("0x0000000000000000000000000000000000000001".into()),
+            channel_id: None,
             rpc_url: None,
             payment_channel_address: None,
             slash_judge_address: None,
@@ -1323,5 +1710,106 @@ mod tests {
         );
         assert_eq!(parse_hash(&hex).unwrap(), *digest.as_bytes());
         assert!(parse_hash("deadbeef").is_err());
+    }
+
+    #[test]
+    fn parse_channel_id_round_trips_and_rejects_garbage() {
+        let id = B256::repeat_byte(0x42);
+        assert_eq!(parse_channel_id(&id.to_string()).unwrap(), id);
+        assert!(parse_channel_id("not-a-hash").is_err());
+    }
+
+    /// Fixture on-chain view for [`adopt_decision`] tests (#1481): a channel
+    /// that is signable, `Open`, and unexpired — each test below flips exactly
+    /// one predicate away from adoptable.
+    fn adoptable_view(my_key: Address) -> OnChainChannelView {
+        OnChainChannelView {
+            channel_id: B256::repeat_byte(0x11),
+            client: Address::repeat_byte(0x22),
+            provider: Address::repeat_byte(0x33),
+            voucher_signer: my_key,
+            token: Address::repeat_byte(0x44),
+            deposit: U256::from(1_000_000u64),
+            expires_at: 2_000_000_000,
+            claimed_nonce: U256::from(5u64),
+            claimed_bytes: U256::from(500u64),
+            claimed_amount: U256::from(50_000u64),
+            status: PaymentChannel::Status::Open,
+        }
+    }
+
+    /// A channel whose `voucherSigner` this process holds, is `Open`, and is
+    /// unexpired is adopted — and the built [`BuyerChannelState`] carries the
+    /// right identity fields plus a watermark seeded from the on-chain claimed
+    /// totals (not zeroed), so a reused channel resumes at the right nonce.
+    #[test]
+    fn adopt_decision_accepts_signable_open_unexpired_channel() {
+        let my_key = Address::repeat_byte(0xAA);
+        let view = adoptable_view(my_key);
+        let now = 1_000_000_000;
+
+        let AdoptOutcome::Adopt(state) = adopt_decision(&view, my_key, now) else {
+            panic!("expected Adopt for a signable/open/unexpired channel");
+        };
+        assert_eq!(state.channel_id, view.channel_id);
+        assert_eq!(state.voucher_signer, my_key);
+        assert_eq!(state.funder, view.client);
+        assert_eq!(state.provider, view.provider);
+        assert_eq!(state.last_nonce, view.claimed_nonce);
+        assert_eq!(state.last_bytes_delivered, view.claimed_bytes);
+        assert_eq!(state.last_amount, view.claimed_amount);
+    }
+
+    /// A `voucherSigner` this process does not hold can never be adopted, no
+    /// matter its status/expiry — there is no way to sign a voucher it would
+    /// accept.
+    #[test]
+    fn adopt_decision_rejects_a_signer_we_do_not_hold() {
+        let my_key = Address::repeat_byte(0xAA);
+        let view = adoptable_view(Address::repeat_byte(0xBB));
+        assert_eq!(
+            adopt_decision(&view, my_key, 1_000_000_000),
+            AdoptOutcome::NotSignable
+        );
+    }
+
+    /// A `Closed` channel is never adoptable, even if this key could sign for it.
+    #[test]
+    fn adopt_decision_rejects_closed_channel() {
+        let my_key = Address::repeat_byte(0xAA);
+        let mut view = adoptable_view(my_key);
+        view.status = PaymentChannel::Status::Closed;
+        assert_eq!(
+            adopt_decision(&view, my_key, 1_000_000_000),
+            AdoptOutcome::NotOpen
+        );
+    }
+
+    /// A channel past its `expiresAt` is never adoptable — the provider can no
+    /// longer serve against it (`withdraw`/`closeChannel` disallowed past expiry).
+    #[test]
+    fn adopt_decision_rejects_expired_channel() {
+        let my_key = Address::repeat_byte(0xAA);
+        let mut view = adoptable_view(my_key);
+        view.expires_at = 100;
+        assert_eq!(adopt_decision(&view, my_key, 200), AdoptOutcome::Expired);
+    }
+
+    /// The funder-only `topUp` gate (#1481): a local key that IS the channel's
+    /// funder gets the refill amount to top up; a delegate holding only the
+    /// voucher-signing key is `Exhausted` instead of being handed an amount it
+    /// would fail to submit on-chain (`topUp` reverts for a non-funder caller).
+    #[test]
+    fn top_up_decision_gates_on_funder() {
+        assert_eq!(top_up_decision(U256::ZERO, true), TopUpDecision::NotNeeded);
+        assert_eq!(top_up_decision(U256::ZERO, false), TopUpDecision::NotNeeded);
+        assert_eq!(
+            top_up_decision(U256::from(100u64), true),
+            TopUpDecision::TopUp(U256::from(100u64))
+        );
+        assert_eq!(
+            top_up_decision(U256::from(100u64), false),
+            TopUpDecision::Exhausted
+        );
     }
 }

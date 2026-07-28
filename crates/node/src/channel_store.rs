@@ -947,17 +947,17 @@ impl PersistentChannelStateStore {
     /// [`StoreError::Backend`] if the write or durable commit fails.
     pub fn insert_raw_buyer_record(
         &self,
-        provider: Address,
+        channel_id: ChannelId,
         bytes: &[u8],
     ) -> Result<(), StoreError> {
-        BuyerChannelTable::new(&self.db).insert_raw(provider, bytes)
+        BuyerChannelTable::new(&self.db).insert_raw(channel_id, bytes)
     }
 }
 
 /// [`BuyerChannelStore`] adapter over the shared [`PersistentChannelStateStore`].
 ///
 /// Holds an `Arc` to the same store the seller path uses, so both the seller
-/// `channel_state_v1` table and the buyer `buyer_channel_state_v1` table live
+/// `channel_state_v1` table and the buyer `buyer_channel_state_v2` table live
 /// in one redb file behind one handle. Hand this to the buyer service as
 /// `Arc<dyn BuyerChannelStore>`.
 #[derive(Debug, Clone)]
@@ -1003,6 +1003,13 @@ impl BuyerChannelStore for BuyerChannelStoreHandle {
         channel_id: ChannelId,
     ) -> Result<bool, StoreError> {
         self.table().forget_if_channel(provider, channel_id)
+    }
+
+    fn get_by_channel_id(
+        &self,
+        channel_id: ChannelId,
+    ) -> Result<Option<BuyerChannelState>, StoreError> {
+        self.table().get_by_channel_id(channel_id)
     }
 
     fn get_by_provider(&self, provider: Address) -> Result<Option<BuyerChannelState>, StoreError> {
@@ -2451,6 +2458,8 @@ mod tests {
         BuyerChannelState {
             channel_id: id.into(),
             provider: Address::from(prov),
+            funder: Address::from(prov),
+            voucher_signer: Address::from(prov),
             token: address!("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"),
             deposit: U256::from(10_000_000u64),
             last_amount: U256::from(byte) * U256::from(1_000u64),

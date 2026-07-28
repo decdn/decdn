@@ -1031,7 +1031,7 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
                 // clean success, so meter it as a failure rather than
                 // `buyer_topup_ok`, or an operator watching the failure metric
                 // would miss stranded deposits (#1146 review).
-                Ok(DepositOutcome::UnknownProvider | DepositOutcome::ChannelMismatch) => {
+                Ok(DepositOutcome::UnknownChannel | DepositOutcome::ChannelMismatch) => {
                     metrics.buyer_topup_failure();
                 }
                 Err(err) => {
@@ -1147,7 +1147,7 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
             .context("advance buyer channel progress")?
         {
             AdvanceOutcome::Advanced => Ok(()),
-            AdvanceOutcome::UnknownProvider => {
+            AdvanceOutcome::UnknownChannel => {
                 anyhow::bail!("record_progress for unknown provider {provider_addr}")
             }
             // The provider's slot was replaced by a newer open between the
@@ -2340,6 +2340,8 @@ async fn run_open<P: Provider + Clone>(
         self_address,
         provider_addr,
         deposit,
+        // ZERO => self-signing (funder signs); publisher-pays passes a delegate via `channel open`.
+        Address::ZERO,
     )
     .await;
 
@@ -2545,6 +2547,8 @@ struct OnChainOpen {
     /// a zeroed struct from an unknown id can be rejected.
     client: Address,
     provider: Address,
+    /// On-chain `channel.voucherSigner` — the pinned EIP-712 signer (#1481).
+    voucher_signer: Address,
     token: Address,
     deposit: U256,
     expires_at: u64,
@@ -2607,6 +2611,8 @@ fn reconcile_decision(
     let mut state = BuyerChannelState::new(
         view.channel_id,
         view.provider,
+        view.client,
+        view.voucher_signer,
         view.token,
         view.deposit,
         view.expires_at,
@@ -2719,6 +2725,7 @@ async fn reconcile_one_opened<P: Provider + Clone>(
             channel_id: event.channelId,
             client: ch.client,
             provider: ch.provider,
+            voucher_signer: ch.voucherSigner,
             token: ch.token,
             // `Channel.expiresAt` is `uint64` in the binding — no clamp needed.
             expires_at: ch.expiresAt,
@@ -2876,6 +2883,8 @@ mod tests {
         prov[19] = byte;
         BuyerChannelState::new(
             B256::repeat_byte(byte),
+            Address::from(prov),
+            Address::from(prov),
             Address::from(prov),
             address!("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"),
             U256::from(10_000_000u64),
@@ -3422,6 +3431,8 @@ mod tests {
             .record(&decdn_incentive::BuyerChannelState::new(
                 channel_id,
                 provider,
+                provider,
+                provider,
                 token,
                 U256::from(1_000u64),
                 0,
@@ -3534,6 +3545,7 @@ mod tests {
             channel_id: B256::repeat_byte(byte),
             client: self_addr(),
             provider: Address::from(prov),
+            voucher_signer: self_addr(),
             token: address!("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"),
             deposit: U256::from(12_000_000u64),
             expires_at: 1_900_000_000,
@@ -3549,8 +3561,15 @@ mod tests {
         // An Open channel we own with no local row re-hydrates straight from the
         // on-chain `getChannel` fields (deposit/expiry), zero watermark.
         let v = view(5, true, (0, 0, 0));
-        let expected =
-            BuyerChannelState::new(v.channel_id, v.provider, v.token, v.deposit, v.expires_at);
+        let expected = BuyerChannelState::new(
+            v.channel_id,
+            v.provider,
+            v.client,
+            v.voucher_signer,
+            v.token,
+            v.deposit,
+            v.expires_at,
+        );
         assert_eq!(
             reconcile_decision(&v, self_addr(), None),
             ReconcileOutcome::Rehydrate(Box::new(expected))
@@ -3563,8 +3582,15 @@ mod tests {
         // on-chain claimed totals, not zero (else the provider rejects re-signed
         // vouchers).
         let v = view(6, true, (4, 4_096, 41));
-        let mut expected =
-            BuyerChannelState::new(v.channel_id, v.provider, v.token, v.deposit, v.expires_at);
+        let mut expected = BuyerChannelState::new(
+            v.channel_id,
+            v.provider,
+            v.client,
+            v.voucher_signer,
+            v.token,
+            v.deposit,
+            v.expires_at,
+        );
         expected.last_nonce = U256::from(4u64);
         expected.last_bytes_delivered = U256::from(4_096u64);
         expected.last_amount = U256::from(41u64);
@@ -3743,6 +3769,12 @@ mod tests {
             }
             Err(StoreError::Backend("simulated store fault".to_string()))
         }
+        fn get_by_channel_id(
+            &self,
+            _c: ChannelId,
+        ) -> Result<Option<BuyerChannelState>, StoreError> {
+            Ok(None)
+        }
         fn load_all(&self) -> Result<BuyerLoad, StoreError> {
             Ok(BuyerLoad::default())
         }
@@ -3771,7 +3803,7 @@ mod tests {
             _c: ChannelId,
             _additional: U256,
         ) -> Result<decdn_incentive::DepositOutcome, StoreError> {
-            Ok(decdn_incentive::DepositOutcome::UnknownProvider)
+            Ok(decdn_incentive::DepositOutcome::UnknownChannel)
         }
     }
 
@@ -3797,8 +3829,15 @@ mod tests {
         fn load_all(&self) -> Result<decdn_incentive::BuyerLoad, StoreError> {
             Ok(decdn_incentive::BuyerLoad {
                 channels: Vec::new(),
-                skipped: vec![Address::repeat_byte(0x31), Address::repeat_byte(0x32)],
+                skipped: vec![B256::repeat_byte(0x31), B256::repeat_byte(0x32)],
             })
+        }
+
+        fn get_by_channel_id(
+            &self,
+            _c: ChannelId,
+        ) -> Result<Option<BuyerChannelState>, StoreError> {
+            Ok(None)
         }
 
         fn record(&self, _s: &BuyerChannelState) -> Result<(), StoreError> {
@@ -3825,7 +3864,7 @@ mod tests {
             _b: U256,
             _a: U256,
         ) -> Result<AdvanceOutcome, StoreError> {
-            Ok(AdvanceOutcome::UnknownProvider)
+            Ok(AdvanceOutcome::UnknownChannel)
         }
 
         fn add_deposit(
@@ -3834,7 +3873,7 @@ mod tests {
             _c: ChannelId,
             _additional: U256,
         ) -> Result<decdn_incentive::DepositOutcome, StoreError> {
-            Ok(decdn_incentive::DepositOutcome::UnknownProvider)
+            Ok(decdn_incentive::DepositOutcome::UnknownChannel)
         }
     }
 
@@ -3975,6 +4014,12 @@ mod tests {
             std::thread::sleep(self.delay);
             panic!("simulated panic inside the detached open task");
         }
+        fn get_by_channel_id(
+            &self,
+            _c: ChannelId,
+        ) -> Result<Option<BuyerChannelState>, StoreError> {
+            Ok(None)
+        }
         fn load_all(&self) -> Result<BuyerLoad, StoreError> {
             Ok(BuyerLoad::default())
         }
@@ -4003,7 +4048,7 @@ mod tests {
             _c: ChannelId,
             _additional: U256,
         ) -> Result<decdn_incentive::DepositOutcome, StoreError> {
-            Ok(decdn_incentive::DepositOutcome::UnknownProvider)
+            Ok(decdn_incentive::DepositOutcome::UnknownChannel)
         }
     }
 

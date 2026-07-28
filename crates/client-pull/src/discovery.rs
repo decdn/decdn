@@ -289,15 +289,19 @@ where
 /// needed for a view call). Paginated; inactive / undecodable entries are
 /// skipped.
 ///
-/// Private on purpose: this is the un-cached half, and it can sleep for the
-/// full retry schedule. [`bootstrap_nodes`] is the ADR 012 entry point, and a
-/// caller reaching past it would silently opt out of the peer-cache fallback.
+/// Uncached: this is the un-cached half, and it can sleep for the full retry
+/// schedule. For the fetch/bundle-pull bootstrap path, reach it only through
+/// [`bootstrap_nodes`] (the ADR 012 entry point) — calling this directly would
+/// silently opt out of the peer-cache fallback. It is also, deliberately, the
+/// direct read `decdn node lookup` (#1481) uses: that command is an unpaid,
+/// one-shot listing with no client data dir to cache into, so the peer-cache
+/// layer above would have nothing to read from or write to.
 ///
 /// # Errors
 ///
 /// Fails if `rpc_url` is not a valid URL (before any retry is attempted) or a
 /// `getActiveNodes` page call fails permanently or past its retries.
-async fn active_nodes(
+pub async fn active_nodes(
     rpc_url: &str,
     capacity_bond_addr: Address,
 ) -> anyhow::Result<Vec<NodeCandidate>> {

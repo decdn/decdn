@@ -49,6 +49,8 @@ fn seed(data_dir: &std::path::Path, provider_byte: u8) {
     let mut state = BuyerChannelState::new(
         B256::repeat_byte(0xab),
         Address::repeat_byte(provider_byte),
+        Address::repeat_byte(provider_byte),
+        Address::repeat_byte(provider_byte),
         Address::repeat_byte(0xcd),
         U256::from(2_000_000u64),
         0,
@@ -59,9 +61,11 @@ fn seed(data_dir: &std::path::Path, provider_byte: u8) {
     store.record(&state).unwrap();
 }
 
-fn seed_corrupt(data_dir: &std::path::Path, provider: Address) {
+fn seed_corrupt(data_dir: &std::path::Path, channel_id: B256) {
     let store = RedbBuyerChannelStore::open(data_dir).unwrap();
-    store.insert_raw_buyer_record(provider, &[0u8; 8]).unwrap();
+    store
+        .insert_raw_buyer_record(channel_id, &[0u8; 8])
+        .unwrap();
 }
 
 /// Hermetic empty config so `load_file_config` never reads the developer's real
@@ -102,8 +106,8 @@ async fn empty_store_lists_without_error() {
 #[test]
 fn undecodable_row_is_named_on_stderr() {
     let dir = data_dir();
-    let provider = Address::repeat_byte(0x44);
-    seed_corrupt(dir.path(), provider);
+    let corrupt_channel_id = B256::repeat_byte(0x44);
+    seed_corrupt(dir.path(), corrupt_channel_id);
 
     let output = common::decdn_command(dir.path())
         .args(["channel", "list", "--data-dir"])
@@ -116,7 +120,10 @@ fn undecodable_row_is_named_on_stderr() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains(&format!("{provider:#x}")), "{stderr}");
+    assert!(
+        stderr.contains(&format!("{corrupt_channel_id:#x}")),
+        "{stderr}"
+    );
     assert!(stderr.contains("escrowed"), "{stderr}");
     // The store is not truly empty — a deposit is escrowed behind the skipped
     // row — so the empty sentinel must not claim otherwise.
@@ -128,9 +135,9 @@ fn undecodable_row_is_named_on_stderr() {
 fn json_lists_skipped_providers_in_band_alongside_healthy_channels() {
     let dir = data_dir();
     let healthy = Address::repeat_byte(0x11);
-    let corrupt = Address::repeat_byte(0x44);
+    let corrupt_channel_id = B256::repeat_byte(0x44);
     seed(dir.path(), 0x11);
-    seed_corrupt(dir.path(), corrupt);
+    seed_corrupt(dir.path(), corrupt_channel_id);
 
     let output = common::decdn_command(dir.path())
         .args(["channel", "list", "--json", "--data-dir"])
@@ -142,12 +149,15 @@ fn json_lists_skipped_providers_in_band_alongside_healthy_channels() {
         "list failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    // The skipped provider must reach the structured stdout payload, not only
+    // The skipped channel_id must reach the structured stdout payload, not only
     // the stderr warning — a machine consumer parsing stdout would otherwise be
     // blind to the escrowed-but-untracked deposit.
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("\"skipped\""), "{stdout}");
-    assert!(stdout.contains(&format!("{corrupt:#x}")), "{stdout}");
+    assert!(
+        stdout.contains(&format!("{corrupt_channel_id:#x}")),
+        "{stdout}"
+    );
     assert!(stdout.contains(&format!("{healthy:#x}")), "{stdout}");
 }
 

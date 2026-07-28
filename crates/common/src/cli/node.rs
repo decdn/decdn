@@ -170,6 +170,18 @@ pub enum NodeCommand {
     /// then re-run it after the window to withdraw. Pass `--dry-run` to print
     /// the plan without submitting.
     Deregister(DeregisterArgs),
+    /// Unpaid client-side discovery of active nodes via
+    /// `CapacityBond.getActiveNodes` (#1481). Maps node-ids/regions to
+    /// operator Ethereum addresses — the input `decdn channel open
+    /// --provider-address` needs — without spending anything: it builds a
+    /// signer-less read-only provider and never loads a keystore, unlike
+    /// every other on-chain `node` subcommand above.
+    ///
+    /// With neither `--node-id` nor `--region`, lists every active node.
+    /// Pass `--probe` to additionally rank the (region-shortlisted)
+    /// candidates by measured `cdn/probe/v1` round-trip time; without it,
+    /// candidates are listed with no RTT.
+    Lookup(LookupArgs),
 }
 
 /// `decdn node health` — report identity (hex `node_id`) and process
@@ -687,6 +699,41 @@ pub struct DeregisterArgs {
     #[arg(long = "yes", short = 'y')]
     pub yes: bool,
 
+    #[command(flatten)]
+    pub chain: ChainArgs,
+}
+
+/// `decdn node lookup` — unpaid client-side discovery of active nodes via
+/// `CapacityBond.getActiveNodes` (#1481). See [`NodeCommand::Lookup`] for the
+/// full description.
+#[derive(Args, Debug)]
+pub struct LookupArgs {
+    /// Filter to the single node with this exact iroh node id (the same form
+    /// `decdn probe --node-id` accepts). Combinable with `--region`; with
+    /// neither flag every active node is listed.
+    #[arg(long = "node-id", value_name = "ID")]
+    pub node_id: Option<String>,
+
+    /// Filter to nodes whose self-attested region hint (ADR 030) matches this
+    /// ISO 3166-1 alpha-2 code exactly (case-insensitive — normalized the
+    /// same way as `decdn node register --region`).
+    #[arg(long, value_name = "CODE")]
+    pub region: Option<String>,
+
+    /// Probe each matching candidate over `cdn/probe/v1` and sort ascending
+    /// by measured round-trip time. Candidates that don't answer are kept at
+    /// the end (rather than dropped) with no RTT. Without this flag, no
+    /// network probing happens and candidates carry no RTT.
+    #[arg(long)]
+    pub probe: bool,
+
+    /// Roundtrip timeout in milliseconds for each `--probe` probe. Ignored
+    /// without `--probe`.
+    #[arg(long, value_name = "MS", default_value_t = 5_000)]
+    pub timeout_ms: u64,
+
+    // `--json` is supplied by the flattened `ChainArgs` (`CommonChainArgs.json`);
+    // declaring it here too would collide (clap requires unique arg names).
     #[command(flatten)]
     pub chain: ChainArgs,
 }

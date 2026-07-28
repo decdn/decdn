@@ -5,8 +5,8 @@ use super::{
     Arc, B256, BatchOutcome, BatchStop, BufferedVoucherReader, ChannelDeliveryState, ChannelId,
     ChannelState, ClientHandler, ClientMessage, CooperativeClose, CooperativeCloseAuth,
     CooperativeCloseRequest, DEFAULT_TOLERANCE_BPS, Hash, Mutex, RateError, RecvStream, SendStream,
-    U256, VOUCHER_READ_TIMEOUT, VoucherRejectReason, verify_rate, voucher_reject_reason,
-    wire_voucher_to_signed,
+    SignedVoucher, U256, VOUCHER_READ_TIMEOUT, VoucherRejectReason, WatermarkBundle, verify_rate,
+    voucher_reject_reason, wire_voucher_to_signed,
 };
 
 /// A voucher that passed the node-side verify half against the advancing
@@ -33,7 +33,12 @@ struct VerifiedVoucher {
 /// valid prefix is committed + acked before this is acted on.
 enum VerifyStop {
     /// Reject cleanly with this wire reason, then finish the stream (#751).
-    Reject(VoucherRejectReason),
+    /// The optional [`WatermarkBundle`] rides the wallet-less-resume path
+    /// (#1481 §5): it is `Some` only for a watermark-gated regression/exhaustion
+    /// reason whose rejected voucher recovers to the channel's pinned
+    /// `voucher_signer`, and carries the node's true watermark so an authorized
+    /// funder can re-seed and resume. Every other reason carries `None`.
+    Reject(VoucherRejectReason, Option<WatermarkBundle>),
     /// Fail the stream — there is no wire reason for this fault (a buyer
     /// underpayment), and the client is blocked awaiting `VoucherAck` so it
     /// cannot resend mid-stream (ADR 003 §Voucher withholding).
@@ -87,7 +92,7 @@ impl ClientHandler {
         // channel pre-serve, so this arm is unreachable from the sole callers
         // (which always forward `Some`); kept as a defensive backstop.
         let Some(channel) = channel else {
-            self.write_reject(send, VoucherRejectReason::WrongChannel)
+            self.write_reject(send, VoucherRejectReason::WrongChannel, None)
                 .await?;
             return Ok(BatchOutcome {
                 committed: 0,
@@ -134,7 +139,7 @@ impl ClientHandler {
             guard.state.expires_at,
         ) {
             drop(guard);
-            self.write_reject(send, VoucherRejectReason::Expired)
+            self.write_reject(send, VoucherRejectReason::Expired, None)
                 .await?;
             return Ok(BatchOutcome {
                 committed: 0,
@@ -143,7 +148,7 @@ impl ClientHandler {
         }
         if guard.state.cooperative_close_signed() {
             drop(guard);
-            self.write_reject(send, VoucherRejectReason::CooperativeCloseSigned)
+            self.write_reject(send, VoucherRejectReason::CooperativeCloseSigned, None)
                 .await?;
             return Ok(BatchOutcome {
                 committed: 0,
@@ -193,7 +198,9 @@ impl ClientHandler {
                 // rejection is overridden — durability failure is the actionable
                 // signal, and the client must resend the same vouchers.
                 CommitOutcome::StoreFailed => {
-                    self.write_reject(send, VoucherRejectReason::RetryLater)
+                    // `RetryLater` is never a watermark-gated reason, so no
+                    // bundle is ever attached here (#1481 §5).
+                    self.write_reject(send, VoucherRejectReason::RetryLater, None)
                         .await?;
                     return Ok(BatchOutcome {
                         committed: 0,
@@ -214,8 +221,12 @@ impl ClientHandler {
                 committed,
                 stop: BatchStop::Continue,
             }),
-            Some(VerifyStop::Reject(reason)) => {
-                self.write_reject(send, reason).await?;
+            Some(VerifyStop::Reject(reason, bundle)) => {
+                // The wallet-less-resume bundle (if any) was built inside
+                // `verify_voucher` while the per-channel guard was still held —
+                // it reports the committed-prefix watermark for a gated reason
+                // whose voucher recovered to the pinned signer (#1481 §5).
+                self.write_reject(send, reason, bundle).await?;
                 Ok(BatchOutcome {
                     committed,
                     stop: BatchStop::Rejected,
@@ -283,7 +294,12 @@ impl ClientHandler {
                     // A governance floor raise landed between the signed quote and
                     // this voucher (#1382): the buyer is honest, its quote is
                     // stale. Surface the typed re-quote signal in-band.
-                    return Err(VerifyStop::Reject(VoucherRejectReason::RateFloorRaised));
+                    // `RateFloorRaised` is not a watermark-gated reason (#1481 §5),
+                    // so no bundle is attached.
+                    return Err(VerifyStop::Reject(
+                        VoucherRejectReason::RateFloorRaised,
+                        None,
+                    ));
                 }
                 // The floor did NOT rise above the quote, yet the cumulative
                 // payment is still under it — a genuine underpayment the per-delta
@@ -301,7 +317,8 @@ impl ClientHandler {
 
         let Ok(signed) = wire_voucher_to_signed(wire, state.channel_id, state.token, new_bytes)
         else {
-            return Err(VerifyStop::Reject(VoucherRejectReason::BadSignature));
+            // `BadSignature` is not a watermark-gated reason (#1481 §5).
+            return Err(VerifyStop::Reject(VoucherRejectReason::BadSignature, None));
         };
 
         // Validate + advance the candidate in memory only (no store). Cumulative
@@ -319,11 +336,61 @@ impl ClientHandler {
                     gapped: applied.is_gapped(),
                 },
             }),
-            Err(e) => match voucher_reject_reason(&e) {
-                Ok(reason) => Err(VerifyStop::Reject(reason)),
-                Err(_) => Err(VerifyStop::Reject(VoucherRejectReason::RetryLater)),
-            },
+            Err(e) => {
+                // Map to the wire reject reason; a non-mappable store/validation
+                // error falls back to `RetryLater` (never watermark-gated). This
+                // preserves the pre-batch `voucher_reject_reason` classification.
+                let reason = voucher_reject_reason(&e).unwrap_or(VoucherRejectReason::RetryLater);
+                // Wallet-less resume (#1481 §5): for a gated regression/exhaustion
+                // reason whose rejected voucher recovers to the pinned signer,
+                // attach the node's true watermark so an authorized funder can
+                // re-seed and resume. `signed` is the SAME reconstructed voucher
+                // just validated above; `state` is the advancing candidate under
+                // the still-held per-channel guard, so its `last_*` is exactly the
+                // committed-prefix watermark the client should resume from.
+                let bundle = self.watermark_bundle_for_reject(reason, &signed, state);
+                Err(VerifyStop::Reject(reason, bundle))
+            }
         }
+    }
+
+    /// Build the wallet-less-resume [`WatermarkBundle`] for a rejected voucher
+    /// (#1481 §5), or `None` when the voucher is not eligible. Returns `Some`
+    /// only when ALL hold:
+    /// - `reason` is one of the four watermark-gated regression/exhaustion
+    ///   reasons (`StaleNonce` / `AmountRegression` / `BytesRegression` /
+    ///   `InsufficientDeposit`) — every other reason is never gated;
+    /// - the `rejected` voucher's signature recovers to `state.voucher_signer`,
+    ///   the channel's pinned signer — otherwise anyone who guessed the
+    ///   chain-derivable `channel_id` could pull a channel's private watermark
+    ///   with a garbage voucher;
+    /// - the channel has a prior accepted voucher (`last_signature` is `Some`)
+    ///   to echo back.
+    ///
+    /// The watermark reported is `state`'s last-accepted amount / nonce / bytes.
+    /// In the batched flow `state` is the advancing candidate, so this is the
+    /// committed-prefix watermark; the caller reads it while still holding the
+    /// per-channel guard, before the commit swaps it into the live state.
+    fn watermark_bundle_for_reject(
+        &self,
+        reason: VoucherRejectReason,
+        rejected: &SignedVoucher,
+        state: &ChannelState,
+    ) -> Option<WatermarkBundle> {
+        if !reason.is_watermark_gated() {
+            return None;
+        }
+        let recovered = rejected.recover_signer(&self.voucher_domain).ok()?;
+        if recovered != state.voucher_signer {
+            return None;
+        }
+        let last_signature = state.last_signature()?;
+        Some(WatermarkBundle {
+            amount: state.last_amount().to_be_bytes(),
+            nonce: state.last_nonce().to_be_bytes(),
+            bytes_delivered: state.last_bytes_delivered().to_be_bytes(),
+            last_signature: last_signature.to_vec(),
+        })
     }
 
     /// Durably commit the advanced `candidate` (ONE fsynced `store.record`, held

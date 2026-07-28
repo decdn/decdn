@@ -36,7 +36,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use alloy::primitives::{B256, U256};
+use alloy::primitives::{Address, B256, U256};
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::Context;
 use decdn_client_pull::buyer_channel::{ensure_allowance, open_channel, top_up};
@@ -119,6 +119,9 @@ async fn run() -> anyhow::Result<()> {
         buyer_addr,
         provider_addr,
         deposit,
+        // ZERO => self-signing (the funder signs its own vouchers); this test
+        // funds and signs with the same buyer key.
+        Address::ZERO,
     )
     .await
     .context("open buyer channel")?;

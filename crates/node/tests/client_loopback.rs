@@ -798,10 +798,16 @@ async fn group_commit_failure_rejects_whole_batch_with_retry_later() -> anyhow::
     match read_client_msg(&mut recv).await? {
         ClientMessage::StreamError(decdn_protocol::client::StreamError::VoucherRejected {
             reason,
+            bundle,
         }) => {
             anyhow::ensure!(
                 reason == VoucherRejectReason::RetryLater,
                 "expected RetryLater, got {reason:?}"
+            );
+            // `RetryLater` is never a watermark-gated reason (#1481 §5).
+            anyhow::ensure!(
+                bundle.is_none(),
+                "RetryLater must not carry a watermark bundle"
             );
         }
         ClientMessage::VoucherAck => {
