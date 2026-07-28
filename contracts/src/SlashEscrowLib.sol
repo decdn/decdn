@@ -25,9 +25,11 @@ struct SlashRecord {
     address operator; // slot 0: 20 bytes
     uint64 slashedAt; // slot 0: +8 = 28 bytes
     SlashStatus status; // slot 0: +1 = 29 bytes
+    uint8 offenseType; // slot 0: +1 = 30 bytes — free, packs into the existing slot
     address challenger; // slot 1: 20 bytes — paid the 50% leg at finality
     uint64 appealWindowClose; // slot 1: +8 = 28 bytes
     uint256 slashAmount; // slot 2: escrowed TOKEN amount (active + unbonding bond)
+    bytes32 evidenceHash; // slot 3: the `SlashJudge` evidence digest this slash resolved
 }
 
 /// @title SlashEscrowLib
@@ -87,7 +89,9 @@ library SlashEscrowLib {
         address operator,
         address challenger,
         uint256 totalSlashAmount,
-        uint64 appealFilingWindow
+        uint64 appealFilingWindow,
+        uint8 offenseType,
+        bytes32 evidenceHash
     ) public {
         uint64 nowTs = uint64(block.timestamp);
         uint64 windowClose = nowTs + appealFilingWindow;
@@ -95,9 +99,11 @@ library SlashEscrowLib {
             operator: operator,
             slashedAt: nowTs,
             status: SlashStatus.Escrowed,
+            offenseType: offenseType,
             challenger: challenger,
             appealWindowClose: windowClose,
-            slashAmount: totalSlashAmount
+            slashAmount: totalSlashAmount,
+            evidenceHash: evidenceHash
         });
         operatorSlashIds[operator].push(slashId);
         emit SlashRecorded(slashId, operator, nowTs, totalSlashAmount);

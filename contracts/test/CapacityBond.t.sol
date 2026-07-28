@@ -125,7 +125,7 @@ contract CapacityBondTest is Test {
 
         vm.warp(2_000_000);
         vm.prank(admin);
-        bond.slash(operator, challenger, 1);
+        bond.slash(operator, challenger, 1, bytes32(0));
         // `slashedAtEpoch` stores `actualEpoch + 1` so an epoch-0 slash isn't
         // confused with the unslashed sentinel; expect the +1-offset stamp.
         uint64 expected = uint64(uint256(2_000_000) / bond.EPOCH_LENGTH()) + 1;
@@ -145,7 +145,7 @@ contract CapacityBondTest is Test {
         vm.prank(operator);
         bond.bond(MIN_BOND);
         vm.prank(admin);
-        (uint256 slashId, uint256 totalSlash) = bond.slash(operator, challenger, 1);
+        (uint256 slashId, uint256 totalSlash) = bond.slash(operator, challenger, 1, bytes32(0));
         assertGt(bond.slashedAtEpoch(operator), 0);
         assertEq(bond.escrowedTotal(), totalSlash);
 
@@ -174,13 +174,13 @@ contract CapacityBondTest is Test {
 
         // Tier 1: 5% of 160k = 8k.
         vm.prank(admin);
-        bond.slash(operator, challenger, 1);
+        bond.slash(operator, challenger, 1, bytes32(0));
         assertEq(bond.lifetimeOffenseCount(operator), 1);
         assertEq(bond.activeBond(operator), 152_000e18);
 
         // Tier 2: 15% of 152k = 22.8k.
         vm.prank(admin);
-        bond.slash(operator, challenger, 1);
+        bond.slash(operator, challenger, 1, bytes32(0));
         assertEq(bond.lifetimeOffenseCount(operator), 2);
         assertEq(bond.activeBond(operator), 129_200e18);
 
@@ -192,7 +192,7 @@ contract CapacityBondTest is Test {
         vm.expectEmit(true, true, false, true);
         emit CapacityBond.Slashed(operator, challenger, 1, 3, 64_600e18);
         vm.prank(admin);
-        bond.slash(operator, challenger, 1);
+        bond.slash(operator, challenger, 1, bytes32(0));
         assertEq(bond.lifetimeOffenseCount(operator), 3);
         assertEq(bond.activeBond(operator), 64_600e18);
         // Escrow grew by the slashed total; challenger paid nothing yet.
@@ -213,9 +213,9 @@ contract CapacityBondTest is Test {
 
         // Bump lifetimeOffenseCount to 2 so the next slash lands at tier 3.
         vm.prank(admin);
-        bond.slash(operator, challenger, 1); // 5% → 95k active
+        bond.slash(operator, challenger, 1, bytes32(0)); // 5% → 95k active
         vm.prank(admin);
-        bond.slash(operator, challenger, 1); // 15% of 95k → 80.75k active
+        bond.slash(operator, challenger, 1, bytes32(0)); // 15% of 95k → 80.75k active
         assertEq(bond.activeBond(operator), 80_750e18);
 
         // Move most bond into unbonding so unbonding (60k) > active (20.75k).
@@ -227,7 +227,7 @@ contract CapacityBondTest is Test {
         // Active is zeroed; remainder (19.625k) comes out of unbonding, leaving
         // 60k - 19.625k = 40.375k. No underflow, no clip.
         vm.prank(admin);
-        bond.slash(operator, challenger, 1);
+        bond.slash(operator, challenger, 1, bytes32(0));
         assertEq(bond.lifetimeOffenseCount(operator), 3);
         assertEq(bond.activeBond(operator), 0);
         (uint256 unbondingAmt,) = bond.unbondingOf(operator);
@@ -328,9 +328,9 @@ contract CapacityBondTest is Test {
         bond.bond(MIN_BOND);
 
         vm.startPrank(admin);
-        bond.slash(operator, challenger, 1); // 5%  → 47.5k
-        bond.slash(operator, challenger, 1); // 15% → 40.375k
-        bond.slash(operator, challenger, 1); // 50% → 20.1875k < 25k → auto-eject
+        bond.slash(operator, challenger, 1, bytes32(0)); // 5%  → 47.5k
+        bond.slash(operator, challenger, 1, bytes32(0)); // 15% → 40.375k
+        bond.slash(operator, challenger, 1, bytes32(0)); // 50% → 20.1875k < 25k → auto-eject
         vm.stopPrank();
         assertTrue(bond.ejected(operator));
         assertFalse(bond.blacklistEjected(operator));
@@ -352,9 +352,9 @@ contract CapacityBondTest is Test {
         bond.bond(MIN_BOND);
 
         vm.startPrank(admin);
-        bond.slash(operator, challenger, 1);
-        bond.slash(operator, challenger, 1);
-        bond.slash(operator, challenger, 1);
+        bond.slash(operator, challenger, 1, bytes32(0));
+        bond.slash(operator, challenger, 1, bytes32(0));
+        bond.slash(operator, challenger, 1, bytes32(0));
         vm.stopPrank();
         assertTrue(bond.ejected(operator));
         assertFalse(bond.blacklistEjected(operator));
@@ -503,11 +503,11 @@ contract CapacityBondTest is Test {
 
         // Slash #0 (older), then Slash #1 (newer) one epoch later.
         vm.prank(admin);
-        (uint256 s0,) = bond.slash(operator, challenger, 1);
+        (uint256 s0,) = bond.slash(operator, challenger, 1, bytes32(0));
         uint64 stamp0 = bond.slashedAtEpoch(operator);
         vm.warp(block.timestamp + 8 days);
         vm.prank(admin);
-        (uint256 s1,) = bond.slash(operator, challenger, 1);
+        (uint256 s1,) = bond.slash(operator, challenger, 1, bytes32(0));
         assertTrue(bond.slashedAtEpoch(operator) != stamp0);
 
         vm.startPrank(admin);
@@ -538,13 +538,13 @@ contract CapacityBondTest is Test {
 
         // Three slashes across distinct epochs: #0 (old), #1 (mid), #2 (new).
         vm.prank(admin);
-        bond.slash(operator, challenger, 1);
+        bond.slash(operator, challenger, 1, bytes32(0));
         vm.warp(block.timestamp + 8 days);
         vm.prank(admin);
-        (uint256 sMid,) = bond.slash(operator, challenger, 1);
+        (uint256 sMid,) = bond.slash(operator, challenger, 1, bytes32(0));
         vm.warp(block.timestamp + 8 days);
         vm.prank(admin);
-        bond.slash(operator, challenger, 1);
+        bond.slash(operator, challenger, 1, bytes32(0));
         uint64 stampNewest = bond.slashedAtEpoch(operator);
 
         // Reverse the MIDDLE slash — the newest still stands, so the watermark
@@ -776,7 +776,7 @@ contract CapacityBondTest is Test {
         bond.declareMbps(1000);
 
         vm.prank(admin);
-        bond.slash(operator, challenger, 1);
+        bond.slash(operator, challenger, 1, bytes32(0));
         // Post-slash active bond is below bondRequired(1000); no revert occurred.
         assertLt(bond.activeBond(operator), bond.bondRequired(1000));
     }
@@ -998,7 +998,7 @@ contract CapacityBondTest is Test {
         for (uint256 i = 0; i < 20 && !bond.ejected(opAddr); i++) {
             vm.warp(block.timestamp + 8 days);
             vm.prank(admin);
-            bond.slash(opAddr, challenger, 1);
+            bond.slash(opAddr, challenger, 1, bytes32(0));
         }
         assertTrue(bond.ejected(opAddr), "the fixture must actually reach auto-ejection");
         assertEq(bond.declaredMbps(opAddr), 1000, "ejection still does not clear the tier");
@@ -1135,7 +1135,7 @@ contract CapacityBondTest is Test {
         address opAddr = _onboardAtTier(0x9A4D, 1000, bytes32(uint256(0x9A4D)));
 
         vm.prank(admin);
-        bond.slash(opAddr, challenger, 1);
+        bond.slash(opAddr, challenger, 1, bytes32(0));
         uint64 stamp = bond.slashedAtEpoch(opAddr);
         assertGt(stamp, 0, "the fixture must actually record a slash");
         uint64 firstBonded = bond.firstBondedAt(opAddr);
@@ -1332,13 +1332,104 @@ contract CapacityBondTest is Test {
         vm.prank(operator);
         bond.bond(MIN_BOND);
         vm.prank(admin);
-        (uint256 slashId,) = bond.slash(operator, challenger, 1);
+        (uint256 slashId,) = bond.slash(operator, challenger, 1, bytes32(0));
         assertEq(slashId, 0);
         (address op, uint64 ts, uint256 amount) = bond.slashRecords(0);
         assertEq(op, operator);
         assertGt(ts, 0);
         assertGt(amount, 0);
         assertEq(bond.slashCounter(), 1);
+    }
+
+    // ── Per-operator slash enumeration ──────────────────────────────────────
+    //
+    // `operatorSlashCount` + `operatorSlashIdAt` are what let a consumer rebuild
+    // an operator's slash history from chain state instead of re-scanning the
+    // `Slashed` log tail from a block floor on every start.
+
+    /// An operator that was never slashed enumerates as empty rather than
+    /// reverting — the cold-start case a consumer hits on every fresh operator.
+    function test_operatorSlashCount_zeroForUnslashedOperator() public view {
+        assertEq(bond.operatorSlashCount(operator), 0);
+    }
+
+    /// Indexing past the end reverts with the bounds error rather than reading a
+    /// zero `slashId`, which would alias the legitimate `slashId == 0`.
+    function test_operatorSlashIdAt_revertsPastEnd() public {
+        vm.expectRevert(abi.encodeWithSelector(CapacityBond.SlashIndexOutOfRange.selector, operator, 0, 0));
+        bond.operatorSlashIdAt(operator, 0);
+    }
+
+    /// The list appends in slash order and each entry resolves to that operator's
+    /// own record — the property a consumer walks backwards over.
+    function test_operatorSlashEnumeration_appendsInOrder() public {
+        vm.prank(operator);
+        bond.bond(MIN_BOND);
+        vm.startPrank(admin);
+        (uint256 first,) = bond.slash(operator, challenger, 1, keccak256("ev-1"));
+        (uint256 second,) = bond.slash(operator, challenger, 2, keccak256("ev-2"));
+        vm.stopPrank();
+
+        assertEq(bond.operatorSlashCount(operator), 2);
+        assertEq(bond.operatorSlashIdAt(operator, 0), first);
+        assertEq(bond.operatorSlashIdAt(operator, 1), second);
+        assertEq(bond.getSlashRecord(first).operator, operator);
+        assertEq(bond.getSlashRecord(second).operator, operator);
+    }
+
+    /// The list is per-operator: slashing one operator must not appear in
+    /// another's enumeration. Guards against a consumer over-reporting slashes
+    /// against a node that was never slashed.
+    function test_operatorSlashEnumeration_isPerOperator() public {
+        address other = address(0xBEEF);
+        vm.prank(admin);
+        token.transfer(other, MIN_BOND);
+        vm.startPrank(other);
+        token.approve(address(bond), MIN_BOND);
+        bond.bond(MIN_BOND);
+        vm.stopPrank();
+        vm.prank(operator);
+        bond.bond(MIN_BOND);
+
+        vm.prank(admin);
+        (uint256 slashId,) = bond.slash(operator, challenger, 1, keccak256("ev"));
+
+        assertEq(bond.operatorSlashCount(operator), 1);
+        assertEq(bond.operatorSlashIdAt(operator, 0), slashId);
+        assertEq(bond.operatorSlashCount(other), 0);
+    }
+
+    /// `offenseType` and `evidenceHash` are persisted on the record. Without them
+    /// the record cannot replace the `Slashed` log: `CapacityBond.Slashed` carries
+    /// the offense but no `slashId`, and `SlashRecorded` carries the `slashId` but
+    /// no offense, so attributing one to the other off-chain otherwise means
+    /// joining two events by transaction ordering.
+    function test_slashRecord_persistsOffenseTypeAndEvidenceHash() public {
+        bytes32 evidence = keccak256("evidence-digest");
+        vm.prank(operator);
+        bond.bond(MIN_BOND);
+        vm.prank(admin);
+        (uint256 slashId,) = bond.slash(operator, challenger, 2, evidence);
+
+        SlashRecord memory r = bond.getSlashRecord(slashId);
+        assertEq(r.offenseType, 2);
+        assertEq(r.evidenceHash, evidence);
+    }
+
+    /// The appeal deadline on the record is the authoritative one, so a consumer
+    /// reading it needs no block-timestamp arithmetic of its own.
+    function test_slashRecord_appealWindowCloseIsSlashTimePlusWindow() public {
+        vm.warp(1_000_000);
+        vm.prank(operator);
+        bond.bond(MIN_BOND);
+        vm.prank(admin);
+        (uint256 slashId,) = bond.slash(operator, challenger, 1, bytes32(0));
+
+        SlashRecord memory r = bond.getSlashRecord(slashId);
+        assertEq(r.slashedAt, uint64(block.timestamp));
+        // `APPEAL_FILING_WINDOW` is `internal`; the literal matches how the rest
+        // of this suite warps past the window rather than widening visibility.
+        assertEq(r.appealWindowClose, uint64(block.timestamp) + uint64(30 days));
     }
 
     // ── Escrow-on-slash lifecycle (ADR 028) ─────────────────────────────────
@@ -1353,7 +1444,7 @@ contract CapacityBondTest is Test {
         uint256 challengerBefore = token.balanceOf(challenger);
 
         vm.prank(admin);
-        (uint256 slashId, uint256 totalSlash) = bond.slash(operator, challenger, 1);
+        (uint256 slashId, uint256 totalSlash) = bond.slash(operator, challenger, 1, bytes32(0));
 
         assertEq(totalSlash, 2500e18); // 5% of 50k
         assertEq(bond.escrowedTotal(), totalSlash);
@@ -1384,7 +1475,7 @@ contract CapacityBondTest is Test {
         uint256 escrowBefore = bond.escrowedTotal();
 
         vm.prank(admin);
-        (uint256 slashId, uint256 totalSlash) = bond.slash(noBond, challenger, 1);
+        (uint256 slashId, uint256 totalSlash) = bond.slash(noBond, challenger, 1, bytes32(0));
 
         // Zero economic value, but the offense / watermark / eject side effects
         // still fire and the escrow record is well-formed.
@@ -1414,7 +1505,7 @@ contract CapacityBondTest is Test {
         address noBond = address(0xDEAD12);
 
         vm.prank(admin);
-        (uint256 slashId, uint256 totalSlash) = bond.slash(noBond, challenger, 1);
+        (uint256 slashId, uint256 totalSlash) = bond.slash(noBond, challenger, 1, bytes32(0));
         assertEq(totalSlash, 0);
         assertEq(bond.slashedAtEpoch(noBond), 3); // epoch 2, +1-encoded
 
@@ -1440,7 +1531,7 @@ contract CapacityBondTest is Test {
         vm.prank(operator);
         bond.bond(MIN_BOND);
         vm.prank(admin);
-        (uint256 slashId, uint256 totalSlash) = bond.slash(operator, challenger, 1);
+        (uint256 slashId, uint256 totalSlash) = bond.slash(operator, challenger, 1, bytes32(0));
 
         // Too early: filing window still open.
         vm.expectRevert(abi.encodeWithSelector(CapacityBond.FilingWindowStillOpen.selector, _windowClose(slashId)));
@@ -1466,7 +1557,7 @@ contract CapacityBondTest is Test {
         vm.prank(operator);
         bond.bond(MIN_BOND);
         vm.prank(admin);
-        (uint256 slashId,) = bond.slash(operator, challenger, 1);
+        (uint256 slashId,) = bond.slash(operator, challenger, 1, bytes32(0));
 
         vm.prank(admin);
         bond.markAppealOpen(slashId);
@@ -1481,7 +1572,7 @@ contract CapacityBondTest is Test {
         vm.prank(operator);
         bond.bond(MIN_BOND);
         vm.prank(admin);
-        (uint256 slashId, uint256 totalSlash) = bond.slash(operator, challenger, 1);
+        (uint256 slashId, uint256 totalSlash) = bond.slash(operator, challenger, 1, bytes32(0));
 
         uint256 supplyBefore = token.totalSupply();
         uint256 challengerBefore = token.balanceOf(challenger);

@@ -228,11 +228,11 @@ contract E2EProtocolTest is Test, BaseProtocolDeploy {
     function _slashToEjection() internal returns (uint256 lastSlashId) {
         vm.startPrank(address(d.slashJudge));
         uint256 e0 = d.bond.escrowedTotal();
-        d.bond.slash(operator, challenger, 0);
+        d.bond.slash(operator, challenger, 0, bytes32(0));
         uint256 e1 = d.bond.escrowedTotal();
-        d.bond.slash(operator, challenger, 0);
+        d.bond.slash(operator, challenger, 0, bytes32(0));
         uint256 e2 = d.bond.escrowedTotal();
-        (lastSlashId,) = d.bond.slash(operator, challenger, 0);
+        (lastSlashId,) = d.bond.slash(operator, challenger, 0, bytes32(0));
         uint256 e3 = d.bond.escrowedTotal();
         vm.stopPrank();
 
