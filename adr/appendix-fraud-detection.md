@@ -4,7 +4,7 @@
 
 ## Context
 
-The protocol has one on-chain surface where a party can publish a falsified value and benefit if no third party objects within a bounded window — **`closeChannel` / `disputeChannel`** ([ADR 003](003-payments.md#adr-003-payment-model)): a client may close a channel with a stale (low-nonce) voucher; the 48-hour dispute window settles at the stale value unless a higher-nonce voucher (signed by the same channel funder) is submitted in time. Submitting is permissionless from the protocol's side — see Contract integration below.
+The protocol has one on-chain surface where a party can publish a falsified value and benefit if no third party objects within a bounded window — **`closeChannel` / `disputeChannel`** ([ADR 003](003-payments.md#adr-003-payment-model)): a client may close a channel with a stale (low-nonce) voucher — or with none at all, which closes at the channel's recorded watermark; the 48-hour dispute window settles at that value unless a higher-nonce voucher (signed by the channel's pinned `voucherSigner`) is submitted in time. Submitting is permissionless from the protocol's side — see Contract integration below.
 
 The wash-trading defense is structural and lives elsewhere: per-byte settlement (60% operator base) is paid by real clients, and governance vote weight is sourced from `FeeRouter.bytesInWindow` per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight) (proven delivered bytes), so neither faked traffic nor over-declared capacity yields revenue or governance influence. There is no operator-asserted summary, no fraud-challenge mechanism, and no monitoring role for capacity-share. Permissionless off-chain analysis of on-chain settlement flows (operator-cluster / self-routing detection) is the soft layer informing governance threshold-tuning if persistent patterns surface.
 
@@ -19,6 +19,8 @@ can act as a stale-close detector. No registration, registry, fees, or wire inte
 
 When `ChannelCloseInitiated(channelId, ..., nonce)` fires, the detector checks whether it holds a voucher with a higher nonce for that channel. If so, it submits `disputeChannel`.
 
+The trigger is that single question — "do I hold a strictly-higher-nonce voucher?" — and nothing about the close itself. A close carrying the channel's current watermark is legitimate and common: either party may close without presenting a voucher at all (via `closeChannelWithoutVoucher`, or `closeChannel` with all-zero arguments), which advances no watermark and emits `ChannelCloseInitiated` at the recorded values. A detector that treated such an event as suspicious would alarm on routine channel teardown; a detector that asks only whether it can ratchet the watermark up is correct on both.
+
 - A successful dispute updates on-chain `claimedAmount` / `claimedNonce` / `claimedBytes`.
 - The detector spends gas (~$0.05–$0.10 on the production L2 — see [Appendix: L2 Deployment](appendix-l2-deployment.md#appendix-production-l2-deployment-target)) and recovers nothing from the protocol — they must have an out-of-band reason to hold a higher voucher (i.e., they are the node operator, the operator's hot-spare infrastructure, or a counterparty).
 
@@ -28,7 +30,7 @@ This is fundamentally a self-protection mechanism, not a paid service: the offli
 
 Two contract-level requirements, already specified in their owning ADRs:
 
-1. **`disputeChannel` accepts submissions from any address** — the voucher's EIP-712 signature is the sole authorization (`ecrecover(signature) == channel.client`), no `msg.sender` access check ([ADR 003 § closeChannel/disputeChannel](003-payments.md#adr-003-payment-model)).
+1. **`disputeChannel` accepts submissions from any address** — the voucher's EIP-712 signature is the sole authorization (it must recover to `channel.voucherSigner`), no `msg.sender` access check ([ADR 003 § closeChannel/disputeChannel](003-payments.md#adr-003-payment-model)).
 2. **`ChannelCloseInitiated`, `ChannelDisputed`, `ChannelSettled` events are emitted** ([ADR 003](003-payments.md#adr-003-payment-model)).
 
 No `WatchtowerEscrow` contract, heartbeat protocol, per-channel registration, or `cdn/watchtower/v1` ALPN.

@@ -103,6 +103,7 @@ async fn handler_over_http_origin(
     store.record(&ChannelState::new(
         channel_id,
         client,
+        client,
         TOKEN,
         U256::from(10_000_000u64),
     ))?;

@@ -22,6 +22,15 @@
 //! v1 records hydrate with an empty signature and `0` expiry and are simply
 //! unredeemable until the next voucher re-records them.
 //!
+//! Schema v3 adds the channel's pinned `voucher_signer` as a further trailing
+//! segment (after the cooperative-close flag). Its presence is keyed off the
+//! schema version rather than sniffed from the trailer width — see
+//! `StoredChannelState`. A v1/v2 record hydrates `voucher_signer` from the
+//! stored `client`, which is exactly right: those channels predate the split of
+//! funder from signer and are self-signing. **No rollback:** an older binary
+//! reading a v3 record raises [`StoreError::UnsupportedSchema`], which aborts
+//! seller-table hydration and therefore node startup.
+//!
 //! The seller tables above are defined here. The **buyer** table (#744) is not:
 //! its record codec and every one of its operations live in
 //! [`decdn_incentive::buyer_channel_table`], shared with the client's
@@ -64,7 +73,12 @@ const DB_FILE_MODE: u32 = 0o600;
 /// [`StoreError::UnsupportedSchema`]) — opening a forward-incompatible store
 /// is unsafe because we cannot honour the persistence invariant for fields
 /// we do not understand.
-const SUPPORTED_SCHEMA_VERSION: u32 = 2;
+///
+/// v3 adds the pinned voucher-signer segment. Because that segment is untagged
+/// and fixed-width, its presence cannot be inferred from the byte stream — it
+/// is inferred from this version instead, so unknown trailing bytes on an older
+/// record can never be misread as an address. See `decode_record`.
+const SUPPORTED_SCHEMA_VERSION: u32 = 3;
 
 /// Sanity ceiling on trailing bytes per seller record (the buyer table carries
 /// its own, next to the shared codec). Trailing bytes are tolerated
@@ -76,10 +90,24 @@ const SUPPORTED_SCHEMA_VERSION: u32 = 2;
 /// future additive fields (a Vec or two of 32-byte hashes) with headroom.
 const SANE_TRAILER_MAX_BYTES: usize = 256;
 
-/// redb table holding the per-channel voucher state. The table name is
-/// version-tagged so a future breaking on-disk layout change can ship as
-/// `channel_state_v2` with a one-shot migration on open; additive changes
-/// stay on `_v1` (postcard skips unknown trailing bytes).
+/// Encoded width of the voucher-signer trailing segment: postcard writes a
+/// `[u8; 20]` as 20 raw bytes with no length prefix. Its presence is decided by
+/// `schema_version >= 3`, never by the byte width — see `decode_record`.
+/// Comfortably below [`SANE_TRAILER_MAX_BYTES`], so appending it does not start
+/// the excess-trailer warning.
+const SIGNER_SEGMENT_BYTES: usize = 20;
+
+/// redb table holding the per-channel voucher state. The table name tracks
+/// key/value *shape* (raw key type, postcard envelope), not segment content:
+/// a future breaking change to that shape ships as `channel_state_v2` with a
+/// one-shot migration on open. Segment presence within the `_v1` shape is
+/// instead gated by `schema_version` (see [`SUPPORTED_SCHEMA_VERSION`]) — and
+/// a new segment can be either additive (older readers skip unknown trailing
+/// bytes, e.g. the v2 trailer / coop-close flag) or mandatory (a v3+ reader
+/// requires it and rejects its absence as corrupt, e.g. the voucher-signer
+/// segment — see `decode_record`). A mandatory segment is reader-breaking and
+/// bumps `SUPPORTED_SCHEMA_VERSION`; it does not by itself require a table
+/// rename.
 ///
 /// Key: raw `ChannelId` bytes (`[u8; 32]`).
 /// Value: postcard-encoded [`StoredChannelState`] (variable length).
@@ -193,7 +221,17 @@ const fn blacklist_key(region: [u8; 32], hash: [u8; 32]) -> [u8; 64] {
 /// v1 prefix shape stays byte-identical across v1 and v2 and the
 /// `take_from_bytes` prefix decode is unchanged. `decode_record` reads those
 /// segments when `schema_version >= 2`; a v1 record (no trailing segments)
-/// hydrates with an empty signature and `0` expiry.
+/// hydrates with an empty signature and `0` expiry. The cooperative-close flag
+/// (`bool`) and — from schema **v3** — the pinned voucher signer (`[u8; 20]`)
+/// follow as two further trailing segments, in that order.
+///
+/// The signer segment is **version-gated, never width-sniffed.** It is untagged
+/// and fixed-width, so its bytes are indistinguishable from any other >= 20-byte
+/// trailer landing at that position. `decode_record` therefore reads it only
+/// when `schema_version >= 3` — the versions where `record` guarantees it was
+/// written — and never on a v1/v2 record, whose trailing bytes stay "unknown
+/// trailer" and are ignored. A future additive segment must be appended after
+/// the signer *and* carry its own schema bump, for the same reason.
 #[derive(Debug, Serialize, Deserialize)]
 struct StoredChannelState {
     schema_version: u32,
@@ -251,11 +289,18 @@ impl StoredChannelState {
     /// to the in-memory `Option<[u8; 65]>` here: empty → `None`, exactly 65
     /// bytes → `Some`, any other length → [`StoreError::Corrupt`] (a malformed
     /// record we must not silently submit to the on-chain `closeChannel`).
+    ///
+    /// `voucher_signer` is the decoded fourth segment, `None` on a pre-v3 record
+    /// (written before delegated signers existed); it then falls back to the
+    /// stored `client`, matching the on-chain default `openChannel` applies when
+    /// `voucherSigner` is passed as zero — and correct by construction, since a
+    /// channel opened before `openChannel` grew the parameter is self-signing.
     fn into_state(
         self,
         last_signature: Vec<u8>,
         expires_at: u64,
         cooperative_close_signed: bool,
+        voucher_signer: Option<Address>,
     ) -> Result<ChannelState, StoreError> {
         if self.schema_version > SUPPORTED_SCHEMA_VERSION {
             return Err(StoreError::UnsupportedSchema {
@@ -275,9 +320,11 @@ impl StoredChannelState {
                 })?,
             )
         };
+        let client = Address::from(self.client);
         Ok(ChannelState::hydrate(
             channel_id,
-            Address::from(self.client),
+            client,
+            voucher_signer.unwrap_or(client),
             Address::from(self.token),
             U256::from_be_bytes(self.deposit),
             U256::from_be_bytes(self.last_amount),
@@ -627,6 +674,53 @@ fn decode_record(key_bytes: [u8; 32], value_bytes: &[u8]) -> Result<ChannelState
         } else {
             (false, after_trailer)
         };
+    // Pinned voucher signer (ADR 003 §Voucher authority): a trailing `[u8; 20]`
+    // segment after the coop-close flag, present on schema **v3** records. It is
+    // a fixed 20 raw bytes on the wire (postcard encodes a byte array without a
+    // length prefix), so nothing in the bytes themselves identifies it.
+    //
+    // **The gate is the schema version, deliberately.** Sniffing the segment by
+    // width (`leftover.len() >= SIGNER_SEGMENT_BYTES`) would fail *open*: any
+    // record carrying >= 20 bytes of unknown trailer at this position — a future
+    // additive segment, a partially-written record, padding — would be read as an
+    // address, moving the signature-recovery target and making the node verify
+    // vouchers against a key the chain will not accept. So:
+    //
+    // - v1/v2 record: no signer segment was ever written. Do not look at the
+    //   trailer at all; `into_state` falls back to the stored `client`, which is
+    //   correct by construction — a channel opened before `openChannel` grew a
+    //   `voucherSigner` parameter is self-signing.
+    // - v3 record: `record` always emits the segment, so it is mandatory. Its
+    //   absence (or truncation) is genuine corruption and surfaces as
+    //   `StoreError::Corrupt` rather than silently defaulting to `client`.
+    //
+    // The `<= SUPPORTED_SCHEMA_VERSION` half of this guard is defensive, not
+    // load-bearing: `into_state` unconditionally rejects any
+    // `schema_version > SUPPORTED_SCHEMA_VERSION` as `UnsupportedSchema`
+    // before this decoded value is ever used, so it is the authoritative
+    // version gate. It is still checked here, deliberately: without it, a
+    // future schema (v4+, unknown segment layout to this binary) would still
+    // attempt to parse this position as a 20-byte address, and on a short or
+    // differently-shaped trailer that surfaces as a confusing
+    // `StoreError::Corrupt` instead of the clean `UnsupportedSchema` the
+    // caller should see (see `future_schema_version_refuses_to_load`, which
+    // pins exactly this).
+    let (voucher_signer, leftover): (Option<Address>, &[u8]) =
+        if stored.schema_version >= 3 && stored.schema_version <= SUPPORTED_SCHEMA_VERSION {
+            let (bytes, rest) = postcard::take_from_bytes::<[u8; SIGNER_SEGMENT_BYTES]>(leftover)
+                .map_err(|err| StoreError::Corrupt {
+                channel_id: Some(channel_id),
+                detail: format!(
+                    "postcard decode of voucher signer failed \
+                         (schema v{} record must carry the {SIGNER_SEGMENT_BYTES}-byte segment): \
+                         {err}",
+                    stored.schema_version,
+                ),
+            })?;
+            (Some(Address::from(bytes)), rest)
+        } else {
+            (None, leftover)
+        };
     // Forward-compat allowance is bounded: a malicious writer could pad
     // megabytes onto every record and silently inflate every read. Log
     // (don't fail) when the trailer beyond the known fields exceeds a small
@@ -642,7 +736,12 @@ fn decode_record(key_bytes: [u8; 32], value_bytes: &[u8]) -> Result<ChannelState
             "channel state record has unusually large trailing bytes; possible malicious padding or large-additive-field schema skew",
         );
     }
-    stored.into_state(last_signature, expires_at, cooperative_close_signed)
+    stored.into_state(
+        last_signature,
+        expires_at,
+        cooperative_close_signed,
+        voucher_signer,
+    )
 }
 
 impl ChannelStateStore for PersistentChannelStateStore {
@@ -732,6 +831,26 @@ impl ChannelStateStore for PersistentChannelStateStore {
                 StoreError::Codec(format!("postcard encode of coop-close flag: {err}"))
             })?;
         encoded.extend_from_slice(&coop_encoded);
+        // Pinned voucher signer (ADR 003 §Voucher authority): a trailing
+        // `[u8; 20]` segment after the coop-close flag. Unlike the earlier
+        // trailing segments this one is NOT additive-optional — it is the reason
+        // `SUPPORTED_SCHEMA_VERSION` is 3, and every record this function writes
+        // is stamped v3 (via `StoredChannelState::from`) and therefore always
+        // carries it. `decode_record` reads it on exactly the versions that write
+        // it; a v1/v2 record on disk has no such segment and hydrates
+        // `voucher_signer` from `client`, the on-chain default when `openChannel`
+        // is passed a zero `voucherSigner`. 20 bytes keeps the record well under
+        // `SANE_TRAILER_MAX_BYTES`.
+        //
+        // A future additive segment must be appended AFTER this one and must bump
+        // `SUPPORTED_SCHEMA_VERSION` again: the signer segment is untagged and
+        // fixed-width, so version — not byte width — is the only safe way to know
+        // where it ends.
+        let signer_bytes: [u8; SIGNER_SEGMENT_BYTES] = state.voucher_signer.into();
+        let signer_encoded = postcard::to_allocvec(&signer_bytes).map_err(|err| {
+            StoreError::Codec(format!("postcard encode of voucher signer: {err}"))
+        })?;
+        encoded.extend_from_slice(&signer_encoded);
         let key: [u8; 32] = state.channel_id.into();
 
         let mut write_txn = self
@@ -1339,6 +1458,7 @@ mod tests {
         ChannelState::hydrate(
             id.into(),
             address!("00000000000000000000000000000000000000aa"),
+            address!("00000000000000000000000000000000000000aa"),
             address!("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"),
             U256::from(10_000_000u64),
             U256::from(byte) * U256::from(1_000u64),
@@ -1348,6 +1468,55 @@ mod tests {
             1_900_000_000 + u64::from(byte),
             false,
         )
+    }
+
+    /// Like [`sample`] but with a `voucher_signer` distinct from `client`, so a
+    /// decoder that transposed the two — or dropped the signer segment — fails
+    /// the assertion instead of round-tripping by coincidence.
+    fn delegated_sample(byte: u8) -> ChannelState {
+        let base = sample(byte);
+        ChannelState::hydrate(
+            base.channel_id,
+            base.client,
+            address!("00000000000000000000000000000000000000de"),
+            base.token,
+            base.deposit,
+            base.last_amount(),
+            base.last_nonce(),
+            base.last_bytes_delivered(),
+            base.last_signature().copied(),
+            base.expires_at,
+            base.cooperative_close_signed(),
+        )
+    }
+
+    /// Hand-encodes the segments common to every "record written before a
+    /// later segment existed" fixture below: the `StoredChannelState` prefix
+    /// **stamped schema v2**, then the two `TrailerV2` fields (signature,
+    /// expiry) encoded the same way `record` appends them. Named for its
+    /// callers' shared purpose — building the pre-signer-segment shape — even
+    /// though not every caller stops there:
+    /// `record_without_cooperative_close_segment_decodes_false` stops right
+    /// here, while `extra_trailing_bytes_are_tolerated`,
+    /// `record_without_voucher_signer_segment_hydrates_to_client`, and
+    /// `v2_record_with_long_trailing_junk_does_not_hydrate_signer` append a
+    /// coop-close `bool` (and, for two of them, junk bytes) on top. Extracting
+    /// just the truly-shared three segments keeps that layout from drifting
+    /// independently across call sites as more segments accrue.
+    ///
+    /// The explicit `schema_version = 2` is load-bearing: `From<&ChannelState>`
+    /// stamps `SUPPORTED_SCHEMA_VERSION` (now 3), and a v3-stamped record is one
+    /// `decode_record` *requires* a signer segment on. These fixtures are all
+    /// modelling records written by the pre-signer binary, so they must claim
+    /// the version that binary wrote.
+    fn encode_pre_signer(s: &ChannelState) -> anyhow::Result<Vec<u8>> {
+        let mut stored = StoredChannelState::from(s);
+        stored.schema_version = 2;
+        let mut encoded = postcard::to_allocvec(&stored)?;
+        let sig_vec = s.last_signature().map_or_else(Vec::new, |x| x.to_vec());
+        encoded.extend_from_slice(&postcard::to_allocvec(&sig_vec)?);
+        encoded.extend_from_slice(&postcard::to_allocvec(&s.expires_at)?);
+        Ok(encoded)
     }
 
     #[test]
@@ -1626,14 +1795,15 @@ mod tests {
         // Encode the real v2 record (prefix + signature + expiry segments),
         // then append plausible *further* additive-field bytes (simulating
         // what a future schema beyond v2 would write after the known segments).
-        let mut encoded = postcard::to_allocvec(&StoredChannelState::from(&s))?;
-        let sig_vec = s.last_signature().map_or_else(Vec::new, |x| x.to_vec());
-        encoded.extend_from_slice(&postcard::to_allocvec(&sig_vec)?);
-        encoded.extend_from_slice(&postcard::to_allocvec(&s.expires_at)?);
+        let mut encoded = encode_pre_signer(&s)?;
         // The cooperative-close flag is now a known trailing segment; the
         // "further additive-field bytes" a future schema would write come after
         // it, so encode a valid flag first, then the junk a newer writer appended.
         encoded.extend_from_slice(&postcard::to_allocvec(&s.cooperative_close_signed())?);
+        // The junk width is unconstrained since the signer segment became
+        // version-gated: on a v2 record `decode_record` never inspects the
+        // trailer. `v2_record_with_long_trailing_junk_does_not_hydrate_signer`
+        // pins the >= 20-byte case explicitly.
         encoded.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01, 0x02, 0x03]);
 
         let mut tx = store.db.begin_write()?;
@@ -1691,10 +1861,7 @@ mod tests {
         let store = PersistentChannelStateStore::open(dir.path())?;
         let s = sample(0x66);
         let key: [u8; 32] = s.channel_id.into();
-        let mut encoded = postcard::to_allocvec(&StoredChannelState::from(&s))?;
-        let sig_vec = s.last_signature().map_or_else(Vec::new, |x| x.to_vec());
-        encoded.extend_from_slice(&postcard::to_allocvec(&sig_vec)?);
-        encoded.extend_from_slice(&postcard::to_allocvec(&s.expires_at)?);
+        let encoded = encode_pre_signer(&s)?;
         // Deliberately stop here — no coop-flag segment.
         let mut tx = store.db.begin_write()?;
         tx.set_durability(Durability::Immediate)?;
@@ -1711,6 +1878,207 @@ mod tests {
             "a record with no coop segment must decode the flag as false",
         );
         anyhow::ensure!(loaded == s, "the rest of the record must decode unchanged");
+        Ok(())
+    }
+
+    /// A channel whose pinned `voucher_signer` is a delegate distinct from the
+    /// funder MUST round-trip both addresses independently. The two are the same
+    /// type and adjacent in [`ChannelState::hydrate`]'s argument list, so a
+    /// transposition in the decoder compiles silently — using two *different*
+    /// addresses here is what catches it.
+    #[test]
+    fn voucher_signer_persists_across_reopen() -> anyhow::Result<()> {
+        let dir = data_dir()?;
+        let s = delegated_sample(0x77);
+        anyhow::ensure!(s.client != s.voucher_signer, "fixture pins a delegate");
+        {
+            let store = PersistentChannelStateStore::open(dir.path())?;
+            store.record(&s)?;
+        }
+        // Re-open so the value comes from a fresh decode, not memory.
+        let store = PersistentChannelStateStore::open(dir.path())?;
+        let loaded = store
+            .get(s.channel_id)?
+            .ok_or_else(|| anyhow::anyhow!("record missing after reopen"))?;
+        anyhow::ensure!(
+            loaded.voucher_signer == s.voucher_signer,
+            "voucher_signer must survive persist + reopen (got {})",
+            loaded.voucher_signer,
+        );
+        anyhow::ensure!(
+            loaded.client == s.client,
+            "client must not be overwritten by the signer segment (got {})",
+            loaded.client,
+        );
+        anyhow::ensure!(loaded == s, "the full record must round-trip");
+        Ok(())
+    }
+
+    #[test]
+    fn record_without_voucher_signer_segment_hydrates_to_client() -> anyhow::Result<()> {
+        // A record written before delegated signers existed (prefix + v2 trailer
+        // + coop flag, no signer segment) must hydrate `voucher_signer` from the
+        // stored `client` — the on-chain default when `voucherSigner` is zero.
+        let dir = data_dir()?;
+        let store = PersistentChannelStateStore::open(dir.path())?;
+        let s = delegated_sample(0x88);
+        let key: [u8; 32] = s.channel_id.into();
+        let mut encoded = encode_pre_signer(&s)?;
+        encoded.extend_from_slice(&postcard::to_allocvec(&s.cooperative_close_signed())?);
+        // Deliberately stop here — no voucher-signer segment.
+        let mut tx = store.db.begin_write()?;
+        tx.set_durability(Durability::Immediate)?;
+        {
+            let mut t = tx.open_table(CHANNEL_TABLE)?;
+            t.insert(&key, encoded.as_slice())?;
+        }
+        tx.commit()?;
+        let loaded = store
+            .get(s.channel_id)?
+            .ok_or_else(|| anyhow::anyhow!("missing"))?;
+        anyhow::ensure!(
+            loaded.voucher_signer == loaded.client,
+            "a record with no signer segment must hydrate the signer as the client",
+        );
+        // Self-referential on its own: if the decoder misparsed `client`, both
+        // sides move together and the assertion above would still pass. Pin
+        // `client` against the fixture independently, plus the fuller record
+        // equality `voucher_signer_persists_across_reopen` uses.
+        anyhow::ensure!(
+            loaded.client == s.client,
+            "client must decode unchanged (got {})",
+            loaded.client,
+        );
+        anyhow::ensure!(
+            loaded.voucher_signer != s.voucher_signer,
+            "precondition: the fixture's delegate was never written to disk",
+        );
+        Ok(())
+    }
+
+    /// **Fail-open regression (the signer segment must be version-gated).** The
+    /// signer segment is untagged and fixed-width, so a decoder that detects it
+    /// by width (`leftover.len() >= 20`) will happily read *any* >= 20-byte
+    /// unknown trailer on an old record as the voucher signer — silently moving
+    /// the signature-recovery target to an address the chain never agreed to.
+    ///
+    /// This fixture is a schema-**v2** record (no signer segment was ever
+    /// written at that version) carrying 24 bytes of junk after the coop-close
+    /// flag. `voucher_signer` MUST still hydrate from `client`. Under the old
+    /// width-sniffing gate the junk's first 20 bytes decode as
+    /// `0xdede…de` instead, and this test fails.
+    #[test]
+    fn v2_record_with_long_trailing_junk_does_not_hydrate_signer() -> anyhow::Result<()> {
+        let dir = data_dir()?;
+        let store = PersistentChannelStateStore::open(dir.path())?;
+        let s = sample(0x99);
+        let key: [u8; 32] = s.channel_id.into();
+        let mut encoded = encode_pre_signer(&s)?;
+        encoded.extend_from_slice(&postcard::to_allocvec(&s.cooperative_close_signed())?);
+        // 24 bytes — comfortably over `SIGNER_SEGMENT_BYTES`. The junk address a
+        // width-sniffing decoder would produce is `0xdede…de`, distinct from both
+        // `client` and the `delegated_sample` delegate, so neither can mask it.
+        let junk = [0xDEu8; 24];
+        encoded.extend_from_slice(&junk);
+        anyhow::ensure!(
+            junk.len() >= SIGNER_SEGMENT_BYTES,
+            "precondition: junk is wide enough to be misread as an address",
+        );
+
+        let mut tx = store.db.begin_write()?;
+        tx.set_durability(Durability::Immediate)?;
+        {
+            let mut t = tx.open_table(CHANNEL_TABLE)?;
+            t.insert(&key, encoded.as_slice())?;
+        }
+        tx.commit()?;
+
+        let loaded = store
+            .get(s.channel_id)?
+            .ok_or_else(|| anyhow::anyhow!("missing"))?;
+        anyhow::ensure!(
+            loaded.voucher_signer == s.client,
+            "unknown trailing bytes on a v2 record MUST NOT be read as a signer (got {})",
+            loaded.voucher_signer,
+        );
+        anyhow::ensure!(
+            loaded.client == s.client,
+            "client must decode unchanged (got {})",
+            loaded.client,
+        );
+        anyhow::ensure!(loaded == s, "the rest of the record must decode unchanged");
+        Ok(())
+    }
+
+    /// The write path stamps the current schema version, which is what makes the
+    /// version gate in `decode_record` sound: every record `record` produces
+    /// carries the signer segment *and* claims a version that says so. Pinned
+    /// here so a change to either half is caught together.
+    #[test]
+    fn record_stamps_current_schema_version() -> anyhow::Result<()> {
+        anyhow::ensure!(
+            SUPPORTED_SCHEMA_VERSION == 3,
+            "the signer segment's gate is `schema_version >= 3`; bumping this \
+             constant requires revisiting `decode_record`",
+        );
+        let stored = StoredChannelState::from(&delegated_sample(0x11));
+        anyhow::ensure!(
+            stored.schema_version == SUPPORTED_SCHEMA_VERSION,
+            "new writes must be stamped at the supported version (got {})",
+            stored.schema_version,
+        );
+        Ok(())
+    }
+
+    /// On a v3 record the signer segment is mandatory — `record` always writes
+    /// it, so its absence is corruption, not an old record. It MUST surface as
+    /// `Corrupt` rather than silently defaulting `voucher_signer` to `client`,
+    /// which would move the recovery target without anyone noticing.
+    #[test]
+    fn v3_record_with_missing_or_short_signer_segment_is_corrupt() -> anyhow::Result<()> {
+        // `None` → segment omitted entirely; `Some(n)` → truncated to n bytes.
+        for truncate_to in [None, Some(19usize), Some(1usize)] {
+            let dir = data_dir()?;
+            let store = PersistentChannelStateStore::open(dir.path())?;
+            let s = delegated_sample(0xAB);
+            let key: [u8; 32] = s.channel_id.into();
+
+            let mut encoded = postcard::to_allocvec(&StoredChannelState::from(&s))?;
+            encoded.extend_from_slice(&postcard::to_allocvec(&TrailerV2 {
+                signature: s.last_signature().map_or_else(Vec::new, |x| x.to_vec()),
+                expires_at: s.expires_at,
+            })?);
+            encoded.extend_from_slice(&postcard::to_allocvec(&s.cooperative_close_signed())?);
+            if let Some(n) = truncate_to {
+                let signer_bytes: [u8; SIGNER_SEGMENT_BYTES] = s.voucher_signer.into();
+                let partial = signer_bytes
+                    .get(..n)
+                    .ok_or_else(|| anyhow::anyhow!("truncation width out of range"))?;
+                encoded.extend_from_slice(partial);
+            }
+
+            let mut tx = store.db.begin_write()?;
+            tx.set_durability(Durability::Immediate)?;
+            {
+                let mut t = tx.open_table(CHANNEL_TABLE)?;
+                t.insert(&key, encoded.as_slice())?;
+            }
+            tx.commit()?;
+
+            let err = store.load_all().err().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "v3 record missing its signer segment must reject (truncate_to={truncate_to:?})"
+                )
+            })?;
+            anyhow::ensure!(
+                matches!(
+                    &err,
+                    StoreError::Corrupt { channel_id: Some(id), detail }
+                        if *id == s.channel_id && detail.contains("voucher signer"),
+                ),
+                "expected Corrupt(...voucher signer...), got {err:?} (truncate_to={truncate_to:?})",
+            );
+        }
         Ok(())
     }
 
@@ -1754,6 +2122,7 @@ mod tests {
         let s = ChannelState::hydrate(
             base.channel_id,
             base.client,
+            base.voucher_signer,
             base.token,
             base.deposit,
             base.last_amount(),
@@ -1802,12 +2171,19 @@ mod tests {
         let s = sample(0x77);
         let key: [u8; 32] = s.channel_id.into();
 
-        // Hand-write a v2 record whose trailer signature is 64 bytes (one short).
+        // Hand-write an otherwise well-formed current-schema record whose trailer
+        // signature is 64 bytes (one short). The later segments are written
+        // correctly so the failure isolates to the signature-length narrowing —
+        // on a v3 record the signer segment is mandatory, and omitting it would
+        // trip that check first.
         let mut encoded = postcard::to_allocvec(&StoredChannelState::from(&s))?;
         encoded.extend_from_slice(&postcard::to_allocvec(&TrailerV2 {
             signature: vec![0xCD; 64],
             expires_at: 1_900_000_000,
         })?);
+        encoded.extend_from_slice(&postcard::to_allocvec(&s.cooperative_close_signed())?);
+        let signer_bytes: [u8; SIGNER_SEGMENT_BYTES] = s.voucher_signer.into();
+        encoded.extend_from_slice(&postcard::to_allocvec(&signer_bytes)?);
         let mut tx = store.db.begin_write()?;
         tx.set_durability(Durability::Immediate)?;
         {

@@ -159,10 +159,19 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, SunsettingPausable, E
         // bytes) — and `client`'s slot also carries the 1-byte `Status` enum — so
         // the three addresses, three timestamps, and status pack into 3 slots
         // instead of 4. `uint64` holds timestamps for ~584 billion years, matching
-        // the `SlashRecord`/`Appeal` convention.
+        // the `SlashRecord`/`Appeal` convention. `voucherSigner` takes a fourth,
+        // own slot: `client`(20) + `openedAt`(8) + `status`(1) leaves only 3 free
+        // bytes, so a 20-byte address cannot join it, and every other slot is
+        // likewise already at 28 bytes.
         address client;
         uint64 openedAt;
         Status status;
+        /// @notice The address whose EIP-712 signature authorizes vouchers on this channel.
+        /// @dev Pinned at `openChannel` and never mutable — there is deliberately no
+        /// `setVoucherSigner`. Immutability is the security property: a mutable signer
+        /// would let a funder retroactively void a voucher a provider had already earned.
+        /// Distinct from `client`, which remains the funder and the refund destination.
+        address voucherSigner;
         address provider;
         uint64 expiresAt;
         address token;
@@ -195,8 +204,16 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, SunsettingPausable, E
     // Events (ADR 003 § Events)
     // -----------------------------------------------------------------
 
+    /// @dev `voucherSigner` is intentionally NOT indexed: `ChannelOpened` already
+    ///      carries the EVM maximum of three indexed fields. Signer-side enumeration is
+    ///      therefore not `eth_getLogs`-filterable; consumers decode the data field.
     event ChannelOpened(
-        bytes32 indexed channelId, address indexed client, address indexed provider, uint256 deposit, uint256 expiresAt
+        bytes32 indexed channelId,
+        address indexed client,
+        address indexed provider,
+        uint256 deposit,
+        uint256 expiresAt,
+        address voucherSigner
     );
     event ChannelToppedUp(bytes32 indexed channelId, uint256 additionalDeposit, uint256 newDeposit);
     event ChannelWithdrawn(
@@ -334,8 +351,15 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, SunsettingPausable, E
     ///         in and derives `channelId = keccak256(client, provider, channelNonce)`.
     /// @dev The `isActive` read precedes the channel-state writes; safe under
     ///      `nonReentrant` against the immutable, trusted `CapacityBond`.
+    /// @param voucherSigner Address authorized to sign vouchers for this channel.
+    ///        Pass `address(0)` for the default self-signing behaviour (`msg.sender`).
+    ///        Pinned permanently at open; there is no setter. Must not be the
+    ///        counterparty: passing `provider` here hands the provider unilateral
+    ///        authority to sign vouchers draining the full deposit. Callers are
+    ///        responsible for this — it is not enforced on-chain, since any address may
+    ///        legitimately be delegated.
     // slither-disable-next-line reentrancy-no-eth
-    function openChannel(address provider, uint256 deposit)
+    function openChannel(address provider, uint256 deposit, address voucherSigner)
         external
         nonReentrant
         whenNotPaused
@@ -352,6 +376,7 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, SunsettingPausable, E
 
         Channel storage ch = channels[channelId];
         ch.client = msg.sender;
+        ch.voucherSigner = voucherSigner == address(0) ? msg.sender : voucherSigner;
         ch.provider = provider;
         ch.token = address(usdc);
         ch.openedAt = uint64(block.timestamp);
@@ -370,7 +395,7 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, SunsettingPausable, E
         if (received < minDeposit) revert DepositBelowMinimum(received, minDeposit);
         ch.deposit = received;
 
-        emit ChannelOpened(channelId, msg.sender, provider, received, ch.expiresAt);
+        emit ChannelOpened(channelId, msg.sender, provider, received, ch.expiresAt, ch.voucherSigner);
     }
 
     /// @notice Client-only: add funds to an open channel; does not extend `expiresAt`.
@@ -424,7 +449,7 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, SunsettingPausable, E
         _requireOpenAndUnexpired(ch);
         if (msg.sender != ch.provider) revert NotChannelParty();
 
-        _verifyVoucher(channelId, amount, nonce, bytesDelivered, ch.client, signature);
+        _verifyVoucher(channelId, amount, nonce, bytesDelivered, ch.voucherSigner, signature);
         // Strict monotonicity against the shared claim watermark (invariant 4).
         _advanceClaimWatermark(ch, amount, nonce, bytesDelivered, true);
 
@@ -444,7 +469,12 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, SunsettingPausable, E
 
     /// @notice Client or provider: initiate close with the latest voucher; starts
     ///         the dispute window. A zero-voucher close (all-zero args + empty
-    ///         signature, only while `claimedNonce == 0`) skips signature checks.
+    ///         signature) skips signature checks and closes at the recorded
+    ///         watermark.
+    /// @dev A party may always close at the recorded watermark without holding a
+    ///      voucher; a voucher is required only to *raise* the watermark. The
+    ///      zero-voucher call advances nothing, so the counterparty retains its full
+    ///      `disputeChannel` ratchet-up right for the whole dispute window.
     /// @dev `_verifyVoucher` may staticcall an ERC-1271 client before the close-state
     ///      writes; safe under `nonReentrant` + checks-effects-interactions.
     // slither-disable-next-line reentrancy-no-eth
@@ -462,23 +492,31 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, SunsettingPausable, E
         _requireOpenAndUnexpired(ch);
         if (msg.sender != ch.client && msg.sender != ch.provider) revert NotChannelParty();
 
-        bool zeroVoucher =
-            amount == 0 && nonce == 0 && bytesDelivered == 0 && signature.length == 0 && ch.claimedNonce == 0;
+        bool zeroVoucher = amount == 0 && nonce == 0 && bytesDelivered == 0 && signature.length == 0;
 
         if (!zeroVoucher) {
-            _verifyVoucher(channelId, amount, nonce, bytesDelivered, ch.client, signature);
+            _verifyVoucher(channelId, amount, nonce, bytesDelivered, ch.voucherSigner, signature);
             // `strictNonce = false`: a party can always close at the current
             // watermark (`nonce ==`), unlike `withdraw`/`disputeChannel`.
             _advanceClaimWatermark(ch, amount, nonce, bytesDelivered, false);
             _requireBytesTrackPayment(ch);
         }
 
-        ch.status = Status.Closing;
-        ch.disputeDeadline = uint64(block.timestamp + disputeWindow);
+        _initiateClose(ch, channelId);
+    }
 
-        emit ChannelCloseInitiated(
-            channelId, msg.sender, ch.claimedAmount, ch.claimedNonce, ch.claimedBytes, ch.disputeDeadline
-        );
+    /// @notice Client or provider: close at the channel's recorded claim watermark
+    ///         without presenting a voucher.
+    /// @dev A thin alias over the same close path `closeChannel` takes with an empty
+    ///      voucher. It advances no watermark, so the counterparty keeps its full
+    ///      `disputeChannel` ratchet-up right for the dispute window. Exists so a
+    ///      party that never received (or has lost) a voucher is not forced to wait
+    ///      out `expiresAt`.
+    function closeChannelWithoutVoucher(bytes32 channelId) external nonReentrant {
+        Channel storage ch = channels[channelId];
+        _requireOpenAndUnexpired(ch);
+        if (msg.sender != ch.client && msg.sender != ch.provider) revert NotChannelParty();
+        _initiateClose(ch, channelId);
     }
 
     /// @notice Any address: submit a strictly-higher-nonce voucher during the
@@ -500,7 +538,7 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, SunsettingPausable, E
         // forge-lint: disable-next-line(block-timestamp)
         if (block.timestamp >= ch.disputeDeadline) revert DisputeWindowClosed();
 
-        _verifyVoucher(channelId, amount, nonce, bytesDelivered, ch.client, signature);
+        _verifyVoucher(channelId, amount, nonce, bytesDelivered, ch.voucherSigner, signature);
         _advanceClaimWatermark(ch, amount, nonce, bytesDelivered, true);
         _requireBytesTrackPayment(ch);
 
@@ -587,6 +625,22 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, SunsettingPausable, E
     ///      stranded — the caller retries post-unpause or falls back to the
     ///      `closeChannel` path. So no defer branch (and no deferred-settlement
     ///      bookkeeping) is warranted.
+    /// @dev The pinned `voucherSigner` may call this. Being a permitted caller confers no
+    ///      authority beyond holding the two signatures: both are verified independently
+    ///      of `msg.sender`, so whoever assembles a voucher and a matching provider waiver
+    ///      can already have the provider — which holds the voucher and signs its own
+    ///      waiver — submit the same call. Widening the party check only moves who pays
+    ///      the gas. The signer's real power is the one the pin makes legible: its
+    ///      signature is what authorizes vouchers at all, up to `deposit`.
+    /// @dev The signer is deliberately NOT a party to the other lifecycle entry points:
+    ///      `closeChannel` and `closeChannelWithoutVoucher` remain open to either the
+    ///      client or the provider; `topUp` remains client-only (see `topUp`'s caller
+    ///      gate) and `withdraw` remains provider-only (see `withdraw`'s caller gate).
+    ///      The signer is a party to none of them. The asymmetry is intentional — the
+    ///      delegate's authority is confined to what it can already do by signing a
+    ///      voucher.
+    /// @param clientVoucherSig The client-side voucher, signed by the channel's pinned
+    ///        `voucherSigner` (which defaults to `ch.client` when none was delegated).
     // slither-disable-next-line reentrancy-no-eth
     function cooperativeClose(
         bytes32 channelId,
@@ -600,9 +654,12 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, SunsettingPausable, E
         _requireOpenAndUnexpired(ch);
         address clientAddr = ch.client;
         address providerAddr = ch.provider;
-        if (msg.sender != clientAddr && msg.sender != providerAddr) revert NotChannelParty();
+        address signerAddr = ch.voucherSigner;
+        if (msg.sender != clientAddr && msg.sender != providerAddr && msg.sender != signerAddr) {
+            revert NotChannelParty();
+        }
 
-        _verifyVoucher(channelId, amount, nonce, bytesDelivered, clientAddr, clientVoucherSig);
+        _verifyVoucher(channelId, amount, nonce, bytesDelivered, signerAddr, clientVoucherSig);
         _verifyCooperativeClose(channelId, amount, nonce, bytesDelivered, providerAddr, providerCloseSig);
         // Non-strict nonce: the agreed final state may equal the current
         // watermark; a lower one reverts (the watermark is the finality anchor).
@@ -801,6 +858,18 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, SunsettingPausable, E
     // Internal
     // -----------------------------------------------------------------
 
+    /// @dev Shared close tail: move the channel into the dispute window at its
+    ///      current watermark. Callers do the party/state checks and any watermark
+    ///      advance first.
+    function _initiateClose(Channel storage ch, bytes32 channelId) internal {
+        ch.status = Status.Closing;
+        ch.disputeDeadline = uint64(block.timestamp + disputeWindow);
+
+        emit ChannelCloseInitiated(
+            channelId, msg.sender, ch.claimedAmount, ch.claimedNonce, ch.claimedBytes, ch.disputeDeadline
+        );
+    }
+
     function _requireOpenAndUnexpired(Channel storage ch) internal view {
         if (ch.status != Status.Open) revert ChannelNotOpen();
         // forge-lint: disable-next-line(block-timestamp)
@@ -864,22 +933,26 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, SunsettingPausable, E
         }
     }
 
-    /// @dev Verify a client EIP-712 voucher signature (EOA or ERC-1271) over the
+    /// @dev Verify an EIP-712 voucher signature (EOA or ERC-1271) over the
     ///      canonical typed data. `token` is pinned to `usdc` — vouchers for a
     ///      different token never validate.
+    /// @param signer The address the signature must recover to. Every call site passes
+    ///        `ch.voucherSigner`, never `ch.client`: the funder role authorizes nothing
+    ///        by signature, so recovering against it here would accept vouchers the
+    ///        channel never delegated (and reject the ones it did).
     function _verifyVoucher(
         bytes32 channelId,
         uint256 amount,
         uint256 nonce,
         uint256 bytesDelivered,
-        address client,
+        address signer,
         bytes calldata signature
     ) internal view {
         bytes32 structHash = keccak256(
             abi.encode(VOUCHER_TYPEHASH, channelId, amount, nonce, bytesDelivered, address(usdc))
         );
         bytes32 digest = _hashTypedDataV4(structHash);
-        if (!SignatureChecker.isValidSignatureNow(client, digest, signature)) revert InvalidVoucherSignature();
+        if (!SignatureChecker.isValidSignatureNow(signer, digest, signature)) revert InvalidVoucherSignature();
     }
 
     /// @dev Verify the provider's EIP-712 cooperative-close waiver (EOA or

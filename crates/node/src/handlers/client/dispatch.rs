@@ -212,7 +212,11 @@ impl ClientHandler {
         // Origin-blacklist gate (ADR 011 §On Blacklist Event: "stops accepting
         // any StreamRequest that presents a channel funded by that operator
         // address"). `state.client` is that funding address — the same field the
-        // owner-mismatch gate further down reads.
+        // in-flight takedown re-checks read. This gate is keyed on the FUNDER
+        // and must NEVER be re-keyed onto `voucher_signer`: a blacklisted funder
+        // can pin a clean throwaway key as its signer, so checking the signer
+        // would let it buy delivery behind a delegate. The owner-mismatch gate
+        // further down asks the unrelated *signer* question.
         //
         // This must sit ABOVE the availability check, not after channel
         // resolution: every cache-miss arm below `return`s its own refusal, so a
@@ -539,17 +543,19 @@ impl ClientHandler {
                 .await;
         }
 
-        // A verified client binding MUST match the channel's authorized client.
-        // Otherwise this connection is requesting paid delivery on a channel it
-        // does not own (its vouchers would fail `WrongSigner` regardless) — so
-        // refuse before delivering any bytes, closing the leech for bound
-        // clients. Unbound connections fall back to the voucher-signature gate;
-        // an on-chain NodeId→address lookup that would close the residual for
-        // unbound peers is out of scope (#327).
+        // A verified client binding MUST match the channel's pinned
+        // `voucher_signer`. This is a SIGNER question, not a funder one: the
+        // signer is the only identity whose vouchers this channel accepts, so a
+        // binding for anything else — including the channel's own funder, when
+        // it delegated signing — would fail `WrongSigner` at the first voucher
+        // regardless. Refuse before delivering any bytes, closing the leech for
+        // bound clients. Unbound connections fall back to the voucher-signature
+        // gate; an on-chain NodeId→address lookup that would close the residual
+        // for unbound peers is out of scope (#327).
         if let Some(client) = verified_client {
-            let owner = channel.lock().await.state.client;
-            if client != owner {
-                tracing::warn!(%client, %owner, "binding does not authorize this channel");
+            let authorized_signer = channel.lock().await.state.voucher_signer;
+            if client != authorized_signer {
+                tracing::warn!(%client, %authorized_signer, "binding does not authorize this channel");
                 return self
                     .respond_error(&mut send, &req, ServeRejectReason::OwnerMismatch)
                     .await;

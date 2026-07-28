@@ -44,8 +44,8 @@ pub type ChannelId = B256;
 /// invariant compiler-enforced rather than doc-enforced.
 ///
 /// The remaining fields stay `pub` deliberately, and the asymmetry is
-/// intentional: `channel_id`/`client`/`token` are immutable identity set once at
-/// construction; `deposit` is raised by on-chain top-ups
+/// intentional: `channel_id`/`client`/`voucher_signer`/`token` are immutable
+/// identity set once at construction; `deposit` is raised by on-chain top-ups
 /// ([`crate::ChannelState`] consumers via `ChannelOpened`/`ChannelToppedUp`) and
 /// `expires_at` by the lifecycle watcher — both mutated only by trusted node-side
 /// writers under the same clone-record-swap discipline. They are not
@@ -57,8 +57,17 @@ pub type ChannelId = B256;
 pub struct ChannelState {
     /// Channel identifier (matches the on-chain `channelId`).
     pub channel_id: ChannelId,
-    /// The Ethereum address that opened the channel and signs vouchers.
+    /// The Ethereum address that funded the channel — put up the deposit and
+    /// receives the refund. Also what the ADR-011 blacklist gates check.
     pub client: Address,
+    /// The address whose EIP-712 signature authorizes vouchers on this channel.
+    ///
+    /// Pinned on-chain at `openChannel` and never mutable. Distinct from
+    /// [`Self::client`], which is the *funder* — the address that put up the
+    /// deposit, receives the refund, and is what the ADR-011 blacklist gates
+    /// check. Do not conflate the two: moving a compliance gate onto this field
+    /// would let a blacklisted funder serve traffic behind a throwaway key.
+    pub voucher_signer: Address,
     /// `ERC-20` token bound by this channel (`USDC` is the only token
     /// supported by `PaymentChannel`).
     pub token: Address,
@@ -108,16 +117,22 @@ pub struct ChannelState {
 impl ChannelState {
     /// Construct fresh state for a newly-opened channel. The `last_*` fields
     /// start at zero, matching the on-chain `Channel` struct's defaults.
+    ///
+    /// `client` (funder) and `voucher_signer` (voucher authority) are both
+    /// `Address` and adjacent, so a transposition compiles silently — pass them
+    /// in on-chain `Channel` order. For a self-signing channel they are equal.
     #[must_use]
     pub const fn new(
         channel_id: ChannelId,
         client: Address,
+        voucher_signer: Address,
         token: Address,
         deposit: U256,
     ) -> Self {
         Self {
             channel_id,
             client,
+            voucher_signer,
             token,
             deposit,
             last_amount: U256::ZERO,
@@ -140,16 +155,22 @@ impl ChannelState {
     /// **Trust boundary.** This is the one constructor that bypasses
     /// `apply_voucher`'s validation, and several arguments share a type
     /// (`deposit`/`last_amount`/`last_nonce`/`last_bytes_delivered` are all
-    /// `U256`; `client`/`token` are both `Address`), so a transposition compiles.
-    /// It has a single caller — the `channels.redb` decoder — whose
-    /// record→load round-trip tests would catch a swap; do not add callers
-    /// without the same coverage (a field-named init struct would be the move if
-    /// a second one ever appears).
+    /// `U256`; `client`/`voucher_signer`/`token` are all `Address`), so a
+    /// transposition compiles. Swapping `client` and `voucher_signer` in
+    /// particular is silent *and* security-relevant — it moves both the voucher
+    /// verification target and the ADR-011 blacklist subject.
+    /// It has a single caller — the `channels.redb` decoder — which persists
+    /// `client` and `voucher_signer` as separate on-disk segments, so its
+    /// record→load round-trip tests (which pin a signer distinct from the
+    /// funder) catch a swap of that pair. Do not add callers without the same
+    /// coverage (a field-named init struct would be the move if a second one
+    /// ever appears).
     #[must_use]
     #[allow(clippy::too_many_arguments)]
     pub const fn hydrate(
         channel_id: ChannelId,
         client: Address,
+        voucher_signer: Address,
         token: Address,
         deposit: U256,
         last_amount: U256,
@@ -162,6 +183,7 @@ impl ChannelState {
         Self {
             channel_id,
             client,
+            voucher_signer,
             token,
             deposit,
             last_amount,
@@ -242,7 +264,7 @@ impl ChannelState {
     /// the in-memory `last_*` fields.
     ///
     /// Mirrors the on-chain `closeChannel` + `disputeChannel` checks:
-    /// - signature recovers to `self.client`
+    /// - signature recovers to `self.voucher_signer`
     /// - `voucher.channel_id == self.channel_id`
     /// - `voucher.token == self.token`
     /// - `voucher.nonce > self.last_nonce`
@@ -344,6 +366,13 @@ impl ChannelState {
         // Signature check is last among the cheap-fail checks — it's the most
         // expensive in-memory step (ecrecover).
         //
+        // The expected signer is the channel's pinned `voucher_signer`, NOT the
+        // funder: `openChannel` pins a voucher-signing address that may be a
+        // delegate key (it resolves to the funder when opened with a zero
+        // signer, which is the self-signing case). The four on-chain settlement
+        // paths recover against the same field, so verifying against `client`
+        // here would accept vouchers the contract rejects and vice versa.
+        //
         // EOA-only off-chain (#845): `verify_signer` recovers a 65-byte EOA
         // signature via `ecrecover`, matching the stance of `probe_sig` and
         // `bind_sig`. The on-chain `PaymentChannel` path also accepts ERC-1271
@@ -352,7 +381,7 @@ impl ChannelState {
         // ERC-1271 off-chain path needs an `isValidSignature` RPC call and is
         // deferred (ADR 024 §Off-Chain ERC-1271 Verification).
         signed
-            .verify_signer(self.client, domain)
+            .verify_signer(self.voucher_signer, domain)
             .map_err(ChannelError::Signature)?;
 
         // INVARIANT (#527): clone after validation, record on the clone, swap
@@ -562,6 +591,7 @@ mod tests {
         let signer = PrivateKeySigner::random();
         let state = ChannelState::new(
             b256!("11223344556677889900aabbccddeeff00112233445566778899aabbccddeeff"),
+            signer.address(),
             signer.address(),
             TOKEN,
             U256::from(10_000_000u64), // 10 USDC deposit
@@ -796,6 +826,76 @@ mod tests {
             ),
             "{err:?}"
         );
+        Ok(())
+    }
+
+    /// A channel funded by one address but whose pinned `voucher_signer` is a
+    /// distinct delegate key: the delegate's voucher must be accepted.
+    #[test]
+    fn voucher_signed_by_delegate_is_accepted() -> anyhow::Result<()> {
+        let (funder, base, domain, store) = fixture();
+        let delegate = PrivateKeySigner::random();
+        let mut state = ChannelState::new(
+            base.channel_id,
+            funder.address(),
+            delegate.address(),
+            TOKEN,
+            U256::from(10_000_000u64),
+        );
+        let signed =
+            build(state.channel_id, 1_000, 1, 1_048_576, TOKEN).sign(&delegate, &domain)?;
+
+        state.apply_voucher(&signed, &domain, &store)?;
+        anyhow::ensure!(state.last_nonce == U256::from(1u64));
+        Ok(())
+    }
+
+    /// With a delegate pinned, the funder is no longer an authorized signer —
+    /// and the rejection must name the delegate as `expected`, proving the
+    /// verification target actually moved off `client`.
+    #[test]
+    fn voucher_signed_by_funder_is_rejected_when_a_delegate_is_pinned() -> anyhow::Result<()> {
+        let (funder, base, domain, store) = fixture();
+        let delegate = PrivateKeySigner::random();
+        let mut state = ChannelState::new(
+            base.channel_id,
+            funder.address(),
+            delegate.address(),
+            TOKEN,
+            U256::from(10_000_000u64),
+        );
+        let signed = build(state.channel_id, 1_000, 1, 1_048_576, TOKEN).sign(&funder, &domain)?;
+
+        let err = err_of(state.apply_voucher(&signed, &domain, &store))?;
+        let ChannelError::Signature(VoucherError::WrongSigner {
+            expected,
+            recovered,
+        }) = err
+        else {
+            anyhow::bail!("expected WrongSigner, got {err:?}");
+        };
+        anyhow::ensure!(
+            expected == delegate.address(),
+            "expected signer must be the pinned delegate, not the funder"
+        );
+        anyhow::ensure!(recovered == funder.address(), "{recovered}");
+        anyhow::ensure!(
+            state.last_nonce == U256::ZERO,
+            "rejection must not advance state"
+        );
+        Ok(())
+    }
+
+    /// `voucher_signer == client` (the on-chain default when `openChannel` is
+    /// passed a zero signer): the pre-existing self-signed path is unchanged.
+    #[test]
+    fn self_signed_channel_still_accepts_the_funder_voucher() -> anyhow::Result<()> {
+        let (signer, mut state, domain, store) = fixture();
+        anyhow::ensure!(state.voucher_signer == state.client);
+        let signed = build(state.channel_id, 1_000, 1, 1_048_576, TOKEN).sign(&signer, &domain)?;
+
+        state.apply_voucher(&signed, &domain, &store)?;
+        anyhow::ensure!(state.last_nonce == U256::from(1u64));
         Ok(())
     }
 

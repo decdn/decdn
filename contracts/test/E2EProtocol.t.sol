@@ -213,7 +213,7 @@ contract E2EProtocolTest is Test, BaseProtocolDeploy {
     function _openAndSettleChannel() internal returns (uint256 epoch) {
         vm.startPrank(client);
         usdc.approve(address(d.paymentChannel), type(uint256).max);
-        bytes32 channelId = d.paymentChannel.openChannel(operator, DEPOSIT);
+        bytes32 channelId = d.paymentChannel.openChannel(operator, DEPOSIT, address(0));
         vm.stopPrank();
 
         bytes memory voucherSig = _voucherSig(channelId, SETTLE_AMOUNT, 1, SETTLE_BYTES);

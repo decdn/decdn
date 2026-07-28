@@ -605,6 +605,7 @@ mod tests {
         ChannelState::hydrate(
             bytes.into(),
             address!("00000000000000000000000000000000000000aa"),
+            address!("00000000000000000000000000000000000000aa"),
             address!("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"),
             U256::from(10_000_000u64),
             U256::from(1_234u64),
@@ -644,6 +645,7 @@ mod tests {
         let advanced = ChannelState::hydrate(
             s.channel_id,
             s.client,
+            s.voucher_signer,
             s.token,
             s.deposit,
             s.last_amount(),

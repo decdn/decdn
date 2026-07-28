@@ -2,6 +2,7 @@
 pragma solidity 0.8.28;
 
 import { Test } from "forge-std/Test.sol";
+import { Vm } from "forge-std/Vm.sol";
 import { ERC20 } from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { IAccessControl } from "@openzeppelin/contracts/access/IAccessControl.sol";
@@ -176,6 +177,8 @@ contract PaymentChannelTest is Test {
     bytes32 internal constant COOPERATIVE_CLOSE_TYPEHASH = keccak256(
         "CooperativeClose(bytes32 channelId,uint256 amount,uint256 nonce,uint256 bytesDelivered,address token)"
     );
+    bytes32 internal constant CHANNEL_OPENED_SIG =
+        keccak256("ChannelOpened(bytes32,address,address,uint256,uint256,address)");
 
     // Committed EIP-712 parity vector for the cooperative-close waiver, shared with
     // the off-chain Rust signer (`crates/incentive/src/cooperative_close.rs`,
@@ -236,7 +239,7 @@ contract PaymentChannelTest is Test {
 
     function _open() internal returns (bytes32 channelId) {
         vm.prank(client);
-        channelId = channel.openChannel(provider, DEPOSIT);
+        channelId = channel.openChannel(provider, DEPOSIT, address(0));
     }
 
     function _signFor(
@@ -316,7 +319,7 @@ contract PaymentChannelTest is Test {
 
     function _openKeyed() internal returns (bytes32 channelId) {
         vm.prank(client);
-        channelId = channel.openChannel(keyedProvider, DEPOSIT);
+        channelId = channel.openChannel(keyedProvider, DEPOSIT, address(0));
     }
 
     // -----------------------------------------------------------------
@@ -342,7 +345,7 @@ contract PaymentChannelTest is Test {
         bond.setActive(provider, false);
         vm.prank(client);
         vm.expectRevert(abi.encodeWithSelector(PaymentChannel.ProviderNotActive.selector, provider));
-        channel.openChannel(provider, DEPOSIT);
+        channel.openChannel(provider, DEPOSIT, address(0));
     }
 
     function test_openChannel_revertsBelowMinDeposit() public {
@@ -350,7 +353,7 @@ contract PaymentChannelTest is Test {
         vm.expectRevert(
             abi.encodeWithSelector(PaymentChannel.DepositBelowMinimum.selector, uint256(1), uint256(1_000_000))
         );
-        channel.openChannel(provider, 1);
+        channel.openChannel(provider, 1, address(0));
     }
 
     // ADR 009 § Emergency Multisig — the protocol-wide pause sunsets hard at
@@ -367,16 +370,16 @@ contract PaymentChannelTest is Test {
         channel.pause();
         vm.prank(client);
         vm.expectRevert(Pausable.EnforcedPause.selector);
-        channel.openChannel(provider, DEPOSIT);
+        channel.openChannel(provider, DEPOSIT, address(0));
     }
 
     function test_openChannel_distinctIdsAcrossProviders() public {
         address provider2 = address(0xB0B2);
         bond.setActive(provider2, true);
         vm.prank(client);
-        bytes32 id0 = channel.openChannel(provider, DEPOSIT);
+        bytes32 id0 = channel.openChannel(provider, DEPOSIT, address(0));
         vm.prank(client);
-        bytes32 id1 = channel.openChannel(provider2, DEPOSIT);
+        bytes32 id1 = channel.openChannel(provider2, DEPOSIT, address(0));
         assertTrue(id0 != id1);
         assertEq(channel.clientChannelNonce(client), 2);
     }
@@ -603,14 +606,119 @@ contract PaymentChannelTest is Test {
         assertEq(router.callCount(), 0); // zero amount → no router call
     }
 
-    function test_zeroVoucherClose_disabledAfterWithdraw() public {
+    function test_closeChannel_voucherlessAfterWithdrawKeepsWatermark() public {
         bytes32 id = _open();
         vm.prank(provider);
         channel.withdraw(id, 200e6, 1, 20_000_000, _sign(id, 200e6, 1, 20_000_000));
-        // claimedNonce now 1 → zero-voucher path disabled; empty sig fails verification.
-        vm.prank(client);
-        vm.expectRevert(PaymentChannel.InvalidVoucherSignature.selector);
+
+        // No voucher in hand: close at whatever `withdraw` already recorded.
+        vm.prank(provider);
         channel.closeChannel(id, 0, 0, 0, "");
+
+        PaymentChannel.Channel memory ch = channel.getChannel(id);
+        assertEq(uint8(ch.status), uint8(PaymentChannel.Status.Closing), "channel is closing");
+        assertEq(ch.claimedAmount, 200e6, "watermark survives a voucher-less close");
+        assertEq(ch.claimedNonce, 1, "nonce watermark survives");
+        assertEq(ch.claimedBytes, 20_000_000, "byte watermark survives");
+    }
+
+    // -----------------------------------------------------------------
+    // closeChannelWithoutVoucher
+    // -----------------------------------------------------------------
+
+    function test_closeChannelWithoutVoucher_byProvider() public {
+        bytes32 id = _open();
+        uint256 expectedDeadline = block.timestamp + channel.disputeWindow();
+
+        vm.expectEmit(true, true, false, true, address(channel));
+        emit PaymentChannel.ChannelCloseInitiated(id, provider, 0, 0, 0, expectedDeadline);
+
+        vm.prank(provider);
+        channel.closeChannelWithoutVoucher(id);
+        assertEq(uint8(channel.getChannel(id).status), uint8(PaymentChannel.Status.Closing));
+    }
+
+    function test_closeChannelWithoutVoucher_byClient() public {
+        bytes32 id = _open();
+        vm.prank(client);
+        channel.closeChannelWithoutVoucher(id);
+        assertEq(uint8(channel.getChannel(id).status), uint8(PaymentChannel.Status.Closing));
+    }
+
+    function test_closeChannelWithoutVoucher_rejectsStranger() public {
+        bytes32 id = _open();
+        vm.prank(stranger);
+        vm.expectRevert(PaymentChannel.NotChannelParty.selector);
+        channel.closeChannelWithoutVoucher(id);
+    }
+
+    /// @dev The pinned delegate signs vouchers; it is deliberately not a close party.
+    function test_closeChannelWithoutVoucher_rejectsVoucherSigner() public {
+        (address delegate,) = makeAddrAndKey("delegate");
+        vm.prank(client);
+        bytes32 id = channel.openChannel(provider, DEPOSIT, delegate);
+        vm.prank(delegate);
+        vm.expectRevert(PaymentChannel.NotChannelParty.selector);
+        channel.closeChannelWithoutVoucher(id);
+    }
+
+    /// @dev `closeChannelWithoutVoucher` is a distinct entry point with its own
+    ///      `_requireOpenAndUnexpired` guard; pin it independently so a future
+    ///      refactor that drops the guard here (while leaving `closeChannel`
+    ///      guarded) does not pass silently.
+    function test_closeChannelWithoutVoucher_revertsWhenAlreadyClosing() public {
+        bytes32 id = _open();
+        vm.prank(provider);
+        channel.closeChannelWithoutVoucher(id);
+
+        vm.prank(client);
+        vm.expectRevert(PaymentChannel.ChannelNotOpen.selector);
+        channel.closeChannelWithoutVoucher(id);
+    }
+
+    function test_closeChannelWithoutVoucher_revertsAfterExpiry() public {
+        bytes32 id = _open();
+        vm.warp(block.timestamp + MAX_DURATION);
+
+        vm.prank(provider);
+        vm.expectRevert(PaymentChannel.ChannelExpired.selector);
+        channel.closeChannelWithoutVoucher(id);
+    }
+
+    function test_closeChannelWithoutVoucher_disputeStillRatchets() public {
+        bytes32 id = _open();
+        vm.prank(provider);
+        channel.withdraw(id, 100e6, 1, 10_000_000, _sign(id, 100e6, 1, 10_000_000));
+
+        vm.prank(client);
+        channel.closeChannelWithoutVoucher(id);
+
+        channel.disputeChannel(id, 300e6, 2, 30_000_000, _sign(id, 300e6, 2, 30_000_000));
+        assertEq(channel.getChannel(id).claimedAmount, 300e6, "counterparty ratcheted up post-close");
+
+        // The ratchet is not just bookkeeping: settlement must actually route the
+        // delta above what `withdraw` already paid out.
+        vm.warp(block.timestamp + channel.disputeWindow() + 1);
+        channel.settleChannel(id);
+        assertEq(
+            router.totalRouted(), 300e6, "withdraw's 100e6 plus settle's 200e6 delta land at the ratcheted watermark"
+        );
+    }
+
+    function test_closeChannelWithoutVoucher_settlesAtWatermark() public {
+        bytes32 id = _open();
+        vm.prank(provider);
+        channel.withdraw(id, 100e6, 1, 10_000_000, _sign(id, 100e6, 1, 10_000_000));
+
+        uint256 clientBefore = usdc.balanceOf(client);
+        vm.prank(provider);
+        channel.closeChannelWithoutVoucher(id);
+        vm.warp(block.timestamp + channel.disputeWindow() + 1);
+        channel.settleChannel(id);
+
+        assertEq(usdc.balanceOf(client), clientBefore + (DEPOSIT - 100e6), "funder refunded deposit minus watermark");
+        // `withdraw` already routed the full watermark, so settlement routes nothing more.
+        assertEq(router.totalRouted(), 100e6, "no double-pay of the watermark");
     }
 
     function test_close_afterWithdraw_settleRoutesRemainderOnly() public {
@@ -1607,7 +1715,7 @@ contract PaymentChannelTest is Test {
         usdc.approve(address(channel), type(uint256).max);
 
         vm.prank(address(wallet));
-        bytes32 id = channel.openChannel(provider, DEPOSIT);
+        bytes32 id = channel.openChannel(provider, DEPOSIT, address(0));
         assertEq(channel.getChannel(id).client, address(wallet));
 
         // Voucher signed by the wallet's owner key; verified through ERC-1271.
@@ -1680,7 +1788,7 @@ contract PaymentChannelTest is Test {
         // But a fresh open is blocked.
         vm.prank(client);
         vm.expectRevert(Pausable.EnforcedPause.selector);
-        channel.openChannel(provider, DEPOSIT);
+        channel.openChannel(provider, DEPOSIT, address(0));
     }
 
     // -----------------------------------------------------------------
@@ -1915,5 +2023,116 @@ contract PaymentChannelTest is Test {
         assertEq(routedBytes, b);
         assertEq(routedAmt, amount);
         assertEq(usdc.balanceOf(client), 100_000e6 - amount);
+    }
+
+    // -----------------------------------------------------------------
+    // Delegated voucher signer (pinned at open)
+    // -----------------------------------------------------------------
+
+    function test_openChannel_pinsVoucherSigner() public {
+        (address delegate,) = makeAddrAndKey("delegate");
+        vm.prank(client);
+        bytes32 id = channel.openChannel(provider, DEPOSIT, delegate);
+        PaymentChannel.Channel memory ch = channel.getChannel(id);
+        assertEq(ch.client, client, "funder stays the caller");
+        assertEq(ch.voucherSigner, delegate, "signer is pinned to the delegate");
+    }
+
+    function test_openChannel_zeroSignerDefaultsToSender() public {
+        vm.prank(client);
+        bytes32 id = channel.openChannel(provider, DEPOSIT, address(0));
+        assertEq(channel.getChannel(id).voucherSigner, client, "zero defaults to msg.sender");
+    }
+
+    function test_openChannel_emitsVoucherSigner() public {
+        (address delegate,) = makeAddrAndKey("delegate");
+        vm.recordLogs();
+        vm.prank(client);
+        channel.openChannel(provider, DEPOSIT, delegate);
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        bool seen;
+        for (uint256 i = 0; i < logs.length; i++) {
+            if (logs[i].topics[0] != CHANNEL_OPENED_SIG) continue;
+            (,, address signer) = abi.decode(logs[i].data, (uint256, uint256, address));
+            assertEq(signer, delegate, "ChannelOpened carries the pinned signer");
+            seen = true;
+        }
+        assertTrue(seen, "ChannelOpened was emitted");
+    }
+
+    function test_withdraw_acceptsDelegateVoucherRejectsFunder() public {
+        (address delegate, uint256 delegateKey) = makeAddrAndKey("delegate");
+        vm.prank(client);
+        bytes32 id = channel.openChannel(provider, DEPOSIT, delegate);
+
+        bytes memory funderSig = _signTypedAs(CLIENT_PK, VOUCHER_TYPEHASH, id, 100, 1, 1_000_000);
+        vm.prank(provider);
+        vm.expectRevert(PaymentChannel.InvalidVoucherSignature.selector);
+        channel.withdraw(id, 100, 1, 1_000_000, funderSig);
+
+        bytes memory delegateSig = _signTypedAs(delegateKey, VOUCHER_TYPEHASH, id, 100, 1, 1_000_000);
+        vm.prank(provider);
+        channel.withdraw(id, 100, 1, 1_000_000, delegateSig);
+        assertEq(channel.getChannel(id).claimedAmount, 100, "delegate voucher advanced the watermark");
+    }
+
+    function test_closeChannel_verifiesAgainstDelegate() public {
+        (address delegate, uint256 delegateKey) = makeAddrAndKey("delegate");
+        vm.prank(client);
+        bytes32 id = channel.openChannel(provider, DEPOSIT, delegate);
+        bytes memory sig = _signTypedAs(delegateKey, VOUCHER_TYPEHASH, id, 100, 1, 1_000_000);
+        vm.prank(client);
+        channel.closeChannel(id, 100, 1, 1_000_000, sig);
+        assertEq(uint8(channel.getChannel(id).status), uint8(PaymentChannel.Status.Closing));
+    }
+
+    function test_disputeChannel_verifiesAgainstDelegate() public {
+        (address delegate, uint256 delegateKey) = makeAddrAndKey("delegate");
+        vm.prank(client);
+        bytes32 id = channel.openChannel(provider, DEPOSIT, delegate);
+        vm.prank(client);
+        channel.closeChannel(id, 0, 0, 0, "");
+        bytes memory sig = _signTypedAs(delegateKey, VOUCHER_TYPEHASH, id, 100, 1, 1_000_000);
+        channel.disputeChannel(id, 100, 1, 1_000_000, sig);
+        assertEq(channel.getChannel(id).claimedAmount, 100, "dispute ratcheted on a delegate voucher");
+    }
+
+    function test_cooperativeClose_callableAndSignableByDelegate() public {
+        (address delegate, uint256 delegateKey) = makeAddrAndKey("delegate");
+        vm.prank(client);
+        bytes32 id = channel.openChannel(keyedProvider, DEPOSIT, delegate);
+        bytes memory voucherSig = _signTypedAs(delegateKey, VOUCHER_TYPEHASH, id, 100, 1, 1_000_000);
+        bytes memory waiver = _signWaiver(id, 100, 1, 1_000_000);
+        uint256 clientBefore = usdc.balanceOf(client);
+        vm.prank(delegate);
+        channel.cooperativeClose(id, 100, 1, 1_000_000, voucherSig, waiver);
+        assertEq(uint8(channel.getChannel(id).status), uint8(PaymentChannel.Status.Closed));
+        assertEq(usdc.balanceOf(client), clientBefore + (DEPOSIT - 100), "refund still goes to the funder");
+    }
+
+    /// @dev The delegate signs vouchers and may call `cooperativeClose`; it gains
+    ///      no authority over the funding-side lifecycle entry points.
+    function test_topUp_rejectsVoucherSigner() public {
+        (address delegate,) = makeAddrAndKey("delegate");
+        vm.prank(client);
+        bytes32 id = channel.openChannel(provider, DEPOSIT, delegate);
+        usdc.transfer(delegate, 10e6);
+        vm.startPrank(delegate);
+        usdc.approve(address(channel), type(uint256).max);
+        vm.expectRevert(PaymentChannel.NotChannelParty.selector);
+        channel.topUp(id, 10e6);
+        vm.stopPrank();
+    }
+
+    function test_refundOnCloseGoesToFunderNotSigner() public {
+        (address delegate,) = makeAddrAndKey("delegate");
+        uint256 delegateBefore = usdc.balanceOf(delegate);
+        vm.prank(client);
+        bytes32 id = channel.openChannel(provider, DEPOSIT, delegate);
+        vm.prank(client);
+        channel.closeChannel(id, 0, 0, 0, "");
+        vm.warp(block.timestamp + channel.disputeWindow() + 1);
+        channel.settleChannel(id);
+        assertEq(usdc.balanceOf(delegate), delegateBefore, "signer never receives funds");
     }
 }

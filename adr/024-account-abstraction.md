@@ -37,11 +37,11 @@ This is a mechanical replacement. The EIP-712 domain separators, typed data hash
 
 **PaymentChannel ([ADR 003](003-payments.md#adr-003-payment-model)):**
 
-| Function | Current | After |
-| --- | --- | --- |
-| `closeChannel` — voucher signature | `ECDSA.recover(digest, sig) == channel.client` | `SignatureChecker.isValidSignatureNow(channel.client, digest, sig)` |
+| Function | Verification |
+| --- | --- |
+| `closeChannel` — voucher signature | `SignatureChecker.isValidSignatureNow(channel.voucherSigner, digest, sig)` |
 
-`disputeChannel` validates the voucher signature using the same scheme as `closeChannel` and migrates the same way.
+`withdraw`, `disputeChannel`, and `cooperativeClose` validate the voucher signature using the same scheme as `closeChannel`. `channel.voucherSigner` is the address the funder pinned at `openChannel` ([ADR 003 § PaymentChannel](003-payments.md#paymentchannel)); it equals `channel.client` where no delegate was named.
 
 **CapacityBond ([ADR 003](003-payments.md#adr-003-payment-model)):**
 
@@ -70,7 +70,7 @@ This is a mechanical replacement. The EIP-712 domain separators, typed data hash
 
 ### Wallet Support — EOA Default, Safe Supported
 
-The encrypted EOA keystore is deCDN's documented default wallet for both node operators and clients. Safe — and any other ERC-1271-compliant smart account — is **supported**: because `SignatureChecker` is wired at every verification site, a Safe works as `msg.sender` or `channel.client` on every on-chain path with no deCDN feature work, no config surface, and no setup tooling.
+The encrypted EOA keystore is deCDN's documented default wallet for both node operators and clients. Safe — and any other ERC-1271-compliant smart account — is **supported**: because `SignatureChecker` is wired at every verification site, a Safe works as `msg.sender`, `channel.client`, or `channel.voucherSigner` on every on-chain path with no deCDN feature work, no config surface, and no setup tooling.
 
 deCDN does not recommend one. A 1-of-1 Safe carries the same trust posture as the single software-held key that owns it, and the multi-owner threshold that would buy real security cannot be reached on the hot path (below). The choice is the operator's, and the retained contract-level `SignatureChecker` is what makes it free.
 
@@ -86,8 +86,9 @@ deCDN does not recommend one. A 1-of-1 Safe carries the same trust posture as th
 
 **Default: an EOA keystore.** High-value client accounts migrate to 2-of-3 + session keys in Production ([§ Session Keys — Deferred to Production via ERC-7579 smartsessions](#session-keys--deferred-to-production-via-erc-7579-smartsessions)); the same threshold constraint that applies to node operators applies here.
 
-- **Channel operations:** The EOA (or Safe) deposits USDC into `PaymentChannel.openChannel()`. That address is the `channel.client`, and `SignatureChecker` makes the choice transparent to every contract.
-- **Voucher signing:** EIP-712 vouchers are signed with the `channel.client` key. On-chain, `SignatureChecker` validates against `channel.client` (EOA → ECDSA; 1-of-1 Safe → `checkSignatures` via the stock handler). **Off-chain, nodes verify vouchers and `BindNodeId` ephemeral bindings by recovery only** — so a smart-account client can fund a channel on-chain but cannot be served, and its binding is rejected fail-closed ([§ Off-Chain ERC-1271 Verification](#off-chain-erc-1271-verification)). The session-key path — signing at delivery speed via `erc7579/smartsessions` without exposing the Safe owner key — lands with the Production plan below, and is what makes smart-account clients viable end to end.
+- **Channel operations:** The EOA (or Safe) deposits USDC into `PaymentChannel.openChannel()`. That address is the `channel.client` — the funder — and `SignatureChecker` makes the choice transparent to every contract.
+- **Voucher signing:** EIP-712 vouchers are signed by the channel's pinned `voucherSigner`, which the funder fixes at open and which defaults to the funder itself. On-chain, `SignatureChecker` validates against it (EOA → ECDSA; 1-of-1 Safe → `checkSignatures` via the stock handler). **Off-chain, nodes verify vouchers and `BindNodeId` ephemeral bindings by recovery only, against that pinned signer** — so a channel whose *signer* is a smart account cannot be served, and its binding is rejected fail-closed ([§ Off-Chain ERC-1271 Verification](#off-chain-erc-1271-verification)).
+- **A smart-account funder is servable today.** Because the funder and the signer are separate roles, a Safe can fund a channel and pin a plain EOA as its `voucherSigner`. The Safe custodies the deposit and receives the refund; the vouchers recover by `ecrecover` and clear the off-chain path unchanged. The residual gap is narrower than a wallet choice: it is a channel that names a smart account as the *signer*. The session-key path — signing at delivery speed via `erc7579/smartsessions` without exposing the Safe owner key — lands with the Production plan below, and is what a smart account signing for itself needs.
 
 ### Session Keys — Deferred to Production via ERC-7579 smartsessions
 
@@ -116,7 +117,7 @@ No bespoke Safe module, no custom fallback handler, no new security-critical con
 
 [ADR 012](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model) specifies that nodes verify client ephemeral binding signatures (`BindNodeId` with `nonce=0`) off-chain, without an on-chain call.
 
-**PoC — EOA only.** Every signature deCDN produces or verifies off-chain — the node's `slash_sig`, client vouchers, `BindNodeId` bindings, and cooperative-close waivers — is the fixed 65-byte secp256k1 `r‖s‖v` form, verified by recovering the signer and comparing against the expected address. Verifiers reject any other length **fail-closed**. A smart-account signer is therefore un-servable off-chain even though the contracts accept it on-chain, and a party whose registered address is a smart account cannot be verified by recovery at all.
+**PoC — EOA only.** Every signature deCDN produces or verifies off-chain — the node's `slash_sig`, client vouchers, `BindNodeId` bindings, and cooperative-close waivers — is the fixed 65-byte secp256k1 `r‖s‖v` form, verified by recovering the signer and comparing against the expected address. Verifiers reject any other length **fail-closed**. A smart-account signer is therefore un-servable off-chain even though the contracts accept it on-chain, and a party whose registered address is a smart account cannot be verified by recovery at all. On the buyer side this is avoidable without the branch: the funder pins an EOA as the channel's `voucherSigner`, and only the signer is ever recovered. On the operator side it is not — `registerNode` binds `msg.sender`, and requesters recover `slash_sig` against that registered address, so a Safe-addressed operator cannot serve traffic.
 
 **Production.** When smart-account clients arrive, nodes gain an ERC-1271 branch: probe the signer address for code, fall through to recovery when it is empty, and otherwise call `isValidSignature(bytes32,bytes)` on the signer and compare against the ERC-1271 magic value. The cost is one L2 RPC round-trip per client connection at binding time, not per message; nodes SHOULD cache the per-address code result, which does not change after deployment (ignoring `SELFDESTRUCT`, deprecated and irrelevant for Safe wallets).
 

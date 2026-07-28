@@ -265,6 +265,11 @@ impl ClientHandler {
         // Read once: the funder is immutable for the channel's lifetime, and the
         // per-boundary in-flight takedown check below must not re-take the
         // channel lock every MB just to re-read it.
+        //
+        // This is the FUNDER (ADR 011 compliance), never the channel's
+        // `voucher_signer`, and must not be re-keyed onto it: a blacklisted
+        // funder can pin a clean throwaway key as its signer, so checking the
+        // signer here would silently stop enforcing takedowns.
         let funder = channel.lock().await.state.client;
         // Typed total so the window-budget comparisons below stay `Bytes`-vs-`Bytes`.
         // The forwarded/metered quantities are WIRE bytes (the bao verified-stream:

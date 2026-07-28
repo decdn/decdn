@@ -210,7 +210,16 @@ pub async fn open_channel<P: Provider + Clone>(
     provider_addr: Address,
     deposit: U256,
 ) -> Result<OpenedChannel> {
-    let pending = match contract.openChannel(provider_addr, deposit).send().await {
+    // Self-signing open: a zero `voucherSigner` resolves on-chain to `msg.sender`,
+    // which is this buyer's own key — the same behaviour as before the signer
+    // split. Pinning a *delegate* signer here is deliberately out of scope: it
+    // needs a publisher-pays UX (who holds the delegate key, how it is rotated,
+    // how the funder authorizes it), not just an extra argument.
+    let pending = match contract
+        .openChannel(provider_addr, deposit, Address::ZERO)
+        .send()
+        .await
+    {
         Ok(pending) => pending,
         Err(err) => {
             // A deterministic revert (deposit below `minDeposit`, USDC

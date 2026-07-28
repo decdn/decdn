@@ -376,12 +376,26 @@ pub struct ChannelSnapshot {
     /// provider, channelNonce)` per ADR 003), `0x`-prefixed — same
     /// 32-byte encoding `alloy`'s `B256` `Display` produces.
     pub channel_id: String,
-    /// The client (buyer) Ethereum address that opened the channel and
-    /// signs vouchers, rendered as an EIP-55 mixed-case checksummed hex
-    /// string (`0x`-prefixed) — `alloy`'s `Address` `Display`. Note this
-    /// differs from [`PeerView::node_id`], which is plain lowercase hex of
-    /// an iroh public key (a different identity type, not an EVM address).
+    /// The client (buyer) Ethereum address that **funded** the channel —
+    /// the deposit owner and refund destination, and the subject of the
+    /// ADR-011 blacklist gates. Rendered as an EIP-55 mixed-case
+    /// checksummed hex string (`0x`-prefixed) — `alloy`'s `Address`
+    /// `Display`. Note this differs from [`PeerView::node_id`], which is
+    /// plain lowercase hex of an iroh public key (a different identity
+    /// type, not an EVM address). It is *not* necessarily the voucher
+    /// signer — see [`Self::voucher_signer`].
     pub counterparty: String,
+    /// The address pinned on-chain at `openChannel` as this channel's
+    /// voucher signer: the EIP-712 recovery target for every voucher, in
+    /// the same EIP-55 rendering as [`Self::counterparty`]. Equal to
+    /// `counterparty` for the ordinary self-signing case (the contract
+    /// resolves a zero `voucherSigner` argument to `msg.sender`), and a
+    /// distinct delegate key when the funder delegated signing.
+    /// `#[serde(default)]` keeps a pre-delegation server round-tripping;
+    /// such a server reports an empty string, which renderers show as
+    /// unknown rather than guessing the funder.
+    #[serde(default)]
+    pub voucher_signer: String,
     /// Sequence number of the most-recently-accepted voucher
     /// (`ChannelState::last_nonce`). `0` before any voucher has been
     /// applied — matches the on-chain `claimedNonce == 0` sentinel.
@@ -879,6 +893,7 @@ mod tests {
                 ChannelSnapshot {
                     channel_id: "0xabcd".to_string(),
                     counterparty: "0x00aa".to_string(),
+                    voucher_signer: "0x00cc".to_string(),
                     last_nonce: 7,
                     outstanding_micro_usdc: 2_500_000,
                     deposit_micro_usdc: 10_000_000,
@@ -888,6 +903,7 @@ mod tests {
                 ChannelSnapshot {
                     channel_id: "0xbeef".to_string(),
                     counterparty: "0x00bb".to_string(),
+                    voucher_signer: "0x00bb".to_string(),
                     last_nonce: 0,
                     outstanding_micro_usdc: 0,
                     deposit_micro_usdc: 5_000_000,
@@ -904,6 +920,10 @@ mod tests {
         let first = back.channels.first().expect("first channel");
         assert_eq!(first.channel_id, "0xabcd");
         assert_eq!(first.counterparty, "0x00aa");
+        assert_eq!(
+            first.voucher_signer, "0x00cc",
+            "a delegated signer must survive the round trip distinct from the funder"
+        );
         assert_eq!(first.last_nonce, 7);
         assert_eq!(first.outstanding_micro_usdc, 2_500_000);
         assert_eq!(first.deposit_micro_usdc, 10_000_000);
@@ -985,6 +1005,11 @@ mod tests {
         assert!(
             snap.seconds_since_last_voucher.is_none(),
             "missing seconds_since_last_voucher must default to None"
+        );
+        assert!(
+            snap.voucher_signer.is_empty(),
+            "a pre-delegation server omits voucher_signer; it must default to empty \
+             rather than silently reading as the funder"
         );
     }
 }

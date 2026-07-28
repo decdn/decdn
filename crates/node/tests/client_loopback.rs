@@ -235,6 +235,7 @@ async fn client_delivery_roundtrip_advances_channel_state() -> anyhow::Result<()
     store.record(&ChannelState::new(
         channel_id(),
         client_signer.address(),
+        client_signer.address(),
         TOKEN,
         deposit,
     ))?;
@@ -552,6 +553,7 @@ async fn idle_fixture_with_cache(
     let store = Arc::new(MemoryChannelStateStore::new());
     store.record(&ChannelState::new(
         channel_id(),
+        client_signer.address(),
         client_signer.address(),
         TOKEN,
         U256::from(10_000_000u64),
@@ -1066,6 +1068,7 @@ async fn client_delivers_empty_blob() -> anyhow::Result<()> {
     store.record(&ChannelState::new(
         channel_id(),
         client_signer.address(),
+        client_signer.address(),
         TOKEN,
         deposit,
     ))?;
@@ -1153,6 +1156,7 @@ async fn tracked_watermark_survives_post_ack_error() -> anyhow::Result<()> {
     let store = Arc::new(MemoryChannelStateStore::new());
     store.record(&ChannelState::new(
         channel_id(),
+        client_signer.address(),
         client_signer.address(),
         TOKEN,
         deposit,
@@ -1253,6 +1257,7 @@ async fn accepted_voucher_advances_shared_activity_clock() -> anyhow::Result<()>
     store.record(&ChannelState::new(
         channel_id(),
         client_signer.address(),
+        client_signer.address(),
         TOKEN,
         deposit,
     ))?;
@@ -1349,6 +1354,7 @@ async fn accepted_voucher_records_served_bytes_by_region() -> anyhow::Result<()>
     let store = Arc::new(MemoryChannelStateStore::new());
     store.record(&ChannelState::new(
         channel_id(),
+        client_signer.address(),
         client_signer.address(),
         TOKEN,
         deposit,
@@ -1447,6 +1453,7 @@ async fn voucher_acceptance_appends_download_receipt() -> anyhow::Result<()> {
     let store = Arc::new(MemoryChannelStateStore::new());
     store.record(&ChannelState::new(
         channel_id(),
+        client_signer.address(),
         client_signer.address(),
         TOKEN,
         deposit,
@@ -1562,6 +1569,7 @@ async fn delivery_completes_while_receipt_writer_is_stalled() -> anyhow::Result<
     store.record(&ChannelState::new(
         channel_id(),
         client_signer.address(),
+        client_signer.address(),
         TOKEN,
         deposit,
     ))?;
@@ -1664,6 +1672,7 @@ async fn receipt_log_write_failure_does_not_fail_delivery() -> anyhow::Result<()
     store.record(&ChannelState::new(
         channel_id(),
         client_signer.address(),
+        client_signer.address(),
         TOKEN,
         deposit,
     ))?;
@@ -1746,6 +1755,7 @@ async fn client_reused_channel_resumes() -> anyhow::Result<()> {
     let store = Arc::new(MemoryChannelStateStore::new());
     store.record(&ChannelState::new(
         channel_id(),
+        client_signer.address(),
         client_signer.address(),
         TOKEN,
         deposit,
@@ -1860,6 +1870,7 @@ async fn client_byte_offset_returns_suffix_multi_group() -> anyhow::Result<()> {
     store.record(&ChannelState::new(
         channel_id(),
         client_signer.address(),
+        client_signer.address(),
         TOKEN,
         deposit,
     ))?;
@@ -1949,6 +1960,7 @@ async fn client_byte_offset_returns_suffix() -> anyhow::Result<()> {
     store.record(&ChannelState::new(
         channel_id(),
         client_signer.address(),
+        client_signer.address(),
         TOKEN,
         deposit,
     ))?;
@@ -2029,6 +2041,7 @@ async fn client_rejects_zero_rate_response() -> anyhow::Result<()> {
     let store = Arc::new(MemoryChannelStateStore::new());
     store.record(&ChannelState::new(
         channel_id(),
+        client_signer.address(),
         client_signer.address(),
         TOKEN,
         deposit,
@@ -2242,6 +2255,7 @@ async fn client_transient_store_failure_is_retry_later() -> anyhow::Result<()> {
     inner.record(&ChannelState::new(
         channel_id(),
         client_signer.address(),
+        client_signer.address(),
         TOKEN,
         deposit,
     ))?;
@@ -2307,7 +2321,13 @@ async fn client_expired_channel_is_rejected_with_expired() -> anyhow::Result<()>
     let store = Arc::new(MemoryChannelStateStore::new());
     // Seed a channel whose on-chain expiry is already in the past (Unix second
     // `1`), so the serve-gate refuses the first voucher.
-    let mut expired = ChannelState::new(channel_id(), client_signer.address(), TOKEN, deposit);
+    let mut expired = ChannelState::new(
+        channel_id(),
+        client_signer.address(),
+        client_signer.address(),
+        TOKEN,
+        deposit,
+    );
     expired.expires_at = 1;
     store.record(&expired)?;
     let store_dyn: Arc<dyn ChannelStateStore> = store;
@@ -2367,6 +2387,7 @@ fn seeded_store() -> anyhow::Result<(Arc<dyn ChannelStateStore>, Arc<PrivateKeyS
     let store = Arc::new(MemoryChannelStateStore::new());
     store.record(&ChannelState::new(
         channel_id(),
+        signer.address(),
         signer.address(),
         TOKEN,
         deposit,
@@ -3312,6 +3333,358 @@ async fn client_binding_for_other_owner_is_not_found() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// What [`delegate_signer_store`] hands back: the seeded store, the funder
+/// signer, and the delegate voucher signer.
+type DelegateSignerFixture = (
+    Arc<dyn ChannelStateStore>,
+    Arc<PrivateKeySigner>,
+    Arc<PrivateKeySigner>,
+);
+
+/// A channel store seeded with one channel whose FUNDER and pinned
+/// `voucher_signer` are distinct addresses — the publisher-pays delegate shape,
+/// where the funder put up the deposit and a throwaway hot key signs vouchers.
+/// Returns the store, the funder signer, and the delegate signer.
+fn delegate_signer_store() -> anyhow::Result<DelegateSignerFixture> {
+    let funder = Arc::new(PrivateKeySigner::random());
+    let delegate = Arc::new(PrivateKeySigner::random());
+    let deposit = U256::from(10_000_000u64);
+    let store = Arc::new(MemoryChannelStateStore::new());
+    store.record(&ChannelState::new(
+        channel_id(),
+        funder.address(),
+        delegate.address(),
+        TOKEN,
+        deposit,
+    ))?;
+    Ok((store, funder, delegate))
+}
+
+/// Build the `StreamRequestExt` carrying a valid client binding for `signer`
+/// over `client_node_id` — the honest requester never sends one, so the binding
+/// tests construct it by hand.
+fn binding_ext(
+    signer: &PrivateKeySigner,
+    client_node_id: B256,
+) -> anyhow::Result<StreamRequestExt> {
+    Ok(StreamRequestExt {
+        binding: Some(ClientBinding {
+            ethereum_address: signer.address().into(),
+            binding_signature: sign_binding_for(signer, client_node_id)?,
+        }),
+        ..Default::default()
+    })
+}
+
+/// The binding gate is a *signer* question: a connection bound as the channel's
+/// pinned `voucher_signer` is authorized, even though that address never funded
+/// the channel. Its vouchers are the ones the channel will accept, so it is the
+/// only identity that can pay for this delivery.
+#[tokio::test(flavor = "multi_thread")]
+async fn binding_matching_the_delegate_signer_is_authorized() -> anyhow::Result<()> {
+    let payload = b"delegate-signed channel is served".to_vec();
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+    let (store, _funder, delegate) = delegate_signer_store()?;
+    let (target, _server_eth, server_ep, server_task, _metrics) =
+        spawn_handler_server_with_metrics(cache, store, RATE_PER_MB, 0, 16).await?;
+
+    let client_sk = fresh_key();
+    let client_node_id = B256::from(*client_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+
+    let ext = binding_ext(&delegate, client_node_id)?;
+    let req = StreamRequest {
+        hash: *hash.as_bytes(),
+        namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        channel_id: channel_id().into(),
+        byte_offset: 0,
+        byte_len: 0,
+        timestamp_us: 0x00de_1e01,
+    };
+    match raw_request(&client_ep, target, &req, Some(&ext)).await? {
+        ClientMessage::StreamResponse(resp) => {
+            anyhow::ensure!(
+                resp.body.ok,
+                "the pinned voucher signer must be authorized, got {:?}",
+                resp.error
+            );
+        }
+        other => anyhow::bail!("expected a StreamResponse, got {other:?}"),
+    }
+
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
+/// The mirror of the above: a connection bound as the *funder* of a delegated
+/// channel is refused with `OwnerMismatch` (wire `NotFound`). The funder holds
+/// no voucher authority on this channel, so its vouchers would fail
+/// `WrongSigner` mid-stream after free bytes had already shipped.
+#[tokio::test(flavor = "multi_thread")]
+async fn binding_matching_only_the_funder_is_refused() -> anyhow::Result<()> {
+    let payload = b"the funder cannot spend a delegated channel".to_vec();
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+    let (store, funder, _delegate) = delegate_signer_store()?;
+    let (target, _server_eth, server_ep, server_task, metrics) =
+        spawn_handler_server_with_metrics(cache, store, RATE_PER_MB, 0, 16).await?;
+
+    let client_sk = fresh_key();
+    let client_node_id = B256::from(*client_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+
+    let ext = binding_ext(&funder, client_node_id)?;
+    let req = StreamRequest {
+        hash: *hash.as_bytes(),
+        namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        channel_id: channel_id().into(),
+        byte_offset: 0,
+        byte_len: 0,
+        timestamp_us: 0x00de_1e02,
+    };
+    match raw_request(&client_ep, target, &req, Some(&ext)).await? {
+        ClientMessage::StreamResponse(resp) => {
+            anyhow::ensure!(!resp.body.ok, "expected ok:false for the funder binding");
+            anyhow::ensure!(
+                matches!(
+                    resp.error,
+                    Some(decdn_protocol::client::StreamError::NotFound)
+                ),
+                "expected NotFound, got {:?}",
+                resp.error
+            );
+        }
+        other => anyhow::bail!("expected a StreamResponse, got {other:?}"),
+    }
+    anyhow::ensure!(
+        metric_line_present(
+            &metrics.encode()?,
+            "decdn_serve_stream_rejected_owner_mismatch_total 1"
+        ),
+        "the refusal must be the owner-mismatch arm, not some other NotFound"
+    );
+
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
+/// COMPLIANCE REGRESSION GUARD (ADR 011 §On Blacklist Event). The takedown gate
+/// keys on the channel's FUNDER, never on its voucher signer. A blacklisted
+/// funder that delegates signing to a clean throwaway key must still be refused
+/// with `OriginBlacklisted`.
+///
+/// This test fails the moment any blacklist / `content_deny` check is re-keyed
+/// onto `voucher_signer` — which is exactly the silent compliance break a
+/// blanket `state.client` → `voucher_signer` rename would cause.
+#[tokio::test(flavor = "multi_thread")]
+async fn blacklisted_funder_is_refused_even_behind_a_clean_delegate() -> anyhow::Result<()> {
+    let payload = b"a clean delegate does not launder a blacklisted funder".to_vec();
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+    let (store, funder, delegate) = delegate_signer_store()?;
+    // Only the funder is on the deny-set; the delegate signer is clean.
+    let deny = Arc::new(decdn_node::content_deny::ContentDenylist::new(
+        &content_with_origins(&[funder.address()]),
+    ));
+    let (target, _server_eth, server_ep, server_task, metrics) =
+        spawn_handler_server_with_deny(cache, store, deny).await?;
+
+    let client_sk = fresh_key();
+    let client_node_id = B256::from(*client_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+
+    let ext = binding_ext(&delegate, client_node_id)?;
+    let req = StreamRequest {
+        hash: *hash.as_bytes(),
+        namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        channel_id: channel_id().into(),
+        byte_offset: 0,
+        byte_len: 0,
+        timestamp_us: 0x00de_1e03,
+    };
+    match raw_request(&client_ep, target, &req, Some(&ext)).await? {
+        ClientMessage::StreamResponse(resp) => {
+            anyhow::ensure!(
+                !resp.body.ok,
+                "a blacklisted funder must be refused behind a clean delegate"
+            );
+            anyhow::ensure!(
+                matches!(
+                    resp.error,
+                    Some(decdn_protocol::client::StreamError::OriginBlacklisted)
+                ),
+                "expected OriginBlacklisted, got {:?}",
+                resp.error
+            );
+        }
+        other => anyhow::bail!("expected a StreamResponse, got {other:?}"),
+    }
+    anyhow::ensure!(
+        metric_line_present(
+            &metrics.encode()?,
+            "decdn_serve_stream_rejected_origin_denied_total 1"
+        ),
+        "the compliance gauge must count the delegated-channel refusal"
+    );
+
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
+/// The full delegated round trip: a channel whose `voucher_signer` is NOT the
+/// funder is served end to end on delegate-signed vouchers, and the persisted
+/// state keeps the two addresses apart.
+///
+/// Every other delegated-channel test stops at the open-time gate's verdict.
+/// This one crosses the whole seam — request admitted, delegate-signed vouchers
+/// accepted at each interval, bytes assembled and hash-verified — so a
+/// regression that accepted the open but rejected the delegate's vouchers
+/// mid-stream cannot hide.
+#[tokio::test(flavor = "multi_thread")]
+async fn delegate_signed_vouchers_carry_a_delivery_to_completion() -> anyhow::Result<()> {
+    // 1.5 MiB crosses one voucher-interval boundary plus a closing voucher, so
+    // at least two delegate-signed vouchers are verified.
+    let payload = vec![0xC3u8; 1_572_864];
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+    let (store, funder, delegate) = delegate_signer_store()?;
+    let (target, server_eth, server_ep, server_task, _metrics) =
+        spawn_handler_server_with_metrics(cache, Arc::clone(&store), RATE_PER_MB, 0, 16).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    // The requester signs with the DELEGATE — the funder's key never appears.
+    let ctx = channel_context(Arc::clone(&delegate), U256::from(10_000_000u64));
+    let got = stream_fetch(
+        &client_ep,
+        target,
+        &ctx,
+        &slash_domain(),
+        server_eth.address(),
+        *hash.as_bytes(),
+        0,
+        0x00de_1e05,
+        Duration::from_secs(30),
+    )
+    .await?;
+    anyhow::ensure!(
+        got.as_ref() == payload.as_slice(),
+        "delegate-signed delivery returned {} bytes, expected {}",
+        got.len(),
+        payload.len()
+    );
+
+    let states = store.load_all()?;
+    let state = states
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("the channel must still be persisted"))?;
+    anyhow::ensure!(
+        state.last_nonce() >= U256::from(2u64),
+        "expected at least two accepted delegate-signed vouchers, got nonce {}",
+        state.last_nonce()
+    );
+    // ADR 038: the metered quantity is bao wire bytes, not payload bytes.
+    let wire = support::bao_wire_len_whole(payload.len() as u64);
+    anyhow::ensure!(
+        state.last_bytes_delivered() == U256::from(wire),
+        "the persisted byte count must cover the whole blob: {} (expected {wire})",
+        state.last_bytes_delivered()
+    );
+    anyhow::ensure!(
+        state.client == funder.address() && state.voucher_signer == delegate.address(),
+        "funder and signer must stay distinct across a completed delivery"
+    );
+
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
+/// COMPLIANCE REGRESSION GUARD (ADR 011 §On Blacklist Event), mid-stream half.
+///
+/// The per-MB in-flight takedown re-checks in `window.rs` / `delivery.rs` are
+/// keyed on the FUNDER. Only a comment stops them being re-keyed onto
+/// `voucher_signer`, and the open-time delegated-funder test passes either way
+/// because it never reaches a voucher boundary. This one blacklists the funder
+/// AFTER delivery is under way on a channel whose signer is a clean, never-
+/// blacklisted delegate: if the re-check moved to the signer, the stream would
+/// run to completion and this test fails.
+#[tokio::test(flavor = "multi_thread")]
+async fn blacklisting_the_funder_mid_stream_cuts_off_a_delegated_delivery() -> anyhow::Result<()> {
+    // 16 intervals at the harness's 1 MB `voucher_interval_mb`, so plenty of
+    // boundaries remain after the deny-set flip.
+    let payload = vec![0x6Bu8; 16 * 1024 * 1024];
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+    let (store, funder, delegate) = delegate_signer_store()?;
+    // Starts empty — nothing is denied at open time, so the request is admitted
+    // and the cut-off can only come from the mid-stream re-check.
+    let deny = Arc::new(decdn_node::content_deny::ContentDenylist::empty());
+    let (target, server_eth, server_ep, server_task, metrics) =
+        spawn_handler_server_with_deny(cache, Arc::clone(&store), Arc::clone(&deny)).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let ctx = channel_context(Arc::clone(&delegate), U256::from(10_000_000u64));
+    let fetch_ep = client_ep.clone();
+    let server_addr = server_eth.address();
+    let hash_bytes = *hash.as_bytes();
+    let fetch = tokio::spawn(async move {
+        stream_fetch(
+            &fetch_ep,
+            target,
+            &ctx,
+            &slash_domain(),
+            server_addr,
+            hash_bytes,
+            0,
+            0x00de_1e06,
+            Duration::from_secs(30),
+        )
+        .await
+    });
+
+    // Wait for the first accepted (delegate-signed) voucher: proof the request
+    // was admitted and bytes are flowing, so the flip lands mid-stream rather
+    // than racing the open-time gate.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !store
+        .load_all()?
+        .iter()
+        .any(|state| state.last_amount() > U256::ZERO)
+    {
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "no delegate-signed voucher was ever accepted; the test never reached the \
+             mid-stream path"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    // Only the FUNDER goes on the deny-set; the delegate signer stays clean.
+    deny.apply_chain_origin(funder.address(), true);
+
+    let err = fetch.await?.err().ok_or_else(|| {
+        anyhow::anyhow!(
+            "delivery must not complete once the funder is blacklisted — the mid-stream \
+             re-check has been re-keyed onto the voucher signer"
+        )
+    })?;
+    anyhow::ensure!(
+        metric_line_present(
+            &metrics.encode()?,
+            "decdn_serve_stream_terminated_takedown_total 1"
+        ),
+        "the cut-off must be metered as an in-flight termination, not a completed \
+         delivery ({err})"
+    );
+
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
 /// Open a cache pre-seeded with TWO distinct blobs (via a shared filesystem
 /// origin, dropped after population), mirroring [`cache_with_blob`] for the
 /// concurrent-pull test that requests two different hashes at once.
@@ -3457,6 +3830,7 @@ async fn client_not_found_is_refused() -> anyhow::Result<()> {
     store.record(&ChannelState::new(
         channel_id(),
         client_signer.address(),
+        client_signer.address(),
         TOKEN,
         deposit,
     ))?;
@@ -3536,6 +3910,7 @@ async fn register_open_channel_is_idempotent_and_preserves_watermark() -> anyhow
     let advanced = ChannelState::hydrate(
         channel_id(),
         client,
+        client,
         TOKEN,
         U256::from(10_000_000u64),
         U256::from(4_321u64),
@@ -3566,6 +3941,7 @@ async fn register_open_channel_is_idempotent_and_preserves_watermark() -> anyhow
         .register_open_channel(ChannelState::new(
             channel_id(),
             client,
+            client,
             TOKEN,
             U256::from(10_000_000u64),
         ))
@@ -3593,6 +3969,7 @@ async fn update_channel_deposit_raises_and_is_idempotent() -> anyhow::Result<()>
     let client = PrivateKeySigner::random().address();
     store.record(&ChannelState::new(
         channel_id(),
+        client,
         client,
         TOKEN,
         U256::from(10_000_000u64),
@@ -3657,6 +4034,7 @@ async fn channel_metrics_follow_lifecycle_without_replay_double_count() -> anyho
     store.record(&ChannelState::new(
         channel_id(),
         client,
+        client,
         TOKEN,
         U256::from(10_000_000u64),
     ))?;
@@ -3695,6 +4073,7 @@ async fn channel_metrics_follow_lifecycle_without_replay_double_count() -> anyho
         .register_open_channel(ChannelState::new(
             channel_id(),
             client,
+            client,
             TOKEN,
             U256::from(1u64),
         ))
@@ -3705,6 +4084,7 @@ async fn channel_metrics_follow_lifecycle_without_replay_double_count() -> anyho
     handler
         .register_open_channel(ChannelState::new(
             second,
+            client,
             client,
             TOKEN,
             U256::from(7_000_000u64),
@@ -3875,6 +4255,217 @@ async fn pull_through_gate_authorizes_only_channel_owner() -> anyhow::Result<()>
     );
     c3.close().await;
 
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
+/// The pull-through gate is the same *signer* question as the binding gate: on
+/// a channel with a delegated voucher signer, only the delegate can make this
+/// node front upstream USDC. The funder — which cannot produce an acceptable
+/// voucher — must not.
+#[tokio::test(flavor = "multi_thread")]
+async fn pull_through_authorizes_the_delegate_not_the_funder() -> anyhow::Result<()> {
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let cache_tmp = tempfile::tempdir()?;
+    let cache = CacheEngine::open(
+        cache_tmp.path(),
+        vec![Arc::new(CountingOrigin {
+            hits: Arc::clone(&hits),
+        }) as Arc<dyn decdn_cache::Origin>],
+        16,
+    )
+    .await?;
+
+    let (store, funder, delegate) = delegate_signer_store()?;
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = Arc::new(PrivateKeySigner::random());
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let handler = build_handler_full_configured(
+        server_id,
+        &server_eth,
+        &metrics,
+        limiter,
+        cache,
+        store,
+        RATE_PER_MB,
+        &loopback_domains(),
+        0,
+        16,
+        |deps| deps.pull_through = Some(std::time::Duration::from_secs(10)),
+    )?;
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+    let req = StreamRequest {
+        hash: [0xEDu8; 32], // never cached — a miss that would trigger the pull
+        namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        channel_id: channel_id().into(),
+        byte_offset: 0,
+        byte_len: 0,
+        timestamp_us: 0x00de_1e04,
+    };
+
+    // 1) Bound as the FUNDER: it holds no voucher authority here, so it must not
+    //    make this node spend upstream.
+    let funder_sk = fresh_key();
+    let funder_node_id = B256::from(*funder_sk.public().as_bytes());
+    let (c1, _) = local_endpoint(funder_sk, vec![]).await?;
+    let ext_funder = binding_ext(&funder, funder_node_id)?;
+    let _ = raw_request(&c1, target.clone(), &req, Some(&ext_funder)).await?;
+    anyhow::ensure!(
+        hits.load(std::sync::atomic::Ordering::SeqCst) == 0,
+        "the funder of a delegated channel must NOT trigger a paid pull"
+    );
+    c1.close().await;
+
+    // 2) Bound as the pinned DELEGATE signer: authorized → the pull is attempted.
+    let delegate_sk = fresh_key();
+    let delegate_node_id = B256::from(*delegate_sk.public().as_bytes());
+    let (c2, _) = local_endpoint(delegate_sk, vec![]).await?;
+    let ext_delegate = binding_ext(&delegate, delegate_node_id)?;
+    let _ = raw_request(&c2, target.clone(), &req, Some(&ext_delegate)).await?;
+    anyhow::ensure!(
+        hits.load(std::sync::atomic::Ordering::SeqCst) == 1,
+        "the pinned voucher signer MUST trigger the pull exactly once, got {}",
+        hits.load(std::sync::atomic::Ordering::SeqCst)
+    );
+    c2.close().await;
+
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
+/// Build a pull-through-armed handler over a `CountingOrigin` with an ADR 011
+/// origin deny-set wired in, and return the dialable target plus the hit
+/// counter. Shared by the two blacklist-subject tests below, which differ only
+/// in which address is on the deny-set.
+async fn spawn_counting_pull_server_with_deny(
+    store: Arc<dyn ChannelStateStore>,
+    denied: &[alloy::primitives::Address],
+) -> anyhow::Result<(
+    EndpointAddr,
+    Arc<std::sync::atomic::AtomicUsize>,
+    Endpoint,
+    tokio::task::JoinHandle<()>,
+    tempfile::TempDir,
+)> {
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let cache_tmp = tempfile::tempdir()?;
+    let cache = CacheEngine::open(
+        cache_tmp.path(),
+        vec![Arc::new(CountingOrigin {
+            hits: Arc::clone(&hits),
+        }) as Arc<dyn decdn_cache::Origin>],
+        16,
+    )
+    .await?;
+    let deny = Arc::new(decdn_node::content_deny::ContentDenylist::new(
+        &content_with_origins(denied),
+    ));
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = Arc::new(PrivateKeySigner::random());
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let handler = build_handler_full_configured(
+        server_id,
+        &server_eth,
+        &metrics,
+        limiter,
+        cache,
+        store,
+        RATE_PER_MB,
+        &loopback_domains(),
+        0,
+        16,
+        |deps| {
+            deps.pull_through = Some(std::time::Duration::from_secs(10));
+            deps.content_deny = deny;
+        },
+    )?;
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+    Ok((target, hits, server_ep, server_task, cache_tmp))
+}
+
+/// ADR 011 keys compliance on the FUNDER, so a blacklisted funder must not make
+/// this node front upstream USDC even when a perfectly clean delegate key is
+/// doing the signing. The delegate's binding satisfies the *spend-authority*
+/// half of `pull_authorized`; the funder check is the only thing standing
+/// between a sanctioned address and this operator's egress bill.
+#[tokio::test(flavor = "multi_thread")]
+async fn pull_through_refuses_a_blacklisted_funder_behind_a_clean_delegate() -> anyhow::Result<()> {
+    let (store, funder, delegate) = delegate_signer_store()?;
+    let (target, hits, server_ep, server_task, _cache_tmp) =
+        spawn_counting_pull_server_with_deny(store, &[funder.address()]).await?;
+
+    let delegate_sk = fresh_key();
+    let delegate_node_id = B256::from(*delegate_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(delegate_sk, vec![]).await?;
+    let ext = binding_ext(&delegate, delegate_node_id)?;
+    let req = StreamRequest {
+        hash: [0xB1u8; 32], // never cached — a miss that would trigger the pull
+        namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        channel_id: channel_id().into(),
+        byte_offset: 0,
+        byte_len: 0,
+        timestamp_us: 0x00b1_ac11,
+    };
+    let _ = raw_request(&client_ep, target, &req, Some(&ext)).await?;
+    anyhow::ensure!(
+        hits.load(std::sync::atomic::Ordering::SeqCst) == 0,
+        "a blacklisted funder must NOT trigger a paid pull, clean delegate or not"
+    );
+
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
+/// The mirror image, and the deliberate behaviour change: a CLEAN funder whose
+/// pinned `voucher_signer` happens to be on the deny-set IS authorized to pull.
+/// A takedown sanctions the money, not whichever throwaway key signs the
+/// vouchers, so the signer's deny-set membership is not a compliance event here.
+///
+/// This test fails the moment anyone re-adds an `is_origin_denied` check on the
+/// bound (signer) address — the pre-split check that silently became a signer
+/// check when the funder/signer roles were split. It also pins the agreement
+/// with `dispatch.rs`, whose serve gate is funder-only: without this, the two
+/// paths could drift apart unnoticed, since with `voucher_signer == client` on
+/// every channel that exists today no other test can tell them apart.
+#[tokio::test(flavor = "multi_thread")]
+async fn pull_through_allows_a_clean_funder_with_a_blacklisted_delegate() -> anyhow::Result<()> {
+    let (store, _funder, delegate) = delegate_signer_store()?;
+    let (target, hits, server_ep, server_task, _cache_tmp) =
+        spawn_counting_pull_server_with_deny(store, &[delegate.address()]).await?;
+
+    let delegate_sk = fresh_key();
+    let delegate_node_id = B256::from(*delegate_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(delegate_sk, vec![]).await?;
+    let ext = binding_ext(&delegate, delegate_node_id)?;
+    let req = StreamRequest {
+        hash: [0xB2u8; 32], // never cached — a miss that would trigger the pull
+        namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        channel_id: channel_id().into(),
+        byte_offset: 0,
+        byte_len: 0,
+        timestamp_us: 0x00b2_ac11,
+    };
+    let _ = raw_request(&client_ep, target, &req, Some(&ext)).await?;
+    anyhow::ensure!(
+        hits.load(std::sync::atomic::Ordering::SeqCst) == 1,
+        "a clean funder's delegated request MUST trigger the pull exactly once, got {}",
+        hits.load(std::sync::atomic::Ordering::SeqCst)
+    );
+
+    client_ep.close().await;
     server_ep.close().await;
     server_task.await?;
     Ok(())
@@ -4081,6 +4672,7 @@ async fn cooperative_close_signs_waiver_persists_flag_and_stops_serving() -> any
     let store_inner = Arc::new(MemoryChannelStateStore::new());
     store_inner.record(&ChannelState::hydrate(
         channel_id(),
+        signer.address(),
         signer.address(),
         TOKEN,
         deposit,

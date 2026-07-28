@@ -17,7 +17,11 @@ import { OriginAssignment } from "../src/OriginAssignment.sol";
 ///        test, forcing a deliberate ABI change + audit re-review.
 contract InterfaceFreezeTest is Test {
     function test_paymentChannel_abiFrozen() public pure {
-        assertEq(PaymentChannel.openChannel.selector, bytes4(keccak256("openChannel(address,uint256)")), "openChannel");
+        assertEq(
+            PaymentChannel.openChannel.selector,
+            bytes4(keccak256("openChannel(address,uint256,address)")),
+            "openChannel"
+        );
         assertEq(PaymentChannel.topUp.selector, bytes4(keccak256("topUp(bytes32,uint256)")), "topUp");
         assertEq(
             PaymentChannel.withdraw.selector,
@@ -28,6 +32,11 @@ contract InterfaceFreezeTest is Test {
             PaymentChannel.closeChannel.selector,
             bytes4(keccak256("closeChannel(bytes32,uint256,uint256,uint256,bytes)")),
             "closeChannel"
+        );
+        assertEq(
+            PaymentChannel.closeChannelWithoutVoucher.selector,
+            bytes4(keccak256("closeChannelWithoutVoucher(bytes32)")),
+            "closeChannelWithoutVoucher"
         );
         assertEq(
             PaymentChannel.disputeChannel.selector,

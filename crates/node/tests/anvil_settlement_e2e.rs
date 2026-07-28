@@ -318,7 +318,11 @@ alloy::sol! {
 
     #[sol(rpc)]
     contract PaymentChannelOpen {
-        function openChannel(address provider, uint256 deposit) external returns (bytes32 channelId);
+        // `voucherSigner` pins the voucher-signing address; the contract
+        // resolves the zero address to `msg.sender` (self-signing).
+        function openChannel(address provider, uint256 deposit, address voucherSigner)
+            external
+            returns (bytes32 channelId);
     }
 
     #[sol(rpc)]
@@ -618,7 +622,8 @@ async fn run_e2e() -> anyhow::Result<()> {
     // ============================================================
     let deposit = U256::from(DEPOSIT_MICRO_USDC);
     pc_client
-        .openChannel(node_addr, deposit)
+        // self-signing: the contract resolves zero to msg.sender
+        .openChannel(node_addr, deposit, Address::ZERO)
         .send()
         .await?
         .get_receipt()
@@ -723,7 +728,7 @@ async fn run_e2e() -> anyhow::Result<()> {
     // CHANNEL 2 — below-threshold claim, shutdown close, then settle.
     // ============================================================
     pc_client
-        .openChannel(node_addr, deposit)
+        .openChannel(node_addr, deposit, Address::ZERO)
         .send()
         .await?
         .get_receipt()
@@ -779,7 +784,7 @@ async fn run_e2e() -> anyhow::Result<()> {
     );
 
     // Close the un-redeemed channel 2 directly on-chain (node = provider party,
-    // zero-voucher — `claimedNonce == 0` since it stayed below the redeem
+    // no voucher — `claimedNonce == 0` since it stayed below the redeem
     // threshold) to open the dispute window while the settlement watcher stays
     // ALIVE, so GAP 2 below can observe the live `ChannelSettled`. The
     // service-driven shutdown-close path is exercised after GAP 2 (it now
@@ -787,7 +792,7 @@ async fn run_e2e() -> anyhow::Result<()> {
     // watcher). `withdraw` on channel 1 above already proved a persisted voucher
     // is accepted on-chain.
     pc_read
-        .closeChannel(id2, U256::ZERO, U256::ZERO, U256::ZERO, Bytes::new())
+        .closeChannelWithoutVoucher(id2)
         .send()
         .await?
         .get_receipt()
@@ -805,7 +810,7 @@ async fn run_e2e() -> anyhow::Result<()> {
     .await;
     anyhow::ensure!(
         closing.is_some(),
-        "closeChannel did not move channel 2 to Closing"
+        "closeChannelWithoutVoucher did not move channel 2 to Closing"
     );
 
     // Advance past the dispute window and settle (callable by anyone).
@@ -1099,7 +1104,7 @@ async fn run_e2e() -> anyhow::Result<()> {
     let auto_nonce = pc_read.clientChannelNonce(client_addr).call().await?;
     let id3 = derive_channel_id(client_addr, node_addr, auto_nonce.to::<u64>());
     pc_client
-        .openChannel(node_addr, deposit)
+        .openChannel(node_addr, deposit, Address::ZERO)
         .send()
         .await?
         .get_receipt()
@@ -1276,7 +1281,7 @@ async fn run_e2e() -> anyhow::Result<()> {
     let down_nonce = pc_read.clientChannelNonce(client_addr).call().await?;
     let down_id = derive_channel_id(client_addr, node_addr, down_nonce.to::<u64>());
     pc_client
-        .openChannel(node_addr, U256::from(DEPOSIT_MICRO_USDC))
+        .openChannel(node_addr, U256::from(DEPOSIT_MICRO_USDC), Address::ZERO)
         .send()
         .await?
         .get_receipt()
@@ -1358,17 +1363,17 @@ async fn run_e2e() -> anyhow::Result<()> {
     let close_nonce = pc_read.clientChannelNonce(client_addr).call().await?;
     let close_id = derive_channel_id(client_addr, node_addr, close_nonce.to::<u64>());
     pc_client
-        .openChannel(node_addr, U256::from(DEPOSIT_MICRO_USDC))
+        .openChannel(node_addr, U256::from(DEPOSIT_MICRO_USDC), Address::ZERO)
         .send()
         .await?
         .get_receipt()
         .await?;
-    // Close it directly via the contract (zero-voucher path: the channel was
-    // never drawn, so `claimedNonce == 0`). Sent from the node wallet (`pc_read`
+    // Close it directly via the contract (no voucher: the channel was never
+    // drawn, so `claimedNonce == 0`). Sent from the node wallet (`pc_read`
     // is node-provider-filled), matching the node's own crashed close: the
     // channel is `Closing` on-chain but no service recorded a pending entry.
     pc_read
-        .closeChannel(close_id, U256::ZERO, U256::ZERO, U256::ZERO, Bytes::new())
+        .closeChannelWithoutVoucher(close_id)
         .send()
         .await?
         .get_receipt()
@@ -1376,7 +1381,7 @@ async fn run_e2e() -> anyhow::Result<()> {
     let closed_ch = pc_read.getChannel(close_id).call().await?;
     anyhow::ensure!(
         matches!(closed_ch.status, PaymentChannel::Status::Closing),
-        "direct closeChannel did not move the reconciliation channel to Closing"
+        "direct closeChannelWithoutVoucher did not move the reconciliation channel to Closing"
     );
     // No service was watching, so the obligation is absent before re-bootstrap —
     // the very gap #839 recovers.
@@ -1479,7 +1484,7 @@ async fn run_e2e() -> anyhow::Result<()> {
     let live_nonce = pc_read.clientChannelNonce(client_addr).call().await?;
     let live_id = derive_channel_id(client_addr, node_addr, live_nonce.to::<u64>());
     pc_client
-        .openChannel(node_addr, U256::from(DEPOSIT_MICRO_USDC))
+        .openChannel(node_addr, U256::from(DEPOSIT_MICRO_USDC), Address::ZERO)
         .send()
         .await?
         .get_receipt()
@@ -1495,9 +1500,9 @@ async fn run_e2e() -> anyhow::Result<()> {
         .is_some(),
         "watcher did not register the live-arm channel open"
     );
-    // Client-initiated zero-voucher close (never drawn → claimedNonce == 0).
+    // Client-initiated voucher-less close (never drawn → claimedNonce == 0).
     pc_client_full
-        .closeChannel(live_id, U256::ZERO, U256::ZERO, U256::ZERO, Bytes::new())
+        .closeChannelWithoutVoucher(live_id)
         .send()
         .await?
         .get_receipt()
@@ -1694,7 +1699,7 @@ async fn run_e2e() -> anyhow::Result<()> {
     // re-hydrate it so the reclaim sweep can recover the deposit.
     let pc_buyer = PaymentChannelOpen::new(payment_channel, buyer_provider.clone());
     pc_buyer
-        .openChannel(node_addr, U256::from(DEPOSIT_MICRO_USDC))
+        .openChannel(node_addr, U256::from(DEPOSIT_MICRO_USDC), Address::ZERO)
         .send()
         .await?
         .get_receipt()
@@ -1750,7 +1755,7 @@ async fn run_e2e() -> anyhow::Result<()> {
     let pconcrete = Arc::new(PersistentChannelStateStore::open(pstore_dir.path())?);
     // A real on-chain channel whose local row got corrupted by a downgrade.
     pc_buyer
-        .openChannel(node_addr, U256::from(DEPOSIT_MICRO_USDC))
+        .openChannel(node_addr, U256::from(DEPOSIT_MICRO_USDC), Address::ZERO)
         .send()
         .await?
         .get_receipt()
@@ -1827,7 +1832,7 @@ async fn run_e2e() -> anyhow::Result<()> {
     // expired (every prior scenario warped chain time past the max lifetime).
     let pc_buyer_full = PaymentChannel::new(payment_channel, buyer_provider.clone());
     let open_receipt = pc_buyer
-        .openChannel(node_addr, U256::from(DEPOSIT_MICRO_USDC))
+        .openChannel(node_addr, U256::from(DEPOSIT_MICRO_USDC), Address::ZERO)
         .send()
         .await?
         .get_receipt()
@@ -1861,7 +1866,7 @@ async fn run_e2e() -> anyhow::Result<()> {
     // tight bound turns the regression into a fast, named failure.
     let followup = tokio::time::timeout(Duration::from_secs(20), async {
         let receipt = pc_buyer
-            .openChannel(node_addr, U256::from(DEPOSIT_MICRO_USDC))
+            .openChannel(node_addr, U256::from(DEPOSIT_MICRO_USDC), Address::ZERO)
             .send()
             .await?
             .get_receipt()

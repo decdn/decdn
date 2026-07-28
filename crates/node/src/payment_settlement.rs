@@ -769,6 +769,38 @@ fn can_skip_redeem_rpc(
     can_skip
 }
 
+/// Build the [`ChannelState`] a `ChannelOpened` event registers, or `None` when
+/// the event's provider is not this node. The pure half of
+/// [`apply_channel_opened`], split out so the field mapping — in particular the
+/// funder/signer pair, which are both `Address` and so transpose silently — is
+/// unit-testable without a handler or a store.
+fn opened_channel_state(
+    self_address: Address,
+    usdc_token: Address,
+    event: &PaymentChannel::ChannelOpened,
+) -> Option<ChannelState> {
+    // Only channels where this node is the provider concern us.
+    if event.provider != self_address {
+        return None;
+    }
+    // `voucherSigner` is already resolved on-chain — `openChannel` substitutes
+    // `msg.sender` for a zero argument — so the event never carries the zero
+    // address and no client-side defaulting is needed here.
+    let mut state = ChannelState::new(
+        event.channelId,
+        event.client,
+        event.voucherSigner,
+        usdc_token,
+        event.deposit,
+    );
+    // Track on-chain expiry so the sweep can close (and the handler can stop
+    // serving) before `reclaimExpired` opens. A value past u64 is clamped to
+    // "never" — safe, since the only effect of a too-far expiry is we never
+    // force-close.
+    state.expires_at = u64::try_from(event.expiresAt).unwrap_or(u64::MAX);
+    Some(state)
+}
+
 /// Register a `ChannelOpened` event whose provider is this node so the voucher
 /// path accepts vouchers for it. Shared by the live watcher arm and the
 /// bring-up backfill (#762); `register_open_channel` is idempotent, so applying
@@ -787,16 +819,9 @@ async fn apply_channel_opened(
     event: &PaymentChannel::ChannelOpened,
     from_backfill: bool,
 ) -> Result<()> {
-    // Only channels where this node is the provider concern us.
-    if event.provider != self_address {
+    let Some(state) = opened_channel_state(self_address, usdc_token, event) else {
         return Ok(());
-    }
-    let mut state = ChannelState::new(event.channelId, event.client, usdc_token, event.deposit);
-    // Track on-chain expiry so the sweep can close (and the handler can stop
-    // serving) before `reclaimExpired` opens. A value past u64 is clamped to
-    // "never" — safe, since the only effect of a too-far expiry is we never
-    // force-close.
-    state.expires_at = u64::try_from(event.expiresAt).unwrap_or(u64::MAX);
+    };
     handler
         .register_open_channel(state)
         .await
@@ -2050,6 +2075,86 @@ fn restamp_pending_logged(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `ChannelOpened` event with distinct, recognisable addresses in every
+    /// slot, so a transposition of any pair is visible in the assertion.
+    fn channel_opened(
+        client: Address,
+        provider: Address,
+        voucher_signer: Address,
+    ) -> PaymentChannel::ChannelOpened {
+        PaymentChannel::ChannelOpened {
+            channelId: alloy::primitives::B256::repeat_byte(0x77),
+            client,
+            provider,
+            deposit: U256::from(5_000_000u64),
+            expiresAt: U256::from(1_900_000_000u64),
+            voucherSigner: voucher_signer,
+        }
+    }
+
+    /// A channel opened with a delegated signer must hydrate with the delegate
+    /// as `voucher_signer` (the voucher-recovery target) and the funder as
+    /// `client` (the refund destination and ADR-011 compliance subject).
+    #[test]
+    #[allow(clippy::expect_used, reason = "test asserts the Some arm")]
+    fn channel_opened_hydrates_the_pinned_voucher_signer() {
+        let funder = Address::repeat_byte(0x11);
+        let provider = Address::repeat_byte(0x22);
+        let delegate = Address::repeat_byte(0x33);
+        let usdc = Address::repeat_byte(0x44);
+
+        let state =
+            opened_channel_state(provider, usdc, &channel_opened(funder, provider, delegate))
+                .expect("this node is the provider");
+
+        assert_eq!(state.client, funder, "funder must stay the on-chain client");
+        assert_eq!(
+            state.voucher_signer, delegate,
+            "the pinned delegate must be the voucher-recovery target"
+        );
+        assert_eq!(state.token, usdc);
+        assert_eq!(state.deposit, U256::from(5_000_000u64));
+        assert_eq!(state.expires_at, 1_900_000_000);
+    }
+
+    /// The self-signing case: `openChannel` resolves a zero `voucherSigner` to
+    /// `msg.sender` on-chain, so the event carries the funder and both fields
+    /// land on the same address.
+    #[test]
+    #[allow(clippy::expect_used, reason = "test asserts the Some arm")]
+    fn channel_opened_without_a_delegate_signs_for_itself() {
+        let funder = Address::repeat_byte(0x11);
+        let provider = Address::repeat_byte(0x22);
+
+        let state = opened_channel_state(
+            provider,
+            Address::repeat_byte(0x44),
+            &channel_opened(funder, provider, funder),
+        )
+        .expect("this node is the provider");
+
+        assert_eq!(state.client, funder);
+        assert_eq!(state.voucher_signer, funder);
+    }
+
+    /// A channel opened against some other provider is not ours to register.
+    #[test]
+    fn channel_opened_for_another_provider_is_ignored() {
+        let state = opened_channel_state(
+            Address::repeat_byte(0x99),
+            Address::repeat_byte(0x44),
+            &channel_opened(
+                Address::repeat_byte(0x11),
+                Address::repeat_byte(0x22),
+                Address::repeat_byte(0x33),
+            ),
+        );
+        assert!(
+            state.is_none(),
+            "another provider's channel must be skipped"
+        );
+    }
 
     /// A 65-byte signature (`[u8; 65]` so a const index stays provably
     /// in-bounds for the anti-panic lints) with the recovery byte set to `v`.

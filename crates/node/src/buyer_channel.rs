@@ -1925,10 +1925,12 @@ async fn close_unilateral<P: Provider + Clone>(
     metrics: &Arc<Metrics>,
     st: &BuyerChannelState,
 ) -> bool {
-    // Sign our own voucher over the persisted watermark — the client sig the
-    // contract checks against `channel.client` (this node). Honest by
-    // construction: we close at the highest amount we already authorized, and
-    // the dispute window protects the absent provider against a stale nonce.
+    // Sign our own voucher over the persisted watermark — the contract recovers
+    // the signature against the channel's pinned `voucherSigner`, never
+    // `channel.client`. The node opens self-signed channels, so its own key is
+    // that signer. Honest by construction: we close at the highest amount we
+    // already authorized, and the dispute window protects the absent provider
+    // against a stale nonce.
     let voucher = match (Voucher {
         channel_id: st.channel_id,
         amount: st.last_amount,

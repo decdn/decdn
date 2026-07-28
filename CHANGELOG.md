@@ -23,6 +23,39 @@ since project inception and will roll into the first tagged release.
 
 ### Changed (BREAKING)
 
+- **Payment-channel funder and voucher signer are now separate roles.**
+  `openChannel` takes a third argument pinning the channel's `voucherSigner` —
+  the address every voucher signature is verified against, on all four
+  settlement paths (`closeChannel`, `disputeChannel`, `withdraw`,
+  `cooperativeClose`). It is fixed at open and has no setter. Passing the zero
+  address resolves it to `msg.sender`, so a funder that signs its own vouchers
+  keeps today's behaviour. `ch.client` keeps the funder role — it deposits and
+  tops up, receives the refund, owns the `channelId` nonce, and is the address
+  the ADR 011 compliance gates check — but its signature no longer authorizes
+  anything on its own.
+  - **ABI:** `openChannel(address,uint256)` →
+    `openChannel(address,uint256,address)`, so the **selector changes** and an
+    integrator built against the old ABI reverts on every open. `ChannelOpened`
+    gains a sixth parameter (`voucherSigner`), so **topic0 changes** — a log
+    subscriber still filtering the old event hash sees zero events and silently
+    registers no channels, which fails quietly rather than loudly. `getChannel`
+    returns a `Channel` tuple with `voucherSigner` inserted at index 3, so an
+    old-ABI consumer mis-decodes `provider`, `expiresAt`, `token`,
+    `disputeDeadline` and every field after them. All three must be upgraded in
+    lockstep with the deployment.
+  - **On-disk (runtime):** the node's seller channel-state record in
+    `<data_dir>/channels.redb` (`channel_state_v1`) goes to `schema_version` 3,
+    which appends the channel's pinned `voucher_signer` as a trailing segment.
+    The version — not the trailer's byte width — is what tells the decoder the
+    segment is there, so unknown trailing bytes on an older record can never be
+    misread as a signer address and silently move the voucher
+    signature-recovery target. Upgrade is transparent: a v1/v2 record hydrates
+    `voucher_signer` from the stored `client`, correct by construction because
+    those channels predate the funder/signer split and are self-signing.
+    **Rollback is not supported** — an older binary reading a v3 record raises
+    `UnsupportedSchema`, and the seller table is fail-closed, so node startup
+    aborts. Downgrading means restoring `channels.redb` from a pre-upgrade
+    backup.
 - **Blacklist-entry appeals removed (#1432).** `ContentBlacklist` no longer
   carries a second appeal state machine on top of enforcement. The six appeal
   entry points (`openBlacklistAppeal`, `fastTrackBlacklistAppeal`,
@@ -299,6 +332,17 @@ since project inception and will roll into the first tagged release.
 
 ### Changed
 
+#### Contracts
+
+- **`closeChannel`'s voucher-less path now works at any watermark.** Calling it
+  with `amount == 0`, `nonce == 0`, `bytesDelivered == 0` and an empty signature
+  skips voucher verification and closes at the recorded `claimed*`; the extra
+  `claimedNonce == 0` condition that restricted it to channels no `withdraw` had
+  ever touched is gone. The safety argument is unchanged — the path advances no
+  watermark — and the old condition only forced a party with no newer voucher to
+  wait for `expiresAt`. Observable change for anyone who built around the old
+  revert: the call now succeeds where it used to fail.
+
 #### Documentation
 
 - **Safe-as-recommended-wallet and the node-side off-chain ERC-1271 path are
@@ -399,6 +443,16 @@ since project inception and will roll into the first tagged release.
 
 #### CLI
 
+- **`decdn node channels` gained a `SIGNER` column.** It reports the channel's
+  pinned `voucherSigner` — the key whose signature is required on every voucher —
+  next to `COUNTERPARTY` (the funder, and the address the ADR 011 compliance
+  gates check). For every channel opened today the two are equal, because a zero
+  `voucherSigner` argument to `openChannel` resolves on-chain to `msg.sender`;
+  they diverge only when a funder pins a delegate. **Output-breaking for scripts:**
+  the table is ~15 characters wider and column positions after `COUNTERPARTY`
+  have shifted, so positional parsers (`awk '{print $N}'`, fixed-offset `cut`)
+  need updating.
+
 - **The CLI now rejects the zero address for the four addresses resolved by
   `resolve` / `resolve_appeal` / `resolve_publish`, not just the appeal address
   (#1153).** Those four (`capacity_bond_address`, `slash_appeal_address`,
@@ -435,6 +489,15 @@ since project inception and will roll into the first tagged release.
   ownership only; no steady-state behavior change.
 
 ### Added
+
+#### Contracts
+
+- `PaymentChannel.closeChannelWithoutVoucher(bytes32)` — a named entry point for
+  the voucher-less close, callable by either party. It takes the same path as
+  `closeChannel` with all-zero arguments and an empty signature: no signature
+  check, no watermark advance, the channel enters `Closing` at its recorded
+  `claimed*` and emits the same `ChannelCloseInitiated`. Purely additive; the
+  all-zero `closeChannel` spelling still works.
 
 #### Node runtime & wire protocol
 
