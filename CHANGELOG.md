@@ -332,6 +332,20 @@ since project inception and will roll into the first tagged release.
 
 ### Changed
 
+#### Cache / node
+
+- **Blob delivery no longer materialises the whole blob in memory.** The serve
+  path drives a streaming bao export instead of building the entire aligned wire
+  form up front, and the origin pull-through no longer reads a freshly-committed
+  blob back out of the store to hand to `populate`, which discarded it. Serving a
+  708 MB blob previously cost ~708 MB resident per concurrent serve, and again on
+  the cache-miss leg; both are now bounded by one chunk group.
+  - Observable change: the truncated-export refusal (the store's item channel
+    closing without a terminal `Done`) can only be detected after the last item,
+    so it now aborts the delivery **mid-stream** rather than failing before the
+    first byte. The billing invariant is unchanged — the client sees a short
+    delivery and never pays the closing voucher.
+
 #### Contracts
 
 - **`closeChannel`'s voucher-less path now works at any watermark.** Calling it
@@ -443,6 +457,23 @@ since project inception and will roll into the first tagged release.
 
 #### CLI
 
+- **`decdn fetch` streams to disk and resumes an interrupted download.** Verified
+  bao chunk groups are written to `<output>.partial` as they land and the file is
+  renamed into place at the end, instead of the whole blob being buffered in RAM
+  (twice — wire form then decoded form) and written once. Peak memory is now
+  independent of blob size. If a fetch is interrupted, re-running it picks the
+  partial up, asks the node for the un-fetched tail only, and **re-pays only for
+  that tail**; previously it restarted from byte 0.
+  - Observable change: a failed fetch now leaves a `<output>.partial` file behind
+    on purpose — that is what the next run resumes from. It is removed on
+    success and on a failed integrity check.
+  - Bytes inherited from a previous run's partial cannot be verified in isolation
+    (bao verifies a chunk group through the parent hashes covering the rest of
+    the tree, which a client holding only a prefix does not have), so a **resumed**
+    fetch re-hashes the assembled file against the content hash before promoting
+    it. On mismatch the partial is discarded and the fetch fails rather than
+    writing a wrong output file. A fetch that started at byte 0 skips this — every
+    byte was verified on the wire.
 - **`decdn node channels` gained a `SIGNER` column.** It reports the channel's
   pinned `voucherSigner` — the key whose signature is required on every voucher —
   next to `COUNTERPARTY` (the funder, and the address the ADR 011 compliance

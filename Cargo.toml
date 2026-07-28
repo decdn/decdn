@@ -51,6 +51,13 @@ iroh-metrics = "1"
 # pin is deliberate. `positioned-io` is bao-tree's `ReadAt` data-source trait.
 bao-tree = "0.16"
 positioned-io = "0.3"
+# `AsyncStreamReader` — the reader trait `bao-tree`'s INCREMENTAL decoder
+# (`io::fsm::ResponseDecoder`, behind its `tokio_fsm` feature) drives. Needed
+# by name to implement the trait over a live paid pull, and bao-tree re-exports
+# only `AsyncSliceReader`/`AsyncSliceWriter`, not this one. Pinned to what
+# bao-tree 0.16 carries. Unrelated to `iroh-blobs` — depending on it does not
+# regress the CLI's iroh-blobs-free invariant (#578).
+iroh-io = { version = "0.6", default-features = false }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

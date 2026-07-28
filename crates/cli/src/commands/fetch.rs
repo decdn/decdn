@@ -35,8 +35,9 @@ use decdn_client_pull::buyer_channel::{
     LOW_WATER_DIVISOR, ensure_allowance, open_channel, refill_amount, top_up,
 };
 use decdn_client_pull::{
-    ChannelContext, ProgressCallback, PullDeadlines, UpstreamRefused, VoucherProgress,
-    sign_client_binding, stream_fetch_tracked_with_progress,
+    ChannelContext, ChannelLedger, Cumulative, ProgressCallback, PullDeadlines, UpstreamRefused,
+    VoucherProgress, open_progressive_pull, sign_client_binding,
+    stream_fetch_tracked_with_progress,
 };
 use decdn_common::cli::{self, common::expand_tilde};
 use decdn_common::config::{DEFAULT_CHAIN_ID, FileConfig, load_file_config};
@@ -759,6 +760,244 @@ fn annotate_unbound_cache_miss(err: anyhow::Error, ctx: &ChannelContext) -> anyh
     }
 }
 
+/// The scratch file a streaming fetch writes into before it is promoted to
+/// `--output`. Living beside the destination (not in `/tmp`) is what makes the
+/// final step an atomic same-filesystem rename, and what lets a later invocation
+/// find the partial and resume it.
+fn partial_path(output: &Path) -> PathBuf {
+    let mut name = output.as_os_str().to_os_string();
+    name.push(".partial");
+    PathBuf::from(name)
+}
+
+/// Outcome of a streaming fetch into the partial file.
+struct StreamedFetch {
+    /// Whole-blob size the node signed for.
+    total_bytes: u64,
+    /// Byte offset this attempt started from — non-zero when a prior partial was
+    /// resumed. Drives the whole-file re-hash, which is only needed when some of
+    /// the output came off disk rather than off the verified wire.
+    resumed_from: u64,
+}
+
+/// Fetch `hash` into `<output>.partial`, writing each bao chunk group the moment
+/// it verifies and resuming an interrupted prior attempt (#1120, #1122).
+///
+/// This is the streaming counterpart of [`fetch_blob`]. Where that buffers the
+/// whole blob in RAM (twice — the wire form and then the decoded form) and writes
+/// once at the end, this holds one chunk group and appends as it goes, so peak
+/// memory is independent of blob size and an interruption leaves a resumable
+/// prefix on disk instead of nothing.
+///
+/// Resume re-runs discovery in the caller, not here: content is content-addressed,
+/// so whichever node this call is pointed at can serve the tail.
+#[allow(clippy::too_many_arguments)]
+async fn fetch_blob_streaming(
+    endpoint: &Endpoint,
+    target: EndpointAddr,
+    ctx: &ChannelContext,
+    slash_dom: &Eip712Domain,
+    provider: Address,
+    store: &RedbBuyerChannelStore,
+    hash: [u8; 32],
+    namespace_id: [u8; 32],
+    deadlines: PullDeadlines,
+    max_blob_bytes: u64,
+    max_rate_per_mb: u64,
+    partial: &Path,
+    on_progress: Option<&ProgressCallback>,
+) -> anyhow::Result<StreamedFetch> {
+    use std::io::{BufWriter, Seek, SeekFrom};
+
+    // What a previous attempt left behind, snapped down to a chunk-group
+    // boundary: the server anchors its proof to whole groups, so anything past
+    // the last boundary has to be re-fetched anyway.
+    let have = std::fs::metadata(partial).map_or(0, |m| m.len());
+    let byte_offset = decdn_client_pull::sink::resume_offset(have);
+
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .read(true)
+        .truncate(false)
+        .open(partial)
+        .map_err(|e| anyhow::anyhow!("open {}: {e}", partial.display()))?;
+    // The truncate-and-seek to `byte_offset` happens at the top of the attempt
+    // loop below, which covers the first pass too — the file's length always
+    // equals the verified prefix length when a pull starts.
+
+    // One ledger for this channel, seeded from its persisted cumulative state so
+    // the first voucher continues at `prior_nonce + 1` rather than restarting
+    // from zero (which the node rejects as a stale nonce). Same seeding the
+    // buffered path does internally.
+    let ledger = Arc::new(ChannelLedger::new(Cumulative {
+        nonce: ctx.prior_nonce,
+        bytes: ctx.prior_bytes_delivered,
+        amount: ctx.prior_amount,
+    }));
+
+    // Wallet-less resume (#1481): a voucher rejection carrying a bundle signed by
+    // our OWN key means our persisted watermark had fallen behind what the node
+    // holds — reseed from it and reopen. The buffered path gets this from
+    // `fetch_inner`'s internal loop; the streaming path has to drive its own,
+    // because between attempts the OUTPUT FILE must be rewound to `byte_offset`
+    // (the retry re-fetches the same span, and appending it twice would corrupt
+    // the download). `client-pull` cannot do that for us — it does not own the
+    // file — so the loop lives here and the two share `MAX_RESUME_ATTEMPTS`.
+    let mut total_bytes = 0u64;
+    for attempt in 0..=decdn_client_pull::MAX_RESUME_ATTEMPTS {
+        // Rewind to the verified prefix. On the first pass this is a no-op; on a
+        // retry it discards whatever the failed attempt wrote.
+        file.set_len(byte_offset)
+            .map_err(|e| anyhow::anyhow!("truncate {}: {e}", partial.display()))?;
+        file.seek(SeekFrom::Start(byte_offset))
+            .map_err(|e| anyhow::anyhow!("seek {}: {e}", partial.display()))?;
+
+        let opened = open_progressive_pull(
+            endpoint,
+            target.clone(),
+            ctx,
+            Arc::clone(&ledger),
+            slash_dom,
+            provider,
+            hash,
+            namespace_id,
+            byte_offset,
+            micros_now(),
+            max_blob_bytes,
+            max_rate_per_mb,
+            deadlines,
+        )
+        .await;
+
+        let result = match opened {
+            Ok((header, pull)) => {
+                total_bytes = header.total_bytes;
+                let mut writer = BufWriter::new(&mut file);
+                let pulled = decdn_client_pull::sink::pull_to_sink(
+                    pull,
+                    hash,
+                    header.total_bytes,
+                    byte_offset,
+                    &mut writer,
+                )
+                .await;
+                // Flush before anything else: bytes stuck in the `BufWriter` are
+                // bytes the resume path would re-pay for. This must run on the
+                // ERROR path too — that is the whole point of the partial file.
+                let flushed = std::io::Write::flush(&mut writer)
+                    .map_err(|e| anyhow::anyhow!("flush {}: {e}", partial.display()));
+                drop(writer);
+                pulled.and_then(|p| flushed.map(|()| p))
+            }
+            Err(e) => Err(e),
+        };
+
+        // The upstream committed and acked vouchers even on a failed transfer, so
+        // persist the watermark before doing anything else — otherwise the next
+        // attempt re-signs a stale nonce and the channel is stranded, which is
+        // exactly the failure #1122 describes. Mirrors `fetch_blob`.
+        let progress = match &result {
+            Ok(p) => *p,
+            // A failed pull still advanced the ledger up to the last ack; read it
+            // from the ledger we own rather than from the (absent) return value.
+            Err(_) => VoucherProgress::from_cumulative(ledger.committed(), ctx.prior_nonce),
+        };
+        persist_watermark(store, provider, ctx.channel_id, &progress);
+
+        let Err(err) = result else {
+            if let Some(cb) = on_progress {
+                cb(total_bytes, total_bytes);
+            }
+            file.sync_all()
+                .map_err(|e| anyhow::anyhow!("sync {}: {e}", partial.display()))?;
+            return Ok(StreamedFetch {
+                total_bytes,
+                resumed_from: byte_offset,
+            });
+        };
+        if attempt == decdn_client_pull::MAX_RESUME_ATTEMPTS {
+            return Err(err);
+        }
+        match decdn_client_pull::resumable_watermark(&err, ctx) {
+            Some(bundle) => {
+                ledger.reseed(Cumulative::from(bundle));
+                // Worth surfacing rather than logging silently: it means this
+                // client's persisted watermark had fallen behind what it had
+                // actually signed, which is the #1122 desync healing itself.
+                eprintln!(
+                    "note: the node holds a later voucher than this client recorded; \
+                     resynced and retrying (attempt {}/{})",
+                    attempt + 1,
+                    decdn_client_pull::MAX_RESUME_ATTEMPTS
+                );
+            }
+            None => return Err(err),
+        }
+    }
+    // Unreachable: every branch above returns. Kept as a typed bail rather than
+    // `unreachable!()` per the workspace anti-panic policy.
+    Err(anyhow::anyhow!("resume loop exited without returning"))
+}
+
+/// Read `path` fully IF it starts with the `DECDNMAN` magic, else `None`.
+///
+/// The fetched blob may be a file manifest that has to be expanded into per-chunk
+/// pulls, and deciding that needs the bytes. Sniffing the 8-byte magic first is
+/// what keeps that from undoing the streaming work: an ordinary blob — the case
+/// that can be hundreds of megabytes — is never read back at all. A manifest is
+/// a short index by construction, so reading one whole is bounded.
+fn read_if_manifest(path: &Path) -> anyhow::Result<Option<Vec<u8>>> {
+    use std::io::Read;
+
+    let mut file =
+        std::fs::File::open(path).map_err(|e| anyhow::anyhow!("open {}: {e}", path.display()))?;
+    let mut magic = [0u8; file_manifest::MAGIC.len()];
+    match file.read_exact(&mut magic) {
+        Ok(()) => {}
+        // Shorter than the magic ⇒ not a manifest. Not an error: a blob is
+        // allowed to be two bytes long.
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(anyhow::anyhow!("read {}: {e}", path.display())),
+    }
+    if magic != file_manifest::MAGIC {
+        return Ok(None);
+    }
+    let mut out = magic.to_vec();
+    file.read_to_end(&mut out)
+        .map_err(|e| anyhow::anyhow!("read {}: {e}", path.display()))?;
+    Ok(Some(out))
+}
+
+/// Persist what the channel paid, warning rather than masking the fetch outcome.
+///
+/// Shared by the buffered and streaming paths: the bytes were paid for either
+/// way, and a failure to record that only risks a rejected reuse next time.
+fn persist_watermark(
+    store: &RedbBuyerChannelStore,
+    provider: Address,
+    channel_id: B256,
+    progress: &VoucherProgress,
+) {
+    let Some((nonce, bytes_delivered, amount)) = progress.acked() else {
+        return;
+    };
+    // A non-`Advanced` outcome (unknown provider / channel replaced / regression)
+    // means the watermark did NOT move — same hazard as a backend error — so
+    // surface it too rather than dropping it on the floor.
+    match store.advance_progress(provider, channel_id, nonce, bytes_delivered, amount) {
+        Ok(AdvanceOutcome::Advanced) => {}
+        Ok(other) => eprintln!(
+            "warning: voucher watermark not persisted for channel {channel_id} \
+             (provider {provider}): {other:?}; the next reuse may re-sign a stale nonce"
+        ),
+        Err(e) => eprintln!(
+            "warning: failed to persist voucher watermark for channel {channel_id} \
+             (provider {provider}): {e}"
+        ),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn fetch_blob(
     endpoint: &Endpoint,
@@ -800,24 +1039,7 @@ pub(crate) async fn fetch_blob(
     )
     .await;
 
-    if let Some((nonce, bytes_delivered, amount)) = progress.acked() {
-        // The bytes were paid for; any failure to persist the new watermark only
-        // risks a rejected reuse next time, so warn rather than mask the fetch
-        // outcome. A non-`Advanced` outcome (unknown provider / channel replaced
-        // / regression) means the watermark did NOT move — same hazard as a
-        // backend error — so surface it too rather than dropping it on the floor.
-        match store.advance_progress(provider, channel_id, nonce, bytes_delivered, amount) {
-            Ok(AdvanceOutcome::Advanced) => {}
-            Ok(other) => eprintln!(
-                "warning: voucher watermark not persisted for channel {channel_id} \
-                 (provider {provider}): {other:?}; the next reuse may re-sign a stale nonce"
-            ),
-            Err(e) => eprintln!(
-                "warning: failed to persist voucher watermark for channel {channel_id} \
-                 (provider {provider}): {e}"
-            ),
-        }
-    }
+    persist_watermark(store, provider, channel_id, &progress);
 
     Ok(result?.to_vec())
 }
@@ -992,7 +1214,12 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
         .map_or(decdn_protocol::client::NO_NAMESPACE, |n| {
             alloy::primitives::U256::from(n).to_be_bytes()
         });
-    let blob = fetch_blob(
+    // Stream to `<output>.partial` rather than buffering the blob (#1120): peak
+    // memory becomes one chunk group instead of ~2× the blob, and an interrupted
+    // fetch leaves a resumable prefix behind instead of nothing. A prior partial
+    // is picked up automatically and only the un-fetched tail is re-paid for.
+    let partial = partial_path(&args.output);
+    let streamed = fetch_blob_streaming(
         &endpoint,
         // Cloned, not moved: a `DECDNMAN` manifest expands into per-chunk pulls
         // to the same node below (#1183).
@@ -1015,18 +1242,54 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
         )?,
         max_blob_bytes,
         common.max_rate_per_mb,
+        &partial,
         Some(&on_progress),
     )
     .await;
     // Clear the bar before the terminal outcome (success line or error) so it
     // never overwrites the final message, on either path.
     bar.finish_and_clear();
-    let blob = blob.map_err(|err| annotate_unbound_cache_miss(err, &ctx))?;
+    // On error the partial file is deliberately LEFT in place — it is what the
+    // next invocation resumes from, and deleting it here would re-charge the user
+    // for every byte already paid for.
+    let streamed = streamed.map_err(|err| annotate_unbound_cache_miss(err, &ctx))?;
+
+    // A resumed fetch mixed bytes this process verified on the wire with bytes an
+    // earlier process left on disk. The latter were never verified and cannot be
+    // (see `sink::resume_offset`), so settle it here against the content hash
+    // before anything is promoted. A fetch that started at 0 verified every byte
+    // as it landed and needs no second pass.
+    if streamed.resumed_from > 0 {
+        let file = std::fs::File::open(&partial)
+            .map_err(|e| anyhow::anyhow!("reopen {}: {e}", partial.display()))?;
+        let genuine =
+            decdn_client_pull::sink::resume_is_genuine(hash, std::io::BufReader::new(file))
+                .map_err(|e| anyhow::anyhow!("verify {}: {e}", partial.display()))?;
+        if !genuine {
+            // The bad bytes are in the prefix we inherited, so there is nothing
+            // to salvage — drop it so the retry starts clean rather than
+            // resuming onto the same corruption forever.
+            let _ = std::fs::remove_file(&partial);
+            anyhow::bail!(
+                "the partial download at {} did not match {} and has been discarded; \
+                 re-run to fetch it cleanly",
+                partial.display(),
+                blake3::Hash::from_bytes(hash).to_hex()
+            );
+        }
+    }
 
     // A `DECDNMAN` manifest blob is a chunked FILE, not the file's bytes: expand
     // it into per-chunk pulls and reconstruct (ADR 012 § Download flow, #1183).
-    // Anything without the magic is a raw blob and is written through unchanged.
-    if let Some(manifest) = file_manifest::sniff(&blob) {
+    // Anything without the magic is a raw blob and is promoted unchanged.
+    //
+    // Reading the partial back to sniff it is bounded, not a reintroduction of
+    // whole-blob buffering: only a blob small enough to BE a manifest is ever
+    // fully read (the magic check happens on the first 8 bytes).
+    let manifest_blob = read_if_manifest(&partial)?;
+    if let Some(blob) = manifest_blob
+        && let Some(manifest) = file_manifest::sniff(&blob)
+    {
         let chunks = ChunkFetcher {
             endpoint: &endpoint,
             target: &target,
@@ -1048,14 +1311,31 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
             max_rate_per_mb: common.max_rate_per_mb,
             namespace_id,
         };
-        return chunks
+        let out = chunks
             .reconstruct(&manifest?, hash, &args.output, !common.no_keep_blobs)
             .await;
+        // The manifest blob itself is not the user's file — reconstruction wrote
+        // that. Clear the scratch file either way so a later fetch to the same
+        // `--output` does not try to resume a manifest as if it were the content.
+        let _ = std::fs::remove_file(&partial);
+        return out;
     }
 
-    write_blob_atomic(&args.output, &blob)
-        .map_err(|e| anyhow::anyhow!("write {}: {e}", args.output.display()))?;
-    println!("fetched {} bytes -> {}", blob.len(), args.output.display());
+    // Promote the verified partial in place of a copy-through: an atomic rename
+    // on the same filesystem, so `--output` never exists in a half-written state
+    // and the blob is never held in memory to be written a second time.
+    std::fs::rename(&partial, &args.output).map_err(|e| {
+        anyhow::anyhow!(
+            "promote {} -> {}: {e}",
+            partial.display(),
+            args.output.display()
+        )
+    })?;
+    println!(
+        "fetched {} bytes -> {}",
+        streamed.total_bytes,
+        args.output.display()
+    );
     Ok(())
 }
 
@@ -1688,6 +1968,49 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("capacity_bond_address"), "{err}");
         assert!(msg.contains("must not be the zero address"), "{err}");
+    }
+
+    /// The partial lives beside `--output` with a suffix, not in a temp dir: the
+    /// promote step is a rename, which is only atomic within one filesystem, and
+    /// a later invocation has to be able to find it to resume.
+    #[test]
+    fn partial_path_sits_beside_the_output() {
+        let p = partial_path(Path::new("/data/out/movie.mkv"));
+        assert_eq!(p, Path::new("/data/out/movie.mkv.partial"));
+        // A bare filename must stay relative — joining onto a parent of "" would
+        // otherwise send it to the filesystem root.
+        assert_eq!(
+            partial_path(Path::new("blob.bin")),
+            Path::new("blob.bin.partial")
+        );
+    }
+
+    /// Sniffing must read a manifest whole and an ordinary blob not at all — that
+    /// asymmetry is what keeps the manifest check from undoing the streaming.
+    #[test]
+    fn read_if_manifest_reads_only_manifests() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+
+        let manifest = dir.path().join("m.bin");
+        let mut body = file_manifest::MAGIC.to_vec();
+        body.extend_from_slice(b"payload");
+        std::fs::write(&manifest, &body)?;
+        assert_eq!(read_if_manifest(&manifest)?, Some(body));
+
+        let plain = dir.path().join("p.bin");
+        std::fs::write(&plain, b"not a manifest at all")?;
+        assert_eq!(read_if_manifest(&plain)?, None);
+
+        // Shorter than the magic is a legitimate tiny blob, not a read error.
+        let tiny = dir.path().join("t.bin");
+        std::fs::write(&tiny, b"hi")?;
+        assert_eq!(read_if_manifest(&tiny)?, None);
+
+        // Empty blob (#1054) — same.
+        let empty = dir.path().join("e.bin");
+        std::fs::write(&empty, b"")?;
+        assert_eq!(read_if_manifest(&empty)?, None);
+        Ok(())
     }
 
     #[test]

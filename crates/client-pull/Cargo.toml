@@ -27,7 +27,12 @@ decdn-common = { workspace = true }
 # (#915, ADR 038). Both are pure `bao-tree`, so the CLI stays iroh-blobs-free
 # (#578) — verify with `cargo tree -p decdn-cli -e normal -i iroh-blobs`.
 decdn-bao-range = { workspace = true }
-bao-tree = { workspace = true }
+# `tokio_fsm` is what exposes `io::fsm::ResponseDecoder`, the INCREMENTAL
+# decoder the streaming/resumable fetch drives (#1120). Requested explicitly
+# rather than relied on from workspace feature unification: `decdn-cli` must
+# build without any iroh-blobs crate in the graph to turn the feature on for us.
+bao-tree = { workspace = true, features = ["tokio_fsm"] }
+iroh-io = { workspace = true }
 alloy = { workspace = true }
 anyhow = { workspace = true }
 blake3 = { workspace = true }

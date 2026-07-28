@@ -45,6 +45,11 @@ pub mod probe;
 /// Wallet-filled HTTP provider builder for opening/settling payment channels.
 pub mod provider;
 pub mod rtt_map;
+// Docs live in `sink.rs` as `//!`. Deliberately NOT documented here as well:
+// rustdoc resolves intra-doc links on a `mod` item in THIS file's scope, so the
+// module's own links (`ResponseDecoder`, `resume_offset`, …) would go unresolved
+// and fail the `-D warnings` doc gate.
+pub mod sink;
 
 pub use ledger::{ChannelLedger, Cumulative};
 
@@ -1356,14 +1361,18 @@ async fn open_stream(
     .map_err(|_| anyhow::Error::new(PullTimeout { after: open }))?
 }
 
-/// Wallet-less resume (issue #1481 §5): the maximum number of times
-/// [`fetch_inner`] will reopen a fresh stream after a gated, bundled
+/// Wallet-less resume (issue #1481 §5): the maximum number of times a fetch
+/// will reopen a fresh stream after a gated, bundled
 /// `StaleNonce`/`AmountRegression`/`BytesRegression`/`InsufficientDeposit`
 /// rejection. Bounds a node that keeps rejecting (a buggy or adversarial
 /// peer echoing a bundle that never lets the client catch up) to a handful
 /// of round trips rather than looping forever; a healthy self-heal needs
 /// exactly one.
-const MAX_RESUME_ATTEMPTS: u32 = 3;
+///
+/// Public because the STREAMING fetch (#1120) drives its own reopen loop — it
+/// owns the output file and must rewind it before each retry, which this crate
+/// cannot do for it — and both loops must agree on the bound.
+pub const MAX_RESUME_ATTEMPTS: u32 = 3;
 
 /// Buffered fetch with wallet-less resume (issue #1481 §5): if a mid-stream
 /// voucher rejection carries a signer-verified [`WatermarkBundle`] for one of
@@ -1497,7 +1506,7 @@ async fn fetch_inner(
 /// `signed.recover_signer(&self.voucher_domain) == guard.state.voucher_signer`). A bundle whose
 /// signature does not recover to `ctx.client_signer.address()` is treated as a hostile/corrupt
 /// echo, not a legitimate watermark, and is never reseeded from.
-fn resumable_watermark<'a>(
+pub fn resumable_watermark<'a>(
     err: &'a anyhow::Error,
     ctx: &ChannelContext,
 ) -> Option<&'a WatermarkBundle> {
