@@ -46,7 +46,7 @@ pub mod probe;
 pub mod provider;
 pub mod rtt_map;
 
-pub use ledger::{ChannelLedger, Cumulative};
+pub use ledger::{ChannelLedger, Cumulative, DEFAULT_MAX_OUTSTANDING_VOUCHERS};
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -766,6 +766,38 @@ impl std::fmt::Display for LocalPullFault {
 
 impl std::error::Error for LocalPullFault {}
 
+/// Typed sentinel for the client refusing to leave more than
+/// [`DEFAULT_MAX_OUTSTANDING_VOUCHERS`] vouchers unacked on one channel (#1484).
+///
+/// The optimistic paid-fetch loop no longer blocks on each `VoucherAck`, so a
+/// provider that keeps delivering bytes but never acks could otherwise make the
+/// client sign vouchers arbitrarily far ahead of any confirmation. [`ChannelLedger::issue`]
+/// caps the outstanding set at `max`; hitting it aborts the pull.
+///
+/// This is OUR client-side bound, not evidence the peer is dead — a peer legitimately
+/// serving several intervals ahead is fine, only one running unboundedly ahead without
+/// acking trips it. So `node_origin::pull_verdict` classifies it `OurDeadline`
+/// (exonerating + briefly suppressed), never a reputation hit. `downcast_ref` recovers
+/// it through a `.context(…)` layer; that survival is pinned by
+/// `buyer_side_sentinels_survive_anyhow_downcast` in `decdn-node`.
+#[derive(Debug)]
+pub struct TooManyOutstandingVouchers {
+    /// The outstanding-voucher bound that was reached.
+    pub max: usize,
+}
+
+impl std::fmt::Display for TooManyOutstandingVouchers {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "refusing to leave more than {} vouchers unacked; upstream is not acking",
+            self.max
+        )
+    }
+}
+
+impl std::error::Error for TooManyOutstandingVouchers {}
+
 /// The bounds on a pull, each matched to the stage it governs (#1134).
 ///
 /// The two are not interchangeable, and conflating them is the bug this type
@@ -1149,9 +1181,11 @@ pub async fn stream_fetch_tracked_with_progress(
     .await;
     // Copy the acked watermark back into `progress` on EVERY return path (Ok, Err,
     // timeout) BEFORE returning, so the latest acked totals survive a mid-stream
-    // failure or a paid-but-corrupt delivery (#852). The ledger commits only after
-    // an ack, so its snapshot is exactly the last acked cumulative.
-    progress.set_from_cumulative(ledger.snapshot().await, ctx.prior_nonce);
+    // failure or a paid-but-corrupt delivery (#852). The ledger advances `committed`
+    // only after an ack, so it is exactly the last acked cumulative. A completed pull
+    // has read the ack for every voucher it sent (the closing ack precedes `StreamEnd`
+    // on the wire), so `committed` carries the whole transfer here.
+    progress.set_from_cumulative(ledger.committed(), ctx.prior_nonce);
     result
 }
 
@@ -1598,37 +1632,29 @@ async fn receive_and_pay(
                 }
                 bytes_since_voucher = bytes_since_voucher.saturating_add(chunk_len);
                 // Pay at each interval boundary, and a closing voucher once all
-                // expected bytes have arrived — matching the node's pacing.
+                // expected bytes have arrived — matching the node's pacing. Send the
+                // voucher WITHOUT blocking on its ack (#1484): the ack arrives as its
+                // own message later in this loop and is resolved into the ledger by the
+                // `VoucherAck` arm below, so we keep reading bytes across the round trip
+                // rather than stalling a full RTT per interval.
                 let boundary = bytes_since_voucher >= interval_bytes && interval_bytes > 0;
                 let closing = cumulative >= expected_wire_bytes && bytes_since_voucher > 0;
                 if boundary || closing {
-                    self_pay(
-                        send,
-                        recv,
-                        ctx,
-                        ledger,
-                        rate_per_mb,
-                        bytes_since_voucher,
-                        stall,
-                    )
-                    .await?;
+                    send_voucher(send, ctx, ledger, rate_per_mb, bytes_since_voucher).await?;
                     bytes_since_voucher = 0;
-                    // The voucher exchange is a round trip we just completed, so
-                    // the upstream is alive as of now — don't charge its latency
-                    // against the next chunk's stall budget.
-                    deadline = tokio::time::Instant::now() + stall;
                 }
             }
-            ClientMessage::StreamEnd => break,
-            ClientMessage::StreamError(e) => {
-                // TYPED, exactly as at the open stage (#1144). Stringified, a mid-stream
-                // refusal fell through every `downcast_ref` in `classify_pull_failure` to
-                // the catch-all and scored the peer `Unreachable` — the very
-                // mis-attribution #1144 fixed, reappearing one stage later. The wire code
-                // carries the same meaning here as it does in a `StreamResponse`, so let
-                // the one classifier judge both.
-                return Err(anyhow::Error::new(UpstreamRefused::mid_stream(e)));
+            // The ack for a voucher we sent optimistically (#1484). Resolve it into the
+            // ledger's committed watermark and keep going; a `VoucherRejected` here
+            // surfaces the typed payment fault, any other `StreamError` a mid-stream
+            // refusal. The upstream is alive as of this message, so refresh the
+            // inactivity deadline — but only on the ack, never on a bare frame that
+            // carried no progress.
+            ack @ (ClientMessage::VoucherAck | ClientMessage::StreamError(_)) => {
+                resolve_voucher_slot(ledger, ack)?;
+                deadline = tokio::time::Instant::now() + stall;
             }
+            ClientMessage::StreamEnd => break,
             other => anyhow::bail!("unexpected message mid-delivery: {}", variant_name(&other)),
         }
     }
@@ -1970,20 +1996,19 @@ impl UpstreamPull {
         VoucherProgress::from_cumulative(self.ledger.settlement(), self.ctx.prior_nonce)
     }
 
-    /// Issue one voucher for `delta_bytes` newly delivered since the last voucher, through
-    /// the CHANNEL's ledger — shared with every other concurrent pull on it, so their
-    /// vouchers are serialized into strict nonce order rather than colliding
-    /// (see [`stream_fetch_shared`]).
+    /// Send one voucher for `delta_bytes` newly delivered since the last voucher,
+    /// through the CHANNEL's ledger — shared with every other concurrent pull on it, so
+    /// their vouchers are serialized into strict nonce order rather than colliding (see
+    /// [`stream_fetch_shared`]). Sends optimistically (#1484): the ack is read back by
+    /// [`Self::next_chunk`] / [`Self::finish`], not awaited here.
     async fn pay_one(&mut self, delta_bytes: u64) -> anyhow::Result<()> {
         let ledger = Arc::clone(&self.ledger);
-        self_pay(
+        send_voucher(
             &mut self.send,
-            &mut self.recv,
             &self.ctx,
             &ledger,
             self.rate_per_mb,
             delta_bytes,
-            self.stall,
         )
         .await
     }
@@ -2005,72 +2030,84 @@ impl UpstreamPull {
         if self.ended {
             return Ok(None);
         }
-        // The inactivity bound (#1134). A per-call budget IS the stall budget
-        // here: every read that succeeds either carries bytes (#1088 bans empty
-        // `ChunkData`) or terminates the stream (`StreamEnd` / `StreamError` /
-        // anything else bails), so there is no frame a peer can send to hold this
-        // open without making progress. The clock starts when we begin waiting,
-        // not when the last chunk landed, so the caller's downstream-forward time
-        // is not charged against the upstream's budget.
-        let msg = tokio::time::timeout(self.stall, read_client_message(&mut self.recv))
-            .await
-            // Before the first byte this is the server's time-to-first-byte, which scales
-            // with blob size, not an inactivity signal — so it is OUR deadline, not the
-            // peer's fault. Same reasoning, and the same split, as the buffered loop in
-            // `receive_and_pay`; see the long comment there (#1145 review).
-            .map_err(|_| {
-                if self.cumulative == 0 {
-                    anyhow::Error::new(PullTimeout { after: self.stall })
-                } else {
-                    anyhow::Error::new(PullStalled { after: self.stall })
+        // Loop past any optimistic `VoucherAck`s (#1484): a voucher we sent earlier is
+        // acked on its own message, interleaved with chunks, and must be resolved into
+        // the ledger rather than returned to the caller as a chunk. Every iteration
+        // reads exactly one message; the loop only continues on an ack, and the acks it
+        // will consume are bounded by the outstanding set, so a node cannot spin it with
+        // a flood of bare acks (a spurious ack — none outstanding — bails).
+        loop {
+            // The inactivity bound (#1134). A per-read budget IS the stall budget here:
+            // every read that succeeds either carries bytes (#1088 bans empty
+            // `ChunkData`), resolves a voucher, or terminates the stream, so there is no
+            // frame a peer can send to hold this open without making progress. The clock
+            // starts when we begin waiting, not when the last chunk landed, so the
+            // caller's downstream-forward time is not charged against the upstream's
+            // budget.
+            let msg = tokio::time::timeout(self.stall, read_client_message(&mut self.recv))
+                .await
+                // Before the first byte this is the server's time-to-first-byte, which
+                // scales with blob size, not an inactivity signal — so it is OUR
+                // deadline, not the peer's fault. Same reasoning, and the same split, as
+                // the buffered loop in `receive_and_pay`; see the long comment there
+                // (#1145 review).
+                .map_err(|_| {
+                    if self.cumulative == 0 {
+                        anyhow::Error::new(PullTimeout { after: self.stall })
+                    } else {
+                        anyhow::Error::new(PullStalled { after: self.stall })
+                    }
+                })??;
+            match msg {
+                ClientMessage::ChunkData(chunk) => {
+                    // The payload is bounded on both sides by construction (#1088): the
+                    // ceiling caps per-frame allocation, and the non-empty floor keeps
+                    // every frame a unit of progress, so a peer cannot spin this loop —
+                    // or refresh the inactivity deadline above — with a run of empty
+                    // frames. This path has no belt-and-braces byte-progress check behind
+                    // that floor, and does not need one now the floor is structural.
+                    let chunk_len = chunk.bytes().len() as u64;
+                    self.cumulative = self.cumulative.saturating_add(chunk_len);
+                    if self.cumulative > self.expected_wire_bytes {
+                        anyhow::bail!(
+                            "server sent {} bytes, more than the {} promised",
+                            self.cumulative,
+                            self.expected_wire_bytes
+                        );
+                    }
+                    // No per-chunk hashing here: this stream's bytes are bao wire
+                    // bytes forwarded verbatim downstream and teed into the cache's
+                    // verifying decoder (`import_and_verify_stream`), which checks the
+                    // cached copy against the root (ADR 038); the downstream client
+                    // verifies its own copy with its decoder.
+                    self.unvouchered = self.unvouchered.saturating_add(chunk_len);
+                    let boundary =
+                        self.unvouchered >= self.interval_bytes && self.interval_bytes > 0;
+                    let closing =
+                        self.cumulative >= self.expected_wire_bytes && self.unvouchered > 0;
+                    if boundary || closing {
+                        let delta = self.unvouchered;
+                        // Send the voucher WITHOUT blocking on its ack; the ack is read
+                        // back on a later iteration (or by `finish`).
+                        self.pay_one(delta).await?;
+                        self.unvouchered = 0;
+                    }
+                    return Ok(Some(Bytes::from(chunk.into_bytes())));
                 }
-            })??;
-        match msg {
-            ClientMessage::ChunkData(chunk) => {
-                // The payload is bounded on both sides by construction (#1088): the
-                // ceiling caps per-frame allocation, and the non-empty floor keeps every
-                // frame a unit of progress, so a peer cannot spin this loop — or refresh
-                // the inactivity deadline above — with a run of empty frames. This path
-                // has no belt-and-braces byte-progress check behind that floor, and does
-                // not need one now the floor is structural.
-                let chunk_len = chunk.bytes().len() as u64;
-                self.cumulative = self.cumulative.saturating_add(chunk_len);
-                if self.cumulative > self.expected_wire_bytes {
-                    anyhow::bail!(
-                        "server sent {} bytes, more than the {} promised",
-                        self.cumulative,
-                        self.expected_wire_bytes
-                    );
+                // The ack for a voucher we sent optimistically, or a mid-stream refusal.
+                // Resolve it into the ledger and keep reading for the next chunk; a
+                // `VoucherRejected` / other `StreamError` surfaces as an error.
+                ack @ (ClientMessage::VoucherAck | ClientMessage::StreamError(_)) => {
+                    resolve_voucher_slot(&self.ledger, ack)?;
                 }
-                // No per-chunk hashing here: this stream's bytes are bao wire
-                // bytes forwarded verbatim downstream and teed into the cache's
-                // verifying decoder (`import_and_verify_stream`), which checks the
-                // cached copy against the root (ADR 038); the downstream client
-                // verifies its own copy with its decoder.
-                self.unvouchered = self.unvouchered.saturating_add(chunk_len);
-                let boundary = self.unvouchered >= self.interval_bytes && self.interval_bytes > 0;
-                let closing = self.cumulative >= self.expected_wire_bytes && self.unvouchered > 0;
-                if boundary || closing {
-                    let delta = self.unvouchered;
-                    self.pay_one(delta).await?;
-                    self.unvouchered = 0;
+                ClientMessage::StreamEnd => {
+                    self.ended = true;
+                    return Ok(None);
                 }
-                Ok(Some(Bytes::from(chunk.into_bytes())))
+                other => {
+                    anyhow::bail!("unexpected message mid-delivery: {}", variant_name(&other))
+                }
             }
-            ClientMessage::StreamEnd => {
-                self.ended = true;
-                Ok(None)
-            }
-            ClientMessage::StreamError(e) => {
-                // TYPED, exactly as at the open stage (#1144). Stringified, a mid-stream
-                // refusal fell through every `downcast_ref` in `classify_pull_failure` to
-                // the catch-all and scored the peer `Unreachable` — the very
-                // mis-attribution #1144 fixed, reappearing one stage later. The wire code
-                // carries the same meaning here as it does in a `StreamResponse`, so let
-                // the one classifier judge both.
-                Err(anyhow::Error::new(UpstreamRefused::mid_stream(e)))
-            }
-            other => anyhow::bail!("unexpected message mid-delivery: {}", variant_name(&other)),
         }
     }
 
@@ -2098,14 +2135,13 @@ impl UpstreamPull {
                 ClientMessage::ChunkData(_) => {
                     anyhow::bail!("server sent ChunkData after the promised total")
                 }
-                ClientMessage::StreamError(e) => {
-                    // TYPED, exactly as at the open stage (#1144). Stringified, a mid-stream
-                    // refusal fell through every `downcast_ref` in `classify_pull_failure` to
-                    // the catch-all and scored the peer `Unreachable` — the very
-                    // mis-attribution #1144 fixed, reappearing one stage later. The wire code
-                    // carries the same meaning here as it does in a `StreamResponse`, so let
-                    // the one classifier judge both.
-                    return Err(anyhow::Error::new(UpstreamRefused::mid_stream(e)));
+                // The ack for the closing voucher arrives before `StreamEnd` on the wire
+                // (the node collects and acks it, then sends `StreamEnd`), so the drain
+                // must resolve it into the ledger's committed watermark — otherwise the
+                // final voucher would settle high instead of committing (#1484). A
+                // `VoucherRejected` / other `StreamError` still surfaces as an error.
+                ack @ (ClientMessage::VoucherAck | ClientMessage::StreamError(_)) => {
+                    resolve_voucher_slot(&self.ledger, ack)?;
                 }
                 other => {
                     anyhow::bail!("unexpected message at stream end: {}", variant_name(&other))
@@ -2163,35 +2199,31 @@ impl Drop for UpstreamPull {
 }
 
 /// Issue one cumulative voucher for `delta_bytes` newly delivered since the last
-/// voucher, then await `VoucherAck`.
+/// voucher and SEND it — WITHOUT waiting for the `VoucherAck` (#1484).
 ///
 /// Voucher issuance runs through the channel's [`ChannelLedger`], which serializes
-/// the compute → sign → send → await-ack → commit cycle across every concurrent
-/// stream on the channel: the ledger holds its lock across the whole exchange, so
-/// vouchers reach the node in strict nonce order even while byte transfers run in
-/// parallel. Each voucher's own *delta* (`ceil(delta_bytes * rate / 1 MiB)`)
-/// covers its own bytes at the advertised rate (the node checks deltas, not the
-/// rounded cumulative). The ledger commits the advanced cumulative **only after**
-/// the upstream acks, so a rejected voucher leaves the watermark at the last acked
-/// value.
+/// the compute → sign → send critical section across every concurrent stream on the
+/// channel — so vouchers reach the node in strict nonce order — but releases its
+/// issuance lock before any ack is read. That release is the point of #1484: the
+/// blocking ack wait used to hold the shared ledger lock across a full round trip, so
+/// parallel range streams to one provider serialized their payments behind each
+/// other. The ack is now read off the critical path by the receive loop and fed back
+/// through [`ChannelLedger::resolve_ack`] / [`ChannelLedger::resolve_reject`].
 ///
-/// `stall` bounds the wait for the ack (#1134). Without it, an upstream that takes
-/// our voucher and then goes silent would hang the pull forever: the caller's
-/// inactivity deadline covers only the chunk reads, and the overall `hard_cap` is
-/// off by default. Bounding it here is no more hazardous than the QUIC idle
-/// timeout that used to be the sole backstop — the voucher is already on the wire
-/// either way, and in both cases we leave without the ack, so the ledger does not
-/// commit and our persisted watermark can lag what the node accepted. That desync
-/// is pre-existing and tracked in #1122; this only makes the bound prompt and
-/// application-level rather than a transport accident.
-async fn self_pay(
+/// Each voucher's own *delta* (`ceil(delta_bytes * rate / 1 MiB)`) covers its own
+/// bytes at the advertised rate (the node checks deltas, not the rounded cumulative).
+/// The ledger advances its committed watermark only when the ack comes back, so a
+/// voucher whose ack never arrives leaves the committed watermark unmoved while
+/// [`ChannelLedger::settlement`] still reports it (settle high — the upstream persists
+/// before it acks, ADR 003). The outstanding set is bounded, so a silent provider
+/// that keeps delivering but never acks eventually trips
+/// [`TooManyOutstandingVouchers`] rather than making the client pay unboundedly ahead.
+async fn send_voucher(
     send: &mut SendStream,
-    recv: &mut RecvStream,
     ctx: &ChannelContext,
     ledger: &ChannelLedger,
     rate_per_mb: u64,
     delta_bytes: u64,
-    stall: Duration,
 ) -> anyhow::Result<()> {
     ledger
         .issue(delta_bytes, rate_per_mb, |next: Cumulative| async move {
@@ -2208,34 +2240,50 @@ async fn self_pay(
                 send,
                 &ClientMessage::Voucher(signed_to_wire_voucher(&signed)),
             )
-            .await?;
-            let ack = tokio::time::timeout(stall, read_client_message(recv))
-                .await
-                .map_err(|_| anyhow::Error::new(PullStalled { after: stall }))??;
-            match ack {
-                // The upstream persists before it acks (ADR 003), so this is the
-                // cumulative total it has accepted — let the ledger commit it.
-                ClientMessage::VoucherAck => Ok(()),
-                // Only a `VoucherRejected` is OUR payment-side fault. Carry its
-                // typed reason so the orchestrator can exonerate the provider
-                // (#857).
-                ClientMessage::StreamError(StreamError::VoucherRejected { reason }) => {
-                    Err(anyhow::Error::new(UpstreamVoucherRejected { reason }))
-                }
-                // Any OTHER `StreamError` in reply to a voucher is the upstream refusing
-                // mid-stream (it violated the ack protocol, or it is shedding). Carry the
-                // typed wire code as `UpstreamRefused`, exactly as the three mid-stream
-                // receive sites do (#1145 review) — stringifying it here dropped the code
-                // through every downcast to the `Unreachable` catch-all, scoring an honest
-                // `Overloaded`/`NotFound` peer as a dead node.
-                ClientMessage::StreamError(e) => {
-                    Err(anyhow::Error::new(UpstreamRefused::mid_stream(e)))
-                }
-                other => anyhow::bail!("expected VoucherAck, got {}", variant_name(&other)),
-            }
+            .await
         })
         .await
-        .map(|_committed| ())
+        .map(|_sent| ())
+}
+
+/// Dispatch a `VoucherAck` slot message read off the receive loop into the ledger
+/// (#1484). `VoucherAck` advances the committed watermark by resolving the oldest
+/// outstanding voucher; a `StreamError::VoucherRejected` disarms it WITHOUT committing
+/// and surfaces the typed [`UpstreamVoucherRejected`]; any other `StreamError` is a
+/// mid-stream refusal. Returns `Ok(())` when the message was an ack the loop should
+/// keep going past. The caller is responsible for every OTHER message variant — this
+/// only handles the voucher-resolution slot.
+///
+/// A `VoucherAck` with nothing outstanding is a protocol violation (the node acked a
+/// voucher we never sent), and bounding the acks the loop will consume between chunks
+/// to the outstanding set is also what keeps a node from spinning the loop with a
+/// flood of bare acks — so a spurious ack is surfaced as an error rather than ignored.
+fn resolve_voucher_slot(ledger: &ChannelLedger, ack: ClientMessage) -> anyhow::Result<()> {
+    match ack {
+        // The upstream persists before it acks (ADR 003), so the oldest outstanding
+        // voucher is now accepted — advance the committed watermark to it.
+        ClientMessage::VoucherAck => {
+            if ledger.resolve_ack() {
+                Ok(())
+            } else {
+                anyhow::bail!("upstream sent VoucherAck with no voucher outstanding")
+            }
+        }
+        // A `VoucherRejected` is OUR payment-side fault. Disarm the rejected voucher
+        // (known-not-taken, so it must not be settled optimistically) and carry its
+        // typed reason so the orchestrator can exonerate the provider (#857).
+        ClientMessage::StreamError(StreamError::VoucherRejected { reason }) => {
+            ledger.resolve_reject();
+            Err(anyhow::Error::new(UpstreamVoucherRejected { reason }))
+        }
+        // Any OTHER `StreamError` is the upstream refusing mid-stream. Carry the typed
+        // wire code as `UpstreamRefused`, exactly as the mid-stream receive sites do
+        // (#1145 review) — stringifying it dropped the code through every downcast to
+        // the `Unreachable` catch-all, scoring an honest `Overloaded`/`NotFound` peer
+        // as a dead node.
+        ClientMessage::StreamError(e) => Err(anyhow::Error::new(UpstreamRefused::mid_stream(e))),
+        other => anyhow::bail!("expected VoucherAck, got {}", variant_name(&other)),
+    }
 }
 
 /// Validate + verify a `StreamResponse` on receive (ADR 005, ADR 014 §1, #252).
