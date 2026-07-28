@@ -40,14 +40,31 @@ struct ChunkFramer {
     buf: BytesMut,
     /// The export stream has yielded its last item; `buf` is all that remains.
     drained: bool,
+    /// The export faulted. Terminal: `buf` is dropped and no further frame is
+    /// ever cut, because a partially-received export item is unverified and must
+    /// never reach the wire as if it were good.
+    ///
+    /// The producer (`export_bao_range_stream`) already refuses to yield past its
+    /// own error, so this is belt-and-braces — but the framer accepts an arbitrary
+    /// [`BaoExportStream`], and "an error is terminal" is not something it can
+    /// check. Enforcing it here keeps the guarantee inside the type that would
+    /// otherwise violate it.
+    faulted: bool,
+    /// The blob being served, for the fault log. A mid-export fault is a
+    /// server-side store problem (actor crash, corruption) that the client can
+    /// only report as a generic short delivery, so the node has to name it — this
+    /// is the operator's only signal.
+    hash: Hash,
 }
 
 impl ChunkFramer {
-    fn new(stream: BaoExportStream) -> Self {
+    fn new(stream: BaoExportStream, hash: Hash) -> Self {
         Self {
             stream,
             buf: BytesMut::new(),
             drained: false,
+            faulted: false,
+            hash,
         }
     }
 
@@ -62,12 +79,26 @@ impl ChunkFramer {
     /// caller must abort the delivery (skipping `StreamEnd`) so the client sees a
     /// short delivery and does not pay the closing voucher.
     async fn next_frame(&mut self) -> anyhow::Result<Option<Bytes>> {
+        if self.faulted {
+            anyhow::bail!("bao export already faulted; refusing to serve further frames");
+        }
         while !self.drained && self.buf.len() < decdn_protocol::CHUNK_SIZE {
             match self.stream.next().await {
-                Some(item) => {
-                    let bytes =
-                        item.map_err(|e| anyhow::anyhow!("cache export_bao_range failed: {e}"))?;
-                    self.buf.extend_from_slice(&bytes);
+                Some(Ok(bytes)) => self.buf.extend_from_slice(&bytes),
+                Some(Err(e)) => {
+                    // Poison, and drop what was buffered: whatever arrived from a
+                    // faulted export is a partial item nothing has verified, and
+                    // cutting a frame out of it would put unverified bytes on the
+                    // wire and bill the client for them.
+                    self.faulted = true;
+                    self.buf.clear();
+                    tracing::error!(
+                        hash = %self.hash,
+                        error = %e,
+                        "bao export faulted mid-delivery; aborting the serve without StreamEnd \
+                         (the client sees a short delivery and does not pay the closing voucher)"
+                    );
+                    return Err(anyhow::anyhow!("cache bao export failed: {e}"));
                 }
                 None => self.drained = true,
             }
@@ -142,7 +173,7 @@ impl ClientHandler {
             .cache
             .export_bao_range_stream(hash, byte_offset, byte_len, total_bytes)
             .await
-            .map_err(|e| anyhow::anyhow!("cache export_bao_range failed: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("cache export_bao_range_stream failed: {e}"))?;
 
         let interval_bytes = interval_mb.saturating_mul(MB_BYTES);
         // The downstream credit window, floored at one interval so the loop can
@@ -193,7 +224,7 @@ impl ClientHandler {
         // invariant, not a live failure mode; the `?` on `next_frame` IS live —
         // that is where a mid-export store fault or the truncation refusal surfaces
         // now that the export streams (#1132).
-        let mut chunks = ChunkFramer::new(data);
+        let mut chunks = ChunkFramer::new(data, hash);
         let mut next_chunk = chunks.next_frame().await?;
 
         loop {
@@ -330,7 +361,7 @@ impl ClientHandler {
 
 #[cfg(test)]
 mod tests {
-    use super::{BaoExportStream, ChunkFramer};
+    use super::{BaoExportStream, ChunkFramer, Hash};
     use bytes::Bytes;
     use decdn_cache::CacheError;
 
@@ -359,7 +390,7 @@ mod tests {
         ];
         let flat: Vec<u8> = items.iter().flatten().copied().collect();
 
-        let mut framer = ChunkFramer::new(stream_of(items));
+        let mut framer = ChunkFramer::new(stream_of(items), Hash::new(b"framing-test"));
         let mut got: Vec<Bytes> = Vec::new();
         while let Some(frame) = framer.next_frame().await? {
             got.push(frame);
@@ -391,7 +422,7 @@ mod tests {
     /// the deliver phase makes no pass and the serve goes straight to `StreamEnd`.
     #[tokio::test]
     async fn an_empty_export_yields_no_frames() -> anyhow::Result<()> {
-        let mut framer = ChunkFramer::new(stream_of(Vec::new()));
+        let mut framer = ChunkFramer::new(stream_of(Vec::new()), Hash::new(b"empty-test"));
         anyhow::ensure!(
             framer.next_frame().await?.is_none(),
             "an empty export must yield no frames"
@@ -412,7 +443,7 @@ mod tests {
                 "export_bao stream for deadbeef ended without Done; refusing truncated export"
             ))),
         ]));
-        let mut framer = ChunkFramer::new(stream);
+        let mut framer = ChunkFramer::new(stream, Hash::new(b"fault-test"));
 
         // The first full frame is already cuttable from the buffered bytes.
         let first = framer.next_frame().await?;

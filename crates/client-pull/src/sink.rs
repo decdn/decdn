@@ -20,9 +20,9 @@
 //!   all.
 //!
 //! What this module does NOT do is silently trust bytes already on disk from a
-//! previous process. A prefix cannot be verified in isolation — see
-//! [`resume_offset`] for why — so [`resume_is_genuine`] settles it with a single
-//! whole-file hash once the tail has arrived.
+//! previous process. It could check them against a persisted outboard sidecar,
+//! but deliberately keeps none — see [`resume_offset`] — so [`resume_is_genuine`]
+//! settles it with a single whole-file hash once the tail has arrived.
 
 use std::io::Write;
 
@@ -136,6 +136,7 @@ pub async fn pull_to_sink<W: Write>(
     total_bytes: u64,
     byte_offset: u64,
     sink: &mut W,
+    on_progress: Option<&crate::ProgressCallback>,
 ) -> anyhow::Result<VoucherProgress> {
     // The empty blob has no chunk groups and no proof, so there is nothing to
     // decode and nothing to write. Prove the empty stream against the empty root
@@ -148,8 +149,15 @@ pub async fn pull_to_sink<W: Write>(
         return pull.finish().await;
     }
 
-    let reader =
-        decode_to_sink(PullReader::new(pull), hash, total_bytes, byte_offset, sink).await?;
+    let reader = decode_to_sink(
+        PullReader::new(pull),
+        hash,
+        total_bytes,
+        byte_offset,
+        sink,
+        on_progress,
+    )
+    .await?;
     // `finish` enforces wire-byte completeness and drains to `StreamEnd`; the
     // decoder finishing only means the requested chunk ranges were satisfied.
     reader.pull.finish().await
@@ -173,6 +181,12 @@ impl StashedFault for PullReader {
 
 /// A plain in-memory wire buffer has no out-of-band failure mode: whatever the
 /// decoder says about it is the whole story.
+///
+/// Test-only, and gated to say so: it exists purely so the decode loop can be
+/// driven from a fixed wire buffer. Note that a test using it exercises the
+/// `None` branch — the one this trait was invented to avoid — so it must not be
+/// the only coverage. See `fault_tests` for the branch that matters.
+#[cfg(test)]
 impl StashedFault for Bytes {
     fn take_fault(&mut self) -> Option<anyhow::Error> {
         None
@@ -191,6 +205,7 @@ async fn decode_to_sink<R, W>(
     total_bytes: u64,
     byte_offset: u64,
     sink: &mut W,
+    on_progress: Option<&crate::ProgressCallback>,
 ) -> anyhow::Result<R>
 where
     R: iroh_io::AsyncStreamReader + StashedFault,
@@ -220,6 +235,21 @@ where
                             .context("writing verified bytes to the output sink")
                             .context(LocalPullFault)
                     })?;
+                    // Report against the WHOLE blob, not this attempt's tail, so a
+                    // resumed fetch's bar continues from where the partial left off
+                    // rather than snapping back to zero. `leaf.offset` is absolute,
+                    // and the first leaf may start before `byte_offset` (the
+                    // group-aligned superset), so clamp before adding what was
+                    // actually written.
+                    if let Some(cb) = on_progress {
+                        let written = u64::try_from(payload.len()).unwrap_or(0);
+                        let done = leaf
+                            .offset
+                            .max(byte_offset)
+                            .saturating_add(written)
+                            .min(total_bytes);
+                        cb(done, total_bytes);
+                    }
                 }
                 decoder = rest;
             }
@@ -272,21 +302,33 @@ fn classify_decode_error(err: DecodeError) -> anyhow::Error {
 /// Deliberately takes only `have`: the resume offset has to be chosen BEFORE the
 /// request goes out, and the blob's true size is not known until the signed
 /// response comes back. A `have` that overshoots the real blob (a stale file
-/// under the same name) is caught downstream — the response-validation floor
-/// rejects a `byte_offset` past `total_bytes` — and the caller restarts clean.
+/// under the same name) is rejected downstream by the response-validation floor
+/// (`total_bytes >= byte_offset`), and the CLI treats that refusal as proof the
+/// partial is not this blob's: it discards the prefix and refetches from zero.
 ///
-/// # This does not, and cannot, validate the bytes
+/// # This does not validate the bytes — by choice, not by necessity
 ///
 /// It is tempting to verify the on-disk prefix against the content hash here and
-/// skip the whole-file check below. That is not possible: a bao chunk group is
-/// verified against the root through the parent hashes covering the REST of the
-/// tree, and a client holding only a prefix does not have them — the outboard is
-/// precisely what it never received. Any local "prefix verification" would have
-/// to invent the missing hashes, which proves nothing.
+/// skip the whole-file check below. That is *possible in principle*, and it is
+/// worth being precise about why we don't, because "it can't be done" would be
+/// wrong: BLAKE3 is a Merkle tree, so given the interior nodes — the **outboard**
+/// — any range verifies against the root with an `O(log n)` proof and no earlier
+/// bytes (ADR 038). This client already held those hashes: the bao proof it
+/// decoded carried, at every level, the parent pair whose right sibling covers
+/// the untouched tail. That is exactly how each group was checked against the
+/// root on the way in. [`decdn_bao_range`] does the same thing from an
+/// **untrusted** `{H}.obao4`, with no trusted-origin assumption.
 ///
-/// The bytes are therefore validated where it IS sound: [`resume_is_genuine`]
-/// re-hashes the assembled file once the tail has arrived. See its docs for why
-/// that is cheap and where it leaves the trust boundary.
+/// What this client does not do is *persist* them. It writes plaintext only,
+/// links no blob store (#578), and keeps no outboard sidecar beside the
+/// `.partial` — so by the time a later process picks the file up, the hashes are
+/// gone. Adding a sidecar would make the prefix checkable in isolation at the
+/// cost of a second on-disk format to keep consistent; a single BLAKE3 pass on
+/// the comparatively rare resume path is cheaper than that, so [`resume_is_genuine`]
+/// settles it once at the end instead.
+///
+/// If you are here to remove that O(blob) pass: the sidecar is the way, not a
+/// cleverer local check on plaintext alone.
 #[must_use]
 pub const fn resume_offset(have: u64) -> u64 {
     have - (have % CHUNK_GROUP_BYTES)
@@ -299,7 +341,8 @@ pub const fn resume_offset(have: u64) -> u64 {
 /// resumed fetch is different: the prefix came off disk, written by an earlier
 /// process, and could have been truncated mid-write, corrupted by the
 /// filesystem, or simply be a different blob's bytes under the same filename.
-/// Nothing verified it, and nothing could (see [`resume_offset`]).
+/// Nothing verified it, because this client keeps no outboard sidecar to verify
+/// it against (see [`resume_offset`] — that is a choice, not an impossibility).
 ///
 /// So the check happens here, once, against the one thing that is authoritative:
 /// the content hash. This is O(blob) local hashing — around a gigabyte per
@@ -326,7 +369,17 @@ pub fn resume_is_genuine<R: std::io::Read>(hash: [u8; 32], mut reader: R) -> std
         if n == 0 {
             break;
         }
-        hasher.update(buf.get(..n).unwrap_or_default());
+        // A `Read` impl reporting more bytes than the buffer holds is broken.
+        // `unwrap_or_default()` here would feed the hasher NOTHING and quietly
+        // return the wrong verdict from the one check standing between a corrupt
+        // `.partial` and a wrong output file — so refuse instead.
+        let filled = buf.get(..n).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "reader claimed more bytes than it returned",
+            )
+        })?;
+        hasher.update(filled);
     }
     Ok(*hasher.finalize().as_bytes() == hash)
 }
@@ -386,6 +439,7 @@ mod tests {
             u64::try_from(blob.len())?,
             0,
             &mut out,
+            None,
         )
         .await?;
         anyhow::ensure!(out == blob, "streamed output differs from the blob");
@@ -405,7 +459,7 @@ mod tests {
         for offset in [16 * 1024u64, 70_000, 64 * 1024] {
             let (root, wire) = wire_for(&blob, offset)?;
             let mut out: Vec<u8> = Vec::new();
-            decode_to_sink(Bytes::from(wire), root, blob_size, offset, &mut out).await?;
+            decode_to_sink(Bytes::from(wire), root, blob_size, offset, &mut out, None).await?;
             let want = blob
                 .get(usize::try_from(offset)?..)
                 .ok_or_else(|| anyhow::anyhow!("offset out of bounds"))?;
@@ -441,6 +495,7 @@ mod tests {
             u64::try_from(blob.len())?,
             0,
             &mut out,
+            None,
         )
         .await
         .err()
@@ -467,6 +522,7 @@ mod tests {
             u64::try_from(blob.len())?,
             0,
             &mut out,
+            None,
         )
         .await
         .err()
@@ -493,6 +549,7 @@ mod tests {
             u64::try_from(blob.len())?,
             0,
             &mut out,
+            None,
         )
         .await;
         anyhow::ensure!(
@@ -547,6 +604,134 @@ mod tests {
             !resume_is_genuine(hash, &tampered[..])?,
             "a tampered prefix must be rejected — this is the only thing standing between a \
              corrupt .partial and a wrong output file"
+        );
+        Ok(())
+    }
+}
+
+/// The stashed-fault contract, tested without a network.
+///
+/// [`PullReader`] itself needs a live `UpstreamPull`, so these drive
+/// [`decode_to_sink`] through a stand-in reader that behaves identically in the
+/// one dimension that matters: it feeds wire bytes, then stops and parks a typed
+/// error. That is the exact shape a stalled or refusing peer produces, and the
+/// property under test — that the parked error beats the decoder's complaint — is
+/// what keeps the reputation layer able to score a misbehaving peer.
+#[cfg(test)]
+mod fault_tests {
+    use super::{StashedFault, decode_to_sink};
+    use crate::PullStalled;
+    use bao_tree::io::outboard::PreOrderMemOutboard;
+    use bytes::Bytes;
+    use decdn_bao_range::{IROH_BLOCK_SIZE, align_range, encode_verified_range};
+    use std::time::Duration;
+
+    /// Feeds `prefix`, then reports EOF while holding a typed fault — exactly what
+    /// `PullReader` does when `next_chunk` fails partway through a transfer.
+    struct FaultingReader {
+        prefix: Bytes,
+        fault: Option<anyhow::Error>,
+    }
+
+    impl iroh_io::AsyncStreamReader for FaultingReader {
+        async fn read_bytes(&mut self, len: usize) -> std::io::Result<Bytes> {
+            let take = self.prefix.len().min(len);
+            Ok(self.prefix.split_to(take))
+        }
+
+        async fn read<const L: usize>(&mut self) -> std::io::Result<[u8; L]> {
+            if self.prefix.len() < L {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "faulting reader exhausted",
+                ));
+            }
+            let got = self.prefix.split_to(L);
+            let mut out = [0u8; L];
+            out.copy_from_slice(&got);
+            Ok(out)
+        }
+    }
+
+    impl StashedFault for FaultingReader {
+        fn take_fault(&mut self) -> Option<anyhow::Error> {
+            self.fault.take()
+        }
+    }
+
+    fn wire_for(blob: &[u8]) -> anyhow::Result<([u8; 32], Vec<u8>)> {
+        let ob = PreOrderMemOutboard::create(blob, IROH_BLOCK_SIZE);
+        let root = *ob.root.as_bytes();
+        let aligned = align_range(0, 0, u64::try_from(blob.len())?)?;
+        let combined = encode_verified_range(root, &aligned, blob, ob.data.clone().into())?;
+        Ok((
+            root,
+            combined
+                .get(8..)
+                .ok_or_else(|| anyhow::anyhow!("combined shorter than the header"))?
+                .to_vec(),
+        ))
+    }
+
+    /// A parked upstream fault must be what the caller sees — NOT the decoder's
+    /// "the bytes ran out".
+    ///
+    /// This is the entire reason `StashedFault` exists. Swap the two branches in
+    /// `decode_to_sink`'s error arm and every other test in this file still
+    /// passes, while in production every stall, refusal, and voucher rejection on
+    /// the CLI fetch path silently degrades to an anonymous decode error and the
+    /// peer stops being scored for it.
+    #[tokio::test]
+    async fn a_parked_upstream_fault_beats_the_decoder_complaint() -> anyhow::Result<()> {
+        let blob = vec![7u8; 200 * 1024];
+        let (root, wire) = wire_for(&blob)?;
+        // Half a wire is a truncation as far as the decoder is concerned.
+        let half = wire.get(..wire.len() / 2).unwrap_or_default().to_vec();
+        let reader = FaultingReader {
+            prefix: Bytes::from(half),
+            fault: Some(anyhow::Error::new(PullStalled {
+                after: Duration::from_secs(30),
+            })),
+        };
+
+        let mut out: Vec<u8> = Vec::new();
+        let err = decode_to_sink(reader, root, u64::try_from(blob.len())?, 0, &mut out, None)
+            .await
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("a truncated feed must not decode cleanly"))?;
+
+        anyhow::ensure!(
+            err.downcast_ref::<PullStalled>().is_some(),
+            "the typed upstream fault must survive; got: {err}"
+        );
+        Ok(())
+    }
+
+    /// With no parked fault the decoder's own classification stands, so the
+    /// precedence rule cannot be implemented as "always return the stash".
+    #[tokio::test]
+    async fn without_a_parked_fault_the_decoder_error_stands() -> anyhow::Result<()> {
+        let blob = vec![9u8; 200 * 1024];
+        let (root, wire) = wire_for(&blob)?;
+        let half = wire.get(..wire.len() / 2).unwrap_or_default().to_vec();
+        let reader = FaultingReader {
+            prefix: Bytes::from(half),
+            fault: None,
+        };
+
+        let mut out: Vec<u8> = Vec::new();
+        let err = decode_to_sink(reader, root, u64::try_from(blob.len())?, 0, &mut out, None)
+            .await
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("a truncated feed must not decode cleanly"))?;
+
+        anyhow::ensure!(
+            err.downcast_ref::<PullStalled>().is_none(),
+            "no fault was parked, so nothing should have been substituted: {err}"
+        );
+        anyhow::ensure!(
+            err.downcast_ref::<crate::HashMismatch>().is_none(),
+            "a truncation is not corruption: {err}"
         );
         Ok(())
     }

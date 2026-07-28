@@ -1567,11 +1567,19 @@ impl CacheEngine {
     /// not miscounted as client-facing egress and the whole blob is not
     /// re-assembled into a buffer the caller would just drop. A hit is a no-op.
     ///
-    /// That second guarantee is enforced, not merely intended: this path passes
-    /// `want_bytes: false` down to the private `pull_through`, so a committed blob is
-    /// never read back out of the store (#1132). Before that it *was* read back
-    /// and dropped, which is how the serve path's miss leg came to hold ~708 MB
-    /// for a 708 MB blob.
+    /// On the STREAMING commit path that guarantee is enforced, not merely
+    /// intended: `want_bytes: false` reaches `pull_through_attempt`, which returns
+    /// `Committed` without a `read_local` (#1132). Before that the blob *was* read
+    /// back and dropped, which is how the serve path's miss leg came to hold
+    /// ~708 MB for a 708 MB blob.
+    ///
+    /// The BUFFERED arm is the exception and is worth knowing about, because it is
+    /// the path #1132 is titled after: when an origin advertises a `size_hint` at
+    /// or under `cache.origin_retry.buffered_max_bytes` (8 MiB default),
+    /// `should_buffer` drains the blob into a `Bytes` before committing and
+    /// `commit_buffered_bytes` hands it back regardless of `want_bytes`. Nothing is
+    /// re-read, so there is no second copy — but the peak is bounded by that config
+    /// knob rather than by this flag.
     /// The origin-egress metric (`pull_through_bytes`) is still bumped by the
     /// pull, which is correct — those bytes really did leave an origin.
     ///
@@ -2318,40 +2326,22 @@ impl CacheEngine {
         Ok(Bytes::from(bytes))
     }
 
-    /// Export `[byte_offset, byte_offset + byte_len)` of `hash` as the
-    /// **header-less bao interleaved verified-stream encoding** that travels on
-    /// `cdn/client/v1` ([ADR 038 §Serve side](../../../adr/038-bao-verified-range-streaming.md)).
-    /// `byte_len == 0` exports to the blob end. This is the *only* client-facing
-    /// delivery path — there is no raw-byte fallback (ADR 038 AC#4) — so a
-    /// whole-blob serve passes `byte_offset == 0, byte_len == 0`.
+    /// Whole-blob-in-memory form of [`Self::export_bao_range_stream`]: drains the
+    /// stream into one contiguous `Bytes`. See that method for the wire format and
+    /// the range semantics.
     ///
-    /// The returned bytes are proof nodes (64 B each) interleaved with chunk-group
-    /// data in tree order, **without** the 8-byte size header: the signed
-    /// `StreamResponse.body.total_bytes` is the authoritative size, so the
-    /// receiver builds its own `BaoTree` and never reads a header off the wire
-    /// (avoids a second, unauthenticated size source — ADR 038 §Wire format).
-    ///
-    /// The range widens to enclosing 16 KiB chunk-group boundaries
-    /// ([`align_range`]) because a bao proof anchors whole groups; the serve side
-    /// does **not** trim back to the requested offset (trimming would break
-    /// verification). The receiver discards the group-aligned prefix. The outboard
-    /// is read from the store (built at import); no held content is re-hashed.
-    /// Works against a **partial** blob (only imported/verified chunk groups are
-    /// exportable, exactly like [`Self::export_range`]).
+    /// **Peak memory is the whole aligned range.** The paid serve path must NOT
+    /// use this — it drives the stream directly, so a large blob costs one frame
+    /// of RAM rather than a copy of the blob (#1132). Every caller today is a test
+    /// that needs a buffer to assert against; it is kept for them, and because the
+    /// ADR 038 round-trip tests are more legible over a buffer than a stream.
     ///
     /// # Errors
     ///
-    /// [`CacheError::Store`] if the blob is absent, the store cannot report a
-    /// partial blob's size, the requested range is out of bounds, or the bao
-    /// export stream faults.
-    /// Whole-blob-in-memory form of [`Self::export_bao_range_stream`]: drains the
-    /// stream into one contiguous `Bytes`.
-    ///
-    /// **Peak memory is the whole aligned range**, so this is for callers that
-    /// genuinely need the buffer (tests, and any consumer that must random-access
-    /// the wire form). The paid serve path must NOT use it — it drives the stream
-    /// directly so a large blob costs one frame of RAM, not a copy of the blob
-    /// (#1132).
+    /// Everything [`Self::export_bao_range_stream`] can fail with, except that a
+    /// fault discovered while exporting — including the truncation refusal —
+    /// surfaces here as an `Err` return rather than as a terminal stream item,
+    /// because nothing has been handed to a consumer yet.
     pub async fn export_bao_range(
         &self,
         hash: Hash,
@@ -2376,8 +2366,27 @@ impl CacheEngine {
         Ok(Bytes::from(out))
     }
 
-    /// Streaming form of [`Self::export_bao_range`]: the same header-less bao wire
-    /// bytes, yielded incrementally as the store produces them.
+    /// Export `[byte_offset, byte_offset + byte_len)` of `hash` as the
+    /// **header-less bao interleaved verified-stream encoding** that travels on
+    /// `cdn/client/v1` ([ADR 038 §Serve side](../../../adr/038-bao-verified-range-streaming.md)),
+    /// yielded incrementally as the store produces it. `byte_len == 0` exports to
+    /// the blob end. This is the *only* client-facing delivery path — there is no
+    /// raw-byte fallback (ADR 038 AC#4) — so a whole-blob serve passes
+    /// `byte_offset == 0, byte_len == 0`.
+    ///
+    /// The bytes are proof nodes (64 B each) interleaved with chunk-group data in
+    /// tree order, **without** the 8-byte size header: the signed
+    /// `StreamResponse.body.total_bytes` is the authoritative size, so the
+    /// receiver builds its own `BaoTree` and never reads a header off the wire
+    /// (avoids a second, unauthenticated size source — ADR 038 §Wire format).
+    ///
+    /// The range widens to enclosing 16 KiB chunk-group boundaries
+    /// ([`align_range`]) because a bao proof anchors whole groups; the serve side
+    /// does **not** trim back to the requested offset (trimming would break
+    /// verification). The receiver discards the group-aligned prefix. The outboard
+    /// is read from the store (built at import); no held content is re-hashed.
+    /// Works against a **partial** blob (only imported/verified chunk groups are
+    /// exportable, exactly like [`Self::export_range`]).
     ///
     /// Each item is one export item's serialization — a 64-byte proof pair or one
     /// chunk group's data — so a consumer that writes items straight to the wire
@@ -2535,7 +2544,7 @@ impl CacheEngine {
     /// store and returned: [`Self::get`] needs it, [`Self::populate`] would only
     /// drop it. `Ok(None)` is therefore reachable ONLY under
     /// `want_bytes == false`; a `true` call that somehow returns `None` is a logic
-    /// regression, which [`Self::get`] surfaces as a `Store` fault (#1132).
+    /// regression, which [`Self::pull_through_bytes`] surfaces as a `Store` fault (#1132).
     #[allow(clippy::too_many_lines)] // One linear chain walk; each outcome arm carries the rationale for its own fallback/return decision, and splitting the match out would separate those from the loop state (`last_err`, `any_not_found`, `any_short_circuit`) they exist to explain.
     async fn pull_through(
         &self,

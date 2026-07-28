@@ -22,10 +22,15 @@
 //!    an implementation that silently re-downloaded everything.
 //! 3. **Corrupt partial.** Seeded with a prefix of the right length but the wrong
 //!    bytes, the fetch must FAIL and discard the partial. A prefix off disk is
-//!    never verified on the wire (see `sink::resume_offset`), so this whole-file
-//!    check is the only thing standing between a bad `.partial` and a silently
-//!    wrong output file. It must also not leave the bad prefix behind to poison
-//!    every retry.
+//!    never verified on the wire (the CLI persists no outboard sidecar to check it
+//!    against — see `sink::resume_offset`), so this whole-file check is the only
+//!    thing standing between a bad `.partial` and a silently wrong output file. It
+//!    must also not leave the bad prefix behind to poison every retry.
+//! 4. **Partial from a different blob.** Seeded LONGER than the blob, so the node
+//!    refuses the resume offset outright rather than serving bytes that fail a
+//!    hash. That refusal carries no watermark bundle, so nothing reseeds — and
+//!    leaving the partial in place would wedge the command permanently. Adjacent
+//!    to journey 3 and behaves oppositely, which is exactly why both are here.
 //!
 //! Gated behind the `anvil-e2e` feature (off by default). Requires `anvil` +
 //! `forge` on `PATH` and a prior build of the `decdn` binary:
@@ -235,6 +240,37 @@ async fn run() -> anyhow::Result<()> {
     anyhow::ensure!(
         !partial.exists(),
         "a corrupt .partial must be discarded, or every retry resumes onto the same corruption"
+    );
+
+    // ---- Journey 4: a partial from a DIFFERENT (larger) blob ----
+    //
+    // The trap journey 3 does not cover, and the two look adjacent while behaving
+    // oppositely. A same-length corrupt prefix passes the response floor, reaches
+    // the whole-file hash, and self-heals. A prefix LONGER than the blob never
+    // gets that far: the node cannot serve a resume past its own `total_bytes`, so
+    // the pull is refused before a byte moves. That refusal is not a voucher
+    // rejection, so nothing reseeds — and if the partial is then left in place,
+    // every subsequent run recomputes the same impossible offset and fails
+    // identically, forever, with an error blaming the node for a local stale file.
+    //
+    // Mundane trigger: fetch a big blob to `-o out.bin`, interrupt it, then fetch a
+    // smaller one to the same `-o`.
+    std::fs::write(&partial, vec![0xABu8; blob.len() * 2]).context("seed oversized partial")?;
+    anyhow::ensure!(!out.exists(), "output should not exist before journey 4");
+
+    run_fetch_until_ready(client_dir.path(), &args).await?;
+
+    let got = std::fs::read(&out).context("read output after an oversized partial")?;
+    anyhow::ensure!(
+        got == blob,
+        "a partial belonging to another blob must be discarded and the fetch restarted clean, \
+         not wedged: got {} bytes, expected {}",
+        got.len(),
+        blob.len()
+    );
+    anyhow::ensure!(
+        !partial.exists(),
+        "the .partial must be promoted away after recovering from a stale one"
     );
 
     // `NodeFixture` tears the daemon down on drop; there is nothing to await.

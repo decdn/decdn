@@ -4570,8 +4570,10 @@ async fn export_bao_range_round_trips_and_verifies_against_root() -> anyhow::Res
     Ok(())
 }
 
-/// A whole-blob `export_bao_range(hash, 0, 0)` (the offset-0 client serve, which
-/// is now always bao — ADR 038 AC#4) must cover the entire blob and verify.
+/// A whole-blob `export_bao_range(hash, 0, 0)` must cover the entire blob and
+/// verify. This is the buffered drain of `export_bao_range_stream`, not the serve
+/// path itself (the node streams — #1132); it covers the shared wire format both
+/// forms produce, which is what ADR 038 AC#4 pins.
 #[tokio::test]
 async fn export_bao_range_whole_blob_offset_zero() -> anyhow::Result<()> {
     use bytes::Bytes;
@@ -4795,11 +4797,15 @@ async fn export_bao_range_stream_empty_blob_yields_no_items() -> anyhow::Result<
 /// whose post-commit read-back was removed (#1132). The blob is well above
 /// `buffered_max_bytes`, so `should_buffer` routes it to `import_and_verify_stream`
 /// and the new `PullThroughOutcome::Committed` arm is what carries the result
-/// back. That variant holds no payload, so "the whole blob was not re-read" is
-/// enforced by the type; this test is the end-to-end proof that the arm is wired
-/// correctly and still fills the cache.
+/// back.
+///
+/// It does NOT observe the absence of the read-back — that is enforced by
+/// `PullThroughOutcome::Committed` carrying no payload, which is a property of the
+/// type, not of this run. Do not trust this test to catch a reintroduced
+/// `read_local`; it proves the new arm is wired correctly and still fills the
+/// cache, which is the part a type cannot check.
 #[tokio::test]
-async fn populate_fills_via_the_streaming_commit_without_reading_back() -> anyhow::Result<()> {
+async fn populate_fills_via_the_streaming_commit_path() -> anyhow::Result<()> {
     // Comfortably over the 8 MiB `buffered_max_bytes` default.
     let mut payload = vec![0u8; 12 * 1024 * 1024];
     let mut x: u32 = 0x9E37_79B9;

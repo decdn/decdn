@@ -465,15 +465,16 @@ since project inception and will roll into the first tagged release.
   partial up, asks the node for the un-fetched tail only, and **re-pays only for
   that tail**; previously it restarted from byte 0.
   - Observable change: a failed fetch now leaves a `<output>.partial` file behind
-    on purpose — that is what the next run resumes from. It is removed on
-    success and on a failed integrity check.
-  - Bytes inherited from a previous run's partial cannot be verified in isolation
-    (bao verifies a chunk group through the parent hashes covering the rest of
-    the tree, which a client holding only a prefix does not have), so a **resumed**
-    fetch re-hashes the assembled file against the content hash before promoting
-    it. On mismatch the partial is discarded and the fetch fails rather than
-    writing a wrong output file. A fetch that started at byte 0 skips this — every
-    byte was verified on the wire.
+    on purpose — that is what the next run resumes from. It is renamed into place
+    on success, and discarded on a failed integrity check or when the node cannot
+    serve a resume at its offset (which means it belongs to a different blob).
+  - Bytes inherited from a previous run's partial are not verified as they are
+    read: the CLI persists no bao outboard sidecar beside the `.partial`, so it
+    has nothing to check the prefix against. A **resumed** fetch therefore
+    re-hashes the assembled file against the content hash before promoting it,
+    and on mismatch discards the partial and fails rather than writing a wrong
+    output file. A fetch that started at byte 0 skips this — every byte was
+    verified on the wire as it landed.
 - **`decdn node channels` gained a `SIGNER` column.** It reports the channel's
   pinned `voucherSigner` — the key whose signature is required on every voucher —
   next to `COUNTERPARTY` (the funder, and the address the ADR 011 compliance

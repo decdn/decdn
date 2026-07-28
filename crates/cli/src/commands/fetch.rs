@@ -65,6 +65,14 @@ const DEFAULT_DEPOSIT_MICRO_USDC: u64 = 10_000_000;
 /// (`--timeout-ms`); a dead candidate falls out of selection after this.
 const SELECT_PROBE_TIMEOUT_MS: u64 = 5_000;
 
+/// Ceiling on a fetched blob that claims to be a `DECDNMAN` file manifest
+/// ([`read_if_manifest`]). A manifest is an index of chunk hashes — `file_manifest`
+/// already caps the chunk list — so a legitimate one is orders of magnitude under
+/// this. The cap exists because the `DECDNMAN` magic is 8 unauthenticated bytes at
+/// the head of a blob, so without it a publisher could make `decdn fetch` read an
+/// arbitrarily large file fully into memory.
+const MAX_MANIFEST_BYTES: u64 = 32 << 20; // 32 MiB
+
 /// Parse a user-supplied BLAKE3 hash: 64 hex chars, optionally `0x`- or
 /// `b3:`-prefixed (the `b3:` form is what bundle manifests carry).
 pub(crate) fn parse_hash(s: &str) -> anyhow::Result<[u8; 32]> {
@@ -792,6 +800,7 @@ struct StreamedFetch {
 /// Resume re-runs discovery in the caller, not here: content is content-addressed,
 /// so whichever node this call is pointed at can serve the tail.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)] // One sequential open→stream→persist→classify attempt loop. Each stage's comment explains a money-relevant decision (which watermark to settle, when a partial is poison, why a flush failure outranks a pull failure); splitting them out would separate those from the loop state they justify.
 async fn fetch_blob_streaming(
     endpoint: &Endpoint,
     target: EndpointAddr,
@@ -812,8 +821,23 @@ async fn fetch_blob_streaming(
     // What a previous attempt left behind, snapped down to a chunk-group
     // boundary: the server anchors its proof to whole groups, so anything past
     // the last boundary has to be re-fetched anyway.
-    let have = std::fs::metadata(partial).map_or(0, |m| m.len());
-    let byte_offset = decdn_client_pull::sink::resume_offset(have);
+    //
+    // Only `NotFound` means "no partial". Any other stat error (permissions, a
+    // transient fault, `ENOTDIR`) must NOT be read as zero: that would silently
+    // truncate a large verified prefix and re-pay for the whole blob, which is
+    // real money lost to a condition we could have reported.
+    let have = match std::fs::metadata(partial) {
+        Ok(m) => m.len(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(e) => {
+            return Err(anyhow::anyhow!(
+                "stat {}: {e} (refusing to treat this as 'no partial download' — \
+                 that would discard a resumable prefix and re-pay for it)",
+                partial.display()
+            ));
+        }
+    };
+    let mut byte_offset = decdn_client_pull::sink::resume_offset(have);
 
     let mut file = std::fs::OpenOptions::new()
         .create(true)
@@ -880,6 +904,7 @@ async fn fetch_blob_streaming(
                     header.total_bytes,
                     byte_offset,
                     &mut writer,
+                    on_progress,
                 )
                 .await;
                 // Flush before anything else: bytes stuck in the `BufWriter` are
@@ -888,27 +913,43 @@ async fn fetch_blob_streaming(
                 let flushed = std::io::Write::flush(&mut writer)
                     .map_err(|e| anyhow::anyhow!("flush {}: {e}", partial.display()));
                 drop(writer);
-                pulled.and_then(|p| flushed.map(|()| p))
+                // A flush failure is LOCAL and terminal — the disk is full or the
+                // file is gone. It must not be swallowed when the pull also failed
+                // (`and_then` would drop it), because the pull's error is then a
+                // misleading "the peer stalled" and, if it happens to be a
+                // resumable voucher rejection, the loop below would burn every
+                // retry re-paying vouchers against a condition no retry can fix.
+                // So it wins, and it is marked non-resumable by construction:
+                // `resumable_watermark` only matches `UpstreamVoucherRejected`.
+                match (pulled, flushed) {
+                    (_, Err(flush_err)) => Err(flush_err),
+                    (Err(pull_err), Ok(())) => Err(pull_err),
+                    (Ok(p), Ok(())) => Ok(p),
+                }
             }
             Err(e) => Err(e),
         };
 
-        // The upstream committed and acked vouchers even on a failed transfer, so
-        // persist the watermark before doing anything else — otherwise the next
-        // attempt re-signs a stale nonce and the channel is stranded, which is
-        // exactly the failure #1122 describes. Mirrors `fetch_blob`.
+        // The upstream may hold vouchers we sent but never saw acked, so persist
+        // the watermark before doing anything else — otherwise the next attempt
+        // re-signs a spent nonce and the channel is stranded, which is exactly
+        // the failure #1122 describes.
         let progress = match &result {
             Ok(p) => *p,
-            // A failed pull still advanced the ledger up to the last ack; read it
-            // from the ledger we own rather than from the (absent) return value.
-            Err(_) => VoucherProgress::from_cumulative(ledger.committed(), ctx.prior_nonce),
+            // `settlement()`, NOT `committed()`. Vouchers are sent optimistically
+            // (#1484), so when a transfer dies there are usually vouchers in
+            // flight whose fate is unknown; the upstream persists before it acks,
+            // so it most likely holds them. Settling LOW there re-signs a spent
+            // nonce and wedges the channel permanently, while settling high at
+            // worst skips a nonce — which the serve side meters and accepts. The
+            // two readers are equal on the success path and diverge exactly here,
+            // on the interruption this whole feature exists to survive. See
+            // `ChannelLedger::settlement`.
+            Err(_) => VoucherProgress::from_cumulative(ledger.settlement(), ctx.prior_nonce),
         };
         persist_watermark(store, provider, ctx.channel_id, &progress);
 
         let Err(err) = result else {
-            if let Some(cb) = on_progress {
-                cb(total_bytes, total_bytes);
-            }
             file.sync_all()
                 .map_err(|e| anyhow::anyhow!("sync {}: {e}", partial.display()))?;
             return Ok(StreamedFetch {
@@ -916,6 +957,25 @@ async fn fetch_blob_streaming(
                 resumed_from: byte_offset,
             });
         };
+        // A resume offset the server cannot satisfy is proof the partial is not
+        // this blob's — a stale file left under the same `--output` by an earlier
+        // fetch of a DIFFERENT (or larger) blob, or one that completed but was
+        // killed before the rename. The open fails its `total_bytes >= byte_offset`
+        // floor, which is not a voucher rejection, so without this the loop bails
+        // and the partial is deliberately left in place — and every subsequent run
+        // recomputes the same impossible offset and fails identically. That is a
+        // permanent dead end whose error blames the node for a local stale file,
+        // so discard the prefix and start clean, once.
+        if byte_offset > 0 && decdn_client_pull::resumable_watermark(&err, ctx).is_none() {
+            eprintln!(
+                "note: the partial download at {} cannot belong to this blob \
+                 (the node cannot serve a resume at byte {byte_offset}); \
+                 discarding it and fetching from the start",
+                partial.display()
+            );
+            byte_offset = 0;
+            continue;
+        }
         if attempt == decdn_client_pull::MAX_RESUME_ATTEMPTS {
             return Err(err);
         }
@@ -929,7 +989,7 @@ async fn fetch_blob_streaming(
                     "note: the node holds a later voucher than this client recorded; \
                      resynced and retrying (attempt {}/{})",
                     attempt + 1,
-                    decdn_client_pull::MAX_RESUME_ATTEMPTS
+                    decdn_client_pull::MAX_RESUME_ATTEMPTS + 1
                 );
             }
             None => return Err(err),
@@ -962,6 +1022,21 @@ fn read_if_manifest(path: &Path) -> anyhow::Result<Option<Vec<u8>>> {
     }
     if magic != file_manifest::MAGIC {
         return Ok(None);
+    }
+    // "A manifest is short by construction" is a property of honest manifests,
+    // not something the bytes on disk guarantee: the magic is 8 unauthenticated
+    // bytes any publisher can put at the head of a 708 MB blob, and reading that
+    // whole would undo the streaming this function exists to protect. Cap it.
+    let len = file
+        .metadata()
+        .map_err(|e| anyhow::anyhow!("stat {}: {e}", path.display()))?
+        .len();
+    if len > MAX_MANIFEST_BYTES {
+        return Err(anyhow::anyhow!(
+            "{} starts with the DECDNMAN magic but is {len} bytes, above the {MAX_MANIFEST_BYTES}-byte \
+             manifest ceiling; refusing to load it into memory",
+            path.display()
+        ));
     }
     let mut out = magic.to_vec();
     file.read_to_end(&mut out)
@@ -1268,14 +1343,24 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
         if !genuine {
             // The bad bytes are in the prefix we inherited, so there is nothing
             // to salvage — drop it so the retry starts clean rather than
-            // resuming onto the same corruption forever.
-            let _ = std::fs::remove_file(&partial);
-            anyhow::bail!(
-                "the partial download at {} did not match {} and has been discarded; \
-                 re-run to fetch it cleanly",
-                partial.display(),
-                blake3::Hash::from_bytes(hash).to_hex()
-            );
+            // resuming onto the same corruption forever. If the removal itself
+            // fails, say so: telling the user it "has been discarded" when it
+            // has not sends them into a loop where the error message is what
+            // prevents them diagnosing it.
+            let hex = blake3::Hash::from_bytes(hash).to_hex();
+            return Err(match std::fs::remove_file(&partial) {
+                Ok(()) => anyhow::anyhow!(
+                    "the partial download at {} did not match {hex} and has been discarded; \
+                     re-run to fetch it cleanly",
+                    partial.display()
+                ),
+                Err(e) => anyhow::anyhow!(
+                    "the partial download at {} did not match {hex} and could not be removed \
+                     ({e}); delete it by hand before re-running, or every retry will resume \
+                     onto the same corrupt bytes",
+                    partial.display()
+                ),
+            });
         }
     }
 

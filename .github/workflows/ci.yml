@@ -646,14 +646,14 @@ jobs:
     # Bound above the ~109m balanced journeys schedule (below) plus the bin build
     # and workspace compile, so a genuinely hung test hits its own clear per-test
     # message before this opaque job-level kill (#785). The cross-layer journeys
-    # run at --test-threads 2 — 16 tests across 13 files whose per-test
-    # `OVERALL_TIMEOUT` ceilings sum to 218m:
-    #   13m x6  smoke, cli_publish, cli_fetch_manifest, cli_fetch_topup,
-    #           cli_setup_partial, G-NODE-06
+    # run at --test-threads 2 — 17 tests across 14 files whose per-test
+    # `OVERALL_TIMEOUT` ceilings sum to 231m:
+    #   13m x7  smoke, cli_publish, cli_fetch_manifest, cli_fetch_topup,
+    #           cli_setup_partial, cli_fetch_resume, G-NODE-06
     #   10m x5  G-NODE-04 (3 tests), G-ORIGIN-01 (2 tests)
     #   15m x2  G-NODE-08 (authorized-origin), G-NODE-08 (revocation)
     #   20m x3  slash_appeal, G-GOV-02, G-GOV-03
-    # A balanced 2-thread schedule is ~109m (218/2, no single test exceeding it),
+    # A balanced 2-thread schedule is ~116m (231/2, no single test exceeding it),
     # so the bound must clear that plus the bin build, the workspace compile and
     # the per-fixture in-test forge deploys. Keep this inventory in sync when
     # adding a journey — it has gone stale twice already (it once described 6
