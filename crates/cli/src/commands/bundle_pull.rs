@@ -1188,6 +1188,7 @@ mod tests {
                             decdn_client_pull::UpstreamRefused::mid_stream(
                                 decdn_protocol::StreamError::VoucherRejected {
                                     reason: decdn_protocol::VoucherRejectReason::WrongSigner,
+                                    bundle: None,
                                 },
                             ),
                         ))

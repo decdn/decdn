@@ -681,6 +681,31 @@ impl CooperativeCloseAuth {
     }
 }
 
+/// The node's true watermark for a channel, echoed back on a gated
+/// [`StreamError::VoucherRejected`] so a wallet-less client can self-heal
+/// (issue #1481). `amount`/`nonce`/`bytes_delivered` mirror the seller-side
+/// `ChannelState::last_*` fields, 256-bit big-endian for the same reason as
+/// [`Voucher`] — no `U256` in the protocol crate. `last_signature` is the
+/// node's stored last-accepted **client** signature (`r‖s‖v`, exactly
+/// [`VOUCHER_SIG_LEN`]) — not a node signature over this bundle — so the
+/// client can confirm which of its own vouchers the node holds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WatermarkBundle {
+    /// Cumulative amount of the node's last-accepted voucher, big-endian `uint256`.
+    pub amount: [u8; 32],
+    /// Nonce of the node's last-accepted voucher, big-endian `uint256`.
+    pub nonce: [u8; 32],
+    /// Cumulative bytes delivered as of the node's last-accepted voucher,
+    /// big-endian `uint256`.
+    pub bytes_delivered: [u8; 32],
+    /// The client's own signature (`r‖s‖v`, exactly [`VOUCHER_SIG_LEN`]) on the
+    /// node's last-accepted voucher. `Vec<u8>` rather than a fixed array,
+    /// mirroring [`Voucher::signature`] and [`CooperativeCloseAuth::signature`]
+    /// — postcard/serde signature fields on this wire are length-prefixed
+    /// `Vec<u8>`, not `[u8; N]` (serde's array impls top out at N=32).
+    pub last_signature: Vec<u8>,
+}
+
 /// A stream failure code (ADR 005 §Stream errors). Variant order is frozen.
 ///
 /// Every variant except `VoucherRejected` is delivery-side and rides in
@@ -695,6 +720,11 @@ impl CooperativeCloseAuth {
 /// renumber `VoucherRejected` on the wire — an ADR 013 Tier-3 break. Use
 /// [`StreamError::is_delivery_side`], not variant position, to reason about the
 /// domain split.
+///
+/// The same append-only discipline applies WITHIN a struct-variant's fields:
+/// postcard encodes a struct variant's payload positionally, in declaration
+/// order, so `VoucherRejected`'s `bundle` field sits after `reason` and any
+/// future field must append after `bundle`, never insert before it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StreamError {
     /// Node lacks the blob and cannot reach a provider, or declines to pull
@@ -722,6 +752,21 @@ pub enum StreamError {
     VoucherRejected {
         /// The specific validation failure.
         reason: VoucherRejectReason,
+        /// The node's true watermark plus the client's own last-accepted
+        /// signature, attached ONLY on the regression/exhaustion reasons
+        /// (`StaleNonce`, `AmountRegression`, `BytesRegression`,
+        /// `InsufficientDeposit`) and ONLY when the rejected voucher's
+        /// signature recovers to the channel's pinned `voucher_signer`
+        /// (issue #1481 §5 security property — otherwise anyone who guessed
+        /// the chain-derivable `channel_id` could pull the node's watermark).
+        /// A wallet-less client cannot reconstruct its watermark from chain
+        /// (the claim watermark is `0` until settlement), so this lets it
+        /// self-heal: re-seed to the node's true cumulative, re-sign from
+        /// `nonce + 1`, and resume from `bytes_delivered`. `None` for every
+        /// handler-direct reason (`Expired`, `RetryLater`,
+        /// `CooperativeCloseSigned`, `RateFloorRaised`, …) and whenever the
+        /// signer does not recover to `voucher_signer`.
+        bundle: Option<WatermarkBundle>,
     },
     /// The channel funding this request is owned by a blacklisted origin
     /// operator (ADR 011 §`StreamRequest` Response). Permanent for this channel:
@@ -1011,6 +1056,28 @@ mod tests {
     fn stream_error_voucher_rejected_roundtrip() -> Result<(), postcard::Error> {
         let e = StreamError::VoucherRejected {
             reason: VoucherRejectReason::StaleNonce,
+            bundle: None,
+        };
+        let bytes = postcard::to_allocvec(&e)?;
+        let decoded: StreamError = postcard::from_bytes(&bytes)?;
+        assert_eq!(e, decoded);
+        Ok(())
+    }
+
+    /// The gated case: a `WatermarkBundle` rides alongside the reject reason
+    /// (issue #1481). Round-trips `Some` distinctly from the `None` case above
+    /// — this is the shape a wallet-less client actually receives on a gated
+    /// regression/exhaustion reject.
+    #[test]
+    fn stream_error_voucher_rejected_with_bundle_roundtrip() -> Result<(), postcard::Error> {
+        let e = StreamError::VoucherRejected {
+            reason: VoucherRejectReason::StaleNonce,
+            bundle: Some(WatermarkBundle {
+                amount: [0x11u8; 32],
+                nonce: [0x22u8; 32],
+                bytes_delivered: [0x33u8; 32],
+                last_signature: vec![0x44u8; VOUCHER_SIG_LEN],
+            }),
         };
         let bytes = postcard::to_allocvec(&e)?;
         let decoded: StreamError = postcard::from_bytes(&bytes)?;
@@ -1076,6 +1143,7 @@ mod tests {
             StreamError::EvictedSinceProbe,
             StreamError::VoucherRejected {
                 reason: VoucherRejectReason::BadSignature,
+                bundle: None,
             },
             StreamError::OriginBlacklisted,
             StreamError::HashBlacklisted,
@@ -1540,6 +1608,7 @@ mod tests {
             },
             error: Some(StreamError::VoucherRejected {
                 reason: VoucherRejectReason::StaleNonce,
+                bundle: None,
             }),
             ..sample_response()
         };
@@ -1642,6 +1711,7 @@ mod tests {
         }
         let v = StreamError::VoucherRejected {
             reason: VoucherRejectReason::WrongSigner,
+            bundle: None,
         };
         assert!(v.is_mid_stream());
         assert!(!v.is_delivery_side());
@@ -1660,6 +1730,12 @@ mod tests {
             ClientMessage::StreamEnd,
             ClientMessage::StreamError(StreamError::VoucherRejected {
                 reason: VoucherRejectReason::InsufficientDeposit,
+                bundle: Some(WatermarkBundle {
+                    amount: [0x01u8; 32],
+                    nonce: [0x02u8; 32],
+                    bytes_delivered: [0x03u8; 32],
+                    last_signature: vec![0x04u8; VOUCHER_SIG_LEN],
+                }),
             }),
         ];
         for msg in messages {

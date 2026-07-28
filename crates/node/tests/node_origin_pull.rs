@@ -1744,6 +1744,7 @@ async fn serve_then_reject_voucher(
         &mut send,
         &encode_message(&ClientMessage::StreamError(StreamError::VoucherRejected {
             reason,
+            bundle: None,
         }))?,
     )
     .await
@@ -4999,6 +5000,7 @@ async fn node_origin_a_mid_stream_voucher_rejection_still_reaches_the_channel_re
         RATE,
         StreamError::VoucherRejected {
             reason: VoucherRejectReason::InsufficientDeposit,
+            bundle: None,
         },
     );
 

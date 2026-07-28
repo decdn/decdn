@@ -4,9 +4,24 @@
 use super::{
     Arc, B256, ChannelDeliveryState, ChannelId, ClientHandler, ClientMessage, CooperativeClose,
     CooperativeCloseAuth, CooperativeCloseRequest, DEFAULT_TOLERANCE_BPS, Hash, Mutex, RateError,
-    RecvStream, SendStream, U256, VoucherOutcome, VoucherRejectReason, read_voucher, verify_rate,
-    voucher_reject_reason, wire_voucher_to_signed,
+    RecvStream, SendStream, U256, VoucherOutcome, VoucherRejectReason, WatermarkBundle,
+    read_voucher, verify_rate, voucher_reject_reason, wire_voucher_to_signed,
 };
+
+/// Gated reasons (issue #1481 §5): the regression/exhaustion rejections a
+/// wallet-less client cannot distinguish from chain, so a [`WatermarkBundle`]
+/// may accompany them. Every other reason (`WrongChannel`, `BadSignature`,
+/// `WrongSigner`, `WrongToken`, `RetryLater`, `Expired`,
+/// `CooperativeCloseSigned`, `RateFloorRaised`) never carries a bundle.
+const fn bundle_is_gated(reason: VoucherRejectReason) -> bool {
+    matches!(
+        reason,
+        VoucherRejectReason::StaleNonce
+            | VoucherRejectReason::AmountRegression
+            | VoucherRejectReason::BytesRegression
+            | VoucherRejectReason::InsufficientDeposit
+    )
+}
 
 impl ClientHandler {
     /// Read and apply one cumulative voucher covering `delta_bytes` of newly
@@ -43,7 +58,7 @@ impl ClientHandler {
         // caller (`deliver` always forwards `Some`); kept as a defensive backstop
         // — reject with the closest mid-stream reason.
         let Some(channel) = channel else {
-            self.write_reject(send, VoucherRejectReason::WrongChannel)
+            self.write_reject(send, VoucherRejectReason::WrongChannel, None)
                 .await?;
             return Ok(VoucherOutcome::Rejected);
         };
@@ -64,7 +79,7 @@ impl ClientHandler {
             guard.state.expires_at,
         ) {
             drop(guard);
-            self.write_reject(send, VoucherRejectReason::Expired)
+            self.write_reject(send, VoucherRejectReason::Expired, None)
                 .await?;
             return Ok(VoucherOutcome::Rejected);
         }
@@ -78,7 +93,7 @@ impl ClientHandler {
         // "don't sign while delivering" interlock is needed.
         if guard.state.cooperative_close_signed() {
             drop(guard);
-            self.write_reject(send, VoucherRejectReason::CooperativeCloseSigned)
+            self.write_reject(send, VoucherRejectReason::CooperativeCloseSigned, None)
                 .await?;
             return Ok(VoucherOutcome::Rejected);
         }
@@ -160,7 +175,7 @@ impl ClientHandler {
                     // stale. Surface the typed re-quote signal in-band rather than
                     // an opaque `bail!` — the client should re-probe/re-quote at the
                     // new floor, not resend this voucher.
-                    self.write_reject(send, VoucherRejectReason::RateFloorRaised)
+                    self.write_reject(send, VoucherRejectReason::RateFloorRaised, None)
                         .await?;
                     return Ok(VoucherOutcome::Rejected);
                 }
@@ -184,7 +199,7 @@ impl ClientHandler {
         let Ok(signed) = wire_voucher_to_signed(&wire, channel_id, guard.state.token, new_bytes)
         else {
             drop(guard);
-            self.write_reject(send, VoucherRejectReason::BadSignature)
+            self.write_reject(send, VoucherRejectReason::BadSignature, None)
                 .await?;
             return Ok(VoucherOutcome::Rejected);
         };
@@ -264,9 +279,38 @@ impl ClientHandler {
                 Ok(VoucherOutcome::Accepted)
             }
             Err(e) => {
+                let reason_result = voucher_reject_reason(&e);
+                // Wallet-less resume (issue #1481 §5): on a gated regression/
+                // exhaustion reject, attach the node's true watermark ONLY when
+                // the rejected voucher's signature recovers to this channel's
+                // pinned `voucher_signer` — otherwise anyone who guessed the
+                // chain-derivable `channel_id` could pull the watermark by
+                // sending a garbage voucher. `apply_voucher`'s regression checks
+                // fire BEFORE its signature check, so the reject reason alone
+                // does not prove signer identity; recovery must be run
+                // explicitly, here, before the guard (and its `last_*` state)
+                // drops. `signed` is the SAME reconstructed voucher already
+                // validated above (`wire_voucher_to_signed`) — no need to
+                // rebuild it.
+                let bundle = reason_result.ok().and_then(|reason| {
+                    if !bundle_is_gated(reason) {
+                        return None;
+                    }
+                    let recovered = signed.recover_signer(&self.voucher_domain).ok()?;
+                    if recovered != guard.state.voucher_signer {
+                        return None;
+                    }
+                    let last_signature = guard.state.last_signature()?;
+                    Some(WatermarkBundle {
+                        amount: guard.state.last_amount().to_be_bytes(),
+                        nonce: guard.state.last_nonce().to_be_bytes(),
+                        bytes_delivered: guard.state.last_bytes_delivered().to_be_bytes(),
+                        last_signature: last_signature.to_vec(),
+                    })
+                });
                 drop(guard);
-                if let Ok(reason) = voucher_reject_reason(&e) {
-                    self.write_reject(send, reason).await?;
+                if let Ok(reason) = reason_result {
+                    self.write_reject(send, reason, bundle).await?;
                     Ok(VoucherOutcome::Rejected)
                 } else {
                     // Transient store failure (#527, `RetrySignal`): in-memory
@@ -274,8 +318,10 @@ impl ClientHandler {
                     // and finish the stream cleanly (MUST NOT `VoucherAck`, ADR
                     // 003 §332) so the client resends the same voucher on a
                     // fresh stream rather than seeing an opaque connection drop.
+                    // `RetryLater` is never a gated reason, so `bundle` is
+                    // always `None` here regardless of what was computed above.
                     tracing::warn!(error = %e, "channel store write failed; rejecting with RetryLater");
-                    self.write_reject(send, VoucherRejectReason::RetryLater)
+                    self.write_reject(send, VoucherRejectReason::RetryLater, None)
                         .await?;
                     Ok(VoucherOutcome::Rejected)
                 }

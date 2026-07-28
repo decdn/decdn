@@ -66,7 +66,7 @@ use decdn_incentive::{
 };
 use decdn_protocol::client::{
     ClientBinding, ClientMessage, StreamError, StreamRequest, StreamRequestExt, StreamResponse,
-    VoucherRejectReason,
+    VoucherRejectReason, WatermarkBundle,
 };
 use decdn_protocol::{
     ALPN_CLIENT, DEFAULT_VOUCHER_INTERVAL_MB, MB_BYTES, decode_message, encode_message, read_frame,
@@ -486,9 +486,22 @@ impl std::error::Error for PullTimeout {}
 /// (the `Copy` `VoucherRejectReason`, not a lossy stringification) so a future
 /// caller can branch on retry-vs-top-up-vs-abandon without re-parsing a message.
 /// `Display` keeps the stable `voucher rejected` text for logs.
+///
+/// `bundle` mirrors the wire [`WatermarkBundle`] verbatim (issue #1481): `Some`
+/// only for the gated regression/exhaustion reasons, and only when the node
+/// verified the rejected voucher recovered to the channel's pinned
+/// `voucher_signer` before attaching it. A caller that sees `Some` alongside
+/// `StaleNonce`/`AmountRegression`/`BytesRegression` can self-heal — re-seed
+/// its ledger to the bundle's watermark ([`crate::ledger::Cumulative::from`])
+/// and resume from `bytes_delivered` — rather than treating the rejection as
+/// terminal. `InsufficientDeposit` with `bundle: None` means there is no
+/// signer-verified watermark to resume from (or, more commonly, that a
+/// wallet-less delegate simply has no local means to add deposit) — the
+/// caller must surface that to the app rather than loop.
 #[derive(Debug)]
 pub struct UpstreamVoucherRejected {
     pub reason: VoucherRejectReason,
+    pub bundle: Option<WatermarkBundle>,
 }
 
 impl std::fmt::Display for UpstreamVoucherRejected {
@@ -555,7 +568,10 @@ enum Kind {
     /// `expected_signer`.
     Open {
         error: StreamError,
-        response: StreamResponse,
+        // Boxed (issue #1481 review): `StreamError::VoucherRejected` grew an
+        // optional `WatermarkBundle`, which pushed the unboxed variant past
+        // clippy's `large_enum_variant` threshold relative to `MidStream`.
+        response: Box<StreamResponse>,
     },
     /// Mid-stream refusal: a bare [`ClientMessage::StreamError`] frame that
     /// arrived after the open stage. It carries no signature (#1042), so there
@@ -602,7 +618,10 @@ impl UpstreamRefused {
         }
         match response.error.clone() {
             Some(error) => anyhow::Error::new(Self {
-                kind: Kind::Open { error, response },
+                kind: Kind::Open {
+                    error,
+                    response: Box::new(response),
+                },
             }),
             None => anyhow::anyhow!(
                 "delivery refused but the validated response carried no error code \
@@ -654,9 +673,9 @@ impl UpstreamRefused {
     /// resolves `nodeId` against. A challenger may replay it to `SlashJudge`
     /// with no re-signing.
     #[must_use]
-    pub const fn evidence(&self) -> Option<&StreamResponse> {
+    pub fn evidence(&self) -> Option<&StreamResponse> {
         match &self.kind {
-            Kind::Open { response, .. } => Some(response),
+            Kind::Open { response, .. } => Some(response.as_ref()),
             Kind::MidStream { .. } => None,
         }
     }
@@ -2219,8 +2238,11 @@ async fn self_pay(
                 // Only a `VoucherRejected` is OUR payment-side fault. Carry its
                 // typed reason so the orchestrator can exonerate the provider
                 // (#857).
-                ClientMessage::StreamError(StreamError::VoucherRejected { reason }) => {
-                    Err(anyhow::Error::new(UpstreamVoucherRejected { reason }))
+                ClientMessage::StreamError(StreamError::VoucherRejected { reason, bundle }) => {
+                    Err(anyhow::Error::new(UpstreamVoucherRejected {
+                        reason,
+                        bundle,
+                    }))
                 }
                 // Any OTHER `StreamError` in reply to a voucher is the upstream refusing
                 // mid-stream (it violated the ack protocol, or it is shedding). Carry the

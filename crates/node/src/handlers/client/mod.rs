@@ -42,6 +42,7 @@ use decdn_incentive::{
 use decdn_protocol::client::{
     ChunkData, ClientMessage, CooperativeCloseAuth, CooperativeCloseRequest, StreamError,
     StreamRequest, StreamRequestExt, StreamResponse, StreamResponseBody, VoucherRejectReason,
+    WatermarkBundle,
 };
 use decdn_protocol::{
     ALPN_CLIENT, APP_ERR_RATE_LIMITED, FrameError, MB_BYTES, decode_message, encode_message,

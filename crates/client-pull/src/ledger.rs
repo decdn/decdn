@@ -6,6 +6,7 @@ use std::future::Future;
 
 use alloy::primitives::U256;
 use decdn_protocol::MB_BYTES;
+use decdn_protocol::client::WatermarkBundle;
 use tokio::sync::Mutex;
 
 use crate::UpstreamVoucherRejected;
@@ -20,6 +21,20 @@ pub struct Cumulative {
     pub bytes: U256,
     /// Cumulative channel amount paid (token base units).
     pub amount: U256,
+}
+
+impl From<&WatermarkBundle> for Cumulative {
+    /// Decode a wallet-less resume bundle's big-endian `uint256` totals
+    /// (issue #1481) into the same shape [`ChannelLedger`] tracks. Infallible
+    /// — `U256::from_be_bytes` cannot fail on a fixed 32-byte array — so a
+    /// caller can re-seed directly from a bundle without a `Result`.
+    fn from(bundle: &WatermarkBundle) -> Self {
+        Self {
+            nonce: U256::from_be_bytes(bundle.nonce),
+            bytes: U256::from_be_bytes(bundle.bytes_delivered),
+            amount: U256::from_be_bytes(bundle.amount),
+        }
+    }
 }
 
 /// Compute the next voucher's absolute totals from the live cumulative and the
@@ -217,6 +232,30 @@ impl ChannelLedger {
         Ok(next)
     }
 
+    /// Wallet-less self-heal (issue #1481): overwrite the ledger's cumulative
+    /// AND committed watermark to `cum` — typically [`Cumulative::from`] a
+    /// [`WatermarkBundle`] the node attached to a gated `StaleNonce` /
+    /// `AmountRegression` / `BytesRegression` / `InsufficientDeposit`
+    /// rejection — and clear any armed in-flight voucher, since that voucher
+    /// is exactly the one the node just told us it does NOT hold (that is why
+    /// it rejected). The next [`Self::issue`] on this ledger signs
+    /// `cum.nonce + 1`, matching what the node will actually accept next.
+    ///
+    /// This is a hard overwrite, not a monotonic bump: the whole point is
+    /// that the caller's prior local state was wrong (a wallet-less client
+    /// has no reliable on-chain source for its watermark until settlement),
+    /// so the bundle — signer-verified by the node before it was sent — is
+    /// authoritative. Callers MUST only pass a cumulative sourced from a
+    /// bundle the node actually attached, never a value the caller invented.
+    pub async fn reseed(&self, cum: Cumulative) {
+        *self.cumulative.lock().await = cum;
+        *self
+            .committed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = cum;
+        self.set_in_flight(None);
+    }
+
     /// Set the in-flight slot. Poison-tolerant for the same reason [`Self::committed`]
     /// is: the value guards money, and refusing to write it would lose the record.
     fn set_in_flight(&self, value: Option<Cumulative>) {
@@ -329,6 +368,7 @@ mod tests {
             .issue(100, 10, |_next| async {
                 Err(anyhow::Error::new(UpstreamVoucherRejected {
                     reason: VoucherRejectReason::StaleNonce,
+                    bundle: None,
                 }))
             })
             .await;
@@ -338,6 +378,119 @@ mod tests {
             Cumulative::default(),
             "an explicitly rejected voucher must not advance what we persist"
         );
+    }
+
+    /// Issue #1481: a wallet-less client cannot reconstruct its watermark from chain, so a
+    /// gated `StaleNonce` rejection carries the node's true watermark back in a
+    /// `WatermarkBundle`. `Cumulative::from` must decode it losslessly (the boundary values
+    /// that would expose a truncation), and `reseed` must overwrite BOTH `committed` and the
+    /// live `cumulative` — the next `issue` builds on `settlement()`, which reads `cumulative`
+    /// first — while clearing any armed in-flight voucher (the node just told us it does not
+    /// hold that nonce, so treating it as still-owed would double-count).
+    #[test]
+    fn cumulative_from_bundle_is_lossless() {
+        let bundle = WatermarkBundle {
+            amount: U256::MAX.to_be_bytes(),
+            nonce: U256::from(7u64).to_be_bytes(),
+            bytes_delivered: U256::from(1_048_576u64).to_be_bytes(),
+            last_signature: vec![0xABu8; 65],
+        };
+        let cum = Cumulative::from(&bundle);
+        assert_eq!(cum.amount, U256::MAX);
+        assert_eq!(cum.nonce, U256::from(7u64));
+        assert_eq!(cum.bytes, U256::from(1_048_576u64));
+    }
+
+    /// The self-heal itself: a `StaleNonce` rejection with a bundle present is no longer a
+    /// dead end. Re-seeding the ledger from the bundle's watermark, then issuing again, signs
+    /// `bundle.nonce + 1` — not a collision with what the node already holds and not a repeat
+    /// of the stale value the caller's local state was wrong about.
+    #[tokio::test]
+    async fn a_stale_nonce_rejection_with_a_bundle_self_heals() -> anyhow::Result<()> {
+        // The caller's local ledger thinks it is at nonce 1 (e.g. a wallet-less delegate
+        // that never persisted the true watermark across a restart), but the node's true
+        // watermark — echoed back on the gated reject — is nonce 5.
+        let ledger = ChannelLedger::new(Cumulative {
+            nonce: U256::from(1u64),
+            bytes: U256::from(1000u64),
+            amount: U256::from(10u64),
+        });
+        let bundle = WatermarkBundle {
+            amount: U256::from(50u64).to_be_bytes(),
+            nonce: U256::from(5u64).to_be_bytes(),
+            bytes_delivered: U256::from(5000u64).to_be_bytes(),
+            last_signature: vec![0xCDu8; 65],
+        };
+
+        let rejected = ledger
+            .issue(100, 10, |_next| async {
+                Err(anyhow::Error::new(UpstreamVoucherRejected {
+                    reason: VoucherRejectReason::StaleNonce,
+                    bundle: Some(bundle.clone()),
+                }))
+            })
+            .await;
+        let err = rejected
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("expected the stale-nonce voucher to be rejected"))?;
+        let upstream = err
+            .downcast_ref::<UpstreamVoucherRejected>()
+            .ok_or_else(|| anyhow::anyhow!("expected UpstreamVoucherRejected, got: {err:?}"))?;
+        assert_eq!(upstream.reason, VoucherRejectReason::StaleNonce);
+        let recovered_bundle = upstream
+            .bundle
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("StaleNonce with a bundle must not be terminal"))?;
+
+        // Self-heal: re-seed to the node's true watermark and resume.
+        ledger.reseed(Cumulative::from(recovered_bundle)).await;
+        assert_eq!(ledger.settlement().nonce, U256::from(5u64));
+
+        let mut signed_nonce = None;
+        let committed = ledger
+            .issue(100, 10, |next: Cumulative| {
+                signed_nonce = Some(next.nonce);
+                async { Ok(()) }
+            })
+            .await?;
+        assert_eq!(
+            signed_nonce,
+            Some(U256::from(6u64)),
+            "the next voucher must sign bundle.nonce + 1, not the stale local nonce"
+        );
+        assert_eq!(committed.nonce, U256::from(6u64));
+        assert_eq!(committed.bytes, U256::from(5100u64)); // bundle.bytes_delivered + 100
+        Ok(())
+    }
+
+    /// The other half: `InsufficientDeposit` with NO bundle (the node either didn't verify
+    /// the signer or there is genuinely nothing to resume from) must not be treated as
+    /// self-healable — a caller checking `bundle.is_none()` sees exactly the same "give up
+    /// and surface to the app" signal it always did. This is the guard against silently
+    /// looping on a channel a wallet-less delegate has no way to top up.
+    #[tokio::test]
+    async fn insufficient_deposit_without_a_bundle_is_not_self_healable() -> anyhow::Result<()> {
+        let ledger = ChannelLedger::new(Cumulative::default());
+        let result = ledger
+            .issue(100, 10, |_next| async {
+                Err(anyhow::Error::new(UpstreamVoucherRejected {
+                    reason: VoucherRejectReason::InsufficientDeposit,
+                    bundle: None,
+                }))
+            })
+            .await;
+        let err = result
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("an insufficient-deposit voucher must be rejected"))?;
+        let upstream = err
+            .downcast_ref::<UpstreamVoucherRejected>()
+            .ok_or_else(|| anyhow::anyhow!("expected UpstreamVoucherRejected, got: {err:?}"))?;
+        assert_eq!(upstream.reason, VoucherRejectReason::InsufficientDeposit);
+        assert!(
+            upstream.bundle.is_none(),
+            "no bundle means no self-heal path — the caller must surface a top-up need"
+        );
+        Ok(())
     }
 
     /// The load-bearing case (#1145 review): an AMBIGUOUS ack failure — a stall timeout, a

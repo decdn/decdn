@@ -2065,7 +2065,7 @@ fn pull_verdict(err: &anyhow::Error) -> PullVerdict {
         // Unwrap it here rather than in `classify_refusal`, because the answer is not a
         // refusal verdict at all: it is a statement about our CHANNEL, and `voucher_verdict`
         // is the one place that decides what a rejected voucher costs.
-        if let StreamError::VoucherRejected { reason } = refused.error() {
+        if let StreamError::VoucherRejected { reason, .. } = refused.error() {
             return voucher_verdict(*reason);
         }
         return PullVerdict::Refused(classify_refusal(refused.error()));
@@ -2433,6 +2433,7 @@ mod tests {
 
         let rejected: anyhow::Error = anyhow::Error::new(UpstreamVoucherRejected {
             reason: decdn_protocol::client::VoucherRejectReason::StaleNonce,
+            bundle: None,
         });
         assert!(rejected.downcast_ref::<UpstreamVoucherRejected>().is_some());
         assert!(rejected.downcast_ref::<PullTimeout>().is_none());
@@ -2493,6 +2494,7 @@ mod tests {
             StreamError::BlobTooLarge,
             StreamError::VoucherRejected {
                 reason: VoucherRejectReason::RetryLater,
+                bundle: None,
             },
         ] {
             assert_ne!(
@@ -2573,6 +2575,7 @@ mod tests {
         assert_eq!(
             classify_refusal(&StreamError::VoucherRejected {
                 reason: VoucherRejectReason::BadSignature,
+                bundle: None,
             }),
             RefusalVerdict::OurFault
         );
