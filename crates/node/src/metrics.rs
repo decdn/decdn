@@ -1201,6 +1201,15 @@ pub struct DecdnMetrics {
     /// place the distinction lives. Visible name:
     /// `decdn_serve_stream_rejected_cooperative_close_signed_total`.
     pub serve_stream_rejected_cooperative_close_signed: Counter,
+    /// A `CooperativeCloseRequest` was declined because its `client_signature`
+    /// did not recover to the channel's `client` (missing, malformed, or from
+    /// the wrong key). The node signs no waiver and does not freeze the channel.
+    /// The decline is wire-indistinguishable from the unknown-channel /
+    /// zero-voucher finish, so this server-side counter is the only place the
+    /// distinction lives — a rising value is the auth-bypass probing signal
+    /// (ADR 003 §Cooperative close). Visible name:
+    /// `decdn_cooperative_close_request_unauthorized_total`.
+    pub cooperative_close_request_unauthorized: Counter,
     /// Delivery refused because the requested bounded range
     /// `[byte_offset, byte_offset + byte_len)` is out of bounds for the blob
     /// (ADR 005 §Bounded byte ranges: the node MUST reject an overflowing or
@@ -2041,6 +2050,10 @@ recorders! {
     /// cooperative-close waiver (ADR 003 §Cooperative close).
     serve_stream_rejected_cooperative_close_signed
         => serve_stream_rejected_cooperative_close_signed.inc();
+
+    /// Record a `CooperativeCloseRequest` declined for a missing/invalid
+    /// channel-client signature (ADR 003 §Cooperative close auth-bypass fix).
+    cooperative_close_request_unauthorized => cooperative_close_request_unauthorized.inc();
 
     /// Record a `serve_stream` delivery refused because the requested bounded
     /// range is out of bounds for the blob (ADR 005 §Bounded byte ranges).
@@ -3157,6 +3170,7 @@ mod tests {
             "decdn_serve_stream_rejected_insufficient_deposit_total",
             "decdn_serve_stream_rejected_unauthorized_origin_total",
             "decdn_serve_stream_rejected_cooperative_close_signed_total",
+            "decdn_cooperative_close_request_unauthorized_total",
         ];
         let text = metrics.encode().unwrap();
         for name in reasons {
@@ -3175,6 +3189,7 @@ mod tests {
         metrics.serve_stream_rejected_insufficient_deposit();
         metrics.serve_stream_rejected_unauthorized_origin();
         metrics.serve_stream_rejected_cooperative_close_signed();
+        metrics.cooperative_close_request_unauthorized();
 
         let text = metrics.encode().unwrap();
         for name in reasons {
