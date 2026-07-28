@@ -45,6 +45,11 @@ pub mod probe;
 /// Wallet-filled HTTP provider builder for opening/settling payment channels.
 pub mod provider;
 pub mod rtt_map;
+// Docs live in `sink.rs` as `//!`. Deliberately NOT documented here as well:
+// rustdoc resolves intra-doc links on a `mod` item in THIS file's scope, so the
+// module's own links (`ResponseDecoder`, `resume_offset`, …) would go unresolved
+// and fail the `-D warnings` doc gate.
+pub mod sink;
 
 pub use ledger::{ChannelLedger, Cumulative};
 
@@ -309,6 +314,39 @@ pub struct BlobTooLargeClaim {
     pub claimed: u64,
     pub ceiling: u64,
 }
+
+/// The requested `byte_offset` is at or past the blob's end, so no resume can be
+/// served from it (#1120).
+///
+/// Typed rather than a bare string because it is the ONE signal that proves a
+/// caller's partial download does not belong to this blob — a stale `.partial`
+/// left under the same `--output` by a fetch of a different or larger blob, or
+/// one that completed but was killed before its rename. A resumable client keys
+/// its discard-and-refetch on this and nothing else: classifying by exclusion
+/// ("any error that is not a voucher rejection") would sweep in ordinary stalls
+/// and resets and destroy a perfectly good prefix the user has already paid for.
+///
+/// Note this is a statement about the *offset*, not about the peer: the node
+/// answered honestly. Callers must not score it against the provider.
+#[derive(Debug)]
+pub struct ResumeOffsetPastEnd {
+    /// Whole-blob size the node signed for.
+    pub total_bytes: u64,
+    /// The offset we asked to resume from.
+    pub byte_offset: u64,
+}
+
+impl std::fmt::Display for ResumeOffsetPastEnd {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "cannot resume at byte {}: the blob is only {} bytes",
+            self.byte_offset, self.total_bytes
+        )
+    }
+}
+
+impl std::error::Error for ResumeOffsetPastEnd {}
 
 impl std::fmt::Display for BlobTooLargeClaim {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1356,14 +1394,18 @@ async fn open_stream(
     .map_err(|_| anyhow::Error::new(PullTimeout { after: open }))?
 }
 
-/// Wallet-less resume (issue #1481 §5): the maximum number of times
-/// [`fetch_inner`] will reopen a fresh stream after a gated, bundled
+/// Wallet-less resume (issue #1481 §5): the maximum number of times a fetch
+/// will reopen a fresh stream after a gated, bundled
 /// `StaleNonce`/`AmountRegression`/`BytesRegression`/`InsufficientDeposit`
 /// rejection. Bounds a node that keeps rejecting (a buggy or adversarial
 /// peer echoing a bundle that never lets the client catch up) to a handful
 /// of round trips rather than looping forever; a healthy self-heal needs
 /// exactly one.
-const MAX_RESUME_ATTEMPTS: u32 = 3;
+///
+/// Public because the STREAMING fetch (#1120) drives its own reopen loop — it
+/// owns the output file and must rewind it before each retry, which this crate
+/// cannot do for it — and both loops must agree on the bound.
+pub const MAX_RESUME_ATTEMPTS: u32 = 3;
 
 /// Buffered fetch with wallet-less resume (issue #1481 §5): if a mid-stream
 /// voucher rejection carries a signer-verified [`WatermarkBundle`] for one of
@@ -1497,7 +1539,7 @@ async fn fetch_inner(
 /// `signed.recover_signer(&self.voucher_domain) == guard.state.voucher_signer`). A bundle whose
 /// signature does not recover to `ctx.client_signer.address()` is treated as a hostile/corrupt
 /// echo, not a legitimate watermark, and is never reseeded from.
-fn resumable_watermark<'a>(
+pub fn resumable_watermark<'a>(
     err: &'a anyhow::Error,
     ctx: &ChannelContext,
 ) -> Option<&'a WatermarkBundle> {
@@ -1601,12 +1643,16 @@ async fn fetch_inner_once(
     // bypass. A legitimate server always claims `total_bytes >= byte_offset`;
     // reject anything less before the loop. (A non-empty but *short* delivery is
     // caught by the completeness check after the loop.)
-    if resp.body.total_bytes < byte_offset {
-        anyhow::bail!(
-            "server claimed total_bytes ({}) below the requested byte_offset ({})",
-            resp.body.total_bytes,
-            byte_offset
-        );
+    // A resume offset the blob cannot satisfy. `<=` rather than `<`: an offset
+    // exactly AT the end has no chunk group to anchor either, and `align_range`
+    // would reject it a few lines later with an untyped fault — this way both
+    // land on the same typed sentinel. Guarded on `byte_offset > 0` so a 0-byte
+    // blob fetched from 0 (#1054) is untouched.
+    if resp.body.total_bytes <= byte_offset && byte_offset > 0 {
+        return Err(anyhow::Error::new(ResumeOffsetPastEnd {
+            total_bytes: resp.body.total_bytes,
+            byte_offset,
+        }));
     }
 
     let rate_per_mb = resp.body.rate_per_mb;
@@ -2091,12 +2137,16 @@ pub async fn open_progressive_pull(
     if max_rate_per_mb > 0 && resp.body.rate_per_mb > max_rate_per_mb {
         return Err(RateAboveCeiling::over_ceiling(resp, max_rate_per_mb));
     }
-    if resp.body.total_bytes < byte_offset {
-        anyhow::bail!(
-            "server claimed total_bytes ({}) below the requested byte_offset ({})",
-            resp.body.total_bytes,
-            byte_offset
-        );
+    // A resume offset the blob cannot satisfy. `<=` rather than `<`: an offset
+    // exactly AT the end has no chunk group to anchor either, and `align_range`
+    // would reject it a few lines later with an untyped fault — this way both
+    // land on the same typed sentinel. Guarded on `byte_offset > 0` so a 0-byte
+    // blob fetched from 0 (#1054) is untouched.
+    if resp.body.total_bytes <= byte_offset && byte_offset > 0 {
+        return Err(anyhow::Error::new(ResumeOffsetPastEnd {
+            total_bytes: resp.body.total_bytes,
+            byte_offset,
+        }));
     }
 
     let rate_per_mb = resp.body.rate_per_mb;

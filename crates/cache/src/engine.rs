@@ -1545,10 +1545,10 @@ impl CacheEngine {
                         inflight: &self.inner.inflight,
                         notify: &notify,
                     };
-                    break self.pull_through(hash, false).await?;
+                    break self.pull_through_bytes(hash).await?;
                 }
                 // Mutex poisoned — fall through to a direct pull.
-                None => break self.pull_through(hash, false).await?,
+                None => break self.pull_through_bytes(hash).await?,
             }
         };
         self.touch(hash);
@@ -1566,6 +1566,21 @@ impl CacheEngine {
     /// node-to-node cache-miss pull-through hook (#831) — so an internal fill is
     /// not miscounted as client-facing egress and the whole blob is not
     /// re-assembled into a buffer the caller would just drop. A hit is a no-op.
+    ///
+    /// That second guarantee is enforced, not merely intended: this path is
+    /// `FillMode::CommitOnly` all the way down, and neither commit arm can hand a
+    /// payload back under it — the streaming arm skips the `read_local`, the
+    /// buffered arm drops its drain buffer (#1132). Before that the blob *was*
+    /// read back and dropped, which is how the serve path's miss leg came to hold
+    /// ~708 MB for a 708 MB blob.
+    ///
+    /// Note the buffered arm's cost is bounded by
+    /// `cache.origin_retry.buffered_max_bytes` (4 MiB default) rather than by the
+    /// mode: an origin that advertises a `size_hint` at or under it is drained
+    /// before commit either way (a `None` hint always streams, and `0` disables
+    /// buffering). `CommitOnly` guarantees no blob is handed *back*, not that no
+    /// blob is ever briefly buffered.
+    ///
     /// The origin-egress metric (`pull_through_bytes`) is still bumped by the
     /// pull, which is correct — those bytes really did leave an origin.
     ///
@@ -1638,12 +1653,15 @@ impl CacheEngine {
                         inflight: &self.inner.inflight,
                         notify: &notify,
                     };
-                    self.pull_through(hash, local_only).await?;
+                    // Fill-only: the payload is dropped, so the whole blob is
+                    // never read back out of the store (#1132). The wrapper
+                    // returns `()`, so there is nothing here to drop by accident.
+                    self.pull_through_fill(hash, local_only).await?;
                     break;
                 }
                 // Mutex poisoned — fall through to a direct pull.
                 None => {
-                    self.pull_through(hash, local_only).await?;
+                    self.pull_through_fill(hash, local_only).await?;
                     break;
                 }
             }
@@ -2310,15 +2328,56 @@ impl CacheEngine {
         Ok(Bytes::from(bytes))
     }
 
+    /// Whole-blob-in-memory form of [`Self::export_bao_range_stream`]: drains the
+    /// stream into one contiguous `Bytes`. See that method for the wire format and
+    /// the range semantics.
+    ///
+    /// **Peak memory is the whole aligned range.** The paid serve path must NOT
+    /// use this — it drives the stream directly, so a large blob costs one frame
+    /// of RAM rather than a copy of the blob (#1132). Every caller today is a test
+    /// that needs a buffer to assert against; it is kept for them, and because the
+    /// ADR 038 round-trip tests are more legible over a buffer than a stream.
+    ///
+    /// # Errors
+    ///
+    /// Everything [`Self::export_bao_range_stream`] can fail with, except that a
+    /// fault discovered while exporting — including the truncation refusal —
+    /// surfaces here as an `Err` return rather than as a terminal stream item,
+    /// because nothing has been handed to a consumer yet.
+    pub async fn export_bao_range(
+        &self,
+        hash: Hash,
+        byte_offset: u64,
+        byte_len: u64,
+        blob_size: u64,
+    ) -> CacheResult<Bytes> {
+        let mut stream = self
+            .export_bao_range_stream(hash, byte_offset, byte_len, blob_size)
+            .await?;
+        // Pre-size to the exact wire length (proof + data) so the buffer never
+        // reallocates; `wire_len` walks the same node set the export stream emits.
+        // The range re-validated cleanly inside the call above, so a re-alignment
+        // fault here is unreachable — degrade to an unsized buffer rather than
+        // duplicating the error mapping.
+        let cap = align_range(byte_offset, byte_len, blob_size)
+            .map_or(0, |a| usize::try_from(a.wire_len()).unwrap_or(0));
+        let mut out = Vec::with_capacity(cap);
+        while let Some(item) = stream.next().await {
+            out.extend_from_slice(&item?);
+        }
+        Ok(Bytes::from(out))
+    }
+
     /// Export `[byte_offset, byte_offset + byte_len)` of `hash` as the
     /// **header-less bao interleaved verified-stream encoding** that travels on
-    /// `cdn/client/v1` ([ADR 038 §Serve side](../../../adr/038-bao-verified-range-streaming.md)).
-    /// `byte_len == 0` exports to the blob end. This is the *only* client-facing
-    /// delivery path — there is no raw-byte fallback (ADR 038 AC#4) — so a
-    /// whole-blob serve passes `byte_offset == 0, byte_len == 0`.
+    /// `cdn/client/v1` ([ADR 038 §Serve side](../../../adr/038-bao-verified-range-streaming.md)),
+    /// yielded incrementally as the store produces it. `byte_len == 0` exports to
+    /// the blob end. This is the *only* client-facing delivery path — there is no
+    /// raw-byte fallback (ADR 038 AC#4) — so a whole-blob serve passes
+    /// `byte_offset == 0, byte_len == 0`.
     ///
-    /// The returned bytes are proof nodes (64 B each) interleaved with chunk-group
-    /// data in tree order, **without** the 8-byte size header: the signed
+    /// The bytes are proof nodes (64 B each) interleaved with chunk-group data in
+    /// tree order, **without** the 8-byte size header: the signed
     /// `StreamResponse.body.total_bytes` is the authoritative size, so the
     /// receiver builds its own `BaoTree` and never reads a header off the wire
     /// (avoids a second, unauthenticated size source — ADR 038 §Wire format).
@@ -2331,18 +2390,36 @@ impl CacheEngine {
     /// Works against a **partial** blob (only imported/verified chunk groups are
     /// exportable, exactly like [`Self::export_range`]).
     ///
+    /// Each item is one export item's serialization — a 64-byte proof pair or one
+    /// chunk group's data — so a consumer that writes items straight to the wire
+    /// holds O(chunk group) rather than O(blob). This is what the paid serve path
+    /// drives (#1132); a 708 MB blob previously cost ~708 MB resident per
+    /// concurrent serve.
+    ///
+    /// # Truncation is reported mid-stream
+    ///
+    /// The `!done` refusal below (the store's item channel closing without a
+    /// terminal `Done`/`Error` — an actor crash or shutdown race) can only be
+    /// detected at the END of the stream, by which point a streaming consumer has
+    /// already put earlier bytes on the wire. It therefore surfaces as a terminal
+    /// `Err` **item** rather than as a pre-flight error, and the consumer must
+    /// abort the delivery on it. The billing invariant is unchanged: the client
+    /// sees a short delivery, rejects it, and never pays the closing voucher — but
+    /// the detection point moved from before the first byte to after the last
+    /// (#915 review, #1132).
+    ///
     /// # Errors
     ///
-    /// [`CacheError::Store`] if the blob is absent, the store cannot report a
-    /// partial blob's size, the requested range is out of bounds, or the bao
-    /// export stream faults.
-    pub async fn export_bao_range(
+    /// [`CacheError::Store`] if the requested range is out of bounds, or (for the
+    /// 0-byte case) the blob is absent. Faults discovered while exporting —
+    /// including the truncation refusal — arrive as `Err` items in the stream.
+    pub async fn export_bao_range_stream(
         &self,
         hash: Hash,
         byte_offset: u64,
         byte_len: u64,
         blob_size: u64,
-    ) -> CacheResult<Bytes> {
+    ) -> CacheResult<Pin<Box<dyn futures_util::Stream<Item = CacheResult<Bytes>> + Send>>> {
         // `blob_size` is the authoritative whole-blob size supplied by the caller
         // (the signed `total_bytes`), NOT resolved from the store. An origin-tier
         // range pull (#823) imports a *partial* blob whose `status()` size is
@@ -2358,27 +2435,28 @@ impl CacheEngine {
         })?;
 
         // A 0-byte blob (#1054) has no chunk groups and no proof: the header-less
-        // wire form is empty. Return it directly rather than driving an empty
-        // `export_bao` stream, whose terminal `Done` we would otherwise depend on
-        // to clear the `!done` guard. Still confirm presence first: the documented
+        // wire form is empty. Return an empty stream directly rather than driving an
+        // empty `export_bao` stream, whose terminal `Done` we would otherwise depend
+        // on to clear the `!done` guard. Still confirm presence first: the documented
         // contract errors on an absent blob, the non-empty path below faults on
         // `export_bao` for a missing hash, and `has` honors a logical eviction
         // (#279) — so a present-only early return keeps behavior consistent and
         // never serves an empty body for a hash this node has taken down.
+        //
+        // An empty stream (rather than a single empty item) is what keeps the serve
+        // path's "the empty blob goes straight to `StreamEnd`" property: `ChunkData`
+        // cannot hold an empty payload (#1088), so a zero-length item would be
+        // unsendable.
         if blob_size == 0 {
             if !self.has(hash).await? {
                 return Err(CacheError::Store(anyhow::anyhow!(
                     "export_bao_range: blob {hash} not present"
                 )));
             }
-            return Ok(Bytes::new());
+            return Ok(Box::pin(futures_util::stream::empty()));
         }
 
-        // Pre-size to the exact wire length (proof + data) so the buffer never
-        // reallocates; `wire_len` walks the same node set the export stream emits.
-        let cap = usize::try_from(aligned.wire_len()).unwrap_or(0);
-        let mut out = Vec::with_capacity(cap);
-        let mut stream = self
+        let stream = self
             .inner
             .store
             .blobs()
@@ -2387,37 +2465,52 @@ impl CacheEngine {
         // Serialize the header-less wire form: Parent → 64 bytes (left‖right
         // hashes), Leaf → its data; skip the `Size` item (the header) and stop on
         // `Done`. Mirrors iroh-blobs' `ExportBaoProgress::write` minus the header.
-        let mut done = false;
-        while let Some(item) = stream.next().await {
-            match item {
-                EncodedItem::Size(_) => {}
-                EncodedItem::Parent(parent) => {
-                    out.extend_from_slice(parent.pair.0.as_bytes());
-                    out.extend_from_slice(parent.pair.1.as_bytes());
+        //
+        // The `bool` in the unfold state is "this stream is finished" — set after
+        // yielding a terminal error so the consumer cannot poll past it into a
+        // second, spurious truncation error.
+        Ok(Box::pin(futures_util::stream::unfold(
+            (stream, false),
+            move |(mut stream, finished)| async move {
+                if finished {
+                    return None;
                 }
-                EncodedItem::Leaf(leaf) => out.extend_from_slice(&leaf.data),
-                EncodedItem::Done => {
-                    done = true;
-                    break;
+                loop {
+                    match stream.next().await {
+                        Some(EncodedItem::Size(_)) => {}
+                        Some(EncodedItem::Parent(parent)) => {
+                            let mut frame = BytesMut::with_capacity(64);
+                            frame.extend_from_slice(parent.pair.0.as_bytes());
+                            frame.extend_from_slice(parent.pair.1.as_bytes());
+                            return Some((Ok(frame.freeze()), (stream, false)));
+                        }
+                        Some(EncodedItem::Leaf(leaf)) => {
+                            return Some((Ok(leaf.data), (stream, false)));
+                        }
+                        Some(EncodedItem::Done) => return None,
+                        Some(EncodedItem::Error(cause)) => {
+                            let err = CacheError::Store(
+                                anyhow::Error::from(cause).context("export_bao stream failed"),
+                            );
+                            return Some((Err(err), (stream, true)));
+                        }
+                        // The store's item channel closing without a terminal
+                        // `Done`/`Error` (actor crash / shutdown race) would
+                        // otherwise yield a silently TRUNCATED wire that the serve
+                        // path bills the client for and the client rejects as a
+                        // short delivery — with no server-side signal. Refuse
+                        // instead (#915 review).
+                        None => {
+                            let err = CacheError::Store(anyhow::anyhow!(
+                                "export_bao stream for {hash} ended without Done; \
+                                 refusing truncated export"
+                            ));
+                            return Some((Err(err), (stream, true)));
+                        }
+                    }
                 }
-                EncodedItem::Error(cause) => {
-                    return Err(CacheError::Store(
-                        anyhow::Error::from(cause).context("export_bao stream failed"),
-                    ));
-                }
-            }
-        }
-        // The store's item channel closing without a terminal `Done`/`Error`
-        // (actor crash / shutdown race) would otherwise return a silently
-        // TRUNCATED wire that the serve path bills the client for and the
-        // client rejects as a short delivery — with no server-side signal.
-        // Refuse instead (#915 review).
-        if !done {
-            return Err(CacheError::Store(anyhow::anyhow!(
-                "export_bao stream for {hash} ended without Done; refusing truncated export"
-            )));
-        }
-        Ok(Bytes::from(out))
+            },
+        )))
     }
 
     /// Whether the origin chain has any origin `pull_through` would actually try
@@ -2430,7 +2523,52 @@ impl CacheEngine {
             .any(|o| !local_only || o.kind() != OriginKind::Peer)
     }
 
-    async fn pull_through(&self, hash: Hash, local_only: bool) -> CacheResult<Bytes> {
+    /// [`Self::pull_through`] for a caller that needs the bytes ([`Self::get`]).
+    ///
+    /// Exists so no caller has to name a [`FillMode`] or unwrap the `Option`: the
+    /// mode↔shape correspondence is resolved here, once. A `None` under
+    /// [`FillMode::ReturnBytes`] is a logic regression, not a runtime condition —
+    /// surface it as a `Store` fault, since the anti-panic policy rules out an
+    /// `expect` and a silent empty `Bytes` would be worse (the caller would serve
+    /// a zero-length blob).
+    async fn pull_through_bytes(&self, hash: Hash) -> CacheResult<Bytes> {
+        match self
+            .pull_through(hash, false, FillMode::ReturnBytes)
+            .await?
+        {
+            Some(bytes) => Ok(bytes),
+            None => Err(CacheError::Store(anyhow::anyhow!(
+                "pull_through returned no bytes for {hash} under FillMode::ReturnBytes"
+            ))),
+        }
+    }
+
+    /// [`Self::pull_through`] for a caller that only wants the blob present
+    /// ([`Self::populate`] / [`Self::populate_local`]).
+    ///
+    /// The `()` return is the point: under [`FillMode::CommitOnly`] there is no
+    /// payload to hand back, and a caller that cannot receive one cannot
+    /// accidentally keep a whole blob alive (#1132).
+    async fn pull_through_fill(&self, hash: Hash, local_only: bool) -> CacheResult<()> {
+        self.pull_through(hash, local_only, FillMode::CommitOnly)
+            .await
+            .map(drop)
+    }
+
+    /// Walk the origin chain to fill `hash`.
+    ///
+    /// The mode↔return-shape correspondence is exact in both directions:
+    /// [`FillMode::ReturnBytes`] always yields `Some` on success and
+    /// [`FillMode::CommitOnly`] always yields `None`. Prefer the
+    /// [`Self::pull_through_bytes`] / [`Self::pull_through_fill`] wrappers, which
+    /// are total and hide the `Option` entirely.
+    #[allow(clippy::too_many_lines)] // One linear chain walk; each outcome arm carries the rationale for its own fallback/return decision, and splitting the match out would separate those from the loop state (`last_err`, `any_not_found`, `any_short_circuit`) they exist to explain.
+    async fn pull_through(
+        &self,
+        hash: Hash,
+        local_only: bool,
+        mode: FillMode,
+    ) -> CacheResult<Option<Bytes>> {
         // Every pull_through entry is a `get()` cache miss, regardless
         // of how the pull resolves. Coalesced waiters that find a hit
         // on retry never call `pull_through`, so they never reach this
@@ -2508,7 +2646,13 @@ impl CacheEngine {
 
             let (outcome, terminal) =
                 run_with_retry_classified(policy, self.inner.metrics.as_ref(), hash, || {
-                    self.pull_through_attempt(Arc::clone(&origin), hash, max_blob_bytes, policy)
+                    self.pull_through_attempt(
+                        Arc::clone(&origin),
+                        hash,
+                        max_blob_bytes,
+                        policy,
+                        mode,
+                    )
                 })
                 .await;
             // Commit the breaker outcome through the guard (defusing its
@@ -2535,7 +2679,13 @@ impl CacheEngine {
                     // doesn't change the holder's relationship with the
                     // blob.
                     let _ = self.inner.inserts_tx.send(hash);
-                    return Ok(bytes);
+                    return Ok(Some(bytes));
+                }
+                // Same successful commit, minus the read-back the caller did not
+                // want (#1132) — so it must broadcast the insert identically.
+                Ok(PullThroughOutcome::Committed) => {
+                    let _ = self.inner.inserts_tx.send(hash);
+                    return Ok(None);
                 }
                 Ok(PullThroughOutcome::NotFound) => {
                     any_not_found = true;
@@ -2748,6 +2898,11 @@ impl CacheEngine {
     /// produces a fresh attempt on each invocation — the side-channel `Arc`s,
     /// `TempTag`s, and origin futures all have to be re-created per
     /// attempt and can't be reused across iterations.
+    ///
+    /// Under [`FillMode::CommitOnly`] (the `populate` fill path) this returns
+    /// [`PullThroughOutcome::Committed`] rather than a payload — the streaming arm
+    /// by skipping its `read_local`, the buffered arm by dropping its drain
+    /// buffer. See that variant's docs (#1132).
     #[allow(clippy::too_many_lines)] // Linear per-attempt flow; the failure-classification arms each need their own context comment, and splitting them across functions would obscure the sequence more than the length.
     async fn pull_through_attempt(
         &self,
@@ -2755,6 +2910,7 @@ impl CacheEngine {
         hash: Hash,
         max_blob_bytes: u64,
         policy: RetryPolicy,
+        mode: FillMode,
     ) -> Result<PullThroughOutcome, OriginPullError> {
         // The origin handle is now plumbed in by the caller
         // (`pull_through`'s fallback-chain loop, #284) so this method
@@ -2791,7 +2947,7 @@ impl CacheEngine {
                 }
                 Err(e) => return Err(classify_io_error(e)),
             };
-            return self.commit_buffered_bytes(hash, bytes).await;
+            return self.commit_buffered_bytes(hash, bytes, mode).await;
         }
 
         // Streaming path: drive the origin stream into the store, verify the
@@ -2804,6 +2960,13 @@ impl CacheEngine {
             .import_and_verify_stream(hash, stream, max_blob_bytes)
             .await?
         {
+            // The fill-only caller (`populate` / `populate_local`) drops the bytes,
+            // so reading them back would re-materialise the whole blob for nothing
+            // — the exact allocation the streaming import above just avoided
+            // (#1132). Skip it.
+            StreamCommitOutcome::Committed if mode == FillMode::CommitOnly => {
+                Ok(PullThroughOutcome::Committed)
+            }
             StreamCommitOutcome::Committed => match self.read_local(hash).await {
                 Ok(bytes) => Ok(PullThroughOutcome::Bytes(bytes)),
                 Err(CacheError::Store(err)) => Ok(PullThroughOutcome::Store(err)),
@@ -2968,6 +3131,7 @@ impl CacheEngine {
         &self,
         hash: Hash,
         bytes: Bytes,
+        mode: FillMode,
     ) -> Result<PullThroughOutcome, OriginPullError> {
         // iroh-blobs `add_bytes` returns `Ok(NamedTag)` directly,
         // skipping the `TempTag` intermediary used by `add_stream`.
@@ -3009,8 +3173,41 @@ impl CacheEngine {
             }
             return Ok(PullThroughOutcome::HashMismatch { actual });
         }
-        Ok(PullThroughOutcome::Bytes(bytes))
+        match mode {
+            FillMode::ReturnBytes => Ok(PullThroughOutcome::Bytes(bytes)),
+            // The drain already holds these bytes, so unlike the streaming path
+            // there is nothing to *avoid* re-reading here — dropping them is not a
+            // memory win. It is a CONTRACT win: it makes "CommitOnly ⟺ None" true
+            // in both directions, so the wrappers are total and a reader of
+            // `FillMode::CommitOnly` can trust it end to end rather than
+            // discovering this arm as an exception.
+            FillMode::CommitOnly => {
+                drop(bytes);
+                Ok(PullThroughOutcome::Committed)
+            }
+        }
     }
+}
+
+/// Whether a pull-through hands the committed blob back to its caller.
+///
+/// Replaces a `want_bytes: bool` that sat directly beside `local_only: bool` in
+/// `pull_through`'s argument list — two adjacent booleans the compiler would let
+/// you swap silently, in a chain where getting it wrong either reinstates the
+/// #1132 whole-blob read-back or stops `get` consulting peer origins. The
+/// `local_only` half would at least be caught — `populate_local_skips_peer_origin_and_fills_from_local`
+/// asserts `peer_fetches == 0`. The read-back half is the silent one, and is what
+/// the enum is really buying.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FillMode {
+    /// [`CacheEngine::get`] — the caller needs the payload. The streaming arm
+    /// reads the committed blob back out of the store to produce it; the buffered
+    /// arm already holds it and returns its drain buffer.
+    ReturnBytes,
+    /// [`CacheEngine::populate`] — the caller drops the payload, so it is never
+    /// read back (#1132). Serving a 708 MB blob used to cost that much again on
+    /// the miss leg for a buffer nobody looked at.
+    CommitOnly,
 }
 
 /// Per-attempt outcomes that ride out of the retry loop without
@@ -3019,9 +3216,17 @@ impl CacheEngine {
 #[derive(Debug)]
 enum PullThroughOutcome {
     Bytes(Bytes),
+    /// The blob committed to the local store, but the caller asked not to have it
+    /// read back ([`FillMode::CommitOnly`] — the fill-only path, #1132). Carrying no
+    /// payload is the entire point: re-reading a 708 MB blob to hand it to
+    /// [`CacheEngine::populate`], which drops it, was a whole-blob allocation on
+    /// the serve path's miss leg.
+    Committed,
     NotFound,
     BlobTooLarge,
-    HashMismatch { actual: Hash },
+    HashMismatch {
+        actual: Hash,
+    },
     Store(anyhow::Error),
 }
 
@@ -3912,6 +4117,57 @@ mod tests {
         anyhow::ensure!(
             engine.last_accessed(hash).is_some(),
             "expected Some(Instant) after pull-through get"
+        );
+        Ok(())
+    }
+
+    /// The `FillMode` ↔ return-shape correspondence, asserted where the private
+    /// types are visible — the integration tests in `tests/pull_through.rs`
+    /// cannot see `PullThroughOutcome`, so they can only observe that the fill
+    /// happened, not which arm produced it.
+    ///
+    /// This is the property the enum exists to carry, and it must hold in BOTH
+    /// directions: `ReturnBytes` always yields `Some`, `CommitOnly` always yields
+    /// `None`. Before `FillMode` the second half was false on the buffered arm,
+    /// which handed its drain buffer back regardless — an exception that made the
+    /// wrappers partial and the mode untrustworthy to read.
+    ///
+    /// Deliberately run through the BUFFERED arm: `StubOrigin` advertises a size
+    /// hint well under `buffered_max_bytes`, so `should_buffer` routes here. The
+    /// streaming arm never had the defect.
+    #[tokio::test]
+    async fn fill_mode_determines_the_return_shape_in_both_directions() -> anyhow::Result<()> {
+        let payload = b"drained, not streamed";
+        let hash = Hash::new(payload);
+
+        let tmp_fill = tempfile::tempdir()?;
+        let engine = CacheEngine::open(
+            tmp_fill.path(),
+            vec![Arc::new(StubOrigin::new(payload)) as Arc<dyn Origin>],
+            10,
+        )
+        .await?;
+        let committed = engine
+            .pull_through(hash, false, FillMode::CommitOnly)
+            .await?;
+        anyhow::ensure!(
+            committed.is_none(),
+            "CommitOnly must yield no payload, got {committed:?}"
+        );
+
+        let tmp_bytes = tempfile::tempdir()?;
+        let engine = CacheEngine::open(
+            tmp_bytes.path(),
+            vec![Arc::new(StubOrigin::new(payload)) as Arc<dyn Origin>],
+            10,
+        )
+        .await?;
+        let returned = engine
+            .pull_through(hash, false, FillMode::ReturnBytes)
+            .await?;
+        anyhow::ensure!(
+            returned.as_deref() == Some(payload.as_slice()),
+            "ReturnBytes must yield the payload, got {returned:?}"
         );
         Ok(())
     }

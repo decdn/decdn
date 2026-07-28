@@ -643,22 +643,31 @@ jobs:
   anvil-e2e-journeys:
     name: anvil e2e (journeys)
     runs-on: ubuntu-latest
-    # Bound above the ~109m balanced journeys schedule (below) plus the bin build
+    # Bound above the ~128m balanced journeys schedule (below) plus the bin build
     # and workspace compile, so a genuinely hung test hits its own clear per-test
-    # message before this opaque job-level kill (#785). The cross-layer journeys
-    # run at --test-threads 2 — 16 tests across 13 files whose per-test
-    # `OVERALL_TIMEOUT` ceilings sum to 218m:
-    #   13m x6  smoke, cli_publish, cli_fetch_manifest, cli_fetch_topup,
-    #           cli_setup_partial, G-NODE-06
-    #   10m x5  G-NODE-04 (3 tests), G-ORIGIN-01 (2 tests)
-    #   15m x2  G-NODE-08 (authorized-origin), G-NODE-08 (revocation)
+    # message before this opaque job-level kill (#785). The step below runs the
+    # whole `anvil-e2e` feature with no target filter, so the inventory is every
+    # gated test, not a curated list: at --test-threads 2 that is 19 tests across
+    # 16 files whose per-test `OVERALL_TIMEOUT` ceilings sum to 256m:
+    #   13m x7  smoke, cli_publish, cli_fetch_manifest, cli_fetch_topup,
+    #           cli_setup_partial, cli_fetch_resume, G-NODE-06
+    #   10m x6  G-NODE-04 (3 tests), G-ORIGIN-01 (2 tests),
+    #           origin_blacklist_compliance
+    #   15m x3  G-NODE-08 (authorized-origin), G-NODE-08 (namespace-scope),
+    #           G-NODE-08 (revocation)
     #   20m x3  slash_appeal, G-GOV-02, G-GOV-03
-    # A balanced 2-thread schedule is ~109m (218/2, no single test exceeding it),
+    # A balanced 2-thread schedule is ~128m (256/2, no single test exceeding it),
     # so the bound must clear that plus the bin build, the workspace compile and
     # the per-fixture in-test forge deploys. Keep this inventory in sync when
     # adding a journey — it has gone stale twice already (it once described 6
     # tests after the cli_* and G-ORIGIN-* journeys landed, and later named a
     # nonexistent G-ORIGIN-04 while missing the G-GOV-02 / G-NODE-08 journeys).
+    # NOTE: at 256m the balanced ceiling (~128m) now sits just under the 130m
+    # bound, so the headroom the ordering argument depends on is nearly gone —
+    # a hung test could hit the job kill before its own message. This is a
+    # worst case that requires every test to time out at once (the job really
+    # finishes in ~10m), so it is recorded rather than acted on, but the bound
+    # needs raising before the next journey lands.
     # In practice the job finishes in ~10m; these are ceilings, not
     # estimates. The generous backstop deliberately lets a wedged compile or a
     # pre-timer forge hang burn the full bound rather than reintroduce the opaque

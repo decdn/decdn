@@ -40,7 +40,13 @@ pub const IROH_BLOCK_SIZE: BlockSize = BlockSize::from_chunk_log(4);
 /// Bytes per chunk group, derived from [`IROH_BLOCK_SIZE`] (`2^chunk_log` 1 KiB
 /// chunks) — the granularity an origin range must snap to, because a bao proof
 /// anchors whole chunk groups to the root.
-const CHUNK_GROUP_BYTES: u64 = 1u64 << (IROH_BLOCK_SIZE.chunk_log() + 10);
+///
+/// Public so a caller that must snap an offset to a group boundary WITHOUT
+/// knowing the blob's size can do so from the shared constant rather than
+/// re-deriving it (the resumable client fetch, #1120: it picks its resume offset
+/// before the signed response reveals `total_bytes`). Prefer [`align_range`] when
+/// the size is known — it also bound-checks.
+pub const CHUNK_GROUP_BYTES: u64 = 1u64 << (IROH_BLOCK_SIZE.chunk_log() + 10);
 
 /// Exact byte length of the **header-less** bao interleaved encoding a serving
 /// node emits for `chunk_ranges` of a `total_bytes`-byte blob — the sum of every
