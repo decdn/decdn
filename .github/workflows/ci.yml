@@ -1340,8 +1340,12 @@ jobs:
           # Confirm what actually landed. Otherwise a failure here is
           # indistinguishable from a hand-edited lock, and the run log has no
           # record of which compiler produced the diff below.
-          # `gh aw version` writes to stderr, hence the redirect.
-          installed=$(gh aw version 2>&1 | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+          # `gh aw version` writes to stderr, hence the redirect. `-m1` rather
+          # than `| head -1` so there is no second process to SIGPIPE grep
+          # under `pipefail`, and `|| true` because a no-match otherwise exits
+          # 1, and `set -e` would kill the job on that line — losing the very
+          # annotation below that explains what went wrong.
+          installed=$(gh aw version 2>&1 | grep -m1 -oE 'v[0-9]+\.[0-9]+\.[0-9]+' || true)
           echo "Requested ${version}; gh aw reports ${installed:-unknown}."
           if [ "${installed}" != "${version}" ]; then
             echo "::error::pinned ${version} but installed ${installed:-unknown}."
