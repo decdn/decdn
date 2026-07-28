@@ -291,7 +291,17 @@ pub async fn open_channel<P: Provider + Clone>(
     // only ever means a reclaim sweep waits longer).
     let expires_at = u64::try_from(opened.expiresAt).unwrap_or(u64::MAX);
 
-    let state = BuyerChannelState::new(channel_id, provider_addr, token, deposit, expires_at);
+    // Self-signing open (see the `voucherSigner` comment above): the funder and
+    // voucher signer are both this buyer's own key.
+    let state = BuyerChannelState::new(
+        channel_id,
+        provider_addr,
+        self_address,
+        self_address,
+        token,
+        deposit,
+        expires_at,
+    );
     let ctx = ChannelContext::for_buyer_channel(&state, signer, voucher_domain.clone());
     info!(provider = %provider_addr, %channel_id, %deposit, expires_at, "opened buyer payment channel");
     Ok(OpenedChannel { state, ctx, tx })
@@ -378,7 +388,7 @@ where
         // vanished during the RPC. Funds are escrowed on-chain with zero local
         // tracking — `error!` (matching the open path's escrowed-but-untracked
         // posture) and surface the tx for reconcile.
-        DepositOutcome::UnknownProvider => {
+        DepositOutcome::UnknownChannel => {
             error!(
                 provider = %provider_addr,
                 %channel_id,

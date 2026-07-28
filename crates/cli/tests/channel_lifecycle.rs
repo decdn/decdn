@@ -64,6 +64,8 @@ fn seed(dir: &Path, provider_byte: u8) {
     let mut state = BuyerChannelState::new(
         B256::repeat_byte(0xab),
         Address::repeat_byte(provider_byte),
+        Address::repeat_byte(provider_byte),
+        Address::repeat_byte(provider_byte),
         Address::repeat_byte(0xcd),
         U256::from(2_000_000u64),
         0,
@@ -74,9 +76,11 @@ fn seed(dir: &Path, provider_byte: u8) {
     store.record(&state).unwrap();
 }
 
-fn seed_corrupt(dir: &Path, provider: Address) {
+fn seed_corrupt(dir: &Path, channel_id: B256) {
     let store = RedbBuyerChannelStore::open(dir).unwrap();
-    store.insert_raw_buyer_record(provider, &[0u8; 8]).unwrap();
+    store
+        .insert_raw_buyer_record(channel_id, &[0u8; 8])
+        .unwrap();
 }
 
 #[tokio::test]
@@ -97,8 +101,8 @@ async fn clean_empty_store_is_a_noop_success() {
 fn clean_with_only_an_undecodable_row_does_not_claim_nothing_to_clean() {
     let dir = data_dir();
     let cfg = empty_config(dir.path());
-    let provider = Address::repeat_byte(0x55);
-    seed_corrupt(dir.path(), provider);
+    let corrupt_channel_id = B256::repeat_byte(0x55);
+    seed_corrupt(dir.path(), corrupt_channel_id);
 
     let output = common::decdn_command(dir.path())
         .arg("--config")
@@ -123,7 +127,10 @@ fn clean_with_only_an_undecodable_row_does_not_claim_nothing_to_clean() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!stdout.contains("no tracked channels to clean"), "{stdout}");
-    assert!(stderr.contains(&format!("{provider:#x}")), "{stderr}");
+    assert!(
+        stderr.contains(&format!("{corrupt_channel_id:#x}")),
+        "{stderr}"
+    );
     assert!(stderr.contains("escrowed"), "{stderr}");
 }
 

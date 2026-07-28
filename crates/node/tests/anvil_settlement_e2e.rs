@@ -1754,15 +1754,25 @@ async fn run_e2e() -> anyhow::Result<()> {
     )?;
     let pconcrete = Arc::new(PersistentChannelStateStore::open(pstore_dir.path())?);
     // A real on-chain channel whose local row got corrupted by a downgrade.
-    pc_buyer
+    let corrupt_open_receipt = pc_buyer
         .openChannel(node_addr, U256::from(DEPOSIT_MICRO_USDC), Address::ZERO)
         .send()
         .await?
         .get_receipt()
         .await?;
-    // Seed an undecodable value under the provider key (its channel_id is
-    // unrecoverable from disk — exactly what reconcile rebuilds from chain).
-    pconcrete.insert_raw_buyer_record(node_addr, &[0u8; 8])?;
+    let corrupt_channel_id = corrupt_open_receipt
+        .inner
+        .logs()
+        .iter()
+        .filter_map(|log| log.log_decode::<PaymentChannel::ChannelOpened>().ok())
+        .map(|decoded| decoded.inner.data)
+        .find(|ev| ev.client == buyer_addr && ev.provider == node_addr)
+        .map(|ev| ev.channelId)
+        .ok_or_else(|| anyhow::anyhow!("ChannelOpened event missing from openChannel receipt"))?;
+    // Seed an undecodable value under the channel_id key (the primary key,
+    // #1481) — its provider is unrecoverable from disk — exactly what
+    // reconcile rebuilds from chain.
+    pconcrete.insert_raw_buyer_record(corrupt_channel_id, &[0u8; 8])?;
     let pstore_dyn: Arc<dyn BuyerChannelStore> =
         Arc::new(BuyerChannelStoreHandle::new(Arc::clone(&pconcrete)));
     let persist_service = BuyerChannelService::bootstrap(
@@ -1792,11 +1802,12 @@ async fn run_e2e() -> anyhow::Result<()> {
         ),
         "the repaired row must point at an Open on-chain channel"
     );
-    // D2 (mixed reclaim): seed an undecodable row under an unrelated provider key
-    // alongside the healthy (now-expired) repaired row, then sweep — the corrupt
-    // sibling is skipped by load_all and the healthy channel is still reclaimed.
-    let corrupt_provider = Address::from([0xCDu8; 20]);
-    pconcrete.insert_raw_buyer_record(corrupt_provider, &[0u8; 8])?;
+    // D2 (mixed reclaim): seed an undecodable row under an unrelated channel_id
+    // key alongside the healthy (now-expired) repaired row, then sweep — the
+    // corrupt sibling is skipped by load_all and the healthy channel is still
+    // reclaimed.
+    let corrupt_channel_id_2 = B256::repeat_byte(0xCD);
+    pconcrete.insert_raw_buyer_record(corrupt_channel_id_2, &[0u8; 8])?;
     let mut healthy = pstore_dyn
         .get_by_provider(node_addr)?
         .ok_or_else(|| anyhow::anyhow!("repaired row vanished before mixed-reclaim test"))?;
@@ -1812,7 +1823,7 @@ async fn run_e2e() -> anyhow::Result<()> {
         "the healthy expired channel must be reclaimed despite the corrupt sibling"
     );
     anyhow::ensure!(
-        pstore_dyn.get_by_provider(corrupt_provider).is_err(),
+        pstore_dyn.get_by_channel_id(corrupt_channel_id_2).is_err(),
         "the corrupt sibling row remains (skipped, not reclaimed)"
     );
     drop(persist_service);

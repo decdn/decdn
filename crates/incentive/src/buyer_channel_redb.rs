@@ -96,10 +96,10 @@ impl RedbBuyerChannelStore {
     #[cfg(feature = "test-util")]
     pub fn insert_raw_buyer_record(
         &self,
-        provider: Address,
+        channel_id: ChannelId,
         bytes: &[u8],
     ) -> Result<(), StoreError> {
-        self.table().insert_raw(provider, bytes)
+        self.table().insert_raw(channel_id, bytes)
     }
 }
 
@@ -124,6 +124,13 @@ impl BuyerChannelStore for RedbBuyerChannelStore {
         channel_id: ChannelId,
     ) -> Result<bool, StoreError> {
         self.table().forget_if_channel(provider, channel_id)
+    }
+
+    fn get_by_channel_id(
+        &self,
+        channel_id: ChannelId,
+    ) -> Result<Option<BuyerChannelState>, StoreError> {
+        self.table().get_by_channel_id(channel_id)
     }
 
     fn get_by_provider(&self, provider: Address) -> Result<Option<BuyerChannelState>, StoreError> {
@@ -170,6 +177,8 @@ mod tests {
         BuyerChannelState {
             channel_id: alloy::primitives::B256::repeat_byte(provider),
             provider: Address::repeat_byte(provider),
+            funder: Address::repeat_byte(provider),
+            voucher_signer: Address::repeat_byte(provider),
             token: Address::repeat_byte(0xaa),
             deposit: U256::from(1_000_000u64),
             last_amount: U256::from(amount),

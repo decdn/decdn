@@ -322,37 +322,46 @@ fn sign_client_voucher(
 /// drawn sits at all-zero; re-signing that as a voucher advances nothing the
 /// contract has not already recorded.
 ///
-/// Residual gap: this is a proxy for "we hold a key this channel's
-/// `voucherSigner` accepts", not that predicate itself — `BuyerChannelState`
-/// (`crates/incentive/src/buyer_channel.rs`) does not carry the pinned signer,
-/// so the CLI cannot check it directly. A funder-run CLI with a non-zero
-/// watermark it did not itself sign (i.e. a delegated-signer channel) would
-/// still take the `closeChannel` branch and revert. Unreachable today — no
-/// delegation CLI surface exists — and left as-is.
+/// This is only half of `submit_close`'s branch predicate — it says nothing
+/// about whether the loaded key can actually *sign* a voucher this channel's
+/// `voucherSigner` accepts. See [`can_sign_voucher`] for the other half.
 fn has_claim_watermark(state: &BuyerChannelState) -> bool {
     !(state.last_amount.is_zero()
         && state.last_nonce.is_zero()
         && state.last_bytes_delivered.is_zero())
 }
 
-/// Initiate close, opening the dispute window. With a claim on the persisted
-/// watermark this is `closeChannel` over the re-signed latest voucher; with
-/// nothing to claim it is `closeChannelWithoutVoucher`, which reaches the same
-/// close path without the signature check.
+/// Whether `signer` is the address this channel's pinned `voucherSigner`
+/// accepts. `BuyerChannelState::voucher_signer` (#1481) makes this a direct
+/// comparison rather than the pre-#1481 proxy — a funder-run CLI holding a
+/// non-zero watermark on a *delegated* channel (publisher-pays) does not hold
+/// the delegate's key, so `signer.address() != state.voucher_signer` and this
+/// correctly routes to `closeChannelWithoutVoucher` instead of reverting.
+fn can_sign_voucher(state: &BuyerChannelState, signer: &PrivateKeySigner) -> bool {
+    signer.address() == state.voucher_signer
+}
+
+/// Initiate close, opening the dispute window. Only when the loaded key can
+/// sign this channel's voucher **and** the persisted watermark carries
+/// something to claim does this take `closeChannel` over the re-signed latest
+/// voucher; otherwise it is `closeChannelWithoutVoucher`, which reaches the
+/// same close path without the signature check.
 ///
-/// The empty case is not merely cheaper. `closeChannel` treats a signature of
-/// any length as a voucher to verify, so a zero-amount voucher is still checked
-/// against the channel's pinned `voucherSigner` — and on a channel whose signer
-/// is a *delegate*, the funder's own signature does not recover to it and the
-/// close reverts. `closeChannelWithoutVoucher` is exactly the escape hatch for
-/// a funder holding no voucher at all.
+/// The `closeChannelWithoutVoucher` branch is not merely cheaper. `closeChannel`
+/// treats a signature of any length as a voucher to verify, so a zero-amount
+/// voucher is still checked against the channel's pinned `voucherSigner` — and
+/// on a channel whose signer is a *delegate* the funder's own signature does
+/// not recover to it and the close reverts. `closeChannelWithoutVoucher` is
+/// exactly the escape hatch for a funder holding no voucher this channel's
+/// signer would accept (no watermark to claim, or a delegated signer this
+/// process does not hold).
 async fn submit_close<P: Provider + Clone>(
     contract: &PaymentChannel::PaymentChannelInstance<P>,
     state: &BuyerChannelState,
     signer: &PrivateKeySigner,
     domain: &Eip712Domain,
 ) -> anyhow::Result<TxOutcome> {
-    let sent = if has_claim_watermark(state) {
+    let sent = if can_sign_voucher(state, signer) && has_claim_watermark(state) {
         let sig = sign_client_voucher(state, signer, domain)?;
         contract
             .closeChannel(
@@ -834,23 +843,22 @@ fn list(args: &cli::ChannelListArgs, config_path: Option<&Path>) -> anyhow::Resu
     Ok(())
 }
 
-/// Warn about every undecodable buyer row on stderr. The provider key is the
-/// only available repair handle because the channel id lives in the bytes that
-/// failed to decode.
-fn write_skipped_providers(w: &mut impl Write, skipped: &[Address]) -> std::io::Result<()> {
-    for provider in skipped {
+/// Warn about every undecodable buyer row on stderr. The `channel_id` (the
+/// store's primary key) is the only available repair handle — the provider
+/// lives inside the bytes that failed to decode.
+fn write_skipped_providers(w: &mut impl Write, skipped: &[B256]) -> std::io::Result<()> {
+    for channel_id in skipped {
         writeln!(
             w,
-            "warning: buyer channel for provider {provider:#x} could not be decoded; its deposit \
-             remains escrowed but untracked and will not be auto-reclaimed until the record is \
-             repaired"
+            "warning: buyer channel {channel_id:#x} could not be decoded; its deposit remains \
+             escrowed but untracked and will not be auto-reclaimed until the record is repaired"
         )?;
     }
     Ok(())
 }
 
 /// Print the true-empty `clean` sentinel only when no row was skipped.
-fn write_clean_empty_status(w: &mut impl Write, skipped: &[Address]) -> std::io::Result<()> {
+fn write_clean_empty_status(w: &mut impl Write, skipped: &[B256]) -> std::io::Result<()> {
     if skipped.is_empty() {
         writeln!(w, "no tracked channels to clean")?;
     }
@@ -866,7 +874,7 @@ fn write_clean_empty_status(w: &mut impl Write, skipped: &[Address]) -> std::io:
 fn write_channels(
     w: &mut impl Write,
     channels: &[BuyerChannelState],
-    skipped: &[Address],
+    skipped: &[B256],
 ) -> std::io::Result<()> {
     writeln!(w, "channels={}", channels.len())?;
     if channels.is_empty() {
@@ -897,7 +905,7 @@ fn write_channels(
 }
 
 /// Top-level `--json` document. `channels` is the decoded rows; `skipped` lists
-/// the provider addresses of undecodable rows (`{:#x}` hex) so a programmatic
+/// the `channel_id`s of undecodable rows (`{:#x}` hex) so a programmatic
 /// consumer sees the escrowed-but-untracked deposits in-band, not only in the
 /// stderr warning. The human table path surfaces the same split separately.
 #[derive(Serialize)]
@@ -1061,6 +1069,8 @@ mod tests {
         BuyerChannelState {
             channel_id: B256::repeat_byte(0xab),
             provider: Address::repeat_byte(provider_byte),
+            funder: Address::repeat_byte(provider_byte),
+            voucher_signer: Address::repeat_byte(provider_byte),
             token: Address::repeat_byte(0xcd),
             deposit: U256::from(deposit_micro),
             last_amount: U256::from(1_500_000u64),
@@ -1082,7 +1092,7 @@ mod tests {
     #[test]
     fn write_channels_empty_sentinel_is_suppressed_when_a_row_was_skipped() {
         let mut buf = Vec::new();
-        write_channels(&mut buf, &[], &[Address::repeat_byte(0x66)]).unwrap();
+        write_channels(&mut buf, &[], &[B256::repeat_byte(0x66)]).unwrap();
         let out = String::from_utf8(buf).unwrap();
         assert!(out.contains("channels=0"), "{out}");
         assert!(!out.contains("(no tracked channels)"), "{out}");
@@ -1104,12 +1114,12 @@ mod tests {
 
     #[test]
     fn skipped_provider_warning_names_every_escrowed_row() {
-        let skipped = [Address::repeat_byte(0x11), Address::repeat_byte(0x22)];
+        let skipped = [B256::repeat_byte(0x11), B256::repeat_byte(0x22)];
         let mut buf = Vec::new();
         write_skipped_providers(&mut buf, &skipped).unwrap();
         let out = String::from_utf8(buf).unwrap();
-        for provider in skipped {
-            assert!(out.contains(&format!("{provider:#x}")), "{out}");
+        for channel_id in skipped {
+            assert!(out.contains(&format!("{channel_id:#x}")), "{out}");
         }
         assert!(out.contains("escrowed"), "{out}");
         assert!(out.contains("not be auto-reclaimed"), "{out}");
@@ -1125,7 +1135,7 @@ mod tests {
         );
 
         let mut skipped = Vec::new();
-        write_clean_empty_status(&mut skipped, &[Address::repeat_byte(0x33)]).unwrap();
+        write_clean_empty_status(&mut skipped, &[B256::repeat_byte(0x33)]).unwrap();
         assert!(skipped.is_empty());
     }
 
@@ -1178,6 +1188,58 @@ mod tests {
             }
             assert!(has_claim_watermark(&drawn), "field {field} is a claim");
         }
+    }
+
+    /// #1481: `can_sign_voucher` is the real predicate the old `has_claim_watermark`
+    /// proxy could not check — whether the loaded keystore key equals the
+    /// channel's pinned `voucher_signer`. A self-signed channel's own key
+    /// passes; the funder's key on a *delegated* (publisher-pays) channel does
+    /// not, even though the funder is the one who opened it.
+    #[test]
+    fn can_sign_voucher_checks_the_pinned_signer_not_the_funder() {
+        let signer = PrivateKeySigner::random();
+        let mut st = mk_state(0x11, 4, 10_000_000);
+
+        // Self-signed: voucher_signer equals the loaded key.
+        st.voucher_signer = signer.address();
+        assert!(can_sign_voucher(&st, &signer), "self-signed channel");
+
+        // Delegated: voucher_signer is some other address (a delegate this
+        // process does not hold the key for) — the funder's own key must NOT
+        // pass, or `submit_close` would take the reverting `closeChannel` branch.
+        st.voucher_signer = Address::repeat_byte(0x99);
+        assert!(
+            st.voucher_signer != signer.address(),
+            "fixture must pick a genuinely different address"
+        );
+        assert!(
+            !can_sign_voucher(&st, &signer),
+            "delegated channel: funder's key must not pass as the voucher signer"
+        );
+    }
+
+    /// #1481: `submit_close`'s branch selector is `can_sign_voucher &&
+    /// has_claim_watermark`, not `has_claim_watermark` alone. A delegated
+    /// channel with a non-zero watermark must still route to
+    /// `closeChannelWithoutVoucher` (the funder cannot produce a signature the
+    /// pinned `voucherSigner` accepts), which is exactly the bug fixed here:
+    /// the old code took `closeChannel` — and reverted — on this case.
+    #[test]
+    fn close_branch_selector_requires_both_predicates() {
+        let signer = PrivateKeySigner::random();
+        let mut drawn = mk_state(0x11, 4, 10_000_000); // non-zero watermark by construction
+
+        drawn.voucher_signer = signer.address();
+        assert!(
+            can_sign_voucher(&drawn, &signer) && has_claim_watermark(&drawn),
+            "self-signed + drawn must take the closeChannel branch"
+        );
+
+        drawn.voucher_signer = Address::repeat_byte(0x99);
+        assert!(
+            !(can_sign_voucher(&drawn, &signer) && has_claim_watermark(&drawn)),
+            "delegated + drawn must NOT take the closeChannel branch (would revert)"
+        );
     }
 
     #[test]

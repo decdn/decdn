@@ -48,17 +48,34 @@ use crate::store::StoreError;
 /// compiled, read an empty table, and told the reclaim sweep there was nothing to
 /// reclaim. A frozen global is not a per-call knob.
 ///
-/// The `_v1` suffix is a version tag: a future breaking layout change ships as
-/// `_v2` with a one-shot migration on open, while additive changes stay on `_v1`
-/// (decode tolerates unknown trailing bytes).
-const BUYER_CHANNEL_TABLE: TableDefinition<'static, &'static [u8; 20], &'static [u8]> =
-    TableDefinition::new("buyer_channel_state_v1");
+/// **`_v2`** (#1481): the primary key changed from `provider` (20 bytes) to
+/// `channel_id` (32 bytes) and the record gained `funder`/`voucher_signer`. The
+/// rename forces `redb`'s key/value type-name check to reject the old `_v1`
+/// table outright — a v1 file is cleanly ignored (ignored table, not misread),
+/// never live-migrated. See [`BUYER_PROVIDER_INDEX_TABLE`] for the secondary
+/// index that keeps `get_by_provider` a one-hop lookup despite the rekey.
+const BUYER_CHANNEL_TABLE: TableDefinition<'static, &'static [u8; 32], &'static [u8]> =
+    TableDefinition::new("buyer_channel_state_v2");
 
-/// Highest buyer-record `schema_version` this binary can decode. Independent of
-/// the node's seller table — the buyer table is new in #744 with no legacy
-/// records, so it starts at 1 and carries `expires_at` inline rather than as a
-/// trailing segment.
-const BUYER_SUPPORTED_SCHEMA_VERSION: u32 = 1;
+/// Secondary index: `provider (20 bytes) → channel_id (32 bytes)`. Maintained
+/// alongside [`BUYER_CHANNEL_TABLE`] on every `record`/`forget`/
+/// `forget_if_channel` so `get_by_provider` — the open-channel trigger's
+/// reuse-lookup hot path — stays a one-hop lookup instead of a table scan.
+///
+/// **This is a reuse hint, not an enumeration.** If two channels ever share a
+/// provider (e.g. mid-rotate), the index holds only the most-recently-recorded
+/// `channel_id`; the other channel still exists in [`BUYER_CHANNEL_TABLE`] and is
+/// only visible via [`BuyerChannelTable::load_all`] (the reclaim sweep's path)
+/// — never via [`BuyerChannelTable::get_by_provider`].
+const BUYER_PROVIDER_INDEX_TABLE: TableDefinition<'static, &'static [u8; 20], &'static [u8; 32]> =
+    TableDefinition::new("buyer_channel_provider_index_v2");
+
+/// Highest buyer-record `schema_version` this binary can decode. Bumped 1->2
+/// with the `_v2` rekey (#1481): the table rename already isolates `_v1` files,
+/// so this ceiling exists for forward-compat (a v3 binary's records opened by
+/// this v2 binary) rather than backward-compat — there is no live migration
+/// path from a v1 record, and none is attempted.
+const BUYER_SUPPORTED_SCHEMA_VERSION: u32 = 2;
 
 /// Sanity ceiling on trailing bytes per record. Trailing bytes are tolerated
 /// (forward-compat with additive schema changes), but a `remainder.len()` above
@@ -91,6 +108,12 @@ struct StoredBuyerChannelState {
     last_nonce: [u8; 32],
     last_bytes_delivered: [u8; 32],
     expires_at: u64,
+    /// The on-chain `client` (#1481, schema v2). Appended after `expires_at`
+    /// so the field order matches the v1 prefix exactly — see the module
+    /// doc's postcard-positional-encoding warning.
+    funder: [u8; 20],
+    /// The pinned on-chain `voucherSigner` (#1481, schema v2).
+    voucher_signer: [u8; 20],
 }
 
 impl From<&BuyerChannelState> for StoredBuyerChannelState {
@@ -105,6 +128,8 @@ impl From<&BuyerChannelState> for StoredBuyerChannelState {
             last_nonce: state.last_nonce.to_be_bytes(),
             last_bytes_delivered: state.last_bytes_delivered.to_be_bytes(),
             expires_at: state.expires_at,
+            funder: state.funder.into(),
+            voucher_signer: state.voucher_signer.into(),
         }
     }
 }
@@ -120,6 +145,8 @@ impl StoredBuyerChannelState {
         Ok(BuyerChannelState {
             channel_id: B256::from(self.channel_id),
             provider: Address::from(self.provider),
+            funder: Address::from(self.funder),
+            voucher_signer: Address::from(self.voucher_signer),
             token: Address::from(self.token),
             deposit: U256::from_be_bytes(self.deposit),
             last_amount: U256::from_be_bytes(self.last_amount),
@@ -138,24 +165,24 @@ fn encode_record(state: &BuyerChannelState) -> Result<Vec<u8>, StoreError> {
 }
 
 /// Decode one buyer record into a [`BuyerChannelState`], validating that the
-/// embedded `provider` matches the table key (additive-forward-compat via
-/// `take_from_bytes`; bounded trailing-bytes warning).
-fn decode_record(key_bytes: [u8; 20], value_bytes: &[u8]) -> Result<BuyerChannelState, StoreError> {
-    let provider = Address::from(key_bytes);
+/// embedded `channel_id` matches the table's primary key (additive-forward-compat
+/// via `take_from_bytes`; bounded trailing-bytes warning).
+fn decode_record(key_bytes: [u8; 32], value_bytes: &[u8]) -> Result<BuyerChannelState, StoreError> {
+    let channel_id = ChannelId::from(key_bytes);
     let (stored, remainder): (StoredBuyerChannelState, &[u8]) =
         postcard::take_from_bytes(value_bytes).map_err(|err| StoreError::Corrupt {
-            channel_id: None,
-            detail: format!("buyer record postcard decode failed (provider {provider}): {err}"),
+            channel_id: Some(channel_id),
+            detail: format!("buyer record postcard decode failed (channel_id {channel_id}): {err}"),
         })?;
-    if stored.provider != key_bytes {
+    if stored.channel_id != key_bytes {
         return Err(StoreError::Corrupt {
-            channel_id: None,
-            detail: format!("buyer record provider {provider} does not match table key"),
+            channel_id: Some(channel_id),
+            detail: format!("buyer record channel_id {channel_id} does not match table key"),
         });
     }
     if remainder.len() > SANE_TRAILER_MAX_BYTES {
         tracing::warn!(
-            %provider,
+            %channel_id,
             remainder = remainder.len(),
             limit = SANE_TRAILER_MAX_BYTES,
             event = "buyer_channel_store_excess_trailer",
@@ -220,13 +247,16 @@ impl<'a> BuyerChannelTable<'a> {
     ///
     /// Logged at `error!`, not `warn!`: the skipped row's deposit stays
     /// escrowed-but-unreclaimable until an operator repairs the record, so it
-    /// warrants action (and must not be filtered out of alerting). The channel
-    /// id can't be named — it lives inside the undecodable bytes — so the
-    /// on-chain provider key is the only handle it can offer.
+    /// warrants action (and must not be filtered out of alerting). The
+    /// `channel_id` is the table's primary key, so it is always recoverable
+    /// even when the value bytes are not — it is the repair handle this
+    /// offers (the provider, by contrast, lives inside the undecodable value
+    /// bytes and is not).
     ///
-    /// The returned [`BuyerLoad`] also carries every skipped provider. This lets
-    /// callers expose the condition through their own user or operator surface
-    /// without coupling the incentive crate to a CLI or node metrics backend.
+    /// The returned [`BuyerLoad`] also carries every skipped channel id. This
+    /// lets callers expose the condition through their own user or operator
+    /// surface without coupling the incentive crate to a CLI or node metrics
+    /// backend.
     ///
     /// [`BuyerChannelStore`]: crate::buyer_channel::BuyerChannelStore
     ///
@@ -251,14 +281,14 @@ impl<'a> BuyerChannelTable<'a> {
         for entry in iter {
             let (key_guard, value_guard) =
                 entry.map_err(|err| StoreError::Backend(format!("iter entry: {err}")))?;
-            let key_bytes: [u8; 20] = *key_guard.value();
+            let key_bytes: [u8; 32] = *key_guard.value();
             match decode_record(key_bytes, value_guard.value()) {
                 Ok(state) => out.push(state),
                 Err(err) => {
-                    let provider = Address::from(key_bytes);
-                    skipped.push(provider);
+                    let channel_id = ChannelId::from(key_bytes);
+                    skipped.push(channel_id);
                     tracing::error!(
-                        %provider,
+                        %channel_id,
                         %err,
                         event = "buyer_channel_store_skip_undecodable_record",
                         "buyer channel hydration: skipping an undecodable record; its escrowed \
@@ -275,10 +305,17 @@ impl<'a> BuyerChannelTable<'a> {
     }
 
     /// Persist (insert or overwrite) the state for one channel, keyed by
-    /// `state.provider`. Durable (fsynced) before returning `Ok`.
+    /// `state.channel_id` (primary), maintaining `state.provider →
+    /// state.channel_id` in the secondary reuse index. Durable (fsynced)
+    /// before returning `Ok`.
     ///
-    /// Creates the table if absent — unlike the no-row operations, this one
-    /// intends to write.
+    /// Creates both tables if absent — unlike the no-row operations, this one
+    /// intends to write. If a *different* `channel_id` was previously indexed for
+    /// `state.provider`, that older channel's primary row is left in place
+    /// (untouched, no longer reachable via [`Self::get_by_provider`]) — only
+    /// [`Self::load_all`] still enumerates it, which is what lets the reclaim
+    /// sweep still recover its deposit. See the `BUYER_PROVIDER_INDEX_TABLE`
+    /// doc comment for the secondary-index reuse-hint contract.
     ///
     /// # Errors
     ///
@@ -286,7 +323,8 @@ impl<'a> BuyerChannelTable<'a> {
     /// write or fsync fails.
     pub fn record(&self, state: &BuyerChannelState) -> Result<(), StoreError> {
         let encoded = encode_record(state)?;
-        let key: [u8; 20] = state.provider.into();
+        let primary_key: [u8; 32] = state.channel_id.into();
+        let index_key: [u8; 20] = state.provider.into();
 
         let write_txn = self.begin_durable_write()?;
         {
@@ -294,8 +332,16 @@ impl<'a> BuyerChannelTable<'a> {
                 .open_table(BUYER_CHANNEL_TABLE)
                 .map_err(|err| StoreError::Backend(format!("open_table: {err}")))?;
             table
-                .insert(&key, encoded.as_slice())
+                .insert(&primary_key, encoded.as_slice())
                 .map_err(|err| StoreError::Backend(format!("insert: {err}")))?;
+        }
+        {
+            let mut index = write_txn
+                .open_table(BUYER_PROVIDER_INDEX_TABLE)
+                .map_err(|err| StoreError::Backend(format!("open_table (index): {err}")))?;
+            index
+                .insert(&index_key, &primary_key)
+                .map_err(|err| StoreError::Backend(format!("insert (index): {err}")))?;
         }
         write_txn
             .commit()
@@ -303,26 +349,41 @@ impl<'a> BuyerChannelTable<'a> {
         Ok(())
     }
 
-    /// Drop the persisted entry for `provider`. A no-op if no record exists or
-    /// the table was never written. An actual deletion is committed durably.
+    /// Drop the persisted entry the provider index currently maps `provider`
+    /// to, removing it from both the primary table and the index. A no-op if
+    /// no index entry exists for `provider`, or if neither table was ever
+    /// written. An actual deletion is committed durably.
     ///
     /// # Errors
     ///
     /// [`StoreError::Backend`] if the delete or durable commit fails.
     pub fn forget(&self, provider: Address) -> Result<(), StoreError> {
-        let key: [u8; 20] = provider.into();
+        let index_key: [u8; 20] = provider.into();
         let write_txn = self.begin_durable_write()?;
-        let removed = {
+        let primary_key = {
+            let mut index = write_txn
+                .open_table(BUYER_PROVIDER_INDEX_TABLE)
+                .map_err(|err| StoreError::Backend(format!("open_table (index): {err}")))?;
+            let Some(value_guard) = index
+                .get(&index_key)
+                .map_err(|err| StoreError::Backend(format!("get (index): {err}")))?
+            else {
+                return Ok(());
+            };
+            let primary_key: [u8; 32] = *value_guard.value();
+            drop(value_guard);
+            index
+                .remove(&index_key)
+                .map_err(|err| StoreError::Backend(format!("remove (index): {err}")))?;
+            primary_key
+        };
+        {
             let mut table = write_txn
                 .open_table(BUYER_CHANNEL_TABLE)
                 .map_err(|err| StoreError::Backend(format!("open_table: {err}")))?;
             table
-                .remove(&key)
-                .map_err(|err| StoreError::Backend(format!("remove: {err}")))?
-                .is_some()
-        };
-        if !removed {
-            return Ok(());
+                .remove(&primary_key)
+                .map_err(|err| StoreError::Backend(format!("remove: {err}")))?;
         }
         write_txn
             .commit()
@@ -330,7 +391,7 @@ impl<'a> BuyerChannelTable<'a> {
         Ok(())
     }
 
-    /// Point-lookup the live channel for `provider`, or `None` if none is
+    /// Point-lookup the live channel by its primary key, or `None` if none is
     /// tracked.
     ///
     /// Unlike [`Self::load_all`], a corrupt row here is **propagated**: this is
@@ -341,11 +402,11 @@ impl<'a> BuyerChannelTable<'a> {
     ///
     /// [`StoreError::Backend`] if unreadable, [`StoreError::Corrupt`] /
     /// [`StoreError::UnsupportedSchema`] if the record cannot be decoded.
-    pub fn get_by_provider(
+    pub fn get_by_channel_id(
         &self,
-        provider: Address,
+        channel_id: ChannelId,
     ) -> Result<Option<BuyerChannelState>, StoreError> {
-        let key: [u8; 20] = provider.into();
+        let key: [u8; 32] = channel_id.into();
         let read_txn = self
             .db
             .begin_read()
@@ -364,9 +425,53 @@ impl<'a> BuyerChannelTable<'a> {
         Ok(Some(decode_record(key, value_guard.value())?))
     }
 
-    /// Compare-and-delete inside a single write transaction: remove `provider`'s
-    /// row only if the stored `channel_id` still matches. Returns whether a row
-    /// was deleted.
+    /// Point-lookup the live channel for `provider` via the secondary reuse
+    /// index (one hop to the `channel_id`, then a primary lookup), or `None` if
+    /// none is tracked.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Backend`] if unreadable, [`StoreError::Corrupt`] /
+    /// [`StoreError::UnsupportedSchema`] if the record cannot be decoded.
+    pub fn get_by_provider(
+        &self,
+        provider: Address,
+    ) -> Result<Option<BuyerChannelState>, StoreError> {
+        let index_key: [u8; 20] = provider.into();
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|err| StoreError::Backend(format!("begin_read: {err}")))?;
+        let index = match read_txn.open_table(BUYER_PROVIDER_INDEX_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(err) => return Err(StoreError::Backend(format!("open_table (index): {err}"))),
+        };
+        let Some(idx_guard) = index
+            .get(&index_key)
+            .map_err(|err| StoreError::Backend(format!("get (index): {err}")))?
+        else {
+            return Ok(None);
+        };
+        let primary_key: [u8; 32] = *idx_guard.value();
+        drop(idx_guard);
+        let table = match read_txn.open_table(BUYER_CHANNEL_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(err) => return Err(StoreError::Backend(format!("open_table: {err}"))),
+        };
+        let Some(value_guard) = table
+            .get(&primary_key)
+            .map_err(|err| StoreError::Backend(format!("get: {err}")))?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(decode_record(primary_key, value_guard.value())?))
+    }
+
+    /// Compare-and-delete inside a single write transaction: remove
+    /// `provider`'s indexed row only if the provider index still maps it to
+    /// `channel_id`. Returns whether a row was deleted.
     ///
     /// Guards the reclaim sweep against a lost update: between the sweep loading
     /// an expired channel and forgetting it, a concurrent `open_or_reuse` may
@@ -381,27 +486,36 @@ impl<'a> BuyerChannelTable<'a> {
         provider: Address,
         channel_id: ChannelId,
     ) -> Result<bool, StoreError> {
-        let key: [u8; 20] = provider.into();
+        let index_key: [u8; 20] = provider.into();
+        let primary_key: [u8; 32] = channel_id.into();
         let write_txn = self.begin_durable_write()?;
         {
-            let mut table = write_txn
-                .open_table(BUYER_CHANNEL_TABLE)
-                .map_err(|err| StoreError::Backend(format!("open_table: {err}")))?;
-            // Read the current row inside the same (serialised) write txn so the
-            // match-and-remove is atomic against a concurrent replace.
-            let Some(value_guard) = table
-                .get(&key)
-                .map_err(|err| StoreError::Backend(format!("get: {err}")))?
+            let mut index = write_txn
+                .open_table(BUYER_PROVIDER_INDEX_TABLE)
+                .map_err(|err| StoreError::Backend(format!("open_table (index): {err}")))?;
+            // Read the current index entry inside the same (serialised) write
+            // txn so the match-and-remove is atomic against a concurrent replace.
+            let Some(value_guard) = index
+                .get(&index_key)
+                .map_err(|err| StoreError::Backend(format!("get (index): {err}")))?
             else {
                 return Ok(false);
             };
-            let matches = decode_record(key, value_guard.value())?.channel_id == channel_id;
+            let matches = *value_guard.value() == primary_key;
             drop(value_guard);
             if !matches {
                 return Ok(false);
             }
+            index
+                .remove(&index_key)
+                .map_err(|err| StoreError::Backend(format!("remove (index): {err}")))?;
+        }
+        {
+            let mut table = write_txn
+                .open_table(BUYER_CHANNEL_TABLE)
+                .map_err(|err| StoreError::Backend(format!("open_table: {err}")))?;
             table
-                .remove(&key)
+                .remove(&primary_key)
                 .map_err(|err| StoreError::Backend(format!("remove: {err}")))?;
         }
         write_txn
@@ -411,7 +525,7 @@ impl<'a> BuyerChannelTable<'a> {
     }
 
     /// Atomically advance the committed progress for `provider`'s channel inside
-    /// a single write transaction (read → channel-id guard → advance against the
+    /// a single write transaction (provider-index CAS → advance against the
     /// committed watermark → write).
     ///
     /// Closes the lost-update / watermark-regression race that a separate
@@ -430,8 +544,25 @@ impl<'a> BuyerChannelTable<'a> {
         bytes_delivered: U256,
         amount: U256,
     ) -> Result<AdvanceOutcome, StoreError> {
-        let key: [u8; 20] = provider.into();
+        let index_key: [u8; 20] = provider.into();
+        let primary_key: [u8; 32] = channel_id.into();
         let write_txn = self.begin_durable_write()?;
+        {
+            let index = write_txn
+                .open_table(BUYER_PROVIDER_INDEX_TABLE)
+                .map_err(|err| StoreError::Backend(format!("open_table (index): {err}")))?;
+            let Some(idx_guard) = index
+                .get(&index_key)
+                .map_err(|err| StoreError::Backend(format!("get (index): {err}")))?
+            else {
+                return Ok(AdvanceOutcome::UnknownChannel);
+            };
+            let mapped: [u8; 32] = *idx_guard.value();
+            drop(idx_guard);
+            if mapped != primary_key {
+                return Ok(AdvanceOutcome::ChannelMismatch);
+            }
+        }
         {
             let mut table = write_txn
                 .open_table(BUYER_CHANNEL_TABLE)
@@ -440,23 +571,20 @@ impl<'a> BuyerChannelTable<'a> {
             // the advance is checked against — and written over — the committed
             // watermark, never a stale in-memory snapshot.
             let Some(value_guard) = table
-                .get(&key)
+                .get(&primary_key)
                 .map_err(|err| StoreError::Backend(format!("get: {err}")))?
             else {
-                return Ok(AdvanceOutcome::UnknownProvider);
+                return Ok(AdvanceOutcome::UnknownChannel);
             };
-            let mut state = decode_record(key, value_guard.value())?;
+            let mut state = decode_record(primary_key, value_guard.value())?;
             // Drop the borrow of `table` held by `value_guard` before mutating.
             drop(value_guard);
-            if state.channel_id != channel_id {
-                return Ok(AdvanceOutcome::ChannelMismatch);
-            }
             if let Err(err) = state.advance(nonce, bytes_delivered, amount) {
                 return Ok(AdvanceOutcome::Regressed(err));
             }
             let encoded = encode_record(&state)?;
             table
-                .insert(&key, encoded.as_slice())
+                .insert(&primary_key, encoded.as_slice())
                 .map_err(|err| StoreError::Backend(format!("insert: {err}")))?;
         }
         write_txn
@@ -477,27 +605,41 @@ impl<'a> BuyerChannelTable<'a> {
         channel_id: ChannelId,
         additional: U256,
     ) -> Result<DepositOutcome, StoreError> {
-        let key: [u8; 20] = provider.into();
+        let index_key: [u8; 20] = provider.into();
+        let primary_key: [u8; 32] = channel_id.into();
         let write_txn = self.begin_durable_write()?;
+        {
+            let index = write_txn
+                .open_table(BUYER_PROVIDER_INDEX_TABLE)
+                .map_err(|err| StoreError::Backend(format!("open_table (index): {err}")))?;
+            let Some(idx_guard) = index
+                .get(&index_key)
+                .map_err(|err| StoreError::Backend(format!("get (index): {err}")))?
+            else {
+                return Ok(DepositOutcome::UnknownChannel);
+            };
+            let mapped: [u8; 32] = *idx_guard.value();
+            drop(idx_guard);
+            if mapped != primary_key {
+                return Ok(DepositOutcome::ChannelMismatch);
+            }
+        }
         let new_deposit = {
             let mut table = write_txn
                 .open_table(BUYER_CHANNEL_TABLE)
                 .map_err(|err| StoreError::Backend(format!("open_table: {err}")))?;
             let Some(value_guard) = table
-                .get(&key)
+                .get(&primary_key)
                 .map_err(|err| StoreError::Backend(format!("get: {err}")))?
             else {
-                return Ok(DepositOutcome::UnknownProvider);
+                return Ok(DepositOutcome::UnknownChannel);
             };
-            let mut state = decode_record(key, value_guard.value())?;
+            let mut state = decode_record(primary_key, value_guard.value())?;
             drop(value_guard);
-            if state.channel_id != channel_id {
-                return Ok(DepositOutcome::ChannelMismatch);
-            }
             state.deposit = state.deposit.saturating_add(additional);
             let encoded = encode_record(&state)?;
             table
-                .insert(&key, encoded.as_slice())
+                .insert(&primary_key, encoded.as_slice())
                 .map_err(|err| StoreError::Backend(format!("insert: {err}")))?;
             state.deposit
         };
@@ -507,11 +649,14 @@ impl<'a> BuyerChannelTable<'a> {
         Ok(DepositOutcome::Added(new_deposit))
     }
 
-    /// Write raw value bytes under `provider`'s key, **bypassing the encoder**,
-    /// to simulate a row left undecodable by a binary downgrade.
+    /// Write raw value bytes under `channel_id`'s primary key, **bypassing the
+    /// encoder**, to simulate a row left undecodable by a binary downgrade.
     ///
     /// Seeds corruption against a live store for the tolerance tests here and,
-    /// through store-specific test seams, for cross-crate consumer tests.
+    /// through store-specific test seams, for cross-crate consumer tests. Does
+    /// NOT touch the provider index — callers that need `get_by_provider` to
+    /// resolve to the corrupt row must index it themselves (there is no encoded
+    /// state to read a provider from).
     ///
     /// Gated behind `test-util` rather than `#[cfg(test)]` because a cross-crate
     /// `cfg(test)` does not propagate: node's seam could not reach a
@@ -523,8 +668,8 @@ impl<'a> BuyerChannelTable<'a> {
     ///
     /// [`StoreError::Backend`] if the write or durable commit fails.
     #[cfg(any(test, feature = "test-util"))]
-    pub fn insert_raw(&self, provider: Address, bytes: &[u8]) -> Result<(), StoreError> {
-        let key: [u8; 20] = provider.into();
+    pub fn insert_raw(&self, channel_id: ChannelId, bytes: &[u8]) -> Result<(), StoreError> {
+        let key: [u8; 32] = channel_id.into();
         let write_txn = self.begin_durable_write()?;
         {
             let mut table = write_txn
@@ -571,6 +716,12 @@ mod tests {
         ))
     }
 
+    /// Every `byte` gets a **distinct** `channel_id` too (derived from the same
+    /// byte): `channel_id` is the store's primary key, so two fixtures sharing
+    /// one `channel_id` would collide in the primary table instead of coexisting
+    /// as two independent channels. `funder`/`voucher_signer` default to
+    /// `provider` (a self-signed channel); tests that care about a delegated
+    /// signer override `voucher_signer` explicitly.
     fn state(byte: u8) -> BuyerChannelState {
         let mut id = [0u8; 32];
         id[31] = byte;
@@ -579,6 +730,8 @@ mod tests {
         BuyerChannelState {
             channel_id: id.into(),
             provider: Address::from(prov),
+            funder: Address::from(prov),
+            voucher_signer: Address::from(prov),
             token: address!("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"),
             deposit: U256::from(10_000_000u64),
             last_amount: U256::from(byte) * U256::from(1_000u64),
@@ -588,17 +741,22 @@ mod tests {
         }
     }
 
+    /// Mirrors `state(1)`, named for the round-trip test below: a channel whose
+    /// `provider` and `voucher_signer` are distinct once the caller overwrites
+    /// `voucher_signer` (publisher-pays; `state`'s own default is self-signed).
+    fn sample_state() -> BuyerChannelState {
+        state(1)
+    }
+
     const OTHER_CHANNEL: ChannelId =
         b256!("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
 
-    /// Postcard encoding of [`golden_state`].
+    /// Postcard encoding of [`golden_state`] (schema v2, #1481).
     ///
-    /// Produced by running the **pre-#1246 encoder** (on `main`, before the codec
-    /// moved) over this fixture, so it pins the format across the hoist and not
-    /// merely against itself. Hex rather than a 206-byte array literal so a diff
-    /// shows exactly which field moved.
+    /// Produced by running the schema-v2 encoder over this fixture. Hex rather
+    /// than a byte array literal so a diff shows exactly which field moved.
     const GOLDEN_RECORD_HEX: &str = concat!(
-        "01",                                                               // schema_version (varint)
+        "02",                                                               // schema_version (varint)
         "1111111111111111111111111111111111111111111111111111111111111111", // channel_id
         "2222222222222222222222222222222222222222",                         // provider
         "3333333333333333333333333333333333333333",                         // token
@@ -607,6 +765,8 @@ mod tests {
         "000000000000000000000000000000000000000000000000cccccccccccccccc", // last_nonce
         "000000000000000000000000000000000000000000000000dddddddddddddddd", // last_bytes_delivered
         "eeddbbf70e",                                                       // expires_at (varint)
+        "4444444444444444444444444444444444444444",                         // funder
+        "5555555555555555555555555555555555555555",                         // voucher_signer
     );
 
     /// The frozen bytes must also *decode* back to the fixture.
@@ -616,7 +776,7 @@ mod tests {
     /// way, and every other test in this suite round-trips through the current
     /// codec, so a matched encoder/decoder drift would pass all of them.
     /// `GOLDEN_RECORD_HEX` is a source literal no running code produced, so this
-    /// holds `take_from_bytes`, the provider/key cross-check, and the
+    /// holds `take_from_bytes`, the `channel_id/key` cross-check, and the
     /// schema-version gate against the format as it was written on disk.
     #[test]
     fn golden_bytes_still_decode() -> anyhow::Result<()> {
@@ -629,7 +789,7 @@ mod tests {
             })
             .collect::<anyhow::Result<_>>()?;
         let want = golden_state();
-        let got = decode_record(want.provider.into(), &bytes)?;
+        let got = decode_record(want.channel_id.into(), &bytes)?;
         anyhow::ensure!(
             got == want,
             "frozen bytes no longer decode:\n {got:?}\n {want:?}"
@@ -646,11 +806,13 @@ mod tests {
     /// `last_nonce` is `U256::from(7)`, i.e. *the same 32 bytes*, so swapping the
     /// two is invisible. Verified: with `state(7)` this test passed a
     /// `channel_id`/`last_nonce` swap, which would mis-decode every record on
-    /// disk. Keep all eight values distinct.
+    /// disk. Keep all ten values distinct.
     fn golden_state() -> BuyerChannelState {
         BuyerChannelState {
             channel_id: B256::repeat_byte(0x11),
             provider: Address::repeat_byte(0x22),
+            funder: Address::repeat_byte(0x44),
+            voucher_signer: Address::repeat_byte(0x55),
             token: Address::repeat_byte(0x33),
             deposit: U256::from(0xAAAA_AAAA_AAAA_AAAAu64),
             last_amount: U256::from(0xBBBB_BBBB_BBBB_BBBBu64),
@@ -659,6 +821,27 @@ mod tests {
             expires_at: 0xEEEE_EEEEu64,
         }
     }
+
+    /// A genuine schema-**v1** record — 9 fields, no `funder`/`voucher_signer`
+    /// trailer — exactly as it existed before the #1481 rekey (this is the old
+    /// `GOLDEN_RECORD_HEX`/`golden_state`, preserved verbatim as the fixture for
+    /// [`v1_schema_record_skipped_on_hydration`]).
+    const V1_RECORD_HEX: &str = concat!(
+        "01",                                                               // schema_version (varint)
+        "1111111111111111111111111111111111111111111111111111111111111111", // channel_id
+        "2222222222222222222222222222222222222222",                         // provider
+        "3333333333333333333333333333333333333333",                         // token
+        "000000000000000000000000000000000000000000000000aaaaaaaaaaaaaaaa", // deposit
+        "000000000000000000000000000000000000000000000000bbbbbbbbbbbbbbbb", // last_amount
+        "000000000000000000000000000000000000000000000000cccccccccccccccc", // last_nonce
+        "000000000000000000000000000000000000000000000000dddddddddddddddd", // last_bytes_delivered
+        "eeddbbf70e",                                                       // expires_at (varint)
+    );
+
+    /// The `channel_id` [`V1_RECORD_HEX`] would be filed under (its own
+    /// `channel_id` field, `0x11` repeated).
+    const V1_RECORD_CHANNEL_ID: ChannelId =
+        b256!("1111111111111111111111111111111111111111111111111111111111111111");
 
     /// Lowercase hex of `bytes`. `fold` + `write!` rather than the obvious
     /// `map(format!).collect()`, which trips `clippy::format_collect`.
@@ -704,6 +887,35 @@ mod tests {
         let (_d, db) = db()?;
         anyhow::ensure!(tbl(&db).load_all()?.channels.is_empty());
         anyhow::ensure!(tbl(&db).get_by_provider(state(1).provider)?.is_none());
+        anyhow::ensure!(tbl(&db).get_by_channel_id(state(1).channel_id)?.is_none());
+        Ok(())
+    }
+
+    /// Step 1 (#1481): a recorded channel round-trips `voucher_signer` and is
+    /// reachable both by its primary key (`get_by_channel_id`) and via the
+    /// provider secondary index (`get_by_provider`).
+    #[test]
+    fn record_round_trips_voucher_signer_and_keys_by_channel_id() -> anyhow::Result<()> {
+        let (_d, db) = db()?;
+        let mut s = sample_state();
+        s.voucher_signer = Address::repeat_byte(0xAB);
+        anyhow::ensure!(
+            s.provider != s.voucher_signer,
+            "fixture must exercise a delegated (non-self) signer"
+        );
+        tbl(&db).record(&s)?;
+
+        let by_id = tbl(&db)
+            .get_by_channel_id(s.channel_id)?
+            .ok_or_else(|| anyhow::anyhow!("missing by channel_id"))?;
+        anyhow::ensure!(by_id.voucher_signer == s.voucher_signer);
+        anyhow::ensure!(by_id == s);
+
+        let by_prov = tbl(&db)
+            .get_by_provider(s.provider)?
+            .ok_or_else(|| anyhow::anyhow!("missing by provider"))?;
+        anyhow::ensure!(by_prov.channel_id == s.channel_id);
+        anyhow::ensure!(by_prov == s);
         Ok(())
     }
 
@@ -802,18 +1014,18 @@ mod tests {
         let mut stored = StoredBuyerChannelState::from(&s);
         stored.schema_version = BUYER_SUPPORTED_SCHEMA_VERSION + 1;
         let encoded = postcard::to_allocvec(&stored)?;
-        tbl(&db).insert_raw(s.provider, &encoded)?;
+        tbl(&db).insert_raw(s.channel_id, &encoded)?;
 
         let load = tbl(&db).load_all()?;
         anyhow::ensure!(
             load.channels.is_empty(),
             "future-schema record must be skipped, not propagated, by load_all",
         );
-        anyhow::ensure!(load.skipped == vec![s.provider]);
+        anyhow::ensure!(load.skipped == vec![s.channel_id]);
         let err = tbl(&db)
-            .get_by_provider(s.provider)
+            .get_by_channel_id(s.channel_id)
             .err()
-            .ok_or_else(|| anyhow::anyhow!("future schema must reject on get_by_provider"))?;
+            .ok_or_else(|| anyhow::anyhow!("future schema must reject on get_by_channel_id"))?;
         anyhow::ensure!(
             matches!(
                 err,
@@ -826,6 +1038,50 @@ mod tests {
         Ok(())
     }
 
+    /// #1481, Step 8: a genuine schema-**v1** record (no `funder`/
+    /// `voucher_signer` trailer) is skipped by `load_all`, not fatal, and never
+    /// live-migrated — the buyer store is a local cache that re-hydrates from
+    /// chain, so an unsupported old shape is simply dropped and the `channel_id`
+    /// is left in `skipped` for observability.
+    ///
+    /// In practice a real v1 *file* never reaches this path at all: the table
+    /// rename (`_v1` → `_v2`) makes `redb` reject the old table outright at
+    /// `open_table`, so `load_all` sees `TableDoesNotExist` and returns empty
+    /// (no `skipped` entries either) rather than iterating any v1 bytes. This
+    /// test instead seeds a genuine v1-shaped payload directly into the *new*
+    /// `_v2` table — the defence-in-depth case where a v1 record's raw bytes
+    /// somehow end up under a `_v2` key — and confirms the general "any decode
+    /// error is skipped, not propagated" path (the same one
+    /// `future_schema_version_skipped_on_hydration` exercises) covers it too.
+    #[test]
+    fn v1_schema_record_skipped_on_hydration() -> anyhow::Result<()> {
+        let (_d, db) = db()?;
+        let bytes: Vec<u8> = (0..V1_RECORD_HEX.len() / 2)
+            .map(|i| {
+                V1_RECORD_HEX
+                    .get(i * 2..i * 2 + 2)
+                    .ok_or_else(|| anyhow::anyhow!("odd-length v1 hex"))
+                    .and_then(|b| u8::from_str_radix(b, 16).map_err(Into::into))
+            })
+            .collect::<anyhow::Result<_>>()?;
+        tbl(&db).insert_raw(V1_RECORD_CHANNEL_ID, &bytes)?;
+
+        let load = tbl(&db).load_all()?;
+        anyhow::ensure!(
+            load.channels.is_empty(),
+            "a v1-shaped record must not decode as a healthy v2 channel, got {load:?}",
+        );
+        anyhow::ensure!(
+            load.skipped == vec![V1_RECORD_CHANNEL_ID],
+            "the v1 record's channel_id must land in skipped, got {load:?}",
+        );
+        anyhow::ensure!(
+            tbl(&db).get_by_channel_id(V1_RECORD_CHANNEL_ID).is_err(),
+            "the point lookup must also reject the v1-shaped record, not silently return it",
+        );
+        Ok(())
+    }
+
     /// Garbage value bytes under a real buyer key are skipped by `load_all` (one
     /// bad row must not strand every other channel's deposit — PR #753 review),
     /// while a healthy record alongside it survives.
@@ -834,7 +1090,7 @@ mod tests {
         let (_d, db) = db()?;
         let healthy = state(2);
         tbl(&db).record(&healthy)?;
-        tbl(&db).insert_raw(state(3).provider, &[0u8; 8])?; // far too short
+        tbl(&db).insert_raw(state(3).channel_id, &[0u8; 8])?; // far too short
 
         let load = tbl(&db).load_all()?;
         anyhow::ensure!(
@@ -842,13 +1098,13 @@ mod tests {
             "corrupt row must be skipped while the healthy row survives, got {load:?}",
         );
         anyhow::ensure!(
-            load.skipped == vec![state(3).provider],
-            "the skipped provider is the only repair handle, got {load:?}",
+            load.skipped == vec![state(3).channel_id],
+            "the skipped channel_id is the only repair handle, got {load:?}",
         );
         let err = tbl(&db)
-            .get_by_provider(state(3).provider)
+            .get_by_channel_id(state(3).channel_id)
             .err()
-            .ok_or_else(|| anyhow::anyhow!("garbage value must reject on get_by_provider"))?;
+            .ok_or_else(|| anyhow::anyhow!("garbage value must reject on get_by_channel_id"))?;
         anyhow::ensure!(
             matches!(&err, StoreError::Corrupt { detail, .. } if detail.contains("postcard decode")),
             "expected Corrupt(postcard decode), got {err:?}",
@@ -856,27 +1112,27 @@ mod tests {
         Ok(())
     }
 
-    /// A record whose embedded `provider` doesn't match its table key is skipped
-    /// by `load_all`; the point lookup still surfaces `Corrupt`.
+    /// A record whose embedded `channel_id` doesn't match its table key is
+    /// skipped by `load_all`; the point lookup still surfaces `Corrupt`.
     #[test]
-    fn provider_key_mismatch_skipped_on_hydration() -> anyhow::Result<()> {
+    fn channel_id_key_mismatch_skipped_on_hydration() -> anyhow::Result<()> {
         let (_d, db) = db()?;
         let s_for_a = state(0xAA);
         let encoded = postcard::to_allocvec(&StoredBuyerChannelState::from(&s_for_a))?;
-        // Filed under a *different* provider's key.
-        tbl(&db).insert_raw(state(0xBB).provider, &encoded)?;
+        // Filed under a *different* channel_id's key.
+        tbl(&db).insert_raw(state(0xBB).channel_id, &encoded)?;
 
         let load = tbl(&db).load_all()?;
         anyhow::ensure!(
             load.channels.is_empty(),
-            "provider/key-mismatch record must be skipped by load_all",
+            "channel_id/key-mismatch record must be skipped by load_all",
         );
-        anyhow::ensure!(load.skipped == vec![state(0xBB).provider]);
+        anyhow::ensure!(load.skipped == vec![state(0xBB).channel_id]);
         let err = tbl(&db)
-            .get_by_provider(state(0xBB).provider)
+            .get_by_channel_id(state(0xBB).channel_id)
             .err()
             .ok_or_else(|| {
-                anyhow::anyhow!("provider/key mismatch must reject on get_by_provider")
+                anyhow::anyhow!("channel_id/key mismatch must reject on get_by_channel_id")
             })?;
         anyhow::ensure!(
             matches!(&err, StoreError::Corrupt { detail, .. } if detail.contains("does not match table key")),
@@ -893,7 +1149,7 @@ mod tests {
         let s = state(0x42);
         let mut encoded = postcard::to_allocvec(&StoredBuyerChannelState::from(&s))?;
         encoded.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01]);
-        tbl(&db).insert_raw(s.provider, &encoded)?;
+        tbl(&db).insert_raw(s.channel_id, &encoded)?;
 
         let load = tbl(&db).load_all()?;
         anyhow::ensure!(load.channels.len() == 1);
@@ -977,18 +1233,18 @@ mod tests {
                 U256::from(1u64),
                 U256::from(1u64),
                 U256::from(1u64)
-            )? == AdvanceOutcome::UnknownProvider
+            )? == AdvanceOutcome::UnknownChannel
         );
         anyhow::ensure!(
             tbl(&db).add_deposit(ghost.provider, ghost.channel_id, U256::from(1u64))?
-                == DepositOutcome::UnknownProvider
+                == DepositOutcome::UnknownChannel
         );
 
         let s = state(9);
         tbl(&db).record(&s)?;
 
         // With the table now present, an unrecorded provider must still report
-        // UnknownProvider. Both these calls and the never-written-store calls
+        // UnknownChannel. Both these calls and the never-written-store calls
         // above return from inside the write transaction. Mutating that return
         // to ChannelMismatch otherwise passes the whole suite.
         let absent = state(0x5A);
@@ -999,12 +1255,12 @@ mod tests {
                 U256::from(1u64),
                 U256::from(1u64),
                 U256::from(1u64)
-            )? == AdvanceOutcome::UnknownProvider,
+            )? == AdvanceOutcome::UnknownChannel,
             "advance_progress on an absent row of an existing table"
         );
         anyhow::ensure!(
             tbl(&db).add_deposit(absent.provider, absent.channel_id, U256::from(1u64))?
-                == DepositOutcome::UnknownProvider,
+                == DepositOutcome::UnknownChannel,
             "add_deposit on an absent row of an existing table"
         );
 
@@ -1051,13 +1307,13 @@ mod tests {
                 U256::from(1u64),
                 U256::from(1u64),
                 U256::from(1u64)
-            )? == AdvanceOutcome::UnknownProvider
+            )? == AdvanceOutcome::UnknownChannel
         );
         anyhow::ensure!(table_absent(&db)?, "advance_progress created the table");
 
         anyhow::ensure!(
             tbl(&db).add_deposit(s.provider, s.channel_id, U256::from(1u64))?
-                == DepositOutcome::UnknownProvider
+                == DepositOutcome::UnknownChannel
         );
         anyhow::ensure!(table_absent(&db)?, "add_deposit created the table");
 

@@ -47,10 +47,13 @@ pub const NEVER_EXPIRES: u64 = 0;
 /// lifetime), so a reused channel's next voucher resumes at
 /// `last_nonce + 1` / `last_bytes_delivered + delta` / `last_amount + delta`.
 ///
-/// **Field invariant:** `provider` is the **identity key** (the store keys on
-/// it; `channel_id` is the authoritative id decoded from the `ChannelOpened`
-/// event in the open tx receipt). The `last_*` fields MUST only advance —
-/// through
+/// **Field invariant:** `channel_id` is the **identity key** (the store's
+/// primary key; the on-chain `channelId` decoded from the `ChannelOpened`
+/// event in the open tx receipt). `provider` is a **secondary reuse index** —
+/// the open-channel trigger looks it up to decide whether to reuse an
+/// existing channel instead of opening a new one — not the identity key: two
+/// channels can (transiently) exist for the same provider, e.g. across a
+/// rotate. The `last_*` fields MUST only advance — through
 /// [`BuyerChannelState::advance`] (the validated mutator) or hydration from a
 /// [`BuyerChannelStore`]. The fields stay `pub` because the cross-crate
 /// hydration path (`decdn-node` decoding the redb record) needs struct-literal
@@ -61,11 +64,21 @@ pub const NEVER_EXPIRES: u64 = 0;
 pub struct BuyerChannelState {
     /// On-chain `channelId` (`keccak256(client, provider, channelNonce)`) —
     /// learned by decoding the `ChannelOpened` event from the open tx receipt
-    /// (atomic with the open; no follow-up `getChannel` read).
+    /// (atomic with the open; no follow-up `getChannel` read). The store's
+    /// primary key.
     pub channel_id: ChannelId,
     /// Upstream provider's Ethereum address — the per-provider reuse key
-    /// (the channel's identity in [`BuyerChannelStore`]).
+    /// (a secondary index in [`BuyerChannelStore`]; see the field invariant
+    /// above).
     pub provider: Address,
+    /// The on-chain `client`: put up the deposit, receives the refund, and
+    /// the only address `topUp` accepts. Equals the local key for a
+    /// self-opened channel; the publisher for publisher-pays.
+    pub funder: Address,
+    /// Address whose EIP-712 signature this channel accepts — the pinned
+    /// on-chain `voucherSigner`. Equals `funder`/the local key for a
+    /// self-signed channel, a delegate for publisher-pays.
+    pub voucher_signer: Address,
     /// `ERC-20` token bound by the channel (`USDC`).
     pub token: Address,
     /// On-chain deposited amount in token base units (initial + any top-ups).
@@ -88,14 +101,17 @@ pub struct BuyerChannelState {
 ///
 /// A disk-backed store keeps hydration available when one row cannot be
 /// decoded: healthy channels remain usable and reclaimable, while the row's
-/// provider key is retained as the only available repair handle.
+/// primary key (`channel_id`) is retained as the only available repair
+/// handle — the primary table is keyed by `channel_id`, so that is the one
+/// piece of identity an undecodable row still exposes; the provider lives
+/// inside the bytes that failed to decode.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BuyerLoad {
     /// Successfully decoded buyer channels.
     pub channels: Vec<BuyerChannelState>,
-    /// Providers whose persisted rows could not be decoded. Their deposits
+    /// Channel ids whose persisted rows could not be decoded. Their deposits
     /// remain escrowed but untracked until the rows are repaired.
-    pub skipped: Vec<Address>,
+    pub skipped: Vec<ChannelId>,
 }
 
 impl BuyerChannelState {
@@ -105,6 +121,8 @@ impl BuyerChannelState {
     pub const fn new(
         channel_id: ChannelId,
         provider: Address,
+        funder: Address,
+        voucher_signer: Address,
         token: Address,
         deposit: U256,
         expires_at: u64,
@@ -112,6 +130,8 @@ impl BuyerChannelState {
         Self {
             channel_id,
             provider,
+            funder,
+            voucher_signer,
             token,
             deposit,
             last_amount: U256::ZERO,
@@ -203,19 +223,21 @@ pub enum BuyerProgressError {
 /// [`BuyerChannelStore::forget_if_channel`]).
 ///
 /// `#[must_use]`: the variant is the only signal that nothing was persisted
-/// (`UnknownProvider` / `ChannelMismatch`) or that the totals regressed — a
+/// (`UnknownChannel` / `ChannelMismatch`) or that the totals regressed — a
 /// dropped outcome silently looks like success.
 #[derive(Debug, PartialEq, Eq)]
 #[must_use]
 pub enum AdvanceOutcome {
     /// The committed row was advanced and re-persisted durably.
     Advanced,
-    /// No row exists for the provider (the channel was never recorded or its
-    /// table does not exist yet).
-    UnknownProvider,
-    /// The committed row is for a different channel — the provider's slot was
-    /// replaced by a newer open. The caller should treat this as stale and
-    /// must NOT escalate (writing would clobber the live replacement).
+    /// No row is reachable for the provider/channel (the provider's secondary
+    /// index has no entry, or the channel it names is absent — never
+    /// recorded, or the table does not exist yet).
+    UnknownChannel,
+    /// The provider's secondary index names a *different* channel than the
+    /// one the caller expected — the provider's slot was replaced by a newer
+    /// open. The caller should treat this as stale and must NOT escalate
+    /// (writing would clobber the live replacement).
     ChannelMismatch,
     /// The reported totals would regress the committed watermark — a real
     /// caller bug (vouchers never decrease). Carries the rejecting error.
@@ -225,29 +247,32 @@ pub enum AdvanceOutcome {
 /// Outcome of an atomic [`BuyerChannelStore::add_deposit`].
 ///
 /// `#[must_use]` for the same reason as [`AdvanceOutcome`]: a dropped
-/// `ChannelMismatch` / `UnknownProvider` silently looks like a successful
+/// `ChannelMismatch` / `UnknownChannel` silently looks like a successful
 /// credit.
 #[derive(Debug, PartialEq, Eq)]
 #[must_use]
 pub enum DepositOutcome {
     /// `additional` was added to the committed deposit; carries the new total.
     Added(U256),
-    /// No row exists for the provider.
-    UnknownProvider,
+    /// No row is reachable for the provider/channel (see
+    /// [`AdvanceOutcome::UnknownChannel`]).
+    UnknownChannel,
     /// The committed row is for a different channel (stale; NOT escalated).
     ChannelMismatch,
 }
 
-/// Durable backing store for [`BuyerChannelState`], keyed by provider address.
+/// Durable backing store for [`BuyerChannelState`], keyed by `channel_id`
+/// (its on-chain identity) with `provider` as a secondary reuse index.
 ///
 /// Mirrors [`crate::store::ChannelStateStore`] but for the buyer's view. The
 /// reuse unit is one open channel per provider, so `get_by_provider` is the
 /// hot path the channel-open trigger consults before deciding to reuse vs.
-/// open. Implementations MUST persist `record`/`forget` durably (fsync, for
-/// disk-backed impls) before returning `Ok`.
+/// open — it resolves through the provider index to the primary
+/// `channel_id`-keyed row. Implementations MUST persist `record`/`forget`
+/// durably (fsync, for disk-backed impls) before returning `Ok`.
 pub trait BuyerChannelStore: Send + Sync {
     /// Load every persisted buyer channel. Called once at bring-up to hydrate
-    /// the in-memory provider→channel map and seed the reclaim sweep.
+    /// the in-memory channel map and seed the reclaim sweep.
     ///
     /// # Errors
     ///
@@ -257,26 +282,42 @@ pub trait BuyerChannelStore: Send + Sync {
     fn load_all(&self) -> Result<BuyerLoad, StoreError>;
 
     /// Persist (insert or overwrite) the state for one channel, keyed by
-    /// `state.provider`. MUST be durable before returning `Ok`.
+    /// `state.channel_id` (primary) with `state.provider` maintained as a
+    /// secondary reuse index. MUST be durable before returning `Ok`.
     ///
     /// Callers SHOULD pass a `state` whose `last_*` tuple is a non-strict
     /// monotonic successor of any previously-recorded state for
-    /// `state.provider` (advance via [`BuyerChannelState::advance`]). The trait
-    /// does not re-validate this — it is a dumb writer; the monotonicity
-    /// invariant is owned upstream.
+    /// `state.channel_id` (advance via [`BuyerChannelState::advance`]). The
+    /// trait does not re-validate this — it is a dumb writer; the
+    /// monotonicity invariant is owned upstream.
     ///
     /// # Errors
     ///
     /// Returns a [`StoreError`] if the write or fsync fails.
     fn record(&self, state: &BuyerChannelState) -> Result<(), StoreError>;
 
-    /// Drop the persisted entry for `provider` (after the channel is reclaimed
-    /// or settled). A no-op if no record exists. MUST commit durably.
+    /// Drop the persisted entry the provider index currently maps `provider`
+    /// to (after the channel is reclaimed or settled), removing it from both
+    /// the primary table and the provider index. A no-op if no record exists.
+    /// MUST commit durably.
     ///
     /// # Errors
     ///
     /// Returns a [`StoreError`] if the delete or durable commit fails.
     fn forget(&self, provider: Address) -> Result<(), StoreError>;
+
+    /// Point-lookup the live channel by its primary key, or `None` if none is
+    /// tracked. Unlike [`Self::get_by_provider`] this needs no secondary
+    /// index hop.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`StoreError`] if the backing store is unreadable or the
+    /// record is corrupt.
+    fn get_by_channel_id(
+        &self,
+        channel_id: ChannelId,
+    ) -> Result<Option<BuyerChannelState>, StoreError>;
 
     /// Compare-and-delete: drop `provider`'s entry **only if** the stored
     /// record's `channel_id` still equals `channel_id`. Returns `true` if a
@@ -355,12 +396,22 @@ pub trait BuyerChannelStore: Send + Sync {
     ) -> Result<DepositOutcome, StoreError>;
 }
 
+/// In-memory backing for [`MemoryBuyerChannelStore`]: the primary
+/// `channel_id`-keyed map plus the `provider → channel_id` secondary reuse
+/// index, held behind one mutex so the pair updates atomically (mirrors the
+/// redb table's single-write-transaction discipline).
+#[derive(Debug, Default)]
+struct MemoryInner {
+    channels: HashMap<ChannelId, BuyerChannelState>,
+    provider_index: HashMap<Address, ChannelId>,
+}
+
 /// In-memory [`BuyerChannelStore`] for tests and the trait's reference
 /// semantics. Not durable — drops with the process. The runtime uses the
 /// redb-backed impl in `crates/node`.
 #[derive(Debug, Default)]
 pub struct MemoryBuyerChannelStore {
-    inner: Mutex<HashMap<Address, BuyerChannelState>>,
+    inner: Mutex<MemoryInner>,
 }
 
 impl MemoryBuyerChannelStore {
@@ -373,7 +424,7 @@ impl MemoryBuyerChannelStore {
     /// Snapshot the current entry count (test helper).
     #[must_use]
     pub fn len(&self) -> usize {
-        self.inner.lock().map_or(0, |m| m.len())
+        self.inner.lock().map_or(0, |m| m.channels.len())
     }
 
     /// `true` when no channels are tracked.
@@ -390,7 +441,7 @@ impl BuyerChannelStore for MemoryBuyerChannelStore {
             .lock()
             .map_err(|err| StoreError::Backend(format!("memory store mutex poisoned: {err}")))?;
         Ok(BuyerLoad {
-            channels: guard.values().cloned().collect(),
+            channels: guard.channels.values().cloned().collect(),
             skipped: Vec::new(),
         })
     }
@@ -400,7 +451,10 @@ impl BuyerChannelStore for MemoryBuyerChannelStore {
             .inner
             .lock()
             .map_err(|err| StoreError::Backend(format!("memory store mutex poisoned: {err}")))?;
-        guard.insert(state.provider, state.clone());
+        guard
+            .provider_index
+            .insert(state.provider, state.channel_id);
+        guard.channels.insert(state.channel_id, state.clone());
         Ok(())
     }
 
@@ -409,7 +463,9 @@ impl BuyerChannelStore for MemoryBuyerChannelStore {
             .inner
             .lock()
             .map_err(|err| StoreError::Backend(format!("memory store mutex poisoned: {err}")))?;
-        guard.remove(&provider);
+        if let Some(channel_id) = guard.provider_index.remove(&provider) {
+            guard.channels.remove(&channel_id);
+        }
         Ok(())
     }
 
@@ -422,14 +478,23 @@ impl BuyerChannelStore for MemoryBuyerChannelStore {
             .inner
             .lock()
             .map_err(|err| StoreError::Backend(format!("memory store mutex poisoned: {err}")))?;
-        if guard
-            .get(&provider)
-            .is_some_and(|s| s.channel_id == channel_id)
-        {
-            guard.remove(&provider);
+        if guard.provider_index.get(&provider) == Some(&channel_id) {
+            guard.provider_index.remove(&provider);
+            guard.channels.remove(&channel_id);
             return Ok(true);
         }
         Ok(false)
+    }
+
+    fn get_by_channel_id(
+        &self,
+        channel_id: ChannelId,
+    ) -> Result<Option<BuyerChannelState>, StoreError> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|err| StoreError::Backend(format!("memory store mutex poisoned: {err}")))?;
+        Ok(guard.channels.get(&channel_id).cloned())
     }
 
     fn get_by_provider(&self, provider: Address) -> Result<Option<BuyerChannelState>, StoreError> {
@@ -437,7 +502,11 @@ impl BuyerChannelStore for MemoryBuyerChannelStore {
             .inner
             .lock()
             .map_err(|err| StoreError::Backend(format!("memory store mutex poisoned: {err}")))?;
-        Ok(guard.get(&provider).cloned())
+        Ok(guard
+            .provider_index
+            .get(&provider)
+            .and_then(|channel_id| guard.channels.get(channel_id))
+            .cloned())
     }
 
     fn advance_progress(
@@ -452,12 +521,15 @@ impl BuyerChannelStore for MemoryBuyerChannelStore {
             .inner
             .lock()
             .map_err(|err| StoreError::Backend(format!("memory store mutex poisoned: {err}")))?;
-        let Some(state) = guard.get_mut(&provider) else {
-            return Ok(AdvanceOutcome::UnknownProvider);
+        let Some(mapped) = guard.provider_index.get(&provider).copied() else {
+            return Ok(AdvanceOutcome::UnknownChannel);
         };
-        if state.channel_id != channel_id {
+        if mapped != channel_id {
             return Ok(AdvanceOutcome::ChannelMismatch);
         }
+        let Some(state) = guard.channels.get_mut(&channel_id) else {
+            return Ok(AdvanceOutcome::UnknownChannel);
+        };
         match state.advance(nonce, bytes_delivered, amount) {
             Ok(()) => Ok(AdvanceOutcome::Advanced),
             Err(err) => Ok(AdvanceOutcome::Regressed(err)),
@@ -474,12 +546,15 @@ impl BuyerChannelStore for MemoryBuyerChannelStore {
             .inner
             .lock()
             .map_err(|err| StoreError::Backend(format!("memory store mutex poisoned: {err}")))?;
-        let Some(state) = guard.get_mut(&provider) else {
-            return Ok(DepositOutcome::UnknownProvider);
+        let Some(mapped) = guard.provider_index.get(&provider).copied() else {
+            return Ok(DepositOutcome::UnknownChannel);
         };
-        if state.channel_id != channel_id {
+        if mapped != channel_id {
             return Ok(DepositOutcome::ChannelMismatch);
         }
+        let Some(state) = guard.channels.get_mut(&channel_id) else {
+            return Ok(DepositOutcome::UnknownChannel);
+        };
         state.deposit = state.deposit.saturating_add(additional);
         Ok(DepositOutcome::Added(state.deposit))
     }
@@ -488,14 +563,22 @@ impl BuyerChannelStore for MemoryBuyerChannelStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy::primitives::{address, b256};
+    use alloy::primitives::{B256, address, b256};
 
+    /// Every `provider_byte` gets a **distinct** `channel_id` too (derived from
+    /// the same byte): `channel_id` is now the store's primary key, so two
+    /// samples sharing one `channel_id` would collide in the primary table
+    /// instead of coexisting as two independent channels.
     fn sample(provider_byte: u8) -> BuyerChannelState {
         let mut pbytes = [0u8; 20];
         pbytes[19] = provider_byte;
+        let mut idbytes = [0u8; 32];
+        idbytes[31] = provider_byte;
         BuyerChannelState {
-            channel_id: b256!("11223344556677889900aabbccddeeff00112233445566778899aabbccddeeff"),
+            channel_id: B256::from(idbytes),
             provider: Address::from(pbytes),
+            funder: Address::from(pbytes),
+            voucher_signer: Address::from(pbytes),
             token: address!("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"),
             deposit: U256::from(10_000_000u64),
             last_amount: U256::from(1_234u64),
@@ -741,7 +824,7 @@ mod tests {
             .ok_or_else(|| anyhow::anyhow!("missing row"))?;
         anyhow::ensure!(stored == s, "mismatched calls must not mutate the row");
 
-        // Unknown provider → UnknownProvider, no write.
+        // Unknown provider → UnknownChannel, no write.
         anyhow::ensure!(
             store.advance_progress(
                 unknown,
@@ -749,11 +832,11 @@ mod tests {
                 U256::from(1u64),
                 U256::from(1u64),
                 U256::from(1u64)
-            )? == AdvanceOutcome::UnknownProvider
+            )? == AdvanceOutcome::UnknownChannel
         );
         anyhow::ensure!(
             store.add_deposit(unknown, s.channel_id, U256::from(1u64))?
-                == DepositOutcome::UnknownProvider
+                == DepositOutcome::UnknownChannel
         );
         Ok(())
     }
