@@ -46,7 +46,7 @@ pub mod probe;
 pub mod provider;
 pub mod rtt_map;
 
-pub use ledger::{ChannelLedger, Cumulative, DEFAULT_MAX_OUTSTANDING_VOUCHERS};
+pub use ledger::{ChannelLedger, Cumulative};
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -765,38 +765,6 @@ impl std::fmt::Display for LocalPullFault {
 }
 
 impl std::error::Error for LocalPullFault {}
-
-/// Typed sentinel for the client refusing to leave more than
-/// [`DEFAULT_MAX_OUTSTANDING_VOUCHERS`] vouchers unacked on one channel (#1484).
-///
-/// The optimistic paid-fetch loop no longer blocks on each `VoucherAck`, so a
-/// provider that keeps delivering bytes but never acks could otherwise make the
-/// client sign vouchers arbitrarily far ahead of any confirmation. [`ChannelLedger::issue`]
-/// caps the outstanding set at `max`; hitting it aborts the pull.
-///
-/// This is OUR client-side bound, not evidence the peer is dead — a peer legitimately
-/// serving several intervals ahead is fine, only one running unboundedly ahead without
-/// acking trips it. So `node_origin::pull_verdict` classifies it `OurDeadline`
-/// (exonerating + briefly suppressed), never a reputation hit. `downcast_ref` recovers
-/// it through a `.context(…)` layer; that survival is pinned by
-/// `buyer_side_sentinels_survive_anyhow_downcast` in `decdn-node`.
-#[derive(Debug)]
-pub struct TooManyOutstandingVouchers {
-    /// The outstanding-voucher bound that was reached.
-    pub max: usize,
-}
-
-impl std::fmt::Display for TooManyOutstandingVouchers {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "refusing to leave more than {} vouchers unacked; upstream is not acking",
-            self.max
-        )
-    }
-}
-
-impl std::error::Error for TooManyOutstandingVouchers {}
 
 /// The bounds on a pull, each matched to the stage it governs (#1134).
 ///
@@ -2215,9 +2183,10 @@ impl Drop for UpstreamPull {
 /// The ledger advances its committed watermark only when the ack comes back, so a
 /// voucher whose ack never arrives leaves the committed watermark unmoved while
 /// [`ChannelLedger::settlement`] still reports it (settle high — the upstream persists
-/// before it acks, ADR 003). The outstanding set is bounded, so a silent provider
-/// that keeps delivering but never acks eventually trips
-/// [`TooManyOutstandingVouchers`] rather than making the client pay unboundedly ahead.
+/// before it acks, ADR 003). The client never pays ahead of what it received (vouchers
+/// are cumulative over delivered bytes), and a provider that delivers but never acks is
+/// abandoned by the pull's `stall` timeout, so the optimistic loop needs no separate
+/// cap on how many vouchers may be outstanding.
 async fn send_voucher(
     send: &mut SendStream,
     ctx: &ChannelContext,

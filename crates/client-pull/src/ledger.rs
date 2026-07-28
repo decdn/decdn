@@ -11,27 +11,6 @@ use alloy::primitives::U256;
 use decdn_protocol::MB_BYTES;
 use tokio::sync::Mutex;
 
-use crate::TooManyOutstandingVouchers;
-
-/// The most vouchers the client will leave OUTSTANDING (sent but unacked) on one
-/// channel before it refuses to issue another (#1484).
-///
-/// The optimistic loop no longer blocks on each `VoucherAck`, so without a bound a
-/// provider that keeps delivering bytes but never acks could make the client sign
-/// vouchers arbitrarily far ahead of any confirmation. This caps that exposure. The
-/// client still never pays for bytes it has not *received* — every voucher is
-/// cumulative over delivered bytes — so this bounds only how far ahead of the acks
-/// the client will run, not any over-delivery risk.
-///
-/// The default is generous relative to a well-behaved node, which acks a voucher the
-/// instant it reads one and (at the default `pull_ahead_bytes` == one voucher
-/// interval) is never more than a single interval ahead: outstanding oscillates
-/// between 0 and 1 there. A node configured to serve several intervals ahead still
-/// fits comfortably under this; only a provider running unboundedly ahead without
-/// acking trips it, and that abort is exonerating (our client-side bound, classified
-/// [`crate::TooManyOutstandingVouchers`] → `OurDeadline`), not a peer-fault verdict.
-pub const DEFAULT_MAX_OUTSTANDING_VOUCHERS: usize = 16;
-
 /// A channel's cumulative voucher state: the absolute totals carried by the most
 /// recent voucher. All three advance monotonically over the channel's lifetime.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -79,8 +58,9 @@ struct Pipeline {
     /// `committed` still says N-1. Settle low and the next reuse re-signs N, the
     /// upstream rejects `StaleNonce` (terminal), and the channel is wedged with its
     /// deposit escrowed until expiry (the desync in `send_voucher`, tracked in #1122).
-    /// Pipelining (#1484) widens this window from one voucher to a bounded few rather
-    /// than introducing a new state.
+    /// Pipelining (#1484) widens this window from one voucher to however many are in
+    /// flight rather than introducing a new state; the count is bounded by the blob's
+    /// interval budget (`max_blob_size / interval`), not a separate ceiling.
     outstanding: VecDeque<Cumulative>,
 }
 
@@ -108,33 +88,20 @@ pub struct ChannelLedger {
     /// and all three DROP the future. Held for a few instructions at a time and never
     /// across an await, so it cannot deadlock with the issuance lock.
     pipeline: std::sync::Mutex<Pipeline>,
-    /// The most vouchers left outstanding before [`Self::issue`] refuses another
-    /// (#1484). See [`DEFAULT_MAX_OUTSTANDING_VOUCHERS`].
-    max_outstanding: usize,
 }
 
 impl ChannelLedger {
     /// Build a ledger seeded from the channel's persisted cumulative state (the
     /// last voucher acked on earlier streams/invocations). Pass `Cumulative::default()`
-    /// for a brand-new channel. Uses [`DEFAULT_MAX_OUTSTANDING_VOUCHERS`].
+    /// for a brand-new channel.
     #[must_use]
     pub fn new(seed: Cumulative) -> Self {
-        Self::with_max_outstanding(seed, DEFAULT_MAX_OUTSTANDING_VOUCHERS)
-    }
-
-    /// Like [`Self::new`] but with an explicit outstanding-voucher bound — for tests
-    /// and any caller that wants a tighter or looser pipeline than the default.
-    #[must_use]
-    pub fn with_max_outstanding(seed: Cumulative, max_outstanding: usize) -> Self {
         Self {
             issuance: Mutex::new(()),
             pipeline: std::sync::Mutex::new(Pipeline {
                 committed: seed,
                 outstanding: VecDeque::new(),
             }),
-            // A zero bound would deadlock issuance (nothing could ever be sent); a
-            // ledger with no room to pipeline still needs room for one voucher.
-            max_outstanding: max_outstanding.max(1),
         }
     }
 
@@ -207,11 +174,19 @@ impl ChannelLedger {
     /// (its fate is ambiguous: a partial write may have reached the upstream, which
     /// persists before it acks), so `settlement` settles high.
     ///
-    /// Refuses with [`crate::TooManyOutstandingVouchers`] once `max_outstanding`
-    /// vouchers are already unacked, bounding how far ahead of the acks a silent
-    /// provider can push the client. `exchange` receives the next [`Cumulative`] (the
-    /// values to sign and send); the caller owns signing + framing so this module
-    /// stays free of EIP-712 / wire types.
+    /// The outstanding set is deliberately not capped here. It cannot grow without limit:
+    /// the receive loop stops issuing once `expected_wire_bytes` have arrived, and that
+    /// total is capped at the open stage against `max_blob_size`, so the set is bounded
+    /// by `max_blob_size / interval` (a handful of small `Cumulative`s). Nor does an
+    /// unacked pipeline risk money — every voucher is cumulative over bytes ALREADY
+    /// delivered, so the client never pays ahead of what it received. A separate
+    /// client-side ceiling would only have to be kept above the operator-tunable
+    /// serve-side credit window (#1477) or it would abort honest transfers — a coupling
+    /// worth avoiding. A provider that delivers but never acks is caught by the pull's
+    /// `stall` timeout, not by a voucher count.
+    ///
+    /// `exchange` receives the next [`Cumulative`] (the values to sign and send); the
+    /// caller owns signing + framing so this module stays free of EIP-712 / wire types.
     pub async fn issue<F, Fut>(
         &self,
         delta_bytes: u64,
@@ -233,13 +208,6 @@ impl ChannelLedger {
         // `StaleNonce`.
         let next = {
             let mut pipeline = self.pipeline();
-            if pipeline.outstanding.len() >= self.max_outstanding {
-                // Bound reached: refuse rather than pay further ahead of the acks. No
-                // voucher is armed or sent. Exonerating for the peer (our bound).
-                return Err(anyhow::Error::new(TooManyOutstandingVouchers {
-                    max: self.max_outstanding,
-                }));
-            }
             let frontier = match pipeline.outstanding.back() {
                 Some(highest) if highest.nonce > pipeline.committed.nonce => *highest,
                 _ => pipeline.committed,
@@ -586,36 +554,28 @@ mod tests {
         Ok(())
     }
 
-    /// The bound (#1484): once `max_outstanding` vouchers are unacked, the next issue is
-    /// refused with `TooManyOutstandingVouchers` and NOTHING is sent or armed — a silent
-    /// provider cannot make the client pay unboundedly ahead. Acking one frees a slot.
+    /// A deep pipeline is fine: the outstanding set has no fixed ceiling (it is bounded
+    /// only by the blob's interval count via `max_blob_size`), so many vouchers can be
+    /// armed at once and each still builds on the last in strict nonce order. The client
+    /// has paid for exactly the delivered deltas, never ahead of them.
     #[tokio::test]
-    async fn issue_refuses_past_the_outstanding_bound() -> anyhow::Result<()> {
-        let ledger = ChannelLedger::with_max_outstanding(Cumulative::default(), 2);
-        ledger.issue(100, 10, |_next| async { Ok(()) }).await?;
-        ledger.issue(100, 10, |_next| async { Ok(()) }).await?;
-        // Third issue at the cap: refused, no send.
-        let mut sent = false;
-        let refused = ledger
-            .issue(100, 10, |_next| {
-                sent = true;
-                async { Ok(()) }
-            })
-            .await;
-        assert!(!sent, "a refused issue must not run the send");
-        let Err(err) = refused else {
-            anyhow::bail!("must refuse past the bound");
-        };
-        assert!(
-            err.downcast_ref::<TooManyOutstandingVouchers>().is_some(),
-            "the refusal must carry the typed bound error, got: {err}"
+    async fn a_deep_pipeline_stays_ordered_and_exact() -> anyhow::Result<()> {
+        let ledger = ChannelLedger::new(Cumulative::default());
+        for expected in 1..=100u64 {
+            let sent = ledger.issue(100, 10, |_next| async { Ok(()) }).await?;
+            assert_eq!(sent.nonce, U256::from(expected));
+        }
+        let settled = ledger.settlement();
+        assert_eq!(
+            settled.nonce,
+            U256::from(100u64),
+            "settle high across the set"
         );
-        // Still two outstanding, settlement at the highest sent (nonce 2).
-        assert_eq!(ledger.settlement().nonce, U256::from(2u64));
-        // Ack one → a slot frees → the next issue succeeds as nonce 3.
-        assert!(ledger.resolve_ack());
-        let sent3 = ledger.issue(100, 10, |_next| async { Ok(()) }).await?;
-        assert_eq!(sent3.nonce, U256::from(3u64));
+        assert_eq!(
+            settled.bytes,
+            U256::from(10_000u64),
+            "100 × 100 delivered bytes — never more than was issued"
+        );
         Ok(())
     }
 

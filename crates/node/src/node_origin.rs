@@ -61,10 +61,9 @@ use crate::buyer_channel::{ChannelOpenPending, ChannelOpener, OpenReported, Open
 use crate::buyer_ledgers::BuyerLedgers;
 use crate::client_requester::{
     BlobTooLargeClaim, ChannelContext, ChannelLedger, Cumulative, HashMismatch, LocalPullFault,
-    PullDeadlines, PullStalled, PullTimeout, RateAboveCeiling, TooManyOutstandingVouchers,
-    UpstreamPull, UpstreamPullHeader, UpstreamRefused, UpstreamVoucherRejected, VoucherProgress,
-    effective_rate_ceiling, open_progressive_pull as open_progressive_upstream,
-    sign_client_binding, stream_fetch_shared,
+    PullDeadlines, PullStalled, PullTimeout, RateAboveCeiling, UpstreamPull, UpstreamPullHeader,
+    UpstreamRefused, UpstreamVoucherRejected, VoucherProgress, effective_rate_ceiling,
+    open_progressive_pull as open_progressive_upstream, sign_client_binding, stream_fetch_shared,
 };
 use crate::dht::negative_cache::Hash as DhtHash;
 use crate::dht::routing::{NodeId as DhtNodeId, RoutingTable};
@@ -2040,14 +2039,6 @@ fn pull_verdict(err: &anyhow::Error) -> PullVerdict {
     if err.downcast_ref::<PullStalled>().is_some() {
         return PullVerdict::Stalled;
     }
-    // We refused to pay further ahead of the acks (#1484) — OUR client-side bound, not
-    // proof the peer is dead. A provider legitimately serving several intervals ahead is
-    // fine; only one running unboundedly ahead without acking trips this. So treat it
-    // exactly like OUR deadline firing: exonerate the peer and suppress the pair briefly
-    // rather than score it `Unreachable`.
-    if err.downcast_ref::<TooManyOutstandingVouchers>().is_some() {
-        return PullVerdict::OurDeadline;
-    }
     if let Some(rejected) = err.downcast_ref::<UpstreamVoucherRejected>() {
         return voucher_verdict(rejected.reason);
     }
@@ -2469,20 +2460,6 @@ mod tests {
             local.downcast_ref::<PullStalled>().is_none(),
             "and must not be confused with a peer-attributable sentinel"
         );
-
-        // The outstanding-voucher bound (#1484) is exonerating (→ `OurDeadline`), so it
-        // must stay recoverable through a context layer too — otherwise a client that
-        // capped an over-eager provider would fall to the `Unreachable` catch-all and
-        // gossip it as dead.
-        let too_many: anyhow::Error =
-            anyhow::Error::new(TooManyOutstandingVouchers { max: 16 }).context("send_voucher");
-        assert!(
-            too_many
-                .downcast_ref::<TooManyOutstandingVouchers>()
-                .is_some(),
-            "the outstanding-voucher bound must stay recoverable through context layers"
-        );
-        assert!(too_many.downcast_ref::<PullStalled>().is_none());
 
         // The refusal sentinel (#1144) carries the wire code through the same
         // channel, so `classify_pull_failure` can split an honest `NotFound` from
