@@ -4840,3 +4840,78 @@ async fn populate_fills_via_the_streaming_commit_path() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// `populate` must also fill via the BUFFERED commit arm, which this blob is
+/// small enough to take (`should_buffer` routes anything at or under
+/// `buffered_max_bytes`, 8 MiB by default).
+///
+/// That arm changed with `FillMode`: it used to hand its drain buffer back
+/// regardless of what the caller asked for, which made `CommitOnly ⟺ no payload`
+/// true in only one direction and left the mode with a silent exception. It now
+/// drops the buffer and reports `Committed` like the streaming arm. Nothing about
+/// the fill itself should differ — same commit, same broadcast, same bytes — and
+/// that is what this pins. Its sibling
+/// `populate_fills_via_the_streaming_commit_path` covers the other arm; a change
+/// that fixed one and broke the other would pass only one of the two.
+#[tokio::test]
+async fn populate_fills_via_the_buffered_commit_path() -> anyhow::Result<()> {
+    // Well under the 8 MiB `buffered_max_bytes` default, and the mock advertises
+    // a `Content-Length`, so `should_buffer` says yes.
+    let mut payload = vec![0u8; 64 * 1024];
+    let mut x: u32 = 0x0BAD_F00D;
+    for b in &mut payload {
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        *b = x.to_le_bytes().first().copied().unwrap_or(0);
+    }
+    let hash = Hash::new(&payload);
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{}", hash.to_hex())))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(payload.clone()))
+        .mount(&server)
+        .await;
+    let (engine, _tmp) = build_engine(&server.uri()).await?;
+
+    anyhow::ensure!(!engine.has(hash).await?, "blob must start absent");
+    engine.populate(hash).await?;
+    anyhow::ensure!(
+        engine.has(hash).await?,
+        "populate must commit the blob via the buffered arm too"
+    );
+    let got = engine.get(hash).await?;
+    anyhow::ensure!(
+        got.as_ref() == payload.as_slice(),
+        "buffered-arm populate stored the wrong bytes"
+    );
+    Ok(())
+}
+
+/// `get` must still receive the payload from the buffered arm — the direction
+/// `FillMode::ReturnBytes` is responsible for.
+///
+/// Paired deliberately with the test above: they differ only in the mode, so
+/// together they pin that the buffered arm honours BOTH, rather than having been
+/// made to drop its buffer unconditionally.
+#[tokio::test]
+async fn get_still_returns_bytes_from_the_buffered_commit_path() -> anyhow::Result<()> {
+    let payload = b"small enough to be drained, not streamed".to_vec();
+    let hash = Hash::new(&payload);
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{}", hash.to_hex())))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(payload.clone()))
+        .mount(&server)
+        .await;
+    let (engine, _tmp) = build_engine(&server.uri()).await?;
+
+    let got = engine.get(hash).await?;
+    anyhow::ensure!(
+        got.as_ref() == payload.as_slice(),
+        "get must return the drained payload, not an empty or missing blob"
+    );
+    Ok(())
+}

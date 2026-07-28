@@ -1567,19 +1567,18 @@ impl CacheEngine {
     /// not miscounted as client-facing egress and the whole blob is not
     /// re-assembled into a buffer the caller would just drop. A hit is a no-op.
     ///
-    /// On the STREAMING commit path that guarantee is enforced, not merely
-    /// intended: `want_bytes: false` reaches `pull_through_attempt`, which returns
-    /// `Committed` without a `read_local` (#1132). Before that the blob *was* read
-    /// back and dropped, which is how the serve path's miss leg came to hold
+    /// That second guarantee is enforced, not merely intended: this path is
+    /// `FillMode::CommitOnly` all the way down, and neither commit arm can hand a
+    /// payload back under it — the streaming arm skips the `read_local`, the
+    /// buffered arm drops its drain buffer (#1132). Before that the blob *was*
+    /// read back and dropped, which is how the serve path's miss leg came to hold
     /// ~708 MB for a 708 MB blob.
     ///
-    /// The BUFFERED arm is the exception and is worth knowing about, because it is
-    /// the path #1132 is titled after: when an origin advertises a `size_hint` at
-    /// or under `cache.origin_retry.buffered_max_bytes` (8 MiB default),
-    /// `should_buffer` drains the blob into a `Bytes` before committing and
-    /// `commit_buffered_bytes` hands it back regardless of `want_bytes`. Nothing is
-    /// re-read, so there is no second copy — but the peak is bounded by that config
-    /// knob rather than by this flag.
+    /// Note the buffered arm's cost is bounded by
+    /// `cache.origin_retry.buffered_max_bytes` (8 MiB default) rather than by the
+    /// mode: an origin that advertises a small `size_hint` is drained before
+    /// commit either way. `CommitOnly` guarantees no blob is handed *back*, not
+    /// that no blob is ever briefly buffered.
     /// The origin-egress metric (`pull_through_bytes`) is still bumped by the
     /// pull, which is correct — those bytes really did leave an origin.
     ///
@@ -1652,14 +1651,15 @@ impl CacheEngine {
                         inflight: &self.inner.inflight,
                         notify: &notify,
                     };
-                    // `want_bytes: false` — this path drops the payload, so the
-                    // whole blob is never read back out of the store (#1132).
-                    self.pull_through(hash, local_only, false).await?;
+                    // Fill-only: the payload is dropped, so the whole blob is
+                    // never read back out of the store (#1132). The wrapper
+                    // returns `()`, so there is nothing here to drop by accident.
+                    self.pull_through_fill(hash, local_only).await?;
                     break;
                 }
                 // Mutex poisoned — fall through to a direct pull.
                 None => {
-                    self.pull_through(hash, local_only, false).await?;
+                    self.pull_through_fill(hash, local_only).await?;
                     break;
                 }
             }
@@ -2521,36 +2521,51 @@ impl CacheEngine {
             .any(|o| !local_only || o.kind() != OriginKind::Peer)
     }
 
-    /// [`Self::pull_through`] for a caller that needs the bytes: resolves the
-    /// `want_bytes == true` contract that `Option` cannot express in the type.
+    /// [`Self::pull_through`] for a caller that needs the bytes ([`Self::get`]).
     ///
-    /// A `None` here means [`Self::pull_through`] returned the commit-only arm
-    /// despite `want_bytes == true`, which is a logic regression rather than a
-    /// runtime condition. Surface it as a `Store` fault — the workspace anti-panic
-    /// policy rules out an `expect`, and a silent empty `Bytes` would be worse
-    /// (the caller would serve a zero-length blob).
+    /// Exists so no caller has to name a [`FillMode`] or unwrap the `Option`: the
+    /// mode↔shape correspondence is resolved here, once. A `None` under
+    /// [`FillMode::ReturnBytes`] is a logic regression, not a runtime condition —
+    /// surface it as a `Store` fault, since the anti-panic policy rules out an
+    /// `expect` and a silent empty `Bytes` would be worse (the caller would serve
+    /// a zero-length blob).
     async fn pull_through_bytes(&self, hash: Hash) -> CacheResult<Bytes> {
-        match self.pull_through(hash, false, true).await? {
+        match self
+            .pull_through(hash, false, FillMode::ReturnBytes)
+            .await?
+        {
             Some(bytes) => Ok(bytes),
             None => Err(CacheError::Store(anyhow::anyhow!(
-                "pull_through returned no bytes for {hash} despite want_bytes"
+                "pull_through returned no bytes for {hash} under FillMode::ReturnBytes"
             ))),
         }
     }
 
+    /// [`Self::pull_through`] for a caller that only wants the blob present
+    /// ([`Self::populate`] / [`Self::populate_local`]).
+    ///
+    /// The `()` return is the point: under [`FillMode::CommitOnly`] there is no
+    /// payload to hand back, and a caller that cannot receive one cannot
+    /// accidentally keep a whole blob alive (#1132).
+    async fn pull_through_fill(&self, hash: Hash, local_only: bool) -> CacheResult<()> {
+        self.pull_through(hash, local_only, FillMode::CommitOnly)
+            .await
+            .map(drop)
+    }
+
     /// Walk the origin chain to fill `hash`.
     ///
-    /// `want_bytes` selects whether the committed blob is read back out of the
-    /// store and returned: [`Self::get`] needs it, [`Self::populate`] would only
-    /// drop it. `Ok(None)` is therefore reachable ONLY under
-    /// `want_bytes == false`; a `true` call that somehow returns `None` is a logic
-    /// regression, which [`Self::pull_through_bytes`] surfaces as a `Store` fault (#1132).
+    /// The mode↔return-shape correspondence is exact in both directions:
+    /// [`FillMode::ReturnBytes`] always yields `Some` on success and
+    /// [`FillMode::CommitOnly`] always yields `None`. Prefer the
+    /// [`Self::pull_through_bytes`] / [`Self::pull_through_fill`] wrappers, which
+    /// are total and hide the `Option` entirely.
     #[allow(clippy::too_many_lines)] // One linear chain walk; each outcome arm carries the rationale for its own fallback/return decision, and splitting the match out would separate those from the loop state (`last_err`, `any_not_found`, `any_short_circuit`) they exist to explain.
     async fn pull_through(
         &self,
         hash: Hash,
         local_only: bool,
-        want_bytes: bool,
+        mode: FillMode,
     ) -> CacheResult<Option<Bytes>> {
         // Every pull_through entry is a `get()` cache miss, regardless
         // of how the pull resolves. Coalesced waiters that find a hit
@@ -2634,7 +2649,7 @@ impl CacheEngine {
                         hash,
                         max_blob_bytes,
                         policy,
-                        want_bytes,
+                        mode,
                     )
                 })
                 .await;
@@ -2882,9 +2897,10 @@ impl CacheEngine {
     /// `TempTag`s, and origin futures all have to be re-created per
     /// attempt and can't be reused across iterations.
     ///
-    /// `want_bytes == false` (the `populate` fill path) returns
-    /// [`PullThroughOutcome::Committed`] instead of reading the committed blob
-    /// back out of the store — see that variant's docs (#1132).
+    /// Under [`FillMode::CommitOnly`] (the `populate` fill path) this returns
+    /// [`PullThroughOutcome::Committed`] rather than a payload — the streaming arm
+    /// by skipping its `read_local`, the buffered arm by dropping its drain
+    /// buffer. See that variant's docs (#1132).
     #[allow(clippy::too_many_lines)] // Linear per-attempt flow; the failure-classification arms each need their own context comment, and splitting them across functions would obscure the sequence more than the length.
     async fn pull_through_attempt(
         &self,
@@ -2892,7 +2908,7 @@ impl CacheEngine {
         hash: Hash,
         max_blob_bytes: u64,
         policy: RetryPolicy,
-        want_bytes: bool,
+        mode: FillMode,
     ) -> Result<PullThroughOutcome, OriginPullError> {
         // The origin handle is now plumbed in by the caller
         // (`pull_through`'s fallback-chain loop, #284) so this method
@@ -2929,7 +2945,7 @@ impl CacheEngine {
                 }
                 Err(e) => return Err(classify_io_error(e)),
             };
-            return self.commit_buffered_bytes(hash, bytes).await;
+            return self.commit_buffered_bytes(hash, bytes, mode).await;
         }
 
         // Streaming path: drive the origin stream into the store, verify the
@@ -2946,7 +2962,9 @@ impl CacheEngine {
             // so reading them back would re-materialise the whole blob for nothing
             // — the exact allocation the streaming import above just avoided
             // (#1132). Skip it.
-            StreamCommitOutcome::Committed if !want_bytes => Ok(PullThroughOutcome::Committed),
+            StreamCommitOutcome::Committed if mode == FillMode::CommitOnly => {
+                Ok(PullThroughOutcome::Committed)
+            }
             StreamCommitOutcome::Committed => match self.read_local(hash).await {
                 Ok(bytes) => Ok(PullThroughOutcome::Bytes(bytes)),
                 Err(CacheError::Store(err)) => Ok(PullThroughOutcome::Store(err)),
@@ -3111,6 +3129,7 @@ impl CacheEngine {
         &self,
         hash: Hash,
         bytes: Bytes,
+        mode: FillMode,
     ) -> Result<PullThroughOutcome, OriginPullError> {
         // iroh-blobs `add_bytes` returns `Ok(NamedTag)` directly,
         // skipping the `TempTag` intermediary used by `add_stream`.
@@ -3152,8 +3171,38 @@ impl CacheEngine {
             }
             return Ok(PullThroughOutcome::HashMismatch { actual });
         }
-        Ok(PullThroughOutcome::Bytes(bytes))
+        match mode {
+            FillMode::ReturnBytes => Ok(PullThroughOutcome::Bytes(bytes)),
+            // The drain already holds these bytes, so unlike the streaming path
+            // there is nothing to *avoid* re-reading here — dropping them is not a
+            // memory win. It is a CONTRACT win: it makes "CommitOnly ⟺ None" true
+            // in both directions, so the wrappers are total and a reader of
+            // `FillMode::CommitOnly` can trust it end to end rather than
+            // discovering this arm as an exception.
+            FillMode::CommitOnly => {
+                drop(bytes);
+                Ok(PullThroughOutcome::Committed)
+            }
+        }
     }
+}
+
+/// Whether a pull-through hands the committed blob back to its caller.
+///
+/// Replaces a `want_bytes: bool` that sat directly beside `local_only: bool` in
+/// the same argument lists — two adjacent booleans that the compiler would let
+/// you swap silently, in a chain where getting it wrong either reinstates the
+/// #1132 whole-blob read-back or stops `get` consulting peer origins. Neither
+/// failure has a test that would catch it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FillMode {
+    /// [`CacheEngine::get`] — the caller needs the payload, so a committed blob is
+    /// read back out of the store.
+    ReturnBytes,
+    /// [`CacheEngine::populate`] — the caller drops the payload, so it is never
+    /// read back (#1132). Serving a 708 MB blob used to cost that much again on
+    /// the miss leg for a buffer nobody looked at.
+    CommitOnly,
 }
 
 /// Per-attempt outcomes that ride out of the retry loop without
@@ -3163,7 +3212,7 @@ impl CacheEngine {
 enum PullThroughOutcome {
     Bytes(Bytes),
     /// The blob committed to the local store, but the caller asked not to have it
-    /// read back (`want_bytes == false` — the fill-only path, #1132). Carrying no
+    /// read back ([`FillMode::CommitOnly`] — the fill-only path, #1132). Carrying no
     /// payload is the entire point: re-reading a 708 MB blob to hand it to
     /// [`CacheEngine::populate`], which drops it, was a whole-blob allocation on
     /// the serve path's miss leg.
@@ -4063,6 +4112,57 @@ mod tests {
         anyhow::ensure!(
             engine.last_accessed(hash).is_some(),
             "expected Some(Instant) after pull-through get"
+        );
+        Ok(())
+    }
+
+    /// The `FillMode` ↔ return-shape correspondence, asserted where the private
+    /// types are visible — the integration tests in `tests/pull_through.rs`
+    /// cannot see `PullThroughOutcome`, so they can only observe that the fill
+    /// happened, not which arm produced it.
+    ///
+    /// This is the property the enum exists to carry, and it must hold in BOTH
+    /// directions: `ReturnBytes` always yields `Some`, `CommitOnly` always yields
+    /// `None`. Before `FillMode` the second half was false on the buffered arm,
+    /// which handed its drain buffer back regardless — an exception that made the
+    /// wrappers partial and the mode untrustworthy to read.
+    ///
+    /// Deliberately run through the BUFFERED arm: `StubOrigin` advertises a size
+    /// hint well under `buffered_max_bytes`, so `should_buffer` routes here. The
+    /// streaming arm never had the defect.
+    #[tokio::test]
+    async fn fill_mode_determines_the_return_shape_in_both_directions() -> anyhow::Result<()> {
+        let payload = b"drained, not streamed";
+        let hash = Hash::new(payload);
+
+        let tmp_fill = tempfile::tempdir()?;
+        let engine = CacheEngine::open(
+            tmp_fill.path(),
+            vec![Arc::new(StubOrigin::new(payload)) as Arc<dyn Origin>],
+            10,
+        )
+        .await?;
+        let committed = engine
+            .pull_through(hash, false, FillMode::CommitOnly)
+            .await?;
+        anyhow::ensure!(
+            committed.is_none(),
+            "CommitOnly must yield no payload, got {committed:?}"
+        );
+
+        let tmp_bytes = tempfile::tempdir()?;
+        let engine = CacheEngine::open(
+            tmp_bytes.path(),
+            vec![Arc::new(StubOrigin::new(payload)) as Arc<dyn Origin>],
+            10,
+        )
+        .await?;
+        let returned = engine
+            .pull_through(hash, false, FillMode::ReturnBytes)
+            .await?;
+        anyhow::ensure!(
+            returned.as_deref() == Some(payload.as_slice()),
+            "ReturnBytes must yield the payload, got {returned:?}"
         );
         Ok(())
     }
