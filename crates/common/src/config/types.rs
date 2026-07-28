@@ -778,6 +778,18 @@ pub struct PaymentConfig {
     /// not governance-owned: no contract holds a cadence parameter (ADR 003
     /// §Voucher Interval Negotiation).
     pub voucher_interval_mb: Option<u64>,
+    /// Downstream paid-delivery credit window in bytes (ADR 003 §Credit window):
+    /// how far past the client's cleared payment the node keeps streaming before
+    /// it must collect a voucher, so paid delivery pipelines instead of stalling a
+    /// round trip at every interval boundary. Bounds the node's credit exposure
+    /// (unbilled egress already on the wire) to exactly this; the client's exposure
+    /// stays zero (vouchers are cumulative over delivered bytes). Absent =>
+    /// [`crate::config::DEFAULT_CREDIT_WINDOW_BYTES`] (8 MiB). Floored at one
+    /// voucher interval; a value at or below one interval reproduces the
+    /// pre-credit-window stop-and-wait cadence. Like [`Self::voucher_interval_mb`]
+    /// it is node-local config, not a governance-owned parameter — no contract
+    /// holds a delivery-cadence value (ADR 003 §Voucher Interval Negotiation).
+    pub credit_window_bytes: Option<decdn_config_types::Bytes>,
 }
 
 /// Gossip section of the config file (ADR 001).

@@ -307,6 +307,258 @@ async fn client_delivery_roundtrip_advances_channel_state() -> anyhow::Result<()
     Ok(())
 }
 
+/// One voucher interval at the harness's hardcoded `voucher_interval_mb = 1`.
+const HARNESS_INTERVAL_BYTES: u64 = 1024 * 1024;
+
+/// Spin up a serving `ClientHandler` with an explicit downstream credit window
+/// (#1477). `credit_window` of `None` leaves the handler at its stop-and-wait
+/// default (window = one interval); `Some(bytes)` opts the serve loop into
+/// pipelining up to `bytes` ahead of cleared payment.
+async fn spawn_pipelined_server(
+    cache: CacheEngine,
+    store: Arc<dyn ChannelStateStore>,
+    credit_window: Option<u64>,
+) -> anyhow::Result<(
+    EndpointAddr,
+    Arc<PrivateKeySigner>,
+    Endpoint,
+    tokio::task::JoinHandle<()>,
+)> {
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = Arc::new(PrivateKeySigner::random());
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let handler = build_handler_full_configured(
+        server_id,
+        &server_eth,
+        &metrics,
+        limiter,
+        cache,
+        store,
+        RATE_PER_MB,
+        &loopback_domains(),
+        0,
+        16,
+        |deps| {
+            deps.credit_window_bytes = credit_window.map(decdn_cache::Bytes::new);
+        },
+    )?;
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+    Ok((target, server_eth, server_ep, server_task))
+}
+
+/// Open a paid `cdn/client/v1` stream and read past its signed `StreamResponse`,
+/// leaving the caller positioned to read `ChunkData`. The raw counterpart to the
+/// pipelined requester (#1484): it drives the byte stream by hand so a test can
+/// choose exactly when (and whether) to pay.
+async fn open_paid_stream(
+    conn: &Connection,
+    hash: [u8; 32],
+) -> anyhow::Result<(SendStream, RecvStream)> {
+    let (mut send, mut recv) = conn
+        .open_bi()
+        .await
+        .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
+    let req = StreamRequest {
+        hash,
+        namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        channel_id: channel_id().into(),
+        byte_offset: 0,
+        byte_len: 0,
+        timestamp_us: 0x0012_61a0,
+    };
+    let payload =
+        encode_stream_request(&req, None).map_err(|e| anyhow::anyhow!("encode request: {e}"))?;
+    write_frame(&mut send, &payload)
+        .await
+        .map_err(|e| anyhow::anyhow!("write request: {e}"))?;
+    match read_client_msg(&mut recv).await? {
+        ClientMessage::StreamResponse(resp) => {
+            anyhow::ensure!(resp.body.ok, "delivery refused: {:?}", resp.error);
+        }
+        other => anyhow::bail!("expected a StreamResponse, got {other:?}"),
+    }
+    Ok((send, recv))
+}
+
+/// Read EXACTLY `expect` wire bytes of `ChunkData`, giving each read a generous
+/// ceiling so a loaded CI box cannot spuriously truncate a delivery that is in
+/// fact coming. Bails if the server sends a non-chunk, stalls before `expect`, or
+/// overshoots the expected count. Deterministic under load: it waits for bytes
+/// that a correct server WILL send, rather than inferring "done" from a quiet gap.
+async fn read_exact_chunks(recv: &mut RecvStream, expect: u64) -> anyhow::Result<()> {
+    let mut got: u64 = 0;
+    while got < expect {
+        let msg = tokio::time::timeout(Duration::from_secs(10), read_client_msg(recv))
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!("server stalled after {got} of {expect} expected wire bytes")
+            })??;
+        match msg {
+            ClientMessage::ChunkData(chunk) => {
+                got = got.saturating_add(chunk.bytes().len() as u64);
+            }
+            other => anyhow::bail!("expected ChunkData, got {other:?}"),
+        }
+    }
+    anyhow::ensure!(
+        got == expect,
+        "read {got} wire bytes, expected exactly {expect} (server overshot the credit window)"
+    );
+    Ok(())
+}
+
+/// Assert the server has PARKED — that it has sent nothing beyond what was already
+/// read and is blocked in `collect_voucher` awaiting a voucher we are withholding.
+///
+/// This is the credit-exposure bound, checked as an ABSENCE and therefore robust
+/// under parallel test load: a correct pipelining node cannot send past the credit
+/// window without a voucher, so no further byte is ever coming and the read times
+/// out deterministically. Only a buggy OVER-delivering server makes this read
+/// return — and it returns fast, so the timeout only bounds how long we wait to
+/// catch that bug, never whether a correct server passes.
+async fn assert_parked_awaiting_voucher(recv: &mut RecvStream) -> anyhow::Result<()> {
+    match tokio::time::timeout(Duration::from_secs(2), read_client_msg(recv)).await {
+        Err(_elapsed) => Ok(()),
+        Ok(Ok(ClientMessage::ChunkData(chunk))) => anyhow::bail!(
+            "server sent {} more wire bytes past the credit window instead of parking for a voucher",
+            chunk.bytes().len()
+        ),
+        Ok(other) => anyhow::bail!("expected the server to park awaiting a voucher; got {other:?}"),
+    }
+}
+
+/// #1477: with a credit window wider than one interval, the serve loop streams a
+/// FULL window ahead of cleared payment instead of stalling a round trip at each
+/// voucher boundary — and never more than the window (the bounded credit
+/// exposure). A client that pays nothing reads exactly the window, then the
+/// server parks awaiting a voucher.
+#[tokio::test(flavor = "multi_thread")]
+async fn serve_streams_a_full_credit_window_ahead_of_payment() -> anyhow::Result<()> {
+    // The window is 8 MiB — eight of the harness's 1 MiB intervals. Reading a full
+    // window ahead of ANY voucher is the pipelining claim: the pre-#1477 loop
+    // stalled after one interval, so it could never stream this far ahead of zero
+    // payment. The blob is larger than the window, so the WINDOW — not the blob —
+    // bounds the read-ahead.
+    const WINDOW: u64 = 8 * 1024 * 1024;
+    let payload = vec![0x11u8; 16 * 1024 * 1024];
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+    let (store, _signer, _deposit) = seeded_store()?;
+
+    let (target, _server_eth, server_ep, server_task) =
+        spawn_pipelined_server(cache, Arc::clone(&store), Some(WINDOW)).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let conn = client_ep
+        .connect(target, ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+
+    let (_send, mut recv) = open_paid_stream(&conn, *hash.as_bytes()).await?;
+    // A full window arrives ahead of ANY voucher (pipelined past one interval)...
+    read_exact_chunks(&mut recv, WINDOW).await?;
+    // ...and not one byte more (exposure bounded to exactly the window).
+    assert_parked_awaiting_voucher(&mut recv).await?;
+
+    conn.close(0u32.into(), b"done");
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
+/// #1477 backward-compatibility: an unconfigured credit window (`None`) reads as
+/// one interval, reproducing the pre-credit-window stop-and-wait cadence exactly
+/// — the server delivers a single interval, then parks awaiting its voucher. This
+/// is what keeps a not-yet-pipelined requester (#1484) working against a new
+/// node.
+#[tokio::test(flavor = "multi_thread")]
+async fn serve_without_a_credit_window_is_stop_and_wait() -> anyhow::Result<()> {
+    let payload = vec![0x22u8; 16 * 1024 * 1024];
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+    let (store, _signer, _deposit) = seeded_store()?;
+
+    let (target, _server_eth, server_ep, server_task) =
+        spawn_pipelined_server(cache, Arc::clone(&store), None).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let conn = client_ep
+        .connect(target, ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+
+    let (_send, mut recv) = open_paid_stream(&conn, *hash.as_bytes()).await?;
+    // Exactly one interval, then a park: the pre-credit-window cadence.
+    read_exact_chunks(&mut recv, HARNESS_INTERVAL_BYTES).await?;
+    assert_parked_awaiting_voucher(&mut recv).await?;
+
+    conn.close(0u32.into(), b"done");
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
+/// #1477: paying one cumulative voucher frees exactly one interval of credit, so
+/// the server resumes and streams one further interval before parking again — the
+/// window slides forward with payment rather than draining to a hard stop.
+#[tokio::test(flavor = "multi_thread")]
+async fn paying_a_voucher_slides_the_credit_window_forward() -> anyhow::Result<()> {
+    const WINDOW: u64 = 8 * 1024 * 1024;
+    let payload = vec![0x33u8; 16 * 1024 * 1024];
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+    let (store, signer, _deposit) = seeded_store()?;
+
+    let (target, _server_eth, server_ep, server_task) =
+        spawn_pipelined_server(cache, Arc::clone(&store), Some(WINDOW)).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let conn = client_ep
+        .connect(target, ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+
+    let (mut send, mut recv) = open_paid_stream(&conn, *hash.as_bytes()).await?;
+    // Fill the window, then confirm the server has parked.
+    read_exact_chunks(&mut recv, WINDOW).await?;
+    assert_parked_awaiting_voucher(&mut recv).await?;
+
+    // Pay one cumulative voucher covering a single interval.
+    let amount = min_payment(HARNESS_INTERVAL_BYTES, RATE_PER_MB);
+    let voucher = Voucher {
+        channel_id: channel_id(),
+        amount,
+        nonce: U256::ONE,
+        bytes_delivered: U256::from(HARNESS_INTERVAL_BYTES),
+        token: TOKEN,
+    }
+    .sign(&signer, &payment_domain())
+    .map_err(|e| anyhow::anyhow!("sign voucher: {e}"))?;
+    write_client_msg(
+        &mut send,
+        &ClientMessage::Voucher(signed_to_wire_voucher(&voucher)),
+    )
+    .await?;
+    match read_client_msg(&mut recv).await? {
+        ClientMessage::VoucherAck => {}
+        other => anyhow::bail!("expected VoucherAck, got {other:?}"),
+    }
+
+    // The ack freed exactly one interval of credit: the server streams one further
+    // interval (sliding the window forward), then parks again.
+    read_exact_chunks(&mut recv, HARNESS_INTERVAL_BYTES).await?;
+    assert_parked_awaiting_voucher(&mut recv).await?;
+
+    conn.close(0u32.into(), b"done");
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
 /// ADR 005 §Connection lifetime (#1193): a connection with no active stream is
 /// closed by the application layer after `APP_IDLE_TIMEOUT`. A short timeout is
 /// injected via `ClientHandlerDeps.idle_timeout` so the test need not wait the production 30s.

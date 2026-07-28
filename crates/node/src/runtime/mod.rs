@@ -1203,6 +1203,9 @@ async fn build_chain_and_handlers(
     client_deps.background_fill = background_fill;
     client_deps.pull_through_origin = pull_through_origin;
     client_deps.pull_ahead_bytes = pull_ahead_bytes;
+    // Downstream paid-delivery credit window (ADR 003 §Credit window, #1477).
+    client_deps.credit_window_bytes =
+        Some(decdn_cache::Bytes::new(cfg.payment.credit_window_bytes));
     client_deps.leech_governor = leech_governor;
     client_deps.pull_origin_gate = pull_origin_gate;
     let client_handler = Arc::new(ClientHandler::new(client_deps)?);
@@ -3690,6 +3693,7 @@ mod tests {
                 rate_per_mb: 10,
                 delivery_floor: 0,
                 voucher_interval_mb: decdn_protocol::DEFAULT_VOUCHER_INTERVAL_MB,
+                credit_window_bytes: decdn_common::config::DEFAULT_CREDIT_WINDOW_BYTES,
             },
             observability: ResolvedObservability {
                 log_level: decdn_common::cli::common::LogLevel::Info,

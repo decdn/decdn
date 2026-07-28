@@ -103,6 +103,11 @@ impl ClientHandler {
                 .as_ref()
                 .map_or(decdn_common::config::DEFAULT_PULL_AHEAD_BYTES, |b| b.get())
                 .max(interval_bytes)
+                // Match the effective loop window: the credit window (#1477) can
+                // widen `pulled − served_paid` past `pull_ahead_bytes`, so the
+                // deposit floor must cover it too, or a near-empty channel could
+                // trigger a speculative pull it cannot pay for.
+                .max(self.credit_window(interval_bytes))
         };
         let ceiling = min_payment(guard_bytes, rate_per_mb);
         let (deposit, last_amount) = {
@@ -254,13 +259,19 @@ impl ClientHandler {
         mut tee: TeeSink,
     ) -> anyhow::Result<()> {
         let interval_bytes = interval_mb.saturating_mul(MB_BYTES).max(1);
-        // The window must be at least one interval so the loop can always make
-        // progress (pull a full interval, then collect its voucher); a configured
-        // `pull_ahead_bytes` above that lets the pull run further ahead.
+        // The fused window bounds a single quantity: `pulled − served_paid`, which
+        // — because every pulled chunk is forwarded downstream immediately — is at
+        // once the UPSTREAM speculative spend and the DOWNSTREAM unbilled egress.
+        // So it must satisfy both bounds: at least `pull_ahead_bytes` (the upstream
+        // exposure knob, #856) AND at least the downstream `credit_window` (#1477),
+        // which is what pipelines the client-facing leg past the pre-#1477
+        // one-interval barrier. Both already floor at one interval, so the loop can
+        // always make progress (pull a full interval, then collect its voucher).
         let window = self
             .pull_ahead_bytes
             .unwrap_or(Bytes::new(decdn_common::config::DEFAULT_PULL_AHEAD_BYTES))
-            .max(Bytes::new(interval_bytes));
+            .max(Bytes::new(interval_bytes))
+            .max(Bytes::new(self.credit_window(interval_bytes)));
         let peer = client_node_id.0;
         // Read once: the funder is immutable for the channel's lifetime, and the
         // per-boundary in-flight takedown check below must not re-take the
