@@ -44,6 +44,22 @@ mod sol_types {
             /// the live `EnumerableSet` values.
             function getOrigins(uint256 namespaceId) external view returns (address[] memory);
 
+            /// How many namespaces currently have a non-empty authorized set.
+            function assignedNamespaceCount() external view returns (uint256);
+
+            /// A page of the namespaces that currently have origins. Membership
+            /// within a namespace was always readable via `getOrigins`; this is
+            /// the key set, whose absence was the sole reason a bootstrap had to
+            /// replay `AssignmentActivated` from the deploy block.
+            ///
+            /// Order is NOT stable across mutations (swap-and-pop removal), so
+            /// every page and the count it is checked against MUST be read at one
+            /// pinned block height.
+            function assignedNamespaces(uint256 offset, uint256 limit)
+                external
+                view
+                returns (uint256[] memory);
+
             // -----------------------------------------------------------------
             // Write functions (publisher control plane, issue #1029)
             // -----------------------------------------------------------------

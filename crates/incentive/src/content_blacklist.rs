@@ -84,6 +84,56 @@ mod sol_types {
                 view
                 returns (HashEntry memory);
 
+            /// True while `origin` is denied at the origin level, honouring
+            /// emergency auto-expiry (a raw mapping read would not).
+            ///
+            /// Re-added now that the deny-set is enumerable: this was previously
+            /// dropped as dead surface because the only use for it — a
+            /// per-address boot reconcile — had nothing to iterate over.
+            function isOriginBlacklisted(address origin) external view returns (bool);
+
+            /// Every region key whose entries are in scope for `operator` right
+            /// now: `GLOBAL` (always first), the declared region, and — while the
+            /// ADR 030 ripening window is open — the previous one. One to three
+            /// keys. Resolved on-chain through the same internal the slash-
+            /// eligibility predicate uses, so the region packing and ripening
+            /// math cannot drift between the two.
+            function getScopeRegions(address operator) external view returns (bytes32[] memory);
+
+            /// Number of entries indexed under `region`. Companion to
+            /// `blacklistedHashes`; RAW membership, matching that view.
+            function blacklistedHashCount(bytes32 region) external view returns (uint256);
+
+            /// A page of `region`'s entry set. A page shorter than `limit` is the
+            /// end of the set.
+            ///
+            /// Returns RAW membership — an emergency entry past its deadline is
+            /// still listed, because filtering would put holes in a paginated
+            /// view and dropping entries is the fail-open direction. Apply
+            /// `isHashBlacklistedForOperator` (or `getHashEntry`) for liveness.
+            ///
+            /// Order is NOT stable across mutations (swap-and-pop removal), so
+            /// every page — and the count it is checked against — MUST be read at
+            /// one pinned block height, or a concurrent removal can move an
+            /// unread element into an already-read slot and skip it.
+            function blacklistedHashes(bytes32 region, uint256 offset, uint256 limit)
+                external
+                view
+                returns (bytes32[] memory);
+
+            /// Number of addresses denied at the origin or operator level.
+            function blacklistedAddressCount() external view returns (uint256);
+
+            /// A page of the UNION of the origin and operator deny lists — the
+            /// same disjunction `OriginAssignment` evaluates per address, and the
+            /// only readable source for a set that sits outside the
+            /// `getBlacklistVersion()` mechanism entirely. Same raw-membership and
+            /// pinned-block caveats as `blacklistedHashes`.
+            function blacklistedAddresses(uint256 offset, uint256 limit)
+                external
+                view
+                returns (address[] memory);
+
             // -----------------------------------------------------------------
             // Write functions (governance — driven by the e2e harness)
             // -----------------------------------------------------------------
@@ -140,18 +190,17 @@ mod sol_types {
             /// (ADR 011 § Hash Evasion and Origin Blacklisting).
             ///
             /// Deliberately carries NO `version` and is deliberately OUTSIDE the
-            /// `getBlacklistVersion()` poll cycle (ADR 011 § Polling). A consumer
-            /// therefore cannot use the version counter to detect that it missed
-            /// one — it must scan the event tail on its own block-range cursor.
-            /// There is no boot reconcile: the set is not enumerable on-chain
-            /// (nothing lists the blacklisted origins), so the durable projection
-            /// the watcher builds from this event tail — resumed from a persisted
-            /// cursor — is the whole guarantee. This crate's `sol!` binding to the
-            /// on-chain `isOriginBlacklisted(address)` view was dropped as dead
-            /// node-side surface — it was added for a per-address boot reconcile
-            /// that is impossible to drive (nothing enumerates the set). The
-            /// on-chain view itself remains and is still load-bearing elsewhere
-            /// (`OriginAssignment` unions against it; the e2e fixture binds it).
+            /// `getBlacklistVersion()` poll cycle (ADR 011 § Polling), so a
+            /// consumer cannot use the version counter to detect that it missed
+            /// one.
+            ///
+            /// That used to make this event tail the whole guarantee — the set
+            /// was not enumerable, so a durable projection resumed from a
+            /// persisted cursor was the only way to hold it, and losing that
+            /// projection meant coming up with an empty deny-set. It is now
+            /// enumerable via [`blacklistedAddresses`], so this event is a
+            /// low-latency signal to re-read rather than the source of truth, and
+            /// the boot reconcile it lacked is finally possible.
             event OriginBlacklistUpdated(address indexed origin, bool blacklisted);
 
             /// Governance blacklisted an OPERATOR address (`addOperator`), which
