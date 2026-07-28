@@ -179,6 +179,7 @@ jobs:
             steps.solidity_contracts.outputs.solidity == 'true' }}
       markdown: ${{ steps.filter.outputs.markdown }}
       scripts: ${{ steps.filter.outputs.scripts }}
+      agentic: ${{ steps.filter.outputs.agentic }}
     steps:
       - uses: actions/checkout@v7
       - uses: dorny/paths-filter@v4
@@ -235,6 +236,24 @@ jobs:
               - '**/*.md'
               - '.markdownlint.yaml'
               - '.github/workflows/ci.yml'
+            agentic:
+              # Gates `agentic-lock`. The generated .lock.yml is a function of
+              # the .md source, aw.json (`{"maintenance": false}` there is what
+              # suppresses a generated agentics-maintenance.yml daily cron),
+              # the pinned SHAs in .github/aw/actions-lock.json, AND the gh-aw
+              # compiler version itself — most action pins and the agent-engine
+              # version are baked into the compiler binary rather than into
+              # actions-lock.json, which is why the job pins the compiler.
+              # Any of those drifting apart is what it exists to catch.
+              #
+              # `.github/workflows/**` rather than `*.md` / `*.lock.yml`:
+              # dorny/paths-filter uses picomatch, where a single `*` does not
+              # cross `/`, so a future gh-aw import under a subdirectory would
+              # not match and the job would silently skip. This job is cheap;
+              # over-triggering costs far less than a blind required check.
+              - '.github/workflows/**'
+              - '.github/aw/**'
+              - '.gitattributes'
             scripts:
               # Gates `coverage-tooling-tests` (the pytest suite under
               # .github/scripts/tests). The helpers and their regression tests
@@ -1202,6 +1221,161 @@ jobs:
             !adr/_build/**
           config: ".markdownlint.yaml"
 
+  agentic-lock:
+    name: agentic workflow lock
+    runs-on: ubuntu-latest
+    needs: changes
+    # Gated on the `agentic` filter; skips otherwise (accepted via ci-success
+    # allowed-skips below). Still runs unconditionally on push/dispatch.
+    #
+    # Why this job exists: a .lock.yml is generated, but nothing stopped it
+    # being hand-edited. #1002 changed the .md frontmatter, patched the lock by
+    # hand, and left the `frontmatter_hash` in its `# gh-aw-metadata:` header
+    # at the value from the original commit. The setup action recomputes that
+    # hash from the .md at run time, so every Agentic Triage run that reached
+    # `activation` from that merge onward died there with
+    # `ERR_CONFIG: E009 CONFIG_HASH_MISMATCH`. It went unnoticed for a month
+    # because that same commit set `report-failure-as-issue: false`, so the
+    # only signal was red runs in the Actions tab. Recompiling here turns that
+    # into a PR-time failure.
+    if: needs.changes.outputs.agentic == 'true' || github.event_name != 'pull_request'
+    permissions:
+      contents: read
+    # Both `gh extension install` and the compiler's action-pin lookups are
+    # unbounded network calls; without this a hung API call would sit on the
+    # 6-hour default with `ci-success` pending.
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - name: Recompile agentic workflows and fail on drift
+        env:
+          # `gh extension install` and the compiler's action-pin lookups both
+          # go through the API; the default job token covers these public reads.
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          sources=(.github/workflows/*.md)
+          locks=(.github/workflows/*.lock.yml)
+
+          # Key the gate on the SOURCES, not the generated locks. Globbing only
+          # the locks made "the artifact was deleted" indistinguishable from
+          # "this repo has no agentic workflows", so a PR that dropped a
+          # .lock.yml while keeping its .md — or that added the first .md
+          # without compiling — exited 0 green with the workflow silently gone.
+          if [ ${#sources[@]} -eq 0 ] && [ ${#locks[@]} -eq 0 ]; then
+            echo "No agentic workflows in this repo; nothing to verify."
+            exit 0
+          fi
+
+          # Parity in both directions. `gh aw compile` regenerates locks FROM
+          # sources and never audits a lock whose .md is gone, so an orphan
+          # (a rename, or a .md moved out of this directory) keeps running on
+          # GitHub against a source that no longer exists while the recompile
+          # diff stays empty. With one workflow the compiler happens to exit 1
+          # on "no workflow markdown files found"; that accident evaporates as
+          # soon as a second workflow exists, so check it explicitly.
+          for source in "${sources[@]}"; do
+            lock="${source%.md}.lock.yml"
+            if [ ! -f "$lock" ]; then
+              echo "::error file=${source}::no ${lock} for this source."
+              echo "A new agentic workflow was added without compiling it."
+              echo "Fix: gh extension install github/gh-aw && gh aw compile"
+              exit 1
+            fi
+          done
+          for lock in "${locks[@]}"; do
+            source="${lock%.lock.yml}.md"
+            if [ ! -f "$source" ]; then
+              echo "::error file=${lock}::no ${source} for this lock."
+              echo "An orphaned lock still runs on GitHub. Delete it, or restore the source."
+              exit 1
+            fi
+          done
+
+          # Install the compiler the locks were actually built with, not a
+          # version pinned in this file that would drift from them. gh-aw bumps
+          # its own output shape (schema v3 -> v4 added body_hash, and the
+          # setup-action pin tracks the compiler), so "latest" would fail every
+          # PR until someone happened to recompile.
+          #
+          # Parsed per-lock in this shell rather than inside a process
+          # substitution: `mapfile < <(...)` discards the exit status of what
+          # runs inside it, so a jq parse error on a mangled header was
+          # swallowed and resurfaced as a bogus "locks disagree" message.
+          versions=()
+          for lock in "${locks[@]}"; do
+            header=$(sed -n 's/^# gh-aw-metadata: //p' "$lock")
+            if [ -z "$header" ]; then
+              echo "::error file=${lock}::missing '# gh-aw-metadata:' header."
+              echo "The lock was hand-edited or truncated. Regenerate with 'gh aw compile'."
+              exit 1
+            fi
+            if ! lock_version=$(printf '%s\n' "$header" | jq -er '.compiler_version'); then
+              echo "::error file=${lock}::no .compiler_version in the metadata header."
+              echo "gh-aw's metadata schema may have changed. Header was: ${header}"
+              exit 1
+            fi
+            # `jq -r` renders a missing key as the string "null", which would
+            # otherwise reach `--pin null` and fail with an opaque gh error.
+            case "$lock_version" in
+              v[0-9]*) ;;
+              *)
+                echo "::error file=${lock}::unusable compiler_version '${lock_version}'."
+                exit 1
+                ;;
+            esac
+            versions+=("$lock_version")
+          done
+          mapfile -t versions < <(printf '%s\n' "${versions[@]}" | sort -u)
+          if [ ${#versions[@]} -ne 1 ]; then
+            echo "::error::lock files disagree on compiler_version: ${versions[*]}"
+            echo "Recompile them together with a single 'gh aw compile'."
+            exit 1
+          fi
+          version="${versions[0]}"
+          echo "Pinning gh aw to ${version} (read from the lock metadata)."
+          gh extension install github/gh-aw --pin "${version}"
+
+          # Confirm what actually landed. Otherwise a failure here is
+          # indistinguishable from a hand-edited lock, and the run log has no
+          # record of which compiler produced the diff below.
+          # `gh aw version` writes to stderr, hence the redirect. `-m1` rather
+          # than `| head -1` so there is no second process to SIGPIPE grep
+          # under `pipefail`, and `|| true` because a no-match otherwise exits
+          # 1, and `set -e` would kill the job on that line — losing the very
+          # annotation below that explains what went wrong.
+          installed=$(gh aw version 2>&1 | grep -m1 -oE 'v[0-9]+\.[0-9]+\.[0-9]+' || true)
+          echo "Requested ${version}; gh aw reports ${installed:-unknown}."
+          if [ "${installed}" != "${version}" ]; then
+            echo "::error::pinned ${version} but installed ${installed:-unknown}."
+            exit 1
+          fi
+
+          gh aw compile --no-check-update
+
+          # Scope covers every path the compiler writes: the locks and
+          # .github/aw/actions-lock.json, plus the root .gitattributes it
+          # recreates when absent (its `merge=ours` on *.lock.yml is what keeps
+          # lock conflicts resolvable). .github/dependabot.yml is deliberately
+          # NOT here — the ignore-block reconciler is gated behind the
+          # `--dependabot` flag and plain `compile` leaves that file alone,
+          # verified against v0.83.4.
+          paths=(.github/workflows .github/aw .gitattributes)
+          # Stage first: a brand-new lock or a regenerated actions-lock.json
+          # lands as an untracked file, which `git diff` alone would not see.
+          git add -A -- "${paths[@]}"
+          if ! git diff --cached --exit-code -- "${paths[@]}"; then
+            echo "::error::Agentic workflow lock files are out of date."
+            echo "The diff above is what 'gh aw compile' (${version}) produces from the current sources."
+            echo "Never hand-edit a .lock.yml: the setup action rehashes the .md"
+            echo "frontmatter AND body at run time (schema v4) and aborts with"
+            echo "E009 CONFIG_HASH_MISMATCH."
+            echo "To match this job exactly: gh extension install github/gh-aw --pin ${version} && gh aw compile"
+            echo "To intentionally move to a newer compiler: gh extension upgrade aw && gh aw compile"
+            exit 1
+          fi
+
   adr-book-list:
     name: ADR book check
     runs-on: ubuntu-latest
@@ -1255,7 +1429,7 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     needs: [fmt, clippy, changes, test, doctest, deny, doc, public-api, markdownlint, adr-book-list,
-            pr-title, anvil-e2e-settlement, anvil-e2e-journeys,
+            agentic-lock, pr-title, anvil-e2e-settlement, anvil-e2e-journeys,
             solidity-fmt, solidity-build-test, solidity-coverage,
             solidity-solhint, solidity-slither, solidity-aderyn, ed25519-vectors]
     steps:
@@ -1264,12 +1438,14 @@ jobs:
           jobs: ${{ toJSON(needs) }}
           # Rust jobs are gated on `needs.changes.outputs.rust`,
           # adr-book-list on `needs.changes.outputs.adr`, markdownlint on
-          # `needs.changes.outputs.markdown`, and the solidity-* jobs on
+          # `needs.changes.outputs.markdown`, agentic-lock on
+          # `needs.changes.outputs.agentic`, and the solidity-* jobs on
           # `needs.changes.outputs.solidity`; each skips when its paths are
           # untouched. alls-green treats `skipped` as failure unless listed
           # here. `changes` is intentionally omitted — it always runs, so a
           # skip from it signals a misconfiguration that should fail the gate.
           allowed-skips: fmt, clippy, test, doctest, deny, doc, public-api, adr-book-list,
-                         pr-title, markdownlint, anvil-e2e-settlement, anvil-e2e-journeys,
+                         agentic-lock, pr-title, markdownlint,
+                         anvil-e2e-settlement, anvil-e2e-journeys,
                          solidity-fmt, solidity-build-test, solidity-coverage,
                          solidity-solhint, solidity-slither, solidity-aderyn, ed25519-vectors
