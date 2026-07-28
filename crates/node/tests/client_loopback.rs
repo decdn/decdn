@@ -3784,8 +3784,10 @@ async fn client_concurrent_same_channel_both_succeed() -> anyhow::Result<()> {
     anyhow::ensure!(bytes_b.as_ref() == payload_b.as_slice(), "blob B mismatch");
 
     // The channel advanced monotonically: at least one voucher per pull (>= 2
-    // total), and the cumulative bytes cover BOTH payloads.
-    let final_cum = ledger.snapshot().await;
+    // total), and the cumulative bytes cover BOTH payloads. Both pulls completed, so
+    // every voucher they sent optimistically has been acked — `committed` carries the
+    // full total.
+    let final_cum = ledger.committed();
     anyhow::ensure!(
         final_cum.nonce >= U256::from(2u64),
         "ledger nonce: {} (expected >= 2)",
