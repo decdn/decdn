@@ -8,21 +8,6 @@ use super::{
     read_voucher, verify_rate, voucher_reject_reason, wire_voucher_to_signed,
 };
 
-/// Gated reasons (issue #1481 §5): the regression/exhaustion rejections a
-/// wallet-less client cannot distinguish from chain, so a [`WatermarkBundle`]
-/// may accompany them. Every other reason (`WrongChannel`, `BadSignature`,
-/// `WrongSigner`, `WrongToken`, `RetryLater`, `Expired`,
-/// `CooperativeCloseSigned`, `RateFloorRaised`) never carries a bundle.
-const fn bundle_is_gated(reason: VoucherRejectReason) -> bool {
-    matches!(
-        reason,
-        VoucherRejectReason::StaleNonce
-            | VoucherRejectReason::AmountRegression
-            | VoucherRejectReason::BytesRegression
-            | VoucherRejectReason::InsufficientDeposit
-    )
-}
-
 impl ClientHandler {
     /// Read and apply one cumulative voucher covering `delta_bytes` of newly
     /// delivered bytes. A permanent voucher rejection writes a `StreamError` and
@@ -293,7 +278,7 @@ impl ClientHandler {
                 // validated above (`wire_voucher_to_signed`) — no need to
                 // rebuild it.
                 let bundle = reason_result.ok().and_then(|reason| {
-                    if !bundle_is_gated(reason) {
+                    if !reason.is_watermark_gated() {
                         return None;
                     }
                     let recovered = signed.recover_signer(&self.voucher_domain).ok()?;

@@ -706,6 +706,25 @@ pub struct WatermarkBundle {
     pub last_signature: Vec<u8>,
 }
 
+impl WatermarkBundle {
+    /// Validate the wire-level `last_signature` length ([`VOUCHER_SIG_LEN`]) —
+    /// the same client-voucher-signature length [`Voucher::validate`] checks,
+    /// since this IS a client voucher signature (issue #1481). A caller MUST
+    /// call this before trusting a bundle enough to `reseed` a ledger from it:
+    /// the bundle rides inside an application-level `StreamError`, not signed
+    /// itself, so this is a shape check, not an authentication check — it stops
+    /// a malformed/truncated bundle from reaching a fixed-length conversion
+    /// downstream, nothing more.
+    pub const fn validate(&self) -> Result<(), MessageValidationError> {
+        if self.last_signature.len() != VOUCHER_SIG_LEN {
+            return Err(MessageValidationError::InvalidVoucherSigLen {
+                len: self.last_signature.len(),
+            });
+        }
+        Ok(())
+    }
+}
+
 /// A stream failure code (ADR 005 §Stream errors). Variant order is frozen.
 ///
 /// Every variant except `VoucherRejected` is delivery-side and rides in
@@ -878,6 +897,33 @@ pub enum VoucherRejectReason {
     /// this; the `cdn/client/v1` handler emits it directly (ADR 005
     /// §`VoucherRejected` semantics, #1382).
     RateFloorRaised,
+}
+
+impl VoucherRejectReason {
+    /// Whether a [`StreamError::VoucherRejected`] carrying this reason is
+    /// eligible for a [`WatermarkBundle`] (issue #1481 §5): exactly the four
+    /// regression/exhaustion reasons a wallet-less client cannot distinguish
+    /// from chain, since its local watermark is the only thing that could be
+    /// wrong. Every handler-direct reason (`Expired`, `RetryLater`,
+    /// `CooperativeCloseSigned`, `RateFloorRaised`, plus the signer/channel/
+    /// token mismatches) is never eligible — a bundle would not help there,
+    /// since the fix is not "resync the watermark".
+    ///
+    /// Single source of truth for the gate: the node checks this before
+    /// attaching a bundle (`crates/node/src/handlers/client/voucher.rs`) and
+    /// the client checks it again before trusting one enough to self-heal
+    /// (`crates/client-pull/src/lib.rs`) — both call this rather than each
+    /// keeping their own copy of the four-way match.
+    #[must_use]
+    pub const fn is_watermark_gated(self) -> bool {
+        matches!(
+            self,
+            Self::StaleNonce
+                | Self::AmountRegression
+                | Self::BytesRegression
+                | Self::InsufficientDeposit
+        )
+    }
 }
 
 #[cfg(test)]
@@ -1361,6 +1407,29 @@ mod tests {
             })
         );
         assert_eq!(sample_voucher().validate(), Ok(()));
+    }
+
+    /// A malformed/truncated bundle must fail its own shape check before any
+    /// caller trusts it enough to reseed a ledger (issue #1481 review).
+    #[test]
+    fn watermark_bundle_validate_rejects_wrong_len_signature() {
+        let b = WatermarkBundle {
+            amount: [0u8; 32],
+            nonce: [0u8; 32],
+            bytes_delivered: [0u8; 32],
+            last_signature: vec![0xCDu8; VOUCHER_SIG_LEN - 1],
+        };
+        assert_eq!(
+            b.validate(),
+            Err(MessageValidationError::InvalidVoucherSigLen {
+                len: VOUCHER_SIG_LEN - 1
+            })
+        );
+        let ok = WatermarkBundle {
+            last_signature: vec![0xCDu8; VOUCHER_SIG_LEN],
+            ..b
+        };
+        assert_eq!(ok.validate(), Ok(()));
     }
 
     // --- Edge-case roundtrips ------------------------------------------------

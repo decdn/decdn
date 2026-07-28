@@ -38,7 +38,9 @@ use decdn_incentive::{
     signed_to_wire_voucher, slash_judge_domain, voucher_domain,
 };
 use decdn_node::buyer_channel::{ChannelOpenPending, ChannelOpener, OpenSlotReserved};
-use decdn_node::client_requester::ChannelContext;
+use decdn_node::client_requester::{
+    ChannelContext, ChannelLedger, Cumulative, PullDeadlines, stream_fetch_shared,
+};
 use decdn_node::dht::routing::{NodeId as DhtNodeId, RoutingTable};
 use decdn_node::dht::{
     ConfigStakerSet, NegativeProbeCache, NodeAddressResolver, OriginDirectory, PositiveProbeCache,
@@ -1000,6 +1002,15 @@ fn counter_value(metrics: &Arc<Metrics>, name: &str) -> Result<u64> {
         .and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or(0);
     Ok(val)
+}
+
+/// Current Unix time in microseconds, for a `StreamRequest`'s `timestamp_us` when a test calls
+/// a low-level `client-pull` entrypoint directly instead of going through `NodeOrigin` (which
+/// generates its own via `node_origin::now_micros`).
+fn now_us() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_micros()).unwrap_or(u64::MAX))
 }
 
 /// Build a cache pre-seeded with every payload in `payloads`: a one-shard
@@ -8991,6 +9002,178 @@ async fn two_concurrent_pulls_to_one_provider_share_the_channel_ledger() -> Resu
     task_a.await?;
     Ok(())
 }
+
+/// Issue #1481 review items 2/3: a real end-to-end exercise of the WIRED resume path
+/// (`fetch_inner`'s retry loop, `crates/client-pull/src/lib.rs`) — not just the
+/// `ChannelLedger::reseed` primitive tested in isolation in `client-pull`'s own unit tests.
+/// This specifically calls [`stream_fetch_shared`], the entrypoint node-to-node cache-miss
+/// pulls use (`node_origin.rs`'s `pull_from_candidate` always passes `byte_offset == 0`), so it
+/// also answers review item 2: a bundled `StaleNonce` reaching that path is retried
+/// transparently INSIDE `client-pull`, before `pull_verdict`/`voucher_verdict` in
+/// `node_origin.rs` ever see it — which is why neither classifier needed to change.
+///
+/// The trigger is genuine, not simulated: two SEPARATE [`ChannelLedger`]s on ONE real channel,
+/// driven one after another against a real `ClientHandler` + real `MemoryChannelStateStore`
+/// (exactly the harness [`two_concurrent_pulls_to_one_provider_share_the_channel_ledger`] uses,
+/// minus the sharing). Pull A's ledger is the first ever voucher on this channel and advances
+/// the node's real on-node nonce to 1. Pull B's ledger is FRESH — never saw pull A — exactly a
+/// wallet-less delegate that lost its watermark between sessions. Its first voucher collides at
+/// nonce 1 and the real `ClientHandler` genuinely rejects `StaleNonce`. Because pull B's
+/// rejected voucher recovers to the channel's registered `voucher_signer` (both pulls use the
+/// SAME buyer key) and the channel already holds an accepted voucher (from pull A) to report,
+/// the node-side gate (task 5) is satisfied and a `WatermarkBundle` rides back on the wire.
+///
+/// Before the review's fix this came back `Err(UpstreamVoucherRejected)` — a wallet-less
+/// client's pull was simply abandoned. This test would have failed against that code; it must
+/// pass now, with pull B's caller seeing NOTHING unusual at all: the retry, reseed, and second
+/// successful voucher round trip happen entirely inside `client-pull`.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)] // test setup; a real end-to-end wire scenario, not logic to split
+async fn a_stale_nonce_rejection_with_a_bundle_self_heals_over_the_wire() -> Result<()> {
+    let payload_a = vec![0xA1u8; 4096];
+    let hash_a = Hash::new(&payload_a);
+    let payload_b = vec![0xB2u8; 4096];
+    let hash_b = Hash::new(&payload_b);
+    anyhow::ensure!(hash_a != hash_b, "fixtures must be distinct blobs");
+
+    let (cache_a, _tmp_a) = cache_with_blobs(&[payload_a.as_slice(), payload_b.as_slice()]).await?;
+    let a_sk = fresh_key();
+    let a_id = a_sk.public();
+    let a_eth = Arc::new(PrivateKeySigner::random());
+    let b_buyer = Arc::new(PrivateKeySigner::random());
+    let channel_id = B256::repeat_byte(0xC7);
+    let store_a = Arc::new(MemoryChannelStateStore::new());
+    store_a.record(&ChannelState::new(
+        channel_id,
+        b_buyer.address(),
+        b_buyer.address(),
+        TOKEN,
+        U256::from(DEPOSIT_MICRO_USDC),
+    ))?;
+    let metrics_a = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics_a);
+    let domains = HandlerDomains {
+        slash: slash_domain(),
+        voucher: voucher_dom(),
+        binding: binding_dom(),
+    };
+    let handler_a = build_handler_full(
+        a_id,
+        &a_eth,
+        &metrics_a,
+        limiter,
+        cache_a,
+        store_a as Arc<dyn ChannelStateStore>,
+        RATE,
+        &domains,
+        0,
+        16,
+    )?;
+    let (ep_a, addr_a) =
+        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    let task_a = spawn_a_server(
+        ep_a.clone(),
+        handler_a,
+        Arc::clone(&a_eth),
+        slash_domain(),
+        4096,
+        RATE,
+    );
+
+    let (ep_b, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let target = EndpointAddr::new(a_id).with_ip_addr(addr_a);
+    let deadlines = PullDeadlines::new(Duration::from_secs(20), Duration::from_secs(20))
+        .map_err(|e| anyhow::anyhow!("deadlines: {e}"))?;
+
+    let ctx = ChannelContext {
+        channel_id,
+        token: TOKEN,
+        deposit: U256::from(DEPOSIT_MICRO_USDC),
+        client_signer: Arc::clone(&b_buyer),
+        voucher_domain: voucher_dom(),
+        prior_nonce: U256::ZERO,
+        prior_bytes_delivered: U256::ZERO,
+        prior_amount: U256::ZERO,
+        client_binding: None,
+    };
+
+    // Pull A: a fresh ledger, first ever voucher on this channel — advances the node's real
+    // state to nonce 1.
+    let ledger_a = ChannelLedger::new(Cumulative::default());
+    let got_a = stream_fetch_shared(
+        &ep_b,
+        target.clone(),
+        &ctx,
+        &ledger_a,
+        &slash_domain(),
+        a_eth.address(),
+        *hash_a.as_bytes(),
+        0,
+        now_us(),
+        deadlines,
+        0,
+        0,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("pull A (seeding the channel) failed: {e}"))?;
+    anyhow::ensure!(
+        got_a.as_ref() == payload_a.as_slice(),
+        "pull A bytes mismatch"
+    );
+
+    // Pull B: a SEPARATE ledger modelling a wallet-less delegate that correctly tracked the
+    // channel's cumulative amount/bytes (e.g. it sums what it has spent locally) but whose
+    // NONCE counter specifically desynced — nonce 0 while amount/bytes already match pull A's
+    // real ending state. This is deliberate, not an oversight: seeding a TOTALLY fresh
+    // `Cumulative::default()` here would undersign relative to `delta_bytes` (the real
+    // channel's `last_amount` already exceeds an amount computed from a zero baseline) and hit
+    // the UNRELATED pre-existing hard-fail underpayment path in
+    // `crates/node/src/handlers/client/voucher.rs` (`anyhow::bail!("voucher underpays…")`)
+    // before ever reaching the nonce check this test exists to exercise. Matching amount/bytes
+    // while leaving the nonce stale isolates the ONE thing this test is about: a genuine
+    // `StaleNonce` that reaches `apply_voucher`, gets gated, and comes back with a bundle.
+    let seed = ledger_a.settlement();
+    let ledger_b = ChannelLedger::new(Cumulative {
+        nonce: U256::ZERO,
+        bytes: seed.bytes,
+        amount: seed.amount,
+    });
+    let got_b = stream_fetch_shared(
+        &ep_b,
+        target.clone(),
+        &ctx,
+        &ledger_b,
+        &slash_domain(),
+        a_eth.address(),
+        *hash_b.as_bytes(),
+        0,
+        now_us(),
+        deadlines,
+        0,
+        0,
+    )
+    .await
+    .map_err(|e| {
+        anyhow::anyhow!("pull B must self-heal a bundled StaleNonce transparently: {e}")
+    })?;
+    anyhow::ensure!(
+        got_b.as_ref() == payload_b.as_slice(),
+        "pull B must return the FULL blob, unchanged from what byte_offset == 0 promises — a \
+         retry that jumped the wire byte_offset to the channel's cumulative bytes_delivered \
+         would truncate this"
+    );
+
+    ep_b.close().await;
+    ep_a.close().await;
+    task_a.await?;
+    Ok(())
+}
+
+// The negative twin of the test above: a mid-stream `StaleNonce` with NO bundle (the
+// pre-#1481 shape, still what a genuinely non-gated or unverifiable rejection looks like)
+// stays terminal — the existing hand-rolled-upstream tests already cover this
+// (`pull_against_a_voucher_rejecting_upstream` and friends; `serve_then_reject_voucher`
+// always sends `bundle: None`), so it is not duplicated here.
 
 /// ADR 001 §Probe cache: "On a cache miss the requester checks the probe cache first; if a
 /// valid entry exists, it skips DHT lookup and goes straight to selection."

@@ -1354,8 +1354,147 @@ async fn open_stream(
     .map_err(|_| anyhow::Error::new(PullTimeout { after: open }))?
 }
 
+/// Wallet-less resume (issue #1481 §5): the maximum number of times
+/// [`fetch_inner`] will reopen a fresh stream after a gated, bundled
+/// `StaleNonce`/`AmountRegression`/`BytesRegression`/`InsufficientDeposit`
+/// rejection. Bounds a node that keeps rejecting (a buggy or adversarial
+/// peer echoing a bundle that never lets the client catch up) to a handful
+/// of round trips rather than looping forever; a healthy self-heal needs
+/// exactly one.
+const MAX_RESUME_ATTEMPTS: u32 = 3;
+
+/// Buffered fetch with wallet-less resume (issue #1481 §5): if a mid-stream
+/// voucher rejection carries a signer-verified [`WatermarkBundle`] for one of
+/// the four regression/exhaustion reasons, reseed `ledger` from it and reopen
+/// the pull — at the **same** `byte_offset` the caller originally requested,
+/// not `bundle.bytes_delivered` — instead of surfacing the rejection as
+/// terminal.
+///
+/// `bundle.bytes_delivered` is deliberately NOT used as the retry's wire
+/// `byte_offset`, even though that is what makes a `WatermarkBundle` look
+/// resumable at a glance. The two are different axes: `bytes_delivered` is
+/// the CHANNEL's cumulative payment counter (used to reconstruct each
+/// voucher's EIP-712 `bytesDelivered`, ADR 005 — [`Voucher`] carries no such
+/// field on the wire), not a position within THIS blob's byte range. A
+/// channel can fund many blobs; jumping the wire offset ahead to the
+/// channel's cumulative would, for every caller that requested
+/// `byte_offset == 0` (every production caller today — `stream_fetch_shared`
+/// always passes `0`, `crates/node/src/node_origin.rs`), silently return a
+/// TRUNCATED tail instead of the full blob the caller is relying on getting
+/// back. The bytes already streamed in the failed attempt were never decoded
+/// (the error path never reaches `decode_verified_range`), so there is
+/// nothing to legitimately splice a jump with. Retrying at the caller's
+/// original offset is always safe and is the only thing this bundle field
+/// is actually needed for: fixing the ledger's amount/nonce/bytes BASELINE
+/// so the resumed stream's vouchers verify against what the node now
+/// expects, not re-deriving where in the blob to resume.
+///
+/// This is the ONLY retry loop in the crate for this case —
+/// [`self_pay`]/[`receive_and_pay`] never retry themselves, because the
+/// stream they hold is already dead by the time a mid-stream
+/// `VoucherRejected` reaches them (the node finishes its send side before
+/// replying, `handlers/client/wire.rs::write_reject`); a fresh stream can
+/// only be opened by whoever owns the connection, which is here.
+///
+/// Every existing caller — `stream_fetch` (test-only), [`stream_fetch_tracked`],
+/// [`stream_fetch_tracked_with_progress`], and, importantly,
+/// [`stream_fetch_shared`] (the daemon's own node-to-node cache-miss buyer
+/// leg, ADR 002/037) — goes through this wrapper, so a resumable rejection
+/// on any of those paths is retried transparently: `pull_verdict` /
+/// `voucher_verdict` in `decdn-node`'s `node_origin.rs` only ever see the
+/// FINAL outcome (success, or the original terminal error once
+/// [`MAX_RESUME_ATTEMPTS`] is exhausted or the reason/bundle isn't
+/// eligible) — the `OurDeadChannel` classification there stays correct as
+/// the terminal fallback and needs no change.
+///
+/// A bundle-less rejection, a non-gated reason, or a bundle that fails
+/// [`WatermarkBundle::validate`] (malformed `last_signature` length) is
+/// never treated as resumable and is returned to the caller unchanged on
+/// the first attempt, exactly as before this feature existed.
 #[allow(clippy::too_many_arguments)]
 async fn fetch_inner(
+    endpoint: &Endpoint,
+    target: EndpointAddr,
+    ctx: &ChannelContext,
+    slash_domain: &Eip712Domain,
+    expected_signer: Address,
+    hash: [u8; 32],
+    namespace_id: [u8; 32],
+    byte_offset: u64,
+    timestamp_us: u64,
+    max_blob_size_bytes: u64,
+    max_rate_per_mb: u64,
+    open: Duration,
+    stall: Duration,
+    ledger: &ChannelLedger,
+    on_progress: Option<&ProgressCallback>,
+) -> anyhow::Result<Bytes> {
+    for attempt in 0..=MAX_RESUME_ATTEMPTS {
+        let result = fetch_inner_once(
+            endpoint,
+            target.clone(),
+            ctx,
+            slash_domain,
+            expected_signer,
+            hash,
+            namespace_id,
+            byte_offset,
+            timestamp_us,
+            max_blob_size_bytes,
+            max_rate_per_mb,
+            open,
+            stall,
+            ledger,
+            on_progress,
+        )
+        .await;
+        let Err(e) = result else {
+            return result;
+        };
+        if attempt == MAX_RESUME_ATTEMPTS {
+            return Err(e);
+        }
+        match resumable_watermark(&e) {
+            Some(bundle) => {
+                ledger.reseed(Cumulative::from(bundle)).await;
+                tracing::debug!(
+                    attempt,
+                    byte_offset,
+                    "voucher rejection carried a watermark bundle; reseeded and retrying \
+                     at the same byte_offset"
+                );
+            }
+            None => return Err(e),
+        }
+    }
+    // Unreachable: the loop above always returns on both the `Ok` and every `Err`
+    // branch (either directly or after `attempt == MAX_RESUME_ATTEMPTS`
+    // triggers on the final iteration). Kept as a typed bail rather than
+    // `unreachable!()`/`panic!()` per the workspace anti-panic policy.
+    Err(anyhow::anyhow!("resume loop exited without returning"))
+}
+
+/// Extract a resumable [`WatermarkBundle`] from a pull error, or `None` if the
+/// error is not an `UpstreamVoucherRejected`, its reason is not
+/// [`VoucherRejectReason::is_watermark_gated`], it carries no bundle, or the
+/// bundle fails [`WatermarkBundle::validate`] (defense in depth against a
+/// malformed bundle — the node is trusted to have gated this correctly, but
+/// the client re-checks rather than assuming the wire payload is
+/// well-formed before it trusts the bundle enough to reseed from it).
+fn resumable_watermark(err: &anyhow::Error) -> Option<&WatermarkBundle> {
+    let rejected = err.downcast_ref::<UpstreamVoucherRejected>()?;
+    if !rejected.reason.is_watermark_gated() {
+        return None;
+    }
+    let bundle = rejected.bundle.as_ref()?;
+    if bundle.validate().is_err() {
+        return None;
+    }
+    Some(bundle)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn fetch_inner_once(
     endpoint: &Endpoint,
     target: EndpointAddr,
     ctx: &ChannelContext,
