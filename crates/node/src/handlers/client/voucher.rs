@@ -314,6 +314,53 @@ impl ClientHandler {
             // a concurrent voucher cannot advance the watermark between the value
             // we sign and the flag we set. Signing is local and fast.
             let mut guard = channel.lock().await;
+
+            // Ownership gate. Signing a waiver is a DURABLE, one-way commitment —
+            // the node then serves no further bytes on the channel (the
+            // `serve_stream` and `collect_voucher` gates) — and `channel_id =
+            // keccak256(client, provider, nonce)` is chain-derivable, so this
+            // request MUST prove control of the channel's `voucher_signer` key.
+            // The requester signs an off-chain EIP-712 `CooperativeCloseRequest`
+            // (recovered under the same `PaymentChannel` voucher domain); we
+            // refuse unless it recovers to `state.voucher_signer`. Without this,
+            // any peer that can name a channel id could force the node to sign a
+            // waiver and permanently freeze the channel.
+            //
+            // Checked against `voucher_signer`, not the funder `client` — a
+            // SIGNER question, matching the delivery path's owner-match gate and
+            // the on-chain `cooperativeClose`, which verifies the client voucher
+            // against `ch.voucherSigner` (never `ch.client`). The funder role
+            // authorizes nothing by signature, so a delegated channel's funder
+            // could neither complete the on-chain close nor should it be able to
+            // freeze the channel. This is the cooperative-close analogue of the
+            // owner-match gate the cooperative-close branch returns above, before
+            // that gate runs.
+            //
+            // Decline == finish the stream with no waiver, byte-for-byte the
+            // unknown-channel / zero-voucher decline below, so an unauthorized
+            // request stays wire-indistinguishable and leaks neither channel
+            // existence nor the watermark. The otherwise-invisible refusal is
+            // metered so operators can see the probing.
+            let authorized_signer = guard.state.voucher_signer;
+            let authorized = matches!(
+                decdn_incentive::recover_coop_close_request(
+                    B256::from(req.channel_id),
+                    &req.client_signature,
+                    &self.voucher_domain,
+                ),
+                Ok(recovered) if recovered == authorized_signer
+            );
+            if !authorized {
+                drop(guard);
+                self.metrics.cooperative_close_request_unauthorized();
+                tracing::warn!(
+                    %channel_id,
+                    "cooperative-close request without a valid voucher-signer signature; declining"
+                );
+                let _ = send.finish();
+                return Ok(());
+            }
+
             if guard.state.last_nonce() == U256::ZERO {
                 // No voucher accepted yet: nothing to settle. Finish; client
                 // falls back to the zero-voucher close.

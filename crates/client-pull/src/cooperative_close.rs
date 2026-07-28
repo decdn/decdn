@@ -24,7 +24,7 @@ use alloy::primitives::{Address, B256, Bytes, Signature, U256};
 use alloy::providers::Provider;
 use alloy::signers::local::PrivateKeySigner;
 use decdn_incentive::payment_channel::PaymentChannel;
-use decdn_incentive::{CooperativeClose, SignedCooperativeClose, Voucher};
+use decdn_incentive::{CooperativeClose, SignedCooperativeClose, Voucher, sign_coop_close_request};
 use decdn_protocol::client::{ClientMessage, CooperativeCloseAuth, CooperativeCloseRequest};
 use decdn_protocol::{
     ALPN_CLIENT, FrameError, decode_message, encode_message, read_frame, write_frame,
@@ -68,29 +68,45 @@ pub enum CooperativeCloseOutcome {
 /// Ask `target` for a cooperative-close waiver on `channel_id` over
 /// `cdn/client/v1`.
 ///
+/// The request is authenticated: `client_signer` (the channel's `voucherSigner`
+/// key — the same key that signs the settlement voucher below) signs an EIP-712
+/// `CooperativeCloseRequest(channelId)` under `domain` (the `PaymentChannel`
+/// voucher domain), which the provider recovers and checks against the channel's
+/// pinned `voucherSigner` before signing any waiver. Without it the provider
+/// declines — the same `Ok(None)` path as an unknown channel.
+///
 /// Returns `Ok(Some(auth))` with the provider's waiver, or `Ok(None)` when the
 /// provider finishes the stream without one — its decline signal for an unknown
-/// channel or a channel with no accepted voucher yet (handlers/client.rs). A
-/// network/protocol failure is `Err`.
+/// channel, an unauthenticated request, or a channel with no accepted voucher
+/// yet (handlers/client.rs). A network/protocol failure is `Err`.
 ///
 /// # Errors
 ///
-/// Dial/stream failures, a non-auth reply, a malformed auth frame, or timeout.
+/// Dial/stream failures, request signing, a non-auth reply, a malformed auth
+/// frame, or timeout.
 pub async fn request_cooperative_close_auth(
     endpoint: &Endpoint,
     target: EndpointAddr,
     channel_id: B256,
+    client_signer: &PrivateKeySigner,
+    domain: &Eip712Domain,
     timeout: Duration,
 ) -> anyhow::Result<Option<CooperativeCloseAuth>> {
-    tokio::time::timeout(timeout, request_inner(endpoint, target, channel_id))
-        .await
-        .map_err(|_| anyhow::anyhow!("cooperative-close request timed out after {timeout:?}"))?
+    let client_signature = sign_coop_close_request(client_signer, channel_id, domain)
+        .map_err(|e| anyhow::anyhow!("sign cooperative-close request: {e}"))?;
+    tokio::time::timeout(
+        timeout,
+        request_inner(endpoint, target, channel_id, client_signature),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("cooperative-close request timed out after {timeout:?}"))?
 }
 
 async fn request_inner(
     endpoint: &Endpoint,
     target: EndpointAddr,
     channel_id: B256,
+    client_signature: Vec<u8>,
 ) -> anyhow::Result<Option<CooperativeCloseAuth>> {
     let conn = endpoint
         .connect(target, ALPN_CLIENT)
@@ -103,6 +119,7 @@ async fn request_inner(
 
     let req = ClientMessage::CooperativeCloseRequest(CooperativeCloseRequest {
         channel_id: channel_id.into(),
+        client_signature,
     });
     let payload = encode_message(&req).map_err(|e| anyhow::anyhow!("encode request: {e}"))?;
     write_frame(&mut send, &payload)
@@ -268,7 +285,15 @@ pub async fn cooperative_close<P: Provider>(
     domain: &Eip712Domain,
     timeout: Duration,
 ) -> anyhow::Result<CooperativeCloseOutcome> {
-    let Some(auth) = request_cooperative_close_auth(endpoint, target, channel_id, timeout).await?
+    let Some(auth) = request_cooperative_close_auth(
+        endpoint,
+        target,
+        channel_id,
+        client_signer,
+        domain,
+        timeout,
+    )
+    .await?
     else {
         return Ok(CooperativeCloseOutcome::Declined);
     };
