@@ -200,6 +200,27 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, SunsettingPausable, E
     ///         flushable while parked.
     EnumerableSet.Bytes32Set private _deferredSettlements;
 
+    /// @notice Per-role enumeration of a party's own channels, so neither side
+    ///         has to scan `ChannelOpened` over a block-range window to reconcile.
+    /// @dev    The two roles are stored differently because only one of them can
+    ///         reconstruct an id. `channelId` is
+    ///         `keccak256(client, provider, nonce)`: the CLIENT already knows its
+    ///         own address and already has `clientChannelNonce`, so recording just
+    ///         the counterparty per nonce is enough for it to recompute every id
+    ///         off-chain — one storage slot, versus the two a `bytes32[]` push
+    ///         costs (element + array length). The PROVIDER has no such shortcut
+    ///         (it knows neither the client nor that client's nonce), so its side
+    ///         must store the ids themselves.
+    /// @dev    Both are append-only and never rewritten, so a settled or closed
+    ///         channel keeps its entry and the ordering is stable — unlike the
+    ///         swap-and-pop sets elsewhere in this file, paging needs no block
+    ///         pinning for correctness. A reader resolves current state with
+    ///         `getChannel(id).status`, which makes reconciliation idempotent.
+    ///         The trade is that both grow with lifetime channel count; a reader
+    ///         that skips entries it already knows holds steady state at one page.
+    mapping(address client => mapping(uint256 nonce => address provider)) internal _clientChannelProviders;
+    mapping(address provider => bytes32[]) internal _providerChannels;
+
     // -----------------------------------------------------------------
     // Events (ADR 003 § Events)
     // -----------------------------------------------------------------
@@ -373,6 +394,9 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, SunsettingPausable, E
         uint256 channelNonce = clientChannelNonce[msg.sender];
         channelId = keccak256(abi.encodePacked(msg.sender, provider, channelNonce));
         clientChannelNonce[msg.sender] = channelNonce + 1;
+
+        _clientChannelProviders[msg.sender][channelNonce] = provider;
+        _providerChannels[provider].push(channelId);
 
         Channel storage ch = channels[channelId];
         ch.client = msg.sender;
@@ -745,6 +769,61 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, SunsettingPausable, E
         page = new bytes32[](size);
         for (uint256 i = 0; i < size; i++) {
             page[i] = _deferredSettlements.at(offset + i);
+        }
+    }
+
+    /// @notice How many channels have ever been opened against `provider`.
+    function providerChannelCount(address provider) external view returns (uint256) {
+        return _providerChannels[provider].length;
+    }
+
+    /// @notice A page of the channel ids `client` opened, oldest first.
+    /// @dev    Reconstructed rather than stored: the id is
+    ///         `keccak256(client, provider, nonce)` and only the counterparty is
+    ///         held per nonce, so this recomputes each id from the caller's own
+    ///         address. `clientChannelNonce(client)` is the count — there is no
+    ///         separate counter to drift from it. Same clamp as
+    ///         `deferredSettlements`: never forms `offset + limit`, so
+    ///         `limit == type(uint256).max` clamps instead of overflowing.
+    function clientChannels(address client, uint256 offset, uint256 limit)
+        external
+        view
+        returns (bytes32[] memory page)
+    {
+        uint256 len = clientChannelNonce[client];
+        if (offset >= len || limit == 0) {
+            return new bytes32[](0);
+        }
+        uint256 remaining = len - offset;
+        uint256 size = limit < remaining ? limit : remaining;
+        page = new bytes32[](size);
+        for (uint256 i = 0; i < size; i++) {
+            uint256 nonce = offset + i;
+            page[i] = keccak256(abi.encodePacked(client, _clientChannelProviders[client][nonce], nonce));
+        }
+    }
+
+    /// @notice A page of the channel ids opened against `provider`, oldest first.
+    ///         Same contract as `clientChannels`.
+    function providerChannels(address provider, uint256 offset, uint256 limit)
+        external
+        view
+        returns (bytes32[] memory page)
+    {
+        return _page(_providerChannels[provider], offset, limit);
+    }
+
+    /// @dev Shared paging over an append-only id list.
+    function _page(bytes32[] storage ids, uint256 offset, uint256 limit) internal view returns (bytes32[] memory page) {
+        uint256 len = ids.length;
+        if (offset >= len || limit == 0) {
+            return new bytes32[](0);
+        }
+        uint256 remaining = len - offset;
+        uint256 size = limit < remaining ? limit : remaining;
+        page = new bytes32[](size);
+        for (uint256 i = 0; i < size; i++) {
+            page[i] = ids[offset + i];
         }
     }
 
