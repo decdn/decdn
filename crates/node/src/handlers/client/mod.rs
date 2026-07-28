@@ -36,8 +36,8 @@ use decdn_cache::{
 use decdn_incentive::rate::{DEFAULT_TOLERANCE_BPS, RateError, min_payment, verify_rate};
 use decdn_incentive::store::StoreError;
 use decdn_incentive::{
-    ChannelId, ChannelState, ChannelStateStore, CooperativeClose, StreamSlashData, VoucherActivity,
-    verify_binding, voucher_reject_reason, wire_voucher_to_signed,
+    ChannelId, ChannelState, ChannelStateStore, CooperativeClose, SignedVoucher, StreamSlashData,
+    VoucherActivity, verify_binding, voucher_reject_reason, wire_voucher_to_signed,
 };
 use decdn_protocol::client::{
     ChunkData, ClientMessage, CooperativeCloseAuth, CooperativeCloseRequest, StreamError,
@@ -693,6 +693,15 @@ pub struct ClientHandlerDeps {
     pub(crate) background_fill: Option<BackgroundFill>,
     pub pull_through_origin: Option<Arc<NodeOrigin>>,
     pub pull_ahead_bytes: Option<Bytes>,
+    /// Downstream paid-delivery credit window in bytes (ADR 003 §Credit window):
+    /// how far past cleared payment the serve loop keeps streaming before it must
+    /// collect a voucher. `None` (the default, and in tests) reads as one voucher
+    /// interval — stop-and-wait, the pre-credit-window cadence. The runtime sets
+    /// it from `payment.credit_window_bytes`. Independent of `pull_ahead_bytes`
+    /// (which bounds the *upstream* speculative spend on a cache-miss pull): this
+    /// bounds the *downstream* unbilled-egress exposure. Both are floored at one
+    /// interval so the serve loop can always make progress.
+    pub credit_window_bytes: Option<Bytes>,
     pub leech_governor: Option<Arc<LeechGovernor>>,
     pub pull_origin_gate: Option<Arc<dyn OriginDirectory>>,
     pub idle_timeout: Option<Duration>,
@@ -755,6 +764,7 @@ impl ClientHandlerDeps {
             background_fill: None,
             pull_through_origin: None,
             pull_ahead_bytes: None,
+            credit_window_bytes: None,
             leech_governor: None,
             pull_origin_gate: None,
             idle_timeout: None,
@@ -856,6 +866,13 @@ pub struct ClientHandler {
     /// `pull_through_origin`. The window-paced loop pulls at most this many bytes
     /// ahead of cleared downstream payment.
     pull_ahead_bytes: Option<Bytes>,
+    /// Downstream paid-delivery credit window in bytes (ADR 003 §Credit window),
+    /// set at construction via [`ClientHandlerDeps`]. The serve loop keeps
+    /// streaming while `delivered − paid ≤ credit_window`, collecting cumulative
+    /// vouchers as they arrive instead of stalling a full round trip at every
+    /// interval. `None` reads as one voucher interval (stop-and-wait). Read
+    /// through [`Self::credit_window`], which applies the one-interval floor.
+    credit_window_bytes: Option<Bytes>,
     /// Node-wide seed-leech caps (#856, ADR 037), set at construction via
     /// [`ClientHandlerDeps`]. Consulted before/while a speculative pull-through
     /// proceeds and credited from the voucher path. `None` (tests / feature off)
@@ -963,6 +980,7 @@ impl ClientHandler {
             background_fill: deps.background_fill,
             pull_through_origin: deps.pull_through_origin,
             pull_ahead_bytes: deps.pull_ahead_bytes,
+            credit_window_bytes: deps.credit_window_bytes,
             leech_governor: deps.leech_governor,
             pull_origin_gate: deps.pull_origin_gate,
             content_deny: deps.content_deny,
@@ -1039,6 +1057,25 @@ impl ClientHandler {
         tokio::task::spawn_blocking(move || store.forget(channel_id))
             .await
             .map_err(|e| StoreError::Backend(format!("forget_channel join: {e}")))?
+    }
+
+    /// The effective downstream credit window in bytes for a stream whose
+    /// negotiated voucher interval is `interval_bytes` (ADR 003 §Credit window).
+    ///
+    /// The serve loop keeps `delivered − paid` within this bound before it must
+    /// collect a voucher, so it is exactly the node's bounded credit exposure:
+    /// unbilled egress already on the wire, capped here and nowhere else. Floored
+    /// at one interval so the loop can always make progress (deliver a full
+    /// interval, then recoup it) — a configured window below one interval, or the
+    /// unconfigured `None`, both collapse to the interval, which reproduces the
+    /// pre-credit-window stop-and-wait cadence exactly. The floor is also what
+    /// rules out a deadlock: whenever the window blocks further delivery, at least
+    /// one full interval is unpaid, so there is always a voucher to collect.
+    pub(super) fn credit_window(&self, interval_bytes: u64) -> u64 {
+        self.credit_window_bytes
+            .as_ref()
+            .map_or(0, |b| b.get())
+            .max(interval_bytes)
     }
 
     /// Has a takedown landed on this stream since it opened (ADR 011 §On
