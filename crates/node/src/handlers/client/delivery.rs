@@ -40,9 +40,11 @@ struct ChunkFramer {
     buf: BytesMut,
     /// The export stream has yielded its last item; `buf` is all that remains.
     drained: bool,
-    /// The export faulted. Terminal: `buf` is dropped and no further frame is
-    /// ever cut, because a partially-received export item is unverified and must
-    /// never reach the wire as if it were good.
+    /// The export faulted. Terminal: `buf` is cleared and no further frame is
+    /// ever cut. Not because those bytes are suspect — `buf` only ever holds
+    /// WHOLE export items, and they came from the store's own bao encoder — but
+    /// because the delivery is being abandoned, so cutting another frame would
+    /// bill the client for a transfer that can never complete.
     ///
     /// The producer (`export_bao_range_stream`) already refuses to yield past its
     /// own error, so this is belt-and-braces — but the framer accepts an arbitrary
@@ -86,10 +88,9 @@ impl ChunkFramer {
             match self.stream.next().await {
                 Some(Ok(bytes)) => self.buf.extend_from_slice(&bytes),
                 Some(Err(e)) => {
-                    // Poison, and drop what was buffered: whatever arrived from a
-                    // faulted export is a partial item nothing has verified, and
-                    // cutting a frame out of it would put unverified bytes on the
-                    // wire and bill the client for them.
+                    // Poison, and drop the buffered remainder: this delivery is
+                    // over, so any further frame would bill for a transfer that
+                    // cannot complete.
                     self.faulted = true;
                     self.buf.clear();
                     tracing::error!(
@@ -438,7 +439,11 @@ mod tests {
     #[tokio::test]
     async fn a_mid_export_fault_propagates() -> anyhow::Result<()> {
         let stream: BaoExportStream = Box::pin(futures_util::stream::iter(vec![
-            Ok(Bytes::from(vec![7u8; 2048])),
+            // 1500, deliberately NOT a CHUNK_SIZE multiple: one full frame is
+            // cuttable, leaving 476 bytes buffered when the fault lands. With a
+            // multiple the buffer would be empty at that point and the `buf.clear()`
+            // below would be unobservable.
+            Ok(Bytes::from(vec![7u8; 1500])),
             Err(CacheError::Store(anyhow::anyhow!(
                 "export_bao stream for deadbeef ended without Done; refusing truncated export"
             ))),
@@ -460,6 +465,17 @@ mod tests {
         anyhow::ensure!(
             err.to_string().contains("refusing truncated export"),
             "fault lost its cause: {err}"
+        );
+
+        // The framer must now be POISONED. Without it, the 476 unverified bytes
+        // still buffered when the export faulted would be cut into a frame and
+        // put on the wire as if they were good — and the client billed for them.
+        // `Ok(None)` would be just as wrong: it reads as a clean end of blob.
+        let after = framer.next_frame().await;
+        anyhow::ensure!(
+            after.is_err(),
+            "a faulted framer must refuse further frames, got {:?}",
+            after.map(|o| o.map(|b| b.len()))
         );
         Ok(())
     }

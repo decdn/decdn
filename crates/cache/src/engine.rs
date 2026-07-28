@@ -1575,10 +1575,12 @@ impl CacheEngine {
     /// ~708 MB for a 708 MB blob.
     ///
     /// Note the buffered arm's cost is bounded by
-    /// `cache.origin_retry.buffered_max_bytes` (8 MiB default) rather than by the
-    /// mode: an origin that advertises a small `size_hint` is drained before
-    /// commit either way. `CommitOnly` guarantees no blob is handed *back*, not
-    /// that no blob is ever briefly buffered.
+    /// `cache.origin_retry.buffered_max_bytes` (4 MiB default) rather than by the
+    /// mode: an origin that advertises a `size_hint` at or under it is drained
+    /// before commit either way (a `None` hint always streams, and `0` disables
+    /// buffering). `CommitOnly` guarantees no blob is handed *back*, not that no
+    /// blob is ever briefly buffered.
+    ///
     /// The origin-egress metric (`pull_through_bytes`) is still bumped by the
     /// pull, which is correct — those bytes really did leave an origin.
     ///
@@ -3190,14 +3192,17 @@ impl CacheEngine {
 /// Whether a pull-through hands the committed blob back to its caller.
 ///
 /// Replaces a `want_bytes: bool` that sat directly beside `local_only: bool` in
-/// the same argument lists — two adjacent booleans that the compiler would let
+/// `pull_through`'s argument list — two adjacent booleans the compiler would let
 /// you swap silently, in a chain where getting it wrong either reinstates the
-/// #1132 whole-blob read-back or stops `get` consulting peer origins. Neither
-/// failure has a test that would catch it.
+/// #1132 whole-blob read-back or stops `get` consulting peer origins. The
+/// `local_only` half would at least be caught — `populate_local_skips_peer_origin_and_fills_from_local`
+/// asserts `peer_fetches == 0`. The read-back half is the silent one, and is what
+/// the enum is really buying.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum FillMode {
-    /// [`CacheEngine::get`] — the caller needs the payload, so a committed blob is
-    /// read back out of the store.
+    /// [`CacheEngine::get`] — the caller needs the payload. The streaming arm
+    /// reads the committed blob back out of the store to produce it; the buffered
+    /// arm already holds it and returns its drain buffer.
     ReturnBytes,
     /// [`CacheEngine::populate`] — the caller drops the payload, so it is never
     /// read back (#1132). Serving a 708 MB blob used to cost that much again on

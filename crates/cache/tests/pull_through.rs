@@ -4573,7 +4573,8 @@ async fn export_bao_range_round_trips_and_verifies_against_root() -> anyhow::Res
 /// A whole-blob `export_bao_range(hash, 0, 0)` must cover the entire blob and
 /// verify. This is the buffered drain of `export_bao_range_stream`, not the serve
 /// path itself (the node streams — #1132); it covers the shared wire format both
-/// forms produce, which is what ADR 038 AC#4 pins.
+/// forms produce (ADR 038 AC#3), and the whole-blob offset-0 byte-identity of
+/// AC#7.
 #[tokio::test]
 async fn export_bao_range_whole_blob_offset_zero() -> anyhow::Result<()> {
     use bytes::Bytes;
@@ -4799,14 +4800,14 @@ async fn export_bao_range_stream_empty_blob_yields_no_items() -> anyhow::Result<
 /// and the new `PullThroughOutcome::Committed` arm is what carries the result
 /// back.
 ///
-/// It does NOT observe the absence of the read-back — that is enforced by
-/// `PullThroughOutcome::Committed` carrying no payload, which is a property of the
-/// type, not of this run. Do not trust this test to catch a reintroduced
-/// `read_local`; it proves the new arm is wired correctly and still fills the
-/// cache, which is the part a type cannot check.
+/// It does NOT observe the absence of the read-back. `PullThroughOutcome::Committed`
+/// stops the bytes riding out in the variant, but a stray `let _ = read_local(..)`
+/// before returning it would compile and this test would not notice. So do not
+/// trust it to catch a reintroduced read-back; it proves the new arm is wired
+/// correctly and still fills the cache, which is the part a type cannot check.
 #[tokio::test]
 async fn populate_fills_via_the_streaming_commit_path() -> anyhow::Result<()> {
-    // Comfortably over the 8 MiB `buffered_max_bytes` default.
+    // Comfortably over the 4 MiB `buffered_max_bytes` default.
     let mut payload = vec![0u8; 12 * 1024 * 1024];
     let mut x: u32 = 0x9E37_79B9;
     for b in &mut payload {
@@ -4843,19 +4844,18 @@ async fn populate_fills_via_the_streaming_commit_path() -> anyhow::Result<()> {
 
 /// `populate` must also fill via the BUFFERED commit arm, which this blob is
 /// small enough to take (`should_buffer` routes anything at or under
-/// `buffered_max_bytes`, 8 MiB by default).
+/// `buffered_max_bytes`, 4 MiB by default; a `None` hint streams regardless).
 ///
 /// That arm changed with `FillMode`: it used to hand its drain buffer back
-/// regardless of what the caller asked for, which made `CommitOnly ⟺ no payload`
-/// true in only one direction and left the mode with a silent exception. It now
-/// drops the buffer and reports `Committed` like the streaming arm. Nothing about
-/// the fill itself should differ — same commit, same broadcast, same bytes — and
-/// that is what this pins. Its sibling
-/// `populate_fills_via_the_streaming_commit_path` covers the other arm; a change
-/// that fixed one and broke the other would pass only one of the two.
+/// regardless of what the caller asked for. This pins only that the fill still
+/// works — it CANNOT distinguish the two behaviours, because `pull_through_fill`
+/// drops the payload either way and `PullThroughOutcome` is private to the crate.
+/// The correspondence itself is pinned by
+/// `engine::tests::fill_mode_determines_the_return_shape_in_both_directions`,
+/// which lives where the private types are visible.
 #[tokio::test]
 async fn populate_fills_via_the_buffered_commit_path() -> anyhow::Result<()> {
-    // Well under the 8 MiB `buffered_max_bytes` default, and the mock advertises
+    // Well under the 4 MiB `buffered_max_bytes` default, and the mock advertises
     // a `Content-Length`, so `should_buffer` says yes.
     let mut payload = vec![0u8; 64 * 1024];
     let mut x: u32 = 0x0BAD_F00D;
@@ -4889,14 +4889,14 @@ async fn populate_fills_via_the_buffered_commit_path() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `get` must still receive the payload from the buffered arm — the direction
-/// `FillMode::ReturnBytes` is responsible for.
+/// `get` must still receive the payload for a blob small enough to take the
+/// buffered drain — a regression guard on the `FillMode::ReturnBytes` direction.
 ///
-/// Paired deliberately with the test above: they differ only in the mode, so
-/// together they pin that the buffered arm honours BOTH, rather than having been
-/// made to drop its buffer unconditionally.
+/// Named for what it observes, not for which arm ran: an integration test cannot
+/// see `should_buffer`'s decision. The size is chosen to route through the drain,
+/// but only the unit test can confirm that it did.
 #[tokio::test]
-async fn get_still_returns_bytes_from_the_buffered_commit_path() -> anyhow::Result<()> {
+async fn get_returns_bytes_for_a_small_origin_blob() -> anyhow::Result<()> {
     let payload = b"small enough to be drained, not streamed".to_vec();
     let hash = Hash::new(&payload);
 

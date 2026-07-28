@@ -312,23 +312,24 @@ fn classify_decode_error(err: DecodeError) -> anyhow::Error {
 /// skip the whole-file check below. That is *possible in principle*, and it is
 /// worth being precise about why we don't, because "it can't be done" would be
 /// wrong: BLAKE3 is a Merkle tree, so given the interior nodes — the **outboard**
-/// — any range verifies against the root with an `O(log n)` proof and no earlier
-/// bytes (ADR 038). This client already held those hashes: the bao proof it
-/// decoded carried, at every level, the parent pair whose right sibling covers
-/// the untouched tail. That is exactly how each group was checked against the
-/// root on the way in. [`decdn_bao_range`] does the same thing from an
-/// **untrusted** `{H}.obao4`, with no trusted-origin assumption.
+/// — a range verifies against the root from an `O(log n)` proof, with no earlier
+/// bytes (ADR 038). This client already saw those hashes: the bao proof it
+/// decoded carried, at every level, the sibling hashes covering the parts of the
+/// tree it did not descend into. That is exactly how each group was checked
+/// against the root on the way in.
 ///
-/// What this client does not do is *persist* them. It writes plaintext only,
-/// links no blob store (#578), and keeps no outboard sidecar beside the
-/// `.partial` — so by the time a later process picks the file up, the hashes are
-/// gone. Adding a sidecar would make the prefix checkable in isolation at the
-/// cost of a second on-disk format to keep consistent; a single BLAKE3 pass on
-/// the comparatively rare resume path is cheaper than that, so [`resume_is_genuine`]
-/// settles it once at the end instead.
+/// What it does not do is *persist* them. It writes plaintext only, links no blob
+/// store (#578), and keeps no outboard beside the `.partial` — so by the time a
+/// later process picks the file up, the hashes are gone and only the content hash
+/// remains to check against. Hence [`resume_is_genuine`], once, at the end.
 ///
-/// If you are here to remove that O(blob) pass: the sidecar is the way, not a
-/// cleverer local check on plaintext alone.
+/// Two things to know before trying to remove that pass. It would need a
+/// *partial* outboard format: [`decdn_bao_range`] verifies a range against an
+/// untrusted `{H}.obao4`, but its encoder requires a COMPLETE outboard, and an
+/// interrupted client never received the interior nodes of the subtrees it never
+/// fetched. And it would not remove the hashing — verifying a prefix still hashes
+/// every chunk group in it, so the win is detecting a bad prefix *before* paying
+/// for the tail, not avoiding an O(prefix) pass.
 #[must_use]
 pub const fn resume_offset(have: u64) -> u64 {
     have - (have % CHUNK_GROUP_BYTES)
@@ -459,7 +460,49 @@ mod tests {
         for offset in [16 * 1024u64, 70_000, 64 * 1024] {
             let (root, wire) = wire_for(&blob, offset)?;
             let mut out: Vec<u8> = Vec::new();
-            decode_to_sink(Bytes::from(wire), root, blob_size, offset, &mut out, None).await?;
+            // Record progress while we are here: the clamp
+            // (`leaf.offset.max(byte_offset)`) only matters at a resumed offset,
+            // and without it the bar reports positions BELOW where the partial
+            // already reached — i.e. it appears to go backwards on resume.
+            let seen: std::sync::Arc<std::sync::Mutex<Vec<(u64, u64)>>> =
+                std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let sink_seen = std::sync::Arc::clone(&seen);
+            let cb: Box<crate::ProgressCallback> = Box::new(move |done, total| {
+                if let Ok(mut g) = sink_seen.lock() {
+                    g.push((done, total));
+                }
+            });
+            decode_to_sink(
+                Bytes::from(wire),
+                root,
+                blob_size,
+                offset,
+                &mut out,
+                Some(cb.as_ref()),
+            )
+            .await?;
+
+            let reports = seen
+                .lock()
+                .map_err(|_| anyhow::anyhow!("poisoned"))?
+                .clone();
+            anyhow::ensure!(
+                !reports.is_empty(),
+                "progress must be reported as groups land, not once at the end (offset {offset})"
+            );
+            anyhow::ensure!(
+                reports.is_sorted_by_key(|(done, _)| *done),
+                "progress must not go backwards at offset {offset}: {reports:?}"
+            );
+            anyhow::ensure!(
+                reports.first().is_some_and(|(done, _)| *done >= offset),
+                "a resumed fetch must report from the resume point, not from 0 (offset {offset})"
+            );
+            anyhow::ensure!(
+                reports.last() == Some(&(blob_size, blob_size)),
+                "the final report must reach 100% at offset {offset}: {:?}",
+                reports.last()
+            );
             let want = blob
                 .get(usize::try_from(offset)?..)
                 .ok_or_else(|| anyhow::anyhow!("offset out of bounds"))?;

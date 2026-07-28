@@ -315,6 +315,39 @@ pub struct BlobTooLargeClaim {
     pub ceiling: u64,
 }
 
+/// The requested `byte_offset` is at or past the blob's end, so no resume can be
+/// served from it (#1120).
+///
+/// Typed rather than a bare string because it is the ONE signal that proves a
+/// caller's partial download does not belong to this blob — a stale `.partial`
+/// left under the same `--output` by a fetch of a different or larger blob, or
+/// one that completed but was killed before its rename. A resumable client keys
+/// its discard-and-refetch on this and nothing else: classifying by exclusion
+/// ("any error that is not a voucher rejection") would sweep in ordinary stalls
+/// and resets and destroy a perfectly good prefix the user has already paid for.
+///
+/// Note this is a statement about the *offset*, not about the peer: the node
+/// answered honestly. Callers must not score it against the provider.
+#[derive(Debug)]
+pub struct ResumeOffsetPastEnd {
+    /// Whole-blob size the node signed for.
+    pub total_bytes: u64,
+    /// The offset we asked to resume from.
+    pub byte_offset: u64,
+}
+
+impl std::fmt::Display for ResumeOffsetPastEnd {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "cannot resume at byte {}: the blob is only {} bytes",
+            self.byte_offset, self.total_bytes
+        )
+    }
+}
+
+impl std::error::Error for ResumeOffsetPastEnd {}
+
 impl std::fmt::Display for BlobTooLargeClaim {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -1610,12 +1643,16 @@ async fn fetch_inner_once(
     // bypass. A legitimate server always claims `total_bytes >= byte_offset`;
     // reject anything less before the loop. (A non-empty but *short* delivery is
     // caught by the completeness check after the loop.)
-    if resp.body.total_bytes < byte_offset {
-        anyhow::bail!(
-            "server claimed total_bytes ({}) below the requested byte_offset ({})",
-            resp.body.total_bytes,
-            byte_offset
-        );
+    // A resume offset the blob cannot satisfy. `<=` rather than `<`: an offset
+    // exactly AT the end has no chunk group to anchor either, and `align_range`
+    // would reject it a few lines later with an untyped fault — this way both
+    // land on the same typed sentinel. Guarded on `byte_offset > 0` so a 0-byte
+    // blob fetched from 0 (#1054) is untouched.
+    if resp.body.total_bytes <= byte_offset && byte_offset > 0 {
+        return Err(anyhow::Error::new(ResumeOffsetPastEnd {
+            total_bytes: resp.body.total_bytes,
+            byte_offset,
+        }));
     }
 
     let rate_per_mb = resp.body.rate_per_mb;
@@ -2100,12 +2137,16 @@ pub async fn open_progressive_pull(
     if max_rate_per_mb > 0 && resp.body.rate_per_mb > max_rate_per_mb {
         return Err(RateAboveCeiling::over_ceiling(resp, max_rate_per_mb));
     }
-    if resp.body.total_bytes < byte_offset {
-        anyhow::bail!(
-            "server claimed total_bytes ({}) below the requested byte_offset ({})",
-            resp.body.total_bytes,
-            byte_offset
-        );
+    // A resume offset the blob cannot satisfy. `<=` rather than `<`: an offset
+    // exactly AT the end has no chunk group to anchor either, and `align_range`
+    // would reject it a few lines later with an untyped fault — this way both
+    // land on the same typed sentinel. Guarded on `byte_offset > 0` so a 0-byte
+    // blob fetched from 0 (#1054) is untouched.
+    if resp.body.total_bytes <= byte_offset && byte_offset > 0 {
+        return Err(anyhow::Error::new(ResumeOffsetPastEnd {
+            total_bytes: resp.body.total_bytes,
+            byte_offset,
+        }));
     }
 
     let rate_per_mb = resp.body.rate_per_mb;
