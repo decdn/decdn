@@ -780,8 +780,9 @@ pub enum StreamError {
         /// the chain-derivable `channel_id` could pull the node's watermark).
         /// A wallet-less client cannot reconstruct its watermark from chain
         /// (the claim watermark is `0` until settlement), so this lets it
-        /// self-heal: re-seed to the node's true cumulative, re-sign from
-        /// `nonce + 1`, and resume from `bytes_delivered`. `None` for every
+        /// self-heal: re-seed the ledger's PAYMENT BASELINE to `bytes_delivered`
+        /// (a channel-cumulative counter, NOT a blob `byte_offset`) and re-sign
+        /// from `nonce + 1`. `None` for every
         /// handler-direct reason (`Expired`, `RetryLater`,
         /// `CooperativeCloseSigned`, `RateFloorRaised`, …) and whenever the
         /// signer does not recover to `voucher_signer`.

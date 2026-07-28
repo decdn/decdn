@@ -957,7 +957,7 @@ impl PersistentChannelStateStore {
 /// [`BuyerChannelStore`] adapter over the shared [`PersistentChannelStateStore`].
 ///
 /// Holds an `Arc` to the same store the seller path uses, so both the seller
-/// `channel_state_v1` table and the buyer `buyer_channel_state_v1` table live
+/// `channel_state_v1` table and the buyer `buyer_channel_state_v2` table live
 /// in one redb file behind one handle. Hand this to the buyer service as
 /// `Arc<dyn BuyerChannelStore>`.
 #[derive(Debug, Clone)]
