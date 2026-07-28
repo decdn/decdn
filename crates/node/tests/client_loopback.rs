@@ -45,8 +45,8 @@ use decdn_cache::{
 use decdn_incentive::{
     ChannelState, ChannelStateStore, CooperativeClose, EPHEMERAL_BINDING_NONCE,
     MemoryChannelStateStore, SignedCooperativeClose, Voucher, bind_node_id_domain,
-    binding_signing_hash, min_payment, signed_to_wire_voucher, slash_judge_domain,
-    stream_sig::StreamSlashData, voucher_domain,
+    binding_signing_hash, min_payment, sign_coop_close_request, signed_to_wire_voucher,
+    slash_judge_domain, stream_sig::StreamSlashData, voucher_domain,
 };
 use decdn_node::client_requester::{
     ChannelContext, ChannelLedger, Cumulative, PullDeadlines, RateAboveCeiling,
@@ -3784,8 +3784,10 @@ async fn client_concurrent_same_channel_both_succeed() -> anyhow::Result<()> {
     anyhow::ensure!(bytes_b.as_ref() == payload_b.as_slice(), "blob B mismatch");
 
     // The channel advanced monotonically: at least one voucher per pull (>= 2
-    // total), and the cumulative bytes cover BOTH payloads.
-    let final_cum = ledger.snapshot().await;
+    // total), and the cumulative bytes cover BOTH payloads. Both pulls completed, so
+    // every voucher they sent optimistically has been acked — `committed` carries the
+    // full total.
+    let final_cum = ledger.committed();
     anyhow::ensure!(
         final_cum.nonce >= U256::from(2u64),
         "ledger nonce: {} (expected >= 2)",
@@ -4654,6 +4656,160 @@ async fn raw_message_request(
     Ok(m)
 }
 
+/// Like [`raw_message_request`], but maps the provider's *decline* — a clean
+/// stream finish with no reply frame (surfacing as `UnexpectedEof` while reading
+/// the length prefix) — to `Ok(None)` instead of an error. Mirrors the real
+/// requester's decline handling in `client-pull`'s `request_inner`.
+async fn raw_message_request_opt(
+    client_ep: &Endpoint,
+    target: EndpointAddr,
+    msg: &ClientMessage,
+) -> anyhow::Result<Option<ClientMessage>> {
+    let conn = client_ep
+        .connect(target, ALPN_CLIENT)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    let (mut send, mut recv) = conn
+        .open_bi()
+        .await
+        .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
+    let payload = encode_message(msg).map_err(|e| anyhow::anyhow!("encode: {e}"))?;
+    write_frame(&mut send, &payload)
+        .await
+        .map_err(|e| anyhow::anyhow!("write: {e}"))?;
+    let _ = send.finish();
+    match read_frame(&mut recv).await {
+        Ok(frame) => {
+            let (m, _rest) = decode_message::<ClientMessage>(&frame)
+                .map_err(|e| anyhow::anyhow!("decode: {e}"))?;
+            Ok(Some(m))
+        }
+        Err(_) => Ok(None),
+    }
+}
+
+/// The cooperative-close request is UNAUTHENTICATED unless it carries a
+/// `client_signature` recovering to the channel's `client`. A request with no
+/// signature — the exact bare request that used to freeze any channel — must be
+/// declined: no waiver, and (crucially) the sticky no-longer-serving flag is NOT
+/// set, so the channel stays serveable. Guards the auth-bypass fix (#1480).
+#[tokio::test(flavor = "multi_thread")]
+async fn cooperative_close_unauthenticated_request_is_declined() -> anyhow::Result<()> {
+    let signer = Arc::new(PrivateKeySigner::random());
+    let (cache, _hash, _cache_tmp) = cache_with_blob(&[0x5Au8; 4096]).await?;
+    let store_inner = Arc::new(MemoryChannelStateStore::new());
+    store_inner.record(&ChannelState::hydrate(
+        channel_id(),
+        signer.address(),
+        signer.address(),
+        TOKEN,
+        U256::from(10_000_000u64),
+        U256::from(4_000u64),
+        U256::from(5u64),
+        U256::from(2_048u64),
+        Some([0x11; 65]),
+        0,
+        false,
+    ))?;
+    let store: Arc<dyn ChannelStateStore> = store_inner.clone();
+    let (target, _server_eth, server_ep, server_task, metrics) =
+        spawn_handler_server_with_metrics(cache, store, RATE_PER_MB, 0, 16).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let reply = raw_message_request_opt(
+        &client_ep,
+        target,
+        &ClientMessage::CooperativeCloseRequest(CooperativeCloseRequest {
+            channel_id: channel_id().0,
+            client_signature: Vec::new(),
+        }),
+    )
+    .await?;
+    anyhow::ensure!(
+        reply.is_none(),
+        "an unauthenticated cooperative-close request must be declined (no waiver): {reply:?}"
+    );
+
+    let persisted = store_inner
+        .get(channel_id())?
+        .ok_or_else(|| anyhow::anyhow!("channel missing"))?;
+    anyhow::ensure!(
+        !persisted.cooperative_close_signed(),
+        "an unauthenticated request must NOT freeze the channel"
+    );
+    let text = metrics
+        .encode()
+        .map_err(|e| anyhow::anyhow!("encode metrics: {e}"))?;
+    anyhow::ensure!(
+        metric_line_present(
+            &text,
+            "decdn_cooperative_close_request_unauthorized_total 1"
+        ),
+        "the declined request must be metered:\n{text}"
+    );
+
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
+/// A cooperative-close request signed by the WRONG key (not the channel's
+/// `client`) is declined identically: the signature recovers to some other
+/// address, fails the `== state.client` check, and the channel stays serveable.
+#[tokio::test(flavor = "multi_thread")]
+async fn cooperative_close_wrong_signer_is_declined() -> anyhow::Result<()> {
+    let signer = Arc::new(PrivateKeySigner::random());
+    let impostor = PrivateKeySigner::random();
+    let (cache, _hash, _cache_tmp) = cache_with_blob(&[0x5Au8; 4096]).await?;
+    let store_inner = Arc::new(MemoryChannelStateStore::new());
+    store_inner.record(&ChannelState::hydrate(
+        channel_id(),
+        signer.address(),
+        signer.address(),
+        TOKEN,
+        U256::from(10_000_000u64),
+        U256::from(4_000u64),
+        U256::from(5u64),
+        U256::from(2_048u64),
+        Some([0x11; 65]),
+        0,
+        false,
+    ))?;
+    let store: Arc<dyn ChannelStateStore> = store_inner.clone();
+    let (target, _server_eth, server_ep, server_task, _metrics) =
+        spawn_handler_server_with_metrics(cache, store, RATE_PER_MB, 0, 16).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    // Signed by the impostor over the correct channel id + domain.
+    let client_signature = sign_coop_close_request(&impostor, channel_id(), &payment_domain())?;
+    let reply = raw_message_request_opt(
+        &client_ep,
+        target,
+        &ClientMessage::CooperativeCloseRequest(CooperativeCloseRequest {
+            channel_id: channel_id().0,
+            client_signature,
+        }),
+    )
+    .await?;
+    anyhow::ensure!(
+        reply.is_none(),
+        "a wrong-signer cooperative-close request must be declined: {reply:?}"
+    );
+    let persisted = store_inner
+        .get(channel_id())?
+        .ok_or_else(|| anyhow::anyhow!("channel missing"))?;
+    anyhow::ensure!(
+        !persisted.cooperative_close_signed(),
+        "a wrong-signer request must NOT freeze the channel"
+    );
+
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
 /// End-to-end cooperative close (ADR 003 §Cooperative close): a channel with an
 /// advanced watermark answers a `CooperativeCloseRequest` with a waiver that
 /// recovers to the node's eth key over the on-chain `CooperativeClose` typed
@@ -4689,12 +4845,14 @@ async fn cooperative_close_signs_waiver_persists_flag_and_stops_serving() -> any
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
 
-    // (1) Request the waiver.
+    // (1) Request the waiver, authenticated by the channel client's key.
+    let client_signature = sign_coop_close_request(&signer, channel_id(), &payment_domain())?;
     let reply = raw_message_request(
         &client_ep,
         target.clone(),
         &ClientMessage::CooperativeCloseRequest(CooperativeCloseRequest {
             channel_id: channel_id().0,
+            client_signature,
         }),
     )
     .await?;

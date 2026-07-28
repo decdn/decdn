@@ -71,7 +71,7 @@ const RATE_B: u64 = 13;
 /// wire size, not the content length. The stream pays `rate` per fully crossed
 /// 1-MiB interval plus a closing voucher of `ceil(remainder * rate / MiB)` for
 /// the trailing wire bytes, mirroring the requester's per-voucher
-/// `ceil(bytes_delta * rate / MiB)` arithmetic in `client_requester::self_pay`.
+/// `ceil(bytes_delta * rate / MiB)` arithmetic in `client_requester::send_voucher`.
 fn expected_amount(rate: u64) -> U256 {
     const MIB: u64 = 1024 * 1024;
     let wire = support::bao_wire_len_whole(PAYLOAD_LEN as u64);

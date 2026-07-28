@@ -35,6 +35,7 @@ pub mod channel_open_error;
 pub mod client_bridge;
 pub mod client_reputation;
 pub mod content_blacklist;
+pub mod coop_close_request;
 pub mod cooperative_close;
 pub mod erc20;
 pub mod eth_identity;
@@ -74,6 +75,10 @@ pub use client_bridge::{
 pub use client_reputation::{
     Admission, ClientReputation, ClientReputationConfig, ClientReputationLedger,
     ClientReputationStore, ConfigError as ClientReputationConfigError, MemoryClientReputationStore,
+};
+pub use coop_close_request::{
+    COOP_CLOSE_REQUEST_SIG_LEN, CoopCloseRequestError, coop_close_request_signing_hash,
+    recover_coop_close_request, sign_coop_close_request,
 };
 pub use cooperative_close::{CooperativeClose, SignedCooperativeClose};
 pub use erc20::Erc20;

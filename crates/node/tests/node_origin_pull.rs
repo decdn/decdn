@@ -1766,10 +1766,11 @@ async fn serve_then_reject_voucher(
 }
 
 /// Serve the whole payload, read the closing voucher, then reply with an ARBITRARY
-/// `StreamError` (not a `VoucherRejected`) — the shape that lands in `self_pay`'s ack-wait
-/// catch-all (#1145 review). Modelled on [`serve_then_reject_voucher`], differing only in the
-/// final frame: an `Overloaded`/`NotFound` in reply to a voucher must be metered as a refusal,
-/// not stringified into the `Unreachable` catch-all.
+/// `StreamError` (not a `VoucherRejected`) — the shape the receive loop's voucher-slot
+/// handler (`resolve_voucher_slot`) folds into `UpstreamRefused` (#1145 review, #1484).
+/// Modelled on [`serve_then_reject_voucher`], differing only in the final frame: an
+/// `Overloaded`/`NotFound` in reply to a voucher must be metered as a refusal, not
+/// stringified into the `Unreachable` catch-all.
 async fn serve_then_error_on_voucher(
     conn: Connection,
     eth: &Arc<PrivateKeySigner>,
@@ -1838,7 +1839,7 @@ async fn serve_then_error_on_voucher(
     let ClientMessage::Voucher(_) = voucher_msg else {
         anyhow::bail!("voucher-erroring upstream: expected a Voucher");
     };
-    // The non-`VoucherRejected` reply: this is the frame `self_pay`'s ack-wait catch-all sees.
+    // The non-`VoucherRejected` reply: the frame the receive loop's `resolve_voucher_slot` sees.
     write_frame(
         &mut send,
         &encode_message(&ClientMessage::StreamError(error))?,
@@ -4745,16 +4746,17 @@ async fn node_origin_mid_stream_refusal_is_metered_not_scored() -> Result<()> {
 }
 
 /// #1145 review (4th `{e:?}` site) — a non-`VoucherRejected` `StreamError` arriving in reply
-/// to the CLOSING VOUCHER lands in `self_pay`'s ack-wait catch-all. Round 2 typed the three
+/// to the CLOSING VOUCHER lands in the receive loop's voucher-slot handler
+/// (`resolve_voucher_slot`, once the optimistic loop of #1484). Round 2 typed the three
 /// mid-stream receive sites but left this one stringifying the wire code, so an honest
-/// `Overloaded`/`NotFound` in the ack wait fell through every downcast to the `Unreachable`
-/// catch-all — scoring a reachable, honestly-answering peer as a dead node.
+/// `Overloaded`/`NotFound` fell through every downcast to the `Unreachable` catch-all —
+/// scoring a reachable, honestly-answering peer as a dead node.
 ///
-/// Driven through the REAL ack wait (the server delivers the whole payload, reads the closing
+/// Driven through the REAL path (the server delivers the whole payload, reads the closing
 /// voucher, then replies `Overloaded`), because — as the mid-stream sibling spells out — an
 /// assertion against `classify_pull_failure`'s ladder would pass with the `bail!("{e:?}")`
 /// restored: the classifier was never the thing that broke. `node_pull_refused_total` is
-/// reachable only if `self_pay` kept the wire code as `UpstreamRefused`.
+/// reachable only if the voucher-slot handler kept the wire code as `UpstreamRefused`.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)] // multi-node fixture setup, like its siblings above
 async fn node_origin_an_ack_wait_refusal_is_metered_not_scored() -> Result<()> {
@@ -4836,7 +4838,8 @@ async fn node_origin_an_ack_wait_refusal_is_metered_not_scored() -> Result<()> {
         "a refused delivery must not surface bytes (NotFound)"
     );
 
-    // Metered as a REFUSAL — only possible if `self_pay` kept the wire code as `UpstreamRefused`.
+    // Metered as a REFUSAL — only possible if the voucher-slot handler kept the wire code
+    // as `UpstreamRefused`.
     assert_counter(&b_metrics, "node_pull_refused_total", 1)?;
     // …and NOT as an unreachable peer. This is the assertion the 4th-site bug fails.
     assert_counter(&b_metrics, "node_pull_unreachable_total", 0)?;
@@ -4970,12 +4973,15 @@ async fn node_origin_a_wedged_provider_is_skipped_for_other_hashes() -> Result<(
 }
 
 /// #1145 review — a `VoucherRejected` arriving MID-STREAM is the same event as one arriving
-/// in the ack wait, and must get the same channel remedy.
+/// in reply to a voucher, and must get the same channel remedy.
 ///
-/// The fix above (typing the mid-stream `StreamError`) created this hole one arm over. Only
-/// `self_pay`'s ack wait turns the code into `UpstreamVoucherRejected`; the three mid-stream
-/// receive sites wrap ANY `StreamError` into `UpstreamRefused`. So a `VoucherRejected` that
-/// did not arrive in a voucher round trip reached `classify_refusal`, was ruled `OurFault` —
+/// The fix above (typing the mid-stream `StreamError`) created this hole one arm over. Since
+/// #1484 the receive loop reads every voucher reply through one handler
+/// (`resolve_voucher_slot`), which turns a `VoucherRejected` into `UpstreamVoucherRejected`
+/// wherever it lands and any other `StreamError` into `UpstreamRefused` — unifying what used
+/// to be a split between the blocking ack wait and the mid-stream receive sites. Before that
+/// unification a `VoucherRejected` that did not arrive in a voucher round trip reached
+/// `classify_refusal`, was ruled `OurFault` —
 /// score nothing, suppress nothing, *do* nothing — and skipped the entire channel remedy.
 ///
 /// The consequence is the one the drained-channel test exists to prevent, reached by another
@@ -8815,9 +8821,15 @@ async fn window_pull_through_share_ratio_refuses_at_admission() -> Result<()> {
 /// what makes it a money bug is that `StaleNonce` is now a TERMINAL verdict — it wedges the
 /// channel (the row is kept for the reclaim sweep, but the provider is suppressed and the
 /// loser's ledger desyncs) — so a collision the shared ledger prevents would otherwise strand
-/// the deposit. Hence the two assertions beyond "both blobs arrived": nothing was retired, and
-/// the watermark advanced monotonically through both pulls rather than one pull's voucher being
-/// refused.
+/// the deposit. Hence the assertions beyond "both blobs arrived": nothing was retired, and the
+/// channel's nonce advanced through EVERY voucher of both pulls on one monotonic sequence.
+///
+/// Since #1484 the client sends vouchers optimistically and each pull persists the shared
+/// ledger's SETTLE-HIGH watermark, so both `record_progress` calls now report the fully
+/// advanced cumulative rather than two disjoint sub-watermarks: the evidence of sharing is
+/// that the recorded nonce reaches the full four-voucher total (one interval + one closing per
+/// 1.5 MiB pull), which two separate ledgers — each capped at nonce 2 and colliding on nonce
+/// 1 — could never reach.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::expect_used, clippy::too_many_lines)]
 async fn two_concurrent_pulls_to_one_provider_share_the_channel_ledger() -> Result<()> {
@@ -8982,20 +8994,28 @@ async fn two_concurrent_pulls_to_one_provider_share_the_channel_ledger() -> Resu
         "no channel may be retired here — both pulls paid honestly on a live channel, got {retired_now:?}"
     );
 
-    // Both pulls issued through one ledger, so the channel's nonces are strictly
-    // increasing across them rather than two pulls both claiming nonce 1.
+    // Both pulls issued through ONE ledger, so the channel's nonces form a single
+    // monotonic sequence carrying every voucher from both pulls: two per 1.5 MiB pull
+    // (one interval + one closing), four in all. Separate ledgers would each cap at
+    // nonce 2 and collide on nonce 1 — which the empty-result / retire checks above
+    // already catch. Under the optimistic loop (#1484) both pulls persist the shared
+    // settle-high watermark, so the sharing is evidenced by the recorded nonce reaching
+    // the full four-voucher total rather than by the two settlements differing (they no
+    // longer need to: both observe the same advanced cumulative).
     let entries = recorded.lock().expect("recorded lock").clone();
-    let mut nonces: Vec<U256> = entries.iter().map(|(_, n, ..)| *n).collect();
-    nonces.sort_unstable();
-    nonces.dedup();
     anyhow::ensure!(
-        nonces.len() == entries.len(),
-        "two settlements recorded the SAME nonce — the pulls did not share a ledger: {entries:?}"
+        entries.len() == 2,
+        "expected one recorded settlement per pull, got {entries:?}"
     );
-    let top = nonces.last().copied().unwrap_or(U256::ZERO);
+    let top = entries
+        .iter()
+        .map(|(_, n, ..)| *n)
+        .max()
+        .unwrap_or(U256::ZERO);
     anyhow::ensure!(
-        top >= U256::from(2u64),
-        "the channel must have carried at least one voucher per pull; top nonce was {top}"
+        top == U256::from(4u64),
+        "the shared ledger's nonce must carry all four vouchers (two per 1.5 MiB pull); \
+         separate ledgers would each cap at nonce 2 and collide: {entries:?}"
     );
 
     ep_a.close().await;

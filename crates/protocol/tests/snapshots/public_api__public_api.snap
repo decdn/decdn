@@ -64,6 +64,7 @@ impl decdn_protocol::client::CooperativeCloseAuth
 pub const fn decdn_protocol::client::CooperativeCloseAuth::validate(&self) -> core::result::Result<(), decdn_protocol::message::MessageValidationError>
 pub struct decdn_protocol::client::CooperativeCloseRequest
 pub decdn_protocol::client::CooperativeCloseRequest::channel_id: [u8; 32]
+pub decdn_protocol::client::CooperativeCloseRequest::client_signature: alloc::vec::Vec<u8>
 pub struct decdn_protocol::client::StreamRequest
 pub decdn_protocol::client::StreamRequest::byte_len: u64
 pub decdn_protocol::client::StreamRequest::byte_offset: u64

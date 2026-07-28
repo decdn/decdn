@@ -2066,15 +2066,15 @@ fn pull_verdict(err: &anyhow::Error) -> PullVerdict {
     }
     if let Some(refused) = err.downcast_ref::<UpstreamRefused>() {
         // A `VoucherRejected` arriving as a mid-stream refusal is the SAME event as one
-        // arriving in the ack wait, and must get the same remedy (#1145 review).
+        // arriving in reply to a voucher, and must get the same remedy (#1145 review).
         //
-        // Only `self_pay`'s ack wait special-cases the code into `UpstreamVoucherRejected`;
-        // the three mid-stream receive sites wrap any `StreamError` into `UpstreamRefused`.
-        // So one that arrives outside a voucher round trip reached `classify_refusal`, was
-        // ruled `OurFault` — score nothing, suppress nothing, do nothing — and skipped the
-        // whole channel remedy above. A wedged or settled channel stayed in the store and
-        // was handed straight back on the next miss, forever, on a `debug!` line invisible
-        // at the project's default `RUST_LOG=info`.
+        // Since #1484 the client's `resolve_voucher_slot` types a `VoucherRejected` into
+        // `UpstreamVoucherRejected` wherever it lands, so this unwrap is a defensive backstop
+        // for any `VoucherRejected` that still reaches here inside `UpstreamRefused`: were it
+        // left folded into the refusal ladder it would be ruled `OurFault` — score nothing,
+        // suppress nothing, do nothing — and skip the whole channel remedy above, leaving a
+        // wedged or settled channel in the store to be handed straight back on the next miss,
+        // forever, on a `debug!` line invisible at the project's default `RUST_LOG=info`.
         //
         // Unwrap it here rather than in `classify_refusal`, because the answer is not a
         // refusal verdict at all: it is a statement about our CHANNEL, and `voucher_verdict`

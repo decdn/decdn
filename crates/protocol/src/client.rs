@@ -635,12 +635,27 @@ impl Voucher {
 /// Payer → node request asking the node to co-sign a cooperative close
 /// (ADR 003 §Cooperative close). The node looks up the highest voucher it holds
 /// for `channel_id` and answers with a [`CooperativeCloseAuth`] waiving the
-/// dispute window. Carries only the channel id — the node declares the final
-/// `(amount, nonce, bytes_delivered)` it is willing to settle at.
+/// dispute window. The node declares the final `(amount, nonce, bytes_delivered)`
+/// it is willing to settle at.
+///
+/// `client_signature` proves the requester controls the channel's pinned
+/// `voucherSigner` key: an EOA EIP-712 `CooperativeCloseRequest(bytes32
+/// channelId)` signature that MUST recover to it (the same identity the paid
+/// path and on-chain `cooperativeClose` check, never the funder `client`).
+/// Signing a waiver is a durable, one-way commitment (the node stops serving the
+/// channel), and `channel_id` is chain-derivable, so a request that does not
+/// prove control is declined — otherwise any peer could freeze any channel. An
+/// absent (empty) or non-recovering signature is answered by finishing the
+/// stream with no waiver, exactly like the unknown-channel decline.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CooperativeCloseRequest {
     /// `channelId = keccak256(client, provider, channelNonce)` (ADR 003).
     pub channel_id: [u8; 32],
+    /// EOA secp256k1 EIP-712 `CooperativeCloseRequest(channelId)` signature
+    /// (`r‖s‖v`, [`COOPERATIVE_CLOSE_SIG_LEN`] bytes) recovering to the channel's
+    /// pinned `voucherSigner`. Empty means "no proof supplied" — the node
+    /// declines.
+    pub client_signature: Vec<u8>,
 }
 
 /// Node → payer cooperative-close waiver (ADR 003 §Cooperative close). The node
@@ -1163,6 +1178,7 @@ mod tests {
             first_byte(&ClientMessage::CooperativeCloseRequest(
                 CooperativeCloseRequest {
                     channel_id: [0u8; 32],
+                    client_signature: Vec::new(),
                 }
             ))?,
             7

@@ -1,0 +1,3 @@
+# Exclude vendored dependencies from line counts (gitignore-style globs).
+contracts/lib/
+node_modules/
