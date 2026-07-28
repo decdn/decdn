@@ -27,6 +27,7 @@ pub decdn_protocol::client::StreamError::NotFound
 pub decdn_protocol::client::StreamError::OriginBlacklisted
 pub decdn_protocol::client::StreamError::Overloaded
 pub decdn_protocol::client::StreamError::VoucherRejected
+pub decdn_protocol::client::StreamError::VoucherRejected::bundle: core::option::Option<decdn_protocol::client::WatermarkBundle>
 pub decdn_protocol::client::StreamError::VoucherRejected::reason: decdn_protocol::client::VoucherRejectReason
 impl decdn_protocol::client::StreamError
 pub const fn decdn_protocol::client::StreamError::is_delivery_side(&self) -> bool
@@ -44,6 +45,8 @@ pub decdn_protocol::client::VoucherRejectReason::StaleNonce
 pub decdn_protocol::client::VoucherRejectReason::WrongChannel
 pub decdn_protocol::client::VoucherRejectReason::WrongSigner
 pub decdn_protocol::client::VoucherRejectReason::WrongToken
+impl decdn_protocol::client::VoucherRejectReason
+pub const fn decdn_protocol::client::VoucherRejectReason::is_watermark_gated(self) -> bool
 pub struct decdn_protocol::client::ChunkData
 impl decdn_protocol::client::ChunkData
 pub fn decdn_protocol::client::ChunkData::bytes(&self) -> &[u8]
@@ -100,6 +103,13 @@ pub decdn_protocol::client::Voucher::nonce: [u8; 32]
 pub decdn_protocol::client::Voucher::signature: alloc::vec::Vec<u8>
 impl decdn_protocol::client::Voucher
 pub const fn decdn_protocol::client::Voucher::validate(&self) -> core::result::Result<(), decdn_protocol::message::MessageValidationError>
+pub struct decdn_protocol::client::WatermarkBundle
+pub decdn_protocol::client::WatermarkBundle::amount: [u8; 32]
+pub decdn_protocol::client::WatermarkBundle::bytes_delivered: [u8; 32]
+pub decdn_protocol::client::WatermarkBundle::last_signature: alloc::vec::Vec<u8>
+pub decdn_protocol::client::WatermarkBundle::nonce: [u8; 32]
+impl decdn_protocol::client::WatermarkBundle
+pub const fn decdn_protocol::client::WatermarkBundle::validate(&self) -> core::result::Result<(), decdn_protocol::message::MessageValidationError>
 pub const decdn_protocol::client::BINDING_SIG_LEN: usize
 pub const decdn_protocol::client::CHUNK_SIZE: usize
 pub const decdn_protocol::client::COOPERATIVE_CLOSE_SIG_LEN: usize
@@ -354,6 +364,7 @@ pub decdn_protocol::StreamError::NotFound
 pub decdn_protocol::StreamError::OriginBlacklisted
 pub decdn_protocol::StreamError::Overloaded
 pub decdn_protocol::StreamError::VoucherRejected
+pub decdn_protocol::StreamError::VoucherRejected::bundle: core::option::Option<decdn_protocol::client::WatermarkBundle>
 pub decdn_protocol::StreamError::VoucherRejected::reason: decdn_protocol::client::VoucherRejectReason
 impl decdn_protocol::client::StreamError
 pub const fn decdn_protocol::client::StreamError::is_delivery_side(&self) -> bool
@@ -371,6 +382,8 @@ pub decdn_protocol::VoucherRejectReason::StaleNonce
 pub decdn_protocol::VoucherRejectReason::WrongChannel
 pub decdn_protocol::VoucherRejectReason::WrongSigner
 pub decdn_protocol::VoucherRejectReason::WrongToken
+impl decdn_protocol::client::VoucherRejectReason
+pub const fn decdn_protocol::client::VoucherRejectReason::is_watermark_gated(self) -> bool
 pub struct decdn_protocol::BatchStoreAck
 pub decdn_protocol::BatchStoreAck::results: alloc::vec::Vec<bool>
 pub struct decdn_protocol::BatchStoreRequest
