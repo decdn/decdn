@@ -403,7 +403,7 @@ When a node receives a new blacklisted hash, it must, **in order**:
 2. **Stop serving** — reject any new `StreamRequest` for the hash immediately, returning `HashBlacklisted`
 3. **Evict from cache** — delete the blob from local storage within the compliance window
 
-The publish-first ordering is critical: continuing to publish DHT records and probe-respond `has_blob: true` after the compliance window triggers phantom-blob slashing ([ADR 005 — `cdn/probe/v1`](005-protocol.md#cdnprobev1--latency-probe)). Disk eviction can be async; DHT-record and probe-response suppression must be synchronous.
+The publish-first ordering is critical: continuing to serve a blacklisted hash after the compliance window is a blacklist-violation slashing offense ([ADR 014 § SlashJudge Contract](014-on-chain-verification.md#slashjudge-contract)), and a signed response for that hash is dispositive evidence. Disk eviction can be async; DHT-record and probe-response suppression must be synchronous.
 
 When a node receives a blacklisted origin address, it additionally stops accepting any `StreamRequest` that presents a channel funded by that operator address, and removes all of that origin's NodeIds from its local peer table.
 

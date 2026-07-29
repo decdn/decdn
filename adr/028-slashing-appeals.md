@@ -5,7 +5,7 @@
 
 ## Context
 
-The protocol slashes operator bonds at 5% / 15% / 50% escalation tiers ([ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn)). Under **escrow-on-slash** the slashed TOKEN is held in `CapacityBond` escrow rather than distributed immediately. This ADR specifies the operator-facing appeal that decides whether that escrow is refunded to the operator or distributed (50% challenger / 50% burn) at finality. The three `SlashJudge` offenses — phantom delivery, rate manipulation, blacklist violation — still execute the bond reduction immediately on successful on-chain verification ([ADR 014 § Bond Handling](014-on-chain-verification.md#bond-handling)), but the funds are now recoverable until the appeal window resolves. Operators hit while offline have a bounded recourse path.
+The protocol slashes operator bonds at 5% / 15% / 50% escalation tiers ([ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn)). Under **escrow-on-slash** the slashed TOKEN is held in `CapacityBond` escrow rather than distributed immediately. This ADR specifies the operator-facing appeal that decides whether that escrow is refunded to the operator or distributed (50% challenger / 50% burn) at finality. The two `SlashJudge` offenses — rate manipulation, blacklist violation — still execute the bond reduction immediately on successful on-chain verification ([ADR 014 § Bond Handling](014-on-chain-verification.md#bond-handling)), but the funds are now recoverable until the appeal window resolves. Operators hit while offline have a bounded recourse path.
 
 Without a documented escalation path, every legitimate-outage slash (network outage, NTP drift, regional ISP failure, hosting-provider incident) becomes either a permanent operator loss (damages onboarding/trust) or an ad-hoc emergency-multisig discretion event (unbounded multisig precedent). A bounded mechanism is needed before mainnet. This ADR adds a governance-level appeal layered on the escrow-on-slash machinery — no new governance bodies, no changes to the slash *bond-reduction* primitive. Disputing the *underlying blacklist entry* is a different matter, handled by the ordinary removal path in [ADR 011 § Removing a Wrongful Entry](011-content-takedown.md#removing-a-wrongful-entry).
 
@@ -17,7 +17,7 @@ A **successful** appeal (`grantAppeal`) calls `CapacityBond.settleAppealGranted`
 
 ### Scope
 
-All three `SlashJudge` offense types are appealable: phantom, rate manipulation, blacklist. Each executes at reveal time (the `submit*Challenge` call, after a prior `commitChallenge`) with no in-protocol counter-evidence opportunity ([ADR 014 § Bond Handling](014-on-chain-verification.md#bond-handling)); the legitimate-outage rationale applies to all three.
+Both `SlashJudge` offense types are appealable: rate manipulation, blacklist. Each executes at reveal time (the `submit*Challenge` call, after a prior `commitChallenge`) with no in-protocol counter-evidence opportunity ([ADR 014 § Bond Handling](014-on-chain-verification.md#bond-handling)); the legitimate-outage rationale applies to both.
 
 The [§ Eligibility and evidence standard](#eligibility-and-evidence-standard) bar is the gate against frivolous appeals, not the offense type. **Scope limitation: [ADR 028](028-slashing-appeals.md#adr-028-slashing-appeals-and-dispute-escalation) covers appeals against the *slash event itself* on operational-failure grounds — the operator could not comply because of an outage, NTP drift, or similar.** Disputing whether the blacklisted hash belongs on the list at all is out of scope; that is the removal path in [ADR 011 § Removing a Wrongful Entry](011-content-takedown.md#removing-a-wrongful-entry), which carries no appeal state machine of its own. The evidence standard admits no content-policy arguments; only the operational-failure evidence types are admissible. The multisig is expected to apply heightened scrutiny to blacklist-offense appeals (deliberate moderation noncompliance, not operational failure); this guidance is not coded into the contract.
 
@@ -104,7 +104,7 @@ No `MAX_APPEAL_RESTITUTION` cap exists: under escrow-on-slash a granted appeal r
 
 **Window timing invariant.** `APPEAL_FILING_WINDOW`, `APPEAL_REVIEW_WINDOW`, and `APPEAL_RATIFICATION_WINDOW` are sequential, each on its own clock starting from a distinct event (slash block, `openSlashAppeal` block, `fastTrackAppeal` block respectively). The filing window is enforced on `CapacityBond` (`markAppealOpen` reverts once `block.timestamp > slashedAt + APPEAL_FILING_WINDOW`); the review and ratification windows are enforced on `SlashAppeal` via `cleanupExpiredAppeal`. The filing window gates *when* an appeal may be opened, not how long it has to conclude.
 
-**Cluster-slash residual exposure.** All three slashable offenses require the operator's own signed messages ([ADR 014 § Bond Handling](014-on-chain-verification.md#bond-handling)), so an external adversary cannot drive a cluster of slashes — the failure mode is operator misconfiguration (buggy release, NTP drift, blacklist sync gap). On a cluster, the operator consumes the `APPEAL_FREQUENCY_WINDOW` slot on the most clear-cut case and absorbs the residual on the others; [§ Reputation handling](#reputation-handling) keeps the reputation cost and lifetime offense counter regardless. Reputation decay ([ADR 008](008-reputation.md#adr-008-reputation-system)) bounds the residual. Governance can revisit the frequency window if observed volume warrants.
+**Cluster-slash residual exposure.** Both slashable offenses require the operator's own signed messages ([ADR 014 § Bond Handling](014-on-chain-verification.md#bond-handling)), so an external adversary cannot drive a cluster of slashes — the failure mode is operator misconfiguration (buggy release, NTP drift, blacklist sync gap). On a cluster, the operator consumes the `APPEAL_FREQUENCY_WINDOW` slot on the most clear-cut case and absorbs the residual on the others; [§ Reputation handling](#reputation-handling) keeps the reputation cost and lifetime offense counter regardless. Reputation decay ([ADR 008](008-reputation.md#adr-008-reputation-system)) bounds the residual. Governance can revisit the frequency window if observed volume warrants.
 
 ### Contract surface
 
@@ -113,7 +113,7 @@ This ADR specifies the contract surface at the semantic level — function signa
 ```solidity
 // On SlashAppeal. `slashId` is allocated by CapacityBond.slash (ADR 014 §
 // SlashJudge → CapacityBond) — globally monotonic, single counter across all
-// three offense types. `evidenceBundleHash` references the off-chain bundle.
+// both offense types. `evidenceBundleHash` references the off-chain bundle.
 function openSlashAppeal(uint256 slashId, bytes32 evidenceBundleHash) external; // posts APPEAL_BOND, calls markAppealOpen
 function fastTrackAppeal(uint256 slashId) external onlyEmergencyMultisig;
 function rejectAppeal(uint256 slashId) external onlyEmergencyMultisig;   // uphold, burn full appeal bond
@@ -133,7 +133,7 @@ function finalizeUnappealedSlash(uint256 slashId) external; // after the filing 
 
 **Multisig capability scope.** `fastTrackAppeal` and `rejectAppeal` are gated by `SlashAppeal.EMERGENCY_MULTISIG_ROLE`, the same 3-of-5 emergency multisig as [ADR 009 § Emergency Multisig](009-governance.md#emergency-multisig). The threshold and signing semantics are unchanged from [ADR 009](009-governance.md#emergency-multisig).
 
-**Dependency on slash identifiers.** The `slashId` argument refers to the slash record minted by `CapacityBond.slash` (driven by `SlashJudge` per [ADR 014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence)) — a globally monotonic non-zero counter across all three offense types. Without a minted slash record, no appeal can be filed.
+**Dependency on slash identifiers.** The `slashId` argument refers to the slash record minted by `CapacityBond.slash` (driven by `SlashJudge` per [ADR 014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence)) — a globally monotonic non-zero counter across both offense types. Without a minted slash record, no appeal can be filed.
 
 A standalone `SlashAppeal` contract (rather than inlining the appeal logic into `CapacityBond`) keeps `CapacityBond` comfortably under the 24 KB EIP-170 limit and isolates the dispute-policy surface from the escrow custodian; the cross-contract coupling is the narrow `SLASH_APPEAL_ROLE` hook set above.
 

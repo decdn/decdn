@@ -379,7 +379,7 @@ since project inception and will roll into the first tagged release.
   hot-path multisig and to smart-account clients.
   - **Contracts:** unchanged. `SignatureChecker` stays wired in
     `PaymentChannel` (voucher + provider waiver), `CapacityBond`
-    (`registerNode` / `bindNodeId`), `SlashJudge` (phantom / rate / blacklist
+    (`registerNode` / `bindNodeId`), `SlashJudge` (rate / blacklist
     evidence), and `DecdnGovernor` (EIP-712 delegation); the
     `MockERC1271Wallet` fixtures and ERC-1271 branch tests stay with them. No
     ABI, deploy, or bytecode change. This is the insurance against a

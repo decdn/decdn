@@ -105,14 +105,11 @@ blacklist updates and stop being able to settle channels. Once
 
 ## Slashing risk
 
-**Triggers** — the three, and only three, offenses `SlashJudge` adjudicates,
+**Triggers** — the two, and only two, offenses `SlashJudge` adjudicates,
 one per `submit*Challenge` entry point (per
 [ADR 011](../adr/011-content-takedown.md),
 [ADR 014](../adr/014-on-chain-verification.md)):
 
-- **Phantom announce** — claiming a hash you don't actually hold (signed
-  `has_blob: true` then evicted within `probe_hold_duration`, or refused to
-  serve when the stream request arrived).
 - **Rate manipulation** — charging a *higher* stream rate than this node
   itself probe-quoted, inside the 30-second slashing window. The direction
   matters: `SlashJudge` reverts `NotRateManipulation` unless the signed
@@ -133,8 +130,9 @@ slashed by an external adversary.
   - `DecdnProbeHoldViolations` (critical) — hold budget exhausted, so
     present blobs are being answered `has_blob: false`. Budget pressure and
     lost revenue, not slash evidence; see step 4.
-  - `DecdnSlashEvidenceExposure` (critical) — node served bytes for a hash
-    inside the slash window after `has_blob: true`.
+  - `DecdnSlashEvidenceExposure` (critical) — node advertised `has_blob: true`
+    then served `ok: false` within the probe hold: it advertised a blob it
+    could not serve. An availability/reputation self-signal, not slash evidence.
   - `DecdnBlacklistSyncLagCritical` (critical) — blacklist > 30 minutes
     stale; serving any recently blacklisted hash is now slashable.
   - `DecdnBlacklistVersionFarBehind` (critical) — multiple blacklist
@@ -151,8 +149,7 @@ slashed by an external adversary.
 **Remediate:**
 
 1. **Fix the root cause before anything else.** Each offense has its own:
-   eviction-hold pressure or a crashed signing host (phantom), blacklist
-   watcher lag or a stale RPC endpoint (blacklist violation), a rate
+   blacklist watcher lag or a stale RPC endpoint (blacklist violation), a rate
    reconfiguration applied inside the 30-second window (rate manipulation).
    A slash you appeal while the underlying problem persists will not stop
    the next strike.
@@ -192,8 +189,8 @@ slashed by an external adversary.
    `decdn_probe_hold_unavailable_total{reason="exhausted"}` and fires when a
    blob is present but *un-holdable*
    because every hold slot is live, so the node signs `has_blob: false` and
-   forgoes the delivery rather than risk a phantom slash — the literal
-   "evicted after signing `has_blob: true`" case is unreachable by
+   forgoes the delivery rather than advertise a blob it cannot serve — the
+   literal "evicted after advertising `has_blob: true`" case is unreachable by
    construction (held hashes are invisible to the LRU driver). Raise the
    budget with `[cache] max_probe_holds` (`--max-probe-holds` /
    `DECDN_MAX_PROBE_HOLDS`, default 256); a busy node serving many peers
