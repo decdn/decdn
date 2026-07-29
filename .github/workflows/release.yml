@@ -35,7 +35,7 @@ env:
 jobs:
   release:
     name: Release
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     outputs:
       version: ${{ steps.version.outputs.version }}
       tag: ${{ steps.version.outputs.tag }}
@@ -257,7 +257,7 @@ jobs:
     name: Upload release assets
     needs: [release, build-binaries]
     if: ${{ !inputs.dry_run }}
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v7
 
@@ -277,7 +277,7 @@ jobs:
     name: Docker image
     needs: release
     if: ${{ !inputs.dry_run }}
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     permissions:
       contents: read
       packages: write
@@ -289,8 +289,8 @@ jobs:
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v4
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+      - name: Setup Blacksmith Builder
+        uses: useblacksmith/setup-docker-builder@v1
 
       - name: Log in to GHCR
         uses: docker/login-action@v4
@@ -311,7 +311,7 @@ jobs:
 
       - name: Build and push
         id: build
-        uses: docker/build-push-action@v7
+        uses: useblacksmith/build-push-action@v2
         with:
           context: .
           file: Dockerfile
@@ -319,8 +319,6 @@ jobs:
           platforms: linux/amd64,linux/arm64
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
 
       - name: Generate SBOM
         uses: anchore/sbom-action@v0
