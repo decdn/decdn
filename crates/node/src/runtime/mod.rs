@@ -3613,7 +3613,6 @@ mod tests {
             blockchain: ResolvedBlockchain {
                 origin_assignment_address: None,
                 publisher_registry_address: None,
-                origin_directory_from_block: 0,
                 rpc_url: "http://localhost:8545".into(),
                 eth_keystore: PathBuf::from("/tmp/keystore.json"),
                 keystore_password_file: None,
@@ -3628,9 +3627,7 @@ mod tests {
                 settlement_auto_threshold_micro_usdc: None,
                 settlement_auto_by_voucher_nonce_span: None,
                 slash_judge_address: "0x0000000000000000000000000000000000000003".to_string(),
-                slash_judge_from_block: 0,
                 content_blacklist_address: None,
-                content_blacklist_from_block: 0,
                 content_blacklist_poll_interval_sec: 600,
                 chain_id: decdn_common::config::DEFAULT_CHAIN_ID,
             },

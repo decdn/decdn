@@ -19,9 +19,9 @@
 /// few extra blocks of `eth_getLogs`. Sized for the shallow reorgs of an
 /// Arbitrum-Sepolia-class L2.
 ///
-/// The rewind applies only where a *durable* cursor is resumed — the
-/// `HeadMinusWindow` / `FullReplay` starts re-derive their floor from head on
-/// every boot, so there is nothing to rewind.
+/// The rewind applies only where a *durable* cursor is resumed — a
+/// `HeadMinusWindow` start re-derives its floor from head on every boot, so
+/// there is nothing to rewind.
 ///
 /// Two live consumers after the #1238 axis split:
 /// - the settlement watcher ([`crate::payment_settlement`], #751), through

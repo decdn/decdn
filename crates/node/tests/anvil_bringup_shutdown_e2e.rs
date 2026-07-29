@@ -323,7 +323,6 @@ fn build_config(
         blockchain: ResolvedBlockchain {
             origin_assignment_address: None,
             publisher_registry_address: None,
-            origin_directory_from_block: 0,
             rpc_url,
             eth_keystore: keystore_path,
             keystore_password_file: Some(password_file),
@@ -340,9 +339,7 @@ fn build_config(
             settlement_auto_threshold_micro_usdc: None,
             settlement_auto_by_voucher_nonce_span: None,
             slash_judge_address: addrs.slash_judge.to_string(),
-            slash_judge_from_block: 0,
             content_blacklist_address: Some(addrs.content_blacklist.to_string()),
-            content_blacklist_from_block: 0,
             content_blacklist_poll_interval_sec: 600,
             chain_id: CHAIN_ID,
         },

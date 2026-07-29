@@ -59,13 +59,6 @@ content_blacklist_address = "0xd4b2b7CC768c14004dC3400743E2EDB0724355f3"
 # the daemon accepts but ignores this key (node.toml is shared by both binaries).
 slash_appeal_address = "0x0D60c0AbffBb5D612B66DB6bDd0d741BB36072cF"
 
-# Log-replay start heights for the chain watchers. Set to the deploy block so a
-# node restart does not rescan the whole chain (all contracts were deployed in
-# the same broadcast). Absent => 0, which is correct but slow / RPC-heavy.
-origin_directory_from_block  = 11249862
-slash_judge_from_block       = 11249862
-content_blacklist_from_block = 11249862
-
 [cache]
 # MUST-EDIT — blob cache directory and size budget (MB).
 cache_dir     = '/var/cache/decdn'
