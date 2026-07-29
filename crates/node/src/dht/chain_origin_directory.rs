@@ -87,6 +87,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+use alloy::eips::BlockId;
 use alloy::primitives::{Address, U256};
 use alloy::providers::Provider;
 use alloy::rpc::types::{Filter, Log};
@@ -95,10 +96,10 @@ use anyhow::{Context, Result};
 use tracing::{debug, info, warn};
 
 use crate::chain_events::resumable_watcher::{
-    self, Checkpoint, CursorStart, LogSink, WatcherConfig, WatcherHandle,
+    self, CursorStart, LogSink, WatcherConfig, WatcherHandle,
 };
 use crate::chain_events::shared_head::HeadSource;
-use crate::chain_events::{REORG_MARGIN_BLOCKS, backfill_windows, check_backfill_range, timed};
+use crate::chain_events::timed;
 use crate::dht::chain_projection::{ChainProjection, with_read, with_write};
 use crate::dht::origin::OriginDirectory;
 use crate::dht::routing::NodeId;
@@ -107,20 +108,19 @@ use crate::metrics::{Metrics, metric_hook};
 use decdn_common::redact::sanitize_err_chain;
 use decdn_incentive::capacity_bond::CapacityBond;
 use decdn_incentive::origin_assignment::OriginAssignment;
-use decdn_incentive::{CheckpointKey, KeyedCheckpointStore};
 // Event structs imported directly so the topic0 dispatch stays under the 100-col
 // width (the fully-qualified `OriginAssignment::<Event>` paths overflow it).
 use decdn_incentive::origin_assignment::OriginAssignment::{
     AssignmentActivated, AssignmentRevoked, BlacklistedAssignmentPruned,
 };
 
-/// Block-window size for the genesis `AssignmentActivated` log replay, passed as
-/// the `span` to [`backfill_windows`]. Kept well under the common provider
-/// `eth_getLogs` 10k-block cap so bootstrap works on range-limited RPCs without
-/// a per-provider knob. This is a *deliberate* override of the shared
-/// [`crate::chain_events::MAX_BACKFILL_BLOCK_SPAN`] (10k), not drift — the extra
-/// 1k of margin is the point; don't "fix" the divergence by unifying the constant.
-const REPLAY_WINDOW_BLOCKS: u64 = 9_000;
+/// How many namespace ids `bootstrap_cache` reads per `assignedNamespaces` call.
+///
+/// Bounds the returned array so one call cannot exceed a provider's response
+/// limit, the same role the old `eth_getLogs` block window played — but sized
+/// against a result count rather than a block span, which is the thing actually
+/// being limited now. 100 matches the capacity-bond registry's page size.
+const NAMESPACE_PAGE_SIZE: u64 = 100;
 
 /// In-memory projection of the on-chain origin directory. All resolution logic
 /// lives here as pure methods over the maps so it is unit-testable without a
@@ -262,8 +262,6 @@ impl ChainOriginDirectory {
         provider: P,
         origin_assignment_addr: Address,
         capacity_bond_addr: Address,
-        from_block: u64,
-        checkpoint_store: Arc<dyn KeyedCheckpointStore>,
         event_poll_interval: Duration,
         head: Arc<dyn HeadSource>,
         staker_set: Arc<dyn StakerSet>,
@@ -277,24 +275,16 @@ impl ChainOriginDirectory {
             bond: CapacityBond::new(capacity_bond_addr, provider.clone()),
         };
 
-        // Resume the `AssignmentActivated` replay floor from the persisted cursor
-        // (#1108), rewound by `REORG_MARGIN_BLOCKS` and floored at the deploy
-        // block for shallow-reorg safety across restarts (#1238) — a checkpoint
-        // written before a reorg re-enumerates the rewound span rather than
-        // trusting a block that may have been orphaned. A restart rebuilds the
-        // namespace set from there rather than from the deploy block. `None`
-        // (first-ever boot) falls back to `from_block`. A namespace first
-        // activated below the cursor is re-surfaced by its next live event;
-        // membership is always authoritative via `getOrigins`, so no revoke is
-        // ever missed.
-        let replay_from = resume_replay_floor(checkpoint_store.as_ref(), from_block)?;
-        let (cache, snapshot_block) = bootstrap_cache(&contracts, replay_from, &metrics)
+        // Read the namespace set outright. No floor to resolve and no cursor to
+        // resume: the enumeration covers all of history on every boot, so a
+        // namespace assigned while this node was down is present immediately
+        // rather than waiting for its next live event.
+        let (cache, snapshot_block) = bootstrap_cache(&contracts, &metrics)
             .await
             .context("snapshot OriginAssignment at bootstrap")?;
         info!(
             namespaces = cache.origins_of_ns.len(),
             operators = cache.operator_node.len(),
-            replay_from,
             snapshot_block,
             "ChainOriginDirectory bootstrap snapshot complete"
         );
@@ -319,11 +309,10 @@ impl ChainOriginDirectory {
                     AssignmentRevoked::SIGNATURE_HASH,
                     BlacklistedAssignmentPruned::SIGNATURE_HASH,
                 ]),
-            cursor_start(snapshot_block, checkpoint_store),
+            cursor_start(snapshot_block),
             event_poll_interval,
             "origin-directory",
         )
-        .with_from_block(from_block)
         .on_established(metric_hook(
             &metrics,
             Metrics::origin_directory_watcher_cycle_established,
@@ -504,60 +493,18 @@ impl<P: Provider + Clone> OriginSink<P> {
     }
 }
 
-/// The origin watcher's cursor start: **seed** the live tail from the bootstrap
-/// snapshot block and **persist** the [`CheckpointKey::Origin`] cursor forward
-/// each window (#1108). The historical range `[replay_from, snapshot_block]` is
-/// covered by the enumeration `bootstrap` runs before the watcher spawns, so the
-/// watcher does not resolve a floor — it starts at `at` and writes forward.
+/// The origin watcher's cursor start: seed the live tail at the block the
+/// bootstrap enumeration was taken at, and persist nothing.
 ///
-/// The reorg rewind is applied to `replay_from` (the enumeration floor), not
-/// here: this watcher replays from an enumeration rather than the generic
-/// `initial_from` path, so the durable checkpoint is rewound where it is read,
-/// at bootstrap. Because the start no longer carries a `reorg_margin` /
-/// `none_fallback` it never reads, the #1238 dead-field shape is gone — that is
-/// why the split moved persistence (`persist`) apart from floor derivation.
-fn cursor_start(at: u64, store: Arc<dyn KeyedCheckpointStore>) -> CursorStart {
-    CursorStart::Seeded {
-        at,
-        persist: Some(Checkpoint {
-            store,
-            key: CheckpointKey::Origin,
-        }),
-    }
-}
-
-/// The `AssignmentActivated` replay floor for a bootstrap: the persisted
-/// [`CheckpointKey::Origin`] checkpoint rewound `REORG_MARGIN_BLOCKS` for
-/// shallow-reorg safety across restarts (#1238), floored at the deploy block;
-/// `None` (first-ever boot) → the deploy block. Origin resolves this itself
-/// rather than through the watcher's `initial_from` because it replays from an
-/// enumeration, not the generic getLogs floor. Pure so the rewind is
-/// unit-testable without a live provider.
-const fn replay_floor(checkpoint: Option<u64>, from_block: u64) -> u64 {
-    match checkpoint {
-        Some(last) => {
-            let rewound = last.saturating_sub(REORG_MARGIN_BLOCKS);
-            if rewound > from_block {
-                rewound
-            } else {
-                from_block
-            }
-        }
-        None => from_block,
-    }
-}
-
-/// Read the persisted [`CheckpointKey::Origin`] cursor and resolve the bootstrap
-/// replay floor through [`replay_floor`]. A read error propagates (a failed
-/// checkpoint read fails start, unchanged by #1238); a cold store degrades to
-/// the deploy block. Wraps the read + rewind as one seam so `bootstrap`'s wiring
-/// — that the durable cursor actually feeds the rewind — is unit-testable
-/// without a live provider.
-fn resume_replay_floor(store: &dyn KeyedCheckpointStore, from_block: u64) -> Result<u64> {
-    let checkpoint = store
-        .load_checkpoint(CheckpointKey::Origin)
-        .context("read origin-directory scan checkpoint at bootstrap")?;
-    Ok(replay_floor(checkpoint, from_block))
+/// The cursor used to be durable so a restart could resume the historical
+/// `AssignmentActivated` replay part-way. There is no historical replay left to
+/// resume: every boot re-reads the namespace set outright, which covers the
+/// downtime gap by construction and needs no reorg rewind — a checkpoint written
+/// before a reorg was the only reason one was needed. This matches the
+/// capacity-bond registry, whose set is likewise rebuilt from its enumeration
+/// each boot.
+const fn cursor_start(at: u64) -> CursorStart {
+    CursorStart::Seeded { at, persist: None }
 }
 
 impl ChainOriginDirectory {
@@ -594,13 +541,60 @@ where
     with_read(cache, LABEL, f)
 }
 
-/// Snapshot current chain state: replay `AssignmentActivated` to learn the set
-/// of namespaces that have ever been assigned an origin set, then `getOrigins`
-/// each for its authoritative current membership and resolve every operator's
-/// `NodeId`.
+/// Page `assignedNamespaces` at one PINNED block.
+///
+/// Pinning is load-bearing, not tidiness. The on-chain set removes by
+/// swap-and-pop, so between two page reads at different heights a removal can
+/// relocate an unread element into an already-read slot and it is skipped
+/// silently. The count is re-read at the same height and a mismatch aborts the
+/// snapshot rather than seating a partial namespace set — a namespace missing
+/// here means its authorized origins are invisible until its next live event.
+async fn enumerate_namespaces<P>(contracts: &Contracts<P>, at_block: u64) -> Result<HashSet<U256>>
+where
+    P: Provider + Clone,
+{
+    let block = BlockId::Number(at_block.into());
+    let count = contracts
+        .origin
+        .assignedNamespaceCount()
+        .block(block)
+        .call()
+        .await
+        .context("assignedNamespaceCount")?;
+
+    let mut namespaces = HashSet::new();
+    let mut offset = U256::ZERO;
+    let page_size = U256::from(NAMESPACE_PAGE_SIZE);
+    while offset < count {
+        let page = contracts
+            .origin
+            .assignedNamespaces(offset, page_size)
+            .block(block)
+            .call()
+            .await
+            .with_context(|| format!("assignedNamespaces(offset={offset}, limit={page_size})"))?;
+        if page.is_empty() {
+            break;
+        }
+        offset = offset.saturating_add(U256::from(page.len()));
+        namespaces.extend(page);
+    }
+
+    let seen = U256::from(namespaces.len());
+    anyhow::ensure!(
+        seen == count,
+        "namespace enumeration read {seen} of {count} entries at block {at_block}; \
+         the set changed mid-page (swap-and-pop removal), so the snapshot would be \
+         missing a namespace"
+    );
+    Ok(namespaces)
+}
+
+/// Snapshot current chain state: enumerate the namespaces that currently have an
+/// origin set, then `getOrigins` each for its authoritative membership and
+/// resolve every operator's `NodeId`.
 async fn bootstrap_cache<P>(
     contracts: &Contracts<P>,
-    replay_from_block: u64,
     metrics: &Metrics,
 ) -> Result<(DirectoryCache, u64)>
 where
@@ -608,49 +602,20 @@ where
 {
     let mut cache = DirectoryCache::default();
 
-    // 1. Discover the namespace set, via windowed AssignmentActivated log replay
-    //    starting at `replay_from_block`. Operators SHOULD set this to the
-    //    OriginAssignment deployment block (`blockchain.origin_directory_from_block`);
-    //    the default `0` is correct but scans the whole chain history in
-    //    `REPLAY_WINDOW_BLOCKS` windows, which is slow / RPC-heavy on an
-    //    established L2.
-    let latest = contracts
+    // 1. Discover the namespace set by reading it. This used to be a windowed
+    //    `AssignmentActivated` replay from a configured floor — the whole chain
+    //    on a cold store — purely because the key set was not enumerable on
+    //    chain. Membership was always authoritative via `getOrigins`; only
+    //    "which ids exist" had to come from logs. `assignedNamespaces` closes
+    //    that, so there is no historical scan on any boot, warm or cold.
+    let snapshot_block = contracts
         .origin
         .provider()
         .get_block_number()
         .await
-        .context("get_block_number for AssignmentActivated replay")?;
-    // The replay floor resumes from a persisted checkpoint (#1108), so a stale /
-    // lagging RPC head can legitimately sit *behind* it (`replay_from_block >
-    // latest`) — replication lag or a reorg. `backfill_windows` would silently
-    // yield no windows for that inverted range, skipping the replay with no
-    // signal. Do not propagate the error: `bootstrap` is one-shot (no retry) and
-    // a fatal startup crash is strictly worse than graceful degradation. Instead
-    // warn + bump a counter and degrade to an empty snapshot — namespaces are
-    // re-surfaced once the live tail re-emits their assignment events (#1152).
-    let mut namespaces: HashSet<U256> = HashSet::new();
-    if let Err(err) = check_backfill_range(replay_from_block, latest) {
-        warn!(
-            %err, replay_from_block, latest,
-            "origin-directory genesis replay: invalid range; skipping replay this boot \
-             (empty snapshot until assignments re-surface via the live tail)"
-        );
-        metrics.origin_directory_bootstrap_range_anomaly();
-    } else {
-        for (from, to) in backfill_windows(replay_from_block, latest, REPLAY_WINDOW_BLOCKS) {
-            let logs = contracts
-                .origin
-                .AssignmentActivated_filter()
-                .from_block(from)
-                .to_block(to)
-                .query()
-                .await
-                .with_context(|| format!("query AssignmentActivated logs [{from}, {to}]"))?;
-            for (event, _log) in logs {
-                namespaces.insert(event.namespaceId);
-            }
-        }
-    }
+        .context("get_block_number for the OriginAssignment namespace enumeration")?;
+    let namespaces = enumerate_namespaces(contracts, snapshot_block).await?;
+    let latest = snapshot_block;
 
     // 2. namespace → operators, via getOrigins point reads (authoritative
     //    current set; avoids replaying assignment-mutation ordering). A namespace
@@ -1448,99 +1413,25 @@ mod tests {
         );
     }
 
-    /// POLICY PIN: the origin watcher seeds the live tail from its bootstrap
-    /// snapshot block and persists `CheckpointKey::Origin` forward. The historical
-    /// range is covered by the enumeration `bootstrap` runs first; the
-    /// cross-restart reorg rewind lives on `replay_from` (see `replay_floor`),
-    /// not on the seeded start.
+    /// POLICY PIN: the origin watcher seeds the live tail at the block its
+    /// bootstrap enumeration was taken at, and persists NOTHING.
+    ///
+    /// The durable cursor existed to resume a historical `AssignmentActivated`
+    /// replay part-way. There is no replay left to resume — every boot re-reads
+    /// the namespace set — so a checkpoint here would be dead weight that could
+    /// only go stale. A regression that reintroduces one fails this.
     #[test]
-    fn cursor_start_is_seeded_with_origin_persist() {
-        struct NoopCheckpointStore;
-        impl KeyedCheckpointStore for NoopCheckpointStore {
-            fn load_checkpoint(
-                &self,
-                _key: CheckpointKey,
-            ) -> Result<Option<u64>, decdn_incentive::StoreError> {
-                Ok(None)
-            }
-            fn record_checkpoint(
-                &self,
-                _key: CheckpointKey,
-                _block: u64,
-            ) -> Result<(), decdn_incentive::StoreError> {
-                Ok(())
-            }
-        }
-        let store: Arc<dyn KeyedCheckpointStore> = Arc::new(NoopCheckpointStore);
-        assert!(matches!(
-            cursor_start(1234, store),
-            CursorStart::Seeded {
-                at: 1234,
-                persist: Some(Checkpoint {
-                    key: CheckpointKey::Origin,
-                    ..
-                }),
-            }
-        ));
-    }
-
-    /// GUARDRAIL (#1238): a resumed origin boot re-enumerates `REORG_MARGIN_BLOCKS`
-    /// below the persisted cursor so a shallow reorg near the checkpoint cannot
-    /// orphan claims across a restart. Pins that the rewind *engages* — before
-    /// #1238 `replay_from` was the raw checkpoint with no rewind, so this would
-    /// read `10_000`.
-    #[test]
-    fn replay_floor_rewinds_checkpoint_by_reorg_margin() {
-        assert_eq!(
-            replay_floor(Some(10_000), 500),
-            10_000 - REORG_MARGIN_BLOCKS
-        );
-    }
-
-    /// The rewound floor never drops below the deploy block.
-    #[test]
-    fn replay_floor_floored_at_deploy_block() {
-        assert_eq!(replay_floor(Some(REORG_MARGIN_BLOCKS), 500), 500);
-    }
-
-    /// A first-ever boot (cold store) replays from the deploy block.
-    #[test]
-    fn replay_floor_cold_boot_is_deploy_block() {
-        assert_eq!(replay_floor(None, 500), 500);
-    }
-
-    /// GUARDRAIL (#1238) — the *wiring*, not just the arithmetic: `bootstrap`
-    /// resolves its replay floor by reading the persisted `CheckpointKey::Origin`
-    /// cursor and applying the rewind. The `replay_floor_*` tests pin the pure
-    /// math; this pins that the durable read feeds it, so a call site that
-    /// dropped the rewind (the pre-#1238 raw `unwrap_or`) fails here — it would
-    /// read `10_000`, not `10_000 - REORG_MARGIN_BLOCKS`.
-    #[test]
-    fn resume_replay_floor_rewinds_the_persisted_origin_checkpoint() {
-        /// Returns a fixed checkpoint, asserting the `Origin` key is the one read.
-        struct SeededOriginStore(u64);
-        impl KeyedCheckpointStore for SeededOriginStore {
-            fn load_checkpoint(
-                &self,
-                key: CheckpointKey,
-            ) -> Result<Option<u64>, decdn_incentive::StoreError> {
-                assert_eq!(
-                    key,
-                    CheckpointKey::Origin,
-                    "resume must read the Origin cursor"
+    fn cursor_start_seeds_at_the_snapshot_and_persists_nothing() {
+        match cursor_start(4_242) {
+            CursorStart::Seeded { at, persist } => {
+                assert_eq!(at, 4_242, "the tail must start at the enumeration block");
+                assert!(
+                    persist.is_none(),
+                    "the origin watcher must not persist a scan cursor"
                 );
-                Ok(Some(self.0))
             }
-            fn record_checkpoint(
-                &self,
-                _key: CheckpointKey,
-                _block: u64,
-            ) -> Result<(), decdn_incentive::StoreError> {
-                Ok(())
-            }
+            _ => panic!("origin must seed its tail from its enumeration block"),
         }
-        let floor = resume_replay_floor(&SeededOriginStore(10_000), 500).ok();
-        assert_eq!(floor, Some(10_000 - REORG_MARGIN_BLOCKS));
     }
 
     #[test]
