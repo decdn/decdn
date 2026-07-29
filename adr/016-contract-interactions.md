@@ -25,7 +25,7 @@ All on-chain contracts inherit from [OpenZeppelin Contracts](https://docs.openze
 | FeeRouter | [026](026-tokenomics.md#adr-026-tokenomics) | Yes (transient) | USDC (transient; all three buckets transfer same-tx) | `AccessControl`, `ReentrancyGuard`, `Pausable` (three-bucket settlement distributor: 60% operator base / 30% buyback-and-burn / 10% treasury per [ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split); no epoch buckets, no claim windows) |
 | SlashAppeal | [026](026-tokenomics.md#adr-026-tokenomics), [028](028-slashing-appeals.md#adr-028-slashing-appeals-and-dispute-escalation) | Yes (TOKEN appeal bonds only) | TOKEN (appeal bonds) | `AccessControl`, `ReentrancyGuard`, `Pausable` (slash-appeal state machine per [ADR 028](028-slashing-appeals.md#adr-028-slashing-appeals-and-dispute-escalation): `openSlashAppeal` / `fastTrackAppeal` / `rejectAppeal` / `grantAppeal` / `upholdAppeal` / `cleanupExpiredAppeal`; drives `CapacityBond`'s escrow-on-slash settle hooks) |
 | BuybackBurner | [018](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol), [026](026-tokenomics.md#adr-026-tokenomics) | Yes | USDC, TOKEN (transient) | `AccessControl`, `ReentrancyGuard`, `Pausable` (Balancer V3 swap-and-burn path; receives 30% of every settlement) |
-| ContentBlacklist | [011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting) | No | — | `AccessControl`, `ReentrancyGuard` — not `Pausable`, because the unlawful-content-removal duty is permanent and must survive the pause sunset ([§ Emergency Multisig](#emergency-multisig-production)) (full surface: hash-level — global + regional — operator-level — `addOperator` / `removeOperator` — origin-level — `isOriginBlacklisted` / `setOriginBlacklist`) |
+| ContentBlacklist | [011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting) | No | — | `AccessControl`, `ReentrancyGuard` — not `Pausable`, because the unlawful-content-removal duty is permanent and must survive the pause sunset ([§ Emergency Multisig](#emergency-multisig-production)) (full surface: hash-level — global + regional — operator-level — `addOperator` / `removeOperator` — origin-level — `isOriginBlacklisted` / `setOriginBlacklist` — plus the enumeration views `getScopeRegions` / `blacklistedHashCount` / `blacklistedHashes` / `blacklistedAddressCount` / `blacklistedAddresses` that let the compliance layer rebuild blacklist state without replaying takedown events) |
 | PublisherRegistry | [002](002-content-addressing.md#adr-002-content-addressing) | No | — | `AccessControl` (no `ReentrancyGuard`: the contract makes no external calls and holds no funds, so a reentrancy guard would be dead weight — every function is pure storage bookkeeping) |
 | OriginAssignment | [011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting) | No | — | `AccessControl`, `ReentrancyGuard` |
 | SlashJudge | [014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence) | Yes | TOKEN (challenge bonds) | `AccessControl`, `ReentrancyGuard`, `Pausable`, `EIP712` |
@@ -56,10 +56,12 @@ classDiagram
         +registerNode(nodeId, ...)
         +requestUnbond(amount)
         +unbond()
-        +slash()
+        +slash(op, challenger, offenseType, evidenceHash)
         +declaredMbps(op)
         +firstBondedAt(op)
         +slashedAtEpoch(op)
+        +operatorSlashCount(op)
+        +operatorSlashIdAt(op, index)
     }
     class BuybackBurner {
         +executeBuyback(amount, minOut)
@@ -232,7 +234,7 @@ No deCDN contract uses proxy (upgradeable) deployment patterns. Production contr
 
 #### Contract: CapacityBond
 
-`CapacityBond` is the operator-registry contract: voluntary TOKEN bond on the capacity-bond curve, NodeId binding, the `firstBondedAt` / `slashedAtEpoch` reads consumed by `DecdnGovernor`, and the escrow-on-slash settle hooks consumed by `SlashAppeal`. There is no on-chain operator-credit grant/vest surface — slashing applies only to the operator's voluntary bond (`bondOf(op)`), and a granted appeal refunds the escrowed bond liquid. The full surface (`bond`, `requestUnbond`, `unbond`, `declareMbps`, `registerNode`, `deregisterNode`, `slash`, `firstBondedAt`, `bondOf`, `slashedAtEpoch`, `bindNodeId` / `reclaimNodeId`, `isActive`) is covered in [§ Contract Inventory](#contract-inventory), [§ Contract Architecture](#contract-architecture-classdiagram), [§ Cross-Contract Call Graph](#cross-contract-call-graph), and [§ Off-Chain Read API](#off-chain-read-api-client--node-bootstrap).
+`CapacityBond` is the operator-registry contract: voluntary TOKEN bond on the capacity-bond curve, NodeId binding, the `firstBondedAt` / `slashedAtEpoch` reads consumed by `DecdnGovernor`, and the escrow-on-slash settle hooks consumed by `SlashAppeal`. There is no on-chain operator-credit grant/vest surface — slashing applies only to the operator's voluntary bond (`bondOf(op)`), and a granted appeal refunds the escrowed bond liquid. Each `slash` persists a `SlashRecord` — carrying the `offenseType` ([ADR 014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence) offense taxonomy index) and the `evidenceHash` (the `SlashJudge` evidence digest the slash resolved) alongside the escrow bookkeeping — and appends its `slashId` to a per-operator append-only list enumerable via `operatorSlashCount` / `operatorSlashIdAt`. The full surface (`bond`, `requestUnbond`, `unbond`, `declareMbps`, `registerNode`, `deregisterNode`, `slash`, `firstBondedAt`, `bondOf`, `slashedAtEpoch`, `operatorSlashCount`, `operatorSlashIdAt`, `bindNodeId` / `reclaimNodeId`, `isActive`) is covered in [§ Contract Inventory](#contract-inventory), [§ Contract Architecture](#contract-architecture-classdiagram), [§ Cross-Contract Call Graph](#cross-contract-call-graph), and [§ Off-Chain Read API](#off-chain-read-api-client--node-bootstrap).
 
 ### Deployment Order and Initialization Dependencies
 
@@ -401,7 +403,7 @@ graph LR
     OA -->|"ownerOf(namespaceId)"| PR
     OA -->|"isOriginBlacklisted(operator)"| CB
     GOV -->|"activateAssignment(...)"| OA
-    SJ -->|"slash(node, offenseType)"| CBOND
+    SJ -->|"slash(node, offenseType, evidenceHash)"| CBOND
     SJ -->|"safeTransferFrom / safeTransfer"| ERC
     CBOND -->|"safeTransferFrom / safeTransfer"| ERC
     SA -->|"markAppealOpen / settleAppealUpheld / settleAppealGranted"| CBOND
@@ -430,7 +432,7 @@ graph LR
 | OriginAssignment | PublisherRegistry | `ownerOf(namespaceId)` | Public (read-only) | No |
 | OriginAssignment | ContentBlacklist | `isOriginBlacklisted(operator)` | Public (read-only) | No |
 | Governor | OriginAssignment | `activateAssignment(namespaceId)`, `revokeAssignment(namespaceId, operator)`, `setMaxOriginsPerNamespace(cap)`, `setAssignmentTimelock(seconds)`, `setContentBlacklist(address)` | `GOVERNANCE_ROLE` on OriginAssignment | Yes |
-| SlashJudge | CapacityBond | `slash(node, offenseType)` | `SLASH_ROLE` | Yes |
+| SlashJudge | CapacityBond | `slash(node, challenger, offenseType, evidenceHash)` — `SlashJudge` forwards the `SlashJudge`-side evidence digest as `evidenceHash`, which `CapacityBond` persists on the `SlashRecord` alongside `offenseType` | `SLASH_ROLE` | Yes |
 | SlashJudge | IERC20 (TOKEN) | `safeTransferFrom()` / `safeTransfer()` | Caller must have allowance/balance | Yes |
 | CapacityBond | IERC20 (TOKEN) | `safeTransferFrom()` / `safeTransfer()` (escrow refund to operator on a granted appeal, or challenger 50% leg at finality; remaining burn leg via `token.burn`) | Caller must have allowance/balance | Yes |
 | SlashAppeal | CapacityBond | `markAppealOpen(slashId)` (lock escrow), `settleAppealUpheld(slashId)` (distribute 50/50), `settleAppealGranted(slashId)` (refund operator + recompute the multi-slash `slashedAtEpoch` watermark, restoring served-bytes voting weight per [ADR 036 § Slashing zero-out](036-served-bytes-voting-weight.md#slashing-zero-out)) — per [ADR 028 § Contract surface](028-slashing-appeals.md#contract-surface). | `SLASH_APPEAL_ROLE` on CapacityBond | Yes |
@@ -443,6 +445,8 @@ graph LR
 
 The cross-contract call table above covers contract-to-contract interactions only. Off-chain components — clients and nodes — also need a stable set of view functions for cold-start peer discovery and live state inspection. These are specified in detail in the referenced ADRs but were not surfaced here, leaving room for them to be missed during contract scaffolding.
 
+Enumerable state carries a `count()` + paged `getter(offset, limit)` pair so a consumer rebuilds a list from chain state rather than replaying event logs. Pages clamp to the backing length (an `offset` past the end returns an empty page); `CapacityBond.operatorSlashIdAt` instead reverts `SlashIndexOutOfRange` on an out-of-range index, matching its use as a bounded backward walk from `operatorSlashCount`. These are additive view surfaces — no state, event, or write path changes.
+
 | Caller | Callee | Function | Used by | Reference |
 | --- | --- | --- | --- | --- |
 | Off-chain client/node | CapacityBond | `getActiveNodeCount() returns (uint256)` | Bootstrap pagination loop | [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh), [ADR 012](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model), [ADR 019](019-node-onboarding.md#adr-019-node-onboarding-and-bootstrapping-flow) |
@@ -454,6 +458,10 @@ The cross-contract call table above covers contract-to-contract interactions onl
 | Off-chain client/node | CapacityBond | `slashedAtEpoch(address operator) returns (uint64)` | Epoch of this operator's most recent slash; zero if never slashed. `DecdnGovernor._getVotes` reads it for the slash-aware voting-weight zero-out per [ADR 036 § Slashing zero-out](036-served-bytes-voting-weight.md#slashing-zero-out). | [ADR 036 § Slashing zero-out](036-served-bytes-voting-weight.md#slashing-zero-out) |
 | Off-chain client/node | OriginAssignment | `isAuthorizedOrigin(uint256 namespaceId, address operator) returns (bool)` | Probe-time check: is this operator authorized to act as origin for this namespace | [ADR 005](005-protocol.md#adr-005-wire-protocol), [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting) |
 | Off-chain client/node | OriginAssignment | `getOrigins(uint256 namespaceId) returns (address[])` | Discovery: list of authorized origin operators for a namespace; `getOrigins(0)` is empty — namespace 0 has no authorized origins | [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting), [ADR 022](022-content-discovery.md#adr-022--content-discovery-at-scale) |
+| Off-chain client/node | CapacityBond | `operatorSlashCount(address operator) returns (uint256)`, `operatorSlashIdAt(address operator, uint256 index) returns (uint256 slashId)` | Enumerate an operator's slash history (`slashId` → `SlashRecord`) directly from chain state instead of replaying the `Slashed` log tail; `operatorSlashIdAt` reverts `SlashIndexOutOfRange` past the end | [ADR 014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence), [ADR 028](028-slashing-appeals.md#adr-028-slashing-appeals-and-dispute-escalation) |
+| Off-chain client/node | ContentBlacklist | `getScopeRegions(address operator) returns (bytes32[])`, `blacklistedHashCount(bytes32 region) returns (uint256)`, `blacklistedHashes(bytes32 region, uint256 offset, uint256 limit) returns (bytes32[])`, `blacklistedAddressCount() returns (uint256)`, `blacklistedAddresses(uint256 offset, uint256 limit) returns (address[])` | Enumerate blacklist state — an operator's scoped regions, a region's blacklisted hashes, and blacklisted origin addresses — for the compliance layer without replaying takedown events | [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting) |
+| Off-chain client/node | OriginAssignment | `assignedNamespaceCount() returns (uint256)`, `assignedNamespaces(uint256 offset, uint256 limit) returns (uint256[])` | Enumerate every namespace with a live origin assignment from chain state, for discovery indexers that would otherwise replay assignment events | [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting), [ADR 022](022-content-discovery.md#adr-022--content-discovery-at-scale) |
+| Off-chain client/node | PaymentChannel | `providerChannelCount(address provider) returns (uint256)`, `providerChannels(address provider, uint256 offset, uint256 limit) returns (bytes32[])`, `clientChannels(address client, uint256 offset, uint256 limit) returns (bytes32[])` | Enumerate a provider's or client's channel ids from chain state — nodes and clients recover open channels after a restart without replaying `ChannelOpened` logs | [ADR 003](003-payments.md#adr-003-payment-model) |
 
 ##### Bootstrap pattern
 
@@ -514,7 +522,7 @@ flowchart TD
     Operator -->|"bond() + declareMbps(): deposit bond"| CBOND
     CBOND -->|"unbond() after 14d window"| Operator
     Challenger -->|"submitPhantomChallenge() /<br/>submitRateChallenge() /<br/>submitBlacklistChallenge()<br/>bond deposit"| SJ
-    SJ -->|"slash(node, offenseType)<br/>(amount computed internally)"| CBOND
+    SJ -->|"slash(node, offenseType, evidenceHash)<br/>(amount computed internally)"| CBOND
     CBOND -->|"escrow slashed TOKEN (held until finality)"| CBOND
     CBOND -->|"finality: 50% challenger"| Challenger
     CBOND -->|"finality: 50% burn"| BURN
@@ -622,12 +630,12 @@ Every state-mutating function that makes an external call is listed below with i
 | `declareMbps(mbps)` | None | `whenNotPaused`; declared capacity within `[minCapacityMbps, maxCapacityMbps]` (out-of-band reverts); and `activeBond ≥ bondRequired(mbps)` — the bond-curve coupling (reverts `BondBelowCurve`) per [ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve) |
 | `requestUnbond(amount)` | None (state change only) | `nonReentrant`, `whenNotPaused`, checks-effects-interactions (bond balance is finalized first); the post-decrement `activeBond ≥ bondRequired(declaredMbps)` curve check (reverts `BondBelowCurve`); starts the 14-day unbonding window |
 | `unbond()` | `IERC20.safeTransfer()` (TOKEN; reclaims the unbonded amount after a prior `requestUnbond(amount)` once the 14-day window has elapsed) | `nonReentrant`, checks-effects-interactions; the bonded amount remains slashable throughout the unbonding window |
-| `slash(node, offenseType)` | None at slash time — the slashed TOKEN is moved into per-`slashId` escrow (`escrowedTotal`); distribution happens at finality. Stamps `slashedAtEpoch[op] = uint64(block.timestamp / EPOCH_LENGTH)` for the served-bytes voting-weight zero-out per [ADR 036 § Slashing zero-out](036-served-bytes-voting-weight.md#slashing-zero-out). | `nonReentrant`, checks-effects-interactions, `SLASH_ROLE` |
+| `slash(node, challenger, offenseType, evidenceHash)` | None at slash time — the slashed TOKEN is moved into per-`slashId` escrow (`escrowedTotal`); distribution happens at finality. Mints a `SlashRecord` (persisting `offenseType` and the passed-in `evidenceHash`) and appends its `slashId` to the operator's append-only slash list read by `operatorSlashCount` / `operatorSlashIdAt`. Stamps `slashedAtEpoch[op] = uint64(block.timestamp / EPOCH_LENGTH)` for the served-bytes voting-weight zero-out per [ADR 036 § Slashing zero-out](036-served-bytes-voting-weight.md#slashing-zero-out). | `nonReentrant`, checks-effects-interactions, `SLASH_ROLE` |
 | `finalizeUnappealedSlash(slashId)` | `IERC20.safeTransfer()` (50% challenger), `token.burn()` (50%) — after the filing window with no appeal | `nonReentrant`, `whenNotPaused`; permissionless |
 | `markAppealOpen` / `settleAppealUpheld` / `settleAppealGranted` | escrow lock / distribute 50-50 / refund operator + recompute the multi-slash `slashedAtEpoch` watermark | `nonReentrant` (settle paths), `SLASH_APPEAL_ROLE` (held by `SlashAppeal`) |
 | `ejectNode()` | None (state change only; always sets the permanent `blacklistEjected` latch, and sets the `ejected` master gate + node-deactivation effects on the first ejection — a no-op on those if the operator was already ejected) | `BLACKLIST_ROLE` |
 | `unEjectNode()` | None (state change only; clears the `blacklistEjected` latch, idempotent — re-entry follows the normal re-bond path) | `BLACKLIST_ROLE` |
-| `declaredMbps(operator)`, `firstBondedAt(operator)`, `slashedAtEpoch(operator)`, `isActive(operator)` | None (read-only) | N/A |
+| `declaredMbps(operator)`, `firstBondedAt(operator)`, `slashedAtEpoch(operator)`, `isActive(operator)`, `operatorSlashCount(operator)`, `operatorSlashIdAt(operator, index)` | None (read-only) | N/A |
 
 #### SlashJudge
 
