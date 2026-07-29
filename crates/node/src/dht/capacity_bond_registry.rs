@@ -38,7 +38,7 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use alloy::primitives::{Address, U256};
 use alloy::providers::Provider;
@@ -52,6 +52,7 @@ use crate::chain_events::resumable_watcher::{
 };
 use crate::chain_events::shared_head::HeadSource;
 use crate::chain_events::timed;
+use crate::dht::chain_projection::with_write;
 use crate::dht::chain_staker_set::{ChainStakerSet, StakerChange, apply_change};
 use crate::dht::node_address::{
     ChainNodeAddressDirectory, NodeAddressResolver, remove_binding, set_binding,
@@ -106,6 +107,18 @@ pub(crate) trait RegistryChainReads: Send + Sync {
         &self,
         operator: Address,
     ) -> impl Future<Output = Result<Option<(NodeId, bool)>>> + Send;
+
+    /// Re-enumerate both projections from chain state, as the bootstrap does.
+    ///
+    /// This is the self-healing leg. Every other input to these projections is
+    /// an event, and an event can be missed — an orphaned log at the unstable
+    /// tip stays applied because `eth_getLogs` never reports a removal, and a
+    /// tick lost to RPC backoff advances nothing but is not replayed. Neither
+    /// shows up as an error, so without a periodic authoritative re-read the
+    /// only repair for a drifted set is a process restart.
+    fn full_snapshot(
+        &self,
+    ) -> impl Future<Output = Result<(HashSet<NodeId>, HashMap<NodeId, Address>)>> + Send;
 }
 
 /// Production [`RegistryChainReads`] over the live contract.
@@ -114,6 +127,10 @@ struct ContractReads<P: Provider + Clone> {
 }
 
 impl<P: Provider + Clone> RegistryChainReads for ContractReads<P> {
+    async fn full_snapshot(&self) -> Result<(HashSet<NodeId>, HashMap<NodeId, Address>)> {
+        bootstrap_registry(&self.registry).await
+    }
+
     async fn node_id_of(&self, operator: Address) -> Result<Option<(NodeId, bool)>> {
         // Bounded explicitly: `WatcherConfig::rpc_call_timeout` covers only the
         // loop's own `get_logs`, so a sink's follow-up read stays unbounded unless
@@ -144,6 +161,14 @@ pub(crate) struct RegistrySink<R> {
     /// `None` when pull-through is off — see [`RegistryHandles::node_addresses`].
     pub(crate) bindings: Option<Arc<RwLock<HashMap<NodeId, Address>>>>,
     pub(crate) metrics: Arc<Metrics>,
+    /// How often [`RegistryChainReads::full_snapshot`] re-derives both
+    /// projections. Deliberately a constant rather than a config knob: it is a
+    /// correctness backstop, not a tuning surface, and an operator who set it
+    /// wrong would silently lose the only drift repair short of a restart.
+    pub(crate) resync_interval: Duration,
+    /// When the last re-enumeration ran. Seeded to "just ran" at bootstrap,
+    /// since the bootstrap enumeration IS one.
+    pub(crate) last_resync: Option<Instant>,
 }
 
 impl<R: RegistryChainReads> RegistrySink<R> {
@@ -259,7 +284,64 @@ impl<R: RegistryChainReads> LogSink for RegistrySink<R> {
         }
         Ok(())
     }
+
+    /// Cadence-gated re-enumeration: rebuild both projections from chain state
+    /// and swap them in.
+    ///
+    /// Build-then-swap, never clear-then-fill: the new sets are fully
+    /// materialized before either lock is taken for writing, so a failed read
+    /// leaves the previous projections intact rather than emptying them. An
+    /// empty staker set would make the node treat every peer as unstaked.
+    ///
+    /// Returns `Ok` on failure. The event tail is the primary path and is still
+    /// working; backing the whole watcher off would also stall event pickup,
+    /// trading a stale set for no updates at all.
+    async fn on_tick_complete(&mut self) -> Result<()> {
+        let now = Instant::now();
+        if self
+            .last_resync
+            .is_some_and(|last| now.duration_since(last) < self.resync_interval)
+        {
+            return Ok(());
+        }
+        // Stamp before the call, not only on success, so a persistently failing
+        // read retries on the resync cadence rather than on every watcher tick.
+        self.last_resync = Some(now);
+
+        let (active, bindings) = match self.reads.full_snapshot().await {
+            Ok(snapshot) => snapshot,
+            Err(err) => {
+                warn!(%err, "capacity-bond registry resync failed; keeping current projections");
+                return Ok(());
+            }
+        };
+
+        let active_len = active.len();
+        let binding_len = bindings.len();
+        with_write(&self.active, "chain staker set", |set| *set = active);
+        self.metrics.staker_set_active_count(active_len);
+        if let Some(slot) = &self.bindings {
+            with_write(slot, "chain node-address directory", |map| *map = bindings);
+            self.metrics.node_address_directory_size(binding_len);
+        }
+        debug!(
+            active_count = active_len,
+            binding_count = binding_len,
+            "capacity-bond registry resynced from chain"
+        );
+        Ok(())
+    }
 }
+
+/// How often the watcher re-derives both projections from `getActiveNodes`.
+///
+/// Fifteen minutes is well under any plausible drift-detection window and costs
+/// one paginated read plus an `isActive` per registered operator — on a network
+/// of tens of nodes, a handful of calls per quarter hour. Deliberately a
+/// constant, not a config knob: it is a correctness backstop rather than a
+/// tuning surface, and an operator who set it wrong (or to zero) would silently
+/// lose the only repair for a drifted set short of a process restart.
+const REGISTRY_RESYNC_INTERVAL: Duration = Duration::from_mins(15);
 
 /// One paginated `getActiveNodes` read feeding both projections.
 ///
@@ -360,6 +442,10 @@ where
         active: Arc::clone(&active),
         bindings: bindings.clone(),
         metrics: Arc::clone(&metrics),
+        resync_interval: REGISTRY_RESYNC_INTERVAL,
+        // The bootstrap enumeration just ran, so the first backstop resync is
+        // due one interval from now rather than on the first tick.
+        last_resync: Some(Instant::now()),
     };
     let cfg = WatcherConfig::new(
         head,
@@ -446,12 +532,43 @@ mod tests {
     }
 
     /// Scripted [`RegistryChainReads`]: no provider, no chain.
-    struct StubReads(std::result::Result<Option<(NodeId, bool)>, &'static str>);
+    struct StubReads {
+        node_id: std::result::Result<Option<(NodeId, bool)>, &'static str>,
+        /// What `full_snapshot` returns; `Err` models an unreadable chain.
+        snapshot: std::result::Result<(HashSet<NodeId>, HashMap<NodeId, Address>), &'static str>,
+    }
+
+    impl StubReads {
+        fn new(node_id: std::result::Result<Option<(NodeId, bool)>, &'static str>) -> Self {
+            Self {
+                node_id,
+                snapshot: Ok((HashSet::new(), HashMap::new())),
+            }
+        }
+
+        fn with_snapshot(
+            mut self,
+            snapshot: std::result::Result<
+                (HashSet<NodeId>, HashMap<NodeId, Address>),
+                &'static str,
+            >,
+        ) -> Self {
+            self.snapshot = snapshot;
+            self
+        }
+    }
 
     impl RegistryChainReads for StubReads {
         async fn node_id_of(&self, _operator: Address) -> Result<Option<(NodeId, bool)>> {
-            match &self.0 {
+            match &self.node_id {
                 Ok(v) => Ok(*v),
+                Err(msg) => Err(anyhow::anyhow!(*msg)),
+            }
+        }
+
+        async fn full_snapshot(&self) -> Result<(HashSet<NodeId>, HashMap<NodeId, Address>)> {
+            match &self.snapshot {
+                Ok(v) => Ok(v.clone()),
                 Err(msg) => Err(anyhow::anyhow!(*msg)),
             }
         }
@@ -476,12 +593,14 @@ mod tests {
             active: Arc::clone(&active),
             bindings: bindings.clone(),
             metrics: Arc::clone(&metrics),
+            resync_interval: REGISTRY_RESYNC_INTERVAL,
+            last_resync: Some(Instant::now()),
         };
         (s, active, bindings, metrics)
     }
 
     fn ok_reads() -> StubReads {
-        StubReads(Ok(None))
+        StubReads::new(Ok(None))
     }
 
     fn is_active(active: &Arc<RwLock<HashSet<NodeId>>>, id: NodeId) -> bool {
@@ -597,7 +716,7 @@ mod tests {
     /// binding.
     #[tokio::test]
     async fn reinstated_resolves_via_node_id_of_and_leaves_bindings_untouched() {
-        let (mut s, active, bindings, _m) = sink(StubReads(Ok(Some((nid(1), true)))), true);
+        let (mut s, active, bindings, _m) = sink(StubReads::new(Ok(Some((nid(1), true)))), true);
         let _ = s.apply(registered_log(nid(1), addr(9))).await;
         let _ = s.apply(auto_ejected_log(nid(1))).await;
 
@@ -613,7 +732,7 @@ mod tests {
     #[tokio::test]
     async fn node_id_of_disagreeing_with_the_event_wins() {
         // `Reinstated` implies active, but nodeIdOf says otherwise.
-        let (mut s, active, _b, _m) = sink(StubReads(Ok(Some((nid(1), false)))), true);
+        let (mut s, active, _b, _m) = sink(StubReads::new(Ok(Some((nid(1), false)))), true);
         let _ = s.apply(registered_log(nid(1), addr(9))).await;
 
         let r = s.apply(reinstated_log(addr(9))).await;
@@ -627,7 +746,7 @@ mod tests {
     /// shared, would stall the bindings projection too).
     #[tokio::test]
     async fn node_id_of_failure_bumps_resolve_failure_and_returns_ok() {
-        let (mut s, _a, _b, metrics) = sink(StubReads(Err("rpc down")), true);
+        let (mut s, _a, _b, metrics) = sink(StubReads::new(Err("rpc down")), true);
 
         let r = s.apply(reinstated_log(addr(9))).await;
 
@@ -643,7 +762,7 @@ mod tests {
     /// An unbound operator (`bytes32(0)`) is ignored: binding precedes activation.
     #[tokio::test]
     async fn unbound_operator_event_is_ignored() {
-        let (mut s, active, _b, _m) = sink(StubReads(Ok(None)), true);
+        let (mut s, active, _b, _m) = sink(StubReads::new(Ok(None)), true);
 
         let r = s.apply(reinstated_log(addr(9))).await;
 
@@ -692,6 +811,93 @@ mod tests {
             text.lines()
                 .any(|l| l == "decdn_staker_set_watcher_restarts_total 2"),
             "established() must close the drift window so a later backoff re-arms:\n{text}"
+        );
+    }
+
+    // ── Periodic re-enumeration ─────────────────────────────────────────────
+    //
+    // The self-healing leg. Every other input to these projections is an event,
+    // and a missed or orphaned event never surfaces as an error — so without
+    // this, a drifted set is only repaired by restarting the process.
+
+    fn snapshot_of(ids: &[u8], addrs: &[u8]) -> (HashSet<NodeId>, HashMap<NodeId, Address>) {
+        let active: HashSet<NodeId> = ids.iter().map(|b| nid(*b)).collect();
+        let bindings: HashMap<NodeId, Address> =
+            addrs.iter().map(|b| (nid(*b), addr(*b))).collect();
+        (active, bindings)
+    }
+
+    /// A due resync replaces both projections wholesale, so an entry the event
+    /// tail dropped comes back and one it wrongly added goes away.
+    #[tokio::test]
+    async fn resync_replaces_both_projections() {
+        let reads = StubReads::new(Ok(None)).with_snapshot(Ok(snapshot_of(&[2, 3], &[2, 3])));
+        let (mut sink, active, bindings, _m) = sink(reads, true);
+
+        // Seed a stale view: 1 is gone from chain, 2 is missing locally.
+        with_write(&active, "t", |set| {
+            set.insert(nid(1));
+        });
+        sink.last_resync = None; // force the resync on this tick
+
+        sink.on_tick_complete().await.unwrap();
+
+        let got = active.read().unwrap().clone();
+        assert_eq!(
+            got,
+            snapshot_of(&[2, 3], &[]).0,
+            "stale entry dropped, missing one restored"
+        );
+        let b = bindings.unwrap();
+        assert_eq!(b.read().unwrap().len(), 2, "bindings are replaced too");
+    }
+
+    /// A failed read must leave the previous projections intact. Emptying the
+    /// staker set would make the node treat every peer as unstaked.
+    #[tokio::test]
+    async fn resync_failure_keeps_the_previous_projections() {
+        let reads = StubReads::new(Ok(None)).with_snapshot(Err("rpc down"));
+        let (mut sink, active, _bindings, _m) = sink(reads, true);
+        with_write(&active, "t", |set| {
+            set.insert(nid(1));
+        });
+        sink.last_resync = None;
+
+        sink.on_tick_complete().await.unwrap();
+
+        assert!(
+            active.read().unwrap().contains(&nid(1)),
+            "a failed resync must not clear the set"
+        );
+    }
+
+    /// Not-yet-due ticks must not re-read: the watcher ticks every few seconds,
+    /// so an ungated resync would hammer the RPC with a paginated enumeration.
+    #[tokio::test]
+    async fn resync_is_cadence_gated() {
+        let reads = StubReads::new(Ok(None)).with_snapshot(Ok(snapshot_of(&[9], &[9])));
+        let (mut sink, active, _bindings, _m) = sink(reads, true);
+        // `sink()` stamps `last_resync` to now, so nothing is due yet.
+        sink.on_tick_complete().await.unwrap();
+        assert!(
+            active.read().unwrap().is_empty(),
+            "a resync ran despite not being due"
+        );
+    }
+
+    /// A failing read still stamps the clock, so retries follow the resync
+    /// cadence rather than the (seconds-scale) watcher tick.
+    #[tokio::test]
+    async fn failed_resync_still_stamps_the_clock() {
+        let reads = StubReads::new(Ok(None)).with_snapshot(Err("rpc down"));
+        let (mut sink, _active, _bindings, _m) = sink(reads, true);
+        sink.last_resync = None;
+
+        sink.on_tick_complete().await.unwrap();
+
+        assert!(
+            sink.last_resync.is_some(),
+            "a failed resync must still stamp, or it retries every tick"
         );
     }
 }

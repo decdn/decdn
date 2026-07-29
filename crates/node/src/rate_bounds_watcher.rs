@@ -9,10 +9,11 @@
 //! 1h). Both paths `store` into the shared [`RateBounds`], so a governance
 //! retune reaches the running probe/client handlers without a restart.
 //!
-//! The sink is read-only and holds no durable cursor: a bounded recent
-//! lookback (`CursorStart::HeadMinusWindow`) is sufficient because the startup
-//! read already established the authoritative baseline, and the periodic
-//! re-read reconciles anything the event tail missed.
+//! The sink is read-only and holds no durable cursor, and it scans no history:
+//! the tail starts AT head. There is nothing for a lookback to recover — the
+//! startup `getRateBounds()` read is authoritative and already reflects every
+//! event ever emitted, so re-scanning blocks below it can only re-derive a value
+//! the node already holds. The hourly re-read covers anything the tail drops.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -24,7 +25,6 @@ use alloy::sol_types::SolEvent;
 use anyhow::Result;
 use decdn_incentive::payment_channel::PaymentChannel;
 
-use crate::chain_events::MAX_BACKFILL_BLOCK_SPAN;
 use crate::chain_events::resumable_watcher::{
     self, CursorStart, LogSink, WatcherConfig, WatcherHandle,
 };
@@ -167,12 +167,12 @@ where
         Filter::new()
             .address(payment_channel_addr)
             .event_signature(PaymentChannel::RateBoundsUpdated::SIGNATURE_HASH),
-        // Bounded recent lookback each boot; the startup getRateBounds() read is
-        // the authoritative baseline, and the periodic re-read reconciles the
-        // tail. No durable cursor needed.
-        CursorStart::HeadMinusWindow {
-            window_blocks: MAX_BACKFILL_BLOCK_SPAN,
-        },
+        // Start the tail at head — no historical scan at all. `window_blocks: 0`
+        // resolves to head exactly. The startup `getRateBounds()` read is the
+        // authoritative baseline and already folds in every past event, so a
+        // lookback would re-derive a value the node holds; the hourly re-read is
+        // the backstop for anything the tail drops. No durable cursor needed.
+        CursorStart::HeadMinusWindow { window_blocks: 0 },
         event_poll_interval.max(Duration::from_secs(1)),
         "rate-bounds",
     )
