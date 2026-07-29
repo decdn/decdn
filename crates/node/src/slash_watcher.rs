@@ -13,10 +13,11 @@
 //!   the authoritative `CapacityBond.operatorSlash*` enumeration (ADR 019), not
 //!   by re-scanning the `Slashed` log tail from a block floor (#1108). Walking
 //!   the append-only index backwards and stopping at the first closed record
-//!   reads only the still-appealable tail, and every field — offense, evidence,
-//!   and the pause-aware `appealWindowClose` — comes straight off the record.
-//!   Fatal on failure, like the registry bootstrap on the same contract that
-//!   already gates startup: an RPC that fails here fails there first.
+//!   reads only the still-appealable tail. Offense and evidence come straight off
+//!   the record; the enforced deadline is the record's base `appealWindowClose`
+//!   plus the global `pausedTotal`, both read at the same snapshot. Fatal on
+//!   failure, like the registry bootstrap on the same contract that already gates
+//!   startup: an RPC that fails here fails there first.
 //! - **Follow `SlashRecorded` at head.** `SlashRecorded` indexes `operator` as
 //!   `topic2`, so every `eth_getLogs` window constrains on it — a node never
 //!   decodes other operators' slashes — and the tail is seeded at the
@@ -81,10 +82,10 @@ pub struct DetectedSlash {
     /// on the tail, `None` for one recovered by the boot/resync enumeration
     /// (which reads records, not logs).
     pub block_number: Option<u64>,
-    /// **Authoritative** appeal-window close, read from `getSlashRecord`
-    /// (`appealWindowClose`): it carries protocol-pause extensions, which a
-    /// deadline derived from a log's block timestamp does not. Always `Some` now
-    /// the deadline comes off the record rather than a best-effort block read.
+    /// **Effective** appeal-window close the contract enforces: the record's base
+    /// `appealWindowClose` plus the global `pausedTotal` snapshot, so protocol-pause
+    /// extensions are reflected. Always `Some` now the deadline comes off the
+    /// record rather than a best-effort block read.
     pub appeal_window_close: Option<u64>,
 }
 
@@ -104,8 +105,9 @@ struct SlashRecordView {
     amount: U256,
     /// `keccak256` evidence digest.
     evidence_hash: B256,
-    /// **Authoritative** appeal-window close: carries protocol-pause extensions,
-    /// unlike a deadline derived from a log's block timestamp.
+    /// **Base** appeal-window close (`slashedAt + 30d`), fixed at mint. The
+    /// deadline the contract enforces adds the global `pausedTotal`; callers must
+    /// fold that in (see [`bootstrap_slashes`]).
     appeal_window_close: u64,
 }
 
@@ -133,6 +135,9 @@ trait SlashChainReads: Send + Sync {
         &self,
         slash_id: U256,
     ) -> impl Future<Output = Result<SlashRecordView>> + Send;
+    /// The global `pausedTotal` offset added to every record's base
+    /// `appealWindowClose` to get the deadline the contract enforces.
+    fn paused_total(&self) -> impl Future<Output = Result<u64>> + Send;
 }
 
 /// Enumerate this operator's still-appealable slashes from the authoritative
@@ -152,13 +157,20 @@ async fn bootstrap_slashes<R: SlashChainReads>(
     now_secs: u64,
 ) -> Result<Vec<DetectedSlash>> {
     let count = reads.operator_slash_count(operator).await?;
+    // The enforced deadline is the record's base `appealWindowClose` plus this
+    // global offset; read once at the same snapshot. It only ever grows and
+    // applies uniformly, so base-close ordering equals effective-close ordering
+    // and the backward-walk early-stop below stays valid.
+    let paused_total = reads.paused_total().await?;
     let mut out = Vec::new();
     let mut index = count;
     while index > U256::ZERO {
         index -= U256::from(1u8);
         let slash_id = reads.operator_slash_id_at(operator, index).await?;
         let record = reads.get_slash_record(slash_id).await?;
-        if record.appeal_window_close <= now_secs {
+        // The deadline the contract enforces (`SlashEscrowLib`): base + pause.
+        let effective_close = record.appeal_window_close.saturating_add(paused_total);
+        if effective_close <= now_secs {
             // Appended in `slashedAt` order, so every older record is closed too.
             break;
         }
@@ -167,10 +179,10 @@ async fn bootstrap_slashes<R: SlashChainReads>(
             offense_type: record.offense_type,
             amount: record.amount,
             evidence_hash: record.evidence_hash,
-            // No log is read on this path; the record carries the authoritative
-            // deadline rather than a block-timestamp derivation.
+            // No log is read on this path; the deadline is the pause-extended one
+            // the contract enforces, not a block-timestamp derivation.
             block_number: None,
-            appeal_window_close: Some(record.appeal_window_close),
+            appeal_window_close: Some(effective_close),
         });
     }
     Ok(out)
@@ -212,6 +224,10 @@ impl<P: Provider + Clone> SlashChainReads for ContractReads<P> {
             evidence_hash: record.evidenceHash,
             appeal_window_close: record.appealWindowClose,
         })
+    }
+
+    async fn paused_total(&self) -> Result<u64> {
+        self.bond.pausedTotal().call().await.context("pausedTotal")
     }
 }
 
@@ -460,6 +476,8 @@ async fn record_recorded_log<R: SlashChainReads>(
     let Some(slash_id) = decode_recorded(self_address, log) else {
         return;
     };
+    // Read the record and the global pause offset together; a failure on either
+    // soft-skips (the resync recovers it) rather than recording a wrong deadline.
     let record = match reads.get_slash_record(slash_id).await {
         Ok(record) => record,
         Err(err) => {
@@ -467,6 +485,17 @@ async fn record_recorded_log<R: SlashChainReads>(
                 err = %sanitize_err_chain(&err),
                 slash_id = %slash_id,
                 "failed to read slash record for a live SlashRecorded log; the resync will recover it"
+            );
+            return;
+        }
+    };
+    let paused_total = match reads.paused_total().await {
+        Ok(paused_total) => paused_total,
+        Err(err) => {
+            warn!(
+                err = %sanitize_err_chain(&err),
+                slash_id = %slash_id,
+                "failed to read pausedTotal for a live SlashRecorded log; the resync will recover it"
             );
             return;
         }
@@ -480,7 +509,8 @@ async fn record_recorded_log<R: SlashChainReads>(
             amount: record.amount,
             evidence_hash: record.evidence_hash,
             block_number: log.block_number,
-            appeal_window_close: Some(record.appeal_window_close),
+            // The deadline the contract enforces: base close + global pause offset.
+            appeal_window_close: Some(record.appeal_window_close.saturating_add(paused_total)),
         },
     );
 }
@@ -603,6 +633,8 @@ mod tests {
         operator: Address,
         /// (slashId, record) in append order (index 0 = oldest).
         slashes: Vec<(U256, SlashRecordView)>,
+        /// Global `CapacityBond.pausedTotal` the enumeration adds to each base close.
+        paused_total: u64,
         /// slashIds whose record was point-read, for the early-stop assertion.
         reads: std::sync::Mutex<Vec<U256>>,
     }
@@ -612,8 +644,14 @@ mod tests {
             Self {
                 operator,
                 slashes,
+                paused_total: 0,
                 reads: std::sync::Mutex::new(Vec::new()),
             }
+        }
+
+        fn with_paused_total(mut self, paused_total: u64) -> Self {
+            self.paused_total = paused_total;
+            self
         }
 
         fn records_read(&self) -> Vec<U256> {
@@ -643,6 +681,10 @@ mod tests {
                 .find(|(id, _)| *id == slash_id)
                 .map(|(_, rec)| rec.clone())
                 .ok_or_else(|| anyhow::anyhow!("no such slash"))
+        }
+
+        async fn paused_total(&self) -> Result<u64> {
+            Ok(self.paused_total)
         }
     }
 
@@ -715,6 +757,39 @@ mod tests {
             reads.records_read(),
             vec![U256::from(3u64), U256::from(2u64)]
         );
+    }
+
+    /// The enforced deadline is the base `appealWindowClose` plus the global
+    /// `pausedTotal`. A slash whose base window has closed but whose pause-extended
+    /// window is still open MUST stay visible — and the backward walk must not stop
+    /// early on it and hide older still-appealable slashes.
+    #[tokio::test]
+    async fn bootstrap_slashes_honors_the_pause_extended_deadline() {
+        let op = Address::repeat_byte(0x5A);
+        let now = 1_000;
+        // Every base window has already closed (all <= now)…
+        let reads = StubSlashReads::new(
+            op,
+            vec![
+                (U256::from(10u64), record(0, 1, 0x10, now - 50)),
+                (U256::from(20u64), record(0, 1, 0x20, now - 10)),
+                (U256::from(30u64), record(0, 1, 0x30, now - 5)),
+            ],
+        )
+        // …but a 100s protocol pause moves every effective deadline past `now`.
+        .with_paused_total(100);
+
+        let slashes = bootstrap_slashes(&reads, op, now).await.unwrap();
+
+        assert_eq!(
+            slashes.len(),
+            3,
+            "all three are still appealable once pausedTotal is added; ignoring it \
+             would surface none (base windows closed) and stop the walk early"
+        );
+        // The surfaced deadline is the pause-extended one the contract enforces.
+        assert_eq!(slashes[0].appeal_window_close, Some(now + 95)); // 30: (now-5)+100
+        assert_eq!(slashes[2].appeal_window_close, Some(now + 50)); // 10: (now-50)+100
     }
 
     /// An operator with no slashes enumerates to an empty set without error.
