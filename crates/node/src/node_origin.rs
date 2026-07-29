@@ -1175,9 +1175,11 @@ async fn probe_candidate(
         // Drives the geo-diversity tie-break tier (selection.rs) and the
         // latency-vs-claim penalty above.
         region,
-        // No on-chain stake lookup is wired yet (#1470 / ADR 019): `0` is the
-        // known-no-bond value, and a future lookup must resolve a failed read
-        // here rather than pass an "unknown" through — see `Candidate::stake`.
+        // No on-chain stake lookup is wired yet (#1470 / ADR 019). `0` is a
+        // placeholder here, not an observation — which is exactly why tier 2 is
+        // a uniform no-op until the lookup lands. When it does, a failed read
+        // must be resolved here (retry, or drop the candidate) rather than
+        // passed through as `0`; see `Candidate::stake`.
         stake: 0,
     })
 }

@@ -164,10 +164,40 @@ pub const DEFAULT_FS_RESCAN_INTERVAL_SEC: u64 = 60;
 /// Default for `cache.prewarm` (#1130): **off**. Prewarm speculatively pulls the
 /// pin set from a remote origin, and those bytes are billed egress whether or not
 /// anyone ever requests them — a cost no operator should incur by upgrading. An
-/// `fs` origin ignores the flag either way (its content is already local), so
+/// fs-only chain ignores the flag either way (its content is already local), so
 /// defaulting on would silently add a bill for exactly the remote-origin
 /// operators it does affect.
 pub const DEFAULT_PREWARM: bool = false;
+
+/// Whether `cache.prewarm` should actually run for this origin chain (#1130).
+///
+/// The flag alone is not enough: prewarm imports origin content into the cache
+/// store, which for a `Filesystem` origin means a second copy of the same bytes
+/// on the same disk for no benefit — that content is already local and is
+/// advertised through the origin-held index. So prewarm applies only when the
+/// chain contains at least one **remote** origin, and the flag is the operator's
+/// consent to pay that origin's egress up front. An empty chain has nothing to
+/// warm from and is likewise `false`.
+///
+/// A mixed chain warms, with a caveat worth stating: the fill walks the chain in
+/// order and stops at the first origin holding the hash, so an fs entry ahead of
+/// a remote one is preferred and costs no *egress* — but the fill still imports
+/// those bytes into the store, a second copy on the same disk. The fs-only skip
+/// avoids that entirely; a mixed chain trades it for warming the pins only the
+/// remote origin has.
+///
+/// Lives here rather than in `decdn-node` so `decdn config validate` can report
+/// an *inert* `prewarm = true` — set, but with no remote origin to warm from —
+/// instead of echoing the raw flag back at an operator whose node will silently
+/// never warm.
+#[must_use]
+pub fn prewarm_enabled_for(cache: &crate::config::ResolvedCache) -> bool {
+    cache.prewarm
+        && cache
+            .origins
+            .iter()
+            .any(|o| !matches!(o, crate::config::resolved::ResolvedOrigin::Fs { .. }))
+}
 
 /// Default LRU eviction driver high-water percent of `cache.cache_size_mb`
 /// (#1173, appendix-blob-cache-eviction.md § Trigger and target). Above this

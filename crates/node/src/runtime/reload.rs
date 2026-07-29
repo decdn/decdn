@@ -389,6 +389,13 @@ struct PinnedHashesSection {
     /// is authoritative and a reload cannot turn prewarm on or off — only warm
     /// the pins a reload adds, when it was already on.
     prewarm: bool,
+    /// `cache.cache_size_mb` at boot, for the reload-time pin-budget re-check.
+    /// Restart-required like `prewarm`, so the boot value stays authoritative.
+    cache_size_mb: u64,
+    /// Held for the duration of a detached rescan/warm so overlapping reloads
+    /// cannot stack them. A `tokio::sync::Mutex` (not `std`) because it is held
+    /// across awaits.
+    warm_in_flight: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl ReloadableSection for PinnedHashesSection {
@@ -433,9 +440,33 @@ impl ReloadableSection for PinnedHashesSection {
                 // than only at the next periodic rescan (#1130). Detached so we
                 // honor reload()'s no-await invariant; rescan is idempotent.
                 let engine = engine.clone();
-                let prewarm = self.prewarm;
+                // Warm only when this reload actually added a pin. `infallible_swap`
+                // runs for every section on every reload, so without this gate a
+                // config-management loop that SIGHUPs on a timer would start an
+                // overlapping full-pin-set warm each tick. Origin egress is safe
+                // under overlap (the engine coalesces in-flight fills), but
+                // `rescan_origins` issues one HEAD per pinned hash and is NOT
+                // coalesced, so N overlapping passes cost N x pin-set HEADs.
+                let warm = self.prewarm && diff.added > 0;
+                let single_flight = Arc::clone(&self.warm_in_flight);
+                let cache_size_mb = self.cache_size_mb;
                 tokio::spawn(async move {
+                    // At most one reload warm at a time. `try_lock` rather than
+                    // `lock`: a second reload arriving mid-warm wants the *newer*
+                    // pin set warmed, and the in-flight pass already re-reads the
+                    // live set, so queueing would only duplicate work.
+                    let Ok(_guard) = single_flight.try_lock() else {
+                        tracing::debug!(
+                            "pinned_hashes reload: an origin rescan/warm is already in \
+                             flight; skipping this one (it re-reads the live pin set)"
+                        );
+                        return;
+                    };
                     engine.rescan_origins().await;
+                    // Re-check the pin budget here too, not just at boot: a reload
+                    // is the one moment the pin set can grow past the cache
+                    // ceiling on a running node.
+                    super::warn_if_pins_exceed_cache(&engine, cache_size_mb);
                     // Then warm anything this reload pinned that isn't resident
                     // (#1130) — this is what makes a pin added at runtime
                     // effective without a restart. Passing the whole pin set
@@ -444,7 +475,7 @@ impl ReloadableSection for PinnedHashesSection {
                     // already in the store, so the extra work is one local
                     // presence check per pin, and in exchange a pin that was
                     // warmed earlier but has since been lost gets repaired.
-                    if prewarm {
+                    if warm {
                         let report = engine.prewarm_pinned().await;
                         tracing::info!(
                             fetched = report.fetched,
@@ -722,7 +753,9 @@ impl RuntimeReloadState {
         let pinned = Arc::new(PinnedHashesSection {
             engine: std::sync::Mutex::new(None),
             buf: std::sync::Mutex::new(None),
-            prewarm: super::prewarm_enabled_for(&initial.cache),
+            prewarm: decdn_common::config::prewarm_enabled_for(&initial.cache),
+            cache_size_mb: initial.cache.cache_size_mb,
+            warm_in_flight: Arc::new(tokio::sync::Mutex::new(())),
         });
         let security = Arc::new(SecuritySection {
             limiter: std::sync::Mutex::new(None),
@@ -2684,6 +2717,71 @@ mod tests {
             ..CacheConfig::default()
         };
         assert!(cache_has_restart_required_field(&with_dir));
+        // `prewarm` specifically (#1130). The exhaustive destructure makes
+        // *adding* a field a compile error, but not deleting a clause from the
+        // `||` chain — and dropping this one is a silent no-op for the operator:
+        // they set `prewarm = true`, SIGHUP, get no "requires restart" notice,
+        // and the section's boot-fixed flag stays `false` for the process
+        // lifetime.
+        let with_prewarm = CacheConfig {
+            prewarm: Some(true),
+            ..CacheConfig::default()
+        };
+        assert!(cache_has_restart_required_field(&with_prewarm));
+    }
+
+    /// `PinnedHashesSection.prewarm` is fixed at boot from the resolved config
+    /// and gates every reload-time warm. Nothing else observes it, so a wiring
+    /// mistake here is silent: runtime-added pins would simply never warm, with
+    /// an absent log line as the only symptom.
+    #[test]
+    fn pinned_section_takes_its_prewarm_flag_from_the_boot_config() {
+        use decdn_common::config::resolved::ResolvedOrigin;
+
+        let section_prewarm = |prewarm: bool, origins: Vec<ResolvedOrigin>| {
+            let mut initial = seed_resolved(10, LogLevel::Info);
+            initial.cache.prewarm = prewarm;
+            initial.cache.origins = origins;
+            let (setter, _captured) = recording_setter();
+            let state = RuntimeReloadState::new(
+                PaymentArgs {
+                    rate_per_mb: None,
+                    delivery_floor: None,
+                },
+                ObservabilityArgs {
+                    log_level: None,
+                    log_format: None,
+                    metrics_port: None,
+                    metrics_bind: None,
+                    admin_port: None,
+                    otlp_endpoint: None,
+                },
+                &initial,
+                setter,
+            );
+            state.pinned.prewarm
+        };
+
+        let http = || ResolvedOrigin::Http {
+            url: decdn_cache::parse_origin_url("https://origin.example/").expect("url"),
+            decompress: decdn_cache::DecompressMode::Auto,
+        };
+        let fs = || ResolvedOrigin::Fs {
+            path: PathBuf::from("/srv/origin"),
+        };
+
+        assert!(
+            section_prewarm(true, vec![http()]),
+            "prewarm on with a remote origin must arm the reload warm"
+        );
+        assert!(
+            !section_prewarm(false, vec![http()]),
+            "prewarm off must disarm it even with a remote origin"
+        );
+        assert!(
+            !section_prewarm(true, vec![fs()]),
+            "an fs-only chain is inert, so the reload warm must stay disarmed"
+        );
     }
 
     /// The `[observability]` restart notice is gated on a *non-reloadable*

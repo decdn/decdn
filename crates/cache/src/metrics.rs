@@ -299,25 +299,51 @@ pub struct CacheMetrics {
     /// Field name omits `_total`: the emitted name is
     /// `decdn_cache_prewarm_blobs_total`.
     pub prewarm_blobs: Counter,
-    /// Bytes pulled from a remote origin by prewarm
-    /// (`decdn_cache_prewarm_bytes_total`), summed from the post-fetch store
-    /// size of each prewarmed blob. This is paid origin egress the node
-    /// incurred *before* any client asked — the reason prewarm is opt-in.
-    /// Included in `pull_through_bytes`, which counts every origin byte
-    /// regardless of what triggered the pull; this counter is the prewarm
-    /// share of it.
+    /// Size of the blobs prewarm pulled (`decdn_cache_prewarm_bytes_total`),
+    /// summed from the post-fetch **store** size of each one — a proxy for the
+    /// origin egress prewarm spent before any client asked, which is the reason
+    /// prewarm is opt-in.
+    ///
+    /// A proxy, not the egress itself, and the two can differ. This sums
+    /// `inspect().size_bytes` (bytes as stored), whereas
+    /// `pull_through_bytes` meters bytes as they arrive off the wire — so a
+    /// compressed HTTP origin under `DecompressMode::Auto` moves fewer wire
+    /// bytes than this reports. Treat it as "how much pinned content prewarm
+    /// materialized", and use `pull_through_bytes` when the question is
+    /// literally what the origin billed. A size lookup that fails contributes
+    /// `0`, so this can also undercount.
     ///
     /// Field name omits `_total`: the emitted name is
     /// `decdn_cache_prewarm_bytes_total`.
     pub prewarm_bytes: Counter,
+    /// Pinned hashes prewarm refused to fetch because they are blacklisted or
+    /// operator-evicted (`decdn_cache_prewarm_refused_total`).
+    ///
+    /// This is the one prewarm outcome that means **an operator instruction is
+    /// being actively overridden** — `pinned_hashes` says fetch it, the deny
+    /// set says never. Without its own counter that case is invisible: a pin set
+    /// entirely covered by a blacklist yields zero fetches, zero bytes and zero
+    /// failures, which is byte-identical to the healthy steady state.
+    ///
+    /// A sustained nonzero value is not itself a fault — a takedown landing on
+    /// pinned content is exactly when it should fire — but it should prompt
+    /// trimming the pin set so the intent in config matches reality.
+    ///
+    /// Field name omits `_total`: the emitted name is
+    /// `decdn_cache_prewarm_refused_total`.
+    pub prewarm_refused: Counter,
     /// Prewarm attempts that failed (`decdn_cache_prewarm_failures_total`) —
     /// the origin did not have the pinned hash, or the fetch/store errored.
     /// Never fatal: prewarm is best-effort and a failure leaves the hash to
     /// be pulled on demand.
     ///
-    /// Operator-actionable: a failure count equal to the pin-set size means
-    /// the pinned hashes are not in the configured origin at all — almost
-    /// always a wrong `cache.pinned_hashes` or a wrong origin URL/bucket.
+    /// Operator-actionable, but **this counter alone does not say why**. It
+    /// merges three situations with different remedies: the origin does not
+    /// hold the hash (wrong `cache.pinned_hashes`, or a wrong bucket/prefix),
+    /// the origin is unreachable or its circuit breaker is open, and a local
+    /// store error on the presence check. A value equal to the pin-set size is
+    /// the signal to look — the per-hash `warn` lines carry the distinguishing
+    /// error. Splitting the count by cause is tracked separately.
     ///
     /// Field name omits `_total`: the emitted name is
     /// `decdn_cache_prewarm_failures_total`.

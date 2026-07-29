@@ -240,7 +240,9 @@ pub struct DecdnMetrics {
     /// at zero rather than appearing only on first increment. Field has no
     /// `_total` suffix because the `OpenMetrics` encoder appends it.
     ///
-    /// **This is the documented exception, not the convention** (#1475). Every
+    /// **This is the documented exception, not the convention** (#1475) — the
+    /// one labeled *reason split*, which is not the same as the crate's only
+    /// `Family`: `streams_active` is keyed on `direction`. Every
     /// other reason-style split in this crate — `dispatch_rejected_*`,
     /// `probe_rate_limit_rejected_*`, `channel_open_failures_*`, and gossip's
     /// `gossip_messages_rejected_clock_skew` — fans out to sibling unlabeled
@@ -248,12 +250,17 @@ pub struct DecdnMetrics {
     /// need no `EncodeLabelSet` type, no pre-materialization to keep a series
     /// exporting at zero, and no alert rewrite when a reason is added.
     ///
-    /// The exception is earned here because the three values share one alert
-    /// and one remedy axis (raise `max_probe_holds` / re-enable holds), so an
-    /// operator queries the aggregate first and drills in second — exactly the
-    /// shape a label serves and sibling counters make awkward. A split whose
-    /// values have *unrelated* remedies gains nothing from a label and should
-    /// stay siblings.
+    /// The exception is earned because the three values share one *aggregate*
+    /// and one budget axis: an operator asks "are probe holds unavailable?"
+    /// first and drills into which value second — the shape a label serves and
+    /// sibling counters make awkward. They pointedly do NOT share an alert:
+    /// `DecdnProbeHoldViolations` filters to `reason="exhausted"` precisely
+    /// because [`ProbeHoldUnavailableReason::Disabled`] is an intentional
+    /// operator choice and alerting on it would be nonsensical, and
+    /// `StakeLaneReserved` has its own knob. Being able to express that filter
+    /// is itself part of what the label buys. A split whose values have
+    /// unrelated remedies *and* no meaningful aggregate gains nothing from a
+    /// label and should stay siblings.
     probe_hold_unavailable: Family<ProbeHoldUnavailableLabels, Counter>,
     /// `decdn_probe_hold_slots_used` (registry): current active
     /// probe-triggered eviction holds (distinct held blobs), ADR 005
@@ -2994,6 +3001,13 @@ mod tests {
             "decdn_cache_evictions_starved_total",
             "decdn_cache_size_measure_failures_total",
             "decdn_cache_evicted_operator_total",
+            // Prewarm counters (#1130). Same `_total`-suffix trap: the struct
+            // fields are `prewarm_blobs`, `prewarm_bytes`, `prewarm_refused`,
+            // `prewarm_failures`.
+            "decdn_cache_prewarm_blobs_total",
+            "decdn_cache_prewarm_bytes_total",
+            "decdn_cache_prewarm_refused_total",
+            "decdn_cache_prewarm_failures_total",
         ] {
             assert!(
                 has_metric_line(&text, name, 0),

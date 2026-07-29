@@ -13,7 +13,7 @@ use decdn_cli::commands::config as commands;
 use decdn_common::cli::{ConfigValidateArgs, RunArgs};
 use decdn_common::config::{
     ResolvedBlockchain, ResolvedCache, ResolvedConfig, ResolvedGossip, ResolvedIdentity,
-    ResolvedNetwork, ResolvedObservability, ResolvedPayment, ResolvedSecurity,
+    ResolvedNetwork, ResolvedObservability, ResolvedOrigin, ResolvedPayment, ResolvedSecurity,
 };
 use tempfile::TempDir;
 
@@ -471,11 +471,20 @@ fn summary_reports_the_origin_rescan_and_prewarm_knobs() -> anyhow::Result<()> {
         "prewarm off must be stated, not merely omitted: {out}"
     );
 
+    // `prewarm = true` with the fixture's origin chain. The summary must report
+    // what prewarm will DO, not echo the flag: a flag set against an fs-only or
+    // empty chain is inert, and validate is the pre-flight tool that should say
+    // so rather than leaving the operator to discover it from a boot log.
+    let remote = ResolvedOrigin::Http {
+        url: decdn_cache::parse_origin_url("https://origin.example/")?,
+        decompress: decdn_cache::DecompressMode::Auto,
+    };
     let out = render(
         None,
         &sample_resolved(|c| {
             c.cache.fs_rescan_interval_sec = 0;
             c.cache.prewarm = true;
+            c.cache.origins = vec![remote.clone()];
         }),
     )?;
     anyhow::ensure!(
@@ -484,7 +493,30 @@ fn summary_reports_the_origin_rescan_and_prewarm_knobs() -> anyhow::Result<()> {
     );
     anyhow::ensure!(
         out.contains("prewarm:                  enabled"),
-        "the summary must report prewarm when it is on: {out}"
+        "the summary must report prewarm as enabled when a remote origin backs it: {out}"
+    );
+
+    let out = render(
+        None,
+        &sample_resolved(|c| {
+            c.cache.prewarm = true;
+            c.cache.origins = vec![ResolvedOrigin::Fs {
+                path: std::path::PathBuf::from("/srv/origin"),
+            }];
+        }),
+    )?;
+    anyhow::ensure!(
+        out.contains("prewarm:                  set but INERT") && out.contains("local filesystem"),
+        "an fs-only chain makes prewarm inert and validate must say so, not print \
+         'enabled': {out}"
+    );
+
+    let out = render(None, &sample_resolved(|c| c.cache.prewarm = true))?;
+    anyhow::ensure!(
+        out.contains("prewarm:                  set but INERT")
+            && out.contains("no origin configured"),
+        "with no origin at all the reason must name that, not blame filesystem \
+         origins that do not exist: {out}"
     );
     Ok(())
 }

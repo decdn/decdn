@@ -78,8 +78,8 @@ pub(crate) fn source_key(ip: IpAddr) -> IpAddr {
 /// Metrics-wise this is a **sibling-counter** split, per the convention settled
 /// in #1475: each variant increments its own unlabeled counter
 /// (`decdn_dispatch_rejected_{global,per_source}_total`) rather than a `reason`
-/// label. `decdn_probe_hold_unavailable_total` is the one labeled exception —
-/// see [`crate::metrics::ProbeHoldUnavailableReason`].
+/// label. `decdn_probe_hold_unavailable_total` is the one labeled *reason
+/// split* — see [`crate::metrics::ProbeHoldUnavailableReason`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RejectReason {
     /// Global concurrency semaphore exhausted.

@@ -22,6 +22,7 @@ use iroh_blobs::store::fs::options::Options as FsStoreOptions;
 use iroh_blobs::store::{GcConfig, ProtectOutcome};
 use iroh_blobs::util::{RecvStream, RecvStreamAsyncStreamReader};
 use tokio::sync::{Notify, broadcast};
+use tokio_util::sync::CancellationToken;
 
 use decdn_config_types::{CircuitBreakerPolicy, DeniedHashes, PinDiff, PinnedHashes, RetryPolicy};
 
@@ -327,9 +328,10 @@ pub struct EvictionPreview {
 /// Every field is a count of distinct hashes except `bytes`, and the four counts
 /// partition the deduplicated input: `fetched + already_present + refused +
 /// failed` equals the number of distinct hashes passed in. That identity is what
-/// makes the log line diagnosable — `failed == input` means the origin does not
-/// hold the pin set at all, while `already_present == input` is the healthy
-/// steady state on a warm restart.
+/// makes the log line diagnosable: `already_present == input` is the healthy
+/// steady state on a warm restart, and `failed == input` means nothing was
+/// retrievable — which could be a wrong pin set, an unreachable origin, or a
+/// local store fault, so read the per-hash `warn` lines to tell those apart.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PrewarmReport {
     /// Hashes actually pulled from an origin into the store on this pass.
@@ -365,13 +367,35 @@ impl PrewarmReport {
     }
 }
 
+/// Who actually paid the origin egress in a [`CacheEngine::populate_inner`] call.
+///
+/// `populate`/`populate_local` discard this — a fill is a fill to them. It exists
+/// for callers that **meter** fetches: `Ok(())` alone cannot distinguish "this
+/// task pulled the blob" from "this task waited on someone else's pull and found
+/// the blob present afterwards" (the `#305` inflight-coalescing path). Counting
+/// the latter as a fetch double-counts one unit of paid egress whenever two
+/// prewarm passes overlap (#1130).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FillOwnership {
+    /// This task ran the origin pull.
+    Fetched,
+    /// Another task's pull satisfied us; we paid nothing.
+    Coalesced,
+    /// The blob was already complete before we did anything.
+    AlreadyPresent,
+}
+
 /// What [`CacheEngine::prewarm`] did with a single hash, folded into a
 /// [`PrewarmReport`] by the caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PrewarmOutcome {
+    /// This pass pulled the blob from an origin and paid for `bytes`.
     Fetched { bytes: u64 },
+    /// Nothing to do — already complete, or filled by a concurrent pass.
     AlreadyPresent,
+    /// Blacklisted or operator-evicted; prewarm is not a takedown bypass.
     Refused,
+    /// The presence check or the fetch errored. Left to an on-demand pull.
     Failed,
 }
 
@@ -1149,9 +1173,44 @@ impl CacheEngine {
     where
         I: IntoIterator<Item = Hash>,
     {
+        self.prewarm_inner(hashes, None).await
+    }
+
+    /// [`Self::prewarm_pinned`] that stops early when `stop` fires.
+    ///
+    /// The runtime cancels this at the top of shutdown, before it closes the
+    /// blob store. Without that, a restart part-way through a large warm leaves
+    /// the loop pulling against a closed store: every remaining pin fails its
+    /// presence check, and `prewarm_failures_total` lands at roughly the pin-set
+    /// size — the exact signature that counter's own documentation tells
+    /// operators means their `pinned_hashes` are wrong. A routine restart must
+    /// not manufacture that alarm.
+    ///
+    /// Cancellation is checked between hashes, so the overrun is bounded by one
+    /// blob rather than by the whole set. Hashes not reached are simply absent
+    /// from the report — they are neither `failed` nor `refused`, because
+    /// nothing was attempted.
+    pub async fn prewarm_cancellable(&self, stop: &CancellationToken) -> PrewarmReport {
+        let pinned: Vec<Hash> = self.inner.pinned.load().iter().copied().collect();
+        self.prewarm_inner(pinned, Some(stop)).await
+    }
+
+    /// Shared body of the three prewarm entry points. `stop` is `None` for the
+    /// uncancellable ones.
+    async fn prewarm_inner<I>(&self, hashes: I, stop: Option<&CancellationToken>) -> PrewarmReport
+    where
+        I: IntoIterator<Item = Hash>,
+    {
         let mut report = PrewarmReport::default();
         let mut seen: HashSet<Hash> = HashSet::new();
         for hash in hashes {
+            if stop.is_some_and(CancellationToken::is_cancelled) {
+                tracing::info!(
+                    warmed = report.fetched,
+                    "prewarm: cancelled by shutdown; leaving the rest of the pin set unwarmed"
+                );
+                break;
+            }
             if seen.insert(hash) {
                 report.fold(self.prewarm_one(hash).await);
             }
@@ -1160,6 +1219,8 @@ impl CacheEngine {
             m.prewarm_blobs
                 .inc_by(u64::try_from(report.fetched).unwrap_or(u64::MAX));
             m.prewarm_bytes.inc_by(report.bytes);
+            m.prewarm_refused
+                .inc_by(u64::try_from(report.refused).unwrap_or(u64::MAX));
             m.prewarm_failures
                 .inc_by(u64::try_from(report.failed).unwrap_or(u64::MAX));
         }
@@ -1180,10 +1241,18 @@ impl CacheEngine {
                 return PrewarmOutcome::Failed;
             }
         }
-        match self.populate_local(hash).await {
-            Ok(()) => PrewarmOutcome::Fetched {
+        // `populate_inner`, not `populate_local`, because the wrapper discards
+        // the ownership signal: a coalesced waiter also returns `Ok(())`, and
+        // counting that as a fetch would double-count one unit of paid egress
+        // when two prewarm passes overlap. `local_only = true` keeps the `Peer`
+        // origin out of scope exactly as `populate_local` does.
+        match self.populate_inner(hash, true).await {
+            Ok(FillOwnership::Fetched) => PrewarmOutcome::Fetched {
                 bytes: self.stored_size(hash).await,
             },
+            Ok(FillOwnership::Coalesced | FillOwnership::AlreadyPresent) => {
+                PrewarmOutcome::AlreadyPresent
+            }
             Err(err) => {
                 tracing::warn!(%hash, error = %err, "prewarm: fetch failed; leaving to on-demand pull");
                 PrewarmOutcome::Failed
@@ -1217,7 +1286,7 @@ impl CacheEngine {
     /// available optimization, not the expected usage.
     pub async fn prewarm_pinned(&self) -> PrewarmReport {
         let pinned: Vec<Hash> = self.inner.pinned.load().iter().copied().collect();
-        self.prewarm(pinned).await
+        self.prewarm_inner(pinned, None).await
     }
 
     /// Swap in the live *local* denied set from `[content] denied_hashes` (ADR
@@ -1838,7 +1907,7 @@ impl CacheEngine {
     /// Same set as [`Self::get`] (`NoOrigin` / `NotFound` / `HashMismatch` /
     /// `BlobTooLarge` / `OriginError` / `Store`).
     pub async fn populate(&self, hash: Hash) -> CacheResult<()> {
-        self.populate_inner(hash, false).await
+        self.populate_inner(hash, false).await.map(|_| ())
     }
 
     /// Like [`Self::populate`], but restricted to the node's OWN configured
@@ -1854,16 +1923,16 @@ impl CacheEngine {
     ///
     /// Same set as [`Self::populate`].
     pub async fn populate_local(&self, hash: Hash) -> CacheResult<()> {
-        self.populate_inner(hash, true).await
+        self.populate_inner(hash, true).await.map(|_| ())
     }
 
     /// Shared body of [`Self::populate`] / [`Self::populate_local`]. `local_only`
     /// threads through the coalescing loop into [`Self::pull_through`], where it
     /// skips the `Peer` origin.
-    async fn populate_inner(&self, hash: Hash, local_only: bool) -> CacheResult<()> {
+    async fn populate_inner(&self, hash: Hash, local_only: bool) -> CacheResult<FillOwnership> {
         if self.has(hash).await? {
             self.touch(hash);
-            return Ok(());
+            return Ok(FillOwnership::AlreadyPresent);
         }
         // Logical-eviction guard (#279): never re-pull a deliberately evicted
         // hash (mirrors `get`).
@@ -1876,7 +1945,7 @@ impl CacheEngine {
         // Coalesce concurrent fills for the same hash (#305), mirroring `get`'s
         // loop but bumping no `get`-caller metrics: `populate` fills as a side
         // effect, so it counts neither a hit nor returned bytes.
-        loop {
+        let ownership = loop {
             let state = self.inner.inflight.lock().ok().map(|mut guard| {
                 if let Some(n) = guard.get(&hash) {
                     Err(Arc::clone(n))
@@ -1891,7 +1960,9 @@ impl CacheEngine {
                 Some(Err(notify)) => {
                     notify.notified().await;
                     if self.has(hash).await? {
-                        break;
+                        // The owner paid the egress, not us. Callers that meter
+                        // fetches (prewarm, #1130) must not count this as one.
+                        break FillOwnership::Coalesced;
                     }
                 }
                 // We own the pull — the guard wakes waiters + clears the entry
@@ -1906,17 +1977,17 @@ impl CacheEngine {
                     // never read back out of the store (#1132). The wrapper
                     // returns `()`, so there is nothing here to drop by accident.
                     self.pull_through_fill(hash, local_only).await?;
-                    break;
+                    break FillOwnership::Fetched;
                 }
                 // Mutex poisoned — fall through to a direct pull.
                 None => {
                     self.pull_through_fill(hash, local_only).await?;
-                    break;
+                    break FillOwnership::Fetched;
                 }
             }
-        }
+        };
         self.touch(hash);
-        Ok(())
+        Ok(ownership)
     }
 
     /// Attempt a **range-scoped** origin pull-through for `[byte_offset,

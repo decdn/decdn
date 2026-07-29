@@ -17,6 +17,7 @@ use anyhow::Context;
 use decdn_cache::{
     CacheEngine, FilesystemOrigin, HttpOrigin, Origin, S3Credentials, S3Origin, S3OriginConfig,
 };
+use decdn_common::config::prewarm_enabled_for;
 use decdn_common::config::{ResolvedDiscovery, ResolvedOrigin, ResolvedS3Credentials};
 use iroh::address_lookup::{DnsAddressLookup, MemoryLookup, PkarrPublisher};
 use iroh::endpoint::{IdleTimeout, QuicTransportConfig, VarInt, presets};
@@ -262,26 +263,6 @@ where
     stop_tx
 }
 
-/// Whether `cache.prewarm` should actually run for this origin chain (#1130).
-///
-/// The flag alone is not enough: prewarm imports origin content into the cache
-/// store, which for a `Filesystem` origin means a second copy of the same bytes
-/// on the same disk for no benefit — that content is already local and is
-/// advertised through the origin-held index. So prewarm applies only when the
-/// chain contains at least one **remote** origin, and the flag is the operator's
-/// consent to pay that origin's egress up front.
-///
-/// A mixed chain warms: `populate_local` walks the chain in order and stops at
-/// the first origin that has the hash, so an fs entry ahead of a remote one is
-/// still preferred and costs nothing.
-fn prewarm_enabled_for(cache: &decdn_common::config::ResolvedCache) -> bool {
-    cache.prewarm
-        && cache
-            .origins
-            .iter()
-            .any(|o| !matches!(o, decdn_common::config::resolved::ResolvedOrigin::Fs { .. }))
-}
-
 /// Warn when the pin set cannot fit under the cache ceiling (#1130).
 ///
 /// Pinned hashes are LRU-exempt (`eviction_candidates` filters them out), so a
@@ -293,8 +274,12 @@ fn prewarm_enabled_for(cache: &decdn_common::config::ResolvedCache) -> bool {
 /// Warn rather than fail or truncate. The operator's pin set is a deliberate
 /// statement about what this node must serve, and silently warming only part of
 /// it would be worse than warming all of it noisily. Sizes come from the
-/// origin-held index that the startup rescan just populated, so unpinned or
-/// unresolvable hashes simply contribute nothing and the number is a lower bound.
+/// origin-held index, so a hash the index cannot size contributes nothing and
+/// the total is a **lower bound**. That matters: an origin that blocks `HEAD`
+/// leaves the index empty and this check silently never fires. It is a cheap
+/// early hint, not the authoritative signal — that is
+/// `decdn_cache_evictions_starved_total` with `decdn_cache_bytes` at
+/// `decdn_cache_size_limit_bytes`.
 fn warn_if_pins_exceed_cache(cache: &decdn_cache::CacheEngine, cache_size_mb: u64) {
     let pinned = cache.pinned_snapshot();
     let pinned_bytes: u64 = pinned
@@ -446,9 +431,10 @@ async fn build_infra(
     // tick with new confirmed blocks — and the directly-durable store fsyncs on
     // each. The persisted value is only a *floor* for the resume backfill
     // (`resolve_persisted_start` rewinds it by the reorg margin; the sinks are
-    // idempotent), so coarsening the write cadence is safe — and each key is
-    // force-flushed on graceful shutdown (settlement by its service, origin by
-    // the shutdown sequence below) so steady-state progress is not lost.
+    // idempotent), so coarsening the write cadence is safe — and the one key
+    // still persisted (settlement) is force-flushed on graceful shutdown by its
+    // own service, so steady-state progress is not lost. The origin directory
+    // stopped persisting a cursor in #1504; it enumerates on every boot.
     // Wrapping here (the wiring layer) keeps the domain trait and the disk store
     // free of the debounce policy.
     let watcher_checkpoint_store: Arc<dyn decdn_incentive::KeyedCheckpointStore> = Arc::new(
@@ -1427,6 +1413,9 @@ struct Background {
     /// Origin-held-index periodic rescan (#1130). `None` when
     /// `cache.fs_rescan_interval_sec == 0` disables it.
     origin_rescan_stop_tx: Option<oneshot::Sender<()>>,
+    /// Remote-origin prewarm (#1130). Always present — cancelling a token for a
+    /// warm that never started is a no-op, which is cheaper than an `Option`.
+    prewarm_stop: CancellationToken,
     record_store_gc_stop_tx: oneshot::Sender<()>,
     eviction_stop_tx: oneshot::Sender<()>,
     dht_rate_limit_gc_stop_tx: oneshot::Sender<()>,
@@ -1768,33 +1757,59 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
         None
     };
 
+    // Unconditional, and deliberately outside the prewarm gate below: an
+    // oversized pin set starves the eviction driver on EVERY node, prewarm or
+    // not, because pinned blobs are LRU-exempt however they arrived. Gating this
+    // on prewarm would hide it from the default configuration (`prewarm = false`)
+    // and from every fs-origin node — i.e. from almost everyone.
+    warn_if_pins_exceed_cache(&infra.cache, cfg.cache.cache_size_mb);
+
     // Remote-origin prewarm (#1130). Detached: pulling the pin set out of an
     // `http`/`s3` origin is unbounded network work, and a node that cannot reach
     // its origin must still finish bring-up and serve whatever it already holds.
     // Newly-warmed blobs reach the announce set through `subscribe_inserts`, so
     // nothing needs re-seeding here. The `fs` skip is the point of the feature —
     // see `prewarm_enabled_for`.
+    let prewarm_stop = CancellationToken::new();
     if prewarm_enabled_for(&cfg.cache) {
         let cache = infra.cache.clone();
-        let cache_size_mb = cfg.cache.cache_size_mb;
+        // Cancelled at the top of `shutdown()`, before `cache.shutdown()` closes
+        // the store. Without it a restart mid-warm leaves the loop pulling
+        // against a closed store, which fails every remaining pin and lands
+        // `prewarm_failures_total` at ≈ the pin-set size — precisely the
+        // signature that metric tells operators means their `pinned_hashes` are
+        // wrong. Same rationale as `pull_through_bg_shutdown`: once we are
+        // terminating, warming for future requests is moot and the egress is
+        // waste.
+        let stop = prewarm_stop.clone();
         tasks.spawn(async move {
-            warn_if_pins_exceed_cache(&cache, cache_size_mb);
-            let report = cache.prewarm_pinned().await;
+            let report = cache.prewarm_cancellable(&stop).await;
             tracing::info!(
                 fetched = report.fetched,
                 already_present = report.already_present,
                 refused = report.refused,
                 failed = report.failed,
                 bytes = report.bytes,
+                cancelled = stop.is_cancelled(),
                 "cache.prewarm: remote-origin prewarm of the pin set complete (#1130)"
             );
         });
     } else if cfg.cache.prewarm {
-        tracing::info!(
-            "cache.prewarm is set but every configured origin is a local filesystem; \
-             skipping prewarm — fs-origin content is served from the origin-held index \
-             and importing it would duplicate the bytes on the same disk (#1130)"
-        );
+        // Two distinct reasons prewarm is inert; naming the wrong one sends the
+        // operator hunting for an `fs` entry that may not exist.
+        if cfg.cache.origins.is_empty() {
+            tracing::warn!(
+                "cache.prewarm is set but no origin is configured, so there is nothing to \
+                 warm from — set [cache.origin] (or [[cache.origins]]) to an http/s3 \
+                 backend, or unset prewarm (#1130)"
+            );
+        } else {
+            tracing::info!(
+                "cache.prewarm is set but every configured origin is a local filesystem; \
+                 skipping prewarm — fs-origin content is served from the origin-held index \
+                 and importing it would duplicate the bytes on the same disk (#1130)"
+            );
+        }
     }
 
     // DHT bucket-refresh (ADR 022 §Routing Table). Once per hour
@@ -2186,6 +2201,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
         dispatch_gc_stop_tx,
         region_log_stop_tx,
         origin_rescan_stop_tx,
+        prewarm_stop,
         record_store_gc_stop_tx,
         eviction_stop_tx,
         dht_rate_limit_gc_stop_tx,
@@ -2267,6 +2283,7 @@ pub async fn run(
         buyer_bootstrap_stop_tx: bg.buyer_bootstrap_stop_tx,
         region_log_stop_tx: bg.region_log_stop_tx,
         origin_rescan_stop_tx: bg.origin_rescan_stop_tx,
+        prewarm_stop: bg.prewarm_stop,
         record_store_gc_stop_tx: bg.record_store_gc_stop_tx,
         eviction_stop_tx: bg.eviction_stop_tx,
         dht_rate_limit_gc_stop_tx: bg.dht_rate_limit_gc_stop_tx,
@@ -2305,6 +2322,9 @@ struct ShutdownHandles<P: Provider + Clone + 'static> {
     /// Origin-held-index periodic rescan (#1130). `None` when
     /// `cache.fs_rescan_interval_sec == 0` disables it.
     origin_rescan_stop_tx: Option<oneshot::Sender<()>>,
+    /// Remote-origin prewarm (#1130). Always present — cancelling a token for a
+    /// warm that never started is a no-op, which is cheaper than an `Option`.
+    prewarm_stop: CancellationToken,
     record_store_gc_stop_tx: oneshot::Sender<()>,
     eviction_stop_tx: oneshot::Sender<()>,
     dht_rate_limit_gc_stop_tx: oneshot::Sender<()>,
@@ -2331,9 +2351,9 @@ struct ShutdownHandles<P: Provider + Clone + 'static> {
 /// PR1). Consumes every field of [`ShutdownHandles`] via an exhaustive
 /// destructure — see that type's docs for why the `..`-free binding is
 /// load-bearing. The teardown ordering here is itself load-bearing (metrics
-/// accept-loop stop first; `origin_watcher` shutdown before the `Origin`
-/// checkpoint flush; `capacity_bond_watcher` shutdown after `router.shutdown`)
-/// and must not be reordered.
+/// accept-loop stop first; prewarm cancelled before `cache.shutdown()` closes
+/// the store; `capacity_bond_watcher` shutdown after `router.shutdown`) and
+/// must not be reordered.
 #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
 async fn shutdown<P: Provider + Clone + 'static>(
     handles: ShutdownHandles<P>,
@@ -2348,6 +2368,7 @@ async fn shutdown<P: Provider + Clone + 'static>(
         buyer_bootstrap_stop_tx,
         region_log_stop_tx,
         origin_rescan_stop_tx,
+        prewarm_stop,
         record_store_gc_stop_tx,
         eviction_stop_tx,
         dht_rate_limit_gc_stop_tx,
@@ -2403,6 +2424,14 @@ async fn shutdown<P: Provider + Clone + 'static>(
     if let Some(tx) = origin_rescan_stop_tx {
         let _ = tx.send(());
     }
+    // Remote-origin prewarm (#1130). Cancelled HERE, well before
+    // `cache.shutdown()` closes the store further down: a warm still running
+    // against a closed store fails every remaining pin and lands
+    // `prewarm_failures_total` at ~the pin-set size, which is exactly the
+    // signature that counter is documented to mean "your pinned_hashes are
+    // wrong". Same reasoning as `pull_through_bg_shutdown` — once we are
+    // terminating, warming for future requests is moot and the egress is waste.
+    prewarm_stop.cancel();
     let _ = record_store_gc_stop_tx.send(());
     // Eviction driver (#1173): best-effort stop, same shape as the GC sweeps.
     // The task also drains via `JoinSet::join_next` below.

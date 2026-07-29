@@ -29,8 +29,10 @@
 ///
 /// That convention is settled, not provisional (#1475): sibling counters are the
 /// default for a closed reason split, and `decdn_probe_hold_unavailable_total`
-/// is the one deliberate labeled exception — earned because its values share a
-/// single alert and remedy. A new split here should follow the siblings.
+/// is the one deliberate labeled *reason split* — earned because its values
+/// share one aggregate and one budget axis. It is not the only `Family` in
+/// `decdn-node`; `streams_active` is one too, as noted above. A new reason
+/// split here should follow the siblings.
 ///
 /// The argument is kept because it is meaningful at the call site and is what
 /// such a breakdown would key on. Callers should not assume the resulting

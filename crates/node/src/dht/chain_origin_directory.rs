@@ -327,8 +327,9 @@ impl ChainOriginDirectory {
             Metrics::origin_directory_watcher_task_panicked,
         ));
         // This sink observes no shutdown token, so it ignores the one `spawn`
-        // mints (`|_| sink`); the runtime drives graceful stop, then flushes the
-        // origin scan checkpoint, via `watcher`.
+        // mints (`|_| sink`); the runtime drives graceful stop via `watcher`.
+        // There is no checkpoint flush behind it — this watcher persists no
+        // cursor (see `cursor_start`).
         let watcher = Arc::new(resumable_watcher::spawn(provider, cfg, move |_| sink));
 
         Ok(Self {
@@ -370,7 +371,7 @@ impl<P: Provider + Clone> LogSink for OriginSink<P> {
 
     /// Retry every deferred `getOrigins` re-read. Runs at the end of every tick
     /// (idle ones included), so a namespace whose re-read failed at apply time —
-    /// after which the persisted cursor may already have advanced past the
+    /// after which the scan cursor may already have advanced past the
     /// triggering event — heals here rather than staying fail-closed until an
     /// unrelated same-namespace event. Returns `Err` while any namespace is
     /// still failing so the tick backs off instead of re-polling a throttled
@@ -648,8 +649,8 @@ where
 /// filling `cache.operator_node`.
 ///
 /// A failed lookup degrades — counted, warned, operator left unmapped — rather
-/// than propagating, for the same reason the replay floor in `bootstrap_cache`
-/// does: `bootstrap` is one-shot (no retry) and its error is fatal at
+/// than propagating, for the same reason the namespace enumeration in
+/// `bootstrap_cache` does: `bootstrap` is one-shot (no retry) and its error is fatal at
 /// `runtime`'s call site, so a crash here is strictly worse than graceful
 /// degradation. That matters more now `nodeIdOf` is bounded by [`timed`] —
 /// propagating would turn one slow (>10s) call on a congested or rate-limited

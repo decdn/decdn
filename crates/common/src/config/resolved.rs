@@ -239,8 +239,8 @@ pub struct ResolvedCache {
     /// Prewarm [`Self::pinned_hashes`] from a remote (`http`/`s3`) origin at
     /// startup and on reload (#1130). Default
     /// [`crate::config::DEFAULT_PREWARM`] (`false`) when the TOML section omits
-    /// the field. A `Filesystem` origin ignores it — see the `CacheConfig`
-    /// field doc for why.
+    /// the field. An fs-**only** origin chain ignores it — see the `CacheConfig`
+    /// field doc for why, and for what a mixed chain does instead.
     pub prewarm: bool,
     /// LRU eviction driver high-water percent of [`Self::cache_size_mb`]
     /// (#1173). Above this fraction the driver actively evicts. Validated to

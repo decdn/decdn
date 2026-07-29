@@ -173,14 +173,19 @@ pub struct Candidate {
     /// tie-break tier. `0` means *known to hold no bond* — there is no
     /// "not looked up" state, by design (#1470).
     ///
-    /// This type deliberately cannot carry a failed read. A chain read
-    /// succeeds for some peers and fails for others, and a mixed population
-    /// is the steady state for an RPC read, not an edge case — folding a
-    /// failure to `0` here would silently sink a well-staked peer below a
-    /// provably-unbonded one. The lookup layer must therefore resolve the
-    /// failure where it is still visible: retry it, or drop the candidate.
-    /// Nothing populates this yet (on-chain integration is deferred; see ADR
-    /// 019 for the capacity-bond interface that will).
+    /// This type has no *encoding* for a failed read — not the same as
+    /// preventing one. A chain read succeeds for some peers and fails for
+    /// others, and a mixed population is the steady state for an RPC read, not
+    /// an edge case; folding a failure to `0` here would silently sink a
+    /// well-staked peer below a provably-unbonded one. So the lookup layer must
+    /// resolve the failure where it is still visible: retry it, or drop the
+    /// candidate. **Nothing in the type enforces that today** — a future caller
+    /// can still write `stake: 0` on a failed read and it will compile. The
+    /// constructor-level enforcement (a `Stake` obtainable only from a
+    /// successful read, with `Candidate`'s fields made private) lands with the
+    /// lookup itself; see #1470. Nothing populates this yet — on-chain
+    /// integration is deferred; see ADR 019 for the capacity-bond interface
+    /// that will.
     pub stake: u64,
 }
 
@@ -357,16 +362,17 @@ fn pick_best_in_group(
         });
     }
 
-    // Tier 2: higher stake wins. Every value here is a known one — a failed
-    // on-chain read is resolved at the lookup layer (retried, or the candidate
-    // dropped) and never reaches `Candidate.stake`, so this tier can rank on
-    // the numbers alone. See the field doc for why that boundary matters
-    // (#1470).
+    // Tier 2: higher stake wins. Every value here is meant to be a completed
+    // observation — a failed on-chain read must be resolved at the lookup layer
+    // (retried, or the candidate dropped) rather than reaching
+    // `Candidate.stake` — so this tier can rank on the numbers alone. See the
+    // field doc for why that boundary matters, and for the fact that nothing
+    // enforces it yet (#1470).
     //
     // Uniformly a no-op today: every construction site passes `0` because
-    // on-chain integration is deferred (ADR 001 "Contract Interface: Node
-    // Registry" / ADR 019 for the capacity-bond interface that will populate
-    // it).
+    // on-chain integration is deferred (ADR 003 § Node Registry for the
+    // contract surface, ADR 019 for the capacity-bond interface that will
+    // populate it).
     let max_stake = pool
         .iter()
         .filter_map(|i| group.get(*i).map(|r| r.candidate.stake))
@@ -717,29 +723,39 @@ mod tests {
     }
 
     #[test]
-    fn equal_stake_falls_through_to_random_tier() {
-        // Three candidates on the same stake: tier 2 retains all of them (a
-        // `max` that everyone matches must not collapse the pool), then tier 3
-        // picks randomly. Across enough seeds every candidate should win first
-        // — confirms tier 2 doesn't short-circuit on the first max it finds.
-        let a = with_stake(with_region(make_candidate(1, 100, 10, 1.0), "US"), 0);
-        let b = with_stake(with_region(make_candidate(2, 100, 10, 1.0), "US"), 0);
-        let c = with_stake(with_region(make_candidate(3, 100, 10, 1.0), "US"), 0);
+    fn tier_two_prunes_the_loser_then_tier_three_randomizes_the_survivors() {
+        // Two top-stake candidates plus one strictly lower: tier 2 must retain
+        // BOTH leaders and drop the laggard, then tier 3 picks uniformly between
+        // the survivors. This covers the tier-2 → tier-3 handoff — `retain`
+        // actually removing someone, and the pool it leaves being larger than
+        // one. A version where every stake is equal would exercise neither:
+        // `retain` would keep everyone and this would collapse into a plain
+        // tier-3 uniformity test.
+        let a = with_stake(with_region(make_candidate(1, 100, 10, 1.0), "US"), 1_000);
+        let b = with_stake(with_region(make_candidate(2, 100, 10, 1.0), "US"), 1_000);
+        let laggard = with_stake(with_region(make_candidate(3, 100, 10, 1.0), "US"), 0);
         let mut winners = std::collections::HashSet::new();
         for seed in 0u64..32 {
             let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-            let out = rank_candidates_with_rng(vec![a.clone(), b.clone(), c.clone()], &mut rng);
-            if let Some(first) = out.first().map(|r| r.candidate.node_id[0]) {
-                winners.insert(first);
+            let out =
+                rank_candidates_with_rng(vec![a.clone(), b.clone(), laggard.clone()], &mut rng);
+            let first = out.first().map(|r| r.candidate.node_id[0]);
+            assert_ne!(
+                first,
+                Some(3),
+                "seed {seed}: the lower-stake candidate must never survive tier 2"
+            );
+            if let Some(id) = first {
+                winners.insert(id);
             }
-            if winners.len() == 3 {
+            if winners.len() == 2 {
                 break;
             }
         }
         assert_eq!(
             winners.len(),
-            3,
-            "expected all three equal-stake candidates to win across 32 seeds, saw {winners:?}"
+            2,
+            "expected both top-stake candidates to win across 32 seeds, saw {winners:?}"
         );
     }
 

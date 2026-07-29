@@ -416,10 +416,13 @@ pub struct CacheConfig {
     /// [`crate::config::DEFAULT_PREWARM`] (`false`). Restart-required.
     ///
     /// Opt-in because it costs origin egress up front: an `http`/`s3` origin
-    /// bills for bytes the node speculatively pulls. A `Filesystem` origin
-    /// ignores this — its content is already local and is advertised through the
-    /// origin-held index, so importing it would only duplicate the bytes on the
-    /// same disk.
+    /// bills for bytes the node speculatively pulls. A chain of **only**
+    /// `Filesystem` origins ignores this — that content is already local and is
+    /// advertised through the origin-held index, so importing it would duplicate
+    /// the bytes on the same disk. A *mixed* chain does warm, and pins served by
+    /// the fs entry are imported (duplicated) as part of that; configure `fs`
+    /// alone if avoiding the second copy matters more than warming the pins only
+    /// the remote origin has.
     ///
     /// Prewarm covers the pin set specifically, because pinned content is
     /// LRU-exempt and so is the only content guaranteed to still be resident
