@@ -1,41 +1,44 @@
 //! Daemon slash-detection watcher (#1032, G-NODE-05).
 //!
-//! Follows `SlashJudge.Slashed` for this node's own operator and records each
-//! slash into a shared in-memory store, so the operator can see it over the
-//! admin RPC (`admin_v1_slashes`) and file `decdn appeal slash` within the
-//! 30-day window without watching the chain directly. A counter metric
-//! (`decdn_slashes_detected_total`) mirrors it.
+//! Surfaces every still-appealable slash minted against this node's own operator
+//! so the operator can see it over the admin RPC (`admin_v1_slashes`) and file
+//! `decdn appeal slash` within the 30-day window without watching the chain
+//! directly. A counter metric (`decdn_slashes_detected_total`) mirrors it.
 //!
-//! Shape mirrors [`crate::payment_settlement`] but far leaner (read-only, no
-//! settlement path):
+//! Shape follows the `CapacityBond` registry watcher
+//! ([`crate::dht::capacity_bond_registry`]) — **enumerate at head, follow the
+//! tail, re-read periodically as the backstop** — rather than replaying logs:
 //!
-//! - **Server-side operator filter.** `Slashed` indexes `operator` as `topic2`,
-//!   so every `eth_getLogs` window constrains on it — a node never downloads or
-//!   decodes other operators' slashes.
-//! - **Rebuild from a bounded floor on every start.** The detected-slash store
-//!   is in-memory, so it is empty on each process start and must be rebuilt by
-//!   scanning history — a durable resume cursor could not skip this (resuming
-//!   from it would drop still-appealable slashes at/below the cursor). But only
-//!   the still-appealable tail matters, so the boot scan is bounded to the
-//!   `appeal_window_blocks` lookback (`head - ~30 days`, clamped `>= from_block`
-//!   the `SlashJudge` deploy floor) rather than genesis (#1108) — turning an
-//!   O(chain-age) boot scan into O(appeal window). This still re-surfaces a slash
-//!   mined while the node was down on the next restart, within its appeal window.
-//! - **Unified getLogs poller.** Backfill and the live tail are one
-//!   `resumable_watcher` cursor loop (#1092/#1106): each poll tick scans
-//!   `[cursor, head]` in `MAX_BACKFILL_BLOCK_SPAN` windows via `eth_getLogs`
-//!   (no `eth_newFilter`), advancing the cursor. The store is deduped by
-//!   `slashId`, so the re-scan overlap each boot is harmless.
+//! - **Enumerate at boot.** The in-memory store is rebuilt on every start from
+//!   the authoritative `CapacityBond.operatorSlash*` enumeration (ADR 019), not
+//!   by re-scanning the `Slashed` log tail from a block floor (#1108). Walking
+//!   the append-only index backwards and stopping at the first closed record
+//!   reads only the still-appealable tail, and every field — offense, evidence,
+//!   and the pause-aware `appealWindowClose` — comes straight off the record.
+//!   Fatal on failure, like the registry bootstrap on the same contract that
+//!   already gates startup: an RPC that fails here fails there first.
+//! - **Follow `SlashRecorded` at head.** `SlashRecorded` indexes `operator` as
+//!   `topic2`, so every `eth_getLogs` window constrains on it — a node never
+//!   decodes other operators' slashes — and the tail is seeded at the
+//!   enumeration snapshot head, so there is no historical scan on any boot. The
+//!   event carries only the `slashId`; the offense/evidence/deadline are
+//!   point-read from `getSlashRecord`.
+//! - **Resync as the backstop.** A missed tail event (reorg at the unstable tip,
+//!   or a tick lost to RPC backoff) never self-heals otherwise, so the store is
+//!   re-enumerated every `SLASH_RESYNC_INTERVAL`; this also prunes slashes
+//!   whose appeal window has since closed. The store is deduped by `slashId`, so
+//!   the enumeration/tail overlap is harmless.
 
+use std::future::Future;
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use alloy::primitives::{Address, B256, U256};
 use alloy::providers::Provider;
 use alloy::rpc::types::{Filter, Log};
 use alloy::sol_types::SolEvent;
-use anyhow::Result;
-use decdn_incentive::slash_judge::SlashJudge;
+use anyhow::{Context, Result};
+use decdn_incentive::capacity_bond::CapacityBond;
 use tracing::{debug, info, warn};
 
 use decdn_common::redact::sanitize_err_chain;
@@ -44,28 +47,16 @@ use crate::chain_events::resumable_watcher::{
     self, CursorStart, LogSink, WatcherConfig, WatcherHandle,
 };
 use crate::chain_events::shared_head::HeadSource;
-use crate::chain_events::timed;
 use crate::metrics::{Metrics, metric_hook};
 
-/// Nominal appeal filing window (ADR 028: 30 days from the slash timestamp).
-const APPEAL_FILING_WINDOW_SECS: u64 = 30 * 24 * 60 * 60;
-
-/// Nominal Arbitrum block time. Used only to convert the 30-day appeal window
-/// into a block-count lookback for the boot re-scan (below); it does not need to
-/// be exact, only a *lower* bound on the true block time so the derived
-/// block-count is an *upper* bound and the re-scan never covers less than the
-/// appeal window. Arbitrum Sepolia observes ~0.25–0.3s/block.
-const ARBITRUM_BLOCK_TIME_MS: u64 = 250;
-
-/// Block-count lookback that covers at least the [`APPEAL_FILING_WINDOW_SECS`]
-/// appeal window (#1108). The slash watcher re-scans `[head - this, head]` each
-/// boot (clamped `>= from_block`) instead of `[from_block, head]`, because the
-/// in-memory store must be rebuilt every start but only the still-appealable tail
-/// matters — bounding an O(chain-age) boot scan to O(appeal window). `div_ceil`
-/// keeps it an upper bound so the window is never under-covered.
-const fn appeal_window_blocks() -> u64 {
-    (APPEAL_FILING_WINDOW_SECS * 1_000).div_ceil(ARBITRUM_BLOCK_TIME_MS)
-}
+/// How often the store is re-enumerated from `CapacityBond` as a drift backstop.
+///
+/// Mirrors the `CapacityBond` registry watcher's cadence and rationale: a missed
+/// live-tail event never self-heals short of a restart, and one enumeration of a
+/// single operator's (tiny) slash list every quarter hour is negligible.
+/// Deliberately a constant, not a config knob — a correctness backstop, not a
+/// tuning surface.
+const SLASH_RESYNC_INTERVAL: Duration = Duration::from_mins(15);
 
 /// Ceiling for the poll-retry backoff — a deliberate override of the shared
 /// [`crate::chain_events::WATCHER_MAX_BACKOFF`]: it is lower than the other
@@ -84,16 +75,16 @@ pub struct DetectedSlash {
     pub offense_type: u8,
     /// Bond amount slashed, in TOKEN base units.
     pub amount: U256,
-    /// `keccak256` evidence digest from the `Slashed` event.
+    /// `keccak256` evidence digest, from the `CapacityBond` slash record.
     pub evidence_hash: B256,
-    /// Block the `Slashed` log was mined in (`None` if pending when observed).
+    /// Block the `SlashRecorded` log was mined in — `Some` for a slash seen live
+    /// on the tail, `None` for one recovered by the boot/resync enumeration
+    /// (which reads records, not logs).
     pub block_number: Option<u64>,
-    /// **Nominal** appeal-window close: the `Slashed` block timestamp + 30 days
-    /// (`None` if the block read failed). This is a cheap client-side hint, not
-    /// the authoritative deadline — it does NOT read the `CapacityBond` slash
-    /// record and ignores protocol-pause extensions, which only ever move the
-    /// real deadline *later* (`markAppealOpen` adds `pausedTotal`). Safe to file
-    /// before this; a keeper must not treat a just-past value as final.
+    /// **Authoritative** appeal-window close, read from `getSlashRecord`
+    /// (`appealWindowClose`): it carries protocol-pause extensions, which a
+    /// deadline derived from a log's block timestamp does not. Always `Some` now
+    /// the deadline comes off the record rather than a best-effort block read.
     pub appeal_window_close: Option<u64>,
 }
 
@@ -101,6 +92,139 @@ pub struct DetectedSlash {
 /// deduped by `slashId`. Cloned into [`crate::admin::AdminState`] for the
 /// read-only `admin_v1_slashes` surface.
 pub type SlashStore = Arc<RwLock<Vec<DetectedSlash>>>;
+
+/// The authoritative `CapacityBond.getSlashRecord` fields the enumeration and
+/// live tail consume, decoupled from the ABI struct so the boot path is
+/// unit-testable with a scripted stub.
+#[derive(Debug, Clone)]
+struct SlashRecordView {
+    /// Offense taxonomy index (ADR 014).
+    offense_type: u8,
+    /// Bond amount slashed, in TOKEN base units.
+    amount: U256,
+    /// `keccak256` evidence digest.
+    evidence_hash: B256,
+    /// **Authoritative** appeal-window close: carries protocol-pause extensions,
+    /// unlike a deadline derived from a log's block timestamp.
+    appeal_window_close: u64,
+}
+
+/// The chain reads the boot enumeration and the live tail perform, behind a
+/// trait so the paging and still-appealable filter are unit-testable without a
+/// provider.
+///
+/// Spelled RPITIT with an explicit `+ Send` (rather than `async fn`, whose
+/// futures carry no `Send` bound) because the periodic resync calls these from
+/// inside the spawned watcher's `on_tick_complete`, whose future `tokio::spawn`
+/// requires to be `Send`. Production monomorphizes to the alloy contract impl.
+trait SlashChainReads: Send + Sync {
+    /// How many slashes have ever been minted against `operator`
+    /// (`operatorSlashCount`).
+    fn operator_slash_count(&self, operator: Address) -> impl Future<Output = Result<U256>> + Send;
+    /// The `slashId` at `index` in `operator`'s append-only slash list
+    /// (`operatorSlashIdAt`); indices are stable, so no pinned block is needed.
+    fn operator_slash_id_at(
+        &self,
+        operator: Address,
+        index: U256,
+    ) -> impl Future<Output = Result<U256>> + Send;
+    /// The authoritative record for `slashId` (`getSlashRecord`).
+    fn get_slash_record(
+        &self,
+        slash_id: U256,
+    ) -> impl Future<Output = Result<SlashRecordView>> + Send;
+}
+
+/// Enumerate this operator's still-appealable slashes from the authoritative
+/// `CapacityBond` records — the boot path that replaces re-scanning the
+/// `Slashed` log tail from a block floor on every start (#1108, ADR 019).
+///
+/// Walks the append-only index backwards from newest and stops at the first
+/// record whose appeal window has already closed against `now_secs`: earlier
+/// records were minted earlier (`slashedAt` order), so their windows closed too.
+/// The list is append-only with stable indices, so — unlike the swap-and-pop
+/// enumeration views — no pinned-block read or count re-check is required; a
+/// slash minted mid-scan lands at an index past the old count (unseen here) and
+/// is picked up by the live `SlashRecorded` tail instead.
+async fn bootstrap_slashes<R: SlashChainReads>(
+    reads: &R,
+    operator: Address,
+    now_secs: u64,
+) -> Result<Vec<DetectedSlash>> {
+    let count = reads.operator_slash_count(operator).await?;
+    let mut out = Vec::new();
+    let mut index = count;
+    while index > U256::ZERO {
+        index -= U256::from(1u8);
+        let slash_id = reads.operator_slash_id_at(operator, index).await?;
+        let record = reads.get_slash_record(slash_id).await?;
+        if record.appeal_window_close <= now_secs {
+            // Appended in `slashedAt` order, so every older record is closed too.
+            break;
+        }
+        out.push(DetectedSlash {
+            slash_id,
+            offense_type: record.offense_type,
+            amount: record.amount,
+            evidence_hash: record.evidence_hash,
+            // No log is read on this path; the record carries the authoritative
+            // deadline rather than a block-timestamp derivation.
+            block_number: None,
+            appeal_window_close: Some(record.appeal_window_close),
+        });
+    }
+    Ok(out)
+}
+
+/// Production [`SlashChainReads`] over the live `CapacityBond` contract.
+#[derive(Clone)]
+struct ContractReads<P: Provider + Clone> {
+    bond: CapacityBond::CapacityBondInstance<P>,
+}
+
+impl<P: Provider + Clone> SlashChainReads for ContractReads<P> {
+    async fn operator_slash_count(&self, operator: Address) -> Result<U256> {
+        self.bond
+            .operatorSlashCount(operator)
+            .call()
+            .await
+            .with_context(|| format!("operatorSlashCount({operator})"))
+    }
+
+    async fn operator_slash_id_at(&self, operator: Address, index: U256) -> Result<U256> {
+        self.bond
+            .operatorSlashIdAt(operator, index)
+            .call()
+            .await
+            .with_context(|| format!("operatorSlashIdAt({operator}, {index})"))
+    }
+
+    async fn get_slash_record(&self, slash_id: U256) -> Result<SlashRecordView> {
+        let record = self
+            .bond
+            .getSlashRecord(slash_id)
+            .call()
+            .await
+            .with_context(|| format!("getSlashRecord({slash_id})"))?;
+        Ok(SlashRecordView {
+            offense_type: record.offenseType,
+            amount: record.slashAmount,
+            evidence_hash: record.evidenceHash,
+            appeal_window_close: record.appealWindowClose,
+        })
+    }
+}
+
+/// Current wall-clock UNIX seconds, the clock the still-appealable filter tests
+/// each record's `appealWindowClose` against. Wall time tracks chain time within
+/// seconds on an L2; the filter only decides whether a slash is *shown*, so a
+/// boundary-second skew is immaterial (the authoritative deadline is stored
+/// regardless). A pre-epoch clock degrades to `0`, which shows every slash.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
 
 /// A running slash-detection watcher. Holds the shared store and owns its
 /// `WatcherHandle` — graceful [`shutdown`](Self::shutdown) first (the runtime
@@ -118,55 +242,80 @@ impl std::fmt::Debug for SlashWatcher {
 }
 
 impl SlashWatcher {
-    /// Spawn the slash-detection watcher. Infallible: every RPC (head read,
-    /// `get_logs`) happens inside the poll loop, so a transient
-    /// bring-up failure retries with backoff rather than disabling detection for
-    /// the daemon's lifetime.
+    /// Enumerate this operator's still-appealable slashes from `CapacityBond`,
+    /// then spawn the `SlashRecorded` tail that keeps the store current.
     ///
-    /// `from_block` is the deploy floor the boot re-scan is clamped to. The
-    /// in-memory store is rebuilt on **every** process start, but bounded to the
-    /// `appeal_window_blocks` lookback (`head - ~30 days`, clamped `>=
-    /// from_block`) rather than genesis (#1108), so a slash mined while the node
-    /// was down is re-surfaced on restart within its appeal window without an
-    /// O(chain-age) scan — the store is not durable, so a resume cursor could not
-    /// skip this rebuild.
-    #[must_use]
-    #[allow(clippy::too_many_arguments)]
-    pub fn bootstrap<P: Provider + Clone + 'static>(
+    /// Fatal on an enumeration failure, matching the `CapacityBond` registry
+    /// bootstrap that runs on the same contract immediately before this one and
+    /// already gates node startup: an RPC that fails here fails there first, so
+    /// this adds no new startup-failure mode. Once running, a transient tail RPC
+    /// blip retries with backoff, and the periodic resync repairs any drift — so
+    /// detection is never disabled for the daemon's lifetime.
+    pub async fn bootstrap<P: Provider + Clone + 'static>(
         provider: P,
-        slash_judge_addr: Address,
+        capacity_bond_addr: Address,
         self_address: Address,
-        from_block: u64,
         event_poll_interval: Duration,
         head: Arc<dyn HeadSource>,
         metrics: Arc<Metrics>,
-    ) -> Self {
-        info!(%slash_judge_addr, %self_address, from_block, "slash-detection watcher started");
+    ) -> Result<Self> {
+        info!(%capacity_bond_addr, %self_address, "slash-detection watcher started");
+        let reads = ContractReads {
+            bond: CapacityBond::new(capacity_bond_addr, provider.clone()),
+        };
+
+        // Head BEFORE the enumeration, then seed the tail cursor there. The
+        // reverse order would lose a `SlashRecorded` landing between enumeration
+        // and the head read — neither in the snapshot nor above the cursor.
+        // Re-applying a snapshot event is a deduped no-op, so overlap is safe but
+        // a gap is not.
+        let snapshot_block = head
+            .head()
+            .await
+            .context("read head block for the slash enumeration snapshot")?;
+        let initial = bootstrap_slashes(&reads, self_address, unix_now())
+            .await
+            .with_context(|| {
+                format!("enumerate operator slashes from CapacityBond at {capacity_bond_addr}")
+            })?;
+        info!(
+            slash_count = initial.len(),
+            snapshot_block, %self_address, "slash enumeration complete"
+        );
+
+        // Seed through `record_slash` so the boot set is logged, counted, and
+        // deduped on the same path the live tail uses.
         let store: SlashStore = Arc::new(RwLock::new(Vec::new()));
-        // Built before `metrics` is moved into the sink below.
+        for slash in initial {
+            record_slash(&store, &metrics, slash);
+        }
+
         let on_established = metric_hook(&metrics, Metrics::slash_watcher_cycle_established);
         let on_backoff = metric_hook(&metrics, Metrics::slash_watcher_backoff_started);
         let on_tick_success = metric_hook(&metrics, Metrics::slash_watcher_tick);
         let on_task_panic = metric_hook(&metrics, Metrics::slash_watcher_task_panicked);
         let sink = SlashSink {
-            provider: provider.clone(),
+            reads,
             self_address,
             store: Arc::clone(&store),
-            metrics,
+            metrics: Arc::clone(&metrics),
+            resync_interval: SLASH_RESYNC_INTERVAL,
+            // The bootstrap enumeration just ran, so the first backstop resync is
+            // due one interval from now rather than on the first tick.
+            last_resync: Some(Instant::now()),
         };
         let cfg = WatcherConfig::new(
             head,
-            operator_filter(slash_judge_addr, self_address),
-            // No durable resume cursor (the in-memory store is rebuilt each boot);
-            // re-scan the bounded appeal-window lookback, clamped to the deploy
-            // floor (`from_block`), so a slash mined while down is re-surfaced (#1108).
-            CursorStart::HeadMinusWindow {
-                window_blocks: appeal_window_blocks(),
+            operator_filter(capacity_bond_addr, self_address),
+            // The enumeration rebuilt the store from all of history, so seed the
+            // tail at that snapshot head — no durable cursor, no historical scan.
+            CursorStart::Seeded {
+                at: snapshot_block,
+                persist: None,
             },
             event_poll_interval,
             "slash",
         )
-        .with_from_block(from_block)
         .max_backoff(SLASH_MAX_BACKOFF)
         .on_established(on_established)
         .on_backoff(on_backoff)
@@ -175,7 +324,7 @@ impl SlashWatcher {
         // This sink observes no shutdown token, so it ignores the one `spawn`
         // mints (`|_| sink`); the runtime drives graceful stop via `shutdown`.
         let watcher = resumable_watcher::spawn(provider, cfg, move |_| sink);
-        Self { store, watcher }
+        Ok(Self { store, watcher })
     }
 
     /// Signal the watcher to stop its poll loop and return. Called by the runtime
@@ -191,22 +340,26 @@ impl SlashWatcher {
     }
 }
 
-/// Applies operator-filtered `Slashed` logs to the in-memory detected-slash
-/// store (#1092). `apply` never returns `Err`: [`record_log`] decodes, skips a
-/// reorged-out/undecodable/foreign log, and dedupes by `slashId`, so a bad log
-/// neither tears down the poll cycle nor hot-loops the deterministic re-scan. The
-/// best-effort appeal-window block-timestamp read fails soft (logged, `None`).
-struct SlashSink<P: Provider + Clone> {
-    provider: P,
+/// Applies operator-filtered `SlashRecorded` logs to the in-memory store and
+/// re-enumerates it periodically as the drift backstop.
+///
+/// `apply` never returns `Err`: [`record_recorded_log`] decodes, skips a
+/// reorged-out/undecodable/foreign log, soft-skips on a failed record read (the
+/// resync recovers it), and dedupes by `slashId`, so a bad log neither tears
+/// down the poll cycle nor hot-loops.
+struct SlashSink<R: SlashChainReads> {
+    reads: R,
     self_address: Address,
     store: SlashStore,
     metrics: Arc<Metrics>,
+    resync_interval: Duration,
+    last_resync: Option<Instant>,
 }
 
-impl<P: Provider + Clone> LogSink for SlashSink<P> {
+impl<R: SlashChainReads> LogSink for SlashSink<R> {
     async fn apply(&mut self, log: Log) -> Result<()> {
-        record_log(
-            &self.provider,
+        record_recorded_log(
+            &self.reads,
             self.self_address,
             &self.store,
             &self.metrics,
@@ -215,105 +368,121 @@ impl<P: Provider + Clone> LogSink for SlashSink<P> {
         .await;
         Ok(())
     }
+
+    /// Re-enumerate the operator's still-appealable slashes on the resync cadence
+    /// and replace the store wholesale (build-then-swap: a failed read keeps the
+    /// current set). This repairs any tail event lost to a reorg or RPC backoff
+    /// and prunes slashes whose appeal window has since closed. Returns `Ok` on
+    /// failure — the event tail is the primary path and is still working.
+    async fn on_tick_complete(&mut self) -> Result<()> {
+        let now = Instant::now();
+        if self
+            .last_resync
+            .is_some_and(|last| now.duration_since(last) < self.resync_interval)
+        {
+            return Ok(());
+        }
+        // Stamp before the call, not only on success, so a persistently failing
+        // read retries on the resync cadence rather than on every watcher tick.
+        self.last_resync = Some(now);
+
+        let fresh = match bootstrap_slashes(&self.reads, self.self_address, unix_now()).await {
+            Ok(fresh) => fresh,
+            Err(err) => {
+                warn!(
+                    err = %sanitize_err_chain(&err),
+                    "slash resync failed; keeping the current detected-slash set"
+                );
+                return Ok(());
+            }
+        };
+        let count = fresh.len();
+        let mut guard = self
+            .store
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = fresh;
+        drop(guard);
+        debug!(
+            slash_count = count,
+            "detected-slash set resynced from chain"
+        );
+        Ok(())
+    }
 }
 
-/// The address + `Slashed`-signature + `topic2 == operator` filter applied to
-/// every `eth_getLogs` poll window, so the RPC only ever returns this operator's
-/// slashes.
-fn operator_filter(slash_judge_addr: Address, self_address: Address) -> Filter {
+/// The address + `SlashRecorded`-signature + `topic2 == operator` filter applied
+/// to every `eth_getLogs` poll window, so the RPC only ever returns this
+/// operator's slashes.
+fn operator_filter(capacity_bond_addr: Address, self_address: Address) -> Filter {
     Filter::new()
-        .address(slash_judge_addr)
-        .event_signature(SlashJudge::Slashed::SIGNATURE_HASH)
+        .address(capacity_bond_addr)
+        .event_signature(CapacityBond::SlashRecorded::SIGNATURE_HASH)
         .topic2(self_address.into_word())
 }
 
-/// Decode one `Slashed` log, or `None` for a log that must not be recorded:
-/// reorged-out (`removed == true` — not expected from `eth_getLogs`, which
-/// returns only canonical logs, so this is defensive against a nonconforming
-/// provider), undecodable, or another operator's. The `topic2` filter already
-/// constrains to this operator, but the defensive operator check guards against a
-/// provider that ignores the topic. Pure (no provider) so the skip policy is
-/// unit-testable.
-fn decode_slashed(
-    self_address: Address,
-    log: &alloy::rpc::types::Log,
-) -> Option<SlashJudge::Slashed> {
+/// Decode one `SlashRecorded` log to its `slashId`, or `None` for a log that
+/// must not be recorded: reorged-out (`removed == true` — not expected from
+/// `eth_getLogs`, so this is defensive against a nonconforming provider),
+/// undecodable, or another operator's. The `topic2` filter already constrains to
+/// this operator, but the defensive operator check guards against a provider that
+/// ignores the topic. Pure (no provider) so the skip policy is unit-testable.
+fn decode_recorded(self_address: Address, log: &alloy::rpc::types::Log) -> Option<U256> {
     if log.removed {
-        debug!("skipping reorged-out (removed) Slashed log");
+        debug!("skipping reorged-out (removed) SlashRecorded log");
         return None;
     }
-    let Ok(event) = SlashJudge::Slashed::decode_log_data(&log.inner.data) else {
+    let Ok(event) = CapacityBond::SlashRecorded::decode_log_data(&log.inner.data) else {
         warn!(
             block_number = ?log.block_number,
             tx = ?log.transaction_hash,
-            "skipping undecodable Slashed log"
+            "skipping undecodable SlashRecorded log"
         );
         return None;
     };
     if event.operator != self_address {
         return None;
     }
-    Some(event)
+    Some(event.slashId)
 }
 
-/// Decode one `Slashed` log and record it. Skipped logs (see
-/// [`decode_slashed`]) neither tear down the cycle nor record a phantom slash.
-async fn record_log<P: Provider>(
-    provider: &P,
+/// Decode one `SlashRecorded` log, point-read its authoritative record, and
+/// record it. Skipped logs (see [`decode_recorded`]) and a failed record read
+/// neither tear down the cycle nor record a phantom slash — a record read that
+/// fails is recovered by the next resync.
+async fn record_recorded_log<R: SlashChainReads>(
+    reads: &R,
     self_address: Address,
     store: &SlashStore,
     metrics: &Arc<Metrics>,
     log: &alloy::rpc::types::Log,
 ) {
-    let Some(event) = decode_slashed(self_address, log) else {
+    let Some(slash_id) = decode_recorded(self_address, log) else {
         return;
     };
-    let window_close = appeal_window_close(provider, log.block_number).await;
+    let record = match reads.get_slash_record(slash_id).await {
+        Ok(record) => record,
+        Err(err) => {
+            warn!(
+                err = %sanitize_err_chain(&err),
+                slash_id = %slash_id,
+                "failed to read slash record for a live SlashRecorded log; the resync will recover it"
+            );
+            return;
+        }
+    };
     record_slash(
         store,
         metrics,
         DetectedSlash {
-            slash_id: event.slashId,
-            offense_type: event.offenseType as u8,
-            amount: event.amount,
-            evidence_hash: event.evidenceHash,
+            slash_id,
+            offense_type: record.offense_type,
+            amount: record.amount,
+            evidence_hash: record.evidence_hash,
             block_number: log.block_number,
-            appeal_window_close: window_close,
+            appeal_window_close: Some(record.appeal_window_close),
         },
     );
-}
-
-/// Nominal appeal-window close = block timestamp + 30 days, or `None` when the
-/// block number is absent (pending log) or the block read fails (best-effort).
-///
-/// The read is bounded by [`timed`], and a timeout takes the same soft-degrade
-/// path as any other read failure: the slash is still recorded, only its appeal
-/// deadline is unknown. That is strictly better than the unbounded alternative,
-/// where one stalled `get_block` wedges the whole tick and *no* slash surfaces.
-async fn appeal_window_close<P: Provider>(provider: &P, block_number: Option<u64>) -> Option<u64> {
-    let block_number = block_number?;
-    match timed(
-        None,
-        "get_block",
-        provider.get_block(alloy::eips::BlockId::from(block_number)),
-    )
-    .await
-    {
-        Ok(Some(block)) => Some(block.header.timestamp + APPEAL_FILING_WINDOW_SECS),
-        Ok(None) => None,
-        Err(err) => {
-            // Scrubbed, not `%err`: `timed` folds in the transport leg, whose
-            // Display carries reqwest's ` for url (…)` tail — i.e. the raw
-            // `rpc_url`, credentials and all. This was the one chain-error log
-            // in the tree rendering an alloy error unscrubbed.
-            warn!(
-                err = %sanitize_err_chain(&err),
-                block_number,
-                "failed to read slash block timestamp for appeal window"
-            );
-            None
-        }
-    }
 }
 
 /// Append `slash` to the store if its `slashId` is not already present, bumping
@@ -345,31 +514,9 @@ fn record_slash(store: &SlashStore, metrics: &Arc<Metrics>, slash: DetectedSlash
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
-
-    /// A stalled provider must not wedge the tick: the block read is bounded, and
-    /// a timeout takes the same soft-degrade path as any other read failure.
-    ///
-    /// This drives the real `appeal_window_close` against a real provider, so it
-    /// fails if the `timed` wrap is ever dropped from the call site — asserting
-    /// `timed` in isolation would prove the mechanism but not this wiring.
-    /// `start_paused` auto-advances to the deadline, so it costs no wall-clock.
-    #[tokio::test(start_paused = true)]
-    async fn hanging_block_read_degrades_to_no_deadline_rather_than_wedging() {
-        use crate::chain_events::test_support::{bounded, hanging_provider};
-        let provider = hanging_provider();
-        assert_eq!(
-            bounded(
-                "appeal_window_close",
-                appeal_window_close(&provider, Some(100))
-            )
-            .await,
-            None,
-            "a stalled get_block must degrade to an unknown appeal deadline"
-        );
-    }
 
     /// A `DetectedSlash` distinguished only by `slash_id` (the dedup key).
     fn slash(id: u64) -> DetectedSlash {
@@ -383,15 +530,14 @@ mod tests {
         }
     }
 
-    /// A well-formed `Slashed` RPC log for `operator`, with the `removed`
+    /// A well-formed `SlashRecorded` RPC log for `operator`, with the `removed`
     /// reorg flag under test control.
-    fn slashed_log(operator: Address, removed: bool) -> alloy::rpc::types::Log {
-        let event = SlashJudge::Slashed {
+    fn recorded_log(operator: Address, removed: bool) -> alloy::rpc::types::Log {
+        let event = CapacityBond::SlashRecorded {
             slashId: U256::from(1u64),
             operator,
-            offenseType: SlashJudge::OffenseType::Phantom,
-            amount: U256::from(42u64),
-            evidenceHash: B256::repeat_byte(7),
+            slashedAt: 0,
+            slashAmount: U256::from(42u64),
         };
         alloy::rpc::types::Log {
             inner: alloy::primitives::Log {
@@ -434,32 +580,153 @@ mod tests {
     }
 
     #[test]
-    fn decode_slashed_skips_removed_and_foreign_logs() {
+    fn decode_recorded_skips_removed_and_foreign_logs() {
         let operator = Address::repeat_byte(0x11);
 
         // The same log decodes when live but is skipped once reorged out
         // (`removed == true`), so a reorg can't record a phantom slash.
-        assert!(decode_slashed(operator, &slashed_log(operator, false)).is_some());
-        assert!(decode_slashed(operator, &slashed_log(operator, true)).is_none());
+        assert_eq!(
+            decode_recorded(operator, &recorded_log(operator, false)),
+            Some(U256::from(1u64))
+        );
+        assert!(decode_recorded(operator, &recorded_log(operator, true)).is_none());
         // Defensive operator check: another operator's slash is never recorded
         // even if a provider ignores the `topic2` filter.
         assert!(
-            decode_slashed(Address::repeat_byte(0x22), &slashed_log(operator, false)).is_none()
+            decode_recorded(Address::repeat_byte(0x22), &recorded_log(operator, false)).is_none()
         );
     }
 
-    /// The scan-floor policy (cursor rewind, deploy-floor clamp, head clamp) now
-    /// lives on the resumable watcher's `resolve_head_window_start` /
-    /// `resolve_persisted_start`; its unit tests live in
-    /// `crate::chain_events::resumable_watcher`.
-    #[test]
-    fn appeal_window_covers_thirty_days() {
-        // The boot lookback must cover the full 30-day appeal window even at the
-        // fastest plausible block time. Pinned to the concrete expected count
-        // (30 days of 250ms Arbitrum blocks) so an accidental unit slip in the
-        // formula (secs vs ms) fails loudly rather than restating itself.
-        assert_eq!(appeal_window_blocks(), 10_368_000);
-        // At least one block per second of the window (block time < 1s).
-        assert!(appeal_window_blocks() >= APPEAL_FILING_WINDOW_SECS);
+    /// Scripted [`SlashChainReads`]: no provider, no chain. Slashes are supplied
+    /// oldest-first (append order), matching `operatorSlashIdAt`'s stable indices.
+    struct StubSlashReads {
+        operator: Address,
+        /// (slashId, record) in append order (index 0 = oldest).
+        slashes: Vec<(U256, SlashRecordView)>,
+        /// slashIds whose record was point-read, for the early-stop assertion.
+        reads: std::sync::Mutex<Vec<U256>>,
+    }
+
+    impl StubSlashReads {
+        fn new(operator: Address, slashes: Vec<(U256, SlashRecordView)>) -> Self {
+            Self {
+                operator,
+                slashes,
+                reads: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn records_read(&self) -> Vec<U256> {
+            self.reads.lock().unwrap().clone()
+        }
+    }
+
+    impl SlashChainReads for StubSlashReads {
+        async fn operator_slash_count(&self, operator: Address) -> Result<U256> {
+            assert_eq!(operator, self.operator, "unexpected operator");
+            Ok(U256::from(self.slashes.len()))
+        }
+
+        async fn operator_slash_id_at(&self, operator: Address, index: U256) -> Result<U256> {
+            assert_eq!(operator, self.operator, "unexpected operator");
+            let i: usize = index.to();
+            self.slashes
+                .get(i)
+                .map(|(id, _)| *id)
+                .ok_or_else(|| anyhow::anyhow!("SlashIndexOutOfRange"))
+        }
+
+        async fn get_slash_record(&self, slash_id: U256) -> Result<SlashRecordView> {
+            self.reads.lock().unwrap().push(slash_id);
+            self.slashes
+                .iter()
+                .find(|(id, _)| *id == slash_id)
+                .map(|(_, rec)| rec.clone())
+                .ok_or_else(|| anyhow::anyhow!("no such slash"))
+        }
+    }
+
+    fn record(
+        offense_type: u8,
+        amount: u64,
+        evidence: u8,
+        appeal_window_close: u64,
+    ) -> SlashRecordView {
+        SlashRecordView {
+            offense_type,
+            amount: U256::from(amount),
+            evidence_hash: B256::repeat_byte(evidence),
+            appeal_window_close,
+        }
+    }
+
+    /// Enumeration surfaces the still-appealable slashes newest-first, carrying
+    /// the authoritative record fields, and excludes those whose window closed.
+    #[tokio::test]
+    async fn bootstrap_slashes_surfaces_only_still_appealable_slashes_newest_first() {
+        let op = Address::repeat_byte(0xAB);
+        let now = 1_000;
+        // Append order (oldest→newest): id 10 already closed, 20 and 30 still open.
+        let reads = StubSlashReads::new(
+            op,
+            vec![
+                (U256::from(10u64), record(2, 100, 0x11, now - 1)),
+                (U256::from(20u64), record(1, 200, 0x22, now + 50)),
+                (U256::from(30u64), record(0, 300, 0x33, now + 99)),
+            ],
+        );
+
+        let slashes = bootstrap_slashes(&reads, op, now).await.unwrap();
+
+        assert_eq!(slashes.len(), 2, "closed slash 10 must be excluded");
+        // Newest-first backward walk: 30 then 20.
+        assert_eq!(slashes[0].slash_id, U256::from(30u64));
+        assert_eq!(slashes[1].slash_id, U256::from(20u64));
+        // Authoritative appeal-window close carried from the record, not derived.
+        assert_eq!(slashes[0].appeal_window_close, Some(now + 99));
+        assert_eq!(slashes[0].offense_type, 0);
+        assert_eq!(slashes[1].evidence_hash, B256::repeat_byte(0x22));
+        // No log, so no block number.
+        assert_eq!(slashes[0].block_number, None);
+    }
+
+    /// The backward walk stops at the first closed record and never reads the
+    /// older ones (they are closed too — appended in `slashedAt` order).
+    #[tokio::test]
+    async fn bootstrap_slashes_stops_at_the_first_closed_record() {
+        let op = Address::repeat_byte(0xCD);
+        let now = 1_000;
+        let reads = StubSlashReads::new(
+            op,
+            vec![
+                (U256::from(1u64), record(0, 1, 0x01, now - 100)),
+                (U256::from(2u64), record(0, 1, 0x02, now - 50)),
+                (U256::from(3u64), record(0, 1, 0x03, now + 10)),
+            ],
+        );
+
+        let slashes = bootstrap_slashes(&reads, op, now).await.unwrap();
+
+        assert_eq!(slashes.len(), 1);
+        assert_eq!(slashes[0].slash_id, U256::from(3u64));
+        // Only the newest was point-read; the walk stopped at slash 2 without
+        // reading slash 1.
+        assert_eq!(
+            reads.records_read(),
+            vec![U256::from(3u64), U256::from(2u64)]
+        );
+    }
+
+    /// An operator with no slashes enumerates to an empty set without error.
+    #[tokio::test]
+    async fn bootstrap_slashes_of_a_clean_operator_is_empty() {
+        let op = Address::repeat_byte(0xEF);
+        let reads = StubSlashReads::new(op, vec![]);
+        assert!(
+            bootstrap_slashes(&reads, op, 1_000)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 }

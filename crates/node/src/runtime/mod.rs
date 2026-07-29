@@ -793,23 +793,25 @@ async fn build_chain_and_handlers(
     // during drain). Also held inside both façades' projections.
     let capacity_bond_watcher = registry.watcher;
 
-    // Slash-detection watcher (#1032, G-NODE-05): follow `SlashJudge.Slashed`
-    // for this operator so the slash surfaces over `admin_v1_slashes` (+ the
-    // `decdn_slashes_detected_total` metric) and the operator can file
-    // `decdn appeal slash` in time. Read-only; held to `run()`'s end so its
-    // background task lives as long as the daemon. `bootstrap` is infallible —
-    // every RPC (head read, `get_logs`) happens inside the poll
-    // loop, so a bring-up RPC blip retries with backoff rather than disabling
-    // detection for the daemon's lifetime.
+    // Slash-detection watcher (#1032, G-NODE-05): enumerate this operator's
+    // still-appealable slashes from `CapacityBond` and follow `SlashRecorded`, so
+    // a slash surfaces over `admin_v1_slashes` (+ the `decdn_slashes_detected_total`
+    // metric) and the operator can file `decdn appeal slash` in time. Read-only;
+    // held to `run()`'s end so its background task lives as long as the daemon.
+    // The boot enumeration is fatal, like the CapacityBond registry bootstrap
+    // above on the same contract that already gates startup — so it adds no new
+    // failure mode; thereafter a tail blip retries and the periodic resync heals
+    // drift, so detection is never disabled for the daemon's lifetime.
     let slash_watcher = crate::slash_watcher::SlashWatcher::bootstrap(
         ProviderFactory::read_only(rpc_url.clone(), event_poll_interval),
-        slash_judge_addr,
+        capacity_bond_addr,
         infra.eth_signer.address(),
-        cfg.blockchain.slash_judge_from_block,
         event_poll_interval,
         Arc::clone(&head),
         Arc::clone(&infra.node_metrics),
-    );
+    )
+    .await
+    .context("bootstrap the slash-detection watcher")?;
     let slash_store = slash_watcher.store();
 
     // NodeId → bonded operator address resolver for node-to-node pulls (#831),
