@@ -90,6 +90,7 @@ fn seed_resolved(rate: u64, level: LogLevel) -> ResolvedConfig {
             circuit_breaker: decdn_cache::CircuitBreakerPolicy::default(),
             user_agent: decdn_cache::DEFAULT_USER_AGENT.to_string(),
             gc_interval_sec: 0,
+            fs_rescan_interval_sec: 0,
             eviction_high_water_pct: 90,
             eviction_target_pct: 80,
             eviction_per_sweep_budget: 16,

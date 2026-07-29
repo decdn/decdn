@@ -836,6 +836,7 @@ impl RuntimeReloadState {
                 circuit_breaker: decdn_cache::CircuitBreakerPolicy::default(),
                 user_agent: decdn_cache::DEFAULT_USER_AGENT.to_string(),
                 gc_interval_sec: 0,
+                fs_rescan_interval_sec: 0,
                 eviction_high_water_pct: 90,
                 eviction_target_pct: 80,
                 eviction_per_sweep_budget: 16,
@@ -1177,6 +1178,7 @@ const fn cache_has_restart_required_field(c: &decdn_common::config::types::Cache
         circuit_breaker,
         user_agent,
         gc_interval_sec,
+        fs_rescan_interval_sec,
         eviction_high_water_pct,
         eviction_target_pct,
         eviction_per_sweep_budget,
@@ -1202,6 +1204,9 @@ const fn cache_has_restart_required_field(c: &decdn_common::config::types::Cache
         || circuit_breaker.is_some()
         || user_agent.is_some()
         || gc_interval_sec.is_some()
+        // The rescan *cadence* needs a restart to rebuild the interval timer;
+        // a reload still re-runs one rescan to pick up newly-added files.
+        || fs_rescan_interval_sec.is_some()
         || eviction_high_water_pct.is_some()
         || eviction_target_pct.is_some()
         || eviction_per_sweep_budget.is_some()
@@ -1343,6 +1348,7 @@ mod tests {
                 circuit_breaker: decdn_cache::CircuitBreakerPolicy::default(),
                 user_agent: decdn_cache::DEFAULT_USER_AGENT.to_string(),
                 gc_interval_sec: 0,
+                fs_rescan_interval_sec: 0,
                 eviction_high_water_pct: 90,
                 eviction_target_pct: 80,
                 eviction_per_sweep_budget: 16,
