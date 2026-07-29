@@ -1197,12 +1197,16 @@ pub struct DecdnMetrics {
     /// not authorize the named channel (#327). Visible name:
     /// `decdn_serve_stream_rejected_owner_mismatch_total`.
     pub serve_stream_rejected_owner_mismatch: Counter,
-    /// `serve_stream` requests refused before anything is signed because the
+    /// `serve_stream` requests refused before any bytes are served because the
     /// requesting channel's remaining deposit could not cover what the node
-    /// would front at its rate. Both pre-flight deposit guards bump this: the
-    /// cache-miss one (#856) reserves the worst-case blob cost before an
-    /// upstream pull, and the direct-serve one (#1516) reserves the first credit
-    /// window of the requested span. Wire-indistinguishable from `cache_miss`
+    /// would front at its rate. (The refusal itself is signed — as an `ok: false`
+    /// response; what is never signed is an `ok: true`.) Two guards bump this.
+    /// The cache-miss one (#856) reserves the whole-blob cost when
+    /// `max_blob_size_bytes` is finite and the speculative window cost otherwise,
+    /// and runs before the *window* pull-through spend — but NOT before the
+    /// buffered/range/local fill tiers, which spend first and reach the
+    /// direct-serve guard afterwards. The direct-serve one (#1516) reserves
+    /// `min(credit window, chunk-group-aligned request span)`. Wire-indistinguishable from `cache_miss`
     /// (signed as `NotFound`), so this server-side counter is the only place the
     /// distinction lives — a rising value isolates near-empty-deposit abuse.
     /// Visible name: `decdn_serve_stream_rejected_insufficient_deposit_total`.

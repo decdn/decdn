@@ -21,6 +21,13 @@ pub mod retry;
 pub use circuit_breaker::{
     Admission, BreakerState, Clock, ManualClock, OriginBreaker, OriginOutcome, SystemClock,
 };
+/// Bao chunk-group granularity (16 KiB, ADR 038), re-exported because it is a
+/// *billing-visible* property of [`CacheEngine::export_bao_range_stream`]: the
+/// export snaps a requested range out to the enclosing group boundaries and the
+/// serve path does not trim back, so the payer is charged for the aligned
+/// superset. Any caller pricing a range before serving it must align first or it
+/// under-reserves by up to two groups.
+pub use decdn_bao_range::CHUNK_GROUP_BYTES;
 pub use engine::{
     CacheEngine, CacheStats, EvictionCandidates, EvictionPreview, PrewarmReport, RangePullOutcome,
     TeeOpen, TeeReservation, TeeSink,

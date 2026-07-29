@@ -1664,9 +1664,12 @@ async fn client_delivers_empty_blob() -> anyhow::Result<()> {
 /// it must NOT reset to `None`.
 ///
 /// Induced deterministically by deposit exhaustion (no mock server): a 1.5 MiB
-/// blob needs two vouchers — cumulative amount 10 then 15 at `RATE_PER_MB` — but
-/// the channel deposit is 12. The node acks voucher 1 (amount 10 <= 12) and
-/// rejects voucher 2 (amount 15 > 12) as over-deposit, so the fetch errors after
+/// blob needs two vouchers — cumulative amount 10 then 16 at `RATE_PER_MB` — but
+/// the channel deposit is 12. (Billing is bao WIRE bytes, ADR 038: the 1.5 MiB
+/// payload is `1_578_944` wire bytes, so voucher 1 covers the `1_048_576`-byte
+/// interval for 10 and voucher 2 the `530_368`-byte remainder for a cumulative
+/// 16.) The node acks voucher 1 (amount 10 <= 12) and
+/// rejects voucher 2 (amount 16 > 12) as over-deposit, so the fetch errors after
 /// one acked voucher. `progress.acked()` must then report voucher 1 (nonce 1),
 /// proving the copy-back in `stream_fetch_tracked` runs on the error path.
 ///
@@ -2839,9 +2842,9 @@ async fn client_sub_interval_blob_serves_below_one_interval_cost() -> anyhow::Re
     .await?;
     anyhow::ensure!(got == payload, "the sub-interval blob must transfer intact");
     anyhow::ensure!(
-        !metric_line_present(
+        metric_line_present(
             &metrics.encode()?,
-            "decdn_serve_stream_rejected_insufficient_deposit_total 1"
+            "decdn_serve_stream_rejected_insufficient_deposit_total 0"
         ),
         "a funded sub-interval request must not trip the deposit gate"
     );
@@ -2982,6 +2985,131 @@ async fn client_spent_down_channel_is_refused_pre_serve() -> anyhow::Result<()> 
             "decdn_serve_stream_rejected_insufficient_deposit_total 1"
         ),
         "the spent-down refusal must bump the deposit counter"
+    );
+
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
+/// The resume arm of the #1516 gate's span (`byte_offset > 0`, `byte_len == 0`),
+/// which is the shape `decdn fetch --output` sends when continuing a partial
+/// download. The gate must price only the remaining tail, not the whole blob.
+///
+/// This is the arm with teeth. `decdn fetch` treats a `NotFound` on a resume as
+/// evidence the partial file may belong to another blob, so it rewinds to
+/// `byte_offset = 0` and re-downloads — and re-pays for — everything it already
+/// had (`crates/cli/src/commands/fetch.rs`, `resume_may_be_stale`). A gate that
+/// mispriced a resume as the whole blob would therefore not merely refuse: it
+/// would silently double the user's bill on every interrupted large fetch.
+///
+/// Sized so the two readings diverge: a 1.4 MiB blob resumed at 1 MiB leaves a
+/// ~0.4 MiB tail costing 4, while the whole blob would cost 14 and one window
+/// 10. A deposit of 5 covers only the tail, so pricing anything but the tail
+/// refuses.
+#[tokio::test(flavor = "multi_thread")]
+async fn client_resumed_range_is_priced_on_the_tail_not_the_whole_blob() -> anyhow::Result<()> {
+    const TAIL_OFFSET: u64 = 1_048_576;
+    let payload = vec![0x9Eu8; 1_468_006]; // 1.4 MiB
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+
+    let signer = Arc::new(PrivateKeySigner::random());
+    let store = Arc::new(MemoryChannelStateStore::new());
+    store.record(&ChannelState::new(
+        channel_id(),
+        signer.address(),
+        signer.address(),
+        TOKEN,
+        U256::from(5u64), // covers the ~0.4 MiB tail (4), not the blob (14)
+    ))?;
+    let store_dyn: Arc<dyn ChannelStateStore> = store.clone();
+    let (target, _server_eth, server_ep, server_task, metrics) =
+        spawn_handler_server_with_metrics(cache, store_dyn, RATE_PER_MB, 0, 16).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let req = StreamRequest {
+        hash: *hash.as_bytes(),
+        namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        channel_id: channel_id().into(),
+        byte_offset: TAIL_OFFSET,
+        byte_len: 0,
+        timestamp_us: 0x9E01,
+    };
+    match raw_request(&client_ep, target, &req, None).await? {
+        ClientMessage::StreamResponse(resp) => anyhow::ensure!(
+            resp.body.ok,
+            "a resume funded for its tail must be served, not refused: {:?}",
+            resp.error
+        ),
+        other => anyhow::bail!("expected a signed StreamResponse, got {other:?}"),
+    }
+    anyhow::ensure!(
+        metric_line_present(
+            &metrics.encode()?,
+            "decdn_serve_stream_rejected_insufficient_deposit_total 0"
+        ),
+        "the resume must not trip the deposit gate"
+    );
+
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
+/// The gate's boundary: `headroom == ceiling` must PASS, because the check is
+/// `<` and a channel funded to exactly the window's cost can pay for it.
+///
+/// Left uncovered by the four refusal/serve tests — each sits strictly on one
+/// side of the boundary, so flipping `<` to `<=` passes all of them while
+/// refusing every exactly-funded channel with a lossy `NotFound` the CLI renders
+/// as a missing blob. A `decdn fetch --deposit-micro-usdc` funded to the computed
+/// cost is exactly this case.
+#[tokio::test(flavor = "multi_thread")]
+async fn client_headroom_equal_to_the_ceiling_is_served() -> anyhow::Result<()> {
+    let payload = vec![0xB0u8; 1_572_864]; // 1.5 MiB → one 1 MiB window costs 10
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+
+    let signer = Arc::new(PrivateKeySigner::random());
+    let store = Arc::new(MemoryChannelStateStore::new());
+    store.record(&ChannelState::new(
+        channel_id(),
+        signer.address(),
+        signer.address(),
+        TOKEN,
+        U256::from(10u64), // exactly the ceiling — `10 < 10` is false, so serve
+    ))?;
+    let store_dyn: Arc<dyn ChannelStateStore> = store.clone();
+    let (target, _server_eth, server_ep, server_task, metrics) =
+        spawn_handler_server_with_metrics(cache, store_dyn, RATE_PER_MB, 0, 16).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let req = StreamRequest {
+        hash: *hash.as_bytes(),
+        namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        channel_id: channel_id().into(),
+        byte_offset: 0,
+        byte_len: 0,
+        timestamp_us: 0xB001,
+    };
+    // Only the pre-serve verdict is asserted. The transfer may still stop at a
+    // later voucher — the ceiling is priced in content bytes while vouchers bill
+    // wire bytes — and that is the mid-stream ceiling's job, not the gate's.
+    match raw_request(&client_ep, target, &req, None).await? {
+        ClientMessage::StreamResponse(resp) => anyhow::ensure!(
+            resp.body.ok,
+            "headroom exactly equal to the ceiling must be served: {:?}",
+            resp.error
+        ),
+        other => anyhow::bail!("expected a signed StreamResponse, got {other:?}"),
+    }
+    anyhow::ensure!(
+        metric_line_present(
+            &metrics.encode()?,
+            "decdn_serve_stream_rejected_insufficient_deposit_total 0"
+        ),
+        "an exactly-funded channel must not trip the deposit gate"
     );
 
     client_ep.close().await;
