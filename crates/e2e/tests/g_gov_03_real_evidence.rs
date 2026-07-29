@@ -8,18 +8,14 @@
 //! closes that gap: every byte of evidence submitted here came off the wire from a
 //! running `decdn-node`, `slash_sig` included, and is forwarded verbatim.
 //!
-//! Two nodes, one offense each, both induced through real operator surfaces:
-//!
-//! - **Phantom announcement (node A).** A holds `H` and answers a probe with a
-//!   signed `has_blob: true`. The operator then evicts `H` over the admin RPC, and
-//!   the next paid stream on the *same already-accepted channel* comes back as a
-//!   signed `ok: false`. Those two daemon-signed messages, seconds apart, are the
-//!   `SlashJudge` phantom pair.
-//! - **Rate bait-and-switch (node B).** B answers a probe at its configured rate,
-//!   the operator raises `payment.rate_per_mb` and hot-reloads it (no restart —
-//!   the field is in the reloadable set), and B's next signed `StreamResponse`
-//!   quotes the higher rate inside the 30s window. That is the
-//!   `submitRateChallenge` pair.
+//! One node, one offense — **rate manipulation** — induced through real operator
+//! surfaces. The node answers a probe for a held blob at its configured rate; the
+//! operator raises `payment.rate_per_mb` and hot-reloads it (no restart — the
+//! field is in the reloadable set); the node's next signed `StreamResponse` for
+//! the same hash *delivers* (`ok: true`) at the higher rate inside the 30s window.
+//! Those two daemon-signed messages are the `submitRateChallenge` pair. A signed
+//! refusal (`ok: false`) is deliberately not usable: rate manipulation requires a
+//! delivery, so only a real `ok: true` response at the raised rate is evidence.
 //!
 //! The positive path asserts the full on-chain consequence: the slash lands, the
 //! TOKEN is escrowed (ADR 028 escrow-on-slash) rather than distributed
@@ -34,6 +30,10 @@
 //!   (`TimestampWindowViolated`) — the 30s window is enforced on real evidence;
 //! - the real probe with its signature swapped for one from an unrelated key is
 //!   rejected (`InvalidProbeSignature`);
+//! - the real stream with its signature swapped for a non-operator's is rejected
+//!   (`InvalidStreamSignature`);
+//! - the same real pair replayed after a successful slash is rejected
+//!   (`EvidenceAlreadyUsed`);
 //! - a failed challenge moves no TOKEN. Note the issue text says the challenger
 //!   "forfeits" its bond; the as-built contract does not, and deliberately so —
 //!   ADR 014 § Bond Handling: "a `submit*Challenge` that fails on-chain
@@ -59,8 +59,9 @@
     clippy::panic,
     clippy::indexing_slicing,
     clippy::duration_suboptimal_units,
-    // `node_a_id` / `node_b_id` and friends: the A/B suffix IS the distinction the
-    // journey is about, and renaming to satisfy the heuristic would obscure it.
+    // `forged`/`forger`, `stream`/`stream_forger` etc.: the near-identical names
+    // pair a forged artifact with the key that forged it, which reads clearer
+    // than a contrived rename.
     clippy::similar_names,
     // The journey is deliberately one linear narrative (capture → negatives →
     // positive → finality) sharing one anvil deployment; splitting it would either
@@ -74,8 +75,6 @@ use std::time::Duration;
 use alloy::primitives::{B256, U256};
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::Context;
-use decdn_cache::Hash;
-use decdn_common::admin::{AdminRpcClient, EvictRequest};
 use decdn_e2e::assert::expect_revert_anyhow;
 use decdn_e2e::bindings::SlashJudgeRate;
 use decdn_e2e::chain::{ChainFixture, EvidencePair, Offense};
@@ -85,15 +84,10 @@ use decdn_e2e::time;
 use decdn_incentive::stream_sig::StreamSlashData;
 use decdn_incentive::{ProbeSlashData, slash_judge_domain};
 use decdn_protocol::ProbeResponse;
-use decdn_protocol::client::{StreamError, StreamResponse};
+use decdn_protocol::client::StreamResponse;
 
 const MIB: usize = 1024 * 1024;
 const DAY: u64 = 24 * 60 * 60;
-
-/// The per-reason reject counter for a genuine cache miss. Reading it pins node
-/// B's refusal to an honest miss rather than one of the other six reasons
-/// `ServeRejectReason::wire_error` collapses onto `NotFound` (#1379).
-const CACHE_MISS_METRIC: &str = "decdn_serve_stream_rejected_cache_miss_total";
 
 /// The rendered fixture config's `payment.rate_per_mb`. The bait rate.
 const BASE_RATE_PER_MB: u64 = 10;
@@ -103,8 +97,7 @@ const SWITCHED_RATE_PER_MB: u64 = 40;
 
 /// Overall ceiling so an unbounded await fails fast with a clear message.
 /// Cleanup (anvil kill, daemon kill) runs on drop even on timeout. The journey
-/// runs a full deploy, two daemons, four commit-reveal challenges and several
-/// time warps.
+/// runs a full deploy, a daemon, several commit-reveal challenges and time warps.
 const OVERALL_TIMEOUT: Duration = Duration::from_secs(1200);
 
 #[tokio::test(flavor = "multi_thread")]
@@ -122,168 +115,72 @@ async fn run() -> anyhow::Result<()> {
 
     let chain = ChainFixture::launch().await?;
 
-    // Node A carries the phantom offense, node B the rate bait-and-switch. Two
-    // operators rather than two offenses on one so each assertion reads against a
-    // first-offense bond tier and an untouched `slashedAtEpoch`.
-    let payload_a = vec![0xA1u8; 2 * MIB];
-    let payload_b = vec![0xB2u8; 2 * MIB];
-    let (node_a, hash_a) = NodeFixture::launch(&chain, "US", &payload_a).await?;
-    let (node_b, hash_b) = NodeFixture::launch(&chain, "US", &payload_b).await?;
+    let payload = vec![0xA1u8; 2 * MIB];
+    let (node, hash) = NodeFixture::launch(&chain, "US", &payload).await?;
     let client = ClientFixture::new(&chain).await?;
+    let node_id = B256::from_slice(node.node_id().as_bytes());
 
-    // ================================================================
-    // Capture 1 — phantom announcement from node A.
-    // ================================================================
+    // A real session: opens + funds a channel and warms `hash`, so the node has
+    // observed the channel AND holds the blob — both preconditions for it to sign
+    // a real `ok: true` delivery response below.
+    let (session, _) = client.open_session(&chain, &node, hash).await?;
 
-    // A real paid delivery first. It proves A serves `H`, and — the part the
-    // capture depends on — leaves behind a channel A's chain watcher has already
-    // accepted, so the refusal below cannot be the pre-observation `UnknownChannel`
-    // masquerading as evidence.
-    let delivered = client
-        .fetch(&chain, &node_a, hash_a, alloy::primitives::U256::ZERO)
-        .await?;
-    anyhow::ensure!(
-        delivered.bytes == payload_a,
-        "node A must deliver H before we induce the phantom"
-    );
-    let channel_a = delivered.channel_id;
-
-    // Anchor evidence timestamps to chain time. The judge's staleness bound (and
-    // its future-skew guard) are what compare against `block.timestamp`; the 30s
-    // window is computed purely between the two evidence timestamps and is
-    // chain-time-independent. Anchoring both keeps the pair fresh as well as
-    // in-window.
+    // Anchor evidence timestamps to chain time. The judge's staleness bound and
+    // its future-skew guard compare against `block.timestamp`; the 30s window is
+    // computed purely between the two evidence timestamps.
     let now_us = chain.head_timestamp().await? * 1_000_000;
     let probe_ts = now_us;
     let stream_ts = now_us + 1_000_000; // +1s, well inside the 30s window
     let stale_probe_ts = now_us - 40_000_000; // -40s, deliberately outside it
 
-    // The out-of-window probe is captured FIRST, while A still holds `H` — it is
-    // real daemon output (`has_blob: true`, signed), differing from the admissible
-    // one only in the timestamp the requester chose.
-    let stale_probe = client.probe_at(&node_a, hash_a, stale_probe_ts).await?;
-    let probe_a = client.probe_at(&node_a, hash_a, probe_ts).await?;
+    // Real probes at the CONFIGURED rate, captured before the switch. The stale
+    // one (same content, only the requester timestamp differs) feeds the
+    // out-of-window negative.
+    let stale_probe = client.probe_at(&node, hash, stale_probe_ts).await?;
+    let probe = client.probe_at(&node, hash, probe_ts).await?;
     anyhow::ensure!(
-        probe_a.body.has_blob && stale_probe.body.has_blob,
-        "node A must announce H as held before eviction"
+        probe.body.has_blob && stale_probe.body.has_blob,
+        "node must announce the held blob"
     );
     anyhow::ensure!(
-        probe_a.body.rate_per_mb == BASE_RATE_PER_MB,
-        "unexpected quoted rate {} from node A",
-        probe_a.body.rate_per_mb
-    );
-
-    // The operator evicts what it just announced. Eviction is sticky and
-    // authoritative in the client handler (#279), so the next stream refuses
-    // rather than silently refilling from A's own filesystem origin.
-    node_a
-        .admin_client()?
-        .evict(EvictRequest {
-            hash: alloy::hex::encode(hash_a.as_bytes()),
-            dry_run: false,
-        })
-        .await
-        .context("admin evict H on node A")?;
-
-    let stream_a = client
-        .refused_stream(&chain, &node_a, channel_a, hash_a, stream_ts)
-        .await?;
-    anyhow::ensure!(
-        !stream_a.body.ok,
-        "the captured StreamResponse must be a refusal"
-    );
-    anyhow::ensure!(
-        stream_a.body.hash == *hash_a.as_bytes(),
-        "the refusal must answer for the probed hash"
-    );
-    // Pin the *cause*. Without this the journey would still pass if the eviction
-    // silently no-op'd and the refusal were some other `ok: false` (an unknown
-    // channel, say) — a slash landing for a reason the test never induced.
-    anyhow::ensure!(
-        stream_a.error == Some(StreamError::EvictedSinceProbe),
-        "the refusal must be the eviction, got {:?}",
-        stream_a.error
+        probe.body.rate_per_mb == BASE_RATE_PER_MB,
+        "node must quote the configured rate before the switch, got {}",
+        probe.body.rate_per_mb
     );
 
-    // ================================================================
-    // Capture 2 — rate bait-and-switch from node B.
-    // ================================================================
-
-    let delivered_b = client
-        .fetch(&chain, &node_b, hash_b, alloy::primitives::U256::ZERO)
-        .await?;
-    anyhow::ensure!(
-        delivered_b.bytes == payload_b,
-        "node B must deliver its blob before we induce the switch"
-    );
-    let channel_b = delivered_b.channel_id;
-
-    // A hash B has never held: its refusal is a clean cache miss, and no eviction
-    // is needed to provoke it — so the *only* thing that changes between the probe
-    // and the stream is the rate.
-    let unheld = Hash::new(b"g-gov-03: a blob no node in this journey holds");
-    let now_b_us = chain.head_timestamp().await? * 1_000_000;
-    let probe_b = client.probe_at(&node_b, unheld, now_b_us).await?;
-    anyhow::ensure!(
-        probe_b.body.rate_per_mb == BASE_RATE_PER_MB,
-        "node B must quote the configured rate before the switch, got {}",
-        probe_b.body.rate_per_mb
-    );
-
-    // The switch: rewrite the operator's own config and hot-reload it. No
-    // restart, no reconnect — the handlers read the rate through the atomic the
+    // The switch: rewrite the operator's own config rate and hot-reload it. No
+    // restart, no reconnect — the serve path reads the rate through the atomic the
     // reload swaps.
-    let reloaded = node_b.set_rate_per_mb(SWITCHED_RATE_PER_MB).await?;
+    let reloaded = node.set_rate_per_mb(SWITCHED_RATE_PER_MB).await?;
     anyhow::ensure!(
         reloaded == SWITCHED_RATE_PER_MB,
         "daemon reported rate {reloaded} after reload, expected {SWITCHED_RATE_PER_MB}"
     );
 
-    // Read node B's cache-miss reject counter across the refusal. `NotFound` on
-    // its own cannot establish an honest miss — `ServeRejectReason::wire_error`
-    // collapses seven reasons (UnknownChannel, OwnerMismatch, InsufficientDeposit,
-    // …) onto it — so a future regression that dropped `channel_b` would keep this
-    // green while the rate predicate tested something weaker. The per-reason
-    // counter, bumped before the wire write, discriminates the miss directly (#1379).
-    let miss_before = node_b.scrape_metric(CACHE_MISS_METRIC).await?;
-    let stream_b = client
-        .refused_stream(&chain, &node_b, channel_b, unheld, now_b_us + 1_000_000)
+    // The real signed DELIVERY at the raised rate, for the same hash, inside the
+    // window. `ok: true` is what makes this rate-manipulation evidence: the node
+    // quoted `BASE_RATE_PER_MB` in the probe and now commits to deliver at
+    // `SWITCHED_RATE_PER_MB`. (A refusal here would be inert — rate manipulation
+    // requires a delivery.)
+    let stream = client
+        .capture_delivery_response(&session, hash, U256::ZERO, stream_ts)
         .await?;
-    let miss_after = node_b.scrape_metric(CACHE_MISS_METRIC).await?;
-    // Symmetric with the node-A capture: pin the answered hash at the capture so a
-    // mismatch localizes here rather than surfacing later as the judge's same-hash
-    // check inside the challenge.
+    anyhow::ensure!(stream.body.ok, "the captured delivery must be ok:true");
     anyhow::ensure!(
-        stream_b.body.hash == *unheld.as_bytes(),
-        "the refusal must answer for the probed hash"
+        stream.body.hash == *hash.as_bytes(),
+        "the delivery must answer for the probed hash"
     );
     anyhow::ensure!(
-        stream_b.body.rate_per_mb > probe_b.body.rate_per_mb,
+        stream.body.rate_per_mb > probe.body.rate_per_mb,
         "the daemon must have signed the raised rate: probe {} vs stream {}",
-        probe_b.body.rate_per_mb,
-        stream_b.body.rate_per_mb
-    );
-    // The refusal is the honest cache miss, not an eviction or a channel fault —
-    // so the rate really is the only thing that moved between the two messages.
-    // The signed wire code says `NotFound`; the counter step proves it was the
-    // *cache-miss* reason specifically, not `UnknownChannel`/`OwnerMismatch`/etc.
-    anyhow::ensure!(
-        stream_b.error == Some(StreamError::NotFound),
-        "the refusal must be a plain miss, got {:?}",
-        stream_b.error
-    );
-    anyhow::ensure!(
-        miss_after == miss_before + 1,
-        "node B's refusal must bump the cache-miss reject counter (0→1), ruling out \
-         the six other reasons NotFound collapses onto"
+        probe.body.rate_per_mb,
+        stream.body.rate_per_mb
     );
 
     // ================================================================
     // Negatives — the judge rejects real-but-inadmissible evidence.
     // ================================================================
 
-    let node_a_id = B256::from_slice(node_a.node_id().as_bytes());
-    let node_b_id = B256::from_slice(node_b.node_id().as_bytes());
     let bond = chain.challenge_bond().await?;
 
     // (1) Outside the 30s window. Both messages are genuine and correctly signed;
@@ -292,38 +189,35 @@ async fn run() -> anyhow::Result<()> {
     let err = chain
         .challenge_with_real_evidence(
             &out_of_window,
-            node_a.operator_addr(),
-            node_a_id,
-            Offense::Phantom,
+            node.operator_addr(),
+            node_id,
+            Offense::RateManipulation,
             EvidencePair {
                 probe: &stale_probe,
-                stream: &stream_a,
+                stream: &stream,
             },
             B256::repeat_byte(0x01),
         )
         .await
         .err()
         .ok_or_else(|| anyhow::anyhow!("a 40s-apart probe/stream pair must not be slashable"))?;
-    // Pinning the *typed* error is what makes a negative meaningful: an `is_err()`
-    // alone would also be satisfied by a fixture bug (unfunded challenger, bad
-    // nonce) that never reached the judge's checks at all.
     expect_revert_anyhow::<SlashJudgeRate::TimestampWindowViolated>(&err, "out-of-window pair")?;
     assert_challenge_cost_nothing(&chain, out_of_window.address(), bond).await?;
 
-    // (2) Forged signature: the real probe body, re-signed by a key that is not
-    // the operator's. `SignatureChecker` recovers a different address.
+    // (2) Forged PROBE signature: the real probe body, re-signed by a key that is
+    // not the operator's. `SignatureChecker` recovers a different address.
     let impostor = PrivateKeySigner::random();
-    let forged = forge_probe_signature(&chain, &probe_a, &impostor)?;
+    let forged = forge_probe_signature(&chain, &probe, &impostor)?;
     let forger = PrivateKeySigner::random();
     let err = chain
         .challenge_with_real_evidence(
             &forger,
-            node_a.operator_addr(),
-            node_a_id,
-            Offense::Phantom,
+            node.operator_addr(),
+            node_id,
+            Offense::RateManipulation,
             EvidencePair {
                 probe: &forged,
-                stream: &stream_a,
+                stream: &stream,
             },
             B256::repeat_byte(0x02),
         )
@@ -336,22 +230,21 @@ async fn run() -> anyhow::Result<()> {
     // (2b) Forged STREAM signature: the real probe with the real stream body, but
     // the stream `slash_sig` re-signed by a non-operator. `_verifyPair` checks the
     // probe leg first, so a real probe reaches — and fails at — the stream-leg
-    // check `InvalidStreamSignature`, which no test (Solidity or e2e) covered
-    // before (#1378). The forged stream carries the same body, so its evidenceHash
-    // matches the real pair — but the signature check reverts before `_resolve`
-    // ever consults `usedEvidenceHash`, so this leaves the real evidence spendable
-    // by the positive path below.
+    // check `InvalidStreamSignature`. The forged stream carries the same body, so
+    // its evidenceHash matches the real pair — but the signature check reverts
+    // before `_resolve` consults `usedEvidenceHash`, so the real evidence stays
+    // spendable by the positive path below.
     let stream_impostor = PrivateKeySigner::random();
-    let forged_stream = forge_stream_signature(&chain, &stream_a, &stream_impostor)?;
+    let forged_stream = forge_stream_signature(&chain, &stream, &stream_impostor)?;
     let stream_forger = PrivateKeySigner::random();
     let err = chain
         .challenge_with_real_evidence(
             &stream_forger,
-            node_a.operator_addr(),
-            node_a_id,
-            Offense::Phantom,
+            node.operator_addr(),
+            node_id,
+            Offense::RateManipulation,
             EvidencePair {
-                probe: &probe_a,
+                probe: &probe,
                 stream: &forged_stream,
             },
             B256::repeat_byte(0x06),
@@ -367,70 +260,54 @@ async fn run() -> anyhow::Result<()> {
     )?;
     assert_challenge_cost_nothing(&chain, stream_forger.address(), bond).await?;
 
-    // (3) Neither failed challenge minted anything: A is still unslashed.
+    // (3) Neither failed challenge minted anything: the operator is still unslashed.
     anyhow::ensure!(
-        chain.slashed_at_epoch(node_a.operator_addr()).await? == 0,
+        chain.slashed_at_epoch(node.operator_addr()).await? == 0,
         "a rejected challenge must not stamp the vote-weight watermark"
     );
 
     // ================================================================
-    // Positive — the real pairs are admissible.
+    // Positive — the real pair is admissible.
     // ================================================================
 
-    let slash_a = drive_slash(
+    let slash = drive_slash(
         &chain,
-        &node_a,
-        node_a_id,
-        Offense::Phantom,
-        EvidencePair {
-            probe: &probe_a,
-            stream: &stream_a,
-        },
-        B256::repeat_byte(0x03),
-    )
-    .await
-    .context("phantom challenge from real daemon evidence")?;
-
-    let slash_b = drive_slash(
-        &chain,
-        &node_b,
-        node_b_id,
+        &node,
+        node_id,
         Offense::RateManipulation,
         EvidencePair {
-            probe: &probe_b,
-            stream: &stream_b,
+            probe: &probe,
+            stream: &stream,
         },
-        B256::repeat_byte(0x04),
+        B256::repeat_byte(0x03),
     )
     .await
     .context("rate challenge from real daemon evidence")?;
 
     // ================================================================
-    // Replay — the same real phantom pair cannot slash twice.
+    // Replay — the same real pair cannot slash twice.
     // ================================================================
-    // Resubmitting node A's exact phantom pair under a *fresh* salt is rejected by
-    // `EvidenceAlreadyUsed` — the dedup guard that lives in `SlashJudge` itself
-    // (keyed on the offense/probe/stream triple), not in `CapacityBond`. This is
-    // what stops a griefer ratcheting `lifetimeOffenseCount` off one captured
-    // refusal. The fresh salt rules out the commit-reveal replay guard as the
-    // cause, isolating the evidence-level dedup (#1378). It reverts at
+    // Resubmitting the exact pair under a *fresh* salt is rejected by
+    // `EvidenceAlreadyUsed` — the dedup guard in `SlashJudge` itself (keyed on the
+    // offense/probe/stream triple), not in `CapacityBond`. The fresh salt rules
+    // out the commit-reveal replay guard as the cause. It reverts at
     // `usedEvidenceHash` before the challenge bond is pulled, so it costs nothing.
     let replayer = PrivateKeySigner::random();
     let err = chain
         .challenge_with_real_evidence(
             &replayer,
-            node_a.operator_addr(),
-            node_a_id,
-            Offense::Phantom,
+            node.operator_addr(),
+            node_id,
+            Offense::RateManipulation,
             EvidencePair {
-                probe: &probe_a,
-                stream: &stream_a,
+                probe: &probe,
+                stream: &stream,
             },
             B256::repeat_byte(0x07),
         )
         .await
         .err()
-        .ok_or_else(|| anyhow::anyhow!("a replayed phantom pair must not slash a second time"))?;
+        .ok_or_else(|| anyhow::anyhow!("a replayed pair must not slash a second time"))?;
     expect_revert_anyhow::<SlashJudgeRate::EvidenceAlreadyUsed>(&err, "replayed evidence")?;
     assert_challenge_cost_nothing(&chain, replayer.address(), bond).await?;
 
@@ -440,8 +317,7 @@ async fn run() -> anyhow::Result<()> {
     // ================================================================
 
     time::increase_time(chain.admin(), 31 * DAY).await?;
-    assert_fifty_fifty_split(&chain, &slash_a).await?;
-    assert_fifty_fifty_split(&chain, &slash_b).await?;
+    assert_fifty_fifty_split(&chain, &slash).await?;
 
     Ok(())
 }
