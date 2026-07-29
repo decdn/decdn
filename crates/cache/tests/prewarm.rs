@@ -17,6 +17,7 @@ use decdn_cache::{
     CacheEngine, CacheMetrics, Hash, HttpOrigin, Origin, OriginFetch, OriginKind, OriginPullError,
     PinnedHashes, RetryPolicy,
 };
+use tokio_util::sync::CancellationToken;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -163,7 +164,13 @@ async fn prewarm_never_re_pulls_a_refused_hash() -> anyhow::Result<()> {
     let (server, [hash]) = serve_blobs([payload]).await;
 
     let origin = Arc::new(HttpOrigin::parse(&server.uri())?);
-    let (engine, _tmp) = build_engine(vec![origin as Arc<dyn Origin>], pin(&[hash]), None).await?;
+    let metrics = Arc::new(CacheMetrics::default());
+    let (engine, _tmp) = build_engine(
+        vec![origin as Arc<dyn Origin>],
+        pin(&[hash]),
+        Some(Arc::clone(&metrics)),
+    )
+    .await?;
 
     engine.get(hash).await?;
     engine.evict(hash).await?;
@@ -183,7 +190,101 @@ async fn prewarm_never_re_pulls_a_refused_hash() -> anyhow::Result<()> {
         after == before,
         "prewarm must not have hit the origin for a refused hash ({before} -> {after})"
     );
+    // The refusal must be visible as its own metric. Landing it in `failures`
+    // instead would tell an operator their pin set is broken when it is the
+    // takedown working as intended.
+    anyhow::ensure!(
+        metrics.prewarm_refused.get() == 1
+            && metrics.prewarm_failures.get() == 0
+            && metrics.prewarm_blobs.get() == 0,
+        "a refused pin must count as refused, not as a failure or a fetch"
+    );
     Ok(())
+}
+
+#[tokio::test]
+async fn prewarm_cancelled_before_it_starts_touches_nothing() -> anyhow::Result<()> {
+    // The token is checked before the first hash, so a warm cancelled during
+    // bring-up must not reach the origin at all.
+    let payload: &[u8] = b"should never be fetched";
+    let (server, [hash]) = serve_blobs([payload]).await;
+    let origin = Arc::new(HttpOrigin::parse(&server.uri())?);
+    let (engine, _tmp) = build_engine(vec![origin as Arc<dyn Origin>], pin(&[hash]), None).await?;
+
+    let stop = CancellationToken::new();
+    stop.cancel();
+    let report = engine.prewarm_cancellable(&stop).await;
+
+    anyhow::ensure!(
+        report.cancelled && report.attempted() == 0 && report.bytes == 0,
+        "a pre-cancelled warm must attempt nothing and say so, got {report:?}"
+    );
+    let gets = server.received_requests().await.map_or(0, |r| r.len());
+    anyhow::ensure!(
+        gets == 0,
+        "the origin must not have been touched, saw {gets}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn prewarm_cancelled_mid_set_leaves_the_rest_unattempted() -> anyhow::Result<()> {
+    // This is the shape the shutdown fix exists for. Before it, a warm still
+    // running when the store closed failed EVERY remaining pin, driving
+    // `prewarm_failures_total` to the pin-set size — the exact signature that
+    // metric documents as "your pinned_hashes are wrong". Unreached pins must
+    // land in no bin at all, so a cancelled warm cannot be mistaken for a broken
+    // pin set.
+    let first: &[u8] = b"the one blob we allow through";
+    let second: &[u8] = b"cancellation should stop us before this";
+    let (server, [h1, h2]) = serve_blobs([first, second]).await;
+
+    let stop = CancellationToken::new();
+    // Cancels from inside the first fetch, so exactly one hash is attempted and
+    // the loop's next iteration sees the token already fired. No timing.
+    let origin = Arc::new(CancellingOrigin {
+        inner: HttpOrigin::parse(&server.uri())?,
+        stop: stop.clone(),
+    });
+    let (engine, _tmp) =
+        build_engine(vec![origin as Arc<dyn Origin>], pin(&[h1, h2]), None).await?;
+
+    let report = engine.prewarm_cancellable(&stop).await;
+    anyhow::ensure!(
+        report.cancelled && report.attempted() == 1,
+        "exactly one hash may be attempted before the cancel is observed, got {report:?}"
+    );
+    anyhow::ensure!(
+        report.failed == 0,
+        "the unreached pin must NOT be counted as a failure — that is the false \
+         alarm this fix removes: {report:?}"
+    );
+    // Whichever hash the set yielded first is the one that ran; both are valid.
+    let _ = (h1, h2);
+    Ok(())
+}
+
+/// Wraps a real origin and fires `stop` on its first fetch, so a cancellation
+/// lands deterministically mid-set with no sleeps.
+#[derive(Debug)]
+struct CancellingOrigin {
+    inner: HttpOrigin,
+    stop: CancellationToken,
+}
+
+impl Origin for CancellingOrigin {
+    fn fetch(
+        &self,
+        hash: Hash,
+        max_bytes: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<OriginFetch, OriginPullError>> + Send + '_>> {
+        self.stop.cancel();
+        self.inner.fetch(hash, max_bytes)
+    }
+
+    fn kind(&self) -> OriginKind {
+        self.inner.kind()
+    }
 }
 
 #[tokio::test]
@@ -219,9 +320,11 @@ async fn prewarm_dedups_input_and_the_counts_partition_it() -> anyhow::Result<()
 
 /// An origin that reports itself as `Peer` and records every fetch. Stands in
 /// for the node→node pull origin, whose egress is billed in USDC.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct PeerOriginSpy {
     fetches: AtomicUsize,
+    /// Bytes this origin would serve if anyone asked it — see `fetch`.
+    payload: &'static [u8],
 }
 
 impl Origin for PeerOriginSpy {
@@ -231,7 +334,21 @@ impl Origin for PeerOriginSpy {
         _max_bytes: u64,
     ) -> Pin<Box<dyn Future<Output = Result<OriginFetch, OriginPullError>> + Send + '_>> {
         self.fetches.fetch_add(1, Ordering::SeqCst);
-        Box::pin(async { Ok(OriginFetch::NotFound) })
+        // Serves real bytes on purpose. A spy that always 404s would let the
+        // "peer-only pin must fail" assertion pass whether the peer was skipped
+        // or consulted-and-empty — the report could not tell them apart, and only
+        // the fetch counter would catch a regression. Serving the payload makes a
+        // regression flip `fetched` 1 -> 2 and inflate `bytes`, so the report
+        // itself fails.
+        let payload = self.payload;
+        Box::pin(async move {
+            Ok(OriginFetch::Found {
+                stream: Box::pin(futures_util::stream::once(async move {
+                    Ok(bytes::Bytes::from_static(payload))
+                })),
+                size_hint: Some(payload.len() as u64),
+            })
+        })
     }
 
     fn kind(&self) -> OriginKind {
@@ -254,21 +371,25 @@ async fn prewarm_never_fronts_usdc_to_a_peer_origin() -> anyhow::Result<()> {
     // prewarm to keep walking the chain while still refusing the paid fallback.
     let via_http: &[u8] = b"the configured origin has this";
     let (server, [http_hash]) = serve_blobs([via_http]).await;
-    let peer_only = Hash::new(b"only a peer could serve this");
 
-    let spy = Arc::new(PeerOriginSpy::default());
+    let peer_payload: &[u8] = b"only a peer could serve this";
+    let spy = Arc::new(PeerOriginSpy {
+        fetches: AtomicUsize::new(0),
+        payload: peer_payload,
+    });
     let http = Arc::new(HttpOrigin::parse(&server.uri())?);
     let (engine, _tmp) = build_engine(
         vec![http as Arc<dyn Origin>, Arc::clone(&spy) as Arc<dyn Origin>],
-        pin(&[http_hash, peer_only]),
+        pin(&[http_hash, Hash::new(peer_payload)]),
         None,
     )
     .await?;
 
     let report = engine.prewarm_pinned().await;
     anyhow::ensure!(
-        report.fetched == 1 && report.failed == 1,
-        "the http pin warms; the peer-only pin must fail rather than be bought, got {report:?}"
+        report.fetched == 1 && report.failed == 1 && report.bytes == via_http.len() as u64,
+        "the http pin warms; the peer-only pin must fail rather than be bought — the peer \
+         origin would have served it, so a regression shows up here as fetched==2: {report:?}"
     );
     anyhow::ensure!(
         spy.fetches.load(Ordering::SeqCst) == 0,

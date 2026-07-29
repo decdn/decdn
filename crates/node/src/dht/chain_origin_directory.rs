@@ -649,8 +649,9 @@ where
 /// filling `cache.operator_node`.
 ///
 /// A failed lookup degrades — counted, warned, operator left unmapped — rather
-/// than propagating, for the same reason the namespace enumeration in
-/// `bootstrap_cache` does: `bootstrap` is one-shot (no retry) and its error is fatal at
+/// than propagating. (Note the contrast with the namespace enumeration in
+/// `bootstrap_cache`, which does the opposite and propagates.) The reason is that
+/// `bootstrap` is one-shot (no retry) and its error is fatal at
 /// `runtime`'s call site, so a crash here is strictly worse than graceful
 /// degradation. That matters more now `nodeIdOf` is bounded by [`timed`] —
 /// propagating would turn one slow (>10s) call on a congested or rate-limited

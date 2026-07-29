@@ -57,8 +57,8 @@ sol! {
 ///
 /// The sibling-counter shape is the settled convention (#1475), not a stopgap:
 /// these three classes have unrelated operator remedies (fund the wallet / fix
-/// the contract call / chase the RPC), so there is no single alert a shared
-/// `reason` label would serve. `decdn_probe_hold_unavailable_total` is the one
+/// the contract call / chase the RPC) *and* no meaningful aggregate — "how many
+/// channel opens failed" is not a question with one answer or one response. `decdn_probe_hold_unavailable_total` is the one
 /// labeled reason split, and it is labeled precisely because its values *do*
 /// share one aggregate and one budget axis.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

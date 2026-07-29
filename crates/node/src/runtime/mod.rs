@@ -1770,7 +1770,10 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
     // Newly-warmed blobs reach the announce set through `subscribe_inserts`, so
     // nothing needs re-seeding here. The `fs` skip is the point of the feature —
     // see `prewarm_enabled_for`.
-    let prewarm_stop = CancellationToken::new();
+    // Shared with the reload path (`RuntimeReloadState` owns it) so one cancel
+    // stops both legs. Cancelling only the startup warm would leave a reload warm
+    // running into `cache.shutdown()` — the same bug, on the other leg.
+    let prewarm_stop = reload_state.prewarm_stop();
     if prewarm_enabled_for(&cfg.cache) {
         let cache = infra.cache.clone();
         // Cancelled at the top of `shutdown()`, before `cache.shutdown()` closes

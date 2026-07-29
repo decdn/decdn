@@ -369,8 +369,8 @@ fn pick_best_in_group(
     // field doc for why that boundary matters, and for the fact that nothing
     // enforces it yet (#1470).
     //
-    // Uniformly a no-op today: every construction site passes `0` because
-    // on-chain integration is deferred (ADR 003 § Node Registry for the
+    // Uniformly a no-op today: every production construction site passes `0`
+    // because on-chain integration is deferred (ADR 003 § Node Registry for the
     // contract surface, ADR 019 for the capacity-bond interface that will
     // populate it).
     let max_stake = pool

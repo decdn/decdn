@@ -242,7 +242,7 @@ pub struct DecdnMetrics {
     ///
     /// **This is the documented exception, not the convention** (#1475) — the
     /// one labeled *reason split*, which is not the same as the crate's only
-    /// `Family`: `streams_active` is keyed on `direction`. Every
+    /// `Family` — `streams_active` is another. Every
     /// other reason-style split in this crate — `dispatch_rejected_*`,
     /// `probe_rate_limit_rejected_*`, `channel_open_failures_*`, and gossip's
     /// `gossip_messages_rejected_clock_skew` — fans out to sibling unlabeled

@@ -1256,7 +1256,7 @@ async fn cached_candidates(deps: &NodeOriginDeps, target: DhtHash) -> Option<Vec
             rtt_ms: provider.rtt_ms,
             reputation: peer_reputation(deps, pk),
             region,
-            // See `probe_candidate` above: `0` is known-no-bond, not "unknown".
+            // See `probe_candidate` above: `0` is a placeholder, not a lookup.
             stake: 0,
         });
     }

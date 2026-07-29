@@ -327,17 +327,12 @@ since project inception and will roll into the first tagged release.
 #### Origin directory
 
 - **Origin-directory genesis replay no longer skips silently on an inverted
-  block range (#1152).** `bootstrap_cache` replays `ContentClaimed` over
-  `[replay_from, latest]`. Since the replay floor resumes from a persisted
-  checkpoint (#1108), a stale/lagging RPC head can put `replay_from > latest`
-  (replication lag or a reorg); `backfill_windows` yields no windows for that
-  range, so the replay was silently skipped with no signal. The anomaly now
-  emits a `warn!` and bumps a new
-  `decdn_origin_directory_bootstrap_range_anomaly_total` counter. Behaviour is
-  otherwise unchanged — the replay is still skipped that boot (per-namespace
-  membership absent, so claimed hashes fall back to the default-open set until
-  the live tail re-surfaces claims) rather than crashing startup, since the
-  bootstrap call site is one-shot with no retry.
+  block range (#1152).** Superseded before release by the #1504 enumeration
+  rewrite, which removed genesis replay entirely: there is no `replay_from`, no
+  persisted origin checkpoint and no `backfill_windows` call left on that path,
+  so the inverted-range case it guarded against is unreachable and the
+  `decdn_origin_directory_bootstrap_range_anomaly_total` counter it added no
+  longer exists. Retained here only so the issue number resolves.
 
 ### Changed
 
@@ -355,7 +350,7 @@ since project inception and will roll into the first tagged release.
 - **The metric reason-split convention is settled: sibling counters, not
   labels.** `decdn_probe_hold_unavailable_total{reason}` remains the one labeled
   *reason split* — not the only labelled metric, since `decdn_streams_active`
-  and `decdn_streams_failed_total` are labelled on other axes — and is now
+  is labelled on another axis — and is now
   documented as the deliberate exception (its values share one aggregate and one
   budget axis; they pointedly do not share an alert, which is why the alert
   filters to `reason="exhausted"`); `dispatch_rejected_*`,
@@ -573,8 +568,9 @@ since project inception and will roll into the first tagged release.
   `decdn config validate` reports a flag set against an fs-only or empty chain
   as `set but INERT` rather than echoing it back. Warming runs detached, so an
   unreachable origin cannot block bring-up; it is cancelled at the top of
-  shutdown so a restart mid-warm cannot manufacture a false
-  `prewarm_failures_total` spike; it fills local-origin-only, so it never fronts
+  shutdown so a restart mid-warm does not manufacture a false
+  `prewarm_failures_total` spike (cancellation is checked between hashes, so a
+  single in-flight blob can still fail against a closing store); it fills local-origin-only, so it never fronts
   USDC to a peer; and a hash filled by a concurrent pass is not counted as a
   fetch, so overlapping warms do not double-count paid egress. A reload warms
   only when it actually adds a pin, and at most one warm runs at a time.

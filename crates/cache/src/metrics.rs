@@ -304,14 +304,17 @@ pub struct CacheMetrics {
     /// origin egress prewarm spent before any client asked, which is the reason
     /// prewarm is opt-in.
     ///
-    /// A proxy, not the egress itself, and the two can differ. This sums
-    /// `inspect().size_bytes` (bytes as stored), whereas
-    /// `pull_through_bytes` meters bytes as they arrive off the wire — so a
-    /// compressed HTTP origin under `DecompressMode::Auto` moves fewer wire
-    /// bytes than this reports. Treat it as "how much pinned content prewarm
-    /// materialized", and use `pull_through_bytes` when the question is
-    /// literally what the origin billed. A size lookup that fails contributes
-    /// `0`, so this can also undercount.
+    /// A proxy for spend, not a measurement of it. Both this and
+    /// `pull_through_bytes` count **content** bytes, not wire bytes —
+    /// `HttpOrigin` disables reqwest's transparent decompression and decodes
+    /// itself, and the pull meter sits downstream of that decoder — so neither
+    /// answers "what did the origin bill" for a compressed origin. They also
+    /// diverge from each other in three ways: `pull_through_bytes` counts bytes
+    /// from pulls that later failed, and counts the *owner's* bytes for a fill
+    /// this pass scored as coalesced; while this counter contributes `0` when the
+    /// post-fill size lookup fails. Read it as "how much pinned content prewarm
+    /// materialized", and expect it to track `pull_through_bytes` without
+    /// being a strict subset of it.
     ///
     /// Field name omits `_total`: the emitted name is
     /// `decdn_cache_prewarm_bytes_total`.
@@ -338,12 +341,14 @@ pub struct CacheMetrics {
     /// be pulled on demand.
     ///
     /// Operator-actionable, but **this counter alone does not say why**. It
-    /// merges three situations with different remedies: the origin does not
-    /// hold the hash (wrong `cache.pinned_hashes`, or a wrong bucket/prefix),
-    /// the origin is unreachable or its circuit breaker is open, and a local
-    /// store error on the presence check. A value equal to the pin-set size is
-    /// the signal to look — the per-hash `warn` lines carry the distinguishing
-    /// error. Splitting the count by cause is tracked separately.
+    /// merges several situations with different remedies, including: the origin
+    /// does not hold the hash (wrong `cache.pinned_hashes`, or a wrong
+    /// bucket/prefix), the origin is unreachable or its circuit breaker is open,
+    /// the blob exceeds `max_blob_size_mb`, the origin served bytes that failed
+    /// BLAKE3 verification, and a local store error on the presence check. A
+    /// value equal to the pin-set size is the signal to look — the per-hash
+    /// `warn` lines carry the distinguishing error. Splitting the count by cause
+    /// is tracked separately.
     ///
     /// Field name omits `_total`: the emitted name is
     /// `decdn_cache_prewarm_failures_total`.

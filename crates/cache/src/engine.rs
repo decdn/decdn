@@ -325,18 +325,26 @@ pub struct EvictionPreview {
 
 /// Outcome of one [`CacheEngine::prewarm`] pass (#1130).
 ///
-/// Every field is a count of distinct hashes except `bytes`, and the four counts
-/// partition the deduplicated input: `fetched + already_present + refused +
-/// failed` equals the number of distinct hashes passed in. That identity is what
-/// makes the log line diagnosable: `already_present == input` is the healthy
-/// steady state on a warm restart, and `failed == input` means nothing was
-/// retrievable — which could be a wrong pin set, an unreachable origin, or a
-/// local store fault, so read the per-hash `warn` lines to tell those apart.
+/// Every field is a count of distinct hashes except `bytes` and `cancelled`, and
+/// the four counts partition the hashes actually **attempted**:
+/// `fetched + already_present + refused + failed == attempted()`. On a run that
+/// finished, `attempted()` is the number of distinct hashes passed in; on a
+/// cancelled one it is fewer, because the loop stops and the hashes it never
+/// reached land in no bin at all — check [`Self::cancelled`] before reading the
+/// counts as a verdict on the whole input.
+///
+/// That identity is what makes the log line diagnosable: `already_present ==
+/// attempted()` is the healthy steady state on a warm restart, and `failed ==
+/// attempted()` means nothing was retrievable — which could be a wrong pin set,
+/// an unreachable origin, or a local store fault, so read the per-hash `warn`
+/// lines to tell those apart.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PrewarmReport {
     /// Hashes actually pulled from an origin into the store on this pass.
     pub fetched: usize,
-    /// Hashes already complete in the store; no origin egress was paid.
+    /// Hashes that needed no fetch from this pass — already complete in the
+    /// store, or filled by a concurrent pass while this one waited. Either way
+    /// this pass paid no origin egress.
     pub already_present: usize,
     /// Hashes skipped because [`CacheEngine::refuses`] them — blacklisted or
     /// operator-evicted. Prewarm is not a bypass for a takedown.
@@ -344,15 +352,38 @@ pub struct PrewarmReport {
     /// Hashes whose presence check or fetch errored. Best-effort: these are
     /// logged and left for an on-demand pull.
     pub failed: usize,
-    /// Bytes of the `fetched` blobs, as the store reports them after the fill.
-    /// This is paid origin egress incurred before any request.
+    /// Size of the `fetched` blobs as the store reports them after the fill.
+    ///
+    /// A proxy for what prewarm spent, not a measurement of it: this is the
+    /// stored (decompressed) length, and a size lookup that fails contributes
+    /// `0`. See `CacheMetrics::prewarm_bytes` for how it relates to
+    /// `pull_through_bytes`.
     pub bytes: u64,
+    /// The run stopped early because its cancellation token fired — see
+    /// [`CacheEngine::prewarm_cancellable`].
+    ///
+    /// Recorded here rather than sampled from the token by the caller: a caller
+    /// that checks `token.is_cancelled()` after awaiting can observe a cancel
+    /// that landed *after* the run finished, and would then report a complete
+    /// warm as truncated.
+    pub cancelled: bool,
 }
 
 impl PrewarmReport {
+    /// Hashes this run actually classified — the sum of the four counts, and the
+    /// left-hand side of the partition identity in the type doc. Equals the
+    /// distinct input size only when [`Self::cancelled`] is `false`.
+    #[must_use]
+    pub const fn attempted(&self) -> usize {
+        self.fetched
+            .saturating_add(self.already_present)
+            .saturating_add(self.refused)
+            .saturating_add(self.failed)
+    }
+
     /// Accumulate one hash's outcome. Saturating so a pathological input size
     /// cannot wrap a count into a smaller (and reassuring) number.
-    const fn fold(&mut self, outcome: PrewarmOutcome) {
+    const fn record(&mut self, outcome: PrewarmOutcome) {
         match outcome {
             PrewarmOutcome::Fetched { bytes } => {
                 self.fetched = self.fetched.saturating_add(1);
@@ -367,14 +398,23 @@ impl PrewarmReport {
     }
 }
 
-/// Who actually paid the origin egress in a [`CacheEngine::populate_inner`] call.
+/// Whether a [`CacheEngine::populate_inner`] call ran the fill itself.
+///
+/// Not "who paid the egress", though that is the motivating use: on a chain whose
+/// first hit is a `Filesystem` origin a `Fetched` costs no egress at all. What is
+/// structurally guaranteed is narrower and is what the metric relies on —
+/// `Fetched` is returned only on the two paths that call `pull_through_fill`, so
+/// summing it equals the number of origin fetch attempts.
 ///
 /// `populate`/`populate_local` discard this — a fill is a fill to them. It exists
 /// for callers that **meter** fetches: `Ok(())` alone cannot distinguish "this
-/// task pulled the blob" from "this task waited on someone else's pull and found
-/// the blob present afterwards" (the `#305` inflight-coalescing path). Counting
-/// the latter as a fetch double-counts one unit of paid egress whenever two
-/// prewarm passes overlap (#1130).
+/// task ran the pull" from "this task waited on someone else's pull and found the
+/// blob present afterwards" (the `#305` inflight-coalescing path). Counting the
+/// latter as a fetch double-counts one unit of paid egress whenever two prewarm
+/// passes overlap (#1130).
+///
+/// The mutex-poisoned arm reports `Fetched` deliberately: coalescing is bypassed
+/// there, so that task really does run its own fill and the sum stays exact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FillOwnership {
     /// This task ran the origin pull.
@@ -1157,12 +1197,12 @@ impl CacheEngine {
     ///
     /// Semantics per hash, in order: a [`Self::refuses`] hash is skipped (a
     /// blacklisted or operator-evicted hash must never be re-pulled, and prewarm
-    /// is not an exception); an already-present hash is a no-op; otherwise
-    /// [`Self::populate_local`] fetches it. `populate_local`, not
-    /// [`Self::populate`] — the `Peer` node→node origin is deliberately out of
-    /// scope, because fronting USDC to peers for content nobody has asked for
-    /// yet is a very different decision from paying an origin's egress, and the
-    /// operator opted into the latter only.
+    /// is not an exception); an already-present hash is a no-op; otherwise the
+    /// **local-origin** fill path fetches it. Local-only is the point: the `Peer`
+    /// node→node origin is deliberately out of scope, because fronting USDC to
+    /// peers for content nobody has asked for yet is a very different decision
+    /// from paying an origin's egress, and the operator opted into the latter
+    /// only.
     ///
     /// Best-effort by construction: every failure is counted and logged, none
     /// propagates. A cold node must boot with an unreachable origin, and a
@@ -1205,14 +1245,16 @@ impl CacheEngine {
         let mut seen: HashSet<Hash> = HashSet::new();
         for hash in hashes {
             if stop.is_some_and(CancellationToken::is_cancelled) {
+                report.cancelled = true;
                 tracing::info!(
                     warmed = report.fetched,
+                    attempted = report.attempted(),
                     "prewarm: cancelled by shutdown; leaving the rest of the pin set unwarmed"
                 );
                 break;
             }
             if seen.insert(hash) {
-                report.fold(self.prewarm_one(hash).await);
+                report.record(self.prewarm_one(hash).await);
             }
         }
         if let Some(m) = &self.inner.metrics {
@@ -1241,12 +1283,11 @@ impl CacheEngine {
                 return PrewarmOutcome::Failed;
             }
         }
-        // `populate_inner`, not `populate_local`, because the wrapper discards
-        // the ownership signal: a coalesced waiter also returns `Ok(())`, and
-        // counting that as a fetch would double-count one unit of paid egress
-        // when two prewarm passes overlap. `local_only = true` keeps the `Peer`
-        // origin out of scope exactly as `populate_local` does.
-        match self.populate_inner(hash, true).await {
+        // The reporting variant, because the `()` wrapper discards the ownership
+        // signal: a coalesced waiter also returns `Ok(())`, and counting that as
+        // a fetch would double-count one unit of paid egress when two prewarm
+        // passes overlap.
+        match self.populate_local_reporting(hash).await {
             Ok(FillOwnership::Fetched) => PrewarmOutcome::Fetched {
                 bytes: self.stored_size(hash).await,
             },
@@ -1923,7 +1964,16 @@ impl CacheEngine {
     ///
     /// Same set as [`Self::populate`].
     pub async fn populate_local(&self, hash: Hash) -> CacheResult<()> {
-        self.populate_inner(hash, true).await.map(|_| ())
+        self.populate_local_reporting(hash).await.map(|_| ())
+    }
+
+    /// [`Self::populate_local`] that reports whether this call ran the fill.
+    ///
+    /// The single owner of `local_only = true`, so the "never front USDC to a
+    /// peer" guarantee is expressed once rather than duplicated as a bare `true`
+    /// at each metering call site.
+    async fn populate_local_reporting(&self, hash: Hash) -> CacheResult<FillOwnership> {
+        self.populate_inner(hash, true).await
     }
 
     /// Shared body of [`Self::populate`] / [`Self::populate_local`]. `local_only`
