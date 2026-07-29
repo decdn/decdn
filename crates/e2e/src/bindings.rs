@@ -325,11 +325,11 @@ pub use decdn_incentive::slash_judge::SlashJudge;
 // than declared here, so there is no local block to extend — unlike the escrow
 // reads and `totalSupply`, which fold into `CapacityBond` / `Erc20`.
 alloy::sol! {
-    /// `SlashJudge.submitRateChallenge` — the rate-manipulation twin of
-    /// `submitPhantomChallenge` (omitted by the production binding, which only
-    /// needs the phantom path). Bound at the `SlashJudge` address; `_verifyPair`
-    /// applies the same signature / same-hash / 30s-window / staleness checks and
-    /// then demands `stream.ratePerMb > probe.ratePerMb`.
+    /// `SlashJudge.submitRateChallenge` — the rate-manipulation reveal entry
+    /// point (omitted by the production binding, which never submits challenges,
+    /// only watches the `Slashed` event). Bound at the `SlashJudge` address;
+    /// `_verifyPair` applies the signature / same-hash / 30s-window / staleness
+    /// checks and then demands `stream.ok && stream.ratePerMb > probe.ratePerMb`.
     ///
     /// The two errors are declared so a reverted reveal decodes to a *named*
     /// error rather than an opaque selector, and so

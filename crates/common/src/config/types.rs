@@ -462,7 +462,8 @@ pub struct CacheConfig {
     /// probe-triggered hold (ADR 005 §Hold budget, #318). Holds are
     /// per-blob: multiple peers probing the same hash share one slot. When
     /// the budget is exhausted, additional probes for unheld blobs receive
-    /// `has_blob: false` rather than risk a phantom-announcement slash.
+    /// `has_blob: false` — the node declines to advertise a hold it cannot
+    /// guarantee for the follow-up pull (an availability choice).
     /// Absent => [`crate::config::DEFAULT_MAX_PROBE_HOLDS`] (256). `0`
     /// disables `has_blob: true` entirely (every probe answers false).
     /// Operators with small caches SHOULD set this to ≤25% of cache

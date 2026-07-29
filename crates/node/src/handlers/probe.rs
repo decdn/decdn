@@ -338,9 +338,10 @@ impl ProbeHandler {
         // limiter passes — do not reorder).
         let (has_blob, total_bytes) = if stake_lane_reserved {
             // End-client probe shed to protect stake-lane headroom. Sign
-            // `has_blob: false` (the blob may be present, but a
-            // non-guaranteed hold must never risk a phantom slash — ADR
-            // 005) and count the reservation distinctly from genuine
+            // `has_blob: false` (the blob may be present, but under budget
+            // pressure the node conservatively declines to advertise a hold
+            // it cannot guarantee — an availability choice, not a slash
+            // concern) and count the reservation distinctly from genuine
             // budget exhaustion / config disable (#757).
             self.metrics
                 .probe_hold_unavailable(ProbeHoldUnavailableReason::StakeLaneReserved);
@@ -397,10 +398,11 @@ impl ProbeHandler {
                 Ok(ProbeHoldOutcome::Unavailable) => (false, None),
                 // A transient cache fault is *not* the same as "absent": the
                 // node may actually hold the blob. We still conservatively
-                // answer `has_blob: false` (never risk a phantom slash, ADR
-                // 005), but a degrading backend must be operator-visible rather
-                // than indistinguishable from a normal miss. The registry has
-                // no metric for this; a warn log is the actionable signal.
+                // answer `has_blob: false` (a store it cannot read is one it
+                // cannot serve), but a degrading backend must be
+                // operator-visible rather than indistinguishable from a normal
+                // miss. The registry has no metric for this; a warn log is the
+                // actionable signal.
                 Err(e) => {
                     tracing::warn!(
                         error = %e,

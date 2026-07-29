@@ -16,9 +16,9 @@ import { IContentBlacklistHashView } from "./interfaces/IContentBlacklistHashVie
 import { RegionScopeLib } from "./RegionScopeLib.sol";
 
 /// @title SlashJudge
-/// @notice On-chain adjudicator for the three signature-dependent slashable
-///         offenses (ADR 014): phantom announcement, rate manipulation, and
-///         blacklist violation. Challenging is a two-phase commit–reveal flow
+/// @notice On-chain adjudicator for the two signature-dependent slashable
+///         offenses (ADR 014): rate manipulation and blacklist violation.
+///         Challenging is a two-phase commit–reveal flow
 ///         (ADR 014 § Challenge front-running mitigation, #854): the challenger
 ///         first `commitChallenge`s an opaque
 ///         `keccak256(abi.encode(evidenceHash, salt, challenger))`, then reveals via a
@@ -64,7 +64,8 @@ contract SlashJudge is ISlashJudge, AccessControl, ReentrancyGuard, SunsettingPa
     // Constants (ADR 014 § Governable Parameters with Safety Bounds)
     // -----------------------------------------------------------------
 
-    /// @dev 30-second requester-anchored window for the two-message offenses.
+    /// @dev 30-second requester-anchored window for the two-message
+    ///      rate-manipulation offense.
     uint64 internal constant SLASH_WINDOW_US = 30_000_000;
     /// @dev Fixed NTP-drift tolerance; not governable (ADR 014).
     uint64 internal constant MAX_FUTURE_SKEW_US = 60_000_000;
@@ -175,7 +176,6 @@ contract SlashJudge is ISlashJudge, AccessControl, ReentrancyGuard, SunsettingPa
     error InvalidStreamSignature();
     error InvalidResponseSignature();
     error HashMismatch(bytes32 expected, bytes32 actual);
-    error NotPhantom();
     error NotRateManipulation();
     error NotBlacklistViolation();
     error TimestampWindowViolated(uint64 probeTsUs, uint64 streamTsUs);
@@ -264,23 +264,6 @@ contract SlashJudge is ISlashJudge, AccessControl, ReentrancyGuard, SunsettingPa
         }
         commitments[commitment] = uint64(block.timestamp);
         emit ChallengeCommitted(commitment);
-    }
-
-    /// @inheritdoc ISlashJudge
-    function submitPhantomChallenge(
-        address challengedNode,
-        bytes32 nodeId,
-        bytes calldata probeResponseData,
-        bytes calldata probeSlashSig,
-        bytes calldata streamResponseData,
-        bytes calldata streamSlashSig,
-        bytes32 salt
-    ) external override nonReentrant whenNotPaused {
-        _checkRegistered(challengedNode, nodeId);
-        bytes32 evidenceHash = _verifyPair(
-            challengedNode, probeResponseData, probeSlashSig, streamResponseData, streamSlashSig, OffenseType.Phantom
-        );
-        _resolve(challengedNode, OffenseType.Phantom, evidenceHash, salt);
     }
 
     /// @inheritdoc ISlashJudge
@@ -386,9 +369,9 @@ contract SlashJudge is ISlashJudge, AccessControl, ReentrancyGuard, SunsettingPa
     // Internal — verification
     // -----------------------------------------------------------------
 
-    /// @dev Shared phantom/rate path: decode + verify both signatures, confirm
+    /// @dev Rate-manipulation path: decode + verify both signatures, confirm
     ///      same-hash, the 30s window, and evidence freshness, then apply the
-    ///      offense-specific predicate and return the `evidenceHash`. Registration
+    ///      rate predicate and return the `evidenceHash`. Registration
     ///      is checked by the caller; the predicate and hashing fold in here
     ///      (rather than returning the decoded messages) so the reveal entry
     ///      points stay within the stack limit once `salt` rides along (via_ir is
@@ -420,13 +403,12 @@ contract SlashJudge is ISlashJudge, AccessControl, ReentrancyGuard, SunsettingPa
         }
         _checkStaleness(p.timestampUs);
 
-        if (offense == OffenseType.Phantom) {
-            // Phantom = announced the blob then failed to deliver it.
-            if (!p.hasBlob || s.ok) revert NotPhantom();
-        } else {
-            // Rate manipulation = charged a higher stream rate than was probe-quoted.
-            if (s.ratePerMb <= p.ratePerMb) revert NotRateManipulation();
-        }
+        // Rate manipulation = delivered (`ok:true`) at a higher stream rate than
+        // was probe-quoted. The `ok` requirement is load-bearing: it keeps a
+        // signed refusal (`ok:false`) inert as evidence — you cannot overcharge
+        // on a delivery you declined, so a refusal is definitionally not rate
+        // manipulation, and the node may sign `ok:false` freely.
+        if (!s.ok || s.ratePerMb <= p.ratePerMb) revert NotRateManipulation();
 
         evidenceHash = keccak256(abi.encode(uint8(offense), probeHash, streamHash));
     }

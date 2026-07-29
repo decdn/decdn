@@ -3,8 +3,8 @@
 //! Every `ProbeResponse` carries a mandatory, non-empty secp256k1 EIP-712
 //! signature (`slash_sig`) over its frozen signed field set. The signature
 //! makes the response cryptographically attributable to a registered node
-//! and is the on-chain evidence for phantom-announcement and rate-
-//! manipulation slashing (ADR 005 §`cdn/probe/v1`, ADR 014 §1–2).
+//! and is the on-chain evidence for rate-manipulation and blacklist-violation
+//! slashing (ADR 005 §`cdn/probe/v1`, ADR 014).
 //!
 //! The signed payload follows ADR 014 §EIP-712 Type Definitions exactly so an
 //! off-chain Rust signature byte-matches what the on-chain `SlashJudge`
@@ -90,8 +90,8 @@ pub fn slash_judge_domain(chain_id: u64, verifying_contract: Address) -> Eip712D
 /// `hash` is the queried blob hash echoed from the `ProbeRequest`;
 /// `timestamp_us` is the requester-generated timestamp echoed back. Together
 /// with `has_blob` and `rate_per_mb` these are exactly the fields the
-/// on-chain `SlashJudge` reconstructs to verify phantom-announcement and
-/// rate-manipulation evidence.
+/// on-chain `SlashJudge` reconstructs to verify rate-manipulation and
+/// blacklist-violation evidence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProbeSlashData {
     /// BLAKE3 hash of the probed blob (iroh `Hash` bytes).

@@ -80,7 +80,7 @@ const SLASH_MAX_BACKOFF: Duration = Duration::from_secs(30);
 pub struct DetectedSlash {
     /// Globally-monotonic on-chain `slashId` (`CapacityBond.slash`).
     pub slash_id: U256,
-    /// Offense taxonomy index (ADR 014): 0=Phantom, 1=RateManipulation, 2=Blacklist.
+    /// Offense taxonomy index (ADR 014): 0=RateManipulation, 1=Blacklist.
     pub offense_type: u8,
     /// Bond amount slashed, in TOKEN base units.
     pub amount: U256,
@@ -389,7 +389,7 @@ mod tests {
         let event = SlashJudge::Slashed {
             slashId: U256::from(1u64),
             operator,
-            offenseType: SlashJudge::OffenseType::Phantom,
+            offenseType: SlashJudge::OffenseType::RateManipulation,
             amount: U256::from(42u64),
             evidenceHash: B256::repeat_byte(7),
         };

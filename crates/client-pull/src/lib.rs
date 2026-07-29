@@ -633,13 +633,13 @@ impl UpstreamRefused {
     /// launder a malformed refusal into a plausible-looking one.
     ///
     /// Takes the whole `response` rather than just its `error` so the operator's
-    /// own signed refusal survives as evidence ([`Self::evidence`], #1042) —
+    /// own signed refusal survives on the value ([`Self::evidence`], #1042) —
     /// `body` is exactly the field set the `SlashJudge` EIP-712 `StreamResponse`
     /// typehash covers and `slash_sig` is the operator's secp256k1 signature over
-    /// it. Paired with the same node's earlier `ProbeResponse` for the same hash
-    /// it is the complete on-chain phantom-announcement (`hasBlob && !ok`) or
-    /// rate-manipulation (`stream.ratePerMb > probe.ratePerMb`) evidence pair —
-    /// court-admissible as-is, with no re-signing by the observer.
+    /// it. Note a refusal (`ok == false`) is no longer on-chain slash evidence:
+    /// the phantom offense is retired and rate manipulation requires `ok == true`
+    /// (ADR 014), so this retention is now inert — kept pending the follow-on
+    /// removal of the refusal-evidence path.
     fn open(response: StreamResponse) -> anyhow::Error {
         // `ok == true` is not a refusal at all — building an `Open` from it would
         // mint an evidence-carrying refusal with `ok == true`, violating invariant
@@ -3138,7 +3138,7 @@ mod tests {
     /// attestation survives the client's error path intact — byte-for-byte, still
     /// recovering to the signer. Before #1042 `refusal()` took only
     /// `response.error` and dropped the body and signature on the floor, leaving
-    /// `SlashJudge`'s phantom/rate paths reachable only from a test that holds the
+    /// `SlashJudge`'s rate path reachable only from a test that holds the
     /// operator's key and synthesises its own evidence.
     ///
     /// Deliberately routed through the private [`UpstreamRefused::open`] — the one
@@ -3156,8 +3156,8 @@ mod tests {
 
         let operator = PrivateKeySigner::random();
         let domain = slash_judge_domain(31_337, alloy::primitives::Address::repeat_byte(0x11));
-        // The wire shape of a phantom refusal: the node signed `ok = false` for a
-        // hash it had just announced.
+        // The wire shape of a signed refusal: the node signed `ok = false` for a
+        // hash it had just announced (now inert as slash evidence).
         let body = StreamResponseBody {
             hash: [0x5Au8; 32],
             ok: false,

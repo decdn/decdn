@@ -16,8 +16,9 @@
 //!
 //! That last point is #1165's "no evidence retention" requirement, and it is
 //! not a memory optimisation. A `ProbeResponse` carries `slash_sig`: a peer's
-//! signed `has_blob: true`, which is on-chain phantom-announcement slash
-//! evidence for `PROBE_SLASH_WINDOW` (ADR 005). A structure that survives one
+//! signed `has_blob: true`, which is on-chain rate-manipulation and
+//! blacklist-violation slash evidence for `PROBE_SLASH_WINDOW` (ADR 014). A
+//! structure that survives one
 //! request in order to speed up the next has no business holding another node's
 //! slashable statements — retaining them turns an availability cache into an
 //! evidence locker.

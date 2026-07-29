@@ -3,9 +3,11 @@
 //! Every `StreamResponse` carries a mandatory, non-empty secp256k1 EIP-712
 //! signature (`slash_sig`) over its frozen signed field set. The signature
 //! makes the response cryptographically attributable to a registered node and
-//! is the on-chain evidence for phantom-announcement and rate-manipulation
-//! slashing (ADR 005 §`cdn/client/v1`, ADR 014 §1–2). This mirrors
-//! [`crate::probe_sig`] for the delivery protocol.
+//! is the on-chain evidence for rate-manipulation and blacklist-violation
+//! slashing (ADR 005 §`cdn/client/v1`, ADR 014). This mirrors
+//! [`crate::probe_sig`] for the delivery protocol. A signed refusal
+//! (`ok:false`) is inert as evidence — rate manipulation requires `ok:true`
+//! (ADR 014 § Rate manipulation), so a node may sign refusals freely.
 //!
 //! The signed payload follows ADR 014 §EIP-712 Type Definitions exactly so an
 //! off-chain Rust signature byte-matches what the on-chain `SlashJudge`
@@ -71,7 +73,7 @@ use sol_types::StreamResponse as StreamResponseSol;
 /// response body; `timestamp_us` is the requester-generated timestamp echoed
 /// from the `StreamRequest`. Together with `ok`, `rate_per_mb`, `total_bytes`,
 /// and `redirect`, these are exactly the fields the on-chain `SlashJudge`
-/// reconstructs to verify phantom-announcement and rate-manipulation evidence.
+/// reconstructs to verify rate-manipulation and blacklist-violation evidence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StreamSlashData {
     /// BLAKE3 hash of the delivered blob (iroh `Hash` bytes).

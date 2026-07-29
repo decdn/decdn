@@ -228,10 +228,10 @@ pub struct DecdnMetrics {
     /// `probe_hold_violations` / `probe_holds_disabled` /
     /// `probe_stake_lane_reserved` counters).
     ///
-    /// Every value is an availability degradation, never a safety fault — the
-    /// node loses revenue but never signs a phantom announcement, because the
-    /// hold mechanism makes the registry's literal "evicted after signing
-    /// `has_blob: true`" case unreachable by construction. See
+    /// Every value is an availability degradation: the node declines to
+    /// advertise a blob it cannot guarantee to hold for the follow-up pull, so
+    /// it forgoes the revenue rather than risk a miss the probing client would
+    /// score against it (ADR 008 reputation). See
     /// [`ProbeHoldUnavailableReason`] for what each value means and which one
     /// the "raise `max_probe_holds`" alert fires on; all three children are
     /// materialized at startup by [`Metrics::new`] so each series is exported

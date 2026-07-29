@@ -3,8 +3,8 @@ pragma solidity 0.8.28;
 
 /// @title ISlashJudge
 /// @notice Canonical external surface of `SlashJudge` (ADR 014 § SlashJudge
-///         Contract). Adjudicates the three signature-dependent offenses —
-///         phantom announcement, rate manipulation, blacklist violation — via a
+///         Contract). Adjudicates the two signature-dependent offenses —
+///         rate manipulation, blacklist violation — via a
 ///         two-phase commit–reveal flow (ADR 014 § Challenge front-running
 ///         mitigation, #854): `commitChallenge` registers an opaque commitment,
 ///         then a `submit*Challenge` reveal resolves once the commitment matures
@@ -21,7 +21,6 @@ interface ISlashJudge {
     /// @dev Ordering is contract-canonical (ADR 014 § Consequences): a reorder
     ///      requires a coordinated migration of `SlashAppeal`.
     enum OffenseType {
-        Phantom,
         RateManipulation,
         Blacklist
     }
@@ -41,19 +40,6 @@ interface ISlashJudge {
     ///         before `REVEAL_WINDOW` have elapsed. Binding the challenger means a
     ///         mempool copy of the reveal cannot steal the 50% reward (#854).
     function commitChallenge(bytes32 commitment) external;
-
-    /// @notice Phantom announcement: a signed `ProbeResponse{hasBlob:true}` and a
-    ///         signed `StreamResponse{ok:false}` for the same hash within 30s.
-    ///         Reveals a prior `commitChallenge`; `salt` reconstructs it.
-    function submitPhantomChallenge(
-        address challengedNode,
-        bytes32 nodeId,
-        bytes calldata probeResponseData,
-        bytes calldata probeSlashSig,
-        bytes calldata streamResponseData,
-        bytes calldata streamSlashSig,
-        bytes32 salt
-    ) external;
 
     /// @notice Rate manipulation: a signed pair where the stream rate exceeds the
     ///         probe rate for the same hash within 30s. Reveals a prior

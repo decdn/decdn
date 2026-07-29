@@ -1399,10 +1399,10 @@ impl CacheEngine {
         // hold. (Today only the tests lower it post-startup;
         // `cache.max_probe_holds` is restart-required, not hot-reloaded.) Also
         // skips the O(N) expiry sweep entirely while holds are off. Returning
-        // before the under-lock `is_evicted` re-check is slash-safe: a blob
+        // before the under-lock `is_evicted` re-check is harmless: a blob
         // evicted concurrently here is still answered `has_blob: false` (the
         // misclassification is `Unavailable`→`HoldsDisabled`, a metric-only
-        // miscount between two non-slash counters — never a phantom `true`).
+        // miscount between two counters — never a false `has_blob: true`).
         if max == 0 {
             return Ok(ProbeHoldOutcome::HoldsDisabled);
         }
@@ -1434,8 +1434,9 @@ impl CacheEngine {
         // TOCTOU re-check: a concurrent `evict()` or denylist reload may have
         // completed after the `has()` above. Under the lock, a refused hash is
         // never held — a hold is what authorises signing `has_blob: true`, and
-        // signing that for a hash the serve path will refuse is the ADR 005
-        // phantom-announcement evidence pair.
+        // signing that for a *blacklisted* hash is the ADR 014
+        // blacklist-violation evidence (and for a locally-evicted one, an
+        // advertisement the serve path would only refuse).
         if self.refuses(hash) {
             return Ok(ProbeHoldOutcome::Unavailable);
         }
@@ -5694,7 +5695,7 @@ mod tests {
         let absent = Hash::new(b"never fetched");
         anyhow::ensure!(
             engine.try_probe_hold(absent).await? == ProbeHoldOutcome::Unavailable,
-            "absent blob must not be holdable (would risk a phantom slash)"
+            "absent blob must not be holdable (an absent blob is never advertised)"
         );
         Ok(())
     }

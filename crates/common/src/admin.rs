@@ -463,8 +463,8 @@ pub struct SlashRecordDto {
     /// rendered as a decimal string — it is a `uint256` and can exceed `u64`.
     /// This is the value passed to `decdn appeal slash <SLASH_ID>`.
     pub slash_id: String,
-    /// Offense taxonomy index (ADR 014): `0` = Phantom, `1` = `RateManipulation`,
-    /// `2` = Blacklist. Kept numeric to avoid drift if the enum grows.
+    /// Offense taxonomy index (ADR 014): `0` = `RateManipulation`,
+    /// `1` = Blacklist. Kept numeric to avoid drift if the enum grows.
     pub offense_type: u8,
     /// Bond amount slashed, in TOKEN base units, as a decimal string (`uint256`).
     pub amount: String,

@@ -291,124 +291,27 @@ contract SlashJudgeTest is Test {
     }
 
     // -----------------------------------------------------------------
-    // Phantom
-    // -----------------------------------------------------------------
-
-    function test_phantom_slashesAndRoundTripsBond() public {
-        SlashJudge.ProbeMsg memory p = _probe(true, 10, probeTs);
-        SlashJudge.StreamMsg memory s = _stream(false, 10, streamTs);
-
-        uint256 balBefore = token.balanceOf(challenger);
-        _commitAndMature(_pairHash(p, s, ISlashJudge.OffenseType.Phantom));
-        vm.prank(challenger);
-        judge.submitPhantomChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), SALT);
-
-        assertEq(slasher.slashCount(), 1);
-        assertEq(slasher.lastOperator(), node);
-        assertEq(slasher.lastChallenger(), challenger);
-        assertEq(slasher.lastOffense(), uint8(ISlashJudge.OffenseType.Phantom));
-        assertEq(token.balanceOf(challenger), balBefore); // bond returned
-    }
-
-    function test_phantom_revertsWhenStreamOk() public {
-        SlashJudge.ProbeMsg memory p = _probe(true, 10, probeTs);
-        SlashJudge.StreamMsg memory s = _stream(true, 10, streamTs); // ok=true → not phantom
-        vm.prank(challenger);
-        vm.expectRevert(SlashJudge.NotPhantom.selector);
-        judge.submitPhantomChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), SALT);
-    }
-
-    function test_phantom_revertsOnUnregisteredNode() public {
-        slasher.setBound(node, bytes32(0));
-        SlashJudge.ProbeMsg memory p = _probe(true, 10, probeTs);
-        SlashJudge.StreamMsg memory s = _stream(false, 10, streamTs);
-        vm.prank(challenger);
-        vm.expectRevert(abi.encodeWithSelector(SlashJudge.NodeNotRegistered.selector, node));
-        judge.submitPhantomChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), SALT);
-    }
-
-    function test_phantom_revertsOnNodeIdMismatch() public {
-        SlashJudge.ProbeMsg memory p = _probe(true, 10, probeTs);
-        SlashJudge.StreamMsg memory s = _stream(false, 10, streamTs);
-        bytes32 wrongId = bytes32(uint256(0xBAD));
-        vm.prank(challenger);
-        vm.expectRevert(abi.encodeWithSelector(SlashJudge.NodeIdMismatch.selector, wrongId, NODE_ID));
-        judge.submitPhantomChallenge(node, wrongId, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), SALT);
-    }
-
-    function test_phantom_revertsOnBadProbeSignature() public {
-        SlashJudge.ProbeMsg memory p = _probe(true, 10, probeTs);
-        SlashJudge.StreamMsg memory s = _stream(false, 10, streamTs);
-        bytes memory probeSig = _signProbe(_probe(true, 99, probeTs)); // signed different rate
-        vm.prank(challenger);
-        vm.expectRevert(SlashJudge.InvalidProbeSignature.selector);
-        judge.submitPhantomChallenge(node, NODE_ID, abi.encode(p), probeSig, abi.encode(s), _signStream(s), SALT);
-    }
-
-    function test_phantom_revertsOutsideTimestampWindow() public {
-        uint64 farStream = probeTs + 30_000_000; // exactly 30s → not < 30s
-        SlashJudge.ProbeMsg memory p = _probe(true, 10, probeTs);
-        SlashJudge.StreamMsg memory s = _stream(false, 10, farStream);
-        vm.prank(challenger);
-        vm.expectRevert(abi.encodeWithSelector(SlashJudge.TimestampWindowViolated.selector, probeTs, farStream));
-        judge.submitPhantomChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), SALT);
-    }
-
-    function test_phantom_revertsOnStaleEvidence() public {
-        uint256 nowUs = block.timestamp * 1_000_000;
-        uint64 oldProbe = uint64(nowUs - (6 days * 1_000_000)); // older than 5d ceiling
-        uint64 oldStream = oldProbe + 5_000_000;
-        SlashJudge.ProbeMsg memory p = _probe(true, 10, oldProbe);
-        SlashJudge.StreamMsg memory s = _stream(false, 10, oldStream);
-        vm.prank(challenger);
-        vm.expectRevert(
-            abi.encodeWithSelector(SlashJudge.EvidenceTooOld.selector, uint256(6 days * 1_000_000), MAX_EVIDENCE_AGE_US)
-        );
-        judge.submitPhantomChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), SALT);
-    }
-
-    function test_phantom_revertsOnFutureEvidence() public {
-        uint256 nowUs = block.timestamp * 1_000_000;
-        uint64 futureProbe = uint64(nowUs + 120_000_000); // 120s > 60s skew
-        uint64 futureStream = futureProbe + 5_000_000;
-        SlashJudge.ProbeMsg memory p = _probe(true, 10, futureProbe);
-        SlashJudge.StreamMsg memory s = _stream(false, 10, futureStream);
-        vm.prank(challenger);
-        vm.expectRevert(abi.encodeWithSelector(SlashJudge.EvidenceInFuture.selector, futureProbe));
-        judge.submitPhantomChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), SALT);
-    }
-
-    function test_phantom_revertsOnEvidenceReplay() public {
-        SlashJudge.ProbeMsg memory p = _probe(true, 10, probeTs);
-        SlashJudge.StreamMsg memory s = _stream(false, 10, streamTs);
-        bytes32 evidenceHash = _pairHash(p, s, ISlashJudge.OffenseType.Phantom);
-
-        _commitAndMature(evidenceHash);
-        vm.prank(challenger);
-        judge.submitPhantomChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), SALT);
-
-        // Re-commit the same proof: the commitment check now passes but the
-        // evidence replay guard must still reject it (no offense-count ratchet).
-        _commitAndMature(evidenceHash);
-        vm.prank(challenger);
-        vm.expectRevert(abi.encodeWithSelector(SlashJudge.EvidenceAlreadyUsed.selector, evidenceHash));
-        judge.submitPhantomChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), SALT);
-
-        assertEq(slasher.slashCount(), 1);
-        assertTrue(judge.usedEvidenceHash(evidenceHash));
-    }
-
-    // -----------------------------------------------------------------
     // Rate manipulation
+    //
+    // The shared `_verifyPair` machinery (registration, node-id, signatures,
+    // 30s window, staleness, replay) is exercised through this — the only
+    // surviving two-message entry point.
     // -----------------------------------------------------------------
 
     function test_rate_slashesWhenStreamRateHigher() public {
         SlashJudge.ProbeMsg memory p = _probe(true, 10, probeTs);
         SlashJudge.StreamMsg memory s = _stream(true, 25, streamTs); // 25 > 10
+
+        uint256 balBefore = token.balanceOf(challenger);
         _commitAndMature(_pairHash(p, s, ISlashJudge.OffenseType.RateManipulation));
         vm.prank(challenger);
         judge.submitRateChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), SALT);
+
+        assertEq(slasher.slashCount(), 1);
+        assertEq(slasher.lastOperator(), node);
+        assertEq(slasher.lastChallenger(), challenger);
         assertEq(slasher.lastOffense(), uint8(ISlashJudge.OffenseType.RateManipulation));
+        assertEq(token.balanceOf(challenger), balBefore); // bond returned
     }
 
     function test_rate_revertsWhenNotHigher() public {
@@ -417,6 +320,98 @@ contract SlashJudgeTest is Test {
         vm.prank(challenger);
         vm.expectRevert(SlashJudge.NotRateManipulation.selector);
         judge.submitRateChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), SALT);
+    }
+
+    /// @dev A signed refusal (`ok:false`) is inert as rate evidence even when it
+    ///      quotes a higher rate than the probe — you cannot overcharge on a
+    ///      delivery you declined. This is what lets a node sign `ok:false`
+    ///      freely (the retired phantom offense used to weaponize exactly this).
+    function test_rate_revertsWhenStreamNotOk() public {
+        SlashJudge.ProbeMsg memory p = _probe(true, 10, probeTs);
+        SlashJudge.StreamMsg memory s = _stream(false, 25, streamTs); // ok=false, 25 > 10
+        vm.prank(challenger);
+        vm.expectRevert(SlashJudge.NotRateManipulation.selector);
+        judge.submitRateChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), SALT);
+    }
+
+    function test_rate_revertsOnUnregisteredNode() public {
+        slasher.setBound(node, bytes32(0));
+        SlashJudge.ProbeMsg memory p = _probe(true, 10, probeTs);
+        SlashJudge.StreamMsg memory s = _stream(true, 25, streamTs);
+        vm.prank(challenger);
+        vm.expectRevert(abi.encodeWithSelector(SlashJudge.NodeNotRegistered.selector, node));
+        judge.submitRateChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), SALT);
+    }
+
+    function test_rate_revertsOnNodeIdMismatch() public {
+        SlashJudge.ProbeMsg memory p = _probe(true, 10, probeTs);
+        SlashJudge.StreamMsg memory s = _stream(true, 25, streamTs);
+        bytes32 wrongId = bytes32(uint256(0xBAD));
+        vm.prank(challenger);
+        vm.expectRevert(abi.encodeWithSelector(SlashJudge.NodeIdMismatch.selector, wrongId, NODE_ID));
+        judge.submitRateChallenge(node, wrongId, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), SALT);
+    }
+
+    function test_rate_revertsOnBadProbeSignature() public {
+        SlashJudge.ProbeMsg memory p = _probe(true, 10, probeTs);
+        SlashJudge.StreamMsg memory s = _stream(true, 25, streamTs);
+        bytes memory probeSig = _signProbe(_probe(true, 99, probeTs)); // signed different rate
+        vm.prank(challenger);
+        vm.expectRevert(SlashJudge.InvalidProbeSignature.selector);
+        judge.submitRateChallenge(node, NODE_ID, abi.encode(p), probeSig, abi.encode(s), _signStream(s), SALT);
+    }
+
+    function test_rate_revertsOutsideTimestampWindow() public {
+        uint64 farStream = probeTs + 30_000_000; // exactly 30s → not < 30s
+        SlashJudge.ProbeMsg memory p = _probe(true, 10, probeTs);
+        SlashJudge.StreamMsg memory s = _stream(true, 25, farStream);
+        vm.prank(challenger);
+        vm.expectRevert(abi.encodeWithSelector(SlashJudge.TimestampWindowViolated.selector, probeTs, farStream));
+        judge.submitRateChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), SALT);
+    }
+
+    function test_rate_revertsOnStaleEvidence() public {
+        uint256 nowUs = block.timestamp * 1_000_000;
+        uint64 oldProbe = uint64(nowUs - (6 days * 1_000_000)); // older than 5d ceiling
+        uint64 oldStream = oldProbe + 5_000_000;
+        SlashJudge.ProbeMsg memory p = _probe(true, 10, oldProbe);
+        SlashJudge.StreamMsg memory s = _stream(true, 25, oldStream);
+        vm.prank(challenger);
+        vm.expectRevert(
+            abi.encodeWithSelector(SlashJudge.EvidenceTooOld.selector, uint256(6 days * 1_000_000), MAX_EVIDENCE_AGE_US)
+        );
+        judge.submitRateChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), SALT);
+    }
+
+    function test_rate_revertsOnFutureEvidence() public {
+        uint256 nowUs = block.timestamp * 1_000_000;
+        uint64 futureProbe = uint64(nowUs + 120_000_000); // 120s > 60s skew
+        uint64 futureStream = futureProbe + 5_000_000;
+        SlashJudge.ProbeMsg memory p = _probe(true, 10, futureProbe);
+        SlashJudge.StreamMsg memory s = _stream(true, 25, futureStream);
+        vm.prank(challenger);
+        vm.expectRevert(abi.encodeWithSelector(SlashJudge.EvidenceInFuture.selector, futureProbe));
+        judge.submitRateChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), SALT);
+    }
+
+    function test_rate_revertsOnEvidenceReplay() public {
+        SlashJudge.ProbeMsg memory p = _probe(true, 10, probeTs);
+        SlashJudge.StreamMsg memory s = _stream(true, 25, streamTs);
+        bytes32 evidenceHash = _pairHash(p, s, ISlashJudge.OffenseType.RateManipulation);
+
+        _commitAndMature(evidenceHash);
+        vm.prank(challenger);
+        judge.submitRateChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), SALT);
+
+        // Re-commit the same proof: the commitment check now passes but the
+        // evidence replay guard must still reject it (no offense-count ratchet).
+        _commitAndMature(evidenceHash);
+        vm.prank(challenger);
+        vm.expectRevert(abi.encodeWithSelector(SlashJudge.EvidenceAlreadyUsed.selector, evidenceHash));
+        judge.submitRateChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), SALT);
+
+        assertEq(slasher.slashCount(), 1);
+        assertTrue(judge.usedEvidenceHash(evidenceHash));
     }
 
     // -----------------------------------------------------------------
@@ -737,8 +732,9 @@ contract SlashJudgeTest is Test {
 
     function test_commit_revertsOnDuplicate() public {
         SlashJudge.ProbeMsg memory p = _probe(true, 10, probeTs);
-        SlashJudge.StreamMsg memory s = _stream(false, 10, streamTs);
-        bytes32 commitment = keccak256(abi.encode(_pairHash(p, s, ISlashJudge.OffenseType.Phantom), SALT, challenger));
+        SlashJudge.StreamMsg memory s = _stream(true, 25, streamTs);
+        bytes32 commitment =
+            keccak256(abi.encode(_pairHash(p, s, ISlashJudge.OffenseType.RateManipulation), SALT, challenger));
 
         vm.prank(challenger);
         judge.commitChallenge(commitment);
@@ -766,16 +762,16 @@ contract SlashJudgeTest is Test {
 
     function test_reveal_revertsWithoutCommit() public {
         SlashJudge.ProbeMsg memory p = _probe(true, 10, probeTs);
-        SlashJudge.StreamMsg memory s = _stream(false, 10, streamTs);
+        SlashJudge.StreamMsg memory s = _stream(true, 25, streamTs);
         vm.prank(challenger);
         vm.expectRevert(SlashJudge.NoCommitment.selector);
-        judge.submitPhantomChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), SALT);
+        judge.submitRateChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), SALT);
     }
 
     function test_reveal_revertsBeforeDelay() public {
         SlashJudge.ProbeMsg memory p = _probe(true, 10, probeTs);
-        SlashJudge.StreamMsg memory s = _stream(false, 10, streamTs);
-        bytes32 evidenceHash = _pairHash(p, s, ISlashJudge.OffenseType.Phantom);
+        SlashJudge.StreamMsg memory s = _stream(true, 25, streamTs);
+        bytes32 evidenceHash = _pairHash(p, s, ISlashJudge.OffenseType.RateManipulation);
 
         _commitAs(challenger, evidenceHash);
         uint256 readyAt = block.timestamp + REVEAL_DELAY;
@@ -783,13 +779,13 @@ contract SlashJudgeTest is Test {
         vm.warp(block.timestamp + REVEAL_DELAY - 1);
         vm.prank(challenger);
         vm.expectRevert(abi.encodeWithSelector(SlashJudge.RevealTooEarly.selector, readyAt));
-        judge.submitPhantomChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), SALT);
+        judge.submitRateChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), SALT);
     }
 
     function test_reveal_revertsAfterWindow() public {
         SlashJudge.ProbeMsg memory p = _probe(true, 10, probeTs);
-        SlashJudge.StreamMsg memory s = _stream(false, 10, streamTs);
-        bytes32 evidenceHash = _pairHash(p, s, ISlashJudge.OffenseType.Phantom);
+        SlashJudge.StreamMsg memory s = _stream(true, 25, streamTs);
+        bytes32 evidenceHash = _pairHash(p, s, ISlashJudge.OffenseType.RateManipulation);
 
         _commitAs(challenger, evidenceHash);
         uint256 expiresAt = block.timestamp + REVEAL_WINDOW;
@@ -798,7 +794,7 @@ contract SlashJudgeTest is Test {
         vm.warp(block.timestamp + REVEAL_WINDOW + 1);
         vm.prank(challenger);
         vm.expectRevert(abi.encodeWithSelector(SlashJudge.CommitmentExpired.selector, expiresAt));
-        judge.submitPhantomChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), SALT);
+        judge.submitRateChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), SALT);
     }
 
     function test_reveal_revertsForWrongChallenger() public {
@@ -806,27 +802,27 @@ contract SlashJudgeTest is Test {
         // different `msg.sender` reconstructs a different commitment, which was
         // never registered → NoCommitment. This is the front-running fix.
         SlashJudge.ProbeMsg memory p = _probe(true, 10, probeTs);
-        SlashJudge.StreamMsg memory s = _stream(false, 10, streamTs);
-        _commitAndMature(_pairHash(p, s, ISlashJudge.OffenseType.Phantom));
+        SlashJudge.StreamMsg memory s = _stream(true, 25, streamTs);
+        _commitAndMature(_pairHash(p, s, ISlashJudge.OffenseType.RateManipulation));
 
         vm.prank(stranger);
         vm.expectRevert(SlashJudge.NoCommitment.selector);
-        judge.submitPhantomChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), SALT);
+        judge.submitRateChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), SALT);
     }
 
     function test_reveal_consumesCommitment() public {
         SlashJudge.ProbeMsg memory p = _probe(true, 10, probeTs);
-        SlashJudge.StreamMsg memory s = _stream(false, 10, streamTs);
-        _commitAndMature(_pairHash(p, s, ISlashJudge.OffenseType.Phantom));
+        SlashJudge.StreamMsg memory s = _stream(true, 25, streamTs);
+        _commitAndMature(_pairHash(p, s, ISlashJudge.OffenseType.RateManipulation));
 
         vm.prank(challenger);
-        judge.submitPhantomChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), SALT);
+        judge.submitRateChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), SALT);
 
         // The commitment was deleted on the successful reveal, so a naive resubmit
         // (no fresh commit) fails the commitment check before the replay guard.
         vm.prank(challenger);
         vm.expectRevert(SlashJudge.NoCommitment.selector);
-        judge.submitPhantomChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), SALT);
+        judge.submitRateChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), SALT);
     }
 
     function test_commit_emitsEvent() public {
@@ -840,22 +836,22 @@ contract SlashJudgeTest is Test {
     function test_reveal_succeedsAtExactReadyBoundary() public {
         // block.timestamp == committedAt + MIN_REVEAL_DELAY is valid (`<` not `<=`).
         SlashJudge.ProbeMsg memory p = _probe(true, 10, probeTs);
-        SlashJudge.StreamMsg memory s = _stream(false, 10, streamTs);
-        _commitAs(challenger, _pairHash(p, s, ISlashJudge.OffenseType.Phantom));
+        SlashJudge.StreamMsg memory s = _stream(true, 25, streamTs);
+        _commitAs(challenger, _pairHash(p, s, ISlashJudge.OffenseType.RateManipulation));
         vm.warp(block.timestamp + REVEAL_DELAY); // exactly at readyAt
         vm.prank(challenger);
-        judge.submitPhantomChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), SALT);
+        judge.submitRateChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), SALT);
         assertEq(slasher.slashCount(), 1);
     }
 
     function test_reveal_succeedsAtExactExpiryBoundary() public {
         // block.timestamp == committedAt + REVEAL_WINDOW is still valid (`>` not `>=`).
         SlashJudge.ProbeMsg memory p = _probe(true, 10, probeTs);
-        SlashJudge.StreamMsg memory s = _stream(false, 10, streamTs);
-        _commitAs(challenger, _pairHash(p, s, ISlashJudge.OffenseType.Phantom));
+        SlashJudge.StreamMsg memory s = _stream(true, 25, streamTs);
+        _commitAs(challenger, _pairHash(p, s, ISlashJudge.OffenseType.RateManipulation));
         vm.warp(block.timestamp + REVEAL_WINDOW); // exactly at expiry
         vm.prank(challenger);
-        judge.submitPhantomChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), SALT);
+        judge.submitRateChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), SALT);
         assertEq(slasher.slashCount(), 1);
     }
 
@@ -863,14 +859,12 @@ contract SlashJudgeTest is Test {
         // The commitment binds the salt: revealing the same evidence under a
         // different salt reconstructs a commitment that was never stored.
         SlashJudge.ProbeMsg memory p = _probe(true, 10, probeTs);
-        SlashJudge.StreamMsg memory s = _stream(false, 10, streamTs);
-        _commitAndMature(_pairHash(p, s, ISlashJudge.OffenseType.Phantom)); // commits with SALT
+        SlashJudge.StreamMsg memory s = _stream(true, 25, streamTs);
+        _commitAndMature(_pairHash(p, s, ISlashJudge.OffenseType.RateManipulation)); // commits with SALT
         bytes32 otherSalt = bytes32(uint256(0xBEEF));
         vm.prank(challenger);
         vm.expectRevert(SlashJudge.NoCommitment.selector);
-        judge.submitPhantomChallenge(
-            node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), otherSalt
-        );
+        judge.submitRateChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), otherSalt);
     }
 
     function test_commit_overwritesExpiredCommitment() public {
@@ -878,8 +872,8 @@ contract SlashJudgeTest is Test {
         // re-commit the SAME (evidence, salt) once it lapses past REVEAL_WINDOW,
         // then reveal — proving they are not permanently wedged on that salt.
         SlashJudge.ProbeMsg memory p = _probe(true, 10, probeTs);
-        SlashJudge.StreamMsg memory s = _stream(false, 10, streamTs);
-        bytes32 evidenceHash = _pairHash(p, s, ISlashJudge.OffenseType.Phantom);
+        SlashJudge.StreamMsg memory s = _stream(true, 25, streamTs);
+        bytes32 evidenceHash = _pairHash(p, s, ISlashJudge.OffenseType.RateManipulation);
 
         _commitAs(challenger, evidenceHash);
         vm.warp(block.timestamp + REVEAL_WINDOW + 1); // first commitment expires
@@ -888,7 +882,7 @@ contract SlashJudgeTest is Test {
         _commitAs(challenger, evidenceHash);
         vm.warp(block.timestamp + REVEAL_DELAY + 1); // mature the fresh commitment
         vm.prank(challenger);
-        judge.submitPhantomChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), SALT);
+        judge.submitRateChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), SALT);
         assertEq(slasher.slashCount(), 1);
     }
 
@@ -911,20 +905,20 @@ contract SlashJudgeTest is Test {
         // commitment — hits the evidence replay guard. The reward is decided by
         // reveal order, never by copying calldata.
         SlashJudge.ProbeMsg memory p = _probe(true, 10, probeTs);
-        SlashJudge.StreamMsg memory s = _stream(false, 10, streamTs);
-        bytes32 evidenceHash = _pairHash(p, s, ISlashJudge.OffenseType.Phantom);
+        SlashJudge.StreamMsg memory s = _stream(true, 25, streamTs);
+        bytes32 evidenceHash = _pairHash(p, s, ISlashJudge.OffenseType.RateManipulation);
 
         _commitAs(challenger, evidenceHash);
         _commitAs(challenger2, evidenceHash);
         vm.warp(block.timestamp + REVEAL_DELAY + 1);
 
         vm.prank(challenger);
-        judge.submitPhantomChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), SALT);
+        judge.submitRateChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), SALT);
         assertEq(slasher.lastChallenger(), challenger);
 
         vm.prank(challenger2);
         vm.expectRevert(abi.encodeWithSelector(SlashJudge.EvidenceAlreadyUsed.selector, evidenceHash));
-        judge.submitPhantomChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), SALT);
+        judge.submitRateChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), SALT);
 
         assertEq(slasher.slashCount(), 1);
     }
@@ -985,10 +979,10 @@ contract SlashJudgeTest is Test {
         vm.prank(pauser);
         judge.pause();
         SlashJudge.ProbeMsg memory p = _probe(true, 10, probeTs);
-        SlashJudge.StreamMsg memory s = _stream(false, 10, streamTs);
+        SlashJudge.StreamMsg memory s = _stream(true, 25, streamTs);
         vm.prank(challenger);
         vm.expectRevert();
-        judge.submitPhantomChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), SALT);
+        judge.submitRateChallenge(node, NODE_ID, abi.encode(p), _signProbe(p), abi.encode(s), _signStream(s), SALT);
     }
 
     function test_constructor_revertsWhenEvidenceAgeExceedsUnbonding() public {

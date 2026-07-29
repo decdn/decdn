@@ -1,12 +1,12 @@
 //! Probe-triggered eviction-hold constants (ADR 005 §Probe-triggered
 //! eviction hold, §Hold budget; appendix-blob-cache-eviction.md §4).
 //!
-//! When a node signs `has_blob: true` in a `ProbeResponse` it MUST guarantee
-//! the blob is not LRU-evicted for [`PROBE_HOLD_DURATION`], otherwise it risks
-//! a phantom-announcement slash. All three timing parameters derive from a
-//! single base value [`PROBE_SLASH_WINDOW`] so a future governance change to
-//! the slashing window only needs to touch one constant (ADR 005 §Derived
-//! constants).
+//! When a node signs `has_blob: true` in a `ProbeResponse` it keeps the blob
+//! eviction-exempt for [`PROBE_HOLD_DURATION`] so it is still resident when the
+//! probing client's follow-up pull arrives — an availability guarantee, kept
+//! because the node is about to earn on that pull. All three timing parameters
+//! derive from a single base value [`PROBE_SLASH_WINDOW`], which remains the
+//! on-chain rate-manipulation probe↔stream window (ADR 014).
 
 use std::time::Duration;
 

@@ -1023,8 +1023,8 @@ async fn probe_has_blob_true_for_cached_blob() -> anyhow::Result<()> {
 
 /// A node with the eviction-hold path **disabled by config**
 /// (`max_probe_holds == 0`) holds the blob but cannot guarantee a hold, so it
-/// must still answer `has_blob: false` with a valid `slash_sig` over
-/// `has_blob=false` — never risk a phantom slash (ADR 005 §Hold budget).
+/// answers `has_blob: false` with a valid `slash_sig` over `has_blob=false` —
+/// declining to advertise a hold it cannot guarantee (ADR 005 §Hold budget).
 /// Exercises the handler's `HoldsDisabled` arm end-to-end and asserts the
 /// outcome is counted as a *disabled* event, NOT as budget pressure (#739).
 #[tokio::test(flavor = "multi_thread")]

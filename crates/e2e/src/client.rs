@@ -519,7 +519,8 @@ impl ClientFixture {
 
     /// Probe `node` for `hash` over `cdn/probe/v1` and return the signed
     /// response. Unpaid (no channel) — used to assert the daemon's probe handler
-    /// reports `has_blob: false` after eviction (the phantom-blob slash seam).
+    /// reports `has_blob: false` after a blacklist eviction (the
+    /// blacklist-violation compliance seam).
     pub async fn probe(
         &self,
         node: &NodeFixture,

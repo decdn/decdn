@@ -51,14 +51,9 @@ contract InterfaceFreezeTest is Test {
     }
 
     function test_slashJudge_abiFrozen() public pure {
-        // The trailing `bytes32 salt` on the three reveals + `commitChallenge` are
+        // The trailing `bytes32 salt` on the two reveals + `commitChallenge` are
         // the commit–reveal front-running fix (#854); a deliberate ABI change.
         assertEq(SlashJudge.commitChallenge.selector, bytes4(keccak256("commitChallenge(bytes32)")), "commitChallenge");
-        assertEq(
-            SlashJudge.submitPhantomChallenge.selector,
-            bytes4(keccak256("submitPhantomChallenge(address,bytes32,bytes,bytes,bytes,bytes,bytes32)")),
-            "submitPhantomChallenge"
-        );
         assertEq(
             SlashJudge.submitRateChallenge.selector,
             bytes4(keccak256("submitRateChallenge(address,bytes32,bytes,bytes,bytes,bytes,bytes32)")),
