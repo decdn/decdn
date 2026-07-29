@@ -395,12 +395,18 @@ async fn resolve_selection(
 
 /// Entry point for `decdn bundle pull`.
 pub async fn bundle_pull(args: &BundlePullArgs, config_path: Option<&Path>) -> anyhow::Result<()> {
+    // Validate the flag combination first — BEFORE the dry-run short-circuit — so a
+    // bad combo (e.g. `--provider-address` without `--channel-id`/`--node-id`, #1492)
+    // or an unusable timeout pair is rejected even for `--dry-run`. This rule moved
+    // out of clap `requires` into `validate()`, so unlike the old clap check it does
+    // not run at parse time; dry-run must trigger it explicitly. It is cheap and
+    // side-effect-free.
+    args.common.validate()?;
+
     // Dry-run short-circuits before any network/chain/keystore activity.
     if args.dry_run {
         return dry_run(args);
     }
-    // As in `fetch`: reject a hard cap that would silently disable stall detection.
-    args.common.validate()?;
 
     // A local manifest is read up front (no network): an empty bundle then needs
     // no endpoint or keystore password at all.
@@ -610,24 +616,32 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
                     .store
                     .get_by_provider(provider)?
                     .is_some_and(|state| !state.is_expired_at(fetch::unix_now()));
-                let _open_guard = if reuse_only {
-                    None
-                } else {
-                    Some(self.open_lock.lock().await)
+                let ctx = {
+                    let _open_guard = if reuse_only {
+                        None
+                    } else {
+                        Some(self.open_lock.lock().await)
+                    };
+                    fetch::open_or_reuse(
+                        self.store,
+                        self.contract,
+                        self.rpc,
+                        self.signer,
+                        self.voucher_dom,
+                        provider,
+                        self.self_address,
+                        self.chain.payment_channel,
+                        self.chain.deposit,
+                        self.chain.max_approve,
+                    )
+                    .await?
                 };
-                fetch::open_or_reuse(
-                    self.store,
-                    self.contract,
-                    self.rpc,
-                    self.signer,
-                    self.voucher_dom,
-                    provider,
-                    self.self_address,
-                    self.chain.payment_channel,
-                    self.chain.deposit,
-                    self.chain.max_approve,
-                )
-                .await?
+                // Attach the ADR 005 client binding, exactly as `fetch::build_channel_ctx`
+                // does on its auto-open path. Without it the request carries no verified
+                // buyer identity, so the node's `pull_authorized` gate never fires a
+                // cache-miss origin pull and `--namespace` would be inert here. Signed
+                // outside the `open_lock` — it touches no on-chain allowance.
+                fetch::attach_client_binding(ctx, self.chain, self.endpoint, self.signer)?
             }
             // Adopt-by-id (#1481): no on-chain open, no USDC allowance, so the
             // `open_lock` is never taken. First entry hydrates the buyer-store row from
@@ -1285,6 +1299,42 @@ mod tests {
         let none = T::try_parse_from(["t", "-o", "out", "--hash", "b3:aa"])
             .expect("namespace is optional");
         assert_eq!(none.a.namespace, None, "absent flag stays None");
+    }
+
+    /// `--dry-run` must still enforce the flag-combination rule. The #1492 pairing
+    /// (`--provider-address` needs `--channel-id` or `--node-id`) moved from clap
+    /// `requires` into `validate()`, which no longer runs at parse time — so
+    /// `bundle_pull` calls it BEFORE the dry-run short-circuit. Without that, a
+    /// `--dry-run --provider-address 0x..` alone would succeed where the old clap
+    /// check rejected it. Asserted end-to-end: the command returns the guard error
+    /// (before any network/chain I/O, since `validate()` fails first).
+    #[tokio::test]
+    async fn dry_run_still_rejects_a_dangling_provider_address() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct T {
+            #[command(flatten)]
+            a: decdn_common::cli::BundlePullArgs,
+        }
+        let addr = "0x0000000000000000000000000000000000000001";
+        let args = T::parse_from([
+            "t",
+            "-o",
+            "out",
+            "--hash",
+            "b3:aa",
+            "--dry-run",
+            "--provider-address",
+            addr,
+        ])
+        .a;
+        let err = super::bundle_pull(&args, None)
+            .await
+            .expect_err("a dangling --provider-address must be rejected even for --dry-run");
+        assert!(
+            format!("{err:#}").contains("--provider-address needs a target"),
+            "expected the #1492 guard error, got: {err:#}"
+        );
     }
 
     /// `--channel-id` on bundle pull must NOT go through `explicit_target` (that path
