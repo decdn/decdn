@@ -25,7 +25,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use alloy::dyn_abi::Eip712Domain;
-use alloy::primitives::Address;
+use alloy::primitives::{Address, B256};
 use alloy::providers::Provider;
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::{Context as _, anyhow, bail};
@@ -49,6 +49,16 @@ use decdn_client_pull::endpoint as client_endpoint;
 use decdn_client_pull::provider;
 
 type FetchTarget = (PublicKey, Address);
+
+/// How each entry's channel context is obtained. `AutoOpen` opens-or-reuses a
+/// buyer channel keyed by provider (the default and discovery paths). `Adopt`
+/// reuses one publisher-opened channel adopted by id (#1481) for the WHOLE bundle
+/// — every entry shares its provider, so there is nothing to open.
+#[derive(Clone, Copy)]
+enum Payment {
+    AutoOpen,
+    Adopt { channel_id: B256 },
+}
 
 /// Remove the node that just refused delivery before probing fallback holders.
 /// The node id is the delivery endpoint identity; excluding it also protects
@@ -281,14 +291,122 @@ async fn discover_candidates(
     ))
 }
 
+/// Load the buyer's Ethereum signer (vouchers + any openChannel tx) and its
+/// address, prompting for the keystore password once. Password from
+/// `$DECDN_KEYSTORE_PASSWORD`, else a TTY prompt. Called per selection path so the
+/// prompt is ordered relative to discovery (see `resolve_selection`).
+fn load_buyer_signer(
+    chain: &fetch::ResolvedChain,
+) -> anyhow::Result<(Arc<PrivateKeySigner>, Address)> {
+    let password = read_password(
+        &[
+            PasswordSource::Env(eth_identity::KEYSTORE_PASSWORD_ENV),
+            PasswordSource::Prompt { confirm: false },
+        ],
+        "eth keystore password",
+    )?;
+    let signer = Arc::new(load_signer(&chain.keystore, &password)?);
+    let self_address = signer.address();
+    Ok((signer, self_address))
+}
+
+/// The resolved node selection, payment mode, and buyer signer for a pull run.
+struct Selection {
+    /// `Some((node, provider))` pins every entry to one node; `None` discovers per
+    /// entry against `candidates`.
+    explicit: Option<FetchTarget>,
+    candidates: Option<Vec<NodeCandidate>>,
+    payment: Payment,
+    signer: Arc<PrivateKeySigner>,
+    self_address: Address,
+}
+
+/// Resolve the node selection, payment mode, and buyer signer for a pull run.
+///
+/// The keystore prompt is ordered per path so it only appears once there is real
+/// work: the `--channel-id` adopt path needs the keystore up front (to guard the
+/// channel's `voucherSigner` and read `getChannel`); the discovery path defers it
+/// until AFTER the registry read, so a failed discovery never prompts. Modes:
+/// - `--channel-id` (#1481): adopt one publisher-opened channel and pin the WHOLE
+///   bundle to its single on-chain provider (node derived from it, or the explicit
+///   `--node-id`). No per-entry discovery.
+/// - else `--node-id`: pin every entry to that node, auto-opening per provider.
+/// - else: per-entry discovery, auto-opening per provider.
+async fn resolve_selection(
+    common: &ClientFetchArgs,
+    chain: &fetch::ResolvedChain,
+    store: &RedbBuyerChannelStore,
+) -> anyhow::Result<Selection> {
+    if let Some(raw_channel_id) = &common.channel_id {
+        let channel_id = fetch::parse_channel_id(raw_channel_id)?;
+        let expected_provider = common
+            .provider_address
+            .as_deref()
+            .map(|p| chain_ctx::parse_address(p, "--provider-address"))
+            .transpose()?;
+        let (signer, self_address) = load_buyer_signer(chain)?;
+        // Read (and guard) the channel's provider to resolve the pinned node. A
+        // throwaway contract just for this one `getChannel`; `fetch_from` rebuilds
+        // per entry from the now-persisted store row.
+        let read_rpc = provider::build_provider(&chain.rpc_url, &signer)?;
+        let read_contract = PaymentChannel::new(chain.payment_channel, read_rpc);
+        let voucher_dom = voucher_domain(chain.chain_id, chain.payment_channel);
+        let (_ctx, provider) = fetch::hydrate_channel_by_id(
+            store,
+            &read_contract,
+            channel_id,
+            self_address,
+            &voucher_dom,
+            &signer,
+            expected_provider,
+        )
+        .await?;
+        let node_id = fetch::resolve_node_for_provider(common, chain, provider).await?;
+        return Ok(Selection {
+            explicit: Some((node_id, provider)),
+            candidates: None,
+            payment: Payment::Adopt { channel_id },
+            signer,
+            self_address,
+        });
+    }
+
+    // Explicit single node for every entry, or a per-entry discovery candidate list
+    // read from `CapacityBond` once.
+    let explicit = explicit_target(common)?;
+    let candidates = match explicit {
+        Some(_) => None,
+        // The registry read is bounded by `--timeout-ms` (#1349), inside
+        // `bootstrap_nodes` so a timeout still falls through to the peer cache.
+        // Unlike `fetch`, no probing happens here — `discover_candidates` is the
+        // registry read plus `select_candidates`; probing is per entry, in
+        // `pick_excluding` below.
+        None => Some(discover_candidates(chain, common.discovery_cap()).await?),
+    };
+    let (signer, self_address) = load_buyer_signer(chain)?;
+    Ok(Selection {
+        explicit,
+        candidates,
+        payment: Payment::AutoOpen,
+        signer,
+        self_address,
+    })
+}
+
 /// Entry point for `decdn bundle pull`.
 pub async fn bundle_pull(args: &BundlePullArgs, config_path: Option<&Path>) -> anyhow::Result<()> {
+    // Validate the flag combination first — BEFORE the dry-run short-circuit — so a
+    // bad combo (e.g. `--provider-address` without `--channel-id`/`--node-id`, #1492)
+    // or an unusable timeout pair is rejected even for `--dry-run`. This rule moved
+    // out of clap `requires` into `validate()`, so unlike the old clap check it does
+    // not run at parse time; dry-run must trigger it explicitly. It is cheap and
+    // side-effect-free.
+    args.common.validate()?;
+
     // Dry-run short-circuits before any network/chain/keystore activity.
     if args.dry_run {
         return dry_run(args);
     }
-    // As in `fetch`: reject a hard cap that would silently disable stall detection.
-    args.common.validate()?;
 
     // A local manifest is read up front (no network): an empty bundle then needs
     // no endpoint or keystore password at all.
@@ -311,34 +429,29 @@ pub async fn bundle_pull(args: &BundlePullArgs, config_path: Option<&Path>) -> a
     let store = RedbBuyerChannelStore::open(&chain.data_dir)?;
     let endpoint = client_endpoint::client_endpoint(&relays, &disc).await?;
 
-    // Selection: explicit single node for every entry, or a per-entry discovery
-    // candidate list read from `CapacityBond` once.
-    let explicit = explicit_target(common)?;
-    let candidates = match explicit {
-        Some(_) => None,
-        // The registry read is bounded by `--timeout-ms` (#1349), inside
-        // `bootstrap_nodes` so a timeout still falls through to the peer cache.
-        // Unlike `fetch`, no probing happens here — `discover_candidates` is
-        // the registry read plus `select_candidates`; probing is per entry, in
-        // `pick_excluding` below.
-        None => Some(discover_candidates(&chain, common.discovery_cap()).await?),
-    };
+    // Selection + payment mode + the buyer signer, resolved per path (see
+    // `resolve_selection`).
+    let Selection {
+        explicit,
+        candidates,
+        payment,
+        signer,
+        self_address,
+    } = resolve_selection(common, &chain, &store).await?;
 
-    // Buyer signer (vouchers + any openChannel tx). Prompted only once, after we
-    // know there is work to do. Password from env, else TTY.
-    let password = read_password(
-        &[
-            PasswordSource::Env(eth_identity::KEYSTORE_PASSWORD_ENV),
-            PasswordSource::Prompt { confirm: false },
-        ],
-        "eth keystore password",
-    )?;
-    let signer = Arc::new(load_signer(&chain.keystore, &password)?);
-    let self_address = signer.address();
+    // Chain plumbing for the pull loop, built once from the resolved signer.
     let rpc = provider::build_provider(&chain.rpc_url, &signer)?;
     let contract = PaymentChannel::new(chain.payment_channel, rpc.clone());
     let voucher_dom = voucher_domain(chain.chain_id, chain.payment_channel);
     let slash_dom = slash_judge_domain(chain.chain_id, chain.slash_judge);
+
+    // `--namespace <id>` → big-endian `uint256`; absent => `NO_NAMESPACE`
+    // (best-effort cache/DHT). Same conversion as `decdn fetch`.
+    let namespace_id = args
+        .namespace
+        .map_or(decdn_protocol::client::NO_NAMESPACE, |n| {
+            alloy::primitives::U256::from(n).to_be_bytes()
+        });
 
     let ctx = PullCtx {
         endpoint: &endpoint,
@@ -352,8 +465,10 @@ pub async fn bundle_pull(args: &BundlePullArgs, config_path: Option<&Path>) -> a
         chain: &chain,
         relays: &relays,
         explicit,
+        payment,
         candidates,
         common,
+        namespace_id,
         locks: RefCell::new(HashMap::new()),
         open_lock: tokio::sync::Mutex::new(()),
     };
@@ -403,11 +518,18 @@ struct PullCtx<'a, P: Provider + Clone> {
     slash_dom: &'a Eip712Domain,
     chain: &'a fetch::ResolvedChain,
     relays: &'a [RelayUrl],
-    /// `Some((node_id, provider))` pins every entry to one node (`--node-id`);
-    /// `None` discovers per entry against `candidates`.
+    /// `Some((node_id, provider))` pins every entry to one node (`--node-id` or
+    /// the `--channel-id` adopt path); `None` discovers per entry against
+    /// `candidates`.
     explicit: Option<FetchTarget>,
+    /// Auto-open per provider, or adopt one channel by id for the whole bundle.
+    payment: Payment,
     candidates: Option<Vec<NodeCandidate>>,
     common: &'a ClientFetchArgs,
+    /// Bundle-level namespace id (ADR 002) applied to every paid pull in the run —
+    /// `--namespace <id>` as a big-endian `uint256`; `NO_NAMESPACE` when the flag
+    /// was omitted.
+    namespace_id: [u8; 32],
     /// Per-provider locks: serialize fetches sharing one channel's voucher
     /// nonce. Lazily created; held only across one entry's fetch.
     locks: RefCell<HashMap<Address, Rc<tokio::sync::Mutex<()>>>>,
@@ -482,35 +604,66 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         let lock = self.provider_lock(provider);
         let _guard = lock.lock().await;
 
-        // Only an actual channel *open* touches the shared USDC allowance, so
-        // only opens take the global `open_lock`. A live-channel reuse issues no
-        // approval and — under the per-provider lock held above, which gives this
-        // provider's channel state exclusive access — cannot turn into an open, so
-        // it stays lock-free and concurrent with another provider's in-flight open
-        // (which can take minutes on-chain).
-        let reuse_only = self
-            .store
-            .get_by_provider(provider)?
-            .is_some_and(|state| !state.is_expired_at(fetch::unix_now()));
-        let ctx = {
-            let _open_guard = if reuse_only {
-                None
-            } else {
-                Some(self.open_lock.lock().await)
-            };
-            fetch::open_or_reuse(
-                self.store,
-                self.contract,
-                self.rpc,
-                self.signer,
-                self.voucher_dom,
-                provider,
-                self.self_address,
-                self.chain.payment_channel,
-                self.chain.deposit,
-                self.chain.max_approve,
-            )
-            .await?
+        let ctx = match self.payment {
+            Payment::AutoOpen => {
+                // Only an actual channel *open* touches the shared USDC allowance, so
+                // only opens take the global `open_lock`. A live-channel reuse issues no
+                // approval and — under the per-provider lock held above, which gives this
+                // provider's channel state exclusive access — cannot turn into an open, so
+                // it stays lock-free and concurrent with another provider's in-flight open
+                // (which can take minutes on-chain).
+                let reuse_only = self
+                    .store
+                    .get_by_provider(provider)?
+                    .is_some_and(|state| !state.is_expired_at(fetch::unix_now()));
+                let ctx = {
+                    let _open_guard = if reuse_only {
+                        None
+                    } else {
+                        Some(self.open_lock.lock().await)
+                    };
+                    fetch::open_or_reuse(
+                        self.store,
+                        self.contract,
+                        self.rpc,
+                        self.signer,
+                        self.voucher_dom,
+                        provider,
+                        self.self_address,
+                        self.chain.payment_channel,
+                        self.chain.deposit,
+                        self.chain.max_approve,
+                    )
+                    .await?
+                };
+                // Attach the ADR 005 client binding, exactly as `fetch::build_channel_ctx`
+                // does on its auto-open path. Without it the request carries no verified
+                // buyer identity, so the node's `pull_authorized` gate never fires a
+                // cache-miss origin pull and `--namespace` would be inert here. Signed
+                // outside the `open_lock` — it touches no on-chain allowance.
+                fetch::attach_client_binding(ctx, self.chain, self.endpoint, self.signer)?
+            }
+            // Adopt-by-id (#1481): no on-chain open, no USDC allowance, so the
+            // `open_lock` is never taken. First entry hydrates the buyer-store row from
+            // chain; later entries hit the `store.get_by_channel_id` fast path. Rebuilt
+            // per entry (like `open_or_reuse`) to re-snapshot the advanced watermark; the
+            // per-provider lock above serializes the shared nonce. `--provider-address`
+            // was already validated as the guard when the channel was first hydrated in
+            // `resolve_selection`, so pass `None` here to avoid re-parsing it per entry.
+            Payment::Adopt { channel_id } => {
+                let ctx = fetch::hydrate_channel_by_id(
+                    self.store,
+                    self.contract,
+                    channel_id,
+                    self.self_address,
+                    self.voucher_dom,
+                    self.signer,
+                    None,
+                )
+                .await?
+                .0;
+                fetch::attach_client_binding(ctx, self.chain, self.endpoint, self.signer)?
+            }
         };
 
         let mut target = EndpointAddr::new(node_id);
@@ -534,9 +687,10 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             provider,
             self.store,
             hash,
-            // Bundle chunk-blobs are fetched by hash; a `--namespace` for bundle
-            // pull is a separate future concern, so pass NO_NAMESPACE for now.
-            decdn_protocol::client::NO_NAMESPACE,
+            // Bundle-level `--namespace` (ADR 002): routes any cache-miss origin
+            // pull to that namespace's authorized origins. Applies uniformly to the
+            // manifest blob and every entry — all funnel through here.
+            self.namespace_id,
             // Same shape as `fetch` (#1134): a node that accepts the connection and never
             // answers is as dead as one that stops mid-stream, so the same budget bounds
             // both stages, under a cap that must outlast them both.
@@ -1120,5 +1274,91 @@ mod tests {
             EntryOutcome::Skipped,
         ];
         assert!(report(&outcomes, Path::new("/out"), false).is_ok());
+    }
+
+    /// `--namespace` on bundle pull is bundle-level: one id for the whole run. It
+    /// rejects the reserved `0` (the `NO_NAMESPACE` sentinel — omit the flag instead),
+    /// reusing the same parser as `decdn fetch`.
+    #[test]
+    fn bundle_pull_namespace_flag_parses_and_rejects_zero() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct T {
+            #[command(flatten)]
+            a: decdn_common::cli::BundlePullArgs,
+        }
+        let ok = T::try_parse_from(["t", "-o", "out", "--hash", "b3:aa", "--namespace", "7"])
+            .expect("valid namespace parses");
+        assert_eq!(ok.a.namespace, Some(7));
+
+        assert!(
+            T::try_parse_from(["t", "-o", "out", "--hash", "b3:aa", "--namespace", "0"]).is_err(),
+            "namespace 0 is the reserved sentinel and must be rejected"
+        );
+
+        let none = T::try_parse_from(["t", "-o", "out", "--hash", "b3:aa"])
+            .expect("namespace is optional");
+        assert_eq!(none.a.namespace, None, "absent flag stays None");
+    }
+
+    /// `--dry-run` must still enforce the flag-combination rule. The #1492 pairing
+    /// (`--provider-address` needs `--channel-id` or `--node-id`) moved from clap
+    /// `requires` into `validate()`, which no longer runs at parse time — so
+    /// `bundle_pull` calls it BEFORE the dry-run short-circuit. Without that, a
+    /// `--dry-run --provider-address 0x..` alone would succeed where the old clap
+    /// check rejected it. Asserted end-to-end: the command returns the guard error
+    /// (before any network/chain I/O, since `validate()` fails first).
+    #[tokio::test]
+    async fn dry_run_still_rejects_a_dangling_provider_address() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct T {
+            #[command(flatten)]
+            a: decdn_common::cli::BundlePullArgs,
+        }
+        let addr = "0x0000000000000000000000000000000000000001";
+        let args = T::parse_from([
+            "t",
+            "-o",
+            "out",
+            "--hash",
+            "b3:aa",
+            "--dry-run",
+            "--provider-address",
+            addr,
+        ])
+        .a;
+        let err = super::bundle_pull(&args, None)
+            .await
+            .expect_err("a dangling --provider-address must be rejected even for --dry-run");
+        assert!(
+            format!("{err:#}").contains("--provider-address needs a target"),
+            "expected the #1492 guard error, got: {err:#}"
+        );
+    }
+
+    /// `--channel-id` on bundle pull must NOT go through `explicit_target` (that path
+    /// is only for `--node-id`); it derives the pinned node from the channel's on-chain
+    /// provider. Here we pin the invariant that `explicit_target` returns `None` when
+    /// only `--channel-id` (no `--node-id`) is set, so the channel-id branch in
+    /// `resolve_selection` is what supplies the target.
+    #[test]
+    fn channel_id_without_node_id_is_not_an_explicit_target() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct T {
+            #[command(flatten)]
+            a: ClientFetchArgs,
+        }
+        let id = "0x1111111111111111111111111111111111111111111111111111111111111111";
+        let a = T::parse_from(["t", "--channel-id", id]).a;
+        // `explicit_target` keys off `--node-id` only; channel-id alone yields None,
+        // so the adopt branch (not explicit_target) resolves the node.
+        assert!(
+            super::explicit_target(&a)
+                .expect("no node-id => Ok(None)")
+                .is_none(),
+            "channel-id alone is not an explicit --node-id target"
+        );
     }
 }

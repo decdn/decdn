@@ -53,8 +53,10 @@ fn parse_region_flag(raw: &str) -> Result<String, String> {
 /// Reachability and the required chain coordinates are validated at runtime
 /// rather than by clap, because the relay (`network.relay_urls`, #935) and the
 /// chain coordinates (`[blockchain]`) can come from config, which clap cannot
-/// see. The `--node-id`/`--provider-address`/`--addr` pairing IS enforced by
-/// clap `requires`.
+/// see. `--node-id` requires `--provider-address` at the clap layer; the reverse
+/// pairing (`--provider-address` needs `--channel-id` OR `--node-id`) is enforced
+/// in `validate()`, so `--provider-address` can guard the `--channel-id` adopt
+/// path standalone (#1492). `--addr` requires `--node-id` at the clap layer.
 #[derive(Debug, Clone, Args)]
 pub struct ClientFetchArgs {
     /// Target node id (iroh `EndpointId`, z-base32). Omit it to auto-discover:
@@ -79,8 +81,12 @@ pub struct ClientFetchArgs {
     /// opened/reused against it, and the response `slash_sig` must recover to it
     /// (ADR 014 §1); a mismatch aborts the pull. Omit it when auto-discovering
     /// (no `--node-id`): it is derived from the selected node's registry entry.
-    /// Pairs with `--node-id`, so it requires it.
-    #[arg(long, value_name = "0xADDR", requires = "node_id")]
+    ///
+    /// Not a bare clap `requires` (#1492): it may stand alone alongside
+    /// `--channel-id`, where it only GUARDS the adopted channel's on-chain
+    /// provider. On the auto-open path it still needs `--node-id`; that pairing is
+    /// enforced in `validate()`, not by clap.
+    #[arg(long, value_name = "0xADDR")]
     pub provider_address: Option<String>,
 
     /// Adopt an existing channel by id (publisher-pays); skips auto-open. The
@@ -332,6 +338,8 @@ impl ClientFetchArgs {
     /// # Errors
     ///
     /// When `--timeout-ms` does not exceed twice `--stall-timeout-ms`.
+    ///
+    /// When `--provider-address` is set without either `--channel-id` or `--node-id`.
     pub fn validate(&self) -> anyhow::Result<()> {
         let need = self.stall_timeout_ms.saturating_mul(2);
         anyhow::ensure!(
@@ -343,6 +351,19 @@ impl ClientFetchArgs {
             self.timeout_ms,
             self.stall_timeout_ms,
             need,
+        );
+
+        // #1492: `--provider-address` is either the delivering node's address on
+        // the explicit/auto-open path (where it pairs with `--node-id`) or a
+        // mismatch guard on the `--channel-id` adopt path. Standing alone it has
+        // no node to dial and no channel to guard, so it is meaningless — the
+        // clap `requires` that used to block this was relaxed to allow the
+        // channel-id pairing, so the rule lives here now.
+        anyhow::ensure!(
+            self.provider_address.is_none() || self.channel_id.is_some() || self.node_id.is_some(),
+            "--provider-address needs a target: pair it with --channel-id (to guard \
+             the adopted channel's on-chain provider) or with --node-id (the delivering \
+             node). Alone it has neither a node to dial nor a channel to guard",
         );
         Ok(())
     }
@@ -372,9 +393,10 @@ pub struct FetchArgs {
     pub common: ClientFetchArgs,
 }
 
-/// Parse a `--namespace` id for `decdn fetch`, rejecting the reserved `0`
-/// (namespace 0 is "no namespace"; omit the flag for best-effort retrieval).
-fn parse_fetch_namespace_id(s: &str) -> Result<u64, String> {
+/// Parse a `--namespace` id (rejecting the reserved `0` — namespace 0 is "no
+/// namespace"; omit the flag for best-effort retrieval). Shared by `decdn fetch`
+/// and `decdn bundle pull`.
+pub(crate) fn parse_fetch_namespace_id(s: &str) -> Result<u64, String> {
     let id: u64 = s
         .parse()
         .map_err(|_| format!("invalid namespace id: {s}"))?;
@@ -586,13 +608,61 @@ mod tests {
     }
 
     /// `--channel-id` (#1481, publisher-pays adopt-by-id) is optional and stands
-    /// alone — unlike `--provider-address` it does not `requires` `--node-id`,
-    /// since the adopt path can derive the node to dial from the channel's
-    /// on-chain provider instead.
+    /// alone: the adopt path derives the node to dial from the channel's on-chain
+    /// provider, so it needs neither `--node-id` nor `--provider-address` (the
+    /// latter is only an optional guard here — see the `validate()` tests).
     #[test]
     fn channel_id_is_optional_and_stands_alone() {
         assert_eq!(parse(&[]).channel_id, None, "the flag stays optional");
         let id = "0x1111111111111111111111111111111111111111111111111111111111111111"; // 66 chars, arbitrary opaque string at the clap layer
         assert_eq!(parse(&["--channel-id", id]).channel_id.as_deref(), Some(id));
+    }
+
+    /// #1492: `--provider-address` no longer clap-`requires` `--node-id`; the pairing
+    /// rule moved into `validate()`. It may stand alone ONLY alongside `--channel-id`
+    /// (where it guards the channel's on-chain provider). On the auto-open path it still
+    /// needs an explicit node.
+    #[test]
+    fn provider_address_may_guard_channel_id_without_node_id() {
+        let id = "0x1111111111111111111111111111111111111111111111111111111111111111";
+        let addr = "0x0000000000000000000000000000000000000001";
+        // Parses at the clap layer (no `requires` error) ...
+        let c = parse(&["--channel-id", id, "--provider-address", addr]);
+        // ... and passes the runtime rule.
+        assert!(
+            c.validate().is_ok(),
+            "provider-address guarding channel-id is allowed"
+        );
+    }
+
+    #[test]
+    fn provider_address_alone_is_rejected_by_validate() {
+        let addr = "0x0000000000000000000000000000000000000001";
+        // Clap now admits it (no `requires`), but validate() rejects it.
+        let c = parse(&["--provider-address", addr]);
+        let err = c
+            .validate()
+            .expect_err("provider-address needs channel-id or node-id");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--channel-id") && msg.contains("--node-id"),
+            "the error names both ways to satisfy the flag: {msg}"
+        );
+    }
+
+    #[test]
+    fn provider_address_with_node_id_is_the_unchanged_auto_open_path() {
+        let addr = "0x0000000000000000000000000000000000000001";
+        let c = parse(&["--node-id", "n", "--provider-address", addr]);
+        assert!(c.validate().is_ok(), "explicit node + provider still valid");
+    }
+
+    #[test]
+    fn node_id_alone_is_still_a_clap_error() {
+        // `--node-id` keeps `requires = "provider_address"`, enforced at the clap layer.
+        assert!(
+            TestCli::try_parse_from(["test", "--node-id", "n"]).is_err(),
+            "--node-id without --provider-address is a parse error"
+        );
     }
 }

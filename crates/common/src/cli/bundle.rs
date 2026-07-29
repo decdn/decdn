@@ -92,7 +92,10 @@ pub struct BundleCreateArgs {
 /// `--hash <b3>` (fetch the manifest blob first, then its entries). Both then
 /// run the same per-entry fetch loop. The network/chain/target flags come from
 /// the flattened [`ClientFetchArgs`] — `--node-id` pins every entry to one node,
-/// otherwise each entry is discovered independently (#936/#391).
+/// `--channel-id` (#1481) adopts one publisher-opened channel and pins the whole
+/// bundle to its provider, otherwise each entry is discovered independently
+/// (#936/#391). `--namespace` (ADR 002) routes every cache-miss origin pull to a
+/// namespace's authorized origins.
 #[derive(Args, Debug)]
 #[command(group(ArgGroup::new("bundle_source").required(true).args(["input", "hash"])))]
 pub struct BundlePullArgs {
@@ -132,6 +135,15 @@ pub struct BundlePullArgs {
     /// Emit a one-line JSON summary instead of human-readable output.
     #[arg(long)]
     pub json: bool,
+
+    /// Namespace the whole bundle is published under (ADR 002 § Retrieval by
+    /// namespace). Applies to EVERY fetch in the run — the manifest blob and each
+    /// entry — so a serving node routes any cache-miss origin pull to that
+    /// namespace's DAO-authorized origins. The manifest format carries no per-entry
+    /// namespace, so this is necessarily bundle-level. Absent => no namespace:
+    /// served best-effort from cache / DHT only.
+    #[arg(long, value_name = "ID", value_parser = super::fetch::parse_fetch_namespace_id)]
+    pub namespace: Option<u64>,
 
     #[command(flatten)]
     pub common: ClientFetchArgs,
