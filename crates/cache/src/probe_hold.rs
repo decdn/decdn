@@ -38,8 +38,9 @@ pub use decdn_config_types::DEFAULT_MAX_PROBE_HOLDS;
 /// emit the right metric without a second cache lookup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProbeHoldOutcome {
-    /// Blob present (and not operator-evicted) **and** a hold is guaranteed
-    /// for the full slashing window — safe to sign `has_blob: true`.
+    /// Blob present (and not operator-evicted) **and** an eviction hold was
+    /// placed, so the blob stays resident for the follow-up pull — sign
+    /// `has_blob: true`.
     Held,
     /// Blob absent or operator-evicted — sign `has_blob: false`. Not a
     /// degradation: the node simply does not have the content.
@@ -52,18 +53,18 @@ pub enum ProbeHoldOutcome {
     /// mean "we have it but would not hold it".
     Unavailable,
     /// Blob present but **all hold slots are in use** (`max_probe_holds > 0`
-    /// and the live-hold count has reached it) — sign `has_blob: false` and
-    /// count it as a `probe_hold_unavailable{reason="exhausted"}` availability
-    /// degradation (ADR 005 §Hold budget). Genuine budget pressure: the
-    /// operator-actionable
-    /// remedy is to raise `max_probe_holds`. Never a safety fault — the node
-    /// loses revenue but is never falsely slashed.
+    /// and the live-hold count has reached it). The caller still advertises
+    /// `has_blob: true` but places no hold — the blob may be LRU-evicted before
+    /// the pull (a reputation risk, never a slash). Counted as
+    /// `probe_hold_unavailable{reason="exhausted"}` (ADR 005 §Hold budget); the
+    /// operator-actionable remedy for the lost holds is to raise
+    /// `max_probe_holds`.
     BudgetExhausted,
     /// Blob present but the eviction-hold path is **disabled by config**
-    /// (`max_probe_holds == 0`) — sign `has_blob: false`. Operationally
-    /// distinct from [`Self::BudgetExhausted`] (#739): this is an intentional
-    /// operator decision, not load. Counted as
-    /// `probe_hold_unavailable{reason="disabled"}`, never as
+    /// (`max_probe_holds == 0`) — the operator opt-out from probe-advertised
+    /// serving, so the caller signs `has_blob: false`. Operationally distinct
+    /// from [`Self::BudgetExhausted`] (#739): a deliberate choice, not load.
+    /// Counted as `probe_hold_unavailable{reason="disabled"}`, never as
     /// `{reason="exhausted"}` (whose alert remedy is "increase
     /// `max_probe_holds`", nonsensical when holds are deliberately off).
     HoldsDisabled,

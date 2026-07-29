@@ -1079,12 +1079,13 @@ async fn probe_holds_disabled_signs_has_blob_false_and_counts_disabled() -> anyh
     Ok(())
 }
 
-/// A node with a positive but fully-occupied hold budget answers
-/// `has_blob: false` and counts the event as genuine budget pressure
-/// (`reason="exhausted"`), NOT as a config disable (#739). This is the
-/// signal whose alert remedy is "increase `max_probe_holds`".
+/// A node with a positive but fully-occupied hold budget still advertises
+/// `has_blob: true` (the hold is best-effort — presence, not a guaranteed hold,
+/// governs the answer) but places no hold, and counts the event as genuine
+/// budget pressure (`reason="exhausted"`), NOT as a config disable (#739). This
+/// is the signal whose alert remedy is "increase `max_probe_holds`".
 #[tokio::test(flavor = "multi_thread")]
-async fn probe_budget_exhausted_counts_exhausted_not_disabled() -> anyhow::Result<()> {
+async fn probe_budget_exhausted_still_advertises_and_counts_exhausted() -> anyhow::Result<()> {
     let a: &[u8] = b"first popular blob";
     let b: &[u8] = b"second popular blob";
     let (cache, ha, hb, _cache_tmp) = cache_with_two_blobs(a, b).await?;
@@ -1109,8 +1110,13 @@ async fn probe_budget_exhausted_counts_exhausted_not_disabled() -> anyhow::Resul
     let resp = run_one_probe(server_sk, handler, req).await?;
 
     anyhow::ensure!(
-        !resp.body.has_blob,
-        "budget-exhausted hold must yield has_blob=false even though the blob is cached"
+        resp.body.has_blob,
+        "budget-exhausted must still advertise has_blob=true — the hold is forgone, not the answer"
+    );
+    anyhow::ensure!(
+        resp.total_bytes == Some(b.len() as u64),
+        "the advertised blob must carry its size, got {:?}",
+        resp.total_bytes
     );
     assert_slash_sig_valid(&resp, &signer, &domain)?;
 
@@ -1134,15 +1140,16 @@ async fn probe_budget_exhausted_counts_exhausted_not_disabled() -> anyhow::Resul
 }
 
 /// With a stake-lane reservation configured (#757, ADR 003 §Admission and
-/// Priority), a probe from a client that is NOT a registered operator is
-/// answered `has_blob: false` once hold usage reaches the end-client ceiling.
-/// Here `max_holds=1, reserved=1` gives a ceiling of `0`, so the end-client
-/// is shed immediately even though the blob is cached and the budget is free.
-/// The event is counted as a stake-lane reservation — never as budget
-/// exhaustion (`reason="exhausted"`) or a config disable
-/// (`reason="disabled"`), whose alerts have different remedies.
+/// Priority), a probe from a client that is NOT a registered operator still
+/// advertises `has_blob: true` but places no eviction hold once hold usage
+/// reaches the end-client ceiling — the reservation protects node-to-node hold
+/// slots, it does not suppress an honest answer. Here `max_holds=1, reserved=1`
+/// gives a ceiling of `0`, so the end-client is shed from the hold immediately
+/// even though the blob is cached. The event is counted as a stake-lane
+/// reservation — never as budget exhaustion (`reason="exhausted"`) or a config
+/// disable (`reason="disabled"`), whose alerts have different remedies.
 #[tokio::test(flavor = "multi_thread")]
-async fn probe_end_client_reserved_out_signs_has_blob_false() -> anyhow::Result<()> {
+async fn probe_end_client_reserved_out_still_advertises() -> anyhow::Result<()> {
     let payload = b"reserved-for-stake-lane content";
     let (cache, hash, _cache_tmp) = cache_with_blob(payload).await?;
     cache.set_max_probe_holds(1);
@@ -1172,15 +1179,14 @@ async fn probe_end_client_reserved_out_signs_has_blob_false() -> anyhow::Result<
     let resp = run_one_probe(server_sk, handler, req).await?;
 
     anyhow::ensure!(
-        !resp.body.has_blob,
-        "an end-client under a stake-lane reservation must get has_blob=false"
+        resp.body.has_blob,
+        "an end-client under a stake-lane reservation must still get has_blob=true (hold shed, not the answer)"
     );
     anyhow::ensure!(
-        resp.total_bytes.is_none(),
-        "no size advertised when has_blob=false, got {:?}",
+        resp.total_bytes == Some(payload.len() as u64),
+        "the advertised blob must carry its size, got {:?}",
         resp.total_bytes
     );
-    // The signature must cover has_blob=false (never a stale true).
     assert_slash_sig_valid(&resp, &signer, &domain)?;
 
     let text = metrics.encode()?;

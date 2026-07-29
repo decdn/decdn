@@ -228,10 +228,12 @@ pub struct DecdnMetrics {
     /// `probe_hold_violations` / `probe_holds_disabled` /
     /// `probe_stake_lane_reserved` counters).
     ///
-    /// Every value is an availability degradation: the node declines to
-    /// advertise a blob it cannot guarantee to hold for the follow-up pull, so
-    /// it forgoes the revenue rather than risk a miss the probing client would
-    /// score against it (ADR 008 reputation). See
+    /// Each value records a probe for a held blob that got **no** eviction
+    /// hold. For `exhausted` / `stake_lane_reserved` the node still advertises
+    /// (`has_blob: true`) and simply forgoes the hold — the blob may be
+    /// LRU-evicted before the pull, an availability risk (ADR 008 reputation),
+    /// never a slash. `disabled` is the operator opt-out (`max_probe_holds ==
+    /// 0`) that answers `has_blob: false` outright. See
     /// [`ProbeHoldUnavailableReason`] for what each value means and which one
     /// the "raise `max_probe_holds`" alert fires on; all three children are
     /// materialized at startup by [`Metrics::new`] so each series is exported
