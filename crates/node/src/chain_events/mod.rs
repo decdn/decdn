@@ -56,9 +56,7 @@ pub(crate) mod resumable_watcher;
 // external integration tests (`tests/anvil_settlement_e2e.rs`) call.
 pub mod shared_head;
 
-pub(crate) use backfill::{
-    MAX_BACKFILL_BLOCK_SPAN, REORG_MARGIN_BLOCKS, backfill_windows, check_backfill_range,
-};
+pub(crate) use backfill::{MAX_BACKFILL_BLOCK_SPAN, REORG_MARGIN_BLOCKS, backfill_windows};
 
 use std::future::IntoFuture;
 use std::time::Duration;
