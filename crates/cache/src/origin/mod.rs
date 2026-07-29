@@ -377,6 +377,30 @@ pub trait Origin: std::fmt::Debug + Send + Sync + 'static {
         Box::pin(async { Ok(None) })
     }
 
+    /// Enumerate the hashes this origin currently holds, so a node can
+    /// advertise them (probe `has_blob` / DHT announce) *before* any
+    /// pull-through — closing the "cold origin blob is undiscoverable until
+    /// first pulled" gap (#1130).
+    ///
+    /// The default returns an empty list. Only an *enumerable* backend
+    /// overrides it: the local filesystem, whose sharded directory listing
+    /// is the hash set. HTTP has no listing endpoint, and S3's
+    /// `ListObjectsV2` is deliberately not walked (egress + unbounded
+    /// bucket), so remote origins are advertised via the operator's
+    /// `pinned_hashes` instead of this method.
+    ///
+    /// Enumeration is *presence-only* (trust model): it does not read or
+    /// hash file contents. Callers verify served bytes against the content
+    /// address at serve time, and a wrong/corrupt file is the publisher's
+    /// error (it only hurts the publisher — an announced-but-unservable hash
+    /// costs bandwidth + local reputation, never a bond slash, provided the
+    /// serve path never signs an `ok:false` refusal).
+    fn enumerate(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Hash>, OriginPullError>> + Send + '_>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
     /// Tag identifying the backend type. Surfaced through
     /// [`crate::EvictionPreview::origin_kinds`] so admin dry-run callers
     /// can estimate origin egress cost (#439) — `Filesystem` is a local

@@ -402,6 +402,15 @@ pub struct CacheConfig {
     /// hostile-origin amplification window at the cost of more
     /// list+sweep CPU per minute.
     pub gc_interval_sec: Option<u64>,
+    /// Interval between origin-held-index rescans in seconds (#1130). Absent =>
+    /// [`crate::config::DEFAULT_FS_RESCAN_INTERVAL_SEC`]. The node re-walks its
+    /// `fs` origin directory (and re-checks present pins) at this cadence so a
+    /// file dropped into the origin becomes discoverable — probe `has_blob` +
+    /// DHT announce — within one interval, without a restart or reload. `0`
+    /// disables the periodic rescan (startup + `decdn node reload` still run
+    /// it). Shorter intervals pick up new files faster at the cost of more
+    /// directory-walk + `size()` I/O per minute.
+    pub fs_rescan_interval_sec: Option<u64>,
     /// LRU eviction driver: percent of [`Self::cache_size_mb`] above which
     /// the driver actively evicts (#1173, appendix-blob-cache-eviction.md
     /// § Trigger and target). Absent =>

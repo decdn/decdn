@@ -155,6 +155,12 @@ const DEFAULT_PROBE_MAX_TRACKED_PER_PEER: usize = 4096;
 /// can tune lower; setting to `0` disables the periodic sweep entirely.
 pub const DEFAULT_GC_INTERVAL_SEC: u64 = 300;
 
+/// Default interval between origin-held-index rescans in seconds (#1130). A
+/// minute balances "drop a file, it's fetchable soon" against directory-walk
+/// cost; operators indexing a large fs origin can raise it, and `0` disables
+/// the periodic rescan (startup + reload still run one).
+pub const DEFAULT_FS_RESCAN_INTERVAL_SEC: u64 = 60;
+
 /// Default LRU eviction driver high-water percent of `cache.cache_size_mb`
 /// (#1173, appendix-blob-cache-eviction.md § Trigger and target). Above this
 /// fraction the driver actively evicts.
@@ -1595,6 +1601,10 @@ fn resolve_cache_into(
         .and_then(|c| c.gc_interval_sec)
         .unwrap_or(DEFAULT_GC_INTERVAL_SEC);
 
+    let fs_rescan_interval_sec = file
+        .and_then(|c| c.fs_rescan_interval_sec)
+        .unwrap_or(DEFAULT_FS_RESCAN_INTERVAL_SEC);
+
     // LRU eviction driver knobs (#1173, appendix-blob-cache-eviction.md). Each
     // is range-checked against its structural bounds; the target/high-water
     // hysteresis gap is a cross-field invariant enforced after both resolve.
@@ -1769,6 +1779,7 @@ fn resolve_cache_into(
         circuit_breaker,
         user_agent,
         gc_interval_sec,
+        fs_rescan_interval_sec,
         eviction_high_water_pct,
         eviction_target_pct,
         eviction_per_sweep_budget,
@@ -5555,6 +5566,36 @@ swap_pool_address = \"0xPool\"
             resolved.gc_interval_sec == 42,
             "expected 42, got: {}",
             resolved.gc_interval_sec
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_cache_fs_rescan_interval_defaults_when_absent() -> anyhow::Result<()> {
+        // Absent => DEFAULT_FS_RESCAN_INTERVAL_SEC (#1130).
+        let cli = cache_cli(None, None);
+        let resolved = resolve_cache(&cli, None, Path::new("/tmp"))?;
+        anyhow::ensure!(
+            resolved.fs_rescan_interval_sec == DEFAULT_FS_RESCAN_INTERVAL_SEC,
+            "expected default {}, got: {}",
+            DEFAULT_FS_RESCAN_INTERVAL_SEC,
+            resolved.fs_rescan_interval_sec
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_cache_fs_rescan_interval_from_file_overrides_default() -> anyhow::Result<()> {
+        let cli = cache_cli(None, None);
+        let file = types::CacheConfig {
+            fs_rescan_interval_sec: Some(30),
+            ..types::CacheConfig::default()
+        };
+        let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
+        anyhow::ensure!(
+            resolved.fs_rescan_interval_sec == 30,
+            "expected 30, got: {}",
+            resolved.fs_rescan_interval_sec
         );
         Ok(())
     }

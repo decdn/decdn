@@ -231,6 +231,11 @@ pub struct ResolvedCache {
     /// [`crate::config::DEFAULT_GC_INTERVAL_SEC`] when the TOML section
     /// omits the field.
     pub gc_interval_sec: u64,
+    /// Interval between origin-held-index rescans in seconds (#1130). `0`
+    /// disables the periodic rescan (startup + `decdn node reload` still run
+    /// one). Default [`crate::config::DEFAULT_FS_RESCAN_INTERVAL_SEC`] when the
+    /// TOML section omits the field.
+    pub fs_rescan_interval_sec: u64,
     /// LRU eviction driver high-water percent of [`Self::cache_size_mb`]
     /// (#1173). Above this fraction the driver actively evicts. Validated to
     /// `[60, 95]`. Default [`crate::config::DEFAULT_EVICTION_HIGH_WATER_PCT`].

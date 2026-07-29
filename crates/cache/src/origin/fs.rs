@@ -118,6 +118,35 @@ fn classify_io_error(err: std::io::Error) -> OriginPullError {
     }
 }
 
+/// Parse a sharded leaf file name as a BLAKE3 [`struct@Hash`], panic-free.
+///
+/// `iroh_blobs::Hash`'s own `FromStr` panics (via `data-encoding`) on a
+/// wrong-length input, so it must never see an untrusted directory entry
+/// name (see the same warning in `decdn-common`'s admin hash parser). We
+/// accept only the canonical 64-char lowercase-hex form that `to_hex()`
+/// produces; anything else (stray files, `.obao4` siblings, uppercase) is
+/// `None` and silently skipped by the enumeration.
+fn hash_from_hex_name(name: &str) -> Option<Hash> {
+    if name.len() != 64 {
+        return None;
+    }
+    let bytes = name.as_bytes();
+    let hex_val = |c: u8| -> Option<u8> {
+        match c {
+            b'0'..=b'9' => Some(c - b'0'),
+            b'a'..=b'f' => Some(c - b'a' + 10),
+            _ => None,
+        }
+    };
+    let mut out = [0u8; 32];
+    for (i, slot) in out.iter_mut().enumerate() {
+        let hi = hex_val(*bytes.get(i * 2)?)?;
+        let lo = hex_val(*bytes.get(i * 2 + 1)?)?;
+        *slot = (hi << 4) | lo;
+    }
+    Some(Hash::from_bytes(out))
+}
+
 impl Origin for FilesystemOrigin {
     fn kind(&self) -> OriginKind {
         OriginKind::Filesystem
@@ -411,6 +440,70 @@ impl Origin for FilesystemOrigin {
                     Err(classify_io_error(err).map_inner(|e| e.context(msg)))
                 }
             }
+        })
+    }
+
+    fn enumerate(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Hash>, OriginPullError>> + Send + '_>> {
+        Box::pin(async move {
+            // Presence-only walk of `{base}/{hex[0..2]}/{hex}` — the file
+            // name IS the hash, so this never reads or hashes payloads
+            // (trust model, #1130). Skip sibling `{H}.obao4` outboards,
+            // non-directory shard entries, and any leaf whose name isn't a
+            // valid hash sharded under its own first two hex chars (a stray
+            // file dropped into the tree is silently ignored, not an error).
+            let mut out = Vec::new();
+            let mut shards = match tokio::fs::read_dir(&self.base).await {
+                Ok(rd) => rd,
+                Err(err) => {
+                    let msg = format!(
+                        "cache.origin.path read_dir failed for {}",
+                        self.base.display()
+                    );
+                    return Err(classify_io_error(err).map_inner(|e| e.context(msg)));
+                }
+            };
+            while let Some(shard) = shards.next_entry().await.map_err(|err| {
+                classify_io_error(err)
+                    .map_inner(|e| e.context("cache.origin.path shard read failed".to_string()))
+            })? {
+                let shard_name = shard.file_name();
+                let shard_str = match shard_name.to_str() {
+                    // Shard dirs are exactly the two-char hex prefix.
+                    Some(s) if s.len() == 2 => s,
+                    _ => continue,
+                };
+                match shard.file_type().await {
+                    Ok(ft) if ft.is_dir() => {}
+                    _ => continue,
+                }
+                let shard_path = shard.path();
+                // A shard that vanished mid-walk (gc/operator cleanup) is not
+                // fatal to enumerating the rest of the tree.
+                let Ok(mut entries) = tokio::fs::read_dir(&shard_path).await else {
+                    continue;
+                };
+                while let Some(entry) = entries.next_entry().await.map_err(|err| {
+                    classify_io_error(err)
+                        .map_inner(|e| e.context("cache.origin.path entry read failed".to_string()))
+                })? {
+                    let name = entry.file_name();
+                    let name = match name.to_str() {
+                        Some(n) if !n.ends_with(OBAO4_SUFFIX) => n,
+                        _ => continue,
+                    };
+                    let Some(hash) = hash_from_hex_name(name) else {
+                        continue;
+                    };
+                    // The leaf must live under its own shard, else it's a
+                    // mis-placed file we won't be able to serve by path.
+                    if hash.to_hex().get(..2) == Some(shard_str) {
+                        out.push(hash);
+                    }
+                }
+            }
+            Ok(out)
         })
     }
 }
@@ -777,6 +870,51 @@ mod tests {
         )
         .await?;
         Ok(hash)
+    }
+
+    /// `enumerate` returns exactly the data-object hashes present under the
+    /// sharded tree, excluding `.obao4` siblings and stray non-hash files,
+    /// and without reading payloads (#1130 discovery, trust model).
+    #[tokio::test]
+    async fn enumerate_lists_data_hashes_only() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let origin = FilesystemOrigin::new(tmp.path()).await?;
+        let canonical = tokio::fs::canonicalize(tmp.path()).await?;
+
+        // Two real blobs, one WITH a sibling outboard (so the `.obao4`
+        // exclusion is exercised) and one without.
+        let h1 = seed_blob_with_outboard(&canonical, &vec![1u8; 40 * 1024]).await?;
+        let payload2 = vec![2u8; 8 * 1024];
+        let h2 = Hash::new(&payload2);
+        let hex2 = h2.to_hex();
+        let shard2 = hex2
+            .get(..2)
+            .ok_or_else(|| anyhow::anyhow!("hex too short"))?;
+        let shard2_dir = canonical.join(shard2);
+        tokio::fs::create_dir_all(&shard2_dir).await?;
+        tokio::fs::write(shard2_dir.join(hex2.as_str()), &payload2).await?;
+
+        // A stray non-hash file inside a valid shard dir — must be ignored.
+        tokio::fs::write(shard2_dir.join("not-a-hash.txt"), b"junk").await?;
+
+        let mut got = origin.enumerate().await?;
+        got.sort_by_key(|h| *h.as_bytes());
+        let mut want = vec![h1, h2];
+        want.sort_by_key(|h| *h.as_bytes());
+        anyhow::ensure!(
+            got == want,
+            "enumerate mismatch: got {got:?}, want {want:?}"
+        );
+        Ok(())
+    }
+
+    /// An empty origin enumerates to nothing (not an error).
+    #[tokio::test]
+    async fn enumerate_empty_origin_is_empty() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let origin = FilesystemOrigin::new(tmp.path()).await?;
+        anyhow::ensure!(origin.enumerate().await?.is_empty(), "expected empty");
+        Ok(())
     }
 
     /// A blob with a published `{hex}.obao4` range-fetches: the aligned span
