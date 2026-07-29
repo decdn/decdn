@@ -283,5 +283,33 @@ debug = true
 
 [profile.release]
 opt-level = 3
-lto = "thin"
-strip = "symbols"
+# Fat LTO + a single codegen unit. `codegen-units` defaulted to 16 here, which
+# was the binding constraint — not the LTO mode. Measured on a 16-core clean
+# build of both binaries: cgu=1 alone costs +5s (356s → 361s) and takes ~16% off
+# both; fat LTO on top costs +118s total and takes `decdn-node` 47.4 → 35.6 MB
+# and `decdn` 32.3 → 21.1 MB. CI never builds `--release` (see ci.yml), so the
+# extra time lands only on the release workflow's 10-way parallel matrix and the
+# Docker image build.
+lto = "fat"
+codegen-units = 1
+# NOT `panic = "abort"`: production code recovers from panics via unwinding —
+# `chain_events::resumable_watcher` wraps hook dispatch in `catch_unwind` so a
+# panicking hook cannot kill the daemon, `dht::chain_projection` does the same
+# for lock poisoning, and the runtime / admin / buyer-channel layers branch on
+# `JoinError::is_panic`. `abort` turns every one of those into a dead process.
+#
+# `strip = "debuginfo"`, not `"symbols"`: the symbol table stays in the shipped
+# binary, so a `RUST_BACKTRACE` panic from an operator's node symbolizes to
+# function names (`decdn_node::receipt_log::…::record`) instead of bare
+# addresses. Measured cost on `decdn-node`: 35.6 MB → 41.3 MB, still well under
+# the 47.4 MB we shipped before this profile change.
+#
+# `file:line` is deliberately NOT bought here — it needs `strip = "none"`, which
+# takes `decdn-node` to 91.8 MB, and it cannot be moved to a sidecar: under
+# split DWARF the line-number program stays in the executable's `.debug_line`,
+# so a stripped binary plus its `.dwp` resolves nothing (verified: addr2line
+# returns `:?` with the `.dwp` present). `debug` / `split-debuginfo` are
+# therefore left off — a `.dwp` that cannot symbolize the shipped binary is
+# 85 MB of build time for nothing. The route to `file:line` is an
+# `objcopy --only-keep-debug` sidecar built in the release workflow.
+strip = "debuginfo"
