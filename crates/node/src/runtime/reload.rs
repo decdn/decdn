@@ -449,6 +449,12 @@ impl ReloadableSection for PinnedHashesSection {
                         tracing::info!(
                             fetched = report.fetched,
                             already_present = report.already_present,
+                            // Same field set as the startup log. `refused` earns
+                            // its place here more than there: a reload is exactly
+                            // when an operator pins a hash that is already
+                            // denylisted or operator-evicted, and without this
+                            // the pin silently never warms.
+                            refused = report.refused,
                             failed = report.failed,
                             bytes = report.bytes,
                             "cache.prewarm: warmed the reloaded pin set (#1130)"

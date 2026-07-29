@@ -1208,8 +1208,13 @@ impl CacheEngine {
     /// exists for, since pinned content is LRU-exempt and so is the only content
     /// guaranteed to still be there when a request finally arrives.
     ///
-    /// Callers warming an incremental reload should pass `PinDiff`'s added
-    /// hashes to [`Self::prewarm`] instead, rather than re-walking every pin.
+    /// **Idempotent, and cheap to re-run.** Every hash already in the store is
+    /// skipped after one local presence check, so calling this on each reload
+    /// costs no extra origin egress over passing only the newly-added pins — and
+    /// it additionally repairs a pin that was warmed earlier but has since been
+    /// lost. That is why the reload path re-runs it wholesale rather than
+    /// threading `PinDiff` through; passing a delta to [`Self::prewarm`] is an
+    /// available optimization, not the expected usage.
     pub async fn prewarm_pinned(&self) -> PrewarmReport {
         let pinned: Vec<Hash> = self.inner.pinned.load().iter().copied().collect();
         self.prewarm(pinned).await
