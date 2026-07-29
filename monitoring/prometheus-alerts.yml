@@ -159,20 +159,6 @@ groups:
             at least the on-chain floor (hot-reloadable via SIGHUP).
             See adr/003-payments.md#rate-bounds-refresh.
 
-      - alert: DecdnSlashEvidenceExposure
-        expr: rate(decdn_slash_evidence_exposure_total[5m]) > 0
-        for: 1m
-        labels:
-          severity: critical
-          slash_risk: phantom_announcement
-        annotations:
-          summary: "Self-detected slash-evidence exposure on {{ $labels.instance }}"
-          description: |
-            The node produced a signed has_blob: true probe followed by a
-            stream response within the 30s slashing window — valid phantom
-            slash evidence. This is a critical bug signal. Stop the node
-            and file a bug. See adr/005-protocol.md.
-
   # ---------------------------------------------------------------
   # Liveness / capacity — operator-onboarding defaults.
   # Tune `for:` and thresholds for your fleet size before paging.

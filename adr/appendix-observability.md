@@ -44,7 +44,7 @@ Metrics are grouped into **mandatory** (M) and **recommended** (R) tiers.
 
 #### Slash-Safety Metrics (all Mandatory)
 
-These give early warning for the two slashable offenses in [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn), grouped here with the closely-related probe-hold capacity metrics. A sustained non-zero value for the slash-evidence and blacklist-lag **counters** requires immediate operator attention. The **gauges** (`decdn_probe_hold_slots_used`/`_max`, `decdn_blacklist_version_behind`) are normally non-zero — alert on the thresholds/rates in the table below, not on presence. `decdn_probe_hold_unavailable_total` is an availability signal, not a slash risk — see its row, and alert only on `reason="exhausted"`, the budget-pressure value.
+These give early warning for the two slashable offenses in [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn), grouped here with the closely-related probe-hold capacity metrics. A sustained non-zero value for the blacklist-lag **counters** requires immediate operator attention. The **gauges** (`decdn_probe_hold_slots_used`/`_max`, `decdn_blacklist_version_behind`) are normally non-zero — alert on the thresholds/rates in the table below, not on presence. `decdn_probe_hold_unavailable_total` is an availability signal, not a slash risk — see its row, and alert only on `reason="exhausted"`, the budget-pressure value.
 
 | Metric | Type | Tier | Description |
 |--------|------|------|-------------|
@@ -54,7 +54,6 @@ These give early warning for the two slashable offenses in [ADR 026 § Slashing 
 | `decdn_blacklist_sync_lag_seconds` | Gauge | M | Seconds since the last successful `getBlacklistVersion()` poll. Exceeding the compliance window makes serving any recently-blacklisted hash slashable ([ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting)). |
 | `decdn_blacklist_version_behind` | Gauge | M | `on_chain_version − local_version`. Positive means new blacklist entries not yet fetched. |
 | `decdn_rate_bounds_clamp_events_total` | Counter | M | Times `rate_per_mb` was raised to the governance `deliveryFloor` before signing a `ProbeResponse` / `StreamResponse` — the configured rate sits below the current floor ([ADR 003](003-payments.md#adr-003-payment-model), [ADR 005](005-protocol.md#adr-005-wire-protocol)). |
-| `decdn_slash_evidence_exposure_total` | Counter | M | Self-detected `has_blob: true` probe followed by an `ok: false` stream response within the 35-second probe hold — the node advertised a blob it then could not serve, an availability/reputation self-signal ([ADR 005](005-protocol.md#adr-005-wire-protocol)). Non-zero is a critical bug signal. |
 
 **Recommended alert thresholds:**
 
@@ -64,7 +63,6 @@ These give early warning for the two slashable offenses in [ADR 026 § Slashing 
 | `decdn_blacklist_sync_lag_seconds` | > 600s (1 poll interval) | > 1800s | Check RPC provider; manual sync if needed. |
 | `decdn_blacklist_version_behind` | > 0 | > 1 | Investigate RPC / poll failure. |
 | `decdn_rate_bounds_clamp_events_total` (rate) | > 0 | — | Raise the `rate_per_mb` config to at least the governance `deliveryFloor`. |
-| `decdn_slash_evidence_exposure_total` (rate) | — | > 0 | File a bug; stop node immediately if rate is sustained. |
 
 #### Delivery Metrics (`cdn/client/v1`)
 
@@ -269,7 +267,6 @@ Earlier ADRs used informal metric names; this table maps them to canonical repla
 | `rate_bounds_clamp_events` | `decdn_rate_bounds_clamp_events_total` | architecture.md |
 | `blacklist_sync_lag_seconds` | `decdn_blacklist_sync_lag_seconds` | [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting) |
 | `blacklist_version_behind` | `decdn_blacklist_version_behind` | [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting) |
-| `slash_evidence_exposure` | `decdn_slash_evidence_exposure_total` | architecture.md |
 | `probe_collection_latency_seconds` | `decdn_probe_collection_latency_seconds` | [ADR 001 § Probe response collection](001-network.md#probe-response-collection) |
 | `streams_active` | `decdn_streams_active` | architecture.md |
 | `streams_completed` | `decdn_streams_completed_total` | architecture.md |

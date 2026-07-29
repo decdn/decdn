@@ -130,9 +130,6 @@ slashed by an external adversary.
   - `DecdnProbeHoldViolations` (critical) — hold budget exhausted, so
     present blobs are being answered `has_blob: false`. Budget pressure and
     lost revenue, not slash evidence; see step 4.
-  - `DecdnSlashEvidenceExposure` (critical) — node advertised `has_blob: true`
-    then served `ok: false` within the probe hold: it advertised a blob it
-    could not serve. An availability/reputation self-signal, not slash evidence.
   - `DecdnBlacklistSyncLagCritical` (critical) — blacklist > 30 minutes
     stale; serving any recently blacklisted hash is now slashable.
   - `DecdnBlacklistVersionFarBehind` (critical) — multiple blacklist
@@ -206,9 +203,6 @@ slashed by an external adversary.
    [ADR 005 § Hold budget](../adr/005-protocol.md#hold-budget) and
    [Appendix: Observability](../adr/appendix-observability.md#slash-safety-metrics-all-mandatory).
    See also [ADR 008](../adr/008-reputation.md) for reputation impact.
-5. **For self-detected exposure (`DecdnSlashEvidenceExposure`):** stop the
-   node immediately and file a bug — this signals a code-path defect, not an
-   operator misconfiguration.
 
 ## ContentBlacklist compliance
 

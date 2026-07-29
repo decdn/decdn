@@ -291,14 +291,6 @@ Node advertises a low rate in probe responses then returns a higher rate in `Str
 
 **Resolved: slashable offense.** Both responses are signed over the advertised rate ([ADR 005](005-protocol.md#adr-005-wire-protocol)); a same-NodeId signed pair where `StreamResponse.rate_per_mb > ProbeResponse.rate_per_mb` and the requester-anchored timestamp delta is under 30 seconds is on-chain-verifiable evidence. Clock-skew immune (both timestamps originate from the requester's clock; the node echoes them back in its signed response). The slash schedule lives in [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn); see [ADR 014 § Slash Signatures — secp256k1 EIP-712](014-on-chain-verification.md#slash-signatures--secp256k1-eip-712) for the on-chain verifier.
 
-#### Advertised-then-unavailable blob
-
-Node announces a blob as cached (`has_blob: true` in a `ProbeResponse`) then fails or redirects on the actual request.
-
-This is an availability failure, not an on-chain slashing offense. A signed `StreamResponse(ok: false)` refusal is not slash evidence of any kind, and a bare timeout produces no signed second message either; both are scored purely by local per-peer reputation ([ADR 008](008-reputation.md#adr-008-reputation-system)). A node that advertises a blob it then cannot serve takes a reputation hit with the requesters that observe it.
-
-To keep the follow-up pull served, nodes honor a **probe-triggered eviction hold** (35s, the 30s probe window + 5s margin) that keeps a just-advertised blob resident — see [ADR 005 § Probe-Triggered Eviction Hold](005-protocol.md#probe-triggered-eviction-hold) for the requirement and dependent parameters (probe cache TTL, `probe_hold_duration`). Under OOM / under-provisioning the correct behavior is to answer `has_blob: false` up front rather than advertise a blob it cannot serve. The protocol does not subsidize under-provisioning.
-
 #### Channel close front-running
 
 Node monitors the mempool and front-runs a client's channel close with a higher voucher submission.
@@ -363,7 +355,7 @@ A node bonds, responds to probes with `has_blob: true`, but refuses to serve —
 - **Publisher-chosen operator sets.** Content owners hold a publisher identity ([ADR 002 § Publisher Identity and Namespaces](002-content-addressing.md#publisher-identity-and-namespaces)) and propose an origin operator set per namespace. Governance ratifies the proposal via the standard timelock path ([ADR 011 § Origin Assignment Authority](011-content-takedown.md#origin-assignment-authority)). Set size is the publisher's call — a single trusted operator works for hobbyist publishers, multi-operator sets defuse single-point withholding for publishers who want it. Content served under namespace 0 has no authorized origins — it is served best-effort from cache/DHT only ([ADR 002 § Namespace 0](002-content-addressing.md#namespace-0)).
 - **Reputation fast-path.** Nodes that respond `has_blob: true` to probes but fail to deliver accumulate reputation penalties at a steeper rate. A node with consistently poor availability is deprioritized in provider selection and loses delivery revenue. Publishers may use the reputation signal as input when proposing or revoking operators in their namespace's assignment.
 
-Note: the probe-triggered eviction hold ([ADR 005](005-protocol.md#probe-triggered-eviction-hold)) addresses a related but distinct problem. Withholding is a node that has the blob but refuses to serve it (behavioral — handled by reputation). The eviction hold addresses a node that advertised `has_blob: true` but lost the blob to cache pressure before the stream request (mechanical — kept resident by the hold so the follow-up pull succeeds; if the hold fails, advertising a blob it can no longer serve is an availability/reputation failure per [ADR 008](008-reputation.md#adr-008-reputation-system)).
+Note: the probe-triggered eviction hold ([ADR 005](005-protocol.md#probe-triggered-eviction-hold)) addresses a related but distinct problem. Withholding is a node that has the blob but refuses to serve it (behavioral — handled by reputation). The eviction hold addresses a node that advertised `has_blob: true` but lost the blob to cache pressure before the stream request (mechanical — kept resident by the hold so the follow-up pull succeeds).
 
 #### Replay attack on vouchers
 
