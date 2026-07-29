@@ -1373,6 +1373,9 @@ struct Background {
     metrics_stop_tx: oneshot::Sender<()>,
     dispatch_gc_stop_tx: oneshot::Sender<()>,
     region_log_stop_tx: Option<oneshot::Sender<()>>,
+    /// Origin-held-index periodic rescan (#1130). `None` when
+    /// `cache.fs_rescan_interval_sec == 0` disables it.
+    origin_rescan_stop_tx: Option<oneshot::Sender<()>>,
     record_store_gc_stop_tx: oneshot::Sender<()>,
     eviction_stop_tx: oneshot::Sender<()>,
     dht_rate_limit_gc_stop_tx: oneshot::Sender<()>,
@@ -1643,23 +1646,33 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
     // steady-state `subscribe_inserts` path catches only blobs newly fetched
     // post-boot — blobs already on disk that get cache-HIT requests are NOT
     // re-scheduled until the next successful restart.
-    let cold_start_count = match infra.cache.iter_hashes().await {
-        Ok(hashes) => republish_scheduler.seed_cold_start(
-            hashes
-                .into_iter()
-                .map(|h| decdn_protocol::ContentHash::from_bytes(*h.as_bytes())),
+    // Populate the origin-held index before seeding announces (#1130) so cold
+    // origin content (fs directory entries + present pins) is advertised from
+    // the first republish, not only after a warm pulls it into the store.
+    infra.cache.rescan_origins().await;
+
+    // Union store-complete blobs with origin-held content. The scheduler dedups
+    // internally (idempotent `scheduled` set); collecting into a set first keeps
+    // the logged count honest and coalesces a hash that is both stored and
+    // origin-held into one jitter draw. On a store list-error we still seed the
+    // origin-held set — announce degrades only for the store half.
+    let mut cold_start_set: std::collections::HashSet<decdn_cache::Hash> =
+        infra.cache.origin_held_hashes().into_iter().collect();
+    match infra.cache.iter_hashes().await {
+        Ok(hashes) => cold_start_set.extend(hashes),
+        Err(err) => tracing::warn!(
+            error = %err,
+            "cold-start store seed failed; blobs not re-fetched this session will go un-republished until next restart (ADR 022 §Bootstrap AC 16 degraded)"
         ),
-        Err(err) => {
-            tracing::warn!(
-                error = %err,
-                "cold-start seed failed; blobs not re-fetched this session will go un-republished until next restart (ADR 022 §Bootstrap AC 16 degraded)"
-            );
-            0
-        }
-    };
+    }
+    let cold_start_count = republish_scheduler.seed_cold_start(
+        cold_start_set
+            .into_iter()
+            .map(|h| decdn_protocol::ContentHash::from_bytes(*h.as_bytes())),
+    );
     tracing::info!(
         cold_start_count,
-        "republish scheduler seeded from existing cache (ADR 022 §Bootstrap cold-start)"
+        "republish scheduler seeded from existing cache + origin-held index (ADR 022 §Bootstrap cold-start, #1130)"
     );
     tasks.spawn(crate::dht::publish::run_republish(
         infra.ep.clone(),
@@ -1670,6 +1683,39 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
         cache_inserts_rx,
         republish_stop_rx,
     ));
+
+    // Periodic origin rescan (#1130): re-walk the fs origin + re-check pins so a
+    // file added after boot becomes discoverable within one interval, then push
+    // newly-found hashes into the republish scheduler — origin content never
+    // generates a store-insert event, so this is its only steady-state announce
+    // trigger. `fs_rescan_interval_sec == 0` disables it (startup + reload still
+    // rescan). The tick body offloads the async rescan to a detached task
+    // (`spawn_periodic` bodies are synchronous); scheduling is idempotent, so an
+    // already-announced hash coalesces rather than double-drawing jitter.
+    let origin_rescan_stop_tx = if cfg.cache.fs_rescan_interval_sec > 0 {
+        let cache = infra.cache.clone();
+        let scheduler = Arc::clone(&republish_scheduler);
+        Some(spawn_periodic(
+            &mut tasks,
+            "origin_rescan",
+            Duration::from_secs(cfg.cache.fs_rescan_interval_sec),
+            move || {
+                let cache = cache.clone();
+                let scheduler = Arc::clone(&scheduler);
+                tokio::spawn(async move {
+                    cache.rescan_origins().await;
+                    scheduler.seed_cold_start(
+                        cache
+                            .origin_held_hashes()
+                            .into_iter()
+                            .map(|h| decdn_protocol::ContentHash::from_bytes(*h.as_bytes())),
+                    );
+                });
+            },
+        ))
+    } else {
+        None
+    };
 
     // DHT bucket-refresh (ADR 022 §Routing Table). Once per hour
     // picks the bucket with the oldest last-refresh timestamp and
@@ -2059,6 +2105,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
         metrics_stop_tx,
         dispatch_gc_stop_tx,
         region_log_stop_tx,
+        origin_rescan_stop_tx,
         record_store_gc_stop_tx,
         eviction_stop_tx,
         dht_rate_limit_gc_stop_tx,
@@ -2139,6 +2186,7 @@ pub async fn run(
         dispatch_gc_stop_tx: bg.dispatch_gc_stop_tx,
         buyer_bootstrap_stop_tx: bg.buyer_bootstrap_stop_tx,
         region_log_stop_tx: bg.region_log_stop_tx,
+        origin_rescan_stop_tx: bg.origin_rescan_stop_tx,
         record_store_gc_stop_tx: bg.record_store_gc_stop_tx,
         eviction_stop_tx: bg.eviction_stop_tx,
         dht_rate_limit_gc_stop_tx: bg.dht_rate_limit_gc_stop_tx,
@@ -2175,6 +2223,9 @@ struct ShutdownHandles<P: Provider + Clone + 'static> {
     dispatch_gc_stop_tx: oneshot::Sender<()>,
     buyer_bootstrap_stop_tx: oneshot::Sender<()>,
     region_log_stop_tx: Option<oneshot::Sender<()>>,
+    /// Origin-held-index periodic rescan (#1130). `None` when
+    /// `cache.fs_rescan_interval_sec == 0` disables it.
+    origin_rescan_stop_tx: Option<oneshot::Sender<()>>,
     record_store_gc_stop_tx: oneshot::Sender<()>,
     eviction_stop_tx: oneshot::Sender<()>,
     dht_rate_limit_gc_stop_tx: oneshot::Sender<()>,
@@ -2218,6 +2269,7 @@ async fn shutdown<P: Provider + Clone + 'static>(
         dispatch_gc_stop_tx,
         buyer_bootstrap_stop_tx,
         region_log_stop_tx,
+        origin_rescan_stop_tx,
         record_store_gc_stop_tx,
         eviction_stop_tx,
         dht_rate_limit_gc_stop_tx,
@@ -2268,6 +2320,10 @@ async fn shutdown<P: Provider + Clone + 'static>(
     let _ = buyer_bootstrap_stop_tx.send(());
     // region bandwidth accounting log (#750)
     if let Some(tx) = region_log_stop_tx {
+        let _ = tx.send(());
+    }
+    // origin-held-index periodic rescan (#1130)
+    if let Some(tx) = origin_rescan_stop_tx {
         let _ = tx.send(());
     }
     let _ = record_store_gc_stop_tx.send(());

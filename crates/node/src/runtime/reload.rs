@@ -421,7 +421,16 @@ impl ReloadableSection for PinnedHashesSection {
         // from "cache not yet attached" and the same dedicated tracing
         // line covers it.
         let pin_diff = if let Ok(g) = self.engine.lock() {
-            g.as_ref().map(|engine| engine.set_pinned(&resolved))
+            g.as_ref().map(|engine| {
+                let diff = engine.set_pinned(&resolved);
+                // Refresh the origin-held index so a newly-added pin (or a file
+                // dropped into the fs origin) is announced on this reload rather
+                // than only at the next periodic rescan (#1130). Detached so we
+                // honor reload()'s no-await invariant; rescan is idempotent.
+                let engine = engine.clone();
+                tokio::spawn(async move { engine.rescan_origins().await });
+                diff
+            })
         } else {
             tracing::error!(
                 section = self.name(),
