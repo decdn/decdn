@@ -999,15 +999,15 @@ impl CacheEngine {
         self.inner.denied.load().contains(&hash)
     }
 
-    /// Replace the governance deny-set wholesale — the blacklist watcher's boot
-    /// restore from its durable projection.
+    /// Replace the governance deny-set wholesale.
     ///
-    /// Deliberately NOT derived from a chain read or from `evicted.log`:
-    /// `ContentBlacklist` exposes no enumeration of the blacklisted set, and the
-    /// eviction log records *that* a hash was evicted, never *why*. The
-    /// watcher's durable projection is the only thing that survives a restart
-    /// knowing a refusal was governance-sourced. See
-    /// `BlacklistEntryStore::load_blacklist_denied_hashes`.
+    /// The set records *why* a hash is refused — governance-sourced, which selects
+    /// the wire refusal code — a fact `evicted.log` (which records only *that* a
+    /// hash was evicted) cannot express. The blacklist watcher rebuilds it each
+    /// boot by re-checking every enumerated hash through
+    /// `isHashBlacklistedForOperator` and writing survivors one at a time via
+    /// [`Self::set_chain_denied_one`]; this bulk setter is retained for tests and
+    /// any wholesale reseed.
     pub fn set_chain_denied(&self, hashes: HashSet<Hash>) {
         self.inner.chain_denied.store(Arc::new(hashes));
     }

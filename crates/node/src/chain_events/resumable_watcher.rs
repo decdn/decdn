@@ -71,9 +71,14 @@ pub(crate) enum ColdStart {
     Head,
     /// Start at **`from_block`** (the deploy block) and replay the full history.
     /// For a projection that must reflect *all* pre-existing on-chain state, not
-    /// merely what changed since this node first booted: the blacklist deny-set,
-    /// where silently missing a pre-existing entry means serving a hash the node
-    /// is slashable for serving.
+    /// merely what changed since this node first booted.
+    ///
+    /// Currently unconstructed: the blacklist deny-set was the last projection
+    /// that needed a full-history replay, and it now enumerates its state from
+    /// chain instead (#1497). Retained as the framework's full-replay floor pending
+    /// a dedicated cleanup of the replay surface, rather than deleted piecemeal in a
+    /// compliance change.
+    #[allow(dead_code)]
     FromBlock,
 }
 
@@ -115,7 +120,13 @@ pub(crate) enum CursorStart {
     /// Replay the entire stream from `from_block` (the deploy block) on **every**
     /// boot; do not persist. For an in-memory projection with no on-chain
     /// enumeration source, where a resume cursor would drop entries that must be
-    /// rebuilt (the blacklist deny-set — see `blacklist_watcher`).
+    /// rebuilt.
+    ///
+    /// Currently unconstructed outside tests: the blacklist deny-set was the last
+    /// such projection and now enumerates its state from chain (#1497). Retained
+    /// (like [`ColdStart::FromBlock`]) as the framework's full-replay surface
+    /// pending a dedicated cleanup, rather than deleted piecemeal here.
+    #[allow(dead_code)]
     FullReplay,
 }
 
@@ -325,6 +336,11 @@ impl WatcherConfig {
     }
 
     /// Override the scan floor for a site whose contract deploy block is not 0.
+    ///
+    /// Currently unused: the only site that set a non-zero floor was the blacklist
+    /// watcher's full-history replay, now retired for chain enumeration (#1497).
+    /// Retained alongside [`CursorStart::FullReplay`] / [`ColdStart::FromBlock`].
+    #[allow(dead_code)]
     pub(crate) const fn with_from_block(mut self, from_block: u64) -> Self {
         self.from_block = from_block;
         self
