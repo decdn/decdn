@@ -88,13 +88,14 @@ impl ContentDenylist {
         origin_count
     }
 
-    /// Replace the on-chain origin set wholesale — the watcher's boot restore
-    /// from its durable projection.
+    /// Replace the on-chain origin set wholesale — the watcher's boot seed from
+    /// the enumerated address union, and its periodic re-enumeration refresh.
     ///
-    /// Deliberately NOT a chain read: `ContentBlacklist` exposes no enumeration
-    /// of the blacklisted set, so there is nothing to sweep against and the
-    /// durable projection is the whole guarantee. See
-    /// `BlacklistEntryStore::load_blacklist_origins`.
+    /// The union is the origin ∪ operator deny set read from
+    /// `ContentBlacklist.blacklistedAddresses`, liveness-filtered by
+    /// `isOriginBlacklisted || isOperatorBlacklisted` (see
+    /// `decdn-node::blacklist_watcher`). It is rebuilt from chain each boot, so
+    /// there is no durable projection to reload.
     pub fn set_chain_origins(&self, origins: HashSet<Address>) {
         self.chain_origins.store(Arc::new(origins));
     }

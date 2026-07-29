@@ -215,8 +215,10 @@ impl ClientHandler {
     /// paths. A [`FillOutcome::HardFault`] means the operator's OWN origin faulted
     /// (an S3 5xx, an open breaker, an fs I/O error) — the caller may still try a
     /// further tier, but must not let a later clean miss launder the fault into a
-    /// signed `NotFound` (#1129). Unlike `try_pull_through`, a timeout does NOT
-    /// spawn node→node background fill — this path is local-only.
+    /// signed `NotFound` (#1129). A timeout never spawns a node→node background
+    /// fill — this path is local-only — but it now warms the *local* origin in
+    /// the background so a retry sticks (#1130, Gate B; see
+    /// [`Self::on_local_populate_timeout`]).
     pub(super) async fn try_local_populate(&self, hash: Hash, timeout: Duration) -> FillOutcome {
         match tokio::time::timeout(timeout, self.cache.populate_local(hash)).await {
             Ok(Ok(())) => FillOutcome::Filled,
@@ -247,8 +249,9 @@ impl ClientHandler {
     /// blob if a concurrent fill landed it in the store at the instant the
     /// deadline fired (so a node with node→node OFF doesn't report `CacheMiss` for
     /// a blob that is now present), otherwise meters the timeout and reports the
-    /// miss. Unlike [`Self::on_pull_through_timeout`] it spawns NO background warm
-    /// — this path is local-only and must not kick off a node→node pull.
+    /// miss. It spawns a *local-origin* background warm ([`Self::spawn_local_warm`],
+    /// #1130 Gate B) so a retry sticks, but never a node→node pull — unlike
+    /// [`Self::on_pull_through_timeout`], this path must stay local-only.
     ///
     /// A deadline expiry is a [`FillOutcome::CleanMiss`], not a fault — see
     /// [`Self::on_pull_through_timeout`] for why.
@@ -272,7 +275,43 @@ impl ClientHandler {
         }
         self.metrics.node_pull_through_timeout();
         tracing::debug!(%hash, ?timeout, "reactive local-origin pull-through timed out");
+        // Gate B (#1130): the per-request deadline fired, but the local pull may
+        // just be slow, not absent. Finish it in the background so a retry hits a
+        // warm store instead of re-missing. The old behavior warmed nothing, so a
+        // cold origin blob needed several fetches before it stuck.
+        self.spawn_local_warm(hash);
         FillOutcome::CleanMiss
+    }
+
+    /// Spawn a detached local-origin warm after a reactive populate deadline
+    /// expiry (#1130, Gate B). The foreground request already returned a clean
+    /// miss; this lets the local pull finish past the per-request deadline so a
+    /// retry hits a warm store instead of re-missing.
+    ///
+    /// Local-only by construction: it calls [`CacheEngine::populate_local`](super::CacheEngine::populate_local),
+    /// which skips the paid `Peer` origin — so unlike the node→node
+    /// [`Self::maybe_spawn_background_fill`] it needs no memory-budget /
+    /// cancellation bookkeeping. The engine's in-flight coalescing dedups
+    /// concurrent warms for the same hash, so a burst of timed-out requests
+    /// collapses to one pull; `populate_local` drops the payload (`CommitOnly`),
+    /// so memory stays bounded by the streaming import, not the blob size.
+    fn spawn_local_warm(&self, hash: Hash) {
+        let cache = self.cache.clone();
+        let metrics = Arc::clone(&self.metrics);
+        tokio::spawn(async move {
+            match cache.populate_local(hash).await {
+                Ok(()) => {
+                    tracing::debug!(%hash, "background local-origin warm populated blob (#1130 Gate B)");
+                }
+                Err(e) if is_clean_miss(&e) => {
+                    tracing::debug!(%hash, error = %e, "background local-origin warm found nothing to warm");
+                }
+                Err(e) => {
+                    metrics.node_pull_through_error();
+                    tracing::warn!(%hash, error = %e, "background local-origin warm FAILED; this is a fault, not a miss");
+                }
+            }
+        });
     }
 
     /// Attempt to fill a bounded/offset cache-miss request by pulling only the

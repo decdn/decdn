@@ -155,6 +155,12 @@ const DEFAULT_PROBE_MAX_TRACKED_PER_PEER: usize = 4096;
 /// can tune lower; setting to `0` disables the periodic sweep entirely.
 pub const DEFAULT_GC_INTERVAL_SEC: u64 = 300;
 
+/// Default interval between origin-held-index rescans in seconds (#1130). A
+/// minute balances "drop a file, it's fetchable soon" against directory-walk
+/// cost; operators indexing a large fs origin can raise it, and `0` disables
+/// the periodic rescan (startup + reload still run one).
+pub const DEFAULT_FS_RESCAN_INTERVAL_SEC: u64 = 60;
+
 /// Default LRU eviction driver high-water percent of `cache.cache_size_mb`
 /// (#1173, appendix-blob-cache-eviction.md § Trigger and target). Above this
 /// fraction the driver actively evicts.
@@ -1241,17 +1247,6 @@ fn resolve_blockchain_into(
              set it to the deployed PublisherRegistry contract",
         );
     }
-    // File-only tuning for the chain-backed origin directory's log replay.
-    // Default `0` is correct but scans the whole chain; operators set this to
-    // the PublisherRegistry deployment block on an established L2.
-    let origin_directory_from_block = file
-        .and_then(|b| b.origin_directory_from_block)
-        .unwrap_or(0);
-    // Scan floor for the slash watcher (#1032). Every daemon start rescans
-    // from this block (the in-memory detected-slash store must be rebuilt), so
-    // setting it to the SlashJudge deploy block bounds every restart's scan.
-    let slash_judge_from_block = file.and_then(|b| b.slash_judge_from_block).unwrap_or(0);
-
     // Required like the other contract addresses: a wrong/zero
     // `verifyingContract` silently produces `slash_sig`s no verifier accepts
     // (ADR 014 §1).
@@ -1318,12 +1313,6 @@ fn resolve_blockchain_into(
     }
     let content_blacklist_address =
         (!content_blacklist_address.is_empty()).then_some(content_blacklist_address);
-    // File-only tuning for the watcher's `HashBlacklisted` log replay start block
-    // (mirrors `origin_directory_from_block`). SHOULD be the ContentBlacklist
-    // deployment block; absent => `0`, correct but scans the whole chain.
-    let content_blacklist_from_block = file
-        .and_then(|b| b.content_blacklist_from_block)
-        .unwrap_or(0);
     let content_blacklist_poll_interval_sec = file
         .and_then(|b| b.content_blacklist_poll_interval_sec)
         .unwrap_or(DEFAULT_CONTENT_BLACKLIST_POLL_INTERVAL_SEC);
@@ -1482,11 +1471,8 @@ fn resolve_blockchain_into(
         capacity_bond_address,
         origin_assignment_address,
         publisher_registry_address,
-        origin_directory_from_block,
         slash_judge_address,
-        slash_judge_from_block,
         content_blacklist_address,
-        content_blacklist_from_block,
         content_blacklist_poll_interval_sec,
         chain_id,
         rpc_watchdog_interval_sec,
@@ -1614,6 +1600,10 @@ fn resolve_cache_into(
     let gc_interval_sec = file
         .and_then(|c| c.gc_interval_sec)
         .unwrap_or(DEFAULT_GC_INTERVAL_SEC);
+
+    let fs_rescan_interval_sec = file
+        .and_then(|c| c.fs_rescan_interval_sec)
+        .unwrap_or(DEFAULT_FS_RESCAN_INTERVAL_SEC);
 
     // LRU eviction driver knobs (#1173, appendix-blob-cache-eviction.md). Each
     // is range-checked against its structural bounds; the target/high-water
@@ -1789,6 +1779,7 @@ fn resolve_cache_into(
         circuit_breaker,
         user_agent,
         gc_interval_sec,
+        fs_rescan_interval_sec,
         eviction_high_water_pct,
         eviction_target_pct,
         eviction_per_sweep_budget,
@@ -3734,7 +3725,6 @@ mod tests {
     fn cfg_with_rpc(raw: &str) -> FileConfig {
         FileConfig {
             blockchain: Some(types::BlockchainConfig {
-                origin_directory_from_block: None,
                 origin_assignment_address: None,
                 publisher_registry_address: None,
                 rpc_url: Some(raw.to_string()),
@@ -3766,11 +3756,9 @@ mod tests {
         let home = home_str()?;
         let mut cfg = FileConfig {
             blockchain: Some(types::BlockchainConfig {
-                origin_directory_from_block: None,
                 origin_assignment_address: None,
                 publisher_registry_address: None,
                 slash_judge_address: Some("${HOME}/judge".to_string()),
-                slash_judge_from_block: None,
                 slash_appeal_address: None,
                 content_blacklist_address: None,
                 ..Default::default()
@@ -4142,7 +4130,6 @@ mod tests {
             }),
             ("blockchain.rpc_url", |c, v| {
                 c.blockchain = Some(types::BlockchainConfig {
-                    origin_directory_from_block: None,
                     origin_assignment_address: None,
                     publisher_registry_address: None,
                     rpc_url: Some(v.to_string()),
@@ -4151,7 +4138,6 @@ mod tests {
             }),
             ("blockchain.eth_keystore", |c, v| {
                 c.blockchain = Some(types::BlockchainConfig {
-                    origin_directory_from_block: None,
                     origin_assignment_address: None,
                     publisher_registry_address: None,
                     eth_keystore: Some(PathBuf::from(v)),
@@ -4160,7 +4146,6 @@ mod tests {
             }),
             ("blockchain.payment_channel_address", |c, v| {
                 c.blockchain = Some(types::BlockchainConfig {
-                    origin_directory_from_block: None,
                     origin_assignment_address: None,
                     publisher_registry_address: None,
                     payment_channel_address: Some(v.to_string()),
@@ -4169,7 +4154,6 @@ mod tests {
             }),
             ("blockchain.capacity_bond_address", |c, v| {
                 c.blockchain = Some(types::BlockchainConfig {
-                    origin_directory_from_block: None,
                     origin_assignment_address: None,
                     publisher_registry_address: None,
                     capacity_bond_address: Some(v.to_string()),
@@ -5582,6 +5566,36 @@ swap_pool_address = \"0xPool\"
             resolved.gc_interval_sec == 42,
             "expected 42, got: {}",
             resolved.gc_interval_sec
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_cache_fs_rescan_interval_defaults_when_absent() -> anyhow::Result<()> {
+        // Absent => DEFAULT_FS_RESCAN_INTERVAL_SEC (#1130).
+        let cli = cache_cli(None, None);
+        let resolved = resolve_cache(&cli, None, Path::new("/tmp"))?;
+        anyhow::ensure!(
+            resolved.fs_rescan_interval_sec == DEFAULT_FS_RESCAN_INTERVAL_SEC,
+            "expected default {}, got: {}",
+            DEFAULT_FS_RESCAN_INTERVAL_SEC,
+            resolved.fs_rescan_interval_sec
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_cache_fs_rescan_interval_from_file_overrides_default() -> anyhow::Result<()> {
+        let cli = cache_cli(None, None);
+        let file = types::CacheConfig {
+            fs_rescan_interval_sec: Some(30),
+            ..types::CacheConfig::default()
+        };
+        let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
+        anyhow::ensure!(
+            resolved.fs_rescan_interval_sec == 30,
+            "expected 30, got: {}",
+            resolved.fs_rescan_interval_sec
         );
         Ok(())
     }
@@ -8371,8 +8385,6 @@ swap_pool_address = \"0xPool\"
             chain_id: None,
         };
         let file = types::BlockchainConfig {
-            origin_directory_from_block: None,
-            content_blacklist_from_block: None,
             content_blacklist_poll_interval_sec: None,
             origin_assignment_address: None,
             publisher_registry_address: None,
@@ -8389,7 +8401,6 @@ swap_pool_address = \"0xPool\"
             settlement_auto_threshold_micro_usdc: None,
             settlement_auto_by_voucher_nonce_span: None,
             slash_judge_address: Some(GOOD_ADDR.to_string()),
-            slash_judge_from_block: None,
             slash_appeal_address: None,
             content_blacklist_address: None,
             chain_id: None,
@@ -8412,8 +8423,6 @@ swap_pool_address = \"0xPool\"
         let dir = data_dir_with_keystore()?;
         let cli = empty_blockchain_args();
         let file = types::BlockchainConfig {
-            origin_directory_from_block: None,
-            content_blacklist_from_block: None,
             content_blacklist_poll_interval_sec: None,
             origin_assignment_address: None,
             publisher_registry_address: None,
@@ -8430,7 +8439,6 @@ swap_pool_address = \"0xPool\"
             settlement_auto_threshold_micro_usdc: None,
             settlement_auto_by_voucher_nonce_span: None,
             slash_judge_address: Some(GOOD_ADDR.to_string()),
-            slash_judge_from_block: None,
             slash_appeal_address: None,
             content_blacklist_address: None,
             chain_id: None,
@@ -8848,8 +8856,6 @@ swap_pool_address = \"0xPool\"
             chain_id: None,
         };
         let file = types::BlockchainConfig {
-            origin_directory_from_block: None,
-            content_blacklist_from_block: None,
             content_blacklist_poll_interval_sec: None,
             origin_assignment_address: None,
             publisher_registry_address: None,
@@ -8866,7 +8872,6 @@ swap_pool_address = \"0xPool\"
             settlement_auto_threshold_micro_usdc: None,
             settlement_auto_by_voucher_nonce_span: None,
             slash_judge_address: Some(GOOD_ADDR.to_string()),
-            slash_judge_from_block: None,
             slash_appeal_address: None,
             content_blacklist_address: None,
             chain_id: None,
@@ -8900,8 +8905,6 @@ swap_pool_address = \"0xPool\"
             chain_id: None,
         };
         let file = types::BlockchainConfig {
-            origin_directory_from_block: None,
-            content_blacklist_from_block: None,
             content_blacklist_poll_interval_sec: None,
             origin_assignment_address: None,
             publisher_registry_address: None,
@@ -8918,7 +8921,6 @@ swap_pool_address = \"0xPool\"
             settlement_auto_threshold_micro_usdc: None,
             settlement_auto_by_voucher_nonce_span: None,
             slash_judge_address: Some(GOOD_ADDR.to_string()),
-            slash_judge_from_block: None,
             slash_appeal_address: None,
             content_blacklist_address: None,
             chain_id: None,
@@ -8951,8 +8953,6 @@ swap_pool_address = \"0xPool\"
             chain_id: None,
         };
         let file = types::BlockchainConfig {
-            origin_directory_from_block: None,
-            content_blacklist_from_block: None,
             content_blacklist_poll_interval_sec: None,
             origin_assignment_address: None,
             publisher_registry_address: None,
@@ -8969,7 +8969,6 @@ swap_pool_address = \"0xPool\"
             settlement_auto_threshold_micro_usdc: Some(0),
             settlement_auto_by_voucher_nonce_span: None,
             slash_judge_address: Some(GOOD_ADDR.to_string()),
-            slash_judge_from_block: None,
             slash_appeal_address: None,
             content_blacklist_address: None,
             chain_id: None,
@@ -9002,8 +9001,6 @@ swap_pool_address = \"0xPool\"
             chain_id: None,
         };
         let file = types::BlockchainConfig {
-            origin_directory_from_block: None,
-            content_blacklist_from_block: None,
             content_blacklist_poll_interval_sec: None,
             origin_assignment_address: None,
             publisher_registry_address: None,
@@ -9020,7 +9017,6 @@ swap_pool_address = \"0xPool\"
             settlement_auto_threshold_micro_usdc: None,
             settlement_auto_by_voucher_nonce_span: Some(0),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
-            slash_judge_from_block: None,
             slash_appeal_address: None,
             content_blacklist_address: None,
             chain_id: None,
@@ -9076,8 +9072,6 @@ swap_pool_address = \"0xPool\"
             chain_id: None,
         };
         let file = types::BlockchainConfig {
-            origin_directory_from_block: None,
-            content_blacklist_from_block: None,
             content_blacklist_poll_interval_sec: None,
             origin_assignment_address: None,
             publisher_registry_address: None,
@@ -9094,7 +9088,6 @@ swap_pool_address = \"0xPool\"
             settlement_auto_threshold_micro_usdc: Some(50_000_000),
             settlement_auto_by_voucher_nonce_span: Some(1_000),
             slash_judge_address: Some(GOOD_ADDR.to_string()),
-            slash_judge_from_block: None,
             slash_appeal_address: None,
             content_blacklist_address: None,
             chain_id: None,
@@ -9126,8 +9119,6 @@ swap_pool_address = \"0xPool\"
             chain_id: None,
         };
         let file = types::BlockchainConfig {
-            origin_directory_from_block: None,
-            content_blacklist_from_block: None,
             content_blacklist_poll_interval_sec: None,
             origin_assignment_address: None,
             publisher_registry_address: None,
@@ -9144,7 +9135,6 @@ swap_pool_address = \"0xPool\"
             settlement_auto_threshold_micro_usdc: None,
             settlement_auto_by_voucher_nonce_span: None,
             slash_judge_address: Some(GOOD_ADDR.to_string()),
-            slash_judge_from_block: None,
             slash_appeal_address: None,
             content_blacklist_address: None,
             chain_id: None,
@@ -9171,8 +9161,6 @@ swap_pool_address = \"0xPool\"
             chain_id: None,
         };
         let file = types::BlockchainConfig {
-            origin_directory_from_block: None,
-            content_blacklist_from_block: None,
             content_blacklist_poll_interval_sec: None,
             origin_assignment_address: None,
             publisher_registry_address: None,
@@ -9189,7 +9177,6 @@ swap_pool_address = \"0xPool\"
             settlement_auto_threshold_micro_usdc: None,
             settlement_auto_by_voucher_nonce_span: None,
             slash_judge_address: Some(GOOD_ADDR.to_string()),
-            slash_judge_from_block: None,
             slash_appeal_address: None,
             content_blacklist_address: None,
             chain_id: None,
@@ -9252,7 +9239,6 @@ swap_pool_address = \"0xPool\"
             event_poll_interval_ms: Some(MIN_EVENT_POLL_INTERVAL_MS - 1),
             rate_bounds_poll_interval_sec: None,
             slash_judge_address: Some(GOOD_ADDR.to_string()),
-            slash_judge_from_block: None,
             slash_appeal_address: None,
             content_blacklist_address: None,
             ..Default::default()
@@ -9318,7 +9304,6 @@ swap_pool_address = \"0xPool\"
             event_poll_interval_ms: Some(MIN_EVENT_POLL_INTERVAL_MS),
             rate_bounds_poll_interval_sec: None,
             slash_judge_address: Some(GOOD_ADDR.to_string()),
-            slash_judge_from_block: None,
             slash_appeal_address: None,
             content_blacklist_address: None,
             ..Default::default()
@@ -9330,7 +9315,6 @@ swap_pool_address = \"0xPool\"
             event_poll_interval_ms: Some(1000),
             rate_bounds_poll_interval_sec: None,
             slash_judge_address: Some(GOOD_ADDR.to_string()),
-            slash_judge_from_block: None,
             slash_appeal_address: None,
             content_blacklist_address: None,
             ..Default::default()

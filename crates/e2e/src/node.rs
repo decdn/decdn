@@ -464,9 +464,9 @@ impl NodeFixture {
     /// operator is already on-chain), then wait until healthy. Proves persisted
     /// state (e.g. durable blacklist eviction via `evicted.log`) survives a
     /// restart, and exercises the across-restart slash re-scan (#1032): the new
-    /// process rebuilds its in-memory slash store from the
-    /// `slash_judge_from_block` floor. Uses `&self`: the child handle lives
-    /// behind a `Mutex`, so the swap needs no exclusive borrow.
+    /// process rebuilds its in-memory slash store by re-enumerating on chain and
+    /// seeding the watcher tail. Uses `&self`: the child handle lives behind a
+    /// `Mutex`, so the swap needs no exclusive borrow.
     pub async fn restart(&self) -> anyhow::Result<()> {
         // Kill the old process and swap in the new one, holding the guard lock
         // only briefly (never across an await). `wait()` reaps the old process

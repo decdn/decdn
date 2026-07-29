@@ -421,7 +421,16 @@ impl ReloadableSection for PinnedHashesSection {
         // from "cache not yet attached" and the same dedicated tracing
         // line covers it.
         let pin_diff = if let Ok(g) = self.engine.lock() {
-            g.as_ref().map(|engine| engine.set_pinned(&resolved))
+            g.as_ref().map(|engine| {
+                let diff = engine.set_pinned(&resolved);
+                // Refresh the origin-held index so a newly-added pin (or a file
+                // dropped into the fs origin) is announced on this reload rather
+                // than only at the next periodic rescan (#1130). Detached so we
+                // honor reload()'s no-await invariant; rescan is idempotent.
+                let engine = engine.clone();
+                tokio::spawn(async move { engine.rescan_origins().await });
+                diff
+            })
         } else {
             tracing::error!(
                 section = self.name(),
@@ -804,7 +813,6 @@ impl RuntimeReloadState {
             blockchain: ResolvedBlockchain {
                 origin_assignment_address: None,
                 publisher_registry_address: None,
-                origin_directory_from_block: 0,
                 rpc_url: "http://localhost:8545".into(),
                 eth_keystore: PathBuf::from("/tmp/keystore.json"),
                 keystore_password_file: None,
@@ -819,9 +827,7 @@ impl RuntimeReloadState {
                 settlement_auto_threshold_micro_usdc: None,
                 settlement_auto_by_voucher_nonce_span: None,
                 slash_judge_address: "0x0000000000000000000000000000000000000003".to_string(),
-                slash_judge_from_block: 0,
                 content_blacklist_address: None,
-                content_blacklist_from_block: 0,
                 content_blacklist_poll_interval_sec: 600,
                 chain_id: decdn_common::config::DEFAULT_CHAIN_ID,
             },
@@ -836,6 +842,7 @@ impl RuntimeReloadState {
                 circuit_breaker: decdn_cache::CircuitBreakerPolicy::default(),
                 user_agent: decdn_cache::DEFAULT_USER_AGENT.to_string(),
                 gc_interval_sec: 0,
+                fs_rescan_interval_sec: 0,
                 eviction_high_water_pct: 90,
                 eviction_target_pct: 80,
                 eviction_per_sweep_budget: 16,
@@ -1177,6 +1184,7 @@ const fn cache_has_restart_required_field(c: &decdn_common::config::types::Cache
         circuit_breaker,
         user_agent,
         gc_interval_sec,
+        fs_rescan_interval_sec,
         eviction_high_water_pct,
         eviction_target_pct,
         eviction_per_sweep_budget,
@@ -1202,6 +1210,9 @@ const fn cache_has_restart_required_field(c: &decdn_common::config::types::Cache
         || circuit_breaker.is_some()
         || user_agent.is_some()
         || gc_interval_sec.is_some()
+        // The rescan *cadence* needs a restart to rebuild the interval timer;
+        // a reload still re-runs one rescan to pick up newly-added files.
+        || fs_rescan_interval_sec.is_some()
         || eviction_high_water_pct.is_some()
         || eviction_target_pct.is_some()
         || eviction_per_sweep_budget.is_some()
@@ -1311,7 +1322,6 @@ mod tests {
             blockchain: ResolvedBlockchain {
                 origin_assignment_address: None,
                 publisher_registry_address: None,
-                origin_directory_from_block: 0,
                 rpc_url: "http://localhost:8545".into(),
                 eth_keystore: PathBuf::from("/tmp/keystore.json"),
                 keystore_password_file: None,
@@ -1326,9 +1336,7 @@ mod tests {
                 settlement_auto_threshold_micro_usdc: None,
                 settlement_auto_by_voucher_nonce_span: None,
                 slash_judge_address: "0x0000000000000000000000000000000000000003".to_string(),
-                slash_judge_from_block: 0,
                 content_blacklist_address: None,
-                content_blacklist_from_block: 0,
                 content_blacklist_poll_interval_sec: 600,
                 chain_id: decdn_common::config::DEFAULT_CHAIN_ID,
             },
@@ -1343,6 +1351,7 @@ mod tests {
                 circuit_breaker: decdn_cache::CircuitBreakerPolicy::default(),
                 user_agent: decdn_cache::DEFAULT_USER_AGENT.to_string(),
                 gc_interval_sec: 0,
+                fs_rescan_interval_sec: 0,
                 eviction_high_water_pct: 90,
                 eviction_target_pct: 80,
                 eviction_per_sweep_budget: 16,

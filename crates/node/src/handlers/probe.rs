@@ -412,6 +412,22 @@ impl ProbeHandler {
                 }
             }
         };
+
+        // Origin-held fallback (#1130). If the store can't back a
+        // `has_blob: true` — the blob was never pulled into it, or is
+        // un-holdable under hold-budget / stake-lane pressure — but the blob is
+        // servable from a configured origin (fs directory entry, or a present
+        // pin), advertise it anyway so cold origin content is discoverable on
+        // the first probe rather than only after a warm.
+        //
+        // Origin content takes **no** eviction hold: it lives on disk / behind
+        // the origin, not in the evictable store, so hold-budget pressure is
+        // irrelevant to it and no probe-hold reservation is needed. This is
+        // phantom-slash-safe only because the delivery path never signs an
+        // `ok: false` StreamResponse for an announced-but-unservable hash — it
+        // fails silent instead (ADR 005; see the delivery/fill handlers).
+        let (has_blob, total_bytes) =
+            fold_origin_held((has_blob, total_bytes), self.cache.origin_held_size(hash));
         // On the shed path no hold was attempted, so the value sampled for
         // the gate is still current — reuse it instead of re-acquiring the
         // lock and sweeping again. Off that path a hold may have been taken,
@@ -647,10 +663,56 @@ async fn read_probe_request(
     }
 }
 
+/// Fold the origin-held index into the store's `has_blob` decision (#1130).
+///
+/// If the store already backs `has_blob: true`, keep it. Otherwise, when the
+/// blob is servable from a configured origin (`origin_size` is `Some`),
+/// advertise it with the origin's size — cold origin content is discoverable
+/// on the first probe. Pure so the policy is unit-testable without a live
+/// connection.
+const fn fold_origin_held(
+    store_decision: (bool, Option<u64>),
+    origin_size: Option<u64>,
+) -> (bool, Option<u64>) {
+    match store_decision {
+        (true, bytes) => (true, bytes),
+        (false, _) => match origin_size {
+            Some(size) => (true, Some(size)),
+            None => (false, None),
+        },
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
-    use super::stake_lane_reserved_out;
+    use super::{fold_origin_held, stake_lane_reserved_out};
+
+    /// A store-backed `has_blob: true` is preserved untouched, even if the
+    /// origin also holds the blob — the store size wins (it's already held).
+    #[test]
+    fn fold_origin_held_keeps_store_hit() {
+        assert_eq!(
+            fold_origin_held((true, Some(100)), Some(200)),
+            (true, Some(100))
+        );
+        assert_eq!(fold_origin_held((true, None), Some(200)), (true, None));
+    }
+
+    /// A store miss + origin hold → advertise with the origin's size (#1130).
+    #[test]
+    fn fold_origin_held_promotes_origin_content() {
+        assert_eq!(
+            fold_origin_held((false, None), Some(4096)),
+            (true, Some(4096))
+        );
+    }
+
+    /// A store miss with no origin hold stays a true negative.
+    #[test]
+    fn fold_origin_held_absent_stays_false() {
+        assert_eq!(fold_origin_held((false, None), None), (false, None));
+    }
 
     /// With no reservation configured (`reserved == 0`) the gate is a
     /// no-op: even a non-stake requester at a full hold budget is never

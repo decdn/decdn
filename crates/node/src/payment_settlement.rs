@@ -2771,8 +2771,8 @@ mod tests {
     // The `advance_checkpoint` monotonicity and backfill-floor policy are now the
     // resumable watcher's `resolve_persisted_start` / per-window cursor advance;
     // their unit tests live in `crate::chain_events::resumable_watcher`. The
-    // `backfill_windows` / `check_backfill_range` window-math tests moved with
-    // those primitives to `crate::chain_events::backfill`.
+    // `backfill_windows` window-math tests moved with those primitives to
+    // `crate::chain_events::backfill`.
 
     #[test]
     fn ready_to_settle_boundary() {

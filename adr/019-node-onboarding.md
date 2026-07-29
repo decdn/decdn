@@ -129,9 +129,9 @@ The node SHOULD subscribe to on-chain `RateBoundsUpdated` events for real-time u
 
 #### Step 3.2 — Sync content blacklist
 
-Fetch the full current blacklist (global entries + the node's declared region entries) from the `ContentBlacklist` contract. Record the current `blacklistVersion`. The node MUST NOT accept connections until this sync completes successfully ([ADR 011](011-content-takedown.md#polling)).
+Enumerate the full current deny-set from the `ContentBlacklist` contract at a single pinned block — the blacklisted address union (`blacklistedAddresses`, kept to the live members of `isOriginBlacklisted || isOperatorBlacklisted`) and the node's in-scope hashes (`getScopeRegions` then `blacklistedHashes` per region, liveness-filtered by `isHashBlacklistedForOperator`). The node MUST NOT accept connections until this enumeration completes successfully ([ADR 011](011-content-takedown.md#enumerating-the-deny-set)).
 
-After initial sync, the node polls `getBlacklistVersion()` every `blacklist_poll_interval` (default 10 minutes) for incremental updates.
+After the initial enumeration, the node follows the contract's blacklist events for live updates and periodically re-enumerates as the backstop. There is no version checkpoint to record: every boot rebuilds the complete deny-set, so a node returning from any downtime is immediately current.
 
 #### Step 3.3 — Build initial peer table from on-chain registry
 
