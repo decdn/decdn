@@ -1036,15 +1036,35 @@ impl CacheEngine {
 
     /// Snapshot of the hashes in the origin-held index (#1130), for seeding the
     /// DHT announce / republish set alongside [`Self::iter_hashes`].
+    ///
+    /// Filtered through the **live** [`Self::refuses`] set: the index is only a
+    /// per-rescan snapshot, so a hash blacklisted / evicted / denied *after* the
+    /// last rescan is still in it — but must never be announced. The live filter
+    /// closes that window without waiting for the next rescan.
     pub fn origin_held_hashes(&self) -> Vec<Hash> {
-        self.inner.origin_held.load().keys().copied().collect()
+        self.inner
+            .origin_held
+            .load()
+            .keys()
+            .copied()
+            .filter(|h| !self.refuses(*h))
+            .collect()
     }
 
     /// Total byte size of `hash` if this node can serve it from a configured
     /// origin (#1130), else `None`. Backs the probe `has_blob` / `total_bytes`
     /// answer for origin-held content — `Some` means "advertise and serve" —
     /// resolved from the last [`Self::rescan_origins`] with no per-probe I/O.
+    ///
+    /// Returns `None` for a [`Self::refuses`]-listed hash even if the snapshot
+    /// still holds it: the index is rebuilt only on rescan, so a hash
+    /// blacklisted / evicted / denied since the last rescan would otherwise be
+    /// advertised (probe `has_blob: true`) or leak past the serve-miss
+    /// slash-safety gate. The live refusal check is the authority.
     pub fn origin_held_size(&self, hash: Hash) -> Option<u64> {
+        if self.refuses(hash) {
+            return None;
+        }
         self.inner.origin_held.load().get(&hash).copied()
     }
 
@@ -4126,9 +4146,28 @@ mod tests {
             "absent hash must not be servable from origin",
         );
 
-        // A denied hash drops out of the index on the next rescan.
+        // A hash denied AFTER the last rescan must drop out of the *live* reads
+        // immediately — the snapshot still lists it, but `refuses` is the
+        // authority. This guards the #1130 blacklist-compliance interaction:
+        // without it the probe would sign has_blob:true for a just-blacklisted
+        // blob (g_node_04). No rescan between the deny and the assertions.
         engine.set_denied(&crate::DeniedHashes::new(
-            [from_store_hash(h2)].into_iter().collect(),
+            [from_store_hash(h1)].into_iter().collect(),
+        ));
+        anyhow::ensure!(
+            engine.origin_held_size(h1).is_none(),
+            "a hash denied since the last rescan must not be servable from origin",
+        );
+        anyhow::ensure!(
+            !engine.origin_held_hashes().contains(&h1),
+            "a hash denied since the last rescan must not be announced",
+        );
+
+        // And it also drops from the index proper on the next rescan.
+        engine.set_denied(&crate::DeniedHashes::new(
+            [from_store_hash(h1), from_store_hash(h2)]
+                .into_iter()
+                .collect(),
         ));
         engine.rescan_origins().await;
         anyhow::ensure!(
