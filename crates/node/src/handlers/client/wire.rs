@@ -126,6 +126,34 @@ impl ClientHandler {
             }
             ServeRejectReason::OriginDenied => self.metrics.serve_stream_rejected_origin_denied(),
         }
+        // Slash-safety (#1130). If we advertised `has_blob: true` for this hash
+        // because it is origin-held (fs directory entry / present pin), we must
+        // NEVER sign an `ok: false` *availability* refusal for it: a signed
+        // has_blob:true probe + a signed NotFound StreamResponse for the same
+        // hash within 30s is phantom-announcement evidence (ADR 014). A serve
+        // that missed here (the reactive pull timed out, or the origin object
+        // vanished between probe and serve) is the publisher's problem, not a
+        // reason to hand a requester slashable evidence. Fail SILENT — the
+        // metric already fired above; drop the stream without signing. The
+        // correct consequence is a local reputation ding (ADR 008), not a bond
+        // slash. Only the availability reasons are gated; payment/auth
+        // rejections are unaffected (they are not "I don't have it" claims and
+        // pre-date this path).
+        if matches!(
+            reason,
+            ServeRejectReason::CacheMiss | ServeRejectReason::EvictedSinceProbe
+        ) {
+            let store_hash = decdn_cache::Hash::from_bytes(req.hash);
+            if self.cache.origin_held_size(store_hash).is_some() {
+                tracing::debug!(
+                    hash = %store_hash,
+                    ?reason,
+                    "origin-held serve failed; dropping without a signed ok:false to avoid phantom-slash evidence (#1130)"
+                );
+                return Ok(());
+            }
+        }
+
         let error = reason.wire_error();
         let rate_per_mb = self.clamped_rate();
         let body = StreamResponseBody {
