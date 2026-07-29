@@ -584,8 +584,9 @@ where
     anyhow::ensure!(
         seen == count,
         "namespace enumeration read {seen} of {count} entries at block {at_block}; \
-         the set changed mid-page (swap-and-pop removal), so the snapshot would be \
-         missing a namespace"
+         the pinned set was read inconsistently (a mid-page swap-and-pop removal, \
+         or an inconsistent/reorged RPC view of this block), so the snapshot would \
+         be missing a namespace — aborting rather than seating a partial set"
     );
     Ok(namespaces)
 }
