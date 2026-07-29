@@ -227,6 +227,10 @@ alloy::sol! {
         function addOperator(address operator) external;
         function removeOperator(address operator) external;
         function isOriginBlacklisted(address origin) external view returns (bool);
+        /// The operator-level deny list, which `addOperator` writes and
+        /// `isOriginBlacklisted` does NOT reflect — the two are independent
+        /// mappings that `OriginAssignment` unions.
+        function isOperatorBlacklisted(address operator) external view returns (bool);
     }
 
     /// OpenZeppelin `AccessControl` surface, bound at a governed contract's
