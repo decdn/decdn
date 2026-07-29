@@ -202,8 +202,8 @@ pub struct BlockchainConfig {
     /// Deposit (base units, `µUSDC`) the buyer path escrows when opening a
     /// `PaymentChannel` against an upstream provider on a cache miss (#744).
     /// Absent => default (10 USDC = `10_000_000` `µUSDC`, ADR 003 § Deposit
-    /// Economics recommended minimum). Clamped up to the on-chain `minDeposit`
-    /// floor at open time.
+    /// Economics recommended minimum). Escrowed as configured at open time —
+    /// there is no on-chain floor to clamp up to, only a non-zero requirement.
     pub buyer_deposit_micro_usdc: Option<u64>,
     /// Whether to issue an unlimited (max) USDC approval for the
     /// `PaymentChannel` contract so the buyer path can `openChannel` (#744).

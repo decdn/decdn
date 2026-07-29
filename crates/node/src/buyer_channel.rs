@@ -538,8 +538,8 @@ fn claim_refill_slot(set: &Arc<Mutex<HashSet<Address>>>, provider: Address) -> O
 
 /// The low-water top-up amount for a reused channel (#1146, #1103): `U256::ZERO`
 /// when the remaining deposit still has headroom, else the amount that restores
-/// it to the working `target`. `target = max(deposit_hint, default_deposit,
-/// min_deposit)` — the same deposit a fresh open would fund (see
+/// it to the working `target`. `target = max(deposit_hint, default_deposit)` —
+/// the same deposit a fresh open would fund (see
 /// [`BuyerChannelService::join_or_spawn_open`]) — and the trigger is
 /// `target / LOW_WATER_DIVISOR` (20% remaining). `deposit` / `prior_amount` are
 /// the reused channel's on-chain deposit and cumulative vouchered amount, read
@@ -551,9 +551,8 @@ fn refill_decision(
     prior_amount: U256,
     deposit_hint: U256,
     default_deposit: U256,
-    min_deposit: U256,
 ) -> U256 {
-    let target = deposit_hint.max(default_deposit).max(min_deposit);
+    let target = deposit_hint.max(default_deposit);
     let low_water = target / U256::from(LOW_WATER_DIVISOR);
     refill_amount(deposit, prior_amount, target, low_water)
 }
@@ -569,7 +568,6 @@ pub struct BuyerChannelService<P: Provider + Clone + 'static> {
     voucher_domain: Eip712Domain,
     token: Address,
     self_address: Address,
-    min_deposit: U256,
     default_deposit: U256,
     /// Providers with an `openChannel` currently in flight, each mapped to a
     /// cloneable handle on the detached task performing it (#1143).
@@ -618,15 +616,15 @@ pub struct BuyerChannelService<P: Provider + Clone + 'static> {
 
 impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
     /// Bootstrap the service: self-check the contract, read the immutable USDC
-    /// token and the governable `minDeposit` floor, issue the one-time USDC
-    /// approval if requested, and spawn the reclaim sweep.
+    /// token, issue the one-time USDC approval if requested, and spawn the
+    /// reclaim sweep.
     ///
     /// `default_deposit` is the deposit used when a caller does not specify a
-    /// larger one; it is clamped up to the on-chain `minDeposit`.
+    /// larger one.
     ///
     /// # Errors
     ///
-    /// Returns an error if the `usdc()` / `minDeposit()` self-check calls fail
+    /// Returns an error if the `usdc()` self-check call fails
     /// (a bad `payment_channel_address` or unreachable RPC is fatal at
     /// bring-up), if the persisted buyer channels cannot be loaded, or if the
     /// one-time approval transaction fails.
@@ -650,11 +648,6 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
         let token = contract.usdc().call().await.with_context(|| {
             format!("PaymentChannel.usdc() self-check at {payment_channel_addr}")
         })?;
-        let min_deposit = contract
-            .minDeposit()
-            .call()
-            .await
-            .context("PaymentChannel.minDeposit() self-check")?;
 
         if ensure_max_approval {
             // Daemon posture: an unlimited (`None`) standing approval for a
@@ -671,7 +664,6 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
             %payment_channel_addr,
             %token,
             %self_address,
-            %min_deposit,
             tracked,
             "BuyerChannelService bootstrap complete"
         );
@@ -734,7 +726,6 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
             voucher_domain,
             token,
             self_address,
-            min_deposit,
             default_deposit,
             opens_in_flight,
             topups_in_flight,
@@ -776,7 +767,7 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
     /// channel tracked for that provider, or lazily open a new one.
     ///
     /// `deposit_hint` is the desired deposit for a freshly-opened channel; the
-    /// actual deposit is `max(deposit_hint, default_deposit, min_deposit)`. The
+    /// actual deposit is `max(deposit_hint, default_deposit)`. The
     /// hint is ignored when an existing channel is reused (call
     /// [`Self::top_up`] to add funds to a live channel).
     ///
@@ -909,13 +900,7 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
         deposit: U256,
         prior_amount: U256,
     ) -> Option<(RefillSlot, U256)> {
-        let additional = refill_decision(
-            deposit,
-            prior_amount,
-            deposit_hint,
-            self.default_deposit,
-            self.min_deposit,
-        );
+        let additional = refill_decision(deposit, prior_amount, deposit_hint, self.default_deposit);
         if additional.is_zero() {
             return None; // still above the low-water mark
         }
@@ -1059,7 +1044,7 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
         let voucher_domain = self.voucher_domain.clone();
         let token = self.token;
         let self_address = self.self_address;
-        let deposit = deposit_hint.max(self.default_deposit).max(self.min_deposit);
+        let deposit = deposit_hint.max(self.default_deposit);
         let metrics = Arc::clone(&self.metrics);
 
         // `spawn_open` reserves the slot (in the map we hold locked) AND holds it in the task
@@ -3103,10 +3088,7 @@ mod tests {
         // deposit 10 USDC, nothing spent → remaining == target, well above the 20%
         // low-water mark, so no top-up.
         let ten = U256::from(10_000_000u64);
-        assert_eq!(
-            refill_decision(ten, U256::ZERO, ten, ten, U256::from(1u64)),
-            U256::ZERO
-        );
+        assert_eq!(refill_decision(ten, U256::ZERO, ten, ten), U256::ZERO);
     }
 
     #[test]
@@ -3116,28 +3098,28 @@ mod tests {
         let ten = U256::from(10_000_000u64);
         let prior = U256::from(9_000_000u64); // remaining == 1 USDC
         assert_eq!(
-            refill_decision(ten, prior, ten, ten, U256::from(1u64)),
+            refill_decision(ten, prior, ten, ten),
             U256::from(9_000_000u64)
         );
     }
 
     #[test]
-    fn refill_decision_target_is_max_of_hint_default_and_min() {
+    fn refill_decision_target_is_max_of_hint_and_default() {
         // A tiny deposit_hint must not shrink the target: it is
-        // max(hint, default_deposit, min_deposit), exactly the fresh-open deposit.
+        // max(hint, default_deposit), exactly the fresh-open deposit.
         let ten = U256::from(10_000_000u64);
         let prior = U256::from(9_999_999u64); // remaining == 1 µUSDC
-        // hint below both → target = default (10 USDC), low_water = 2 USDC.
+        // hint below default → target = default (10 USDC), low_water = 2 USDC.
         assert_eq!(
-            refill_decision(ten, prior, U256::from(1u64), ten, U256::from(2_000_000u64)),
+            refill_decision(ten, prior, U256::from(1u64), ten),
             ten - U256::from(1u64),
         );
 
-        // min_deposit as the DECIDING term of the max(): min > default > hint.
+        // hint as the DECIDING term of the max(): hint > default.
         assert_eq!(
-            refill_decision(ten, prior, U256::from(1u64), ten, U256::from(20_000_000u64)),
+            refill_decision(ten, prior, U256::from(20_000_000u64), ten),
             U256::from(20_000_000u64) - U256::from(1u64),
-            "min_deposit must be able to raise the target above default/hint"
+            "a larger deposit_hint must raise the target above the default"
         );
     }
 
@@ -3885,7 +3867,6 @@ mod tests {
             voucher_domain: decdn_incentive::voucher::voucher_domain(1, payment_channel),
             token: Address::repeat_byte(0x11),
             self_address,
-            min_deposit: U256::from(1u64),
             default_deposit: U256::from(1u64),
             opens_in_flight: Arc::new(Mutex::new(HashMap::new())),
             topups_in_flight: Arc::new(Mutex::new(HashSet::new())),

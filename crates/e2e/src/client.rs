@@ -33,7 +33,7 @@ use crate::bindings::{Erc20, PaymentChannelOpen};
 use crate::chain::ChainFixture;
 use crate::node::NodeFixture;
 
-/// Default channel deposit: 10 USDC (≥ the contract `minDeposit`). Public so a
+/// Default channel deposit: 10 USDC (ADR 003 recommended minimum). Public so a
 /// journey can assert the daemon reports this exact deposit for the channel.
 pub const DEPOSIT_MICRO_USDC: u64 = 10_000_000;
 /// Fixed slash-receipt timestamp (µs). The node does not gate freshness on this

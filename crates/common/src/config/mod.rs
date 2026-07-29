@@ -85,8 +85,8 @@ const MIN_EVENT_POLL_INTERVAL_MS: u64 = 250;
 const DEFAULT_REDEEM_THRESHOLD_MICRO_USDC: u64 = 1_000_000;
 /// Default buyer-side channel deposit: 10 USDC (`10_000_000` `µUSDC`). ADR 003
 /// § Deposit Economics recommends a 10 USDC practical minimum (gas overhead
-/// ~2.3%); the on-chain `minDeposit` floor still applies and the resolved value
-/// is clamped up to it at open time (#744).
+/// ~2.3%); it is a client-side recommendation, not an on-chain floor, so the
+/// resolved value is escrowed as configured (#744).
 const DEFAULT_BUYER_DEPOSIT_MICRO_USDC: u64 = 10_000_000;
 /// Default interval between outgoing `NodeAnnounce` messages (ADR 001).
 const DEFAULT_ANNOUNCE_INTERVAL_SEC: u64 = 60;
@@ -1447,16 +1447,16 @@ fn resolve_blockchain_into(
     let buyer_deposit_micro_usdc = file
         .and_then(|b| b.buyer_deposit_micro_usdc)
         .unwrap_or(DEFAULT_BUYER_DEPOSIT_MICRO_USDC);
-    // A `0` buyer deposit would open dust channels (and revert below the
-    // on-chain `minDeposit` floor). Reject it; the on-chain floor is the
-    // authority on the lower bound, but a configured 0 is always an operator
-    // mistake worth catching at load time.
+    // `openChannel` reverts `ZeroAmount` on a zero deposit, so a configured 0
+    // can never open a channel at all. Reject it here too: the contract is the
+    // authority, but catching it at load time beats surfacing it as a failed
+    // transaction on the first cache-miss pull.
     bag.check_with(
         buyer_deposit_micro_usdc > 0,
         "blockchain.buyer_deposit_micro_usdc",
         || {
-            "blockchain.buyer_deposit_micro_usdc must be > 0 (a 0 deposit opens \
-             dust channels and reverts below the on-chain minDeposit floor)"
+            "blockchain.buyer_deposit_micro_usdc must be > 0 (openChannel reverts \
+             ZeroAmount on a zero deposit)"
                 .to_string()
         },
     );

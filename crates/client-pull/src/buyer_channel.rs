@@ -156,7 +156,7 @@ pub async fn ensure_allowance<P: Provider + Clone>(
 /// and `provider == provider_addr` to confirm we decoded our own open.
 ///
 /// `deposit` is the final escrow amount — the caller applies any
-/// `max(hint, default, min_deposit)` clamping before calling. The returned
+/// `max(hint, default)` clamping before calling. The returned
 /// [`OpenedChannel`] is **not yet persisted**: the caller records
 /// [`OpenedChannel::state`] in its `BuyerChannelStore`, and on a record failure
 /// should log [`OpenedChannel::tx`] (the deposit is escrowed on-chain).
@@ -223,8 +223,8 @@ pub async fn open_channel<P: Provider + Clone>(
     {
         Ok(pending) => pending,
         Err(err) => {
-            // A deterministic revert (deposit below `minDeposit`, USDC
-            // balance/allowance too low, provider inactive, …) is caught at gas
+            // A deterministic revert (a zero deposit, USDC balance/allowance
+            // too low, provider inactive, …) is caught at gas
             // estimation, so it surfaces here with ABI revert data attached;
             // a send error *without* revert data is a transport/RPC fault.
             let reason =
@@ -251,7 +251,7 @@ pub async fn open_channel<P: Provider + Clone>(
         // A mined revert: the revert reason is not recoverable from the receipt
         // (no trace), so it is classified as a generic on-chain revert. Most
         // insufficient-deposit cases are caught at gas estimation above, but
-        // because balance/allowance/`minDeposit` state can change between
+        // because balance/allowance state can change between
         // estimation and mining, a mined revert *could* still be
         // insufficient-deposit — it just can't be distinguished here, so it
         // folds into `ContractRevert`.

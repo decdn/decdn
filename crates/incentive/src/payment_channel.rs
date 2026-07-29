@@ -9,8 +9,7 @@
 //!   [`crate::channel::ChannelState::token`] since `ChannelOpened` does not
 //!   carry it) and `getChannel(channelId)` (to read the on-chain
 //!   `withdrawnAmount` watermark when deciding whether a redemption delta
-//!   crosses the threshold), plus `minDeposit()` (the buyer-path deposit
-//!   floor);
+//!   crosses the threshold);
 //! - seller writes: `withdraw` (redeem accrued earnings while the channel
 //!   stays open — no dispute window), `closeChannel` (initiate close with the
 //!   latest voucher), and `settleChannel` (finalize after the window);
@@ -106,11 +105,6 @@ mod sol_types {
             /// Full on-chain channel record. The seller path reads
             /// `withdrawnAmount` to compute the un-redeemed delta.
             function getChannel(bytes32 channelId) external view returns (Channel memory);
-
-            /// Governable minimum deposit (token base units) enforced by
-            /// `openChannel`. The buyer path reads it to clamp a configured
-            /// deposit up to the on-chain floor before opening.
-            function minDeposit() external view returns (uint256);
 
             /// Governable per-megabyte delivery-rate floor (ADR 019 §3.1 /
             /// ADR 003) — the settlement-enforced minimum rate a voucher may
