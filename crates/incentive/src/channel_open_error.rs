@@ -4,9 +4,13 @@
 //! that an operator must triage differently:
 //!
 //! - **`InsufficientDeposit`** — a *misconfiguration*: the node's USDC balance
-//!   or standing allowance cannot cover the deposit, or the requested deposit
-//!   is below the on-chain `minDeposit` floor. The fix is operator-side (fund
-//!   the wallet / raise the deposit), not infrastructure.
+//!   or standing allowance cannot cover the deposit, or the deposit is zero —
+//!   either as requested, or as the balance delta actually received under a
+//!   fee-on-transfer token. (The node's own path cannot request zero:
+//!   `blockchain.buyer_deposit_micro_usdc` is validated `> 0` at config load, so
+//!   the reachable zero here is the received-delta one, or a hand-passed CLI
+//!   `--deposit-micro-usdc 0`.) The fix is operator-side (fund the wallet / raise
+//!   the deposit), not infrastructure.
 //! - **`ContractRevert`** — any *other* deterministic on-chain revert (provider
 //!   not active, a paused contract, a future revert reason). The deposit was
 //!   not escrowed; the cause is on-chain state, not this node's wallet or RPC.
@@ -32,10 +36,18 @@ use alloy::sol;
 use alloy::sol_types::SolError;
 
 sol! {
-    /// `PaymentChannel.openChannel` reverts this when the (received) deposit is
-    /// below the governable `minDeposit` floor — declared here only for its
-    /// 4-byte selector, so the classifier needs no live contract binding.
-    error DepositBelowMinimum(uint256 deposit, uint256 minDeposit);
+    /// `PaymentChannel.openChannel` reverts this when the requested deposit — or
+    /// the balance delta actually received, under a fee-on-transfer token — is
+    /// zero. Declared here only for its 4-byte selector, so the classifier needs
+    /// no live contract binding.
+    ///
+    /// Unlike the `DepositBelowMinimum` it replaced, this selector is NOT unique
+    /// to `openChannel`: `PaymentChannel.topUp` reverts it too, and `FeeRouter`,
+    /// `CapacityBond` and `BuybackBurner` each declare the identical
+    /// argument-less signature, so all five share one 4-byte selector. Safe here
+    /// only because [`ChannelOpenFailureReason::classify_revert_data`] is called
+    /// on the open path alone; widening its use would need this checked.
+    error ZeroAmount();
 
     /// `OpenZeppelin` v5 `ERC20`: the spender's balance is below the transfer
     /// amount. `openChannel`'s `safeTransferFrom` bubbles this up verbatim when
@@ -64,8 +76,9 @@ sol! {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChannelOpenFailureReason {
     /// The node's USDC balance/allowance cannot cover the deposit, or the
-    /// deposit is below the on-chain `minDeposit` floor — an operator
-    /// misconfiguration. Metric label `insufficient_deposit`.
+    /// deposit is zero — as requested, or as the received balance delta under a
+    /// fee-on-transfer token. An operator misconfiguration either way. Metric
+    /// label `insufficient_deposit`.
     InsufficientDeposit,
     /// Any other deterministic on-chain revert (the deposit was not escrowed).
     /// Metric label `contract_revert`.
@@ -125,7 +138,7 @@ fn is_insufficient_deposit_selector(revert_data: &[u8]) -> bool {
     let Some(selector) = revert_data.get(..4) else {
         return false;
     };
-    selector == DepositBelowMinimum::SELECTOR
+    selector == ZeroAmount::SELECTOR
         || selector == ERC20InsufficientBalance::SELECTOR
         || selector == ERC20InsufficientAllowance::SELECTOR
 }
@@ -144,14 +157,8 @@ mod tests {
     }
 
     #[test]
-    fn deposit_below_minimum_is_insufficient_deposit() {
-        let data = Bytes::from(
-            DepositBelowMinimum {
-                deposit: U256::from(1u64),
-                minDeposit: U256::from(1_000_000u64),
-            }
-            .abi_encode(),
-        );
+    fn zero_amount_is_insufficient_deposit() {
+        let data = Bytes::from(ZeroAmount {}.abi_encode());
         assert_eq!(
             ChannelOpenFailureReason::classify_revert_data(Some(&data)),
             ChannelOpenFailureReason::InsufficientDeposit

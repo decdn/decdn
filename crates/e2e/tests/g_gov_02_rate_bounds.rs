@@ -31,7 +31,7 @@
 //!    — settling alone proves little, since the on-chain floor check rejects
 //!    only *under*-payment, so an over-priced sale would settle just as cleanly.
 //! 7. **Negative — out-of-safety-bounds.** `setRateBounds` reverts with
-//!    `RateBoundsInvalid` for `floor < MIN_DEPOSIT_FLOOR` and for a floor above
+//!    `RateBoundsInvalid` for `floor < MIN_RATE_FLOOR` and for a floor above
 //!    `MAX_RATE_PER_MB`, the ADR 005 wire cap the schema will carry — proven as
 //!    `from = Timelock` static calls for both (so the
 //!    `GOVERNANCE_ROLE` gate is passed and the bounds check is the only thing
@@ -104,7 +104,7 @@ mod gov_abi {
         #[sol(rpc)]
         contract PaymentChannelGov {
             /// Thrown by `setRateBounds` (and the constructor) when
-            /// `newFloor < MIN_DEPOSIT_FLOOR` or `newFloor > type(uint64).max`.
+            /// `newFloor < MIN_RATE_FLOOR` or `newFloor > MAX_RATE_PER_MB`.
             error RateBoundsInvalid(uint256 deliveryFloor);
 
             function setRateBounds(uint256 newFloor) external;
@@ -342,7 +342,7 @@ async fn run() -> anyhow::Result<()> {
         .context("an in-bounds floor must simulate cleanly from the Timelock")?;
     expect_revert::<_, PaymentChannelGov::RateBoundsInvalid>(
         simulate_set_rate_bounds(&chain, timelock, U256::ZERO).await,
-        "setRateBounds below MIN_DEPOSIT_FLOOR",
+        "setRateBounds below MIN_RATE_FLOOR",
     )?;
     // The floor is capped at the ADR 005 wire constant `MAX_RATE_PER_MB`, not at
     // `type(uint64).max`. Every value in the gap between them is quietly

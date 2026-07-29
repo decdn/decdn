@@ -812,9 +812,13 @@ pub struct DecdnMetrics {
     pub node_pull_channel_open_failures: Counter,
     /// `decdn_channel_open_failures_insufficient_deposit_total` (#966): a buyer
     /// `openChannel` tx reverted because the node's USDC balance/allowance could
-    /// not cover the deposit, or the deposit was below the on-chain `minDeposit`
-    /// floor. A *misconfiguration* signal — the fix is operator-side (fund the
-    /// wallet, raise the configured deposit), not infrastructure. A plain counter
+    /// not cover the deposit, or the deposit was zero — either as requested, or
+    /// as the balance delta actually received under a fee-on-transfer token.
+    /// Both zero cases revert the same argument-less `ZeroAmount`, so this
+    /// counter cannot separate them; the wallet balance is what distinguishes a
+    /// misconfigured deposit from a token that shaved it. A *misconfiguration*
+    /// signal either way — the fix is operator-side (fund the wallet, raise the
+    /// configured deposit), not infrastructure. A plain counter
     /// field carries no label dimension (a labeled series would need a `Family`),
     /// so the issue's `{reason=…}` split is realized as
     /// three sibling counters (mirroring `dht_rate_limit_rejected_*`); the
