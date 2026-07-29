@@ -288,4 +288,38 @@ pub struct CacheMetrics {
     /// Field name omits `_total`: the emitted name is
     /// `decdn_cache_evicted_operator_total`.
     pub evicted_operator: Counter,
+    // ---- Remote-origin prewarm (#1130) ----
+    /// Blobs pulled into the store by [`crate::CacheEngine::prewarm`]
+    /// (`decdn_cache_prewarm_blobs_total`). Counts only real fetches — a
+    /// hash already present is not counted, so a steady-state node with a
+    /// stable pin set holds this flat after the first boot. A rising value
+    /// across restarts means prewarmed content is being evicted or GC'd
+    /// between runs, which for a pinned set should not happen.
+    ///
+    /// Field name omits `_total`: the emitted name is
+    /// `decdn_cache_prewarm_blobs_total`.
+    pub prewarm_blobs: Counter,
+    /// Bytes pulled from a remote origin by prewarm
+    /// (`decdn_cache_prewarm_bytes_total`), summed from the post-fetch store
+    /// size of each prewarmed blob. This is paid origin egress the node
+    /// incurred *before* any client asked — the reason prewarm is opt-in.
+    /// Included in `pull_through_bytes`, which counts every origin byte
+    /// regardless of what triggered the pull; this counter is the prewarm
+    /// share of it.
+    ///
+    /// Field name omits `_total`: the emitted name is
+    /// `decdn_cache_prewarm_bytes_total`.
+    pub prewarm_bytes: Counter,
+    /// Prewarm attempts that failed (`decdn_cache_prewarm_failures_total`) —
+    /// the origin did not have the pinned hash, or the fetch/store errored.
+    /// Never fatal: prewarm is best-effort and a failure leaves the hash to
+    /// be pulled on demand.
+    ///
+    /// Operator-actionable: a failure count equal to the pin-set size means
+    /// the pinned hashes are not in the configured origin at all — almost
+    /// always a wrong `cache.pinned_hashes` or a wrong origin URL/bucket.
+    ///
+    /// Field name omits `_total`: the emitted name is
+    /// `decdn_cache_prewarm_failures_total`.
+    pub prewarm_failures: Counter,
 }

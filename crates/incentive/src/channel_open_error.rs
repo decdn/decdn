@@ -54,6 +54,13 @@ sol! {
 /// counter (one counter per class — a plain counter field carries no label dimension) and
 /// attach a structured `reason` log field, while the human-readable message is
 /// preserved for logs.
+///
+/// The sibling-counter shape is the settled convention (#1475), not a stopgap:
+/// these three classes have unrelated operator remedies (fund the wallet / fix
+/// the contract call / chase the RPC), so there is no single alert a shared
+/// `reason` label would serve. `decdn_probe_hold_unavailable_total` is the one
+/// labeled exception, and it is labeled precisely because its values *do* share
+/// one alert.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChannelOpenFailureReason {
     /// The node's USDC balance/allowance cannot cover the deposit, or the

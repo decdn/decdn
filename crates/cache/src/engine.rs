@@ -322,6 +322,59 @@ pub struct EvictionPreview {
     pub origin_kinds: Vec<OriginKind>,
 }
 
+/// Outcome of one [`CacheEngine::prewarm`] pass (#1130).
+///
+/// Every field is a count of distinct hashes except `bytes`, and the four counts
+/// partition the deduplicated input: `fetched + already_present + refused +
+/// failed` equals the number of distinct hashes passed in. That identity is what
+/// makes the log line diagnosable — `failed == input` means the origin does not
+/// hold the pin set at all, while `already_present == input` is the healthy
+/// steady state on a warm restart.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PrewarmReport {
+    /// Hashes actually pulled from an origin into the store on this pass.
+    pub fetched: usize,
+    /// Hashes already complete in the store; no origin egress was paid.
+    pub already_present: usize,
+    /// Hashes skipped because [`CacheEngine::refuses`] them — blacklisted or
+    /// operator-evicted. Prewarm is not a bypass for a takedown.
+    pub refused: usize,
+    /// Hashes whose presence check or fetch errored. Best-effort: these are
+    /// logged and left for an on-demand pull.
+    pub failed: usize,
+    /// Bytes of the `fetched` blobs, as the store reports them after the fill.
+    /// This is paid origin egress incurred before any request.
+    pub bytes: u64,
+}
+
+impl PrewarmReport {
+    /// Accumulate one hash's outcome. Saturating so a pathological input size
+    /// cannot wrap a count into a smaller (and reassuring) number.
+    const fn fold(&mut self, outcome: PrewarmOutcome) {
+        match outcome {
+            PrewarmOutcome::Fetched { bytes } => {
+                self.fetched = self.fetched.saturating_add(1);
+                self.bytes = self.bytes.saturating_add(bytes);
+            }
+            PrewarmOutcome::AlreadyPresent => {
+                self.already_present = self.already_present.saturating_add(1);
+            }
+            PrewarmOutcome::Refused => self.refused = self.refused.saturating_add(1),
+            PrewarmOutcome::Failed => self.failed = self.failed.saturating_add(1),
+        }
+    }
+}
+
+/// What [`CacheEngine::prewarm`] did with a single hash, folded into a
+/// [`PrewarmReport`] by the caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrewarmOutcome {
+    Fetched { bytes: u64 },
+    AlreadyPresent,
+    Refused,
+    Failed,
+}
+
 /// Snapshot of access times for blobs that are eligible for LRU
 /// eviction — i.e. **pinned hashes are already excluded**. Returned by
 /// [`CacheEngine::eviction_candidates`].
@@ -1066,6 +1119,100 @@ impl CacheEngine {
             return None;
         }
         self.inner.origin_held.load().get(&hash).copied()
+    }
+
+    /// Pull `hashes` into the store from this node's OWN configured origins,
+    /// ahead of any request for them (#1130).
+    ///
+    /// This is the **remote**-origin half of origin-aware serving. A `Filesystem`
+    /// origin needs no prewarm — its content is already local and is advertised
+    /// through the origin-held index ([`Self::rescan_origins`]), so importing it
+    /// would only duplicate the bytes on the same disk. Callers gate on origin
+    /// kind; this method does not, so a caller that *wants* to materialize an fs
+    /// origin into the store can.
+    ///
+    /// Semantics per hash, in order: a [`Self::refuses`] hash is skipped (a
+    /// blacklisted or operator-evicted hash must never be re-pulled, and prewarm
+    /// is not an exception); an already-present hash is a no-op; otherwise
+    /// [`Self::populate_local`] fetches it. `populate_local`, not
+    /// [`Self::populate`] — the `Peer` node→node origin is deliberately out of
+    /// scope, because fronting USDC to peers for content nobody has asked for
+    /// yet is a very different decision from paying an origin's egress, and the
+    /// operator opted into the latter only.
+    ///
+    /// Best-effort by construction: every failure is counted and logged, none
+    /// propagates. A cold node must boot with an unreachable origin, and a
+    /// prewarm miss costs nothing beyond a first-request pull-through.
+    /// Duplicates in `hashes` are collapsed, so passing pins ∪ some other set is
+    /// safe.
+    pub async fn prewarm<I>(&self, hashes: I) -> PrewarmReport
+    where
+        I: IntoIterator<Item = Hash>,
+    {
+        let mut report = PrewarmReport::default();
+        let mut seen: HashSet<Hash> = HashSet::new();
+        for hash in hashes {
+            if seen.insert(hash) {
+                report.fold(self.prewarm_one(hash).await);
+            }
+        }
+        if let Some(m) = &self.inner.metrics {
+            m.prewarm_blobs
+                .inc_by(u64::try_from(report.fetched).unwrap_or(u64::MAX));
+            m.prewarm_bytes.inc_by(report.bytes);
+            m.prewarm_failures
+                .inc_by(u64::try_from(report.failed).unwrap_or(u64::MAX));
+        }
+        report
+    }
+
+    /// One hash's worth of [`Self::prewarm`]. Split out so the outer loop stays
+    /// a fold over outcomes rather than a nest of `continue`s.
+    async fn prewarm_one(&self, hash: Hash) -> PrewarmOutcome {
+        if self.refuses(hash) {
+            return PrewarmOutcome::Refused;
+        }
+        match self.has(hash).await {
+            Ok(true) => return PrewarmOutcome::AlreadyPresent,
+            Ok(false) => {}
+            Err(err) => {
+                tracing::warn!(%hash, error = %err, "prewarm: presence check failed; skipping");
+                return PrewarmOutcome::Failed;
+            }
+        }
+        match self.populate_local(hash).await {
+            Ok(()) => PrewarmOutcome::Fetched {
+                bytes: self.stored_size(hash).await,
+            },
+            Err(err) => {
+                tracing::warn!(%hash, error = %err, "prewarm: fetch failed; leaving to on-demand pull");
+                PrewarmOutcome::Failed
+            }
+        }
+    }
+
+    /// Size the store reports for `hash`, or `0` if it cannot say. A local
+    /// metadata read, never an origin round-trip — used for prewarm byte
+    /// attribution, where a missing size costs a metric and nothing else.
+    async fn stored_size(&self, hash: Hash) -> u64 {
+        match self.inspect(hash).await {
+            Ok(preview) => preview.size_bytes.unwrap_or(0),
+            Err(err) => {
+                tracing::debug!(%hash, error = %err, "prewarm: size lookup failed");
+                0
+            }
+        }
+    }
+
+    /// [`Self::prewarm`] over the current operator pin set — the set prewarm
+    /// exists for, since pinned content is LRU-exempt and so is the only content
+    /// guaranteed to still be there when a request finally arrives.
+    ///
+    /// Callers warming an incremental reload should pass `PinDiff`'s added
+    /// hashes to [`Self::prewarm`] instead, rather than re-walking every pin.
+    pub async fn prewarm_pinned(&self) -> PrewarmReport {
+        let pinned: Vec<Hash> = self.inner.pinned.load().iter().copied().collect();
+        self.prewarm(pinned).await
     }
 
     /// Swap in the live *local* denied set from `[content] denied_hashes` (ADR

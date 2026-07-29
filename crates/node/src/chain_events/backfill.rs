@@ -1,15 +1,16 @@
 //! Windowing + reorg-margin primitives shared by every on-chain watcher.
 //!
 //! `resumable_watcher::run` walks a `[cursor, head]` gap in bounded
-//! `eth_getLogs` windows and rewinds a shallow reorg margin on resume; the
-//! buyer-side bootstrap reconciliation scan ([`crate::buyer_channel`], #763)
-//! reuses the same math. Kept here (rather than in any one watcher) so a new
-//! consumer picks up the shared span instead of forking a fresh one (#1092).
-//! The origin directory's genesis `AssignmentActivated` replay
-//! ([`crate::dht::chain_origin_directory`], #651) also windows through
-//! [`backfill_windows`], passing its own deliberate `REPLAY_WINDOW_BLOCKS = 9_000`
-//! span (a margin under the provider 10k `eth_getLogs` cap) rather than
-//! [`MAX_BACKFILL_BLOCK_SPAN`] (#1139).
+//! `eth_getLogs` windows and rewinds a shallow reorg margin on resume. Kept here
+//! (rather than in any one watcher) so a new consumer picks up the shared span
+//! instead of forking a fresh one (#1092).
+//!
+//! Scope shrank with #1504: the genesis-replay consumers (the origin directory's
+//! `AssignmentActivated` scan and its `REPLAY_WINDOW_BLOCKS` span, the blacklist
+//! and buyer-reconcile scans) are gone — those watchers enumerate their state
+//! from a contract view at a pinned block instead. What remains is the live-tail
+//! windowing every watcher shares, plus the durable-cursor rewind that only the
+//! settlement watcher resumes from.
 
 /// How many blocks the persisted scan checkpoint is rewound before the
 /// resume backfill (#751), absorbing a shallow reorg between the last scanned
@@ -23,15 +24,13 @@
 /// `HeadMinusWindow` start re-derives its floor from head on every boot, so
 /// there is nothing to rewind.
 ///
-/// Two live consumers after the #1238 axis split:
-/// - the settlement watcher ([`crate::payment_settlement`], #751), through
-///   [`super::resumable_watcher::CursorStart::FromCheckpoint`]'s `reorg_margin`; and
-/// - the origin directory ([`crate::dht::chain_origin_directory`]), whose
-///   bootstrap rewinds its persisted `CheckpointKey::Origin` cursor before
-///   re-enumerating (`chain_origin_directory::replay_floor`). Origin resolves
-///   the rewind there rather than in the watcher because it replays from an
-///   enumeration and seeds the live tail, not from the generic getLogs floor —
-///   which is exactly why #1238 split persistence apart from floor derivation.
+/// One live consumer after #1504: the settlement watcher
+/// ([`crate::payment_settlement`], #751), through
+/// [`super::resumable_watcher::CursorStart::FromCheckpoint`]'s `reorg_margin`.
+/// The origin directory used to be the second, rewinding a persisted
+/// `CheckpointKey::Origin` cursor before re-enumerating; it now seeds its tail at
+/// the enumeration block and persists nothing, so there is no cursor to rewind
+/// and a reorg below that block is corrected by the next boot's enumeration.
 pub(crate) const REORG_MARGIN_BLOCKS: u64 = 128;
 
 /// Maximum block span scanned per `eth_getLogs` during the resume backfill

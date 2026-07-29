@@ -27,6 +27,11 @@
 /// `decdn-node`'s `metrics` module (`dispatch_rejected_{global,per_source}`,
 /// `gossip_messages_rejected_clock_skew`). Neither is wired today.
 ///
+/// That convention is settled, not provisional (#1475): sibling counters are the
+/// default for a closed reason split, and `decdn_probe_hold_unavailable_total`
+/// is the one deliberate labeled exception — earned because its values share a
+/// single alert and remedy. A new split here should follow the siblings.
+///
 /// The argument is kept because it is meaningful at the call site and is what
 /// such a breakdown would key on. Callers should not assume the resulting
 /// series distinguish topics — in practice they do not, and the

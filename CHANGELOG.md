@@ -341,6 +341,30 @@ since project inception and will roll into the first tagged release.
 
 ### Changed
 
+#### Node selection & observability
+
+- **`Candidate.stake` is now `u64`, not `Option<u64>`** (internal API,
+  `decdn-node`). The `Option` conflated "not looked up" with "looked up, holds
+  no bond", and the stake tie-break ranked unknown strictly *below* a known
+  zero. That is a hazard the moment on-chain stake lookup is wired: a chain read
+  succeeds for some peers and fails for others, so one flaky RPC call would have
+  silently sunk a well-staked peer below an unbonded one. The type no longer has
+  a way to express a failed read — the lookup layer must retry or drop the
+  candidate. Nothing populates stake yet, so the tie-break tier is unchanged in
+  behaviour.
+- **The metric reason-split convention is settled: sibling counters, not
+  labels.** `decdn_probe_hold_unavailable_total{reason}` remains the one
+  labeled family and is now documented as the deliberate exception (its values
+  share a single alert and remedy); `dispatch_rejected_*`,
+  `probe_rate_limit_rejected_*`, `channel_open_failures_*` and the gossip
+  rejection counters stay siblings. **No metric is renamed.** The
+  observability appendix is corrected accordingly: it documented
+  `decdn_gossip_messages_rejected_total{reason="clock_skew"}`, a labeled name
+  the node has never exported — the real series is
+  `decdn_gossip_messages_rejected_clock_skew_total` — and the three sibling
+  families are now listed in the registry, where previously they appeared in no
+  operator-facing artifact at all.
+
 #### Cache / node
 
 - **Blob delivery no longer materialises the whole blob in memory.** The serve
@@ -530,6 +554,27 @@ since project inception and will roll into the first tagged release.
   ownership only; no steady-state behavior change.
 
 ### Added
+
+#### Cache / config
+
+- **`cache.prewarm` — opt-in remote-origin warm of the pinned set.** With
+  `prewarm = true`, a node fetches every hash in `cache.pinned_hashes` from its
+  configured `http`/`s3` origin at startup and again on `decdn node reload`,
+  so the first request for pinned content does not pay full pull-through
+  latency. Defaults to `false` and is **restart-required**: prewarm spends
+  origin egress on bytes nobody has asked for yet, so it never turns itself on
+  across an upgrade. `fs` origins ignore the flag — their content is already
+  local and is advertised through the origin-held index, so importing it would
+  only duplicate the bytes on the same disk. Warming runs detached, so an
+  unreachable origin cannot block bring-up, and it goes through the local-origin
+  fill path, so it never fronts USDC to a peer. A pinned set larger than
+  `cache.cache_size_mb` now logs a warning — pinned blobs are LRU-exempt, so the
+  eviction driver could otherwise never reach its high-water target.
+  - New metrics: `decdn_cache_prewarm_blobs_total`,
+    `decdn_cache_prewarm_bytes_total`, `decdn_cache_prewarm_failures_total`.
+- `decdn config validate` now reports `fs_rescan_interval_sec` and `prewarm`,
+  and `decdn config init`'s template documents both. `fs_rescan_interval_sec`
+  shipped without either, so its resolved value was invisible to operators.
 
 #### Contracts
 

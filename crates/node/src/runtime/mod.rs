@@ -262,6 +262,60 @@ where
     stop_tx
 }
 
+/// Whether `cache.prewarm` should actually run for this origin chain (#1130).
+///
+/// The flag alone is not enough: prewarm imports origin content into the cache
+/// store, which for a `Filesystem` origin means a second copy of the same bytes
+/// on the same disk for no benefit — that content is already local and is
+/// advertised through the origin-held index. So prewarm applies only when the
+/// chain contains at least one **remote** origin, and the flag is the operator's
+/// consent to pay that origin's egress up front.
+///
+/// A mixed chain warms: `populate_local` walks the chain in order and stops at
+/// the first origin that has the hash, so an fs entry ahead of a remote one is
+/// still preferred and costs nothing.
+fn prewarm_enabled_for(cache: &decdn_common::config::ResolvedCache) -> bool {
+    cache.prewarm
+        && cache
+            .origins
+            .iter()
+            .any(|o| !matches!(o, decdn_common::config::resolved::ResolvedOrigin::Fs { .. }))
+}
+
+/// Warn when the pin set cannot fit under the cache ceiling (#1130).
+///
+/// Pinned hashes are LRU-exempt (`eviction_candidates` filters them out), so a
+/// pin set larger than `cache.cache_size_mb` makes the eviction driver's
+/// high-water mark permanently unreachable: it will starve every tick while the
+/// disk keeps growing. Prewarm is where this becomes visible, because it is what
+/// materializes the whole pin set at once.
+///
+/// Warn rather than fail or truncate. The operator's pin set is a deliberate
+/// statement about what this node must serve, and silently warming only part of
+/// it would be worse than warming all of it noisily. Sizes come from the
+/// origin-held index that the startup rescan just populated, so unpinned or
+/// unresolvable hashes simply contribute nothing and the number is a lower bound.
+fn warn_if_pins_exceed_cache(cache: &decdn_cache::CacheEngine, cache_size_mb: u64) {
+    let pinned = cache.pinned_snapshot();
+    let pinned_bytes: u64 = pinned
+        .iter()
+        .filter_map(|h| cache.origin_held_size(decdn_cache::Hash::from_bytes(*h.as_bytes())))
+        .fold(0u64, u64::saturating_add);
+    let limit_bytes = cache_size_mb.saturating_mul(1024 * 1024);
+    if pinned_bytes > limit_bytes {
+        tracing::warn!(
+            pinned_count = pinned.len(),
+            pinned_bytes,
+            cache_size_mb,
+            limit_bytes,
+            "cache.pinned_hashes is larger than cache.cache_size_mb; pinned blobs are \
+             LRU-exempt, so the eviction driver can never reach its high-water target and \
+             disk use will exceed the configured ceiling. Raise cache_size_mb or trim the \
+             pin set (#1130)"
+        );
+    }
+}
+
 /// Emit one `debug` line for a keyed rate-limiter GC sweep that pruned buckets.
 /// Shared by the DHT and probe rate-limiter GC ticks, whose per-layer
 /// (`per_ip` / `per_peer`) log arms are otherwise byte-identical.
@@ -1713,6 +1767,35 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
     } else {
         None
     };
+
+    // Remote-origin prewarm (#1130). Detached: pulling the pin set out of an
+    // `http`/`s3` origin is unbounded network work, and a node that cannot reach
+    // its origin must still finish bring-up and serve whatever it already holds.
+    // Newly-warmed blobs reach the announce set through `subscribe_inserts`, so
+    // nothing needs re-seeding here. The `fs` skip is the point of the feature —
+    // see `prewarm_enabled_for`.
+    if prewarm_enabled_for(&cfg.cache) {
+        let cache = infra.cache.clone();
+        let cache_size_mb = cfg.cache.cache_size_mb;
+        tasks.spawn(async move {
+            warn_if_pins_exceed_cache(&cache, cache_size_mb);
+            let report = cache.prewarm_pinned().await;
+            tracing::info!(
+                fetched = report.fetched,
+                already_present = report.already_present,
+                refused = report.refused,
+                failed = report.failed,
+                bytes = report.bytes,
+                "cache.prewarm: remote-origin prewarm of the pin set complete (#1130)"
+            );
+        });
+    } else if cfg.cache.prewarm {
+        tracing::info!(
+            "cache.prewarm is set but every configured origin is a local filesystem; \
+             skipping prewarm — fs-origin content is served from the origin-held index \
+             and importing it would duplicate the bytes on the same disk (#1130)"
+        );
+    }
 
     // DHT bucket-refresh (ADR 022 §Routing Table). Once per hour
     // picks the bucket with the oldest last-refresh timestamp and
@@ -3632,6 +3715,37 @@ mod tests {
         );
     }
 
+    /// `cache.prewarm` is consent to pay a *remote* origin's egress up front.
+    /// The fs skip is the whole reason the flag is origin-kind-aware (#1130):
+    /// warming an fs origin would import a second copy of bytes that are already
+    /// on the same disk, which is the storage doubling the issue set out to fix.
+    #[test]
+    fn prewarm_applies_only_to_remote_origins() {
+        let http = || ResolvedOrigin::Http {
+            url: decdn_cache::parse_origin_url("https://origin.example/").expect("url"),
+            decompress: decdn_cache::DecompressMode::Auto,
+        };
+        let fs = || ResolvedOrigin::Fs {
+            path: PathBuf::from("/srv/origin"),
+        };
+
+        for (label, origins, flag, want) in [
+            ("flag off, remote origin", vec![http()], false, false),
+            ("flag on, remote origin", vec![http()], true, true),
+            ("flag on, fs origin only", vec![fs()], true, false),
+            ("flag on, mixed chain", vec![fs(), http()], true, true),
+            ("flag on, no origin at all", vec![], true, false),
+        ] {
+            let (_tmp, mut cfg) = cfg_with_origins(origins);
+            cfg.cache.prewarm = flag;
+            assert_eq!(
+                prewarm_enabled_for(&cfg.cache),
+                want,
+                "prewarm_enabled_for mismatched on: {label}"
+            );
+        }
+    }
+
     /// Build a minimal `ResolvedConfig` with the cache section
     /// pointed at the given `origin`. Other sections carry sensible
     /// dummies — only the cache is exercised. Mirrors the fixture
@@ -3699,6 +3813,7 @@ mod tests {
                 user_agent: decdn_cache::DEFAULT_USER_AGENT.to_string(),
                 gc_interval_sec: 0,
                 fs_rescan_interval_sec: 0,
+                prewarm: false,
                 eviction_high_water_pct: 90,
                 eviction_target_pct: 80,
                 eviction_per_sweep_budget: 16,

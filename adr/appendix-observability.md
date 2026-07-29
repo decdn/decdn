@@ -32,6 +32,21 @@ All metrics use the `decdn_` prefix, snake_case, and Prometheus-standard unit su
 
 Label names: snake_case, no abbreviations. Label values: lowercase where possible.
 
+#### Reason splits: sibling counters, not labels
+
+Several subsystems classify a failure into a small closed set of reasons. The convention is **one unlabeled sibling counter per reason**, not one counter with a `reason` label (#1475):
+
+| Family | Series |
+|--------|--------|
+| Connection dispatch rejection (`RejectReason`) | `decdn_dispatch_rejected_global_total`, `decdn_dispatch_rejected_per_source_total` |
+| Probe rate-limit rejection (`RejectLayer`) | `decdn_probe_rate_limit_rejected_per_peer_total`, `decdn_probe_rate_limit_rejected_per_ip_total`, `decdn_probe_rate_limit_rejected_global_total` |
+| Buyer `openChannel` failure (`ChannelOpenFailureReason`) | `decdn_channel_open_failures_insufficient_deposit_total`, `decdn_channel_open_failures_contract_revert_total`, `decdn_channel_open_failures_rpc_error_total` (plus the aggregate `decdn_node_pull_channel_open_failures_total`) |
+| Gossip envelope rejection (`AnnounceReject`) | `decdn_gossip_announces_rejected_total` (aggregate) + `decdn_gossip_messages_rejected_clock_skew_total` |
+
+Siblings are the default because each reason in these families has an **unrelated operator remedy**, so no single alert spans the family and a shared label buys nothing; a sibling also needs no typed `EncodeLabelSet` and no pre-materialization to keep a series exporting at zero.
+
+**`decdn_probe_hold_unavailable_total{reason}` is the one deliberate exception.** Its three values share one alert and one remedy axis (hold-budget pressure), so operators query the aggregate first and drill in on the label second — the shape a label serves well. A new split should follow the sibling convention unless it meets that same bar. Either way the invariant is absolute: **no metric may silently stop exporting at zero**, and an alert whose remedy applies to only one reason must carry the corresponding filter.
+
 All metrics are exported in **Prometheus text format 0.0.4** on a configurable HTTP port (default `9090`) at `/metrics`. The same port exposes `/health` (see [Health Endpoint](#health-endpoint)). The port MUST be operator-configurable and MUST NOT be publicly accessible without authentication in production (firewall or auth proxy).
 
 ### Metric Registry
@@ -89,6 +104,9 @@ These give early warning for the three slashable offenses in [ADR 026 § Slashin
 | `decdn_cache_evictions_total` | Counter | R | Blobs evicted by LRU pressure (eviction-driver loop). See [appendix-blob-cache-eviction.md](appendix-blob-cache-eviction.md#appendix-blob-cache-eviction-policy). |
 | `decdn_cache_evicted_operator_total` | Counter | R | Hashes removed via `decdn node evict` (durable, persisted to `<cache_dir>/evicted.log`). Distinct from `decdn_cache_evictions_total`. See [appendix-blob-cache-eviction.md § Operator-evict is orthogonal to LRU](appendix-blob-cache-eviction.md#operator-evict-is-orthogonal-to-lru). |
 | `decdn_cache_pinned_count` | Gauge | R | Size of the operator-pinned set (LRU-exempt). See [appendix-blob-cache-eviction.md § Operator pinning overrides LRU](appendix-blob-cache-eviction.md#operator-pinning-overrides-lru). |
+| `decdn_cache_prewarm_blobs_total` | Counter | R | Blobs pulled into the store by `cache.prewarm` — the opt-in warm of `cache.pinned_hashes` from a **remote** (`http`/`s3`) origin at startup and on reload (#1130). Counts real fetches only; an already-resident hash is not counted, so a node with a stable pin set holds this flat after its first boot. A value that keeps rising across restarts means prewarmed content is not surviving between runs, which for an LRU-exempt pinned set should not happen. `fs` origins ignore prewarm — their content is served from the origin-held index instead. |
+| `decdn_cache_prewarm_bytes_total` | Counter | R | Bytes of origin egress prewarm paid before any client requested them (#1130). The prewarm share of `decdn_cache_pull_through_bytes_total`. This is the cost the opt-in flag exists to gate. |
+| `decdn_cache_prewarm_failures_total` | Counter | R | Prewarm attempts that failed — the origin does not hold the pinned hash, or the fetch/store errored (#1130). Never fatal: the hash is left to an on-demand pull. Operator-actionable when it equals the pin-set size, which almost always means `cache.pinned_hashes` names content the configured origin does not have. |
 | `decdn_probe_post_eviction_failures_total` | Counter | R | `EvictedSinceProbe` responses from remote nodes during cache-hit stream requests. A sustained rate above ~1% of cache-hit attempts suggests remote hold mechanism failures ([ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh), [ADR 005](005-protocol.md#adr-005-wire-protocol)). |
 
 #### Probe Metrics (`cdn/probe/v1`)
@@ -124,7 +142,8 @@ These give early warning for the three slashable offenses in [ADR 026 § Slashin
 
 | Metric | Type | Tier | Labels | Description |
 |--------|------|------|--------|-------------|
-| `decdn_gossip_messages_rejected_total` | Counter | M | `reason={clock_skew,invalid_signature,not_registered,stale_timestamp,invalid_region,duplicate_hashes,table_full}` | Gossip messages rejected during validation ([ADR 001](001-network.md#gossip-validation)) or peer-table admission ([appendix-peer-table-eviction.md](appendix-peer-table-eviction.md#appendix-peer-table-eviction-policy)). `reason=clock_skew` is the canonical replacement for [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh)'s `gossip_messages_rejected_clock_skew`. `table_full` fires only when the optional `gossip.max_peer_entries` ceiling is set and exceeded. |
+| `decdn_gossip_announces_rejected_total` | Counter | M | — | Gossip envelopes rejected during validation ([ADR 001](001-network.md#gossip-validation)) or peer-table admission ([appendix-peer-table-eviction.md](appendix-peer-table-eviction.md#appendix-peer-table-eviction-policy)), aggregated over every reason. The reason enum (`AnnounceReject`) carries a stable label per variant for logs; only `clock_skew` is broken out as a metric — see the next row and [§ Reason splits](#reason-splits-sibling-counters-not-labels). |
+| `decdn_gossip_messages_rejected_clock_skew_total` | Counter | M | — | The clock-skew subset of the row above, as a sibling counter ([ADR 001 § Clock synchronization](001-network.md#adr-001-network-topology-and-peer-mesh)). Broken out because it is the one rejection reason with its own operator remedy — fix NTP — so it is alertable without being buried in the aggregate. Canonical replacement for the informal `gossip_messages_rejected_clock_skew` in [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh). |
 | `decdn_peer_table_size` | Gauge | M | — | Number of distinct peers in the local peer table. |
 | `decdn_peer_table_evicted_ttl_total` | Counter | R | — | Peer-table entries removed by the TTL sweeper ([appendix-peer-table-eviction.md § Lifecycle and TTL](appendix-peer-table-eviction.md#lifecycle-and-ttl)). |
 | `decdn_peer_table_evicted_registry_total` | Counter | R | `reason={deregistered,ejected}` | Peer-table entries removed in response to a `NodeDeregistered` or `NodeAutoEjected` registry event ([appendix-peer-table-eviction.md § Registry-cache interaction (active eviction)](appendix-peer-table-eviction.md#registry-cache-interaction-active-eviction)). |
@@ -261,7 +280,7 @@ Earlier ADRs used informal metric names; this table maps them to canonical repla
 
 | Informal name (prior ADR) | Canonical name (this appendix) | Source ADR |
 |---------------------------|---------------------------|------------|
-| `gossip_messages_rejected_clock_skew` | `decdn_gossip_messages_rejected_total{reason="clock_skew"}` | [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh) |
+| `gossip_messages_rejected_clock_skew` | `decdn_gossip_messages_rejected_clock_skew_total` | [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh) |
 | `probe_hold_violations` | `decdn_probe_hold_unavailable_total{reason="exhausted"}` | [ADR 005](005-protocol.md#adr-005-wire-protocol), architecture.md |
 | `probe_holds_disabled` | `decdn_probe_hold_unavailable_total{reason="disabled"}` | [ADR 005](005-protocol.md#adr-005-wire-protocol), #739 |
 | `probe_stake_lane_reserved` | `decdn_probe_hold_unavailable_total{reason="stake_lane_reserved"}` | [ADR 003 § Admission and Priority](003-payments.md#admission-and-priority), #757 |

@@ -169,18 +169,19 @@ pub struct Candidate {
     /// ISO 3166-1 alpha-2 region from `NodeAnnounce`. Used by the
     /// geo-diversity tie-break tier.
     pub region: String,
-    /// On-chain stake in TOKEN base units. `None` until on-chain stake
-    /// lookup is wired (out of scope for issue #322); when populated,
-    /// higher stake wins the stake tie-break tier.
+    /// On-chain stake in TOKEN base units; higher stake wins the stake
+    /// tie-break tier. `0` means *known to hold no bond* — there is no
+    /// "not looked up" state, by design (#1470).
     ///
-    /// The `Option` carries two distinct meanings, and the tie-break relies
-    /// on the distinction: `Some(0)` is *known* to hold no bond, `None` has
-    /// *not been looked up*. Unknown loses to every known value, `Some(0)`
-    /// included — see the tier 2 comment in `pick_best_in_group`. A lookup that
-    /// errors must therefore not fall back to `None`; decide the failure
-    /// policy at the lookup layer, where the distinction is still visible
-    /// (#1470).
-    pub stake: Option<u64>,
+    /// This type deliberately cannot carry a failed read. A chain read
+    /// succeeds for some peers and fails for others, and a mixed population
+    /// is the steady state for an RPC read, not an edge case — folding a
+    /// failure to `0` here would silently sink a well-staked peer below a
+    /// provably-unbonded one. The lookup layer must therefore resolve the
+    /// failure where it is still visible: retry it, or drop the candidate.
+    /// Nothing populates this yet (on-chain integration is deferred; see ADR
+    /// 019 for the capacity-bond interface that will).
+    pub stake: u64,
 }
 
 /// A candidate paired with its computed selection score. Lower score is better.
@@ -356,27 +357,22 @@ fn pick_best_in_group(
         });
     }
 
-    // Tier 2: higher stake wins, and an *unknown* stake ranks below every
-    // known one — including `Some(0)`. `filter_map` drops `None` before
-    // `max`, so a provably-zero-stake node outranks an unlooked-up one.
-    // That is deliberate, not an accident of the combinator: `Some(0)` means
-    // "queried, holds no bond"; `None` means "not queried yet". Pinned by
-    // `some_stake_beats_none_stake`, `some_zero_stake_beats_none_stake`, and
-    // `three_way_zero_stake_falls_through_to_random_tier` below.
+    // Tier 2: higher stake wins. Every value here is a known one — a failed
+    // on-chain read is resolved at the lookup layer (retried, or the candidate
+    // dropped) and never reaches `Candidate.stake`, so this tier can rank on
+    // the numbers alone. See the field doc for why that boundary matters
+    // (#1470).
     //
-    // The tier is a uniform no-op today — every construction site passes
-    // `None` (on-chain integration is deferred; see ADR 001 "Contract
-    // Interface: Node Registry" / ADR 019 for the capacity-bond interface
-    // that will populate `Candidate.stake`). When that lookup lands, a
-    // *failed* read must not be encoded as `None` alongside successful ones,
-    // or one flaky RPC call silently sinks a well-staked peer below a
-    // zero-stake one. Resolve the failure at the lookup layer (#1470).
+    // Uniformly a no-op today: every construction site passes `0` because
+    // on-chain integration is deferred (ADR 001 "Contract Interface: Node
+    // Registry" / ADR 019 for the capacity-bond interface that will populate
+    // it).
     let max_stake = pool
         .iter()
-        .filter_map(|i| group.get(*i).and_then(|r| r.candidate.stake))
+        .filter_map(|i| group.get(*i).map(|r| r.candidate.stake))
         .max();
     if let Some(top) = max_stake {
-        pool.retain(|i| group.get(*i).and_then(|r| r.candidate.stake) == Some(top));
+        pool.retain(|i| group.get(*i).map(|r| r.candidate.stake) == Some(top));
     }
 
     // Tier 3: random tie-break. Uniformly pick from the remaining pool.
@@ -697,7 +693,7 @@ mod tests {
             rtt_ms: rtt,
             reputation: rep,
             region: "US".to_string(),
-            stake: None,
+            stake: 0,
         }
     }
 
@@ -706,7 +702,7 @@ mod tests {
         c
     }
 
-    fn with_stake(mut c: Candidate, stake: Option<u64>) -> Candidate {
+    fn with_stake(mut c: Candidate, stake: u64) -> Candidate {
         c.stake = stake;
         c
     }
@@ -714,75 +710,36 @@ mod tests {
     #[test]
     fn higher_stake_wins_when_geo_tied() {
         // Same score, same region. Higher stake wins at tier 2.
-        let small_stake = with_stake(
-            with_region(make_candidate(1, 100, 10, 1.0), "US"),
-            Some(1_000),
-        );
-        let big_stake = with_stake(
-            with_region(make_candidate(2, 100, 10, 1.0), "US"),
-            Some(10_000),
-        );
+        let small_stake = with_stake(with_region(make_candidate(1, 100, 10, 1.0), "US"), 1_000);
+        let big_stake = with_stake(with_region(make_candidate(2, 100, 10, 1.0), "US"), 10_000);
         let out = rank_candidates(vec![small_stake, big_stake]);
         assert_eq!(out.first().map(|r| r.candidate.node_id[0]), Some(2));
     }
 
     #[test]
-    fn some_stake_beats_none_stake() {
-        let known = with_stake(
-            with_region(make_candidate(1, 100, 10, 1.0), "US"),
-            Some(1_000),
-        );
-        let unknown = with_stake(with_region(make_candidate(2, 100, 10, 1.0), "US"), None);
-        let out = rank_candidates(vec![unknown, known]);
-        assert_eq!(out.first().map(|r| r.candidate.node_id[0]), Some(1));
-    }
-
-    #[test]
-    fn some_zero_stake_beats_none_stake() {
-        // Zero-stake operators are still "known" — `Some(0)` should beat `None`
-        // (treated as "not yet looked up") at tier 2. `max_stake` returns
-        // `Some(0)` for the pool, then retain keeps only `stake == Some(0)`,
-        // which drops the `None` entry.
-        let known_zero = with_stake(with_region(make_candidate(1, 100, 10, 1.0), "US"), Some(0));
-        let unknown = with_stake(with_region(make_candidate(2, 100, 10, 1.0), "US"), None);
-        let out = rank_candidates(vec![unknown, known_zero]);
-        assert_eq!(out.first().map(|r| r.candidate.node_id[0]), Some(1));
-    }
-
-    #[test]
-    fn three_way_zero_stake_falls_through_to_random_tier() {
-        // Two `Some(0)` candidates plus one `None`: tier 2 retains both
-        // `Some(0)` entries (dropping `None`), then tier 3 picks randomly
-        // between the two survivors. Across enough seeds we should see both
-        // survivors win first — confirms tier 2 doesn't accidentally
-        // short-circuit on a single Some(0) winner.
-        let a = with_stake(with_region(make_candidate(1, 100, 10, 1.0), "US"), Some(0));
-        let b = with_stake(with_region(make_candidate(2, 100, 10, 1.0), "US"), Some(0));
-        let unknown = with_stake(with_region(make_candidate(3, 100, 10, 1.0), "US"), None);
-        let mut first_was_a = false;
-        let mut first_was_b = false;
+    fn equal_stake_falls_through_to_random_tier() {
+        // Three candidates on the same stake: tier 2 retains all of them (a
+        // `max` that everyone matches must not collapse the pool), then tier 3
+        // picks randomly. Across enough seeds every candidate should win first
+        // — confirms tier 2 doesn't short-circuit on the first max it finds.
+        let a = with_stake(with_region(make_candidate(1, 100, 10, 1.0), "US"), 0);
+        let b = with_stake(with_region(make_candidate(2, 100, 10, 1.0), "US"), 0);
+        let c = with_stake(with_region(make_candidate(3, 100, 10, 1.0), "US"), 0);
+        let mut winners = std::collections::HashSet::new();
         for seed in 0u64..32 {
             let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-            let out =
-                rank_candidates_with_rng(vec![a.clone(), b.clone(), unknown.clone()], &mut rng);
-            // The unknown (None stake) must never win first — tier 2 drops it.
-            assert_ne!(
-                out.first().map(|r| r.candidate.node_id[0]),
-                Some(3),
-                "seed {seed}: None-stake candidate should never beat Some(0)"
-            );
-            match out.first().map(|r| r.candidate.node_id[0]) {
-                Some(1) => first_was_a = true,
-                Some(2) => first_was_b = true,
-                _ => {}
+            let out = rank_candidates_with_rng(vec![a.clone(), b.clone(), c.clone()], &mut rng);
+            if let Some(first) = out.first().map(|r| r.candidate.node_id[0]) {
+                winners.insert(first);
             }
-            if first_was_a && first_was_b {
+            if winners.len() == 3 {
                 break;
             }
         }
-        assert!(
-            first_was_a && first_was_b,
-            "expected both Some(0) candidates to win across 32 seeds"
+        assert_eq!(
+            winners.len(),
+            3,
+            "expected all three equal-stake candidates to win across 32 seeds, saw {winners:?}"
         );
     }
 
@@ -800,14 +757,8 @@ mod tests {
         // group", not "prefer any specific region per se" — a future tweak
         // that biased the first pick toward, say, the alphabetically-first
         // region would change this outcome.
-        let us_rich = with_stake(
-            with_region(make_candidate(1, 100, 10, 1.0), "US"),
-            Some(10_000),
-        );
-        let de_poor = with_stake(
-            with_region(make_candidate(2, 100, 10, 1.0), "DE"),
-            Some(1_000),
-        );
+        let us_rich = with_stake(with_region(make_candidate(1, 100, 10, 1.0), "US"), 10_000);
+        let de_poor = with_stake(with_region(make_candidate(2, 100, 10, 1.0), "DE"), 1_000);
         let out = rank_candidates(vec![us_rich, de_poor]);
         assert_eq!(out.first().map(|r| r.candidate.node_id[0]), Some(1));
     }
@@ -843,14 +794,8 @@ mod tests {
     fn within_1_percent_counts_as_tied() {
         // score_a = 1000, score_b = 1005 → within 0.5%, should tie-break.
         // Tier 1 (geo) is neutral (same region); tier 2 (stake) decides.
-        let high_score = with_stake(
-            with_region(make_candidate(1, 100, 10, 1.0), "US"),
-            Some(1_000),
-        ); // score 1000
-        let low_score = with_stake(
-            with_region(make_candidate(2, 1005, 1, 1.0), "US"),
-            Some(10_000),
-        ); // score 1005
+        let high_score = with_stake(with_region(make_candidate(1, 100, 10, 1.0), "US"), 1_000); // score 1000
+        let low_score = with_stake(with_region(make_candidate(2, 1005, 1, 1.0), "US"), 10_000); // score 1005
         let out = rank_candidates(vec![high_score, low_score]);
         // Tied → higher-stake (id 2) wins despite higher raw score.
         assert_eq!(out.first().map(|r| r.candidate.node_id[0]), Some(2));
@@ -860,14 +805,8 @@ mod tests {
     fn outside_1_percent_does_not_tie_break() {
         // 1000 vs 1020 → 2% gap, no tie-break. Higher stake on the dearer
         // candidate can't pull it ahead.
-        let cheap = with_stake(
-            with_region(make_candidate(1, 100, 10, 1.0), "US"),
-            Some(1_000),
-        ); // score 1000
-        let dear = with_stake(
-            with_region(make_candidate(2, 1020, 1, 1.0), "US"),
-            Some(10_000),
-        ); // score 1020
+        let cheap = with_stake(with_region(make_candidate(1, 100, 10, 1.0), "US"), 1_000); // score 1000
+        let dear = with_stake(with_region(make_candidate(2, 1020, 1, 1.0), "US"), 10_000); // score 1020
         let out = rank_candidates(vec![cheap, dear]);
         assert_eq!(out.first().map(|r| r.candidate.node_id[0]), Some(1));
     }
@@ -878,14 +817,8 @@ mod tests {
         // so 1.0% is *inclusive* (still a tie). Pins the boundary against a
         // future change to `>=` that would silently exclude exact-1% pairs.
         // Stake on the dearer candidate proves the tie-break ran.
-        let high_score = with_stake(
-            with_region(make_candidate(1, 100, 10, 1.0), "US"),
-            Some(1_000),
-        ); // score 1000
-        let low_score = with_stake(
-            with_region(make_candidate(2, 1010, 1, 1.0), "US"),
-            Some(10_000),
-        ); // score 1010
+        let high_score = with_stake(with_region(make_candidate(1, 100, 10, 1.0), "US"), 1_000); // score 1000
+        let low_score = with_stake(with_region(make_candidate(2, 1010, 1, 1.0), "US"), 10_000); // score 1010
         let out = rank_candidates(vec![high_score, low_score]);
         assert_eq!(out.first().map(|r| r.candidate.node_id[0]), Some(2));
     }
@@ -896,14 +829,8 @@ mod tests {
         // single tie group so the stake tier picks between them. Without the
         // zero-pivot fix, each becomes its own singleton group and stake is
         // skipped entirely.
-        let zero_low_stake = with_stake(
-            with_region(make_candidate(1, 0, 10, 1.0), "US"),
-            Some(1_000),
-        ); // score 0, low stake
-        let zero_high_stake = with_stake(
-            with_region(make_candidate(2, 0, 10, 1.0), "US"),
-            Some(10_000),
-        ); // score 0, high stake
+        let zero_low_stake = with_stake(with_region(make_candidate(1, 0, 10, 1.0), "US"), 1_000); // score 0, low stake
+        let zero_high_stake = with_stake(with_region(make_candidate(2, 0, 10, 1.0), "US"), 10_000); // score 0, high stake
         let out = rank_candidates(vec![zero_low_stake, zero_high_stake]);
         // Tied at 0.0 → higher-stake (id 2) wins.
         assert_eq!(out.first().map(|r| r.candidate.node_id[0]), Some(2));

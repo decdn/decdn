@@ -205,6 +205,22 @@ pub fn write_validate_summary<W: std::io::Write>(
         0 => writeln!(w, "  gc_interval_sec:          disabled")?,
         n => writeln!(w, "  gc_interval_sec:          {n}")?,
     }
+    match resolved.cache.fs_rescan_interval_sec {
+        0 => writeln!(
+            w,
+            "  fs_rescan_interval_sec:   disabled (startup + reload only)"
+        )?,
+        n => writeln!(w, "  fs_rescan_interval_sec:   {n}")?,
+    }
+    if resolved.cache.prewarm {
+        writeln!(
+            w,
+            "  prewarm:                  enabled ({} pinned hashes, remote origins only)",
+            resolved.cache.pinned_hashes.len()
+        )?;
+    } else {
+        writeln!(w, "  prewarm:                  disabled")?;
+    }
     writeln!(
         w,
         "  eviction:                 high_water_pct={}, target_pct={}, per_sweep_budget={}, tick_secs={}",
@@ -484,6 +500,8 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # above — uncomment this header along with them or TOML will nest them wrongly.
 # [cache]
 # gc_interval_sec = 300                    # iroh-blobs GC sweep cadence; 0 disables (#518). NOTE: the eviction driver only drops GC protection, so with 0 it can never reclaim disk and cache_size_mb is unenforceable (#1173)
+# fs_rescan_interval_sec = 60              # re-walk the fs origin + re-check pins into the origin-held index, so a file dropped into the origin becomes probe-answerable and DHT-announced within one interval (#1130); 0 disables the timer (startup and `decdn node reload` still rescan)
+# prewarm = false                          # fetch pinned_hashes from a REMOTE (http/s3) origin into the cache at startup and on reload, before any client asks (#1130). Costs origin egress up front, which is why it is opt-in. fs origins ignore it — their content is already local and is served via the origin-held index. Pinned blobs are LRU-exempt, so keep the pinned set under cache_size_mb or the eviction driver can never reach its target
 # eviction_high_water_pct = 90             # LRU driver evicts above this % of cache_size_mb (#1173); bounds [60,95]
 # eviction_target_pct = 80                 # LRU driver evicts down to this % (#1173); bounds [40,90], must be <= high_water-5
 # eviction_per_sweep_budget = 16           # max LRU victims per tick before yielding (#1173); bounds [1,256]

@@ -384,6 +384,11 @@ struct PinnedHashesSection {
     /// SIGHUP select loop runs.
     engine: std::sync::Mutex<Option<decdn_cache::CacheEngine>>,
     buf: std::sync::Mutex<Option<decdn_cache::PinnedHashes>>,
+    /// Whether remote-origin prewarm was enabled at boot (#1130). Fixed for the
+    /// process lifetime: `cache.prewarm` is restart-required, so the boot value
+    /// is authoritative and a reload cannot turn prewarm on or off — only warm
+    /// the pins a reload adds, when it was already on.
+    prewarm: bool,
 }
 
 impl ReloadableSection for PinnedHashesSection {
@@ -428,7 +433,28 @@ impl ReloadableSection for PinnedHashesSection {
                 // than only at the next periodic rescan (#1130). Detached so we
                 // honor reload()'s no-await invariant; rescan is idempotent.
                 let engine = engine.clone();
-                tokio::spawn(async move { engine.rescan_origins().await });
+                let prewarm = self.prewarm;
+                tokio::spawn(async move {
+                    engine.rescan_origins().await;
+                    // Then warm anything this reload pinned that isn't resident
+                    // (#1130) — this is what makes a pin added at runtime
+                    // effective without a restart. Passing the whole pin set
+                    // rather than just the delta is deliberate and no more
+                    // expensive in origin egress: `prewarm` no-ops on a hash
+                    // already in the store, so the extra work is one local
+                    // presence check per pin, and in exchange a pin that was
+                    // warmed earlier but has since been lost gets repaired.
+                    if prewarm {
+                        let report = engine.prewarm_pinned().await;
+                        tracing::info!(
+                            fetched = report.fetched,
+                            already_present = report.already_present,
+                            failed = report.failed,
+                            bytes = report.bytes,
+                            "cache.prewarm: warmed the reloaded pin set (#1130)"
+                        );
+                    }
+                });
                 diff
             })
         } else {
@@ -690,6 +716,7 @@ impl RuntimeReloadState {
         let pinned = Arc::new(PinnedHashesSection {
             engine: std::sync::Mutex::new(None),
             buf: std::sync::Mutex::new(None),
+            prewarm: super::prewarm_enabled_for(&initial.cache),
         });
         let security = Arc::new(SecuritySection {
             limiter: std::sync::Mutex::new(None),
@@ -843,6 +870,7 @@ impl RuntimeReloadState {
                 user_agent: decdn_cache::DEFAULT_USER_AGENT.to_string(),
                 gc_interval_sec: 0,
                 fs_rescan_interval_sec: 0,
+                prewarm: false,
                 eviction_high_water_pct: 90,
                 eviction_target_pct: 80,
                 eviction_per_sweep_budget: 16,
@@ -1185,6 +1213,7 @@ const fn cache_has_restart_required_field(c: &decdn_common::config::types::Cache
         user_agent,
         gc_interval_sec,
         fs_rescan_interval_sec,
+        prewarm,
         eviction_high_water_pct,
         eviction_target_pct,
         eviction_per_sweep_budget,
@@ -1213,6 +1242,10 @@ const fn cache_has_restart_required_field(c: &decdn_common::config::types::Cache
         // The rescan *cadence* needs a restart to rebuild the interval timer;
         // a reload still re-runs one rescan to pick up newly-added files.
         || fs_rescan_interval_sec.is_some()
+        // Whether prewarm is ON needs a restart (the startup warm has already
+        // run); a reload still warms whatever pins it *adds*, when prewarm was
+        // already enabled at boot.
+        || prewarm.is_some()
         || eviction_high_water_pct.is_some()
         || eviction_target_pct.is_some()
         || eviction_per_sweep_budget.is_some()
@@ -1352,6 +1385,7 @@ mod tests {
                 user_agent: decdn_cache::DEFAULT_USER_AGENT.to_string(),
                 gc_interval_sec: 0,
                 fs_rescan_interval_sec: 0,
+                prewarm: false,
                 eviction_high_water_pct: 90,
                 eviction_target_pct: 80,
                 eviction_per_sweep_budget: 16,

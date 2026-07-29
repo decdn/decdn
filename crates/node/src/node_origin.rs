@@ -1175,7 +1175,10 @@ async fn probe_candidate(
         // Drives the geo-diversity tie-break tier (selection.rs) and the
         // latency-vs-claim penalty above.
         region,
-        stake: None,
+        // No on-chain stake lookup is wired yet (#1470 / ADR 019): `0` is the
+        // known-no-bond value, and a future lookup must resolve a failed read
+        // here rather than pass an "unknown" through — see `Candidate::stake`.
+        stake: 0,
     })
 }
 
@@ -1251,7 +1254,8 @@ async fn cached_candidates(deps: &NodeOriginDeps, target: DhtHash) -> Option<Vec
             rtt_ms: provider.rtt_ms,
             reputation: peer_reputation(deps, pk),
             region,
-            stake: None,
+            // See `probe_candidate` above: `0` is known-no-bond, not "unknown".
+            stake: 0,
         });
     }
     if candidates.is_empty() {

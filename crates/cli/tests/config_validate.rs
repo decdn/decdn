@@ -362,6 +362,7 @@ fn sample_resolved(overrides: impl FnOnce(&mut ResolvedConfig)) -> ResolvedConfi
             user_agent: decdn_cache::DEFAULT_USER_AGENT.to_string(),
             gc_interval_sec: 300,
             fs_rescan_interval_sec: 60,
+            prewarm: false,
             eviction_high_water_pct: 90,
             eviction_target_pct: 80,
             eviction_per_sweep_budget: 16,
@@ -447,6 +448,43 @@ fn summary_reports_the_pull_through_deadlines_when_enabled() -> anyhow::Result<(
         out.contains("stall_timeout_sec=15"),
         "the summary must report the resolved inactivity budget — it is the primary health \
          signal, and it is a term of the derived outer deadline: {out}"
+    );
+    Ok(())
+}
+
+/// `fs_rescan_interval_sec` (#1508) and `prewarm` (#1130) both control how much
+/// origin work a node does on its own initiative, and both were invisible in
+/// `decdn config validate` — the one place an operator checks what a config
+/// actually resolved to. A knob that costs egress must not be silently on or off.
+#[test]
+fn summary_reports_the_origin_rescan_and_prewarm_knobs() -> anyhow::Result<()> {
+    let out = render(
+        None,
+        &sample_resolved(|c| c.cache.fs_rescan_interval_sec = 45),
+    )?;
+    anyhow::ensure!(
+        out.contains("fs_rescan_interval_sec:   45"),
+        "the summary must report the resolved rescan cadence: {out}"
+    );
+    anyhow::ensure!(
+        out.contains("prewarm:                  disabled"),
+        "prewarm off must be stated, not merely omitted: {out}"
+    );
+
+    let out = render(
+        None,
+        &sample_resolved(|c| {
+            c.cache.fs_rescan_interval_sec = 0;
+            c.cache.prewarm = true;
+        }),
+    )?;
+    anyhow::ensure!(
+        out.contains("fs_rescan_interval_sec:   disabled"),
+        "a zero cadence must render as disabled, not as the bare number 0: {out}"
+    );
+    anyhow::ensure!(
+        out.contains("prewarm:                  enabled"),
+        "the summary must report prewarm when it is on: {out}"
     );
     Ok(())
 }

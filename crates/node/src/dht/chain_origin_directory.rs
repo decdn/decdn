@@ -35,13 +35,13 @@
 //!
 //! # Snapshot strategy
 //!
-//! `AssignmentActivated` names every namespace that has ever been given an
-//! origin set, so the set of namespaces is discovered by replaying
-//! `AssignmentActivated` logs from a configured start block (the
-//! `OriginAssignment` deployment block; windowed to respect provider
-//! `eth_getLogs` range caps). Each discovered namespace's `namespace → operators`
-//! set is then snapshotted with a direct `getOrigins` point read (authoritative
-//! current membership; a namespace whose set is now empty simply caches empty).
+//! The namespace set is **enumerated, not replayed** (#1497/#1504):
+//! `assignedNamespaceCount()` / `assignedNamespaces(offset, limit)` are paged at
+//! one pinned block height, so every boot — warm or cold — reads the current set
+//! outright with no configured start block and no `eth_getLogs` window. Each
+//! enumerated namespace's `namespace → operators` set is then snapshotted with a
+//! direct `getOrigins` point read (authoritative current membership; a namespace
+//! whose set is now empty simply caches empty).
 //!
 //! The live path keeps that authoritative-read discipline: each
 //! `OriginAssignment` event is a **signal to re-read `getOrigins` for the
@@ -58,15 +58,14 @@
 //!
 //! The live tail runs on the shared `resumable_watcher` `eth_getLogs` poller
 //! (#1092/#1106 — no `eth_newFilter`): one filter over the `OriginAssignment`
-//! address, demuxed by `topic0`. Backfill and the live tail are one cursor loop
-//! whose scan cursor is **persisted** (`CheckpointKey::Origin`, #1108), so a
-//! restart resumes the `AssignmentActivated` replay floor rather than rescanning
-//! from the deploy block. A namespace first activated below the resumed cursor is
-//! re-surfaced by the live tail's next event for it; membership is always
-//! authoritative via `getOrigins`, so no revoke is ever missed. A poll-tick RPC
-//! failure backs off (1s → 60s) and re-scans the window on the next tick,
-//! re-applying any event lost in the gap — surfaced by
-//! `..._watcher_restarts_total` / `..._down_seconds`.
+//! address, demuxed by `topic0`. Its cursor is **seeded at the bootstrap
+//! enumeration block and persists nothing** (`CursorStart::Seeded { persist:
+//! None }`, see `cursor_start`) — the enumeration covers the whole downtime
+//! gap on every boot, so there is no replay floor to resume and no reorg rewind
+//! to protect. Events are therefore a signal for *when* to re-read, never a
+//! source of history. A poll-tick RPC failure backs off (1s → 60s) and re-scans
+//! the window on the next tick, re-applying any event lost in the gap —
+//! surfaced by `..._watcher_restarts_total` / `..._down_seconds`.
 //!
 //! A narrower drift source: a per-event `getOrigins` or `nodeIdOf` RPC failure
 //! is surfaced by `decdn_origin_directory_watcher_resolve_failures_total`
@@ -75,8 +74,8 @@
 //! namespace is recorded and its `getOrigins` re-read retried at the end of every
 //! poll tick until it succeeds (the tick fails → backs off while any retry is
 //! outstanding), so the hole heals without waiting for another same-namespace
-//! event — necessary because the persisted cursor may already have advanced past
-//! the triggering log. On a **removal** event (revoke / prune) a failed re-read
+//! event — necessary because the scan cursor may already have advanced past the
+//! triggering log. On a **removal** event (revoke / prune) a failed re-read
 //! falls back to a precise delta removal from the event payload, so a revoke is
 //! never weaker than a direct delete even when `getOrigins` is unavailable (and
 //! the namespace is still queued for the retry re-read).
@@ -252,11 +251,9 @@ impl ChainOriginDirectory {
     ///
     /// The watcher owns its own shutdown token (minted by `resumable_watcher::
     /// spawn`); the runtime drives graceful stop via the returned directory's
-    /// `watcher()` handle. That path matters here: the watcher
-    /// persists its scan cursor through the (debounced) `checkpoint_store`, and
-    /// only `shutdown()` (not the `AbortOnDrop` backstop) flushes the buffered
-    /// tail (`CheckpointKey::Origin`) to disk — an abort-only teardown would
-    /// silently drop up to a debounce window of progress on every clean stop.
+    /// `watcher()` handle. Nothing is flushed on that path — this watcher
+    /// persists no cursor (see `cursor_start`) — but the ordered stop still
+    /// matters so the task is not left polling through teardown.
     #[allow(clippy::too_many_arguments)]
     pub async fn bootstrap<P>(
         provider: P,
@@ -291,9 +288,9 @@ impl ChainOriginDirectory {
         metrics.origin_directory_operator_count(authorized_operator_count(&cache));
 
         let cache = Arc::new(RwLock::new(cache));
-        // The live tail flows forward from the bootstrap snapshot block (bootstrap
-        // already covered `[replay_from, snapshot_block]`), persisting the cursor
-        // forward from there.
+        // The live tail flows forward from the bootstrap snapshot block — the
+        // enumeration is authoritative as of that height, so everything below it
+        // is already covered and nothing needs persisting.
         let sink = OriginSink {
             contracts,
             cache: Arc::clone(&cache),
@@ -509,8 +506,8 @@ const fn cursor_start(at: u64) -> CursorStart {
 
 impl ChainOriginDirectory {
     /// The owned watcher handle, cloned so the runtime can drive graceful
-    /// shutdown in its deliberate order (cancel, then flush the `Origin`
-    /// checkpoint) — see `runtime`.
+    /// shutdown — see `runtime`. There is no checkpoint to flush behind it
+    /// (see `cursor_start`); the handle exists to stop the poll loop.
     pub(crate) fn watcher(&self) -> Arc<WatcherHandle> {
         self.proj.watcher()
     }

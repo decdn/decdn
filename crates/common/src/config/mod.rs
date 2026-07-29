@@ -161,6 +161,14 @@ pub const DEFAULT_GC_INTERVAL_SEC: u64 = 300;
 /// the periodic rescan (startup + reload still run one).
 pub const DEFAULT_FS_RESCAN_INTERVAL_SEC: u64 = 60;
 
+/// Default for `cache.prewarm` (#1130): **off**. Prewarm speculatively pulls the
+/// pin set from a remote origin, and those bytes are billed egress whether or not
+/// anyone ever requests them — a cost no operator should incur by upgrading. An
+/// `fs` origin ignores the flag either way (its content is already local), so
+/// defaulting on would silently add a bill for exactly the remote-origin
+/// operators it does affect.
+pub const DEFAULT_PREWARM: bool = false;
+
 /// Default LRU eviction driver high-water percent of `cache.cache_size_mb`
 /// (#1173, appendix-blob-cache-eviction.md § Trigger and target). Above this
 /// fraction the driver actively evicts.
@@ -1605,6 +1613,8 @@ fn resolve_cache_into(
         .and_then(|c| c.fs_rescan_interval_sec)
         .unwrap_or(DEFAULT_FS_RESCAN_INTERVAL_SEC);
 
+    let prewarm = file.and_then(|c| c.prewarm).unwrap_or(DEFAULT_PREWARM);
+
     // LRU eviction driver knobs (#1173, appendix-blob-cache-eviction.md). Each
     // is range-checked against its structural bounds; the target/high-water
     // hysteresis gap is a cross-field invariant enforced after both resolve.
@@ -1780,6 +1790,7 @@ fn resolve_cache_into(
         user_agent,
         gc_interval_sec,
         fs_rescan_interval_sec,
+        prewarm,
         eviction_high_water_pct,
         eviction_target_pct,
         eviction_per_sweep_budget,
@@ -5597,6 +5608,27 @@ swap_pool_address = \"0xPool\"
             "expected 30, got: {}",
             resolved.fs_rescan_interval_sec
         );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_cache_prewarm_defaults_off_and_reads_the_file() -> anyhow::Result<()> {
+        // Absent => DEFAULT_PREWARM (false) — prewarm costs origin egress, so it
+        // must never turn itself on across an upgrade (#1130).
+        let cli = cache_cli(None, None);
+        let resolved = resolve_cache(&cli, None, Path::new("/tmp"))?;
+        anyhow::ensure!(
+            resolved.prewarm == DEFAULT_PREWARM && !resolved.prewarm,
+            "expected prewarm off by default, got: {}",
+            resolved.prewarm
+        );
+
+        let file = types::CacheConfig {
+            prewarm: Some(true),
+            ..types::CacheConfig::default()
+        };
+        let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
+        anyhow::ensure!(resolved.prewarm, "expected prewarm enabled from the file");
         Ok(())
     }
 
