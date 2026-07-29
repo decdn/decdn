@@ -133,6 +133,15 @@ pub struct BundlePullArgs {
     #[arg(long)]
     pub json: bool,
 
+    /// Namespace the whole bundle is published under (ADR 002 § Retrieval by
+    /// namespace). Applies to EVERY fetch in the run — the manifest blob, each
+    /// `DECDNMAN` chunk, and each entry — so a serving node routes any cache-miss
+    /// origin pull to that namespace's DAO-authorized origins. The manifest format
+    /// carries no per-entry namespace, so this is necessarily bundle-level. Absent
+    /// => no namespace: served best-effort from cache / DHT only.
+    #[arg(long, value_name = "ID", value_parser = super::fetch::parse_fetch_namespace_id)]
+    pub namespace: Option<u64>,
+
     #[command(flatten)]
     pub common: ClientFetchArgs,
 }

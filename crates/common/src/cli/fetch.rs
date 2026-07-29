@@ -405,9 +405,10 @@ pub struct FetchArgs {
     pub common: ClientFetchArgs,
 }
 
-/// Parse a `--namespace` id for `decdn fetch`, rejecting the reserved `0`
-/// (namespace 0 is "no namespace"; omit the flag for best-effort retrieval).
-fn parse_fetch_namespace_id(s: &str) -> Result<u64, String> {
+/// Parse a `--namespace` id (rejecting the reserved `0` — namespace 0 is "no
+/// namespace"; omit the flag for best-effort retrieval). Shared by `decdn fetch`
+/// and `decdn bundle pull`.
+pub(crate) fn parse_fetch_namespace_id(s: &str) -> Result<u64, String> {
     let id: u64 = s
         .parse()
         .map_err(|_| format!("invalid namespace id: {s}"))?;

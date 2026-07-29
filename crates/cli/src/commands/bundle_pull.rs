@@ -397,6 +397,14 @@ pub async fn bundle_pull(args: &BundlePullArgs, config_path: Option<&Path>) -> a
     let voucher_dom = voucher_domain(chain.chain_id, chain.payment_channel);
     let slash_dom = slash_judge_domain(chain.chain_id, chain.slash_judge);
 
+    // `--namespace <id>` → big-endian `uint256`; absent => `NO_NAMESPACE`
+    // (best-effort cache/DHT). Same conversion as `decdn fetch`.
+    let namespace_id = args
+        .namespace
+        .map_or(decdn_protocol::client::NO_NAMESPACE, |n| {
+            alloy::primitives::U256::from(n).to_be_bytes()
+        });
+
     let ctx = PullCtx {
         endpoint: &endpoint,
         store: &store,
@@ -411,6 +419,7 @@ pub async fn bundle_pull(args: &BundlePullArgs, config_path: Option<&Path>) -> a
         explicit,
         candidates,
         common,
+        namespace_id,
         locks: RefCell::new(HashMap::new()),
         open_lock: tokio::sync::Mutex::new(()),
     };
@@ -465,6 +474,10 @@ struct PullCtx<'a, P: Provider + Clone> {
     explicit: Option<FetchTarget>,
     candidates: Option<Vec<NodeCandidate>>,
     common: &'a ClientFetchArgs,
+    /// Bundle-level namespace id (ADR 002) applied to every paid pull in the run —
+    /// `--namespace <id>` as a big-endian `uint256`; `NO_NAMESPACE` when the flag
+    /// was omitted.
+    namespace_id: [u8; 32],
     /// Per-provider locks: serialize fetches sharing one channel's voucher
     /// nonce. Lazily created; held only across one entry's fetch.
     locks: RefCell<HashMap<Address, Rc<tokio::sync::Mutex<()>>>>,
@@ -602,9 +615,10 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             provider,
             self.store,
             hash,
-            // Bundle chunk-blobs are fetched by hash; a `--namespace` for bundle
-            // pull is a separate future concern, so pass NO_NAMESPACE for now.
-            decdn_protocol::client::NO_NAMESPACE,
+            // Bundle-level `--namespace` (ADR 002): routes any cache-miss origin
+            // pull to that namespace's authorized origins. Applies uniformly — the
+            // manifest blob, `DECDNMAN` chunks, and entries all funnel through here.
+            self.namespace_id,
             // Same shape as `fetch` (#1134): a node that accepts the connection and never
             // answers is as dead as one that stops mid-stream, so the same budget bounds
             // both stages, under a cap that must outlast them both.
@@ -1487,5 +1501,30 @@ mod tests {
             EntryOutcome::Skipped,
         ];
         assert!(report(&outcomes, Path::new("/out"), false).is_ok());
+    }
+
+    /// `--namespace` on bundle pull is bundle-level: one id for the whole run. It
+    /// rejects the reserved `0` (the `NO_NAMESPACE` sentinel — omit the flag instead),
+    /// reusing the same parser as `decdn fetch`.
+    #[test]
+    fn bundle_pull_namespace_flag_parses_and_rejects_zero() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct T {
+            #[command(flatten)]
+            a: decdn_common::cli::BundlePullArgs,
+        }
+        let ok = T::try_parse_from(["t", "-o", "out", "--hash", "b3:aa", "--namespace", "7"])
+            .expect("valid namespace parses");
+        assert_eq!(ok.a.namespace, Some(7));
+
+        assert!(
+            T::try_parse_from(["t", "-o", "out", "--hash", "b3:aa", "--namespace", "0"]).is_err(),
+            "namespace 0 is the reserved sentinel and must be rejected"
+        );
+
+        let none = T::try_parse_from(["t", "-o", "out", "--hash", "b3:aa"])
+            .expect("namespace is optional");
+        assert_eq!(none.a.namespace, None, "absent flag stays None");
     }
 }
