@@ -64,6 +64,28 @@ since project inception and will roll into the first tagged release.
     `stake_lane_reserved` now record an advertised-without-hold probe rather
     than a suppressed answer. Alert text and the runbook are updated
     accordingly; review any custom rules built on them.
+- **`PaymentChannel.minDeposit` removed (#1515).** **ABI-breaking, not
+  config-breaking.** The network minimum-deposit parameter is gone: the
+  `minDeposit()` view and the `setMinDeposit(uint256)` governance setter no
+  longer exist (an integrator calling either now reverts on a missing selector),
+  the `MinDepositUpdated` event is gone (a subscriber filtering its topic sees
+  zero events, silently), and the `DepositBelowMinimum` error selector is
+  retired. `openChannel` now accepts **any non-zero deposit** and reverts
+  `ZeroAmount` on zero — both before the transfer and on the received balance
+  delta, so a fee-on-transfer token cannot shave a deposit to nothing. Because
+  the parameter no longer exists, any pending or scripted `setMinDeposit`
+  governance proposal is un-executable. `PaymentChannel` has a constructor and no
+  proxy, so this requires a **fresh deployment**; existing testnet instances must
+  be redeployed. The floor bounded nothing that is not already bounded — service
+  by the seller-side per-voucher ceiling (see the #1516 entry under Fixed),
+  channel spam by gas — and the client-side 10 USDC recommendation of
+  [ADR 003 § Deposit Economics](adr/003-payments.md#deposit-economics) is
+  unchanged. `blockchain.buyer_deposit_micro_usdc` keeps its name, its 10 USDC
+  default, and its `> 0` validation; buyer paths simply no longer read the
+  contract to clamp up to a floor. Unrelated to the deposit: the internal
+  `MIN_DEPOSIT_FLOOR` constant, which only ever bounded the delivery-*rate*
+  floor, is renamed `MIN_RATE_FLOOR` — same value, same two call sites, no
+  behaviour change.
 - **Log-replay start-block config knobs removed.** **Config-breaking:** the
   three `[blockchain]` scan-floor fields — `origin_directory_from_block`,
   `slash_judge_from_block`, and `content_blacklist_from_block` — are removed.
