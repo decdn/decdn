@@ -165,6 +165,14 @@ impl From<&decdn_common::config::ResolvedProbe> for RateLimitConfig {
 
 /// Layer that triggered a rejection. Used as a log/trace field and to pick
 /// the right per-layer Counter via [`RateLimitMetricsSink::rejected`].
+///
+/// A **sibling-counter** split, per the convention settled in #1475 — one
+/// unlabeled counter per layer (`decdn_probe_rate_limit_rejected_{per_peer,
+/// per_ip,global}_total` on the probe path, and the matching
+/// `decdn_dht_rate_limit_rejected_*` trio on the DHT path — this enum is shared
+/// by both), not a `layer` label. The labeled
+/// `decdn_probe_hold_unavailable_total` is the one deliberate reason-split
+/// exception.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RejectLayer {
     /// Per-peer (`NodeId`) bucket exhausted.

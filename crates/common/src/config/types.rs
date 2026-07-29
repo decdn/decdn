@@ -411,6 +411,26 @@ pub struct CacheConfig {
     /// it). Shorter intervals pick up new files faster at the cost of more
     /// directory-walk + `size()` I/O per minute.
     pub fs_rescan_interval_sec: Option<u64>,
+    /// Fetch [`Self::pinned_hashes`] from a **remote** origin into the cache at
+    /// startup and on reload, before any client asks for them (#1130). Absent =>
+    /// [`crate::config::DEFAULT_PREWARM`] (`false`). Restart-required.
+    ///
+    /// Opt-in because it costs origin egress up front: an `http`/`s3` origin
+    /// bills for bytes the node speculatively pulls. A chain of **only**
+    /// `Filesystem` origins ignores this — that content is already local and is
+    /// advertised through the origin-held index, so importing it would duplicate
+    /// the bytes on the same disk. A *mixed* chain does warm, and pins served by
+    /// the fs entry are imported (duplicated) as part of that; configure `fs`
+    /// alone if avoiding the second copy matters more than warming the pins only
+    /// the remote origin has.
+    ///
+    /// Prewarm covers the pin set specifically, because pinned content is
+    /// LRU-exempt and so is the only content guaranteed to still be resident
+    /// when a request eventually arrives. Note the corollary: a pinned set
+    /// larger than [`Self::cache_size_mb`] cannot be evicted down to the
+    /// high-water mark, so the node warns and keeps serving rather than silently
+    /// truncating the operator's pin set.
+    pub prewarm: Option<bool>,
     /// LRU eviction driver: percent of [`Self::cache_size_mb`] above which
     /// the driver actively evicts (#1173, appendix-blob-cache-eviction.md
     /// § Trigger and target). Absent =>

@@ -27,6 +27,13 @@
 /// `decdn-node`'s `metrics` module (`dispatch_rejected_{global,per_source}`,
 /// `gossip_messages_rejected_clock_skew`). Neither is wired today.
 ///
+/// That convention is settled, not provisional (#1475): sibling counters are the
+/// default for a closed reason split, and `decdn_probe_hold_unavailable_total`
+/// is the one deliberate labeled *reason split* — earned because its values
+/// share one aggregate and one budget axis. It is not the only `Family` in
+/// `decdn-node`; `streams_active` is one too, as noted above. A new reason
+/// split here should follow the siblings.
+///
 /// The argument is kept because it is meaningful at the call site and is what
 /// such a breakdown would key on. Callers should not assume the resulting
 /// series distinguish topics — in practice they do not, and the

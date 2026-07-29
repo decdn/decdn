@@ -91,6 +91,14 @@ impl OwnedAnnounceGate {
 
 /// Every reason an incoming envelope can be rejected. Each variant's
 /// [`Self::label`] is stable and suitable as a Prometheus label value.
+///
+/// It is not currently *used* as one. Per the convention settled in #1475, the
+/// node aggregates every rejection into `decdn_gossip_announces_rejected_total`
+/// and breaks out only `clock_skew` — the one reason with its own operator
+/// remedy (fix NTP) — as the sibling
+/// `decdn_gossip_messages_rejected_clock_skew_total`. A new variant here needs
+/// no metric work unless it likewise earns a distinct remedy; the labels remain
+/// stable for logs and for any future breakdown.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum AnnounceReject {
     #[error("envelope postcard decode failed")]

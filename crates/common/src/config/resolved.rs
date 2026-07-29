@@ -236,6 +236,18 @@ pub struct ResolvedCache {
     /// one). Default [`crate::config::DEFAULT_FS_RESCAN_INTERVAL_SEC`] when the
     /// TOML section omits the field.
     pub fs_rescan_interval_sec: u64,
+    /// Prewarm [`Self::pinned_hashes`] from a remote (`http`/`s3`) origin at
+    /// startup and on reload (#1130). Default
+    /// [`crate::config::DEFAULT_PREWARM`] (`false`) when the TOML section omits
+    /// the field. An fs-**only** origin chain ignores it — see the `CacheConfig`
+    /// field doc for why, and for what a mixed chain does instead.
+    ///
+    /// **Do not read this field directly to decide whether prewarm runs.** It is
+    /// the operator's request, not the effective answer; an fs-only or empty
+    /// origin chain makes it inert. Use
+    /// [`crate::config::prewarm_enabled_for`], which is what the runtime and
+    /// `decdn config validate` both consult.
+    pub prewarm: bool,
     /// LRU eviction driver high-water percent of [`Self::cache_size_mb`]
     /// (#1173). Above this fraction the driver actively evicts. Validated to
     /// `[60, 95]`. Default [`crate::config::DEFAULT_EVICTION_HIGH_WATER_PCT`].

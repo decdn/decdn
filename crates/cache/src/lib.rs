@@ -22,8 +22,8 @@ pub use circuit_breaker::{
     Admission, BreakerState, Clock, ManualClock, OriginBreaker, OriginOutcome, SystemClock,
 };
 pub use engine::{
-    CacheEngine, CacheStats, EvictionCandidates, EvictionPreview, RangePullOutcome, TeeOpen,
-    TeeReservation, TeeSink,
+    CacheEngine, CacheStats, EvictionCandidates, EvictionPreview, PrewarmReport, RangePullOutcome,
+    TeeOpen, TeeReservation, TeeSink,
 };
 pub use error::{CacheError, CacheResult, OriginError, OriginPullError, SupportedEncoding};
 /// The blob-store hash. `decdn_cache::Hash` continues to mean

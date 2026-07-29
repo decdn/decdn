@@ -180,8 +180,10 @@ pub struct DecdnMetrics {
     /// breakdown is realized as this distinct counter rather than a label,
     /// matching the `dispatch_rejected_{global,per_source}` convention. That
     /// is a choice, not a backend limit — `iroh_metrics` does support labels
-    /// via `Family<L, M>`, which `probe_hold_unavailable` uses. Field has no
-    /// `_total`
+    /// via `Family<L, M>`, which [`Metrics::probe_hold_unavailable`] uses. #1475
+    /// settled that fork in favour of sibling counters; the labeled probe-hold
+    /// family is the documented exception, so **do not** "unify" this onto a
+    /// `reason` label. Field has no `_total`
     /// suffix because the `OpenMetrics` encoder appends it; operator-visible
     /// name: `decdn_gossip_messages_rejected_clock_skew_total`. Lets
     /// operators alert on NTP-drift-induced peer invisibility without it
@@ -238,10 +240,27 @@ pub struct DecdnMetrics {
     /// at zero rather than appearing only on first increment. Field has no
     /// `_total` suffix because the `OpenMetrics` encoder appends it.
     ///
-    /// This is the one labeled `Counter` in this group; the other
-    /// reason-style splits (`dispatch_rejected_*`,
-    /// `probe_rate_limit_rejected_*`, `channel_open_failures_*`) remain
-    /// sibling counters pending the decision tracked in #1475.
+    /// **This is the documented exception, not the convention** (#1475) — the
+    /// one labeled *reason split*, which is not the same as the crate's only
+    /// `Family` — `streams_active` is another. Every
+    /// other reason-style split in this crate — `dispatch_rejected_*`,
+    /// `probe_rate_limit_rejected_*`, `channel_open_failures_*`, and gossip's
+    /// `gossip_messages_rejected_clock_skew` — fans out to sibling unlabeled
+    /// counters, and that stays the default for a new split: sibling counters
+    /// need no `EncodeLabelSet` type, no pre-materialization to keep a series
+    /// exporting at zero, and no alert rewrite when a reason is added.
+    ///
+    /// The exception is earned because the three values share one *aggregate*
+    /// and one budget axis: an operator asks "are probe holds unavailable?"
+    /// first and drills into which value second — the shape a label serves and
+    /// sibling counters make awkward. They pointedly do NOT share an alert:
+    /// `DecdnProbeHoldViolations` filters to `reason="exhausted"` precisely
+    /// because [`ProbeHoldUnavailableReason::Disabled`] is an intentional
+    /// operator choice and alerting on it would be nonsensical, and
+    /// `StakeLaneReserved` has its own knob. Being able to express that filter
+    /// is itself part of what the label buys. A split whose values have
+    /// unrelated remedies *and* no meaningful aggregate gains nothing from a
+    /// label and should stay siblings.
     probe_hold_unavailable: Family<ProbeHoldUnavailableLabels, Counter>,
     /// `decdn_probe_hold_slots_used` (registry): current active
     /// probe-triggered eviction holds (distinct held blobs), ADR 005
@@ -2982,6 +3001,13 @@ mod tests {
             "decdn_cache_evictions_starved_total",
             "decdn_cache_size_measure_failures_total",
             "decdn_cache_evicted_operator_total",
+            // Prewarm counters (#1130). Same `_total`-suffix trap: the struct
+            // fields are `prewarm_blobs`, `prewarm_bytes`, `prewarm_refused`,
+            // `prewarm_failures`.
+            "decdn_cache_prewarm_blobs_total",
+            "decdn_cache_prewarm_bytes_total",
+            "decdn_cache_prewarm_refused_total",
+            "decdn_cache_prewarm_failures_total",
         ] {
             assert!(
                 has_metric_line(&text, name, 0),

@@ -31,10 +31,11 @@ pub(crate) const SUBSCRIBE_FAILED_LABEL: &str = "subscribe_failed";
 /// Label passed to [`GossipMetrics::inc_rejected`] when an inbound
 /// signature-valid announce is dropped because the peer table is at its
 /// hard cap and the inline TTL sweep couldn't free a slot. Matches the
-/// `reason=table_full` label value documented in
-/// appendix-peer-table-eviction § Observability and appendix-observability
-/// so operator dashboards resolve. Pinned by the label-stability test in
-/// `validation::tests`.
+/// `table_full` reason token documented in appendix-peer-table-eviction
+/// § Observability. It is a **log** token, not a metrics label: the node's
+/// implementor aggregates every rejection into
+/// `decdn_gossip_announces_rejected_total` per the sibling-counter convention
+/// (#1475). Pinned by the label-stability test in `validation::tests`.
 pub(crate) const PEER_TABLE_FULL_LABEL: &str = "table_full";
 
 /// Label passed to [`GossipMetrics::inc_rejected`] when a subscriber's

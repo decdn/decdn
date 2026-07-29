@@ -54,7 +54,7 @@ pub struct ContentDenylist {
 
 impl ContentDenylist {
     /// Build from resolved config, with an empty on-chain set — the watcher
-    /// fills that in once it has replayed.
+    /// fills that in once its bootstrap enumeration completes (#1504).
     #[must_use]
     pub fn new(content: &ResolvedContent) -> Self {
         Self {
