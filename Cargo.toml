@@ -287,9 +287,9 @@ opt-level = 3
 # was the binding constraint — not the LTO mode. Measured on a 16-core clean
 # build of both binaries: cgu=1 alone costs +5s (356s → 361s) and takes ~16% off
 # both; fat LTO on top costs +118s total and takes `decdn-node` 47.4 → 35.6 MB
-# and `decdn` 32.3 → 21.1 MB. CI never builds `--release` (see ci.yml), so the
-# extra time lands only on the release workflow's 10-way parallel matrix and the
-# Docker image build.
+# and `decdn` 32.3 → 21.1 MB. CI never builds `--release` (see
+# `.github/workflows/ci.yml`), so the extra time lands only on the release
+# workflow's 10-way parallel matrix and the Docker image build.
 lto = "fat"
 codegen-units = 1
 # NOT `panic = "abort"`: production code recovers from panics via unwinding —
