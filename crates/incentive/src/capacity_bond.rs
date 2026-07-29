@@ -70,6 +70,27 @@ mod sol_types {
             /// `bytes32(0)` if the operator has no binding.
             function nodeIdOf(address operator) external view returns (bytes32 nodeId, bool active);
 
+            /// On-chain escrow record for one slash (ADR 028 escrow-on-slash).
+            /// Field order is ABI-significant — it mirrors `SlashEscrowLib`'s
+            /// struct exactly, and a reordering here silently mis-decodes.
+            struct SlashRecord {
+                address operator;
+                uint64 slashedAt;
+                uint8 status;
+                uint8 offenseType;
+                address challenger;
+                uint64 appealWindowClose;
+                uint256 slashAmount;
+                bytes32 evidenceHash;
+            }
+
+            /// A slash record was minted. Indexed on `operator`, so a node
+            /// filters its own with `topic2` and then point-reads the record —
+            /// the live-tail counterpart to the `operatorSlash*` enumeration.
+            event SlashRecorded(
+                uint256 indexed slashId, address indexed operator, uint64 slashedAt, uint256 slashAmount
+            );
+
             /// Paginated snapshot of `_registeredAddrs` — every
             /// operator with a current registration, **NOT** filtered
             /// for bond / unbonding / ejection. Callers combine with
@@ -78,6 +99,30 @@ mod sol_types {
 
             /// Cardinality of `_registeredAddrs`.
             function getActiveNodeCount() external view returns (uint256);
+
+            /// How many slashes have ever been minted against `operator`.
+            /// Paired with `operatorSlashIdAt`, this replaces re-scanning the
+            /// `Slashed` log tail from a block floor on every start: walk
+            /// backwards from `count - 1` and stop at the first record whose
+            /// `appealWindowClose` has already passed.
+            function operatorSlashCount(address operator) external view returns (uint256);
+
+            /// The `slashId` at `index` in `operator`'s append-only slash list.
+            /// Append-only and never reordered, so indices are stable across
+            /// calls and no pinned-block read is required. Reverts
+            /// `SlashIndexOutOfRange` past the end rather than returning a zero
+            /// id, which would alias the legitimate `slashId == 0`.
+            function operatorSlashIdAt(address operator, uint256 index) external view returns (uint256);
+
+            /// Full escrow record for `slashId`.
+            ///
+            /// `appealWindowClose` here is the AUTHORITATIVE deadline: it carries
+            /// protocol-pause extensions, which a deadline derived from the log's
+            /// block timestamp does not. `offenseType` and `evidenceHash` are
+            /// persisted on the record precisely so it is self-sufficient — the
+            /// `CapacityBond.Slashed` event carries the offense but no `slashId`,
+            /// and `SlashRecorded` carries the `slashId` but no offense.
+            function getSlashRecord(uint256 slashId) external view returns (SlashRecord memory);
 
             /// The operator's raw registration record. `active` here is
             /// `_nodes[operator].active` alone — the flag `deregisterNode`

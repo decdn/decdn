@@ -3,6 +3,7 @@ pragma solidity 0.8.28;
 
 import { AccessControl } from "@openzeppelin/contracts/access/AccessControl.sol";
 import { ReentrancyGuard } from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import { EnumerableSet } from "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
 
 import { ICapacityBondEjector } from "./interfaces/ICapacityBondEjector.sol";
 import { ICapacityBondRegionView } from "./interfaces/ICapacityBondRegionView.sol";
@@ -18,6 +19,9 @@ import { RegionScopeLib } from "./RegionScopeLib.sol";
 ///         slashed under an entry later found wrongful is made whole through
 ///         `SlashAppeal` (ADR 028), a separate contract.
 contract ContentBlacklist is AccessControl, ReentrancyGuard {
+    using EnumerableSet for EnumerableSet.Bytes32Set;
+    using EnumerableSet for EnumerableSet.AddressSet;
+
     // -----------------------------------------------------------------
     // Roles
     // -----------------------------------------------------------------
@@ -207,6 +211,24 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     ///         ADR 011 names the accessor `getBlacklistVersion()`, and an
     ///         auto-getter would be `_blacklistVersion()`.
     uint256 internal _blacklistVersion;
+
+    /// @notice Membership index for `_hashEntries[region]`, so the entry set of a
+    ///         region can be READ rather than reconstructed from the event log.
+    /// @dev    Maintained in the same two choke points as `_blacklistVersion`
+    ///         (`_addHash` / `_removeHashRegional`), so no call site can add an
+    ///         entry without indexing it. Holds RAW membership — see
+    ///         `blacklistedHashes` for why it is not expiry-filtered.
+    mapping(bytes32 region => EnumerableSet.Bytes32Set) internal _regionHashes;
+
+    /// @notice Membership index for the union of the two address-level deny
+    ///         lists: `_isOriginBlacklisted` ∪ `isOperatorBlacklisted`.
+    /// @dev    A union rather than two sets because that is the only question
+    ///         any consumer asks — `OriginAssignment._isBlacklisted` already
+    ///         computes exactly this disjunction on-chain, and a node's delivery
+    ///         gate refuses on either. Reconciled through `_syncAddr`, which
+    ///         re-derives membership from both sources so clearing one list while
+    ///         the other still holds cannot drop the address from the index.
+    EnumerableSet.AddressSet internal _blacklistedAddrs;
 
     // -----------------------------------------------------------------
     // Events
@@ -409,6 +431,7 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         Category cat = _toCategory(category);
         _isOriginBlacklisted[operator] = true;
         _emergencyOrigins[operator] = EmergencyOrigin({ addedAt: uint64(block.timestamp), category: uint8(cat) });
+        _syncAddr(operator);
         emit OriginBlacklistUpdated(operator, true);
         emit EmergencyOriginAdded(operator, uint8(cat), reason);
     }
@@ -442,6 +465,7 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         if (!_emergencyExpired(eo.addedAt != 0, eo.addedAt, eo.category)) revert NotExpired();
         delete _emergencyOrigins[origin];
         _isOriginBlacklisted[origin] = false;
+        _syncAddr(origin);
         emit OriginBlacklistUpdated(origin, false);
     }
 
@@ -453,6 +477,7 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         if (operator == address(0)) revert ZeroAddress();
         if (!isOperatorBlacklisted[operator]) {
             isOperatorBlacklisted[operator] = true;
+            _syncAddr(operator);
             emit OperatorBlacklisted(operator);
             capacityBond.ejectNode(operator);
         }
@@ -472,6 +497,7 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         if (operator == address(0)) revert ZeroAddress();
         if (isOperatorBlacklisted[operator]) {
             isOperatorBlacklisted[operator] = false;
+            _syncAddr(operator);
             emit OperatorBlacklistCleared(operator);
         }
         capacityBond.unEjectNode(operator);
@@ -485,6 +511,7 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         if (origin == address(0)) revert ZeroAddress();
         _isOriginBlacklisted[origin] = blacklisted;
         delete _emergencyOrigins[origin];
+        _syncAddr(origin);
         emit OriginBlacklistUpdated(origin, blacklisted);
     }
 
@@ -522,31 +549,112 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     ///         this answers "in scope right now".
     /// @dev    Reads the operator's region inputs from `CapacityBond` via
     ///         `regionScopeData` and evaluates the predicate with `RegionScopeLib`.
-    // slither-disable-next-line unused-return
     function isHashBlacklistedForOperator(bytes32 hash, address operator) external view returns (bool) {
         if (_isLive(GLOBAL_REGION, hash)) return true;
-        (
-            string memory regionHint,
-            string memory regionPrev,
-            uint64 regionLastChanged,
-            uint64 firstBondedAt,
-            uint64 gateActivatedAt,
-            uint256 window
-        ) = capacityBondRegion.regionScopeData(operator);
-
-        uint64 effective = RegionScopeLib.effectiveSince(regionLastChanged, firstBondedAt, gateActivatedAt);
-        // forge-lint: disable-next-line(block-timestamp)
-        (bytes32 cur, bytes32 prev, bool prevApplies) = RegionScopeLib.scopedRegions(
-            GLOBAL_REGION, regionHint, regionPrev, uint64(block.timestamp), effective, window
-        );
-
+        (bytes32 cur, bytes32 prev, bool prevApplies) = _scopeRegions(operator);
         if (cur != bytes32(0) && _isLive(cur, hash)) return true;
         if (prevApplies && _isLive(prev, hash)) return true;
         return false;
     }
 
+    /// @notice Every region key whose entries are in scope for `operator` right
+    ///         now: `GLOBAL_REGION` (always, at index 0), the current region, and
+    ///         — while the ADR 030 ripening window is open — the previous one.
+    ///         Zero keys are omitted, so the result has 1 to 3 elements.
+    /// @dev    The enumeration counterpart of `isHashBlacklistedForOperator`. A
+    ///         consumer pages `blacklistedHashes` for each key returned here and
+    ///         enforces the union, instead of replaying `HashBlacklisted` from
+    ///         the deploy block and retaining out-of-scope entries against a
+    ///         future region change. Both this and the point query resolve their
+    ///         keys through `_scopeRegions`, so the region packing and the
+    ///         ripening arithmetic cannot drift between the two paths.
+    function getScopeRegions(address operator) external view returns (bytes32[] memory regions) {
+        (bytes32 cur, bytes32 prev, bool prevApplies) = _scopeRegions(operator);
+        uint256 n = 1;
+        if (cur != bytes32(0)) ++n;
+        if (prevApplies) ++n;
+
+        regions = new bytes32[](n);
+        regions[0] = GLOBAL_REGION;
+        uint256 i = 1;
+        if (cur != bytes32(0)) {
+            regions[i] = cur;
+            ++i;
+        }
+        if (prevApplies) regions[i] = prev;
+    }
+
     function getHashEntry(bytes32 region, bytes32 hash) external view returns (HashEntry memory) {
         return _hashEntries[region][hash];
+    }
+
+    /// @notice How many entries `region` holds. Companion to `blacklistedHashes`.
+    /// @dev    RAW membership, matching that view — see its `@dev` for why.
+    function blacklistedHashCount(bytes32 region) external view returns (uint256) {
+        return _regionHashes[region].length();
+    }
+
+    /// @notice A page of `region`'s entry set, starting at `offset` and at most
+    ///         `limit` long. A page shorter than `limit` means the end of the set.
+    /// @dev    Returns RAW membership — every hash with a stored entry —
+    ///         deliberately NOT filtered through `_isLive`. Filtering would put
+    ///         holes in a paginated view, so a short page would stop meaning "end
+    ///         of set"; and the only entries it would drop are emergency ones past
+    ///         their category deadline. Omitting those is the FAIL-OPEN direction
+    ///         for a compliance gate, whereas returning them merely over-enforces
+    ///         — which is already what a consumer does today, since it learns of
+    ///         an expiry only from the `HashRemoved` that `expireEmergencyEntry`
+    ///         emits. Callers needing liveness read `getHashEntry` or
+    ///         `isHashBlacklistedForOperator` per hash.
+    /// @dev    Order is NOT stable across mutations: removal is swap-and-pop, so a
+    ///         removal between two page reads can move an unread element into an
+    ///         already-read slot and skip it. Page every offset at ONE pinned
+    ///         block height and re-check `blacklistedHashCount` at that same
+    ///         height. Same hazard `PaymentChannel.deferredSettlements` documents.
+    function blacklistedHashes(bytes32 region, uint256 offset, uint256 limit)
+        external
+        view
+        returns (bytes32[] memory page)
+    {
+        EnumerableSet.Bytes32Set storage set = _regionHashes[region];
+        uint256 len = set.length();
+        if (offset >= len) return new bytes32[](0);
+        // `len - offset` rather than `offset + limit`, which can overflow.
+        uint256 n = len - offset;
+        if (n > limit) n = limit;
+        page = new bytes32[](n);
+        for (uint256 i = 0; i < n; ++i) {
+            page[i] = set.at(offset + i);
+        }
+    }
+
+    /// @notice How many addresses are denied at the origin or operator level.
+    function blacklistedAddressCount() external view returns (uint256) {
+        return _blacklistedAddrs.length();
+    }
+
+    /// @notice A page of the union of the origin and operator deny lists — the
+    ///         same disjunction `OriginAssignment` evaluates per address.
+    /// @dev    RAW membership, with the same pagination caveats as
+    ///         `blacklistedHashes`: an emergency origin whose term lapsed but
+    ///         which nobody has run `expireEmergencyOrigin` against is still
+    ///         returned, and the order is unstable across mutations. The live
+    ///         per-address predicates remain `isOriginBlacklisted` and
+    ///         `isOperatorBlacklisted`.
+    /// @dev    This is the only readable source for the origin deny-set. Unlike
+    ///         the hash set, it is outside the `getBlacklistVersion()` mechanism
+    ///         (ADR 011 § Polling — `OriginBlacklistUpdated` carries no version),
+    ///         so a consumer has no counter to detect a missed update against and
+    ///         previously had nothing to reconcile a dropped event with.
+    function blacklistedAddresses(uint256 offset, uint256 limit) external view returns (address[] memory page) {
+        uint256 len = _blacklistedAddrs.length();
+        if (offset >= len) return new address[](0);
+        uint256 n = len - offset;
+        if (n > limit) n = limit;
+        page = new address[](n);
+        for (uint256 i = 0; i < n; ++i) {
+            page[i] = _blacklistedAddrs.at(offset + i);
+        }
     }
 
     /// @notice Current blacklist revision (ADR 011 § Blacklist version) —
@@ -700,6 +808,9 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         e.emergency = emergency;
         e.category = uint8(category);
         hashReason[region][hash] = reason;
+        // Idempotent: a re-add restamps the entry and leaves the index alone.
+        // slither-disable-next-line unused-return
+        _regionHashes[region].add(hash);
         unchecked {
             ++_blacklistVersion;
         }
@@ -711,10 +822,31 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         if (e.addedAt == 0) revert EntryNotBlacklisted(region, hash);
         delete _hashEntries[region][hash];
         delete hashReason[region][hash];
+        // slither-disable-next-line unused-return
+        _regionHashes[region].remove(hash);
         unchecked {
             ++_blacklistVersion;
         }
         emit HashRemoved(region, hash, _blacklistVersion);
+    }
+
+    /// @dev Re-derive `a`'s membership in the union index from BOTH source
+    ///      mappings. Add-if-either / remove-if-neither, rather than mirroring
+    ///      whichever list the caller just touched: the two are set independently
+    ///      (`setOriginBlacklist` never touches `isOperatorBlacklisted`, and
+    ///      `addOperator` never touches `_isOriginBlacklisted`), so a caller
+    ///      clearing one while the other still holds must NOT drop the address.
+    ///      Reads `isOriginBlacklisted` — the expiry-honouring view, not the raw
+    ///      mapping — so an emergency origin that lapsed leaves the index on the
+    ///      next write that touches it.
+    function _syncAddr(address a) internal {
+        if (isOriginBlacklisted(a) || isOperatorBlacklisted[a]) {
+            // slither-disable-next-line unused-return
+            _blacklistedAddrs.add(a);
+        } else {
+            // slither-disable-next-line unused-return
+            _blacklistedAddrs.remove(a);
+        }
     }
 
     /// @dev Reads storage directly to avoid the `storage → memory` flagged
@@ -724,6 +856,29 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     ///      bothered to clean up still stops being enforceable the instant it
     ///      lapses; the permissionless call materializes that, it does not cause
     ///      it.
+    /// @dev The ADR 030 region-scope predicate, resolved once for both the point
+    ///      query (`isHashBlacklistedForOperator`) and the enumeration
+    ///      (`getScopeRegions`). `cur` is `bytes32(0)` when the operator declares
+    ///      no region or declares GLOBAL; `prevApplies` is true only while the
+    ///      ripening window is still open over a distinct previous region.
+    // slither-disable-next-line unused-return
+    function _scopeRegions(address operator) internal view returns (bytes32 cur, bytes32 prev, bool prevApplies) {
+        (
+            string memory regionHint,
+            string memory regionPrev,
+            uint64 regionLastChanged,
+            uint64 firstBondedAt,
+            uint64 gateActivatedAt,
+            uint256 window
+        ) = capacityBondRegion.regionScopeData(operator);
+
+        uint64 effective = RegionScopeLib.effectiveSince(regionLastChanged, firstBondedAt, gateActivatedAt);
+        // forge-lint: disable-next-line(block-timestamp)
+        return RegionScopeLib.scopedRegions(
+            GLOBAL_REGION, regionHint, regionPrev, uint64(block.timestamp), effective, window
+        );
+    }
+
     function _isLive(bytes32 region, bytes32 hash) internal view returns (bool) {
         HashEntry storage e = _hashEntries[region][hash];
         if (e.addedAt == 0) return false;

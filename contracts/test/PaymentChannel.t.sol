@@ -2135,4 +2135,81 @@ contract PaymentChannelTest is Test {
         channel.settleChannel(id);
         assertEq(usdc.balanceOf(delegate), delegateBefore, "signer never receives funds");
     }
+
+    // -----------------------------------------------------------------
+    // Per-role channel enumeration
+    // -----------------------------------------------------------------
+    //
+    // `channelId` is `keccak256(client, provider, nonce)`, so the provider is in
+    // the preimage and a client cannot re-derive its own ids from
+    // `clientChannelNonce`; `voucherSigner` is in event data, not a topic. These
+    // lists are what replace a `ChannelOpened` block-range scan for both roles.
+
+    function test_channelEnumeration_emptyBeforeAnyOpen() public view {
+        assertEq(channel.clientChannelNonce(client), 0);
+        assertEq(channel.providerChannelCount(provider), 0);
+        assertEq(channel.clientChannels(client, 0, 10).length, 0);
+        assertEq(channel.providerChannels(provider, 0, 10).length, 0);
+    }
+
+    /// One open indexes the same id under both roles.
+    function test_channelEnumeration_indexesBothSides() public {
+        bytes32 id = _open();
+
+        assertEq(channel.clientChannelNonce(client), 1);
+        assertEq(channel.clientChannels(client, 0, 10)[0], id);
+        assertEq(channel.providerChannelCount(provider), 1);
+        assertEq(channel.providerChannels(provider, 0, 10)[0], id);
+    }
+
+    /// Append-only and ordered: ids come back oldest-first, which is what lets a
+    /// reader page forward without pinning a block.
+    function test_channelEnumeration_appendsInOpenOrder() public {
+        bytes32 first = _open();
+        bytes32 second = _open();
+
+        bytes32[] memory ids = channel.clientChannels(client, 0, 10);
+        assertEq(ids.length, 2);
+        assertEq(ids[0], first);
+        assertEq(ids[1], second);
+    }
+
+    /// A terminal channel KEEPS its id, so a reader reconciles via
+    /// `getChannel(id).status` rather than by the id's presence. Dropping it
+    /// would make the list a poor proxy for "channels that ever existed" and
+    /// reintroduce the swap-and-pop instability this design avoids.
+    function test_channelEnumeration_retainsSettledChannels() public {
+        bytes32 id = _open();
+        vm.prank(client);
+        channel.closeChannel(id, 0, 0, 0, "");
+        vm.warp(block.timestamp + channel.disputeWindow() + 1);
+        channel.settleChannel(id);
+
+        assertEq(channel.clientChannelNonce(client), 1, "id is retained after settlement");
+        assertEq(channel.clientChannels(client, 0, 10)[0], id);
+        assertEq(uint8(channel.getChannel(id).status), uint8(PaymentChannel.Status.Closed));
+    }
+
+    /// The lists are per-address: another client's channel must not appear.
+    function test_channelEnumeration_isPerAddress() public {
+        _open();
+        assertEq(channel.clientChannelNonce(stranger), 0);
+        assertEq(channel.providerChannelCount(address(0xFEED)), 0);
+    }
+
+    /// Same pagination contract as `deferredSettlements`, including the
+    /// `type(uint256).max` clamp that must not overflow `offset + limit`.
+    function test_channelEnumeration_pagination() public {
+        for (uint256 i = 0; i < 4; ++i) {
+            _open();
+        }
+
+        assertEq(channel.clientChannelNonce(client), 4);
+        assertEq(channel.clientChannels(client, 0, 3).length, 3);
+        assertEq(channel.clientChannels(client, 3, 3).length, 1);
+        assertEq(channel.clientChannels(client, 4, 1).length, 0);
+        assertEq(channel.clientChannels(client, 0, 0).length, 0);
+        assertEq(channel.clientChannels(client, 0, type(uint256).max).length, 4);
+        assertEq(channel.providerChannels(provider, 1, type(uint256).max).length, 3);
+    }
 }

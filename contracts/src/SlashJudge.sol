@@ -597,7 +597,7 @@ contract SlashJudge is ISlashJudge, AccessControl, ReentrancyGuard, SunsettingPa
         uint256 bond = challengeBond;
         token.safeTransferFrom(msg.sender, address(this), bond);
 
-        (uint256 slashId, uint256 amount) = capacityBond.slash(operator, msg.sender, uint8(offenseType));
+        (uint256 slashId, uint256 amount) = capacityBond.slash(operator, msg.sender, uint8(offenseType), evidenceHash);
 
         token.safeTransfer(msg.sender, bond);
 

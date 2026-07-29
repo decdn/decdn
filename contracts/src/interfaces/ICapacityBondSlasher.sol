@@ -13,7 +13,12 @@ interface ICapacityBondSlasher {
     ///         recording `challenger` for the 50% finality leg (escrow-on-slash,
     ///         ADR 026 / ADR 028). Returns the minted `slashId` and the combined
     ///         slashed amount. Caller must hold `SLASH_ROLE`.
-    function slash(address operator, address challenger, uint8 offenseType)
+    /// @param  offenseType ADR 014 offense taxonomy index, persisted on the slash
+    ///         record so a consumer can attribute an offense to a `slashId`
+    ///         without joining two events by transaction ordering.
+    /// @param  evidenceHash The `SlashJudge` evidence digest this slash resolved,
+    ///         persisted on the record for the same reason.
+    function slash(address operator, address challenger, uint8 offenseType, bytes32 evidenceHash)
         external
         returns (uint256 slashId, uint256 slashAmount);
 

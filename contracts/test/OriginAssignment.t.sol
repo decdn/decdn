@@ -390,4 +390,117 @@ contract OriginAssignmentTest is Test {
         );
         oa.setMaxOriginsPerNamespace(0);
     }
+
+    // -----------------------------------------------------------------
+    // Namespace enumeration
+    // -----------------------------------------------------------------
+    //
+    // Membership within a namespace was always readable via `getOrigins`; the
+    // key set was not, which is why a consumer had to replay
+    // `AssignmentActivated` from the deploy block just to learn which ids exist.
+
+    function _activate() internal {
+        _propose(_ops2());
+        vm.warp(block.timestamp + TIMELOCK);
+        vm.prank(admin);
+        oa.activateAssignment(NS);
+    }
+
+    /// Nothing assigned yet enumerates as empty rather than reverting.
+    function test_assignedNamespaces_emptyBeforeAnyActivation() public view {
+        assertEq(oa.assignedNamespaceCount(), 0);
+        assertEq(oa.assignedNamespaces(0, 10).length, 0);
+    }
+
+    /// Activation seats the namespace; a proposal alone must not.
+    function test_assignedNamespaces_seatedOnActivationNotProposal() public {
+        _propose(_ops2());
+        assertEq(oa.assignedNamespaceCount(), 0, "a pending proposal is not an assignment");
+
+        vm.warp(block.timestamp + TIMELOCK);
+        vm.prank(admin);
+        oa.activateAssignment(NS);
+
+        assertEq(oa.assignedNamespaceCount(), 1);
+        assertEq(oa.assignedNamespaces(0, 10)[0], NS);
+    }
+
+    /// Re-activating the same namespace must not duplicate the key.
+    function test_assignedNamespaces_reActivationDoesNotDuplicate() public {
+        _activate();
+        _propose(_ops2());
+        vm.warp(block.timestamp + TIMELOCK);
+        vm.prank(admin);
+        oa.activateAssignment(NS);
+        assertEq(oa.assignedNamespaceCount(), 1);
+    }
+
+    /// The key set tracks "has origins", not "was ever assigned": it survives
+    /// removal of one operator and is withdrawn only when the last one goes.
+    function test_assignedNamespaces_withdrawnOnlyWhenSetEmpties() public {
+        _activate();
+
+        vm.prank(publisher);
+        oa.revokeAssignment(NS, opA);
+        assertEq(oa.assignedNamespaceCount(), 1, "one operator remains");
+
+        vm.prank(publisher);
+        oa.revokeAssignment(NS, opB);
+        assertEq(oa.assignedNamespaceCount(), 0, "set is now empty");
+        assertEq(oa.getOrigins(NS).length, 0);
+    }
+
+    /// The permissionless prune path must maintain the index too, or a fully
+    /// pruned namespace would linger in the enumeration forever.
+    function test_assignedNamespaces_prunePathWithdrawsWhenEmptied() public {
+        _activate();
+        blacklist.setBlacklisted(opA, true);
+        blacklist.setBlacklisted(opB, true);
+
+        oa.pruneBlacklistedAssignment(NS, opA);
+        assertEq(oa.assignedNamespaceCount(), 1);
+        oa.pruneBlacklistedAssignment(NS, opB);
+        assertEq(oa.assignedNamespaceCount(), 0);
+    }
+
+    /// The index invariant, stated directly: a namespace is enumerated iff it
+    /// has origins.
+    function test_assignedNamespaces_matchesGetOriginsNonEmpty() public {
+        _activate();
+        assertEq(oa.assignedNamespaceCount(), 1);
+        assertGt(oa.getOrigins(NS).length, 0);
+
+        vm.startPrank(publisher);
+        oa.revokeAssignment(NS, opA);
+        oa.revokeAssignment(NS, opB);
+        vm.stopPrank();
+
+        assertEq(oa.assignedNamespaceCount(), 0);
+        assertEq(oa.getOrigins(NS).length, 0);
+    }
+
+    /// Same pagination contract as the other enumeration views, including the
+    /// `type(uint256).max` clamp.
+    function test_assignedNamespaces_pagination() public {
+        for (uint256 ns = 1; ns <= 3; ++ns) {
+            registry.setOwner(ns, publisher);
+            address[] memory ops = new address[](1);
+            ops[0] = opA;
+            vm.prank(publisher);
+            oa.proposeAssignment(ns, ops);
+        }
+        vm.warp(block.timestamp + TIMELOCK);
+        vm.startPrank(admin);
+        for (uint256 ns = 1; ns <= 3; ++ns) {
+            oa.activateAssignment(ns);
+        }
+        vm.stopPrank();
+
+        assertEq(oa.assignedNamespaceCount(), 3);
+        assertEq(oa.assignedNamespaces(0, 2).length, 2);
+        assertEq(oa.assignedNamespaces(2, 2).length, 1);
+        assertEq(oa.assignedNamespaces(3, 1).length, 0);
+        assertEq(oa.assignedNamespaces(0, 0).length, 0);
+        assertEq(oa.assignedNamespaces(0, type(uint256).max).length, 3);
+    }
 }

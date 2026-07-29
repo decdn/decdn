@@ -28,6 +28,7 @@ contract MockSlasher is ICapacityBondSlasher, ICapacityBondRegionView {
     address public lastOperator;
     address public lastChallenger;
     uint8 public lastOffense;
+    bytes32 public lastEvidenceHash;
     uint256 public slashCount;
 
     // ADR 030 region-scope read source (production `CapacityBond` is both the
@@ -92,7 +93,7 @@ contract MockSlasher is ICapacityBondSlasher, ICapacityBondRegionView {
         return (id, id != bytes32(0));
     }
 
-    function slash(address operator, address challenger, uint8 offenseType)
+    function slash(address operator, address challenger, uint8 offenseType, bytes32 evidenceHash)
         external
         override
         returns (uint256, uint256)
@@ -100,6 +101,7 @@ contract MockSlasher is ICapacityBondSlasher, ICapacityBondRegionView {
         lastOperator = operator;
         lastChallenger = challenger;
         lastOffense = offenseType;
+        lastEvidenceHash = evidenceHash;
         slashCount++;
         return (nextId++, returnAmount);
     }

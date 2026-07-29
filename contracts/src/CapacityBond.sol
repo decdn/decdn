@@ -522,6 +522,7 @@ contract CapacityBond is
 
     // ADR 028 — slash record lookup + escrow lifecycle
     error UnknownSlash(uint256 slashId);
+    error SlashIndexOutOfRange(address operator, uint256 index, uint256 length);
     error SlashNotEscrowed(uint256 slashId);
     error SlashAppealNotOpen(uint256 slashId);
     error FilingWindowStillOpen(uint64 readyAt);
@@ -993,7 +994,7 @@ contract CapacityBond is
     // Slashing (SLASH_ROLE — held by SlashJudge)
     // -----------------------------------------------------------------
 
-    function slash(address operator, address challenger, uint8 offenseType)
+    function slash(address operator, address challenger, uint8 offenseType, bytes32 evidenceHash)
         external
         nonReentrant
         whenNotPaused
@@ -1012,7 +1013,7 @@ contract CapacityBond is
         // `finalizeUnappealedSlash` (no appeal) or a `SLASH_APPEAL_ROLE` settle
         // hook resolves it. The challenger is recorded for the 50% leg paid at
         // finality.
-        slashId = _mintSlashRecord(operator, challenger, totalSlash);
+        slashId = _mintSlashRecord(operator, challenger, totalSlash, offenseType, evidenceHash);
         _stampSlash(operator, challenger, offenseType, totalSlash, newCount);
     }
 
@@ -1037,10 +1038,13 @@ contract CapacityBond is
     ///      The record lets `SlashAppeal.openSlashAppeal` validate appeals
     ///      without trusting the appellant's `operator` claim (I2 fix), and pins
     ///      the challenger + filing-window deadline for finality.
-    function _mintSlashRecord(address operator, address challenger, uint256 totalSlashAmount)
-        internal
-        returns (uint256 slashId)
-    {
+    function _mintSlashRecord(
+        address operator,
+        address challenger,
+        uint256 totalSlashAmount,
+        uint8 offenseType,
+        bytes32 evidenceHash
+    ) internal returns (uint256 slashId) {
         slashId = slashCounter;
         unchecked {
             slashCounter = slashId + 1;
@@ -1053,7 +1057,9 @@ contract CapacityBond is
             operator,
             challenger,
             totalSlashAmount,
-            uint64(APPEAL_FILING_WINDOW)
+            uint64(APPEAL_FILING_WINDOW),
+            offenseType,
+            evidenceHash
         );
     }
 
@@ -1422,6 +1428,30 @@ contract CapacityBond is
     function getSlashRecord(uint256 slashId) external view returns (SlashRecord memory) {
         if (slashId >= slashCounter) revert UnknownSlash(slashId);
         return _slashRecords[slashId];
+    }
+
+    /// @notice How many slashes have ever been minted against `operator`.
+    /// @dev    Paired with `operatorSlashIdAt`, this is the enumeration that lets
+    ///         a consumer rebuild an operator's slash history from chain state
+    ///         instead of re-scanning the `Slashed` log tail from a block floor
+    ///         on every start. Deliberately two scalar getters rather than one
+    ///         `uint256[]` return: a dynamic-array getter costs several hundred
+    ///         bytes of ABI-encoding bytecode, and this contract sits close to
+    ///         the EIP-170 runtime ceiling. Lists are short in practice — a slash
+    ///         auto-ejects below `minBond / 2`, so re-slashing an operator
+    ///         requires a fresh re-bond first.
+    function operatorSlashCount(address operator) external view returns (uint256) {
+        return _operatorSlashIds[operator].length;
+    }
+
+    /// @notice The `slashId` at `index` in `operator`'s append-only slash list.
+    /// @dev    Append-only and never reordered, so `index` is stable across calls
+    ///         and a caller may walk backwards from `operatorSlashCount` and stop
+    ///         at the first record whose appeal window has already closed.
+    function operatorSlashIdAt(address operator, uint256 index) external view returns (uint256) {
+        uint256[] storage ids = _operatorSlashIds[operator];
+        if (index >= ids.length) revert SlashIndexOutOfRange(operator, index, ids.length);
+        return ids[index];
     }
 
     // -----------------------------------------------------------------

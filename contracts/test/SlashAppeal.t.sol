@@ -87,7 +87,7 @@ contract SlashAppealTest is Test {
         vm.prank(operator);
         bond.bond(MIN_BOND);
         vm.prank(admin);
-        (slashId,) = bond.slash(operator, challenger, 1);
+        (slashId,) = bond.slash(operator, challenger, 1, bytes32(0));
     }
 
     /// @dev Filing is operator-only; the operator is the appellant.
@@ -245,7 +245,7 @@ contract SlashAppealTest is Test {
 
         // Second slash of the same operator, fresh escrow.
         vm.prank(admin);
-        (uint256 slashId2,) = bond.slash(operator, challenger, 1);
+        (uint256 slashId2,) = bond.slash(operator, challenger, 1, bytes32(0));
         vm.prank(operator);
         vm.expectRevert(
             abi.encodeWithSelector(SlashAppeal.FrequencyCapHit.selector, uint64(block.timestamp + 365 days))
@@ -370,7 +370,7 @@ contract SlashAppealTest is Test {
 
         // Slash #1, open + fast-track its appeal.
         vm.prank(admin);
-        (uint256 s1,) = bond.slash(operator, challenger, 1);
+        (uint256 s1,) = bond.slash(operator, challenger, 1, bytes32(0));
         uint64 stamp1 = bond.slashedAtEpoch(operator);
         _open(s1);
         vm.prank(multisig);
@@ -379,7 +379,7 @@ contract SlashAppealTest is Test {
         // Slash #2 in a later epoch — overwrites the per-operator stamp.
         vm.warp(block.timestamp + 8 days);
         vm.prank(admin);
-        bond.slash(operator, challenger, 1);
+        bond.slash(operator, challenger, 1, bytes32(0));
         uint64 stamp2 = bond.slashedAtEpoch(operator);
         assertTrue(stamp2 != stamp1);
 
@@ -398,13 +398,13 @@ contract SlashAppealTest is Test {
 
         // Slash #1 (older) — stays Escrowed/standing for the whole test.
         vm.prank(admin);
-        bond.slash(operator, challenger, 1);
+        bond.slash(operator, challenger, 1, bytes32(0));
         uint64 stamp1 = bond.slashedAtEpoch(operator);
 
         // Slash #2 (newer) in a later epoch — overwrites the per-operator stamp.
         vm.warp(block.timestamp + 8 days);
         vm.prank(admin);
-        (uint256 s2,) = bond.slash(operator, challenger, 1);
+        (uint256 s2,) = bond.slash(operator, challenger, 1, bytes32(0));
         assertTrue(bond.slashedAtEpoch(operator) != stamp1);
 
         // Grant the NEWER appeal — the watermark must fall back to the older
@@ -441,7 +441,7 @@ contract SlashAppealTest is Test {
         vm.prank(operator);
         bond.bond(MIN_BOND);
         vm.prank(admin);
-        (uint256 slashId,) = bond.slash(operator, challenger, 1);
+        (uint256 slashId,) = bond.slash(operator, challenger, 1, bytes32(0));
         uint256 slashTime = block.timestamp;
 
         // Pause for 10 days inside the filing window.

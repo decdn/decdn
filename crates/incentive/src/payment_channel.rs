@@ -127,6 +127,27 @@ mod sol_types {
             /// receipt.
             function clientChannelNonce(address client) external view returns (uint256);
 
+            /// How many channels have ever been opened against `provider`.
+            function providerChannelCount(address provider) external view returns (uint256);
+
+            /// A page of the channel ids opened against `provider`, oldest first.
+            /// Append-only and never rewritten, so a settled or closed channel
+            /// keeps its id and the ordering is stable — no pinned-block read is
+            /// required. Resolve current state per id with `getChannel`.
+            function providerChannels(address provider, uint256 offset, uint256 limit)
+                external
+                view
+                returns (bytes32[] memory);
+
+            /// A page of the channel ids `client` opened, oldest first.
+            /// `clientChannelNonce(client)` is the count — the contract stores
+            /// only the counterparty per nonce and recomputes each id, so there
+            /// is no separate counter that could drift from the nonce.
+            function clientChannels(address client, uint256 offset, uint256 limit)
+                external
+                view
+                returns (bytes32[] memory);
+
             // -----------------------------------------------------------------
             // Write functions (provider/seller path)
             // -----------------------------------------------------------------
