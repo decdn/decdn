@@ -521,6 +521,21 @@ impl<P: Provider + Clone> WatcherState<P> {
         self.known.insert((region, hash));
     }
 
+    /// Fold a fresh re-enumeration snapshot into the projections. The asymmetry is
+    /// deliberate and correctness-critical: the `known` worklist is UNIONED so an
+    /// out-of-scope entry the tail learned (and retained for a future ripening
+    /// transition, which emits no event) is not dropped by an in-scope-only
+    /// enumeration, while the chain origins are authoritative and REPLACED
+    /// wholesale. Every enumerated origin is seeded into `pending_origin_peer_ops`
+    /// so the next tick's drain (re)derives its `NodeId` deny-set entry.
+    fn fold_reenumeration(&mut self, snapshot: BootstrapSnapshot) {
+        self.known.extend(snapshot.known);
+        self.denylist.set_chain_origins(snapshot.origins.clone());
+        for addr in snapshot.origins {
+            self.pending_origin_peer_ops.entry(addr).or_insert(true);
+        }
+    }
+
     /// Drop exactly the `(region, hash)` entry — same-hash entries under other
     /// regions stay retained for re-scoping.
     fn remove_entry(&mut self, region: B256, hash: Hash) {
@@ -707,18 +722,7 @@ impl<P: Provider + Clone> LogSink for BlacklistSink<P> {
         // keeps the current set. The `rescan` below then re-scopes + evicts.
         if due {
             match bootstrap_snapshot(&self.reads, self.operator).await {
-                Ok(snapshot) => {
-                    self.state.known.extend(snapshot.known);
-                    self.state
-                        .denylist
-                        .set_chain_origins(snapshot.origins.clone());
-                    for addr in snapshot.origins {
-                        self.state
-                            .pending_origin_peer_ops
-                            .entry(addr)
-                            .or_insert(true);
-                    }
-                }
+                Ok(snapshot) => self.state.fold_reenumeration(snapshot),
                 Err(err) => warn!(
                     err = %sanitize_err_chain(&err),
                     "blacklist watcher: periodic re-enumeration failed; keeping the current \
@@ -1589,6 +1593,73 @@ mod tests {
         let union = enumerate_address_union(&stub, op, stub.block).await?;
         assert_eq!(union.len(), addrs.len(), "every distinct address survives");
         Ok(())
+    }
+
+    // ----- periodic re-enumeration fold (Ok arm of `on_tick_complete`) -----
+
+    /// The correctness-critical asymmetry of the re-enumeration fold: `known` is
+    /// UNIONED (an out-of-scope entry the tail learned and retained for a future
+    /// ripening transition must survive an in-scope-only re-enumeration), while the
+    /// chain origins are REPLACED WHOLESALE (the authoritative current set). A live
+    /// pre-existing origin X must NOT survive a snapshot that no longer lists it.
+    #[test]
+    fn reenumeration_unions_known_and_replaces_origins() {
+        let x = addr(0x11);
+        let y = addr(0x22);
+        let denylist = Arc::new(ContentDenylist::empty());
+        // Seed the prior chain-origin set with X, as a previous enumeration would.
+        denylist.set_chain_origins([x].into_iter().collect());
+        let mut state = state_with_denylist(Arc::clone(&denylist));
+        // An out-of-scope `(region, hash)` the tail retained for a future ripening.
+        let retained = (b256(0xEE), hash(0xEE));
+        state.known.insert(retained);
+
+        let snapshot = BootstrapSnapshot {
+            block: 100,
+            origins: [y].into_iter().collect(),
+            known: [(US, hash(0x33))].into_iter().collect(),
+        };
+        state.fold_reenumeration(snapshot);
+
+        // `known` is UNIONed: the retained out-of-scope entry survives alongside the
+        // freshly enumerated in-scope one.
+        assert!(
+            state.known.contains(&retained),
+            "the retained out-of-scope entry MUST survive the union"
+        );
+        assert!(
+            state.known.contains(&(US, hash(0x33))),
+            "the newly enumerated in-scope entry is added"
+        );
+        assert_eq!(state.known.len(), 2);
+
+        // Chain origins are REPLACED wholesale: Y is now denied, X is gone.
+        assert!(denylist.is_origin_denied(&y), "the new origin Y is denied");
+        assert!(
+            !denylist.is_origin_denied(&x),
+            "the prior origin X was replaced wholesale, not unioned"
+        );
+
+        // Every enumerated origin is seeded into the pending-origin retry map.
+        assert_eq!(state.pending_origin_peer_ops.get(&y), Some(&true));
+    }
+
+    /// The fold seeds `pending_origin_peer_ops` for every enumerated origin, so the
+    /// next tick's drain re-derives their `NodeId` deny-set entries.
+    #[test]
+    fn reenumeration_seeds_pending_origin_peer_ops_for_each_origin() {
+        let mut state = state();
+        let a = addr(0x44);
+        let b = addr(0x55);
+        let snapshot = BootstrapSnapshot {
+            block: 7,
+            origins: [a, b].into_iter().collect(),
+            known: HashSet::new(),
+        };
+        state.fold_reenumeration(snapshot);
+
+        assert_eq!(state.pending_origin_peer_ops.get(&a), Some(&true));
+        assert_eq!(state.pending_origin_peer_ops.get(&b), Some(&true));
     }
 
     // ----- in-memory worklist behaviour -----
