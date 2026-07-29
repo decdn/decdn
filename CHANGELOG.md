@@ -338,6 +338,24 @@ since project inception and will roll into the first tagged release.
 
 #### Node serve path
 
+- **An underfunded channel no longer gets one interval free per request
+  (#1516).** The direct-serve path signed a success `StreamResponse` and streamed
+  a full credit window — one 1 MB voucher interval at the default cadence, more
+  if `credit_window_bytes` is configured — before the per-voucher deposit ceiling
+  could fire at the first voucher boundary. A channel that could not cover even
+  that first window was therefore served it anyway, on every request, and a
+  client's resume loop could farm a fresh one per retry attempt. The serve path
+  now reserves `min(credit window, requested span)` against the channel's
+  *remaining* headroom (`deposit − last claimed amount`, matching how both the
+  off-chain and on-chain ceilings compare cumulative voucher amounts) and refuses
+  before signing, metered as `serve_stream_rejected_insufficient_deposit` — the
+  same guard the cache-miss pull-through path has carried since #856, against a
+  narrower ceiling. Residual free egress drops from a whole credit window to the
+  bao proof overhead on one (well under 1%), since the reservation is priced in
+  content bytes while delivery bills wire bytes; the mid-stream ceiling remains
+  the exact authority. A funded request for a blob or bounded range smaller than
+  one interval is unaffected — the reservation is capped by the span, not by the
+  cadence. No wire, config, or ABI change.
 - **A degraded node no longer reports itself as merely empty (#1129).** On a
   `cdn/client/v1` cache miss, a transient origin/store fault during a reactive
   pull-through fill (an S3 5xx surviving retry exhaustion, an open circuit

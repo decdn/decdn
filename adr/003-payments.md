@@ -228,6 +228,8 @@ Client receives bytes but stops signing vouchers, getting content for free up to
 
 The self-enforcing stop is sufficient. Maximum loss is one voucher interval at the negotiated cadence: default cadence (1 MB × market rate ≈ $0.00001) is negligible; 100 MB at market rate is ~$0.001; the wire ceiling (1024 MB) at the ceiling rate is ~$1.024 — still negligible relative to channel deposits. Nodes serving high-value content can unilaterally enforce smaller intervals regardless of what was negotiated.
 
+That bound applies to a *funded* channel. A channel whose remaining deposit cannot cover even the first credit window is refused before the node signs a success `StreamResponse`, so it is never served the free interval at all — the seller-side pre-flight deposit guard of [ADR 037 § Implementation status](037-regional-proxy-warming.md#implementation-status-856), which fronts both the cache-miss and the direct-serve paths.
+
 #### Channel griefing
 
 Client opens many channels with minimum deposit and never streams, forcing nodes to track and eventually close stale channels.

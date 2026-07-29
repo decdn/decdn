@@ -1193,13 +1193,15 @@ pub struct DecdnMetrics {
     /// not authorize the named channel (#327). Visible name:
     /// `decdn_serve_stream_rejected_owner_mismatch_total`.
     pub serve_stream_rejected_owner_mismatch: Counter,
-    /// `serve_stream` cache-miss requests refused before any upstream pull
-    /// because the requesting channel's remaining deposit could not cover the
-    /// worst-case blob cost at the node's rate (#856 pre-flight deposit guard).
-    /// Wire-indistinguishable from `cache_miss` (signed as `NotFound`), so this
-    /// server-side counter is the only place the distinction lives — a rising
-    /// value isolates near-empty-deposit pull-through abuse. Visible name:
-    /// `decdn_serve_stream_rejected_insufficient_deposit_total`.
+    /// `serve_stream` requests refused before anything is signed because the
+    /// requesting channel's remaining deposit could not cover what the node
+    /// would front at its rate. Both pre-flight deposit guards bump this: the
+    /// cache-miss one (#856) reserves the worst-case blob cost before an
+    /// upstream pull, and the direct-serve one (#1516) reserves the first credit
+    /// window of the requested span. Wire-indistinguishable from `cache_miss`
+    /// (signed as `NotFound`), so this server-side counter is the only place the
+    /// distinction lives — a rising value isolates near-empty-deposit abuse.
+    /// Visible name: `decdn_serve_stream_rejected_insufficient_deposit_total`.
     pub serve_stream_rejected_insufficient_deposit: Counter,
     /// `serve_stream` cache-miss requests refused before any upstream pull
     /// because the operator's `pull_through_require_authorized_origin` gate is on

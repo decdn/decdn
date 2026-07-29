@@ -78,7 +78,11 @@ impl ClientHandler {
         let rate_per_mb = self.clamped_rate();
 
         // (1) Pre-flight deposit guard: refuse the speculative pull if the channel
-        // provably cannot pay the cost it would front. With a finite
+        // provably cannot pay the cost it would front. Twin of the direct-serve
+        // gate in `dispatch.rs` (#1516) — keep the two in step; they differ only
+        // in the ceiling, because this path also fronts the *upstream* spend.
+        //
+        // With a finite
         // `max_blob_size_bytes` the ceiling is the worst-case whole-blob cost. When
         // the size cap is unbounded (`0`) there is no whole-blob ceiling, so the
         // guard falls back to the per-request speculative *window* cost — it must

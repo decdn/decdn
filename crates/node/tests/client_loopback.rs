@@ -49,9 +49,9 @@ use decdn_incentive::{
     slash_judge_domain, stream_sig::StreamSlashData, voucher_domain,
 };
 use decdn_node::client_requester::{
-    ChannelContext, ChannelLedger, Cumulative, PullDeadlines, RateAboveCeiling,
-    UpstreamVoucherRejected, VoucherProgress, sign_client_binding, stream_fetch,
-    stream_fetch_shared, stream_fetch_tracked, stream_fetch_tracked_with_progress,
+    ChannelContext, ChannelLedger, Cumulative, PullDeadlines, RateAboveCeiling, UpstreamRefused,
+    VoucherProgress, sign_client_binding, stream_fetch, stream_fetch_shared, stream_fetch_tracked,
+    stream_fetch_tracked_with_progress,
 };
 use decdn_node::dispatch::ConnectionLimiter;
 use decdn_node::handlers::client::{ClientHandler, ClientHandlerDeps};
@@ -1669,6 +1669,22 @@ async fn client_delivers_empty_blob() -> anyhow::Result<()> {
 /// rejects voucher 2 (amount 15 > 12) as over-deposit, so the fetch errors after
 /// one acked voucher. `progress.acked()` must then report voucher 1 (nonce 1),
 /// proving the copy-back in `stream_fetch_tracked` runs on the error path.
+///
+/// The deposit of 12 is load-bearing in both directions: it must clear the #1516
+/// pre-serve gate's ceiling (one credit window at `RATE_PER_MB` = 10) so the
+/// first attempt is actually served, and fall short of voucher 2 so the
+/// mid-stream ceiling is what stops it. An acked nonce of 1 is only reachable
+/// through that exact sequence, so it pins the mid-stream backstop as surely as
+/// asserting on the reject reason did.
+///
+/// The *terminal* error is the pre-serve refusal, not the voucher rejection,
+/// and that is the #1516 fix showing through: the rejection carries an
+/// authenticated `WatermarkBundle`, so `fetch_inner`'s resume loop reseeds the
+/// ledger and retries at the same offset — but the channel is now down to 2 base
+/// units of headroom, so the retry cannot cover a window and is refused before
+/// anything is signed. Pre-#1516 each of those futile attempts was served a
+/// fresh free window first; the counter assertion below pins that the resume
+/// loop can no longer be used to farm them.
 #[tokio::test(flavor = "multi_thread")]
 async fn tracked_watermark_survives_post_ack_error() -> anyhow::Result<()> {
     let payload = vec![0xABu8; 1_572_864]; // 1.5 MiB → two vouchers (amount 10 then 15).
@@ -1728,22 +1744,28 @@ async fn tracked_watermark_survives_post_ack_error() -> anyhow::Result<()> {
     )
     .await;
 
-    // Assert the *intended* failure mode, not just any error: voucher 2 must be
-    // rejected mid-stream as over-deposit. A regression that errors for some other
+    // Assert the *intended* failure mode, not just any error: the exhausted
+    // channel is refused, and it is refused pre-serve on the resume retry rather
+    // than being handed another window. A regression that errors for some other
     // reason (e.g. a transport fault) should fail this test loudly.
     let err = result
         .err()
         .ok_or_else(|| anyhow::anyhow!("fetch must error when voucher 2 is over-deposit"))?;
-    let rejected = err
-        .downcast_ref::<UpstreamVoucherRejected>()
-        .ok_or_else(|| anyhow::anyhow!("expected UpstreamVoucherRejected, got: {err:?}"))?;
+    let refused = err
+        .downcast_ref::<UpstreamRefused>()
+        .ok_or_else(|| anyhow::anyhow!("expected UpstreamRefused, got: {err:?}"))?;
     anyhow::ensure!(
-        rejected.reason == VoucherRejectReason::InsufficientDeposit,
-        "voucher 2 must be rejected for InsufficientDeposit; got {:?}",
-        rejected.reason
+        matches!(
+            refused.error(),
+            decdn_protocol::client::StreamError::NotFound
+        ),
+        "the exhausted retry must be refused pre-serve; got {:?}",
+        refused.error()
     );
-    // The contract: the watermark survives the error and reflects the one acked
-    // voucher (nonce 1), so the caller can still persist what it paid.
+    // The contract this test exists for: the watermark survives the error and
+    // reflects the one acked voucher (nonce 1). Reaching nonce 1 — and no
+    // further — is only possible if voucher 1 was acked and voucher 2 hit the
+    // mid-stream over-deposit ceiling, so this also pins that backstop.
     let acked = progress.acked().ok_or_else(|| {
         anyhow::anyhow!("acked watermark must survive a post-ack error, got None")
     })?;
@@ -1751,6 +1773,15 @@ async fn tracked_watermark_survives_post_ack_error() -> anyhow::Result<()> {
         acked.0 == U256::from(1u64),
         "exactly one voucher should be acked before the rejection; acked nonce = {}",
         acked.0
+    );
+    // #1516: the resume retry is cut off before delivery. Pre-fix it was served
+    // a fresh credit window for free — once per resume attempt.
+    anyhow::ensure!(
+        metric_line_present(
+            &metrics.encode()?,
+            "decdn_serve_stream_rejected_insufficient_deposit_total 1"
+        ),
+        "the futile resume retry must be refused pre-serve, not re-served"
     );
 
     client_ep.close().await;
@@ -2678,6 +2709,279 @@ async fn client_unknown_channel_is_rejected() -> anyhow::Result<()> {
             "decdn_serve_stream_rejected_unknown_channel_total 1"
         ),
         "unknown-channel refusal must bump its reason counter"
+    );
+
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
+/// #1516 pre-serve deposit gate: a known, owned channel whose deposit cannot
+/// cover the first credit window is refused *before* the node signs `ok: true`.
+/// Previously the node signed and streamed a whole window (one 1 MiB interval at
+/// the harness cadence) before `stage_voucher`'s `AmountExceedsDeposit` could
+/// fire at the first voucher boundary — a free interval per request, on every
+/// request. The 1.5 MiB blob exceeds the window, so the gate is what stops the
+/// stream, not the blob running out. Deposit 9 sits one base unit under the
+/// window's cost of 10 at `RATE_PER_MB`.
+#[tokio::test(flavor = "multi_thread")]
+async fn client_underfunded_channel_is_refused_pre_serve() -> anyhow::Result<()> {
+    let payload = vec![0xABu8; 1_572_864]; // 1.5 MiB — larger than one credit window
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+
+    let signer = Arc::new(PrivateKeySigner::random());
+    let store = Arc::new(MemoryChannelStateStore::new());
+    store.record(&ChannelState::new(
+        channel_id(),
+        signer.address(),
+        signer.address(),
+        TOKEN,
+        U256::from(9u64), // one under `min_payment(1 MiB, RATE_PER_MB) == 10`
+    ))?;
+    let store_dyn: Arc<dyn ChannelStateStore> = store.clone();
+    let (target, _server_eth, server_ep, server_task, metrics) =
+        spawn_handler_server_with_metrics(cache, store_dyn, RATE_PER_MB, 0, 16).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let req = StreamRequest {
+        hash: *hash.as_bytes(),
+        namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        channel_id: channel_id().into(),
+        byte_offset: 0,
+        byte_len: 0,
+        timestamp_us: 0x1516,
+    };
+    // Raw, so the server's FIRST reply is read directly: an `ok: true` here would
+    // mean bytes were already committed to the wire.
+    match raw_request(&client_ep, target, &req, None).await? {
+        ClientMessage::StreamResponse(resp) => {
+            anyhow::ensure!(
+                !resp.body.ok,
+                "an underfunded channel must be refused pre-serve, not served"
+            );
+            anyhow::ensure!(
+                matches!(
+                    resp.error,
+                    Some(decdn_protocol::client::StreamError::NotFound)
+                ),
+                "expected the collapsed NotFound wire code, got {:?}",
+                resp.error
+            );
+        }
+        other => anyhow::bail!("expected a pre-serve StreamResponse refusal, got {other:?}"),
+    }
+
+    anyhow::ensure!(
+        metric_line_present(
+            &metrics.encode()?,
+            "decdn_serve_stream_rejected_insufficient_deposit_total 1"
+        ),
+        "the refusal must be distinguishable server-side — the wire code is lossy"
+    );
+    // The acceptance criterion of #1516: zero bytes served. The channel never
+    // advanced, so nothing was delivered and nothing was owed.
+    let persisted = store.load_all()?;
+    let state = persisted
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("the seeded channel must still be persisted"))?;
+    anyhow::ensure!(
+        state.last_bytes_delivered() == U256::ZERO && state.last_amount() == U256::ZERO,
+        "a refused request must deliver zero bytes; got {} bytes / {} owed",
+        state.last_bytes_delivered(),
+        state.last_amount()
+    );
+
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
+/// The `min(credit window, request span)` term of the #1516 gate. The gate
+/// reserves what the node can actually front before the first voucher, which for
+/// a sub-interval blob is the blob — not a full 1 MiB interval it will never
+/// stream. Reserving a whole interval here would price this request at 10 and
+/// refuse a deposit of 5 that comfortably covers the ~3 the transfer really
+/// costs, turning a correctness fix into a regression for small blobs.
+#[tokio::test(flavor = "multi_thread")]
+async fn client_sub_interval_blob_serves_below_one_interval_cost() -> anyhow::Result<()> {
+    let payload = vec![0x2Cu8; 262_144]; // 256 KiB — a quarter of one voucher interval
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+
+    let signer = Arc::new(PrivateKeySigner::random());
+    let deposit = U256::from(5u64); // < one interval's cost (10), > this blob's (~3)
+    let store = Arc::new(MemoryChannelStateStore::new());
+    store.record(&ChannelState::new(
+        channel_id(),
+        signer.address(),
+        signer.address(),
+        TOKEN,
+        deposit,
+    ))?;
+    let store_dyn: Arc<dyn ChannelStateStore> = store.clone();
+    let (target, server_eth, server_ep, server_task, metrics) =
+        spawn_handler_server_with_metrics(cache, store_dyn, RATE_PER_MB, 0, 16).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let ctx = channel_context(signer, deposit);
+    let got = stream_fetch(
+        &client_ep,
+        target,
+        &ctx,
+        &slash_domain(),
+        server_eth.address(),
+        *hash.as_bytes(),
+        0,
+        0x2C01,
+        Duration::from_secs(10),
+    )
+    .await?;
+    anyhow::ensure!(got == payload, "the sub-interval blob must transfer intact");
+    anyhow::ensure!(
+        !metric_line_present(
+            &metrics.encode()?,
+            "decdn_serve_stream_rejected_insufficient_deposit_total 1"
+        ),
+        "a funded sub-interval request must not trip the deposit gate"
+    );
+
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
+/// The gate scales with the configured credit window (#1477), not with one
+/// voucher interval. `deliver` streams while `delivered - paid < window`, so with
+/// a 4 MiB window the node fronts 4 MiB before it collects anything — and a
+/// deposit of 10 covers only the first 1 MiB interval of that. An interval-sized
+/// gate would wave this through (10 >= 10) and hand over 4 MiB, which is exactly
+/// how enabling a credit window would silently re-open the hole #1516 closes.
+#[tokio::test(flavor = "multi_thread")]
+async fn client_deposit_gate_covers_the_configured_credit_window() -> anyhow::Result<()> {
+    const WINDOW: u64 = 4 * 1024 * 1024;
+    let payload = vec![0x77u8; 8 * 1024 * 1024]; // larger than the window, so the window binds
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+
+    let signer = Arc::new(PrivateKeySigner::random());
+    let store = Arc::new(MemoryChannelStateStore::new());
+    store.record(&ChannelState::new(
+        channel_id(),
+        signer.address(),
+        signer.address(),
+        TOKEN,
+        U256::from(10u64), // one interval's worth; the 4 MiB window costs 40
+    ))?;
+
+    // Built inline rather than via `spawn_pipelined_server`, which discards the
+    // metrics handle this test asserts on.
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = Arc::new(PrivateKeySigner::random());
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let store_dyn: Arc<dyn ChannelStateStore> = store.clone();
+    let handler = build_handler_configured(
+        server_id,
+        &server_eth,
+        &metrics,
+        limiter,
+        cache,
+        store_dyn,
+        RATE_PER_MB,
+        |deps| {
+            deps.credit_window_bytes = Some(decdn_cache::Bytes::new(WINDOW));
+        },
+    )?;
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let req = StreamRequest {
+        hash: *hash.as_bytes(),
+        namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        channel_id: channel_id().into(),
+        byte_offset: 0,
+        byte_len: 0,
+        timestamp_us: 0x1477,
+    };
+    match raw_request(&client_ep, target, &req, None).await? {
+        ClientMessage::StreamResponse(resp) => anyhow::ensure!(
+            !resp.body.ok,
+            "a deposit covering one interval must not unlock a four-interval window"
+        ),
+        other => anyhow::bail!("expected a pre-serve StreamResponse refusal, got {other:?}"),
+    }
+    anyhow::ensure!(
+        metric_line_present(
+            &metrics.encode()?,
+            "decdn_serve_stream_rejected_insufficient_deposit_total 1"
+        ),
+        "the credit-window refusal must bump the deposit counter"
+    );
+
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
+/// The #1516 gate reserves remaining HEADROOM, not the gross deposit. Both
+/// deposit authorities — `ChannelState::stage_voucher` off-chain and
+/// `PaymentChannel._advanceClaimWatermark` on-chain — compare the *cumulative*
+/// voucher amount, so a long-lived channel that has already claimed most of its
+/// deposit has almost nothing left to spend. Here the gross deposit (100) is ten
+/// times the window's cost and would sail through a gross-deposit check, while
+/// the real headroom (5) cannot cover it. The `last_*` fields are private
+/// (#751), so the spent-down watermark is built via `hydrate`.
+#[tokio::test(flavor = "multi_thread")]
+async fn client_spent_down_channel_is_refused_pre_serve() -> anyhow::Result<()> {
+    let payload = vec![0x5Du8; 1_572_864]; // 1.5 MiB — one credit window costs 10
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+
+    let client = PrivateKeySigner::random().address();
+    let store = Arc::new(MemoryChannelStateStore::new());
+    store.record(&ChannelState::hydrate(
+        channel_id(),
+        client,
+        client,
+        TOKEN,
+        U256::from(100u64),       // gross deposit — ten windows' worth
+        U256::from(95u64),        // ...but already claimed, leaving headroom of 5
+        U256::from(9u64),         // last_nonce
+        U256::from(9_961_472u64), // last_bytes_delivered
+        Some([0x22; 65]),
+        0,
+        false,
+    ))?;
+    let store_dyn: Arc<dyn ChannelStateStore> = store.clone();
+    let (target, _server_eth, server_ep, server_task, metrics) =
+        spawn_handler_server_with_metrics(cache, store_dyn, RATE_PER_MB, 0, 16).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let req = StreamRequest {
+        hash: *hash.as_bytes(),
+        namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        channel_id: channel_id().into(),
+        byte_offset: 0,
+        byte_len: 0,
+        timestamp_us: 0x5D01,
+    };
+    match raw_request(&client_ep, target, &req, None).await? {
+        ClientMessage::StreamResponse(resp) => anyhow::ensure!(
+            !resp.body.ok,
+            "a spent-down channel must be refused on headroom, not waved through on gross deposit"
+        ),
+        other => anyhow::bail!("expected a pre-serve StreamResponse refusal, got {other:?}"),
+    }
+    anyhow::ensure!(
+        metric_line_present(
+            &metrics.encode()?,
+            "decdn_serve_stream_rejected_insufficient_deposit_total 1"
+        ),
+        "the spent-down refusal must bump the deposit counter"
     );
 
     client_ep.close().await;

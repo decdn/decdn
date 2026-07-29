@@ -4,9 +4,9 @@
 use super::{
     APP_ERR_MALFORMED_MESSAGE, APP_ERR_NO_ERROR, APP_ERR_RATE_LIMITED, APP_IDLE_TIMEOUT, Address,
     Arc, B256, ChannelId, ClientHandler, ClientMessage, Connection, FillOutcome, FirstMessage,
-    Hash, Mutex, OwnedSemaphorePermit, REJECTION_CLOSE_TIMEOUT, RecvStream, RejectReason,
+    Hash, MB_BYTES, Mutex, OwnedSemaphorePermit, REJECTION_CLOSE_TIMEOUT, RecvStream, RejectReason,
     Semaphore, SendStream, ServeRejectReason, StreamReadError, StreamResponseBody, TeeOpen, U256,
-    VarInt, pull_origin_gate_blocks, read_first_message, reset_stream, verify_binding,
+    VarInt, min_payment, pull_origin_gate_blocks, read_first_message, reset_stream, verify_binding,
 };
 use futures_util::StreamExt as _;
 
@@ -570,8 +570,63 @@ impl ClientHandler {
             None => self.voucher_interval_mb,
         };
 
-        // Build and sign the success response.
         let rate_per_mb = self.clamped_rate();
+
+        // Pre-flight deposit gate — the direct-serve twin of the pull-through
+        // guard in `window.rs` (keep the two in step). Without it the node signs
+        // `ok: true` and streams a full credit window before `stage_voucher`'s
+        // `AmountExceedsDeposit` can fire at the first voucher boundary, so a
+        // channel that cannot cover even that first window gets it free on every
+        // request (#1516).
+        //
+        // The quantity is remaining HEADROOM, not the gross deposit: both the
+        // off-chain check (`ChannelState::stage_voucher`) and the on-chain one
+        // (`PaymentChannel._advanceClaimWatermark`) compare the *cumulative*
+        // voucher amount against the deposit, so a long-lived channel with most
+        // of its deposit already claimed has only `deposit - last_amount` left.
+        //
+        // The ceiling is the CREDIT WINDOW, not one interval: `deliver` streams
+        // while `delivered - paid < credit_window(interval_bytes)`, so with
+        // `credit_window_bytes` configured (#1477) the node fronts a whole window
+        // before it collects anything. Gating on one interval would let enabling
+        // a credit window silently re-open the hole.
+        //
+        // ... but capped by the request's own span, or a legitimately funded
+        // sub-interval fetch (a small blob, or a bounded range) would be refused
+        // for not covering a window it will never use. The bounds check above has
+        // already run, so the subtraction cannot underflow; a zero-length blob
+        // yields a zero ceiling and passes (#1054).
+        //
+        // `guard_bytes` is a CONTENT-byte count while billing is in bao WIRE bytes
+        // (the interleaved proof makes wire slightly higher — well under 1% past a
+        // few chunk groups, ADR 038), so the gate under-reserves by that fraction.
+        // Deliberate, and in the safe direction: it can only ever *serve* a
+        // request it should have refused, never refuse one that could pay. The
+        // residual free egress drops from a full credit window to the proof
+        // fraction of one, and the mid-stream ceiling remains the exact authority.
+        //
+        // This is a per-request floor, NOT a reservation: two concurrent streams
+        // on one channel can each pass and jointly exceed the headroom. The
+        // mid-stream backstop bounds that, exactly as it does for `window.rs`.
+        let interval_bytes = interval_mb.saturating_mul(MB_BYTES).max(1);
+        let span = if req.byte_len > 0 {
+            req.byte_len
+        } else {
+            total_bytes.saturating_sub(req.byte_offset)
+        };
+        let guard_bytes = span.min(self.credit_window(interval_bytes));
+        let ceiling = min_payment(guard_bytes, rate_per_mb);
+        let (deposit, last_amount) = {
+            let guard = channel.lock().await;
+            (guard.state.deposit, guard.state.last_amount())
+        };
+        if deposit.saturating_sub(last_amount) < ceiling {
+            return self
+                .respond_error(&mut send, &req, ServeRejectReason::InsufficientDeposit)
+                .await;
+        }
+
+        // Build and sign the success response.
         let body = StreamResponseBody {
             hash: req.hash,
             ok: true,
