@@ -1409,10 +1409,10 @@ contract CapacityBondTest is Test {
         vm.prank(operator);
         bond.bond(MIN_BOND);
         vm.prank(admin);
-        (uint256 slashId,) = bond.slash(operator, challenger, 2, evidence);
+        (uint256 slashId,) = bond.slash(operator, challenger, 1, evidence);
 
         SlashRecord memory r = bond.getSlashRecord(slashId);
-        assertEq(r.offenseType, 2);
+        assertEq(r.offenseType, 1);
         assertEq(r.evidenceHash, evidence);
     }
 

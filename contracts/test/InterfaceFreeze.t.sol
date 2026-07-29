@@ -6,6 +6,7 @@ import { Test } from "forge-std/Test.sol";
 import { PaymentChannel } from "../src/PaymentChannel.sol";
 import { SlashJudge } from "../src/SlashJudge.sol";
 import { OriginAssignment } from "../src/OriginAssignment.sol";
+import { ISlashJudge } from "../src/interfaces/ISlashJudge.sol";
 
 /// @title InterfaceFreezeTest — public-surface stability snapshot (issue #452
 ///        acceptance: "interface ABIs frozen for audit"). Scope is the three
@@ -70,6 +71,18 @@ contract InterfaceFreezeTest is Test {
         assertEq(
             SlashJudge.setChallengeBond.selector, bytes4(keccak256("setChallengeBond(uint256)")), "setChallengeBond"
         );
+    }
+
+    /// @notice `OffenseType` ordinals are durable: they land in
+    ///         `SlashEscrowLib.SlashRecord.offenseType` storage, in both
+    ///         (non-indexed) `Slashed` events, and inside the `evidenceHash`
+    ///         preimage that keys `usedEvidenceHash` and `commitments`. Enum
+    ///         members ABI-encode as `uint8`, so a reorder leaves every selector
+    ///         above unchanged — `test_slashJudge_abiFrozen` is structurally
+    ///         blind to it. This is the gate that is not.
+    function test_slashJudge_offenseOrdinalsFrozen() public pure {
+        assertEq(uint8(ISlashJudge.OffenseType.RateManipulation), 0, "RateManipulation ordinal");
+        assertEq(uint8(ISlashJudge.OffenseType.Blacklist), 1, "Blacklist ordinal");
     }
 
     function test_originAssignment_abiFrozen() public pure {

@@ -66,7 +66,7 @@ EIP712Domain({
 1. Challenger submits the serialized message fields and `slash_sig` to `SlashJudge`.
 2. The contract reconstructs the EIP-712 typed data hash and calls `SignatureChecker.isValidSignatureNow(challengedNode, hash, slash_sig)` — **~3,000 gas** for EOA nodes, **~15,000 gas** for Safe-based nodes ([ADR 024](024-account-abstraction.md#adr-024-account-abstraction-and-safe-smart-wallet-support)).
 3. The challenger-provided address is looked up in `CapacityBond` to confirm it maps to a registered node.
-4. For offenses requiring two messages (rate manipulation), the signatures must both validate against the **same** node address.
+4. For the two-message offense (rate manipulation), the signatures must both validate against the **same** node address.
 
 #### Node Implementation
 
@@ -110,8 +110,10 @@ interface ISlashJudge {
     /// reward (see § Challenge front-running mitigation). Reverts on a duplicate.
     function commitChallenge(bytes32 commitment) external;
 
-    /// Rate manipulation: stream rate > probe rate within 30s window.
-    /// Reveals a prior `commitChallenge`; emits `Slashed` synchronously on success.
+    /// Rate manipulation: stream delivered (`ok == true`) at a rate exceeding
+    /// the probe quote, same hash, within the 30s window. A signed refusal is
+    /// inert as evidence. Reveals a prior `commitChallenge`; emits `Slashed`
+    /// synchronously on success.
     function submitRateChallenge(
         address challengedNode,
         bytes32 nodeId,
@@ -156,7 +158,7 @@ All challenge types MUST validate evidence age using a skew-safe comparison. Let
 
 The check applies at initialization too — neither contract may be deployed with an initial pair that violates the invariant. This matches the cross-parameter setter pattern used elsewhere (see [ADR 026 § Governable parameters with safety bounds](026-tokenomics.md#governable-parameters-with-safety-bounds): the FeeRouter sum-to-100% invariant) — invariants between parameters with a genuine ordering relationship are contract-enforced, not implementation-enforced.
 
-**Rate manipulation:**
+##### Rate manipulation
 
 1. Challenger provides `challengedNode` address (the node's Ethereum address or Safe address)
 2. `SignatureChecker.isValidSignatureNow(challengedNode, probeDigest, probeSlashSig)` — must pass
@@ -281,5 +283,5 @@ The `MAX_EVIDENCE_AGE_US < unbondingPeriod` invariant is paired across two contr
 - The `slash_sig` field adds ~65 bytes per `ProbeResponse` and `StreamResponse`. For probe messages this is meaningful overhead; for stream responses preceding multi-MB deliveries, it is negligible.
 - Off-chain verifiers (clients, requesting nodes, third-party fraud detectors) must `ecrecover` and look up `CapacityBond.nodeIdOf(recovered)` to attribute a message to a NodeId, rather than verifying directly against the iroh key. These parties already maintain the binding cache for voucher attribution, so the marginal cost is one extra map lookup per verification.
 - Cross-contract replay is prevented by per-contract EIP-712 domains, but implementers must configure domain separators correctly at deployment.
-- The [§ SlashJudge Contract](#slashjudge-contract) `Slashed` event adds an `OffenseType` enum, a `nextSlashId` storage slot, and the per-offense `evidenceHash` preimage encoding to `SlashJudge`'s audit surface — small but real: every slash path emits the event atomically with `CapacityBond.slash()`, and the `OffenseType` ordering is contract-canonical (any reordering requires coordinated migration of `SlashAppeal` per [ADR 028 § Contract surface](028-slashing-appeals.md#contract-surface)).
+- The [§ SlashJudge Contract](#slashjudge-contract) `Slashed` event adds an `OffenseType` enum, a `nextSlashId` storage slot, and the per-offense `evidenceHash` preimage encoding to `SlashJudge`'s audit surface — small but real: every slash path emits the event atomically with `CapacityBond.slash()`, and the `OffenseType` ordering is contract-canonical. The ordinal is durable in four places — the persisted `SlashEscrowLib.SlashRecord.offenseType`, the two non-indexed `Slashed` events (whose `topic0` is unchanged by a reorder, so historical logs silently re-decode), the `evidenceHash` preimage that keys `usedEvidenceHash`, and transitively the `commitments` mapping — so any reordering after deployment is a data migration, not an edit. `SlashAppeal` is offense-agnostic and is *not* affected: it reads only the operator from `slashRecords` ([ADR 028 § Contract surface](028-slashing-appeals.md#contract-surface)). The ordinals are pinned by `InterfaceFreeze.t.sol`, since selectors alone cannot detect a reorder.
 - The [§ Challenge front-running mitigation](#challenge-front-running-mitigation-commitreveal) commit–reveal makes every honest challenge two transactions (`commitChallenge` then `submit*Challenge`) separated by `MIN_REVEAL_DELAY`, adds a `commitments` mapping to `SlashJudge`'s storage and audit surface, and introduces an unbonded permissionless commit whose only abuse is gas-bounded storage spam. This is the accepted cost of removing the reward-MEV surface; the slash semantics, evidence checks, and `Slashed` record are unchanged.

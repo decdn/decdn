@@ -23,6 +23,47 @@ since project inception and will roll into the first tagged release.
 
 ### Changed (BREAKING)
 
+- **Phantom-announcement offense retired; probe holds are now best-effort.**
+  `SlashJudge` adjudicates two offenses instead of three. The
+  announce-then-fail-to-deliver ("phantom announcement") offense is gone: it
+  punished an availability miss, and enforcing it required the node to withhold
+  truthful `has_blob` answers under load, which a probe flood could weaponize
+  into a network-wide availability blackout.
+  - **ABI:** `submitPhantomChallenge(address,bytes32,bytes,bytes,bytes,bytes,bytes32)`
+    is removed, along with the `NotPhantom()` error. `ISlashJudge.OffenseType`
+    drops its leading `Phantom` variant and **renumbers**: `RateManipulation`
+    `1 → 0`, `Blacklist` `2 → 1`. The ordinal is durable — it is persisted in
+    `SlashEscrowLib.SlashRecord.offenseType`, emitted in both (non-indexed)
+    `Slashed` events, and folded into the `evidenceHash` preimage that keys
+    `usedEvidenceHash` and `commitments`. `SlashAppeal` is offense-agnostic and
+    needs no migration. `InterfaceFreeze.t.sol` now pins the ordinals, since
+    selectors are invariant under a reorder.
+    - **Migration:** any consumer decoding `offenseType` off-chain — including
+      the `decdn node slashes` admin RPC field `offense_type` — must be
+      updated. A pre-existing on-chain record or log with `offenseType == 1`
+      meant `RateManipulation` and now decodes as `Blacklist`; `2` no longer
+      names an offense. Re-deploy rather than upgrade in place.
+  - **Rate manipulation now requires `stream.ok == true`.** A signed refusal
+    cannot overcharge on a delivery it declined, so a refusal is inert as
+    evidence and a node may sign `ok: false` freely — under either remaining
+    offense (blacklist violation requires a served claim).
+  - **Probe behaviour (observable on the wire).** Presence, not a guaranteed
+    hold, governs `has_blob`. Under hold-budget exhaustion or a stake-lane
+    reservation the node now answers `has_blob: true` and forgoes only the
+    eviction hold, where it previously answered `has_blob: false`. Such a blob
+    stays LRU-evictable, so a pull that loses the race costs one wasted round
+    trip. `max_probe_holds = 0` still answers `has_blob: false`, but only for
+    store-backed content — origin-servable content takes no hold and is
+    advertised regardless. Peer selection will now pick nodes that previously
+    excluded themselves.
+  - **Monitoring-breaking:** `decdn_slash_evidence_exposure_total` and its
+    `DecdnSlashEvidenceExposure` alert are deleted (the series was documented
+    but never emitted, so no dashboard was ever populated by it). The
+    `decdn_probe_hold_unavailable_total{reason}` counter keeps its name while
+    two of its three reasons change meaning — `exhausted` and
+    `stake_lane_reserved` now record an advertised-without-hold probe rather
+    than a suppressed answer. Alert text and the runbook are updated
+    accordingly; review any custom rules built on them.
 - **Log-replay start-block config knobs removed.** **Config-breaking:** the
   three `[blockchain]` scan-floor fields — `origin_directory_from_block`,
   `slash_judge_from_block`, and `content_blacklist_from_block` — are removed.

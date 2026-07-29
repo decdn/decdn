@@ -44,12 +44,12 @@ Metrics are grouped into **mandatory** (M) and **recommended** (R) tiers.
 
 #### Slash-Safety Metrics (all Mandatory)
 
-These give early warning for the two slashable offenses in [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn), grouped here with the closely-related probe-hold capacity metrics. A sustained non-zero value for the blacklist-lag **counters** requires immediate operator attention. The **gauges** (`decdn_probe_hold_slots_used`/`_max`, `decdn_blacklist_version_behind`) are normally non-zero — alert on the thresholds/rates in the table below, not on presence. `decdn_probe_hold_unavailable_total` is an availability signal, not a slash risk — see its row, and alert only on `reason="exhausted"`, the budget-pressure value.
+These give early warning for the two slashable offenses in [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn), grouped here with the closely-related probe-hold capacity metrics. A sustained non-zero value for the blacklist-lag **gauges** requires immediate operator attention. Those gauges and the probe-hold ones (`decdn_probe_hold_slots_used`/`_max`, `decdn_blacklist_version_behind`) are normally non-zero — alert on the thresholds/rates in the table below, not on presence. `decdn_probe_hold_unavailable_total` is an availability signal, not a slash risk — see its row, and alert only on `reason="exhausted"`, the budget-pressure value.
 
 | Metric | Type | Tier | Description |
 |--------|------|------|-------------|
-| `decdn_probe_hold_unavailable_total{reason}` | Counter | M | A probe that could not be answered from a guaranteed eviction hold, so the node signed `has_blob: false` ([ADR 005](005-protocol.md#probe-triggered-eviction-hold)). Always an availability degradation, never a safety fault — the literal "evicted after signing `has_blob: true`" case is unreachable by construction (held hashes are invisible to the LRU driver). The `reason` label carries the cause, because each has a different operator remedy: **`exhausted`** — blob present but **all** hold slots were live (`max_probe_holds` reached); genuine budget pressure and the only value the "raise `max_probe_holds`" alert fires on. **`disabled`** — blob present but the hold path is **off by config** (`max_probe_holds == 0`); an intentional operator choice, so alerting on it would be nonsensical (#739). **`stake_lane_reserved`** — an end-client probe hit the stake-lane-reserved end-client ceiling (`max_probe_holds − cache.stake_lane_reserved_holds`), keeping headroom for registered node-to-node cache-miss probes (#757, [ADR 003 § Admission and Priority](003-payments.md#admission-and-priority)); fires *before* the hold attempt, so the cache is not consulted — a content-independent admission decision — and stays zero unless `cache.stake_lane_reserved_holds > 0`. All three children are exported at zero from startup, so a missing series means a broken exporter, not an idle node. |
-| `decdn_probe_hold_slots_used` | Gauge | M | Eviction-hold slots in use out of `max_probe_holds`. Saturation forces `has_blob: false` at probe time. |
+| `decdn_probe_hold_unavailable_total{reason}` | Counter | M | A probe for a present blob that got **no** eviction hold ([ADR 005](005-protocol.md#probe-triggered-eviction-hold)). Holds are best-effort, so this is not the same as answering `has_blob: false` — see the per-reason split. Never a safety fault: no offense pairs a probe with a later miss ([ADR 014](014-on-chain-verification.md#rate-manipulation)), and an unheld advertisement that loses the eviction race costs one wasted round trip. The `reason` label carries the cause, because each has a different operator remedy: **`exhausted`** — blob present but **all** hold slots were live (`max_probe_holds` reached); the node still advertises `has_blob: true` and forgoes only the hold, so the blob may be LRU-evicted before the pull. Genuine budget pressure and the only value the "raise `max_probe_holds`" alert fires on. **`disabled`** — blob present but the hold path is **off by config** (`max_probe_holds == 0`); the one reason that also suppresses the advertisement (`has_blob: false` for store-backed content; origin-held content takes no hold and is unaffected). An intentional operator choice, so alerting on it would be nonsensical (#739). **`stake_lane_reserved`** — an end-client probe hit the stake-lane-reserved end-client ceiling (`max_probe_holds − cache.stake_lane_reserved_holds`), keeping hold headroom for registered node-to-node cache-miss probes (#757, [ADR 003 § Admission and Priority](003-payments.md#admission-and-priority)). The reservation is a content-independent admission decision taken before any hold attempt, but the handler still consults the cache to answer honestly and advertises a present blob. Stays zero unless `cache.stake_lane_reserved_holds > 0`. All three children are exported at zero from startup, so a missing series means a broken exporter, not an idle node. |
+| `decdn_probe_hold_slots_used` | Gauge | M | Eviction-hold slots in use out of `max_probe_holds`. Saturation means new probes are advertised without a hold, not answered `has_blob: false`. |
 | `decdn_probe_hold_slots_max` | Gauge | M | Configured `max_probe_holds`. Paired with `decdn_probe_hold_slots_used` for a saturation ratio. |
 | `decdn_blacklist_sync_lag_seconds` | Gauge | M | Seconds since the last successful `getBlacklistVersion()` poll. Exceeding the compliance window makes serving any recently-blacklisted hash slashable ([ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting)). |
 | `decdn_blacklist_version_behind` | Gauge | M | `on_chain_version − local_version`. Positive means new blacklist entries not yet fetched. |
@@ -102,9 +102,9 @@ These give early warning for the two slashable offenses in [ADR 026 § Slashing 
 > The probe-hold capacity counter `decdn_probe_hold_unavailable_total{reason}`
 > and the `decdn_probe_hold_slots_used` / `_max` gauges live in
 > [§ Slash-Safety Metrics](#slash-safety-metrics-all-mandatory), not here. They
-> are grouped there deliberately, alongside the slash-evidence counters they sit
-> next to on an operator's dashboard. Documenting them twice is how the two
-> copies drifted apart.
+> are grouped there deliberately, alongside the blacklist-compliance metrics
+> they sit next to on an operator's dashboard. Documenting them twice is how the
+> two copies drifted apart.
 
 #### Payment Channel Metrics
 
@@ -241,7 +241,7 @@ Metrics cover aggregates; structured logs cover per-event detail. Logs complemen
 - **Library:** `tracing` crate (standard in the iroh ecosystem).
 - **Format:** JSON (`tracing-subscriber` `json` formatter) for production machine consumption. Human-readable (`pretty`) available via config flag for local development.
 - **Log levels:**
-  - `ERROR` — unrecoverable, needs operator intervention (startup failures, slash-evidence exposure, RPC unreachable after all retries).
+  - `ERROR` — unrecoverable, needs operator intervention (startup failures, RPC unreachable after all retries).
   - `WARN` — recoverable degraded conditions (blacklist poll lag > 1 interval, startup clock skew > 10 s, probe hold slot saturation > 90%).
   - `INFO` — significant lifecycle events (node ready, channel opened/settled, peer joined/left, `NodeAnnounce` published).
   - `DEBUG` — per-stream and per-probe events. Not for high-volume production.

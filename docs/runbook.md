@@ -128,8 +128,9 @@ slashed by an external adversary.
 
 - Alerts in `monitoring/prometheus-alerts.yml` (verbatim names):
   - `DecdnProbeHoldViolations` (critical) — hold budget exhausted, so
-    present blobs are being answered `has_blob: false`. Budget pressure and
-    lost revenue, not slash evidence; see step 4.
+    present blobs are being advertised without an eviction hold and may be
+    evicted before the pull arrives. Budget pressure and lost deliveries,
+    not slash evidence; see step 4.
   - `DecdnBlacklistSyncLagCritical` (critical) — blacklist > 30 minutes
     stale; serving any recently blacklisted hash is now slashable.
   - `DecdnBlacklistVersionFarBehind` (critical) — multiple blacklist
@@ -181,14 +182,15 @@ slashed by an external adversary.
    (`APPEAL_FREQUENCY_WINDOW`), so lead with the most clear-cut case. Flow,
    windows, and what counts as evidence:
    [ADR 028](../adr/028-slashing-appeals.md#adr-028-slashing-appeals-and-dispute-escalation).
-4. **For `DecdnProbeHoldViolations`:** this is lost revenue, not slash
+4. **For `DecdnProbeHoldViolations`:** this is lost deliveries, not slash
    evidence. The alert watches
    `decdn_probe_hold_unavailable_total{reason="exhausted"}` and fires when a
    blob is present but *un-holdable*
-   because every hold slot is live, so the node signs `has_blob: false` and
-   forgoes the delivery rather than advertise a blob it cannot serve — the
-   literal "evicted after advertising `has_blob: true`" case is unreachable by
-   construction (held hashes are invisible to the LRU driver). Raise the
+   because every hold slot is live. Holds are best-effort, so the node still
+   signs `has_blob: true` and forgoes only the hold — the blob stays visible to
+   the LRU driver and may be evicted before the requester's pull arrives, which
+   costs a wasted round trip. No offense pairs a probe with a later miss, so
+   this is never slash evidence. Raise the
    budget with `[cache] max_probe_holds` (`--max-probe-holds` /
    `DECDN_MAX_PROBE_HOLDS`, default 256); a busy node serving many peers
    should scale it up proportionally, while a node with a *small* cache
@@ -196,13 +198,13 @@ slashed by an external adversary.
    restart-required** — a config reload logs "requires restart" and keeps the
    old value. Add host memory or shed load if the pressure is genuine. If the
    series is flat but `reason="disabled"` or `reason="stake_lane_reserved"` is
-   climbing, the refusals are deliberate — a `max_probe_holds` of 0, or
+   climbing, the forgone holds are deliberate — a `max_probe_holds` of 0, or
    end-client probes shed to keep stake-lane headroom — and neither calls for
-   this remedy.
+   this remedy. Note only `disabled` also suppresses the advertisement;
+   `stake_lane_reserved` still answers `has_blob: true`.
    Background:
    [ADR 005 § Hold budget](../adr/005-protocol.md#hold-budget) and
    [Appendix: Observability](../adr/appendix-observability.md#slash-safety-metrics-all-mandatory).
-   See also [ADR 008](../adr/008-reputation.md) for reputation impact.
 
 ## ContentBlacklist compliance
 

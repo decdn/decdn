@@ -2683,8 +2683,8 @@ mod tests {
     }
 
     /// ADR 001 §Probe cache mandates tracking the `EvictedSinceProbe` rate, and
-    /// ADR 005 explains why it is not just "a candidate failed": a peer emitting
-    /// it inside `PROBE_SLASH_WINDOW` has handed us slash evidence. Both causes
+    /// ADR 005 explains why it is not just "a candidate failed": it is a peer
+    /// contradicting its own recent availability answer. Both causes
     /// are `DurableMiss` — they say the same thing about the peer — but only one
     /// is that signal, and a shared unpayloaded variant cannot tell them apart.
     #[test]

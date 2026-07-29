@@ -1022,9 +1022,11 @@ async fn probe_has_blob_true_for_cached_blob() -> anyhow::Result<()> {
 }
 
 /// A node with the eviction-hold path **disabled by config**
-/// (`max_probe_holds == 0`) holds the blob but cannot guarantee a hold, so it
-/// answers `has_blob: false` with a valid `slash_sig` over `has_blob=false` —
-/// declining to advertise a hold it cannot guarantee (ADR 005 §Hold budget).
+/// (`max_probe_holds == 0`) holds the blob but answers `has_blob: false` with a
+/// valid `slash_sig` over `has_blob=false`. The reason is the operator opt-out,
+/// NOT the missing guarantee — `BudgetExhausted` also places no hold and still
+/// advertises. `max_probe_holds = 0` means "do not advertise store-backed
+/// content at all" (ADR 005 §Hold budget).
 /// Exercises the handler's `HoldsDisabled` arm end-to-end and asserts the
 /// outcome is counted as a *disabled* event, NOT as budget pressure (#739).
 #[tokio::test(flavor = "multi_thread")]
@@ -1096,6 +1098,10 @@ async fn probe_budget_exhausted_still_advertises_and_counts_exhausted() -> anyho
         cache.try_probe_hold(ha).await? == decdn_cache::ProbeHoldOutcome::Held,
         "first hold should fit the budget"
     );
+    // Kept so the test can prove the budget was respected, not just reported:
+    // `has_blob` looks identical whether the second probe forwent the hold or
+    // overran `max_probe_holds`.
+    let cache_probe = cache.clone();
 
     let server_sk = fresh_key();
     let server_id = server_sk.public();
@@ -1119,6 +1125,15 @@ async fn probe_budget_exhausted_still_advertises_and_counts_exhausted() -> anyho
         resp.total_bytes
     );
     assert_slash_sig_valid(&resp, &signer, &domain)?;
+
+    // The budget is a hard ceiling: the advertised-but-unheld blob must not
+    // have taken a second slot. Only `ha` is held.
+    anyhow::ensure!(
+        cache_probe.probe_hold_slots_used() == 1,
+        "budget-exhausted must forgo the hold, leaving max_probe_holds=1 slot \
+         in use; found {}",
+        cache_probe.probe_hold_slots_used()
+    );
 
     let text = metrics.encode()?;
     anyhow::ensure!(
@@ -1153,6 +1168,11 @@ async fn probe_end_client_reserved_out_still_advertises() -> anyhow::Result<()> 
     let payload = b"reserved-for-stake-lane content";
     let (cache, hash, _cache_tmp) = cache_with_blob(payload).await?;
     cache.set_max_probe_holds(1);
+    // Kept so the test can inspect hold state after the probe. Asserting the
+    // wire answer alone cannot distinguish "advertised, no hold" from
+    // "advertised AND consumed a reserved slot" — the latter is exactly the
+    // regression #757 exists to prevent, and it is invisible in `has_blob`.
+    let cache_probe = cache.clone();
 
     let server_sk = fresh_key();
     let server_id = server_sk.public();
@@ -1188,6 +1208,14 @@ async fn probe_end_client_reserved_out_still_advertises() -> anyhow::Result<()> 
         resp.total_bytes
     );
     assert_slash_sig_valid(&resp, &signer, &domain)?;
+
+    // The point of the reservation: the end-client got an honest answer but
+    // consumed NO hold slot, leaving the whole budget for the stake lane.
+    anyhow::ensure!(
+        cache_probe.probe_hold_slots_used() == 0,
+        "a reserved-out end-client must place no hold; {} slot(s) in use",
+        cache_probe.probe_hold_slots_used()
+    );
 
     let text = metrics.encode()?;
     anyhow::ensure!(
@@ -1225,6 +1253,9 @@ async fn probe_stake_lane_requester_keeps_reserved_headroom() -> anyhow::Result<
     let payload = b"served to a node-to-node requester";
     let (cache, hash, _cache_tmp) = cache_with_blob(payload).await?;
     cache.set_max_probe_holds(1);
+    // The mirror of the end-client assertion: a stake-lane requester must
+    // actually CONSUME the slot the reservation held open for it.
+    let cache_probe = cache.clone();
 
     let server_sk = fresh_key();
     let server_id = server_sk.public();
@@ -1263,6 +1294,15 @@ async fn probe_stake_lane_requester_keeps_reserved_headroom() -> anyhow::Result<
         resp.total_bytes
     );
     assert_slash_sig_valid(&resp, &signer, &domain)?;
+
+    // Unlike the shed end-client, this requester went through the real hold
+    // path and took the reserved slot. Together the two tests pin the
+    // reservation's actual behaviour, not just its counter.
+    anyhow::ensure!(
+        cache_probe.probe_hold_slots_used() == 1,
+        "a stake-lane requester must consume its reserved hold slot; {} in use",
+        cache_probe.probe_hold_slots_used()
+    );
 
     let text = metrics.encode()?;
     anyhow::ensure!(

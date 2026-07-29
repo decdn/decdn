@@ -32,6 +32,11 @@
 //!   rejected (`InvalidProbeSignature`);
 //! - the real stream with its signature swapped for a non-operator's is rejected
 //!   (`InvalidStreamSignature`);
+//! - a real, correctly-signed daemon *refusal* (`ok: false`) at the raised rate,
+//!   paired with the node's own base-rate probe for that hash, is rejected
+//!   (`NotRateManipulation`). Every other leg of the predicate passes, so this
+//!   isolates the `stream.ok` guard — the property that lets a node sign
+//!   refusals freely;
 //! - the same real pair replayed after a successful slash is rejected
 //!   (`EvidenceAlreadyUsed`);
 //! - a failed challenge moves no TOKEN. Note the issue text says the challenger
@@ -75,6 +80,7 @@ use std::time::Duration;
 use alloy::primitives::{B256, U256};
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::Context;
+use decdn_cache::Hash;
 use decdn_e2e::assert::expect_revert_anyhow;
 use decdn_e2e::bindings::SlashJudgeRate;
 use decdn_e2e::chain::{ChainFixture, EvidencePair, Offense};
@@ -146,6 +152,17 @@ async fn run() -> anyhow::Result<()> {
         probe.body.rate_per_mb == BASE_RATE_PER_MB,
         "node must quote the configured rate before the switch, got {}",
         probe.body.rate_per_mb
+    );
+
+    // A base-rate probe for a hash the node does NOT hold, feeding the
+    // signed-refusal negative (2c) below. `has_blob: false` is irrelevant to the
+    // rate predicate — what matters is that the probe is real, signed, at the
+    // base rate, and names the same hash the refusal will.
+    let absent = Hash::new(b"g-gov-03: never published, always refused");
+    let absent_probe = client.probe_at(&node, absent, probe_ts).await?;
+    anyhow::ensure!(
+        !absent_probe.body.has_blob,
+        "the node must not claim a blob it was never given"
     );
 
     // The switch: rewrite the operator's own config rate and hot-reload it. No
@@ -259,6 +276,44 @@ async fn run() -> anyhow::Result<()> {
         "forged stream signature",
     )?;
     assert_challenge_cost_nothing(&chain, stream_forger.address(), bond).await?;
+
+    // (2c) A real, correctly-signed REFUSAL is inert. The daemon signed
+    // `ok: false` for a hash it does not hold, at the raised rate, inside the
+    // window, against the probe it issued for that same hash at the base rate.
+    // Every other leg of the rate predicate passes — same hash, same operator,
+    // real signatures, and `stream.ratePerMb > probe.ratePerMb` — so
+    // `NotRateManipulation` here can only be the `!s.ok` guard firing. This is
+    // what lets a node sign refusals freely (ADR 014 § Rate manipulation): you
+    // cannot overcharge on a delivery you declined.
+    let refusal = client
+        .refused_stream(&chain, &node, session.channel_id(), absent, stream_ts)
+        .await?;
+    anyhow::ensure!(!refusal.body.ok, "the captured refusal must be ok:false");
+    anyhow::ensure!(
+        refusal.body.rate_per_mb > absent_probe.body.rate_per_mb,
+        "the refusal must quote the raised rate so only the ok-guard can reject: \
+         probe {} vs stream {}",
+        absent_probe.body.rate_per_mb,
+        refusal.body.rate_per_mb
+    );
+    let refusal_challenger = PrivateKeySigner::random();
+    let err = chain
+        .challenge_with_real_evidence(
+            &refusal_challenger,
+            node.operator_addr(),
+            node_id,
+            Offense::RateManipulation,
+            EvidencePair {
+                probe: &absent_probe,
+                stream: &refusal,
+            },
+            B256::repeat_byte(0x08),
+        )
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("a signed refusal must never be rate-manipulation"))?;
+    expect_revert_anyhow::<SlashJudgeRate::NotRateManipulation>(&err, "signed refusal")?;
+    assert_challenge_cost_nothing(&chain, refusal_challenger.address(), bond).await?;
 
     // (3) Neither failed challenge minted anything: the operator is still unslashed.
     anyhow::ensure!(

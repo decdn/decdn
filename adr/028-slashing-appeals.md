@@ -112,7 +112,7 @@ This ADR specifies the contract surface at the semantic level — function signa
 
 ```solidity
 // On SlashAppeal. `slashId` is allocated by CapacityBond.slash (ADR 014 §
-// SlashJudge → CapacityBond) — globally monotonic, single counter across all
+// SlashJudge → CapacityBond) — globally monotonic, single counter across
 // both offense types. `evidenceBundleHash` references the off-chain bundle.
 function openSlashAppeal(uint256 slashId, bytes32 evidenceBundleHash) external; // posts APPEAL_BOND, calls markAppealOpen
 function fastTrackAppeal(uint256 slashId) external onlyEmergencyMultisig;

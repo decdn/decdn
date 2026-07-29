@@ -223,7 +223,7 @@
           "refId": "B"
         }
       ],
-      "title": "Slash-risk event rates",
+      "title": "Probe-hold & rate-clamp event rates",
       "type": "timeseries"
     },
     {

@@ -196,6 +196,28 @@ impl ProbeHandler {
         }
     }
 
+    /// The advertised `total_bytes` for a blob already established as present.
+    ///
+    /// `total_bytes` is an unsigned, optional hint outside the `slash_sig`
+    /// typehash, so `None` degrades cleanly to "unknown but fetchable" — no
+    /// consumer treats it as a presence signal. An `Err` here is still worth a
+    /// log: every caller has *just* proven the blob present, so a failing
+    /// `inspect` means the store started degrading in between, which is a
+    /// strictly stronger signal than the plain miss the `Err` arms warn about.
+    async fn inspect_size(&self, hash: Hash) -> Option<u64> {
+        match self.cache.inspect(hash).await {
+            Ok(preview) => preview.size_bytes,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    %hash,
+                    "inspect failed for a blob just proven present; advertising without a size"
+                );
+                None
+            }
+        }
+    }
+
     // Linear, ordered protocol sequence (limit → accept → read → hold →
     // clamp → sign → write → close). Splitting it would scatter the ADR-013
     // app-error-code mapping and the ADR-005 ordering invariants across
@@ -333,67 +355,79 @@ impl ProbeHandler {
         // whenever it holds the blob and has not refused it, then keeps a 35s
         // eviction hold *if it can* so the blob is still resident for the
         // follow-up pull. Budget pressure or a stake-lane reservation only means
-        // "place no hold" — never "deny an honest answer": a blob evicted before
-        // the pull is a reputation miss (ADR 008), not a slash, so a probe flood
-        // that fills the hold cache can never suppress a truthful `has_blob`.
+        // "place no hold" — never "deny an honest answer", so a probe flood that
+        // fills the hold cache can never suppress a truthful `has_blob`.
+        //
+        // What an unheld advertisement actually costs, if the blob is
+        // LRU-evicted before the pull lands: one wasted round trip. The delivery
+        // path answers a plain `NotFound` and the requester goes elsewhere. It
+        // is NOT a slash (no offense pairs a probe with a miss — ADR 014), and
+        // it is NOT a reputation penalty either: `classify_refusal` rates
+        // `NotFound` as `RefusalVerdict::Transient`, which briefly suppresses
+        // the (peer, hash) pair *without* scoring the peer, because a miss is
+        // not attributable to it (see `node_origin.rs`). Do not justify this
+        // path by reputation — nothing records an outcome for it.
+        //
         // The hold is attempted *after* the rate limiter (ADR 005 §Probe rate
         // limiting: hold admission occurs only after the limiter passes — do not
         // reorder).
         let (has_blob, total_bytes) = if stake_lane_reserved {
             // End-client shed to protect stake-lane hold headroom (#757): place
             // no hold, but still answer honestly — presence does not depend on a
-            // slot. `has()` excludes operator-evicted; the `refuses` re-check
-            // excludes a blacklisted/denied hash (signing `has_blob: true` for
-            // one is a blacklist-violation offense, ADR 014).
+            // slot. `has()` already folds in `refuses()` (denied / chain-denied /
+            // operator-evicted), so it alone settles presence; the second
+            // `refuses` call is not a distinct predicate but a re-check that
+            // narrows the TOCTOU window the `await` opens, because signing
+            // `has_blob: true` for a blacklisted hash is a blacklist-violation
+            // offense (ADR 014).
             self.metrics
                 .probe_hold_unavailable(ProbeHoldUnavailableReason::StakeLaneReserved);
             match self.cache.has(hash).await {
-                Ok(true) if !self.cache.refuses(hash) => {
-                    let size = self
-                        .cache
-                        .inspect(hash)
-                        .await
-                        .ok()
-                        .and_then(|p| p.size_bytes);
-                    (true, size)
+                Ok(true) if !self.cache.refuses(hash) => (true, self.inspect_size(hash).await),
+                Ok(_) => (false, None),
+                // Same reasoning as the `try_probe_hold` `Err` arm below: a store
+                // fault is not "absent" and must not be silently indistinguishable
+                // from one. This path runs only under hold pressure — precisely
+                // when a degrading backend is most worth surfacing.
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        %hash,
+                        "cache error during stake-lane shed presence check; \
+                         answering has_blob:false"
+                    );
+                    (false, None)
                 }
-                _ => (false, None),
             }
         } else {
             match self.cache.try_probe_hold(hash).await {
-                Ok(ProbeHoldOutcome::Held) => {
-                    let size = self
-                        .cache
-                        .inspect(hash)
-                        .await
-                        .ok()
-                        .and_then(|p| p.size_bytes);
-                    (true, size)
-                }
+                Ok(ProbeHoldOutcome::Held) => (true, self.inspect_size(hash).await),
                 Ok(ProbeHoldOutcome::BudgetExhausted) => {
                     // Present but every hold slot is live: advertise anyway and
                     // forgo the hold. A probe flood that fills the best-effort
                     // hold cache cannot suppress an honest answer — the blob is
                     // here now (a `BudgetExhausted` outcome already means present
-                    // and not refused); if it is evicted before the pull that is
-                    // a reputation miss, not a slash. Raising `max_probe_holds`
-                    // is still the remedy for the lost holds (#739).
+                    // and not refused). If it is evicted before the pull, that
+                    // costs one wasted round trip (see the block comment above).
+                    // Raising `max_probe_holds` is still the remedy for the lost
+                    // holds (#739).
                     self.metrics
                         .probe_hold_unavailable(ProbeHoldUnavailableReason::Exhausted);
-                    let size = self
-                        .cache
-                        .inspect(hash)
-                        .await
-                        .ok()
-                        .and_then(|p| p.size_bytes);
-                    (true, size)
+                    (true, self.inspect_size(hash).await)
                 }
                 Ok(ProbeHoldOutcome::HoldsDisabled) => {
                     // Holds disabled by config (`max_probe_holds == 0`) is the
-                    // operator's explicit opt-out from probe-advertised serving:
-                    // answer `has_blob: false` so this node is never selected for
-                    // the blob. Distinct from budget pressure (which still
-                    // advertises) — this is a deliberate choice, not load (#739).
+                    // operator's explicit opt-out from advertising *store-backed*
+                    // content: answer `has_blob: false` so this node is not
+                    // selected off the evictable store. Distinct from budget
+                    // pressure (which still advertises) — a deliberate choice,
+                    // not load (#739).
+                    //
+                    // It is not a blanket "answer false to everything": the
+                    // origin-held fallback below takes no hold and so is
+                    // unaffected by this setting. A node with a configured origin
+                    // still advertises origin-servable content with
+                    // `max_probe_holds == 0`.
                     self.metrics
                         .probe_hold_unavailable(ProbeHoldUnavailableReason::Disabled);
                     (false, None)
@@ -419,16 +453,20 @@ impl ProbeHandler {
         };
 
         // Origin-held fallback (#1130). If the store can't back a
-        // `has_blob: true` — the blob was never pulled into it — but it is
-        // servable from a configured origin (fs directory entry, or a present
-        // pin), advertise it anyway so cold origin content is discoverable on
-        // the first probe rather than only after a warm.
+        // `has_blob: true` — the blob was never pulled into it, holds are
+        // disabled, or the store read faulted — but it is servable from a
+        // configured origin (fs directory entry, or a present pin), advertise it
+        // anyway so cold origin content is discoverable on the first probe
+        // rather than only after a warm.
         //
         // Origin content takes **no** eviction hold: it lives on disk / behind
-        // the origin, not in the evictable store, so hold-budget pressure is
-        // irrelevant to it. If the origin object later vanishes before the pull,
-        // the delivery path answers a plain miss and the requester retries
-        // elsewhere — an availability matter (ADR 008), not a slash.
+        // the origin, not in the evictable store, so hold-budget pressure and
+        // `max_probe_holds` are both irrelevant to it — which is why
+        // `max_probe_holds == 0` silences store-backed advertisements but not
+        // these. If the origin object later vanishes before the pull, the
+        // delivery path answers a plain miss and the requester retries
+        // elsewhere: one wasted round trip, not a slash (ADR 014) and not a
+        // reputation penalty (see the hold block comment above).
         let (has_blob, total_bytes) =
             fold_origin_held((has_blob, total_bytes), self.cache.origin_held_size(hash));
         // On the shed path no hold was attempted, so the value sampled for

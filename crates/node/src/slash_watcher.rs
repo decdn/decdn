@@ -712,7 +712,7 @@ mod tests {
         let reads = StubSlashReads::new(
             op,
             vec![
-                (U256::from(10u64), record(2, 100, 0x11, now - 1)),
+                (U256::from(10u64), record(1, 100, 0x11, now - 1)),
                 (U256::from(20u64), record(1, 200, 0x22, now + 50)),
                 (U256::from(30u64), record(0, 300, 0x33, now + 99)),
             ],

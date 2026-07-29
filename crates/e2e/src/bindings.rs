@@ -350,6 +350,11 @@ alloy::sol! {
         /// slash. The dedup guard that lives in `SlashJudge` itself (not
         /// `CapacityBond`), replayed under a fresh salt by the #1378 negative.
         error EvidenceAlreadyUsed(bytes32 evidenceHash);
+        /// The pair passed every structural check but is not an overcharge:
+        /// either the stream refused (`!ok`) or it did not exceed the probe
+        /// quote. The `!ok` leg is what keeps a signed refusal inert as
+        /// evidence, exercised by the signed-refusal negative.
+        error NotRateManipulation();
 
         function submitRateChallenge(
             address challengedNode,
