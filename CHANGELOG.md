@@ -23,6 +23,15 @@ since project inception and will roll into the first tagged release.
 
 ### Changed (BREAKING)
 
+- **Log-replay start-block config knobs removed.** **Config-breaking:** the
+  three `[blockchain]` scan-floor fields — `origin_directory_from_block`,
+  `slash_judge_from_block`, and `content_blacklist_from_block` — are removed.
+  Every chain watcher now enumerates its state on chain and seeds the live tail
+  rather than replaying `eth_getLogs` history from a configured floor, so none
+  of the three is read anymore. Because `[blockchain]` uses
+  `deny_unknown_fields`, a config file that still sets any of them now fails
+  `decdn config validate` and node startup — delete the keys. There is no
+  replacement setting.
 - **Payment-channel funder and voucher signer are now separate roles.**
   `openChannel` takes a third argument pinning the channel's `voucherSigner` —
   the address every voucher signature is verified against, on all four

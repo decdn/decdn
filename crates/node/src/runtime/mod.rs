@@ -793,23 +793,25 @@ async fn build_chain_and_handlers(
     // during drain). Also held inside both façades' projections.
     let capacity_bond_watcher = registry.watcher;
 
-    // Slash-detection watcher (#1032, G-NODE-05): follow `SlashJudge.Slashed`
-    // for this operator so the slash surfaces over `admin_v1_slashes` (+ the
-    // `decdn_slashes_detected_total` metric) and the operator can file
-    // `decdn appeal slash` in time. Read-only; held to `run()`'s end so its
-    // background task lives as long as the daemon. `bootstrap` is infallible —
-    // every RPC (head read, `get_logs`) happens inside the poll
-    // loop, so a bring-up RPC blip retries with backoff rather than disabling
-    // detection for the daemon's lifetime.
+    // Slash-detection watcher (#1032, G-NODE-05): enumerate this operator's
+    // still-appealable slashes from `CapacityBond` and follow `SlashRecorded`, so
+    // a slash surfaces over `admin_v1_slashes` (+ the `decdn_slashes_detected_total`
+    // metric) and the operator can file `decdn appeal slash` in time. Read-only;
+    // held to `run()`'s end so its background task lives as long as the daemon.
+    // The boot enumeration is fatal, like the CapacityBond registry bootstrap
+    // above on the same contract that already gates startup — so it adds no new
+    // failure mode; thereafter a tail blip retries and the periodic resync heals
+    // drift, so detection is never disabled for the daemon's lifetime.
     let slash_watcher = crate::slash_watcher::SlashWatcher::bootstrap(
         ProviderFactory::read_only(rpc_url.clone(), event_poll_interval),
-        slash_judge_addr,
+        capacity_bond_addr,
         infra.eth_signer.address(),
-        cfg.blockchain.slash_judge_from_block,
         event_poll_interval,
         Arc::clone(&head),
         Arc::clone(&infra.node_metrics),
-    );
+    )
+    .await
+    .context("bootstrap the slash-detection watcher")?;
     let slash_store = slash_watcher.store();
 
     // NodeId → bonded operator address resolver for node-to-node pulls (#831),
@@ -1259,41 +1261,36 @@ async fn build_chain_and_handlers(
     .await
     .context("PaymentChannel settlement service bootstrap")?;
 
-    // Blacklist compliance watcher (ADR 011/031, issue #1031), spawned early in
-    // bring-up (where the router used to be built) so its mandatory first replay
-    // and operator-scope pass runs concurrently with the rest of startup. It
-    // evicts held blobs whose hash is
-    // blacklisted in scope for this operator, which cascades to DHT-announce
-    // suppression (the republisher's `is_evicted` gate), probe `has_blob:false`,
-    // and delivery refusal — the node's only local protection against the slash
-    // for serving blacklisted content. `blacklist_ready_rx` gates the ALPN
-    // router below on that first pass; the returned `WatcherHandle` owns the
-    // loop's shutdown token (its sink shares it, #1236). Since #1181 the watcher
-    // does persist a scan cursor, so teardown flushes `CheckpointKey::Blacklist`
-    // explicitly (see the shutdown path) rather than relying on `AbortOnDrop`.
+    // Blacklist compliance watcher (ADR 011/031, issue #1031). Its boot pass
+    // ENUMERATES the current on-chain deny-set at one pinned block
+    // (`blacklistedAddresses` ∪ per-region `blacklistedHashes`) rather than
+    // replaying logs, then follows the live tail seeded at that block. It evicts
+    // held blobs whose hash is blacklisted in scope for this operator, which
+    // cascades to DHT-announce suppression (the republisher's `is_evicted` gate),
+    // probe `has_blob:false`, and delivery refusal — the node's only local
+    // protection against the slash for serving blacklisted content.
+    // `blacklist_ready_rx` gates the ALPN router below on that first enumeration;
+    // the returned `WatcherHandle` owns the loop's shutdown token (its sink shares
+    // it, #1236). The tail carries no durable cursor, so teardown has no scan
+    // checkpoint to flush.
     let (blacklist_ready_tx, blacklist_ready_rx) = oneshot::channel();
     let blacklist_watcher = crate::blacklist_watcher::spawn(
         ProviderFactory::read_only(blacklist_rpc_url, event_poll_interval),
         content_blacklist_addr,
         infra.eth_signer.address(),
         infra.cache.clone(),
-        cfg.blockchain.content_blacklist_from_block,
         event_poll_interval,
         Arc::clone(&head),
         Duration::from_secs(cfg.blockchain.content_blacklist_poll_interval_sec),
         blacklist_ready_tx,
         &infra.node_metrics,
-        // The deny-set store must be the *unbuffered* concrete store: the resume
-        // cursor's safety rests on those writes being durable before it advances.
-        // The cursor itself may ride the debounced checkpoint store — a lagging
-        // cursor only widens the next rescan, which is idempotent.
-        infra.concrete_channel_store.clone(),
-        Arc::clone(&infra.watcher_checkpoint_store),
         Arc::clone(&content_denylist),
         capacity_bond_addr,
         Arc::clone(&peer_table),
         Arc::clone(&announce_origin_deny),
-    );
+    )
+    .await
+    .context("blacklist compliance watcher boot enumeration")?;
 
     // Rate-bounds watcher (#1172, ADR 019 §3.1): follows `RateBoundsUpdated` off
     // the shared-head getLogs poller and re-reads `getRateBounds()`
@@ -2148,7 +2145,6 @@ pub async fn run(
         blacklist_watcher: ch.blacklist_watcher,
         rate_bounds_watcher: ch.rate_bounds_watcher,
         origin_watcher: ch.origin_watcher,
-        watcher_checkpoint_store: infra.watcher_checkpoint_store,
         admin_stop_tx: bg.admin_stop_tx,
         rpc_watchdog: bg.rpc_watchdog,
         gossip_shutdown: bg.gossip_shutdown,
@@ -2184,7 +2180,6 @@ struct ShutdownHandles<P: Provider + Clone + 'static> {
     blacklist_watcher: crate::chain_events::resumable_watcher::WatcherHandle,
     rate_bounds_watcher: crate::chain_events::resumable_watcher::WatcherHandle,
     origin_watcher: Option<Arc<crate::chain_events::resumable_watcher::WatcherHandle>>,
-    watcher_checkpoint_store: Arc<dyn decdn_incentive::KeyedCheckpointStore>,
     admin_stop_tx: Option<oneshot::Sender<()>>,
     rpc_watchdog: Option<(oneshot::Sender<()>, tokio::task::JoinHandle<()>)>,
     gossip_shutdown: CancellationToken,
@@ -2227,7 +2222,6 @@ async fn shutdown<P: Provider + Clone + 'static>(
         blacklist_watcher,
         rate_bounds_watcher,
         origin_watcher,
-        watcher_checkpoint_store,
         mut admin_stop_tx,
         rpc_watchdog,
         gossip_shutdown,
@@ -2286,18 +2280,9 @@ async fn shutdown<P: Provider + Clone + 'static>(
     }
     // No origin cursor to flush: the directory re-reads its namespace set from
     // chain on every boot, so there is no scan progress a lost flush could cost.
-    // Same treatment for the blacklist cursor, which became a persisted cursor
-    // once the deny-set itself was made durable (#1181) and likewise has no
-    // owning service. Also best-effort, and for the same reason it is *only* an
-    // efficiency concern: a lost flush leaves the cursor lagging, and the sinks
-    // are idempotent, so the next boot merely re-scans a wider span. Under-
-    // enforcement is not on the table — the deny-set it rebuilds from is durable
-    // independently of this cursor.
-    if let Err(err) =
-        watcher_checkpoint_store.flush_checkpoint(decdn_incentive::CheckpointKey::Blacklist)
-    {
-        tracing::warn!(%err, "failed to flush blacklist scan checkpoint on shutdown");
-    }
+    // The blacklist watcher is the same shape now — it re-enumerates the deny-set
+    // from chain on every boot and its live tail carries no durable cursor — so
+    // there is nothing to flush here either.
     // Admin server shutdown is ordered per `admin_stop_order`:
     //
     //   - `Early` (the default, including SIGTERM/SIGINT and plain
@@ -3628,7 +3613,6 @@ mod tests {
             blockchain: ResolvedBlockchain {
                 origin_assignment_address: None,
                 publisher_registry_address: None,
-                origin_directory_from_block: 0,
                 rpc_url: "http://localhost:8545".into(),
                 eth_keystore: PathBuf::from("/tmp/keystore.json"),
                 keystore_password_file: None,
@@ -3643,9 +3627,7 @@ mod tests {
                 settlement_auto_threshold_micro_usdc: None,
                 settlement_auto_by_voucher_nonce_span: None,
                 slash_judge_address: "0x0000000000000000000000000000000000000003".to_string(),
-                slash_judge_from_block: 0,
                 content_blacklist_address: None,
-                content_blacklist_from_block: 0,
                 content_blacklist_poll_interval_sec: 600,
                 chain_id: decdn_common::config::DEFAULT_CHAIN_ID,
             },

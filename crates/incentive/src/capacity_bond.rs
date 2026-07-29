@@ -116,13 +116,24 @@ mod sol_types {
 
             /// Full escrow record for `slashId`.
             ///
-            /// `appealWindowClose` here is the AUTHORITATIVE deadline: it carries
-            /// protocol-pause extensions, which a deadline derived from the log's
-            /// block timestamp does not. `offenseType` and `evidenceHash` are
-            /// persisted on the record precisely so it is self-sufficient — the
-            /// `CapacityBond.Slashed` event carries the offense but no `slashId`,
-            /// and `SlashRecorded` carries the `slashId` but no offense.
+            /// `appealWindowClose` here is the **base** deadline (`slashedAt +
+            /// appealFilingWindow`), fixed at mint. The deadline the contract
+            /// actually enforces is `appealWindowClose + pausedTotal`
+            /// ([`SlashEscrowLib`] adds the global pause offset at finalize /
+            /// appeal-open time), so a consumer that gates on the deadline MUST
+            /// read [`pausedTotal`](Self::pausedTotal) at the same block and add
+            /// it. `offenseType` and `evidenceHash` are persisted on the record
+            /// precisely so it is self-sufficient — the `CapacityBond.Slashed`
+            /// event carries the offense but no `slashId`, and `SlashRecorded`
+            /// carries the `slashId` but no offense.
             function getSlashRecord(uint256 slashId) external view returns (SlashRecord memory);
+
+            /// Global cumulative appeal-window pause offset, in seconds. Every
+            /// slash's enforced deadline is `getSlashRecord(id).appealWindowClose
+            /// + pausedTotal`; the offset only ever grows (`_unpause` credits each
+            /// ended pause interval), so it uniformly extends every open window
+            /// and preserves base-close ordering.
+            function pausedTotal() external view returns (uint64);
 
             /// The operator's raw registration record. `active` here is
             /// `_nodes[operator].active` alone — the flag `deregisterNode`

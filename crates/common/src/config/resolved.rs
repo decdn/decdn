@@ -100,25 +100,12 @@ pub struct ResolvedBlockchain {
     /// `PublisherRegistry` contract address. Independent of the origin directory
     /// (the publish CLI's `namespace create` target); not consumed by the node.
     pub publisher_registry_address: Option<String>,
-    /// Starting block for the chain-backed origin directory's `AssignmentActivated`
-    /// log replay (the `OriginAssignment` deployment block). Defaults to `0`.
-    pub origin_directory_from_block: u64,
     /// `SlashJudge` contract address — the EIP-712 `verifyingContract` for
     /// `slash_sig` signatures (ADR 014). Required (no default).
     pub slash_judge_address: String,
-    /// Scan floor for the slash-detection watcher (the `SlashJudge`
-    /// deployment block). Defaults to `0` (#1032). Every daemon start rescans
-    /// from this block (the in-memory detected-slash store must be rebuilt);
-    /// the in-process cursor only covers resubscribe gaps within one process
-    /// lifetime.
-    pub slash_judge_from_block: u64,
     /// Required `ContentBlacklist` contract address (ADR 011/019/031). Successful
     /// node config resolution always produces `Some`; the runtime rejects `None`.
     pub content_blacklist_address: Option<String>,
-    /// Starting block for the blacklist watcher's `HashBlacklisted` log replay
-    /// (the `ContentBlacklist` deployment block). Defaults to `0`. Only used
-    /// when `content_blacklist_address` is set.
-    pub content_blacklist_from_block: u64,
     /// Seconds between the blacklist watcher's periodic replay + re-scope pass.
     /// Defaults to [`super::DEFAULT_CONTENT_BLACKLIST_POLL_INTERVAL_SEC`]. Only
     /// used when `content_blacklist_address` is set.

@@ -143,29 +143,12 @@ pub struct BlockchainConfig {
     /// it is the publish CLI's `namespace create` target and is not consumed by
     /// the node runtime.
     pub publisher_registry_address: Option<String>,
-    /// DEPRECATED / IGNORED. Was the block height at which the chain-backed
-    /// origin directory began its `AssignmentActivated` log replay. The
-    /// directory now enumerates the namespace set on chain
-    /// (`assignedNamespaces`, #1497) instead of replaying, so this value is no
-    /// longer read. The key is still accepted — `[blockchain]` denies unknown
-    /// fields — but has no effect; it is removed once the remaining `*_from_block`
-    /// watchers migrate.
-    pub origin_directory_from_block: Option<u64>,
     /// `SlashJudge` contract address — the EIP-712 `verifyingContract` for
     /// `ProbeResponse` / `StreamResponse` `slash_sig` signatures (ADR 014
     /// §1–2). Required: a wrong/zero address silently produces signatures no
     /// verifier accepts, so resolution fails fast when it is missing rather
     /// than defaulting.
     pub slash_judge_address: Option<String>,
-    /// Block height at which the slash-detection watcher begins its
-    /// `SlashJudge.Slashed` log scan (#1032). SHOULD be the `SlashJudge`
-    /// deployment block; absent => `0`, which is correct but scans the entire
-    /// chain history (slow / RPC-heavy on an established L2). Every daemon
-    /// start rescans from this block — the detected-slash store is in-memory
-    /// and must be rebuilt — so this bounds the scan cost of *every* restart;
-    /// the watcher's in-process cursor only covers resubscribe gaps within one
-    /// process lifetime.
-    pub slash_judge_from_block: Option<u64>,
     /// `SlashAppeal` contract address — the target for `decdn appeal slash`
     /// (ADR 028). Consumed **only** by that CLI (via `chain_ctx::resolve_appeal`,
     /// which validates it); the daemon accepts the key here — `[blockchain]`
@@ -176,12 +159,6 @@ pub struct BlockchainConfig {
     /// startup completes the initial global + operator-scope replay before any
     /// ALPN accepts connections (ADR 011/019/031).
     pub content_blacklist_address: Option<String>,
-    /// Block height at which the blacklist watcher begins its `HashBlacklisted`
-    /// log replay. SHOULD be the `ContentBlacklist` deployment block; absent =>
-    /// `0`, which is correct but scans the whole chain history (slow / RPC-heavy
-    /// on an established L2). Only consulted when `content_blacklist_address` is
-    /// set. Mirrors `origin_directory_from_block`.
-    pub content_blacklist_from_block: Option<u64>,
     /// Seconds between the blacklist watcher's periodic replay + re-scope pass
     /// (ADR 011 §Polling cadence). This backstop is what catches scope changes
     /// with no `ContentBlacklist` event — an operator region/ripening

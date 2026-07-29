@@ -90,7 +90,23 @@ mod sol_types {
             /// Re-added now that the deny-set is enumerable: this was previously
             /// dropped as dead surface because the only use for it — a
             /// per-address boot reconcile — had nothing to iterate over.
+            ///
+            /// This alone is NOT the address-liveness predicate: it reads only
+            /// `_isOriginBlacklisted` and returns `false` for an OPERATOR-only
+            /// entry (`addOperator` sets `isOperatorBlacklisted` and never touches
+            /// the origin mapping). A boot reconcile of the `blacklistedAddresses`
+            /// union MUST OR this with `isOperatorBlacklisted` — the same
+            /// disjunction `ContentBlacklist._syncAddr` / `OriginAssignment` use —
+            /// or it drops every voted-out operator (#1499).
             function isOriginBlacklisted(address origin) external view returns (bool);
+
+            /// The operator half of the address deny-set (`addOperator` /
+            /// `removeOperator`). Public auto-getter for the `mapping(address =>
+            /// bool)`; there is no emergency auto-expiry on this leg, so — unlike
+            /// [`isOriginBlacklisted`] — a raw read IS the live value. The boot
+            /// reconcile ORs the two: `isOriginBlacklisted(a) ||
+            /// isOperatorBlacklisted(a)`.
+            function isOperatorBlacklisted(address operator) external view returns (bool);
 
             /// Every region key whose entries are in scope for `operator` right
             /// now: `GLOBAL` (always first), the declared region, and — while the

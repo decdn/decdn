@@ -11,8 +11,6 @@
 //! span (a margin under the provider 10k `eth_getLogs` cap) rather than
 //! [`MAX_BACKFILL_BLOCK_SPAN`] (#1139).
 
-use anyhow::Result;
-
 /// How many blocks the persisted scan checkpoint is rewound before the
 /// resume backfill (#751), absorbing a shallow reorg between the last scanned
 /// block and the next boot: a `ChannelOpened` re-mined at a slightly different
@@ -21,9 +19,9 @@ use anyhow::Result;
 /// few extra blocks of `eth_getLogs`. Sized for the shallow reorgs of an
 /// Arbitrum-Sepolia-class L2.
 ///
-/// The rewind applies only where a *durable* cursor is resumed — the
-/// `HeadMinusWindow` / `FullReplay` starts re-derive their floor from head on
-/// every boot, so there is nothing to rewind.
+/// The rewind applies only where a *durable* cursor is resumed — a
+/// `HeadMinusWindow` start re-derives its floor from head on every boot, so
+/// there is nothing to rewind.
 ///
 /// Two live consumers after the #1238 axis split:
 /// - the settlement watcher ([`crate::payment_settlement`], #751), through
@@ -56,8 +54,8 @@ pub(crate) const MAX_BACKFILL_BLOCK_SPAN: u64 = 10_000;
 /// Split an inclusive `[from, to]` block range into successive inclusive windows
 /// of at most `span` blocks (#751), so a long resume backfill issues bounded
 /// `eth_getLogs` calls. Pure and allocation-light (one entry per window); a
-/// `from > to` range yields no windows (the caller validates that separately via
-/// [`check_backfill_range`]). Unit-tested for the window math.
+/// `from > to` range yields no windows (the caller validates that separately).
+/// Unit-tested for the window math.
 ///
 /// Shared so the buyer-side bootstrap reconciliation scan
 /// ([`crate::buyer_channel`], #763) reuses the same windowing rather than forking it.
@@ -75,28 +73,6 @@ pub(crate) fn backfill_windows(from: u64, to: u64, span: u64) -> Vec<(u64, u64)>
         }
         start = end.saturating_add(1);
     }
-}
-
-/// Validate the bring-up backfill range `[from, to]` (#762). On a consistent
-/// chain the head is monotonic, so `to` (read on the first watcher cycle) is
-/// always `>=` `from` (the head captured at bootstrap); `from == to` is a valid
-/// single-block range that must still be scanned (a `ChannelOpened` can sit in
-/// that exact block). `from > to` is an anomaly — RPC replication lag (a
-/// load-balanced endpoint answering from a stale node) or a reorg — returned as
-/// an `Err` so the caller retries via the watcher backoff rather than skipping
-/// the backfill (which would permanently reopen the race once the lagging node
-/// catches up).
-///
-/// Shared so the buyer-side bootstrap reconciliation scan
-/// ([`crate::buyer_channel`], #763) shares the same range validation.
-pub(crate) fn check_backfill_range(from: u64, to: u64) -> Result<()> {
-    if from > to {
-        anyhow::bail!(
-            "backfill range invalid: from_block ({from}) > to_block ({to}); \
-             likely RPC replication lag or a reorg — retrying via watcher backoff"
-        );
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -150,20 +126,5 @@ mod tests {
             Some(to),
             "the final window must reach `to`"
         );
-    }
-
-    #[test]
-    fn check_backfill_range_boundary() {
-        // Empty range (`from > to`): an RPC-lag / reorg anomaly, not "no blocks
-        // elapsed" — returned as a retryable `Err` so the caller retries rather
-        // than silently skipping (which would reopen the race).
-        assert!(check_backfill_range(1_001, 1_000).is_err());
-        // Single block (`from == to`): valid and must be scanned — a
-        // ChannelOpened can sit in the exact block bootstrap read the head at.
-        assert!(check_backfill_range(1_000, 1_000).is_ok());
-        // Normal forward range.
-        assert!(check_backfill_range(1_000, 1_005).is_ok());
-        // Genesis / zero head is a valid single-block range.
-        assert!(check_backfill_range(0, 0).is_ok());
     }
 }

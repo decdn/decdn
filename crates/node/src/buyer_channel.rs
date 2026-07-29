@@ -32,6 +32,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use alloy::dyn_abi::Eip712Domain;
+use alloy::eips::BlockId;
 use alloy::primitives::{Address, Bytes, U256};
 use alloy::providers::Provider;
 use alloy::signers::local::PrivateKeySigner;
@@ -51,9 +52,7 @@ use crate::client_requester::ChannelContext;
 // The buyer-channel open kernel (#940) — the `openChannel` tx + `ChannelOpened`
 // decode + state/ctx build, and the one-time USDC approval — now live in the
 // shared `decdn-client-pull` crate (re-exported here as `client_requester`).
-use crate::chain_events::{
-    AbortOnDrop, MAX_BACKFILL_BLOCK_SPAN, backfill_windows, check_backfill_range,
-};
+use crate::chain_events::AbortOnDrop;
 use crate::client_requester::buyer_channel::{
     LOW_WATER_DIVISOR, OpenedChannel, ensure_allowance, open_channel, refill_amount,
 };
@@ -126,30 +125,6 @@ pub struct BuyerReconcileConfig {
     /// Resolves the provider's operator address back to a dialable `NodeId`.
     pub resolver: Arc<dyn NodeAddressResolver>,
 }
-
-/// How many blocks back from head the one-shot bootstrap reconciliation scan
-/// looks for orphaned `ChannelOpened(client == self)` events (#763). The buyer
-/// has no scan checkpoint (unlike the seller watcher): orphans arise from the rare
-/// post-escrow failure legs in `run_open` (event-decode or `store.record` failing
-/// *after* the on-chain escrow) or a postcard-undecodable row after a binary
-/// downgrade — all of which strand a deposit seconds before the next restart.
-/// Abandoning an in-flight `openChannel` is deliberately not on that list *within a
-/// process lifetime*: its receipt wait is unbounded precisely so a tx that later mines can
-/// never become an orphan, and the caller giving up does not cancel it (see
-/// `open_channel`, and `InFlightOpenGuard`, which is why the slot outlives the caller).
-///
-/// It IS on the list across a restart, though, and the distinction is easy to lose: the
-/// open task is a bare `tokio::spawn` with no drain participation, so a SIGTERM while an
-/// `openChannel` sits in the mempool escrows a deposit with no persisted row — exactly the
-/// orphan shape above, which is why this scan must keep covering it. That is a real hazard
-/// but a bounded one: the reconcile below recovers it on the next boot, well inside this
-/// lookback.
-///
-/// A modest fixed lookback (~1–2 days of an Arbitrum-Sepolia-class ~0.25 s/block L2)
-/// recovers those realistic cases cheaply without re-scanning the full chain every boot.
-/// An orphan older than this window is missed (it is reclaim-able only after its long
-/// expiry anyway); promote to config if operators need a full-lifetime scan.
-const BUYER_RECONCILE_LOOKBACK_BLOCKS: u64 = 700_000;
 
 /// Bound the wait for the `reclaimExpired` receipt on the open path's rotate leg.
 ///
@@ -318,9 +293,9 @@ fn rehydrate_open_error(err: &Arc<anyhow::Error>) -> anyhow::Error {
 /// resolves. Release the slot while a tx is still in the mempool and the next miss
 /// opens a SECOND channel to the same provider; the boot reconcile scan then
 /// declines to adopt the first (`ReconcileOutcome::DeferredSecondOpen`), leaving its
-/// deposit unreclaimed until the live row clears — by which point the orphan's
-/// `ChannelOpened` is likely outside the ~2-day event lookback
-/// (`BUYER_RECONCILE_LOOKBACK_BLOCKS`) and it is not found at all.
+/// deposit unreclaimed until the live row clears. The boot reconcile enumerates the
+/// full client-channel history (no block lookback), so a later boot re-encounters
+/// the orphan once the live row is gone — but until then its deposit stays stranded.
 ///
 /// This is the same reasoning that keeps `openChannel`'s receipt wait unbounded (see
 /// `decdn_client_pull::buyer_channel::open_channel`), and the two must not drift: a
@@ -2635,12 +2610,12 @@ fn reconcile_decision(
     ReconcileOutcome::Rehydrate(Box::new(state))
 }
 
-/// Reconcile one `ChannelOpened` event: confirm it is ours, read authoritative
-/// on-chain state, and re-hydrate the local store if the channel is an orphan.
+/// Reconcile one enumerated channel id: read authoritative on-chain state and
+/// re-hydrate the local store if the channel is an orphan.
 /// Returns `Ok(true)` when a row was (re)hydrated, `Ok(false)` when skipped, and
-/// `Err` only on a per-event fault (a `getChannel` RPC error) the caller logs
+/// `Err` only on a per-id fault (a `getChannel` RPC error) the caller logs
 /// and steps past.
-// Linear guard sequence (ownership filter → getChannel → per-provider slot →
+// Linear guard sequence (getChannel → per-provider slot →
 // store-read with fault/corrupt split → decide → record); splitting would
 // scatter the atomicity reasoning.
 #[allow(clippy::cognitive_complexity)]
@@ -2649,19 +2624,13 @@ async fn reconcile_one_opened<P: Provider + Clone>(
     store: &Arc<dyn BuyerChannelStore>,
     self_address: Address,
     opens_in_flight: &Arc<Mutex<HashMap<Address, SharedOpen>>>,
-    event: &PaymentChannel::ChannelOpened,
+    channel_id: ChannelId,
 ) -> Result<bool> {
-    // The query already topic-filters on `client == self_address` (the indexed
-    // `client` topic), so in practice every event here is ours; this is a
-    // defense-in-depth check against a misbehaving RPC that ignores the topic.
-    if event.client != self_address {
-        return Ok(false);
-    }
     let ch = contract
-        .getChannel(event.channelId)
+        .getChannel(channel_id)
         .call()
         .await
-        .with_context(|| format!("reconcile getChannel for {}", event.channelId))?;
+        .with_context(|| format!("reconcile getChannel for {channel_id}"))?;
 
     // Serialize against the live open path for this provider. The reconciler is a
     // second writer to the provider-keyed store, racing concurrent cache-miss
@@ -2695,7 +2664,7 @@ async fn reconcile_one_opened<P: Provider + Clone>(
             ) => {
                 warn!(
                     provider = %ch.provider,
-                    channel_id = %event.channelId,
+                    channel_id = %channel_id,
                     %err,
                     "buyer reconcile: local row unreadable (corrupt/downgraded); re-hydrating from chain"
                 );
@@ -2714,7 +2683,7 @@ async fn reconcile_one_opened<P: Provider + Clone>(
             ) => {
                 warn!(
                     provider = %ch.provider,
-                    channel_id = %event.channelId,
+                    channel_id = %channel_id,
                     %err,
                     "buyer reconcile: store read failed (backend/IO); skipping to avoid clobbering a possibly-healthy row"
                 );
@@ -2722,7 +2691,7 @@ async fn reconcile_one_opened<P: Provider + Clone>(
             }
         };
         let view = OnChainOpen {
-            channel_id: event.channelId,
+            channel_id,
             client: ch.client,
             provider: ch.provider,
             voucher_signer: ch.voucherSigner,
@@ -2769,7 +2738,7 @@ async fn reconcile_one_opened<P: Provider + Clone>(
         // authoritative channel — the reconciler steps past.
         debug!(
             provider = %ch.provider,
-            channel_id = %event.channelId,
+            channel_id = %channel_id,
             "buyer reconcile: a live open is in flight for this provider; skipping (it persists the real channel)"
         );
         return Ok(false);
@@ -2777,19 +2746,121 @@ async fn reconcile_one_opened<P: Provider + Clone>(
     Ok(did_rehydrate)
 }
 
-/// One-shot bootstrap reconciliation scan (#763): enumerate
-/// `ChannelOpened(client == self)` over the last [`BUYER_RECONCILE_LOOKBACK_BLOCKS`]
-/// blocks and re-hydrate any still-`Open` channel missing or undecodable in the
-/// local store, so the reclaim sweep can recover its deposit. Best-effort: a
-/// head-read failure `warn!`s and returns; a single window's `query()` failure is
-/// logged and skipped so the *other* windows still reconcile (unlike the seller,
-/// the buyer keeps no checkpoint, so the lost window is only re-covered on a
-/// later restart); per-event faults are logged and skipped. The completion log
-/// reports the failed-window count so a partial scan is observable. Mirrors the
-/// seller-side backfill (now the resumable watcher's first poll tick), reusing
-/// the shared window helpers in [`crate::chain_events::backfill`].
-// Linear scan (head → windows → query → per-event) with inline best-effort
-// guards; splitting would obscure the control flow.
+/// One page of client channel ids per `clientChannels` call.
+const CLIENT_CHANNEL_PAGE_SIZE: u64 = 100;
+
+/// The two chain reads the buyer boot enumeration performs, behind a trait so the
+/// paging and accumulation are unit-testable without a provider.
+///
+/// Spelled RPITIT with an explicit `+ Send` (rather than `async fn`, whose futures
+/// carry no `Send` bound) because the enumeration runs inside the fire-and-forget
+/// `tokio::spawn` bootstrap task, whose future must be `Send`. Production
+/// monomorphizes to the alloy `PaymentChannel` contract impl.
+trait ClientChannelReads: Send + Sync {
+    /// How many channels `client` has ever opened (`clientChannelNonce`). The
+    /// contract recomputes each id from the nonce, so this counter cannot drift
+    /// from the enumerable set.
+    fn client_channel_count(
+        &self,
+        client: Address,
+        at_block: u64,
+    ) -> impl std::future::Future<Output = Result<U256>> + Send;
+    /// A page of `client`'s channel ids, oldest first (`clientChannels`).
+    fn client_channels_page(
+        &self,
+        client: Address,
+        offset: U256,
+        limit: U256,
+        at_block: u64,
+    ) -> impl std::future::Future<Output = Result<Vec<ChannelId>>> + Send;
+}
+
+/// Enumerate every channel id `client` has opened, paging `clientChannels` from a
+/// single PINNED block for a consistent snapshot of count and pages.
+///
+/// The client channel set is append-only per nonce — the contract recomputes each
+/// id from the nonce and never removes one — so, unlike the swap-and-pop
+/// enumeration views (`assignedNamespaces`), pinning is only for snapshot
+/// consistency, not correctness: a strict count re-check is not load-bearing and a
+/// short/empty page is a clean stop rather than a mismatch to abort on. A channel
+/// opened mid-boot lands past `count` (unseen this boot) and is re-hydrated by a
+/// later restart if it strands.
+async fn enumerate_client_channels<R: ClientChannelReads>(
+    reads: &R,
+    client: Address,
+    at_block: u64,
+) -> Result<Vec<ChannelId>> {
+    let count = reads.client_channel_count(client, at_block).await?;
+    let mut ids = Vec::new();
+    let mut offset = U256::ZERO;
+    let page_size = U256::from(CLIENT_CHANNEL_PAGE_SIZE);
+    while offset < count {
+        let page = reads
+            .client_channels_page(client, offset, page_size, at_block)
+            .await?;
+        if page.is_empty() {
+            break;
+        }
+        offset = offset.saturating_add(U256::from(page.len()));
+        ids.extend(page);
+    }
+    Ok(ids)
+}
+
+/// Production [`ClientChannelReads`] over the live `PaymentChannel` contract, each
+/// read pinned to the boot snapshot block.
+#[derive(Clone)]
+struct ContractClientChannelReads<P: Provider + Clone> {
+    contract: PaymentChannel::PaymentChannelInstance<P>,
+}
+
+impl<P: Provider + Clone> ClientChannelReads for ContractClientChannelReads<P> {
+    async fn client_channel_count(&self, client: Address, at_block: u64) -> Result<U256> {
+        self.contract
+            .clientChannelNonce(client)
+            .block(BlockId::Number(at_block.into()))
+            .call()
+            .await
+            .map_err(|err| {
+                anyhow::anyhow!(
+                    "clientChannelNonce({client}): {}",
+                    sanitize_rpc_display(&err)
+                )
+            })
+    }
+
+    async fn client_channels_page(
+        &self,
+        client: Address,
+        offset: U256,
+        limit: U256,
+        at_block: u64,
+    ) -> Result<Vec<ChannelId>> {
+        self.contract
+            .clientChannels(client, offset, limit)
+            .block(BlockId::Number(at_block.into()))
+            .call()
+            .await
+            .map_err(|err| {
+                anyhow::anyhow!(
+                    "clientChannels({client}, offset={offset}, limit={limit}): {}",
+                    sanitize_rpc_display(&err)
+                )
+            })
+    }
+}
+
+/// One-shot bootstrap reconciliation (#763): enumerate every channel this node
+/// opened via the on-chain `clientChannels`/`clientChannelNonce` view and
+/// re-hydrate any still-`Open` channel missing or undecodable in the local store,
+/// so the reclaim sweep can recover its deposit. This replaces the previous
+/// 700k-block `ChannelOpened` log replay: the enumeration covers the client's full
+/// channel history with no block lookback, so an orphan can never age out of a scan
+/// window. Best-effort: a head-read or enumeration failure `warn!`s and returns;
+/// per-id faults are logged and skipped. The completion log reports the failed-id
+/// count so a partial reconcile is observable.
+// Linear flow (head → enumerate → per-id) with inline best-effort guards;
+// splitting would obscure the control flow.
 #[allow(clippy::cognitive_complexity)]
 async fn reconcile_orphans_once<P: Provider + Clone>(
     contract: PaymentChannel::PaymentChannelInstance<P>,
@@ -2797,6 +2868,7 @@ async fn reconcile_orphans_once<P: Provider + Clone>(
     self_address: Address,
     opens_in_flight: Arc<Mutex<HashMap<Address, SharedOpen>>>,
 ) {
+    // Pin every read to one head so count and pages are a consistent snapshot.
     let head = match contract.provider().get_block_number().await {
         Ok(h) => h,
         Err(err) => {
@@ -2804,73 +2876,48 @@ async fn reconcile_orphans_once<P: Provider + Clone>(
             return;
         }
     };
-    let start = head.saturating_sub(BUYER_RECONCILE_LOOKBACK_BLOCKS);
-    if let Err(err) = check_backfill_range(start, head) {
-        warn!(%err, start, head, "buyer reconcile: invalid scan range; skipping");
-        return;
-    }
-    let windows = backfill_windows(start, head, MAX_BACKFILL_BLOCK_SPAN);
-    let total_windows = windows.len();
+    let reads = ContractClientChannelReads {
+        contract: contract.clone(),
+    };
+    let ids = match enumerate_client_channels(&reads, self_address, head).await {
+        Ok(ids) => ids,
+        Err(err) => {
+            warn!(%err, head, "buyer reconcile: client-channel enumeration failed; skipping scan this boot");
+            return;
+        }
+    };
+    let total = ids.len();
     let mut rehydrated: usize = 0;
-    let mut failed_windows: usize = 0;
-    for (from, to) in windows {
-        let logs = match contract
-            .ChannelOpened_filter()
-            // RPC-level filter on the indexed `client` topic so `eth_getLogs`
-            // returns only this node's own opens — bounds result-count/latency on
-            // busy deployments instead of fetching every open in the window.
-            .topic2(self_address)
-            .from_block(from)
-            .to_block(to)
-            .query()
-            .await
+    let mut failed: usize = 0;
+    for channel_id in ids {
+        match reconcile_one_opened(
+            &contract,
+            &store,
+            self_address,
+            &opens_in_flight,
+            channel_id,
+        )
+        .await
         {
-            Ok(logs) => logs,
+            Ok(true) => rehydrated = rehydrated.saturating_add(1),
+            Ok(false) => {}
             Err(err) => {
-                // Skip just this window, not the whole scan: the windows are
-                // independent, so a transient `eth_getLogs` failure on one should
-                // not strand orphans in later windows until the next restart.
                 warn!(
                     err = %sanitize_rpc_display(&err),
-                    from,
-                    to,
-                    "buyer reconcile: ChannelOpened query failed for this window; skipping it"
+                    channel_id = %channel_id,
+                    "buyer reconcile: skipping channel after a per-id fault"
                 );
-                failed_windows = failed_windows.saturating_add(1);
-                continue;
-            }
-        };
-        for (event, _log) in logs {
-            match reconcile_one_opened(&contract, &store, self_address, &opens_in_flight, &event)
-                .await
-            {
-                Ok(true) => rehydrated = rehydrated.saturating_add(1),
-                Ok(false) => {}
-                Err(err) => warn!(
-                    err = %sanitize_rpc_display(&err),
-                    channel_id = %event.channelId,
-                    "buyer reconcile: skipping event after a per-event fault"
-                ),
+                failed = failed.saturating_add(1);
             }
         }
     }
-    // If every window's query failed, the scan accomplished nothing this boot —
-    // escalate to `error!` so an RPC outage is visible above the per-window warns,
-    // not buried under an `info!` "complete". Otherwise report normally.
-    if total_windows > 0 && failed_windows == total_windows {
-        error!(
-            start,
-            head,
-            failed_windows,
-            "buyer reconcile: every window's ChannelOpened query failed; reconciliation \
-             accomplished nothing this boot (RPC outage?) — orphans recovered on a later restart"
-        );
-    } else {
-        info!(
-            start,
-            head, rehydrated, failed_windows, "buyer reconcile: bootstrap scan complete"
-        );
-    }
+    info!(
+        head,
+        channel_count = total,
+        rehydrated,
+        failed,
+        "buyer reconcile: bootstrap enumeration complete"
+    );
 }
 
 #[cfg(test)]
@@ -2890,6 +2937,137 @@ mod tests {
             U256::from(10_000_000u64),
             1_900_000_000,
         )
+    }
+
+    /// Scripted [`ClientChannelReads`]: no provider, no chain. Ids are supplied
+    /// oldest-first (append order), matching `clientChannels`' stable ordering.
+    /// `count` is decoupled from the id list so a short/empty-page early stop can
+    /// be exercised against a count that over-reports.
+    struct StubClientReads {
+        client: Address,
+        /// Channel ids oldest→newest.
+        ids: Vec<ChannelId>,
+        /// The value `client_channel_count` reports (may exceed `ids.len()`).
+        count: U256,
+        /// The `at_block` every call must be pinned to.
+        expect_block: u64,
+        /// (offset, limit) of each page read, for the paging assertion.
+        pages: std::sync::Mutex<Vec<(U256, U256)>>,
+    }
+
+    impl StubClientReads {
+        fn new(client: Address, ids: Vec<ChannelId>, expect_block: u64) -> Self {
+            Self {
+                client,
+                count: U256::from(ids.len()),
+                ids,
+                expect_block,
+                pages: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        /// Report a `count` larger than the id list to drive an early stop.
+        fn with_count(mut self, count: u64) -> Self {
+            self.count = U256::from(count);
+            self
+        }
+
+        #[allow(clippy::unwrap_used)]
+        fn pages_read(&self) -> Vec<(U256, U256)> {
+            self.pages.lock().unwrap().clone()
+        }
+    }
+
+    impl ClientChannelReads for StubClientReads {
+        async fn client_channel_count(&self, client: Address, at_block: u64) -> Result<U256> {
+            assert_eq!(client, self.client, "unexpected client");
+            assert_eq!(at_block, self.expect_block, "count read not pinned");
+            Ok(self.count)
+        }
+
+        #[allow(clippy::indexing_slicing, clippy::unwrap_used)]
+        async fn client_channels_page(
+            &self,
+            client: Address,
+            offset: U256,
+            limit: U256,
+            at_block: u64,
+        ) -> Result<Vec<ChannelId>> {
+            assert_eq!(client, self.client, "unexpected client");
+            assert_eq!(at_block, self.expect_block, "page read not pinned");
+            self.pages.lock().unwrap().push((offset, limit));
+            let start: usize = offset.to();
+            let take: usize = limit.to();
+            if start >= self.ids.len() {
+                return Ok(Vec::new());
+            }
+            let end = start.saturating_add(take).min(self.ids.len());
+            Ok(self.ids[start..end].to_vec())
+        }
+    }
+
+    /// Enumeration pages `clientChannels` until it has read `count` ids, preserving
+    /// on-chain (oldest-first) order across page boundaries.
+    #[tokio::test]
+    #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+    async fn enumerate_client_channels_pages_and_accumulates_in_order() {
+        let client = Address::repeat_byte(0xAB);
+        // 250 ids → three pages of 100/100/50 at PAGE_SIZE == 100.
+        let ids: Vec<ChannelId> = (0u8..250).map(B256::repeat_byte).collect();
+        let reads = StubClientReads::new(client, ids.clone(), 4_242);
+
+        let got = enumerate_client_channels(&reads, client, 4_242)
+            .await
+            .unwrap();
+
+        assert_eq!(got, ids, "all ids in oldest-first order across pages");
+        assert_eq!(
+            reads.pages_read(),
+            vec![
+                (U256::ZERO, U256::from(100u64)),
+                (U256::from(100u64), U256::from(100u64)),
+                (U256::from(200u64), U256::from(100u64)),
+            ],
+            "offset advances by the page length, limit is the page size"
+        );
+    }
+
+    /// A client with no channels enumerates to an empty set and reads no page.
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn enumerate_client_channels_of_a_clean_client_is_empty() {
+        let client = Address::repeat_byte(0xEF);
+        let reads = StubClientReads::new(client, vec![], 7);
+        assert!(
+            enumerate_client_channels(&reads, client, 7)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(reads.pages_read().is_empty(), "count == 0 reads no page");
+    }
+
+    /// A short/empty page stops the walk cleanly even when `count` over-reports —
+    /// the append-only set cannot shrink, so there is no abort-on-mismatch.
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn enumerate_client_channels_breaks_on_a_short_page() {
+        let client = Address::repeat_byte(0xCD);
+        let ids: Vec<ChannelId> = (0u8..30).map(B256::repeat_byte).collect();
+        // count claims 500 but only 30 ids exist: the second page is empty → stop.
+        let reads = StubClientReads::new(client, ids.clone(), 9).with_count(500);
+
+        let got = enumerate_client_channels(&reads, client, 9).await.unwrap();
+
+        assert_eq!(got, ids, "returns the real ids without erroring on the gap");
+        assert_eq!(
+            reads.pages_read(),
+            vec![
+                (U256::ZERO, U256::from(100u64)),
+                (U256::from(30u64), U256::from(100u64))
+            ],
+            "reads the first (short) page, then one empty page, then stops"
+        );
     }
 
     // channelId derivation moved on-chain → the `ChannelOpened` event in the
