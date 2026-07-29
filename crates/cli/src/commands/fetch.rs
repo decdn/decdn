@@ -510,7 +510,7 @@ pub(crate) async fn resolve_target_node(
 /// searched for the entry whose `eth_address` matches `provider` — there is no
 /// discovered-node ranking to derive it from, since adopt-by-id skips the
 /// probe/select step entirely.
-async fn resolve_node_for_provider(
+pub(crate) async fn resolve_node_for_provider(
     args: &cli::ClientFetchArgs,
     chain: &ResolvedChain,
     provider: Address,
@@ -666,7 +666,7 @@ pub(crate) fn adopt_decision(ch: &OnChainChannelView, my_key: Address, now: u64)
 /// Returns the built [`ChannelContext`] plus the resolved provider address (so
 /// the caller can dial it) or a clear, actionable error — never lets an
 /// unadoptable channel fall through to a confusing on-chain revert.
-async fn hydrate_channel_by_id<P>(
+pub(crate) async fn hydrate_channel_by_id<P>(
     store: &RedbBuyerChannelStore,
     contract: &PaymentChannel::PaymentChannelInstance<P>,
     channel_id: B256,
@@ -1692,7 +1692,7 @@ where
 ///
 /// No binding when `chain.capacity_bond` is unset — see
 /// [`build_channel_ctx`]'s docs for why that is silent.
-fn attach_client_binding(
+pub(crate) fn attach_client_binding(
     ctx: ChannelContext,
     chain: &ResolvedChain,
     endpoint: &Endpoint,
