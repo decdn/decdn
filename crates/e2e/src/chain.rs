@@ -726,6 +726,64 @@ impl ChainFixture {
             .context("isOriginBlacklisted")
     }
 
+    /// `ContentBlacklist.addOperator` / `removeOperator` — the SECOND,
+    /// independent address-level deny list (ADR 011 § Hash Evasion and Origin
+    /// Blacklisting).
+    ///
+    /// Distinct from [`Self::set_origin_blacklist`] and not a convenience
+    /// wrapper over it: `addOperator` writes `isOperatorBlacklisted` and emits
+    /// `OperatorBlacklisted`, never touching `_isOriginBlacklisted` or
+    /// `OriginBlacklistUpdated`. A consumer watching only the origin event
+    /// misses this path entirely — and it is the primary governance route, since
+    /// it also ejects the operator from `CapacityBond`. `OriginAssignment` treats
+    /// the two as a union, so a node must too.
+    pub async fn set_operator_blacklist(
+        &self,
+        operator: Address,
+        blacklisted: bool,
+    ) -> anyhow::Result<()> {
+        self.impersonate(self.addrs.timelock).await?;
+        let raw = self.raw_provider();
+        let contract = ContentBlacklistOrigin::new(self.addrs.content_blacklist, &raw);
+        // The two calls are distinct builder types, so each arm sends its own
+        // rather than binding one variable.
+        let (receipt, label) = if blacklisted {
+            let r = contract
+                .addOperator(operator)
+                .from(self.addrs.timelock)
+                .send()
+                .await
+                .context("addOperator send")?
+                .get_receipt()
+                .await
+                .context("addOperator receipt")?;
+            (r, "addOperator")
+        } else {
+            let r = contract
+                .removeOperator(operator)
+                .from(self.addrs.timelock)
+                .send()
+                .await
+                .context("removeOperator send")?
+                .get_receipt()
+                .await
+                .context("removeOperator receipt")?;
+            (r, "removeOperator")
+        };
+        crate::ensure_mined(&receipt, label)
+    }
+
+    /// Read the on-chain `isOperatorBlacklisted(operator)` mapping — the
+    /// fixture-side confirmation for [`Self::set_operator_blacklist`], and the
+    /// other half of the union `OriginAssignment` evaluates.
+    pub async fn is_operator_blacklisted(&self, operator: Address) -> anyhow::Result<bool> {
+        ContentBlacklistOrigin::new(self.addrs.content_blacklist, &self.admin)
+            .isOperatorBlacklisted(operator)
+            .call()
+            .await
+            .context("isOperatorBlacklisted")
+    }
+
     /// Add `hash` to `region`'s blacklist, acting as that region's registered
     /// body. `region` is the packed key from [`region_key`]. Emits
     /// `HashBlacklisted(region, hash)`.
