@@ -92,6 +92,14 @@ struct Inner {
     /// takedown, full stop. The pin just keeps the hash off the LRU
     /// candidate list.
     pinned: ArcSwap<HashSet<Hash>>,
+    /// Origin-held discovery index (#1130): hashes this node can serve from a
+    /// configured origin *before* any pull-through, each mapped to its total
+    /// byte size. Rebuilt wholesale by [`CacheEngine::rescan_origins`] (fs
+    /// directory enumeration ∪ present operator pins) and swapped atomically,
+    /// mirroring `pinned`. Probe and DHT-announce read it so cold origin
+    /// content is discoverable on the first request rather than only after a
+    /// warm pulls it into the store. Never includes refused/denied hashes.
+    origin_held: ArcSwap<HashMap<Hash, u64>>,
     /// Hashes this node refuses to serve, announce, or acquire because the
     /// operator's own `[content] denied_hashes` names them, and which a later
     /// config reload can UN-refuse (ADR 011 § Local Denylist). The governance
@@ -871,6 +879,7 @@ impl CacheEngine {
                         .map(|h| to_store_hash(*h))
                         .collect::<HashSet<Hash>>(),
                 )),
+                origin_held: ArcSwap::from(Arc::new(HashMap::new())),
                 denied: ArcSwap::from(Arc::new(HashSet::new())),
                 chain_denied: ArcSwap::from(Arc::new(HashSet::new())),
                 evicted: Mutex::new(evicted),
@@ -969,6 +978,74 @@ impl CacheEngine {
     /// Is `hash` currently pinned? Cheap O(1) lookup against the live set.
     pub fn is_pinned(&self, hash: Hash) -> bool {
         self.inner.pinned.load().contains(&hash)
+    }
+
+    /// Rebuild the origin-held discovery index (#1130): the hashes this node
+    /// can serve from a configured origin *before* any pull-through, so probe
+    /// and DHT-announce can advertise them. The set is the union of
+    ///
+    /// - every enumerable origin's [`Origin::enumerate`] listing (the local
+    ///   filesystem walks its sharded tree; HTTP/S3 enumerate to nothing), and
+    /// - operator `pinned_hashes` the origin chain actually has (the remote
+    ///   discovery path — HTTP has no listing, S3's is deliberately not walked,
+    ///   so the pin list is their advertisement set),
+    ///
+    /// each mapped to its total byte size and filtered through [`Self::refuses`]
+    /// so denied/blacklisted content is never advertised. Rebuilt wholesale and
+    /// swapped atomically (like `pinned`): a concurrent reader sees the old or
+    /// the new map, never a partial one.
+    ///
+    /// **Cost:** one [`Self::origin_size`] probe per held hash — a local
+    /// `metadata()` stat per fs entry, one HTTP `HEAD` / S3 `HeadObject` per
+    /// pinned remote hash. Runs off the hot path at the configured rescan
+    /// cadence (startup / interval / reload), never per request.
+    pub async fn rescan_origins(&self) {
+        // Gather candidate hashes: every enumerable origin's listing plus the
+        // operator pin set (snapshotted before any await, so we never hold the
+        // `ArcSwap` guard across a `size()` probe).
+        let mut candidates: Vec<Hash> = Vec::new();
+        for origin in &self.inner.origins {
+            match origin.enumerate().await {
+                Ok(hashes) => candidates.extend(hashes),
+                Err(err) => tracing::warn!(
+                    origin = ?origin.kind(),
+                    error = %err,
+                    "rescan_origins: enumerate failed; skipping this origin"
+                ),
+            }
+        }
+        candidates.extend(self.inner.pinned.load().iter().copied());
+
+        // Resolve size for each present, non-refused candidate, deduping so we
+        // probe each hash once. `origin_size` is a local stat (fs) or one HEAD
+        // (pinned remote); `None`/error means "origin doesn't have it" → skip.
+        let mut held: HashMap<Hash, u64> = HashMap::new();
+        for hash in candidates {
+            if self.refuses(hash) || held.contains_key(&hash) {
+                continue;
+            }
+            if let Ok(Some(size)) = self.origin_size(hash).await {
+                held.insert(hash, size);
+            }
+        }
+
+        let count = held.len();
+        self.inner.origin_held.store(Arc::new(held));
+        tracing::debug!(count, "rescan_origins: refreshed origin-held index");
+    }
+
+    /// Snapshot of the hashes in the origin-held index (#1130), for seeding the
+    /// DHT announce / republish set alongside [`Self::iter_hashes`].
+    pub fn origin_held_hashes(&self) -> Vec<Hash> {
+        self.inner.origin_held.load().keys().copied().collect()
+    }
+
+    /// Total byte size of `hash` if this node can serve it from a configured
+    /// origin (#1130), else `None`. Backs the probe `has_blob` / `total_bytes`
+    /// answer for origin-held content — `Some` means "advertise and serve" —
+    /// resolved from the last [`Self::rescan_origins`] with no per-probe I/O.
+    pub fn origin_held_size(&self, hash: Hash) -> Option<u64> {
+        self.inner.origin_held.load().get(&hash).copied()
     }
 
     /// Swap in the live *local* denied set from `[content] denied_hashes` (ADR
@@ -3996,6 +4073,67 @@ mod tests {
         anyhow::ensure!(
             !engine.eviction_candidates().contains_key(&hash),
             "released hash should leave the candidate set"
+        );
+        Ok(())
+    }
+
+    /// The origin-held index (#1130) advertises fs-origin content by directory
+    /// enumeration, includes only *present* pins, and excludes refused hashes.
+    #[tokio::test]
+    async fn rescan_origins_indexes_fs_and_present_pins() -> anyhow::Result<()> {
+        use crate::origin::FilesystemOrigin;
+
+        async fn seed(base: &Path, payload: Vec<u8>) -> anyhow::Result<(Hash, u64)> {
+            let hash = Hash::new(&payload);
+            let hex = hash.to_hex();
+            let shard = hex.get(..2).unwrap_or("");
+            let dir = base.join(shard);
+            tokio::fs::create_dir_all(&dir).await?;
+            tokio::fs::write(dir.join(hex.as_str()), &payload).await?;
+            let len = u64::try_from(payload.len()).unwrap_or(u64::MAX);
+            Ok((hash, len))
+        }
+
+        let origin_dir = tempfile::tempdir()?;
+        let base = tokio::fs::canonicalize(origin_dir.path()).await?;
+        let (h1, len1) = seed(&base, vec![1u8; 5000]).await?;
+        let (h2, len2) = seed(&base, vec![2u8; 9000]).await?;
+
+        let cache_dir = tempfile::tempdir()?;
+        let origin = Arc::new(FilesystemOrigin::new(&base).await?) as Arc<dyn Origin>;
+        let engine = CacheEngine::open(cache_dir.path(), vec![origin], 10).await?;
+
+        // Pin one present hash and one absent hash; only the present one is held.
+        let absent = Hash::new(b"never-on-disk");
+        engine.set_pinned(&PinnedHashes::new(
+            [from_store_hash(h1), from_store_hash(absent)]
+                .into_iter()
+                .collect(),
+        ));
+
+        engine.rescan_origins().await;
+
+        let held: HashSet<Hash> = engine.origin_held_hashes().into_iter().collect();
+        anyhow::ensure!(
+            held.contains(&h1) && held.contains(&h2),
+            "fs blobs must be enumerated into the held index",
+        );
+        anyhow::ensure!(!held.contains(&absent), "absent pin must not be held");
+        anyhow::ensure!(engine.origin_held_size(h1) == Some(len1), "h1 size wrong");
+        anyhow::ensure!(engine.origin_held_size(h2) == Some(len2), "h2 size wrong");
+        anyhow::ensure!(
+            engine.origin_held_size(absent).is_none(),
+            "absent hash must not be servable from origin",
+        );
+
+        // A denied hash drops out of the index on the next rescan.
+        engine.set_denied(&crate::DeniedHashes::new(
+            [from_store_hash(h2)].into_iter().collect(),
+        ));
+        engine.rescan_origins().await;
+        anyhow::ensure!(
+            engine.origin_held_size(h2).is_none(),
+            "denied hash must not be advertised",
         );
         Ok(())
     }
