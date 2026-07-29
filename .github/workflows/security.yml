@@ -31,7 +31,7 @@ concurrency:
 jobs:
   trivy-fs:
     name: Trivy filesystem scan
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v7
 
@@ -48,7 +48,7 @@ jobs:
   trivy-image:
     name: Trivy image scan
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     permissions:
       contents: read
       packages: read
