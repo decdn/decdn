@@ -21,7 +21,7 @@
 //! The chain/discovery/delivery seams (`resolve_chain`, `resolve_target_node`,
 //! `probe_and_rank`, `open_or_reuse`, `fetch_blob`, `write_blob_atomic`) are
 //! `pub(crate)` so `decdn bundle pull` (#391) reuses the same paid-fetch kernel
-//! across a manifest's many entries.
+//! across a bundle's many entries.
 
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -50,7 +50,6 @@ use decdn_protocol::client::StreamError;
 use iroh::{Endpoint, EndpointAddr, PublicKey, RelayUrl};
 
 use super::chain_ctx;
-use super::file_manifest;
 use decdn_client_pull::discovery::{self, NodeCandidate};
 use decdn_client_pull::endpoint as client_endpoint;
 use decdn_client_pull::probe::probe_once;
@@ -64,24 +63,6 @@ const DEFAULT_DEPOSIT_MICRO_USDC: u64 = 10_000_000;
 /// concurrently, so this bounds selection latency rather than the overall fetch
 /// (`--timeout-ms`); a dead candidate falls out of selection after this.
 const SELECT_PROBE_TIMEOUT_MS: u64 = 5_000;
-
-/// Ceiling on a fetched blob that claims to be a `DECDNMAN` file manifest
-/// ([`read_if_manifest`]).
-///
-/// The cap exists because the `DECDNMAN` magic is 8 unauthenticated bytes at the
-/// head of a blob: without it a publisher could make `decdn fetch` read an
-/// arbitrarily large file fully into memory, undoing the streaming this module is
-/// built around.
-///
-/// Derived from [`file_manifest::MAX_CHUNKS`] rather than picked, so the two
-/// cannot drift into disagreeing about what is decodable: at the ~33-37 bytes per
-/// encoded `ChunkEntry` that `MAX_CHUNKS` documents, 64 B/entry leaves headroom
-/// for postcard's varint widths at the top of the range plus the fixed header. A
-/// flat 32 MiB — the obvious guess — is actually BELOW what `MAX_CHUNKS` permits,
-/// so it would have rejected manifests `file_manifest::decode` accepts.
-/// ADR 012 sizes the format for 10,000-chunk files (~370 KB), so nothing real is
-/// near either bound.
-const MAX_MANIFEST_BYTES: u64 = (file_manifest::MAX_CHUNKS as u64) * 64;
 
 /// Parse a user-supplied BLAKE3 hash: 64 hex chars, optionally `0x`- or
 /// `b3:`-prefixed (the `b3:` form is what bundle manifests carry).
@@ -988,50 +969,6 @@ async fn fetch_blob_streaming(
     }
 }
 
-/// Read `path` fully IF it starts with the `DECDNMAN` magic, else `None`.
-///
-/// The fetched blob may be a file manifest that has to be expanded into per-chunk
-/// pulls, and deciding that needs the bytes. Sniffing the 8-byte magic first is
-/// what keeps that from undoing the streaming work: an ordinary blob — the case
-/// that can be hundreds of megabytes — is never read back at all. A manifest is
-/// a short index by construction, so reading one whole is bounded.
-fn read_if_manifest(path: &Path) -> anyhow::Result<Option<Vec<u8>>> {
-    use std::io::Read;
-
-    let mut file =
-        std::fs::File::open(path).map_err(|e| anyhow::anyhow!("open {}: {e}", path.display()))?;
-    let mut magic = [0u8; file_manifest::MAGIC.len()];
-    match file.read_exact(&mut magic) {
-        Ok(()) => {}
-        // Shorter than the magic ⇒ not a manifest. Not an error: a blob is
-        // allowed to be two bytes long.
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(anyhow::anyhow!("read {}: {e}", path.display())),
-    }
-    if magic != file_manifest::MAGIC {
-        return Ok(None);
-    }
-    // "A manifest is short by construction" is a property of honest manifests,
-    // not something the bytes on disk guarantee: the magic is 8 unauthenticated
-    // bytes any publisher can put at the head of a 708 MB blob, and reading that
-    // whole would undo the streaming this function exists to protect. Cap it.
-    let len = file
-        .metadata()
-        .map_err(|e| anyhow::anyhow!("stat {}: {e}", path.display()))?
-        .len();
-    if len > MAX_MANIFEST_BYTES {
-        return Err(anyhow::anyhow!(
-            "{} starts with the DECDNMAN magic but is {len} bytes, above the {MAX_MANIFEST_BYTES}-byte \
-             manifest ceiling; refusing to load it into memory",
-            path.display()
-        ));
-    }
-    let mut out = magic.to_vec();
-    file.read_to_end(&mut out)
-        .map_err(|e| anyhow::anyhow!("read {}: {e}", path.display()))?;
-    Ok(Some(out))
-}
-
 /// Whether a failed open is consistent with the resume offset being wrong — i.e.
 /// the `.partial` on disk belonging to a different (or larger) blob.
 ///
@@ -1256,110 +1193,84 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
     // derived from the adopted channel's on-chain `provider`, and there is no
     // discovery/probe/select step to run before prompting for the keystore
     // password.
-    let (node_id, provider, ctx, signer, self_address, rpc, contract, voucher_dom, slash_dom) =
-        if let Some(raw_channel_id) = &common.channel_id {
-            let channel_id = parse_channel_id(raw_channel_id)?;
-            let expected_provider = common
-                .provider_address
-                .as_deref()
-                .map(|p| chain_ctx::parse_address(p, "--provider-address"))
-                .transpose()?;
+    let (node_id, provider, ctx, slash_dom) = if let Some(raw_channel_id) = &common.channel_id {
+        let channel_id = parse_channel_id(raw_channel_id)?;
+        let expected_provider = common
+            .provider_address
+            .as_deref()
+            .map(|p| chain_ctx::parse_address(p, "--provider-address"))
+            .transpose()?;
 
-            let password = read_password(
-                &[
-                    PasswordSource::Env(eth_identity::KEYSTORE_PASSWORD_ENV),
-                    PasswordSource::Prompt { confirm: false },
-                ],
-                "eth keystore password",
-            )?;
-            let signer = Arc::new(load_signer(&chain.keystore, &password)?);
-            let self_address = signer.address();
-            let rpc = provider::build_provider(&chain.rpc_url, &signer)?;
-            let contract = PaymentChannel::new(chain.payment_channel, rpc.clone());
-            let voucher_dom = voucher_domain(chain.chain_id, chain.payment_channel);
-            let slash_dom = slash_judge_domain(chain.chain_id, chain.slash_judge);
+        let password = read_password(
+            &[
+                PasswordSource::Env(eth_identity::KEYSTORE_PASSWORD_ENV),
+                PasswordSource::Prompt { confirm: false },
+            ],
+            "eth keystore password",
+        )?;
+        let signer = Arc::new(load_signer(&chain.keystore, &password)?);
+        let self_address = signer.address();
+        let rpc = provider::build_provider(&chain.rpc_url, &signer)?;
+        let contract = PaymentChannel::new(chain.payment_channel, rpc.clone());
+        let voucher_dom = voucher_domain(chain.chain_id, chain.payment_channel);
+        let slash_dom = slash_judge_domain(chain.chain_id, chain.slash_judge);
 
-            let (ctx, provider) = hydrate_channel_by_id(
-                &store,
-                &contract,
-                channel_id,
-                self_address,
-                &voucher_dom,
-                &signer,
-                expected_provider,
-            )
-            .await?;
-            let ctx = attach_client_binding(ctx, &chain, &endpoint, &signer)?;
-            let node_id = resolve_node_for_provider(common, &chain, provider).await?;
+        let (ctx, provider) = hydrate_channel_by_id(
+            &store,
+            &contract,
+            channel_id,
+            self_address,
+            &voucher_dom,
+            &signer,
+            expected_provider,
+        )
+        .await?;
+        let ctx = attach_client_binding(ctx, &chain, &endpoint, &signer)?;
+        let node_id = resolve_node_for_provider(common, &chain, provider).await?;
 
-            (
-                node_id,
-                provider,
-                ctx,
-                signer,
-                self_address,
-                rpc,
-                contract,
-                voucher_dom,
-                slash_dom,
-            )
-        } else {
-            // Resolve the node to fetch from: explicit `--node-id`, or auto-discover.
-            let (node_id, provider) =
-                resolve_target_node(common, &chain, &endpoint, &store, &relays, hash).await?;
+        (node_id, provider, ctx, slash_dom)
+    } else {
+        // Resolve the node to fetch from: explicit `--node-id`, or auto-discover.
+        let (node_id, provider) =
+            resolve_target_node(common, &chain, &endpoint, &store, &relays, hash).await?;
 
-            // Buyer signer (vouchers + the openChannel tx). Loaded after selection so a
-            // failed discovery never prompts for a keystore password. Password from env,
-            // else TTY.
-            let password = read_password(
-                &[
-                    PasswordSource::Env(eth_identity::KEYSTORE_PASSWORD_ENV),
-                    PasswordSource::Prompt { confirm: false },
-                ],
-                "eth keystore password",
-            )?;
-            let signer = Arc::new(load_signer(&chain.keystore, &password)?);
-            let self_address = signer.address();
+        // Buyer signer (vouchers + the openChannel tx). Loaded after selection so a
+        // failed discovery never prompts for a keystore password. Password from env,
+        // else TTY.
+        let password = read_password(
+            &[
+                PasswordSource::Env(eth_identity::KEYSTORE_PASSWORD_ENV),
+                PasswordSource::Prompt { confirm: false },
+            ],
+            "eth keystore password",
+        )?;
+        let signer = Arc::new(load_signer(&chain.keystore, &password)?);
+        let self_address = signer.address();
 
-            let rpc = provider::build_provider(&chain.rpc_url, &signer)?;
-            let contract = PaymentChannel::new(chain.payment_channel, rpc.clone());
-            let voucher_dom = voucher_domain(chain.chain_id, chain.payment_channel);
-            let slash_dom = slash_judge_domain(chain.chain_id, chain.slash_judge);
+        let rpc = provider::build_provider(&chain.rpc_url, &signer)?;
+        let contract = PaymentChannel::new(chain.payment_channel, rpc.clone());
+        let voucher_dom = voucher_domain(chain.chain_id, chain.payment_channel);
+        let slash_dom = slash_judge_domain(chain.chain_id, chain.slash_judge);
 
-            // Reuse a live channel for this provider (resuming its watermark), else open
-            // and persist a new one, with the ADR 005 client binding attached.
-            //
-            // Rebuilt before EVERY blob rather than hoisted: the context snapshots the
-            // channel's voucher watermark (`prior_nonce`), which `fetch_blob` advances in
-            // the store as it pays. A chunked-manifest fetch (#1183) issues many
-            // sequential pulls on one channel, and reusing a stale context would re-sign
-            // an already-spent nonce. It also gives each chunk a fresh low-deposit
-            // refill check (#1103).
-            let ctx = build_channel_ctx(
-                &store,
-                &contract,
-                &rpc,
-                &signer,
-                &voucher_dom,
-                provider,
-                self_address,
-                &chain,
-                &endpoint,
-            )
-            .await?;
+        // Reuse a live channel for this provider (resuming its watermark), else open
+        // and persist a new one, with the ADR 005 client binding attached. The
+        // context snapshots the channel's voucher watermark (`prior_nonce`) and gives
+        // the fetch a low-deposit refill check (#1103).
+        let ctx = build_channel_ctx(
+            &store,
+            &contract,
+            &rpc,
+            &signer,
+            &voucher_dom,
+            provider,
+            self_address,
+            &chain,
+            &endpoint,
+        )
+        .await?;
 
-            (
-                node_id,
-                provider,
-                ctx,
-                signer,
-                self_address,
-                rpc,
-                contract,
-                voucher_dom,
-                slash_dom,
-            )
-        };
+        (node_id, provider, ctx, slash_dom)
+    };
 
     let mut target = EndpointAddr::new(node_id);
     // `--addr` requires `--node-id` (clap), so it only pins the explicit-node
@@ -1379,8 +1290,6 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
     let (bar, on_progress) = delivery_progress();
     // The namespace routing hint (ADR 005 § Namespace routing): `--namespace <id>`
     // → big-endian `uint256`; absent => `NO_NAMESPACE` (best-effort cache/DHT).
-    // A `DECDNMAN` manifest's chunk pulls inherit it (the chunks are that
-    // namespace's content), threaded through `ChunkFetcher` below.
     let namespace_id = args
         .namespace
         .map_or(decdn_protocol::client::NO_NAMESPACE, |n| {
@@ -1393,9 +1302,7 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
     let partial = partial_path(&args.output);
     let streamed = fetch_blob_streaming(
         &endpoint,
-        // Cloned, not moved: a `DECDNMAN` manifest expands into per-chunk pulls
-        // to the same node below (#1183).
-        target.clone(),
+        target,
         &ctx,
         &slash_dom,
         provider,
@@ -1462,48 +1369,6 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
         }
     }
 
-    // A `DECDNMAN` manifest blob is a chunked FILE, not the file's bytes: expand
-    // it into per-chunk pulls and reconstruct (ADR 012 § Download flow, #1183).
-    // Anything without the magic is a raw blob and is promoted unchanged.
-    //
-    // Reading the partial back to sniff it is bounded, not a reintroduction of
-    // whole-blob buffering: only a blob small enough to BE a manifest is ever
-    // fully read (the magic check happens on the first 8 bytes).
-    let manifest_blob = read_if_manifest(&partial)?;
-    if let Some(blob) = manifest_blob
-        && let Some(manifest) = file_manifest::sniff(&blob)
-    {
-        let chunks = ChunkFetcher {
-            endpoint: &endpoint,
-            target: &target,
-            store: &store,
-            contract: &contract,
-            rpc: &rpc,
-            signer: &signer,
-            voucher_dom: &voucher_dom,
-            slash_dom: &slash_dom,
-            chain: &chain,
-            provider,
-            self_address,
-            deadlines: PullDeadlines::capped(
-                common.stall_timeout(),
-                common.stall_timeout(),
-                common.hard_cap(),
-            )?,
-            max_blob_bytes,
-            max_rate_per_mb: common.max_rate_per_mb,
-            namespace_id,
-        };
-        let out = chunks
-            .reconstruct(&manifest?, hash, &args.output, !common.no_keep_blobs)
-            .await;
-        // The manifest blob itself is not the user's file — reconstruction wrote
-        // that. Clear the scratch file either way so a later fetch to the same
-        // `--output` does not try to resume a manifest as if it were the content.
-        let _ = std::fs::remove_file(&partial);
-        return out;
-    }
-
     // Promote the verified partial in place of a copy-through: an atomic rename
     // on the same filesystem, so `--output` never exists in a half-written state
     // and the blob is never held in memory to be written a second time.
@@ -1543,101 +1408,6 @@ fn delivery_progress() -> (indicatif::ProgressBar, impl Fn(u64, u64) + 'static) 
     (bar, on_progress)
 }
 
-/// The fetch-wide state a chunked `DECDNMAN` download needs to pull each chunk
-/// (#1183), borrowed from [`fetch`]'s own locals.
-///
-/// It exists because chunk pulls are *repeated* single-blob fetches: they reuse
-/// the node, channel, and deadlines already resolved for the manifest blob, but
-/// each needs a freshly-rebuilt [`ChannelContext`] (see [`build_channel_ctx`]).
-/// Bundling them beats threading a dozen arguments through a free function.
-struct ChunkFetcher<'a, P: alloy::providers::Provider + Clone> {
-    endpoint: &'a Endpoint,
-    /// The node that served the manifest; its chunks are pulled from it too.
-    target: &'a EndpointAddr,
-    store: &'a RedbBuyerChannelStore,
-    contract: &'a PaymentChannel::PaymentChannelInstance<P>,
-    rpc: &'a P,
-    signer: &'a Arc<PrivateKeySigner>,
-    voucher_dom: &'a Eip712Domain,
-    slash_dom: &'a Eip712Domain,
-    chain: &'a ResolvedChain,
-    provider: Address,
-    self_address: Address,
-    /// Applied per chunk, matching how `--stall-timeout-ms`/`--timeout-ms` are
-    /// documented to apply per entry for `bundle pull`.
-    deadlines: PullDeadlines,
-    max_blob_bytes: u64,
-    /// Buyer-side per-MB rate ceiling applied per chunk (#1375); `0` = unlimited.
-    max_rate_per_mb: u64,
-    /// The namespace the manifest's content is published under (ADR 002 §
-    /// Retrieval by namespace); every chunk pull routes on it. `NO_NAMESPACE`
-    /// when `--namespace` was omitted.
-    namespace_id: [u8; 32],
-}
-
-impl<P: alloy::providers::Provider + Clone> ChunkFetcher<'_, P> {
-    /// Pull one chunk blob on a fresh channel context.
-    async fn fetch(&self, hash: [u8; 32]) -> anyhow::Result<Vec<u8>> {
-        let ctx = build_channel_ctx(
-            self.store,
-            self.contract,
-            self.rpc,
-            self.signer,
-            self.voucher_dom,
-            self.provider,
-            self.self_address,
-            self.chain,
-            self.endpoint,
-        )
-        .await?;
-        fetch_blob(
-            self.endpoint,
-            self.target.clone(),
-            &ctx,
-            self.slash_dom,
-            self.provider,
-            self.store,
-            hash,
-            self.namespace_id,
-            self.deadlines,
-            self.max_blob_bytes,
-            self.max_rate_per_mb,
-            // No per-chunk byte bar: it would reset once per chunk and read as a
-            // stuttering restart. Chunk progress is the printed lines here plus
-            // the per-chunk error context from `file_manifest::reconstruct`.
-            None,
-        )
-        .await
-        .map_err(|err| annotate_unbound_cache_miss(err, &ctx))
-    }
-
-    /// Reconstruct the manifest's file into `output` and report.
-    async fn reconstruct(
-        &self,
-        manifest: &file_manifest::FileManifest,
-        manifest_hash: [u8; 32],
-        output: &Path,
-        keep_blobs: bool,
-    ) -> anyhow::Result<()> {
-        println!(
-            "fetched a file manifest ({} chunk(s), {} bytes); reconstructing",
-            manifest.chunks.len(),
-            manifest.total_bytes
-        );
-        let written = file_manifest::reconstruct(
-            manifest,
-            manifest_hash,
-            &file_manifest::downloads_root(&self.chain.data_dir),
-            output,
-            keep_blobs,
-            |chunk_hash| self.fetch(chunk_hash),
-        )
-        .await?;
-        println!("reconstructed {written} bytes -> {}", output.display());
-        Ok(())
-    }
-}
-
 /// [`open_or_reuse`] plus the ADR 005 client identity binding (#1115): sign our
 /// OWN iroh `NodeId` with the buyer key so the serving node can prove we own the
 /// channel and reactively pull a cache-missed blob from its configured origin.
@@ -1648,9 +1418,6 @@ impl<P: alloy::providers::Provider + Clone> ChunkFetcher<'_, P> {
 /// emitted for that — it would fire on every successful cached fetch too,
 /// training users to ignore it; the refusal is explained at the point of failure
 /// by [`annotate_unbound_cache_miss`].
-///
-/// Its own function (rather than inline in [`fetch`]) because a chunked-manifest
-/// download rebuilds the context once per chunk — see the call site.
 #[allow(clippy::too_many_arguments)]
 async fn build_channel_ctx<P>(
     store: &RedbBuyerChannelStore,
@@ -1934,7 +1701,6 @@ mod tests {
             max_rate_per_mb: 0,
             stall_timeout_ms: 30_000,
             timeout_ms: 3_600_000,
-            no_keep_blobs: false,
         }
     }
 
@@ -2340,42 +2106,6 @@ mod tests {
         Ok(())
     }
 
-    /// The manifest sniff must refuse an oversized blob rather than read it whole.
-    ///
-    /// The `DECDNMAN` magic is 8 bytes any publisher can put at the head of a
-    /// 708 MB blob, so without the cap this one function undoes the streaming the
-    /// rest of the command is built around. Uses `set_len` so the file is sparse
-    /// and the test costs nothing.
-    #[test]
-    fn read_if_manifest_refuses_a_blob_above_the_ceiling() -> anyhow::Result<()> {
-        use std::io::Write as _;
-        let dir = tempfile::tempdir()?;
-
-        let oversized = dir.path().join("huge.bin");
-        let mut f = std::fs::File::create(&oversized)?;
-        f.write_all(&file_manifest::MAGIC)?;
-        f.set_len(MAX_MANIFEST_BYTES + 1)?;
-        drop(f);
-        let err = read_if_manifest(&oversized)
-            .expect_err("a blob above the ceiling must be refused, not read into memory");
-        assert!(
-            format!("{err:#}").contains("ceiling"),
-            "the error must name the ceiling: {err:#}"
-        );
-
-        // The boundary twin, so the cap cannot be "fixed" by rejecting everything.
-        let at_cap = dir.path().join("at-cap.bin");
-        let mut f = std::fs::File::create(&at_cap)?;
-        f.write_all(&file_manifest::MAGIC)?;
-        f.set_len(MAX_MANIFEST_BYTES)?;
-        drop(f);
-        assert!(
-            read_if_manifest(&at_cap)?.is_some(),
-            "a manifest exactly at the ceiling must still be read"
-        );
-        Ok(())
-    }
-
     #[test]
     fn partial_path_sits_beside_the_output() {
         let p = partial_path(Path::new("/data/out/movie.mkv"));
@@ -2386,34 +2116,6 @@ mod tests {
             partial_path(Path::new("blob.bin")),
             Path::new("blob.bin.partial")
         );
-    }
-
-    /// Sniffing must read a manifest whole and an ordinary blob not at all — that
-    /// asymmetry is what keeps the manifest check from undoing the streaming.
-    #[test]
-    fn read_if_manifest_reads_only_manifests() -> anyhow::Result<()> {
-        let dir = tempfile::tempdir()?;
-
-        let manifest = dir.path().join("m.bin");
-        let mut body = file_manifest::MAGIC.to_vec();
-        body.extend_from_slice(b"payload");
-        std::fs::write(&manifest, &body)?;
-        assert_eq!(read_if_manifest(&manifest)?, Some(body));
-
-        let plain = dir.path().join("p.bin");
-        std::fs::write(&plain, b"not a manifest at all")?;
-        assert_eq!(read_if_manifest(&plain)?, None);
-
-        // Shorter than the magic is a legitimate tiny blob, not a read error.
-        let tiny = dir.path().join("t.bin");
-        std::fs::write(&tiny, b"hi")?;
-        assert_eq!(read_if_manifest(&tiny)?, None);
-
-        // Empty blob (#1054) — same.
-        let empty = dir.path().join("e.bin");
-        std::fs::write(&empty, b"")?;
-        assert_eq!(read_if_manifest(&empty)?, None);
-        Ok(())
     }
 
     #[test]

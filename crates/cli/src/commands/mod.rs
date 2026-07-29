@@ -14,7 +14,6 @@ pub mod channel;
 pub mod config;
 pub mod deregister;
 pub mod fetch;
-pub mod file_manifest;
 pub mod key_gen;
 pub mod node;
 pub mod node_top;

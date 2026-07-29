@@ -4,9 +4,8 @@
 > publisher-side convenience for grouping multiple BLAKE3-content-addressed
 > blobs into a single JSON manifest file. Nodes do not require bundle
 > support — they deliver individual hashes. Alternative grouping
-> mechanisms (tarballs, the per-blob chunk manifest from
-> [ADR 012 § File Manifests and Reconstruction](012-client.md#file-manifests-and-reconstruction))
-> remain valid for their own use cases.
+> mechanisms (tarballs and the like) remain valid for their own use
+> cases.
 
 **Date:** 2026-05-07 — **Status:** Accepted (`bundle create`
 ships; `bundle pull` deferred). **Touches:** `decdn` CLI, content
@@ -115,23 +114,6 @@ Origins serve the bundle bytes as one regular blob; publishers announce
 the bundle hash; clients fetch the bundle hash, parse the JSON, then
 fetch every `entries[].hash` separately. The bundle is leaf data, not a
 manifest in the protocol sense.
-
-## Non-relationship to [ADR 012](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model)'s `DECDNMAN` chunk manifest
-
-[ADR 012 § File Manifests and Reconstruction](012-client.md#file-manifests-and-reconstruction)
-defines a binary chunk manifest with the magic prefix `DECDNMAN` for
-streaming a single large blob in pieces. Bundles are **not** that:
-
-- `DECDNMAN` is a **transport-side, intra-file** binary format — one
-  logical blob split into ordered chunks with shared total-size
-  metadata. Clients reassemble it into one file.
-- Bundles are a **publisher-side, inter-file** JSON format — many
-  independent content blobs grouped by relative path. Clients
-  reconstruct a directory tree.
-
-Different layer, different audience, different magic. The two compose:
-an entry's `hash` may itself be a `DECDNMAN` manifest blob hash for a
-chunked single file inside a bundled directory.
 
 ## Relationship to [ADR 002](002-content-addressing.md#adr-002-content-addressing) / [ADR 013](013-schema-evolution.md#adr-013-schema-evolution)
 
