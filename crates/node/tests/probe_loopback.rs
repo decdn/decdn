@@ -1022,9 +1022,11 @@ async fn probe_has_blob_true_for_cached_blob() -> anyhow::Result<()> {
 }
 
 /// A node with the eviction-hold path **disabled by config**
-/// (`max_probe_holds == 0`) holds the blob but cannot guarantee a hold, so it
-/// must still answer `has_blob: false` with a valid `slash_sig` over
-/// `has_blob=false` — never risk a phantom slash (ADR 005 §Hold budget).
+/// (`max_probe_holds == 0`) holds the blob but answers `has_blob: false` with a
+/// valid `slash_sig` over `has_blob=false`. The reason is the operator opt-out,
+/// NOT the missing guarantee — `BudgetExhausted` also places no hold and still
+/// advertises. `max_probe_holds = 0` means "do not advertise store-backed
+/// content at all" (ADR 005 §Hold budget).
 /// Exercises the handler's `HoldsDisabled` arm end-to-end and asserts the
 /// outcome is counted as a *disabled* event, NOT as budget pressure (#739).
 #[tokio::test(flavor = "multi_thread")]
@@ -1079,12 +1081,13 @@ async fn probe_holds_disabled_signs_has_blob_false_and_counts_disabled() -> anyh
     Ok(())
 }
 
-/// A node with a positive but fully-occupied hold budget answers
-/// `has_blob: false` and counts the event as genuine budget pressure
-/// (`reason="exhausted"`), NOT as a config disable (#739). This is the
-/// signal whose alert remedy is "increase `max_probe_holds`".
+/// A node with a positive but fully-occupied hold budget still advertises
+/// `has_blob: true` (the hold is best-effort — presence, not a guaranteed hold,
+/// governs the answer) but places no hold, and counts the event as genuine
+/// budget pressure (`reason="exhausted"`), NOT as a config disable (#739). This
+/// is the signal whose alert remedy is "increase `max_probe_holds`".
 #[tokio::test(flavor = "multi_thread")]
-async fn probe_budget_exhausted_counts_exhausted_not_disabled() -> anyhow::Result<()> {
+async fn probe_budget_exhausted_still_advertises_and_counts_exhausted() -> anyhow::Result<()> {
     let a: &[u8] = b"first popular blob";
     let b: &[u8] = b"second popular blob";
     let (cache, ha, hb, _cache_tmp) = cache_with_two_blobs(a, b).await?;
@@ -1095,6 +1098,10 @@ async fn probe_budget_exhausted_counts_exhausted_not_disabled() -> anyhow::Resul
         cache.try_probe_hold(ha).await? == decdn_cache::ProbeHoldOutcome::Held,
         "first hold should fit the budget"
     );
+    // Kept so the test can prove the budget was respected, not just reported:
+    // `has_blob` looks identical whether the second probe forwent the hold or
+    // overran `max_probe_holds`.
+    let cache_probe = cache.clone();
 
     let server_sk = fresh_key();
     let server_id = server_sk.public();
@@ -1109,10 +1116,24 @@ async fn probe_budget_exhausted_counts_exhausted_not_disabled() -> anyhow::Resul
     let resp = run_one_probe(server_sk, handler, req).await?;
 
     anyhow::ensure!(
-        !resp.body.has_blob,
-        "budget-exhausted hold must yield has_blob=false even though the blob is cached"
+        resp.body.has_blob,
+        "budget-exhausted must still advertise has_blob=true — the hold is forgone, not the answer"
+    );
+    anyhow::ensure!(
+        resp.total_bytes == Some(b.len() as u64),
+        "the advertised blob must carry its size, got {:?}",
+        resp.total_bytes
     );
     assert_slash_sig_valid(&resp, &signer, &domain)?;
+
+    // The budget is a hard ceiling: the advertised-but-unheld blob must not
+    // have taken a second slot. Only `ha` is held.
+    anyhow::ensure!(
+        cache_probe.probe_hold_slots_used() == 1,
+        "budget-exhausted must forgo the hold, leaving max_probe_holds=1 slot \
+         in use; found {}",
+        cache_probe.probe_hold_slots_used()
+    );
 
     let text = metrics.encode()?;
     anyhow::ensure!(
@@ -1134,18 +1155,24 @@ async fn probe_budget_exhausted_counts_exhausted_not_disabled() -> anyhow::Resul
 }
 
 /// With a stake-lane reservation configured (#757, ADR 003 §Admission and
-/// Priority), a probe from a client that is NOT a registered operator is
-/// answered `has_blob: false` once hold usage reaches the end-client ceiling.
-/// Here `max_holds=1, reserved=1` gives a ceiling of `0`, so the end-client
-/// is shed immediately even though the blob is cached and the budget is free.
-/// The event is counted as a stake-lane reservation — never as budget
-/// exhaustion (`reason="exhausted"`) or a config disable
-/// (`reason="disabled"`), whose alerts have different remedies.
+/// Priority), a probe from a client that is NOT a registered operator still
+/// advertises `has_blob: true` but places no eviction hold once hold usage
+/// reaches the end-client ceiling — the reservation protects node-to-node hold
+/// slots, it does not suppress an honest answer. Here `max_holds=1, reserved=1`
+/// gives a ceiling of `0`, so the end-client is shed from the hold immediately
+/// even though the blob is cached. The event is counted as a stake-lane
+/// reservation — never as budget exhaustion (`reason="exhausted"`) or a config
+/// disable (`reason="disabled"`), whose alerts have different remedies.
 #[tokio::test(flavor = "multi_thread")]
-async fn probe_end_client_reserved_out_signs_has_blob_false() -> anyhow::Result<()> {
+async fn probe_end_client_reserved_out_still_advertises() -> anyhow::Result<()> {
     let payload = b"reserved-for-stake-lane content";
     let (cache, hash, _cache_tmp) = cache_with_blob(payload).await?;
     cache.set_max_probe_holds(1);
+    // Kept so the test can inspect hold state after the probe. Asserting the
+    // wire answer alone cannot distinguish "advertised, no hold" from
+    // "advertised AND consumed a reserved slot" — the latter is exactly the
+    // regression #757 exists to prevent, and it is invisible in `has_blob`.
+    let cache_probe = cache.clone();
 
     let server_sk = fresh_key();
     let server_id = server_sk.public();
@@ -1172,16 +1199,23 @@ async fn probe_end_client_reserved_out_signs_has_blob_false() -> anyhow::Result<
     let resp = run_one_probe(server_sk, handler, req).await?;
 
     anyhow::ensure!(
-        !resp.body.has_blob,
-        "an end-client under a stake-lane reservation must get has_blob=false"
+        resp.body.has_blob,
+        "an end-client under a stake-lane reservation must still get has_blob=true (hold shed, not the answer)"
     );
     anyhow::ensure!(
-        resp.total_bytes.is_none(),
-        "no size advertised when has_blob=false, got {:?}",
+        resp.total_bytes == Some(payload.len() as u64),
+        "the advertised blob must carry its size, got {:?}",
         resp.total_bytes
     );
-    // The signature must cover has_blob=false (never a stale true).
     assert_slash_sig_valid(&resp, &signer, &domain)?;
+
+    // The point of the reservation: the end-client got an honest answer but
+    // consumed NO hold slot, leaving the whole budget for the stake lane.
+    anyhow::ensure!(
+        cache_probe.probe_hold_slots_used() == 0,
+        "a reserved-out end-client must place no hold; {} slot(s) in use",
+        cache_probe.probe_hold_slots_used()
+    );
 
     let text = metrics.encode()?;
     anyhow::ensure!(
@@ -1219,6 +1253,9 @@ async fn probe_stake_lane_requester_keeps_reserved_headroom() -> anyhow::Result<
     let payload = b"served to a node-to-node requester";
     let (cache, hash, _cache_tmp) = cache_with_blob(payload).await?;
     cache.set_max_probe_holds(1);
+    // The mirror of the end-client assertion: a stake-lane requester must
+    // actually CONSUME the slot the reservation held open for it.
+    let cache_probe = cache.clone();
 
     let server_sk = fresh_key();
     let server_id = server_sk.public();
@@ -1257,6 +1294,15 @@ async fn probe_stake_lane_requester_keeps_reserved_headroom() -> anyhow::Result<
         resp.total_bytes
     );
     assert_slash_sig_valid(&resp, &signer, &domain)?;
+
+    // Unlike the shed end-client, this requester went through the real hold
+    // path and took the reserved slot. Together the two tests pin the
+    // reservation's actual behaviour, not just its counter.
+    anyhow::ensure!(
+        cache_probe.probe_hold_slots_used() == 1,
+        "a stake-lane requester must consume its reserved hold slot; {} in use",
+        cache_probe.probe_hold_slots_used()
+    );
 
     let text = metrics.encode()?;
     anyhow::ensure!(

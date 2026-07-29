@@ -36,11 +36,11 @@ groups:
             decdn_probe_hold_unavailable_total{reason="exhausted"} has been
             incrementing for 5m on {{ $labels.instance }}. Each increment is a
             blob that IS present but could not be held because every probe-hold
-            slot was live, so the node answered has_blob: false and forwent the
-            delivery. This is lost
-            revenue under budget pressure, not slash evidence — a held hash is
-            invisible to the LRU driver, so the "evicted after signing
-            has_blob: true" case is unreachable by construction. Reduce load or
+            slot was live. Holds are best-effort, so the node still advertised
+            has_blob: true and forwent only the hold — the blob is now visible
+            to the LRU driver and may be evicted before the requester's pull
+            arrives, costing a wasted round trip and a lost delivery. Not slash
+            evidence: no offense pairs a probe with a later miss. Reduce load or
             raise max_probe_holds; investigate OOM. The reason filter is
             load-bearing: reason="disabled" (max_probe_holds=0) and
             reason="stake_lane_reserved" are deliberate operator decisions and
@@ -158,20 +158,6 @@ groups:
             are not charging what you configured. Raise payment.rate_per_mb to
             at least the on-chain floor (hot-reloadable via SIGHUP).
             See adr/003-payments.md#rate-bounds-refresh.
-
-      - alert: DecdnSlashEvidenceExposure
-        expr: rate(decdn_slash_evidence_exposure_total[5m]) > 0
-        for: 1m
-        labels:
-          severity: critical
-          slash_risk: phantom_announcement
-        annotations:
-          summary: "Self-detected slash-evidence exposure on {{ $labels.instance }}"
-          description: |
-            The node produced a signed has_blob: true probe followed by a
-            stream response within the 30s slashing window — valid phantom
-            slash evidence. This is a critical bug signal. Stop the node
-            and file a bug. See adr/005-protocol.md.
 
   # ---------------------------------------------------------------
   # Liveness / capacity — operator-onboarding defaults.
@@ -331,8 +317,9 @@ groups:
         annotations:
           summary: "Probe-hold slots >90% used on {{ $labels.instance }}"
           description: |
-            Saturation forces has_blob: false answers for cached content,
-            losing revenue. Raise max_probe_holds — on a small cache keep it
+            Saturation means cached content is advertised without an eviction
+            hold, so it can be evicted before the pull arrives — wasted round
+            trips and lost deliveries. Raise max_probe_holds — on a small cache keep it
             proportional to cache size (recommended: no more than 25% of cache
             capacity); a production node serving many peers should scale the
             default up instead. max_probe_holds is restart-required.

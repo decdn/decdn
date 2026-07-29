@@ -1176,8 +1176,8 @@ impl CacheEngine {
     /// Returns `None` for a [`Self::refuses`]-listed hash even if the snapshot
     /// still holds it: the index is rebuilt only on rescan, so a hash
     /// blacklisted / evicted / denied since the last rescan would otherwise be
-    /// advertised (probe `has_blob: true`) or leak past the serve-miss
-    /// slash-safety gate. The live refusal check is the authority.
+    /// advertised (probe `has_blob: true`) for content the serve path would
+    /// refuse. The live refusal check is the authority.
     pub fn origin_held_size(&self, hash: Hash) -> Option<u64> {
         if self.refuses(hash) {
             return None;
@@ -1719,16 +1719,20 @@ impl CacheEngine {
     /// `hash` for [`crate::probe_hold::PROBE_HOLD_DURATION`] (ADR 005
     /// §Probe-triggered eviction hold).
     ///
-    /// Returns [`ProbeHoldOutcome::Held`] only when the node may safely sign
-    /// `has_blob: true`: the blob is present, not operator-evicted, **and** a
-    /// hold is guaranteed for the full slashing window. Otherwise returns one
-    /// of three `has_blob: false` causes so the caller need not re-inspect the
-    /// cache to classify the miss:
+    /// Returns [`ProbeHoldOutcome::Held`] when the blob is present, not
+    /// operator-evicted, and a hold was placed for the full window. The other
+    /// three variants classify why no hold happened, so the caller need not
+    /// re-inspect the cache:
     /// - [`ProbeHoldOutcome::Unavailable`] — blob absent or operator-evicted.
     /// - [`ProbeHoldOutcome::HoldsDisabled`] — holds disabled by config
     ///   (`max_probe_holds == 0`); an intentional operator decision.
     /// - [`ProbeHoldOutcome::BudgetExhausted`] — present but every hold slot
     ///   is live (`max_probe_holds > 0`); genuine budget pressure.
+    ///
+    /// Placing a hold and advertising the blob are **not** the same decision:
+    /// `BudgetExhausted` is advertised despite holding no slot. Callers should
+    /// read [`ProbeHoldOutcome::advertises`] / [`ProbeHoldOutcome::hold_placed`]
+    /// rather than comparing against `Held`.
     ///
     /// Per-blob semantics: a hash already held has its expiry refreshed and
     /// consumes no additional slot, so many peers probing one popular blob
@@ -1751,17 +1755,17 @@ impl CacheEngine {
         }
         let max = self.inner.max_probe_holds.load(Ordering::Relaxed);
         // Holds disabled by config (#739): answer `HoldsDisabled` before
-        // touching the lock. This is the unconditional "never sign
-        // has_blob:true" path — it must override an existing live hold so that
+        // touching the lock. This is the "never advertise store-backed content"
+        // path — it must override an existing live hold so that
         // if the budget is ever lowered to 0 while a hold is live, the disable
         // wins instead of the fast path below refreshing and re-signing the
         // hold. (Today only the tests lower it post-startup;
         // `cache.max_probe_holds` is restart-required, not hot-reloaded.) Also
         // skips the O(N) expiry sweep entirely while holds are off. Returning
-        // before the under-lock `is_evicted` re-check is slash-safe: a blob
+        // before the under-lock `is_evicted` re-check is harmless: a blob
         // evicted concurrently here is still answered `has_blob: false` (the
         // misclassification is `Unavailable`→`HoldsDisabled`, a metric-only
-        // miscount between two non-slash counters — never a phantom `true`).
+        // miscount between two counters — never a false `has_blob: true`).
         if max == 0 {
             return Ok(ProbeHoldOutcome::HoldsDisabled);
         }
@@ -1793,8 +1797,9 @@ impl CacheEngine {
         // TOCTOU re-check: a concurrent `evict()` or denylist reload may have
         // completed after the `has()` above. Under the lock, a refused hash is
         // never held — a hold is what authorises signing `has_blob: true`, and
-        // signing that for a hash the serve path will refuse is the ADR 005
-        // phantom-announcement evidence pair.
+        // signing that for a *blacklisted* hash is the ADR 014
+        // blacklist-violation evidence (and for a locally-evicted one, an
+        // advertisement the serve path would only refuse).
         if self.refuses(hash) {
             return Ok(ProbeHoldOutcome::Unavailable);
         }
@@ -6144,7 +6149,7 @@ mod tests {
         let absent = Hash::new(b"never fetched");
         anyhow::ensure!(
             engine.try_probe_hold(absent).await? == ProbeHoldOutcome::Unavailable,
-            "absent blob must not be holdable (would risk a phantom slash)"
+            "absent blob must not be holdable (an absent blob is never advertised)"
         );
         Ok(())
     }

@@ -5,15 +5,14 @@
 
 ## Context
 
-Three slashable offenses require on-chain evidence verification ([ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn)):
+Two slashable offenses require on-chain evidence verification ([ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn)):
 
-1. **Phantom announcement** — node signs `has_blob: true` then cannot deliver
-2. **Rate manipulation** — node advertises one rate in probe, charges higher in stream
-3. **Blacklist violation** — node serves a blacklisted hash after the compliance window ([ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting))
+1. **Rate manipulation** — node advertises one rate in probe, delivers (`ok: true`) at a higher rate in stream
+2. **Blacklist violation** — node serves a blacklisted hash after the compliance window ([ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting))
 
 Content corruption — a node delivering bytes that don't BLAKE3 to the advertised hash — is not an on-chain offense; it is absorbed at the wire by client-side BLAKE3 verification + post-verification voucher signing per [ADR 003 § Corrupted delivery](003-payments.md#corrupted-delivery).
 
-Phantom, rate, and blacklist all require verifying cryptographic signatures from protocol messages. EVM-native `ecrecover` handles secp256k1 (ECDSA) cheaply (~3,000 gas). This ADR specifies the concrete mechanism: `ecrecover`-based signature verification through a unified `SlashJudge` contract.
+Rate and blacklist both require verifying cryptographic signatures from protocol messages. EVM-native `ecrecover` handles secp256k1 (ECDSA) cheaply (~3,000 gas). This ADR specifies the concrete mechanism: `ecrecover`-based signature verification through a unified `SlashJudge` contract.
 
 ## Decision
 
@@ -67,7 +66,7 @@ EIP712Domain({
 1. Challenger submits the serialized message fields and `slash_sig` to `SlashJudge`.
 2. The contract reconstructs the EIP-712 typed data hash and calls `SignatureChecker.isValidSignatureNow(challengedNode, hash, slash_sig)` — **~3,000 gas** for EOA nodes, **~15,000 gas** for Safe-based nodes ([ADR 024](024-account-abstraction.md#adr-024-account-abstraction-and-safe-smart-wallet-support)).
 3. The challenger-provided address is looked up in `CapacityBond` to confirm it maps to a registered node.
-4. For offenses requiring two messages (phantom, rate manipulation), the signatures must both validate against the **same** node address.
+4. For the two-message offense (rate manipulation), the signatures must both validate against the **same** node address.
 
 #### Node Implementation
 
@@ -77,7 +76,7 @@ When constructing a `ProbeResponse` or `StreamResponse`, the node signs the secu
 
 ### SlashJudge Contract
 
-A unified contract that adjudicates the three signature-dependent offenses (phantom announcement, rate manipulation, blacklist violation). Challenging is a two-phase **commit–reveal** flow (see [§ Challenge front-running mitigation](#challenge-front-running-mitigation-commitreveal)): a `commitChallenge` registers an opaque commitment, and the `submit*Challenge` reveal resolves synchronously once the commitment matures — there is still no counter-evidence window (see § Bond Handling). The contract holds challenge bonds, verifies evidence, and calls `CapacityBond.slash()` on each successful reveal.
+A unified contract that adjudicates the two signature-dependent offenses (rate manipulation, blacklist violation). Challenging is a two-phase **commit–reveal** flow (see [§ Challenge front-running mitigation](#challenge-front-running-mitigation-commitreveal)): a `commitChallenge` registers an opaque commitment, and the `submit*Challenge` reveal resolves synchronously once the commitment matures — there is still no counter-evidence window (see § Bond Handling). The contract holds challenge bonds, verifies evidence, and calls `CapacityBond.slash()` on each successful reveal.
 
 #### Interface
 
@@ -87,7 +86,7 @@ The `bytes calldata` arguments named `*ResponseData` in the interface below are 
 
 ```solidity
 interface ISlashJudge {
-    enum OffenseType { Phantom, RateManipulation, Blacklist }
+    enum OffenseType { RateManipulation, Blacklist }
 
     /// Emitted on every slash resolution that reduces stake. `slashId` is globally
     /// monotonic across all offense types. `evidenceHash` is keccak256 over the
@@ -111,21 +110,10 @@ interface ISlashJudge {
     /// reward (see § Challenge front-running mitigation). Reverts on a duplicate.
     function commitChallenge(bytes32 commitment) external;
 
-    /// Phantom announcement: node signed has_blob=true then ok=false within 30s.
-    /// Reveals a prior `commitChallenge` (`salt` reconstructs it); emits `Slashed`
-    /// synchronously once the commitment matures (no counter-evidence window).
-    function submitPhantomChallenge(
-        address challengedNode,              // Ethereum address or Safe address of the challenged node
-        bytes32 nodeId,
-        bytes calldata probeResponseData,   // serialized {hash, has_blob, rate_per_mb, timestamp_us}
-        bytes calldata probeSlashSig,        // EIP-712 signature (EOA or ERC-1271)
-        bytes calldata streamResponseData,  // serialized {hash, ok, rate_per_mb, total_bytes, channel_id, timestamp_us, redirect}
-        bytes calldata streamSlashSig,       // EIP-712 signature (EOA or ERC-1271)
-        bytes32 salt                         // reveals the commitChallenge commitment
-    ) external;
-
-    /// Rate manipulation: stream rate > probe rate within 30s window.
-    /// Reveals a prior `commitChallenge`; emits `Slashed` synchronously on success.
+    /// Rate manipulation: stream delivered (`ok == true`) at a rate exceeding
+    /// the probe quote, same hash, within the 30s window. A signed refusal is
+    /// inert as evidence. Reveals a prior `commitChallenge`; emits `Slashed`
+    /// synchronously on success.
     function submitRateChallenge(
         address challengedNode,
         bytes32 nodeId,
@@ -148,8 +136,8 @@ interface ISlashJudge {
         bytes32 salt                   // reveals the commitChallenge commitment
     ) external;
 
-    // After a matured commitment, all three offense types (Phantom,
-    // RateManipulation, Blacklist) resolve synchronously at reveal time. There is
+    // After a matured commitment, both offense types (RateManipulation,
+    // Blacklist) resolve synchronously at reveal time. There is
     // no counter-evidence window — `Slashed` is emitted atomically with
     // `CapacityBond.slash()` inside each `submit*Challenge` reveal.
 }
@@ -157,20 +145,9 @@ interface ISlashJudge {
 
 #### Evidence Verification Per Offense Type
 
-##### Phantom announcement
-
-1. Challenger provides `challengedNode` address (the node's Ethereum address or Safe address)
-2. `SignatureChecker.isValidSignatureNow(challengedNode, probeDigest, probeSlashSig)` — must pass
-3. `SignatureChecker.isValidSignatureNow(challengedNode, streamDigest, streamSlashSig)` — must pass
-4. Verify `probeResponse.has_blob == true` and `streamResponse.ok == false`
-5. Verify `probeResponse.hash == streamResponse.hash` (same blob)
-6. Verify `streamResponse.timestamp_us >= probeResponse.timestamp_us`
-7. Verify `streamResponse.timestamp_us - probeResponse.timestamp_us < 30_000_000` (30-second window)
-8. Look up `challengedNode` in `CapacityBond` — must be a registered node
-
 ##### Evidence staleness
 
-All challenge types MUST validate evidence age using a skew-safe comparison. Let `nowUs = block.timestamp * 1_000_000` and `evidence.timestamp_us` be the earliest `timestamp_us` from the submitted evidence messages (e.g., `probeResponse.timestamp_us` for phantom/rate challenges, `streamResponse.timestamp_us` for blacklist challenges lacking a probe). The contract MUST: first require `evidence.timestamp_us <= nowUs + MAX_FUTURE_SKEW_US` (rejects far-future timestamps); then compute age without underflow as `ageUs = evidence.timestamp_us >= nowUs ? 0 : nowUs - evidence.timestamp_us`; then require `ageUs < MAX_EVIDENCE_AGE_US`. `MAX_EVIDENCE_AGE_US` is a governable parameter on `SlashJudge` (PoC: 5 days = 432,000,000,000 μs; safety bounds: [1 day, 30 days]). `MAX_FUTURE_SKEW_US` is fixed at 60,000,000 μs (60 seconds).
+All challenge types MUST validate evidence age using a skew-safe comparison. Let `nowUs = block.timestamp * 1_000_000` and `evidence.timestamp_us` be the earliest `timestamp_us` from the submitted evidence messages (e.g., `probeResponse.timestamp_us` for rate challenges, `streamResponse.timestamp_us` for blacklist challenges lacking a probe). The contract MUST: first require `evidence.timestamp_us <= nowUs + MAX_FUTURE_SKEW_US` (rejects far-future timestamps); then compute age without underflow as `ageUs = evidence.timestamp_us >= nowUs ? 0 : nowUs - evidence.timestamp_us`; then require `ageUs < MAX_EVIDENCE_AGE_US`. `MAX_EVIDENCE_AGE_US` is a governable parameter on `SlashJudge` (PoC: 5 days = 432,000,000,000 μs; safety bounds: [1 day, 30 days]). `MAX_FUTURE_SKEW_US` is fixed at 60,000,000 μs (60 seconds).
 
 ##### Interaction with unbonding period
 
@@ -181,11 +158,18 @@ All challenge types MUST validate evidence age using a skew-safe comparison. Let
 
 The check applies at initialization too — neither contract may be deployed with an initial pair that violates the invariant. This matches the cross-parameter setter pattern used elsewhere (see [ADR 026 § Governable parameters with safety bounds](026-tokenomics.md#governable-parameters-with-safety-bounds): the FeeRouter sum-to-100% invariant) — invariants between parameters with a genuine ordering relationship are contract-enforced, not implementation-enforced.
 
-**Rate manipulation:** 1–3. Same `SignatureChecker` verification and identity check as phantom
-4. Verify `streamResponse.rate_per_mb > probeResponse.rate_per_mb`
-5. Verify `probeResponse.hash == streamResponse.hash` (same blob)
-6–8. Same timestamp and registration checks as phantom
-9. Slash immediately via `CapacityBond.slash()` — no counter-evidence window. Two signed messages from the same NodeId disagreeing about that node's own rate within 30 seconds are non-repudiable; the node's last probe-quoted rate is binding for the slashing window. Legitimate rate changes wait out the 30-second window before serving a stream at the new rate.
+##### Rate manipulation
+
+1. Challenger provides `challengedNode` address (the node's Ethereum address or Safe address)
+2. `SignatureChecker.isValidSignatureNow(challengedNode, probeDigest, probeSlashSig)` — must pass
+3. `SignatureChecker.isValidSignatureNow(challengedNode, streamDigest, streamSlashSig)` — must pass
+4. Verify `streamResponse.ok == true` — the stream must be a delivery, not a refusal
+5. Verify `streamResponse.rate_per_mb > probeResponse.rate_per_mb`
+6. Verify `probeResponse.hash == streamResponse.hash` (same blob)
+7. Verify `streamResponse.timestamp_us >= probeResponse.timestamp_us`
+8. Verify `streamResponse.timestamp_us - probeResponse.timestamp_us < 30_000_000` (30-second window)
+9. Look up `challengedNode` in `CapacityBond` — must be a registered node
+10. Slash immediately via `CapacityBond.slash()` — no counter-evidence window. Two signed messages from the same NodeId disagreeing about that node's own rate within 30 seconds are non-repudiable; the node's last probe-quoted rate is binding for the slashing window. Legitimate rate changes wait out the 30-second window before serving a stream at the new rate.
 
 ##### Blacklist violation
 
@@ -214,7 +198,7 @@ The check applies at initialization too — neither contract may be deployed wit
 
 - Challengers must `TOKEN.approve(slashJudge, bondAmount)` before calling any `submit*Challenge()` reveal. The contract transfers the bond on the reveal (not on `commitChallenge`, which moves no funds — see [§ Challenge front-running mitigation](#challenge-front-running-mitigation-commitreveal)).
 - **Successful challenge:** bond returned to challenger; node slashed via `CapacityBond.slash()`.
-- **All three offenses** (phantom, rate manipulation, blacklist): if on-chain verification passes, the slash executes synchronously at reveal time (inside the `submit*Challenge` call, after a prior `commitChallenge`) — no counter-evidence window. Each offense's evidence is cryptographically dispositive: phantom and rate manipulation rely on two contradictory signed messages from the same node within 30 s; blacklist relies on a signed response for an already-blacklisted hash. The node's recourse is to not commit the offense (for rate changes, honor the last probe-quoted rate for the 30-second slashing window per the rate-manipulation flow above).
+- **Both offenses** (rate manipulation, blacklist): if on-chain verification passes, the slash executes synchronously at reveal time (inside the `submit*Challenge` call, after a prior `commitChallenge`) — no counter-evidence window. Each offense's evidence is cryptographically dispositive: rate manipulation relies on two signed messages from the same node — a probe quote and a higher-rate delivery — within 30 s; blacklist relies on a signed response for an already-blacklisted hash. The node's recourse is to not commit the offense (for rate changes, honor the last probe-quoted rate for the 30-second slashing window per the rate-manipulation flow above).
 - **Frivolous-challenge bond loss.** A `submit*Challenge` that fails on-chain verification (signature mismatch, timestamp out of window, hash mismatch, etc.) reverts and the challenger pays only gas; the bond is not transferred for failed verifications. A challenge that *passes* verification always slashes the node — there is no second-stage dispute that could forfeit the bond after-the-fact.
 
 #### Challenge front-running mitigation (commit–reveal)
@@ -238,12 +222,11 @@ Every slash that reduces operator stake emits `Slashed(slashId, operator, offens
 
 - **`slashId`** is a globally monotonic `uint256` (single counter across all offense types, not per-operator and not per-offense-type), allocated from a `nextSlashId` storage slot incremented inline in the same transaction as the `CapacityBond.slash(...)` call. `slashId` values are stable, non-reusable, and non-zero — `slashId == 0` is reserved as the "no slash" sentinel.
 - **`offenseType`** is the `OffenseType` enum from the interface above.
-- **`evidenceHash`** is `keccak256` over a per-offense canonical preimage that uniquely identifies the (offenseType, evidence) pair the slash relied on. The preimage uses `abi.encode(...)` (not `abi.encodePacked`) so field encoding is unambiguous across implementers. Every preimage is prefixed by `uint8(offenseType)` so two distinct offenses against the same operator on overlapping evidence (e.g., a single `(probe, stream)` pair where `streamResponse.ok == false` AND `streamResponse.rate_per_mb > probeResponse.rate_per_mb` triggers both phantom and rate-manipulation) produce distinct `evidenceHash` values, not just distinct `slashId`s. Signatures are **excluded** — the [§ Slash Signatures — secp256k1 EIP-712](#slash-signatures--secp256k1-eip-712) EIP-712 typed-data digests they sign already uniquely identify the message contents, so a successful slash trivially fixes the digest set; including the variable-length signature blobs would add an `abi.encode` vs `abi.encodePacked` field-length ambiguity without adding evidentiary content. The `blobHash` parameter passed to the immediate-execution `submit*Challenge` paths is similarly excluded — the [§ SlashJudge Contract](#slashjudge-contract) evidence-verification flow already binds it via the `responseData.hash == blobHash` check, and the EIP-712 `*Response` struct hash commits to `hash` directly. The per-offense preimages are:
-  - **Phantom:** `keccak256(abi.encode(uint8(OffenseType.Phantom), probeStructHash, streamStructHash))`.
-  - **Rate manipulation:** `keccak256(abi.encode(uint8(OffenseType.RateManipulation), probeStructHash, streamStructHash))`. The `OffenseType` prefix is what distinguishes this preimage from phantom on overlapping evidence.
+- **`evidenceHash`** is `keccak256` over a per-offense canonical preimage that uniquely identifies the (offenseType, evidence) pair the slash relied on. The preimage uses `abi.encode(...)` (not `abi.encodePacked`) so field encoding is unambiguous across implementers. Every preimage is prefixed by `uint8(offenseType)` so two distinct offenses against the same operator on overlapping evidence produce distinct `evidenceHash` values, not just distinct `slashId`s. Signatures are **excluded** — the [§ Slash Signatures — secp256k1 EIP-712](#slash-signatures--secp256k1-eip-712) EIP-712 typed-data digests they sign already uniquely identify the message contents, so a successful slash trivially fixes the digest set; including the variable-length signature blobs would add an `abi.encode` vs `abi.encodePacked` field-length ambiguity without adding evidentiary content. The `blobHash` parameter passed to the immediate-execution `submit*Challenge` paths is similarly excluded — the [§ SlashJudge Contract](#slashjudge-contract) evidence-verification flow already binds it via the `responseData.hash == blobHash` check, and the EIP-712 `*Response` struct hash commits to `hash` directly. The per-offense preimages are:
+  - **Rate manipulation:** `keccak256(abi.encode(uint8(OffenseType.RateManipulation), probeStructHash, streamStructHash))`. The `OffenseType` prefix keeps this preimage distinct from a blacklist preimage built over the same response on overlapping evidence.
   - **Blacklist:** `keccak256(abi.encode(uint8(OffenseType.Blacklist), responseStructHash, isStreamResponse))`. The boolean is required because it is a `submitBlacklistChallenge` parameter, not part of any `*Response` struct.
   Each `*StructHash` is the EIP-712 struct hash of the corresponding `*Response` per [§ Slash Signatures — secp256k1 EIP-712](#slash-signatures--secp256k1-eip-712) (head-only `bytes32` — `abi.encode` adds no padding to a fixed-width 32-byte value). Appeals reference `evidenceHash` to prove they challenge the same evidence the slash relied on; [ADR 028 § Contract surface](028-slashing-appeals.md#contract-surface) `openSlashAppeal(slashId, evidenceBundleHash)` requires `evidenceBundleHash == evidenceHash` of the referenced `Slashed` event.
-- **Emission sites.** All three offenses are immediate: `Slashed` is emitted from the synchronous `submit*Challenge` paths immediately after the inline `CapacityBond.slash()` returns. The "`CapacityBond.slash()` then `emit Slashed`" sequence is contract-enforced atomic (single transaction); a slash without a matching event is impossible.
+- **Emission sites.** Both offenses are immediate: `Slashed` is emitted from the synchronous `submit*Challenge` paths immediately after the inline `CapacityBond.slash()` returns. The "`CapacityBond.slash()` then `emit Slashed`" sequence is contract-enforced atomic (single transaction); a slash without a matching event is impossible.
 
 The companion `SlashAppeal` events (`AppealOpened`, `AppealGranted`, etc.) are specified in [ADR 028 § Contract surface](028-slashing-appeals.md#contract-surface); only `Slashed` itself is canonicalised here.
 
@@ -251,9 +234,8 @@ The companion `SlashAppeal` events (`AppealOpened`, `AppealGranted`, etc.) are s
 
 | Operation | Estimated Gas | Notes |
 | --- | --- | --- |
-| `submitPhantomChallenge` | ~65k–90k | 2× `SignatureChecker` (6k EOA / ~30k Safe) + calldata + storage + bond transfer + `Slashed` emit on success |
 | `submitRateChallenge` | ~65k–90k | 2× `SignatureChecker` (6k EOA / ~30k Safe) + calldata + storage for pending challenge + bond transfer + `Slashed` emit on success |
-| `submitBlacklistChallenge` | ~75k–95k | 1× `SignatureChecker` (3k EOA / ~15k Safe) + up to three `ContentBlacklist` entry reads (global, current region, unripened previous region) + one `CapacityBond` region-scope read (~15k: two `string` fields plus four timestamps) + bond transfer + `Slashed` emit on success. The scope resolution in [§ Blacklist violation](#blacklist-violation) item 7 makes this the most read-heavy of the three challenge paths, though it still verifies only one signature. A challenge that resolves on the global leg short-circuits before the region reads. |
+| `submitBlacklistChallenge` | ~75k–95k | 1× `SignatureChecker` (3k EOA / ~15k Safe) + up to three `ContentBlacklist` entry reads (global, current region, unripened previous region) + one `CapacityBond` region-scope read (~15k: two `string` fields plus four timestamps) + bond transfer + `Slashed` emit on success. The scope resolution in [§ Blacklist violation](#blacklist-violation) item 7 makes this the more read-heavy of the two challenge paths, though it still verifies only one signature. A challenge that resolves on the global leg short-circuits before the region reads. |
 | `Slashed` event emit | ~5k–7k | `nextSlashId++` (cold SLOAD + non-zero→non-zero SSTORE on first emit per tx, ~5k post-EIP-2929) + LOG3 base + 3 stack topics (event signature + 2 indexed) + 96 bytes non-indexed data (~2k); negligible vs the surrounding `CapacityBond.slash()`. The very first `Slashed` ever emitted on a fresh deployment pays an additional ~17k for the 0→non-zero `nextSlashId` SSTORE. |
 
 #### Governable Parameters with Safety Bounds
@@ -288,7 +270,7 @@ The `MAX_EVIDENCE_AGE_US < unbondingPeriod` invariant is paired across two contr
 
 ### Positive
 
-- All three slashable offenses now have a concrete, gas-efficient on-chain evidence path. Slashing is no longer aspirational.
+- Both slashable offenses now have a concrete, gas-efficient on-chain evidence path. Slashing is no longer aspirational.
 - `ecrecover` at 3,000 gas per signature is 100–300× cheaper than a Solidity Ed25519 library, making routine slashing economically viable even for small offenses.
 - `slash_sig` reuses the existing NodeId-to-Ethereum-address binding in `CapacityBond` — no new on-chain registration step.
 - `slash_sig` is mandatory and non-empty on every `ProbeResponse` and `StreamResponse`. Universal on-chain accountability is the protocol's single stance — there is no opt-out and no validation-mode difference between PoC and production for this field.
@@ -301,5 +283,5 @@ The `MAX_EVIDENCE_AGE_US < unbondingPeriod` invariant is paired across two contr
 - The `slash_sig` field adds ~65 bytes per `ProbeResponse` and `StreamResponse`. For probe messages this is meaningful overhead; for stream responses preceding multi-MB deliveries, it is negligible.
 - Off-chain verifiers (clients, requesting nodes, third-party fraud detectors) must `ecrecover` and look up `CapacityBond.nodeIdOf(recovered)` to attribute a message to a NodeId, rather than verifying directly against the iroh key. These parties already maintain the binding cache for voucher attribution, so the marginal cost is one extra map lookup per verification.
 - Cross-contract replay is prevented by per-contract EIP-712 domains, but implementers must configure domain separators correctly at deployment.
-- The [§ SlashJudge Contract](#slashjudge-contract) `Slashed` event adds an `OffenseType` enum, a `nextSlashId` storage slot, and the per-offense `evidenceHash` preimage encoding to `SlashJudge`'s audit surface — small but real: every slash path emits the event atomically with `CapacityBond.slash()`, and the `OffenseType` ordering is contract-canonical (any reordering requires coordinated migration of `SlashAppeal` per [ADR 028 § Contract surface](028-slashing-appeals.md#contract-surface)).
+- The [§ SlashJudge Contract](#slashjudge-contract) `Slashed` event adds an `OffenseType` enum, a `nextSlashId` storage slot, and the per-offense `evidenceHash` preimage encoding to `SlashJudge`'s audit surface — small but real: every slash path emits the event atomically with `CapacityBond.slash()`, and the `OffenseType` ordering is contract-canonical. The ordinal is durable in four places — the persisted `SlashEscrowLib.SlashRecord.offenseType`, the two non-indexed `Slashed` events (whose `topic0` is unchanged by a reorder, so historical logs silently re-decode), the `evidenceHash` preimage that keys `usedEvidenceHash`, and transitively the `commitments` mapping — so any reordering after deployment is a data migration, not an edit. `SlashAppeal` is offense-agnostic and is *not* affected: it reads only the operator from `slashRecords` ([ADR 028 § Contract surface](028-slashing-appeals.md#contract-surface)). The ordinals are pinned by `InterfaceFreeze.t.sol`, since selectors alone cannot detect a reorder.
 - The [§ Challenge front-running mitigation](#challenge-front-running-mitigation-commitreveal) commit–reveal makes every honest challenge two transactions (`commitChallenge` then `submit*Challenge`) separated by `MIN_REVEAL_DELAY`, adds a `commitments` mapping to `SlashJudge`'s storage and audit surface, and introduces an unbonded permissionless commit whose only abuse is gas-bounded storage spam. This is the accepted cost of removing the reward-MEV surface; the slash semantics, evidence checks, and `Slashed` record are unchanged.

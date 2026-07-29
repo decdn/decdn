@@ -104,15 +104,14 @@ const POOL_DRAIN_SETTLE: Duration = Duration::from_millis(250);
 /// startup (the `free_port` TOCTOU: another process claimed the port first).
 const ANVIL_ATTEMPTS: usize = 3;
 
-/// The two `SlashJudge._verifyPair` offenses a signed probe/stream pair can
-/// prove (#1042). Mirrors the leading entries of `ISlashJudge.OffenseType`;
-/// `Blacklist` is excluded because it takes a single response, not a pair, and
-/// has its own entry point.
+/// The `SlashJudge._verifyPair` offense a signed probe/stream pair can prove
+/// (#1042). Mirrors the paired entry of `ISlashJudge.OffenseType`; `Blacklist`
+/// is excluded because it takes a single response, not a pair, and has its own
+/// entry point.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Offense {
-    /// `probe.hasBlob && !stream.ok` — announced the blob, then refused it.
-    Phantom,
-    /// `stream.ratePerMb > probe.ratePerMb` within the 30s window — bait-and-switch.
+    /// `stream.ok && stream.ratePerMb > probe.ratePerMb` within the 30s window —
+    /// quoted low to win selection, then delivered at a higher rate.
     RateManipulation,
 }
 
@@ -124,7 +123,6 @@ impl Offense {
     /// corrupt `evidenceHash` and surface as a misleading `NoCommitment()`.
     const fn offense_type(self) -> SlashJudge::OffenseType {
         match self {
-            Self::Phantom => SlashJudge::OffenseType::Phantom,
             Self::RateManipulation => SlashJudge::OffenseType::RateManipulation,
         }
     }
@@ -137,7 +135,6 @@ impl Offense {
     /// The reveal entry point, for error context.
     const fn entry_point(self) -> &'static str {
         match self {
-            Self::Phantom => "submitPhantomChallenge",
             Self::RateManipulation => "submitRateChallenge",
         }
     }
@@ -1078,12 +1075,13 @@ impl ChainFixture {
             .context("read TOKEN balance")
     }
 
-    /// Slash `operator` through a real `SlashJudge` phantom-announcement
+    /// Slash `operator` through a real `SlashJudge` rate-manipulation
     /// commit-reveal challenge (#1032, G-NODE-05). Builds the operator's own
-    /// self-incriminating probe (`hasBlob=true`) + stream (`ok=false`) evidence
-    /// for the same `blob_hash`, signs it with the operator's eth key over the
-    /// `SlashJudge` EIP-712 domain, commits, warps past `MIN_REVEAL_DELAY`, and
-    /// reveals as `challenger`. Returns the minted `slashId`.
+    /// self-incriminating probe (`hasBlob=true`, low rate) + stream (`ok=true`,
+    /// higher rate) evidence for the same `blob_hash`, signs it with the
+    /// operator's eth key over the `SlashJudge` EIP-712 domain, commits, warps
+    /// past `MIN_REVEAL_DELAY`, and reveals as `challenger`. Returns the minted
+    /// `slashId`.
     // The commit-reveal flow (arm challenger → build+sign evidence → commit →
     // warp → reveal → extract slashId) reads linearly; splitting it would
     // scatter the evidence construction across helpers.
@@ -1103,20 +1101,23 @@ impl ChainFixture {
         let now = self.head_timestamp().await?;
         let probe_ts_us = (now - 10) * 1_000_000;
         let stream_ts_us = (now - 5) * 1_000_000;
-        let rate: u64 = 10;
+        // Rate manipulation: probe quotes `probe_rate`, delivery charges a
+        // higher `stream_rate` for the same hash inside the 30s window.
+        let probe_rate: u64 = 10;
+        let stream_rate: u64 = 25;
         let total_bytes: u64 = 1_048_576;
         let channel_id = B256::from(U256::from(1u64));
 
         let probe = ProbeSlashData {
             hash: blob_hash,
             has_blob: true,
-            rate_per_mb: rate,
+            rate_per_mb: probe_rate,
             timestamp_us: probe_ts_us,
         };
         let stream = StreamSlashData {
             hash: blob_hash,
-            ok: false,
-            rate_per_mb: rate,
+            ok: true,
+            rate_per_mb: stream_rate,
             total_bytes,
             channel_id,
             timestamp_us: stream_ts_us,
@@ -1134,11 +1135,11 @@ impl ChainFixture {
             .as_bytes()
             .to_vec();
 
-        // evidenceHash = keccak256(abi.encode(uint8(Phantom), probeStructHash,
-        // streamStructHash)); commitment binds it to (salt, challenger).
-        // `abi.encode(uint8 v)` right-aligns `v` in a 32-byte word — byte-
-        // identical to `uint256(v)`, which alloy's `SolValue` encodes directly.
-        let offense = U256::from(Offense::Phantom.discriminant());
+        // evidenceHash = keccak256(abi.encode(uint8(RateManipulation),
+        // probeStructHash, streamStructHash)); commitment binds it to (salt,
+        // challenger). `abi.encode(uint8 v)` right-aligns `v` in a 32-byte word
+        // — byte-identical to `uint256(v)`, which alloy's `SolValue` encodes.
+        let offense = U256::from(Offense::RateManipulation.discriminant());
         let evidence_hash =
             keccak256((offense, probe.struct_hash(), stream.struct_hash()).abi_encode());
         let salt = B256::repeat_byte(0x99);
@@ -1161,20 +1162,20 @@ impl ChainFixture {
         let probe_msg = SlashJudge::ProbeMsg {
             hash: blob_hash,
             hasBlob: true,
-            ratePerMb: rate,
+            ratePerMb: probe_rate,
             timestampUs: probe_ts_us,
         };
         let stream_msg = SlashJudge::StreamMsg {
             hash: blob_hash,
-            ok: false,
-            ratePerMb: rate,
+            ok: true,
+            ratePerMb: stream_rate,
             totalBytes: total_bytes,
             channelId: channel_id,
             timestampUs: stream_ts_us,
             redirect: B256::ZERO,
         };
-        let receipt = judge
-            .submitPhantomChallenge(
+        let receipt = crate::bindings::SlashJudgeRate::new(self.addrs.slash_judge, &ch_provider)
+            .submitRateChallenge(
                 operator.address(),
                 node_id,
                 Bytes::from(probe_msg.abi_encode()),
@@ -1185,16 +1186,16 @@ impl ChainFixture {
             )
             .send()
             .await
-            .context("submitPhantomChallenge send")?
+            .context("submitRateChallenge send")?
             .get_receipt()
             .await
-            .context("submitPhantomChallenge receipt")?;
-        crate::ensure_mined(&receipt, "submitPhantomChallenge")?;
+            .context("submitRateChallenge receipt")?;
+        crate::ensure_mined(&receipt, "submitRateChallenge")?;
 
         self.extract_slash_id(
             receipt.inner.logs(),
-            "submitPhantomChallenge",
-            Some((Offense::Phantom, evidence_hash)),
+            "submitRateChallenge",
+            Some((Offense::RateManipulation, evidence_hash)),
         )
     }
 
@@ -1293,10 +1294,10 @@ impl ChainFixture {
     /// (forged signature, out-of-window pair), which are just the same call with
     /// one field of the real evidence perturbed.
     ///
-    /// Handles both `_verifyPair` offenses: [`Offense::Phantom`]
-    /// (`probe.has_blob && !stream.ok`) and [`Offense::RateManipulation`]
-    /// (`stream.rate_per_mb > probe.rate_per_mb`). `salt` is caller-supplied so
-    /// two challenges in one journey cannot collide on a commitment slot.
+    /// Handles the `_verifyPair` offense [`Offense::RateManipulation`]
+    /// (`stream.ok && stream.rate_per_mb > probe.rate_per_mb`). `salt` is
+    /// caller-supplied so two challenges in one journey cannot collide on a
+    /// commitment slot.
     ///
     /// Returns the minted `slashId`. An `Err` here is the *whole point* for the
     /// negative cases: a challenge that fails verification reverts, and per
@@ -1378,20 +1379,6 @@ impl ChainFixture {
         let stream_bytes = Bytes::from(stream_msg.abi_encode());
 
         let pending = match offense {
-            Offense::Phantom => {
-                judge
-                    .submitPhantomChallenge(
-                        operator,
-                        node_id,
-                        probe_bytes,
-                        probe_sig,
-                        stream_bytes,
-                        stream_sig,
-                        salt,
-                    )
-                    .send()
-                    .await
-            }
             Offense::RateManipulation => {
                 crate::bindings::SlashJudgeRate::new(self.addrs.slash_judge, &ch_provider)
                     .submitRateChallenge(

@@ -521,7 +521,7 @@ flowchart TD
 
     Operator -->|"bond() + declareMbps(): deposit bond"| CBOND
     CBOND -->|"unbond() after 14d window"| Operator
-    Challenger -->|"submitPhantomChallenge() /<br/>submitRateChallenge() /<br/>submitBlacklistChallenge()<br/>bond deposit"| SJ
+    Challenger -->|"submitRateChallenge() /<br/>submitBlacklistChallenge()<br/>bond deposit"| SJ
     SJ -->|"slash(node, offenseType, evidenceHash)<br/>(amount computed internally)"| CBOND
     CBOND -->|"escrow slashed TOKEN (held until finality)"| CBOND
     CBOND -->|"finality: 50% challenger"| Challenger
@@ -641,7 +641,6 @@ Every state-mutating function that makes an external call is listed below with i
 
 | Function | External Calls | Guards |
 | --- | --- | --- |
-| `submitPhantomChallenge()` | `IERC20.safeTransferFrom()` (TOKEN bond deposit), `CapacityBond.slash()`, `IERC20.safeTransfer()` (slash reward + bond return on success) | `nonReentrant`, checks-effects-interactions |
 | `submitRateChallenge()` | `IERC20.safeTransferFrom()` (TOKEN bond deposit), `CapacityBond.slash()`, `IERC20.safeTransfer()` (slash reward + bond return on success) | `nonReentrant`, checks-effects-interactions |
 | `submitBlacklistChallenge()` | `IERC20.safeTransferFrom()` (TOKEN bond deposit), `ContentBlacklist.getHashEntry(region, hash)` (read, once per scope leg), `CapacityBond.regionScopeData(operator)` (read, regional legs only), `CapacityBond.slash()`, `IERC20.safeTransfer()` (slash reward + bond return on success) | `nonReentrant`, checks-effects-interactions |
 

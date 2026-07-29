@@ -126,40 +126,6 @@ impl ClientHandler {
             }
             ServeRejectReason::OriginDenied => self.metrics.serve_stream_rejected_origin_denied(),
         }
-        // Slash-safety (#1130). If we advertised `has_blob: true` for this hash
-        // because it is origin-held (fs directory entry / present pin) and the
-        // operator has NOT refused it, we must never sign an `ok: false`
-        // CacheMiss for it: a signed has_blob:true probe + a signed NotFound
-        // within 30s is phantom-announcement evidence (ADR 014). A CacheMiss on
-        // origin-held content means the reactive pull timed out, or the origin
-        // object vanished between probe and serve — the publisher's problem, not
-        // grounds to hand a requester slashable evidence. Fail SILENT — the
-        // metric already fired above; drop without signing. The correct
-        // consequence is a local reputation ding (ADR 008), not a bond slash.
-        //
-        // Scope is deliberately narrow:
-        // - Only `CacheMiss`. A deliberately EVICTED or DENIED hash surfaces as
-        //   `EvictedSinceProbe` / `HashDenied`, and signing THAT refusal is the
-        //   intended, accountable behavior — it is exactly how an
-        //   announce-then-evict is made slashable (see G-GOV-03). Suppressing it
-        //   would break slashing accountability.
-        // - The live `refuses` guard is belt-and-suspenders: `origin_held` is a
-        //   rescan snapshot that can lag a just-issued eviction, so we re-check
-        //   the live refusal set rather than trust the snapshot alone.
-        // - Payment/auth rejections are untouched (not availability claims).
-        if matches!(reason, ServeRejectReason::CacheMiss) {
-            let store_hash = decdn_cache::Hash::from_bytes(req.hash);
-            if !self.cache.refuses(store_hash) && self.cache.origin_held_size(store_hash).is_some()
-            {
-                tracing::debug!(
-                    hash = %store_hash,
-                    ?reason,
-                    "origin-held serve missed; dropping without a signed ok:false to avoid phantom-slash evidence (#1130)"
-                );
-                return Ok(());
-            }
-        }
-
         let error = reason.wire_error();
         let rate_per_mb = self.clamped_rate();
         let body = StreamResponseBody {

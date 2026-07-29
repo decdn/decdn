@@ -5631,6 +5631,86 @@ async fn unbound_client_fetch_is_refused_on_origin_only_blob() -> anyhow::Result
     Ok(())
 }
 
+/// A serve miss on a hash the node **advertises as origin-held** answers with a
+/// signed `StreamResponse{ok: false}` rather than dropping the stream.
+///
+/// This is the path the #1130 fail-silent gate used to suppress. That gate
+/// existed because a signed `has_blob: true` probe plus a signed `ok: false`
+/// stream was phantom-announcement evidence; with the phantom offense retired
+/// the refusal is inert (rate manipulation requires `ok == true`, blacklist
+/// violation requires a served claim — ADR 014), so the accountable answer is to
+/// sign it. Dropping instead cost the requester a full open-stage timeout.
+///
+/// The setup is the [`unbound_client_fetch_is_refused_on_origin_only_blob`]
+/// control plus the one thing it lacks: `rescan_origins()`, which populates the
+/// `origin_held` index so `origin_held_size(hash)` is `Some`. Without that call
+/// the suppressed branch was unreachable, which is why no test ever covered it.
+#[tokio::test(flavor = "multi_thread")]
+async fn origin_held_serve_miss_signs_a_refusal_rather_than_dropping() -> anyhow::Result<()> {
+    let payload = vec![0x3Cu8; 32 * 1024];
+    let (cache, hash, _cache_metrics, _origin_tmp, _cache_tmp) =
+        empty_cache_with_fs_origin(&payload).await?;
+    // Populate the origin-held index: the node now advertises this hash on
+    // probe (`has_blob: true`) even though the store has never held it.
+    cache.rescan_origins().await;
+    anyhow::ensure!(
+        cache.origin_held_size(hash) == Some(payload.len() as u64),
+        "precondition: the hash must be indexed as origin-held"
+    );
+    let (store, signer, deposit) = seeded_store()?;
+    let (target, server_eth_addr, server_ep, server_task) =
+        spawn_pull_through_server(cache, Arc::clone(&store)).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    // No client binding => `pull_authorized` fails, so the reactive pull never
+    // runs and the serve path reaches a plain `CacheMiss` on origin-held content.
+    let ctx = channel_context(Arc::clone(&signer), deposit);
+
+    let Err(err) = stream_fetch(
+        &client_ep,
+        target,
+        &ctx,
+        &slash_domain(),
+        server_eth_addr,
+        *hash.as_bytes(),
+        0,
+        0x00c0_ffee,
+        Duration::from_secs(20),
+    )
+    .await
+    else {
+        anyhow::bail!("an unbound fetch of origin-held content must be refused")
+    };
+
+    // The assertion that distinguishes this from the deleted behaviour: a typed
+    // refusal carrying the operator's signed response, not a timeout on a
+    // silently-dropped stream.
+    let refused = err
+        .downcast_ref::<decdn_client_pull::UpstreamRefused>()
+        .ok_or_else(|| anyhow::anyhow!("expected a typed UpstreamRefused, got: {err:#}"))?;
+    let evidence = refused.evidence().ok_or_else(|| {
+        anyhow::anyhow!("the refusal must carry the operator's signed StreamResponse")
+    })?;
+    anyhow::ensure!(
+        !evidence.body.ok,
+        "an origin-held serve miss must sign ok:false, got ok:{}",
+        evidence.body.ok
+    );
+    anyhow::ensure!(
+        evidence.body.hash == *hash.as_bytes(),
+        "the signed refusal must name the requested hash"
+    );
+    anyhow::ensure!(
+        !evidence.slash_sig.is_empty(),
+        "the refusal must be signed — an unsigned one is unattributable"
+    );
+
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
 /// Like [`spawn_pull_through_server`] but arms ONLY the reactive LOCAL-origin
 /// populate (`ClientHandlerDeps.local_populate`) — NOT the node→node buffered/window paths.
 /// This is the cache-only-operator wiring (#1116): `[cache.origin]` set,

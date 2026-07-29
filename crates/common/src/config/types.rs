@@ -466,26 +466,26 @@ pub struct CacheConfig {
     pub eviction_tick_secs: Option<u64>,
     /// Maximum number of concurrently held (eviction-exempt) blobs for the
     /// probe-triggered hold (ADR 005 §Hold budget, #318). Holds are
-    /// per-blob: multiple peers probing the same hash share one slot. When
-    /// the budget is exhausted, additional probes for unheld blobs receive
-    /// `has_blob: false` rather than risk a phantom-announcement slash.
-    /// Absent => [`crate::config::DEFAULT_MAX_PROBE_HOLDS`] (256). `0`
-    /// disables `has_blob: true` entirely (every probe answers false).
-    /// Operators with small caches SHOULD set this to ≤25% of cache
-    /// capacity.
+    /// per-blob: multiple peers probing the same hash share one slot. When the
+    /// budget is exhausted, a probe for a blob that is present but gets no slot
+    /// still advertises (`has_blob: true`) and places no eviction hold — the
+    /// blob may be LRU-evicted before the pull, costing one wasted round trip
+    /// (never a slash). Absent => [`crate::config::DEFAULT_MAX_PROBE_HOLDS`]
+    /// (256). `0` is the operator opt-out: holds are disabled and probes answer
+    /// `has_blob: false` for store-backed content — content servable from a
+    /// configured origin takes no hold and is still advertised. Operators with
+    /// small caches SHOULD set this to ≤25% of cache capacity.
     pub max_probe_holds: Option<u64>,
     /// Number of probe-hold slots reserved for the **stake lane** —
     /// registered operators issuing node-to-node cache-miss probes (#757,
-    /// ADR 003 §Admission and Priority). Under hold-budget pressure,
-    /// end-client probes are answered `has_blob: false` once usage reaches
-    /// `max_probe_holds - stake_lane_reserved_holds`, keeping the last
-    /// `stake_lane_reserved_holds` slots available for node-to-node probes
-    /// so end-client load cannot starve them. Absent / `0` (the default)
+    /// ADR 003 §Admission and Priority). An end-client probe places no eviction
+    /// hold once usage reaches `max_probe_holds - stake_lane_reserved_holds` (it
+    /// still advertises `has_blob: true` if the blob is present), keeping the
+    /// last `stake_lane_reserved_holds` slots available for node-to-node probes
+    /// so end-client load cannot starve their holds. Absent / `0` (the default)
     /// disables the reservation entirely — a single-lane node is unaffected.
-    /// Values `>= max_probe_holds` reserve the whole budget for the stake
-    /// lane: the end-client ceiling collapses to `0`, so every end-client
-    /// probe is shed whenever holds are enabled — regardless of current
-    /// usage, not only under pressure.
+    /// Values `>= max_probe_holds` reserve the whole budget for the stake lane:
+    /// no end-client probe takes a hold slot, regardless of current usage.
     pub stake_lane_reserved_holds: Option<u64>,
     /// Enable node-to-node paid cache-miss pull-through (#831, ADR 001/022).
     /// Absent / `false` (the default) → a cache miss serves `NotFound` as

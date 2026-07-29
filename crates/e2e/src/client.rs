@@ -21,8 +21,10 @@ use decdn_client_pull::{
     UpstreamVoucherRejected, VoucherProgress, sign_client_binding, stream_fetch_tracked,
 };
 use decdn_incentive::{bind_node_id_domain, slash_judge_domain, voucher_domain};
-use decdn_protocol::client::StreamError;
-use decdn_protocol::{ALPN_CLIENT, StreamRequest, StreamRequestExt, encode_stream_request};
+use decdn_protocol::client::{ClientMessage, StreamError, StreamResponse};
+use decdn_protocol::{
+    ALPN_CLIENT, StreamRequest, StreamRequestExt, decode_message, encode_stream_request,
+};
 use iroh::endpoint::presets;
 use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey};
 
@@ -453,6 +455,73 @@ impl ClientFixture {
         Ok(frames)
     }
 
+    /// Capture the daemon's signed `StreamResponse { ok: true }` for a **held**
+    /// blob at a caller-chosen `timestamp_us` — the delivery side of a real
+    /// rate-manipulation evidence pair (#1042).
+    ///
+    /// The node signs the open-stage `StreamResponse` (committing to deliver at
+    /// its *current* rate) before any voucher is exchanged, so this reads only
+    /// the first frame and never pays. Unlike [`Self::capture_delivery_wire`] the
+    /// timestamp is caller-controlled, so the response lands inside the 30s
+    /// probe↔stream slashing window; unlike [`Self::refused_stream`] it requires
+    /// the node to actually deliver (`ok == true`) — a refusal here means the
+    /// blob was not held or the channel was not yet observed, a setup failure.
+    pub async fn capture_delivery_response(
+        &self,
+        session: &ChannelSession,
+        hash: Hash,
+        namespace_id: U256,
+        timestamp_us: u64,
+    ) -> anyhow::Result<StreamResponse> {
+        let conn = self
+            .endpoint
+            .connect(session.target.clone(), ALPN_CLIENT)
+            .await
+            .map_err(|e| anyhow::anyhow!("connect for delivery capture: {e}"))?;
+        let (mut send, mut recv) = conn
+            .open_bi()
+            .await
+            .map_err(|e| anyhow::anyhow!("open_bi for delivery capture: {e}"))?;
+        let req = StreamRequest {
+            hash: *hash.as_bytes(),
+            namespace_id: namespace_id.to_be_bytes(),
+            channel_id: session.ctx.channel_id.into(),
+            byte_offset: 0,
+            byte_len: 0,
+            timestamp_us,
+        };
+        let ext = StreamRequestExt {
+            voucher_interval_mb: None,
+            binding: session.ctx.client_binding.clone(),
+        };
+        let payload = encode_stream_request(&req, Some(&ext))
+            .context("encode delivery-capture StreamRequest")?;
+        decdn_protocol::write_frame(&mut send, &payload)
+            .await
+            .context("write delivery-capture StreamRequest")?;
+
+        let frame =
+            tokio::time::timeout(WIRE_TAP_FIRST_FRAME, decdn_protocol::read_frame(&mut recv))
+                .await
+                .context("delivery capture: node sent no open frame")?
+                .context("delivery capture: read frame")?;
+        conn.close(0u32.into(), b"delivery capture complete");
+
+        let (msg, _rest) = decode_message::<ClientMessage>(&frame)
+            .context("decode delivery-capture open frame")?;
+        match msg {
+            ClientMessage::StreamResponse(resp) => {
+                anyhow::ensure!(
+                    resp.body.ok,
+                    "delivery capture expected ok:true, got a refusal ({:?})",
+                    resp.error
+                );
+                Ok(resp)
+            }
+            _ => anyhow::bail!("delivery capture expected a StreamResponse open frame"),
+        }
+    }
+
     /// Open and fund a payment channel to `node`, returning the session state a
     /// paid fetch needs. Does **not** wait for the node to observe the channel —
     /// [`Self::fetch`] rides that window out by retrying, [`Self::open_session`]
@@ -519,7 +588,8 @@ impl ClientFixture {
 
     /// Probe `node` for `hash` over `cdn/probe/v1` and return the signed
     /// response. Unpaid (no channel) — used to assert the daemon's probe handler
-    /// reports `has_blob: false` after eviction (the phantom-blob slash seam).
+    /// reports `has_blob: false` after a blacklist eviction (the
+    /// blacklist-violation compliance seam).
     pub async fn probe(
         &self,
         node: &NodeFixture,

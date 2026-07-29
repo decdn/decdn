@@ -1052,7 +1052,7 @@ mod tests {
             },
             crate::slash_watcher::DetectedSlash {
                 slash_id: U256::from(2u64),
-                offense_type: 2,
+                offense_type: 1,
                 amount: U256::from(200u64),
                 evidence_hash: B256::repeat_byte(0x22),
                 block_number: Some(20),
@@ -1066,7 +1066,7 @@ mod tests {
         // Newest-first: the watcher appends in detection order, the method reverses.
         let first = resp.slashes.first().expect("first slash");
         assert_eq!(first.slash_id, "2");
-        assert_eq!(first.offense_type, 2);
+        assert_eq!(first.offense_type, 1);
         assert_eq!(first.amount, "200");
         assert_eq!(first.appeal_window_close, None);
         let second = resp.slashes.get(1).expect("second slash");

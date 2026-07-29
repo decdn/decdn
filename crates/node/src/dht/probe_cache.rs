@@ -16,11 +16,14 @@
 //!
 //! That last point is #1165's "no evidence retention" requirement, and it is
 //! not a memory optimisation. A `ProbeResponse` carries `slash_sig`: a peer's
-//! signed `has_blob: true`, which is on-chain phantom-announcement slash
-//! evidence for `PROBE_SLASH_WINDOW` (ADR 005). A structure that survives one
-//! request in order to speed up the next has no business holding another node's
-//! slashable statements — retaining them turns an availability cache into an
-//! evidence locker.
+//! signed `has_blob: true`. Paired with a stream response it is on-chain
+//! rate-manipulation evidence for `PROBE_SLASH_WINDOW`, and it can also
+//! corroborate a blacklist violation — which is bounded by `MAX_EVIDENCE_AGE_US`
+//! (5 days), not by the 30s window (ADR 014 §Evidence staleness). So the 15s TTL
+//! does not make retention harmless by expiry alone; the point is simply that a
+//! structure surviving one request to speed up the next has no business holding
+//! another node's slashable statements — retaining them turns an availability
+//! cache into an evidence locker.
 //!
 //! `reputation` is likewise NOT stored, for a different reason: it is a local,
 //! live value that moves on every pull outcome. Freezing it for the TTL would let a

@@ -73,8 +73,8 @@ const OVERALL_TIMEOUT: Duration = Duration::from_secs(600);
 /// `SlashJudge.PROBE_TYPEHASH`.
 const PROBE_TYPE: &[u8] =
     b"ProbeResponse(bytes32 hash,bool hasBlob,uint64 ratePerMb,uint64 timestampUs)";
-/// `OffenseType.Blacklist` discriminant (`ISlashJudge` enum: Phantom, Rate, Blacklist).
-const OFFENSE_BLACKLIST: u8 = 2;
+/// `OffenseType.Blacklist` discriminant (`ISlashJudge` enum: Rate, Blacklist).
+const OFFENSE_BLACKLIST: u8 = 1;
 /// The daemon config's quoted rate; echoed into the probe evidence.
 const RATE_PER_MB: u64 = 10;
 
@@ -143,8 +143,8 @@ async fn run_global() -> anyhow::Result<()> {
     // specifically (not some unrelated channel/connect/payment failure).
     assert_refused_as_blacklisted(&chain, &node, hash).await?;
 
-    // ...and the probe handler stops signing `has_blob: true` (the phantom-blob
-    // slash seam — distinct from the delivery path above).
+    // ...and the probe handler stops signing `has_blob: true` (the
+    // blacklist-violation compliance seam — distinct from the delivery path above).
     let probe = ClientFixture::new(&chain).await?.probe(&node, hash).await?;
     assert!(
         !probe.body.has_blob,

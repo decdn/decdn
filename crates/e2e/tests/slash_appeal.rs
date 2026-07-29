@@ -7,7 +7,8 @@
 //!    nonzero Governor vote weight (ADR-036 served bytes × age ramp) at the
 //!    proposal snapshot — A's own weight is zeroed by the slash, so a second
 //!    operator must carry the grant vote.
-//! 2. Slash A through a **real** `SlashJudge` phantom commit-reveal challenge.
+//! 2. Slash A through a **real** `SlashJudge` rate-manipulation commit-reveal
+//!    challenge.
 //! 3. Assert A's daemon surfaces the slash over `admin_v1_slashes`.
 //! 4. File the appeal through the **`decdn appeal slash` CLI** (posts the bond),
 //!    the emergency multisig fast-tracks, and a **real Governor proposal**
@@ -102,8 +103,8 @@ async fn run() -> anyhow::Result<()> {
     // inside the trailing window at the proposal snapshot.
     time::increase_time(chain.admin(), 8 * DAY).await?;
 
-    // ---- Slash A via a real SlashJudge phantom challenge. A fresh EOA is the
-    // challenger; A's own eth key signs the self-incriminating evidence.
+    // ---- Slash A via a real SlashJudge rate-manipulation challenge. A fresh EOA
+    // is the challenger; A's own eth key signs the self-incriminating evidence.
     let challenger = PrivateKeySigner::random();
     let node_a_id = B256::from_slice(node_a.node_id().as_bytes());
     let blob_hash = B256::repeat_byte(0x42);

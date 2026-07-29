@@ -54,5 +54,5 @@ A protocol decision establishes a participant role with a defined wire interface
 ## Cross-ADR Impact
 
 - [ADR 003 — Payments](003-payments.md#adr-003-payment-model) — `closeChannel` / `disputeChannel` flow, dispute window, local-monitor Option C
-- [ADR 014 — On-chain Verification](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence) — `SlashJudge` challenge-bond mechanism (Bond Handling) for the three signature-dependent offenses
+- [ADR 014 — On-chain Verification](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence) — `SlashJudge` challenge-bond mechanism (Bond Handling) for the two signature-dependent offenses
 - [Appendix: L2 Deployment](appendix-l2-deployment.md#appendix-production-l2-deployment-target) — gas-cost context for detector economics

@@ -6,7 +6,7 @@
 //! - The daemon slash watcher demuxes the `Slashed` event (filtered to its own
 //!   operator) to surface a slash over the admin RPC.
 //! - The cross-layer e2e drives a real commit-reveal challenge
-//!   (`commitChallenge` → `submitPhantomChallenge`) to land a slash on-chain.
+//!   (`commitChallenge` → `submitRateChallenge`) to land a slash on-chain.
 //!
 //! The `ProbeMsg` / `StreamMsg` evidence structs mirror the on-chain layout;
 //! the EIP-712 signatures over them are built by [`crate::probe_sig`] /
@@ -36,7 +36,6 @@ mod sol_types {
             /// Offense taxonomy. Ordering is contract-canonical (ADR 014);
             /// mirrors `ISlashJudge.OffenseType`.
             enum OffenseType {
-                Phantom,
                 RateManipulation,
                 Blacklist
             }
@@ -68,19 +67,6 @@ mod sol_types {
             /// Phase 1 of a challenge: register the opaque commitment
             /// `keccak256(abi.encode(evidenceHash, salt, msg.sender))`.
             function commitChallenge(bytes32 commitment) external;
-
-            /// Phase 2 (phantom): reveal a matured commitment. The node
-            /// announced the blob (`probe.hasBlob == true`) but failed to
-            /// deliver it (`stream.ok == false`) for the same `hash`.
-            function submitPhantomChallenge(
-                address challengedNode,
-                bytes32 nodeId,
-                bytes probeResponseData,
-                bytes probeSlashSig,
-                bytes streamResponseData,
-                bytes streamSlashSig,
-                bytes32 salt
-            ) external;
 
             /// Emitted on every slash that reduces operator bond. `slashId` is
             /// minted by `CapacityBond.slash`; consumed by

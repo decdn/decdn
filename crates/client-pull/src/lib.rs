@@ -633,13 +633,17 @@ impl UpstreamRefused {
     /// launder a malformed refusal into a plausible-looking one.
     ///
     /// Takes the whole `response` rather than just its `error` so the operator's
-    /// own signed refusal survives as evidence ([`Self::evidence`], #1042) —
+    /// own signed refusal survives on the value ([`Self::evidence`], #1042) —
     /// `body` is exactly the field set the `SlashJudge` EIP-712 `StreamResponse`
     /// typehash covers and `slash_sig` is the operator's secp256k1 signature over
-    /// it. Paired with the same node's earlier `ProbeResponse` for the same hash
-    /// it is the complete on-chain phantom-announcement (`hasBlob && !ok`) or
-    /// rate-manipulation (`stream.ratePerMb > probe.ratePerMb`) evidence pair —
-    /// court-admissible as-is, with no re-signing by the observer.
+    /// it.
+    ///
+    /// A refusal (`ok == false`) is **not** on-chain slash evidence: rate
+    /// manipulation requires `ok == true` and blacklist violation requires a
+    /// served claim (ADR 014), so a node may sign refusals freely. The retention
+    /// is kept on its own merits — it is an attributable, non-repudiable record
+    /// of *why* a paid pull was declined, which the caller can log, surface, or
+    /// present in a dispute without re-signing anything.
     fn open(response: StreamResponse) -> anyhow::Error {
         // `ok == true` is not a refusal at all — building an `Open` from it would
         // mint an evidence-carrying refusal with `ok == true`, violating invariant
@@ -681,8 +685,9 @@ impl UpstreamRefused {
     ///
     /// Public because callers outside the crate (and their tests) legitimately
     /// build mid-stream refusals; it is safe to expose precisely because it
-    /// *cannot* carry evidence — the encapsulation that matters guards the
-    /// evidence-carrying `open`, which stays crate-private.
+    /// *cannot* carry a signed response — the encapsulation that matters guards
+    /// the attributable `open` ([`Self::evidence`]), which stays crate-private
+    /// so a caller cannot mint a refusal attributed to an operator.
     #[must_use]
     pub const fn mid_stream(error: StreamError) -> Self {
         Self {
@@ -704,12 +709,16 @@ impl UpstreamRefused {
     /// The upstream's own signed [`StreamResponse`], present iff the refusal
     /// arrived at the **open stage**. `None` for a mid-stream frame.
     ///
-    /// This is evidence, not diagnostics — already verified against
+    /// An attributable record, not loose diagnostics — already verified against
     /// `expected_signer` by `verify_response` before this value is built, so a
     /// present value always recovers to `expected_signer`: the operator address
     /// the caller bound this pull to, which is what `SlashJudge._checkRegistered`
-    /// resolves `nodeId` against. A challenger may replay it to `SlashJudge`
-    /// with no re-signing.
+    /// resolves `nodeId` against.
+    ///
+    /// Note it is not by itself *slash* evidence — no offense admits a refusal
+    /// (`ok == false`) as its stream leg (ADR 014). What it gives the caller is a
+    /// non-repudiable statement of why the pull was declined, signed by the
+    /// operator and usable verbatim, with no re-signing.
     #[must_use]
     pub fn evidence(&self) -> Option<&StreamResponse> {
         match &self.kind {
@@ -3138,7 +3147,7 @@ mod tests {
     /// attestation survives the client's error path intact — byte-for-byte, still
     /// recovering to the signer. Before #1042 `refusal()` took only
     /// `response.error` and dropped the body and signature on the floor, leaving
-    /// `SlashJudge`'s phantom/rate paths reachable only from a test that holds the
+    /// `SlashJudge`'s rate path reachable only from a test that holds the
     /// operator's key and synthesises its own evidence.
     ///
     /// Deliberately routed through the private [`UpstreamRefused::open`] — the one
@@ -3156,8 +3165,8 @@ mod tests {
 
         let operator = PrivateKeySigner::random();
         let domain = slash_judge_domain(31_337, alloy::primitives::Address::repeat_byte(0x11));
-        // The wire shape of a phantom refusal: the node signed `ok = false` for a
-        // hash it had just announced.
+        // The wire shape of a signed refusal: the node signed `ok = false` for a
+        // hash it had just announced (now inert as slash evidence).
         let body = StreamResponseBody {
             hash: [0x5Au8; 32],
             ok: false,

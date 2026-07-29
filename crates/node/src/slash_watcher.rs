@@ -72,7 +72,7 @@ const SLASH_MAX_BACKOFF: Duration = Duration::from_secs(30);
 pub struct DetectedSlash {
     /// Globally-monotonic on-chain `slashId` (`CapacityBond.slash`).
     pub slash_id: U256,
-    /// Offense taxonomy index (ADR 014): 0=Phantom, 1=RateManipulation, 2=Blacklist.
+    /// Offense taxonomy index (ADR 014): 0=RateManipulation, 1=Blacklist.
     pub offense_type: u8,
     /// Bond amount slashed, in TOKEN base units.
     pub amount: U256,
@@ -712,7 +712,7 @@ mod tests {
         let reads = StubSlashReads::new(
             op,
             vec![
-                (U256::from(10u64), record(2, 100, 0x11, now - 1)),
+                (U256::from(10u64), record(1, 100, 0x11, now - 1)),
                 (U256::from(20u64), record(1, 200, 0x22, now + 50)),
                 (U256::from(30u64), record(0, 300, 0x33, now + 99)),
             ],

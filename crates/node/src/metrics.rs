@@ -56,8 +56,11 @@ struct StreamLabels {
     direction: StreamDirection,
 }
 
-/// Why a probe could not be answered from a guaranteed eviction hold, as the
-/// `reason` label on `decdn_probe_hold_unavailable_total`.
+/// Why a probe for a present blob got **no** eviction hold, as the `reason`
+/// label on `decdn_probe_hold_unavailable_total`.
+///
+/// Holds are best-effort, so this is not the same as "answered
+/// `has_blob: false`" — `exhausted` and `stake_lane_reserved` still advertise.
 ///
 /// The three values are not interchangeable — each has a different operator
 /// remedy, which is why they were three separate counters before #1443 and why
@@ -85,23 +88,28 @@ struct StreamLabels {
 )]
 pub enum ProbeHoldUnavailableReason {
     /// Blob present, but **all** hold slots were live (`max_probe_holds`
-    /// reached) — genuine budget pressure. The node answers `has_blob: false`
-    /// and forgoes the delivery. This is the "raise `max_probe_holds`" signal
-    /// and the only value the `DecdnProbeHoldViolations` alert fires on.
+    /// reached) — genuine budget pressure. The node still advertises
+    /// `has_blob: true` and forgoes only the hold, so the blob may be
+    /// LRU-evicted before the pull lands. This is the "raise `max_probe_holds`"
+    /// signal and the only value the `DecdnProbeHoldViolations` alert fires on.
     Exhausted,
     /// Blob present, but the eviction-hold path is **disabled by config**
     /// (`max_probe_holds == 0`) — an intentional operator choice, not budget
-    /// pressure (#739). Raising `max_probe_holds` is the remedy only if the
-    /// disable was unintended; alerting on it would be nonsensical.
+    /// pressure (#739). The one reason that also suppresses the advertisement:
+    /// the node answers `has_blob: false` for store-backed content (origin-held
+    /// content takes no hold and is unaffected). Raising `max_probe_holds` is
+    /// the remedy only if the disable was unintended; alerting on it would be
+    /// nonsensical.
     Disabled,
     /// An end-client probe (a requester that is *not* a registered operator)
     /// hit the stake-lane-reserved end-client ceiling
-    /// (`max_probe_holds - cache.stake_lane_reserved_holds`), keeping headroom
-    /// for node-to-node cache-miss probes per ADR 003 §Admission and Priority
-    /// (#757). Unlike the two above this fires *before* the hold attempt, so
-    /// the cache is **not consulted** — the blob may or may not be present;
-    /// the reservation is a content-independent admission decision. Zero
-    /// unless `cache.stake_lane_reserved_holds > 0`.
+    /// (`max_probe_holds - cache.stake_lane_reserved_holds`), keeping hold
+    /// headroom for node-to-node cache-miss probes per ADR 003 §Admission and
+    /// Priority (#757). The reservation is a content-independent *admission*
+    /// decision, so unlike the two above it is decided before any hold attempt
+    /// — but the handler still consults the cache afterwards to answer
+    /// honestly, and advertises the blob if it is present. Zero unless
+    /// `cache.stake_lane_reserved_holds > 0`.
     StakeLaneReserved,
 }
 
@@ -224,16 +232,19 @@ pub struct DecdnMetrics {
     pub dispatch_per_source_skipped_no_addr: Counter,
     /// `decdn_probe_hold_unavailable_total{reason}` per the canonical metric
     /// registry (`adr/appendix-observability.md` — the authoritative naming
-    /// source, superseding informal ADR-005 references): a probe that could
-    /// not be answered from a guaranteed eviction hold, broken out by cause
-    /// on the `reason` label (#1443, collapsing the former
-    /// `probe_hold_violations` / `probe_holds_disabled` /
-    /// `probe_stake_lane_reserved` counters).
+    /// source, superseding informal ADR-005 references): a probe for a present
+    /// blob that got no eviction hold, broken out by cause on the `reason`
+    /// label (#1443, collapsing the former `probe_hold_violations` /
+    /// `probe_holds_disabled` / `probe_stake_lane_reserved` counters).
     ///
-    /// Every value is an availability degradation, never a safety fault — the
-    /// node loses revenue but never signs a phantom announcement, because the
-    /// hold mechanism makes the registry's literal "evicted after signing
-    /// `has_blob: true`" case unreachable by construction. See
+    /// For `exhausted` / `stake_lane_reserved` the node still advertises
+    /// (`has_blob: true`) and simply forgoes the hold — the blob may be
+    /// LRU-evicted before the pull, costing one wasted round trip. That is not
+    /// a slash (ADR 014 pairs no offense with a miss) and not a reputation
+    /// penalty either: a `NotFound` is classified `Transient` and suppresses
+    /// the (peer, hash) pair without scoring the peer. `disabled` is the
+    /// operator opt-out (`max_probe_holds == 0`) that answers `has_blob: false`
+    /// for store-backed content. See
     /// [`ProbeHoldUnavailableReason`] for what each value means and which one
     /// the "raise `max_probe_holds`" alert fires on; all three children are
     /// materialized at startup by [`Metrics::new`] so each series is exported

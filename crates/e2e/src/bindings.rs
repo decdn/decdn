@@ -325,11 +325,11 @@ pub use decdn_incentive::slash_judge::SlashJudge;
 // than declared here, so there is no local block to extend — unlike the escrow
 // reads and `totalSupply`, which fold into `CapacityBond` / `Erc20`.
 alloy::sol! {
-    /// `SlashJudge.submitRateChallenge` — the rate-manipulation twin of
-    /// `submitPhantomChallenge` (omitted by the production binding, which only
-    /// needs the phantom path). Bound at the `SlashJudge` address; `_verifyPair`
-    /// applies the same signature / same-hash / 30s-window / staleness checks and
-    /// then demands `stream.ratePerMb > probe.ratePerMb`.
+    /// `SlashJudge.submitRateChallenge` — the rate-manipulation reveal entry
+    /// point (omitted by the production binding, which never submits challenges,
+    /// only watches the `Slashed` event). Bound at the `SlashJudge` address;
+    /// `_verifyPair` applies the signature / same-hash / 30s-window / staleness
+    /// checks and then demands `stream.ok && stream.ratePerMb > probe.ratePerMb`.
     ///
     /// The two errors are declared so a reverted reveal decodes to a *named*
     /// error rather than an opaque selector, and so
@@ -350,6 +350,11 @@ alloy::sol! {
         /// slash. The dedup guard that lives in `SlashJudge` itself (not
         /// `CapacityBond`), replayed under a fresh salt by the #1378 negative.
         error EvidenceAlreadyUsed(bytes32 evidenceHash);
+        /// The pair passed every structural check but is not an overcharge:
+        /// either the stream refused (`!ok`) or it did not exceed the probe
+        /// quote. The `!ok` leg is what keeps a signed refusal inert as
+        /// evidence, exercised by the signed-refusal negative.
+        error NotRateManipulation();
 
         function submitRateChallenge(
             address challengedNode,

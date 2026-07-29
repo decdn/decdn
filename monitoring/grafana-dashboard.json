@@ -218,18 +218,12 @@
         },
         {
           "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
-          "expr": "rate(decdn_slash_evidence_exposure_total{instance=~\"$instance\"}[5m])",
-          "legendFormat": "slash_evidence_exposure / s — {{instance}}",
-          "refId": "B"
-        },
-        {
-          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
           "expr": "rate(decdn_rate_bounds_clamp_events_total{instance=~\"$instance\"}[5m])",
           "legendFormat": "rate_bounds_clamp / s — {{instance}}",
-          "refId": "C"
+          "refId": "B"
         }
       ],
-      "title": "Slash-risk event rates",
+      "title": "Probe-hold & rate-clamp event rates",
       "type": "timeseries"
     },
     {
