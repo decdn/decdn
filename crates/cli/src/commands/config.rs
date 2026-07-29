@@ -161,7 +161,7 @@ pub fn write_validate_summary<W: std::io::Write>(
     )?;
     writeln!(
         w,
-        "  origin_directory_from_block: {}",
+        "  origin_directory_from_block: {} (ignored; origin set is enumerated on chain)",
         resolved.blockchain.origin_directory_from_block
     )?;
     writeln!(
@@ -455,7 +455,7 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # capacity_bond_address = ""        # REQUIRED: 0x-prefixed hex
 # origin_assignment_address = ""     # OPTIONAL: 0x-prefixed hex; `decdn publish assign` target, and the chain-backed origin directory for cache-miss pull-through fallback (ADR 022).
 # publisher_registry_address = ""    # OPTIONAL: 0x-prefixed hex; `decdn publish namespace create` target (#1029).
-# origin_directory_from_block = 0    # OPTIONAL: AssignmentActivated log-replay start; set to the OriginAssignment deploy block (default 0 scans the whole chain)
+# origin_directory_from_block = 0    # DEPRECATED/IGNORED: origin set is now enumerated on chain (#1497); accepted but has no effect
 # slash_judge_address = ""           # REQUIRED: 0x-prefixed hex (EIP-712 verifyingContract, ADR 014)
 # chain_id = 421614                  # EIP-712 chain id; default Arbitrum Sepolia
 # rpc_watchdog_interval_sec = 30     # 0 disables the connectivity watchdog

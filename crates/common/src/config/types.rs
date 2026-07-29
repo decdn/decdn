@@ -143,11 +143,13 @@ pub struct BlockchainConfig {
     /// it is the publish CLI's `namespace create` target and is not consumed by
     /// the node runtime.
     pub publisher_registry_address: Option<String>,
-    /// Block height at which the chain-backed origin directory begins its
-    /// `AssignmentActivated` log replay. SHOULD be the `OriginAssignment`
-    /// deployment block; absent => `0`, which is correct but scans the entire
-    /// chain history (slow / RPC-heavy on an established L2). Only consulted
-    /// when the `origin_assignment_address` is set.
+    /// DEPRECATED / IGNORED. Was the block height at which the chain-backed
+    /// origin directory began its `AssignmentActivated` log replay. The
+    /// directory now enumerates the namespace set on chain
+    /// (`assignedNamespaces`, #1497) instead of replaying, so this value is no
+    /// longer read. The key is still accepted — `[blockchain]` denies unknown
+    /// fields — but has no effect; it is removed once the remaining `*_from_block`
+    /// watchers migrate.
     pub origin_directory_from_block: Option<u64>,
     /// `SlashJudge` contract address — the EIP-712 `verifyingContract` for
     /// `ProbeResponse` / `StreamResponse` `slash_sig` signatures (ADR 014
