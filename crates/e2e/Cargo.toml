@@ -30,10 +30,9 @@ default = []
 # What this gate buys is the *store type*, not the dependency. Since #1246 the
 # shared buyer-table codec/ops (`buyer_channel_table`) compile in every build of
 # this crate: `decdn-node` is a non-optional dep and enables
-# `decdn-incentive/buyer-store-core`. `redb` and `postcard` were never actually
-# gated out here either — `redb` arrives transitively via `decdn-node`, and
-# `postcard` via `decdn-protocol`.
-anvil-e2e = ["decdn-incentive/redb", "dep:postcard", "dep:serde"]
+# `decdn-incentive/buyer-store-core`. `redb` was never actually gated out here
+# either — it arrives transitively via `decdn-node`.
+anvil-e2e = ["decdn-incentive/redb"]
 
 [dependencies]
 decdn-node = { workspace = true }
@@ -49,11 +48,6 @@ decdn-config-types = { workspace = true }
 # `decdn-bao-range` so the fixture can't diverge from the canonical block size.
 decdn-bao-range = { workspace = true }
 bao-tree = { workspace = true }
-# `cli_fetch_manifest` (anvil-e2e only) postcard-encodes a `DECDNMAN` manifest blob
-# to seed into the node, mirroring the ADR 012 § Manifest format wire layout the CLI
-# consumer decodes. Gated with the test so default builds carry no unused dep.
-postcard = { workspace = true, optional = true }
-serde = { workspace = true, optional = true }
 alloy = { workspace = true }
 iroh = { workspace = true }
 tokio = { workspace = true }

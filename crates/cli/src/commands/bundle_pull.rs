@@ -7,9 +7,8 @@
 //! and paid for — once and hard-linked (or copied) to each path (#1306). Node selection is
 //! per blob (#936): with an explicit `--node-id` every entry is pulled from that
 //! one node, otherwise each distinct blob discovers its own holder among the
-//! region-nearest active nodes. A `DECDNMAN` entry reuses that holder for its
-//! chunks, discovering again only after a typed delivery refusal. Distinct blobs
-//! are fetched with `--jobs` concurrency.
+//! region-nearest active nodes. Distinct blobs are fetched with `--jobs`
+//! concurrency.
 //!
 //! **Voucher-nonce safety.** A payment channel's vouchers use a strictly
 //! increasing nonce, so two in-flight fetches sharing one channel would race it.
@@ -18,7 +17,7 @@
 //! same provider's channel (which also makes the lazy open-or-reuse first-touch
 //! race-free). Distinct providers proceed in parallel.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
@@ -44,11 +43,10 @@ use serde::{Deserialize, Serialize};
 
 use super::chain_ctx;
 use super::fetch;
-use super::file_manifest;
+use decdn_client_pull::PullDeadlines;
 use decdn_client_pull::discovery::{self, NodeCandidate};
 use decdn_client_pull::endpoint as client_endpoint;
 use decdn_client_pull::provider;
-use decdn_client_pull::{PullDeadlines, UpstreamRefused};
 
 type FetchTarget = (PublicKey, Address);
 
@@ -60,27 +58,6 @@ type FetchTarget = (PublicKey, Address);
 enum Payment {
     AutoOpen,
     Adopt { channel_id: B256 },
-}
-
-/// How the initial entry target was selected. Keeping this provenance beside
-/// the target prevents reconstruction from accidentally enabling discovery for
-/// an explicit `--node-id` pull.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SelectedTarget<T> {
-    Pinned(T),
-    Discovered(T),
-}
-
-impl<T: Copy> SelectedTarget<T> {
-    const fn target(self) -> T {
-        match self {
-            Self::Pinned(target) | Self::Discovered(target) => target,
-        }
-    }
-
-    const fn is_pinned(self) -> bool {
-        matches!(self, Self::Pinned(_))
-    }
 }
 
 /// Remove the node that just refused delivery before probing fallback holders.
@@ -179,8 +156,8 @@ fn plan_slots<'a>(
 
 /// Turn classified [`Slot`]s into outcomes: materialize the blob at the first
 /// writable destination and hard-link/copy it to the rest. `materialize` is the
-/// paid path (for a `DECDNMAN` entry it fetches the chunks) and runs **at most
-/// once** per group — every later destination goes through the free `link`,
+/// paid path and runs **at most once** per group — every later destination goes
+/// through the free `link`,
 /// reported as [`EntryOutcome::Linked`] so the summary never implies a second
 /// paid fetch. If the first materialize fails, the next writable path retries it
 /// from the same in-memory bytes (no re-fetch), so one bad path can't doom the
@@ -221,40 +198,6 @@ where
         outcomes.push(outcome);
     }
     outcomes
-}
-
-/// Fetch from `preferred`; on an auto-discovered delivery refusal only, discover
-/// a holder for this hash, retry there, and carry a successful fallback forward.
-async fn fetch_preferred<T, Fetch, FetchFut, Discover, DiscoverFut>(
-    hash: [u8; 32],
-    preferred: &Cell<SelectedTarget<T>>,
-    fetch_from: Fetch,
-    discover: Discover,
-) -> anyhow::Result<Vec<u8>>
-where
-    T: Copy,
-    Fetch: Fn([u8; 32], T) -> FetchFut,
-    FetchFut: std::future::Future<Output = anyhow::Result<Vec<u8>>>,
-    Discover: FnOnce([u8; 32], T) -> DiscoverFut,
-    DiscoverFut: std::future::Future<Output = anyhow::Result<T>>,
-{
-    let selected = preferred.get();
-    let target = selected.target();
-    match fetch_from(hash, target).await {
-        Ok(bytes) => Ok(bytes),
-        Err(err)
-            if !selected.is_pinned()
-                && err
-                    .downcast_ref::<UpstreamRefused>()
-                    .is_some_and(|refused| refused.error().is_delivery_side()) =>
-        {
-            let fallback = discover(hash, target).await?;
-            let bytes = fetch_from(hash, fallback).await?;
-            preferred.set(SelectedTarget::Discovered(fallback));
-            Ok(bytes)
-        }
-        Err(err) => Err(err),
-    }
 }
 
 /// Read-side bundle manifest (the write-side lives in [`super::bundle`]). `size`
@@ -351,7 +294,7 @@ async fn discover_candidates(
 /// Load the buyer's Ethereum signer (vouchers + any openChannel tx) and its
 /// address, prompting for the keystore password once. Password from
 /// `$DECDN_KEYSTORE_PASSWORD`, else a TTY prompt. Called per selection path so the
-/// prompt is ordered relative to discovery (see `bundle_pull`).
+/// prompt is ordered relative to discovery (see `resolve_selection`).
 fn load_buyer_signer(
     chain: &fetch::ResolvedChain,
 ) -> anyhow::Result<(Arc<PrivateKeySigner>, Address)> {
@@ -569,8 +512,9 @@ struct PullCtx<'a, P: Provider + Clone> {
     slash_dom: &'a Eip712Domain,
     chain: &'a fetch::ResolvedChain,
     relays: &'a [RelayUrl],
-    /// `Some((node_id, provider))` pins every entry to one node (`--node-id`);
-    /// `None` discovers per entry against `candidates`.
+    /// `Some((node_id, provider))` pins every entry to one node (`--node-id` or
+    /// the `--channel-id` adopt path); `None` discovers per entry against
+    /// `candidates`.
     explicit: Option<FetchTarget>,
     /// Auto-open per provider, or adopt one channel by id for the whole bundle.
     payment: Payment,
@@ -606,13 +550,11 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
 
     /// Select the node to fetch `hash` from: the pinned explicit node, or
     /// per-entry discovery over the shared candidate list.
-    async fn pick(&self, hash: [u8; 32]) -> anyhow::Result<SelectedTarget<FetchTarget>> {
+    async fn pick(&self, hash: [u8; 32]) -> anyhow::Result<FetchTarget> {
         if let Some(pinned) = self.explicit {
-            return Ok(SelectedTarget::Pinned(pinned));
+            return Ok(pinned);
         }
-        Ok(SelectedTarget::Discovered(
-            self.pick_excluding(hash, None).await?,
-        ))
+        self.pick_excluding(hash, None).await
     }
 
     /// Select a target while omitting a node that already refused this hash.
@@ -641,17 +583,8 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
 
     /// Fetch one blob after normal explicit selection or discovery.
     async fn fetch(&self, hash: [u8; 32]) -> anyhow::Result<Vec<u8>> {
-        Ok(self.fetch_with_target(hash).await?.0)
-    }
-
-    /// Fetch one blob and retain the target chosen for it.
-    async fn fetch_with_target(
-        &self,
-        hash: [u8; 32],
-    ) -> anyhow::Result<(Vec<u8>, SelectedTarget<FetchTarget>)> {
-        let selected = self.pick(hash).await?;
-        let bytes = self.fetch_from(hash, selected.target()).await?;
-        Ok((bytes, selected))
+        let target = self.pick(hash).await?;
+        self.fetch_from(hash, target).await
     }
 
     /// Fetch directly from `node_id`/`provider`, bypassing discovery.
@@ -702,7 +635,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             // per entry (like `open_or_reuse`) to re-snapshot the advanced watermark; the
             // per-provider lock above serializes the shared nonce. `--provider-address`
             // was already validated as the guard when the channel was first hydrated in
-            // `bundle_pull()`, so pass `None` here to avoid re-parsing it per entry.
+            // `resolve_selection`, so pass `None` here to avoid re-parsing it per entry.
             Payment::Adopt { channel_id } => {
                 let ctx = fetch::hydrate_channel_by_id(
                     self.store,
@@ -741,8 +674,8 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             self.store,
             hash,
             // Bundle-level `--namespace` (ADR 002): routes any cache-miss origin
-            // pull to that namespace's authorized origins. Applies uniformly — the
-            // manifest blob, `DECDNMAN` chunks, and entries all funnel through here.
+            // pull to that namespace's authorized origins. Applies uniformly to the
+            // manifest blob and every entry — all funnel through here.
             self.namespace_id,
             // Same shape as `fetch` (#1134): a node that accepts the connection and never
             // answers is as dead as one that stops mid-stream, so the same budget bounds
@@ -758,22 +691,6 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             // many concurrent pulls; `bundle pull` reports at entry granularity
             // instead (#1118 scopes the byte bar to single-blob `fetch`).
             None,
-        )
-        .await
-    }
-
-    /// Fetch one `DECDNMAN` chunk from its preferred target, with discovery
-    /// fallback enabled only for the auto-discovered bundle-pull path.
-    async fn fetch_manifest_chunk(
-        &self,
-        hash: [u8; 32],
-        preferred: &Cell<SelectedTarget<FetchTarget>>,
-    ) -> anyhow::Result<Vec<u8>> {
-        fetch_preferred(
-            hash,
-            preferred,
-            |hash, target| self.fetch_from(hash, target),
-            |hash, refusing| self.pick_excluding(hash, Some(refusing)),
         )
         .await
     }
@@ -843,7 +760,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
                 .collect();
         }
 
-        let (bytes, target) = match self.fetch_with_target(hash).await {
+        let bytes = match self.fetch(hash).await {
             Ok(fetched) => fetched,
             Err(e) => {
                 return slots
@@ -862,71 +779,20 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         let bytes = &bytes;
         materialize_group(
             slots,
-            |dest| self.materialize(bytes, hash, dest, target),
+            |dest| std::future::ready(materialize(bytes, &dest)),
             link_or_copy_atomic,
         )
         .await
     }
+}
 
-    /// Write already-fetched `bytes` to `dest`, returning the byte count. A bundle
-    /// entry's blob may itself be a `DECDNMAN` file manifest — the two layers
-    /// compose (`appendix-bundles.md` § Non-relationship to ADR 012's `DECDNMAN`
-    /// chunk manifest) — in which case the real bytes are its chunks (#1183),
-    /// reconstructed here. Without the magic these ARE the bytes; write as-is.
-    async fn materialize(
-        &self,
-        bytes: &[u8],
-        hash: [u8; 32],
-        dest: PathBuf,
-        target: SelectedTarget<FetchTarget>,
-    ) -> anyhow::Result<u64> {
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("create {}", parent.display()))?;
-        }
-        if let Some(manifest) = file_manifest::sniff(bytes) {
-            return self.reconstruct_entry(manifest, hash, &dest, target).await;
-        }
-        fetch::write_blob_atomic(&dest, bytes)
-            .with_context(|| format!("write {}", dest.display()))?;
-        Ok(bytes.len() as u64)
+/// Write already-fetched `bytes` to `dest`, returning the byte count.
+fn materialize(bytes: &[u8], dest: &Path) -> anyhow::Result<u64> {
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
-
-    /// Expand a manifest entry whose blob turned out to be a file manifest:
-    /// fetch and verify its chunks in order, then reconstruct into `dest`.
-    ///
-    /// Chunk pulls first target the node that served the manifest. A typed
-    /// delivery refusal triggers normal per-hash discovery, and a successful
-    /// fallback becomes the preferred target for later chunks. Explicit
-    /// `--node-id` pulls remain pinned. Per-provider channel serialization is
-    /// still released between sequential chunks, while sibling entries retain
-    /// their independent selection policy.
-    async fn reconstruct_entry(
-        &self,
-        manifest: anyhow::Result<file_manifest::FileManifest>,
-        manifest_hash: [u8; 32],
-        dest: &Path,
-        target: SelectedTarget<FetchTarget>,
-    ) -> anyhow::Result<u64> {
-        let manifest = manifest?;
-        // A given manifest blob is reconstructed at most once per bundle pull:
-        // entries are grouped by hash before the fan-out (#1306), so the two
-        // paths of a file duplicated in the bundle share one reconstruction and
-        // the second is a hard link, not a second paid fetch. Cross-process
-        // serialization of the shared part directory (two `decdn` invocations on
-        // one data dir) is handled by the `flock` inside `file_manifest::
-        // reconstruct` (#1303); no process-local lock is needed here.
-        let preferred = Cell::new(target);
-        file_manifest::reconstruct(
-            &manifest,
-            manifest_hash,
-            &file_manifest::downloads_root(&self.chain.data_dir),
-            dest,
-            !self.common.no_keep_blobs,
-            |chunk_hash| self.fetch_manifest_chunk(chunk_hash, &preferred),
-        )
-        .await
-    }
+    fetch::write_blob_atomic(dest, bytes).with_context(|| format!("write {}", dest.display()))?;
+    Ok(bytes.len() as u64)
 }
 
 impl EntryOutcome {
@@ -1104,138 +970,6 @@ mod tests {
 
     use super::*;
 
-    #[tokio::test]
-    async fn manifest_chunks_reuse_the_preferred_target_without_discovery() {
-        let preferred = std::cell::Cell::new(SelectedTarget::Discovered(1u8));
-        let fetches = Rc::new(RefCell::new(Vec::new()));
-        let discoveries = Rc::new(RefCell::new(0u8));
-
-        for hash in [[1u8; 32], [2u8; 32]] {
-            fetch_preferred(
-                hash,
-                &preferred,
-                {
-                    let fetches = Rc::clone(&fetches);
-                    move |hash, target| {
-                        let fetches = Rc::clone(&fetches);
-                        async move {
-                            fetches.borrow_mut().push((hash, target));
-                            Ok(vec![hash[0]])
-                        }
-                    }
-                },
-                {
-                    let discoveries = Rc::clone(&discoveries);
-                    move |_, _| {
-                        let discoveries = Rc::clone(&discoveries);
-                        async move {
-                            *discoveries.borrow_mut() += 1;
-                            Ok(9u8)
-                        }
-                    }
-                },
-            )
-            .await
-            .unwrap();
-        }
-
-        assert_eq!(
-            fetches.borrow().as_slice(),
-            &[([1u8; 32], 1), ([2u8; 32], 1)]
-        );
-        assert_eq!(*discoveries.borrow(), 0);
-        assert_eq!(preferred.get(), SelectedTarget::Discovered(1));
-    }
-
-    #[tokio::test]
-    async fn delivery_refusal_discovers_once_and_carries_the_fallback_forward() {
-        let preferred = std::cell::Cell::new(SelectedTarget::Discovered(1u8));
-        let fetches = Rc::new(RefCell::new(Vec::new()));
-        let discoveries = Rc::new(RefCell::new(0u8));
-
-        for hash in [[1u8; 32], [2u8; 32]] {
-            fetch_preferred(
-                hash,
-                &preferred,
-                {
-                    let fetches = Rc::clone(&fetches);
-                    move |hash, target| {
-                        let fetches = Rc::clone(&fetches);
-                        async move {
-                            fetches.borrow_mut().push((hash, target));
-                            if hash == [1u8; 32] && target == 1 {
-                                Err(anyhow::Error::new(
-                                    decdn_client_pull::UpstreamRefused::mid_stream(
-                                        decdn_protocol::StreamError::EvictedSinceProbe,
-                                    ),
-                                ))
-                            } else {
-                                Ok(vec![hash[0]])
-                            }
-                        }
-                    }
-                },
-                {
-                    let discoveries = Rc::clone(&discoveries);
-                    move |_, _| {
-                        let discoveries = Rc::clone(&discoveries);
-                        async move {
-                            *discoveries.borrow_mut() += 1;
-                            Ok(2u8)
-                        }
-                    }
-                },
-            )
-            .await
-            .unwrap();
-        }
-
-        assert_eq!(
-            fetches.borrow().as_slice(),
-            &[([1u8; 32], 1), ([1u8; 32], 2), ([2u8; 32], 2),]
-        );
-        assert_eq!(*discoveries.borrow(), 1);
-        assert_eq!(preferred.get(), SelectedTarget::Discovered(2));
-    }
-
-    #[tokio::test]
-    async fn delivery_refusal_excludes_the_refusing_target_from_discovery() {
-        let preferred = std::cell::Cell::new(SelectedTarget::Discovered(1u8));
-        let excluded = Rc::new(RefCell::new(Vec::new()));
-
-        let bytes = fetch_preferred(
-            [1u8; 32],
-            &preferred,
-            |hash, target| async move {
-                if target == 1 {
-                    Err(anyhow::Error::new(
-                        decdn_client_pull::UpstreamRefused::mid_stream(
-                            decdn_protocol::StreamError::Overloaded,
-                        ),
-                    ))
-                } else {
-                    Ok(vec![hash[0]])
-                }
-            },
-            {
-                let excluded = Rc::clone(&excluded);
-                move |_, refusing_target| {
-                    let excluded = Rc::clone(&excluded);
-                    async move {
-                        excluded.borrow_mut().push(refusing_target);
-                        Ok(2u8)
-                    }
-                }
-            },
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(bytes, vec![1]);
-        assert_eq!(excluded.borrow().as_slice(), &[1]);
-        assert_eq!(preferred.get(), SelectedTarget::Discovered(2));
-    }
-
     #[test]
     fn fallback_candidates_omit_the_refusing_node() {
         let refusing = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
@@ -1258,106 +992,6 @@ mod tests {
 
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].node_id, alternative);
-    }
-
-    #[tokio::test]
-    async fn explicit_pin_does_not_discover_after_not_found() {
-        let preferred = std::cell::Cell::new(SelectedTarget::Pinned(1u8));
-        let discoveries = Rc::new(RefCell::new(0u8));
-
-        let err = fetch_preferred(
-            [1u8; 32],
-            &preferred,
-            |_, _| async {
-                Err(anyhow::Error::new(
-                    decdn_client_pull::UpstreamRefused::mid_stream(
-                        decdn_protocol::StreamError::NotFound,
-                    ),
-                ))
-            },
-            {
-                let discoveries = Rc::clone(&discoveries);
-                move |_, _| {
-                    let discoveries = Rc::clone(&discoveries);
-                    async move {
-                        *discoveries.borrow_mut() += 1;
-                        Ok(2u8)
-                    }
-                }
-            },
-        )
-        .await
-        .unwrap_err();
-
-        assert!(
-            matches!(
-                err.downcast_ref::<decdn_client_pull::UpstreamRefused>(),
-                Some(refused)
-                    if matches!(refused.error(), decdn_protocol::StreamError::NotFound)
-            ),
-            "{err:#}"
-        );
-        assert_eq!(*discoveries.borrow(), 0);
-        assert_eq!(preferred.get(), SelectedTarget::Pinned(1));
-    }
-
-    /// The delivery-side gate is load-bearing in the money sense, so pin it from
-    /// this side too (`StreamError`'s own domain split is covered in
-    /// `decdn_protocol`). `VoucherRejected` is the one code that arrives ONLY
-    /// mid-stream — after bytes were delivered and paid for — and it reports a
-    /// buyer-side voucher fault that would follow us to the next node. Falling
-    /// back on it would re-fetch and re-pay the chunk to lose the same way twice,
-    /// once per remaining chunk.
-    #[tokio::test]
-    async fn voucher_rejection_does_not_fall_back() {
-        let preferred = std::cell::Cell::new(SelectedTarget::Discovered(1u8));
-        let fetches = Rc::new(RefCell::new(0u8));
-        let discoveries = Rc::new(RefCell::new(0u8));
-
-        let err = fetch_preferred(
-            [1u8; 32],
-            &preferred,
-            {
-                let fetches = Rc::clone(&fetches);
-                move |_, _| {
-                    let fetches = Rc::clone(&fetches);
-                    async move {
-                        *fetches.borrow_mut() += 1;
-                        Err(anyhow::Error::new(
-                            decdn_client_pull::UpstreamRefused::mid_stream(
-                                decdn_protocol::StreamError::VoucherRejected {
-                                    reason: decdn_protocol::VoucherRejectReason::WrongSigner,
-                                    bundle: None,
-                                },
-                            ),
-                        ))
-                    }
-                }
-            },
-            {
-                let discoveries = Rc::clone(&discoveries);
-                move |_, _| {
-                    let discoveries = Rc::clone(&discoveries);
-                    async move {
-                        *discoveries.borrow_mut() += 1;
-                        Ok(2u8)
-                    }
-                }
-            },
-        )
-        .await
-        .unwrap_err();
-
-        assert!(
-            matches!(
-                err.downcast_ref::<decdn_client_pull::UpstreamRefused>(),
-                Some(refused) if refused.error().is_mid_stream()
-            ),
-            "{err:#}"
-        );
-        assert_eq!(*fetches.borrow(), 1, "the refusal must not be retried");
-        assert_eq!(*discoveries.borrow(), 0);
-        assert_eq!(preferred.get(), SelectedTarget::Discovered(1));
     }
 
     #[test]
@@ -1657,7 +1291,7 @@ mod tests {
     /// is only for `--node-id`); it derives the pinned node from the channel's on-chain
     /// provider. Here we pin the invariant that `explicit_target` returns `None` when
     /// only `--channel-id` (no `--node-id`) is set, so the channel-id branch in
-    /// `bundle_pull()` is what supplies the target.
+    /// `resolve_selection` is what supplies the target.
     #[test]
     fn channel_id_without_node_id_is_not_an_explicit_target() {
         use clap::Parser;

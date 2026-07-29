@@ -236,18 +236,6 @@ pub struct ClientFetchArgs {
     /// never be detected.
     #[arg(long, value_name = "MS", default_value_t = 3_600_000, value_parser = clap::value_parser!(u64).range(1..))]
     pub timeout_ms: u64,
-
-    /// Delete the per-chunk part files immediately after reconstructing a
-    /// `DECDNMAN` file manifest (ADR 012 § Blob retention, #1183).
-    ///
-    /// The parts under `<data-dir>/downloads/<manifest-hash>/` (default
-    /// `~/.decdn/client/downloads/`) are **retained by default** so the client
-    /// can re-serve them, and so an interrupted
-    /// reconstruction resumes without re-fetching (and re-paying for) chunks it
-    /// already holds. Pass this to trade that away for disk. No effect on a raw
-    /// single-blob fetch, which has no chunks.
-    #[arg(long)]
-    pub no_keep_blobs: bool,
 }
 
 impl ClientFetchArgs {
