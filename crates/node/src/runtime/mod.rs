@@ -916,10 +916,9 @@ async fn build_chain_and_handlers(
     // Without those addresses this is an `EmptyOriginDirectory`: the gate rejects
     // every hash and the FIND_VALUE fallback resolves nothing (same prior behavior).
     // The chain-backed directory's watcher handle, captured before the `Arc<dyn>`
-    // coercion so the ordered graceful stop below can `shutdown()` it and *then*
-    // flush the debounced `CheckpointKey::Origin` cursor (an abort-only teardown
-    // would drop up to a debounce window of scan progress on every clean stop).
-    // `None` on the config fallback, which has no watcher — nothing to stop.
+    // coercion so the ordered graceful stop below can `shutdown()` it. There is
+    // no cursor to flush afterwards — the namespace set is re-read from chain on
+    // every boot. `None` on the config fallback, which has no watcher.
     let (origin_directory, origin_watcher): (
         Arc<dyn crate::dht::origin::OriginDirectory>,
         Option<Arc<crate::chain_events::resumable_watcher::WatcherHandle>>,
@@ -930,8 +929,6 @@ async fn build_chain_and_handlers(
             ProviderFactory::read_only(rpc_url.clone(), event_poll_interval),
             origin_assignment_addr,
             capacity_bond_addr,
-            cfg.blockchain.origin_directory_from_block,
-            Arc::clone(&infra.watcher_checkpoint_store),
             event_poll_interval,
             Arc::clone(&head),
             Arc::clone(&staker_set),
@@ -2287,18 +2284,8 @@ async fn shutdown<P: Provider + Clone + 'static>(
     if let Some(watcher) = &origin_watcher {
         watcher.shutdown();
     }
-    // Deterministically flush the origin scan cursor: the watcher's own
-    // cancel-path flush races `origin_directory`'s abort-on-drop teardown, and
-    // a lost flush silently widens the next boot's rescan by up to a debounce
-    // window. Settlement's `ChannelOpened` key is flushed by its service's
-    // `flush_checkpoint_on_shutdown`; `Origin` has no owning service, so flush
-    // it here. Best-effort, mirroring that path: a failed flush only widens
-    // the next rescan, so warn and continue shutting down.
-    if let Err(err) =
-        watcher_checkpoint_store.flush_checkpoint(decdn_incentive::CheckpointKey::Origin)
-    {
-        tracing::warn!(%err, "failed to flush origin-directory scan checkpoint on shutdown");
-    }
+    // No origin cursor to flush: the directory re-reads its namespace set from
+    // chain on every boot, so there is no scan progress a lost flush could cost.
     // Same treatment for the blacklist cursor, which became a persisted cursor
     // once the deny-set itself was made durable (#1181) and likewise has no
     // owning service. Also best-effort, and for the same reason it is *only* an
