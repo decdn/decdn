@@ -54,7 +54,7 @@ A Tier 2 release adds new optional message variants (e.g. a `Ping`/`Pong` keepal
 
 1. **Read the release notes** for new operator-config flags introduced with the variant. Typically opt-in (e.g. `enable_keepalive = true`); defaults are conservative.
 2. **Pull and restart at your normal cadence,** per [§ Restarting a node safely](#restarting-a-node-safely). No Tier 2 release needs coordination beyond that standing procedure.
-3. **Monitor `decdn_serve_stream_rejected_internal_error_total`** for one rolling window after restart. A spike means a peer is rejecting the new variant — expected and benign for legacy peers, but a sustained rate from your own outbound streams suggests config drift.
+3. **Watch the logs, not a metric — the fallback is unmetered.** A legacy peer rejecting the new variant closes with `UNSUPPORTED_MESSAGE` and the sender falls back; that path emits a `tracing::debug!` (e.g. `crates/node/src/dht/client.rs`'s batch-store fallback) and increments **no counter**. Expected and benign for legacy peers, but a sustained rate on your own outbound streams suggests config drift, so grep for the fallback line for one rolling window after restart. This step previously named `decdn_streams_failed_total{reason="protocol_error"}`, which the node has never exported ([`appendix-observability.md`](appendix-observability.md#appendix-observability-and-metrics) now carries it as `planned`); a per-variant fallback counter is the missing piece.
 4. **Configure new metrics** in your dashboard if the release exposes them (canonical registry: [`appendix-observability.md`](appendix-observability.md#appendix-observability-and-metrics)).
 
 Payment channels and stake state are unaffected.

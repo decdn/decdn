@@ -33,7 +33,7 @@
 //! `DecdnMetrics::probe_hold_unavailable` and `DecdnMetrics::streams_active`
 //! both use. Each layer has an unrelated remedy, so no alert spans the family.
 //! Operators recover the rolled-up rate with
-//! `sum(rate(decdn_{probe,dht}_rate_limit_rejected_{per_peer,per_ip,global}_total[1m]))`.
+//! `sum(rate({__name__=~"decdn_(probe|dht)_rate_limit_rejected_(per_peer|per_ip|global)_total"}[1m]))`.
 
 use std::net::IpAddr;
 use std::num::NonZeroU32;

@@ -343,7 +343,7 @@ pub struct DecdnMetrics {
     /// convention; a plain counter field carries no label dimension (a labeled
     /// series would need a `Family`);
     /// operators recover the rolled-up rate with
-    /// `sum(rate(decdn_probe_rate_limit_rejected_{per_peer,per_ip,global}_total[1m]))`.
+    /// `sum(rate({__name__=~"decdn_probe_rate_limit_rejected_(per_peer|per_ip|global)_total"}[1m]))`.
     /// Operator-visible name: `decdn_probe_rate_limit_rejected_per_peer_total`.
     pub probe_rate_limit_rejected_per_peer: Counter,
     /// `cdn/probe/v1` requests rejected by the per-IP token bucket. Sibling

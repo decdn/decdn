@@ -43,7 +43,7 @@ pub type ProbeRejectLayer = RejectLayer;
 /// sibling-counter convention settled in #1475 and recorded in
 /// `adr/appendix-observability.md` § Reason splits. Operators recover the
 /// rolled-up rate with
-/// `sum(rate(decdn_probe_rate_limit_rejected_{per_peer,per_ip,global}_total[1m]))`.
+/// `sum(rate({__name__=~"decdn_probe_rate_limit_rejected_(per_peer|per_ip|global)_total"}[1m]))`.
 ///
 /// **This is a choice, not a backend limitation** — an earlier version of this
 /// comment claimed `iroh_metrics` has no per-field labels, which is false:
