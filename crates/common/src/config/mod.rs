@@ -86,13 +86,18 @@ const DEFAULT_REDEEM_THRESHOLD_MICRO_USDC: u64 = 1_000_000;
 /// Default first-contact `openChannel` deposit: 0.5 USDC (`500_000` `µUSDC`).
 /// Kept small so an unproven node holds little of the buyer's capital before
 /// it has served verified bytes.
-const DEFAULT_BUYER_INITIAL_DEPOSIT_MICRO_USDC: u64 = 500_000;
+///
+/// `pub` so `decdn-cli`'s `--initial-deposit-micro-usdc` resolution shares this
+/// single source of truth with the config resolver rather than duplicating it.
+pub const DEFAULT_BUYER_INITIAL_DEPOSIT_MICRO_USDC: u64 = 500_000;
 /// Default refill target every `topUp` restores toward: 10 USDC
 /// (`10_000_000` `µUSDC`). ADR 003 § Deposit Economics recommends a 10 USDC
 /// practical minimum (gas overhead ~2.3%); the on-chain `minDeposit` floor
 /// still applies and the resolved value is clamped up to it at open time
 /// (#744).
-const DEFAULT_BUYER_WORKING_DEPOSIT_MICRO_USDC: u64 = 10_000_000;
+///
+/// `pub` — see [`DEFAULT_BUYER_INITIAL_DEPOSIT_MICRO_USDC`].
+pub const DEFAULT_BUYER_WORKING_DEPOSIT_MICRO_USDC: u64 = 10_000_000;
 /// Default interval between outgoing `NodeAnnounce` messages (ADR 001).
 const DEFAULT_ANNOUNCE_INTERVAL_SEC: u64 = 60;
 /// Default peer-table entry TTL after which a stale entry is evicted.

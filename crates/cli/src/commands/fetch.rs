@@ -55,10 +55,6 @@ use decdn_client_pull::endpoint as client_endpoint;
 use decdn_client_pull::probe::probe_once;
 use decdn_client_pull::provider;
 
-/// Default deposit when opening a new channel: 10 USDC (ADR 003 § Deposit
-/// Economics recommended minimum). Clamped up to the on-chain `minDeposit`.
-const DEFAULT_DEPOSIT_MICRO_USDC: u64 = 10_000_000;
-
 /// Per-candidate probe timeout during auto-discovery (#936). The K probes run
 /// concurrently, so this bounds selection latency rather than the overall fetch
 /// (`--timeout-ms`); a dead candidate falls out of selection after this.
@@ -147,7 +143,11 @@ pub(crate) struct ResolvedChain {
     /// Client region for region-first discovery ordering (`--region` >
     /// `identity.region`). `None` skips the ordering.
     pub(crate) region: Option<String>,
-    pub(crate) deposit: U256,
+    /// Deposit to escrow when OPENING a new channel (ignored on reuse).
+    pub(crate) initial_deposit: U256,
+    /// Deposit a reused channel's proactive refill targets once it has served
+    /// verified bytes. `0` disables top-up.
+    pub(crate) working_deposit: U256,
     pub(crate) max_approve: bool,
 }
 
@@ -229,10 +229,15 @@ pub(crate) fn resolve_chain(
             |p| expand_tilde(&p),
         );
 
-    let deposit = U256::from(
+    let initial_deposit = U256::from(
+        args.initial_deposit_micro_usdc
+            .or_else(|| bc.and_then(|b| b.buyer_initial_deposit_micro_usdc))
+            .unwrap_or(decdn_common::config::DEFAULT_BUYER_INITIAL_DEPOSIT_MICRO_USDC),
+    );
+    let working_deposit = U256::from(
         args.working_deposit_micro_usdc
             .or_else(|| bc.and_then(|b| b.buyer_working_deposit_micro_usdc))
-            .unwrap_or(DEFAULT_DEPOSIT_MICRO_USDC),
+            .unwrap_or(decdn_common::config::DEFAULT_BUYER_WORKING_DEPOSIT_MICRO_USDC),
     );
     // Client default: exact (deposit-sized) USDC approval, not an unlimited
     // standing allowance. `buyer_max_approve = true` opts a power user back into
@@ -248,7 +253,8 @@ pub(crate) fn resolve_chain(
         keystore,
         data_dir,
         region,
-        deposit,
+        initial_deposit,
+        working_deposit,
         max_approve,
     })
 }
@@ -1442,7 +1448,8 @@ where
         provider,
         self_address,
         chain.payment_channel,
-        chain.deposit,
+        chain.initial_deposit,
+        chain.working_deposit,
         chain.max_approve,
     )
     .await?;
@@ -1521,7 +1528,8 @@ pub(crate) async fn open_or_reuse<P>(
     provider: Address,
     self_address: Address,
     payment_channel_addr: Address,
-    deposit: U256,
+    initial_deposit: U256,
+    working_deposit: U256,
     max_approve: bool,
 ) -> anyhow::Result<ChannelContext>
 where
@@ -1533,8 +1541,16 @@ where
             // a sustained series of fetches against one provider isn't stranded
             // by a spent-down deposit (#1103). `topUp` does not extend expiry, so
             // a near-expiry channel is still replaced below, never topped up.
-            let low_water = deposit / U256::from(LOW_WATER_DIVISOR);
-            let additional = refill_amount(state.deposit, state.last_amount, deposit, low_water);
+            //
+            // Refill toward the WORKING target (graduation), not the small initial
+            // open deposit. `working_deposit == 0` disables top-up: leave the
+            // channel as-is.
+            let additional = if working_deposit.is_zero() {
+                U256::ZERO
+            } else {
+                let low_water = working_deposit / U256::from(LOW_WATER_DIVISOR);
+                refill_amount(state.deposit, state.last_amount, working_deposit, low_water)
+            };
             let state = match top_up_decision(additional, state.funder == self_address) {
                 TopUpDecision::NotNeeded => state,
                 // `topUp` is funder-only on-chain (`PaymentChannel.sol:379`); this key
@@ -1603,13 +1619,13 @@ where
         .map_err(|e| anyhow::anyhow!("read PaymentChannel.usdc(): {e}"))?;
     // Clamp the deposit up to the on-chain floor so `openChannel` can't revert
     // for under-funding on a network with a higher `minDeposit` (matches the
-    // node's buyer path and the `--deposit-micro-usdc` help text).
+    // node's buyer path and the `--initial-deposit-micro-usdc` help text).
     let min_deposit = contract
         .minDeposit()
         .call()
         .await
         .map_err(|e| anyhow::anyhow!("read PaymentChannel.minDeposit(): {e}"))?;
-    let deposit = deposit.max(min_deposit);
+    let deposit = initial_deposit.max(min_deposit);
     // `max_approve` opts into an unlimited standing allowance; otherwise approve
     // exactly the (clamped) deposit being escrowed. Unconditional either way — the
     // old `false` branch issued no approve at all, so `openChannel`'s internal
@@ -1809,7 +1825,8 @@ mod tests {
         assert_eq!(r.rpc_url, "http://config:8545");
         // chain_id absent everywhere → default.
         assert_eq!(r.chain_id, DEFAULT_CHAIN_ID);
-        assert_eq!(r.deposit, U256::from(5_000_000u64));
+        assert_eq!(r.initial_deposit, U256::from(500_000u64));
+        assert_eq!(r.working_deposit, U256::from(5_000_000u64));
         // keystore defaults under the data dir.
         assert_eq!(
             r.keystore,

@@ -629,4 +629,17 @@ mod tests {
             "remaining already >= target yields no top-up even below low-water"
         );
     }
+
+    #[test]
+    fn refill_targets_working_deposit_not_initial_open_size() {
+        // Channel opened at initial 500_000, spent to 40_000 remaining (< 20% of the
+        // 10_000_000 working target). Refill must restore toward WORKING, not initial.
+        let initial = U256::from(500_000u64);
+        let working = U256::from(10_000_000u64);
+        let deposit = initial; // opened at initial
+        let prior = U256::from(460_000u64); // remaining = 40_000
+        let low_water = working / U256::from(LOW_WATER_DIVISOR);
+        let add = refill_amount(deposit, prior, working, low_water);
+        assert_eq!(add, working - (deposit - prior)); // tops up remaining -> working
+    }
 }

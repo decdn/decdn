@@ -631,7 +631,8 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
                         provider,
                         self.self_address,
                         self.chain.payment_channel,
-                        self.chain.deposit,
+                        self.chain.initial_deposit,
+                        self.chain.working_deposit,
                         self.chain.max_approve,
                     )
                     .await?
