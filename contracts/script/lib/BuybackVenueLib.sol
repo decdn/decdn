@@ -12,8 +12,9 @@ import { IUniswapV3SwapRouter } from "../../src/interfaces/IUniswapV3SwapRouter.
 
 /// @title BuybackVenueLib — the one place buyback venue selection and concrete
 ///        `GuardedBuybackBurner` construction live.
-/// @notice Two entry points activate the buyback bucket and they must wire an
-///         identical burner from identical inputs: the deploy-time genesis path
+/// @notice Two entry points construct the buyback burner and must wire an identical
+///         one from identical inputs (only the genesis path also *activates* the
+///         bucket; the runbook script prints the calldata for governance to do it): the deploy-time genesis path
 ///         (`BaseProtocolDeploy._activateBuyback`, driven by `DeployProtocol`'s
 ///         env reader) and the post-deploy operator runbook
 ///         (`ActivateBuyback.s.sol`). Before this library each carried its own
@@ -43,6 +44,13 @@ library BuybackVenueLib {
 
     /// @notice `BUYBACK_VENUE` did not name a supported venue.
     error UnknownBuybackVenue(string venue);
+    /// @notice A `Venue` variant reached a dispatch site that does not handle it.
+    ///         Solidity has no exhaustive match, so every dispatch on this enum ends in
+    ///         an explicit `else revert` carrying this — otherwise adding a variant
+    ///         silently reinterprets it as whichever venue the fallthrough arm names,
+    ///         and the two entry points this library exists to keep in step would fall
+    ///         through to *different* venues.
+    error UnknownVenueVariant(uint8 venue);
 
     // Steady-state FeeRouter split once buyback is live (ADR 026 § FeeRouter
     // split, ADR 016 § Deployment Order): 60% operator / 30% buyback / 10% treasury.
@@ -124,8 +132,10 @@ library BuybackVenueLib {
     /// @notice Deploy the Balancer V3 burner bound to `wiring`'s 80/20 pool, Vault,
     ///         Router, and Permit2. `admin` receives `DEFAULT_ADMIN_ROLE` +
     ///         `GOVERNANCE_ROLE`; the caller is responsible for handing those on.
-    ///         The constructor fail-fasts unless the pool is a live, registered
-    ///         USDC/TOKEN pair, so a mis-wired pool never ships.
+    ///         The constructor validates the pool is registered with `vault` and
+    ///         carries live {USDC, TOKEN} legs — but only once BOTH `pool` and `vault`
+    ///         are non-zero; a zero either side is the deferred-wiring path, accepted
+    ///         here and rejected later at swap time with `PoolNotWired`.
     function deployBalancerBurner(
         IERC20 usdc,
         ERC20Burnable token,

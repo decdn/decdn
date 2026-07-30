@@ -65,8 +65,10 @@ import { IPublisherRegistryOwnership } from "../src/interfaces/IPublisherRegistr
 ///                                         OriginAssignment. Deployer is admin of
 ///                                         every AccessControl-bearing target.
 ///           3. `_deployGovernor`        — DecdnGovernor; grant Timelock's
-///                                         PROPOSER + CANCELLER roles to the
-///                                         Governor.
+///                                         PROPOSER + CANCELLER roles to
+///                                         `_initialProposer` — the Governor, or
+///                                         the bootstrap multisig when one is
+///                                         configured (ADR 009).
 ///           4. `_wireCrossContractRoles` — peer role grants (slash-appeal driver,
 ///                                          blacklist ejector,
 ///                                          emergency multisig, PAUSER_ROLE on every
@@ -93,7 +95,11 @@ import { IPublisherRegistryOwnership } from "../src/interfaces/IPublisherRegistr
 ///                                          mode seats. Runs in-script (not
 ///                                          just in tests) so a mainnet deploy
 ///                                          refuses to finish if any handoff
-///                                          step failed silently.
+///                                          step failed silently. It cannot detect
+///                                          an arbitrary third proposer — OZ's
+///                                          Timelock is not enumerable — only that
+///                                          the seated address holds the role and
+///                                          the Governor does not.
 ///           7. `_assertPeerRolesWired`   — reverts if any phase-4 peer-role grant
 ///                                          or address binding (slash trigger,
 ///                                          router-caller, pausers, emergency
@@ -308,6 +314,18 @@ abstract contract BaseProtocolDeploy is Script {
     ///         away while the operator set is still too thin for capacity-weighted
     ///         voting to be safe (ADR 009).
     error ProposerNotSeated(address account, bytes32 role, bool shouldHold);
+    /// @notice `DeployConfig.bootstrapMultisig` is the deployer EOA. That would seat
+    ///         a single key as the Timelock's sole proposer for the whole bootstrap
+    ///         phase — the standing god-mode the handoff exists to remove — and
+    ///         `_assertNoBackDoors` would pass, because it asks whether the deployer
+    ///         holds GOVERNANCE_ROLE/DEFAULT_ADMIN_ROLE, not whether it can schedule.
+    error BootstrapMultisigIsDeployer(address account);
+    /// @notice `DeployConfig.bootstrapMultisig` holds no code. ADR 009 § Composition
+    ///         specifies a 5-of-9 multisig; a typo'd or dead EOA here becomes the only
+    ///         party that can ever schedule, with the Governor unseated and the
+    ///         deployer renounced — permanently ungovernable, with no on-chain
+    ///         recovery and a green deploy.
+    error BootstrapMultisigNotAContract(address account);
     /// @notice Post-deploy invariant — a phase-4 peer role (e.g. `SLASH_ROLE`,
     ///         `ROUTER_CALLER_ROLE`, `PAUSER_ROLE`) was not actually granted to
     ///         `grantee` on `target`. OZ `grantRole` does not revert when the
@@ -388,7 +406,8 @@ abstract contract BaseProtocolDeploy is Script {
     // Phase 1 — TimelockController. Deployed before the targets so its address
     // is available to FeeRouter as the treasury bucket destination (ADR 016
     // § Deployment Order step 3). Deployer is the initial admin; `proposers` is
-    // empty (PROPOSER_ROLE granted to the Governor in phase 3) and `executors`
+    // empty (PROPOSER_ROLE granted in phase 3, to the Governor or the bootstrap
+    // multisig — see `_initialProposer`) and `executors`
     // is `[address(0)]` (anyone may execute after the delay).
     function _deployTimelock(DeployConfig memory cfg) internal returns (TimelockController) {
         if (cfg.deployer == address(0)) revert ZeroAddress("deployer");
@@ -515,6 +534,27 @@ abstract contract BaseProtocolDeploy is Script {
     function _deployGovernor(DeployConfig memory cfg, Deployment memory d) internal {
         d.governor = new DecdnGovernor(d.router, d.bond, d.timelock);
 
+        // Validate the bootstrap multisig BEFORE seating it. `_assertNoBackDoors`
+        // cannot catch either failure below, because in both cases the address
+        // genuinely does hold the role the invariant asks about:
+        //
+        //   - deployer — seats a standing single-key scheduling power on a Timelock
+        //     that holds GOVERNANCE_ROLE over every target, surviving the very
+        //     handoff whose purpose is to leave the deployer with nothing. The
+        //     deployer's Timelock DEFAULT_ADMIN_ROLE is renounced in phase 5, so
+        //     the grant is then irrevocable without the deployer's own cooperation.
+        //   - non-contract — a typo'd or dead address becomes the only party that
+        //     can ever schedule. The Governor has no proposer role, the deployer has
+        //     renounced, and there is no on-chain recovery: permanently ungovernable.
+        //
+        // Both are plausible slips (`BOOTSTRAP_MULTISIG=$DEPLOYER` in a shell that
+        // already exports `DEPLOYER`), and neither has any recovery path, so they
+        // are worth a fail-fast rather than an invariant.
+        if (cfg.bootstrapMultisig != address(0)) {
+            if (cfg.bootstrapMultisig == cfg.deployer) revert BootstrapMultisigIsDeployer(cfg.deployer);
+            if (cfg.bootstrapMultisig.code.length == 0) revert BootstrapMultisigNotAContract(cfg.bootstrapMultisig);
+        }
+
         address proposer = _initialProposer(cfg, d);
         d.timelock.grantRole(d.timelock.PROPOSER_ROLE(), proposer);
         d.timelock.grantRole(d.timelock.CANCELLER_ROLE(), proposer);
@@ -635,11 +675,17 @@ abstract contract BaseProtocolDeploy is Script {
     function _allGovernedTargets(Deployment memory d) internal pure returns (address[] memory) {
         IAccessControl[8] memory fixedTargets = _governedTargets(d);
         bool hasBurner = address(d.buybackBurner) != address(0);
-        address[] memory targets = new address[](hasBurner ? 9 : 8);
-        for (uint256 i = 0; i < fixedTargets.length; i++) {
+        // Sized and indexed off `fixedTargets.length`, never a literal: widening
+        // `_governedTargets` — which its own docstring instructs a future target to do
+        // — would otherwise overwrite the new entry with the burner here, dropping it
+        // from BOTH the handoff and the invariant. They share this helper, so they
+        // would agree on the wrong answer and ship a deployer back door green.
+        uint256 n = fixedTargets.length;
+        address[] memory targets = new address[](hasBurner ? n + 1 : n);
+        for (uint256 i = 0; i < n; i++) {
             targets[i] = address(fixedTargets[i]);
         }
-        if (hasBurner) targets[8] = address(d.buybackBurner);
+        if (hasBurner) targets[n] = address(d.buybackBurner);
         return targets;
     }
 
@@ -690,8 +736,8 @@ abstract contract BaseProtocolDeploy is Script {
             revert DeployerStillHoldsRole(tl, DEFAULT_ADMIN_ROLE);
         }
         // The Timelock must self-administer, or its own role surface is stranded.
-        // True in both modes: the bootstrap phase withholds GOVERNANCE_ROLE on the
-        // targets from the Timelock, not control of the Timelock itself.
+        // True in both modes: the bootstrap phase confines who may *schedule* through
+        // the Timelock, not what the Timelock holds or its control of its own roles.
         if (!d.timelock.hasRole(DEFAULT_ADMIN_ROLE, tl)) {
             revert GovernanceNotHandedOff(tl, DEFAULT_ADMIN_ROLE);
         }
@@ -773,8 +819,18 @@ abstract contract BaseProtocolDeploy is Script {
         if (act.keeper == address(0)) revert MissingBuybackKeeper();
         _assertVenueFieldsScoped(act);
 
-        GuardedBuybackBurner burner =
-            act.venue == BuybackVenueLib.Venue.UNISWAP ? _activateUniswap(cfg, act, d) : _activateBalancer(cfg, act, d);
+        // Explicit else-revert rather than a two-way ternary: Solidity has no
+        // exhaustiveness check, so a third `Venue` variant would otherwise be silently
+        // deployed as Balancer here while `_deriveTokenSeed` sized its pool with
+        // Uniswap's 1:1 weights — a mis-anchored pool with no revert anywhere.
+        GuardedBuybackBurner burner;
+        if (act.venue == BuybackVenueLib.Venue.UNISWAP) {
+            burner = _activateUniswap(cfg, act, d);
+        } else if (act.venue == BuybackVenueLib.Venue.BALANCER) {
+            burner = _activateBalancer(cfg, act, d);
+        } else {
+            revert BuybackVenueLib.UnknownVenueVariant(uint8(act.venue));
+        }
 
         // The burner is Pausable: grant the emergency multisig PAUSER_ROLE while the
         // deployer still admins it, so it ships with a live pauser like every other
@@ -1049,6 +1105,9 @@ abstract contract BaseProtocolDeploy is Script {
         returns (uint256)
     {
         if (targetPrice == 0) revert TargetPriceZero();
+        if (venue != BuybackVenueLib.Venue.BALANCER && venue != BuybackVenueLib.Venue.UNISWAP) {
+            revert BuybackVenueLib.UnknownVenueVariant(uint8(venue));
+        }
         (uint256 wToken, uint256 wUsdc) =
             venue == BuybackVenueLib.Venue.BALANCER ? (BAL_TOKEN_WEIGHT, BAL_USDC_WEIGHT) : (uint256(1), uint256(1));
         return Math.mulDiv(Math.mulDiv(usdcSeed, wToken, wUsdc), 1e18, targetPrice);

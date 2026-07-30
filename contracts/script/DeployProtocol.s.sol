@@ -348,7 +348,8 @@ contract DeployProtocol is BaseProtocolDeploy {
         // (this script deploys it — issue #669), not here.
         string memory deps = "externalDeps";
         // `address(0)` on a direct-to-Timelock deploy; otherwise the ADR 009
-        // bootstrap multisig holding GOVERNANCE_ROLE until it transitions.
+        // bootstrap multisig holding the Timelock's PROPOSER_ROLE/CANCELLER_ROLE
+        // until it transitions. It never holds GOVERNANCE_ROLE on the targets.
         vm.serializeAddress(deps, "bootstrapMultisig", cfg.bootstrapMultisig);
         vm.serializeAddress(deps, "emergencyMultisig", cfg.emergencyMultisig);
         string memory depsJson = vm.serializeAddress(deps, "usdc", address(cfg.usdc));

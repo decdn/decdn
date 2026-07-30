@@ -320,7 +320,7 @@ N                          = windowEpochs                                       
 The voting set is narrow at launch (likely <50 operators in the first 6–12 months). Direct application of capacity-weighted governance pre-bootstrap risks hostile takeover via a cheap operator-fleet setup.
 
 - For the first 6–12 months, governance runs through a multisig with hard-cap pause powers (extends [ADR 009](009-governance.md#adr-009-governance-model)'s emergency-multisig pattern).
-- Transition to full operator-weighted governance is triggered by a single Timelock batch the multisig schedules manually when it judges the operator set broad enough — it moves the Timelock's `PROPOSER_ROLE` from the multisig to `DecdnGovernor` and cannot be undone (see [ADR 009 § Bootstrap-multisig phase](009-governance.md#bootstrap-multisig-phase)).
+- Transition to full operator-weighted governance is triggered by a single Timelock batch the multisig schedules manually when it judges the operator set broad enough — it moves the Timelock's `PROPOSER_ROLE` and `CANCELLER_ROLE` from the multisig to `DecdnGovernor`, after which the multisig can no longer schedule anything — including its own reinstatement (see [ADR 009 § Bootstrap-multisig phase](009-governance.md#bootstrap-multisig-phase)).
 - Before transition, the multisig can execute parameter changes within the safety bounds in [§ Governable parameters with safety bounds](#governable-parameters-with-safety-bounds).
 
 ### Operator economics

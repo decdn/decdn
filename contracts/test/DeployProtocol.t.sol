@@ -8,6 +8,7 @@ import { Pausable } from "@openzeppelin/contracts/utils/Pausable.sol";
 import { IAccessControl } from "@openzeppelin/contracts/access/IAccessControl.sol";
 
 import { BaseProtocolDeploy } from "../script/BaseProtocolDeploy.s.sol";
+import { TransitionToGovernor } from "../script/TransitionToGovernor.s.sol";
 import { IEd25519Verifier } from "../src/interfaces/IEd25519Verifier.sol";
 import { Token } from "../src/Token.sol";
 import { CapacityBond } from "../src/CapacityBond.sol";
@@ -19,6 +20,12 @@ import { ISlashJudgeEvidenceView } from "../src/interfaces/ISlashJudgeEvidenceVi
 
 import { MockEd25519Verifier } from "./mocks/MockEd25519Verifier.sol";
 import { MockSlashJudgeEvidence } from "./mocks/MockSlashJudgeEvidence.sol";
+
+/// @dev Stand-in for the ADR 009 5-of-9 bootstrap-governance multisig. It must hold
+///      code: `_deployGovernor` rejects an EOA with `BootstrapMultisigNotAContract`,
+///      because a typo'd or dead address seated as the Timelock's only proposer
+///      leaves the protocol permanently ungovernable.
+contract MockMultisig { }
 
 contract DeployUSDC is ERC20 {
     constructor() ERC20("USDC", "USDC") { }
@@ -40,7 +47,7 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
     address internal initialTokenHolder = address(0xBEEF);
     /// @dev ADR 009's 5-of-9 bootstrap-governance multisig, distinct from the 3-of-5
     ///      emergency multisig above. Only used by the bootstrap-mode tests.
-    address internal bootstrapMultisig = address(0xB0075);
+    address internal bootstrapMultisig = address(new MockMultisig());
 
     Deployment internal d;
     DeployConfig internal cfg;
@@ -377,8 +384,7 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
         bytes32 proposerRole = bd.timelock.PROPOSER_ROLE();
         bytes32 cancellerRole = bd.timelock.CANCELLER_ROLE();
 
-        (address[] memory targets, uint256[] memory values, bytes[] memory payloads) =
-            _transitionBatch(bd, proposerRole, cancellerRole);
+        (address[] memory targets, uint256[] memory values, bytes[] memory payloads) = _transitionBatch(bd);
 
         uint256 delay = bd.timelock.getMinDelay();
         vm.prank(bootstrapMultisig);
@@ -392,6 +398,66 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
         assertFalse(bd.timelock.hasRole(cancellerRole, bootstrapMultisig), "multisig canceller stripped");
     }
 
+    /// @notice The script's precondition, which had no coverage at all. Its output is
+    ///         signed once and is irreversible, so each rejected state matters: a
+    ///         default-mode deploy (multisig never seated) and an already-transitioned
+    ///         chain must both refuse to print rather than emit a plausible batch.
+    function test_transitionScript_revertsOutsideBootstrapPhase() public {
+        TransitionToGovernor script = new TransitionToGovernor();
+
+        // Default-mode deploy: the Governor already proposes, so there is no phase to end.
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                TransitionToGovernor.NotInBootstrapPhase.selector, bootstrapMultisig, address(d.governor)
+            )
+        );
+        script.transitionBatchChecked(d.timelock, address(d.governor), bootstrapMultisig);
+
+        // Already transitioned: run the real batch, then re-check.
+        Deployment memory bd = _runFullDeploy(_bootstrapConfig());
+        (address[] memory t, uint256[] memory v, bytes[] memory p) = _transitionBatch(bd);
+        uint256 delay = bd.timelock.getMinDelay();
+        vm.prank(bootstrapMultisig);
+        bd.timelock.scheduleBatch(t, v, p, bytes32(0), bytes32(0), delay);
+        vm.warp(block.timestamp + delay + 1);
+        bd.timelock.executeBatch(t, v, p, bytes32(0), bytes32(0));
+
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                TransitionToGovernor.NotInBootstrapPhase.selector, bootstrapMultisig, address(bd.governor)
+            )
+        );
+        script.transitionBatchChecked(bd.timelock, address(bd.governor), bootstrapMultisig);
+    }
+
+    /// @notice The governor argument is validated by *identity*, not by the absence of
+    ///         roles. "Holds neither role" is the default state of every address, so
+    ///         without this an EOA or a one-nibble typo would yield a clean-looking
+    ///         batch that irreversibly hands scheduling power to a dead address.
+    function test_transitionScript_revertsOnWrongGovernor() public {
+        Deployment memory bd = _runFullDeploy(_bootstrapConfig());
+        TransitionToGovernor script = new TransitionToGovernor();
+
+        // An EOA: no code at all.
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                TransitionToGovernor.GovernorNotBoundToTimelock.selector, address(0xBEEF), address(0)
+            )
+        );
+        script.transitionBatchChecked(bd.timelock, address(0xBEEF), bootstrapMultisig);
+
+        // A real Governor — but one bound to a different Timelock (another deploy).
+        Deployment memory other = _runFullDeploy(_bootstrapConfig());
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                TransitionToGovernor.GovernorNotBoundToTimelock.selector,
+                address(other.governor),
+                address(other.timelock)
+            )
+        );
+        script.transitionBatchChecked(bd.timelock, address(other.governor), bootstrapMultisig);
+    }
+
     /// @notice Irreversibility, the property ADR 009 § Transition promises: with its
     ///         PROPOSER_ROLE gone the multisig cannot even schedule the proposal that
     ///         would reinstate it. Nothing enforces this but the role itself, so it is
@@ -399,10 +465,8 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
     function test_bootstrap_transitionCannotBeUndoneByTheMultisig() public {
         Deployment memory bd = _runFullDeploy(_bootstrapConfig());
         bytes32 proposerRole = bd.timelock.PROPOSER_ROLE();
-        bytes32 cancellerRole = bd.timelock.CANCELLER_ROLE();
 
-        (address[] memory targets, uint256[] memory values, bytes[] memory payloads) =
-            _transitionBatch(bd, proposerRole, cancellerRole);
+        (address[] memory targets, uint256[] memory values, bytes[] memory payloads) = _transitionBatch(bd);
         uint256 delay = bd.timelock.getMinDelay();
         vm.prank(bootstrapMultisig);
         bd.timelock.scheduleBatch(targets, values, payloads, bytes32(0), bytes32(0), delay);
@@ -419,25 +483,46 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
         bd.timelock.schedule(address(bd.timelock), 0, reinstate, bytes32(0), bytes32(0), delay);
     }
 
-    /// @dev The four legs `script/TransitionToGovernor.s.sol` prints, in its order:
-    ///      grant the Governor both roles, then revoke the multisig's. Built here
-    ///      rather than imported so a drift between the script's order and this
-    ///      test's is a review-visible diff in two places, not a silent alias.
-    function _transitionBatch(Deployment memory bd, bytes32 proposerRole, bytes32 cancellerRole)
+    /// @dev The batch the runbook script actually prints. Calling the script rather
+    ///      than rebuilding the four legs here is deliberate: a hand-written twin is a
+    ///      second source of truth, so reordering or retargeting a leg in the script
+    ///      would leave every test green while changing the one artifact a multisig
+    ///      signs. Duplication does not make drift review-visible — it hides it.
+    function _transitionBatch(Deployment memory bd)
         internal
-        view
         returns (address[] memory targets, uint256[] memory values, bytes[] memory payloads)
     {
-        targets = new address[](4);
-        values = new uint256[](4);
-        payloads = new bytes[](4);
-        for (uint256 i = 0; i < 4; i++) {
-            targets[i] = address(bd.timelock);
-        }
-        payloads[0] = abi.encodeCall(bd.timelock.grantRole, (proposerRole, address(bd.governor)));
-        payloads[1] = abi.encodeCall(bd.timelock.grantRole, (cancellerRole, address(bd.governor)));
-        payloads[2] = abi.encodeCall(bd.timelock.revokeRole, (proposerRole, bootstrapMultisig));
-        payloads[3] = abi.encodeCall(bd.timelock.revokeRole, (cancellerRole, bootstrapMultisig));
+        return new TransitionToGovernor().transitionBatch(bd.timelock, address(bd.governor), bootstrapMultisig);
+    }
+
+    /// @notice Seating the deployer as the bootstrap multisig must fail the deploy,
+    ///         not merely be discouraged. It is a plausible slip (`BOOTSTRAP_MULTISIG=$DEPLOYER`
+    ///         in a shell that already exports `DEPLOYER`) and `_assertNoBackDoors`
+    ///         cannot catch it — the deployer would genuinely hold the role the
+    ///         invariant asks about, while gaining standing scheduling power over a
+    ///         Timelock that governs every target, irrevocably.
+    function test_bootstrap_revertsWhenMultisigIsDeployer() public {
+        DeployConfig memory bad = _testConfig();
+        bad.bootstrapMultisig = bad.deployer;
+        vm.expectRevert(abi.encodeWithSelector(BaseProtocolDeploy.BootstrapMultisigIsDeployer.selector, bad.deployer));
+        this.externalRunFullDeploy(bad);
+    }
+
+    /// @notice A typo'd or dead EOA in `BOOTSTRAP_MULTISIG` would become the only
+    ///         party able to schedule — Governor unseated, deployer renounced — with
+    ///         no on-chain recovery and a green deploy. ADR 009 § Composition
+    ///         specifies a multisig, so require code.
+    function test_bootstrap_revertsWhenMultisigIsNotAContract() public {
+        DeployConfig memory bad = _testConfig();
+        bad.bootstrapMultisig = address(0xDEAD);
+        vm.expectRevert(
+            abi.encodeWithSelector(BaseProtocolDeploy.BootstrapMultisigNotAContract.selector, address(0xDEAD))
+        );
+        this.externalRunFullDeploy(bad);
+    }
+
+    function externalRunFullDeploy(DeployConfig calldata cfgIn) external returns (Deployment memory) {
+        return _runFullDeploy(cfgIn);
     }
 
     /// @notice `_assertNoBackDoors` must fail a bootstrap deploy whose Governor was

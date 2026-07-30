@@ -41,8 +41,9 @@ contracts/
   lib/            — submodules: openzeppelin-contracts, forge-std, solady, crypto-lib
 ```
 
-`ActivateBuyback` and `TransitionToGovernor` broadcast nothing — they print the
-Timelock calldata for a governance action to schedule. `TransitionToGovernor`
+`TransitionToGovernor` broadcasts nothing; `ActivateBuyback` broadcasts only the
+burner deployment. Both then print the Timelock calldata for a governance action
+to schedule — neither can activate or transition anything itself. `TransitionToGovernor`
 ends the [ADR 009](../adr/009-governance.md#bootstrap-multisig-phase)
 bootstrap-multisig phase (only relevant if the deploy set `BOOTSTRAP_MULTISIG`):
 
@@ -52,8 +53,9 @@ GOVERNANCE_TIMELOCK=<timelock> DECDN_GOVERNOR=<governor> BOOTSTRAP_MULTISIG=<mul
 ```
 
 It reverts `NotInBootstrapPhase` rather than print a batch if the chain is not
-mid-bootstrap. Executing the batch is **one-way** — it strips the multisig's
-`PROPOSER_ROLE`, so it can never schedule again.
+mid-bootstrap. Executing the batch is **one-way** — it strips the multisig's `PROPOSER_ROLE`, so
+it can never schedule again, including its own reinstatement. Only the inheriting
+DAO could restore it, by vote.
 
 Compiled with solc `0.8.28`, EVM `cancun`, optimizer at 200 runs. CI pins Foundry to `v1.7.1`.
 

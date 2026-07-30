@@ -81,9 +81,17 @@ contract ActivateBuyback is Script {
         BuybackVenueLib.Venue selected = BuybackVenueLib.parseVenue(venue);
 
         vm.startBroadcast();
-        burner = selected == BuybackVenueLib.Venue.BALANCER
-            ? _deployBalancer(IERC20(usdcAddr), ERC20Burnable(tokenAddr), timelock)
-            : _deployUniswap(IERC20(usdcAddr), ERC20Burnable(tokenAddr), timelock);
+        // Explicit else-revert, not a two-way ternary. This script and the genesis
+        // path previously fell through to *different* venues, so an unhandled variant
+        // would have wired different burners from the same env — the exact drift
+        // `BuybackVenueLib` exists to prevent.
+        if (selected == BuybackVenueLib.Venue.BALANCER) {
+            burner = _deployBalancer(IERC20(usdcAddr), ERC20Burnable(tokenAddr), timelock);
+        } else if (selected == BuybackVenueLib.Venue.UNISWAP) {
+            burner = _deployUniswap(IERC20(usdcAddr), ERC20Burnable(tokenAddr), timelock);
+        } else {
+            revert BuybackVenueLib.UnknownVenueVariant(uint8(selected));
+        }
         vm.stopBroadcast();
 
         console2.log("Venue:", venue);
