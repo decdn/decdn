@@ -854,6 +854,10 @@ impl RuntimeReloadState {
                 user_agent: decdn_cache::DEFAULT_USER_AGENT.to_string(),
                 gc_interval_sec: 0,
                 fs_rescan_interval_sec: 0,
+                origin_probe_ttl_sec: decdn_common::config::DEFAULT_ORIGIN_PROBE_TTL_SEC,
+                origin_probe_timeout_ms: decdn_common::config::DEFAULT_ORIGIN_PROBE_TIMEOUT_MS,
+                origin_probe_memo_capacity:
+                    decdn_common::config::DEFAULT_ORIGIN_PROBE_MEMO_CAPACITY,
                 eviction_high_water_pct: 90,
                 eviction_target_pct: 80,
                 eviction_per_sweep_budget: 16,
@@ -1195,6 +1199,9 @@ const fn cache_has_restart_required_field(c: &decdn_common::config::types::Cache
         user_agent,
         gc_interval_sec,
         fs_rescan_interval_sec,
+        origin_probe_ttl_sec,
+        origin_probe_timeout_ms,
+        origin_probe_memo_capacity,
         eviction_high_water_pct,
         eviction_target_pct,
         eviction_per_sweep_budget,
@@ -1222,6 +1229,11 @@ const fn cache_has_restart_required_field(c: &decdn_common::config::types::Cache
         // The rescan *cadence* needs a restart to rebuild the interval timer;
         // a reload still re-runs one rescan to pick up newly-added files.
         || fs_rescan_interval_sec.is_some()
+        // Live-origin probe memo (#1130 pt3) is built once at bring-up, so any
+        // of its knobs changing needs a restart.
+        || origin_probe_ttl_sec.is_some()
+        || origin_probe_timeout_ms.is_some()
+        || origin_probe_memo_capacity.is_some()
         || eviction_high_water_pct.is_some()
         || eviction_target_pct.is_some()
         || eviction_per_sweep_budget.is_some()
@@ -1360,6 +1372,10 @@ mod tests {
                 user_agent: decdn_cache::DEFAULT_USER_AGENT.to_string(),
                 gc_interval_sec: 0,
                 fs_rescan_interval_sec: 0,
+                origin_probe_ttl_sec: decdn_common::config::DEFAULT_ORIGIN_PROBE_TTL_SEC,
+                origin_probe_timeout_ms: decdn_common::config::DEFAULT_ORIGIN_PROBE_TIMEOUT_MS,
+                origin_probe_memo_capacity:
+                    decdn_common::config::DEFAULT_ORIGIN_PROBE_MEMO_CAPACITY,
                 eviction_high_water_pct: 90,
                 eviction_target_pct: 80,
                 eviction_per_sweep_budget: 16,

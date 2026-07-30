@@ -31,6 +31,7 @@ use crate::circuit_breaker::{
 use crate::error::{CacheError, CacheResult, OriginPullError};
 use crate::metrics::CacheMetrics;
 use crate::origin::{Origin, OriginKind, OriginRangeFetch, OriginRangeRequest};
+use crate::origin_probe::{OriginProbeMemo, Presence};
 use crate::probe_hold::ProbeHoldOutcome;
 use crate::range_pull::{AlignedRange, align_range, encode_verified_range};
 use crate::retry::{
@@ -100,6 +101,15 @@ struct Inner {
     /// content is discoverable on the first request rather than only after a
     /// warm pulls it into the store. Never includes refused/denied hashes.
     origin_held: ArcSwap<HashMap<Hash, u64>>,
+    /// Live-origin probe memo (#1130 pt3). The `origin_held` index only covers
+    /// fs enumeration ∪ pins — http/s3 do not list, so a non-pinned bucket
+    /// object is absent from it. [`CacheEngine::origin_probe_size`] falls back to
+    /// a live `HEAD`/`HeadObject` for such hashes and memoises the answer here
+    /// (positive AND negative) under `cache.origin_probe_ttl_sec`, so a probe
+    /// flood costs at most one origin round-trip per hash per TTL window rather
+    /// than one per probe. Restart-configured like `max_probe_holds`; swapped in
+    /// wholesale by [`CacheEngine::set_origin_probe_config`] at bring-up.
+    origin_probe_memo: Mutex<OriginProbeMemo>,
     /// Hashes this node refuses to serve, announce, or acquire because the
     /// operator's own `[content] denied_hashes` names them, and which a later
     /// config reload can UN-refuse (ADR 011 § Local Denylist). The governance
@@ -880,6 +890,7 @@ impl CacheEngine {
                         .collect::<HashSet<Hash>>(),
                 )),
                 origin_held: ArcSwap::from(Arc::new(HashMap::new())),
+                origin_probe_memo: Mutex::new(OriginProbeMemo::default()),
                 denied: ArcSwap::from(Arc::new(HashSet::new())),
                 chain_denied: ArcSwap::from(Arc::new(HashSet::new())),
                 evicted: Mutex::new(evicted),
@@ -1066,6 +1077,68 @@ impl CacheEngine {
             return None;
         }
         self.inner.origin_held.load().get(&hash).copied()
+    }
+
+    /// Total byte size of `hash` if a configured origin can serve it, resolved
+    /// by a **live** `HEAD`/`HeadObject`/stat and memoised (#1130 pt3). This is
+    /// the per-probe fallback for the http/s3 discovery gap: [`Self::rescan_origins`]
+    /// can only index what an origin `enumerate`s, and http/s3 enumerate to
+    /// nothing, so a non-pinned bucket object is absent from
+    /// [`Self::origin_held_size`]. Callers should consult the in-memory index
+    /// first (zero I/O) and only fall back here on its miss.
+    ///
+    /// A memo hit returns with no I/O. On a miss the origin chain is probed via
+    /// [`Self::origin_size`] under a `cache.origin_probe_timeout_ms` ceiling, and
+    /// the answer — `Present(size)` OR `Absent` — is memoised for
+    /// `cache.origin_probe_ttl_sec`. Caching the negative is deliberate: it is
+    /// what stops a random-hash probe flood from issuing a `HeadObject` per
+    /// probe. A timeout, a transport error, an unknown size, and a genuine 404
+    /// all fold to `Absent`/`None` — the safe "do not advertise" answer, which
+    /// post-#1512 is never slashable (an unservable `has_blob:false`, or a later
+    /// `NotFound` on the serve, carries only local reputation, not a bond slash).
+    ///
+    /// **Never fetches the body** — existence and size only.
+    pub async fn origin_probe_size(&self, hash: Hash) -> Option<u64> {
+        if self.refuses(hash) {
+            return None;
+        }
+        let now = Instant::now();
+        let timeout = {
+            let mut memo = self.probe_memo_lock();
+            if let Some(presence) = memo.get(hash, now) {
+                return presence.size();
+            }
+            memo.timeout()
+        };
+        // Live probe off the memo lock (never hold it across the await). A
+        // `NoOrigin` error (no origins configured), any transport error, an
+        // unknown size, or the timeout all collapse to `Absent`.
+        let presence = match tokio::time::timeout(timeout, self.origin_size(hash)).await {
+            Ok(Ok(Some(size))) => Presence::Present(size),
+            Ok(Ok(None) | Err(_)) | Err(_) => Presence::Absent,
+        };
+        self.probe_memo_lock().insert(hash, presence, now);
+        presence.size()
+    }
+
+    /// Lock the origin-probe memo, recovering a poisoned mutex rather than
+    /// panicking (the anti-panic policy) — a poisoned memo only means a prior
+    /// holder panicked mid-update, and a best-effort existence cache is safe to
+    /// keep using.
+    fn probe_memo_lock(&self) -> std::sync::MutexGuard<'_, OriginProbeMemo> {
+        self.inner
+            .origin_probe_memo
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Install the live-origin-probe configuration at runtime bring-up (#1130
+    /// pt3). `cache.*` is restart-required, so this is called once from the
+    /// runtime wiring and swaps the memo wholesale (dropping any warm entries) —
+    /// the same "set once, no threading through every test constructor" pattern
+    /// as [`Self::set_max_probe_holds`].
+    pub fn set_origin_probe_config(&self, ttl: Duration, timeout: Duration, capacity: usize) {
+        *self.probe_memo_lock() = OriginProbeMemo::new(ttl, timeout, capacity);
     }
 
     /// Swap in the live *local* denied set from `[content] denied_hashes` (ADR
@@ -4031,6 +4104,168 @@ mod tests {
                 });
             Box::pin(async move { result })
         }
+    }
+
+    /// Origin that answers `size()` (a `HEAD`/`HeadObject` stand-in) for one
+    /// hash and COUNTS the calls, so a test can prove `origin_probe_size`
+    /// memoises rather than re-probing the backend on every probe. An optional
+    /// delay exercises the per-probe timeout.
+    #[derive(Debug)]
+    struct CountingSizeOrigin {
+        hash: Hash,
+        size: u64,
+        calls: Arc<AtomicUsize>,
+        delay: Option<Duration>,
+    }
+
+    impl CountingSizeOrigin {
+        fn new(hash: Hash, size: u64) -> (Self, Arc<AtomicUsize>) {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let origin = Self {
+                hash,
+                size,
+                calls: Arc::clone(&calls),
+                delay: None,
+            };
+            (origin, calls)
+        }
+
+        fn slow(hash: Hash, size: u64, delay: Duration) -> (Self, Arc<AtomicUsize>) {
+            let (mut origin, calls) = Self::new(hash, size);
+            origin.delay = Some(delay);
+            (origin, calls)
+        }
+    }
+
+    impl Origin for CountingSizeOrigin {
+        fn kind(&self) -> OriginKind {
+            OriginKind::Http
+        }
+
+        fn fetch(
+            &self,
+            _hash: Hash,
+            _max_bytes: u64,
+        ) -> Pin<Box<dyn Future<Output = Result<OriginFetch, crate::OriginPullError>> + Send + '_>>
+        {
+            // Never exercised by the probe path (existence + size only).
+            Box::pin(async { Ok(OriginFetch::NotFound) })
+        }
+
+        fn size(
+            &self,
+            hash: Hash,
+        ) -> Pin<Box<dyn Future<Output = Result<Option<u64>, crate::OriginPullError>> + Send + '_>>
+        {
+            let matches = hash == self.hash;
+            let size = self.size;
+            let calls = Arc::clone(&self.calls);
+            let delay = self.delay;
+            Box::pin(async move {
+                // Count the *attempt* before any await, so a probe that the
+                // caller times out still registers as a backend hit.
+                calls.fetch_add(1, Ordering::SeqCst);
+                if let Some(d) = delay {
+                    tokio::time::sleep(d).await;
+                }
+                Ok(matches.then_some(size))
+            })
+        }
+    }
+
+    /// A present remote object is discovered by a live `HEAD` and the answer is
+    /// memoised: a second probe for the same hash issues NO further backend call.
+    #[tokio::test]
+    async fn origin_probe_size_hits_origin_then_memoises_positive() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let hash = Hash::new(b"remote object");
+        let (origin, calls) = CountingSizeOrigin::new(hash, 4096);
+        let engine =
+            CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 10).await?;
+
+        assert_eq!(
+            engine.origin_probe_size(hash).await,
+            Some(4096),
+            "live HEAD finds it"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "one backend HEAD");
+        assert_eq!(
+            engine.origin_probe_size(hash).await,
+            Some(4096),
+            "served from memo"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "memo hit issues no second HEAD"
+        );
+        Ok(())
+    }
+
+    /// A 404 is memoised too — the whole point of the negative cache is that a
+    /// random-hash probe flood does not re-`HeadObject` the origin every time.
+    #[tokio::test]
+    async fn origin_probe_size_memoises_absent() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let present = Hash::new(b"present");
+        let absent = Hash::new(b"absent");
+        let (origin, calls) = CountingSizeOrigin::new(present, 100);
+        let engine =
+            CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 10).await?;
+
+        assert_eq!(
+            engine.origin_probe_size(absent).await,
+            None,
+            "not in origin"
+        );
+        assert_eq!(engine.origin_probe_size(absent).await, None, "still absent");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "negative answer is cached");
+        Ok(())
+    }
+
+    /// A refused (denied/blacklisted/evicted) hash is never advertised, and the
+    /// guard short-circuits BEFORE any backend probe.
+    #[tokio::test]
+    async fn origin_probe_size_refused_never_probes() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let hash = Hash::new(b"denied object");
+        let (origin, calls) = CountingSizeOrigin::new(hash, 100);
+        let engine =
+            CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 10).await?;
+        engine.set_chain_denied_one(hash, true);
+
+        assert_eq!(
+            engine.origin_probe_size(hash).await,
+            None,
+            "refused stays hidden"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "no HEAD for a refused hash"
+        );
+        Ok(())
+    }
+
+    /// A slow origin must not stall the probe: the live HEAD is bounded by
+    /// `origin_probe_timeout_ms` and a timeout folds to `None` (safe — never
+    /// slashable post-#1512).
+    #[tokio::test]
+    async fn origin_probe_size_times_out_to_absent() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let hash = Hash::new(b"slow object");
+        let (origin, _calls) = CountingSizeOrigin::slow(hash, 100, Duration::from_millis(400));
+        let engine =
+            CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 10).await?;
+        // Tight timeout so the 400 ms origin overruns it.
+        engine.set_origin_probe_config(Duration::from_secs(15), Duration::from_millis(20), 16);
+
+        assert_eq!(
+            engine.origin_probe_size(hash).await,
+            None,
+            "a HEAD slower than the ceiling folds to absent",
+        );
+        Ok(())
     }
 
     /// `total_bytes` must sum the on-disk footprint — it is the eviction

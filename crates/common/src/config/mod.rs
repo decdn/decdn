@@ -161,6 +161,21 @@ pub const DEFAULT_GC_INTERVAL_SEC: u64 = 300;
 /// the periodic rescan (startup + reload still run one).
 pub const DEFAULT_FS_RESCAN_INTERVAL_SEC: u64 = 60;
 
+/// Default TTL in seconds for a memoised live-origin probe answer (#1130 pt3).
+/// Long enough that a burst of probes for the same object costs one
+/// `HEAD`/`HeadObject`, short enough to track an origin deletion within the
+/// probe-hold horizon.
+pub const DEFAULT_ORIGIN_PROBE_TTL_SEC: u64 = 15;
+
+/// Default per-probe ceiling in milliseconds on the live-origin
+/// `HEAD`/`HeadObject` (#1130 pt3). A slow origin must not stall the probe hot
+/// path; on overrun the probe answers `has_blob: false` and memoises the miss.
+pub const DEFAULT_ORIGIN_PROBE_TIMEOUT_MS: u64 = 2000;
+
+/// Default cap on distinct hashes in the live-origin probe memo (#1130 pt3).
+/// Bounds memo memory under a random-hash probe flood.
+pub const DEFAULT_ORIGIN_PROBE_MEMO_CAPACITY: u64 = 4096;
+
 /// Default LRU eviction driver high-water percent of `cache.cache_size_mb`
 /// (#1173, appendix-blob-cache-eviction.md § Trigger and target). Above this
 /// fraction the driver actively evicts.
@@ -1605,6 +1620,21 @@ fn resolve_cache_into(
         .and_then(|c| c.fs_rescan_interval_sec)
         .unwrap_or(DEFAULT_FS_RESCAN_INTERVAL_SEC);
 
+    // Live-origin probe memo knobs (#1130 pt3). No range checks: a `0` TTL simply
+    // memoises nothing (every probe re-HEADs), a `0` timeout is clamped to a live
+    // future by `tokio::time::timeout`, and a `0` capacity is floored to 1 by
+    // `OriginProbeMemo::new` — all degenerate-but-safe, so there is no invalid
+    // value to reject.
+    let origin_probe_ttl_sec = file
+        .and_then(|c| c.origin_probe_ttl_sec)
+        .unwrap_or(DEFAULT_ORIGIN_PROBE_TTL_SEC);
+    let origin_probe_timeout_ms = file
+        .and_then(|c| c.origin_probe_timeout_ms)
+        .unwrap_or(DEFAULT_ORIGIN_PROBE_TIMEOUT_MS);
+    let origin_probe_memo_capacity = file
+        .and_then(|c| c.origin_probe_memo_capacity)
+        .unwrap_or(DEFAULT_ORIGIN_PROBE_MEMO_CAPACITY);
+
     // LRU eviction driver knobs (#1173, appendix-blob-cache-eviction.md). Each
     // is range-checked against its structural bounds; the target/high-water
     // hysteresis gap is a cross-field invariant enforced after both resolve.
@@ -1777,6 +1807,9 @@ fn resolve_cache_into(
         user_agent,
         gc_interval_sec,
         fs_rescan_interval_sec,
+        origin_probe_ttl_sec,
+        origin_probe_timeout_ms,
+        origin_probe_memo_capacity,
         eviction_high_water_pct,
         eviction_target_pct,
         eviction_per_sweep_budget,

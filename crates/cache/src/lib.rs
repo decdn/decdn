@@ -14,6 +14,7 @@ pub mod engine;
 pub mod error;
 pub mod metrics;
 pub mod origin;
+pub mod origin_probe;
 pub mod probe_hold;
 pub mod range_pull;
 pub mod retry;

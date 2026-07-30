@@ -411,6 +411,27 @@ pub struct CacheConfig {
     /// it). Shorter intervals pick up new files faster at the cost of more
     /// directory-walk + `size()` I/O per minute.
     pub fs_rescan_interval_sec: Option<u64>,
+    /// TTL, in seconds, for a memoised live-origin probe answer (#1130 pt3).
+    /// Absent => [`crate::config::DEFAULT_ORIGIN_PROBE_TTL_SEC`] (15). A probe for
+    /// a hash absent from the `fs`-enumeration ∪ pins index falls back to a live
+    /// `HEAD`/`HeadObject` against the http/s3 origin; the answer — present-with-
+    /// size OR absent — is cached for this long so a non-pinned bucket object is
+    /// discoverable without a per-probe origin round-trip. Caching the negative
+    /// is what blunts a random-hash probe flood. Shorter TTLs track origin
+    /// deletions faster at the cost of more `HEAD` traffic.
+    pub origin_probe_ttl_sec: Option<u64>,
+    /// Per-probe ceiling, in milliseconds, on the live-origin `HEAD`/`HeadObject`
+    /// (#1130 pt3). Absent => [`crate::config::DEFAULT_ORIGIN_PROBE_TIMEOUT_MS`]
+    /// (2000). A slow origin must never stall the probe hot path; on timeout the
+    /// probe answers `has_blob: false` (safe — never slashable post-#1512) and
+    /// the miss is memoised as absent for one TTL.
+    pub origin_probe_timeout_ms: Option<u64>,
+    /// Maximum distinct hashes held in the live-origin probe memo (#1130 pt3).
+    /// Absent => [`crate::config::DEFAULT_ORIGIN_PROBE_MEMO_CAPACITY`] (4096).
+    /// Bounds memo memory under a random-hash probe flood; the cache is
+    /// best-effort, so at capacity one arbitrary entry is dropped to admit a new
+    /// answer (expired entries reclaimed first).
+    pub origin_probe_memo_capacity: Option<u64>,
     /// LRU eviction driver: percent of [`Self::cache_size_mb`] above which
     /// the driver actively evicts (#1173, appendix-blob-cache-eviction.md
     /// § Trigger and target). Absent =>
