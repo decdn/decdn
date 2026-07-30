@@ -369,7 +369,6 @@ async fn run_reactive_topup() -> anyhow::Result<()> {
         "the on-chain channel deposit must have grown to the working deposit: got {onchain}, \
          expected {WORKING_DEPOSIT_MICRO_USDC}"
     );
-
     drop(node);
     Ok(())
 }
@@ -432,6 +431,33 @@ fn topup_fetch_argv(
     keystore: &std::path::Path,
     out: &std::path::Path,
 ) -> Vec<String> {
+    topup_fetch_argv_with_deposits(
+        chain,
+        node,
+        hash,
+        data_dir,
+        keystore,
+        out,
+        INITIAL_DEPOSIT_MICRO_USDC,
+        WORKING_DEPOSIT_MICRO_USDC,
+    )
+}
+
+/// Same argv shape as [`topup_fetch_argv`], but with the initial/working deposit
+/// as parameters rather than the single-voucher-exhaustion test's fixed
+/// constants — used by the multi-interval regression below, which needs a
+/// bigger initial deposit so several intervals are delivered before exhaustion.
+#[allow(clippy::too_many_arguments)]
+fn topup_fetch_argv_with_deposits(
+    chain: &ChainFixture,
+    node: &NodeFixture,
+    hash: &Hash,
+    data_dir: &std::path::Path,
+    keystore: &std::path::Path,
+    out: &std::path::Path,
+    initial_deposit_micro_usdc: u64,
+    working_deposit_micro_usdc: u64,
+) -> Vec<String> {
     vec![
         "--hash".into(),
         hash.to_hex(),
@@ -456,8 +482,282 @@ fn topup_fetch_argv(
         "--keystore".into(),
         keystore.display().to_string(),
         "--initial-deposit-micro-usdc".into(),
-        INITIAL_DEPOSIT_MICRO_USDC.to_string(),
+        initial_deposit_micro_usdc.to_string(),
         "--working-deposit-micro-usdc".into(),
-        WORKING_DEPOSIT_MICRO_USDC.to_string(),
+        working_deposit_micro_usdc.to_string(),
     ]
+}
+
+// ---- Multi-interval reactive top-up: no double-pay, no under-pay ----
+//
+// The test above bakes the channel's very FIRST voucher into `InsufficientDeposit`
+// on a fresh channel — no prior accepted voucher exists, so this is the shallowest
+// possible exercise of the reactive branch. This test drives the case that
+// actually motivated the fix: several whole voucher intervals get delivered AND
+// ACCEPTED first, and only the NEXT one exhausts the deposit.
+//
+// Before the `genuine_exhaustion` fix (client-pull's advancement-based bundle
+// check), this scenario was unreachable end-to-end: once any voucher has been
+// accepted, the node attaches a `WatermarkBundle` to every subsequent
+// watermark-gated rejection it can (`watermark_bundle_for_reject`), including a
+// perfectly ordinary exhaustion — and the old `genuine_exhaustion` treated ANY
+// authenticated bundle as proof of a healable desync, regardless of whether it
+// told the client anything new. That routed real exhaustion into the resync path
+// (which cannot fix a genuinely short deposit) instead of the top-up path, and the
+// fetch failed outright after burning `MAX_RESUME_ATTEMPTS`. The fix distinguishes
+// "bundle reports something AHEAD of what we already hold" (desync — reseed) from
+// "bundle just echoes our own already-committed watermark" (not a desync — the
+// exhaustion is real), by comparing the bundle's nonce against `ledger.committed()`.
+//
+// This also exercises the OTHER half of the fix: resuming at the PAID frontier
+// (`fetch_start_offset + (committed.bytes_now - committed.bytes_at_start)`)
+// rather than the raw on-disk length. The accepted intervals' bytes are both
+// PAID and on disk, so paid-frontier and on-disk-length agree for them; only the
+// small final (rejected) interval's bytes are on disk but unpaid, and the fix
+// must re-fetch and pay for exactly that tail — no more (double-pay), no less
+// (under-pay).
+
+const MULTI_WORKING_DEPOSIT_MICRO_USDC: u64 = 40_000_000; // plenty to finish the blob
+// Must be >= working_deposit / LOW_WATER_DIVISOR (8_000_000 at the current
+// divisor of 5): this test pre-opens and pre-records the channel itself, so
+// `open_or_reuse`'s reuse-time auto-refill (#1103) sees an EXISTING channel on
+// the CLI's one and only invocation. Below that threshold, `open_or_reuse`
+// tops it up to the working deposit before the stream even opens — pre-empting
+// the REACTIVE (mid-stream) top-up this test means to exercise.
+//
+// Covers exactly two whole voucher intervals at the daemon's UNCONFIGURED
+// default voucher interval — 4 MiB
+// (`decdn_common::config::DEFAULT_VOUCHER_INTERVAL_MB`, distinct from the
+// client-side wire fallback of the same name in `decdn_protocol`, which is 1)
+// — and `MULTI_RATE_PER_MB` (2 * 8_000_000 = 16_000_000), so the third — a
+// partial tail, since the blob is just over two intervals — is the one that
+// genuinely exhausts the deposit.
+//
+// The interval is left at the daemon's default deliberately, rather than
+// configured down to something smaller: overriding it requires a daemon
+// RESTART (`voucher_interval_mb` is read once at bring-up), and restarting
+// between the channel's on-chain open and this test's later on-chain `topUp`
+// was observed to make the daemon's settlement watcher stop applying
+// `ChannelToppedUp` events to its tracked channel state — the admin API kept
+// reporting the pre-top-up deposit indefinitely, well past any poll interval,
+// causing the resumed voucher to be rejected forever. That looks like a real,
+// separate bug in the watcher/restart interaction, out of scope for this fix;
+// avoiding any daemon restart in this test sidesteps it entirely (mirroring
+// the single-voucher test above, which also never restarts the daemon and
+// reliably sees its own top-up applied).
+const MULTI_INITIAL_DEPOSIT_MICRO_USDC: u64 = 16_000_000;
+const MULTI_RATE_PER_MB: u64 = 2_000_000; // 2 USDC/MB, same as the single-voucher test
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fetch_topup_after_several_delivered_intervals_does_not_double_pay() -> anyhow::Result<()> {
+    tokio::time::timeout(OVERALL_TIMEOUT, Box::pin(run_multi_interval_topup()))
+        .await
+        .context("multi-interval reactive top-up e2e exceeded the overall timeout")??;
+    Ok(())
+}
+
+/// A deterministic blob spanning just over two whole 4 MiB voucher intervals
+/// (the daemon's default cadence), so two full intervals are delivered and
+/// accepted before a small partial third exhausts
+/// `MULTI_INITIAL_DEPOSIT_MICRO_USDC`.
+fn make_multi_interval_blob() -> Vec<u8> {
+    let mut v = vec![0u8; 9 * 1024 * 1024 + 777];
+    let mut x: u32 = 0x2468_ac13;
+    for b in &mut v {
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        *b = x.to_le_bytes().first().copied().unwrap_or(0);
+    }
+    v
+}
+
+async fn run_multi_interval_topup() -> anyhow::Result<()> {
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .try_init();
+
+    ensure_decdn_cli_built()?;
+    let chain = ChainFixture::launch().await?;
+
+    // A blob spanning just over two whole 4 MiB voucher intervals, so two full
+    // intervals get delivered and accepted before a small partial tail
+    // exhausts the deposit.
+    let blob = make_multi_interval_blob();
+    let blob_hash = Hash::new(&blob);
+    let (node, hash) = NodeFixture::launch(&chain, "US", &blob).await?;
+    anyhow::ensure!(
+        hash == blob_hash,
+        "seeded blob hash mismatch: {hash} vs {blob_hash}"
+    );
+    node.set_rate_per_mb(MULTI_RATE_PER_MB).await?;
+
+    let client_dir = tempfile::tempdir().context("client tempdir")?;
+    #[cfg(unix)]
+    std::fs::set_permissions(
+        client_dir.path(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .context("chmod client dir 0o700")?;
+    eth_identity::generate_and_persist(client_dir.path(), TOPUP_KEYSTORE_PASSWORD, false)
+        .context("generate buyer keystore")?;
+    let keystore = eth_identity::keystore_path(client_dir.path());
+    let buyer =
+        eth_identity::load_signer(&keystore, TOPUP_KEYSTORE_PASSWORD).context("load buyer")?;
+    let buyer_addr = buyer.address();
+    chain.fund_eth(buyer_addr, 100).await?;
+    chain
+        .mint_usdc(
+            buyer_addr,
+            U256::from(MULTI_WORKING_DEPOSIT_MICRO_USDC) * U256::from(4u64),
+        )
+        .await
+        .context("mint buyer USDC")?;
+
+    // Pre-open the channel ourselves and wait for the node to observe it,
+    // rather than letting the CLI's own `open_or_reuse` race the node's chain
+    // watcher the way `run_topup_fetch_until_ready` exists to ride out for the
+    // OTHER test in this file. That retry loop re-invokes the WHOLE `decdn
+    // fetch` process on ANY failure, including ones unrelated to the race —
+    // and a second invocation resumes from whatever the first one flushed via
+    // the function-ENTRY `resume_offset(existing_partial_len(...))` path
+    // (unrelated to this fix, and pre-existing), which would corrupt the very
+    // cost measurement this test exists to take. Pre-clearing the race keeps
+    // this test to exactly ONE `decdn fetch` invocation, so the reactive
+    // top-up branch is the only thing that can move the byte offset.
+    let voucher_dom = voucher_domain(chain.chain_id(), chain.addrs().payment_channel);
+    ensure_allowance(
+        &chain.provider_for(&buyer),
+        chain.usdc(),
+        buyer_addr,
+        chain.addrs().payment_channel,
+        None,
+    )
+    .await
+    .context("approve PaymentChannel")?;
+    let pc = PaymentChannel::new(chain.addrs().payment_channel, chain.provider_for(&buyer));
+    let min_deposit = pc.minDeposit().call().await.context("read minDeposit")?;
+    let initial_deposit = U256::from(MULTI_INITIAL_DEPOSIT_MICRO_USDC).max(min_deposit);
+    let opened = open_channel(
+        &pc,
+        Arc::new(buyer.clone()),
+        &voucher_dom,
+        chain.usdc(),
+        buyer_addr,
+        node.operator_addr(),
+        initial_deposit,
+        // ZERO => self-signing (the funder signs its own vouchers).
+        Address::ZERO,
+    )
+    .await
+    .context("open buyer channel")?;
+    {
+        // Scoped: the CLI subprocess below opens its OWN handle on the same
+        // redb file, and the store enforces single-writer access — this
+        // handle must be dropped before spawning `decdn fetch`.
+        let store = RedbBuyerChannelStore::open(client_dir.path()).context("open buyer store")?;
+        store.record(&opened.state).context("record channel")?;
+    }
+    node.wait_for_channel(opened.state.channel_id, Duration::from_secs(60))
+        .await
+        .context("wait for node to observe the pre-opened channel")?;
+
+    let out = client_dir.path().join("blob.bin");
+    let args = topup_fetch_argv_with_deposits(
+        &chain,
+        &node,
+        &blob_hash,
+        client_dir.path(),
+        &keystore,
+        &out,
+        MULTI_INITIAL_DEPOSIT_MICRO_USDC,
+        MULTI_WORKING_DEPOSIT_MICRO_USDC,
+    );
+
+    let before = billed_bytes(client_dir.path(), node.operator_addr())?;
+    anyhow::ensure!(
+        before == 0,
+        "no bytes should be billed before the first fetch"
+    );
+
+    // A single invocation — see the comment above on why this test avoids
+    // `run_topup_fetch_until_ready`'s blind cross-invocation retry.
+    let output =
+        tokio::process::Command::from(decdn_command(client_dir.path(), TOPUP_KEYSTORE_PASSWORD)?)
+            .arg("fetch")
+            .args(&args)
+            .output()
+            .await
+            .context("spawn decdn fetch")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "decdn fetch failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let got = std::fs::read(&out).context("read output")?;
+    anyhow::ensure!(
+        got == blob,
+        "the fetch must still complete successfully after the reactive top-up: got {} bytes, \
+         expected {}",
+        got.len(),
+        blob.len()
+    );
+    let partial = client_dir.path().join("blob.bin.partial");
+    anyhow::ensure!(
+        !partial.exists(),
+        "the .partial scratch file must be promoted away, not left beside --output: {}",
+        partial.display()
+    );
+
+    // The money-correctness assertion: the channel's persisted cumulative
+    // voucher watermark (`last_amount` — the off-chain figure a `settleChannel`
+    // would later claim on-chain; the channel is never closed in this test, so
+    // there is no on-chain `claimedAmount` to read yet) must be approximately
+    // the blob's real cost — delivered ONCE — never `blob_cost +
+    // already_delivered_prefix` (double-pay) and never LESS than the true cost
+    // (under-pay). This is the SAME `ceil(bytes * rate / MB)` formula
+    // `crates/cli/src/commands/fetch.rs`'s reactive branch (and the node's own
+    // `next_voucher`) use to price a voucher, applied to the whole blob rather
+    // than one interval.
+    const MB_BYTES: u64 = 1024 * 1024;
+    let blob_len = u64::try_from(blob.len()).context("blob length as u64")?;
+    let true_cost = U256::from(blob_len)
+        .saturating_mul(U256::from(MULTI_RATE_PER_MB))
+        .div_ceil(U256::from(MB_BYTES));
+
+    let store = RedbBuyerChannelStore::open(client_dir.path()).context("open buyer store")?;
+    let persisted = store
+        .get_by_provider(node.operator_addr())
+        .context("read persisted channel")?
+        .ok_or_else(|| anyhow::anyhow!("buyer channel not recorded after fetch"))?;
+
+    // Bao's wire framing carries a small proof overhead on top of the content
+    // bytes `true_cost` is computed from (ADR 038) — a fraction that shrinks
+    // with blob size and is well under 1% here — so allow a little headroom
+    // above `true_cost` without allowing anywhere near a second full payment
+    // for the already-delivered prefix.
+    let generous_ceiling =
+        true_cost + true_cost / U256::from(20u64) + U256::from(MULTI_RATE_PER_MB);
+    anyhow::ensure!(
+        persisted.last_amount <= generous_ceiling,
+        "the channel must not have double-paid the prefix delivered before the top-up: \
+         settled {} µUSDC, but the blob's true cost at {MULTI_RATE_PER_MB} µUSDC/MB is only \
+         {true_cost} µUSDC (ceiling with wire-overhead headroom: {generous_ceiling}) — a \
+         double-pay bug would settle at roughly twice that",
+        persisted.last_amount
+    );
+    // And a sanity floor: the fetch really did pay for (approximately) the
+    // whole blob, not merely avoid overpaying by paying too little (the
+    // under-pay hole a naive on-disk-length resume would have opened).
+    anyhow::ensure!(
+        persisted.last_amount >= true_cost.saturating_sub(U256::from(MULTI_RATE_PER_MB)),
+        "the channel must have paid for (approximately) the full blob: settled {} µUSDC, \
+         expected close to {true_cost} µUSDC — under-paying this much would mean the \
+         already-delivered prefix was never billed",
+        persisted.last_amount
+    );
+
+    drop(node);
+    Ok(())
 }

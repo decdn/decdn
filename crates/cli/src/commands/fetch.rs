@@ -859,6 +859,20 @@ where
         amount: ctx.prior_amount,
     }));
 
+    // Reactive graduation (#1497): the wire offset and channel-cumulative
+    // bytes-delivered baseline THIS blob's fetch started from, captured once,
+    // before the attempt loop below ever runs. The reactive top-up branch uses
+    // these to recover the PAID frontier of this blob — `fetch_start_offset +
+    // (ledger.committed().bytes - fetch_start_committed_bytes)` — which is safe
+    // to resume from because it counts only bytes an ACCEPTED voucher actually
+    // covered, unlike the on-disk file length (which can run ahead of payment:
+    // the credit window, ADR 003 §Credit window, lets the node stream up to a
+    // full interval's worth of content before the voucher that pays for it is
+    // even due, and `decode_to_sink` flushes and verifies those bytes to disk
+    // as they arrive, independent of whether that voucher is later accepted).
+    let fetch_start_offset = byte_offset;
+    let fetch_start_committed_bytes = ledger.committed().bytes;
+
     // Wallet-less resume (#1481): a voucher rejection carrying a bundle signed by
     // our OWN key means our persisted watermark had fallen behind what the node
     // holds — reseed from it and reopen. The buffered path gets this from
@@ -984,34 +998,34 @@ where
         }
         // Reactive graduation (#1497): a genuine mid-fetch ceiling hit —
         // validated against our OWN ledger, not the node's word — tops the
-        // channel up toward `working_deposit` and resumes at the same
-        // `byte_offset`. Desync is handled above by the reseed path; a node
-        // crying poverty while our ledger still has headroom falls through to
-        // the terminal error below (we refuse to fund a bogus claim), as does a
-        // delegate key that cannot fund (`top_up_decision` -> `Exhausted`).
+        // channel up toward `working_deposit` and resumes at the PAID frontier.
+        // Desync is handled above by the reseed path (`genuine_exhaustion` now
+        // gates on whether an attached `WatermarkBundle` ADVANCES past
+        // `ledger.committed()`, not merely on its presence — a channel that has
+        // ever had a voucher accepted gets a bundle on every watermark-gated
+        // rejection thereafter, including a genuinely-exhausted one, so bundle
+        // presence alone is not evidence of desync); a node crying poverty while
+        // our ledger still has headroom falls through to the terminal error
+        // below (we refuse to fund a bogus claim), as does a delegate key that
+        // cannot fund (`top_up_decision` -> `Exhausted`, handled explicitly
+        // below rather than silently falling through).
         //
         // The next voucher's true cost is `ceil(interval_bytes * quoted_rate_per_mb
         // / 1 MiB)` — the exact formula `ChannelLedger`'s own `next_voucher` uses
         // — from the QUOTED rate/cadence on the most recent successful open, never
         // the buyer's `max_rate_per_mb` ceiling (that bounds what we're willing to
         // pay, not what the next voucher actually costs).
-        let remaining = ctx.deposit.saturating_sub(ledger.committed().amount);
+        let committed = ledger.committed();
+        let remaining = ctx.deposit.saturating_sub(committed.amount);
         let next_cost = U256::from(voucher_interval_bytes)
             .saturating_mul(U256::from(quoted_rate_per_mb))
             .div_ceil(U256::from(MB_BYTES));
         if topups < decdn_client_pull::MAX_TOPUP_ATTEMPTS
             && working_deposit > U256::ZERO
-            && decdn_client_pull::genuine_exhaustion(
-                &err,
-                ctx,
-                ledger.committed(),
-                remaining,
-                next_cost,
-            )
+            && decdn_client_pull::genuine_exhaustion(&err, ctx, committed, remaining, next_cost)
         {
-            let is_funder = store
-                .get_by_provider(provider)?
-                .is_some_and(|state| state.funder == self_address);
+            let funder = store.get_by_provider(provider)?.map(|state| state.funder);
+            let is_funder = funder.is_some_and(|funder| funder == self_address);
             let additional = working_deposit.saturating_sub(remaining);
             match top_up_decision(additional, is_funder) {
                 TopUpDecision::TopUp(additional) => {
@@ -1037,11 +1051,58 @@ where
                         decdn_client_pull::MAX_TOPUP_ATTEMPTS
                     );
                     topups += 1;
+                    // Resume at the PAID frontier of this blob, NOT the raw
+                    // on-disk length: `existing_partial_len` answers "how much
+                    // verified content is on disk", but the credit window
+                    // (ADR 003 §Credit window) lets the node stream — and
+                    // `decode_to_sink` flush and bao-verify — a full interval's
+                    // worth of content before the voucher that pays for it is
+                    // even due. The voucher that just got rejected covers
+                    // exactly the bytes still unpaid past `committed`, so
+                    // nothing between `fetch_start_offset` and the true paid
+                    // frontier was ever accepted — using the on-disk length
+                    // here would skip billing for it entirely (an under-pay /
+                    // free-bandwidth hole), while leaving `byte_offset`
+                    // unadvanced (the original bug) would re-serve and re-pay
+                    // for whatever WAS already accepted.
+                    //
+                    // `ledger.committed().bytes` only ever advances by bytes an
+                    // ACCEPTED voucher covered, and `fetch_start_committed_bytes`
+                    // is the channel-cumulative baseline at the moment THIS
+                    // blob's fetch began — so the delta between them is exactly
+                    // how many of THIS blob's bytes are paid for, and adding
+                    // that to `fetch_start_offset` recovers the in-blob paid
+                    // frontier. The on-disk file is always at least this long
+                    // (bao decoding always leads payment, never lags it), so
+                    // `[paid_frontier, on_disk_len)` — re-fetched and paid once
+                    // on the next attempt — is never negative and never skips
+                    // unpaid content.
+                    let paid_bytes_this_blob =
+                        committed.bytes.saturating_sub(fetch_start_committed_bytes);
+                    let paid_frontier = fetch_start_offset
+                        .saturating_add(u64::try_from(paid_bytes_this_blob).unwrap_or(u64::MAX));
+                    byte_offset = paid_frontier;
                     continue;
                 }
-                // Not the funder, or nothing left to add: fall through to the
-                // terminal error below.
-                TopUpDecision::Exhausted | TopUpDecision::NotNeeded => {}
+                TopUpDecision::Exhausted => {
+                    // This key only signs vouchers (a publisher-pays delegate,
+                    // #1481) — it is not the on-chain channel funder and
+                    // `topUp` is funder-only (`PaymentChannel.sol`); attempting
+                    // it would just revert. Fail fast and terminally with an
+                    // actionable message instead of looping into the resync
+                    // path below (which cannot heal a genuine, non-desync
+                    // exhaustion) or letting an opaque on-chain revert surface.
+                    let funder_display =
+                        funder.map_or_else(|| "<unknown>".to_string(), |f| f.to_string());
+                    return Err(anyhow::anyhow!(
+                        "channel exhausted mid-fetch: this key ({self_address}) only signs \
+                         vouchers and is not the channel's funder ({funder_display}); it \
+                         cannot top up — ask the funder to raise the deposit"
+                    ));
+                }
+                // Nothing left to add (deposit already at/above the working
+                // target): fall through to the terminal error below.
+                TopUpDecision::NotNeeded => {}
             }
         }
         if attempt >= decdn_client_pull::MAX_RESUME_ATTEMPTS {
