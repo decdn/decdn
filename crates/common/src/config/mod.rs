@@ -83,11 +83,16 @@ const MIN_EVENT_POLL_INTERVAL_MS: u64 = 250;
 /// At this size the ~$0.10 `withdraw` gas is a few percent of the redeemed
 /// amount while bounding unsettled exposure to ~1 USDC per channel (#327).
 const DEFAULT_REDEEM_THRESHOLD_MICRO_USDC: u64 = 1_000_000;
-/// Default buyer-side channel deposit: 10 USDC (`10_000_000` `µUSDC`). ADR 003
-/// § Deposit Economics recommends a 10 USDC practical minimum (gas overhead
-/// ~2.3%); the on-chain `minDeposit` floor still applies and the resolved value
-/// is clamped up to it at open time (#744).
-const DEFAULT_BUYER_DEPOSIT_MICRO_USDC: u64 = 10_000_000;
+/// Default first-contact `openChannel` deposit: 0.5 USDC (`500_000` `µUSDC`).
+/// Kept small so an unproven node holds little of the buyer's capital before
+/// it has served verified bytes.
+const DEFAULT_BUYER_INITIAL_DEPOSIT_MICRO_USDC: u64 = 500_000;
+/// Default refill target every `topUp` restores toward: 10 USDC
+/// (`10_000_000` `µUSDC`). ADR 003 § Deposit Economics recommends a 10 USDC
+/// practical minimum (gas overhead ~2.3%); the on-chain `minDeposit` floor
+/// still applies and the resolved value is clamped up to it at open time
+/// (#744).
+const DEFAULT_BUYER_WORKING_DEPOSIT_MICRO_USDC: u64 = 10_000_000;
 /// Default interval between outgoing `NodeAnnounce` messages (ADR 001).
 const DEFAULT_ANNOUNCE_INTERVAL_SEC: u64 = 60;
 /// Default peer-table entry TTL after which a stale entry is evicted.
@@ -1406,19 +1411,33 @@ fn resolve_blockchain_into(
         },
     );
 
-    let buyer_deposit_micro_usdc = file
-        .and_then(|b| b.buyer_deposit_micro_usdc)
-        .unwrap_or(DEFAULT_BUYER_DEPOSIT_MICRO_USDC);
-    // A `0` buyer deposit would open dust channels (and revert below the
-    // on-chain `minDeposit` floor). Reject it; the on-chain floor is the
-    // authority on the lower bound, but a configured 0 is always an operator
-    // mistake worth catching at load time.
+    let buyer_initial_deposit_micro_usdc = file
+        .and_then(|b| b.buyer_initial_deposit_micro_usdc)
+        .unwrap_or(DEFAULT_BUYER_INITIAL_DEPOSIT_MICRO_USDC);
     bag.check_with(
-        buyer_deposit_micro_usdc > 0,
-        "blockchain.buyer_deposit_micro_usdc",
+        buyer_initial_deposit_micro_usdc > 0,
+        "blockchain.buyer_initial_deposit_micro_usdc",
         || {
-            "blockchain.buyer_deposit_micro_usdc must be > 0 (a 0 deposit opens \
+            "blockchain.buyer_initial_deposit_micro_usdc must be > 0 (a 0 deposit opens \
              dust channels and reverts below the on-chain minDeposit floor)"
+                .to_string()
+        },
+    );
+    let buyer_working_deposit_micro_usdc = file
+        .and_then(|b| b.buyer_working_deposit_micro_usdc)
+        .unwrap_or(DEFAULT_BUYER_WORKING_DEPOSIT_MICRO_USDC);
+    // `0` is the explicit "never top up" sentinel (a spent channel errors rather
+    // than refilling). Any nonzero working target below the initial deposit is an
+    // operator mistake: the refill target must not be smaller than what a fresh
+    // open already escrows, or the very first refill would shrink the channel.
+    bag.check_with(
+        buyer_working_deposit_micro_usdc == 0
+            || buyer_working_deposit_micro_usdc >= buyer_initial_deposit_micro_usdc,
+        "blockchain.buyer_working_deposit_micro_usdc",
+        || {
+            "blockchain.buyer_working_deposit_micro_usdc must be 0 (disable top-up) or \
+             >= blockchain.buyer_initial_deposit_micro_usdc (the refill target cannot be \
+             smaller than the initial open deposit)"
                 .to_string()
         },
     );
@@ -1479,7 +1498,8 @@ fn resolve_blockchain_into(
         event_poll_interval_ms,
         rate_bounds_poll_interval_sec,
         redeem_threshold_micro_usdc,
-        buyer_deposit_micro_usdc,
+        buyer_initial_deposit_micro_usdc,
+        buyer_working_deposit_micro_usdc,
         buyer_max_approve,
         settlement_auto_threshold_micro_usdc,
         settlement_auto_by_voucher_nonce_span,
@@ -8396,7 +8416,8 @@ swap_pool_address = \"0xPool\"
             event_poll_interval_ms: None,
             rate_bounds_poll_interval_sec: None,
             redeem_threshold_micro_usdc: None,
-            buyer_deposit_micro_usdc: None,
+            buyer_initial_deposit_micro_usdc: None,
+            buyer_working_deposit_micro_usdc: None,
             buyer_max_approve: None,
             settlement_auto_threshold_micro_usdc: None,
             settlement_auto_by_voucher_nonce_span: None,
@@ -8434,7 +8455,8 @@ swap_pool_address = \"0xPool\"
             event_poll_interval_ms: None,
             rate_bounds_poll_interval_sec: None,
             redeem_threshold_micro_usdc: None,
-            buyer_deposit_micro_usdc: None,
+            buyer_initial_deposit_micro_usdc: None,
+            buyer_working_deposit_micro_usdc: None,
             buyer_max_approve: None,
             settlement_auto_threshold_micro_usdc: None,
             settlement_auto_by_voucher_nonce_span: None,
@@ -8867,7 +8889,8 @@ swap_pool_address = \"0xPool\"
             event_poll_interval_ms: None,
             rate_bounds_poll_interval_sec: None,
             redeem_threshold_micro_usdc: None,
-            buyer_deposit_micro_usdc: None,
+            buyer_initial_deposit_micro_usdc: None,
+            buyer_working_deposit_micro_usdc: None,
             buyer_max_approve: None,
             settlement_auto_threshold_micro_usdc: None,
             settlement_auto_by_voucher_nonce_span: None,
@@ -8916,7 +8939,8 @@ swap_pool_address = \"0xPool\"
             event_poll_interval_ms: None,
             rate_bounds_poll_interval_sec: None,
             redeem_threshold_micro_usdc: Some(0),
-            buyer_deposit_micro_usdc: None,
+            buyer_initial_deposit_micro_usdc: None,
+            buyer_working_deposit_micro_usdc: None,
             buyer_max_approve: None,
             settlement_auto_threshold_micro_usdc: None,
             settlement_auto_by_voucher_nonce_span: None,
@@ -8964,7 +8988,8 @@ swap_pool_address = \"0xPool\"
             event_poll_interval_ms: None,
             rate_bounds_poll_interval_sec: None,
             redeem_threshold_micro_usdc: None,
-            buyer_deposit_micro_usdc: None,
+            buyer_initial_deposit_micro_usdc: None,
+            buyer_working_deposit_micro_usdc: None,
             buyer_max_approve: None,
             settlement_auto_threshold_micro_usdc: Some(0),
             settlement_auto_by_voucher_nonce_span: None,
@@ -9012,7 +9037,8 @@ swap_pool_address = \"0xPool\"
             event_poll_interval_ms: None,
             rate_bounds_poll_interval_sec: None,
             redeem_threshold_micro_usdc: None,
-            buyer_deposit_micro_usdc: None,
+            buyer_initial_deposit_micro_usdc: None,
+            buyer_working_deposit_micro_usdc: None,
             buyer_max_approve: None,
             settlement_auto_threshold_micro_usdc: None,
             settlement_auto_by_voucher_nonce_span: Some(0),
@@ -9083,7 +9109,8 @@ swap_pool_address = \"0xPool\"
             event_poll_interval_ms: None,
             rate_bounds_poll_interval_sec: None,
             redeem_threshold_micro_usdc: None,
-            buyer_deposit_micro_usdc: None,
+            buyer_initial_deposit_micro_usdc: None,
+            buyer_working_deposit_micro_usdc: None,
             buyer_max_approve: None,
             settlement_auto_threshold_micro_usdc: Some(50_000_000),
             settlement_auto_by_voucher_nonce_span: Some(1_000),
@@ -9130,7 +9157,8 @@ swap_pool_address = \"0xPool\"
             event_poll_interval_ms: None,
             rate_bounds_poll_interval_sec: None,
             redeem_threshold_micro_usdc: None,
-            buyer_deposit_micro_usdc: None,
+            buyer_initial_deposit_micro_usdc: None,
+            buyer_working_deposit_micro_usdc: None,
             buyer_max_approve: None,
             settlement_auto_threshold_micro_usdc: None,
             settlement_auto_by_voucher_nonce_span: None,
@@ -9172,7 +9200,8 @@ swap_pool_address = \"0xPool\"
             event_poll_interval_ms: None,
             rate_bounds_poll_interval_sec: None,
             redeem_threshold_micro_usdc: None,
-            buyer_deposit_micro_usdc: None,
+            buyer_initial_deposit_micro_usdc: None,
+            buyer_working_deposit_micro_usdc: None,
             buyer_max_approve: None,
             settlement_auto_threshold_micro_usdc: None,
             settlement_auto_by_voucher_nonce_span: None,
@@ -9214,6 +9243,169 @@ swap_pool_address = \"0xPool\"
             resolved.rpc_watchdog_interval_sec,
             DEFAULT_RPC_WATCHDOG_INTERVAL_SEC
         );
+        Ok(())
+    }
+
+    #[test]
+    fn buyer_initial_deposit_zero_is_rejected() -> anyhow::Result<()> {
+        let dir = data_dir_with_keystore()?;
+        let cli = BlockchainArgs {
+            origin_assignment_address: None,
+            publisher_registry_address: None,
+            rpc_url: Some("https://example/rpc".to_string()),
+            eth_keystore: None,
+            keystore_password_file: None,
+            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            capacity_bond_address: Some(GOOD_ADDR.to_string()),
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            content_blacklist_address: None,
+            chain_id: None,
+        };
+        let file = types::BlockchainConfig {
+            content_blacklist_poll_interval_sec: None,
+            origin_assignment_address: None,
+            publisher_registry_address: None,
+            rpc_url: None,
+            eth_keystore: None,
+            payment_channel_address: None,
+            capacity_bond_address: None,
+            rpc_watchdog_interval_sec: None,
+            event_poll_interval_ms: None,
+            rate_bounds_poll_interval_sec: None,
+            redeem_threshold_micro_usdc: None,
+            buyer_initial_deposit_micro_usdc: Some(0),
+            buyer_working_deposit_micro_usdc: None,
+            buyer_max_approve: None,
+            settlement_auto_threshold_micro_usdc: None,
+            settlement_auto_by_voucher_nonce_span: None,
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            slash_appeal_address: None,
+            content_blacklist_address: None,
+            chain_id: None,
+            ..Default::default()
+        };
+        let Err(err) = resolve_blockchain(&cli, Some(&file), dir.path()) else {
+            anyhow::bail!("expected error when buyer initial deposit is 0");
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("blockchain.buyer_initial_deposit_micro_usdc"),
+            "error should name the field: {msg}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn buyer_working_deposit_below_initial_is_rejected() -> anyhow::Result<()> {
+        let dir = data_dir_with_keystore()?;
+        let cli = BlockchainArgs {
+            origin_assignment_address: None,
+            publisher_registry_address: None,
+            rpc_url: Some("https://example/rpc".to_string()),
+            eth_keystore: None,
+            keystore_password_file: None,
+            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            capacity_bond_address: Some(GOOD_ADDR.to_string()),
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            content_blacklist_address: None,
+            chain_id: None,
+        };
+        let file = types::BlockchainConfig {
+            content_blacklist_poll_interval_sec: None,
+            origin_assignment_address: None,
+            publisher_registry_address: None,
+            rpc_url: None,
+            eth_keystore: None,
+            payment_channel_address: None,
+            capacity_bond_address: None,
+            rpc_watchdog_interval_sec: None,
+            event_poll_interval_ms: None,
+            rate_bounds_poll_interval_sec: None,
+            redeem_threshold_micro_usdc: None,
+            buyer_initial_deposit_micro_usdc: Some(2_000_000),
+            buyer_working_deposit_micro_usdc: Some(1_000_000),
+            buyer_max_approve: None,
+            settlement_auto_threshold_micro_usdc: None,
+            settlement_auto_by_voucher_nonce_span: None,
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            slash_appeal_address: None,
+            content_blacklist_address: None,
+            chain_id: None,
+            ..Default::default()
+        };
+        let Err(err) = resolve_blockchain(&cli, Some(&file), dir.path()) else {
+            anyhow::bail!("expected error when working deposit is below initial deposit");
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("blockchain.buyer_working_deposit_micro_usdc"),
+            "error should name the field: {msg}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn buyer_working_deposit_zero_disables_topup_and_resolves() -> anyhow::Result<()> {
+        let dir = data_dir_with_keystore()?;
+        let cli = BlockchainArgs {
+            origin_assignment_address: None,
+            publisher_registry_address: None,
+            rpc_url: Some("https://example/rpc".to_string()),
+            eth_keystore: None,
+            keystore_password_file: None,
+            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            capacity_bond_address: Some(GOOD_ADDR.to_string()),
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            content_blacklist_address: Some(GOOD_ADDR.to_string()),
+            chain_id: None,
+        };
+        let file = types::BlockchainConfig {
+            content_blacklist_poll_interval_sec: None,
+            origin_assignment_address: None,
+            publisher_registry_address: None,
+            rpc_url: None,
+            eth_keystore: None,
+            payment_channel_address: None,
+            capacity_bond_address: None,
+            rpc_watchdog_interval_sec: None,
+            event_poll_interval_ms: None,
+            rate_bounds_poll_interval_sec: None,
+            redeem_threshold_micro_usdc: None,
+            buyer_initial_deposit_micro_usdc: Some(500_000),
+            buyer_working_deposit_micro_usdc: Some(0),
+            buyer_max_approve: None,
+            settlement_auto_threshold_micro_usdc: None,
+            settlement_auto_by_voucher_nonce_span: None,
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            slash_appeal_address: None,
+            content_blacklist_address: None,
+            chain_id: None,
+            ..Default::default()
+        };
+        let resolved = resolve_blockchain(&cli, Some(&file), dir.path())?;
+        assert_eq!(resolved.buyer_initial_deposit_micro_usdc, 500_000);
+        assert_eq!(resolved.buyer_working_deposit_micro_usdc, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn buyer_deposits_default_when_absent() -> anyhow::Result<()> {
+        let dir = data_dir_with_keystore()?;
+        let cli = BlockchainArgs {
+            origin_assignment_address: None,
+            publisher_registry_address: None,
+            rpc_url: Some("https://example/rpc".to_string()),
+            eth_keystore: None,
+            keystore_password_file: None,
+            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            capacity_bond_address: Some(GOOD_ADDR.to_string()),
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            content_blacklist_address: Some(GOOD_ADDR.to_string()),
+            chain_id: None,
+        };
+        let resolved = resolve_blockchain(&cli, None, dir.path())?;
+        assert_eq!(resolved.buyer_initial_deposit_micro_usdc, 500_000);
+        assert_eq!(resolved.buyer_working_deposit_micro_usdc, 10_000_000);
         Ok(())
     }
 

@@ -231,7 +231,7 @@ pub(crate) fn resolve_chain(
 
     let deposit = U256::from(
         args.deposit_micro_usdc
-            .or_else(|| bc.and_then(|b| b.buyer_deposit_micro_usdc))
+            .or_else(|| bc.and_then(|b| b.buyer_working_deposit_micro_usdc))
             .unwrap_or(DEFAULT_DEPOSIT_MICRO_USDC),
     );
     // Client default: exact (deposit-sized) USDC approval, not an unlimited
@@ -1802,7 +1802,7 @@ mod tests {
     #[test]
     fn config_fills_unset_flags_and_defaults() {
         let file = config(
-            "[blockchain]\nrpc_url = \"http://config:8545\"\npayment_channel_address = \"0x3333333333333333333333333333333333333333\"\nslash_judge_address = \"0x4444444444444444444444444444444444444444\"\nbuyer_deposit_micro_usdc = 5000000\n",
+            "[blockchain]\nrpc_url = \"http://config:8545\"\npayment_channel_address = \"0x3333333333333333333333333333333333333333\"\nslash_judge_address = \"0x4444444444444444444444444444444444444444\"\nbuyer_initial_deposit_micro_usdc = 500000\nbuyer_working_deposit_micro_usdc = 5000000\n",
         );
         let r = resolve_chain(&common(), &file).unwrap();
         assert_eq!(r.rpc_url, "http://config:8545");

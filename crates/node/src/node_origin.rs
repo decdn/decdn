@@ -179,7 +179,7 @@ pub struct NodeOriginConfig {
     /// retains the signed over-quote as rate-manipulation evidence.
     pub max_rate_per_mb: u64,
     /// Desired deposit for a freshly-opened buyer channel
-    /// (`blockchain.buyer_deposit_micro_usdc`); ignored when a channel is reused.
+    /// (`blockchain.buyer_working_deposit_micro_usdc`); ignored when a channel is reused.
     pub deposit_hint: U256,
     /// DHT lookup tuning.
     pub lookup: LookupConfig,

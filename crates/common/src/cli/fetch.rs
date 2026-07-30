@@ -178,7 +178,7 @@ pub struct ClientFetchArgs {
     pub data_dir: Option<PathBuf>,
 
     /// Deposit (`µUSDC`) to escrow when opening a new channel (ignored on reuse).
-    /// Overrides `blockchain.buyer_deposit_micro_usdc`; defaults to 10 USDC.
+    /// Overrides `blockchain.buyer_working_deposit_micro_usdc`; defaults to 10 USDC.
     /// Clamped up to the on-chain `minDeposit`.
     #[arg(long, value_name = "MICRO_USDC")]
     pub deposit_micro_usdc: Option<u64>,
