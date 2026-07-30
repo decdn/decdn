@@ -788,7 +788,13 @@ fn annotate_unbound_cache_miss(err: anyhow::Error, ctx: &ChannelContext) -> anyh
         );
         if quoted_rate > 0 && headroom < estimate {
             causes.push(format!(
-                "this channel's remaining deposit ({headroom}) is below the AT LEAST                  ~{estimate} the node reserves before serving at its quoted rate of                  {quoted_rate} per MB (it may reserve several times this, depending on                  its configured credit window). The fetch path already auto-refills                  below a low-water mark, so reaching this means the configured working                  deposit is itself too small: raise `--deposit-micro-usdc` (or                  `blockchain.buyer_deposit_micro_usdc`) and retry"
+                "this channel's remaining deposit ({headroom}) is below the ~{estimate} \
+                 the node reserves before serving at its quoted rate of {quoted_rate} per \
+                 MB — and that estimate is a LOWER bound, since the node may reserve \
+                 several times it depending on its configured credit window. The fetch \
+                 path already auto-refills below a low-water mark, so reaching this means \
+                 the configured working deposit is itself too small: raise \
+                 `--deposit-micro-usdc` (or `blockchain.buyer_deposit_micro_usdc`) and retry"
             ));
         }
     }
