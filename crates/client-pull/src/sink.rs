@@ -30,7 +30,7 @@ use bao_tree::io::fsm::{ResponseDecoder, ResponseDecoderNext};
 use bao_tree::io::{BaoContentItem, DecodeError};
 use bao_tree::{BaoTree, ChunkRanges};
 use bytes::{Bytes, BytesMut};
-use decdn_bao_range::{CHUNK_GROUP_BYTES, IROH_BLOCK_SIZE, align_range};
+use decdn_bao_range::{CHUNK_GROUP_BYTES, IROH_BLOCK_SIZE, align_range, bao_encoded_size};
 
 use crate::{HashMismatch, LocalPullFault, UpstreamPull, VoucherProgress};
 
@@ -335,6 +335,89 @@ pub const fn resume_offset(have: u64) -> u64 {
     have - (have % CHUNK_GROUP_BYTES)
 }
 
+/// Map a **paid wire-byte watermark** back to the **content-byte frontier** it
+/// covers, for a stream that began at content offset `fetch_start` of a
+/// `total_bytes`-byte blob (#1497).
+///
+/// Vouchers pay for **wire** bytes — bao-encoded content PLUS interleaved proof
+/// (ADR 038 §Payment metering) — so `paid_wire` (the channel-cumulative bytes an
+/// ACCEPTED voucher covered, minus this stream's baseline) is a WIRE quantity.
+/// Resuming at `fetch_start + paid_wire` would treat it as a CONTENT offset and,
+/// since wire ≥ content, overshoot the true content paid-frontier: the content
+/// span between the real frontier and that overshoot would never be billed on the
+/// resumed leg (a systematic under-pay), and a large overshoot can even exceed the
+/// on-disk content length. This maps `paid_wire` back into content space instead.
+///
+/// # What it returns, and why it never under-pays
+///
+/// The result is the **largest chunk-group boundary `C` in `[fetch_start,
+/// total_bytes]` whose bao wire cost is fully within `paid_wire`** — i.e. the
+/// greatest `C` with `wire([fetch_start, C)) <= paid_wire`, where `wire(range)` is
+/// [`bao_encoded_size`] over the real `total_bytes` tree (the identical walk the
+/// serve-side encoder and `aligned_wire_len` use, so it equals the bytes actually
+/// on the wire, byte-for-byte).
+///
+/// Because a bao pre-order stream emits every chunk group's proof-and-data before
+/// it descends into any later subtree, the wire position at which content offset
+/// `C` finishes is exactly `wire([fetch_start, C))` (same tree, same pre-order
+/// walk, same node set up to `C`; later subtrees' interior nodes are emitted only
+/// after `C`). So `wire([fetch_start, C)) <= paid_wire` proves every byte needed
+/// to deliver content `[fetch_start, C)` landed inside the paid wire prefix — that
+/// content is paid for. Resuming at `C` therefore re-fetches only `[C, end)`;
+/// nothing past a paid frontier is skipped, so it **cannot under-pay**. The only
+/// slack is the sub-group tail between `C` and the true (possibly mid-group) paid
+/// frontier: that content is re-fetched and re-paid once on the next leg, a
+/// bounded over-pay of **strictly less than one chunk group** (16 KiB).
+///
+/// `fetch_start` MUST be a chunk-group boundary (every resume offset is — it comes
+/// from [`resume_offset`] or a previous call to this function). A `paid_wire` of
+/// `0`, or a `total_bytes` of `0`, yields `fetch_start` (nothing paid on this leg
+/// ⇒ resume where it began).
+#[must_use]
+pub fn content_paid_frontier(fetch_start: u64, total_bytes: u64, paid_wire: u64) -> u64 {
+    // Wire cost of content `[fetch_start, c)` over the full `total_bytes` tree.
+    // `align_range` bound-checks and snaps to groups; `wire_len` is
+    // `bao_encoded_size(total_bytes, ranges)` — the exact on-wire byte count. An
+    // out-of-range `c` (only reachable if `fetch_start >= total_bytes`, which a
+    // live mid-fetch never is) maps to `u64::MAX`, excluding it from the search.
+    let wire_to = |c: u64| -> u64 {
+        if c <= fetch_start {
+            return 0;
+        }
+        let len = c.saturating_sub(fetch_start);
+        align_range(fetch_start, len, total_bytes).map_or(u64::MAX, |r| {
+            bao_encoded_size(total_bytes, r.chunk_ranges())
+        })
+    };
+
+    let span = total_bytes.saturating_sub(fetch_start);
+    if paid_wire == 0 || span == 0 {
+        return fetch_start.min(total_bytes);
+    }
+    // Candidate content frontiers are the group boundaries `C(k) = fetch_start +
+    // k·GROUP`, capped at `total_bytes` (the final partial group). `wire_to` is
+    // monotonic non-decreasing in `C`, so binary-search the largest `k` that fits.
+    let c_of = |k: u64| -> u64 {
+        k.saturating_mul(CHUNK_GROUP_BYTES)
+            .saturating_add(fetch_start)
+            .min(total_bytes)
+    };
+    let k_max = span.div_ceil(CHUNK_GROUP_BYTES);
+    let (mut lo, mut hi, mut best) = (0u64, k_max, 0u64);
+    while lo <= hi {
+        let mid = lo.saturating_add((hi - lo) / 2);
+        if wire_to(c_of(mid)) <= paid_wire {
+            best = mid;
+            lo = mid.saturating_add(1);
+        } else if mid == 0 {
+            break;
+        } else {
+            hi = mid.saturating_sub(1);
+        }
+    }
+    c_of(best)
+}
+
 /// Whether an assembled file that was RESUMED really is the blob `hash`.
 ///
 /// Every byte this process fetched was verified per chunk group as it landed, so
@@ -387,11 +470,13 @@ pub fn resume_is_genuine<R: std::io::Read>(hash: [u8; 32], mut reader: R) -> std
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_to_sink, resume_is_genuine, resume_offset};
+    use super::{content_paid_frontier, decode_to_sink, resume_is_genuine, resume_offset};
     use crate::HashMismatch;
     use bao_tree::io::outboard::PreOrderMemOutboard;
     use bytes::Bytes;
-    use decdn_bao_range::{IROH_BLOCK_SIZE, align_range, encode_verified_range};
+    use decdn_bao_range::{
+        CHUNK_GROUP_BYTES, IROH_BLOCK_SIZE, align_range, bao_encoded_size, encode_verified_range,
+    };
 
     fn make_blob(len: usize) -> Vec<u8> {
         let mut v = vec![0u8; len];
@@ -625,6 +710,79 @@ mod tests {
             3 * GROUP,
             "floors to the group below, never rounds up past what is on disk"
         );
+    }
+
+    /// Exact wire byte count to deliver content `[fetch_start, c)` of a
+    /// `total`-byte blob — the same `bao_encoded_size` walk `content_paid_frontier`
+    /// inverts.
+    fn wire_to(fetch_start: u64, c: u64, total: u64) -> u64 {
+        if c <= fetch_start {
+            return 0;
+        }
+        align_range(fetch_start, c - fetch_start, total)
+            .map_or(u64::MAX, |r| bao_encoded_size(total, r.chunk_ranges()))
+    }
+
+    /// `content_paid_frontier` must map a paid WIRE watermark to the LARGEST
+    /// content group boundary whose wire cost is fully within it: never above
+    /// (that would under-pay), and tight (the next group would exceed the paid
+    /// wire). Swept across a blob spanning several groups and every plausible paid
+    /// wire watermark.
+    #[test]
+    fn content_paid_frontier_never_over_maps_and_is_tight() {
+        let group = CHUNK_GROUP_BYTES;
+        // A few groups plus a partial tail, and a mid-blob resume start so the
+        // `fetch_start > 0` arithmetic is exercised too.
+        for total in [3 * group + 123, 6 * group, group + 1] {
+            for fetch_start in [0u64, group, 2 * group] {
+                if fetch_start >= total {
+                    continue;
+                }
+                let full_wire = wire_to(fetch_start, total, total);
+                // Sweep paid-wire watermarks across the whole stream, including
+                // values that land mid-group and mid-proof.
+                for step in 0..=40u64 {
+                    let paid_wire = full_wire.saturating_mul(step) / 40;
+                    let c = content_paid_frontier(fetch_start, total, paid_wire);
+
+                    assert!(c >= fetch_start, "frontier must not regress below start");
+                    assert!(c <= total, "frontier must not exceed the blob");
+                    assert_eq!(
+                        (c - fetch_start) % group,
+                        if c == total {
+                            (total - fetch_start) % group
+                        } else {
+                            0
+                        },
+                        "frontier is a group boundary (or the blob end)"
+                    );
+                    // No under-pay: every content byte up to `c` was inside the
+                    // paid wire prefix.
+                    assert!(
+                        wire_to(fetch_start, c, total) <= paid_wire,
+                        "c={c} maps past the paid wire {paid_wire} (would under-pay)"
+                    );
+                    // Tight: the NEXT group would have spilled past the paid wire
+                    // (unless we are already at the blob end).
+                    if c < total {
+                        let next = (c + group).min(total);
+                        assert!(
+                            wire_to(fetch_start, next, total) > paid_wire,
+                            "next group {next} still fits in {paid_wire}: not tight"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// `paid_wire == 0` (nothing accepted on this leg) resumes exactly where the
+    /// leg began — no spurious advance.
+    #[test]
+    fn content_paid_frontier_zero_paid_stays_at_start() {
+        let group = CHUNK_GROUP_BYTES;
+        assert_eq!(content_paid_frontier(0, 5 * group, 0), 0);
+        assert_eq!(content_paid_frontier(group, 5 * group, 0), group);
     }
 
     /// The whole-file check is what makes resume safe, since the on-disk prefix

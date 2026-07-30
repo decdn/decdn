@@ -859,17 +859,19 @@ where
         amount: ctx.prior_amount,
     }));
 
-    // Reactive graduation (#1497): the wire offset and channel-cumulative
-    // bytes-delivered baseline THIS blob's fetch started from, captured once,
-    // before the attempt loop below ever runs. The reactive top-up branch uses
-    // these to recover the PAID frontier of this blob — `fetch_start_offset +
-    // (ledger.committed().bytes - fetch_start_committed_bytes)` — which is safe
-    // to resume from because it counts only bytes an ACCEPTED voucher actually
-    // covered, unlike the on-disk file length (which can run ahead of payment:
-    // the credit window, ADR 003 §Credit window, lets the node stream up to a
-    // full interval's worth of content before the voucher that pays for it is
-    // even due, and `decode_to_sink` flushes and verifies those bytes to disk
-    // as they arrive, independent of whether that voucher is later accepted).
+    // Reactive graduation (#1497): the CONTENT offset this blob's fetch started
+    // from, and the channel-cumulative WIRE-byte baseline at that moment, captured
+    // once before the attempt loop below ever runs. The reactive top-up branch
+    // feeds these to `content_paid_frontier` to recover the PAID content frontier
+    // of this blob: `committed().bytes - fetch_start_committed_bytes` is the WIRE
+    // bytes an ACCEPTED voucher covered on this leg (vouchers pay in wire bytes —
+    // content plus bao proof, ADR 038), which that helper maps back into content
+    // space. This counts only paid bytes — unlike the on-disk file length, which
+    // runs ahead of payment: the credit window (ADR 003 §Credit window) lets the
+    // node stream up to a full interval's worth of content before the voucher that
+    // pays for it is even due, and `decode_to_sink` flushes and verifies those
+    // bytes to disk as they arrive, independent of whether that voucher is later
+    // accepted.
     let fetch_start_offset = byte_offset;
     let fetch_start_committed_bytes = ledger.committed().bytes;
 
@@ -1057,31 +1059,35 @@ where
                     // (ADR 003 §Credit window) lets the node stream — and
                     // `decode_to_sink` flush and bao-verify — a full interval's
                     // worth of content before the voucher that pays for it is
-                    // even due. The voucher that just got rejected covers
-                    // exactly the bytes still unpaid past `committed`, so
-                    // nothing between `fetch_start_offset` and the true paid
-                    // frontier was ever accepted — using the on-disk length
-                    // here would skip billing for it entirely (an under-pay /
+                    // even due. Using the on-disk length here would skip billing
+                    // for that credited-but-unpaid tail entirely (an under-pay /
                     // free-bandwidth hole), while leaving `byte_offset`
-                    // unadvanced (the original bug) would re-serve and re-pay
-                    // for whatever WAS already accepted.
+                    // unadvanced (the original bug) would re-serve and re-pay for
+                    // whatever WAS already accepted.
                     //
-                    // `ledger.committed().bytes` only ever advances by bytes an
-                    // ACCEPTED voucher covered, and `fetch_start_committed_bytes`
-                    // is the channel-cumulative baseline at the moment THIS
-                    // blob's fetch began — so the delta between them is exactly
-                    // how many of THIS blob's bytes are paid for, and adding
-                    // that to `fetch_start_offset` recovers the in-blob paid
-                    // frontier. The on-disk file is always at least this long
-                    // (bao decoding always leads payment, never lags it), so
-                    // `[paid_frontier, on_disk_len)` — re-fetched and paid once
-                    // on the next attempt — is never negative and never skips
-                    // unpaid content.
-                    let paid_bytes_this_blob =
-                        committed.bytes.saturating_sub(fetch_start_committed_bytes);
-                    let paid_frontier = fetch_start_offset
-                        .saturating_add(u64::try_from(paid_bytes_this_blob).unwrap_or(u64::MAX));
-                    byte_offset = paid_frontier;
+                    // The paid frontier is derived in CONTENT bytes. Vouchers pay
+                    // for WIRE bytes — bao-encoded content plus interleaved proof
+                    // (ADR 038) — so `ledger.committed().bytes` is a channel-
+                    // cumulative WIRE watermark, and `fetch_start_committed_bytes`
+                    // is the WIRE baseline captured when THIS blob's fetch began.
+                    // Their delta is the wire bytes an ACCEPTED voucher covered on
+                    // this leg; `content_paid_frontier` maps that wire watermark
+                    // back through the bao tree to the largest chunk-group content
+                    // boundary provably inside it. That is `<= fetch_start_offset
+                    // + wire_delta` (wire >= content), so it can never overshoot
+                    // into unbilled content (the wire-vs-content under-pay this
+                    // fixes); it is `<= the on-disk content length` (bao decode
+                    // always leads payment); and `[frontier, on_disk_len)` is
+                    // re-fetched and paid once on the next attempt — a bounded
+                    // over-pay of strictly under one chunk group, never a skip.
+                    let paid_wire_this_blob =
+                        u64::try_from(committed.bytes.saturating_sub(fetch_start_committed_bytes))
+                            .unwrap_or(u64::MAX);
+                    byte_offset = decdn_client_pull::sink::content_paid_frontier(
+                        fetch_start_offset,
+                        total_bytes,
+                        paid_wire_this_blob,
+                    );
                     continue;
                 }
                 TopUpDecision::Exhausted => {

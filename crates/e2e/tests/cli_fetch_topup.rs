@@ -39,6 +39,7 @@ use std::time::Duration;
 use alloy::primitives::{Address, B256, U256};
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::Context;
+use decdn_bao_range::align_range;
 use decdn_cache::Hash;
 use decdn_client_pull::buyer_channel::{ensure_allowance, open_channel, top_up};
 use decdn_e2e::chain::ChainFixture;
@@ -509,13 +510,20 @@ fn topup_fetch_argv_with_deposits(
 // "bundle just echoes our own already-committed watermark" (not a desync — the
 // exhaustion is real), by comparing the bundle's nonce against `ledger.committed()`.
 //
-// This also exercises the OTHER half of the fix: resuming at the PAID frontier
-// (`fetch_start_offset + (committed.bytes_now - committed.bytes_at_start)`)
-// rather than the raw on-disk length. The accepted intervals' bytes are both
-// PAID and on disk, so paid-frontier and on-disk-length agree for them; only the
-// small final (rejected) interval's bytes are on disk but unpaid, and the fix
-// must re-fetch and pay for exactly that tail — no more (double-pay), no less
-// (under-pay).
+// This also exercises the OTHER half of the fix: resuming at the CONTENT paid
+// frontier — `content_paid_frontier(fetch_start_offset, total_bytes,
+// committed.bytes_now - committed.bytes_at_start)` — rather than the raw on-disk
+// length OR the naive `fetch_start + wire_delta`. Vouchers pay for WIRE bytes
+// (bao content plus interleaved proof, ADR 038), so `committed.bytes` is a WIRE
+// watermark; mapping it back through the bao tree lands the resume on the largest
+// content chunk-group boundary provably inside the paid wire. The fix must
+// re-fetch and pay for exactly the delivered-but-unpaid tail — no more
+// (double-pay), no less (under-pay). The old `fetch_start + wire_delta` resume
+// treated the wire watermark as a content offset and overshot by the proof
+// overhead, silently skipping ~one proof's worth of delivered content from
+// billing — a sub-1% under-pay that a content-only cost floor cannot see (the
+// paid proof inflates any honest settle above it), which is why the floor below
+// is the whole-blob WIRE cost.
 
 const MULTI_WORKING_DEPOSIT_MICRO_USDC: u64 = 40_000_000; // plenty to finish the blob
 // Must be >= working_deposit / LOW_WATER_DIVISOR (8_000_000 at the current
@@ -713,18 +721,50 @@ async fn run_multi_interval_topup() -> anyhow::Result<()> {
     // The money-correctness assertion: the channel's persisted cumulative
     // voucher watermark (`last_amount` — the off-chain figure a `settleChannel`
     // would later claim on-chain; the channel is never closed in this test, so
-    // there is no on-chain `claimedAmount` to read yet) must be approximately
-    // the blob's real cost — delivered ONCE — never `blob_cost +
-    // already_delivered_prefix` (double-pay) and never LESS than the true cost
-    // (under-pay). This is the SAME `ceil(bytes * rate / MB)` formula
-    // `crates/cli/src/commands/fetch.rs`'s reactive branch (and the node's own
-    // `next_voucher`) use to price a voucher, applied to the whole blob rather
-    // than one interval.
+    // there is no on-chain `claimedAmount` to read yet) must be the blob's real
+    // WIRE cost — delivered ONCE — never `blob_cost + already_delivered_prefix`
+    // (double-pay) and never below the whole-blob wire cost (under-pay).
+    //
+    // Two reference costs, both via the node's/`next_voucher`'s `ceil(bytes *
+    // rate / MB)` voucher-pricing formula:
+    //
+    //  * `true_cost` — over the blob's CONTENT bytes. This is the spec figure and
+    //    an absolute floor, but NOT a tight one: vouchers actually pay for WIRE
+    //    bytes (content + interleaved bao proof, ADR 038), so every honest settle
+    //    sits ABOVE `true_cost` by the paid proof. A content-only floor therefore
+    //    cannot see the wire-vs-content under-pay this test guards — the skipped
+    //    sliver (~one proof's worth) is smaller than the proof overhead that
+    //    inflates the settle above `true_cost`. It is kept only for context.
+    //  * `wire_floor` — over the blob's exact bao WIRE bytes (`bao_encoded_size`,
+    //    the identical tree walk the serve encoder and the pull's
+    //    `expected_wire_bytes` use). A correct fetch pays for every one of these
+    //    bytes at least once, so `wire_floor` is the TIGHT no-under-pay gate: the
+    //    old `fetch_start + wire_delta` resume skipped delivered content and
+    //    settles strictly below it.
     const MB_BYTES: u64 = 1024 * 1024;
     let blob_len = u64::try_from(blob.len()).context("blob length as u64")?;
-    let true_cost = U256::from(blob_len)
-        .saturating_mul(U256::from(MULTI_RATE_PER_MB))
-        .div_ceil(U256::from(MB_BYTES));
+    let ceil_cost = |bytes: u64| {
+        U256::from(bytes)
+            .saturating_mul(U256::from(MULTI_RATE_PER_MB))
+            .div_ceil(U256::from(MB_BYTES))
+    };
+    let true_cost = ceil_cost(blob_len);
+    // Exact whole-blob wire size: content + every 64-byte bao proof node, in
+    // pre-order (ADR 038). `align_range(0, 0, blob_len)` is the whole-blob range;
+    // its `wire_len()` is `bao_encoded_size` over the real block-size tree.
+    let whole_wire = align_range(0, 0, blob_len)
+        .context("align whole blob")?
+        .wire_len();
+    let wire_floor = ceil_cost(whole_wire);
+    // One 16 KiB chunk group's cost. The conservative resume snaps the paid
+    // frontier DOWN to a group boundary, so the resumed leg re-fetches STRICTLY
+    // LESS than one group of already-paid content; two groups of headroom above
+    // `wire_floor` also covers the resumed leg's own left-boundary proof hashes
+    // (~log2(groups) × 64 B) and the handful of per-voucher `ceil` roundings —
+    // and is still ~250× below a single re-paid 4 MiB voucher interval, which is
+    // what a genuine double-pay would add.
+    let one_group_cost = ceil_cost(decdn_bao_range::CHUNK_GROUP_BYTES);
+    let ceiling = wire_floor.saturating_add(one_group_cost.saturating_mul(U256::from(2u64)));
 
     let store = RedbBuyerChannelStore::open(client_dir.path()).context("open buyer store")?;
     let persisted = store
@@ -732,29 +772,25 @@ async fn run_multi_interval_topup() -> anyhow::Result<()> {
         .context("read persisted channel")?
         .ok_or_else(|| anyhow::anyhow!("buyer channel not recorded after fetch"))?;
 
-    // Bao's wire framing carries a small proof overhead on top of the content
-    // bytes `true_cost` is computed from (ADR 038) — a fraction that shrinks
-    // with blob size and is well under 1% here — so allow a little headroom
-    // above `true_cost` without allowing anywhere near a second full payment
-    // for the already-delivered prefix.
-    let generous_ceiling =
-        true_cost + true_cost / U256::from(20u64) + U256::from(MULTI_RATE_PER_MB);
+    // Upper bound: no double-pay. At most one chunk group of re-fetched paid
+    // content plus small proof/rounding slack above the whole-blob wire cost.
     anyhow::ensure!(
-        persisted.last_amount <= generous_ceiling,
+        persisted.last_amount <= ceiling,
         "the channel must not have double-paid the prefix delivered before the top-up: \
-         settled {} µUSDC, but the blob's true cost at {MULTI_RATE_PER_MB} µUSDC/MB is only \
-         {true_cost} µUSDC (ceiling with wire-overhead headroom: {generous_ceiling}) — a \
-         double-pay bug would settle at roughly twice that",
+         settled {} µUSDC, but the whole-blob WIRE cost at {MULTI_RATE_PER_MB} µUSDC/MB is \
+         {wire_floor} µUSDC (content-only cost {true_cost}); tight ceiling {ceiling} allows \
+         under one re-fetched chunk group — a double-pay would settle a full interval higher",
         persisted.last_amount
     );
-    // And a sanity floor: the fetch really did pay for (approximately) the
-    // whole blob, not merely avoid overpaying by paying too little (the
-    // under-pay hole a naive on-disk-length resume would have opened).
+    // Lower bound: no under-pay. The whole blob's wire bytes were paid at least
+    // once. The wire-vs-content bug skipped ~one proof's worth of delivered
+    // content and would settle BELOW `wire_floor` (yet still above the coarse
+    // content-only `true_cost`, which is why the floor must be `wire_floor`).
     anyhow::ensure!(
-        persisted.last_amount >= true_cost.saturating_sub(U256::from(MULTI_RATE_PER_MB)),
-        "the channel must have paid for (approximately) the full blob: settled {} µUSDC, \
-         expected close to {true_cost} µUSDC — under-paying this much would mean the \
-         already-delivered prefix was never billed",
+        persisted.last_amount >= wire_floor,
+        "the channel under-paid: settled {} µUSDC, below the whole-blob WIRE cost of \
+         {wire_floor} µUSDC (content-only {true_cost}) — resuming past the true content paid \
+         frontier would skip billing the delivered-but-unpaid tail exactly like this",
         persisted.last_amount
     );
 
