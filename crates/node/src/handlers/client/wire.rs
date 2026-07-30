@@ -130,9 +130,6 @@ impl ClientHandler {
             ServeRejectReason::InsufficientDeposit => {
                 self.metrics.serve_stream_rejected_insufficient_deposit();
             }
-            ServeRejectReason::UnauthorizedOrigin => {
-                self.metrics.serve_stream_rejected_unauthorized_origin();
-            }
             ServeRejectReason::CooperativeCloseSigned => {
                 self.metrics
                     .serve_stream_rejected_cooperative_close_signed();

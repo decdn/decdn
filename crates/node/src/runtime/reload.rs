@@ -874,7 +874,6 @@ impl RuntimeReloadState {
                 pull_share_ratio_percent: decdn_cache::Percent::new(
                     decdn_common::config::DEFAULT_PULL_SHARE_RATIO_PERCENT,
                 ),
-                pull_through_require_authorized_origin: false,
             },
             payment: ResolvedPayment {
                 rate_per_mb,
@@ -1209,7 +1208,6 @@ const fn cache_has_restart_required_field(c: &decdn_common::config::types::Cache
         pull_ahead_bytes,
         max_unrecouped_leech_bytes,
         pull_share_ratio_percent,
-        pull_through_require_authorized_origin,
     } = c;
     cache_dir.is_some()
         || cache_size_mb.is_some()
@@ -1237,7 +1235,6 @@ const fn cache_has_restart_required_field(c: &decdn_common::config::types::Cache
         || pull_ahead_bytes.is_some()
         || max_unrecouped_leech_bytes.is_some()
         || pull_share_ratio_percent.is_some()
-        || pull_through_require_authorized_origin.is_some()
 }
 
 /// Whether the file's `[observability]` section sets any field that a
@@ -1383,7 +1380,6 @@ mod tests {
                 pull_share_ratio_percent: decdn_cache::Percent::new(
                     decdn_common::config::DEFAULT_PULL_SHARE_RATIO_PERCENT,
                 ),
-                pull_through_require_authorized_origin: false,
             },
             payment: ResolvedPayment {
                 rate_per_mb: rate,

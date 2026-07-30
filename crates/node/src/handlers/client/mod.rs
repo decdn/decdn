@@ -56,7 +56,6 @@ use tokio::io::AsyncReadExt;
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
 
-use crate::dht::origin::OriginDirectory;
 use crate::dispatch::{ConnectionLimiter, RejectReason};
 use crate::leech_governor::LeechGovernor;
 use crate::metrics::Metrics;
@@ -286,20 +285,6 @@ impl Drop for BgInflightGuard {
     }
 }
 
-/// Whether the reactive pull-through authorized-origin gate (#821) refuses to
-/// initiate a pull for a request under `namespace_id`. Returns `true` (refuse)
-/// only when the operator opted in — a directory is wired on
-/// [`ClientHandlerDeps`] — AND that directory holds no authorized origin for the
-/// namespace. `NO_NAMESPACE` (0) has no authorized origins (ADR 002 §Namespace
-/// 0), so an enabled gate refuses it. An unset gate (the default) always returns
-/// `false`, preserving the permissionless cache role. Free function so the branch
-/// is unit-testable without a full handler / QUIC stream (the wire `NotFound` it
-/// produces is indistinguishable from a plain miss, so an end-to-end test cannot
-/// observe it).
-fn pull_origin_gate_blocks(gate: Option<&Arc<dyn OriginDirectory>>, namespace_id: U256) -> bool {
-    gate.is_some_and(|dir| !dir.has_origin(namespace_id))
-}
-
 /// Claim `hash` for a background fill (#859), returning a [`BgInflightGuard`]
 /// the caller must hold for the lifetime of the spawned warm task — dropping it
 /// releases the claim. Returns `None` only if a fill is already in flight for
@@ -491,7 +476,6 @@ enum ServeRejectReason {
     UnknownChannel,
     OwnerMismatch,
     InsufficientDeposit,
-    UnauthorizedOrigin,
     CooperativeCloseSigned,
     RangeNotSatisfiable,
     /// The blob is on this operator's local denylist (ADR 011 §Local Denylist).
@@ -542,7 +526,6 @@ impl ServeRejectReason {
             | Self::UnknownChannel
             | Self::OwnerMismatch
             | Self::InsufficientDeposit
-            | Self::UnauthorizedOrigin
             | Self::CooperativeCloseSigned
             | Self::RangeNotSatisfiable => StreamError::NotFound,
             Self::EvictedSinceProbe => StreamError::EvictedSinceProbe,
@@ -720,7 +703,6 @@ pub struct ClientHandlerDeps {
     /// (5 ms). The runtime sets it from `payment.voucher_commit_interval_ms`.
     pub voucher_commit_interval: Option<Duration>,
     pub leech_governor: Option<Arc<LeechGovernor>>,
-    pub pull_origin_gate: Option<Arc<dyn OriginDirectory>>,
     pub idle_timeout: Option<Duration>,
 }
 
@@ -784,7 +766,6 @@ impl ClientHandlerDeps {
             credit_window_bytes: None,
             voucher_commit_interval: None,
             leech_governor: None,
-            pull_origin_gate: None,
             idle_timeout: None,
         }
     }
@@ -904,23 +885,6 @@ pub struct ClientHandler {
     /// proceeds and credited from the voucher path. `None` (tests / feature off)
     /// leaves only the per-request window.
     leech_governor: Option<Arc<LeechGovernor>>,
-    /// Optional content-authorization gate on the reactive pull-through path
-    /// (#821, ADR 037 §Seed-leech caps / ADR 022 §`FIND_VALUE` Flow), set at
-    /// construction via [`ClientHandlerDeps`] only when the operator sets
-    /// `cache.pull_through_require_authorized_origin = true`. `None` (the default
-    /// and in tests) keeps the permissionless cache role: misses pull through
-    /// unconditionally. When `Some`, a cache miss whose request namespace has no
-    /// authorized origin in this directory (`has_origin == false`) is refused with
-    /// `NotFound` before any upstream pull or cache-warming write — a
-    /// pull-*initiation* gate only, never consulted for a range already held.
-    /// Resolves against the shared `OriginDirectory` keyed on the request's
-    /// `namespace_id`: namespace 0 (`NO_NAMESPACE`) has no authorized origins (ADR
-    /// 002 §Namespace 0), so an armed gate refuses it — the opposite of the removed
-    /// default-open allow-list. Fail-closed on RPC loss. Note the namespace is
-    /// client-asserted: under namespace-as-origin-addressing there is no on-chain
-    /// hash→namespace claim, so this gate scopes on the namespace the requester
-    /// names, not on proven hash membership.
-    pull_origin_gate: Option<Arc<dyn OriginDirectory>>,
     /// Live content deny-set (ADR 011). Consulted at three points, all of which
     /// must gate or the check is bypassable: the hash gate above the
     /// availability check in `serve_stream`, the origin gate right after channel
@@ -1009,7 +973,6 @@ impl ClientHandler {
             credit_window_bytes: deps.credit_window_bytes,
             voucher_commit_interval: deps.voucher_commit_interval,
             leech_governor: deps.leech_governor,
-            pull_origin_gate: deps.pull_origin_gate,
             content_deny: deps.content_deny,
             rate_per_mb: deps.rate_per_mb,
             rate_bounds: deps.rate_bounds,
@@ -1902,7 +1865,6 @@ mod tests {
             ServeRejectReason::UnknownChannel,
             ServeRejectReason::OwnerMismatch,
             ServeRejectReason::InsufficientDeposit,
-            ServeRejectReason::UnauthorizedOrigin,
             ServeRejectReason::CooperativeCloseSigned,
             ServeRejectReason::RangeNotSatisfiable,
         ] {
@@ -1944,37 +1906,6 @@ mod tests {
             ServeRejectReason::EvictedSinceProbe.wire_error(),
             ServeRejectReason::HashDenied.wire_error()
         );
-    }
-
-    // #821: the reactive pull-through authorized-origin gate refuses a pull only
-    // when the operator opted in (a directory is wired) AND the request's
-    // namespace has no authorized origin; an unset gate keeps the permissionless
-    // default. Namespace 0 (no namespace) always resolves to no origins.
-    #[test]
-    fn pull_origin_gate_decision() {
-        use crate::dht::origin::{EmptyOriginDirectory, OriginDirectory, StaticOriginDirectory};
-        use crate::dht::routing::NodeId;
-
-        let ns = U256::from(7u64);
-
-        // Unset gate (default): never blocks — cache role stays permissionless.
-        assert!(!pull_origin_gate_blocks(None, ns));
-
-        // Opted in on a node with no chain addresses — the runtime's fallback
-        // shape. Blocks every request, which is the #1292 hazard: on the wire this
-        // is indistinguishable from a plain miss.
-        let empty: Arc<dyn OriginDirectory> = Arc::new(EmptyOriginDirectory);
-        assert!(pull_origin_gate_blocks(Some(&empty), ns));
-
-        // Opted in, directory holds an authorized origin for the namespace: allows.
-        let mut m = HashMap::new();
-        m.insert(ns, vec![NodeId::from_bytes([1u8; 32])]);
-        let authorized: Arc<dyn OriginDirectory> = Arc::new(StaticOriginDirectory::new(m));
-        assert!(!pull_origin_gate_blocks(Some(&authorized), ns));
-        // A different, unassigned namespace through the same directory is blocked.
-        assert!(pull_origin_gate_blocks(Some(&authorized), U256::from(9u64)));
-        // Namespace 0 (no namespace) has no authorized origins → blocked.
-        assert!(pull_origin_gate_blocks(Some(&authorized), U256::ZERO));
     }
 
     /// #1382 / #1388: the hard per-byte voucher floor must track the LIVE

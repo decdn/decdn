@@ -6,8 +6,7 @@ use super::{
     Arc, B256, CHUNK_GROUP_BYTES, ChannelId, ClientHandler, ClientMessage, Connection, FillOutcome,
     FirstMessage, Hash, MB_BYTES, Mutex, OwnedSemaphorePermit, REJECTION_CLOSE_TIMEOUT, RecvStream,
     RejectReason, Semaphore, SendStream, ServeRejectReason, StreamReadError, StreamResponseBody,
-    TeeOpen, U256, VarInt, min_payment, pull_origin_gate_blocks, read_first_message, reset_stream,
-    verify_binding,
+    TeeOpen, VarInt, min_payment, read_first_message, reset_stream, verify_binding,
 };
 use futures_util::StreamExt as _;
 
@@ -267,25 +266,6 @@ impl ClientHandler {
                         .respond_error(&mut send, &req, ServeRejectReason::EvictedSinceProbe)
                         .await;
                 }
-                // Content-authorization gate (#821, ADR 037 §Seed-leech caps).
-                // When the operator opts in
-                // (`pull_through_require_authorized_origin`), refuse to INITIATE an
-                // upstream pull and its cache-warming write for a request whose
-                // namespace has no currently-authorized origin. Namespace 0 has no
-                // authorized origins (ADR 002 §Namespace 0), so an enabled gate
-                // refuses it. It is a pull-*initiation* gate only: a range already
-                // held is served from the `Ok(true)` arm above, so refusing held
-                // blobs stays `ContentBlacklist`'s job (ADR 011/031). The directory
-                // is wired only when the gate is enabled, so an unset gate keeps the
-                // permissionless cache-role default.
-                if pull_origin_gate_blocks(
-                    self.pull_origin_gate.as_ref(),
-                    U256::from_be_bytes(req.namespace_id),
-                ) {
-                    return self
-                        .respond_error(&mut send, &req, ServeRejectReason::UnauthorizedOrigin)
-                        .await;
-                }
                 // Node-to-node cache-miss pull-through (#831). Fronting upstream
                 // USDC egress is privileged: gate it on the request PROVING
                 // ownership of the named channel — a verified client binding
@@ -351,9 +331,9 @@ impl ClientHandler {
                 // terminal MISS below therefore goes through
                 // `FillOutcome::miss_reason` — including the window path's leech
                 // shed. (The channel-class refusals — `UnknownChannel`,
-                // `InsufficientDeposit`, `UnauthorizedOrigin` — keep their own
-                // reasons: they are client-attributable and would refuse regardless
-                // of origin health.)
+                // `InsufficientDeposit` — keep their own reasons: they are
+                // client-attributable and would refuse regardless of origin
+                // health.)
                 let mut locally_filled = false;
                 if range_pulled_size.is_none()
                     && let Some(timeout) = self.local_populate

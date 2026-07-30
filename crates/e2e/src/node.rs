@@ -189,7 +189,7 @@ impl NodeFixture {
         region: &str,
         serve_blobs: &[&[u8]],
     ) -> anyhow::Result<(Self, Vec<Hash>)> {
-        Self::launch_configured(chain, region, serve_blobs, false, false, &[]).await
+        Self::launch_configured(chain, region, serve_blobs, false, &[]).await
     }
 
     /// Launch an empty bonded cache node whose misses use paid node-to-node
@@ -200,44 +200,12 @@ impl NodeFixture {
         discovery_peers: &[&NodeFixture],
     ) -> anyhow::Result<Self> {
         let (node, hashes) =
-            Self::launch_configured(chain, region, &[], true, true, discovery_peers).await?;
+            Self::launch_configured(chain, region, &[], true, discovery_peers).await?;
         anyhow::ensure!(
             hashes.is_empty(),
             "empty cache launch returned seeded hashes"
         );
         Ok(node)
-    }
-
-    /// Launch a bonded node that **owns an opaque origin backend** and gates its
-    /// reactive cache-miss fill on the chain-backed authorized-origin directory
-    /// (`cache.pull_through_require_authorized_origin`, #821 / ADR 037).
-    ///
-    /// `cached_blobs` are pre-warmed into the node's local store, so they are
-    /// served from cache regardless of what the chain says. Blobs written *after*
-    /// launch with [`Self::seed_origin_blob`] exist ONLY in the backend, so
-    /// serving them requires the gate to be open — which is the distinction
-    /// G-NODE-08 asserts.
-    ///
-    /// Note what the gate actually checks: `pull_origin_gate_blocks` asks whether
-    /// the hash's **namespace** has any currently-authorized active origin, not
-    /// whether *this* operator is one of them. A namespace ratified to a
-    /// different operator would also open this node's gate. Whether that is the
-    /// intended scope is tracked in #1368; this fixture deliberately does not
-    /// depend on either reading.
-    ///
-    /// No discovery peers, so the node has no upstream and a served backend-only
-    /// blob can only have come from its own `[cache.origin]`. `render_config`
-    /// exposes the two knobs independently (#1376), but this helper still arms
-    /// both: `pull_through_require_authorized_origin` is only *wired* by the
-    /// daemon inside `if node_to_node_pull_through_enabled` (`runtime::mod`), so
-    /// the gate needs node→node pull-through on to take effect. The no-upstream
-    /// guarantee therefore rests on the empty peer set, not on the flag being off.
-    pub async fn launch_authorized_origin(
-        chain: &ChainFixture,
-        region: &str,
-        cached_blobs: &[&[u8]],
-    ) -> anyhow::Result<(Self, Vec<Hash>)> {
-        Self::launch_configured(chain, region, cached_blobs, true, true, &[]).await
     }
 
     /// Write `blob` into the node's opaque origin backend **without** touching its
@@ -333,7 +301,6 @@ impl NodeFixture {
         region: &str,
         serve_blobs: &[&[u8]],
         node_to_node_pull_through: bool,
-        require_authorized_origin: bool,
         discovery_peers: &[&NodeFixture],
     ) -> anyhow::Result<(Self, Vec<Hash>)> {
         let data_dir = tempfile::tempdir().context("create node data dir")?;
@@ -406,7 +373,6 @@ impl NodeFixture {
             chain_id: chain.chain_id(),
             addrs: chain.addrs(),
             node_to_node_pull_through,
-            require_authorized_origin,
             discovery_peers: &discovery_peers,
         });
         let config_path = data_dir.path().join("node.toml");
@@ -625,7 +591,6 @@ struct RenderConfig<'a> {
     chain_id: u64,
     addrs: ContractAddrs,
     node_to_node_pull_through: bool,
-    require_authorized_origin: bool,
     discovery_peers: &'a [(iroh::PublicKey, u16)],
 }
 
@@ -667,7 +632,6 @@ redeem_threshold_micro_usdc = 10
 cache_dir = '{cache_dir}'
 cache_size_mb = 4096
 node_to_node_pull_through_enabled = {node_to_node_pull_through}
-pull_through_require_authorized_origin = {require_authorized_origin}
 
 [cache.origin]
 kind = "fs"
@@ -698,7 +662,6 @@ metrics_bind = "127.0.0.1"
         origin_assignment = a.origin_assignment,
         cache_dir = c.cache_dir.display(),
         node_to_node_pull_through = c.node_to_node_pull_through,
-        require_authorized_origin = c.require_authorized_origin,
         origin_dir = c.origin_dir.display(),
         admin_port = c.admin_port,
         metrics_port = c.metrics_port,
@@ -863,9 +826,6 @@ mod tests {
             chain_id: 31_337,
             addrs,
             node_to_node_pull_through: true,
-            // Distinct value from `node_to_node_pull_through` so a template that
-            // wrongly re-tied the two keys (the pre-#1376 bug) is caught here.
-            require_authorized_origin: false,
             discovery_peers: &discovery_peers,
         });
 
@@ -885,17 +845,9 @@ mod tests {
         );
         assert_eq!(doc["cache"]["origin"]["kind"].as_str(), Some("fs"));
         assert!(doc["cache"]["origin"].get("path").is_some());
-        // The two knobs render independently (#1376): the fixture set them to
-        // distinct values above, so this also guards against a regression that
-        // re-ties `pull_through_require_authorized_origin` to
-        // `node_to_node_pull_through_enabled`.
         assert_eq!(
             doc["cache"]["node_to_node_pull_through_enabled"].as_bool(),
             Some(true)
-        );
-        assert_eq!(
-            doc["cache"]["pull_through_require_authorized_origin"].as_bool(),
-            Some(false)
         );
         assert_eq!(
             doc["network"]["discovery"]["peers"]
@@ -939,7 +891,6 @@ mod tests {
             chain_id: 31_337,
             addrs,
             node_to_node_pull_through: true,
-            require_authorized_origin: true,
             discovery_peers: &[],
         })
     }
@@ -962,10 +913,6 @@ mod tests {
         assert_eq!(doc["cache"]["origin"]["kind"].as_str(), Some("fs"));
         assert_eq!(
             doc["cache"]["node_to_node_pull_through_enabled"].as_bool(),
-            Some(true)
-        );
-        assert_eq!(
-            doc["cache"]["pull_through_require_authorized_origin"].as_bool(),
             Some(true)
         );
         assert_eq!(doc["blockchain"]["chain_id"].as_integer(), Some(31_337));

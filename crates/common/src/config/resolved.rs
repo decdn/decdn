@@ -93,9 +93,8 @@ pub struct ResolvedBlockchain {
     /// `CapacityBond` contract address.
     pub capacity_bond_address: String,
     /// `OriginAssignment` contract address. `Some` only when the operator opts
-    /// into the chain-backed origin directory; `None` => empty deny-all
-    /// directory, so the pull-through authorized-origin gate finds no origins
-    /// (ADR 022).
+    /// into the chain-backed origin directory; `None` => empty directory, so
+    /// the `FIND_VALUE` routing fallback (ADR 022) resolves nothing.
     pub origin_assignment_address: Option<String>,
     /// `PublisherRegistry` contract address. Independent of the origin directory
     /// (the publish CLI's `namespace create` target); not consumed by the node.
@@ -293,16 +292,6 @@ pub struct ResolvedCache {
     /// Per-peer share ratio as a percentage (#856, ADR 037 `share_ratio`;
     /// `100` == 1.0×). Default [`crate::config::DEFAULT_PULL_SHARE_RATIO_PERCENT`].
     pub pull_share_ratio_percent: decdn_config_types::Percent,
-    /// Gate the reactive cache-miss pull-through path on an authorized origin
-    /// (#821, ADR 037 §Seed-leech caps). Default `false` — the cache role stays
-    /// permissionless. When `true`, the handler refuses to initiate an upstream
-    /// pull (and its cache-warming write) for a hash whose namespace has no
-    /// authorized origin, returning `NotFound`; ranges already held are still
-    /// served. `cache.*` is restart-required, so this is read once at bring-up.
-    /// The runtime attaches the gate only when `node_to_node_pull_through_enabled`
-    /// is also set, so it is a no-op without that path (a miss already returns
-    /// `NotFound`).
-    pub pull_through_require_authorized_origin: bool,
 }
 
 /// Resolved + validated origin backend selection (#437). Mirrors

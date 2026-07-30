@@ -134,10 +134,10 @@ pub struct BlockchainConfig {
     /// `CapacityBond` contract address.
     pub capacity_bond_address: Option<String>,
     /// `OriginAssignment` contract address. Optional: when set, the node runs the
-    /// chain-backed origin directory for the cache-miss pull-through fallback,
-    /// resolving a request's namespace via `getOrigins(namespaceId)` (ADR 022).
-    /// Unset => the origin directory is empty (deny-all) and the pull-through
-    /// authorized-origin gate finds no origins.
+    /// chain-backed origin directory for node-to-node routing, resolving a
+    /// request's namespace via `getOrigins(namespaceId)` (ADR 022) for the
+    /// `FIND_VALUE` fallback. Unset => the origin directory is empty, so that
+    /// fallback resolves nothing.
     pub origin_assignment_address: Option<String>,
     /// `PublisherRegistry` contract address. Independent of the origin directory:
     /// it is the publish CLI's `namespace create` target and is not consumed by
@@ -542,23 +542,6 @@ pub struct CacheConfig {
     /// allowance of `pull_ahead_bytes`, bounding concentrated single-peer abuse.
     /// `0` pins a peer to only the opening window.
     pub pull_share_ratio_percent: Option<decdn_config_types::Percent>,
-    /// Content-authorization gate on the reactive cache-miss pull-through path
-    /// (#821, ADR 037 §Seed-leech caps / ADR 022 §`FIND_VALUE` Flow). Absent =>
-    /// `false` (the cache role stays permissionless, unchanged network
-    /// behavior). When `true`, the node refuses to *initiate* an upstream pull
-    /// and the associated cache-warming write for a request whose namespace has no
-    /// currently-authorized origin via `OriginAssignment.getOrigins(namespaceId)`
-    /// (`namespaceId == 0`/`NO_NAMESPACE` has no authorized origins, so the gate
-    /// refuses it — ADR 002 §Namespace 0), returning `NotFound` to the requesting
-    /// client. It is a pull-*initiation* gate only: a range the node already holds
-    /// is served regardless — refusing held blobs is `ContentBlacklist`'s job
-    /// (ADR 011/031). Requires the `origin_assignment_address` blockchain key;
-    /// without it the directory is empty and the gate fails closed (every pull is
-    /// refused).
-    /// Only affects the node-to-node reactive pull-through path, so it is a no-op
-    /// unless `node_to_node_pull_through_enabled` is also `true` — with
-    /// pull-through off, a cache miss already returns `NotFound`.
-    pub pull_through_require_authorized_origin: Option<bool>,
 }
 
 /// Origin backend selection (#437). Tagged on the inner `kind` field.

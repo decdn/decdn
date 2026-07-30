@@ -374,7 +374,6 @@ fn build_config(
             pull_share_ratio_percent: decdn_cache::Percent::new(
                 decdn_common::config::DEFAULT_PULL_SHARE_RATIO_PERCENT,
             ),
-            pull_through_require_authorized_origin: false,
         },
         payment: ResolvedPayment {
             rate_per_mb: 10,

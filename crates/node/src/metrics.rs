@@ -1211,19 +1211,6 @@ pub struct DecdnMetrics {
     /// distinction lives — a rising value isolates near-empty-deposit abuse.
     /// Visible name: `decdn_serve_stream_rejected_insufficient_deposit_total`.
     pub serve_stream_rejected_insufficient_deposit: Counter,
-    /// `serve_stream` cache-miss requests refused before any upstream pull
-    /// because the operator's `pull_through_require_authorized_origin` gate is on
-    /// and the request's namespace has no currently-authorized origin (#821, ADR 037
-    /// §Seed-leech caps). The gate scopes on the namespace the requester *names*,
-    /// not on proven hash membership — under namespace-as-origin-addressing there
-    /// is no on-chain hash→namespace claim, so this sheds only requests naming a
-    /// namespace with no authorized origin, not arbitrary-hash warming behind a
-    /// live namespace. Wire-indistinguishable from `cache_miss` (signed as
-    /// `NotFound`), so this server-side counter is the only place the distinction
-    /// lives — a rising value shows how much unauthorized-namespace warming the gate
-    /// is shedding. Visible name:
-    /// `decdn_serve_stream_rejected_unauthorized_origin_total`.
-    pub serve_stream_rejected_unauthorized_origin: Counter,
     /// New delivery refused because the channel has a signed cooperative-close
     /// waiver (ADR 003 §Cooperative close) — the node committed to settling at
     /// the watermark and serves no further bytes. Wire-indistinguishable from
@@ -2070,11 +2057,6 @@ recorders! {
     /// (#856): the requesting channel could not cover the worst-case blob cost,
     /// so no upstream pull was started.
     serve_stream_rejected_insufficient_deposit => serve_stream_rejected_insufficient_deposit.inc();
-
-    /// Record a `serve_stream` cache-miss refused by the authorized-origin gate
-    /// (#821): `pull_through_require_authorized_origin` is on and the request's
-    /// namespace has no authorized origin, so no upstream pull was started.
-    serve_stream_rejected_unauthorized_origin => serve_stream_rejected_unauthorized_origin.inc();
 
     /// Record a `serve_stream` delivery refused because the channel has a signed
     /// cooperative-close waiver (ADR 003 §Cooperative close).
@@ -3190,7 +3172,6 @@ mod tests {
             "decdn_serve_stream_rejected_unknown_channel_total",
             "decdn_serve_stream_rejected_owner_mismatch_total",
             "decdn_serve_stream_rejected_insufficient_deposit_total",
-            "decdn_serve_stream_rejected_unauthorized_origin_total",
             "decdn_serve_stream_rejected_cooperative_close_signed_total",
             "decdn_cooperative_close_request_unauthorized_total",
         ];
@@ -3209,7 +3190,6 @@ mod tests {
         metrics.serve_stream_rejected_unknown_channel();
         metrics.serve_stream_rejected_owner_mismatch();
         metrics.serve_stream_rejected_insufficient_deposit();
-        metrics.serve_stream_rejected_unauthorized_origin();
         metrics.serve_stream_rejected_cooperative_close_signed();
         metrics.cooperative_close_request_unauthorized();
 
