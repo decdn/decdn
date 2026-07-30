@@ -184,11 +184,25 @@ impl ClientHandler {
         // so that cannot happen: there is no way to sign a refusal without the
         // caller having priced the request exactly once.
         //
-        // Deliberately BELOW the binding block: every exit above this point
-        // (`permit.is_none()`, a cooperative close, a malformed binding) returns
-        // without signing anything, so pricing them would meter a clamp for a
-        // request that never quoted a rate.
+        // Deliberately BELOW the binding block. Every exit above this point — a
+        // first-message read error, the stream-cap shed, a cooperative close, a
+        // malformed binding — returns without signing a `StreamResponse`, so none
+        // of them ever quotes a rate, and pricing them would meter a clamp for a
+        // request that never had a price. (The cooperative close does sign: an
+        // EIP-712 waiver, which carries no rate.)
         let rate_per_mb = self.clamped_rate();
+
+        // Honor a client voucher-interval proposal (ADR 003 §Voucher Interval
+        // Negotiation): accept the smaller of the proposal and our configured
+        // cadence, never below 1 MB. Resolved here rather than just before signing
+        // so the cache-miss deposit floor below prices against the SAME interval
+        // the serve gate and `deliver` use — otherwise a client proposing a smaller
+        // cadence would be judged against our larger one, making the floor
+        // strictly stricter than the gate it precedes.
+        let interval_mb = match ext.voucher_interval_mb {
+            Some(proposed) => self.voucher_interval_mb.min(proposed).max(1),
+            None => self.voucher_interval_mb,
+        };
 
         // Local-denylist gate (ADR 011 §Local Denylist, §On Blacklist Event
         // step 2: "reject any new StreamRequest for the hash immediately").
@@ -340,33 +354,71 @@ impl ClientHandler {
                 // Pre-spend deposit floor (#1519). Every fill tier below spends:
                 // the range and local tiers front the operator's own origin
                 // egress, and the buffered tier's `cache.populate` walks the paid
-                // `Peer` origin and fronts real upstream USDC. All three are gated
+                // `Peer` origin and fronts real upstream USDC. (The range tier is
+                // own-egress-only because `NodeOrigin` does not implement
+                // `Origin::fetch_range` — `pull_through_range` iterates every
+                // origin with no `local_only` filter, so the day it does, that tier
+                // starts fronting upstream USDC too. Nothing would fail.) All three are gated
                 // on channel OWNERSHIP (`pull_authorized`) and none on solvency,
                 // so before this floor a dust-deposit channel could name N absent
                 // hashes, make the node pay for each, and be refused afterwards by
                 // the serve-path gate — the attacker gains nothing, but the
                 // operator still pays. Refuse here instead, before any of it.
                 //
-                // The ceiling is deliberately WEAK — "can this channel pay for
-                // anything at all", one credit window — because `total_bytes` is
-                // unknowable before the fill, so the serve path's exact
-                // chunk-group-aligned span is unavailable here. An underfunded
-                // channel is caught; a merely small request is not pre-judged.
+                // The floor is one credit window, CAPPED BY THE REQUEST'S SPAN
+                // when the request bounds itself. A bounded range carries
+                // `byte_len`, so its billed size is knowable without `total_bytes`
+                // (align it out to chunk groups exactly as the serve path does —
+                // `export_bao_range_stream` serves the aligned superset). Pricing
+                // such a request at a whole window would refuse a client that can
+                // comfortably pay for the range it asked for, and it would do so
+                // ONLY on a cache miss — the serve gate prices the same request at
+                // the aligned span — so the same request would be served warm and
+                // refused cold. Worse, `decdn fetch` reads a refused resume as a
+                // possibly-stale partial, rewinds to zero and re-pays for the whole
+                // blob, so mispricing a bounded request doubles a user's bill.
                 //
-                // `window.rs` keeps its own guard, and the honest relationship is
-                // narrower than "two separate guards": `DEFAULT_PULL_AHEAD_BYTES`
-                // is exactly one interval, so at default settings that guard
-                // computes this same ceiling and is redundant with this one. It
-                // earns its place only once `max_blob_size_bytes` is finite, where
-                // it reserves the whole-blob cost — far stricter than this floor —
-                // and it is the tier that fronts UPSTREAM spend. Do not delete it
-                // on the strength of this floor alone.
+                // For an UNBOUNDED request (`byte_len == 0`: whole blob, or a tail
+                // from an offset) the billed size genuinely is unknowable pre-fill,
+                // so the window stands. Be clear about the residual that leaves,
+                // because it is not small: at stock config the window is 8 MiB
+                // (`DEFAULT_CREDIT_WINDOW_BYTES`, over a 4 MiB
+                // `DEFAULT_VOUCHER_INTERVAL_MB`), so a cold 100 KiB whole-blob
+                // fetch is priced at 8 MiB while the same blob served warm is
+                // priced at 100 KiB. A channel funded for the blob but not for a
+                // window is refused cold and served warm. Closing that needs the
+                // origin size probe to run before the floor, which is a larger
+                // change than this one.
+                //
+                // `window.rs` keeps its own guard. The honest relationship is
+                // narrower than "two separate guards": at default settings its
+                // `else` arm resolves to `max(pull_ahead, interval, credit_window)`
+                // = the credit window = this same floor, so it is redundant
+                // there. (Not because `DEFAULT_PULL_AHEAD_BYTES` equals one
+                // interval — it is 1 MiB against a 4 MiB default interval. The
+                // `.max(credit_window(..))` term is what makes them coincide.) It
+                // diverges once either `max_blob_size_bytes` is finite (it then
+                // reserves the whole-blob cost) or `pull_ahead_bytes` is raised
+                // above the window — nothing validates that pair against each
+                // other. Neither direction is guaranteed stricter: a 1 MiB blob cap
+                // under an 8 MiB window makes it WEAKER than this floor. It is also
+                // the tier that fronts UPSTREAM spend. Do not delete it on the
+                // strength of this floor alone.
                 //
                 // Skipped for an unknown channel: `pull_authorized` already
                 // refuses those before every tier, so there is no spend to gate.
                 if let Some(channel) = &known_channel {
-                    let interval_bytes = self.voucher_interval_mb.saturating_mul(MB_BYTES).max(1);
-                    let floor = min_payment(self.credit_window(interval_bytes), rate_per_mb);
+                    let interval_bytes = interval_mb.saturating_mul(MB_BYTES).max(1);
+                    let window = self.credit_window(interval_bytes);
+                    // `u64::MAX` stands in for the unknown blob size: both of
+                    // `align_range`'s clamps to it become no-ops, so this is the
+                    // aligned span the serve path would bill, never less.
+                    let reserved = if req.byte_len > 0 {
+                        aligned_span(req.byte_offset, req.byte_len, u64::MAX).min(window)
+                    } else {
+                        window
+                    };
+                    let floor = min_payment(reserved, rate_per_mb);
                     let (deposit, last_amount) = {
                         let guard = channel.lock().await;
                         (guard.state.deposit, guard.state.last_amount())
@@ -676,14 +728,6 @@ impl ClientHandler {
                     .await;
             }
         }
-
-        // Honor a client voucher-interval proposal (ADR 003 §Voucher Interval
-        // Negotiation): accept the smaller of the proposal and our configured
-        // cadence, never below 1 MB.
-        let interval_mb = match ext.voucher_interval_mb {
-            Some(proposed) => self.voucher_interval_mb.min(proposed).max(1),
-            None => self.voucher_interval_mb,
-        };
 
         // Pre-flight deposit gate — the direct-serve twin of the pull-through
         // guard in `window.rs` (keep the two in step). Without it the node signs

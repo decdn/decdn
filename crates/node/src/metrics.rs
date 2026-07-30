@@ -948,9 +948,16 @@ pub struct DecdnMetrics {
     /// [`Self::serve_stream_rejected_insufficient_deposit`]), so a node whose own
     /// deposit is too small to buy anything sees 100% of its pulls refused with
     /// nothing in its own telemetry saying so. Before this the arm bumped no
-    /// counter at all and logged at `debug`. A rate approaching
-    /// `node_pull_refused` means "nobody will serve me", which is a local problem;
-    /// a small fraction is the healthy "that peer did not have it".
+    /// counter at all and logged at `debug`.
+    ///
+    /// Read it with one caveat: `Transient` is `NotFound | Overloaded`, and
+    /// `Overloaded` is the PEER's backpressure — not local, and the code's own
+    /// policy is to respect rather than punish it. So a network-wide load event
+    /// drives this ratio to ~1 for a reason no local change fixes. A rate
+    /// approaching `node_pull_refused` therefore means "nobody is serving me",
+    /// which is *usually* local (deposit, binding) but is worth confirming against
+    /// peer health first; a small fraction is the healthy "that peer did not
+    /// have it".
     pub node_pull_refused_unattributable: Counter,
     /// `decdn_node_pull_stalled_total` (#1134): an upstream went silent mid-stream
     /// — no byte of progress within `node_pull_stall_timeout_sec` — so the pull was
@@ -1216,7 +1223,9 @@ pub struct DecdnMetrics {
     /// requesting channel's remaining deposit could not cover what the node
     /// would front at its rate. (The refusal itself is signed — as an `ok: false`
     /// response; what is never signed is an `ok: true`.) **Three** guards bump
-    /// this, in firing order:
+    /// this. Not a sequence any one request walks: a cache HIT reaches only (3),
+    /// and the window tier returns out of `serve_stream`, so (2) and (3) are
+    /// mutually exclusive. A miss passes (1) and then at most one of (2)/(3):
     /// 1. the cache-miss **floor** (#1519) — one credit window, applied above
     ///    every fill tier so none of them fronts origin egress or upstream USDC
     ///    for a channel that cannot pay for a single interval;
@@ -3199,8 +3208,10 @@ mod tests {
             "decdn_serve_stream_rejected_owner_mismatch_total",
             "decdn_serve_stream_rejected_insufficient_deposit_total",
             "decdn_serve_stream_rejected_cooperative_close_signed_total",
-            // Completed in #1520: these four were missing, so nothing pinned that
-            // they export at zero and a dashboard querying them read `(no data)`.
+            // Completed in #1520. These four always exported (the fields have
+            // existed as long as their siblings) — what was missing was any
+            // assertion pinning it, so a rename could have silently broken a
+            // dashboard without failing this test.
             "decdn_serve_stream_rejected_range_not_satisfiable_total",
             "decdn_serve_stream_rejected_hash_denied_total",
             "decdn_serve_stream_rejected_chain_hash_denied_total",

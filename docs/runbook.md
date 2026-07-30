@@ -345,11 +345,13 @@ revenue flat while requests arrive; `decdn fetch` against this node returns
   to divide by.
 - The node's own throttled `warn!` ("refusing paying clients: remaining channel
   deposit below the reserved cost"), at most one per 5 minutes, carrying the
-  channel id, the shortfall, and how many refusals it suppressed since the last
-  line. Raise the log level to `debug` for one line per refusal.
-- Grafana panel **Payment-class serve refusals**. All four series on it collapse
-  to the same `NotFound` wire code, so a client cannot distinguish them and these
-  counters are the only place the cause exists.
+  channel id, the remaining headroom, the amount reserved, and how many refusals it
+  suppressed since the last line. Raise the log level to `debug` for one line per
+  refusal — that one also carries the hash.
+- Grafana panel **Payment-class serve refusals (all collapse to NotFound)**. Its
+  four series are four of the seven reject reasons that share that one wire code, so
+  a client cannot distinguish them and the server-side counters are the only place
+  the cause exists at all.
 
 **Causes:** two, with opposite remedies, and the counter alone cannot tell them
 apart — this is why the log line exists:
@@ -374,13 +376,14 @@ refused — look for `decdn_node_pull_refused_unattributable_total` climbing tow
    disagreement is cause (2).
 2. For cause (2), check watcher liveness —
    `decdn_settlement_watcher_last_tick_timestamp_seconds` should advance every
-   `blockchain.event_poll_interval_sec`. A stalled watcher usually means the RPC
+   `blockchain.event_poll_interval_ms`. A stalled watcher usually means the RPC
    endpoint is unreachable or rate-limiting; see [RPC unreachable](#rpc-unreachable).
 3. For cause (1), no action. If the rate is high because many clients open dust
    channels deliberately, note that the refusal now happens *before* any fill
    (#1519), so it costs this node nothing beyond the signature.
 4. Do not raise a deposit floor to "fix" this. There is no on-chain minimum
-   deposit ([ADR 003 § Deposit Economics](../adr/003-payments.md#deposit-economics));
+   deposit beyond non-zero
+   ([ADR 003 § Deposit Economics](../adr/003-payments.md#deposit-economics));
    service is bounded by what a deposit funds, which is exactly what this refusal
    is enforcing.
 

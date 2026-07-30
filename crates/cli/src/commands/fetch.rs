@@ -736,14 +736,21 @@ where
 /// calls that share a channel (`ctx`/`provider`) — vouchers on one channel use a
 /// strictly-increasing nonce, so two in-flight fetches on the same channel would
 /// race it.
-/// Reconnect an opaque `delivery refused: NotFound` to its likely cause when the
-/// request went out WITHOUT an ADR 005 client binding. An unbound request (no
+/// Reconnect an opaque `delivery refused: NotFound` to its likely cause(s).
+///
+/// Two causes are checked, and BOTH may be attached: the channel cannot cover what
+/// the node reserves before serving, and/or the request carried no ADR 005 client
+/// binding. They are independent — an unbound fetch on a drained channel is both,
+/// and fixing only the one we happened to name first leaves the retry failing
+/// identically. An unbound request (no
 /// `blockchain.capacity_bond_address`, so nothing to sign) cannot authorize the
 /// node to reactively pull a cache-missed blob from its origin, so the node
 /// returns a bare `NotFound` — indistinguishable, without this, from a genuinely
-/// absent/blacklisted/wrong hash. Scoped to `NotFound` (a size/blacklist refusal
-/// is not fixed by a binding) and to unbound contexts, so a bound fetch's error
-/// is passed through untouched. Every other error is returned verbatim.
+/// absent/blacklisted/wrong hash. Scoped to `NotFound` — a size or blacklist
+/// refusal is fixed by neither cause — so every other error is returned verbatim.
+/// A BOUND fetch is no longer passed through untouched: the deposit cause applies
+/// to it too, and is the more common one now that #1519 refuses an underfunded
+/// channel before any fill.
 fn annotate_unbound_cache_miss(err: anyhow::Error, ctx: &ChannelContext) -> anyhow::Error {
     let Some(refused) = err.downcast_ref::<UpstreamRefused>() else {
         return err;
@@ -752,41 +759,66 @@ fn annotate_unbound_cache_miss(err: anyhow::Error, ctx: &ChannelContext) -> anyh
         return err;
     }
 
+    // Both causes are checked and BOTH may attach. They are independent — an
+    // unbound fetch on a drained channel is both — and naming only the first
+    // leaves the user fixing one and retrying into the other.
+    let mut causes: Vec<String> = Vec::new();
+
     // Cause (a): our channel cannot cover what the node reserves before serving
-    // (#1516/#1519). Checked FIRST because it is the one we can prove rather than
-    // guess: the signed refusal carries the node's quoted `rate_per_mb`, and the
-    // channel's own deposit and cumulative paid amount are right here, so the
-    // shortfall is arithmetic. This reasons only about OUR channel from data the
-    // node already sent us, so it does not weaken the deliberate collapse of seven
-    // reject reasons onto `NotFound` (which exists so a prober cannot map other
-    // clients' balances).
+    // (#1516/#1519). The signed refusal carries the node's quoted `rate_per_mb`,
+    // and the channel's own deposit and cumulative paid amount are right here, so
+    // the comparison uses only OUR channel and data the node already sent us — it
+    // does not weaken the deliberate collapse of seven reject reasons onto
+    // `NotFound` (which exists so a prober cannot map other clients' balances).
     //
-    // One credit window is the node's floor; we do not know its configured
-    // interval, so use the protocol default. That makes this a heuristic for the
-    // MESSAGE only — it never changes what we do.
+    // The threshold is an ESTIMATE, not a proof: the node's floor is one credit
+    // window at ITS configuration, which we cannot read. Estimated with the shipped
+    // defaults — 8 MiB (`DEFAULT_CREDIT_WINDOW_BYTES`) over a 4 MiB
+    // `DEFAULT_VOUCHER_INTERVAL_MB`, so the window is the binding term. (The
+    // *protocol* 1 MiB interval would under-estimate by 8x and stay silent across
+    // exactly the headroom band a stock node refuses in.) An operator who raised
+    // `credit_window_bytes` has a higher floor than this, so the miss direction is
+    // "we stay silent when we could have spoken" — never a fabricated shortfall.
+    // Phrased as a possibility, and as a lower bound, for that reason.
     if let Some(quoted_rate) = refused.evidence().map(|resp| resp.body.rate_per_mb) {
         let headroom = ctx.deposit.saturating_sub(ctx.prior_amount);
-        let one_window = min_payment(decdn_protocol::MB_BYTES, quoted_rate);
-        if quoted_rate > 0 && headroom < one_window {
-            return err.context(format!(
-                "this channel's remaining deposit ({headroom}) is below the ~{one_window} \
-                 the node reserves before serving at its quoted rate of {quoted_rate} \
-                 per MB; top it up (`decdn channel top-up`) or open a larger one \
-                 (`--deposit-micro-usdc`)"
+        let estimate = min_payment(
+            decdn_common::config::DEFAULT_CREDIT_WINDOW_BYTES,
+            quoted_rate,
+        );
+        if quoted_rate > 0 && headroom < estimate {
+            causes.push(format!(
+                "this channel's remaining deposit ({headroom}) is below the AT LEAST                  ~{estimate} the node reserves before serving at its quoted rate of                  {quoted_rate} per MB (it may reserve several times this, depending on                  its configured credit window). The fetch path already auto-refills                  below a low-water mark, so reaching this means the configured working                  deposit is itself too small: raise `--deposit-micro-usdc` (or                  `blockchain.buyer_deposit_micro_usdc`) and retry"
             ));
         }
     }
 
     // Cause (b): no binding, so the node would not reactively pull for us.
     if ctx.client_binding.is_none() {
-        return err.context(
-            "one possible cause: no client identity binding was sent because \
+        causes.push(
+            "no client identity binding was sent because \
              blockchain.capacity_bond_address is unset, so the node could not \
              reactively pull this cache-missed blob from its origin; set \
-             blockchain.capacity_bond_address to enable reactive pull-through",
+             blockchain.capacity_bond_address to enable reactive pull-through"
+                .to_string(),
         );
     }
-    err
+
+    match causes.len() {
+        0 => err,
+        1 => err.context(causes.concat()),
+        // Numbered rather than joined with "and": each clause is a full sentence
+        // with its own remedy, so a reader needs to see they are separate fixes.
+        n => err.context(format!(
+            "{n} possible causes: {}",
+            causes
+                .iter()
+                .enumerate()
+                .map(|(i, c)| format!("({}) {c}", i + 1))
+                .collect::<Vec<_>>()
+                .join("; ")
+        )),
+    }
 }
 
 /// The scratch file a streaming fetch writes into before it is promoted to

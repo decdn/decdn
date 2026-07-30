@@ -289,8 +289,11 @@ impl Drop for BgInflightGuard {
 /// `last_warn_ms`, or nothing has ever been warned (`last_warn_ms == 0`).
 ///
 /// Pure and millisecond-based so the throttle is testable without sleeping. A
-/// clock that jumps backwards yields `false` (via the saturating subtraction),
-/// which suppresses rather than spams — the safe direction for a log gate.
+/// clock that steps behind `last_warn_ms` yields `false` (via the saturating
+/// subtraction), suppressing rather than spamming. Note the asymmetry that leaves:
+/// a clock that jumps FORWARD parks `last_warn_ms` in the future, so the gate stays
+/// shut for the size of the jump rather than for `interval` — see
+/// [`ClientHandler::note_deposit_refusal`] for why that is tolerated.
 fn should_warn_now(now_ms: u64, last_warn_ms: u64, interval: Duration) -> bool {
     if last_warn_ms == 0 {
         return true;
@@ -1079,18 +1082,6 @@ impl ClientHandler {
             .map_err(|e| StoreError::Backend(format!("forget_channel join: {e}")))?
     }
 
-    /// The effective downstream credit window in bytes for a stream whose
-    /// negotiated voucher interval is `interval_bytes` (ADR 003 §Credit window).
-    ///
-    /// The serve loop keeps `delivered − paid` within this bound before it must
-    /// collect a voucher, so it is exactly the node's bounded credit exposure:
-    /// unbilled egress already on the wire, capped here and nowhere else. Floored
-    /// at one interval so the loop can always make progress (deliver a full
-    /// interval, then recoup it) — a configured window below one interval, or the
-    /// unconfigured `None`, both collapse to the interval, which reproduces the
-    /// pre-credit-window stop-and-wait cadence exactly. The floor is also what
-    /// rules out a deadlock: whenever the window blocks further delivery, at least
-    /// one full interval is unpaid, so there is always a voucher to collect.
     /// Minimum gap between insufficient-deposit `warn!` lines (#1520).
     ///
     /// A module const, not a config field: a log cadence does not justify the five
@@ -1174,6 +1165,18 @@ impl ClientHandler {
         }
     }
 
+    /// The effective downstream credit window in bytes for a stream whose
+    /// negotiated voucher interval is `interval_bytes` (ADR 003 §Credit window).
+    ///
+    /// The serve loop keeps `delivered − paid` within this bound before it must
+    /// collect a voucher, so it is exactly the node's bounded credit exposure:
+    /// unbilled egress already on the wire, capped here and nowhere else. Floored
+    /// at one interval so the loop can always make progress (deliver a full
+    /// interval, then recoup it) — a configured window below one interval, or the
+    /// unconfigured `None`, both collapse to the interval, which reproduces the
+    /// pre-credit-window stop-and-wait cadence exactly. The floor is also what
+    /// rules out a deadlock: whenever the window blocks further delivery, at least
+    /// one full interval is unpaid, so there is always a voucher to collect.
     pub(super) fn credit_window(&self, interval_bytes: u64) -> u64 {
         self.credit_window_bytes
             .as_ref()
@@ -1957,10 +1960,6 @@ mod tests {
         );
     }
 
-    /// ADR 011 §`StreamRequest` Response names distinct refusal codes for the two
-    /// takedown reasons. They must NOT join the seven-reason `NotFound` collapse:
-    /// a client told `NotFound` retries elsewhere and pays again, which for
-    /// `OriginBlacklisted` is advice that can never succeed.
     #[test]
     fn deposit_refusal_warn_fires_on_the_first_refusal_then_waits_out_the_window() {
         let interval = Duration::from_mins(5);
@@ -1978,6 +1977,48 @@ mod tests {
         assert!(should_warn_now(last + 600_000, last, interval));
     }
 
+    /// The atomic path, which `should_warn_now`'s two tests do not touch. The
+    /// suppressed count IS the feature — it is what distinguishes one dry client
+    /// from a node refusing everyone — and every part of producing it was
+    /// unverified: the `fetch_add` before the gate, the `swap(0)`, and the
+    /// `saturating_sub(1)` that removes the winner's own event from its own report.
+    ///
+    /// Mutants this kills: dropping the `-1` (every line off by one); moving the
+    /// `fetch_add` after the gate (the first warn reports 0 forever and nothing
+    /// accumulates); `swap` → `load` (the count grows monotonically and "suppressed
+    /// since the last line" becomes meaningless).
+    ///
+    /// No sleeping and no clock injection: the window is forced open by writing
+    /// `last_warn_ms` back to 1, which is what a test in the same module can do.
+    #[tokio::test]
+    async fn deposit_refusal_warn_reports_exactly_what_it_swallowed() {
+        let metrics = Arc::new(Metrics::new());
+        let (handler, _dir) = handler_for_warm_tests(&metrics, None).await;
+
+        // First refusal is always visible, and has swallowed nothing.
+        assert_eq!(handler.note_deposit_refusal(), Some(0));
+        // Inside the window: silent, but counting.
+        assert_eq!(handler.note_deposit_refusal(), None);
+        assert_eq!(handler.note_deposit_refusal(), None);
+
+        // Force the window open. `1`, not `0` — `0` is the never-warned sentinel.
+        handler
+            .deposit_refusal_last_warn_ms
+            .store(1, Ordering::Relaxed);
+        assert_eq!(
+            handler.note_deposit_refusal(),
+            Some(2),
+            "the line must report the two it swallowed, not counting itself"
+        );
+
+        // And the counter reset, so the next window starts from zero.
+        assert_eq!(handler.note_deposit_refusal(), None);
+        handler
+            .deposit_refusal_last_warn_ms
+            .store(1, Ordering::Relaxed);
+        assert_eq!(handler.note_deposit_refusal(), Some(1));
+    }
+
     #[test]
     fn deposit_refusal_warn_suppresses_rather_than_spams_on_a_backwards_clock() {
         // A clock that steps backwards (NTP correction, VM migration) makes
@@ -1988,6 +2029,10 @@ mod tests {
         assert!(!should_warn_now(500, 1_000_000, interval));
     }
 
+    /// ADR 011 §`StreamRequest` Response names distinct refusal codes for the two
+    /// takedown reasons. They must NOT join the seven-reason `NotFound` collapse:
+    /// a client told `NotFound` retries elsewhere and pays again, which for
+    /// `OriginBlacklisted` is advice that can never succeed.
     #[test]
     fn takedown_reject_reasons_do_not_collapse_to_not_found() {
         assert_eq!(

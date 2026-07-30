@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use alloy::dyn_abi::Eip712Domain;
-use alloy::primitives::{Address, TxHash, U256};
+use alloy::primitives::{Address, FixedBytes, TxHash, U256};
 use alloy::providers::Provider;
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::{Context, Result};
@@ -310,12 +310,18 @@ pub async fn open_channel<P: Provider + Clone>(
     // Record what the contract CREDITED, not what we asked it to transfer.
     // `openChannel` sets `ch.deposit` to the measured balance delta and emits that
     // in `ChannelOpened.deposit`, precisely so a fee-on-transfer token cannot
-    // over-state a channel against the shared USDC pool. Recording the requested
-    // amount would put the over-statement in our own row instead: our vouchers
-    // would climb past the on-chain deposit and `_advanceClaimWatermark` would
-    // revert at `withdraw`/`settleChannel`, leaving the seller holding delivered
-    // bytes it can never claim. `channelId` and `expiresAt` were already taken
-    // from this event; `deposit` was the one field still read from the argument.
+    // over-state a channel against the shared USDC pool.
+    //
+    // Recording the requested amount puts the over-statement in our own row. The
+    // harm is buyer-side, not a settlement revert: nothing here bounds vouchers by
+    // this field (`ChannelContext::deposit` is informational — the seller enforces
+    // the real one, refusing off-chain via `stage_voucher`'s `AmountExceedsDeposit`
+    // long before any on-chain call). What breaks is our own headroom arithmetic:
+    // `refill_amount` reads `deposit - prior_amount` from the inflated row, so the
+    // auto-refill fires late or short, and because `add_deposit` accumulates, the
+    // drift compounds with every top-up until every seller refuses us. `channelId`
+    // and `expiresAt` were already taken from this event; `deposit` was the one
+    // field still read from the argument.
     let credited = opened.deposit;
     let state = BuyerChannelState::new(
         channel_id,
@@ -336,6 +342,124 @@ pub async fn open_channel<P: Provider + Clone>(
         "opened buyer payment channel"
     );
     Ok(OpenedChannel { state, ctx, tx })
+}
+
+/// Log the local-credit outcome of a landed `topUp` at the right severity.
+///
+/// Extracted from [`top_up`] to keep it under the cognitive-complexity limit. The
+/// severities are the point: by the time any of these fire the deposit is already
+/// escrowed on-chain, so `UnknownChannel` means escrowed-and-untracked (matching
+/// the open path's posture) while `ChannelMismatch` leaves the provider reclaimable.
+fn log_top_up_outcome(
+    outcome: &DepositOutcome,
+    provider_addr: Address,
+    channel_id: FixedBytes<32>,
+    additional: U256,
+    tx: TxHash,
+) {
+    match outcome {
+        DepositOutcome::Added(new_deposit) => {
+            info!(
+                provider = %provider_addr,
+                %channel_id,
+                %new_deposit,
+                %tx,
+                "topped up buyer channel"
+            );
+        }
+        // The on-chain topUp already credited `channel_id`, but the local row
+        // vanished during the RPC. Funds are escrowed on-chain with zero local
+        // tracking — `error!` (matching the open path's escrowed-but-untracked
+        // posture) and surface the tx for reconcile.
+        DepositOutcome::UnknownChannel => {
+            error!(
+                provider = %provider_addr,
+                %channel_id,
+                %additional,
+                %tx,
+                "top_up: on-chain topUp landed but no local channel record exists to credit; \
+                 deposit is escrowed on-chain and untracked — reconcile against the tx"
+            );
+        }
+        // A row still exists (for a different channel), so the provider stays
+        // reclaimable — less severe than `UnknownProvider`, hence `warn!`.
+        DepositOutcome::ChannelMismatch => {
+            warn!(
+                provider = %provider_addr,
+                %channel_id,
+                %additional,
+                %tx,
+                "top_up: provider channel replaced during the topUp RPC; the on-chain deposit \
+                 was credited to the topped-up channel but the local record now tracks a \
+                 different channel — reconcile against the tx"
+            );
+        }
+    }
+}
+
+/// How much a landed `topUp` actually credited on-chain.
+///
+/// `topUp` adds the measured balance DELTA, not the requested amount, so a
+/// fee-on-transfer token cannot over-state a channel — and the local row has to
+/// mirror that or the buyer's own headroom arithmetic drifts (see `top_up`).
+/// Normally that value is `ChannelToppedUp.additionalDeposit`.
+///
+/// Extracted from [`top_up`] both to keep that function under the complexity limit
+/// and because the three-way fallback is the part worth reading on its own.
+async fn resolve_top_up_credit<P: Provider + Clone>(
+    contract: &PaymentChannel::PaymentChannelInstance<P>,
+    channel_id: FixedBytes<32>,
+    additional: U256,
+    prior_deposit: U256,
+    tx: TxHash,
+    receipt: &alloy::rpc::types::TransactionReceipt,
+) -> U256 {
+    // Filtered on the emitting address, not just the topic: `topUp` transfers
+    // BEFORE it emits, so a token with a transfer hook could plant a forged
+    // `ChannelToppedUp` earlier in the same receipt and `find` would prefer it. Not
+    // reachable today (the settlement token's address is immutable at deployment),
+    // but this function's whole premise is a token that misbehaves during transfer,
+    // so the one assumption it rests on should not be the unchecked one.
+    if let Some(ev) = receipt
+        .inner
+        .logs()
+        .iter()
+        .filter(|log| log.address() == *contract.address())
+        .filter_map(|log| log.log_decode::<PaymentChannel::ChannelToppedUp>().ok())
+        .map(|decoded| decoded.inner.data)
+        .find(|ev| ev.channelId == channel_id)
+    {
+        return ev.additionalDeposit;
+    }
+
+    // No event for our channel means our view of the contract is wrong (an ABI
+    // skew, a swallowed log) — which is exactly the state in which guessing
+    // `additional` is least defensible, since the same skew invalidates the
+    // assumption that `additional` is still the right quantity. Read the truth
+    // instead: the funds are already escrowed, so one extra `eth_call` is cheap and
+    // `getChannel` is the value we were trying to mirror anyway.
+    match contract.getChannel(channel_id).call().await {
+        Ok(ch) => {
+            warn!(
+                %channel_id, %tx,
+                "topUp receipt carried no ChannelToppedUp for this channel; \
+                 reconciled the deposit against getChannel instead"
+            );
+            // Delta against the pre-RPC snapshot. Exact unless a concurrent top-up
+            // landed during our own RPC, which would make this credit too large —
+            // acceptable only because we are already in the "our ABI is wrong"
+            // state, and still strictly better than a number the chain never saw.
+            ch.deposit.saturating_sub(prior_deposit)
+        }
+        Err(e) => {
+            error!(
+                %channel_id, %tx, error = %e,
+                "topUp landed but neither its event nor getChannel could be read; \
+                 crediting the requested amount, which may over-state the local row"
+            );
+            additional
+        }
+    }
 }
 
 /// Add `additional` USDC to the buyer channel tracked for `provider_addr` and
@@ -383,12 +507,14 @@ where
     S: BuyerChannelStore + ?Sized,
 {
     // Read the channel_id BEFORE the RPC — needed for `topUp` and as the
-    // channel-id guard on the post-RPC write.
-    let channel_id = store
+    // channel-id guard on the post-RPC write. The deposit snapshot alongside it is
+    // used ONLY as the baseline for the degraded reconcile path below, never for
+    // the normal credit.
+    let row = store
         .get_by_provider(provider_addr)
         .context("look up buyer channel for top-up")?
-        .with_context(|| format!("top_up for unknown provider {provider_addr}"))?
-        .channel_id;
+        .with_context(|| format!("top_up for unknown provider {provider_addr}"))?;
+    let (channel_id, prior_deposit) = (row.channel_id, row.deposit);
     let receipt = contract
         .topUp(channel_id, additional)
         .send()
@@ -404,72 +530,19 @@ where
     // Credit the *committed* deposit inside a write txn (never the pre-RPC
     // snapshot), channel-id-guarded so a concurrent advance/reuse during the RPC
     // is not clobbered.
-    // Credit what the contract credited, for the same reason `open_channel` does:
-    // `topUp` adds the measured balance delta and emits it as
-    // `ChannelToppedUp.additionalDeposit`. If the event is missing (an ABI skew, a
-    // proxy that swallowed it) fall back to the requested amount and say so — that
-    // is the pre-existing behaviour, and it is better than failing a top-up whose
-    // funds are already escrowed on-chain.
-    let credited = receipt
-        .inner
-        .logs()
-        .iter()
-        .filter_map(|log| log.log_decode::<PaymentChannel::ChannelToppedUp>().ok())
-        .map(|decoded| decoded.inner.data)
-        .find(|ev| ev.channelId == channel_id)
-        .map_or_else(
-            || {
-                warn!(
-                    %channel_id,
-                    %tx,
-                    "topUp receipt carried no ChannelToppedUp for this channel; \
-                     crediting the requested amount"
-                );
-                additional
-            },
-            |ev| ev.additionalDeposit,
-        );
+    let credited = resolve_top_up_credit(
+        contract,
+        channel_id,
+        additional,
+        prior_deposit,
+        tx,
+        &receipt,
+    )
+    .await;
     let outcome = store
         .add_deposit(provider_addr, channel_id, credited)
         .context("persist buyer channel top-up")?;
-    match &outcome {
-        DepositOutcome::Added(new_deposit) => {
-            info!(
-                provider = %provider_addr,
-                %channel_id,
-                %new_deposit,
-                %tx,
-                "topped up buyer channel"
-            );
-        }
-        // The on-chain topUp already credited `channel_id`, but the local row
-        // vanished during the RPC. Funds are escrowed on-chain with zero local
-        // tracking — `error!` (matching the open path's escrowed-but-untracked
-        // posture) and surface the tx for reconcile.
-        DepositOutcome::UnknownChannel => {
-            error!(
-                provider = %provider_addr,
-                %channel_id,
-                %additional,
-                %tx,
-                "top_up: on-chain topUp landed but no local channel record exists to credit; \
-                 deposit is escrowed on-chain and untracked — reconcile against the tx"
-            );
-        }
-        // A row still exists (for a different channel), so the provider stays
-        // reclaimable — less severe than `UnknownProvider`, hence `warn!`.
-        DepositOutcome::ChannelMismatch => {
-            warn!(
-                provider = %provider_addr,
-                %channel_id,
-                %additional,
-                %tx,
-                "top_up: provider channel replaced during the topUp RPC; the on-chain deposit \
-                 was credited to the topped-up channel but the local record now tracks a \
-                 different channel — reconcile against the tx"
-            );
-        }
-    }
+    log_top_up_outcome(&outcome, provider_addr, channel_id, additional, tx);
     Ok(outcome)
 }
 

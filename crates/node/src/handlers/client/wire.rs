@@ -85,7 +85,7 @@ impl ClientHandler {
     /// Send a signed `StreamResponse { ok: false, error }` (delivery-side
     /// failure), then finish the stream. `reason` is the single source of truth:
     /// it both selects the per-reason metric (finer-grained than the wire for the
-    /// three `NotFound` cases, which collapse to one code to avoid leaking channel
+    /// seven `NotFound` cases, which collapse to one code to avoid leaking channel
     /// existence) and derives the wire `StreamError` via `wire_error()` (#876).
     /// The metric
     /// is bumped before the network write so a refusal is counted even if the
@@ -96,9 +96,12 @@ impl ClientHandler {
     /// side-effecting — it bumps `rate_bounds_clamped` and warns when the
     /// configured rate sits below the on-chain delivery floor — so a caller that
     /// priced the request and then refused would double-count it (#1518). Taking
-    /// the price as a parameter makes the one-call-per-request invariant a
-    /// property the compiler checks: `serve_stream` has the crate's only
-    /// production `clamped_rate()` call, and every refusal is handed its result.
+    /// the price as a parameter is what stops this function recomputing it
+    /// implicitly — which is the shape the bug took. It does not make the invariant
+    /// fully type-checked: a caller can still pass `self.clamped_rate()` inline, or
+    /// `0`, or another request's rate. What holds it today is that `serve_stream`
+    /// has the crate's only production `clamped_rate()` call and threads that one
+    /// value everywhere, which is a grep-verified property, not a typed one.
     pub(super) async fn respond_error(
         &self,
         send: &mut SendStream,

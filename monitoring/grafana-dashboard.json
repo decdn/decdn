@@ -342,7 +342,7 @@
     },
     {
       "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
-      "description": "Delivery refusals whose cause is a payment problem, not availability (#1520). All four collapse to the same NotFound wire code so a client cannot tell them apart — these counters are the only place the cause exists. `insufficient deposit` is fed by three guards (the pre-spend miss floor, the window tier's ceiling, and the direct-serve ceiling) and cannot attribute a spike to one; the node's throttled warn! line does. Sustained insufficient-deposit means either clients running dry (no action) or this node's chain watcher lagging an on-chain top-up, in which case funded clients are being turned away.",
+      "description": "Delivery refusals that share the NotFound wire code (#1520). The first three are payment-class; `cache miss` is availability and is plotted as the baseline to read the others against. All four collapse to the same NotFound wire code so a client cannot tell them apart — these counters are the only place the cause exists. `insufficient deposit` is fed by three guards (the pre-spend miss floor, the window tier's ceiling, and the direct-serve ceiling) and cannot attribute a spike to one; the node's throttled warn! line does. Sustained insufficient-deposit means either clients running dry (no action) or this node's chain watcher lagging an on-chain top-up, in which case funded clients are being turned away.",
       "fieldConfig": {
         "defaults": {
           "color": {"mode": "palette-classic"},

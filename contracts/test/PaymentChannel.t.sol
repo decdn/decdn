@@ -2253,17 +2253,28 @@ contract PaymentChannelTest is Test {
 // ---------------------------------------------------------------------------
 
 /// @dev A settlement token that burns a fixed share of every transfer, so the
-///      recipient's balance rises by less than the amount sent. Overriding
-///      `_update` is OZ v5's hook for this (same technique as
-///      `MaliciousERC20` in `TestnetFaucet.t.sol`).
+///      recipient's balance rises by less than the amount sent. `_update` is OZ
+///      v5's hook for intercepting a transfer — the same hook `MaliciousERC20` in
+///      `TestnetFaucet.t.sol` uses, though that one is a reentrancy mock and
+///      leaves the amount alone.
 ///
 ///      `PaymentChannel` credits the measured balance DELTA rather than the
 ///      requested amount, specifically so a token like this cannot over-state a
 ///      channel's share of the shared pool. Nothing tested that, because the
 ///      suite had no fee-bearing token — the guards and the delta arithmetic were
 ///      unexercised on every path. This is not a token deCDN will ever configure
-///      (the USDC address is immutable at deployment and mainnet USDC is not
-///      fee-on-transfer); it exists to turn an assumption into an assertion.
+///      (mainnet USDC is not fee-on-transfer today). Note what actually protects
+///      us: the token's ADDRESS is immutable at deployment, not its behaviour —
+///      real USDC is an upgradeable proxy, which is the hazard
+///      `src/PaymentChannel.sol`'s own comment names. So this turns an assumption
+///      into an assertion, and the assumption is narrower than "USDC will never
+///      do this".
+///
+///      Scope: the INBOUND legs only (`openChannel`, `topUp`). The payout legs
+///      (`withdraw`, `settleChannel`, the `FeeRouter` hand-off) are untested under
+///      a shaving token — `PaymentChannel`'s own accounting survives an outbound
+///      shave since its balance drops by the full amount, but `FeeRouter` would
+///      receive less than it records.
 contract FeeOnTransferUSDC is ERC20 {
     /// @dev Burn share in basis points. `10_000` confiscates the whole transfer,
     ///      which is what reaches the post-transfer `ZeroAmount` guards.
@@ -2278,6 +2289,10 @@ contract FeeOnTransferUSDC is ERC20 {
     ///      under test would be `ERC20InsufficientBalance` rather than the
     ///      post-transfer guard we mean to exercise.
     function setFeeBps(uint256 feeBps_) external {
+        // Bounded so a typo cannot make `value - fee` underflow and revert inside
+        // `_update`, which would surface as an opaque arithmetic panic rather than
+        // as the guard a test meant to exercise.
+        require(feeBps_ <= 10_000, "fee > 100%");
         feeBps = feeBps_;
     }
 
@@ -2286,8 +2301,10 @@ contract FeeOnTransferUSDC is ERC20 {
     }
 
     function _update(address from, address to, uint256 value) internal override {
-        // Mint and burn (either endpoint zero) must pass through untouched, or
-        // the constructor's own `_mint` would be shaved too.
+        // Mint and burn pass through untouched. Defensive rather than load-bearing
+        // for the constructor's `_mint` (which is covered by `feeBps == 0`, the
+        // default) — it is the fee-burn leg below that must not recurse into a
+        // second fee, and keeping both endpoints explicit says so.
         if (from == address(0) || to == address(0) || feeBps == 0) {
             super._update(from, to, value);
             return;
@@ -2378,6 +2395,9 @@ contract PaymentChannelFeeOnTransferTest is Test {
             if (logs[i].topics[0] == keccak256("ChannelOpened(bytes32,address,address,uint256,uint256,address)")) {
                 (uint256 deposit,,) = abi.decode(logs[i].data, (uint256, uint256, address));
                 assertEq(deposit, expected, "event deposit is the received delta");
+                // Anchored to the real balance too, so the mock's own fee formula
+                // is not part of the oracle.
+                assertEq(deposit, usdc.balanceOf(address(channel)), "and to the balance");
                 assertEq(logs[i].topics[1], id);
                 found = true;
             }
@@ -2397,6 +2417,7 @@ contract PaymentChannelFeeOnTransferTest is Test {
         channel.topUp(id, top);
 
         assertEq(channel.getChannel(id).deposit, opened + credited, "top-up credits its delta");
+        assertEq(usdc.balanceOf(address(channel)), opened + credited, "and it matches the real balance");
     }
 
     /// @dev The post-transfer guard, which no test could reach before: a token that
@@ -2418,10 +2439,14 @@ contract PaymentChannelFeeOnTransferTest is Test {
         assertEq(channel.getChannel(id).deposit, DEPOSIT, "opened at full value");
 
         usdc.setFeeBps(10_000);
+        uint256 clientBefore = usdc.balanceOf(client);
         vm.prank(client);
         vm.expectRevert(PaymentChannel.ZeroAmount.selector);
         channel.topUp(id, 500e6);
 
-        assertEq(channel.getChannel(id).deposit, DEPOSIT, "and the deposit is unchanged");
+        // Not `getChannel(...).deposit == DEPOSIT` — a reverted call rolls state
+        // back by definition, so that would assert nothing. What is worth pinning
+        // is that the client's funds were not confiscated by the reverted attempt.
+        assertEq(usdc.balanceOf(client), clientBefore, "client keeps its funds");
     }
 }
