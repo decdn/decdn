@@ -35,9 +35,25 @@ contracts/
   src/            — 12 contracts + BondMath/SlashEscrowLib libraries
     interfaces/   — 14 frozen external surfaces (I*.sol)
   test/           — Foundry suite (19 *.t.sol + mocks/ + ed25519-vectors/)
-  script/         — DeployProtocol, BaseProtocolDeploy, TestnetFaucet
+  script/         — DeployProtocol, BaseProtocolDeploy, ActivateBuyback,
+                    TransitionToGovernor, TestnetFaucet
+    lib/          — BuybackVenueLib (shared venue dispatch + burner construction)
   lib/            — submodules: openzeppelin-contracts, forge-std, solady, crypto-lib
 ```
+
+`ActivateBuyback` and `TransitionToGovernor` broadcast nothing — they print the
+Timelock calldata for a governance action to schedule. `TransitionToGovernor`
+ends the [ADR 009](../adr/009-governance.md#bootstrap-multisig-phase)
+bootstrap-multisig phase (only relevant if the deploy set `BOOTSTRAP_MULTISIG`):
+
+```bash
+GOVERNANCE_TIMELOCK=<timelock> DECDN_GOVERNOR=<governor> BOOTSTRAP_MULTISIG=<multisig> \
+  forge script script/TransitionToGovernor.s.sol:TransitionToGovernor --rpc-url "$RPC_URL"
+```
+
+It reverts `NotInBootstrapPhase` rather than print a batch if the chain is not
+mid-bootstrap. Executing the batch is **one-way** — it strips the multisig's
+`PROPOSER_ROLE`, so it can never schedule again.
 
 Compiled with solc `0.8.28`, EVM `cancun`, optimizer at 200 runs. CI pins Foundry to `v1.7.1`.
 

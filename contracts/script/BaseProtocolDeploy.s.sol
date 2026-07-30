@@ -20,11 +20,8 @@ import { PaymentChannel } from "../src/PaymentChannel.sol";
 import { SlashJudge } from "../src/SlashJudge.sol";
 import { OriginAssignment } from "../src/OriginAssignment.sol";
 import { GuardedBuybackBurner } from "../src/GuardedBuybackBurner.sol";
-import { BuybackBurnerUniswapV3 } from "../src/BuybackBurnerUniswapV3.sol";
-import { BuybackBurnerBalancerV3 } from "../src/BuybackBurnerBalancerV3.sol";
-import { IUniswapV3SwapRouter } from "../src/interfaces/IUniswapV3SwapRouter.sol";
-import { IBalancerV3Router } from "../src/interfaces/IBalancerV3Router.sol";
 import { IPermit2 } from "../src/interfaces/IPermit2.sol";
+import { BuybackVenueLib } from "./lib/BuybackVenueLib.sol";
 import { INonfungiblePositionManager } from "./interfaces/IUniswapV3PoolCreation.sol";
 import { IBalancerV3RouterInit, IBalancerV3WeightedPoolFactory } from "./interfaces/IBalancerV3PoolCreation.sol";
 import { IEd25519Verifier } from "../src/interfaces/IEd25519Verifier.sol";
@@ -90,7 +87,10 @@ import { IPublisherRegistryOwnership } from "../src/interfaces/IPublisherRegistr
 ///                                          the contract ungoverned mid-tx.
 ///           6. `_assertNoBackDoors`      — reverts if deployer still holds
 ///                                          GOVERNANCE_ROLE or DEFAULT_ADMIN_ROLE
-///                                          on any target. Runs in-script (not
+///                                          on any target, if the Timelock does not
+///                                          hold both, or if the Timelock's sole
+///                                          proposer is not the one this deploy
+///                                          mode seats. Runs in-script (not
 ///                                          just in tests) so a mainnet deploy
 ///                                          refuses to finish if any handoff
 ///                                          step failed silently.
@@ -142,12 +142,6 @@ abstract contract BaseProtocolDeploy is Script {
     // activates through the ADR 018 governance-gated path once the pool is
     // seeded, a private-RPC keeper is live, and the per-epoch cap is calibrated.
 
-    // Steady-state FeeRouter split once buyback is live (ADR 026 § FeeRouter
-    // split): 60% operator / 30% buyback / 10% treasury.
-    uint256 internal constant STEADY_OPERATOR_SHARE = 6000;
-    uint256 internal constant STEADY_BUYBACK_SHARE = 3000;
-    uint256 internal constant STEADY_TREASURY_SHARE = 1000;
-
     /// @dev Largest tick Uniswap V3 supports; the seed position spans the full
     ///      range clamped to the fee tier's tick spacing (constant-product depth).
     int24 internal constant UNIV3_MAX_TICK = 887_272;
@@ -164,47 +158,58 @@ abstract contract BaseProtocolDeploy is Script {
     uint256 internal constant BAL_TOKEN_WEIGHT = 0.8e18;
     uint256 internal constant BAL_USDC_WEIGHT = 0.2e18;
 
-    /// @notice Venue the genesis buyback activation targets. `UNISWAP` creates and
-    ///         seeds the TOKEN/USDC V3 pool in-script (the only venue live on the
-    ///         Arbitrum Sepolia initial network). `BALANCER` wires an already-seeded
-    ///         Balancer V3 80/20 pool (POL seeding is a treasury/Permit2 act per
-    ///         ADR 018 § POL mechanics, not reproduced by the genesis script).
-    enum BuybackVenue {
-        UNISWAP,
-        BALANCER
+    /// @notice Pool seed amounts (raw). Both venues create + seed the pool
+    ///         in-script; the venue-appropriate ratio differs (the 80/20 Balancer
+    ///         pool needs a different TOKEN:USDC ratio than the constant-product
+    ///         Uniswap pool to hit the same anchor price), so `_deriveTokenSeed`
+    ///         computes `tokenSeed` per venue.
+    struct PoolSeed {
+        uint256 usdcSeed; // USDC seed (raw, 6-dec)
+        uint256 tokenSeed; // TOKEN seed (raw, 18-dec)
+    }
+
+    /// @notice Uniswap-venue inputs — the pool is created + seeded in-script.
+    ///         Must be entirely zero when `venue != UNISWAP` (see
+    ///         `_assertVenueFieldsScoped`).
+    struct UniswapVenueParams {
+        address swapRouter; // SwapRouter02 (swap + token-pull target)
+        address positionManager; // NonfungiblePositionManager (create + seed)
+        uint24 poolFee; // fee tier (e.g. 10000 = 1%)
+    }
+
+    /// @notice Balancer-venue inputs — the 80/20 pool is created + seeded
+    ///         in-script. Must be entirely zero when `venue != BALANCER` (see
+    ///         `_assertVenueFieldsScoped`).
+    struct BalancerVenueParams {
+        address factory; // WeightedPoolFactory (create the 80/20 pool)
+        address router; // Balancer V3 Router (seed via Permit2 + swap target)
+        address vault; // Balancer V3 Vault (reads + approvals)
+        address permit2; // canonical Permit2 the V3 Router pulls through
+        uint256 swapFee; // pool swap fee (WAD; 1e16 = 1%)
+        uint256 subSwapCount; // keeper TWAP sub-swap count (immutable on the burner)
+        uint256 subSwapMinBlockGap; // keeper TWAP sub-swap block gap
     }
 
     /// @notice Genesis buyback-activation inputs. `activate == false` reproduces
     ///         the dormant launch exactly; all other fields are then ignored.
+    ///
+    /// @dev    The two venues' inputs live in their own sub-structs rather than
+    ///         flattened side by side (issue #1090): a flat struct made
+    ///         `balVault`-while-`venue == UNISWAP` a silently-ignored field.
+    ///         Solidity has no tagged union, so grouping alone cannot make that
+    ///         unrepresentable — `_assertVenueFieldsScoped` supplies the
+    ///         enforcement by rejecting any non-zero field on the unselected
+    ///         venue's sub-struct.
     struct BuybackActivation {
         bool activate;
-        BuybackVenue venue;
+        BuybackVenueLib.Venue venue;
         // Keeper granted KEEPER_ROLE in-script (required when `activate`).
         address keeper;
-        // Shared MEV-stack guard params (ADR 018 § Parameter Table).
-        uint256 twapMinWindow;
-        uint256 maxBuybackAmount;
-        uint256 minBuybackAmount;
-        uint256 slippageBps;
-        uint256 epochLiquidityCapFraction;
-        // Pool seed amounts (raw). Both venues create + seed the pool in-script;
-        // the venue-appropriate defaults differ (the 80/20 Balancer pool needs a
-        // different TOKEN:USDC ratio than the constant-product Uniswap pool to hit
-        // the same anchor price), so the reader defaults these per venue.
-        uint256 usdcSeed; // USDC seed (raw, 6-dec)
-        uint256 tokenSeed; // TOKEN seed (raw, 18-dec)
-        // --- Uniswap venue (pool created + seeded in-script) ---
-        address uniSwapRouter; // SwapRouter02 (swap + token-pull target)
-        address uniPositionManager; // NonfungiblePositionManager (create + seed)
-        uint24 uniPoolFee; // fee tier (e.g. 10000 = 1%)
-        // --- Balancer venue (pool created + seeded in-script) ---
-        address balFactory; // WeightedPoolFactory (create the 80/20 pool)
-        address balRouter; // Balancer V3 Router (seed via Permit2 + swap target)
-        address balVault; // Balancer V3 Vault (reads + approvals)
-        address permit2; // canonical Permit2 the V3 Router pulls through
-        uint256 balSwapFee; // pool swap fee (WAD; 1e16 = 1%)
-        uint256 balSubSwapCount; // keeper TWAP sub-swap count (immutable on the burner)
-        uint256 balSubSwapMinBlockGap; // keeper TWAP sub-swap block gap
+        // Shared MEV-stack guard band (ADR 018 § Parameter Table).
+        BuybackVenueLib.GuardParams guard;
+        PoolSeed seed;
+        UniswapVenueParams uni;
+        BalancerVenueParams bal;
     }
 
     // PaymentChannel launch params (ADR 003 § Initial deployment values). All
@@ -232,6 +237,15 @@ abstract contract BaseProtocolDeploy is Script {
         address initialTokenHolder;
         // Governance / Timelock
         uint256 timelockDelay;
+        // ADR 009 § Bootstrap-multisig phase. `address(0)` (the default) seats
+        // `DecdnGovernor` as the Timelock's proposer, so served-bytes-weighted DAO
+        // voting is live from block one. A non-zero address instead seats THIS
+        // multisig as the sole proposer and leaves the Governor without the role, so
+        // only the multisig can schedule while the operator set is thin. Either way
+        // the Timelock holds GOVERNANCE_ROLE and imposes its 48-hour delay. Opt-in
+        // because the initial testnet network runs a single controlled EOA and has
+        // no multisig to seat (issue #1175).
+        address bootstrapMultisig;
         // CapacityBond economic params (ADR 026 defaults)
         uint256 minBond;
         uint256 unbondingPeriod;
@@ -285,6 +299,14 @@ abstract contract BaseProtocolDeploy is Script {
     ///         contract ungoverned. Asserting both directions makes the in-script
     ///         guard symmetric with the test role matrix.
     error GovernanceNotHandedOff(address target, bytes32 role);
+    /// @notice Post-deploy invariant — the Timelock's `PROPOSER_ROLE` is not seated
+    ///         as this deploy mode requires. `shouldHold` distinguishes the two
+    ///         failures: `true` means `account` was meant to be able to propose and
+    ///         cannot; `false` means it can propose and must not — the shape that
+    ///         matters, since a bootstrap deploy that left `DecdnGovernor` a proposer
+    ///         puts DAO execution one 48-hour delay away while the operator set is
+    ///         still too thin for capacity-weighted voting to be safe (ADR 009).
+    error ProposerNotSeated(address account, bool shouldHold);
     /// @notice Post-deploy invariant — a phase-4 peer role (e.g. `SLASH_ROLE`,
     ///         `ROUTER_CALLER_ROLE`, `PAUSER_ROLE`) was not actually granted to
     ///         `grantee` on `target`. OZ `grantRole` does not revert when the
@@ -304,6 +326,13 @@ abstract contract BaseProtocolDeploy is Script {
     ///         `KEEPER_ROLE` holder can never `executeBuyback`, silently queueing
     ///         USDC in the burner forever.
     error MissingBuybackKeeper();
+    /// @notice Genesis activation carried a non-zero field on the venue it did NOT
+    ///         select — e.g. a `bal.vault` under `venue == UNISWAP`. Under the old
+    ///         flat `BuybackActivation` that field was silently dropped, so a
+    ///         caller could believe it had wired a Balancer pool and ship a Uniswap
+    ///         burner. `venue` is the selected venue; the offending fields are the
+    ///         other one's.
+    error VenueFieldsCrossWired(BuybackVenueLib.Venue venue);
     /// @notice The venue seed left the pool with no USDC depth — the per-epoch
     ///         cap denominator (`usdc.balanceOf(pool)`) would be zero, so the
     ///         "seed the pool before wiring" guard fails the deploy loudly.
@@ -469,11 +498,32 @@ abstract contract BaseProtocolDeploy is Script {
     // Phase 3 — Governor; Timelock proposer/canceller wiring. The Timelock
     // itself is already deployed (phase 1) so its address could seed FeeRouter's
     // treasury bucket.
-    function _deployGovernor(DeployConfig memory, Deployment memory d) internal {
+    //
+    // WHO may schedule through the Timelock is the whole of the ADR 009 phase
+    // distinction (issue #1175). The Timelock holds GOVERNANCE_ROLE on every target
+    // in both modes — so every parameter change carries the standard 48-hour delay
+    // either way — and what differs is who can propose one:
+    //
+    //   - default (`bootstrapMultisig == 0`) — the Governor, so served-bytes-weighted
+    //     DAO voting is live from block one.
+    //   - bootstrap — the bootstrap multisig, and the Governor gets NOTHING. It is
+    //     deployed and its vote-weight sources are wired (ADR 009 § Transition: wired
+    //     at deployment, not at transition), but with no PROPOSER_ROLE no DAO proposal
+    //     can reach execution while the operator set is too thin for capacity-weighted
+    //     voting to be safe.
+    function _deployGovernor(DeployConfig memory cfg, Deployment memory d) internal {
         d.governor = new DecdnGovernor(d.router, d.bond, d.timelock);
 
-        d.timelock.grantRole(d.timelock.PROPOSER_ROLE(), address(d.governor));
-        d.timelock.grantRole(d.timelock.CANCELLER_ROLE(), address(d.governor));
+        address proposer = _initialProposer(cfg, d);
+        d.timelock.grantRole(d.timelock.PROPOSER_ROLE(), proposer);
+        d.timelock.grantRole(d.timelock.CANCELLER_ROLE(), proposer);
+    }
+
+    /// @dev The address seated as the Timelock's sole proposer/canceller at deploy.
+    ///      Single source of truth for `_deployGovernor` and `_assertNoBackDoors`
+    ///      so the wiring and the invariant cannot disagree about the mode.
+    function _initialProposer(DeployConfig memory cfg, Deployment memory d) internal pure returns (address) {
+        return cfg.bootstrapMultisig == address(0) ? address(d.governor) : cfg.bootstrapMultisig;
     }
 
     // Phase 4 — cross-contract peer roles + deployer-only state setters.
@@ -537,33 +587,47 @@ abstract contract BaseProtocolDeploy is Script {
 
     // Phase 5 — atomic role handoff to Timelock.
     //
+    // Identical in both ADR 009 phases: the Timelock is always the GOVERNANCE_ROLE
+    // and DEFAULT_ADMIN_ROLE holder, so every parameter change carries the standard
+    // 48-hour delay whoever proposes it. The bootstrap phase differs only in who may
+    // schedule through the Timelock, which `_deployGovernor` decides.
+    //
     // Grant-before-revoke ordering is mandatory: revoking GOVERNANCE_ROLE or
     // DEFAULT_ADMIN_ROLE from the deployer before granting it to the Timelock
     // strands the contract (no holder of either role) and locks out every
     // governance setter until a recovery deploy.
     function _handOffGovernance(DeployConfig memory cfg, Deployment memory d) internal {
-        IAccessControl[8] memory targets = _governedTargets(d);
+        address[] memory targets = _allGovernedTargets(d);
         address tl = address(d.timelock);
+        // The genesis-activated burner (if any) is inside `targets`: it is deployed
+        // with the deployer as admin so `_activateBuyback` can `setKeeper` in-script,
+        // and this loop closes that back door alongside every other target.
         for (uint256 i = 0; i < targets.length; i++) {
-            targets[i].grantRole(GOVERNANCE_ROLE, tl);
-            targets[i].grantRole(DEFAULT_ADMIN_ROLE, tl);
-            targets[i].revokeRole(GOVERNANCE_ROLE, cfg.deployer);
-            targets[i].revokeRole(DEFAULT_ADMIN_ROLE, cfg.deployer);
-        }
-        // The genesis-activated burner (if any) is a governed target too: hand its
-        // GOVERNANCE_ROLE + DEFAULT_ADMIN_ROLE to the Timelock, same grant-before-
-        // revoke ordering. Deployed with the deployer as admin so `_activateBuyback`
-        // could `setKeeper` in-script; this closes that back door.
-        if (address(d.buybackBurner) != address(0)) {
-            IAccessControl burner = IAccessControl(address(d.buybackBurner));
-            burner.grantRole(GOVERNANCE_ROLE, tl);
-            burner.grantRole(DEFAULT_ADMIN_ROLE, tl);
-            burner.revokeRole(GOVERNANCE_ROLE, cfg.deployer);
-            burner.revokeRole(DEFAULT_ADMIN_ROLE, cfg.deployer);
+            IAccessControl target = IAccessControl(targets[i]);
+            target.grantRole(GOVERNANCE_ROLE, tl);
+            target.grantRole(DEFAULT_ADMIN_ROLE, tl);
+            target.revokeRole(GOVERNANCE_ROLE, cfg.deployer);
+            target.revokeRole(DEFAULT_ADMIN_ROLE, cfg.deployer);
         }
 
         // Final step: deployer no longer admins the Timelock itself.
         d.timelock.renounceRole(d.timelock.DEFAULT_ADMIN_ROLE(), cfg.deployer);
+    }
+
+    /// @dev Every target whose GOVERNANCE_ROLE + DEFAULT_ADMIN_ROLE the handoff
+    ///      moves: the eight fixed governed targets plus the genesis-activated
+    ///      burner when one was deployed. Dynamic because the burner is conditional;
+    ///      single source of truth for `_handOffGovernance` and `_assertNoBackDoors`
+    ///      so a target cannot be handed off by one and missed by the other.
+    function _allGovernedTargets(Deployment memory d) internal pure returns (address[] memory) {
+        IAccessControl[8] memory fixedTargets = _governedTargets(d);
+        bool hasBurner = address(d.buybackBurner) != address(0);
+        address[] memory targets = new address[](hasBurner ? 9 : 8);
+        for (uint256 i = 0; i < fixedTargets.length; i++) {
+            targets[i] = address(fixedTargets[i]);
+        }
+        if (hasBurner) targets[8] = address(d.buybackBurner);
+        return targets;
     }
 
     // Phase 6 — post-deploy invariant. Symmetric check: the deployer holds
@@ -572,46 +636,47 @@ abstract contract BaseProtocolDeploy is Script {
     // stranded). A handoff that revoked the deployer but skipped a Timelock grant
     // would pass the back-door half yet leave a contract ungoverned.
     function _assertNoBackDoors(DeployConfig memory cfg, Deployment memory d) internal view {
-        IAccessControl[8] memory targets = _governedTargets(d);
+        address[] memory targets = _allGovernedTargets(d);
         address tl = address(d.timelock);
+
         for (uint256 i = 0; i < targets.length; i++) {
-            address target = address(targets[i]);
-            if (targets[i].hasRole(GOVERNANCE_ROLE, cfg.deployer)) {
-                revert DeployerStillHoldsRole(target, GOVERNANCE_ROLE);
+            IAccessControl target = IAccessControl(targets[i]);
+            if (target.hasRole(GOVERNANCE_ROLE, cfg.deployer)) {
+                revert DeployerStillHoldsRole(targets[i], GOVERNANCE_ROLE);
             }
-            if (targets[i].hasRole(DEFAULT_ADMIN_ROLE, cfg.deployer)) {
-                revert DeployerStillHoldsRole(target, DEFAULT_ADMIN_ROLE);
+            if (target.hasRole(DEFAULT_ADMIN_ROLE, cfg.deployer)) {
+                revert DeployerStillHoldsRole(targets[i], DEFAULT_ADMIN_ROLE);
             }
-            if (!targets[i].hasRole(GOVERNANCE_ROLE, tl)) {
-                revert GovernanceNotHandedOff(target, GOVERNANCE_ROLE);
+            if (!target.hasRole(GOVERNANCE_ROLE, tl)) {
+                revert GovernanceNotHandedOff(targets[i], GOVERNANCE_ROLE);
             }
-            if (!targets[i].hasRole(DEFAULT_ADMIN_ROLE, tl)) {
-                revert GovernanceNotHandedOff(target, DEFAULT_ADMIN_ROLE);
+            if (!target.hasRole(DEFAULT_ADMIN_ROLE, tl)) {
+                revert GovernanceNotHandedOff(targets[i], DEFAULT_ADMIN_ROLE);
             }
         }
+
+        // Timelock PROPOSER_ROLE seating (ADR 009, issue #1175). The role checks
+        // above are mode-independent — they pass identically whether the Governor or
+        // the bootstrap multisig can propose — so nothing else in this invariant can
+        // catch a bootstrap deploy that left the Governor a proposer, which would put
+        // DAO proposals one 48-hour delay from execution against the thin operator set
+        // the phase exists to protect. Asserted in both directions so the default
+        // deploy equally cannot ship with a Governor that can never propose.
+        address proposer = _initialProposer(cfg, d);
+        bytes32 proposerRole = d.timelock.PROPOSER_ROLE();
+        if (!d.timelock.hasRole(proposerRole, proposer)) revert ProposerNotSeated(proposer, true);
+        if (cfg.bootstrapMultisig != address(0) && d.timelock.hasRole(proposerRole, address(d.governor))) {
+            revert ProposerNotSeated(address(d.governor), false);
+        }
+
         if (d.timelock.hasRole(DEFAULT_ADMIN_ROLE, cfg.deployer)) {
             revert DeployerStillHoldsRole(tl, DEFAULT_ADMIN_ROLE);
         }
         // The Timelock must self-administer, or its own role surface is stranded.
+        // True in both modes: the bootstrap phase withholds GOVERNANCE_ROLE on the
+        // targets from the Timelock, not control of the Timelock itself.
         if (!d.timelock.hasRole(DEFAULT_ADMIN_ROLE, tl)) {
             revert GovernanceNotHandedOff(tl, DEFAULT_ADMIN_ROLE);
-        }
-
-        // Same symmetric guard for the genesis-activated burner (if any).
-        if (address(d.buybackBurner) != address(0)) {
-            IAccessControl burner = IAccessControl(address(d.buybackBurner));
-            if (burner.hasRole(GOVERNANCE_ROLE, cfg.deployer)) {
-                revert DeployerStillHoldsRole(address(d.buybackBurner), GOVERNANCE_ROLE);
-            }
-            if (burner.hasRole(DEFAULT_ADMIN_ROLE, cfg.deployer)) {
-                revert DeployerStillHoldsRole(address(d.buybackBurner), DEFAULT_ADMIN_ROLE);
-            }
-            if (!burner.hasRole(GOVERNANCE_ROLE, tl)) {
-                revert GovernanceNotHandedOff(address(d.buybackBurner), GOVERNANCE_ROLE);
-            }
-            if (!burner.hasRole(DEFAULT_ADMIN_ROLE, tl)) {
-                revert GovernanceNotHandedOff(address(d.buybackBurner), DEFAULT_ADMIN_ROLE);
-            }
         }
     }
 
@@ -689,9 +754,10 @@ abstract contract BaseProtocolDeploy is Script {
     ///      treat it as a governed target.
     function _activateBuyback(DeployConfig memory cfg, BuybackActivation memory act, Deployment memory d) internal {
         if (act.keeper == address(0)) revert MissingBuybackKeeper();
+        _assertVenueFieldsScoped(act);
 
         GuardedBuybackBurner burner =
-            act.venue == BuybackVenue.UNISWAP ? _activateUniswap(cfg, act, d) : _activateBalancer(cfg, act, d);
+            act.venue == BuybackVenueLib.Venue.UNISWAP ? _activateUniswap(cfg, act, d) : _activateBalancer(cfg, act, d);
 
         // The burner is Pausable: grant the emergency multisig PAUSER_ROLE while the
         // deployer still admins it, so it ships with a live pauser like every other
@@ -706,13 +772,30 @@ abstract contract BaseProtocolDeploy is Script {
         // holds GOVERNANCE_ROLE on the router here (pre-handoff);
         // `setSharesAndDestinations` sets the buyback destination before the non-zero
         // buyback share, satisfying the cross-validation invariant.
-        uint256[3] memory shares = [STEADY_OPERATOR_SHARE, STEADY_BUYBACK_SHARE, STEADY_TREASURY_SHARE];
         d.router
             .setSharesAndDestinations(
-                shares, FeeRouter.ShareDestinations({ buybackBurner: address(burner), treasury: address(d.timelock) })
+                BuybackVenueLib.steadyShares(),
+                FeeRouter.ShareDestinations({ buybackBurner: address(burner), treasury: address(d.timelock) })
             );
 
         d.buybackBurner = burner;
+    }
+
+    /// @dev Reject any non-zero field belonging to the venue `act` did not select.
+    ///      `DeployProtocol._readBuybackActivation` only ever populates one branch,
+    ///      so this fires exactly on a hand-constructed activation that wired both
+    ///      — the failure mode the old flat struct swallowed (issue #1090).
+    function _assertVenueFieldsScoped(BuybackActivation memory act) internal pure {
+        if (act.venue == BuybackVenueLib.Venue.UNISWAP) {
+            BalancerVenueParams memory b = act.bal;
+            bool crossWired = b.factory != address(0) || b.router != address(0) || b.vault != address(0)
+                || b.permit2 != address(0) || b.swapFee != 0 || b.subSwapCount != 0 || b.subSwapMinBlockGap != 0;
+            if (crossWired) revert VenueFieldsCrossWired(act.venue);
+        } else {
+            UniswapVenueParams memory u = act.uni;
+            bool crossWired = u.swapRouter != address(0) || u.positionManager != address(0) || u.poolFee != 0;
+            if (crossWired) revert VenueFieldsCrossWired(act.venue);
+        }
     }
 
     /// @dev Uniswap venue: create + seed the TOKEN/USDC V3 pool in-script, then
@@ -726,19 +809,8 @@ abstract contract BaseProtocolDeploy is Script {
         // per-epoch cap denominator (`usdc.balanceOf(pool)`) is zero.
         if (cfg.usdc.balanceOf(pool) == 0) revert PoolNotSeeded(pool);
 
-        return new BuybackBurnerUniswapV3(
-            cfg.usdc,
-            ERC20Burnable(address(d.token)),
-            cfg.deployer,
-            BuybackBurnerUniswapV3.Config({
-                swapRouter_: IUniswapV3SwapRouter(act.uniSwapRouter),
-                pool_: pool,
-                twapMinWindow_: act.twapMinWindow,
-                maxBuybackAmount_: act.maxBuybackAmount,
-                minBuybackAmount_: act.minBuybackAmount,
-                slippageBps_: act.slippageBps,
-                epochLiquidityCapFraction_: act.epochLiquidityCapFraction
-            })
+        return BuybackVenueLib.deployUniswapBurner(
+            cfg.usdc, ERC20Burnable(address(d.token)), cfg.deployer, act.uni.swapRouter, pool, act.guard
         );
     }
 
@@ -757,24 +829,22 @@ abstract contract BaseProtocolDeploy is Script {
         // The Router minted the pool BPT (protocol-owned liquidity) to the
         // broadcasting deployer; hand it to the Timelock and clear the Permit2
         // approvals so the deployer keeps no custody — mirroring the Uniswap path.
-        _finalizeBalancerSeed(cfg.usdc, IERC20(address(d.token)), pool, act.permit2, cfg.deployer, address(d.timelock));
-        return new BuybackBurnerBalancerV3(
+        _finalizeBalancerSeed(
+            cfg.usdc, IERC20(address(d.token)), pool, act.bal.permit2, cfg.deployer, address(d.timelock)
+        );
+        return BuybackVenueLib.deployBalancerBurner(
             cfg.usdc,
             ERC20Burnable(address(d.token)),
             cfg.deployer,
-            BuybackBurnerBalancerV3.Config({
-                swapRouter_: IBalancerV3Router(act.balRouter),
-                pool_: pool,
-                vault_: act.balVault,
-                permit2_: act.permit2,
-                subSwapCount_: act.balSubSwapCount,
-                subSwapMinBlockGap_: act.balSubSwapMinBlockGap,
-                twapMinWindow_: act.twapMinWindow,
-                maxBuybackAmount_: act.maxBuybackAmount,
-                minBuybackAmount_: act.minBuybackAmount,
-                slippageBps_: act.slippageBps,
-                epochLiquidityCapFraction_: act.epochLiquidityCapFraction
-            })
+            BuybackVenueLib.BalancerWiring({
+                swapRouter: act.bal.router,
+                pool: pool,
+                vault: act.bal.vault,
+                permit2: act.bal.permit2,
+                subSwapCount: act.bal.subSwapCount,
+                subSwapMinBlockGap: act.bal.subSwapMinBlockGap
+            }),
+            act.guard
         );
     }
 
@@ -790,8 +860,8 @@ abstract contract BaseProtocolDeploy is Script {
     {
         IERC20 usdc = cfg.usdc;
         IERC20 token = IERC20(address(d.token));
-        _requireSeedBalance(usdc, cfg.deployer, act.usdcSeed);
-        _requireSeedBalance(token, cfg.deployer, act.tokenSeed);
+        _requireSeedBalance(usdc, cfg.deployer, act.seed.usdcSeed);
+        _requireSeedBalance(token, cfg.deployer, act.seed.tokenSeed);
 
         bool usdcFirst = address(usdc) < address(token);
         // Split the declaration from the allocation: `forge fmt` treats
@@ -823,14 +893,14 @@ abstract contract BaseProtocolDeploy is Script {
             pauseManager: address(0), swapFeeManager: address(0), poolCreator: address(0)
         });
 
-        pool = IBalancerV3WeightedPoolFactory(act.balFactory)
+        pool = IBalancerV3WeightedPoolFactory(act.bal.factory)
             .create(
                 "deCDN 80TOKEN-20USDC",
                 "dcdn-8020",
                 tokens,
                 weights,
                 roles,
-                act.balSwapFee,
+                act.bal.swapFee,
                 address(0), // no hooks
                 false, // enableDonation
                 false, // disableUnbalancedLiquidity
@@ -841,14 +911,14 @@ abstract contract BaseProtocolDeploy is Script {
         uint256[] memory initAmounts = new uint256[](2);
         initTokens[0] = tokens[0].token;
         initTokens[1] = tokens[1].token;
-        initAmounts[0] = usdcFirst ? act.usdcSeed : act.tokenSeed;
-        initAmounts[1] = usdcFirst ? act.tokenSeed : act.usdcSeed;
+        initAmounts[0] = usdcFirst ? act.seed.usdcSeed : act.seed.tokenSeed;
+        initAmounts[1] = usdcFirst ? act.seed.tokenSeed : act.seed.usdcSeed;
 
-        _permit2Approve(usdc, act, act.usdcSeed);
-        _permit2Approve(token, act, act.tokenSeed);
+        _permit2Approve(usdc, act, act.seed.usdcSeed);
+        _permit2Approve(token, act, act.seed.tokenSeed);
 
         // slither-disable-next-line unused-return
-        IBalancerV3RouterInit(act.balRouter).initialize(pool, initTokens, initAmounts, 0, false, "");
+        IBalancerV3RouterInit(act.bal.router).initialize(pool, initTokens, initAmounts, 0, false, "");
     }
 
     /// @dev Post-seed cleanup for the Balancer venue: move the freshly-minted
@@ -873,8 +943,9 @@ abstract contract BaseProtocolDeploy is Script {
     ///      `erc20` from the deployer: ERC20-approve Permit2, then set the Permit2
     ///      allowance for the Router.
     function _permit2Approve(IERC20 erc20, BuybackActivation memory act, uint256 amount) internal {
-        erc20.forceApprove(act.permit2, type(uint256).max);
-        IPermit2(act.permit2).approve(address(erc20), act.balRouter, uint160(amount), uint48(block.timestamp + 1 days));
+        erc20.forceApprove(act.bal.permit2, type(uint256).max);
+        IPermit2(act.bal.permit2)
+            .approve(address(erc20), act.bal.router, uint160(amount), uint48(block.timestamp + 1 days));
     }
 
     /// @dev Create the TOKEN/USDC Uniswap V3 pool (idempotent) at the seed-implied
@@ -892,28 +963,28 @@ abstract contract BaseProtocolDeploy is Script {
         // encodes token1-per-token0 in raw units, matching the seed ratio, so a
         // full-range position deploys both legs without a residual.
         (address token0, address token1, uint256 amount0, uint256 amount1) = address(usdc) < address(token)
-            ? (address(usdc), address(token), act.usdcSeed, act.tokenSeed)
-            : (address(token), address(usdc), act.tokenSeed, act.usdcSeed);
+            ? (address(usdc), address(token), act.seed.usdcSeed, act.seed.tokenSeed)
+            : (address(token), address(usdc), act.seed.tokenSeed, act.seed.usdcSeed);
 
-        _requireSeedBalance(usdc, cfg.deployer, act.usdcSeed);
-        _requireSeedBalance(token, cfg.deployer, act.tokenSeed);
+        _requireSeedBalance(usdc, cfg.deployer, act.seed.usdcSeed);
+        _requireSeedBalance(token, cfg.deployer, act.seed.tokenSeed);
 
         uint160 sqrtPriceX96 = _sqrtPriceX96(amount1, amount0);
 
-        INonfungiblePositionManager npm = INonfungiblePositionManager(act.uniPositionManager);
-        pool = npm.createAndInitializePoolIfNecessary(token0, token1, act.uniPoolFee, sqrtPriceX96);
+        INonfungiblePositionManager npm = INonfungiblePositionManager(act.uni.positionManager);
+        pool = npm.createAndInitializePoolIfNecessary(token0, token1, act.uni.poolFee, sqrtPriceX96);
 
         // Scoped approvals for the seed pull (the manager pulls via a standard ERC20
         // allowance); `forceApprove` handles non-standard return-less USDC.
         IERC20(token0).forceApprove(address(npm), amount0);
         IERC20(token1).forceApprove(address(npm), amount1);
 
-        int24 tickUpper = _fullRangeTick(act.uniPoolFee);
+        int24 tickUpper = _fullRangeTick(act.uni.poolFee);
         npm.mint(
             INonfungiblePositionManager.MintParams({
                 token0: token0,
                 token1: token1,
-                fee: act.uniPoolFee,
+                fee: act.uni.poolFee,
                 tickLower: -tickUpper,
                 tickUpper: tickUpper,
                 amount0Desired: amount0,
@@ -955,14 +1026,14 @@ abstract contract BaseProtocolDeploy is Script {
     ///      where the value-weight ratio is 1:1 for the 50/50 constant-product
     ///      Uniswap pool and 4:1 (80/20) for the Balancer weighted pool. Feeding the
     ///      seeds in this proportion makes the pool initialize at exactly `targetPrice`.
-    function _deriveTokenSeed(BuybackVenue venue, uint256 usdcSeed, uint256 targetPrice)
+    function _deriveTokenSeed(BuybackVenueLib.Venue venue, uint256 usdcSeed, uint256 targetPrice)
         internal
         pure
         returns (uint256)
     {
         if (targetPrice == 0) revert TargetPriceZero();
         (uint256 wToken, uint256 wUsdc) =
-            venue == BuybackVenue.BALANCER ? (BAL_TOKEN_WEIGHT, BAL_USDC_WEIGHT) : (uint256(1), uint256(1));
+            venue == BuybackVenueLib.Venue.BALANCER ? (BAL_TOKEN_WEIGHT, BAL_USDC_WEIGHT) : (uint256(1), uint256(1));
         return Math.mulDiv(Math.mulDiv(usdcSeed, wToken, wUsdc), 1e18, targetPrice);
     }
 
@@ -1005,10 +1076,8 @@ abstract contract BaseProtocolDeploy is Script {
             revert BindingNotWired(address(d.router), address(burner), d.router.buybackBurner());
         }
         uint256[3] memory shares = d.router.getShares();
-        if (
-            shares[0] != STEADY_OPERATOR_SHARE || shares[1] != STEADY_BUYBACK_SHARE
-                || shares[2] != STEADY_TREASURY_SHARE
-        ) {
+        uint256[3] memory expected = BuybackVenueLib.steadyShares();
+        if (shares[0] != expected[0] || shares[1] != expected[1] || shares[2] != expected[2]) {
             revert BuybackSharesNotActivated(shares[0], shares[1], shares[2]);
         }
         _requireRole(burner, burner.KEEPER_ROLE(), act.keeper);

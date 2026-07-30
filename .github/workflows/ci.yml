@@ -943,18 +943,25 @@ jobs:
         working-directory: contracts
     env:
       FOUNDRY_PROFILE: fork
-      # Live Balancer V3 RPC endpoints. Both are absent on fork PRs (secrets are
-      # withheld) and in forks that never configured them — the run step below
-      # no-ops when neither is set, and each fork suite additionally self-skips on
+      # Live RPC endpoints for the fork suites. All are absent on fork PRs (secrets
+      # are withheld) and in forks that never configured them — the run step below
+      # no-ops when none is set, and each fork suite additionally self-skips on
       # its own missing RPC, so this job never blocks a PR for a missing secret.
+      # Each name matches an `[rpc_endpoints]` alias in `contracts/foundry.toml`.
       #   ARBITRUM_RPC_URL — read/validation suite (BuybackBurnerBalancerV3.fork);
       #     verifies our IBalancerV3* ABIs against live Arbitrum One bytecode. Pins
       #     a historical block, so it needs an ARCHIVE endpoint.
       #   SEPOLIA_RPC_URL — swap+burn suite (BuybackBurnerBalancerV3.swapburn.fork,
-      #     issue #995); creates+seeds its own pool and runs a real executeBuyback.
+      #     issue #995) and the Balancer genesis-activation suite
+      #     (GenesisBuybackActivationBalancer.fork); each creates+seeds its own pool.
       #     Forks at LATEST, so a plain public (non-archive) endpoint suffices.
+      #   ARBITRUM_SEPOLIA_RPC_URL — Uniswap genesis-activation suite
+      #     (GenesisBuybackActivation.fork, issue #1090); the initial network's only
+      #     runnable buyback venue, so this is the deploy path #1083 actually takes.
+      #     Forks at LATEST and creates its own pool — a plain public endpoint suffices.
       ARBITRUM_RPC_URL: ${{ secrets.ARBITRUM_RPC_URL }}
       SEPOLIA_RPC_URL: ${{ secrets.SEPOLIA_RPC_URL }}
+      ARBITRUM_SEPOLIA_RPC_URL: ${{ secrets.ARBITRUM_SEPOLIA_RPC_URL }}
     steps:
       # submodules: recursive — forge-std + openzeppelin-contracts are submodules.
       - uses: actions/checkout@v7
@@ -963,10 +970,10 @@ jobs:
       - uses: foundry-rs/foundry-toolchain@v1.9.0
         with:
           version: v1.7.1
-      # Runs both fork suites; each self-skips unless its own RPC is set, so a run
+      # Runs every fork suite; each self-skips unless its own RPC is set, so a run
       # with only one secret configured exercises just that suite.
       - name: Fork tests (no-op when no fork RPC is set)
-        if: env.ARBITRUM_RPC_URL != '' || env.SEPOLIA_RPC_URL != ''
+        if: env.ARBITRUM_RPC_URL != '' || env.SEPOLIA_RPC_URL != '' || env.ARBITRUM_SEPOLIA_RPC_URL != ''
         run: forge test --match-path 'test/*.fork.t.sol' -vv
 
   solidity-coverage:

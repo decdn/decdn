@@ -23,6 +23,21 @@ since project inception and will roll into the first tagged release.
 
 ### Changed (BREAKING)
 
+- **Deploy-script-breaking: `DeployConfig` and `BuybackActivation` changed shape
+  (#1090, #1175).** Both are `BaseProtocolDeploy` structs, so only out-of-tree
+  callers that construct them by hand are affected — no contract ABI, config
+  file, or CLI surface changes, and a `DeployProtocol` run with an unchanged
+  environment produces the same deploy it did before.
+  - `DeployConfig` gains `bootstrapMultisig` (read from the new optional
+    `BOOTSTRAP_MULTISIG` env var). Unset/zero keeps today's behaviour exactly:
+    `DecdnGovernor` is seated as the `TimelockController`'s proposer at deploy,
+    so DAO voting is live immediately.
+  - `BuybackActivation`'s 17 flat fields regroup into venue-scoped sub-structs
+    (`guard`, `seed`, `uni`, `bal`). The flat layout let a Balancer field be set
+    under `venue == UNISWAP` and silently dropped; `_activateBuyback` now reverts
+    `VenueFieldsCrossWired` on any non-zero field belonging to the unselected
+    venue.
+
 - **Monitoring-breaking: `monitoring/` no longer ships rules and panels that
   could never fire (#1513).** Eleven `decdn_*` series referenced by the
   reference alerts and dashboard were never exported by any node. Nothing in CI
@@ -591,6 +606,19 @@ since project inception and will roll into the first tagged release.
 
 ### Changed
 
+- **`contracts/script/lib/BuybackVenueLib.sol` is now the single home for buyback
+  venue dispatch and burner construction (#1090).** The steady-state FeeRouter
+  split, the canonical Permit2 address, the `BUYBACK_VENUE` string dispatch, and
+  the per-venue `Config` literal were duplicated across `BaseProtocolDeploy`,
+  `ActivateBuyback`, and `DeployProtocol` — four ways for the deploy-time genesis
+  activation and the post-deploy runbook to wire different burners from the same
+  inputs. Behaviour is unchanged; the duplication is gone.
+- **CI runs the Uniswap genesis-activation fork suite (#1090).** The
+  `solidity fork test` job now passes `ARBITRUM_SEPOLIA_RPC_URL` through, so
+  `GenesisBuybackActivation.fork.t.sol` executes instead of self-skipping. It
+  covers the Arbitrum Sepolia deploy path, which previously had no executable CI
+  coverage. Requires the repo secret of the same name to be configured.
+
 #### Node selection & observability
 
 - **`Candidate.stake` is now `u64`, not `Option<u64>`** (internal API,
@@ -807,6 +835,17 @@ since project inception and will roll into the first tagged release.
   ownership only; no steady-state behavior change.
 
 ### Added
+
+- **ADR 009 bootstrap-multisig governance phase (#1175).** `DeployProtocol` run
+  with `BOOTSTRAP_MULTISIG=<addr>` seats that multisig as the Timelock's sole
+  `PROPOSER_ROLE`/`CANCELLER_ROLE` holder and grants `DecdnGovernor` neither, so
+  no operator vote can execute while the operator set is still thin enough for a
+  cheap fleet to capture. The Timelock keeps `GOVERNANCE_ROLE` on every target in
+  both modes, so the 48-hour delay applies to the multisig's own changes.
+  `contracts/script/TransitionToGovernor.s.sol` prints the one-way Timelock batch
+  that ends the phase; `_assertNoBackDoors` now fails a deploy whose proposer is
+  not the one its mode seats. Off by default — the initial testnet deploy is
+  unaffected.
 
 #### Cache / config
 
