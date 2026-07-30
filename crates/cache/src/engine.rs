@@ -5,8 +5,8 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
@@ -77,7 +77,15 @@ struct Inner {
     /// In-flight pull-through requests. When a pull is in progress for a hash,
     /// subsequent callers wait on the [`Notify`] rather than issuing a
     /// duplicate origin fetch (coalescing, fixes #305).
+    ///
+    /// Lock it only through [`Inner::lock_inflight`] — never `.lock()`
+    /// directly. See that method for why poison must be recovered here
+    /// rather than skipped.
     inflight: Mutex<HashMap<Hash, Arc<Notify>>>,
+    /// One-shot latch for the [`Inner::lock_inflight`] poison log (#1517).
+    /// The counter carries the true count; this keeps a hot path from
+    /// spamming an identical `tracing::error!` on every request.
+    inflight_poison_logged: AtomicBool,
     /// Operator-pinned blob hashes (#276). Pinned hashes are excluded from
     /// the eviction-candidates snapshot and therefore survive any LRU
     /// pressure. Held in [`ArcSwap`] so SIGHUP reloads can swap in a new
@@ -260,6 +268,53 @@ struct Inner {
     gc_store_handle: Option<Arc<OnceLock<FsStore>>>,
 }
 
+impl Inner {
+    /// The only way to lock [`Inner::inflight`] (#1517).
+    ///
+    /// **Poison is recovered, not skipped.** This mutex guards the
+    /// fill-coalescing map, which is what stops N concurrent requests for
+    /// one missing blob from opening N origin pulls. Skipping the critical
+    /// section — what `.lock().ok()` did before #1517 — loses coalescing,
+    /// and a `std::sync::Mutex` poison is sticky for the process lifetime,
+    /// so it loses it *permanently*. On a metered `http`/`s3` origin that
+    /// is an unbounded multiplier on the egress bill; on the `Peer` origin
+    /// reached via `populate` it is a double-spend of USDC vouchers to
+    /// upstream nodes — the hazard [`TeeOpen::InFlight`] exists to prevent.
+    /// Recovering the guard keeps that invariant intact, and matches the
+    /// reasoning already written down for `evicted` (see
+    /// [`CacheEngine::evict`] and [`CacheEngine::is_evicted`]).
+    ///
+    /// The map is only ever read, inserted into, and removed from under
+    /// this lock — no user code runs inside the critical section — so a
+    /// recovered guard cannot observe a torn `HashMap`.
+    ///
+    /// **But it is still reported.** The anti-panic policy makes poison
+    /// close to unreachable, so a firing here is a genuine bug: it bumps
+    /// `decdn_cache_inflight_mutex_poisoned_total` every time and logs
+    /// once (latched via `inflight_poison_logged`, since this sits on the
+    /// per-request path).
+    fn lock_inflight(&self) -> MutexGuard<'_, HashMap<Hash, Arc<Notify>>> {
+        match self.inflight.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                if let Some(m) = &self.metrics {
+                    m.inflight_mutex_poisoned.inc();
+                }
+                if !self.inflight_poison_logged.swap(true, Ordering::Relaxed) {
+                    tracing::error!(
+                        "inflight coalescing mutex poisoned; recovering inner state. \
+                         A task panicked while holding it — this is a bug, not an \
+                         operational condition. Coalescing is preserved; further \
+                         occurrences are counted by \
+                         decdn_cache_inflight_mutex_poisoned_total but not re-logged."
+                    );
+                }
+                poisoned.into_inner()
+            }
+        }
+    }
+}
+
 /// Coarse-grained cache statistics.
 ///
 /// All fields are stubs for now — the gossip crate will read from here once
@@ -397,15 +452,19 @@ impl<'a> IntoIterator for &'a EvictionCandidates {
 /// same hash would block forever on a `Notify` that never fires.
 struct InflightGuard<'a> {
     hash: Hash,
-    inflight: &'a Mutex<HashMap<Hash, Arc<Notify>>>,
+    inner: &'a Inner,
     notify: &'a Arc<Notify>,
 }
 
 impl Drop for InflightGuard<'_> {
     fn drop(&mut self) {
-        if let Ok(mut guard) = self.inflight.lock() {
-            guard.remove(&self.hash);
-        }
+        // Removal goes through `lock_inflight`, which recovers a poisoned
+        // guard (#1517). Dropping the removal on poison — what the previous
+        // `if let Ok(..)` did — leaked the entry, and since `notify_waiters`
+        // only wakes *current* waiters, every later request for this hash
+        // would then park on a `Notify` that never fires again: the exact
+        // permanent hang this guard exists to prevent.
+        self.inner.lock_inflight().remove(&self.hash);
         self.notify.notify_waiters();
     }
 }
@@ -586,11 +645,20 @@ async fn gc_protect_inner(
         // Surface poison: this mutex guards metrics-only state, so a
         // poisoned lock means a *prior* invocation of this function
         // panicked while holding the guard (i.e., somewhere in the
-        // diff/fold loop). Different from the operational mutexes
-        // (`evicted`, `access_times`) where silent recovery is correct.
-        // Recover the inner state to keep metrics flowing — the next
-        // cycle re-establishes a baseline — but log once so the panic
-        // doesn't hide.
+        // diff/fold loop). Recover the inner state to keep metrics
+        // flowing — the next cycle re-establishes a baseline — but log
+        // once so the panic doesn't hide.
+        //
+        // Three classes of mutex in this file, all of which recover the
+        // guard; they differ only in how loudly:
+        // - metrics-only (`prev_pre_sweep`, here) — recover + `warn!`.
+        // - operational (`evicted`, `access_times`) — recover silently;
+        //   the invariant is restored, and there is nothing an operator
+        //   would do with the report.
+        // - operational AND financially load-bearing (`inflight`) —
+        //   recover, `error!` once, and count it, because losing that
+        //   invariant costs origin egress and USDC. See
+        //   [`Inner::lock_inflight`].
         let mut guard = match prev_pre_sweep.lock() {
             Ok(g) => g,
             Err(poisoned) => {
@@ -883,6 +951,7 @@ impl CacheEngine {
                 max_blob_bytes,
                 access_times: Mutex::new(HashMap::new()),
                 inflight: Mutex::new(HashMap::new()),
+                inflight_poison_logged: AtomicBool::new(false),
                 pinned: ArcSwap::from(Arc::new(
                     pinned
                         .iter()
@@ -1682,7 +1751,8 @@ impl CacheEngine {
         // A single lock acquisition atomically checks and inserts to avoid the
         // race where multiple tasks see an empty map and all proceed to pull.
         let bytes = loop {
-            let state = self.inner.inflight.lock().ok().map(|mut guard| {
+            let state = {
+                let mut guard = self.inner.lock_inflight();
                 if let Some(n) = guard.get(&hash) {
                     Err(Arc::clone(n))
                 } else {
@@ -1690,11 +1760,11 @@ impl CacheEngine {
                     guard.insert(hash, Arc::clone(&n));
                     Ok(n)
                 }
-            });
+            };
 
             match state {
                 // Another task owns the pull — wait, then retry from the top.
-                Some(Err(notify)) => {
+                Err(notify) => {
                     notify.notified().await;
                     if self.has(hash).await? {
                         let bytes = self.read_local(hash).await?;
@@ -1714,16 +1784,14 @@ impl CacheEngine {
                 // removes the inflight entry and wakes waiters even if this
                 // task is cancelled mid-await, preventing the leak that would
                 // otherwise hang every future request for `hash`.
-                Some(Ok(notify)) => {
+                Ok(notify) => {
                     let _guard = InflightGuard {
                         hash,
-                        inflight: &self.inner.inflight,
+                        inner: &self.inner,
                         notify: &notify,
                     };
                     break self.pull_through_bytes(hash).await?;
                 }
-                // Mutex poisoned — fall through to a direct pull.
-                None => break self.pull_through_bytes(hash).await?,
             }
         };
         self.touch(hash);
@@ -1803,7 +1871,8 @@ impl CacheEngine {
         // loop but bumping no `get`-caller metrics: `populate` fills as a side
         // effect, so it counts neither a hit nor returned bytes.
         loop {
-            let state = self.inner.inflight.lock().ok().map(|mut guard| {
+            let state = {
+                let mut guard = self.inner.lock_inflight();
                 if let Some(n) = guard.get(&hash) {
                     Err(Arc::clone(n))
                 } else {
@@ -1811,10 +1880,10 @@ impl CacheEngine {
                     guard.insert(hash, Arc::clone(&n));
                     Ok(n)
                 }
-            });
+            };
             match state {
                 // Another task owns the pull — wait, then re-check presence.
-                Some(Err(notify)) => {
+                Err(notify) => {
                     notify.notified().await;
                     if self.has(hash).await? {
                         break;
@@ -1822,20 +1891,15 @@ impl CacheEngine {
                 }
                 // We own the pull — the guard wakes waiters + clears the entry
                 // even on cancellation.
-                Some(Ok(notify)) => {
+                Ok(notify) => {
                     let _guard = InflightGuard {
                         hash,
-                        inflight: &self.inner.inflight,
+                        inner: &self.inner,
                         notify: &notify,
                     };
                     // Fill-only: the payload is dropped, so the whole blob is
                     // never read back out of the store (#1132). The wrapper
                     // returns `()`, so there is nothing here to drop by accident.
-                    self.pull_through_fill(hash, local_only).await?;
-                    break;
-                }
-                // Mutex poisoned — fall through to a direct pull.
-                None => {
                     self.pull_through_fill(hash, local_only).await?;
                     break;
                 }
@@ -2115,11 +2179,7 @@ impl CacheEngine {
     /// caller owns the upstream pull, so the engine stays payment-agnostic.
     #[must_use]
     pub fn open_tee_sink(&self, hash: Hash) -> TeeOpen {
-        let mut guard = self
-            .inner
-            .inflight
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut guard = self.inner.lock_inflight();
         if guard.contains_key(&hash) {
             return TeeOpen::InFlight;
         }
@@ -3512,12 +3572,7 @@ impl Drop for TeeReservation {
         if !self.active {
             return;
         }
-        self.engine
-            .inner
-            .inflight
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(&self.hash);
+        self.engine.inner.lock_inflight().remove(&self.hash);
         self.notify.notify_waiters();
     }
 }
@@ -3678,12 +3733,7 @@ impl Drop for TeeSink {
         if let Some(import) = self.import.take() {
             import.abort();
         }
-        self.engine
-            .inner
-            .inflight
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(&self.hash);
+        self.engine.inner.lock_inflight().remove(&self.hash);
         self.notify.notify_waiters();
     }
 }
@@ -5252,6 +5302,193 @@ mod tests {
         anyhow::ensure!(
             inflight_len == 0,
             "inflight map should be empty after cancellation, had {inflight_len} entries"
+        );
+        Ok(())
+    }
+
+    // ----- In-flight mutex poisoning (#1517) -----
+
+    /// Poison `inner.inflight` the only way a `std::sync::Mutex` can be
+    /// poisoned: panic while holding the guard.
+    ///
+    /// This is synthetic by construction — the workspace anti-panic policy
+    /// (`unwrap_used` / `expect_used` / `panic` denied) is precisely why no
+    /// production path can do this, and precisely why a real firing would be
+    /// a bug worth an `error!` rather than a condition worth tuning.
+    #[allow(clippy::panic)]
+    fn poison_inflight(engine: &CacheEngine) {
+        let inner = Arc::clone(&engine.inner);
+        let handle = std::thread::spawn(move || {
+            let _guard = inner.inflight.lock();
+            panic!("deliberately poisoning the inflight mutex");
+        });
+        // Panicked by construction, so `join` returns the panic payload.
+        drop(handle.join());
+    }
+
+    /// Read the map length without laundering poison into a false `0` —
+    /// `lock().ok()` would report an empty map on a poisoned mutex and make
+    /// the orphan assertion below vacuously true.
+    fn inflight_len(engine: &CacheEngine) -> usize {
+        engine
+            .inner
+            .inflight
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
+    }
+
+    /// The load-bearing half of #1517: a poisoned coalescing mutex must not
+    /// cost origin egress. Before the fix both `get` call sites discarded the
+    /// `PoisonError` and fell through to a *direct* pull, and std poison is
+    /// sticky for the process lifetime — so one panic permanently turned every
+    /// concurrent request for a missing blob into its own origin fetch. On a
+    /// metered `http`/`s3` origin that is an unbounded egress multiplier; on
+    /// the `Peer` origin reached via `populate` it is a USDC double-spend.
+    ///
+    /// `fetch_count == 1` under a poisoned mutex is the whole assertion.
+    #[tokio::test]
+    async fn poisoned_inflight_mutex_still_coalesces_and_is_counted() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let payload = b"coalesce under poison";
+        let hash = Hash::new(payload);
+        let origin = Arc::new(SlowCountingOrigin::new(
+            payload,
+            std::time::Duration::from_millis(50),
+        ));
+
+        let cm = Arc::new(CacheMetrics::default());
+        let engine = CacheEngine::open_full(
+            tmp.path(),
+            vec![origin.clone() as Arc<dyn Origin>],
+            10,
+            crate::PinnedHashes::empty(),
+            crate::RetryPolicy::default(),
+            CircuitBreakerPolicy::default(),
+            Some(Arc::clone(&cm)),
+            Duration::ZERO,
+        )
+        .await?;
+
+        poison_inflight(&engine);
+
+        let mut handles = Vec::new();
+        for _ in 0..5 {
+            let e = engine.clone();
+            handles.push(tokio::spawn(async move { e.get(hash).await }));
+        }
+        for handle in handles {
+            let result = handle
+                .await
+                .map_err(|e| anyhow::anyhow!("task join: {e}"))?;
+            anyhow::ensure!(result.is_ok(), "expected Ok, got {result:?}");
+        }
+
+        let count = origin.fetch_count.load(Ordering::SeqCst);
+        anyhow::ensure!(
+            count == 1,
+            "coalescing must survive poison — expected exactly 1 origin fetch, got {count}"
+        );
+        anyhow::ensure!(
+            cm.inflight_mutex_poisoned.get() > 0,
+            "recovering the guard silently is the pre-#1517 bug; the poison must be counted"
+        );
+        anyhow::ensure!(
+            inflight_len(&engine) == 0,
+            "the owner's guard must still clear its entry under poison"
+        );
+        Ok(())
+    }
+
+    /// The log is latched but the counter is not: an operator gets one
+    /// `error!` and an honest total, rather than one line per request on a hot
+    /// path. Asserting the latch flag is a proxy for "logged at most once" —
+    /// the crate has no `tracing` capture layer in its dev-deps, and adding one
+    /// to observe a single line is not worth the dependency.
+    #[tokio::test]
+    async fn poisoned_inflight_log_latches_but_the_counter_does_not() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let payload = b"latch check";
+        let hash = Hash::new(payload);
+        let origin = StubOrigin::new(payload);
+
+        let cm = Arc::new(CacheMetrics::default());
+        let engine = CacheEngine::open_full(
+            tmp.path(),
+            vec![Arc::new(origin) as Arc<dyn Origin>],
+            10,
+            crate::PinnedHashes::empty(),
+            crate::RetryPolicy::default(),
+            CircuitBreakerPolicy::default(),
+            Some(Arc::clone(&cm)),
+            Duration::ZERO,
+        )
+        .await?;
+
+        poison_inflight(&engine);
+
+        anyhow::ensure!(
+            !engine.inner.inflight_poison_logged.load(Ordering::Relaxed),
+            "the latch must not be set before any lock is taken"
+        );
+
+        // One miss takes the lock more than once (claim the entry, then
+        // release it in `InflightGuard::drop`), which is all it takes to show
+        // the two diverging: n bumps against a single latched bool. A second
+        // `get` would add nothing — it is a cache hit and returns above the
+        // coalescing loop without locking at all.
+        let _ = engine.get(hash).await?;
+        let bumps = cm.inflight_mutex_poisoned.get();
+
+        anyhow::ensure!(
+            engine.inner.inflight_poison_logged.load(Ordering::Relaxed),
+            "the first poisoned lock must latch the log"
+        );
+        anyhow::ensure!(
+            bumps > 1,
+            "the counter must count every poisoned lock, not latch with the log; got {bumps}"
+        );
+        Ok(())
+    }
+
+    /// The drop-path half of #1517. `InflightGuard::drop` used to swallow the
+    /// `PoisonError` and skip the removal; since `notify_waiters` only wakes
+    /// *current* waiters, the leaked entry made every later request for that
+    /// hash park on a `Notify` that would never fire again — a permanent hang,
+    /// which is the exact failure the guard exists to prevent.
+    ///
+    /// The unpoisoned cancellation case is covered by
+    /// [`cancelled_owner_does_not_orphan_inflight_entry`]; this is its poisoned
+    /// twin, and it reads the map with `into_inner` so poison cannot fake a
+    /// pass.
+    #[tokio::test]
+    async fn poisoned_mutex_does_not_orphan_inflight_entry() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let payload = b"poisoned cancel";
+        let hash = Hash::new(payload);
+        let origin = SlowCountingOrigin::new(payload, std::time::Duration::from_secs(10));
+
+        let engine =
+            CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 10).await?;
+
+        poison_inflight(&engine);
+
+        let owner_engine = engine.clone();
+        let owner = tokio::spawn(async move {
+            tokio::time::timeout(std::time::Duration::from_millis(50), owner_engine.get(hash)).await
+        });
+        let _ = owner.await?;
+
+        // An empty map is the whole assertion, and it reads through
+        // `into_inner` so poison cannot fake it. Under the pre-#1517 drop impl
+        // the entry survives here and `len == 1`. There is deliberately no
+        // "now issue another get and time it" probe: this origin sleeps for ten
+        // seconds by design, so any such timeout would measure the stub rather
+        // than the orphaned `Notify`.
+        let len = inflight_len(&engine);
+        anyhow::ensure!(
+            len == 0,
+            "InflightGuard::drop must clear the entry under poison, had {len}"
         );
         Ok(())
     }

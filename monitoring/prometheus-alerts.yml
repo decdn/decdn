@@ -49,53 +49,16 @@ groups:
             and changes nothing. See
             adr/005-protocol.md#probe-triggered-eviction-hold.
 
-      - alert: DecdnBlacklistSyncLagWarning
-        expr: decdn_blacklist_sync_lag_seconds > 600
-        for: 2m
-        labels:
-          severity: warning
-          slash_risk: blacklist_violation
-        annotations:
-          summary: "Blacklist poll lagging on {{ $labels.instance }}"
-          description: |
-            One full poll interval has elapsed without a successful
-            getBlacklistVersion(). Check RPC provider availability.
-            See adr/011-content-takedown.md.
-
-      - alert: DecdnBlacklistSyncLagCritical
-        expr: decdn_blacklist_sync_lag_seconds > 1800
-        for: 1m
-        labels:
-          severity: critical
-          slash_risk: blacklist_violation
-        annotations:
-          summary: "Blacklist sync stale (>30m) on {{ $labels.instance }}"
-          description: |
-            Serving any recently-blacklisted hash is now slashable.
-            Investigate the RPC provider or perform a manual sync.
-
-      - alert: DecdnBlacklistVersionBehind
-        expr: decdn_blacklist_version_behind > 0
-        for: 10m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Blacklist version drift on {{ $labels.instance }}"
-          description: |
-            on_chain_version - local_version > 0 for 10 minutes. The node
-            has not yet fetched the latest entries.
-
-      - alert: DecdnBlacklistVersionFarBehind
-        expr: decdn_blacklist_version_behind > 1
-        for: 2m
-        labels:
-          severity: critical
-        annotations:
-          summary: "Blacklist >1 version behind on {{ $labels.instance }}"
-          description: |
-            Multiple blacklist versions missed. Investigate RPC / poll failure
-            immediately.
-
+      # Removed in #1513: DecdnBlacklistSyncLagWarning / …Critical (on
+      # decdn_blacklist_sync_lag_seconds) and DecdnBlacklistVersionBehind /
+      # …FarBehind (on decdn_blacklist_version_behind). Neither series has ever
+      # been exported — ADR 011 designs them, no field implements them — so all
+      # four rules were permanently silent while reading, on a dashboard, as
+      # blacklist-lag coverage. DecdnBlacklistWatcherStalled below is the real
+      # coverage: it fires on staleness of the watcher's last successful tick,
+      # which IS exported. If the version-delta gauges land later, restore the
+      # threshold rules then; adr/appendix-observability.md carries them as
+      # `planned` rows in the meantime.
       - alert: DecdnBlacklistWatcherStalled
         # Positive liveness: the gauge is stamped every successful poll tick, so
         # staleness catches a panicked, wedged, or exited watcher that the
@@ -207,7 +170,11 @@ groups:
             avoids false alerts when only one direction is idle.
 
       - alert: DecdnPeerTableThin
-        expr: decdn_peer_table_size < 3
+        # `decdn_gossip_peer_table_size`, not `decdn_peer_table_size` (#1513).
+        # The exporter field is `gossip_peer_table_size`, so the ADR-registry
+        # name this rule used to carry has never existed and the alert could
+        # never fire.
+        expr: decdn_gossip_peer_table_size < 3
         for: 10m
         labels:
           severity: warning
@@ -274,39 +241,37 @@ groups:
   - name: decdn-delivery
     interval: 30s
     rules:
-      - alert: DecdnHighStreamErrorRate
-        expr: |
-          (
-            sum by (instance) (rate(decdn_streams_failed_total[5m]))
-            /
-            clamp_min(
-              sum by (instance) (rate(decdn_streams_failed_total[5m]))
-                + sum by (instance) (rate(decdn_streams_completed_total[5m])),
-              1
-            )
-          ) > 0.05
+      # Replaces DecdnHighStreamErrorRate (#1513), which divided
+      # decdn_streams_failed_total by decdn_streams_{failed,completed}_total —
+      # none of which the exporter emits, so it could never fire. There is no
+      # outcome-labelled stream family to rebuild the ratio from, and no
+      # serve-ATTEMPT counter to divide by, so this is an absolute rate on the
+      # one refusal reason that means "the node is at fault": every other
+      # decdn_serve_stream_rejected_* value is a client-side or policy outcome
+      # (unfunded channel, unknown channel, denied hash) that a healthy node
+      # produces on purpose.
+      - alert: DecdnServeInternalErrorRate
+        expr: sum by (instance) (rate(decdn_serve_stream_rejected_internal_error_total[5m])) > 0
         for: 10m
         labels:
           severity: warning
         annotations:
-          summary: "Stream failure rate >5% on {{ $labels.instance }}"
+          summary: "Serve path returning internal errors on {{ $labels.instance }}"
           description: |
-            More than 5% of streams have failed over the last 5 minutes.
-            Break down by `reason` label to localise the cause.
+            The node is refusing paid stream requests with an internal error
+            rather than a policy reason. Sustained non-zero means a node-side
+            fault — a degraded blob store, a wedged origin, or a signing
+            failure — not a client problem. Check the node's error logs; the
+            throttled `error!` names the specific failure.
 
-      - alert: DecdnHashMismatchAppearing
-        expr: rate(decdn_streams_failed_total{reason="hash_mismatch"}[10m]) > 0
-        for: 2m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Hash-mismatch failures on {{ $labels.instance }}"
-          description: |
-            Streams are failing with reason=hash_mismatch. Either the origin
-            store is corrupted or the operator served a blob whose stored
-            bytes do not match its address. Hash mismatch is a critical
-            data-integrity signal; the short `for:` reflects that. See
-            adr/002-content-addressing.md.
+      # Removed in #1513: DecdnHashMismatchAppearing, which read
+      # decdn_streams_failed_total{reason="hash_mismatch"}. Neither that series
+      # nor any outcome-labelled stream family has ever been exported, so the
+      # rule was permanently silent. Delivery hash mismatch is genuinely
+      # unmetered today — the cache returns CacheError::HashMismatch and the
+      # node logs it, but nothing counts it. This is a real coverage gap, not a
+      # naming fix; it is recorded in docs/runbook.md rather than papered over
+      # with another rule that cannot fire.
 
       - alert: DecdnProbeHoldsSaturated
         expr: |
@@ -347,10 +312,9 @@ groups:
       #
       # A raw rate, not a ratio, because the node exports no serve-ATTEMPT counter:
       # `decdn_serve_stream_rejected_*` is a per-reason family with no success
-      # sibling, so there is nothing to divide by. (Do not copy
-      # `DecdnHighStreamErrorRate`'s denominator above — `decdn_streams_failed_total`
-      # and `decdn_streams_completed_total` are not emitted by this exporter, so
-      # that rule cannot fire. Tracked in #1513.) The threshold is therefore
+      # sibling, so there is nothing to divide by. (#1513 deleted the one rule
+      # that pretended otherwise — see `DecdnServeInternalErrorRate` above.)
+      # The threshold is therefore
       # absolute and deliberately loose: any sustained refusal rate is worth a look,
       # because before #1520 this counter had no alert, panel, or runbook entry at
       # all and a node could refuse every paying client in silence.

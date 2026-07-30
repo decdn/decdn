@@ -277,6 +277,28 @@ pub struct CacheMetrics {
     /// Field name omits `_total`: the emitted name is
     /// `decdn_cache_size_measure_failures_total`.
     pub size_measure_failures: Counter,
+    /// Times the in-flight fill-coalescing mutex was found poisoned
+    /// (#1517). A poison means some earlier task panicked while holding
+    /// the map guard; the workspace anti-panic policy (`unwrap_used` /
+    /// `expect_used` / `panic` denied) makes that close to unreachable,
+    /// so **any** nonzero value is a genuine bug worth filing rather
+    /// than an operational condition worth tuning.
+    ///
+    /// The engine recovers the guard via `PoisonError::into_inner` and
+    /// keeps coalescing, so this is a report, not a degradation: it does
+    /// not mean duplicate origin pulls happened. It is metered because
+    /// the alternative — the pre-#1517 behaviour of discarding the error
+    /// — silently disabled coalescing for the life of the process, and
+    /// the only observable was `decdn_cache_pull_through_bytes_total`
+    /// rising faster than request volume.
+    ///
+    /// Paired with a single `tracing::error!`, latched so a hot path
+    /// cannot spam the log; the counter carries the true count.
+    ///
+    /// Field name omits `_total`: the `OpenMetrics` encoder appends it
+    /// automatically, so the emitted name is
+    /// `decdn_cache_inflight_mutex_poisoned_total`.
+    pub inflight_mutex_poisoned: Counter,
     /// Hashes removed via the durable operator-evict path
     /// (`decdn_cache_evicted_operator_total`) — `decdn node evict` / DMCA
     /// takedown. Bumped once per takedown that actually stopped serving: an

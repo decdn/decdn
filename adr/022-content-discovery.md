@@ -161,7 +161,7 @@ Total tokens consumed: `k`, matching what the per-hash equivalent would have cha
 
 **Interaction with the per-publisher quota.** STORE admission additionally consumes one slot from the publisher's record quota ([§ Content Records and TTL](#content-records-and-ttl)); the rate limit fires first, so a rate-limited STORE never consumes a quota slot. FIND_VALUE responses that route the requester onward (via `closer_nodes`) do not multiply rate-limit consumption on the responder — one inbound request, one bucket token, regardless of response size.
 
-**Observability.** `decdn_dht_rate_limit_rejections_total{layer={per_peer, per_ip, global}}` counter, same shape as the probe-side metric.
+**Observability.** `decdn_dht_rate_limit_rejected_{per_peer,per_ip,global}_total` — three unlabeled sibling counters, the same shape as the probe-side metric. Siblings rather than one `layer`-labelled counter, per the convention settled in #1475 ([appendix-observability.md § Reason splits](appendix-observability.md#reason-splits-sibling-counters-not-labels)); the labelled `decdn_dht_rate_limit_rejections_total` this line used to specify was never exported.
 
 #### FIND_VALUE Flow (Cache Miss → DHT Lookup)
 
@@ -303,7 +303,7 @@ New optional variants (e.g., `BatchStore` / `BatchStoreAck` added for publishing
 7. Content propagation is driven entirely by realized paid demand — reactive cache-miss pull-through per [ADR 037](037-regional-proxy-warming.md#adr-037-latency-driven-proxy-warming-for-regional-locality) plus explicit operator pinning. No FIND_VALUE-query-frequency or per-hash cache-miss-frequency signal is collected or emitted to drive speculative acquisition.
 8. An accepted `StoreRequest`'s record TTL is anchored on the receiver's wall-clock at acceptance time (`expiry_us = receive_us + record_ttl_us`), independent of any holder-supplied timestamp.
 9. A receiver enforces both a per-publisher record cap (hard reject with `StoreAck { accepted: false }` when at cap) and a per-node global cap (global LRU eviction when at cap and the inserting publisher is below its per-publisher cap). No publisher can force eviction of another publisher's records by exceeding its own cap.
-10. `cdn/dht/v1` inbound traffic is bounded by global, per-IP, and per-peer token buckets; rejected requests close the stream with `RATE_LIMITED` and are counted in `decdn_dht_rate_limit_rejections_total` labeled by layer.
+10. `cdn/dht/v1` inbound traffic is bounded by global, per-IP, and per-peer token buckets; rejected requests close the stream with `RATE_LIMITED` and are counted in the `decdn_dht_rate_limit_rejected_{per_peer,per_ip,global}_total` sibling counters.
 11. A `FindValueResponse` containing `closer_nodes` entries whose XOR distance is not strictly less than the responder's own has those entries dropped by the requester; honest entries from the same response are retained.
 12. The requester randomizes the surviving provider set before issuing `cdn/probe/v1` requests; probe order is statistically independent of `FindValueResponse.providers` order.
 13. NodeIds returning `has_blob: false` for hash H are not re-probed for H within the negative probe cache TTL ([ADR 001 § Probe cache](001-network.md#probe-cache)).

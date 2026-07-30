@@ -23,6 +23,46 @@ since project inception and will roll into the first tagged release.
 
 ### Changed (BREAKING)
 
+- **Monitoring-breaking: `monitoring/` no longer ships rules and panels that
+  could never fire (#1513).** Thirteen `decdn_*` series referenced by the
+  reference alerts and dashboard were never exported by any node. Nothing in CI
+  compared the two, so each shipped as coverage while being permanently silent.
+  Both files now reference only live series, enforced by a new
+  `monitoring_selectors_are_exported` test.
+  - **Renamed:** `decdn_peer_table_size` → `decdn_gossip_peer_table_size`
+    (exporter field `gossip_peer_table_size`). This revives
+    `DecdnPeerTableThin`, which has never been able to fire, and fixes the
+    "Peer table size" dashboard panel. **Any forked dashboard or alert file
+    needs the same edit.**
+  - **Alerts deleted:** `DecdnBlacklistSyncLagWarning`,
+    `DecdnBlacklistSyncLagCritical`, `DecdnBlacklistVersionBehind`,
+    `DecdnBlacklistVersionFarBehind` (on `decdn_blacklist_sync_lag_seconds` /
+    `decdn_blacklist_version_behind`, neither emitted — the blacklist watcher is
+    unimplemented; `DecdnBlacklistWatcherStalled` is the real coverage), and
+    `DecdnHashMismatchAppearing` (on
+    `decdn_streams_failed_total{reason="hash_mismatch"}`). Delivery hash
+    mismatch is genuinely unmetered — a real coverage gap, now recorded in
+    `docs/runbook.md` rather than papered over with a rule that cannot fire.
+  - **Alert replaced:** `DecdnHighStreamErrorRate` →
+    `DecdnServeInternalErrorRate`. The old rule divided
+    `decdn_streams_failed_total` by `decdn_streams_{failed,completed}_total`;
+    none exist. There is no serve-attempt counter to build a ratio from, so the
+    replacement is an absolute rate on
+    `decdn_serve_stream_rejected_internal_error_total` — the one refusal reason
+    that means the node itself is at fault rather than the client.
+  - **Panels changed:** "Blacklist sync lag" → "Blacklist watcher tick age";
+    "Throughput (served vs received)" now reads
+    `decdn_cache_bytes_returned_total` / `decdn_cache_pull_through_bytes_total`
+    (whose ratio is the origin-egress amplification factor) instead of
+    `decdn_bytes_{served,received}_total`; "Probe responses by result" and the
+    p50/p95/p99 "Probe fan-out latency" panel are replaced by one probe
+    request-rate + probe-cache hit/miss panel (the exporter registers no
+    histograms at all, so no quantile panel is buildable today); "Stream
+    failures by reason" is dropped as redundant with the real serve-refusal
+    panel, which gains an `internal error` series; the payments panel drops its
+    settled-channel and vouchers-signed series for
+    `decdn_voucher_nonce_gaps_total`.
+
 - **Phantom-announcement offense retired; probe holds are now best-effort.**
   `SlashJudge` adjudicates two offenses instead of three. The
   announce-then-fail-to-deliver ("phantom announcement") offense is gone: it
@@ -358,6 +398,69 @@ since project inception and will roll into the first tagged release.
   explicit operator pinning ([ADR 022](adr/022-content-discovery.md)).
 
 ### Fixed
+
+#### Cache
+
+- **A poisoned coalescing mutex no longer silently costs origin egress and USDC
+  (#1517).** `CacheEngine`'s in-flight fill-coalescing map is what stops N
+  concurrent requests for one missing blob from opening N origin pulls. Three of
+  its five lock sites discarded the `PoisonError` — `get`'s loop and
+  `populate_inner`'s fell through to a *direct* pull, and `InflightGuard::drop`
+  skipped its removal — while the two tee-path sites already recovered the guard
+  with `PoisonError::into_inner`. Since a `std::sync::Mutex` poison is sticky for
+  the process lifetime, one panic permanently disabled coalescing: an unbounded
+  egress multiplier on a metered `http`/`s3` origin, and on the `Peer` origin
+  reached via `populate` a double-spend of USDC vouchers upstream — the exact
+  hazard `TeeOpen::InFlight` is documented to prevent. Nothing logged it and
+  nothing counted it; the only observable was
+  `decdn_cache_pull_through_bytes_total` outrunning request volume.
+  - All five sites now go through one `Inner::lock_inflight` choke point that
+    recovers the guard, matching the crate's dominant idiom and the rationale
+    already written for `evicted` / `is_evicted`. **Coalescing survives poison**,
+    so the hazard is removed rather than merely reported.
+  - The dropped removal in `InflightGuard::drop` was a second, unrecorded bug:
+    `notify_waiters()` wakes only *current* waiters, so a leaked entry left every
+    later request for that hash parked on a `Notify` that would never fire again
+    — the permanent hang the guard exists to prevent.
+  - **New metric:** `decdn_cache_inflight_mutex_poisoned_total`, paired with a
+    single latched `tracing::error!`. The anti-panic policy makes poison close to
+    unreachable, so any nonzero value is a bug report, not a threshold to tune;
+    `docs/runbook.md § Cache coalescing mutex poisoned` says so and says restart
+    is the only way to clear it. No config, wire, or ABI change.
+
+#### Observability
+
+- **The ADR metric registry can no longer document series the node never emits
+  (#1513).** `adr/appendix-observability.md` calls itself the canonical registry
+  but had no way to say "specified, not built" — its only axis was the M/R
+  *requirement* tier — so roughly a third of its rows read as shipped while
+  nothing exported them.
+  - **New `Status` column** (`live` / `planned`) on every registry table, and a
+    new `adr_registry_names_are_exported` test asserting every `live` row
+    resolves against the encoder's output. `planned` is the allowlist that gate
+    skips, which is what lets the check be absolute instead of carrying a
+    hand-maintained skip list that would rot the same way the names did.
+  - **Corrected names:** `decdn_peer_table_size` →
+    `decdn_gossip_peer_table_size` (also in `adr/appendix-peer-table-eviction.md`
+    and a `crates/common` config doc) and `decdn_gossip_announces_sent_total` →
+    `decdn_gossip_announces_published_total`. ADR 005 and ADR 022 specified a
+    single labelled `decdn_{probe,dht}_rate_limit_rejections_total`; the exporter
+    has always emitted sibling trios, and the ADRs now say so.
+  - **Added rows** for both rate-limit families (rejected / prune-sweeps /
+    tracked, 14 series), which existed only as brace-expanded shorthand in the
+    reason-splits table and so carried no Type, Tier, or description anywhere.
+  - `decdn_peer_table_evicted_registry_total` was specified with a `reason`
+    label, contradicting the same appendix's claim that
+    `decdn_probe_hold_unavailable_total{reason}` is the one labelled reason
+    split. It is now two sibling counters, per #1475.
+  - The doc comments in `crates/node/src/dht/rate_limit.rs` and
+    `crates/node/src/handlers/probe_rate_limit.rs` justified sibling counters
+    with "the `iroh_metrics::MetricsGroup` backend has no per-field labels".
+    That is false — `probe_hold_unavailable` and `streams_active` are both
+    `Family<L, M>` — and it contradicted five other comments in the tree.
+    Rewritten to state the #1475 convention as the deliberate choice it is.
+  - `decdn_cache_tag_drop_failures_total` joins the name-pinning array; it has
+    been bumped since #860/#837 but was never pinned.
 
 #### Node serve path
 

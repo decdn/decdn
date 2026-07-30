@@ -102,7 +102,7 @@
       "targets": [
         {
           "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
-          "expr": "decdn_peer_table_size{instance=~\"$instance\"}",
+          "expr": "decdn_gossip_peer_table_size{instance=~\"$instance\"}",
           "legendFormat": "{{instance}}",
           "refId": "A"
         }
@@ -181,12 +181,12 @@
       "targets": [
         {
           "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
-          "expr": "decdn_blacklist_sync_lag_seconds{instance=~\"$instance\"}",
+          "expr": "time() - (decdn_blacklist_watcher_last_tick_timestamp_seconds{instance=~\"$instance\"} > 0)",
           "legendFormat": "{{instance}}",
           "refId": "A"
         }
       ],
-      "title": "Blacklist sync lag",
+      "title": "Blacklist watcher tick age",
       "type": "stat"
     },
     {
@@ -274,7 +274,7 @@
           "custom": {"drawStyle": "line", "fillOpacity": 10, "lineWidth": 2}
         }
       },
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 15},
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 15},
       "id": 20,
       "options": {"legend": {"displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi"}},
       "targets": [
@@ -293,51 +293,29 @@
       "fieldConfig": {
         "defaults": {
           "color": {"mode": "palette-classic"},
-          "custom": {"drawStyle": "bars", "fillOpacity": 60, "lineWidth": 1, "stacking": {"mode": "normal"}},
-          "unit": "ops"
-        }
-      },
-      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 15},
-      "id": 21,
-      "options": {"legend": {"displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi"}},
-      "targets": [
-        {
-          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
-          "expr": "sum by (reason) (rate(decdn_streams_failed_total{instance=~\"$instance\"}[5m]))",
-          "legendFormat": "{{reason}}",
-          "refId": "A"
-        }
-      ],
-      "title": "Stream failures by reason",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
-      "fieldConfig": {
-        "defaults": {
-          "color": {"mode": "palette-classic"},
           "custom": {"drawStyle": "line", "fillOpacity": 10, "lineWidth": 2},
           "unit": "Bps"
         }
       },
       "gridPos": {"h": 8, "w": 24, "x": 0, "y": 23},
       "id": 22,
+      "description": "Bytes handed back to cache callers vs bytes pulled from origin (#1513). This replaces a served/received pair built on decdn_bytes_{served,received}_total, neither of which the exporter has ever emitted. The cache counters are the closest true equivalent and carry a reading the originals did not: their ratio is the origin-egress amplification factor — 1.0 while the node is a pure pass-through, trending to 0 as content gets re-served from cache.",
       "options": {"legend": {"displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi"}},
       "targets": [
         {
           "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
-          "expr": "rate(decdn_bytes_served_total{instance=~\"$instance\"}[5m])",
+          "expr": "rate(decdn_cache_bytes_returned_total{instance=~\"$instance\"}[5m])",
           "legendFormat": "served — {{instance}}",
           "refId": "A"
         },
         {
           "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
-          "expr": "rate(decdn_bytes_received_total{instance=~\"$instance\"}[5m])",
-          "legendFormat": "received — {{instance}}",
+          "expr": "rate(decdn_cache_pull_through_bytes_total{instance=~\"$instance\"}[5m])",
+          "legendFormat": "origin pull-through — {{instance}}",
           "refId": "B"
         }
       ],
-      "title": "Throughput (served vs received)",
+      "title": "Throughput (served vs origin pull-through)",
       "type": "timeseries"
     },
     {
@@ -377,6 +355,12 @@
           "expr": "sum by (instance) (rate(decdn_serve_stream_rejected_cache_miss_total{instance=~\"$instance\"}[5m]))",
           "legendFormat": "cache miss",
           "refId": "D"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "sum by (instance) (rate(decdn_serve_stream_rejected_internal_error_total{instance=~\"$instance\"}[5m]))",
+          "legendFormat": "internal error",
+          "refId": "E"
         }
       ],
       "title": "Payment-class serve refusals (all collapse to NotFound)",
@@ -462,41 +446,7 @@
     },
     {
       "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
-      "fieldConfig": {
-        "defaults": {
-          "color": {"mode": "palette-classic"},
-          "custom": {"drawStyle": "line", "fillOpacity": 10, "lineWidth": 2},
-          "unit": "s"
-        }
-      },
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 49},
-      "id": 40,
-      "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi"}},
-      "targets": [
-        {
-          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
-          "expr": "histogram_quantile(0.5, sum by (le, outcome) (rate(decdn_probe_fanout_latency_seconds_bucket{instance=~\"$instance\"}[5m])))",
-          "legendFormat": "p50 — {{outcome}}",
-          "refId": "A"
-        },
-        {
-          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
-          "expr": "histogram_quantile(0.95, sum by (le, outcome) (rate(decdn_probe_fanout_latency_seconds_bucket{instance=~\"$instance\"}[5m])))",
-          "legendFormat": "p95 — {{outcome}}",
-          "refId": "B"
-        },
-        {
-          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
-          "expr": "histogram_quantile(0.99, sum by (le, outcome) (rate(decdn_probe_fanout_latency_seconds_bucket{instance=~\"$instance\"}[5m])))",
-          "legendFormat": "p99 — {{outcome}}",
-          "refId": "C"
-        }
-      ],
-      "title": "Probe fan-out latency (p50/p95/p99)",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "description": "Probe request load and how much of it the positive-probe cache absorbs (#1513). Replaces a 'Probe responses by result' panel and a p50/p95/p99 fan-out latency panel, both of which queried series the exporter has never emitted — see the CHANGELOG for the retired names. No quantile panel can be built today: the exporter registers no histograms at all.",
       "fieldConfig": {
         "defaults": {
           "color": {"mode": "palette-classic"},
@@ -504,18 +454,30 @@
           "unit": "ops"
         }
       },
-      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 49},
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 49},
       "id": 41,
       "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi"}},
       "targets": [
         {
           "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
-          "expr": "sum by (result) (rate(decdn_probe_responses_total{instance=~\"$instance\"}[5m]))",
-          "legendFormat": "{{result}}",
+          "expr": "sum by (instance) (rate(decdn_probe_requests_total{instance=~\"$instance\"}[5m]))",
+          "legendFormat": "requests",
           "refId": "A"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "sum by (instance) (rate(decdn_probe_cache_hits_total{instance=~\"$instance\"}[5m]))",
+          "legendFormat": "probe-cache hits",
+          "refId": "B"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "sum by (instance) (rate(decdn_probe_cache_misses_total{instance=~\"$instance\"}[5m]))",
+          "legendFormat": "probe-cache misses",
+          "refId": "C"
         }
       ],
-      "title": "Probe responses by result",
+      "title": "Probe request rate and probe-cache hit/miss",
       "type": "timeseries"
     },
     {
@@ -546,18 +508,12 @@
         },
         {
           "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
-          "expr": "rate(decdn_channels_settled_total{instance=~\"$instance\"}[1h]) * 3600",
-          "legendFormat": "settled / hour — {{instance}}",
+          "expr": "sum by (instance) (rate(decdn_voucher_nonce_gaps_total{instance=~\"$instance\"}[5m]))",
+          "legendFormat": "voucher nonce gaps / s — {{instance}}",
           "refId": "B"
-        },
-        {
-          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
-          "expr": "rate(decdn_vouchers_signed_total{instance=~\"$instance\"}[5m])",
-          "legendFormat": "vouchers signed / s — {{instance}}",
-          "refId": "C"
         }
       ],
-      "title": "Channel and voucher activity",
+      "title": "Open channels and voucher nonce gaps",
       "type": "timeseries"
     },
     {
