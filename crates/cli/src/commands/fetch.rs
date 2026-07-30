@@ -46,6 +46,7 @@ use decdn_incentive::buyer_channel_redb::RedbBuyerChannelStore;
 use decdn_incentive::eth_identity::{self, PasswordSource, load_signer, read_password};
 use decdn_incentive::payment_channel::PaymentChannel;
 use decdn_incentive::{bind_node_id_domain, slash_judge_domain, voucher_domain};
+use decdn_protocol::MB_BYTES;
 use decdn_protocol::client::StreamError;
 use iroh::{Endpoint, EndpointAddr, PublicKey, RelayUrl};
 
@@ -798,10 +799,10 @@ struct StreamedFetch {
 /// so whichever node this call is pointed at can serve the tail.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_lines)] // One sequential open→stream→persist→classify attempt loop. Each stage's comment explains a money-relevant decision (which watermark to settle, when a partial is poison, why a flush failure outranks a pull failure); splitting them out would separate those from the loop state they justify.
-async fn fetch_blob_streaming(
+async fn fetch_blob_streaming<P>(
     endpoint: &Endpoint,
     target: EndpointAddr,
-    ctx: &ChannelContext,
+    ctx: &mut ChannelContext,
     slash_dom: &Eip712Domain,
     provider: Address,
     store: &RedbBuyerChannelStore,
@@ -812,7 +813,19 @@ async fn fetch_blob_streaming(
     max_rate_per_mb: u64,
     partial: &Path,
     on_progress: Option<&ProgressCallback>,
-) -> anyhow::Result<StreamedFetch> {
+    // Reactive graduation (#1497): funding handles for a mid-fetch top-up. Only
+    // touched when a genuine `InsufficientDeposit` is confirmed against the
+    // buyer's own ledger — see the reactive branch below.
+    contract: &PaymentChannel::PaymentChannelInstance<P>,
+    rpc: &P,
+    self_address: Address,
+    payment_channel_addr: Address,
+    max_approve: bool,
+    working_deposit: U256,
+) -> anyhow::Result<StreamedFetch>
+where
+    P: alloy::providers::Provider + Clone,
+{
     use std::io::{BufWriter, Seek, SeekFrom};
 
     // What a previous attempt left behind, snapped down to a chunk-group
@@ -864,6 +877,20 @@ async fn fetch_blob_streaming(
     let mut total_bytes = 0u64;
     let mut attempt = 0u32;
     let mut restarted = false;
+    // Reactive graduation (#1497): bounds how many times a genuine mid-fetch
+    // `InsufficientDeposit` is answered with an on-chain `topUp` rather than a
+    // terminal error. Separate budget from `attempt`/`MAX_RESUME_ATTEMPTS` — see
+    // `MAX_TOPUP_ATTEMPTS`'s doc.
+    let mut topups = 0u32;
+    // The upstream's quoted per-MB rate and voucher cadence (in bytes) from the
+    // most recent successful open, used to price the NEXT voucher when deciding
+    // whether a mid-stream `InsufficientDeposit` is genuine (see the reactive
+    // branch below). Only ever consulted after at least one successful open —
+    // exactly the case where an `InsufficientDeposit` can occur, since it is
+    // raised by a voucher rejection mid-stream, never by the open handshake
+    // itself.
+    let mut quoted_rate_per_mb = 0u64;
+    let mut voucher_interval_bytes = 0u64;
     loop {
         // Open BEFORE touching the file. The rewind below is destructive, and an
         // open can fail for reasons that have nothing to do with the partial (the
@@ -890,6 +917,8 @@ async fn fetch_blob_streaming(
         let result = match opened {
             Ok((header, pull)) => {
                 total_bytes = header.total_bytes;
+                quoted_rate_per_mb = header.rate_per_mb;
+                voucher_interval_bytes = header.interval_bytes;
                 // The open succeeded, so this attempt is really going to write.
                 // Rewind to the verified prefix: a no-op on the first pass, and on
                 // a retry it discards whatever the failed attempt left behind.
@@ -952,6 +981,62 @@ async fn fetch_blob_streaming(
             restarted = true;
             byte_offset = 0;
             continue;
+        }
+        // Reactive graduation (#1497): a genuine mid-fetch ceiling hit —
+        // validated against our OWN ledger, not the node's word — tops the
+        // channel up toward `working_deposit` and resumes at the same
+        // `byte_offset`. Desync is handled above by the reseed path; a node
+        // crying poverty while our ledger still has headroom falls through to
+        // the terminal error below (we refuse to fund a bogus claim), as does a
+        // delegate key that cannot fund (`top_up_decision` -> `Exhausted`).
+        //
+        // The next voucher's true cost is `ceil(interval_bytes * quoted_rate_per_mb
+        // / 1 MiB)` — the exact formula `ChannelLedger`'s own `next_voucher` uses
+        // — from the QUOTED rate/cadence on the most recent successful open, never
+        // the buyer's `max_rate_per_mb` ceiling (that bounds what we're willing to
+        // pay, not what the next voucher actually costs).
+        let remaining = ctx.deposit.saturating_sub(ledger.committed().amount);
+        let next_cost = U256::from(voucher_interval_bytes)
+            .saturating_mul(U256::from(quoted_rate_per_mb))
+            .div_ceil(U256::from(MB_BYTES));
+        if topups < decdn_client_pull::MAX_TOPUP_ATTEMPTS
+            && working_deposit > U256::ZERO
+            && decdn_client_pull::genuine_exhaustion(&err, ctx, remaining, next_cost)
+        {
+            let is_funder = store
+                .get_by_provider(provider)?
+                .is_some_and(|state| state.funder == self_address);
+            let additional = working_deposit.saturating_sub(remaining);
+            match top_up_decision(additional, is_funder) {
+                TopUpDecision::TopUp(additional) => {
+                    ensure_allowance(
+                        rpc,
+                        ctx.token,
+                        self_address,
+                        payment_channel_addr,
+                        if max_approve { None } else { Some(additional) },
+                    )
+                    .await?;
+                    // The escrowed-but-untracked outcomes are logged inside
+                    // `top_up`; re-read below and reflect whatever landed.
+                    let _ = top_up(contract, store, provider, additional).await?;
+                    if let Some(state) = store.get_by_provider(provider)? {
+                        ctx.deposit = state.deposit; // reflect the graduated deposit
+                    }
+                    eprintln!(
+                        "note: channel exhausted mid-fetch after the node delivered its \
+                         initial deposit's worth of verified bytes; topped up toward the \
+                         working deposit and resuming (top-up {}/{})",
+                        topups + 1,
+                        decdn_client_pull::MAX_TOPUP_ATTEMPTS
+                    );
+                    topups += 1;
+                    continue;
+                }
+                // Not the funder, or nothing left to add: fall through to the
+                // terminal error below.
+                TopUpDecision::Exhausted | TopUpDecision::NotNeeded => {}
+            }
         }
         if attempt >= decdn_client_pull::MAX_RESUME_ATTEMPTS {
             return Err(err);
@@ -1199,84 +1284,101 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
     // derived from the adopted channel's on-chain `provider`, and there is no
     // discovery/probe/select step to run before prompting for the keystore
     // password.
-    let (node_id, provider, ctx, slash_dom) = if let Some(raw_channel_id) = &common.channel_id {
-        let channel_id = parse_channel_id(raw_channel_id)?;
-        let expected_provider = common
-            .provider_address
-            .as_deref()
-            .map(|p| chain_ctx::parse_address(p, "--provider-address"))
-            .transpose()?;
+    let (node_id, provider, mut ctx, slash_dom, contract, rpc, self_address) =
+        if let Some(raw_channel_id) = &common.channel_id {
+            let channel_id = parse_channel_id(raw_channel_id)?;
+            let expected_provider = common
+                .provider_address
+                .as_deref()
+                .map(|p| chain_ctx::parse_address(p, "--provider-address"))
+                .transpose()?;
 
-        let password = read_password(
-            &[
-                PasswordSource::Env(eth_identity::KEYSTORE_PASSWORD_ENV),
-                PasswordSource::Prompt { confirm: false },
-            ],
-            "eth keystore password",
-        )?;
-        let signer = Arc::new(load_signer(&chain.keystore, &password)?);
-        let self_address = signer.address();
-        let rpc = provider::build_provider(&chain.rpc_url, &signer)?;
-        let contract = PaymentChannel::new(chain.payment_channel, rpc.clone());
-        let voucher_dom = voucher_domain(chain.chain_id, chain.payment_channel);
-        let slash_dom = slash_judge_domain(chain.chain_id, chain.slash_judge);
+            let password = read_password(
+                &[
+                    PasswordSource::Env(eth_identity::KEYSTORE_PASSWORD_ENV),
+                    PasswordSource::Prompt { confirm: false },
+                ],
+                "eth keystore password",
+            )?;
+            let signer = Arc::new(load_signer(&chain.keystore, &password)?);
+            let self_address = signer.address();
+            let rpc = provider::build_provider(&chain.rpc_url, &signer)?;
+            let contract = PaymentChannel::new(chain.payment_channel, rpc.clone());
+            let voucher_dom = voucher_domain(chain.chain_id, chain.payment_channel);
+            let slash_dom = slash_judge_domain(chain.chain_id, chain.slash_judge);
 
-        let (ctx, provider) = hydrate_channel_by_id(
-            &store,
-            &contract,
-            channel_id,
-            self_address,
-            &voucher_dom,
-            &signer,
-            expected_provider,
-        )
-        .await?;
-        let ctx = attach_client_binding(ctx, &chain, &endpoint, &signer)?;
-        let node_id = resolve_node_for_provider(common, &chain, provider).await?;
+            let (ctx, provider) = hydrate_channel_by_id(
+                &store,
+                &contract,
+                channel_id,
+                self_address,
+                &voucher_dom,
+                &signer,
+                expected_provider,
+            )
+            .await?;
+            let ctx = attach_client_binding(ctx, &chain, &endpoint, &signer)?;
+            let node_id = resolve_node_for_provider(common, &chain, provider).await?;
 
-        (node_id, provider, ctx, slash_dom)
-    } else {
-        // Resolve the node to fetch from: explicit `--node-id`, or auto-discover.
-        let (node_id, provider) =
-            resolve_target_node(common, &chain, &endpoint, &store, &relays, hash).await?;
+            (
+                node_id,
+                provider,
+                ctx,
+                slash_dom,
+                contract,
+                rpc,
+                self_address,
+            )
+        } else {
+            // Resolve the node to fetch from: explicit `--node-id`, or auto-discover.
+            let (node_id, provider) =
+                resolve_target_node(common, &chain, &endpoint, &store, &relays, hash).await?;
 
-        // Buyer signer (vouchers + the openChannel tx). Loaded after selection so a
-        // failed discovery never prompts for a keystore password. Password from env,
-        // else TTY.
-        let password = read_password(
-            &[
-                PasswordSource::Env(eth_identity::KEYSTORE_PASSWORD_ENV),
-                PasswordSource::Prompt { confirm: false },
-            ],
-            "eth keystore password",
-        )?;
-        let signer = Arc::new(load_signer(&chain.keystore, &password)?);
-        let self_address = signer.address();
+            // Buyer signer (vouchers + the openChannel tx). Loaded after selection so a
+            // failed discovery never prompts for a keystore password. Password from env,
+            // else TTY.
+            let password = read_password(
+                &[
+                    PasswordSource::Env(eth_identity::KEYSTORE_PASSWORD_ENV),
+                    PasswordSource::Prompt { confirm: false },
+                ],
+                "eth keystore password",
+            )?;
+            let signer = Arc::new(load_signer(&chain.keystore, &password)?);
+            let self_address = signer.address();
 
-        let rpc = provider::build_provider(&chain.rpc_url, &signer)?;
-        let contract = PaymentChannel::new(chain.payment_channel, rpc.clone());
-        let voucher_dom = voucher_domain(chain.chain_id, chain.payment_channel);
-        let slash_dom = slash_judge_domain(chain.chain_id, chain.slash_judge);
+            let rpc = provider::build_provider(&chain.rpc_url, &signer)?;
+            let contract = PaymentChannel::new(chain.payment_channel, rpc.clone());
+            let voucher_dom = voucher_domain(chain.chain_id, chain.payment_channel);
+            let slash_dom = slash_judge_domain(chain.chain_id, chain.slash_judge);
 
-        // Reuse a live channel for this provider (resuming its watermark), else open
-        // and persist a new one, with the ADR 005 client binding attached. The
-        // context snapshots the channel's voucher watermark (`prior_nonce`) and gives
-        // the fetch a low-deposit refill check (#1103).
-        let ctx = build_channel_ctx(
-            &store,
-            &contract,
-            &rpc,
-            &signer,
-            &voucher_dom,
-            provider,
-            self_address,
-            &chain,
-            &endpoint,
-        )
-        .await?;
+            // Reuse a live channel for this provider (resuming its watermark), else open
+            // and persist a new one, with the ADR 005 client binding attached. The
+            // context snapshots the channel's voucher watermark (`prior_nonce`) and gives
+            // the fetch a low-deposit refill check (#1103).
+            let ctx = build_channel_ctx(
+                &store,
+                &contract,
+                &rpc,
+                &signer,
+                &voucher_dom,
+                provider,
+                self_address,
+                &chain,
+                &endpoint,
+            )
+            .await?;
 
-        (node_id, provider, ctx, slash_dom)
-    };
+            (
+                node_id,
+                provider,
+                ctx,
+                slash_dom,
+                contract,
+                rpc,
+                self_address,
+            )
+        };
 
     let mut target = EndpointAddr::new(node_id);
     // `--addr` requires `--node-id` (clap), so it only pins the explicit-node
@@ -1309,7 +1411,7 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
     let streamed = fetch_blob_streaming(
         &endpoint,
         target,
-        &ctx,
+        &mut ctx,
         &slash_dom,
         provider,
         &store,
@@ -1329,6 +1431,13 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
         common.max_rate_per_mb,
         &partial,
         Some(&on_progress),
+        // Reactive graduation (#1497): funding handles for a mid-fetch top-up.
+        &contract,
+        &rpc,
+        self_address,
+        chain.payment_channel,
+        chain.max_approve,
+        chain.working_deposit,
     )
     .await;
     // Clear the bar before the terminal outcome (success line or error) so it

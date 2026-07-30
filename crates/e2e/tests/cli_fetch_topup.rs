@@ -39,10 +39,14 @@ use std::time::Duration;
 use alloy::primitives::{Address, B256, U256};
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::Context;
+use decdn_cache::Hash;
 use decdn_client_pull::buyer_channel::{ensure_allowance, open_channel, top_up};
 use decdn_e2e::chain::ChainFixture;
+use decdn_e2e::cli::{decdn_command, ensure_decdn_cli_built};
+use decdn_e2e::node::NodeFixture;
 use decdn_incentive::buyer_channel::BuyerChannelStore;
 use decdn_incentive::buyer_channel_redb::RedbBuyerChannelStore;
+use decdn_incentive::eth_identity;
 use decdn_incentive::payment_channel::PaymentChannel;
 use decdn_incentive::voucher_domain;
 
@@ -204,4 +208,256 @@ async fn run() -> anyhow::Result<()> {
     );
 
     Ok(())
+}
+
+// ---- Reactive graduation (#1497): a genuine MID-FETCH `InsufficientDeposit` ----
+//
+// The test above drives the shared `top_up` kernel directly (the auto-refill-at-
+// reuse-time leg, #1103). This one drives the shipped `decdn` binary through a
+// REAL paid pull that outgrows its `initial_deposit` partway through — the
+// reactive leg added in `fetch_blob_streaming` (`crates/cli/src/commands/fetch.rs`)
+// — and asserts the fetch still SUCCEEDS, having topped the channel up on-chain
+// toward `working_deposit` rather than surfacing the exhaustion as a terminal
+// error.
+//
+// The channel opens at the on-chain `minDeposit` floor (1 USDC) and the node's
+// rate is set high enough that the very FIRST voucher interval (1 MB, the
+// protocol default) already costs more than that — so the node rejects the
+// channel's first-ever voucher with `InsufficientDeposit`. A fresh channel has
+// no prior accepted voucher, so the node's reject carries no `WatermarkBundle`
+// (`watermark_bundle_for_reject` requires one to echo back) — exactly the
+// "genuine exhaustion, not a healable desync" case `genuine_exhaustion` exists
+// to recognize. The CLI should top up to `working_deposit` and retry the same
+// blob from scratch, landing a channel deposit of exactly `working_deposit` (no
+// bytes were ever committed before the top-up).
+
+const INITIAL_DEPOSIT_MICRO_USDC: u64 = 1_000_000; // 1 USDC == on-chain minDeposit
+const WORKING_DEPOSIT_MICRO_USDC: u64 = 10_000_000; // 10 USDC — plenty to finish the blob
+const HIGH_RATE_PER_MB: u64 = 2_000_000; // 2 USDC/MB — exceeds the initial deposit in <1 MB
+const TOPUP_KEYSTORE_PASSWORD: &str = "topup-e2e-password";
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fetch_larger_than_initial_deposit_tops_up_and_completes() -> anyhow::Result<()> {
+    tokio::time::timeout(OVERALL_TIMEOUT, Box::pin(run_reactive_topup()))
+        .await
+        .context("reactive top-up e2e exceeded the overall timeout")??;
+    Ok(())
+}
+
+/// A deterministic multi-MB blob — big enough that, at [`HIGH_RATE_PER_MB`], its
+/// total cost spans several 1 MB voucher intervals and comfortably exceeds
+/// [`INITIAL_DEPOSIT_MICRO_USDC`] while staying well under
+/// [`WORKING_DEPOSIT_MICRO_USDC`].
+fn make_blob() -> Vec<u8> {
+    let mut v = vec![0u8; 2 * 1024 * 1024 + 777];
+    let mut x: u32 = 0x2468_ace0;
+    for b in &mut v {
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        *b = x.to_le_bytes().first().copied().unwrap_or(0);
+    }
+    v
+}
+
+async fn run_reactive_topup() -> anyhow::Result<()> {
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .try_init();
+
+    ensure_decdn_cli_built()?;
+    let chain = ChainFixture::launch().await?;
+
+    let blob = make_blob();
+    let blob_hash = Hash::new(&blob);
+    let (node, hash) = NodeFixture::launch(&chain, "US", &blob).await?;
+    anyhow::ensure!(
+        hash == blob_hash,
+        "seeded blob hash mismatch: {hash} vs {blob_hash}"
+    );
+    // Bait the very first voucher interval into `InsufficientDeposit`: at the
+    // default cost of 10 µUSDC/MB the 1 USDC initial deposit is plenty, so the
+    // rate must be raised before the buyer ever opens the channel.
+    node.set_rate_per_mb(HIGH_RATE_PER_MB).await?;
+
+    // Funded buyer with an on-disk keystore under a `0o700` client data dir (the
+    // `RedbBuyerChannelStore` the CLI opens enforces the mode; `tempdir` is
+    // `0o755`).
+    let client_dir = tempfile::tempdir().context("client tempdir")?;
+    #[cfg(unix)]
+    std::fs::set_permissions(
+        client_dir.path(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .context("chmod client dir 0o700")?;
+    eth_identity::generate_and_persist(client_dir.path(), TOPUP_KEYSTORE_PASSWORD, false)
+        .context("generate buyer keystore")?;
+    let keystore = eth_identity::keystore_path(client_dir.path());
+    let buyer =
+        eth_identity::load_signer(&keystore, TOPUP_KEYSTORE_PASSWORD).context("load buyer")?;
+    let buyer_addr = buyer.address();
+    chain.fund_eth(buyer_addr, 100).await?;
+    chain
+        .mint_usdc(
+            buyer_addr,
+            U256::from(WORKING_DEPOSIT_MICRO_USDC) * U256::from(4u64),
+        )
+        .await
+        .context("mint buyer USDC")?;
+
+    let out = client_dir.path().join("blob.bin");
+    let args = topup_fetch_argv(
+        &chain,
+        &node,
+        &blob_hash,
+        client_dir.path(),
+        &keystore,
+        &out,
+    );
+
+    let before = billed_bytes(client_dir.path(), node.operator_addr())?;
+    anyhow::ensure!(
+        before == 0,
+        "no bytes should be billed before the first fetch"
+    );
+
+    run_topup_fetch_until_ready(client_dir.path(), &args).await?;
+
+    let got = std::fs::read(&out).context("read output")?;
+    anyhow::ensure!(
+        got == blob,
+        "the fetch must still complete successfully after the reactive top-up: got {} bytes, \
+         expected {}",
+        got.len(),
+        blob.len()
+    );
+    let partial = client_dir.path().join("blob.bin.partial");
+    anyhow::ensure!(
+        !partial.exists(),
+        "the .partial scratch file must be promoted away, not left beside --output: {}",
+        partial.display()
+    );
+
+    // The graduating assertion: the channel's on-chain deposit must have grown
+    // from the 1 USDC initial open to the full working deposit. No bytes were
+    // ever committed before the reactive top-up fired (the very first voucher
+    // was the one rejected), so the topped-up deposit lands at EXACTLY
+    // `working_deposit` — not merely "more than initial".
+    let store = RedbBuyerChannelStore::open(client_dir.path()).context("open buyer store")?;
+    let persisted = store
+        .get_by_provider(node.operator_addr())
+        .context("read persisted channel")?
+        .ok_or_else(|| anyhow::anyhow!("buyer channel not recorded after fetch"))?;
+    let channel_id = persisted.channel_id;
+    anyhow::ensure!(
+        persisted.deposit == U256::from(WORKING_DEPOSIT_MICRO_USDC),
+        "the persisted deposit must reflect the graduated top-up: got {}, expected {}",
+        persisted.deposit,
+        WORKING_DEPOSIT_MICRO_USDC
+    );
+
+    let buyer_provider = chain.provider_for(&buyer);
+    let pc = PaymentChannel::new(chain.addrs().payment_channel, buyer_provider);
+    let onchain = pc
+        .getChannel(channel_id)
+        .call()
+        .await
+        .context("getChannel")?
+        .deposit;
+    anyhow::ensure!(
+        onchain == U256::from(WORKING_DEPOSIT_MICRO_USDC),
+        "the on-chain channel deposit must have grown to the working deposit: got {onchain}, \
+         expected {WORKING_DEPOSIT_MICRO_USDC}"
+    );
+
+    drop(node);
+    Ok(())
+}
+
+/// Cumulative bytes billed on the persisted channel for `provider`, or `0` before
+/// any channel has been recorded. Mirrors `cli_fetch_resume.rs`'s helper of the
+/// same shape.
+fn billed_bytes(data_dir: &std::path::Path, provider: Address) -> anyhow::Result<u64> {
+    let Ok(store) = RedbBuyerChannelStore::open(data_dir) else {
+        return Ok(0);
+    };
+    let Some(state) = store.get_by_provider(provider).context("read channel")? else {
+        return Ok(0);
+    };
+    Ok(u64::try_from(state.last_bytes_delivered).unwrap_or(u64::MAX))
+}
+
+/// Run `decdn fetch`, retrying until the node's chain watcher has observed the
+/// freshly-opened channel (`decdn fetch` has no internal retry for that race).
+async fn run_topup_fetch_until_ready(
+    data_dir: &std::path::Path,
+    args: &[String],
+) -> anyhow::Result<()> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+    loop {
+        let output =
+            tokio::process::Command::from(decdn_command(data_dir, TOPUP_KEYSTORE_PASSWORD)?)
+                .arg("fetch")
+                .args(args)
+                .output()
+                .await
+                .context("spawn decdn fetch")?;
+        if output.status.success() {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "decdn fetch never succeeded; last stderr:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        tracing::debug!(
+            "fetch not ready; retrying after watcher catch-up:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        tokio::time::sleep(Duration::from_millis(750)).await;
+    }
+}
+
+/// The `decdn fetch` argv (after the `fetch` subcommand) for the reactive
+/// top-up journey: a small `--initial-deposit-micro-usdc` (clamped to the
+/// on-chain floor) and a `--working-deposit-micro-usdc` large enough to finish
+/// the blob once the reactive leg tops up. `--capacity-bond-address` is omitted
+/// deliberately: the node holds the blob, so the fetch never needs reactive
+/// origin pull-through.
+fn topup_fetch_argv(
+    chain: &ChainFixture,
+    node: &NodeFixture,
+    hash: &Hash,
+    data_dir: &std::path::Path,
+    keystore: &std::path::Path,
+    out: &std::path::Path,
+) -> Vec<String> {
+    vec![
+        "--hash".into(),
+        hash.to_hex(),
+        "-o".into(),
+        out.display().to_string(),
+        "--node-id".into(),
+        node.node_id().to_string(),
+        "--addr".into(),
+        format!("127.0.0.1:{}", node.bind_port()),
+        "--provider-address".into(),
+        format!("{}", node.operator_addr()),
+        "--rpc-url".into(),
+        chain.rpc_url(),
+        "--payment-channel-address".into(),
+        format!("{}", chain.addrs().payment_channel),
+        "--slash-judge-address".into(),
+        format!("{}", chain.addrs().slash_judge),
+        "--chain-id".into(),
+        chain.chain_id().to_string(),
+        "--data-dir".into(),
+        data_dir.display().to_string(),
+        "--keystore".into(),
+        keystore.display().to_string(),
+        "--initial-deposit-micro-usdc".into(),
+        INITIAL_DEPOSIT_MICRO_USDC.to_string(),
+        "--working-deposit-micro-usdc".into(),
+        WORKING_DEPOSIT_MICRO_USDC.to_string(),
+    ]
 }

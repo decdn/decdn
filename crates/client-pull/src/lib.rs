@@ -1416,6 +1416,17 @@ async fn open_stream(
 /// cannot do for it — and both loops must agree on the bound.
 pub const MAX_RESUME_ATTEMPTS: u32 = 3;
 
+/// Reactive graduation (#1497): the maximum number of times the STREAMING fetch
+/// (`crates/cli/src/commands/fetch.rs`) will `topUp` a channel toward its
+/// `working_deposit` after a genuine mid-fetch `InsufficientDeposit` (validated
+/// against the buyer's own ledger via [`genuine_exhaustion`]) and retry the same
+/// `byte_offset`. Separate from [`MAX_RESUME_ATTEMPTS`]: a top-up is a funding
+/// action with its own on-chain cost and failure mode (a delegate key that
+/// cannot fund, an allowance that fails to land), not a wallet-less resume, so
+/// it is bounded on its own budget rather than sharing/competing with the resume
+/// attempts.
+pub const MAX_TOPUP_ATTEMPTS: u32 = 3;
+
 /// Buffered fetch with wallet-less resume (issue #1481 §5): if a mid-stream
 /// voucher rejection carries a signer-verified [`WatermarkBundle`] for one of
 /// the four regression/exhaustion reasons, reseed `ledger` from it and reopen
