@@ -596,36 +596,14 @@ since project inception and will roll into the first tagged release.
 
 #### Cache / config
 
-- **`cache.prewarm` — opt-in remote-origin warm of the pinned set.** With
-  `prewarm = true`, a node fetches every hash in `cache.pinned_hashes` from its
-  configured `http`/`s3` origin at startup and again on `decdn node reload`,
-  so the first request for pinned content does not pay full pull-through
-  latency. Defaults to `false` and is **restart-required**: prewarm spends
-  origin egress on bytes nobody has asked for yet, so it never turns itself on
-  across an upgrade. An **fs-only** origin chain ignores the flag — that content
-  is already local and is advertised through the origin-held index, so importing
-  it would only duplicate the bytes on the same disk; a *mixed* fs+remote chain
-  does warm, and pins the fs entry serves are imported as part of that.
-  `decdn config validate` reports a flag set against an fs-only or empty chain
-  as `set but INERT` rather than echoing it back. Warming runs detached, so an
-  unreachable origin cannot block bring-up; it is cancelled at the top of
-  shutdown so a restart mid-warm does not manufacture a false
-  `prewarm_failures_total` spike (cancellation is checked between hashes, so a
-  single in-flight blob can still fail against a closing store); it fills local-origin-only, so it never fronts
-  USDC to a peer; and a hash filled by a concurrent pass is not counted as a
-  fetch, so overlapping warms do not double-count paid egress. A reload warms
-  only when it actually adds a pin, and at most one warm runs at a time.
-  - New metrics: `decdn_cache_prewarm_blobs_total`,
-    `decdn_cache_prewarm_bytes_total`, `decdn_cache_prewarm_refused_total`,
-    `decdn_cache_prewarm_failures_total`.
 - A pinned set larger than `cache.cache_size_mb` now logs a warning at startup
   and on reload. Pinned blobs are LRU-exempt, so the eviction driver could
   otherwise never reach its high-water target and the disk grows past the
-  configured ceiling. Independent of `prewarm` — the hazard applies to every
-  node however the pinned content arrived.
-- `decdn config validate` now reports `fs_rescan_interval_sec` and `prewarm`,
-  and `decdn config init`'s template documents both. `fs_rescan_interval_sec`
-  shipped without either, so its resolved value was invisible to operators.
+  configured ceiling. The hazard applies to every node however the pinned
+  content arrived.
+- `decdn config validate` now reports `fs_rescan_interval_sec`, and
+  `decdn config init`'s template documents it. It shipped without either, so its
+  resolved value was invisible to operators.
 
 #### Contracts
 

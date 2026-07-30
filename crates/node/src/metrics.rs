@@ -3012,13 +3012,6 @@ mod tests {
             "decdn_cache_evictions_starved_total",
             "decdn_cache_size_measure_failures_total",
             "decdn_cache_evicted_operator_total",
-            // Prewarm counters (#1130). Same `_total`-suffix trap: the struct
-            // fields are `prewarm_blobs`, `prewarm_bytes`, `prewarm_refused`,
-            // `prewarm_failures`.
-            "decdn_cache_prewarm_blobs_total",
-            "decdn_cache_prewarm_bytes_total",
-            "decdn_cache_prewarm_refused_total",
-            "decdn_cache_prewarm_failures_total",
         ] {
             assert!(
                 has_metric_line(&text, name, 0),
