@@ -409,6 +409,24 @@ since project inception and will roll into the first tagged release.
   argument and `serve_stream` holds the crate's only `clamped_rate()` call, which
   makes the one-clamp-per-request invariant something the compiler enforces
   rather than a matter of review attention. No wire, config, or ABI change.
+- **Buyer channel rows now record the deposit the contract credited, not the amount
+  requested (#1521).** `openChannel` and `topUp` credit a measured balance delta —
+  deliberately, so a fee-on-transfer settlement token cannot over-state a channel
+  against the shared USDC pool — and emit that delta in `ChannelOpened.deposit` /
+  `ChannelToppedUp.additionalDeposit`. The buyer path recorded its own requested
+  amount instead, so under such a token its local watermark would exceed the
+  on-chain deposit, its vouchers would climb past it, and `_advanceClaimWatermark`
+  would revert at `withdraw`/`settleChannel` — leaving the seller holding delivered
+  bytes it could never claim. `open_channel` now reads `ChannelOpened.deposit` (it
+  already took `channelId` and `expiresAt` from that event) and `top_up` decodes
+  `ChannelToppedUp` rather than assuming the requested amount landed, falling back
+  to the requested amount with a `warn!` if the event is absent. Not reachable
+  today — the USDC address is immutable at deployment and mainnet USDC is not
+  fee-on-transfer — so this is defensive depth, not a live fix. **Contract
+  behaviour is unchanged:** a partial shave is still credited as received rather
+  than reverted, which is now an asserted decision instead of an unexercised path;
+  reverting would hard-code "the settlement token must never be fee-bearing" into
+  the contract, a policy call larger than the test gap that prompted this.
 - **A degraded node no longer reports itself as merely empty (#1129).** On a
   `cdn/client/v1` cache miss, a transient origin/store fault during a reactive
   pull-through fill (an S3 5xx surviving retry exhaustion, an open circuit

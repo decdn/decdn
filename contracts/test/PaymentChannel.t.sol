@@ -2247,3 +2247,181 @@ contract PaymentChannelTest is Test {
         assertEq(channel.providerChannels(provider, 1, type(uint256).max).length, 3);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Fee-on-transfer coverage (#1521)
+// ---------------------------------------------------------------------------
+
+/// @dev A settlement token that burns a fixed share of every transfer, so the
+///      recipient's balance rises by less than the amount sent. Overriding
+///      `_update` is OZ v5's hook for this (same technique as
+///      `MaliciousERC20` in `TestnetFaucet.t.sol`).
+///
+///      `PaymentChannel` credits the measured balance DELTA rather than the
+///      requested amount, specifically so a token like this cannot over-state a
+///      channel's share of the shared pool. Nothing tested that, because the
+///      suite had no fee-bearing token — the guards and the delta arithmetic were
+///      unexercised on every path. This is not a token deCDN will ever configure
+///      (the USDC address is immutable at deployment and mainnet USDC is not
+///      fee-on-transfer); it exists to turn an assumption into an assertion.
+contract FeeOnTransferUSDC is ERC20 {
+    /// @dev Burn share in basis points. `10_000` confiscates the whole transfer,
+    ///      which is what reaches the post-transfer `ZeroAmount` guards.
+    uint256 public feeBps;
+
+    constructor() ERC20("Fee USDC", "fUSDC") {
+        _mint(msg.sender, 1_000_000_000e6);
+    }
+
+    /// @dev Armed only AFTER the test has funded and approved its client. Funding
+    ///      at a 100% burn would leave the client with nothing, and the revert
+    ///      under test would be `ERC20InsufficientBalance` rather than the
+    ///      post-transfer guard we mean to exercise.
+    function setFeeBps(uint256 feeBps_) external {
+        feeBps = feeBps_;
+    }
+
+    function decimals() public pure override returns (uint8) {
+        return 6;
+    }
+
+    function _update(address from, address to, uint256 value) internal override {
+        // Mint and burn (either endpoint zero) must pass through untouched, or
+        // the constructor's own `_mint` would be shaved too.
+        if (from == address(0) || to == address(0) || feeBps == 0) {
+            super._update(from, to, value);
+            return;
+        }
+        uint256 fee = value * feeBps / 10_000;
+        super._update(from, to, value - fee);
+        if (fee > 0) super._update(from, address(0), fee);
+    }
+}
+
+/// @dev `PaymentChannelTest` hard-codes `new MockUSDC()` and types its `usdc`
+///      field concretely, so there is no seam to swap the token through — hence a
+///      second test contract rather than a parameterised `setUp`.
+contract PaymentChannelFeeOnTransferTest is Test {
+    FeeOnTransferUSDC internal usdc;
+    MockActiveBond internal bond;
+    MockSettlementRouter internal router;
+    PaymentChannel internal channel;
+
+    address internal client = address(0xC11E27);
+    address internal provider = address(0xB0B);
+    address internal admin = address(0xA11CE);
+
+    uint256 internal constant DISPUTE_WINDOW = 48 hours;
+    uint256 internal constant MAX_DURATION = 90 days;
+    uint256 internal constant DELIVERY_FLOOR = 1;
+    uint256 internal constant DEPOSIT = 1000e6;
+
+    /// @dev 1% burn: large enough that `received != deposit` is unambiguous, small
+    ///      enough that the channel still opens (so the delta arithmetic, not just
+    ///      the revert, is under test).
+    uint256 internal constant FEE_BPS = 100;
+
+    /// @dev Deploys with NO fee, funds and approves the client, then arms the fee.
+    ///      The ordering is load-bearing — see `setFeeBps`.
+    function _deploy(uint256 feeBps) internal {
+        usdc = new FeeOnTransferUSDC();
+        bond = new MockActiveBond();
+        router = new MockSettlementRouter(usdc);
+        bond.setActive(provider, true);
+
+        channel = new PaymentChannel({
+            usdc_: usdc,
+            capacityBond_: bond,
+            feeRouter_: address(router),
+            disputeWindow_: DISPUTE_WINDOW,
+            maxChannelDuration_: MAX_DURATION,
+            deliveryFloor_: DELIVERY_FLOOR,
+            admin: admin
+        });
+
+        usdc.transfer(client, 100_000e6);
+        vm.prank(client);
+        usdc.approve(address(channel), type(uint256).max);
+
+        usdc.setFeeBps(feeBps);
+    }
+
+    /// @dev The assertion that actually protects money: the channel is credited
+    ///      with what ARRIVED, not what was asked for. Crediting the requested
+    ///      amount would over-state the channel against a shared USDC pool, so
+    ///      later settlements would draw on a balance that was never escrowed.
+    function test_openChannel_creditsTheReceivedDeltaNotTheRequestedAmount() public {
+        _deploy(FEE_BPS);
+        uint256 expected = DEPOSIT - (DEPOSIT * FEE_BPS / 10_000);
+
+        vm.prank(client);
+        bytes32 id = channel.openChannel(provider, DEPOSIT, address(0));
+
+        assertEq(channel.getChannel(id).deposit, expected, "credited the delta");
+        assertLt(channel.getChannel(id).deposit, DEPOSIT, "and it is less than requested");
+        assertEq(usdc.balanceOf(address(channel)), expected, "which matches the real balance");
+    }
+
+    /// @dev `ChannelOpened.deposit` must carry the same delta, because off-chain
+    ///      buyers build their local channel row from this event.
+    function test_openChannel_eventCarriesTheReceivedDelta() public {
+        _deploy(FEE_BPS);
+        uint256 expected = DEPOSIT - (DEPOSIT * FEE_BPS / 10_000);
+
+        vm.recordLogs();
+        vm.prank(client);
+        bytes32 id = channel.openChannel(provider, DEPOSIT, address(0));
+
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        bool found = false;
+        for (uint256 i = 0; i < logs.length; i++) {
+            if (logs[i].topics[0] == keccak256("ChannelOpened(bytes32,address,address,uint256,uint256,address)")) {
+                (uint256 deposit,,) = abi.decode(logs[i].data, (uint256, uint256, address));
+                assertEq(deposit, expected, "event deposit is the received delta");
+                assertEq(logs[i].topics[1], id);
+                found = true;
+            }
+        }
+        assertTrue(found, "ChannelOpened was emitted");
+    }
+
+    function test_topUp_creditsTheReceivedDeltaNotTheRequestedAmount() public {
+        _deploy(FEE_BPS);
+        uint256 opened = DEPOSIT - (DEPOSIT * FEE_BPS / 10_000);
+        vm.prank(client);
+        bytes32 id = channel.openChannel(provider, DEPOSIT, address(0));
+
+        uint256 top = 500e6;
+        uint256 credited = top - (top * FEE_BPS / 10_000);
+        vm.prank(client);
+        channel.topUp(id, top);
+
+        assertEq(channel.getChannel(id).deposit, opened + credited, "top-up credits its delta");
+    }
+
+    /// @dev The post-transfer guard, which no test could reach before: a token that
+    ///      confiscates the whole transfer leaves `received == 0`, and a
+    ///      zero-deposit channel is un-serviceable while still consuming a
+    ///      provider slot and a client nonce. The PRE-transfer guard cannot catch
+    ///      this — `deposit` is non-zero.
+    function test_openChannel_revertsWhenTheTokenConfiscatesTheWholeDeposit() public {
+        _deploy(10_000); // 100% burn
+        vm.prank(client);
+        vm.expectRevert(PaymentChannel.ZeroAmount.selector);
+        channel.openChannel(provider, DEPOSIT, address(0));
+    }
+
+    function test_topUp_revertsWhenTheTokenConfiscatesTheWholeTopUp() public {
+        _deploy(0); // open cleanly, then confiscate only the top-up
+        vm.prank(client);
+        bytes32 id = channel.openChannel(provider, DEPOSIT, address(0));
+        assertEq(channel.getChannel(id).deposit, DEPOSIT, "opened at full value");
+
+        usdc.setFeeBps(10_000);
+        vm.prank(client);
+        vm.expectRevert(PaymentChannel.ZeroAmount.selector);
+        channel.topUp(id, 500e6);
+
+        assertEq(channel.getChannel(id).deposit, DEPOSIT, "and the deposit is unchanged");
+    }
+}

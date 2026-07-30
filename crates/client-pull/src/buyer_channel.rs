@@ -307,17 +307,34 @@ pub async fn open_channel<P: Provider + Clone>(
     } else {
         voucher_signer
     };
+    // Record what the contract CREDITED, not what we asked it to transfer.
+    // `openChannel` sets `ch.deposit` to the measured balance delta and emits that
+    // in `ChannelOpened.deposit`, precisely so a fee-on-transfer token cannot
+    // over-state a channel against the shared USDC pool. Recording the requested
+    // amount would put the over-statement in our own row instead: our vouchers
+    // would climb past the on-chain deposit and `_advanceClaimWatermark` would
+    // revert at `withdraw`/`settleChannel`, leaving the seller holding delivered
+    // bytes it can never claim. `channelId` and `expiresAt` were already taken
+    // from this event; `deposit` was the one field still read from the argument.
+    let credited = opened.deposit;
     let state = BuyerChannelState::new(
         channel_id,
         provider_addr,
         self_address,
         recorded_voucher_signer,
         token,
-        deposit,
+        credited,
         expires_at,
     );
     let ctx = ChannelContext::for_buyer_channel(&state, signer, voucher_domain.clone());
-    info!(provider = %provider_addr, %channel_id, %deposit, expires_at, "opened buyer payment channel");
+    info!(
+        provider = %provider_addr,
+        %channel_id,
+        requested = %deposit,
+        credited = %credited,
+        expires_at,
+        "opened buyer payment channel"
+    );
     Ok(OpenedChannel { state, ctx, tx })
 }
 
@@ -334,8 +351,10 @@ pub async fn open_channel<P: Provider + Clone>(
 /// [`BuyerChannelStore::add_deposit`], which reads the deposit inside its own
 /// write transaction (never this pre-call snapshot) and channel-id-guards it, so
 /// a concurrent watermark advance or channel rotation during the RPC is not
-/// clobbered. USDC is not fee-on-transfer, so the local `+= additional` matches
-/// the contract's `+= received`.
+/// clobbered. The amount credited is read back from `ChannelToppedUp`, not assumed
+/// to equal `additional`: the contract credits a measured balance delta, so the
+/// two differ under a fee-on-transfer token and the local row must not over-state
+/// the on-chain deposit.
 ///
 /// # Returns
 ///
@@ -385,8 +404,33 @@ where
     // Credit the *committed* deposit inside a write txn (never the pre-RPC
     // snapshot), channel-id-guarded so a concurrent advance/reuse during the RPC
     // is not clobbered.
+    // Credit what the contract credited, for the same reason `open_channel` does:
+    // `topUp` adds the measured balance delta and emits it as
+    // `ChannelToppedUp.additionalDeposit`. If the event is missing (an ABI skew, a
+    // proxy that swallowed it) fall back to the requested amount and say so — that
+    // is the pre-existing behaviour, and it is better than failing a top-up whose
+    // funds are already escrowed on-chain.
+    let credited = receipt
+        .inner
+        .logs()
+        .iter()
+        .filter_map(|log| log.log_decode::<PaymentChannel::ChannelToppedUp>().ok())
+        .map(|decoded| decoded.inner.data)
+        .find(|ev| ev.channelId == channel_id)
+        .map_or_else(
+            || {
+                warn!(
+                    %channel_id,
+                    %tx,
+                    "topUp receipt carried no ChannelToppedUp for this channel; \
+                     crediting the requested amount"
+                );
+                additional
+            },
+            |ev| ev.additionalDeposit,
+        );
     let outcome = store
-        .add_deposit(provider_addr, channel_id, additional)
+        .add_deposit(provider_addr, channel_id, credited)
         .context("persist buyer channel top-up")?;
     match &outcome {
         DepositOutcome::Added(new_deposit) => {
