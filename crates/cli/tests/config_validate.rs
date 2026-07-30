@@ -13,7 +13,7 @@ use decdn_cli::commands::config as commands;
 use decdn_common::cli::{ConfigValidateArgs, RunArgs};
 use decdn_common::config::{
     ResolvedBlockchain, ResolvedCache, ResolvedConfig, ResolvedGossip, ResolvedIdentity,
-    ResolvedNetwork, ResolvedObservability, ResolvedOrigin, ResolvedPayment, ResolvedSecurity,
+    ResolvedNetwork, ResolvedObservability, ResolvedPayment, ResolvedSecurity,
 };
 use tempfile::TempDir;
 
@@ -362,7 +362,6 @@ fn sample_resolved(overrides: impl FnOnce(&mut ResolvedConfig)) -> ResolvedConfi
             user_agent: decdn_cache::DEFAULT_USER_AGENT.to_string(),
             gc_interval_sec: 300,
             fs_rescan_interval_sec: 60,
-            prewarm: false,
             eviction_high_water_pct: 90,
             eviction_target_pct: 80,
             eviction_per_sweep_budget: 16,
@@ -452,12 +451,12 @@ fn summary_reports_the_pull_through_deadlines_when_enabled() -> anyhow::Result<(
     Ok(())
 }
 
-/// `fs_rescan_interval_sec` (#1508) and `prewarm` (#1130) both control how much
-/// origin work a node does on its own initiative, and both were invisible in
-/// `decdn config validate` — the one place an operator checks what a config
-/// actually resolved to. A knob that costs egress must not be silently on or off.
+/// `fs_rescan_interval_sec` (#1508) controls how much origin work a node does on
+/// its own initiative, and it was invisible in `decdn config validate` — the one
+/// place an operator checks what a config actually resolved to. A knob that costs
+/// I/O must not be silently on or off.
 #[test]
-fn summary_reports_the_origin_rescan_and_prewarm_knobs() -> anyhow::Result<()> {
+fn summary_reports_the_origin_rescan_knob() -> anyhow::Result<()> {
     let out = render(
         None,
         &sample_resolved(|c| c.cache.fs_rescan_interval_sec = 45),
@@ -466,57 +465,14 @@ fn summary_reports_the_origin_rescan_and_prewarm_knobs() -> anyhow::Result<()> {
         out.contains("fs_rescan_interval_sec:   45"),
         "the summary must report the resolved rescan cadence: {out}"
     );
-    anyhow::ensure!(
-        out.contains("prewarm:                  disabled"),
-        "prewarm off must be stated, not merely omitted: {out}"
-    );
 
-    // `prewarm = true` with the fixture's origin chain. The summary must report
-    // what prewarm will DO, not echo the flag: a flag set against an fs-only or
-    // empty chain is inert, and validate is the pre-flight tool that should say
-    // so rather than leaving the operator to discover it from a boot log.
-    let remote = ResolvedOrigin::Http {
-        url: decdn_cache::parse_origin_url("https://origin.example/")?,
-        decompress: decdn_cache::DecompressMode::Auto,
-    };
     let out = render(
         None,
-        &sample_resolved(|c| {
-            c.cache.fs_rescan_interval_sec = 0;
-            c.cache.prewarm = true;
-            c.cache.origins = vec![remote.clone()];
-        }),
+        &sample_resolved(|c| c.cache.fs_rescan_interval_sec = 0),
     )?;
     anyhow::ensure!(
         out.contains("fs_rescan_interval_sec:   disabled"),
         "a zero cadence must render as disabled, not as the bare number 0: {out}"
-    );
-    anyhow::ensure!(
-        out.contains("prewarm:                  enabled"),
-        "the summary must report prewarm as enabled when a remote origin backs it: {out}"
-    );
-
-    let out = render(
-        None,
-        &sample_resolved(|c| {
-            c.cache.prewarm = true;
-            c.cache.origins = vec![ResolvedOrigin::Fs {
-                path: std::path::PathBuf::from("/srv/origin"),
-            }];
-        }),
-    )?;
-    anyhow::ensure!(
-        out.contains("prewarm:                  set but INERT") && out.contains("local filesystem"),
-        "an fs-only chain makes prewarm inert and validate must say so, not print \
-         'enabled': {out}"
-    );
-
-    let out = render(None, &sample_resolved(|c| c.cache.prewarm = true))?;
-    anyhow::ensure!(
-        out.contains("prewarm:                  set but INERT")
-            && out.contains("no origin configured"),
-        "with no origin at all the reason must name that, not blame filesystem \
-         origins that do not exist: {out}"
     );
     Ok(())
 }

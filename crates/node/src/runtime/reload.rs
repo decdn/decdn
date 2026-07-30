@@ -60,7 +60,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::dispatch::ConnectionLimiter;
 use anyhow::Context;
@@ -71,7 +71,6 @@ use decdn_common::config::{
     load_file_config, parse_pinned_hashes, resolve_observability_into, resolve_payment_into,
     resolve_security_into,
 };
-use tokio_util::sync::CancellationToken;
 
 /// Read-only snapshot of the reloadable fields, returned by
 /// [`RuntimeReloadState::current`]. Used by `admin_v1_reload` to report
@@ -385,40 +384,9 @@ struct PinnedHashesSection {
     /// SIGHUP select loop runs.
     engine: std::sync::Mutex<Option<decdn_cache::CacheEngine>>,
     buf: std::sync::Mutex<Option<decdn_cache::PinnedHashes>>,
-    /// Whether remote-origin prewarm was enabled at boot (#1130) — the resolved
-    /// [`decdn_common::config::prewarm_enabled_for`] predicate, not the raw
-    /// flag. Fixed for the process lifetime: `cache.prewarm` is restart-required,
-    /// so the boot value is authoritative and a reload cannot turn prewarm on or
-    /// off — only warm the pins a reload adds, when it was already on.
-    prewarm: bool,
     /// `cache.cache_size_mb` at boot, for the reload-time pin-budget re-check.
-    /// Restart-required like `prewarm`, so the boot value stays authoritative.
+    /// Restart-required, so the boot value stays authoritative.
     cache_size_mb: u64,
-    /// Held for the duration of a detached rescan/warm so overlapping reloads
-    /// cannot stack them. A `tokio::sync::Mutex` (not `std`) because it is held
-    /// across awaits.
-    ///
-    /// Single-flight, **not** drop-the-loser: a reload that cannot take the lock
-    /// has already set [`Self::warm_dirty`], and the holder re-checks that flag
-    /// before releasing. Dropping the loser outright would strand its pins — the
-    /// in-flight pass snapshots the pinned set when it starts, so a pin added
-    /// after that point is invisible to it, and nothing would retry until the
-    /// next reload that happens to add one.
-    warm_in_flight: Arc<tokio::sync::Mutex<()>>,
-    /// A reload landed and its pin set has not been covered by a completed pass
-    /// yet. Set before the spawn, cleared by the lock holder at the top of each
-    /// iteration, so there is no lost wakeup in either interleaving.
-    warm_dirty: Arc<AtomicBool>,
-    /// At least one coalesced reload actually added a pin, so the next pass must
-    /// warm and not merely rescan. Accumulates across coalesced reloads: a
-    /// reload that only *removes* a pin must not swallow the warm owed to one
-    /// that added one.
-    warm_wanted: Arc<AtomicBool>,
-    /// Shared with the startup warm so shutdown cancels both legs. A reload warm
-    /// left running while `cache.shutdown()` closes the store underneath it
-    /// fails every remaining pin and inflates `prewarm_failures_total` into the
-    /// exact shape that metric documents as "your `pinned_hashes` are wrong".
-    prewarm_stop: CancellationToken,
 }
 
 impl ReloadableSection for PinnedHashesSection {
@@ -463,82 +431,13 @@ impl ReloadableSection for PinnedHashesSection {
                 // than only at the next periodic rescan (#1130). Detached so we
                 // honor reload()'s no-await invariant; rescan is idempotent.
                 let engine = engine.clone();
-                // Flag the work BEFORE contending for the lock, so no update can
-                // be lost in either interleaving: if the holder is about to
-                // finish, it re-checks and loops; if it is mid-pass, it re-checks
-                // when it gets there.
-                self.warm_dirty.store(true, Ordering::SeqCst);
-                if self.prewarm && diff.added > 0 {
-                    // Accumulated, not per-task: a reload that only *removes* a
-                    // pin must not swallow the warm owed to a concurrent one that
-                    // added one.
-                    self.warm_wanted.store(true, Ordering::SeqCst);
-                }
-                let single_flight = Arc::clone(&self.warm_in_flight);
-                let dirty = Arc::clone(&self.warm_dirty);
-                let wanted = Arc::clone(&self.warm_wanted);
                 let cache_size_mb = self.cache_size_mb;
-                let stop = self.prewarm_stop.clone();
                 tokio::spawn(async move {
-                    // Single-flight so a config-management loop that SIGHUPs on a
-                    // timer cannot stack passes: `rescan_origins` issues one HEAD
-                    // per pinned hash and is NOT coalesced by the engine (only
-                    // fills are), so N overlapping passes would cost N x pin-set
-                    // HEADs. Losing the lock is safe precisely BECAUSE the flags
-                    // above are already set — the holder's loop below picks the
-                    // work up. Dropping the loser outright would strand its pins:
-                    // both `rescan_origins` and `prewarm_pinned` snapshot the
-                    // pinned set when they start, so a pin added after that point
-                    // is invisible to the pass in flight.
-                    let Ok(_guard) = single_flight.try_lock() else {
-                        tracing::debug!(
-                            "pinned_hashes reload: coalescing into the rescan/warm \
-                             already in flight; it will re-run for this pin set"
-                        );
-                        return;
-                    };
-                    // Re-run while anything arrived during the previous pass. The
-                    // flag is cleared BEFORE the snapshots are taken, so a reload
-                    // landing mid-pass always earns another iteration.
-                    while dirty.swap(false, Ordering::SeqCst) {
-                        engine.rescan_origins().await;
-                        // Re-check the pin budget here too, not just at boot: a
-                        // reload is the one moment the pin set can grow past the
-                        // cache ceiling on a running node.
-                        super::warn_if_pins_exceed_cache(&engine, cache_size_mb);
-                        // Then warm anything pinned that isn't resident (#1130) —
-                        // this is what makes a pin added at runtime effective
-                        // without a restart. The whole pin set, not just the
-                        // delta: `prewarm` no-ops on a hash already in the store,
-                        // so the extra cost is one local presence check per pin,
-                        // and in exchange a pin warmed earlier but since lost is
-                        // repaired on any reload that warms.
-                        if wanted.swap(false, Ordering::SeqCst) {
-                            // Cancellable, like the startup warm: a reload warm
-                            // still running when `cache.shutdown()` closes the
-                            // store fails every remaining pin and inflates
-                            // `prewarm_failures_total` into the shape that metric
-                            // documents as "your pinned_hashes are wrong".
-                            let report = engine.prewarm_cancellable(&stop).await;
-                            tracing::info!(
-                                fetched = report.fetched,
-                                already_present = report.already_present,
-                                // Same field set as the startup log. `refused`
-                                // earns its place here more than there: a reload
-                                // is exactly when an operator pins a hash that is
-                                // already denylisted or operator-evicted, and
-                                // without this the pin silently never warms.
-                                refused = report.refused,
-                                failed = report.failed,
-                                bytes = report.bytes,
-                                cancelled = report.cancelled,
-                                "cache.prewarm: warmed the reloaded pin set (#1130)"
-                            );
-                        }
-                        if stop.is_cancelled() {
-                            break;
-                        }
-                    }
+                    engine.rescan_origins().await;
+                    // Re-check the pin budget here too, not just at boot: a reload
+                    // is the one moment the pin set can grow past the cache ceiling
+                    // on a running node.
+                    super::warn_if_pins_exceed_cache(&engine, cache_size_mb);
                 });
                 diff
             })
@@ -801,12 +700,7 @@ impl RuntimeReloadState {
         let pinned = Arc::new(PinnedHashesSection {
             engine: std::sync::Mutex::new(None),
             buf: std::sync::Mutex::new(None),
-            prewarm: decdn_common::config::prewarm_enabled_for(&initial.cache),
             cache_size_mb: initial.cache.cache_size_mb,
-            warm_in_flight: Arc::new(tokio::sync::Mutex::new(())),
-            warm_dirty: Arc::new(AtomicBool::new(false)),
-            warm_wanted: Arc::new(AtomicBool::new(false)),
-            prewarm_stop: CancellationToken::new(),
         });
         let security = Arc::new(SecuritySection {
             limiter: std::sync::Mutex::new(None),
@@ -872,15 +766,6 @@ impl RuntimeReloadState {
 
     /// Attach the live `ConnectionLimiter` after it's been built. Same
     /// shape as [`Self::attach_cache`]: must be called before the SIGHUP
-    /// The cancellation token that stops any in-flight prewarm — the reload
-    /// warm's, and (because the runtime clones this one for it) the startup
-    /// warm's too. One token for both legs, cancelled at the top of `shutdown()`
-    /// before the blob store closes.
-    #[must_use]
-    pub fn prewarm_stop(&self) -> CancellationToken {
-        self.pinned.prewarm_stop.clone()
-    }
-
     /// select loop, supports `None` for tests, recovers from a poisoned
     /// mutex by replacing the inner state.
     pub fn attach_limiter(&self, limiter: Option<Arc<ConnectionLimiter>>) {
@@ -969,7 +854,6 @@ impl RuntimeReloadState {
                 user_agent: decdn_cache::DEFAULT_USER_AGENT.to_string(),
                 gc_interval_sec: 0,
                 fs_rescan_interval_sec: 0,
-                prewarm: false,
                 eviction_high_water_pct: 90,
                 eviction_target_pct: 80,
                 eviction_per_sweep_budget: 16,
@@ -1312,7 +1196,6 @@ const fn cache_has_restart_required_field(c: &decdn_common::config::types::Cache
         user_agent,
         gc_interval_sec,
         fs_rescan_interval_sec,
-        prewarm,
         eviction_high_water_pct,
         eviction_target_pct,
         eviction_per_sweep_budget,
@@ -1341,10 +1224,6 @@ const fn cache_has_restart_required_field(c: &decdn_common::config::types::Cache
         // The rescan *cadence* needs a restart to rebuild the interval timer;
         // a reload still re-runs one rescan to pick up newly-added files.
         || fs_rescan_interval_sec.is_some()
-        // Whether prewarm is ON needs a restart (the startup warm has already
-        // run); a reload still warms whatever pins it *adds*, when prewarm was
-        // already enabled at boot.
-        || prewarm.is_some()
         || eviction_high_water_pct.is_some()
         || eviction_target_pct.is_some()
         || eviction_per_sweep_budget.is_some()
@@ -1484,7 +1363,6 @@ mod tests {
                 user_agent: decdn_cache::DEFAULT_USER_AGENT.to_string(),
                 gc_interval_sec: 0,
                 fs_rescan_interval_sec: 0,
-                prewarm: false,
                 eviction_high_water_pct: 90,
                 eviction_target_pct: 80,
                 eviction_per_sweep_budget: 16,
@@ -2777,145 +2655,6 @@ mod tests {
             ..CacheConfig::default()
         };
         assert!(cache_has_restart_required_field(&with_dir));
-        // `prewarm` specifically (#1130). The exhaustive destructure makes
-        // *adding* a field a compile error, but not deleting a clause from the
-        // `||` chain — and dropping this one is a silent no-op for the operator:
-        // they set `prewarm = true`, SIGHUP, get no "requires restart" notice,
-        // and the section's boot-fixed flag stays `false` for the process
-        // lifetime.
-        let with_prewarm = CacheConfig {
-            prewarm: Some(true),
-            ..CacheConfig::default()
-        };
-        assert!(cache_has_restart_required_field(&with_prewarm));
-    }
-
-    /// `PinnedHashesSection.prewarm` is fixed at boot from the resolved config
-    /// and gates every reload-time warm. Nothing else observes it, so a wiring
-    /// mistake here is silent: runtime-added pins would simply never warm, with
-    /// an absent log line as the only symptom.
-    #[test]
-    fn pinned_section_takes_its_prewarm_flag_from_the_boot_config() {
-        use decdn_common::config::resolved::ResolvedOrigin;
-
-        let section_prewarm = |prewarm: bool, origins: Vec<ResolvedOrigin>| {
-            let mut initial = seed_resolved(10, LogLevel::Info);
-            initial.cache.prewarm = prewarm;
-            initial.cache.origins = origins;
-            let (setter, _captured) = recording_setter();
-            let state = RuntimeReloadState::new(
-                PaymentArgs {
-                    rate_per_mb: None,
-                    delivery_floor: None,
-                },
-                ObservabilityArgs {
-                    log_level: None,
-                    log_format: None,
-                    metrics_port: None,
-                    metrics_bind: None,
-                    admin_port: None,
-                    otlp_endpoint: None,
-                },
-                &initial,
-                setter,
-            );
-            state.pinned.prewarm
-        };
-
-        let http = || ResolvedOrigin::Http {
-            url: decdn_cache::parse_origin_url("https://origin.example/").expect("url"),
-            decompress: decdn_cache::DecompressMode::Auto,
-        };
-        let fs = || ResolvedOrigin::Fs {
-            path: PathBuf::from("/srv/origin"),
-        };
-
-        assert!(
-            section_prewarm(true, vec![http()]),
-            "prewarm on with a remote origin must arm the reload warm"
-        );
-        assert!(
-            !section_prewarm(false, vec![http()]),
-            "prewarm off must disarm it even with a remote origin"
-        );
-        assert!(
-            !section_prewarm(true, vec![fs()]),
-            "an fs-only chain is inert, so the reload warm must stay disarmed"
-        );
-        assert!(
-            section_prewarm(true, vec![fs(), http()]),
-            "a mixed chain warms — this is the case every doc correction in #1510 \
-             is about, and it was previously covered nowhere"
-        );
-        assert!(
-            !section_prewarm(true, Vec::new()),
-            "an empty chain has nothing to warm from"
-        );
-    }
-
-    /// The single-flight guard must COALESCE a losing reload, not drop it. The
-    /// in-flight pass snapshots the pinned set when it starts, so a pin added
-    /// after that point is invisible to it — dropping the loser outright would
-    /// strand that pin until a restart, which is exactly the silent failure the
-    /// dirty flag exists to prevent.
-    #[tokio::test]
-    async fn a_reload_that_loses_the_single_flight_race_leaves_its_work_flagged() {
-        let dir = tempfile::tempdir().unwrap();
-        let h = make_hex_hash(9);
-        let path = write_config(dir.path(), &format!("[cache]\npinned_hashes = [\"{h}\"]\n"));
-
-        let mut initial = seed_resolved(10, LogLevel::Info);
-        initial.cache.prewarm = true;
-        initial.cache.origins = vec![decdn_common::config::resolved::ResolvedOrigin::Http {
-            url: decdn_cache::parse_origin_url("https://origin.example/").expect("url"),
-            decompress: decdn_cache::DecompressMode::Auto,
-        }];
-        let (setter, _captured) = recording_setter();
-        let state = RuntimeReloadState::new(
-            PaymentArgs {
-                rate_per_mb: None,
-                delivery_floor: None,
-            },
-            ObservabilityArgs {
-                log_level: None,
-                log_format: None,
-                metrics_port: None,
-                metrics_bind: None,
-                admin_port: None,
-                otlp_endpoint: None,
-            },
-            &initial,
-            setter,
-        );
-        let (cache, _tmp_cache) = build_test_cache().await;
-        state.attach_cache(Some(cache.clone()));
-
-        // Stand in for a pass already in flight: hold the guard for the whole
-        // reload, so the spawned task's `try_lock` is guaranteed to fail.
-        let held = state
-            .pinned
-            .warm_in_flight
-            .clone()
-            .try_lock_owned()
-            .unwrap();
-        state.reload(&path).await.unwrap();
-        // Let the losing task run to its `try_lock` and return.
-        tokio::task::yield_now().await;
-
-        assert!(
-            state.pinned.warm_dirty.load(Ordering::SeqCst),
-            "the losing reload must leave the dirty flag set so the holder re-runs"
-        );
-        assert!(
-            state.pinned.warm_wanted.load(Ordering::SeqCst),
-            "and must leave the warm owed, since it added a pin"
-        );
-        assert_eq!(
-            cache.pinned_snapshot().len(),
-            1,
-            "the pin itself still landed"
-        );
-        drop(held);
     }
 
     /// The `[observability]` restart notice is gated on a *non-reloadable*
