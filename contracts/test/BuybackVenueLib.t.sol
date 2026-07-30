@@ -3,9 +3,6 @@ pragma solidity 0.8.28;
 
 import { Test } from "forge-std/Test.sol";
 
-import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import { ERC20Burnable } from "@openzeppelin/contracts/token/ERC20/extensions/ERC20Burnable.sol";
-
 import { BuybackVenueLib } from "../script/lib/BuybackVenueLib.sol";
 import { GuardedBuybackBurner } from "../src/GuardedBuybackBurner.sol";
 
@@ -79,16 +76,16 @@ contract BuybackVenueLibTest is Test {
             ["balancer.swapRouter", "balancer.pool", "balancer.vault", "balancer.permit2", "balancer.subSwapCount"];
         for (uint256 i = 0; i < fields.length; i++) {
             vm.expectRevert(abi.encodeWithSelector(BuybackVenueLib.WiringIncomplete.selector, fields[i]));
-            harness.deployBalancer(_wiringWithFieldCleared(i), _liveGuard());
+            harness.requireBalancer(_wiringWithFieldCleared(i), _liveGuard());
         }
     }
 
     function test_uniswapBurner_rejectsIncompleteWiring() public {
         vm.expectRevert(abi.encodeWithSelector(BuybackVenueLib.WiringIncomplete.selector, "uniswap.swapRouter"));
-        harness.deployUniswap(address(0), address(0xB001), _liveGuard());
+        harness.requireUniswap(address(0), address(0xB001), _liveGuard());
 
         vm.expectRevert(abi.encodeWithSelector(BuybackVenueLib.WiringIncomplete.selector, "uniswap.pool"));
-        harness.deployUniswap(address(0x8081), address(0), _liveGuard());
+        harness.requireUniswap(address(0x8081), address(0), _liveGuard());
     }
 
     /// @notice `min == max == 0` passes every bound `GuardedBuybackBurner`'s
@@ -102,10 +99,10 @@ contract BuybackVenueLibTest is Test {
         dead.maxBuybackAmount_ = 0;
 
         vm.expectRevert(BuybackVenueLib.GuardBandDead.selector);
-        harness.deployUniswap(address(0x8081), address(0xB001), dead);
+        harness.requireUniswap(address(0x8081), address(0xB001), dead);
 
         vm.expectRevert(BuybackVenueLib.GuardBandDead.selector);
-        harness.deployBalancer(_wiring(), dead);
+        harness.requireBalancer(_wiring(), dead);
     }
 
     function _liveGuard() internal pure returns (GuardedBuybackBurner.GuardParams memory) {
@@ -162,24 +159,21 @@ contract VenueParserHarness {
         return BuybackVenueLib.parseVenue(venue);
     }
 
-    /// @dev Token args are pass-through and never touched before the guards revert, so
-    ///      these need no live contracts. A call that gets past the guards will fail on
-    ///      the real deployment — which is fine, every test here asserts a revert.
-    function deployBalancer(BuybackVenueLib.BalancerWiring memory wiring, GuardedBuybackBurner.GuardParams memory guard)
-        external
-        returns (GuardedBuybackBurner)
-    {
-        return BuybackVenueLib.deployBalancerBurner(
-            IERC20(address(0xDEC)), ERC20Burnable(address(0xDEC)), address(0xA), wiring, guard
-        );
+    /// @dev Calls the VALIDATORS, not the builders. A harness that called
+    ///      `deployBalancerBurner` would inline both burners' creation bytecode and
+    ///      exceed EIP-170 (27,849 bytes), failing the `--sizes` CI gate — which is
+    ///      why the guards live in their own functions.
+    function requireBalancer(
+        BuybackVenueLib.BalancerWiring memory wiring,
+        GuardedBuybackBurner.GuardParams memory guard
+    ) external pure {
+        BuybackVenueLib.requireBalancerWiring(wiring, guard);
     }
 
-    function deployUniswap(address swapRouter, address pool, GuardedBuybackBurner.GuardParams memory guard)
+    function requireUniswap(address swapRouter, address pool, GuardedBuybackBurner.GuardParams memory guard)
         external
-        returns (GuardedBuybackBurner)
+        pure
     {
-        return BuybackVenueLib.deployUniswapBurner(
-            IERC20(address(0xDEC)), ERC20Burnable(address(0xDEC)), address(0xA), swapRouter, pool, guard
-        );
+        BuybackVenueLib.requireUniswapWiring(swapRouter, pool, guard);
     }
 }

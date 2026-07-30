@@ -117,6 +117,44 @@ library BuybackVenueLib {
         return [STEADY_OPERATOR_SHARE, STEADY_BUYBACK_SHARE, STEADY_TREASURY_SHARE];
     }
 
+    /// @notice Reject an incomplete Balancer wiring or a dead guard band, before any
+    ///         deployment. Separated from `deployBalancerBurner` so it can be exercised
+    ///         directly: a harness calling the builder would inline both burners'
+    ///         creation bytecode and blow past EIP-170.
+    ///
+    /// @dev    `vault` is the one field with no downstream backstop — a zero vault is
+    ///         `BuybackBurnerBalancerV3`'s documented deferred-wiring path, so the
+    ///         constructor skips validation and the burner reverts `PoolNotWired` on
+    ///         every swap forever. A zero `swapRouter` or `permit2` would hit
+    ///         `ZeroAddress` in that constructor anyway; naming them here only makes
+    ///         the failure legible. `subSwapCount` is keeper-schedule metadata, an
+    ///         immutable that ADR 018 § Parameter Table defines for `= 1` and `> 1`
+    ///         and never `0`, so a zero is a permanently-wrong, redeploy-only config.
+    function requireBalancerWiring(BalancerWiring memory wiring, GuardedBuybackBurner.GuardParams memory guard)
+        internal
+        pure
+    {
+        if (wiring.swapRouter == address(0)) revert WiringIncomplete("balancer.swapRouter");
+        if (wiring.pool == address(0)) revert WiringIncomplete("balancer.pool");
+        if (wiring.vault == address(0)) revert WiringIncomplete("balancer.vault");
+        if (wiring.permit2 == address(0)) revert WiringIncomplete("balancer.permit2");
+        if (wiring.subSwapCount == 0) revert WiringIncomplete("balancer.subSwapCount");
+        _requireLiveGuardBand(guard);
+    }
+
+    /// @notice The Uniswap counterpart. Both terms are caught downstream too — a zero
+    ///         router by the burner constructor's `ZeroAddress` — so this converts
+    ///         opaque reverts into named ones rather than closing a silent hole, and
+    ///         applies the same guard-band check.
+    function requireUniswapWiring(address swapRouter, address pool, GuardedBuybackBurner.GuardParams memory guard)
+        internal
+        pure
+    {
+        if (swapRouter == address(0)) revert WiringIncomplete("uniswap.swapRouter");
+        if (pool == address(0)) revert WiringIncomplete("uniswap.pool");
+        _requireLiveGuardBand(guard);
+    }
+
     /// @dev Reject a guard band that can never execute. `GuardedBuybackBurner`'s
     ///      constructor checks `min > max` but not `max == 0`, so an all-zero band
     ///      passes every bound it does check and then fails `amountIn > maxBuybackAmount`
@@ -138,9 +176,7 @@ library BuybackVenueLib {
         address pool,
         GuardedBuybackBurner.GuardParams memory guard
     ) internal returns (GuardedBuybackBurner) {
-        if (swapRouter == address(0)) revert WiringIncomplete("uniswap.swapRouter");
-        if (pool == address(0)) revert WiringIncomplete("uniswap.pool");
-        _requireLiveGuardBand(guard);
+        requireUniswapWiring(swapRouter, pool, guard);
         return new BuybackBurnerUniswapV3(
             usdc,
             token,
@@ -171,19 +207,7 @@ library BuybackVenueLib {
         BalancerWiring memory wiring,
         GuardedBuybackBurner.GuardParams memory guard
     ) internal returns (GuardedBuybackBurner) {
-        // `vault` is the one field with no downstream backstop: a zero vault is the
-        // documented deferred-wiring path, so the constructor skips validation and
-        // the burner reverts `PoolNotWired` on every swap, forever. The others would
-        // revert eventually; naming them here just makes the failure legible.
-        if (wiring.swapRouter == address(0)) revert WiringIncomplete("balancer.swapRouter");
-        if (wiring.pool == address(0)) revert WiringIncomplete("balancer.pool");
-        if (wiring.vault == address(0)) revert WiringIncomplete("balancer.vault");
-        if (wiring.permit2 == address(0)) revert WiringIncomplete("balancer.permit2");
-        // Keeper-schedule metadata, immutable and redeploy-only (ADR 018 § Parameter
-        // Table). No on-chain path reads it, but ADR 018 defines `= 1` and `> 1` and
-        // never `0`, so a zero is a permanently-wrong config with no defined meaning.
-        if (wiring.subSwapCount == 0) revert WiringIncomplete("balancer.subSwapCount");
-        _requireLiveGuardBand(guard);
+        requireBalancerWiring(wiring, guard);
         return new BuybackBurnerBalancerV3(
             usdc,
             token,
