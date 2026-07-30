@@ -67,15 +67,6 @@ pub trait OriginDirectory: Send + Sync + std::fmt::Debug {
     /// including `namespace_id == 0` (no namespace: cache/DHT-only, no origins
     /// per ADR 002 §Namespace 0).
     fn lookup_origins(&self, namespace_id: U256) -> Vec<NodeId>;
-
-    /// Whether at least one authorised origin exists for `namespace_id`, without
-    /// materialising the candidate list. The pull-through authorized-origin gate
-    /// (ADR 037 §Seed-leech caps) calls this to test emptiness; the default
-    /// delegates to `lookup_origins`, but `Vec`-backed implementations SHOULD
-    /// override to avoid the clone.
-    fn has_origin(&self, namespace_id: U256) -> bool {
-        !self.lookup_origins(namespace_id).is_empty()
-    }
 }
 
 /// [`OriginDirectory`] that resolves nothing.
@@ -87,25 +78,15 @@ pub trait OriginDirectory: Send + Sync + std::fmt::Debug {
 /// so "no chain config" means "no origin directory" rather than "an
 /// operator-supplied one".
 ///
-/// Every consumer degrades to a hard deny, and in one case that deny is
-/// indistinguishable from ordinary operation — worth knowing before enabling
-/// the pull-through authorized-origin gate on a node without a chain address:
-///
-/// - the FIND\_VALUE fallback resolves nothing, so a `namespaceId != 0` DHT miss
-///   reports the blob unavailable on the network;
-/// - the pull-through gate (`cache.pull_through_require_authorized_origin`)
-///   refuses **every** cache miss with a wire `NotFound`, which is
-///   indistinguishable from a plain miss.
+/// Every consumer degrades to a hard deny on a node without a chain address:
+/// the FIND\_VALUE fallback resolves nothing, so a `namespaceId != 0` DHT miss
+/// reports the blob unavailable on the network.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct EmptyOriginDirectory;
 
 impl OriginDirectory for EmptyOriginDirectory {
     fn lookup_origins(&self, _namespace_id: U256) -> Vec<NodeId> {
         Vec::new()
-    }
-
-    fn has_origin(&self, _namespace_id: U256) -> bool {
-        false
     }
 }
 
@@ -138,12 +119,6 @@ impl OriginDirectory for StaticOriginDirectory {
     fn lookup_origins(&self, namespace_id: U256) -> Vec<NodeId> {
         self.origins.get(&namespace_id).cloned().unwrap_or_default()
     }
-
-    fn has_origin(&self, namespace_id: U256) -> bool {
-        self.origins
-            .get(&namespace_id)
-            .is_some_and(|o| !o.is_empty())
-    }
 }
 
 #[cfg(test)]
@@ -165,20 +140,16 @@ mod tests {
 
     #[test]
     fn empty_directory_returns_empty_for_every_lookup() {
-        // The runtime's non-chain fallback: nothing resolves, and `has_origin`
-        // is false for every namespace, so each consuming gate hard-denies.
+        // The runtime's non-chain fallback: nothing resolves for any namespace.
         let dir = EmptyOriginDirectory;
         assert!(dir.lookup_origins(ns(0)).is_empty());
         assert!(dir.lookup_origins(ns(7)).is_empty());
-        assert!(!dir.has_origin(ns(0)));
-        assert!(!dir.has_origin(ns(7)));
     }
 
     #[test]
     fn static_directory_with_no_entries_resolves_nothing() {
         let dir = StaticOriginDirectory::new(HashMap::new());
         assert!(dir.lookup_origins(ns(3)).is_empty());
-        assert!(!dir.has_origin(ns(3)));
     }
 
     #[test]
@@ -195,22 +166,5 @@ mod tests {
         // via an Option.
         assert!(dir.lookup_origins(ns(0)).is_empty());
         assert!(dir.lookup_origins(ns(3)).is_empty());
-    }
-
-    #[test]
-    fn has_origin_matches_lookup_emptiness_without_cloning() {
-        // The clone-free `has_origin` override must agree with
-        // `!lookup_origins(..).is_empty()` for the pull-through gate: present,
-        // absent, and the edge case of a namespace mapped to an empty vec.
-        let mut m = HashMap::new();
-        m.insert(ns(1), vec![nid(0xA)]);
-        m.insert(ns(2), Vec::new()); // present key, no origins
-        let dir = StaticOriginDirectory::new(m);
-        assert!(dir.has_origin(ns(1)));
-        assert!(!dir.has_origin(ns(2)));
-        assert!(!dir.has_origin(ns(3)));
-        for n in [1u64, 2, 3] {
-            assert_eq!(dir.has_origin(ns(n)), !dir.lookup_origins(ns(n)).is_empty());
-        }
     }
 }

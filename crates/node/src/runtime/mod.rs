@@ -980,18 +980,6 @@ async fn build_chain_and_handlers(
         let origin_watcher = directory.watcher();
         (Arc::new(directory), Some(origin_watcher))
     } else {
-        // The empty fallback makes the pull-through authorized-origin gate deny
-        // every request, and that denial is indistinguishable from ordinary
-        // operation (a wire `NotFound`). Warn if the gate is armed on a node with
-        // no chain directory so the dead path is diagnosable rather than silent
-        // (#1292).
-        if cfg.cache.pull_through_require_authorized_origin {
-            tracing::warn!(
-                "cache.pull_through_require_authorized_origin is set but no chain origin \
-                 directory is configured (blockchain.origin_assignment_address unset); \
-                 the gate will deny every cache-miss pull with a wire NotFound"
-            );
-        }
         (Arc::new(crate::dht::origin::EmptyOriginDirectory), None)
     };
     let dht_handler = Arc::new(DhtHandler::new(
@@ -1133,7 +1121,6 @@ async fn build_chain_and_handlers(
     let mut pull_through_origin = None;
     let mut pull_ahead_bytes = None;
     let mut leech_governor = None;
-    let mut pull_origin_gate = None;
     if cfg.cache.node_to_node_pull_through_enabled {
         // The outer deadline bounds how long a miss blocks the delivery path before
         // falling back to `NotFound`. It is *derived* from the per-candidate budget
@@ -1192,15 +1179,6 @@ async fn build_chain_and_handlers(
                 Arc::clone(&infra.node_metrics),
             )));
         }
-        // Optional content-authorization gate on the reactive pull-through path
-        // (#821, ADR 037 §Seed-leech caps). Off by default — the cache role stays
-        // permissionless. When the operator opts in, the handler refuses to initiate
-        // an upstream pull for a hash with no authorized origin, resolved against the
-        // shared origin directory (and fails closed when the origin-directory
-        // addresses are unset, since the directory is then empty).
-        if cfg.cache.pull_through_require_authorized_origin {
-            pull_origin_gate = Some(Arc::clone(&origin_directory));
-        }
     }
 
     // Build the paid-delivery handler from a single deps literal (#1254): every
@@ -1251,7 +1229,6 @@ async fn build_chain_and_handlers(
         cfg.payment.voucher_commit_interval_ms,
     ));
     client_deps.leech_governor = leech_governor;
-    client_deps.pull_origin_gate = pull_origin_gate;
     let client_handler = Arc::new(ClientHandler::new(client_deps)?);
 
     // On-chain seller-settlement service (#327). A wallet-filled provider
@@ -3762,7 +3739,6 @@ mod tests {
                 pull_share_ratio_percent: decdn_cache::Percent::new(
                     decdn_common::config::DEFAULT_PULL_SHARE_RATIO_PERCENT,
                 ),
-                pull_through_require_authorized_origin: false,
             },
             payment: ResolvedPayment {
                 rate_per_mb: 10,

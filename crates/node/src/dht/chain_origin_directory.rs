@@ -168,18 +168,6 @@ impl DirectoryCache {
         nodes.dedup();
         nodes
     }
-
-    /// Whether at least one active authorised origin exists for `namespace_id`.
-    /// Iterates the underlying set directly and short-circuits on the first hit —
-    /// no allocation, since the pull-through authorized-origin gate only tests
-    /// emptiness on the (uncommon) lookup-miss path.
-    fn has_any(&self, namespace_id: U256, staker_set: &dyn StakerSet) -> bool {
-        self.origins_of_ns
-            .get(&namespace_id)
-            .into_iter()
-            .flatten()
-            .any(|op| self.active_node_for(op, staker_set).is_some())
-    }
 }
 
 /// Names the projection in the poison-recovery `warn!` emitted by
@@ -518,11 +506,6 @@ impl OriginDirectory for ChainOriginDirectory {
     fn lookup_origins(&self, namespace_id: U256) -> Vec<NodeId> {
         self.proj
             .read(|c| c.resolve(namespace_id, self.staker_set.as_ref()))
-    }
-
-    fn has_origin(&self, namespace_id: U256) -> bool {
-        self.proj
-            .read(|c| c.has_any(namespace_id, self.staker_set.as_ref()))
     }
 }
 
@@ -1116,7 +1099,6 @@ mod tests {
         let stakers = StubStakers::new(&[nid(0xA), nid(0xB)]);
         // `resolve` returns sorted + deduplicated, so assert order directly.
         assert_eq!(c.resolve(ns(7), &stakers), vec![nid(0xA), nid(0xB)]);
-        assert!(c.has_any(ns(7), &stakers));
     }
 
     #[test]
@@ -1128,7 +1110,6 @@ mod tests {
         // Only A is active; B is bonded-but-inactive (e.g. unbonding).
         let stakers = StubStakers::new(&[nid(0xA)]);
         assert_eq!(c.resolve(ns(7), &stakers), vec![nid(0xA)]);
-        assert!(c.has_any(ns(7), &stakers));
     }
 
     #[test]
@@ -1137,20 +1118,6 @@ mod tests {
         let c = cache_with(&[(7, &[addr(0xA), addr(0xB)])], &[(addr(0xA), nid(0xA))]);
         let stakers = StubStakers::new(&[nid(0xA), nid(0xB)]);
         assert_eq!(c.resolve(ns(7), &stakers), vec![nid(0xA)]);
-    }
-
-    #[test]
-    fn has_any_agrees_with_resolve_emptiness() {
-        // ns 7 has an operator, ns 8 is empty, ns 9 was never cached.
-        let c = cache_with(&[(7, &[addr(0xA)]), (8, &[])], &[(addr(0xA), nid(0xA))]);
-        let stakers = StubStakers::new(&[nid(0xA)]);
-        for namespace in [ns(7), ns(8), ns(9)] {
-            assert_eq!(
-                c.has_any(namespace, &stakers),
-                !c.resolve(namespace, &stakers).is_empty(),
-                "has_any must agree with resolve emptiness for {namespace}"
-            );
-        }
     }
 
     // ---- Cache-mutation (event-application) semantics, exercised directly on
@@ -1401,10 +1368,6 @@ mod tests {
             assert!(
                 c.resolve(U256::ZERO, &stakers).is_empty(),
                 "NO_NAMESPACE must resolve to no origins"
-            );
-            assert!(
-                !c.has_any(U256::ZERO, &stakers),
-                "NO_NAMESPACE must not authorize any origin"
             );
         });
         assert!(
