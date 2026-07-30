@@ -110,10 +110,27 @@ struct WireWriter {
 }
 
 impl Write for WireWriter {
+    /// Splits `buf` into [`decdn_protocol::CHUNK_SIZE`]-bounded pieces before
+    /// sending, one per `blocking_send`. `encode_whole_blob_headerless` writes
+    /// in whatever granularity the bao encoder buffers internally (a whole
+    /// 16 KiB chunk-group's interleaved proof+data can land in one `write`
+    /// call) — larger than the wire protocol's per-frame [`ChunkData`]
+    /// cap. Every consumer of [`LocalOutboardPull::next_chunk`] (the window
+    /// serve loop, via [`crate::CacheEngine::open_local_outboard_pull`])
+    /// relays each yielded [`Bytes`] straight into one `ChunkData` frame — the
+    /// same assumption the node-to-node upstream-pull path in `decdn-node`
+    /// satisfies for free because its chunks were already framed to
+    /// `CHUNK_SIZE` by the upstream peer. Chunking here, rather than at the
+    /// `next_chunk` call site, keeps that invariant true for every consumer
+    /// without each one re-deriving it.
+    ///
+    /// [`ChunkData`]: decdn_protocol::client::ChunkData
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.tx_wire
-            .blocking_send(Bytes::copy_from_slice(buf))
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "wire receiver dropped"))?;
+        for piece in buf.chunks(decdn_protocol::CHUNK_SIZE) {
+            self.tx_wire
+                .blocking_send(Bytes::copy_from_slice(piece))
+                .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "wire receiver dropped"))?;
+        }
         Ok(buf.len())
     }
 

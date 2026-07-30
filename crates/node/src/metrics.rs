@@ -1159,6 +1159,19 @@ pub struct DecdnMetrics {
     /// a sustained rate HERE points at disk, not peers. Field has no `_total`
     /// suffix because the `OpenMetrics` encoder appends it.
     pub node_pull_through_local_tee_failed: Counter,
+    /// `decdn_local_outboard_serves_total` (#1130): times the node served a
+    /// whole-blob cache miss by streaming straight from its own configured
+    /// origin (http/s3/fs) into the paying client while teeing the bytes into
+    /// the local cache store — the stream-while-store path, entered only when
+    /// the origin publishes a `{H}.obao4` pre-order outboard alongside the
+    /// object. Incremented once per entry into `serve_via_local_outboard`,
+    /// before any admission guard, so it also counts requests this tier later
+    /// rejects (deposit/leech/size) — it marks which SERVE TIER fired, not
+    /// whether the fill ultimately succeeded. A miss that instead falls back to
+    /// the buffered `populate_local` path (no outboard, or this tier declined)
+    /// never bumps this counter, which is what lets a test or dashboard tell
+    /// the two fill strategies apart deterministically instead of by timing.
+    pub local_outboard_serves: Counter,
     /// `decdn_origin_directory_watcher_restarts_total` (#651): distinct drift
     /// windows the [`crate::dht::chain_origin_directory`] watcher has entered.
     /// Same semantics as `staker_set_watcher_restarts` — bumped once on the
@@ -2146,6 +2159,12 @@ recorders! {
     /// already-paid upstream chunk failed (#856) — a store fault, not a downstream
     /// client drop.
     node_pull_through_local_tee_failed => node_pull_through_local_tee_failed.inc();
+
+    /// The node entered `serve_via_local_outboard` — the stream-while-store
+    /// serve tier fired for this request (#1130). Counted at entry, before any
+    /// admission guard; distinguishes this tier from the buffered
+    /// `populate_local` fallback regardless of this request's eventual outcome.
+    local_outboard_serve => local_outboard_serves.inc();
 
     /// A buyer→upstream pull hit this node's own `pull_timeout` deadline (#857).
     /// A buyer-side condition, so it does not score the provider's reputation.

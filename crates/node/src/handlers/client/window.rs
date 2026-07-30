@@ -294,6 +294,12 @@ impl ClientHandler {
         fault_seen: bool,
         rate_per_mb: u64,
     ) -> anyhow::Result<()> {
+        // Mark that the stream-while-store tier fired for this request, before
+        // any admission guard below — this is the tier-selection signal
+        // (#1130), not a success signal; an early reject still counts as this
+        // tier having been entered.
+        self.metrics.local_outboard_serve();
+
         // Resolve the owning channel (existence + ownership already proven by
         // `pull_authorized`) — needed for the deposit guard and the downstream
         // voucher collection.
