@@ -1173,7 +1173,11 @@ abstract contract BaseProtocolDeploy is Script {
         pure
         returns (PoolSeed memory)
     {
-        return PoolSeed({ usdcSeed: usdcSeed, tokenSeed: _deriveTokenSeed(venue, usdcSeed, targetPrice), venue: venue });
+        // Split rather than inlined: `forge fmt` collapses the one-line form to 121
+        // chars, one over solhint's 120 limit, and the two tools then disagree
+        // forever (`forge fmt --check` passes, `solhint` fails).
+        uint256 tokenSeed = _deriveTokenSeed(venue, usdcSeed, targetPrice);
+        return PoolSeed({ usdcSeed: usdcSeed, tokenSeed: tokenSeed, venue: venue });
     }
 
     /// @dev Reject a `PoolSeed` derived for a different venue than the activation
