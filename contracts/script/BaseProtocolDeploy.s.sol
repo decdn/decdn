@@ -299,14 +299,15 @@ abstract contract BaseProtocolDeploy is Script {
     ///         contract ungoverned. Asserting both directions makes the in-script
     ///         guard symmetric with the test role matrix.
     error GovernanceNotHandedOff(address target, bytes32 role);
-    /// @notice Post-deploy invariant — the Timelock's `PROPOSER_ROLE` is not seated
-    ///         as this deploy mode requires. `shouldHold` distinguishes the two
-    ///         failures: `true` means `account` was meant to be able to propose and
-    ///         cannot; `false` means it can propose and must not — the shape that
-    ///         matters, since a bootstrap deploy that left `DecdnGovernor` a proposer
-    ///         puts DAO execution one 48-hour delay away while the operator set is
-    ///         still too thin for capacity-weighted voting to be safe (ADR 009).
-    error ProposerNotSeated(address account, bool shouldHold);
+    /// @notice Post-deploy invariant — a Timelock scheduling role (`PROPOSER_ROLE`
+    ///         or `CANCELLER_ROLE`) is not seated as this deploy mode requires.
+    ///         `shouldHold` distinguishes the two failures: `true` means `account`
+    ///         was meant to hold `role` and does not; `false` means it holds `role`
+    ///         and must not — the shape that matters, since a bootstrap deploy that
+    ///         left `DecdnGovernor` a proposer puts DAO execution one 48-hour delay
+    ///         away while the operator set is still too thin for capacity-weighted
+    ///         voting to be safe (ADR 009).
+    error ProposerNotSeated(address account, bytes32 role, bool shouldHold);
     /// @notice Post-deploy invariant — a phase-4 peer role (e.g. `SLASH_ROLE`,
     ///         `ROUTER_CALLER_ROLE`, `PAUSER_ROLE`) was not actually granted to
     ///         `grantee` on `target`. OZ `grantRole` does not revert when the
@@ -526,6 +527,18 @@ abstract contract BaseProtocolDeploy is Script {
         return cfg.bootstrapMultisig == address(0) ? address(d.governor) : cfg.bootstrapMultisig;
     }
 
+    /// @dev Assert one Timelock scheduling role is seated as this deploy mode
+    ///      requires: held by `_initialProposer`, and — in bootstrap mode, where the
+    ///      two are different addresses — NOT held by the Governor. Applied to
+    ///      `PROPOSER_ROLE` and `CANCELLER_ROLE` alike.
+    function _assertTimelockRoleSeating(DeployConfig memory cfg, Deployment memory d, bytes32 role) internal view {
+        address expected = _initialProposer(cfg, d);
+        if (!d.timelock.hasRole(role, expected)) revert ProposerNotSeated(expected, role, true);
+        if (cfg.bootstrapMultisig != address(0) && d.timelock.hasRole(role, address(d.governor))) {
+            revert ProposerNotSeated(address(d.governor), role, false);
+        }
+    }
+
     // Phase 4 — cross-contract peer roles + deployer-only state setters.
     //
     // These calls all require the deployer to still hold `GOVERNANCE_ROLE` or
@@ -655,19 +668,23 @@ abstract contract BaseProtocolDeploy is Script {
             }
         }
 
-        // Timelock PROPOSER_ROLE seating (ADR 009, issue #1175). The role checks
+        // Timelock proposer/canceller seating (ADR 009, issue #1175). The role checks
         // above are mode-independent — they pass identically whether the Governor or
         // the bootstrap multisig can propose — so nothing else in this invariant can
         // catch a bootstrap deploy that left the Governor a proposer, which would put
         // DAO proposals one 48-hour delay from execution against the thin operator set
         // the phase exists to protect. Asserted in both directions so the default
         // deploy equally cannot ship with a Governor that can never propose.
-        address proposer = _initialProposer(cfg, d);
-        bytes32 proposerRole = d.timelock.PROPOSER_ROLE();
-        if (!d.timelock.hasRole(proposerRole, proposer)) revert ProposerNotSeated(proposer, true);
-        if (cfg.bootstrapMultisig != address(0) && d.timelock.hasRole(proposerRole, address(d.governor))) {
-            revert ProposerNotSeated(address(d.governor), false);
-        }
+        //
+        // CANCELLER_ROLE is checked alongside PROPOSER_ROLE rather than assumed from
+        // it. `_deployGovernor` grants them on adjacent lines and `TransitionToGovernor`
+        // moves them together, but OZ `grantRole` does not revert on a wrong or dropped
+        // target — the same silence `_assertPeerRolesWired` exists to break. A canceller
+        // grant that missed the multisig would take away its only way to cancel its own
+        // erroneous scheduled proposal inside the 48-hour window, for the whole 6–12
+        // month phase, and nothing would surface it until the day it was needed.
+        _assertTimelockRoleSeating(cfg, d, d.timelock.PROPOSER_ROLE());
+        _assertTimelockRoleSeating(cfg, d, d.timelock.CANCELLER_ROLE());
 
         if (d.timelock.hasRole(DEFAULT_ADMIN_ROLE, cfg.deployer)) {
             revert DeployerStillHoldsRole(tl, DEFAULT_ADMIN_ROLE);

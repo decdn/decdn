@@ -48,10 +48,11 @@ import { IAccessControl } from "@openzeppelin/contracts/access/IAccessControl.so
 ///         (`contracts.TimelockController`, `contracts.DecdnGovernor`, and
 ///         `externalDeps.bootstrapMultisig`).
 contract TransitionToGovernor is Script {
-    /// @notice The Timelock's proposer set does not look like a live bootstrap
+    /// @notice The Timelock's scheduling roles do not look like a live bootstrap
     ///         phase, so this batch is not the right instrument. Either the deploy
-    ///         never entered the phase (the Governor already proposes) or the
-    ///         transition already ran.
+    ///         never entered the phase, the transition already ran, or the two roles
+    ///         are seated inconsistently — all cases where the operator should look
+    ///         at the chain rather than sign what this script would have printed.
     error NotInBootstrapPhase(address multisig, address governor);
 
     function run() external view {
@@ -62,11 +63,18 @@ contract TransitionToGovernor is Script {
         bytes32 proposerRole = timelock.PROPOSER_ROLE();
         bytes32 cancellerRole = timelock.CANCELLER_ROLE();
 
-        // Fail loudly rather than print a batch that would revert (or, worse, one
-        // that looks plausible) against a chain that is not mid-bootstrap.
-        if (!timelock.hasRole(proposerRole, multisig) || timelock.hasRole(proposerRole, governor)) {
-            revert NotInBootstrapPhase(multisig, governor);
-        }
+        // Fail loudly rather than print a plausible-looking batch against a chain
+        // that is not mid-bootstrap. The predicate is the phase definition in full —
+        // the multisig holds BOTH scheduling roles and the Governor holds neither —
+        // not just the proposer half. The batch itself would survive a partial state
+        // (OZ `grantRole`/`revokeRole` no-op when the state already matches, so it
+        // converges either way); what a loose predicate costs is the signal. Printing
+        // against a half-transitioned or never-bootstrapped chain tells the operator
+        // that the chain looked as expected when it did not, which is the wrong thing
+        // to learn from a script whose output is signed once and is irreversible.
+        bool multisigSeated = timelock.hasRole(proposerRole, multisig) && timelock.hasRole(cancellerRole, multisig);
+        bool governorUnseated = !timelock.hasRole(proposerRole, governor) && !timelock.hasRole(cancellerRole, governor);
+        if (!multisigSeated || !governorUnseated) revert NotInBootstrapPhase(multisig, governor);
 
         address[] memory targets = new address[](4);
         uint256[] memory values = new uint256[](4);

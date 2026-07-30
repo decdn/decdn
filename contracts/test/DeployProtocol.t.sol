@@ -453,7 +453,9 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
         bd.timelock.grantRole(proposerRole, address(bd.governor));
 
         vm.expectRevert(
-            abi.encodeWithSelector(BaseProtocolDeploy.ProposerNotSeated.selector, address(bd.governor), false)
+            abi.encodeWithSelector(
+                BaseProtocolDeploy.ProposerNotSeated.selector, address(bd.governor), proposerRole, false
+            )
         );
         this.externalAssertNoBackDoors(bootCfg, bd);
     }
@@ -466,9 +468,51 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
         d.timelock.revokeRole(proposerRole, address(d.governor));
 
         vm.expectRevert(
-            abi.encodeWithSelector(BaseProtocolDeploy.ProposerNotSeated.selector, address(d.governor), true)
+            abi.encodeWithSelector(
+                BaseProtocolDeploy.ProposerNotSeated.selector, address(d.governor), proposerRole, true
+            )
         );
         this.externalAssertNoBackDoors(cfg, d);
+    }
+
+    /// @notice CANCELLER_ROLE gets the same treatment as PROPOSER_ROLE. It is granted
+    ///         on the line after the proposer grant and moved by the same transition
+    ///         batch, so it is exactly the kind of coupled-by-convention wiring that
+    ///         drifts silently — OZ `grantRole` does not revert on a dropped target.
+    ///         A multisig without it cannot cancel its own erroneous scheduled
+    ///         proposal inside the 48-hour window for the whole bootstrap phase.
+    function test_bootstrap_assertNoBackDoors_revertsWhenMultisigCannotCancel() public {
+        DeployConfig memory bootCfg = _bootstrapConfig();
+        Deployment memory bd = _runFullDeploy(bootCfg);
+
+        bytes32 cancellerRole = bd.timelock.CANCELLER_ROLE();
+        vm.prank(address(bd.timelock));
+        bd.timelock.revokeRole(cancellerRole, bootstrapMultisig);
+
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                BaseProtocolDeploy.ProposerNotSeated.selector, bootstrapMultisig, cancellerRole, true
+            )
+        );
+        this.externalAssertNoBackDoors(bootCfg, bd);
+    }
+
+    /// @notice And the other direction: a Governor that can cancel during bootstrap
+    ///         holds a scheduling power the phase withholds from it.
+    function test_bootstrap_assertNoBackDoors_revertsWhenGovernorCanCancel() public {
+        DeployConfig memory bootCfg = _bootstrapConfig();
+        Deployment memory bd = _runFullDeploy(bootCfg);
+
+        bytes32 cancellerRole = bd.timelock.CANCELLER_ROLE();
+        vm.prank(address(bd.timelock));
+        bd.timelock.grantRole(cancellerRole, address(bd.governor));
+
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                BaseProtocolDeploy.ProposerNotSeated.selector, address(bd.governor), cancellerRole, false
+            )
+        );
+        this.externalAssertNoBackDoors(bootCfg, bd);
     }
 
     // ZeroAddress fail-fast checks in `_deployTargets`. One test per validated
