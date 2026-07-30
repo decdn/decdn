@@ -1021,6 +1021,17 @@ since project inception and will roll into the first tagged release.
 
 ### Security
 
+- `ruint` → 1.20.0 (RUSTSEC-2026-0220: `Uint::overflowing_shl`/`overflowing_shr`
+  returned false-negative overflow flags, so `checked_*` returned `Some` instead
+  of `None`, `strict_*` failed to panic, and `saturating_*` wrapped; the bad
+  `checked_shl` result makes `to_base_be` and string formatting loop forever on
+  no-alloc builds for non-limb-aligned widths). Reaches us transitively through
+  `alloy-primitives`, i.e. the U256 arithmetic on the payment path. No deCDN code
+  calls the affected APIs — every `checked_shl` in `crates/` is on a primitive
+  `u64` (`cache/src/retry.rs`, `protocol/src/framing.rs`), not a `ruint::Uint`.
+  Lockfile-only bump; no dependency requirement changed. The six new `ark-*`
+  lockfile entries are optional features we do not enable — `cargo tree -e normal`
+  links none of them.
 - `quinn-proto` → 0.11.16 (GHSA-4w2j-m93h-cj5j: remote memory exhaustion in
   the QUIC state machine, fixed in 0.11.15) (#1465). Lockfile-only bump; no
   dependency requirement changed.
