@@ -1001,7 +1001,13 @@ where
             .div_ceil(U256::from(MB_BYTES));
         if topups < decdn_client_pull::MAX_TOPUP_ATTEMPTS
             && working_deposit > U256::ZERO
-            && decdn_client_pull::genuine_exhaustion(&err, ctx, remaining, next_cost)
+            && decdn_client_pull::genuine_exhaustion(
+                &err,
+                ctx,
+                ledger.committed(),
+                remaining,
+                next_cost,
+            )
         {
             let is_funder = store
                 .get_by_provider(provider)?
