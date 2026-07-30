@@ -340,3 +340,36 @@ groups:
             channel open/settle/close events are not being ingested, so
             voucher redemption and reconciliation stall. Restart and check the
             RPC provider.
+
+      # #1520. Three deposit guards route through this one counter (the miss floor,
+      # the window ceiling, the direct-serve ceiling), so it cannot say WHICH — the
+      # node's throttled `warn!` names that.
+      #
+      # A raw rate, not a ratio, because the node exports no serve-ATTEMPT counter:
+      # `decdn_serve_stream_rejected_*` is a per-reason family with no success
+      # sibling, so there is nothing to divide by. (Do not copy
+      # `DecdnHighStreamErrorRate`'s denominator above — `decdn_streams_failed_total`
+      # and `decdn_streams_completed_total` are not emitted by this exporter, so
+      # that rule cannot fire. Tracked in #1513.) The threshold is therefore
+      # absolute and deliberately loose: any sustained refusal rate is worth a look,
+      # because before #1520 this counter had no alert, panel, or runbook entry at
+      # all and a node could refuse every paying client in silence.
+      - alert: DecdnRefusingPayingClients
+        expr: sum by (instance) (rate(decdn_serve_stream_rejected_insufficient_deposit_total[10m])) > 0.1
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Sustained insufficient-deposit refusals on {{ $labels.instance }}"
+          description: |
+            This node is refusing delivery because the requesting channel's
+            remaining deposit cannot cover the reserved cost, and has been for 15
+            minutes. Two causes with opposite remedies, and this series cannot tell
+            them apart — read the node's throttled `warn!` line, which carries the
+            channel and the shortfall:
+            (a) clients genuinely running dry, which needs no action; or
+            (b) this node's chain watcher lagging an on-chain `ChannelToppedUp`, in
+            which case funded clients are being turned away — check RPC health and
+            `decdn_settlement_watcher_last_tick_timestamp_seconds`.
+            Long `for:` because a burst of dry clients is normal.
+            See adr/003-payments.md and docs/runbook.md.

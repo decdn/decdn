@@ -331,6 +331,59 @@ nodeId-indexed `NodeAutoEjected`. The node's staker-set watcher follows
    [ADR 028 SlashAppeal](../adr/028-slashing-appeals.md) path, with its own bond
    and evidence rules, and it is the only appeal surface the protocol carries.
 
+## Refusing paying clients (insufficient deposit)
+
+**Symptoms:** clients report a blob as missing that this node holds; delivery
+revenue flat while requests arrive; `decdn fetch` against this node returns
+`delivery refused: NotFound`.
+
+**Detect:**
+
+- `DecdnRefusingPayingClients` (warning) —
+  `rate(decdn_serve_stream_rejected_insufficient_deposit_total[10m]) > 0.1` for
+  15 minutes. A raw rate, not a ratio: the exporter has no serve-attempt counter
+  to divide by.
+- The node's own throttled `warn!` ("refusing paying clients: remaining channel
+  deposit below the reserved cost"), at most one per 5 minutes, carrying the
+  channel id, the shortfall, and how many refusals it suppressed since the last
+  line. Raise the log level to `debug` for one line per refusal.
+- Grafana panel **Payment-class serve refusals**. All four series on it collapse
+  to the same `NotFound` wire code, so a client cannot distinguish them and these
+  counters are the only place the cause exists.
+
+**Causes:** two, with opposite remedies, and the counter alone cannot tell them
+apart — this is why the log line exists:
+
+1. **Clients genuinely running dry.** Their remaining deposit cannot cover one
+   credit window. Nothing is wrong with this node. Expect a low background rate.
+2. **This node's chain watcher is lagging an on-chain top-up.** The seller's view
+   of a channel's deposit is only raised by observing `ChannelToppedUp`, so a
+   client that just topped up is refused until the watcher catches up. Funded
+   clients are being turned away and will route elsewhere.
+
+A third, rarer cause: the operator's own `blockchain.buyer_deposit_micro_usdc` is
+too small for the *upstream* rate, in which case this node is the one being
+refused — look for `decdn_node_pull_refused_unattributable_total` climbing toward
+`decdn_node_pull_refused_total` instead.
+
+**Remediate:**
+
+1. Distinguish the two causes. Take a channel id from the `warn!` line and compare
+   the node's view against the chain: `decdn node channels` reports the deposit the
+   node believes, and `PaymentChannel.getChannel(channelId)` reports the truth. A
+   disagreement is cause (2).
+2. For cause (2), check watcher liveness —
+   `decdn_settlement_watcher_last_tick_timestamp_seconds` should advance every
+   `blockchain.event_poll_interval_sec`. A stalled watcher usually means the RPC
+   endpoint is unreachable or rate-limiting; see [RPC unreachable](#rpc-unreachable).
+3. For cause (1), no action. If the rate is high because many clients open dust
+   channels deliberately, note that the refusal now happens *before* any fill
+   (#1519), so it costs this node nothing beyond the signature.
+4. Do not raise a deposit floor to "fix" this. There is no on-chain minimum
+   deposit ([ADR 003 § Deposit Economics](../adr/003-payments.md#deposit-economics));
+   service is bounded by what a deposit funds, which is exactly what this refusal
+   is enforcing.
+
 ## Gossip / peer table degraded
 
 **Symptoms:** node not discovering peers; clients stop selecting it;

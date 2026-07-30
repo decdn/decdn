@@ -371,7 +371,14 @@ impl ClientHandler {
                         let guard = channel.lock().await;
                         (guard.state.deposit, guard.state.last_amount())
                     };
-                    if deposit.saturating_sub(last_amount) < floor {
+                    let headroom = deposit.saturating_sub(last_amount);
+                    if headroom < floor {
+                        self.log_deposit_refusal(
+                            ChannelId::from(req.channel_id),
+                            hash,
+                            headroom,
+                            floor,
+                        );
                         return self
                             .respond_error(
                                 &mut send,
@@ -741,7 +748,9 @@ impl ClientHandler {
             let guard = channel.lock().await;
             (guard.state.deposit, guard.state.last_amount())
         };
-        if deposit.saturating_sub(last_amount) < ceiling {
+        let headroom = deposit.saturating_sub(last_amount);
+        if headroom < ceiling {
+            self.log_deposit_refusal(channel_id, hash, headroom, ceiling);
             return self
                 .respond_error(
                     &mut send,

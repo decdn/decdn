@@ -45,6 +45,7 @@ use decdn_incentive::buyer_channel::{AdvanceOutcome, BuyerChannelState, BuyerCha
 use decdn_incentive::buyer_channel_redb::RedbBuyerChannelStore;
 use decdn_incentive::eth_identity::{self, PasswordSource, load_signer, read_password};
 use decdn_incentive::payment_channel::PaymentChannel;
+use decdn_incentive::rate::min_payment;
 use decdn_incentive::{bind_node_id_domain, slash_judge_domain, voucher_domain};
 use decdn_protocol::client::StreamError;
 use iroh::{Endpoint, EndpointAddr, PublicKey, RelayUrl};
@@ -744,19 +745,48 @@ where
 /// is not fixed by a binding) and to unbound contexts, so a bound fetch's error
 /// is passed through untouched. Every other error is returned verbatim.
 fn annotate_unbound_cache_miss(err: anyhow::Error, ctx: &ChannelContext) -> anyhow::Error {
-    let refused_not_found = err
-        .downcast_ref::<UpstreamRefused>()
-        .is_some_and(|refused| matches!(refused.error(), StreamError::NotFound));
-    if ctx.client_binding.is_none() && refused_not_found {
-        err.context(
-            "no client identity binding was sent because \
+    let Some(refused) = err.downcast_ref::<UpstreamRefused>() else {
+        return err;
+    };
+    if !matches!(refused.error(), StreamError::NotFound) {
+        return err;
+    }
+
+    // Cause (a): our channel cannot cover what the node reserves before serving
+    // (#1516/#1519). Checked FIRST because it is the one we can prove rather than
+    // guess: the signed refusal carries the node's quoted `rate_per_mb`, and the
+    // channel's own deposit and cumulative paid amount are right here, so the
+    // shortfall is arithmetic. This reasons only about OUR channel from data the
+    // node already sent us, so it does not weaken the deliberate collapse of seven
+    // reject reasons onto `NotFound` (which exists so a prober cannot map other
+    // clients' balances).
+    //
+    // One credit window is the node's floor; we do not know its configured
+    // interval, so use the protocol default. That makes this a heuristic for the
+    // MESSAGE only — it never changes what we do.
+    if let Some(quoted_rate) = refused.evidence().map(|resp| resp.body.rate_per_mb) {
+        let headroom = ctx.deposit.saturating_sub(ctx.prior_amount);
+        let one_window = min_payment(decdn_protocol::MB_BYTES, quoted_rate);
+        if quoted_rate > 0 && headroom < one_window {
+            return err.context(format!(
+                "this channel's remaining deposit ({headroom}) is below the ~{one_window} \
+                 the node reserves before serving at its quoted rate of {quoted_rate} \
+                 per MB; top it up (`decdn channel top-up`) or open a larger one \
+                 (`--deposit-micro-usdc`)"
+            ));
+        }
+    }
+
+    // Cause (b): no binding, so the node would not reactively pull for us.
+    if ctx.client_binding.is_none() {
+        return err.context(
+            "one possible cause: no client identity binding was sent because \
              blockchain.capacity_bond_address is unset, so the node could not \
              reactively pull this cache-missed blob from its origin; set \
              blockchain.capacity_bond_address to enable reactive pull-through",
-        )
-    } else {
-        err
+        );
     }
+    err
 }
 
 /// The scratch file a streaming fetch writes into before it is promoted to

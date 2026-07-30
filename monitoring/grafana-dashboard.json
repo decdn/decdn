@@ -341,8 +341,50 @@
       "type": "timeseries"
     },
     {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "description": "Delivery refusals whose cause is a payment problem, not availability (#1520). All four collapse to the same NotFound wire code so a client cannot tell them apart — these counters are the only place the cause exists. `insufficient deposit` is fed by three guards (the pre-spend miss floor, the window tier's ceiling, and the direct-serve ceiling) and cannot attribute a spike to one; the node's throttled warn! line does. Sustained insufficient-deposit means either clients running dry (no action) or this node's chain watcher lagging an on-chain top-up, in which case funded clients are being turned away.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "bars", "fillOpacity": 60, "lineWidth": 1, "stacking": {"mode": "normal"}},
+          "unit": "ops"
+        }
+      },
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 31},
+      "id": 23,
+      "options": {"legend": {"displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "sum by (instance) (rate(decdn_serve_stream_rejected_insufficient_deposit_total{instance=~\"$instance\"}[5m]))",
+          "legendFormat": "insufficient deposit",
+          "refId": "A"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "sum by (instance) (rate(decdn_serve_stream_rejected_unknown_channel_total{instance=~\"$instance\"}[5m]))",
+          "legendFormat": "unknown channel",
+          "refId": "B"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "sum by (instance) (rate(decdn_serve_stream_rejected_owner_mismatch_total{instance=~\"$instance\"}[5m]))",
+          "legendFormat": "owner mismatch",
+          "refId": "C"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "sum by (instance) (rate(decdn_serve_stream_rejected_cache_miss_total{instance=~\"$instance\"}[5m]))",
+          "legendFormat": "cache miss",
+          "refId": "D"
+        }
+      ],
+      "title": "Payment-class serve refusals (all collapse to NotFound)",
+      "type": "timeseries"
+    },
+    {
       "collapsed": false,
-      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 31},
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 39},
       "id": 103,
       "panels": [],
       "title": "Cache",
@@ -367,7 +409,7 @@
           "unit": "percentunit"
         }
       },
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 32},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 40},
       "id": 30,
       "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi"}},
       "targets": [
@@ -390,7 +432,7 @@
           "unit": "ops"
         }
       },
-      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 32},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 40},
       "id": 31,
       "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi"}},
       "targets": [
@@ -412,7 +454,7 @@
     },
     {
       "collapsed": false,
-      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 40},
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 48},
       "id": 104,
       "panels": [],
       "title": "Probes",
@@ -427,7 +469,7 @@
           "unit": "s"
         }
       },
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 41},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 49},
       "id": 40,
       "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi"}},
       "targets": [
@@ -462,7 +504,7 @@
           "unit": "ops"
         }
       },
-      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 41},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 49},
       "id": 41,
       "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi"}},
       "targets": [
@@ -478,7 +520,7 @@
     },
     {
       "collapsed": false,
-      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 49},
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 57},
       "id": 105,
       "panels": [],
       "title": "Payments",
@@ -492,7 +534,7 @@
           "custom": {"drawStyle": "line", "fillOpacity": 10, "lineWidth": 2}
         }
       },
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 50},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 58},
       "id": 50,
       "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi"}},
       "targets": [
@@ -527,7 +569,7 @@
           "thresholds": {"mode": "absolute", "steps": [{"color": "blue", "value": null}]}
         }
       },
-      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 50},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 58},
       "id": 51,
       "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi"}},
       "targets": [

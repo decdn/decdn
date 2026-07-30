@@ -937,6 +937,21 @@ pub struct DecdnMetrics {
     /// a sustained rate here usually means content discovery is steering this node
     /// at upstreams that do not hold the blob — not that the upstreams are bad.
     pub node_pull_refused: Counter,
+    /// `decdn_node_pull_refused_unattributable_total` (#1520): the subset of
+    /// [`Self::node_pull_refused`] whose wire code this node cannot pin on the
+    /// upstream — `NotFound` and `Overloaded`, i.e. `RefusalVerdict::Transient`.
+    /// Those briefly suppress the `(peer, hash)` pair without touching reputation.
+    ///
+    /// Split out because it is the shape a *buyer-side* misconfiguration takes:
+    /// `NotFound` is what a seller signs when it refuses OUR channel for
+    /// insufficient deposit (the reject reasons collapse deliberately, see
+    /// [`Self::serve_stream_rejected_insufficient_deposit`]), so a node whose own
+    /// deposit is too small to buy anything sees 100% of its pulls refused with
+    /// nothing in its own telemetry saying so. Before this the arm bumped no
+    /// counter at all and logged at `debug`. A rate approaching
+    /// `node_pull_refused` means "nobody will serve me", which is a local problem;
+    /// a small fraction is the healthy "that peer did not have it".
+    pub node_pull_refused_unattributable: Counter,
     /// `decdn_node_pull_stalled_total` (#1134): an upstream went silent mid-stream
     /// — no byte of progress within `node_pull_stall_timeout_sec` — so the pull was
     /// abandoned. UNLIKE `node_pull_timeout` (our own budget expiring, which is not
@@ -2147,6 +2162,11 @@ recorders! {
     /// code; only `InternalError` also scores the provider's reputation.
     node_pull_refused => node_pull_refused.inc();
 
+    /// A refusal this node cannot attribute to the upstream (#1520) — `NotFound`
+    /// or `Overloaded`. A rate approaching `node_pull_refused` means nobody will
+    /// serve us, which is usually our own deposit or binding, not their fault.
+    node_pull_refused_unattributable => node_pull_refused_unattributable.inc();
+
     /// An upstream went silent mid-stream (#1134); the pull was abandoned and the
     /// provider scored `Unreachable`.
     node_pull_stalled => node_pull_stalled.inc();
@@ -3179,6 +3199,12 @@ mod tests {
             "decdn_serve_stream_rejected_owner_mismatch_total",
             "decdn_serve_stream_rejected_insufficient_deposit_total",
             "decdn_serve_stream_rejected_cooperative_close_signed_total",
+            // Completed in #1520: these four were missing, so nothing pinned that
+            // they export at zero and a dashboard querying them read `(no data)`.
+            "decdn_serve_stream_rejected_range_not_satisfiable_total",
+            "decdn_serve_stream_rejected_hash_denied_total",
+            "decdn_serve_stream_rejected_chain_hash_denied_total",
+            "decdn_serve_stream_rejected_origin_denied_total",
             "decdn_cooperative_close_request_unauthorized_total",
         ];
         let text = metrics.encode().unwrap();
@@ -3197,6 +3223,10 @@ mod tests {
         metrics.serve_stream_rejected_owner_mismatch();
         metrics.serve_stream_rejected_insufficient_deposit();
         metrics.serve_stream_rejected_cooperative_close_signed();
+        metrics.serve_stream_rejected_range_not_satisfiable();
+        metrics.serve_stream_rejected_hash_denied();
+        metrics.serve_stream_rejected_chain_hash_denied();
+        metrics.serve_stream_rejected_origin_denied();
         metrics.cooperative_close_request_unauthorized();
 
         let text = metrics.encode().unwrap();
