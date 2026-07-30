@@ -177,11 +177,17 @@ pub struct ClientFetchArgs {
     #[arg(long, value_name = "PATH")]
     pub data_dir: Option<PathBuf>,
 
-    /// Deposit (`µUSDC`) to escrow when opening a new channel (ignored on reuse).
-    /// Overrides `blockchain.buyer_working_deposit_micro_usdc`; defaults to 10 USDC.
+    /// Deposit (`µUSDC`) to escrow when OPENING a new channel (ignored on reuse).
+    /// Overrides `blockchain.buyer_initial_deposit_micro_usdc`; default 0.5 USDC.
     /// Clamped up to the on-chain `minDeposit`.
     #[arg(long, value_name = "MICRO_USDC")]
-    pub deposit_micro_usdc: Option<u64>,
+    pub initial_deposit_micro_usdc: Option<u64>,
+
+    /// Deposit (`µUSDC`) each top-up refills the channel toward once it has served
+    /// verified bytes. Overrides `blockchain.buyer_working_deposit_micro_usdc`;
+    /// default 10 USDC. `0` disables top-up.
+    #[arg(long, value_name = "MICRO_USDC")]
+    pub working_deposit_micro_usdc: Option<u64>,
 
     /// Reject a delivery whose claimed total size exceeds this many MiB
     /// **before** buffering it — guards client memory against a provider that

@@ -230,7 +230,7 @@ pub(crate) fn resolve_chain(
         );
 
     let deposit = U256::from(
-        args.deposit_micro_usdc
+        args.working_deposit_micro_usdc
             .or_else(|| bc.and_then(|b| b.buyer_working_deposit_micro_usdc))
             .unwrap_or(DEFAULT_DEPOSIT_MICRO_USDC),
     );
@@ -1696,7 +1696,8 @@ mod tests {
             chain_id: None,
             keystore: None,
             data_dir: Some(PathBuf::from("/tmp/d")),
-            deposit_micro_usdc: None,
+            initial_deposit_micro_usdc: None,
+            working_deposit_micro_usdc: None,
             max_blob_mb: 1024,
             max_rate_per_mb: 0,
             stall_timeout_ms: 30_000,
