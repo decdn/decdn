@@ -122,6 +122,29 @@ groups:
             at least the on-chain floor (hot-reloadable via SIGHUP).
             See adr/003-payments.md#rate-bounds-refresh.
 
+      # A latent-bug report, not a degradation (#1517). The engine recovers the
+      # guard and clears the poison, so coalescing never stops and no restart is
+      # needed — but the workspace anti-panic policy means no production path is
+      # supposed to be able to poison this at all, so any nonzero value is a bug
+      # worth filing.
+      #
+      # `> 0`, not `rate(...)`: the counter counts poisonings (one per panic,
+      # because the poison is cleared), and the whole point is that a single
+      # occurrence matters. It is process-local, so it resets on restart.
+      - alert: DecdnCacheInflightMutexPoisoned
+        expr: decdn_cache_inflight_mutex_poisoned_total > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Cache coalescing mutex poisoned on {{ $labels.instance }}"
+          description: |
+            A task panicked while holding the in-flight fill-coalescing map.
+            Coalescing is preserved and no operator action is needed beyond
+            reporting it — do NOT restart to "clear" it. File the panic with
+            the surrounding ERROR log line (emitted once per process).
+            See docs/runbook.md § Cache coalescing mutex poisoned.
+
   # ---------------------------------------------------------------
   # Liveness / capacity — operator-onboarding defaults.
   # Tune `for:` and thresholds for your fleet size before paging.

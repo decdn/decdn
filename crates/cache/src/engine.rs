@@ -78,13 +78,15 @@ struct Inner {
     /// subsequent callers wait on the [`Notify`] rather than issuing a
     /// duplicate origin fetch (coalescing, fixes #305).
     ///
-    /// Lock it only through [`Inner::lock_inflight`] — never `.lock()`
-    /// directly. See that method for why poison must be recovered here
-    /// rather than skipped.
+    /// Production code locks it only through [`Inner::lock_inflight`] —
+    /// never `.lock()` directly. See that method for why poison must be
+    /// recovered here rather than skipped. (Tests below reach for `.lock()`
+    /// deliberately, to poison it and to read its length through
+    /// `PoisonError::into_inner`.)
     inflight: Mutex<HashMap<Hash, Arc<Notify>>>,
     /// One-shot latch for the [`Inner::lock_inflight`] poison log (#1517).
-    /// The counter carries the true count; this keeps a hot path from
-    /// spamming an identical `tracing::error!` on every request.
+    /// The counter carries the true count of poisonings; this bounds the
+    /// log to one line even under a pathological panic loop.
     inflight_poison_logged: AtomicBool,
     /// Operator-pinned blob hashes (#276). Pinned hashes are excluded from
     /// the eviction-candidates snapshot and therefore survive any LRU
@@ -271,13 +273,13 @@ struct Inner {
 impl Inner {
     /// The only way to lock [`Inner::inflight`] (#1517).
     ///
-    /// **Poison is recovered, not skipped.** This mutex guards the
-    /// fill-coalescing map, which is what stops N concurrent requests for
-    /// one missing blob from opening N origin pulls. Skipping the critical
-    /// section — what `.lock().ok()` did before #1517 — loses coalescing,
-    /// and a `std::sync::Mutex` poison is sticky for the process lifetime,
-    /// so it loses it *permanently*. On a metered `http`/`s3` origin that
-    /// is an unbounded multiplier on the egress bill; on the `Peer` origin
+    /// **Poison is recovered and cleared, not skipped.** This mutex guards
+    /// the fill-coalescing map, which is what stops N concurrent requests
+    /// for one missing blob from opening N origin pulls. Skipping the
+    /// critical section — what `.lock().ok()` did before #1517 — loses
+    /// coalescing, and because nothing cleared the poison, it lost it for
+    /// the rest of the process. On a metered `http`/`s3` origin that is an
+    /// unbounded multiplier on the egress bill; on the `Peer` origin
     /// reached via `populate` it is a double-spend of USDC vouchers to
     /// upstream nodes — the hazard [`TeeOpen::InFlight`] exists to prevent.
     /// Recovering the guard keeps that invariant intact, and matches the
@@ -285,14 +287,25 @@ impl Inner {
     /// [`CacheEngine::evict`] and [`CacheEngine::is_evicted`]).
     ///
     /// The map is only ever read, inserted into, and removed from under
-    /// this lock — no user code runs inside the critical section — so a
-    /// recovered guard cannot observe a torn `HashMap`.
+    /// this lock — no user code runs inside the critical section, at any of
+    /// the six call sites — so a recovered guard cannot observe a torn
+    /// `HashMap`. Having established that, [`Mutex::clear_poison`] (stable
+    /// since 1.77; MSRV is 1.95) returns the mutex to a healthy state. That
+    /// is what makes the counter below mean *"how many tasks panicked in
+    /// here"* rather than *"how many times we locked since one did"* — the
+    /// latter climbs at request rate forever and reads on a `rate()` panel
+    /// as a raging ongoing incident long after a single panic.
     ///
-    /// **But it is still reported.** The anti-panic policy makes poison
-    /// close to unreachable, so a firing here is a genuine bug: it bumps
-    /// `decdn_cache_inflight_mutex_poisoned_total` every time and logs
-    /// once (latched via `inflight_poison_logged`, since this sits on the
-    /// per-request path).
+    /// **It is still reported.** The anti-panic policy makes poison close
+    /// to unreachable, so a firing here is a genuine bug: it bumps
+    /// `decdn_cache_inflight_mutex_poisoned_total` once per poisoning, and
+    /// logs on the first one (latched via `inflight_poison_logged` — with
+    /// the clear above, a repeat means a *new* panic rather than an echo of
+    /// the old one, but the latch still bounds a pathological panic loop).
+    ///
+    /// Note the coalescing wait this guards (`notify.notified().await` in
+    /// [`CacheEngine::get`]) has no deadline of its own; callers impose
+    /// their own (the node wraps `populate` in `tokio::time::timeout`).
     fn lock_inflight(&self) -> MutexGuard<'_, HashMap<Hash, Arc<Notify>>> {
         match self.inflight.lock() {
             Ok(guard) => guard,
@@ -302,13 +315,14 @@ impl Inner {
                 }
                 if !self.inflight_poison_logged.swap(true, Ordering::Relaxed) {
                     tracing::error!(
-                        "inflight coalescing mutex poisoned; recovering inner state. \
-                         A task panicked while holding it — this is a bug, not an \
-                         operational condition. Coalescing is preserved; further \
-                         occurrences are counted by \
+                        "inflight coalescing mutex poisoned; recovering inner state and \
+                         clearing the poison. A task panicked while holding it — this is a \
+                         bug, not an operational condition. Coalescing is preserved and no \
+                         restart is needed; any further poisonings are counted by \
                          decdn_cache_inflight_mutex_poisoned_total but not re-logged."
                     );
                 }
+                self.inflight.clear_poison();
                 poisoned.into_inner()
             }
         }
@@ -649,16 +663,25 @@ async fn gc_protect_inner(
         // flowing — the next cycle re-establishes a baseline — but log
         // once so the panic doesn't hide.
         //
-        // Three classes of mutex in this file, all of which recover the
-        // guard; they differ only in how loudly:
-        // - metrics-only (`prev_pre_sweep`, here) — recover + `warn!`.
-        // - operational (`evicted`, `access_times`) — recover silently;
-        //   the invariant is restored, and there is nothing an operator
-        //   would do with the report.
-        // - operational AND financially load-bearing (`inflight`) —
-        //   recover, `error!` once, and count it, because losing that
-        //   invariant costs origin egress and USDC. See
-        //   [`Inner::lock_inflight`].
+        // Poison handling in this file is decided **per lock site**, not
+        // per mutex, so the honest summary is a spectrum rather than a
+        // taxonomy:
+        // - `inflight` recovers, clears the poison, `error!`s once and
+        //   counts it at all six sites, because losing its invariant costs
+        //   origin egress and USDC. See [`Inner::lock_inflight`].
+        // - `evicted` and `probe_holds` recover silently everywhere; for
+        //   `evicted` that is load-bearing (skipping would resume serving
+        //   a DMCA-takedown hash) and written up at `evict`/`is_evicted`.
+        // - `access_times` is mixed: it recovers where a lost update is
+        //   durability-relevant (`evict`, the LRU delete path) and skips on
+        //   the read/observability paths (`last_accessed`,
+        //   `access_times_snapshot`, `eviction_candidates`, `touch`). That
+        //   split is a gap, not a design — a poisoned `access_times` makes
+        //   `eviction_candidates` return empty, which stops LRU eviction
+        //   and fills the disk. Tracked separately from #1517.
+        // - `origin_probe_memo` recovers silently via `probe_memo_lock`.
+        // - `prev_pre_sweep` (here) is the only metrics-only one: recover
+        //   + `warn!`, since the next cycle re-establishes a baseline.
         let mut guard = match prev_pre_sweep.lock() {
             Ok(g) => g,
             Err(poisoned) => {
@@ -5267,7 +5290,7 @@ mod tests {
 
         let _ = engine.get(hash).await?;
 
-        let inflight_len = engine.inner.inflight.lock().ok().map_or(0, |g| g.len());
+        let inflight_len = inflight_len(&engine);
         anyhow::ensure!(
             inflight_len == 0,
             "inflight map should be empty after pull, had {inflight_len} entries"
@@ -5298,7 +5321,7 @@ mod tests {
         let _ = owner.await?;
 
         // The inflight map must be empty — InflightGuard::drop ran on cancel.
-        let inflight_len = engine.inner.inflight.lock().ok().map_or(0, |g| g.len());
+        let inflight_len = inflight_len(&engine);
         anyhow::ensure!(
             inflight_len == 0,
             "inflight map should be empty after cancellation, had {inflight_len} entries"
@@ -5389,9 +5412,15 @@ mod tests {
             count == 1,
             "coalescing must survive poison — expected exactly 1 origin fetch, got {count}"
         );
+        // Exactly one: `lock_inflight` clears the poison, so a single
+        // panic is a single bump no matter how many locks follow it.
+        // Asserting the exact value is what pins that — `> 0` would pass
+        // just as happily if the clear were dropped and the counter
+        // climbed with request volume.
+        let bumps = cm.inflight_mutex_poisoned.get();
         anyhow::ensure!(
-            cm.inflight_mutex_poisoned.get() > 0,
-            "recovering the guard silently is the pre-#1517 bug; the poison must be counted"
+            bumps == 1,
+            "one poisoning must count exactly once, got {bumps}"
         );
         anyhow::ensure!(
             inflight_len(&engine) == 0,
@@ -5400,13 +5429,23 @@ mod tests {
         Ok(())
     }
 
-    /// The log is latched but the counter is not: an operator gets one
-    /// `error!` and an honest total, rather than one line per request on a hot
-    /// path. Asserting the latch flag is a proxy for "logged at most once" —
-    /// the crate has no `tracing` capture layer in its dev-deps, and adding one
-    /// to observe a single line is not worth the dependency.
+    /// Two separate poisonings count twice while the log stays latched at one.
+    ///
+    /// Two poisonings, not one, is the whole point: because `lock_inflight`
+    /// clears the poison, a single panic yields a single bump, so only a
+    /// *second* panic can show the counter advancing past the latch. This is
+    /// also the test that pins "counts poisonings, not locks-since-a-poisoning"
+    /// — drop the `clear_poison` and the first `get` alone drives the counter
+    /// to 2, which the exact-value assertions below reject.
+    ///
+    /// The latch itself is asserted through the private `AtomicBool` rather
+    /// than by capturing log output: no crate in the workspace carries a
+    /// `tracing` capture layer in dev-deps, and that is a weak proxy — it
+    /// cannot catch a mutation that logs unconditionally *and* sets the flag.
+    /// Recorded rather than papered over; the counter assertions are the ones
+    /// carrying real weight here.
     #[tokio::test]
-    async fn poisoned_inflight_log_latches_but_the_counter_does_not() -> anyhow::Result<()> {
+    async fn separate_poisonings_each_count_while_the_log_latches() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
         let payload = b"latch check";
         let hash = Hash::new(payload);
@@ -5432,22 +5471,146 @@ mod tests {
             "the latch must not be set before any lock is taken"
         );
 
-        // One miss takes the lock more than once (claim the entry, then
-        // release it in `InflightGuard::drop`), which is all it takes to show
-        // the two diverging: n bumps against a single latched bool. A second
-        // `get` would add nothing — it is a cache hit and returns above the
-        // coalescing loop without locking at all.
+        // One miss takes the lock twice (claim the entry, then release it in
+        // `InflightGuard::drop`) but sees the poison only on the first, since
+        // that lock clears it.
         let _ = engine.get(hash).await?;
-        let bumps = cm.inflight_mutex_poisoned.get();
-
+        let after_first = cm.inflight_mutex_poisoned.get();
+        anyhow::ensure!(
+            after_first == 1,
+            "one poisoning, one bump — the poison must have been cleared; got {after_first}"
+        );
         anyhow::ensure!(
             engine.inner.inflight_poison_logged.load(Ordering::Relaxed),
             "the first poisoned lock must latch the log"
         );
+
+        // A second, independent panic. A second `get` would add nothing on its
+        // own — it is a cache hit and returns above the coalescing loop without
+        // locking at all — so poison directly and take one more lock.
+        poison_inflight(&engine);
+        drop(engine.inner.lock_inflight());
+        let after_second = cm.inflight_mutex_poisoned.get();
+
         anyhow::ensure!(
-            bumps > 1,
-            "the counter must count every poisoned lock, not latch with the log; got {bumps}"
+            after_second == 2,
+            "the counter must count the second poisoning too, got {after_second}"
         );
+        anyhow::ensure!(
+            engine.inner.inflight_poison_logged.load(Ordering::Relaxed),
+            "the latch must stay set — the second poisoning must not re-log"
+        );
+        Ok(())
+    }
+
+    /// `populate_inner`'s coalescing loop is a near-verbatim *copy* of `get`'s,
+    /// not a shared helper, and the pre-#1517 defect was per-copy — each had its
+    /// own poison fall-through. So covering `get` does not cover this, and a
+    /// mutation that reverts only `populate_inner` survives a `get`-only suite.
+    ///
+    /// This is also the copy that matters most: `populate` (unlike
+    /// `populate_local`) walks the `Peer` origin, so a lost claim here is the
+    /// duplicate *paid* upstream pull — the USDC double-spend #1517 names.
+    /// `get`, by contrast, has no production caller in the daemon; the serve
+    /// path fills via `populate`/`populate_local` and `open_tee_sink`.
+    #[tokio::test]
+    async fn poisoned_populate_still_coalesces_into_one_fill() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let payload = b"populate under poison";
+        let hash = Hash::new(payload);
+        let origin = Arc::new(SlowCountingOrigin::new(
+            payload,
+            std::time::Duration::from_millis(50),
+        ));
+
+        let cm = Arc::new(CacheMetrics::default());
+        let engine = CacheEngine::open_full(
+            tmp.path(),
+            vec![origin.clone() as Arc<dyn Origin>],
+            10,
+            crate::PinnedHashes::empty(),
+            crate::RetryPolicy::default(),
+            CircuitBreakerPolicy::default(),
+            Some(Arc::clone(&cm)),
+            Duration::ZERO,
+        )
+        .await?;
+
+        poison_inflight(&engine);
+
+        let mut handles = Vec::new();
+        for _ in 0..5 {
+            let e = engine.clone();
+            handles.push(tokio::spawn(async move { e.populate(hash).await }));
+        }
+        for handle in handles {
+            let result = handle
+                .await
+                .map_err(|e| anyhow::anyhow!("task join: {e}"))?;
+            anyhow::ensure!(result.is_ok(), "expected Ok, got {result:?}");
+        }
+
+        let count = origin.fetch_count.load(Ordering::SeqCst);
+        anyhow::ensure!(
+            count == 1,
+            "populate must coalesce under poison — expected 1 origin fetch, got {count}"
+        );
+        let bumps = cm.inflight_mutex_poisoned.get();
+        anyhow::ensure!(bumps == 1, "one poisoning, one bump; got {bumps}");
+        anyhow::ensure!(inflight_len(&engine) == 0, "the claim must be released");
+        Ok(())
+    }
+
+    /// The cross-path case, and the one that maps most directly onto the USDC
+    /// hazard: `open_tee_sink` answers `TeeOpen::InFlight` off the *same* map
+    /// that `populate`/`get` claim into.
+    ///
+    /// `open_tee_sink` itself already recovered poison before #1517, so it was
+    /// never broken from its own side — it was defeated from the other. A
+    /// poisoned `populate` fell through to a direct pull **without inserting the
+    /// entry**; a concurrent `open_tee_sink` then saw an empty map, returned
+    /// `Owner`, and opened a second paid upstream pull. Neither site alone
+    /// exhibits that, which is why it needs its own test.
+    #[tokio::test]
+    async fn poisoned_claim_is_still_visible_to_the_tee_path() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let payload = b"tee sees the claim";
+        let hash = Hash::new(payload);
+        let origin = Arc::new(SlowCountingOrigin::new(
+            payload,
+            std::time::Duration::from_secs(10),
+        ));
+
+        let engine =
+            CacheEngine::open(tmp.path(), vec![origin.clone() as Arc<dyn Origin>], 10).await?;
+
+        poison_inflight(&engine);
+
+        // Claim the hash from the populate side and leave it in flight.
+        let filler = engine.clone();
+        let owner = tokio::spawn(async move { filler.populate(hash).await });
+        // Wait for the claim to land rather than sleeping a fixed interval —
+        // but with a deadline. An unbounded spin here would *hang* under the
+        // very regression this test exists to catch (a poisoned `populate` that
+        // never inserts the claim), and a hung test blocks CI instead of
+        // reporting. Fail fast and say which it was.
+        let deadline = std::time::Duration::from_secs(5);
+        tokio::time::timeout(deadline, async {
+            while inflight_len(&engine) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!("populate never claimed the hash within {deadline:?} under poison")
+        })?;
+
+        anyhow::ensure!(
+            matches!(engine.open_tee_sink(hash), TeeOpen::InFlight),
+            "a claim taken under poison must still block a second paid upstream pull"
+        );
+
+        owner.abort();
         Ok(())
     }
 
@@ -5466,10 +5629,17 @@ mod tests {
         let tmp = tempfile::tempdir()?;
         let payload = b"poisoned cancel";
         let hash = Hash::new(payload);
-        let origin = SlowCountingOrigin::new(payload, std::time::Duration::from_secs(10));
+        let origin_handle = Arc::new(SlowCountingOrigin::new(
+            payload,
+            std::time::Duration::from_secs(10),
+        ));
 
-        let engine =
-            CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 10).await?;
+        let engine = CacheEngine::open(
+            tmp.path(),
+            vec![origin_handle.clone() as Arc<dyn Origin>],
+            10,
+        )
+        .await?;
 
         poison_inflight(&engine);
 
@@ -5479,7 +5649,19 @@ mod tests {
         });
         let _ = owner.await?;
 
-        // An empty map is the whole assertion, and it reads through
+        // Prove the owner actually claimed the entry before asserting it was
+        // released. Without this the test passes vacuously whenever the 50 ms
+        // timeout lands before the pull starts — `get` does `refuses()` and
+        // `has()` (fs store I/O) first — and an empty map then proves nothing,
+        // even under the pre-#1517 drop impl. A loaded CI box makes that a
+        // silent false pass rather than a visible flake.
+        let claimed = origin_handle.fetch_count.load(Ordering::SeqCst);
+        anyhow::ensure!(
+            claimed == 1,
+            "owner must have reached the pull (and so held the entry), got {claimed} fetches"
+        );
+
+        // An empty map is the assertion proper, and it reads through
         // `into_inner` so poison cannot fake it. Under the pre-#1517 drop impl
         // the entry survives here and `len == 1`. There is deliberately no
         // "now issue another get and time it" probe: this origin sleeps for ten

@@ -396,9 +396,12 @@ refused — look for `decdn_node_pull_refused_unattributable_total` climbing tow
 **Symptoms:** none that a user would notice. This is a latent-bug report, not a
 degradation — the node keeps coalescing correctly.
 
-**Detect:** `decdn_cache_inflight_mutex_poisoned_total > 0`, plus a single
+**Detect:** `DecdnCacheInflightMutexPoisoned` fires on
+`decdn_cache_inflight_mutex_poisoned_total > 0`, alongside a single
 `inflight coalescing mutex poisoned` line at `ERROR`. The log is latched to one
-line per process; the counter carries the true count.
+line per process; the counter carries the true count of poisonings (the engine
+clears the poison each time, so it counts incidents, not requests that followed
+one).
 
 **What it means:** some task panicked while holding the cache's in-flight
 fill-coalescing map. The workspace anti-panic policy (`unwrap`/`expect`/`panic`
@@ -408,35 +411,59 @@ threshold to tune. The engine recovers the guard and coalescing survives, so
 there is no operator action beyond reporting it.
 
 **Why it is metered at all:** before #1517 the node discarded the poison and
-fell through to an uncoalesced direct pull. Because a `std::sync::Mutex` poison
-is sticky for the process lifetime, one panic permanently turned every
-concurrent request for a missing blob into its own origin fetch — unbounded
+fell through to an uncoalesced direct pull. Because nothing cleared the poison, and a
+`std::sync::Mutex` stays poisoned until something does, one panic permanently
+turned every concurrent request for a missing blob into its own origin fetch — unbounded
 egress on a metered `http`/`s3` origin, and duplicate USDC vouchers upstream on
 a node-to-node pull. The only symptom was
 `decdn_cache_pull_through_bytes_total` climbing faster than request volume.
 
-**Remediate:** restart the node to clear the poison (it cannot be cleared in
-place), and file the panic. Nothing is lost on restart — the map is
-process-local.
+**Remediate:** nothing operational — **do not restart**. The engine calls
+`Mutex::clear_poison` after recovering the guard, so the mutex is already
+healthy and coalescing never stopped. File the panic with the surrounding logs.
+The counter does not reset without a restart, which is deliberate: the evidence
+should outlive the incident. Alert on `> 0` rather than `rate()` for the same
+reason.
 
-## Delivery hash mismatch is not metered
+## Delivery hash mismatch — metered on the pull leg only
 
-**Symptoms:** clients report corrupt or rejected blobs; the node logs
-`HashMismatch` but no counter moves.
+**Symptoms:** clients report corrupt or rejected blobs; a peer is serving bytes
+that do not hash to the requested root.
+
+**Detect:** mismatch **is** counted, but only where this node is the *buyer*:
+
+- `decdn_node_pull_corruption_total` — an upstream served hash-mismatched bytes
+  for a paid pull. This is the one to watch: USDC was spent on wrong content.
+- `decdn_node_pull_through_upstream_verify_failed_total` — the tee/window path's
+  bao decoder rejected a chunk group (`VerifyFailed` or `HashMismatch`).
+- `decdn_node_pull_through_errors_total` — the fill path's catch-all, shared
+  with `BlobTooLarge` / `VerifyFailed` / `EvictionLimitExceeded`, so a rise here
+  is a hint rather than a diagnosis.
+
+None of the three has an alert or a panel in `monitoring/`. That is the
+actionable gap.
+
+**The real blind spot is the serve leg.** `HashMismatch` is deliberately *not*
+classified as a `HardFault` (`crates/node/src/handlers/client/mod.rs`) — it is
+deterministic, and reporting it as "this node is broken" would steer clients off
+a healthy node forever over one bad blob. The consequence is that
+`miss_reason()` collapses it to `ServeRejectReason::CacheMiss`, so a serve-side
+integrity fault is indistinguishable from a blob the node simply does not have,
+inside the noisiest benign counter on the serve path
+(`decdn_serve_stream_rejected_cache_miss_total`). `DecdnServeInternalErrorRate`
+cannot fire on it either. Closing that needs a dedicated serve-side counter, not
+a rule.
 
 `monitoring/` carried a `DecdnHashMismatchAppearing` alert until #1513. It
 queried `decdn_streams_failed_total{reason="hash_mismatch"}` — a series the
 exporter has never emitted, and there is no outcome-labelled stream family to
-rebuild it from — so it never fired. The alert was deleted rather than
-rewritten, because nothing counts the event today.
-
-**Detect (today):** grep the node's logs for `HashMismatch`. The cache returns
-`CacheError::HashMismatch` and the drain path logs it, but it reaches no
-counter.
+rebuild it from — so it never fired. It was deleted rather than repointed at one
+of the counters above, because the pull-leg counters mean something different
+from what that alert claimed to watch.
 
 **Escalate if seen:** a mismatch means either a corrupted local store or an
-origin serving bytes that do not match their address. Both are data-integrity
-faults — see [ADR 002](../adr/002-content-addressing.md).
+origin (or upstream peer) serving bytes that do not match their address. Both
+are data-integrity faults — see [ADR 002](../adr/002-content-addressing.md).
 
 ## Gossip / peer table degraded
 

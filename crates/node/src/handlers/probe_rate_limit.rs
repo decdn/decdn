@@ -47,8 +47,10 @@ pub type ProbeRejectLayer = RejectLayer;
 ///
 /// **This is a choice, not a backend limitation** — an earlier version of this
 /// comment claimed `iroh_metrics` has no per-field labels, which is false:
-/// [`crate::metrics::Metrics::probe_hold_unavailable`] is a `Family<L, M>`, and
-/// so is `streams_active`. Each layer here has an unrelated remedy (one abusive
+/// `DecdnMetrics::probe_hold_unavailable` and `DecdnMetrics::streams_active` are
+/// both `Family<L, M>` (private fields; see
+/// [`crate::metrics::Metrics::probe_hold_unavailable`] for the accessor that
+/// uses one). Each layer here has an unrelated remedy (one abusive
 /// peer, one abusive host, aggregate load), so no alert spans the family and a
 /// shared label would buy nothing. ADR 005 § Observability originally specified
 /// a single labelled `decdn_probe_rate_limit_rejections_total`; that name was

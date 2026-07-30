@@ -24,7 +24,7 @@ since project inception and will roll into the first tagged release.
 ### Changed (BREAKING)
 
 - **Monitoring-breaking: `monitoring/` no longer ships rules and panels that
-  could never fire (#1513).** Thirteen `decdn_*` series referenced by the
+  could never fire (#1513).** Eleven `decdn_*` series referenced by the
   reference alerts and dashboard were never exported by any node. Nothing in CI
   compared the two, so each shipped as coverage while being permanently silent.
   Both files now reference only live series, enforced by a new
@@ -404,29 +404,38 @@ since project inception and will roll into the first tagged release.
 - **A poisoned coalescing mutex no longer silently costs origin egress and USDC
   (#1517).** `CacheEngine`'s in-flight fill-coalescing map is what stops N
   concurrent requests for one missing blob from opening N origin pulls. Three of
-  its five lock sites discarded the `PoisonError` — `get`'s loop and
+  its **six** lock sites discarded the `PoisonError` — `get`'s loop and
   `populate_inner`'s fell through to a *direct* pull, and `InflightGuard::drop`
-  skipped its removal — while the two tee-path sites already recovered the guard
-  with `PoisonError::into_inner`. Since a `std::sync::Mutex` poison is sticky for
-  the process lifetime, one panic permanently disabled coalescing: an unbounded
+  skipped its removal — while the three tee-path sites (`open_tee_sink`,
+  `TeeReservation::drop`, `TeeSink::drop`) already recovered the guard with
+  `PoisonError::into_inner`. Since nothing cleared the poison, and a
+  `std::sync::Mutex` stays poisoned until something does, one panic permanently
+  disabled coalescing: an unbounded
   egress multiplier on a metered `http`/`s3` origin, and on the `Peer` origin
   reached via `populate` a double-spend of USDC vouchers upstream — the exact
   hazard `TeeOpen::InFlight` is documented to prevent. Nothing logged it and
   nothing counted it; the only observable was
   `decdn_cache_pull_through_bytes_total` outrunning request volume.
-  - All five sites now go through one `Inner::lock_inflight` choke point that
+  - All six sites now go through one `Inner::lock_inflight` choke point that
     recovers the guard, matching the crate's dominant idiom and the rationale
     already written for `evicted` / `is_evicted`. **Coalescing survives poison**,
-    so the hazard is removed rather than merely reported.
+    so the hazard is removed rather than merely reported. Having established that
+    the critical sections contain no user code (so the map cannot be torn), it
+    also calls `Mutex::clear_poison`, returning the mutex to a healthy state — no
+    restart is needed, and the counter below counts *poisonings* rather than
+    locks-taken-since-a-poisoning, so a `rate()` panel shows incidents instead of
+    request volume.
   - The dropped removal in `InflightGuard::drop` was a second, unrecorded bug:
     `notify_waiters()` wakes only *current* waiters, so a leaked entry left every
     later request for that hash parked on a `Notify` that would never fire again
     — the permanent hang the guard exists to prevent.
   - **New metric:** `decdn_cache_inflight_mutex_poisoned_total`, paired with a
-    single latched `tracing::error!`. The anti-panic policy makes poison close to
-    unreachable, so any nonzero value is a bug report, not a threshold to tune;
-    `docs/runbook.md § Cache coalescing mutex poisoned` says so and says restart
-    is the only way to clear it. No config, wire, or ABI change.
+    single latched `tracing::error!`, an `appendix-observability.md` registry
+    row, and a `DecdnCacheInflightMutexPoisoned` alert on `> 0`. The anti-panic
+    policy makes poison close to unreachable, so any nonzero value is a bug
+    report, not a threshold to tune; `docs/runbook.md § Cache coalescing mutex
+    poisoned` says so, and says explicitly **not** to restart. No config, wire,
+    or ABI change.
 
 #### Observability
 

@@ -284,16 +284,26 @@ pub struct CacheMetrics {
     /// so **any** nonzero value is a genuine bug worth filing rather
     /// than an operational condition worth tuning.
     ///
-    /// The engine recovers the guard via `PoisonError::into_inner` and
-    /// keeps coalescing, so this is a report, not a degradation: it does
-    /// not mean duplicate origin pulls happened. It is metered because
-    /// the alternative — the pre-#1517 behaviour of discarding the error
-    /// — silently disabled coalescing for the life of the process, and
-    /// the only observable was `decdn_cache_pull_through_bytes_total`
-    /// rising faster than request volume.
+    /// The engine recovers the guard via `PoisonError::into_inner`, clears
+    /// the poison, and keeps coalescing — so this is a report, not a
+    /// degradation: it does not mean duplicate origin pulls happened, and
+    /// it does not call for a restart. It is metered because the
+    /// alternative — the pre-#1517 behaviour of discarding the error —
+    /// silently disabled coalescing for the life of the process, and the
+    /// only observable was `decdn_cache_pull_through_bytes_total` rising
+    /// faster than request volume.
     ///
-    /// Paired with a single `tracing::error!`, latched so a hot path
-    /// cannot spam the log; the counter carries the true count.
+    /// **Counts poisonings, not locks-since-a-poisoning.** Because the
+    /// engine clears the poison, one panic bumps this exactly once; a
+    /// `rate()` panel therefore shows the incidents rather than the
+    /// request rate that followed them. Paired with a single
+    /// `tracing::error!`, latched so a pathological panic loop cannot spam
+    /// the log while this counter keeps the true total.
+    ///
+    /// Note: the bump is skipped when the engine was built with no metrics
+    /// handle (`CacheEngine::open`'s 3-arg form, test-only today — the
+    /// daemon always wires `Some(..)`). There the latched log line is the
+    /// whole signal.
     ///
     /// Field name omits `_total`: the `OpenMetrics` encoder appends it
     /// automatically, so the emitted name is

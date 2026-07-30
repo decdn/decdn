@@ -50,7 +50,7 @@ For defense-in-depth against an unforeseen growth path (registry-validation regr
 - **When set and exceeded:** new inserts are rejected; the failure surfaces in the existing aggregate gossip-rejection counter `decdn_gossip_announces_rejected_total` (per [appendix-observability.md § Gossip Metrics](appendix-observability.md#gossip-metrics)). The rejection carries a stable `table_full` reason token in logs, but it is **not** a metrics label: per [appendix-observability.md § Reason splits](appendix-observability.md#reason-splits-sibling-counters-not-labels), gossip rejections aggregate into one counter and only `clock_skew` is broken out as a sibling. **No existing entry is evicted to make room** — eviction-by-priority would conflate discovery with selection trust (see [§ Reputation does not factor into eviction](#reputation-does-not-factor-into-eviction)) and is rejected in *Alternatives Considered*.
 - **Operator signal:** sustained `decdn_gossip_peer_table_size > registered_node_count × 1.5` indicates registry validation is not constraining inserts as expected and warrants investigation, not silent eviction.
 
-Implementing `gossip.max_peer_entries` is OPTIONAL for the PoC (`peer_table_size` already covers the observable signal); the config key is reserved here so a follow-up implementation needs no ADR amendment.
+Implementing `gossip.max_peer_entries` is OPTIONAL for the PoC (`decdn_gossip_peer_table_size` already covers the observable signal); the config key is reserved here so a follow-up implementation needs no ADR amendment.
 
 ### Registry-cache interaction (active eviction)
 

@@ -2861,18 +2861,36 @@ mod tests {
     /// counter's TYPE line carries the *unsuffixed* stem (`# TYPE
     /// decdn_cache_hits counter`) while the sample is `decdn_cache_hits_total
     /// 0` — so parsing TYPE would blind the gate to the `_total` suffix, which
-    /// is the single most common way a documented name goes wrong here (a
-    /// counter field must never spell `_total`; the encoder appends it).
-    /// Truncating at the first `{` also folds labelled families down to their
-    /// base name, so `decdn_streams_active{direction="inbound"} 0` registers
-    /// as `decdn_streams_active` — a name [`has_metric_line`] cannot match
+    /// is the single most common way a documented name goes wrong here. (The
+    /// convention is that a counter field omits `_total` and lets the encoder
+    /// append it; the encoder only appends when it is absent, so the four
+    /// `gossip_*_total` fields that do spell it export correctly. Follow the
+    /// convention in new code, but it is not a hard rule.)
+    ///
+    /// Truncating at the first `{` folds labelled families down to their base
+    /// name, so `decdn_streams_active{direction="inbound"} 0` registers as
+    /// `decdn_streams_active` — a name [`has_metric_line`] cannot match
     /// because it requires an exact value-bearing line.
+    ///
+    /// Histograms get their `_bucket`/`_sum`/`_count` samples folded back to
+    /// the base name too. There is no bare `name` sample for a histogram, so
+    /// without this the first `live` histogram row would fail the registry
+    /// gate with a message telling its author to mark a genuinely-shipping
+    /// metric `planned`. The exporter registers no histograms today; this is
+    /// here so that stays a non-event when one lands.
     fn exported_series(text: &str) -> std::collections::HashSet<String> {
         text.lines()
             .filter(|l| !l.starts_with('#') && !l.is_empty())
             .filter_map(|l| {
                 let name = l.split(['{', ' ']).next()?;
                 (!name.is_empty()).then(|| name.to_string())
+            })
+            .flat_map(|name| {
+                let base = ["_bucket", "_sum", "_count"]
+                    .iter()
+                    .find_map(|sfx| name.strip_suffix(sfx))
+                    .map(str::to_string);
+                std::iter::once(name).chain(base)
             })
             .collect()
     }
@@ -2910,16 +2928,22 @@ mod tests {
     ///
     /// **What this does not prove.** A name that resolves may still sit at a
     /// permanent zero because nothing increments it; the gate is about the
-    /// name, not the wiring. `docs/runbook.md § Blacklist` is the live example.
+    /// name, not the wiring. `docs/runbook.md § ContentBlacklist compliance` is the live example.
     #[test]
     fn monitoring_selectors_are_exported() {
-        // `decdn_health` is a Prometheus `job=` label from the blackbox scrape
-        // example in the file's header comment, not a series.
-        //
-        // Names ending in `_` are filtered separately below: no exported series
-        // ends with an underscore, so a trailing one means the scan stopped at
-        // a wildcard — a prose `decdn_serve_stream_rejected_*`, or the inner
+        // Names ending in `_` are filtered below: no exported series ends with
+        // an underscore, so a trailing one means the scan stopped at a
+        // wildcard — a prose `decdn_serve_stream_rejected_*`, or the inner
         // pattern of the `{__name__=~"decdn_.+_task_panicked_total"}` matcher.
+        //
+        // Belt-and-braces against a name that is not a series at all. Only
+        // `decdn_health` qualifies today (a Prometheus `job=` label in the
+        // blackbox-probe example at prometheus-alerts.yml's watcher group), and
+        // it currently sits on a `#` line that the strip below already removes
+        // — so this is unreachable unless that example migrates out of a
+        // comment. Kept rather than deleted because a `job=` label is a
+        // legitimate non-series `decdn_*` token that the scanner cannot
+        // distinguish structurally.
         const NOT_SERIES: [&str; 1] = ["decdn_health"];
 
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -2944,8 +2968,12 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n");
             let names = decdn_names_in(&live);
+            // Floor sized just under the smaller file's real count (17 in
+            // the alerts, 27 in the dashboard). A loose floor is the same
+            // failure this gate exists to stop: a shape change that silently
+            // drops most of the coverage while the test stays green.
             assert!(
-                names.len() > 10,
+                names.len() >= 15,
                 "{file} yielded only {} names — the scanner or the file shape changed",
                 names.len()
             );
@@ -3022,8 +3050,11 @@ mod tests {
             }
         }
 
+        // Floor sized just under the real count (47 live rows today). `> 20`
+        // would tolerate a table-shape change that silently dropped more than
+        // half the registry — the exact rot this gate exists to catch.
         assert!(
-            checked > 20,
+            checked >= 40,
             "only {checked} registry rows parsed — the table shape changed and this \
              gate silently stopped covering the registry"
         );
@@ -3049,7 +3080,7 @@ mod tests {
         // Scoped to the one series this collapse renamed — it asserts the
         // *query line*, which the blanket name gate below cannot. The blanket
         // "every `decdn_*` in monitoring/ is exported" check that used to be
-        // impossible here (13 stale names blocked it) now lives in
+        // impossible here (the stale names blocked it) now lives in
         // `monitoring_selectors_are_exported`, since #1513 repaired them.
         const SELECTOR: &str = "decdn_probe_hold_unavailable_total{reason=\"exhausted\"";
 
