@@ -3,11 +3,12 @@
 
 use alloy::primitives::U256;
 
+use super::source::ProgressiveSource;
 use super::{
     Arc, B256, BatchStop, BufferedVoucherReader, Bytes, CacheError, ChannelDeliveryState,
     ChannelId, ChunkData, ClientHandler, ClientMessage, FillOutcome, Hash, MB_BYTES, Mutex,
-    NodeOrigin, NodeProgressivePull, RecvStream, SendStream, ServeRejectReason, StreamRequest,
-    StreamRequestExt, StreamResponseBody, TeeReservation, TeeSink, TeeVerdict, VecDeque,
+    NodeOrigin, RecvStream, SendStream, ServeRejectReason, StreamRequest, StreamRequestExt,
+    StreamResponseBody, TeeReservation, TeeSink, TeeVerdict, VecDeque,
     WINDOW_PULL_FALLBACK_DEADLINE, min_payment,
 };
 
@@ -226,6 +227,11 @@ impl ClientHandler {
         // interleaved bao back to that many plaintext bytes.
         let tee = tee.begin(total_bytes);
 
+        // This open path is node-only for now (#1130 Task 6 wires the local
+        // stream-while-store arm); wrap here so the loop below can drive
+        // either source uniformly.
+        let pull = ProgressiveSource::Node(pull);
+
         // (6) Fused window-paced loop. Boxed to keep the large loop future off
         // this frame (clippy::large_futures).
         Box::pin(self.window_forward_loop(
@@ -276,7 +282,7 @@ impl ClientHandler {
         rate_per_mb: u64,
         interval_mb: u64,
         total_bytes: u64,
-        mut pull: NodeProgressivePull,
+        mut pull: ProgressiveSource,
         mut tee: TeeSink,
     ) -> anyhow::Result<()> {
         let interval_bytes = interval_mb.saturating_mul(MB_BYTES).max(1);
@@ -654,7 +660,7 @@ impl ClientHandler {
     /// `write_message` failure both propagate `Err` and may not have written any
     /// frame (an underpayment `bail!` has no wire reject code). Do not read this
     /// as "a rejection was always sent."
-    pub(super) fn abandon_window_serve(&self, pull: NodeProgressivePull, tee: TeeSink) {
+    pub(super) fn abandon_window_serve(&self, pull: ProgressiveSource, tee: TeeSink) {
         pull.abandon(None);
         tee.abandon();
         self.metrics.node_pull_through_client_abandoned();

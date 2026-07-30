@@ -10,12 +10,6 @@
 //! `finish`/`abandon`/`abandon_corrupt` carry no [`TeeVerdict`] / cause — the
 //! dispatch below simply drops those arguments on that arm.
 
-// Nothing in `decdn-node` constructs a `ProgressiveSource` yet — only this module's
-// own tests do. Task 5 (#1130) retypes the window serve loop to this enum, at which
-// point every variant/method below is live. Blanket-allowed here rather than
-// per-item so the wiring commit's diff is just deleting this line.
-#![allow(dead_code)]
-
 use bytes::Bytes;
 use decdn_cache::LocalOutboardPull;
 
@@ -40,6 +34,12 @@ pub(crate) enum ProgressiveSource {
     Node(NodeProgressivePull),
     /// A local pull streaming an already-held origin's plaintext through the
     /// bao encoder (#1130 Task 3): no upstream to pay or score.
+    // Not yet constructed outside this module's own tests — Task 6 (#1130)
+    // wires the local stream-while-store open site that produces this
+    // variant in production. Narrowed to this variant (rather than the
+    // module-wide allow Task 5 removed) since every method on the enum is
+    // already reachable via `Node`.
+    #[allow(dead_code)]
     LocalOutboard(LocalOutboardPull),
 }
 

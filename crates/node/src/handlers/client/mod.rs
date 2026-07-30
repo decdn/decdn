@@ -59,7 +59,7 @@ use tokio_util::sync::CancellationToken;
 use crate::dispatch::{ConnectionLimiter, RejectReason};
 use crate::leech_governor::LeechGovernor;
 use crate::metrics::Metrics;
-use crate::node_origin::{NodeOrigin, NodeProgressivePull, TeeVerdict};
+use crate::node_origin::{NodeOrigin, TeeVerdict};
 use crate::receipt_log::{DownloadReceipt, ReceiptSink};
 use crate::region_accounting::RegionAccountant;
 
