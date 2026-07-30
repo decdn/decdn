@@ -554,6 +554,13 @@ fn refill_decision(
     working_deposit: U256,
     min_deposit: U256,
 ) -> U256 {
+    if working_deposit.is_zero() {
+        // `0` disables top-up entirely (matches the CLI's auto-refill config
+        // semantics for `buyer_working_deposit_micro_usdc`) — a reused channel is
+        // never proactively refilled, no matter how far below what the target
+        // would otherwise put its low-water mark.
+        return U256::ZERO;
+    }
     let target = deposit_hint.max(working_deposit).max(min_deposit);
     let low_water = target / U256::from(LOW_WATER_DIVISOR);
     refill_amount(deposit, prior_amount, target, low_water)
@@ -3177,6 +3184,26 @@ mod tests {
         let min = U256::from(1u64);
         let add = refill_decision(deposit, prior, hint, working, min);
         assert_eq!(add, working - (deposit - prior)); // graduate toward working
+    }
+
+    #[test]
+    fn refill_decision_working_deposit_zero_disables_topup() {
+        // `working_deposit == 0` must disable the proactive refill entirely,
+        // mirroring the CLI's "0 disables top-up entirely" documented semantics
+        // for `buyer_working_deposit_micro_usdc`. Without the early return, the
+        // target would still be max(deposit_hint, min_deposit), which can sit
+        // well above the channel's remaining balance and trigger an unwanted
+        // on-chain topUp.
+        let deposit = U256::from(10_000_000u64); // deposit_hint == initial deposit
+        let prior = U256::from(9_999_000u64); // remaining is far below what would
+        // otherwise be the low-water mark.
+        let hint = deposit;
+        let min = U256::from(1u64);
+        assert_eq!(
+            refill_decision(deposit, prior, hint, U256::ZERO, min),
+            U256::ZERO,
+            "working_deposit == 0 must disable refill even when the channel is low"
+        );
     }
 
     #[test]

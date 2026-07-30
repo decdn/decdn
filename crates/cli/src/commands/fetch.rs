@@ -872,8 +872,8 @@ where
     // pays for it is even due, and `decode_to_sink` flushes and verifies those
     // bytes to disk as they arrive, independent of whether that voucher is later
     // accepted.
-    let fetch_start_offset = byte_offset;
-    let fetch_start_committed_bytes = ledger.committed().bytes;
+    let mut fetch_start_offset = byte_offset;
+    let mut fetch_start_committed_bytes = ledger.committed().bytes;
 
     // Wallet-less resume (#1481): a voucher rejection carrying a bundle signed by
     // our OWN key means our persisted watermark had fallen behind what the node
@@ -996,6 +996,15 @@ where
             );
             restarted = true;
             byte_offset = 0;
+            // A later reactive top-up's `content_paid_frontier` call anchors its
+            // paid-content math on these two baselines (#1497 finding). Left
+            // stale after this restart, they would still point at the ABANDONED
+            // resume attempt's offset/watermark, so a subsequent top-up would
+            // overshoot the true (from-zero) paid frontier and the whole-file
+            // hash check would fail the fetch. Re-anchor both to the from-zero
+            // restart, mirroring the initial capture above.
+            fetch_start_offset = byte_offset;
+            fetch_start_committed_bytes = ledger.committed().bytes;
             continue;
         }
         // Reactive graduation (#1497): a genuine mid-fetch ceiling hit —
