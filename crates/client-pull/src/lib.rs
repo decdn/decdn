@@ -1579,6 +1579,34 @@ pub fn resumable_watermark<'a>(
     Some(bundle)
 }
 
+/// True iff `err` is an `InsufficientDeposit` voucher rejection that the buyer's OWN ledger
+/// corroborates as genuine exhaustion — i.e. not a healable watermark desync
+/// ([`resumable_watermark`] returns `None`), AND the buyer's remaining spendable deposit is
+/// below the cost of the next voucher. A node claiming `InsufficientDeposit` while the buyer's
+/// ledger still shows headroom is NOT corroborated (returns `false`) — the caller must refuse
+/// to fund it.
+pub fn genuine_exhaustion(
+    err: &anyhow::Error,
+    ctx: &ChannelContext,
+    remaining_spendable: U256,
+    next_voucher_cost: U256,
+) -> bool {
+    let Some(rejected) = err.downcast_ref::<UpstreamVoucherRejected>() else {
+        return false;
+    };
+    if rejected.reason != VoucherRejectReason::InsufficientDeposit {
+        return false;
+    }
+    // A healable watermark desync is NOT exhaustion — let the resume loop reseed instead of
+    // adding funds.
+    if resumable_watermark(err, ctx).is_some() {
+        return false;
+    }
+    // Validate the node's claim against our OWN accounting: only genuine if we truly cannot
+    // cover the next voucher. Otherwise the node is lying/buggy and we refuse to fund it.
+    remaining_spendable < next_voucher_cost
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn fetch_inner_once(
     endpoint: &Endpoint,
@@ -2582,7 +2610,7 @@ mod tests {
     use super::{
         ChannelContext, HashMismatch, LocalPullFault, U256, UpstreamVoucherRejected, Voucher,
         VoucherRejectReason, WatermarkBundle, aligned_wire_len, decode_verified_range,
-        resumable_watermark,
+        genuine_exhaustion, resumable_watermark,
     };
 
     /// The `LocalPullFault` marker must ride out on the errors the range helpers ACTUALLY
@@ -2933,6 +2961,125 @@ mod tests {
             )
         })?;
         assert_eq!(got.bytes_delivered, expected_bytes);
+        Ok(())
+    }
+
+    /// True twin: `InsufficientDeposit` with no bundle (nothing for `resumable_watermark` to
+    /// reseed from) and our own ledger confirming we truly cannot cover the next voucher.
+    #[test]
+    fn genuine_exhaustion_true_when_insufficient_and_ledger_drained() {
+        use alloy::primitives::{Address, B256};
+        use alloy::signers::local::PrivateKeySigner;
+
+        let channel_id = B256::repeat_byte(0x11);
+        let token = Address::repeat_byte(0x22);
+        let domain = decdn_incentive::voucher_domain(1, Address::repeat_byte(0x33));
+        let signer = std::sync::Arc::new(PrivateKeySigner::random());
+        let ctx = resume_test_ctx(channel_id, token, &signer, &domain);
+
+        let err = anyhow::Error::new(UpstreamVoucherRejected {
+            reason: VoucherRejectReason::InsufficientDeposit,
+            bundle: None,
+        });
+        // remaining 10 µUSDC, next voucher needs 1000 -> truly out.
+        assert!(genuine_exhaustion(
+            &err,
+            &ctx,
+            U256::from(10u64),
+            U256::from(1000u64)
+        ));
+    }
+
+    /// A node crying `InsufficientDeposit` while our OWN ledger still shows headroom is NOT
+    /// corroborated — the caller must refuse to fund it (a lying or buggy node must not be
+    /// able to solicit an unnecessary top-up).
+    #[test]
+    fn genuine_exhaustion_false_when_ledger_still_has_headroom() {
+        use alloy::primitives::{Address, B256};
+        use alloy::signers::local::PrivateKeySigner;
+
+        let channel_id = B256::repeat_byte(0x11);
+        let token = Address::repeat_byte(0x22);
+        let domain = decdn_incentive::voucher_domain(1, Address::repeat_byte(0x33));
+        let signer = std::sync::Arc::new(PrivateKeySigner::random());
+        let ctx = resume_test_ctx(channel_id, token, &signer, &domain);
+
+        let err = anyhow::Error::new(UpstreamVoucherRejected {
+            reason: VoucherRejectReason::InsufficientDeposit,
+            bundle: None,
+        });
+        assert!(!genuine_exhaustion(
+            &err,
+            &ctx,
+            U256::from(5000u64),
+            U256::from(1000u64)
+        ));
+    }
+
+    /// Any rejection reason other than `InsufficientDeposit` is never exhaustion, regardless
+    /// of what the ledger shows.
+    #[test]
+    fn genuine_exhaustion_false_for_non_insufficient_reason() {
+        use alloy::primitives::{Address, B256};
+        use alloy::signers::local::PrivateKeySigner;
+
+        let channel_id = B256::repeat_byte(0x11);
+        let token = Address::repeat_byte(0x22);
+        let domain = decdn_incentive::voucher_domain(1, Address::repeat_byte(0x33));
+        let signer = std::sync::Arc::new(PrivateKeySigner::random());
+        let ctx = resume_test_ctx(channel_id, token, &signer, &domain);
+
+        let err = anyhow::Error::new(UpstreamVoucherRejected {
+            reason: VoucherRejectReason::StaleNonce,
+            bundle: None,
+        });
+        assert!(!genuine_exhaustion(
+            &err,
+            &ctx,
+            U256::ZERO,
+            U256::from(1000u64)
+        ));
+    }
+
+    /// A healable watermark desync (an authenticated bundle `resumable_watermark` accepts) is
+    /// NOT genuine exhaustion, even if it rides on an `InsufficientDeposit` rejection and even
+    /// if the ledger looks drained — the caller should reseed and resume, not fund a top-up.
+    #[test]
+    fn genuine_exhaustion_false_when_healable_desync_bundle_present() -> anyhow::Result<()> {
+        use alloy::primitives::{Address, B256};
+        use alloy::signers::local::PrivateKeySigner;
+
+        let channel_id = B256::repeat_byte(0x11);
+        let token = Address::repeat_byte(0x22);
+        let domain = decdn_incentive::voucher_domain(1, Address::repeat_byte(0x33));
+        let signer = std::sync::Arc::new(PrivateKeySigner::random());
+        let ctx = resume_test_ctx(channel_id, token, &signer, &domain);
+
+        let bundle = signed_bundle(
+            channel_id,
+            token,
+            &signer,
+            &domain,
+            U256::from(500u64),
+            U256::from(3u64),
+            U256::from(4096u64),
+        )?;
+        let err = anyhow::Error::new(UpstreamVoucherRejected {
+            reason: VoucherRejectReason::InsufficientDeposit,
+            bundle: Some(bundle),
+        });
+
+        // Sanity: this bundle IS the healable-desync case `resumable_watermark` resolves.
+        anyhow::ensure!(
+            resumable_watermark(&err, &ctx).is_some(),
+            "test bundle must be a healable desync resumable_watermark accepts"
+        );
+        assert!(!genuine_exhaustion(
+            &err,
+            &ctx,
+            U256::from(10u64),
+            U256::from(1000u64)
+        ));
         Ok(())
     }
 
