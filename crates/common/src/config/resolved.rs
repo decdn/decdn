@@ -234,6 +234,19 @@ pub struct ResolvedCache {
     /// one). Default [`crate::config::DEFAULT_FS_RESCAN_INTERVAL_SEC`] when the
     /// TOML section omits the field.
     pub fs_rescan_interval_sec: u64,
+    /// TTL in seconds for a memoised live-origin probe answer (#1130 pt3).
+    /// Default [`crate::config::DEFAULT_ORIGIN_PROBE_TTL_SEC`]. Backs the
+    /// per-probe `HEAD`/`HeadObject` fallback that discovers non-pinned http/s3
+    /// objects the enumeration index cannot see.
+    pub origin_probe_ttl_sec: u64,
+    /// Per-probe live-`HEAD` ceiling in milliseconds (#1130 pt3). Default
+    /// [`crate::config::DEFAULT_ORIGIN_PROBE_TIMEOUT_MS`]. Keeps a slow origin
+    /// off the probe hot path.
+    pub origin_probe_timeout_ms: u64,
+    /// Maximum distinct hashes in the live-origin probe memo (#1130 pt3).
+    /// Default [`crate::config::DEFAULT_ORIGIN_PROBE_MEMO_CAPACITY`]. Bounds
+    /// memo memory under a random-hash probe flood.
+    pub origin_probe_memo_capacity: u64,
     /// LRU eviction driver high-water percent of [`Self::cache_size_mb`]
     /// (#1173). Above this fraction the driver actively evicts. Validated to
     /// `[60, 95]`. Default [`crate::config::DEFAULT_EVICTION_HIGH_WATER_PCT`].

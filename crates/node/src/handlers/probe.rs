@@ -469,6 +469,21 @@ impl ProbeHandler {
         // reputation penalty (see the hold block comment above).
         let (has_blob, total_bytes) =
             fold_origin_held((has_blob, total_bytes), self.cache.origin_held_size(hash));
+        // Live-origin HEAD fallback (#1130 pt3). The index above covers fs
+        // enumeration ∪ pins; http/s3 do not list, so a non-pinned bucket object
+        // is invisible to it. When nothing has answered `true` yet, consult the
+        // origin directly (`HEAD`/`HeadObject`, no body) with a TTL memo so a
+        // non-pinned remote object is discoverable on the first probe rather than
+        // never. Skipped once `has_blob` is already true — no point paying a HEAD
+        // for a blob the store or the index already backs.
+        let (has_blob, total_bytes) = if has_blob {
+            (has_blob, total_bytes)
+        } else {
+            fold_origin_held(
+                (has_blob, total_bytes),
+                self.cache.origin_probe_size(hash).await,
+            )
+        };
         // On the shed path no hold was attempted, so the value sampled for
         // the gate is still current — reuse it instead of re-acquiring the
         // lock and sweeping again. Off that path a hold may have been taken,

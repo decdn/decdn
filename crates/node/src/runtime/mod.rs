@@ -3018,6 +3018,12 @@ async fn build_cache(
     // `cache.*` is restart-required (not hot-reloaded), so applying the
     // probe-hold budget once here is sufficient (ADR 005 §Hold budget, #318).
     engine.set_max_probe_holds(cfg.cache.max_probe_holds);
+    // Live-origin probe memo (#1130 pt3) — likewise restart-configured once.
+    engine.set_origin_probe_config(
+        std::time::Duration::from_secs(cfg.cache.origin_probe_ttl_sec),
+        std::time::Duration::from_millis(cfg.cache.origin_probe_timeout_ms),
+        usize::try_from(cfg.cache.origin_probe_memo_capacity).unwrap_or(usize::MAX),
+    );
     Ok(engine)
 }
 
@@ -3719,6 +3725,10 @@ mod tests {
                 user_agent: decdn_cache::DEFAULT_USER_AGENT.to_string(),
                 gc_interval_sec: 0,
                 fs_rescan_interval_sec: 0,
+                origin_probe_ttl_sec: decdn_common::config::DEFAULT_ORIGIN_PROBE_TTL_SEC,
+                origin_probe_timeout_ms: decdn_common::config::DEFAULT_ORIGIN_PROBE_TIMEOUT_MS,
+                origin_probe_memo_capacity:
+                    decdn_common::config::DEFAULT_ORIGIN_PROBE_MEMO_CAPACITY,
                 eviction_high_water_pct: 90,
                 eviction_target_pct: 80,
                 eviction_per_sweep_budget: 16,
