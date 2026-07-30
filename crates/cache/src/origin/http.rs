@@ -18,7 +18,7 @@ use reqwest::header::{CONTENT_ENCODING, CONTENT_LENGTH, RANGE};
 use super::fs::OBAO4_SUFFIX;
 use super::{
     DEFAULT_USER_AGENT, DecompressMode, Origin, OriginFetch, OriginKind, OriginRangeFetch,
-    OriginRangeRequest, OriginUrl, decompress, parse_origin_url, redact_for_log,
+    OriginRangeRequest, OriginUrl, OutboardFetch, decompress, parse_origin_url, redact_for_log,
 };
 use crate::error::{OriginError, OriginPullError};
 
@@ -415,6 +415,24 @@ impl Origin for HttpOrigin {
         })
     }
 
+    fn fetch_outboard(
+        &self,
+        hash: Hash,
+        outboard_max_bytes: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<OutboardFetch, OriginPullError>> + Send + '_>> {
+        Box::pin(async move {
+            let hex = hash.to_hex();
+            let obao4_url = self
+                .base_url
+                .as_url()
+                .join(&format!("{hex}{OBAO4_SUFFIX}"))
+                .with_context(|| format!("failed to build outboard URL for {hash}"))
+                .map_err(OriginPullError::Permanent)?;
+            self.get_outboard_bounded(&obao4_url, outboard_max_bytes)
+                .await
+        })
+    }
+
     fn size(
         &self,
         hash: Hash,
@@ -520,6 +538,55 @@ impl HttpOrigin {
             return Ok(None);
         }
         self.collect_capped(resp, max_bytes, url_log).await
+    }
+
+    /// GET `url` and buffer the whole body, capped at `max_bytes`, returning
+    /// an [`OutboardFetch`] rather than an `Option<Bytes>` — unlike
+    /// [`Self::get_bounded`] (used by the range-pull's outboard sub-fetch,
+    /// where any non-success collapses to a single "degrade" signal), a
+    /// standalone [`Origin::fetch_outboard`] call distinguishes a genuine
+    /// 404 ([`OutboardFetch::NotFound`]) from every other non-success status
+    /// — redirect (disabled per #579), permission decline, 5xx —
+    /// ([`OutboardFetch::Unsupported`]). Neither is an error; only a
+    /// transport-level fault on the `.send()` surfaces as [`OriginPullError`].
+    async fn get_outboard_bounded(
+        &self,
+        url: &reqwest::Url,
+        max_bytes: u64,
+    ) -> Result<OutboardFetch, OriginPullError> {
+        let url_log = redact_for_log(url);
+        let send_fut = self.client.get(url.clone()).send();
+        let resp = match tokio::time::timeout(self.response_headers_timeout, send_fut).await {
+            Err(_elapsed) => {
+                return Err(OriginPullError::Transient(anyhow::anyhow!(
+                    "origin GET {url_log} headers timed out"
+                )));
+            }
+            Ok(Err(reqwest_err)) => {
+                return Err(classify_reqwest_error(reqwest_err)
+                    .map_inner(|e| e.context(format!("origin GET {url_log} failed"))));
+            }
+            Ok(Ok(resp)) => resp,
+        };
+        if resp.status() == StatusCode::NOT_FOUND {
+            return Ok(OutboardFetch::NotFound);
+        }
+        // Any other non-success (3xx — redirects are disabled, #579 — 401/403,
+        // 5xx) degrades rather than errors: the optimization is best-effort,
+        // and a persistent fault re-surfaces at full severity on whatever
+        // fallback path the caller takes next.
+        if !resp.status().is_success() {
+            return Ok(OutboardFetch::Unsupported);
+        }
+        if let Some(len) = resp.content_length()
+            && len > max_bytes
+        {
+            return Ok(OutboardFetch::Unsupported);
+        }
+        match self.collect_capped(resp, max_bytes, url_log).await? {
+            Some(bytes) => Ok(OutboardFetch::Found(bytes)),
+            None => Ok(OutboardFetch::Unsupported),
+        }
     }
 
     /// GET `url` with a `Range` header and buffer the partial body. Returns
@@ -680,7 +747,112 @@ fn response_chunk_stream(
 
 #[cfg(test)]
 mod tests {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
     use super::*;
+
+    /// A published sibling `{hex}.obao4` is fetched in full via
+    /// `fetch_outboard` alone (no data GET at all, #1130 stream-while-store
+    /// seam).
+    #[tokio::test]
+    async fn fetch_outboard_returns_sibling_obao4() -> anyhow::Result<()> {
+        let server = MockServer::start().await;
+        let hash = Hash::new(b"http-outboard-marker");
+        let hex = hash.to_hex();
+        let outboard_bytes = vec![0xABu8; 4096];
+        Mock::given(method("GET"))
+            .and(path(format!("/{hex}.obao4")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard_bytes.clone()))
+            .mount(&server)
+            .await;
+        let origin = HttpOrigin::parse(&server.uri())?;
+
+        match origin.fetch_outboard(hash, 1 << 20).await? {
+            OutboardFetch::Found(bytes) => {
+                anyhow::ensure!(
+                    bytes.as_ref() == outboard_bytes.as_slice(),
+                    "outboard bytes mismatch"
+                );
+            }
+            other => anyhow::bail!("expected Found, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    /// A `404` on the sibling outboard is `NotFound`, not an error.
+    #[tokio::test]
+    async fn fetch_outboard_404_is_not_found() -> anyhow::Result<()> {
+        let server = MockServer::start().await;
+        let hash = Hash::new(b"http-outboard-missing-marker");
+        let hex = hash.to_hex();
+        Mock::given(method("GET"))
+            .and(path(format!("/{hex}.obao4")))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        let origin = HttpOrigin::parse(&server.uri())?;
+
+        anyhow::ensure!(
+            matches!(
+                origin.fetch_outboard(hash, 1 << 20).await?,
+                OutboardFetch::NotFound
+            ),
+            "404 must be NotFound",
+        );
+        Ok(())
+    }
+
+    /// A non-404 decline (403 here) degrades to `Unsupported` rather than
+    /// erroring — mirrors `fetch_range`'s "best-effort, never an error for a
+    /// status-level decline" contract.
+    #[tokio::test]
+    async fn fetch_outboard_non_404_decline_is_unsupported() -> anyhow::Result<()> {
+        let server = MockServer::start().await;
+        let hash = Hash::new(b"http-outboard-forbidden-marker");
+        let hex = hash.to_hex();
+        Mock::given(method("GET"))
+            .and(path(format!("/{hex}.obao4")))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+        let origin = HttpOrigin::parse(&server.uri())?;
+
+        anyhow::ensure!(
+            matches!(
+                origin.fetch_outboard(hash, 1 << 20).await?,
+                OutboardFetch::Unsupported
+            ),
+            "non-404 decline must degrade to Unsupported",
+        );
+        Ok(())
+    }
+
+    /// An outboard whose advertised `Content-Length` exceeds
+    /// `outboard_max_bytes` degrades to `Unsupported` rather than buffering —
+    /// the OOM guard mirrored from `fetch_range`'s outboard sub-fetch.
+    #[tokio::test]
+    async fn fetch_outboard_oversize_is_unsupported() -> anyhow::Result<()> {
+        let server = MockServer::start().await;
+        let hash = Hash::new(b"http-outboard-oversize-marker");
+        let hex = hash.to_hex();
+        let huge = vec![0x5Au8; 8192];
+        Mock::given(method("GET"))
+            .and(path(format!("/{hex}.obao4")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(huge))
+            .mount(&server)
+            .await;
+        let origin = HttpOrigin::parse(&server.uri())?;
+
+        anyhow::ensure!(
+            matches!(
+                origin.fetch_outboard(hash, 1024).await?,
+                OutboardFetch::Unsupported
+            ),
+            "oversize outboard must degrade to Unsupported",
+        );
+        Ok(())
+    }
 
     /// `DEFAULT_USER_AGENT` (#435, now in the `decdn-config-types` leaf
     /// crate per #578) embeds that crate's `CARGO_PKG_VERSION` so origin

@@ -1234,3 +1234,98 @@ async fn size_missing_object_is_none() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+// ----------------------------------------------------------------------------
+// `S3Origin::fetch_outboard` (#1130) — a standalone `GetObject` on the
+// sibling `{key}.obao4`, no accompanying data GET. Mirrors the outboard
+// sub-fetch covered above for `fetch_range`, but as its own trait method.
+// ----------------------------------------------------------------------------
+
+use decdn_cache::OutboardFetch;
+
+#[tokio::test]
+async fn fetch_outboard_returns_sibling_obao4() -> anyhow::Result<()> {
+    let hash = Hash::new(b"s3-outboard-marker");
+    let obao4_key = format!("{}.obao4", expected_key("", hash));
+    let outboard_bytes = vec![0xCDu8; 4096];
+
+    let obao4_match = obao4_key.clone();
+    let body = outboard_bytes.clone();
+    let obao4_rule = mock!(Client::get_object)
+        .match_requests(move |req| req.key() == Some(&obao4_match))
+        .then_output(move || {
+            GetObjectOutput::builder()
+                .body(ByteStream::from(body.clone()))
+                .build()
+        });
+    let client = mock_s3_client_match_any(&[&obao4_rule]);
+    let origin = s3_origin(client, "");
+
+    match origin.fetch_outboard(hash, 1 << 20).await? {
+        OutboardFetch::Found(bytes) => {
+            anyhow::ensure!(
+                bytes.as_ref() == outboard_bytes.as_slice(),
+                "outboard bytes mismatch"
+            );
+        }
+        other => anyhow::bail!("expected Found, got {other:?}"),
+    }
+    anyhow::ensure!(obao4_rule.num_calls() == 1, "exactly one outboard GET");
+    Ok(())
+}
+
+#[tokio::test]
+async fn fetch_outboard_missing_sibling_is_not_found() -> anyhow::Result<()> {
+    let hash = Hash::new(b"s3-outboard-missing-marker");
+    let obao4_key = format!("{}.obao4", expected_key("", hash));
+
+    let obao4_match = obao4_key.clone();
+    let obao4_rule = mock!(Client::get_object)
+        .match_requests(move |req| req.key() == Some(&obao4_match))
+        .then_error(|| GetObjectError::NoSuchKey(NoSuchKey::builder().build()));
+    let client = mock_s3_client_match_any(&[&obao4_rule]);
+    let origin = s3_origin(client, "");
+
+    anyhow::ensure!(
+        matches!(
+            origin.fetch_outboard(hash, 1 << 20).await?,
+            OutboardFetch::NotFound
+        ),
+        "missing sibling must be NotFound",
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn fetch_outboard_oversize_degrades_without_buffering() -> anyhow::Result<()> {
+    // Same OOM guard as the `fetch_range` outboard sub-fetch: the mock omits
+    // Content-Length (matching real chunked responses) so the pre-check can't
+    // short-circuit, exercising the streaming abort in `collect_bounded`.
+    let hash = Hash::new(b"s3-outboard-oversize-marker");
+    let obao4_key = format!("{}.obao4", expected_key("", hash));
+    let huge_outboard = vec![0x5Au8; 8 * 1024 * 1024];
+
+    let obao4_match = obao4_key.clone();
+    let obao4_rule = mock!(Client::get_object)
+        .match_requests(move |req| req.key() == Some(&obao4_match))
+        .then_output(move || {
+            GetObjectOutput::builder()
+                .body(ByteStream::from(huge_outboard.clone()))
+                .build()
+        });
+    let client = mock_s3_client_match_any(&[&obao4_rule]);
+    let origin = s3_origin(client, "");
+
+    anyhow::ensure!(
+        matches!(
+            origin.fetch_outboard(hash, 4 * 1024).await?,
+            OutboardFetch::Unsupported
+        ),
+        "oversize outboard must degrade to Unsupported",
+    );
+    anyhow::ensure!(
+        obao4_rule.num_calls() == 1,
+        "outboard GET issued exactly once"
+    );
+    Ok(())
+}

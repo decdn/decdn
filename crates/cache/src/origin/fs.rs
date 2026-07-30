@@ -20,7 +20,7 @@ use iroh_blobs::Hash;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
 
-use super::{Origin, OriginFetch, OriginKind, OriginRangeFetch, OriginRangeRequest};
+use super::{Origin, OriginFetch, OriginKind, OriginRangeFetch, OriginRangeRequest, OutboardFetch};
 use crate::error::OriginPullError;
 
 /// Sibling-key suffix for the published pre-order bao outboard
@@ -394,6 +394,55 @@ impl Origin for FilesystemOrigin {
                 data: Bytes::from(data),
                 outboard: Bytes::from(outboard),
             })
+        })
+    }
+
+    fn fetch_outboard(
+        &self,
+        hash: Hash,
+        outboard_max_bytes: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<OutboardFetch, OriginPullError>> + Send + '_>> {
+        Box::pin(async move {
+            let obao4_path = self.obao4_path_for(hash);
+            // Check the on-disk length via `metadata()` before reading, same
+            // rationale as `fetch_range`'s outboard sub-fetch: a wildly
+            // oversized `.obao4` is malformed/foreign, and reading it first
+            // would buffer the whole thing into memory only to reject it.
+            match tokio::fs::metadata(&obao4_path).await {
+                Ok(meta) if meta.len() > outboard_max_bytes => {
+                    return Ok(OutboardFetch::Unsupported);
+                }
+                Ok(_) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(OutboardFetch::NotFound);
+                }
+                Err(err) => {
+                    let msg = format!(
+                        "cache.origin.path outboard metadata failed for {}",
+                        obao4_path.display()
+                    );
+                    return Err(classify_io_error(err).map_inner(|e| e.context(msg)));
+                }
+            }
+            let outboard = match tokio::fs::read(&obao4_path).await {
+                Ok(b) => b,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(OutboardFetch::NotFound);
+                }
+                Err(err) => {
+                    let msg = format!(
+                        "cache.origin.path outboard read failed for {}",
+                        obao4_path.display()
+                    );
+                    return Err(classify_io_error(err).map_inner(|e| e.context(msg)));
+                }
+            };
+            // Defense-in-depth: a file that grew between `metadata` and `read`
+            // (TOCTOU) is still rejected on the buffered length.
+            if u64::try_from(outboard.len()).unwrap_or(u64::MAX) > outboard_max_bytes {
+                return Ok(OutboardFetch::Unsupported);
+            }
+            Ok(OutboardFetch::Found(Bytes::from(outboard)))
         })
     }
 
@@ -974,6 +1023,49 @@ mod tests {
                 OriginRangeFetch::Unsupported
             ),
             "missing outboard must degrade",
+        );
+        Ok(())
+    }
+
+    /// A blob with a published sibling `{hex}.obao4` returns the outboard
+    /// bytes verbatim via `fetch_outboard` alone (no data read). This is the
+    /// failing-first TDD test for #1130's stream-while-store seam — written
+    /// before `fetch_outboard` existed on the trait.
+    #[tokio::test]
+    async fn fetch_outboard_returns_sibling_obao4() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let origin = FilesystemOrigin::new(tmp.path()).await?;
+        let canonical = tokio::fs::canonicalize(tmp.path()).await?;
+        let payload = vec![9u8; 64 * 1024];
+        let hash = seed_blob_with_outboard(&canonical, &payload).await?;
+
+        let obao4_path = origin.obao4_path_for(hash);
+        let expected = tokio::fs::read(&obao4_path).await?;
+
+        match origin.fetch_outboard(hash, 1 << 20).await? {
+            OutboardFetch::Found(bytes) => {
+                anyhow::ensure!(
+                    bytes.as_ref() == expected.as_slice(),
+                    "outboard bytes mismatch"
+                );
+            }
+            other => anyhow::bail!("expected Found, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    /// A hash with no sibling `.obao4` returns `NotFound`, not an error.
+    #[tokio::test]
+    async fn fetch_outboard_missing_sibling_is_not_found() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let origin = FilesystemOrigin::new(tmp.path()).await?;
+        let hash = Hash::new(b"no-outboard-marker");
+        anyhow::ensure!(
+            matches!(
+                origin.fetch_outboard(hash, 1 << 20).await?,
+                OutboardFetch::NotFound
+            ),
+            "missing sibling must be NotFound",
         );
         Ok(())
     }
