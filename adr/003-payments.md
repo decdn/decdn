@@ -27,7 +27,7 @@ A channel is opened by depositing the payment token into the `PaymentChannel` co
 Key parameters:
 
 - Voucher cadence: 1 MB delivered per voucher (default; negotiable up to the 1024 MB wire ceiling for large transfers — see [Voucher Interval Negotiation](#voucher-interval-negotiation))
-- Minimum deposit: 1 USDC (contract floor, governable); recommended practical minimum: 10 USDC (see [Deposit Economics](#deposit-economics))
+- Minimum deposit: 1 USDC (contract floor, governable). The buyer path opens a channel small and graduates it: a channel opens at a small **initial** deposit (default 0.5 USDC), then tops up toward a larger **working** deposit (default 10 USDC) once the counterparty has served verified bytes (see [Deposit Economics](#deposit-economics))
 - Fee routing: the operator payment-token balance is forwarded to `FeeRouter.routeSettlement(operator, bytesDelivered, amount)` — at final settlement, and incrementally on each `withdraw` — and the three-bucket split (60% operator base, 30% buyback, 10% treasury) is dispatched same-tx per [ADR 026](026-tokenomics.md#adr-026-tokenomics). The per-call deltas partition the channel's lifetime claim, so each byte and USDC unit is split exactly once. See [FeeRouter Integration](#feerouter-integration).
 - Operator return is differentiated through the `CapacityBond` lock-to-capacity curve per [ADR 026](026-tokenomics.md#adr-026-tokenomics), not via a fee-discount mechanic on the channel contract.
 
@@ -35,15 +35,18 @@ Key parameters:
 
 Opening, closing, and settling a channel requires three on-chain transactions totalling ~$0.23 at the production L2's typical gas prices (`openChannel` ~$0.05, `closeChannel` ~$0.10, `settleChannel` ~$0.08). This estimate assumes an existing ERC-20 approval; first-time users incur an additional one-time `approve` transaction (~$0.03), bringing the true first-channel cost to ~$0.26. `openChannel` writes the pinned `voucherSigner` into a storage slot of its own (the packed header has no room left), and `closeChannelWithoutVoucher` substitutes for `closeChannel` at marginally lower cost since it verifies no signature; on an L2 whose per-transaction cost is dominated by data posting, neither shifts the figures above at this rounding. The table below uses the $0.23 lifecycle cost (excluding the one-time approval) as a percentage of various deposit sizes:
 
-| Deposit | Lifecycle gas ($0.23) | Gas % of deposit |
-|---------|----------------------|------------------|
-| 1 USDC  | $0.23                | 23%              |
-| 5 USDC  | $0.23                | 4.6%             |
-| 10 USDC | $0.23                | 2.3%             |
-| 25 USDC | $0.23                | 0.92%            |
-| 100 USDC| $0.23                | 0.23%            |
+| Deposit  | Lifecycle gas ($0.23) | Gas % of deposit |
+|----------|----------------------|------------------|
+| 0.5 USDC | $0.23                | 46%              |
+| 1 USDC   | $0.23                | 23%              |
+| 5 USDC   | $0.23                | 4.6%             |
+| 10 USDC  | $0.23                | 2.3%             |
+| 25 USDC  | $0.23                | 0.92%            |
+| 100 USDC | $0.23                | 0.23%            |
 
-**Recommended practical minimum: 10 USDC.** Client software should default to a 10 USDC minimum deposit (user-overridable). At 10 USDC, gas overhead is 2.3% — acceptable for a channel covering ~10,000,000 MB at the floor rate or ~1,000,000 MB (~1,000 GB) at the expected market rate ($0.01/GB), sufficient for weeks to months of casual use without top-up. The contract minimum (1 USDC, governable via `setMinDeposit`) remains a safety floor preventing dust channels that cost more to settle than they contain; it is deliberately not raised, since doing so would cut governance flexibility and create a hard barrier for development/testing scenarios where small deposits are useful.
+**Two-tier deposit: small initial, larger working target.** A freshly opened channel escrows a small **initial** deposit — a first-contact lock, so an unproven counterparty holds little of the buyer's capital before it has served verified bytes. Client software defaults the initial deposit to 0.5 USDC (user-overridable, clamped up to the contract's `minDeposit` floor at open time). At that size gas overhead is the largest share in the table above (46%), but so is the amount actually at risk on a channel with no track record yet.
+
+Once a channel has proven itself — the counterparty has served verified bytes — the buyer path tops it up via `topUp` toward a larger **working** deposit, defaulting to 10 USDC (also user-overridable; `0` disables top-up). `topUp` spends only its own transaction rather than a fresh open/close/settle cycle, so graduating an already-open channel is cheaper than opening a second one at the working size. At 10 USDC, gas overhead on the eventual settle is 2.3% — acceptable for a channel covering ~10,000,000 MB at the floor rate or ~1,000,000 MB (~1,000 GB) at the expected market rate ($0.01/GB), sufficient for weeks to months of casual use without further top-up. The contract minimum (1 USDC, governable via `setMinDeposit`) remains a safety floor preventing dust channels that cost more to settle than they contain; it is deliberately not raised, since doing so would cut governance flexibility and create a hard barrier for development/testing scenarios where small deposits are useful.
 
 #### Amortization
 
@@ -84,7 +87,7 @@ At the default 1 MB cadence, a 10 GB blob requires 10,000 vouchers — each invo
 | 100 MB | $0.0001 | $0.001 | $0.10 |
 | 1024 MB (max) | $0.001024 | $0.01024 | $1.024 |
 
-Even the worst case (1024 MB at ceiling rate) exposes $1.024 — well below the recommended 10 USDC minimum deposit.
+Even the worst case (1024 MB at ceiling rate) exposes $1.024 — well below the 10 USDC working-deposit default.
 
 Voucher interval negotiation is complemented by per-node `max_blob_size` limits ([ADR 005](005-protocol.md#error-handling-and-retry-semantics)): while interval negotiation reduces per-voucher overhead for large blobs, `max_blob_size` allows nodes to refuse blobs that would create unacceptable resource pressure (cache exhaustion, extended origin pulls) regardless of voucher cadence.
 
@@ -208,7 +211,7 @@ Surfacing these reasons off-chain saves both parties the gas of a doomed on-chai
 - On-chain costs are amortized across an entire channel lifetime — open + close + settle = three transactions regardless of how many MB are delivered (settle can be called by any address, allowing third-party settlement bots)
 - USDC denomination gives node operators predictable unit economics: delivery revenue covers infrastructure costs without exposure to TOKEN price movements
 - The voucher is the payment receipt; the BLAKE3 hash is the delivery receipt. Together they provide mutual protection: the client doesn't sign a voucher for bytes that fail hash verification; the node stops delivering if vouchers stop arriving
-- Maximum risk per voucher interval at default cadence (1 MB) is $0.00001 at market rate — negligible. At the wire ceiling (1024 MB) and ceiling rate ($0.001/MB), worst-case risk is $1.024 per interval — still small relative to the recommended 10 USDC minimum deposit (see [Voucher Interval Negotiation](#voucher-interval-negotiation))
+- Maximum risk per voucher interval at default cadence (1 MB) is $0.00001 at market rate — negligible. At the wire ceiling (1024 MB) and ceiling rate ($0.001/MB), worst-case risk is $1.024 per interval — still small relative to the 10 USDC working-deposit default (see [Voucher Interval Negotiation](#voucher-interval-negotiation))
 - Market-driven rate setting means replication happens organically: profitable content gets cached by more nodes, driving prices down without any coordination protocol
 - The `PaymentChannel` contract is functionally separated from the `CapacityBond`, keeping the audit surface for each contract's core logic bounded
 
@@ -238,7 +241,7 @@ Client opens many channels with minimum deposit and never streams, forcing nodes
 
 The symmetric attack surface — a funder that signed vouchers off-chain and then closes without presenting them, hoping to repudiate them — is covered by the 48h dispute window plus permissionless `disputeChannel`. A voucher-less close settles at most at the recorded watermark and never below it, so it claws back nothing already recorded on-chain; the only thing it can do is omit vouchers the provider holds off-chain. The provider — or any third party holding one — reasserts the highest of them via `disputeChannel` for the whole window, ratcheting the watermark up to the true amount before `settleChannel` can run. This is the same mechanism that answers the analogous [stale close](#stale-close) attack, and it answers it to the same degree: the window exists precisely so an under-stated close can be corrected by whoever holds the better voucher.
 
-The griefing attacker's financial cost stays bounded: at the recommended 10 USDC minimum, $1,000 opens 100 channels; the counterparty (or the attacker, to recover the deposit) closes them all and each settles after the dispute window with full client refund (no profit motive) and ~$0.18 gas per close+settle pair. Total gas exposure for 100 channels is ~$18 — enough to warrant additional mitigations for high-volume attacks:
+The griefing attacker's financial cost stays bounded: a griefed channel never streams, so it never graduates past the small initial deposit — at the 0.5 USDC initial-deposit default, $1,000 opens 2,000 channels; the counterparty (or the attacker, to recover the deposit) closes them all and each settles after the dispute window with full client refund (no profit motive) and ~$0.18 gas per close+settle pair. Total gas exposure for 2,000 channels is ~$360 — enough to warrant additional mitigations for high-volume attacks:
 
 - **Option A — On-chain channel cap per address.** The `PaymentChannel` contract enforces a maximum number of open channels per client Ethereum address (e.g., 10). Hard to circumvent without new wallet addresses, each requiring on-chain funding.
 - **Option B — Node-side filtering.** Nodes refuse `StreamRequest` from channels that have been open longer than N days with zero vouchers. Off-chain, no contract change needed, but relies on node operator implementation.
