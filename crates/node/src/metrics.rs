@@ -812,9 +812,13 @@ pub struct DecdnMetrics {
     pub node_pull_channel_open_failures: Counter,
     /// `decdn_channel_open_failures_insufficient_deposit_total` (#966): a buyer
     /// `openChannel` tx reverted because the node's USDC balance/allowance could
-    /// not cover the deposit, or the deposit was below the on-chain `minDeposit`
-    /// floor. A *misconfiguration* signal — the fix is operator-side (fund the
-    /// wallet, raise the configured deposit), not infrastructure. A plain counter
+    /// not cover the deposit, or the deposit was zero — either as requested, or
+    /// as the balance delta actually received under a fee-on-transfer token.
+    /// Both zero cases revert the same argument-less `ZeroAmount`, so this
+    /// counter cannot separate them; the wallet balance is what distinguishes a
+    /// misconfigured deposit from a token that shaved it. A *misconfiguration*
+    /// signal either way — the fix is operator-side (fund the wallet, raise the
+    /// configured deposit), not infrastructure. A plain counter
     /// field carries no label dimension (a labeled series would need a `Family`),
     /// so the issue's `{reason=…}` split is realized as
     /// three sibling counters (mirroring `dht_rate_limit_rejected_*`); the
@@ -1193,13 +1197,19 @@ pub struct DecdnMetrics {
     /// not authorize the named channel (#327). Visible name:
     /// `decdn_serve_stream_rejected_owner_mismatch_total`.
     pub serve_stream_rejected_owner_mismatch: Counter,
-    /// `serve_stream` cache-miss requests refused before any upstream pull
-    /// because the requesting channel's remaining deposit could not cover the
-    /// worst-case blob cost at the node's rate (#856 pre-flight deposit guard).
-    /// Wire-indistinguishable from `cache_miss` (signed as `NotFound`), so this
-    /// server-side counter is the only place the distinction lives — a rising
-    /// value isolates near-empty-deposit pull-through abuse. Visible name:
-    /// `decdn_serve_stream_rejected_insufficient_deposit_total`.
+    /// `serve_stream` requests refused before any bytes are served because the
+    /// requesting channel's remaining deposit could not cover what the node
+    /// would front at its rate. (The refusal itself is signed — as an `ok: false`
+    /// response; what is never signed is an `ok: true`.) Two guards bump this.
+    /// The cache-miss one (#856) reserves the whole-blob cost when
+    /// `max_blob_size_bytes` is finite and the speculative window cost otherwise,
+    /// and runs before the *window* pull-through spend — but NOT before the
+    /// buffered/range/local fill tiers, which spend first and reach the
+    /// direct-serve guard afterwards. The direct-serve one (#1516) reserves
+    /// `min(credit window, chunk-group-aligned request span)`. Wire-indistinguishable from `cache_miss`
+    /// (signed as `NotFound`), so this server-side counter is the only place the
+    /// distinction lives — a rising value isolates near-empty-deposit abuse.
+    /// Visible name: `decdn_serve_stream_rejected_insufficient_deposit_total`.
     pub serve_stream_rejected_insufficient_deposit: Counter,
     /// `serve_stream` cache-miss requests refused before any upstream pull
     /// because the operator's `pull_through_require_authorized_origin` gate is on

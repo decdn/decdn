@@ -96,6 +96,26 @@ impl ClientHandler {
         req: &StreamRequest,
         reason: ServeRejectReason,
     ) -> anyhow::Result<()> {
+        self.respond_error_at_rate(send, req, reason, self.clamped_rate())
+            .await
+    }
+
+    /// [`Self::respond_error`] for a caller that has ALREADY called
+    /// [`Self::clamped_rate`] for this request.
+    ///
+    /// `clamped_rate` is side-effecting — it bumps `rate_bounds_clamped` and logs
+    /// a warning when the configured rate sits below the on-chain delivery floor —
+    /// so a path that computes the rate and then refuses must not let
+    /// `respond_error` compute it a second time, or a single request
+    /// double-counts the metric and double-logs. Refusal paths that never needed
+    /// the rate keep using [`Self::respond_error`].
+    pub(super) async fn respond_error_at_rate(
+        &self,
+        send: &mut SendStream,
+        req: &StreamRequest,
+        reason: ServeRejectReason,
+        rate_per_mb: u64,
+    ) -> anyhow::Result<()> {
         match reason {
             ServeRejectReason::EvictedSinceProbe => {
                 self.metrics.serve_stream_rejected_evicted_since_probe();
@@ -127,7 +147,6 @@ impl ClientHandler {
             ServeRejectReason::OriginDenied => self.metrics.serve_stream_rejected_origin_denied(),
         }
         let error = reason.wire_error();
-        let rate_per_mb = self.clamped_rate();
         let body = StreamResponseBody {
             hash: req.hash,
             ok: false,

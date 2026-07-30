@@ -69,7 +69,6 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, SunsettingPausable, E
     uint256 internal constant DISPUTE_WINDOW_CEILING = 72 hours;
     uint256 internal constant MAX_CHANNEL_DURATION_FLOOR = 7 days;
     uint256 internal constant MAX_CHANNEL_DURATION_CEILING = 365 days;
-    uint256 internal constant MIN_DEPOSIT_FLOOR = 1;
 
     /// @dev Mirrors `decdn_protocol::MAX_RATE_PER_MB` (ADR 005 §Wire protocol),
     ///      the largest `rate_per_mb` the wire schema will decode. A floor above
@@ -84,15 +83,17 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, SunsettingPausable, E
     ///      (`crates/node/src/rate_bounds.rs`) for deployments predating this.
     uint256 internal constant MAX_RATE_PER_MB = 1_000_000_000_000;
 
+    /// @dev Lower bound of the governable per-MB delivery-rate floor, and the
+    ///      pair to `MAX_RATE_PER_MB`. A zero floor would let a node advertise a
+    ///      zero rate to attract traffic while generating no protocol fees
+    ///      (ADR 009 § Rate floor); it is also what keeps `deliveryFloor` a
+    ///      non-zero divisor in `_advanceClaimWatermark`.
+    uint256 internal constant MIN_RATE_FLOOR = 1;
+
     /// @dev 1 MB in bytes (binary MB, ADR 005 / `rate::BYTES_PER_MB`). Used to
     ///      convert the MB-denominated `deliveryFloor` into the per-byte price
     ///      floor enforced at settlement (`_advanceClaimWatermark`).
     uint256 internal constant BYTES_PER_MB = 1_048_576;
-
-    /// @dev Deployment default for the governable param ADR 016 § Contract Inventory does
-    ///      not pass as a constructor arg. `minDeposit` = 1 USDC (6 decimals) —
-    ///      the dust floor of ADR 003 § Deposit Economics.
-    uint256 internal constant DEFAULT_MIN_DEPOSIT = 1_000_000;
 
     // -----------------------------------------------------------------
     // EIP-712 voucher typing (ADR 003 § EIP-712 Voucher Signature)
@@ -136,9 +137,6 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, SunsettingPausable, E
 
     /// @notice Channel lifetime in seconds (default 90d; bounded [7d, 365d]).
     uint256 public maxChannelDuration;
-
-    /// @notice Minimum opening deposit in USDC base units (default 1 USDC).
-    uint256 public minDeposit;
 
     /// @dev Per-MB delivery-rate floor in USDC base units, exposed via
     ///      `getRateBounds`. ENFORCED at settlement (`_advanceClaimWatermark`
@@ -277,7 +275,6 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, SunsettingPausable, E
         bytes32 indexed channelId, address indexed provider, uint256 settleAmount, uint256 settleBytes
     );
     event FeeRouterUpdated(address indexed oldRouter, address indexed newRouter);
-    event MinDepositUpdated(uint256 oldValue, uint256 newValue);
     event DisputeWindowUpdated(uint256 oldValue, uint256 newValue);
     event RateBoundsUpdated(uint256 newDeliveryFloor);
 
@@ -287,7 +284,6 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, SunsettingPausable, E
 
     error ZeroAddress();
     error FeeRouterHasNoCode(address feeRouter);
-    error DepositBelowMinimum(uint256 deposit, uint256 minDeposit);
     error ProviderNotActive(address provider);
     error NotChannelParty();
     error ChannelNotOpen();
@@ -348,7 +344,7 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, SunsettingPausable, E
         if (maxChannelDuration_ < MAX_CHANNEL_DURATION_FLOOR || maxChannelDuration_ > MAX_CHANNEL_DURATION_CEILING) {
             revert ParamOutOfBounds(maxChannelDuration_, MAX_CHANNEL_DURATION_FLOOR, MAX_CHANNEL_DURATION_CEILING);
         }
-        if (deliveryFloor_ < MIN_DEPOSIT_FLOOR || deliveryFloor_ > MAX_RATE_PER_MB) {
+        if (deliveryFloor_ < MIN_RATE_FLOOR || deliveryFloor_ > MAX_RATE_PER_MB) {
             revert RateBoundsInvalid(deliveryFloor_);
         }
 
@@ -358,7 +354,6 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, SunsettingPausable, E
         disputeWindow = disputeWindow_;
         maxChannelDuration = maxChannelDuration_;
         deliveryFloor = deliveryFloor_;
-        minDeposit = DEFAULT_MIN_DEPOSIT;
 
         _grantRole(DEFAULT_ADMIN_ROLE, admin);
         _grantRole(GOVERNANCE_ROLE, admin);
@@ -387,7 +382,7 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, SunsettingPausable, E
         returns (bytes32 channelId)
     {
         if (provider == address(0)) revert ZeroAddress();
-        if (deposit < minDeposit) revert DepositBelowMinimum(deposit, minDeposit);
+        if (deposit == 0) revert ZeroAmount();
         // aderyn-ignore-next-line(reentrancy-state-change)
         if (!capacityBond.isActive(provider)) revert ProviderNotActive(provider);
 
@@ -416,7 +411,14 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, SunsettingPausable, E
         usdc.safeTransferFrom(msg.sender, address(this), deposit);
         // aderyn-ignore-next-line(reentrancy-state-change)
         uint256 received = usdc.balanceOf(address(this)) - balanceBefore;
-        if (received < minDeposit) revert DepositBelowMinimum(received, minDeposit);
+        // `received` is a derived balance delta; the `== 0` is a presence check
+        // (a fee-on-transfer proxy that shaved the deposit to nothing), not a
+        // dangerous balance equality. A zero-deposit channel is un-serviceable —
+        // every voucher that pays for bytes hits `AmountExceedsDeposit` (the
+        // zero-voucher close still passes) — while still occupying a
+        // `_providerChannels` slot and a client nonce.
+        // slither-disable-next-line incorrect-equality
+        if (received == 0) revert ZeroAmount();
         ch.deposit = received;
 
         emit ChannelOpened(channelId, msg.sender, provider, received, ch.expiresAt, ch.voucherSigner);
@@ -886,15 +888,6 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, SunsettingPausable, E
         emit FeeRouterUpdated(old, newRouter);
     }
 
-    function setMinDeposit(uint256 newMinDeposit) external onlyRole(GOVERNANCE_ROLE) {
-        if (newMinDeposit < MIN_DEPOSIT_FLOOR) {
-            revert ParamOutOfBounds(newMinDeposit, MIN_DEPOSIT_FLOOR, type(uint256).max);
-        }
-        uint256 old = minDeposit;
-        minDeposit = newMinDeposit;
-        emit MinDepositUpdated(old, newMinDeposit);
-    }
-
     function setDisputeWindow(uint256 newWindow) external onlyRole(GOVERNANCE_ROLE) {
         if (newWindow < DISPUTE_WINDOW_FLOOR || newWindow > DISPUTE_WINDOW_CEILING) {
             revert ParamOutOfBounds(newWindow, DISPUTE_WINDOW_FLOOR, DISPUTE_WINDOW_CEILING);
@@ -908,7 +901,7 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, SunsettingPausable, E
         // Cap at MAX_RATE_PER_MB, not `type(uint64).max`: the daemon decodes the
         // floor as `u64` (#1383), but `u64` is ~18M× the wire cap, and every
         // value in that gap is quietly network-isolating (see the constant).
-        if (newFloor < MIN_DEPOSIT_FLOOR || newFloor > MAX_RATE_PER_MB) {
+        if (newFloor < MIN_RATE_FLOOR || newFloor > MAX_RATE_PER_MB) {
             revert RateBoundsInvalid(newFloor);
         }
         deliveryFloor = newFloor;
@@ -987,7 +980,7 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, SunsettingPausable, E
         // * deliveryFloor`. Evaluated as a bytes ceiling via `Math.mulDiv` so a
         // malicious `bytesDelivered` near `type(uint256).max` reverts with a
         // clean `RateFloorViolation` rather than an arithmetic panic.
-        // `deliveryFloor >= MIN_DEPOSIT_FLOOR (1)` makes the divisor non-zero;
+        // `deliveryFloor >= MIN_RATE_FLOOR (1)` makes the divisor non-zero;
         // `amount == 0` yields `maxBytes == 0`, so the zero-voucher close
         // (`amount == 0 && bytesDelivered == 0`) still passes.
         uint256 maxBytes = Math.mulDiv(amount, BYTES_PER_MB, deliveryFloor);

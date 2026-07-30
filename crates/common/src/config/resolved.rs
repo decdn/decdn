@@ -141,8 +141,7 @@ pub struct ResolvedBlockchain {
     pub redeem_threshold_micro_usdc: u64,
     /// Deposit (base units, `µUSDC`) used when the buyer path opens a new
     /// `PaymentChannel` against an upstream provider on a cache miss (#744).
-    /// Defaults to 10 USDC (`10_000_000` `µUSDC`); clamped up to the on-chain
-    /// `minDeposit` floor at open time.
+    /// Defaults to 10 USDC (`10_000_000` `µUSDC`), escrowed as configured.
     pub buyer_deposit_micro_usdc: u64,
     /// Whether the buyer path issues a one-time max USDC approval for the
     /// `PaymentChannel` contract at startup (#744, ADR 003 § Deposit

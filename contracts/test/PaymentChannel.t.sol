@@ -348,12 +348,21 @@ contract PaymentChannelTest is Test {
         channel.openChannel(provider, DEPOSIT, address(0));
     }
 
-    function test_openChannel_revertsBelowMinDeposit() public {
+    function test_openChannel_revertsOnZeroDeposit() public {
         vm.prank(client);
-        vm.expectRevert(
-            abi.encodeWithSelector(PaymentChannel.DepositBelowMinimum.selector, uint256(1), uint256(1_000_000))
-        );
-        channel.openChannel(provider, 1, address(0));
+        vm.expectRevert(PaymentChannel.ZeroAmount.selector);
+        channel.openChannel(provider, 0, address(0));
+    }
+
+    /// @dev The behavioural change of removing the `minDeposit` floor: any
+    ///      non-zero deposit opens. Service is bounded by what the deposit funds
+    ///      (the seller-side per-voucher ceiling), and channel spam is bounded by
+    ///      gas — neither needs a network minimum. Asserted on the credited
+    ///      `deposit` so a reintroduced floor cannot pass by reverting elsewhere.
+    function test_openChannel_acceptsOneBaseUnitDeposit() public {
+        vm.prank(client);
+        bytes32 id = channel.openChannel(provider, 1, address(0));
+        assertEq(channel.getChannel(id).deposit, 1, "a one-base-unit deposit must open");
     }
 
     // ADR 009 § Emergency Multisig — the protocol-wide pause sunsets hard at
@@ -819,6 +828,17 @@ contract PaymentChannelTest is Test {
         assertFalse(ok, "on-chain max voucher interval setter must be absent");
     }
 
+    function test_minDeposit_getterRemoved() public view {
+        (bool ok,) = address(channel).staticcall(abi.encodeWithSignature("minDeposit()"));
+        assertFalse(ok, "on-chain minimum-deposit state must be absent");
+    }
+
+    function test_setMinDeposit_governanceEntryPointRemoved() public {
+        vm.prank(admin);
+        (bool ok,) = address(channel).call(abi.encodeWithSignature("setMinDeposit(uint256)", 5));
+        assertFalse(ok, "on-chain minimum-deposit setter must be absent");
+    }
+
     function test_setFeeRouter_updatesTarget() public {
         MockSettlementRouter router2 = new MockSettlementRouter(usdc);
         vm.prank(admin);
@@ -882,12 +902,26 @@ contract PaymentChannelTest is Test {
         assertEq(channel.disputeWindow(), 60 hours);
     }
 
+    /// @dev Covers EVERY `GOVERNANCE_ROLE` setter, not a single representative:
+    ///      this is the contract's only `AccessControlUnauthorizedAccount` probe,
+    ///      so a one-setter version silently loses all authorization coverage the
+    ///      day that setter is removed. Each argument is in bounds, so the revert
+    ///      can only be the access-control check.
     function test_setters_onlyGovernance() public {
+        bytes memory unauthorized =
+            abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, stranger, GOVERNANCE_ROLE);
+
         vm.prank(stranger);
-        vm.expectRevert(
-            abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, stranger, GOVERNANCE_ROLE)
-        );
-        channel.setMinDeposit(5);
+        vm.expectRevert(unauthorized);
+        channel.setFeeRouter(address(router));
+
+        vm.prank(stranger);
+        vm.expectRevert(unauthorized);
+        channel.setDisputeWindow(60 hours);
+
+        vm.prank(stranger);
+        vm.expectRevert(unauthorized);
+        channel.setRateBounds(2);
     }
 
     function test_getRateBounds_returnsConfigured() public view {
@@ -1065,7 +1099,7 @@ contract PaymentChannelTest is Test {
         channel.closeChannel(idNew, 1, 1, BYTES_PER_MB, sig);
     }
 
-    /// @dev The `setRateBounds` guard `newFloor < MIN_DEPOSIT_FLOOR` fires. The
+    /// @dev The `setRateBounds` guard `newFloor < MIN_RATE_FLOOR` fires. The
     ///      floor is 1, so 0 is the only sub-floor value. Pranked as `admin`
     ///      (the `GOVERNANCE_ROLE` holder) so the revert is the bounds guard and
     ///      not the access-control check.

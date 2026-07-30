@@ -3,10 +3,11 @@
 
 use super::{
     APP_ERR_MALFORMED_MESSAGE, APP_ERR_NO_ERROR, APP_ERR_RATE_LIMITED, APP_IDLE_TIMEOUT, Address,
-    Arc, B256, ChannelId, ClientHandler, ClientMessage, Connection, FillOutcome, FirstMessage,
-    Hash, Mutex, OwnedSemaphorePermit, REJECTION_CLOSE_TIMEOUT, RecvStream, RejectReason,
-    Semaphore, SendStream, ServeRejectReason, StreamReadError, StreamResponseBody, TeeOpen, U256,
-    VarInt, pull_origin_gate_blocks, read_first_message, reset_stream, verify_binding,
+    Arc, B256, CHUNK_GROUP_BYTES, ChannelId, ClientHandler, ClientMessage, Connection, FillOutcome,
+    FirstMessage, Hash, MB_BYTES, Mutex, OwnedSemaphorePermit, REJECTION_CLOSE_TIMEOUT, RecvStream,
+    RejectReason, Semaphore, SendStream, ServeRejectReason, StreamReadError, StreamResponseBody,
+    TeeOpen, U256, VarInt, min_payment, pull_origin_gate_blocks, read_first_message, reset_stream,
+    verify_binding,
 };
 use futures_util::StreamExt as _;
 
@@ -570,8 +571,83 @@ impl ClientHandler {
             None => self.voucher_interval_mb,
         };
 
-        // Build and sign the success response.
         let rate_per_mb = self.clamped_rate();
+
+        // Pre-flight deposit gate — the direct-serve twin of the pull-through
+        // guard in `window.rs` (keep the two in step). Without it the node signs
+        // `ok: true` and streams a full credit window before `stage_voucher`'s
+        // `AmountExceedsDeposit` can fire at the first voucher boundary, so a
+        // channel that cannot cover even that first window gets it free on every
+        // request (#1516).
+        //
+        // The quantity is remaining HEADROOM, not the gross deposit: both the
+        // off-chain check (`ChannelState::stage_voucher`) and the on-chain one
+        // (`PaymentChannel._advanceClaimWatermark`) compare the *cumulative*
+        // voucher amount against the deposit, so a long-lived channel with most
+        // of its deposit already claimed has only `deposit - last_amount` left.
+        //
+        // The ceiling is the CREDIT WINDOW, not one interval: `deliver` streams
+        // while `delivered - paid < credit_window(interval_bytes)`, so with
+        // `credit_window_bytes` configured (#1477) the node fronts a whole window
+        // before it collects anything. Gating on one interval would let enabling
+        // a credit window silently re-open the hole.
+        //
+        // ... but capped by the request's own span, or a legitimately funded
+        // sub-interval fetch (a small blob, or a bounded range) would be refused
+        // for not covering a window it will never use.
+        //
+        // The span is the CHUNK-GROUP-ALIGNED one, not the requested one, because
+        // that is what gets billed: `export_bao_range_stream` snaps the range out
+        // to the enclosing 16 KiB group boundaries (a bao proof anchors whole
+        // groups) and `deliver` does NOT trim back — the receiver discards the
+        // leading bytes itself. Pricing the *requested* span would under-reserve
+        // by up to two groups (~32 KiB, ~3% of a default 1 MiB window), which for
+        // a two-byte range request is four orders of magnitude. That is not the
+        // by-design looseness below; it is the wrong quantity.
+        //
+        // What remains loose is only bao's proof interleave: `guard_bytes` counts
+        // CONTENT bytes while billing counts WIRE bytes. State the residual as an
+        // ABSOLUTE bound, because the fraction is misleading — the boundary proof
+        // is `64 * log2(blob_groups / range_groups)`, so it amortizes to ~0.4% of
+        // a whole blob or a window-sized range but reaches ~8% of a *single*
+        // 16 KiB group of a multi-gigabyte blob. Either way it is at most ~1.3 KiB
+        // per request, against the 1 MiB (or wider) window that used to ship free.
+        // Deliberate, and in the safe direction — the gate can only ever *serve* a
+        // request it should have refused, never refuse one that could pay — and
+        // the mid-stream ceiling remains the exact authority.
+        //
+        // A zero-length blob yields a zero ceiling and passes (#1054).
+        //
+        // The bounds check above rejected `byte_offset >= total_bytes`, so the
+        // span arithmetic never clamps to zero. That is the load-bearing property,
+        // not underflow: a clamped span of 0 would zero the ceiling and wave every
+        // request through.
+        //
+        // This is a per-request floor, NOT a reservation: two concurrent streams
+        // on one channel can each pass and jointly exceed the headroom. The
+        // mid-stream ceiling bounds each STREAM to one window of unbilled egress,
+        // but nothing caps the aggregate at the deposit — what bounds N is the
+        // per-connection stream cap. Same in `window.rs`.
+        let interval_bytes = interval_mb.saturating_mul(MB_BYTES).max(1);
+        let guard_bytes = aligned_span(req.byte_offset, req.byte_len, total_bytes)
+            .min(self.credit_window(interval_bytes));
+        let ceiling = min_payment(guard_bytes, rate_per_mb);
+        let (deposit, last_amount) = {
+            let guard = channel.lock().await;
+            (guard.state.deposit, guard.state.last_amount())
+        };
+        if deposit.saturating_sub(last_amount) < ceiling {
+            return self
+                .respond_error_at_rate(
+                    &mut send,
+                    &req,
+                    ServeRejectReason::InsufficientDeposit,
+                    rate_per_mb,
+                )
+                .await;
+        }
+
+        // Build and sign the success response.
         let body = StreamResponseBody {
             hash: req.hash,
             ok: true,
@@ -600,5 +676,88 @@ impl ClientHandler {
             interval_mb,
         )
         .await
+    }
+}
+
+/// Content bytes a `(byte_offset, byte_len)` request will actually be BILLED for,
+/// i.e. the chunk-group-aligned superset `export_bao_range_stream` serves.
+///
+/// Mirrors `decdn_bao_range::align_range`: the start floors to its group
+/// boundary, the end ceils to one and clamps to the blob. The serve path does not
+/// trim back to `byte_offset` (trimming would break bao verification — the
+/// receiver discards the leading bytes itself), so the payer covers the whole
+/// aligned range. A pre-flight price computed on the *requested* span would
+/// under-reserve by up to two groups.
+///
+/// `byte_len == 0` means "to the end of the blob" (whole blob when `byte_offset`
+/// is also 0). Total-saturating throughout: the caller's range bounds check has
+/// already rejected an out-of-bounds request, and a zero-length blob correctly
+/// yields 0.
+fn aligned_span(byte_offset: u64, byte_len: u64, total_bytes: u64) -> u64 {
+    let end = if byte_len > 0 {
+        byte_offset.saturating_add(byte_len).min(total_bytes)
+    } else {
+        total_bytes
+    };
+    let start = (byte_offset / CHUNK_GROUP_BYTES).saturating_mul(CHUNK_GROUP_BYTES);
+    let aligned_end = end
+        .div_ceil(CHUNK_GROUP_BYTES)
+        .saturating_mul(CHUNK_GROUP_BYTES)
+        .min(total_bytes);
+    aligned_end.saturating_sub(start)
+}
+
+#[cfg(test)]
+mod aligned_span_tests {
+    use super::{CHUNK_GROUP_BYTES, aligned_span};
+
+    const G: u64 = CHUNK_GROUP_BYTES;
+
+    #[test]
+    fn whole_blob_is_the_blob() {
+        assert_eq!(aligned_span(0, 0, 5 * G), 5 * G);
+        // A partial final group is clamped to the blob, not rounded past it.
+        assert_eq!(aligned_span(0, 0, 5 * G + 1), 5 * G + 1);
+    }
+
+    #[test]
+    fn zero_length_blob_prices_nothing() {
+        // #1054: must yield a zero ceiling so an empty blob still serves.
+        assert_eq!(aligned_span(0, 0, 0), 0);
+    }
+
+    #[test]
+    fn a_tiny_range_is_priced_as_the_group_it_touches() {
+        // The regression this helper exists for: pricing `byte_len` directly
+        // would reserve 2 bytes for a request that bills a full 16 KiB group.
+        assert_eq!(aligned_span(0, 2, 10 * G), G);
+        assert_eq!(aligned_span(1, 1, 10 * G), G);
+    }
+
+    #[test]
+    fn a_range_straddling_a_boundary_pays_both_groups() {
+        // Worst case: one byte either side of a boundary spans two whole groups.
+        assert_eq!(aligned_span(G - 1, 2, 10 * G), 2 * G);
+    }
+
+    #[test]
+    fn an_already_aligned_range_gains_nothing() {
+        assert_eq!(aligned_span(G, G, 10 * G), G);
+        assert_eq!(aligned_span(2 * G, 3 * G, 10 * G), 3 * G);
+    }
+
+    #[test]
+    fn a_whole_tail_runs_from_its_group_start_to_the_blob_end() {
+        // `byte_len == 0` with a non-zero offset is the resume shape.
+        assert_eq!(aligned_span(3 * G, 0, 10 * G), 7 * G);
+        // Mid-group offset floors back to the group start.
+        assert_eq!(aligned_span(3 * G + 5, 0, 10 * G), 7 * G);
+    }
+
+    #[test]
+    fn a_range_past_the_blob_end_clamps_to_the_blob() {
+        // The caller's bounds check rejects these, but the helper must not
+        // over-price if it is ever reached with a partial final group.
+        assert_eq!(aligned_span(0, u64::MAX, 3 * G + 7), 3 * G + 7);
     }
 }

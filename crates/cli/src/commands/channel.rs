@@ -541,8 +541,8 @@ fn resolve_voucher_signer(voucher_signer: Option<&str>) -> anyhow::Result<Addres
 /// publisher-pays case, where the caller (funder) escrows the deposit but a
 /// wallet-less delegate signs vouchers for delivery. Mirrors the auto-open
 /// path in `decdn fetch` ([`crate::commands::fetch::open_or_reuse`]): read
-/// `usdc()`/`minDeposit()` off the contract, clamp the deposit up to the
-/// on-chain floor, ensure the allowance, then submit `openChannel`.
+/// `usdc()` off the contract, ensure the allowance, then submit
+/// `openChannel`.
 async fn open(args: &cli::ChannelOpenArgs, config_path: Option<&Path>) -> anyhow::Result<()> {
     let file = load_file_config(config_path)?;
     let chain = resolve_chain(&args.chain, &file)?;
@@ -561,12 +561,7 @@ async fn open(args: &cli::ChannelOpenArgs, config_path: Option<&Path>) -> anyhow
         .call()
         .await
         .map_err(|e| anyhow::anyhow!("read PaymentChannel.usdc(): {e}"))?;
-    let min_deposit = contract
-        .minDeposit()
-        .call()
-        .await
-        .map_err(|e| anyhow::anyhow!("read PaymentChannel.minDeposit(): {e}"))?;
-    let deposit = U256::from(args.deposit_micro_usdc).max(min_deposit);
+    let deposit = U256::from(args.deposit_micro_usdc);
 
     ensure_allowance(
         &rpc,

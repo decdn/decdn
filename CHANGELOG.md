@@ -64,6 +64,29 @@ since project inception and will roll into the first tagged release.
     `stake_lane_reserved` now record an advertised-without-hold probe rather
     than a suppressed answer. Alert text and the runbook are updated
     accordingly; review any custom rules built on them.
+- **`PaymentChannel.minDeposit` removed (#1515).** **ABI-breaking, not
+  config-breaking.** The network minimum-deposit parameter is gone: the
+  `minDeposit()` view and the `setMinDeposit(uint256)` governance setter no
+  longer exist (an integrator calling either now reverts on a missing selector),
+  the `MinDepositUpdated` event is gone (a subscriber filtering its topic sees
+  zero events, silently), and the `DepositBelowMinimum` error selector is
+  retired. `openChannel` now accepts **any non-zero deposit** and reverts
+  `ZeroAmount` on zero — both before the transfer and on the received balance
+  delta, so a fee-on-transfer token cannot shave a deposit to nothing. Because
+  the parameter no longer exists, any pending or scripted `setMinDeposit`
+  governance proposal is un-executable. `PaymentChannel` has a constructor and no
+  proxy, so this requires a **fresh deployment**; existing testnet instances must
+  be redeployed. The floor bounded nothing that is not already bounded — service
+  by the seller-side per-voucher ceiling (see the #1516 entry under Fixed),
+  channel spam by gas — and the client-side 10 USDC recommendation of
+  [ADR 003 § Deposit Economics](adr/003-payments.md#deposit-economics) is
+  unchanged. `blockchain.buyer_deposit_micro_usdc` keeps its name, its 10 USDC
+  default, and its `> 0` validation; buyer paths simply no longer read the
+  contract to clamp up to a floor. The internal `MIN_DEPOSIT_FLOOR` constant
+  bounded two different things — `setMinDeposit`'s own lower bound and the
+  delivery-*rate* floor. With the former gone it is renamed `MIN_RATE_FLOOR` to
+  match what it still does; same value, two remaining call sites (the constructor
+  and `setRateBounds`), no behaviour change.
 - **Log-replay start-block config knobs removed.** **Config-breaking:** the
   three `[blockchain]` scan-floor fields — `origin_directory_from_block`,
   `slash_judge_from_block`, and `content_blacklist_from_block` — are removed.
@@ -338,6 +361,31 @@ since project inception and will roll into the first tagged release.
 
 #### Node serve path
 
+- **An underfunded channel no longer gets one interval free per request
+  (#1516).** The direct-serve path signed a success `StreamResponse` and streamed
+  a full credit window — one 1 MB voucher interval at the default cadence, more
+  if `credit_window_bytes` is configured — before the per-voucher deposit ceiling
+  could fire at the first voucher boundary. A channel that could not cover even
+  that first window was therefore served it anyway, on every request, and a
+  client's resume loop could farm a fresh one per retry attempt. The serve path
+  now reserves `min(credit window, requested span)` against the channel's
+  *remaining* headroom (`deposit − last claimed amount`, matching how both the
+  off-chain and on-chain ceilings compare cumulative voucher amounts) and refuses
+  before signing, metered as `serve_stream_rejected_insufficient_deposit` — the
+  same guard the cache-miss pull-through path has carried since #856, against a
+  narrower ceiling. The span is chunk-group-aligned, because
+  `export_bao_range_stream` serves the aligned superset and the serve path does
+  not trim back, so pricing the requested span would under-reserve a small
+  bounded range by up to two 16 KiB groups. What remains unreserved is only bao's
+  proof interleave (the reservation counts content bytes, delivery bills wire
+  bytes): at most ~1.3 KiB per request, against the 1 MiB-or-wider window that
+  used to ship free. The mid-stream ceiling remains the exact authority. A funded
+  request for a blob or range smaller than one interval is unaffected — the
+  reservation is capped by the span, not by the cadence. Note the guard sits
+  after the buffered/range/local fill tiers, which are gated on channel ownership
+  but not deposit, so an underfunded channel can still cause origin or upstream
+  spend that this refusal then declines to bill for; closing that is tracked
+  separately. No wire, config, or ABI change.
 - **A degraded node no longer reports itself as merely empty (#1129).** On a
   `cdn/client/v1` cache miss, a transient origin/store fault during a reactive
   pull-through fill (an S3 5xx surviving retry exhaustion, an open circuit

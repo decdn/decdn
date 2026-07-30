@@ -56,7 +56,7 @@ use decdn_client_pull::probe::probe_once;
 use decdn_client_pull::provider;
 
 /// Default deposit when opening a new channel: 10 USDC (ADR 003 § Deposit
-/// Economics recommended minimum). Clamped up to the on-chain `minDeposit`.
+/// Economics recommended minimum).
 const DEFAULT_DEPOSIT_MICRO_USDC: u64 = 10_000_000;
 
 /// Per-candidate probe timeout during auto-discovery (#936). The K probes run
@@ -1601,17 +1601,8 @@ where
         .call()
         .await
         .map_err(|e| anyhow::anyhow!("read PaymentChannel.usdc(): {e}"))?;
-    // Clamp the deposit up to the on-chain floor so `openChannel` can't revert
-    // for under-funding on a network with a higher `minDeposit` (matches the
-    // node's buyer path and the `--deposit-micro-usdc` help text).
-    let min_deposit = contract
-        .minDeposit()
-        .call()
-        .await
-        .map_err(|e| anyhow::anyhow!("read PaymentChannel.minDeposit(): {e}"))?;
-    let deposit = deposit.max(min_deposit);
     // `max_approve` opts into an unlimited standing allowance; otherwise approve
-    // exactly the (clamped) deposit being escrowed. Unconditional either way — the
+    // exactly the deposit being escrowed. Unconditional either way — the
     // old `false` branch issued no approve at all, so `openChannel`'s internal
     // `transferFrom` reverted unless the wallet had pre-approved out of band.
     let approve_amount = if max_approve { None } else { Some(deposit) };

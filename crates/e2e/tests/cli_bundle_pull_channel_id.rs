@@ -49,7 +49,7 @@ use decdn_incentive::eth_identity;
 use decdn_incentive::payment_channel::PaymentChannel;
 use decdn_incentive::voucher_domain;
 
-const DEPOSIT_MICRO_USDC: u64 = 10_000_000; // 10 USDC (>= deploy minDeposit)
+const DEPOSIT_MICRO_USDC: u64 = 10_000_000; // 10 USDC (ADR 003 recommended minimum)
 const KEYSTORE_PASSWORD: &str = "bundle-adopt-e2e-password";
 const OVERALL_TIMEOUT: Duration = Duration::from_secs(780);
 
@@ -125,8 +125,7 @@ async fn run() -> anyhow::Result<()> {
     )
     .await
     .context("approve PaymentChannel")?;
-    let min_deposit = pc.minDeposit().call().await.context("read minDeposit")?;
-    let deposit = U256::from(DEPOSIT_MICRO_USDC).max(min_deposit);
+    let deposit = U256::from(DEPOSIT_MICRO_USDC);
     let voucher_dom = voucher_domain(chain.chain_id(), chain.addrs().payment_channel);
     let opened = open_channel(
         &pc,
