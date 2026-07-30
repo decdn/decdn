@@ -90,26 +90,16 @@ impl ClientHandler {
     /// The metric
     /// is bumped before the network write so a refusal is counted even if the
     /// client has already gone and the write fails.
-    pub(super) async fn respond_error(
-        &self,
-        send: &mut SendStream,
-        req: &StreamRequest,
-        reason: ServeRejectReason,
-    ) -> anyhow::Result<()> {
-        self.respond_error_at_rate(send, req, reason, self.clamped_rate())
-            .await
-    }
-
-    /// [`Self::respond_error`] for a caller that has ALREADY called
-    /// [`Self::clamped_rate`] for this request.
     ///
-    /// `clamped_rate` is side-effecting — it bumps `rate_bounds_clamped` and logs
-    /// a warning when the configured rate sits below the on-chain delivery floor —
-    /// so a path that computes the rate and then refuses must not let
-    /// `respond_error` compute it a second time, or a single request
-    /// double-counts the metric and double-logs. Refusal paths that never needed
-    /// the rate keep using [`Self::respond_error`].
-    pub(super) async fn respond_error_at_rate(
+    /// `rate_per_mb` is a required argument rather than something this function
+    /// computes, and that is the whole point: [`Self::clamped_rate`] is
+    /// side-effecting — it bumps `rate_bounds_clamped` and warns when the
+    /// configured rate sits below the on-chain delivery floor — so a caller that
+    /// priced the request and then refused would double-count it (#1518). Taking
+    /// the price as a parameter makes the one-call-per-request invariant a
+    /// property the compiler checks: `serve_stream` has the crate's only
+    /// production `clamped_rate()` call, and every refusal is handed its result.
+    pub(super) async fn respond_error(
         &self,
         send: &mut SendStream,
         req: &StreamRequest,

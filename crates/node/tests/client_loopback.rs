@@ -5312,6 +5312,7 @@ async fn spawn_counting_pull_server_with_deny(
     Endpoint,
     tokio::task::JoinHandle<()>,
     tempfile::TempDir,
+    Arc<Metrics>,
 )> {
     let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let cache_tmp = tempfile::tempdir()?;
@@ -5350,7 +5351,158 @@ async fn spawn_counting_pull_server_with_deny(
     let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
     let server_task = spawn_server(server_ep.clone(), handler);
     let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
-    Ok((target, hits, server_ep, server_task, cache_tmp))
+    Ok((target, hits, server_ep, server_task, cache_tmp, metrics))
+}
+
+/// [`spawn_counting_pull_server_with_deny`] with an empty deny-set.
+async fn spawn_counting_pull_server(
+    store: Arc<dyn ChannelStateStore>,
+) -> anyhow::Result<(
+    EndpointAddr,
+    Arc<std::sync::atomic::AtomicUsize>,
+    Endpoint,
+    tokio::task::JoinHandle<()>,
+    tempfile::TempDir,
+    Arc<Metrics>,
+)> {
+    spawn_counting_pull_server_with_deny(store, &[]).await
+}
+
+/// #1519, the headline case: an underfunded channel must not make the node spend.
+///
+/// Every cache-miss fill tier is gated on channel OWNERSHIP (`pull_authorized`)
+/// and none was gated on solvency, so before the pre-spend floor a dust-deposit
+/// channel could name absent hashes, make the node pay its paid upstream for each,
+/// and be refused afterwards by the serve-path gate. The attacker gained nothing —
+/// #1516 closed the free-egress half — but the operator still paid.
+///
+/// `hits == 0` IS the acceptance criterion: the origin was never contacted. The
+/// second counter assertion is what makes the test specific rather than merely
+/// green — a refusal that came from the fill missing (rather than from the floor)
+/// would bump `cache_miss` instead, and `hits == 0` alone cannot tell them apart.
+#[tokio::test(flavor = "multi_thread")]
+async fn underfunded_channel_never_reaches_the_paid_pull() -> anyhow::Result<()> {
+    let signer = Arc::new(PrivateKeySigner::random());
+    let store = Arc::new(MemoryChannelStateStore::new());
+    store.record(&ChannelState::new(
+        channel_id(),
+        signer.address(),
+        signer.address(),
+        TOKEN,
+        U256::from(9u64), // one under the floor (one 1 MiB credit window = 10)
+    ))?;
+    let store_dyn: Arc<dyn ChannelStateStore> = store.clone();
+    let (target, hits, server_ep, server_task, _cache_tmp, metrics) =
+        spawn_counting_pull_server(store_dyn).await?;
+
+    let client_sk = fresh_key();
+    let client_node_id = B256::from(*client_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    // Bound, so `pull_authorized` would have said yes and the pull WOULD have run.
+    let ext = binding_ext(&signer, client_node_id)?;
+    let req = StreamRequest {
+        hash: [0x19u8; 32], // never cached — a miss that would trigger the pull
+        namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        channel_id: channel_id().into(),
+        byte_offset: 0,
+        byte_len: 0,
+        timestamp_us: 0x1519,
+    };
+    match raw_request(&client_ep, target, &req, Some(&ext)).await? {
+        ClientMessage::StreamResponse(resp) => {
+            anyhow::ensure!(!resp.body.ok, "an underfunded miss must be refused");
+            anyhow::ensure!(
+                matches!(
+                    resp.error,
+                    Some(decdn_protocol::client::StreamError::NotFound)
+                ),
+                "expected the collapsed NotFound wire code, got {:?}",
+                resp.error
+            );
+        }
+        other => anyhow::bail!("expected a signed refusal, got {other:?}"),
+    }
+
+    anyhow::ensure!(
+        hits.load(std::sync::atomic::Ordering::SeqCst) == 0,
+        "the origin must never be contacted for a channel that cannot pay: {} hits",
+        hits.load(std::sync::atomic::Ordering::SeqCst)
+    );
+    let text = metrics.encode()?;
+    anyhow::ensure!(
+        metric_line_present(
+            &text,
+            "decdn_serve_stream_rejected_insufficient_deposit_total 1"
+        ),
+        "the refusal must be attributed to the deposit floor"
+    );
+    anyhow::ensure!(
+        metric_line_present(&text, "decdn_serve_stream_rejected_cache_miss_total 0"),
+        "the refusal must come from the floor, not from the fill missing"
+    );
+
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
+/// The boundary control for #1519, and the reason the floor cannot be quietly
+/// tightened. A channel funded to EXACTLY one credit window clears the floor
+/// (the check is `<`) and must still reach the pull.
+///
+/// Without this, raising the floor — or flipping `<` to `<=` — would break
+/// nothing: `underfunded_channel_never_reaches_the_paid_pull` above only pins
+/// that an *under*-funded channel is stopped. A floor that also stopped funded
+/// channels would turn a cold fetch into a permanent refusal on every node.
+#[tokio::test(flavor = "multi_thread")]
+async fn funded_channel_still_reaches_the_paid_pull() -> anyhow::Result<()> {
+    let signer = Arc::new(PrivateKeySigner::random());
+    let store = Arc::new(MemoryChannelStateStore::new());
+    store.record(&ChannelState::new(
+        channel_id(),
+        signer.address(),
+        signer.address(),
+        TOKEN,
+        U256::from(10u64), // exactly the floor — `10 < 10` is false, so proceed
+    ))?;
+    let store_dyn: Arc<dyn ChannelStateStore> = store.clone();
+    let (target, hits, server_ep, server_task, _cache_tmp, metrics) =
+        spawn_counting_pull_server(store_dyn).await?;
+
+    let client_sk = fresh_key();
+    let client_node_id = B256::from(*client_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let ext = binding_ext(&signer, client_node_id)?;
+    let req = StreamRequest {
+        hash: [0x1Au8; 32],
+        namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        channel_id: channel_id().into(),
+        byte_offset: 0,
+        byte_len: 0,
+        timestamp_us: 0x151A,
+    };
+    // `CountingOrigin` has nothing to serve, so the request still ends in a
+    // refusal — but a `cache_miss` one, AFTER the origin was asked.
+    let _ = raw_request(&client_ep, target, &req, Some(&ext)).await?;
+
+    anyhow::ensure!(
+        hits.load(std::sync::atomic::Ordering::SeqCst) == 1,
+        "a channel funded to exactly the floor must still reach the pull: {} hits",
+        hits.load(std::sync::atomic::Ordering::SeqCst)
+    );
+    anyhow::ensure!(
+        metric_line_present(
+            &metrics.encode()?,
+            "decdn_serve_stream_rejected_insufficient_deposit_total 0"
+        ),
+        "an exactly-funded channel must not trip the deposit floor"
+    );
+
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
 }
 
 /// ADR 011 keys compliance on the FUNDER, so a blacklisted funder must not make
@@ -5361,7 +5513,7 @@ async fn spawn_counting_pull_server_with_deny(
 #[tokio::test(flavor = "multi_thread")]
 async fn pull_through_refuses_a_blacklisted_funder_behind_a_clean_delegate() -> anyhow::Result<()> {
     let (store, funder, delegate) = delegate_signer_store()?;
-    let (target, hits, server_ep, server_task, _cache_tmp) =
+    let (target, hits, server_ep, server_task, _cache_tmp, _metrics) =
         spawn_counting_pull_server_with_deny(store, &[funder.address()]).await?;
 
     let delegate_sk = fresh_key();
@@ -5402,7 +5554,7 @@ async fn pull_through_refuses_a_blacklisted_funder_behind_a_clean_delegate() -> 
 #[tokio::test(flavor = "multi_thread")]
 async fn pull_through_allows_a_clean_funder_with_a_blacklisted_delegate() -> anyhow::Result<()> {
     let (store, _funder, delegate) = delegate_signer_store()?;
-    let (target, hits, server_ep, server_task, _cache_tmp) =
+    let (target, hits, server_ep, server_task, _cache_tmp, _metrics) =
         spawn_counting_pull_server_with_deny(store, &[delegate.address()]).await?;
 
     let delegate_sk = fresh_key();

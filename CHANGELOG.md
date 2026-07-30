@@ -381,11 +381,34 @@ since project inception and will roll into the first tagged release.
   bytes): at most ~1.3 KiB per request, against the 1 MiB-or-wider window that
   used to ship free. The mid-stream ceiling remains the exact authority. A funded
   request for a blob or range smaller than one interval is unaffected — the
-  reservation is capped by the span, not by the cadence. Note the guard sits
-  after the buffered/range/local fill tiers, which are gated on channel ownership
-  but not deposit, so an underfunded channel can still cause origin or upstream
-  spend that this refusal then declines to bill for; closing that is tracked
-  separately. No wire, config, or ABI change.
+  reservation is capped by the span, not by the cadence. This gate's placement
+  relative to the cache-miss fill tiers is corrected by the next entry. No wire,
+  config, or ABI change.
+- **An underfunded channel can no longer make the node spend before it is refused
+  (#1519).** The gate above runs on the serve path, which a cache miss reaches
+  only *after* the fill tiers — and `try_range_pull_through`,
+  `try_local_populate` and `try_pull_through` were gated on channel ownership
+  (`pull_authorized`) but not on solvency, the last of them reaching the paid
+  `Peer` origin. So a dust-deposit channel could name absent hashes, make the
+  operator pay origin egress and upstream USDC for each, and be refused
+  afterwards: the client gained nothing, but the bill was real. A **pre-spend
+  floor** now runs above every tier, refusing when remaining headroom cannot
+  cover one credit window. It is deliberately a floor rather than the serve
+  path's exact span-capped ceiling, because `total_bytes` is unknowable before
+  the fill — so it catches a channel that cannot pay for anything at all, and
+  does not pre-judge a merely small request. Two deliberate consequences: a cold
+  sub-window fetch that previously got a free fill is now refused (such a channel
+  could not have completed the transfer either way), and this refusal *pre-empts*
+  the #1129 fault latch — a client-attributable refusal wins over "this node is
+  degraded", because it would refuse regardless of origin health. **Residual:** a
+  channel funded to exactly one window can still trigger a whole-blob buffered
+  node-to-node pull costing more than it can repay; that tier is bounded by the
+  cache engine's separate `max_blob_mb` rather than by anything the handler
+  prices, and giving it a ceiling in its own quantity is tracked separately.
+  Internally, `respond_error` now takes the request's price as a required
+  argument and `serve_stream` holds the crate's only `clamped_rate()` call, which
+  makes the one-clamp-per-request invariant something the compiler enforces
+  rather than a matter of review attention. No wire, config, or ABI change.
 - **A degraded node no longer reports itself as merely empty (#1129).** On a
   `cdn/client/v1` cache miss, a transient origin/store fault during a reactive
   pull-through fill (an S3 5xx surviving retry exhaustion, an open circuit

@@ -1200,15 +1200,21 @@ pub struct DecdnMetrics {
     /// `serve_stream` requests refused before any bytes are served because the
     /// requesting channel's remaining deposit could not cover what the node
     /// would front at its rate. (The refusal itself is signed — as an `ok: false`
-    /// response; what is never signed is an `ok: true`.) Two guards bump this.
-    /// The cache-miss one (#856) reserves the whole-blob cost when
-    /// `max_blob_size_bytes` is finite and the speculative window cost otherwise,
-    /// and runs before the *window* pull-through spend — but NOT before the
-    /// buffered/range/local fill tiers, which spend first and reach the
-    /// direct-serve guard afterwards. The direct-serve one (#1516) reserves
-    /// `min(credit window, chunk-group-aligned request span)`. Wire-indistinguishable from `cache_miss`
-    /// (signed as `NotFound`), so this server-side counter is the only place the
-    /// distinction lives — a rising value isolates near-empty-deposit abuse.
+    /// response; what is never signed is an `ok: true`.) **Three** guards bump
+    /// this, in firing order:
+    /// 1. the cache-miss **floor** (#1519) — one credit window, applied above
+    ///    every fill tier so none of them fronts origin egress or upstream USDC
+    ///    for a channel that cannot pay for a single interval;
+    /// 2. the **window** tier's speculative ceiling (#856) — the whole-blob cost
+    ///    when `max_blob_size_bytes` is finite, else the window cost;
+    /// 3. the **direct-serve** ceiling (#1516) —
+    ///    `min(credit window, chunk-group-aligned request span)`.
+    ///
+    /// It does not distinguish them, so a spike cannot be attributed to a layer
+    /// from this series alone — the log line at the refusal site is what says
+    /// which. Wire-indistinguishable from `cache_miss` (signed as `NotFound`), so
+    /// this server-side counter is the only place the *reason* lives at all — now
+    /// more load-bearing, since a third refusal path routes through it.
     /// Visible name: `decdn_serve_stream_rejected_insufficient_deposit_total`.
     pub serve_stream_rejected_insufficient_deposit: Counter,
     /// New delivery refused because the channel has a signed cooperative-close

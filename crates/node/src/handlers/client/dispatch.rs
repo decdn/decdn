@@ -176,6 +176,20 @@ impl ClientHandler {
 
         let hash = Hash::from_bytes(req.hash);
 
+        // The request's price, resolved ONCE and threaded to every refusal and to
+        // the window tier. `clamped_rate` is side-effecting — it bumps
+        // `rate_bounds_clamped` and warns when the configured rate sits below the
+        // on-chain delivery floor — so calling it twice double-counts one request
+        // (#1518). `respond_error` takes the rate as a required argument precisely
+        // so that cannot happen: there is no way to sign a refusal without the
+        // caller having priced the request exactly once.
+        //
+        // Deliberately BELOW the binding block: every exit above this point
+        // (`permit.is_none()`, a cooperative close, a malformed binding) returns
+        // without signing anything, so pricing them would meter a clamp for a
+        // request that never quoted a rate.
+        let rate_per_mb = self.clamped_rate();
+
         // Local-denylist gate (ADR 011 §Local Denylist, §On Blacklist Event
         // step 2: "reject any new StreamRequest for the hash immediately").
         //
@@ -200,12 +214,17 @@ impl ClientHandler {
         // far more common hit; both are one atomic load and a hash-set probe.
         if self.cache.is_denied(hash) {
             return self
-                .respond_error(&mut send, &req, ServeRejectReason::HashDenied)
+                .respond_error(&mut send, &req, ServeRejectReason::HashDenied, rate_per_mb)
                 .await;
         }
         if self.cache.is_chain_denied(hash) {
             return self
-                .respond_error(&mut send, &req, ServeRejectReason::ChainHashDenied)
+                .respond_error(
+                    &mut send,
+                    &req,
+                    ServeRejectReason::ChainHashDenied,
+                    rate_per_mb,
+                )
                 .await;
         }
 
@@ -229,18 +248,30 @@ impl ClientHandler {
         //
         // Resolving the channel early is a `HashMap` lookup, so the cost is
         // nil; `pull_authorized` keeps its own check as the spend-side backstop.
-        if let Some(channel) = self
+        //
+        // The resolved `Arc` is KEPT rather than dropped at the end of this gate:
+        // the pre-spend deposit floor in the cache-miss arm below needs the same
+        // channel, and re-resolving it would take the map lock a second time for
+        // no reason. `None` means the channel is unknown, which both gates treat
+        // as "not my business" — an unknown channel cannot make this node spend,
+        // because `pull_authorized` refuses it before every fill tier.
+        let known_channel = self
             .channels
             .lock()
             .await
             .get(&ChannelId::from(req.channel_id))
-            .cloned()
-        {
+            .cloned();
+        if let Some(channel) = &known_channel {
             let funder = channel.lock().await.state.client;
             if self.content_deny.is_origin_denied(&funder) {
                 tracing::warn!(%funder, "refusing delivery on a channel funded by a blacklisted origin");
                 return self
-                    .respond_error(&mut send, &req, ServeRejectReason::OriginDenied)
+                    .respond_error(
+                        &mut send,
+                        &req,
+                        ServeRejectReason::OriginDenied,
+                        rate_per_mb,
+                    )
                     .await;
             }
         }
@@ -263,7 +294,12 @@ impl ClientHandler {
                 // hash an operator deliberately evicted (#279).
                 if self.cache.is_evicted(hash) {
                     return self
-                        .respond_error(&mut send, &req, ServeRejectReason::EvictedSinceProbe)
+                        .respond_error(
+                            &mut send,
+                            &req,
+                            ServeRejectReason::EvictedSinceProbe,
+                            rate_per_mb,
+                        )
                         .await;
                 }
                 // Node-to-node cache-miss pull-through (#831). Fronting upstream
@@ -301,6 +337,52 @@ impl ClientHandler {
                 // origin chain), but that is a coincidence of the current tier
                 // ordering, not an invariant — and this is the one bug the file
                 // exists to prevent. Latch every tier.
+                // Pre-spend deposit floor (#1519). Every fill tier below spends:
+                // the range and local tiers front the operator's own origin
+                // egress, and the buffered tier's `cache.populate` walks the paid
+                // `Peer` origin and fronts real upstream USDC. All three are gated
+                // on channel OWNERSHIP (`pull_authorized`) and none on solvency,
+                // so before this floor a dust-deposit channel could name N absent
+                // hashes, make the node pay for each, and be refused afterwards by
+                // the serve-path gate — the attacker gains nothing, but the
+                // operator still pays. Refuse here instead, before any of it.
+                //
+                // The ceiling is deliberately WEAK — "can this channel pay for
+                // anything at all", one credit window — because `total_bytes` is
+                // unknowable before the fill, so the serve path's exact
+                // chunk-group-aligned span is unavailable here. An underfunded
+                // channel is caught; a merely small request is not pre-judged.
+                //
+                // `window.rs` keeps its own guard, and the honest relationship is
+                // narrower than "two separate guards": `DEFAULT_PULL_AHEAD_BYTES`
+                // is exactly one interval, so at default settings that guard
+                // computes this same ceiling and is redundant with this one. It
+                // earns its place only once `max_blob_size_bytes` is finite, where
+                // it reserves the whole-blob cost — far stricter than this floor —
+                // and it is the tier that fronts UPSTREAM spend. Do not delete it
+                // on the strength of this floor alone.
+                //
+                // Skipped for an unknown channel: `pull_authorized` already
+                // refuses those before every tier, so there is no spend to gate.
+                if let Some(channel) = &known_channel {
+                    let interval_bytes = self.voucher_interval_mb.saturating_mul(MB_BYTES).max(1);
+                    let floor = min_payment(self.credit_window(interval_bytes), rate_per_mb);
+                    let (deposit, last_amount) = {
+                        let guard = channel.lock().await;
+                        (guard.state.deposit, guard.state.last_amount())
+                    };
+                    if deposit.saturating_sub(last_amount) < floor {
+                        return self
+                            .respond_error(
+                                &mut send,
+                                &req,
+                                ServeRejectReason::InsufficientDeposit,
+                                rate_per_mb,
+                            )
+                            .await;
+                    }
+                }
+
                 let mut fault_seen = false;
                 if (req.byte_offset > 0 || req.byte_len > 0)
                     && self.pull_authorized(&req, verified_client).await
@@ -388,6 +470,7 @@ impl ClientHandler {
                                 Arc::clone(origin),
                                 tee,
                                 fault_seen,
+                                rate_per_mb,
                             ))
                             .await;
                         }
@@ -401,7 +484,9 @@ impl ClientHandler {
                             if !coalesced.is_filled() {
                                 let reason =
                                     FillOutcome::miss_reason(fault_seen || coalesced.is_fault());
-                                return self.respond_error(&mut send, &req, reason).await;
+                                return self
+                                    .respond_error(&mut send, &req, reason, rate_per_mb)
+                                    .await;
                             }
                         }
                     }
@@ -419,14 +504,21 @@ impl ClientHandler {
                     };
                     if !buffered.is_filled() {
                         let reason = FillOutcome::miss_reason(fault_seen || buffered.is_fault());
-                        return self.respond_error(&mut send, &req, reason).await;
+                        return self
+                            .respond_error(&mut send, &req, reason, rate_per_mb)
+                            .await;
                     }
                 }
             }
             Err(e) => {
                 tracing::warn!(%hash, error = %e, "cache `has` lookup failed on delivery path");
                 return self
-                    .respond_error(&mut send, &req, ServeRejectReason::InternalError)
+                    .respond_error(
+                        &mut send,
+                        &req,
+                        ServeRejectReason::InternalError,
+                        rate_per_mb,
+                    )
                     .await;
             }
         }
@@ -450,7 +542,12 @@ impl ClientHandler {
                 Err(e) => {
                     tracing::warn!(%hash, error = %e, "cache `inspect` failed on delivery path");
                     return self
-                        .respond_error(&mut send, &req, ServeRejectReason::InternalError)
+                        .respond_error(
+                            &mut send,
+                            &req,
+                            ServeRejectReason::InternalError,
+                            rate_per_mb,
+                        )
                         .await;
                 }
             };
@@ -460,14 +557,24 @@ impl ClientHandler {
                     "blob present per `has` but `inspect` reports no size; treating as fault"
                 );
                 return self
-                    .respond_error(&mut send, &req, ServeRejectReason::InternalError)
+                    .respond_error(
+                        &mut send,
+                        &req,
+                        ServeRejectReason::InternalError,
+                        rate_per_mb,
+                    )
                     .await;
             };
             total_bytes
         };
         if self.max_blob_size_bytes > 0 && total_bytes > self.max_blob_size_bytes {
             return self
-                .respond_error(&mut send, &req, ServeRejectReason::BlobTooLarge)
+                .respond_error(
+                    &mut send,
+                    &req,
+                    ServeRejectReason::BlobTooLarge,
+                    rate_per_mb,
+                )
                 .await;
         }
 
@@ -488,7 +595,12 @@ impl ClientHandler {
                         .is_none_or(|end| end > total_bytes));
             if out_of_bounds {
                 return self
-                    .respond_error(&mut send, &req, ServeRejectReason::RangeNotSatisfiable)
+                    .respond_error(
+                        &mut send,
+                        &req,
+                        ServeRejectReason::RangeNotSatisfiable,
+                        rate_per_mb,
+                    )
                     .await;
             }
         }
@@ -508,7 +620,12 @@ impl ClientHandler {
         let Some(channel) = channel else {
             tracing::warn!(%channel_id, "stream request on unknown channel; refusing pre-serve");
             return self
-                .respond_error(&mut send, &req, ServeRejectReason::UnknownChannel)
+                .respond_error(
+                    &mut send,
+                    &req,
+                    ServeRejectReason::UnknownChannel,
+                    rate_per_mb,
+                )
                 .await;
         };
 
@@ -520,7 +637,12 @@ impl ClientHandler {
         // running when the waiver was signed stops at its next voucher).
         if channel.lock().await.state.cooperative_close_signed() {
             return self
-                .respond_error(&mut send, &req, ServeRejectReason::CooperativeCloseSigned)
+                .respond_error(
+                    &mut send,
+                    &req,
+                    ServeRejectReason::CooperativeCloseSigned,
+                    rate_per_mb,
+                )
                 .await;
         }
 
@@ -538,7 +660,12 @@ impl ClientHandler {
             if client != authorized_signer {
                 tracing::warn!(%client, %authorized_signer, "binding does not authorize this channel");
                 return self
-                    .respond_error(&mut send, &req, ServeRejectReason::OwnerMismatch)
+                    .respond_error(
+                        &mut send,
+                        &req,
+                        ServeRejectReason::OwnerMismatch,
+                        rate_per_mb,
+                    )
                     .await;
             }
         }
@@ -550,8 +677,6 @@ impl ClientHandler {
             Some(proposed) => self.voucher_interval_mb.min(proposed).max(1),
             None => self.voucher_interval_mb,
         };
-
-        let rate_per_mb = self.clamped_rate();
 
         // Pre-flight deposit gate — the direct-serve twin of the pull-through
         // guard in `window.rs` (keep the two in step). Without it the node signs
@@ -618,7 +743,7 @@ impl ClientHandler {
         };
         if deposit.saturating_sub(last_amount) < ceiling {
             return self
-                .respond_error_at_rate(
+                .respond_error(
                     &mut send,
                     &req,
                     ServeRejectReason::InsufficientDeposit,
