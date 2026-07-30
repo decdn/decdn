@@ -381,11 +381,65 @@ since project inception and will roll into the first tagged release.
   bytes): at most ~1.3 KiB per request, against the 1 MiB-or-wider window that
   used to ship free. The mid-stream ceiling remains the exact authority. A funded
   request for a blob or range smaller than one interval is unaffected — the
-  reservation is capped by the span, not by the cadence. Note the guard sits
-  after the buffered/range/local fill tiers, which are gated on channel ownership
-  but not deposit, so an underfunded channel can still cause origin or upstream
-  spend that this refusal then declines to bill for; closing that is tracked
-  separately. No wire, config, or ABI change.
+  reservation is capped by the span, not by the cadence. This gate's placement
+  relative to the cache-miss fill tiers is corrected by the next entry. No wire,
+  config, or ABI change.
+- **An underfunded channel can no longer make the node spend before it is refused
+  (#1519).** The gate above runs on the serve path, which a cache miss reaches
+  only *after* the fill tiers — and `try_range_pull_through`,
+  `try_local_populate` and `try_pull_through` were gated on channel ownership
+  (`pull_authorized`) but not on solvency, the last of them reaching the paid
+  `Peer` origin. So a dust-deposit channel could name absent hashes, make the
+  operator pay origin egress and upstream USDC for each, and be refused
+  afterwards: the client gained nothing, but the bill was real. A **pre-spend
+  floor** now runs above every tier, refusing when remaining headroom cannot
+  cover one credit window. It is deliberately a floor rather than the serve
+  path's exact span-capped ceiling, because `total_bytes` is unknowable before
+  the fill — so it catches a channel that cannot pay for anything at all, and
+  does not pre-judge a merely small request. Two deliberate consequences: a cold
+  sub-window fetch that previously got a free fill is now refused (such a channel
+  could not have completed the transfer either way), and this refusal *pre-empts*
+  the #1129 fault latch — a client-attributable refusal wins over "this node is
+  degraded", because it would refuse regardless of origin health. **Residual:** a
+  channel funded to exactly one window can still trigger a whole-blob buffered
+  node-to-node pull costing more than it can repay; that tier is bounded by the
+  cache engine's enforcement of `cache.max_blob_size_mb` rather than by anything the
+  handler prices (not a *separate* knob — both derive from the same config field, but
+  only the engine bounds that tier), and giving it a ceiling in its own quantity is
+  tracked separately.
+  Internally, `respond_error` now takes the request's price as a required
+  argument and `serve_stream` holds the crate's only production `clamped_rate()`
+  call. That stops this function from recomputing the price *implicitly*, which is
+  the shape the bug took — it does not make the invariant type-checked, since a
+  caller can still pass an inline `self.clamped_rate()` or the wrong value. What
+  holds it is the single call site plus two new tests
+  (`a_refused_request_clamps_the_rate_exactly_once` and its zero-case sibling),
+  where before it was review attention alone. No wire, config, or ABI change.
+- **Buyer channel rows now record the deposit the contract credited, not the amount
+  requested (#1521).** `openChannel` and `topUp` credit a measured balance delta —
+  deliberately, so a fee-on-transfer settlement token cannot over-state a channel
+  against the shared USDC pool — and emit that delta in `ChannelOpened.deposit` /
+  `ChannelToppedUp.additionalDeposit`. The buyer path recorded its own requested
+  amount instead, so under such a token its local row would over-state the deposit.
+  The harm is buyer-side rather than a settlement revert: nothing in the buyer bounds
+  vouchers by this field, and the seller refuses off-chain via `stage_voucher` long
+  before any on-chain call. What breaks is the buyer's own headroom arithmetic — the
+  auto-refill reads `deposit - prior_amount` from the inflated row, so it fires late
+  or short, and because credits accumulate the drift compounds with every top-up
+  until every seller refuses us. `open_channel` now reads `ChannelOpened.deposit` (it
+  already took `channelId` and `expiresAt` from that event) and `top_up` decodes
+  `ChannelToppedUp` rather than assuming the requested amount landed. If that event
+  is absent — meaning our view of the contract is wrong, which is the worst state in
+  which to guess — it reconciles against `getChannel` and `warn!`s; only if that
+  read *also* fails does it credit the requested amount, and then at `error!`. Not reachable
+  today — mainnet USDC is not fee-on-transfer — so this is defensive depth, not a
+  live fix. Note what protects us is that the settlement token's ADDRESS is immutable
+  at deployment, not its behaviour: real USDC is an upgradeable proxy, which is the
+  hazard `PaymentChannel`'s own comment names. **Contract
+  behaviour is unchanged:** a partial shave is still credited as received rather
+  than reverted, which is now an asserted decision instead of an unexercised path;
+  reverting would hard-code "the settlement token must never be fee-bearing" into
+  the contract, a policy call larger than the test gap that prompted this.
 - **A degraded node no longer reports itself as merely empty (#1129).** On a
   `cdn/client/v1` cache miss, a transient origin/store fault during a reactive
   pull-through fill (an S3 5xx surviving retry exhaustion, an open circuit

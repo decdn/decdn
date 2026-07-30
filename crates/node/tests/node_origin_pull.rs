@@ -7674,9 +7674,12 @@ async fn window_pull_through_insufficient_deposit_refuses_before_pulling() -> Re
 
     let leaf_eth = Arc::new(PrivateKeySigner::random());
     let leaf_channel_id = B256::repeat_byte(0x3F);
-    // max_blob_size_bytes = 64 MiB → ceiling = min_payment(64 MiB, RATE) = 640
-    // µUSDC; the leaf's deposit of 1 µUSDC cannot cover it. The blob itself is
-    // well under 64 MiB, so this is the deposit guard firing, not the size gate.
+    // Deposit 100 µUSDC clears `dispatch.rs`'s pre-spend miss floor (#1519 — one
+    // credit window at `RATE`, i.e. 10) but not this handler's 64 MiB blob-size
+    // ceiling (`min_payment(64 MiB, RATE)` = 640), so the guard under test is
+    // `window.rs`'s — not the hoisted floor, and not the size gate (the blob is
+    // well under 64 MiB). A deposit below 10 would be refused by the floor first
+    // and this test would silently stop covering `window.rs` at all.
     let max_blob_size_bytes = 64 * 1024 * 1024;
     let (handler_b, b_target, ep_b, recorded, cache_b, b_metrics, _local_rep, _leech_gov) =
         build_node_b(
@@ -7688,7 +7691,7 @@ async fn window_pull_through_insufficient_deposit_refuses_before_pulling() -> Re
             &b_buyer,
             leaf_channel_id,
             leaf_eth.address(),
-            U256::from(1u64),
+            U256::from(100u64),
             max_blob_size_bytes,
             None,
         )

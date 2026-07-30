@@ -937,6 +937,28 @@ pub struct DecdnMetrics {
     /// a sustained rate here usually means content discovery is steering this node
     /// at upstreams that do not hold the blob — not that the upstreams are bad.
     pub node_pull_refused: Counter,
+    /// `decdn_node_pull_refused_unattributable_total` (#1520): the subset of
+    /// [`Self::node_pull_refused`] whose wire code this node cannot pin on the
+    /// upstream — `NotFound` and `Overloaded`, i.e. `RefusalVerdict::Transient`.
+    /// Those briefly suppress the `(peer, hash)` pair without touching reputation.
+    ///
+    /// Split out because it is the shape a *buyer-side* misconfiguration takes:
+    /// `NotFound` is what a seller signs when it refuses OUR channel for
+    /// insufficient deposit (the reject reasons collapse deliberately, see
+    /// [`Self::serve_stream_rejected_insufficient_deposit`]), so a node whose own
+    /// deposit is too small to buy anything sees 100% of its pulls refused with
+    /// nothing in its own telemetry saying so. Before this the arm bumped no
+    /// counter at all and logged at `debug`.
+    ///
+    /// Read it with one caveat: `Transient` is `NotFound | Overloaded`, and
+    /// `Overloaded` is the PEER's backpressure — not local, and the code's own
+    /// policy is to respect rather than punish it. So a network-wide load event
+    /// drives this ratio to ~1 for a reason no local change fixes. A rate
+    /// approaching `node_pull_refused` therefore means "nobody is serving me",
+    /// which is *usually* local (deposit, binding) but is worth confirming against
+    /// peer health first; a small fraction is the healthy "that peer did not
+    /// have it".
+    pub node_pull_refused_unattributable: Counter,
     /// `decdn_node_pull_stalled_total` (#1134): an upstream went silent mid-stream
     /// — no byte of progress within `node_pull_stall_timeout_sec` — so the pull was
     /// abandoned. UNLIKE `node_pull_timeout` (our own budget expiring, which is not
@@ -1200,15 +1222,23 @@ pub struct DecdnMetrics {
     /// `serve_stream` requests refused before any bytes are served because the
     /// requesting channel's remaining deposit could not cover what the node
     /// would front at its rate. (The refusal itself is signed — as an `ok: false`
-    /// response; what is never signed is an `ok: true`.) Two guards bump this.
-    /// The cache-miss one (#856) reserves the whole-blob cost when
-    /// `max_blob_size_bytes` is finite and the speculative window cost otherwise,
-    /// and runs before the *window* pull-through spend — but NOT before the
-    /// buffered/range/local fill tiers, which spend first and reach the
-    /// direct-serve guard afterwards. The direct-serve one (#1516) reserves
-    /// `min(credit window, chunk-group-aligned request span)`. Wire-indistinguishable from `cache_miss`
-    /// (signed as `NotFound`), so this server-side counter is the only place the
-    /// distinction lives — a rising value isolates near-empty-deposit abuse.
+    /// response; what is never signed is an `ok: true`.) **Three** guards bump
+    /// this. Not a sequence any one request walks: a cache HIT reaches only (3),
+    /// and the window tier returns out of `serve_stream`, so (2) and (3) are
+    /// mutually exclusive. A miss passes (1) and then at most one of (2)/(3):
+    /// 1. the cache-miss **floor** (#1519) — one credit window, applied above
+    ///    every fill tier so none of them fronts origin egress or upstream USDC
+    ///    for a channel that cannot pay for a single interval;
+    /// 2. the **window** tier's speculative ceiling (#856) — the whole-blob cost
+    ///    when `max_blob_size_bytes` is finite, else the window cost;
+    /// 3. the **direct-serve** ceiling (#1516) —
+    ///    `min(credit window, chunk-group-aligned request span)`.
+    ///
+    /// It does not distinguish them, so a spike cannot be attributed to a layer
+    /// from this series alone — the log line at the refusal site is what says
+    /// which. Wire-indistinguishable from `cache_miss` (signed as `NotFound`), so
+    /// this server-side counter is the only place the *reason* lives at all — now
+    /// more load-bearing, since a third refusal path routes through it.
     /// Visible name: `decdn_serve_stream_rejected_insufficient_deposit_total`.
     pub serve_stream_rejected_insufficient_deposit: Counter,
     /// New delivery refused because the channel has a signed cooperative-close
@@ -2140,6 +2170,11 @@ recorders! {
     /// A selected upstream refused delivery up front (#1144). Counts every wire
     /// code; only `InternalError` also scores the provider's reputation.
     node_pull_refused => node_pull_refused.inc();
+
+    /// A refusal this node cannot attribute to the upstream (#1520) — `NotFound`
+    /// or `Overloaded`. A rate approaching `node_pull_refused` means nobody will
+    /// serve us, which is usually our own deposit or binding, not their fault.
+    node_pull_refused_unattributable => node_pull_refused_unattributable.inc();
 
     /// An upstream went silent mid-stream (#1134); the pull was abandoned and the
     /// provider scored `Unreachable`.
@@ -3173,6 +3208,14 @@ mod tests {
             "decdn_serve_stream_rejected_owner_mismatch_total",
             "decdn_serve_stream_rejected_insufficient_deposit_total",
             "decdn_serve_stream_rejected_cooperative_close_signed_total",
+            // Completed in #1520. These four always exported (the fields have
+            // existed as long as their siblings) — what was missing was any
+            // assertion pinning it, so a rename could have silently broken a
+            // dashboard without failing this test.
+            "decdn_serve_stream_rejected_range_not_satisfiable_total",
+            "decdn_serve_stream_rejected_hash_denied_total",
+            "decdn_serve_stream_rejected_chain_hash_denied_total",
+            "decdn_serve_stream_rejected_origin_denied_total",
             "decdn_cooperative_close_request_unauthorized_total",
         ];
         let text = metrics.encode().unwrap();
@@ -3191,6 +3234,10 @@ mod tests {
         metrics.serve_stream_rejected_owner_mismatch();
         metrics.serve_stream_rejected_insufficient_deposit();
         metrics.serve_stream_rejected_cooperative_close_signed();
+        metrics.serve_stream_rejected_range_not_satisfiable();
+        metrics.serve_stream_rejected_hash_denied();
+        metrics.serve_stream_rejected_chain_hash_denied();
+        metrics.serve_stream_rejected_origin_denied();
         metrics.cooperative_close_request_unauthorized();
 
         let text = metrics.encode().unwrap();

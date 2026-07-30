@@ -2247,3 +2247,206 @@ contract PaymentChannelTest is Test {
         assertEq(channel.providerChannels(provider, 1, type(uint256).max).length, 3);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Fee-on-transfer coverage (#1521)
+// ---------------------------------------------------------------------------
+
+/// @dev A settlement token that burns a fixed share of every transfer, so the
+///      recipient's balance rises by less than the amount sent. `_update` is OZ
+///      v5's hook for intercepting a transfer — the same hook `MaliciousERC20` in
+///      `TestnetFaucet.t.sol` uses, though that one is a reentrancy mock and
+///      leaves the amount alone.
+///
+///      `PaymentChannel` credits the measured balance DELTA rather than the
+///      requested amount, specifically so a token like this cannot over-state a
+///      channel's share of the shared pool. Nothing tested that, because the
+///      suite had no fee-bearing token — the guards and the delta arithmetic were
+///      unexercised on every path. This is not a token deCDN will ever configure
+///      (mainnet USDC is not fee-on-transfer today). Note what actually protects
+///      us: the token's ADDRESS is immutable at deployment, not its behaviour —
+///      real USDC is an upgradeable proxy, which is the hazard
+///      `src/PaymentChannel.sol`'s own comment names. So this turns an assumption
+///      into an assertion, and the assumption is narrower than "USDC will never
+///      do this".
+///
+///      Scope: the INBOUND legs only (`openChannel`, `topUp`). The payout legs
+///      (`withdraw`, `settleChannel`, the `FeeRouter` hand-off) are untested under
+///      a shaving token — `PaymentChannel`'s own accounting survives an outbound
+///      shave since its balance drops by the full amount, but `FeeRouter` would
+///      receive less than it records.
+contract FeeOnTransferUSDC is ERC20 {
+    /// @dev Burn share in basis points. `10_000` confiscates the whole transfer,
+    ///      which is what reaches the post-transfer `ZeroAmount` guards.
+    uint256 public feeBps;
+
+    constructor() ERC20("Fee USDC", "fUSDC") {
+        _mint(msg.sender, 1_000_000_000e6);
+    }
+
+    /// @dev Armed only AFTER the test has funded and approved its client. Funding
+    ///      at a 100% burn would leave the client with nothing, and the revert
+    ///      under test would be `ERC20InsufficientBalance` rather than the
+    ///      post-transfer guard we mean to exercise.
+    function setFeeBps(uint256 feeBps_) external {
+        // Bounded so a typo cannot make `value - fee` underflow and revert inside
+        // `_update`, which would surface as an opaque arithmetic panic rather than
+        // as the guard a test meant to exercise.
+        require(feeBps_ <= 10_000, "fee > 100%");
+        feeBps = feeBps_;
+    }
+
+    function decimals() public pure override returns (uint8) {
+        return 6;
+    }
+
+    function _update(address from, address to, uint256 value) internal override {
+        // Mint and burn pass through untouched. Defensive rather than load-bearing
+        // for the constructor's `_mint` (which is covered by `feeBps == 0`, the
+        // default) — it is the fee-burn leg below that must not recurse into a
+        // second fee, and keeping both endpoints explicit says so.
+        if (from == address(0) || to == address(0) || feeBps == 0) {
+            super._update(from, to, value);
+            return;
+        }
+        uint256 fee = value * feeBps / 10_000;
+        super._update(from, to, value - fee);
+        if (fee > 0) super._update(from, address(0), fee);
+    }
+}
+
+/// @dev `PaymentChannelTest` hard-codes `new MockUSDC()` and types its `usdc`
+///      field concretely, so there is no seam to swap the token through — hence a
+///      second test contract rather than a parameterised `setUp`.
+contract PaymentChannelFeeOnTransferTest is Test {
+    FeeOnTransferUSDC internal usdc;
+    MockActiveBond internal bond;
+    MockSettlementRouter internal router;
+    PaymentChannel internal channel;
+
+    address internal client = address(0xC11E27);
+    address internal provider = address(0xB0B);
+    address internal admin = address(0xA11CE);
+
+    uint256 internal constant DISPUTE_WINDOW = 48 hours;
+    uint256 internal constant MAX_DURATION = 90 days;
+    uint256 internal constant DELIVERY_FLOOR = 1;
+    uint256 internal constant DEPOSIT = 1000e6;
+
+    /// @dev 1% burn: large enough that `received != deposit` is unambiguous, small
+    ///      enough that the channel still opens (so the delta arithmetic, not just
+    ///      the revert, is under test).
+    uint256 internal constant FEE_BPS = 100;
+
+    /// @dev Deploys with NO fee, funds and approves the client, then arms the fee.
+    ///      The ordering is load-bearing — see `setFeeBps`.
+    function _deploy(uint256 feeBps) internal {
+        usdc = new FeeOnTransferUSDC();
+        bond = new MockActiveBond();
+        router = new MockSettlementRouter(usdc);
+        bond.setActive(provider, true);
+
+        channel = new PaymentChannel({
+            usdc_: usdc,
+            capacityBond_: bond,
+            feeRouter_: address(router),
+            disputeWindow_: DISPUTE_WINDOW,
+            maxChannelDuration_: MAX_DURATION,
+            deliveryFloor_: DELIVERY_FLOOR,
+            admin: admin
+        });
+
+        usdc.transfer(client, 100_000e6);
+        vm.prank(client);
+        usdc.approve(address(channel), type(uint256).max);
+
+        usdc.setFeeBps(feeBps);
+    }
+
+    /// @dev The assertion that actually protects money: the channel is credited
+    ///      with what ARRIVED, not what was asked for. Crediting the requested
+    ///      amount would over-state the channel against a shared USDC pool, so
+    ///      later settlements would draw on a balance that was never escrowed.
+    function test_openChannel_creditsTheReceivedDeltaNotTheRequestedAmount() public {
+        _deploy(FEE_BPS);
+        uint256 expected = DEPOSIT - (DEPOSIT * FEE_BPS / 10_000);
+
+        vm.prank(client);
+        bytes32 id = channel.openChannel(provider, DEPOSIT, address(0));
+
+        assertEq(channel.getChannel(id).deposit, expected, "credited the delta");
+        assertLt(channel.getChannel(id).deposit, DEPOSIT, "and it is less than requested");
+        assertEq(usdc.balanceOf(address(channel)), expected, "which matches the real balance");
+    }
+
+    /// @dev `ChannelOpened.deposit` must carry the same delta, because off-chain
+    ///      buyers build their local channel row from this event.
+    function test_openChannel_eventCarriesTheReceivedDelta() public {
+        _deploy(FEE_BPS);
+        uint256 expected = DEPOSIT - (DEPOSIT * FEE_BPS / 10_000);
+
+        vm.recordLogs();
+        vm.prank(client);
+        bytes32 id = channel.openChannel(provider, DEPOSIT, address(0));
+
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        bool found = false;
+        for (uint256 i = 0; i < logs.length; i++) {
+            if (logs[i].topics[0] == keccak256("ChannelOpened(bytes32,address,address,uint256,uint256,address)")) {
+                (uint256 deposit,,) = abi.decode(logs[i].data, (uint256, uint256, address));
+                assertEq(deposit, expected, "event deposit is the received delta");
+                // Anchored to the real balance too, so the mock's own fee formula
+                // is not part of the oracle.
+                assertEq(deposit, usdc.balanceOf(address(channel)), "and to the balance");
+                assertEq(logs[i].topics[1], id);
+                found = true;
+            }
+        }
+        assertTrue(found, "ChannelOpened was emitted");
+    }
+
+    function test_topUp_creditsTheReceivedDeltaNotTheRequestedAmount() public {
+        _deploy(FEE_BPS);
+        uint256 opened = DEPOSIT - (DEPOSIT * FEE_BPS / 10_000);
+        vm.prank(client);
+        bytes32 id = channel.openChannel(provider, DEPOSIT, address(0));
+
+        uint256 top = 500e6;
+        uint256 credited = top - (top * FEE_BPS / 10_000);
+        vm.prank(client);
+        channel.topUp(id, top);
+
+        assertEq(channel.getChannel(id).deposit, opened + credited, "top-up credits its delta");
+        assertEq(usdc.balanceOf(address(channel)), opened + credited, "and it matches the real balance");
+    }
+
+    /// @dev The post-transfer guard, which no test could reach before: a token that
+    ///      confiscates the whole transfer leaves `received == 0`, and a
+    ///      zero-deposit channel is un-serviceable while still consuming a
+    ///      provider slot and a client nonce. The PRE-transfer guard cannot catch
+    ///      this — `deposit` is non-zero.
+    function test_openChannel_revertsWhenTheTokenConfiscatesTheWholeDeposit() public {
+        _deploy(10_000); // 100% burn
+        vm.prank(client);
+        vm.expectRevert(PaymentChannel.ZeroAmount.selector);
+        channel.openChannel(provider, DEPOSIT, address(0));
+    }
+
+    function test_topUp_revertsWhenTheTokenConfiscatesTheWholeTopUp() public {
+        _deploy(0); // open cleanly, then confiscate only the top-up
+        vm.prank(client);
+        bytes32 id = channel.openChannel(provider, DEPOSIT, address(0));
+        assertEq(channel.getChannel(id).deposit, DEPOSIT, "opened at full value");
+
+        usdc.setFeeBps(10_000);
+        uint256 clientBefore = usdc.balanceOf(client);
+        vm.prank(client);
+        vm.expectRevert(PaymentChannel.ZeroAmount.selector);
+        channel.topUp(id, 500e6);
+
+        // Not `getChannel(...).deposit == DEPOSIT` — a reverted call rolls state
+        // back by definition, so that would assert nothing. What is worth pinning
+        // is that the client's funds were not confiscated by the reverted attempt.
+        assertEq(usdc.balanceOf(client), clientBefore, "client keeps its funds");
+    }
+}
