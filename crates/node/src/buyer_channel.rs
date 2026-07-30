@@ -538,24 +538,35 @@ fn claim_refill_slot(set: &Arc<Mutex<HashSet<Address>>>, provider: Address) -> O
 
 /// The low-water top-up amount for a reused channel (#1146, #1103): `U256::ZERO`
 /// when the remaining deposit still has headroom, else the amount that restores
-/// it to the working `target`. `target = max(deposit_hint, default_deposit,
-/// min_deposit)` — the same deposit a fresh open would fund (see
-/// [`BuyerChannelService::join_or_spawn_open`]) — and the trigger is
-/// `target / LOW_WATER_DIVISOR` (20% remaining). `deposit` / `prior_amount` are
-/// the reused channel's on-chain deposit and cumulative vouchered amount, read
-/// straight off the [`ChannelContext`] the reuse path already built — no extra
-/// store read. Pure so the policy is unit-testable; the shared [`refill_amount`]
-/// kernel is the same one the CLI fetch auto-refill uses.
+/// it to the working `target`. `target = max(deposit_hint, working_deposit,
+/// min_deposit)` — the graduation target a proven-good channel refills toward
+/// (see [`open_deposit`] for the smaller, INITIAL amount a fresh open funds
+/// instead) — and the trigger is `target / LOW_WATER_DIVISOR` (20% remaining).
+/// `deposit` / `prior_amount` are the reused channel's on-chain deposit and
+/// cumulative vouchered amount, read straight off the [`ChannelContext`] the
+/// reuse path already built — no extra store read. Pure so the policy is
+/// unit-testable; the shared [`refill_amount`] kernel is the same one the CLI
+/// fetch auto-refill uses.
 fn refill_decision(
     deposit: U256,
     prior_amount: U256,
     deposit_hint: U256,
-    default_deposit: U256,
+    working_deposit: U256,
     min_deposit: U256,
 ) -> U256 {
-    let target = deposit_hint.max(default_deposit).max(min_deposit);
+    let target = deposit_hint.max(working_deposit).max(min_deposit);
     let low_water = target / U256::from(LOW_WATER_DIVISOR);
     refill_amount(deposit, prior_amount, target, low_water)
+}
+
+/// The deposit a FRESH open escrows (#1497 task 6): "open small, graduate on
+/// proof". `max(deposit_hint, initial_deposit, min_deposit)` — deliberately the
+/// small `initial_deposit`, not the larger `working_deposit` [`refill_decision`]
+/// graduates a proven channel toward. `deposit_hint` still lets a caller ask for
+/// more up front; the on-chain `min_deposit` floor always wins. Pure so the open
+/// path's sizing is unit-testable without a live contract.
+fn open_deposit(deposit_hint: U256, initial_deposit: U256, min_deposit: U256) -> U256 {
+    deposit_hint.max(initial_deposit).max(min_deposit)
 }
 
 /// Buyer-side `PaymentChannel` service. Generic over the alloy [`Provider`]
@@ -570,7 +581,13 @@ pub struct BuyerChannelService<P: Provider + Clone + 'static> {
     token: Address,
     self_address: Address,
     min_deposit: U256,
-    default_deposit: U256,
+    /// The small deposit a fresh `openChannel` escrows (#1497 task 6):
+    /// "open small, graduate on proof". Consumed by [`open_deposit`].
+    initial_deposit: U256,
+    /// The larger graduation target a reused channel's low-water refill tops up
+    /// toward (see [`refill_decision`]). Renamed from `default_deposit` —
+    /// opening and refilling now use two different deposit sizes instead of one.
+    working_deposit: U256,
     /// Providers with an `openChannel` currently in flight, each mapped to a
     /// cloneable handle on the detached task performing it (#1143).
     ///
@@ -621,8 +638,10 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
     /// token and the governable `minDeposit` floor, issue the one-time USDC
     /// approval if requested, and spawn the reclaim sweep.
     ///
-    /// `default_deposit` is the deposit used when a caller does not specify a
-    /// larger one; it is clamped up to the on-chain `minDeposit`.
+    /// `initial_deposit` is the small deposit a fresh open escrows;
+    /// `working_deposit` is the larger target a reused channel's low-water
+    /// refill graduates it toward (#1497 task 6). Both are clamped up to the
+    /// on-chain `minDeposit`.
     ///
     /// # Errors
     ///
@@ -639,7 +658,8 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
         store: Arc<dyn BuyerChannelStore>,
         signer: Arc<PrivateKeySigner>,
         voucher_domain: Eip712Domain,
-        default_deposit: U256,
+        initial_deposit: U256,
+        working_deposit: U256,
         ensure_max_approval: bool,
         reconcile: Option<BuyerReconcileConfig>,
         pending_store: Arc<dyn PendingSettleStore>,
@@ -735,7 +755,8 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
             token,
             self_address,
             min_deposit,
-            default_deposit,
+            initial_deposit,
+            working_deposit,
             opens_in_flight,
             topups_in_flight,
             reclaim_failures,
@@ -776,7 +797,8 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
     /// channel tracked for that provider, or lazily open a new one.
     ///
     /// `deposit_hint` is the desired deposit for a freshly-opened channel; the
-    /// actual deposit is `max(deposit_hint, default_deposit, min_deposit)`. The
+    /// actual deposit is `max(deposit_hint, initial_deposit, min_deposit)` — the
+    /// small INITIAL size, not the working target. The
     /// hint is ignored when an existing channel is reused (call
     /// [`Self::top_up`] to add funds to a live channel).
     ///
@@ -913,7 +935,7 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
             deposit,
             prior_amount,
             deposit_hint,
-            self.default_deposit,
+            self.working_deposit,
             self.min_deposit,
         );
         if additional.is_zero() {
@@ -1059,7 +1081,11 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
         let voucher_domain = self.voucher_domain.clone();
         let token = self.token;
         let self_address = self.self_address;
-        let deposit = deposit_hint.max(self.default_deposit).max(self.min_deposit);
+        // Open at the INITIAL deposit (floored by the on-chain minimum), NOT the
+        // working target — "open small, graduate on proof". `deposit_hint` still
+        // lets a caller ask for more up front, but the small initial is the
+        // floor, not working.
+        let deposit = open_deposit(deposit_hint, self.initial_deposit, self.min_deposit);
         let metrics = Arc::clone(&self.metrics);
 
         // `spawn_open` reserves the slot (in the map we hold locked) AND holds it in the task
@@ -3122,23 +3148,57 @@ mod tests {
     }
 
     #[test]
-    fn refill_decision_target_is_max_of_hint_default_and_min() {
+    fn refill_decision_target_is_max_of_hint_working_and_min() {
         // A tiny deposit_hint must not shrink the target: it is
-        // max(hint, default_deposit, min_deposit), exactly the fresh-open deposit.
+        // max(hint, working_deposit, min_deposit), exactly the fresh-open deposit.
         let ten = U256::from(10_000_000u64);
         let prior = U256::from(9_999_999u64); // remaining == 1 µUSDC
-        // hint below both → target = default (10 USDC), low_water = 2 USDC.
+        // hint below both → target = working (10 USDC), low_water = 2 USDC.
         assert_eq!(
             refill_decision(ten, prior, U256::from(1u64), ten, U256::from(2_000_000u64)),
             ten - U256::from(1u64),
         );
 
-        // min_deposit as the DECIDING term of the max(): min > default > hint.
+        // min_deposit as the DECIDING term of the max(): min > working > hint.
         assert_eq!(
             refill_decision(ten, prior, U256::from(1u64), ten, U256::from(20_000_000u64)),
             U256::from(20_000_000u64) - U256::from(1u64),
-            "min_deposit must be able to raise the target above default/hint"
+            "min_deposit must be able to raise the target above working/hint"
         );
+    }
+
+    #[test]
+    fn refill_decision_targets_working_not_initial() {
+        // deposit_hint = initial (small); working is the graduation target.
+        let deposit = U256::from(500_000u64); // opened at initial
+        let prior = U256::from(490_000u64); // remaining 10_000 (< 20% of working)
+        let hint = U256::from(500_000u64); // initial
+        let working = U256::from(10_000_000u64);
+        let min = U256::from(1u64);
+        let add = refill_decision(deposit, prior, hint, working, min);
+        assert_eq!(add, working - (deposit - prior)); // graduate toward working
+    }
+
+    #[test]
+    fn open_deposit_uses_initial_not_working() {
+        // A fresh open must fund the small initial deposit, not the larger
+        // working target — "open small, graduate on proof" (#1497 task 6).
+        let initial = U256::from(500_000u64);
+        let working = U256::from(10_000_000u64);
+        let min = U256::from(1u64);
+        assert_eq!(open_deposit(U256::ZERO, initial, min), initial);
+        assert_ne!(open_deposit(U256::ZERO, initial, min), working);
+    }
+
+    #[test]
+    fn open_deposit_hint_and_min_still_win_over_initial() {
+        let initial = U256::from(500_000u64);
+        // A caller-supplied hint larger than initial is still honored.
+        let hint = U256::from(2_000_000u64);
+        assert_eq!(open_deposit(hint, initial, U256::from(1u64)), hint);
+        // The on-chain floor wins even over a larger initial.
+        let big_min = U256::from(1_000_000u64);
+        assert_eq!(open_deposit(U256::ZERO, initial, big_min), big_min);
     }
 
     #[test]
@@ -3886,7 +3946,8 @@ mod tests {
             token: Address::repeat_byte(0x11),
             self_address,
             min_deposit: U256::from(1u64),
-            default_deposit: U256::from(1u64),
+            initial_deposit: U256::from(1u64),
+            working_deposit: U256::from(1u64),
             opens_in_flight: Arc::new(Mutex::new(HashMap::new())),
             topups_in_flight: Arc::new(Mutex::new(HashSet::new())),
             reclaim_failures: Arc::new(Mutex::new(HashMap::new())),
