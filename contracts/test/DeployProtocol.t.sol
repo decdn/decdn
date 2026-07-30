@@ -437,10 +437,11 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
         assertTrue(bd.timelock.isOperationPending(bd.timelock.hashOperationBatch(t, v, p, bytes32(0), bytes32(0))));
     }
 
-    /// @notice `CANCELLER_ROLE` gets its own commit (b04ecf43) and a docstring arguing
-    ///         it is "the only way to cancel its own erroneous scheduled proposal
-    ///         inside the 48-hour window" — but every assertion so far reads the role
-    ///         bit. This is the rehearsal that argument describes.
+    /// @notice `_assertTimelockRoleSeating` asserts `CANCELLER_ROLE` separately from
+    ///         `PROPOSER_ROLE` on the argument that it is the multisig's only way to
+    ///         cancel its own erroneous scheduled proposal inside the 48-hour window.
+    ///         Every other assertion reads the role bit; this is the rehearsal that
+    ///         argument describes.
     function test_bootstrap_multisigCanCancelItsOwnScheduledProposal() public {
         Deployment memory bd = _runFullDeploy(_bootstrapConfig());
         uint256 delay = bd.timelock.getMinDelay();
@@ -459,6 +460,65 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
         vm.warp(block.timestamp + delay + 1);
         vm.expectPartialRevert(TimelockController.TimelockUnexpectedOperationState.selector);
         bd.timelock.execute(address(bd.bond), 0, payload, bytes32(0), bytes32(0));
+    }
+
+    /// @notice The deployer leg of `_assertTimelockRoleSeating`, which had no test —
+    ///         delete those three lines and everything else still passes. It guards
+    ///         the `_postWiringHook` surface: the deployer admins the Timelock through
+    ///         phases 3-5, so a future hook could grant itself scheduling power and
+    ///         survive the handoff whose whole purpose is to leave it nothing.
+    function test_assertNoBackDoors_revertsWhenDeployerCanSchedule() public {
+        bytes32 proposerRole = d.timelock.PROPOSER_ROLE();
+        vm.prank(address(d.timelock));
+        d.timelock.grantRole(proposerRole, cfg.deployer);
+
+        vm.expectRevert(
+            abi.encodeWithSelector(BaseProtocolDeploy.TimelockRoleUnexpected.selector, cfg.deployer, proposerRole)
+        );
+        this.externalAssertNoBackDoors(cfg, d);
+    }
+
+    /// @notice `NotInBootstrapPhase` is a four-way conjunction, and both prior tests
+    ///         used states that are FULLY out of phase — so every `&&` could flip to
+    ///         `||` and they would still pass. A half-transitioned chain (multisig
+    ///         proposes but cannot cancel) is the state the guard's own comment says
+    ///         costs the operator signal, and it is what pins the conjunction.
+    function test_transitionScript_revertsOnHalfSeatedMultisig() public {
+        Deployment memory bd = _runFullDeploy(_bootstrapConfig());
+        // Hoisted: `vm.expectRevert` binds to the next call, and an inline
+        // `new TransitionToGovernor()` would consume it on the contract creation.
+        TransitionToGovernor script = new TransitionToGovernor();
+        bytes32 cancellerRole = bd.timelock.CANCELLER_ROLE();
+        vm.prank(address(bd.timelock));
+        bd.timelock.revokeRole(cancellerRole, bootstrapMultisig);
+
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                TransitionToGovernor.NotInBootstrapPhase.selector, bootstrapMultisig, address(bd.governor)
+            )
+        );
+        script.transitionBatchChecked(bd.timelock, address(bd.governor), bootstrapMultisig);
+    }
+
+    /// @notice Cancellation must be the multisig's alone. The positive half proves it
+    ///         can; without this an over-broad `CANCELLER_ROLE` grant would let any
+    ///         address cancel the transition batch itself during the delay window.
+    function test_bootstrap_thirdPartyCannotCancel() public {
+        Deployment memory bd = _runFullDeploy(_bootstrapConfig());
+        uint256 delay = bd.timelock.getMinDelay();
+        bytes memory payload = abi.encodeCall(bd.bond.setCurrentTermsHash, (keccak256("t")));
+
+        vm.prank(bootstrapMultisig);
+        bd.timelock.schedule(address(bd.bond), 0, payload, bytes32(0), bytes32(0), delay);
+        bytes32 id = bd.timelock.hashOperation(address(bd.bond), 0, payload, bytes32(0), bytes32(0));
+
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IAccessControl.AccessControlUnauthorizedAccount.selector, address(0xBAD), bd.timelock.CANCELLER_ROLE()
+            )
+        );
+        vm.prank(address(0xBAD));
+        bd.timelock.cancel(id);
     }
 
     /// @notice The script's precondition, which had no coverage at all. Its output is
@@ -555,7 +615,10 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
         internal
         returns (address[] memory targets, uint256[] memory values, bytes[] memory payloads)
     {
-        return new TransitionToGovernor().transitionBatch(bd.timelock, address(bd.governor), bootstrapMultisig);
+        // `transitionBatchChecked`, not `transitionBatch`: the checked wrapper is what
+        // `run()` calls, so its success path is what a multisig actually signs. The
+        // unchecked variant would leave that path executed by nothing.
+        return new TransitionToGovernor().transitionBatchChecked(bd.timelock, address(bd.governor), bootstrapMultisig);
     }
 
     /// @notice Seating the deployer as the bootstrap multisig must fail the deploy,

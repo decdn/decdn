@@ -991,9 +991,21 @@ jobs:
           done
       # Runs every fork suite; each self-skips unless its own RPC is set, so a run
       # with only one secret configured exercises just that suite.
+      # Reports how many suites the glob matched, not just which secrets exist.
+      # `forge test --match-path` exits 0 on a glob that matches nothing, so a rename
+      # or a typo would otherwise go green — and, with the summary above, green next
+      # to three configured-secret checkmarks. Counting the files is what turns
+      # "configured" into "actually ran".
       - name: Fork tests (no-op when no fork RPC is set)
         if: env.ARBITRUM_RPC_URL != '' || env.SEPOLIA_RPC_URL != '' || env.ARBITRUM_SEPOLIA_RPC_URL != ''
-        run: forge test --match-path 'test/*.fork.t.sol' -vv
+        run: |
+          matched=$(ls -1 test/*.fork.t.sol 2>/dev/null | wc -l)
+          echo "- fork suites matched by the glob: $matched" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$matched" -eq 0 ]; then
+            echo "::error::test/*.fork.t.sol matched no files — the fork suites have moved or been renamed"
+            exit 1
+          fi
+          forge test --match-path 'test/*.fork.t.sol' -vv
 
   solidity-coverage:
     name: solidity coverage

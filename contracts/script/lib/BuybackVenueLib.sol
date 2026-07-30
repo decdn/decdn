@@ -51,6 +51,22 @@ library BuybackVenueLib {
     ///         and the two entry points this library exists to keep in step would fall
     ///         through to *different* venues.
     error UnknownVenueVariant(uint8 venue);
+    /// @notice A burner was about to be constructed with a required field left at
+    ///         zero. `field` names it. Lives here rather than on the deploy script
+    ///         because BOTH entry points reach the burner through this library —
+    ///         `ActivateBuyback` builds its wiring straight from `vm.envAddress`,
+    ///         which rejects an *unset* var but happily parses an explicit `0x0`.
+    ///         A guard on the deploy script alone leaves the runbook path unprotected,
+    ///         which is the two-entry-point drift issue #1090 exists to remove.
+    error WiringIncomplete(string field);
+    /// @notice `maxBuybackAmount_` is zero. `GuardedBuybackBurner`'s constructor
+    ///         rejects an inverted band (`min > max`) but not a zero one, so
+    ///         `min == max == 0` constructs cleanly and then reverts
+    ///         `AboveMaxBuyback` on every call forever — a burner receiving the
+    ///         buyback bucket's 30% of revenue that can never spend it. Reachable
+    ///         from production env as `MIN_BUYBACK_AMOUNT=0 MAX_BUYBACK_AMOUNT=0`,
+    ///         the "0 means unlimited" misreading.
+    error GuardBandDead();
 
     // Steady-state FeeRouter split once buyback is live (ADR 026 § FeeRouter
     // split, ADR 016 § Deployment Order): 60% operator / 30% buyback / 10% treasury.
@@ -65,10 +81,12 @@ library BuybackVenueLib {
     // The shared MEV-defense guard band is NOT redeclared here. It is
     // `GuardedBuybackBurner.GuardParams` (ADR 018 § Parameter Table) — venue-
     // independent by construction, since it lives on the shared base rather than on
-    // either subclass. A local copy would be a fourth shape for one concept
-    // (base struct -> UniswapV3.Config -> BalancerV3.Config -> here) whose only
-    // effect is that a new guard field silently defaults to zero on this path
-    // instead of failing to compile.
+    // either subclass. A local copy would be a fourth name for one concept
+    // (base struct -> UniswapV3.Config -> BalancerV3.Config -> here). Not a
+    // correctness argument: a new field on the base breaks the named-args literals
+    // in both burner constructors, which breaks the `Config` literals below, so it
+    // fails to compile either way. The cost of the copy is the extra hop to update
+    // and the extra name, which is reason enough not to have one.
 
     /// @notice Everything `BuybackBurnerBalancerV3`'s constructor needs beyond the
     ///         tokens, admin, and guard band. Deliberately narrower than the
@@ -99,6 +117,16 @@ library BuybackVenueLib {
         return [STEADY_OPERATOR_SHARE, STEADY_BUYBACK_SHARE, STEADY_TREASURY_SHARE];
     }
 
+    /// @dev Reject a guard band that can never execute. `GuardedBuybackBurner`'s
+    ///      constructor checks `min > max` but not `max == 0`, so an all-zero band
+    ///      passes every bound it does check and then fails `amountIn > maxBuybackAmount`
+    ///      on every call. Checked here rather than in the burner because that
+    ///      contract is shipped and its bounds are ADR 018 parameters — this is the
+    ///      seam both deploy paths already share.
+    function _requireLiveGuardBand(GuardedBuybackBurner.GuardParams memory guard) private pure {
+        if (guard.maxBuybackAmount_ == 0) revert GuardBandDead();
+    }
+
     /// @notice Deploy the Uniswap V3 burner bound to `pool` and `swapRouter`
     ///         (SwapRouter02). `admin` receives `DEFAULT_ADMIN_ROLE` +
     ///         `GOVERNANCE_ROLE`; the caller is responsible for handing those on.
@@ -110,6 +138,9 @@ library BuybackVenueLib {
         address pool,
         GuardedBuybackBurner.GuardParams memory guard
     ) internal returns (GuardedBuybackBurner) {
+        if (swapRouter == address(0)) revert WiringIncomplete("uniswap.swapRouter");
+        if (pool == address(0)) revert WiringIncomplete("uniswap.pool");
+        _requireLiveGuardBand(guard);
         return new BuybackBurnerUniswapV3(
             usdc,
             token,
@@ -140,6 +171,19 @@ library BuybackVenueLib {
         BalancerWiring memory wiring,
         GuardedBuybackBurner.GuardParams memory guard
     ) internal returns (GuardedBuybackBurner) {
+        // `vault` is the one field with no downstream backstop: a zero vault is the
+        // documented deferred-wiring path, so the constructor skips validation and
+        // the burner reverts `PoolNotWired` on every swap, forever. The others would
+        // revert eventually; naming them here just makes the failure legible.
+        if (wiring.swapRouter == address(0)) revert WiringIncomplete("balancer.swapRouter");
+        if (wiring.pool == address(0)) revert WiringIncomplete("balancer.pool");
+        if (wiring.vault == address(0)) revert WiringIncomplete("balancer.vault");
+        if (wiring.permit2 == address(0)) revert WiringIncomplete("balancer.permit2");
+        // Keeper-schedule metadata, immutable and redeploy-only (ADR 018 § Parameter
+        // Table). No on-chain path reads it, but ADR 018 defines `= 1` and `> 1` and
+        // never `0`, so a zero is a permanently-wrong config with no defined meaning.
+        if (wiring.subSwapCount == 0) revert WiringIncomplete("balancer.subSwapCount");
+        _requireLiveGuardBand(guard);
         return new BuybackBurnerBalancerV3(
             usdc,
             token,

@@ -34,8 +34,8 @@ since project inception and will roll into the first tagged release.
     `BOOTSTRAP_MULTISIG` env var). Unset/zero keeps today's behaviour exactly:
     `DecdnGovernor` is seated as the `TimelockController`'s proposer at deploy,
     so DAO voting is live immediately.
-  - `BuybackActivation`'s 17 flat fields regroup into `guard` + `seed` (both
-    venue-*independent*) and the venue-scoped `uni` / `bal`. The flat layout let a
+  - `BuybackActivation`'s 17 flat fields regroup into the venue-independent `guard`,
+    the venue-derived `seed`, and the venue-scoped `uni` / `bal`. The flat layout let a
     Balancer field be set under `venue == UNISWAP` and silently dropped;
     `_activateBuyback` now rejects both halves of that mistake —
     `VenueFieldsCrossWired` for a field on the unselected venue, `VenueFieldsUnwired`
@@ -625,6 +625,26 @@ since project inception and will roll into the first tagged release.
   the per-venue `Config` literal — so the deploy-time genesis activation and the
   post-deploy runbook could wire different burners from the same inputs. Behaviour
   is unchanged; the duplication is gone.
+- **Burner wiring and guard-band validation moved into `BuybackVenueLib`.** The
+  completeness checks added earlier lived on `BaseProtocolDeploy`, so only the
+  genesis path had them — `ActivateBuyback`, the post-deploy runbook with no
+  `_assertBuybackActivated` backstop, had none. That is the two-entry-point drift
+  #1090 exists to remove, reintroduced by the fix for it. Both paths now validate at
+  the library both already call (`WiringIncomplete`), which also closes a second
+  dead-burner door: `GuardedBuybackBurner` rejects an inverted band but not a zero
+  one, so `MIN_BUYBACK_AMOUNT=0 MAX_BUYBACK_AMOUNT=0` constructed cleanly and then
+  reverted `AboveMaxBuyback` on every call forever (`GuardBandDead`).
+- **`PoolSeed` is self-checking rather than self-describing.** It now records
+  `targetPrice`, and `_assertVenueSeedMatches` re-derives `tokenSeed` instead of
+  trusting the venue tag. A tag alone is an unverifiable claim by whoever built the
+  struct, and `Venue.UNISWAP == 0` made it vacuous on a default-constructed seed —
+  which is the venue the Arbitrum Sepolia launch uses. A mismatch now reverts
+  `PoolSeedNotDerived`; an unset one reverts `TargetPriceZero`.
+- **`_activateBalancer` rejects a caller-supplied `bal.wiring.pool`** rather than
+  overwriting it (`PoolPrefilled`). The field is filled from the pool the script
+  creates, so a supplied value was silently discarded and a second pool created and
+  seeded with real protocol-owned liquidity — the natural mistake, since
+  `ActivateBuyback` reads `BALANCER_POOL` from env because it wires a live pool.
 - **The `solidity fork test` job now reports which fork RPCs are configured.** A
   skipped step yielded a green job rendered identically to one where every fork
   suite passed, which is how it went unnoticed that no fork RPC secret has ever
@@ -643,9 +663,11 @@ since project inception and will roll into the first tagged release.
   at the moment a deploy aborts mid-broadcast.
 - **CI runs the Uniswap genesis-activation fork suite (#1090).** The
   `solidity fork test` job now passes `ARBITRUM_SEPOLIA_RPC_URL` through, so
-  `GenesisBuybackActivation.fork.t.sol` executes instead of self-skipping. It
-  covers the Arbitrum Sepolia deploy path, which previously had no executable CI
-  coverage. Requires the repo secret of the same name to be configured.
+  `GenesisBuybackActivation.fork.t.sol` can execute instead of self-skipping. It
+  covers the Arbitrum Sepolia deploy path, which had no executable CI coverage.
+  **Still gated on the secret existing** — no fork RPC secret is configured on the
+  repo today, so all four fork suites remain unexecuted; see the fork-RPC reporting
+  entry above, which is what makes that visible.
 
 #### Node selection & observability
 
@@ -1056,7 +1078,8 @@ since project inception and will roll into the first tagged release.
   no-alloc builds for non-limb-aligned widths). Reaches us transitively through
   `alloy-primitives`, i.e. the U256 arithmetic on the payment path. No deCDN code
   calls the affected APIs — every `checked_shl` in `crates/` is on a primitive
-  `u64` (`cache/src/retry.rs`, `protocol/src/framing.rs`), not a `ruint::Uint`.
+  integer (`u64` in `cache/src/retry.rs`, `u32` in `protocol/src/framing.rs`), not a
+  `ruint::Uint`.
   Lockfile-only bump; no dependency requirement changed. The six new `ark-*`
   lockfile entries are optional features we do not enable — `cargo tree -e normal`
   links none of them.
