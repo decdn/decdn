@@ -71,6 +71,7 @@ use crate::region_accounting::RegionAccountant;
 mod delivery;
 mod dispatch;
 mod fill;
+mod source;
 mod voucher;
 mod window;
 mod wire;
