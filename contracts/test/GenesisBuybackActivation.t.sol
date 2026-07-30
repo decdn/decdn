@@ -7,6 +7,7 @@ import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 import { BaseProtocolDeploy } from "../script/BaseProtocolDeploy.s.sol";
 import { BuybackVenueLib } from "../script/lib/BuybackVenueLib.sol";
+import { GuardedBuybackBurner } from "../src/GuardedBuybackBurner.sol";
 import { INonfungiblePositionManager } from "../script/interfaces/IUniswapV3PoolCreation.sol";
 import { BuybackBurnerUniswapV3 } from "../src/BuybackBurnerUniswapV3.sol";
 import { MockEd25519Verifier } from "./mocks/MockEd25519Verifier.sol";
@@ -17,6 +18,9 @@ import { MockEd25519Verifier } from "./mocks/MockEd25519Verifier.sol";
 // The live-Uniswap acceptance path is covered by the gated Arbitrum Sepolia fork
 // test `GenesisBuybackActivation.fork.t.sol`.
 // -----------------------------------------------------------------
+
+/// @dev Bootstrap multisig stand-in — `_deployGovernor` requires code.
+contract MockGenesisMultisig { }
 
 contract MockUSDC is ERC20 {
     constructor() ERC20("USDC", "USDC") { }
@@ -162,17 +166,15 @@ contract GenesisBuybackActivationTest is Test, BaseProtocolDeploy {
         act.activate = true;
         act.venue = BuybackVenueLib.Venue.UNISWAP;
         act.keeper = keeper;
-        act.guard = BuybackVenueLib.GuardParams({
-            twapMinWindow: 1800,
-            maxBuybackAmount: 10_000e6,
-            minBuybackAmount: 100e6,
-            slippageBps: 200,
-            epochLiquidityCapFraction: 1000
+        act.guard = GuardedBuybackBurner.GuardParams({
+            twapMinWindow_: 1800,
+            maxBuybackAmount_: 10_000e6,
+            minBuybackAmount_: 100e6,
+            slippageBps_: 200,
+            epochLiquidityCapFraction_: 1000
         });
         act.uni = UniswapVenueParams({ swapRouter: swapRouter, positionManager: positionManager, poolFee: 10_000 });
-        act.seed = PoolSeed({
-            usdcSeed: USDC_SEED, tokenSeed: _deriveTokenSeed(BuybackVenueLib.Venue.UNISWAP, USDC_SEED, TARGET_PRICE)
-        });
+        act.seed = _derivePoolSeed(BuybackVenueLib.Venue.UNISWAP, USDC_SEED, TARGET_PRICE);
     }
 
     // External wrapper so `vm.expectRevert` catches reverts at the call boundary.
@@ -265,7 +267,7 @@ contract GenesisBuybackActivationTest is Test, BaseProtocolDeploy {
     ///         believe it had pointed at a Balancer pool and ship a Uniswap burner.
     function test_revertsWhenBalancerFieldsSetUnderUniswapVenue() public {
         BuybackActivation memory act = _uniswapActivation(address(0xdead));
-        act.bal.vault = address(0xBA1);
+        act.bal.wiring.vault = address(0xBA1);
         vm.expectRevert(
             abi.encodeWithSelector(BaseProtocolDeploy.VenueFieldsCrossWired.selector, BuybackVenueLib.Venue.UNISWAP)
         );
@@ -284,17 +286,9 @@ contract GenesisBuybackActivationTest is Test, BaseProtocolDeploy {
         this.externalRunFullDeploy(_config(), act);
     }
 
-    /// @notice The guard must not fire on the shapes the env reader actually
-    ///         produces: one venue populated, the other left entirely zero.
-    function test_scopedVenueFields_passTheGuard() public {
-        // A clean Uniswap activation runs THROUGH the guard and only fails later,
-        // at the pool-seed stage — proof the guard is venue-scoped, not blanket.
-        MockPositionManager npm = new MockPositionManager(false);
-        usdc.approve(address(npm), type(uint256).max);
-        vm.expectPartialRevert(BaseProtocolDeploy.PoolNotSeeded.selector);
-        this.externalRunFullDeploy(_config(), _uniswapActivation(address(npm)));
-    }
-
+    /// @notice Doubles as proof that `_assertVenueFieldsScoped` is venue-scoped
+    ///         rather than blanket: a correctly-wired Uniswap activation runs THROUGH
+    ///         both halves of the guard and only fails later, here.
     function test_revertsWhenPoolNotSeeded() public {
         // A manager that creates the pool but seeds no liquidity must fail the
         // "seed before wire" guard.
@@ -323,6 +317,75 @@ contract GenesisBuybackActivationTest is Test, BaseProtocolDeploy {
     // factory/vault/router stack is impractical to mock in-process. The keeper
     // guard here (`test_revertsWhenKeeperMissing`) is venue-agnostic and fires
     // before any venue-specific work, so it covers the Balancer path too.
+
+    // -----------------------------------------------------------------
+    // Bootstrap phase x genesis activation (ADR 009 + ADR 018)
+    // -----------------------------------------------------------------
+
+    /// @notice `BOOTSTRAP_MULTISIG` and `ACTIVATE_BUYBACK` are independent env vars,
+    ///         and this combination is the configuration the Arbitrum Sepolia deploy
+    ///         (#1083) actually takes: bootstrap multisig + Uniswap genesis venue.
+    ///         Neither suite constructed it before — `DeployProtocolTest` always
+    ///         deploys activation-off and this file always deploys bootstrap-off — so
+    ///         the one path where `_allGovernedTargets` returns nine targets, and the
+    ///         only path a real launch uses, had no coverage at all.
+    function test_bootstrap_withGenesisActivation_handsBurnerOffAndKeepsMultisigProposer() public {
+        MockPositionManager npm = new MockPositionManager(true);
+        usdc.approve(address(npm), type(uint256).max);
+
+        DeployConfig memory bootCfg = _config();
+        bootCfg.bootstrapMultisig = address(new MockGenesisMultisig());
+        Deployment memory bd = _runFullDeploy(bootCfg, _uniswapActivation(address(npm)));
+
+        // The burner is the ninth governed target: it must land on the Timelock with
+        // the rest, not be skipped because the handoff sized its array off a literal.
+        assertTrue(address(bd.buybackBurner) != address(0), "burner deployed");
+        assertTrue(bd.buybackBurner.hasRole(GOVERNANCE_ROLE, address(bd.timelock)), "burner gov to timelock");
+        assertTrue(bd.buybackBurner.hasRole(DEFAULT_ADMIN_ROLE, address(bd.timelock)), "burner admin to timelock");
+        assertFalse(bd.buybackBurner.hasRole(GOVERNANCE_ROLE, address(this)), "no deployer back door on burner");
+
+        // And the bootstrap phase still holds: only the multisig may schedule.
+        bytes32 proposerRole = bd.timelock.PROPOSER_ROLE();
+        assertTrue(bd.timelock.hasRole(proposerRole, bootCfg.bootstrapMultisig), "multisig proposes");
+        assertFalse(bd.timelock.hasRole(proposerRole, address(bd.governor)), "governor cannot propose yet");
+    }
+
+    // -----------------------------------------------------------------
+    // Venue/seed scoping guards
+    // -----------------------------------------------------------------
+
+    /// @notice The under-wire half of `_assertVenueFieldsScoped`. Without it a
+    ///         Balancer activation missing its Vault seeds the pool, constructs a
+    ///         burner whose wiring validation no-ops on a zero vault, flips the
+    ///         FeeRouter to route 30% of revenue at it, and passes every post-deploy
+    ///         assert — leaving a burner that reverts `PoolNotWired` forever.
+    ///         Asserted on the Uniswap venue here because the Balancer bundle needs a
+    ///         live factory; the guard is the same code path for both.
+    function test_revertsWhenSelectedVenueIsUnderWired() public {
+        BuybackActivation memory act = _uniswapActivation(address(0xdead));
+        act.uni.positionManager = address(0);
+        vm.expectRevert(
+            abi.encodeWithSelector(BaseProtocolDeploy.VenueFieldsUnwired.selector, BuybackVenueLib.Venue.UNISWAP)
+        );
+        this.externalRunFullDeploy(_config(), act);
+    }
+
+    /// @notice A seed sized for one venue paired with the other. `_deriveTokenSeed`
+    ///         weights the TOKEN leg 80/20 for Balancer and 1:1 for Uniswap, so this
+    ///         would initialize the genesis pool at 4x or 1/4 the intended anchor —
+    ///         silently, with no revert anywhere downstream.
+    function test_revertsWhenSeedWasDerivedForTheOtherVenue() public {
+        BuybackActivation memory act = _uniswapActivation(address(0xdead));
+        act.seed = _derivePoolSeed(BuybackVenueLib.Venue.BALANCER, USDC_SEED, TARGET_PRICE);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                BaseProtocolDeploy.PoolSeedVenueMismatch.selector,
+                BuybackVenueLib.Venue.UNISWAP,
+                BuybackVenueLib.Venue.BALANCER
+            )
+        );
+        this.externalRunFullDeploy(_config(), act);
+    }
 
     // -----------------------------------------------------------------
     // _deriveTokenSeed — price-driven TOKEN seed sizing

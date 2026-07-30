@@ -62,16 +62,13 @@ library BuybackVenueLib {
     ///      Balancer V3 Router pulls the swap's input USDC through it.
     address internal constant CANONICAL_PERMIT2 = 0x000000000022D473030F116dDEE9F6B43aC78BA3;
 
-    /// @notice The shared MEV-defense guard band both venues configure identically
-    ///         (ADR 018 § Parameter Table). Venue-independent by construction — it
-    ///         lives on `GuardedBuybackBurner`, not on either subclass.
-    struct GuardParams {
-        uint256 twapMinWindow;
-        uint256 maxBuybackAmount;
-        uint256 minBuybackAmount;
-        uint256 slippageBps;
-        uint256 epochLiquidityCapFraction;
-    }
+    // The shared MEV-defense guard band is NOT redeclared here. It is
+    // `GuardedBuybackBurner.GuardParams` (ADR 018 § Parameter Table) — venue-
+    // independent by construction, since it lives on the shared base rather than on
+    // either subclass. A local copy would be a fourth shape for one concept
+    // (base struct -> UniswapV3.Config -> BalancerV3.Config -> here) whose only
+    // effect is that a new guard field silently defaults to zero on this path
+    // instead of failing to compile.
 
     /// @notice Everything `BuybackBurnerBalancerV3`'s constructor needs beyond the
     ///         tokens, admin, and guard band. Deliberately narrower than the
@@ -111,7 +108,7 @@ library BuybackVenueLib {
         address admin,
         address swapRouter,
         address pool,
-        GuardParams memory guard
+        GuardedBuybackBurner.GuardParams memory guard
     ) internal returns (GuardedBuybackBurner) {
         return new BuybackBurnerUniswapV3(
             usdc,
@@ -120,11 +117,11 @@ library BuybackVenueLib {
             BuybackBurnerUniswapV3.Config({
                 swapRouter_: IUniswapV3SwapRouter(swapRouter),
                 pool_: pool,
-                twapMinWindow_: guard.twapMinWindow,
-                maxBuybackAmount_: guard.maxBuybackAmount,
-                minBuybackAmount_: guard.minBuybackAmount,
-                slippageBps_: guard.slippageBps,
-                epochLiquidityCapFraction_: guard.epochLiquidityCapFraction
+                twapMinWindow_: guard.twapMinWindow_,
+                maxBuybackAmount_: guard.maxBuybackAmount_,
+                minBuybackAmount_: guard.minBuybackAmount_,
+                slippageBps_: guard.slippageBps_,
+                epochLiquidityCapFraction_: guard.epochLiquidityCapFraction_
             })
         );
     }
@@ -141,7 +138,7 @@ library BuybackVenueLib {
         ERC20Burnable token,
         address admin,
         BalancerWiring memory wiring,
-        GuardParams memory guard
+        GuardedBuybackBurner.GuardParams memory guard
     ) internal returns (GuardedBuybackBurner) {
         return new BuybackBurnerBalancerV3(
             usdc,
@@ -154,11 +151,11 @@ library BuybackVenueLib {
                 permit2_: wiring.permit2,
                 subSwapCount_: wiring.subSwapCount,
                 subSwapMinBlockGap_: wiring.subSwapMinBlockGap,
-                twapMinWindow_: guard.twapMinWindow,
-                maxBuybackAmount_: guard.maxBuybackAmount,
-                minBuybackAmount_: guard.minBuybackAmount,
-                slippageBps_: guard.slippageBps,
-                epochLiquidityCapFraction_: guard.epochLiquidityCapFraction
+                twapMinWindow_: guard.twapMinWindow_,
+                maxBuybackAmount_: guard.maxBuybackAmount_,
+                minBuybackAmount_: guard.minBuybackAmount_,
+                slippageBps_: guard.slippageBps_,
+                epochLiquidityCapFraction_: guard.epochLiquidityCapFraction_
             })
         );
     }

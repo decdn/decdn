@@ -970,6 +970,25 @@ jobs:
       - uses: foundry-rs/foundry-toolchain@v1.9.0
         with:
           version: v1.7.1
+      # A skipped step yields a SUCCESSFUL job, and the checks UI renders
+      # "solidity fork test ✓" identically whether every fork suite passed or none
+      # ran at all. Distinguishing them meant opening the log and noticing an
+      # absence — which is why nobody spotted that no fork RPC secret has ever been
+      # configured, leaving all four suites permanently unexecuted behind a green
+      # check. This step always runs and puts the state in the job summary.
+      # Deliberately not a failure: fork PRs cannot have secrets by policy, and a
+      # hard gate here would turn main red until the secrets are provisioned.
+      - name: Fork RPC configuration
+        if: always()
+        run: |
+          for v in ARBITRUM_RPC_URL SEPOLIA_RPC_URL ARBITRUM_SEPOLIA_RPC_URL; do
+            if [ -z "${!v}" ]; then
+              echo "::warning::$v is not configured — its fork suite did not run"
+              echo "- ⚠️ \`$v\` unset — suite skipped" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "- ✅ \`$v\` configured" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
       # Runs every fork suite; each self-skips unless its own RPC is set, so a run
       # with only one secret configured exercises just that suite.
       - name: Fork tests (no-op when no fork RPC is set)

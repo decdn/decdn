@@ -6,6 +6,7 @@ import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 import { BaseProtocolDeploy } from "../script/BaseProtocolDeploy.s.sol";
 import { BuybackVenueLib } from "../script/lib/BuybackVenueLib.sol";
+import { GuardedBuybackBurner } from "../src/GuardedBuybackBurner.sol";
 import { IUniswapV3Factory } from "../script/interfaces/IUniswapV3PoolCreation.sol";
 import { BuybackBurnerUniswapV3 } from "../src/BuybackBurnerUniswapV3.sol";
 import { MockEd25519Verifier } from "./mocks/MockEd25519Verifier.sol";
@@ -89,17 +90,15 @@ contract GenesisBuybackActivationForkTest is Test, BaseProtocolDeploy {
         act.activate = true;
         act.venue = BuybackVenueLib.Venue.UNISWAP;
         act.keeper = keeper;
-        act.guard = BuybackVenueLib.GuardParams({
-            twapMinWindow: 1800,
-            maxBuybackAmount: 10_000e6,
-            minBuybackAmount: 100e6,
-            slippageBps: 200,
-            epochLiquidityCapFraction: 1000
+        act.guard = GuardedBuybackBurner.GuardParams({
+            twapMinWindow_: 1800,
+            maxBuybackAmount_: 10_000e6,
+            minBuybackAmount_: 100e6,
+            slippageBps_: 200,
+            epochLiquidityCapFraction_: 1000
         });
         act.uni = UniswapVenueParams({ swapRouter: SWAP_ROUTER, positionManager: POSITION_MANAGER, poolFee: FEE });
-        act.seed = PoolSeed({
-            usdcSeed: USDC_SEED, tokenSeed: _deriveTokenSeed(BuybackVenueLib.Venue.UNISWAP, USDC_SEED, TARGET_PRICE)
-        });
+        act.seed = _derivePoolSeed(BuybackVenueLib.Venue.UNISWAP, USDC_SEED, TARGET_PRICE);
     }
 
     /// @notice The headline acceptance: flag ON + Uniswap venue lands the

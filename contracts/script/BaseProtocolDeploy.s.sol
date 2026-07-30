@@ -36,7 +36,7 @@ import { IPublisherRegistryOwnership } from "../src/interfaces/IPublisherRegistr
 
 /// @title BaseProtocolDeploy
 /// @notice Abstract deploy primitive for the v3 contract surface. Performs the
-///         six-phase deploy described in ADR 016 § Deployment Order and
+///         seven-phase deploy described in ADR 016 § Deployment Order and
 ///         Initialization Dependencies + § Post-Deployment Initialization, then
 ///         asserts the deployer EOA holds no role on any target. Inherited by
 ///         `DeployProtocol.s.sol` (the env-var production script) and
@@ -172,6 +172,9 @@ abstract contract BaseProtocolDeploy is Script {
     struct PoolSeed {
         uint256 usdcSeed; // USDC seed (raw, 6-dec)
         uint256 tokenSeed; // TOKEN seed (raw, 18-dec)
+        // The venue `tokenSeed` was derived FOR. Carried so `_activateBuyback` can
+        // reject a seed paired with the other venue — see `_derivePoolSeed`.
+        BuybackVenueLib.Venue venue;
     }
 
     /// @notice Uniswap-venue inputs — the pool is created + seeded in-script.
@@ -186,14 +189,16 @@ abstract contract BaseProtocolDeploy is Script {
     /// @notice Balancer-venue inputs — the 80/20 pool is created + seeded
     ///         in-script. Must be entirely zero when `venue != BALANCER` (see
     ///         `_assertVenueFieldsScoped`).
+    /// @dev Only `factory` and `swapFee` are pool-*creation* inputs. Everything the
+    ///      burner's constructor needs is nested rather than restated, so adding a
+    ///      field to `BalancerWiring` is a compile error here instead of a silently
+    ///      unmapped value — the positional hand-mapping this replaces had no such
+    ///      backstop. `wiring.pool` is the one deliberate hole: it does not exist at
+    ///      env-read time and is filled by `_activateBalancer` once the pool is created.
     struct BalancerVenueParams {
         address factory; // WeightedPoolFactory (create the 80/20 pool)
-        address router; // Balancer V3 Router (seed via Permit2 + swap target)
-        address vault; // Balancer V3 Vault (reads + approvals)
-        address permit2; // canonical Permit2 the V3 Router pulls through
         uint256 swapFee; // pool swap fee (WAD; 1e16 = 1%)
-        uint256 subSwapCount; // keeper TWAP sub-swap count (immutable on the burner)
-        uint256 subSwapMinBlockGap; // keeper TWAP sub-swap block gap
+        BuybackVenueLib.BalancerWiring wiring;
     }
 
     /// @notice Genesis buyback-activation inputs. `activate == false` reproduces
@@ -212,7 +217,7 @@ abstract contract BaseProtocolDeploy is Script {
         // Keeper granted KEEPER_ROLE in-script (required when `activate`).
         address keeper;
         // Shared MEV-stack guard band (ADR 018 § Parameter Table).
-        BuybackVenueLib.GuardParams guard;
+        GuardedBuybackBurner.GuardParams guard;
         PoolSeed seed;
         UniswapVenueParams uni;
         BalancerVenueParams bal;
@@ -305,15 +310,20 @@ abstract contract BaseProtocolDeploy is Script {
     ///         contract ungoverned. Asserting both directions makes the in-script
     ///         guard symmetric with the test role matrix.
     error GovernanceNotHandedOff(address target, bytes32 role);
-    /// @notice Post-deploy invariant — a Timelock scheduling role (`PROPOSER_ROLE`
-    ///         or `CANCELLER_ROLE`) is not seated as this deploy mode requires.
-    ///         `shouldHold` distinguishes the two failures: `true` means `account`
-    ///         was meant to hold `role` and does not; `false` means it holds `role`
-    ///         and must not — the shape that matters, since a bootstrap deploy that
-    ///         left `DecdnGovernor` a proposer puts DAO execution one 48-hour delay
-    ///         away while the operator set is still too thin for capacity-weighted
-    ///         voting to be safe (ADR 009).
-    error ProposerNotSeated(address account, bytes32 role, bool shouldHold);
+    /// @notice Post-deploy invariant — `account` was meant to hold a Timelock
+    ///         scheduling role (`PROPOSER_ROLE` or `CANCELLER_ROLE`) and does not.
+    ///         Nobody can schedule through it, so the protocol ships ungovernable.
+    error TimelockRoleMissing(address account, bytes32 role);
+    /// @notice Post-deploy invariant — `account` holds a Timelock scheduling role and
+    ///         must not. The consequence is the opposite of `TimelockRoleMissing` and
+    ///         they are deliberately separate errors rather than one carrying a
+    ///         boolean: a deploy aborts mid-broadcast and the revert has to say which
+    ///         it was without the operator going to read the source. A bootstrap
+    ///         deploy that left `DecdnGovernor` a proposer puts DAO execution one
+    ///         48-hour delay away against an operator set still too thin for
+    ///         capacity-weighted voting to be safe (ADR 009); a deployer holding one
+    ///         is a standing single-key scheduler surviving the handoff.
+    error TimelockRoleUnexpected(address account, bytes32 role);
     /// @notice `DeployConfig.bootstrapMultisig` is the deployer EOA. That would seat
     ///         a single key as the Timelock's sole proposer for the whole bootstrap
     ///         phase — the standing god-mode the handoff exists to remove — and
@@ -352,6 +362,17 @@ abstract contract BaseProtocolDeploy is Script {
     ///         burner. `venue` is the selected venue; the offending fields are the
     ///         other one's.
     error VenueFieldsCrossWired(BuybackVenueLib.Venue venue);
+    /// @notice Genesis activation left a required field zero on the venue it DID
+    ///         select. `venue` is that venue. Catches the mirror of
+    ///         `VenueFieldsCrossWired`: a Balancer activation missing its Vault ships
+    ///         a burner that can never swap while already receiving the buyback
+    ///         bucket's 30% of revenue.
+    error VenueFieldsUnwired(BuybackVenueLib.Venue venue);
+    /// @notice The `PoolSeed` was derived for `seedVenue` but the activation selects
+    ///         `venue`. The two weight the TOKEN leg differently (80/20 vs 1:1), so
+    ///         proceeding would initialize the genesis pool at 4x or 1/4 the intended
+    ///         anchor price — silently, since nothing downstream re-checks.
+    error PoolSeedVenueMismatch(BuybackVenueLib.Venue venue, BuybackVenueLib.Venue seedVenue);
     /// @notice The venue seed left the pool with no USDC depth — the per-epoch
     ///         cap denominator (`usdc.balanceOf(pool)`) would be zero, so the
     ///         "seed the pool before wiring" guard fails the deploy loudly.
@@ -573,9 +594,23 @@ abstract contract BaseProtocolDeploy is Script {
     ///      `PROPOSER_ROLE` and `CANCELLER_ROLE` alike.
     function _assertTimelockRoleSeating(DeployConfig memory cfg, Deployment memory d, bytes32 role) internal view {
         address expected = _initialProposer(cfg, d);
-        if (!d.timelock.hasRole(role, expected)) revert ProposerNotSeated(expected, role, true);
-        if (cfg.bootstrapMultisig != address(0) && d.timelock.hasRole(role, address(d.governor))) {
-            revert ProposerNotSeated(address(d.governor), role, false);
+        if (!d.timelock.hasRole(role, expected)) revert TimelockRoleMissing(expected, role);
+
+        // Gated on `expected != governor` rather than on bootstrap mode. The old
+        // `bootstrapMultisig != 0` gate short-circuited the whole negative half on a
+        // default deploy, leaving it with NO assertion that anyone other than the
+        // Governor can schedule.
+        if (address(d.governor) != expected && d.timelock.hasRole(role, address(d.governor))) {
+            revert TimelockRoleUnexpected(address(d.governor), role);
+        }
+
+        // The deployer, unconditionally. `_assertNoBackDoors` checks it for
+        // GOVERNANCE_ROLE/DEFAULT_ADMIN_ROLE on the targets and DEFAULT_ADMIN_ROLE on
+        // the Timelock — never for scheduling power. It admins the Timelock through
+        // phases 3-5, so a `_postWiringHook` override or any future code could grant
+        // itself one and survive the handoff whose whole point is to leave it nothing.
+        if (cfg.deployer != expected && d.timelock.hasRole(role, cfg.deployer)) {
+            revert TimelockRoleUnexpected(cfg.deployer, role);
         }
     }
 
@@ -818,6 +853,7 @@ abstract contract BaseProtocolDeploy is Script {
     function _activateBuyback(DeployConfig memory cfg, BuybackActivation memory act, Deployment memory d) internal {
         if (act.keeper == address(0)) revert MissingBuybackKeeper();
         _assertVenueFieldsScoped(act);
+        _assertVenueSeedMatches(act);
 
         // Explicit else-revert rather than a two-way ternary: Solidity has no
         // exhaustiveness check, so a third `Venue` variant would otherwise be silently
@@ -854,20 +890,54 @@ abstract contract BaseProtocolDeploy is Script {
         d.buybackBurner = burner;
     }
 
-    /// @dev Reject any non-zero field belonging to the venue `act` did not select.
-    ///      `DeployProtocol._readBuybackActivation` only ever populates one branch,
-    ///      so this fires exactly on a hand-constructed activation that wired both
-    ///      — the failure mode the old flat struct swallowed (issue #1090).
+    /// @dev Two halves, both needed.
+    ///
+    ///      **Cross-wired** — any non-zero field on the venue `act` did NOT select.
+    ///      Compared as an `abi.encode` digest against a zero-valued struct rather
+    ///      than a hand-written disjunction, so the check cannot fall behind the
+    ///      type: a field added later is covered by construction, where an
+    ///      enumeration would compile clean, pass every test, and silently
+    ///      under-check.
+    ///
+    ///      **Under-wired** — a required field missing on the venue it DID select.
+    ///      Without this, `bal.wiring.vault == 0` is entirely silent: the pool seeds
+    ///      (that path never reads the vault), `BuybackBurnerBalancerV3`'s
+    ///      constructor treats a zero vault as the documented deferred-wiring case
+    ///      and skips validation, and `_assertBuybackActivated` only checks the
+    ///      FeeRouter binding, the shares, and two roles — never liveness. The
+    ///      deploy exits 0 having routed 30% of protocol revenue to a burner whose
+    ///      every `executeBuyback` reverts `PoolNotWired`, forever, post-handoff.
+    ///      That is the outcome `MissingBuybackKeeper` exists to prevent, reached
+    ///      through a different door. The Uniswap side fails less quietly (an
+    ///      `extcodesize` revert with no reason string, mid-broadcast) but earns the
+    ///      same guard.
+    ///
+    ///      `DeployProtocol._readBuybackActivation` is an `if/else` and cannot emit
+    ///      either state, so both halves fire only on a hand-constructed activation
+    ///      — which is exactly what the test fixtures and any future caller of the
+    ///      `internal _runFullDeploy(cfg, act)` overload are.
     function _assertVenueFieldsScoped(BuybackActivation memory act) internal pure {
         if (act.venue == BuybackVenueLib.Venue.UNISWAP) {
-            BalancerVenueParams memory b = act.bal;
-            bool crossWired = b.factory != address(0) || b.router != address(0) || b.vault != address(0)
-                || b.permit2 != address(0) || b.swapFee != 0 || b.subSwapCount != 0 || b.subSwapMinBlockGap != 0;
-            if (crossWired) revert VenueFieldsCrossWired(act.venue);
-        } else {
+            BalancerVenueParams memory emptyBal;
+            if (keccak256(abi.encode(act.bal)) != keccak256(abi.encode(emptyBal))) {
+                revert VenueFieldsCrossWired(act.venue);
+            }
             UniswapVenueParams memory u = act.uni;
-            bool crossWired = u.swapRouter != address(0) || u.positionManager != address(0) || u.poolFee != 0;
-            if (crossWired) revert VenueFieldsCrossWired(act.venue);
+            if (u.swapRouter == address(0) || u.positionManager == address(0) || u.poolFee == 0) {
+                revert VenueFieldsUnwired(act.venue);
+            }
+        } else {
+            UniswapVenueParams memory emptyUni;
+            if (keccak256(abi.encode(act.uni)) != keccak256(abi.encode(emptyUni))) {
+                revert VenueFieldsCrossWired(act.venue);
+            }
+            BalancerVenueParams memory b = act.bal;
+            // `subSwapCount` / `subSwapMinBlockGap` are deliberately absent: both are
+            // legitimately zero (the burner stores them unchecked), so requiring them
+            // would reject a valid activation.
+            bool unwired = b.factory == address(0) || b.swapFee == 0 || b.wiring.swapRouter == address(0)
+                || b.wiring.vault == address(0) || b.wiring.permit2 == address(0);
+            if (unwired) revert VenueFieldsUnwired(act.venue);
         }
     }
 
@@ -903,21 +973,13 @@ abstract contract BaseProtocolDeploy is Script {
         // broadcasting deployer; hand it to the Timelock and clear the Permit2
         // approvals so the deployer keeps no custody — mirroring the Uniswap path.
         _finalizeBalancerSeed(
-            cfg.usdc, IERC20(address(d.token)), pool, act.bal.permit2, cfg.deployer, address(d.timelock)
+            cfg.usdc, IERC20(address(d.token)), pool, act.bal.wiring.permit2, cfg.deployer, address(d.timelock)
         );
+        // The only field the env reader could not fill: the pool did not exist yet.
+        BuybackVenueLib.BalancerWiring memory wiring = act.bal.wiring;
+        wiring.pool = pool;
         return BuybackVenueLib.deployBalancerBurner(
-            cfg.usdc,
-            ERC20Burnable(address(d.token)),
-            cfg.deployer,
-            BuybackVenueLib.BalancerWiring({
-                swapRouter: act.bal.router,
-                pool: pool,
-                vault: act.bal.vault,
-                permit2: act.bal.permit2,
-                subSwapCount: act.bal.subSwapCount,
-                subSwapMinBlockGap: act.bal.subSwapMinBlockGap
-            }),
-            act.guard
+            cfg.usdc, ERC20Burnable(address(d.token)), cfg.deployer, wiring, act.guard
         );
     }
 
@@ -991,7 +1053,7 @@ abstract contract BaseProtocolDeploy is Script {
         _permit2Approve(token, act, act.seed.tokenSeed);
 
         // slither-disable-next-line unused-return
-        IBalancerV3RouterInit(act.bal.router).initialize(pool, initTokens, initAmounts, 0, false, "");
+        IBalancerV3RouterInit(act.bal.wiring.swapRouter).initialize(pool, initTokens, initAmounts, 0, false, "");
     }
 
     /// @dev Post-seed cleanup for the Balancer venue: move the freshly-minted
@@ -1016,9 +1078,9 @@ abstract contract BaseProtocolDeploy is Script {
     ///      `erc20` from the deployer: ERC20-approve Permit2, then set the Permit2
     ///      allowance for the Router.
     function _permit2Approve(IERC20 erc20, BuybackActivation memory act, uint256 amount) internal {
-        erc20.forceApprove(act.bal.permit2, type(uint256).max);
-        IPermit2(act.bal.permit2)
-            .approve(address(erc20), act.bal.router, uint160(amount), uint48(block.timestamp + 1 days));
+        erc20.forceApprove(act.bal.wiring.permit2, type(uint256).max);
+        IPermit2(act.bal.wiring.permit2)
+            .approve(address(erc20), act.bal.wiring.swapRouter, uint160(amount), uint48(block.timestamp + 1 days));
     }
 
     /// @dev Create the TOKEN/USDC Uniswap V3 pool (idempotent) at the seed-implied
@@ -1099,6 +1161,28 @@ abstract contract BaseProtocolDeploy is Script {
     ///      where the value-weight ratio is 1:1 for the 50/50 constant-product
     ///      Uniswap pool and 4:1 (80/20) for the Balancer weighted pool. Feeding the
     ///      seeds in this proportion makes the pool initialize at exactly `targetPrice`.
+    /// @notice The only supported way to build a `PoolSeed`. `tokenSeed` is
+    ///         venue-derived (80/20 weights for Balancer, 1:1 for Uniswap), so a seed
+    ///         and a venue chosen independently can disagree — and that disagreement
+    ///         is **silent**: the pool simply initializes at 4x or 1/4 the intended
+    ///         anchor price, seeding real protocol-owned liquidity at the wrong
+    ///         value with no revert anywhere. Recording the venue here lets
+    ///         `_assertVenueSeedMatches` reject the mismatch instead.
+    function _derivePoolSeed(BuybackVenueLib.Venue venue, uint256 usdcSeed, uint256 targetPrice)
+        internal
+        pure
+        returns (PoolSeed memory)
+    {
+        return PoolSeed({ usdcSeed: usdcSeed, tokenSeed: _deriveTokenSeed(venue, usdcSeed, targetPrice), venue: venue });
+    }
+
+    /// @dev Reject a `PoolSeed` derived for a different venue than the activation
+    ///      selects. Cheap, and the only guard standing between a mis-anchored
+    ///      genesis pool and a silent 4x pricing error.
+    function _assertVenueSeedMatches(BuybackActivation memory act) internal pure {
+        if (act.seed.venue != act.venue) revert PoolSeedVenueMismatch(act.venue, act.seed.venue);
+    }
+
     function _deriveTokenSeed(BuybackVenueLib.Venue venue, uint256 usdcSeed, uint256 targetPrice)
         internal
         pure

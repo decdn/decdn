@@ -27,16 +27,26 @@ since project inception and will roll into the first tagged release.
   (#1090, #1175).** Both are `BaseProtocolDeploy` structs, so only out-of-tree
   callers that construct them by hand are affected — no contract ABI, config
   file, or CLI surface changes, and a `DeployProtocol` run with an unchanged
-  environment produces the same deploy it did before.
+  environment produces the same deploy it did before. The written manifest does
+  change shape: `deployments/<chainId>.json` gains an `externalDeps.bootstrapMultisig`
+  key, which matters to anything parsing it.
   - `DeployConfig` gains `bootstrapMultisig` (read from the new optional
     `BOOTSTRAP_MULTISIG` env var). Unset/zero keeps today's behaviour exactly:
     `DecdnGovernor` is seated as the `TimelockController`'s proposer at deploy,
     so DAO voting is live immediately.
-  - `BuybackActivation`'s 17 flat fields regroup into venue-scoped sub-structs
-    (`guard`, `seed`, `uni`, `bal`). The flat layout let a Balancer field be set
-    under `venue == UNISWAP` and silently dropped; `_activateBuyback` now reverts
-    `VenueFieldsCrossWired` on any non-zero field belonging to the unselected
-    venue.
+  - `BuybackActivation`'s 17 flat fields regroup into `guard` + `seed` (both
+    venue-*independent*) and the venue-scoped `uni` / `bal`. The flat layout let a
+    Balancer field be set under `venue == UNISWAP` and silently dropped;
+    `_activateBuyback` now rejects both halves of that mistake —
+    `VenueFieldsCrossWired` for a field on the unselected venue, `VenueFieldsUnwired`
+    for a required field missing on the selected one (a Balancer activation without
+    its Vault otherwise ships a burner that can never swap while already receiving
+    30% of protocol revenue). `PoolSeed` additionally records the venue it was
+    derived for, since the 80/20-vs-1:1 seed weighting means a mismatched pair
+    mis-anchors the genesis pool silently (`PoolSeedVenueMismatch`).
+  - `BalancerVenueParams` nests `BuybackVenueLib.BalancerWiring` rather than
+    restating five of its fields, and the guard band is
+    `GuardedBuybackBurner.GuardParams` rather than a fourth copy of the same shape.
 
 - **Monitoring-breaking: `monitoring/` no longer ships rules and panels that
   could never fire (#1513).** Eleven `decdn_*` series referenced by the
@@ -610,9 +620,27 @@ since project inception and will roll into the first tagged release.
   venue dispatch and burner construction (#1090).** The steady-state FeeRouter
   split, the canonical Permit2 address, the `BUYBACK_VENUE` string dispatch, and
   the per-venue `Config` literal were duplicated across `BaseProtocolDeploy`,
-  `ActivateBuyback`, and `DeployProtocol` — four ways for the deploy-time genesis
-  activation and the post-deploy runbook to wire different burners from the same
-  inputs. Behaviour is unchanged; the duplication is gone.
+  `ActivateBuyback`, and `DeployProtocol`. Four items each had two copies — the
+  steady-state split, the canonical Permit2 address, the venue-string dispatch, and
+  the per-venue `Config` literal — so the deploy-time genesis activation and the
+  post-deploy runbook could wire different burners from the same inputs. Behaviour
+  is unchanged; the duplication is gone.
+- **The `solidity fork test` job now reports which fork RPCs are configured.** A
+  skipped step yielded a green job rendered identically to one where every fork
+  suite passed, which is how it went unnoticed that no fork RPC secret has ever
+  been set — all four suites have been permanently unexecuted behind a passing
+  check. The job now always writes each secret's state to the run summary and
+  emits a warning for the missing ones. Deliberately not a hard failure: fork PRs
+  cannot carry secrets by policy.
+- **`_assertTimelockRoleSeating` is mode-independent and also checks the deployer.**
+  Its negative half was gated on bootstrap mode, so a default deploy asserted
+  nothing about anyone *other* than the Governor holding a scheduling role, and the
+  deployer was never checked for one at all — it admins the Timelock through phases
+  3-5, so a future `_postWiringHook` could grant itself one and survive the handoff.
+  `ProposerNotSeated(address, bytes32, bool)` splits into `TimelockRoleMissing` and
+  `TimelockRoleUnexpected`: the two directions mean opposite things (ungovernable
+  vs. governance live too early) and a boolean three commas deep does not say which
+  at the moment a deploy aborts mid-broadcast.
 - **CI runs the Uniswap genesis-activation fork suite (#1090).** The
   `solidity fork test` job now passes `ARBITRUM_SEPOLIA_RPC_URL` through, so
   `GenesisBuybackActivation.fork.t.sol` executes instead of self-skipping. It

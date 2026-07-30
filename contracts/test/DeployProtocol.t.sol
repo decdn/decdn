@@ -6,6 +6,7 @@ import { ERC20 } from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { Pausable } from "@openzeppelin/contracts/utils/Pausable.sol";
 import { IAccessControl } from "@openzeppelin/contracts/access/IAccessControl.sol";
+import { TimelockController } from "@openzeppelin/contracts/governance/TimelockController.sol";
 
 import { BaseProtocolDeploy } from "../script/BaseProtocolDeploy.s.sol";
 import { TransitionToGovernor } from "../script/TransitionToGovernor.s.sol";
@@ -317,7 +318,7 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
         bootCfg.bootstrapMultisig = bootstrapMultisig;
     }
 
-    function test_bootstrap_multisigIsTheSoleProposer() public {
+    function test_bootstrap_multisigProposesAndGovernorCannot() public {
         Deployment memory bd = _runFullDeploy(_bootstrapConfig());
         bytes32 proposerRole = bd.timelock.PROPOSER_ROLE();
         bytes32 cancellerRole = bd.timelock.CANCELLER_ROLE();
@@ -368,7 +369,7 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
         bd.timelock.schedule(address(bd.bond), 0, payload, bytes32(0), bytes32(0), delay);
 
         // Not yet — the whole safeguard is that the operator set can see it coming.
-        vm.expectRevert();
+        vm.expectPartialRevert(TimelockController.TimelockUnexpectedOperationState.selector);
         bd.timelock.execute(address(bd.bond), 0, payload, bytes32(0), bytes32(0));
 
         vm.warp(block.timestamp + delay + 1);
@@ -396,6 +397,68 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
         assertTrue(bd.timelock.hasRole(cancellerRole, address(bd.governor)), "governor cancels");
         assertFalse(bd.timelock.hasRole(proposerRole, bootstrapMultisig), "multisig stripped");
         assertFalse(bd.timelock.hasRole(cancellerRole, bootstrapMultisig), "multisig canceller stripped");
+    }
+
+    /// @notice Role bits are a proxy; this is the property. `GovernorTimelockControl`
+    ///         reaches the Timelock through `scheduleBatch`, so pranking as the
+    ///         Governor and calling it directly proves the phase actually withholds
+    ///         execution — and that the transition restores it. (The Governor's own
+    ///         propose/vote state machine is covered in default mode by
+    ///         `GovernanceLifecycle.t.sol`; what is bootstrap-specific is exactly this
+    ///         one authorization edge.)
+    function test_bootstrap_governorCannotScheduleUntilTransition() public {
+        Deployment memory bd = _runFullDeploy(_bootstrapConfig());
+        bytes32 proposerRole = bd.timelock.PROPOSER_ROLE();
+        uint256 delay = bd.timelock.getMinDelay();
+
+        address[] memory t = new address[](1);
+        uint256[] memory v = new uint256[](1);
+        bytes[] memory p = new bytes[](1);
+        t[0] = address(bd.bond);
+        p[0] = abi.encodeCall(bd.bond.setCurrentTermsHash, (keccak256("dao terms")));
+
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IAccessControl.AccessControlUnauthorizedAccount.selector, address(bd.governor), proposerRole
+            )
+        );
+        vm.prank(address(bd.governor));
+        bd.timelock.scheduleBatch(t, v, p, bytes32(0), bytes32(0), delay);
+
+        // After the transition the same call is authorized.
+        (address[] memory bt, uint256[] memory bv, bytes[] memory bp) = _transitionBatch(bd);
+        vm.prank(bootstrapMultisig);
+        bd.timelock.scheduleBatch(bt, bv, bp, bytes32(0), bytes32(0), delay);
+        vm.warp(block.timestamp + delay + 1);
+        bd.timelock.executeBatch(bt, bv, bp, bytes32(0), bytes32(0));
+
+        vm.prank(address(bd.governor));
+        bd.timelock.scheduleBatch(t, v, p, bytes32(0), bytes32(0), delay);
+        assertTrue(bd.timelock.isOperationPending(bd.timelock.hashOperationBatch(t, v, p, bytes32(0), bytes32(0))));
+    }
+
+    /// @notice `CANCELLER_ROLE` gets its own commit (b04ecf43) and a docstring arguing
+    ///         it is "the only way to cancel its own erroneous scheduled proposal
+    ///         inside the 48-hour window" — but every assertion so far reads the role
+    ///         bit. This is the rehearsal that argument describes.
+    function test_bootstrap_multisigCanCancelItsOwnScheduledProposal() public {
+        Deployment memory bd = _runFullDeploy(_bootstrapConfig());
+        uint256 delay = bd.timelock.getMinDelay();
+        bytes memory payload = abi.encodeCall(bd.bond.setCurrentTermsHash, (keccak256("oops")));
+
+        vm.prank(bootstrapMultisig);
+        bd.timelock.schedule(address(bd.bond), 0, payload, bytes32(0), bytes32(0), delay);
+        bytes32 id = bd.timelock.hashOperation(address(bd.bond), 0, payload, bytes32(0), bytes32(0));
+        assertTrue(bd.timelock.isOperationPending(id), "scheduled");
+
+        vm.prank(bootstrapMultisig);
+        bd.timelock.cancel(id);
+        assertFalse(bd.timelock.isOperation(id), "cancelled");
+
+        // And the cancelled operation cannot then be executed once the delay elapses.
+        vm.warp(block.timestamp + delay + 1);
+        vm.expectPartialRevert(TimelockController.TimelockUnexpectedOperationState.selector);
+        bd.timelock.execute(address(bd.bond), 0, payload, bytes32(0), bytes32(0));
     }
 
     /// @notice The script's precondition, which had no coverage at all. Its output is
@@ -539,7 +602,7 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
 
         vm.expectRevert(
             abi.encodeWithSelector(
-                BaseProtocolDeploy.ProposerNotSeated.selector, address(bd.governor), proposerRole, false
+                BaseProtocolDeploy.TimelockRoleUnexpected.selector, address(bd.governor), proposerRole
             )
         );
         this.externalAssertNoBackDoors(bootCfg, bd);
@@ -553,9 +616,7 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
         d.timelock.revokeRole(proposerRole, address(d.governor));
 
         vm.expectRevert(
-            abi.encodeWithSelector(
-                BaseProtocolDeploy.ProposerNotSeated.selector, address(d.governor), proposerRole, true
-            )
+            abi.encodeWithSelector(BaseProtocolDeploy.TimelockRoleMissing.selector, address(d.governor), proposerRole)
         );
         this.externalAssertNoBackDoors(cfg, d);
     }
@@ -575,9 +636,7 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
         bd.timelock.revokeRole(cancellerRole, bootstrapMultisig);
 
         vm.expectRevert(
-            abi.encodeWithSelector(
-                BaseProtocolDeploy.ProposerNotSeated.selector, bootstrapMultisig, cancellerRole, true
-            )
+            abi.encodeWithSelector(BaseProtocolDeploy.TimelockRoleMissing.selector, bootstrapMultisig, cancellerRole)
         );
         this.externalAssertNoBackDoors(bootCfg, bd);
     }
@@ -594,7 +653,7 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
 
         vm.expectRevert(
             abi.encodeWithSelector(
-                BaseProtocolDeploy.ProposerNotSeated.selector, address(bd.governor), cancellerRole, false
+                BaseProtocolDeploy.TimelockRoleUnexpected.selector, address(bd.governor), cancellerRole
             )
         );
         this.externalAssertNoBackDoors(bootCfg, bd);

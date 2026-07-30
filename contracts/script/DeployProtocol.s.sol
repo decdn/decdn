@@ -5,6 +5,7 @@ import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 import { BaseProtocolDeploy } from "./BaseProtocolDeploy.s.sol";
 import { BuybackVenueLib } from "./lib/BuybackVenueLib.sol";
+import { GuardedBuybackBurner } from "../src/GuardedBuybackBurner.sol";
 import { Ed25519Verifier } from "../src/Ed25519Verifier.sol";
 
 /// @title DeployProtocol — production v3 contract surface deployer (issue #694)
@@ -251,12 +252,12 @@ contract DeployProtocol is BaseProtocolDeploy {
 
         act.venue = BuybackVenueLib.parseVenue(vm.envOr("BUYBACK_VENUE", string("uniswap")));
         act.keeper = vm.envAddress("BUYBACK_KEEPER"); // required — enforced in _activateBuyback too
-        act.guard = BuybackVenueLib.GuardParams({
-            twapMinWindow: vm.envOr("TWAP_MIN_WINDOW_SECS", uint256(1800)),
-            maxBuybackAmount: vm.envOr("MAX_BUYBACK_AMOUNT", uint256(10_000e6)),
-            minBuybackAmount: vm.envOr("MIN_BUYBACK_AMOUNT", uint256(100e6)),
-            slippageBps: vm.envOr("SLIPPAGE_BPS", uint256(200)),
-            epochLiquidityCapFraction: vm.envOr("EPOCH_CAP_FRACTION_BPS", uint256(1000))
+        act.guard = GuardedBuybackBurner.GuardParams({
+            twapMinWindow_: vm.envOr("TWAP_MIN_WINDOW_SECS", uint256(1800)),
+            maxBuybackAmount_: vm.envOr("MAX_BUYBACK_AMOUNT", uint256(10_000e6)),
+            minBuybackAmount_: vm.envOr("MIN_BUYBACK_AMOUNT", uint256(100e6)),
+            slippageBps_: vm.envOr("SLIPPAGE_BPS", uint256(200)),
+            epochLiquidityCapFraction_: vm.envOr("EPOCH_CAP_FRACTION_BPS", uint256(1000))
         });
 
         // Pool seed: pick a USDC amount you actually hold and a target TOKEN price;
@@ -264,9 +265,11 @@ contract DeployProtocol is BaseProtocolDeploy {
         // (no need to hand-compute the ratio, and it differs per venue's weights).
         // `BUYBACK_TARGET_PRICE` is the price of one whole TOKEN in USDC base units
         // (6-dec USDC → `$0.01/TOKEN` is `10_000`).
-        act.seed.usdcSeed = vm.envOr("BUYBACK_USDC_SEED", uint256(100e6));
+        uint256 usdcSeed = vm.envOr("BUYBACK_USDC_SEED", uint256(100e6));
         uint256 targetPrice = vm.envOr("BUYBACK_TARGET_PRICE", uint256(10_000)); // $0.01/TOKEN
-        act.seed.tokenSeed = _deriveTokenSeed(act.venue, act.seed.usdcSeed, targetPrice);
+        // Built through the derivation helper so the seed records the venue it was
+        // sized for; pairing it with the other venue mis-anchors the pool silently.
+        act.seed = _derivePoolSeed(act.venue, usdcSeed, targetPrice);
 
         // Exactly one venue sub-struct is populated; the other stays zero, which is
         // what `_assertVenueFieldsScoped` enforces before the burner is deployed.
@@ -281,12 +284,16 @@ contract DeployProtocol is BaseProtocolDeploy {
             act.uni.poolFee = uint24(fee);
         } else {
             act.bal.factory = vm.envAddress("BALANCER_WEIGHTED_POOL_FACTORY");
-            act.bal.router = vm.envAddress("BALANCER_ROUTER");
-            act.bal.vault = vm.envAddress("BALANCER_VAULT");
-            act.bal.permit2 = vm.envOr("PERMIT2_ADDRESS", BuybackVenueLib.CANONICAL_PERMIT2);
             act.bal.swapFee = vm.envOr("BALANCER_SWAP_FEE", uint256(1e16)); // 1% (ADR 018 pool fee)
-            act.bal.subSwapCount = vm.envOr("SUB_SWAP_COUNT", uint256(4));
-            act.bal.subSwapMinBlockGap = vm.envOr("SUB_SWAP_MIN_BLOCK_GAP", uint256(10));
+            // `pool` stays zero: it does not exist until `_activateBalancer` creates it.
+            act.bal.wiring = BuybackVenueLib.BalancerWiring({
+                swapRouter: vm.envAddress("BALANCER_ROUTER"),
+                pool: address(0),
+                vault: vm.envAddress("BALANCER_VAULT"),
+                permit2: vm.envOr("PERMIT2_ADDRESS", BuybackVenueLib.CANONICAL_PERMIT2),
+                subSwapCount: vm.envOr("SUB_SWAP_COUNT", uint256(4)),
+                subSwapMinBlockGap: vm.envOr("SUB_SWAP_MIN_BLOCK_GAP", uint256(10))
+            });
         }
     }
 

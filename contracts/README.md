@@ -32,11 +32,12 @@ Libraries:
 
 ```
 contracts/
-  src/            — 12 contracts + BondMath/SlashEscrowLib libraries
-    interfaces/   — 14 frozen external surfaces (I*.sol)
-  test/           — Foundry suite (19 *.t.sol + mocks/ + ed25519-vectors/)
+  src/            — 16 contracts + BondMath/SlashEscrowLib/RegionScopeLib libraries
+    interfaces/   — 23 frozen external surfaces (I*.sol)
+  test/           — Foundry suite (31 *.t.sol + mocks/ + ed25519-vectors/)
   script/         — DeployProtocol, BaseProtocolDeploy, ActivateBuyback,
                     TransitionToGovernor, TestnetFaucet
+    interfaces/   — pool-creation surfaces used only by the deploy scripts
     lib/          — BuybackVenueLib (shared venue dispatch + burner construction)
   lib/            — submodules: openzeppelin-contracts, forge-std, solady, crypto-lib
 ```

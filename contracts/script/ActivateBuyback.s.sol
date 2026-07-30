@@ -154,13 +154,13 @@ contract ActivateBuyback is Script {
     /// @dev The venue-independent MEV-defense guard band. Defaults track ADR 018
     ///      § Parameter Table and match `DeployProtocol._readBuybackActivation`'s,
     ///      so the runbook and the genesis path configure the same burner.
-    function _readGuardParams() internal view returns (BuybackVenueLib.GuardParams memory) {
-        return BuybackVenueLib.GuardParams({
-            twapMinWindow: vm.envOr("TWAP_MIN_WINDOW_SECS", uint256(1800)),
-            maxBuybackAmount: vm.envOr("MAX_BUYBACK_AMOUNT", uint256(10_000e6)),
-            minBuybackAmount: vm.envOr("MIN_BUYBACK_AMOUNT", uint256(100e6)),
-            slippageBps: vm.envOr("SLIPPAGE_BPS", uint256(200)),
-            epochLiquidityCapFraction: vm.envOr("EPOCH_CAP_FRACTION_BPS", uint256(1000))
+    function _readGuardParams() internal view returns (GuardedBuybackBurner.GuardParams memory) {
+        return GuardedBuybackBurner.GuardParams({
+            twapMinWindow_: vm.envOr("TWAP_MIN_WINDOW_SECS", uint256(1800)),
+            maxBuybackAmount_: vm.envOr("MAX_BUYBACK_AMOUNT", uint256(10_000e6)),
+            minBuybackAmount_: vm.envOr("MIN_BUYBACK_AMOUNT", uint256(100e6)),
+            slippageBps_: vm.envOr("SLIPPAGE_BPS", uint256(200)),
+            epochLiquidityCapFraction_: vm.envOr("EPOCH_CAP_FRACTION_BPS", uint256(1000))
         });
     }
 }

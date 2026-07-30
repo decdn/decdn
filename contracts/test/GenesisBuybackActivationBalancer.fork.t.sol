@@ -7,6 +7,7 @@ import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 import { BaseProtocolDeploy } from "../script/BaseProtocolDeploy.s.sol";
 import { BuybackVenueLib } from "../script/lib/BuybackVenueLib.sol";
+import { GuardedBuybackBurner } from "../src/GuardedBuybackBurner.sol";
 import { BuybackBurnerBalancerV3 } from "../src/BuybackBurnerBalancerV3.sol";
 import { IBalancerV3Vault } from "../src/interfaces/IBalancerV3Vault.sol";
 import { MockEd25519Verifier } from "./mocks/MockEd25519Verifier.sol";
@@ -111,25 +112,27 @@ contract GenesisBuybackActivationBalancerForkTest is Test, BaseProtocolDeploy {
         act.activate = true;
         act.venue = BuybackVenueLib.Venue.BALANCER;
         act.keeper = keeper;
-        act.guard = BuybackVenueLib.GuardParams({
-            twapMinWindow: 1800,
-            maxBuybackAmount: 10_000e6,
-            minBuybackAmount: 100e6,
-            slippageBps: 200,
-            epochLiquidityCapFraction: 1000
+        act.guard = GuardedBuybackBurner.GuardParams({
+            twapMinWindow_: 1800,
+            maxBuybackAmount_: 10_000e6,
+            minBuybackAmount_: 100e6,
+            slippageBps_: 200,
+            epochLiquidityCapFraction_: 1000
         });
         act.bal = BalancerVenueParams({
             factory: FACTORY,
-            router: ROUTER,
-            vault: VAULT,
-            permit2: PERMIT2,
             swapFee: 1e16, // 1%
-            subSwapCount: 4,
-            subSwapMinBlockGap: 10
+            // `pool` is filled by `_activateBalancer` once the factory creates it.
+            wiring: BuybackVenueLib.BalancerWiring({
+                swapRouter: ROUTER,
+                pool: address(0),
+                vault: VAULT,
+                permit2: PERMIT2,
+                subSwapCount: 4,
+                subSwapMinBlockGap: 10
+            })
         });
-        act.seed = PoolSeed({
-            usdcSeed: USDC_SEED, tokenSeed: _deriveTokenSeed(BuybackVenueLib.Venue.BALANCER, USDC_SEED, TARGET_PRICE)
-        });
+        act.seed = _derivePoolSeed(BuybackVenueLib.Venue.BALANCER, USDC_SEED, TARGET_PRICE);
     }
 
     /// @notice The headline acceptance: flag ON + Balancer venue creates + seeds a
