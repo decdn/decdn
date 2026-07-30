@@ -343,7 +343,7 @@ pub struct DecdnMetrics {
     /// convention; a plain counter field carries no label dimension (a labeled
     /// series would need a `Family`);
     /// operators recover the rolled-up rate with
-    /// `sum(rate(decdn_probe_rate_limit_rejected_{per_peer,per_ip,global}_total[1m]))`.
+    /// `sum(rate({__name__=~"decdn_probe_rate_limit_rejected_(per_peer|per_ip|global)_total"}[1m]))`.
     /// Operator-visible name: `decdn_probe_rate_limit_rejected_per_peer_total`.
     pub probe_rate_limit_rejected_per_peer: Counter,
     /// `cdn/probe/v1` requests rejected by the per-IP token bucket. Sibling
@@ -2855,6 +2855,217 @@ mod tests {
         }
     }
 
+    /// Every series name the encoder actually emits, label suffixes stripped.
+    ///
+    /// Built from **sample** lines, not `# TYPE` lines. In `OpenMetrics` a
+    /// counter's TYPE line carries the *unsuffixed* stem (`# TYPE
+    /// decdn_cache_hits counter`) while the sample is `decdn_cache_hits_total
+    /// 0` — so parsing TYPE would blind the gate to the `_total` suffix, which
+    /// is the single most common way a documented name goes wrong here. (The
+    /// convention is that a counter field omits `_total` and lets the encoder
+    /// append it; the encoder only appends when it is absent, so the four
+    /// `gossip_*_total` fields that do spell it export correctly. Follow the
+    /// convention in new code, but it is not a hard rule.)
+    ///
+    /// Truncating at the first `{` folds labelled families down to their base
+    /// name, so `decdn_streams_active{direction="inbound"} 0` registers as
+    /// `decdn_streams_active` — a name [`has_metric_line`] cannot match
+    /// because it requires an exact value-bearing line.
+    ///
+    /// Histograms get their `_bucket`/`_sum`/`_count` samples folded back to
+    /// the base name too. There is no bare `name` sample for a histogram, so
+    /// without this the first `live` histogram row would fail the registry
+    /// gate with a message telling its author to mark a genuinely-shipping
+    /// metric `planned`. The exporter registers no histograms today; this is
+    /// here so that stays a non-event when one lands.
+    fn exported_series(text: &str) -> std::collections::HashSet<String> {
+        text.lines()
+            .filter(|l| !l.starts_with('#') && !l.is_empty())
+            .filter_map(|l| {
+                let name = l.split(['{', ' ']).next()?;
+                (!name.is_empty()).then(|| name.to_string())
+            })
+            .flat_map(|name| {
+                let base = ["_bucket", "_sum", "_count"]
+                    .iter()
+                    .find_map(|sfx| name.strip_suffix(sfx))
+                    .map(str::to_string);
+                std::iter::once(name).chain(base)
+            })
+            .collect()
+    }
+
+    /// Scan free-form text (YAML, JSON, markdown) for `decdn_`-prefixed
+    /// identifiers. Hand-rolled rather than regex: the node crate has no
+    /// `regex` dependency and this is a two-line character scan.
+    fn decdn_names_in(text: &str) -> std::collections::BTreeSet<String> {
+        let bytes = text.as_bytes();
+        let mut out = std::collections::BTreeSet::new();
+        let mut i = 0usize;
+        while let Some(rel) = text.get(i..).and_then(|s| s.find("decdn_")) {
+            let start = i + rel;
+            let mut end = start;
+            while bytes
+                .get(end)
+                .is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'_')
+            {
+                end += 1;
+            }
+            if let Some(name) = text.get(start..end) {
+                out.insert(name.to_string());
+            }
+            i = end.max(start + 1);
+        }
+        out
+    }
+
+    /// Every `decdn_*` name in `monitoring/` must resolve to a real exported
+    /// series. This is the blanket assertion the single-selector test below
+    /// could not carry until #1513: `DecdnPeerTableThin` queried
+    /// `decdn_peer_table_size` (the exporter emits `decdn_gossip_peer_table_size`)
+    /// and `DecdnHighStreamErrorRate` divided by `decdn_streams_completed_total`,
+    /// which no field produces — both shipped as rules that could never fire.
+    ///
+    /// **What this does not prove.** A name that resolves may still sit at a
+    /// permanent zero because nothing increments it; the gate is about the
+    /// name, not the wiring. `docs/runbook.md § ContentBlacklist compliance` is the live example.
+    #[test]
+    fn monitoring_selectors_are_exported() {
+        // Names ending in `_` are filtered below: no exported series ends with
+        // an underscore, so a trailing one means the scan stopped at a
+        // wildcard — a prose `decdn_serve_stream_rejected_*`, or the inner
+        // pattern of the `{__name__=~"decdn_.+_task_panicked_total"}` matcher.
+        //
+        // Belt-and-braces against a name that is not a series at all. Only
+        // `decdn_health` qualifies today (a Prometheus `job=` label in the
+        // blackbox-probe example at prometheus-alerts.yml's watcher group), and
+        // it currently sits on a `#` line that the strip below already removes
+        // — so this is unreachable unless that example migrates out of a
+        // comment. Kept rather than deleted because a `job=` label is a
+        // legitimate non-series `decdn_*` token that the scanner cannot
+        // distinguish structurally.
+        const NOT_SERIES: [&str; 1] = ["decdn_health"];
+
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let exported = exported_series(&Metrics::new().encode().unwrap());
+
+        for file in [
+            "monitoring/prometheus-alerts.yml",
+            "monitoring/grafana-dashboard.json",
+        ] {
+            let text = fs::read_to_string(root.join(file)).unwrap();
+            // Drop whole-line YAML comments before scanning. A retired series
+            // has to stay nameable in prose — the comments explaining why
+            // `decdn_streams_failed_total` was removed are the record of that
+            // decision, and a gate that forbade writing the name down would
+            // push the next maintainer to delete the explanation instead of
+            // the rule. Everything YAML actually evaluates survives the strip,
+            // including block-scalar `expr: |` bodies. JSON has no comments, so
+            // this is a no-op for the dashboard.
+            let live: String = text
+                .lines()
+                .filter(|l| !l.trim_start().starts_with('#'))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let names = decdn_names_in(&live);
+            // Floor sized just under the smaller file's real count (17 in
+            // the alerts, 27 in the dashboard). A loose floor is the same
+            // failure this gate exists to stop: a shape change that silently
+            // drops most of the coverage while the test stays green.
+            assert!(
+                names.len() >= 15,
+                "{file} yielded only {} names — the scanner or the file shape changed",
+                names.len()
+            );
+            let stale: Vec<&String> = names
+                .iter()
+                .filter(|n| !n.ends_with('_'))
+                .filter(|n| !NOT_SERIES.contains(&n.as_str()) && !exported.contains(*n))
+                .collect();
+            assert!(
+                stale.is_empty(),
+                "{file} references series the exporter does not emit: {stale:?}\n\
+                 Rename them to the real field, or delete the alert/panel — do not \
+                 add a waiver."
+            );
+        }
+    }
+
+    /// Every `live` row in the ADR metric registry must resolve to an exported
+    /// series. `adr/appendix-observability.md` calls itself the canonical
+    /// registry, so a row naming a series the node never emits sends operators
+    /// off to build a dashboard that renders `(no data)` — which is what
+    /// `decdn_peer_table_size` and `decdn_gossip_announces_sent_total` did
+    /// until #1513.
+    ///
+    /// Rows whose Status column says `planned` are skipped: the registry is
+    /// allowed to record design intent, it is just not allowed to do so
+    /// silently. That column is the allowlist, and it is the reason this gate
+    /// can be absolute rather than carrying a hand-maintained skip list that
+    /// would rot the same way the names did.
+    #[test]
+    fn adr_registry_names_are_exported() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let text = fs::read_to_string(root.join("adr/appendix-observability.md")).unwrap();
+        let exported = exported_series(&Metrics::new().encode().unwrap());
+
+        let mut checked = 0usize;
+        let mut stale: Vec<String> = Vec::new();
+        for line in text.lines() {
+            // A registry row is `| <name> | <Type> | <Tier> | <Status> | … |`.
+            // Keying on the *Type* cell is what separates registry rows from
+            // the other `decdn_*`-bearing tables in this file — the alert
+            // thresholds (`| Metric | Warning | Critical | Action |`), the
+            // health-endpoint JSON mapping, and the informal-name
+            // cross-reference — without hard-coding section boundaries.
+            let cells: Vec<&str> = line.split('|').map(str::trim).collect();
+            let (Some(metric), Some(kind), Some(status)) =
+                (cells.get(1), cells.get(2), cells.get(4))
+            else {
+                continue;
+            };
+            if !matches!(*kind, "Counter" | "Gauge" | "Histogram") {
+                continue;
+            }
+            let Some(name) = metric.strip_prefix('`').and_then(|m| m.split('`').next()) else {
+                continue;
+            };
+            // Documentation forms, not single series: label suffixes and
+            // brace-expanded shorthand (`..._{per_peer,per_ip}_total`), and the
+            // per-watcher templates (`decdn_<watcher>_task_panicked_total`),
+            // which stand in for one row per watcher rather than naming one.
+            if name.contains('{') || name.contains('<') {
+                continue;
+            }
+            if *status == "planned" {
+                continue;
+            }
+            assert_eq!(
+                *status, "live",
+                "row for {name} has Status {status:?}; the only values are `live` and `planned`"
+            );
+            checked += 1;
+            if !exported.contains(name) {
+                stale.push(name.to_string());
+            }
+        }
+
+        // Floor sized just under the real count (47 live rows today). `> 20`
+        // would tolerate a table-shape change that silently dropped more than
+        // half the registry — the exact rot this gate exists to catch.
+        assert!(
+            checked >= 40,
+            "only {checked} registry rows parsed — the table shape changed and this \
+             gate silently stopped covering the registry"
+        );
+        assert!(
+            stale.is_empty(),
+            "adr/appendix-observability.md documents series the exporter does not emit: \
+             {stale:?}\nEither correct the name or mark the row `planned` in its Status \
+             column."
+        );
+    }
+
     #[test]
     fn alert_and_dashboard_selectors_match_the_exported_series() {
         // Nothing in CI validates `monitoring/` against the code — there is no
@@ -2866,10 +3077,11 @@ mod tests {
         // querying a series that no longer exists: the page for probe-hold
         // budget pressure then silently never fires again.
         //
-        // Deliberately scoped to the one series this collapse renamed. A
-        // blanket "every `decdn_*` in monitoring/ is exported" assertion is a
-        // worthwhile follow-up but cannot land here — 13 names in those files
-        // are already stale, 10 of which exist nowhere in `crates/`.
+        // Scoped to the one series this collapse renamed — it asserts the
+        // *query line*, which the blanket name gate below cannot. The blanket
+        // "every `decdn_*` in monitoring/ is exported" check that used to be
+        // impossible here (the stale names blocked it) now lives in
+        // `monitoring_selectors_are_exported`, since #1513 repaired them.
         const SELECTOR: &str = "decdn_probe_hold_unavailable_total{reason=\"exhausted\"";
 
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -3039,6 +3251,15 @@ mod tests {
             "decdn_cache_evictions_starved_total",
             "decdn_cache_size_measure_failures_total",
             "decdn_cache_evicted_operator_total",
+            // Best-effort tag-deletion failures. Bumped since #860/#837 but
+            // never pinned here until #1513 — the array is hand-maintained, so
+            // a new `CacheMetrics` field is covered only if someone adds it.
+            "decdn_cache_tag_drop_failures_total",
+            // In-flight coalescing mutex poison (#1517). The struct field is
+            // `inflight_mutex_poisoned`. Any nonzero value is a bug report, so
+            // the series must exist from a fresh registry — an operator has to
+            // be able to alert on `> 0` before it has ever fired.
+            "decdn_cache_inflight_mutex_poisoned_total",
         ] {
             assert!(
                 has_metric_line(&text, name, 0),

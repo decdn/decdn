@@ -39,12 +39,22 @@ pub type ProbeRateLimitConfig = RateLimitConfig;
 pub type ProbeRejectLayer = RejectLayer;
 
 /// Routes shared-limiter metric events to the probe operator-visible counters
-/// (`decdn_probe_rate_limit_*`). ADR 005 §Observability specifies a single
-/// labeled counter, but the `iroh_metrics::MetricsGroup` backend has no
-/// per-field labels, so we surface one Counter per layer (the same deviation
-/// the DHT and dispatch counters take); operators recover the rolled-up rate
-/// with
-/// `sum(rate(decdn_probe_rate_limit_rejected_{per_peer,per_ip,global}_total[1m]))`.
+/// (`decdn_probe_rate_limit_*`): one unlabeled Counter per layer, per the
+/// sibling-counter convention settled in #1475 and recorded in
+/// `adr/appendix-observability.md` § Reason splits. Operators recover the
+/// rolled-up rate with
+/// `sum(rate({__name__=~"decdn_probe_rate_limit_rejected_(per_peer|per_ip|global)_total"}[1m]))`.
+///
+/// **This is a choice, not a backend limitation** — an earlier version of this
+/// comment claimed `iroh_metrics` has no per-field labels, which is false:
+/// `DecdnMetrics::probe_hold_unavailable` and `DecdnMetrics::streams_active` are
+/// both `Family<L, M>` (private fields; see
+/// [`crate::metrics::Metrics::probe_hold_unavailable`] for the accessor that
+/// uses one). Each layer here has an unrelated remedy (one abusive
+/// peer, one abusive host, aggregate load), so no alert spans the family and a
+/// shared label would buy nothing. ADR 005 § Observability originally specified
+/// a single labelled `decdn_probe_rate_limit_rejections_total`; that name was
+/// never exported and the appendix registry now carries this trio instead.
 struct ProbeRateLimitMetrics(Arc<Metrics>);
 
 impl RateLimitMetricsSink for ProbeRateLimitMetrics {

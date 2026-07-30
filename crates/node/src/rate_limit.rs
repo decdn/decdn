@@ -26,11 +26,14 @@
 //! request rejected by the global cap never pays the per-IP map lookup; a
 //! per-IP rejection never pays the per-peer map lookup. The first rejection
 //! short-circuits and is the only one reported to the sink's
-//! [`RateLimitMetricsSink::rejected`] — one Counter per layer (the
-//! iroh-metrics backend does not support per-field labels, so we use distinct
-//! counters; see the per-path `Metrics` methods for the deviation rationale
-//! from each ADR's labeled-counter shape and the rolled-up Prometheus query
-//! operators can use).
+//! [`RateLimitMetricsSink::rejected`] — one unlabeled Counter per layer, per
+//! the sibling-counter convention settled in #1475 (see [`RejectLayer`] below
+//! and `adr/appendix-observability.md` § Reason splits). **Not** a backend
+//! limitation: `iroh_metrics` supports labels via `Family<L, M>`, which
+//! `DecdnMetrics::probe_hold_unavailable` and `DecdnMetrics::streams_active`
+//! both use. Each layer has an unrelated remedy, so no alert spans the family.
+//! Operators recover the rolled-up rate with
+//! `sum(rate({__name__=~"decdn_(probe|dht)_rate_limit_rejected_(per_peer|per_ip|global)_total"}[1m]))`.
 
 use std::net::IpAddr;
 use std::num::NonZeroU32;

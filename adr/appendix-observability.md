@@ -51,68 +51,88 @@ All metrics are exported in **Prometheus text format 0.0.4** on a configurable H
 
 ### Metric Registry
 
+Every registry row carries two independent axes. **Tier** says how strongly the protocol requires the metric; **Status** says whether the reference implementation emits it today. They are orthogonal on purpose: an M-tier row can be `planned`, and that combination is exactly the gap worth tracking.
+
 Metrics are grouped into **mandatory** (M) and **recommended** (R) tiers.
 
 **Mandatory (M):** The node MUST expose these or refuse to start. They cover slash-risk conditions and delivery accountability.
 
 **Recommended (R):** The node SHOULD expose these. Absence is not a startup blocker, but operators lose subsystem visibility.
 
+Status is `live` or `planned`:
+
+**`live`:** `decdn-node` exports this series today. Safe to put on a dashboard or in an alert.
+
+**`planned`:** specified here, not yet implemented. **Nothing emits it**, so a panel or alert built on it will render `(no data)` and a threshold rule will never fire. Do not add it to `monitoring/`.
+
+The `live` rows are enforced: `crates/node/src/metrics.rs`'s `adr_registry_names_are_exported` test asserts every one of them appears in the encoder's output, so a `live` row naming a series the node does not emit fails CI. Two limits worth knowing. The gate skips rows whose metric cell carries a label or a `<placeholder>` (`decdn_probe_hold_unavailable_total{reason}` and the two `decdn_<watcher>_*` templates), so those three are documented but unenforced. And it runs in one direction only — it proves no documented row is fiction, **not** that every exported series is documented. The registry is a curated subset of roughly 180 exported series, so absence from this table is not evidence that a metric does not exist; grep `crates/node/src/metrics.rs` and `crates/cache/src/metrics.rs` before concluding that. `planned` is the allowlist that gate skips — which is why marking a row `planned` is a deliberate act, and why this appendix could previously carry a wrong name indefinitely (before #1513 it had no way to say "not built yet" at all, and several rows quietly meant it).
+
+Adding a metric therefore means editing this table in the same change, not afterwards.
+
 #### Slash-Safety Metrics (all Mandatory)
 
-These give early warning for the two slashable offenses in [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn), grouped here with the closely-related probe-hold capacity metrics. A sustained non-zero value for the blacklist-lag **gauges** requires immediate operator attention. Those gauges and the probe-hold ones (`decdn_probe_hold_slots_used`/`_max`, `decdn_blacklist_version_behind`) are normally non-zero — alert on the thresholds/rates in the table below, not on presence. `decdn_probe_hold_unavailable_total` is an availability signal, not a slash risk — see its row, and alert only on `reason="exhausted"`, the budget-pressure value.
+These give early warning for the two slashable offenses in [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn), grouped here with the closely-related probe-hold capacity metrics. A sustained non-zero value for the blacklist-lag **gauges** would require immediate operator attention, but both are `planned` — nothing emits them, so the blacklist rows in the threshold table below are specification, not deployable coverage (`DecdnBlacklistWatcherStalled` in `monitoring/` is the live substitute, reading the watcher's last-tick gauge). The probe-hold gauges (`decdn_probe_hold_slots_used`/`_max`) are live and normally non-zero — alert on the thresholds/rates in the table below, not on presence. `decdn_probe_hold_unavailable_total` is an availability signal, not a slash risk — see its row, and alert only on `reason="exhausted"`, the budget-pressure value.
 
-| Metric | Type | Tier | Description |
-|--------|------|------|-------------|
-| `decdn_probe_hold_unavailable_total{reason}` | Counter | M | A probe for a present blob that got **no** eviction hold ([ADR 005](005-protocol.md#probe-triggered-eviction-hold)). Holds are best-effort, so this is not the same as answering `has_blob: false` — see the per-reason split. Never a safety fault: no offense pairs a probe with a later miss ([ADR 014](014-on-chain-verification.md#rate-manipulation)), and an unheld advertisement that loses the eviction race costs one wasted round trip. The `reason` label carries the cause, because each has a different operator remedy: **`exhausted`** — blob present but **all** hold slots were live (`max_probe_holds` reached); the node still advertises `has_blob: true` and forgoes only the hold, so the blob may be LRU-evicted before the pull. Genuine budget pressure and the only value the "raise `max_probe_holds`" alert fires on. **`disabled`** — blob present but the hold path is **off by config** (`max_probe_holds == 0`); the one reason that also suppresses the advertisement (`has_blob: false` for store-backed content; origin-held content takes no hold and is unaffected). An intentional operator choice, so alerting on it would be nonsensical (#739). **`stake_lane_reserved`** — an end-client probe hit the stake-lane-reserved end-client ceiling (`max_probe_holds − cache.stake_lane_reserved_holds`), keeping hold headroom for registered node-to-node cache-miss probes (#757, [ADR 003 § Admission and Priority](003-payments.md#admission-and-priority)). The reservation is a content-independent admission decision taken before any hold attempt, but the handler still consults the cache to answer honestly and advertises a present blob. Stays zero unless `cache.stake_lane_reserved_holds > 0`. All three children are exported at zero from startup, so a missing series means a broken exporter, not an idle node. |
-| `decdn_probe_hold_slots_used` | Gauge | M | Eviction-hold slots in use out of `max_probe_holds`. Saturation means new probes are advertised without a hold, not answered `has_blob: false`. |
-| `decdn_probe_hold_slots_max` | Gauge | M | Configured `max_probe_holds`. Paired with `decdn_probe_hold_slots_used` for a saturation ratio. |
-| `decdn_blacklist_sync_lag_seconds` | Gauge | M | Seconds since the last successful `getBlacklistVersion()` poll. Exceeding the compliance window makes serving any recently-blacklisted hash slashable ([ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting)). |
-| `decdn_blacklist_version_behind` | Gauge | M | `on_chain_version − local_version`. Positive means new blacklist entries not yet fetched. |
-| `decdn_rate_bounds_clamp_events_total` | Counter | M | Times `rate_per_mb` was raised to the governance `deliveryFloor` before signing a `ProbeResponse` / `StreamResponse` — the configured rate sits below the current floor ([ADR 003](003-payments.md#adr-003-payment-model), [ADR 005](005-protocol.md#adr-005-wire-protocol)). |
+| Metric | Type | Tier | Status | Description |
+|--------|------|------|--------|-------------|
+| `decdn_probe_hold_unavailable_total{reason}` | Counter | M | live | A probe for a present blob that got **no** eviction hold ([ADR 005](005-protocol.md#probe-triggered-eviction-hold)). Holds are best-effort, so this is not the same as answering `has_blob: false` — see the per-reason split. Never a safety fault: no offense pairs a probe with a later miss ([ADR 014](014-on-chain-verification.md#rate-manipulation)), and an unheld advertisement that loses the eviction race costs one wasted round trip. The `reason` label carries the cause, because each has a different operator remedy: **`exhausted`** — blob present but **all** hold slots were live (`max_probe_holds` reached); the node still advertises `has_blob: true` and forgoes only the hold, so the blob may be LRU-evicted before the pull. Genuine budget pressure and the only value the "raise `max_probe_holds`" alert fires on. **`disabled`** — blob present but the hold path is **off by config** (`max_probe_holds == 0`); the one reason that also suppresses the advertisement (`has_blob: false` for store-backed content; origin-held content takes no hold and is unaffected). An intentional operator choice, so alerting on it would be nonsensical (#739). **`stake_lane_reserved`** — an end-client probe hit the stake-lane-reserved end-client ceiling (`max_probe_holds − cache.stake_lane_reserved_holds`), keeping hold headroom for registered node-to-node cache-miss probes (#757, [ADR 003 § Admission and Priority](003-payments.md#admission-and-priority)). The reservation is a content-independent admission decision taken before any hold attempt, but the handler still consults the cache to answer honestly and advertises a present blob. Stays zero unless `cache.stake_lane_reserved_holds > 0`. All three children are exported at zero from startup, so a missing series means a broken exporter, not an idle node. |
+| `decdn_probe_hold_slots_used` | Gauge | M | live | Eviction-hold slots in use out of `max_probe_holds`. Saturation means new probes are advertised without a hold, not answered `has_blob: false`. |
+| `decdn_probe_hold_slots_max` | Gauge | M | live | Configured `max_probe_holds`. Paired with `decdn_probe_hold_slots_used` for a saturation ratio. |
+| `decdn_blacklist_sync_lag_seconds` | Gauge | M | planned | Seconds since the last successful `getBlacklistVersion()` poll. Exceeding the compliance window makes serving any recently-blacklisted hash slashable ([ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting)). |
+| `decdn_blacklist_version_behind` | Gauge | M | planned | `on_chain_version − local_version`. Positive means new blacklist entries not yet fetched. |
+| `decdn_rate_bounds_clamp_events_total` | Counter | M | live | Times `rate_per_mb` was raised to the governance `deliveryFloor` before signing a `ProbeResponse` / `StreamResponse` — the configured rate sits below the current floor ([ADR 003](003-payments.md#adr-003-payment-model), [ADR 005](005-protocol.md#adr-005-wire-protocol)). |
 
 **Recommended alert thresholds:**
 
 | Metric | Warning | Critical | Action |
 |--------|---------|----------|--------|
 | `decdn_probe_hold_unavailable_total{reason="exhausted"}` (rate) | > 0 | > 0 sustained | Reduce load or increase `max_probe_holds`; check for OOM. Filter on `reason="exhausted"` — the `disabled` and `stake_lane_reserved` values are deliberate operator decisions and must not trip this alert. |
-| `decdn_blacklist_sync_lag_seconds` | > 600s (1 poll interval) | > 1800s | Check RPC provider; manual sync if needed. |
-| `decdn_blacklist_version_behind` | > 0 | > 1 | Investigate RPC / poll failure. |
+| `decdn_blacklist_sync_lag_seconds` | > 600s (1 poll interval) | > 1800s | **`planned` — do not deploy this rule; nothing emits the gauge and it can never fire.** Thresholds recorded for whoever implements the watcher. Check RPC provider; manual sync if needed. |
+| `decdn_blacklist_version_behind` | > 0 | > 1 | **`planned` — do not deploy this rule** (see above). Investigate RPC / poll failure. |
 | `decdn_rate_bounds_clamp_events_total` (rate) | > 0 | — | Raise the `rate_per_mb` config to at least the governance `deliveryFloor`. |
 
 #### Delivery Metrics (`cdn/client/v1`)
 
-| Metric | Type | Tier | Labels | Description |
-|--------|------|------|--------|-------------|
-| `decdn_streams_active` | Gauge | M | `direction={inbound,outbound}` | Currently open delivery streams. |
-| `decdn_streams_completed_total` | Counter | M | `direction={inbound,outbound}` | Successfully completed streams. |
-| `decdn_streams_failed_total` | Counter | M | `direction, reason` | Failed streams. `reason` values: `hash_mismatch`, `channel_insufficient`, `rate_mismatch`, `blob_too_large`, `evicted`, `timeout`, `protocol_error`, `other`. |
-| `decdn_bytes_served_total` | Counter | M | — | Bytes delivered to clients and downstream nodes (inbound streams from the requester's perspective). |
-| `decdn_bytes_received_total` | Counter | M | — | Bytes received as a client in node-to-node cache-miss pulls. |
+| Metric | Type | Tier | Status | Labels | Description |
+|--------|------|------|--------|--------|-------------|
+| `decdn_streams_active` | Gauge | M | live | `direction={inbound,outbound}` | Currently open delivery streams. |
+| `decdn_streams_completed_total` | Counter | M | planned | `direction={inbound,outbound}` | Successfully completed streams. |
+| `decdn_streams_failed_total` | Counter | M | planned | `direction, reason` | Failed streams. `reason` values: `hash_mismatch`, `channel_insufficient`, `rate_mismatch`, `blob_too_large`, `evicted`, `timeout`, `protocol_error`, `other`. |
+| `decdn_bytes_served_total` | Counter | M | planned | — | Bytes delivered to clients and downstream nodes (inbound streams from the requester's perspective). |
+| `decdn_bytes_received_total` | Counter | M | planned | — | Bytes received as a client in node-to-node cache-miss pulls. |
 
 #### Cache Metrics
 
-| Metric | Type | Tier | Description |
-|--------|------|------|-------------|
-| `decdn_cache_bytes` | Gauge | M | Total cache size in bytes (all blobs). Paired with `decdn_cache_size_limit_bytes` for a saturation ratio. |
-| `decdn_cache_size_limit_bytes` | Gauge | R | Configured cache capacity in bytes (`cache.cache_size_mb × 1 048 576`). See [appendix-blob-cache-eviction.md](appendix-blob-cache-eviction.md#appendix-blob-cache-eviction-policy). |
-| `decdn_cache_hits_total` | Counter | M | Probe or stream requests satisfied from local cache. |
-| `decdn_cache_misses_total` | Counter | M | Probe or stream requests requiring origin pull or peer pull. |
-| `decdn_cache_bytes_returned_total` | Counter | R | Bytes returned from `CacheEngine::get` to the caller on success. Counts both cache-hit and pull-through-success paths. |
-| `decdn_cache_pull_through_bytes_total` | Counter | R | Bytes received from origin during a cache miss, counted regardless of BLAKE3 verification or store landing — origin egress is paid either way. Independent of `decdn_cache_bytes_returned_total`: equal values mean pure pass-through; `bytes_returned_total >> pull_through_bytes_total` indicates effective caching. |
-| `decdn_cache_evictions_total` | Counter | R | Blobs evicted by LRU pressure (eviction-driver loop). See [appendix-blob-cache-eviction.md](appendix-blob-cache-eviction.md#appendix-blob-cache-eviction-policy). |
-| `decdn_cache_evicted_operator_total` | Counter | R | Hashes removed via `decdn node evict` (durable, persisted to `<cache_dir>/evicted.log`). Distinct from `decdn_cache_evictions_total`. See [appendix-blob-cache-eviction.md § Operator-evict is orthogonal to LRU](appendix-blob-cache-eviction.md#operator-evict-is-orthogonal-to-lru). |
-| `decdn_cache_pinned_count` | Gauge | R | Size of the operator-pinned set (LRU-exempt). See [appendix-blob-cache-eviction.md § Operator pinning overrides LRU](appendix-blob-cache-eviction.md#operator-pinning-overrides-lru). |
-| `decdn_probe_post_eviction_failures_total` | Counter | R | `EvictedSinceProbe` responses from remote nodes during cache-hit stream requests. A sustained rate above ~1% of cache-hit attempts suggests remote hold mechanism failures ([ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh), [ADR 005](005-protocol.md#adr-005-wire-protocol)). |
+| Metric | Type | Tier | Status | Description |
+|--------|------|------|--------|-------------|
+| `decdn_cache_bytes` | Gauge | M | live | Total cache size in bytes (all blobs). Paired with `decdn_cache_size_limit_bytes` for a saturation ratio. |
+| `decdn_cache_size_limit_bytes` | Gauge | R | live | Configured cache capacity in bytes (`cache.cache_size_mb × 1 048 576`). See [appendix-blob-cache-eviction.md](appendix-blob-cache-eviction.md#appendix-blob-cache-eviction-policy). |
+| `decdn_cache_hits_total` | Counter | M | live | Probe or stream requests satisfied from local cache. |
+| `decdn_cache_misses_total` | Counter | M | live | Probe or stream requests requiring origin pull or peer pull. |
+| `decdn_cache_bytes_returned_total` | Counter | R | live | Bytes returned from `CacheEngine::get` to the caller on success. Counts both cache-hit and pull-through-success paths. |
+| `decdn_cache_pull_through_bytes_total` | Counter | R | live | Bytes received from origin during a cache miss, counted regardless of BLAKE3 verification or store landing — origin egress is paid either way. Independent of `decdn_cache_bytes_returned_total`: equal values mean pure pass-through; `bytes_returned_total >> pull_through_bytes_total` indicates effective caching. |
+| `decdn_cache_evictions_total` | Counter | R | live | Blobs evicted by LRU pressure (eviction-driver loop). See [appendix-blob-cache-eviction.md](appendix-blob-cache-eviction.md#appendix-blob-cache-eviction-policy). |
+| `decdn_cache_evicted_operator_total` | Counter | R | live | Hashes removed via `decdn node evict` (durable, persisted to `<cache_dir>/evicted.log`). Distinct from `decdn_cache_evictions_total`. See [appendix-blob-cache-eviction.md § Operator-evict is orthogonal to LRU](appendix-blob-cache-eviction.md#operator-evict-is-orthogonal-to-lru). |
+| `decdn_cache_inflight_mutex_poisoned_total` | Counter | R | live | Times a task panicked while holding the in-flight fill-coalescing map, counted once per poisoning (the engine clears the poison, so this does not climb with request volume). The engine recovers the guard and coalescing is preserved, so this is a **latent-bug report, not a degradation** — any nonzero value is worth filing rather than tuning, and needs no restart. Alert on `> 0`. See [docs/runbook.md § Cache coalescing mutex poisoned](../docs/runbook.md). |
+| `decdn_cache_pinned_count` | Gauge | R | live | Size of the operator-pinned set (LRU-exempt). See [appendix-blob-cache-eviction.md § Operator pinning overrides LRU](appendix-blob-cache-eviction.md#operator-pinning-overrides-lru). |
+| `decdn_probe_post_eviction_failures_total` | Counter | R | live | `EvictedSinceProbe` responses from remote nodes during cache-hit stream requests. A sustained rate above ~1% of cache-hit attempts suggests remote hold mechanism failures ([ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh), [ADR 005](005-protocol.md#adr-005-wire-protocol)). |
 
 #### Probe Metrics (`cdn/probe/v1`)
 
-| Metric | Type | Tier | Labels | Description |
-|--------|------|------|--------|-------------|
-| `decdn_probe_collection_latency_seconds` | Histogram | M | — | Duration of a complete probe collection window, send to collection end, bounding the window in [ADR 001 § Probe response collection](001-network.md#probe-response-collection). Buckets: `[0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5]`. |
-| `decdn_probe_requests_total` | Counter | R | — | Probe requests served by this node, incremented once the response frame is written. The serve-side counterpart to `decdn_probe_responses_total` (which counts probes this node *sent* and got answers to). Flat while a node is reachable but unprobed; the first signal that a restarted or re-keyed node is being found again. |
-| `decdn_probe_responses_total` | Counter | R | `result={has_blob,no_blob,timeout}` | Probe responses received, by result. |
-| `decdn_probe_cache_hits_total` | Counter | R | — | Cache-miss pulls whose candidate walk started from a live [ADR 001 § Probe cache](001-network.md#adr-001-network-topology-and-peer-mesh) entry. DHT lookup and probe fanout are skipped, unless every cached provider fails — the fetch then either falls through to a fresh lookup + probe (if attempt budget remains) or returns a clean miss (if the cached providers exhausted the budget first, the common case since an entry holds up to 10 providers but the budget is 3), and stays counted here either way (the hit measures "the cache had something worth trying", not delivery). With `decdn_probe_cache_misses_total` this is the hit ratio the TTL exists to buy (`probe_cache_ttl = PROBE_SLASH_WINDOW / 2`, [ADR 005 § Derived constants](005-protocol.md#adr-005-wire-protocol)); a ratio near zero means the TTL is shorter than the inter-arrival time for hot blobs and the cache is pure overhead. |
-| `decdn_probe_cache_misses_total` | Counter | R | — | Cache-miss pulls that ran a fresh DHT lookup + probe. Counts an entry that was absent, expired, **or fully suppressed** (every cached provider negative-cached, wedged, no longer an active staker, or otherwise unselectable) — all three cost the same network work, which is what this measures. |
+| Metric | Type | Tier | Status | Labels | Description |
+|--------|------|------|--------|--------|-------------|
+| `decdn_probe_collection_latency_seconds` | Histogram | M | planned | — | Duration of a complete probe collection window, send to collection end, bounding the window in [ADR 001 § Probe response collection](001-network.md#probe-response-collection). Buckets: `[0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5]`. |
+| `decdn_probe_requests_total` | Counter | R | live | — | Probe requests served by this node, incremented once the response frame is written. The serve-side counterpart to `decdn_probe_responses_total` (which counts probes this node *sent* and got answers to). Flat while a node is reachable but unprobed; the first signal that a restarted or re-keyed node is being found again. |
+| `decdn_probe_responses_total` | Counter | R | planned | `result={has_blob,no_blob,timeout}` | Probe responses received, by result. |
+| `decdn_probe_cache_hits_total` | Counter | R | live | — | Cache-miss pulls whose candidate walk started from a live [ADR 001 § Probe cache](001-network.md#adr-001-network-topology-and-peer-mesh) entry. DHT lookup and probe fanout are skipped, unless every cached provider fails — the fetch then either falls through to a fresh lookup + probe (if attempt budget remains) or returns a clean miss (if the cached providers exhausted the budget first, the common case since an entry holds up to 10 providers but the budget is 3), and stays counted here either way (the hit measures "the cache had something worth trying", not delivery). With `decdn_probe_cache_misses_total` this is the hit ratio the TTL exists to buy (`probe_cache_ttl = PROBE_SLASH_WINDOW / 2`, [ADR 005 § Derived constants](005-protocol.md#adr-005-wire-protocol)); a ratio near zero means the TTL is shorter than the inter-arrival time for hot blobs and the cache is pure overhead. |
+| `decdn_probe_rate_limit_rejected_per_peer_total` | Counter | R | live | — | Probe requests shed by the per-peer token bucket. |
+| `decdn_probe_rate_limit_rejected_per_ip_total` | Counter | R | live | — | Probe requests shed by the per-IP token bucket — the layer that catches one host cycling node IDs. |
+| `decdn_probe_rate_limit_rejected_global_total` | Counter | R | live | — | Probe requests shed by the node-wide ceiling. Rising while the per-peer and per-IP siblings stay flat means aggregate load, not one abusive source. |
+| `decdn_probe_rate_limit_prune_sweeps_per_ip_total` | Counter | R | live | — | Sweeps that expired idle per-IP buckets. |
+| `decdn_probe_rate_limit_prune_sweeps_per_peer_total` | Counter | R | live | — | Sweeps that expired idle per-peer buckets. |
+| `decdn_probe_rate_limit_tracked_per_ip` | Gauge | R | live | — | Live per-IP buckets. Unbounded growth against a flat sweep rate is a memory-exhaustion signal. |
+| `decdn_probe_rate_limit_tracked_per_peer` | Gauge | R | live | — | Live per-peer buckets. Same reading as the per-IP gauge. |
+| `decdn_probe_cache_misses_total` | Counter | R | live | — | Cache-miss pulls that ran a fresh DHT lookup + probe. Counts an entry that was absent, expired, **or fully suppressed** (every cached provider negative-cached, wedged, no longer an active staker, or otherwise unselectable) — all three cost the same network work, which is what this measures. |
 
 > The probe-hold capacity counter `decdn_probe_hold_unavailable_total{reason}`
 > and the `decdn_probe_hold_slots_used` / `_max` gauges live in
@@ -123,63 +143,73 @@ These give early warning for the two slashable offenses in [ADR 026 § Slashing 
 
 #### Payment Channel Metrics
 
-| Metric | Type | Tier | Description |
-|--------|------|------|-------------|
-| `decdn_channels_open` | Gauge | M | Currently open payment channels (as node — inbound from clients). |
-| `decdn_channels_settled_total` | Counter | M | Channels settled on-chain. |
-| `decdn_channel_deposit_usdc` | Gauge | M | Total USDC deposited across all currently open inbound channels. Represents maximum on-chain recoverable value. |
-| `decdn_buyer_channel_store_skipped_undecodable_records_total` | Counter | M | Buyer-channel rows omitted from successful store hydration because their persisted values cannot be decoded. One bad row does not stop healthy channels from loading or being reclaimed; each load attempt counts every omitted row, so any increase means a buyer deposit is escrowed but untracked and requires record repair. |
-| `decdn_vouchers_signed_total` | Counter | M | Vouchers signed by this node as the payee. |
-| `decdn_vouchers_received_total` | Counter | R | Vouchers received by this node as the payer (node-to-node pulls). |
-| `decdn_channel_disputes_total` | Counter | R | Channels that entered the dispute window. |
+| Metric | Type | Tier | Status | Description |
+|--------|------|------|--------|-------------|
+| `decdn_channels_open` | Gauge | M | live | Currently open payment channels (as node — inbound from clients). |
+| `decdn_channels_settled_total` | Counter | M | planned | Channels settled on-chain. |
+| `decdn_channel_deposit_usdc` | Gauge | M | live | Total USDC deposited across all currently open inbound channels. Represents maximum on-chain recoverable value. |
+| `decdn_buyer_channel_store_skipped_undecodable_records_total` | Counter | M | live | Buyer-channel rows omitted from successful store hydration because their persisted values cannot be decoded. One bad row does not stop healthy channels from loading or being reclaimed; each load attempt counts every omitted row, so any increase means a buyer deposit is escrowed but untracked and requires record repair. |
+| `decdn_vouchers_signed_total` | Counter | M | planned | Vouchers signed by this node as the payee. |
+| `decdn_vouchers_received_total` | Counter | R | planned | Vouchers received by this node as the payer (node-to-node pulls). |
+| `decdn_channel_disputes_total` | Counter | R | planned | Channels that entered the dispute window. |
 
 #### Gossip Metrics
 
-| Metric | Type | Tier | Labels | Description |
-|--------|------|------|--------|-------------|
-| `decdn_gossip_announces_rejected_total` | Counter | M | — | Gossip envelopes rejected during validation ([ADR 001](001-network.md#gossip-validation)) or peer-table admission ([appendix-peer-table-eviction.md](appendix-peer-table-eviction.md#appendix-peer-table-eviction-policy)), aggregated over every reason. The reason enum (`AnnounceReject`) carries a stable label per variant for logs; only `clock_skew` is broken out as a metric — see the next row and [§ Reason splits](#reason-splits-sibling-counters-not-labels). |
-| `decdn_gossip_messages_rejected_clock_skew_total` | Counter | M | — | The clock-skew subset of the row above, as a sibling counter ([ADR 001 § Clock synchronization](001-network.md#adr-001-network-topology-and-peer-mesh)). Broken out because it is the one rejection reason with its own operator remedy — fix NTP — so it is alertable without being buried in the aggregate. Canonical replacement for the informal `gossip_messages_rejected_clock_skew` in [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh). |
-| `decdn_peer_table_size` | Gauge | M | — | Number of distinct peers in the local peer table. |
-| `decdn_peer_table_evicted_ttl_total` | Counter | R | — | Peer-table entries removed by the TTL sweeper ([appendix-peer-table-eviction.md § Lifecycle and TTL](appendix-peer-table-eviction.md#lifecycle-and-ttl)). |
-| `decdn_peer_table_evicted_registry_total` | Counter | R | `reason={deregistered,ejected}` | Peer-table entries removed in response to a `NodeDeregistered` or `NodeAutoEjected` registry event ([appendix-peer-table-eviction.md § Registry-cache interaction (active eviction)](appendix-peer-table-eviction.md#registry-cache-interaction-active-eviction)). |
-| `decdn_gossip_announces_sent_total` | Counter | R | — | `NodeAnnounce` messages published. |
-| `decdn_gossip_announces_received_total` | Counter | R | — | `NodeAnnounce` messages accepted (passed validation). |
-| `decdn_gossip_subscriber_reconnections_total` | Counter | R | — | Successful subscriber reconnections after a gossip stream drop. |
+| Metric | Type | Tier | Status | Labels | Description |
+|--------|------|------|--------|--------|-------------|
+| `decdn_gossip_announces_rejected_total` | Counter | M | live | — | Gossip envelopes rejected during validation ([ADR 001](001-network.md#gossip-validation)) or peer-table admission ([appendix-peer-table-eviction.md](appendix-peer-table-eviction.md#appendix-peer-table-eviction-policy)), aggregated over every reason. The reason enum (`AnnounceReject`) carries a stable label per variant for logs; only `clock_skew` is broken out as a metric — see the next row and [§ Reason splits](#reason-splits-sibling-counters-not-labels). |
+| `decdn_gossip_messages_rejected_clock_skew_total` | Counter | M | live | — | The clock-skew subset of the row above, as a sibling counter ([ADR 001 § Clock synchronization](001-network.md#adr-001-network-topology-and-peer-mesh)). Broken out because it is the one rejection reason with its own operator remedy — fix NTP — so it is alertable without being buried in the aggregate. Canonical replacement for the informal `gossip_messages_rejected_clock_skew` in [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh). |
+| `decdn_gossip_peer_table_size` | Gauge | M | live | — | Number of distinct peers in the local peer table. |
+| `decdn_peer_table_evicted_ttl_total` | Counter | R | live | — | Peer-table entries removed by the TTL sweeper ([appendix-peer-table-eviction.md § Lifecycle and TTL](appendix-peer-table-eviction.md#lifecycle-and-ttl)). |
+| `decdn_peer_table_evicted_registry_deregistered_total` | Counter | R | planned | — | Peer-table entries removed in response to a `NodeDeregistered` registry event ([appendix-peer-table-eviction.md § Registry-cache interaction (active eviction)](appendix-peer-table-eviction.md#registry-cache-interaction-active-eviction)). |
+| `decdn_peer_table_evicted_registry_ejected_total` | Counter | R | planned | — | As above, for `NodeAutoEjected`. Siblings rather than one `reason`-labelled counter, per [§ Reason splits](#reason-splits-sibling-counters-not-labels) — the previous single labelled row contradicted this appendix's own claim that `decdn_probe_hold_unavailable_total{reason}` is the one labelled reason split. |
+| `decdn_gossip_announces_published_total` | Counter | R | live | — | `NodeAnnounce` messages published. |
+| `decdn_gossip_announces_received_total` | Counter | R | live | — | `NodeAnnounce` messages accepted (passed validation). |
+| `decdn_gossip_subscriber_reconnections_total` | Counter | R | live | — | Successful subscriber reconnections after a gossip stream drop. |
 
 #### Reputation Metrics
 
 Reputation is local-only per [ADR 008](008-reputation.md#adr-008-reputation-system) — no gossip, so the only reputation metric is the local score gauge.
 
-| Metric | Type | Tier | Description |
-|--------|------|------|-------------|
-| `decdn_reputation_score` | Gauge | R | This node's current local reputation score (0.0–1.0) for a peer, computed from its own delivery observations per [ADR 008](008-reputation.md#adr-008-reputation-system). |
+| Metric | Type | Tier | Status | Description |
+|--------|------|------|--------|-------------|
+| `decdn_reputation_score` | Gauge | R | planned | This node's current local reputation score (0.0–1.0) for a peer, computed from its own delivery observations per [ADR 008](008-reputation.md#adr-008-reputation-system). |
 
 #### Node / Process Metrics
 
-| Metric | Type | Tier | Description |
-|--------|------|------|-------------|
-| `decdn_node_uptime_seconds` | Gauge | R | Seconds since the node process started. Used by the `/health` endpoint and operator dashboards to correlate events with restarts. |
+| Metric | Type | Tier | Status | Description |
+|--------|------|------|--------|-------------|
+| `decdn_node_uptime_seconds` | Gauge | R | live | Seconds since the node process started. Used by the `/health` endpoint and operator dashboards to correlate events with restarts. |
 
 #### DHT / Content-Discovery Metrics
 
 Per [ADR 022](022-content-discovery.md#adr-022--content-discovery-at-scale) (`cdn/dht/v1`). DHT STORE and FIND_VALUE carry no protocol-level fee; these metrics expose discovery health only.
 
-| Metric | Type | Tier | Labels | Description |
-|--------|------|------|--------|-------------|
-| `decdn_dht_store_published_total` | Counter | R | — | DHT STORE records this node published to the K-closest peers ([ADR 022](022-content-discovery.md#adr-022--content-discovery-at-scale)). |
-| `decdn_dht_findvalue_queries_total` | Counter | R | — | DHT FIND_VALUE lookups this node issued to discover providers. |
-| `decdn_dht_routing_table_size` | Gauge | R | — | Distinct entries in the local Kademlia routing table. |
+| Metric | Type | Tier | Status | Labels | Description |
+|--------|------|------|--------|--------|-------------|
+| `decdn_dht_store_published_total` | Counter | R | planned | — | DHT STORE records this node published to the K-closest peers ([ADR 022](022-content-discovery.md#adr-022--content-discovery-at-scale)). |
+| `decdn_dht_findvalue_queries_total` | Counter | R | planned | — | DHT FIND_VALUE lookups this node issued to discover providers. |
+| `decdn_dht_routing_table_size` | Gauge | R | planned | — | Distinct entries in the local Kademlia routing table. |
+| `decdn_dht_rate_limit_rejected_per_peer_total` | Counter | R | live | — | DHT requests shed by the per-peer token bucket. |
+| `decdn_dht_rate_limit_rejected_per_ip_total` | Counter | R | live | — | DHT requests shed by the per-IP token bucket. |
+| `decdn_dht_rate_limit_rejected_global_total` | Counter | R | live | — | DHT requests shed by the node-wide ceiling. |
+| `decdn_dht_rate_limit_prune_sweeps_per_ip_total` | Counter | R | live | — | Sweeps that expired idle per-IP buckets. |
+| `decdn_dht_rate_limit_prune_sweeps_per_peer_total` | Counter | R | live | — | Sweeps that expired idle per-peer buckets. |
+| `decdn_dht_rate_limit_tracked_per_ip` | Gauge | R | live | — | Live per-IP buckets. |
+| `decdn_dht_rate_limit_tracked_per_peer` | Gauge | R | live | — | Live per-peer buckets. |
+
+Both rate-limit trios come from the same `RejectLayer` enum and the same shared limiter (`crates/node/src/rate_limit.rs`); the probe copies are in [§ Probe Metrics](#probe-metrics-cdnprobev1). They are **sibling counters, not a `layer` label**, per [§ Reason splits](#reason-splits-sibling-counters-not-labels) — recover the rolled-up rate with `sum(rate({__name__=~"decdn_dht_rate_limit_rejected_(per_peer|per_ip|global)_total"}[1m]))` (a `__name__` regex, not shell-style brace expansion — PromQL has no such syntax; the braces elsewhere in this appendix are naming shorthand for a family, never a query). [ADR 005 § Probe rate limiting](005-protocol.md#probe-rate-limiting) and [ADR 022 § DHT Rate Limiting](022-content-discovery.md#dht-rate-limiting) originally specified a single labelled `*_rejections_total` counter for each; those names were never exported and the sibling trios above supersede them.
 
 ##### Active-Staker Set Watcher Metrics
 
 The shared `capacity-bond` watcher follows `CapacityBond` membership events to keep a cached active-staker set in sync with chain state. Since #1226 that one loop also feeds the `NodeId → operator address` bindings projection, so these metrics are its health for both — there is no separate node-address watcher family (#1231) ([ADR 022 § STORE Flow](022-content-discovery.md#adr-022--content-discovery-at-scale), [ADR 019 § Step 3.3](019-node-onboarding.md#step-33--build-initial-peer-table-from-on-chain-registry)). On a mid-run watcher RPC outage the cache can **drift** from chain state, so the watcher re-enumerates `getActiveNodes` on a fixed interval (a correctness backstop, not a tuning knob) to repair any membership event lost to a reorg or a backoff gap; the drift window is bounded by that cadence rather than persisting until a restart. That drift is revenue-impacting while it lasts: the cached set decides which probes the stake-lane reservation sheds ([ADR 003 § Admission and Priority](003-payments.md#admission-and-priority), #757) and gates DHT `Store` admission. These metrics make the drift window alertable rather than log-grep-only — `decdn_rpc_healthy` tracks the reachability watchdog, **not** this watcher (#783).
 
-| Metric | Type | Tier | Labels | Description |
-|--------|------|------|--------|-------------|
-| `decdn_staker_set_watcher_restarts_total` | Counter | M | — | Distinct drift windows the watcher has entered (#783, edge-triggered #788): bumped **once** on the transition from a healthy cycle into the error/backoff state, so each increment brackets exactly one drift window (it does **not** count individual backoff iterations of one continuous outage). Pairs with the per-error `warn!` in `resumable_watcher::run` ("watcher RPC error; restarting after backoff"). |
-| `decdn_staker_set_watcher_resolve_failures_total` | Counter | M | — | Operator-indexed events (`Reinstated` / `UnbondingRequested`) dropped because the follow-up `nodeIdOf(operator)` RPC failed (#788). The membership change is lost, leaving the cached set out of sync for that operator until a later event corrects it — silent drift that trips no restart/down-seconds metric, hence its own counter. Pairs with the per-failure `warn!` in `capacity_bond_registry`'s `RegistrySink::on_operator_change`. |
-| `decdn_staker_set_watcher_down_seconds` | Gauge | M | — | True downtime (#783, semantics corrected #788): seconds the watcher has been in the error/backoff state, i.e. failing its `eth_getLogs` poll tick. Reads `0` for the **entire life of any established cycle**, however long or quiet (a healthy poll loop persists indefinitely — this is *not* cycle age), and climbs only while between a failed cycle and the next re-establishment, so an alert fires on a *sustained* outage rather than a transient restart. Reads `0` until the first cycle is established after bootstrap; a poisoned internal lock reports `i64::MAX` (conservative — never masks an in-progress outage). |
-| `decdn_staker_set_active_count` | Gauge | R | — | Current cached active-staker set size (#783), sampled on bootstrap and on every membership change. Pair with `decdn_staker_set_watcher_down_seconds`: the count holding flat while down-seconds climbs means the cache is frozen, not that the network genuinely lost operators. |
+| Metric | Type | Tier | Status | Labels | Description |
+|--------|------|------|--------|--------|-------------|
+| `decdn_staker_set_watcher_restarts_total` | Counter | M | live | — | Distinct drift windows the watcher has entered (#783, edge-triggered #788): bumped **once** on the transition from a healthy cycle into the error/backoff state, so each increment brackets exactly one drift window (it does **not** count individual backoff iterations of one continuous outage). Pairs with the per-error `warn!` in `resumable_watcher::run` ("watcher RPC error; restarting after backoff"). |
+| `decdn_staker_set_watcher_resolve_failures_total` | Counter | M | live | — | Operator-indexed events (`Reinstated` / `UnbondingRequested`) dropped because the follow-up `nodeIdOf(operator)` RPC failed (#788). The membership change is lost, leaving the cached set out of sync for that operator until a later event corrects it — silent drift that trips no restart/down-seconds metric, hence its own counter. Pairs with the per-failure `warn!` in `capacity_bond_registry`'s `RegistrySink::on_operator_change`. |
+| `decdn_staker_set_watcher_down_seconds` | Gauge | M | live | — | True downtime (#783, semantics corrected #788): seconds the watcher has been in the error/backoff state, i.e. failing its `eth_getLogs` poll tick. Reads `0` for the **entire life of any established cycle**, however long or quiet (a healthy poll loop persists indefinitely — this is *not* cycle age), and climbs only while between a failed cycle and the next re-establishment, so an alert fires on a *sustained* outage rather than a transient restart. Reads `0` until the first cycle is established after bootstrap; a poisoned internal lock reports `i64::MAX` (conservative — never masks an in-progress outage). |
+| `decdn_staker_set_active_count` | Gauge | R | live | — | Current cached active-staker set size (#783), sampled on bootstrap and on every membership change. Pair with `decdn_staker_set_watcher_down_seconds`: the count holding flat while down-seconds climbs means the cache is frozen, not that the network genuinely lost operators. |
 
 **Recommended alerts:**
 
@@ -195,11 +225,11 @@ All five chain-event watchers run through one shared `resumable_watcher::run` lo
 
 In the metric names below, `<watcher>` expands to one of **`slash_watcher`**, **`staker_set_watcher`**, **`origin_directory_watcher`**, **`blacklist_watcher`**, or **`settlement_watcher`**.
 
-| Metric | Type | Tier | Labels | Description |
-|--------|------|------|--------|-------------|
-| `decdn_<watcher>_last_tick_timestamp_seconds` | Gauge | M | — | **Positive liveness signal** (#1316): Unix wall-clock time of the last *successful* poll tick, stamped every tick (including idle ticks — a successful head read is proof of life). Unlike the error-triggered down-family, a panicked, wedged, or cleanly-exited task stops advancing this, so staleness is detectable. One series per watcher (`slash`, `staker_set`, `origin_directory`, `blacklist`, `settlement`). Reads `0` until the first successful tick. |
-| `decdn_<watcher>_task_panicked_total` | Counter | M | — | The watcher task unwound on a panic (#1316). Bumped from a `Drop` guard in `resumable_watcher::run` — the only thing that runs on the unwind, since the detached task is never awaited. **Any non-zero value is a bug in this node.** One series per watcher. |
-| `decdn_blacklist_enforcement_failures_total` | Counter | M | — | Distinct hashes a batched re-scope could not re-verify or evict this pass (`Recheck::Failed` — a disk error or a scope `eth_call` failure) (#1319). Non-zero means the deny-set is **not fully enforced** and a blacklisted blob may still be servable and slashable (`SlashJudge.submitBlacklistChallenge`), even while `decdn_blacklist_watcher_down_seconds` reads `0` — the two answer different questions (deny-set enforced vs chain readable). Pairs with the aggregate `warn!` (`"blacklist re-scope could not enforce every entry"`). |
+| Metric | Type | Tier | Status | Labels | Description |
+|--------|------|------|--------|--------|-------------|
+| `decdn_<watcher>_last_tick_timestamp_seconds` | Gauge | M | live | — | **Positive liveness signal** (#1316): Unix wall-clock time of the last *successful* poll tick, stamped every tick (including idle ticks — a successful head read is proof of life). Unlike the error-triggered down-family, a panicked, wedged, or cleanly-exited task stops advancing this, so staleness is detectable. One series per watcher (`slash`, `staker_set`, `origin_directory`, `blacklist`, `settlement`). Reads `0` until the first successful tick. |
+| `decdn_<watcher>_task_panicked_total` | Counter | M | live | — | The watcher task unwound on a panic (#1316). Bumped from a `Drop` guard in `resumable_watcher::run` — the only thing that runs on the unwind, since the detached task is never awaited. **Any non-zero value is a bug in this node.** One series per watcher. |
+| `decdn_blacklist_enforcement_failures_total` | Counter | M | live | — | Distinct hashes a batched re-scope could not re-verify or evict this pass (`Recheck::Failed` — a disk error or a scope `eth_call` failure) (#1319). Non-zero means the deny-set is **not fully enforced** and a blacklisted blob may still be servable and slashable (`SlashJudge.submitBlacklistChallenge`), even while `decdn_blacklist_watcher_down_seconds` reads `0` — the two answer different questions (deny-set enforced vs chain readable). Pairs with the aggregate `warn!` (`"blacklist re-scope could not enforce every entry"`). |
 
 **Recommended alerts:**
 
@@ -234,7 +264,7 @@ In the metric names below, `<watcher>` expands to one of **`slash_watcher`**, **
 
 | JSON key | Prometheus metric | Notes |
 |----------|------------------|-------|
-| `peer_table_size` | `decdn_peer_table_size` | Direct gauge value |
+| `peer_table_size` | `decdn_gossip_peer_table_size` | Direct gauge value |
 | `channels_open` | `decdn_channels_open` | Direct gauge value |
 | `channel_deposit_usdc` | `decdn_channel_deposit_usdc` | Formatted as decimal string for readability; metric stores raw value |
 | `node_uptime_seconds` | `decdn_node_uptime_seconds` | Direct gauge value |

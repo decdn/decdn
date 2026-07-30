@@ -277,6 +277,38 @@ pub struct CacheMetrics {
     /// Field name omits `_total`: the emitted name is
     /// `decdn_cache_size_measure_failures_total`.
     pub size_measure_failures: Counter,
+    /// Times the in-flight fill-coalescing mutex was found poisoned
+    /// (#1517). A poison means some earlier task panicked while holding
+    /// the map guard; the workspace anti-panic policy (`unwrap_used` /
+    /// `expect_used` / `panic` denied) makes that close to unreachable,
+    /// so **any** nonzero value is a genuine bug worth filing rather
+    /// than an operational condition worth tuning.
+    ///
+    /// The engine recovers the guard via `PoisonError::into_inner`, clears
+    /// the poison, and keeps coalescing — so this is a report, not a
+    /// degradation: it does not mean duplicate origin pulls happened, and
+    /// it does not call for a restart. It is metered because the
+    /// alternative — the pre-#1517 behaviour of discarding the error —
+    /// silently disabled coalescing for the life of the process, and the
+    /// only observable was `decdn_cache_pull_through_bytes_total` rising
+    /// faster than request volume.
+    ///
+    /// **Counts poisonings, not locks-since-a-poisoning.** Because the
+    /// engine clears the poison, one panic bumps this exactly once; a
+    /// `rate()` panel therefore shows the incidents rather than the
+    /// request rate that followed them. Paired with a single
+    /// `tracing::error!`, latched so a pathological panic loop cannot spam
+    /// the log while this counter keeps the true total.
+    ///
+    /// Note: the bump is skipped when the engine was built with no metrics
+    /// handle (`CacheEngine::open`'s 3-arg form, test-only today — the
+    /// daemon always wires `Some(..)`). There the latched log line is the
+    /// whole signal.
+    ///
+    /// Field name omits `_total`: the `OpenMetrics` encoder appends it
+    /// automatically, so the emitted name is
+    /// `decdn_cache_inflight_mutex_poisoned_total`.
+    pub inflight_mutex_poisoned: Counter,
     /// Hashes removed via the durable operator-evict path
     /// (`decdn_cache_evicted_operator_total`) — `decdn node evict` / DMCA
     /// takedown. Bumped once per takedown that actually stopped serving: an

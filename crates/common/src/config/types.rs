@@ -813,7 +813,8 @@ pub struct GossipConfig {
     /// (appendix-peer-table-eviction § No hard size cap). Once the table is
     /// at the cap, new announces from previously-unseen node IDs are
     /// rejected after a one-shot inline TTL sweep; existing entries are
-    /// still refreshed. Absent => no cap (unlimited); `decdn_peer_table_size`
+    /// still refreshed. Absent => no cap (unlimited);
+    /// `decdn_gossip_peer_table_size`
     /// is the early-warning signal operators watch to set the ceiling
     /// reactively. Must be `> 0` when set.
     pub max_peer_entries: Option<u64>,

@@ -222,11 +222,15 @@ publishing DHT records, stop serving (`StreamRequest` → `HashBlacklisted`), an
 evict. **None of this is implemented at PoC, on either side.** The deployed
 `ContentBlacklist` exposes no `getBlacklistVersion()` accessor (so even the
 delta-sync query the ADR assumes would need a contract change), and the node
-has no blacklist watcher in `crates/`. Alerts for
-`decdn_blacklist_sync_lag_seconds` / `decdn_blacklist_version_behind` exist in
-`monitoring/prometheus-alerts.yml` (and the sync-lag panel in the Grafana
-dashboard), but the underlying metrics are **not emitted by the node**. Until
-the watcher and metrics land, hash-level takedown is a
+has no blacklist watcher in `crates/`. #1513 removed the four alerts and the
+one panel that queried `decdn_blacklist_sync_lag_seconds` /
+`decdn_blacklist_version_behind`: neither series has ever been emitted, so all
+five were permanently silent while reading as blacklist-lag coverage. Both
+names survive in `adr/appendix-observability.md` as `planned` rows; restore the
+rules when the gauges land. `DecdnBlacklistWatcherStalled` and the
+"Blacklist watcher tick age" panel are the real coverage today — they read
+`decdn_blacklist_watcher_last_tick_timestamp_seconds`, which *is* exported.
+Until the watcher and metrics land, hash-level takedown is a
 **manual operator action** — see Remediate below.
 
 Operator-*level* blacklisting is different and **is** enforced today: when
@@ -387,6 +391,80 @@ refused — look for `decdn_node_pull_refused_unattributable_total` climbing tow
    service is bounded by what a deposit funds, which is exactly what this refusal
    is enforcing.
 
+## Cache coalescing mutex poisoned
+
+**Symptoms:** none that a user would notice. This is a latent-bug report, not a
+degradation — the node keeps coalescing correctly.
+
+**Detect:** `DecdnCacheInflightMutexPoisoned` fires on
+`decdn_cache_inflight_mutex_poisoned_total > 0`, alongside a single
+`inflight coalescing mutex poisoned` line at `ERROR`. The log is latched to one
+line per process; the counter carries the true count of poisonings (the engine
+clears the poison each time, so it counts incidents, not requests that followed
+one).
+
+**What it means:** some task panicked while holding the cache's in-flight
+fill-coalescing map. The workspace anti-panic policy (`unwrap`/`expect`/`panic`
+denied by clippy) means no production path is supposed to be able to do this, so
+**any** nonzero value is a bug worth filing with the surrounding logs — not a
+threshold to tune. The engine recovers the guard and coalescing survives, so
+there is no operator action beyond reporting it.
+
+**Why it is metered at all:** before #1517 the node discarded the poison and
+fell through to an uncoalesced direct pull. Because nothing cleared the poison, and a
+`std::sync::Mutex` stays poisoned until something does, one panic permanently
+turned every concurrent request for a missing blob into its own origin fetch — unbounded
+egress on a metered `http`/`s3` origin, and duplicate USDC vouchers upstream on
+a node-to-node pull. The only symptom was
+`decdn_cache_pull_through_bytes_total` climbing faster than request volume.
+
+**Remediate:** nothing operational — **do not restart**. The engine calls
+`Mutex::clear_poison` after recovering the guard, so the mutex is already
+healthy and coalescing never stopped. File the panic with the surrounding logs.
+The counter does not reset without a restart, which is deliberate: the evidence
+should outlive the incident. Alert on `> 0` rather than `rate()` for the same
+reason.
+
+## Delivery hash mismatch — metered on the pull leg only
+
+**Symptoms:** clients report corrupt or rejected blobs; a peer is serving bytes
+that do not hash to the requested root.
+
+**Detect:** mismatch **is** counted, but only where this node is the *buyer*:
+
+- `decdn_node_pull_corruption_total` — an upstream served hash-mismatched bytes
+  for a paid pull. This is the one to watch: USDC was spent on wrong content.
+- `decdn_node_pull_through_upstream_verify_failed_total` — the tee/window path's
+  bao decoder rejected a chunk group (`VerifyFailed` or `HashMismatch`).
+- `decdn_node_pull_through_errors_total` — the fill path's catch-all, shared
+  with `BlobTooLarge` / `VerifyFailed` / `EvictionLimitExceeded`, so a rise here
+  is a hint rather than a diagnosis.
+
+None of the three has an alert or a panel in `monitoring/`. That is the
+actionable gap.
+
+**The real blind spot is the serve leg.** `HashMismatch` is deliberately *not*
+classified as a `HardFault` (`crates/node/src/handlers/client/mod.rs`) — it is
+deterministic, and reporting it as "this node is broken" would steer clients off
+a healthy node forever over one bad blob. The consequence is that
+`miss_reason()` collapses it to `ServeRejectReason::CacheMiss`, so a serve-side
+integrity fault is indistinguishable from a blob the node simply does not have,
+inside the noisiest benign counter on the serve path
+(`decdn_serve_stream_rejected_cache_miss_total`). `DecdnServeInternalErrorRate`
+cannot fire on it either. Closing that needs a dedicated serve-side counter, not
+a rule.
+
+`monitoring/` carried a `DecdnHashMismatchAppearing` alert until #1513. It
+queried `decdn_streams_failed_total{reason="hash_mismatch"}` — a series the
+exporter has never emitted, and there is no outcome-labelled stream family to
+rebuild it from — so it never fired. It was deleted rather than repointed at one
+of the counters above, because the pull-leg counters mean something different
+from what that alert claimed to watch.
+
+**Escalate if seen:** a mismatch means either a corrupted local store or an
+origin (or upstream peer) serving bytes that do not match their address. Both
+are data-integrity faults — see [ADR 002](../adr/002-content-addressing.md).
+
 ## Gossip / peer table degraded
 
 **Symptoms:** node not discovering peers; clients stop selecting it;
@@ -395,8 +473,10 @@ refused — look for `decdn_node_pull_refused_unattributable_total` climbing tow
 **Detect:**
 
 - `DecdnPeerTableThin` (warning) — `decdn_gossip_peer_table_size < 3` for
-  10 minutes (the alert and metric are registered as
-  `decdn_gossip_peer_table_size` in `crates/node/src/metrics.rs`).
+  10 minutes. Until #1513 the alert queried `decdn_peer_table_size`, a name
+  nothing has ever exported, so it could not fire; if you run a forked copy of
+  `monitoring/prometheus-alerts.yml`, check that its `expr` carries the
+  `gossip_` prefix.
 - `DecdnNoActiveStreams` (warning) — `decdn_streams_active == 0` across all
   directions for 15 minutes (gossip degradation is one of several causes).
 - `decdn_iroh_*` transport-level metrics for connection failures (registered
