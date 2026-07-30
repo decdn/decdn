@@ -34,11 +34,22 @@ pub type DhtRateLimitConfig = RateLimitConfig;
 pub type DhtRejectLayer = RejectLayer;
 
 /// Routes shared-limiter metric events to the DHT operator-visible counters
-/// (`decdn_dht_rate_limit_*`). ADR 022 §Observability specifies a single
-/// labeled counter, but the `iroh_metrics::MetricsGroup` backend has no
-/// per-field labels, so we surface one Counter per layer (the same deviation
-/// the dispatch counters take); operators recover the rolled-up rate with
-/// `sum(rate(decdn_dht_rate_limit_rejected_{per_peer,per_ip,global}_total[1m]))`.
+/// (`decdn_dht_rate_limit_*`): one unlabeled Counter per layer, per the
+/// sibling-counter convention settled in #1475 and recorded in
+/// `adr/appendix-observability.md` § Reason splits. Operators recover the
+/// rolled-up rate with
+/// `sum(rate({__name__=~"decdn_dht_rate_limit_rejected_(per_peer|per_ip|global)_total"}[1m]))`.
+///
+/// **This is a choice, not a backend limitation** — an earlier version of this
+/// comment claimed `iroh_metrics` has no per-field labels, which is false:
+/// `DecdnMetrics::probe_hold_unavailable` and `DecdnMetrics::streams_active` are
+/// both `Family<L, M>` (private fields; see
+/// [`crate::metrics::Metrics::probe_hold_unavailable`] for the accessor that
+/// uses one). Each layer here has an unrelated remedy (one abusive
+/// peer, one abusive host, aggregate load), so no alert spans the family and a
+/// shared label would buy nothing. ADR 022 § Observability originally specified
+/// a single labelled `decdn_dht_rate_limit_rejections_total`; that name was
+/// never exported and the appendix registry now carries this trio instead.
 struct DhtRateLimitMetrics(Arc<Metrics>);
 
 impl RateLimitMetricsSink for DhtRateLimitMetrics {
@@ -366,15 +377,15 @@ mod tests {
 
     #[test]
     fn rejection_increments_layer_metric_in_scrape() {
-        // ADR 022 §Observability specifies a single labeled counter
-        // (`decdn_dht_rate_limit_rejections_total{layer=...}`), but the
-        // codebase's metrics backend (`iroh_metrics::MetricsGroup`) does
-        // not support per-field labels. We follow the existing convention
-        // from the dispatch counters (`dispatch_rejected_global` /
-        // `dispatch_rejected_per_source`) and surface one Counter per
-        // layer. Operators with the ADR-022 alert form do
-        // `sum(rate(decdn_dht_rate_limit_rejected_{per_peer,per_ip,global}_total[1m]))`
-        // to recover the rolled-up rate; per-layer alerts are unaffected.
+        // One unlabeled Counter per layer, matching the dispatch counters
+        // (`dispatch_rejected_global` / `dispatch_rejected_per_source`) — the
+        // sibling-counter convention settled in #1475, not a backend
+        // limitation (`iroh_metrics` does support labels via `Family<L, M>`;
+        // `probe_hold_unavailable` uses one). Operators recover the rolled-up
+        // rate with
+        // `sum(rate({__name__=~"decdn_dht_rate_limit_rejected_(per_peer|per_ip|global)_total"}[1m]))`;
+        // per-layer alerts are unaffected. ADR 022 § Observability now
+        // specifies this trio.
         let metrics = metrics();
         let lim = DhtRateLimiter::new(&strict_cfg(), Arc::clone(&metrics));
         lim.check(&peer(1), Some(ip(10, 0, 0, 1)))

@@ -51,7 +51,7 @@ use decdn_incentive::eth_identity;
 use decdn_incentive::payment_channel::PaymentChannel;
 use decdn_incentive::voucher_domain;
 
-const DEPOSIT_MICRO_USDC: u64 = 10_000_000; // 10 USDC (>= deploy minDeposit)
+const DEPOSIT_MICRO_USDC: u64 = 10_000_000; // 10 USDC (ADR 003 recommended minimum)
 const OVERALL_TIMEOUT: Duration = Duration::from_secs(780);
 
 #[tokio::test(flavor = "multi_thread")]
@@ -111,9 +111,7 @@ async fn run() -> anyhow::Result<()> {
     .await
     .context("approve PaymentChannel")?;
 
-    // Clamp the deposit up to the on-chain floor (as the CLI open path does).
-    let min_deposit = pc.minDeposit().call().await.context("read minDeposit")?;
-    let deposit = U256::from(DEPOSIT_MICRO_USDC).max(min_deposit);
+    let deposit = U256::from(DEPOSIT_MICRO_USDC);
     let voucher_dom = voucher_domain(chain.chain_id(), chain.addrs().payment_channel);
 
     let opened = open_channel(
@@ -221,18 +219,19 @@ async fn run() -> anyhow::Result<()> {
 // toward `working_deposit` rather than surfacing the exhaustion as a terminal
 // error.
 //
-// The channel opens at the on-chain `minDeposit` floor (1 USDC) and the node's
-// rate is set high enough that the very FIRST voucher interval (1 MB, the
-// protocol default) already costs more than that — so the node rejects the
-// channel's first-ever voucher with `InsufficientDeposit`. A fresh channel has
-// no prior accepted voucher, so the node's reject carries no `WatermarkBundle`
-// (`watermark_bundle_for_reject` requires one to echo back) — exactly the
-// "genuine exhaustion, not a healable desync" case `genuine_exhaustion` exists
-// to recognize. The CLI should top up to `working_deposit` and retry the same
-// blob from scratch, landing a channel deposit of exactly `working_deposit` (no
-// bytes were ever committed before the top-up).
+// The channel opens at a small configured initial deposit (1 USDC; escrowed as
+// configured — no on-chain floor) and the node's rate is set high enough that
+// the very FIRST voucher interval (1 MB, the protocol default) already costs
+// more than that — so the node rejects the channel's first-ever voucher with
+// `InsufficientDeposit`. A fresh channel has no prior accepted voucher, so the
+// node's reject carries no `WatermarkBundle` (`watermark_bundle_for_reject`
+// requires one to echo back) — exactly the "genuine exhaustion, not a healable
+// desync" case `genuine_exhaustion` exists to recognize. The CLI should top up
+// to `working_deposit` and retry the same blob from scratch, landing a channel
+// deposit of exactly `working_deposit` (no bytes were ever committed before
+// the top-up).
 
-const INITIAL_DEPOSIT_MICRO_USDC: u64 = 1_000_000; // 1 USDC == on-chain minDeposit
+const INITIAL_DEPOSIT_MICRO_USDC: u64 = 1_000_000; // 1 USDC initial deposit
 const WORKING_DEPOSIT_MICRO_USDC: u64 = 10_000_000; // 10 USDC — plenty to finish the blob
 const HIGH_RATE_PER_MB: u64 = 2_000_000; // 2 USDC/MB — exceeds the initial deposit in <1 MB
 const TOPUP_KEYSTORE_PASSWORD: &str = "topup-e2e-password";
@@ -644,8 +643,9 @@ async fn run_multi_interval_topup() -> anyhow::Result<()> {
     .await
     .context("approve PaymentChannel")?;
     let pc = PaymentChannel::new(chain.addrs().payment_channel, chain.provider_for(&buyer));
-    let min_deposit = pc.minDeposit().call().await.context("read minDeposit")?;
-    let initial_deposit = U256::from(MULTI_INITIAL_DEPOSIT_MICRO_USDC).max(min_deposit);
+    // Escrowed as configured — no on-chain floor to clamp up to, only a
+    // non-zero requirement (`openChannel` reverts `ZeroAmount`).
+    let initial_deposit = U256::from(MULTI_INITIAL_DEPOSIT_MICRO_USDC);
     let opened = open_channel(
         &pc,
         Arc::new(buyer.clone()),

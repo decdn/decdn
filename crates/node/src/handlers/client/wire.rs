@@ -85,16 +85,29 @@ impl ClientHandler {
     /// Send a signed `StreamResponse { ok: false, error }` (delivery-side
     /// failure), then finish the stream. `reason` is the single source of truth:
     /// it both selects the per-reason metric (finer-grained than the wire for the
-    /// three `NotFound` cases, which collapse to one code to avoid leaking channel
+    /// seven `NotFound` cases, which collapse to one code to avoid leaking channel
     /// existence) and derives the wire `StreamError` via `wire_error()` (#876).
     /// The metric
     /// is bumped before the network write so a refusal is counted even if the
     /// client has already gone and the write fails.
+    ///
+    /// `rate_per_mb` is a required argument rather than something this function
+    /// computes, and that is the whole point: [`Self::clamped_rate`] is
+    /// side-effecting — it bumps `rate_bounds_clamped` and warns when the
+    /// configured rate sits below the on-chain delivery floor — so a caller that
+    /// priced the request and then refused would double-count it (#1518). Taking
+    /// the price as a parameter is what stops this function recomputing it
+    /// implicitly — which is the shape the bug took. It does not make the invariant
+    /// fully type-checked: a caller can still pass `self.clamped_rate()` inline, or
+    /// `0`, or another request's rate. What holds it today is that `serve_stream`
+    /// has the crate's only production `clamped_rate()` call and threads that one
+    /// value everywhere, which is a grep-verified property, not a typed one.
     pub(super) async fn respond_error(
         &self,
         send: &mut SendStream,
         req: &StreamRequest,
         reason: ServeRejectReason,
+        rate_per_mb: u64,
     ) -> anyhow::Result<()> {
         match reason {
             ServeRejectReason::EvictedSinceProbe => {
@@ -110,9 +123,6 @@ impl ClientHandler {
             ServeRejectReason::InsufficientDeposit => {
                 self.metrics.serve_stream_rejected_insufficient_deposit();
             }
-            ServeRejectReason::UnauthorizedOrigin => {
-                self.metrics.serve_stream_rejected_unauthorized_origin();
-            }
             ServeRejectReason::CooperativeCloseSigned => {
                 self.metrics
                     .serve_stream_rejected_cooperative_close_signed();
@@ -127,7 +137,6 @@ impl ClientHandler {
             ServeRejectReason::OriginDenied => self.metrics.serve_stream_rejected_origin_denied(),
         }
         let error = reason.wire_error();
-        let rate_per_mb = self.clamped_rate();
         let body = StreamResponseBody {
             hash: req.hash,
             ok: false,

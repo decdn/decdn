@@ -49,9 +49,9 @@ use decdn_incentive::{
     slash_judge_domain, stream_sig::StreamSlashData, voucher_domain,
 };
 use decdn_node::client_requester::{
-    ChannelContext, ChannelLedger, Cumulative, PullDeadlines, RateAboveCeiling,
-    UpstreamVoucherRejected, VoucherProgress, sign_client_binding, stream_fetch,
-    stream_fetch_shared, stream_fetch_tracked, stream_fetch_tracked_with_progress,
+    ChannelContext, ChannelLedger, Cumulative, PullDeadlines, RateAboveCeiling, UpstreamRefused,
+    VoucherProgress, sign_client_binding, stream_fetch, stream_fetch_shared, stream_fetch_tracked,
+    stream_fetch_tracked_with_progress,
 };
 use decdn_node::dispatch::ConnectionLimiter;
 use decdn_node::handlers::client::{ClientHandler, ClientHandlerDeps};
@@ -1664,11 +1664,30 @@ async fn client_delivers_empty_blob() -> anyhow::Result<()> {
 /// it must NOT reset to `None`.
 ///
 /// Induced deterministically by deposit exhaustion (no mock server): a 1.5 MiB
-/// blob needs two vouchers — cumulative amount 10 then 15 at `RATE_PER_MB` — but
-/// the channel deposit is 12. The node acks voucher 1 (amount 10 <= 12) and
-/// rejects voucher 2 (amount 15 > 12) as over-deposit, so the fetch errors after
+/// blob needs two vouchers — cumulative amount 10 then 16 at `RATE_PER_MB` — but
+/// the channel deposit is 12. (Billing is bao WIRE bytes, ADR 038: the 1.5 MiB
+/// payload is `1_578_944` wire bytes, so voucher 1 covers the `1_048_576`-byte
+/// interval for 10 and voucher 2 the `530_368`-byte remainder for a cumulative
+/// 16.) The node acks voucher 1 (amount 10 <= 12) and
+/// rejects voucher 2 (amount 16 > 12) as over-deposit, so the fetch errors after
 /// one acked voucher. `progress.acked()` must then report voucher 1 (nonce 1),
 /// proving the copy-back in `stream_fetch_tracked` runs on the error path.
+///
+/// The deposit of 12 is load-bearing in both directions: it must clear the #1516
+/// pre-serve gate's ceiling (one credit window at `RATE_PER_MB` = 10) so the
+/// first attempt is actually served, and fall short of voucher 2 so the
+/// mid-stream ceiling is what stops it. An acked nonce of 1 is only reachable
+/// through that exact sequence, so it pins the mid-stream backstop as surely as
+/// asserting on the reject reason did.
+///
+/// The *terminal* error is the pre-serve refusal, not the voucher rejection,
+/// and that is the #1516 fix showing through: the rejection carries an
+/// authenticated `WatermarkBundle`, so `fetch_inner`'s resume loop reseeds the
+/// ledger and retries at the same offset — but the channel is now down to 2 base
+/// units of headroom, so the retry cannot cover a window and is refused before
+/// anything is signed. Pre-#1516 each of those futile attempts was served a
+/// fresh free window first; the counter assertion below pins that the resume
+/// loop can no longer be used to farm them.
 #[tokio::test(flavor = "multi_thread")]
 async fn tracked_watermark_survives_post_ack_error() -> anyhow::Result<()> {
     let payload = vec![0xABu8; 1_572_864]; // 1.5 MiB → two vouchers (amount 10 then 15).
@@ -1728,22 +1747,28 @@ async fn tracked_watermark_survives_post_ack_error() -> anyhow::Result<()> {
     )
     .await;
 
-    // Assert the *intended* failure mode, not just any error: voucher 2 must be
-    // rejected mid-stream as over-deposit. A regression that errors for some other
+    // Assert the *intended* failure mode, not just any error: the exhausted
+    // channel is refused, and it is refused pre-serve on the resume retry rather
+    // than being handed another window. A regression that errors for some other
     // reason (e.g. a transport fault) should fail this test loudly.
     let err = result
         .err()
         .ok_or_else(|| anyhow::anyhow!("fetch must error when voucher 2 is over-deposit"))?;
-    let rejected = err
-        .downcast_ref::<UpstreamVoucherRejected>()
-        .ok_or_else(|| anyhow::anyhow!("expected UpstreamVoucherRejected, got: {err:?}"))?;
+    let refused = err
+        .downcast_ref::<UpstreamRefused>()
+        .ok_or_else(|| anyhow::anyhow!("expected UpstreamRefused, got: {err:?}"))?;
     anyhow::ensure!(
-        rejected.reason == VoucherRejectReason::InsufficientDeposit,
-        "voucher 2 must be rejected for InsufficientDeposit; got {:?}",
-        rejected.reason
+        matches!(
+            refused.error(),
+            decdn_protocol::client::StreamError::NotFound
+        ),
+        "the exhausted retry must be refused pre-serve; got {:?}",
+        refused.error()
     );
-    // The contract: the watermark survives the error and reflects the one acked
-    // voucher (nonce 1), so the caller can still persist what it paid.
+    // The contract this test exists for: the watermark survives the error and
+    // reflects the one acked voucher (nonce 1). Reaching nonce 1 — and no
+    // further — is only possible if voucher 1 was acked and voucher 2 hit the
+    // mid-stream over-deposit ceiling, so this also pins that backstop.
     let acked = progress.acked().ok_or_else(|| {
         anyhow::anyhow!("acked watermark must survive a post-ack error, got None")
     })?;
@@ -1751,6 +1776,15 @@ async fn tracked_watermark_survives_post_ack_error() -> anyhow::Result<()> {
         acked.0 == U256::from(1u64),
         "exactly one voucher should be acked before the rejection; acked nonce = {}",
         acked.0
+    );
+    // #1516: the resume retry is cut off before delivery. Pre-fix it was served
+    // a fresh credit window for free — once per resume attempt.
+    anyhow::ensure!(
+        metric_line_present(
+            &metrics.encode()?,
+            "decdn_serve_stream_rejected_insufficient_deposit_total 1"
+        ),
+        "the futile resume retry must be refused pre-serve, not re-served"
     );
 
     client_ep.close().await;
@@ -2678,6 +2712,404 @@ async fn client_unknown_channel_is_rejected() -> anyhow::Result<()> {
             "decdn_serve_stream_rejected_unknown_channel_total 1"
         ),
         "unknown-channel refusal must bump its reason counter"
+    );
+
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
+/// #1516 pre-serve deposit gate: a known, owned channel whose deposit cannot
+/// cover the first credit window is refused *before* the node signs `ok: true`.
+/// Previously the node signed and streamed a whole window (one 1 MiB interval at
+/// the harness cadence) before `stage_voucher`'s `AmountExceedsDeposit` could
+/// fire at the first voucher boundary — a free interval per request, on every
+/// request. The 1.5 MiB blob exceeds the window, so the gate is what stops the
+/// stream, not the blob running out. Deposit 9 sits one base unit under the
+/// window's cost of 10 at `RATE_PER_MB`.
+#[tokio::test(flavor = "multi_thread")]
+async fn client_underfunded_channel_is_refused_pre_serve() -> anyhow::Result<()> {
+    let payload = vec![0xABu8; 1_572_864]; // 1.5 MiB — larger than one credit window
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+
+    let signer = Arc::new(PrivateKeySigner::random());
+    let store = Arc::new(MemoryChannelStateStore::new());
+    store.record(&ChannelState::new(
+        channel_id(),
+        signer.address(),
+        signer.address(),
+        TOKEN,
+        U256::from(9u64), // one under `min_payment(1 MiB, RATE_PER_MB) == 10`
+    ))?;
+    let store_dyn: Arc<dyn ChannelStateStore> = store.clone();
+    let (target, _server_eth, server_ep, server_task, metrics) =
+        spawn_handler_server_with_metrics(cache, store_dyn, RATE_PER_MB, 0, 16).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let req = StreamRequest {
+        hash: *hash.as_bytes(),
+        namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        channel_id: channel_id().into(),
+        byte_offset: 0,
+        byte_len: 0,
+        timestamp_us: 0x1516,
+    };
+    // Raw, so the server's FIRST reply is read directly: an `ok: true` here would
+    // mean bytes were already committed to the wire.
+    match raw_request(&client_ep, target, &req, None).await? {
+        ClientMessage::StreamResponse(resp) => {
+            anyhow::ensure!(
+                !resp.body.ok,
+                "an underfunded channel must be refused pre-serve, not served"
+            );
+            anyhow::ensure!(
+                matches!(
+                    resp.error,
+                    Some(decdn_protocol::client::StreamError::NotFound)
+                ),
+                "expected the collapsed NotFound wire code, got {:?}",
+                resp.error
+            );
+        }
+        other => anyhow::bail!("expected a pre-serve StreamResponse refusal, got {other:?}"),
+    }
+
+    anyhow::ensure!(
+        metric_line_present(
+            &metrics.encode()?,
+            "decdn_serve_stream_rejected_insufficient_deposit_total 1"
+        ),
+        "the refusal must be distinguishable server-side — the wire code is lossy"
+    );
+    // The acceptance criterion of #1516: zero bytes served. The channel never
+    // advanced, so nothing was delivered and nothing was owed.
+    let persisted = store.load_all()?;
+    let state = persisted
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("the seeded channel must still be persisted"))?;
+    anyhow::ensure!(
+        state.last_bytes_delivered() == U256::ZERO && state.last_amount() == U256::ZERO,
+        "a refused request must deliver zero bytes; got {} bytes / {} owed",
+        state.last_bytes_delivered(),
+        state.last_amount()
+    );
+
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
+/// The `min(credit window, request span)` term of the #1516 gate. The gate
+/// reserves what the node can actually front before the first voucher, which for
+/// a sub-interval blob is the blob — not a full 1 MiB interval it will never
+/// stream. Reserving a whole interval here would price this request at 10 and
+/// refuse a deposit of 5 that comfortably covers the ~3 the transfer really
+/// costs, turning a correctness fix into a regression for small blobs.
+#[tokio::test(flavor = "multi_thread")]
+async fn client_sub_interval_blob_serves_below_one_interval_cost() -> anyhow::Result<()> {
+    let payload = vec![0x2Cu8; 262_144]; // 256 KiB — a quarter of one voucher interval
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+
+    let signer = Arc::new(PrivateKeySigner::random());
+    let deposit = U256::from(5u64); // < one interval's cost (10), > this blob's (~3)
+    let store = Arc::new(MemoryChannelStateStore::new());
+    store.record(&ChannelState::new(
+        channel_id(),
+        signer.address(),
+        signer.address(),
+        TOKEN,
+        deposit,
+    ))?;
+    let store_dyn: Arc<dyn ChannelStateStore> = store.clone();
+    let (target, server_eth, server_ep, server_task, metrics) =
+        spawn_handler_server_with_metrics(cache, store_dyn, RATE_PER_MB, 0, 16).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let ctx = channel_context(signer, deposit);
+    let got = stream_fetch(
+        &client_ep,
+        target,
+        &ctx,
+        &slash_domain(),
+        server_eth.address(),
+        *hash.as_bytes(),
+        0,
+        0x2C01,
+        Duration::from_secs(10),
+    )
+    .await?;
+    anyhow::ensure!(got == payload, "the sub-interval blob must transfer intact");
+    anyhow::ensure!(
+        metric_line_present(
+            &metrics.encode()?,
+            "decdn_serve_stream_rejected_insufficient_deposit_total 0"
+        ),
+        "a funded sub-interval request must not trip the deposit gate"
+    );
+
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
+/// The gate scales with the configured credit window (#1477), not with one
+/// voucher interval. `deliver` streams while `delivered - paid < window`, so with
+/// a 4 MiB window the node fronts 4 MiB before it collects anything — and a
+/// deposit of 10 covers only the first 1 MiB interval of that. An interval-sized
+/// gate would wave this through (10 >= 10) and hand over 4 MiB, which is exactly
+/// how enabling a credit window would silently re-open the hole #1516 closes.
+#[tokio::test(flavor = "multi_thread")]
+async fn client_deposit_gate_covers_the_configured_credit_window() -> anyhow::Result<()> {
+    const WINDOW: u64 = 4 * 1024 * 1024;
+    let payload = vec![0x77u8; 8 * 1024 * 1024]; // larger than the window, so the window binds
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+
+    let signer = Arc::new(PrivateKeySigner::random());
+    let store = Arc::new(MemoryChannelStateStore::new());
+    store.record(&ChannelState::new(
+        channel_id(),
+        signer.address(),
+        signer.address(),
+        TOKEN,
+        U256::from(10u64), // one interval's worth; the 4 MiB window costs 40
+    ))?;
+
+    // Built inline rather than via `spawn_pipelined_server`, which discards the
+    // metrics handle this test asserts on.
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = Arc::new(PrivateKeySigner::random());
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let store_dyn: Arc<dyn ChannelStateStore> = store.clone();
+    let handler = build_handler_configured(
+        server_id,
+        &server_eth,
+        &metrics,
+        limiter,
+        cache,
+        store_dyn,
+        RATE_PER_MB,
+        |deps| {
+            deps.credit_window_bytes = Some(decdn_cache::Bytes::new(WINDOW));
+        },
+    )?;
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let req = StreamRequest {
+        hash: *hash.as_bytes(),
+        namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        channel_id: channel_id().into(),
+        byte_offset: 0,
+        byte_len: 0,
+        timestamp_us: 0x1477,
+    };
+    match raw_request(&client_ep, target, &req, None).await? {
+        ClientMessage::StreamResponse(resp) => anyhow::ensure!(
+            !resp.body.ok,
+            "a deposit covering one interval must not unlock a four-interval window"
+        ),
+        other => anyhow::bail!("expected a pre-serve StreamResponse refusal, got {other:?}"),
+    }
+    anyhow::ensure!(
+        metric_line_present(
+            &metrics.encode()?,
+            "decdn_serve_stream_rejected_insufficient_deposit_total 1"
+        ),
+        "the credit-window refusal must bump the deposit counter"
+    );
+
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
+/// The #1516 gate reserves remaining HEADROOM, not the gross deposit. Both
+/// deposit authorities — `ChannelState::stage_voucher` off-chain and
+/// `PaymentChannel._advanceClaimWatermark` on-chain — compare the *cumulative*
+/// voucher amount, so a long-lived channel that has already claimed most of its
+/// deposit has almost nothing left to spend. Here the gross deposit (100) is ten
+/// times the window's cost and would sail through a gross-deposit check, while
+/// the real headroom (5) cannot cover it. The `last_*` fields are private
+/// (#751), so the spent-down watermark is built via `hydrate`.
+#[tokio::test(flavor = "multi_thread")]
+async fn client_spent_down_channel_is_refused_pre_serve() -> anyhow::Result<()> {
+    let payload = vec![0x5Du8; 1_572_864]; // 1.5 MiB — one credit window costs 10
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+
+    let client = PrivateKeySigner::random().address();
+    let store = Arc::new(MemoryChannelStateStore::new());
+    store.record(&ChannelState::hydrate(
+        channel_id(),
+        client,
+        client,
+        TOKEN,
+        U256::from(100u64),       // gross deposit — ten windows' worth
+        U256::from(95u64),        // ...but already claimed, leaving headroom of 5
+        U256::from(9u64),         // last_nonce
+        U256::from(9_961_472u64), // last_bytes_delivered
+        Some([0x22; 65]),
+        0,
+        false,
+    ))?;
+    let store_dyn: Arc<dyn ChannelStateStore> = store.clone();
+    let (target, _server_eth, server_ep, server_task, metrics) =
+        spawn_handler_server_with_metrics(cache, store_dyn, RATE_PER_MB, 0, 16).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let req = StreamRequest {
+        hash: *hash.as_bytes(),
+        namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        channel_id: channel_id().into(),
+        byte_offset: 0,
+        byte_len: 0,
+        timestamp_us: 0x5D01,
+    };
+    match raw_request(&client_ep, target, &req, None).await? {
+        ClientMessage::StreamResponse(resp) => anyhow::ensure!(
+            !resp.body.ok,
+            "a spent-down channel must be refused on headroom, not waved through on gross deposit"
+        ),
+        other => anyhow::bail!("expected a pre-serve StreamResponse refusal, got {other:?}"),
+    }
+    anyhow::ensure!(
+        metric_line_present(
+            &metrics.encode()?,
+            "decdn_serve_stream_rejected_insufficient_deposit_total 1"
+        ),
+        "the spent-down refusal must bump the deposit counter"
+    );
+
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
+/// The resume arm of the #1516 gate's span (`byte_offset > 0`, `byte_len == 0`),
+/// which is the shape `decdn fetch --output` sends when continuing a partial
+/// download. The gate must price only the remaining tail, not the whole blob.
+///
+/// This is the arm with teeth. `decdn fetch` treats a `NotFound` on a resume as
+/// evidence the partial file may belong to another blob, so it rewinds to
+/// `byte_offset = 0` and re-downloads — and re-pays for — everything it already
+/// had (`crates/cli/src/commands/fetch.rs`, `resume_may_be_stale`). A gate that
+/// mispriced a resume as the whole blob would therefore not merely refuse: it
+/// would silently double the user's bill on every interrupted large fetch.
+///
+/// Sized so the two readings diverge: a 1.4 MiB blob resumed at 1 MiB leaves a
+/// ~0.4 MiB tail costing 4, while the whole blob would cost 14 and one window
+/// 10. A deposit of 5 covers only the tail, so pricing anything but the tail
+/// refuses.
+#[tokio::test(flavor = "multi_thread")]
+async fn client_resumed_range_is_priced_on_the_tail_not_the_whole_blob() -> anyhow::Result<()> {
+    const TAIL_OFFSET: u64 = 1_048_576;
+    let payload = vec![0x9Eu8; 1_468_006]; // 1.4 MiB
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+
+    let signer = Arc::new(PrivateKeySigner::random());
+    let store = Arc::new(MemoryChannelStateStore::new());
+    store.record(&ChannelState::new(
+        channel_id(),
+        signer.address(),
+        signer.address(),
+        TOKEN,
+        U256::from(5u64), // covers the ~0.4 MiB tail (4), not the blob (14)
+    ))?;
+    let store_dyn: Arc<dyn ChannelStateStore> = store.clone();
+    let (target, _server_eth, server_ep, server_task, metrics) =
+        spawn_handler_server_with_metrics(cache, store_dyn, RATE_PER_MB, 0, 16).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let req = StreamRequest {
+        hash: *hash.as_bytes(),
+        namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        channel_id: channel_id().into(),
+        byte_offset: TAIL_OFFSET,
+        byte_len: 0,
+        timestamp_us: 0x9E01,
+    };
+    match raw_request(&client_ep, target, &req, None).await? {
+        ClientMessage::StreamResponse(resp) => anyhow::ensure!(
+            resp.body.ok,
+            "a resume funded for its tail must be served, not refused: {:?}",
+            resp.error
+        ),
+        other => anyhow::bail!("expected a signed StreamResponse, got {other:?}"),
+    }
+    anyhow::ensure!(
+        metric_line_present(
+            &metrics.encode()?,
+            "decdn_serve_stream_rejected_insufficient_deposit_total 0"
+        ),
+        "the resume must not trip the deposit gate"
+    );
+
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
+/// The gate's boundary: `headroom == ceiling` must PASS, because the check is
+/// `<` and a channel funded to exactly the window's cost can pay for it.
+///
+/// Left uncovered by the four refusal/serve tests — each sits strictly on one
+/// side of the boundary, so flipping `<` to `<=` passes all of them while
+/// refusing every exactly-funded channel with a lossy `NotFound` the CLI renders
+/// as a missing blob. A `decdn fetch --deposit-micro-usdc` funded to the computed
+/// cost is exactly this case.
+#[tokio::test(flavor = "multi_thread")]
+async fn client_headroom_equal_to_the_ceiling_is_served() -> anyhow::Result<()> {
+    let payload = vec![0xB0u8; 1_572_864]; // 1.5 MiB → one 1 MiB window costs 10
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+
+    let signer = Arc::new(PrivateKeySigner::random());
+    let store = Arc::new(MemoryChannelStateStore::new());
+    store.record(&ChannelState::new(
+        channel_id(),
+        signer.address(),
+        signer.address(),
+        TOKEN,
+        U256::from(10u64), // exactly the ceiling — `10 < 10` is false, so serve
+    ))?;
+    let store_dyn: Arc<dyn ChannelStateStore> = store.clone();
+    let (target, _server_eth, server_ep, server_task, metrics) =
+        spawn_handler_server_with_metrics(cache, store_dyn, RATE_PER_MB, 0, 16).await?;
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let req = StreamRequest {
+        hash: *hash.as_bytes(),
+        namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        channel_id: channel_id().into(),
+        byte_offset: 0,
+        byte_len: 0,
+        timestamp_us: 0xB001,
+    };
+    // Only the pre-serve verdict is asserted. The transfer may still stop at a
+    // later voucher — the ceiling is priced in content bytes while vouchers bill
+    // wire bytes — and that is the mid-stream ceiling's job, not the gate's.
+    match raw_request(&client_ep, target, &req, None).await? {
+        ClientMessage::StreamResponse(resp) => anyhow::ensure!(
+            resp.body.ok,
+            "headroom exactly equal to the ceiling must be served: {:?}",
+            resp.error
+        ),
+        other => anyhow::bail!("expected a signed StreamResponse, got {other:?}"),
+    }
+    anyhow::ensure!(
+        metric_line_present(
+            &metrics.encode()?,
+            "decdn_serve_stream_rejected_insufficient_deposit_total 0"
+        ),
+        "an exactly-funded channel must not trip the deposit gate"
     );
 
     client_ep.close().await;
@@ -4880,6 +5312,7 @@ async fn spawn_counting_pull_server_with_deny(
     Endpoint,
     tokio::task::JoinHandle<()>,
     tempfile::TempDir,
+    Arc<Metrics>,
 )> {
     let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let cache_tmp = tempfile::tempdir()?;
@@ -4918,7 +5351,371 @@ async fn spawn_counting_pull_server_with_deny(
     let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
     let server_task = spawn_server(server_ep.clone(), handler);
     let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
-    Ok((target, hits, server_ep, server_task, cache_tmp))
+    Ok((target, hits, server_ep, server_task, cache_tmp, metrics))
+}
+
+/// [`spawn_counting_pull_server_with_deny`] with an empty deny-set.
+async fn spawn_counting_pull_server(
+    store: Arc<dyn ChannelStateStore>,
+) -> anyhow::Result<(
+    EndpointAddr,
+    Arc<std::sync::atomic::AtomicUsize>,
+    Endpoint,
+    tokio::task::JoinHandle<()>,
+    tempfile::TempDir,
+    Arc<Metrics>,
+)> {
+    spawn_counting_pull_server_with_deny(store, &[]).await
+}
+
+/// #1519, the headline case: an underfunded channel must not make the node spend.
+///
+/// Every cache-miss fill tier is gated on channel OWNERSHIP (`pull_authorized`)
+/// and none was gated on solvency, so before the pre-spend floor a dust-deposit
+/// channel could name absent hashes, make the node pay its paid upstream for each,
+/// and be refused afterwards by the serve-path gate. The attacker gained nothing —
+/// #1516 closed the free-egress half — but the operator still paid.
+///
+/// `hits == 0` IS the acceptance criterion: the origin was never contacted. The
+/// second counter assertion is what makes the test specific rather than merely
+/// green — a refusal that came from the fill missing (rather than from the floor)
+/// would bump `cache_miss` instead, and `hits == 0` alone cannot tell them apart.
+#[tokio::test(flavor = "multi_thread")]
+async fn underfunded_channel_never_reaches_the_paid_pull() -> anyhow::Result<()> {
+    let signer = Arc::new(PrivateKeySigner::random());
+    let store = Arc::new(MemoryChannelStateStore::new());
+    store.record(&ChannelState::new(
+        channel_id(),
+        signer.address(),
+        signer.address(),
+        TOKEN,
+        U256::from(9u64), // one under the floor (one 1 MiB credit window = 10)
+    ))?;
+    let store_dyn: Arc<dyn ChannelStateStore> = store.clone();
+    let (target, hits, server_ep, server_task, _cache_tmp, metrics) =
+        spawn_counting_pull_server(store_dyn).await?;
+
+    let client_sk = fresh_key();
+    let client_node_id = B256::from(*client_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    // Bound, so `pull_authorized` would have said yes and the pull WOULD have run.
+    let ext = binding_ext(&signer, client_node_id)?;
+    let req = StreamRequest {
+        hash: [0x19u8; 32], // never cached — a miss that would trigger the pull
+        namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        channel_id: channel_id().into(),
+        byte_offset: 0,
+        byte_len: 0,
+        timestamp_us: 0x1519,
+    };
+    match raw_request(&client_ep, target, &req, Some(&ext)).await? {
+        ClientMessage::StreamResponse(resp) => {
+            anyhow::ensure!(!resp.body.ok, "an underfunded miss must be refused");
+            anyhow::ensure!(
+                matches!(
+                    resp.error,
+                    Some(decdn_protocol::client::StreamError::NotFound)
+                ),
+                "expected the collapsed NotFound wire code, got {:?}",
+                resp.error
+            );
+        }
+        other => anyhow::bail!("expected a signed refusal, got {other:?}"),
+    }
+
+    anyhow::ensure!(
+        hits.load(std::sync::atomic::Ordering::SeqCst) == 0,
+        "the origin must never be contacted for a channel that cannot pay: {} hits",
+        hits.load(std::sync::atomic::Ordering::SeqCst)
+    );
+    let text = metrics.encode()?;
+    anyhow::ensure!(
+        metric_line_present(
+            &text,
+            "decdn_serve_stream_rejected_insufficient_deposit_total 1"
+        ),
+        "the refusal must be attributed to the deposit floor"
+    );
+    anyhow::ensure!(
+        metric_line_present(&text, "decdn_serve_stream_rejected_cache_miss_total 0"),
+        "the refusal must come from the floor, not from the fill missing"
+    );
+
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
+/// The boundary control for #1519, and the reason the floor cannot be quietly
+/// tightened. A channel funded to EXACTLY one credit window clears the floor
+/// (the check is `<`) and must still reach the pull.
+///
+/// Without this, raising the floor — or flipping `<` to `<=` — would break
+/// nothing: `underfunded_channel_never_reaches_the_paid_pull` above only pins
+/// that an *under*-funded channel is stopped. A floor that also stopped funded
+/// channels would turn a cold fetch into a permanent refusal on every node.
+#[tokio::test(flavor = "multi_thread")]
+async fn funded_channel_still_reaches_the_paid_pull() -> anyhow::Result<()> {
+    let signer = Arc::new(PrivateKeySigner::random());
+    let store = Arc::new(MemoryChannelStateStore::new());
+    store.record(&ChannelState::new(
+        channel_id(),
+        signer.address(),
+        signer.address(),
+        TOKEN,
+        U256::from(10u64), // exactly the floor — `10 < 10` is false, so proceed
+    ))?;
+    let store_dyn: Arc<dyn ChannelStateStore> = store.clone();
+    let (target, hits, server_ep, server_task, _cache_tmp, metrics) =
+        spawn_counting_pull_server(store_dyn).await?;
+
+    let client_sk = fresh_key();
+    let client_node_id = B256::from(*client_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let ext = binding_ext(&signer, client_node_id)?;
+    let req = StreamRequest {
+        hash: [0x1Au8; 32],
+        namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        channel_id: channel_id().into(),
+        byte_offset: 0,
+        byte_len: 0,
+        timestamp_us: 0x151A,
+    };
+    // `CountingOrigin` has nothing to serve, so the request still ends in a
+    // refusal — but a `cache_miss` one, AFTER the origin was asked. Asserted rather
+    // than discarded: `let _ =` would stay green on a malformed frame or an
+    // unexpected `ok: true`.
+    match raw_request(&client_ep, target, &req, Some(&ext)).await? {
+        ClientMessage::StreamResponse(resp) => anyhow::ensure!(
+            !resp.body.ok,
+            "CountingOrigin holds nothing, so this must still end in a refusal"
+        ),
+        other => anyhow::bail!("expected a signed StreamResponse, got {other:?}"),
+    }
+
+    anyhow::ensure!(
+        hits.load(std::sync::atomic::Ordering::SeqCst) == 1,
+        "a channel funded to exactly the floor must still reach the pull: {} hits",
+        hits.load(std::sync::atomic::Ordering::SeqCst)
+    );
+    anyhow::ensure!(
+        metric_line_present(
+            &metrics.encode()?,
+            "decdn_serve_stream_rejected_insufficient_deposit_total 0"
+        ),
+        "an exactly-funded channel must not trip the deposit floor"
+    );
+
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
+/// The `last_amount` term of the #1519 floor, and the case that actually happens
+/// in production. The two tests above use a fresh channel, so
+/// `deposit.saturating_sub(last_amount)` is never exercised — a mutant that reads
+/// `let headroom = deposit;` passes the entire suite.
+///
+/// A *dust* channel is the adversarial shape; a *spent-out* channel is the common
+/// one. Here the gross deposit is 10 USDC — a million times the floor — while the
+/// remaining headroom is 5, one below it. Gating on the gross deposit would let
+/// this channel drive an origin pull for every absent hash it names, forever,
+/// which is the same drain #1519 closes against a dust channel.
+#[tokio::test(flavor = "multi_thread")]
+async fn spent_out_channel_never_reaches_the_paid_pull() -> anyhow::Result<()> {
+    let client = PrivateKeySigner::random();
+    let store = Arc::new(MemoryChannelStateStore::new());
+    // `last_*` are private (#751), so the spent-down watermark comes from `hydrate`.
+    store.record(&ChannelState::hydrate(
+        channel_id(),
+        client.address(),
+        client.address(),
+        TOKEN,
+        U256::from(10_000_000u64),    // gross: a million floors' worth
+        U256::from(9_999_995u64),     // ...already claimed, leaving headroom of 5
+        U256::from(11u64),            // last_nonce
+        U256::from(1_048_575_488u64), // last_bytes_delivered
+        Some([0x33; 65]),
+        0,
+        false,
+    ))?;
+    let store_dyn: Arc<dyn ChannelStateStore> = store.clone();
+    let (target, hits, server_ep, server_task, _cache_tmp, metrics) =
+        spawn_counting_pull_server(store_dyn).await?;
+
+    let client_sk = fresh_key();
+    let client_node_id = B256::from(*client_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let ext = binding_ext(&Arc::new(client), client_node_id)?;
+    let req = StreamRequest {
+        hash: [0x33u8; 32],
+        namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        channel_id: channel_id().into(),
+        byte_offset: 0,
+        byte_len: 0,
+        timestamp_us: 0x3301,
+    };
+    let _ = raw_request(&client_ep, target, &req, Some(&ext)).await?;
+
+    anyhow::ensure!(
+        hits.load(std::sync::atomic::Ordering::SeqCst) == 0,
+        "a spent-out channel must not reach the origin despite a large gross deposit: {} hits",
+        hits.load(std::sync::atomic::Ordering::SeqCst)
+    );
+    anyhow::ensure!(
+        metric_line_present(
+            &metrics.encode()?,
+            "decdn_serve_stream_rejected_insufficient_deposit_total 1"
+        ),
+        "the refusal must be attributed to the deposit floor, not to the fill missing"
+    );
+
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
+/// #1518's invariant, which nothing asserted until now: one request clamps the
+/// rate exactly once.
+///
+/// `clamped_rate()` bumps `rate_bounds_clamped` and warns, so a path that priced a
+/// request and then let `respond_error` price it again double-counted a single
+/// request. The fix made the rate a required argument of `respond_error`, which
+/// stops the *implicit* recomputation — but a grep is what holds "exactly one
+/// production call site", and greps do not run in CI. This does.
+///
+/// Driven through the #1519 floor specifically, because that is the path the
+/// collapse was performed for: it prices the request and then falls through into
+/// the fill ladder, whose miss arms also refuse.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_request_clamps_the_rate_exactly_once() -> anyhow::Result<()> {
+    let signer = Arc::new(PrivateKeySigner::random());
+    let store = Arc::new(MemoryChannelStateStore::new());
+    store.record(&ChannelState::new(
+        channel_id(),
+        signer.address(),
+        signer.address(),
+        TOKEN,
+        U256::from(1u64), // under any floor, so the #1519 gate refuses
+    ))?;
+
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = Arc::new(PrivateKeySigner::random());
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let store_dyn: Arc<dyn ChannelStateStore> = store.clone();
+    // An on-chain floor above the advertised rate, so every `clamped_rate()` call
+    // bumps the counter. With `RateBounds::new(0)` (the harness default) it never
+    // fires and this test would be vacuous.
+    let handler = build_handler_configured(
+        server_id,
+        &server_eth,
+        &metrics,
+        limiter,
+        empty_cache().await?.0,
+        store_dyn,
+        RATE_PER_MB,
+        |deps| {
+            deps.rate_bounds = decdn_node::rate_bounds::RateBounds::new(RATE_PER_MB * 50);
+            deps.pull_through = Some(std::time::Duration::from_secs(5));
+        },
+    )?;
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+    let client_sk = fresh_key();
+    let client_node_id = B256::from(*client_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let ext = binding_ext(&signer, client_node_id)?;
+    let req = StreamRequest {
+        hash: [0x18u8; 32],
+        namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        channel_id: channel_id().into(),
+        byte_offset: 0,
+        byte_len: 0,
+        timestamp_us: 0x1518,
+    };
+    let _ = raw_request(&client_ep, target, &req, Some(&ext)).await?;
+
+    anyhow::ensure!(
+        metric_line_present(&metrics.encode()?, "decdn_rate_bounds_clamp_events_total 1"),
+        "one refused request must clamp exactly once; got:\n{}",
+        metrics.encode()?
+    );
+
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
+/// The other half of #1518's invariant: a request that never quotes a rate must
+/// not clamp at all. This is what pins the *placement* of `clamped_rate()` below
+/// the binding block — hoisting it to the top of `serve_stream` would meter a clamp
+/// for a request that is reset without a signed `StreamResponse`, which is the same
+/// double-count bug in a different direction and is otherwise guarded only by prose.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_rejected_before_pricing_does_not_clamp_the_rate() -> anyhow::Result<()> {
+    let (store, _signer, _deposit) = seeded_store()?;
+
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = Arc::new(PrivateKeySigner::random());
+    let metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&metrics);
+    let handler = build_handler_configured(
+        server_id,
+        &server_eth,
+        &metrics,
+        limiter,
+        empty_cache().await?.0,
+        store,
+        RATE_PER_MB,
+        |deps| {
+            deps.rate_bounds = decdn_node::rate_bounds::RateBounds::new(RATE_PER_MB * 50);
+        },
+    )?;
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+    // A binding whose signature recovers a different address: the handler resets the
+    // stream in the binding block, above the pricing point, signing nothing.
+    let client_sk = fresh_key();
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let mut ext = binding_ext(
+        &Arc::new(PrivateKeySigner::random()),
+        B256::repeat_byte(0x77),
+    )?;
+    if let Some(binding) = ext.binding.as_mut() {
+        binding.ethereum_address = [0xAB; 20];
+    }
+    let req = StreamRequest {
+        hash: [0x19u8; 32],
+        namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        channel_id: channel_id().into(),
+        byte_offset: 0,
+        byte_len: 0,
+        timestamp_us: 0x1519,
+    };
+    // The stream is reset, so there is no reply to read — that IS the expected shape.
+    let _ = raw_request(&client_ep, target, &req, Some(&ext)).await;
+
+    anyhow::ensure!(
+        metric_line_present(&metrics.encode()?, "decdn_rate_bounds_clamp_events_total 0"),
+        "a request reset above the pricing point must never clamp; got:\n{}",
+        metrics.encode()?
+    );
+
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
 }
 
 /// ADR 011 keys compliance on the FUNDER, so a blacklisted funder must not make
@@ -4929,7 +5726,7 @@ async fn spawn_counting_pull_server_with_deny(
 #[tokio::test(flavor = "multi_thread")]
 async fn pull_through_refuses_a_blacklisted_funder_behind_a_clean_delegate() -> anyhow::Result<()> {
     let (store, funder, delegate) = delegate_signer_store()?;
-    let (target, hits, server_ep, server_task, _cache_tmp) =
+    let (target, hits, server_ep, server_task, _cache_tmp, _metrics) =
         spawn_counting_pull_server_with_deny(store, &[funder.address()]).await?;
 
     let delegate_sk = fresh_key();
@@ -4970,7 +5767,7 @@ async fn pull_through_refuses_a_blacklisted_funder_behind_a_clean_delegate() -> 
 #[tokio::test(flavor = "multi_thread")]
 async fn pull_through_allows_a_clean_funder_with_a_blacklisted_delegate() -> anyhow::Result<()> {
     let (store, _funder, delegate) = delegate_signer_store()?;
-    let (target, hits, server_ep, server_task, _cache_tmp) =
+    let (target, hits, server_ep, server_task, _cache_tmp, _metrics) =
         spawn_counting_pull_server_with_deny(store, &[delegate.address()]).await?;
 
     let delegate_sk = fresh_key();

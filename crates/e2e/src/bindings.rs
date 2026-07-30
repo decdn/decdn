@@ -125,7 +125,6 @@ alloy::sol! {
         function openChannel(address provider, uint256 deposit, address voucherSigner)
             external
             returns (bytes32 channelId);
-        function minDeposit() external view returns (uint256);
         function clientChannelNonce(address client) external view returns (uint256);
     }
 

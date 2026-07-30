@@ -6,6 +6,8 @@ import { ERC20 } from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 import { BaseProtocolDeploy } from "../script/BaseProtocolDeploy.s.sol";
+import { BuybackVenueLib } from "../script/lib/BuybackVenueLib.sol";
+import { GuardedBuybackBurner } from "../src/GuardedBuybackBurner.sol";
 import { BuybackBurnerBalancerV3 } from "../src/BuybackBurnerBalancerV3.sol";
 import { IBalancerV3Vault } from "../src/interfaces/IBalancerV3Vault.sol";
 import { MockEd25519Verifier } from "./mocks/MockEd25519Verifier.sol";
@@ -90,6 +92,8 @@ contract GenesisBuybackActivationBalancerForkTest is Test, BaseProtocolDeploy {
             emergencyMultisig: emergencyMultisig,
             initialTokenHolder: address(this),
             timelockDelay: 48 hours,
+            // Direct-to-Timelock handoff; the ADR 009 bootstrap phase is opt-in.
+            bootstrapMultisig: address(0),
             minBond: 50_000e18,
             unbondingPeriod: 14 days,
             multiaddrUpdateCooldown: 0,
@@ -106,22 +110,29 @@ contract GenesisBuybackActivationBalancerForkTest is Test, BaseProtocolDeploy {
 
     function _activation() internal view returns (BuybackActivation memory act) {
         act.activate = true;
-        act.venue = BuybackVenue.BALANCER;
+        act.venue = BuybackVenueLib.Venue.BALANCER;
         act.keeper = keeper;
-        act.twapMinWindow = 1800;
-        act.maxBuybackAmount = 10_000e6;
-        act.minBuybackAmount = 100e6;
-        act.slippageBps = 200;
-        act.epochLiquidityCapFraction = 1000;
-        act.balFactory = FACTORY;
-        act.balRouter = ROUTER;
-        act.balVault = VAULT;
-        act.permit2 = PERMIT2;
-        act.balSwapFee = 1e16; // 1%
-        act.balSubSwapCount = 4;
-        act.balSubSwapMinBlockGap = 10;
-        act.usdcSeed = USDC_SEED;
-        act.tokenSeed = _deriveTokenSeed(BuybackVenue.BALANCER, USDC_SEED, TARGET_PRICE);
+        act.guard = GuardedBuybackBurner.GuardParams({
+            twapMinWindow_: 1800,
+            maxBuybackAmount_: 10_000e6,
+            minBuybackAmount_: 100e6,
+            slippageBps_: 200,
+            epochLiquidityCapFraction_: 1000
+        });
+        act.bal = BalancerVenueParams({
+            factory: FACTORY,
+            swapFee: 1e16, // 1%
+            // `pool` is filled by `_activateBalancer` once the factory creates it.
+            wiring: BuybackVenueLib.BalancerWiring({
+                swapRouter: ROUTER,
+                pool: address(0),
+                vault: VAULT,
+                permit2: PERMIT2,
+                subSwapCount: 4,
+                subSwapMinBlockGap: 10
+            })
+        });
+        act.seed = _derivePoolSeed(BuybackVenueLib.Venue.BALANCER, USDC_SEED, TARGET_PRICE);
     }
 
     /// @notice The headline acceptance: flag ON + Balancer venue creates + seeds a

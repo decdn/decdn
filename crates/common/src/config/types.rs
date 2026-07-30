@@ -134,10 +134,10 @@ pub struct BlockchainConfig {
     /// `CapacityBond` contract address.
     pub capacity_bond_address: Option<String>,
     /// `OriginAssignment` contract address. Optional: when set, the node runs the
-    /// chain-backed origin directory for the cache-miss pull-through fallback,
-    /// resolving a request's namespace via `getOrigins(namespaceId)` (ADR 022).
-    /// Unset => the origin directory is empty (deny-all) and the pull-through
-    /// authorized-origin gate finds no origins.
+    /// chain-backed origin directory for node-to-node routing, resolving a
+    /// request's namespace via `getOrigins(namespaceId)` (ADR 022) for the
+    /// `FIND_VALUE` fallback. Unset => the origin directory is empty, so that
+    /// fallback resolves nothing.
     pub origin_assignment_address: Option<String>,
     /// `PublisherRegistry` contract address. Independent of the origin directory:
     /// it is the publish CLI's `namespace create` target and is not consumed by
@@ -203,7 +203,8 @@ pub struct BlockchainConfig {
     /// new `PaymentChannel` against a provider (the first-contact lock). Kept
     /// small so an unproven node holds little of the buyer's capital before it
     /// has served verified bytes. Absent => default (0.5 USDC = `500_000`).
-    /// Clamped up to the on-chain `minDeposit` floor at open time.
+    /// Escrowed as configured at open time (no on-chain floor; only a
+    /// non-zero requirement).
     pub buyer_initial_deposit_micro_usdc: Option<u64>,
     /// Deposit (base units, `µUSDC`) every `topUp` refills the channel toward
     /// once it has proven itself — the proactive low-water refill and the
@@ -419,6 +420,27 @@ pub struct CacheConfig {
     /// it). Shorter intervals pick up new files faster at the cost of more
     /// directory-walk + `size()` I/O per minute.
     pub fs_rescan_interval_sec: Option<u64>,
+    /// TTL, in seconds, for a memoised live-origin probe answer (#1130 pt3).
+    /// Absent => [`crate::config::DEFAULT_ORIGIN_PROBE_TTL_SEC`] (15). A probe for
+    /// a hash absent from the `fs`-enumeration ∪ pins index falls back to a live
+    /// `HEAD`/`HeadObject` against the http/s3 origin; the answer — present-with-
+    /// size OR absent — is cached for this long so a non-pinned bucket object is
+    /// discoverable without a per-probe origin round-trip. Caching the negative
+    /// is what blunts a random-hash probe flood. Shorter TTLs track origin
+    /// deletions faster at the cost of more `HEAD` traffic.
+    pub origin_probe_ttl_sec: Option<u64>,
+    /// Per-probe ceiling, in milliseconds, on the live-origin `HEAD`/`HeadObject`
+    /// (#1130 pt3). Absent => [`crate::config::DEFAULT_ORIGIN_PROBE_TIMEOUT_MS`]
+    /// (2000). A slow origin must never stall the probe hot path; on timeout the
+    /// probe answers `has_blob: false` (safe — never slashable post-#1512) and
+    /// the miss is memoised as absent for one TTL.
+    pub origin_probe_timeout_ms: Option<u64>,
+    /// Maximum distinct hashes held in the live-origin probe memo (#1130 pt3).
+    /// Absent => [`crate::config::DEFAULT_ORIGIN_PROBE_MEMO_CAPACITY`] (4096).
+    /// Bounds memo memory under a random-hash probe flood; the cache is
+    /// best-effort, so at capacity one arbitrary entry is dropped to admit a new
+    /// answer (expired entries reclaimed first).
+    pub origin_probe_memo_capacity: Option<u64>,
     /// LRU eviction driver: percent of [`Self::cache_size_mb`] above which
     /// the driver actively evicts (#1173, appendix-blob-cache-eviction.md
     /// § Trigger and target). Absent =>
@@ -550,23 +572,6 @@ pub struct CacheConfig {
     /// allowance of `pull_ahead_bytes`, bounding concentrated single-peer abuse.
     /// `0` pins a peer to only the opening window.
     pub pull_share_ratio_percent: Option<decdn_config_types::Percent>,
-    /// Content-authorization gate on the reactive cache-miss pull-through path
-    /// (#821, ADR 037 §Seed-leech caps / ADR 022 §`FIND_VALUE` Flow). Absent =>
-    /// `false` (the cache role stays permissionless, unchanged network
-    /// behavior). When `true`, the node refuses to *initiate* an upstream pull
-    /// and the associated cache-warming write for a request whose namespace has no
-    /// currently-authorized origin via `OriginAssignment.getOrigins(namespaceId)`
-    /// (`namespaceId == 0`/`NO_NAMESPACE` has no authorized origins, so the gate
-    /// refuses it — ADR 002 §Namespace 0), returning `NotFound` to the requesting
-    /// client. It is a pull-*initiation* gate only: a range the node already holds
-    /// is served regardless — refusing held blobs is `ContentBlacklist`'s job
-    /// (ADR 011/031). Requires the `origin_assignment_address` blockchain key;
-    /// without it the directory is empty and the gate fails closed (every pull is
-    /// refused).
-    /// Only affects the node-to-node reactive pull-through path, so it is a no-op
-    /// unless `node_to_node_pull_through_enabled` is also `true` — with
-    /// pull-through off, a cache miss already returns `NotFound`.
-    pub pull_through_require_authorized_origin: Option<bool>,
 }
 
 /// Origin backend selection (#437). Tagged on the inner `kind` field.
@@ -817,7 +822,8 @@ pub struct GossipConfig {
     /// (appendix-peer-table-eviction § No hard size cap). Once the table is
     /// at the cap, new announces from previously-unseen node IDs are
     /// rejected after a one-shot inline TTL sweep; existing entries are
-    /// still refreshed. Absent => no cap (unlimited); `decdn_peer_table_size`
+    /// still refreshed. Absent => no cap (unlimited);
+    /// `decdn_gossip_peer_table_size`
     /// is the early-warning signal operators watch to set the ceiling
     /// reactively. Must be `> 0` when set.
     pub max_peer_entries: Option<u64>,

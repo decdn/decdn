@@ -31,7 +31,8 @@ use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::{Address, B256, U256};
 use alloy::signers::local::PrivateKeySigner;
 use decdn_cache::{
-    Bytes, CacheEngine, CacheError, Hash, RangePullOutcome, TeeOpen, TeeReservation, TeeSink,
+    Bytes, CHUNK_GROUP_BYTES, CacheEngine, CacheError, Hash, RangePullOutcome, TeeOpen,
+    TeeReservation, TeeSink,
 };
 use decdn_incentive::rate::{DEFAULT_TOLERANCE_BPS, RateError, min_payment, verify_rate};
 use decdn_incentive::store::StoreError;
@@ -55,7 +56,6 @@ use tokio::io::AsyncReadExt;
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
 
-use crate::dht::origin::OriginDirectory;
 use crate::dispatch::{ConnectionLimiter, RejectReason};
 use crate::leech_governor::LeechGovernor;
 use crate::metrics::Metrics;
@@ -285,18 +285,21 @@ impl Drop for BgInflightGuard {
     }
 }
 
-/// Whether the reactive pull-through authorized-origin gate (#821) refuses to
-/// initiate a pull for a request under `namespace_id`. Returns `true` (refuse)
-/// only when the operator opted in — a directory is wired on
-/// [`ClientHandlerDeps`] — AND that directory holds no authorized origin for the
-/// namespace. `NO_NAMESPACE` (0) has no authorized origins (ADR 002 §Namespace
-/// 0), so an enabled gate refuses it. An unset gate (the default) always returns
-/// `false`, preserving the permissionless cache role. Free function so the branch
-/// is unit-testable without a full handler / QUIC stream (the wire `NotFound` it
-/// produces is indistinguishable from a plain miss, so an end-to-end test cannot
-/// observe it).
-fn pull_origin_gate_blocks(gate: Option<&Arc<dyn OriginDirectory>>, namespace_id: U256) -> bool {
-    gate.is_some_and(|dir| !dir.has_origin(namespace_id))
+/// Whether an insufficient-deposit `warn!` is due: `interval` has elapsed since
+/// `last_warn_ms`, or nothing has ever been warned (`last_warn_ms == 0`).
+///
+/// Pure and millisecond-based so the throttle is testable without sleeping. A
+/// clock that steps behind `last_warn_ms` yields `false` (via the saturating
+/// subtraction), suppressing rather than spamming. Note the asymmetry that leaves:
+/// a clock that jumps FORWARD parks `last_warn_ms` in the future, so the gate stays
+/// shut for the size of the jump rather than for `interval` — see
+/// [`ClientHandler::note_deposit_refusal`] for why that is tolerated.
+fn should_warn_now(now_ms: u64, last_warn_ms: u64, interval: Duration) -> bool {
+    if last_warn_ms == 0 {
+        return true;
+    }
+    let elapsed = now_ms.saturating_sub(last_warn_ms);
+    elapsed >= u64::try_from(interval.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Claim `hash` for a background fill (#859), returning a [`BgInflightGuard`]
@@ -490,7 +493,6 @@ enum ServeRejectReason {
     UnknownChannel,
     OwnerMismatch,
     InsufficientDeposit,
-    UnauthorizedOrigin,
     CooperativeCloseSigned,
     RangeNotSatisfiable,
     /// The blob is on this operator's local denylist (ADR 011 §Local Denylist).
@@ -541,7 +543,6 @@ impl ServeRejectReason {
             | Self::UnknownChannel
             | Self::OwnerMismatch
             | Self::InsufficientDeposit
-            | Self::UnauthorizedOrigin
             | Self::CooperativeCloseSigned
             | Self::RangeNotSatisfiable => StreamError::NotFound,
             Self::EvictedSinceProbe => StreamError::EvictedSinceProbe,
@@ -719,7 +720,6 @@ pub struct ClientHandlerDeps {
     /// (5 ms). The runtime sets it from `payment.voucher_commit_interval_ms`.
     pub voucher_commit_interval: Option<Duration>,
     pub leech_governor: Option<Arc<LeechGovernor>>,
-    pub pull_origin_gate: Option<Arc<dyn OriginDirectory>>,
     pub idle_timeout: Option<Duration>,
 }
 
@@ -783,7 +783,6 @@ impl ClientHandlerDeps {
             credit_window_bytes: None,
             voucher_commit_interval: None,
             leech_governor: None,
-            pull_origin_gate: None,
             idle_timeout: None,
         }
     }
@@ -903,23 +902,6 @@ pub struct ClientHandler {
     /// proceeds and credited from the voucher path. `None` (tests / feature off)
     /// leaves only the per-request window.
     leech_governor: Option<Arc<LeechGovernor>>,
-    /// Optional content-authorization gate on the reactive pull-through path
-    /// (#821, ADR 037 §Seed-leech caps / ADR 022 §`FIND_VALUE` Flow), set at
-    /// construction via [`ClientHandlerDeps`] only when the operator sets
-    /// `cache.pull_through_require_authorized_origin = true`. `None` (the default
-    /// and in tests) keeps the permissionless cache role: misses pull through
-    /// unconditionally. When `Some`, a cache miss whose request namespace has no
-    /// authorized origin in this directory (`has_origin == false`) is refused with
-    /// `NotFound` before any upstream pull or cache-warming write — a
-    /// pull-*initiation* gate only, never consulted for a range already held.
-    /// Resolves against the shared `OriginDirectory` keyed on the request's
-    /// `namespace_id`: namespace 0 (`NO_NAMESPACE`) has no authorized origins (ADR
-    /// 002 §Namespace 0), so an armed gate refuses it — the opposite of the removed
-    /// default-open allow-list. Fail-closed on RPC loss. Note the namespace is
-    /// client-asserted: under namespace-as-origin-addressing there is no on-chain
-    /// hash→namespace claim, so this gate scopes on the namespace the requester
-    /// names, not on proven hash membership.
-    pull_origin_gate: Option<Arc<dyn OriginDirectory>>,
     /// Live content deny-set (ADR 011). Consulted at three points, all of which
     /// must gate or the check is bypassable: the hash gate above the
     /// availability check in `serve_stream`, the origin gate right after channel
@@ -934,6 +916,20 @@ pub struct ClientHandler {
     voucher_interval_mb: u64,
     max_blob_size_bytes: u64,
     max_concurrent_streams: usize,
+    /// Throttle state for the insufficient-deposit refusal log (#1520): the
+    /// millisecond timestamp of the last emitted `warn!`, and how many refusals
+    /// have been swallowed since. See [`ClientHandler::note_deposit_refusal`].
+    ///
+    /// Unkeyed on purpose. A per-channel `governor` limiter was the obvious reach —
+    /// it is already a dependency and the vocabulary the three request limiters
+    /// speak — but keying it means an unboundedly growing map, and the in-tree cost
+    /// of owning one is `retain_recent` sweeps, split single-flight prune guards,
+    /// and two metrics per map (`crate::rate_limit`). That is a lot of machinery to
+    /// rate-limit a log line, and the aggregate is what answers the triage
+    /// question anyway: "one client ran dry" versus "I am refusing everyone". The
+    /// per-channel detail lives in the `debug!` beside it and in the counter.
+    deposit_refusal_last_warn_ms: AtomicU64,
+    deposit_refusal_suppressed: AtomicU64,
     /// Application-layer idle-close ceiling (ADR 005 §Connection lifetime).
     /// `None` (the default and production path) reads as [`APP_IDLE_TIMEOUT`]
     /// (30s); a shorter value is set at construction via [`ClientHandlerDeps`]
@@ -1008,13 +1004,14 @@ impl ClientHandler {
             credit_window_bytes: deps.credit_window_bytes,
             voucher_commit_interval: deps.voucher_commit_interval,
             leech_governor: deps.leech_governor,
-            pull_origin_gate: deps.pull_origin_gate,
             content_deny: deps.content_deny,
             rate_per_mb: deps.rate_per_mb,
             rate_bounds: deps.rate_bounds,
             voucher_interval_mb: deps.voucher_interval_mb,
             max_blob_size_bytes: deps.max_blob_size_bytes,
             max_concurrent_streams: deps.max_concurrent_streams,
+            deposit_refusal_last_warn_ms: AtomicU64::new(0),
+            deposit_refusal_suppressed: AtomicU64::new(0),
             idle_timeout: deps.idle_timeout,
         })
     }
@@ -1083,6 +1080,89 @@ impl ClientHandler {
         tokio::task::spawn_blocking(move || store.forget(channel_id))
             .await
             .map_err(|e| StoreError::Backend(format!("forget_channel join: {e}")))?
+    }
+
+    /// Minimum gap between insufficient-deposit `warn!` lines (#1520).
+    ///
+    /// A module const, not a config field: a log cadence does not justify the five
+    /// config sites (schema, resolver, validate summary, template, docs) a
+    /// `[payment]` knob costs, and no operator needs to tune it.
+    pub(super) const DEPOSIT_REFUSAL_WARN_INTERVAL: Duration = Duration::from_mins(5);
+
+    /// Record an insufficient-deposit refusal and decide whether this one gets a
+    /// `warn!`. Returns `Some(suppressed_since_last)` when the caller should warn.
+    ///
+    /// The refusal is routine — a client running dry is not a fault — so warning
+    /// per occurrence is farmable into log spam by exactly the abuse this guards
+    /// against. But a one-shot latch (the only existing precedent, `log_per_source_poison`
+    /// in `crate::dispatch`) is wrong in the other direction: this fires
+    /// legitimately and repeatedly, so a permanently-latched warning is as
+    /// invisible as none. Hence a window, with the swallowed count carried on the
+    /// line so a reader can tell one dry client from a node refusing everyone.
+    ///
+    /// The window arithmetic lives in [`should_warn_now`] so it is testable
+    /// without sleeping.
+    pub(super) fn note_deposit_refusal(&self) -> Option<u64> {
+        self.deposit_refusal_suppressed
+            .fetch_add(1, Ordering::Relaxed);
+        let now_ms = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX);
+        let last = self.deposit_refusal_last_warn_ms.load(Ordering::Relaxed);
+        if !should_warn_now(now_ms, last, Self::DEPOSIT_REFUSAL_WARN_INTERVAL) {
+            return None;
+        }
+        // Lost the race: another task is emitting this window's line. Its count
+        // already includes ours, because we bumped before checking.
+        if self
+            .deposit_refusal_last_warn_ms
+            .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return None;
+        }
+        Some(
+            self.deposit_refusal_suppressed
+                .swap(0, Ordering::Relaxed)
+                .saturating_sub(1),
+        )
+    }
+
+    /// Emit the observable side of an insufficient-deposit refusal (#1520).
+    ///
+    /// Unconditional `debug!` so a support ticket is answerable at all, plus a
+    /// throttled `warn!` (see [`Self::note_deposit_refusal`]). The wire code is
+    /// deliberately lossy — `InsufficientDeposit` collapses to `NotFound` with six
+    /// other reasons so a prober cannot map channel balances — so without these the
+    /// only trace of a refusal is a counter that, at the time this was written, no
+    /// alert, panel, or runbook entry referenced.
+    ///
+    /// `headroom` and `ceiling` are both in payment-token base units.
+    pub(super) fn log_deposit_refusal(
+        &self,
+        channel_id: ChannelId,
+        hash: Hash,
+        headroom: U256,
+        ceiling: U256,
+    ) {
+        tracing::debug!(
+            %channel_id, %hash, %headroom, %ceiling,
+            "refusing delivery: remaining channel deposit cannot cover the reserved cost"
+        );
+        if let Some(suppressed) = self.note_deposit_refusal() {
+            tracing::warn!(
+                %channel_id, %headroom, %ceiling, suppressed,
+                interval = ?Self::DEPOSIT_REFUSAL_WARN_INTERVAL,
+                "refusing paying clients: remaining channel deposit below the reserved cost. \
+                 A sustained rate here is either a client running dry (no action) or this \
+                 node's chain watcher lagging behind an on-chain top-up (check RPC health) \
+                 — see docs/runbook.md"
+            );
+        }
     }
 
     /// The effective downstream credit window in bytes for a stream whose
@@ -1880,6 +1960,75 @@ mod tests {
         );
     }
 
+    #[test]
+    fn deposit_refusal_warn_fires_on_the_first_refusal_then_waits_out_the_window() {
+        let interval = Duration::from_mins(5);
+        // Nothing warned yet: the very first refusal must be visible, not swallowed
+        // until a window elapses from process start.
+        assert!(should_warn_now(0, 0, interval));
+        assert!(should_warn_now(1_000_000, 0, interval));
+
+        let last = 1_000_000;
+        // Inside the window — suppressed.
+        assert!(!should_warn_now(last, last, interval));
+        assert!(!should_warn_now(last + 299_999, last, interval));
+        // Exactly at the boundary, and past it — due.
+        assert!(should_warn_now(last + 300_000, last, interval));
+        assert!(should_warn_now(last + 600_000, last, interval));
+    }
+
+    /// The atomic path, which `should_warn_now`'s two tests do not touch. The
+    /// suppressed count IS the feature — it is what distinguishes one dry client
+    /// from a node refusing everyone — and every part of producing it was
+    /// unverified: the `fetch_add` before the gate, the `swap(0)`, and the
+    /// `saturating_sub(1)` that removes the winner's own event from its own report.
+    ///
+    /// Mutants this kills: dropping the `-1` (every line off by one); moving the
+    /// `fetch_add` after the gate (the first warn reports 0 forever and nothing
+    /// accumulates); `swap` → `load` (the count grows monotonically and "suppressed
+    /// since the last line" becomes meaningless).
+    ///
+    /// No sleeping and no clock injection: the window is forced open by writing
+    /// `last_warn_ms` back to 1, which is what a test in the same module can do.
+    #[tokio::test]
+    async fn deposit_refusal_warn_reports_exactly_what_it_swallowed() {
+        let metrics = Arc::new(Metrics::new());
+        let (handler, _dir) = handler_for_warm_tests(&metrics, None).await;
+
+        // First refusal is always visible, and has swallowed nothing.
+        assert_eq!(handler.note_deposit_refusal(), Some(0));
+        // Inside the window: silent, but counting.
+        assert_eq!(handler.note_deposit_refusal(), None);
+        assert_eq!(handler.note_deposit_refusal(), None);
+
+        // Force the window open. `1`, not `0` — `0` is the never-warned sentinel.
+        handler
+            .deposit_refusal_last_warn_ms
+            .store(1, Ordering::Relaxed);
+        assert_eq!(
+            handler.note_deposit_refusal(),
+            Some(2),
+            "the line must report the two it swallowed, not counting itself"
+        );
+
+        // And the counter reset, so the next window starts from zero.
+        assert_eq!(handler.note_deposit_refusal(), None);
+        handler
+            .deposit_refusal_last_warn_ms
+            .store(1, Ordering::Relaxed);
+        assert_eq!(handler.note_deposit_refusal(), Some(1));
+    }
+
+    #[test]
+    fn deposit_refusal_warn_suppresses_rather_than_spams_on_a_backwards_clock() {
+        // A clock that steps backwards (NTP correction, VM migration) makes
+        // `now < last`. The saturating subtraction yields 0 elapsed, so the gate
+        // stays shut until the clock catches up. Suppressing is the safe direction
+        // for a log gate: the alternative is every refusal warning until then.
+        let interval = Duration::from_mins(5);
+        assert!(!should_warn_now(500, 1_000_000, interval));
+    }
+
     /// ADR 011 §`StreamRequest` Response names distinct refusal codes for the two
     /// takedown reasons. They must NOT join the seven-reason `NotFound` collapse:
     /// a client told `NotFound` retries elsewhere and pays again, which for
@@ -1901,7 +2050,6 @@ mod tests {
             ServeRejectReason::UnknownChannel,
             ServeRejectReason::OwnerMismatch,
             ServeRejectReason::InsufficientDeposit,
-            ServeRejectReason::UnauthorizedOrigin,
             ServeRejectReason::CooperativeCloseSigned,
             ServeRejectReason::RangeNotSatisfiable,
         ] {
@@ -1943,37 +2091,6 @@ mod tests {
             ServeRejectReason::EvictedSinceProbe.wire_error(),
             ServeRejectReason::HashDenied.wire_error()
         );
-    }
-
-    // #821: the reactive pull-through authorized-origin gate refuses a pull only
-    // when the operator opted in (a directory is wired) AND the request's
-    // namespace has no authorized origin; an unset gate keeps the permissionless
-    // default. Namespace 0 (no namespace) always resolves to no origins.
-    #[test]
-    fn pull_origin_gate_decision() {
-        use crate::dht::origin::{EmptyOriginDirectory, OriginDirectory, StaticOriginDirectory};
-        use crate::dht::routing::NodeId;
-
-        let ns = U256::from(7u64);
-
-        // Unset gate (default): never blocks — cache role stays permissionless.
-        assert!(!pull_origin_gate_blocks(None, ns));
-
-        // Opted in on a node with no chain addresses — the runtime's fallback
-        // shape. Blocks every request, which is the #1292 hazard: on the wire this
-        // is indistinguishable from a plain miss.
-        let empty: Arc<dyn OriginDirectory> = Arc::new(EmptyOriginDirectory);
-        assert!(pull_origin_gate_blocks(Some(&empty), ns));
-
-        // Opted in, directory holds an authorized origin for the namespace: allows.
-        let mut m = HashMap::new();
-        m.insert(ns, vec![NodeId::from_bytes([1u8; 32])]);
-        let authorized: Arc<dyn OriginDirectory> = Arc::new(StaticOriginDirectory::new(m));
-        assert!(!pull_origin_gate_blocks(Some(&authorized), ns));
-        // A different, unassigned namespace through the same directory is blocked.
-        assert!(pull_origin_gate_blocks(Some(&authorized), U256::from(9u64)));
-        // Namespace 0 (no namespace) has no authorized origins → blocked.
-        assert!(pull_origin_gate_blocks(Some(&authorized), U256::ZERO));
     }
 
     /// #1382 / #1388: the hard per-byte voucher floor must track the LIVE

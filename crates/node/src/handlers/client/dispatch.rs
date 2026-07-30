@@ -3,10 +3,10 @@
 
 use super::{
     APP_ERR_MALFORMED_MESSAGE, APP_ERR_NO_ERROR, APP_ERR_RATE_LIMITED, APP_IDLE_TIMEOUT, Address,
-    Arc, B256, ChannelId, ClientHandler, ClientMessage, Connection, FillOutcome, FirstMessage,
-    Hash, Mutex, OwnedSemaphorePermit, REJECTION_CLOSE_TIMEOUT, RecvStream, RejectReason,
-    Semaphore, SendStream, ServeRejectReason, StreamReadError, StreamResponseBody, TeeOpen, U256,
-    VarInt, pull_origin_gate_blocks, read_first_message, reset_stream, verify_binding,
+    Arc, B256, CHUNK_GROUP_BYTES, ChannelId, ClientHandler, ClientMessage, Connection, FillOutcome,
+    FirstMessage, Hash, MB_BYTES, Mutex, OwnedSemaphorePermit, REJECTION_CLOSE_TIMEOUT, RecvStream,
+    RejectReason, Semaphore, SendStream, ServeRejectReason, StreamReadError, StreamResponseBody,
+    TeeOpen, VarInt, min_payment, read_first_message, reset_stream, verify_binding,
 };
 use futures_util::StreamExt as _;
 
@@ -176,6 +176,34 @@ impl ClientHandler {
 
         let hash = Hash::from_bytes(req.hash);
 
+        // The request's price, resolved ONCE and threaded to every refusal and to
+        // the window tier. `clamped_rate` is side-effecting — it bumps
+        // `rate_bounds_clamped` and warns when the configured rate sits below the
+        // on-chain delivery floor — so calling it twice double-counts one request
+        // (#1518). `respond_error` takes the rate as a required argument precisely
+        // so that cannot happen: there is no way to sign a refusal without the
+        // caller having priced the request exactly once.
+        //
+        // Deliberately BELOW the binding block. Every exit above this point — a
+        // first-message read error, the stream-cap shed, a cooperative close, a
+        // malformed binding — returns without signing a `StreamResponse`, so none
+        // of them ever quotes a rate, and pricing them would meter a clamp for a
+        // request that never had a price. (The cooperative close does sign: an
+        // EIP-712 waiver, which carries no rate.)
+        let rate_per_mb = self.clamped_rate();
+
+        // Honor a client voucher-interval proposal (ADR 003 §Voucher Interval
+        // Negotiation): accept the smaller of the proposal and our configured
+        // cadence, never below 1 MB. Resolved here rather than just before signing
+        // so the cache-miss deposit floor below prices against the SAME interval
+        // the serve gate and `deliver` use — otherwise a client proposing a smaller
+        // cadence would be judged against our larger one, making the floor
+        // strictly stricter than the gate it precedes.
+        let interval_mb = match ext.voucher_interval_mb {
+            Some(proposed) => self.voucher_interval_mb.min(proposed).max(1),
+            None => self.voucher_interval_mb,
+        };
+
         // Local-denylist gate (ADR 011 §Local Denylist, §On Blacklist Event
         // step 2: "reject any new StreamRequest for the hash immediately").
         //
@@ -200,12 +228,17 @@ impl ClientHandler {
         // far more common hit; both are one atomic load and a hash-set probe.
         if self.cache.is_denied(hash) {
             return self
-                .respond_error(&mut send, &req, ServeRejectReason::HashDenied)
+                .respond_error(&mut send, &req, ServeRejectReason::HashDenied, rate_per_mb)
                 .await;
         }
         if self.cache.is_chain_denied(hash) {
             return self
-                .respond_error(&mut send, &req, ServeRejectReason::ChainHashDenied)
+                .respond_error(
+                    &mut send,
+                    &req,
+                    ServeRejectReason::ChainHashDenied,
+                    rate_per_mb,
+                )
                 .await;
         }
 
@@ -229,18 +262,30 @@ impl ClientHandler {
         //
         // Resolving the channel early is a `HashMap` lookup, so the cost is
         // nil; `pull_authorized` keeps its own check as the spend-side backstop.
-        if let Some(channel) = self
+        //
+        // The resolved `Arc` is KEPT rather than dropped at the end of this gate:
+        // the pre-spend deposit floor in the cache-miss arm below needs the same
+        // channel, and re-resolving it would take the map lock a second time for
+        // no reason. `None` means the channel is unknown, which both gates treat
+        // as "not my business" — an unknown channel cannot make this node spend,
+        // because `pull_authorized` refuses it before every fill tier.
+        let known_channel = self
             .channels
             .lock()
             .await
             .get(&ChannelId::from(req.channel_id))
-            .cloned()
-        {
+            .cloned();
+        if let Some(channel) = &known_channel {
             let funder = channel.lock().await.state.client;
             if self.content_deny.is_origin_denied(&funder) {
                 tracing::warn!(%funder, "refusing delivery on a channel funded by a blacklisted origin");
                 return self
-                    .respond_error(&mut send, &req, ServeRejectReason::OriginDenied)
+                    .respond_error(
+                        &mut send,
+                        &req,
+                        ServeRejectReason::OriginDenied,
+                        rate_per_mb,
+                    )
                     .await;
             }
         }
@@ -263,26 +308,12 @@ impl ClientHandler {
                 // hash an operator deliberately evicted (#279).
                 if self.cache.is_evicted(hash) {
                     return self
-                        .respond_error(&mut send, &req, ServeRejectReason::EvictedSinceProbe)
-                        .await;
-                }
-                // Content-authorization gate (#821, ADR 037 §Seed-leech caps).
-                // When the operator opts in
-                // (`pull_through_require_authorized_origin`), refuse to INITIATE an
-                // upstream pull and its cache-warming write for a request whose
-                // namespace has no currently-authorized origin. Namespace 0 has no
-                // authorized origins (ADR 002 §Namespace 0), so an enabled gate
-                // refuses it. It is a pull-*initiation* gate only: a range already
-                // held is served from the `Ok(true)` arm above, so refusing held
-                // blobs stays `ContentBlacklist`'s job (ADR 011/031). The directory
-                // is wired only when the gate is enabled, so an unset gate keeps the
-                // permissionless cache-role default.
-                if pull_origin_gate_blocks(
-                    self.pull_origin_gate.as_ref(),
-                    U256::from_be_bytes(req.namespace_id),
-                ) {
-                    return self
-                        .respond_error(&mut send, &req, ServeRejectReason::UnauthorizedOrigin)
+                        .respond_error(
+                            &mut send,
+                            &req,
+                            ServeRejectReason::EvictedSinceProbe,
+                            rate_per_mb,
+                        )
                         .await;
                 }
                 // Node-to-node cache-miss pull-through (#831). Fronting upstream
@@ -320,6 +351,97 @@ impl ClientHandler {
                 // origin chain), but that is a coincidence of the current tier
                 // ordering, not an invariant — and this is the one bug the file
                 // exists to prevent. Latch every tier.
+                // Pre-spend deposit floor (#1519). Every fill tier below spends:
+                // the range and local tiers front the operator's own origin
+                // egress, and the buffered tier's `cache.populate` walks the paid
+                // `Peer` origin and fronts real upstream USDC. (The range tier is
+                // own-egress-only because `NodeOrigin` does not implement
+                // `Origin::fetch_range` — `pull_through_range` iterates every
+                // origin with no `local_only` filter, so the day it does, that tier
+                // starts fronting upstream USDC too. Nothing would fail.) All three are gated
+                // on channel OWNERSHIP (`pull_authorized`) and none on solvency,
+                // so before this floor a dust-deposit channel could name N absent
+                // hashes, make the node pay for each, and be refused afterwards by
+                // the serve-path gate — the attacker gains nothing, but the
+                // operator still pays. Refuse here instead, before any of it.
+                //
+                // The floor is one credit window, CAPPED BY THE REQUEST'S SPAN
+                // when the request bounds itself. A bounded range carries
+                // `byte_len`, so its billed size is knowable without `total_bytes`
+                // (align it out to chunk groups exactly as the serve path does —
+                // `export_bao_range_stream` serves the aligned superset). Pricing
+                // such a request at a whole window would refuse a client that can
+                // comfortably pay for the range it asked for, and it would do so
+                // ONLY on a cache miss — the serve gate prices the same request at
+                // the aligned span — so the same request would be served warm and
+                // refused cold. Worse, `decdn fetch` reads a refused resume as a
+                // possibly-stale partial, rewinds to zero and re-pays for the whole
+                // blob, so mispricing a bounded request doubles a user's bill.
+                //
+                // For an UNBOUNDED request (`byte_len == 0`: whole blob, or a tail
+                // from an offset) the billed size genuinely is unknowable pre-fill,
+                // so the window stands. Be clear about the residual that leaves,
+                // because it is not small: at stock config the window is 8 MiB
+                // (`DEFAULT_CREDIT_WINDOW_BYTES`, over a 4 MiB
+                // `DEFAULT_VOUCHER_INTERVAL_MB`), so a cold 100 KiB whole-blob
+                // fetch is priced at 8 MiB while the same blob served warm is
+                // priced at 100 KiB. A channel funded for the blob but not for a
+                // window is refused cold and served warm. Closing that needs the
+                // origin size probe to run before the floor, which is a larger
+                // change than this one.
+                //
+                // `window.rs` keeps its own guard. The honest relationship is
+                // narrower than "two separate guards": at default settings its
+                // `else` arm resolves to `max(pull_ahead, interval, credit_window)`
+                // = the credit window = this same floor, so it is redundant
+                // there. (Not because `DEFAULT_PULL_AHEAD_BYTES` equals one
+                // interval — it is 1 MiB against a 4 MiB default interval. The
+                // `.max(credit_window(..))` term is what makes them coincide.) It
+                // diverges once either `max_blob_size_bytes` is finite (it then
+                // reserves the whole-blob cost) or `pull_ahead_bytes` is raised
+                // above the window — nothing validates that pair against each
+                // other. Neither direction is guaranteed stricter: a 1 MiB blob cap
+                // under an 8 MiB window makes it WEAKER than this floor. It is also
+                // the tier that fronts UPSTREAM spend. Do not delete it on the
+                // strength of this floor alone.
+                //
+                // Skipped for an unknown channel: `pull_authorized` already
+                // refuses those before every tier, so there is no spend to gate.
+                if let Some(channel) = &known_channel {
+                    let interval_bytes = interval_mb.saturating_mul(MB_BYTES).max(1);
+                    let window = self.credit_window(interval_bytes);
+                    // `u64::MAX` stands in for the unknown blob size: both of
+                    // `align_range`'s clamps to it become no-ops, so this is the
+                    // aligned span the serve path would bill, never less.
+                    let reserved = if req.byte_len > 0 {
+                        aligned_span(req.byte_offset, req.byte_len, u64::MAX).min(window)
+                    } else {
+                        window
+                    };
+                    let floor = min_payment(reserved, rate_per_mb);
+                    let (deposit, last_amount) = {
+                        let guard = channel.lock().await;
+                        (guard.state.deposit, guard.state.last_amount())
+                    };
+                    let headroom = deposit.saturating_sub(last_amount);
+                    if headroom < floor {
+                        self.log_deposit_refusal(
+                            ChannelId::from(req.channel_id),
+                            hash,
+                            headroom,
+                            floor,
+                        );
+                        return self
+                            .respond_error(
+                                &mut send,
+                                &req,
+                                ServeRejectReason::InsufficientDeposit,
+                                rate_per_mb,
+                            )
+                            .await;
+                    }
+                }
+
                 let mut fault_seen = false;
                 if (req.byte_offset > 0 || req.byte_len > 0)
                     && self.pull_authorized(&req, verified_client).await
@@ -350,9 +472,9 @@ impl ClientHandler {
                 // terminal MISS below therefore goes through
                 // `FillOutcome::miss_reason` — including the window path's leech
                 // shed. (The channel-class refusals — `UnknownChannel`,
-                // `InsufficientDeposit`, `UnauthorizedOrigin` — keep their own
-                // reasons: they are client-attributable and would refuse regardless
-                // of origin health.)
+                // `InsufficientDeposit` — keep their own reasons: they are
+                // client-attributable and would refuse regardless of origin
+                // health.)
                 let mut locally_filled = false;
                 if range_pulled_size.is_none()
                     && let Some(timeout) = self.local_populate
@@ -407,6 +529,7 @@ impl ClientHandler {
                                 Arc::clone(origin),
                                 tee,
                                 fault_seen,
+                                rate_per_mb,
                             ))
                             .await;
                         }
@@ -420,7 +543,9 @@ impl ClientHandler {
                             if !coalesced.is_filled() {
                                 let reason =
                                     FillOutcome::miss_reason(fault_seen || coalesced.is_fault());
-                                return self.respond_error(&mut send, &req, reason).await;
+                                return self
+                                    .respond_error(&mut send, &req, reason, rate_per_mb)
+                                    .await;
                             }
                         }
                     }
@@ -438,14 +563,21 @@ impl ClientHandler {
                     };
                     if !buffered.is_filled() {
                         let reason = FillOutcome::miss_reason(fault_seen || buffered.is_fault());
-                        return self.respond_error(&mut send, &req, reason).await;
+                        return self
+                            .respond_error(&mut send, &req, reason, rate_per_mb)
+                            .await;
                     }
                 }
             }
             Err(e) => {
                 tracing::warn!(%hash, error = %e, "cache `has` lookup failed on delivery path");
                 return self
-                    .respond_error(&mut send, &req, ServeRejectReason::InternalError)
+                    .respond_error(
+                        &mut send,
+                        &req,
+                        ServeRejectReason::InternalError,
+                        rate_per_mb,
+                    )
                     .await;
             }
         }
@@ -469,7 +601,12 @@ impl ClientHandler {
                 Err(e) => {
                     tracing::warn!(%hash, error = %e, "cache `inspect` failed on delivery path");
                     return self
-                        .respond_error(&mut send, &req, ServeRejectReason::InternalError)
+                        .respond_error(
+                            &mut send,
+                            &req,
+                            ServeRejectReason::InternalError,
+                            rate_per_mb,
+                        )
                         .await;
                 }
             };
@@ -479,14 +616,24 @@ impl ClientHandler {
                     "blob present per `has` but `inspect` reports no size; treating as fault"
                 );
                 return self
-                    .respond_error(&mut send, &req, ServeRejectReason::InternalError)
+                    .respond_error(
+                        &mut send,
+                        &req,
+                        ServeRejectReason::InternalError,
+                        rate_per_mb,
+                    )
                     .await;
             };
             total_bytes
         };
         if self.max_blob_size_bytes > 0 && total_bytes > self.max_blob_size_bytes {
             return self
-                .respond_error(&mut send, &req, ServeRejectReason::BlobTooLarge)
+                .respond_error(
+                    &mut send,
+                    &req,
+                    ServeRejectReason::BlobTooLarge,
+                    rate_per_mb,
+                )
                 .await;
         }
 
@@ -507,7 +654,12 @@ impl ClientHandler {
                         .is_none_or(|end| end > total_bytes));
             if out_of_bounds {
                 return self
-                    .respond_error(&mut send, &req, ServeRejectReason::RangeNotSatisfiable)
+                    .respond_error(
+                        &mut send,
+                        &req,
+                        ServeRejectReason::RangeNotSatisfiable,
+                        rate_per_mb,
+                    )
                     .await;
             }
         }
@@ -527,7 +679,12 @@ impl ClientHandler {
         let Some(channel) = channel else {
             tracing::warn!(%channel_id, "stream request on unknown channel; refusing pre-serve");
             return self
-                .respond_error(&mut send, &req, ServeRejectReason::UnknownChannel)
+                .respond_error(
+                    &mut send,
+                    &req,
+                    ServeRejectReason::UnknownChannel,
+                    rate_per_mb,
+                )
                 .await;
         };
 
@@ -539,7 +696,12 @@ impl ClientHandler {
         // running when the waiver was signed stops at its next voucher).
         if channel.lock().await.state.cooperative_close_signed() {
             return self
-                .respond_error(&mut send, &req, ServeRejectReason::CooperativeCloseSigned)
+                .respond_error(
+                    &mut send,
+                    &req,
+                    ServeRejectReason::CooperativeCloseSigned,
+                    rate_per_mb,
+                )
                 .await;
         }
 
@@ -557,21 +719,93 @@ impl ClientHandler {
             if client != authorized_signer {
                 tracing::warn!(%client, %authorized_signer, "binding does not authorize this channel");
                 return self
-                    .respond_error(&mut send, &req, ServeRejectReason::OwnerMismatch)
+                    .respond_error(
+                        &mut send,
+                        &req,
+                        ServeRejectReason::OwnerMismatch,
+                        rate_per_mb,
+                    )
                     .await;
             }
         }
 
-        // Honor a client voucher-interval proposal (ADR 003 §Voucher Interval
-        // Negotiation): accept the smaller of the proposal and our configured
-        // cadence, never below 1 MB.
-        let interval_mb = match ext.voucher_interval_mb {
-            Some(proposed) => self.voucher_interval_mb.min(proposed).max(1),
-            None => self.voucher_interval_mb,
+        // Pre-flight deposit gate — the direct-serve twin of the pull-through
+        // guard in `window.rs` (keep the two in step). Without it the node signs
+        // `ok: true` and streams a full credit window before `stage_voucher`'s
+        // `AmountExceedsDeposit` can fire at the first voucher boundary, so a
+        // channel that cannot cover even that first window gets it free on every
+        // request (#1516).
+        //
+        // The quantity is remaining HEADROOM, not the gross deposit: both the
+        // off-chain check (`ChannelState::stage_voucher`) and the on-chain one
+        // (`PaymentChannel._advanceClaimWatermark`) compare the *cumulative*
+        // voucher amount against the deposit, so a long-lived channel with most
+        // of its deposit already claimed has only `deposit - last_amount` left.
+        //
+        // The ceiling is the CREDIT WINDOW, not one interval: `deliver` streams
+        // while `delivered - paid < credit_window(interval_bytes)`, so with
+        // `credit_window_bytes` configured (#1477) the node fronts a whole window
+        // before it collects anything. Gating on one interval would let enabling
+        // a credit window silently re-open the hole.
+        //
+        // ... but capped by the request's own span, or a legitimately funded
+        // sub-interval fetch (a small blob, or a bounded range) would be refused
+        // for not covering a window it will never use.
+        //
+        // The span is the CHUNK-GROUP-ALIGNED one, not the requested one, because
+        // that is what gets billed: `export_bao_range_stream` snaps the range out
+        // to the enclosing 16 KiB group boundaries (a bao proof anchors whole
+        // groups) and `deliver` does NOT trim back — the receiver discards the
+        // leading bytes itself. Pricing the *requested* span would under-reserve
+        // by up to two groups (~32 KiB, ~3% of a default 1 MiB window), which for
+        // a two-byte range request is four orders of magnitude. That is not the
+        // by-design looseness below; it is the wrong quantity.
+        //
+        // What remains loose is only bao's proof interleave: `guard_bytes` counts
+        // CONTENT bytes while billing counts WIRE bytes. State the residual as an
+        // ABSOLUTE bound, because the fraction is misleading — the boundary proof
+        // is `64 * log2(blob_groups / range_groups)`, so it amortizes to ~0.4% of
+        // a whole blob or a window-sized range but reaches ~8% of a *single*
+        // 16 KiB group of a multi-gigabyte blob. Either way it is at most ~1.3 KiB
+        // per request, against the 1 MiB (or wider) window that used to ship free.
+        // Deliberate, and in the safe direction — the gate can only ever *serve* a
+        // request it should have refused, never refuse one that could pay — and
+        // the mid-stream ceiling remains the exact authority.
+        //
+        // A zero-length blob yields a zero ceiling and passes (#1054).
+        //
+        // The bounds check above rejected `byte_offset >= total_bytes`, so the
+        // span arithmetic never clamps to zero. That is the load-bearing property,
+        // not underflow: a clamped span of 0 would zero the ceiling and wave every
+        // request through.
+        //
+        // This is a per-request floor, NOT a reservation: two concurrent streams
+        // on one channel can each pass and jointly exceed the headroom. The
+        // mid-stream ceiling bounds each STREAM to one window of unbilled egress,
+        // but nothing caps the aggregate at the deposit — what bounds N is the
+        // per-connection stream cap. Same in `window.rs`.
+        let interval_bytes = interval_mb.saturating_mul(MB_BYTES).max(1);
+        let guard_bytes = aligned_span(req.byte_offset, req.byte_len, total_bytes)
+            .min(self.credit_window(interval_bytes));
+        let ceiling = min_payment(guard_bytes, rate_per_mb);
+        let (deposit, last_amount) = {
+            let guard = channel.lock().await;
+            (guard.state.deposit, guard.state.last_amount())
         };
+        let headroom = deposit.saturating_sub(last_amount);
+        if headroom < ceiling {
+            self.log_deposit_refusal(channel_id, hash, headroom, ceiling);
+            return self
+                .respond_error(
+                    &mut send,
+                    &req,
+                    ServeRejectReason::InsufficientDeposit,
+                    rate_per_mb,
+                )
+                .await;
+        }
 
         // Build and sign the success response.
-        let rate_per_mb = self.clamped_rate();
         let body = StreamResponseBody {
             hash: req.hash,
             ok: true,
@@ -600,5 +834,88 @@ impl ClientHandler {
             interval_mb,
         )
         .await
+    }
+}
+
+/// Content bytes a `(byte_offset, byte_len)` request will actually be BILLED for,
+/// i.e. the chunk-group-aligned superset `export_bao_range_stream` serves.
+///
+/// Mirrors `decdn_bao_range::align_range`: the start floors to its group
+/// boundary, the end ceils to one and clamps to the blob. The serve path does not
+/// trim back to `byte_offset` (trimming would break bao verification — the
+/// receiver discards the leading bytes itself), so the payer covers the whole
+/// aligned range. A pre-flight price computed on the *requested* span would
+/// under-reserve by up to two groups.
+///
+/// `byte_len == 0` means "to the end of the blob" (whole blob when `byte_offset`
+/// is also 0). Total-saturating throughout: the caller's range bounds check has
+/// already rejected an out-of-bounds request, and a zero-length blob correctly
+/// yields 0.
+fn aligned_span(byte_offset: u64, byte_len: u64, total_bytes: u64) -> u64 {
+    let end = if byte_len > 0 {
+        byte_offset.saturating_add(byte_len).min(total_bytes)
+    } else {
+        total_bytes
+    };
+    let start = (byte_offset / CHUNK_GROUP_BYTES).saturating_mul(CHUNK_GROUP_BYTES);
+    let aligned_end = end
+        .div_ceil(CHUNK_GROUP_BYTES)
+        .saturating_mul(CHUNK_GROUP_BYTES)
+        .min(total_bytes);
+    aligned_end.saturating_sub(start)
+}
+
+#[cfg(test)]
+mod aligned_span_tests {
+    use super::{CHUNK_GROUP_BYTES, aligned_span};
+
+    const G: u64 = CHUNK_GROUP_BYTES;
+
+    #[test]
+    fn whole_blob_is_the_blob() {
+        assert_eq!(aligned_span(0, 0, 5 * G), 5 * G);
+        // A partial final group is clamped to the blob, not rounded past it.
+        assert_eq!(aligned_span(0, 0, 5 * G + 1), 5 * G + 1);
+    }
+
+    #[test]
+    fn zero_length_blob_prices_nothing() {
+        // #1054: must yield a zero ceiling so an empty blob still serves.
+        assert_eq!(aligned_span(0, 0, 0), 0);
+    }
+
+    #[test]
+    fn a_tiny_range_is_priced_as_the_group_it_touches() {
+        // The regression this helper exists for: pricing `byte_len` directly
+        // would reserve 2 bytes for a request that bills a full 16 KiB group.
+        assert_eq!(aligned_span(0, 2, 10 * G), G);
+        assert_eq!(aligned_span(1, 1, 10 * G), G);
+    }
+
+    #[test]
+    fn a_range_straddling_a_boundary_pays_both_groups() {
+        // Worst case: one byte either side of a boundary spans two whole groups.
+        assert_eq!(aligned_span(G - 1, 2, 10 * G), 2 * G);
+    }
+
+    #[test]
+    fn an_already_aligned_range_gains_nothing() {
+        assert_eq!(aligned_span(G, G, 10 * G), G);
+        assert_eq!(aligned_span(2 * G, 3 * G, 10 * G), 3 * G);
+    }
+
+    #[test]
+    fn a_whole_tail_runs_from_its_group_start_to_the_blob_end() {
+        // `byte_len == 0` with a non-zero offset is the resume shape.
+        assert_eq!(aligned_span(3 * G, 0, 10 * G), 7 * G);
+        // Mid-group offset floors back to the group start.
+        assert_eq!(aligned_span(3 * G + 5, 0, 10 * G), 7 * G);
+    }
+
+    #[test]
+    fn a_range_past_the_blob_end_clamps_to_the_blob() {
+        // The caller's bounds check rejects these, but the helper must not
+        // over-price if it is ever reached with a partial final group.
+        assert_eq!(aligned_span(0, u64::MAX, 3 * G + 7), 3 * G + 7);
     }
 }

@@ -23,6 +23,71 @@ since project inception and will roll into the first tagged release.
 
 ### Changed (BREAKING)
 
+- **Deploy-script-breaking: `DeployConfig` and `BuybackActivation` changed shape
+  (#1090, #1175).** Both are `BaseProtocolDeploy` structs, so only out-of-tree
+  callers that construct them by hand are affected — no contract ABI, config
+  file, or CLI surface changes, and a `DeployProtocol` run with an unchanged
+  environment produces the same deploy it did before. The written manifest does
+  change shape: `deployments/<chainId>.json` gains an `externalDeps.bootstrapMultisig`
+  key, which matters to anything parsing it.
+  - `DeployConfig` gains `bootstrapMultisig` (read from the new optional
+    `BOOTSTRAP_MULTISIG` env var). Unset/zero keeps today's behaviour exactly:
+    `DecdnGovernor` is seated as the `TimelockController`'s proposer at deploy,
+    so DAO voting is live immediately.
+  - `BuybackActivation`'s 17 flat fields regroup into the venue-independent `guard`,
+    the venue-derived `seed`, and the venue-scoped `uni` / `bal`. The flat layout let a
+    Balancer field be set under `venue == UNISWAP` and silently dropped;
+    `_activateBuyback` now rejects both halves of that mistake —
+    `VenueFieldsCrossWired` for a field on the unselected venue, `VenueFieldsUnwired`
+    for a required field missing on the selected one (a Balancer activation without
+    its Vault otherwise ships a burner that can never swap while already receiving
+    30% of protocol revenue). `PoolSeed` additionally records the venue it was
+    derived for, since the 80/20-vs-1:1 seed weighting means a mismatched pair
+    mis-anchors the genesis pool silently (`PoolSeedVenueMismatch`).
+  - `BalancerVenueParams` nests `BuybackVenueLib.BalancerWiring` rather than
+    restating five of its fields, and the guard band is
+    `GuardedBuybackBurner.GuardParams` rather than a fourth copy of the same shape.
+
+- **Monitoring-breaking: `monitoring/` no longer ships rules and panels that
+  could never fire (#1513).** Eleven `decdn_*` series referenced by the
+  reference alerts and dashboard were never exported by any node. Nothing in CI
+  compared the two, so each shipped as coverage while being permanently silent.
+  Both files now reference only live series, enforced by a new
+  `monitoring_selectors_are_exported` test.
+  - **Renamed:** `decdn_peer_table_size` → `decdn_gossip_peer_table_size`
+    (exporter field `gossip_peer_table_size`). This revives
+    `DecdnPeerTableThin`, which has never been able to fire, and fixes the
+    "Peer table size" dashboard panel. **Any forked dashboard or alert file
+    needs the same edit.**
+  - **Alerts deleted:** `DecdnBlacklistSyncLagWarning`,
+    `DecdnBlacklistSyncLagCritical`, `DecdnBlacklistVersionBehind`,
+    `DecdnBlacklistVersionFarBehind` (on `decdn_blacklist_sync_lag_seconds` /
+    `decdn_blacklist_version_behind`, neither emitted — the blacklist watcher is
+    unimplemented; `DecdnBlacklistWatcherStalled` is the real coverage), and
+    `DecdnHashMismatchAppearing` (on
+    `decdn_streams_failed_total{reason="hash_mismatch"}`). Delivery hash
+    mismatch is genuinely unmetered — a real coverage gap, now recorded in
+    `docs/runbook.md` rather than papered over with a rule that cannot fire.
+  - **Alert replaced:** `DecdnHighStreamErrorRate` →
+    `DecdnServeInternalErrorRate`. The old rule divided
+    `decdn_streams_failed_total` by `decdn_streams_{failed,completed}_total`;
+    none exist. There is no serve-attempt counter to build a ratio from, so the
+    replacement is an absolute rate on
+    `decdn_serve_stream_rejected_internal_error_total` — the one refusal reason
+    that means the node itself is at fault rather than the client.
+  - **Panels changed:** "Blacklist sync lag" → "Blacklist watcher tick age";
+    "Throughput (served vs received)" now reads
+    `decdn_cache_bytes_returned_total` / `decdn_cache_pull_through_bytes_total`
+    (whose ratio is the origin-egress amplification factor) instead of
+    `decdn_bytes_{served,received}_total`; "Probe responses by result" and the
+    p50/p95/p99 "Probe fan-out latency" panel are replaced by one probe
+    request-rate + probe-cache hit/miss panel (the exporter registers no
+    histograms at all, so no quantile panel is buildable today); "Stream
+    failures by reason" is dropped as redundant with the real serve-refusal
+    panel, which gains an `internal error` series; the payments panel drops its
+    settled-channel and vouchers-signed series for
+    `decdn_voucher_nonce_gaps_total`.
+
 - **Phantom-announcement offense retired; probe holds are now best-effort.**
   `SlashJudge` adjudicates two offenses instead of three. The
   announce-then-fail-to-deliver ("phantom announcement") offense is gone: it
@@ -64,6 +129,29 @@ since project inception and will roll into the first tagged release.
     `stake_lane_reserved` now record an advertised-without-hold probe rather
     than a suppressed answer. Alert text and the runbook are updated
     accordingly; review any custom rules built on them.
+- **`PaymentChannel.minDeposit` removed (#1515).** **ABI-breaking, not
+  config-breaking.** The network minimum-deposit parameter is gone: the
+  `minDeposit()` view and the `setMinDeposit(uint256)` governance setter no
+  longer exist (an integrator calling either now reverts on a missing selector),
+  the `MinDepositUpdated` event is gone (a subscriber filtering its topic sees
+  zero events, silently), and the `DepositBelowMinimum` error selector is
+  retired. `openChannel` now accepts **any non-zero deposit** and reverts
+  `ZeroAmount` on zero — both before the transfer and on the received balance
+  delta, so a fee-on-transfer token cannot shave a deposit to nothing. Because
+  the parameter no longer exists, any pending or scripted `setMinDeposit`
+  governance proposal is un-executable. `PaymentChannel` has a constructor and no
+  proxy, so this requires a **fresh deployment**; existing testnet instances must
+  be redeployed. The floor bounded nothing that is not already bounded — service
+  by the seller-side per-voucher ceiling (see the #1516 entry under Fixed),
+  channel spam by gas — and the client-side 10 USDC recommendation of
+  [ADR 003 § Deposit Economics](adr/003-payments.md#deposit-economics) is
+  unchanged. `blockchain.buyer_deposit_micro_usdc` keeps its name, its 10 USDC
+  default, and its `> 0` validation; buyer paths simply no longer read the
+  contract to clamp up to a floor. The internal `MIN_DEPOSIT_FLOOR` constant
+  bounded two different things — `setMinDeposit`'s own lower bound and the
+  delivery-*rate* floor. With the former gone it is renamed `MIN_RATE_FLOOR` to
+  match what it still does; same value, two remaining call sites (the constructor
+  and `setRateBounds`), no behaviour change.
 - **Log-replay start-block config knobs removed.** **Config-breaking:** the
   three `[blockchain]` scan-floor fields — `origin_directory_from_block`,
   `slash_judge_from_block`, and `content_blacklist_from_block` — are removed.
@@ -336,8 +424,159 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+#### Cache
+
+- **A poisoned coalescing mutex no longer silently costs origin egress and USDC
+  (#1517).** `CacheEngine`'s in-flight fill-coalescing map is what stops N
+  concurrent requests for one missing blob from opening N origin pulls. Three of
+  its **six** lock sites discarded the `PoisonError` — `get`'s loop and
+  `populate_inner`'s fell through to a *direct* pull, and `InflightGuard::drop`
+  skipped its removal — while the three tee-path sites (`open_tee_sink`,
+  `TeeReservation::drop`, `TeeSink::drop`) already recovered the guard with
+  `PoisonError::into_inner`. Since nothing cleared the poison, and a
+  `std::sync::Mutex` stays poisoned until something does, one panic permanently
+  disabled coalescing: an unbounded
+  egress multiplier on a metered `http`/`s3` origin, and on the `Peer` origin
+  reached via `populate` a double-spend of USDC vouchers upstream — the exact
+  hazard `TeeOpen::InFlight` is documented to prevent. Nothing logged it and
+  nothing counted it; the only observable was
+  `decdn_cache_pull_through_bytes_total` outrunning request volume.
+  - All six sites now go through one `Inner::lock_inflight` choke point that
+    recovers the guard, matching the crate's dominant idiom and the rationale
+    already written for `evicted` / `is_evicted`. **Coalescing survives poison**,
+    so the hazard is removed rather than merely reported. Having established that
+    the critical sections contain no user code (so the map cannot be torn), it
+    also calls `Mutex::clear_poison`, returning the mutex to a healthy state — no
+    restart is needed, and the counter below counts *poisonings* rather than
+    locks-taken-since-a-poisoning, so a `rate()` panel shows incidents instead of
+    request volume.
+  - The dropped removal in `InflightGuard::drop` was a second, unrecorded bug:
+    `notify_waiters()` wakes only *current* waiters, so a leaked entry left every
+    later request for that hash parked on a `Notify` that would never fire again
+    — the permanent hang the guard exists to prevent.
+  - **New metric:** `decdn_cache_inflight_mutex_poisoned_total`, paired with a
+    single latched `tracing::error!`, an `appendix-observability.md` registry
+    row, and a `DecdnCacheInflightMutexPoisoned` alert on `> 0`. The anti-panic
+    policy makes poison close to unreachable, so any nonzero value is a bug
+    report, not a threshold to tune; `docs/runbook.md § Cache coalescing mutex
+    poisoned` says so, and says explicitly **not** to restart. No config, wire,
+    or ABI change.
+
+#### Observability
+
+- **The ADR metric registry can no longer document series the node never emits
+  (#1513).** `adr/appendix-observability.md` calls itself the canonical registry
+  but had no way to say "specified, not built" — its only axis was the M/R
+  *requirement* tier — so roughly a third of its rows read as shipped while
+  nothing exported them.
+  - **New `Status` column** (`live` / `planned`) on every registry table, and a
+    new `adr_registry_names_are_exported` test asserting every `live` row
+    resolves against the encoder's output. `planned` is the allowlist that gate
+    skips, which is what lets the check be absolute instead of carrying a
+    hand-maintained skip list that would rot the same way the names did.
+  - **Corrected names:** `decdn_peer_table_size` →
+    `decdn_gossip_peer_table_size` (also in `adr/appendix-peer-table-eviction.md`
+    and a `crates/common` config doc) and `decdn_gossip_announces_sent_total` →
+    `decdn_gossip_announces_published_total`. ADR 005 and ADR 022 specified a
+    single labelled `decdn_{probe,dht}_rate_limit_rejections_total`; the exporter
+    has always emitted sibling trios, and the ADRs now say so.
+  - **Added rows** for both rate-limit families (rejected / prune-sweeps /
+    tracked, 14 series), which existed only as brace-expanded shorthand in the
+    reason-splits table and so carried no Type, Tier, or description anywhere.
+  - `decdn_peer_table_evicted_registry_total` was specified with a `reason`
+    label, contradicting the same appendix's claim that
+    `decdn_probe_hold_unavailable_total{reason}` is the one labelled reason
+    split. It is now two sibling counters, per #1475.
+  - The doc comments in `crates/node/src/dht/rate_limit.rs` and
+    `crates/node/src/handlers/probe_rate_limit.rs` justified sibling counters
+    with "the `iroh_metrics::MetricsGroup` backend has no per-field labels".
+    That is false — `probe_hold_unavailable` and `streams_active` are both
+    `Family<L, M>` — and it contradicted five other comments in the tree.
+    Rewritten to state the #1475 convention as the deliberate choice it is.
+  - `decdn_cache_tag_drop_failures_total` joins the name-pinning array; it has
+    been bumped since #860/#837 but was never pinned.
+
 #### Node serve path
 
+- **An underfunded channel no longer gets one interval free per request
+  (#1516).** The direct-serve path signed a success `StreamResponse` and streamed
+  a full credit window — one 1 MB voucher interval at the default cadence, more
+  if `credit_window_bytes` is configured — before the per-voucher deposit ceiling
+  could fire at the first voucher boundary. A channel that could not cover even
+  that first window was therefore served it anyway, on every request, and a
+  client's resume loop could farm a fresh one per retry attempt. The serve path
+  now reserves `min(credit window, requested span)` against the channel's
+  *remaining* headroom (`deposit − last claimed amount`, matching how both the
+  off-chain and on-chain ceilings compare cumulative voucher amounts) and refuses
+  before signing, metered as `serve_stream_rejected_insufficient_deposit` — the
+  same guard the cache-miss pull-through path has carried since #856, against a
+  narrower ceiling. The span is chunk-group-aligned, because
+  `export_bao_range_stream` serves the aligned superset and the serve path does
+  not trim back, so pricing the requested span would under-reserve a small
+  bounded range by up to two 16 KiB groups. What remains unreserved is only bao's
+  proof interleave (the reservation counts content bytes, delivery bills wire
+  bytes): at most ~1.3 KiB per request, against the 1 MiB-or-wider window that
+  used to ship free. The mid-stream ceiling remains the exact authority. A funded
+  request for a blob or range smaller than one interval is unaffected — the
+  reservation is capped by the span, not by the cadence. This gate's placement
+  relative to the cache-miss fill tiers is corrected by the next entry. No wire,
+  config, or ABI change.
+- **An underfunded channel can no longer make the node spend before it is refused
+  (#1519).** The gate above runs on the serve path, which a cache miss reaches
+  only *after* the fill tiers — and `try_range_pull_through`,
+  `try_local_populate` and `try_pull_through` were gated on channel ownership
+  (`pull_authorized`) but not on solvency, the last of them reaching the paid
+  `Peer` origin. So a dust-deposit channel could name absent hashes, make the
+  operator pay origin egress and upstream USDC for each, and be refused
+  afterwards: the client gained nothing, but the bill was real. A **pre-spend
+  floor** now runs above every tier, refusing when remaining headroom cannot
+  cover one credit window. It is deliberately a floor rather than the serve
+  path's exact span-capped ceiling, because `total_bytes` is unknowable before
+  the fill — so it catches a channel that cannot pay for anything at all, and
+  does not pre-judge a merely small request. Two deliberate consequences: a cold
+  sub-window fetch that previously got a free fill is now refused (such a channel
+  could not have completed the transfer either way), and this refusal *pre-empts*
+  the #1129 fault latch — a client-attributable refusal wins over "this node is
+  degraded", because it would refuse regardless of origin health. **Residual:** a
+  channel funded to exactly one window can still trigger a whole-blob buffered
+  node-to-node pull costing more than it can repay; that tier is bounded by the
+  cache engine's enforcement of `cache.max_blob_size_mb` rather than by anything the
+  handler prices (not a *separate* knob — both derive from the same config field, but
+  only the engine bounds that tier), and giving it a ceiling in its own quantity is
+  tracked separately.
+  Internally, `respond_error` now takes the request's price as a required
+  argument and `serve_stream` holds the crate's only production `clamped_rate()`
+  call. That stops this function from recomputing the price *implicitly*, which is
+  the shape the bug took — it does not make the invariant type-checked, since a
+  caller can still pass an inline `self.clamped_rate()` or the wrong value. What
+  holds it is the single call site plus two new tests
+  (`a_refused_request_clamps_the_rate_exactly_once` and its zero-case sibling),
+  where before it was review attention alone. No wire, config, or ABI change.
+- **Buyer channel rows now record the deposit the contract credited, not the amount
+  requested (#1521).** `openChannel` and `topUp` credit a measured balance delta —
+  deliberately, so a fee-on-transfer settlement token cannot over-state a channel
+  against the shared USDC pool — and emit that delta in `ChannelOpened.deposit` /
+  `ChannelToppedUp.additionalDeposit`. The buyer path recorded its own requested
+  amount instead, so under such a token its local row would over-state the deposit.
+  The harm is buyer-side rather than a settlement revert: nothing in the buyer bounds
+  vouchers by this field, and the seller refuses off-chain via `stage_voucher` long
+  before any on-chain call. What breaks is the buyer's own headroom arithmetic — the
+  auto-refill reads `deposit - prior_amount` from the inflated row, so it fires late
+  or short, and because credits accumulate the drift compounds with every top-up
+  until every seller refuses us. `open_channel` now reads `ChannelOpened.deposit` (it
+  already took `channelId` and `expiresAt` from that event) and `top_up` decodes
+  `ChannelToppedUp` rather than assuming the requested amount landed. If that event
+  is absent — meaning our view of the contract is wrong, which is the worst state in
+  which to guess — it reconciles against `getChannel` and `warn!`s; only if that
+  read *also* fails does it credit the requested amount, and then at `error!`. Not reachable
+  today — mainnet USDC is not fee-on-transfer — so this is defensive depth, not a
+  live fix. Note what protects us is that the settlement token's ADDRESS is immutable
+  at deployment, not its behaviour: real USDC is an upgradeable proxy, which is the
+  hazard `PaymentChannel`'s own comment names. **Contract
+  behaviour is unchanged:** a partial shave is still credited as received rather
+  than reverted, which is now an asserted decision instead of an unexercised path;
+  reverting would hard-code "the settlement token must never be fee-bearing" into
+  the contract, a policy call larger than the test gap that prompted this.
 - **A degraded node no longer reports itself as merely empty (#1129).** On a
   `cdn/client/v1` cache miss, a transient origin/store fault during a reactive
   pull-through fill (an S3 5xx surviving retry exhaustion, an open circuit
@@ -376,6 +615,59 @@ since project inception and will roll into the first tagged release.
   longer exists. Retained here only so the issue number resolves.
 
 ### Changed
+
+- **`contracts/script/lib/BuybackVenueLib.sol` is now the single home for buyback
+  venue dispatch and burner construction (#1090).** The steady-state FeeRouter
+  split, the canonical Permit2 address, the `BUYBACK_VENUE` string dispatch, and
+  the per-venue `Config` literal were duplicated across `BaseProtocolDeploy`,
+  `ActivateBuyback`, and `DeployProtocol`. Four items each had two copies — the
+  steady-state split, the canonical Permit2 address, the venue-string dispatch, and
+  the per-venue `Config` literal — so the deploy-time genesis activation and the
+  post-deploy runbook could wire different burners from the same inputs. Behaviour
+  is unchanged; the duplication is gone.
+- **Burner wiring and guard-band validation moved into `BuybackVenueLib`.** The
+  completeness checks added earlier lived on `BaseProtocolDeploy`, so only the
+  genesis path had them — `ActivateBuyback`, the post-deploy runbook with no
+  `_assertBuybackActivated` backstop, had none. That is the two-entry-point drift
+  #1090 exists to remove, reintroduced by the fix for it. Both paths now validate at
+  the library both already call (`WiringIncomplete`), which also closes a second
+  dead-burner door: `GuardedBuybackBurner` rejects an inverted band but not a zero
+  one, so `MIN_BUYBACK_AMOUNT=0 MAX_BUYBACK_AMOUNT=0` constructed cleanly and then
+  reverted `AboveMaxBuyback` on every call forever (`GuardBandDead`).
+- **`PoolSeed` is self-checking rather than self-describing.** It now records
+  `targetPrice`, and `_assertVenueSeedMatches` re-derives `tokenSeed` instead of
+  trusting the venue tag. A tag alone is an unverifiable claim by whoever built the
+  struct, and `Venue.UNISWAP == 0` made it vacuous on a default-constructed seed —
+  which is the venue the Arbitrum Sepolia launch uses. A mismatch now reverts
+  `PoolSeedNotDerived`; an unset one reverts `TargetPriceZero`.
+- **`_activateBalancer` rejects a caller-supplied `bal.wiring.pool`** rather than
+  overwriting it (`PoolPrefilled`). The field is filled from the pool the script
+  creates, so a supplied value was silently discarded and a second pool created and
+  seeded with real protocol-owned liquidity — the natural mistake, since
+  `ActivateBuyback` reads `BALANCER_POOL` from env because it wires a live pool.
+- **The `solidity fork test` job now reports which fork RPCs are configured.** A
+  skipped step yielded a green job rendered identically to one where every fork
+  suite passed, which is how it went unnoticed that no fork RPC secret has ever
+  been set — all four suites have been permanently unexecuted behind a passing
+  check. The job now always writes each secret's state to the run summary and
+  emits a warning for the missing ones. Deliberately not a hard failure: fork PRs
+  cannot carry secrets by policy.
+- **`_assertTimelockRoleSeating` is mode-independent and also checks the deployer.**
+  Its negative half was gated on bootstrap mode, so a default deploy asserted
+  nothing about anyone *other* than the Governor holding a scheduling role, and the
+  deployer was never checked for one at all — it admins the Timelock through phases
+  3-5, so a future `_postWiringHook` could grant itself one and survive the handoff.
+  `ProposerNotSeated(address, bytes32, bool)` splits into `TimelockRoleMissing` and
+  `TimelockRoleUnexpected`: the two directions mean opposite things (ungovernable
+  vs. governance live too early) and a boolean three commas deep does not say which
+  at the moment a deploy aborts mid-broadcast.
+- **CI runs the Uniswap genesis-activation fork suite (#1090).** The
+  `solidity fork test` job now passes `ARBITRUM_SEPOLIA_RPC_URL` through, so
+  `GenesisBuybackActivation.fork.t.sol` can execute instead of self-skipping. It
+  covers the Arbitrum Sepolia deploy path, which had no executable CI coverage.
+  **Still gated on the secret existing** — no fork RPC secret is configured on the
+  repo today, so all four fork suites remain unexecuted; see the fork-RPC reporting
+  entry above, which is what makes that visible.
 
 #### Node selection & observability
 
@@ -594,6 +886,17 @@ since project inception and will roll into the first tagged release.
 
 ### Added
 
+- **ADR 009 bootstrap-multisig governance phase (#1175).** `DeployProtocol` run
+  with `BOOTSTRAP_MULTISIG=<addr>` seats that multisig as the Timelock's sole
+  `PROPOSER_ROLE`/`CANCELLER_ROLE` holder and grants `DecdnGovernor` neither, so
+  no operator vote can execute while the operator set is still thin enough for a
+  cheap fleet to capture. The Timelock keeps `GOVERNANCE_ROLE` on every target in
+  both modes, so the 48-hour delay applies to the multisig's own changes.
+  `contracts/script/TransitionToGovernor.s.sol` prints the one-way Timelock batch
+  that ends the phase; `_assertNoBackDoors` now fails a deploy whose proposer is
+  not the one its mode seats. Off by default — the initial testnet deploy is
+  unaffected.
+
 #### Cache / config
 
 - A pinned set larger than `cache.cache_size_mb` now logs a warning at startup
@@ -768,6 +1071,18 @@ since project inception and will roll into the first tagged release.
 
 ### Security
 
+- `ruint` → 1.20.0 (RUSTSEC-2026-0220: `Uint::overflowing_shl`/`overflowing_shr`
+  returned false-negative overflow flags, so `checked_*` returned `Some` instead
+  of `None`, `strict_*` failed to panic, and `saturating_*` wrapped; the bad
+  `checked_shl` result makes `to_base_be` and string formatting loop forever on
+  no-alloc builds for non-limb-aligned widths). Reaches us transitively through
+  `alloy-primitives`, i.e. the U256 arithmetic on the payment path. No deCDN code
+  calls the affected APIs — every `checked_shl` in `crates/` is on a primitive
+  integer (`u64` in `cache/src/retry.rs`, `u32` in `protocol/src/framing.rs`), not a
+  `ruint::Uint`.
+  Lockfile-only bump; no dependency requirement changed. The six new `ark-*`
+  lockfile entries are optional features we do not enable — `cargo tree -e normal`
+  links none of them.
 - `quinn-proto` → 0.11.16 (GHSA-4w2j-m93h-cj5j: remote memory exhaustion in
   the QUIC state machine, fixed in 0.11.15) (#1465). Lockfile-only bump; no
   dependency requirement changed.

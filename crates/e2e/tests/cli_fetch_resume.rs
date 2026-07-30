@@ -65,7 +65,7 @@ use decdn_incentive::buyer_channel::BuyerChannelStore;
 use decdn_incentive::buyer_channel_redb::RedbBuyerChannelStore;
 use decdn_incentive::eth_identity;
 
-const DEPOSIT_MICRO_USDC: u64 = 10_000_000; // 10 USDC (>= deploy minDeposit)
+const DEPOSIT_MICRO_USDC: u64 = 10_000_000; // 10 USDC (ADR 003 recommended minimum)
 const KEYSTORE_PASSWORD: &str = "resume-e2e-password";
 const OVERALL_TIMEOUT: Duration = Duration::from_secs(780);
 

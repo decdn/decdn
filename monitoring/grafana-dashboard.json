@@ -102,7 +102,7 @@
       "targets": [
         {
           "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
-          "expr": "decdn_peer_table_size{instance=~\"$instance\"}",
+          "expr": "decdn_gossip_peer_table_size{instance=~\"$instance\"}",
           "legendFormat": "{{instance}}",
           "refId": "A"
         }
@@ -181,12 +181,12 @@
       "targets": [
         {
           "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
-          "expr": "decdn_blacklist_sync_lag_seconds{instance=~\"$instance\"}",
+          "expr": "time() - (decdn_blacklist_watcher_last_tick_timestamp_seconds{instance=~\"$instance\"} > 0)",
           "legendFormat": "{{instance}}",
           "refId": "A"
         }
       ],
-      "title": "Blacklist sync lag",
+      "title": "Blacklist watcher tick age",
       "type": "stat"
     },
     {
@@ -274,7 +274,7 @@
           "custom": {"drawStyle": "line", "fillOpacity": 10, "lineWidth": 2}
         }
       },
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 15},
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 15},
       "id": 20,
       "options": {"legend": {"displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi"}},
       "targets": [
@@ -293,56 +293,82 @@
       "fieldConfig": {
         "defaults": {
           "color": {"mode": "palette-classic"},
-          "custom": {"drawStyle": "bars", "fillOpacity": 60, "lineWidth": 1, "stacking": {"mode": "normal"}},
-          "unit": "ops"
-        }
-      },
-      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 15},
-      "id": 21,
-      "options": {"legend": {"displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi"}},
-      "targets": [
-        {
-          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
-          "expr": "sum by (reason) (rate(decdn_streams_failed_total{instance=~\"$instance\"}[5m]))",
-          "legendFormat": "{{reason}}",
-          "refId": "A"
-        }
-      ],
-      "title": "Stream failures by reason",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
-      "fieldConfig": {
-        "defaults": {
-          "color": {"mode": "palette-classic"},
           "custom": {"drawStyle": "line", "fillOpacity": 10, "lineWidth": 2},
           "unit": "Bps"
         }
       },
       "gridPos": {"h": 8, "w": 24, "x": 0, "y": 23},
       "id": 22,
+      "description": "Bytes handed back to cache callers vs bytes pulled from origin (#1513). This replaces a served/received pair built on decdn_bytes_{served,received}_total, neither of which the exporter has ever emitted. The cache counters are the closest true equivalent and carry a reading the originals did not: their ratio is the origin-egress amplification factor — 1.0 while the node is a pure pass-through, trending to 0 as content gets re-served from cache.",
       "options": {"legend": {"displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi"}},
       "targets": [
         {
           "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
-          "expr": "rate(decdn_bytes_served_total{instance=~\"$instance\"}[5m])",
+          "expr": "rate(decdn_cache_bytes_returned_total{instance=~\"$instance\"}[5m])",
           "legendFormat": "served — {{instance}}",
           "refId": "A"
         },
         {
           "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
-          "expr": "rate(decdn_bytes_received_total{instance=~\"$instance\"}[5m])",
-          "legendFormat": "received — {{instance}}",
+          "expr": "rate(decdn_cache_pull_through_bytes_total{instance=~\"$instance\"}[5m])",
+          "legendFormat": "origin pull-through — {{instance}}",
           "refId": "B"
         }
       ],
-      "title": "Throughput (served vs received)",
+      "title": "Throughput (served vs origin pull-through)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "description": "Delivery refusals that share the NotFound wire code (#1520). The first three are payment-class; `cache miss` is availability and is plotted as the baseline to read the others against. All four collapse to the same NotFound wire code so a client cannot tell them apart — these counters are the only place the cause exists. `insufficient deposit` is fed by three guards (the pre-spend miss floor, the window tier's ceiling, and the direct-serve ceiling) and cannot attribute a spike to one; the node's throttled warn! line does. Sustained insufficient-deposit means either clients running dry (no action) or this node's chain watcher lagging an on-chain top-up, in which case funded clients are being turned away.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "bars", "fillOpacity": 60, "lineWidth": 1, "stacking": {"mode": "normal"}},
+          "unit": "ops"
+        }
+      },
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 31},
+      "id": 23,
+      "options": {"legend": {"displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "sum by (instance) (rate(decdn_serve_stream_rejected_insufficient_deposit_total{instance=~\"$instance\"}[5m]))",
+          "legendFormat": "insufficient deposit",
+          "refId": "A"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "sum by (instance) (rate(decdn_serve_stream_rejected_unknown_channel_total{instance=~\"$instance\"}[5m]))",
+          "legendFormat": "unknown channel",
+          "refId": "B"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "sum by (instance) (rate(decdn_serve_stream_rejected_owner_mismatch_total{instance=~\"$instance\"}[5m]))",
+          "legendFormat": "owner mismatch",
+          "refId": "C"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "sum by (instance) (rate(decdn_serve_stream_rejected_cache_miss_total{instance=~\"$instance\"}[5m]))",
+          "legendFormat": "cache miss",
+          "refId": "D"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "sum by (instance) (rate(decdn_serve_stream_rejected_internal_error_total{instance=~\"$instance\"}[5m]))",
+          "legendFormat": "internal error",
+          "refId": "E"
+        }
+      ],
+      "title": "Payment-class serve refusals (all collapse to NotFound)",
       "type": "timeseries"
     },
     {
       "collapsed": false,
-      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 31},
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 39},
       "id": 103,
       "panels": [],
       "title": "Cache",
@@ -367,7 +393,7 @@
           "unit": "percentunit"
         }
       },
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 32},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 40},
       "id": 30,
       "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi"}},
       "targets": [
@@ -390,7 +416,7 @@
           "unit": "ops"
         }
       },
-      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 32},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 40},
       "id": 31,
       "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi"}},
       "targets": [
@@ -412,7 +438,7 @@
     },
     {
       "collapsed": false,
-      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 40},
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 48},
       "id": 104,
       "panels": [],
       "title": "Probes",
@@ -420,41 +446,7 @@
     },
     {
       "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
-      "fieldConfig": {
-        "defaults": {
-          "color": {"mode": "palette-classic"},
-          "custom": {"drawStyle": "line", "fillOpacity": 10, "lineWidth": 2},
-          "unit": "s"
-        }
-      },
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 41},
-      "id": 40,
-      "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi"}},
-      "targets": [
-        {
-          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
-          "expr": "histogram_quantile(0.5, sum by (le, outcome) (rate(decdn_probe_fanout_latency_seconds_bucket{instance=~\"$instance\"}[5m])))",
-          "legendFormat": "p50 — {{outcome}}",
-          "refId": "A"
-        },
-        {
-          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
-          "expr": "histogram_quantile(0.95, sum by (le, outcome) (rate(decdn_probe_fanout_latency_seconds_bucket{instance=~\"$instance\"}[5m])))",
-          "legendFormat": "p95 — {{outcome}}",
-          "refId": "B"
-        },
-        {
-          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
-          "expr": "histogram_quantile(0.99, sum by (le, outcome) (rate(decdn_probe_fanout_latency_seconds_bucket{instance=~\"$instance\"}[5m])))",
-          "legendFormat": "p99 — {{outcome}}",
-          "refId": "C"
-        }
-      ],
-      "title": "Probe fan-out latency (p50/p95/p99)",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "description": "Probe request load and how much of it the positive-probe cache absorbs (#1513). Replaces a 'Probe responses by result' panel and a p50/p95/p99 fan-out latency panel, both of which queried series the exporter has never emitted — see the CHANGELOG for the retired names. No quantile panel can be built today: the exporter registers no histograms at all.",
       "fieldConfig": {
         "defaults": {
           "color": {"mode": "palette-classic"},
@@ -462,23 +454,35 @@
           "unit": "ops"
         }
       },
-      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 41},
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 49},
       "id": 41,
       "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi"}},
       "targets": [
         {
           "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
-          "expr": "sum by (result) (rate(decdn_probe_responses_total{instance=~\"$instance\"}[5m]))",
-          "legendFormat": "{{result}}",
+          "expr": "sum by (instance) (rate(decdn_probe_requests_total{instance=~\"$instance\"}[5m]))",
+          "legendFormat": "requests",
           "refId": "A"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "sum by (instance) (rate(decdn_probe_cache_hits_total{instance=~\"$instance\"}[5m]))",
+          "legendFormat": "probe-cache hits",
+          "refId": "B"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "sum by (instance) (rate(decdn_probe_cache_misses_total{instance=~\"$instance\"}[5m]))",
+          "legendFormat": "probe-cache misses",
+          "refId": "C"
         }
       ],
-      "title": "Probe responses by result",
+      "title": "Probe request rate and probe-cache hit/miss",
       "type": "timeseries"
     },
     {
       "collapsed": false,
-      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 49},
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 57},
       "id": 105,
       "panels": [],
       "title": "Payments",
@@ -492,7 +496,7 @@
           "custom": {"drawStyle": "line", "fillOpacity": 10, "lineWidth": 2}
         }
       },
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 50},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 58},
       "id": 50,
       "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi"}},
       "targets": [
@@ -504,18 +508,12 @@
         },
         {
           "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
-          "expr": "rate(decdn_channels_settled_total{instance=~\"$instance\"}[1h]) * 3600",
-          "legendFormat": "settled / hour — {{instance}}",
+          "expr": "sum by (instance) (rate(decdn_voucher_nonce_gaps_total{instance=~\"$instance\"}[5m]))",
+          "legendFormat": "voucher nonce gaps / s — {{instance}}",
           "refId": "B"
-        },
-        {
-          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
-          "expr": "rate(decdn_vouchers_signed_total{instance=~\"$instance\"}[5m])",
-          "legendFormat": "vouchers signed / s — {{instance}}",
-          "refId": "C"
         }
       ],
-      "title": "Channel and voucher activity",
+      "title": "Open channels and voucher nonce gaps",
       "type": "timeseries"
     },
     {
@@ -527,7 +525,7 @@
           "thresholds": {"mode": "absolute", "steps": [{"color": "blue", "value": null}]}
         }
       },
-      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 50},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 58},
       "id": 51,
       "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi"}},
       "targets": [

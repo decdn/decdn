@@ -5,8 +5,11 @@ import { Test } from "forge-std/Test.sol";
 import { ERC20 } from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { Pausable } from "@openzeppelin/contracts/utils/Pausable.sol";
+import { IAccessControl } from "@openzeppelin/contracts/access/IAccessControl.sol";
+import { TimelockController } from "@openzeppelin/contracts/governance/TimelockController.sol";
 
 import { BaseProtocolDeploy } from "../script/BaseProtocolDeploy.s.sol";
+import { TransitionToGovernor } from "../script/TransitionToGovernor.s.sol";
 import { IEd25519Verifier } from "../src/interfaces/IEd25519Verifier.sol";
 import { Token } from "../src/Token.sol";
 import { CapacityBond } from "../src/CapacityBond.sol";
@@ -18,6 +21,12 @@ import { ISlashJudgeEvidenceView } from "../src/interfaces/ISlashJudgeEvidenceVi
 
 import { MockEd25519Verifier } from "./mocks/MockEd25519Verifier.sol";
 import { MockSlashJudgeEvidence } from "./mocks/MockSlashJudgeEvidence.sol";
+
+/// @dev Stand-in for the ADR 009 5-of-9 bootstrap-governance multisig. It must hold
+///      code: `_deployGovernor` rejects an EOA with `BootstrapMultisigNotAContract`,
+///      because a typo'd or dead address seated as the Timelock's only proposer
+///      leaves the protocol permanently ungovernable.
+contract MockMultisig { }
 
 contract DeployUSDC is ERC20 {
     constructor() ERC20("USDC", "USDC") { }
@@ -37,6 +46,9 @@ contract DeployUSDC is ERC20 {
 contract DeployProtocolTest is Test, BaseProtocolDeploy {
     address internal emergencyMultisig = address(0xC0DE);
     address internal initialTokenHolder = address(0xBEEF);
+    /// @dev ADR 009's 5-of-9 bootstrap-governance multisig, distinct from the 3-of-5
+    ///      emergency multisig above. Only used by the bootstrap-mode tests.
+    address internal bootstrapMultisig = address(new MockMultisig());
 
     Deployment internal d;
     DeployConfig internal cfg;
@@ -56,6 +68,8 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
             emergencyMultisig: emergencyMultisig,
             initialTokenHolder: initialTokenHolder,
             timelockDelay: 48 hours,
+            // Direct-to-Timelock handoff; the ADR 009 bootstrap phase is opt-in.
+            bootstrapMultisig: address(0),
             minBond: 50_000e18,
             unbondingPeriod: 14 days,
             multiaddrUpdateCooldown: 0,
@@ -284,6 +298,428 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
             )
         );
         this.externalAssertNoBackDoors(cfg, d);
+    }
+
+    // -----------------------------------------------------------------
+    // ADR 009 § Bootstrap-multisig phase (issue #1175)
+    //
+    // Every test above covers the DEFAULT path, where `bootstrapMultisig` is zero
+    // and `DecdnGovernor` is the Timelock's proposer from block one. The bootstrap
+    // phase changes exactly one thing — who may SCHEDULE through the Timelock —
+    // because the Timelock holds GOVERNANCE_ROLE on the targets in both modes, so
+    // the 48h delay applies to the multisig's changes too. That makes the target
+    // role matrix identical across modes and means these tests, not the matrix
+    // above, are the only thing standing between a bootstrap deploy and a Governor
+    // that can already propose against a thin operator set.
+    // -----------------------------------------------------------------
+
+    function _bootstrapConfig() internal returns (DeployConfig memory bootCfg) {
+        bootCfg = _testConfig();
+        bootCfg.bootstrapMultisig = bootstrapMultisig;
+    }
+
+    function test_bootstrap_multisigProposesAndGovernorCannot() public {
+        Deployment memory bd = _runFullDeploy(_bootstrapConfig());
+        bytes32 proposerRole = bd.timelock.PROPOSER_ROLE();
+        bytes32 cancellerRole = bd.timelock.CANCELLER_ROLE();
+
+        assertTrue(bd.timelock.hasRole(proposerRole, bootstrapMultisig), "multisig proposes");
+        assertTrue(bd.timelock.hasRole(cancellerRole, bootstrapMultisig), "multisig cancels");
+        assertFalse(bd.timelock.hasRole(proposerRole, address(bd.governor)), "governor cannot propose yet");
+        assertFalse(bd.timelock.hasRole(cancellerRole, address(bd.governor)), "governor cannot cancel yet");
+    }
+
+    /// @notice The role matrix on the targets is deliberately IDENTICAL to the
+    ///         default deploy — that is what keeps the 48-hour delay on every
+    ///         bootstrap-phase parameter change (ADR 009 § Capabilities). A design
+    ///         that gave the multisig GOVERNANCE_ROLE directly would pass every other
+    ///         assertion in this file while letting it act instantly.
+    function test_bootstrap_timelockStillHoldsGovernanceOnTargets() public {
+        Deployment memory bd = _runFullDeploy(_bootstrapConfig());
+        address tl = address(bd.timelock);
+        assertTrue(bd.router.hasRole(GOVERNANCE_ROLE, tl), "router gov");
+        assertTrue(bd.bond.hasRole(GOVERNANCE_ROLE, tl), "bond gov");
+        assertTrue(bd.slashJudge.hasRole(DEFAULT_ADMIN_ROLE, tl), "slashJudge admin");
+        // And the multisig holds nothing directly, so it cannot bypass the delay.
+        assertFalse(bd.router.hasRole(GOVERNANCE_ROLE, bootstrapMultisig), "multisig has no direct gov");
+        assertFalse(bd.bond.hasRole(DEFAULT_ADMIN_ROLE, bootstrapMultisig), "multisig has no direct admin");
+    }
+
+    function test_bootstrap_deployerHoldsNoRoleAnywhere() public {
+        DeployConfig memory bootCfg = _bootstrapConfig();
+        Deployment memory bd = _runFullDeploy(bootCfg);
+        address dep = bootCfg.deployer;
+        assertFalse(bd.router.hasRole(GOVERNANCE_ROLE, dep), "router gov back door");
+        assertFalse(bd.router.hasRole(DEFAULT_ADMIN_ROLE, dep), "router admin back door");
+        assertFalse(bd.bond.hasRole(GOVERNANCE_ROLE, dep), "bond gov back door");
+        assertFalse(bd.timelock.hasRole(DEFAULT_ADMIN_ROLE, dep), "timelock admin back door");
+        assertFalse(bd.timelock.hasRole(bd.timelock.PROPOSER_ROLE(), dep), "deployer cannot propose");
+    }
+
+    /// @notice The delay is the point: a bootstrap-phase parameter change must be
+    ///         scheduled and waited out, not executed on the spot.
+    function test_bootstrap_multisigChangesAreTimelocked() public {
+        Deployment memory bd = _runFullDeploy(_bootstrapConfig());
+        bytes memory payload = abi.encodeCall(bd.bond.setCurrentTermsHash, (keccak256("terms v2")));
+
+        // Hoisted: a nested read inside the argument list would consume the
+        // `vm.prank` before the pranked call ever runs.
+        uint256 delay = bd.timelock.getMinDelay();
+        vm.prank(bootstrapMultisig);
+        bd.timelock.schedule(address(bd.bond), 0, payload, bytes32(0), bytes32(0), delay);
+
+        // Not yet — the whole safeguard is that the operator set can see it coming.
+        vm.expectPartialRevert(TimelockController.TimelockUnexpectedOperationState.selector);
+        bd.timelock.execute(address(bd.bond), 0, payload, bytes32(0), bytes32(0));
+
+        vm.warp(block.timestamp + delay + 1);
+        bd.timelock.execute(address(bd.bond), 0, payload, bytes32(0), bytes32(0));
+        assertEq(bd.bond.currentTermsHash(), keccak256("terms v2"), "change landed after the delay");
+    }
+
+    /// @notice The end-to-end ADR 009 lifecycle: the multisig schedules the batch
+    ///         `script/TransitionToGovernor.s.sol` prints, and once it executes the
+    ///         Governor proposes and the multisig can never schedule again.
+    function test_bootstrap_transitionBatchSwapsTheProposer() public {
+        Deployment memory bd = _runFullDeploy(_bootstrapConfig());
+        bytes32 proposerRole = bd.timelock.PROPOSER_ROLE();
+        bytes32 cancellerRole = bd.timelock.CANCELLER_ROLE();
+
+        (address[] memory targets, uint256[] memory values, bytes[] memory payloads) = _transitionBatch(bd);
+
+        uint256 delay = bd.timelock.getMinDelay();
+        vm.prank(bootstrapMultisig);
+        bd.timelock.scheduleBatch(targets, values, payloads, bytes32(0), bytes32(0), delay);
+        vm.warp(block.timestamp + delay + 1);
+        bd.timelock.executeBatch(targets, values, payloads, bytes32(0), bytes32(0));
+
+        assertTrue(bd.timelock.hasRole(proposerRole, address(bd.governor)), "governor proposes");
+        assertTrue(bd.timelock.hasRole(cancellerRole, address(bd.governor)), "governor cancels");
+        assertFalse(bd.timelock.hasRole(proposerRole, bootstrapMultisig), "multisig stripped");
+        assertFalse(bd.timelock.hasRole(cancellerRole, bootstrapMultisig), "multisig canceller stripped");
+    }
+
+    /// @notice Role bits are a proxy; this is the property. `GovernorTimelockControl`
+    ///         reaches the Timelock through `scheduleBatch`, so pranking as the
+    ///         Governor and calling it directly proves the phase actually withholds
+    ///         execution — and that the transition restores it. (The Governor's own
+    ///         propose/vote state machine is covered in default mode by
+    ///         `GovernanceLifecycle.t.sol`; what is bootstrap-specific is exactly this
+    ///         one authorization edge.)
+    function test_bootstrap_governorCannotScheduleUntilTransition() public {
+        Deployment memory bd = _runFullDeploy(_bootstrapConfig());
+        bytes32 proposerRole = bd.timelock.PROPOSER_ROLE();
+        uint256 delay = bd.timelock.getMinDelay();
+
+        address[] memory t = new address[](1);
+        uint256[] memory v = new uint256[](1);
+        bytes[] memory p = new bytes[](1);
+        t[0] = address(bd.bond);
+        p[0] = abi.encodeCall(bd.bond.setCurrentTermsHash, (keccak256("dao terms")));
+
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IAccessControl.AccessControlUnauthorizedAccount.selector, address(bd.governor), proposerRole
+            )
+        );
+        vm.prank(address(bd.governor));
+        bd.timelock.scheduleBatch(t, v, p, bytes32(0), bytes32(0), delay);
+
+        // After the transition the same call is authorized.
+        (address[] memory bt, uint256[] memory bv, bytes[] memory bp) = _transitionBatch(bd);
+        vm.prank(bootstrapMultisig);
+        bd.timelock.scheduleBatch(bt, bv, bp, bytes32(0), bytes32(0), delay);
+        vm.warp(block.timestamp + delay + 1);
+        bd.timelock.executeBatch(bt, bv, bp, bytes32(0), bytes32(0));
+
+        vm.prank(address(bd.governor));
+        bd.timelock.scheduleBatch(t, v, p, bytes32(0), bytes32(0), delay);
+        assertTrue(bd.timelock.isOperationPending(bd.timelock.hashOperationBatch(t, v, p, bytes32(0), bytes32(0))));
+    }
+
+    /// @notice `_assertTimelockRoleSeating` asserts `CANCELLER_ROLE` separately from
+    ///         `PROPOSER_ROLE` on the argument that it is the multisig's only way to
+    ///         cancel its own erroneous scheduled proposal inside the 48-hour window.
+    ///         Every other assertion reads the role bit; this is the rehearsal that
+    ///         argument describes.
+    function test_bootstrap_multisigCanCancelItsOwnScheduledProposal() public {
+        Deployment memory bd = _runFullDeploy(_bootstrapConfig());
+        uint256 delay = bd.timelock.getMinDelay();
+        bytes memory payload = abi.encodeCall(bd.bond.setCurrentTermsHash, (keccak256("oops")));
+
+        vm.prank(bootstrapMultisig);
+        bd.timelock.schedule(address(bd.bond), 0, payload, bytes32(0), bytes32(0), delay);
+        bytes32 id = bd.timelock.hashOperation(address(bd.bond), 0, payload, bytes32(0), bytes32(0));
+        assertTrue(bd.timelock.isOperationPending(id), "scheduled");
+
+        vm.prank(bootstrapMultisig);
+        bd.timelock.cancel(id);
+        assertFalse(bd.timelock.isOperation(id), "cancelled");
+
+        // And the cancelled operation cannot then be executed once the delay elapses.
+        vm.warp(block.timestamp + delay + 1);
+        vm.expectPartialRevert(TimelockController.TimelockUnexpectedOperationState.selector);
+        bd.timelock.execute(address(bd.bond), 0, payload, bytes32(0), bytes32(0));
+    }
+
+    /// @notice The deployer leg of `_assertTimelockRoleSeating`, which had no test —
+    ///         delete those three lines and everything else still passes. It guards
+    ///         the `_postWiringHook` surface: the deployer admins the Timelock through
+    ///         phases 3-5, so a future hook could grant itself scheduling power and
+    ///         survive the handoff whose whole purpose is to leave it nothing.
+    function test_assertNoBackDoors_revertsWhenDeployerCanSchedule() public {
+        bytes32 proposerRole = d.timelock.PROPOSER_ROLE();
+        vm.prank(address(d.timelock));
+        d.timelock.grantRole(proposerRole, cfg.deployer);
+
+        vm.expectRevert(
+            abi.encodeWithSelector(BaseProtocolDeploy.TimelockRoleUnexpected.selector, cfg.deployer, proposerRole)
+        );
+        this.externalAssertNoBackDoors(cfg, d);
+    }
+
+    /// @notice `NotInBootstrapPhase` is a four-way conjunction, and both prior tests
+    ///         used states that are FULLY out of phase — so every `&&` could flip to
+    ///         `||` and they would still pass. A half-transitioned chain (multisig
+    ///         proposes but cannot cancel) is the state the guard's own comment says
+    ///         costs the operator signal, and it is what pins the conjunction.
+    function test_transitionScript_revertsOnHalfSeatedMultisig() public {
+        Deployment memory bd = _runFullDeploy(_bootstrapConfig());
+        // Hoisted: `vm.expectRevert` binds to the next call, and an inline
+        // `new TransitionToGovernor()` would consume it on the contract creation.
+        TransitionToGovernor script = new TransitionToGovernor();
+        bytes32 cancellerRole = bd.timelock.CANCELLER_ROLE();
+        vm.prank(address(bd.timelock));
+        bd.timelock.revokeRole(cancellerRole, bootstrapMultisig);
+
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                TransitionToGovernor.NotInBootstrapPhase.selector, bootstrapMultisig, address(bd.governor)
+            )
+        );
+        script.transitionBatchChecked(bd.timelock, address(bd.governor), bootstrapMultisig);
+    }
+
+    /// @notice Cancellation must be the multisig's alone. The positive half proves it
+    ///         can; without this an over-broad `CANCELLER_ROLE` grant would let any
+    ///         address cancel the transition batch itself during the delay window.
+    function test_bootstrap_thirdPartyCannotCancel() public {
+        Deployment memory bd = _runFullDeploy(_bootstrapConfig());
+        uint256 delay = bd.timelock.getMinDelay();
+        bytes memory payload = abi.encodeCall(bd.bond.setCurrentTermsHash, (keccak256("t")));
+
+        vm.prank(bootstrapMultisig);
+        bd.timelock.schedule(address(bd.bond), 0, payload, bytes32(0), bytes32(0), delay);
+        bytes32 id = bd.timelock.hashOperation(address(bd.bond), 0, payload, bytes32(0), bytes32(0));
+
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IAccessControl.AccessControlUnauthorizedAccount.selector, address(0xBAD), bd.timelock.CANCELLER_ROLE()
+            )
+        );
+        vm.prank(address(0xBAD));
+        bd.timelock.cancel(id);
+    }
+
+    /// @notice The script's precondition, which had no coverage at all. Its output is
+    ///         signed once and is irreversible, so each rejected state matters: a
+    ///         default-mode deploy (multisig never seated) and an already-transitioned
+    ///         chain must both refuse to print rather than emit a plausible batch.
+    function test_transitionScript_revertsOutsideBootstrapPhase() public {
+        TransitionToGovernor script = new TransitionToGovernor();
+
+        // Default-mode deploy: the Governor already proposes, so there is no phase to end.
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                TransitionToGovernor.NotInBootstrapPhase.selector, bootstrapMultisig, address(d.governor)
+            )
+        );
+        script.transitionBatchChecked(d.timelock, address(d.governor), bootstrapMultisig);
+
+        // Already transitioned: run the real batch, then re-check.
+        Deployment memory bd = _runFullDeploy(_bootstrapConfig());
+        (address[] memory t, uint256[] memory v, bytes[] memory p) = _transitionBatch(bd);
+        uint256 delay = bd.timelock.getMinDelay();
+        vm.prank(bootstrapMultisig);
+        bd.timelock.scheduleBatch(t, v, p, bytes32(0), bytes32(0), delay);
+        vm.warp(block.timestamp + delay + 1);
+        bd.timelock.executeBatch(t, v, p, bytes32(0), bytes32(0));
+
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                TransitionToGovernor.NotInBootstrapPhase.selector, bootstrapMultisig, address(bd.governor)
+            )
+        );
+        script.transitionBatchChecked(bd.timelock, address(bd.governor), bootstrapMultisig);
+    }
+
+    /// @notice The governor argument is validated by *identity*, not by the absence of
+    ///         roles. "Holds neither role" is the default state of every address, so
+    ///         without this an EOA or a one-nibble typo would yield a clean-looking
+    ///         batch that irreversibly hands scheduling power to a dead address.
+    function test_transitionScript_revertsOnWrongGovernor() public {
+        Deployment memory bd = _runFullDeploy(_bootstrapConfig());
+        TransitionToGovernor script = new TransitionToGovernor();
+
+        // An EOA: no code at all.
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                TransitionToGovernor.GovernorNotBoundToTimelock.selector, address(0xBEEF), address(0)
+            )
+        );
+        script.transitionBatchChecked(bd.timelock, address(0xBEEF), bootstrapMultisig);
+
+        // A real Governor — but one bound to a different Timelock (another deploy).
+        Deployment memory other = _runFullDeploy(_bootstrapConfig());
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                TransitionToGovernor.GovernorNotBoundToTimelock.selector,
+                address(other.governor),
+                address(other.timelock)
+            )
+        );
+        script.transitionBatchChecked(bd.timelock, address(other.governor), bootstrapMultisig);
+    }
+
+    /// @notice Irreversibility, the property ADR 009 § Transition promises: with its
+    ///         PROPOSER_ROLE gone the multisig cannot even schedule the proposal that
+    ///         would reinstate it. Nothing enforces this but the role itself, so it is
+    ///         worth asserting rather than assuming.
+    function test_bootstrap_transitionCannotBeUndoneByTheMultisig() public {
+        Deployment memory bd = _runFullDeploy(_bootstrapConfig());
+        bytes32 proposerRole = bd.timelock.PROPOSER_ROLE();
+
+        (address[] memory targets, uint256[] memory values, bytes[] memory payloads) = _transitionBatch(bd);
+        uint256 delay = bd.timelock.getMinDelay();
+        vm.prank(bootstrapMultisig);
+        bd.timelock.scheduleBatch(targets, values, payloads, bytes32(0), bytes32(0), delay);
+        vm.warp(block.timestamp + delay + 1);
+        bd.timelock.executeBatch(targets, values, payloads, bytes32(0), bytes32(0));
+
+        bytes memory reinstate = abi.encodeCall(bd.timelock.grantRole, (proposerRole, bootstrapMultisig));
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IAccessControl.AccessControlUnauthorizedAccount.selector, bootstrapMultisig, proposerRole
+            )
+        );
+        vm.prank(bootstrapMultisig);
+        bd.timelock.schedule(address(bd.timelock), 0, reinstate, bytes32(0), bytes32(0), delay);
+    }
+
+    /// @dev The batch the runbook script actually prints. Calling the script rather
+    ///      than rebuilding the four legs here is deliberate: a hand-written twin is a
+    ///      second source of truth, so reordering or retargeting a leg in the script
+    ///      would leave every test green while changing the one artifact a multisig
+    ///      signs. Duplication does not make drift review-visible — it hides it.
+    function _transitionBatch(Deployment memory bd)
+        internal
+        returns (address[] memory targets, uint256[] memory values, bytes[] memory payloads)
+    {
+        // `transitionBatchChecked`, not `transitionBatch`: the checked wrapper is what
+        // `run()` calls, so its success path is what a multisig actually signs. The
+        // unchecked variant would leave that path executed by nothing.
+        return new TransitionToGovernor().transitionBatchChecked(bd.timelock, address(bd.governor), bootstrapMultisig);
+    }
+
+    /// @notice Seating the deployer as the bootstrap multisig must fail the deploy,
+    ///         not merely be discouraged. It is a plausible slip (`BOOTSTRAP_MULTISIG=$DEPLOYER`
+    ///         in a shell that already exports `DEPLOYER`) and `_assertNoBackDoors`
+    ///         cannot catch it — the deployer would genuinely hold the role the
+    ///         invariant asks about, while gaining standing scheduling power over a
+    ///         Timelock that governs every target, irrevocably.
+    function test_bootstrap_revertsWhenMultisigIsDeployer() public {
+        DeployConfig memory bad = _testConfig();
+        bad.bootstrapMultisig = bad.deployer;
+        vm.expectRevert(abi.encodeWithSelector(BaseProtocolDeploy.BootstrapMultisigIsDeployer.selector, bad.deployer));
+        this.externalRunFullDeploy(bad);
+    }
+
+    /// @notice A typo'd or dead EOA in `BOOTSTRAP_MULTISIG` would become the only
+    ///         party able to schedule — Governor unseated, deployer renounced — with
+    ///         no on-chain recovery and a green deploy. ADR 009 § Composition
+    ///         specifies a multisig, so require code.
+    function test_bootstrap_revertsWhenMultisigIsNotAContract() public {
+        DeployConfig memory bad = _testConfig();
+        bad.bootstrapMultisig = address(0xDEAD);
+        vm.expectRevert(
+            abi.encodeWithSelector(BaseProtocolDeploy.BootstrapMultisigNotAContract.selector, address(0xDEAD))
+        );
+        this.externalRunFullDeploy(bad);
+    }
+
+    function externalRunFullDeploy(DeployConfig calldata cfgIn) external returns (Deployment memory) {
+        return _runFullDeploy(cfgIn);
+    }
+
+    /// @notice `_assertNoBackDoors` must fail a bootstrap deploy whose Governor was
+    ///         granted PROPOSER_ROLE anyway. Nothing else in the invariant catches it:
+    ///         the target role matrix is identical in both modes, so every deployer
+    ///         and hand-off check passes while DAO execution sits one delay away.
+    function test_bootstrap_assertNoBackDoors_revertsWhenGovernorCanPropose() public {
+        DeployConfig memory bootCfg = _bootstrapConfig();
+        Deployment memory bd = _runFullDeploy(bootCfg);
+
+        bytes32 proposerRole = bd.timelock.PROPOSER_ROLE();
+        vm.prank(address(bd.timelock));
+        bd.timelock.grantRole(proposerRole, address(bd.governor));
+
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                BaseProtocolDeploy.TimelockRoleUnexpected.selector, address(bd.governor), proposerRole
+            )
+        );
+        this.externalAssertNoBackDoors(bootCfg, bd);
+    }
+
+    /// @notice The mirror direction on the DEFAULT path: a deploy that never seated
+    ///         the Governor would ship a protocol nobody can govern.
+    function test_default_assertNoBackDoors_revertsWhenGovernorCannotPropose() public {
+        bytes32 proposerRole = d.timelock.PROPOSER_ROLE();
+        vm.prank(address(d.timelock));
+        d.timelock.revokeRole(proposerRole, address(d.governor));
+
+        vm.expectRevert(
+            abi.encodeWithSelector(BaseProtocolDeploy.TimelockRoleMissing.selector, address(d.governor), proposerRole)
+        );
+        this.externalAssertNoBackDoors(cfg, d);
+    }
+
+    /// @notice CANCELLER_ROLE gets the same treatment as PROPOSER_ROLE. It is granted
+    ///         on the line after the proposer grant and moved by the same transition
+    ///         batch, so it is exactly the kind of coupled-by-convention wiring that
+    ///         drifts silently — OZ `grantRole` does not revert on a dropped target.
+    ///         A multisig without it cannot cancel its own erroneous scheduled
+    ///         proposal inside the 48-hour window for the whole bootstrap phase.
+    function test_bootstrap_assertNoBackDoors_revertsWhenMultisigCannotCancel() public {
+        DeployConfig memory bootCfg = _bootstrapConfig();
+        Deployment memory bd = _runFullDeploy(bootCfg);
+
+        bytes32 cancellerRole = bd.timelock.CANCELLER_ROLE();
+        vm.prank(address(bd.timelock));
+        bd.timelock.revokeRole(cancellerRole, bootstrapMultisig);
+
+        vm.expectRevert(
+            abi.encodeWithSelector(BaseProtocolDeploy.TimelockRoleMissing.selector, bootstrapMultisig, cancellerRole)
+        );
+        this.externalAssertNoBackDoors(bootCfg, bd);
+    }
+
+    /// @notice And the other direction: a Governor that can cancel during bootstrap
+    ///         holds a scheduling power the phase withholds from it.
+    function test_bootstrap_assertNoBackDoors_revertsWhenGovernorCanCancel() public {
+        DeployConfig memory bootCfg = _bootstrapConfig();
+        Deployment memory bd = _runFullDeploy(bootCfg);
+
+        bytes32 cancellerRole = bd.timelock.CANCELLER_ROLE();
+        vm.prank(address(bd.timelock));
+        bd.timelock.grantRole(cancellerRole, address(bd.governor));
+
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                BaseProtocolDeploy.TimelockRoleUnexpected.selector, address(bd.governor), cancellerRole
+            )
+        );
+        this.externalAssertNoBackDoors(bootCfg, bd);
     }
 
     // ZeroAddress fail-fast checks in `_deployTargets`. One test per validated

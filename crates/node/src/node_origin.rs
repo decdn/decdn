@@ -2269,6 +2269,13 @@ fn classify_pull_failure(
                     debug!(%provider_addr, ?cause, %err, "node-origin: upstream does not have this blob; negative-caching this (peer, hash) for the full TTL without tarring reputation");
                 }
                 RefusalVerdict::Transient => {
+                    // Metered (#1520). This arm is where a *buyer-side* problem
+                    // lands: a seller refusing our channel for insufficient
+                    // deposit signs `NotFound`, deliberately indistinguishable
+                    // from an honest miss, so without a counter here a node whose
+                    // own deposit cannot buy anything sees every pull refused with
+                    // nothing in its telemetry saying why.
+                    deps.metrics.node_pull_refused_unattributable();
                     suppress(Some(REFUSAL_SUPPRESSION_TTL));
                     debug!(%provider_addr, %err, ttl = ?REFUSAL_SUPPRESSION_TTL, "node-origin: upstream refused for a reason we cannot attribute to it; briefly suppressing this (peer, hash) without tarring reputation");
                 }

@@ -136,7 +136,7 @@ const MIB: usize = 1024 * 1024;
 //    (its 1 MiB interval voucher, 10 µUSDC, already crosses the threshold)
 //  - channel 2: 0.5 MiB delivered → claim = ceil(0.5*10) =  5 µUSDC < 10
 const REDEEM_THRESHOLD_MICRO_USDC: u64 = 10;
-const DEPOSIT_MICRO_USDC: u64 = 10_000_000; // 10 USDC, ≥ contract minDeposit (1 USDC)
+const DEPOSIT_MICRO_USDC: u64 = 10_000_000; // 10 USDC (ADR 003 recommended minimum)
 const TOPUP_MICRO_USDC: u64 = 2_000_000; // 2 USDC added via topUp in the buyer path (#744)
 // Warp past any governable channel lifetime (max 365 days) so `reclaimExpired`
 // is permitted on-chain in the buyer-path reclaim assertion (#744).
@@ -277,7 +277,7 @@ fn broadcast_phase_failure_is_retryable() {
 fn genuine_revert_fails_fast() {
     // A revert/abort during simulation never prints the success marker, so the
     // body did not complete ⇒ deterministic ⇒ fail fast (no retry).
-    let stdout = b"Error: Simulated execution failed.\nReason: revert: minDeposit not met\n";
+    let stdout = b"Error: Simulated execution failed.\nReason: revert: ProviderNotActive\n";
     assert!(!forge_script_body_completed(stdout));
 }
 

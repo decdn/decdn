@@ -93,9 +93,8 @@ pub struct ResolvedBlockchain {
     /// `CapacityBond` contract address.
     pub capacity_bond_address: String,
     /// `OriginAssignment` contract address. `Some` only when the operator opts
-    /// into the chain-backed origin directory; `None` => empty deny-all
-    /// directory, so the pull-through authorized-origin gate finds no origins
-    /// (ADR 022).
+    /// into the chain-backed origin directory; `None` => empty directory, so
+    /// the `FIND_VALUE` routing fallback (ADR 022) resolves nothing.
     pub origin_assignment_address: Option<String>,
     /// `PublisherRegistry` contract address. Independent of the origin directory
     /// (the publish CLI's `namespace create` target); not consumed by the node.
@@ -140,8 +139,9 @@ pub struct ResolvedBlockchain {
     /// 1 USDC (`1_000_000` `µUSDC`) when unset.
     pub redeem_threshold_micro_usdc: u64,
     /// First-contact `openChannel` deposit (base units, `µUSDC`). Defaults to
-    /// 0.5 USDC (`500_000`); clamped up to the on-chain `minDeposit` floor at
-    /// open time. See `ResolvedBlockchain::buyer_working_deposit_micro_usdc`.
+    /// 0.5 USDC (`500_000`); escrowed as configured at open time (no on-chain
+    /// floor; only a non-zero requirement). See
+    /// `ResolvedBlockchain::buyer_working_deposit_micro_usdc`.
     pub buyer_initial_deposit_micro_usdc: u64,
     /// Refill target (base units, `µUSDC`) every `topUp` restores toward.
     /// Defaults to 10 USDC (`10_000_000`). `0` disables top-up. Guaranteed
@@ -239,6 +239,19 @@ pub struct ResolvedCache {
     /// one). Default [`crate::config::DEFAULT_FS_RESCAN_INTERVAL_SEC`] when the
     /// TOML section omits the field.
     pub fs_rescan_interval_sec: u64,
+    /// TTL in seconds for a memoised live-origin probe answer (#1130 pt3).
+    /// Default [`crate::config::DEFAULT_ORIGIN_PROBE_TTL_SEC`]. Backs the
+    /// per-probe `HEAD`/`HeadObject` fallback that discovers non-pinned http/s3
+    /// objects the enumeration index cannot see.
+    pub origin_probe_ttl_sec: u64,
+    /// Per-probe live-`HEAD` ceiling in milliseconds (#1130 pt3). Default
+    /// [`crate::config::DEFAULT_ORIGIN_PROBE_TIMEOUT_MS`]. Keeps a slow origin
+    /// off the probe hot path.
+    pub origin_probe_timeout_ms: u64,
+    /// Maximum distinct hashes in the live-origin probe memo (#1130 pt3).
+    /// Default [`crate::config::DEFAULT_ORIGIN_PROBE_MEMO_CAPACITY`]. Bounds
+    /// memo memory under a random-hash probe flood.
+    pub origin_probe_memo_capacity: u64,
     /// LRU eviction driver high-water percent of [`Self::cache_size_mb`]
     /// (#1173). Above this fraction the driver actively evicts. Validated to
     /// `[60, 95]`. Default [`crate::config::DEFAULT_EVICTION_HIGH_WATER_PCT`].
@@ -297,16 +310,6 @@ pub struct ResolvedCache {
     /// Per-peer share ratio as a percentage (#856, ADR 037 `share_ratio`;
     /// `100` == 1.0×). Default [`crate::config::DEFAULT_PULL_SHARE_RATIO_PERCENT`].
     pub pull_share_ratio_percent: decdn_config_types::Percent,
-    /// Gate the reactive cache-miss pull-through path on an authorized origin
-    /// (#821, ADR 037 §Seed-leech caps). Default `false` — the cache role stays
-    /// permissionless. When `true`, the handler refuses to initiate an upstream
-    /// pull (and its cache-warming write) for a hash whose namespace has no
-    /// authorized origin, returning `NotFound`; ranges already held are still
-    /// served. `cache.*` is restart-required, so this is read once at bring-up.
-    /// The runtime attaches the gate only when `node_to_node_pull_through_enabled`
-    /// is also set, so it is a no-op without that path (a miss already returns
-    /// `NotFound`).
-    pub pull_through_require_authorized_origin: bool,
 }
 
 /// Resolved + validated origin backend selection (#437). Mirrors

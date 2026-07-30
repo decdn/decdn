@@ -112,6 +112,8 @@ contract GovernanceLifecycleTest is Test, BaseProtocolDeploy {
             // operators + FeeRouter bucket destinations downstream.
             initialTokenHolder: address(this),
             timelockDelay: TIMELOCK_DELAY,
+            // Direct-to-Timelock handoff; the ADR 009 bootstrap phase is opt-in.
+            bootstrapMultisig: address(0),
             minBond: MIN_BOND,
             unbondingPeriod: UNBONDING_PERIOD,
             multiaddrUpdateCooldown: 0,

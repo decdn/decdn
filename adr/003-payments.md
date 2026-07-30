@@ -27,7 +27,7 @@ A channel is opened by depositing the payment token into the `PaymentChannel` co
 Key parameters:
 
 - Voucher cadence: 1 MB delivered per voucher (default; negotiable up to the 1024 MB wire ceiling for large transfers — see [Voucher Interval Negotiation](#voucher-interval-negotiation))
-- Minimum deposit: 1 USDC (contract floor, governable). The buyer path opens a channel small and graduates it: a channel opens at a small **initial** deposit (default 0.5 USDC), then tops up toward a larger **working** deposit (default 10 USDC) once the counterparty has served verified bytes (see [Deposit Economics](#deposit-economics))
+- Minimum deposit: none on-chain beyond non-zero. The buyer path opens a channel small and graduates it: a channel opens at a small **initial** deposit (default 0.5 USDC), then tops up toward a larger **working** deposit (default 10 USDC, recommended practical minimum) once the counterparty has served verified bytes (see [Deposit Economics](#deposit-economics))
 - Fee routing: the operator payment-token balance is forwarded to `FeeRouter.routeSettlement(operator, bytesDelivered, amount)` — at final settlement, and incrementally on each `withdraw` — and the three-bucket split (60% operator base, 30% buyback, 10% treasury) is dispatched same-tx per [ADR 026](026-tokenomics.md#adr-026-tokenomics). The per-call deltas partition the channel's lifetime claim, so each byte and USDC unit is split exactly once. See [FeeRouter Integration](#feerouter-integration).
 - Operator return is differentiated through the `CapacityBond` lock-to-capacity curve per [ADR 026](026-tokenomics.md#adr-026-tokenomics), not via a fee-discount mechanic on the channel contract.
 
@@ -44,9 +44,9 @@ Opening, closing, and settling a channel requires three on-chain transactions to
 | 25 USDC  | $0.23                | 0.92%            |
 | 100 USDC | $0.23                | 0.23%            |
 
-**Two-tier deposit: small initial, larger working target.** A freshly opened channel escrows a small **initial** deposit — a first-contact lock, so an unproven counterparty holds little of the buyer's capital before it has served verified bytes. Client software defaults the initial deposit to 0.5 USDC (user-overridable, clamped up to the contract's `minDeposit` floor at open time). At that size gas overhead is the largest share in the table above (46%), but so is the amount actually at risk on a channel with no track record yet.
+**Two-tier deposit: small initial, larger working target.** A freshly opened channel escrows a small **initial** deposit — a first-contact lock, so an unproven counterparty holds little of the buyer's capital before it has served verified bytes. Client software defaults the initial deposit to 0.5 USDC (user-overridable). Deposits are escrowed exactly as configured — `openChannel` accepts any non-zero deposit, with no on-chain floor to clamp up to. At 0.5 USDC gas overhead is the largest share in the table above (46%), but so is the amount actually at risk on a channel with no track record yet.
 
-Once a channel has proven itself — the counterparty has served verified bytes — the buyer path tops it up via `topUp` toward a larger **working** deposit, defaulting to 10 USDC (also user-overridable; `0` disables top-up). `topUp` spends only its own transaction rather than a fresh open/close/settle cycle, so graduating an already-open channel is cheaper than opening a second one at the working size. At 10 USDC, gas overhead on the eventual settle is 2.3% — acceptable for a channel covering ~10,000,000 MB at the floor rate or ~1,000,000 MB (~1,000 GB) at the expected market rate ($0.01/GB), sufficient for weeks to months of casual use without further top-up. The contract minimum (1 USDC, governable via `setMinDeposit`) remains a safety floor preventing dust channels that cost more to settle than they contain; it is deliberately not raised, since doing so would cut governance flexibility and create a hard barrier for development/testing scenarios where small deposits are useful.
+Once a channel has proven itself — the counterparty has served verified bytes — the buyer path tops it up via `topUp` toward a larger **working** deposit, defaulting to 10 USDC (also user-overridable; `0` disables top-up). `topUp` spends only its own transaction rather than a fresh open/close/settle cycle, so graduating an already-open channel is cheaper than opening a second one at the working size. At 10 USDC, gas overhead on the eventual settle is 2.3% — acceptable for a channel covering ~10,000,000 MB at the floor rate or ~1,000,000 MB (~1,000 GB) at the expected market rate ($0.01/GB), sufficient for weeks to months of casual use without further top-up. This 10 USDC working target is a client-side recommendation, not a network floor. A network minimum would bound neither of the things it appears to — service is bounded by what the deposit funds (the seller refuses a request whose channel cannot cover the first credit window, see [Voucher withholding](#voucher-withholding)) and channel spam is bounded by gas (each `openChannel` costs gas and locks real funds, refundable only to the client) — while creating a hard barrier for development/testing scenarios where small deposits are useful.
 
 #### Amortization
 
@@ -231,20 +231,7 @@ Client receives bytes but stops signing vouchers, getting content for free up to
 
 The self-enforcing stop is sufficient. Maximum loss is one voucher interval at the negotiated cadence: default cadence (1 MB × market rate ≈ $0.00001) is negligible; 100 MB at market rate is ~$0.001; the wire ceiling (1024 MB) at the ceiling rate is ~$1.024 — still negligible relative to channel deposits. Nodes serving high-value content can unilaterally enforce smaller intervals regardless of what was negotiated.
 
-#### Channel griefing
-
-Client opens many channels with minimum deposit and never streams, forcing nodes to track and eventually close stale channels.
-
-**Resolved: voucher-less close (either party).** The `closeChannelWithoutVoucher` path — canonically specified in [Fee Routing on Disputed Closes](#fee-routing-on-disputed-closes) — bounds the maximum tracking duration to the dispute window (48 hours default) rather than the full 90-day channel expiry, and is permissionlessly disputable if the closing party actually signed a voucher off-chain. No additional inactivity timer or separate expiry mechanism beyond the existing channel expiry / `reclaimExpired` path is needed; that existing escape hatch remains as a final fallback for cases where the channel is abandoned without any close action at all.
-
-**Why symmetric.** The provider needs the path to release abandoned channels they track. The client needs it so they aren't locked into 90 days of `reclaimExpired` waiting when a node fails before the first 1 MB voucher boundary — a routine ops failure with no malicious actor. Restricting the path to providers would create a structural liquidity-lock on every node-failure event, contrary to the intended failure-mode posture.
-
-The symmetric attack surface — a funder that signed vouchers off-chain and then closes without presenting them, hoping to repudiate them — is covered by the 48h dispute window plus permissionless `disputeChannel`. A voucher-less close settles at most at the recorded watermark and never below it, so it claws back nothing already recorded on-chain; the only thing it can do is omit vouchers the provider holds off-chain. The provider — or any third party holding one — reasserts the highest of them via `disputeChannel` for the whole window, ratcheting the watermark up to the true amount before `settleChannel` can run. This is the same mechanism that answers the analogous [stale close](#stale-close) attack, and it answers it to the same degree: the window exists precisely so an under-stated close can be corrected by whoever holds the better voucher.
-
-The griefing attacker's financial cost stays bounded: a griefed channel never streams, so it never graduates past the small initial deposit — at the 0.5 USDC initial-deposit default, $1,000 opens 2,000 channels; the counterparty (or the attacker, to recover the deposit) closes them all and each settles after the dispute window with full client refund (no profit motive) and ~$0.18 gas per close+settle pair. Total gas exposure for 2,000 channels is ~$360 — enough to warrant additional mitigations for high-volume attacks:
-
-- **Option A — On-chain channel cap per address.** The `PaymentChannel` contract enforces a maximum number of open channels per client Ethereum address (e.g., 10). Hard to circumvent without new wallet addresses, each requiring on-chain funding.
-- **Option B — Node-side filtering.** Nodes refuse `StreamRequest` from channels that have been open longer than N days with zero vouchers. Off-chain, no contract change needed, but relies on node operator implementation.
+That bound applies to a *funded* channel. A channel whose remaining deposit cannot cover even the first credit window is refused before the node signs a success `StreamResponse`, so it is never served the free interval at all — the seller-side pre-flight deposit guard of [ADR 037 § Implementation status](037-regional-proxy-warming.md#implementation-status-856), which fronts both the cache-miss and the direct-serve paths.
 
 #### Stale close
 
@@ -436,7 +423,6 @@ The delegate must not be the counterparty: pinning `provider` as `voucherSigner`
 | View | `getRateBounds() → floor` | Current `deliveryFloor` in payment-token base units. |
 | View | `feeRouter() → address` | Configured `FeeRouter` target ([ADR 026](026-tokenomics.md#adr-026-tokenomics)). |
 | Governance | `setFeeRouter(addr)` | Replace router target. `GOVERNANCE_ROLE`-gated; routed through the standard 48h `TimelockController` delay; emits `FeeRouterUpdated(address oldRouter, address newRouter)`. See [§ Governance setter: setFeeRouter](#governance-setter-setfeerouter) below. |
-| Governance | `setMinDeposit(amount)` | Minimum channel deposit. |
 | Governance | `setDisputeWindow(seconds)` | Dispute window (bounded 172800–259200 — 48h–72h). |
 | Governance | `setRateBounds(floor)` | Per-MB delivery-rate floor in payment-token base units. Capped at `MAX_RATE_PER_MB`. |
 
@@ -485,7 +471,7 @@ Because `withdraw` advances the shared watermark, a subsequent voucher-less clos
 
 #### Initial deployment values
 
-The constructor takes `(usdc, capacityBond, feeRouter, disputeWindow, maxChannelDuration, deliveryFloor, admin)` per [ADR 016 § Contract Inventory](016-contract-interactions.md#contract-inventory) and defaults the parameter not passed as an argument: `minDeposit = 1_000_000` (1 USDC). `disputeWindow` and `maxChannelDuration` are constructor arguments validated against the hardcoded safety bounds (deployment defaults: 48h and 90d respectively — see the bounds table below and [ADR 009](009-governance.md#adr-009-governance-model) for governance ranges). The constructor MUST reject any zero address among `(usdc, capacityBond, feeRouter, admin)` and a `feeRouter` whose code size is zero (EOA / undeployed address).
+The constructor takes `(usdc, capacityBond, feeRouter, disputeWindow, maxChannelDuration, deliveryFloor, admin)` per [ADR 016 § Contract Inventory](016-contract-interactions.md#contract-inventory). Every governable parameter it exposes is a constructor argument; there are none it defaults. `disputeWindow` and `maxChannelDuration` are constructor arguments validated against the hardcoded safety bounds (deployment defaults: 48h and 90d respectively — see the bounds table below and [ADR 009](009-governance.md#adr-009-governance-model) for governance ranges). The constructor MUST reject any zero address among `(usdc, capacityBond, feeRouter, admin)` and a `feeRouter` whose code size is zero (EOA / undeployed address).
 
 Default deployment value for `disputeWindow`: **172800 seconds (48 hours)** — sized to guarantee effective dispute response time under L2 sequencer censorship (see [§ L2 sequencer censorship](#l2-sequencer-censorship) below). Safety bounds per [ADR 009](009-governance.md#adr-009-governance-model): 172800–259200 seconds (48h–72h). Under [ADR 026](026-tokenomics.md#adr-026-tokenomics) the constructor carries no `feePercentage` / `discountedFeePercentage` / treasury-address parameters; bucket shares are governed on `FeeRouter`, and the treasury bucket is one of `FeeRouter`'s three buckets (see [FeeRouter Integration](#feerouter-integration)).
 
@@ -533,7 +519,6 @@ A node reconciling its own channels after a restart does not scan logs, though: 
 | Parameter | Minimum | Maximum |
 | --- | --- | --- |
 | Dispute window | 172800 seconds (48 hours) | 259200 seconds (3 days) |
-| Min deposit | 1 base unit | No max |
 | Rate floor | 1 base unit | `MAX_RATE_PER_MB` (10^12) |
 | Max channel duration | 604800 seconds (7 days) | 31536000 seconds (365 days) |
 
@@ -686,7 +671,7 @@ The `DOMAIN_SEPARATOR` is computed once in the constructor and stored as an immu
 Voucher nonces within a channel start at **1**. Nonce 0 is reserved as the sentinel value meaning "no voucher has been submitted" — it is the Solidity default for `claimedNonce` in a newly opened `Channel` struct. The first signed voucher in a channel uses `nonce=1`, the second uses `nonce=2`, and so on. This convention ensures:
 
 - `claimedNonce == 0` reliably identifies channels where no voucher has ever been recorded on-chain, distinguishing "nothing claimed" from "claimed zero".
-- Any real voucher (nonce ≥ 1) can always be used to dispute a close taken at a never-advanced watermark (`claimedNonce == 0`), since `disputeChannel` requires a strictly higher nonce (see [Channel griefing](#channel-griefing) and the channel close lifecycle in [PaymentChannel](#paymentchannel)).
+- Any real voucher (nonce ≥ 1) can always be used to dispute a close taken at a never-advanced watermark (`claimedNonce == 0`), since `disputeChannel` requires a strictly higher nonce (see [Fee Routing on Disputed Closes](#fee-routing-on-disputed-closes) and the channel close lifecycle in [PaymentChannel](#paymentchannel)).
 
 ### Node Registry
 

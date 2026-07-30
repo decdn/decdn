@@ -89,6 +89,9 @@ fn seed_resolved(rate: u64, level: LogLevel) -> ResolvedConfig {
             user_agent: decdn_cache::DEFAULT_USER_AGENT.to_string(),
             gc_interval_sec: 0,
             fs_rescan_interval_sec: 0,
+            origin_probe_ttl_sec: decdn_common::config::DEFAULT_ORIGIN_PROBE_TTL_SEC,
+            origin_probe_timeout_ms: decdn_common::config::DEFAULT_ORIGIN_PROBE_TIMEOUT_MS,
+            origin_probe_memo_capacity: decdn_common::config::DEFAULT_ORIGIN_PROBE_MEMO_CAPACITY,
             eviction_high_water_pct: 90,
             eviction_target_pct: 80,
             eviction_per_sweep_budget: 16,
@@ -108,7 +111,6 @@ fn seed_resolved(rate: u64, level: LogLevel) -> ResolvedConfig {
             pull_share_ratio_percent: decdn_cache::Percent::new(
                 decdn_common::config::DEFAULT_PULL_SHARE_RATIO_PERCENT,
             ),
-            pull_through_require_authorized_origin: false,
         },
         payment: ResolvedPayment {
             rate_per_mb: rate,

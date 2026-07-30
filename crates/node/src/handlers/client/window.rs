@@ -39,7 +39,7 @@ impl ClientHandler {
     /// regardless of origin health, and they collapse to `NotFound` deliberately so
     /// a prober cannot map out other clients' channel balances
     /// ([`ServeRejectReason::wire_error`]).
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub(super) async fn serve_via_window_pull_through(
         &self,
         mut send: SendStream,
@@ -51,6 +51,7 @@ impl ClientHandler {
         origin: Arc<NodeOrigin>,
         tee: TeeReservation,
         fault_seen: bool,
+        rate_per_mb: u64,
     ) -> anyhow::Result<()> {
         // The ADR 011 OPEN-TIME deny gates are already discharged on the only
         // path that reaches here: `serve_stream` refuses a denylisted hash
@@ -71,14 +72,21 @@ impl ClientHandler {
         let Some(channel) = self.channels.lock().await.get(&channel_id).cloned() else {
             tee.abandon();
             return self
-                .respond_error(&mut send, req, ServeRejectReason::UnknownChannel)
+                .respond_error(
+                    &mut send,
+                    req,
+                    ServeRejectReason::UnknownChannel,
+                    rate_per_mb,
+                )
                 .await;
         };
 
-        let rate_per_mb = self.clamped_rate();
-
         // (1) Pre-flight deposit guard: refuse the speculative pull if the channel
-        // provably cannot pay the cost it would front. With a finite
+        // provably cannot pay the cost it would front. Twin of the direct-serve
+        // gate in `dispatch.rs` (#1516) — keep the two in step; they differ only
+        // in the ceiling, because this path also fronts the *upstream* spend.
+        //
+        // With a finite
         // `max_blob_size_bytes` the ceiling is the worst-case whole-blob cost. When
         // the size cap is unbounded (`0`) there is no whole-blob ceiling, so the
         // guard falls back to the per-request speculative *window* cost — it must
@@ -114,10 +122,17 @@ impl ClientHandler {
             let guard = channel.lock().await;
             (guard.state.deposit, guard.state.last_amount())
         };
-        if deposit.saturating_sub(last_amount) < ceiling {
+        let headroom = deposit.saturating_sub(last_amount);
+        if headroom < ceiling {
+            self.log_deposit_refusal(channel_id, hash, headroom, ceiling);
             tee.abandon();
             return self
-                .respond_error(&mut send, req, ServeRejectReason::InsufficientDeposit)
+                .respond_error(
+                    &mut send,
+                    req,
+                    ServeRejectReason::InsufficientDeposit,
+                    rate_per_mb,
+                )
                 .await;
         }
 
@@ -131,7 +146,9 @@ impl ClientHandler {
             // doc for why the shed is included where the channel-class refusals are
             // not.
             let reason = FillOutcome::miss_reason(fault_seen);
-            return self.respond_error(&mut send, req, reason).await;
+            return self
+                .respond_error(&mut send, req, reason, rate_per_mb)
+                .await;
         }
 
         // (3) Open the progressive upstream pull, bounded by the pull-through
@@ -158,14 +175,18 @@ impl ClientHandler {
                     tee.abandon();
                     self.maybe_spawn_background_fill(hash);
                     let reason = FillOutcome::miss_reason(fault_seen);
-                    return self.respond_error(&mut send, req, reason).await;
+                    return self
+                        .respond_error(&mut send, req, reason, rate_per_mb)
+                        .await;
                 }
                 Err(_elapsed) => {
                     tee.abandon();
                     self.metrics.node_pull_through_timeout();
                     self.maybe_spawn_background_fill(hash);
                     let reason = FillOutcome::miss_reason(fault_seen);
-                    return self.respond_error(&mut send, req, reason).await;
+                    return self
+                        .respond_error(&mut send, req, reason, rate_per_mb)
+                        .await;
                 }
             };
         let total_bytes = header.total_bytes;
@@ -175,7 +196,7 @@ impl ClientHandler {
             pull.abandon(None);
             tee.abandon();
             return self
-                .respond_error(&mut send, req, ServeRejectReason::BlobTooLarge)
+                .respond_error(&mut send, req, ServeRejectReason::BlobTooLarge, rate_per_mb)
                 .await;
         }
 

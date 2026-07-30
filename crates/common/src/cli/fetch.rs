@@ -179,7 +179,7 @@ pub struct ClientFetchArgs {
 
     /// Deposit (`µUSDC`) to escrow when OPENING a new channel (ignored on reuse).
     /// Overrides `blockchain.buyer_initial_deposit_micro_usdc`; default 0.5 USDC.
-    /// Clamped up to the on-chain `minDeposit`.
+    /// Escrowed as configured (no on-chain floor; only a non-zero requirement).
     #[arg(long, value_name = "MICRO_USDC")]
     pub initial_deposit_micro_usdc: Option<u64>,
 

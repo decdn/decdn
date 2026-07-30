@@ -68,6 +68,8 @@ contract E2EProtocolTest is Test, BaseProtocolDeploy {
             emergencyMultisig: emergencyMultisig,
             initialTokenHolder: tokenHolder,
             timelockDelay: 48 hours,
+            // Direct-to-Timelock handoff; the ADR 009 bootstrap phase is opt-in.
+            bootstrapMultisig: address(0),
             minBond: MIN_BOND,
             unbondingPeriod: 14 days,
             multiaddrUpdateCooldown: 0,

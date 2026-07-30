@@ -104,7 +104,7 @@ Checks fire cheapest-first (global → per-IP → per-peer) so a probe rejected 
 
 | Metric | Type | Description |
 |---|---|---|
-| `decdn_probe_rate_limit_rejections_total` | counter, label `layer={per_peer, per_ip, global}` | New: probes rejected by the rate limiter, broken down by which layer rejected first. |
+| `decdn_probe_rate_limit_rejected_{per_peer,per_ip,global}_total` | three counters, unlabeled | Probes rejected by the rate limiter, one sibling counter per layer that rejected first. Sibling counters rather than a `layer` label, per the convention settled in #1475 — see [appendix-observability.md § Reason splits](appendix-observability.md#reason-splits-sibling-counters-not-labels). The single labelled `decdn_probe_rate_limit_rejections_total` this row used to name was never exported. |
 
 ### `cdn/client/v1` — paid delivery protocol
 

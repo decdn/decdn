@@ -5,12 +5,9 @@ import { Script, console2 } from "forge-std/Script.sol";
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { ERC20Burnable } from "@openzeppelin/contracts/token/ERC20/extensions/ERC20Burnable.sol";
 
-import { BuybackBurnerBalancerV3 } from "../src/BuybackBurnerBalancerV3.sol";
-import { BuybackBurnerUniswapV3 } from "../src/BuybackBurnerUniswapV3.sol";
 import { GuardedBuybackBurner } from "../src/GuardedBuybackBurner.sol";
 import { FeeRouter } from "../src/FeeRouter.sol";
-import { IBalancerV3Router } from "../src/interfaces/IBalancerV3Router.sol";
-import { IUniswapV3SwapRouter } from "../src/interfaces/IUniswapV3SwapRouter.sol";
+import { BuybackVenueLib } from "./lib/BuybackVenueLib.sol";
 
 // This is an operator runbook script whose entire purpose is to print the
 // deployed address and the governance calldata to schedule through the
@@ -69,18 +66,6 @@ import { IUniswapV3SwapRouter } from "../src/interfaces/IUniswapV3SwapRouter.sol
 ///           - `EPOCH_CAP_FRACTION_BPS`    (default 1000 = 10%)
 ///           - `TWAP_MIN_WINDOW_SECS`      (default 1800)
 contract ActivateBuyback is Script {
-    // Steady-state FeeRouter split once buyback is live (ADR 016 § Deployment
-    // Order): 60% operator / 30% buyback / 10% treasury.
-    uint256 internal constant STEADY_OPERATOR_SHARE = 6000;
-    uint256 internal constant STEADY_BUYBACK_SHARE = 3000;
-    uint256 internal constant STEADY_TREASURY_SHARE = 1000;
-
-    /// @dev Canonical Uniswap Permit2 (same CREATE2 address on every chain); the
-    ///      Balancer V3 Router pulls the swap's input USDC through it.
-    address internal constant CANONICAL_PERMIT2 = 0x000000000022D473030F116dDEE9F6B43aC78BA3;
-
-    error UnknownBuybackVenue(string venue);
-
     function run() external returns (GuardedBuybackBurner burner) {
         address tokenAddr = vm.envAddress("TOKEN_ADDRESS");
         address usdcAddr = vm.envAddress("USDC_ADDRESS");
@@ -88,16 +73,24 @@ contract ActivateBuyback is Script {
         address feeRouter = vm.envAddress("FEE_ROUTER");
         address keeper = vm.envAddress("BUYBACK_KEEPER");
 
+        // Resolved before `startBroadcast` so an unknown venue aborts with no gas
+        // spent. `BuybackVenueLib` is the same dispatch `DeployProtocol`'s genesis
+        // path uses, so the two entry points cannot disagree about what "uniswap"
+        // means (issue #1090).
         string memory venue = vm.envOr("BUYBACK_VENUE", string("uniswap"));
-        bytes32 h = keccak256(bytes(venue));
+        BuybackVenueLib.Venue selected = BuybackVenueLib.parseVenue(venue);
 
         vm.startBroadcast();
-        if (h == keccak256("balancer")) {
+        // Explicit else-revert, not a two-way ternary. This script and the genesis
+        // path previously fell through to *different* venues, so an unhandled variant
+        // would have wired different burners from the same env — the exact drift
+        // `BuybackVenueLib` exists to prevent.
+        if (selected == BuybackVenueLib.Venue.BALANCER) {
             burner = _deployBalancer(IERC20(usdcAddr), ERC20Burnable(tokenAddr), timelock);
-        } else if (h == keccak256("uniswap")) {
+        } else if (selected == BuybackVenueLib.Venue.UNISWAP) {
             burner = _deployUniswap(IERC20(usdcAddr), ERC20Burnable(tokenAddr), timelock);
         } else {
-            revert UnknownBuybackVenue(venue);
+            revert BuybackVenueLib.UnknownVenueVariant(uint8(selected));
         }
         vm.stopBroadcast();
 
@@ -107,10 +100,12 @@ contract ActivateBuyback is Script {
         console2.log("");
         console2.log("== Schedule the following through the 48h Timelock ==");
 
-        uint256[3] memory shares = [STEADY_OPERATOR_SHARE, STEADY_BUYBACK_SHARE, STEADY_TREASURY_SHARE];
         bytes memory activateCalldata = abi.encodeCall(
             FeeRouter.setSharesAndDestinations,
-            (shares, FeeRouter.ShareDestinations({ buybackBurner: address(burner), treasury: timelock }))
+            (
+                BuybackVenueLib.steadyShares(),
+                FeeRouter.ShareDestinations({ buybackBurner: address(burner), treasury: timelock })
+            )
         );
         console2.log("1) target:", feeRouter);
         console2.log("   FeeRouter.setSharesAndDestinations([6000,3000,1000], {burner, timelock})");
@@ -126,23 +121,19 @@ contract ActivateBuyback is Script {
         internal
         returns (GuardedBuybackBurner)
     {
-        return new BuybackBurnerBalancerV3(
+        return BuybackVenueLib.deployBalancerBurner(
             usdc,
             token,
             timelock,
-            BuybackBurnerBalancerV3.Config({
-                swapRouter_: IBalancerV3Router(vm.envAddress("BALANCER_ROUTER")),
-                pool_: vm.envAddress("BALANCER_POOL"),
-                vault_: vm.envAddress("BALANCER_VAULT"),
-                permit2_: vm.envOr("PERMIT2_ADDRESS", CANONICAL_PERMIT2),
-                subSwapCount_: vm.envOr("SUB_SWAP_COUNT", uint256(4)),
-                subSwapMinBlockGap_: vm.envOr("SUB_SWAP_MIN_BLOCK_GAP", uint256(10)),
-                twapMinWindow_: vm.envOr("TWAP_MIN_WINDOW_SECS", uint256(1800)),
-                maxBuybackAmount_: vm.envOr("MAX_BUYBACK_AMOUNT", uint256(10_000e6)),
-                minBuybackAmount_: vm.envOr("MIN_BUYBACK_AMOUNT", uint256(100e6)),
-                slippageBps_: vm.envOr("SLIPPAGE_BPS", uint256(200)),
-                epochLiquidityCapFraction_: vm.envOr("EPOCH_CAP_FRACTION_BPS", uint256(1000))
-            })
+            BuybackVenueLib.BalancerWiring({
+                swapRouter: vm.envAddress("BALANCER_ROUTER"),
+                pool: vm.envAddress("BALANCER_POOL"),
+                vault: vm.envAddress("BALANCER_VAULT"),
+                permit2: vm.envOr("PERMIT2_ADDRESS", BuybackVenueLib.CANONICAL_PERMIT2),
+                subSwapCount: vm.envOr("SUB_SWAP_COUNT", uint256(4)),
+                subSwapMinBlockGap: vm.envOr("SUB_SWAP_MIN_BLOCK_GAP", uint256(10))
+            }),
+            _readGuardParams()
         );
     }
 
@@ -150,19 +141,26 @@ contract ActivateBuyback is Script {
         internal
         returns (GuardedBuybackBurner)
     {
-        return new BuybackBurnerUniswapV3(
+        return BuybackVenueLib.deployUniswapBurner(
             usdc,
             token,
             timelock,
-            BuybackBurnerUniswapV3.Config({
-                swapRouter_: IUniswapV3SwapRouter(vm.envAddress("UNISWAP_SWAP_ROUTER")),
-                pool_: vm.envAddress("UNISWAP_POOL"),
-                twapMinWindow_: vm.envOr("TWAP_MIN_WINDOW_SECS", uint256(1800)),
-                maxBuybackAmount_: vm.envOr("MAX_BUYBACK_AMOUNT", uint256(10_000e6)),
-                minBuybackAmount_: vm.envOr("MIN_BUYBACK_AMOUNT", uint256(100e6)),
-                slippageBps_: vm.envOr("SLIPPAGE_BPS", uint256(200)),
-                epochLiquidityCapFraction_: vm.envOr("EPOCH_CAP_FRACTION_BPS", uint256(1000))
-            })
+            vm.envAddress("UNISWAP_SWAP_ROUTER"),
+            vm.envAddress("UNISWAP_POOL"),
+            _readGuardParams()
         );
+    }
+
+    /// @dev The venue-independent MEV-defense guard band. Defaults track ADR 018
+    ///      § Parameter Table and match `DeployProtocol._readBuybackActivation`'s,
+    ///      so the runbook and the genesis path configure the same burner.
+    function _readGuardParams() internal view returns (GuardedBuybackBurner.GuardParams memory) {
+        return GuardedBuybackBurner.GuardParams({
+            twapMinWindow_: vm.envOr("TWAP_MIN_WINDOW_SECS", uint256(1800)),
+            maxBuybackAmount_: vm.envOr("MAX_BUYBACK_AMOUNT", uint256(10_000e6)),
+            minBuybackAmount_: vm.envOr("MIN_BUYBACK_AMOUNT", uint256(100e6)),
+            slippageBps_: vm.envOr("SLIPPAGE_BPS", uint256(200)),
+            epochLiquidityCapFraction_: vm.envOr("EPOCH_CAP_FRACTION_BPS", uint256(1000))
+        });
     }
 }
