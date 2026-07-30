@@ -4,8 +4,9 @@
 use super::{
     Arc, B256, BatchOutcome, BatchStop, BufferedVoucherReader, ChannelDeliveryState, ChannelId,
     ChannelState, ClientHandler, ClientMessage, CooperativeClose, CooperativeCloseAuth,
-    CooperativeCloseRequest, DEFAULT_TOLERANCE_BPS, Hash, Mutex, RateError, RecvStream, SendStream,
-    SignedVoucher, U256, VOUCHER_READ_TIMEOUT, VoucherRejectReason, WatermarkBundle, verify_rate,
+    CooperativeCloseAuthExt, CooperativeCloseRequest, DEFAULT_TOLERANCE_BPS, Hash, Mutex,
+    RateError, RecvStream, SendStream, SignedVoucher, U256, VOUCHER_READ_TIMEOUT,
+    VoucherRejectReason, WatermarkBundle, encode_cooperative_close_auth, verify_rate,
     voucher_reject_reason, wire_voucher_to_signed,
 };
 
@@ -494,7 +495,7 @@ impl ClientHandler {
             return Ok(());
         };
 
-        let auth = {
+        let (auth, ext) = {
             // Hold the per-channel lock across read-watermark → sign → persist so
             // a concurrent voucher cannot advance the watermark between the value
             // we sign and the flag we set. Signing is local and fast.
@@ -579,17 +580,36 @@ impl ClientHandler {
             .map_err(|e| anyhow::anyhow!("cooperative-close mark task failed: {e}"))?;
             mark_res?;
             guard.state = candidate;
-            CooperativeCloseAuth {
+            let auth = CooperativeCloseAuth {
                 channel_id: req.channel_id,
                 amount: guard.state.last_amount().to_be_bytes(),
                 nonce: guard.state.last_nonce().to_be_bytes(),
                 bytes_delivered: guard.state.last_bytes_delivered().to_be_bytes(),
                 signature: signed.signature.as_bytes().to_vec(),
-            }
+            };
+            // Echo the client's own last-accepted voucher signature (#1495). It
+            // is the signature over exactly the tuple declared above — both are
+            // read from the same `guard.state` under the same guard, and the
+            // store writes them together on accept — so a client whose persisted
+            // watermark lags can verify against its own key that the tuple is one
+            // it already signed, instead of dead-ending on the over-claim
+            // refusal with its deposit stranded. Same value and same purpose as
+            // `WatermarkBundle::last_signature` on the fetch path (#1481).
+            //
+            // `None` (a hydrated state carrying no signature) sends the bare
+            // pre-#1495 auth: the client cannot verify and keeps its refusal.
+            let ext = guard
+                .state
+                .last_signature()
+                .map(|last_signature| CooperativeCloseAuthExt {
+                    last_signature: last_signature.to_vec(),
+                });
+            (auth, ext)
         };
 
-        self.write_message(&mut send, &ClientMessage::CooperativeCloseAuth(auth))
-            .await?;
+        let payload = encode_cooperative_close_auth(&auth, ext.as_ref())
+            .map_err(|e| anyhow::anyhow!("cooperative-close auth encode failed: {e}"))?;
+        self.write_payload(&mut send, &payload).await?;
         let _ = send.finish();
         Ok(())
     }

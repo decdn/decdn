@@ -59,13 +59,14 @@ library BuybackVenueLib {
     ///         A guard on the deploy script alone leaves the runbook path unprotected,
     ///         which is the two-entry-point drift issue #1090 exists to remove.
     error WiringIncomplete(string field);
-    /// @notice `maxBuybackAmount_` is zero. `GuardedBuybackBurner`'s constructor
-    ///         rejects an inverted band (`min > max`) but not a zero one, so
-    ///         `min == max == 0` constructs cleanly and then reverts
-    ///         `AboveMaxBuyback` on every call forever — a burner receiving the
-    ///         buyback bucket's 30% of revenue that can never spend it. Reachable
-    ///         from production env as `MIN_BUYBACK_AMOUNT=0 MAX_BUYBACK_AMOUNT=0`,
-    ///         the "0 means unlimited" misreading.
+    /// @notice `maxBuybackAmount_` is zero — a burner receiving the buyback
+    ///         bucket's share of revenue that could never spend it, because
+    ///         `amountIn > maxBuybackAmount` would revert every call forever.
+    ///         Reachable from production env as
+    ///         `MIN_BUYBACK_AMOUNT=0 MAX_BUYBACK_AMOUNT=0`, the "0 means
+    ///         unlimited" misreading. `GuardedBuybackBurner.BuybackBandDead` is
+    ///         now the authority (#1532); this stays as a pre-broadcast
+    ///         fail-fast — see `_requireLiveGuardBand`.
     error GuardBandDead();
 
     // Steady-state FeeRouter split once buyback is live (ADR 026 § FeeRouter
@@ -155,12 +156,12 @@ library BuybackVenueLib {
         _requireLiveGuardBand(guard);
     }
 
-    /// @dev Reject a guard band that can never execute. `GuardedBuybackBurner`'s
-    ///      constructor checks `min > max` but not `max == 0`, so an all-zero band
-    ///      passes every bound it does check and then fails `amountIn > maxBuybackAmount`
-    ///      on every call. Checked here rather than in the burner because that
-    ///      contract is shipped and its bounds are ADR 018 parameters — this is the
-    ///      seam both deploy paths already share.
+    /// @dev Reject a guard band that can never execute. Redundant since #1532 —
+    ///      `GuardedBuybackBurner`'s constructor now reverts `BuybackBandDead` on
+    ///      `max == 0` itself, and that is the authority. Kept as a fail-fast at
+    ///      the seam both deploy paths share, so a mis-set env var surfaces
+    ///      before the deploy transaction is broadcast rather than as a reverted
+    ///      deployment mid-run.
     function _requireLiveGuardBand(GuardedBuybackBurner.GuardParams memory guard) private pure {
         if (guard.maxBuybackAmount_ == 0) revert GuardBandDead();
     }

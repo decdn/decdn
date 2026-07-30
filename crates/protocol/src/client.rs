@@ -667,6 +667,15 @@ pub struct CooperativeCloseRequest {
 /// `PaymentChannel.cooperativeClose` for an immediate, window-free settle.
 /// `amount`/`nonce`/`bytes_delivered` are 256-bit big-endian values for the
 /// same reason as [`Voucher`] — no `U256` in the protocol crate.
+///
+/// This struct holds **only the frozen base fields**. The optional
+/// [`CooperativeCloseAuthExt`] is carried as **separate trailing bytes** after
+/// this message in the frame, parsed via [`parse_cooperative_close_auth_ext`] —
+/// the same two-phase pattern [`StreamRequest`] uses for [`StreamRequestExt`],
+/// and for the same reason: a node that sends the extension stays readable by a
+/// client that predates it, and a client that reads it stays compatible with a
+/// node that does not send it. Use [`encode_cooperative_close_auth`] to build
+/// the wire payload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CooperativeCloseAuth {
     /// `channel_id` echoed from the [`CooperativeCloseRequest`].
@@ -693,6 +702,89 @@ impl CooperativeCloseAuth {
             });
         }
         Ok(())
+    }
+}
+
+/// Optional trailing extension to [`CooperativeCloseAuth`], carried as separate
+/// bytes after the base message in the same frame (issue #1495).
+///
+/// The base auth carries only the *provider's* waiver signature, so a client
+/// whose persisted watermark lags the node's — it signed vouchers it did not
+/// durably persist before an unclean exit — has nothing it can check against its
+/// own key and must refuse the close, stranding the channel and its deposit.
+/// `last_signature` closes that: it is the client's OWN last-accepted voucher
+/// signature, the same value [`WatermarkBundle::last_signature`] carries on the
+/// fetch path, echoed so the client can verify the node's declared tuple is one
+/// it already signed before settling at it.
+///
+/// Absent (an empty `last_signature`, which is also [`Default`]) means the node
+/// did not supply one — either it predates this extension or its stored channel
+/// state carries no signature. A client that cannot verify keeps its refusal, so
+/// absence is never weaker than the pre-extension behaviour.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CooperativeCloseAuthExt {
+    /// The client's own signature (`r‖s‖v`, exactly [`VOUCHER_SIG_LEN`]) on the
+    /// voucher whose `(amount, nonce, bytes_delivered)` the accompanying
+    /// [`CooperativeCloseAuth`] declares. Empty ⇒ not supplied. `Vec<u8>` for the
+    /// same reason as [`WatermarkBundle::last_signature`].
+    pub last_signature: Vec<u8>,
+}
+
+impl CooperativeCloseAuthExt {
+    /// Validate the wire-level `last_signature` length: empty (not supplied) or
+    /// exactly [`VOUCHER_SIG_LEN`]. Like [`WatermarkBundle::validate`] this is a
+    /// shape check, not an authentication check — the extension rides inside an
+    /// unsigned frame, so the caller MUST still verify the signature recovers to
+    /// its own voucher-signing address before trusting the declared tuple.
+    pub const fn validate(&self) -> Result<(), MessageValidationError> {
+        if !self.last_signature.is_empty() && self.last_signature.len() != VOUCHER_SIG_LEN {
+            return Err(MessageValidationError::InvalidVoucherSigLen {
+                len: self.last_signature.len(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Encode a [`CooperativeCloseAuth`] frame payload: the postcard-encoded
+/// `ClientMessage::CooperativeCloseAuth(auth)` followed, when `ext` is `Some`, by
+/// the postcard-encoded extension. The receiver recovers `auth` from
+/// [`crate::decode_message`] and the extension from that call's returned
+/// remainder via [`parse_cooperative_close_auth_ext`].
+///
+/// # Errors
+///
+/// Propagates a [`postcard::Error`] if serialization fails.
+pub fn encode_cooperative_close_auth(
+    auth: &CooperativeCloseAuth,
+    ext: Option<&CooperativeCloseAuthExt>,
+) -> Result<Vec<u8>, postcard::Error> {
+    let mut buf = postcard::to_allocvec(&ClientMessage::CooperativeCloseAuth(auth.clone()))?;
+    if let Some(ext) = ext {
+        buf.extend_from_slice(&postcard::to_allocvec(ext)?);
+    }
+    Ok(buf)
+}
+
+/// Parse the trailing [`CooperativeCloseAuthExt`] bytes returned as the remainder
+/// by [`crate::decode_message`] after a `ClientMessage::CooperativeCloseAuth`.
+///
+/// An empty remainder ⇒ [`CooperativeCloseAuthExt::default`] (no echo — a node
+/// that predates the extension). Trailing bytes beyond the known fields are
+/// tolerated for forward compatibility (ADR 013 §Tier 1), matching
+/// [`parse_stream_request_ext`].
+///
+/// # Errors
+///
+/// Returns a [`postcard::Error`] if a non-empty remainder is not a valid
+/// `CooperativeCloseAuthExt` prefix.
+pub fn parse_cooperative_close_auth_ext(
+    remainder: &[u8],
+) -> Result<CooperativeCloseAuthExt, postcard::Error> {
+    if remainder.is_empty() {
+        Ok(CooperativeCloseAuthExt::default())
+    } else {
+        Ok(postcard::take_from_bytes::<CooperativeCloseAuthExt>(remainder)?.0)
     }
 }
 
@@ -1286,6 +1378,88 @@ mod tests {
         let expected_disc = postcard::to_allocvec(&(ClientMessage::VARIANT_COUNT - 1))?;
         assert!(bytes.starts_with(&expected_disc));
         Ok(())
+    }
+
+    fn sample_coop_auth() -> CooperativeCloseAuth {
+        CooperativeCloseAuth {
+            channel_id: [7u8; 32],
+            amount: [1u8; 32],
+            nonce: [2u8; 32],
+            bytes_delivered: [3u8; 32],
+            signature: vec![0xABu8; COOPERATIVE_CLOSE_SIG_LEN],
+        }
+    }
+
+    fn sample_coop_ext() -> CooperativeCloseAuthExt {
+        CooperativeCloseAuthExt {
+            last_signature: vec![0xCDu8; VOUCHER_SIG_LEN],
+        }
+    }
+
+    /// Two-phase: no ext ⇒ the payload is byte-identical to the bare message a
+    /// pre-#1495 node emits, so an old client decodes it unchanged. This is the
+    /// property that makes the extension non-wire-breaking.
+    #[test]
+    fn cooperative_close_auth_two_phase_no_ext() -> Result<(), crate::framing::FrameError> {
+        let auth = sample_coop_auth();
+        let payload = encode_cooperative_close_auth(&auth, None)?;
+        assert_eq!(
+            payload,
+            postcard::to_allocvec(&ClientMessage::CooperativeCloseAuth(auth.clone()))?,
+            "no ext ⇒ the legacy payload, byte for byte"
+        );
+        let (msg, remainder) = decode_message::<ClientMessage>(&payload)?;
+        assert_eq!(msg, ClientMessage::CooperativeCloseAuth(auth));
+        assert!(remainder.is_empty());
+        assert_eq!(
+            parse_cooperative_close_auth_ext(remainder)?,
+            CooperativeCloseAuthExt::default()
+        );
+        Ok(())
+    }
+
+    /// Two-phase: with an ext the base message decodes identically and the echo
+    /// arrives as the remainder — an old client stops after the base message and
+    /// simply ignores the trailing bytes.
+    #[test]
+    fn cooperative_close_auth_two_phase_with_ext() -> Result<(), crate::framing::FrameError> {
+        let auth = sample_coop_auth();
+        let ext = sample_coop_ext();
+        let payload = encode_cooperative_close_auth(&auth, Some(&ext))?;
+        let (msg, remainder) = decode_message::<ClientMessage>(&payload)?;
+        assert_eq!(msg, ClientMessage::CooperativeCloseAuth(auth));
+        assert!(!remainder.is_empty(), "ext present ⇒ trailing bytes");
+        assert_eq!(parse_cooperative_close_auth_ext(remainder)?, ext);
+        Ok(())
+    }
+
+    /// Forward compatibility (ADR 013 §Tier 1), mirroring
+    /// `stream_request_ext_tolerates_future_trailing_bytes`.
+    #[test]
+    fn cooperative_close_auth_ext_tolerates_future_trailing_bytes() -> Result<(), postcard::Error> {
+        let ext = sample_coop_ext();
+        let mut bytes = postcard::to_allocvec(&ext)?;
+        bytes.extend_from_slice(&[0xAAu8, 0xBB, 0xCC]); // simulated future field
+        assert_eq!(parse_cooperative_close_auth_ext(&bytes)?, ext);
+        Ok(())
+    }
+
+    #[test]
+    fn cooperative_close_auth_ext_validate_accepts_empty_and_full_length() {
+        assert!(CooperativeCloseAuthExt::default().validate().is_ok());
+        assert!(sample_coop_ext().validate().is_ok());
+    }
+
+    #[test]
+    fn cooperative_close_auth_ext_validate_rejects_wrong_len_signature() {
+        let ext = CooperativeCloseAuthExt {
+            last_signature: vec![0u8; VOUCHER_SIG_LEN - 1],
+        };
+        assert!(matches!(
+            ext.validate(),
+            Err(MessageValidationError::InvalidVoucherSigLen { len })
+                if len == VOUCHER_SIG_LEN - 1
+        ));
     }
 
     #[test]

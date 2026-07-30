@@ -182,7 +182,19 @@ impl ClientHandler {
         msg: &ClientMessage,
     ) -> anyhow::Result<()> {
         let payload = encode_message(msg).map_err(|e| anyhow::anyhow!("encode failed: {e}"))?;
-        write_frame(send, &payload)
+        self.write_payload(send, &payload).await
+    }
+
+    /// Frame an already-encoded payload. Used by the two-phase messages whose
+    /// payload is a base message plus trailing extension bytes
+    /// (`encode_cooperative_close_auth`), which [`Self::write_message`] cannot
+    /// build because it encodes exactly one message.
+    pub(super) async fn write_payload(
+        &self,
+        send: &mut SendStream,
+        payload: &[u8],
+    ) -> anyhow::Result<()> {
+        write_frame(send, payload)
             .await
             .map_err(|e| anyhow::anyhow!("write failed: {e}"))
     }

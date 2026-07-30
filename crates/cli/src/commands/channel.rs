@@ -29,11 +29,13 @@ use decdn_client_pull::cooperative_close::{
 };
 use decdn_common::cli::{self, common::expand_tilde};
 use decdn_common::config::{DEFAULT_CHAIN_ID, FileConfig, load_file_config};
-use decdn_incentive::buyer_channel::{BuyerChannelState, BuyerChannelStore, BuyerLoad};
+use decdn_incentive::buyer_channel::{
+    AdvanceOutcome, BuyerChannelState, BuyerChannelStore, BuyerLoad,
+};
 use decdn_incentive::buyer_channel_redb::RedbBuyerChannelStore;
 use decdn_incentive::eth_identity::{self, PasswordSource, load_signer, read_password};
 use decdn_incentive::payment_channel::PaymentChannel;
-use decdn_incentive::{Voucher, voucher_domain};
+use decdn_incentive::{ChannelId, Voucher, voucher_domain};
 use iroh::{EndpointAddr, PublicKey};
 use serde::Serialize;
 
@@ -175,7 +177,12 @@ async fn coop_close(args: &cli::CoopCloseArgs, config_path: Option<&Path>) -> an
     .await?;
 
     match outcome {
-        CooperativeCloseOutcome::Settled => {
+        CooperativeCloseOutcome::Settled { reconciled } => {
+            // Our persisted watermark lagged what we had actually signed, and the
+            // provider proved it with our own signature (#1495). Persist the
+            // healed value before forgetting the row, so a failed forget cannot
+            // leave the store claiming less than was settled on-chain.
+            persist_reconciled(&store, provider, state.channel_id, reconciled);
             // Deposit refunded on-chain; drop the now-terminal channel so a later
             // fetch opens a fresh one. A failed forget only risks a stale reuse
             // attempt (rejected on-chain), so warn rather than fail the close.
@@ -198,13 +205,51 @@ async fn coop_close(args: &cli::CoopCloseArgs, config_path: Option<&Path>) -> an
                  yet); close it the ordinary way with closeChannel"
             )
         }
-        CooperativeCloseOutcome::Reverted => {
+        CooperativeCloseOutcome::Reverted { reconciled } => {
+            // Persist the healed watermark here too: the fallback `closeChannel`
+            // must submit the voucher we actually signed, not the stale one this
+            // command started from.
+            persist_reconciled(&store, provider, state.channel_id, reconciled);
             anyhow::bail!(
                 "cooperativeClose reverted on-chain for channel {} (it may have raced a \
                  withdraw/close, or the watermark regressed); close it the ordinary way",
                 state.channel_id
             )
         }
+    }
+}
+
+/// Persist a watermark the close reconciled against the node's echo (#1495).
+///
+/// Best-effort: a failure here costs a stale local record, not money — the
+/// on-chain settlement already stands — so it warns rather than failing the
+/// close. `AdvanceOutcome` is `#[must_use]` precisely because a dropped
+/// `UnknownChannel`/`ChannelMismatch` looks like success, so each variant is
+/// reported rather than discarded.
+fn persist_reconciled(
+    store: &RedbBuyerChannelStore,
+    provider: Address,
+    channel_id: ChannelId,
+    reconciled: Option<AuthorizedWatermark>,
+) {
+    let Some(healed) = reconciled else { return };
+    match store.advance_progress(
+        provider,
+        channel_id,
+        healed.nonce,
+        healed.bytes_delivered,
+        healed.amount,
+    ) {
+        Ok(AdvanceOutcome::Advanced) => {}
+        Ok(other) => eprintln!(
+            "warning: channel {channel_id} settled at the provider's watermark ({}, {}, {}) but \
+             the local record was not advanced: {other:?}",
+            healed.amount, healed.nonce, healed.bytes_delivered
+        ),
+        Err(e) => eprintln!(
+            "warning: channel {channel_id} settled at the provider's watermark but persisting it \
+             locally failed: {e}"
+        ),
     }
 }
 

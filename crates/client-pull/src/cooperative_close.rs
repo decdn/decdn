@@ -25,11 +25,16 @@ use alloy::providers::Provider;
 use alloy::signers::local::PrivateKeySigner;
 use decdn_incentive::payment_channel::PaymentChannel;
 use decdn_incentive::{CooperativeClose, SignedCooperativeClose, Voucher, sign_coop_close_request};
-use decdn_protocol::client::{ClientMessage, CooperativeCloseAuth, CooperativeCloseRequest};
+use decdn_protocol::client::{
+    ClientMessage, CooperativeCloseAuth, CooperativeCloseAuthExt, CooperativeCloseRequest,
+    parse_cooperative_close_auth_ext,
+};
 use decdn_protocol::{
     ALPN_CLIENT, FrameError, decode_message, encode_message, read_frame, write_frame,
 };
 use iroh::{Endpoint, EndpointAddr};
+
+use crate::voucher_signed_by;
 
 /// What the client authorized on the channel — the cap the provider's returned
 /// settlement tuple may not exceed.
@@ -41,7 +46,7 @@ use iroh::{Endpoint, EndpointAddr};
 /// voucher above what it issued. For a buyer-held channel these come straight
 /// from the persisted `BuyerChannelState` (`last_amount`/`last_nonce`/
 /// `last_bytes_delivered`).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AuthorizedWatermark {
     /// Highest cumulative amount the client has signed a voucher for.
     pub amount: U256,
@@ -52,17 +57,30 @@ pub struct AuthorizedWatermark {
 }
 
 /// Result of a client-initiated cooperative close.
+///
+/// `reconciled` is `Some` when the close settled at a watermark HIGHER than the
+/// caller's persisted record, having proved via the node's echo that the client
+/// itself signed that tuple (#1495). The caller MUST persist it: on `Settled` so
+/// a failed channel-forget cannot leave the store claiming less than was
+/// actually settled, and on `Reverted` so the `closeChannel` fallback submits the
+/// true voucher rather than the stale one it started with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CooperativeCloseOutcome {
     /// Settled on-chain in one tx; the channel is terminal `Closed`.
-    Settled,
+    Settled {
+        /// The healed watermark, if the close reconciled a lagging local record.
+        reconciled: Option<AuthorizedWatermark>,
+    },
     /// The provider has no channel or no accepted voucher and finished without a
     /// waiver. The caller should fall back to `closeChannel`.
     Declined,
     /// The `cooperativeClose` tx was mined but reverted (e.g. it raced a
     /// `withdraw`/`closeChannel`, or the watermark regressed against the on-chain
     /// `claimed*`). The caller should fall back to `closeChannel`.
-    Reverted,
+    Reverted {
+        /// The healed watermark, if the close reconciled a lagging local record.
+        reconciled: Option<AuthorizedWatermark>,
+    },
 }
 
 /// Ask `target` for a cooperative-close waiver on `channel_id` over
@@ -75,10 +93,12 @@ pub enum CooperativeCloseOutcome {
 /// pinned `voucherSigner` before signing any waiver. Without it the provider
 /// declines — the same `Ok(None)` path as an unknown channel.
 ///
-/// Returns `Ok(Some(auth))` with the provider's waiver, or `Ok(None)` when the
-/// provider finishes the stream without one — its decline signal for an unknown
-/// channel, an unauthenticated request, or a channel with no accepted voucher
-/// yet (handlers/client.rs). A network/protocol failure is `Err`.
+/// Returns `Ok(Some((auth, ext)))` with the provider's waiver and its optional
+/// trailing extension (`ext.last_signature` empty when the node supplied no echo
+/// — see [`CooperativeCloseAuthExt`]), or `Ok(None)` when the provider finishes
+/// the stream without a waiver — its decline signal for an unknown channel, an
+/// unauthenticated request, or a channel with no accepted voucher yet
+/// (handlers/client.rs). A network/protocol failure is `Err`.
 ///
 /// # Errors
 ///
@@ -91,7 +111,7 @@ pub async fn request_cooperative_close_auth(
     client_signer: &PrivateKeySigner,
     domain: &Eip712Domain,
     timeout: Duration,
-) -> anyhow::Result<Option<CooperativeCloseAuth>> {
+) -> anyhow::Result<Option<(CooperativeCloseAuth, CooperativeCloseAuthExt)>> {
     let client_signature = sign_coop_close_request(client_signer, channel_id, domain)
         .map_err(|e| anyhow::anyhow!("sign cooperative-close request: {e}"))?;
     tokio::time::timeout(
@@ -107,7 +127,7 @@ async fn request_inner(
     target: EndpointAddr,
     channel_id: B256,
     client_signature: Vec<u8>,
-) -> anyhow::Result<Option<CooperativeCloseAuth>> {
+) -> anyhow::Result<Option<(CooperativeCloseAuth, CooperativeCloseAuthExt)>> {
     let conn = endpoint
         .connect(target, ALPN_CLIENT)
         .await
@@ -139,13 +159,20 @@ async fn request_inner(
         }
         Err(e) => return Err(anyhow::anyhow!("read auth: {e}")),
     };
-    let (msg, _rest) =
+    let (msg, remainder) =
         decode_message::<ClientMessage>(&frame).map_err(|e| anyhow::anyhow!("decode auth: {e}"))?;
     match msg {
         ClientMessage::CooperativeCloseAuth(auth) => {
             auth.validate()
                 .map_err(|e| anyhow::anyhow!("invalid cooperative-close auth: {e}"))?;
-            Ok(Some(auth))
+            // Two-phase (#1495): the watermark echo rides as trailing bytes after
+            // the base message. A node that predates it leaves the remainder
+            // empty, which parses to the default (no echo).
+            let ext = parse_cooperative_close_auth_ext(remainder)
+                .map_err(|e| anyhow::anyhow!("decode cooperative-close auth extension: {e}"))?;
+            ext.validate()
+                .map_err(|e| anyhow::anyhow!("invalid cooperative-close auth extension: {e}"))?;
+            Ok(Some((auth, ext)))
         }
         other => anyhow::bail!("expected CooperativeCloseAuth, got {other:?}"),
     }
@@ -167,24 +194,39 @@ struct PreparedClose {
 /// Validate the provider's waiver against what the client authorized, then sign
 /// the matching client voucher — the security-critical, network-free core.
 ///
-/// Refuses if the provider's tuple exceeds the authorized watermark (a provider
-/// trying to inflate the payout toward the full deposit) or if the waiver does
+/// The provider's tuple is accepted when it is **within** `authorized`, or — when
+/// it exceeds it — when `ext.last_signature` proves the client itself already
+/// signed **that exact tuple** (#1495). Everything else is refused: a provider
+/// trying to inflate the payout toward the full deposit, or a waiver that does
 /// not recover to `provider_eth`.
+///
+/// The second branch is what lets a client whose persisted watermark legitimately
+/// lags — it signed vouchers it did not durably persist before an unclean exit —
+/// settle at all. Without it the guard is correct but terminal, and the channel
+/// plus its deposit are stranded. It is not a relaxation: proving the client
+/// signed the tuple is strictly stronger evidence than the local record it
+/// replaces, and it is checked over the same tuple this function goes on to sign,
+/// so there is no window between what was proved and what is committed.
+///
+/// Returns the prepared close and, when the second branch was taken, the healed
+/// watermark for the caller to persist.
 ///
 /// # Errors
 ///
 /// - provider over-claimed beyond `authorized`,
 /// - the waiver signature is malformed or signed by the wrong key,
 /// - client voucher signing fails.
+#[allow(clippy::too_many_arguments)]
 fn prepare_close(
     auth: &CooperativeCloseAuth,
+    ext: &CooperativeCloseAuthExt,
     channel_id: B256,
     provider_eth: Address,
     token: Address,
     authorized: AuthorizedWatermark,
     client_signer: &PrivateKeySigner,
     domain: &Eip712Domain,
-) -> anyhow::Result<PreparedClose> {
+) -> anyhow::Result<(PreparedClose, Option<AuthorizedWatermark>)> {
     // The provider echoes the requested `channel_id`; a mismatch would already
     // fail signature verification (the digest is rebuilt from the local
     // `channel_id`), but checking the echo up front gives an actionable error
@@ -200,21 +242,45 @@ fn prepare_close(
     let nonce = U256::from_be_bytes(auth.nonce);
     let bytes_delivered = U256::from_be_bytes(auth.bytes_delivered);
 
-    // Never sign away more than we authorized. The provider returns the highest
-    // client voucher it holds, which can only be <= what we issued; a larger
-    // tuple means a misbehaving provider. Refuse — the channel can still be
-    // closed the slow way.
-    if amount > authorized.amount
+    // Never sign away more than we can account for. The provider returns the
+    // highest client voucher it holds, which can only be <= what we issued — so a
+    // larger tuple is either a misbehaving provider inflating the payout, or our
+    // own record lagging what we actually signed.
+    //
+    // Tell those apart by asking the provider to prove it: `last_signature` must
+    // recover to OUR voucher-signing key over the exact tuple below. Only we
+    // could have produced it, so a tuple that verifies is one we already
+    // committed to and the record — not the waiver — is what was wrong. Anything
+    // that does not verify is refused as before; the channel can still be closed
+    // the slow way.
+    let over_claimed = amount > authorized.amount
         || nonce > authorized.nonce
-        || bytes_delivered > authorized.bytes_delivered
-    {
-        anyhow::bail!(
-            "provider over-claimed: waiver ({amount}, {nonce}, {bytes_delivered}) exceeds \
-             authorized ({}, {}, {})",
-            authorized.amount,
-            authorized.nonce,
-            authorized.bytes_delivered
-        );
+        || bytes_delivered > authorized.bytes_delivered;
+    let mut reconciled = None;
+    if over_claimed {
+        if !voucher_signed_by(
+            client_signer.address(),
+            channel_id,
+            token,
+            domain,
+            amount,
+            nonce,
+            bytes_delivered,
+            &ext.last_signature,
+        ) {
+            anyhow::bail!(
+                "provider over-claimed: waiver ({amount}, {nonce}, {bytes_delivered}) exceeds \
+                 authorized ({}, {}, {}) and carries no signature of ours over it",
+                authorized.amount,
+                authorized.nonce,
+                authorized.bytes_delivered
+            );
+        }
+        reconciled = Some(AuthorizedWatermark {
+            amount,
+            nonce,
+            bytes_delivered,
+        });
     }
 
     // Verify the waiver really is the provider's before spending gas.
@@ -246,18 +312,21 @@ fn prepare_close(
     .map_err(|e| anyhow::anyhow!("client voucher signing failed: {e}"))?
     .signature;
 
-    Ok(PreparedClose {
-        amount,
-        nonce,
-        bytes_delivered,
-        // `Signature::as_bytes` emits `v` in the 27/28 convention the contract's
-        // `ECDSA.recover` expects (see node `normalize_voucher_signature`). Use the
-        // re-serialized parsed `provider_sig` rather than the raw wire bytes so a
-        // non-canonical `v` (0/1) that parses and verifies still lands on-chain in
-        // the form the contract requires — both sigs go through the same normalizer.
-        client_sig: Bytes::from(client_sig.as_bytes().to_vec()),
-        provider_sig: Bytes::from(provider_sig.as_bytes().to_vec()),
-    })
+    Ok((
+        PreparedClose {
+            amount,
+            nonce,
+            bytes_delivered,
+            // `Signature::as_bytes` emits `v` in the 27/28 convention the contract's
+            // `ECDSA.recover` expects (see node `normalize_voucher_signature`). Use the
+            // re-serialized parsed `provider_sig` rather than the raw wire bytes so a
+            // non-canonical `v` (0/1) that parses and verifies still lands on-chain in
+            // the form the contract requires — both sigs go through the same normalizer.
+            client_sig: Bytes::from(client_sig.as_bytes().to_vec()),
+            provider_sig: Bytes::from(provider_sig.as_bytes().to_vec()),
+        },
+        reconciled,
+    ))
 }
 
 /// Run a full client-initiated cooperative close against `target` and submit it
@@ -285,7 +354,7 @@ pub async fn cooperative_close<P: Provider>(
     domain: &Eip712Domain,
     timeout: Duration,
 ) -> anyhow::Result<CooperativeCloseOutcome> {
-    let Some(auth) = request_cooperative_close_auth(
+    let Some((auth, ext)) = request_cooperative_close_auth(
         endpoint,
         target,
         channel_id,
@@ -298,8 +367,9 @@ pub async fn cooperative_close<P: Provider>(
         return Ok(CooperativeCloseOutcome::Declined);
     };
 
-    let prepared = prepare_close(
+    let (prepared, reconciled) = prepare_close(
         &auth,
+        &ext,
         channel_id,
         provider_eth,
         token,
@@ -329,7 +399,7 @@ pub async fn cooperative_close<P: Provider>(
         // genuine transport/RPC failure (connectivity, nonce) and stays an error
         // the caller should retry, not a settlement signal.
         Err(e) if e.as_revert_data().is_some() => {
-            return Ok(CooperativeCloseOutcome::Reverted);
+            return Ok(CooperativeCloseOutcome::Reverted { reconciled });
         }
         Err(e) => return Err(anyhow::anyhow!("cooperativeClose send failed: {e}")),
     };
@@ -338,9 +408,9 @@ pub async fn cooperative_close<P: Provider>(
         .await
         .map_err(|e| anyhow::anyhow!("cooperativeClose receipt failed: {e}"))?;
     if receipt.status() {
-        Ok(CooperativeCloseOutcome::Settled)
+        Ok(CooperativeCloseOutcome::Settled { reconciled })
     } else {
-        Ok(CooperativeCloseOutcome::Reverted)
+        Ok(CooperativeCloseOutcome::Reverted { reconciled })
     }
 }
 
@@ -406,8 +476,9 @@ mod tests {
             U256::from(3u64),
             U256::from(9000u64),
         );
-        let prepared = prepare_close(
+        let (prepared, reconciled) = prepare_close(
             &auth,
+            &CooperativeCloseAuthExt::default(),
             channel_id,
             provider.address(),
             token,
@@ -417,6 +488,10 @@ mod tests {
         )
         .expect("prepare at exact watermark");
         assert_eq!(prepared.amount, U256::from(500u64));
+        assert_eq!(
+            reconciled, None,
+            "nothing to reconcile at the exact watermark"
+        );
         // The client sig must recover to the client key over the same tuple.
         let recovered = SignedVoucherCheck::recover(
             &prepared.client_sig,
@@ -445,8 +520,9 @@ mod tests {
             U256::from(2u64),
             U256::from(8000u64),
         );
-        prepare_close(
+        let (_, reconciled) = prepare_close(
             &auth,
+            &CooperativeCloseAuthExt::default(),
             channel_id,
             provider.address(),
             token,
@@ -455,6 +531,7 @@ mod tests {
             &domain(),
         )
         .expect("provider tuple below authorized is accepted");
+        assert_eq!(reconciled, None, "a lower tuple is not a reconciliation");
     }
 
     #[test]
@@ -474,6 +551,7 @@ mod tests {
         );
         let err = prepare_close(
             &auth,
+            &CooperativeCloseAuthExt::default(),
             channel_id,
             provider.address(),
             token,
@@ -503,6 +581,7 @@ mod tests {
         );
         let err = prepare_close(
             &auth,
+            &CooperativeCloseAuthExt::default(),
             channel_id,
             provider.address(),
             token,
@@ -531,6 +610,7 @@ mod tests {
         );
         let err = prepare_close(
             &auth,
+            &CooperativeCloseAuthExt::default(),
             B256::repeat_byte(0xBB),
             provider.address(),
             token,
@@ -540,6 +620,170 @@ mod tests {
         )
         .expect_err("wrong-channel waiver must be refused");
         assert!(err.to_string().contains("wrong channel"), "{err}");
+    }
+
+    /// Build the echo a node attaches: `signer`'s voucher signature over
+    /// `(channel_id, amount, nonce, bytes, token)`. With `signer == the client`
+    /// and the tuple matching the auth's, this is the genuine #1495 echo.
+    fn echo(
+        signer: &PrivateKeySigner,
+        channel_id: B256,
+        token: Address,
+        amount: U256,
+        nonce: U256,
+        bytes_delivered: U256,
+    ) -> CooperativeCloseAuthExt {
+        let voucher = Voucher {
+            channel_id,
+            amount,
+            nonce,
+            bytes_delivered,
+            token,
+        }
+        .sign(signer, &domain())
+        .expect("voucher signs");
+        CooperativeCloseAuthExt {
+            last_signature: voucher.signature.as_bytes().to_vec(),
+        }
+    }
+
+    /// The #1495 reconcile: our persisted record lags what we actually signed, and
+    /// the provider proves the higher tuple with our own signature over it. We
+    /// settle at the provider's state instead of dead-ending with the deposit
+    /// stranded.
+    #[test]
+    fn reconciles_over_claim_proved_by_our_own_signature() {
+        let provider = PrivateKeySigner::random();
+        let client = PrivateKeySigner::random();
+        let channel_id = B256::repeat_byte(0xC1);
+        let token = Address::repeat_byte(0xC2);
+        let (amount, nonce, bytes) = (U256::from(600u64), U256::from(4u64), U256::from(9500u64));
+        let auth = provider_auth(&provider, channel_id, token, amount, nonce, bytes);
+        let ext = echo(&client, channel_id, token, amount, nonce, bytes);
+
+        let (prepared, reconciled) = prepare_close(
+            &auth,
+            &ext,
+            channel_id,
+            provider.address(),
+            token,
+            // Our record lags: we persisted only up to (500, 3, 9000).
+            watermark(500, 3, 9000),
+            &client,
+            &domain(),
+        )
+        .expect("a self-signed over-claim reconciles");
+
+        assert_eq!(prepared.amount, amount, "settles at the provider's state");
+        assert_eq!(
+            reconciled,
+            Some(AuthorizedWatermark {
+                amount,
+                nonce,
+                bytes_delivered: bytes,
+            }),
+            "the healed watermark is surfaced for the caller to persist"
+        );
+    }
+
+    /// An over-claim with a signature from someone else's key is exactly the
+    /// deposit-draining attack the guard exists to stop. Still refused.
+    #[test]
+    fn refuses_over_claim_signed_by_a_foreign_key() {
+        let provider = PrivateKeySigner::random();
+        let client = PrivateKeySigner::random();
+        let impostor = PrivateKeySigner::random();
+        let channel_id = B256::repeat_byte(0xD1);
+        let token = Address::repeat_byte(0xD2);
+        let (amount, nonce, bytes) = (U256::from(600u64), U256::from(4u64), U256::from(9500u64));
+        let auth = provider_auth(&provider, channel_id, token, amount, nonce, bytes);
+        // Signed by someone who is not us — proves nothing about what we owe.
+        let ext = echo(&impostor, channel_id, token, amount, nonce, bytes);
+
+        let err = prepare_close(
+            &auth,
+            &ext,
+            channel_id,
+            provider.address(),
+            token,
+            watermark(500, 3, 9000),
+            &client,
+            &domain(),
+        )
+        .expect_err("a foreign signature must not unlock the over-claim");
+        assert!(err.to_string().contains("over-claimed"), "{err}");
+    }
+
+    /// The echo must cover the tuple being settled, not merely be *some* voucher
+    /// we once signed — otherwise a provider could pair a low real signature with
+    /// an inflated declared tuple.
+    #[test]
+    fn refuses_over_claim_whose_echo_covers_a_different_tuple() {
+        let provider = PrivateKeySigner::random();
+        let client = PrivateKeySigner::random();
+        let channel_id = B256::repeat_byte(0xE1);
+        let token = Address::repeat_byte(0xE2);
+        // Declared: 600. Echoed signature: a genuine one of ours, but over 500.
+        let auth = provider_auth(
+            &provider,
+            channel_id,
+            token,
+            U256::from(600u64),
+            U256::from(4u64),
+            U256::from(9500u64),
+        );
+        let ext = echo(
+            &client,
+            channel_id,
+            token,
+            U256::from(500u64),
+            U256::from(3u64),
+            U256::from(9000u64),
+        );
+
+        let err = prepare_close(
+            &auth,
+            &ext,
+            channel_id,
+            provider.address(),
+            token,
+            watermark(500, 3, 9000),
+            &client,
+            &domain(),
+        )
+        .expect_err("an echo over a different tuple must not unlock the over-claim");
+        assert!(err.to_string().contains("over-claimed"), "{err}");
+    }
+
+    /// A node that predates the extension sends no echo. The client cannot
+    /// verify, so it keeps the pre-#1495 refusal — absence is never weaker.
+    #[test]
+    fn refuses_over_claim_when_the_node_sends_no_echo() {
+        let provider = PrivateKeySigner::random();
+        let client = PrivateKeySigner::random();
+        let channel_id = B256::repeat_byte(0xF1);
+        let token = Address::repeat_byte(0xF2);
+        let auth = provider_auth(
+            &provider,
+            channel_id,
+            token,
+            U256::from(600u64),
+            U256::from(4u64),
+            U256::from(9500u64),
+        );
+
+        let err = prepare_close(
+            &auth,
+            &CooperativeCloseAuthExt::default(),
+            channel_id,
+            provider.address(),
+            token,
+            watermark(500, 3, 9000),
+            &client,
+            &domain(),
+        )
+        .expect_err("no echo ⇒ the pre-#1495 refusal stands");
+        assert!(err.to_string().contains("over-claimed"), "{err}");
     }
 
     /// Recover the signer of a wire voucher signature over a tuple — test helper

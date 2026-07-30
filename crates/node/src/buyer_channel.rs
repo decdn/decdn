@@ -1609,10 +1609,14 @@ async fn reconcile_one<P: Provider + Clone>(
     )
     .await;
     match outcome {
-        Ok(CooperativeCloseOutcome::Settled) => {
+        Ok(CooperativeCloseOutcome::Settled { reconciled }) => {
             obs.remove(&st.channel_id);
             close_failures.remove(&st.channel_id);
             metrics.buyer_reconcile_settled();
+            // Our record lagged what we had actually signed and the provider
+            // proved it with our own signature (#1495) — persist the healed
+            // watermark before forgetting the row.
+            persist_reconciled(store, st.provider, st.channel_id, reconciled);
             if let Err(err) = store.forget_if_channel(st.provider, st.channel_id) {
                 warn!(
                     channel_id = %st.channel_id, %err,
@@ -1638,12 +1642,15 @@ async fn reconcile_one<P: Provider + Clone>(
                 "reconcile: provider declined cooperative close; backing off, leaving for expiry reclaim"
             );
         }
-        Ok(CooperativeCloseOutcome::Reverted) => {
+        Ok(CooperativeCloseOutcome::Reverted { reconciled }) => {
             // A revert is persistent until something on-chain changes (the
             // provider is reachable; a unilateral close would revert too). Back
             // off the idle tally (~24h); the expiry-reclaim sweep remains the net.
             obs.remove(&st.channel_id);
             close_failures.remove(&st.channel_id);
+            // Persist the healed watermark here too, so the eventual unilateral
+            // close submits the voucher we actually signed, not the stale one.
+            persist_reconciled(store, st.provider, st.channel_id, reconciled);
             warn!(
                 channel_id = %st.channel_id, provider = %st.provider,
                 "reconcile: cooperativeClose reverted on-chain; backing off, leaving for expiry reclaim"
@@ -1689,6 +1696,45 @@ async fn reconcile_one<P: Provider + Clone>(
                 }
             }
         }
+    }
+}
+
+/// Persist a watermark the cooperative close reconciled against the provider's
+/// echo of our own voucher signature (#1495).
+///
+/// Best-effort: the settlement already stands on-chain, so a failure here costs a
+/// stale local record, not money. `AdvanceOutcome` is `#[must_use]` because a
+/// dropped `UnknownChannel`/`ChannelMismatch` looks like success, so every
+/// variant is logged rather than discarded.
+fn persist_reconciled(
+    store: &Arc<dyn BuyerChannelStore>,
+    provider: Address,
+    channel_id: ChannelId,
+    reconciled: Option<AuthorizedWatermark>,
+) {
+    let Some(healed) = reconciled else { return };
+    match store.advance_progress(
+        provider,
+        channel_id,
+        healed.nonce,
+        healed.bytes_delivered,
+        healed.amount,
+    ) {
+        Ok(AdvanceOutcome::Advanced) => {
+            debug!(
+                %channel_id, %provider, amount = %healed.amount, nonce = %healed.nonce,
+                "reconcile: local watermark lagged; healed from the provider's echo of our own \
+                 voucher signature"
+            );
+        }
+        Ok(outcome) => warn!(
+            %channel_id, %provider, ?outcome,
+            "reconcile: settled at the provider's watermark but the local record was not advanced"
+        ),
+        Err(err) => warn!(
+            %channel_id, %provider, %err,
+            "reconcile: settled at the provider's watermark but persisting it locally failed"
+        ),
     }
 }
 

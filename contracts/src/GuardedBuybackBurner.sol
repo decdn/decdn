@@ -47,6 +47,15 @@ abstract contract GuardedBuybackBurner is BuybackBurner {
     uint256 internal constant CAP_FRACTION_FLOOR = 100; // 1%
     uint256 internal constant CAP_FRACTION_CEILING = 3000; // 30%
 
+    /// @notice Ceiling on `slippageBps` so the TWAP floor cannot be configured
+    ///         toothless. `_twapFloor` scales by `(BPS_DENOMINATOR - slippageBps)`,
+    ///         so a tolerance near `BPS_DENOMINATOR` collapses the floor toward
+    ///         zero and disables the whole MEV stack with no revert and no event —
+    ///         the same fail-open shape `_twapFloor` already rejects for the swap
+    ///         fee. ADR 018 sets the tolerance at 200 bps; 10% leaves ample room
+    ///         for genuine volatility while keeping the guard a guard.
+    uint256 internal constant SLIPPAGE_CEILING = 1000; // 10%
+
     /// @notice Floor on the constructor `twapMinWindow` so the fail-closed TWAP
     ///         maturity guard cannot be configured toothless (a near-zero window
     ///         would let the floor activate over a one-block span, collapsing the
@@ -129,6 +138,7 @@ abstract contract GuardedBuybackBurner is BuybackBurner {
     error CapFractionOutOfBounds(uint256 value, uint256 floor, uint256 ceiling);
     error TwapWindowTooShort(uint256 value, uint256 floor);
     error BuybackBandInverted(uint256 minAmount, uint256 maxAmount);
+    error BuybackBandDead();
     error UnsupportedTokenDecimals(uint8 decimals);
     error SwapFeeInvalid(uint256 feeE18);
 
@@ -138,9 +148,10 @@ abstract contract GuardedBuybackBurner is BuybackBurner {
 
     /// @param twapMinWindow_ Minimum matured TWAP span before the floor is
     ///        trusted; `>= MIN_TWAP_WINDOW`.
-    /// @param maxBuybackAmount_ Upper bound of the per-call USDC band.
+    /// @param maxBuybackAmount_ Upper bound of the per-call USDC band; non-zero
+    ///        (a zero ceiling reverts every non-zero buyback, forever).
     /// @param minBuybackAmount_ Lower bound of the per-call USDC band; `<= max`.
-    /// @param slippageBps_ TWAP-floor slippage tolerance; `< 100%`.
+    /// @param slippageBps_ TWAP-floor slippage tolerance; `<= 10%`.
     /// @param epochLiquidityCapFraction_ Per-epoch cap fraction; `[1%, 30%]`.
     struct GuardParams {
         uint256 twapMinWindow_;
@@ -153,11 +164,12 @@ abstract contract GuardedBuybackBurner is BuybackBurner {
     constructor(IERC20 usdc_, ERC20Burnable token_, address admin, GuardParams memory g)
         BuybackBurner(usdc_, token_, admin)
     {
-        if (g.slippageBps_ >= BPS_DENOMINATOR) revert SlippageOutOfBounds(g.slippageBps_, BPS_DENOMINATOR);
+        if (g.slippageBps_ > SLIPPAGE_CEILING) revert SlippageOutOfBounds(g.slippageBps_, SLIPPAGE_CEILING);
         if (g.epochLiquidityCapFraction_ < CAP_FRACTION_FLOOR || g.epochLiquidityCapFraction_ > CAP_FRACTION_CEILING) {
             revert CapFractionOutOfBounds(g.epochLiquidityCapFraction_, CAP_FRACTION_FLOOR, CAP_FRACTION_CEILING);
         }
         if (g.twapMinWindow_ < MIN_TWAP_WINDOW) revert TwapWindowTooShort(g.twapMinWindow_, MIN_TWAP_WINDOW);
+        if (g.maxBuybackAmount_ == 0) revert BuybackBandDead();
         if (g.minBuybackAmount_ > g.maxBuybackAmount_) {
             revert BuybackBandInverted(g.minBuybackAmount_, g.maxBuybackAmount_);
         }
@@ -234,7 +246,7 @@ abstract contract GuardedBuybackBurner is BuybackBurner {
     }
 
     function setSlippageTolerance(uint256 newBps) external onlyRole(GOVERNANCE_ROLE) {
-        if (newBps >= BPS_DENOMINATOR) revert SlippageOutOfBounds(newBps, BPS_DENOMINATOR);
+        if (newBps > SLIPPAGE_CEILING) revert SlippageOutOfBounds(newBps, SLIPPAGE_CEILING);
         uint256 old = slippageBps;
         slippageBps = newBps;
         emit SlippageUpdated(old, newBps);
@@ -248,6 +260,11 @@ abstract contract GuardedBuybackBurner is BuybackBurner {
     }
 
     function setMaxBuybackAmount(uint256 newAmount) external onlyRole(GOVERNANCE_ROLE) {
+        // A zero ceiling is not an inverted band when the floor is also zero, so
+        // `BuybackBandInverted` below would pass it. Reject it here: governance
+        // could otherwise walk the band to `0/0` in two calls and wedge the
+        // burner permanently, holding the FeeRouter's buyback bucket unspendable.
+        if (newAmount == 0) revert BuybackBandDead();
         if (newAmount < minBuybackAmount) revert BuybackBandInverted(minBuybackAmount, newAmount);
         uint256 old = maxBuybackAmount;
         maxBuybackAmount = newAmount;

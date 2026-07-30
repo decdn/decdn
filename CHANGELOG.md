@@ -424,6 +424,51 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+#### Payments
+
+- **A cooperative close now reconciles when the client's watermark lags the
+  node's, instead of stranding the channel (#1495).** `decdn channel coop-close`
+  refuses any provider tuple above what the client persisted — correctly, since
+  without that guard a provider could ask the client to sign away up to the full
+  deposit. But the guard had no reconciliation branch, so a client that signed
+  vouchers it did not durably persist before an unclean exit could never settle,
+  and its deposit stayed locked until expiry. The node now echoes the client's
+  **own** last-accepted voucher signature alongside the waiver, and the client
+  settles at the node's state only when that signature recovers to its own
+  voucher-signing key over exactly the tuple being settled. Anything else keeps
+  the refusal. This is the same self-heal primitive the fetch path already uses
+  (`WatermarkBundle.last_signature`, #1481), and it strengthens rather than
+  relaxes the check: only the client could have produced the signature.
+  - **Not wire-breaking.** The echo rides as a `CooperativeCloseAuthExt` trailing
+    extension (the two-phase pattern `StreamRequest`/`StreamRequestExt` uses), so
+    `CooperativeCloseAuth` itself is unchanged on the wire and mixed-version peers
+    interoperate in both directions. An old client ignores the trailing bytes and
+    a new client against an old node reads no echo; both keep the pre-existing
+    refusal. No ALPN bump, and operators can hot-upgrade across it.
+  - Node-side `CooperativeCloseOutcome::Settled`/`Reverted` now carry the healed
+    watermark so the buyer store is advanced before the channel row is dropped,
+    and so a `closeChannel` fallback submits the voucher actually signed.
+
+#### Contracts
+
+- **`GuardedBuybackBurner` no longer accepts a slippage tolerance that disables
+  the MEV defense, or a buyback band that can never execute (#1532).**
+  `slippageBps` was rejected only at `>= 100%`, so a value like 9999 scaled the
+  TWAP floor to 0.01% of fair value — the entire ADR 018 MEV stack off, with no
+  revert, no event, and a green deploy. It is now bounded at
+  `SLIPPAGE_CEILING = 1000` (10%, against a 200 bps default) at both the
+  constructor and `setSlippageTolerance`, mirroring the `[1%, 30%]` bound the
+  neighbouring `epochLiquidityCapFraction` already carried at both sites.
+  Separately, `maxBuybackAmount == 0` constructed cleanly and then reverted
+  `AboveMaxBuyback` on every call forever — a burner accruing the FeeRouter's
+  buyback bucket with no way to spend it — and governance could walk the band to
+  `0/0` in two calls, since a zero ceiling is not an *inverted* band once the
+  floor is also zero. Both entry points now revert `BuybackBandDead`. The
+  deploy-time fail-fast `BuybackVenueLib.GuardBandDead` is retained so a mis-set
+  env var still surfaces before the deploy transaction is broadcast. Both bounds
+  are stated in the ADR 018 parameter table; the shipped defaults satisfy them,
+  so no deployment path changes.
+
 #### Cache
 
 - **A poisoned coalescing mutex no longer silently costs origin egress and USDC
