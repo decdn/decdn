@@ -4,6 +4,8 @@ pragma solidity 0.8.28;
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 import { BaseProtocolDeploy } from "./BaseProtocolDeploy.s.sol";
+import { BuybackVenueLib } from "./lib/BuybackVenueLib.sol";
+import { GuardedBuybackBurner } from "../src/GuardedBuybackBurner.sol";
 import { Ed25519Verifier } from "../src/Ed25519Verifier.sol";
 
 /// @title DeployProtocol — production v3 contract surface deployer (issue #694)
@@ -63,6 +65,18 @@ import { Ed25519Verifier } from "../src/Ed25519Verifier.sol";
 ///         than a tunable that could only ever be 7 days.
 ///
 ///         Optional env vars (defaults from ADR 026 / ADR 028 / ADR 009 / 036):
+///           - `BOOTSTRAP_MULTISIG`         (default unset = DAO governance live at
+///                                            deploy). Set it to the 5-of-9 bootstrap
+///                                            multisig to launch into the ADR 009
+///                                            § Bootstrap-multisig phase instead: the
+///                                            multisig becomes the Timelock's sole
+///                                            PROPOSER/CANCELLER and `DecdnGovernor`
+///                                            gets neither, so every change still
+///                                            carries the 48h delay but only the
+///                                            multisig can schedule one. The phase
+///                                            ends when the multisig schedules the
+///                                            `TransitionToGovernor` batch — manual,
+///                                            no threshold automation.
 ///           - `TIMELOCK_DELAY`             (default 48h; floor MIN_TIMELOCK_DELAY)
 ///           - `MIN_BOND`                   (default 50_000e18)
 ///           - `UNBONDING_PERIOD`           (default 14 days)
@@ -165,6 +179,11 @@ contract DeployProtocol is BaseProtocolDeploy {
         if (cfg.timelockDelay < MIN_TIMELOCK_DELAY) {
             revert TimelockDelayTooShort(cfg.timelockDelay, MIN_TIMELOCK_DELAY);
         }
+        // ADR 009 § Bootstrap-multisig phase. Unset (the default) = DAO governance
+        // live at deploy. Set = seat this multisig as the Timelock's sole proposer
+        // and withhold the role from `DecdnGovernor` until the transition batch runs
+        // (see `script/TransitionToGovernor.s.sol`, issue #1175).
+        cfg.bootstrapMultisig = vm.envOr("BOOTSTRAP_MULTISIG", address(0));
         cfg.minBond = vm.envOr("MIN_BOND", DEFAULT_MIN_BOND);
         cfg.unbondingPeriod = vm.envOr("UNBONDING_PERIOD", DEFAULT_UNBONDING_PERIOD);
         cfg.multiaddrUpdateCooldown = vm.envOr("MULTIADDR_UPDATE_COOLDOWN", DEFAULT_MULTIADDR_UPDATE_COOLDOWN);
@@ -225,59 +244,57 @@ contract DeployProtocol is BaseProtocolDeploy {
     //     - `BALANCER_SWAP_FEE`          (default 1e16 = 1%)
     //     - `SUB_SWAP_COUNT`             (default 4)
     //     - `SUB_SWAP_MIN_BLOCK_GAP`     (default 10)
-    error UnknownBuybackVenue(string venue);
     error PoolFeeOutOfRange(uint256 fee);
-
-    /// @dev Canonical Uniswap Permit2 (same CREATE2 address on every chain).
-    address internal constant CANONICAL_PERMIT2 = 0x000000000022D473030F116dDEE9F6B43aC78BA3;
 
     function _readBuybackActivation() internal view returns (BuybackActivation memory act) {
         act.activate = vm.envOr("ACTIVATE_BUYBACK", false);
         if (!act.activate) return act; // all-off; every other field is ignored.
 
-        act.venue = _readVenue();
+        act.venue = BuybackVenueLib.parseVenue(vm.envOr("BUYBACK_VENUE", string("uniswap")));
         act.keeper = vm.envAddress("BUYBACK_KEEPER"); // required — enforced in _activateBuyback too
-        act.twapMinWindow = vm.envOr("TWAP_MIN_WINDOW_SECS", uint256(1800));
-        act.maxBuybackAmount = vm.envOr("MAX_BUYBACK_AMOUNT", uint256(10_000e6));
-        act.minBuybackAmount = vm.envOr("MIN_BUYBACK_AMOUNT", uint256(100e6));
-        act.slippageBps = vm.envOr("SLIPPAGE_BPS", uint256(200));
-        act.epochLiquidityCapFraction = vm.envOr("EPOCH_CAP_FRACTION_BPS", uint256(1000));
+        act.guard = GuardedBuybackBurner.GuardParams({
+            twapMinWindow_: vm.envOr("TWAP_MIN_WINDOW_SECS", uint256(1800)),
+            maxBuybackAmount_: vm.envOr("MAX_BUYBACK_AMOUNT", uint256(10_000e6)),
+            minBuybackAmount_: vm.envOr("MIN_BUYBACK_AMOUNT", uint256(100e6)),
+            slippageBps_: vm.envOr("SLIPPAGE_BPS", uint256(200)),
+            epochLiquidityCapFraction_: vm.envOr("EPOCH_CAP_FRACTION_BPS", uint256(1000))
+        });
 
         // Pool seed: pick a USDC amount you actually hold and a target TOKEN price;
         // the paired TOKEN seed is derived so the pool initializes at that price
         // (no need to hand-compute the ratio, and it differs per venue's weights).
         // `BUYBACK_TARGET_PRICE` is the price of one whole TOKEN in USDC base units
         // (6-dec USDC → `$0.01/TOKEN` is `10_000`).
-        act.usdcSeed = vm.envOr("BUYBACK_USDC_SEED", uint256(100e6));
+        uint256 usdcSeed = vm.envOr("BUYBACK_USDC_SEED", uint256(100e6));
         uint256 targetPrice = vm.envOr("BUYBACK_TARGET_PRICE", uint256(10_000)); // $0.01/TOKEN
-        act.tokenSeed = _deriveTokenSeed(act.venue, act.usdcSeed, targetPrice);
+        // Built through the derivation helper so the seed records the venue it was
+        // sized for; pairing it with the other venue mis-anchors the pool silently.
+        act.seed = _derivePoolSeed(act.venue, usdcSeed, targetPrice);
 
-        if (act.venue == BuybackVenue.UNISWAP) {
-            act.uniSwapRouter = vm.envAddress("UNISWAP_SWAP_ROUTER");
-            act.uniPositionManager = vm.envAddress("UNISWAP_POSITION_MANAGER");
+        // Exactly one venue sub-struct is populated; the other stays zero, which is
+        // what `_assertVenueFieldsScoped` enforces before the burner is deployed.
+        if (act.venue == BuybackVenueLib.Venue.UNISWAP) {
+            act.uni.swapRouter = vm.envAddress("UNISWAP_SWAP_ROUTER");
+            act.uni.positionManager = vm.envAddress("UNISWAP_POSITION_MANAGER");
             // Validate the fee against the supported Uniswap V3 tiers here, before
             // `vm.startBroadcast`, so an unsupported tier aborts with no gas spent
             // rather than reverting `UnsupportedFeeTier` mid-deploy.
             uint256 fee = vm.envOr("UNISWAP_POOL_FEE", uint256(10_000));
             if (fee != 100 && fee != 500 && fee != 3000 && fee != 10_000) revert PoolFeeOutOfRange(fee);
-            act.uniPoolFee = uint24(fee);
+            act.uni.poolFee = uint24(fee);
         } else {
-            act.balFactory = vm.envAddress("BALANCER_WEIGHTED_POOL_FACTORY");
-            act.balRouter = vm.envAddress("BALANCER_ROUTER");
-            act.balVault = vm.envAddress("BALANCER_VAULT");
-            act.permit2 = vm.envOr("PERMIT2_ADDRESS", CANONICAL_PERMIT2);
-            act.balSwapFee = vm.envOr("BALANCER_SWAP_FEE", uint256(1e16)); // 1% (ADR 018 pool fee)
-            act.balSubSwapCount = vm.envOr("SUB_SWAP_COUNT", uint256(4));
-            act.balSubSwapMinBlockGap = vm.envOr("SUB_SWAP_MIN_BLOCK_GAP", uint256(10));
+            act.bal.factory = vm.envAddress("BALANCER_WEIGHTED_POOL_FACTORY");
+            act.bal.swapFee = vm.envOr("BALANCER_SWAP_FEE", uint256(1e16)); // 1% (ADR 018 pool fee)
+            // `pool` stays zero: it does not exist until `_activateBalancer` creates it.
+            act.bal.wiring = BuybackVenueLib.BalancerWiring({
+                swapRouter: vm.envAddress("BALANCER_ROUTER"),
+                pool: address(0),
+                vault: vm.envAddress("BALANCER_VAULT"),
+                permit2: vm.envOr("PERMIT2_ADDRESS", BuybackVenueLib.CANONICAL_PERMIT2),
+                subSwapCount: vm.envOr("SUB_SWAP_COUNT", uint256(4)),
+                subSwapMinBlockGap: vm.envOr("SUB_SWAP_MIN_BLOCK_GAP", uint256(10))
+            });
         }
-    }
-
-    function _readVenue() internal view returns (BuybackVenue) {
-        string memory v = vm.envOr("BUYBACK_VENUE", string("uniswap"));
-        bytes32 h = keccak256(bytes(v));
-        if (h == keccak256("uniswap")) return BuybackVenue.UNISWAP;
-        if (h == keccak256("balancer")) return BuybackVenue.BALANCER;
-        revert UnknownBuybackVenue(v);
     }
 
     // -----------------------------------------------------------------
@@ -337,6 +354,10 @@ contract DeployProtocol is BaseProtocolDeploy {
         // external dependency. The Ed25519Verifier is likewise under `contracts`
         // (this script deploys it — issue #669), not here.
         string memory deps = "externalDeps";
+        // `address(0)` on a direct-to-Timelock deploy; otherwise the ADR 009
+        // bootstrap multisig holding the Timelock's PROPOSER_ROLE/CANCELLER_ROLE
+        // until it transitions. It never holds GOVERNANCE_ROLE on the targets.
+        vm.serializeAddress(deps, "bootstrapMultisig", cfg.bootstrapMultisig);
         vm.serializeAddress(deps, "emergencyMultisig", cfg.emergencyMultisig);
         string memory depsJson = vm.serializeAddress(deps, "usdc", address(cfg.usdc));
 

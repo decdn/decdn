@@ -6,6 +6,8 @@ import { ERC20 } from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 import { BaseProtocolDeploy } from "../script/BaseProtocolDeploy.s.sol";
+import { BuybackVenueLib } from "../script/lib/BuybackVenueLib.sol";
+import { GuardedBuybackBurner } from "../src/GuardedBuybackBurner.sol";
 import { INonfungiblePositionManager } from "../script/interfaces/IUniswapV3PoolCreation.sol";
 import { BuybackBurnerUniswapV3 } from "../src/BuybackBurnerUniswapV3.sol";
 import { MockEd25519Verifier } from "./mocks/MockEd25519Verifier.sol";
@@ -16,6 +18,9 @@ import { MockEd25519Verifier } from "./mocks/MockEd25519Verifier.sol";
 // The live-Uniswap acceptance path is covered by the gated Arbitrum Sepolia fork
 // test `GenesisBuybackActivation.fork.t.sol`.
 // -----------------------------------------------------------------
+
+/// @dev Bootstrap multisig stand-in — `_deployGovernor` requires code.
+contract MockGenesisMultisig { }
 
 contract MockUSDC is ERC20 {
     constructor() ERC20("USDC", "USDC") { }
@@ -141,6 +146,8 @@ contract GenesisBuybackActivationTest is Test, BaseProtocolDeploy {
             emergencyMultisig: emergencyMultisig,
             initialTokenHolder: address(this),
             timelockDelay: 48 hours,
+            // Direct-to-Timelock handoff; the ADR 009 bootstrap phase is opt-in.
+            bootstrapMultisig: address(0),
             minBond: 50_000e18,
             unbondingPeriod: 14 days,
             multiaddrUpdateCooldown: 0,
@@ -157,18 +164,17 @@ contract GenesisBuybackActivationTest is Test, BaseProtocolDeploy {
 
     function _uniswapActivation(address positionManager) internal view returns (BuybackActivation memory act) {
         act.activate = true;
-        act.venue = BuybackVenue.UNISWAP;
+        act.venue = BuybackVenueLib.Venue.UNISWAP;
         act.keeper = keeper;
-        act.twapMinWindow = 1800;
-        act.maxBuybackAmount = 10_000e6;
-        act.minBuybackAmount = 100e6;
-        act.slippageBps = 200;
-        act.epochLiquidityCapFraction = 1000;
-        act.uniSwapRouter = swapRouter;
-        act.uniPositionManager = positionManager;
-        act.uniPoolFee = 10_000;
-        act.usdcSeed = USDC_SEED;
-        act.tokenSeed = _deriveTokenSeed(BuybackVenue.UNISWAP, USDC_SEED, TARGET_PRICE);
+        act.guard = GuardedBuybackBurner.GuardParams({
+            twapMinWindow_: 1800,
+            maxBuybackAmount_: 10_000e6,
+            minBuybackAmount_: 100e6,
+            slippageBps_: 200,
+            epochLiquidityCapFraction_: 1000
+        });
+        act.uni = UniswapVenueParams({ swapRouter: swapRouter, positionManager: positionManager, poolFee: 10_000 });
+        act.seed = _derivePoolSeed(BuybackVenueLib.Venue.UNISWAP, USDC_SEED, TARGET_PRICE);
     }
 
     // External wrapper so `vm.expectRevert` catches reverts at the call boundary.
@@ -220,6 +226,21 @@ contract GenesisBuybackActivationTest is Test, BaseProtocolDeploy {
         assertEq(d.router.buybackBurner(), address(d.buybackBurner), "burner wired into router");
         assertEq(d.router.treasury(), address(d.timelock), "treasury is timelock");
 
+        // Every guard-band field, read back off the deployed burner. The band crosses
+        // three hand-written mappings on its way here (activation struct ->
+        // `GuardedBuybackBurner.GuardParams` -> each venue's `Config`), and most
+        // transpositions do NOT self-detect: swapping `slippageBps` with
+        // `epochLiquidityCapFraction` yields 1000 and 200, both inside their
+        // respective bounds, and ships a 10% slippage tolerance in place of 2% — the
+        // MEV exposure ADR 018's parameter table exists to bound. The values in
+        // `_uniswapActivation` are deliberately distinct and outside each other's
+        // valid ranges so a swap cannot be absorbed.
+        assertEq(d.buybackBurner.twapMinWindow(), 1800, "twapMinWindow");
+        assertEq(d.buybackBurner.maxBuybackAmount(), 10_000e6, "maxBuybackAmount");
+        assertEq(d.buybackBurner.minBuybackAmount(), 100e6, "minBuybackAmount");
+        assertEq(d.buybackBurner.slippageBps(), 200, "slippageBps");
+        assertEq(d.buybackBurner.epochLiquidityCapFraction(), 1000, "epochLiquidityCapFraction");
+
         // Keeper + pauser wired on the burner.
         assertTrue(d.buybackBurner.hasRole(d.buybackBurner.KEEPER_ROLE(), keeper), "keeper role");
         assertTrue(d.buybackBurner.hasRole(d.buybackBurner.PAUSER_ROLE(), emergencyMultisig), "pauser role to multisig");
@@ -255,6 +276,34 @@ contract GenesisBuybackActivationTest is Test, BaseProtocolDeploy {
         this.externalRunFullDeploy(_config(), act);
     }
 
+    /// @notice Venue-scoped sub-structs plus this guard replace the old flat
+    ///         `BuybackActivation` (issue #1090). Wiring a Balancer field under
+    ///         `venue == UNISWAP` used to be silently dropped — the caller could
+    ///         believe it had pointed at a Balancer pool and ship a Uniswap burner.
+    function test_revertsWhenBalancerFieldsSetUnderUniswapVenue() public {
+        BuybackActivation memory act = _uniswapActivation(address(0xdead));
+        act.bal.wiring.vault = address(0xBA1);
+        vm.expectRevert(
+            abi.encodeWithSelector(BaseProtocolDeploy.VenueFieldsCrossWired.selector, BuybackVenueLib.Venue.UNISWAP)
+        );
+        this.externalRunFullDeploy(_config(), act);
+    }
+
+    /// @notice The mirror direction. Fires before any venue-specific work, so the
+    ///         zero `bal.factory` that would otherwise revert deeper never matters.
+    function test_revertsWhenUniswapFieldsSetUnderBalancerVenue() public {
+        BuybackActivation memory act = _uniswapActivation(address(0xdead));
+        act.venue = BuybackVenueLib.Venue.BALANCER;
+        // `act.uni` is still populated from the Uniswap helper — the cross-wiring.
+        vm.expectRevert(
+            abi.encodeWithSelector(BaseProtocolDeploy.VenueFieldsCrossWired.selector, BuybackVenueLib.Venue.BALANCER)
+        );
+        this.externalRunFullDeploy(_config(), act);
+    }
+
+    /// @notice Doubles as proof that `_assertVenueFieldsScoped` is venue-scoped
+    ///         rather than blanket: a correctly-wired Uniswap activation runs THROUGH
+    ///         both halves of the guard and only fails later, here.
     function test_revertsWhenPoolNotSeeded() public {
         // A manager that creates the pool but seeds no liquidity must fail the
         // "seed before wire" guard.
@@ -285,36 +334,159 @@ contract GenesisBuybackActivationTest is Test, BaseProtocolDeploy {
     // before any venue-specific work, so it covers the Balancer path too.
 
     // -----------------------------------------------------------------
+    // Bootstrap phase x genesis activation (ADR 009 + ADR 018)
+    // -----------------------------------------------------------------
+
+    /// @notice `BOOTSTRAP_MULTISIG` and `ACTIVATE_BUYBACK` are independent env vars,
+    ///         and this combination is the configuration the Arbitrum Sepolia deploy
+    ///         (#1083) actually takes: bootstrap multisig + Uniswap genesis venue.
+    ///         Neither suite constructed it before — `DeployProtocolTest` always
+    ///         deploys activation-off and this file always deploys bootstrap-off — so
+    ///         the combination a real launch uses had no coverage. (The nine-target
+    ///         handoff itself is not new here: any activation-on deploy exercises it,
+    ///         including `test_uniswap_burnerHandedToTimelock_noDeployerBackDoor`.)
+    function test_bootstrap_withGenesisActivation_handsBurnerOffAndKeepsMultisigProposer() public {
+        MockPositionManager npm = new MockPositionManager(true);
+        usdc.approve(address(npm), type(uint256).max);
+
+        DeployConfig memory bootCfg = _config();
+        bootCfg.bootstrapMultisig = address(new MockGenesisMultisig());
+        Deployment memory bd = _runFullDeploy(bootCfg, _uniswapActivation(address(npm)));
+
+        // The burner is the ninth governed target: it must land on the Timelock with
+        // the rest, not be skipped because the handoff sized its array off a literal.
+        assertTrue(address(bd.buybackBurner) != address(0), "burner deployed");
+        assertTrue(bd.buybackBurner.hasRole(GOVERNANCE_ROLE, address(bd.timelock)), "burner gov to timelock");
+        assertTrue(bd.buybackBurner.hasRole(DEFAULT_ADMIN_ROLE, address(bd.timelock)), "burner admin to timelock");
+        assertFalse(bd.buybackBurner.hasRole(GOVERNANCE_ROLE, address(this)), "no deployer back door on burner");
+
+        // And the bootstrap phase still holds: only the multisig may schedule.
+        bytes32 proposerRole = bd.timelock.PROPOSER_ROLE();
+        assertTrue(bd.timelock.hasRole(proposerRole, bootCfg.bootstrapMultisig), "multisig proposes");
+        assertFalse(bd.timelock.hasRole(proposerRole, address(bd.governor)), "governor cannot propose yet");
+    }
+
+    // -----------------------------------------------------------------
+    // Venue/seed scoping guards
+    // -----------------------------------------------------------------
+
+    /// @dev A Balancer activation wired well enough to clear the cross-wire half,
+    ///      so the under-wire and seed guards are what a test actually exercises.
+    ///      Needs no live contracts: every guard it targets runs inside
+    ///      `_assertVenueFieldsScoped` / `_assertVenueSeedMatches`, the first two
+    ///      statements of `_activateBuyback`, before any external call.
+    function _balancerActivation() internal view returns (BuybackActivation memory act) {
+        act.activate = true;
+        act.venue = BuybackVenueLib.Venue.BALANCER;
+        act.keeper = keeper;
+        act.guard = GuardedBuybackBurner.GuardParams({
+            twapMinWindow_: 1800,
+            maxBuybackAmount_: 10_000e6,
+            minBuybackAmount_: 100e6,
+            slippageBps_: 200,
+            epochLiquidityCapFraction_: 1000
+        });
+        act.bal = BalancerVenueParams({
+            factory: address(0xFAC),
+            swapFee: 1e16,
+            wiring: BuybackVenueLib.BalancerWiring({
+                swapRouter: address(0x8081),
+                pool: address(0), // created by `_activateBalancer`; prefilling is rejected
+                vault: address(0xA017),
+                permit2: BuybackVenueLib.CANONICAL_PERMIT2,
+                subSwapCount: 4,
+                subSwapMinBlockGap: 10
+            })
+        });
+        act.seed = _derivePoolSeed(BuybackVenueLib.Venue.BALANCER, USDC_SEED, TARGET_PRICE);
+    }
+
+    /// @notice The pool-creation inputs, which the deploy script still owns because
+    ///         the library never sees them.
+    function test_revertsWhenBalancerFactoryIsUnwired() public {
+        BuybackActivation memory act = _balancerActivation();
+        act.bal.factory = address(0);
+        vm.expectRevert(
+            abi.encodeWithSelector(BaseProtocolDeploy.VenueFieldsUnwired.selector, BuybackVenueLib.Venue.BALANCER)
+        );
+        this.externalRunFullDeploy(_config(), act);
+    }
+
+    /// @notice `_activateBalancer` overwrites `wiring.pool` with the pool it creates,
+    ///         so a caller-supplied value would be silently discarded and a second
+    ///         pool created and seeded with real protocol-owned liquidity. The natural
+    ///         mistake: `ActivateBuyback` reads `BALANCER_POOL` from env because it
+    ///         wires a live pool instead of creating one.
+    function test_revertsWhenBalancerPoolIsPrefilled() public {
+        BuybackActivation memory act = _balancerActivation();
+        act.bal.wiring.pool = address(0xB001);
+        vm.expectRevert(abi.encodeWithSelector(BaseProtocolDeploy.PoolPrefilled.selector, address(0xB001)));
+        this.externalRunFullDeploy(_config(), act);
+    }
+
+    /// @notice A guard band of `min == max == 0` passes every bound
+    ///         `GuardedBuybackBurner`'s constructor checks (it rejects `min > max`,
+    ///         not a zero band) and then reverts `AboveMaxBuyback` on every call
+    ///         forever. Reachable from production env as
+    ///         `MIN_BUYBACK_AMOUNT=0 MAX_BUYBACK_AMOUNT=0`.
+    function test_revertsWhenGuardBandIsDead() public {
+        MockPositionManager npm = new MockPositionManager(true);
+        usdc.approve(address(npm), type(uint256).max);
+        BuybackActivation memory act = _uniswapActivation(address(npm));
+        act.guard.minBuybackAmount_ = 0;
+        act.guard.maxBuybackAmount_ = 0;
+        vm.expectRevert(BuybackVenueLib.GuardBandDead.selector);
+        this.externalRunFullDeploy(_config(), act);
+    }
+
+    /// @notice A seed sized for one venue paired with the other. `_deriveTokenSeed`
+    ///         weights the TOKEN leg 80/20 for Balancer and 1:1 for Uniswap, so this
+    ///         would initialize the genesis pool at 4x or 1/4 the intended anchor —
+    ///         silently, with no revert anywhere downstream.
+    function test_revertsWhenSeedWasDerivedForTheOtherVenue() public {
+        BuybackActivation memory act = _uniswapActivation(address(0xdead));
+        act.seed = _derivePoolSeed(BuybackVenueLib.Venue.BALANCER, USDC_SEED, TARGET_PRICE);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                BaseProtocolDeploy.PoolSeedVenueMismatch.selector,
+                BuybackVenueLib.Venue.UNISWAP,
+                BuybackVenueLib.Venue.BALANCER
+            )
+        );
+        this.externalRunFullDeploy(_config(), act);
+    }
+
+    // -----------------------------------------------------------------
     // _deriveTokenSeed — price-driven TOKEN seed sizing
     // -----------------------------------------------------------------
 
     function test_deriveTokenSeed_uniswapAnchor() public pure {
         // 10k USDC at $0.01/TOKEN -> 1M TOKEN (50/50 value split).
-        assertEq(_deriveTokenSeed(BuybackVenue.UNISWAP, 10_000e6, 10_000), 1_000_000e18);
+        assertEq(_deriveTokenSeed(BuybackVenueLib.Venue.UNISWAP, 10_000e6, 10_000), 1_000_000e18);
     }
 
     function test_deriveTokenSeed_balancerAnchor() public pure {
         // 250k USDC at $0.01/TOKEN, 80/20 -> 100M TOKEN (TOKEN side is 4x by value).
-        assertEq(_deriveTokenSeed(BuybackVenue.BALANCER, 250_000e6, 10_000), 100_000_000e18);
+        assertEq(_deriveTokenSeed(BuybackVenueLib.Venue.BALANCER, 250_000e6, 10_000), 100_000_000e18);
     }
 
     function test_deriveTokenSeed_scalesInverselyWithPrice() public pure {
         // At $0.02/TOKEN the same USDC buys half the TOKEN.
-        assertEq(_deriveTokenSeed(BuybackVenue.UNISWAP, 10_000e6, 20_000), 500_000e18);
+        assertEq(_deriveTokenSeed(BuybackVenueLib.Venue.UNISWAP, 10_000e6, 20_000), 500_000e18);
     }
 
     function test_deriveTokenSeed_smallSeed() public pure {
         // The point of the price knob: 100 USDC at $0.01 seeds 10k TOKEN, no
         // hand-computed ratio and no large USDC balance required.
-        assertEq(_deriveTokenSeed(BuybackVenue.UNISWAP, 100e6, 10_000), 10_000e18);
+        assertEq(_deriveTokenSeed(BuybackVenueLib.Venue.UNISWAP, 100e6, 10_000), 10_000e18);
     }
 
     function test_deriveTokenSeed_revertsOnZeroPrice() public {
         vm.expectRevert(BaseProtocolDeploy.TargetPriceZero.selector);
-        this.externalDeriveTokenSeed(BuybackVenue.UNISWAP, 100e6, 0);
+        this.externalDeriveTokenSeed(BuybackVenueLib.Venue.UNISWAP, 100e6, 0);
     }
 
-    function externalDeriveTokenSeed(BuybackVenue venue, uint256 usdcSeed, uint256 targetPrice)
+    function externalDeriveTokenSeed(BuybackVenueLib.Venue venue, uint256 usdcSeed, uint256 targetPrice)
         external
         pure
         returns (uint256)

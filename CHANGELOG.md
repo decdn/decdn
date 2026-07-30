@@ -23,6 +23,31 @@ since project inception and will roll into the first tagged release.
 
 ### Changed (BREAKING)
 
+- **Deploy-script-breaking: `DeployConfig` and `BuybackActivation` changed shape
+  (#1090, #1175).** Both are `BaseProtocolDeploy` structs, so only out-of-tree
+  callers that construct them by hand are affected — no contract ABI, config
+  file, or CLI surface changes, and a `DeployProtocol` run with an unchanged
+  environment produces the same deploy it did before. The written manifest does
+  change shape: `deployments/<chainId>.json` gains an `externalDeps.bootstrapMultisig`
+  key, which matters to anything parsing it.
+  - `DeployConfig` gains `bootstrapMultisig` (read from the new optional
+    `BOOTSTRAP_MULTISIG` env var). Unset/zero keeps today's behaviour exactly:
+    `DecdnGovernor` is seated as the `TimelockController`'s proposer at deploy,
+    so DAO voting is live immediately.
+  - `BuybackActivation`'s 17 flat fields regroup into the venue-independent `guard`,
+    the venue-derived `seed`, and the venue-scoped `uni` / `bal`. The flat layout let a
+    Balancer field be set under `venue == UNISWAP` and silently dropped;
+    `_activateBuyback` now rejects both halves of that mistake —
+    `VenueFieldsCrossWired` for a field on the unselected venue, `VenueFieldsUnwired`
+    for a required field missing on the selected one (a Balancer activation without
+    its Vault otherwise ships a burner that can never swap while already receiving
+    30% of protocol revenue). `PoolSeed` additionally records the venue it was
+    derived for, since the 80/20-vs-1:1 seed weighting means a mismatched pair
+    mis-anchors the genesis pool silently (`PoolSeedVenueMismatch`).
+  - `BalancerVenueParams` nests `BuybackVenueLib.BalancerWiring` rather than
+    restating five of its fields, and the guard band is
+    `GuardedBuybackBurner.GuardParams` rather than a fourth copy of the same shape.
+
 - **Monitoring-breaking: `monitoring/` no longer ships rules and panels that
   could never fire (#1513).** Eleven `decdn_*` series referenced by the
   reference alerts and dashboard were never exported by any node. Nothing in CI
@@ -591,6 +616,59 @@ since project inception and will roll into the first tagged release.
 
 ### Changed
 
+- **`contracts/script/lib/BuybackVenueLib.sol` is now the single home for buyback
+  venue dispatch and burner construction (#1090).** The steady-state FeeRouter
+  split, the canonical Permit2 address, the `BUYBACK_VENUE` string dispatch, and
+  the per-venue `Config` literal were duplicated across `BaseProtocolDeploy`,
+  `ActivateBuyback`, and `DeployProtocol`. Four items each had two copies — the
+  steady-state split, the canonical Permit2 address, the venue-string dispatch, and
+  the per-venue `Config` literal — so the deploy-time genesis activation and the
+  post-deploy runbook could wire different burners from the same inputs. Behaviour
+  is unchanged; the duplication is gone.
+- **Burner wiring and guard-band validation moved into `BuybackVenueLib`.** The
+  completeness checks added earlier lived on `BaseProtocolDeploy`, so only the
+  genesis path had them — `ActivateBuyback`, the post-deploy runbook with no
+  `_assertBuybackActivated` backstop, had none. That is the two-entry-point drift
+  #1090 exists to remove, reintroduced by the fix for it. Both paths now validate at
+  the library both already call (`WiringIncomplete`), which also closes a second
+  dead-burner door: `GuardedBuybackBurner` rejects an inverted band but not a zero
+  one, so `MIN_BUYBACK_AMOUNT=0 MAX_BUYBACK_AMOUNT=0` constructed cleanly and then
+  reverted `AboveMaxBuyback` on every call forever (`GuardBandDead`).
+- **`PoolSeed` is self-checking rather than self-describing.** It now records
+  `targetPrice`, and `_assertVenueSeedMatches` re-derives `tokenSeed` instead of
+  trusting the venue tag. A tag alone is an unverifiable claim by whoever built the
+  struct, and `Venue.UNISWAP == 0` made it vacuous on a default-constructed seed —
+  which is the venue the Arbitrum Sepolia launch uses. A mismatch now reverts
+  `PoolSeedNotDerived`; an unset one reverts `TargetPriceZero`.
+- **`_activateBalancer` rejects a caller-supplied `bal.wiring.pool`** rather than
+  overwriting it (`PoolPrefilled`). The field is filled from the pool the script
+  creates, so a supplied value was silently discarded and a second pool created and
+  seeded with real protocol-owned liquidity — the natural mistake, since
+  `ActivateBuyback` reads `BALANCER_POOL` from env because it wires a live pool.
+- **The `solidity fork test` job now reports which fork RPCs are configured.** A
+  skipped step yielded a green job rendered identically to one where every fork
+  suite passed, which is how it went unnoticed that no fork RPC secret has ever
+  been set — all four suites have been permanently unexecuted behind a passing
+  check. The job now always writes each secret's state to the run summary and
+  emits a warning for the missing ones. Deliberately not a hard failure: fork PRs
+  cannot carry secrets by policy.
+- **`_assertTimelockRoleSeating` is mode-independent and also checks the deployer.**
+  Its negative half was gated on bootstrap mode, so a default deploy asserted
+  nothing about anyone *other* than the Governor holding a scheduling role, and the
+  deployer was never checked for one at all — it admins the Timelock through phases
+  3-5, so a future `_postWiringHook` could grant itself one and survive the handoff.
+  `ProposerNotSeated(address, bytes32, bool)` splits into `TimelockRoleMissing` and
+  `TimelockRoleUnexpected`: the two directions mean opposite things (ungovernable
+  vs. governance live too early) and a boolean three commas deep does not say which
+  at the moment a deploy aborts mid-broadcast.
+- **CI runs the Uniswap genesis-activation fork suite (#1090).** The
+  `solidity fork test` job now passes `ARBITRUM_SEPOLIA_RPC_URL` through, so
+  `GenesisBuybackActivation.fork.t.sol` can execute instead of self-skipping. It
+  covers the Arbitrum Sepolia deploy path, which had no executable CI coverage.
+  **Still gated on the secret existing** — no fork RPC secret is configured on the
+  repo today, so all four fork suites remain unexecuted; see the fork-RPC reporting
+  entry above, which is what makes that visible.
+
 #### Node selection & observability
 
 - **`Candidate.stake` is now `u64`, not `Option<u64>`** (internal API,
@@ -808,6 +886,17 @@ since project inception and will roll into the first tagged release.
 
 ### Added
 
+- **ADR 009 bootstrap-multisig governance phase (#1175).** `DeployProtocol` run
+  with `BOOTSTRAP_MULTISIG=<addr>` seats that multisig as the Timelock's sole
+  `PROPOSER_ROLE`/`CANCELLER_ROLE` holder and grants `DecdnGovernor` neither, so
+  no operator vote can execute while the operator set is still thin enough for a
+  cheap fleet to capture. The Timelock keeps `GOVERNANCE_ROLE` on every target in
+  both modes, so the 48-hour delay applies to the multisig's own changes.
+  `contracts/script/TransitionToGovernor.s.sol` prints the one-way Timelock batch
+  that ends the phase; `_assertNoBackDoors` now fails a deploy whose proposer is
+  not the one its mode seats. Off by default — the initial testnet deploy is
+  unaffected.
+
 #### Cache / config
 
 - A pinned set larger than `cache.cache_size_mb` now logs a warning at startup
@@ -982,6 +1071,18 @@ since project inception and will roll into the first tagged release.
 
 ### Security
 
+- `ruint` → 1.20.0 (RUSTSEC-2026-0220: `Uint::overflowing_shl`/`overflowing_shr`
+  returned false-negative overflow flags, so `checked_*` returned `Some` instead
+  of `None`, `strict_*` failed to panic, and `saturating_*` wrapped; the bad
+  `checked_shl` result makes `to_base_be` and string formatting loop forever on
+  no-alloc builds for non-limb-aligned widths). Reaches us transitively through
+  `alloy-primitives`, i.e. the U256 arithmetic on the payment path. No deCDN code
+  calls the affected APIs — every `checked_shl` in `crates/` is on a primitive
+  integer (`u64` in `cache/src/retry.rs`, `u32` in `protocol/src/framing.rs`), not a
+  `ruint::Uint`.
+  Lockfile-only bump; no dependency requirement changed. The six new `ark-*`
+  lockfile entries are optional features we do not enable — `cargo tree -e normal`
+  links none of them.
 - `quinn-proto` → 0.11.16 (GHSA-4w2j-m93h-cj5j: remote memory exhaustion in
   the QUIC state machine, fixed in 0.11.15) (#1465). Lockfile-only bump; no
   dependency requirement changed.
