@@ -79,10 +79,7 @@ pub struct HealthResponse {
     /// (read off the `decdn_dispatch_in_flight` gauge — see
     /// `ConnectionLimiter` in `decdn-node`). Polled by `decdn node drain
     /// --wait` (issue #604) to detect when all client streams have
-    /// completed during a graceful drain. `#[serde(default)]` keeps
-    /// older servers (which don't serialize the field) round-tripping
-    /// cleanly through new clients as `0`.
-    #[serde(default)]
+    /// completed during a graceful drain.
     pub in_flight_streams: u64,
 }
 
@@ -121,9 +118,8 @@ pub struct EvictResponse {
     pub was_present: bool,
     /// `true` when this response describes a dry-run preview — the
     /// cache state was *not* mutated and only [`Self::preview`] is
-    /// meaningful. `false` (the default) means the eviction was
-    /// applied per the existing `admin_v1_evict` behaviour.
-    #[serde(default)]
+    /// meaningful. `false` means the eviction was applied per the
+    /// existing `admin_v1_evict` behaviour.
     pub dry_run: bool,
     /// Pre-evict snapshot of the blob's local-cache state (#379).
     /// Populated for both real and dry-run calls so an operator's
@@ -133,7 +129,6 @@ pub struct EvictResponse {
     /// past the `clippy::struct_excessive_bools` threshold and so a
     /// future addition to the snapshot doesn't churn the top-level
     /// response shape.
-    #[serde(default)]
     pub preview: EvictPreview,
 }
 
@@ -148,24 +143,20 @@ pub struct EvictPreview {
     /// `None` when the blob isn't in the store. `Partial` blobs (an
     /// interrupted pull) report whatever size the store has so far —
     /// operators can spot a half-finished pull while inspecting.
-    #[serde(default)]
     pub size_bytes: Option<u64>,
     /// Microseconds elapsed since the last `get()` against this hash.
     /// `None` when no access has been recorded — typical for a hash
     /// that was just inserted but never re-served, or one that has
     /// been logically evicted (eviction clears the access entry).
-    #[serde(default)]
     pub last_accessed_us_ago: Option<u64>,
     /// Whether the hash is in the operator-pinned set (#276).
     /// Pinning protects against LRU eviction but **not** against an
     /// explicit `admin_v1_evict`; surfaced here so dry-run callers
     /// can confirm policy state before issuing the real takedown.
-    #[serde(default)]
     pub pinned: bool,
     /// Whether the hash is already in `<cache_dir>/evicted.log`.
     /// `true` means a real `admin_v1_evict` would short-circuit
     /// (idempotent re-run, no log line appended).
-    #[serde(default)]
     pub already_evicted: bool,
     /// Ordered list of origin backends the node would consult on a
     /// post-eviction miss (#439, #284). Empty when the engine has no
@@ -266,11 +257,8 @@ pub struct DrainResponse {
     pub initiated: bool,
     /// `true` when the server received `wait_admin: true` *and* is
     /// keeping admin alive through `router.shutdown` on this drain.
-    /// `#[serde(default)]` so older servers (which don't serialize the
-    /// field) round-trip cleanly as `false`; the `--wait` client treats
-    /// `false` as "server cannot observe completion safely" and refuses
-    /// to poll.
-    #[serde(default)]
+    /// The `--wait` client treats `false` as "server cannot observe
+    /// completion safely" and refuses to poll.
     pub wait_admin_honored: bool,
 }
 
@@ -314,9 +302,7 @@ pub struct RoutingHealth {
     /// completed, or `None` if no pass has run yet (node up less than one
     /// interval). The refresh pass touches all non-empty buckets at once,
     /// so this is a single network-wide timestamp rather than a per-bucket
-    /// value. `#[serde(default)]` keeps older servers round-tripping as
-    /// `None`.
-    #[serde(default)]
+    /// value.
     pub last_refresh_us: Option<u64>,
 }
 
@@ -391,10 +377,6 @@ pub struct ChannelSnapshot {
     /// `counterparty` for the ordinary self-signing case (the contract
     /// resolves a zero `voucherSigner` argument to `msg.sender`), and a
     /// distinct delegate key when the funder delegated signing.
-    /// `#[serde(default)]` keeps a pre-delegation server round-tripping;
-    /// such a server reports an empty string, which renderers show as
-    /// unknown rather than guessing the funder.
-    #[serde(default)]
     pub voucher_signer: String,
     /// Sequence number of the most-recently-accepted voucher
     /// (`ChannelState::last_nonce`). `0` before any voucher has been
@@ -418,8 +400,6 @@ pub struct ChannelSnapshot {
     /// next voucher, because the persisted `ChannelState` carries no
     /// last-voucher wall-clock. Operators use this to spot stale
     /// channels (high `outstanding` but no recent vouchers).
-    /// `#[serde(default)]` keeps older servers round-tripping as `None`.
-    #[serde(default)]
     pub seconds_since_last_voucher: Option<u64>,
     /// `true` when the accrued claim (`outstanding_micro_usdc`) has
     /// reached the node's configured redemption threshold
@@ -473,7 +453,6 @@ pub struct SlashRecordDto {
     pub evidence_hash: String,
     /// Block number the `Slashed` log was mined in, or `None` if the log was
     /// still pending when observed (rare; live logs carry a block number).
-    #[serde(default)]
     pub block_number: Option<u64>,
     /// **Nominal** appeal-window close (Unix seconds): the `Slashed` block
     /// timestamp + 30 days, or `None` if the block read failed. This is a cheap
@@ -481,7 +460,6 @@ pub struct SlashRecordDto {
     /// ignores protocol-pause extensions — which only ever move the real
     /// deadline *later* (`markAppealOpen` adds `pausedTotal`). Safe to file
     /// before this; a keeper must not treat a just-past value as final.
-    #[serde(default)]
     pub appeal_window_close: Option<u64>,
 }
 
@@ -507,12 +485,9 @@ pub struct RegionBytes {
     /// Cumulative bytes this node has *pulled from* counterparties in this
     /// region since process start. Reads `0` until node-to-node pull-through
     /// is orchestrated (#750).
-    /// `#[serde(default)]` keeps older servers that omit the field round-tripping.
-    #[serde(default)]
     pub bytes_in: u64,
     /// Cumulative bytes this node has *served to* counterparties in this
     /// region since process start.
-    #[serde(default)]
     pub bytes_out: u64,
 }
 
@@ -521,9 +496,6 @@ pub struct RegionBytes {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegionStatsResponse {
     /// One entry per region observed since process start, sorted by region code.
-    /// `#[serde(default)]` keeps an older/partial server that omits the field
-    /// round-tripping as an empty list — matching the empty-when-unwired posture.
-    #[serde(default)]
     pub regions: Vec<RegionBytes>,
 }
 
@@ -893,15 +865,5 @@ mod tests {
         assert_eq!(first.region, "DE");
         assert_eq!(first.bytes_in, 1_048_576);
         assert_eq!(first.bytes_out, 5_242_880);
-    }
-
-    #[test]
-    fn region_stats_response_omitted_regions_defaults_empty() {
-        // A node with no accountant wired returns an empty snapshot, which
-        // serializes with `regions` omitted; it must deserialize back to an
-        // empty list.
-        let back: RegionStatsResponse =
-            serde_json::from_str("{}").expect("deserialize RegionStatsResponse without regions");
-        assert!(back.regions.is_empty());
     }
 }
