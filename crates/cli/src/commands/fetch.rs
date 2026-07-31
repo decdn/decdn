@@ -41,7 +41,9 @@ use decdn_client_pull::{
 };
 use decdn_common::cli::{self, common::expand_tilde};
 use decdn_common::config::{DEFAULT_CHAIN_ID, FileConfig, load_file_config};
-use decdn_incentive::buyer_channel::{AdvanceOutcome, BuyerChannelState, BuyerChannelStore};
+use decdn_incentive::buyer_channel::{
+    AdvanceOutcome, BuyerChannelState, BuyerChannelStore, DepositOutcome,
+};
 use decdn_incentive::buyer_channel_redb::RedbBuyerChannelStore;
 use decdn_incentive::eth_identity::{self, PasswordSource, load_signer, read_password};
 use decdn_incentive::payment_channel::PaymentChannel;
@@ -244,16 +246,36 @@ pub(crate) fn resolve_chain(
             |p| expand_tilde(&p),
         );
 
-    let initial_deposit = U256::from(
-        args.initial_deposit_micro_usdc
-            .or_else(|| bc.and_then(|b| b.buyer_initial_deposit_micro_usdc))
-            .unwrap_or(decdn_common::config::DEFAULT_BUYER_INITIAL_DEPOSIT_MICRO_USDC),
+    // The two deposit knobs carry the same invariants the daemon resolver
+    // (`resolve_blockchain_into`) enforces, and they must be checked HERE too: this
+    // path resolves the raw `[blockchain]` table plus the CLI flags without going
+    // through that resolver, so without these the client would accept a config file
+    // `decdn config validate` rejects, and `--initial-deposit-micro-usdc 0` would
+    // surface as an opaque `openChannel` `ZeroAmount` revert instead of a load-time
+    // message. Keep the wording in step with `resolve_blockchain_into`.
+    let initial_deposit_micro_usdc = args
+        .initial_deposit_micro_usdc
+        .or_else(|| bc.and_then(|b| b.buyer_initial_deposit_micro_usdc))
+        .unwrap_or(decdn_common::config::DEFAULT_BUYER_INITIAL_DEPOSIT_MICRO_USDC);
+    anyhow::ensure!(
+        initial_deposit_micro_usdc > 0,
+        "buyer_initial_deposit_micro_usdc must be > 0 (openChannel reverts ZeroAmount on a \
+         zero deposit) — set --initial-deposit-micro-usdc or \
+         blockchain.buyer_initial_deposit_micro_usdc"
     );
-    let working_deposit = U256::from(
-        args.working_deposit_micro_usdc
-            .or_else(|| bc.and_then(|b| b.buyer_working_deposit_micro_usdc))
-            .unwrap_or(decdn_common::config::DEFAULT_BUYER_WORKING_DEPOSIT_MICRO_USDC),
+    let working_deposit_micro_usdc = args
+        .working_deposit_micro_usdc
+        .or_else(|| bc.and_then(|b| b.buyer_working_deposit_micro_usdc))
+        .unwrap_or(decdn_common::config::DEFAULT_BUYER_WORKING_DEPOSIT_MICRO_USDC);
+    anyhow::ensure!(
+        working_deposit_micro_usdc == 0 || working_deposit_micro_usdc >= initial_deposit_micro_usdc,
+        "buyer_working_deposit_micro_usdc must be 0 (disable top-up) or >= \
+         buyer_initial_deposit_micro_usdc (the refill target cannot be smaller than the \
+         initial open deposit) — got {working_deposit_micro_usdc} vs \
+         {initial_deposit_micro_usdc}"
     );
+    let initial_deposit = U256::from(initial_deposit_micro_usdc);
+    let working_deposit = U256::from(working_deposit_micro_usdc);
     // Client default: exact (deposit-sized) USDC approval, not an unlimited
     // standing allowance. `buyer_max_approve = true` opts a power user back into
     // the node/operator posture. (The daemon's own default stays unlimited.)
@@ -814,7 +836,8 @@ fn annotate_unbound_cache_miss(err: anyhow::Error, ctx: &ChannelContext) -> anyh
                  several times it depending on its configured credit window. The fetch \
                  path already auto-refills below a low-water mark, so reaching this means \
                  the configured working deposit is itself too small: raise \
-                 `--deposit-micro-usdc` (or `blockchain.buyer_deposit_micro_usdc`) and retry"
+                 `--working-deposit-micro-usdc` (or \
+                 `blockchain.buyer_working_deposit_micro_usdc`) and retry"
             ));
         }
     }
@@ -940,19 +963,30 @@ where
         amount: ctx.prior_amount,
     }));
 
-    // Reactive graduation (#1497): the CONTENT offset this blob's fetch started
-    // from, and the channel-cumulative WIRE-byte baseline at that moment, captured
-    // once before the attempt loop below ever runs. The reactive top-up branch
-    // feeds these to `content_paid_frontier` to recover the PAID content frontier
-    // of this blob: `committed().bytes - fetch_start_committed_bytes` is the WIRE
-    // bytes an ACCEPTED voucher covered on this leg (vouchers pay in wire bytes —
-    // content plus bao proof, ADR 038), which that helper maps back into content
-    // space. This counts only paid bytes — unlike the on-disk file length, which
-    // runs ahead of payment: the credit window (ADR 003 §Credit window) lets the
-    // node stream up to a full interval's worth of content before the voucher that
-    // pays for it is even due, and `decode_to_sink` flushes and verifies those
+    // Reactive graduation (#1497): the CONTENT offset the CURRENT leg started
+    // from, and the channel-cumulative WIRE-byte baseline at that moment. The
+    // reactive top-up branch feeds these to `content_paid_frontier` to recover the
+    // PAID content frontier: `committed().bytes - fetch_start_committed_bytes` is
+    // the WIRE bytes an ACCEPTED voucher covered on this leg (vouchers pay in wire
+    // bytes — content plus bao proof, ADR 038), which that helper maps back into
+    // content space. This counts only paid bytes — unlike the on-disk file length,
+    // which runs ahead of payment: the credit window (ADR 003 §Credit window) lets
+    // the node stream up to a full interval's worth of content before the voucher
+    // that pays for it is even due, and `decode_to_sink` flushes and verifies those
     // bytes to disk as they arrive, independent of whether that voucher is later
     // accepted.
+    //
+    // PER-LEG, not per-fetch. `content_paid_frontier` inverts the wire cost of ONE
+    // contiguous delivery starting at `fetch_start_offset`, but `committed().bytes`
+    // is channel-cumulative and keeps climbing across every attempt in the loop
+    // below. Left anchored at the fetch's start, a second leg's delta would sum two
+    // independent bao range encodings — re-billing the first leg's span and its
+    // re-sent root->offset proof path — and the inflated budget would map to a
+    // frontier PAST the true paid one: content skipped unbilled (the exact under-pay
+    // this helper exists to prevent), `byte_offset` beyond the verified on-disk
+    // prefix, `set_len` zero-extending the partial, and the whole-file hash check
+    // failing a fetch already paid for. So these are re-anchored on EVERY successful
+    // open below, which is the only place a new leg can begin.
     let mut fetch_start_offset = byte_offset;
     let mut fetch_start_committed_bytes = ledger.committed().bytes;
 
@@ -1027,6 +1061,16 @@ where
                 // to any prior top-up — clear the settle-wait state (#1497).
                 awaiting_topup_settle = false;
                 settle_waits = 0;
+                // A new leg starts here, so re-anchor the paid-frontier baselines
+                // (#1497 review finding). This is the single place they are set
+                // after the initial capture: every path that begins another
+                // delivery — resume retry, from-zero restart, post-top-up resume —
+                // reaches this arm first, so anchoring here keeps
+                // `committed().bytes - fetch_start_committed_bytes` equal to THIS
+                // leg's wire spend and nothing else. See the capture site above for
+                // what goes wrong when a second leg inherits a stale baseline.
+                fetch_start_offset = byte_offset;
+                fetch_start_committed_bytes = ledger.committed().bytes;
                 // The open succeeded, so this attempt is really going to write.
                 // Rewind to the verified prefix: a no-op on the first pass, and on
                 // a retry it discards whatever the failed attempt left behind.
@@ -1109,15 +1153,10 @@ where
             );
             restarted = true;
             byte_offset = 0;
-            // A later reactive top-up's `content_paid_frontier` call anchors its
-            // paid-content math on these two baselines (#1497 finding). Left
-            // stale after this restart, they would still point at the ABANDONED
-            // resume attempt's offset/watermark, so a subsequent top-up would
-            // overshoot the true (from-zero) paid frontier and the whole-file
-            // hash check would fail the fetch. Re-anchor both to the from-zero
-            // restart, mirroring the initial capture above.
-            fetch_start_offset = byte_offset;
-            fetch_start_committed_bytes = ledger.committed().bytes;
+            // The paid-frontier baselines still point at the ABANDONED resume
+            // attempt, but they are re-anchored to this from-zero restart by the
+            // successful-open arm above before any voucher can be signed against
+            // them (#1497 finding) — no re-anchor is needed here.
             continue;
         }
         // Reactive graduation (#1497): a genuine mid-fetch ceiling hit —
@@ -1161,16 +1200,45 @@ where
                         if max_approve { None } else { Some(additional) },
                     )
                     .await?;
-                    // The escrowed-but-untracked outcomes are logged inside
-                    // `top_up`; re-read below and reflect whatever landed.
-                    let _ = top_up(contract, store, provider, additional).await?;
-                    if let Some(state) = store.get_by_provider(provider)? {
-                        ctx.deposit = state.deposit; // reflect the graduated deposit
+                    // Grade the outcome rather than re-reading the store: `Added`
+                    // carries the new total directly, and the other two variants
+                    // mean the `topUp` MINED — the USDC is escrowed on-chain — but
+                    // the local row could not be credited. Those are terminal here.
+                    // `top_up` reports them via `tracing`, which this binary
+                    // installs no subscriber for, so they would otherwise be
+                    // invisible; and continuing would leave `ctx.deposit` stale, so
+                    // the next pass would recompute the same shortfall, escrow
+                    // again, and (on `UnknownChannel`, where the funder lookup below
+                    // now returns `None`) blame a nonexistent third-party funder for
+                    // a channel this key does fund.
+                    match top_up(contract, store, provider, additional).await? {
+                        DepositOutcome::Added(new_deposit) => ctx.deposit = new_deposit,
+                        DepositOutcome::UnknownChannel => {
+                            return Err(anyhow::anyhow!(
+                                "mid-fetch top-up of {additional} µUSDC for channel \
+                                 {} landed on-chain but no local record remains to \
+                                 credit it: the deposit is ESCROWED AND UNTRACKED. \
+                                 Reconcile against the chain before retrying",
+                                ctx.channel_id
+                            ));
+                        }
+                        DepositOutcome::ChannelMismatch => {
+                            return Err(anyhow::anyhow!(
+                                "mid-fetch top-up of {additional} µUSDC for channel \
+                                 {} landed on-chain but the local record now tracks a \
+                                 different channel for provider {provider}: the deposit \
+                                 is escrowed against the topped-up channel. Reconcile \
+                                 against the chain before retrying",
+                                ctx.channel_id
+                            ));
+                        }
                     }
                     eprintln!(
                         "note: channel exhausted mid-fetch after the node delivered its \
-                         initial deposit's worth of verified bytes; topped up toward the \
-                         working deposit and resuming (top-up {}/{})",
+                         initial deposit's worth of verified bytes; topped up {additional} \
+                         µUSDC toward the working deposit (channel now holds {}) and \
+                         resuming (top-up {}/{})",
+                        ctx.deposit,
                         topups + 1,
                         decdn_client_pull::MAX_TOPUP_ATTEMPTS
                     );
@@ -1242,8 +1310,14 @@ where
             return Err(err);
         }
         match decdn_client_pull::resumable_watermark(&err, ctx) {
-            Some(bundle) => {
-                ledger.reseed(Cumulative::from(bundle));
+            // Only an ADVANCING bundle is a desync worth retrying — `reseed`
+            // reports that, and refuses to regress the watermark. A bundle that
+            // merely echoes our own committed watermark (which the node attaches to
+            // every watermark-gated rejection once a voucher has been accepted,
+            // including a genuinely exhausted one that this pass declined to fund)
+            // would otherwise burn the whole resume budget re-sending vouchers the
+            // node has already refused, and bury the real error behind it.
+            Some(bundle) if ledger.reseed(Cumulative::from(bundle)) => {
                 // Worth surfacing rather than logging silently: it means this
                 // client's persisted watermark had fallen behind what it had
                 // actually signed, which is the #1122 desync healing itself.
@@ -1255,7 +1329,7 @@ where
                 );
                 attempt += 1;
             }
-            None => return Err(err),
+            Some(_) | None => return Err(err),
         }
     }
 }
@@ -2134,6 +2208,81 @@ mod tests {
         assert_eq!(
             r.keystore,
             eth_identity::keystore_path(&PathBuf::from("/tmp/d"))
+        );
+    }
+
+    /// `resolve_chain` must enforce the same two deposit invariants the daemon
+    /// resolver does (#1497 review). It reads the raw `[blockchain]` table plus the
+    /// CLI flags rather than going through `resolve_blockchain_into`, so without
+    /// its own checks `decdn fetch` would accept a config file that
+    /// `decdn config validate` rejects — a validator that does not validate what
+    /// actually runs — and `--initial-deposit-micro-usdc 0` would reach the chain
+    /// and surface as an opaque `openChannel` `ZeroAmount` revert.
+    #[test]
+    fn resolve_chain_rejects_deposits_the_daemon_resolver_would_reject() {
+        let base = "[blockchain]\nrpc_url = \"http://config:8545\"\npayment_channel_address = \"0x3333333333333333333333333333333333333333\"\nslash_judge_address = \"0x4444444444444444444444444444444444444444\"\n";
+
+        // A zero initial deposit can never open a channel.
+        let err = resolve_chain(
+            &common(),
+            &config(&format!("{base}buyer_initial_deposit_micro_usdc = 0\n")),
+        )
+        .expect_err("a zero initial deposit must be refused at resolve time");
+        assert!(
+            err.to_string().contains("buyer_initial_deposit_micro_usdc"),
+            "the error must name the offending field; got: {err}"
+        );
+
+        // A nonzero working target below the initial open size would make the very
+        // first refill shrink the channel.
+        let err = resolve_chain(
+            &common(),
+            &config(&format!(
+                "{base}buyer_initial_deposit_micro_usdc = 10000000\nbuyer_working_deposit_micro_usdc = 1000000\n"
+            )),
+        )
+        .expect_err("a working target below the initial deposit must be refused");
+        assert!(
+            err.to_string().contains("buyer_working_deposit_micro_usdc"),
+            "the error must name the offending field; got: {err}"
+        );
+
+        // `0` is the explicit disable sentinel, not a too-small target: it must
+        // still resolve however large the initial deposit is.
+        let r = resolve_chain(
+            &common(),
+            &config(&format!(
+                "{base}buyer_initial_deposit_micro_usdc = 10000000\nbuyer_working_deposit_micro_usdc = 0\n"
+            )),
+        )
+        .expect("0 disables top-up and must remain valid");
+        assert_eq!(r.working_deposit, U256::ZERO);
+    }
+
+    /// The flags are the surface these invariants are easiest to violate from, and
+    /// they bypass the config file entirely — so they need their own coverage.
+    #[test]
+    fn resolve_chain_validates_the_cli_flags_too() {
+        let file = config(
+            "[blockchain]\nrpc_url = \"http://config:8545\"\npayment_channel_address = \"0x3333333333333333333333333333333333333333\"\nslash_judge_address = \"0x4444444444444444444444444444444444444444\"\n",
+        );
+        let mut args = common();
+        args.initial_deposit_micro_usdc = Some(0);
+        let err = resolve_chain(&args, &file)
+            .expect_err("--initial-deposit-micro-usdc 0 must be refused before the RPC");
+        assert!(
+            err.to_string().contains("buyer_initial_deposit_micro_usdc"),
+            "got: {err}"
+        );
+
+        let mut args = common();
+        args.initial_deposit_micro_usdc = Some(5_000_000);
+        args.working_deposit_micro_usdc = Some(1_000_000);
+        let err = resolve_chain(&args, &file)
+            .expect_err("a flag-set working target below the initial deposit must be refused");
+        assert!(
+            err.to_string().contains("buyer_working_deposit_micro_usdc"),
+            "got: {err}"
         );
     }
 

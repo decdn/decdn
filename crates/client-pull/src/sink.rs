@@ -776,6 +776,80 @@ mod tests {
         }
     }
 
+    /// The per-leg precondition, stated as a test (#1497 review).
+    ///
+    /// `content_paid_frontier` inverts the wire cost of ONE contiguous delivery
+    /// starting at `fetch_start`. Its caller derives `paid_wire` from a
+    /// CHANNEL-cumulative watermark, so if the `(fetch_start, baseline)` pair is
+    /// not re-anchored when a new leg begins, the second call is handed the SUM of
+    /// two independent bao range encodings against the first leg's start offset.
+    ///
+    /// That sum strictly exceeds the contiguous cost of the same span, so it can
+    /// only map the frontier FORWARD — content delivered but never billed, and a
+    /// `byte_offset` past the verified on-disk prefix.
+    ///
+    /// Two magnitudes, both covered here:
+    ///
+    /// * **Disjoint legs** — the excess is only the re-sent root->`fetch_start`
+    ///   proof path (~64 B per tree level). Real, but usually smaller than the
+    ///   16 KiB group the answer is snapped down to, so it often lands on the same
+    ///   boundary. Correctness here rests on luck, not on the invariant, which is
+    ///   why the assertion is the direction (never backwards) rather than a jump.
+    /// * **A re-paid leg** — a resume retry re-delivers a span already paid for
+    ///   (the ledger reseeds and the next attempt reopens at the same offset), so
+    ///   the cumulative watermark climbs by a WHOLE duplicated span. That is
+    ///   megabytes, not bytes, and it moves the frontier by entire groups.
+    #[test]
+    fn summed_multi_leg_wire_over_maps_which_is_why_baselines_are_per_leg() {
+        let group = CHUNK_GROUP_BYTES;
+        let total = 12 * group;
+        // Leg 1 delivers [0, 3 groups); leg 2 resumes there and delivers to 6.
+        let (frontier1, frontier2) = (3 * group, 6 * group);
+        let leg1_wire = wire_to(0, frontier1, total);
+        let leg2_wire = wire_to(frontier1, frontier2, total);
+        let contiguous_wire = wire_to(0, frontier2, total);
+
+        // The sum double-counts leg 2's re-sent left-boundary proof path.
+        assert!(
+            leg1_wire + leg2_wire > contiguous_wire,
+            "the two legs' wire ({leg1_wire} + {leg2_wire}) must exceed the contiguous \
+             cost of the same span ({contiguous_wire}), else this hazard would not exist"
+        );
+
+        // Correct (per-leg) call: anchored at leg 2's own start and budget.
+        let correct = content_paid_frontier(frontier1, total, leg2_wire);
+        assert_eq!(
+            correct, frontier2,
+            "the per-leg call lands on the true frontier"
+        );
+
+        // Stale baseline, disjoint legs: never maps BEHIND the true frontier, so it
+        // can only skip billing, never re-bill.
+        let stale = content_paid_frontier(0, total, leg1_wire + leg2_wire);
+        assert!(
+            stale >= frontier2,
+            "a summed budget cannot under-report the frontier: {stale} < {frontier2}"
+        );
+
+        // Stale baseline with a RE-PAID leg: the ledger's cumulative wire includes
+        // [0, 3 groups) twice — once for the abandoned attempt, once for the retry.
+        // Anchored at the fetch's original start, that budget runs far past the
+        // frontier actually paid for, skipping whole groups of billing.
+        let with_repaid = content_paid_frontier(0, total, 2 * leg1_wire + leg2_wire);
+        assert!(
+            with_repaid > frontier2 + group,
+            "a re-paid leg must visibly overshoot the true frontier by more than a \
+             group: got {with_repaid}, true frontier {frontier2}"
+        );
+        // And the per-leg anchoring is immune to it: leg 2's own budget is unchanged
+        // by whatever earlier legs re-paid for.
+        assert_eq!(
+            content_paid_frontier(frontier1, total, leg2_wire),
+            frontier2,
+            "per-leg anchoring is unaffected by an earlier leg being re-paid"
+        );
+    }
+
     /// `paid_wire == 0` (nothing accepted on this leg) resumes exactly where the
     /// leg began — no spurious advance.
     #[test]

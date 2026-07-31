@@ -49,9 +49,9 @@ use decdn_incentive::{
     slash_judge_domain, stream_sig::StreamSlashData, voucher_domain,
 };
 use decdn_node::client_requester::{
-    ChannelContext, ChannelLedger, Cumulative, PullDeadlines, RateAboveCeiling, UpstreamRefused,
-    VoucherProgress, sign_client_binding, stream_fetch, stream_fetch_shared, stream_fetch_tracked,
-    stream_fetch_tracked_with_progress,
+    ChannelContext, ChannelLedger, Cumulative, PullDeadlines, RateAboveCeiling,
+    UpstreamVoucherRejected, VoucherProgress, sign_client_binding, stream_fetch,
+    stream_fetch_shared, stream_fetch_tracked, stream_fetch_tracked_with_progress,
 };
 use decdn_node::dispatch::ConnectionLimiter;
 use decdn_node::handlers::client::{ClientHandler, ClientHandlerDeps};
@@ -1680,14 +1680,16 @@ async fn client_delivers_empty_blob() -> anyhow::Result<()> {
 /// through that exact sequence, so it pins the mid-stream backstop as surely as
 /// asserting on the reject reason did.
 ///
-/// The *terminal* error is the pre-serve refusal, not the voucher rejection,
-/// and that is the #1516 fix showing through: the rejection carries an
-/// authenticated `WatermarkBundle`, so `fetch_inner`'s resume loop reseeds the
-/// ledger and retries at the same offset — but the channel is now down to 2 base
-/// units of headroom, so the retry cannot cover a window and is refused before
-/// anything is signed. Pre-#1516 each of those futile attempts was served a
-/// fresh free window first; the counter assertion below pins that the resume
-/// loop can no longer be used to farm them.
+/// The *terminal* error is the voucher rejection itself, and no resume retry is
+/// attempted at all. The rejection does carry an authenticated `WatermarkBundle`,
+/// but that bundle merely echoes the watermark this client already holds (nonce 1
+/// — the node attaches one to every watermark-gated rejection once any voucher has
+/// been accepted, including a genuinely exhausted one). `ChannelLedger::reseed`
+/// refuses a non-advancing cumulative, so `fetch_inner` surfaces the real cause
+/// instead of spending a resume attempt re-sending a voucher the node has already
+/// refused for lack of deposit. The counter assertion below pins that: pre-#1516
+/// each futile attempt was served a fresh free window, and now there is no futile
+/// attempt to serve.
 #[tokio::test(flavor = "multi_thread")]
 async fn tracked_watermark_survives_post_ack_error() -> anyhow::Result<()> {
     let payload = vec![0xABu8; 1_572_864]; // 1.5 MiB → two vouchers (amount 10 then 15).
@@ -1747,23 +1749,32 @@ async fn tracked_watermark_survives_post_ack_error() -> anyhow::Result<()> {
     )
     .await;
 
-    // Assert the *intended* failure mode, not just any error: the exhausted
-    // channel is refused, and it is refused pre-serve on the resume retry rather
-    // than being handed another window. A regression that errors for some other
-    // reason (e.g. a transport fault) should fail this test loudly.
+    // Assert the *intended* failure mode, not just any error: the over-deposit
+    // voucher rejection is what surfaces, unmasked by a futile resume. A
+    // regression that errors for some other reason (e.g. a transport fault)
+    // should fail this test loudly.
     let err = result
         .err()
         .ok_or_else(|| anyhow::anyhow!("fetch must error when voucher 2 is over-deposit"))?;
-    let refused = err
-        .downcast_ref::<UpstreamRefused>()
-        .ok_or_else(|| anyhow::anyhow!("expected UpstreamRefused, got: {err:?}"))?;
+    let rejected = err
+        .downcast_ref::<UpstreamVoucherRejected>()
+        .ok_or_else(|| anyhow::anyhow!("expected UpstreamVoucherRejected, got: {err:?}"))?;
     anyhow::ensure!(
         matches!(
-            refused.error(),
-            decdn_protocol::client::StreamError::NotFound
+            rejected.reason,
+            decdn_protocol::client::VoucherRejectReason::InsufficientDeposit
         ),
-        "the exhausted retry must be refused pre-serve; got {:?}",
-        refused.error()
+        "the exhausted channel must surface its own rejection reason; got {:?}",
+        rejected.reason
+    );
+    // The bundle IS attached — this is the case that made bundle presence alone
+    // an unsafe reseed trigger. Pinning it here keeps the test honest: it is
+    // asserting that a *present* bundle was correctly declined, not that none
+    // arrived.
+    anyhow::ensure!(
+        rejected.bundle.is_some(),
+        "the rejection should still carry a watermark bundle; \
+         without one this test would pass vacuously"
     );
     // The contract this test exists for: the watermark survives the error and
     // reflects the one acked voucher (nonce 1). Reaching nonce 1 — and no
@@ -1777,14 +1788,17 @@ async fn tracked_watermark_survives_post_ack_error() -> anyhow::Result<()> {
         "exactly one voucher should be acked before the rejection; acked nonce = {}",
         acked.0
     );
-    // #1516: the resume retry is cut off before delivery. Pre-fix it was served
-    // a fresh credit window for free — once per resume attempt.
+    // #1516 pinned that a futile resume retry is refused pre-serve rather than
+    // handed a free credit window. With the non-advancing bundle now declined,
+    // there is no second attempt to refuse at all — strictly stronger, so the
+    // pre-serve rejection counter must stay at zero.
     anyhow::ensure!(
         metric_line_present(
             &metrics.encode()?,
-            "decdn_serve_stream_rejected_insufficient_deposit_total 1"
+            "decdn_serve_stream_rejected_insufficient_deposit_total 0"
         ),
-        "the futile resume retry must be refused pre-serve, not re-served"
+        "an exhausted channel must not retry at all, so nothing should reach the \
+         pre-serve deposit gate"
     );
 
     client_ep.close().await;
@@ -3064,8 +3078,8 @@ async fn client_resumed_range_is_priced_on_the_tail_not_the_whole_blob() -> anyh
 /// Left uncovered by the four refusal/serve tests — each sits strictly on one
 /// side of the boundary, so flipping `<` to `<=` passes all of them while
 /// refusing every exactly-funded channel with a lossy `NotFound` the CLI renders
-/// as a missing blob. A `decdn fetch --deposit-micro-usdc` funded to the computed
-/// cost is exactly this case.
+/// as a missing blob. A `decdn fetch --initial-deposit-micro-usdc` funded to the
+/// computed cost is exactly this case.
 #[tokio::test(flavor = "multi_thread")]
 async fn client_headroom_equal_to_the_ceiling_is_served() -> anyhow::Result<()> {
     let payload = vec![0xB0u8; 1_572_864]; // 1.5 MiB → one 1 MiB window costs 10

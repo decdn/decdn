@@ -84,8 +84,8 @@ const MIN_EVENT_POLL_INTERVAL_MS: u64 = 250;
 /// amount while bounding unsettled exposure to ~1 USDC per channel (#327).
 const DEFAULT_REDEEM_THRESHOLD_MICRO_USDC: u64 = 1_000_000;
 /// Default first-contact `openChannel` deposit: 0.5 USDC (`500_000` `µUSDC`).
-/// Kept small so an unproven node holds little of the buyer's capital before
-/// it has served verified bytes.
+/// Kept small so an untried node holds little of the buyer's capital on first
+/// contact.
 ///
 /// `pub` so `decdn-cli`'s `--initial-deposit-micro-usdc` resolution shares this
 /// single source of truth with the config resolver rather than duplicating it.

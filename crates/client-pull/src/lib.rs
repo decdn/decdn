@@ -1519,8 +1519,13 @@ async fn fetch_inner(
             return Err(e);
         }
         match resumable_watermark(&e, ctx) {
-            Some(bundle) => {
-                ledger.reseed(Cumulative::from(bundle));
+            // A bundle that does not ADVANCE our committed watermark is not a
+            // desync: the node attaches one to every watermark-gated rejection once
+            // any voucher has been accepted, so an exhausted channel echoes our own
+            // watermark straight back. Retrying against it is futile — and applying
+            // it would regress the ledger — so surface the real error instead of
+            // spending the resume budget on it.
+            Some(bundle) if ledger.reseed(Cumulative::from(bundle)) => {
                 tracing::debug!(
                     attempt,
                     byte_offset,
@@ -1528,7 +1533,7 @@ async fn fetch_inner(
                      retrying at the same byte_offset"
                 );
             }
-            None => return Err(e),
+            Some(_) | None => return Err(e),
         }
     }
     // Unreachable: the loop above always returns on both the `Ok` and every `Err`

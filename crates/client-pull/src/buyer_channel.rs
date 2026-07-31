@@ -564,6 +564,24 @@ pub const LOW_WATER_DIVISOR: u64 = 5;
 /// that restores it to `target_deposit` (the configured working deposit);
 /// otherwise return `U256::ZERO` (no refill).
 ///
+/// Deliberately NOT gated on evidence of service (#1497 review). Gating on
+/// `prior_amount > 0` — "only graduate a channel that has had a voucher accepted"
+/// — reads like the right way to make the two-tier deposit's trust story literal,
+/// and it DEADLOCKS: the seller refuses to serve at all unless the channel's
+/// headroom covers its pre-serve reserve (one credit window at the quoted rate,
+/// `handlers/client/window.rs`), which at a stock rate is several times the
+/// default 0.5 USDC initial deposit. A channel whose initial deposit is below that
+/// reserve is never served, so no voucher is ever accepted, so the gate never
+/// opens — and the low-water refill that would have rescued it is exactly what the
+/// gate suppressed. The `anvil-e2e` journey
+/// `fetch_larger_than_initial_deposit_tops_up_and_completes` fails this way.
+///
+/// So graduation is a pure low-water refill, and the honest statement of the
+/// guarantee is positional rather than reputational: the buyer's exposure to an
+/// unproven counterparty is bounded by the INITIAL deposit for as long as the
+/// channel is only opened, and rises to the working target on reuse. See
+/// [ADR 003 § Deposit Economics](../../../adr/003-payments.md).
+///
 /// The exact cost of the *next* fetch is not known at refill time on either
 /// caller — the per-MB `rate` is only learned from the provider's probe /
 /// `StreamResponse` (and the CLI's explicit `--node-id` path does no probe; the
@@ -744,6 +762,39 @@ mod tests {
             refill_amount(deposit, U256::ZERO, target(), deposit),
             U256::ZERO,
             "remaining already >= target yields no top-up even below low-water"
+        );
+    }
+
+    /// A never-served channel MUST still be refillable (#1497 review).
+    ///
+    /// It is tempting to gate graduation on evidence of service — refuse to refill
+    /// while `prior_amount == 0`, so an unproven counterparty can never hold the
+    /// working deposit. That gate deadlocks, and this test is the guard against
+    /// re-introducing it: the seller will not serve a channel whose headroom is
+    /// below its pre-serve reserve (one credit window at the quoted rate), which
+    /// at a stock rate exceeds the default 0.5 USDC open. Such a channel is never
+    /// served → never has a voucher accepted → never satisfies the gate → is never
+    /// refilled, and the fetch fails permanently instead of graduating. Verified
+    /// against the live daemon: adding the gate makes the `anvil-e2e` journey
+    /// `fetch_larger_than_initial_deposit_tops_up_and_completes` fail with the
+    /// node's `remaining channel deposit below the reserved cost` refusal.
+    #[test]
+    fn refill_amount_graduates_a_freshly_opened_channel_that_has_served_nothing() {
+        let initial = U256::from(500_000u64); // the shipped open size
+        let working = target(); // 10 USDC
+        let low_water = working / U256::from(LOW_WATER_DIVISOR); // 2 USDC
+
+        // The shipped defaults really do put a fresh open below low-water — which
+        // is what makes the refill reachable (and a service gate fatal) here.
+        assert!(
+            initial < low_water,
+            "fixture must put a freshly opened channel below low-water"
+        );
+        assert_eq!(
+            refill_amount(initial, U256::ZERO, working, low_water),
+            working - initial,
+            "a channel that has served nothing must still be refillable, or a small \
+             initial deposit can never reach the seller's pre-serve reserve"
         );
     }
 

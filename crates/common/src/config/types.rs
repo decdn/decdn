@@ -201,14 +201,17 @@ pub struct BlockchainConfig {
     pub redeem_threshold_micro_usdc: Option<u64>,
     /// Deposit (base units, `µUSDC`) the buyer path escrows when it **opens** a
     /// new `PaymentChannel` against a provider (the first-contact lock). Kept
-    /// small so an unproven node holds little of the buyer's capital before it
-    /// has served verified bytes. Absent => default (0.5 USDC = `500_000`).
+    /// small so an untried node holds little of the buyer's capital on first
+    /// contact. Absent => default (0.5 USDC = `500_000`).
     /// Escrowed as configured at open time (no on-chain floor; only a
     /// non-zero requirement).
     pub buyer_initial_deposit_micro_usdc: Option<u64>,
     /// Deposit (base units, `µUSDC`) every `topUp` refills the channel toward
-    /// once it has proven itself — the proactive low-water refill and the
-    /// reactive mid-fetch top-up both target this. Larger values amortize gas
+    /// once it is reused or runs short mid-transfer. Both refill
+    /// legs target this: the proactive low-water refill, which both binaries
+    /// run on channel reuse, and the reactive mid-fetch top-up, which is
+    /// **`decdn fetch` only** — the daemon's buffered cache-miss pull has no
+    /// paid-frontier resume and is deferred to #1530. Larger values amortize gas
     /// across more delivery at the cost of more capital locked for up to the
     /// 48h dispute window. Absent => default (10 USDC = `10_000_000`). `0`
     /// disables top-up entirely (a spent-down channel errors instead of
