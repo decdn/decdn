@@ -520,6 +520,48 @@ mod tests {
         assert_eq!(recovered, client.address());
     }
 
+    /// A funded channel that never delivered a byte (#1539): the provider's tuple
+    /// and the client's authorized watermark are both zero, so nothing over-claims
+    /// and the client signs a zero voucher for the window-free
+    /// `cooperativeClose(id, 0, 0, 0, ...)`.
+    #[test]
+    fn accepts_zero_tuple_waiver_for_an_unused_channel() {
+        let provider = PrivateKeySigner::random();
+        let client = PrivateKeySigner::random();
+        let channel_id = B256::repeat_byte(0x0A);
+        let token = Address::repeat_byte(0x0B);
+        let auth = provider_auth(
+            &provider,
+            channel_id,
+            token,
+            U256::ZERO,
+            U256::ZERO,
+            U256::ZERO,
+        );
+        let (prepared, reconciled) = prepare_close(
+            &auth,
+            channel_id,
+            provider.address(),
+            token,
+            watermark(0, 0, 0),
+            &client,
+            &domain(),
+        )
+        .expect("a zero-tuple waiver on an unused channel is accepted");
+        assert_eq!(prepared.amount, U256::ZERO);
+        assert_eq!(reconciled, None, "nothing to reconcile at the zero tuple");
+        // The client sig recovers to the client key over the zero tuple.
+        let recovered = SignedVoucherCheck::recover(
+            &prepared.client_sig,
+            channel_id,
+            U256::ZERO,
+            U256::ZERO,
+            U256::ZERO,
+            token,
+        );
+        assert_eq!(recovered, client.address());
+    }
+
     #[test]
     fn accepts_provider_watermark_below_authorized() {
         // Provider acked fewer bytes than the client issued — settling at the
