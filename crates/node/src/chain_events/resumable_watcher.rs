@@ -735,7 +735,7 @@ mod tests {
     }
 
     /// A `Seeded { persist: Some(_) }` start writes its cursor forward (origin's
-    /// checkpoint — no production watcher does today; a `persist: None` seed records nothing
+    /// checkpoint, which no production watcher does today. A `persist: None` seed records nothing
     /// (capacity-bond, rebuilt each boot).
     #[test]
     fn seeded_persist_drives_the_forward_checkpoint() {

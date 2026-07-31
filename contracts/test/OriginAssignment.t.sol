@@ -2,6 +2,7 @@
 pragma solidity 0.8.28;
 
 import { Test } from "forge-std/Test.sol";
+import { Vm } from "forge-std/Vm.sol";
 import { IAccessControl } from "@openzeppelin/contracts/access/IAccessControl.sol";
 
 import { OriginAssignment } from "../src/OriginAssignment.sol";
@@ -234,8 +235,6 @@ contract OriginAssignmentTest is Test {
         oa.requestVetting();
         vm.warp(block.timestamp + TIMELOCK + 1);
 
-        vm.expectEmit(true, true, true, true);
-        emit OriginAssignment.VettingRequestCancelled(publisher);
         vm.prank(admin);
         oa.setPublisherVetted(publisher, false);
 
@@ -363,17 +362,30 @@ contract OriginAssignmentTest is Test {
         vm.prank(publisher);
         oaNoBl.addOrigin(NS, opA);
         assertTrue(oaNoBl.isAuthorizedOrigin(NS, opA));
+    }
 
-        // ADR 016 post-deploy step 2: binding the blacklist turns the guard on.
-        // Nothing else proves the setter writes the slot the guard reads — every
-        // other blacklist test gets its binding from the constructor.
+    /// ADR 016 post-deploy step 2: binding the blacklist turns the guard on.
+    /// Nothing else proves the setter writes the slot the guards read — every
+    /// other blacklist test gets its binding from the constructor, so a setter
+    /// that wrote the wrong slot would ship a permanently unenforced blacklist
+    /// with a green suite.
+    function test_setContentBlacklist_turnsTheGuardOn() public {
+        OriginAssignment oaNoBl = new OriginAssignment(bond, registry, address(0), admin);
+        vm.prank(admin);
+        oaNoBl.setPublisherVetted(publisher, true);
+        vm.prank(publisher);
+        oaNoBl.addOrigin(NS, opA);
+
         vm.prank(admin);
         oaNoBl.setContentBlacklist(address(blacklist));
+
         blacklist.setBlacklisted(opB, true);
         vm.prank(publisher);
         vm.expectRevert(abi.encodeWithSelector(OriginAssignment.OperatorBlacklisted.selector, opB));
         oaNoBl.addOrigin(NS, opB);
+
         // And the prune path, which reverted `ContentBlacklistNotSet` before.
+        blacklist.setBlacklisted(opA, true);
         oaNoBl.pruneBlacklistedOrigin(NS, opA);
         assertFalse(oaNoBl.isAuthorizedOrigin(NS, opA));
     }
@@ -581,6 +593,57 @@ contract OriginAssignmentTest is Test {
             address(oa).staticcall(abi.encodeWithSelector(bytes4(keccak256("isVettedPublisher(address)")), publisher));
         assertTrue(ok, "isVettedPublisher(address) must exist at the frozen selector");
         assertTrue(abi.decode(ret, (bool)), "and must answer for a vetted publisher");
+
+        // Same situation, same reason: a public variable bound by hand in
+        // `crates/e2e/src/bindings.rs`.
+        (ok, ret) = address(oa).staticcall(abi.encodeWithSelector(bytes4(keccak256("vettingTimelock()"))));
+        assertTrue(ok, "vettingTimelock() must exist at the frozen selector");
+        assertEq(abi.decode(ret, (uint256)), TIMELOCK, "and must answer the configured delay");
+    }
+
+    /// Event topic0s, frozen. `InterfaceFreeze` pins function selectors, so
+    /// nothing there covers events — and this redesign changed `OriginAdded`
+    /// from one indexed field plus an ABI-encoded array to three indexed fields
+    /// and an empty data section. That shape is what the node's `sol!` binding
+    /// decodes; drift makes every log undecodable, which the watcher swallows by
+    /// design (a `warn!` plus a counter). Without this the only gate is the anvil
+    /// e2e.
+    function test_eventTopics_frozen() public pure {
+        assertEq(
+            OriginAssignment.OriginAdded.selector, keccak256("OriginAdded(uint256,address,address)"), "OriginAdded"
+        );
+        assertEq(
+            OriginAssignment.OriginRemoved.selector,
+            keccak256("OriginRemoved(uint256,address,address)"),
+            "OriginRemoved"
+        );
+        assertEq(
+            OriginAssignment.BlacklistedOriginPruned.selector,
+            keccak256("BlacklistedOriginPruned(uint256,address,address)"),
+            "BlacklistedOriginPruned"
+        );
+        assertEq(
+            OriginAssignment.VettingRequested.selector,
+            keccak256("VettingRequested(address,uint256)"),
+            "VettingRequested"
+        );
+    }
+
+    /// Governance clearing a pending request must not announce it as a
+    /// *cancellation* — that word is reserved for the publisher withdrawing its
+    /// own. A spurious emit here would corrupt the pending-set view of exactly
+    /// the log consumer the event exists for, and Foundry does not fail on
+    /// unexpected events unless an `expectEmit` is armed, so assert it directly.
+    function test_setPublisherVetted_emitsNoCancellation() public {
+        vm.recordLogs();
+        _vet(publisher);
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        for (uint256 i = 0; i < logs.length; ++i) {
+            assertTrue(
+                logs[i].topics[0] != OriginAssignment.VettingRequestCancelled.selector,
+                "governance must not emit VettingRequestCancelled"
+            );
+        }
     }
 
     // -----------------------------------------------------------------

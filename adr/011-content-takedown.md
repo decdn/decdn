@@ -299,7 +299,7 @@ interface IOriginAssignment {
 
     // Vetted namespace owner seats one more authorized origin. Effective
     // immediately. Reverts if msg.sender does not own the namespace, is not
-    // vetted, or if the operator is not active in CapacityBond, is blacklisted,
+    // vetted, or if the operator is not active in CapacityBond,
     // is blacklisted through EITHER ContentBlacklist mapping, is already
     // seated, or would exceed maxOriginsPerNamespace. Validation
     // covers ONLY the operator being added: operators already in the set are
@@ -335,8 +335,7 @@ interface IOriginAssignment {
     function setContentBlacklist(address contentBlacklist) external;
 
     // Governable parameters with safety bounds (see ADR 009). Each emits its
-    // own update event: ContentBlacklistUpdated, MaxOriginsPerNamespaceUpdated,
-    // VettingTimelockUpdated. setPublisherVetted rejects the zero address.
+    // own update event: MaxOriginsPerNamespaceUpdated, VettingTimelockUpdated.
     function setMaxOriginsPerNamespace(uint256 cap) external;
     function setVettingTimelock(uint256 secondsDelay) external;
 
@@ -398,7 +397,7 @@ A registered namespace with no seated origin is **unassigned**. No operator is a
 
 ### Duplicate-address rejection
 
-The contract rejects an `addOrigin` for an operator already seated in the namespace. The authorized set is an `EnumerableSet`, so a repeat add cannot inflate it — the revert turns a silent no-op into an explicit caller error, and it stops a publisher from reading a successful transaction as added redundancy. Operator-set sizing — including how many operators a publisher commits per namespace — is a publisher/governance policy decision, not a contract invariant; the protocol does not enforce a redundancy floor, and `addOrigin` does not impose one.
+The contract rejects an `addOrigin` for an operator already seated in the namespace. The authorized set is an `EnumerableSet`, so a repeat add cannot inflate it. The revert turns a silent no-op into an explicit caller error. It also stops a publisher from reading a successful transaction as added redundancy. Operator-set sizing is a publisher and governance policy decision, not a contract invariant. The protocol enforces no redundancy floor.
 
 ### Cross-contract integration
 
@@ -412,7 +411,7 @@ The contract rejects an `addOrigin` for an operator already seated in the namesp
 
 `ContentBlacklist.addOperator(operator)` does **not** call `OriginAssignment` to evict the operator from every namespace. The naïve approach — iterate every namespace the operator is assigned to and remove them in one transaction — is unbounded: an operator in N namespaces costs O(N) storage writes, and a prolific operator could exceed the block gas limit, blocking the blacklist transaction entirely.
 
-Off-chain consumers of `OriginAssignment.getOrigins(namespaceId)` (clients selecting peers for first-fetch, off-chain monitors checking publisher availability commitments) cross-reference each returned operator against `ContentBlacklist.isOriginBlacklisted` and treat blacklisted entries as unauthorized regardless of stale `OriginAssignment` state. Storage cleanup happens lazily and permissionlessly via `OriginAssignment.pruneBlacklistedOrigin(namespaceId, operator)`: each call removes one entry; anyone may call it (the contract checks `ContentBlacklist.isOriginBlacklisted` itself, so the caller cannot grief by claiming a non-blacklisted operator is blacklisted). Reputation services and other public-good infrastructure will likely run pruning jobs.
+Off-chain consumers of `OriginAssignment.getOrigins(namespaceId)` (clients selecting peers for first-fetch, off-chain monitors checking publisher availability commitments) cross-reference each returned operator against **both** `ContentBlacklist.isOriginBlacklisted` and `isOperatorBlacklisted`, and treat an entry blacklisted through either as unauthorized regardless of stale `OriginAssignment` state. Storage cleanup happens lazily and permissionlessly via `OriginAssignment.pruneBlacklistedOrigin(namespaceId, operator)`: each call removes one entry; anyone may call it (the contract evaluates that same union itself, so the caller cannot grief by claiming a non-blacklisted operator is blacklisted). Reputation services and other public-good infrastructure will likely run pruning jobs.
 
 Net: blacklisting an operator is O(1) on-chain (one ejection call) and storage cleanup is O(1) per call with no transaction-size limit — no design path requires iterating an operator's full namespace set.
 

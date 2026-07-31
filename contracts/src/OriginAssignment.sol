@@ -100,6 +100,13 @@ contract OriginAssignment is AccessControl, ReentrancyGuard {
     // -----------------------------------------------------------------
 
     event VettingRequested(address indexed publisher, uint256 readyAt);
+    /// @notice The publisher withdrew its OWN pending request. Governance never
+    ///         emits this: both `grantVetting` and `setPublisherVetted` also
+    ///         clear a pending request, and both announce it with
+    ///         `PublisherVetted`. A consumer tracking pending requests therefore
+    ///         closes an entry on EITHER event — which is why governance does
+    ///         not emit a second one that would say "cancelled" for a request it
+    ///         actually fulfilled.
     event VettingRequestCancelled(address indexed publisher);
     event PublisherVetted(address indexed publisher, bool vetted, address indexed by);
     event OriginAdded(uint256 indexed namespaceId, address indexed operator, address indexed by);
@@ -219,15 +226,8 @@ contract OriginAssignment is AccessControl, ReentrancyGuard {
     function setPublisherVetted(address publisher, bool vetted) external onlyRole(GOVERNANCE_ROLE) {
         if (publisher == address(0)) revert ZeroAddress();
         // A grant consumes any pending request; a revocation clears it too, so a
-        // ripened request cannot be used to walk straight back in. Announce that
-        // clearing with the same event `cancelVettingRequest` emits, so a log
-        // consumer tracking pending requests does not need to know that
-        // `PublisherVetted` is also a pending-request terminator.
-        // slither-disable-next-line incorrect-equality
-        if (_vettingReadyAt[publisher] != 0) {
-            delete _vettingReadyAt[publisher];
-            emit VettingRequestCancelled(publisher);
-        }
+        // ripened request cannot be used to walk straight back in.
+        delete _vettingReadyAt[publisher];
         isVettedPublisher[publisher] = vetted;
         emit PublisherVetted(publisher, vetted, msg.sender);
     }
@@ -263,9 +263,10 @@ contract OriginAssignment is AccessControl, ReentrancyGuard {
         // Duplicate BEFORE cap: re-adding an operator that is already seated is a
         // caller error whatever the set size, and reporting `TooManyOrigins` for
         // it would name a count the set never reaches.
-        // Both guards read before writing: an `add` that the cap check then
-        // reverts still costs its two SSTOREs, because a revert refunds only the
-        // gas left, not the gas already spent.
+        // Both guards read before writing. Reacting to `add`'s return value
+        // instead would make a doomed at-cap call pay for two SSTOREs it then
+        // throws away, because a revert refunds only the gas left, not the gas
+        // already spent.
         EnumerableSet.AddressSet storage set = _origins[namespaceId];
         if (set.contains(operator)) revert DuplicateOperator(operator);
         // The cap binds ADDS ONLY, so it is not a set-wide invariant: lowering

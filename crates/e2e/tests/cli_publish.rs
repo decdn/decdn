@@ -17,9 +17,9 @@
 //!    watcher's metrics, since an undecodable log is swallowed by design) — and
 //!    `publish revoke` unseats it just as immediately.
 //! 5. A multi-operator `assign` is N transactions, so it can land half-way:
-//!    seating one good and one unbonded operator leaves the first live on-chain
-//!    and prints a `status=partial` receipt naming both, before it exits
-//!    non-zero.
+//!    one good, one unbonded, and one the loop never reaches. The good seat
+//!    stays live on-chain and the `status=partial` receipt names all three with
+//!    distinct states, printed before the command exits non-zero.
 //!
 //! There is no per-hash on-chain claim (ADR 002 § Hash-to-namespace
 //! association) — content is bound to a namespace off-chain at fetch time.
@@ -158,9 +158,9 @@ async fn run() -> anyhow::Result<()> {
     seat_then_unseat(&node, &assignment, namespace_id, operator).await?;
 
     // ---- 6. A multi-operator `assign` is N transactions, so it can land
-    // half-way. Seat a good operator and an unbonded one in the same invocation:
-    // the first must stay live on-chain and the receipt must say so, because an
-    // operator who only sees the error cannot tell what took effect.
+    // half-way. One good operator, one unbonded, one never reached: the first
+    // must stay live on-chain and the receipt must say so, because an operator
+    // who only sees the error cannot tell what took effect.
     partial_seat_reports_what_landed(&node, &chain, &assignment, operator).await
 }
 
@@ -178,6 +178,11 @@ async fn partial_seat_reports_what_landed<P: alloy::providers::Provider>(
     // `OperatorNotActive` — a per-operator guard, which is what makes the run
     // partial rather than uniformly doomed.
     let unbonded = alloy::primitives::Address::repeat_byte(0xDE);
+    // A third operator the loop never reaches. It costs no transaction and no
+    // wall time, but it is the only thing that exercises the receipt's
+    // untried-tail padding: with the run stopping on the LAST operator, that
+    // padding is always empty and could be deleted without failing anything.
+    let untried = alloy::primitives::Address::repeat_byte(0xAD);
 
     let out = run_publish_expect_failure(
         node,
@@ -186,6 +191,7 @@ async fn partial_seat_reports_what_landed<P: alloy::providers::Provider>(
             &ns.to_string(),
             &format!("{operator:#x}"),
             &format!("{unbonded:#x}"),
+            &format!("{untried:#x}"),
             "--json",
         ],
     )
@@ -223,15 +229,22 @@ async fn partial_seat_reports_what_landed<P: alloy::providers::Provider>(
         .context("receipt carries no origins array")?;
     assert_eq!(
         origins.len(),
-        2,
-        "every requested operator must appear: {receipt}"
+        3,
+        "every requested operator must appear, including ones never tried: {receipt}"
     );
     assert_eq!(origins[0]["state"], serde_json::json!("seated"));
     assert!(
         origins[0]["tx"].is_string(),
         "the seat must cite its tx: {receipt}"
     );
-    assert_eq!(origins[1]["state"], serde_json::json!("reverted"));
+    // `failed`, not `reverted`: the guard fires in the pre-flight gas estimate,
+    // so this transaction was never broadcast and there is no tx to look up.
+    assert_eq!(origins[1]["state"], serde_json::json!("failed"));
+    assert!(
+        origins[1]["tx"].is_null(),
+        "nothing was broadcast for it: {receipt}"
+    );
+    assert_eq!(origins[2]["state"], serde_json::json!("not_attempted"));
 
     Ok(())
 }

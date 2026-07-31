@@ -320,6 +320,9 @@ async fn request_vetting(
     // `Ok` on the dry-run path: nothing was sent, so there is nothing to decode
     // and nothing to report as failed.
     let mut deadline: anyhow::Result<u64> = Ok(0);
+    // Whether the request reached the chain. Only then may the error text claim
+    // a queued request the publisher has to reckon with.
+    let mut landed = false;
 
     if !outcome.dry_run {
         let (signer, provider) = signer_and_provider(&resolved, &args.chain).await?;
@@ -345,6 +348,7 @@ async fn request_vetting(
             // handle the publisher has on a request that now blocks re-running
             // this command (`VettingRequestPending`).
             Ok(receipt) => {
+                landed = true;
                 deadline = decode_vetting_deadline(&receipt);
                 if let Ok(ready_at) = deadline {
                     outcome.ready_at = Some(ready_at);
@@ -354,9 +358,12 @@ async fn request_vetting(
                 // A hash that survived the error means the transaction was
                 // broadcast and only its receipt was unreadable: the request may
                 // well be queued, so report it rather than implying nothing
-                // happened.
+                // happened. No hash means the send was rejected or the call
+                // reverted — nothing is queued, and `send_for_receipt`'s own
+                // error already says so.
                 outcome.in_flight = outcome.tx.is_some();
                 deadline = Err(err);
+                landed = false;
             }
         }
     }
@@ -364,19 +371,40 @@ async fn request_vetting(
     let mut out = io::stdout().lock();
     let write_err = write_vetting_outcome(&mut out, &outcome, args.chain.common.json).err();
     drop(out);
-    let in_flight = outcome.in_flight;
+    let context = vetting_failure_context(landed, outcome.in_flight);
     propagate(
-        deadline.err().map(|err| {
-            err.context(if in_flight {
-                "the transaction was broadcast — check the tx above before re-running, since a \
-                 queued request makes `request-vetting` revert VettingRequestPending"
-            } else {
-                "the request is queued on-chain — the tx above is its only handle"
-            })
+        deadline.err().map(|err| match context {
+            Some(note) => err.context(note),
+            None => err,
         }),
         write_err,
         "failed to write request-vetting output",
     )
+}
+
+/// Extra guidance to attach to a `request-vetting` failure, or `None` when the
+/// underlying error already says everything true.
+///
+/// The distinction matters because the publisher's next move differs. A request
+/// that reached the chain blocks the obvious retry (`requestVetting` reverts
+/// `VettingRequestPending`), so the operator must be told it exists. A send that
+/// was rejected — the modal case, since `AlreadyVetted` / `NoNamespaceOwned` /
+/// `VettingRequestPending` all surface from the pre-flight gas estimate before
+/// anything is broadcast — queued nothing, and claiming otherwise sends the
+/// operator looking for a transaction that does not exist.
+const fn vetting_failure_context(landed: bool, in_flight: bool) -> Option<&'static str> {
+    if in_flight {
+        Some(
+            "the transaction was broadcast — check the tx above before re-running, since a \
+             queued request makes `request-vetting` revert VettingRequestPending",
+        )
+    } else if landed {
+        Some("the request is queued on-chain — the tx above is its only handle")
+    } else {
+        // Nothing reached the chain: `send_for_receipt`'s error is already both
+        // accurate and actionable, and there is no hash to point at.
+        None
+    }
 }
 
 /// Pull `readyAt` out of a confirmed `requestVetting` receipt. Split out so the
@@ -439,9 +467,13 @@ fn propagate(
 ) -> anyhow::Result<()> {
     match (chain_err, write_err) {
         (Some(err), None) => Err(err),
-        (Some(err), Some(w)) => {
-            Err(err.context(format!("(the receipt could not be written to stdout: {w})")))
-        }
+        // `anyhow` renders the outermost context first, so this wording has to
+        // lead with the chain failure — the write error is the aside, not the
+        // headline.
+        (Some(err), Some(w)) => Err(err.context(format!(
+            "the command failed on-chain (cause below), and its receipt could not be written \
+             to stdout: {w}"
+        ))),
         (None, Some(w)) => Err(anyhow::Error::from(w).context(write_context)),
         (None, None) => Ok(()),
     }
@@ -451,8 +483,9 @@ fn propagate(
 // assign (instant, one addOrigin per operator)
 // -------------------------------------------------------------------------
 
-/// The failure hint shared by `addOrigin` and `removeOrigin`: every guard the
-/// contract applies, led by the one a publisher hits first.
+/// The `addOrigin` failure hint: every guard the contract applies, led by the one
+/// a publisher hits first. `removeOrigin` has its own, since none of the operator
+/// guards below apply to unseating.
 const ADD_ORIGIN_HINT: &str = "the signer must be a vetted publisher (run `decdn publish \
      request-vetting`, then wait for governance to grant it) and own the namespace; the \
      operator must be an active bonded node, not blacklisted, not already seated, and must \
@@ -471,13 +504,16 @@ pub(crate) enum SeatOutcome {
     Seated(B256),
     /// The transaction was broadcast but its outcome could not be read (the
     /// receipt fetch failed). It may still confirm. `send_for_receipt` records
-    /// the hash before awaiting the receipt precisely so this case can be
-    /// reported; the hash is `None` only in the shape it documents as
-    /// impossible.
-    InFlight(Option<B256>),
-    /// Attempted and definitively did not take effect — the send was rejected,
-    /// or the transaction confirmed as a revert.
-    Reverted,
+    /// the hash before awaiting the receipt precisely so this case can carry it.
+    InFlight(B256),
+    /// Attempted and definitively did not take effect. Covers both a send the
+    /// node rejected (nothing was ever broadcast — the usual shape, since the
+    /// `addOrigin` guards surface from the pre-flight gas estimate) and a
+    /// transaction that confirmed as a revert. `send_for_receipt` clears the
+    /// hash on the latter, so the two are indistinguishable here — which is why
+    /// this is not called `reverted`, a word that would send the operator
+    /// hunting for a transaction that may never have existed.
+    Failed,
     /// The loop stopped before this operator was tried.
     NotAttempted,
 }
@@ -486,9 +522,8 @@ impl SeatOutcome {
     /// The transaction hash, for any state that has one.
     const fn tx(self) -> Option<B256> {
         match self {
-            Self::Seated(hash) => Some(hash),
-            Self::InFlight(hash) => hash,
-            Self::Reverted | Self::NotAttempted => None,
+            Self::Seated(hash) | Self::InFlight(hash) => Some(hash),
+            Self::Failed | Self::NotAttempted => None,
         }
     }
 
@@ -497,7 +532,7 @@ impl SeatOutcome {
         match self {
             Self::Seated(_) => "seated",
             Self::InFlight(_) => "in_flight",
-            Self::Reverted => "reverted",
+            Self::Failed => "failed",
             Self::NotAttempted => "not_attempted",
         }
     }
@@ -508,9 +543,9 @@ impl SeatOutcome {
 /// `seats` carries every requested operator in the order given, each paired with
 /// what happened to it — one entry per operator, always, so the receipt cannot
 /// misattribute a transaction or silently omit an operator. `dry_run` is a field
-/// rather than inferred from the absence of transactions (the convention its
-/// sibling outcome types use) because "nothing was sent" and "the first send
-/// reverted" are different answers that both leave zero seats.
+/// rather than inferred from the absence of transactions because "nothing was
+/// sent" and "the first send failed" are different answers that both leave zero
+/// seats — the same reason `VettingOutcome` and `RevokeOutcome` carry it too.
 pub(crate) struct AssignOutcome {
     pub(crate) operator: Option<Address>,
     pub(crate) origin_assignment: Address,
@@ -542,9 +577,11 @@ impl AssignOutcome {
         {
             return "unknown";
         }
+        // `0` first: an empty `seats` would otherwise satisfy `n == len` and
+        // report every operator seated when none were.
         match self.seated_count() {
-            n if n == self.seats.len() => "seated",
             0 => "failed",
+            n if n == self.seats.len() => "seated",
             _ => "partial",
         }
     }
@@ -633,33 +670,24 @@ async fn assign(args: &cli::AssignArgs, global_config: Option<&Path>) -> anyhow:
             )
             .await;
             match (sent, tx) {
-                (Ok(_), Some(hash)) => outcome.seats.push((*operator, SeatOutcome::Seated(hash))),
-                // `send_for_receipt` records the hash before awaiting the
-                // receipt, so a success with no hash should be unreachable.
-                // Report it as in-flight rather than as a seat we cannot cite.
-                (Ok(_), None) => {
-                    outcome.seats.push((*operator, SeatOutcome::InFlight(None)));
-                    failure = Some((
-                        *operator,
-                        anyhow::anyhow!("addOrigin succeeded but recorded no transaction hash"),
-                    ));
-                    stopped_at = i + 1;
-                    break;
-                }
-                // A hash with an `Err` means the transaction was broadcast and
-                // its outcome could not be read — NOT that it failed. Saying
-                // "reverted" here is how an operator gets told to re-send a
+                // The receipt carries the hash, so a confirmed seat always cites
+                // one — there is no "succeeded but we lost the hash" state to
+                // represent.
+                (Ok(receipt), _) => outcome
+                    .seats
+                    .push((*operator, SeatOutcome::Seated(receipt.transaction_hash))),
+                // A hash surviving an `Err` means the transaction was broadcast
+                // and its outcome could not be read — NOT that it failed. Saying
+                // it failed here is how an operator gets told to re-send a
                 // transaction that is still pending.
                 (Err(err), Some(hash)) => {
-                    outcome
-                        .seats
-                        .push((*operator, SeatOutcome::InFlight(Some(hash))));
+                    outcome.seats.push((*operator, SeatOutcome::InFlight(hash)));
                     failure = Some((*operator, err));
                     stopped_at = i + 1;
                     break;
                 }
                 (Err(err), None) => {
-                    outcome.seats.push((*operator, SeatOutcome::Reverted));
+                    outcome.seats.push((*operator, SeatOutcome::Failed));
                     failure = Some((*operator, err));
                     stopped_at = i + 1;
                     break;
@@ -684,8 +712,9 @@ async fn assign(args: &cli::AssignArgs, global_config: Option<&Path>) -> anyhow:
     let chain_err = failure.map(|(operator, err)| {
         err.context(format!(
             "addOrigin failed for operator {operator:#x} after seating {} of {} (the seated \
-             operators are live; re-run with the operators still marked not_attempted, and \
-             check any marked in_flight on a block explorer before re-sending them)",
+             operators are live; once the cause is fixed, re-run with the operators marked \
+             failed or not_attempted, and check any marked in_flight on a block explorer \
+             before re-sending them)",
             outcome.seated_count(),
             outcome.seats.len(),
         ))
@@ -865,7 +894,7 @@ mod tests {
             namespace_id: 7,
             seats: vec![
                 (landed, SeatOutcome::Seated(B256::repeat_byte(0x55))),
-                (failed, SeatOutcome::Reverted),
+                (failed, SeatOutcome::Failed),
                 (untried, SeatOutcome::NotAttempted),
             ],
             dry_run: false,
@@ -875,7 +904,7 @@ mod tests {
         let s = String::from_utf8(buf).unwrap();
         assert!(s.contains(&format!("  operator={landed:#x} tx=")), "{s}");
         assert!(
-            s.contains(&format!("  operator={failed:#x} state=reverted")),
+            s.contains(&format!("  operator={failed:#x} state=failed")),
             "{s}"
         );
         assert!(
@@ -895,7 +924,7 @@ mod tests {
             origin_assignment: Address::repeat_byte(0x02),
             namespace_id: 7,
             seats: vec![
-                (Address::repeat_byte(0x11), SeatOutcome::Reverted),
+                (Address::repeat_byte(0x11), SeatOutcome::Failed),
                 (Address::repeat_byte(0x22), SeatOutcome::NotAttempted),
             ],
             dry_run: false,
@@ -926,10 +955,7 @@ mod tests {
             namespace_id: 7,
             seats: vec![
                 (landed, SeatOutcome::Seated(B256::repeat_byte(0x55))),
-                (
-                    unknown,
-                    SeatOutcome::InFlight(Some(B256::repeat_byte(0x66))),
-                ),
+                (unknown, SeatOutcome::InFlight(B256::repeat_byte(0x66))),
             ],
             dry_run: false,
         };
@@ -954,6 +980,21 @@ mod tests {
             origins[1]["tx"],
             serde_json::json!(format!("{:#x}", B256::repeat_byte(0x66)))
         );
+    }
+
+    /// `seated` means every requested operator landed. An empty `seats` satisfies
+    /// `seated_count == len` vacuously, so the zero case has to be answered first
+    /// or a receipt with no operators at all claims success.
+    #[test]
+    fn assign_status_does_not_call_an_empty_run_seated() {
+        let empty = AssignOutcome {
+            operator: Some(Address::repeat_byte(0xCD)),
+            origin_assignment: Address::repeat_byte(0x02),
+            namespace_id: 7,
+            seats: Vec::new(),
+            dry_run: false,
+        };
+        assert_eq!(empty.status(), "failed");
     }
 
     #[test]
@@ -1176,6 +1217,30 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
         assert_eq!(v["status"], serde_json::json!("unknown"));
         assert!(v["ready_at"].is_null(), "{v}");
+    }
+
+    /// The guidance attached to a `request-vetting` failure has to distinguish
+    /// three outcomes. Claiming a queued request on the path where the send was
+    /// rejected — the modal failure, since the contract's guards surface from the
+    /// pre-flight gas estimate — sends the publisher looking for a transaction
+    /// that never existed, and contradicts the `status=failed` receipt printed
+    /// one line above.
+    #[test]
+    fn vetting_failure_context_only_claims_a_queued_request_when_one_exists() {
+        // Broadcast, receipt unreadable: the request may exist, so say so.
+        let in_flight = vetting_failure_context(false, true).unwrap();
+        assert!(in_flight.contains("was broadcast"), "{in_flight}");
+        assert!(in_flight.contains("VettingRequestPending"), "{in_flight}");
+
+        // Confirmed, but the deadline could not be decoded: it IS queued.
+        let landed = vetting_failure_context(true, false).unwrap();
+        assert!(landed.contains("queued on-chain"), "{landed}");
+
+        // Nothing reached the chain — no queued request, and no hash to cite.
+        assert!(
+            vetting_failure_context(false, false).is_none(),
+            "a rejected send must not claim a queued request"
+        );
     }
 
     /// A send that never made it on-chain is `failed`, not `dry_run` — the two
