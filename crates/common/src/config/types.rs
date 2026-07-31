@@ -66,9 +66,6 @@ pub struct NetworkConfig {
     /// proceeds (iroh retries in the background); entries with no derivable
     /// host/port are skipped.
     pub relay_urls: Option<Vec<String>>,
-    /// Deprecated single-relay alias for [`Self::relay_urls`]. When set and
-    /// `relay_urls` is absent, it is folded into the list as a single entry.
-    pub relay_url: Option<String>,
     /// Operator-configurable address discovery (#818 scope 1). Absent => the
     /// node uses the n0-hosted pkarr/DNS discovery (`presets::N0`, unchanged).
     /// Present => the node drops the n0 discovery leg and composes only the

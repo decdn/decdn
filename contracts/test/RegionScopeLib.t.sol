@@ -12,10 +12,6 @@ contract RegionScopeHarness {
         return RegionScopeLib.pack(s);
     }
 
-    function effectiveSince(uint64 rlc, uint64 fb, uint64 gate) external pure returns (uint64) {
-        return RegionScopeLib.effectiveSince(rlc, fb, gate);
-    }
-
     function scopedRegions(
         bytes32 globalRegion,
         string memory regionHint,
@@ -82,20 +78,6 @@ contract RegionScopeLibTest is Test {
         assertEq(h.pack("abcdefghijklmnopqrstuvwxyzABCDEFOVERFLOW"), full32);
         // Exactly 32 bytes round-trips too (boundary of the guard).
         assertEq(h.pack("abcdefghijklmnopqrstuvwxyzABCDEF"), full32);
-    }
-
-    // --- effectiveSince -----------------------------------------------------
-
-    function test_effectiveSince_lastChangedWins() public view {
-        // regionLastChanged != 0 takes precedence over both fallbacks.
-        assertEq(h.effectiveSince(500, 100, 300), 500);
-    }
-
-    function test_effectiveSince_fallbackPicksMax() public view {
-        // Never changed: max(firstBondedAt, gate). Both orderings.
-        assertEq(h.effectiveSince(0, 400, 300), 400); // firstBonded > gate
-        assertEq(h.effectiveSince(0, 100, 300), 300); // gate > firstBonded
-        assertEq(h.effectiveSince(0, 300, 300), 300); // equal
     }
 
     // --- scopedRegions ------------------------------------------------------

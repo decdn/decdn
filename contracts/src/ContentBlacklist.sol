@@ -863,19 +863,14 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     ///      ripening window is still open over a distinct previous region.
     // slither-disable-next-line unused-return
     function _scopeRegions(address operator) internal view returns (bytes32 cur, bytes32 prev, bool prevApplies) {
-        (
-            string memory regionHint,
-            string memory regionPrev,
-            uint64 regionLastChanged,
-            uint64 firstBondedAt,
-            uint64 gateActivatedAt,
-            uint256 window
-        ) = capacityBondRegion.regionScopeData(operator);
+        (string memory regionHint, string memory regionPrev, uint64 regionLastChanged, uint256 window) =
+            capacityBondRegion.regionScopeData(operator);
 
-        uint64 effective = RegionScopeLib.effectiveSince(regionLastChanged, firstBondedAt, gateActivatedAt);
+        // The ripening window runs from `regionLastChanged` (set at registration,
+        // restamped on each `updateRegion`), used directly as `effective`.
         // forge-lint: disable-next-line(block-timestamp)
         return RegionScopeLib.scopedRegions(
-            GLOBAL_REGION, regionHint, regionPrev, uint64(block.timestamp), effective, window
+            GLOBAL_REGION, regionHint, regionPrev, uint64(block.timestamp), regionLastChanged, window
         );
     }
 

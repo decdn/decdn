@@ -3,9 +3,10 @@ pragma solidity 0.8.28;
 
 /// @title RegionScopeLib
 /// @notice Pure helpers for the ADR 030 § Region-stability window ripening
-///         predicate: the `effective`-since fallback, region string→bytes32
-///         packing, and the three-leg scope test (global ∪ current-region ∪
-///         ripening-prev-region).
+///         predicate: region string→bytes32 packing and the three-leg scope
+///         test (global ∪ current-region ∪ ripening-prev-region). The window
+///         runs from the operator's `regionLastChanged` stamp, which callers
+///         pass in directly as `effective`.
 /// @dev    Every function is `internal`, so the library inlines into its
 ///         consumers (`SlashJudge`, `ContentBlacklist`) rather than deploying
 ///         separately. This keeps the predicate logic — and the string-packing
@@ -13,24 +14,6 @@ pragma solidity 0.8.28;
 ///         runtime bytecode (`CapacityBond` never imports this library). Mirrors
 ///         the `BondMath.reduceAtTier` extraction rationale.
 library RegionScopeLib {
-    /// @notice ADR 030 § Region-stability window: the `effective`-since stamp
-    ///         that the ripening window runs from.
-    ///         `effective = regionLastChanged != 0 ? regionLastChanged
-    ///                                             : max(firstBondedAt, regionGateActivatedAt)`.
-    /// @dev    The `max(firstBondedAt, regionGateActivatedAt)` fallback keeps the
-    ///         migration cohort conservative: a node bonded long before the gate
-    ///         does not inherit an ancient `firstBondedAt` that passes the window
-    ///         instantly — for a non-upgradeable fresh deploy, `regionGateActivatedAt`
-    ///         is the constructor stamp and `firstBondedAt` is always ≥ it.
-    function effectiveSince(uint64 regionLastChanged, uint64 firstBondedAt, uint64 regionGateActivatedAt)
-        internal
-        pure
-        returns (uint64)
-    {
-        if (regionLastChanged != 0) return regionLastChanged;
-        return firstBondedAt >= regionGateActivatedAt ? firstBondedAt : regionGateActivatedAt;
-    }
-
     /// @notice Pack a region string into a left-aligned, zero-padded `bytes32`,
     ///         matching Solidity's `bytes32("literal")` packing so the result
     ///         compares equal to `ContentBlacklist`'s `bytes32` region keys.

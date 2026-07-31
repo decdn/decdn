@@ -153,15 +153,29 @@ contract CapacityBondRegionE2ETest is Test {
     // ----------------------------------------------------------------------
 
     /// @notice ADR 030 § Region-stability window over a real registration: the
-    ///         first `updateRegion` is cooldown-exempt and snapshots the prior
-    ///         region into `regionPrev`; a second call inside
-    ///         `regionStabilityWindow` reverts `RegionCooldownActive`; once the
-    ///         window elapses the call succeeds and re-snapshots. Asserts the
-    ///         `RegionUpdated` payload on both successful calls.
+    ///         cooldown now runs from `regionLastChanged`, which is stamped at
+    ///         registration, so even the FIRST `updateRegion` is gated —
+    ///         attempting it inside the window reverts `RegionCooldownActive`.
+    ///         Once the window elapses the call succeeds and snapshots the prior
+    ///         region into `regionPrev`; a further call inside the fresh window
+    ///         reverts again; once that elapses it succeeds and re-snapshots.
+    ///         Asserts the `RegionUpdated` payload on both successful calls.
     function test_updateRegion_cooldownPrevSnapshotAndEvent() public {
         _bondAndRegister();
 
-        // First update — no cooldown (regionLastChanged == 0 branch).
+        // `regionLastChanged` is stamped at registration, so the first update is
+        // no longer cooldown-exempt: inside the window it reverts.
+        uint64 registeredAt = bond.regionLastChanged(REG_OPERATOR);
+        assertEq(registeredAt, uint64(block.timestamp));
+        vm.prank(REG_OPERATOR);
+        vm.expectRevert(
+            abi.encodeWithSelector(CapacityBond.RegionCooldownActive.selector, registeredAt + uint64(REGION_WINDOW))
+        );
+        bond.updateRegion("eu-west");
+
+        // Past the window after registration the first update succeeds and
+        // snapshots the registered region into `regionPrev`.
+        vm.warp(uint256(registeredAt) + REGION_WINDOW + 1);
         vm.expectEmit(true, false, false, true, address(bond));
         emit CapacityBond.RegionUpdated(REG_NODE_ID, "us-east", "eu-west");
         vm.prank(REG_OPERATOR);
@@ -171,7 +185,7 @@ contract CapacityBondRegionE2ETest is Test {
 
         uint64 firstChanged = bond.regionLastChanged(REG_OPERATOR);
 
-        // Second update inside the window reverts with the exact ready time.
+        // A further update inside the fresh window reverts with the exact ready time.
         vm.warp(block.timestamp + 1 days);
         vm.prank(REG_OPERATOR);
         vm.expectRevert(
@@ -291,8 +305,10 @@ contract CapacityBondRegionE2ETest is Test {
         _bondAndRegister();
 
         _blacklistRegional(US_EAST, BLOB);
-        // Flip region (first update is cooldown-exempt): current becomes eu-west,
+        // The first update is now gated by the registration-time cooldown stamp,
+        // so warp past REGION_WINDOW before flipping: current becomes eu-west,
         // regionPrev snapshots us-east, regionLastChanged = now.
+        vm.warp(block.timestamp + REGION_WINDOW + 1);
         vm.prank(REG_OPERATOR);
         bond.updateRegion("eu-west");
 
@@ -316,6 +332,9 @@ contract CapacityBondRegionE2ETest is Test {
         _bondAndRegister();
 
         _blacklistRegional(US_EAST, BLOB);
+        // First update is gated by the registration-time cooldown; warp past
+        // REGION_WINDOW before flipping.
+        vm.warp(block.timestamp + REGION_WINDOW + 1);
         vm.prank(REG_OPERATOR);
         bond.updateRegion("eu-west");
 

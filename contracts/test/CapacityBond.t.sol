@@ -1602,24 +1602,6 @@ contract CapacityBondTest is Test {
     // exercised here, plus the ADR 030 ripening-predicate read surface below.
     // ----------------------------------------------------------------------
 
-    function test_regionGateActivatedAt_setAtConstruction() public {
-        // Non-upgradeable fresh deploy == gate activation: the stamp is the
-        // construction block.timestamp (ADR 030 § Region-stability window).
-        vm.warp(4_242_424);
-        CapacityBond fresh = new CapacityBond({
-            token_: token,
-            ed25519Verifier_: ed25519,
-            admin: admin,
-            minBond_: MIN_BOND,
-            unbondingPeriod_: UNBONDING,
-            multiaddrUpdateCooldown_: 0,
-            maxMultiaddrSize_: 1024,
-            regionStabilityWindow_: 7 days,
-            currentTermsHash_: TERMS_HASH
-        });
-        assertEq(fresh.regionGateActivatedAt(), 4_242_424);
-    }
-
     function test_regionScopeData_returnsRegisteredNodeInputs() public {
         uint256 opPk = 0xF00D;
         address opAddr = vm.addr(opPk);
@@ -1638,20 +1620,14 @@ contract CapacityBondTest is Test {
         vm.prank(opAddr);
         bond.registerNode(nodeId, hex"", "us-east", TERMS_HASH, bindingSig, hex"01");
 
-        (
-            string memory regionHint,
-            string memory regionPrev,
-            uint64 regionLastChanged,
-            uint64 firstBondedAt,
-            uint64 gateActivatedAt,
-            uint256 window
-        ) = bond.regionScopeData(opAddr);
+        (string memory regionHint, string memory regionPrev, uint64 regionLastChanged, uint256 window) =
+            bond.regionScopeData(opAddr);
 
         assertEq(regionHint, "us-east");
         assertEq(regionPrev, ""); // never changed
-        assertEq(regionLastChanged, 0); // never changed
-        assertEq(firstBondedAt, bond.firstBondedAt(opAddr));
-        assertEq(gateActivatedAt, bond.regionGateActivatedAt());
+        // Stamped at registration (ADR 030): never 0 for an active node — the
+        // ripening window and `updateRegion` cooldown both run from this stamp.
+        assertEq(regionLastChanged, uint64(block.timestamp));
         assertEq(window, bond.regionStabilityWindow());
     }
 
