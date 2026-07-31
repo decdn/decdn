@@ -50,10 +50,15 @@ abstract contract GuardedBuybackBurner is BuybackBurner {
     /// @notice Ceiling on `slippageBps` so the TWAP floor cannot be configured
     ///         toothless. `_twapFloor` scales by `(BPS_DENOMINATOR - slippageBps)`,
     ///         so a tolerance near `BPS_DENOMINATOR` collapses the floor toward
-    ///         zero and disables the whole MEV stack with no revert and no event —
-    ///         the same fail-open shape `_twapFloor` already rejects for the swap
-    ///         fee. ADR 018 sets the tolerance at 200 bps; 10% leaves ample room
-    ///         for genuine volatility while keeping the guard a guard.
+    ///         zero and disables the whole MEV stack — the same fail-open shape
+    ///         `_twapFloor` already rejects for the swap fee. The failure is
+    ///         silent: no revert, and via the setter only a routine
+    ///         `SlippageUpdated` indistinguishable from any other parameter
+    ///         change. ADR 018 sets the tolerance at 200 bps; 10% leaves ample
+    ///         room for genuine volatility while keeping the guard a guard.
+    ///         Note the low end is unbounded but degenerate: `0` leaves no
+    ///         tolerance for the price impact this parameter absorbs, so
+    ///         buybacks land only when spot beats the TWAP (ADR 018).
     uint256 internal constant SLIPPAGE_CEILING = 1000; // 10%
 
     /// @notice Floor on the constructor `twapMinWindow` so the fail-closed TWAP
@@ -262,8 +267,10 @@ abstract contract GuardedBuybackBurner is BuybackBurner {
     function setMaxBuybackAmount(uint256 newAmount) external onlyRole(GOVERNANCE_ROLE) {
         // A zero ceiling is not an inverted band when the floor is also zero, so
         // `BuybackBandInverted` below would pass it. Reject it here: governance
-        // could otherwise walk the band to `0/0` in two calls and wedge the
-        // burner permanently, holding the FeeRouter's buyback bucket unspendable.
+        // could otherwise walk the band to `0/0` in two calls, stalling every
+        // non-zero buyback while the FeeRouter keeps accruing into the burner.
+        // Recoverable by a further `setMaxBuybackAmount`, so the cost is a
+        // silent, timelock-delayed outage rather than a permanent one.
         if (newAmount == 0) revert BuybackBandDead();
         if (newAmount < minBuybackAmount) revert BuybackBandInverted(minBuybackAmount, newAmount);
         uint256 old = maxBuybackAmount;

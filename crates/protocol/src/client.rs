@@ -711,7 +711,10 @@ impl CooperativeCloseAuth {
 /// The base auth carries only the *provider's* waiver signature, so a client
 /// whose persisted watermark lags the node's — it signed vouchers it did not
 /// durably persist before an unclean exit — has nothing it can check against its
-/// own key and must refuse the close, stranding the channel and its deposit.
+/// own key and must refuse the close. It is not stuck (the `closeChannel` →
+/// dispute window → `settleChannel` fallback remains), but it loses the
+/// one-transaction settle and falls back to submitting a voucher *below* what it
+/// actually signed, underpaying the provider unless the provider disputes.
 /// `last_signature` closes that: it is the client's OWN last-accepted voucher
 /// signature, the same value [`WatermarkBundle::last_signature`] carries on the
 /// fetch path, echoed so the client can verify the node's declared tuple is one
@@ -1442,6 +1445,16 @@ mod tests {
         bytes.extend_from_slice(&[0xAAu8, 0xBB, 0xCC]); // simulated future field
         assert_eq!(parse_cooperative_close_auth_ext(&bytes)?, ext);
         Ok(())
+    }
+
+    /// Mirrors `parse_stream_request_ext_rejects_malformed_remainder`. A garbage
+    /// remainder must be an error, NOT silently read as "no echo" — the client
+    /// distinguishes a node that predates the extension from one that sent
+    /// something it could not read, and only the first is benign.
+    #[test]
+    fn parse_cooperative_close_auth_ext_rejects_malformed_remainder() {
+        // A varint length of 1 with no byte following it.
+        assert!(parse_cooperative_close_auth_ext(&[0x01]).is_err());
     }
 
     #[test]

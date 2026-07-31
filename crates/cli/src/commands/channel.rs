@@ -133,8 +133,9 @@ async fn coop_close(args: &cli::CoopCloseArgs, config_path: Option<&Path>) -> an
         .map_err(|e| anyhow::anyhow!("invalid --node-id {:?}: {e}", args.node_id))?;
     let provider = chain_ctx::parse_address(&args.provider_address, "--provider-address")?;
 
-    // The channel to close is the one tracked for this provider; its watermark is
-    // exactly what this client paid, and the cap on what we'll sign away.
+    // The channel to close is the one tracked for this provider. Its watermark is
+    // the cap on what we'll sign away — absent a node echo proving we signed a
+    // higher tuple (#1495), in which case the close reconciles to that instead.
     let store = RedbBuyerChannelStore::open(&chain.data_dir)?;
     let state = store.get_by_provider(provider)?.ok_or_else(|| {
         anyhow::anyhow!("no buyer channel tracked for provider {provider} — nothing to close")
@@ -162,6 +163,7 @@ async fn coop_close(args: &cli::CoopCloseArgs, config_path: Option<&Path>) -> an
         target = target.with_relay_url(url.clone());
     }
 
+    let mut reconciled = None;
     let outcome = cooperative_close(
         &endpoint,
         target,
@@ -173,16 +175,20 @@ async fn coop_close(args: &cli::CoopCloseArgs, config_path: Option<&Path>) -> an
         &signer,
         &domain,
         Duration::from_millis(args.timeout_ms),
+        &mut reconciled,
     )
-    .await?;
+    .await;
 
-    match outcome {
-        CooperativeCloseOutcome::Settled { reconciled } => {
-            // Our persisted watermark lagged what we had actually signed, and the
-            // provider proved it with our own signature (#1495). Persist the
-            // healed value before forgetting the row, so a failed forget cannot
-            // leave the store claiming less than was settled on-chain.
-            persist_reconciled(&store, provider, state.channel_id, reconciled);
+    // Our persisted watermark lagged what we had actually signed, and the
+    // provider proved it with our own signature (#1495). Persist the healed
+    // value on EVERY path, before inspecting the outcome: it is a tuple we
+    // provably signed regardless of how the transaction resolved, and on the
+    // error paths — where a `get_receipt` failure leaves the settlement unknown
+    // — it is the only record that the chain may already have settled higher.
+    persist_reconciled(&store, provider, state.channel_id, reconciled);
+
+    match outcome? {
+        CooperativeCloseOutcome::Settled => {
             // Deposit refunded on-chain; drop the now-terminal channel so a later
             // fetch opens a fresh one. A failed forget only risks a stale reuse
             // attempt (rejected on-chain), so warn rather than fail the close.
@@ -205,11 +211,7 @@ async fn coop_close(args: &cli::CoopCloseArgs, config_path: Option<&Path>) -> an
                  yet); close it the ordinary way with closeChannel"
             )
         }
-        CooperativeCloseOutcome::Reverted { reconciled } => {
-            // Persist the healed watermark here too: the fallback `closeChannel`
-            // must submit the voucher we actually signed, not the stale one this
-            // command started from.
-            persist_reconciled(&store, provider, state.channel_id, reconciled);
+        CooperativeCloseOutcome::Reverted => {
             anyhow::bail!(
                 "cooperativeClose reverted on-chain for channel {} (it may have raced a \
                  withdraw/close, or the watermark regressed); close it the ordinary way",

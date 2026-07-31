@@ -542,7 +542,8 @@ contract BuybackBurnerBalancerV3Test is Test {
     function test_setMaxBuybackAmount_revertsOnZero() public {
         // `0` is not an *inverted* band once the floor is also 0, so the
         // inverted-band check alone let governance walk the band to `0/0` in two
-        // calls and wedge the burner permanently (#1532).
+        // calls, stalling every non-zero buyback until a further governance call
+        // raised the ceiling (#1532).
         vm.prank(gov);
         bb.setMinBuybackAmount(0);
 

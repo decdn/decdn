@@ -60,8 +60,9 @@ library BuybackVenueLib {
     ///         which is the two-entry-point drift issue #1090 exists to remove.
     error WiringIncomplete(string field);
     /// @notice `maxBuybackAmount_` is zero — a burner receiving the buyback
-    ///         bucket's share of revenue that could never spend it, because
-    ///         `amountIn > maxBuybackAmount` would revert every call forever.
+    ///         bucket's share of revenue that cannot spend it, because
+    ///         `amountIn > maxBuybackAmount` reverts every non-zero buyback
+    ///         until governance raises the ceiling (48h timelock).
     ///         Reachable from production env as
     ///         `MIN_BUYBACK_AMOUNT=0 MAX_BUYBACK_AMOUNT=0`, the "0 means
     ///         unlimited" misreading. `GuardedBuybackBurner.BuybackBandDead` is

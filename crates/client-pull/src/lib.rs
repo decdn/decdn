@@ -1528,57 +1528,46 @@ async fn fetch_inner(
 }
 
 /// The security-critical core shared by every "did WE sign this?" check: does `signature` recover
-/// to `expected` over the voucher `(channel_id, amount, nonce, bytes_delivered, token)` under
-/// `domain`?
+/// to `expected` over `voucher` under `domain`?
 ///
 /// A node's claim about a channel's watermark arrives over an unauthenticated application-level
 /// message — a mid-stream `StreamError` on the fetch path (#1042), a `CooperativeCloseAuth` on the
-/// close path (#1495) — so `amount`/`nonce`/`bytes_delivered` are attacker-controllable on the
-/// wire. Without this check a malicious or buggy upstream could hand back an inflated watermark and
-/// have the client act on it: `reseed` its ledger and then sign a voucher for
-/// `claimed_amount + delta` on the retried pull, or sign away `claimed_amount` outright on a
+/// close path (#1495) — so the claimed `amount`/`nonce`/`bytes_delivered` are attacker-controllable
+/// on the wire. Without this check a malicious or buggy upstream could hand back an inflated
+/// watermark and have the client act on it: `reseed` its ledger and then sign a voucher for the
+/// echoed `amount + delta` on the retried pull, or sign away the echoed `amount` outright on a
 /// cooperative close. Either is a voucher this client genuinely holds the key to sign and the node
 /// can redeem on-chain up to the deposit, draining the channel while delivering ~nothing.
 ///
 /// The client's OWN last-accepted voucher signature closes that hole: a node can only echo back a
 /// signature the client itself produced, so a tuple that verifies is by construction one this client
-/// already committed to. This is the client-side half of exactly the check the node performs before
-/// it ever attaches an echo (`crates/node/src/handlers/client/voucher.rs`:
-/// `signed.recover_signer(&self.voucher_domain) == guard.state.voucher_signer`). A signature that
-/// does not recover to `expected` is treated as a hostile or corrupt echo, never as evidence.
+/// already committed to. That the node's stored signature always matches its stored tuple is the
+/// write-side invariant of `decdn_incentive::ChannelState::accept_voucher`, which writes
+/// `last_amount`/`last_nonce`/`last_bytes_delivered`/`last_signature` together and only after
+/// verifying the signature against the channel's pinned `voucher_signer`. A signature that does not
+/// recover to `expected` is treated as a hostile or corrupt echo, never as evidence.
 ///
-/// Callers MUST verify over the exact tuple they are about to act on — not a tuple derived from it —
-/// so there is no window in which the proof covers one state and the action commits another.
-// The arguments ARE the voucher: bundling them into a struct would just move the
-// same fields behind a name that has no other use, and would let a caller build
-// it once and reuse it across tuples — the exact mistake the paragraph above
-// forbids.
-#[allow(clippy::too_many_arguments)]
+/// Callers MUST verify over the exact tuple they are about to adopt as their new committed baseline
+/// — never a tuple derived from it — so there is no window in which the proof covers one state and
+/// the action commits another. Taking the whole [`Voucher`] rather than its fields loose is what
+/// lets a caller verify and then act on *the same value*: `prepare_close` builds one voucher, proves
+/// it here, and signs that same voucher.
+#[must_use]
 pub fn voucher_signed_by(
-    expected: Address,
-    channel_id: B256,
-    token: Address,
-    domain: &Eip712Domain,
-    amount: U256,
-    nonce: U256,
-    bytes_delivered: U256,
+    voucher: &Voucher,
     signature: &[u8],
+    expected: Address,
+    domain: &Eip712Domain,
 ) -> bool {
     let Ok(signature) = Signature::try_from(signature) else {
         return false;
     };
-    let recovered = SignedVoucher {
-        voucher: Voucher {
-            channel_id,
-            amount,
-            nonce,
-            bytes_delivered,
-            token,
-        },
+    SignedVoucher {
+        voucher: voucher.clone(),
         signature,
     }
-    .recover_signer(domain);
-    recovered.is_ok_and(|recovered| recovered == expected)
+    .recover_signer(domain)
+    .is_ok_and(|recovered| recovered == expected)
 }
 
 /// Extract a resumable, AUTHENTICATED [`WatermarkBundle`] from a pull error, or `None` if the
@@ -1602,15 +1591,18 @@ pub fn resumable_watermark<'a>(
     if bundle.validate().is_err() {
         return None;
     }
+    let claimed = Voucher {
+        channel_id: ctx.channel_id,
+        amount: U256::from_be_bytes(bundle.amount),
+        nonce: U256::from_be_bytes(bundle.nonce),
+        bytes_delivered: U256::from_be_bytes(bundle.bytes_delivered),
+        token: ctx.token,
+    };
     voucher_signed_by(
-        ctx.client_signer.address(),
-        ctx.channel_id,
-        ctx.token,
-        &ctx.voucher_domain,
-        U256::from_be_bytes(bundle.amount),
-        U256::from_be_bytes(bundle.nonce),
-        U256::from_be_bytes(bundle.bytes_delivered),
+        &claimed,
         &bundle.last_signature,
+        ctx.client_signer.address(),
+        &ctx.voucher_domain,
     )
     .then_some(bundle)
 }

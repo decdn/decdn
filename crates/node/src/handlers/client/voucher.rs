@@ -589,21 +589,40 @@ impl ClientHandler {
             };
             // Echo the client's own last-accepted voucher signature (#1495). It
             // is the signature over exactly the tuple declared above — both are
-            // read from the same `guard.state` under the same guard, and the
-            // store writes them together on accept — so a client whose persisted
-            // watermark lags can verify against its own key that the tuple is one
-            // it already signed, instead of dead-ending on the over-claim
-            // refusal with its deposit stranded. Same value and same purpose as
-            // `WatermarkBundle::last_signature` on the fetch path (#1481).
+            // read from the same `guard.state` under the same guard, and
+            // `ChannelState::accept_voucher` writes all four together only after
+            // verifying the signature against `voucher_signer` — so any stored
+            // signature is genuine and can never be paired with a different
+            // tuple. A client whose persisted watermark lags can therefore verify
+            // against its own key that the tuple is one it already signed,
+            // instead of dead-ending on the over-claim refusal and falling back
+            // to the slow `closeChannel` path with a voucher that underpays us.
+            // Same value and same purpose as `WatermarkBundle::last_signature` on
+            // the fetch path (#1481).
             //
-            // `None` (a hydrated state carrying no signature) sends the bare
-            // pre-#1495 auth: the client cannot verify and keeps its refusal.
-            let ext = guard
-                .state
-                .last_signature()
-                .map(|last_signature| CooperativeCloseAuthExt {
+            // `None` sends the bare pre-#1495 auth: the client cannot verify and
+            // keeps its refusal. Control flow has already established
+            // `last_nonce != 0` (the zero-voucher decline returned above) and
+            // `accept_voucher` writes nonce and signature together, so this arm
+            // means precisely a **schema-v1 store record**, which never wrote the
+            // signature segment. That is a real population, not a hypothetical,
+            // and the client it strands is exactly the one #1495 exists for — so
+            // meter it rather than letting a stale row look like a normal waiver.
+            let ext = if let Some(last_signature) = guard.state.last_signature() {
+                Some(CooperativeCloseAuthExt {
                     last_signature: last_signature.to_vec(),
-                });
+                })
+            } else {
+                self.metrics.cooperative_close_auth_no_echo();
+                tracing::warn!(
+                    %channel_id,
+                    nonce = %guard.state.last_nonce(),
+                    "cooperative-close: channel has an accepted voucher but no stored \
+                     signature (pre-v2 store record); sending the bare waiver — a client \
+                     whose watermark lags cannot reconcile and will fall back to closeChannel"
+                );
+                None
+            };
             (auth, ext)
         };
 

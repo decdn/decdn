@@ -427,12 +427,16 @@ since project inception and will roll into the first tagged release.
 #### Payments
 
 - **A cooperative close now reconciles when the client's watermark lags the
-  node's, instead of stranding the channel (#1495).** `decdn channel coop-close`
+  node's (#1495).** `decdn channel coop-close`
   refuses any provider tuple above what the client persisted — correctly, since
   without that guard a provider could ask the client to sign away up to the full
   deposit. But the guard had no reconciliation branch, so a client that signed
-  vouchers it did not durably persist before an unclean exit could never settle,
-  and its deposit stayed locked until expiry. The node now echoes the client's
+  vouchers it did not durably persist before an unclean exit could not
+  cooperatively close at all. Nothing was lost — the `closeChannel` → dispute
+  window → `settleChannel` fallback remains — but the one-transaction settle was
+  unreachable, and the fallback submits a voucher *below* what the client
+  actually signed, underpaying the provider unless it watches the window and
+  disputes. The node now echoes the client's
   **own** last-accepted voucher signature alongside the waiver, and the client
   settles at the node's state only when that signature recovers to its own
   voucher-signing key over exactly the tuple being settled. Anything else keeps
@@ -676,9 +680,11 @@ since project inception and will roll into the first tagged release.
   `_assertBuybackActivated` backstop, had none. That is the two-entry-point drift
   #1090 exists to remove, reintroduced by the fix for it. Both paths now validate at
   the library both already call (`WiringIncomplete`), which also closes a second
-  dead-burner door: `GuardedBuybackBurner` rejects an inverted band but not a zero
-  one, so `MIN_BUYBACK_AMOUNT=0 MAX_BUYBACK_AMOUNT=0` constructed cleanly and then
-  reverted `AboveMaxBuyback` on every call forever (`GuardBandDead`).
+  dead-burner door: at the time `GuardedBuybackBurner` rejected an inverted band
+  but not a zero one, so `MIN_BUYBACK_AMOUNT=0 MAX_BUYBACK_AMOUNT=0` constructed
+  cleanly and then reverted `AboveMaxBuyback` on every non-zero buyback
+  (`GuardBandDead`). Superseded by #1532 — the burner now rejects a zero ceiling
+  itself, and the library guard is retained as a pre-broadcast fail-fast.
 - **`PoolSeed` is self-checking rather than self-describing.** It now records
   `targetPrice`, and `_assertVenueSeedMatches` re-derives `tokenSeed` instead of
   trusting the venue tag. A tag alone is an unverifiable claim by whoever built the

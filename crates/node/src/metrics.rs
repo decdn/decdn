@@ -477,6 +477,16 @@ pub struct DecdnMetrics {
     /// ahead of expiry. Operator-visible name:
     /// `decdn_buyer_reconcile_settled_total`.
     pub buyer_reconcile_settled: Counter,
+    /// Cooperative closes that settled at a watermark ABOVE this node's own
+    /// persisted buyer record, after the provider proved with our own voucher
+    /// signature that we had signed it (#1495). Each increment means our durable
+    /// buyer store lagged what we actually signed — an unclean shutdown that lost
+    /// committed vouchers, or a persistence bug. The close is correct and the
+    /// record is healed, so this is not an error; it is the only signal that the
+    /// underlying durability gap exists at all, and a sustained rate warrants
+    /// investigating the buyer store rather than the close path. Operator-visible
+    /// name: `decdn_buyer_reconcile_watermark_healed_total`.
+    pub buyer_reconcile_watermark_healed: Counter,
     /// Idle buyer channels the reconcile sweep `closeChannel`d **unilaterally**
     /// because the provider was unreachable for a cooperative close (#988) —
     /// either it deregistered (`node_id_for` → `None`) or it failed
@@ -1257,6 +1267,19 @@ pub struct DecdnMetrics {
     /// (ADR 003 §Cooperative close). Visible name:
     /// `decdn_cooperative_close_request_unauthorized_total`.
     pub cooperative_close_request_unauthorized: Counter,
+    /// A cooperative-close waiver was signed for a channel that has an accepted
+    /// voucher but no stored `last_signature`, so the auth went out with no
+    /// `CooperativeCloseAuthExt` echo (#1495). Reachable deterministically for a
+    /// **schema-v1 store record**, which never wrote that segment: `accept_voucher`
+    /// writes nonce and signature together, so `nonce > 0` with no signature can
+    /// only be a pre-v2 row. A client whose own watermark lags then cannot
+    /// reconcile and falls back to the slow `closeChannel` path with a voucher
+    /// that underpays this node. Wire-indistinguishable from a normal waiver, so
+    /// this counter is the only place the distinction lives — a non-zero value on
+    /// a long-lived node means its oldest channel rows predate the signature
+    /// segment. Visible name:
+    /// `decdn_cooperative_close_auth_no_echo_total`.
+    pub cooperative_close_auth_no_echo: Counter,
     /// Delivery refused because the requested bounded range
     /// `[byte_offset, byte_offset + byte_len)` is out of bounds for the blob
     /// (ADR 005 §Bounded byte ranges: the node MUST reject an overflowing or
@@ -1883,6 +1906,10 @@ recorders! {
     /// reclaiming its deposit early (#972).
     buyer_reconcile_settled => buyer_reconcile_settled.inc();
 
+    /// A cooperative close settled above our own persisted watermark, having
+    /// proved we signed it — our durable buyer record had lagged (#1495).
+    buyer_reconcile_watermark_healed => buyer_reconcile_watermark_healed.inc();
+
     /// The reconcile sweep escalated an idle channel to a **unilateral**
     /// `closeChannel` because the provider was unreachable for a cooperative
     /// close — deregistered, or timing out repeatedly (#988/#989). The
@@ -2096,6 +2123,10 @@ recorders! {
     /// Record a `CooperativeCloseRequest` declined for a missing/invalid
     /// channel-client signature (ADR 003 §Cooperative close auth-bypass fix).
     cooperative_close_request_unauthorized => cooperative_close_request_unauthorized.inc();
+
+    /// A waiver was signed for a channel with an accepted voucher but no stored
+    /// signature to echo, so a lagging client cannot reconcile (#1495).
+    cooperative_close_auth_no_echo => cooperative_close_auth_no_echo.inc();
 
     /// Record a `serve_stream` delivery refused because the requested bounded
     /// range is out of bounds for the blob (ADR 005 §Bounded byte ranges).
@@ -3438,6 +3469,9 @@ mod tests {
             "decdn_serve_stream_rejected_chain_hash_denied_total",
             "decdn_serve_stream_rejected_origin_denied_total",
             "decdn_cooperative_close_request_unauthorized_total",
+            // #1495: the two otherwise-invisible cooperative-close paths.
+            "decdn_cooperative_close_auth_no_echo_total",
+            "decdn_buyer_reconcile_watermark_healed_total",
         ];
         let text = metrics.encode().unwrap();
         for name in reasons {
@@ -3460,6 +3494,8 @@ mod tests {
         metrics.serve_stream_rejected_chain_hash_denied();
         metrics.serve_stream_rejected_origin_denied();
         metrics.cooperative_close_request_unauthorized();
+        metrics.cooperative_close_auth_no_echo();
+        metrics.buyer_reconcile_watermark_healed();
 
         let text = metrics.encode().unwrap();
         for name in reasons {

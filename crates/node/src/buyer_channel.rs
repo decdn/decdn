@@ -1595,6 +1595,7 @@ async fn reconcile_one<P: Provider + Clone>(
         nonce: st.last_nonce,
         bytes_delivered: st.last_bytes_delivered,
     };
+    let mut reconciled = None;
     let outcome = cooperative_close(
         &config.endpoint,
         EndpointAddr::new(public_key),
@@ -1606,17 +1607,27 @@ async fn reconcile_one<P: Provider + Clone>(
         signer,
         voucher_domain,
         RECONCILE_DIAL_TIMEOUT,
+        &mut reconciled,
     )
     .await;
+    // Our record lagged what we had actually signed and the provider proved it
+    // with our own signature (#1495). Persist on EVERY path, before matching:
+    // the tuple is one we provably signed however the transaction resolved, and
+    // the `Err` arm below escalates to a unilateral close that must submit it
+    // rather than the stale voucher this sweep started from.
+    //
+    // Metered here rather than inside the helper: a heal means our own durable
+    // store lost committed vouchers, which is a persistence signal worth a fleet
+    // -wide counter even though the close itself is correct.
+    if reconciled.is_some() {
+        metrics.buyer_reconcile_watermark_healed();
+    }
+    persist_reconciled(store, st.provider, st.channel_id, reconciled);
     match outcome {
-        Ok(CooperativeCloseOutcome::Settled { reconciled }) => {
+        Ok(CooperativeCloseOutcome::Settled) => {
             obs.remove(&st.channel_id);
             close_failures.remove(&st.channel_id);
             metrics.buyer_reconcile_settled();
-            // Our record lagged what we had actually signed and the provider
-            // proved it with our own signature (#1495) — persist the healed
-            // watermark before forgetting the row.
-            persist_reconciled(store, st.provider, st.channel_id, reconciled);
             if let Err(err) = store.forget_if_channel(st.provider, st.channel_id) {
                 warn!(
                     channel_id = %st.channel_id, %err,
@@ -1642,15 +1653,12 @@ async fn reconcile_one<P: Provider + Clone>(
                 "reconcile: provider declined cooperative close; backing off, leaving for expiry reclaim"
             );
         }
-        Ok(CooperativeCloseOutcome::Reverted { reconciled }) => {
+        Ok(CooperativeCloseOutcome::Reverted) => {
             // A revert is persistent until something on-chain changes (the
             // provider is reachable; a unilateral close would revert too). Back
             // off the idle tally (~24h); the expiry-reclaim sweep remains the net.
             obs.remove(&st.channel_id);
             close_failures.remove(&st.channel_id);
-            // Persist the healed watermark here too, so the eventual unilateral
-            // close submits the voucher we actually signed, not the stale one.
-            persist_reconciled(store, st.provider, st.channel_id, reconciled);
             warn!(
                 channel_id = %st.channel_id, provider = %st.provider,
                 "reconcile: cooperativeClose reverted on-chain; backing off, leaving for expiry reclaim"
@@ -1721,10 +1729,13 @@ fn persist_reconciled(
         healed.amount,
     ) {
         Ok(AdvanceOutcome::Advanced) => {
-            debug!(
+            // `warn!`, not `debug!`: the close is correct, but reaching here at
+            // all means the durable buyer store lost vouchers we had signed.
+            warn!(
                 %channel_id, %provider, amount = %healed.amount, nonce = %healed.nonce,
-                "reconcile: local watermark lagged; healed from the provider's echo of our own \
-                 voucher signature"
+                "reconcile: local watermark lagged what we had signed; healed from the \
+                 provider's echo of our own voucher signature — the buyer store lost committed \
+                 vouchers (unclean shutdown?)"
             );
         }
         Ok(outcome) => warn!(
@@ -2952,6 +2963,9 @@ async fn reconcile_orphans_once<P: Provider + Clone>(
 }
 
 #[cfg(test)]
+// Test scaffolding legitimately uses unwrap/expect; the workspace anti-panic
+// policy targets runtime code (matches `client-pull`'s test modules).
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use alloy::primitives::{B256, address};
@@ -2968,6 +2982,99 @@ mod tests {
             U256::from(10_000_000u64),
             1_900_000_000,
         )
+    }
+
+    /// `persist_reconciled` must land each component of the healed watermark in
+    /// the field it belongs to.
+    ///
+    /// `advance_progress` takes `(nonce, bytes_delivered, amount)` — three
+    /// adjacent `U256`s in an order that differs from both the struct's field
+    /// order and the tuple order used everywhere else in this flow. Transposing
+    /// any two compiles, runs, warns nothing, and silently persists a watermark
+    /// the next voucher then signs from. Distinct values per field are what makes
+    /// a transposition visible here.
+    #[test]
+    fn persist_reconciled_maps_each_component_to_its_own_field() {
+        let store: Arc<dyn BuyerChannelStore> =
+            Arc::new(decdn_incentive::MemoryBuyerChannelStore::new());
+        let st = sample(0x42);
+        store.record(&st).expect("seed the row");
+
+        persist_reconciled(
+            &store,
+            st.provider,
+            st.channel_id,
+            Some(AuthorizedWatermark {
+                amount: U256::from(700u64),
+                nonce: U256::from(8u64),
+                bytes_delivered: U256::from(90_000u64),
+            }),
+        );
+
+        let row = store
+            .get_by_provider(st.provider)
+            .expect("read back")
+            .expect("row still present");
+        assert_eq!(row.last_amount, U256::from(700u64), "amount");
+        assert_eq!(row.last_nonce, U256::from(8u64), "nonce");
+        assert_eq!(
+            row.last_bytes_delivered,
+            U256::from(90_000u64),
+            "bytes_delivered"
+        );
+    }
+
+    /// `None` means the close never reconciled, so the row must be left exactly
+    /// as it was — a write here would fabricate a watermark.
+    #[test]
+    fn persist_reconciled_without_a_reconciliation_writes_nothing() {
+        let store: Arc<dyn BuyerChannelStore> =
+            Arc::new(decdn_incentive::MemoryBuyerChannelStore::new());
+        let st = sample(0x43);
+        store.record(&st).expect("seed the row");
+
+        persist_reconciled(&store, st.provider, st.channel_id, None);
+
+        let row = store
+            .get_by_provider(st.provider)
+            .expect("read back")
+            .expect("row still present");
+        assert_eq!(row.last_amount, U256::ZERO);
+        assert_eq!(row.last_nonce, U256::ZERO);
+        assert_eq!(row.last_bytes_delivered, U256::ZERO);
+    }
+
+    /// A provider whose slot now names a DIFFERENT channel must not be clobbered:
+    /// `advance_progress` reports `ChannelMismatch` and writes nothing. This is
+    /// the `Ok(other)` warn arm, which would otherwise be dead in test.
+    #[test]
+    fn persist_reconciled_leaves_a_replaced_channel_untouched() {
+        let store: Arc<dyn BuyerChannelStore> =
+            Arc::new(decdn_incentive::MemoryBuyerChannelStore::new());
+        let st = sample(0x44);
+        store.record(&st).expect("seed the row");
+
+        persist_reconciled(
+            &store,
+            st.provider,
+            // A stale channel id for this provider — the slot was replaced.
+            B256::repeat_byte(0xEE),
+            Some(AuthorizedWatermark {
+                amount: U256::from(700u64),
+                nonce: U256::from(8u64),
+                bytes_delivered: U256::from(90_000u64),
+            }),
+        );
+
+        let row = store
+            .get_by_provider(st.provider)
+            .expect("read back")
+            .expect("row still present");
+        assert_eq!(
+            row.last_amount,
+            U256::ZERO,
+            "a mismatched channel must not advance the live row"
+        );
     }
 
     /// Scripted [`ClientChannelReads`]: no provider, no chain. Ids are supplied

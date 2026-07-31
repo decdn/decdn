@@ -1,33 +1,34 @@
 //! Live anvil-backed e2e for the cooperative-close **watermark reconciliation**
 //! path (#1495), against a real node over a real paid `cdn/client/v1` channel.
 //!
-//! The scenario is the one that stranded deposits: a client signs vouchers, the
-//! node accepts and stores them, and then the client's record of what it signed
-//! ends up *behind* the node's — vouchers issued but not durably persisted
-//! before an unclean exit. The over-claim guard in `prepare_close` is correct
-//! (without it a provider could ask the client to sign away up to the full
-//! deposit) but had no reconciliation branch, so the close dead-ended and the
-//! deposit sat locked until expiry.
+//! The scenario: a client signs vouchers, the node accepts and stores them, and
+//! then the client's record of what it signed ends up *behind* the node's —
+//! vouchers issued but not durably persisted before an unclean exit. The
+//! over-claim guard in `prepare_close` is correct (without it a provider could
+//! ask the client to sign away up to the full deposit) but had no reconciliation
+//! branch, so the cooperative close dead-ended. Nothing was lost — the
+//! `closeChannel` → dispute window → `settleChannel` fallback remains — but the
+//! one-transaction settle was unreachable, and the fallback submits a voucher
+//! below what the client actually signed.
 //!
-//! Two journeys share one node, one buyer, and one real paid fetch:
+//! One journey, because one is what needs a live node:
 //!
-//! 1. **A lagging watermark reconciles.** The authorized watermark handed to
-//!    `cooperative_close` is deliberately rolled back below what the fetch
-//!    actually paid — the desync, expressed exactly as an unclean exit would
-//!    leave it. The close must settle anyway, at the *node's* state, and report
-//!    the healed watermark. That the node echoed our own voucher signature is
-//!    what makes this safe, and only a live node exercises that: the echo comes
-//!    from the node's own channel store, populated by the real fetch.
-//! 2. **A channel with nothing to prove is still declined.** The reconcile
-//!    branch only fires on an echo the client can verify against its own key, so
-//!    it must not soften the paths where there is no echo at all. Journey 2 asks
-//!    the node to close a channel it has never seen a voucher for: it declines,
-//!    and the client falls back rather than signing anything.
+//! **A lagging watermark reconciles.** The authorized watermark handed to
+//! `cooperative_close` is deliberately rolled back below what the fetch actually
+//! paid — the desync, expressed exactly as an unclean exit would leave it. The
+//! close must settle anyway, at the *node's* state, and report the healed
+//! watermark, which must then match the on-chain `claimedAmount`. That the node
+//! echoed our own voucher signature is what makes this safe, and only a live
+//! node exercises it: the echo comes from the node's own channel store,
+//! populated by the real paid fetch above.
 //!
-//! The adversarial cases — an echo from a foreign key, and an echo over a
-//! *different* tuple than the one declared — are unit tests in
-//! `client-pull::cooperative_close`, since forging them requires a hostile node
-//! this harness does not model.
+//! Everything else about the branch is cheaper to test elsewhere and is tested
+//! there: the adversarial echoes (foreign key, and a genuine signature over a
+//! *different* tuple) and the no-echo refusal are unit tests in
+//! `client-pull::cooperative_close`, since forging them needs a hostile node
+//! this harness does not model; the node-side attach/omit behaviour is in
+//! `decdn-node`'s `client_loopback`; and the unknown-channel decline is already
+//! covered there too.
 //!
 //! Gated behind the `anvil-e2e` feature (off by default). Requires `anvil` +
 //! `forge` on `PATH`:
@@ -101,15 +102,14 @@ async fn run() -> anyhow::Result<()> {
         node.bind_port(),
     )));
 
-    // The node's true watermark, for the assertion below. Read it before closing:
-    // signing a waiver makes the channel terminal.
-    let paid = pc
+    // Precondition: the channel is funded, so a settle has something to settle.
+    let before = pc
         .getChannel(channel_id)
         .call()
         .await
         .context("read channel before close")?;
     anyhow::ensure!(
-        paid.deposit > U256::ZERO,
+        before.deposit > U256::ZERO,
         "the channel must be funded before the close"
     );
 
@@ -123,6 +123,7 @@ async fn run() -> anyhow::Result<()> {
         bytes_delivered: U256::ZERO,
     };
 
+    let mut reconciled = None;
     let outcome = cooperative_close(
         client.endpoint(),
         target,
@@ -134,16 +135,18 @@ async fn run() -> anyhow::Result<()> {
         client.signer(),
         &domain,
         COOP_CLOSE_TIMEOUT,
+        &mut reconciled,
     )
     .await
     .context("cooperative close with a lagging watermark")?;
 
     // Before #1495 this path could not reach an outcome at all: `prepare_close`
-    // returned an `Err("provider over-claimed: ...")` and the deposit stayed
-    // locked until expiry.
-    let CooperativeCloseOutcome::Settled { reconciled } = outcome else {
-        anyhow::bail!("expected a settled close, got {outcome:?}");
-    };
+    // returned an `Err("provider over-claimed: ...")`, forcing the slow
+    // `closeChannel` fallback with a voucher that underpays the node.
+    anyhow::ensure!(
+        outcome == CooperativeCloseOutcome::Settled,
+        "expected a settled close, got {outcome:?}"
+    );
     let healed = reconciled.ok_or_else(|| {
         anyhow::anyhow!("a close above a zeroed local watermark must report a reconciliation")
     })?;
@@ -165,44 +168,6 @@ async fn run() -> anyhow::Result<()> {
         after.claimedAmount,
         healed.amount
     );
-
-    // Journey 2: a channel the node holds no voucher for. There is nothing to
-    // waive and nothing to echo, so the node declines and the client signs
-    // nothing — the reconcile branch does not weaken that.
-    let fresh = ClientFixture::new(&chain).await?;
-    let (fresh_session, fresh_bytes) = fresh.open_session(&chain, &node, hash).await?;
-    anyhow::ensure!(fresh_bytes == blob, "second buyer's warm-up must deliver");
-    let fresh_rpc = chain.provider_for(fresh.signer());
-    let fresh_pc = PaymentChannel::new(chain.addrs().payment_channel, fresh_rpc);
-    let fresh_target = EndpointAddr::new(node.node_id()).with_ip_addr(SocketAddr::V4(
-        SocketAddrV4::new(Ipv4Addr::LOCALHOST, node.bind_port()),
-    ));
-
-    // Ask to close a channel id the node has never seen.
-    let unknown_channel = alloy::primitives::B256::repeat_byte(0x9E);
-    let declined = cooperative_close(
-        fresh.endpoint(),
-        fresh_target,
-        &fresh_pc,
-        unknown_channel,
-        node.operator_addr(),
-        chain.usdc(),
-        AuthorizedWatermark {
-            amount: U256::ZERO,
-            nonce: U256::ZERO,
-            bytes_delivered: U256::ZERO,
-        },
-        fresh.signer(),
-        &domain,
-        COOP_CLOSE_TIMEOUT,
-    )
-    .await
-    .context("cooperative close on an unknown channel")?;
-    anyhow::ensure!(
-        matches!(declined, CooperativeCloseOutcome::Declined),
-        "an unknown channel must be declined, got {declined:?}"
-    );
-    drop(fresh_session);
 
     Ok(())
 }

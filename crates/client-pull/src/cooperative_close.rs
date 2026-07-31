@@ -8,8 +8,10 @@
 //!
 //! 1. Ask the provider for a waiver over the channel's final watermark
 //!    (`request_cooperative_close_auth`).
-//! 2. Refuse if the provider's returned tuple exceeds what the client actually
-//!    authorized, then verify the waiver signature really is the provider's.
+//! 2. Bound the provider's returned tuple by what the client authorized — or,
+//!    when it exceeds that, by the client's own signature over exactly that
+//!    tuple, echoed back in `CooperativeCloseAuthExt` (#1495). Then verify the
+//!    waiver signature really is the provider's.
 //! 3. Sign a client voucher over the agreed tuple and submit `cooperativeClose`
 //!    in one tx (`cooperative_close`).
 //!
@@ -43,9 +45,12 @@ use crate::voucher_signed_by;
 /// the monotonic on-chain `claimed*` watermark, but neither stops a provider
 /// from asking the client to *sign away* more than it actually owes (up to the
 /// full deposit). This cap is the off-chain guard: the client refuses to sign a
-/// voucher above what it issued. For a buyer-held channel these come straight
-/// from the persisted `BuyerChannelState` (`last_amount`/`last_nonce`/
-/// `last_bytes_delivered`).
+/// voucher above what it issued — **unless** the provider proves, with the
+/// client's own signature over exactly the declared tuple, that the client
+/// already issued the higher one (#1495; see `prepare_close`). For a
+/// buyer-held channel these come straight from the persisted
+/// `BuyerChannelState` (`last_amount`/`last_nonce`/`last_bytes_delivered`),
+/// which is exactly the record that can lag what was actually signed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AuthorizedWatermark {
     /// Highest cumulative amount the client has signed a voucher for.
@@ -57,30 +62,17 @@ pub struct AuthorizedWatermark {
 }
 
 /// Result of a client-initiated cooperative close.
-///
-/// `reconciled` is `Some` when the close settled at a watermark HIGHER than the
-/// caller's persisted record, having proved via the node's echo that the client
-/// itself signed that tuple (#1495). The caller MUST persist it: on `Settled` so
-/// a failed channel-forget cannot leave the store claiming less than was
-/// actually settled, and on `Reverted` so the `closeChannel` fallback submits the
-/// true voucher rather than the stale one it started with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CooperativeCloseOutcome {
     /// Settled on-chain in one tx; the channel is terminal `Closed`.
-    Settled {
-        /// The healed watermark, if the close reconciled a lagging local record.
-        reconciled: Option<AuthorizedWatermark>,
-    },
+    Settled,
     /// The provider has no channel or no accepted voucher and finished without a
     /// waiver. The caller should fall back to `closeChannel`.
     Declined,
     /// The `cooperativeClose` tx was mined but reverted (e.g. it raced a
     /// `withdraw`/`closeChannel`, or the watermark regressed against the on-chain
     /// `claimed*`). The caller should fall back to `closeChannel`.
-    Reverted {
-        /// The healed watermark, if the close reconciled a lagging local record.
-        reconciled: Option<AuthorizedWatermark>,
-    },
+    Reverted,
 }
 
 /// Ask `target` for a cooperative-close waiver on `channel_id` over
@@ -202,18 +194,24 @@ struct PreparedClose {
 ///
 /// The second branch is what lets a client whose persisted watermark legitimately
 /// lags — it signed vouchers it did not durably persist before an unclean exit —
-/// settle at all. Without it the guard is correct but terminal, and the channel
-/// plus its deposit are stranded. It is not a relaxation: proving the client
-/// signed the tuple is strictly stronger evidence than the local record it
-/// replaces, and it is checked over the same tuple this function goes on to sign,
-/// so there is no window between what was proved and what is committed.
+/// cooperatively close at all. Without it the guard is correct but terminal: the
+/// caller keeps the `closeChannel` → dispute window → `settleChannel` fallback,
+/// so nothing is lost, but it forfeits the one-transaction settle and submits a
+/// voucher *below* what it actually signed, underpaying the provider unless the
+/// provider watches the window and disputes. The branch is not a relaxation:
+/// proving the client signed the tuple is strictly stronger evidence than the
+/// local record it replaces, and it is checked over the same tuple this function
+/// goes on to sign, so there is no window between what was proved and what is
+/// committed.
 ///
 /// Returns the prepared close and, when the second branch was taken, the healed
 /// watermark for the caller to persist.
 ///
 /// # Errors
 ///
-/// - provider over-claimed beyond `authorized`,
+/// - the provider echoed a waiver for a different `channel_id`,
+/// - the provider over-claimed beyond `authorized` and supplied no signature of
+///   ours over the declared tuple,
 /// - the waiver signature is malformed or signed by the wrong key,
 /// - client voucher signing fails.
 #[allow(clippy::too_many_arguments)]
@@ -242,35 +240,50 @@ fn prepare_close(
     let nonce = U256::from_be_bytes(auth.nonce);
     let bytes_delivered = U256::from_be_bytes(auth.bytes_delivered);
 
+    // The one statement of the tuple: proved below, then signed below that, so
+    // "what was verified" and "what is committed" are the same VALUE rather than
+    // two locals that happen to agree.
+    let settlement = Voucher {
+        channel_id,
+        amount,
+        nonce,
+        bytes_delivered,
+        token,
+    };
+
     // Never sign away more than we can account for. The provider returns the
     // highest client voucher it holds, which can only be <= what we issued — so a
     // larger tuple is either a misbehaving provider inflating the payout, or our
     // own record lagging what we actually signed.
     //
     // Tell those apart by asking the provider to prove it: `last_signature` must
-    // recover to OUR voucher-signing key over the exact tuple below. Only we
-    // could have produced it, so a tuple that verifies is one we already
-    // committed to and the record — not the waiver — is what was wrong. Anything
-    // that does not verify is refused as before; the channel can still be closed
-    // the slow way.
+    // recover to OUR voucher-signing key over exactly `settlement`. Only we could
+    // have produced it, so a tuple that verifies is one we already committed to
+    // and the record — not the waiver — is what was wrong. Anything that does not
+    // verify is refused as before; the channel can still be closed the slow way.
     let over_claimed = amount > authorized.amount
         || nonce > authorized.nonce
         || bytes_delivered > authorized.bytes_delivered;
     let mut reconciled = None;
     if over_claimed {
         if !voucher_signed_by(
-            client_signer.address(),
-            channel_id,
-            token,
-            domain,
-            amount,
-            nonce,
-            bytes_delivered,
+            &settlement,
             &ext.last_signature,
+            client_signer.address(),
+            domain,
         ) {
+            // Distinguish the two causes: an operator's next action differs.
+            let detail = if ext.last_signature.is_empty() {
+                "and the provider echoed no signature of ours (it may predate the reconcile \
+                 extension, or hold no stored signature for this channel) — close it the \
+                 ordinary way"
+            } else {
+                "and the signature it echoed is not one of ours over that tuple — this provider \
+                 is claiming payment we never authorized"
+            };
             anyhow::bail!(
                 "provider over-claimed: waiver ({amount}, {nonce}, {bytes_delivered}) exceeds \
-                 authorized ({}, {}, {}) and carries no signature of ours over it",
+                 authorized ({}, {}, {}) {detail}",
                 authorized.amount,
                 authorized.nonce,
                 authorized.bytes_delivered
@@ -299,18 +312,13 @@ fn prepare_close(
     .verify_signer(provider_eth, domain)
     .map_err(|e| anyhow::anyhow!("provider waiver verification failed: {e}"))?;
 
-    // Sign our own voucher over the agreed tuple — the client sig the contract
-    // checks against `channel.client`.
-    let client_sig = Voucher {
-        channel_id,
-        amount,
-        nonce,
-        bytes_delivered,
-        token,
-    }
-    .sign(client_signer, domain)
-    .map_err(|e| anyhow::anyhow!("client voucher signing failed: {e}"))?
-    .signature;
+    // Sign the agreed tuple — the same `settlement` value proved above, and the
+    // client sig the contract recovers against the channel's pinned
+    // `voucherSigner`.
+    let client_sig = settlement
+        .sign(client_signer, domain)
+        .map_err(|e| anyhow::anyhow!("client voucher signing failed: {e}"))?
+        .signature;
 
     Ok((
         PreparedClose {
@@ -337,10 +345,25 @@ fn prepare_close(
 /// `claimed*` floor, so a revert is non-fatal ([`CooperativeCloseOutcome`]) — the
 /// caller falls back to `closeChannel`.
 ///
+/// `reconciled` is an out-param, set to `Some` as soon as the provider proves —
+/// with the client's own signature over exactly the declared tuple — that the
+/// client signed a HIGHER watermark than `authorized` (#1495). It is written
+/// **before** the transaction is sent, so it is reported on every return path
+/// including the error ones, mirroring `stream_fetch_tracked`'s `progress`
+/// out-param. That matters: a `get_receipt` failure does not mean the settle
+/// failed, so a caller that only learned the healed watermark from an `Ok` could
+/// keep a stale record for a chain that already settled at the higher tuple.
+/// Persisting it is safe regardless of how the transaction resolves — it is a
+/// tuple this client provably signed, and `advance_progress` is monotonic.
+///
+/// The caller MUST persist it: on a settle so a failed channel-forget cannot
+/// leave the store claiming less than was settled, and on a revert or error so
+/// the `closeChannel` fallback submits the true voucher rather than the stale one.
+///
 /// # Errors
 ///
-/// Network/protocol failure, provider over-claim, waiver verification failure,
-/// signing failure, or an on-chain send/receipt error.
+/// Network/protocol failure, an unproved provider over-claim, waiver
+/// verification failure, signing failure, or an on-chain send/receipt error.
 #[allow(clippy::too_many_arguments)]
 pub async fn cooperative_close<P: Provider>(
     endpoint: &Endpoint,
@@ -353,6 +376,7 @@ pub async fn cooperative_close<P: Provider>(
     client_signer: &PrivateKeySigner,
     domain: &Eip712Domain,
     timeout: Duration,
+    reconciled: &mut Option<AuthorizedWatermark>,
 ) -> anyhow::Result<CooperativeCloseOutcome> {
     let Some((auth, ext)) = request_cooperative_close_auth(
         endpoint,
@@ -367,7 +391,7 @@ pub async fn cooperative_close<P: Provider>(
         return Ok(CooperativeCloseOutcome::Declined);
     };
 
-    let (prepared, reconciled) = prepare_close(
+    let (prepared, healed) = prepare_close(
         &auth,
         &ext,
         channel_id,
@@ -377,6 +401,9 @@ pub async fn cooperative_close<P: Provider>(
         client_signer,
         domain,
     )?;
+    // Report before sending, so every path below — including the two error
+    // returns — hands the caller a watermark it has already proved it signed.
+    *reconciled = healed;
 
     let pending = match contract
         .cooperativeClose(
@@ -399,7 +426,7 @@ pub async fn cooperative_close<P: Provider>(
         // genuine transport/RPC failure (connectivity, nonce) and stays an error
         // the caller should retry, not a settlement signal.
         Err(e) if e.as_revert_data().is_some() => {
-            return Ok(CooperativeCloseOutcome::Reverted { reconciled });
+            return Ok(CooperativeCloseOutcome::Reverted);
         }
         Err(e) => return Err(anyhow::anyhow!("cooperativeClose send failed: {e}")),
     };
@@ -408,9 +435,9 @@ pub async fn cooperative_close<P: Provider>(
         .await
         .map_err(|e| anyhow::anyhow!("cooperativeClose receipt failed: {e}"))?;
     if receipt.status() {
-        Ok(CooperativeCloseOutcome::Settled { reconciled })
+        Ok(CooperativeCloseOutcome::Settled)
     } else {
-        Ok(CooperativeCloseOutcome::Reverted { reconciled })
+        Ok(CooperativeCloseOutcome::Reverted)
     }
 }
 
@@ -712,6 +739,13 @@ mod tests {
         )
         .expect_err("a foreign signature must not unlock the over-claim");
         assert!(err.to_string().contains("over-claimed"), "{err}");
+        // The two refusal causes must read differently: a hostile echo tells the
+        // operator to stop using this provider, an absent one only to close the
+        // slow way. Same string for both would bury the security event.
+        assert!(
+            err.to_string().contains("not one of ours over that tuple"),
+            "a present-but-foreign echo must be named as such: {err}"
+        );
     }
 
     /// The echo must cover the tuple being settled, not merely be *some* voucher
@@ -784,6 +818,10 @@ mod tests {
         )
         .expect_err("no echo ⇒ the pre-#1495 refusal stands");
         assert!(err.to_string().contains("over-claimed"), "{err}");
+        assert!(
+            err.to_string().contains("echoed no signature of ours"),
+            "an absent echo must be distinguishable from a hostile one: {err}"
+        );
     }
 
     /// Recover the signer of a wire voucher signature over a tuple — test helper
