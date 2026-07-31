@@ -316,6 +316,7 @@ Operator runbook entries go in [docs/runbook.md](docs/runbook.md); cross-referen
 **Conventions:**
 
 - File naming: `NNN-topic.md` (zero-padded 3-digit prefix). Check `adr/` for the current highest number to determine the next sequence.
+- Write ADR prose in [ASD-STE100 Simplified Technical English](https://en.wikipedia.org/wiki/Simplified_Technical_English): short sentences, active voice, present tense, one idea per sentence, simple approved vocabulary. Every ADR already follows this — keep new ADRs and edits consistent with it.
 - When changing any ADR, check for cross-ADR consistency — terms, parameters, and protocol names must match across all ADRs and `architecture.md`. This is the most common source of bugs in this repo.
 - `architecture.md` must be updated whenever an ADR changes a user-visible summary point
 

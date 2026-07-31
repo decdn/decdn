@@ -16,6 +16,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for build commands, ADR conventions, pre-
 - List `adr/` and find the highest number before you make a new ADR. Do not trust this note for the current number.
 - Do not use these numbers again: 004, 006, 010, 015, 027, 029, 031, 032, 033, 034, 035. Each one is retired or reclassified.
 - Retired ADRs move to `adr/_history/`. Read the file there if you need the history. Do not add the history to this file.
+- Write ADRs in ASD-STE100 Simplified Technical English: short sentences, active voice, present tense, one idea per sentence. Every ADR follows this. Keep new ADRs and edits the same.
 
 ## Common Commands
 
