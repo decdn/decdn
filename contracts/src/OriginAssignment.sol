@@ -262,15 +262,20 @@ contract OriginAssignment is AccessControl, ReentrancyGuard {
 
         // Duplicate BEFORE cap: re-adding an operator that is already seated is a
         // caller error whatever the set size, and reporting `TooManyOrigins` for
-        // it would name a count the set never reaches. The add is rolled back
-        // with the transaction if the cap check below then reverts.
+        // it would name a count the set never reaches.
+        // Both guards read before writing: an `add` that the cap check then
+        // reverts still costs its two SSTOREs, because a revert refunds only the
+        // gas left, not the gas already spent.
         EnumerableSet.AddressSet storage set = _origins[namespaceId];
-        if (!set.add(operator)) revert DuplicateOperator(operator);
+        if (set.contains(operator)) revert DuplicateOperator(operator);
         // The cap binds ADDS ONLY, so it is not a set-wide invariant: lowering
         // `maxOriginsPerNamespace` leaves larger existing sets in place rather
         // than evicting from them.
         uint256 seated = set.length();
-        if (seated > maxOriginsPerNamespace) revert TooManyOrigins(seated, maxOriginsPerNamespace);
+        if (seated >= maxOriginsPerNamespace) revert TooManyOrigins(seated + 1, maxOriginsPerNamespace);
+        // Necessarily true: the `contains` guard above already rejected a repeat.
+        // slither-disable-next-line unused-return
+        set.add(operator);
         // Idempotent: the namespace enters the key set on its 0→1 transition and
         // the later adds are no-ops.
         // slither-disable-next-line unused-return

@@ -262,9 +262,14 @@ pub(crate) struct VettingOutcome {
     pub(crate) operator: Option<Address>,
     pub(crate) origin_assignment: Address,
     /// Unix time the vetting timelock elapses (earliest governance grant), from
-    /// the `VettingRequested` event. `None` on a dry run.
+    /// the `VettingRequested` event. `None` on a dry run, and `None` when the
+    /// request landed but its deadline could not be recovered.
     pub(crate) ready_at: Option<u64>,
     pub(crate) tx: Option<B256>,
+    /// The transaction was broadcast but its outcome could not be read, so the
+    /// request is neither confirmed queued nor known to have failed.
+    pub(crate) in_flight: bool,
+    pub(crate) dry_run: bool,
 }
 
 pub(crate) fn write_vetting_outcome(
@@ -272,6 +277,7 @@ pub(crate) fn write_vetting_outcome(
     o: &VettingOutcome,
     json: bool,
 ) -> io::Result<()> {
+    let status = single_tx_status(o.dry_run, o.in_flight, o.tx, "vetting_requested");
     if json {
         let value = serde_json::json!({
             "submitted": o.tx.is_some(),
@@ -279,7 +285,7 @@ pub(crate) fn write_vetting_outcome(
             "operator": o.operator.map(|a| format!("{a:#x}")),
             "origin_assignment": format!("{:#x}", o.origin_assignment),
             "ready_at": o.ready_at,
-            "status": if o.tx.is_some() { "vetting_requested" } else { "dry_run" },
+            "status": status,
         });
         return writeln!(w, "{value}");
     }
@@ -290,11 +296,11 @@ pub(crate) fn write_vetting_outcome(
     if let Some(ready_at) = o.ready_at {
         writeln!(w, "ready_at={ready_at}")?;
     }
+    // Requested only: the grant is a separate governance action, and until it
+    // lands `assign` still reverts `PublisherNotVetted`.
     match o.tx {
-        // Requested only: the grant is a separate governance action, and until
-        // it lands `assign` still reverts `PublisherNotVetted`.
-        Some(h) => writeln!(w, "status=vetting_requested tx={h:#x}"),
-        None => writeln!(w, "status=dry_run submitted=false"),
+        Some(h) => writeln!(w, "status={status} tx={h:#x}"),
+        None => writeln!(w, "status={status} submitted=false"),
     }
 }
 
@@ -308,16 +314,18 @@ async fn request_vetting(
         origin_assignment: oa_addr,
         ready_at: None,
         tx: None,
+        in_flight: false,
+        dry_run: args.chain.common.dry_run,
     };
     // `Ok` on the dry-run path: nothing was sent, so there is nothing to decode
     // and nothing to report as failed.
     let mut deadline: anyhow::Result<u64> = Ok(0);
 
-    if !args.chain.common.dry_run {
+    if !outcome.dry_run {
         let (signer, provider) = signer_and_provider(&resolved, &args.chain).await?;
         outcome.operator = Some(signer.address());
         let contract = OriginAssignment::new(oa_addr, &provider);
-        let receipt = decdn_incentive::tx::send_for_receipt(
+        let sent = decdn_incentive::tx::send_for_receipt(
             contract.requestVetting(),
             "requestVetting",
             Some(
@@ -327,26 +335,44 @@ async fn request_vetting(
             ),
             &mut outcome.tx,
         )
-        .await?;
+        .await;
 
-        // Surface the timelock deadline (`readyAt`), matching the honest decode
-        // in `namespace_create`: match by signature, then decode. Every failure
-        // below happens AFTER the request is queued on-chain, so it must not
-        // short-circuit the receipt — the tx hash in `outcome.tx` is the only
-        // handle the publisher has on a request that now blocks re-running this
-        // command (`VettingRequestPending`).
-        deadline = decode_vetting_deadline(&receipt);
-        if let Ok(ready_at) = deadline {
-            outcome.ready_at = Some(ready_at);
+        match sent {
+            // Surface the timelock deadline (`readyAt`), matching the honest
+            // decode in `namespace_create`: match by signature, then decode.
+            // Every failure here happens AFTER the request is queued on-chain,
+            // so it must not short-circuit the receipt — the tx hash is the only
+            // handle the publisher has on a request that now blocks re-running
+            // this command (`VettingRequestPending`).
+            Ok(receipt) => {
+                deadline = decode_vetting_deadline(&receipt);
+                if let Ok(ready_at) = deadline {
+                    outcome.ready_at = Some(ready_at);
+                }
+            }
+            Err(err) => {
+                // A hash that survived the error means the transaction was
+                // broadcast and only its receipt was unreadable: the request may
+                // well be queued, so report it rather than implying nothing
+                // happened.
+                outcome.in_flight = outcome.tx.is_some();
+                deadline = Err(err);
+            }
         }
     }
 
     let mut out = io::stdout().lock();
     let write_err = write_vetting_outcome(&mut out, &outcome, args.chain.common.json).err();
     drop(out);
+    let in_flight = outcome.in_flight;
     propagate(
         deadline.err().map(|err| {
-            err.context("the request is queued on-chain — the tx above is its only handle")
+            err.context(if in_flight {
+                "the transaction was broadcast — check the tx above before re-running, since a \
+                 queued request makes `request-vetting` revert VettingRequestPending"
+            } else {
+                "the request is queued on-chain — the tx above is its only handle"
+            })
         }),
         write_err,
         "failed to write request-vetting output",
@@ -373,6 +399,30 @@ fn decode_vetting_deadline(receipt: &alloy::rpc::types::TransactionReceipt) -> a
         )?;
     u64::try_from(requested.inner.data.readyAt)
         .context("vetting readyAt exceeds u64 (unexpected on this chain)")
+}
+
+/// The `status=` token for a command that submits exactly ONE transaction.
+///
+/// `in_flight` is the case that needs its own answer: the transaction was
+/// broadcast and its outcome could not be read, so neither the success label nor
+/// "failed" is honest. `send_for_receipt` clears the hash on a confirmed revert
+/// and leaves it set when only the receipt fetch failed, which is what makes the
+/// two distinguishable here.
+const fn single_tx_status(
+    dry_run: bool,
+    in_flight: bool,
+    tx: Option<B256>,
+    confirmed: &'static str,
+) -> &'static str {
+    if dry_run {
+        "dry_run"
+    } else if in_flight {
+        "unknown"
+    } else if tx.is_some() {
+        confirmed
+    } else {
+        "failed"
+    }
 }
 
 /// Return the on-chain failure if there was one, otherwise the stdout-write
@@ -647,6 +697,9 @@ async fn assign(args: &cli::AssignArgs, global_config: Option<&Path>) -> anyhow:
 // revoke
 // -------------------------------------------------------------------------
 
+/// Receipt for `publish revoke`. One transaction, so the shape is simpler than
+/// [`AssignOutcome`] — but it needs the same honesty about a broadcast whose
+/// outcome could not be read.
 pub(crate) struct RevokeOutcome {
     pub(crate) operator: Option<Address>,
     pub(crate) origin_assignment: Address,
@@ -654,6 +707,10 @@ pub(crate) struct RevokeOutcome {
     /// The operator being unseated.
     pub(crate) revoked: Address,
     pub(crate) tx: Option<B256>,
+    /// The transaction was broadcast but its outcome could not be read, so the
+    /// operator may or may not still be seated.
+    pub(crate) in_flight: bool,
+    pub(crate) dry_run: bool,
 }
 
 pub(crate) fn write_revoke_outcome(
@@ -661,6 +718,7 @@ pub(crate) fn write_revoke_outcome(
     o: &RevokeOutcome,
     json: bool,
 ) -> io::Result<()> {
+    let status = single_tx_status(o.dry_run, o.in_flight, o.tx, "revoked");
     if json {
         let value = serde_json::json!({
             "submitted": o.tx.is_some(),
@@ -669,7 +727,7 @@ pub(crate) fn write_revoke_outcome(
             "origin_assignment": format!("{:#x}", o.origin_assignment),
             "namespace_id": o.namespace_id,
             "revoked_operator": format!("{:#x}", o.revoked),
-            "status": if o.tx.is_some() { "revoked" } else { "dry_run" },
+            "status": status,
         });
         return writeln!(w, "{value}");
     }
@@ -680,8 +738,8 @@ pub(crate) fn write_revoke_outcome(
     writeln!(w, "namespace_id={}", o.namespace_id)?;
     writeln!(w, "revoked_operator={:#x}", o.revoked)?;
     match o.tx {
-        Some(h) => writeln!(w, "status=revoked tx={h:#x}"),
-        None => writeln!(w, "status=dry_run submitted=false"),
+        Some(h) => writeln!(w, "status={status} tx={h:#x}"),
+        None => writeln!(w, "status={status} submitted=false"),
     }
 }
 
@@ -695,13 +753,19 @@ async fn revoke(args: &cli::RevokeArgs, global_config: Option<&Path>) -> anyhow:
         namespace_id: args.namespace,
         revoked,
         tx: None,
+        in_flight: false,
+        dry_run: args.chain.common.dry_run,
     };
 
-    if !args.chain.common.dry_run {
+    // Print before propagating, for the same reason `assign` does: a broadcast
+    // whose receipt could not be read leaves the hash set, and a `--json`
+    // consumer that only sees the error loses its one handle on the removal.
+    let mut chain_err = None;
+    if !outcome.dry_run {
         let (signer, provider) = signer_and_provider(&resolved, &args.chain).await?;
         outcome.operator = Some(signer.address());
         let contract = OriginAssignment::new(oa_addr, &provider);
-        decdn_incentive::tx::send_for_receipt(
+        if let Err(err) = decdn_incentive::tx::send_for_receipt(
             contract.removeOrigin(U256::from(args.namespace), revoked),
             "removeOrigin",
             Some(
@@ -710,13 +774,24 @@ async fn revoke(args: &cli::RevokeArgs, global_config: Option<&Path>) -> anyhow:
             ),
             &mut outcome.tx,
         )
-        .await?;
+        .await
+        {
+            outcome.in_flight = outcome.tx.is_some();
+            chain_err = Some(if outcome.in_flight {
+                err.context(
+                    "the transaction was broadcast — check the tx above before re-running, \
+                     since a removal that landed makes the retry revert NotAuthorizedOrigin",
+                )
+            } else {
+                err
+            });
+        }
     }
 
     let mut out = io::stdout().lock();
-    write_revoke_outcome(&mut out, &outcome, args.chain.common.json)
-        .context("failed to write revoke output")?;
-    Ok(())
+    let write_err = write_revoke_outcome(&mut out, &outcome, args.chain.common.json).err();
+    drop(out);
+    propagate(chain_err, write_err, "failed to write revoke output")
 }
 
 #[cfg(test)]
@@ -932,6 +1007,8 @@ mod tests {
             origin_assignment: Address::repeat_byte(0x02),
             ready_at: Some(1_700_000_000),
             tx: Some(B256::repeat_byte(0x55)),
+            in_flight: false,
+            dry_run: false,
         };
         let mut buf = Vec::new();
         write_vetting_outcome(&mut buf, &done, false).unwrap();
@@ -943,6 +1020,7 @@ mod tests {
             operator: None,
             ready_at: None,
             tx: None,
+            dry_run: true,
             ..done
         };
         let mut buf = Vec::new();
@@ -961,6 +1039,8 @@ mod tests {
             namespace_id: 7,
             revoked: Address::repeat_byte(0x11),
             tx: Some(B256::repeat_byte(0x55)),
+            in_flight: false,
+            dry_run: false,
         };
         let mut buf = Vec::new();
         write_revoke_outcome(&mut buf, &o, false).unwrap();
@@ -972,6 +1052,7 @@ mod tests {
         let dry = RevokeOutcome {
             operator: None,
             tx: None,
+            dry_run: true,
             ..o
         };
         let mut buf = Vec::new();
@@ -1052,6 +1133,67 @@ mod tests {
         assert!(origins[1]["tx"].is_null(), "{v}");
     }
 
+    /// A `removeOrigin` / `requestVetting` that was broadcast without a readable
+    /// receipt must not print the success label — the operator has to check the
+    /// hash before retrying, because a retry after a landed removal reverts.
+    #[test]
+    fn single_tx_commands_report_an_unreadable_broadcast_as_unknown() {
+        let revoke = RevokeOutcome {
+            operator: Some(Address::repeat_byte(0xCD)),
+            origin_assignment: Address::repeat_byte(0x02),
+            namespace_id: 7,
+            revoked: Address::repeat_byte(0x11),
+            tx: Some(B256::repeat_byte(0x55)),
+            in_flight: true,
+            dry_run: false,
+        };
+        let mut buf = Vec::new();
+        write_revoke_outcome(&mut buf, &revoke, false).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(text.contains("status=unknown tx=0x5555"), "{text}");
+        assert!(!text.contains("status=revoked"), "{text}");
+
+        let mut buf = Vec::new();
+        write_revoke_outcome(&mut buf, &revoke, true).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+        assert_eq!(v["status"], serde_json::json!("unknown"));
+        // The hash still reaches the receipt — it is the operator's only handle.
+        assert_eq!(
+            v["tx"],
+            serde_json::json!(format!("{:#x}", B256::repeat_byte(0x55)))
+        );
+
+        let vetting = VettingOutcome {
+            operator: Some(Address::repeat_byte(0xCD)),
+            origin_assignment: Address::repeat_byte(0x02),
+            ready_at: None,
+            tx: Some(B256::repeat_byte(0x66)),
+            in_flight: true,
+            dry_run: false,
+        };
+        let mut buf = Vec::new();
+        write_vetting_outcome(&mut buf, &vetting, true).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+        assert_eq!(v["status"], serde_json::json!("unknown"));
+        assert!(v["ready_at"].is_null(), "{v}");
+    }
+
+    /// A send that never made it on-chain is `failed`, not `dry_run` — the two
+    /// were indistinguishable while the status was derived from `tx` alone.
+    #[test]
+    fn single_tx_status_separates_failed_from_dry_run() {
+        assert_eq!(single_tx_status(true, false, None, "revoked"), "dry_run");
+        assert_eq!(single_tx_status(false, false, None, "revoked"), "failed");
+        assert_eq!(
+            single_tx_status(false, false, Some(B256::repeat_byte(1)), "revoked"),
+            "revoked"
+        );
+        assert_eq!(
+            single_tx_status(false, true, Some(B256::repeat_byte(1)), "revoked"),
+            "unknown"
+        );
+    }
+
     #[test]
     fn vetting_and_revoke_json_round_trip() {
         let vetting = VettingOutcome {
@@ -1059,6 +1201,8 @@ mod tests {
             origin_assignment: Address::repeat_byte(0x02),
             ready_at: Some(1_700_000_000),
             tx: Some(B256::repeat_byte(0x55)),
+            in_flight: false,
+            dry_run: false,
         };
         let mut buf = Vec::new();
         write_vetting_outcome(&mut buf, &vetting, true).unwrap();
@@ -1072,6 +1216,8 @@ mod tests {
             namespace_id: 7,
             revoked: Address::repeat_byte(0x11),
             tx: None,
+            in_flight: false,
+            dry_run: true,
         };
         let mut buf = Vec::new();
         write_revoke_outcome(&mut buf, &revoke, true).unwrap();
