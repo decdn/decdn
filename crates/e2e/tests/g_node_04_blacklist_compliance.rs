@@ -304,6 +304,13 @@ async fn run_scope_transition() -> anyhow::Result<()> {
         "out-of-region entry must NOT be evicted before the region changes"
     );
 
+    // The operator registered as DE, which stamps `regionLastChanged`; the
+    // `updateRegion` cooldown (= REGION_STABILITY_WINDOW) runs from that stamp,
+    // so step past it before the region change or the tx reverts
+    // `RegionCooldownActive`.
+    let window = chain.region_stability_window().await?;
+    chain.advance_time(window + 60).await?;
+
     // Operator moves to US (no ContentBlacklist event fires) — H is now in scope.
     chain.update_region(node.operator(), "US").await?;
 

@@ -893,10 +893,26 @@ impl ChainFixture {
             .context("read complianceWindow")
     }
 
+    /// `CapacityBond.regionStabilityWindow()` — the ADR 030 region-change cooldown
+    /// (and ripening window), in seconds. Read rather than hardcoded so a
+    /// governance change to the default cannot silently turn a time-advance into
+    /// a no-op.
+    pub async fn region_stability_window(&self) -> anyhow::Result<u64> {
+        let window = CapacityBond::new(self.addrs.capacity_bond, &self.admin)
+            .regionStabilityWindow()
+            .call()
+            .await
+            .context("read regionStabilityWindow")?;
+        u64::try_from(window).context("regionStabilityWindow exceeds u64")
+    }
+
     /// Change an operator's self-attested region via `CapacityBond.updateRegion`
-    /// (ADR 030). Sent by the operator itself. The first change has no cooldown
-    /// (`regionLastChanged` is 0 until the first update). Used to exercise a
-    /// scope transition that emits no `ContentBlacklist` event.
+    /// (ADR 030). Sent by the operator itself. The cooldown (=
+    /// `REGION_STABILITY_WINDOW`) runs from when the current region took effect,
+    /// including registration, so a caller must advance chain time past
+    /// [`Self::region_stability_window`] before the change or the tx reverts
+    /// `RegionCooldownActive`. Used to exercise a scope transition that emits no
+    /// `ContentBlacklist` event.
     pub async fn update_region(
         &self,
         operator: &PrivateKeySigner,

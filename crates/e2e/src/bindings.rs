@@ -81,6 +81,10 @@ alloy::sol! {
         function bindingNonce(address operator) external view returns (uint64);
         function registrationNonce(bytes32 nodeId) external view returns (uint64);
         function updateRegion(string newRegion) external;
+        // ADR 030 region-change cooldown / ripening window (seconds). Read so the
+        // scope-transition journey can advance past the cooldown before its
+        // `updateRegion`, rather than hardcoding the 7-day default.
+        function regionStabilityWindow() external view returns (uint256);
         function declareMbps(uint256 mbps) external;
         function bondRequired(uint256 mbps) external view returns (uint256);
         function activeBond(address operator) external view returns (uint256);
