@@ -165,30 +165,31 @@ alloy::sol! {
         error NotPendingOwner(uint256 namespaceId, address caller);
     }
 
-    /// `OriginAssignment` propose (publisher) + activate (governance) + reads
-    /// (ADR 011). Activation requires `GOVERNANCE_ROLE`; a fixture helper to
-    /// drive it under role impersonation is not yet implemented (forward surface
-    /// for the origin-recognition journeys #1038/#1039).
+    /// `OriginAssignment` publisher vetting (governance) + origin seating
+    /// (publisher) + reads (ADR 011). The two planes: governance vets the
+    /// publisher WALLET once — either the slow `requestVetting` → timelock →
+    /// `grantVetting` path or the instant `setPublisherVetted` override, both
+    /// `GOVERNANCE_ROLE` on the grant side and driven under role impersonation by
+    /// the `ChainFixture` helpers — after which the publisher seats and unseats
+    /// origins itself with no wait.
     #[sol(rpc)]
     contract OriginAssignment {
-        function assignmentTimelock() external view returns (uint256);
-        function proposeAssignment(uint256 namespaceId, address[] operators) external;
-        function activateAssignment(uint256 namespaceId) external;
+        function vettingTimelock() external view returns (uint256);
+        function requestVetting() external;
+        function grantVetting(address publisher) external;
+        function setPublisherVetted(address publisher, bool vetted) external;
+        function isVettedPublisher(address publisher) external view returns (bool);
+        // Unix time a pending vetting request ripens; 0 means none is pending —
+        // the state `decdn publish request-vetting` leaves behind.
+        function getPendingVetting(address publisher) external view returns (uint256);
+        // A vetted namespace owner seats one origin. Instant: `getOrigins`
+        // reflects it in the same transaction.
+        function addOrigin(uint256 namespaceId, address operator) external;
         // Publisher (own namespace) or governance removes one operator, closing
         // the authorized-origin gate for a fresh backend-only hash (#1373).
-        function revokeAssignment(uint256 namespaceId, address operator) external;
+        function removeOrigin(uint256 namespaceId, address operator) external;
         function getOrigins(uint256 namespaceId) external view returns (address[] memory);
         function isAuthorizedOrigin(uint256 namespaceId, address operator) external view returns (bool);
-        // Pending (proposed, not-yet-activated) assignment read — the state
-        // `decdn publish assign` leaves behind, since it only `proposeAssignment`s
-        // (activation is a separate governance step). Returns the proposed
-        // operator set and the timelock deadline (`readyAt == 0` means no pending
-        // proposal). Matches the tuple-return contract signature; alloy generates
-        // a `getPendingAssignmentReturn { operators, readyAt }` struct.
-        function getPendingAssignment(uint256 namespaceId)
-            external
-            view
-            returns (address[] memory operators, uint256 readyAt);
     }
 
     /// `SlashJudge.submitBlacklistChallenge` — the blacklist-violation slash

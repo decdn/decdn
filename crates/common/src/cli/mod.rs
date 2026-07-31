@@ -40,7 +40,7 @@ pub use node::{
 pub use probe::ProbeArgs;
 pub use publish::{
     AssignArgs, NamespaceArgs, NamespaceCommand, NamespaceCreateArgs, PublishArgs,
-    PublishChainArgs, PublishCommand,
+    PublishChainArgs, PublishCommand, RequestVettingArgs, RevokeArgs,
 };
 pub use run::RunArgs;
 pub use setup::{PayBondWith, SetupArgs};
@@ -104,8 +104,10 @@ pub enum Command {
     Bundle(BundleArgs),
     /// Client-side payment-channel lifecycle (`list`/`status`, `coop-close`).
     Channel(ChannelArgs),
-    /// Publisher control plane: create namespaces, claim content hashes, and
-    /// propose authorized-origin operator sets on-chain (issue #1029).
+    /// Publisher control plane: create namespaces, request publisher vetting,
+    /// and seat or unseat authorized origins on-chain (issues #1029 / #1491).
+    /// Content is bound to a namespace off-chain at fetch time, so there is no
+    /// per-hash on-chain claim.
     Publish(PublishArgs),
     /// File a slash appeal, posting the appeal bond (ADR 028).
     Appeal(AppealArgs),

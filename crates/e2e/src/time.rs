@@ -26,7 +26,7 @@ pub async fn mine<P: Provider>(provider: &P) -> anyhow::Result<()> {
 
 /// Advance the chain clock so `block.timestamp >= ready_at`, then mine. A
 /// no-op (still mines once) if the head is already past `ready_at`. Useful for
-/// timelock `readyAt` gates (namespace transfer, origin-assignment activation).
+/// timelock `readyAt` gates (namespace transfer, publisher vetting).
 pub async fn advance_to<P: Provider>(provider: &P, ready_at: u64) -> anyhow::Result<()> {
     let head = provider
         .get_block(alloy::eips::BlockId::latest())

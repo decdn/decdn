@@ -17,7 +17,7 @@
 //!   CLI subcommand, so this leg drives the contract bindings directly.
 //!
 //! Deliberately out of scope: proving content becomes servable *as an origin*.
-//! That needs an `OriginAssignment` proposal, governance activation, and a
+//! That needs an `OriginAssignment` publisher vetting, a seated origin, and a
 //! bonded operator to serve it — G-NODE-08's setup — so this file stops at the
 //! namespace lifecycle.
 //!

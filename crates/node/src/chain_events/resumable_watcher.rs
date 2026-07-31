@@ -72,7 +72,7 @@ pub(crate) enum CursorStart {
     /// Start at an explicit block — a bootstrap snapshot head, already covered
     /// by an out-of-band enumeration. Bypasses floor derivation entirely.
     /// `persist` carries the cursor forward when the projection has a durable
-    /// checkpoint (origin's `AssignmentActivated` cursor) and is `None` for an
+    /// checkpoint (the origin watcher's former cursor) and is `None` for an
     /// ephemeral live-follow rebuilt from its enumeration each boot (the
     /// capacity-bond staker set).
     Seeded {
@@ -735,7 +735,7 @@ mod tests {
     }
 
     /// A `Seeded { persist: Some(_) }` start writes its cursor forward (origin's
-    /// `CheckpointKey::Origin` resume); a `persist: None` seed records nothing
+    /// checkpoint, which no production watcher does today. A `persist: None` seed records nothing
     /// (capacity-bond, rebuilt each boot).
     #[test]
     fn seeded_persist_drives_the_forward_checkpoint() {

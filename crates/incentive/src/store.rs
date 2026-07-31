@@ -167,7 +167,10 @@ pub trait PendingSettleStore: Send + Sync {
 pub enum CheckpointKey {
     /// Settlement watcher `ChannelOpened` high-water block (#751).
     ChannelOpened,
-    /// Origin-directory watcher `AssignmentActivated` scan cursor (#1108).
+    /// Origin-directory watcher scan cursor (#1108). The origin watcher no
+    /// longer persists one (it re-enumerates the namespace set every boot,
+    /// #1504); the key remains the second checkpoint key the store's
+    /// multi-watcher tests exercise.
     Origin,
 }
 

@@ -3,8 +3,8 @@ pragma solidity 0.8.28;
 
 /// @title IContentBlacklistOriginView
 /// @notice Consumer-side view of `ContentBlacklist`'s two operator-blacklist
-///         mappings used by `OriginAssignment.activateAssignment` (operator
-///         re-validation) and `pruneBlacklistedAssignment` (permissionless
+///         mappings used by `OriginAssignment.addOrigin` (operator
+///         validation at seating time) and `pruneBlacklistedOrigin` (permissionless
 ///         cleanup) per ADR 011 § Interaction with ContentBlacklist. Both are
 ///         `ContentBlacklist` public mapping getters. Consulting BOTH closes the
 ///         stale-authorization gap: an operator blacklisted via either the
