@@ -1527,6 +1527,49 @@ async fn fetch_inner(
     Err(anyhow::anyhow!("resume loop exited without returning"))
 }
 
+/// The security-critical core shared by every "did WE sign this?" check: does `signature` recover
+/// to `expected` over `voucher` under `domain`?
+///
+/// A node's claim about a channel's watermark arrives over an unauthenticated application-level
+/// message — a mid-stream `StreamError` on the fetch path (#1042), a `CooperativeCloseAuth` on the
+/// close path (#1495) — so the claimed `amount`/`nonce`/`bytes_delivered` are attacker-controllable
+/// on the wire. Without this check a malicious or buggy upstream could hand back an inflated
+/// watermark and have the client act on it: `reseed` its ledger and then sign a voucher for the
+/// echoed `amount + delta` on the retried pull, or sign away the echoed `amount` outright on a
+/// cooperative close. Either is a voucher this client genuinely holds the key to sign and the node
+/// can redeem on-chain up to the deposit, draining the channel while delivering ~nothing.
+///
+/// The client's OWN last-accepted voucher signature closes that hole: a node can only echo back a
+/// signature the client itself produced, so a tuple that verifies is by construction one this client
+/// already committed to. That the node's stored signature always matches its stored tuple is the
+/// write-side invariant of `decdn_incentive::ChannelState::accept_voucher`, which writes
+/// `last_amount`/`last_nonce`/`last_bytes_delivered`/`last_signature` together and only after
+/// verifying the signature against the channel's pinned `voucher_signer`. A signature that does not
+/// recover to `expected` is treated as a hostile or corrupt echo, never as evidence.
+///
+/// Callers MUST verify over the exact tuple they are about to adopt as their new committed baseline
+/// — never a tuple derived from it — so there is no window in which the proof covers one state and
+/// the action commits another. Taking the whole [`Voucher`] rather than its fields loose is what
+/// lets a caller verify and then act on *the same value*: `prepare_close` builds one voucher, proves
+/// it here, and signs that same voucher.
+#[must_use]
+pub fn voucher_signed_by(
+    voucher: &Voucher,
+    signature: &[u8],
+    expected: Address,
+    domain: &Eip712Domain,
+) -> bool {
+    let Ok(signature) = Signature::try_from(signature) else {
+        return false;
+    };
+    SignedVoucher {
+        voucher: voucher.clone(),
+        signature,
+    }
+    .recover_signer(domain)
+    .is_ok_and(|recovered| recovered == expected)
+}
+
 /// Extract a resumable, AUTHENTICATED [`WatermarkBundle`] from a pull error, or `None` if the
 /// error is not an `UpstreamVoucherRejected`, its reason is not
 /// [`VoucherRejectReason::is_watermark_gated`], it carries no bundle, the bundle fails
@@ -1534,20 +1577,8 @@ async fn fetch_inner(
 /// check — `last_signature` does not recover to this client's OWN voucher-signing address over
 /// the bundle's `amount`/`nonce`/`bytes_delivered`.
 ///
-/// The bundle rides inside a mid-stream `StreamError`, which carries no signature of its own
-/// (#1042) — the upstream node is unauthenticated at this layer, so `amount`/`nonce`/
-/// `bytes_delivered` are otherwise attacker-controllable. Without this check, a malicious or
-/// buggy upstream could hand back an inflated watermark, have this client `reseed` its ledger
-/// to it, and the RETRIED pull would sign a voucher for `bundle.amount + delta` — a voucher this
-/// client genuinely holds the key to sign and the node can redeem on-chain up to the deposit,
-/// draining the channel while delivering ~nothing. `last_signature` closes that hole: it is
-/// supposed to be the client's OWN last-accepted voucher signature, echoed back so the client
-/// can confirm the watermark corresponds to a voucher IT ITSELF signed (see the field's doc on
-/// [`WatermarkBundle`]) — this is the client-side half of exactly the check the node's own gate
-/// performs before it ever attaches a bundle (`crates/node/src/handlers/client/voucher.rs`:
-/// `signed.recover_signer(&self.voucher_domain) == guard.state.voucher_signer`). A bundle whose
-/// signature does not recover to `ctx.client_signer.address()` is treated as a hostile/corrupt
-/// echo, not a legitimate watermark, and is never reseeded from.
+/// That last check is [`voucher_signed_by`]; see its doc for why acting on an unverified watermark
+/// is a channel-draining hole rather than a robustness nicety.
 pub fn resumable_watermark<'a>(
     err: &'a anyhow::Error,
     ctx: &ChannelContext,
@@ -1560,23 +1591,20 @@ pub fn resumable_watermark<'a>(
     if bundle.validate().is_err() {
         return None;
     }
-    let signature = Signature::try_from(bundle.last_signature.as_slice()).ok()?;
-    let recovered = SignedVoucher {
-        voucher: Voucher {
-            channel_id: ctx.channel_id,
-            amount: U256::from_be_bytes(bundle.amount),
-            nonce: U256::from_be_bytes(bundle.nonce),
-            bytes_delivered: U256::from_be_bytes(bundle.bytes_delivered),
-            token: ctx.token,
-        },
-        signature,
-    }
-    .recover_signer(&ctx.voucher_domain)
-    .ok()?;
-    if recovered != ctx.client_signer.address() {
-        return None;
-    }
-    Some(bundle)
+    let claimed = Voucher {
+        channel_id: ctx.channel_id,
+        amount: U256::from_be_bytes(bundle.amount),
+        nonce: U256::from_be_bytes(bundle.nonce),
+        bytes_delivered: U256::from_be_bytes(bundle.bytes_delivered),
+        token: ctx.token,
+    };
+    voucher_signed_by(
+        &claimed,
+        &bundle.last_signature,
+        ctx.client_signer.address(),
+        &ctx.voucher_domain,
+    )
+    .then_some(bundle)
 }
 
 #[allow(clippy::too_many_arguments)]

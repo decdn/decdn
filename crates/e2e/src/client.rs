@@ -167,6 +167,21 @@ impl ClientFixture {
         self.signer.address()
     }
 
+    /// The buyer's voucher-signing key, for journeys that drive a `client-pull`
+    /// entry point directly rather than through [`Self::fetch`] (e.g. the
+    /// cooperative-close path, which is not a fetch).
+    #[must_use]
+    pub const fn signer(&self) -> &Arc<PrivateKeySigner> {
+        &self.signer
+    }
+
+    /// The buyer's loopback iroh endpoint, for the same reason as
+    /// [`Self::signer`].
+    #[must_use]
+    pub const fn endpoint(&self) -> &Endpoint {
+        &self.endpoint
+    }
+
     /// Open a channel to `node`, then fetch `hash` over the paid path, retrying
     /// until the node's chain watcher has observed the `ChannelOpened` event and
     /// begins accepting the channel's vouchers. Verifies the delivered bytes

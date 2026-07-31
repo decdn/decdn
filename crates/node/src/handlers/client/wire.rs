@@ -182,7 +182,17 @@ impl ClientHandler {
         msg: &ClientMessage,
     ) -> anyhow::Result<()> {
         let payload = encode_message(msg).map_err(|e| anyhow::anyhow!("encode failed: {e}"))?;
-        write_frame(send, &payload)
+        self.write_payload(send, &payload).await
+    }
+
+    /// Frame an already-encoded payload. [`Self::write_message`] delegates here
+    /// after encoding a single [`ClientMessage`].
+    pub(super) async fn write_payload(
+        &self,
+        send: &mut SendStream,
+        payload: &[u8],
+    ) -> anyhow::Result<()> {
+        write_frame(send, payload)
             .await
             .map_err(|e| anyhow::anyhow!("write failed: {e}"))
     }

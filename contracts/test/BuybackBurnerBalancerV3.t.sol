@@ -218,6 +218,8 @@ contract BuybackBurnerBalancerV3Test is Test {
 
     uint256 internal constant TWAP_WINDOW = 3600;
     uint256 internal constant SLIPPAGE_BPS = 200;
+    /// Mirrors `GuardedBuybackBurner.SLIPPAGE_CEILING`, which is `internal`.
+    uint256 internal constant SLIPPAGE_CEILING = 1000; // 10%
     uint256 internal constant MIN_BUYBACK = 100e6;
     uint256 internal constant MAX_BUYBACK = 500_000e6;
     uint256 internal constant CAP_FRACTION = 1000; // 10%
@@ -515,9 +517,39 @@ contract BuybackBurnerBalancerV3Test is Test {
         bb.setSlippageTolerance(500);
         assertEq(bb.slippageBps(), 500);
 
+        // The ceiling is inclusive: exactly 10% is accepted, 1 bp above reverts.
         vm.prank(gov);
-        vm.expectRevert(abi.encodeWithSelector(GuardedBuybackBurner.SlippageOutOfBounds.selector, 10_000, 10_000));
-        bb.setSlippageTolerance(10_000);
+        bb.setSlippageTolerance(SLIPPAGE_CEILING);
+        assertEq(bb.slippageBps(), SLIPPAGE_CEILING);
+
+        vm.prank(gov);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                GuardedBuybackBurner.SlippageOutOfBounds.selector, SLIPPAGE_CEILING + 1, SLIPPAGE_CEILING
+            )
+        );
+        bb.setSlippageTolerance(SLIPPAGE_CEILING + 1);
+
+        // The pre-#1532 boundary: anything short of 100% used to pass, which
+        // scaled the TWAP floor to 0.01% of fair value — a disabled guard.
+        vm.prank(gov);
+        vm.expectRevert(
+            abi.encodeWithSelector(GuardedBuybackBurner.SlippageOutOfBounds.selector, 9999, SLIPPAGE_CEILING)
+        );
+        bb.setSlippageTolerance(9999);
+    }
+
+    function test_setMaxBuybackAmount_revertsOnZero() public {
+        // `0` is not an *inverted* band once the floor is also 0, so the
+        // inverted-band check alone let governance walk the band to `0/0` in two
+        // calls, stalling every non-zero buyback until a further governance call
+        // raised the ceiling (#1532).
+        vm.prank(gov);
+        bb.setMinBuybackAmount(0);
+
+        vm.prank(gov);
+        vm.expectRevert(GuardedBuybackBurner.BuybackBandDead.selector);
+        bb.setMaxBuybackAmount(0);
     }
 
     function test_setEpochLiquidityCapFraction_boundsAndGuards() public {
@@ -582,6 +614,35 @@ contract BuybackBurnerBalancerV3Test is Test {
         vm.expectRevert(
             abi.encodeWithSelector(GuardedBuybackBurner.TwapWindowTooShort.selector, 30 minutes - 1, 30 minutes)
         );
+        new BuybackBurnerBalancerV3(IERC20(address(usdc)), ERC20Burnable(address(token)), admin, cfg);
+    }
+
+    function test_constructor_revertsOnSlippageAboveCeiling() public {
+        BuybackBurnerBalancerV3.Config memory cfg = _defaultCfg();
+        cfg.slippageBps_ = SLIPPAGE_CEILING + 1;
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                GuardedBuybackBurner.SlippageOutOfBounds.selector, SLIPPAGE_CEILING + 1, SLIPPAGE_CEILING
+            )
+        );
+        new BuybackBurnerBalancerV3(IERC20(address(usdc)), ERC20Burnable(address(token)), admin, cfg);
+    }
+
+    function test_constructor_acceptsSlippageAtCeiling() public {
+        BuybackBurnerBalancerV3.Config memory cfg = _defaultCfg();
+        cfg.slippageBps_ = SLIPPAGE_CEILING;
+        BuybackBurnerBalancerV3 atCeiling =
+            new BuybackBurnerBalancerV3(IERC20(address(usdc)), ERC20Burnable(address(token)), admin, cfg);
+        assertEq(atCeiling.slippageBps(), SLIPPAGE_CEILING, "ceiling is inclusive");
+    }
+
+    function test_constructor_revertsOnZeroMaxBuyback() public {
+        // `min == max == 0` used to construct cleanly and then revert
+        // `AboveMaxBuyback` on every non-zero call, forever (#1532).
+        BuybackBurnerBalancerV3.Config memory cfg = _defaultCfg();
+        cfg.minBuybackAmount_ = 0;
+        cfg.maxBuybackAmount_ = 0;
+        vm.expectRevert(GuardedBuybackBurner.BuybackBandDead.selector);
         new BuybackBurnerBalancerV3(IERC20(address(usdc)), ERC20Burnable(address(token)), admin, cfg);
     }
 

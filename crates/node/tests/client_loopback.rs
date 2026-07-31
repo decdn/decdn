@@ -5951,13 +5951,16 @@ async fn pull_through_outer_deadline_accommodates_a_slow_pull() -> anyhow::Resul
     Ok(())
 }
 
-/// Open a bidi stream, send one arbitrary [`ClientMessage`], and return the
-/// first decoded reply — the cooperative-close analogue of [`raw_request`].
-async fn raw_message_request(
+/// Open a bidi stream, send one arbitrary [`ClientMessage`], and return the first
+/// decoded reply plus any trailing bytes in the frame. The cooperative-close auth
+/// carries its #1495 watermark echo *inside* the message now (a wire break), so a
+/// well-formed reply leaves the remainder empty — the tests assert that. The
+/// cooperative-close analogue of [`raw_request`].
+async fn raw_message_request_with_remainder(
     client_ep: &Endpoint,
     target: EndpointAddr,
     msg: &ClientMessage,
-) -> anyhow::Result<ClientMessage> {
+) -> anyhow::Result<(ClientMessage, Vec<u8>)> {
     let conn = client_ep
         .connect(target, ALPN_CLIENT)
         .await
@@ -5973,12 +5976,12 @@ async fn raw_message_request(
     let frame = read_frame(&mut recv)
         .await
         .map_err(|e| anyhow::anyhow!("read frame (stream reset?): {e}"))?;
-    let (m, _rest) =
+    let (m, rest) =
         decode_message::<ClientMessage>(&frame).map_err(|e| anyhow::anyhow!("decode: {e}"))?;
-    Ok(m)
+    Ok((m, rest.to_vec()))
 }
 
-/// Like [`raw_message_request`], but maps the provider's *decline* — a clean
+/// Like [`raw_message_request_with_remainder`], but maps the provider's *decline* — a clean
 /// stream finish with no reply frame (surfacing as `UnexpectedEof` while reading
 /// the length prefix) — to `Ok(None)` instead of an error. Mirrors the real
 /// requester's decline handling in `client-pull`'s `request_inner`.
@@ -6137,6 +6140,9 @@ async fn cooperative_close_wrong_signer_is_declined() -> anyhow::Result<()> {
 /// recovers to the node's eth key over the on-chain `CooperativeClose` typed
 /// data, persists the no-longer-serving flag, and refuses subsequent delivery.
 #[tokio::test(flavor = "multi_thread")]
+// One sequential waiver journey (request → verify → flag → refusal) reads more
+// clearly unsplit.
+#[allow(clippy::too_many_lines)]
 async fn cooperative_close_signs_waiver_persists_flag_and_stops_serving() -> anyhow::Result<()> {
     let payload = vec![0x5Au8; 4096];
     let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
@@ -6147,6 +6153,19 @@ async fn cooperative_close_signs_waiver_persists_flag_and_stops_serving() -> any
     let last_amount = U256::from(4_000u64);
     let last_nonce = U256::from(5u64);
     let last_bytes = U256::from(2_048u64);
+    // A REAL client voucher signature over the seeded watermark — the node echoes
+    // it back so a client whose record lags can verify it against its own key
+    // (#1495), so it has to be genuine, not a placeholder.
+    let last_voucher_sig = Voucher {
+        channel_id: channel_id(),
+        amount: last_amount,
+        nonce: last_nonce,
+        bytes_delivered: last_bytes,
+        token: TOKEN,
+    }
+    .sign(signer.as_ref(), &payment_domain())?
+    .signature
+    .as_bytes();
     let store_inner = Arc::new(MemoryChannelStateStore::new());
     store_inner.record(&ChannelState::hydrate(
         channel_id(),
@@ -6157,7 +6176,7 @@ async fn cooperative_close_signs_waiver_persists_flag_and_stops_serving() -> any
         last_amount,
         last_nonce,
         last_bytes,
-        Some([0x11; 65]),
+        Some(last_voucher_sig),
         0,
         false,
     ))?;
@@ -6169,7 +6188,7 @@ async fn cooperative_close_signs_waiver_persists_flag_and_stops_serving() -> any
 
     // (1) Request the waiver, authenticated by the channel client's key.
     let client_signature = sign_coop_close_request(&signer, channel_id(), &payment_domain())?;
-    let reply = raw_message_request(
+    let (reply, remainder) = raw_message_request_with_remainder(
         &client_ep,
         target.clone(),
         &ClientMessage::CooperativeCloseRequest(CooperativeCloseRequest {
@@ -6182,6 +6201,20 @@ async fn cooperative_close_signs_waiver_persists_flag_and_stops_serving() -> any
         ClientMessage::CooperativeCloseAuth(a) => a,
         other => anyhow::bail!("expected CooperativeCloseAuth, got {other:?}"),
     };
+
+    // (1b) The auth carries our own last-accepted voucher signature over the very
+    //      tuple it declares (#1495) — the proof a lagging client checks against
+    //      its own key before settling. It rides inside the message now, so the
+    //      frame has no trailing bytes.
+    anyhow::ensure!(
+        remainder.is_empty(),
+        "the echo rides inside the auth message"
+    );
+    auth.validate()?;
+    anyhow::ensure!(
+        auth.last_signature == last_voucher_sig,
+        "the echo must be the client's own stored voucher signature"
+    );
     anyhow::ensure!(auth.channel_id == channel_id().0, "channel id echoed");
     anyhow::ensure!(
         U256::from_be_bytes(auth.amount) == last_amount,
@@ -6239,6 +6272,64 @@ async fn cooperative_close_signs_waiver_persists_flag_and_stops_serving() -> any
         }
         other => anyhow::bail!("expected StreamResponse, got {other:?}"),
     }
+
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
+/// A channel state hydrated with no stored voucher signature yields a waiver with
+/// no extension (#1495) — the pre-extension payload, byte for byte. The client
+/// then has nothing to verify and keeps its over-claim refusal, which is why
+/// absence is safe rather than a hole.
+#[tokio::test]
+async fn cooperative_close_without_a_stored_signature_omits_the_echo() -> anyhow::Result<()> {
+    let payload = vec![0x6Bu8; 4096];
+    let (cache, _hash, _cache_tmp) = cache_with_blob(&payload).await?;
+
+    let signer = Arc::new(PrivateKeySigner::random());
+    let store_inner = Arc::new(MemoryChannelStateStore::new());
+    store_inner.record(&ChannelState::hydrate(
+        channel_id(),
+        signer.address(),
+        signer.address(),
+        TOKEN,
+        U256::from(10_000_000u64),
+        U256::from(4_000u64),
+        U256::from(5u64),
+        U256::from(2_048u64),
+        None, // no stored signature — nothing to echo
+        0,
+        false,
+    ))?;
+    let store: Arc<dyn ChannelStateStore> = store_inner.clone();
+    let (target, _server_eth, server_ep, server_task, _metrics) =
+        spawn_handler_server_with_metrics(cache, store, RATE_PER_MB, 0, 16).await?;
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+
+    let client_signature = sign_coop_close_request(&signer, channel_id(), &payment_domain())?;
+    let (reply, remainder) = raw_message_request_with_remainder(
+        &client_ep,
+        target,
+        &ClientMessage::CooperativeCloseRequest(CooperativeCloseRequest {
+            channel_id: channel_id().0,
+            client_signature,
+        }),
+    )
+    .await?;
+    let auth = match reply {
+        ClientMessage::CooperativeCloseAuth(a) => a,
+        other => anyhow::bail!("expected CooperativeCloseAuth, got {other:?}"),
+    };
+    anyhow::ensure!(
+        remainder.is_empty(),
+        "the echo rides inside the auth message"
+    );
+    anyhow::ensure!(
+        auth.last_signature.is_empty(),
+        "no stored signature ⇒ an empty echo, but the waiver is still issued"
+    );
 
     client_ep.close().await;
     server_ep.close().await;

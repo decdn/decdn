@@ -667,6 +667,20 @@ pub struct CooperativeCloseRequest {
 /// `PaymentChannel.cooperativeClose` for an immediate, window-free settle.
 /// `amount`/`nonce`/`bytes_delivered` are 256-bit big-endian values for the
 /// same reason as [`Voucher`] — no `U256` in the protocol crate.
+///
+/// `last_signature` is the client's OWN last-accepted voucher signature, echoed
+/// back so a client whose persisted watermark lags the node's — it signed
+/// vouchers it did not durably persist before an unclean exit — can verify the
+/// node's declared tuple is one it already signed before settling at it. Without
+/// it such a client can only refuse the declared tuple (it has nothing to check
+/// against its own key): it is not stuck — the `closeChannel` → dispute window →
+/// `settleChannel` fallback remains — but it loses the one-transaction settle
+/// and falls back to submitting a voucher *below* what it actually signed,
+/// underpaying the provider unless the provider disputes. It is the same value
+/// [`WatermarkBundle::last_signature`] carries on the fetch path. An empty
+/// `last_signature` means the node supplied no echo (its stored channel state
+/// carries no signature); a client that cannot verify keeps its refusal, so an
+/// empty echo is never weaker than a full one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CooperativeCloseAuth {
     /// `channel_id` echoed from the [`CooperativeCloseRequest`].
@@ -680,16 +694,32 @@ pub struct CooperativeCloseAuth {
     /// Provider's EOA secp256k1 EIP-712 `CooperativeClose` signature (`r‖s‖v`,
     /// exactly [`COOPERATIVE_CLOSE_SIG_LEN`]).
     pub signature: Vec<u8>,
+    /// The client's own signature (`r‖s‖v`, exactly [`VOUCHER_SIG_LEN`]) on the
+    /// voucher whose `(amount, nonce, bytes_delivered)` this auth declares (issue
+    /// #1495). Empty ⇒ not supplied. `Vec<u8>` for the same reason as
+    /// [`WatermarkBundle::last_signature`]. This is a shape carried inside an
+    /// unsigned frame — the client MUST still verify the signature recovers to
+    /// its own voucher-signing address over the declared tuple before trusting
+    /// it.
+    pub last_signature: Vec<u8>,
 }
 
 impl CooperativeCloseAuth {
-    /// Validate the wire-level `signature` length ([`COOPERATIVE_CLOSE_SIG_LEN`]).
-    /// The cryptographic check (recovery against the channel's provider) happens
-    /// in `decdn_incentive` once the typed data is reconstructed.
+    /// Validate the wire-level signature lengths: `signature` is exactly
+    /// [`COOPERATIVE_CLOSE_SIG_LEN`], and `last_signature` is empty (not supplied)
+    /// or exactly [`VOUCHER_SIG_LEN`]. These are shape checks; the cryptographic
+    /// checks (the waiver recovers to the channel's provider, and `last_signature`
+    /// recovers to the client's own voucher-signing key over the declared tuple)
+    /// happen in `decdn_client_pull` once the typed data is reconstructed.
     pub const fn validate(&self) -> Result<(), MessageValidationError> {
         if self.signature.len() != COOPERATIVE_CLOSE_SIG_LEN {
             return Err(MessageValidationError::InvalidCooperativeCloseSigLen {
                 len: self.signature.len(),
+            });
+        }
+        if !self.last_signature.is_empty() && self.last_signature.len() != VOUCHER_SIG_LEN {
+            return Err(MessageValidationError::InvalidVoucherSigLen {
+                len: self.last_signature.len(),
             });
         }
         Ok(())
@@ -1190,6 +1220,7 @@ mod tests {
                 nonce: [0u8; 32],
                 bytes_delivered: [0u8; 32],
                 signature: vec![0u8; COOPERATIVE_CLOSE_SIG_LEN],
+                last_signature: Vec::new(),
             }))?,
             8
         );
@@ -1281,11 +1312,57 @@ mod tests {
             nonce: [0u8; 32],
             bytes_delivered: [0u8; 32],
             signature: vec![0u8; COOPERATIVE_CLOSE_SIG_LEN],
+            last_signature: Vec::new(),
         });
         let bytes = postcard::to_allocvec(&last)?;
         let expected_disc = postcard::to_allocvec(&(ClientMessage::VARIANT_COUNT - 1))?;
         assert!(bytes.starts_with(&expected_disc));
         Ok(())
+    }
+
+    fn sample_coop_auth() -> CooperativeCloseAuth {
+        CooperativeCloseAuth {
+            channel_id: [7u8; 32],
+            amount: [1u8; 32],
+            nonce: [2u8; 32],
+            bytes_delivered: [3u8; 32],
+            signature: vec![0xABu8; COOPERATIVE_CLOSE_SIG_LEN],
+            last_signature: vec![0xCDu8; VOUCHER_SIG_LEN],
+        }
+    }
+
+    /// The echo rides inside the base message now (#1495 wire break): a single
+    /// `CooperativeCloseAuth` round-trips through the frame with `last_signature`
+    /// intact — no separate trailing extension to parse.
+    #[test]
+    fn cooperative_close_auth_round_trips_with_echo() -> Result<(), crate::framing::FrameError> {
+        let auth = sample_coop_auth();
+        let payload = encode_message(&ClientMessage::CooperativeCloseAuth(auth.clone()))?;
+        let (msg, remainder) = decode_message::<ClientMessage>(&payload)?;
+        assert_eq!(msg, ClientMessage::CooperativeCloseAuth(auth));
+        assert!(remainder.is_empty(), "no trailing extension bytes");
+        Ok(())
+    }
+
+    #[test]
+    fn cooperative_close_auth_validate_accepts_empty_and_full_echo() {
+        // Full echo.
+        assert!(sample_coop_auth().validate().is_ok());
+        // Empty echo (node supplied none).
+        let mut auth = sample_coop_auth();
+        auth.last_signature.clear();
+        assert!(auth.validate().is_ok());
+    }
+
+    #[test]
+    fn cooperative_close_auth_validate_rejects_wrong_len_echo() {
+        let mut auth = sample_coop_auth();
+        auth.last_signature = vec![0u8; VOUCHER_SIG_LEN - 1];
+        assert!(matches!(
+            auth.validate(),
+            Err(MessageValidationError::InvalidVoucherSigLen { len })
+                if len == VOUCHER_SIG_LEN - 1
+        ));
     }
 
     #[test]

@@ -424,6 +424,60 @@ since project inception and will roll into the first tagged release.
 
 ### Fixed
 
+#### Payments
+
+- **A cooperative close now reconciles when the client's watermark lags the
+  node's (#1495).** `decdn channel coop-close`
+  refuses any provider tuple above what the client persisted — correctly, since
+  without that guard a provider could ask the client to sign away up to the full
+  deposit. But the guard had no reconciliation branch, so a client that signed
+  vouchers it did not durably persist before an unclean exit could not
+  cooperatively close at all. Nothing was lost — the `closeChannel` → dispute
+  window → `settleChannel` fallback remains — but the one-transaction settle was
+  unreachable, and the fallback submits a voucher *below* what the client
+  actually signed, underpaying the provider unless it watches the window and
+  disputes. The node now echoes the client's
+  **own** last-accepted voucher signature alongside the waiver, and the client
+  settles at the node's state only when that signature recovers to its own
+  voucher-signing key over exactly the tuple being settled. Anything else keeps
+  the refusal. This is the same self-heal primitive the fetch path already uses
+  (`WatermarkBundle.last_signature`, #1481), and it strengthens rather than
+  relaxes the check: only the client could have produced the signature.
+  - **Wire-breaking (pre-launch).** The echo is a new `last_signature` field on
+    `CooperativeCloseAuth` itself, not a trailing extension — the network is
+    pre-launch, so there is no mixed-version population to preserve and the field
+    is added directly rather than negotiated. It is empty when the node holds no
+    stored signature for the channel, in which case the client keeps the
+    pre-existing refusal.
+  - `cooperative_close` gains a `reconciled: &mut Option<AuthorizedWatermark>`
+    out-param carrying the healed watermark, written **before** the transaction
+    is sent so every return path reports it — including the error ones, where a
+    failed `get_receipt` leaves the settlement unknown and the chain may already
+    have settled higher. Both callers persist it before inspecting the outcome,
+    so the buyer store is advanced before the channel row is dropped and a
+    `closeChannel` fallback submits the voucher actually signed.
+    `CooperativeCloseOutcome` itself is unchanged (three fieldless variants).
+
+#### Contracts
+
+- **`GuardedBuybackBurner` no longer accepts a slippage tolerance that disables
+  the MEV defense, or a buyback band that can never execute (#1532).**
+  `slippageBps` was rejected only at `>= 100%`, so a value like 9999 scaled the
+  TWAP floor to 0.01% of fair value — the entire ADR 018 MEV stack off, with no
+  revert, no event, and a green deploy. It is now bounded at
+  `SLIPPAGE_CEILING = 1000` (10%, against a 200 bps default) at both the
+  constructor and `setSlippageTolerance`, mirroring the `[1%, 30%]` bound the
+  neighbouring `epochLiquidityCapFraction` already carried at both sites.
+  Separately, `maxBuybackAmount == 0` constructed cleanly and then reverted
+  `AboveMaxBuyback` on every call forever — a burner accruing the FeeRouter's
+  buyback bucket with no way to spend it — and governance could walk the band to
+  `0/0` in two calls, since a zero ceiling is not an *inverted* band once the
+  floor is also zero. Both entry points now revert `BuybackBandDead`. The
+  deploy-time fail-fast `BuybackVenueLib.GuardBandDead` is retained so a mis-set
+  env var still surfaces before the deploy transaction is broadcast. Both bounds
+  are stated in the ADR 018 parameter table; the shipped defaults satisfy them,
+  so no deployment path changes.
+
 #### Cache
 
 - **A poisoned coalescing mutex no longer silently costs origin egress and USDC
@@ -631,9 +685,11 @@ since project inception and will roll into the first tagged release.
   `_assertBuybackActivated` backstop, had none. That is the two-entry-point drift
   #1090 exists to remove, reintroduced by the fix for it. Both paths now validate at
   the library both already call (`WiringIncomplete`), which also closes a second
-  dead-burner door: `GuardedBuybackBurner` rejects an inverted band but not a zero
-  one, so `MIN_BUYBACK_AMOUNT=0 MAX_BUYBACK_AMOUNT=0` constructed cleanly and then
-  reverted `AboveMaxBuyback` on every call forever (`GuardBandDead`).
+  dead-burner door: at the time `GuardedBuybackBurner` rejected an inverted band
+  but not a zero one, so `MIN_BUYBACK_AMOUNT=0 MAX_BUYBACK_AMOUNT=0` constructed
+  cleanly and then reverted `AboveMaxBuyback` on every non-zero buyback
+  (`GuardBandDead`). Superseded by #1532 — the burner now rejects a zero ceiling
+  itself, and the library guard is retained as a pre-broadcast fail-fast.
 - **`PoolSeed` is self-checking rather than self-describing.** It now records
   `targetPrice`, and `_assertVenueSeedMatches` re-derives `tokenSeed` instead of
   trusting the venue tag. A tag alone is an unverifiable claim by whoever built the

@@ -60,9 +60,9 @@ import { BuybackVenueLib } from "./lib/BuybackVenueLib.sol";
 ///           - `UNISWAP_POOL`         — seeded TOKEN/USDC V3 pool
 ///
 ///         Optional shared env vars (defaults from ADR 018 § Parameter Table):
-///           - `MAX_BUYBACK_AMOUNT`        (default 10_000e6 USDC)
+///           - `MAX_BUYBACK_AMOUNT`        (default 10_000e6 USDC; must be non-zero)
 ///           - `MIN_BUYBACK_AMOUNT`        (default 100e6 USDC)
-///           - `SLIPPAGE_BPS`              (default 200)
+///           - `SLIPPAGE_BPS`              (default 200; ceiling 1000 = 10%)
 ///           - `EPOCH_CAP_FRACTION_BPS`    (default 1000 = 10%)
 ///           - `TWAP_MIN_WINDOW_SECS`      (default 1800)
 contract ActivateBuyback is Script {

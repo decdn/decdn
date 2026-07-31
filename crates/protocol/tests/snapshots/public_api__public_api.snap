@@ -61,6 +61,7 @@ pub struct decdn_protocol::client::CooperativeCloseAuth
 pub decdn_protocol::client::CooperativeCloseAuth::amount: [u8; 32]
 pub decdn_protocol::client::CooperativeCloseAuth::bytes_delivered: [u8; 32]
 pub decdn_protocol::client::CooperativeCloseAuth::channel_id: [u8; 32]
+pub decdn_protocol::client::CooperativeCloseAuth::last_signature: alloc::vec::Vec<u8>
 pub decdn_protocol::client::CooperativeCloseAuth::nonce: [u8; 32]
 pub decdn_protocol::client::CooperativeCloseAuth::signature: alloc::vec::Vec<u8>
 impl decdn_protocol::client::CooperativeCloseAuth

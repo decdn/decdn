@@ -1595,6 +1595,7 @@ async fn reconcile_one<P: Provider + Clone>(
         nonce: st.last_nonce,
         bytes_delivered: st.last_bytes_delivered,
     };
+    let mut reconciled = None;
     let outcome = cooperative_close(
         &config.endpoint,
         EndpointAddr::new(public_key),
@@ -1606,8 +1607,22 @@ async fn reconcile_one<P: Provider + Clone>(
         signer,
         voucher_domain,
         RECONCILE_DIAL_TIMEOUT,
+        &mut reconciled,
     )
     .await;
+    // Our record lagged what we had actually signed and the provider proved it
+    // with our own signature (#1495). Persist on EVERY path, before matching:
+    // the tuple is one we provably signed however the transaction resolved, and
+    // the `Err` arm below escalates to a unilateral close that must submit it
+    // rather than the stale voucher this sweep started from.
+    //
+    // Metered here rather than inside the helper: a heal means our own durable
+    // store lost committed vouchers, which is a persistence signal worth a fleet
+    // -wide counter even though the close itself is correct.
+    if reconciled.is_some() {
+        metrics.buyer_reconcile_watermark_healed();
+    }
+    persist_reconciled(store, st.provider, st.channel_id, reconciled);
     match outcome {
         Ok(CooperativeCloseOutcome::Settled) => {
             obs.remove(&st.channel_id);
@@ -1689,6 +1704,48 @@ async fn reconcile_one<P: Provider + Clone>(
                 }
             }
         }
+    }
+}
+
+/// Persist a watermark the cooperative close reconciled against the provider's
+/// echo of our own voucher signature (#1495).
+///
+/// Best-effort: the settlement already stands on-chain, so a failure here costs a
+/// stale local record, not money. `AdvanceOutcome` is `#[must_use]` because a
+/// dropped `UnknownChannel`/`ChannelMismatch` looks like success, so every
+/// variant is logged rather than discarded.
+fn persist_reconciled(
+    store: &Arc<dyn BuyerChannelStore>,
+    provider: Address,
+    channel_id: ChannelId,
+    reconciled: Option<AuthorizedWatermark>,
+) {
+    let Some(healed) = reconciled else { return };
+    match store.advance_progress(
+        provider,
+        channel_id,
+        healed.nonce,
+        healed.bytes_delivered,
+        healed.amount,
+    ) {
+        Ok(AdvanceOutcome::Advanced) => {
+            // `warn!`, not `debug!`: the close is correct, but reaching here at
+            // all means the durable buyer store lost vouchers we had signed.
+            warn!(
+                %channel_id, %provider, amount = %healed.amount, nonce = %healed.nonce,
+                "reconcile: local watermark lagged what we had signed; healed from the \
+                 provider's echo of our own voucher signature — the buyer store lost committed \
+                 vouchers (unclean shutdown?)"
+            );
+        }
+        Ok(outcome) => warn!(
+            %channel_id, %provider, ?outcome,
+            "reconcile: settled at the provider's watermark but the local record was not advanced"
+        ),
+        Err(err) => warn!(
+            %channel_id, %provider, %err,
+            "reconcile: settled at the provider's watermark but persisting it locally failed"
+        ),
     }
 }
 
@@ -2906,6 +2963,9 @@ async fn reconcile_orphans_once<P: Provider + Clone>(
 }
 
 #[cfg(test)]
+// Test scaffolding legitimately uses unwrap/expect; the workspace anti-panic
+// policy targets runtime code (matches `client-pull`'s test modules).
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use alloy::primitives::{B256, address};
@@ -2922,6 +2982,99 @@ mod tests {
             U256::from(10_000_000u64),
             1_900_000_000,
         )
+    }
+
+    /// `persist_reconciled` must land each component of the healed watermark in
+    /// the field it belongs to.
+    ///
+    /// `advance_progress` takes `(nonce, bytes_delivered, amount)` — three
+    /// adjacent `U256`s in an order that differs from both the struct's field
+    /// order and the tuple order used everywhere else in this flow. Transposing
+    /// any two compiles, runs, warns nothing, and silently persists a watermark
+    /// the next voucher then signs from. Distinct values per field are what makes
+    /// a transposition visible here.
+    #[test]
+    fn persist_reconciled_maps_each_component_to_its_own_field() {
+        let store: Arc<dyn BuyerChannelStore> =
+            Arc::new(decdn_incentive::MemoryBuyerChannelStore::new());
+        let st = sample(0x42);
+        store.record(&st).expect("seed the row");
+
+        persist_reconciled(
+            &store,
+            st.provider,
+            st.channel_id,
+            Some(AuthorizedWatermark {
+                amount: U256::from(700u64),
+                nonce: U256::from(8u64),
+                bytes_delivered: U256::from(90_000u64),
+            }),
+        );
+
+        let row = store
+            .get_by_provider(st.provider)
+            .expect("read back")
+            .expect("row still present");
+        assert_eq!(row.last_amount, U256::from(700u64), "amount");
+        assert_eq!(row.last_nonce, U256::from(8u64), "nonce");
+        assert_eq!(
+            row.last_bytes_delivered,
+            U256::from(90_000u64),
+            "bytes_delivered"
+        );
+    }
+
+    /// `None` means the close never reconciled, so the row must be left exactly
+    /// as it was — a write here would fabricate a watermark.
+    #[test]
+    fn persist_reconciled_without_a_reconciliation_writes_nothing() {
+        let store: Arc<dyn BuyerChannelStore> =
+            Arc::new(decdn_incentive::MemoryBuyerChannelStore::new());
+        let st = sample(0x43);
+        store.record(&st).expect("seed the row");
+
+        persist_reconciled(&store, st.provider, st.channel_id, None);
+
+        let row = store
+            .get_by_provider(st.provider)
+            .expect("read back")
+            .expect("row still present");
+        assert_eq!(row.last_amount, U256::ZERO);
+        assert_eq!(row.last_nonce, U256::ZERO);
+        assert_eq!(row.last_bytes_delivered, U256::ZERO);
+    }
+
+    /// A provider whose slot now names a DIFFERENT channel must not be clobbered:
+    /// `advance_progress` reports `ChannelMismatch` and writes nothing. This is
+    /// the `Ok(other)` warn arm, which would otherwise be dead in test.
+    #[test]
+    fn persist_reconciled_leaves_a_replaced_channel_untouched() {
+        let store: Arc<dyn BuyerChannelStore> =
+            Arc::new(decdn_incentive::MemoryBuyerChannelStore::new());
+        let st = sample(0x44);
+        store.record(&st).expect("seed the row");
+
+        persist_reconciled(
+            &store,
+            st.provider,
+            // A stale channel id for this provider — the slot was replaced.
+            B256::repeat_byte(0xEE),
+            Some(AuthorizedWatermark {
+                amount: U256::from(700u64),
+                nonce: U256::from(8u64),
+                bytes_delivered: U256::from(90_000u64),
+            }),
+        );
+
+        let row = store
+            .get_by_provider(st.provider)
+            .expect("read back")
+            .expect("row still present");
+        assert_eq!(
+            row.last_amount,
+            U256::ZERO,
+            "a mismatched channel must not advance the live row"
+        );
     }
 
     /// Scripted [`ClientChannelReads`]: no provider, no chain. Ids are supplied

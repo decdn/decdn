@@ -424,11 +424,12 @@ contract GenesisBuybackActivationTest is Test, BaseProtocolDeploy {
         this.externalRunFullDeploy(_config(), act);
     }
 
-    /// @notice A guard band of `min == max == 0` passes every bound
-    ///         `GuardedBuybackBurner`'s constructor checks (it rejects `min > max`,
-    ///         not a zero band) and then reverts `AboveMaxBuyback` on every call
-    ///         forever. Reachable from production env as
-    ///         `MIN_BUYBACK_AMOUNT=0 MAX_BUYBACK_AMOUNT=0`.
+    /// @notice A guard band of `min == max == 0` reverts `AboveMaxBuyback` on
+    ///         every non-zero buyback until governance raises the ceiling.
+    ///         Reachable from production env as
+    ///         `MIN_BUYBACK_AMOUNT=0 MAX_BUYBACK_AMOUNT=0`. `GuardedBuybackBurner`
+    ///         rejects it too since #1532 (`BuybackBandDead`); this pins the
+    ///         activation path's pre-broadcast fail-fast.
     function test_revertsWhenGuardBandIsDead() public {
         MockPositionManager npm = new MockPositionManager(true);
         usdc.approve(address(npm), type(uint256).max);

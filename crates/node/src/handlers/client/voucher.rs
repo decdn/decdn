@@ -579,12 +579,49 @@ impl ClientHandler {
             .map_err(|e| anyhow::anyhow!("cooperative-close mark task failed: {e}"))?;
             mark_res?;
             guard.state = candidate;
+            // Echo the client's own last-accepted voucher signature (#1495). It
+            // is the signature over exactly the tuple declared below — both are
+            // read from the same `guard.state` under the same guard, and
+            // `ChannelState::accept_voucher` writes all four together only after
+            // verifying the signature against `voucher_signer` — so any stored
+            // signature is genuine and can never be paired with a different
+            // tuple. A client whose persisted watermark lags can therefore verify
+            // against its own key that the tuple is one it already signed,
+            // instead of dead-ending on the over-claim refusal and falling back
+            // to the slow `closeChannel` path with a voucher that underpays us.
+            // Same value and same purpose as `WatermarkBundle::last_signature` on
+            // the fetch path (#1481).
+            //
+            // An empty echo sends the auth with no reconcile evidence: the client
+            // cannot verify and keeps its refusal. Control flow has already
+            // established `last_nonce != 0` (the zero-voucher decline returned
+            // above) and `accept_voucher` writes nonce and signature together, so
+            // this arm means precisely a **schema-v1 store record**, which never
+            // wrote the signature segment. That is a real population, not a
+            // hypothetical, and the client it strands is exactly the one #1495
+            // exists for — so meter it rather than letting a stale row look like a
+            // normal waiver.
+            let last_signature = if let Some(sig) = guard.state.last_signature() {
+                sig.to_vec()
+            } else {
+                self.metrics.cooperative_close_auth_no_echo();
+                tracing::warn!(
+                    %channel_id,
+                    nonce = %guard.state.last_nonce(),
+                    "cooperative-close: channel has an accepted voucher but no stored \
+                     signature (pre-v2 store record); sending the waiver with no echo — a \
+                     client whose watermark lags cannot reconcile and will fall back to \
+                     closeChannel"
+                );
+                Vec::new()
+            };
             CooperativeCloseAuth {
                 channel_id: req.channel_id,
                 amount: guard.state.last_amount().to_be_bytes(),
                 nonce: guard.state.last_nonce().to_be_bytes(),
                 bytes_delivered: guard.state.last_bytes_delivered().to_be_bytes(),
                 signature: signed.signature.as_bytes().to_vec(),
+                last_signature,
             }
         };
 

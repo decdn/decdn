@@ -88,11 +88,14 @@ contract BuybackVenueLibTest is Test {
         harness.requireUniswap(address(0x8081), address(0), _liveGuard());
     }
 
-    /// @notice `min == max == 0` passes every bound `GuardedBuybackBurner`'s
-    ///         constructor checks — it rejects an inverted band, not a zero one — and
-    ///         then reverts `AboveMaxBuyback` on every call forever. Reachable from
+    /// @notice `min == max == 0` reverts `AboveMaxBuyback` on every non-zero
+    ///         buyback until governance raises the ceiling (48h timelock), while
+    ///         the FeeRouter keeps accruing into the burner. Reachable from
     ///         production env as `MIN_BUYBACK_AMOUNT=0 MAX_BUYBACK_AMOUNT=0`, the
-    ///         "0 means unlimited" misreading.
+    ///         "0 means unlimited" misreading. `GuardedBuybackBurner` rejects it
+    ///         too since #1532 (`BuybackBandDead`); this pins the library's
+    ///         pre-broadcast fail-fast, so a mis-set env var surfaces before the
+    ///         deploy transaction rather than as a reverted deployment mid-run.
     function test_rejectsDeadGuardBand() public {
         GuardedBuybackBurner.GuardParams memory dead = _liveGuard();
         dead.minBuybackAmount_ = 0;

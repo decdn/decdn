@@ -222,9 +222,9 @@ contract DeployProtocol is BaseProtocolDeploy {
     //     - `BUYBACK_VENUE`              — uniswap|balancer (default uniswap; the
     //                                      only venue live on Arbitrum Sepolia)
     //     - `TWAP_MIN_WINDOW_SECS`       (default 1800)
-    //     - `MAX_BUYBACK_AMOUNT`         (default 10_000e6 USDC)
+    //     - `MAX_BUYBACK_AMOUNT`         (default 10_000e6 USDC; must be non-zero)
     //     - `MIN_BUYBACK_AMOUNT`         (default 100e6 USDC)
-    //     - `SLIPPAGE_BPS`               (default 200)
+    //     - `SLIPPAGE_BPS`               (default 200; ceiling 1000 = 10%)
     //     - `EPOCH_CAP_FRACTION_BPS`     (default 1000 = 10%)
     //   Pool seed (both venues create + seed the pool in-script; the deployer must
     //   hold the seed TOKEN + USDC — set `INITIAL_TOKEN_HOLDER` to the deployer or
