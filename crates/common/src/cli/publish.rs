@@ -1,10 +1,12 @@
 //! CLI argument parsing for `decdn publish` — the origin-publisher control
-//! plane (issues #1029 / #1491, ADR 002 / ADR 011). Four on-chain writes:
+//! plane (issues #1029 / #1491, ADR 002 / ADR 011). Four write commands:
 //! `namespace create` (`PublisherRegistry.createNamespace`), `request-vetting`
 //! (`OriginAssignment.requestVetting`, the one governance-gated step), and then
 //! `assign` / `revoke` (`OriginAssignment.addOrigin` / `removeOrigin`), which a
-//! vetted publisher self-serves with no waiting. Content is bound to a namespace
-//! off-chain at fetch time, so there is no per-hash on-chain claim.
+//! vetted publisher self-serves with no waiting. `assign` submits one
+//! `addOrigin` per operator, so it is N transactions rather than one. Content is
+//! bound to a namespace off-chain at fetch time, so there is no per-hash
+//! on-chain claim.
 
 use clap::{Args, Subcommand};
 

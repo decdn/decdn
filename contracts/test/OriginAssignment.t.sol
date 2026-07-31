@@ -225,16 +225,28 @@ contract OriginAssignmentTest is Test {
     }
 
     /// Un-vetting must also clear a pending request — otherwise a rogue
-    /// publisher's already-ripened request would walk it straight back in.
-    function test_setPublisherVetted_unvetClearsPendingRequest() public {
+    /// publisher's already-ripened request would walk it straight back in. The
+    /// request is warped past its timelock FIRST: an implementation that only
+    /// cleared un-ripened requests would pass the un-warped version of this test
+    /// while leaving the exact hole open.
+    function test_setPublisherVetted_unvetClearsRipenedPendingRequest() public {
         vm.prank(publisher);
         oa.requestVetting();
+        vm.warp(block.timestamp + TIMELOCK + 1);
 
+        vm.expectEmit(true, true, true, true);
+        emit OriginAssignment.VettingRequestCancelled(publisher);
         vm.prank(admin);
         oa.setPublisherVetted(publisher, false);
 
         assertFalse(oa.isVettedPublisher(publisher));
         assertEq(oa.getPendingVetting(publisher), 0);
+
+        // The ripened request is gone, not merely hidden: governance cannot
+        // grant it, so the publisher must queue a fresh one and wait again.
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(OriginAssignment.NoVettingRequest.selector, publisher));
+        oa.grantVetting(publisher);
     }
 
     function test_setPublisherVetted_rejectsZeroAddress() public {
@@ -314,6 +326,20 @@ contract OriginAssignmentTest is Test {
         oa.addOrigin(NS, opA);
     }
 
+    /// At cap, a re-add of an ALREADY-SEATED operator must still report the
+    /// duplicate — ADR 011 § Edge cases states that unconditionally, and
+    /// `TooManyOrigins` would name a count the set never reaches.
+    function test_addOrigin_duplicateOutranksCapWhenFull() public {
+        vm.prank(admin);
+        oa.setMaxOriginsPerNamespace(1);
+        _vet(publisher);
+        _seat(opA);
+
+        vm.prank(publisher);
+        vm.expectRevert(abi.encodeWithSelector(OriginAssignment.DuplicateOperator.selector, opA));
+        oa.addOrigin(NS, opA);
+    }
+
     function test_addOrigin_revertsAtCap() public {
         vm.prank(admin);
         oa.setMaxOriginsPerNamespace(1);
@@ -337,6 +363,19 @@ contract OriginAssignmentTest is Test {
         vm.prank(publisher);
         oaNoBl.addOrigin(NS, opA);
         assertTrue(oaNoBl.isAuthorizedOrigin(NS, opA));
+
+        // ADR 016 post-deploy step 2: binding the blacklist turns the guard on.
+        // Nothing else proves the setter writes the slot the guard reads — every
+        // other blacklist test gets its binding from the constructor.
+        vm.prank(admin);
+        oaNoBl.setContentBlacklist(address(blacklist));
+        blacklist.setBlacklisted(opB, true);
+        vm.prank(publisher);
+        vm.expectRevert(abi.encodeWithSelector(OriginAssignment.OperatorBlacklisted.selector, opB));
+        oaNoBl.addOrigin(NS, opB);
+        // And the prune path, which reverted `ContentBlacklistNotSet` before.
+        oaNoBl.pruneBlacklistedOrigin(NS, opA);
+        assertFalse(oaNoBl.isAuthorizedOrigin(NS, opA));
     }
 
     /// The #1107 regression, stated as an invariant: seating B validates B and
@@ -406,10 +445,14 @@ contract OriginAssignmentTest is Test {
     function test_removeOrigin_byPublisherAndGovernance() public {
         _vetAndSeatBoth();
 
+        vm.expectEmit(true, true, true, true);
+        emit OriginAssignment.OriginRemoved(NS, opA, publisher);
         vm.prank(publisher);
         oa.removeOrigin(NS, opA);
         assertFalse(oa.isAuthorizedOrigin(NS, opA));
 
+        vm.expectEmit(true, true, true, true);
+        emit OriginAssignment.OriginRemoved(NS, opB, admin);
         vm.prank(admin);
         oa.removeOrigin(NS, opB);
         assertFalse(oa.isAuthorizedOrigin(NS, opB));
@@ -433,6 +476,8 @@ contract OriginAssignmentTest is Test {
 
         blacklist.setBlacklisted(opA, true);
         // Permissionless — any caller.
+        vm.expectEmit(true, true, true, true);
+        emit OriginAssignment.BlacklistedOriginPruned(NS, opA, stranger);
         vm.prank(stranger);
         oa.pruneBlacklistedOrigin(NS, opA);
         assertFalse(oa.isAuthorizedOrigin(NS, opA));
@@ -481,6 +526,15 @@ contract OriginAssignmentTest is Test {
             )
         );
         oa.setVettingTimelock(1 hours);
+        // The ceiling half: a copy-paste slip comparing against the FLOOR twice
+        // would pass the check above and let governance set a 90-day delay.
+        vm.prank(admin);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                OriginAssignment.ParamOutOfBounds.selector, uint256(15 days), uint256(24 hours), uint256(14 days)
+            )
+        );
+        oa.setVettingTimelock(15 days);
         vm.prank(admin);
         oa.setVettingTimelock(7 days);
         assertEq(oa.vettingTimelock(), 7 days);
@@ -492,6 +546,41 @@ contract OriginAssignmentTest is Test {
             abi.encodeWithSelector(OriginAssignment.ParamOutOfBounds.selector, uint256(0), uint256(1), uint256(50))
         );
         oa.setMaxOriginsPerNamespace(0);
+        vm.prank(admin);
+        vm.expectRevert(
+            abi.encodeWithSelector(OriginAssignment.ParamOutOfBounds.selector, uint256(51), uint256(1), uint256(50))
+        );
+        oa.setMaxOriginsPerNamespace(51);
+    }
+
+    /// The three remaining governance setters share one role gate; a missing
+    /// `onlyRole` on `setContentBlacklist` would hand anyone the power to
+    /// re-point the blacklist read and disable the operator-blacklist guard.
+    function test_governanceSetters_rejectNonGovernance() public {
+        bytes memory denied =
+            abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, stranger, GOVERNANCE_ROLE);
+        vm.startPrank(stranger);
+        vm.expectRevert(denied);
+        oa.setContentBlacklist(address(blacklist));
+        vm.expectRevert(denied);
+        oa.setVettingTimelock(7 days);
+        vm.expectRevert(denied);
+        oa.setMaxOriginsPerNamespace(5);
+        vm.stopPrank();
+    }
+
+    /// `isVettedPublisher` is a public mapping, so `InterfaceFreeze` cannot
+    /// freeze its selector the way it freezes real functions — a rename there
+    /// compiles fine. The Rust `sol!` binding and the e2e fixtures both bind this
+    /// getter by hand, and a silent rename would mis-decode against a live
+    /// deployment, which only the anvil job would catch. Probe the deployed ABI
+    /// directly so the cheap gate catches it.
+    function test_publicGetters_matchTheFrozenAbi() public {
+        _vet(publisher);
+        (bool ok, bytes memory ret) =
+            address(oa).staticcall(abi.encodeWithSelector(bytes4(keccak256("isVettedPublisher(address)")), publisher));
+        assertTrue(ok, "isVettedPublisher(address) must exist at the frozen selector");
+        assertTrue(abi.decode(ret, (bool)), "and must answer for a vetted publisher");
     }
 
     // -----------------------------------------------------------------
@@ -586,5 +675,30 @@ contract OriginAssignmentTest is Test {
         assertEq(oa.assignedNamespaces(3, 1).length, 0);
         assertEq(oa.assignedNamespaces(0, 0).length, 0);
         assertEq(oa.assignedNamespaces(0, type(uint256).max).length, 3);
+    }
+
+    /// Removal is swap-and-pop, so paging after one is where an off-by-one drops
+    /// a namespace — and a dropped id is a namespace whose origins the node
+    /// never learns at bootstrap. Asserted as a SET: order is explicitly not
+    /// stable across mutations.
+    function test_assignedNamespaces_pagesCorrectlyAfterARemoval() public {
+        _vet(publisher);
+        registry.setNamespaceCount(publisher, 3);
+        for (uint256 ns = 1; ns <= 3; ++ns) {
+            registry.setOwner(ns, publisher);
+            vm.prank(publisher);
+            oa.addOrigin(ns, opA);
+        }
+
+        vm.prank(publisher);
+        oa.removeOrigin(2, opA);
+
+        assertEq(oa.assignedNamespaceCount(), 2);
+        uint256 first = oa.assignedNamespaces(0, 1)[0];
+        uint256 second = oa.assignedNamespaces(1, 1)[0];
+        assertTrue(first != second, "pages must not repeat an id");
+        assertTrue(first == 1 || first == 3, "only 1 and 3 remain");
+        assertTrue(second == 1 || second == 3, "only 1 and 3 remain");
+        assertEq(oa.assignedNamespaces(2, 1).length, 0);
     }
 }

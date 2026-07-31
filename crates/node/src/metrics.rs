@@ -1192,7 +1192,7 @@ pub struct DecdnMetrics {
     /// `OpenMetrics` encoder appends the `_total` suffix.
     pub origin_directory_watcher_restarts: Counter,
     /// `decdn_origin_directory_watcher_resolve_failures_total` (#651): times a
-    /// `getOrigins` for a newly-activated namespace OR a `nodeIdOf(operator)`
+    /// `getOrigins` for a namespace that just seated an origin OR a `nodeIdOf(operator)`
     /// binding lookup failed, leaving an operator unmapped (and so unresolvable
     /// as an origin) until a later event re-surfaces it. Does not trip a
     /// backoff, so without this counter it would move no metric. Pairs with the

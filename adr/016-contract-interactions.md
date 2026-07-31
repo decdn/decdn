@@ -429,8 +429,8 @@ graph LR
 | Emergency multisig | SlashAppeal | `fastTrackAppeal(slashId)`, `rejectAppeal(slashId)` | `EMERGENCY_MULTISIG_ROLE` on SlashAppeal | Yes |
 | ContentBlacklist | CapacityBond | `ejectNode(operatorAddress)` (on `addOperator`; sets the permanent `blacklistEjected` latch), `unEjectNode(operatorAddress)` (on `removeOperator`; clears the latch — re-entry then follows the normal re-bond path per [ADR 011 § Hash Evasion and Origin Blacklisting](011-content-takedown.md#hash-evasion-and-origin-blacklisting)) | `BLACKLIST_ROLE` | Yes |
 | OriginAssignment | CapacityBond | `isActive(operator)` | Public (read-only) | No |
-| OriginAssignment | PublisherRegistry | `ownerOf(namespaceId)` | Public (read-only) | No |
-| OriginAssignment | ContentBlacklist | `isOriginBlacklisted(operator)` | Public (read-only) | No |
+| OriginAssignment | PublisherRegistry | `ownerOf(namespaceId)`, `namespaceCount(publisher)` | Public (read-only) | No |
+| OriginAssignment | ContentBlacklist | `isOriginBlacklisted(operator)`, `isOperatorBlacklisted(operator)` | Public (read-only) | No |
 | Governor | OriginAssignment | `grantVetting(publisher)`, `setPublisherVetted(publisher, vetted)`, `removeOrigin(namespaceId, operator)`, `setMaxOriginsPerNamespace(cap)`, `setVettingTimelock(seconds)`, `setContentBlacklist(address)` | `GOVERNANCE_ROLE` on OriginAssignment | Yes |
 | SlashJudge | CapacityBond | `slash(node, challenger, offenseType, evidenceHash)` — `SlashJudge` forwards the `SlashJudge`-side evidence digest as `evidenceHash`, which `CapacityBond` persists on the `SlashRecord` alongside `offenseType` | `SLASH_ROLE` | Yes |
 | SlashJudge | IERC20 (TOKEN) | `safeTransferFrom()` / `safeTransfer()` | Caller must have allowance/balance | Yes |
@@ -696,9 +696,9 @@ No external calls; no funds held. The contract therefore inherits no `Reentrancy
 | `cancelVettingRequest()` | None (state change only) | Caller must have a pending request |
 | `grantVetting(publisher)` | None (state change only) | `GOVERNANCE_ROLE`; a request must be pending and its timelock elapsed |
 | `setPublisherVetted(publisher, bool)` | None (state change only) | `GOVERNANCE_ROLE`; instant grant or un-vet, rejects the zero address, clears any pending request either way |
-| `addOrigin(namespaceId, operator)` | `PublisherRegistry.ownerOf(namespaceId)` (read), `CapacityBond.isActive(operator)` (read), `ContentBlacklist.isOriginBlacklisted(operator)` (read) | Caller must own the namespace AND be a vetted publisher; the operator must be active, not blacklisted, not already seated, and fit under `maxOriginsPerNamespace`. Validation covers only the operator being added |
+| `addOrigin(namespaceId, operator)` | `PublisherRegistry.ownerOf(namespaceId)` (read), `CapacityBond.isActive(operator)` (read), `ContentBlacklist.isOriginBlacklisted(operator)` **and** `isOperatorBlacklisted(operator)` (reads — the guard is the union) | Caller must own the namespace AND be a vetted publisher; the operator must be active, not blacklisted, not already seated, and fit under `maxOriginsPerNamespace`. Validation covers only the operator being added |
 | `removeOrigin(namespaceId, operator)` | None (state change only) | Either `GOVERNANCE_ROLE` or namespace owner; removal may drop the active set to zero — the namespace simply re-enters the unassigned state |
-| `pruneBlacklistedOrigin(namespaceId, operator)` | `ContentBlacklist.isOriginBlacklisted(operator)` (read) | Permissionless; reverts if operator is not currently blacklisted in `ContentBlacklist` |
+| `pruneBlacklistedOrigin(namespaceId, operator)` | `ContentBlacklist.isOriginBlacklisted(operator)` **and** `isOperatorBlacklisted(operator)` (reads — the guard is the union) | Permissionless; reverts if operator is blacklisted through neither mapping |
 | `setMaxOriginsPerNamespace(uint256)`, `setVettingTimelock(uint256)` | None (state change only) | `GOVERNANCE_ROLE`; safety bounds enforced ([ADR 009](009-governance.md#adr-009-governance-model)) |
 | `isAuthorizedOrigin()`, `getOrigins()`, `isVettedPublisher()`, `getPendingVetting()`, `assignedNamespaceCount()`, `assignedNamespaces()` | None (read-only) | N/A |
 

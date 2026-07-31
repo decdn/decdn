@@ -175,6 +175,10 @@ contract OriginAssignment is AccessControl, ReentrancyGuard {
         // aderyn-ignore-next-line(reentrancy-state-change)
         if (publisherRegistry.namespaceCount(msg.sender) == 0) revert NoNamespaceOwned(msg.sender);
 
+        // `vettingTimelock` is bounded to [24h, 14d], so the sum cannot approach
+        // 2^64 and the narrowing cast cannot truncate. The floor also makes
+        // `readyAt` strictly positive, which is what lets `0` serve as the
+        // "no request pending" sentinel.
         uint64 readyAt = uint64(block.timestamp + vettingTimelock);
         _vettingReadyAt[msg.sender] = readyAt;
 
@@ -215,8 +219,15 @@ contract OriginAssignment is AccessControl, ReentrancyGuard {
     function setPublisherVetted(address publisher, bool vetted) external onlyRole(GOVERNANCE_ROLE) {
         if (publisher == address(0)) revert ZeroAddress();
         // A grant consumes any pending request; a revocation clears it too, so a
-        // ripened request cannot be used to walk straight back in.
-        delete _vettingReadyAt[publisher];
+        // ripened request cannot be used to walk straight back in. Announce that
+        // clearing with the same event `cancelVettingRequest` emits, so a log
+        // consumer tracking pending requests does not need to know that
+        // `PublisherVetted` is also a pending-request terminator.
+        // slither-disable-next-line incorrect-equality
+        if (_vettingReadyAt[publisher] != 0) {
+            delete _vettingReadyAt[publisher];
+            emit VettingRequestCancelled(publisher);
+        }
         isVettedPublisher[publisher] = vetted;
         emit PublisherVetted(publisher, vetted, msg.sender);
     }
@@ -234,9 +245,12 @@ contract OriginAssignment is AccessControl, ReentrancyGuard {
     ///      `nonReentrant` (the reads are views).
     // slither-disable-next-line reentrancy-no-eth
     function addOrigin(uint256 namespaceId, address operator) external nonReentrant {
+        // Vetting first: it is a local SLOAD, and it is the blocking prerequisite
+        // an unvetted caller must act on. Checking it before the cross-contract
+        // `ownerOf` read saves that call and reports the actionable error.
+        if (!isVettedPublisher[msg.sender]) revert PublisherNotVetted(msg.sender);
         // aderyn-ignore-next-line(reentrancy-state-change)
         if (publisherRegistry.ownerOf(namespaceId) != msg.sender) revert NotNamespaceOwner(namespaceId, msg.sender);
-        if (!isVettedPublisher[msg.sender]) revert PublisherNotVetted(msg.sender);
         // aderyn-ignore-next-line(reentrancy-state-change)
         if (!capacityBond.isActive(operator)) revert OperatorNotActive(operator);
 
@@ -246,10 +260,17 @@ contract OriginAssignment is AccessControl, ReentrancyGuard {
             revert OperatorBlacklisted(operator);
         }
 
+        // Duplicate BEFORE cap: re-adding an operator that is already seated is a
+        // caller error whatever the set size, and reporting `TooManyOrigins` for
+        // it would name a count the set never reaches. The add is rolled back
+        // with the transaction if the cap check below then reverts.
         EnumerableSet.AddressSet storage set = _origins[namespaceId];
-        uint256 seated = set.length();
-        if (seated >= maxOriginsPerNamespace) revert TooManyOrigins(seated + 1, maxOriginsPerNamespace);
         if (!set.add(operator)) revert DuplicateOperator(operator);
+        // The cap binds ADDS ONLY, so it is not a set-wide invariant: lowering
+        // `maxOriginsPerNamespace` leaves larger existing sets in place rather
+        // than evicting from them.
+        uint256 seated = set.length();
+        if (seated > maxOriginsPerNamespace) revert TooManyOrigins(seated, maxOriginsPerNamespace);
         // Idempotent: the namespace enters the key set on its 0→1 transition and
         // the later adds are no-ops.
         // slither-disable-next-line unused-return

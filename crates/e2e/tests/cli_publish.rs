@@ -12,8 +12,14 @@
 //!    non-zero `getPendingVetting` deadline; the fixture then warps past the
 //!    timelock and grants it as the governance Timelock.
 //! 4. `publish assign <id> <operator>` now seats the origin **instantly** —
-//!    `getOrigins` reflects it with no further governance action — and
+//!    `getOrigins` reflects it with no further governance action, and the node's
+//!    origin directory consumes the `OriginAdded` log (asserted through the
+//!    watcher's metrics, since an undecodable log is swallowed by design) — and
 //!    `publish revoke` unseats it just as immediately.
+//! 5. A multi-operator `assign` is N transactions, so it can land half-way:
+//!    seating one good and one unbonded operator leaves the first live on-chain
+//!    and prints a `status=partial` receipt naming both, before it exits
+//!    non-zero.
 //!
 //! There is no per-hash on-chain claim (ADR 002 § Hash-to-namespace
 //! association) — content is bound to a namespace off-chain at fetch time.
@@ -149,7 +155,85 @@ async fn run() -> anyhow::Result<()> {
     );
 
     // ---- 4/5. Seat then unseat, both instant.
-    seat_then_unseat(&node, &assignment, namespace_id, operator).await
+    seat_then_unseat(&node, &assignment, namespace_id, operator).await?;
+
+    // ---- 6. A multi-operator `assign` is N transactions, so it can land
+    // half-way. Seat a good operator and an unbonded one in the same invocation:
+    // the first must stay live on-chain and the receipt must say so, because an
+    // operator who only sees the error cannot tell what took effect.
+    partial_seat_reports_what_landed(&node, &chain, &assignment, operator).await
+}
+
+/// The partial-seat path: `assign` stops at the first failure, but everything it
+/// already seated is on-chain and the receipt has to name it.
+async fn partial_seat_reports_what_landed<P: alloy::providers::Provider>(
+    node: &NodeFixture,
+    chain: &ChainFixture,
+    assignment: &OriginAssignment::OriginAssignmentInstance<P>,
+    operator: alloy::primitives::Address,
+) -> anyhow::Result<()> {
+    let create = run_publish(node, &["namespace", "create", "--json"]).await?;
+    let ns = parse_namespace_id(&create.stdout)?;
+    // Never bonded, so `CapacityBond.isActive` is false and `addOrigin` reverts
+    // `OperatorNotActive` — a per-operator guard, which is what makes the run
+    // partial rather than uniformly doomed.
+    let unbonded = alloy::primitives::Address::repeat_byte(0xDE);
+
+    let out = run_publish_expect_failure(
+        node,
+        &[
+            "assign",
+            &ns.to_string(),
+            &format!("{operator:#x}"),
+            &format!("{unbonded:#x}"),
+            "--json",
+        ],
+    )
+    .await?;
+
+    // The good operator is seated and STAYS seated despite the run failing.
+    assert_eq!(
+        assignment.getOrigins(U256::from(ns)).call().await?,
+        vec![operator],
+        "the seat that landed before the revert must survive it: {out}",
+    );
+    assert!(
+        !chain.is_authorized_origin(U256::from(ns), unbonded).await?,
+        "the unbonded operator must not be seated: {out}",
+    );
+
+    // The receipt must be printed before the error propagates, and must mark the
+    // two operators differently — this is the whole point of the ordering.
+    // `run_publish_expect_failure` returns the two streams rendered together, so
+    // the receipt line carries a `stdout: ` prefix — parse from the first brace.
+    let receipt: serde_json::Value = out
+        .lines()
+        .filter_map(|l| l.find('{').and_then(|i| l.get(i..)))
+        .find_map(|json| serde_json::from_str(json).ok())
+        .context(format!(
+            "assign printed no JSON receipt before failing: {out}"
+        ))?;
+    assert_eq!(
+        receipt["status"],
+        serde_json::json!("partial"),
+        "receipt: {receipt}"
+    );
+    let origins = receipt["origins"]
+        .as_array()
+        .context("receipt carries no origins array")?;
+    assert_eq!(
+        origins.len(),
+        2,
+        "every requested operator must appear: {receipt}"
+    );
+    assert_eq!(origins[0]["state"], serde_json::json!("seated"));
+    assert!(
+        origins[0]["tx"].is_string(),
+        "the seat must cite its tx: {receipt}"
+    );
+    assert_eq!(origins[1]["state"], serde_json::json!("reverted"));
+
+    Ok(())
 }
 
 /// The self-serve half of the journey: a vetted publisher seats an origin and
@@ -188,6 +272,20 @@ async fn seat_then_unseat<P: alloy::providers::Provider>(
         "the seated operator must be an authorized origin",
     );
 
+    // The node must actually CONSUME the seating event, not merely coexist with
+    // it. `OriginAdded` carries three indexed fields and an empty data section
+    // (its predecessor carried one indexed field plus an ABI-encoded array), so
+    // a `sol!` binding that drifted on arity would decode to nothing — and the
+    // watcher swallows an undecodable log by design, bumping a counter and
+    // continuing. Nothing else in the suite looks at the node side of this.
+    wait_for_metric(node, "decdn_origin_directory_operator_count", 1).await?;
+    assert_eq!(
+        node.scrape_metric("decdn_origin_directory_watcher_resolve_failures_total")
+            .await?,
+        0,
+        "a decode failure would be swallowed as a warn + counter bump, so assert the counter",
+    );
+
     // `publish revoke` unseats it, just as immediately.
     run_publish(
         node,
@@ -206,8 +304,26 @@ async fn seat_then_unseat<P: alloy::providers::Provider>(
             .is_empty(),
         "removeOrigin must unseat the operator in the same tx",
     );
+    // And the removal reaches the node too, closing the authorized-origin gate.
+    wait_for_metric(node, "decdn_origin_directory_operator_count", 0).await?;
 
     Ok(())
+}
+
+/// Poll a node metric until it reads `want`, so the watcher's poll cadence does
+/// not race the assertion. Fails with the last value seen rather than hanging.
+async fn wait_for_metric(node: &NodeFixture, name: &str, want: u64) -> anyhow::Result<()> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let mut last = None;
+    while std::time::Instant::now() < deadline {
+        let got = node.scrape_metric(name).await?;
+        if got == want {
+            return Ok(());
+        }
+        last = Some(got);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    anyhow::bail!("{name} never reached {want} (last saw {last:?})")
 }
 
 /// Run `decdn publish <args…> --config <config>` against the node fixture's

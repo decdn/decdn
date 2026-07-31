@@ -309,6 +309,9 @@ async fn request_vetting(
         ready_at: None,
         tx: None,
     };
+    // `Ok` on the dry-run path: nothing was sent, so there is nothing to decode
+    // and nothing to report as failed.
+    let mut deadline: anyhow::Result<u64> = Ok(0);
 
     if !args.chain.common.dry_run {
         let (signer, provider) = signer_and_provider(&resolved, &args.chain).await?;
@@ -327,31 +330,71 @@ async fn request_vetting(
         .await?;
 
         // Surface the timelock deadline (`readyAt`), matching the honest decode
-        // in `namespace_create`: match by signature, then decode.
-        let requested = receipt
-            .inner
-            .logs()
-            .iter()
-            .find(|log| log.topic0() == Some(&OriginAssignment::VettingRequested::SIGNATURE_HASH))
-            .context(
-                "requestVetting succeeded but its receipt carried no VettingRequested log (the \
-                 timelock deadline could not be recovered; check the tx on a block explorer)",
-            )?
-            .log_decode::<OriginAssignment::VettingRequested>()
-            .context(
-                "requestVetting emitted a VettingRequested log that failed to decode (ABI \
-                 mismatch between this CLI and the deployed OriginAssignment?)",
-            )?;
-        outcome.ready_at = Some(
-            u64::try_from(requested.inner.data.readyAt)
-                .context("vetting readyAt exceeds u64 (unexpected on this chain)")?,
-        );
+        // in `namespace_create`: match by signature, then decode. Every failure
+        // below happens AFTER the request is queued on-chain, so it must not
+        // short-circuit the receipt — the tx hash in `outcome.tx` is the only
+        // handle the publisher has on a request that now blocks re-running this
+        // command (`VettingRequestPending`).
+        deadline = decode_vetting_deadline(&receipt);
+        if let Ok(ready_at) = deadline {
+            outcome.ready_at = Some(ready_at);
+        }
     }
 
     let mut out = io::stdout().lock();
-    write_vetting_outcome(&mut out, &outcome, args.chain.common.json)
-        .context("failed to write request-vetting output")?;
-    Ok(())
+    let write_err = write_vetting_outcome(&mut out, &outcome, args.chain.common.json).err();
+    drop(out);
+    propagate(
+        deadline.err().map(|err| {
+            err.context("the request is queued on-chain — the tx above is its only handle")
+        }),
+        write_err,
+        "failed to write request-vetting output",
+    )
+}
+
+/// Pull `readyAt` out of a confirmed `requestVetting` receipt. Split out so the
+/// caller can print its receipt before propagating any of these failures, all of
+/// which happen after the transaction has already taken effect.
+fn decode_vetting_deadline(receipt: &alloy::rpc::types::TransactionReceipt) -> anyhow::Result<u64> {
+    let requested = receipt
+        .inner
+        .logs()
+        .iter()
+        .find(|log| log.topic0() == Some(&OriginAssignment::VettingRequested::SIGNATURE_HASH))
+        .context(
+            "requestVetting succeeded but its receipt carried no VettingRequested log (the \
+             timelock deadline could not be recovered; check the tx on a block explorer)",
+        )?
+        .log_decode::<OriginAssignment::VettingRequested>()
+        .context(
+            "requestVetting emitted a VettingRequested log that failed to decode (ABI \
+             mismatch between this CLI and the deployed OriginAssignment?)",
+        )?;
+    u64::try_from(requested.inner.data.readyAt)
+        .context("vetting readyAt exceeds u64 (unexpected on this chain)")
+}
+
+/// Return the on-chain failure if there was one, otherwise the stdout-write
+/// failure, otherwise success.
+///
+/// The order is the point: a broken pipe must never outrank — and so hide — a
+/// chain error the operator has to act on. Printing the receipt first is what
+/// makes a partial or ambiguous on-chain effect recoverable, and that guarantee
+/// is worthless if the write's own `?` returns before the real error is built.
+fn propagate(
+    chain_err: Option<anyhow::Error>,
+    write_err: Option<io::Error>,
+    write_context: &'static str,
+) -> anyhow::Result<()> {
+    match (chain_err, write_err) {
+        (Some(err), None) => Err(err),
+        (Some(err), Some(w)) => {
+            Err(err.context(format!("(the receipt could not be written to stdout: {w})")))
+        }
+        (None, Some(w)) => Err(anyhow::Error::from(w).context(write_context)),
+        (None, None) => Ok(()),
+    }
 }
 
 // -------------------------------------------------------------------------
@@ -365,29 +408,94 @@ const ADD_ORIGIN_HINT: &str = "the signer must be a vetted publisher (run `decdn
      operator must be an active bonded node, not blacklisted, not already seated, and must \
      fit under maxOriginsPerNamespace";
 
+/// What happened to one operator in the seating loop.
+///
+/// Seating is one transaction per operator, so a run that stops half-way leaves
+/// the namespace genuinely part-seated. The receipt has to say which operators
+/// are live, which definitely are not, and — the case that matters most — which
+/// one was broadcast without a readable outcome, because that one must not be
+/// blindly re-sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SeatOutcome {
+    /// The `addOrigin` transaction confirmed. The operator is authorized.
+    Seated(B256),
+    /// The transaction was broadcast but its outcome could not be read (the
+    /// receipt fetch failed). It may still confirm. `send_for_receipt` records
+    /// the hash before awaiting the receipt precisely so this case can be
+    /// reported; the hash is `None` only in the shape it documents as
+    /// impossible.
+    InFlight(Option<B256>),
+    /// Attempted and definitively did not take effect — the send was rejected,
+    /// or the transaction confirmed as a revert.
+    Reverted,
+    /// The loop stopped before this operator was tried.
+    NotAttempted,
+}
+
+impl SeatOutcome {
+    /// The transaction hash, for any state that has one.
+    const fn tx(self) -> Option<B256> {
+        match self {
+            Self::Seated(hash) => Some(hash),
+            Self::InFlight(hash) => hash,
+            Self::Reverted | Self::NotAttempted => None,
+        }
+    }
+
+    /// The `state=` token in the receipt.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Seated(_) => "seated",
+            Self::InFlight(_) => "in_flight",
+            Self::Reverted => "reverted",
+            Self::NotAttempted => "not_attempted",
+        }
+    }
+}
+
+/// Receipt for `publish assign`.
+///
+/// `seats` carries every requested operator in the order given, each paired with
+/// what happened to it — one entry per operator, always, so the receipt cannot
+/// misattribute a transaction or silently omit an operator. `dry_run` is a field
+/// rather than inferred from the absence of transactions (the convention its
+/// sibling outcome types use) because "nothing was sent" and "the first send
+/// reverted" are different answers that both leave zero seats.
 pub(crate) struct AssignOutcome {
     pub(crate) operator: Option<Address>,
     pub(crate) origin_assignment: Address,
     pub(crate) namespace_id: u64,
-    /// Every operator the invocation asked to seat, in the order given.
-    pub(crate) operators: Vec<Address>,
-    /// The operators actually seated, each with the transaction that seated it.
-    /// Seating is one transaction per operator, so a mid-run revert leaves this
-    /// a prefix of `operators` — which is exactly what the receipt must show.
-    pub(crate) seated: Vec<(Address, B256)>,
+    pub(crate) seats: Vec<(Address, SeatOutcome)>,
     pub(crate) dry_run: bool,
 }
 
 impl AssignOutcome {
-    /// `dry_run` before anything is sent, `seated` once every requested operator
-    /// landed, `partial` when a mid-run revert stopped the loop early.
-    const fn status(&self) -> &'static str {
+    fn seated_count(&self) -> usize {
+        self.seats
+            .iter()
+            .filter(|(_, s)| matches!(s, SeatOutcome::Seated(_)))
+            .count()
+    }
+
+    /// `dry_run` before anything is sent; `unknown` whenever a transaction was
+    /// broadcast without a readable outcome (it outranks everything else — it is
+    /// the state the operator must resolve before re-running); then `seated`,
+    /// `failed`, or `partial` by how many seats landed.
+    fn status(&self) -> &'static str {
         if self.dry_run {
-            "dry_run"
-        } else if self.seated.len() == self.operators.len() {
-            "seated"
-        } else {
-            "partial"
+            return "dry_run";
+        }
+        if self
+            .seats
+            .iter()
+            .any(|(_, s)| matches!(s, SeatOutcome::InFlight(_)))
+        {
+            return "unknown";
+        }
+        match self.seated_count() {
+            n if n == self.seats.len() => "seated",
+            0 => "failed",
+            _ => "partial",
         }
     }
 }
@@ -399,14 +507,15 @@ pub(crate) fn write_assign_outcome(
 ) -> io::Result<()> {
     if json {
         let value = serde_json::json!({
-            "submitted": !o.seated.is_empty(),
+            "submitted": o.seats.iter().any(|(_, s)| s.tx().is_some()),
             "operator": o.operator.map(|a| format!("{a:#x}")),
             "origin_assignment": format!("{:#x}", o.origin_assignment),
             "namespace_id": o.namespace_id,
-            "operators": o.operators.iter().map(|a| format!("{a:#x}")).collect::<Vec<_>>(),
-            "origins": o.seated.iter().map(|(a, tx)| serde_json::json!({
+            "operators": o.seats.iter().map(|(a, _)| format!("{a:#x}")).collect::<Vec<_>>(),
+            "origins": o.seats.iter().map(|(a, s)| serde_json::json!({
                 "operator": format!("{a:#x}"),
-                "tx": format!("{tx:#x}"),
+                "tx": s.tx().map(|h| format!("{h:#x}")),
+                "state": s.label(),
             })).collect::<Vec<_>>(),
             "status": o.status(),
         });
@@ -417,17 +526,17 @@ pub(crate) fn write_assign_outcome(
     }
     writeln!(w, "origin_assignment={:#x}", o.origin_assignment)?;
     writeln!(w, "namespace_id={}", o.namespace_id)?;
-    writeln!(w, "operators={}", o.operators.len())?;
-    for a in &o.operators {
-        match o.seated.iter().find(|(seated, _)| seated == a) {
-            Some((_, tx)) => writeln!(w, "  operator={a:#x} tx={tx:#x}")?,
-            None => writeln!(w, "  operator={a:#x} unseated")?,
+    writeln!(w, "operators={}", o.seats.len())?;
+    for (a, seat) in &o.seats {
+        match seat.tx() {
+            Some(tx) => writeln!(w, "  operator={a:#x} tx={tx:#x} state={}", seat.label())?,
+            None => writeln!(w, "  operator={a:#x} state={}", seat.label())?,
         }
     }
     if o.dry_run {
         writeln!(w, "status=dry_run submitted=false")
     } else {
-        writeln!(w, "status={} seated={}", o.status(), o.seated.len())
+        writeln!(w, "status={} seated={}", o.status(), o.seated_count())
     }
 }
 
@@ -444,24 +553,27 @@ async fn assign(args: &cli::AssignArgs, global_config: Option<&Path>) -> anyhow:
         operator: None,
         origin_assignment: oa_addr,
         namespace_id: args.namespace,
-        // Moved in (not cloned): the dry-run path never submits, so it does no
-        // extra allocation.
-        operators,
-        seated: Vec::new(),
+        seats: Vec::with_capacity(operators.len()),
         dry_run: args.chain.common.dry_run,
     };
 
     // Seating is a per-operator delta, so a set of N operators is N
-    // transactions. They run in the order given and stop at the first revert:
-    // the remaining operators are almost certainly doomed for the same reason
-    // (an unvetted signer, a namespace the signer does not own), and continuing
-    // would burn gas to collect the identical error N times.
+    // transactions. They run in the order given and stop at the first failure:
+    // the remaining operators are usually doomed for the same reason (an
+    // unvetted signer, a namespace the signer does not own), and continuing
+    // would burn gas to collect the identical error N times. The untried
+    // operators are recorded as such rather than dropped.
     let mut failure = None;
-    if !outcome.dry_run {
+    if outcome.dry_run {
+        outcome
+            .seats
+            .extend(operators.iter().map(|a| (*a, SeatOutcome::NotAttempted)));
+    } else {
         let (signer, provider) = signer_and_provider(&resolved, &args.chain).await?;
         outcome.operator = Some(signer.address());
         let contract = OriginAssignment::new(oa_addr, &provider);
-        for operator in &outcome.operators {
+        let mut stopped_at = operators.len();
+        for (i, operator) in operators.iter().enumerate() {
             let mut tx = None;
             let sent = decdn_incentive::tx::send_for_receipt(
                 contract.addOrigin(U256::from(args.namespace), *operator),
@@ -471,41 +583,64 @@ async fn assign(args: &cli::AssignArgs, global_config: Option<&Path>) -> anyhow:
             )
             .await;
             match (sent, tx) {
-                (Ok(_), Some(hash)) => outcome.seated.push((*operator, hash)),
+                (Ok(_), Some(hash)) => outcome.seats.push((*operator, SeatOutcome::Seated(hash))),
+                // `send_for_receipt` records the hash before awaiting the
+                // receipt, so a success with no hash should be unreachable.
+                // Report it as in-flight rather than as a seat we cannot cite.
                 (Ok(_), None) => {
-                    // `send_for_receipt` records the hash before awaiting the
-                    // receipt, so a success with no hash is impossible; treat it
-                    // as a failure rather than reporting a seat we cannot cite.
+                    outcome.seats.push((*operator, SeatOutcome::InFlight(None)));
                     failure = Some((
                         *operator,
                         anyhow::anyhow!("addOrigin succeeded but recorded no transaction hash"),
                     ));
+                    stopped_at = i + 1;
                     break;
                 }
-                (Err(err), _) => {
+                // A hash with an `Err` means the transaction was broadcast and
+                // its outcome could not be read — NOT that it failed. Saying
+                // "reverted" here is how an operator gets told to re-send a
+                // transaction that is still pending.
+                (Err(err), Some(hash)) => {
+                    outcome
+                        .seats
+                        .push((*operator, SeatOutcome::InFlight(Some(hash))));
                     failure = Some((*operator, err));
+                    stopped_at = i + 1;
+                    break;
+                }
+                (Err(err), None) => {
+                    outcome.seats.push((*operator, SeatOutcome::Reverted));
+                    failure = Some((*operator, err));
+                    stopped_at = i + 1;
                     break;
                 }
             }
         }
+        outcome.seats.extend(
+            operators
+                .get(stopped_at..)
+                .unwrap_or_default()
+                .iter()
+                .map(|a| (*a, SeatOutcome::NotAttempted)),
+        );
     }
 
     // Print BEFORE propagating: the seats that already landed are on-chain, and
     // an operator who only sees the error has no way to tell which.
     let mut out = io::stdout().lock();
-    write_assign_outcome(&mut out, &outcome, args.chain.common.json)
-        .context("failed to write assign output")?;
+    let write_err = write_assign_outcome(&mut out, &outcome, args.chain.common.json).err();
     drop(out);
 
-    if let Some((operator, err)) = failure {
-        return Err(err.context(format!(
-            "addOrigin failed for operator {operator:#x} after seating {} of {} \
-             (the seated operators are live; re-run with the remaining ones)",
-            outcome.seated.len(),
-            outcome.operators.len(),
-        )));
-    }
-    Ok(())
+    let chain_err = failure.map(|(operator, err)| {
+        err.context(format!(
+            "addOrigin failed for operator {operator:#x} after seating {} of {} (the seated \
+             operators are live; re-run with the operators still marked not_attempted, and \
+             check any marked in_flight on a block explorer before re-sending them)",
+            outcome.seated_count(),
+            outcome.seats.len(),
+        ))
+    });
+    propagate(chain_err, write_err, "failed to write assign output")
 }
 
 // -------------------------------------------------------------------------
@@ -626,41 +761,124 @@ mod tests {
             operator: Some(Address::repeat_byte(0xCD)),
             origin_assignment: Address::repeat_byte(0x02),
             namespace_id: 7,
-            operators: vec![a, b],
-            seated: vec![(a, B256::repeat_byte(0x55)), (b, B256::repeat_byte(0x66))],
+            seats: vec![
+                (a, SeatOutcome::Seated(B256::repeat_byte(0x55))),
+                (b, SeatOutcome::Seated(B256::repeat_byte(0x66))),
+            ],
             dry_run: false,
         };
         let mut buf = Vec::new();
         write_assign_outcome(&mut buf, &o, false).unwrap();
         let s = String::from_utf8(buf).unwrap();
         assert!(s.contains("operators=2"), "{s}");
-        assert!(s.contains("  operator=0x1111"), "{s}");
         assert!(s.contains("tx=0x5555"), "{s}");
         assert!(s.contains("tx=0x6666"), "{s}");
         assert!(s.contains("status=seated seated=2"), "{s}");
     }
 
-    /// Seating is one transaction per operator, so a mid-run revert leaves some
+    /// Seating is one transaction per operator, so a mid-run failure leaves some
     /// operators live and the rest not. The receipt must say which — that is the
     /// whole reason it is printed before the error propagates.
     #[test]
     fn assign_output_distinguishes_partial_from_seated() {
-        let a = Address::repeat_byte(0x11);
-        let b = Address::repeat_byte(0x22);
+        let landed = Address::repeat_byte(0x11);
+        let failed = Address::repeat_byte(0x22);
+        let untried = Address::repeat_byte(0x33);
         let o = AssignOutcome {
             operator: Some(Address::repeat_byte(0xCD)),
             origin_assignment: Address::repeat_byte(0x02),
             namespace_id: 7,
-            operators: vec![a, b],
-            seated: vec![(a, B256::repeat_byte(0x55))],
+            seats: vec![
+                (landed, SeatOutcome::Seated(B256::repeat_byte(0x55))),
+                (failed, SeatOutcome::Reverted),
+                (untried, SeatOutcome::NotAttempted),
+            ],
             dry_run: false,
         };
         let mut buf = Vec::new();
         write_assign_outcome(&mut buf, &o, false).unwrap();
         let s = String::from_utf8(buf).unwrap();
-        assert!(s.contains(&format!("  operator={a:#x} tx=")), "{s}");
-        assert!(s.contains(&format!("  operator={b:#x} unseated")), "{s}");
+        assert!(s.contains(&format!("  operator={landed:#x} tx=")), "{s}");
+        assert!(
+            s.contains(&format!("  operator={failed:#x} state=reverted")),
+            "{s}"
+        );
+        assert!(
+            s.contains(&format!("  operator={untried:#x} state=not_attempted")),
+            "{s}"
+        );
         assert!(s.contains("status=partial seated=1"), "{s}");
+    }
+
+    /// Nothing landed is NOT "partial" — that would read as if a seat exists.
+    /// This is the modal failure (an unvetted signer), so the status a machine
+    /// consumer switches on has to be right for it.
+    #[test]
+    fn assign_output_reports_failed_when_no_seat_landed() {
+        let o = AssignOutcome {
+            operator: Some(Address::repeat_byte(0xCD)),
+            origin_assignment: Address::repeat_byte(0x02),
+            namespace_id: 7,
+            seats: vec![
+                (Address::repeat_byte(0x11), SeatOutcome::Reverted),
+                (Address::repeat_byte(0x22), SeatOutcome::NotAttempted),
+            ],
+            dry_run: false,
+        };
+        let mut buf = Vec::new();
+        write_assign_outcome(&mut buf, &o, false).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains("status=failed seated=0"), "{s}");
+
+        let mut buf = Vec::new();
+        write_assign_outcome(&mut buf, &o, true).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+        assert_eq!(v["status"], serde_json::json!("failed"));
+        assert_eq!(v["submitted"], serde_json::json!(false));
+    }
+
+    /// A transaction that was broadcast but whose receipt could not be read has
+    /// an UNKNOWN outcome. Reporting it as reverted is how an operator gets told
+    /// to re-send a transaction that is still pending, so it gets its own state,
+    /// keeps its hash, and outranks every other status.
+    #[test]
+    fn assign_output_surfaces_an_in_flight_transaction() {
+        let landed = Address::repeat_byte(0x11);
+        let unknown = Address::repeat_byte(0x22);
+        let o = AssignOutcome {
+            operator: Some(Address::repeat_byte(0xCD)),
+            origin_assignment: Address::repeat_byte(0x02),
+            namespace_id: 7,
+            seats: vec![
+                (landed, SeatOutcome::Seated(B256::repeat_byte(0x55))),
+                (
+                    unknown,
+                    SeatOutcome::InFlight(Some(B256::repeat_byte(0x66))),
+                ),
+            ],
+            dry_run: false,
+        };
+        let mut buf = Vec::new();
+        write_assign_outcome(&mut buf, &o, false).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(
+            s.contains(&format!("  operator={unknown:#x} tx=0x6666")),
+            "the in-flight hash must reach the receipt, not just the error chain: {s}"
+        );
+        assert!(s.contains("state=in_flight"), "{s}");
+        assert!(s.contains("status=unknown"), "{s}");
+
+        let mut buf = Vec::new();
+        write_assign_outcome(&mut buf, &o, true).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+        assert_eq!(v["status"], serde_json::json!("unknown"));
+        assert_eq!(v["submitted"], serde_json::json!(true));
+        let origins = v["origins"].as_array().unwrap();
+        assert_eq!(origins[1]["state"], serde_json::json!("in_flight"));
+        assert_eq!(
+            origins[1]["tx"],
+            serde_json::json!(format!("{:#x}", B256::repeat_byte(0x66)))
+        );
     }
 
     #[test]
@@ -669,8 +887,7 @@ mod tests {
             operator: None,
             origin_assignment: Address::repeat_byte(0x02),
             namespace_id: 7,
-            operators: vec![Address::repeat_byte(0x11)],
-            seated: Vec::new(),
+            seats: vec![(Address::repeat_byte(0x11), SeatOutcome::NotAttempted)],
             dry_run: true,
         };
         let mut buf = Vec::new();
@@ -681,6 +898,31 @@ mod tests {
         // are indented (`  operator=`). Only the signer line must be absent.
         assert!(!s.lines().any(|l| l.starts_with("operator=")), "{s}");
         assert!(!s.contains("tx="), "{s}");
+    }
+
+    /// The write error must never outrank — and so hide — a chain error the
+    /// operator has to act on. `| head -1` on a failed run is the real case.
+    #[test]
+    fn propagate_prefers_the_chain_error_over_a_broken_pipe() {
+        let broken = || io::Error::new(io::ErrorKind::BrokenPipe, "broken pipe");
+        let err = propagate(
+            Some(anyhow::anyhow!("addOrigin reverted")),
+            Some(broken()),
+            "w",
+        )
+        .unwrap_err();
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("addOrigin reverted"), "{rendered}");
+        assert!(rendered.contains("could not be written"), "{rendered}");
+
+        // Write failure alone still surfaces, with its own context.
+        let err = propagate(None, Some(broken()), "failed to write assign output").unwrap_err();
+        assert!(
+            format!("{err:#}").contains("failed to write assign output"),
+            "{err:#}"
+        );
+
+        assert!(propagate(None, None, "w").is_ok());
     }
 
     #[test]
@@ -775,14 +1017,16 @@ mod tests {
 
     #[test]
     fn assign_json_round_trips() {
-        let a = Address::repeat_byte(0x11);
-        let b = Address::repeat_byte(0x22);
+        let landed = Address::repeat_byte(0x11);
+        let untried = Address::repeat_byte(0x22);
         let o = AssignOutcome {
             operator: Some(Address::repeat_byte(0xCD)),
             origin_assignment: Address::repeat_byte(0x02),
             namespace_id: 7,
-            operators: vec![a, b],
-            seated: vec![(a, B256::repeat_byte(0x55))],
+            seats: vec![
+                (landed, SeatOutcome::Seated(B256::repeat_byte(0x55))),
+                (untried, SeatOutcome::NotAttempted),
+            ],
             dry_run: false,
         };
         let mut buf = Vec::new();
@@ -792,12 +1036,20 @@ mod tests {
         assert_eq!(v["submitted"], serde_json::json!(true));
         assert_eq!(v["operators"].as_array().unwrap().len(), 2);
         let origins = v["origins"].as_array().unwrap();
-        assert_eq!(origins.len(), 1);
-        assert_eq!(origins[0]["operator"], serde_json::json!(format!("{a:#x}")));
+        // Every requested operator appears, in order, with its state — so a
+        // consumer can never mistake "not tried" for "did not happen".
+        assert_eq!(origins.len(), 2);
+        assert_eq!(
+            origins[0]["operator"],
+            serde_json::json!(format!("{landed:#x}"))
+        );
+        assert_eq!(origins[0]["state"], serde_json::json!("seated"));
         assert_eq!(
             origins[0]["tx"],
             serde_json::json!(format!("{:#x}", B256::repeat_byte(0x55)))
         );
+        assert_eq!(origins[1]["state"], serde_json::json!("not_attempted"));
+        assert!(origins[1]["tx"].is_null(), "{v}");
     }
 
     #[test]

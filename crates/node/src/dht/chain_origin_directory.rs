@@ -1126,7 +1126,9 @@ mod tests {
     #[test]
     fn origin_added_replaces_namespace_set() {
         let mut c = cache_with(&[(7, &[addr(0xA)])], &[]);
-        // Wholesale replace 7's set with {B, C}.
+        // The authoritative re-read replaces 7's cached set with {B, C}. The
+        // event itself is a single-operator delta; the wholesale replace is the
+        // CACHE's behaviour on re-read, which is what makes event order moot.
         c.origins_of_ns
             .insert(ns(7), [addr(0xB), addr(0xC)].into_iter().collect());
         let set = &c.origins_of_ns[&ns(7)];

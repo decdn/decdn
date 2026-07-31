@@ -31,21 +31,24 @@ since project inception and will roll into the first tagged release.
   vets the publisher **wallet** once; the vetted publisher then seats and unseats
   origins for its own namespaces itself, one operator at a time, effective in the
   transaction that carries them.
-  - **Removed:** `proposeAssignment`, `activateAssignment`,
-    `cancelAssignmentProposal`, `getPendingAssignment`, and the events
-    `AssignmentProposed` / `AssignmentProposalCancelled` / `AssignmentActivated` /
-    `AssignmentRevoked` / `BlacklistedAssignmentPruned`.
+  - **Removed, with no replacement:** `proposeAssignment`,
+    `activateAssignment`, `cancelAssignmentProposal`, `getPendingAssignment`,
+    and the events `AssignmentProposed` / `AssignmentProposalCancelled` /
+    `AssignmentActivated`.
   - **Added:** `requestVetting()`, `cancelVettingRequest()`,
     `grantVetting(address)`, `setPublisherVetted(address,bool)`,
     `isVettedPublisher(address)`, `getPendingVetting(address)`, and
-    `addOrigin(uint256,address)` — the single "origin seated" path, which emits
-    the single `OriginAdded` event.
-  - **Renamed:** `revokeAssignment` → `removeOrigin`,
+    `addOrigin(uint256,address)` — the single "origin seated" path. New events:
+    `OriginAdded`, `VettingRequested`, `VettingRequestCancelled` (also emitted
+    when `setPublisherVetted` clears a pending request), and `PublisherVetted`.
+  - **Renamed** (an indexer migrating off the old topics should map these rather
+    than treat them as removed): `revokeAssignment` → `removeOrigin`,
     `pruneBlacklistedAssignment` → `pruneBlacklistedOrigin`,
     `assignmentTimelock` / `setAssignmentTimelock` → `vettingTimelock` /
     `setVettingTimelock` (same 24h–14d bounds, same 3-day default — it now delays
-    vetting, not any assignment). Events follow: `OriginRemoved`,
-    `BlacklistedOriginPruned`, `VettingTimelockUpdated`.
+    vetting, not any assignment). Events follow: `AssignmentRevoked` →
+    `OriginRemoved`, `BlacklistedAssignmentPruned` → `BlacklistedOriginPruned`,
+    `AssignmentTimelockUpdated` → `VettingTimelockUpdated`.
   - `IPublisherRegistryOwnership` gains `namespaceCount(address)`, which
     `requestVetting` reads to reject a caller that owns no namespace.
   - The node's origin-directory watcher follows the renamed events; its read
@@ -57,11 +60,15 @@ since project inception and will roll into the first tagged release.
   two sibling subcommands (#1491).**
   - `publish assign <ns> <op…>` now sends one `addOrigin` per operator instead of
     a single `proposeAssignment`, in the order given, stopping at the first
-    revert. Its receipt changes accordingly: the `ready_at` and `replaced_prior`
-    fields are gone, `status` is `seated` / `partial` / `dry_run` instead of
-    `proposed_pending_dao`, and the JSON gains an `origins: [{operator, tx}]`
-    array. A partial run prints its receipt before the error, so the operator can
-    see which seats landed.
+    failure. Its receipt changes accordingly: the `ready_at` and `replaced_prior`
+    fields are gone, `status` is `seated` / `partial` / `failed` / `unknown` /
+    `dry_run` instead of `proposed_pending_dao`, and the JSON gains an
+    `origins: [{operator, tx, state}]` array listing **every** requested operator
+    with what happened to it (`seated`, `reverted`, `not_attempted`, or
+    `in_flight`). A run that stops part-way prints its receipt before the error,
+    so the operator can see which seats landed; `in_flight` marks a transaction
+    that was broadcast without a readable outcome and must be checked rather than
+    blindly re-sent.
   - **New `publish request-vetting`** — the one governance-gated step; prints the
     `ready_at` the vetting timelock elapses.
   - **New `publish revoke <ns> <operator>`** — unseats one authorized origin.

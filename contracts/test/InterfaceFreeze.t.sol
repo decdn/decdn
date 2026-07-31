@@ -118,5 +118,38 @@ contract InterfaceFreezeTest is Test {
             "isAuthorizedOrigin"
         );
         assertEq(OriginAssignment.getOrigins.selector, bytes4(keccak256("getOrigins(uint256)")), "getOrigins");
+        // Reads the off-chain side binds by hand. `assignedNamespaces` is the
+        // only way the node discovers which namespaces exist at bootstrap, and
+        // `getPendingVetting` was added alongside its `sol!` mirror in the same
+        // change — exactly the drift this gate exists to catch before the anvil
+        // job does. (`isVettedPublisher` is a public mapping, so its auto-getter
+        // is not a type member and cannot be frozen here; it is pinned against
+        // the live ABI in `OriginAssignmentTest.test_publicGetters_matchTheFrozenAbi`.)
+        assertEq(
+            OriginAssignment.getPendingVetting.selector,
+            bytes4(keccak256("getPendingVetting(address)")),
+            "getPendingVetting"
+        );
+        assertEq(
+            OriginAssignment.assignedNamespaceCount.selector,
+            bytes4(keccak256("assignedNamespaceCount()")),
+            "assignedNamespaceCount"
+        );
+        assertEq(
+            OriginAssignment.assignedNamespaces.selector,
+            bytes4(keccak256("assignedNamespaces(uint256,uint256)")),
+            "assignedNamespaces"
+        );
+        // Governance-proposal targets: a drifted selector silently bricks a vote.
+        assertEq(
+            OriginAssignment.setVettingTimelock.selector,
+            bytes4(keccak256("setVettingTimelock(uint256)")),
+            "setVettingTimelock"
+        );
+        assertEq(
+            OriginAssignment.setMaxOriginsPerNamespace.selector,
+            bytes4(keccak256("setMaxOriginsPerNamespace(uint256)")),
+            "setMaxOriginsPerNamespace"
+        );
     }
 }

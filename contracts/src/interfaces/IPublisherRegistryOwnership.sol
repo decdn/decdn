@@ -10,8 +10,11 @@ pragma solidity 0.8.28;
 ///           unassigned id (including the reserved no-namespace id `0`).
 ///         - `namespaceCount` proves the caller is a publisher at all, which is
 ///           the entry condition for `requestVetting`. It is likewise a public
-///           mapping getter, and reads `0` for an address that never created a
-///           namespace.
+///           mapping getter. It counts namespaces the address owns **now**, not
+///           namespaces it ever created: `PublisherRegistry` decrements it when
+///           a transfer finalizes, so it reads `0` both for an address that
+///           never created one and for an address that transferred them all
+///           away.
 interface IPublisherRegistryOwnership {
     function ownerOf(uint256 namespaceId) external view returns (address);
 
