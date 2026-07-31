@@ -10,8 +10,8 @@
 //!    (`request_cooperative_close_auth`).
 //! 2. Bound the provider's returned tuple by what the client authorized — or,
 //!    when it exceeds that, by the client's own signature over exactly that
-//!    tuple, echoed back in `CooperativeCloseAuthExt` (#1495). Then verify the
-//!    waiver signature really is the provider's.
+//!    tuple, echoed back in `CooperativeCloseAuth::last_signature` (#1495). Then
+//!    verify the waiver signature really is the provider's.
 //! 3. Sign a client voucher over the agreed tuple and submit `cooperativeClose`
 //!    in one tx (`cooperative_close`).
 //!
@@ -27,10 +27,7 @@ use alloy::providers::Provider;
 use alloy::signers::local::PrivateKeySigner;
 use decdn_incentive::payment_channel::PaymentChannel;
 use decdn_incentive::{CooperativeClose, SignedCooperativeClose, Voucher, sign_coop_close_request};
-use decdn_protocol::client::{
-    ClientMessage, CooperativeCloseAuth, CooperativeCloseAuthExt, CooperativeCloseRequest,
-    parse_cooperative_close_auth_ext,
-};
+use decdn_protocol::client::{ClientMessage, CooperativeCloseAuth, CooperativeCloseRequest};
 use decdn_protocol::{
     ALPN_CLIENT, FrameError, decode_message, encode_message, read_frame, write_frame,
 };
@@ -85,12 +82,12 @@ pub enum CooperativeCloseOutcome {
 /// pinned `voucherSigner` before signing any waiver. Without it the provider
 /// declines — the same `Ok(None)` path as an unknown channel.
 ///
-/// Returns `Ok(Some((auth, ext)))` with the provider's waiver and its optional
-/// trailing extension (`ext.last_signature` empty when the node supplied no echo
-/// — see [`CooperativeCloseAuthExt`]), or `Ok(None)` when the provider finishes
-/// the stream without a waiver — its decline signal for an unknown channel, an
-/// unauthenticated request, or a channel with no accepted voucher yet
-/// (handlers/client.rs). A network/protocol failure is `Err`.
+/// Returns `Ok(Some(auth))` with the provider's waiver (whose `last_signature` is
+/// empty when the node supplied no echo — see [`CooperativeCloseAuth`]), or
+/// `Ok(None)` when the provider finishes the stream without a waiver — its
+/// decline signal for an unknown channel, an unauthenticated request, or a
+/// channel with no accepted voucher yet (handlers/client.rs). A network/protocol
+/// failure is `Err`.
 ///
 /// # Errors
 ///
@@ -103,7 +100,7 @@ pub async fn request_cooperative_close_auth(
     client_signer: &PrivateKeySigner,
     domain: &Eip712Domain,
     timeout: Duration,
-) -> anyhow::Result<Option<(CooperativeCloseAuth, CooperativeCloseAuthExt)>> {
+) -> anyhow::Result<Option<CooperativeCloseAuth>> {
     let client_signature = sign_coop_close_request(client_signer, channel_id, domain)
         .map_err(|e| anyhow::anyhow!("sign cooperative-close request: {e}"))?;
     tokio::time::timeout(
@@ -119,7 +116,7 @@ async fn request_inner(
     target: EndpointAddr,
     channel_id: B256,
     client_signature: Vec<u8>,
-) -> anyhow::Result<Option<(CooperativeCloseAuth, CooperativeCloseAuthExt)>> {
+) -> anyhow::Result<Option<CooperativeCloseAuth>> {
     let conn = endpoint
         .connect(target, ALPN_CLIENT)
         .await
@@ -151,20 +148,15 @@ async fn request_inner(
         }
         Err(e) => return Err(anyhow::anyhow!("read auth: {e}")),
     };
-    let (msg, remainder) =
+    let (msg, _remainder) =
         decode_message::<ClientMessage>(&frame).map_err(|e| anyhow::anyhow!("decode auth: {e}"))?;
     match msg {
         ClientMessage::CooperativeCloseAuth(auth) => {
+            // `validate` checks both signature lengths, including the #1495
+            // watermark echo now carried inside the message.
             auth.validate()
                 .map_err(|e| anyhow::anyhow!("invalid cooperative-close auth: {e}"))?;
-            // Two-phase (#1495): the watermark echo rides as trailing bytes after
-            // the base message. A node that predates it leaves the remainder
-            // empty, which parses to the default (no echo).
-            let ext = parse_cooperative_close_auth_ext(remainder)
-                .map_err(|e| anyhow::anyhow!("decode cooperative-close auth extension: {e}"))?;
-            ext.validate()
-                .map_err(|e| anyhow::anyhow!("invalid cooperative-close auth extension: {e}"))?;
-            Ok(Some((auth, ext)))
+            Ok(Some(auth))
         }
         other => anyhow::bail!("expected CooperativeCloseAuth, got {other:?}"),
     }
@@ -187,7 +179,7 @@ struct PreparedClose {
 /// the matching client voucher — the security-critical, network-free core.
 ///
 /// The provider's tuple is accepted when it is **within** `authorized`, or — when
-/// it exceeds it — when `ext.last_signature` proves the client itself already
+/// it exceeds it — when `auth.last_signature` proves the client itself already
 /// signed **that exact tuple** (#1495). Everything else is refused: a provider
 /// trying to inflate the payout toward the full deposit, or a waiver that does
 /// not recover to `provider_eth`.
@@ -217,7 +209,6 @@ struct PreparedClose {
 #[allow(clippy::too_many_arguments)]
 fn prepare_close(
     auth: &CooperativeCloseAuth,
-    ext: &CooperativeCloseAuthExt,
     channel_id: B256,
     provider_eth: Address,
     token: Address,
@@ -268,15 +259,14 @@ fn prepare_close(
     if over_claimed {
         if !voucher_signed_by(
             &settlement,
-            &ext.last_signature,
+            &auth.last_signature,
             client_signer.address(),
             domain,
         ) {
             // Distinguish the two causes: an operator's next action differs.
-            let detail = if ext.last_signature.is_empty() {
-                "and the provider echoed no signature of ours (it may predate the reconcile \
-                 extension, or hold no stored signature for this channel) — close it the \
-                 ordinary way"
+            let detail = if auth.last_signature.is_empty() {
+                "and the provider echoed no signature of ours (it holds no stored signature \
+                 for this channel) — close it the ordinary way"
             } else {
                 "and the signature it echoed is not one of ours over that tuple — this provider \
                  is claiming payment we never authorized"
@@ -378,7 +368,7 @@ pub async fn cooperative_close<P: Provider>(
     timeout: Duration,
     reconciled: &mut Option<AuthorizedWatermark>,
 ) -> anyhow::Result<CooperativeCloseOutcome> {
-    let Some((auth, ext)) = request_cooperative_close_auth(
+    let Some(auth) = request_cooperative_close_auth(
         endpoint,
         target,
         channel_id,
@@ -393,7 +383,6 @@ pub async fn cooperative_close<P: Provider>(
 
     let (prepared, healed) = prepare_close(
         &auth,
-        &ext,
         channel_id,
         provider_eth,
         token,
@@ -478,6 +467,7 @@ mod tests {
             nonce: nonce.to_be_bytes(),
             bytes_delivered: bytes_delivered.to_be_bytes(),
             signature: signed.signature.as_bytes().to_vec(),
+            last_signature: Vec::new(),
         }
     }
 
@@ -505,7 +495,6 @@ mod tests {
         );
         let (prepared, reconciled) = prepare_close(
             &auth,
-            &CooperativeCloseAuthExt::default(),
             channel_id,
             provider.address(),
             token,
@@ -549,7 +538,6 @@ mod tests {
         );
         let (_, reconciled) = prepare_close(
             &auth,
-            &CooperativeCloseAuthExt::default(),
             channel_id,
             provider.address(),
             token,
@@ -578,7 +566,6 @@ mod tests {
         );
         let err = prepare_close(
             &auth,
-            &CooperativeCloseAuthExt::default(),
             channel_id,
             provider.address(),
             token,
@@ -608,7 +595,6 @@ mod tests {
         );
         let err = prepare_close(
             &auth,
-            &CooperativeCloseAuthExt::default(),
             channel_id,
             provider.address(),
             token,
@@ -637,7 +623,6 @@ mod tests {
         );
         let err = prepare_close(
             &auth,
-            &CooperativeCloseAuthExt::default(),
             B256::repeat_byte(0xBB),
             provider.address(),
             token,
@@ -649,9 +634,10 @@ mod tests {
         assert!(err.to_string().contains("wrong channel"), "{err}");
     }
 
-    /// Build the echo a node attaches: `signer`'s voucher signature over
-    /// `(channel_id, amount, nonce, bytes, token)`. With `signer == the client`
-    /// and the tuple matching the auth's, this is the genuine #1495 echo.
+    /// Build the echo a node attaches (`CooperativeCloseAuth::last_signature`):
+    /// `signer`'s voucher signature over `(channel_id, amount, nonce, bytes,
+    /// token)`. With `signer == the client` and the tuple matching the auth's,
+    /// this is the genuine #1495 echo.
     fn echo(
         signer: &PrivateKeySigner,
         channel_id: B256,
@@ -659,7 +645,7 @@ mod tests {
         amount: U256,
         nonce: U256,
         bytes_delivered: U256,
-    ) -> CooperativeCloseAuthExt {
+    ) -> Vec<u8> {
         let voucher = Voucher {
             channel_id,
             amount,
@@ -669,9 +655,7 @@ mod tests {
         }
         .sign(signer, &domain())
         .expect("voucher signs");
-        CooperativeCloseAuthExt {
-            last_signature: voucher.signature.as_bytes().to_vec(),
-        }
+        voucher.signature.as_bytes().to_vec()
     }
 
     /// The #1495 reconcile: our persisted record lags what we actually signed, and
@@ -685,12 +669,11 @@ mod tests {
         let channel_id = B256::repeat_byte(0xC1);
         let token = Address::repeat_byte(0xC2);
         let (amount, nonce, bytes) = (U256::from(600u64), U256::from(4u64), U256::from(9500u64));
-        let auth = provider_auth(&provider, channel_id, token, amount, nonce, bytes);
-        let ext = echo(&client, channel_id, token, amount, nonce, bytes);
+        let mut auth = provider_auth(&provider, channel_id, token, amount, nonce, bytes);
+        auth.last_signature = echo(&client, channel_id, token, amount, nonce, bytes);
 
         let (prepared, reconciled) = prepare_close(
             &auth,
-            &ext,
             channel_id,
             provider.address(),
             token,
@@ -723,13 +706,12 @@ mod tests {
         let channel_id = B256::repeat_byte(0xD1);
         let token = Address::repeat_byte(0xD2);
         let (amount, nonce, bytes) = (U256::from(600u64), U256::from(4u64), U256::from(9500u64));
-        let auth = provider_auth(&provider, channel_id, token, amount, nonce, bytes);
+        let mut auth = provider_auth(&provider, channel_id, token, amount, nonce, bytes);
         // Signed by someone who is not us — proves nothing about what we owe.
-        let ext = echo(&impostor, channel_id, token, amount, nonce, bytes);
+        auth.last_signature = echo(&impostor, channel_id, token, amount, nonce, bytes);
 
         let err = prepare_close(
             &auth,
-            &ext,
             channel_id,
             provider.address(),
             token,
@@ -758,7 +740,7 @@ mod tests {
         let channel_id = B256::repeat_byte(0xE1);
         let token = Address::repeat_byte(0xE2);
         // Declared: 600. Echoed signature: a genuine one of ours, but over 500.
-        let auth = provider_auth(
+        let mut auth = provider_auth(
             &provider,
             channel_id,
             token,
@@ -766,7 +748,7 @@ mod tests {
             U256::from(4u64),
             U256::from(9500u64),
         );
-        let ext = echo(
+        auth.last_signature = echo(
             &client,
             channel_id,
             token,
@@ -777,7 +759,6 @@ mod tests {
 
         let err = prepare_close(
             &auth,
-            &ext,
             channel_id,
             provider.address(),
             token,
@@ -789,8 +770,9 @@ mod tests {
         assert!(err.to_string().contains("over-claimed"), "{err}");
     }
 
-    /// A node that predates the extension sends no echo. The client cannot
-    /// verify, so it keeps the pre-#1495 refusal — absence is never weaker.
+    /// A node holding no stored signature for the channel sends an empty echo.
+    /// The client cannot verify, so it keeps the pre-#1495 refusal — absence is
+    /// never weaker.
     #[test]
     fn refuses_over_claim_when_the_node_sends_no_echo() {
         let provider = PrivateKeySigner::random();
@@ -808,7 +790,6 @@ mod tests {
 
         let err = prepare_close(
             &auth,
-            &CooperativeCloseAuthExt::default(),
             channel_id,
             provider.address(),
             token,

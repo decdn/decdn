@@ -443,12 +443,12 @@ since project inception and will roll into the first tagged release.
   the refusal. This is the same self-heal primitive the fetch path already uses
   (`WatermarkBundle.last_signature`, #1481), and it strengthens rather than
   relaxes the check: only the client could have produced the signature.
-  - **Not wire-breaking.** The echo rides as a `CooperativeCloseAuthExt` trailing
-    extension (the two-phase pattern `StreamRequest`/`StreamRequestExt` uses), so
-    `CooperativeCloseAuth` itself is unchanged on the wire and mixed-version peers
-    interoperate in both directions. An old client ignores the trailing bytes and
-    a new client against an old node reads no echo; both keep the pre-existing
-    refusal. No ALPN bump, and operators can hot-upgrade across it.
+  - **Wire-breaking (pre-launch).** The echo is a new `last_signature` field on
+    `CooperativeCloseAuth` itself, not a trailing extension — the network is
+    pre-launch, so there is no mixed-version population to preserve and the field
+    is added directly rather than negotiated. It is empty when the node holds no
+    stored signature for the channel, in which case the client keeps the
+    pre-existing refusal.
   - `cooperative_close` gains a `reconciled: &mut Option<AuthorizedWatermark>`
     out-param carrying the healed watermark, written **before** the transaction
     is sent so every return path reports it — including the error ones, where a

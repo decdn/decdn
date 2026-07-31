@@ -61,14 +61,11 @@ pub struct decdn_protocol::client::CooperativeCloseAuth
 pub decdn_protocol::client::CooperativeCloseAuth::amount: [u8; 32]
 pub decdn_protocol::client::CooperativeCloseAuth::bytes_delivered: [u8; 32]
 pub decdn_protocol::client::CooperativeCloseAuth::channel_id: [u8; 32]
+pub decdn_protocol::client::CooperativeCloseAuth::last_signature: alloc::vec::Vec<u8>
 pub decdn_protocol::client::CooperativeCloseAuth::nonce: [u8; 32]
 pub decdn_protocol::client::CooperativeCloseAuth::signature: alloc::vec::Vec<u8>
 impl decdn_protocol::client::CooperativeCloseAuth
 pub const fn decdn_protocol::client::CooperativeCloseAuth::validate(&self) -> core::result::Result<(), decdn_protocol::message::MessageValidationError>
-pub struct decdn_protocol::client::CooperativeCloseAuthExt
-pub decdn_protocol::client::CooperativeCloseAuthExt::last_signature: alloc::vec::Vec<u8>
-impl decdn_protocol::client::CooperativeCloseAuthExt
-pub const fn decdn_protocol::client::CooperativeCloseAuthExt::validate(&self) -> core::result::Result<(), decdn_protocol::message::MessageValidationError>
 pub struct decdn_protocol::client::CooperativeCloseRequest
 pub decdn_protocol::client::CooperativeCloseRequest::channel_id: [u8; 32]
 pub decdn_protocol::client::CooperativeCloseRequest::client_signature: alloc::vec::Vec<u8>
@@ -122,9 +119,7 @@ pub const decdn_protocol::client::MAX_VOUCHER_INTERVAL_MB: u64
 pub const decdn_protocol::client::MB_BYTES: u64
 pub const decdn_protocol::client::NO_NAMESPACE: [u8; 32]
 pub const decdn_protocol::client::VOUCHER_SIG_LEN: usize
-pub fn decdn_protocol::client::encode_cooperative_close_auth(&decdn_protocol::client::CooperativeCloseAuth, core::option::Option<&decdn_protocol::client::CooperativeCloseAuthExt>) -> core::result::Result<alloc::vec::Vec<u8>, postcard::error::Error>
 pub fn decdn_protocol::client::encode_stream_request(&decdn_protocol::client::StreamRequest, core::option::Option<&decdn_protocol::client::StreamRequestExt>) -> core::result::Result<alloc::vec::Vec<u8>, postcard::error::Error>
-pub fn decdn_protocol::client::parse_cooperative_close_auth_ext(&[u8]) -> core::result::Result<decdn_protocol::client::CooperativeCloseAuthExt, postcard::error::Error>
 pub fn decdn_protocol::client::parse_stream_request_ext(&[u8]) -> core::result::Result<decdn_protocol::client::StreamRequestExt, postcard::error::Error>
 pub mod decdn_protocol::dht
 pub enum decdn_protocol::dht::DhtMessage
@@ -430,10 +425,6 @@ impl core::convert::From<[u8; 32]> for decdn_protocol::identity::ContentHash
 pub fn decdn_protocol::identity::ContentHash::from([u8; 32]) -> Self
 impl core::convert::From<decdn_protocol::identity::ContentHash> for [u8; 32]
 pub fn [u8; 32]::from(decdn_protocol::identity::ContentHash) -> Self
-pub struct decdn_protocol::CooperativeCloseAuthExt
-pub decdn_protocol::CooperativeCloseAuthExt::last_signature: alloc::vec::Vec<u8>
-impl decdn_protocol::client::CooperativeCloseAuthExt
-pub const fn decdn_protocol::client::CooperativeCloseAuthExt::validate(&self) -> core::result::Result<(), decdn_protocol::message::MessageValidationError>
 pub struct decdn_protocol::FindNodeRequest
 pub decdn_protocol::FindNodeRequest::requester: decdn_protocol::identity::NodeId
 pub decdn_protocol::FindNodeRequest::target: decdn_protocol::identity::NodeId
@@ -574,12 +565,10 @@ pub const decdn_protocol::dht::DhtMessage::VARIANT_COUNT: u32
 impl decdn_protocol::framing::TopLevelEnum for decdn_protocol::message::ProbeMessage
 pub const decdn_protocol::message::ProbeMessage::VARIANT_COUNT: u32
 pub fn decdn_protocol::decode_message<M: serde_core::de::DeserializeOwned>(&[u8]) -> core::result::Result<(M, &[u8]), decdn_protocol::framing::FrameError>
-pub fn decdn_protocol::encode_cooperative_close_auth(&decdn_protocol::client::CooperativeCloseAuth, core::option::Option<&decdn_protocol::client::CooperativeCloseAuthExt>) -> core::result::Result<alloc::vec::Vec<u8>, postcard::error::Error>
 pub fn decdn_protocol::encode_message<M: serde_core::ser::Serialize>(&M) -> core::result::Result<alloc::vec::Vec<u8>, decdn_protocol::framing::FrameError>
 pub fn decdn_protocol::encode_stream_request(&decdn_protocol::client::StreamRequest, core::option::Option<&decdn_protocol::client::StreamRequestExt>) -> core::result::Result<alloc::vec::Vec<u8>, postcard::error::Error>
 pub fn decdn_protocol::is_unknown_variant<M: decdn_protocol::framing::TopLevelEnum>(&[u8]) -> bool
 pub fn decdn_protocol::is_valid_region(&str) -> bool
-pub fn decdn_protocol::parse_cooperative_close_auth_ext(&[u8]) -> core::result::Result<decdn_protocol::client::CooperativeCloseAuthExt, postcard::error::Error>
 pub fn decdn_protocol::parse_stream_request_ext(&[u8]) -> core::result::Result<decdn_protocol::client::StreamRequestExt, postcard::error::Error>
 pub async fn decdn_protocol::read_frame<R: tokio::io::async_read::AsyncRead + core::marker::Unpin>(&mut R) -> core::result::Result<alloc::vec::Vec<u8>, decdn_protocol::framing::FrameError>
 pub async fn decdn_protocol::write_frame<W: tokio::io::async_write::AsyncWrite + core::marker::Unpin>(&mut W, &[u8]) -> core::result::Result<(), decdn_protocol::framing::FrameError>

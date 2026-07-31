@@ -185,10 +185,8 @@ impl ClientHandler {
         self.write_payload(send, &payload).await
     }
 
-    /// Frame an already-encoded payload. Used by the two-phase messages whose
-    /// payload is a base message plus trailing extension bytes
-    /// (`encode_cooperative_close_auth`), which [`Self::write_message`] cannot
-    /// build because it encodes exactly one message.
+    /// Frame an already-encoded payload. [`Self::write_message`] delegates here
+    /// after encoding a single [`ClientMessage`].
     pub(super) async fn write_payload(
         &self,
         send: &mut SendStream,

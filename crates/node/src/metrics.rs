@@ -1268,8 +1268,8 @@ pub struct DecdnMetrics {
     /// `decdn_cooperative_close_request_unauthorized_total`.
     pub cooperative_close_request_unauthorized: Counter,
     /// A cooperative-close waiver was signed for a channel that has an accepted
-    /// voucher but no stored `last_signature`, so the auth went out with no
-    /// `CooperativeCloseAuthExt` echo (#1495). Reachable deterministically for a
+    /// voucher but no stored `last_signature`, so the auth went out with an empty
+    /// `CooperativeCloseAuth::last_signature` echo (#1495). Reachable deterministically for a
     /// **schema-v1 store record**, which never wrote that segment: `accept_voucher`
     /// writes nonce and signature together, so `nonce > 0` with no signature can
     /// only be a pre-v2 row. A client whose own watermark lags then cannot

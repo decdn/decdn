@@ -12,11 +12,10 @@ pub mod message;
 pub mod region;
 
 pub use client::{
-    BINDING_SIG_LEN, CHUNK_SIZE, ChunkData, ClientBinding, ClientMessage, CooperativeCloseAuthExt,
+    BINDING_SIG_LEN, CHUNK_SIZE, ChunkData, ClientBinding, ClientMessage,
     DEFAULT_VOUCHER_INTERVAL_MB, MAX_VOUCHER_INTERVAL_MB, MB_BYTES, StreamError, StreamRequest,
     StreamRequestExt, StreamResponse, StreamResponseBody, VOUCHER_SIG_LEN, Voucher,
-    VoucherRejectReason, encode_cooperative_close_auth, encode_stream_request,
-    parse_cooperative_close_auth_ext, parse_stream_request_ext,
+    VoucherRejectReason, encode_stream_request, parse_stream_request_ext,
 };
 pub use dht::{
     BatchStoreAck, BatchStoreRequest, CloserNodes, CloserNodesError, DhtMessage, FindNodeRequest,

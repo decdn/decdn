@@ -41,9 +41,9 @@ use decdn_incentive::{
     VoucherActivity, verify_binding, voucher_reject_reason, wire_voucher_to_signed,
 };
 use decdn_protocol::client::{
-    ChunkData, ClientMessage, CooperativeCloseAuth, CooperativeCloseAuthExt,
-    CooperativeCloseRequest, StreamError, StreamRequest, StreamRequestExt, StreamResponse,
-    StreamResponseBody, VoucherRejectReason, WatermarkBundle, encode_cooperative_close_auth,
+    ChunkData, ClientMessage, CooperativeCloseAuth, CooperativeCloseRequest, StreamError,
+    StreamRequest, StreamRequestExt, StreamResponse, StreamResponseBody, VoucherRejectReason,
+    WatermarkBundle,
 };
 use decdn_protocol::{
     ALPN_CLIENT, APP_ERR_RATE_LIMITED, FrameError, MB_BYTES, decode_message, encode_message,

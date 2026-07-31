@@ -4,9 +4,8 @@
 use super::{
     Arc, B256, BatchOutcome, BatchStop, BufferedVoucherReader, ChannelDeliveryState, ChannelId,
     ChannelState, ClientHandler, ClientMessage, CooperativeClose, CooperativeCloseAuth,
-    CooperativeCloseAuthExt, CooperativeCloseRequest, DEFAULT_TOLERANCE_BPS, Hash, Mutex,
-    RateError, RecvStream, SendStream, SignedVoucher, U256, VOUCHER_READ_TIMEOUT,
-    VoucherRejectReason, WatermarkBundle, encode_cooperative_close_auth, verify_rate,
+    CooperativeCloseRequest, DEFAULT_TOLERANCE_BPS, Hash, Mutex, RateError, RecvStream, SendStream,
+    SignedVoucher, U256, VOUCHER_READ_TIMEOUT, VoucherRejectReason, WatermarkBundle, verify_rate,
     voucher_reject_reason, wire_voucher_to_signed,
 };
 
@@ -495,7 +494,7 @@ impl ClientHandler {
             return Ok(());
         };
 
-        let (auth, ext) = {
+        let auth = {
             // Hold the per-channel lock across read-watermark → sign → persist so
             // a concurrent voucher cannot advance the watermark between the value
             // we sign and the flag we set. Signing is local and fast.
@@ -580,15 +579,8 @@ impl ClientHandler {
             .map_err(|e| anyhow::anyhow!("cooperative-close mark task failed: {e}"))?;
             mark_res?;
             guard.state = candidate;
-            let auth = CooperativeCloseAuth {
-                channel_id: req.channel_id,
-                amount: guard.state.last_amount().to_be_bytes(),
-                nonce: guard.state.last_nonce().to_be_bytes(),
-                bytes_delivered: guard.state.last_bytes_delivered().to_be_bytes(),
-                signature: signed.signature.as_bytes().to_vec(),
-            };
             // Echo the client's own last-accepted voucher signature (#1495). It
-            // is the signature over exactly the tuple declared above — both are
+            // is the signature over exactly the tuple declared below — both are
             // read from the same `guard.state` under the same guard, and
             // `ChannelState::accept_voucher` writes all four together only after
             // verifying the signature against `voucher_signer` — so any stored
@@ -600,35 +592,41 @@ impl ClientHandler {
             // Same value and same purpose as `WatermarkBundle::last_signature` on
             // the fetch path (#1481).
             //
-            // `None` sends the bare pre-#1495 auth: the client cannot verify and
-            // keeps its refusal. Control flow has already established
-            // `last_nonce != 0` (the zero-voucher decline returned above) and
-            // `accept_voucher` writes nonce and signature together, so this arm
-            // means precisely a **schema-v1 store record**, which never wrote the
-            // signature segment. That is a real population, not a hypothetical,
-            // and the client it strands is exactly the one #1495 exists for — so
-            // meter it rather than letting a stale row look like a normal waiver.
-            let ext = if let Some(last_signature) = guard.state.last_signature() {
-                Some(CooperativeCloseAuthExt {
-                    last_signature: last_signature.to_vec(),
-                })
+            // An empty echo sends the auth with no reconcile evidence: the client
+            // cannot verify and keeps its refusal. Control flow has already
+            // established `last_nonce != 0` (the zero-voucher decline returned
+            // above) and `accept_voucher` writes nonce and signature together, so
+            // this arm means precisely a **schema-v1 store record**, which never
+            // wrote the signature segment. That is a real population, not a
+            // hypothetical, and the client it strands is exactly the one #1495
+            // exists for — so meter it rather than letting a stale row look like a
+            // normal waiver.
+            let last_signature = if let Some(sig) = guard.state.last_signature() {
+                sig.to_vec()
             } else {
                 self.metrics.cooperative_close_auth_no_echo();
                 tracing::warn!(
                     %channel_id,
                     nonce = %guard.state.last_nonce(),
                     "cooperative-close: channel has an accepted voucher but no stored \
-                     signature (pre-v2 store record); sending the bare waiver — a client \
-                     whose watermark lags cannot reconcile and will fall back to closeChannel"
+                     signature (pre-v2 store record); sending the waiver with no echo — a \
+                     client whose watermark lags cannot reconcile and will fall back to \
+                     closeChannel"
                 );
-                None
+                Vec::new()
             };
-            (auth, ext)
+            CooperativeCloseAuth {
+                channel_id: req.channel_id,
+                amount: guard.state.last_amount().to_be_bytes(),
+                nonce: guard.state.last_nonce().to_be_bytes(),
+                bytes_delivered: guard.state.last_bytes_delivered().to_be_bytes(),
+                signature: signed.signature.as_bytes().to_vec(),
+                last_signature,
+            }
         };
 
-        let payload = encode_cooperative_close_auth(&auth, ext.as_ref())
-            .map_err(|e| anyhow::anyhow!("cooperative-close auth encode failed: {e}"))?;
-        self.write_payload(&mut send, &payload).await?;
+        self.write_message(&mut send, &ClientMessage::CooperativeCloseAuth(auth))
+            .await?;
         let _ = send.finish();
         Ok(())
     }

@@ -59,7 +59,7 @@ use decdn_node::metrics::Metrics;
 use decdn_node::region_accounting::{RegionAccountant, RegionResolver, UNKNOWN_REGION};
 use decdn_protocol::client::{
     ClientBinding, ClientMessage, CooperativeCloseRequest, StreamRequest, StreamRequestExt,
-    VoucherRejectReason, parse_cooperative_close_auth_ext,
+    VoucherRejectReason,
 };
 use decdn_protocol::{
     ALPN_CLIENT, decode_message, encode_message, encode_stream_request, read_frame, write_frame,
@@ -5952,8 +5952,9 @@ async fn pull_through_outer_deadline_accommodates_a_slow_pull() -> anyhow::Resul
 }
 
 /// Open a bidi stream, send one arbitrary [`ClientMessage`], and return the first
-/// decoded reply plus the frame's trailing bytes — the two-phase extension a
-/// message may carry after its base (`CooperativeCloseAuthExt`, #1495). The
+/// decoded reply plus any trailing bytes in the frame. The cooperative-close auth
+/// carries its #1495 watermark echo *inside* the message now (a wire break), so a
+/// well-formed reply leaves the remainder empty — the tests assert that. The
 /// cooperative-close analogue of [`raw_request`].
 async fn raw_message_request_with_remainder(
     client_ep: &Endpoint,
@@ -6201,13 +6202,17 @@ async fn cooperative_close_signs_waiver_persists_flag_and_stops_serving() -> any
         other => anyhow::bail!("expected CooperativeCloseAuth, got {other:?}"),
     };
 
-    // (1b) The trailing extension carries our own last-accepted voucher signature
-    //      over the very tuple the auth declares (#1495) — the proof a lagging
-    //      client checks against its own key before settling.
-    let ext = parse_cooperative_close_auth_ext(&remainder)?;
-    ext.validate()?;
+    // (1b) The auth carries our own last-accepted voucher signature over the very
+    //      tuple it declares (#1495) — the proof a lagging client checks against
+    //      its own key before settling. It rides inside the message now, so the
+    //      frame has no trailing bytes.
     anyhow::ensure!(
-        ext.last_signature == last_voucher_sig,
+        remainder.is_empty(),
+        "the echo rides inside the auth message"
+    );
+    auth.validate()?;
+    anyhow::ensure!(
+        auth.last_signature == last_voucher_sig,
         "the echo must be the client's own stored voucher signature"
     );
     anyhow::ensure!(auth.channel_id == channel_id().0, "channel id echoed");
@@ -6313,19 +6318,17 @@ async fn cooperative_close_without_a_stored_signature_omits_the_echo() -> anyhow
         }),
     )
     .await?;
-    anyhow::ensure!(
-        matches!(reply, ClientMessage::CooperativeCloseAuth(_)),
-        "the waiver is still issued"
-    );
+    let auth = match reply {
+        ClientMessage::CooperativeCloseAuth(a) => a,
+        other => anyhow::bail!("expected CooperativeCloseAuth, got {other:?}"),
+    };
     anyhow::ensure!(
         remainder.is_empty(),
-        "no stored signature ⇒ no trailing extension bytes"
+        "the echo rides inside the auth message"
     );
     anyhow::ensure!(
-        parse_cooperative_close_auth_ext(&remainder)?
-            .last_signature
-            .is_empty(),
-        "an empty remainder parses to the no-echo default"
+        auth.last_signature.is_empty(),
+        "no stored signature ⇒ an empty echo, but the waiver is still issued"
     );
 
     client_ep.close().await;
