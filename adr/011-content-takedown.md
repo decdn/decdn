@@ -352,7 +352,12 @@ interface IOriginAssignment {
     function assignedNamespaceCount() external view returns (uint256);
     function assignedNamespaces(uint256 offset, uint256 limit) external view returns (uint256[] memory);
 
-    // Events
+    // Events. A consumer tracking pending vetting requests opens an entry on
+    // VettingRequested and closes it on EITHER VettingRequestCancelled (the
+    // publisher withdrew) or PublisherVetted (governance granted or revoked,
+    // both of which also clear the request). Governance never emits
+    // VettingRequestCancelled: that word is reserved for the publisher's own
+    // withdrawal, and would misdescribe a request governance fulfilled.
     event VettingRequested(address indexed publisher, uint256 readyAt);
     event VettingRequestCancelled(address indexed publisher);
     event PublisherVetted(address indexed publisher, bool vetted, address indexed by);

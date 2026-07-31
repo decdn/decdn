@@ -552,6 +552,42 @@ contract OriginAssignmentTest is Test {
         assertEq(oa.vettingTimelock(), 7 days);
     }
 
+    /// ADR 011 § Contract promises each governance setter emits its own update
+    /// event, and the CHANGELOG tells indexers to map those topics. Nothing
+    /// asserted the payloads, so a swapped old/new argument — the classic slip
+    /// in a two-value update event — would ship silently.
+    function test_governanceSetters_emitOldThenNew() public {
+        vm.expectEmit(true, true, true, true);
+        emit OriginAssignment.VettingTimelockUpdated(TIMELOCK, 7 days);
+        vm.prank(admin);
+        oa.setVettingTimelock(7 days);
+
+        vm.expectEmit(true, true, true, true);
+        emit OriginAssignment.MaxOriginsPerNamespaceUpdated(10, 5);
+        vm.prank(admin);
+        oa.setMaxOriginsPerNamespace(5);
+
+        OriginAssignment oaNoBl = new OriginAssignment(bond, registry, address(0), admin);
+        vm.expectEmit(true, true, true, true);
+        emit OriginAssignment.ContentBlacklistUpdated(address(0), address(blacklist));
+        vm.prank(admin);
+        oaNoBl.setContentBlacklist(address(blacklist));
+    }
+
+    /// `PublisherVetted` carries the direction and the caller; both matter to a
+    /// consumer deciding whether a publisher may still seat origins.
+    function test_setPublisherVetted_emitsDirectionAndCaller() public {
+        vm.expectEmit(true, true, true, true);
+        emit OriginAssignment.PublisherVetted(publisher, true, admin);
+        vm.prank(admin);
+        oa.setPublisherVetted(publisher, true);
+
+        vm.expectEmit(true, true, true, true);
+        emit OriginAssignment.PublisherVetted(publisher, false, admin);
+        vm.prank(admin);
+        oa.setPublisherVetted(publisher, false);
+    }
+
     function test_setMaxOrigins_enforcesBounds() public {
         vm.prank(admin);
         vm.expectRevert(

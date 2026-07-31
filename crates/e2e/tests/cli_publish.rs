@@ -154,10 +154,10 @@ async fn run() -> anyhow::Result<()> {
         "grantVetting must vet the publisher",
     );
 
-    // ---- 4/5. Seat then unseat, both instant.
+    // ---- 4. Seat then unseat, both instant.
     seat_then_unseat(&node, &assignment, namespace_id, operator).await?;
 
-    // ---- 6. A multi-operator `assign` is N transactions, so it can land
+    // ---- 5. A multi-operator `assign` is N transactions, so it can land
     // half-way. One good operator, one unbonded, one never reached: the first
     // must stay live on-chain and the receipt must say so, because an operator
     // who only sees the error cannot tell what took effect.

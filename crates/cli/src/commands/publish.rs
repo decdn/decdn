@@ -45,8 +45,8 @@ pub async fn publish_dispatch(
 }
 
 /// Resolve the publisher coordinates and parse the `PublisherRegistry`
-/// address. Shared by `namespace create` and `claim`; the signer and provider
-/// are built on the submit path by [`signer_and_provider`].
+/// address. Used by `namespace create`; the signer and provider are built on
+/// the submit path by [`signer_and_provider`].
 fn registry_ctx(
     chain: &cli::PublishChainArgs,
     global_config: Option<&Path>,
@@ -84,8 +84,8 @@ fn assignment_ctx(
 }
 
 /// Preflight the RPC network, decrypt the keystore signer, and build the
-/// wallet-filled provider — the byte-identical submit preamble shared by
-/// `namespace create`, `claim`, and `assign`. Called only on the submit path
+/// wallet-filled provider — the byte-identical submit preamble shared by every
+/// submitting subcommand. Called only on the submit path
 /// (never a dry run), so it always decrypts. The network is verified *before*
 /// touching secrets, so a wrong `--rpc-url` fails here rather than after an
 /// interactive password prompt + scrypt KDF.
@@ -262,8 +262,10 @@ pub(crate) struct VettingOutcome {
     pub(crate) operator: Option<Address>,
     pub(crate) origin_assignment: Address,
     /// Unix time the vetting timelock elapses (earliest governance grant), from
-    /// the `VettingRequested` event. `None` on a dry run, and `None` when the
-    /// request landed but its deadline could not be recovered.
+    /// the `VettingRequested` event. `None` on a dry run, when the request
+    /// landed but its deadline could not be recovered, and when nothing reached
+    /// the chain at all — read it together with `status`, which distinguishes
+    /// those three.
     pub(crate) ready_at: Option<u64>,
     pub(crate) tx: Option<B256>,
     /// The transaction was broadcast but its outcome could not be read, so the
@@ -644,23 +646,26 @@ async fn assign(args: &cli::AssignArgs, global_config: Option<&Path>) -> anyhow:
         dry_run: args.chain.common.dry_run,
     };
 
+    // Seed one slot per requested operator up front, so "one entry per operator,
+    // in order" is a property of this line rather than of the loop's bookkeeping.
+    // The loop only ever OVERWRITES a slot — it cannot drop, duplicate, or
+    // reorder an operator, and everything it never reaches stays `NotAttempted`.
+    outcome.seats = operators
+        .iter()
+        .map(|a| (*a, SeatOutcome::NotAttempted))
+        .collect();
+
     // Seating is a per-operator delta, so a set of N operators is N
     // transactions. They run in the order given and stop at the first failure:
     // the remaining operators are usually doomed for the same reason (an
     // unvetted signer, a namespace the signer does not own), and continuing
-    // would burn gas to collect the identical error N times. The untried
-    // operators are recorded as such rather than dropped.
+    // would burn gas to collect the identical error N times.
     let mut failure = None;
-    if outcome.dry_run {
-        outcome
-            .seats
-            .extend(operators.iter().map(|a| (*a, SeatOutcome::NotAttempted)));
-    } else {
+    if !outcome.dry_run {
         let (signer, provider) = signer_and_provider(&resolved, &args.chain).await?;
         outcome.operator = Some(signer.address());
         let contract = OriginAssignment::new(oa_addr, &provider);
-        let mut stopped_at = operators.len();
-        for (i, operator) in operators.iter().enumerate() {
+        for (operator, seat) in &mut outcome.seats {
             let mut tx = None;
             let sent = decdn_incentive::tx::send_for_receipt(
                 contract.addOrigin(U256::from(args.namespace), *operator),
@@ -673,34 +678,23 @@ async fn assign(args: &cli::AssignArgs, global_config: Option<&Path>) -> anyhow:
                 // The receipt carries the hash, so a confirmed seat always cites
                 // one — there is no "succeeded but we lost the hash" state to
                 // represent.
-                (Ok(receipt), _) => outcome
-                    .seats
-                    .push((*operator, SeatOutcome::Seated(receipt.transaction_hash))),
+                (Ok(receipt), _) => *seat = SeatOutcome::Seated(receipt.transaction_hash),
                 // A hash surviving an `Err` means the transaction was broadcast
                 // and its outcome could not be read — NOT that it failed. Saying
                 // it failed here is how an operator gets told to re-send a
                 // transaction that is still pending.
                 (Err(err), Some(hash)) => {
-                    outcome.seats.push((*operator, SeatOutcome::InFlight(hash)));
+                    *seat = SeatOutcome::InFlight(hash);
                     failure = Some((*operator, err));
-                    stopped_at = i + 1;
                     break;
                 }
                 (Err(err), None) => {
-                    outcome.seats.push((*operator, SeatOutcome::Failed));
+                    *seat = SeatOutcome::Failed;
                     failure = Some((*operator, err));
-                    stopped_at = i + 1;
                     break;
                 }
             }
         }
-        outcome.seats.extend(
-            operators
-                .get(stopped_at..)
-                .unwrap_or_default()
-                .iter()
-                .map(|a| (*a, SeatOutcome::NotAttempted)),
-        );
     }
 
     // Print BEFORE propagating: the seats that already landed are on-chain, and
