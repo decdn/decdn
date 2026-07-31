@@ -291,6 +291,41 @@ impl OriginRangeRequest {
     }
 }
 
+/// Result of an [`Origin::fetch_outboard`] call — a standalone fetch of just
+/// the sibling `{H}.obao4` outboard, with no accompanying blob data. Feeds a
+/// later "stream-while-store" serve path (#1130): a node that already holds
+/// the outboard but not the full blob can start verifying/serving a
+/// requester's byte range before the origin pull-through of the data
+/// completes, rather than waiting on a whole-blob fetch first.
+///
+/// Like [`OriginRangeFetch`], the origin is a dumb byte store: the returned
+/// outboard is **untrusted** until verified against the root `H`.
+pub enum OutboardFetch {
+    /// The origin served the sibling `{H}.obao4` outboard, bounded by the
+    /// caller's `outboard_max_bytes`.
+    Found(Bytes),
+    /// The origin reported the outboard object does not exist (e.g. HTTP
+    /// 404, S3 `NoSuchKey`, a missing filesystem sibling).
+    NotFound,
+    /// The outboard fetch is not available from this origin — e.g. a status
+    /// other than success/404 (redirect, permission decline), or an
+    /// oversize outboard rejected before buffering. Never an error: the
+    /// caller degrades to whatever fallback applies (a later whole-blob
+    /// pull will re-surface a genuine, persistent fault at its proper
+    /// severity).
+    Unsupported,
+}
+
+impl std::fmt::Debug for OutboardFetch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Found(bytes) => f.debug_tuple("Found").field(&bytes.len()).finish(),
+            Self::NotFound => f.write_str("NotFound"),
+            Self::Unsupported => f.write_str("Unsupported"),
+        }
+    }
+}
+
 /// An origin backend. Implementors fetch a blob identified by its BLAKE3 hash.
 ///
 /// The origin is **not** responsible for verifying the hash — the cache engine
@@ -345,6 +380,29 @@ pub trait Origin: std::fmt::Debug + Send + Sync + 'static {
         _outboard_max_bytes: u64,
     ) -> Pin<Box<dyn Future<Output = Result<OriginRangeFetch, OriginPullError>> + Send + '_>> {
         Box::pin(async { Ok(OriginRangeFetch::Unsupported) })
+    }
+
+    /// Fetch **just** the sibling `{H}.obao4` outboard for the blob `hash` —
+    /// no accompanying blob data (#1130, feeds a later "stream-while-store"
+    /// serve path: a node that holds the outboard can start verifying
+    /// against `H` before the full blob has finished pulling through).
+    /// `outboard_max_bytes` caps the read, same rationale as
+    /// [`Self::fetch_range`]'s outboard sub-fetch — the engine derives it
+    /// from the blob size, and an oversize outboard is malformed/foreign.
+    ///
+    /// The default implementation returns [`OutboardFetch::Unsupported`], so
+    /// a custom [`Origin`] needs no change. The three shipped adapters
+    /// override it.
+    ///
+    /// Like [`Self::fetch_range`], returning [`OutboardFetch::Unsupported`]
+    /// or [`OutboardFetch::NotFound`] is never an error — only a genuine
+    /// transport / permission failure surfaces as [`OriginPullError`].
+    fn fetch_outboard(
+        &self,
+        _hash: Hash,
+        _outboard_max_bytes: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<OutboardFetch, OriginPullError>> + Send + '_>> {
+        Box::pin(async { Ok(OutboardFetch::Unsupported) })
     }
 
     /// Best-effort total byte size of the blob `hash`, used to scope a

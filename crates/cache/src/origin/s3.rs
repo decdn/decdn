@@ -42,7 +42,7 @@ use tokio_util::io::ReaderStream;
 use super::fs::OBAO4_SUFFIX;
 use super::{
     DecompressMode, Origin, OriginFetch, OriginKind, OriginRangeFetch, OriginRangeRequest,
-    OriginUrl, decompress,
+    OriginUrl, OutboardFetch, decompress,
 };
 use crate::error::OriginPullError;
 
@@ -754,6 +754,47 @@ impl Origin for S3Origin {
                 return Ok(OriginRangeFetch::Unsupported);
             }
             Ok(OriginRangeFetch::Ranged { data, outboard })
+        })
+    }
+
+    fn fetch_outboard(
+        &self,
+        hash: Hash,
+        outboard_max_bytes: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<OutboardFetch, OriginPullError>> + Send + '_>> {
+        Box::pin(async move {
+            let data_key = key_for(&self.prefix, hash);
+            let obao4_key = format!("{data_key}{OBAO4_SUFFIX}");
+            let log_target = format!("s3://{}/{}", self.bucket, obao4_key);
+            let resp = match self
+                .client
+                .get_object()
+                .bucket(self.bucket.as_ref())
+                .key(&obao4_key)
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => match classify_get_object_error(e, &log_target)? {
+                    // Missing outboard is the expected path for an origin
+                    // that doesn't publish `{H}.obao4`.
+                    OriginFetch::NotFound => return Ok(OutboardFetch::NotFound),
+                    // `classify_get_object_error` never actually produces
+                    // this arm for an `Err` input; only present to satisfy
+                    // exhaustiveness (mirrors `get_object_bounded`).
+                    OriginFetch::Found { .. } => return Ok(OutboardFetch::Unsupported),
+                },
+            };
+            if let Some(len) = resp.content_length()
+                && (len < 0 || u64::try_from(len).unwrap_or(u64::MAX) > outboard_max_bytes)
+            {
+                return Ok(OutboardFetch::Unsupported);
+            }
+            let cap = usize::try_from(outboard_max_bytes).unwrap_or(usize::MAX);
+            match collect_bounded(resp.body, cap).await? {
+                Some(bytes) => Ok(OutboardFetch::Found(bytes)),
+                None => Ok(OutboardFetch::Unsupported),
+            }
         })
     }
 

@@ -3,11 +3,12 @@
 
 use alloy::primitives::U256;
 
+use super::source::ProgressiveSource;
 use super::{
     Arc, B256, BatchStop, BufferedVoucherReader, Bytes, CacheError, ChannelDeliveryState,
     ChannelId, ChunkData, ClientHandler, ClientMessage, FillOutcome, Hash, MB_BYTES, Mutex,
-    NodeOrigin, NodeProgressivePull, RecvStream, SendStream, ServeRejectReason, StreamRequest,
-    StreamRequestExt, StreamResponseBody, TeeReservation, TeeSink, TeeVerdict, VecDeque,
+    NodeOrigin, RecvStream, SendStream, ServeRejectReason, StreamRequest, StreamRequestExt,
+    StreamResponseBody, TeeReservation, TeeSink, TeeVerdict, VecDeque,
     WINDOW_PULL_FALLBACK_DEADLINE, min_payment,
 };
 
@@ -226,6 +227,181 @@ impl ClientHandler {
         // interleaved bao back to that many plaintext bytes.
         let tee = tee.begin(total_bytes);
 
+        // This open path is node-only for now (#1130 Task 6 wires the local
+        // stream-while-store arm); wrap here so the loop below can drive
+        // either source uniformly.
+        let pull = ProgressiveSource::Node(pull);
+
+        // (6) Fused window-paced loop. Boxed to keep the large loop future off
+        // this frame (clippy::large_futures).
+        Box::pin(self.window_forward_loop(
+            &mut send,
+            &mut recv,
+            hash,
+            channel_id,
+            &channel,
+            client_node_id,
+            rate_per_mb,
+            interval_mb,
+            total_bytes,
+            pull,
+            tee,
+        ))
+        .await
+    }
+
+    /// Serve a cache miss by streaming the node's OWN configured fs/http/s3
+    /// origin straight to the paying client while teeing it into the store
+    /// (#1130, "stream-while-store"). The origin has already published this
+    /// blob's `{H}.obao4` outboard, so `open_local_outboard_pull` (Task 3) is
+    /// already open on entry as `pull` with its plaintext length in `header`;
+    /// this path fuses that local pull with downstream delivery via the #856
+    /// [`Self::window_forward_loop`], so time-to-first-byte no longer waits for the
+    /// whole blob to land. Whole-blob only (`byte_offset == 0 && byte_len == 0`):
+    /// the tee's verifying decoder walks `ChunkRanges::all()` and the window loop
+    /// bills the whole blob, exactly like the node→node window path. The caller
+    /// has already proven channel ownership (`pull_authorized`) and claimed the
+    /// tee sink. Terminal: consumes `send`/`recv`.
+    ///
+    /// The load-bearing difference from [`Self::serve_via_window_pull_through`]:
+    /// the `pull` is passed in ALREADY OPEN, so every early-return path must stop
+    /// it (`pull.abandon()`) in addition to abandoning the tee — the upstream
+    /// twin only had to abandon the tee because it hadn't opened its pull yet.
+    ///
+    /// The ADR 011 OPEN-TIME deny gates are already discharged on the only path
+    /// that reaches here — `serve_stream` refuses a denylisted hash before the
+    /// availability check, and this branch is entered only behind
+    /// `pull_authorized`, which refuses a blacklisted funding origin. A takedown
+    /// landing after this point is caught per MB boundary inside
+    /// `window_forward_loop` (ADR 011 §On Blacklist Event).
+    ///
+    /// `fault_seen` carries whether an EARLIER tier hit a transient backend fault
+    /// for this request (#1129); the leech shed reports `InternalError` rather
+    /// than a bare `CacheMiss` when this node is degraded, matching the upstream
+    /// twin.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn serve_via_local_outboard(
+        &self,
+        mut send: SendStream,
+        mut recv: RecvStream,
+        req: &StreamRequest,
+        ext: &StreamRequestExt,
+        hash: Hash,
+        client_node_id: B256,
+        header: decdn_cache::LocalOutboardHeader,
+        pull: decdn_cache::LocalOutboardPull,
+        tee: TeeReservation,
+        fault_seen: bool,
+        rate_per_mb: u64,
+    ) -> anyhow::Result<()> {
+        // Mark that the stream-while-store tier fired for this request, before
+        // any admission guard below — this is the tier-selection signal
+        // (#1130), not a success signal; an early reject still counts as this
+        // tier having been entered.
+        self.metrics.local_outboard_serve();
+
+        // Resolve the owning channel (existence + ownership already proven by
+        // `pull_authorized`) — needed for the deposit guard and the downstream
+        // voucher collection.
+        let channel_id = ChannelId::from(req.channel_id);
+        let Some(channel) = self.channels.lock().await.get(&channel_id).cloned() else {
+            pull.abandon();
+            tee.abandon();
+            return self
+                .respond_error(
+                    &mut send,
+                    req,
+                    ServeRejectReason::UnknownChannel,
+                    rate_per_mb,
+                )
+                .await;
+        };
+
+        // (1) Pre-flight deposit guard: refuse the speculative pull if the channel
+        // provably cannot pay the cost it would front. See
+        // `serve_via_window_pull_through` for the ceiling rationale (finite cap →
+        // worst-case whole-blob cost; unbounded cap → the per-request window).
+        let guard_bytes = if self.max_blob_size_bytes > 0 {
+            self.max_blob_size_bytes
+        } else {
+            let interval_bytes = self.voucher_interval_mb.saturating_mul(MB_BYTES).max(1);
+            self.pull_ahead_bytes
+                .as_ref()
+                .map_or(decdn_common::config::DEFAULT_PULL_AHEAD_BYTES, |b| b.get())
+                .max(interval_bytes)
+                .max(self.credit_window(interval_bytes))
+        };
+        let ceiling = min_payment(guard_bytes, rate_per_mb);
+        let (deposit, last_amount) = {
+            let guard = channel.lock().await;
+            (guard.state.deposit, guard.state.last_amount())
+        };
+        if deposit.saturating_sub(last_amount) < ceiling {
+            pull.abandon();
+            tee.abandon();
+            return self
+                .respond_error(
+                    &mut send,
+                    req,
+                    ServeRejectReason::InsufficientDeposit,
+                    rate_per_mb,
+                )
+                .await;
+        }
+
+        // (2) Seed-leech admission: global unrecouped budget + per-peer share
+        // ratio. `may_pull` bumps its own pause metric on refusal.
+        let peer = client_node_id.0;
+        if !self.leech_admit(&peer) {
+            pull.abandon();
+            tee.abandon();
+            // A shed under the leech caps is a miss, not a client fault — so it
+            // honors a fault latched by an earlier tier (#1129).
+            let reason = FillOutcome::miss_reason(fault_seen);
+            return self
+                .respond_error(&mut send, req, reason, rate_per_mb)
+                .await;
+        }
+
+        // (No upstream-open tier here: the local pull is already open on entry.)
+        let total_bytes = header.total_bytes;
+
+        // (4) Size gate on the origin-claimed total.
+        if self.max_blob_size_bytes > 0 && total_bytes > self.max_blob_size_bytes {
+            pull.abandon();
+            tee.abandon();
+            return self
+                .respond_error(&mut send, req, ServeRejectReason::BlobTooLarge, rate_per_mb)
+                .await;
+        }
+
+        // (5) Voucher-interval negotiation (ADR 003), then sign + send the
+        // response up front — it commits to `total_bytes`, known from the local
+        // outboard header.
+        let interval_mb = match ext.voucher_interval_mb {
+            Some(proposed) => self.voucher_interval_mb.min(proposed).max(1),
+            None => self.voucher_interval_mb,
+        };
+        let body = StreamResponseBody {
+            hash: req.hash,
+            ok: true,
+            rate_per_mb,
+            total_bytes,
+            channel_id: req.channel_id,
+            timestamp_us: req.timestamp_us,
+            redirect: None,
+        };
+        let resp = self.sign_response(body, None, Some(interval_mb))?;
+        self.write_message(&mut send, &ClientMessage::StreamResponse(resp))
+            .await?;
+
+        // Frame the tee's verifying decoder now that the whole-blob content size
+        // is known (ADR 038) — the forwarded wire is header-less.
+        let tee = tee.begin(total_bytes);
+
+        // Wrap the already-open local pull so the shared loop can drive it.
+        let pull = ProgressiveSource::LocalOutboard(pull);
+
         // (6) Fused window-paced loop. Boxed to keep the large loop future off
         // this frame (clippy::large_futures).
         Box::pin(self.window_forward_loop(
@@ -276,7 +452,7 @@ impl ClientHandler {
         rate_per_mb: u64,
         interval_mb: u64,
         total_bytes: u64,
-        mut pull: NodeProgressivePull,
+        mut pull: ProgressiveSource,
         mut tee: TeeSink,
     ) -> anyhow::Result<()> {
         let interval_bytes = interval_mb.saturating_mul(MB_BYTES).max(1);
@@ -654,7 +830,7 @@ impl ClientHandler {
     /// `write_message` failure both propagate `Err` and may not have written any
     /// frame (an underpayment `bail!` has no wire reject code). Do not read this
     /// as "a rejection was always sent."
-    pub(super) fn abandon_window_serve(&self, pull: NodeProgressivePull, tee: TeeSink) {
+    pub(super) fn abandon_window_serve(&self, pull: ProgressiveSource, tee: TeeSink) {
         pull.abandon(None);
         tee.abandon();
         self.metrics.node_pull_through_client_abandoned();

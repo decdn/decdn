@@ -451,6 +451,78 @@ impl ClientHandler {
                     fault_seen |= range_outcome.is_fault();
                 }
 
+                let mut locally_filled = false;
+
+                // Local-origin stream-while-store (#1130). When the node's OWN
+                // configured fs/http/s3 origin publishes the {H}.obao4 outboard,
+                // stream the blob from origin straight to the paying client while
+                // teeing into the store, so time-to-first-byte no longer waits for
+                // the whole blob to land. Whole-blob only (offset==0 && len==0):
+                // the tee's verifying decoder walks ChunkRanges::all() and the
+                // window loop bills the whole blob, exactly like the node→node
+                // window path. Best-effort: no published outboard / no origin size
+                // / no origins => Ok(None) => fall through to try_local_populate
+                // EXACTLY as before (ADR 037 §"Fallback is always correct").
+                if range_pulled_size.is_none()
+                    && !locally_filled
+                    && req.byte_offset == 0
+                    && req.byte_len == 0
+                    && self.pull_authorized(&req, verified_client).await
+                {
+                    match self.cache.open_local_outboard_pull(hash).await {
+                        Ok(Some((header, pull))) => match self.cache.open_tee_sink(hash) {
+                            TeeOpen::Owner(tee) => {
+                                // Boxed: the fused serve future is large
+                                // (clippy::large_futures).
+                                return Box::pin(self.serve_via_local_outboard(
+                                    send,
+                                    recv,
+                                    &req,
+                                    &ext,
+                                    hash,
+                                    client_node_id,
+                                    header,
+                                    pull,
+                                    tee,
+                                    fault_seen,
+                                    rate_per_mb,
+                                ))
+                                .await;
+                            }
+                            // A concurrent fill for this hash is already running
+                            // (#305): do NOT open a second stream. Stop the pull we
+                            // just opened, wait for the in-flight fill via
+                            // coalescing `populate`, then serve from the store.
+                            TeeOpen::InFlight => {
+                                pull.abandon();
+                                let coalesced = self.await_coalesced_fill(hash).await;
+                                if coalesced.is_filled() {
+                                    locally_filled = true;
+                                } else {
+                                    let reason = FillOutcome::miss_reason(
+                                        fault_seen || coalesced.is_fault(),
+                                    );
+                                    return self
+                                        .respond_error(&mut send, &req, reason, rate_per_mb)
+                                        .await;
+                                }
+                            }
+                        },
+                        // No outboard / no size / no origins — degrade to the
+                        // buffered local populate below, then the node→node tiers,
+                        // exactly as today.
+                        Ok(None) => {}
+                        // A genuine origin transport fault while opening the stream.
+                        // Latch it (#1129) so a later-tier miss reports
+                        // InternalError not NotFound, then fall through — another
+                        // source may still serve.
+                        Err(e) => {
+                            tracing::debug!(%hash, error = %e, "local-outboard open faulted; falling through");
+                            fault_seen = true;
+                        }
+                    }
+                }
+
                 // Reactive LOCAL-origin populate (#1116). Before any node→node
                 // path, try to fill from the node's OWN configured fs/http/s3
                 // origin (`populate_local` never touches the paid `Peer` origin).
@@ -475,8 +547,8 @@ impl ClientHandler {
                 // `InsufficientDeposit` — keep their own reasons: they are
                 // client-attributable and would refuse regardless of origin
                 // health.)
-                let mut locally_filled = false;
                 if range_pulled_size.is_none()
+                    && !locally_filled
                     && let Some(timeout) = self.local_populate
                     && self.pull_authorized(&req, verified_client).await
                 {

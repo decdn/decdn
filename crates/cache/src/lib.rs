@@ -12,6 +12,7 @@
 pub mod circuit_breaker;
 pub mod engine;
 pub mod error;
+pub mod local_outboard_pull;
 pub mod metrics;
 pub mod origin;
 pub mod origin_probe;
@@ -42,10 +43,11 @@ pub use error::{CacheError, CacheResult, OriginError, OriginPullError, Supported
 /// [`decdn_config_types::Hash`]; [`to_store_hash`]/[`from_store_hash`]
 /// convert between the two (both are the same 32 bytes — issue #578).
 pub use iroh_blobs::Hash;
+pub use local_outboard_pull::{LocalOutboardHeader, LocalOutboardPull};
 pub use metrics::CacheMetrics;
 pub use origin::{
     FilesystemOrigin, HttpOrigin, Origin, OriginFetch, OriginRangeFetch, OriginRangeRequest,
-    S3Credentials, S3Origin, S3OriginConfig,
+    OutboardFetch, S3Credentials, S3Origin, S3OriginConfig,
 };
 pub use probe_hold::{
     PROBE_HOLD_DURATION, PROBE_HOLD_MARGIN, PROBE_SLASH_WINDOW, ProbeHoldOutcome,
