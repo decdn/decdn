@@ -449,9 +449,14 @@ since project inception and will roll into the first tagged release.
     interoperate in both directions. An old client ignores the trailing bytes and
     a new client against an old node reads no echo; both keep the pre-existing
     refusal. No ALPN bump, and operators can hot-upgrade across it.
-  - Node-side `CooperativeCloseOutcome::Settled`/`Reverted` now carry the healed
-    watermark so the buyer store is advanced before the channel row is dropped,
-    and so a `closeChannel` fallback submits the voucher actually signed.
+  - `cooperative_close` gains a `reconciled: &mut Option<AuthorizedWatermark>`
+    out-param carrying the healed watermark, written **before** the transaction
+    is sent so every return path reports it — including the error ones, where a
+    failed `get_receipt` leaves the settlement unknown and the chain may already
+    have settled higher. Both callers persist it before inspecting the outcome,
+    so the buyer store is advanced before the channel row is dropped and a
+    `closeChannel` fallback submits the voucher actually signed.
+    `CooperativeCloseOutcome` itself is unchanged (three fieldless variants).
 
 #### Contracts
 
