@@ -1892,6 +1892,26 @@ contract PaymentChannelTest is Test {
         assertEq(usdc.balanceOf(client), 100_000e6 - amount);
     }
 
+    /// @dev Zero-voucher cooperative close (#1539): a funded channel that never
+    ///      delivered a byte settles at the zero tuple, refunding the full deposit
+    ///      in one tx with no route to the provider and no dispute window.
+    function test_cooperativeClose_zeroVoucher_refundsFullDepositNoRoute() public {
+        bytes32 id = _openKeyed();
+
+        vm.prank(client);
+        channel.cooperativeClose(id, 0, 0, 0, _signClient(id, 0, 0, 0), _signWaiver(id, 0, 0, 0));
+
+        // Nothing owed the provider ⇒ no route.
+        assertEq(router.callCount(), 0);
+
+        PaymentChannel.Channel memory ch = channel.getChannel(id);
+        assertEq(uint8(ch.status), 2); // Closed
+        assertEq(ch.claimedAmount, 0);
+        assertEq(ch.claimedNonce, 0);
+        // Full deposit refunded — the client is made whole.
+        assertEq(usdc.balanceOf(client), 100_000e6);
+    }
+
     function test_cooperativeClose_eitherPartyMaySubmit() public {
         bytes32 id = _openKeyed();
         uint256 amount = 250e6;

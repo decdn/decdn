@@ -473,11 +473,13 @@ impl ClientHandler {
     /// reply with a [`CooperativeCloseAuth`] so the client can settle on-chain
     /// without the dispute window.
     ///
-    /// Best-effort by design: an unknown channel, or one with no accepted voucher
-    /// yet (`last_nonce == 0` — nothing to waive; the client uses the zero-voucher
-    /// close path), is answered by finishing the stream with no auth, and the
-    /// client falls back to `closeChannel`. Signing happens before the waiver flag
-    /// is persisted, and the flag is persisted (durably, mirroring #527) before
+    /// Best-effort by design: an unknown channel is answered by finishing the
+    /// stream with no auth, and the client falls back to `closeChannel`. A channel
+    /// with no accepted voucher yet (`last_nonce == 0`) is NOT declined — the node
+    /// signs a waiver over the zero tuple so the funder reclaims the deposit
+    /// window-free via `cooperativeClose(id, 0, 0, 0, ...)` (#1539). Signing
+    /// happens before the waiver flag is persisted, and the flag is persisted
+    /// (durably, mirroring #527) before
     /// the auth is sent — so a store failure leaves the channel still serveable
     /// and the node has not handed out a waiver it won't remember. Once flagged,
     /// the node serves no further bytes on the channel (the `serve_stream` and
@@ -522,10 +524,10 @@ impl ClientHandler {
             // that gate runs.
             //
             // Decline == finish the stream with no waiver, byte-for-byte the
-            // unknown-channel / zero-voucher decline below, so an unauthorized
-            // request stays wire-indistinguishable and leaks neither channel
-            // existence nor the watermark. The otherwise-invisible refusal is
-            // metered so operators can see the probing.
+            // unknown-channel decline above, so an unauthorized request stays
+            // wire-indistinguishable and leaks neither channel existence nor the
+            // watermark. The otherwise-invisible refusal is metered so operators
+            // can see the probing.
             let authorized_signer = guard.state.voucher_signer;
             let authorized = matches!(
                 decdn_incentive::recover_coop_close_request(
@@ -546,13 +548,15 @@ impl ClientHandler {
                 return Ok(());
             }
 
-            if guard.state.last_nonce() == U256::ZERO {
-                // No voucher accepted yet: nothing to settle. Finish; client
-                // falls back to the zero-voucher close.
-                drop(guard);
-                let _ = send.finish();
-                return Ok(());
-            }
+            // A channel that never accepted a voucher (`last_nonce == 0`) is not
+            // declined (#1539): the node signs a waiver over the zero tuple so the
+            // funder reclaims the deposit in one `cooperativeClose(id, 0, 0, 0,
+            // ...)` — window-free — instead of the `closeChannelWithoutVoucher` →
+            // dispute-window → `settleChannel` fallback. The node is owed nothing
+            // either way, so cooperating costs it nothing; the auth gate above
+            // (proving control of `voucher_signer`) already bounds this to the
+            // channel's own signer, so it is neither a griefing vector nor a leak
+            // to any third party.
             let close = CooperativeClose {
                 channel_id,
                 amount: guard.state.last_amount(),
@@ -593,26 +597,33 @@ impl ClientHandler {
             // the fetch path (#1481).
             //
             // An empty echo sends the auth with no reconcile evidence: the client
-            // cannot verify and keeps its refusal. Control flow has already
-            // established `last_nonce != 0` (the zero-voucher decline returned
-            // above) and `accept_voucher` writes nonce and signature together, so
-            // this arm means precisely a **schema-v1 store record**, which never
-            // wrote the signature segment. That is a real population, not a
-            // hypothetical, and the client it strands is exactly the one #1495
-            // exists for — so meter it rather than letting a stale row look like a
-            // normal waiver.
+            // cannot verify and keeps its refusal. Two disjoint causes reach it:
+            //
+            //   * `last_nonce == 0` — a zero-voucher close (#1539). Nothing was
+            //     ever signed, so there is genuinely nothing to echo, and the
+            //     client's authorized watermark is also zero so it never reaches
+            //     the reconcile branch. This is normal, not an anomaly — do NOT
+            //     meter it.
+            //   * `last_nonce != 0` with no stored signature — a **schema-v1 store
+            //     record**, since `accept_voucher` writes nonce and signature
+            //     together, so a non-zero nonce with no signature can only be a
+            //     pre-v2 row. That strands exactly the lagging client #1495 exists
+            //     for, so meter it rather than letting a stale row look like a
+            //     normal waiver.
             let last_signature = if let Some(sig) = guard.state.last_signature() {
                 sig.to_vec()
             } else {
-                self.metrics.cooperative_close_auth_no_echo();
-                tracing::warn!(
-                    %channel_id,
-                    nonce = %guard.state.last_nonce(),
-                    "cooperative-close: channel has an accepted voucher but no stored \
-                     signature (pre-v2 store record); sending the waiver with no echo — a \
-                     client whose watermark lags cannot reconcile and will fall back to \
-                     closeChannel"
-                );
+                if guard.state.last_nonce() != U256::ZERO {
+                    self.metrics.cooperative_close_auth_no_echo();
+                    tracing::warn!(
+                        %channel_id,
+                        nonce = %guard.state.last_nonce(),
+                        "cooperative-close: channel has an accepted voucher but no stored \
+                         signature (pre-v2 store record); sending the waiver with no echo — a \
+                         client whose watermark lags cannot reconcile and will fall back to \
+                         closeChannel"
+                    );
+                }
                 Vec::new()
             };
             CooperativeCloseAuth {

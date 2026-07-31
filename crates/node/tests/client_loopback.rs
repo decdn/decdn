@@ -6337,6 +6337,110 @@ async fn cooperative_close_without_a_stored_signature_omits_the_echo() -> anyhow
     Ok(())
 }
 
+/// A funded channel that never accepted a voucher (`last_nonce == 0`) is
+/// cooperatively closed at the zero tuple (#1539): the node signs a
+/// `CooperativeClose` over `(0, 0, 0)` so the funder reclaims the deposit in one
+/// transaction instead of waiting a dispute window. The echo is empty (nothing
+/// was ever signed) and — unlike the schema-v1 no-signature row — this is NOT an
+/// anomaly, so the `cooperative_close_auth_no_echo` counter must stay at 0.
+#[tokio::test(flavor = "multi_thread")]
+async fn cooperative_close_of_a_zero_voucher_channel_signs_the_zero_tuple() -> anyhow::Result<()> {
+    let payload = vec![0x7Cu8; 4096];
+    let (cache, _hash, _cache_tmp) = cache_with_blob(&payload).await?;
+
+    // A channel funded but never used: watermark and signature are all zero.
+    let signer = Arc::new(PrivateKeySigner::random());
+    let deposit = U256::from(10_000_000u64);
+    let store_inner = Arc::new(MemoryChannelStateStore::new());
+    store_inner.record(&ChannelState::hydrate(
+        channel_id(),
+        signer.address(),
+        signer.address(),
+        TOKEN,
+        deposit,
+        U256::ZERO, // last_amount
+        U256::ZERO, // last_nonce — never accepted a voucher
+        U256::ZERO, // last_bytes_delivered
+        None,       // no stored signature
+        0,
+        false,
+    ))?;
+    let store: Arc<dyn ChannelStateStore> = store_inner.clone();
+    let (target, server_eth, server_ep, server_task, metrics) =
+        spawn_handler_server_with_metrics(cache, store, RATE_PER_MB, 0, 16).await?;
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+
+    // (1) Request the waiver, authenticated by the channel's voucher-signer key.
+    let client_signature = sign_coop_close_request(&signer, channel_id(), &payment_domain())?;
+    let (reply, remainder) = raw_message_request_with_remainder(
+        &client_ep,
+        target.clone(),
+        &ClientMessage::CooperativeCloseRequest(CooperativeCloseRequest {
+            channel_id: channel_id().0,
+            client_signature,
+        }),
+    )
+    .await?;
+    let auth = match reply {
+        ClientMessage::CooperativeCloseAuth(a) => a,
+        other => anyhow::bail!("expected CooperativeCloseAuth, got {other:?}"),
+    };
+    auth.validate()?;
+
+    // (2) The declared tuple is all zero and the echo is empty.
+    anyhow::ensure!(
+        remainder.is_empty(),
+        "the echo rides inside the auth message"
+    );
+    anyhow::ensure!(auth.channel_id == channel_id().0, "channel id echoed");
+    anyhow::ensure!(
+        U256::from_be_bytes(auth.amount) == U256::ZERO
+            && U256::from_be_bytes(auth.nonce) == U256::ZERO
+            && U256::from_be_bytes(auth.bytes_delivered) == U256::ZERO,
+        "a zero-voucher close declares the zero tuple"
+    );
+    anyhow::ensure!(
+        auth.last_signature.is_empty(),
+        "nothing was ever signed ⇒ an empty echo"
+    );
+
+    // (3) The waiver recovers to the node's eth key over the zero CooperativeClose
+    //     tuple — exactly what on-chain `cooperativeClose(id, 0, 0, 0, ...)` checks.
+    let waiver = SignedCooperativeClose {
+        close: CooperativeClose {
+            channel_id: channel_id(),
+            amount: U256::ZERO,
+            nonce: U256::ZERO,
+            bytes_delivered: U256::ZERO,
+            token: TOKEN,
+        },
+        signature: Signature::try_from(auth.signature.as_slice())?,
+    };
+    waiver.verify_signer(server_eth.address(), &payment_domain())?;
+
+    // (4) The no-longer-serving flag persisted, and the no-echo counter stayed at
+    //     0 — an empty echo here is expected, not a stranded schema-v1 row.
+    let persisted = store_inner
+        .get(channel_id())?
+        .ok_or_else(|| anyhow::anyhow!("channel missing after waiver"))?;
+    anyhow::ensure!(
+        persisted.cooperative_close_signed(),
+        "cooperative-close flag must persist after signing the zero waiver"
+    );
+    anyhow::ensure!(
+        metric_line_present(
+            &metrics.encode()?,
+            "decdn_cooperative_close_auth_no_echo_total 0"
+        ),
+        "a legitimate zero-voucher close must NOT be metered as a no-echo anomaly"
+    );
+
+    client_ep.close().await;
+    server_ep.close().await;
+    server_task.await?;
+    Ok(())
+}
+
 /// Build a cache whose local store is EMPTY but whose filesystem origin holds
 /// `payload`, so a `cdn/client/v1` cache miss must reactively pull the origin
 /// through to serve. Both temp dirs are returned so the caller keeps the origin
