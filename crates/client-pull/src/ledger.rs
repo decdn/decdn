@@ -260,10 +260,23 @@ impl ChannelLedger {
     ///
     /// Synchronous: the pipeline is behind a `std::sync::Mutex` (#1484), so unlike
     /// the pre-pipelining ledger this needs no `await`.
-    pub fn reseed(&self, cum: Cumulative) {
+    /// Returns `false` — leaving the ledger untouched — if `cum` does not ADVANCE
+    /// past the committed watermark. Reseeding is for healing a watermark that has
+    /// fallen BEHIND what the node holds; a bundle at or behind `committed` proves
+    /// nothing and applying it would REGRESS the watermark, so the retry would
+    /// re-sign a spent nonce and strand the channel — the #1122 wedge this ledger
+    /// exists to prevent. Guarded here rather than only at the call sites for the
+    /// same reason [`Self::resolve_ack`] guards: monotonicity is the ledger's
+    /// invariant to keep, not its callers'.
+    #[must_use]
+    pub fn reseed(&self, cum: Cumulative) -> bool {
         let mut pipeline = self.pipeline();
+        if cum.nonce <= pipeline.committed.nonce {
+            return false;
+        }
         pipeline.committed = cum;
         pipeline.outstanding.clear();
+        true
     }
 
     /// Resolve the oldest outstanding voucher as ACKED: advance the committed
@@ -480,7 +493,10 @@ mod tests {
         // Self-heal: re-seed to the node's authenticated watermark. reseed clears the whole
         // outstanding pipeline, so settlement drops to the bundle's nonce — proving both
         // armed vouchers were discarded wholesale, not one at a time.
-        ledger.reseed(Cumulative::from(&bundle));
+        assert!(
+            ledger.reseed(Cumulative::from(&bundle)),
+            "a bundle ahead of committed must be applied"
+        );
         assert_eq!(
             ledger.settlement().nonce,
             U256::from(5u64),
@@ -501,6 +517,63 @@ mod tests {
         );
         assert_eq!(issued.nonce, U256::from(6u64));
         assert_eq!(issued.bytes, U256::from(5100u64)); // bundle.bytes_delivered + 100
+        Ok(())
+    }
+
+    /// The monotonicity guard (#1497 review): a bundle that does NOT advance past
+    /// the committed watermark must be refused, leaving the ledger untouched.
+    ///
+    /// This is not a hypothetical. The node attaches an authenticated bundle to
+    /// EVERY watermark-gated rejection once any voucher has been accepted —
+    /// including a genuinely exhausted channel, where the bundle simply echoes the
+    /// watermark the client already holds. Applying it would REGRESS `committed`,
+    /// and the retry would then re-sign a nonce the node has already consumed:
+    /// the `StaleNonce` wedge of #1122, caused by the client's own self-heal.
+    /// Refusing it also lets the caller surface the real rejection instead of
+    /// spending its resume budget re-sending refused vouchers.
+    #[tokio::test]
+    async fn reseed_refuses_a_bundle_that_does_not_advance_the_watermark() -> anyhow::Result<()> {
+        let committed = Cumulative {
+            nonce: U256::from(5u64),
+            bytes: U256::from(5000u64),
+            amount: U256::from(50u64),
+        };
+        let ledger = ChannelLedger::new(committed);
+        // One voucher optimistically in flight, so a wrongly-applied reseed would
+        // be observable twice over: regressed committed AND a cleared pipeline.
+        ledger.issue(100, 10, |_next| async { Ok(()) }).await?;
+
+        // The exhausted-channel echo: same nonce we already hold.
+        let echo = Cumulative {
+            nonce: U256::from(5u64),
+            bytes: U256::from(5000u64),
+            amount: U256::from(50u64),
+        };
+        assert!(
+            !ledger.reseed(echo),
+            "a bundle at the committed watermark proves nothing and must be refused"
+        );
+        assert_eq!(
+            ledger.settlement().nonce,
+            U256::from(6u64),
+            "the refused reseed must leave the outstanding pipeline intact"
+        );
+
+        // And the strictly-behind case: a stale bundle must not rewind us either.
+        let behind = Cumulative {
+            nonce: U256::from(2u64),
+            bytes: U256::from(2000u64),
+            amount: U256::from(20u64),
+        };
+        assert!(
+            !ledger.reseed(behind),
+            "a bundle behind committed must be refused"
+        );
+        assert_eq!(
+            ledger.committed().nonce,
+            U256::from(5u64),
+            "committed must never regress"
+        );
         Ok(())
     }
 

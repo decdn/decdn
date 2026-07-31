@@ -1855,7 +1855,8 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
     // `'static` so it can't borrow `cfg`/`secret_key`, and those are used later.
     let (buyer_bootstrap_stop_tx, buyer_bootstrap_stop_rx) = oneshot::channel::<()>();
     let buyer_voucher_domain = ch.voucher_domain.clone();
-    let buyer_default_deposit = U256::from(cfg.blockchain.buyer_deposit_micro_usdc);
+    let buyer_initial_deposit = U256::from(cfg.blockchain.buyer_initial_deposit_micro_usdc);
+    let buyer_working_deposit = U256::from(cfg.blockchain.buyer_working_deposit_micro_usdc);
     let buyer_ensure_max_approval = cfg.blockchain.buyer_max_approve;
     let buyer_signer_address = infra.eth_signer.address();
     let pull_through_enabled = cfg.cache.node_to_node_pull_through_enabled;
@@ -1874,7 +1875,9 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
             .max_blob_size_mb
             .saturating_mul(decdn_protocol::MB_BYTES),
         max_rate_per_mb: cfg.cache.max_rate_per_mb,
-        deposit_hint: U256::from(cfg.blockchain.buyer_deposit_micro_usdc),
+        // Miss pulls open small and graduate on proof (#1497 task 6): the
+        // fresh-open deposit is the INITIAL size, not the working target.
+        deposit_hint: buyer_initial_deposit,
         lookup: crate::dht::LookupConfig::default(),
         // Own self-attested region for the ADR 030 latency-vs-claim penalty
         // (#1177); `None` disables it (nothing to compare a peer's claim against).
@@ -1906,7 +1909,8 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
                 buyer_channel_store,
                 eth_signer_for_buyer,
                 buyer_voucher_domain,
-                buyer_default_deposit,
+                buyer_initial_deposit,
+                buyer_working_deposit,
                 buyer_ensure_max_approval,
                 // Idle-reconcile dial wiring (#972): only when node→node
                 // pull-through gave us a node-address resolver to map a
@@ -3704,7 +3708,8 @@ mod tests {
                 event_poll_interval_ms: 7000,
                 rate_bounds_poll_interval_sec: 3600,
                 redeem_threshold_micro_usdc: 1_000_000,
-                buyer_deposit_micro_usdc: 10_000_000,
+                buyer_initial_deposit_micro_usdc: 10_000_000,
+                buyer_working_deposit_micro_usdc: 10_000_000,
                 buyer_max_approve: true,
                 settlement_auto_threshold_micro_usdc: None,
                 settlement_auto_by_voucher_nonce_span: None,

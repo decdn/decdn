@@ -23,6 +23,32 @@ since project inception and will roll into the first tagged release.
 
 ### Changed (BREAKING)
 
+- **Config-breaking and CLI-breaking: `blockchain.buyer_deposit_micro_usdc` is
+  split into two knobs (#1497).** The buyer path now opens a channel small and
+  graduates it, so the single deposit knob becomes a pair. There is **no alias**:
+  `[blockchain]` is `deny_unknown_fields`, so any existing config file carrying
+  the old key fails at load with an unknown-field error until it is migrated.
+  - `blockchain.buyer_initial_deposit_micro_usdc` — the first-contact
+    `openChannel` lock. **Default 0.5 USDC (`500_000`), down from the old key's
+    10 USDC**: a channel now escrows 20× less at open, so an unproven provider
+    holds correspondingly less of the buyer's capital. Validated `> 0`.
+  - `blockchain.buyer_working_deposit_micro_usdc` — the target every `topUp`
+    refills toward. Default 10 USDC (`10_000_000`), matching the old key's
+    default. `0` disables top-up entirely; any other value must be
+    `>= buyer_initial_deposit_micro_usdc`.
+  - The `decdn fetch` flag `--deposit-micro-usdc` is likewise **renamed with no
+    alias** into `--initial-deposit-micro-usdc` / `--working-deposit-micro-usdc`;
+    the old spelling is now rejected as an unexpected argument.
+  - Operator impact beyond the rename: because channels open at 0.5 USDC, a
+    *first-contact* pull is bounded by what that deposit buys (~500 MB at ADR
+    003's ceiling rate) until the channel graduates. `decdn fetch` recovers
+    in-flight by topping up mid-transfer and resuming at the paid frontier; the
+    daemon's node-to-node pull and `decdn bundle pull` graduate only on reuse,
+    so an oversized *first* pull on those paths can now fail where a 10 USDC
+    open previously succeeded. Raise `buyer_initial_deposit_micro_usdc` if that
+    matters for a given deployment. See
+    [ADR 003 § Deposit Economics](adr/003-payments.md#deposit-economics).
+
 - **Deploy-script-breaking: `DeployConfig` and `BuybackActivation` changed shape
   (#1090, #1175).** Both are `BaseProtocolDeploy` structs, so only out-of-tree
   callers that construct them by hand are affected — no contract ABI, config
@@ -145,9 +171,12 @@ since project inception and will roll into the first tagged release.
   by the seller-side per-voucher ceiling (see the #1516 entry under Fixed),
   channel spam by gas — and the client-side 10 USDC recommendation of
   [ADR 003 § Deposit Economics](adr/003-payments.md#deposit-economics) is
-  unchanged. `blockchain.buyer_deposit_micro_usdc` keeps its name, its 10 USDC
-  default, and its `> 0` validation; buyer paths simply no longer read the
-  contract to clamp up to a floor. The internal `MIN_DEPOSIT_FLOOR` constant
+  unchanged. `blockchain.buyer_deposit_micro_usdc` kept its name, its 10 USDC
+  default, and its `> 0` validation at the time of this change; buyer paths
+  simply no longer read the contract to clamp up to a floor. (That knob was
+  subsequently split into `buyer_initial_deposit_micro_usdc` /
+  `buyer_working_deposit_micro_usdc` — see the two-tier deposit entry above.)
+  The internal `MIN_DEPOSIT_FLOOR` constant
   bounded two different things — `setMinDeposit`'s own lower bound and the
   delivery-*rate* floor. With the former gone it is renamed `MIN_RATE_FLOOR` to
   match what it still does; same value, two remaining call sites (the constructor

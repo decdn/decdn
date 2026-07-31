@@ -138,10 +138,15 @@ pub struct ResolvedBlockchain {
     /// settlement path submits an on-chain `withdraw` (#327). Defaults to
     /// 1 USDC (`1_000_000` `µUSDC`) when unset.
     pub redeem_threshold_micro_usdc: u64,
-    /// Deposit (base units, `µUSDC`) used when the buyer path opens a new
-    /// `PaymentChannel` against an upstream provider on a cache miss (#744).
-    /// Defaults to 10 USDC (`10_000_000` `µUSDC`), escrowed as configured.
-    pub buyer_deposit_micro_usdc: u64,
+    /// First-contact `openChannel` deposit (base units, `µUSDC`). Defaults to
+    /// 0.5 USDC (`500_000`); escrowed as configured at open time (no on-chain
+    /// floor; only a non-zero requirement). See
+    /// `ResolvedBlockchain::buyer_working_deposit_micro_usdc`.
+    pub buyer_initial_deposit_micro_usdc: u64,
+    /// Refill target (base units, `µUSDC`) every `topUp` restores toward.
+    /// Defaults to 10 USDC (`10_000_000`). `0` disables top-up. Guaranteed
+    /// `>= buyer_initial_deposit_micro_usdc` when nonzero.
+    pub buyer_working_deposit_micro_usdc: u64,
     /// Whether the buyer path issues a one-time max USDC approval for the
     /// `PaymentChannel` contract at startup (#744, ADR 003 § Deposit
     /// Economics). Defaults to `true`; set `false` to manage the allowance

@@ -1416,6 +1416,17 @@ async fn open_stream(
 /// cannot do for it — and both loops must agree on the bound.
 pub const MAX_RESUME_ATTEMPTS: u32 = 3;
 
+/// Reactive graduation (#1497): the maximum number of times the STREAMING fetch
+/// (`crates/cli/src/commands/fetch.rs`) will `topUp` a channel toward its
+/// `working_deposit` after a genuine mid-fetch `InsufficientDeposit` (validated
+/// against the buyer's own ledger via [`genuine_exhaustion`]) and retry the same
+/// `byte_offset`. Separate from [`MAX_RESUME_ATTEMPTS`]: a top-up is a funding
+/// action with its own on-chain cost and failure mode (a delegate key that
+/// cannot fund, an allowance that fails to land), not a wallet-less resume, so
+/// it is bounded on its own budget rather than sharing/competing with the resume
+/// attempts.
+pub const MAX_TOPUP_ATTEMPTS: u32 = 3;
+
 /// Buffered fetch with wallet-less resume (issue #1481 §5): if a mid-stream
 /// voucher rejection carries a signer-verified [`WatermarkBundle`] for one of
 /// the four regression/exhaustion reasons, reseed `ledger` from it and reopen
@@ -1508,8 +1519,13 @@ async fn fetch_inner(
             return Err(e);
         }
         match resumable_watermark(&e, ctx) {
-            Some(bundle) => {
-                ledger.reseed(Cumulative::from(bundle));
+            // A bundle that does not ADVANCE our committed watermark is not a
+            // desync: the node attaches one to every watermark-gated rejection once
+            // any voucher has been accepted, so an exhausted channel echoes our own
+            // watermark straight back. Retrying against it is futile — and applying
+            // it would regress the ledger — so surface the real error instead of
+            // spending the resume budget on it.
+            Some(bundle) if ledger.reseed(Cumulative::from(bundle)) => {
                 tracing::debug!(
                     attempt,
                     byte_offset,
@@ -1517,7 +1533,7 @@ async fn fetch_inner(
                      retrying at the same byte_offset"
                 );
             }
-            None => return Err(e),
+            Some(_) | None => return Err(e),
         }
     }
     // Unreachable: the loop above always returns on both the `Ok` and every `Err`
@@ -1605,6 +1621,54 @@ pub fn resumable_watermark<'a>(
         &ctx.voucher_domain,
     )
     .then_some(bundle)
+}
+
+/// True iff `err` is an `InsufficientDeposit` voucher rejection that the buyer's OWN ledger
+/// corroborates as genuine exhaustion, AND the buyer's remaining spendable deposit is below the
+/// cost of the next voucher. A node claiming `InsufficientDeposit` while the buyer's ledger
+/// still shows headroom is NOT corroborated (returns `false`) — the caller must refuse to fund
+/// it.
+///
+/// `committed` is the caller's OWN `ledger.committed()` at the moment of the rejection — the
+/// watermark this genuinely-exhausted-or-not decision is judged against.
+///
+/// The healable-desync carve-out is watermark-ADVANCEMENT-based, not bundle-PRESENCE-based.
+/// The node attaches an authenticated [`WatermarkBundle`] to EVERY watermark-gated rejection for
+/// which it has a prior accepted voucher to echo (`watermark_bundle_for_reject` in
+/// `crates/node/src/handlers/client/voucher.rs`) — including a rejection caused by perfectly
+/// ordinary, real exhaustion on a channel that has already had some vouchers accepted. Treating
+/// bundle PRESENCE alone as "this is a desync" would misroute every such real exhaustion into
+/// the resync path (which cannot fix it — the deposit is actually short — and eventually fails
+/// after burning `MAX_RESUME_ATTEMPTS`) instead of the top-up path that could. The bundle is only
+/// evidence of desync when it reports a watermark AHEAD of what we already hold — i.e. the node
+/// knows about a voucher we do not, which reseeding can heal. A bundle that merely echoes back
+/// our OWN already-committed watermark (at or behind `committed`) proves nothing about desync;
+/// it is the node correctly reporting the state we already agree on, and the exhaustion is real.
+pub fn genuine_exhaustion(
+    err: &anyhow::Error,
+    ctx: &ChannelContext,
+    committed: Cumulative,
+    remaining_spendable: U256,
+    next_voucher_cost: U256,
+) -> bool {
+    let Some(rejected) = err.downcast_ref::<UpstreamVoucherRejected>() else {
+        return false;
+    };
+    if rejected.reason != VoucherRejectReason::InsufficientDeposit {
+        return false;
+    }
+    // An authenticated bundle that ADVANCES our committed nonce is a healable desync — let the
+    // resume loop reseed instead of adding funds. A bundle that is absent, or present but at or
+    // behind `committed`, proves no desync (see the doc comment above), so exhaustion can still
+    // be genuine.
+    if let Some(bundle) = resumable_watermark(err, ctx)
+        && Cumulative::from(bundle).nonce > committed.nonce
+    {
+        return false;
+    }
+    // Validate the node's claim against our OWN accounting: only genuine if we truly cannot
+    // cover the next voucher. Otherwise the node is lying/buggy and we refuse to fund it.
+    remaining_spendable < next_voucher_cost
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2608,9 +2672,9 @@ mod tests {
     use decdn_bao_range::{IROH_BLOCK_SIZE, align_range, encode_verified_range};
 
     use super::{
-        ChannelContext, HashMismatch, LocalPullFault, U256, UpstreamVoucherRejected, Voucher,
-        VoucherRejectReason, WatermarkBundle, aligned_wire_len, decode_verified_range,
-        resumable_watermark,
+        ChannelContext, Cumulative, HashMismatch, LocalPullFault, U256, UpstreamVoucherRejected,
+        Voucher, VoucherRejectReason, WatermarkBundle, aligned_wire_len, decode_verified_range,
+        genuine_exhaustion, resumable_watermark,
     };
 
     /// The `LocalPullFault` marker must ride out on the errors the range helpers ACTUALLY
@@ -2961,6 +3025,201 @@ mod tests {
             )
         })?;
         assert_eq!(got.bytes_delivered, expected_bytes);
+        Ok(())
+    }
+
+    /// True twin: `InsufficientDeposit` with no bundle (nothing for `resumable_watermark` to
+    /// reseed from) and our own ledger confirming we truly cannot cover the next voucher.
+    #[test]
+    fn genuine_exhaustion_true_when_insufficient_and_ledger_drained() {
+        use alloy::primitives::{Address, B256};
+        use alloy::signers::local::PrivateKeySigner;
+
+        let channel_id = B256::repeat_byte(0x11);
+        let token = Address::repeat_byte(0x22);
+        let domain = decdn_incentive::voucher_domain(1, Address::repeat_byte(0x33));
+        let signer = std::sync::Arc::new(PrivateKeySigner::random());
+        let ctx = resume_test_ctx(channel_id, token, &signer, &domain);
+
+        let err = anyhow::Error::new(UpstreamVoucherRejected {
+            reason: VoucherRejectReason::InsufficientDeposit,
+            bundle: None,
+        });
+        // remaining 10 µUSDC, next voucher needs 1000 -> truly out.
+        assert!(genuine_exhaustion(
+            &err,
+            &ctx,
+            Cumulative::default(),
+            U256::from(10u64),
+            U256::from(1000u64)
+        ));
+    }
+
+    /// A node crying `InsufficientDeposit` while our OWN ledger still shows headroom is NOT
+    /// corroborated — the caller must refuse to fund it (a lying or buggy node must not be
+    /// able to solicit an unnecessary top-up).
+    #[test]
+    fn genuine_exhaustion_false_when_ledger_still_has_headroom() {
+        use alloy::primitives::{Address, B256};
+        use alloy::signers::local::PrivateKeySigner;
+
+        let channel_id = B256::repeat_byte(0x11);
+        let token = Address::repeat_byte(0x22);
+        let domain = decdn_incentive::voucher_domain(1, Address::repeat_byte(0x33));
+        let signer = std::sync::Arc::new(PrivateKeySigner::random());
+        let ctx = resume_test_ctx(channel_id, token, &signer, &domain);
+
+        let err = anyhow::Error::new(UpstreamVoucherRejected {
+            reason: VoucherRejectReason::InsufficientDeposit,
+            bundle: None,
+        });
+        assert!(!genuine_exhaustion(
+            &err,
+            &ctx,
+            Cumulative::default(),
+            U256::from(5000u64),
+            U256::from(1000u64)
+        ));
+    }
+
+    /// Any rejection reason other than `InsufficientDeposit` is never exhaustion, regardless
+    /// of what the ledger shows.
+    #[test]
+    fn genuine_exhaustion_false_for_non_insufficient_reason() {
+        use alloy::primitives::{Address, B256};
+        use alloy::signers::local::PrivateKeySigner;
+
+        let channel_id = B256::repeat_byte(0x11);
+        let token = Address::repeat_byte(0x22);
+        let domain = decdn_incentive::voucher_domain(1, Address::repeat_byte(0x33));
+        let signer = std::sync::Arc::new(PrivateKeySigner::random());
+        let ctx = resume_test_ctx(channel_id, token, &signer, &domain);
+
+        let err = anyhow::Error::new(UpstreamVoucherRejected {
+            reason: VoucherRejectReason::StaleNonce,
+            bundle: None,
+        });
+        assert!(!genuine_exhaustion(
+            &err,
+            &ctx,
+            Cumulative::default(),
+            U256::ZERO,
+            U256::from(1000u64)
+        ));
+    }
+
+    /// A healable watermark desync — an authenticated bundle that ADVANCES our committed
+    /// watermark (the node knows about a voucher nonce we do not) — is NOT genuine exhaustion,
+    /// even if it rides on an `InsufficientDeposit` rejection and even if the ledger looks
+    /// drained: the caller should reseed and resume, not fund a top-up.
+    #[test]
+    fn genuine_exhaustion_false_when_healable_desync_bundle_advances_committed()
+    -> anyhow::Result<()> {
+        use alloy::primitives::{Address, B256};
+        use alloy::signers::local::PrivateKeySigner;
+
+        let channel_id = B256::repeat_byte(0x11);
+        let token = Address::repeat_byte(0x22);
+        let domain = decdn_incentive::voucher_domain(1, Address::repeat_byte(0x33));
+        let signer = std::sync::Arc::new(PrivateKeySigner::random());
+        let ctx = resume_test_ctx(channel_id, token, &signer, &domain);
+        // Our own ledger is still at nonce 2; the bundle reports nonce 3 — the node holds a
+        // later voucher than we do, exactly the healable desync #1481 §5 exists to catch.
+        let committed = Cumulative {
+            nonce: U256::from(2u64),
+            bytes: U256::from(2048u64),
+            amount: U256::from(300u64),
+        };
+
+        let bundle = signed_bundle(
+            channel_id,
+            token,
+            &signer,
+            &domain,
+            U256::from(500u64),
+            U256::from(3u64),
+            U256::from(4096u64),
+        )?;
+        let err = anyhow::Error::new(UpstreamVoucherRejected {
+            reason: VoucherRejectReason::InsufficientDeposit,
+            bundle: Some(bundle),
+        });
+
+        // Sanity: this bundle IS the healable-desync case `resumable_watermark` resolves, and
+        // it genuinely advances past `committed`.
+        let resolved = resumable_watermark(&err, &ctx).ok_or_else(|| {
+            anyhow::anyhow!("test bundle must be a healable desync resumable_watermark accepts")
+        })?;
+        anyhow::ensure!(
+            Cumulative::from(resolved).nonce > committed.nonce,
+            "test bundle must advance past `committed` to exercise the desync branch"
+        );
+        assert!(!genuine_exhaustion(
+            &err,
+            &ctx,
+            committed,
+            U256::from(10u64),
+            U256::from(1000u64)
+        ));
+        Ok(())
+    }
+
+    /// The case this whole redesign exists for: a bundle that is PRESENT and authenticated, but
+    /// does NOT advance past `committed` — the node echoing back exactly the watermark we
+    /// already hold, because there is nothing later for it to report. This is NOT a desync (there
+    /// is nothing to reseed to), so a genuinely drained ledger IS genuine exhaustion — the top-up
+    /// path must fire, not the resync path. Every watermark-gated rejection on a channel that has
+    /// ever had a voucher accepted carries a bundle (`watermark_bundle_for_reject`), so bundle
+    /// PRESENCE alone (the pre-redesign check) would have misrouted this into an unproductive
+    /// resync loop that eventually fails outright.
+    #[test]
+    fn genuine_exhaustion_true_when_bundle_present_but_does_not_advance_committed()
+    -> anyhow::Result<()> {
+        use alloy::primitives::{Address, B256};
+        use alloy::signers::local::PrivateKeySigner;
+
+        let channel_id = B256::repeat_byte(0x11);
+        let token = Address::repeat_byte(0x22);
+        let domain = decdn_incentive::voucher_domain(1, Address::repeat_byte(0x33));
+        let signer = std::sync::Arc::new(PrivateKeySigner::random());
+        let ctx = resume_test_ctx(channel_id, token, &signer, &domain);
+        // Our ledger and the echoed bundle agree EXACTLY: nonce 3 both sides.
+        let committed = Cumulative {
+            nonce: U256::from(3u64),
+            bytes: U256::from(4096u64),
+            amount: U256::from(500u64),
+        };
+
+        let bundle = signed_bundle(
+            channel_id,
+            token,
+            &signer,
+            &domain,
+            U256::from(500u64),
+            U256::from(3u64),
+            U256::from(4096u64),
+        )?;
+        let err = anyhow::Error::new(UpstreamVoucherRejected {
+            reason: VoucherRejectReason::InsufficientDeposit,
+            bundle: Some(bundle),
+        });
+
+        // Sanity: the bundle is still authenticated (resumable_watermark resolves it) — the
+        // fix is NOT "stop trusting the bundle", it's "stop treating its mere presence as proof
+        // of desync".
+        anyhow::ensure!(
+            resumable_watermark(&err, &ctx).is_some(),
+            "test bundle must be authenticated for this to be a meaningful test"
+        );
+        // remaining 10 µUSDC, next voucher needs 1000 -> truly out, and the bundle does not
+        // move us anywhere new.
+        assert!(genuine_exhaustion(
+            &err,
+            &ctx,
+            committed,
+            U256::from(10u64),
+            U256::from(1000u64)
+        ));
         Ok(())
     }
 

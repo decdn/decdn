@@ -898,7 +898,8 @@ async fn run_e2e() -> anyhow::Result<()> {
         buyer_store_dyn,
         Arc::clone(&buyer_signer),
         voucher_domain(CHAIN_ID, payment_channel),
-        U256::from(DEPOSIT_MICRO_USDC),
+        U256::from(DEPOSIT_MICRO_USDC),            // initial_deposit
+        U256::from(DEPOSIT_MICRO_USDC), // working_deposit (same size: graduation not under test here)
         true, // fresh buyer identity → issue the one-time max USDC approval
         None, // idle-reconcile sweep not under test here
         Arc::new(MemoryPendingSettleStore::new()), // buyer pending-settle set (#988); unused with reconcile off
@@ -1713,7 +1714,8 @@ async fn run_e2e() -> anyhow::Result<()> {
         recon_store_dyn,
         Arc::clone(&buyer_signer),
         voucher_domain(CHAIN_ID, payment_channel),
-        U256::from(DEPOSIT_MICRO_USDC),
+        U256::from(DEPOSIT_MICRO_USDC), // initial_deposit
+        U256::from(DEPOSIT_MICRO_USDC), // working_deposit (same size: graduation not under test here)
         false,
         None, // idle-reconcile sweep not under test here
         Arc::new(MemoryPendingSettleStore::new()),
@@ -1782,7 +1784,8 @@ async fn run_e2e() -> anyhow::Result<()> {
         Arc::clone(&pstore_dyn),
         Arc::clone(&buyer_signer),
         voucher_domain(CHAIN_ID, payment_channel),
-        U256::from(DEPOSIT_MICRO_USDC),
+        U256::from(DEPOSIT_MICRO_USDC), // initial_deposit
+        U256::from(DEPOSIT_MICRO_USDC), // working_deposit (same size: graduation not under test here)
         false,
         None, // idle-reconcile sweep not under test here
         Arc::new(MemoryPendingSettleStore::new()),

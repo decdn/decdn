@@ -36,5 +36,6 @@ slash_judge_address     = "0x20abcCC80F595a586f4Bd906a1b00c4196416EB7"
 capacity_bond_address = "0x2aF490628579c08DC6D0B013090cDC11D4d60Dd4"
 
 # Buyer channel economics (optional; ADR 003 defaults shown).
-# buyer_deposit_micro_usdc = 10000000   # 10 USDC escrowed when opening a channel
+# buyer_initial_deposit_micro_usdc = 500000     # deposit when OPENING a channel (first-contact lock); default 0.5 USDC
+# buyer_working_deposit_micro_usdc = 10000000    # refill target on reuse or mid-transfer shortfall; 0 disables top-up; default 10 USDC
 # buyer_max_approve = true              # one-time max USDC approval to PaymentChannel

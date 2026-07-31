@@ -196,12 +196,24 @@ pub struct BlockchainConfig {
     /// smaller values bound unsettled exposure. Absent => default
     /// (1 USDC = `1_000_000` `µUSDC`).
     pub redeem_threshold_micro_usdc: Option<u64>,
-    /// Deposit (base units, `µUSDC`) the buyer path escrows when opening a
-    /// `PaymentChannel` against an upstream provider on a cache miss (#744).
-    /// Absent => default (10 USDC = `10_000_000` `µUSDC`, ADR 003 § Deposit
-    /// Economics recommended minimum). Escrowed as configured at open time —
-    /// there is no on-chain floor to clamp up to, only a non-zero requirement.
-    pub buyer_deposit_micro_usdc: Option<u64>,
+    /// Deposit (base units, `µUSDC`) the buyer path escrows when it **opens** a
+    /// new `PaymentChannel` against a provider (the first-contact lock). Kept
+    /// small so an untried node holds little of the buyer's capital on first
+    /// contact. Absent => default (0.5 USDC = `500_000`).
+    /// Escrowed as configured at open time (no on-chain floor; only a
+    /// non-zero requirement).
+    pub buyer_initial_deposit_micro_usdc: Option<u64>,
+    /// Deposit (base units, `µUSDC`) every `topUp` refills the channel toward
+    /// once it is reused or runs short mid-transfer. Both refill
+    /// legs target this: the proactive low-water refill, which both binaries
+    /// run on channel reuse, and the reactive mid-fetch top-up, which is
+    /// **`decdn fetch` only** — the daemon's buffered cache-miss pull has no
+    /// paid-frontier resume and is deferred to #1530. Larger values amortize gas
+    /// across more delivery at the cost of more capital locked for up to the
+    /// 48h dispute window. Absent => default (10 USDC = `10_000_000`). `0`
+    /// disables top-up entirely (a spent-down channel errors instead of
+    /// refilling). Must be `>= buyer_initial_deposit_micro_usdc` when nonzero.
+    pub buyer_working_deposit_micro_usdc: Option<u64>,
     /// Whether to issue an unlimited (max) USDC approval for the
     /// `PaymentChannel` contract so the buyer path can `openChannel` (#744).
     /// The absent-default is **profile-dependent**: the node daemon defaults to
@@ -491,7 +503,7 @@ pub struct CacheConfig {
     /// miss triggers DHT provider discovery → probe → ranked paid pull from an
     /// upstream node, which populates the cache and is then served. OFF by
     /// default for the initial network: enabling it makes the node front USDC
-    /// egress to fill misses (bounded by `blockchain.buyer_deposit_micro_usdc`
+    /// egress to fill misses (bounded by `blockchain.buyer_working_deposit_micro_usdc`
     /// and the upstream's per-MB rate), and the serving path only triggers it
     /// behind a valid, channel-bound client so an unpaid request cannot drive
     /// egress.
