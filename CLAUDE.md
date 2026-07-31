@@ -4,32 +4,19 @@
 
 Decentralized CDN (deCDN) — nodes cache and serve content-addressed blobs over iroh QUIC, clients pay per-MB via off-chain USDC payment channels. Rust implementation; the initial network deployment targets tens of nodes on an Arbitrum Sepolia testnet. "PoC" in code and ADR comments refers to that network-scale milestone, not contract-surface scope — the on-chain surface ships at full production shape with governance-tunable economics from day one (see [ADR 016 § Contract Inventory](adr/016-contract-interactions.md) and [§ Tunable Economics](adr/016-contract-interactions.md#tunable-economics)).
 
-**Status: Early implementation.** Cargo workspace with 12 crates. Two binaries (#421): `node` produces the `decdn-node` daemon with the runtime bring-up, admin RPC server, dispatch limiter, and probe handler; `cli` produces the user-facing `decdn` binary carrying `probe`, `node {peers,…}`, `key-gen`, `config {…}`, `bundle {create}`. `common` holds the shared config schema, identity loading, and AdminRpc trait + DTOs both binaries import. `protocol` has varint framing, `ProbeMessage` (ADR 013), and `NodeAnnounce` gossip types; `cache` has the pull-through engine + HTTP/filesystem origin adapters; `gossip` has the `NodeAnnounce` pub/sub service with peer table. `incentive` has implemented payment-channel, staking, and voucher logic (alloy); `reputation` has ADR-008-conformant local per-peer EWMA scoring (in-memory; local-only by design — reputation is not gossiped or aggregated across nodes, per ADR 008). Neither crate is a stub. ADRs in `adr/` remain the primary design artifacts.
+**Status: Early implementation.** Cargo workspace with 12 crates and two binaries (#421): the `node` crate builds the `decdn-node` daemon (runtime bring-up, admin RPC server, dispatch limiter, probe handler); the `cli` crate builds the user-facing `decdn` binary (`probe`, `node {peers,…}`, `key-gen`, `config {…}`, `bundle {create}`). See the [Crate Structure](#crate-structure) section for what each crate owns. No crate is a stub.
+
+**Pre-launch: wire-breaking changes are fine.** Nothing is deployed and there are no live peers. Do not add backward-compatibility shims, version negotiation, dual-format readers, or migration paths for wire, postcard, ABI, config, or storage changes. Change the format, update every side in the same PR, and delete the old shape. Compatibility work only becomes real after the first public deployment.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for build commands, ADR conventions, pre-commit hooks, and development environment setup.
 
-**ADR note:**
+**ADRs.** ADRs live in `adr/`. They are the primary design artifacts. `adr/architecture.md` is the living overview. See [CONTRIBUTING.md](CONTRIBUTING.md) for ADR conventions.
 
-- **Next ADR number: 040.** File naming: `NNN-topic.md` (zero-padded 3-digit prefix). Always verify by listing `adr/` for the highest number before creating a new ADR.
-- **Do not reuse numbers:** 004, 006, 010, 015, 027, 029, 031, 032, 033, 034, 035 (retired or reclassified — see history below).
-- **Canonical ADRs (recent):** 028, 030, 036, 037, 038, 039.
-- **History:**
-  - 024 (account abstraction) — **scope narrowed (#1431), ADR retained in place.** The contract-level `SignatureChecker` at every verification site is KEPT (already shipped; it is what avoids a coordinated on-chain retrofit), as is the Production session-key plan (Safe-7579 + `erc7579/smartsessions`). Dropped: "Safe as the **recommended** wallet" (the EOA keystore is now the documented default; Safe is *supported*, not recommended, and not tooled) and the § Consequences obligation that `decdn setup` guide Safe creation — a promise the CLI never grew. The node-side off-chain ERC-1271 verifier is relabelled from PoC deliverable to Production-deferred, matching what the Rust always said; its `alloy` sketch is gone. § Safe as Recommended Wallet → § Wallet Support — EOA Default, Safe Supported (the only changed anchor); § Off-Chain ERC-1271 Verification keeps its heading and is now the stable target for the `crates/protocol` citations that used to reference **ADR 024 §18 by line number**. Newly documented: a Safe-addressed operator cannot serve traffic (requesters recover `slash_sig` against the registered address). Touched ADRs 024, 003, 012, 019, architecture, and the operator-key-rotation appendix; no contract, ABI, config, or CLI change. #1186 (implement off-chain ERC-1271) closed as superseded.
-  - 026 (tokenomics) — **Genesis Bond Credit removal:** the on-chain Genesis Bond Credit mechanism (the `CapacityBond` grant/vest/claim/forfeit surface, `GENESIS_GRANTOR_ROLE`, `PendingCredit`, the credit leg of slashing/escrow, and `claimSlashGateEpochs`) is gone. Its 5pp earmark folds back into the operational DAO Treasury (group 2, now a flat 15% — 30% at TGE, then 48-month linear); any retroactive testnet-operator recognition is a discretionary off-chain Treasury TGE-unlock with no contract surface. Slashing and granted-appeal refunds are now bond-only. Touched ADRs 026, 016, 028, 036, 008, architecture, glossary, and observability/key-rotation appendices.
-  - 036 (`036-served-bytes-voting-weight.md`): supersedes voting-weight clauses of ADR 009 §Production and ADR 026 §Governance; promotes `FeeRouter.bytesPerEpoch` from analytics-only to governance-canonical, adds `windowEpochs` governable parameter, adds `slashedAtEpoch` zero-out on `CapacityBond`.
-  - 035 (`035-delegator-pool.md`): retired under the work-token rewrite; archived in `adr/_history/035-delegator-pool.md`.
-  - 034 (`034-gauge-boost-voting-escrow.md`): retired under the work-token rewrite; archived in `adr/_history/034-gauge-boost-voting-escrow.md`.
-  - 033 (`033-safety-insurance-reserve.md`): retired under the **SafetyReserve removal** — the `SafetyReserve` contract, its 5% FeeRouter bucket, and the 30% slash-redirect are gone; slash restitution is now **escrow-on-slash** in ADR 026 §Slashing and burn (the FeeRouter split drops to 60/30/10 and the slash distribution at finality to 50 challenger / 50 burn). Archived in `adr/_history/033-safety-insurance-reserve.md`.
-  - 032 (`032-safety-reserve-appeals-contract.md`): retired under the SafetyReserve removal — the slash-appeal state machine moved to the standalone `SlashAppeal` contract; the canonical surface is now ADR 028 §Contract surface. Archived in `adr/_history/032-safety-reserve-appeals-contract.md`.
-  - 031 (`031-content-blacklist-appeals-contract.md`): retired under the **blacklist-entry appeals removal** — the second appeal state machine layered on `ContentBlacklist` (the six appeal entry points, `StandingPath`, the per-filer rejection cooldown / perjury denylist, the interim-relief caps, `setAppealBond` / `setRejectionCooldownWindow`, and `entry.suspended` end to end) is gone. Enforcement is untouched; a wrongful entry comes off via `removeHashRegional` or a DecdnGovernor `removeHashGlobal` proposal, and `SlashAppeal` (ADR 028) is now the protocol's only appeal surface. `IPublisherRegistryStanding` was deleted with it. A minimal interim-relief primitive is a named follow-up for the vote that registers the first regional body. Touched ADRs 011, 009, 016, 028, 030, architecture, and `docs/runbook.md`; archived in `adr/_history/031-content-blacklist-appeals-contract.md`.
-  - 030 (`030-node-region-self-attestation.md`, #400): `REGION_STABILITY_WINDOW` is retained, but its **appeals-standing leg is gone** with ADR 031 — the window now serves only the reactive blacklist-scope evasion.
-  - 029: reclassified as `appendix-peer-table-eviction.md`.
-  - 028 (`028-slashing-appeals.md`): status unlocked from "Locked-for-implementation" to "Draft" pending CapacityBond rebase.
-  - 027 (Distinct-Client Diversity Gating / Delivery Receipts): collapsed into ADR 026 §3 per-operator gauge-share cap (itself now retired).
-  - 015 (`015-zero-rtt.md`): retired under the protocol simplification audit — QUIC 0-RTT probe establishment is gone (the `network.enable_0rtt` switch, the `decdn_quic_0rtt_*` / `decdn_quic_session_ticket_*` metrics, `SESSION_TICKET_CACHE_SIZE`, the client attempt/fallback path, and the probe handler's `on_accepting` override). Every connection completes a full handshake; TLS session resumption and stream multiplexing are retained. Archived in `adr/_history/015-zero-rtt.md`.
-  - 010 (Multi-Token Payment Support): dropped for a single immutable USDC token set at deployment; rationale archived in `adr/_history/alternatives-pre-launch.md`.
-  - 006: retired; encrypted publishing and key distribution are application concerns, so the appendix and its prose-only `cdn/keys/v1` ALPN are gone (no replacement ALPN reserved) and the application-level P-19/P-20 privacy rows are struck from ADR 017. The encryption-agnostic guarantee survives as one paragraph in ADR 002; the appendix is archived in `adr/_history/appendix-encrypted-content-publishing.md`. 020/021/023/025: demoted to appendices in a pre-launch cleanup (`appendix-observability.md`, `appendix-l2-deployment.md`, `appendix-poc-production-seams.md`, `appendix-local-admin-http.md`).
-  - 004 (tokenomics): superseded by ADR 026, which was rewritten to the work-token model and again to the no-emission variant (App Incentives in place of OperatorEmissions; the interim Genesis Bond Credits mechanism was later removed — see the ADR 026 note above).
+- The next ADR number is 040. Name each file `NNN-topic.md`. Use a 3-digit prefix.
+- List `adr/` and find the highest number before you make a new ADR. Do not trust this note for the current number.
+- Do not use these numbers again: 004, 006, 010, 015, 027, 029, 031, 032, 033, 034, 035. Each one is retired or reclassified.
+- Retired ADRs move to `adr/_history/`. Read the file there if you need the history. Do not add the history to this file.
+- Write ADRs in ASD-STE100 Simplified Technical English: short sentences, active voice, present tense, one idea per sentence. Every ADR follows this. Keep new ADRs and edits the same.
 
 ## Common Commands
 
@@ -40,27 +27,13 @@ cargo nextest run -p decdn-protocol  # single crate
 cargo fmt -- --check                 # check formatting
 cargo deny check                     # license + advisory audit
 pre-commit run --all-files           # run all hooks
-# Contracts — mirror what CI runs (see § Solidity CI gotchas below).
+# Contracts — mirror what CI runs.
 (cd contracts && forge fmt --check && FOUNDRY_PROFILE=ci forge build --sizes --deny warnings && forge test)
 (cd contracts && aderyn -o /tmp/aderyn.md --no-snippets --skip-update-check)  # fail-on: high
 (cd contracts && slither . --config-file slither.config.json)                 # fail-on: medium
 ```
 
-Full Solidity workflow (static analysis, coverage, gas snapshots) lives in [CONTRIBUTING.md § Solidity development](CONTRIBUTING.md#solidity-development).
-
-### Solidity CI gotchas
-
-CI (`.github/workflows/ci.yml`) runs Solidity jobs that fail on subtler warnings than local `forge test`. Reproduce locally by running the exact commands above before pushing.
-
-- **`--deny warnings` is fatal under `FOUNDRY_PROFILE=ci`.** Includes both solc warnings AND forge-lint warnings. The most common solc trap is **W5740 (unreachable code) in OZ `ReentrancyGuard._nonReentrantAfter`** when a `nonReentrant` function body always reverts. Either drop `nonReentrant` on always-reverting stubs, or make the call go through a TRULY-abstract function (no body) so solc can't propagate the revert. Virtual hooks with concrete bodies are NOT enough — solc inlines them at compile time.
-- **Forge-lint warnings** (`unsafe-typecast`, `erc20-unchecked-transfer`) are suppressed globally in `contracts/foundry.toml` `[lint] exclude_lints = [...]` because per-line waivers would be ~60 sites. The `bytes32("literal")` event-key casts and test-only ERC20 transfers are safe by construction.
-- **Slither directive placement matters.** `// slither-disable-next-line <detector>` must be the **immediate predecessor** of the target line — comments in between break the targeting. For `unused-return` on tuple destructuring, slither attributes the finding to the **enclosing function**, so the directive goes above the `function` declaration, not the call site.
-- **Aderyn directives** (`// aderyn-ignore-next-line(<detector>)`) likewise need to be the immediate predecessor. Detector names live in `aderyn registry`.
-- **`forge fmt` vs `solhint` 120-char rule** can disagree by ±1 char on named-args revert calls. Positional args (`revert ParamOutOfBounds(value, floor, ceiling)`) are the safe tie-breaker.
-- **`emit` before `revert`** in always-reverting functions lets solc classify them as state-mutating (avoids the "function state mutability can be restricted to view" warning, which is also fatal under `--deny warnings`).
-- **Pre-commit hooks** (`pre-commit run --all-files`) re-run forge-fmt and solhint. If a hook auto-fixes, the commit aborts and you re-stage; CI's `forge fmt --check` then passes.
-
-The fail thresholds for the static-analysis jobs are set in their respective configs: aderyn uses `fail-on: high` via the GitHub Action input; slither uses `fail_on: medium` in `contracts/slither.config.json`.
+Full Solidity workflow, CI gotchas, static analysis, coverage, and gas snapshots live in [CONTRIBUTING.md § Solidity development](CONTRIBUTING.md#solidity-development). CI fails on warnings that local `forge test` ignores, so reproduce with the `FOUNDRY_PROFILE=ci` commands before pushing.
 
 ## Architecture
 
@@ -111,4 +84,3 @@ The two binaries share `common` for config schema, identity, and admin wire type
 - All byte transfers are paid, including node-to-node cache-miss pulls
 - TOKEN for staking/governance, USDC for payments (dual-currency model)
 - Domain crates (`cache`, `gossip`, etc.) are "leaf" — no mode branching or `#[cfg(feature = "poc")]`. The `node` crate's wiring layer selects backends/implementations. See [adr/appendix-poc-production-seams.md](adr/appendix-poc-production-seams.md) for the full Rust implementation pattern.
-- ADRs in `adr/` document all major decisions; `adr/architecture.md` is the living overview

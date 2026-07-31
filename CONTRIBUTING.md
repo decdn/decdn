@@ -231,6 +231,18 @@ pass (empty) and fail (the drifted entries).
 - **Solhint** failures point at code; fix the code rather than disabling the rule. Rule changes require a separate PR with rationale. Solhint lints `contracts/src/`, `contracts/testnet/`, and `contracts/script/` (per the `lint` script in `contracts/package.json`); test files (Foundry's `test_xxx_yyy` convention) are out of scope by design.
 - **Coverage** posts a sticky PR comment with total line coverage + delta vs `main` (the `solidity-coverage` job uploads an LCOV baseline on push-to-main and downloads it on PRs). The comment script is `.github/scripts/contracts-coverage-comment.sh`; the Rust side uses the analogous `coverage-diff.py`.
 
+**CI gotchas (subtler than local `forge test`):**
+
+CI (`.github/workflows/ci.yml`) runs Solidity jobs that fail on warnings local `forge test` ignores. Reproduce them locally by running the `FOUNDRY_PROFILE=ci` commands above before pushing.
+
+- **`--deny warnings` is fatal under `FOUNDRY_PROFILE=ci`.** It covers both solc warnings AND forge-lint warnings. The most common solc trap is **W5740 (unreachable code) in OZ `ReentrancyGuard._nonReentrantAfter`** when a `nonReentrant` function body always reverts. Either drop `nonReentrant` on always-reverting stubs, or route the call through a TRULY-abstract function (no body) so solc can't propagate the revert. Virtual hooks with concrete bodies are NOT enough — solc inlines them at compile time.
+- **Forge-lint warnings** (`unsafe-typecast`, `erc20-unchecked-transfer`) are suppressed globally in `contracts/foundry.toml` `[lint] exclude_lints = [...]` because per-line waivers would be ~60 sites. The `bytes32("literal")` event-key casts and test-only ERC20 transfers are safe by construction.
+- **Slither directive placement matters.** `// slither-disable-next-line <detector>` must be the **immediate predecessor** of the target line — comments in between break the targeting. For `unused-return` on tuple destructuring, slither attributes the finding to the **enclosing function**, so the directive goes above the `function` declaration, not the call site.
+- **Aderyn directives** (`// aderyn-ignore-next-line(<detector>)`) likewise need to be the immediate predecessor. Detector names live in `aderyn registry`.
+- **`forge fmt` vs `solhint` 120-char rule** can disagree by ±1 char on named-args revert calls. Positional args (`revert ParamOutOfBounds(value, floor, ceiling)`) are the safe tie-breaker.
+- **`emit` before `revert`** in always-reverting functions lets solc classify them as state-mutating (avoids the "function state mutability can be restricted to view" warning, which is also fatal under `--deny warnings`).
+- **Pre-commit hooks** re-run forge-fmt and solhint. If a hook auto-fixes, the commit aborts and you re-stage; CI's `forge fmt --check` then passes.
+
 ### Local deployment (Anvil)
 
 `script/DeployProtocol.s.sol` deploys the full contract suite, hands all governance roles to the `TimelockController`, and writes a `deployments/<chainId>.json` manifest. The script does **not** deploy USDC — it wraps an existing token — so a local deploy first stands up the `MintableUSDC` mock from `test/mocks/`.
@@ -304,6 +316,7 @@ Operator runbook entries go in [docs/runbook.md](docs/runbook.md); cross-referen
 **Conventions:**
 
 - File naming: `NNN-topic.md` (zero-padded 3-digit prefix). Check `adr/` for the current highest number to determine the next sequence.
+- Write ADR prose in [ASD-STE100 Simplified Technical English](https://en.wikipedia.org/wiki/Simplified_Technical_English): short sentences, active voice, present tense, one idea per sentence, simple approved vocabulary. Every ADR already follows this — keep new ADRs and edits consistent with it.
 - When changing any ADR, check for cross-ADR consistency — terms, parameters, and protocol names must match across all ADRs and `architecture.md`. This is the most common source of bugs in this repo.
 - `architecture.md` must be updated whenever an ADR changes a user-visible summary point
 
