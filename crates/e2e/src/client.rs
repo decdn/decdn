@@ -801,14 +801,21 @@ fn is_retryable(err: &anyhow::Error) -> bool {
         );
     }
     if let Some(refused) = err.downcast_ref::<UpstreamRefused>() {
-        // `NotFound` is the pre-observation window this loop exists for (and, more
-        // broadly, a node that may hold the blob on a later attempt).
-        // `EvictedSinceProbe` / `Overloaded` are likewise transient. A node that
-        // reports itself degraded, or the blob as over its ceiling, will say the
-        // same thing on every attempt.
-        return !matches!(
+        // Allowlist the genuinely transient refusals: `NotFound` is the
+        // pre-observation window this loop exists for (and, more broadly, a node
+        // that may hold the blob on a later attempt); `EvictedSinceProbe` /
+        // `Overloaded` are likewise transient. Everything else is terminal and
+        // says the same thing on every attempt — a node that reports itself
+        // degraded (`InternalError`), the blob as over its ceiling
+        // (`BlobTooLarge`), or a governance/legal takedown of the content
+        // (`HashBlacklisted` / `OriginBlacklisted`). Retrying those only spins the
+        // loop to its deadline, so fail fast and surface the real cause.
+        //
+        // This is an allowlist rather than a denylist of terminal codes so a new
+        // terminal `StreamError` variant defaults to fail-fast, not retry-to-45s.
+        return matches!(
             refused.error(),
-            StreamError::InternalError | StreamError::BlobTooLarge
+            StreamError::NotFound | StreamError::EvictedSinceProbe | StreamError::Overloaded
         );
     }
     true
