@@ -758,46 +758,6 @@ pub fn parse_hash_arg(hex: &str) -> Result<Hash, ErrorObjectOwned> {
 mod tests {
     use super::*;
 
-    /// Wire back-compat for `DrainResponse.wait_admin_honored`
-    /// (issue #604 review): a pre-#604 server's response omits the
-    /// field. `#[serde(default)]` must deserialize the omitted field
-    /// to `false` so the new CLI's safety guard fires ("server
-    /// doesn't honor --wait") rather than the CLI proceeding to poll
-    /// against a server that will close admin early.
-    ///
-    /// Accidental removal of the `#[serde(default)]` attribute would
-    /// otherwise turn an old-server response into a deserialize error,
-    /// surfacing as a confusing "transport" failure instead of the
-    /// actionable "upgrade the node" message.
-    #[test]
-    fn drain_response_legacy_shape_defaults_wait_admin_honored_false() {
-        let legacy = r#"{"initiated":true}"#;
-        let resp: DrainResponse =
-            serde_json::from_str(legacy).expect("legacy DrainResponse must deserialize");
-        assert!(resp.initiated);
-        assert!(
-            !resp.wait_admin_honored,
-            "missing wait_admin_honored must default to false"
-        );
-    }
-
-    /// Same guarantee for `HealthResponse.in_flight_streams`: an
-    /// older server lacking the field must round-trip as `0` so
-    /// pre-#604 `decdn node health` clients (and the new --wait
-    /// polling loop, against any old server) don't break.
-    #[test]
-    fn health_response_legacy_shape_defaults_in_flight_streams_zero() {
-        let legacy = r#"{"node_id":"abc","uptime_s":42}"#;
-        let resp: HealthResponse =
-            serde_json::from_str(legacy).expect("legacy HealthResponse must deserialize");
-        assert_eq!(resp.node_id, "abc");
-        assert_eq!(resp.uptime_s, 42);
-        assert_eq!(
-            resp.in_flight_streams, 0,
-            "missing in_flight_streams must default to 0"
-        );
-    }
-
     /// `DrainRequest` round-trips through `{}` (empty object) by
     /// deserializing each field to its serde default. The whole-
     /// parameter-missing case (no `params` field at all) is handled
@@ -811,31 +771,6 @@ mod tests {
         assert!(
             !req.wait_admin,
             "missing wait_admin must default to false (SIGTERM-equivalent)"
-        );
-    }
-
-    /// Wire back-compat for `RoutingHealth.last_refresh_us` (issue #741):
-    /// a server that has never completed a bucket-refresh pass omits the
-    /// field (or sends `null`). `#[serde(default)]` must deserialize the
-    /// omitted field to `None` so a `decdn node status` client renders
-    /// "not yet refreshed" rather than failing the whole roundtrip.
-    #[test]
-    fn routing_health_legacy_shape_defaults_last_refresh_none() {
-        let legacy = r#"{
-            "total_peers": 3,
-            "non_empty_buckets": 2,
-            "buckets": [{"index":0,"fill":1}],
-            "bucket_capacity": 20,
-            "refresh_interval_s": 3600
-        }"#;
-        let resp: RoutingHealth =
-            serde_json::from_str(legacy).expect("legacy RoutingHealth must deserialize");
-        assert_eq!(resp.total_peers, 3);
-        assert_eq!(resp.bucket_capacity, 20);
-        assert_eq!(resp.refresh_interval_s, 3600);
-        assert!(
-            resp.last_refresh_us.is_none(),
-            "missing last_refresh_us must default to None"
         );
     }
 
@@ -961,55 +896,12 @@ mod tests {
     }
 
     #[test]
-    fn region_stats_response_legacy_shape_defaults_zero() {
-        // An older/partial server that omits the byte fields must still
-        // deserialize, with the missing counters defaulting to zero.
-        let json = r#"{"regions":[{"region":"FR"}]}"#;
-        let back: RegionStatsResponse =
-            serde_json::from_str(json).expect("deserialize partial RegionStatsResponse");
-        let only = back.regions.first().expect("one region");
-        assert_eq!(only.region, "FR");
-        assert_eq!(only.bytes_in, 0);
-        assert_eq!(only.bytes_out, 0);
-    }
-
-    #[test]
     fn region_stats_response_omitted_regions_defaults_empty() {
-        // An older/partial server that omits `regions` entirely must still
-        // deserialize, with the list defaulting to empty — same posture as a
-        // node with no accountant wired returning an empty snapshot.
+        // A node with no accountant wired returns an empty snapshot, which
+        // serializes with `regions` omitted; it must deserialize back to an
+        // empty list.
         let back: RegionStatsResponse =
             serde_json::from_str("{}").expect("deserialize RegionStatsResponse without regions");
         assert!(back.regions.is_empty());
-    }
-
-    /// Wire back-compat for `ChannelSnapshot.seconds_since_last_voucher`
-    /// (issue #749): an older server (or a channel with no in-process
-    /// voucher activity) omits the field. `#[serde(default)]` must
-    /// deserialize the omitted field to `None` so a `decdn node channels`
-    /// client renders "never" rather than failing the whole roundtrip.
-    #[test]
-    fn channel_snapshot_legacy_shape_defaults_seconds_none() {
-        let legacy = r#"{
-            "channel_id": "0xabcd",
-            "counterparty": "0x00aa",
-            "last_nonce": 3,
-            "outstanding_micro_usdc": 100,
-            "deposit_micro_usdc": 200,
-            "settlement_eligible": false
-        }"#;
-        let snap: ChannelSnapshot =
-            serde_json::from_str(legacy).expect("legacy ChannelSnapshot must deserialize");
-        assert_eq!(snap.last_nonce, 3);
-        assert_eq!(snap.outstanding_micro_usdc, 100);
-        assert!(
-            snap.seconds_since_last_voucher.is_none(),
-            "missing seconds_since_last_voucher must default to None"
-        );
-        assert!(
-            snap.voucher_signer.is_empty(),
-            "a pre-delegation server omits voucher_signer; it must default to empty \
-             rather than silently reading as the funder"
-        );
     }
 }

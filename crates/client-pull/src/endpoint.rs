@@ -1,9 +1,8 @@
 //! Shared relay resolution for the one-shot client commands (`fetch`, `probe`).
 //!
 //! Relays are environment configuration, not a per-invocation decision (#935):
-//! they come from the config file (`network.relay_urls`, with the deprecated
-//! singular `network.relay_url` folded in), exactly the field the node already
-//! consumes. `--relay-url` stays as an optional override that replaces the
+//! they come from the config file (`network.relay_urls`), exactly the field the
+//! node already consumes. `--relay-url` stays as an optional override that replaces the
 //! config list. An absent config file yields no relays, so a client that dials
 //! a direct `--addr` needs no config at all.
 
@@ -19,8 +18,8 @@ use iroh::endpoint::presets;
 use iroh::{Endpoint, EndpointAddr, PublicKey, RelayMap, RelayMode, RelayUrl};
 
 /// Resolve the relay URLs for a client command. The `--relay-url` override
-/// (`flag`) wins; otherwise `network.relay_urls` from the config (with the
-/// deprecated singular `relay_url` folded in) is used. An absent config file
+/// (`flag`) wins; otherwise `network.relay_urls` from the config is used. An
+/// absent config file
 /// — including an explicit `--config` path that does not exist — resolves to
 /// an empty list rather than an error, so a client dialing a direct `--addr`
 /// needs no config at all.
@@ -36,10 +35,7 @@ pub fn resolve_relays(
         // when it exists; a present-but-malformed file still surfaces its parse
         // error.
         let net = load_file_config(config_path)?.network.unwrap_or_default();
-        match net.relay_urls {
-            Some(urls) if !urls.is_empty() => urls,
-            _ => net.relay_url.into_iter().collect(),
-        }
+        net.relay_urls.unwrap_or_default()
     } else {
         Vec::new()
     };
@@ -207,14 +203,6 @@ mod tests {
         );
         let relays = resolve_relays(None, Some(cfg.path())).unwrap();
         assert_eq!(relays.len(), 2);
-    }
-
-    #[test]
-    fn deprecated_singular_relay_url_is_folded_in() {
-        let cfg = write_config("[network]\nrelay_url = \"https://old.example.com\"\n");
-        let relays = resolve_relays(None, Some(cfg.path())).unwrap();
-        assert_eq!(relays.len(), 1);
-        assert!(relays[0].to_string().contains("old.example.com"));
     }
 
     #[test]

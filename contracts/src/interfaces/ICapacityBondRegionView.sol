@@ -19,9 +19,10 @@ interface ICapacityBondRegionView {
     /// @return regionHint            Current attested region (≤16 bytes; "" if none).
     /// @return regionPrev            Region in effect before the most recent
     ///                               `updateRegion` ("" if never changed).
-    /// @return regionLastChanged     Last `updateRegion` timestamp; 0 = never changed.
-    /// @return firstBondedAt         First-bond timestamp (write-once).
-    /// @return regionGateActivatedAt Contract-global gate-activation timestamp.
+    /// @return regionLastChanged     Timestamp the current region took effect —
+    ///                               set at `registerNode`, restamped on each
+    ///                               `updateRegion`. The ripening window runs from
+    ///                               this stamp (callers use it as `effective`).
     /// @return regionStabilityWindow Current ripening window in seconds (= REGION_STABILITY_WINDOW).
     function regionScopeData(address operator)
         external
@@ -30,8 +31,6 @@ interface ICapacityBondRegionView {
             string memory regionHint,
             string memory regionPrev,
             uint64 regionLastChanged,
-            uint64 firstBondedAt,
-            uint64 regionGateActivatedAt,
             uint256 regionStabilityWindow
         );
 }

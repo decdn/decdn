@@ -290,34 +290,24 @@ contract CapacityBond is
     /// @notice Previous-region snapshot taken on each `updateRegion` call.
     ///         Consulted by the ADR 030 § Region-stability window blacklist-scope
     ///         ripening predicate (*"a node is in scope iff the entry is global,
-    ///         OR entry.region == regionHint, OR (block.timestamp - effective <
-    ///         REGION_STABILITY_WINDOW AND entry.region == regionPrev)"*) at
-    ///         scope-test / slash-eligibility time. The predicate is enforced by
-    ///         `SlashJudge._checkBlacklistedBefore` and read by
-    ///         `ContentBlacklist.isHashBlacklistedForOperator`; both read this
-    ///         slot (with `regionLastChanged` / `firstBondedAt` /
-    ///         `regionGateActivatedAt`) via `RegionScopeLib` off the aggregate
-    ///         `regionScopeData` getter.
+    ///         OR entry.region == regionHint, OR (block.timestamp -
+    ///         regionLastChanged < REGION_STABILITY_WINDOW AND entry.region ==
+    ///         regionPrev)"*) at scope-test / slash-eligibility time. The
+    ///         predicate is enforced by `SlashJudge._checkBlacklistedBefore` and
+    ///         read by `ContentBlacklist.isHashBlacklistedForOperator`; both read
+    ///         this slot (with `regionLastChanged`) via `RegionScopeLib` off the
+    ///         aggregate `regionScopeData` getter.
     mapping(address operator => string) public regionPrev;
 
-    /// @notice Last `updateRegion` timestamp; 0 means region has never been
-    ///         changed (initial value from `registerNode` is final until the
-    ///         first explicit update).
+    /// @notice Timestamp the operator's current region took effect: set to
+    ///         `block.timestamp` at `registerNode` and restamped on each
+    ///         `updateRegion`. Never 0 for an active node. The ripening window
+    ///         (and the `updateRegion` cooldown) both run from this stamp.
     mapping(address operator => uint64) public regionLastChanged;
 
     /// @notice Cooldown enforced between `updateRegion` calls per ADR 030
     ///         (default 7 days; governable [3d, 30d]).
     uint256 public regionStabilityWindow;
-
-    /// @notice ADR 030 § Region-stability window gate-activation stamp — the
-    ///         floor the ripening window runs from for nodes that have never
-    ///         changed region (`effective = max(firstBondedAt, this)`). ADR 030
-    ///         specifies an "upgrade initializer" for this value, but
-    ///         `CapacityBond` is constructor-deployed and non-upgradeable, so a
-    ///         fresh deploy *is* gate activation (no pre-upgrade cohort) — it is
-    ///         set to `block.timestamp` in the constructor.
-    // forge-lint: disable-next-line(screaming-snake-case-immutable)
-    uint64 public immutable regionGateActivatedAt;
 
     // -----------------------------------------------------------------
     // Storage — slash records (ADR 028 § Contract surface)
@@ -575,10 +565,6 @@ contract CapacityBond is
         regionStabilityWindow = regionStabilityWindow_;
         if (currentTermsHash_ == bytes32(0)) revert ZeroTermsHash();
         currentTermsHash = currentTermsHash_;
-        // ADR 030 § Region-stability window: fresh deploy == gate activation
-        // (non-upgradeable, so no migration cohort to stay conservative for).
-        // forge-lint: disable-next-line(block-timestamp)
-        regionGateActivatedAt = uint64(block.timestamp);
 
         // Declared-capacity band defaults (ADR 026 § Capacity-bond curve):
         // 10 Mbps floor (bars sub-floor dust declarations), 200 Gbps ceiling.
@@ -758,12 +744,12 @@ contract CapacityBond is
         NodeInfo storage info = _nodes[msg.sender];
         if (!info.active) revert NodeNotActive();
 
-        uint64 lastChanged = regionLastChanged[msg.sender];
-        if (lastChanged != 0) {
-            uint64 readyAt = lastChanged + uint64(regionStabilityWindow);
-            // forge-lint: disable-next-line(block-timestamp)
-            if (block.timestamp < readyAt) revert RegionCooldownActive(readyAt);
-        }
+        // `regionLastChanged` is stamped at registration and on every change, so
+        // the stability-window cooldown applies uniformly from the moment the
+        // current region took effect — including an operator's first change.
+        uint64 readyAt = regionLastChanged[msg.sender] + uint64(regionStabilityWindow);
+        // forge-lint: disable-next-line(block-timestamp)
+        if (block.timestamp < readyAt) revert RegionCooldownActive(readyAt);
 
         string memory oldRegion = info.regionHint;
         regionPrev[msg.sender] = oldRegion;
@@ -886,6 +872,12 @@ contract CapacityBond is
         info.lastMultiaddrUpdate = uint64(block.timestamp);
         info.multiaddrs = multiaddrs;
         info.regionHint = regionHint;
+        // ADR 030 § Region-stability window: stamp when the current region took
+        // effect so it is never 0 for an active node. The ripening window and
+        // the `updateRegion` cooldown both run from this stamp; a re-registration
+        // (re-onboarding) restarts the window, which is correct.
+        // forge-lint: disable-next-line(block-timestamp)
+        regionLastChanged[msg.sender] = uint64(block.timestamp);
     }
 
     /// @notice Leave the active set. Deactivates the node without touching the
@@ -1480,19 +1472,10 @@ contract CapacityBond is
             string memory regionHint,
             string memory regionPrev_,
             uint64 regionLastChanged_,
-            uint64 firstBondedAt_,
-            uint64 regionGateActivatedAt_,
             uint256 regionStabilityWindow_
         )
     {
-        return (
-            _nodes[operator].regionHint,
-            regionPrev[operator],
-            regionLastChanged[operator],
-            _firstBondedAt[operator],
-            regionGateActivatedAt,
-            regionStabilityWindow
-        );
+        return (_nodes[operator].regionHint, regionPrev[operator], regionLastChanged[operator], regionStabilityWindow);
     }
 
     function isActiveNode(bytes32 nodeId) external view returns (bool) {

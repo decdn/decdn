@@ -44,8 +44,6 @@ contract MockEjector is ICapacityBondEjector, ICapacityBondRegionView {
     mapping(address => string) internal _regionHint;
     mapping(address => string) internal _regionPrev;
     mapping(address => uint64) internal _regionLastChanged;
-    mapping(address => uint64) internal _firstBondedAt;
-    uint64 public gateActivatedAt;
     uint256 public window = 7 days;
 
     function ejectNode(address operator) external override {
@@ -70,12 +68,7 @@ contract MockEjector is ICapacityBondEjector, ICapacityBondRegionView {
         _regionLastChanged[op] = lastChanged;
     }
 
-    function setFirstBondedAt(address op, uint64 ts) external {
-        _firstBondedAt[op] = ts;
-    }
-
-    function setGate(uint64 ts, uint256 window_) external {
-        gateActivatedAt = ts;
+    function setWindow(uint256 window_) external {
         window = window_;
     }
 
@@ -83,16 +76,9 @@ contract MockEjector is ICapacityBondEjector, ICapacityBondRegionView {
         external
         view
         override
-        returns (string memory, string memory, uint64, uint64, uint64, uint256)
+        returns (string memory, string memory, uint64, uint256)
     {
-        return (
-            _regionHint[operator],
-            _regionPrev[operator],
-            _regionLastChanged[operator],
-            _firstBondedAt[operator],
-            gateActivatedAt,
-            window
-        );
+        return (_regionHint[operator], _regionPrev[operator], _regionLastChanged[operator], window);
     }
 }
 
@@ -316,28 +302,6 @@ contract ContentBlacklistTest is Test {
         assertTrue(blacklist.isHashBlacklistedForOperator(SAMPLE_HASH, operator));
         // Flip 8 days ago: ripened, prev no longer in scope.
         bondMock.setRegion(operator, "EU", "US", uint64(block.timestamp - 8 days));
-        assertFalse(blacklist.isHashBlacklistedForOperator(SAMPLE_HASH, operator));
-    }
-
-    function test_isHashBlacklistedForOperator_neverChangedFallback_ripensFromMaxBondGate() public {
-        vm.warp(30 days); // headroom for the `- N days` stamps below
-        vm.prank(regionalBody);
-        blacklist.addHashRegional(REGION_US, SAMPLE_HASH, "DMCA-TEST");
-        // `regionLastChanged == 0` (never changed on-chain) routes the window
-        // through the `max(firstBondedAt, gate)` fallback — the path the
-        // lastChanged tests above never reach via the real `regionScopeData` read.
-        // The gate (1d ago) is the more-recent stamp; a stale `firstBondedAt` (10d
-        // ago) would have closed the 7d window. Prev (US) entry still applies →
-        // true, proving the fallback selected the gate (the `max`).
-        bondMock.setRegion(operator, "EU", "US", 0);
-        bondMock.setFirstBondedAt(operator, uint64(block.timestamp - 10 days));
-        bondMock.setGate(uint64(block.timestamp - 1 days), 7 days);
-        assertTrue(blacklist.isHashBlacklistedForOperator(SAMPLE_HASH, operator));
-        // Now `firstBondedAt` (8d ago) is the `max` and the gate is older still
-        // (9d); 8d ≥ the 7d window → prev US ripened out, current EU has no entry
-        // → false. Proves the window closes the fallback and selects `firstBondedAt`.
-        bondMock.setFirstBondedAt(operator, uint64(block.timestamp - 8 days));
-        bondMock.setGate(uint64(block.timestamp - 9 days), 7 days);
         assertFalse(blacklist.isHashBlacklistedForOperator(SAMPLE_HASH, operator));
     }
 

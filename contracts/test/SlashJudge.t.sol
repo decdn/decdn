@@ -37,8 +37,6 @@ contract MockSlasher is ICapacityBondSlasher, ICapacityBondRegionView {
     mapping(address => string) internal _regionHint;
     mapping(address => string) internal _regionPrev;
     mapping(address => uint64) internal _regionLastChanged;
-    mapping(address => uint64) internal _firstBondedAt;
-    uint64 public gateActivatedAt;
     uint256 public window = 7 days;
 
     constructor(uint256 unbonding_) {
@@ -55,12 +53,7 @@ contract MockSlasher is ICapacityBondSlasher, ICapacityBondRegionView {
         _regionLastChanged[op] = lastChanged;
     }
 
-    function setFirstBondedAt(address op, uint64 ts) external {
-        _firstBondedAt[op] = ts;
-    }
-
-    function setGate(uint64 ts, uint256 window_) external {
-        gateActivatedAt = ts;
+    function setWindow(uint256 window_) external {
         window = window_;
     }
 
@@ -68,16 +61,9 @@ contract MockSlasher is ICapacityBondSlasher, ICapacityBondRegionView {
         external
         view
         override
-        returns (string memory, string memory, uint64, uint64, uint64, uint256)
+        returns (string memory, string memory, uint64, uint256)
     {
-        return (
-            _regionHint[operator],
-            _regionPrev[operator],
-            _regionLastChanged[operator],
-            _firstBondedAt[operator],
-            gateActivatedAt,
-            window
-        );
+        return (_regionHint[operator], _regionPrev[operator], _regionLastChanged[operator], window);
     }
 
     function setReturnAmount(uint256 amount) external {
@@ -615,42 +601,6 @@ contract SlashJudgeTest is Test {
         judge.submitBlacklistChallenge(node, NODE_ID, BLOB, abi.encode(s), _signStream(s), true, SALT);
     }
 
-    function test_blacklist_neverChangedFallback_ripensFromMaxBondGate() public {
-        // `regionLastChanged == 0` (never-changed path) routes `effectiveSince`
-        // through the `max(firstBondedAt, regionGateActivatedAt)` fallback, which
-        // the other integration tests never exercise through the real
-        // `regionScopeData` read. Here the more-recent stamp is the gate (1d ago);
-        // the stale `firstBondedAt` (10d ago) would have closed the 7d window. The
-        // prev-region (us-east) entry therefore still applies → slash, proving the
-        // fallback selected the gate (the `max`), not `firstBondedAt`.
-        slasher.setRegion(node, "eu-west", "us-east", 0);
-        slasher.setFirstBondedAt(node, uint64(block.timestamp - 10 days));
-        slasher.setGate(uint64(block.timestamp - 1 days), 7 days);
-        blacklist.setEntry(bytes32("us-east"), BLOB, uint64(block.timestamp - 1000));
-        SlashJudge.StreamMsg memory s = _stream(true, 10, streamTs);
-        _commitAndMature(_blacklistHash(_streamStructHash(s), true));
-        vm.prank(challenger);
-        judge.submitBlacklistChallenge(node, NODE_ID, BLOB, abi.encode(s), _signStream(s), true, SALT);
-        assertEq(slasher.slashCount(), 1);
-    }
-
-    function test_blacklist_neverChangedFallback_revertsAfterMaxBondGateWindow() public {
-        // Same never-changed fallback, but now the `max` operand is `firstBondedAt`
-        // (8d ago) and the gate is older still (9d ago). 8d ≥ the 7d window, so the
-        // prev-region (us-east) entry has ripened out of scope and the current
-        // region (eu-west) has no entry → revert. Proves the window closes the
-        // fallback from `max(firstBondedAt, gate)` and that `firstBondedAt` is the
-        // selected operand.
-        slasher.setRegion(node, "eu-west", "us-east", 0);
-        slasher.setFirstBondedAt(node, uint64(block.timestamp - 8 days));
-        slasher.setGate(uint64(block.timestamp - 9 days), 7 days);
-        blacklist.setEntry(bytes32("us-east"), BLOB, uint64(block.timestamp - 1000));
-        SlashJudge.StreamMsg memory s = _stream(true, 10, streamTs);
-        vm.prank(challenger);
-        vm.expectRevert(abi.encodeWithSelector(SlashJudge.HashNotBlacklisted.selector, BLOB));
-        judge.submitBlacklistChallenge(node, NODE_ID, BLOB, abi.encode(s), _signStream(s), true, SALT);
-    }
-
     // -----------------------------------------------------------------
     // Serve-time (responseTs) ripening-window anchor (ADR 030 item 2, #801)
     // -----------------------------------------------------------------
@@ -663,7 +613,7 @@ contract SlashJudgeTest is Test {
         // `responseTs` (which predates the flip) keeps us-east in scope -> still
         // slashable. Reachable only when `window < maxEvidenceAge`: governance can set
         // the window to its 3d floor while evidence age is 5d, so the gap is real.
-        slasher.setGate(0, 3 days); // window = 3d (< 5d evidence age); gate unused (changed region)
+        slasher.setWindow(3 days); // window = 3d (< 5d evidence age)
         uint64 nowSec = uint64(block.timestamp);
         uint64 responseTsSec = nowSec - 4 days; // served 4d ago, within the 5d evidence age
         uint64 effective = nowSec - (3 days + 1); // flipped just over `window` ago, AFTER the serve

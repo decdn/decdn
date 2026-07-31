@@ -438,8 +438,6 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # Multiple relays give redundancy/failover; reachability is probed at bring-up
 # and logged but never fatal (the node proceeds and iroh retries in the background).
 # relay_urls = ["https://relay-a.example.", "https://relay-b.example."]
-# Deprecated single-relay alias (folded into relay_urls when set):
-# relay_url = "https://relay.iroh.network."
 # Operator-configurable address discovery (#818). Absent => n0-hosted pkarr/DNS.
 # Present => the node drops the n0 discovery leg and uses only what is set here.
 # [network.discovery]

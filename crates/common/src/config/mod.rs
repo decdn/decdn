@@ -779,21 +779,14 @@ fn resolve_network_into(
         .unwrap_or(DEFAULT_BIND_PORT);
 
     // Relay precedence (highest first): CLI `--relay-url` (singular) >
-    // file `network.relay_urls` (list) > file `network.relay_url` (the
-    // deprecated singular alias). An empty result means "use the n0 default
-    // relays" — the node only swaps in a custom relay map when this is
+    // file `network.relay_urls` (list). An empty result means "use the n0
+    // default relays" — the node only swaps in a custom relay map when this is
     // non-empty. The CLI/env surface stays singular; the multi-relay surface
     // is the TOML `relay_urls` array (issue #795).
     let relay_urls = if let Some(url) = cli.relay_url.clone() {
         vec![url]
     } else {
-        match file.and_then(|n| n.relay_urls.clone()) {
-            Some(list) if !list.is_empty() => list,
-            _ => file
-                .and_then(|n| n.relay_url.clone())
-                .map(|url| vec![url])
-                .unwrap_or_default(),
-        }
+        file.and_then(|n| n.relay_urls.clone()).unwrap_or_default()
     };
 
     // #843: `--relay-url` (and `DECDN_RELAY_URL`, which clap folds into it)
@@ -814,9 +807,10 @@ fn resolve_network_into(
     // Validate each resolved entry. The label names the source the operator
     // actually wrote: the indexed array field (`network.relay_urls[i]`, matching
     // the `cache.origins[i]` convention) only when the list branch above was
-    // taken, otherwise the singular `network.relay_url` (the deprecated alias or
-    // `--relay-url`, which always resolve to a one-element vec) — reporting
-    // `relay_urls[0]` there would point at an array the operator never defined.
+    // taken, otherwise the singular `network.relay_url` (the `--relay-url` /
+    // `DECDN_RELAY_URL` override, which always resolves to a one-element vec) —
+    // reporting `relay_urls[0]` there would point at an array the operator never
+    // defined.
     // The offending entry is echoed with userinfo redacted (a malformed entry
     // can still carry `user:pass@`), mirroring bring-up's `parse_relay_urls`.
     let from_array = cli.relay_url.is_none()
@@ -3070,7 +3064,6 @@ fn expand_env(cfg: &mut FileConfig) -> anyhow::Result<()> {
         expand_str(&mut i.region, "identity.region")?;
     }
     if let Some(n) = cfg.network.as_mut() {
-        expand_str(&mut n.relay_url, "network.relay_url")?;
         if let Some(urls) = n.relay_urls.as_mut() {
             for (idx, url) in urls.iter_mut().enumerate() {
                 *url = expand_value(url, &format!("network.relay_urls[{idx}]"))?;
@@ -3807,8 +3800,8 @@ mod tests {
     #[test]
     fn expand_env_substitutes_each_relay_url() -> anyhow::Result<()> {
         // Regression for the per-element loop in `expand_env`: every entry of
-        // network.relay_urls must get the same `${VAR}` treatment as the
-        // singular relay_url alias, not just the first.
+        // network.relay_urls must get the same `${VAR}` treatment, not just the
+        // first.
         let home = home_str()?;
         let mut cfg = FileConfig {
             network: Some(types::NetworkConfig {
@@ -3817,7 +3810,6 @@ mod tests {
                     "${HOME}/relay-a".to_string(),
                     "${HOME}/relay-b".to_string(),
                 ]),
-                relay_url: None,
                 discovery: None,
             }),
             ..Default::default()
@@ -3854,7 +3846,6 @@ mod tests {
             network: Some(types::NetworkConfig {
                 bind_port: None,
                 relay_urls: None,
-                relay_url: None,
                 discovery: Some(types::DiscoveryConfig {
                     pkarr_url: Some("${HOME}/pkarr".to_string()),
                     dns_origin: Some("${HOME}/dns".to_string()),
@@ -3913,7 +3904,6 @@ mod tests {
             network: Some(types::NetworkConfig {
                 bind_port: None,
                 relay_urls: None,
-                relay_url: None,
                 discovery: Some(types::DiscoveryConfig {
                     pkarr_url: None,
                     dns_origin: None,
@@ -4141,19 +4131,10 @@ mod tests {
                     region: Some(v.to_string()),
                 });
             }),
-            ("network.relay_url", |c, v| {
-                c.network = Some(types::NetworkConfig {
-                    bind_port: None,
-                    relay_urls: None,
-                    relay_url: Some(v.to_string()),
-                    discovery: None,
-                });
-            }),
             ("network.relay_urls", |c, v| {
                 c.network = Some(types::NetworkConfig {
                     bind_port: None,
                     relay_urls: Some(vec![v.to_string()]),
-                    relay_url: None,
                     discovery: None,
                 });
             }),
@@ -4275,7 +4256,7 @@ mod tests {
 
     // Guards against the classic "added a field, forgot to wire expansion"
     // regression — the HTTP-origin URL is URL-shaped and must get the
-    // same `${VAR}` treatment as sibling URL fields (rpc_url, relay_url,
+    // same `${VAR}` treatment as sibling URL fields (rpc_url, relay_urls,
     // etc).
     #[test]
     fn expand_env_substitutes_cache_origin_url() -> anyhow::Result<()> {
@@ -7775,7 +7756,6 @@ swap_pool_address = \"0xPool\"
         let file = types::NetworkConfig {
             bind_port: Some(6666),
             relay_urls: None,
-            relay_url: None,
             discovery: None,
         };
         let resolved = resolve_network(&cli, Some(&file));
@@ -7787,9 +7767,7 @@ swap_pool_address = \"0xPool\"
         let cli = empty_network_args();
         let file = types::NetworkConfig {
             bind_port: Some(6666),
-            relay_urls: None,
-            // Deprecated singular alias folds into the resolved list.
-            relay_url: Some("https://relay.example".to_string()),
+            relay_urls: Some(vec!["https://relay.example".to_string()]),
             discovery: None,
         };
         let resolved = resolve_network(&cli, Some(&file));
@@ -7809,7 +7787,6 @@ swap_pool_address = \"0xPool\"
                 "https://relay-a.example".to_string(),
                 "https://relay-b.example".to_string(),
             ]),
-            relay_url: None,
             discovery: None,
         };
         let resolved = resolve_network(&cli, Some(&file));
@@ -7819,23 +7796,6 @@ swap_pool_address = \"0xPool\"
                 "https://relay-a.example".to_string(),
                 "https://relay-b.example".to_string()
             ]
-        );
-    }
-
-    #[test]
-    fn resolve_network_relay_urls_wins_over_singular_alias() {
-        // When both the list and the deprecated alias are set, the list wins.
-        let cli = empty_network_args();
-        let file = types::NetworkConfig {
-            bind_port: None,
-            relay_urls: Some(vec!["https://list.example".to_string()]),
-            relay_url: Some("https://alias.example".to_string()),
-            discovery: None,
-        };
-        let resolved = resolve_network(&cli, Some(&file));
-        assert_eq!(
-            resolved.relay_urls,
-            vec!["https://list.example".to_string()]
         );
     }
 
@@ -7851,28 +7811,10 @@ swap_pool_address = \"0xPool\"
         let file = types::NetworkConfig {
             bind_port: None,
             relay_urls: Some(vec!["https://list.example".to_string()]),
-            relay_url: Some("https://alias.example".to_string()),
             discovery: None,
         };
         let resolved = resolve_network(&cli, Some(&file));
         assert_eq!(resolved.relay_urls, vec!["https://cli.example".to_string()]);
-    }
-
-    #[test]
-    fn resolve_network_empty_relay_urls_falls_back_to_alias() {
-        // An empty list is treated as "unset" so the alias still applies.
-        let cli = empty_network_args();
-        let file = types::NetworkConfig {
-            bind_port: None,
-            relay_urls: Some(Vec::new()),
-            relay_url: Some("https://alias.example".to_string()),
-            discovery: None,
-        };
-        let resolved = resolve_network(&cli, Some(&file));
-        assert_eq!(
-            resolved.relay_urls,
-            vec!["https://alias.example".to_string()]
-        );
     }
 
     /// `[network]` carries no 0-RTT knob, and the section denies unknown
@@ -7918,7 +7860,6 @@ swap_pool_address = \"0xPool\"
                 "https://relay-a.example".to_string(),
                 "relay://no-port-host".to_string(),
             ]),
-            relay_url: None,
             discovery: None,
         };
         let mut bag = ConfigErrorBag::new();
@@ -7936,7 +7877,6 @@ swap_pool_address = \"0xPool\"
         let file = types::NetworkConfig {
             bind_port: None,
             relay_urls: Some(vec!["not a url".to_string()]),
-            relay_url: None,
             discovery: None,
         };
         let mut bag = ConfigErrorBag::new();
@@ -7960,7 +7900,6 @@ swap_pool_address = \"0xPool\"
                 "https://good.example".to_string(),
                 "also bad".to_string(),
             ]),
-            relay_url: None,
             discovery: None,
         };
         let mut bag = ConfigErrorBag::new();
@@ -7982,7 +7921,6 @@ swap_pool_address = \"0xPool\"
         let file = types::NetworkConfig {
             bind_port: None,
             relay_urls: Some(vec!["https://user:s3cret@host:notaport".to_string()]),
-            relay_url: None,
             discovery: None,
         };
         let mut bag = ConfigErrorBag::new();
@@ -7994,33 +7932,6 @@ swap_pool_address = \"0xPool\"
         assert!(
             msg.contains("***@host"),
             "redacted host should appear: {msg}"
-        );
-    }
-
-    #[test]
-    fn resolve_network_validates_deprecated_relay_url_alias() {
-        // The deprecated singular `relay_url` alias folds into the resolved
-        // list and must be validated — pins that every precedence branch feeds
-        // the parse gate, not just the list path. Its error is labelled under
-        // the singular `network.relay_url`, not the indexed array field the
-        // operator never wrote.
-        let cli = empty_network_args();
-        let file = types::NetworkConfig {
-            bind_port: None,
-            relay_urls: None,
-            relay_url: Some("not a url".to_string()),
-            discovery: None,
-        };
-        let mut bag = ConfigErrorBag::new();
-        let _ = resolve_network_into(&cli, Some(&file), &mut bag);
-        let msg = format!("{:#}", bag.into_result().unwrap_err());
-        assert!(
-            msg.contains("network.relay_url:") && msg.contains("not a url"),
-            "alias entry must be validated under the singular label: {msg}"
-        );
-        assert!(
-            !msg.contains("network.relay_urls["),
-            "singular source must not be reported as an array index: {msg}"
         );
     }
 
@@ -8050,7 +7961,6 @@ swap_pool_address = \"0xPool\"
         types::NetworkConfig {
             bind_port: None,
             relay_urls: None,
-            relay_url: None,
             discovery: Some(discovery),
         }
     }
