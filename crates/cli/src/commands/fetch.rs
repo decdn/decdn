@@ -62,6 +62,19 @@ use decdn_client_pull::provider;
 /// (`--timeout-ms`); a dead candidate falls out of selection after this.
 const SELECT_PROBE_TIMEOUT_MS: u64 = 5_000;
 
+/// Reactive graduation (#1497): after an on-chain `topUp`, the node's settlement
+/// watcher can briefly lag the `ChannelToppedUp` event, so its pre-serve deposit
+/// gate (#1518) still sees the pre-top-up deposit and refuses the resumed open
+/// (collapsed to `NotFound`). The client that performed the top-up waits out that
+/// lag by retrying the open — money-safe, since an open sends no vouchers and does
+/// not move `byte_offset`. `MAX_TOPUP_SETTLE_WAITS * TOPUP_SETTLE_BACKOFF` bounds
+/// the total wait (15s), comfortably above the daemon's chain-event poll cadence
+/// yet well under a fetch's overall deadline.
+const MAX_TOPUP_SETTLE_WAITS: u32 = 30;
+/// Backoff between resume-open retries while waiting for the node's chain watcher
+/// to observe a just-landed top-up (see [`MAX_TOPUP_SETTLE_WAITS`]).
+const TOPUP_SETTLE_BACKOFF: Duration = Duration::from_millis(500);
+
 /// Parse a user-supplied BLAKE3 hash: 64 hex chars, optionally `0x`- or
 /// `b3:`-prefixed (the `b3:` form is what bundle manifests carry).
 pub(crate) fn parse_hash(s: &str) -> anyhow::Result<[u8; 32]> {
@@ -975,6 +988,13 @@ where
     // itself.
     let mut quoted_rate_per_mb = 0u64;
     let mut voucher_interval_bytes = 0u64;
+    // Reactive graduation (#1497): set right after an on-chain top-up so the NEXT
+    // open-time refusal is understood as the node's chain watcher not yet having
+    // observed the top-up (its pre-serve deposit gate, #1518, still sees the stale
+    // deposit) — waited out via `TOPUP_SETTLE_BACKOFF` rather than misread as a
+    // stale partial. Cleared on the first successful open. `settle_waits` bounds it.
+    let mut awaiting_topup_settle = false;
+    let mut settle_waits = 0u32;
     loop {
         // Open BEFORE touching the file. The rewind below is destructive, and an
         // open can fail for reasons that have nothing to do with the partial (the
@@ -1003,6 +1023,10 @@ where
                 total_bytes = header.total_bytes;
                 quoted_rate_per_mb = header.rate_per_mb;
                 voucher_interval_bytes = header.interval_bytes;
+                // The node accepted this open, so its chain watcher has caught up
+                // to any prior top-up — clear the settle-wait state (#1497).
+                awaiting_topup_settle = false;
+                settle_waits = 0;
                 // The open succeeded, so this attempt is really going to write.
                 // Rewind to the verified prefix: a no-op on the first pass, and on
                 // a retry it discards whatever the failed attempt left behind.
@@ -1046,6 +1070,27 @@ where
                 resumed_from: byte_offset,
             });
         };
+        // Reactive graduation (#1497): after a top-up, the node's settlement
+        // watcher may not yet have applied the on-chain `ChannelToppedUp`, so its
+        // pre-serve deposit gate (#1518) refuses the resumed open — the node
+        // collapses that to `NotFound`, the same shape `resume_may_be_stale` keys
+        // on. Retrying the OPEN is money-safe (no vouchers sent, `byte_offset`
+        // unchanged), so wait briefly for the watcher to catch up before treating
+        // this as a stale partial and rewinding to zero. Bounded by
+        // `MAX_TOPUP_SETTLE_WAITS`; on exhaustion, fall through to the normal
+        // stale-partial handling below.
+        if awaiting_topup_settle && resume_may_be_stale(&err) {
+            if settle_waits < MAX_TOPUP_SETTLE_WAITS {
+                settle_waits += 1;
+                eprintln!(
+                    "note: the node has not yet observed the on-chain top-up; waiting for its \
+                     chain watcher before resuming (wait {settle_waits}/{MAX_TOPUP_SETTLE_WAITS})"
+                );
+                tokio::time::sleep(TOPUP_SETTLE_BACKOFF).await;
+                continue;
+            }
+            awaiting_topup_settle = false;
+        }
         // Retry from the start when the refusal is consistent with the resume
         // offset being wrong (see `resume_may_be_stale`). At most once per
         // invocation, and it is a restart rather than a retry, so it does not
@@ -1165,6 +1210,11 @@ where
                         total_bytes,
                         paid_wire_this_blob,
                     );
+                    // The node's chain watcher may not observe this top-up before
+                    // the immediate resume-open below; mark it so an open-time
+                    // refusal is waited out, not misread as a stale partial (#1497).
+                    awaiting_topup_settle = true;
+                    settle_waits = 0;
                     continue;
                 }
                 TopUpDecision::Exhausted => {
