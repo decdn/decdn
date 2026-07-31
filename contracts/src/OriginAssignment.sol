@@ -11,17 +11,23 @@ import { IContentBlacklistOriginView } from "./interfaces/IContentBlacklistOrigi
 
 /// @title OriginAssignment
 /// @notice The DAO's positive origin authority (ADR 011 § Origin Assignment
-///         Authority): which operators may act as origin backers for which
-///         namespace. Registered namespaces follow a publisher-propose /
-///         governance-ratify flow gated by an assignment timelock. Namespace 0
-///         (`namespaceId == 0`) has no publisher, so no set is ever seated for
-///         it — `getOrigins(0)` is empty and `isAuthorizedOrigin(0, op)` is
-///         always false. Authorized sets are `EnumerableSet`s.
+///         Authority), split into two planes:
+///         - **Vetting (cold).** Governance decides once, per publisher wallet,
+///           who is a network-trusted publisher. A publisher requests vetting,
+///           waits `vettingTimelock`, and governance grants it — or governance
+///           grants/revokes instantly with `setPublisherVetted`.
+///         - **Origins (hot).** A vetted publisher seats and unseats origins for
+///           its OWN namespaces instantly, one operator at a time, choosing
+///           freely among bonded operators.
+///         Namespace 0 (`namespaceId == 0`) has no publisher, so no operator is
+///         ever seated for it — `getOrigins(0)` is empty and
+///         `isAuthorizedOrigin(0, op)` is always false. Authorized sets are
+///         `EnumerableSet`s.
 /// @dev    OZ bases per ADR 016 § Contract Inventory: `AccessControl` (governance
 ///         gating) + `ReentrancyGuard` (all cross-contract reads are views, but
 ///         the guard matches the inventory and the repo's external-call-then-write
 ///         convention). Holds no funds. The `ContentBlacklist` binding is wired
-///         once post-deploy via `setContentBlacklist`; until then activation
+///         once post-deploy via `setContentBlacklist`; until then `addOrigin`
 ///         validates against `CapacityBond.isActive` only and `prune` reverts.
 contract OriginAssignment is AccessControl, ReentrancyGuard {
     using EnumerableSet for EnumerableSet.AddressSet;
@@ -37,12 +43,12 @@ contract OriginAssignment is AccessControl, ReentrancyGuard {
     // Constants (ADR 009 § Governable parameters with safety bounds)
     // -----------------------------------------------------------------
 
-    uint256 internal constant ASSIGNMENT_TIMELOCK_FLOOR = 24 hours;
-    uint256 internal constant ASSIGNMENT_TIMELOCK_CEILING = 14 days;
+    uint256 internal constant VETTING_TIMELOCK_FLOOR = 24 hours;
+    uint256 internal constant VETTING_TIMELOCK_CEILING = 14 days;
     uint256 internal constant MAX_ORIGINS_FLOOR = 1;
     uint256 internal constant MAX_ORIGINS_CEILING = 50;
 
-    uint256 internal constant DEFAULT_ASSIGNMENT_TIMELOCK = 3 days;
+    uint256 internal constant DEFAULT_VETTING_TIMELOCK = 3 days;
     uint256 internal constant DEFAULT_MAX_ORIGINS = 10;
 
     // -----------------------------------------------------------------
@@ -55,33 +61,37 @@ contract OriginAssignment is AccessControl, ReentrancyGuard {
     // forge-lint: disable-next-line(screaming-snake-case-immutable)
     IPublisherRegistryOwnership public immutable publisherRegistry;
 
-    /// @notice Read-direction binding for `pruneBlacklistedAssignment` /
-    ///         activation re-validation. `address(0)` until `setContentBlacklist`.
+    /// @notice Read-direction binding for `pruneBlacklistedOrigin` and the
+    ///         `addOrigin` blacklist guard. `address(0)` until
+    ///         `setContentBlacklist`.
     address public contentBlacklist;
 
     uint256 public maxOriginsPerNamespace;
-    uint256 public assignmentTimelock;
+    uint256 public vettingTimelock;
 
     // -----------------------------------------------------------------
-    // Storage — authorized sets + pending proposals
+    // Storage — publisher vetting + authorized sets
     // -----------------------------------------------------------------
+
+    /// @notice Publishers governance trusts to seat origins for their own
+    ///         namespaces. The wallet is vetted, not any operator set, so a
+    ///         vetted publisher adds and removes origins with no further
+    ///         governance action.
+    mapping(address publisher => bool) public isVettedPublisher;
+
+    /// @notice Unix time each pending vetting request ripens. `0` means no
+    ///         request is pending for that publisher.
+    mapping(address publisher => uint64) internal _vettingReadyAt;
 
     mapping(uint256 namespaceId => EnumerableSet.AddressSet) internal _origins;
-
-    struct PendingAssignment {
-        address[] operators;
-        uint64 readyAt;
-    }
-
-    mapping(uint256 namespaceId => PendingAssignment) internal _pending;
 
     /// @notice Every namespace whose authorized set is currently non-empty.
     /// @dev    Membership within a namespace was always readable via `getOrigins`;
     ///         the KEY SET was not, which is the sole reason a consumer had to
-    ///         replay `AssignmentActivated` from the deploy block just to learn
-    ///         which namespaces exist. Maintained alongside every `_origins`
-    ///         mutation: seated on activation, withdrawn once the last operator
-    ///         is revoked or pruned, so `contains(ns)` matches
+    ///         replay seating events from the deploy block just to learn which
+    ///         namespaces exist. Maintained alongside every `_origins` mutation:
+    ///         seated on the 0→1 transition in `addOrigin`, withdrawn once the
+    ///         last operator is removed or pruned, so `contains(ns)` matches
     ///         `getOrigins(ns).length > 0` exactly.
     EnumerableSet.UintSet internal _assignedNamespaces;
 
@@ -89,16 +99,15 @@ contract OriginAssignment is AccessControl, ReentrancyGuard {
     // Events (ADR 011 § Contract: OriginAssignment)
     // -----------------------------------------------------------------
 
-    event AssignmentProposed(
-        uint256 indexed namespaceId, address indexed proposer, address[] operators, uint256 readyAt
-    );
-    event AssignmentProposalCancelled(uint256 indexed namespaceId, address indexed proposer, bool autoCleared);
-    event AssignmentActivated(uint256 indexed namespaceId, address[] operators);
-    event AssignmentRevoked(uint256 indexed namespaceId, address indexed operator, address indexed by);
-    event BlacklistedAssignmentPruned(uint256 indexed namespaceId, address indexed operator, address indexed pruner);
+    event VettingRequested(address indexed publisher, uint256 readyAt);
+    event VettingRequestCancelled(address indexed publisher);
+    event PublisherVetted(address indexed publisher, bool vetted, address indexed by);
+    event OriginAdded(uint256 indexed namespaceId, address indexed operator, address indexed by);
+    event OriginRemoved(uint256 indexed namespaceId, address indexed operator, address indexed by);
+    event BlacklistedOriginPruned(uint256 indexed namespaceId, address indexed operator, address indexed pruner);
     event ContentBlacklistUpdated(address indexed oldAddr, address indexed newAddr);
     event MaxOriginsPerNamespaceUpdated(uint256 oldValue, uint256 newValue);
-    event AssignmentTimelockUpdated(uint256 oldValue, uint256 newValue);
+    event VettingTimelockUpdated(uint256 oldValue, uint256 newValue);
 
     // -----------------------------------------------------------------
     // Errors
@@ -106,17 +115,20 @@ contract OriginAssignment is AccessControl, ReentrancyGuard {
 
     error ZeroAddress();
     error NotNamespaceOwner(uint256 namespaceId, address caller);
-    error EmptyOperatorSet();
     error TooManyOrigins(uint256 count, uint256 cap);
     error DuplicateOperator(address operator);
     error OperatorNotActive(address operator);
     error OperatorBlacklisted(address operator);
-    error NoPendingProposal(uint256 namespaceId);
-    error TimelockNotElapsed(uint256 readyAt);
     error NotAuthorizedOrigin(uint256 namespaceId, address operator);
     error ContentBlacklistNotSet();
     error OperatorNotBlacklisted(address operator);
     error ParamOutOfBounds(uint256 value, uint256 floor, uint256 ceiling);
+    error PublisherNotVetted(address publisher);
+    error NoNamespaceOwned(address publisher);
+    error AlreadyVetted(address publisher);
+    error VettingRequestPending(address publisher);
+    error NoVettingRequest(address publisher);
+    error VettingTimelockNotElapsed(uint256 readyAt);
 
     // -----------------------------------------------------------------
     // Constructor (ADR 016 § Deployment Order, step 10)
@@ -141,90 +153,114 @@ contract OriginAssignment is AccessControl, ReentrancyGuard {
         contentBlacklist = contentBlacklist_; // may be zero at deploy
 
         maxOriginsPerNamespace = DEFAULT_MAX_ORIGINS;
-        assignmentTimelock = DEFAULT_ASSIGNMENT_TIMELOCK;
+        vettingTimelock = DEFAULT_VETTING_TIMELOCK;
 
         _grantRole(DEFAULT_ADMIN_ROLE, admin);
         _grantRole(GOVERNANCE_ROLE, admin);
     }
 
     // -----------------------------------------------------------------
-    // Registered-namespace assignment (publisher propose / DAO ratify)
+    // Publisher vetting (cold path: publisher requests / governance grants)
     // -----------------------------------------------------------------
 
-    /// @notice Publisher proposes a candidate origin set for their namespace.
-    /// @dev External `ownerOf` / `isActive` reads precede the pending-state write;
-    ///      safe under `nonReentrant` (the reads are views).
+    /// @notice A publisher asks governance to vet its wallet. The request
+    ///         ripens after `vettingTimelock`, which is the window governance
+    ///         reviews it in.
+    /// @dev The `namespaceCount` external view read precedes the pending-state
+    ///      write; safe under `nonReentrant` (the read is a view).
     // slither-disable-next-line reentrancy-no-eth
-    function proposeAssignment(uint256 namespaceId, address[] calldata operators) external nonReentrant {
+    function requestVetting() external nonReentrant {
+        if (isVettedPublisher[msg.sender]) revert AlreadyVetted(msg.sender);
+        if (_vettingReadyAt[msg.sender] != 0) revert VettingRequestPending(msg.sender);
         // aderyn-ignore-next-line(reentrancy-state-change)
-        if (publisherRegistry.ownerOf(namespaceId) != msg.sender) revert NotNamespaceOwner(namespaceId, msg.sender);
-        if (operators.length == 0) revert EmptyOperatorSet();
-        if (operators.length > maxOriginsPerNamespace) revert TooManyOrigins(operators.length, maxOriginsPerNamespace);
+        if (publisherRegistry.namespaceCount(msg.sender) == 0) revert NoNamespaceOwned(msg.sender);
 
-        for (uint256 i = 0; i < operators.length; i++) {
-            // aderyn-ignore-next-line(reentrancy-state-change)
-            if (!capacityBond.isActive(operators[i])) revert OperatorNotActive(operators[i]);
-            for (uint256 j = 0; j < i; j++) {
-                if (operators[i] == operators[j]) revert DuplicateOperator(operators[i]);
-            }
-        }
+        uint64 readyAt = uint64(block.timestamp + vettingTimelock);
+        _vettingReadyAt[msg.sender] = readyAt;
 
-        // Overwrite any existing pending proposal (ADR 011 § Edge cases).
-        if (_pending[namespaceId].readyAt != 0) {
-            emit AssignmentProposalCancelled(namespaceId, msg.sender, true);
-        }
-
-        uint64 readyAt = uint64(block.timestamp + assignmentTimelock);
-        _pending[namespaceId] = PendingAssignment({ operators: operators, readyAt: readyAt });
-
-        emit AssignmentProposed(namespaceId, msg.sender, operators, readyAt);
+        emit VettingRequested(msg.sender, readyAt);
     }
 
-    /// @notice Governance ratifies a pending proposal after the timelock, after
-    ///         re-validating each operator is still active and not blacklisted.
-    /// @dev Reverts if an operator went stale during the window (ADR 011 § Lifecycle
-    ///      step 2); the publisher then re-proposes — `proposeAssignment` overwrites
-    ///      the stale pending set (the documented "auto-clear" effect; an in-revert
-    ///      state clear is impossible, so the overwrite path realizes it).
-    // slither-disable-next-line reentrancy-no-eth
-    function activateAssignment(uint256 namespaceId) external nonReentrant onlyRole(GOVERNANCE_ROLE) {
-        PendingAssignment storage pending = _pending[namespaceId];
-        if (pending.readyAt == 0) revert NoPendingProposal(namespaceId);
-        // forge-lint: disable-next-line(block-timestamp)
-        if (block.timestamp < pending.readyAt) revert TimelockNotElapsed(pending.readyAt);
-
-        address[] memory operators = pending.operators;
-        address blacklist = contentBlacklist;
-        for (uint256 i = 0; i < operators.length; i++) {
-            // aderyn-ignore-next-line(reentrancy-state-change)
-            if (!capacityBond.isActive(operators[i])) revert OperatorNotActive(operators[i]);
-            // aderyn-ignore-next-line(reentrancy-state-change)
-            if (blacklist != address(0) && _isBlacklisted(blacklist, operators[i])) {
-                revert OperatorBlacklisted(operators[i]);
-            }
-        }
-
-        _replaceSet(namespaceId, operators);
-        delete _pending[namespaceId];
-
-        emit AssignmentActivated(namespaceId, operators);
-    }
-
-    /// @notice Publisher cancels their own pending proposal before activation.
-    function cancelAssignmentProposal(uint256 namespaceId) external nonReentrant {
-        // aderyn-ignore-next-line(reentrancy-state-change)
-        if (publisherRegistry.ownerOf(namespaceId) != msg.sender) revert NotNamespaceOwner(namespaceId, msg.sender);
-        // The `ownerOf` external read taints the struct field for slither's
-        // strict-equality detector; the `== 0` sentinel is a presence check.
+    /// @notice A publisher withdraws its own pending request.
+    function cancelVettingRequest() external {
+        // The field is a timestamp, so slither's strict-equality detector reads
+        // this as a dangerous compare; the `== 0` sentinel is a presence check.
         // slither-disable-next-line incorrect-equality
-        if (_pending[namespaceId].readyAt == 0) revert NoPendingProposal(namespaceId);
-        delete _pending[namespaceId];
-        emit AssignmentProposalCancelled(namespaceId, msg.sender, false);
+        if (_vettingReadyAt[msg.sender] == 0) revert NoVettingRequest(msg.sender);
+        delete _vettingReadyAt[msg.sender];
+        emit VettingRequestCancelled(msg.sender);
     }
 
-    /// @notice Publisher (own namespace) or governance (any) removes one operator.
+    /// @notice Governance grants a ripened request. This is the only place the
+    ///         timelock is enforced; `setPublisherVetted` is the instant
+    ///         override for both directions.
+    function grantVetting(address publisher) external onlyRole(GOVERNANCE_ROLE) {
+        uint64 readyAt = _vettingReadyAt[publisher];
+        if (readyAt == 0) revert NoVettingRequest(publisher);
+        // forge-lint: disable-next-line(block-timestamp)
+        if (block.timestamp < readyAt) revert VettingTimelockNotElapsed(readyAt);
+
+        delete _vettingReadyAt[publisher];
+        isVettedPublisher[publisher] = true;
+
+        emit PublisherVetted(publisher, true, msg.sender);
+    }
+
+    /// @notice Governance override: vet a publisher with no wait, or un-vet a
+    ///         rogue one. Un-vetting stops NEW origins immediately; origins the
+    ///         publisher already seated stay until `removeOrigin` (governance may
+    ///         call it on any namespace) or a blacklist prune takes them out —
+    ///         evicting them here would be unbounded in the publisher's
+    ///         namespace count.
+    function setPublisherVetted(address publisher, bool vetted) external onlyRole(GOVERNANCE_ROLE) {
+        if (publisher == address(0)) revert ZeroAddress();
+        // A grant consumes any pending request; a revocation clears it too, so a
+        // ripened request cannot be used to walk straight back in.
+        delete _vettingReadyAt[publisher];
+        isVettedPublisher[publisher] = vetted;
+        emit PublisherVetted(publisher, vetted, msg.sender);
+    }
+
+    // -----------------------------------------------------------------
+    // Origin seating (hot path: vetted publisher, instant, one operator)
+    // -----------------------------------------------------------------
+
+    /// @notice A vetted publisher seats one more operator as an origin for its
+    ///         own namespace. Effective immediately.
+    /// @dev Validation covers ONLY `operator`. Operators already in the set are
+    ///      never re-checked, so a transient failure on a live origin cannot
+    ///      block seating a new one (issue #1107). External `ownerOf` /
+    ///      `isActive` / blacklist reads precede the set write; safe under
+    ///      `nonReentrant` (the reads are views).
     // slither-disable-next-line reentrancy-no-eth
-    function revokeAssignment(uint256 namespaceId, address operator) external nonReentrant {
+    function addOrigin(uint256 namespaceId, address operator) external nonReentrant {
+        // aderyn-ignore-next-line(reentrancy-state-change)
+        if (publisherRegistry.ownerOf(namespaceId) != msg.sender) revert NotNamespaceOwner(namespaceId, msg.sender);
+        if (!isVettedPublisher[msg.sender]) revert PublisherNotVetted(msg.sender);
+        // aderyn-ignore-next-line(reentrancy-state-change)
+        if (!capacityBond.isActive(operator)) revert OperatorNotActive(operator);
+
+        address blacklist = contentBlacklist;
+        // aderyn-ignore-next-line(reentrancy-state-change)
+        if (blacklist != address(0) && _isBlacklisted(blacklist, operator)) {
+            revert OperatorBlacklisted(operator);
+        }
+
+        EnumerableSet.AddressSet storage set = _origins[namespaceId];
+        uint256 seated = set.length();
+        if (seated >= maxOriginsPerNamespace) revert TooManyOrigins(seated + 1, maxOriginsPerNamespace);
+        if (!set.add(operator)) revert DuplicateOperator(operator);
+        // Idempotent: the namespace enters the key set on its 0→1 transition and
+        // the later adds are no-ops.
+        // slither-disable-next-line unused-return
+        _assignedNamespaces.add(namespaceId);
+
+        emit OriginAdded(namespaceId, operator, msg.sender);
+    }
+
+    /// @notice Publisher (own namespace) or governance (any) unseats one operator.
+    // slither-disable-next-line reentrancy-no-eth
+    function removeOrigin(uint256 namespaceId, address operator) external nonReentrant {
         if (!hasRole(GOVERNANCE_ROLE, msg.sender)) {
             // aderyn-ignore-next-line(reentrancy-state-change)
             if (publisherRegistry.ownerOf(namespaceId) != msg.sender) {
@@ -233,14 +269,14 @@ contract OriginAssignment is AccessControl, ReentrancyGuard {
         }
         if (!_origins[namespaceId].remove(operator)) revert NotAuthorizedOrigin(namespaceId, operator);
         _pruneEmptyNamespace(namespaceId);
-        emit AssignmentRevoked(namespaceId, operator, msg.sender);
+        emit OriginRemoved(namespaceId, operator, msg.sender);
     }
 
     /// @notice Permissionless: remove a blacklisted operator from a namespace's set.
     ///         The contract checks the blacklist itself, so a caller cannot grief by
     ///         naming a non-blacklisted operator.
     // slither-disable-next-line reentrancy-no-eth
-    function pruneBlacklistedAssignment(uint256 namespaceId, address operator) external nonReentrant {
+    function pruneBlacklistedOrigin(uint256 namespaceId, address operator) external nonReentrant {
         address blacklist = contentBlacklist;
         if (blacklist == address(0)) revert ContentBlacklistNotSet();
         // aderyn-ignore-next-line(reentrancy-state-change)
@@ -249,7 +285,7 @@ contract OriginAssignment is AccessControl, ReentrancyGuard {
         }
         if (!_origins[namespaceId].remove(operator)) revert NotAuthorizedOrigin(namespaceId, operator);
         _pruneEmptyNamespace(namespaceId);
-        emit BlacklistedAssignmentPruned(namespaceId, operator, msg.sender);
+        emit BlacklistedOriginPruned(namespaceId, operator, msg.sender);
     }
 
     /// @dev True if `operator` is blacklisted via EITHER the origin or the
@@ -268,7 +304,7 @@ contract OriginAssignment is AccessControl, ReentrancyGuard {
 
     /// @notice Wire (or re-point) the ContentBlacklist read direction. Rejecting
     ///         `address(0)` prevents regressing into the deployment-window state
-    ///         where activation skips the blacklist check (ADR 011 § Edge cases).
+    ///         where `addOrigin` skips the blacklist check (ADR 011 § Edge cases).
     function setContentBlacklist(address newContentBlacklist) external onlyRole(GOVERNANCE_ROLE) {
         if (newContentBlacklist == address(0)) revert ZeroAddress();
         address old = contentBlacklist;
@@ -285,13 +321,13 @@ contract OriginAssignment is AccessControl, ReentrancyGuard {
         emit MaxOriginsPerNamespaceUpdated(old, cap);
     }
 
-    function setAssignmentTimelock(uint256 secondsDelay) external onlyRole(GOVERNANCE_ROLE) {
-        if (secondsDelay < ASSIGNMENT_TIMELOCK_FLOOR || secondsDelay > ASSIGNMENT_TIMELOCK_CEILING) {
-            revert ParamOutOfBounds(secondsDelay, ASSIGNMENT_TIMELOCK_FLOOR, ASSIGNMENT_TIMELOCK_CEILING);
+    function setVettingTimelock(uint256 secondsDelay) external onlyRole(GOVERNANCE_ROLE) {
+        if (secondsDelay < VETTING_TIMELOCK_FLOOR || secondsDelay > VETTING_TIMELOCK_CEILING) {
+            revert ParamOutOfBounds(secondsDelay, VETTING_TIMELOCK_FLOOR, VETTING_TIMELOCK_CEILING);
         }
-        uint256 old = assignmentTimelock;
-        assignmentTimelock = secondsDelay;
-        emit AssignmentTimelockUpdated(old, secondsDelay);
+        uint256 old = vettingTimelock;
+        vettingTimelock = secondsDelay;
+        emit VettingTimelockUpdated(old, secondsDelay);
     }
 
     // -----------------------------------------------------------------
@@ -316,8 +352,8 @@ contract OriginAssignment is AccessControl, ReentrancyGuard {
 
     /// @notice A page of the namespaces that currently have origins, so a
     ///         consumer can bootstrap by paging this and calling `getOrigins` per
-    ///         id, instead of replaying `AssignmentActivated` from the deploy
-    ///         block to discover which ids exist.
+    ///         id, instead of replaying seating events from the deploy block to
+    ///         discover which ids exist.
     /// @dev    Order is NOT stable across mutations (swap-and-pop on removal), so
     ///         page every offset at ONE pinned block height and re-check
     ///         `assignedNamespaceCount` there. `limit` is clamped against the
@@ -334,38 +370,15 @@ contract OriginAssignment is AccessControl, ReentrancyGuard {
         }
     }
 
-    function getPendingAssignment(uint256 namespaceId)
-        external
-        view
-        returns (address[] memory operators, uint256 readyAt)
-    {
-        PendingAssignment storage pending = _pending[namespaceId];
-        return (pending.operators, pending.readyAt);
+    /// @notice Unix time `publisher`'s pending vetting request ripens, or `0`
+    ///         when no request is pending.
+    function getPendingVetting(address publisher) external view returns (uint256 readyAt) {
+        return _vettingReadyAt[publisher];
     }
 
     // -----------------------------------------------------------------
     // Internal
     // -----------------------------------------------------------------
-
-    /// @dev Replace a namespace's authorized set with `operators` (assumed
-    ///      pre-validated for activity). Reverts `DuplicateOperator` if the input
-    ///      contains a repeat (the second `add` returns false).
-    function _replaceSet(uint256 namespaceId, address[] memory operators) internal {
-        EnumerableSet.AddressSet storage set = _origins[namespaceId];
-        address[] memory current = set.values();
-        for (uint256 i = 0; i < current.length; i++) {
-            // Clearing the set; the bool return (was-present) is irrelevant here.
-            // slither-disable-next-line unused-return
-            set.remove(current[i]);
-        }
-        for (uint256 i = 0; i < operators.length; i++) {
-            if (!set.add(operators[i])) revert DuplicateOperator(operators[i]);
-        }
-        // `operators` is non-empty (propose rejects `EmptyOperatorSet`), so the
-        // namespace is necessarily seated here.
-        // slither-disable-next-line unused-return
-        _assignedNamespaces.add(namespaceId);
-    }
 
     /// @dev Withdraw `namespaceId` from the key set once its last authorized
     ///      operator is gone, keeping `_assignedNamespaces` equal to

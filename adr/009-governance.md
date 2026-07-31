@@ -124,7 +124,7 @@ The α range upper-bounds at 1.8 to prevent a concentration penalty so steep tha
 | Challenge bond | SlashJudge | 1 TOKEN | 1,000 TOKEN |
 | Base slash reset period | CapacityBond | 30 days | 365 days |
 | Compliance window | ContentBlacklist | 1 hour | 7 days |
-| Assignment timelock | OriginAssignment | 24 hours | 14 days |
+| Publisher vetting timelock | OriginAssignment | 24 hours | 14 days |
 | Max origins per namespace | OriginAssignment | 1 | 50 |
 | Max namespaces per publisher | PublisherRegistry | 1 | 1000 |
 | Namespace transfer timelock | PublisherRegistry | 24 hours | 30 days |

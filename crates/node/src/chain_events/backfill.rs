@@ -6,7 +6,7 @@
 //! instead of forking a fresh one (#1092).
 //!
 //! Scope shrank with #1504: the genesis-replay consumers (the origin directory's
-//! `AssignmentActivated` scan and its `REPLAY_WINDOW_BLOCKS` span, the blacklist
+//! `OriginAdded` scan and its `REPLAY_WINDOW_BLOCKS` span, the blacklist
 //! and buyer-reconcile scans) are gone — those watchers enumerate their state
 //! from a contract view at a pinned block instead. What remains is the live-tail
 //! windowing every watcher shares, plus the durable-cursor rewind that only the

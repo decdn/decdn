@@ -552,31 +552,10 @@ impl ChainFixture {
             .context("isAuthorizedOrigin")
     }
 
-    /// Propose the registered namespace's replacement origin set as its owner.
-    pub async fn propose_assignment(
-        &self,
-        owner: &PrivateKeySigner,
-        namespace: U256,
-        operators: &[Address],
-    ) -> anyhow::Result<()> {
-        let provider = self.provider_for(owner);
-        let receipt = OriginAssignment::new(self.addrs.origin_assignment, &provider)
-            .proposeAssignment(namespace, operators.to_vec())
-            .send()
-            .await
-            .context("proposeAssignment send")?
-            .get_receipt()
-            .await
-            .context("proposeAssignment receipt")?;
-        crate::ensure_mined(&receipt, "proposeAssignment")
-    }
-
-    /// Revoke one operator from `namespace`'s active origin set as the namespace
-    /// owner. Unlike `proposeAssignment`, revocation takes effect immediately (no
-    /// timelock) and emits `AssignmentRevoked` — the event `ChainOriginDirectory`
-    /// consumes to re-close the authorized-origin gate for a fresh backend-only
-    /// hash (#1373).
-    pub async fn revoke_assignment(
+    /// Seat one operator as an authorized origin for `namespace`, as its owner.
+    /// The owner must already be a vetted publisher ([`Self::vet_publisher`]);
+    /// seating takes effect immediately and emits `OriginAdded`.
+    pub async fn add_origin(
         &self,
         owner: &PrivateKeySigner,
         namespace: U256,
@@ -584,38 +563,80 @@ impl ChainFixture {
     ) -> anyhow::Result<()> {
         let provider = self.provider_for(owner);
         let receipt = OriginAssignment::new(self.addrs.origin_assignment, &provider)
-            .revokeAssignment(namespace, operator)
+            .addOrigin(namespace, operator)
             .send()
             .await
-            .context("revokeAssignment send")?
+            .context("addOrigin send")?
             .get_receipt()
             .await
-            .context("revokeAssignment receipt")?;
-        crate::ensure_mined(&receipt, "revokeAssignment")
+            .context("addOrigin receipt")?;
+        crate::ensure_mined(&receipt, "addOrigin")
     }
 
-    /// Advance past the assignment delay, then activate as the governance Timelock.
-    pub async fn activate_assignment_after_timelock(&self, namespace: U256) -> anyhow::Result<()> {
+    /// Unseat one operator from `namespace`'s active origin set as the namespace
+    /// owner. Takes effect immediately and emits `OriginRemoved` — the event
+    /// `ChainOriginDirectory` consumes to re-close the authorized-origin gate for
+    /// a fresh backend-only hash (#1373).
+    pub async fn remove_origin(
+        &self,
+        owner: &PrivateKeySigner,
+        namespace: U256,
+        operator: Address,
+    ) -> anyhow::Result<()> {
+        let provider = self.provider_for(owner);
+        let receipt = OriginAssignment::new(self.addrs.origin_assignment, &provider)
+            .removeOrigin(namespace, operator)
+            .send()
+            .await
+            .context("removeOrigin send")?
+            .get_receipt()
+            .await
+            .context("removeOrigin receipt")?;
+        crate::ensure_mined(&receipt, "removeOrigin")
+    }
+
+    /// Vet `publisher` instantly as the governance Timelock — the
+    /// `setPublisherVetted` override. The fast setup for tests whose subject is
+    /// origin seating rather than how the wallet got vetted; see
+    /// [`Self::grant_vetting_after_timelock`] for the slow path.
+    pub async fn vet_publisher(&self, publisher: Address) -> anyhow::Result<()> {
+        self.impersonate(self.addrs.timelock).await?;
+        let raw = self.raw_provider();
+        let receipt = OriginAssignment::new(self.addrs.origin_assignment, &raw)
+            .setPublisherVetted(publisher, true)
+            .from(self.addrs.timelock)
+            .send()
+            .await
+            .context("setPublisherVetted send")?
+            .get_receipt()
+            .await
+            .context("setPublisherVetted receipt")?;
+        crate::ensure_mined(&receipt, "setPublisherVetted")
+    }
+
+    /// The full cold path: advance past the vetting delay a `requestVetting`
+    /// already queued, then grant it as the governance Timelock.
+    pub async fn grant_vetting_after_timelock(&self, publisher: Address) -> anyhow::Result<()> {
         let assignment = OriginAssignment::new(self.addrs.origin_assignment, &self.admin);
         let delay = assignment
-            .assignmentTimelock()
+            .vettingTimelock()
             .call()
             .await
-            .context("read assignmentTimelock")?;
+            .context("read vettingTimelock")?;
         crate::time::increase_time(&self.admin, delay.to::<u64>() + 1).await?;
 
         self.impersonate(self.addrs.timelock).await?;
         let raw = self.raw_provider();
         let receipt = OriginAssignment::new(self.addrs.origin_assignment, &raw)
-            .activateAssignment(namespace)
+            .grantVetting(publisher)
             .from(self.addrs.timelock)
             .send()
             .await
-            .context("activateAssignment send")?
+            .context("grantVetting send")?
             .get_receipt()
             .await
-            .context("activateAssignment receipt")?;
-        crate::ensure_mined(&receipt, "activateAssignment")
+            .context("grantVetting receipt")?;
+        crate::ensure_mined(&receipt, "grantVetting")
     }
 
     /// Current `FeeRouter.bytesPerEpoch(operator)` for the epoch at the chain's

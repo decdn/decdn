@@ -5,10 +5,15 @@
 //!
 //! 1. `publish namespace create` mints a namespace owned by the signer; the id
 //!    is parsed from the `--json` receipt and confirmed via `ownerOf`.
-//! 2. `publish assign <id> <operator>` is **propose-only** (it calls
-//!    `proposeAssignment`, not `activateAssignment`), so `getPendingAssignment`
-//!    reflects the proposed set with a non-zero timelock `readyAt` while
-//!    `getOrigins` stays empty until governance ratifies.
+//! 2. `publish assign <id> <operator>` **fails closed while the publisher is
+//!    unvetted** — origin seating is gated on the wallet, not on a per-set
+//!    governance vote.
+//! 3. `publish request-vetting` queues the one governance-gated step, leaving a
+//!    non-zero `getPendingVetting` deadline; the fixture then warps past the
+//!    timelock and grants it as the governance Timelock.
+//! 4. `publish assign <id> <operator>` now seats the origin **instantly** —
+//!    `getOrigins` reflects it with no further governance action — and
+//!    `publish revoke` unseats it just as immediately.
 //!
 //! There is no per-hash on-chain claim (ADR 002 § Hash-to-namespace
 //! association) — content is bound to a namespace off-chain at fetch time.
@@ -74,9 +79,9 @@ async fn run() -> anyhow::Result<()> {
     let chain = ChainFixture::launch().await?;
 
     // A single onboarded operator plays both roles: the publisher whose keystore
-    // signs the three `decdn publish` writes (and therefore owns the namespace it
-    // creates), and the active bonded node the `assign` proposes as an authorized
-    // origin — `proposeAssignment` gates every operator on `CapacityBond.isActive`,
+    // signs the `decdn publish` writes (and therefore owns the namespace it
+    // creates), and the active bonded node the `assign` seats as an authorized
+    // origin — `addOrigin` gates every operator on `CapacityBond.isActive`,
     // which onboarding satisfies. The node fixture also renders the `node.toml`
     // the CLI reads its `[blockchain]` coordinates + keystore from.
     let serve_blob = b"decdn publish e2e fixture blob (#1073)".to_vec();
@@ -99,11 +104,9 @@ async fn run() -> anyhow::Result<()> {
         "the CLI signer must own the namespace it created on-chain",
     );
 
-    // ---- 2. `publish assign <id> <operator>` is propose-only: it calls
-    // `proposeAssignment`, not `activateAssignment`. So the *pending* proposal
-    // carries the proposed set + a non-zero timelock deadline, while the active
-    // (`getOrigins`) set stays empty until governance ratifies.
-    run_publish(
+    // ---- 2. Seating is gated on the publisher WALLET, so `assign` fails closed
+    // until governance vets it. The revert is the contract's `PublisherNotVetted`.
+    let denied = run_publish_expect_failure(
         &node,
         &[
             "assign",
@@ -112,26 +115,96 @@ async fn run() -> anyhow::Result<()> {
         ],
     )
     .await?;
-    let pending = assignment
-        .getPendingAssignment(U256::from(namespace_id))
-        .call()
-        .await?;
-    assert_eq!(
-        pending.operators,
-        vec![operator],
-        "getPendingAssignment must reflect the proposed operator set",
-    );
-    assert!(
-        pending.readyAt != U256::ZERO,
-        "a pending proposal must carry a non-zero timelock readyAt, got 0",
-    );
     assert!(
         assignment
             .getOrigins(U256::from(namespace_id))
             .call()
             .await?
             .is_empty(),
-        "getOrigins must stay empty until governance activates the proposal",
+        "an unvetted publisher must seat no origins, got {denied}",
+    );
+    assert!(
+        !assignment.isVettedPublisher(operator).call().await?,
+        "the publisher must start unvetted",
+    );
+
+    // ---- 3. `publish request-vetting` queues the single governance-gated step.
+    let requested = run_publish(&node, &["request-vetting", "--json"]).await?;
+    let ready_at = parse_ready_at(&requested.stdout)?;
+    assert!(
+        ready_at > 0,
+        "request-vetting must report a timelock deadline"
+    );
+    assert_eq!(
+        assignment.getPendingVetting(operator).call().await?,
+        U256::from(ready_at),
+        "getPendingVetting must match the readyAt the CLI reported",
+    );
+    // Warp past the timelock and grant as the governance Timelock — the cold
+    // path in full, rather than the `setPublisherVetted` override.
+    chain.grant_vetting_after_timelock(operator).await?;
+    assert!(
+        assignment.isVettedPublisher(operator).call().await?,
+        "grantVetting must vet the publisher",
+    );
+
+    // ---- 4/5. Seat then unseat, both instant.
+    seat_then_unseat(&node, &assignment, namespace_id, operator).await
+}
+
+/// The self-serve half of the journey: a vetted publisher seats an origin and
+/// unseats it again, each in one transaction with no governance step in
+/// between. Split out of [`run`] to keep either function readable.
+async fn seat_then_unseat<P: alloy::providers::Provider>(
+    node: &NodeFixture,
+    assignment: &OriginAssignment::OriginAssignmentInstance<P>,
+    namespace_id: u64,
+    operator: alloy::primitives::Address,
+) -> anyhow::Result<()> {
+    // `assign` now seats the origin instantly: no pending state, no second
+    // governance action — `getOrigins` reflects it immediately.
+    run_publish(
+        node,
+        &[
+            "assign",
+            &namespace_id.to_string(),
+            &format!("{operator:#x}"),
+        ],
+    )
+    .await?;
+    assert_eq!(
+        assignment
+            .getOrigins(U256::from(namespace_id))
+            .call()
+            .await?,
+        vec![operator],
+        "a vetted publisher's addOrigin must seat the operator in the same tx",
+    );
+    assert!(
+        assignment
+            .isAuthorizedOrigin(U256::from(namespace_id), operator)
+            .call()
+            .await?,
+        "the seated operator must be an authorized origin",
+    );
+
+    // `publish revoke` unseats it, just as immediately.
+    run_publish(
+        node,
+        &[
+            "revoke",
+            &namespace_id.to_string(),
+            &format!("{operator:#x}"),
+        ],
+    )
+    .await?;
+    assert!(
+        assignment
+            .getOrigins(U256::from(namespace_id))
+            .call()
+            .await?
+            .is_empty(),
+        "removeOrigin must unseat the operator in the same tx",
     );
 
     Ok(())
@@ -164,6 +237,52 @@ async fn run_publish(node: &NodeFixture, args: &[&str]) -> anyhow::Result<std::p
         String::from_utf8_lossy(&out.stderr),
     );
     Ok(out)
+}
+
+/// Run `decdn publish <args…>` expecting a NON-zero exit — the guard-rail half
+/// of [`run_publish`]. Returns the combined output so the caller can quote it.
+/// A clean exit is the failure here: it would mean the write landed.
+async fn run_publish_expect_failure(node: &NodeFixture, args: &[&str]) -> anyhow::Result<String> {
+    let out = Command::from(decdn_command(node.data_dir(), KEYSTORE_PASSWORD)?)
+        .arg("publish")
+        .args(args)
+        .arg("--config")
+        .arg(node.config_path())
+        .kill_on_drop(true)
+        .output()
+        .await
+        .context("spawn decdn publish")?;
+    let rendered = format!(
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    anyhow::ensure!(
+        !out.status.success(),
+        "`decdn publish {}` unexpectedly succeeded\n{rendered}",
+        args.join(" "),
+    );
+    Ok(rendered)
+}
+
+/// Parse `ready_at` from a `decdn publish request-vetting --json` receipt, the
+/// same last-non-empty-line contract as [`parse_namespace_id`].
+fn parse_ready_at(stdout: &[u8]) -> anyhow::Result<u64> {
+    let text = String::from_utf8_lossy(stdout);
+    let line = text
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .context("request-vetting produced no stdout")?;
+    let v: serde_json::Value =
+        serde_json::from_str(line).context("parse request-vetting JSON receipt")?;
+    anyhow::ensure!(
+        v["status"] == serde_json::json!("vetting_requested"),
+        "request-vetting was not submitted (dry run?): {v}",
+    );
+    v["ready_at"]
+        .as_u64()
+        .context("request-vetting receipt missing a numeric ready_at")
 }
 
 /// Parse the `namespace_id` from a `decdn publish namespace create --json`

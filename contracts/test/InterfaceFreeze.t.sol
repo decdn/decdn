@@ -86,25 +86,26 @@ contract InterfaceFreezeTest is Test {
     }
 
     function test_originAssignment_abiFrozen() public pure {
+        assertEq(OriginAssignment.requestVetting.selector, bytes4(keccak256("requestVetting()")), "requestVetting");
         assertEq(
-            OriginAssignment.proposeAssignment.selector,
-            bytes4(keccak256("proposeAssignment(uint256,address[])")),
-            "proposeAssignment"
+            OriginAssignment.cancelVettingRequest.selector,
+            bytes4(keccak256("cancelVettingRequest()")),
+            "cancelVettingRequest"
+        );
+        assertEq(OriginAssignment.grantVetting.selector, bytes4(keccak256("grantVetting(address)")), "grantVetting");
+        assertEq(
+            OriginAssignment.setPublisherVetted.selector,
+            bytes4(keccak256("setPublisherVetted(address,bool)")),
+            "setPublisherVetted"
+        );
+        assertEq(OriginAssignment.addOrigin.selector, bytes4(keccak256("addOrigin(uint256,address)")), "addOrigin");
+        assertEq(
+            OriginAssignment.removeOrigin.selector, bytes4(keccak256("removeOrigin(uint256,address)")), "removeOrigin"
         );
         assertEq(
-            OriginAssignment.activateAssignment.selector,
-            bytes4(keccak256("activateAssignment(uint256)")),
-            "activateAssignment"
-        );
-        assertEq(
-            OriginAssignment.revokeAssignment.selector,
-            bytes4(keccak256("revokeAssignment(uint256,address)")),
-            "revokeAssignment"
-        );
-        assertEq(
-            OriginAssignment.pruneBlacklistedAssignment.selector,
-            bytes4(keccak256("pruneBlacklistedAssignment(uint256,address)")),
-            "pruneBlacklistedAssignment"
+            OriginAssignment.pruneBlacklistedOrigin.selector,
+            bytes4(keccak256("pruneBlacklistedOrigin(uint256,address)")),
+            "pruneBlacklistedOrigin"
         );
         assertEq(
             OriginAssignment.setContentBlacklist.selector,

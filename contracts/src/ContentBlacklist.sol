@@ -446,7 +446,7 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     ///         advances. Without a materializing call, a delta-polling node
     ///         would keep enforcing an expired entry forever. Mirrors the
     ///         permissionless-cleanup model of
-    ///         `OriginAssignment.pruneBlacklistedAssignment`.
+    ///         `OriginAssignment.pruneBlacklistedOrigin`.
     function expireEmergencyEntry(bytes32 region, bytes32 hash) external {
         HashEntry storage e = _hashEntries[region][hash];
         if (e.addedAt == 0) revert EntryNotBlacklisted(region, hash);

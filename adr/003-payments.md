@@ -889,7 +889,7 @@ function nodeIdOf(address operator) external view returns (bytes32 nodeId, bool 
 // `ContentBlacklist.isOriginBlacklisted` themselves
 // (per [ADR 011 § Interaction with ContentBlacklist](011-content-takedown.md#interaction-with-contentblacklist)).
 // Equivalent to `(_, active) = nodeIdOf(operator)` without reading the binding
-// slot. Consumed by `OriginAssignment.proposeAssignment` / `activateAssignment`
+// slot. Consumed by `OriginAssignment.addOrigin`
 // per [ADR 011 § Origin Assignment
 // Authority](011-content-takedown.md#origin-assignment-authority).
 function isActive(address operator) external view returns (bool);

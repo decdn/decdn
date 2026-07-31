@@ -27,7 +27,7 @@
 //!   one that can resolve anything. It yields the same candidate set the chain
 //!   above specifies, but does not perform that literal call sequence: the
 //!   `namespace → operators` view is fed from `OriginAssignment` events
-//!   (`AssignmentActivated` / `AssignmentRevoked` / `BlacklistedAssignmentPruned`)
+//!   (`OriginAdded` / `OriginRemoved` / `BlacklistedOriginPruned`)
 //!   and the `active` filter is applied from the shared `StakerSet` at lookup
 //!   time rather than taken from the `nodeIdOf` tuple. Lookups are served from an
 //!   event-fed in-memory cache and never hit RPC.

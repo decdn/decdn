@@ -17,14 +17,14 @@ No existing ADR addressed either question. This ADR establishes:
 4. An emergency fast-path for time-critical removals
 5. The slashing regime for non-compliance
 6. The known limitations of hash-based blacklisting and the mitigations available
-7. A governance-controlled positive authority for origin assignment (`OriginAssignment`) — publisher-propose / DAO-ratify per registered namespace; namespace 0 (`namespaceId == 0`) has no authorized origins — built on the publisher/namespace identity primitive defined in [ADR 002](002-content-addressing.md#publisher-identity-and-namespaces)
+7. A governance-controlled positive authority for origin assignment (`OriginAssignment`) — governance vets the publisher wallet once, and the vetted publisher then seats origins for its own namespaces instantly; namespace 0 (`namespaceId == 0`) has no authorized origins — built on the publisher/namespace identity primitive defined in [ADR 002](002-content-addressing.md#publisher-identity-and-namespaces)
 
 ## Decision
 
 Content governance over origins has two symmetric authorities, both DAO-controlled:
 
 - **Negative authority — `ContentBlacklist`.** Removes hashes and operators via two governance paths: a global path (network-wide removal) and a regional path (jurisdiction-scoped removal via a designated regional governance body). Nodes must evict blacklisted content and stop announcing it within a defined compliance window; serving a blacklisted hash after the compliance window is a slashable offense. Origin nodes that repeatedly source blacklisted content can themselves be blacklisted by NodeId or operator address, independent of any specific hash — the primary mitigation for hash evasion via trivial re-encoding.
-- **Positive authority — `OriginAssignment`.** Authorizes specific operators to act as origins for specific namespaces (defined in [ADR 002 § Publisher Identity and Namespaces](002-content-addressing.md#publisher-identity-and-namespaces)). Publishers propose operator sets; governance ratifies each proposal via the standard timelock path. Namespace 0 (`namespaceId == 0`) has no authorized origins — content under it is served best-effort from cache/DHT per [ADR 002 § Retrieval by namespace](002-content-addressing.md#retrieval-by-namespace). `ContentBlacklist` and `OriginAssignment` integrate via runtime checks with lazy storage cleanup — see [§ Interaction with ContentBlacklist](#interaction-with-contentblacklist).
+- **Positive authority — `OriginAssignment`.** Authorizes specific operators to act as origins for specific namespaces (defined in [ADR 002 § Publisher Identity and Namespaces](002-content-addressing.md#publisher-identity-and-namespaces)). Governance vets the publisher wallet through the standard timelock path; the vetted publisher then picks its own origins from the bonded operator set with no further governance action. Namespace 0 (`namespaceId == 0`) has no authorized origins — content under it is served best-effort from cache/DHT per [ADR 002 § Retrieval by namespace](002-content-addressing.md#retrieval-by-namespace). `ContentBlacklist` and `OriginAssignment` integrate via runtime checks with lazy storage cleanup — see [§ Interaction with ContentBlacklist](#interaction-with-contentblacklist).
 
 Each node also maintains a local denylist for operator-initiated removal without waiting for governance.
 
@@ -224,7 +224,7 @@ Hash-based blacklisting covers only exact copies of a blob. A one-byte change pr
 **The protocol's primary response is origin blacklisting.** If an origin-backed node repeatedly sources blacklisted content — whether the same blob or trivially re-encoded variants — governance can blacklist the operator's Ethereum address. `ContentBlacklist.addOperator()` calls `CapacityBond.ejectNode(operatorAddress)` via a cross-contract call; the `CapacityBond` grants the `ContentBlacklist` contract address the `BLACKLIST_ROLE`, permitting this call. A blacklisted origin:
 
 - **Ejected from `CapacityBond`** — emits `EjectedByBlacklist`, sets the permanent `blacklistEjected` latch, and (when the operator had a registered node) sets `active = false` and emits `NodeAutoEjected` ([ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh)). The node-deactivation effects follow the same code path as bond-shortfall auto-ejection ([ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn))
-- **Effectively removed from every namespace's authorized origin set** at runtime; storage cleanup is lazy and permissionless via `pruneBlacklistedAssignment` — see [§ Interaction with ContentBlacklist](#interaction-with-contentblacklist)
+- **Effectively removed from every namespace's authorized origin set** at runtime; storage cleanup is lazy and permissionless via `pruneBlacklistedOrigin` — see [§ Interaction with ContentBlacklist](#interaction-with-contentblacklist)
 - **Remaining bond enters forced unbonding** — the standard unbonding window applies (14 days default per [ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve), governable [7, 60] days). Bond remains slashable during unbonding
 - **Address banned while blacklisted** — cannot register new nodes under the same Ethereum address unless governance removes the blacklist entry via `removeOperator(operatorAddress)`. Re-entry otherwise requires a new identity funded with a fresh capacity bond (`bond = k × Mbps^α`; ≈50,000 TOKEN for a 1 Gbps entry tier at default `k=12.6`, `α=1.2` per [ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve))
 - **The operator's registered NodeId is excluded from peer tables** — gossip validation rejects messages from that blacklisted node, and any existing peer-table entry is removed when the `NodeAutoEjected` event is received (see [appendix-peer-table-eviction.md](appendix-peer-table-eviction.md#appendix-peer-table-eviction-policy))
@@ -253,43 +253,67 @@ The publisher and namespace primitives are defined in [ADR 002 § Publisher Iden
 
 - A **publisher** is an Ethereum address that owns at least one namespace in `PublisherRegistry` (acquired implicitly on the first successful `createNamespace()` call; no separate registration step).
 - A **namespace** is a publisher-owned `uint256` identifier for a content set and the unit of origin addressing; a request names the namespace its content is published under.
-- **Namespace 0** (`namespaceId == 0`) has no publisher and no authorized origins; content served under it is best-effort from cache/DHT ([ADR 002 § Namespace 0](002-content-addressing.md#namespace-0)). Origin assignment applies only to registered namespaces, via the publisher-propose / DAO-ratify flow.
+- **Namespace 0** (`namespaceId == 0`) has no publisher and no authorized origins; content served under it is best-effort from cache/DHT ([ADR 002 § Namespace 0](002-content-addressing.md#namespace-0)). Origin assignment applies only to registered namespaces.
+
+### Two planes: vetting and seating
+
+Origin authorization answers two different questions, and each one gets its own plane:
+
+1. **Is this wallet a network-trusted publisher?** This is a governance question. It is asked once per publisher wallet, and it is timelocked.
+2. **Does this publisher want operator B serving its namespace?** This is the publisher's own question. It is asked constantly, it is a single-operator delta, and it takes effect in the transaction that carries it.
+
+The **cold plane** is publisher vetting. A publisher calls `requestVetting()`, the request ripens after `vettingTimelock`, and governance calls `grantVetting(publisher)`. Governance can also grant or revoke instantly with `setPublisherVetted(publisher, bool)`.
+
+The **hot plane** is origin seating. A vetted publisher calls `addOrigin(namespaceId, operator)` for a namespace it owns. The contract validates that operator alone — active in `CapacityBond`, not blacklisted, not already seated, within `maxOriginsPerNamespace` — and seats it immediately. `removeOrigin` unseats one operator the same way.
+
+The guarantee this preserves: **governance alone decides who is a network-trusted publisher; the publisher only chooses among bonded operators, and only for its own namespaces.**
+
+The earlier design put both questions in one flow: a publisher proposed a complete operator set, and governance ratified the whole set after a timelock. That coupled every routine change to a governance vote, and it re-validated already-serving origins each time a new one was added — so a transient failure on a live origin blocked seating a redundant one. Vetting the wallet once removes both effects.
 
 ### Contract: OriginAssignment
 
 ```solidity
 interface IOriginAssignment {
-    // Publisher proposes a candidate origin set for one of their namespaces.
-    // Reverts if msg.sender is not the namespace owner, if any operator is not
-    // active in CapacityBond at proposal time, if operators.length == 0
-    // (use revokeAssignment for explicit removal), or if operators.length
-    // exceeds maxOriginsPerNamespace.
-    function proposeAssignment(uint256 namespaceId, address[] calldata operators) external;
+    // ---- Cold plane: publisher vetting (governance-gated, one-time) ----
 
-    // Governance ratifies a pending proposal after the assignment timelock.
-    // Reverts if no pending proposal exists, if the timelock has not elapsed,
-    // or if any pending operator is no longer active in CapacityBond or is
-    // currently blacklisted in ContentBlacklist. On revert for either
-    // validation reason, the pending proposal is auto-cleared so the
-    // publisher can immediately submit a fresh `proposeAssignment` without a
-    // separate cancellation step.
-    function activateAssignment(uint256 namespaceId) external;
+    // Publisher asks governance to vet its wallet. Reverts if the caller owns
+    // no namespace (PublisherRegistry.namespaceCount == 0), is already vetted,
+    // or already has a request pending. The request ripens at
+    // block.timestamp + vettingTimelock.
+    function requestVetting() external;
 
-    // Publisher cancels their own pending proposal before activation.
-    // Reverts if msg.sender is not the namespace owner, or if no pending
-    // proposal exists. Equivalent to letting `proposeAssignment` overwrite,
-    // but explicit for the case where the publisher wants to leave the
-    // namespace in its current activated state without queuing a new set.
-    function cancelAssignmentProposal(uint256 namespaceId) external;
+    // Publisher withdraws its own pending request. Reverts if none is pending.
+    function cancelVettingRequest() external;
 
-    // Revocation paths:
-    //  - Publisher may revoke a single operator from their own namespace at any time.
-    //  - Governance may revoke an operator from any namespace.
+    // Governance grants a ripened request. Reverts if no request is pending or
+    // the timelock has not elapsed. GOVERNANCE_ROLE only.
+    function grantVetting(address publisher) external;
+
+    // Governance override in both directions: vet with no wait, or un-vet a
+    // rogue publisher. Clears any pending request either way, so a ripened
+    // request cannot walk an un-vetted publisher straight back in.
+    // GOVERNANCE_ROLE only.
+    function setPublisherVetted(address publisher, bool vetted) external;
+
+    // ---- Hot plane: origin seating (publisher self-serve, instant) ----
+
+    // Vetted namespace owner seats one more authorized origin. Effective
+    // immediately. Reverts if msg.sender does not own the namespace, is not
+    // vetted, or if the operator is not active in CapacityBond, is blacklisted,
+    // is already seated, or would exceed maxOriginsPerNamespace. Validation
+    // covers ONLY the operator being added: operators already in the set are
+    // never re-checked, so a transient failure on a live origin cannot block
+    // seating a new one.
+    function addOrigin(uint256 namespaceId, address operator) external;
+
+    // Removal paths:
+    //  - Publisher may unseat a single operator from its own namespace at any time.
+    //  - Governance may unseat an operator from any namespace.
     // Reverts if `operator` is not a member of the active set for `namespaceId`
-    // — typo protection; revoking a non-member is always a programming error.
-    // Revocation may drop the active set to zero; the namespace simply enters
-    // the unassigned state until a new proposal is activated.
-    function revokeAssignment(uint256 namespaceId, address operator) external;
+    // — typo protection; unseating a non-member is always a programming error.
+    // Removal may drop the active set to zero; the namespace simply enters the
+    // unassigned state until the publisher seats another origin.
+    function removeOrigin(uint256 namespaceId, address operator) external;
 
     // Permissionless storage cleanup for blacklisted operators.
     // Reverts unless the operator is currently blacklisted in ContentBlacklist
@@ -299,81 +323,93 @@ interface IOriginAssignment {
     // from every namespace in one transaction; runtime authorization checks
     // (probe, peer table) consult ContentBlacklist directly so cleanup latency
     // does not affect security.
-    function pruneBlacklistedAssignment(uint256 namespaceId, address operator) external;
+    function pruneBlacklistedOrigin(uint256 namespaceId, address operator) external;
 
     // Wires the read-direction integration with ContentBlacklist for
-    // pruneBlacklistedAssignment. Called once during post-deploy initialization
-    // (see ADR 016) and not expected to change thereafter; GOVERNANCE_ROLE only.
+    // pruneBlacklistedOrigin and the addOrigin blacklist guard. Called once
+    // during post-deploy initialization (see ADR 016) and not expected to change
+    // thereafter; GOVERNANCE_ROLE only.
     function setContentBlacklist(address contentBlacklist) external;
 
     // Governable parameters with safety bounds (see ADR 009)
     function setMaxOriginsPerNamespace(uint256 cap) external;
-    function setAssignmentTimelock(uint256 secondsDelay) external;
+    function setVettingTimelock(uint256 secondsDelay) external;
 
     // Views. For namespaceId == 0 these return empty / false — namespace 0
     // has no authorized origins.
     function isAuthorizedOrigin(uint256 namespaceId, address operator) external view returns (bool);
     function getOrigins(uint256 namespaceId) external view returns (address[] memory);
-    function getPendingAssignment(uint256 namespaceId)
-        external view returns (address[] memory operators, uint256 readyAt);
+    function isVettedPublisher(address publisher) external view returns (bool);
+    function getPendingVetting(address publisher) external view returns (uint256 readyAt);
+
+    // Namespace key-set enumeration, so an off-chain directory can discover
+    // which namespaces have origins without replaying events. Order is not
+    // stable across mutations, so page at one pinned block height.
+    function assignedNamespaceCount() external view returns (uint256);
+    function assignedNamespaces(uint256 offset, uint256 limit) external view returns (uint256[] memory);
 
     // Events
-    event AssignmentProposed(uint256 indexed namespaceId, address indexed proposer, address[] operators, uint256 readyAt);
-    event AssignmentProposalCancelled(uint256 indexed namespaceId, address indexed proposer, bool autoCleared);
-    event AssignmentActivated(uint256 indexed namespaceId, address[] operators);
-    event AssignmentRevoked(uint256 indexed namespaceId, address indexed operator, address indexed by);
-    event BlacklistedAssignmentPruned(uint256 indexed namespaceId, address indexed operator, address indexed pruner);
+    event VettingRequested(address indexed publisher, uint256 readyAt);
+    event VettingRequestCancelled(address indexed publisher);
+    event PublisherVetted(address indexed publisher, bool vetted, address indexed by);
+    event OriginAdded(uint256 indexed namespaceId, address indexed operator, address indexed by);
+    event OriginRemoved(uint256 indexed namespaceId, address indexed operator, address indexed by);
+    event BlacklistedOriginPruned(uint256 indexed namespaceId, address indexed operator, address indexed pruner);
 }
 ```
 
+`OriginAdded` is the only "origin seated" event. An off-chain consumer treats each event as a signal to re-read `getOrigins(namespaceId)`, not as a delta to apply — see [ADR 022 § FIND_VALUE Flow](022-content-discovery.md#adr-022--content-discovery-at-scale).
+
 ### Edge cases
 
-- **Empty operator array (`operators.length == 0`)** — `proposeAssignment` reverts. `revokeAssignment` is the explicit removal path; a zero-length proposal would silently masquerade as a removal and obscure intent.
-- **Proposal expiry** — none. Pending proposals sit indefinitely until `activateAssignment` (governance) or `cancelAssignmentProposal` (publisher). If governance is unresponsive, the publisher cancels and re-proposes; no expiry timer.
-- **Re-proposal while a proposal is already pending** — `proposeAssignment` overwrites the existing pending proposal and resets `readyAt` to `block.timestamp + assignmentTimelock`. The old proposal is discarded; only the latest is observable. Emits `AssignmentProposalCancelled` (with `autoCleared = true`) for the discarded proposal followed by `AssignmentProposed` for the new one.
-- **Activation-revert auto-clear** — when `activateAssignment` reverts because pending operators became inactive or blacklisted during the timelock window, the pending proposal is cleared and `AssignmentProposalCancelled(autoCleared=true)` fires; the publisher submits a fresh proposal without an explicit cancellation call.
-- **`ContentBlacklist` unbound during the deployment window** — until `setContentBlacklist` is called post-deploy (see [ADR 016 § Post-Deployment Initialization](016-contract-interactions.md#post-deployment-initialization)), `activateAssignment` skips the blacklist check and validates only against `CapacityBond.isActive`. Once set the check is mandatory thereafter; `setContentBlacklist(address(0))` reverts to prevent regressing into the deployment-window state. `pruneBlacklistedAssignment` reverts until the binding is set.
-- **`revokeAssignment` of a non-member operator** — reverts. Typo protection; the explicit error surfaces accidental address mismatches that would otherwise pass silently.
+- **Vetting request expiry** — none. A pending request sits indefinitely until `grantVetting` (governance) or `cancelVettingRequest` (publisher). If governance is unresponsive, the publisher cancels; no expiry timer.
+- **`requestVetting` from an address that owns no namespace** — reverts. Vetting authorizes a publisher to seat origins for its own namespaces, so an address with no namespace has nothing to authorize.
+- **Un-vetting a publisher with live origins** — the seated origins stay. Un-vetting stops new `addOrigin` calls immediately, and governance removes the live origins one at a time with `removeOrigin`. Eviction from every namespace in one call is unbounded in the publisher's namespace count, for the same reason `ContentBlacklist.addOperator` does not cross-call — see [§ Interaction with ContentBlacklist](#interaction-with-contentblacklist).
+- **Namespace transferred away during the vetting window** — `grantVetting` still succeeds. Vetting is a property of the wallet and seats nothing on its own; `addOrigin` checks namespace ownership separately on every call, so a publisher with no namespaces can seat no origins.
+- **`addOrigin` for an operator that is already seated** — reverts `DuplicateOperator`. Seating is a delta, so a repeat add is a caller error, not a no-op.
+- **`ContentBlacklist` unbound during the deployment window** — until `setContentBlacklist` is called post-deploy (see [ADR 016 § Post-Deployment Initialization](016-contract-interactions.md#post-deployment-initialization)), `addOrigin` skips the blacklist check and validates only against `CapacityBond.isActive`. Once set the check is mandatory thereafter; `setContentBlacklist(address(0))` reverts to prevent regressing into the deployment-window state. `pruneBlacklistedOrigin` reverts until the binding is set.
+- **`removeOrigin` of a non-member operator** — reverts. Typo protection; the explicit error surfaces accidental address mismatches that would otherwise pass silently.
 
 ### Lifecycle
 
-1. **Publisher proposal.** The publisher calls `proposeAssignment(namespaceId, operators)`. The contract validates that the proposer owns the namespace, that every candidate is currently active in `CapacityBond`, that `operators.length >= 1`, and that the operator count does not exceed `maxOriginsPerNamespace`. The proposal enters a pending state with `readyAt = block.timestamp + assignmentTimelock` (governance-bounded between 24 hours and 14 days; see [ADR 009](009-governance.md#adr-009-governance-model)).
-2. **Governance ratification.** Governance reviews the proposal off-chain during the timelock window. After it elapses, a governance proposal calls `activateAssignment(namespaceId)`. Before replacing the active set, activation re-checks every pending operator against `CapacityBond.isActive` and `ContentBlacklist.isOriginBlacklisted` so a proposal cannot go live with operators that became inactive or were blacklisted during the delay window; if any operator now fails validation, activation reverts and the publisher must submit a fresh proposal. Successful activation replaces the namespace's authorized operator set atomically.
-3. **Operator notification.** Operators in the activated set are now authorized to act as origins for the namespace. They configure their origin store locally and begin serving the namespace's content. The wire protocol does not distinguish origins from cache nodes at probe time — origin status is a publisher-level commitment surfaced via `getOrigins(namespaceId)` for off-chain consumers.
-4. **Revocation.** A publisher may unilaterally remove an operator from their own namespace's set (e.g., the operator is performing poorly). Governance may revoke any operator from any namespace via the standard proposal path (e.g., the operator is misbehaving but has not yet crossed the blacklist threshold). Blacklisting (`ContentBlacklist.addOperator`) takes effect via runtime checks rather than a cross-call — see [§ Interaction with ContentBlacklist](#interaction-with-contentblacklist).
+1. **Publisher vetting.** The publisher calls `requestVetting()`. Governance reviews the publisher off-chain during the timelock window (governance-bounded between 24 hours and 14 days; see [ADR 009](009-governance.md#adr-009-governance-model)) and then calls `grantVetting(publisher)`. The vetting is per wallet and covers every namespace the publisher owns, now and later. Governance can skip the wait with `setPublisherVetted(publisher, true)`.
+2. **Origin seating.** The vetted publisher calls `addOrigin(namespaceId, operator)` for each operator it wants. The contract validates ownership of the namespace, the publisher's vetted status, and that operator's activity, blacklist status, uniqueness, and the per-namespace cap. The operator is authorized when the transaction confirms.
+3. **Operator notification.** Seated operators are now authorized to act as origins for the namespace. They configure their origin store locally and begin serving the namespace's content. The wire protocol does not distinguish origins from cache nodes at probe time — origin status is a publisher-level commitment surfaced via `getOrigins(namespaceId)` for off-chain consumers.
+4. **Removal.** A publisher may unilaterally unseat an operator from its own namespace (e.g., the operator is performing poorly). Governance may unseat any operator from any namespace, and may un-vet the publisher to stop further seating (e.g., the publisher is misbehaving but has not yet crossed the blacklist threshold). Blacklisting (`ContentBlacklist.addOperator`) takes effect via runtime checks rather than a cross-call — see [§ Interaction with ContentBlacklist](#interaction-with-contentblacklist).
 
-The two-step propose-then-ratify flow is deliberate: it gives publishers agency over which operators they trust (publishers know their content best) while keeping the DAO as the authority that confirms the assignment is consistent with protocol-wide policy (e.g., not concentrating too many namespaces on a small operator set, not assigning to operators with poor reputation). Either party can refuse to advance the flow — publishers by not proposing, governance by not ratifying — and the namespace simply continues with its existing assignment (or remains unassigned).
+Splitting the two decisions is deliberate. Publishers know their content best, so they choose which operators serve it; the DAO decides whether a publisher is trustworthy at all, which is the question that actually needs protocol-wide policy. The backstops are reactive rather than preventive: governance removes a bad origin, un-vets a bad publisher, or blacklists a bad operator, and any of the three takes effect without waiting for the other. Content integrity does not depend on any of this — clients verify bytes against the BLAKE3 address regardless of who served them ([ADR 002](002-content-addressing.md#adr-002-content-addressing)).
 
 ### Namespace 0
 
-`namespaceId == 0` has no publisher and no authorized origins. `OriginAssignment` holds no set for it: `getOrigins(0)` is empty and `isAuthorizedOrigin(0, op)` is always false. Namespace-0 content is served best-effort from cache or DHT-discovered holders ([ADR 002 § Namespace 0](002-content-addressing.md#namespace-0)); the origin role does not apply to it.
+`namespaceId == 0` has no publisher and no authorized origins. `OriginAssignment` holds no set for it: `getOrigins(0)` is empty and `isAuthorizedOrigin(0, op)` is always false. `addOrigin(0, op)` reverts for every caller, because `ownerOf(0)` is the zero address. Namespace-0 content is served best-effort from cache or DHT-discovered holders ([ADR 002 § Namespace 0](002-content-addressing.md#namespace-0)); the origin role does not apply to it.
 
 ### Unassigned namespaces
 
-A registered namespace with no activated assignment is **unassigned**. No operator is authorized as origin for its content, but the protocol still permits cache-only serving from any bonded operator that happens to hold the blob — see [ADR 005 § cdn/probe/v1](005-protocol.md#cdnprobev1--latency-probe). A publisher who never proposes an assignment prevents any new origin from picking up the namespace's content from canonical storage; cached copies eventually expire. This is by design — it lets a publisher withdraw a content set from the network by leaving its namespace unassigned or revoking its origins.
+A registered namespace with no seated origin is **unassigned**. No operator is authorized as origin for its content, but the protocol still permits cache-only serving from any bonded operator that happens to hold the blob — see [ADR 005 § cdn/probe/v1](005-protocol.md#cdnprobev1--latency-probe). A publisher who never seats an origin prevents any new origin from picking up the namespace's content from canonical storage; cached copies eventually expire. This is by design — it lets a publisher withdraw a content set from the network by leaving its namespace unassigned or unseating its origins.
 
 ### Duplicate-address rejection
 
-The contract rejects proposals whose `operators` array contains duplicate addresses. Without this, a publisher could submit `[A, A, A]` and concentrate origin responsibility on one operator while appearing to commit to multiple. Activation also re-validates that every pending operator is still active and not blacklisted before the set goes live. Operator-set sizing — including how many operators a publisher commits per namespace — is a publisher/governance policy decision, not a contract invariant; the protocol does not enforce a redundancy floor beyond the requirement that `proposeAssignment` contain at least one operator (use `revokeAssignment` for explicit removal).
+The contract rejects an `addOrigin` for an operator already seated in the namespace. Without this, a publisher could seat `A` three times and concentrate origin responsibility on one operator while appearing to commit to multiple. Operator-set sizing — including how many operators a publisher commits per namespace — is a publisher/governance policy decision, not a contract invariant; the protocol does not enforce a redundancy floor.
 
 ### Cross-contract integration
 
-- `OriginAssignment` reads `PublisherRegistry.ownerOf(namespaceId)` to validate proposer ownership.
-- `OriginAssignment` reads `CapacityBond.isActive(operator)` to validate origin candidates at proposal time. The check is opportunistic, not enforced at probe time — an operator who unbonds mid-assignment is filtered by clients via the standard bond-active check, not by `OriginAssignment` (avoiding expensive cross-contract checks on every assignment lookup).
-- `OriginAssignment.pruneBlacklistedAssignment` reads `ContentBlacklist.isOriginBlacklisted(operator)` to decide whether to remove an entry. Permissionless callers can clean up storage one (`namespaceId`, operator) pair at a time.
+- `OriginAssignment` reads `PublisherRegistry.ownerOf(namespaceId)` to validate that the caller owns the namespace it seats or unseats an origin for.
+- `OriginAssignment` reads `PublisherRegistry.namespaceCount(publisher)` to validate that a `requestVetting` caller is a publisher at all.
+- `OriginAssignment` reads `CapacityBond.isActive(operator)` to validate an origin candidate at seating time. The check is opportunistic, not enforced at probe time — an operator who unbonds while seated is filtered by clients via the standard bond-active check, not by `OriginAssignment` (avoiding expensive cross-contract checks on every assignment lookup).
+- `OriginAssignment` reads `ContentBlacklist.isOriginBlacklisted(operator)` (and the operator mapping) both to reject a blacklisted candidate at seating time and to decide whether `pruneBlacklistedOrigin` may remove an entry. Permissionless callers can clean up storage one (`namespaceId`, operator) pair at a time.
 - `ContentBlacklist.addOperator(operator)` does not call into `OriginAssignment` — see [§ Interaction with ContentBlacklist](#interaction-with-contentblacklist) below for the rationale and the runtime-check pattern.
 
 ### Interaction with ContentBlacklist
 
 `ContentBlacklist.addOperator(operator)` does **not** call `OriginAssignment` to evict the operator from every namespace. The naïve approach — iterate every namespace the operator is assigned to and remove them in one transaction — is unbounded: an operator in N namespaces costs O(N) storage writes, and a prolific operator could exceed the block gas limit, blocking the blacklist transaction entirely.
 
-Off-chain consumers of `OriginAssignment.getOrigins(namespaceId)` (clients selecting peers for first-fetch, off-chain monitors checking publisher availability commitments) cross-reference each returned operator against `ContentBlacklist.isOriginBlacklisted` and treat blacklisted entries as unauthorized regardless of stale `OriginAssignment` state. Storage cleanup happens lazily and permissionlessly via `OriginAssignment.pruneBlacklistedAssignment(namespaceId, operator)`: each call removes one entry; anyone may call it (the contract checks `ContentBlacklist.isOriginBlacklisted` itself, so the caller cannot grief by claiming a non-blacklisted operator is blacklisted). Reputation services and other public-good infrastructure will likely run pruning jobs.
+Off-chain consumers of `OriginAssignment.getOrigins(namespaceId)` (clients selecting peers for first-fetch, off-chain monitors checking publisher availability commitments) cross-reference each returned operator against `ContentBlacklist.isOriginBlacklisted` and treat blacklisted entries as unauthorized regardless of stale `OriginAssignment` state. Storage cleanup happens lazily and permissionlessly via `OriginAssignment.pruneBlacklistedOrigin(namespaceId, operator)`: each call removes one entry; anyone may call it (the contract checks `ContentBlacklist.isOriginBlacklisted` itself, so the caller cannot grief by claiming a non-blacklisted operator is blacklisted). Reputation services and other public-good infrastructure will likely run pruning jobs.
 
 Net: blacklisting an operator is O(1) on-chain (one ejection call) and storage cleanup is O(1) per call with no transaction-size limit — no design path requires iterating an operator's full namespace set.
 
 ### Permissionless property
 
-This authority extends the DAO's role from negative-only (blacklisting) to positive-and-negative (assignment + blacklisting) for registered namespaces. Cache-only serving remains permissionless — any bonded operator may fetch cached blobs from authorized origins and re-serve them regardless of `OriginAssignment` membership; only the *origin* role becomes DAO-gated, via publisher-proposed sets. Namespace 0 has no authorized origins at all. See [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh) for the updated permissionless-role model.
+This authority extends the DAO's role from negative-only (blacklisting) to positive-and-negative (assignment + blacklisting) for registered namespaces. Cache-only serving remains permissionless — any bonded operator may fetch cached blobs from authorized origins and re-serve them regardless of `OriginAssignment` membership; only the *origin* role becomes DAO-gated, via the publisher-vetting plane. Namespace 0 has no authorized origins at all. See [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh) for the updated permissionless-role model.
 
 ## Node Behavior
 

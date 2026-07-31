@@ -1,9 +1,10 @@
 //! CLI argument parsing for `decdn publish` — the origin-publisher control
-//! plane (issue #1029, ADR 002 / ADR 011). Two on-chain writes:
-//! `namespace create` (`PublisherRegistry.createNamespace`) and `assign`
-//! (`OriginAssignment.proposeAssignment`, propose-only; governance activates
-//! separately). Content is bound to a namespace off-chain at fetch time, so
-//! there is no per-hash on-chain claim.
+//! plane (issues #1029 / #1491, ADR 002 / ADR 011). Four on-chain writes:
+//! `namespace create` (`PublisherRegistry.createNamespace`), `request-vetting`
+//! (`OriginAssignment.requestVetting`, the one governance-gated step), and then
+//! `assign` / `revoke` (`OriginAssignment.addOrigin` / `removeOrigin`), which a
+//! vetted publisher self-serves with no waiting. Content is bound to a namespace
+//! off-chain at fetch time, so there is no per-hash on-chain claim.
 
 use clap::{Args, Subcommand};
 
@@ -12,7 +13,7 @@ use super::common::CommonChainArgs;
 /// Parse a namespace id, rejecting the reserved `0`. Namespace ids start at 1
 /// (`PublisherRegistry` pre-increments from 0, and id 0 is reserved for content
 /// published without a namespace), so `0` can never be owned by a publisher —
-/// failing fast here saves the gas of a guaranteed-revert `proposeAssignment`
+/// failing fast here saves the gas of a guaranteed-revert `addOrigin`
 /// transaction, matching the client-side duplicate-operator guard.
 fn parse_namespace_id(s: &str) -> Result<u64, String> {
     let id: u64 = s
@@ -37,9 +38,15 @@ pub struct PublishArgs {
 pub enum PublishCommand {
     /// Create a new namespace owned by the signer (`createNamespace`).
     Namespace(NamespaceArgs),
-    /// Propose an authorized-origin operator set for a namespace
-    /// (`proposeAssignment`). Propose-only: inert until the DAO ratifies.
+    /// Ask governance to vet the signer as a publisher (`requestVetting`).
+    /// One-time and per wallet: once vetted, `assign` and `revoke` take effect
+    /// immediately for every namespace the signer owns.
+    RequestVetting(RequestVettingArgs),
+    /// Seat authorized origins for a namespace (`addOrigin` per operator).
+    /// Requires a vetted signer; effective immediately.
     Assign(AssignArgs),
+    /// Unseat one authorized origin from a namespace (`removeOrigin`).
+    Revoke(RevokeArgs),
 }
 
 /// `decdn publish namespace <subcommand>` (nested to match the issue's
@@ -65,17 +72,40 @@ pub struct NamespaceCreateArgs {
     pub chain: PublishChainArgs,
 }
 
+/// `decdn publish request-vetting` flags.
+#[derive(Args, Debug)]
+pub struct RequestVettingArgs {
+    #[command(flatten)]
+    pub chain: PublishChainArgs,
+}
+
 /// `decdn publish assign <namespace> <ops…>` flags.
 #[derive(Args, Debug)]
 pub struct AssignArgs {
-    /// Namespace id whose authorized-origin set is being proposed.
+    /// Namespace id whose authorized-origin set is being extended.
     #[arg(value_name = "NAMESPACE", value_parser = parse_namespace_id)]
     pub namespace: u64,
 
     /// Operator Ethereum addresses to authorize. Each must be an active
-    /// bonded node. At least one; order-insensitive; no duplicates.
+    /// bonded node and is seated by its own transaction, in the order given.
+    /// At least one; no duplicates.
     #[arg(value_name = "OPERATORS", required = true, num_args = 1..)]
     pub operators: Vec<String>,
+
+    #[command(flatten)]
+    pub chain: PublishChainArgs,
+}
+
+/// `decdn publish revoke <namespace> <operator>` flags.
+#[derive(Args, Debug)]
+pub struct RevokeArgs {
+    /// Namespace id to unseat the origin from.
+    #[arg(value_name = "NAMESPACE", value_parser = parse_namespace_id)]
+    pub namespace: u64,
+
+    /// Operator Ethereum address to unseat. Must currently be authorized.
+    #[arg(value_name = "OPERATOR")]
+    pub operator: String,
 
     #[command(flatten)]
     pub chain: PublishChainArgs,
@@ -118,6 +148,16 @@ mod tests {
     #[test]
     fn assign_rejects_reserved_namespace_zero() {
         let err = Cli::try_parse_from(["decdn", "publish", "assign", "0", "0xabc"])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("0 is reserved"), "{err}");
+    }
+
+    #[test]
+    fn revoke_takes_exactly_one_operator_and_rejects_namespace_zero() {
+        assert!(Cli::try_parse_from(["decdn", "publish", "revoke", "7"]).is_err());
+        assert!(Cli::try_parse_from(["decdn", "publish", "revoke", "7", "0xa", "0xb"]).is_err());
+        let err = Cli::try_parse_from(["decdn", "publish", "revoke", "0", "0xabc"])
             .unwrap_err()
             .to_string();
         assert!(err.contains("0 is reserved"), "{err}");

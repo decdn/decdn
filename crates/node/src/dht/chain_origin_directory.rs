@@ -69,14 +69,14 @@
 //!
 //! A narrower drift source: a per-event `getOrigins` or `nodeIdOf` RPC failure
 //! is surfaced by `decdn_origin_directory_watcher_resolve_failures_total`
-//! (and a `warn!`). On an **activation** event the cache fail-closes for the
-//! affected namespace (an un-added operator authorizes nothing); the failed
+//! (and a `warn!`). On a **seating** event (`OriginAdded`) the cache fail-closes
+//! for the affected namespace (an un-added operator authorizes nothing); the failed
 //! namespace is recorded and its `getOrigins` re-read retried at the end of every
 //! poll tick until it succeeds (the tick fails → backs off while any retry is
 //! outstanding), so the hole heals without waiting for another same-namespace
 //! event — necessary because the scan cursor may already have advanced past the
-//! triggering log. On a **removal** event (revoke / prune) a failed re-read
-//! falls back to a precise delta removal from the event payload, so a revoke is
+//! triggering log. On a **removal** event (remove / prune) a failed re-read
+//! falls back to a precise delta removal from the event payload, so a removal is
 //! never weaker than a direct delete even when `getOrigins` is unavailable (and
 //! the namespace is still queued for the retry re-read).
 //! `decdn_origin_directory_operator_count` tracks the live authorised-origin
@@ -110,7 +110,7 @@ use decdn_incentive::origin_assignment::OriginAssignment;
 // Event structs imported directly so the topic0 dispatch stays under the 100-col
 // width (the fully-qualified `OriginAssignment::<Event>` paths overflow it).
 use decdn_incentive::origin_assignment::OriginAssignment::{
-    AssignmentActivated, AssignmentRevoked, BlacklistedAssignmentPruned,
+    BlacklistedOriginPruned, OriginAdded, OriginRemoved,
 };
 
 /// How many namespace ids `bootstrap_cache` reads per `assignedNamespaces` call.
@@ -127,7 +127,7 @@ const NAMESPACE_PAGE_SIZE: u64 = 100;
 #[derive(Debug, Default)]
 struct DirectoryCache {
     /// `namespaceId → authorized operator addresses`. Snapshotted via `getOrigins`
-    /// and kept current by authoritative `getOrigins` re-reads on each assignment
+    /// and kept current by authoritative `getOrigins` re-reads on each origin
     /// event — never incremental deltas (see the module header). The only
     /// per-operator delete is the fail-closed [`delta_remove_origin`] fallback
     /// when a removal-triggered re-read errors. Namespace 0 is never inserted (it
@@ -290,9 +290,9 @@ impl ChainOriginDirectory {
             Filter::new()
                 .address(origin_assignment_addr)
                 .event_signature(vec![
-                    AssignmentActivated::SIGNATURE_HASH,
-                    AssignmentRevoked::SIGNATURE_HASH,
-                    BlacklistedAssignmentPruned::SIGNATURE_HASH,
+                    OriginAdded::SIGNATURE_HASH,
+                    OriginRemoved::SIGNATURE_HASH,
+                    BlacklistedOriginPruned::SIGNATURE_HASH,
                 ]),
             cursor_start(snapshot_block),
             event_poll_interval,
@@ -404,8 +404,8 @@ impl<P: Provider + Clone> OriginSink<P> {
     #[allow(clippy::cognitive_complexity)]
     async fn apply_origin_event(&mut self, log: &Log) {
         match log.topic0().copied() {
-            Some(sig) if sig == AssignmentActivated::SIGNATURE_HASH => {
-                match AssignmentActivated::decode_log_data(&log.inner.data) {
+            Some(sig) if sig == OriginAdded::SIGNATURE_HASH => {
+                match OriginAdded::decode_log_data(&log.inner.data) {
                     Ok(event) => {
                         on_namespace_changed(
                             &self.contracts,
@@ -424,12 +424,12 @@ impl<P: Provider + Clone> OriginSink<P> {
                         // silently dropping every event of a type — is observable on
                         // dashboards, not warn-log-only.
                         self.metrics.origin_directory_watcher_resolve_failure();
-                        warn!(%err, "skipping undecodable AssignmentActivated log");
+                        warn!(%err, "skipping undecodable OriginAdded log");
                     }
                 }
             }
-            Some(sig) if sig == AssignmentRevoked::SIGNATURE_HASH => {
-                match AssignmentRevoked::decode_log_data(&log.inner.data) {
+            Some(sig) if sig == OriginRemoved::SIGNATURE_HASH => {
+                match OriginRemoved::decode_log_data(&log.inner.data) {
                     Ok(event) => {
                         on_origin_removed(
                             &self.contracts,
@@ -442,16 +442,16 @@ impl<P: Provider + Clone> OriginSink<P> {
                         .await;
                     }
                     Err(err) => {
-                        // See the AssignmentActivated arm: meter decode failures so
-                        // an ABI-drift storm that silently stops applying revokes is
+                        // See the OriginAdded arm: meter decode failures so an
+                        // ABI-drift storm that silently stops applying removals is
                         // visible, not warn-log-only.
                         self.metrics.origin_directory_watcher_resolve_failure();
-                        warn!(%err, "skipping undecodable AssignmentRevoked log");
+                        warn!(%err, "skipping undecodable OriginRemoved log");
                     }
                 }
             }
-            Some(sig) if sig == BlacklistedAssignmentPruned::SIGNATURE_HASH => {
-                match BlacklistedAssignmentPruned::decode_log_data(&log.inner.data) {
+            Some(sig) if sig == BlacklistedOriginPruned::SIGNATURE_HASH => {
+                match BlacklistedOriginPruned::decode_log_data(&log.inner.data) {
                     Ok(event) => {
                         on_origin_removed(
                             &self.contracts,
@@ -464,11 +464,11 @@ impl<P: Provider + Clone> OriginSink<P> {
                         .await;
                     }
                     Err(err) => {
-                        // See the AssignmentActivated arm: meter decode failures so
-                        // an ABI-drift storm that silently stops applying prunes is
+                        // See the OriginAdded arm: meter decode failures so an
+                        // ABI-drift storm that silently stops applying prunes is
                         // visible, not warn-log-only.
                         self.metrics.origin_directory_watcher_resolve_failure();
-                        warn!(%err, "skipping undecodable BlacklistedAssignmentPruned log");
+                        warn!(%err, "skipping undecodable BlacklistedOriginPruned log");
                     }
                 }
             }
@@ -483,7 +483,7 @@ impl<P: Provider + Clone> OriginSink<P> {
 /// bootstrap enumeration was taken at, and persist nothing.
 ///
 /// The cursor used to be durable so a restart could resume the historical
-/// `AssignmentActivated` replay part-way. There is no historical replay left to
+/// `OriginAdded` replay part-way. There is no historical replay left to
 /// resume: every boot re-reads the namespace set outright, which covers the
 /// downtime gap by construction and needs no reorg rewind — a checkpoint written
 /// before a reorg was the only reason one was needed. This matches the
@@ -585,7 +585,7 @@ where
     let mut cache = DirectoryCache::default();
 
     // 1. Discover the namespace set by reading it. This used to be a windowed
-    //    `AssignmentActivated` replay from a configured floor — the whole chain
+    //    `OriginAdded` replay from a configured floor — the whole chain
     //    on a cold store — purely because the key set was not enumerable on
     //    chain. Membership was always authoritative via `getOrigins`; only
     //    "which ids exist" had to come from logs. `assignedNamespaces` closes
@@ -600,11 +600,11 @@ where
     let latest = snapshot_block;
 
     // 2. namespace → operators, via getOrigins point reads (authoritative
-    //    current set; avoids replaying assignment-mutation ordering). A namespace
-    //    whose set was revoked to empty simply caches empty.
+    //    current set; avoids replaying seat/unseat ordering). A namespace whose
+    //    set was emptied simply caches empty.
     for ns in namespaces {
         // Namespace 0 has no authorized origins by construction (`ownerOf(0) == 0`,
-        // so `AssignmentActivated(0, …)` is unreachable). Defend the invariant here
+        // so `OriginAdded(0, …)` is unreachable). Defend the invariant here
         // rather than trust the ABI-decoded event field to never be 0 — a decode
         // drift must not be able to seat operators under `NO_NAMESPACE` and open the
         // gate for every request (ADR 002 §Namespace 0).
@@ -712,7 +712,7 @@ async fn resync_namespace<R: OriginChainReads>(
     namespace: U256,
 ) -> Result<()> {
     // Namespace 0 authorizes nothing by construction (`ownerOf(0) == 0`), so an
-    // `AssignmentActivated/Revoked(0, …)` is unreachable on-chain. Defend it here
+    // `OriginAdded/Removed(0, …)` is unreachable on-chain. Defend it here
     // rather than trust the decoded event field to never be 0 — seating operators
     // under `NO_NAMESPACE` would open the pull-through gate for every request
     // (ADR 002 §Namespace 0).
@@ -729,7 +729,7 @@ async fn resync_namespace<R: OriginChainReads>(
     Ok(())
 }
 
-/// An addition/replace event for `namespace` (activation). Re-read the
+/// A seating event for `namespace` (`OriginAdded`). Re-read the
 /// authoritative set; on RPC failure, defer — an un-added operator authorizes
 /// nothing, so failing closed is safe — and record the namespace for the
 /// `on_tick_complete` retry.
@@ -743,13 +743,13 @@ async fn on_namespace_changed<R: OriginChainReads>(
     if let Err(err) = resync_namespace(reads, cache, metrics, namespace).await {
         metrics.origin_directory_watcher_resolve_failure();
         deferred.insert(namespace);
-        warn!(err = %sanitize_err_chain(&err), %namespace, "getOrigins re-read failed on activation; deferred for retry");
+        warn!(err = %sanitize_err_chain(&err), %namespace, "getOrigins re-read failed on seating; deferred for retry");
     }
 }
 
-/// A removal event — `AssignmentRevoked` / `BlacklistedAssignmentPruned`.
+/// A removal event — `OriginRemoved` / `BlacklistedOriginPruned`.
 /// Re-read the authoritative set; on RPC failure, fall back to the precise delta
-/// removal from the event payload so a revoke is **never weaker** than a direct
+/// removal from the event payload so a removal is **never weaker** than a direct
 /// delete even when `getOrigins` is unavailable — and still record the namespace
 /// for the `on_tick_complete` retry, since the delta fallback leaves the rest of
 /// the cached set potentially stale.
@@ -821,7 +821,7 @@ async fn resolve_and_store_operators<R: OriginChainReads>(
 
 /// Distinct operator addresses currently authorised as origins — the union of
 /// every namespace's operator set. Unlike the monotonic `operator_node` binding
-/// cache, this rises on activate and falls on revoke/prune/replace, so it tracks
+/// cache, this rises on a seat and falls on a remove/prune, so it tracks
 /// the directory's live authorised-origin surface.
 fn authorized_operator_count(c: &DirectoryCache) -> usize {
     c.origins_of_ns
@@ -1124,7 +1124,7 @@ mod tests {
     //      the pure cache the way the watcher's apply helpers mutate it. ----
 
     #[test]
-    fn assignment_activated_replaces_namespace_set() {
+    fn origin_added_replaces_namespace_set() {
         let mut c = cache_with(&[(7, &[addr(0xA)])], &[]);
         // Wholesale replace 7's set with {B, C}.
         c.origins_of_ns
@@ -1135,7 +1135,7 @@ mod tests {
     }
 
     #[test]
-    fn revoke_removes_single_operator() {
+    fn origin_removed_removes_single_operator() {
         let mut c = cache_with(&[(7, &[addr(0xA), addr(0xB)])], &[]);
         c.origins_of_ns.get_mut(&ns(7)).unwrap().remove(&addr(0xA));
         let set = &c.origins_of_ns[&ns(7)];
@@ -1205,7 +1205,7 @@ mod tests {
                 .any(|l| l == "decdn_origin_directory_operator_count 2"),
             "gauge should reflect authorised count 2:\n{text}"
         );
-        // Revoke B from ns 7 and re-publish: the gauge must DROP (the bug the
+        // Unseat B from ns 7 and re-publish: the gauge must DROP (the bug the
         // fix addressed — the old gauge used the monotonic binding cache).
         c.origins_of_ns.get_mut(&ns(7)).unwrap().remove(&addr(0xB));
         metrics.origin_directory_operator_count(authorized_operator_count(&c));
@@ -1213,7 +1213,7 @@ mod tests {
         assert!(
             text.lines()
                 .any(|l| l == "decdn_origin_directory_operator_count 1"),
-            "gauge should drop to 1 after a revoke:\n{text}"
+            "gauge should drop to 1 after a removal:\n{text}"
         );
     }
 
@@ -1222,7 +1222,7 @@ mod tests {
         // Distinct addresses across namespaces: {A, B} in ns 7, {C} in ns 8 = 3.
         let mut c = cache_with(&[(7, &[addr(0xA), addr(0xB)]), (8, &[addr(0xC)])], &[]);
         assert_eq!(authorized_operator_count(&c), 3);
-        // A revoke must DECREASE the count (the bug this fix addresses: the old
+        // A removal must DECREASE the count (the bug this fix addresses: the old
         // gauge counted the monotonic binding cache and never dropped).
         c.origins_of_ns.get_mut(&ns(7)).unwrap().remove(&addr(0xB));
         assert_eq!(authorized_operator_count(&c), 2, "B removed → {{A, C}}");
@@ -1234,15 +1234,15 @@ mod tests {
     //      re-read, not a payload-delta apply. Driven by the StubReads seam. ----
 
     #[tokio::test]
-    async fn reorder_revoke_then_activate_converges_to_chain_truth() {
+    async fn reorder_remove_then_add_converges_to_chain_truth() {
         // Scenario 2: both events re-read authoritative getOrigins(7). Chain truth
-        // is {A} (C already revoked on-chain), so regardless of which event the
+        // is {A} (C already unseated on-chain), so regardless of which event the
         // select observes first, C must not be resurrected.
         let metrics = Arc::new(Metrics::new());
         let reads = StubReads::new()
             .origins(&[(7, &[addr(0xA)])])
             .bindings(&[(addr(0xA), nid(0xA))]);
-        // revoke-first then activate (the dangerous order).
+        // remove-first then add (the dangerous order).
         let cache = shared(cache_with(
             &[(7, &[addr(0xA), addr(0xC)])],
             &[(addr(0xA), nid(0xA)), (addr(0xC), nid(0xC))],
@@ -1253,10 +1253,10 @@ mod tests {
         read_cache(&cache, |c| {
             assert!(
                 !c.origins_of_ns[&ns(7)].contains(&addr(0xC)),
-                "revoke-then-activate"
+                "remove-then-add"
             );
         });
-        // activate-first then revoke (the other order) — same result.
+        // add-first then remove (the other order) — same result.
         let cache = shared(cache_with(
             &[(7, &[addr(0xA), addr(0xC)])],
             &[(addr(0xA), nid(0xA)), (addr(0xC), nid(0xC))],
@@ -1267,15 +1267,15 @@ mod tests {
         read_cache(&cache, |c| {
             assert!(
                 !c.origins_of_ns[&ns(7)].contains(&addr(0xC)),
-                "activate-then-revoke"
+                "add-then-remove"
             );
         });
     }
 
     #[tokio::test]
     async fn removal_falls_back_to_delta_when_get_origins_fails() {
-        // A revoke whose authoritative re-read errors must STILL drop the operator
-        // via the precise delta fallback (a revoke is never weaker than today).
+        // A removal whose authoritative re-read errors must STILL drop the operator
+        // via the precise delta fallback (a removal is never weaker than today).
         let metrics = Arc::new(Metrics::new());
         let cache = shared(cache_with(
             &[(7, &[addr(0xA), addr(0xC)])],
@@ -1287,7 +1287,7 @@ mod tests {
         read_cache(&cache, |c| {
             assert!(
                 !c.origins_of_ns[&ns(7)].contains(&addr(0xC)),
-                "delta fallback must remove the revoked operator despite the RPC failure"
+                "delta fallback must remove the unseated operator despite the RPC failure"
             );
             assert!(
                 c.origins_of_ns[&ns(7)].contains(&addr(0xA)),
@@ -1308,7 +1308,7 @@ mod tests {
 
     #[tokio::test]
     async fn addition_defers_safely_when_get_origins_fails() {
-        // An activation whose re-read errors leaves the set unchanged (fail-closed,
+        // A seating whose re-read errors leaves the set unchanged (fail-closed,
         // safe — an un-added operator authorizes nothing) and self-heals later.
         let metrics = Arc::new(Metrics::new());
         let cache = shared(cache_with(&[(7, &[addr(0xA)])], &[]));
@@ -1327,9 +1327,9 @@ mod tests {
         });
         assert!(
             deferred.contains(&ns(7)),
-            "failed activation re-read must queue the namespace for the tick retry"
+            "failed seating re-read must queue the namespace for the tick retry"
         );
-        // The injected failure clears → a later activation heals to {A, B}.
+        // The injected failure clears → a later seating heals to {A, B}.
         reads.fail_origins.write().unwrap().clear();
         on_namespace_changed(&reads, &cache, &metrics, &mut deferred, ns(7)).await;
         read_cache(&cache, |c| {
@@ -1343,7 +1343,7 @@ mod tests {
     #[tokio::test]
     async fn namespace_zero_event_never_seats_operators() {
         // Defense-in-depth guard (`resync_namespace`): even if a decode drift
-        // produced an `AssignmentActivated(0, …)` and `getOrigins(0)` answered
+        // produced an `OriginAdded(0, …)` and `getOrigins(0)` answered
         // with operators, namespace 0 (`NO_NAMESPACE`) must NEVER gain a cached
         // set — seating one would open the pull-through gate for every
         // unnamespaced request (ADR 002 §Namespace 0). This asserts the guard,
@@ -1379,7 +1379,7 @@ mod tests {
     /// POLICY PIN: the origin watcher seeds the live tail at the block its
     /// bootstrap enumeration was taken at, and persists NOTHING.
     ///
-    /// The durable cursor existed to resume a historical `AssignmentActivated`
+    /// The durable cursor existed to resume a historical `OriginAdded`
     /// replay part-way. There is no replay left to resume — every boot re-reads
     /// the namespace set — so a checkpoint here would be dead weight that could
     /// only go stale. A regression that reintroduces one fails this.

@@ -23,13 +23,22 @@ contract MockBondActivity is ICapacityBondActivity {
 
 contract MockPublisherRegistry is IPublisherRegistryOwnership {
     mapping(uint256 => address) internal _owner;
+    mapping(address => uint256) internal _count;
 
     function setOwner(uint256 ns, address o) external {
         _owner[ns] = o;
     }
 
+    function setNamespaceCount(address publisher, uint256 n) external {
+        _count[publisher] = n;
+    }
+
     function ownerOf(uint256 ns) external view override returns (address) {
         return _owner[ns];
+    }
+
+    function namespaceCount(address publisher) external view override returns (uint256) {
+        return _count[publisher];
     }
 }
 
@@ -79,6 +88,7 @@ contract OriginAssignmentTest is Test {
         oa = new OriginAssignment(bond, registry, address(blacklist), admin);
 
         registry.setOwner(NS, publisher);
+        registry.setNamespaceCount(publisher, 1);
         bond.setActive(opA, true);
         bond.setActive(opB, true);
         bond.setActive(opC, true);
@@ -86,75 +96,285 @@ contract OriginAssignmentTest is Test {
         vm.warp(1_000_000);
     }
 
-    function _ops2() internal view returns (address[] memory a) {
-        a = new address[](2);
-        a[0] = opA;
-        a[1] = opB;
+    /// Governance's instant grant — the fast setup for the origin-plane tests,
+    /// which are about seating, not about how the wallet got vetted.
+    function _vet(address p) internal {
+        vm.prank(admin);
+        oa.setPublisherVetted(p, true);
     }
 
-    function _propose(address[] memory ops) internal {
+    function _seat(address operator) internal {
         vm.prank(publisher);
-        oa.proposeAssignment(NS, ops);
+        oa.addOrigin(NS, operator);
+    }
+
+    /// A vetted publisher with two origins seated — the starting state for the
+    /// removal, prune, and enumeration tests.
+    function _vetAndSeatBoth() internal {
+        _vet(publisher);
+        _seat(opA);
+        _seat(opB);
     }
 
     // -----------------------------------------------------------------
-    // proposeAssignment
+    // Vetting — request / cancel
     // -----------------------------------------------------------------
 
-    function test_propose_storesPending() public {
-        _propose(_ops2());
-        (address[] memory ops, uint256 readyAt) = oa.getPendingAssignment(NS);
-        assertEq(ops.length, 2);
-        assertEq(ops[0], opA);
-        assertEq(readyAt, block.timestamp + TIMELOCK);
+    function test_requestVetting_storesReadyAt() public {
+        vm.prank(publisher);
+        oa.requestVetting();
+        assertEq(oa.getPendingVetting(publisher), block.timestamp + TIMELOCK);
+        assertFalse(oa.isVettedPublisher(publisher), "a request alone does not vet");
     }
 
-    function test_propose_revertsNonOwner() public {
+    /// Vetting is for publishers: an address that never created a namespace has
+    /// nothing to seat origins for, so it cannot enter the queue.
+    function test_requestVetting_revertsWithoutANamespace() public {
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(OriginAssignment.NoNamespaceOwned.selector, stranger));
+        oa.requestVetting();
+    }
+
+    function test_requestVetting_revertsWhileOneIsPending() public {
+        vm.startPrank(publisher);
+        oa.requestVetting();
+        vm.expectRevert(abi.encodeWithSelector(OriginAssignment.VettingRequestPending.selector, publisher));
+        oa.requestVetting();
+        vm.stopPrank();
+    }
+
+    function test_requestVetting_revertsWhenAlreadyVetted() public {
+        _vet(publisher);
+        vm.prank(publisher);
+        vm.expectRevert(abi.encodeWithSelector(OriginAssignment.AlreadyVetted.selector, publisher));
+        oa.requestVetting();
+    }
+
+    function test_cancelVettingRequest_clearsPending() public {
+        vm.startPrank(publisher);
+        oa.requestVetting();
+        oa.cancelVettingRequest();
+        vm.stopPrank();
+        assertEq(oa.getPendingVetting(publisher), 0);
+    }
+
+    function test_cancelVettingRequest_revertsWithoutOne() public {
+        vm.prank(publisher);
+        vm.expectRevert(abi.encodeWithSelector(OriginAssignment.NoVettingRequest.selector, publisher));
+        oa.cancelVettingRequest();
+    }
+
+    // -----------------------------------------------------------------
+    // Vetting — governance grant
+    // -----------------------------------------------------------------
+
+    function test_grantVetting_vetsAfterTimelockAndClearsPending() public {
+        vm.prank(publisher);
+        oa.requestVetting();
+        vm.warp(block.timestamp + TIMELOCK);
+
+        vm.prank(admin);
+        oa.grantVetting(publisher);
+
+        assertTrue(oa.isVettedPublisher(publisher));
+        assertEq(oa.getPendingVetting(publisher), 0);
+    }
+
+    function test_grantVetting_revertsBeforeTimelock() public {
+        vm.prank(publisher);
+        oa.requestVetting();
+        uint256 readyAt = block.timestamp + TIMELOCK;
+
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(OriginAssignment.VettingTimelockNotElapsed.selector, readyAt));
+        oa.grantVetting(publisher);
+    }
+
+    function test_grantVetting_revertsWithoutRequest() public {
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(OriginAssignment.NoVettingRequest.selector, publisher));
+        oa.grantVetting(publisher);
+    }
+
+    function test_grantVetting_onlyGovernance() public {
+        vm.prank(publisher);
+        oa.requestVetting();
+        vm.warp(block.timestamp + TIMELOCK);
+
+        vm.prank(stranger);
+        vm.expectRevert(
+            abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, stranger, GOVERNANCE_ROLE)
+        );
+        oa.grantVetting(publisher);
+    }
+
+    // -----------------------------------------------------------------
+    // Vetting — governance override
+    // -----------------------------------------------------------------
+
+    /// The instant grant also consumes any queued request, so the publisher is
+    /// not left holding a ripened one.
+    function test_setPublisherVetted_grantsInstantlyAndConsumesPending() public {
+        vm.prank(publisher);
+        oa.requestVetting();
+
+        _vet(publisher);
+
+        assertTrue(oa.isVettedPublisher(publisher));
+        assertEq(oa.getPendingVetting(publisher), 0);
+    }
+
+    /// Un-vetting must also clear a pending request — otherwise a rogue
+    /// publisher's already-ripened request would walk it straight back in.
+    function test_setPublisherVetted_unvetClearsPendingRequest() public {
+        vm.prank(publisher);
+        oa.requestVetting();
+
+        vm.prank(admin);
+        oa.setPublisherVetted(publisher, false);
+
+        assertFalse(oa.isVettedPublisher(publisher));
+        assertEq(oa.getPendingVetting(publisher), 0);
+    }
+
+    function test_setPublisherVetted_rejectsZeroAddress() public {
+        vm.prank(admin);
+        vm.expectRevert(OriginAssignment.ZeroAddress.selector);
+        oa.setPublisherVetted(address(0), true);
+    }
+
+    function test_setPublisherVetted_onlyGovernance() public {
+        vm.prank(stranger);
+        vm.expectRevert(
+            abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, stranger, GOVERNANCE_ROLE)
+        );
+        oa.setPublisherVetted(publisher, true);
+    }
+
+    // -----------------------------------------------------------------
+    // addOrigin
+    // -----------------------------------------------------------------
+
+    function test_addOrigin_seatsInstantly() public {
+        _vet(publisher);
+
+        vm.expectEmit(true, true, true, true);
+        emit OriginAssignment.OriginAdded(NS, opA, publisher);
+        vm.prank(publisher);
+        oa.addOrigin(NS, opA);
+
+        assertTrue(oa.isAuthorizedOrigin(NS, opA));
+        assertEq(oa.getOrigins(NS).length, 1);
+    }
+
+    function test_addOrigin_revertsNonOwner() public {
+        _vet(stranger);
         vm.prank(stranger);
         vm.expectRevert(abi.encodeWithSelector(OriginAssignment.NotNamespaceOwner.selector, NS, stranger));
-        oa.proposeAssignment(NS, _ops2());
+        oa.addOrigin(NS, opA);
     }
 
-    function test_propose_revertsEmpty() public {
-        address[] memory empty = new address[](0);
+    function test_addOrigin_revertsUnvettedPublisher() public {
         vm.prank(publisher);
-        vm.expectRevert(OriginAssignment.EmptyOperatorSet.selector);
-        oa.proposeAssignment(NS, empty);
+        vm.expectRevert(abi.encodeWithSelector(OriginAssignment.PublisherNotVetted.selector, publisher));
+        oa.addOrigin(NS, opA);
     }
 
-    function test_propose_revertsDuplicate() public {
-        address[] memory dup = new address[](2);
-        dup[0] = opA;
-        dup[1] = opA;
+    function test_addOrigin_revertsInactiveOperator() public {
+        _vet(publisher);
+        bond.setActive(opA, false);
+        vm.prank(publisher);
+        vm.expectRevert(abi.encodeWithSelector(OriginAssignment.OperatorNotActive.selector, opA));
+        oa.addOrigin(NS, opA);
+    }
+
+    function test_addOrigin_revertsBlacklistedOperator() public {
+        _vet(publisher);
+        blacklist.setBlacklisted(opA, true);
+        vm.prank(publisher);
+        vm.expectRevert(abi.encodeWithSelector(OriginAssignment.OperatorBlacklisted.selector, opA));
+        oa.addOrigin(NS, opA);
+    }
+
+    /// @notice M-2 — seating must also reject an operator blacklisted via the
+    ///         operator mapping (`addOperator`), not only the origin mapping.
+    function test_addOrigin_revertsOperatorBlacklistedViaOperatorMapping() public {
+        _vet(publisher);
+        blacklist.setOperatorBlacklisted(opA, true);
+        vm.prank(publisher);
+        vm.expectRevert(abi.encodeWithSelector(OriginAssignment.OperatorBlacklisted.selector, opA));
+        oa.addOrigin(NS, opA);
+    }
+
+    function test_addOrigin_revertsAlreadySeated() public {
+        _vet(publisher);
+        _seat(opA);
         vm.prank(publisher);
         vm.expectRevert(abi.encodeWithSelector(OriginAssignment.DuplicateOperator.selector, opA));
-        oa.proposeAssignment(NS, dup);
+        oa.addOrigin(NS, opA);
     }
 
-    function test_propose_revertsInactiveOperator() public {
-        bond.setActive(opB, false);
-        vm.prank(publisher);
-        vm.expectRevert(abi.encodeWithSelector(OriginAssignment.OperatorNotActive.selector, opB));
-        oa.proposeAssignment(NS, _ops2());
-    }
-
-    function test_propose_revertsTooMany() public {
+    function test_addOrigin_revertsAtCap() public {
         vm.prank(admin);
         oa.setMaxOriginsPerNamespace(1);
+        _vet(publisher);
+        _seat(opA);
+
         vm.prank(publisher);
         vm.expectRevert(abi.encodeWithSelector(OriginAssignment.TooManyOrigins.selector, uint256(2), uint256(1)));
-        oa.proposeAssignment(NS, _ops2());
+        oa.addOrigin(NS, opB);
     }
 
-    function test_propose_overwriteReplacesPending() public {
-        _propose(_ops2());
-        address[] memory one = new address[](1);
-        one[0] = opC;
+    /// Deployment window: with no `ContentBlacklist` bound, seating validates
+    /// against `CapacityBond.isActive` alone.
+    function test_addOrigin_blacklistSkippedWhenUnset() public {
+        OriginAssignment oaNoBl = new OriginAssignment(bond, registry, address(0), admin);
+        vm.prank(admin);
+        oaNoBl.setPublisherVetted(publisher, true);
+        // opA "blacklisted" in the standalone mock, but oaNoBl has no binding → check skipped.
+        blacklist.setBlacklisted(opA, true);
+
         vm.prank(publisher);
-        oa.proposeAssignment(NS, one);
-        (address[] memory ops,) = oa.getPendingAssignment(NS);
-        assertEq(ops.length, 1);
-        assertEq(ops[0], opC);
+        oaNoBl.addOrigin(NS, opA);
+        assertTrue(oaNoBl.isAuthorizedOrigin(NS, opA));
+    }
+
+    /// The #1107 regression, stated as an invariant: seating B validates B and
+    /// nothing else. A live origin A that has gone inactive AND been blacklisted
+    /// cannot block the publisher from adding a redundant origin.
+    function test_addOrigin_deltaSeatIsIndependentOfLiveOriginState() public {
+        _vet(publisher);
+        _seat(opA);
+
+        bond.setActive(opA, false);
+        blacklist.setBlacklisted(opA, true);
+
+        _seat(opB);
+
+        assertTrue(oa.isAuthorizedOrigin(NS, opB), "B seats despite A's state");
+        assertTrue(oa.isAuthorizedOrigin(NS, opA), "A is untouched, not re-validated");
+    }
+
+    /// Un-vetting is a proactive backstop on FUTURE seating. Already-seated
+    /// origins stay until an explicit removal or a blacklist prune — evicting
+    /// them here would be unbounded in the publisher's namespace count.
+    function test_unvetBlocksNewOriginsButKeepsSeatedOnes() public {
+        _vet(publisher);
+        _seat(opA);
+
+        vm.prank(admin);
+        oa.setPublisherVetted(publisher, false);
+
+        vm.prank(publisher);
+        vm.expectRevert(abi.encodeWithSelector(OriginAssignment.PublisherNotVetted.selector, publisher));
+        oa.addOrigin(NS, opB);
+
+        assertTrue(oa.isAuthorizedOrigin(NS, opA), "the seated origin keeps serving");
+
+        // The publisher can still unseat, and governance can force it.
+        vm.prank(admin);
+        oa.removeOrigin(NS, opA);
+        assertFalse(oa.isAuthorizedOrigin(NS, opA));
     }
 
     // -----------------------------------------------------------------
@@ -162,17 +382,17 @@ contract OriginAssignmentTest is Test {
     // -----------------------------------------------------------------
 
     /// Namespace 0 is the `NO_NAMESPACE` sentinel: it has no publisher
-    /// (`ownerOf(0) == address(0)`), so it can never be assigned an origin, and both
+    /// (`ownerOf(0) == address(0)`), so it can never be seated an origin, and both
     /// origin views resolve to empty for it. This is the on-chain half of the
     /// invariant the node's pull-through gate and origin directory rely on (ADR 002
-    /// §Namespace 0) — the inverse of the removed default-open allow-list, and the
-    /// guarantee that replaced the deleted `test_defaultOpen_*` suite.
+    /// §Namespace 0).
     function test_namespaceZero_isUnassignableAndHasNoOrigins() public {
-        // No caller can own namespace 0 (registry returns address(0)), so a propose
-        // against it always reverts NotNamespaceOwner — it can never be seated.
+        // Even a vetted publisher cannot seat namespace 0 — the registry owns it
+        // to nobody, so the ownership check rejects every caller.
+        _vet(publisher);
         vm.prank(publisher);
         vm.expectRevert(abi.encodeWithSelector(OriginAssignment.NotNamespaceOwner.selector, uint256(0), publisher));
-        oa.proposeAssignment(0, _ops2());
+        oa.addOrigin(0, opA);
 
         // And both origin views are empty/false for namespace 0.
         assertEq(oa.getOrigins(0).length, 0);
@@ -180,184 +400,67 @@ contract OriginAssignmentTest is Test {
     }
 
     // -----------------------------------------------------------------
-    // activateAssignment
+    // removeOrigin / pruneBlacklistedOrigin
     // -----------------------------------------------------------------
 
-    function test_activate_setsAuthorizedSet() public {
-        _propose(_ops2());
-        vm.warp(block.timestamp + TIMELOCK);
-        vm.prank(admin);
-        oa.activateAssignment(NS);
+    function test_removeOrigin_byPublisherAndGovernance() public {
+        _vetAndSeatBoth();
 
-        assertTrue(oa.isAuthorizedOrigin(NS, opA));
-        assertTrue(oa.isAuthorizedOrigin(NS, opB));
-        assertEq(oa.getOrigins(NS).length, 2);
-        (, uint256 readyAt) = oa.getPendingAssignment(NS);
-        assertEq(readyAt, 0); // pending cleared
+        vm.prank(publisher);
+        oa.removeOrigin(NS, opA);
+        assertFalse(oa.isAuthorizedOrigin(NS, opA));
+
+        vm.prank(admin);
+        oa.removeOrigin(NS, opB);
+        assertFalse(oa.isAuthorizedOrigin(NS, opB));
     }
 
-    function test_activate_revertsBeforeTimelock() public {
-        _propose(_ops2());
-        vm.prank(admin);
-        vm.expectRevert(
-            abi.encodeWithSelector(OriginAssignment.TimelockNotElapsed.selector, block.timestamp + TIMELOCK)
-        );
-        oa.activateAssignment(NS);
-    }
-
-    function test_activate_revertsNoPending() public {
-        vm.prank(admin);
-        vm.expectRevert(abi.encodeWithSelector(OriginAssignment.NoPendingProposal.selector, NS));
-        oa.activateAssignment(NS);
-    }
-
-    function test_activate_revertsOperatorWentInactive() public {
-        _propose(_ops2());
-        vm.warp(block.timestamp + TIMELOCK);
-        bond.setActive(opB, false);
-        vm.prank(admin);
-        vm.expectRevert(abi.encodeWithSelector(OriginAssignment.OperatorNotActive.selector, opB));
-        oa.activateAssignment(NS);
-    }
-
-    function test_activate_revertsOperatorBlacklisted() public {
-        _propose(_ops2());
-        vm.warp(block.timestamp + TIMELOCK);
-        blacklist.setBlacklisted(opA, true);
-        vm.prank(admin);
-        vm.expectRevert(abi.encodeWithSelector(OriginAssignment.OperatorBlacklisted.selector, opA));
-        oa.activateAssignment(NS);
-    }
-
-    /// @notice M-2 — activation must also reject an operator blacklisted via the
-    ///         operator mapping (`addOperator`), not only the origin mapping.
-    function test_activate_revertsOperatorBlacklistedViaOperatorMapping() public {
-        _propose(_ops2());
-        vm.warp(block.timestamp + TIMELOCK);
-        blacklist.setOperatorBlacklisted(opB, true);
-        vm.prank(admin);
-        vm.expectRevert(abi.encodeWithSelector(OriginAssignment.OperatorBlacklisted.selector, opB));
-        oa.activateAssignment(NS);
-    }
-
-    function test_activate_onlyGovernance() public {
-        _propose(_ops2());
-        vm.warp(block.timestamp + TIMELOCK);
+    function test_removeOrigin_revertsForThirdParty() public {
+        _vetAndSeatBoth();
         vm.prank(stranger);
-        vm.expectRevert(
-            abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, stranger, GOVERNANCE_ROLE)
-        );
-        oa.activateAssignment(NS);
+        vm.expectRevert(abi.encodeWithSelector(OriginAssignment.NotNamespaceOwner.selector, NS, stranger));
+        oa.removeOrigin(NS, opA);
     }
 
-    function test_activate_replacesPreviousSet() public {
-        _propose(_ops2());
-        vm.warp(block.timestamp + TIMELOCK);
-        vm.prank(admin);
-        oa.activateAssignment(NS);
-
-        // Re-propose a different single-operator set and activate.
-        address[] memory one = new address[](1);
-        one[0] = opC;
-        vm.prank(publisher);
-        oa.proposeAssignment(NS, one);
-        vm.warp(block.timestamp + TIMELOCK);
-        vm.prank(admin);
-        oa.activateAssignment(NS);
-
-        assertFalse(oa.isAuthorizedOrigin(NS, opA));
-        assertFalse(oa.isAuthorizedOrigin(NS, opB));
-        assertTrue(oa.isAuthorizedOrigin(NS, opC));
-        assertEq(oa.getOrigins(NS).length, 1);
-    }
-
-    function test_activate_blacklistSkippedWhenUnset() public {
-        OriginAssignment oaNoBl = new OriginAssignment(bond, registry, address(0), admin);
-        vm.prank(publisher);
-        oaNoBl.proposeAssignment(NS, _ops2());
-        vm.warp(block.timestamp + TIMELOCK);
-        // opA "blacklisted" in the standalone mock, but oaNoBl has no binding → check skipped.
-        blacklist.setBlacklisted(opA, true);
-        vm.prank(admin);
-        oaNoBl.activateAssignment(NS);
-        assertTrue(oaNoBl.isAuthorizedOrigin(NS, opA));
-    }
-
-    // -----------------------------------------------------------------
-    // cancel / revoke / prune
-    // -----------------------------------------------------------------
-
-    function test_cancel_clearsPending() public {
-        _propose(_ops2());
-        vm.prank(publisher);
-        oa.cancelAssignmentProposal(NS);
-        (, uint256 readyAt) = oa.getPendingAssignment(NS);
-        assertEq(readyAt, 0);
-    }
-
-    function test_revoke_byPublisherAndGovernance() public {
-        _propose(_ops2());
-        vm.warp(block.timestamp + TIMELOCK);
-        vm.prank(admin);
-        oa.activateAssignment(NS);
-
-        vm.prank(publisher);
-        oa.revokeAssignment(NS, opA);
-        assertFalse(oa.isAuthorizedOrigin(NS, opA));
-
-        vm.prank(admin);
-        oa.revokeAssignment(NS, opB);
-        assertFalse(oa.isAuthorizedOrigin(NS, opB));
-    }
-
-    function test_revoke_revertsNonMember() public {
+    function test_removeOrigin_revertsNonMember() public {
         vm.prank(admin);
         vm.expectRevert(abi.encodeWithSelector(OriginAssignment.NotAuthorizedOrigin.selector, NS, opC));
-        oa.revokeAssignment(NS, opC);
+        oa.removeOrigin(NS, opC);
     }
 
     function test_prune_removesBlacklistedOperator() public {
-        _propose(_ops2());
-        vm.warp(block.timestamp + TIMELOCK);
-        vm.prank(admin);
-        oa.activateAssignment(NS);
+        _vetAndSeatBoth();
 
         blacklist.setBlacklisted(opA, true);
         // Permissionless — any caller.
         vm.prank(stranger);
-        oa.pruneBlacklistedAssignment(NS, opA);
+        oa.pruneBlacklistedOrigin(NS, opA);
         assertFalse(oa.isAuthorizedOrigin(NS, opA));
     }
 
     /// @notice M-2 — prune must also work for an operator blacklisted via the
     ///         operator mapping (`addOperator`), not only the origin mapping.
     function test_prune_removesOperatorBlacklistedViaOperatorMapping() public {
-        _propose(_ops2());
-        vm.warp(block.timestamp + TIMELOCK);
-        vm.prank(admin);
-        oa.activateAssignment(NS);
+        _vetAndSeatBoth();
 
         blacklist.setOperatorBlacklisted(opA, true);
         vm.prank(stranger);
-        oa.pruneBlacklistedAssignment(NS, opA);
+        oa.pruneBlacklistedOrigin(NS, opA);
         assertFalse(oa.isAuthorizedOrigin(NS, opA));
     }
 
     function test_prune_revertsWhenNotBlacklisted() public {
-        _propose(_ops2());
-        vm.warp(block.timestamp + TIMELOCK);
-        vm.prank(admin);
-        oa.activateAssignment(NS);
+        _vetAndSeatBoth();
         vm.prank(stranger);
         vm.expectRevert(abi.encodeWithSelector(OriginAssignment.OperatorNotBlacklisted.selector, opA));
-        oa.pruneBlacklistedAssignment(NS, opA);
+        oa.pruneBlacklistedOrigin(NS, opA);
     }
 
     function test_prune_revertsWhenBlacklistUnset() public {
         OriginAssignment oaNoBl = new OriginAssignment(bond, registry, address(0), admin);
         vm.prank(stranger);
         vm.expectRevert(OriginAssignment.ContentBlacklistNotSet.selector);
-        oaNoBl.pruneBlacklistedAssignment(NS, opA);
+        oaNoBl.pruneBlacklistedOrigin(NS, opA);
     }
 
     // -----------------------------------------------------------------
@@ -370,17 +473,17 @@ contract OriginAssignmentTest is Test {
         oa.setContentBlacklist(address(0));
     }
 
-    function test_setAssignmentTimelock_enforcesBounds() public {
+    function test_setVettingTimelock_enforcesBounds() public {
         vm.prank(admin);
         vm.expectRevert(
             abi.encodeWithSelector(
                 OriginAssignment.ParamOutOfBounds.selector, uint256(1 hours), uint256(24 hours), uint256(14 days)
             )
         );
-        oa.setAssignmentTimelock(1 hours);
+        oa.setVettingTimelock(1 hours);
         vm.prank(admin);
-        oa.setAssignmentTimelock(7 days);
-        assertEq(oa.assignmentTimelock(), 7 days);
+        oa.setVettingTimelock(7 days);
+        assertEq(oa.vettingTimelock(), 7 days);
     }
 
     function test_setMaxOrigins_enforcesBounds() public {
@@ -396,56 +499,43 @@ contract OriginAssignmentTest is Test {
     // -----------------------------------------------------------------
     //
     // Membership within a namespace was always readable via `getOrigins`; the
-    // key set was not, which is why a consumer had to replay
-    // `AssignmentActivated` from the deploy block just to learn which ids exist.
+    // key set was not, which is why a consumer had to replay the seating events
+    // from the deploy block just to learn which ids exist.
 
-    function _activate() internal {
-        _propose(_ops2());
-        vm.warp(block.timestamp + TIMELOCK);
-        vm.prank(admin);
-        oa.activateAssignment(NS);
-    }
-
-    /// Nothing assigned yet enumerates as empty rather than reverting.
-    function test_assignedNamespaces_emptyBeforeAnyActivation() public view {
+    /// Nothing seated yet enumerates as empty rather than reverting.
+    function test_assignedNamespaces_emptyBeforeAnySeat() public view {
         assertEq(oa.assignedNamespaceCount(), 0);
         assertEq(oa.assignedNamespaces(0, 10).length, 0);
     }
 
-    /// Activation seats the namespace; a proposal alone must not.
-    function test_assignedNamespaces_seatedOnActivationNotProposal() public {
-        _propose(_ops2());
-        assertEq(oa.assignedNamespaceCount(), 0, "a pending proposal is not an assignment");
+    /// The namespace enters the index on its 0→1 transition — the first seat.
+    function test_assignedNamespaces_seatedOnFirstOrigin() public {
+        _vet(publisher);
+        assertEq(oa.assignedNamespaceCount(), 0, "vetting alone seats nothing");
 
-        vm.warp(block.timestamp + TIMELOCK);
-        vm.prank(admin);
-        oa.activateAssignment(NS);
+        _seat(opA);
 
         assertEq(oa.assignedNamespaceCount(), 1);
         assertEq(oa.assignedNamespaces(0, 10)[0], NS);
     }
 
-    /// Re-activating the same namespace must not duplicate the key.
-    function test_assignedNamespaces_reActivationDoesNotDuplicate() public {
-        _activate();
-        _propose(_ops2());
-        vm.warp(block.timestamp + TIMELOCK);
-        vm.prank(admin);
-        oa.activateAssignment(NS);
+    /// A second seat in the same namespace must not duplicate the key.
+    function test_assignedNamespaces_secondOriginDoesNotDuplicate() public {
+        _vetAndSeatBoth();
         assertEq(oa.assignedNamespaceCount(), 1);
     }
 
     /// The key set tracks "has origins", not "was ever assigned": it survives
     /// removal of one operator and is withdrawn only when the last one goes.
     function test_assignedNamespaces_withdrawnOnlyWhenSetEmpties() public {
-        _activate();
+        _vetAndSeatBoth();
 
         vm.prank(publisher);
-        oa.revokeAssignment(NS, opA);
+        oa.removeOrigin(NS, opA);
         assertEq(oa.assignedNamespaceCount(), 1, "one operator remains");
 
         vm.prank(publisher);
-        oa.revokeAssignment(NS, opB);
+        oa.removeOrigin(NS, opB);
         assertEq(oa.assignedNamespaceCount(), 0, "set is now empty");
         assertEq(oa.getOrigins(NS).length, 0);
     }
@@ -453,26 +543,26 @@ contract OriginAssignmentTest is Test {
     /// The permissionless prune path must maintain the index too, or a fully
     /// pruned namespace would linger in the enumeration forever.
     function test_assignedNamespaces_prunePathWithdrawsWhenEmptied() public {
-        _activate();
+        _vetAndSeatBoth();
         blacklist.setBlacklisted(opA, true);
         blacklist.setBlacklisted(opB, true);
 
-        oa.pruneBlacklistedAssignment(NS, opA);
+        oa.pruneBlacklistedOrigin(NS, opA);
         assertEq(oa.assignedNamespaceCount(), 1);
-        oa.pruneBlacklistedAssignment(NS, opB);
+        oa.pruneBlacklistedOrigin(NS, opB);
         assertEq(oa.assignedNamespaceCount(), 0);
     }
 
     /// The index invariant, stated directly: a namespace is enumerated iff it
     /// has origins.
     function test_assignedNamespaces_matchesGetOriginsNonEmpty() public {
-        _activate();
+        _vetAndSeatBoth();
         assertEq(oa.assignedNamespaceCount(), 1);
         assertGt(oa.getOrigins(NS).length, 0);
 
         vm.startPrank(publisher);
-        oa.revokeAssignment(NS, opA);
-        oa.revokeAssignment(NS, opB);
+        oa.removeOrigin(NS, opA);
+        oa.removeOrigin(NS, opB);
         vm.stopPrank();
 
         assertEq(oa.assignedNamespaceCount(), 0);
@@ -482,19 +572,13 @@ contract OriginAssignmentTest is Test {
     /// Same pagination contract as the other enumeration views, including the
     /// `type(uint256).max` clamp.
     function test_assignedNamespaces_pagination() public {
+        _vet(publisher);
+        registry.setNamespaceCount(publisher, 3);
         for (uint256 ns = 1; ns <= 3; ++ns) {
             registry.setOwner(ns, publisher);
-            address[] memory ops = new address[](1);
-            ops[0] = opA;
             vm.prank(publisher);
-            oa.proposeAssignment(ns, ops);
+            oa.addOrigin(ns, opA);
         }
-        vm.warp(block.timestamp + TIMELOCK);
-        vm.startPrank(admin);
-        for (uint256 ns = 1; ns <= 3; ++ns) {
-            oa.activateAssignment(ns);
-        }
-        vm.stopPrank();
 
         assertEq(oa.assignedNamespaceCount(), 3);
         assertEq(oa.assignedNamespaces(0, 2).length, 2);

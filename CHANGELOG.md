@@ -23,6 +23,48 @@ since project inception and will roll into the first tagged release.
 
 ### Changed (BREAKING)
 
+- **ABI-breaking: `OriginAssignment` replaces propose/ratify with publisher
+  vetting plus instant origin seating (#1491).** Origin authorization used to
+  couple two decisions in one flow — a publisher proposed a whole operator set
+  and governance ratified it after a timelock — so every routine add needed a
+  governance vote and re-validated the already-serving origins. Governance now
+  vets the publisher **wallet** once; the vetted publisher then seats and unseats
+  origins for its own namespaces itself, one operator at a time, effective in the
+  transaction that carries them.
+  - **Removed:** `proposeAssignment`, `activateAssignment`,
+    `cancelAssignmentProposal`, `getPendingAssignment`, and the events
+    `AssignmentProposed` / `AssignmentProposalCancelled` / `AssignmentActivated` /
+    `AssignmentRevoked` / `BlacklistedAssignmentPruned`.
+  - **Added:** `requestVetting()`, `cancelVettingRequest()`,
+    `grantVetting(address)`, `setPublisherVetted(address,bool)`,
+    `isVettedPublisher(address)`, `getPendingVetting(address)`, and
+    `addOrigin(uint256,address)` — the single "origin seated" path, which emits
+    the single `OriginAdded` event.
+  - **Renamed:** `revokeAssignment` → `removeOrigin`,
+    `pruneBlacklistedAssignment` → `pruneBlacklistedOrigin`,
+    `assignmentTimelock` / `setAssignmentTimelock` → `vettingTimelock` /
+    `setVettingTimelock` (same 24h–14d bounds, same 3-day default — it now delays
+    vetting, not any assignment). Events follow: `OriginRemoved`,
+    `BlacklistedOriginPruned`, `VettingTimelockUpdated`.
+  - `IPublisherRegistryOwnership` gains `namespaceCount(address)`, which
+    `requestVetting` reads to reject a caller that owns no namespace.
+  - The node's origin-directory watcher follows the renamed events; its read
+    semantics (authoritative `getOrigins` re-read, fail-closed retry, no replay)
+    are unchanged. ADR 011 § Origin Assignment Authority and ADR 016 are rewritten
+    to match; the ADR 009 governable-parameter row is now "Publisher vetting
+    timelock".
+- **CLI-breaking: `decdn publish assign` is instant and per-operator, and gains
+  two sibling subcommands (#1491).**
+  - `publish assign <ns> <op…>` now sends one `addOrigin` per operator instead of
+    a single `proposeAssignment`, in the order given, stopping at the first
+    revert. Its receipt changes accordingly: the `ready_at` and `replaced_prior`
+    fields are gone, `status` is `seated` / `partial` / `dry_run` instead of
+    `proposed_pending_dao`, and the JSON gains an `origins: [{operator, tx}]`
+    array. A partial run prints its receipt before the error, so the operator can
+    see which seats landed.
+  - **New `publish request-vetting`** — the one governance-gated step; prints the
+    `ready_at` the vetting timelock elapses.
+  - **New `publish revoke <ns> <operator>`** — unseats one authorized origin.
 - **Config-breaking and CLI-breaking: `blockchain.buyer_deposit_micro_usdc` is
   split into two knobs (#1497).** The buyer path now opens a channel small and
   graduates it, so the single deposit knob becomes a pair. There is **no alias**:

@@ -50,8 +50,8 @@ Before any on-chain or protocol activity:
    credentials and content set before proceeding. Cache-only serving is permissionless
    at the protocol layer — any staked node may serve cached blobs and pass them on for
    payment. To be recognised as an *authorized origin* for a registered namespace, the
-   namespace's publisher must propose the operator via `OriginAssignment.proposeAssignment`
-   and the DAO must ratify after timelock ([ADR 011 § Origin Assignment Authority](011-content-takedown.md#origin-assignment-authority)).
+   namespace's publisher must seat the operator via `OriginAssignment.addOrigin`, which
+   requires the publisher itself to have been vetted by governance ([ADR 011 § Origin Assignment Authority](011-content-takedown.md#origin-assignment-authority)).
    Content served under namespace 0 (`namespaceId == 0`) has no origin role — no operator can be an
    authorized origin for it (see
    [ADR 011 § Namespace 0](011-content-takedown.md#namespace-0)).
