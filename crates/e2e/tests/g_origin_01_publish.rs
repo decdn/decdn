@@ -126,6 +126,19 @@ async fn run_publish() -> anyhow::Result<()> {
     Ok(())
 }
 
+// The transfer journey is one strictly ordered on-chain script: mint a
+// namespace, queue a transfer, assert `readyAt`, cancel it and prove it is
+// un-queued, re-queue, assert the pre-timelock and wrong-caller rejections,
+// warp past `readyAt`, finalize, then re-check ownership and the cleared
+// pending slot. Every step consumes state the previous step wrote on a live
+// chain, so the sequence — not any nesting — is what makes it long.
+#[allow(
+    clippy::cognitive_complexity,
+    clippy::too_many_lines,
+    reason = "sequential on-chain journey: each step depends on the previous step's chain state, \
+              so decomposing it would thread a state bundle through helpers without reducing the \
+              journey's length or making it easier to follow"
+)]
 async fn run_transfer() -> anyhow::Result<()> {
     let _ = tracing_subscriber::fmt()
         .with_writer(std::io::stderr)

@@ -68,6 +68,22 @@ async fn slash_detection_appeal_and_grant() -> anyhow::Result<()> {
     Ok(())
 }
 
+// The G-NODE-05 journey is one strictly ordered on-chain script: bond two
+// operators, warp past the vote-weight ramp, serve bytes to earn vote weight,
+// slash A through a real SlashJudge challenge, prove the daemon surfaces it
+// across a restart, file the appeal through the CLI, run the fast-track +
+// Governor grant lifecycle, then the three negative filings. Every step
+// consumes state the previous step wrote on a live chain, so splitting it into
+// helpers would only move that state into an argument bundle threaded through
+// each call — the sequence, not the nesting, is what makes it long. Reading it
+// top-to-bottom against the contract call order is the point.
+#[allow(
+    clippy::cognitive_complexity,
+    clippy::too_many_lines,
+    reason = "sequential on-chain journey: each step depends on the previous step's chain state, \
+              so decomposing it would thread a state bundle through helpers without reducing the \
+              journey's length or making it easier to follow"
+)]
 async fn run() -> anyhow::Result<()> {
     let _ = tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -106,10 +122,10 @@ async fn run() -> anyhow::Result<()> {
     // ---- Slash A via a real SlashJudge rate-manipulation challenge. A fresh EOA
     // is the challenger; A's own eth key signs the self-incriminating evidence.
     let challenger = PrivateKeySigner::random();
-    let node_a_id = B256::from_slice(node_a.node_id().as_bytes());
+    let a_node_id = B256::from_slice(node_a.node_id().as_bytes());
     let blob_hash = B256::repeat_byte(0x42);
     let slash_id = chain
-        .slash_operator_via_judge(&challenger, node_a.operator(), node_a_id, blob_hash)
+        .slash_operator_via_judge(&challenger, node_a.operator(), a_node_id, blob_hash)
         .await?;
 
     // ---- Layer 1 (daemon): A surfaces the slash over admin RPC.
@@ -215,7 +231,7 @@ async fn run() -> anyhow::Result<()> {
     // slashed again; fund + approve so the guard (`FrequencyCapHit`), not a
     // zero-allowance `transferFrom`, is what rejects A's own openSlashAppeal.
     let slash_id2 = chain
-        .slash_operator_via_judge(&challenger, node_a.operator(), node_a_id, blob_hash)
+        .slash_operator_via_judge(&challenger, node_a.operator(), a_node_id, blob_hash)
         .await?;
     let a_provider = chain.provider_for(node_a.operator());
     fund_and_approve_bond(&chain, &a_provider, node_a.operator_addr(), bond).await?;
@@ -232,9 +248,9 @@ async fn run() -> anyhow::Result<()> {
     // (never granted, so not frequency-capped), fund + approve its bond so the
     // only possible revert is the closed filing window, warp past 30 days, then
     // openSlashAppeal must revert (FilingWindowClosed).
-    let node_b_id = B256::from_slice(node_b.node_id().as_bytes());
+    let b_node_id = B256::from_slice(node_b.node_id().as_bytes());
     let slash_id3 = chain
-        .slash_operator_via_judge(&challenger, node_b.operator(), node_b_id, blob_hash)
+        .slash_operator_via_judge(&challenger, node_b.operator(), b_node_id, blob_hash)
         .await?;
     fund_and_approve_bond(&chain, &b_provider, node_b.operator_addr(), bond).await?;
     time::increase_time(chain.admin(), 31 * DAY).await?;

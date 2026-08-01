@@ -72,6 +72,17 @@ jobs:
       - run: >
           cargo clippy -p decdn-incentive --no-default-features
           --features buyer-store-core -- -D warnings
+      # Every target gated behind `anvil-e2e` — `crates/e2e/tests/*` and the
+      # gated `decdn-node` tests — is invisible to the run above, which never
+      # turns the feature on. The two anvil jobs that DO build them only run
+      # `cargo nextest`, which never lints, so those targets sat outside the
+      # lint wall every other target obeys and drifted into failing it (#1551).
+      # Linting them here rather than in the anvil jobs keeps the fast feedback
+      # on the clippy job's warm `shared-key: clippy` cache and off the anvil
+      # jobs' hour-scale timeouts.
+      - run: >
+          cargo clippy -p decdn-e2e -p decdn-node --all-targets
+          --features anvil-e2e -- -D warnings
 
   deny:
     name: cargo deny

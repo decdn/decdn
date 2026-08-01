@@ -554,6 +554,9 @@ const MULTI_WORKING_DEPOSIT_MICRO_USDC: u64 = 40_000_000; // plenty to finish th
 // reliably sees its own top-up applied).
 const MULTI_INITIAL_DEPOSIT_MICRO_USDC: u64 = 16_000_000;
 const MULTI_RATE_PER_MB: u64 = 2_000_000; // 2 USDC/MB, same as the single-voucher test
+/// The megabyte the per-MB rates are quoted against — the denominator of
+/// `next_voucher`'s `ceil(bytes * rate / MB)` voucher-pricing formula.
+const MB_BYTES: u64 = 1024 * 1024;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn fetch_topup_after_several_delivered_intervals_does_not_double_pay() -> anyhow::Result<()> {
@@ -741,7 +744,6 @@ async fn run_multi_interval_topup() -> anyhow::Result<()> {
     //    bytes at least once, so `wire_floor` is the TIGHT no-under-pay gate: the
     //    old `fetch_start + wire_delta` resume skipped delivered content and
     //    settles strictly below it.
-    const MB_BYTES: u64 = 1024 * 1024;
     let blob_len = u64::try_from(blob.len()).context("blob length as u64")?;
     let ceil_cost = |bytes: u64| {
         U256::from(bytes)
