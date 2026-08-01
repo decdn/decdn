@@ -145,10 +145,12 @@ contract GovernanceLifecycleTest is Test, BaseProtocolDeploy {
 
     /// @dev Override the base hook to grant the test harness
     ///      `ROUTER_CALLER_ROLE` on FeeRouter so it can call `routeSettlement`
-    ///      to seed served-bytes for vote-weight tests. In production this
-    ///      role lives on `PaymentChannel` (not yet deployed). The hook runs
-    ///      in phase 4 — before the GOVERNANCE_ROLE handoff, which would
-    ///      otherwise put `grantRole` behind the 48h Timelock.
+    ///      to seed served-bytes for vote-weight tests. In production the role
+    ///      belongs to `PaymentChannel` alone — the deploy script grants it
+    ///      there and asserts it — so this grant is an extra holder for the
+    ///      harness, not a substitute. The hook runs in phase 4 — before the
+    ///      GOVERNANCE_ROLE handoff, which would otherwise put `grantRole`
+    ///      behind the 48h Timelock.
     function _postWiringHook(DeployConfig memory, Deployment memory dDeploy) internal override {
         dDeploy.router.grantRole(dDeploy.router.ROUTER_CALLER_ROLE(), address(this));
     }

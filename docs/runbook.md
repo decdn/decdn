@@ -131,12 +131,15 @@ slashed by an external adversary.
     present blobs are being advertised without an eviction hold and may be
     evicted before the pull arrives. Budget pressure and lost deliveries,
     not slash evidence; see step 4.
-  - `DecdnBlacklistSyncLagCritical` (critical) — blacklist > 30 minutes
-    stale; serving any recently blacklisted hash is now slashable.
-  - `DecdnBlacklistVersionFarBehind` (critical) — multiple blacklist
-    versions missed. (Both blacklist alerts above are pre-wired but not yet
-    emitted by the node — see
-    [ContentBlacklist compliance](#contentblacklist-compliance).)
+  - `DecdnBlacklistWatcherStalled` (critical) — the blacklist watcher has
+    not completed a poll tick for several intervals, so the node may be
+    serving content blacklisted since the last successful tick. This is the
+    blacklist-lag coverage that exists; it fires on the age of
+    `decdn_blacklist_watcher_last_tick_timestamp_seconds`. See
+    [ContentBlacklist compliance](#contentblacklist-compliance).
+  - `DecdnBlacklistEnforcementFailing` (critical) — a re-scope could not
+    re-verify or evict every known deny-set entry, so a blacklisted hash may
+    still be servable.
   - `DecdnRateBoundsClamp` (warning) — your configured `rate_per_mb` sits
     *below* the governance `deliveryFloor`, so every quote is being raised to
     the floor before signing. The clamp is raise-only; there is no ceiling. Not
@@ -499,9 +502,11 @@ identity rotation, host clock skew breaking TLS.
    or port-forwarding layer.
 2. If a peer's iroh key was rotated, neighbours referring to its prior
    `NodeId` will not reconnect until they re-discover the new identity via
-   gossip. There is no static bootstrap-peer list in the node config
-   (`crates/node/src/config/types.rs` exposes only `network.bind_port` and
-   `network.relay_url`); follow
+   gossip. The node config carries no static bootstrap-peer list
+   (`crates/common/src/config/types.rs` exposes `network.bind_port`,
+   `network.relay_urls`, and `network.discovery`; the optional
+   `network.discovery.peers` address book is keyed by `NodeId`, so a rotated
+   key orphans its entry rather than bridging the rotation); follow
    [`adr/appendix-operator-key-rotation.md`](../adr/appendix-operator-key-rotation.md)
    for the staged-rotation procedure that keeps connectivity continuous.
 3. Inspect `decdn_iroh_magicsock_*` metrics for connect failures; high

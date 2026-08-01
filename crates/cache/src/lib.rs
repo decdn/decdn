@@ -3,7 +3,9 @@
 //! Wraps `iroh-blobs` with origin pull-through logic: on a cache miss, the
 //! engine fetches from a configured [`Origin`] backend, verifies the BLAKE3
 //! hash, and inserts the bytes before returning them to the caller. Node-to-
-//! node pull-through via `cdn/client/v1` is a follow-up once that ALPN exists.
+//! node pull-through is one such backend — the `node` crate supplies an
+//! [`Origin`] that pays a peer over `cdn/client/v1` — so this crate needs no
+//! knowledge of the paid path.
 //!
 //! Leaf crate per `adr/appendix-poc-production-seams.md` — no `#[cfg(...)]`
 //! mode branching or feature flags here. The `node` crate's wiring layer

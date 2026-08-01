@@ -97,8 +97,9 @@ pub struct DhtHandler {
     records: Arc<Mutex<RecordStore>>,
     /// Cached active-staker set consulted on every `Store` admission
     /// (ADR 022 §STORE Flow line 140). `Arc<dyn StakerSet>` so the
-    /// runtime can swap a chain-backed implementation in once the
-    /// on-chain origin-directory follow-up lands.
+    /// handler is indifferent to the source: the daemon injects the
+    /// chain-backed projection of `CapacityBond`, tests inject an
+    /// in-memory set.
     staker_set: Arc<dyn StakerSet>,
     rate_limiter: Arc<DhtRateLimiter>,
     dispatch_limiter: Arc<ConnectionLimiter>,

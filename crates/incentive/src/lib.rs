@@ -12,12 +12,20 @@
 //! ([`capacity_bond`] reads, [`payment_channel`] reads + writes, [`erc20`]
 //! approve). The seller-side on-chain settlement path (#327 — `ChannelOpened`
 //! → persist, threshold/shutdown `withdraw` + `closeChannel`, `ChannelSettled`
-//! → forget) is fully driven by the `decdn-node` runtime. The buyer-side
-//! cache-miss path (#744 — one-time USDC approve, `openChannel`/`topUp`,
-//! `reclaimExpired` on abandonment; bookkeeping in [`buyer_channel`]) is
-//! *bootstrapped* by the runtime (approval + reclaim sweep), but the
-//! cache-engine hook that would drive `openChannel`/voucher signing on a miss
-//! is not yet wired. The dispute monitor (#324) remains future work.
+//! → forget) is fully driven by the `decdn-node` runtime. So is the buyer-side
+//! cache-miss path (one-time USDC approve, `openChannel`/`topUp`,
+//! `reclaimExpired` on abandonment; bookkeeping in [`buyer_channel`]): the
+//! runtime bootstraps the approval and the reclaim sweep, and its node-to-node
+//! pull-through origin drives `openChannel` and voucher signing on a miss.
+//!
+//! Stale-close defense is the one payment-channel surface this crate does not
+//! reach. Per `adr/appendix-fraud-detection.md` there is no watchtower role,
+//! no escrow contract, and no wire protocol for it: `disputeChannel` is
+//! permissionless, so a node protects itself with a local in-process monitor
+//! that follows `ChannelCloseInitiated` on its own channels and re-submits its
+//! latest voucher. Driving that monitor is a runtime concern, so the
+//! [`payment_channel`] bindings here carry the close/withdraw surface but no
+//! `disputeChannel` call.
 
 pub mod bind_sig;
 pub mod buyer_channel;

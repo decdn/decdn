@@ -5,8 +5,8 @@
 //! responses. This module is the *client* half: outbound requests
 //! issued by the bootstrap path (initial `FindNode(self.node_id)`),
 //! the republish scheduler (one `Store` per K+3-closest peer per
-//! cached blob), and (in a follow-up) the iterative requester-side
-//! `FindValue` lookup.
+//! cached blob), and the iterative requester-side `FindValue` lookup
+//! in [`crate::dht::lookup`].
 //!
 //! Each call:
 //! 1. Connects to the peer's [`EndpointAddr`] with ALPN `cdn/dht/v1`.

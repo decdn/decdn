@@ -440,13 +440,13 @@ async fn build_infra(
         crate::payment_settlement::DebouncedCheckpointStore::new(concrete_channel_store.clone()),
     );
     // Boot-time smoke test: read every persisted record so startup fails
-    // fast on corruption / forward-incompatible schema even before the
-    // future cdn/client/v1 handler (#317) is constructed. The handler will
-    // call `load_all` again to bootstrap its in-memory channel map — that
-    // duplicate read is by design; the runtime cannot keep the snapshot
-    // because no consumer exists yet, and threading a pre-built map
-    // through `Router::builder` would couple the runtime to the (still
-    // unwritten) handler signature. Cost: one extra `load_all` on startup.
+    // fast on corruption / forward-incompatible schema, well before the
+    // `cdn/client/v1` handler is constructed further down the bring-up.
+    // That handler calls `load_all` again to bootstrap its in-memory channel
+    // map — the duplicate read is by design. Infra bring-up hands the handler
+    // the *store*, not a snapshot: a pre-built map threaded through
+    // `ClientHandlerDeps` would couple this stage to the handler's internal
+    // channel representation. Cost: one extra `load_all` on startup.
     let persisted_count = tokio::task::spawn_blocking({
         let store = Arc::clone(&channel_state_store);
         move || store.load_all()

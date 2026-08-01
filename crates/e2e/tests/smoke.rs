@@ -3,9 +3,20 @@
 //! the paid client path delivering a blob — asserting across all three layers
 //! (delivered bytes, daemon admin RPC, on-chain state).
 //!
-//! Full CUJ journeys (onboarding edge cases, blacklist compliance, slash +
-//! appeal, origin recognition, governance → daemon) are follow-up issues that
-//! each become a test file on top of these fixtures.
+//! Each full CUJ journey is its own sibling file on top of these fixtures:
+//! `g_node_04_blacklist_compliance.rs` and `origin_blacklist_compliance.rs`
+//! (hash and operator deny-sets), `slash_appeal.rs` (G-NODE-05 detection +
+//! appeal), `g_node_06_unbond.rs` (capacity reduction and the unbonding
+//! window), `g_gov_02_rate_bounds.rs` and `g_gov_03_real_evidence.rs`
+//! (governance → daemon, and daemon signatures as on-chain evidence),
+//! `g_origin_01_publish.rs` (namespace lifecycle), and the `cli_*` files
+//! (publish, setup, fetch resume / top-up, bundle pull).
+//!
+//! The gap is G-NODE-08 — content published to a namespace becoming servable
+//! *as an origin*, which needs `OriginAssignment` publisher vetting, a seated
+//! origin, and a bonded operator delivering it, plus the privacy assertion that
+//! no origin location reaches the wire. `ClientFixture`'s raw frame capture is
+//! the tap that journey needs; nothing drives it end to end yet.
 //!
 //! Gated behind the `anvil-e2e` feature (off by default). Requires `anvil` +
 //! `forge` on `PATH` and a built `decdn-node` binary:
