@@ -28,6 +28,13 @@ impl ClientHandler {
     /// [`FillOutcome::miss_reason`], reporting `InternalError` when this node is
     /// degraded rather than merely empty.
     ///
+    /// The no-openable-provider exit adds a SECOND source of that fault: the pull's
+    /// own [`PullMiss`](crate::node_origin::PullMiss), which says whether the
+    /// candidate walk failed on a fault in THIS node — a buyer key that cannot
+    /// sign, a deadline config that cannot run (#1560). The two are OR'd, because
+    /// they are the same claim from different tiers: this node, not the content, is
+    /// why the request cannot be answered.
+    ///
     /// The leech shed is included deliberately. `StreamError::NotFound`'s own doc
     /// does sanction it ("declines to pull through … seed-leech caps"), so a bare
     /// `CacheMiss` there is defensible in isolation — but it is the wrong code once
@@ -168,14 +175,18 @@ impl ClientHandler {
             match tokio::time::timeout(deadline, origin.open_progressive_pull(hash, namespace_id))
                 .await
             {
-                Ok(Some(pair)) => pair,
+                Ok(Ok(pair)) => pair,
                 // No upstream provider could be opened. That is a clean miss on THIS
                 // tier — but if an earlier tier faulted, the request as a whole is
-                // still unresolved-by-fault, so honor that (#1129).
-                Ok(None) => {
+                // still unresolved-by-fault, so honor that (#1129). The pull reports
+                // its OWN fault the same way (#1560): a walk that failed on a broken
+                // buyer key of ours is not evidence the blob is absent, so it joins
+                // the latch rather than signing a `NotFound` for content that may
+                // well exist upstream.
+                Ok(Err(miss)) => {
                     tee.abandon();
                     self.maybe_spawn_background_fill(hash);
-                    let reason = FillOutcome::miss_reason(fault_seen);
+                    let reason = FillOutcome::miss_reason(fault_seen || miss.is_local_fault());
                     return self
                         .respond_error(&mut send, req, reason, rate_per_mb)
                         .await;

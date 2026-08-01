@@ -51,7 +51,7 @@ use decdn_node::metrics::Metrics;
 use decdn_node::node_origin::{NodeOrigin, NodeOriginConfig, NodeOriginDeps, TeeVerdict};
 use decdn_node::probe_client::probe_once;
 use decdn_node::region_accounting::{RegionAccountant, RegionResolver};
-use decdn_node::selection::outer_pull_deadline;
+use decdn_node::selection::{MAX_PROVIDER_ATTEMPTS, outer_pull_deadline};
 use decdn_protocol::client::{
     ChunkData, ClientBinding, ClientMessage, StreamError, StreamRequest, StreamRequestExt,
     StreamResponse, StreamResponseBody, VoucherRejectReason,
@@ -576,6 +576,49 @@ fn provisioned_origin_with_accountant(
     providers: Vec<DhtNodeId>,
     addr_map: HashMap<DhtNodeId, Address>,
 ) -> (NodeOrigin, Arc<Mutex<Vec<ProgressEntry>>>) {
+    provisioned_origin_with_deadlines(
+        ep_b,
+        b_dht,
+        hash,
+        channel_id,
+        buyer_signer,
+        local_rep,
+        metrics,
+        region_accountant,
+        providers,
+        addr_map,
+        DEFAULT_TEST_PULL_DEADLINES,
+    )
+}
+
+/// The `(pull_timeout, stall_timeout)` every test that does not care about the deadline gate
+/// runs with — generous enough that a loaded runner never trips them.
+const DEFAULT_TEST_PULL_DEADLINES: (Duration, Duration) =
+    (Duration::from_secs(20), Duration::from_secs(20));
+
+/// Like [`provisioned_origin_with_accountant`], but the caller picks the node-origin
+/// deadline budgets.
+///
+/// The interesting value is a ZERO one. `NodeOriginConfig::deadlines()` refuses it and marks
+/// the error `LocalPullFault`, because a zero stall would trip `PullStalled` on the first
+/// poll of every read and gossip `Unreachable` about every honest peer this node touches. It
+/// is therefore the one local fault a test can induce without forging a broken signer — and
+/// the only handle a wire-level test has on the #1560 path, since the fault has to happen at
+/// OPEN time for the serve handler to still have a refusal code left to pick.
+#[allow(clippy::too_many_arguments)]
+fn provisioned_origin_with_deadlines(
+    ep_b: &iroh::Endpoint,
+    b_dht: DhtNodeId,
+    hash: Hash,
+    channel_id: B256,
+    buyer_signer: &Arc<PrivateKeySigner>,
+    local_rep: &Arc<LocalReputation>,
+    metrics: &Arc<Metrics>,
+    region_accountant: &Arc<RegionAccountant>,
+    providers: Vec<DhtNodeId>,
+    addr_map: HashMap<DhtNodeId, Address>,
+    (pull_timeout, stall_timeout): (Duration, Duration),
+) -> (NodeOrigin, Arc<Mutex<Vec<ProgressEntry>>>) {
     let recorded: Arc<Mutex<Vec<ProgressEntry>>> = Arc::new(Mutex::new(Vec::new()));
     let buyer = Arc::new(StubOpener {
         channel_id,
@@ -586,7 +629,7 @@ fn provisioned_origin_with_accountant(
         recorded: Arc::clone(&recorded),
         retired: Arc::new(Mutex::new(Vec::new())),
     }) as Arc<dyn ChannelOpener>;
-    let origin = build_origin(
+    let origin = build_origin_with_timeout(
         ep_b,
         b_dht,
         hash,
@@ -596,6 +639,9 @@ fn provisioned_origin_with_accountant(
         region_accountant,
         providers,
         addr_map,
+        pull_timeout,
+        stall_timeout,
+        0,
     );
     (origin, recorded)
 }
@@ -2689,8 +2735,9 @@ async fn node_origin_window_open_falls_through_a_stalled_candidate() -> Result<(
                  outer budget, so the honest fallback was never opened"
         )
     })?;
-    let (header, _pull) = opened
-        .ok_or_else(|| anyhow::anyhow!("expected an open against the honest fallback candidate"))?;
+    let (header, _pull) = opened.map_err(|miss| {
+        anyhow::anyhow!("expected an open against the honest fallback candidate, got {miss:?}")
+    })?;
     // A quotes `RATE`; the stallers quote the cheaper `STALL_RATE` (which is why they
     // rank ahead of it). The rate on the verified header therefore proves WHICH
     // provider we opened against.
@@ -3162,14 +3209,35 @@ async fn pull_against_a_voucher_rejecting_upstream_n(
         0,
     );
 
+    // What a failed pull ANSWERS with is itself reason-dependent (#1560), and the
+    // split is the fix: `BadSignature`/`WrongSigner` mean the upstream could not
+    // verify a signature WE produced, so they are a fault in this node and must not
+    // be answered as a `NotFound` about the content. Every other reason is a
+    // statement about one channel, which leaves the blob's availability untouched —
+    // those stay a clean miss.
+    let is_our_signer = matches!(
+        reason,
+        VoucherRejectReason::BadSignature | VoucherRejectReason::WrongSigner
+    );
     for _ in 0..fetches {
-        let got = Origin::fetch(&origin, hash, u64::MAX)
-            .await
-            .map_err(|e| anyhow::anyhow!("fetch: {e}"))?;
-        anyhow::ensure!(
-            matches!(got, OriginFetch::NotFound),
-            "a rejected voucher must not surface bytes (NotFound)"
-        );
+        let got = Origin::fetch(&origin, hash, u64::MAX).await;
+        if is_our_signer {
+            let err = got
+                .err()
+                .ok_or_else(|| anyhow::anyhow!("a signature the upstream cannot verify is OUR fault; the pull must not answer a clean miss"))?;
+            anyhow::ensure!(
+                !err.is_transient(),
+                "a broken buyer key is not cured by retrying — the engine must see a \
+                 Permanent error, or it re-runs the pull and trips the peer origin's \
+                 circuit breaker on our own defect, got {err:?}"
+            );
+        } else {
+            let got = got.map_err(|e| anyhow::anyhow!("fetch: {e}"))?;
+            anyhow::ensure!(
+                matches!(got, OriginFetch::NotFound),
+                "a rejected voucher must not surface bytes (NotFound)"
+            );
+        }
     }
 
     ep_b.close().await;
@@ -3336,6 +3404,345 @@ async fn node_origin_an_unverifiable_voucher_is_a_local_fault_not_a_payment_one(
         "provider score must stay neutral, got {}",
         local_rep.score(a_id)
     );
+    Ok(())
+}
+
+/// #1560 on the WINDOW path: a local fault must leave the open reporting
+/// [`PullMiss::LocalFault`], not the clean miss that the serve path signs as a wire
+/// `NotFound`.
+///
+/// The fault is induced through the deadline gate — a zero `stall_timeout`, which
+/// `NodeOriginConfig::deadlines()` marks `LocalPullFault` because a zero stall trips
+/// `PullStalled` on the first poll and would gossip `Unreachable` about every honest peer
+/// this node touches. That is a real, documented local fault ("check
+/// `cache.node_pull_timeout_sec`"), and unlike a forged broken signer it is deterministic and
+/// never reaches the wire: the pull resolves the candidate, opens its channel, signs the
+/// binding, and only then finds it has no legal budget to run under. So there is no server
+/// here at all, and no way for a network condition to be mistaken for the fault under test.
+///
+/// Seeded with exactly [`MAX_PROVIDER_ATTEMPTS`] candidates, which is load-bearing: the walk
+/// then spends the whole fetch-wide budget and leaves through the probe-cache EXHAUSTION
+/// exit rather than falling through to a fresh lookup. That is the second of the two arms
+/// this fix had to cover — its own comment used to defer to the cold arm's KNOWN LIMITATION
+/// note — and it is also what keeps the test hermetic: a cold fallthrough would live-probe
+/// providers that do not exist and score them `Unreachable`, which has nothing to do with
+/// the fault under test.
+///
+/// The counter assertion is not redundant with the verdict. Metering and answering are
+/// different obligations and the bug was precisely that the first held while the second did
+/// not — `node_pull_local_fault_total` moved, "any sustained rate is an emergency", and the
+/// client was told the blob does not exist.
+#[tokio::test(flavor = "multi_thread")]
+async fn window_open_reports_a_local_fault_rather_than_a_clean_miss() -> Result<()> {
+    let payload = vec![0x5Au8; 4096];
+    let hash = Hash::new(&payload);
+
+    let (ep_b, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let b_id = fresh_key().public();
+    let mut addr_map = HashMap::new();
+    let ranked: Vec<(DhtNodeId, u64)> = (0..MAX_PROVIDER_ATTEMPTS)
+        .map(|_| {
+            let dht = DhtNodeId::from_bytes(*fresh_key().public().as_bytes());
+            addr_map.insert(dht, PrivateKeySigner::random().address());
+            (dht, RATE)
+        })
+        .collect();
+
+    let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
+    let b_metrics = Arc::new(Metrics::new());
+    let b_buyer = Arc::new(PrivateKeySigner::random());
+    let buyer = Arc::new(StubOpener {
+        channel_id: B256::repeat_byte(0x5A),
+        token: TOKEN,
+        deposit: U256::from(DEPOSIT_MICRO_USDC),
+        signer: Arc::clone(&b_buyer),
+        voucher_domain: voucher_dom(),
+        recorded: Arc::new(Mutex::new(Vec::new())),
+        retired: Arc::new(Mutex::new(Vec::new())),
+    }) as Arc<dyn ChannelOpener>;
+    let origin = build_origin_seeded_ranking(
+        &ep_b,
+        DhtNodeId::from_bytes(*b_id.as_bytes()),
+        hash,
+        buyer,
+        &local_rep,
+        &b_metrics,
+        &empty_region_accountant(),
+        &ranked,
+        addr_map,
+        Duration::from_secs(20),
+        // The fault: no stall budget means no pull may legally run.
+        Duration::ZERO,
+    );
+
+    let miss = tokio::time::timeout(
+        Duration::from_secs(10),
+        origin.open_progressive_pull(hash, U256::ZERO),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("open_progressive_pull never returned"))?
+    .err()
+    .ok_or_else(|| anyhow::anyhow!("a pull with no legal deadline budget cannot open"))?;
+    anyhow::ensure!(
+        miss.is_local_fault(),
+        "an unusable deadline config is OUR fault; reporting it as a clean miss is what \
+         signs a client `NotFound` for content this node never even asked for, got {miss:?}"
+    );
+    assert_counter(
+        &b_metrics,
+        "node_pull_local_fault_total",
+        u64::try_from(MAX_PROVIDER_ATTEMPTS).unwrap_or(u64::MAX),
+    )?;
+    // No peer is touched: none was ever dialed, and a fault of ours must never be
+    // spent on anyone's reputation.
+    assert_counter(&b_metrics, "node_pull_unreachable_total", 0)?;
+
+    ep_b.close().await;
+    Ok(())
+}
+
+/// The control for the test above, and the half that must NOT change: an upstream that
+/// honestly refuses is still a clean miss.
+///
+/// Without it, "report every failed open as a local fault" passes the test above and breaks
+/// the property `StreamError::NotFound` exists for — a healthy-but-empty node answering
+/// truthfully. `InternalError` means "do not retry THIS node" (#1129), so mislabelling an
+/// honest miss steers clients off a node that is working perfectly.
+#[tokio::test(flavor = "multi_thread")]
+async fn window_open_still_reports_an_honest_refusal_as_a_clean_miss() -> Result<()> {
+    let payload = vec![0x5Bu8; 4096];
+    let hash = Hash::new(&payload);
+    let total_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
+
+    let a_sk = fresh_key();
+    let a_id = a_sk.public();
+    let a_eth = Arc::new(PrivateKeySigner::random());
+    let (ep_a, addr_a) =
+        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    let task_a = spawn_a_refusing_server(
+        ep_a.clone(),
+        Arc::clone(&a_eth),
+        slash_domain(),
+        total_bytes,
+        RATE,
+        StreamError::NotFound,
+    );
+
+    let (ep_b, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let b_id = fresh_key().public();
+    let _ = probe_once(
+        &ep_b,
+        EndpointAddr::new(a_id).with_ip_addr(addr_a),
+        *hash.as_bytes(),
+        1,
+        Duration::from_secs(10),
+    )
+    .await?;
+
+    let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
+    let b_metrics = Arc::new(Metrics::new());
+    let b_buyer = Arc::new(PrivateKeySigner::random());
+    let (providers, addr_map) =
+        one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth.address());
+    let (origin, _recorded) = provisioned_origin(
+        &ep_b,
+        DhtNodeId::from_bytes(*b_id.as_bytes()),
+        hash,
+        B256::repeat_byte(0x5B),
+        &b_buyer,
+        &local_rep,
+        &b_metrics,
+        providers,
+        addr_map,
+    );
+
+    let miss = tokio::time::timeout(
+        Duration::from_secs(20),
+        origin.open_progressive_pull(hash, U256::ZERO),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("open_progressive_pull never returned"))?
+    .err()
+    .ok_or_else(|| anyhow::anyhow!("a refused open cannot yield a pull"))?;
+    anyhow::ensure!(
+        !miss.is_local_fault(),
+        "a peer that truthfully refuses is not evidence THIS node is broken; calling it a \
+         local fault refuses the client `InternalError` and steers it off a healthy node"
+    );
+    assert_counter(&b_metrics, "node_pull_local_fault_total", 0)?;
+    assert_counter(&b_metrics, "node_pull_refused_total", 1)?;
+
+    ep_b.close().await;
+    ep_a.close().await;
+    task_a.await?;
+    Ok(())
+}
+
+/// A local fault LATCHES; it does not abort the walk (#1560).
+///
+/// Candidate #1's voucher is rejected `BadSignature` — a signature WE produced that the
+/// upstream cannot verify, so `OurLocalFault` — and candidate #2 then delivers the blob.
+/// The fetch must succeed: the flag only ever decides the answer when NOTHING delivered, so
+/// a fault reached on the way to a successful pull is invisible to the caller.
+///
+/// This is the boundary the alternative design would have crossed. Aborting the walk on the
+/// first local fault is tempting (a broken buyer key fails on every candidate anyway, so the
+/// remaining attempts look like waste) — but `OurLocalFault` also covers per-candidate
+/// encode and range faults, and failing fast there throws away a blob a later candidate was
+/// about to serve. The metrics assertion pins the other half: the fault is still METERED
+/// even though the fetch succeeded, because an operator needs to see a node that cannot sign
+/// long before it stops being able to fetch anything at all.
+///
+/// Order is pinned by a seeded probe cache, not a live probe: RTT is a multiplicative term
+/// in the ranker, so a loaded runner could otherwise float the honest candidate first and
+/// the local fault would never be reached at all (a green test that proves nothing). See
+/// `build_origin_seeded_ranking`.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
+async fn a_local_fault_on_one_candidate_does_not_sink_a_walk_that_still_delivers() -> Result<()> {
+    const CHEAP_RATE: u64 = RATE / 2;
+
+    let payload = vec![0x5Cu8; 4096];
+    let hash = Hash::new(&payload);
+    let total_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
+    let b_buyer = Arc::new(PrivateKeySigner::random());
+
+    // Candidate #1 (F): quotes the cheaper rate so it ranks first, serves the bytes, then
+    // rejects the closing voucher as unverifiable — our signer, not its fault.
+    let f_sk = fresh_key();
+    let f_id = f_sk.public();
+    let f_eth = Arc::new(PrivateKeySigner::random());
+    let (ep_f, addr_f) =
+        local_endpoint(f_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    let task_f = spawn_a_voucher_rejecting_server(
+        ep_f.clone(),
+        Arc::clone(&f_eth),
+        slash_domain(),
+        payload.clone(),
+        total_bytes,
+        CHEAP_RATE,
+        VoucherRejectReason::BadSignature,
+    );
+
+    // Candidate #2 (A): the honest fallback, quoting the pricier `RATE`.
+    let a_sk = fresh_key();
+    let a_id = a_sk.public();
+    let a_eth = Arc::new(PrivateKeySigner::random());
+    let channel_id = B256::repeat_byte(0x5C);
+    let (cache_a, hash_a, tmp_a) = cache_with_blob(&payload).await?;
+    anyhow::ensure!(hash_a == hash, "fixture hash mismatch");
+    std::mem::forget(tmp_a);
+    let store_a = Arc::new(MemoryChannelStateStore::new());
+    store_a.record(&ChannelState::new(
+        channel_id,
+        b_buyer.address(),
+        b_buyer.address(),
+        TOKEN,
+        U256::from(DEPOSIT_MICRO_USDC),
+    ))?;
+    let a_metrics = Arc::new(Metrics::new());
+    let limiter = permissive_limiter(&a_metrics);
+    let domains = HandlerDomains {
+        slash: slash_domain(),
+        voucher: voucher_dom(),
+        binding: binding_dom(),
+    };
+    let handler_a = build_handler_full(
+        a_id,
+        &a_eth,
+        &a_metrics,
+        limiter,
+        cache_a,
+        store_a as Arc<dyn ChannelStateStore>,
+        RATE,
+        &domains,
+        0,
+        16,
+    )?;
+    let (ep_a, addr_a) =
+        local_endpoint(a_sk, vec![ALPN_PROBE.to_vec(), ALPN_CLIENT.to_vec()]).await?;
+    let task_a = spawn_a_server(
+        ep_a.clone(),
+        handler_a,
+        Arc::clone(&a_eth),
+        slash_domain(),
+        total_bytes,
+        RATE,
+    );
+
+    // --- Node B: dial-only endpoint hosting the NodeOrigin. -------------------
+    let b_sk = fresh_key();
+    let b_id = b_sk.public();
+    let (ep_b, _addr_b) = local_endpoint(b_sk, vec![]).await?;
+    for (id, addr) in [(f_id, addr_f), (a_id, addr_a)] {
+        let _ = probe_once(
+            &ep_b,
+            EndpointAddr::new(id).with_ip_addr(addr),
+            *hash.as_bytes(),
+            1,
+            Duration::from_secs(10),
+        )
+        .await?;
+    }
+
+    let f_dht = DhtNodeId::from_bytes(*f_id.as_bytes());
+    let a_dht = DhtNodeId::from_bytes(*a_id.as_bytes());
+    let mut addr_map = HashMap::new();
+    addr_map.insert(f_dht, f_eth.address());
+    addr_map.insert(a_dht, a_eth.address());
+
+    let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
+    let b_metrics = Arc::new(Metrics::new());
+    let buyer = Arc::new(StubOpener {
+        channel_id,
+        token: TOKEN,
+        deposit: U256::from(DEPOSIT_MICRO_USDC),
+        signer: Arc::clone(&b_buyer),
+        voucher_domain: voucher_dom(),
+        recorded: Arc::new(Mutex::new(Vec::new())),
+        retired: Arc::new(Mutex::new(Vec::new())),
+    }) as Arc<dyn ChannelOpener>;
+    let origin = build_origin_seeded_ranking(
+        &ep_b,
+        DhtNodeId::from_bytes(*b_id.as_bytes()),
+        hash,
+        buyer,
+        &local_rep,
+        &b_metrics,
+        &empty_region_accountant(),
+        &[(f_dht, CHEAP_RATE), (a_dht, RATE)],
+        addr_map,
+        Duration::from_secs(20),
+        Duration::from_secs(20),
+    );
+
+    let got = tokio::time::timeout(
+        Duration::from_secs(20),
+        Origin::fetch(&origin, hash, u64::MAX),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("fetch never returned"))?
+    .map_err(|e| anyhow::anyhow!("a walk that reached an honest candidate must deliver: {e}"))?;
+    let delivered = got
+        .collect_to_bytes()
+        .await
+        .map_err(|e| anyhow::anyhow!("drain the delivered stream: {e}"))?
+        .ok_or_else(|| {
+            anyhow::anyhow!("the honest fallback held the blob; the walk must not miss")
+        })?;
+    anyhow::ensure!(
+        delivered.as_ref() == payload.as_slice(),
+        "the fallback candidate's bytes must be the ones returned"
+    );
+    // Both halves: the fault was seen and metered, and it did not become the answer.
+    assert_counter(&b_metrics, "node_pull_local_fault_total", 1)?;
+    assert_counter(&b_metrics, "node_pull_success_total", 1)?;
+
+    ep_b.close().await;
+    ep_a.close().await;
+    ep_f.close().await;
+    task_a.await?;
+    task_f.await?;
     Ok(())
 }
 
@@ -4345,7 +4752,9 @@ async fn node_origin_window_empty_chunk_stream_is_rejected_not_spun_on() -> Resu
     )
     .await
     .map_err(|_| anyhow::anyhow!("the progressive open never returned"))?
-    .ok_or_else(|| anyhow::anyhow!("expected a clean open against the empty-chunk upstream"))?;
+    .map_err(|miss| {
+        anyhow::anyhow!("expected a clean open against the empty-chunk upstream, got {miss:?}")
+    })?;
 
     let drained = tokio::time::timeout(EMPTY_CHUNK_ASSERT_WINDOW, async move {
         loop {
@@ -6771,6 +7180,7 @@ async fn build_node_b(
         64,
         leech_caps,
         None,
+        DEFAULT_TEST_PULL_DEADLINES,
     )
     .await
 }
@@ -6795,6 +7205,10 @@ async fn build_node_b(
 /// `content_deny` wires B's ADR 011 deny-set. `None` means "deny nothing" (the
 /// steady state for every other caller); a shared `Arc` lets a test flip an entry
 /// on mid-stream.
+///
+/// `node_pull_deadlines` is B's own upstream `(pull_timeout, stall_timeout)`. Pass
+/// [`DEFAULT_TEST_PULL_DEADLINES`] unless the test is about the deadline gate itself — see
+/// [`provisioned_origin_with_deadlines`] for the one case that is.
 #[allow(clippy::too_many_arguments)]
 async fn build_node_b_with_leaves(
     a_id: iroh::PublicKey,
@@ -6811,6 +7225,7 @@ async fn build_node_b_with_leaves(
     // returned so a test can pre-exhaust it before serving (#1254).
     leech_caps: Option<LeechCaps>,
     content_deny: Option<Arc<decdn_node::content_deny::ContentDenylist>>,
+    node_pull_deadlines: (Duration, Duration),
 ) -> Result<(
     Arc<decdn_node::handlers::client::ClientHandler>,
     EndpointAddr,
@@ -6839,7 +7254,7 @@ async fn build_node_b_with_leaves(
     let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
     let b_metrics = Arc::new(Metrics::new());
     let (providers, addr_map) = one_provider(DhtNodeId::from_bytes(*a_id.as_bytes()), a_eth_addr);
-    let (origin, recorded) = provisioned_origin(
+    let (origin, recorded) = provisioned_origin_with_deadlines(
         &ep_b,
         DhtNodeId::from_bytes(*b_id.as_bytes()),
         hash,
@@ -6847,8 +7262,10 @@ async fn build_node_b_with_leaves(
         b_buyer,
         &local_rep,
         &b_metrics,
+        &empty_region_accountant(),
         providers,
         addr_map,
+        node_pull_deadlines,
     );
 
     // B's empty cache (the tee fills it) and the leaf's channel in B's store.
@@ -7132,6 +7549,7 @@ async fn window_pull_through_funder_blacklisted_mid_stream_cuts_off_a_delegated_
             64,
             None,
             Some(Arc::clone(&deny)),
+            DEFAULT_TEST_PULL_DEADLINES,
         )
         .await?;
     let task_b = spawn_server(ep_b.clone(), handler_b);
@@ -7179,6 +7597,103 @@ async fn window_pull_through_funder_blacklisted_mid_stream_cuts_off_a_delegated_
          re-check has been re-keyed onto the voucher signer: {outcome:?}"
     );
     assert_counter(&b_metrics, "serve_stream_terminated_takedown_total", 1)?;
+
+    leaf_ep.close().await;
+    ep_b.close().await;
+    ep_a.close().await;
+    task_a.await?;
+    task_b.await?;
+    Ok(())
+}
+
+/// #1560 END TO END, over the wire the client actually reads: when B cannot open its
+/// upstream pull because of a fault in B, the leaf must be refused `InternalError` — not the
+/// signed `NotFound` that says the content does not exist.
+///
+/// This is the claim the issue makes, and the only test that can settle it. Everything
+/// upstream of the wire can be right — the verdict classified, the counter bumped, the
+/// `warn!` emitted — while the client is still told the blob is absent; that combination is
+/// exactly what shipped. So the assertion is on what the leaf reads back.
+///
+/// B's fault is a zero `stall_timeout`, which `NodeOriginConfig::deadlines()` refuses and
+/// marks `LocalPullFault` (see [`provisioned_origin_with_deadlines`]). A is healthy and
+/// holds the blob throughout — that is the point. The blob exists, is reachable, and is one
+/// hop away; the only thing wrong is B, and `NotFound` is therefore a false statement about
+/// the content rather than a harsh-but-true one.
+///
+/// Both counters are asserted, in both directions. The wire code and the reject reason are
+/// separate decisions (seven server-side reasons collapse onto `NotFound`), so a fix that
+/// moved one without the other would leave an operator's `cache_miss` tally absorbing an
+/// outage — the noisiest benign counter on the serve path hiding the loudest fault.
+#[tokio::test(flavor = "multi_thread")]
+async fn window_pull_through_local_fault_refuses_internal_error_not_not_found() -> Result<()> {
+    let payload = vec![0xC1u8; 64 * 1024];
+    let hash = Hash::new(&payload);
+
+    let ab_channel_id = B256::repeat_byte(0xA1);
+    let b_buyer = Arc::new(PrivateKeySigner::random());
+    let (a_id, a_addr, a_eth, ep_a, task_a) =
+        spawn_node_a(&payload, ab_channel_id, b_buyer.address()).await?;
+
+    let leaf_eth = Arc::new(PrivateKeySigner::random());
+    let leaf_channel_id = B256::repeat_byte(0x1F);
+    let (handler_b, b_target, ep_b, _recorded, _cache_b, b_metrics, _local_rep, _leech_gov) =
+        build_node_b_with_leaves(
+            a_id,
+            a_addr,
+            a_eth.address(),
+            hash,
+            ab_channel_id,
+            &b_buyer,
+            &[(
+                leaf_channel_id,
+                leaf_eth.address(),
+                leaf_eth.address(),
+                U256::from(DEPOSIT_MICRO_USDC),
+            )],
+            0,
+            64,
+            None,
+            None,
+            // B's fault: no stall budget, so no upstream pull may legally run.
+            (Duration::from_secs(20), Duration::ZERO),
+        )
+        .await?;
+    let task_b = spawn_server(ep_b.clone(), handler_b);
+
+    let leaf_sk = fresh_key();
+    let leaf_node_id = B256::from(*leaf_sk.public().as_bytes());
+    let (leaf_ep, _) = local_endpoint(leaf_sk, vec![]).await?;
+    let refusal = leaf_paced_pull(
+        &leaf_ep,
+        b_target,
+        leaf_node_id,
+        &leaf_eth,
+        leaf_channel_id,
+        hash,
+        RATE,
+        None,
+    )
+    .await
+    .err()
+    .ok_or_else(|| anyhow::anyhow!("B cannot pay for the upstream pull, so it cannot serve"))?;
+    let refusal = refusal.to_string();
+    anyhow::ensure!(
+        refusal.contains("InternalError"),
+        "B's own broken deadline config must be reported as B being broken, got: {refusal}"
+    );
+    anyhow::ensure!(
+        !refusal.contains("NotFound"),
+        "the blob is on A, one hop away — signing the leaf a `NotFound` is a false claim \
+         about the content, which is the whole of #1560, got: {refusal}"
+    );
+
+    assert_counter(&b_metrics, "serve_stream_rejected_internal_error_total", 1)?;
+    assert_counter(&b_metrics, "serve_stream_rejected_cache_miss_total", 0)?;
+    // The fault is metered as ours on the pull leg too, and A — which behaved perfectly
+    // and was never even dialed — keeps a clean record.
+    assert_counter(&b_metrics, "node_pull_local_fault_total", 1)?;
+    assert_counter(&b_metrics, "node_pull_unreachable_total", 0)?;
 
     leaf_ep.close().await;
     ep_b.close().await;
@@ -7331,6 +7846,7 @@ async fn window_pull_through_concurrent_same_hash_single_upstream_pull() -> Resu
             64,
             None,
             None,
+            DEFAULT_TEST_PULL_DEADLINES,
         )
         .await?;
     let task_b = spawn_server_concurrent(ep_b.clone(), handler_b);
@@ -8301,6 +8817,7 @@ async fn window_pull_through_tee_finalize_failure_serves_but_does_not_cache() ->
             1, // engine cap: 1 MiB = total - 1, so `tee.finish()` rejects the promote
             None,
             None,
+            DEFAULT_TEST_PULL_DEADLINES,
         )
         .await?;
     let task_b = spawn_server(ep_b.clone(), handler_b);
@@ -9602,7 +10119,7 @@ async fn a_progressive_pull_routes_the_fallback_on_the_request_namespace() -> Re
     .await
     .map_err(|_| anyhow::anyhow!("NO_NAMESPACE open_progressive_pull never returned"))?;
     anyhow::ensure!(
-        no_ns.is_none(),
+        no_ns.is_err(),
         "a NO_NAMESPACE progressive pull must resolve no authorized origin — the \
          directory has nothing under namespace 0"
     );
@@ -9616,7 +10133,7 @@ async fn a_progressive_pull_routes_the_fallback_on_the_request_namespace() -> Re
     .await
     .map_err(|_| anyhow::anyhow!("namespaced open_progressive_pull never returned"))?;
     anyhow::ensure!(
-        opened.is_some(),
+        opened.is_ok(),
         "a pull under the published namespace must resolve the authorized origin and \
          open the upstream"
     );
@@ -10399,7 +10916,9 @@ async fn a_progressive_pull_reuses_a_probe_cache_entry_written_by_a_buffered_fet
     )
     .await
     .map_err(|_| anyhow::anyhow!("open_progressive_pull never returned"))?
-    .ok_or_else(|| anyhow::anyhow!("expected an open against the cached candidate"))?;
+    .map_err(|miss| {
+        anyhow::anyhow!("expected an open against the cached candidate, got {miss:?}")
+    })?;
     anyhow::ensure!(
         probes.load(Ordering::SeqCst) == 1,
         "the progressive pull re-probed A — the probe cache saved nothing, which is the \
@@ -10628,7 +11147,7 @@ async fn a_window_pull_with_a_partial_cached_budget_falls_through_cold_and_meter
     )
     .await
     .map_err(|_| anyhow::anyhow!("open_progressive_pull never returned"))?
-    .ok_or_else(|| anyhow::anyhow!("expected an open via the cold fallthrough"))?;
+    .map_err(|miss| anyhow::anyhow!("expected an open via the cold fallthrough, got {miss:?}"))?;
     anyhow::ensure!(
         streams_n.load(Ordering::SeqCst) == 2,
         "N must be opened-against exactly twice total (once per call) — the cold path must \
@@ -10834,7 +11353,7 @@ async fn a_window_pull_shares_one_attempt_budget_and_invalidates_on_exhaustion()
     .await
     .map_err(|_| anyhow::anyhow!("call #1 open_progressive_pull never returned"))?;
     anyhow::ensure!(
-        first.is_none(),
+        first.is_err(),
         "all three providers refuse; the first window pull must miss"
     );
     anyhow::ensure!(
@@ -10861,7 +11380,7 @@ async fn a_window_pull_shares_one_attempt_budget_and_invalidates_on_exhaustion()
     .await
     .map_err(|_| anyhow::anyhow!("call #2 open_progressive_pull never returned"))?;
     anyhow::ensure!(
-        second.is_none(),
+        second.is_err(),
         "the cached candidates all refuse again; the second window pull must miss too"
     );
     anyhow::ensure!(
@@ -10890,7 +11409,7 @@ async fn a_window_pull_shares_one_attempt_budget_and_invalidates_on_exhaustion()
     .await
     .map_err(|_| anyhow::anyhow!("call #3 open_progressive_pull never returned"))?;
     anyhow::ensure!(
-        third.is_none(),
+        third.is_err(),
         "all three providers still refuse; the third window pull must miss too"
     );
     anyhow::ensure!(
