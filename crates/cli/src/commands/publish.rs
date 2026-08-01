@@ -161,13 +161,21 @@ async fn preflight_chain_id(rpc_url: &str, expected: u64) -> anyhow::Result<()> 
 // namespace create
 // -------------------------------------------------------------------------
 
-/// Result of `namespace create`. `operator`/`namespace_id`/`tx` are `None` on
-/// a dry run (which loads no keystore, so the signer address is unknown).
+/// Result of `namespace create`. `operator` is `None` on a dry run (which loads
+/// no keystore, so the signer address is unknown).
 pub(crate) struct NamespaceOutcome {
     pub(crate) operator: Option<Address>,
     pub(crate) registry: Address,
+    /// The minted id, from the `NamespaceCreated` event. `None` on a dry run,
+    /// when the namespace was created but its id could not be recovered, and
+    /// when nothing reached the chain at all — read it together with `status`,
+    /// which distinguishes those three.
     pub(crate) namespace_id: Option<u64>,
     pub(crate) tx: Option<B256>,
+    /// The transaction was broadcast but its outcome could not be read, so the
+    /// namespace is neither confirmed created nor known to have failed.
+    pub(crate) in_flight: bool,
+    pub(crate) dry_run: bool,
 }
 
 pub(crate) fn write_namespace_outcome(
@@ -175,6 +183,7 @@ pub(crate) fn write_namespace_outcome(
     o: &NamespaceOutcome,
     json: bool,
 ) -> io::Result<()> {
+    let status = single_tx_status(o.dry_run, o.in_flight, o.tx, "created");
     if json {
         let value = serde_json::json!({
             "submitted": o.tx.is_some(),
@@ -182,6 +191,7 @@ pub(crate) fn write_namespace_outcome(
             "operator": o.operator.map(|a| format!("{a:#x}")),
             "publisher_registry": format!("{:#x}", o.registry),
             "namespace_id": o.namespace_id,
+            "status": status,
         });
         return writeln!(w, "{value}");
     }
@@ -189,9 +199,14 @@ pub(crate) fn write_namespace_outcome(
         writeln!(w, "operator={op:#x}")?;
     }
     writeln!(w, "publisher_registry={:#x}", o.registry)?;
-    match (o.namespace_id, o.tx) {
-        (Some(id), Some(h)) => writeln!(w, "submitted=true namespace_id={id} tx={h:#x}"),
-        _ => writeln!(w, "submitted=false dry_run=true"),
+    // Its own line, like `ready_at`: the id is absent whenever it could not be
+    // decoded, and `status` + `tx` still have to print without it.
+    if let Some(id) = o.namespace_id {
+        writeln!(w, "namespace_id={id}")?;
+    }
+    match o.tx {
+        Some(h) => writeln!(w, "status={status} tx={h:#x}"),
+        None => writeln!(w, "status={status} submitted=false"),
     }
 }
 
@@ -205,51 +220,125 @@ async fn namespace_create(
         registry,
         namespace_id: None,
         tx: None,
+        in_flight: false,
+        dry_run: args.chain.common.dry_run,
     };
+    // `Ok` on the dry-run path: nothing was sent, so there is nothing to decode
+    // and nothing to report as failed.
+    let mut created: anyhow::Result<u64> = Ok(0);
+    // Whether the namespace reached the chain. Only then may the error text
+    // claim a namespace the publisher now owns.
+    let mut landed = false;
 
-    if !args.chain.common.dry_run {
+    if !outcome.dry_run {
         // The keystore is decrypted only when actually submitting — a dry run
         // needs no secrets.
         let (signer, provider) = signer_and_provider(&resolved, &args.chain).await?;
         outcome.operator = Some(signer.address());
         let contract = PublisherRegistry::new(registry, &provider);
-        let receipt = decdn_incentive::tx::send_for_receipt(
+        let sent = decdn_incentive::tx::send_for_receipt(
             contract.createNamespace(),
             "createNamespace",
             Some("check the RPC, gas, and the registry address"),
             &mut outcome.tx,
         )
-        .await?;
-        let tx = receipt.transaction_hash;
-        // The new id comes from the emitted event: the return value is not in a
-        // receipt, and a static pre-call would race a concurrent create
-        // (`_nextNamespaceId` is global across publishers). Match the log by
-        // event signature first, then decode — so an ABI drift surfaces as a
-        // decode error rather than a misleading "missing event".
-        let created = receipt
-            .inner
-            .logs()
-            .iter()
-            .find(|log| log.topic0() == Some(&PublisherRegistry::NamespaceCreated::SIGNATURE_HASH))
-            .context(
-                "createNamespace succeeded on-chain but its receipt carried no NamespaceCreated \
-                 log (the namespace id could not be recovered; check the tx on a block explorer)",
-            )?
-            .log_decode::<PublisherRegistry::NamespaceCreated>()
-            .context(
-                "createNamespace emitted a NamespaceCreated log that failed to decode (ABI \
-                 mismatch between this CLI and the deployed PublisherRegistry?)",
-            )?;
-        let id_u64 = u64::try_from(created.inner.data.namespaceId)
-            .context("namespace id exceeds u64 (unexpected on this chain)")?;
-        outcome.namespace_id = Some(id_u64);
-        outcome.tx = Some(tx);
+        .await;
+
+        match sent {
+            // Every failure below happens AFTER the namespace exists on-chain,
+            // so it must not short-circuit the receipt — the tx hash is the only
+            // handle the publisher has on a namespace whose id was lost, and a
+            // blind retry mints a second one against `maxNamespacesPerPublisher`.
+            Ok(receipt) => {
+                landed = true;
+                created = decode_created_namespace(&receipt);
+                if let Ok(id) = created {
+                    outcome.namespace_id = Some(id);
+                }
+            }
+            Err(err) => {
+                // A hash that survived the error means the transaction was
+                // broadcast and only its receipt was unreadable: the namespace
+                // may well exist, so report it rather than implying nothing
+                // happened. No hash means the send was rejected or the call
+                // reverted — nothing was minted, and `send_for_receipt`'s own
+                // error already says so.
+                outcome.in_flight = outcome.tx.is_some();
+                created = Err(err);
+            }
+        }
     }
 
     let mut out = io::stdout().lock();
-    write_namespace_outcome(&mut out, &outcome, args.chain.common.json)
-        .context("failed to write namespace-create output")?;
-    Ok(())
+    let write_err = write_namespace_outcome(&mut out, &outcome, args.chain.common.json).err();
+    drop(out);
+    let context = namespace_failure_context(landed, outcome.in_flight);
+    propagate(
+        created.err().map(|err| match context {
+            Some(note) => err.context(note),
+            None => err,
+        }),
+        write_err,
+        "failed to write namespace-create output",
+    )
+}
+
+/// Extra guidance to attach to a `namespace create` failure, or `None` when the
+/// underlying error already says everything true.
+///
+/// A namespace cannot be un-created, and creating it already incremented
+/// `namespaceCount` against `maxNamespacesPerPublisher` — so an operator who
+/// retries blind burns quota to mint a second one while the first stays owned
+/// with its id still unrecovered. That warning is only honest once something
+/// reached the chain: a
+/// rejected send — the modal case, since `NamespaceCapReached` surfaces from the
+/// pre-flight gas estimate before anything is broadcast — minted nothing, and
+/// there is no hash to point at.
+const fn namespace_failure_context(landed: bool, in_flight: bool) -> Option<&'static str> {
+    if in_flight {
+        Some(
+            "the transaction was broadcast — check the tx above before re-running, since a \
+             create that landed already counts against maxNamespacesPerPublisher",
+        )
+    } else if landed {
+        Some(
+            "the namespace exists and is owned by the signer — recover its id from the \
+             NamespaceCreated log of the tx above rather than re-running, which mints a second \
+             namespace",
+        )
+    } else {
+        None
+    }
+}
+
+/// Pull the minted id out of a confirmed `createNamespace` receipt.
+///
+/// The id comes from the emitted event: the return value is not in a receipt,
+/// and a static pre-call would race a concurrent create (`_nextNamespaceId` is
+/// global across publishers). Match the log by event signature first, then
+/// decode — so an ABI drift surfaces as a decode error rather than a misleading
+/// "missing event". Split out so the caller can print its receipt before
+/// propagating any of these failures, all of which happen after the namespace
+/// has already been minted.
+fn decode_created_namespace(
+    receipt: &alloy::rpc::types::TransactionReceipt,
+) -> anyhow::Result<u64> {
+    let created = receipt
+        .inner
+        .logs()
+        .iter()
+        .find(|log| log.topic0() == Some(&PublisherRegistry::NamespaceCreated::SIGNATURE_HASH))
+        .context(
+            "createNamespace succeeded on-chain but its receipt carried no NamespaceCreated \
+             log (the namespace id could not be recovered; check the tx on a block explorer)",
+        )?
+        .log_decode::<PublisherRegistry::NamespaceCreated>()
+        .context(
+            "createNamespace emitted a NamespaceCreated log that failed to decode (ABI \
+             mismatch between this CLI and the deployed PublisherRegistry?)",
+        )?;
+    u64::try_from(created.inner.data.namespaceId)
+        .context("namespace id exceeds u64 (unexpected on this chain)")
 }
 
 // -------------------------------------------------------------------------
@@ -830,17 +919,21 @@ mod tests {
             registry: Address::repeat_byte(0x01),
             namespace_id: None,
             tx: None,
+            in_flight: false,
+            dry_run: true,
         };
         let mut buf = Vec::new();
         write_namespace_outcome(&mut buf, &base, false).unwrap();
         let dry = String::from_utf8(buf).unwrap();
-        assert!(dry.contains("submitted=false dry_run=true"), "{dry}");
+        assert!(dry.contains("status=dry_run submitted=false"), "{dry}");
         assert!(!dry.contains("operator="), "{dry}");
+        assert!(!dry.contains("namespace_id="), "{dry}");
 
         let done = NamespaceOutcome {
             operator: Some(Address::repeat_byte(0xCD)),
             namespace_id: Some(9),
             tx: Some(B256::repeat_byte(0x55)),
+            dry_run: false,
             ..base
         };
         let mut buf = Vec::new();
@@ -848,7 +941,98 @@ mod tests {
         let s = String::from_utf8(buf).unwrap();
         assert!(s.contains("operator=0xcdcd"), "{s}");
         assert!(s.contains("namespace_id=9"), "{s}");
-        assert!(s.contains("tx=0x5555"), "{s}");
+        assert!(s.contains("status=created tx=0x5555"), "{s}");
+    }
+
+    /// The state this receipt exists for: `createNamespace` confirmed, so the
+    /// namespace is live and already counts against the publisher's cap, but its
+    /// id could not be decoded. The tx hash is then the operator's ONLY handle on
+    /// it — dropping the receipt here is what made the id unrecoverable and a
+    /// retry quota-burning. It is also not a dry run, and must never say so.
+    #[test]
+    fn namespace_output_surfaces_a_created_namespace_with_an_unknown_id() {
+        let o = NamespaceOutcome {
+            operator: Some(Address::repeat_byte(0xCD)),
+            registry: Address::repeat_byte(0x01),
+            namespace_id: None,
+            tx: Some(B256::repeat_byte(0x55)),
+            in_flight: false,
+            dry_run: false,
+        };
+        let mut buf = Vec::new();
+        write_namespace_outcome(&mut buf, &o, false).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains("status=created tx=0x5555"), "{s}");
+        assert!(!s.contains("dry_run"), "{s}");
+        assert!(!s.contains("namespace_id="), "{s}");
+
+        let mut buf = Vec::new();
+        write_namespace_outcome(&mut buf, &o, true).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+        // `created` + a null id is what separates this from "not created": a
+        // `--json` consumer switching on `status` cannot confuse the two.
+        assert_eq!(v["status"], serde_json::json!("created"));
+        assert_eq!(v["submitted"], serde_json::json!(true));
+        assert!(v["namespace_id"].is_null(), "{v}");
+        assert_eq!(
+            v["tx"],
+            serde_json::json!(format!("{:#x}", B256::repeat_byte(0x55)))
+        );
+
+        // A broadcast whose receipt could not be read is UNKNOWN, not created —
+        // but it keeps its hash for the same reason.
+        let unknown = NamespaceOutcome {
+            in_flight: true,
+            ..o
+        };
+        let mut buf = Vec::new();
+        write_namespace_outcome(&mut buf, &unknown, true).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+        assert_eq!(v["status"], serde_json::json!("unknown"));
+        assert_eq!(
+            v["tx"],
+            serde_json::json!(format!("{:#x}", B256::repeat_byte(0x55)))
+        );
+
+        // Nothing reached the chain: `failed`, and distinguishable from a dry run.
+        let failed = NamespaceOutcome {
+            tx: None,
+            in_flight: false,
+            ..o
+        };
+        let mut buf = Vec::new();
+        write_namespace_outcome(&mut buf, &failed, true).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+        assert_eq!(v["status"], serde_json::json!("failed"));
+        assert_eq!(v["submitted"], serde_json::json!(false));
+    }
+
+    /// A `namespace create` failure must only warn about the burnt quota when a
+    /// namespace was actually minted. Claiming it on the path where the send was
+    /// rejected — the modal failure, since `NamespaceCapReached` surfaces from
+    /// the pre-flight gas estimate — sends the publisher hunting for a namespace
+    /// that does not exist, and contradicts the `status=failed` receipt printed
+    /// one line above.
+    #[test]
+    fn namespace_failure_context_only_claims_a_namespace_when_one_exists() {
+        // Broadcast, receipt unreadable: it may exist, so say so.
+        let in_flight = namespace_failure_context(false, true).unwrap();
+        assert!(in_flight.contains("was broadcast"), "{in_flight}");
+        assert!(
+            in_flight.contains("maxNamespacesPerPublisher"),
+            "{in_flight}"
+        );
+
+        // Confirmed, but the id could not be decoded: the namespace IS owned.
+        let landed = namespace_failure_context(true, false).unwrap();
+        assert!(landed.contains("exists and is owned"), "{landed}");
+        assert!(landed.contains("NamespaceCreated"), "{landed}");
+
+        // Nothing reached the chain — nothing minted, and no hash to cite.
+        assert!(
+            namespace_failure_context(false, false).is_none(),
+            "a rejected send must not claim a created namespace"
+        );
     }
 
     #[test]
@@ -1105,11 +1289,14 @@ mod tests {
             registry: Address::repeat_byte(0x01),
             namespace_id: None,
             tx: None,
+            in_flight: false,
+            dry_run: true,
         };
         let mut buf = Vec::new();
         write_namespace_outcome(&mut buf, &dry, true).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
         assert_eq!(v["submitted"], serde_json::json!(false));
+        assert_eq!(v["status"], serde_json::json!("dry_run"));
         assert!(v["tx"].is_null(), "{v}");
         assert!(v["operator"].is_null(), "{v}");
         assert!(v["namespace_id"].is_null(), "{v}");
@@ -1119,11 +1306,14 @@ mod tests {
             registry: Address::repeat_byte(0x01),
             namespace_id: Some(9),
             tx: Some(B256::repeat_byte(0x55)),
+            in_flight: false,
+            dry_run: false,
         };
         let mut buf = Vec::new();
         write_namespace_outcome(&mut buf, &done, true).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
         assert_eq!(v["submitted"], serde_json::json!(true));
+        assert_eq!(v["status"], serde_json::json!("created"));
         assert_eq!(v["namespace_id"], serde_json::json!(9)); // number, not string
         assert_eq!(
             v["operator"],
