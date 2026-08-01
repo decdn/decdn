@@ -166,10 +166,12 @@ async fn preflight_chain_id(rpc_url: &str, expected: u64) -> anyhow::Result<()> 
 pub(crate) struct NamespaceOutcome {
     pub(crate) operator: Option<Address>,
     pub(crate) registry: Address,
-    /// The minted id, from the `NamespaceCreated` event. `None` on a dry run,
-    /// when the namespace was created but its id could not be recovered, and
-    /// when nothing reached the chain at all — read it together with `status`,
-    /// which distinguishes those three.
+    /// The minted id, from the `NamespaceCreated` event. `None` whenever it
+    /// could not be read, which `status` tells apart: nothing was sent
+    /// (`dry_run`), the send was rejected so nothing was minted (`failed`), the
+    /// transaction was broadcast but its receipt was unreadable so a namespace
+    /// may or may not exist (`unknown`), or the namespace was created and only
+    /// its id could not be decoded (`created`).
     pub(crate) namespace_id: Option<u64>,
     pub(crate) tx: Option<B256>,
     /// The transaction was broadcast but its outcome could not be read, so the
@@ -301,9 +303,12 @@ const fn namespace_failure_context(landed: bool, in_flight: bool) -> Option<&'st
              create that landed already counts against maxNamespacesPerPublisher",
         )
     } else if landed {
+        // Deliberately does not name the NamespaceCreated log: a missing log is
+        // itself one of the decode failures this note is attached to, so citing
+        // it as the recovery path would contradict the error above it.
         Some(
-            "the namespace exists and is owned by the signer — recover its id from the \
-             NamespaceCreated log of the tx above rather than re-running, which mints a second \
+            "the namespace exists and is owned by the signer — recover its id from the tx above \
+             (its logs, or ownerOf on the registry) rather than re-running, which mints a second \
              namespace",
         )
     } else {
@@ -1026,7 +1031,10 @@ mod tests {
         // Confirmed, but the id could not be decoded: the namespace IS owned.
         let landed = namespace_failure_context(true, false).unwrap();
         assert!(landed.contains("exists and is owned"), "{landed}");
-        assert!(landed.contains("NamespaceCreated"), "{landed}");
+        assert!(landed.contains("the tx above"), "{landed}");
+        // A missing NamespaceCreated log is one of the decode failures this note
+        // rides along with, so it must not point at that log as the fix.
+        assert!(!landed.contains("NamespaceCreated"), "{landed}");
 
         // Nothing reached the chain — nothing minted, and no hash to cite.
         assert!(
