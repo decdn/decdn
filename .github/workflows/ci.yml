@@ -72,17 +72,29 @@ jobs:
       - run: >
           cargo clippy -p decdn-incentive --no-default-features
           --features buyer-store-core -- -D warnings
-      # Every target gated behind `anvil-e2e` — `crates/e2e/tests/*` and the
-      # gated `decdn-node` tests — is invisible to the run above, which never
-      # turns the feature on. The two anvil jobs that DO build them only run
-      # `cargo nextest`, which never lints, so those targets sat outside the
-      # lint wall every other target obeys and drifted into failing it (#1551).
-      # Linting them here rather than in the anvil jobs keeps the fast feedback
-      # on the clippy job's warm `shared-key: clippy` cache and off the anvil
-      # jobs' hour-scale timeouts.
-      - run: >
-          cargo clippy -p decdn-e2e -p decdn-node --all-targets
-          --features anvil-e2e -- -D warnings
+      # Everything behind an off-by-default feature is invisible to the
+      # `--workspace --all-targets` run above, which turns none of them on:
+      # `anvil-e2e` (all 15 `crates/e2e/tests/*` + the two gated `decdn-node`
+      # tests), `decdn-node/otlp`, `decdn-protocol/public-api-test`,
+      # `decdn-incentive/test-util`. No anvil job ever invokes
+      # clippy — settlement builds only the two `--test` targets it names,
+      # journeys only `decdn-e2e`'s — so the gated targets sat outside the lint
+      # wall every other target obeys and drifted into failing it (#1551), and
+      # `otlp` was neither built nor linted by any job at all.
+      #
+      # `--all-features` rather than a hand-listed `-p A -p B --features F`: the
+      # curated `--test` list at the settlement job below is how
+      # `anvil_bringup_shutdown_e2e` rotted, and a package list rots the same
+      # way the first time a third crate gains a gated target. The cost is
+      # honest — this drags opentelemetry/tonic into this job's
+      # `shared-key: clippy` cache — and it buys back the rot risk.
+      #
+      # Linting here rather than in the anvil jobs keeps the fast feedback on
+      # this job's warm cache and off those jobs' hour-scale timeouts. This is a
+      # LINT gate, not a build-parity check: it compiles one unified
+      # all-features configuration, which is not the per-job feature set either
+      # anvil job builds.
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
   deny:
     name: cargo deny
@@ -645,6 +657,9 @@ jobs:
       # `anvil_bringup_shutdown_e2e` silently rotted: it was never built by any
       # job, so it stopped compiling for three days without a red build and was
       # even edited in that state. Any new `anvil_*` target must be added here.
+      # The clippy job's `--all-features` run now COMPILES every gated target, so
+      # that particular rot cannot recur silently — but compiling is not running.
+      # A target missing from the list below still never executes.
       - name: Run on-chain anvil e2e
         run: |
           cargo nextest run -p decdn-node --features anvil-e2e \

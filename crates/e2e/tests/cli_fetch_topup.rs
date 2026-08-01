@@ -50,6 +50,10 @@ use decdn_incentive::buyer_channel_redb::RedbBuyerChannelStore;
 use decdn_incentive::eth_identity;
 use decdn_incentive::payment_channel::PaymentChannel;
 use decdn_incentive::voucher_domain;
+// The denominator of `next_voucher`'s `ceil(bytes * rate / MB)` pricing, taken
+// from the protocol rather than re-spelled locally: a hand-copied 1024 * 1024
+// would keep passing if the protocol constant ever moved.
+use decdn_protocol::MB_BYTES;
 
 const DEPOSIT_MICRO_USDC: u64 = 10_000_000; // 10 USDC (ADR 003 recommended minimum)
 const OVERALL_TIMEOUT: Duration = Duration::from_secs(780);
@@ -554,9 +558,6 @@ const MULTI_WORKING_DEPOSIT_MICRO_USDC: u64 = 40_000_000; // plenty to finish th
 // reliably sees its own top-up applied).
 const MULTI_INITIAL_DEPOSIT_MICRO_USDC: u64 = 16_000_000;
 const MULTI_RATE_PER_MB: u64 = 2_000_000; // 2 USDC/MB, same as the single-voucher test
-/// The megabyte the per-MB rates are quoted against — the denominator of
-/// `next_voucher`'s `ceil(bytes * rate / MB)` voucher-pricing formula.
-const MB_BYTES: u64 = 1024 * 1024;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn fetch_topup_after_several_delivered_intervals_does_not_double_pay() -> anyhow::Result<()> {
@@ -1038,7 +1039,7 @@ async fn run_two_topup_fetch() -> anyhow::Result<()> {
     let ceil_cost = |bytes: u64| {
         U256::from(bytes)
             .saturating_mul(U256::from(TWO_TOPUP_RATE_PER_MB))
-            .div_ceil(U256::from(1024u64 * 1024))
+            .div_ceil(U256::from(MB_BYTES))
     };
     let whole_wire = align_range(0, 0, blob_len)
         .context("align whole blob")?

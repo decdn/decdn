@@ -127,11 +127,14 @@ async fn run_publish() -> anyhow::Result<()> {
 }
 
 // The transfer journey is one strictly ordered on-chain script: mint a
-// namespace, queue a transfer, assert `readyAt`, cancel it and prove it is
-// un-queued, re-queue, assert the pre-timelock and wrong-caller rejections,
-// warp past `readyAt`, finalize, then re-check ownership and the cleared
-// pending slot. Every step consumes state the previous step wrote on a live
-// chain, so the sequence — not any nesting — is what makes it long.
+// namespace, assert it starts owned by its creator, queue a transfer, assert the
+// 7-day default timelock and the exact `readyAt`, cancel it and prove it is
+// un-queued, re-queue, warp to just short of `readyAt` and assert the
+// pre-timelock and wrong-caller rejections there, warp past `readyAt`, finalize,
+// then re-check ownership and the cleared pending slot. Every step consumes
+// state the previous step wrote on a live chain — including both warps, since
+// the pre-timelock rejection is only meaningful once the clock has moved — so
+// the sequence, not any nesting, is what makes it long.
 #[allow(
     clippy::cognitive_complexity,
     clippy::too_many_lines,

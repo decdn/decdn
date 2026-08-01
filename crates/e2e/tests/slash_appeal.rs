@@ -68,15 +68,15 @@ async fn slash_detection_appeal_and_grant() -> anyhow::Result<()> {
     Ok(())
 }
 
-// The G-NODE-05 journey is one strictly ordered on-chain script: bond two
-// operators, warp past the vote-weight ramp, serve bytes to earn vote weight,
-// slash A through a real SlashJudge challenge, prove the daemon surfaces it
-// across a restart, file the appeal through the CLI, run the fast-track +
-// Governor grant lifecycle, then the three negative filings. Every step
-// consumes state the previous step wrote on a live chain, so splitting it into
-// helpers would only move that state into an argument bundle threaded through
-// each call — the sequence, not the nesting, is what makes it long. Reading it
-// top-to-bottom against the contract call order is the point.
+// The G-NODE-05 journey is one strictly ordered on-chain script — the module doc
+// above enumerates its steps. Two ordering constraints the step list does not
+// make obvious: the non-operator negative must run BEFORE the CLI files the
+// appeal (once the appeal is granted, `slash_id` is resolved and that filing can
+// no longer be attempted at all), and each step consumes chain state the
+// previous step wrote. So splitting this into helpers would only move that state
+// into an argument bundle threaded through each call — the sequence, not the
+// nesting, is what makes it long. Reading it top-to-bottom against the contract
+// call order is the point.
 #[allow(
     clippy::cognitive_complexity,
     clippy::too_many_lines,
