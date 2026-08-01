@@ -22,7 +22,7 @@ impl ClientHandler {
     /// tee sink. Terminal: consumes `send`/`recv`.
     ///
     /// `fault_seen` carries whether an EARLIER tier (the reactive local-origin
-    /// populate) hit a transient backend fault for this request (#1129). This path
+    /// populate) hit a backend fault for this request (#1129). This path
     /// is the last tier, so all three of its MISS exits — the leech shed, no
     /// openable provider, and the open deadline — refuse via
     /// [`FillOutcome::miss_reason`], reporting `InternalError` when this node is
@@ -31,9 +31,16 @@ impl ClientHandler {
     /// The no-openable-provider exit adds a SECOND source of that fault: the pull's
     /// own [`PullMiss`](crate::node_origin::PullMiss), which says whether the
     /// candidate walk failed on a fault in THIS node — a buyer key that cannot
-    /// sign, a deadline config that cannot run (#1560). The two are OR'd, because
-    /// they are the same claim from different tiers: this node, not the content, is
-    /// why the request cannot be answered.
+    /// sign, a deadline config that cannot run, a channel store it cannot read
+    /// (#1560). The two are OR'd, because they are the same claim from different
+    /// tiers: this node, not the content, is why the request cannot be answered.
+    ///
+    /// The open-deadline exit is the one hole left. `tokio::time::timeout` DROPS the
+    /// walk, so any miss it had latched dies with the cancelled future and that
+    /// arm can only report `fault_seen`. Left as-is deliberately: a deadline expiry is
+    /// not a fault on its own ([`ClientHandler::on_pull_through_timeout`] argues the
+    /// same for the buffered twin), and closing it needs a latch the caller owns rather
+    /// than one living inside the future.
     ///
     /// The leech shed is included deliberately. `StreamError::NotFound`'s own doc
     /// does sanction it ("declines to pull through … seed-leech caps"), so a bare

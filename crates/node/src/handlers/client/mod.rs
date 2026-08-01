@@ -616,10 +616,20 @@ enum FillOutcome {
     /// whatever the other tiers found. Terminal (when no tier fills and none
     /// faulted): `NotFound`.
     CleanMiss,
-    /// A TRANSIENT backend/store fault — the node is degraded, not empty.
-    /// Terminal: `InternalError` ("do not retry this node"), so a client routes
-    /// around a node whose origin is down and the operator's reject metric names
-    /// the real cause.
+    /// A backend/store fault, or a fault in this node's own buyer leg — the node is
+    /// degraded, not empty. Terminal: `InternalError` ("do not retry this node"), so a
+    /// client routes around it and the operator's reject metric names the real cause.
+    ///
+    /// Two different lifetimes arrive here, and the variant deliberately does not
+    /// distinguish them, because the client's answer is the same either way:
+    ///
+    /// - TRANSIENT: the operator's origin is 5xx-ing or its store is briefly unhappy.
+    ///   Passes on its own.
+    /// - PERMANENT: this node's buyer side cannot pay at all — a broken signer, an
+    ///   unusable deadline config, a channel store it cannot read (#1560). The node-origin
+    ///   surfaces these as `OriginPullError::Permanent`, which the engine collapses into
+    ///   `CacheError::OriginError` like any other origin failure. It recurs on every
+    ///   request for EVERY hash until an operator intervenes.
     ///
     /// Deliberately narrow: ONLY `CacheError::OriginError` and `CacheError::Store`
     /// qualify. A `BlobTooLarge` / `HashMismatch` / `VerifyFailed` is deterministic

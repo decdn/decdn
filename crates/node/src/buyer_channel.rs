@@ -48,7 +48,7 @@ use futures_util::FutureExt;
 use iroh::{Endpoint, EndpointAddr, PublicKey};
 use tracing::{debug, error, info, warn};
 
-use crate::client_requester::ChannelContext;
+use crate::client_requester::{ChannelContext, LocalPullFault};
 // The buyer-channel open kernel (#940) — the `openChannel` tx + `ChannelOpened`
 // decode + state/ctx build, and the one-time USDC approval — now live in the
 // shared `decdn-client-pull` crate (re-exported here as `client_requester`).
@@ -900,6 +900,14 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
     /// to ANY provider — was the quieter of the two.
     ///
     /// Metered and marked [`OpenReported`], so the caller-side ladder does not restate it.
+    ///
+    /// ALSO marked [`LocalPullFault`] (#1560). The two markers answer different questions:
+    /// `OpenReported` says "already logged and metered, do not restate", while
+    /// `LocalPullFault` says "this failure is OURS, node-wide". Without the second one the
+    /// caller-side ladder read this as an ordinary skipped candidate and the serve path
+    /// signed the client a `NotFound` — a statement about the CONTENT — while the log line
+    /// two lines above says this node cannot open a channel to anybody. A store that cannot
+    /// be read is not evidence the blob is absent.
     fn reuse_live_or_report(&self, provider_addr: Address) -> Result<Option<ChannelContext>> {
         self.try_reuse_live(provider_addr).map_err(|err| {
             self.metrics.node_pull_channel_open_failure();
@@ -909,7 +917,7 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
                 "buyer channel store read failed; this node can neither open nor reuse a \
                  channel to any provider until the store recovers"
             );
-            err.context(OpenReported)
+            err.context(OpenReported).context(LocalPullFault)
         })
     }
 
@@ -1047,6 +1055,10 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
         // (unlike `Drop`, which recovers so the slot still releases), so EVERY subsequent
         // open to EVERY provider fails here for the life of the process. Report it at that
         // severity rather than letting it trickle out as one more unlabeled open failure.
+        //
+        // Marked [`LocalPullFault`] as well as [`OpenReported`] (#1560): "must be restarted"
+        // is the loudest node-wide buyer fault there is, and until it was typed as ours the
+        // serve path answered every client a `NotFound` about the content instead.
         let mut in_flight = self.opens_in_flight.lock().map_err(|err| {
             self.metrics.node_pull_channel_open_failure();
             error!(
@@ -1055,7 +1067,9 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
                 "opens_in_flight mutex poisoned by an earlier panic; this node can no longer \
                  open a buyer channel to ANY provider and must be restarted"
             );
-            anyhow::anyhow!("opens_in_flight mutex poisoned: {err}").context(OpenReported)
+            anyhow::anyhow!("opens_in_flight mutex poisoned: {err}")
+                .context(OpenReported)
+                .context(LocalPullFault)
         })?;
 
         if let Some(existing) = in_flight.get(&provider_addr) {
