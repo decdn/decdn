@@ -816,9 +816,24 @@ impl std::error::Error for PullStalled {}
 ///
 /// The exception was this class. A node whose own signer is broken cannot pay
 /// anybody, and would previously walk the candidate list tarring every honest
-/// provider it met with an `Unreachable` — an EWMA hit AND a gossiped observation —
-/// on the strength of its own fault. Attach this marker at a local-fault site and
-/// the classifier exonerates the peer and warns about us instead.
+/// provider it met with an `Unreachable` — a local EWMA hit; ADR 008 scoring is
+/// local-only — on the strength of its own fault. Attach this marker at a
+/// local-fault site and the classifier exonerates the peer and warns about us instead.
+///
+/// # It now also decides what a CLIENT is told (#1560)
+///
+/// Reputation is no longer the only consequence. A second consumer — the node crate's
+/// `record_channel_open_failure` — reads this marker to choose between answering a
+/// downstream client `StreamError::NotFound` ("we could not obtain this blob") and
+/// `InternalError` ("unexpected failure; do not retry this node"). That path involves no
+/// peer and no reputation at all.
+///
+/// So attaching this marker at a NEW site changes serve-path refusals, not just scoring.
+/// Attach it when the failure means *this node* cannot serve anyone — a broken signer, an
+/// unreadable or unwritable store, a poisoned lock, an unfunded wallet. Do NOT attach it to
+/// a condition that is specific to one peer, one channel, or one blob, however much it is
+/// "our side" of the exchange: a wedged channel to a single provider is ours and is still a
+/// clean miss, because the node can serve every other request perfectly well.
 ///
 /// It is a marker, so it composes: `.context(LocalPullFault)` on any error.
 #[derive(Debug)]

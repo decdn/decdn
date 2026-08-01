@@ -180,12 +180,19 @@ impl ClientHandler {
                 tracing::debug!(%hash, error = %e, "node-to-node pull-through found no source");
                 FillOutcome::CleanMiss
             }
-            // A TRANSIENT backend fault — the node is degraded, not empty. Report
-            // it as a fault so the caller can refuse `InternalError` if no further
-            // tier fills (#1129), rather than reporting a broken origin as a miss.
+            // A backend fault — the node is degraded, not empty. Report it as a fault so
+            // the caller can refuse `InternalError` if no further tier fills (#1129),
+            // rather than reporting a broken origin as a miss.
+            //
+            // NOT necessarily transient, which this arm used to claim outright: since
+            // #1560 the node-origin also surfaces its own buyer-side faults here (a
+            // broken signer, an unusable deadline config, an unreadable channel store) as
+            // `OriginPullError::Permanent`, and those recur for every hash until an
+            // operator acts. Telling an operator to wait for a permanent defect to pass
+            // is worse than saying nothing, so the line names neither lifetime.
             Ok(Err(e @ (CacheError::OriginError { .. } | CacheError::Store(_)))) => {
                 self.metrics.node_pull_through_error();
-                tracing::warn!(%hash, error = %e, "node-to-node pull-through hit a transient backend fault");
+                tracing::warn!(%hash, error = %e, "node-to-node pull-through hit a backend fault");
                 FillOutcome::HardFault
             }
             // Everything else (`BlobTooLarge`, `HashMismatch`, `VerifyFailed`,
