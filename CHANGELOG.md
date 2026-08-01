@@ -655,10 +655,12 @@ since project inception and will roll into the first tagged release.
   already maps through `CacheError::OriginError` → `FillOutcome::HardFault` →
   `ServeRejectReason::InternalError`, and the window-paced path folds it into
   the same `fault_seen` latch the reactive local-origin tier has used since
-  #1129. Channel-open failures are split by reason rather than blanket-classified:
-  a poisoned open lock or an unreadable channel store is node-wide and refuses,
-  while a per-provider on-chain revert, a pending open, and a reconcile-held slot
-  stay clean misses.
+  #1129. Buyer channel-open failures are attributed at the site that raises them
+  rather than guessed at by the caller: a poisoned open lock, an unreadable
+  channel store, a store write that leaves a deposit untracked, a panicked open
+  task, and a wallet that cannot fund a deposit all refuse, while a pending open,
+  a reconcile-held slot, an unreclaimable expired channel, a per-provider on-chain
+  revert, and a transient RPC fault stay clean misses.
   - Scope is deliberately narrow: only a local fault changes the wire code. A
     wedged or settled *channel* to one provider still answers `NotFound` — it is
     not evidence this node is broken for every client and every blob, and it
@@ -678,9 +680,9 @@ since project inception and will roll into the first tagged release.
     clean-miss branch. No metric was added or renamed.
   - **Known gaps, unchanged by this fix:** when the pull-through deadline expires,
     `tokio::time::timeout` drops the walk and any latched fault dies with it, so
-    that exit still answers `CacheMiss`. A node whose buyer bootstrap never
-    completed is likewise indistinguishable on the wire from one with pull-through
-    switched off.
+    that exit can only report a fault an earlier tier saw. A node whose buyer
+    bootstrap never completed is likewise indistinguishable on the wire from one
+    with pull-through switched off.
 
 - **An underfunded channel no longer gets one interval free per request
   (#1516).** The direct-serve path signed a success `StreamResponse` and streamed

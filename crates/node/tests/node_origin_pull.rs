@@ -37,7 +37,9 @@ use decdn_incentive::{
     MemoryChannelStateStore, ProbeSlashData, StreamSlashData, Voucher, bind_node_id_domain,
     binding_signing_hash, signed_to_wire_voucher, slash_judge_domain, voucher_domain,
 };
-use decdn_node::buyer_channel::{ChannelOpenPending, ChannelOpener, OpenSlotReserved};
+use decdn_node::buyer_channel::{
+    ChannelOpenPending, ChannelOpener, OpenReported, OpenSlotReserved,
+};
 use decdn_node::client_requester::{
     ChannelContext, ChannelLedger, Cumulative, LocalPullFault, PullDeadlines, stream_fetch_shared,
 };
@@ -3509,26 +3511,29 @@ async fn window_open_reports_a_local_fault_rather_than_a_clean_miss() -> Result<
 
 /// How a [`FailingOpener`]'s channel open fails — one per class the caller-side ladder
 /// distinguishes (#1560).
+///
+/// **Each shape reproduces the marker chain its production counterpart actually carries**,
+/// which is the whole point of the enum. The first cut of this fixture attached only the
+/// distinguishing marker, and that omission hid the bug it was written to catch: every
+/// production leg of the open task also carries `OpenReported`, so a `NodeWide` error with
+/// no `OpenReported` cannot detect whether the ladder checks `LocalPullFault` first, and a
+/// `PerProvider` error with no `OpenReported` was answered `Clean` by an arm that no real
+/// error ever reaches. Both mutations stayed green. Keep the chains faithful.
 #[derive(Debug, Clone, Copy)]
 enum OpenFailureShape {
-    /// Typed `LocalPullFault` by the buyer path itself: `join_or_spawn_open`'s
-    /// poisoned-`opens_in_flight` leg and `reuse_live_or_report`'s unreadable-store leg,
-    /// both of which log that this node "can no longer open a buyer channel to ANY
-    /// provider".
+    /// Typed `LocalPullFault` by the buyer path itself — `join_or_spawn_open`'s
+    /// poisoned-`opens_in_flight` leg (which logs that this node "can no longer open a
+    /// buyer channel to ANY provider and must be restarted"), `reuse_live_or_report`'s
+    /// unreadable-store leg (recoverable: "until the store recovers"), `run_open`'s store
+    /// write, a panicked open task, and an `InsufficientDeposit` wallet. All of them ALSO
+    /// carry `OpenReported`, because the open path reports before it returns.
     NodeWide,
-    /// A classified, per-provider on-chain condition. Another candidate may still pay.
+    /// A classified, per-provider on-chain condition, reported by the open task like every
+    /// other leg. Another candidate may still pay.
     PerProvider,
-    /// Unclassified and raised outside the open task — which is what the residual arm of
-    /// `record_channel_open_failure` exists for, and it reads that as this node's store or
-    /// lock state.
+    /// Unclassified and raised outside the open task — the residual, which the ladder reads
+    /// as this node's own state. No `OpenReported`, because nothing reported it.
     Residual,
-}
-
-impl OpenFailureShape {
-    /// Whether the caller-side ladder should call this ours.
-    const fn is_ours(self) -> bool {
-        matches!(self, Self::NodeWide | Self::Residual)
-    }
 }
 
 /// A [`ChannelOpener`] that always fails, in a caller-selected shape.
@@ -3547,8 +3552,10 @@ impl ChannelOpener for FailingOpener {
     ) -> Result<ChannelContext> {
         let err = anyhow::anyhow!("stub channel open failed");
         Err(match self.shape {
-            OpenFailureShape::NodeWide => err.context(LocalPullFault),
-            OpenFailureShape::PerProvider => err.context(ChannelOpenFailureReason::ContractRevert),
+            OpenFailureShape::NodeWide => err.context(OpenReported).context(LocalPullFault),
+            OpenFailureShape::PerProvider => err
+                .context(ChannelOpenFailureReason::ContractRevert)
+                .context(OpenReported),
             OpenFailureShape::Residual => err,
         })
     }
@@ -3579,19 +3586,24 @@ impl ChannelOpener for FailingOpener {
 /// channel to ANY provider and must be restarted" and then, before this fix, told every
 /// client the content did not exist.
 ///
-/// The split is by REASON, and all three classes are driven here. A classified
-/// `ContractRevert` is one provider's on-chain condition and must stay a clean miss, or a
-/// single unlucky provider would make a healthy node declare itself broken. An unclassified
-/// residual failure counts as ours, because everything the open task raises is marked and
-/// returns earlier — so what is left was raised outside it, which is this node's own store
-/// or lock state.
+/// Attribution comes from a marker the raising site attaches, and all three classes are
+/// driven here with production's real marker chains. A `ContractRevert` reported by the open
+/// task is one provider's on-chain condition and must stay a clean miss, or a single unlucky
+/// provider would make a healthy node declare itself broken. An unmarked residual counts as
+/// ours, because every leg the open path knows about returns earlier — so what is left was
+/// raised outside it and nobody classified it.
+///
+/// The expectation is written as a literal per shape rather than derived from a helper: a
+/// symmetric `is_local_fault() == shape.is_ours()` also passes when BOTH sides invert, which
+/// is precisely the mutation a classifier refactor would produce.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_node_wide_channel_open_fault_refuses_rather_than_reporting_an_absent_blob() -> Result<()>
 {
-    for shape in [
-        OpenFailureShape::NodeWide,
-        OpenFailureShape::PerProvider,
-        OpenFailureShape::Residual,
+    // (shape, is a fault of ours, bumps the generic channel-open-failure counter)
+    for (shape, expect_ours, expect_open_failure_counter) in [
+        (OpenFailureShape::NodeWide, true, false),
+        (OpenFailureShape::PerProvider, false, false),
+        (OpenFailureShape::Residual, true, true),
     ] {
         let payload = vec![0x5Eu8; 4096];
         let hash = Hash::new(&payload);
@@ -3637,17 +3649,30 @@ async fn a_node_wide_channel_open_fault_refuses_rather_than_reporting_an_absent_
         .ok_or_else(|| anyhow::anyhow!("no channel can be opened, so no pull can start"))?;
 
         anyhow::ensure!(
-            miss.is_local_fault() == shape.is_ours(),
-            "a {shape:?} channel-open failure must report is_local_fault()={}, got {miss:?}",
-            shape.is_ours()
+            miss.is_local_fault() == expect_ours,
+            "a {shape:?} channel-open failure must report is_local_fault()={expect_ours}, \
+             got {miss:?}"
         );
         let attempts = u64::try_from(MAX_PROVIDER_ATTEMPTS).unwrap_or(u64::MAX);
         assert_counter(
             &b_metrics,
             "node_pull_local_fault_total",
-            if shape.is_ours() { attempts } else { 0 },
+            if expect_ours { attempts } else { 0 },
         )?;
-        // Either way every provider is exonerated: none of them ever got a request.
+        // Distinguishes the three arms from each other, not just their verdicts. The
+        // `LocalPullFault` arm returns before the generic counter is bumped and the
+        // `OpenReported` arm never reaches it, so only the residual moves this one — which
+        // means deleting either of the first two arms changes this assertion too.
+        assert_counter(
+            &b_metrics,
+            "node_pull_channel_open_failures_total",
+            if expect_open_failure_counter {
+                attempts
+            } else {
+                0
+            },
+        )?;
+        // Every provider is exonerated regardless: none of them ever got a request.
         assert_counter(&b_metrics, "node_pull_unreachable_total", 0)?;
 
         ep_b.close().await;
@@ -3663,16 +3688,36 @@ async fn a_node_wide_channel_open_fault_refuses_rather_than_reporting_an_absent_
 /// `miss_answer` at the `budget == 0` short-circuit — never reaching the cold tail the other
 /// tests drive. Without this, reverting that arm to `Ok(OriginFetch::NotFound)` leaves the
 /// whole suite green.
+///
+/// `candidates` is the seeded probe-cache size, and it selects WHICH exit the walk leaves
+/// through — both are driven, because they are different lines with the same job:
+///
+/// - `MAX_PROVIDER_ATTEMPTS` spends the whole budget and exits at the `budget == 0`
+///   short-circuit, without ever reaching a fresh lookup.
+/// - Fewer leaves budget over, so the walk invalidates the cache entry, falls through to a
+///   discovery that finds nothing (the directory is empty for this hash), and exits at the
+///   no-providers arm — which must still report the fault the CACHED walk latched. That
+///   cross-walk carry is the part nothing else covers, and a partial probe-cache list is
+///   routine rather than exotic: `cached_candidates` filters on the negative cache, the
+///   wedged-provider map, and staker liveness.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_buffered_walk_that_exhausts_its_budget_on_local_faults_refuses_rather_than_missing()
 -> Result<()> {
+    for candidates in [MAX_PROVIDER_ATTEMPTS, MAX_PROVIDER_ATTEMPTS - 1] {
+        buffered_local_fault_walk(candidates).await?;
+    }
+    Ok(())
+}
+
+/// One run of the test above, with `candidates` seeded into the probe cache.
+async fn buffered_local_fault_walk(candidates: usize) -> Result<()> {
     let payload = vec![0x5Du8; 4096];
     let hash = Hash::new(&payload);
 
     let (ep_b, _) = local_endpoint(fresh_key(), vec![]).await?;
     let b_id = fresh_key().public();
     let mut addr_map = HashMap::new();
-    let ranked: Vec<(DhtNodeId, u64)> = (0..MAX_PROVIDER_ATTEMPTS)
+    let ranked: Vec<(DhtNodeId, u64)> = (0..candidates)
         .map(|_| {
             let dht = DhtNodeId::from_bytes(*fresh_key().public().as_bytes());
             addr_map.insert(dht, PrivateKeySigner::random().address());
@@ -3722,12 +3767,16 @@ async fn a_buffered_walk_that_exhausts_its_budget_on_local_faults_refuses_rather
         !err.is_transient(),
         "a broken deadline config is not cured by retrying, got {err:?}"
     );
+    // One fault per candidate the walk reached. With a full list that is the whole budget
+    // and the fetch never leaves the cached walk; with a short one the cached walk faults,
+    // the entry is invalidated, and the fall-through re-probes providers that do not answer
+    // — so the second walk contributes no further faults and the `Err` above can only come
+    // from the latch carrying the first walk's verdict across.
     assert_counter(
         &b_metrics,
         "node_pull_local_fault_total",
-        u64::try_from(MAX_PROVIDER_ATTEMPTS).unwrap_or(u64::MAX),
+        u64::try_from(candidates).unwrap_or(u64::MAX),
     )?;
-    assert_counter(&b_metrics, "node_pull_unreachable_total", 0)?;
 
     ep_b.close().await;
     Ok(())
@@ -5148,7 +5197,7 @@ async fn node_origin_mid_stream_silence_scores_stalled_upstream() -> Result<()> 
 /// So a 1 GiB blob — the default `max_blob_size_mb` — read off a cold disk, or served by a
 /// node already streaming to several peers, could blow the 20 s default stall budget doing
 /// exactly what it was asked. The requester then scored it `Unreachable`: a local EWMA hit
-/// AND a gossiped observation, against an honest server, for the crime of being big.
+/// against an honest server, for the crime of being big.
 ///
 /// The fix gives that wait the same verdict the OPEN stage already gives an identical wait —
 /// `PullTimeout`, exonerating — on the same grounds: a bound of ours elapsing over bounded

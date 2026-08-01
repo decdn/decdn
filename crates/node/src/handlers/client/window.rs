@@ -38,8 +38,8 @@ impl ClientHandler {
     /// The open-deadline exit is the one hole left. `tokio::time::timeout` DROPS the
     /// walk, so any miss it had latched dies with the cancelled future and that
     /// arm can only report `fault_seen`. Left as-is deliberately: a deadline expiry is
-    /// not a fault on its own ([`ClientHandler::on_pull_through_timeout`] argues the
-    /// same for the buffered twin), and closing it needs a latch the caller owns rather
+    /// not a fault on its own ([`ClientHandler::on_pull_through_timeout`] treats the
+    /// buffered twin the same way), and closing it needs a latch the caller owns rather
     /// than one living inside the future.
     ///
     /// The leech shed is included deliberately. `StreamError::NotFound`'s own doc

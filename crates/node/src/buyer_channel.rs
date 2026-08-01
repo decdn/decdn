@@ -259,6 +259,13 @@ type BoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + 
 fn rehydrate_open_error(err: &Arc<anyhow::Error>) -> anyhow::Error {
     let reason = err.downcast_ref::<ChannelOpenFailureReason>().copied();
     let reported = err.downcast_ref::<OpenReported>().is_some();
+    // The sentinel the doc above warned about, added in #1560. Dropping it would make the
+    // wire answer depend on WHICH caller observed the failure: the one that spawned the
+    // open would refuse `InternalError`, every caller that merely joined it would sign a
+    // `NotFound` for the same fault. Under load joining is the common case, so the bug
+    // would be intermittent and load-dependent — strictly harder to diagnose than the one
+    // #1560 fixed.
+    let local_fault = err.downcast_ref::<LocalPullFault>().is_some();
     let reserved = err
         .downcast_ref::<OpenSlotReserved>()
         .map(|r| OpenSlotReserved {
@@ -278,6 +285,9 @@ fn rehydrate_open_error(err: &Arc<anyhow::Error>) -> anyhow::Error {
     // seen by anyone — the exact failure mode the doc above warns about.
     if let Some(reserved) = reserved {
         rebuilt = rebuilt.context(reserved);
+    }
+    if local_fault {
+        rebuilt = rebuilt.context(LocalPullFault);
     }
     rebuilt
 }
@@ -444,10 +454,14 @@ impl InFlightOpenGuard {
                          no persisted row, and only the boot reconcile scan will recover it"
                     );
                     // `OpenReported` so a caller that IS still waiting doesn't count this a
-                    // second time — the supervisor above is the report.
+                    // second time — the supervisor above is the report. `LocalPullFault`
+                    // because a panic is the canonical "unexpected failure of this node"
+                    // (#1560): it is deterministic, repeats for every provider, and says
+                    // nothing about whether the content exists.
                     Err(Arc::new(
                         anyhow::anyhow!("buyer channel open task failed: {join_err}")
-                            .context(OpenReported),
+                            .context(OpenReported)
+                            .context(LocalPullFault),
                     ))
                 }
             }
@@ -881,11 +895,15 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
                     "buyer channel opened on-chain but is not live in the store — a deposit \
                      is escrowed against a row we cannot see"
                 );
+                // Node-local by its own log line: a deposit is escrowed against a row we
+                // cannot see, which is this node's store (or clock) disagreeing with the
+                // chain, not a fact about the provider or the content (#1560).
                 anyhow::anyhow!(
                     "buyer channel for provider {provider_addr} opened but is not live in the \
                      store (expired between open and read?)"
                 )
                 .context(OpenReported)
+                .context(LocalPullFault)
             }),
         }
     }
@@ -2309,9 +2327,17 @@ async fn run_open<P: Provider + Clone>(
                  this provider"
             );
             metrics.node_pull_channel_open_failure();
+            // `LocalPullFault` for the reason the line above states: this is OUR store,
+            // and a node that cannot read it cannot pay anyone (#1560). Marked even
+            // though `reuse_live_or_report`'s doc calls this leg the intermittent twin of
+            // the fast-path read — a blip and an outage are the same claim to a client
+            // ("we could not obtain this"), and `FillOutcome::HardFault` covers both
+            // lifetimes on purpose. Classifying the same physical fault differently
+            // depending on which read hit it is the inconsistency worth avoiding.
             return Err(anyhow::Error::new(err))
                 .context("look up existing buyer channel under the open slot")
-                .context(OpenReported);
+                .context(OpenReported)
+                .context(LocalPullFault);
         }
     };
     if let Some(existing) = existing {
@@ -2350,9 +2376,11 @@ async fn run_open<P: Provider + Clone>(
                      reclaim; cannot rotate this provider's channel"
                 );
                 metrics.node_pull_channel_open_failure();
+                // Our store again — same reasoning as the read above (#1560).
                 return Err(anyhow::Error::new(err))
                     .context("re-check expired channel after reclaim")
-                    .context(OpenReported);
+                    .context(OpenReported)
+                    .context(LocalPullFault);
             }
         };
         if after_reclaim.is_some_and(|s| s.channel_id == existing.channel_id) {
@@ -2432,7 +2460,25 @@ async fn run_open<P: Provider + Clone>(
             if let Some(reason) = reason {
                 metrics.channel_open_failure_by_reason(reason);
             }
-            return Err(err.context(OpenReported));
+            // `InsufficientDeposit` alone is node-wide, and it must be typed as ours HERE
+            // rather than classified at the caller (#1560). The caller-side ladder reads
+            // markers, and `OpenReported` — which every leg of this task attaches — ends
+            // its walk before any reason is inspected, so a reason-only split there is
+            // unreachable. Its own doc calls it "an operator misconfiguration either way":
+            // a wallet that cannot fund this deposit cannot fund one for any provider, so
+            // every candidate fails identically and `NotFound` would be a claim about the
+            // content that this node has no basis for. `ContractRevert` is a deterministic
+            // on-chain condition that may be specific to this provider, and `RpcError` is
+            // transient at the network layer by its own definition — neither is evidence
+            // this node is broken.
+            let err = err.context(OpenReported);
+            return Err(match reason {
+                Some(ChannelOpenFailureReason::InsufficientDeposit) => err.context(LocalPullFault),
+                Some(
+                    ChannelOpenFailureReason::ContractRevert | ChannelOpenFailureReason::RpcError,
+                )
+                | None => err,
+            });
         }
     };
 
@@ -2448,9 +2494,16 @@ async fn run_open<P: Provider + Clone>(
              manually against the tx"
         );
         metrics.node_pull_channel_open_failure();
+        // The sharpest of the store legs, and the one the "intermittent blip" argument
+        // does NOT cover (#1560): this is a WRITE. On a full or read-only `data_dir`
+        // every read succeeds and every commit fails, so the fast-path read never faults
+        // and this is the only place the condition surfaces. The node then re-escrows a
+        // fresh deposit on every subsequent miss — an untracked-money emergency by the
+        // log line above — while telling each client the content does not exist.
         return Err(anyhow::Error::new(err))
             .context("persist newly-opened buyer channel")
-            .context(OpenReported);
+            .context(OpenReported)
+            .context(LocalPullFault);
     }
     Ok(())
 }
@@ -4396,11 +4449,60 @@ mod tests {
             "the open task must mark a store fault as already-reported, or a caller that happens \
              to still be waiting double-counts it: {err:#}"
         );
+        // The other half of the contract (#1560), and the one that decides what a CLIENT is
+        // told. `OpenReported` alone means "already logged"; it says nothing about whose
+        // fault this is, and `record_channel_open_failure` reads it as a per-provider leg.
+        // Without the second marker a store this node cannot read answers every client a
+        // signed `NotFound` — a claim about the content — while the log line above says the
+        // node cannot open a channel to anybody.
+        assert!(
+            err.downcast_ref::<LocalPullFault>().is_some(),
+            "a store fault is OURS and must be typed so, or the serve path launders it into \
+             a `NotFound` about the content: {err:#}"
+        );
         assert_eq!(
             counter(&metrics, "node_pull_channel_open_failures_total"),
             1,
             "a store fault under the open slot must bump the channel-open failure counter from \
              inside the task — it is the only party guaranteed to see it"
+        );
+    }
+
+    /// The marker must survive `rehydrate_open_error`, or the wire answer depends on WHICH
+    /// caller observed the failure (#1560).
+    ///
+    /// A caller that spawned the open sees the original error; every caller that merely
+    /// JOINED it sees a rebuilt one, and only the markers `rehydrate_open_error` re-attaches
+    /// survive that rebuild. Its own doc warns that a new sentinel must be added there "or it
+    /// will silently vanish — and only for callers that joined an open, never for the one
+    /// that started it, which is the nastiest possible way for it to fail". `LocalPullFault`
+    /// is exactly such a sentinel, so the joiner would sign a `NotFound` for the same fault
+    /// the spawner refuses — intermittently, and more often under load, since joining is the
+    /// common case when many candidates race.
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    fn rehydrating_a_joined_open_error_keeps_every_marker_that_decides_an_answer() {
+        let original = Arc::new(
+            anyhow::anyhow!("store write failed")
+                .context(ChannelOpenFailureReason::InsufficientDeposit)
+                .context(OpenReported)
+                .context(LocalPullFault),
+        );
+
+        let rebuilt = rehydrate_open_error(&original);
+
+        assert!(
+            rebuilt.downcast_ref::<LocalPullFault>().is_some(),
+            "a joiner must see the same fault attribution as the spawner: {rebuilt:#}"
+        );
+        assert!(
+            rebuilt.downcast_ref::<OpenReported>().is_some(),
+            "already-reported must survive too, or the joiner double-counts: {rebuilt:#}"
+        );
+        assert_eq!(
+            rebuilt.downcast_ref::<ChannelOpenFailureReason>().copied(),
+            Some(ChannelOpenFailureReason::InsufficientDeposit),
+            "the reason label must survive, or the joiner logs `unclassified`: {rebuilt:#}"
         );
     }
 
