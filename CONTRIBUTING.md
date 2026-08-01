@@ -144,6 +144,20 @@ cargo fmt -- --check                 # check formatting
 cargo deny check                     # license + advisory audit (deny.toml)
 ```
 
+The pre-commit hook lints only the default-feature workspace. CI's `clippy` job additionally runs
+the configurations that unification hides, and they fail independently of the hook:
+
+```bash
+cargo clippy --workspace --all-targets --all-features -- -D warnings   # feature-gated targets
+cargo clippy -p decdn-incentive --no-default-features -- -D warnings   # redb not linked
+cargo clippy -p decdn-incentive --no-default-features \
+  --features buyer-store-core -- -D warnings                           # the node's config
+```
+
+The `--all-features` run is the only one that reaches anything behind an off-by-default feature —
+the `anvil-e2e` journeys, `otlp`, `public-api-test`. Run it before pushing a change that touches
+gated code, or the first thing that tells you is a red CI.
+
 ### Public API snapshot
 
 `decdn-protocol` carries a [`public_api`](https://crates.io/crates/public_api) +
@@ -293,7 +307,7 @@ Notes and common snags:
 
 ## Rust Toolchain
 
-`rust-toolchain.toml` pins an exact stable release (currently `1.95.0`); CI uses the same pin via `dtolnay/rust-toolchain@1.95.0` so pre-commit's `cargo clippy` runs the identical lint set as CI. Under a rustup-managed `cargo` (what the devcontainer ships), the pinned toolchain auto-installs and is selected on first `cargo` invocation; other setups need to install `1.95.0` manually.
+`rust-toolchain.toml` pins an exact stable release (currently `1.95.0`); CI uses the same pin via `dtolnay/rust-toolchain@1.95.0` so pre-commit's `cargo clippy` runs the identical lint *rules* as CI. Identical rules, not identical coverage: the hook runs one invocation over the default-feature workspace, while the `clippy` job runs four (see [Build and Test](#build-and-test)). Under a rustup-managed `cargo` (what the devcontainer ships), the pinned toolchain auto-installs and is selected on first `cargo` invocation; other setups need to install `1.95.0` manually.
 
 Dependabot auto-bumps the GitHub Actions refs only — it does **not** touch `rust-toolchain.toml` or `Cargo.toml`'s `rust-version`. When accepting a Dependabot toolchain bump, update those two files in the same PR (and `Cargo.toml`'s `rust-version` if MSRV is moving in lockstep) so developer machines and CI stay aligned.
 

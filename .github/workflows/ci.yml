@@ -72,6 +72,29 @@ jobs:
       - run: >
           cargo clippy -p decdn-incentive --no-default-features
           --features buyer-store-core -- -D warnings
+      # Everything behind an off-by-default feature is invisible to the
+      # `--workspace --all-targets` run above, which turns none of them on:
+      # `anvil-e2e` (all 15 `crates/e2e/tests/*` + the two gated `decdn-node`
+      # tests), `decdn-node/otlp`, `decdn-protocol/public-api-test`,
+      # `decdn-incentive/test-util`. No anvil job ever invokes
+      # clippy — settlement builds only the two `--test` targets it names,
+      # journeys only `decdn-e2e`'s — so the gated targets sat outside the lint
+      # wall every other target obeys and drifted into failing it (#1551), and
+      # `otlp` was neither built nor linted by any job at all.
+      #
+      # `--all-features` rather than a hand-listed `-p A -p B --features F`: the
+      # curated `--test` list at the settlement job below is how
+      # `anvil_bringup_shutdown_e2e` rotted, and a package list rots the same
+      # way the first time a third crate gains a gated target. The cost is
+      # honest — this drags opentelemetry/tonic into this job's
+      # `shared-key: clippy` cache — and it buys back the rot risk.
+      #
+      # Linting here rather than in the anvil jobs keeps the fast feedback on
+      # this job's warm cache and off those jobs' hour-scale timeouts. This is a
+      # LINT gate, not a build-parity check: it compiles one unified
+      # all-features configuration, which is not the per-job feature set either
+      # anvil job builds.
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
   deny:
     name: cargo deny
@@ -634,6 +657,9 @@ jobs:
       # `anvil_bringup_shutdown_e2e` silently rotted: it was never built by any
       # job, so it stopped compiling for three days without a red build and was
       # even edited in that state. Any new `anvil_*` target must be added here.
+      # The clippy job's `--all-features` run now COMPILES every gated target, so
+      # that particular rot cannot recur silently — but compiling is not running.
+      # A target missing from the list below still never executes.
       - name: Run on-chain anvil e2e
         run: |
           cargo nextest run -p decdn-node --features anvil-e2e \
@@ -643,37 +669,42 @@ jobs:
   anvil-e2e-journeys:
     name: anvil e2e (journeys)
     runs-on: blacksmith-4vcpu-ubuntu-2404
-    # Bound above the ~128m balanced journeys schedule (below) plus the bin build
+    # Bound above the ~149m balanced journeys schedule (below) plus the bin build
     # and workspace compile, so a genuinely hung test hits its own clear per-test
     # message before this opaque job-level kill (#785). The step below runs the
     # whole `anvil-e2e` feature with no target filter, so the inventory is every
-    # gated test, not a curated list: at --test-threads 2 that is 20 tests across
-    # 17 files whose per-test `OVERALL_TIMEOUT` ceilings sum to 269m:
-    #   13m x8  smoke, cli_publish, cli_fetch_manifest, cli_fetch_topup,
-    #           cli_setup_partial, cli_fetch_resume, G-NODE-06,
-    #           coop_close_watermark_reconcile
-    #   10m x6  G-NODE-04 (3 tests), G-ORIGIN-01 (2 tests),
-    #           origin_blacklist_compliance
-    #   15m x3  G-NODE-08 (authorized-origin), G-NODE-08 (namespace-scope),
-    #           G-NODE-08 (revocation)
-    #   20m x3  slash_appeal, G-GOV-02, G-GOV-03
-    # A balanced 2-thread schedule is ~135m (269/2, no single test exceeding it),
+    # gated test, not a curated list: at --test-threads 2 that is 25 tests across
+    # 15 files whose per-test `OVERALL_TIMEOUT` ceilings sum to 298m. Count tests,
+    # not files — `cli_fetch_topup` alone is four:
+    #   13m x11  smoke, cli_publish, cli_setup_partial, cli_fetch_resume,
+    #            cli_bundle_pull_channel_id, coop_close_watermark_reconcile,
+    #            G-NODE-06 (1 test each) + cli_fetch_topup (4 tests)
+    #   20m x3   slash_appeal, G-GOV-02, G-GOV-03
+    #   10m x8   G-NODE-04 (3 tests), origin_blacklist_compliance (3 tests),
+    #            G-ORIGIN-01 (2 tests)
+    #   5m  x3   origin_stream_while_store
+    # A balanced 2-thread schedule is ~149m (298/2, no single test exceeding it),
     # so the bound must clear that plus the bin build, the workspace compile and
     # the per-fixture in-test forge deploys. Keep this inventory in sync when
-    # adding a journey — it has gone stale twice already (it once described 6
-    # tests after the cli_* and G-ORIGIN-* journeys landed, and later named a
-    # nonexistent G-ORIGIN-04 while missing the G-GOV-02 / G-NODE-08 journeys).
-    # The bound was 130m when the balanced ceiling was ~128m; the
-    # coop_close_watermark_reconcile journey (#1495) pushed that to ~135m and
-    # over the bound, so it is raised to 160m to restore the headroom the
-    # ordering argument depends on — a hung test must hit its own clear per-test
-    # message before this opaque job-level kill.
+    # adding a journey — it has gone stale three times now (it once described 6
+    # tests after the cli_* and G-ORIGIN-* journeys landed; later named a
+    # nonexistent G-ORIGIN-04 while missing the G-GOV-02 / G-NODE-08 journeys;
+    # and most recently claimed 20 tests across 17 files by naming a
+    # cli_fetch_manifest and three G-NODE-08 tests that exist nowhere in the
+    # repo, counting cli_fetch_topup once when it holds four, and omitting
+    # cli_bundle_pull_channel_id and origin_stream_while_store outright).
+    # The bound was 130m at a ~128m balanced ceiling, then 160m when
+    # coop_close_watermark_reconcile (#1495) pushed it to ~135m. The corrected
+    # 298m sum puts the real ceiling at ~149m, which leaves 160m only ~11m for
+    # the compile the rule above says it must also cover, so it is raised to 175m
+    # to restore the ~25m of headroom that bump targeted — a hung test must hit
+    # its own clear per-test message before this opaque job-level kill.
     # In practice the job finishes in ~10m; these are ceilings, not
     # estimates. The generous backstop deliberately lets a wedged compile or a
     # pre-timer forge hang burn the full bound rather than reintroduce the opaque
     # sub-ceiling kill (#785) that masks the clear per-test message this ordering
     # exists to surface.
-    timeout-minutes: 160
+    timeout-minutes: 175
     needs: changes
     if: >-
       needs.changes.outputs.rust == 'true' ||

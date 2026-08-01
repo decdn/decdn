@@ -50,6 +50,10 @@ use decdn_incentive::buyer_channel_redb::RedbBuyerChannelStore;
 use decdn_incentive::eth_identity;
 use decdn_incentive::payment_channel::PaymentChannel;
 use decdn_incentive::voucher_domain;
+// The denominator of `next_voucher`'s `ceil(bytes * rate / MB)` pricing, taken
+// from the protocol rather than re-spelled locally: a hand-copied 1024 * 1024
+// would keep passing if the protocol constant ever moved.
+use decdn_protocol::MB_BYTES;
 
 const DEPOSIT_MICRO_USDC: u64 = 10_000_000; // 10 USDC (ADR 003 recommended minimum)
 const OVERALL_TIMEOUT: Duration = Duration::from_secs(780);
@@ -741,7 +745,6 @@ async fn run_multi_interval_topup() -> anyhow::Result<()> {
     //    bytes at least once, so `wire_floor` is the TIGHT no-under-pay gate: the
     //    old `fetch_start + wire_delta` resume skipped delivered content and
     //    settles strictly below it.
-    const MB_BYTES: u64 = 1024 * 1024;
     let blob_len = u64::try_from(blob.len()).context("blob length as u64")?;
     let ceil_cost = |bytes: u64| {
         U256::from(bytes)
@@ -1036,7 +1039,7 @@ async fn run_two_topup_fetch() -> anyhow::Result<()> {
     let ceil_cost = |bytes: u64| {
         U256::from(bytes)
             .saturating_mul(U256::from(TWO_TOPUP_RATE_PER_MB))
-            .div_ceil(U256::from(1024u64 * 1024))
+            .div_ceil(U256::from(MB_BYTES))
     };
     let whole_wire = align_range(0, 0, blob_len)
         .context("align whole blob")?
