@@ -255,5 +255,25 @@ async fn run_corrupt_outboard() -> anyhow::Result<()> {
         .await
         .context("node must stay healthy after serving a corrupt outboard")?;
 
+    // ADR 037 AC 13 / ADR 038 AC 4: the bytes teed before the tamper was caught
+    // must NOT have been committed as a local copy. Prove it the way test A
+    // proves the opposite — by taking the origin away and asking again. Delete
+    // both the data object and the corrupt outboard, so a second fetch has no
+    // origin left to stream from; it can only succeed if the node kept a copy
+    // of the partial, unverified bytes. A fresh client keeps the first buyer's
+    // channel state from masking the answer.
+    let data_path = node.origin_root().join(shard).join(hex.as_str());
+    std::fs::remove_file(&data_path).context("remove seeded origin data object")?;
+    std::fs::remove_file(&outboard_path).context("remove corrupted origin outboard")?;
+
+    let second_client = ClientFixture::new(&chain).await?;
+    let after_origin_removed = second_client.fetch(&chain, &node, hash, U256::ZERO).await;
+    anyhow::ensure!(
+        after_origin_removed.is_err(),
+        "a fetch that failed bao verification must leave NO committed local copy, so a second \
+         fetch with the origin removed must fail — it succeeded, meaning partial unverified \
+         bytes were committed"
+    );
+
     Ok(())
 }
