@@ -591,11 +591,11 @@ For how nodes validate `rate_per_mb` against the cached floor before signing pro
 | `setKeeper(addr)` / `setSwapRouter(addr)` | Governance: rotate the authorized keeper or swap router. |
 | `setSlippageTolerance(bps)` / `setMinBuybackAmount(n)` / `setMaxBuybackAmount(n)` | Governance: per-call execution guards. |
 | `setEpochLiquidityCapFraction(bps)` | Governance: per-epoch USDC liquidity cap as a fraction of epoch-start pool depth (bounded `[1%, 30%]`, [ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol)). |
-| `setVault(addr)` / `setPool(addr)` | Governance: wire/rotate the Balancer V3 Vault (pool-registration and pool-state reads, not an approval target) and pool. |
+| `setVault(addr)` / `setPool(addr)` | Governance: wire/rotate the Balancer V3 Vault and the pool. The Vault serves pool-registration and pool-state reads only; it is not an approval target. |
 | `poke()` | Permissionless: advance the on-chain TWAP price accumulator that backs the `minOut` floor. |
 | `keeper() → address` / `getAccumulatedFees() → uint256` | Views: current keeper and accumulated buyback inflow (USDC). |
 
-This is the canonical `BuybackBurner` interface. [ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split) defines the economic parameters and the 30% router-fed inflow source. [ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol) specifies the venue (Balancer V3 Router + 80/20 weighted pool) and how `setSwapRouter` / `setPool` are configured at deployment. **V3 integration note:** `setSwapRouter` holds the Balancer V3 **Router** address, but the Router does not pull input tokens through a plain ERC20 allowance — it pulls them through **Permit2** (`permit2.transferFrom`), so Permit2 is the approval target and the Vault is not one at all. The concrete `BuybackBurnerBalancerV3` ([#686](https://github.com/decdn/decdn/issues/686)) authorizes each swap in two **scoped per-swap** legs — `usdc.forceApprove(permit2, amountIn)`, then `permit2.approve(usdc, swapRouter, amountIn, block.timestamp)` — and resets both to `0` after the swap, so no standing allowance survives. The Vault address is held separately and used only for pool-registration and pool-state reads. See [ADR 018 — Buyback execution via Balancer V3](018-liquidity-strategy.md#buyback-execution-via-balancer-v3).
+This is the canonical `BuybackBurner` interface. [ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split) defines the economic parameters and the 30% router-fed inflow source. [ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol) specifies the venue (Balancer V3 Router + 80/20 weighted pool) and how `setSwapRouter` / `setPool` are configured at deployment. **V3 integration note:** `setSwapRouter` holds the Balancer V3 **Router** address. The Router does not pull input tokens through a plain ERC20 allowance — it pulls them through **Permit2** (`permit2.transferFrom`), so Permit2 is the approval target and the Vault is never one. The concrete `BuybackBurnerBalancerV3` ([#686](https://github.com/decdn/decdn/issues/686)) uses a scoped per-swap Permit2 approval and resets it to `0` after each swap, so no standing allowance survives. The Vault address is held separately and serves pool-registration and pool-state reads only. [ADR 018 § Buyback execution via Balancer V3](018-liquidity-strategy.md#buyback-execution-via-balancer-v3) is authoritative for the mechanism.
 
 All `set*` functions are governance-only behind a timelock.
 
@@ -835,7 +835,7 @@ The protocol requires a verifiable mapping between iroh NodeIds (ed25519 public 
 
 ### Binding Message Format
 
-The binding uses EIP-712 typed structured data, signed by the Ethereum private key. Two typed structs share the per-address `nonce` counter: initial registration signs `RegisterNode`, which additionally binds the operator's acceptance of the current operator terms ([ADR 019 § Terms Acceptance](019-node-onboarding.md#operator-safety-obligations)); rebinding (key rotation) signs the narrower `BindNodeId`.
+The binding uses EIP-712 typed structured data, signed by the Ethereum private key. Two typed structs share the per-address `nonce` counter: initial registration signs `RegisterNode`, which additionally binds the operator's acceptance of the current operator terms ([ADR 019 § Operator Safety Obligations](019-node-onboarding.md#operator-safety-obligations)); rebinding (key rotation) signs the narrower `BindNodeId`.
 
 ```solidity
 bytes32 constant REGISTER_NODE_TYPEHASH = keccak256(
@@ -851,7 +851,7 @@ Where:
 
 - `nodeId`: the 32-byte ed25519 public key (iroh `NodeId`)
 - `nonce`: a monotonic counter per Ethereum address, preventing replay of revoked bindings
-- `termsHash`: the operator-terms hash the caller accepts, which must equal the governance-canonical `currentTermsHash` (registration only; see [ADR 019 § Terms Acceptance](019-node-onboarding.md#operator-safety-obligations))
+- `termsHash`: the operator-terms hash the caller accepts, which must equal the governance-canonical `currentTermsHash` (registration only; see [ADR 019 § Operator Safety Obligations](019-node-onboarding.md#operator-safety-obligations))
 
 The EIP-712 domain separator is the same as the `CapacityBond` contract deployment (chain ID + contract address), preventing cross-chain and cross-contract replay. Terms acceptance is enforced at registration only, so rotating a NodeId through `bindNodeId` neither carries nor re-checks `termsHash`.
 
