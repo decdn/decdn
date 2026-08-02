@@ -10,7 +10,10 @@
 //! window), `g_gov_02_rate_bounds.rs` and `g_gov_03_real_evidence.rs`
 //! (governance → daemon, and daemon signatures as on-chain evidence),
 //! `g_origin_01_publish.rs` (namespace lifecycle), and the `cli_*` files
-//! (publish, setup, fetch resume / top-up, bundle pull).
+//! (publish, setup, fetch resume / top-up, bundle pull). Feature-scoped
+//! journeys sit beside them on the same fixtures —
+//! `coop_close_watermark_reconcile.rs` and `origin_stream_while_store.rs` — so
+//! the directory listing, not this paragraph, is the authority on coverage.
 //!
 //! The gap is G-NODE-08 — content published to a namespace becoming servable
 //! *as an origin*, which needs `OriginAssignment` publisher vetting, a seated

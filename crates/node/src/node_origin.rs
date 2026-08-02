@@ -1,10 +1,10 @@
 //! `NodeOrigin` — the node-to-node cache-miss pull-through origin (#831, ADR
 //! 001/022).
 //!
-//! `CacheEngine` ingests blobs only through the [`Origin`] trait, so the
-//! production shape of "on a miss, discover a provider, open a paid channel,
-//! pull, and populate the cache" is an [`Origin`] implementation injected into
-//! the engine's origin chain (appended last, so configured HTTP/FS/S3 origins
+//! A whole-blob cache miss reaches the network through the engine's origin
+//! chain, so the production shape of "on a miss, discover a provider, open a
+//! paid channel, pull, and populate the cache" is an [`Origin`] implementation
+//! injected into that chain (appended last, so configured HTTP/FS/S3 origins
 //! are tried first and the paid network pull is the final fallback). On
 //! [`Origin::fetch`] this:
 //!

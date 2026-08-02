@@ -19,13 +19,15 @@
 //! pull-through origin drives `openChannel` and voucher signing on a miss.
 //!
 //! Stale-close defense is the one payment-channel surface this crate does not
-//! reach. Per `adr/appendix-fraud-detection.md` there is no watchtower role,
-//! no escrow contract, and no wire protocol for it: `disputeChannel` is
-//! permissionless, so a node protects itself with a local in-process monitor
-//! that follows `ChannelCloseInitiated` on its own channels and re-submits its
-//! latest voucher. Driving that monitor is a runtime concern, so the
-//! [`payment_channel`] bindings here carry the close/withdraw surface but no
-//! `disputeChannel` call.
+//! reach, and it is not built on either side yet. Per
+//! `adr/appendix-fraud-detection.md` it needs no watchtower role, no escrow
+//! contract, and no wire protocol: `disputeChannel` is permissionless, so the
+//! primary mechanism is a local in-process monitor that follows
+//! `ChannelCloseInitiated` on the node's own channels and re-submits its latest
+//! voucher (operator-arranged redundancy and the dispute window back it). That
+//! monitor is deferred (#324) — the runtime observes the event but never
+//! disputes — so the [`payment_channel`] bindings here carry the close/withdraw
+//! surface and deliberately omit `disputeChannel`.
 
 pub mod bind_sig;
 pub mod buyer_channel;

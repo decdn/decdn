@@ -20,8 +20,10 @@
 //! and provisions when `cache.node_to_node_pull_through_enabled` is set;
 //! `node_origin_pull.rs` is the suite that covers it. This file instead drives
 //! the two protocol hops by hand: hop 1 opens the channel and pulls, and step 2
-//! populates B's cache. Of those, the cache population is the one with no public
-//! API at all — `CacheEngine` only ingests via origins — so step 2 stands one up:
+//! populates B's cache. Of those, the cache population is the awkward one: the
+//! engine's public ingest paths are origin pull-through and `open_tee_sink`, and
+//! the tee wants a bao verified stream (ADR 038 framing) rather than the
+//! plaintext `stream_fetch` hands back — so step 2 stands an origin up instead.
 //! `cache_with_blob(&pulled)` builds B's cache by round-tripping the paid-for
 //! bytes through a throwaway filesystem origin (see `support::cache_with_blob`).
 //! Keeping the orchestration out means a failure here points at the wire halves,
@@ -247,10 +249,11 @@ async fn node_to_node_pull_through_two_hops() -> anyhow::Result<()> {
     assert_channel_advanced(&store_a, "A<->B", a_channel_id, RATE_A)?;
 
     // --- Step 2: build B's cache from the pulled bytes -------------------
-    // Stand-in for the deferred runtime wiring: a real node's `NodeOrigin` would
-    // populate the cache during the miss. `CacheEngine` has no public ingest
-    // API (only origin pull-through), so `cache_with_blob` builds B's cache by
-    // round-tripping the paid-for bytes through a throwaway filesystem origin.
+    // Stand-in for the runtime wiring this file leaves out: a real node's
+    // `NodeOrigin` populates the cache during the miss. The engine's public
+    // ingest paths are origin pull-through and `open_tee_sink` (which wants
+    // bao-framed bytes, not plaintext), so `cache_with_blob` builds B's cache
+    // by round-tripping the paid-for bytes through a throwaway filesystem origin.
     let (cache_b, hash_b, _cache_b_tmp) = cache_with_blob(&pulled).await?;
     anyhow::ensure!(hash_b == hash, "ingested hash mismatch");
 
