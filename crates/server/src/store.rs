@@ -173,6 +173,20 @@ impl Store {
         w.commit()?;
         Ok(MicroUsdc(new_total))
     }
+
+    pub fn cap_refund(&self, client: Address, bucket: u32, amount: MicroUsdc) -> anyhow::Result<()> {
+        let w = self.db.begin_write()?;
+        {
+            let mut cap = w.open_table(CAP)?;
+            let prev = cap
+                .get(cap_key(client, bucket))?
+                .map(|v| v.value())
+                .unwrap_or(0);
+            cap.insert(cap_key(client, bucket), prev.saturating_sub(amount.0))?;
+        }
+        w.commit()?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -205,5 +219,22 @@ mod tests {
         let total = s.cap_add(client, bucket, MicroUsdc(2_000_000)).unwrap();
         assert_eq!(total, MicroUsdc(4_000_000));
         assert_eq!(s.cap_spent(client, bucket).unwrap(), MicroUsdc(4_000_000));
+    }
+
+    #[test]
+    fn cap_refund_saturates() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(dir.path()).unwrap();
+        let client = address!("00000000000000000000000000000000000000aa");
+        let bucket = 42;
+
+        // add some cap, then refund part of it
+        let _total = s.cap_add(client, bucket, MicroUsdc(5_000_000)).unwrap();
+        s.cap_refund(client, bucket, MicroUsdc(2_000_000)).unwrap();
+        assert_eq!(s.cap_spent(client, bucket).unwrap(), MicroUsdc(3_000_000));
+
+        // refund more than exists, should saturate at 0
+        s.cap_refund(client, bucket, MicroUsdc(10_000_000)).unwrap();
+        assert_eq!(s.cap_spent(client, bucket).unwrap(), MicroUsdc(0));
     }
 }
