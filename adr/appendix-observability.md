@@ -87,7 +87,7 @@ These give early warning for the two slashable offenses in [ADR 026 § Slashing 
 | Metric | Warning | Critical | Action |
 |--------|---------|----------|--------|
 | `decdn_probe_hold_unavailable_total{reason="exhausted"}` (rate) | > 0 | > 0 sustained | Reduce load or increase `max_probe_holds`; check for OOM. Filter on `reason="exhausted"` — the `disabled` and `stake_lane_reserved` values are deliberate operator decisions and must not trip this alert. |
-| `decdn_blacklist_sync_lag_seconds` | > 600s (1 poll interval) | > 1800s | **`planned` — do not deploy this rule; nothing emits the gauge and it can never fire.** Thresholds recorded for whoever implements the watcher. Check RPC provider; manual sync if needed. |
+| `decdn_blacklist_sync_lag_seconds` | > 600s (1 poll interval) | > 1800s | **`planned` — do not deploy this rule; nothing emits the gauge and it can never fire.** The watcher ships; what is missing is this version-poll gauge, since the watcher enumerates current chain state instead of keying on a version checkpoint ([ADR 011 § Node Behavior](011-content-takedown.md#node-behavior)). Live blacklist coverage is `decdn_blacklist_watcher_last_tick_timestamp_seconds` below. Thresholds recorded for whoever adds the gauge. |
 | `decdn_blacklist_version_behind` | > 0 | > 1 | **`planned` — do not deploy this rule** (see above). Investigate RPC / poll failure. |
 | `decdn_rate_bounds_clamp_events_total` (rate) | > 0 | — | Raise the `rate_per_mb` config to at least the governance `deliveryFloor`. |
 

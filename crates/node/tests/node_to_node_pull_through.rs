@@ -13,20 +13,21 @@
 //! `stream_fetch`) and that *both* off-chain payment channels advance
 //! (nonce / bytes-delivered / cumulative amount).
 //!
-//! **Boundary (deliberately not covered here).** The production runtime does
-//! NOT yet auto-wire this flow. The cache-engine hook that, on a miss, would
-//! discover a provider, open the upstream channel, pull, and populate the cache
-//! is deferred on provider discovery (ADR 001/022) — `runtime/mod.rs` binds the
-//! bootstrapped `BuyerChannelService` to `_buyer_channel_service` and notes the
-//! same, with no tracking issue for the hook itself. There is also no
-//! `NodeOrigin` impl. This test therefore performs those steps manually: hop 1
-//! opens the channel and pulls, and step 2 populates B's cache. Of those, the
-//! cache population is the one with no public API at all — `CacheEngine` only
-//! ingests via origins — so step 2 stands one up: `cache_with_blob(&pulled)`
-//! builds B's cache by round-tripping the paid-for bytes through a throwaway
-//! filesystem origin (see `support::cache_with_blob`). This test composes the
-//! building blocks that exist today; it does not assert the not-yet-built
-//! runtime orchestration.
+//! **Boundary (deliberately not covered here).** The runtime orchestration is
+//! out of scope for this file. The cache-engine hook that, on a miss, discovers
+//! a provider, opens the upstream channel, pulls, and populates the cache is
+//! `decdn_node::node_origin::NodeOrigin`, which `runtime/mod.rs` constructs
+//! and provisions when `cache.node_to_node_pull_through_enabled` is set;
+//! `node_origin_pull.rs` is the suite that covers it. This file instead drives
+//! the two protocol hops by hand: hop 1 opens the channel and pulls, and step 2
+//! populates B's cache. Of those, the cache population is the awkward one: the
+//! engine's public ingest paths are origin pull-through and `open_tee_sink`, and
+//! the tee wants a bao verified stream (ADR 038 framing) rather than the
+//! plaintext `stream_fetch` hands back — so step 2 stands an origin up instead.
+//! `cache_with_blob(&pulled)` builds B's cache by round-tripping the paid-for
+//! bytes through a throwaway filesystem origin (see `support::cache_with_blob`).
+//! Keeping the orchestration out means a failure here points at the wire halves,
+//! not at discovery, reputation, or deadline policy.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -248,10 +249,11 @@ async fn node_to_node_pull_through_two_hops() -> anyhow::Result<()> {
     assert_channel_advanced(&store_a, "A<->B", a_channel_id, RATE_A)?;
 
     // --- Step 2: build B's cache from the pulled bytes -------------------
-    // Stand-in for the deferred runtime wiring: a real node's `NodeOrigin` would
-    // populate the cache during the miss. `CacheEngine` has no public ingest
-    // API (only origin pull-through), so `cache_with_blob` builds B's cache by
-    // round-tripping the paid-for bytes through a throwaway filesystem origin.
+    // Stand-in for the runtime wiring this file leaves out: a real node's
+    // `NodeOrigin` populates the cache during the miss. The engine's public
+    // ingest paths are origin pull-through and `open_tee_sink` (which wants
+    // bao-framed bytes, not plaintext), so `cache_with_blob` builds B's cache
+    // by round-tripping the paid-for bytes through a throwaway filesystem origin.
     let (cache_b, hash_b, _cache_b_tmp) = cache_with_blob(&pulled).await?;
     anyhow::ensure!(hash_b == hash, "ingested hash mismatch");
 

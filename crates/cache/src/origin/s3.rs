@@ -633,10 +633,13 @@ impl Origin for S3Origin {
             // failures they see at headers phase
             // (`classify_get_object_error`) with engine logs and
             // the bucket/key that the request was issued for.
-            // Adding a body-phase context wrapper is a follow-up
-            // (it'd require a bespoke
+            // A body-phase context wrapper is deferred: it needs a
+            // bespoke
             // `Stream::map(io::Error → io::Error::other(format!("{log_target}: …")))`
-            // adapter; out of scope for #271).
+            // adapter wrapping every chunk, and the header-phase
+            // prefix plus the engine log already identify the
+            // request, so the added allocation per chunk buys
+            // little.
             let async_read = resp.body.into_async_read();
             let raw_stream = ReaderStream::new(async_read);
             // Layer the decoder (if any) onto the raw chunk stream. For an

@@ -637,6 +637,53 @@ since project inception and will roll into the first tagged release.
 
 #### Node serve path
 
+- **A fault in this node is no longer signed to clients as a `NotFound` about
+  the content (#1560).** When a node-to-node pull failed for a reason that was
+  *ours* — a buyer key that cannot sign the ADR 005 client binding, a voucher
+  signature the upstream cannot verify (`BadSignature` / `WrongSigner`), an
+  unusable `cache.node_pull_timeout_sec` / `cache.node_pull_stall_timeout_sec`
+  budget, or a buyer-channel store this node cannot read — the serve path
+  collapsed it onto the same clean `NotFound` as "no provider had it". The
+  failure was metered honestly all along
+  (`decdn_node_pull_local_fault_total`, "any sustained rate is an emergency"),
+  but the wire answer told the client the blob does not exist, when in fact it
+  may be one hop away and perfectly reachable. That is the laundering
+  `StreamError::InternalError` ("unexpected failure; do not retry this node")
+  exists to prevent. Each candidate attempt now reports either the payload or a
+  `PullMiss` saying whether the failure was ours: the buffered `Origin::fetch`
+  surfaces a local fault as `OriginPullError::Permanent`, which the cache engine
+  already maps through `CacheError::OriginError` → `FillOutcome::HardFault` →
+  `ServeRejectReason::InternalError`, and the window-paced path folds it into
+  the same `fault_seen` latch the reactive local-origin tier has used since
+  #1129. Buyer channel-open failures are attributed at the site that raises them
+  rather than guessed at by the caller: a poisoned open lock, an unreadable
+  channel store, a store write that leaves a deposit untracked, a panicked open
+  task, and a wallet that cannot fund a deposit all refuse, while a pending open,
+  a reconcile-held slot, an unreclaimable expired channel, a per-provider on-chain
+  revert, and a transient RPC fault stay clean misses.
+  - Scope is deliberately narrow: only a local fault changes the wire code. A
+    wedged or settled *channel* to one provider still answers `NotFound` — it is
+    not evidence this node is broken for every client and every blob, and it
+    already has its own remedy. So does an `OriginBlacklisted` refusal, which is
+    node-wide but is a governance policy state rather than an unexpected failure,
+    and the node can still serve everything already in its cache. A local fault
+    also latches rather than aborting the walk, so a candidate that faults on our
+    own encode or range does not throw away a blob the next candidate was about
+    to serve.
+  - **Operator-visible:** refusals that used to land in
+    `decdn_serve_stream_rejected_cache_miss_total` — the noisiest benign counter
+    on the serve path — now land in
+    `decdn_serve_stream_rejected_internal_error_total`, so
+    `DecdnServeInternalErrorRate` can fire on a node whose buyer side is broken.
+    A buffered-path local fault also now bumps
+    `decdn_node_pull_through_errors_total`, where it previously took the silent
+    clean-miss branch. No metric was added or renamed.
+  - **Known gaps, unchanged by this fix:** when the pull-through deadline expires,
+    `tokio::time::timeout` drops the walk and any latched fault dies with it, so
+    that exit can only report a fault an earlier tier saw. A node whose buyer
+    bootstrap never completed is likewise indistinguishable on the wire from one
+    with pull-through switched off.
+
 - **An underfunded channel no longer gets one interval free per request
   (#1516).** The direct-serve path signed a success `StreamResponse` and streamed
   a full credit window — one 1 MB voucher interval at the default cadence, more

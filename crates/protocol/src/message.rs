@@ -254,9 +254,10 @@ pub struct ProbeResponseBody {
     /// MUST NOT sign `true` unless it can guarantee delivery within the
     /// slashing window (ADR 005 §Probe-triggered eviction hold).
     pub has_blob: bool,
-    /// The node's current quoted rate in token base units per MB. The specific
-    /// token is a deployment concern (see ADR 010) — the protocol itself does
-    /// not normalize units across tokens. Bounded by [`MAX_RATE_PER_MB`].
+    /// The node's current quoted rate in payment-token base units per MB. The
+    /// token is USDC, fixed at contract deployment (ADR 003), so the wire
+    /// carries no token identifier and the units need no normalization.
+    /// Bounded by [`MAX_RATE_PER_MB`].
     #[serde(deserialize_with = "deserialize_rate_per_mb")]
     pub rate_per_mb: u64,
     /// The requester-generated microsecond timestamp from the corresponding

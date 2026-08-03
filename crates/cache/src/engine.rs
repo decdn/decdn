@@ -2266,8 +2266,9 @@ impl CacheEngine {
 
     /// Begin a node-driven *tee* fill of `hash` (#856): the caller pushes the bao
     /// verified-stream it forwards from an upstream node→node pull via
-    /// [`TeeSink::write`] (the 8-byte LE content-size header first, then the
-    /// interleaved bao — ADR 038), while the engine decodes + verifies it against
+    /// [`TeeSink::write`] (the header-less interleaved bao — ADR 038; the content
+    /// size goes to [`TeeReservation::begin`], not in band), while the engine
+    /// decodes + verifies it against
     /// the content root and streams the plaintext into the store; [`TeeSink::finish`]
     /// promotes the blob if every chunk group verified. This lets the
     /// node's `cdn/client/v1` handler fuse the upstream pull with downstream

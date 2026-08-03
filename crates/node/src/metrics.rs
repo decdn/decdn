@@ -978,14 +978,21 @@ pub struct DecdnMetrics {
     /// upstreams or a `node_pull_stall_timeout_sec` too tight for the network.
     pub node_pull_stalled: Counter,
     /// `decdn_node_pull_local_fault_total` (#1145 review): a pull failed for a reason
-    /// that is OURS — a broken signer, an encode fault, a bad range computation — and
-    /// the upstream was exonerated.
+    /// that is OURS — a broken signer, an encode fault, a bad range computation, an
+    /// unusable deadline config, or a buyer channel open this node's own state defeated
+    /// (an unreadable or unwritable channel store, a poisoned open lock, a panicked open
+    /// task, a wallet that cannot fund a deposit; #1560) — and the upstream was exonerated.
     ///
     /// The only counter here that says nothing about the network. Any sustained rate is
     /// an emergency: a node that cannot sign a voucher cannot pay for anything, so every
     /// pull it attempts will fail. Before this existed those failures were scored against
     /// whichever honest providers the node happened to try, so the symptom was a node
-    /// steadily gossiping `Unreachable` about a healthy network.
+    /// steadily blaming a healthy network in its own reputation scores.
+    ///
+    /// Counted PER CANDIDATE, not per request: one node-wide fault moves this by up to
+    /// `MAX_PROVIDER_ATTEMPTS` for a single client request, because the walk tries each
+    /// candidate and fails identically on all of them. Read the rate, not the absolute,
+    /// and do not infer the number of affected requests from it.
     pub node_pull_local_fault: Counter,
     /// `decdn_node_pull_channel_open_pending_total` (#1143): a buyer channel open
     /// was still in flight when the per-candidate budget expired, so the pull moved

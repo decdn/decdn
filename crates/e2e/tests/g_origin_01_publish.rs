@@ -126,6 +126,22 @@ async fn run_publish() -> anyhow::Result<()> {
     Ok(())
 }
 
+// The transfer journey is one strictly ordered on-chain script: mint a
+// namespace, assert it starts owned by its creator, queue a transfer, assert the
+// 7-day default timelock and the exact `readyAt`, cancel it and prove it is
+// un-queued, re-queue, warp to just short of `readyAt` and assert the
+// pre-timelock and wrong-caller rejections there, warp past `readyAt`, finalize,
+// then re-check ownership and the cleared pending slot. Every step consumes
+// state the previous step wrote on a live chain — including both warps, since
+// the pre-timelock rejection is only meaningful once the clock has moved — so
+// the sequence, not any nesting, is what makes it long.
+#[allow(
+    clippy::cognitive_complexity,
+    clippy::too_many_lines,
+    reason = "sequential on-chain journey: each step depends on the previous step's chain state, \
+              so decomposing it would thread a state bundle through helpers without reducing the \
+              journey's length or making it easier to follow"
+)]
 async fn run_transfer() -> anyhow::Result<()> {
     let _ = tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -306,9 +322,11 @@ impl Publisher {
     /// `decdn publish namespace create` → the minted namespace id.
     fn namespace_create(&self, chain: &ChainFixture) -> anyhow::Result<u64> {
         let out = self.run(chain, &["publish", "namespace", "create"])?;
+        // `status` distinguishes a confirmed create from a broadcast whose
+        // receipt could not be read; `submitted` is true for both.
         anyhow::ensure!(
-            out["submitted"] == serde_json::json!(true),
-            "namespace create reported submitted=false: {out}"
+            out["status"] == serde_json::json!("created"),
+            "namespace create did not confirm: {out}"
         );
         out["namespace_id"]
             .as_u64()

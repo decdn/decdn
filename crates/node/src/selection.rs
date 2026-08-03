@@ -18,13 +18,13 @@ pub const MAX_PROVIDER_ATTEMPTS: usize = 3;
 /// Per-candidate probe timeout. Because candidates are probed concurrently, this also
 /// bounds the whole probe-collection phase. The budget covers connection setup plus one
 /// unpaid probe request/response. `probe_once` dials a fresh connection every call, and
-/// since 0-RTT was removed (#1429) even a resumable session still pays a handshake round
-/// trip before the request goes out — so every probe costs two RTTs, not one. Against the
-/// 250-300 ms inter-continental figure in ADR 015's context, that puts the furthest
-/// candidates at or past this ceiling. Dropping them is the intended trade (a slow
-/// candidate must not burn the caller's miss-latency budget, ADR 001 § Probe response
-/// collection), but this is the first term to revisit if distant-region selection looks
-/// too sparse.
+/// the protocol has no 0-RTT path, so even a resumable session pays a handshake round trip
+/// before the request goes out — every probe costs two RTTs, not one. At the 250-300 ms
+/// inter-continental RTTs this budget is sized against, that puts the furthest candidates
+/// at or past this ceiling. Dropping them is the intended trade (a slow candidate must not
+/// burn the caller's miss-latency budget), but this is the first term to revisit if
+/// distant-region selection looks too sparse. Both the figure and the trade are ADR 001
+/// § Probe response collection.
 ///
 /// Lives here, beside the deadline arithmetic that has to budget for it, rather than in
 /// `node_origin` where it is used (#1145 review). Every term of [`outer_pull_deadline`] is

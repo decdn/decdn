@@ -53,12 +53,18 @@ blacklist updates and stop being able to settle channels. Once
 
 **Detect:**
 
-- Existing alerts in `monitoring/prometheus-alerts.yml`:
-  - `DecdnBlacklistSyncLagWarning` — blacklist poll lagging > 10 minutes.
-  - `DecdnBlacklistSyncLagCritical` — blacklist sync stale > 30 minutes
-    (every served hash is now potentially slashable). **Note:** these two
-    blacklist alerts cannot fire yet — the node emits no blacklist-sync
-    metrics; see [ContentBlacklist compliance](#contentblacklist-compliance).
+- Existing alerts in `monitoring/prometheus-alerts.yml`: a dead endpoint stalls
+  every chain-event watcher at once, so expect the five that have stalled alerts
+  to fire together — `DecdnBlacklistWatcherStalled`, `DecdnSlashWatcherStalled`,
+  `DecdnStakerSetWatcherStalled`, `DecdnOriginDirectoryWatcherStalled`, and
+  `DecdnSettlementWatcherStalled`. (The sixth, `rate_bounds`, exports a tick
+  gauge but has no rule.) Several firing together points at the RPC endpoint
+  rather than at any one watcher. Each fires on the *age* of that watcher's last
+  successful tick and is guarded against the pre-first-tick sentinel, so a
+  watcher that never established at all is caught by `decdn_*_watcher_down_seconds`
+  and by the blacklist readiness gate, not here.
+  `DecdnBlacklistWatcherStalled` is the one carrying slash risk; see
+  [ContentBlacklist compliance](#contentblacklist-compliance).
 - Direct probe:
 
   ```bash
@@ -131,12 +137,14 @@ slashed by an external adversary.
     present blobs are being advertised without an eviction hold and may be
     evicted before the pull arrives. Budget pressure and lost deliveries,
     not slash evidence; see step 4.
-  - `DecdnBlacklistSyncLagCritical` (critical) — blacklist > 30 minutes
-    stale; serving any recently blacklisted hash is now slashable.
-  - `DecdnBlacklistVersionFarBehind` (critical) — multiple blacklist
-    versions missed. (Both blacklist alerts above are pre-wired but not yet
-    emitted by the node — see
-    [ContentBlacklist compliance](#contentblacklist-compliance).)
+  - `DecdnBlacklistWatcherStalled` (critical) — the blacklist watcher has
+    not completed a poll tick for several intervals, so the node may be
+    serving content blacklisted since the last successful tick. It fires on
+    the age of `decdn_blacklist_watcher_last_tick_timestamp_seconds`. See
+    [ContentBlacklist compliance](#contentblacklist-compliance).
+  - `DecdnBlacklistEnforcementFailing` (critical) — a re-scope could not
+    re-verify or evict every known deny-set entry, so a blacklisted hash may
+    still be servable.
   - `DecdnRateBoundsClamp` (warning) — your configured `rate_per_mb` sits
     *below* the governance `deliveryFloor`, so every quote is being raised to
     the floor before signing. The clamp is raise-only; there is no ceiling. Not
@@ -214,43 +222,73 @@ announcing, or serving it. Serving a globally blocked hash is a slashable
 offense (see [Slashing risk](#slashing-risk)). Protocol semantics:
 [ADR 011](../adr/011-content-takedown.md).
 
-**How a node is meant to learn about a blocked hash.**
+**How a node learns about a blocked hash.** `crates/node/src/blacklist_watcher.rs`
+implements what
 [ADR 011 § Node Behavior](../adr/011-content-takedown.md#node-behavior)
-*designs* a sync loop: poll `getBlacklistVersion()` on `blacklist_poll_interval`
-(10 minutes), fetch the new entries on a version bump, then **in order** stop
-publishing DHT records, stop serving (`StreamRequest` → `HashBlacklisted`), and
-evict. **None of this is implemented at PoC, on either side.** The deployed
-`ContentBlacklist` exposes no `getBlacklistVersion()` accessor (so even the
-delta-sync query the ADR assumes would need a contract change), and the node
-has no blacklist watcher in `crates/`. #1513 removed the four alerts and the
-one panel that queried `decdn_blacklist_sync_lag_seconds` /
-`decdn_blacklist_version_behind`: neither series has ever been emitted, so all
-five were permanently silent while reading as blacklist-lag coverage. Both
-names survive in `adr/appendix-observability.md` as `planned` rows; restore the
-rules when the gauges land. `DecdnBlacklistWatcherStalled` and the
-"Blacklist watcher tick age" panel are the real coverage today — they read
-`decdn_blacklist_watcher_last_tick_timestamp_seconds`, which *is* exported.
-Until the watcher and metrics land, hash-level takedown is a
-**manual operator action** — see Remediate below.
+specifies. Absence of `blockchain.content_blacklist_address` is a hard startup
+failure, so every paid-delivery node runs it. It enumerates the whole in-scope
+deny-set from `ContentBlacklist` at one pinned block on boot —
+`getScopeRegions(operator)` for the one-to-three regions in scope, then
+`blacklistedHashes` / `blacklistedHashCount` per region — and follows
+`HashBlacklisted` / `HashRemoved` on the shared log poller as a low-latency tail.
+There is no version-checkpoint delta cursor: enumeration reads the full current
+state on every boot, so a node returning after any downtime rebuilds the complete
+deny-set from one snapshot. A periodic re-scope is the backstop: an operator
+region or ripening change (`CapacityBond.updateRegion`) can bring a hash into
+scope while emitting nothing on `ContentBlacklist` at all.
 
-Operator-*level* blacklisting is different and **is** enforced today: when
-governance calls `ContentBlacklist.addOperator`, the contract calls
+Enforcement is two writes per hash, in order — a governance-sourced *deny*, then
+the *eviction*. `CacheEngine::evict` durably records the takedown in `evicted.log`
+and cascades to every serving surface through `CacheEngine::refuses` — including
+the DHT republisher dropping the hash on its next tick, the probe handler no
+longer signing `has_blob: true`, and the client handler refusing to re-pull-fill
+it. `evict` is sticky and works on absent hashes, so a hash blacklisted while the
+node was offline is pre-blocked. The separate deny
+records *why*, which `evicted.log` cannot express — otherwise a governance
+takedown would answer `EvictedSinceProbe` while a local `[content] denied_hashes`
+entry answers `HashBlacklisted`, and the difference tells a client which list a
+hash is on (the fingerprint ADR 011 § `StreamRequest` Response forecloses). A
+fail-closed readiness gate keeps every ALPN listener shut until the first
+enumeration + enforcement pass completes, so a node refuses to serve rather than
+serve un-enforced.
+
+Manual eviction (Remediate below) is therefore for a takedown notice you received
+out of band, or for confirming the watcher already acted — not the primary
+mechanism.
+
+Operator-*level* blacklisting runs on a different path, and takes effect in two
+places. When governance calls `ContentBlacklist.addOperator`, the contract calls
 `CapacityBond.ejectNode`, which emits both `EjectedByBlacklist` and a
 nodeId-indexed `NodeAutoEjected`. The node's staker-set watcher follows
 `NodeAutoEjected` and drops the node from its active set live; the
 `EjectedByBlacklist` event is deliberately not subscribed because
 `NodeAutoEjected` already carries the nodeId (see
-`crates/node/src/dht/chain_staker_set.rs`). No operator action is required.
+`crates/node/src/dht/chain_staker_set.rs`). Separately, the blacklist watcher
+folds the blacklisted-address union into the node's origin deny-set, so a
+`StreamRequest` on a channel funded by a blacklisted operator is refused at the
+delivery gate with `OriginDenied` and any in-flight stream is cut at the next MB
+boundary (`crates/node/src/content_deny.rs`). Both are automatic — no operator
+action is required.
 
 **Detect:**
 
-- Alerts in `monitoring/prometheus-alerts.yml` (verbatim names) — **note
-  these will not fire until the node emits the underlying metrics**:
-  - `DecdnBlacklistSyncLagWarning` — blacklist poll lagging > 10 minutes.
-  - `DecdnBlacklistSyncLagCritical` — sync stale > 30 minutes (every served
-    hash is now potentially slashable).
-  - `DecdnBlacklistVersionFarBehind` — multiple blacklist versions missed.
-- Manual on-chain check (works today): query `ContentBlacklist` directly with
+- Alerts in `monitoring/prometheus-alerts.yml` (verbatim names):
+  - `DecdnBlacklistWatcherStalled` (critical) — no successful poll tick for
+    several intervals; fires on the age of
+    `decdn_blacklist_watcher_last_tick_timestamp_seconds`.
+  - `DecdnBlacklistEnforcementFailing` (critical) — a re-scope could not
+    re-verify or evict every known entry, so a blacklisted hash may still be
+    servable even while `decdn_blacklist_watcher_down_seconds` reads 0. The two
+    answer different questions: deny-set enforced vs chain readable.
+- Grafana: the "Blacklist watcher tick age" panel in
+  `monitoring/grafana-dashboard.json`.
+- There is no sync-lag or version-delta coverage: `decdn_blacklist_sync_lag_seconds`
+  and `decdn_blacklist_version_behind` have never been emitted, so #1513 deleted
+  the four alerts that queried them and repointed the one panel onto the tick
+  gauge above, rather than leave permanently silent rules reading as coverage.
+  Both names survive in `adr/appendix-observability.md` as `planned` rows;
+  restore the rules if the gauges land.
+- Manual on-chain check: query `ContentBlacklist` directly with
   the hash from the takedown notice — `isHashBlacklisted(hash)` for global
   entries, `isHashBlacklistedInRegion(hash, region)` for a regional entry. The
   `region` argument is `bytes32`, not a string: global scope is the sentinel
@@ -499,9 +537,11 @@ identity rotation, host clock skew breaking TLS.
    or port-forwarding layer.
 2. If a peer's iroh key was rotated, neighbours referring to its prior
    `NodeId` will not reconnect until they re-discover the new identity via
-   gossip. There is no static bootstrap-peer list in the node config
-   (`crates/node/src/config/types.rs` exposes only `network.bind_port` and
-   `network.relay_url`); follow
+   gossip. The node config carries no static bootstrap-peer list
+   (`crates/common/src/config/types.rs` exposes `network.bind_port`,
+   `network.relay_urls`, and `network.discovery`; the optional
+   `network.discovery.peers` address book is keyed by `NodeId`, so a rotated
+   key orphans its entry rather than bridging the rotation); follow
    [`adr/appendix-operator-key-rotation.md`](../adr/appendix-operator-key-rotation.md)
    for the staged-rotation procedure that keeps connectivity continuous.
 3. Inspect `decdn_iroh_magicsock_*` metrics for connect failures; high

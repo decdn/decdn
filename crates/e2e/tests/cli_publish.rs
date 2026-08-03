@@ -426,9 +426,12 @@ fn parse_namespace_id(stdout: &[u8]) -> anyhow::Result<u64> {
         .context("namespace-create produced no stdout")?;
     let v: serde_json::Value =
         serde_json::from_str(line).context("parse namespace-create JSON receipt")?;
+    // `status`, not `submitted`, is what separates a confirmed create from a
+    // broadcast whose receipt could not be read — both carry `submitted: true`,
+    // and only the first has an id to read. Matches `parse_ready_at` above.
     anyhow::ensure!(
-        v["submitted"] == serde_json::json!(true),
-        "namespace create was not submitted (dry run?): {v}",
+        v["status"] == serde_json::json!("created"),
+        "namespace create did not confirm (dry run, in flight, or failed?): {v}",
     );
     v["namespace_id"]
         .as_u64()

@@ -7,8 +7,9 @@
 //! not buffer whole-blob first: [`engine::CacheEngine::open_local_outboard_pull`]
 //! (#1130) streams origin bytes through a bao encoder while teeing them into
 //! the store, and [`engine::CacheEngine::pull_through_range`] (#823) pulls only
-//! a verified sub-range. Node-to-node pull-through over `cdn/client/v1` is
-//! wired in the `node` crate's `NodeOrigin` (#831).
+//! a verified sub-range. Node-to-node pull-through is one such backend — the
+//! `node` crate supplies an [`Origin`] (`NodeOrigin`, #831) that pays a peer
+//! over `cdn/client/v1` — so this crate needs no knowledge of the paid path.
 //!
 //! Leaf crate per `adr/appendix-poc-production-seams.md` — no `#[cfg(...)]`
 //! mode branching or feature flags here. The `node` crate's wiring layer

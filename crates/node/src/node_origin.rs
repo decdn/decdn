@@ -1,10 +1,10 @@
 //! `NodeOrigin` — the node-to-node cache-miss pull-through origin (#831, ADR
 //! 001/022).
 //!
-//! `CacheEngine` ingests blobs only through the [`Origin`] trait, so the
-//! production shape of "on a miss, discover a provider, open a paid channel,
-//! pull, and populate the cache" is an [`Origin`] implementation injected into
-//! the engine's origin chain (appended last, so configured HTTP/FS/S3 origins
+//! A whole-blob cache miss reaches the network through the engine's origin
+//! chain, so the production shape of "on a miss, discover a provider, open a
+//! paid channel, pull, and populate the cache" is an [`Origin`] implementation
+//! injected into that chain (appended last, so configured HTTP/FS/S3 origins
 //! are tried first and the paid network pull is the final fallback). On
 //! [`Origin::fetch`] this:
 //!
@@ -90,9 +90,37 @@ use crate::selection::{Candidate, MAX_PROVIDER_ATTEMPTS, PROBE_TIMEOUT, rank_can
 /// `run_open`'s legs, store faults and unreclaimable-expired channels included. So the
 /// unlabeled arm below is now genuinely a *residual*: an open/reuse failure raised
 /// outside the open task itself.
+///
+/// Returns the [`PullMiss`] this failure is (#1560), so a channel open that failed because
+/// of a fault in THIS node is not answered to the client as an absent blob. That matters
+/// more than the buyer-key case #1560 was filed for: the loudest node-wide buyer faults in
+/// this crate all land here, and all used to sign every client a clean `NotFound` — a
+/// poisoned `opens_in_flight` mutex ("this node can no longer open a buyer channel to ANY
+/// provider and must be restarted"), an unreadable channel store ("can neither open nor
+/// reuse a channel to any provider until the store recovers"), a store WRITE that leaves a
+/// deposit untracked, a panicked open task, and a wallet that cannot fund a deposit.
+///
+/// **Attribution is decided at the raising site, not here.** Every one of those legs is
+/// typed [`LocalPullFault`] where it is raised, and this function only reads the marker.
+/// That split is not stylistic: [`OpenReported`] means "already logged and metered, do not
+/// restate" — it says nothing about whose fault the failure is — and every leg of the open
+/// task attaches it. So a ladder that tried to classify by [`ChannelOpenFailureReason`]
+/// here would never run: the `OpenReported` arm ends the walk first. An earlier cut of this
+/// fix did exactly that and shipped a dead `match` whose doc advertised a classification the
+/// code could not perform.
+///
+/// Consequently the unmarked legs are the deliberate `Clean` ones: a pending open, a
+/// reconcile-held slot, an unreclaimable expired channel, a `ContractRevert` (deterministic
+/// on-chain, possibly specific to this provider), and an `RpcError` (transient at the
+/// network layer by its own definition). Refusing `InternalError` for any of those would
+/// steer clients off a node that is fine.
 // The arms are a flat sentinel ladder; splitting it would scatter one decision.
 #[allow(clippy::cognitive_complexity)]
-fn record_channel_open_failure(deps: &NodeOriginDeps, provider_addr: Address, err: &anyhow::Error) {
+fn record_channel_open_failure(
+    deps: &NodeOriginDeps,
+    provider_addr: Address,
+    err: &anyhow::Error,
+) -> PullMiss {
     // Not a failure at all: the open ran past our per-candidate budget and is still
     // going in the background (#1143). Meter it apart from real failures — a sustained rate
     // means this node's chain lane is too slow for `CHANNEL_OPEN_CALLER_BUDGET`, which is a
@@ -106,7 +134,7 @@ fn record_channel_open_failure(deps: &NodeOriginDeps, provider_addr: Address, er
     if err.downcast_ref::<ChannelOpenPending>().is_some() {
         deps.metrics.node_pull_channel_open_pending();
         debug!(%provider_addr, %err, "node-origin: channel open still in flight; trying the next candidate");
-        return;
+        return PullMiss::Clean;
     }
     // Also not a failure: a reconcile scan holds this provider's open slot while it
     // re-hydrates the row, and tells us to retry. Self-clearing, and it happens at
@@ -116,7 +144,32 @@ fn record_channel_open_failure(deps: &NodeOriginDeps, provider_addr: Address, er
     if err.downcast_ref::<OpenSlotReserved>().is_some() {
         deps.metrics.node_pull_channel_open_pending();
         debug!(%provider_addr, %err, "node-origin: a reconcile holds the provider's open slot; trying the next candidate");
-        return;
+        return PullMiss::Clean;
+    }
+    // Ahead of `OpenReported`, deliberately, and this ordering is load-bearing (#1560). The
+    // node-wide buyer faults are reported by the open path AND typed `LocalPullFault` there,
+    // so they carry BOTH markers; `OpenReported` alone would end the walk one arm below with
+    // a `debug!` and a clean miss, which is how a node that "must be restarted" kept telling
+    // clients the content does not exist. `a_node_wide_channel_open_fault_refuses_rather_
+    // than_reporting_an_absent_blob` builds its fixtures with both markers precisely so
+    // swapping these two arms fails.
+    //
+    // Metered here rather than at the raising site's counter alone, so the same emergency
+    // reads on `node_pull_local_fault_total` whichever leg of the buyer path raised it. Note
+    // this fires ONCE PER CANDIDATE, so one node-wide fault moves the counter by up to
+    // `MAX_PROVIDER_ATTEMPTS` per request — the rate is the signal, not the absolute.
+    //
+    // It also logs despite `OpenReported`, which normally means "already reported, stay
+    // quiet". Deliberate: the raising site's line says what broke, and this one says what it
+    // COST — that a client was refused rather than told the blob is missing.
+    if err.downcast_ref::<LocalPullFault>().is_some() {
+        deps.metrics.node_pull_local_fault();
+        warn!(
+            %provider_addr, %err,
+            "node-origin: LOCAL buyer-side fault opening a channel — this node cannot pay \
+             any provider; exonerating the upstream and refusing rather than reporting a miss"
+        );
+        return PullMiss::LocalFault;
     }
     // The detached open task already logged and metered this one (#1143). It has to
     // be the reporter, because when an open fails, every caller may already have
@@ -125,7 +178,13 @@ fn record_channel_open_failure(deps: &NodeOriginDeps, provider_addr: Address, er
     // DID happen to still be waiting from double-counting it.
     if err.downcast_ref::<OpenReported>().is_some() {
         debug!(%provider_addr, %err, "node-origin: buyer channel open failed (reported by the open task)");
-        return;
+        // Reported by the open path and NOT typed as ours there, so it is one of the legs
+        // that leaves this node able to pay somebody else: a `ContractRevert`, an `RpcError`,
+        // or an expired channel that could not be reclaimed. Another candidate may still
+        // deliver, and if none does, `NotFound` is a true statement about what we could
+        // obtain. Everything the open path knows to be node-wide arrives marked and returned
+        // one arm above — the marker is the contract, not this arm's guesswork.
+        return PullMiss::Clean;
     }
     deps.metrics.node_pull_channel_open_failure();
     let reason = err.downcast_ref::<ChannelOpenFailureReason>().copied();
@@ -147,6 +206,21 @@ fn record_channel_open_failure(deps: &NodeOriginDeps, provider_addr: Address, er
         "node-origin: buyer channel open/reuse failed (raised outside the open task — \
          suspect this node's store or lock state, not the peer)"
     );
+    // The residual is node-local by elimination: every leg of the open task returns above
+    // (marked or `OpenReported`), so what reaches here was raised outside it and points at
+    // this node's own state. In practice the only such leg today is a supervisor aborted at
+    // runtime shutdown, where "do not retry this node" is if anything the more useful answer.
+    //
+    // This is a catch-all that defaults to the LOUDER verdict, which is the opposite
+    // discipline from `PullMiss::for_verdict` (deliberately catch-all-free so no future
+    // variant inherits an answer). The inversion is intended and is the policy for this
+    // ladder: attribution here comes from a marker the raising site attaches, so an unmarked
+    // arrival is by definition a leg nobody classified — and an unclassified failure of our
+    // own buyer machinery should surface, not be signed away as absent content. A future leg
+    // that is genuinely per-provider must say so by returning `OpenReported` without the
+    // marker, exactly as the existing ones do.
+    deps.metrics.node_pull_local_fault();
+    PullMiss::LocalFault
 }
 
 /// Tuning knobs for the node-to-node pull, resolved from `[cache]` config.
@@ -220,7 +294,7 @@ impl NodeOriginConfig {
     /// `DeadlineError::ZeroBudget` if either budget is zero. `config`'s own validator
     /// already rejects that at startup, so this is the second lock on a door that must not
     /// open: a zero stall trips `PullStalled` on the first poll of every streaming read, and
-    /// `PullStalled` gossips `Unreachable` — so the failure mode is not a node that stops
+    /// `PullStalled` scores `Unreachable` against the peer — so the failure mode is not a node that stops
     /// working, it is a node that silently defames every honest peer it touches. Both call
     /// sites route it to [`LocalPullFault`], which meters it as OUR emergency and scores no
     /// peer (#1145 review).
@@ -377,14 +451,22 @@ impl NodeOrigin {
     /// Candidate fallback happens at OPEN time only: it walks the ranked
     /// candidates until one successfully opens (handshake + verified response),
     /// because once the caller starts forwarding it is committed to that
-    /// upstream's `total_bytes`. Returns `None` if pull-through is unprovisioned,
-    /// no provider is reachable, or every candidate declined.
+    /// upstream's `total_bytes`.
+    ///
+    /// # Errors
+    ///
+    /// The [`PullMiss`] the failure is, when pull-through is unprovisioned, no
+    /// provider is reachable, or every candidate declined. The caller needs the
+    /// distinction to pick its own wire answer: a [`PullMiss::LocalFault`] must not
+    /// be signed to a client as a clean `NotFound` about the content (#1560).
     pub async fn open_progressive_pull(
         &self,
         hash: Hash,
         namespace_id: U256,
-    ) -> Option<(UpstreamPullHeader, NodeProgressivePull)> {
-        let deps = self.deps.get()?;
+    ) -> Result<(UpstreamPullHeader, NodeProgressivePull), PullMiss> {
+        // Unprovisioned pull-through: nothing was attempted, so nothing can have
+        // faulted — this is the honest empty answer.
+        let deps = self.deps.get().ok_or(PullMiss::Clean)?;
         let hash_bytes = *hash.as_bytes();
         let target = DhtHash::from_bytes(hash_bytes);
         // ONE budget for the whole call, spent across both phases — see `Origin::fetch`'s
@@ -393,6 +475,10 @@ impl NodeOrigin {
         // Mirrors `Origin::fetch`'s `attempt_metered`: one orchestration per call however
         // many candidate lists it walks.
         let mut attempt_metered = false;
+        // Latched across BOTH walks, like `attempt_metered` — a local fault on the
+        // cached list is still this node's fault when the fresh list also comes up
+        // empty (#1560).
+        let mut miss = PullMiss::Clean;
 
         // ADR 001 §Probe cache: "On a cache miss the requester checks the probe cache
         // first; if a valid entry exists, it skips DHT lookup and goes straight to
@@ -404,8 +490,9 @@ impl NodeOrigin {
             let outcome = self
                 .open_from_candidates(deps, &cached, hash_bytes, namespace_id, budget)
                 .await;
-            if let Some(opened) = outcome.payload {
-                return Some(opened);
+            match outcome.payload {
+                Ok(opened) => return Ok(opened),
+                Err(failed) => miss = miss.or(failed),
             }
             budget = budget.saturating_sub(outcome.attempts);
             // Every cached provider we had budget to open from failed. Disproved by
@@ -415,11 +502,12 @@ impl NodeOrigin {
             // whose top-ranked members just failed).
             deps.probe_cache.invalidate(&target);
             if budget == 0 {
-                // Ends the call as `None`, which the caller reads as a miss — the
-                // same collapse the KNOWN LIMITATION note on `Origin::fetch`'s cold
-                // arm documents (#1129). A fix there must cover this exit too.
+                // Ends the call as a miss — carrying whether the exhausted attempts
+                // failed on US, so the serve path does not sign a `NotFound` over our
+                // own broken signer (#1560). The twin of `Origin::fetch`'s
+                // budget-exhaustion arm.
                 debug!(%hash, "node-origin: probe-cache candidates exhausted the attempt budget");
-                return None;
+                return Err(miss);
             }
         } else {
             deps.metrics.probe_cache_miss();
@@ -437,7 +525,7 @@ impl NodeOrigin {
                 deps.metrics.node_pull_no_providers();
             }
             debug!(%hash, "node-origin: no providers discovered for window-paced pull");
-            return None;
+            return Err(miss);
         }
         if !attempt_metered {
             deps.metrics.node_pull_attempt();
@@ -447,6 +535,7 @@ impl NodeOrigin {
         self.open_from_candidates(deps, &ranked, hash_bytes, namespace_id, budget)
             .await
             .payload
+            .map_err(|failed| miss.or(failed))
     }
 
     /// The window twin of [`try_pull`]: walk the ranked candidates, opening from
@@ -462,28 +551,33 @@ impl NodeOrigin {
         budget: usize,
     ) -> PullOutcome<(UpstreamPullHeader, NodeProgressivePull)> {
         let mut attempts = 0;
+        let mut miss = PullMiss::Clean;
         for candidate in ranked.iter().take(budget) {
             attempts += 1;
-            if let Some(opened) = self
+            match self
                 .open_from_candidate(deps, candidate, hash_bytes, namespace_id)
                 .await
             {
-                return PullOutcome {
-                    payload: Some(opened),
-                    attempts,
-                };
+                Ok(opened) => {
+                    return PullOutcome {
+                        payload: Ok(opened),
+                        attempts,
+                    };
+                }
+                Err(failed) => miss = miss.or(failed),
             }
         }
         PullOutcome {
-            payload: None,
+            payload: Err(miss),
             attempts,
         }
     }
 
     /// Resolve, open/reuse a channel, and open a progressive upstream pull from
-    /// one candidate. Returns the header + driver on a clean open; `None`
-    /// (try the next candidate) on an unresolvable address, channel-open failure,
-    /// or a declined/erroring response (classified like the buffered path).
+    /// one candidate. Returns the header + driver on a clean open; otherwise the
+    /// [`PullMiss`] this failure is — an unresolvable address, a channel-open
+    /// failure, or a declined/erroring response (classified like the buffered
+    /// path). Either way the caller tries the next candidate.
     // The window twin of `pull_from_candidate`, and inflated past the line threshold for the
     // same reason: a sequential resolve → open → bind → fetch → classify pipeline whose every
     // stage carries the comment explaining which failure it owns. Splitting it would scatter
@@ -495,16 +589,16 @@ impl NodeOrigin {
         candidate: &Candidate,
         hash_bytes: [u8; 32],
         namespace_id: U256,
-    ) -> Option<(UpstreamPullHeader, NodeProgressivePull)> {
+    ) -> Result<(UpstreamPullHeader, NodeProgressivePull), PullMiss> {
         let Ok(pk) = PublicKey::from_bytes(&candidate.node_id) else {
-            return None;
+            return Err(PullMiss::Clean);
         };
         let Some(provider_addr) = deps
             .addr_resolver
             .address_of(&DhtNodeId::from_bytes(candidate.node_id))
         else {
             debug!("node-origin: candidate has no resolvable operator address; skipping");
-            return None;
+            return Err(PullMiss::Clean);
         };
         let ctx = match deps
             .buyer
@@ -523,8 +617,10 @@ impl NodeOrigin {
         {
             Ok(ctx) => ctx,
             Err(err) => {
-                record_channel_open_failure(deps, provider_addr, &err);
-                return None;
+                // Not blanket-`Clean`: a channel open can fail because THIS node's buyer
+                // side is broken for every provider, and that must not be signed to a
+                // client as an absent blob (#1560). See `record_channel_open_failure`.
+                return Err(record_channel_open_failure(deps, provider_addr, &err));
             }
         };
         // #1117: bind the request so the upstream can chain a reactive pull.
@@ -534,8 +630,9 @@ impl NodeOrigin {
                 // A LOCAL signing fault — classify it so it is metered as ours and the
                 // peer is not scored for a key WE cannot use. No channel: the bind failed
                 // before we could present a voucher on one.
-                classify_pull_failure(deps, pk, provider_addr, hash_bytes, None, &err);
-                return None;
+                let verdict =
+                    classify_pull_failure(deps, pk, provider_addr, hash_bytes, None, &err);
+                return Err(PullMiss::for_verdict(verdict));
             }
         };
         // The OPEN stage is bounded by `deadlines.open` INSIDE `open_progressive_upstream`
@@ -557,13 +654,14 @@ impl NodeOrigin {
         // instead (`stall_timeout`, carried into the returned `UpstreamPull`, #1134): a wall
         // clock over the bytes would cap the blob size this node can pull through.
         // A zero budget is OUR misconfiguration, not the peer's fault — and the loud failure
-        // mode is the wrong one to reach for, because a zero stall would gossip `Unreachable`
+        // mode is the wrong one to reach for, because a zero stall would score `Unreachable`
         // about every honest peer this node touches (#1145 review).
         let deadlines = match deps.config.deadlines() {
             Ok(deadlines) => deadlines,
             Err(err) => {
-                classify_pull_failure(deps, pk, provider_addr, hash_bytes, None, &err);
-                return None;
+                let verdict =
+                    classify_pull_failure(deps, pk, provider_addr, hash_bytes, None, &err);
+                return Err(PullMiss::for_verdict(verdict));
             }
         };
         let ledger = channel_ledger(deps, provider_addr, &ctx);
@@ -597,7 +695,7 @@ impl NodeOrigin {
         )
         .await
         {
-            Ok((header, pull)) => Some((
+            Ok((header, pull)) => Ok((
                 header,
                 NodeProgressivePull {
                     deps: Arc::clone(&self.deps),
@@ -622,7 +720,7 @@ impl NodeOrigin {
             Err(err) => {
                 // No bytes were forwarded and no voucher was paid yet, so there is
                 // nothing to persist; just classify and try the next candidate.
-                classify_pull_failure(
+                let verdict = classify_pull_failure(
                     deps,
                     pk,
                     provider_addr,
@@ -630,7 +728,7 @@ impl NodeOrigin {
                     Some(ctx.channel_id),
                     &err,
                 );
-                None
+                Err(PullMiss::for_verdict(verdict))
             }
         }
     }
@@ -794,7 +892,17 @@ impl NodeProgressivePull {
                 Ok(())
             }
             Err(err) => {
-                classify_pull_failure(deps, pk, provider_addr, hash_bytes, Some(channel_id), &err);
+                // The verdict is dropped deliberately: the `StreamResponse` went out
+                // `ok: true` long ago, so there is no refusal code left to pick — see
+                // `classify_pull_failure`'s own note (#1560).
+                let _ = classify_pull_failure(
+                    deps,
+                    pk,
+                    provider_addr,
+                    hash_bytes,
+                    Some(channel_id),
+                    &err,
+                );
                 Err(err)
             }
         }
@@ -854,7 +962,10 @@ impl NodeProgressivePull {
             return;
         };
         if let Some(err) = cause {
-            classify_pull_failure(deps, pk, provider_addr, hash_bytes, Some(channel_id), err);
+            // Verdict dropped for the same reason as in `finish`: this pull was
+            // already answered on the wire (#1560).
+            let _ =
+                classify_pull_failure(deps, pk, provider_addr, hash_bytes, Some(channel_id), err);
         }
     }
 }
@@ -894,6 +1005,9 @@ impl Origin for NodeOrigin {
             // exactly once — otherwise every such fetch inflates the denominator
             // and quietly deflates every rate built on it.
             let mut attempt_metered = false;
+            // Latched across BOTH walks, like `attempt_metered` — see
+            // `miss_answer` for what it buys.
+            let mut miss = PullMiss::Clean;
 
             // ADR 001 §Probe cache: "On a cache miss the requester checks the probe
             // cache first; if a valid entry exists, it skips DHT lookup and goes
@@ -903,8 +1017,9 @@ impl Origin for NodeOrigin {
                 deps.metrics.node_pull_attempt();
                 attempt_metered = true;
                 let outcome = try_pull(deps, &cached, hash_bytes, budget).await;
-                if let Some(bytes) = outcome.payload {
-                    return Ok(OriginFetch::found_one_shot(bytes));
+                match outcome.payload {
+                    Ok(bytes) => return Ok(OriginFetch::found_one_shot(bytes)),
+                    Err(failed) => miss = miss.or(failed),
                 }
                 budget = budget.saturating_sub(outcome.attempts);
                 // Every cached provider we had budget to try failed to deliver.
@@ -918,14 +1033,14 @@ impl Origin for NodeOrigin {
                     // The cached candidates ate the whole fetch-wide budget.
                     // Running a fresh lookup + probe now would either exceed the
                     // worst case `outer_pull_deadline` is sized for, or discover
-                    // providers it has no attempts left to try. This fetch is a
-                    // clean miss; the entry is gone, so the next one goes cold.
+                    // providers it has no attempts left to try. The entry is gone,
+                    // so the next fetch goes cold.
                     //
-                    // Collapses onto `NotFound` like the cold-path arm below — the
-                    // KNOWN LIMITATION note there (#1129) applies to this exit
-                    // too, and a fix there must cover it.
+                    // Answered through `miss_answer` like the cold-path arm below,
+                    // so an exhausted budget spent on OUR faults is not signed to a
+                    // client as an absent blob (#1560).
                     debug!(%hash, "node-origin: probe-cache candidates exhausted the attempt budget");
-                    return Ok(OriginFetch::NotFound);
+                    return miss_answer(miss);
                 }
             } else {
                 deps.metrics.probe_cache_miss();
@@ -948,7 +1063,7 @@ impl Origin for NodeOrigin {
                     deps.metrics.node_pull_no_providers();
                 }
                 debug!(%hash, "node-origin: no providers discovered for cache-miss pull");
-                return Ok(OriginFetch::NotFound);
+                return miss_answer(miss);
             }
             if !attempt_metered {
                 deps.metrics.node_pull_attempt();
@@ -956,27 +1071,47 @@ impl Origin for NodeOrigin {
             // Writes the probe cache at its tail.
             let ranked = probe_and_rank(deps, providers, hash_bytes).await;
             match try_pull(deps, &ranked, hash_bytes, budget).await.payload {
-                Some(bytes) => Ok(OriginFetch::found_one_shot(bytes)),
-                // KNOWN LIMITATION (#1145 review, #1129): this collapses every non-hit onto a
-                // clean `NotFound` — no providers, all refused, all stalled, AND a LOCAL fault
-                // (e.g. a broken buyer key that fails `bind_upstream_ctx`/voucher signing on
-                // every candidate). The local-fault case ought to surface as
-                // `Err(OriginPullError::Permanent(..))` so the serve path refuses `InternalError`
-                // rather than signing a wire `NotFound` (the laundering `InternalError` exists to
-                // prevent). It is metered honestly today — `classify_pull_failure` routes it to
-                // `node_pull_local_fault`, "any sustained rate is an emergency" — but the wire
-                // answer is still `NotFound`. Distinguishing it here needs `classify_pull_failure`
-                // to RETURN its verdict (it is currently side-effecting) and `pull_from_candidate`
-                // /`try_pull` to propagate an our-fault signal, plus care through the
-                // cache-engine `OriginPullError -> CacheError` mapping — a refactor of the
-                // classification path deliberately left as a follow-up rather than risked here.
-                None => Ok(OriginFetch::NotFound),
+                Ok(bytes) => Ok(OriginFetch::found_one_shot(bytes)),
+                Err(failed) => miss_answer(miss.or(failed)),
             }
         })
     }
 
     fn kind(&self) -> OriginKind {
         OriginKind::Peer
+    }
+}
+
+/// The buffered pull's answer for a walk that delivered nothing (#1560).
+///
+/// A [`PullMiss::Clean`] is a `NotFound`: no provider had it, or every one of them
+/// refused, stalled, or timed out. That is a true statement about what this node
+/// could obtain, and the engine surfaces it as `CacheError::NotFound`.
+///
+/// A [`PullMiss::LocalFault`] is not. The blob may exist on every candidate we
+/// asked; what failed is US — a buyer key that cannot sign, a deadline config that
+/// cannot run, a signature the upstream cannot verify. Reported as a miss it
+/// becomes a signed wire `NotFound`, which is exactly the false claim about content
+/// that `StreamError::InternalError` ("unexpected failure; do not retry this node")
+/// exists to keep a broken node from making. So it surfaces as an origin error
+/// instead, and the serve path's existing `CacheError::OriginError` →
+/// `FillOutcome::HardFault` → `ServeRejectReason::InternalError` chain does the
+/// rest.
+///
+/// [`OriginPullError::Permanent`] rather than `Transient`, on three counts: the
+/// retry loop must not re-run a pull whose signer is broken; `Permanent` records
+/// `OriginOutcome::Available` on the per-origin circuit breaker, so our own defect
+/// does not trip a breaker that describes the PEER origin's health; and the engine's
+/// chain walk lets any error outrank a `NotFound` from another origin, which is the
+/// precedence this fix wants.
+fn miss_answer(miss: PullMiss) -> Result<OriginFetch, OriginPullError> {
+    match miss {
+        PullMiss::Clean => Ok(OriginFetch::NotFound),
+        PullMiss::LocalFault => Err(OriginPullError::Permanent(anyhow::anyhow!(
+            "node-origin: a LOCAL buyer-side fault hit at least one attempted candidate \
+             and none delivered; this node cannot pay, so it refuses rather than signing \
+             a NotFound for content that may well exist (#1560)"
+        ))),
     }
 }
 
@@ -1289,11 +1424,127 @@ async fn cached_candidates(deps: &NodeOriginDeps, target: DhtHash) -> Option<Vec
 /// stream). A plain type parameter — no future is generic here, only the value a
 /// successful walk hands back.
 struct PullOutcome<T> {
-    /// The delivered payload, iff some candidate succeeded.
-    payload: Option<T>,
+    /// The delivered payload, or why the walk produced none.
+    payload: Result<T, PullMiss>,
     /// Candidates actually TRIED — i.e. per-candidate attempts, whether or
     /// not they delivered. Never exceeds the `budget` passed in.
     attempts: usize,
+}
+
+/// Why an attempt — one candidate, or a whole walk of them — produced no payload
+/// (#1560).
+///
+/// The only distinction the callers need is whether the failure was OURS, because
+/// that is what decides the answer this node signs to its own client. Every
+/// non-hit used to collapse onto a clean `NotFound`: no providers, all refused,
+/// all stalled, and a LOCAL fault alike. The last of those is a false statement
+/// about the content — the blob may well exist and be perfectly reachable; it is
+/// this node that cannot sign a voucher for it — and `StreamError::InternalError`
+/// ("unexpected failure; do not retry this node") exists precisely to keep a
+/// broken node from laundering its own defect into a signed claim about content.
+///
+/// Deliberately NOT a per-verdict taxonomy. The crate-private `PullVerdict`
+/// already carries the full one, and it answers a different question ("what does
+/// this failure say about the PEER?"); this answers "what may we tell the
+/// client?". Only its `OurLocalFault` arm changes that answer: a wedged or settled
+/// channel to ONE provider is not node-wide degradation, and it already has its
+/// own remedy (keep the row, suppress the provider).
+///
+/// `#[must_use]`: a classifier's verdict that is dropped rather than propagated silently
+/// reverts #1560 at that call site, which is exactly how the channel-open leg shipped
+/// laundered in the first cut. Dropping a `PullVerdict` is legitimate at the two
+/// mid-stream sites (the answer is already on the wire) and they say so with `let _ =`,
+/// which satisfies this attribute; dropping a `PullMiss` never is.
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PullMiss {
+    /// Nothing about the failure blames this node — the honest empty answer, and
+    /// the one a wire `NotFound` is true of.
+    Clean,
+    /// The attempt failed on a fault in THIS node: a broken signer, a bad
+    /// encode/range, an unusable deadline config, or an upstream that could not
+    /// VERIFY a signature we produced. Says nothing about whether the content
+    /// exists.
+    LocalFault,
+}
+
+impl PullMiss {
+    /// Which miss a classified failure is.
+    ///
+    /// Exhaustive on purpose, like [`classify_refusal`] and [`voucher_verdict`]: a
+    /// new [`PullVerdict`] must DECIDE whether it is honest enough to sign a
+    /// `NotFound` over, rather than inheriting [`Self::Clean`] by falling into a
+    /// catch-all — which is exactly how the local-fault case went unnoticed.
+    // `match_same_arms`: the `Refused(OurFault)` arm reaches `Clean` like the block above it,
+    // but for an unrelated reason — node-wide-but-not-broken, rather than not-about-this-node.
+    // Merging them would erase the only rationale that makes a future variant's arm
+    // decidable, which is the same trade `classify_refusal` makes for the same reason.
+    #[allow(clippy::match_same_arms)]
+    const fn for_verdict(verdict: PullVerdict) -> Self {
+        match verdict {
+            PullVerdict::OurLocalFault => Self::LocalFault,
+            // Every other verdict is either about the peer (`Refused` of the first three
+            // kinds, `Stalled`, `Corruption`, `Unreachable`), about OUR configuration of
+            // what we will accept from it (`OversizeClaim`, `RateCeiling`, `OurDeadline`),
+            // or about one channel to one provider (the three voucher arms). None of them
+            // is evidence that THIS node is broken for every client and every blob, so
+            // none earns an `InternalError`: a node with one wedged channel is still a
+            // healthy node that simply cannot serve this blob right now.
+            PullVerdict::OversizeClaim
+            | PullVerdict::RateCeiling
+            | PullVerdict::OurDeadline
+            | PullVerdict::Stalled
+            | PullVerdict::OurDeadChannel(_)
+            | PullVerdict::OurSettledChannel(_)
+            | PullVerdict::OurVoucherRetryable(_)
+            | PullVerdict::Refused(
+                RefusalVerdict::NodeFault
+                | RefusalVerdict::DurableMiss(_)
+                | RefusalVerdict::Transient,
+            )
+            | PullVerdict::Corruption
+            | PullVerdict::Unreachable => Self::Clean,
+            // Spelled out rather than folded into `Refused(_)` above, because it is the
+            // one refusal `classify_refusal` calls "everything about us": our operator
+            // address is on the ADR 011 blacklist, so every peer refuses identically and
+            // the condition is node-wide, not per-provider.
+            //
+            // Reachable ONLY for `OriginBlacklisted`, though `classify_refusal` maps two
+            // variants here: `pull_verdict` unwraps a `VoucherRejected` to `voucher_verdict`
+            // first, and its own comment calls that a defensive backstop. If that unwrap
+            // ever stops happening, the reasoning below does not transfer — a rejected
+            // voucher is a statement about one channel, not about a governance list.
+            //
+            // It stays `Clean` anyway, on two counts. `InternalError` means "UNEXPECTED
+            // failure" — a governance blacklist is a deterministic policy state, not a
+            // defect. And "do not retry this node" is the wrong advice: a blacklisted node
+            // still serves everything already in its cache perfectly well, so steering
+            // clients off it wholesale costs them the hits it CAN serve. `NotFound` — "not
+            // here, try elsewhere" — is both true of this blob and the better instruction.
+            PullVerdict::Refused(RefusalVerdict::OurFault) => Self::Clean,
+        }
+    }
+
+    /// Fold another attempt's miss into this one: a local fault LATCHES.
+    ///
+    /// A walk reports a local fault if ANY of its attempts hit one, mirroring the
+    /// serve path's `fault_seen` latch — a later candidate's clean miss must not
+    /// overwrite an earlier fault of ours, or the walk reports a degraded node as a
+    /// merely-empty one. The fold runs on every failure, but its result only ever
+    /// DECIDES anything when nothing delivered: a candidate that faults locally
+    /// followed by one that succeeds is a plain success, and the walk returns the
+    /// payload without consulting the latch at all.
+    const fn or(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::LocalFault, _) | (_, Self::LocalFault) => Self::LocalFault,
+            (Self::Clean, Self::Clean) => Self::Clean,
+        }
+    }
+
+    /// Whether this miss is a fault in this node.
+    pub const fn is_local_fault(self) -> bool {
+        matches!(self, Self::LocalFault)
+    }
 }
 
 /// Walk the ranked candidates (best-first), opening a channel and pulling from
@@ -1310,17 +1561,21 @@ async fn try_pull(
     budget: usize,
 ) -> PullOutcome<Bytes> {
     let mut attempts = 0;
+    let mut miss = PullMiss::Clean;
     for candidate in ranked.iter().take(budget) {
         attempts += 1;
-        if let Some(bytes) = pull_from_candidate(deps, candidate, hash_bytes).await {
-            return PullOutcome {
-                payload: Some(bytes),
-                attempts,
-            };
+        match pull_from_candidate(deps, candidate, hash_bytes).await {
+            Ok(bytes) => {
+                return PullOutcome {
+                    payload: Ok(bytes),
+                    attempts,
+                };
+            }
+            Err(failed) => miss = miss.or(failed),
         }
     }
     PullOutcome {
-        payload: None,
+        payload: Err(miss),
         attempts,
     }
 }
@@ -1375,7 +1630,9 @@ fn channel_ledger(
 
 /// Attempt a single paid pull from one candidate: resolve its operator address,
 /// open/reuse a buyer channel, `stream_fetch`, and record the reputation
-/// outcome. Returns the bytes on success, `None` (try the next) otherwise.
+/// outcome. Returns the bytes on success, otherwise the [`PullMiss`] this failure
+/// is (try the next candidate either way — a local fault latches, it does not
+/// abort the walk, #1560).
 // Sequential resolve → open → fetch → classify pipeline; the tracing macros and
 // the success/failure classification inflate the cognitive-complexity + line
 // metrics past threshold (same inflation noted in `chain_staker_set`). Splitting
@@ -1385,9 +1642,9 @@ async fn pull_from_candidate(
     deps: &NodeOriginDeps,
     candidate: &Candidate,
     hash_bytes: [u8; 32],
-) -> Option<Bytes> {
+) -> Result<Bytes, PullMiss> {
     let Ok(pk) = PublicKey::from_bytes(&candidate.node_id) else {
-        return None;
+        return Err(PullMiss::Clean);
     };
     let Some(provider_addr) = deps
         .addr_resolver
@@ -1396,7 +1653,7 @@ async fn pull_from_candidate(
         // No bonded address → we cannot safely open a channel to, or verify the
         // `slash_sig` of, this provider. Skip rather than guess.
         debug!("node-origin: candidate has no resolvable operator address; skipping");
-        return None;
+        return Err(PullMiss::Clean);
     };
     let ctx = match deps
         .buyer
@@ -1412,8 +1669,9 @@ async fn pull_from_candidate(
         Err(err) => {
             // A channel-open failure is OUR payment-side problem, not the
             // provider's fault — don't tar its reputation; just try the next.
-            record_channel_open_failure(deps, provider_addr, &err);
-            return None;
+            // Whether it is also a fault that must change our WIRE answer is a
+            // per-reason question the classifier owns (#1560).
+            return Err(record_channel_open_failure(deps, provider_addr, &err));
         }
     };
     // #1117: bind the request so the upstream can chain a reactive pull.
@@ -1422,8 +1680,8 @@ async fn pull_from_candidate(
         Err(err) => {
             // As on the window path: our signing fault, metered as ours, peer unscored.
             // No channel: the bind failed before we could present a voucher on one.
-            classify_pull_failure(deps, pk, provider_addr, hash_bytes, None, &err);
-            return None;
+            let verdict = classify_pull_failure(deps, pk, provider_addr, hash_bytes, None, &err);
+            return Err(PullMiss::for_verdict(verdict));
         }
     };
     let started = Instant::now();
@@ -1450,8 +1708,8 @@ async fn pull_from_candidate(
     let deadlines = match deps.config.deadlines() {
         Ok(deadlines) => deadlines,
         Err(err) => {
-            classify_pull_failure(deps, pk, provider_addr, hash_bytes, None, &err);
-            return None;
+            let verdict = classify_pull_failure(deps, pk, provider_addr, hash_bytes, None, &err);
+            return Err(PullMiss::for_verdict(verdict));
         }
     };
     let ledger = channel_ledger(deps, provider_addr, &ctx);
@@ -1527,10 +1785,10 @@ async fn pull_from_candidate(
             deps.region_accountant
                 .record_pulled(&candidate.node_id, bytes.len() as u64)
                 .await;
-            Some(bytes)
+            Ok(bytes)
         }
         Err(err) => {
-            classify_pull_failure(
+            let verdict = classify_pull_failure(
                 deps,
                 pk,
                 provider_addr,
@@ -1538,7 +1796,7 @@ async fn pull_from_candidate(
                 Some(ctx.channel_id),
                 &err,
             );
-            None
+            Err(PullMiss::for_verdict(verdict))
         }
     }
 }
@@ -2104,7 +2362,20 @@ fn pull_verdict(err: &anyhow::Error) -> PullVerdict {
 /// `InternalError`, by which a peer reports its own degradation; a hash mismatch
 /// is `Corruption`; everything else is `Unreachable`.
 ///
-/// [`pull_verdict`] makes the decision; this acts on it.
+/// [`pull_verdict`] makes the decision; this acts on it, and RETURNS it so the
+/// caller can act on it too (#1560). The two consumers want different halves of the
+/// same answer: this function asks "what does this failure say about the PEER?" and
+/// spends the reputation/suppression/channel remedies accordingly, while the caller
+/// asks "what may we tell our own client?" and folds the verdict into a
+/// [`PullMiss`]. Returning it is what stops the second question being answered by
+/// silence — every non-hit used to look identical to the serve path, so a fault in
+/// this node was signed to a client as a clean `NotFound` about the content.
+///
+/// A caller that has already answered on the wire may drop the verdict. Both mid-stream
+/// sites do ([`NodeProgressivePull::finish`] and [`NodeProgressivePull::abandon`]): by then
+/// the `StreamResponse` is signed `ok: true` and sent, so the failure is an abort, not a
+/// refusal code, and there is no answer left to pick. A caller that has NOT yet answered
+/// owes the verdict a [`PullMiss`] — dropping it there is how #1560 shipped.
 ///
 /// `channel` is the buyer channel the pull was paying on, or `None` for the failures that
 /// happen before there is one to pay on (a channel open that never completed, a local
@@ -2120,7 +2391,7 @@ fn classify_pull_failure(
     hash_bytes: [u8; 32],
     channel: Option<B256>,
     err: &anyhow::Error,
-) {
+) -> PullVerdict {
     let suppress = |ttl: Option<Duration>| {
         let node = DhtNodeId::from_bytes(*pk.as_bytes());
         let hash = DhtHash::from_bytes(hash_bytes);
@@ -2130,7 +2401,8 @@ fn classify_pull_failure(
         }
     };
 
-    match pull_verdict(err) {
+    let verdict = pull_verdict(err);
+    match verdict {
         // OUR ceiling, not the provider's fault — it may legitimately serve larger blobs to
         // nodes configured with a higher `max_blob_size`. Metered, not scored (#840).
         PullVerdict::OversizeClaim => {
@@ -2286,9 +2558,10 @@ fn classify_pull_failure(
         }
         // A broken signer, a bad encode, a bad range — none of it says anything about the
         // peer, and a node in this state walks the whole candidate list tarring every honest
-        // provider it meets with an `Unreachable` (an EWMA hit AND a gossiped observation)
-        // on the strength of its own defect. `warn!`, not `debug!`: a node that cannot sign
-        // cannot pay, so this is operator-actionable — and it is about US.
+        // provider it meets with an `Unreachable` (a local EWMA hit; ADR 008 scoring is
+        // local-only, with no gossip tier) on the strength of its own defect. `warn!`, not
+        // `debug!`: a node that cannot sign cannot pay, so this is operator-actionable —
+        // and it is about US.
         PullVerdict::OurLocalFault => {
             deps.metrics.node_pull_local_fault();
             warn!(
@@ -2306,6 +2579,7 @@ fn classify_pull_failure(
             record_outcome(deps, pk, &Outcome::Unreachable);
         }
     }
+    verdict
 }
 
 /// The local reputation for `pk`, as the `f32` the selection score consumes.
@@ -2506,7 +2780,7 @@ mod tests {
     /// consults: a refusal is proof the peer ANSWERED, so only the one code by
     /// which a peer reports its own degradation may score it. The `NotFound` case
     /// is the heart of the issue — a healthy-but-empty node used to take an
-    /// `Unreachable` hit (local EWMA + a gossiped observation) for honestly saying
+    /// `Unreachable` hit (local EWMA; ADR 008 has no gossip tier) for honestly saying
     /// so.
     #[test]
     fn only_internal_error_refusals_are_scored() {
@@ -2616,7 +2890,7 @@ mod tests {
     /// ADR 005 client binding is the same key that signs vouchers, and the binding is signed
     /// BEFORE the stream opens, on every candidate. So a node whose signer is broken does not
     /// mis-score one provider — it walks the entire candidate list handing out `Unreachable`
-    /// (a local EWMA hit AND a gossiped observation) to every honest peer it meets, on the
+    /// (a local EWMA hit; ADR 008 scoring is local-only) to every honest peer it meets, on the
     /// strength of its own defect. The catch-all is only ever one misplaced arm away.
     ///
     /// **What this test does and does not prove.** It pins the LADDER: that a `LocalPullFault`
@@ -2663,6 +2937,94 @@ mod tests {
             PullVerdict::OurLocalFault,
             "a local fault must win over a refusal on the same chain: the refusal is a \
              symptom, the broken node is the cause"
+        );
+    }
+
+    /// Only a fault in THIS node may stop a failed pull answering `NotFound` (#1560).
+    ///
+    /// The asymmetry is the whole point, and both halves of it can regress silently. Widen
+    /// it and a node with one wedged channel to one provider tells every client "do not
+    /// retry this node" — steering traffic off a node that is fine for every other provider
+    /// and every other blob. Narrow it (or let a future verdict fall into a catch-all) and
+    /// we are back to the bug: a broken buyer key signs a client a `NotFound` about content
+    /// that exists and is reachable, and the client caches OUR defect as a fact about the
+    /// blob.
+    ///
+    /// The build-break guarantee lives in `PullMiss::for_verdict`'s catch-all-free `match`,
+    /// NOT here: this test iterates a hand-written list, so a new [`PullVerdict`] variant
+    /// would compile fine and simply go untested. What the test pins is the DECISION each
+    /// existing variant made — the thing a future refactor could flip without noticing.
+    ///
+    /// Known edges, stated precisely because the guarantee is narrower than it looks:
+    /// `for_verdict` matches `OurDeadChannel(_)` / `OurSettledChannel(_)` /
+    /// `OurVoucherRetryable(_)` on their payloads, so a new `VoucherRejectReason` inherits
+    /// `Clean` without a build break — acceptable, because `voucher_verdict` IS exhaustive
+    /// over all twelve and already routes the node-wide reasons (`BadSignature`,
+    /// `WrongSigner`) to `OurLocalFault` before this function sees them. `RefusalVerdict`'s
+    /// four discriminants are spelled out so a FIFTH does break the build; its
+    /// `DurableMiss(_)` payload is not, so a new `DurableMissCause` still inherits `Clean`.
+    #[test]
+    fn only_our_own_fault_may_withhold_a_not_found() {
+        let reason = VoucherRejectReason::StaleNonce;
+        for verdict in [
+            PullVerdict::OversizeClaim,
+            PullVerdict::RateCeiling,
+            PullVerdict::OurDeadline,
+            PullVerdict::Stalled,
+            PullVerdict::OurDeadChannel(reason),
+            PullVerdict::OurSettledChannel(reason),
+            PullVerdict::OurVoucherRetryable(reason),
+            PullVerdict::Refused(RefusalVerdict::NodeFault),
+            PullVerdict::Refused(RefusalVerdict::Transient),
+            PullVerdict::Refused(RefusalVerdict::OurFault),
+            PullVerdict::Refused(RefusalVerdict::DurableMiss(DurableMissCause::BlobTooLarge)),
+            PullVerdict::Corruption,
+            PullVerdict::Unreachable,
+        ] {
+            assert_eq!(
+                PullMiss::for_verdict(verdict),
+                PullMiss::Clean,
+                "{verdict:?} is not an UNEXPECTED failure of this node, so it must still \
+                 answer a clean miss"
+            );
+        }
+
+        assert_eq!(
+            PullMiss::for_verdict(PullVerdict::OurLocalFault),
+            PullMiss::LocalFault,
+            "a broken signer / encode / range is the one verdict that makes a `NotFound` a \
+             false claim about the content"
+        );
+    }
+
+    /// A local fault LATCHES across a walk: one candidate's fault is not erased by the next
+    /// candidate's honest miss.
+    ///
+    /// The order matters in both directions, which is why both are asserted. A walk folds
+    /// left-to-right over whatever order the ranker produced, so a fault at position 1
+    /// followed by clean misses, and clean misses followed by a fault at position 3, are the
+    /// same story and must reach the same answer — otherwise the wire code an operator sees
+    /// depends on where in the ranking the broken pull happened to land.
+    #[test]
+    fn a_local_fault_survives_the_rest_of_the_walk() {
+        assert_eq!(
+            PullMiss::Clean.or(PullMiss::Clean),
+            PullMiss::Clean,
+            "a walk of honest misses is an honest miss"
+        );
+        assert_eq!(
+            PullMiss::LocalFault.or(PullMiss::Clean),
+            PullMiss::LocalFault,
+            "a later clean miss must not overwrite an earlier fault of ours"
+        );
+        assert_eq!(
+            PullMiss::Clean.or(PullMiss::LocalFault),
+            PullMiss::LocalFault,
+            "a fault reached late in the walk counts the same as one reached first"
+        );
+        assert_eq!(
+            PullMiss::LocalFault.or(PullMiss::LocalFault),
+            PullMiss::LocalFault
         );
     }
 
