@@ -90,7 +90,7 @@ BOOK_SRCS := \
 DENSITY_CFG := _build/book-density.typ _build/book-margins.yaml _build/table-autofit.lua
 
 .DEFAULT_GOAL := all
-.PHONY: all numeric book clean help check-book-list check-bare-refs check-md-anchors check-anchor-targets check-no-section-numbers check-refs
+.PHONY: all numeric book clean help check-book-list check-bare-refs check-md-anchors check-anchor-targets check-no-section-numbers check-no-history-links check-refs
 
 all: adrs.pdf adrs-book.pdf
 
@@ -156,11 +156,14 @@ check-book-list:
 #                          by NAME only. Scans code too; RFC/EIP/BIP § exempt.
 SRCS_REF := architecture.md $(NUMERIC_SRCS) $(APPENDIX_SRCS) glossary.md
 
-# check-anchor-targets also reads README.md: it links into the ADRs (and out to
-# CONTRIBUTING.md) with anchors that rot the same way. It is deliberately not in
-# SRCS_REF — the other guards police ADR *prose* conventions, which README, as
-# build/reading documentation, does not follow.
-ANCHOR_SRCS := $(SRCS_REF) README.md
+# check-anchor-targets also reads the docs/ and root markdown that link into the
+# ADRs with anchors that rot the same way: adr/README.md, docs/*.md (runbook),
+# and the repo-root CONTRIBUTING.md / CLAUDE.md / CHANGELOG.md / README.md. These
+# are deliberately NOT in SRCS_REF — the other guards police ADR *prose*
+# conventions, which build/reading documentation does not follow. The awk
+# resolves each link relative to its own file's directory, so the `../adr/…`
+# paths these carry resolve correctly.
+ANCHOR_SRCS := $(SRCS_REF) README.md $(wildcard ../docs/*.md) ../CONTRIBUTING.md ../CLAUDE.md ../CHANGELOG.md ../README.md
 
 check-bare-refs:
 	@bad=""; for f in $(SRCS_REF); do \
@@ -208,7 +211,18 @@ check-no-section-numbers:
 	  exit 1; \
 	else echo "no numeric §N refs or numbered headings (RFC/EIP/BIP § exempt)"; fi
 
-check-refs: check-bare-refs check-md-anchors check-anchor-targets check-no-section-numbers
+check-no-history-links:
+	@bad=""; for f in $(SRCS_REF); do \
+	  hits=$$(awk -v F="$$f" '/^```/{c=!c;next} !c{print F":"FNR": "$$0}' "$$f" \
+	    | grep -E '\]\([^)]*_history' || true); \
+	  if [ -n "$$hits" ]; then printf '%s\n' "$$hits"; bad=1; fi; \
+	done; \
+	if [ -n "$$bad" ]; then \
+	  echo "ERROR: canonical ADR link(s) above point into adr/_history/ — retired ADRs are archived for audit but MUST NOT be linked from canonical ADRs; reference them as inline-code names, e.g. \`ADR 033\`"; \
+	  exit 1; \
+	else echo "no canonical ADR links into _history"; fi
+
+check-refs: check-bare-refs check-md-anchors check-anchor-targets check-no-section-numbers check-no-history-links
 
 help:
 	@echo "make            build both PDFs (mermaid-rendered)"

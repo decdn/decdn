@@ -68,7 +68,18 @@ function load(f,   line, incode, ret, t, seg, key, base) {
   return 1;
 }
 
-FNR == 1 { incode = 0; files++ }
+# A link target is relative to the directory of the file that carries it, not to
+# the awk CWD. ADR sources live in adr/, but ANCHOR_SRCS also feeds files from
+# docs/ and the repo root, which reach ADR anchors through their own relative
+# paths (e.g. `../adr/003-payments.md#…`). `base` is the linking file's dir; the
+# OS resolves any `..` segments when getline opens the composed path.
+FNR == 1 {
+  incode = 0; files++;
+  base = FILENAME;
+  slash = 0;
+  for (i = length(base); i >= 1; i--) if (substr(base, i, 1) == "/") { slash = i; break }
+  base = (slash > 0) ? substr(base, 1, slash - 1) : ".";
+}
 /^```/   { incode = !incode; next }
 incode   { next }
 
@@ -82,13 +93,14 @@ incode   { next }
     file = substr(target, 1, hash - 1);
     frag = substr(target, hash + 1);
     sub(/^\.\//, "", file);
-    if (file == "") file = FILENAME;            # same-file `#anchor` link
+    if (file == "") path = FILENAME;            # same-file `#anchor` link
     else if (file ~ /:\/\// || file !~ /\.md$/) continue;
+    else path = base "/" file;                  # resolve against the linker's dir
     links++;
-    if (!load(file)) {
+    if (!load(path)) {
       print FILENAME ":" FNR ": " target " -> no such file";
       bad = 1;
-    } else if (!((file "#" frag) in slugs)) {
+    } else if (!((path "#" frag) in slugs)) {
       print FILENAME ":" FNR ": " target " -> no heading in " file " slugs to #" frag;
       bad = 1;
     }

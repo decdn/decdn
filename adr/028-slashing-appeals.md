@@ -189,6 +189,6 @@ Modeled abuse paths and counters:
 
 - **[ADR 026 — Tokenomics](026-tokenomics.md#slashing-and-burn):** escrow-on-slash and the 50%-challenger / 50%-burn finality split are specified in § Slashing and burn; this ADR specifies the appeal that decides refund-vs-distribute.
 - **[ADR 016 — Smart Contract Interaction Model](016-contract-interactions.md#adr-016-smart-contract-interaction-model):** the `SlashAppeal` contract, the `SLASH_APPEAL_ROLE` grant on `CapacityBond`, and the deployment / wiring order are reflected in the Contract Inventory, Access Control Matrix, and Post-Deployment Initialization.
-- **[ADR 032 — SafetyReserve appeal-surface contract surface](_history/032-safety-reserve-appeals-contract.md):** RETIRED. The appeal state machine it pinned for `SafetyReserve` is re-homed to `SlashAppeal`; the canonical surface is [§ Contract surface](#contract-surface) above.
-- **[ADR 033 — Safety and Insurance Reserve](_history/033-safety-insurance-reserve.md):** RETIRED. The reserve no longer exists; restitution is escrow-refund-in-TOKEN.
+- **`ADR 032` — SafetyReserve appeal-surface contract surface:** RETIRED. The appeal state machine it pinned for `SafetyReserve` is re-homed to `SlashAppeal`; the canonical surface is [§ Contract surface](#contract-surface) above.
+- **`ADR 033` — Safety and Insurance Reserve:** RETIRED. The reserve no longer exists; restitution is escrow-refund-in-TOKEN.
 - Removing a wrongful blacklist *entry* is a separate concern with no appeal machinery of its own — see [ADR 011 § Removing a Wrongful Entry](011-content-takedown.md#removing-a-wrongful-entry). `SlashAppeal` is the protocol's only appeal surface.
