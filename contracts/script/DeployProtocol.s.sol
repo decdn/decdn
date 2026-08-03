@@ -169,6 +169,9 @@ contract DeployProtocol is BaseProtocolDeploy {
         // any caller that forgets to set it.
         cfg.emergencyMultisig = vm.envAddress("EMERGENCY_MULTISIG");
         cfg.initialTokenHolder = vm.envAddress("INITIAL_TOKEN_HOLDER");
+        // Genesis ManualVettingPolicy VETTER_ROLE holder (ADR 011). Optional:
+        // omit it to ship with no genesis vetter and let governance seat one.
+        cfg.initialVetter = vm.envOr("INITIAL_VETTER", address(0));
         // `--sender` on the command line becomes `tx.origin` for the script;
         // use that as the deployer so the role grants the constructors emit
         // are attributable to the broadcasting EOA, not this script contract.
@@ -344,6 +347,7 @@ contract DeployProtocol is BaseProtocolDeploy {
         vm.serializeAddress(contracts, "PublisherRegistry", address(d.registry));
         vm.serializeAddress(contracts, "SlashAppeal", address(d.slashAppeal));
         vm.serializeAddress(contracts, "OriginAssignment", address(d.originAssignment));
+        vm.serializeAddress(contracts, "ManualVettingPolicy", address(d.vettingPolicy));
         vm.serializeAddress(contracts, "PaymentChannel", address(d.paymentChannel));
         vm.serializeAddress(contracts, "SlashJudge", address(d.slashJudge));
         vm.serializeAddress(contracts, "TimelockController", address(d.timelock));

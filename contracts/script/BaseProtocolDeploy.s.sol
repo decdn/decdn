@@ -19,6 +19,8 @@ import { DecdnGovernor } from "../src/DecdnGovernor.sol";
 import { PaymentChannel } from "../src/PaymentChannel.sol";
 import { SlashJudge } from "../src/SlashJudge.sol";
 import { OriginAssignment } from "../src/OriginAssignment.sol";
+import { ManualVettingPolicy } from "../src/ManualVettingPolicy.sol";
+import { IVettingPolicy } from "../src/interfaces/IVettingPolicy.sol";
 import { GuardedBuybackBurner } from "../src/GuardedBuybackBurner.sol";
 import { IPermit2 } from "../src/interfaces/IPermit2.sol";
 import { BuybackVenueLib } from "./lib/BuybackVenueLib.sol";
@@ -256,6 +258,11 @@ abstract contract BaseProtocolDeploy is Script {
         address deployer;
         address emergencyMultisig;
         address initialTokenHolder;
+        // ManualVettingPolicy VETTER_ROLE holder at genesis (ADR 011). May be
+        // `address(0)`: then no genesis vetter is seated and governance grants
+        // VETTER_ROLE post-deploy. On the initial testnet this is the operator
+        // that approves publishers without a 48-hour Timelock delay.
+        address initialVetter;
         // Governance / Timelock
         uint256 timelockDelay;
         // ADR 009 § Bootstrap-multisig phase. `address(0)` (the default) seats
@@ -302,6 +309,7 @@ abstract contract BaseProtocolDeploy is Script {
         PaymentChannel paymentChannel;
         SlashJudge slashJudge;
         OriginAssignment originAssignment;
+        ManualVettingPolicy vettingPolicy;
         // Zero unless genesis buyback activation ran (`BuybackActivation.activate`);
         // then it is the concrete `GuardedBuybackBurner` wired into `FeeRouter`.
         GuardedBuybackBurner buybackBurner;
@@ -553,13 +561,23 @@ abstract contract BaseProtocolDeploy is Script {
             admin: cfg.deployer
         });
 
+        // ManualVettingPolicy (ADR 011): the genesis vetting policy, consumed by
+        // `OriginAssignment` below as a constructor arg. Deployer is admin +
+        // GOVERNANCE_ROLE (handed to the Timelock in phase 5); `initialVetter`
+        // (may be zero) is seeded with VETTER_ROLE, whose admin is GOVERNANCE_ROLE
+        // so governance re-points it post-handoff.
+        d.vettingPolicy = new ManualVettingPolicy({ admin: cfg.deployer, initialVetter: cfg.initialVetter });
+
         // OriginAssignment (ADR 011): deployed with a zero ContentBlacklist binding;
         // `_wireCrossContractRoles` calls `setContentBlacklist` post-deploy (ADR 016
-        // § Post-Deployment Initialization step 2).
+        // § Post-Deployment Initialization step 2). The vetting policy is a
+        // constructor immutable-shaped binding (governance swaps it via
+        // `setVettingPolicy`), non-zero from genesis.
         d.originAssignment = new OriginAssignment({
             capacityBond_: ICapacityBondActivity(address(d.bond)),
             publisherRegistry_: IPublisherRegistryOwnership(address(d.registry)),
             contentBlacklist_: address(0),
+            vettingPolicy_: IVettingPolicy(address(d.vettingPolicy)),
             admin: cfg.deployer
         });
     }
@@ -744,7 +762,7 @@ abstract contract BaseProtocolDeploy is Script {
     ///      single source of truth for `_handOffGovernance` and `_assertNoBackDoors`
     ///      so a target cannot be handed off by one and missed by the other.
     function _allGovernedTargets(Deployment memory d) internal pure returns (address[] memory) {
-        IAccessControl[8] memory fixedTargets = _governedTargets(d);
+        IAccessControl[9] memory fixedTargets = _governedTargets(d);
         bool hasBurner = address(d.buybackBurner) != address(0);
         // Sized and indexed off `fixedTargets.length`, never a literal: widening
         // `_governedTargets` — which its own docstring instructs a future target to do
@@ -851,19 +869,29 @@ abstract contract BaseProtocolDeploy is Script {
         if (boundBlacklist != address(d.blacklist)) {
             revert BindingNotWired(address(d.originAssignment), address(d.blacklist), boundBlacklist);
         }
+        // OriginAssignment.vettingPolicy is a constructor binding, but re-read it
+        // so a wrong-wired genesis policy fails the deploy loudly like every other
+        // security-critical binding.
+        address boundVettingPolicy = address(d.originAssignment.vettingPolicy());
+        if (boundVettingPolicy != address(d.vettingPolicy)) {
+            revert BindingNotWired(address(d.originAssignment), address(d.vettingPolicy), boundVettingPolicy);
+        }
     }
 
     function _requireRole(IAccessControl target, bytes32 role, address grantee) private view {
         if (!target.hasRole(role, grantee)) revert PeerRoleNotWired(address(target), role, grantee);
     }
 
-    /// @dev The eight GOVERNANCE_ROLE/DEFAULT_ADMIN_ROLE-bearing targets handed
+    /// @dev The nine GOVERNANCE_ROLE/DEFAULT_ADMIN_ROLE-bearing targets handed
     ///      off to the Timelock (router, bond, blacklist, slashAppeal, registry,
-    ///      paymentChannel, slashJudge, originAssignment) — single source of truth
-    ///      for `_handOffGovernance` and `_assertNoBackDoors` so the governed set
-    ///      can't drift between them. The array width MUST equal the number of
-    ///      role-bearing `Deployment` members; adding a target requires widening it.
-    function _governedTargets(Deployment memory d) internal pure returns (IAccessControl[8] memory) {
+    ///      paymentChannel, slashJudge, originAssignment, vettingPolicy) — single
+    ///      source of truth for `_handOffGovernance` and `_assertNoBackDoors` so
+    ///      the governed set can't drift between them. The array width MUST equal
+    ///      the number of role-bearing `Deployment` members; adding a target
+    ///      requires widening it. `ManualVettingPolicy`'s VETTER_ROLE is admin'd
+    ///      by its GOVERNANCE_ROLE, so handing off GOVERNANCE_ROLE gives the
+    ///      Timelock control of the vetter set too.
+    function _governedTargets(Deployment memory d) internal pure returns (IAccessControl[9] memory) {
         return [
             IAccessControl(address(d.router)),
             d.bond,
@@ -872,7 +900,8 @@ abstract contract BaseProtocolDeploy is Script {
             d.registry,
             d.paymentChannel,
             d.slashJudge,
-            d.originAssignment
+            d.originAssignment,
+            d.vettingPolicy
         ];
     }
 

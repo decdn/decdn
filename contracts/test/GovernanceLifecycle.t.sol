@@ -111,6 +111,7 @@ contract GovernanceLifecycleTest is Test, BaseProtocolDeploy {
             // Token is minted entirely to the test harness so it can fund
             // operators + FeeRouter bucket destinations downstream.
             initialTokenHolder: address(this),
+            initialVetter: address(0),
             timelockDelay: TIMELOCK_DELAY,
             // Direct-to-Timelock handoff; the ADR 009 bootstrap phase is opt-in.
             bootstrapMultisig: address(0),

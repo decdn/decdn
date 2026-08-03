@@ -8,14 +8,17 @@ import { EnumerableSet } from "@openzeppelin/contracts/utils/structs/EnumerableS
 import { ICapacityBondActivity } from "./interfaces/ICapacityBondActivity.sol";
 import { IPublisherRegistryOwnership } from "./interfaces/IPublisherRegistryOwnership.sol";
 import { IContentBlacklistOriginView } from "./interfaces/IContentBlacklistOriginView.sol";
+import { IVettingPolicy } from "./interfaces/IVettingPolicy.sol";
 
 /// @title OriginAssignment
 /// @notice The DAO's positive origin authority (ADR 011 § Origin Assignment
 ///         Authority), split into two planes:
-///         - **Vetting (cold).** Governance decides once, per publisher wallet,
-///           who is a network-trusted publisher. A publisher requests vetting,
-///           waits `vettingTimelock`, and governance grants it — or governance
-///           grants/revokes instantly with `setPublisherVetted`.
+///         - **Vetting (cold).** Whether a publisher wallet may seat origins is
+///           decided by a swappable `IVettingPolicy`. Governance re-points it
+///           with `setVettingPolicy` to move between vetting procedures (manual
+///           approval, a timelocked governance grant, an on-chain attestation,
+///           or no gate) without changing this contract. `addOrigin` asks the
+///           installed policy `isVetted(msg.sender)` and nothing more.
 ///         - **Origins (hot).** A vetted publisher seats and unseats origins for
 ///           its OWN namespaces instantly, one operator at a time, choosing
 ///           freely among bonded operators.
@@ -43,12 +46,9 @@ contract OriginAssignment is AccessControl, ReentrancyGuard {
     // Constants (ADR 009 § Governable parameters with safety bounds)
     // -----------------------------------------------------------------
 
-    uint256 internal constant VETTING_TIMELOCK_FLOOR = 24 hours;
-    uint256 internal constant VETTING_TIMELOCK_CEILING = 14 days;
     uint256 internal constant MAX_ORIGINS_FLOOR = 1;
     uint256 internal constant MAX_ORIGINS_CEILING = 50;
 
-    uint256 internal constant DEFAULT_VETTING_TIMELOCK = 3 days;
     uint256 internal constant DEFAULT_MAX_ORIGINS = 10;
 
     // -----------------------------------------------------------------
@@ -67,21 +67,18 @@ contract OriginAssignment is AccessControl, ReentrancyGuard {
     address public contentBlacklist;
 
     uint256 public maxOriginsPerNamespace;
-    uint256 public vettingTimelock;
+
+    /// @notice The swappable vetting authority. `addOrigin` seats an origin only
+    ///         when `vettingPolicy.isVetted(msg.sender)` is true. Governance
+    ///         re-points it with `setVettingPolicy` to change the vetting
+    ///         procedure without changing this contract. Always a concrete
+    ///         contract — never `address(0)` (rejected in the constructor and the
+    ///         setter), so `addOrigin` needs no zero branch and fails closed.
+    IVettingPolicy public vettingPolicy;
 
     // -----------------------------------------------------------------
-    // Storage — publisher vetting + authorized sets
+    // Storage — authorized sets
     // -----------------------------------------------------------------
-
-    /// @notice Publishers governance trusts to seat origins for their own
-    ///         namespaces. The wallet is vetted, not any operator set, so a
-    ///         vetted publisher adds and removes origins with no further
-    ///         governance action.
-    mapping(address publisher => bool) public isVettedPublisher;
-
-    /// @notice Unix time each pending vetting request ripens. `0` means no
-    ///         request is pending for that publisher.
-    mapping(address publisher => uint64) internal _vettingReadyAt;
 
     mapping(uint256 namespaceId => EnumerableSet.AddressSet) internal _origins;
 
@@ -99,22 +96,12 @@ contract OriginAssignment is AccessControl, ReentrancyGuard {
     // Events (ADR 011 § Contract: OriginAssignment)
     // -----------------------------------------------------------------
 
-    event VettingRequested(address indexed publisher, uint256 readyAt);
-    /// @notice The publisher withdrew its OWN pending request. Governance never
-    ///         emits this: both `grantVetting` and `setPublisherVetted` also
-    ///         clear a pending request, and both announce it with
-    ///         `PublisherVetted`. A consumer tracking pending requests therefore
-    ///         closes an entry on EITHER event — which is why governance does
-    ///         not emit a second one that would say "cancelled" for a request it
-    ///         actually fulfilled.
-    event VettingRequestCancelled(address indexed publisher);
-    event PublisherVetted(address indexed publisher, bool vetted, address indexed by);
     event OriginAdded(uint256 indexed namespaceId, address indexed operator, address indexed by);
     event OriginRemoved(uint256 indexed namespaceId, address indexed operator, address indexed by);
     event BlacklistedOriginPruned(uint256 indexed namespaceId, address indexed operator, address indexed pruner);
     event ContentBlacklistUpdated(address indexed oldAddr, address indexed newAddr);
     event MaxOriginsPerNamespaceUpdated(uint256 oldValue, uint256 newValue);
-    event VettingTimelockUpdated(uint256 oldValue, uint256 newValue);
+    event VettingPolicyUpdated(address indexed oldPolicy, address indexed newPolicy);
 
     // -----------------------------------------------------------------
     // Errors
@@ -131,11 +118,6 @@ contract OriginAssignment is AccessControl, ReentrancyGuard {
     error OperatorNotBlacklisted(address operator);
     error ParamOutOfBounds(uint256 value, uint256 floor, uint256 ceiling);
     error PublisherNotVetted(address publisher);
-    error NoNamespaceOwned(address publisher);
-    error AlreadyVetted(address publisher);
-    error VettingRequestPending(address publisher);
-    error NoVettingRequest(address publisher);
-    error VettingTimelockNotElapsed(uint256 readyAt);
 
     // -----------------------------------------------------------------
     // Constructor (ADR 016 § Deployment Order, step 10)
@@ -145,91 +127,31 @@ contract OriginAssignment is AccessControl, ReentrancyGuard {
     /// @param publisherRegistry_  Namespace ownership source.
     /// @param contentBlacklist_   May be `address(0)` at deploy; bound later via
     ///                            `setContentBlacklist` (ADR 016 post-deploy step 2).
+    /// @param vettingPolicy_      Installed vetting authority. A concrete policy
+    ///                            exists from genesis — no `address(0)` phase.
     /// @param admin               `DEFAULT_ADMIN_ROLE` + `GOVERNANCE_ROLE` holder.
     constructor(
         ICapacityBondActivity capacityBond_,
         IPublisherRegistryOwnership publisherRegistry_,
         address contentBlacklist_,
+        IVettingPolicy vettingPolicy_,
         address admin
     ) {
-        if (address(capacityBond_) == address(0) || address(publisherRegistry_) == address(0) || admin == address(0)) {
+        if (
+            address(capacityBond_) == address(0) || address(publisherRegistry_) == address(0)
+                || address(vettingPolicy_) == address(0) || admin == address(0)
+        ) {
             revert ZeroAddress();
         }
         capacityBond = capacityBond_;
         publisherRegistry = publisherRegistry_;
         contentBlacklist = contentBlacklist_; // may be zero at deploy
+        vettingPolicy = vettingPolicy_;
 
         maxOriginsPerNamespace = DEFAULT_MAX_ORIGINS;
-        vettingTimelock = DEFAULT_VETTING_TIMELOCK;
 
         _grantRole(DEFAULT_ADMIN_ROLE, admin);
         _grantRole(GOVERNANCE_ROLE, admin);
-    }
-
-    // -----------------------------------------------------------------
-    // Publisher vetting (cold path: publisher requests / governance grants)
-    // -----------------------------------------------------------------
-
-    /// @notice A publisher asks governance to vet its wallet. The request
-    ///         ripens after `vettingTimelock`, which is the window governance
-    ///         reviews it in.
-    /// @dev The `namespaceCount` external view read precedes the pending-state
-    ///      write; safe under `nonReentrant` (the read is a view).
-    // slither-disable-next-line reentrancy-no-eth
-    function requestVetting() external nonReentrant {
-        if (isVettedPublisher[msg.sender]) revert AlreadyVetted(msg.sender);
-        if (_vettingReadyAt[msg.sender] != 0) revert VettingRequestPending(msg.sender);
-        // aderyn-ignore-next-line(reentrancy-state-change)
-        if (publisherRegistry.namespaceCount(msg.sender) == 0) revert NoNamespaceOwned(msg.sender);
-
-        // `vettingTimelock` is bounded to [24h, 14d], so the sum cannot approach
-        // 2^64 and the narrowing cast cannot truncate. The floor also makes
-        // `readyAt` strictly positive, which is what lets `0` serve as the
-        // "no request pending" sentinel.
-        uint64 readyAt = uint64(block.timestamp + vettingTimelock);
-        _vettingReadyAt[msg.sender] = readyAt;
-
-        emit VettingRequested(msg.sender, readyAt);
-    }
-
-    /// @notice A publisher withdraws its own pending request.
-    function cancelVettingRequest() external {
-        // The field is a timestamp, so slither's strict-equality detector reads
-        // this as a dangerous compare; the `== 0` sentinel is a presence check.
-        // slither-disable-next-line incorrect-equality
-        if (_vettingReadyAt[msg.sender] == 0) revert NoVettingRequest(msg.sender);
-        delete _vettingReadyAt[msg.sender];
-        emit VettingRequestCancelled(msg.sender);
-    }
-
-    /// @notice Governance grants a ripened request. This is the only place the
-    ///         timelock is enforced; `setPublisherVetted` is the instant
-    ///         override for both directions.
-    function grantVetting(address publisher) external onlyRole(GOVERNANCE_ROLE) {
-        uint64 readyAt = _vettingReadyAt[publisher];
-        if (readyAt == 0) revert NoVettingRequest(publisher);
-        // forge-lint: disable-next-line(block-timestamp)
-        if (block.timestamp < readyAt) revert VettingTimelockNotElapsed(readyAt);
-
-        delete _vettingReadyAt[publisher];
-        isVettedPublisher[publisher] = true;
-
-        emit PublisherVetted(publisher, true, msg.sender);
-    }
-
-    /// @notice Governance override: vet a publisher with no wait, or un-vet a
-    ///         rogue one. Un-vetting stops NEW origins immediately; origins the
-    ///         publisher already seated stay until `removeOrigin` (governance may
-    ///         call it on any namespace) or a blacklist prune takes them out —
-    ///         evicting them here would be unbounded in the publisher's
-    ///         namespace count.
-    function setPublisherVetted(address publisher, bool vetted) external onlyRole(GOVERNANCE_ROLE) {
-        if (publisher == address(0)) revert ZeroAddress();
-        // A grant consumes any pending request; a revocation clears it too, so a
-        // ripened request cannot be used to walk straight back in.
-        delete _vettingReadyAt[publisher];
-        isVettedPublisher[publisher] = vetted;
-        emit PublisherVetted(publisher, vetted, msg.sender);
     }
 
     // -----------------------------------------------------------------
@@ -245,10 +167,12 @@ contract OriginAssignment is AccessControl, ReentrancyGuard {
     ///      `nonReentrant` (the reads are views).
     // slither-disable-next-line reentrancy-no-eth
     function addOrigin(uint256 namespaceId, address operator) external nonReentrant {
-        // Vetting first: it is a local SLOAD, and it is the blocking prerequisite
-        // an unvetted caller must act on. Checking it before the cross-contract
-        // `ownerOf` read saves that call and reports the actionable error.
-        if (!isVettedPublisher[msg.sender]) revert PublisherNotVetted(msg.sender);
+        // Vetting first: it is the blocking prerequisite an unvetted caller must
+        // act on, so checking it before the `ownerOf` read reports the actionable
+        // error. The policy read is a view STATICCALL; a reverting (misconfigured)
+        // policy fails the call closed, which is the intended posture.
+        // aderyn-ignore-next-line(reentrancy-state-change)
+        if (!vettingPolicy.isVetted(msg.sender)) revert PublisherNotVetted(msg.sender);
         // aderyn-ignore-next-line(reentrancy-state-change)
         if (publisherRegistry.ownerOf(namespaceId) != msg.sender) revert NotNamespaceOwner(namespaceId, msg.sender);
         // aderyn-ignore-next-line(reentrancy-state-change)
@@ -348,13 +272,15 @@ contract OriginAssignment is AccessControl, ReentrancyGuard {
         emit MaxOriginsPerNamespaceUpdated(old, cap);
     }
 
-    function setVettingTimelock(uint256 secondsDelay) external onlyRole(GOVERNANCE_ROLE) {
-        if (secondsDelay < VETTING_TIMELOCK_FLOOR || secondsDelay > VETTING_TIMELOCK_CEILING) {
-            revert ParamOutOfBounds(secondsDelay, VETTING_TIMELOCK_FLOOR, VETTING_TIMELOCK_CEILING);
-        }
-        uint256 old = vettingTimelock;
-        vettingTimelock = secondsDelay;
-        emit VettingTimelockUpdated(old, secondsDelay);
+    /// @notice Install a different vetting policy, changing the vetting procedure
+    ///         without touching this contract. Rejecting `address(0)` keeps
+    ///         `addOrigin` branch-free and fail-closed — "deny everyone" is a
+    ///         policy whose `isVetted` returns false, not a null policy.
+    function setVettingPolicy(IVettingPolicy newPolicy) external onlyRole(GOVERNANCE_ROLE) {
+        if (address(newPolicy) == address(0)) revert ZeroAddress();
+        address old = address(vettingPolicy);
+        vettingPolicy = newPolicy;
+        emit VettingPolicyUpdated(old, address(newPolicy));
     }
 
     // -----------------------------------------------------------------
@@ -397,10 +323,11 @@ contract OriginAssignment is AccessControl, ReentrancyGuard {
         }
     }
 
-    /// @notice Unix time `publisher`'s pending vetting request ripens, or `0`
-    ///         when no request is pending.
-    function getPendingVetting(address publisher) external view returns (uint256 readyAt) {
-        return _vettingReadyAt[publisher];
+    /// @notice Whether `publisher` may currently seat origins, per the installed
+    ///         policy. A passthrough so callers reading vetting status need not
+    ///         know the policy address.
+    function isVettedPublisher(address publisher) external view returns (bool) {
+        return vettingPolicy.isVetted(publisher);
     }
 
     // -----------------------------------------------------------------

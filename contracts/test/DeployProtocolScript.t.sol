@@ -17,6 +17,7 @@ import { DecdnGovernor } from "../src/DecdnGovernor.sol";
 import { PaymentChannel } from "../src/PaymentChannel.sol";
 import { SlashJudge } from "../src/SlashJudge.sol";
 import { OriginAssignment } from "../src/OriginAssignment.sol";
+import { ManualVettingPolicy } from "../src/ManualVettingPolicy.sol";
 import { IEd25519Verifier } from "../src/interfaces/IEd25519Verifier.sol";
 
 /// @title DeployProtocolScriptTest — covers the script-shaped behavior of
@@ -149,6 +150,7 @@ contract DeployProtocolScriptTest is Test, DeployProtocol {
         d.paymentChannel = PaymentChannel(address(0x09));
         d.slashJudge = SlashJudge(address(0x0A));
         d.originAssignment = OriginAssignment(address(0x0B));
+        d.vettingPolicy = ManualVettingPolicy(address(0x0C));
     }
 
     function test_writeManifest_writesAllAddresses() public {
@@ -174,6 +176,7 @@ contract DeployProtocolScriptTest is Test, DeployProtocol {
         assertEq(json.readAddress(".contracts.PaymentChannel"), address(0x09), "PaymentChannel");
         assertEq(json.readAddress(".contracts.SlashJudge"), address(0x0A), "SlashJudge");
         assertEq(json.readAddress(".contracts.OriginAssignment"), address(0x0B), "OriginAssignment");
+        assertEq(json.readAddress(".contracts.ManualVettingPolicy"), address(0x0C), "ManualVettingPolicy");
         assertEq(json.readAddress(".contracts.BuybackBurner"), address(0), "BuybackBurner unwired");
         // The verifier is script-deployed (#669), so it lives under `contracts`.
         assertEq(json.readAddress(".contracts.Ed25519Verifier"), TEST_ED25519, "ed25519");
