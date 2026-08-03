@@ -161,6 +161,20 @@ pub fn write_validate_summary<W: std::io::Write>(
     )?;
     writeln!(
         w,
+        "  content_blacklist_address: {}",
+        resolved
+            .blockchain
+            .content_blacklist_address
+            .as_deref()
+            .unwrap_or("(unset — REQUIRED: the node refuses to start without it)")
+    )?;
+    writeln!(
+        w,
+        "  content_blacklist_poll_interval_sec: {}",
+        resolved.blockchain.content_blacklist_poll_interval_sec
+    )?;
+    writeln!(
+        w,
         "  rpc_watchdog_interval_sec: {}",
         resolved.blockchain.rpc_watchdog_interval_sec
     )?;
@@ -423,9 +437,10 @@ pub fn config_init(args: &cli::ConfigInitArgs) -> anyhow::Result<()> {
 /// - `render_config_emits_parseable_toml` (in `decdn_e2e`) — the e2e template
 ///   parses as valid TOML and spot-checks the daemon-critical keys.
 ///
-/// When adding a config knob, update this template first (see CLAUDE.md's
-/// "config knob surfacing" convention), then the samples; the guards above keep
-/// them honest.
+/// When adding a config knob, update this template first — the
+/// `default_config_template_covers_every_wired_field` guard below enforces
+/// field-level coverage for the daemon-config sections — then the samples; the
+/// guards keep them honest.
 const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # CLI flags override values in this file.
 
@@ -456,6 +471,8 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # origin_assignment_address = ""     # OPTIONAL: 0x-prefixed hex; `decdn publish assign` target, and the chain-backed origin directory for cache-miss pull-through fallback (ADR 022).
 # publisher_registry_address = ""    # OPTIONAL: 0x-prefixed hex; `decdn publish namespace create` target (#1029).
 # slash_judge_address = ""           # REQUIRED: 0x-prefixed hex (EIP-712 verifyingContract, ADR 014)
+# content_blacklist_address = ""     # REQUIRED: 0x-prefixed hex; deployed ContentBlacklist (ADR 011/031). Absent => startup fails before any ALPN accepts; the zero address is rejected (it is a fail-open compliance trap).
+# content_blacklist_poll_interval_sec = 600  # blacklist watcher periodic replay + re-scope cadence (ADR 011); must be > 0; default 600s
 # chain_id = 421614                  # EIP-712 chain id; default Arbitrum Sepolia
 # rpc_watchdog_interval_sec = 30     # 0 disables the connectivity watchdog
 # event_poll_interval_ms = 7000      # eth_getLogs tick cadence for chain watchers + pending-tx receipt polling (#1011/#1106); default 7000ms, min 250ms (lower for a local anvil)
@@ -466,6 +483,17 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # buyer_max_approve = true                       # unlimited USDC approval for PaymentChannel (#744); node default true, decdn client default false (exact deposit-sized approval); set true on the client to opt into unlimited
 # settlement_auto_threshold_micro_usdc = 50000000   # auto-closeChannel once un-redeemed µUSDC reaches this (#742); leave unset/commented to disable — when set it must be > 0
 # settlement_auto_by_voucher_nonce_span = 1000       # auto-closeChannel once the un-redeemed nonce span reaches this (#742); leave unset/commented to disable — when set it must be > 0
+# CLI-only [blockchain] keys — consumed by `decdn setup` / `decdn appeal`, NOT the daemon.
+# They live here because [blockchain] denies unknown fields and a node's node.toml is
+# shared with those CLIs, so a config that drives them must still pass `config validate`.
+# slash_appeal_address = ""          # `decdn appeal slash` target (ADR 028)
+# swap_venue = "uniswap-v3"          # `decdn setup --pay-bond-with usdc` venue: uniswap-v3 | balancer-v3
+# swap_router_address = ""           # router for swap_venue (Uniswap SwapRouter02 / Balancer V3 Router); required when swap_venue is set
+# swap_quoter_address = ""           # Uniswap QuoterV2 (Uniswap venue only)
+# usdc_address = ""                  # USDC token the swap spends; required when swap_venue is set
+# swap_fee_tier = 3000               # Uniswap V3 pool fee tier, e.g. 500/3000/10000 (Uniswap venue only)
+# swap_balancer_pool = ""            # Balancer V3 pool address (Balancer venue only)
+# swap_pool_address = ""             # Uniswap V3 TOKEN/USDC pool for the advisory price-impact check (optional)
 
 [cache]
 # cache_dir = "~/.decdn/cache"
@@ -479,6 +507,22 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # [cache.origin]
 # kind = "http"
 # url = "https://origin.example/"
+# decompress = "auto"                      # optional; "auto" decompresses gzip/zstd, "strict" refuses non-identity encodings
+# — or a local filesystem origin (blobs at {path}/{hex[0..2]}/{hex}):
+# [cache.origin]
+# kind = "fs"
+# path = "/var/lib/decdn/origin"
+# — or an S3-compatible origin (AWS S3 / Cloudflare R2 / Backblaze B2 / MinIO):
+# [cache.origin]
+# kind = "s3"
+# bucket = "decdn-blobs"
+# region = "us-east-1"                      # required even with a custom endpoint_url (SigV4 signing)
+# endpoint_url = "https://<accountid>.r2.cloudflarestorage.com"  # for R2/B2/MinIO; omit for AWS
+# path_style = true                         # required true for MinIO; AWS/R2 default to virtual-hosted-style
+# prefix = "blobs/"                         # optional key prefix; final key is {prefix}{hex[0..2]}/{hex}
+# decompress = "auto"                       # optional; mirrors the HTTP origin's knob
+# [cache.origin.credentials]               # omit entirely to use the AWS default credential chain (env / ~/.aws / IAM role)
+# source = "default-chain"                  # or "static" with access_key_id = "..." and secret_access_key = "..."
 # Multi-origin fallback (#284), tried in order on a miss:
 # [[cache.origins]]
 # kind = "http"
@@ -486,11 +530,23 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # Origin pull-through retry policy (#285); restart-required.
 # [cache.origin_retry]
 # max_retries = 3
+# Per-origin circuit breaker (#963); restart-required. Fronts the retry loop: after
+# failure_threshold consecutive origin-unavailable failures it trips OPEN and fast-fails
+# every miss for cooldown_ms, then admits half_open_max_calls trial pulls. Structurally
+# identical to [cache.origin_retry]. Set enabled = false (or failure_threshold = 0) to opt out.
+# [cache.circuit_breaker]
+# enabled = true
+# failure_threshold = 5
+# cooldown_ms = 30000
+# half_open_max_calls = 1
 # NOTE: the keys below belong to [cache], NOT to the [cache.origin_retry] table
 # above — uncomment this header along with them or TOML will nest them wrongly.
 # [cache]
 # gc_interval_sec = 300                    # iroh-blobs GC sweep cadence; 0 disables (#518). NOTE: the eviction driver only drops GC protection, so with 0 it can never reclaim disk and cache_size_mb is unenforceable (#1173)
 # fs_rescan_interval_sec = 60              # re-walk the fs origin + re-check pins into the origin-held index, so a file dropped into the origin becomes probe-answerable and DHT-announced within one interval (#1130); 0 disables the timer (startup and `decdn node reload` still rescan)
+# origin_probe_ttl_sec = 15                # TTL for a memoised live-origin probe answer — a hash absent from the fs/pins index falls back to a HEAD/HeadObject against the http/s3 origin, cached this long (#1130 pt3)
+# origin_probe_timeout_ms = 2000           # per-probe ceiling on the live-origin HEAD/HeadObject; on timeout the probe answers has_blob:false and the miss is memoised absent for one TTL (#1130 pt3)
+# origin_probe_memo_capacity = 4096        # max distinct hashes held in the live-origin probe memo; bounds memo memory under a random-hash probe flood (#1130 pt3)
 # eviction_high_water_pct = 90             # LRU driver evicts above this % of cache_size_mb (#1173); bounds [60,95]
 # eviction_target_pct = 80                 # LRU driver evicts down to this % (#1173); bounds [40,90], must be <= high_water-5
 # eviction_per_sweep_budget = 16           # max LRU victims per tick before yielding (#1173); bounds [1,256]
@@ -509,6 +565,8 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # rate_per_mb = 10
 # delivery_floor = 0                       # PRE-CHAIN SEED ONLY (#1172): overwritten from on-chain getRateBounds() before serving; governance owns the live floor
 # voucher_interval_mb = 1                  # voucher cadence advertised on cdn/client/v1 (ADR 003); range 1..=MAX_VOUCHER_INTERVAL_MB
+# credit_window_bytes = 8388608            # downstream credit window in bytes (ADR 003 §Credit window); how far past cleared payment the node streams before collecting a voucher; default 8 MiB; floored at one voucher interval
+# voucher_commit_interval_ms = 5           # group-commit interval for durable voucher persistence (ADR 003, #1483); 0 commits each batch immediately; default 5ms
 
 [observability]
 # log_level = "info"
@@ -626,6 +684,239 @@ mod tests {
                 present,
                 "DEFAULT_CONFIG is missing a header for the [{section}] schema section"
             );
+        }
+    }
+
+    // Field-level coverage for the daemon-config sections where wired knobs
+    // recurringly drifted out of the template (#1554): every field of
+    // `BlockchainConfig` / `CacheConfig` / `PaymentConfig` must appear (at least
+    // commented) in DEFAULT_CONFIG. The exhaustive destructures are the
+    // load-bearing part — adding a field to any of these structs fails to
+    // compile until it is named here, and the `contains` assertion then fails
+    // until the template surfaces it. `.is_none()` on each binding is just how
+    // the destructured field is referenced; the token is the substring the
+    // template must carry (a `key =` line for scalars, a table header for the
+    // sub-table types).
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one exhaustive destructure + key list per config section reads best unsplit"
+    )]
+    fn default_config_template_covers_every_wired_field() {
+        let config::types::BlockchainConfig {
+            rpc_url,
+            eth_keystore,
+            payment_channel_address,
+            capacity_bond_address,
+            origin_assignment_address,
+            publisher_registry_address,
+            slash_judge_address,
+            slash_appeal_address,
+            content_blacklist_address,
+            content_blacklist_poll_interval_sec,
+            chain_id,
+            rpc_watchdog_interval_sec,
+            event_poll_interval_ms,
+            rate_bounds_poll_interval_sec,
+            redeem_threshold_micro_usdc,
+            buyer_initial_deposit_micro_usdc,
+            buyer_working_deposit_micro_usdc,
+            buyer_max_approve,
+            settlement_auto_threshold_micro_usdc,
+            settlement_auto_by_voucher_nonce_span,
+            swap_venue,
+            swap_router_address,
+            swap_quoter_address,
+            usdc_address,
+            swap_fee_tier,
+            swap_balancer_pool,
+            swap_pool_address,
+        } = &config::types::BlockchainConfig::default();
+        let blockchain = [
+            ("rpc_url =", rpc_url.is_none()),
+            ("eth_keystore =", eth_keystore.is_none()),
+            (
+                "payment_channel_address =",
+                payment_channel_address.is_none(),
+            ),
+            ("capacity_bond_address =", capacity_bond_address.is_none()),
+            (
+                "origin_assignment_address =",
+                origin_assignment_address.is_none(),
+            ),
+            (
+                "publisher_registry_address =",
+                publisher_registry_address.is_none(),
+            ),
+            ("slash_judge_address =", slash_judge_address.is_none()),
+            ("slash_appeal_address =", slash_appeal_address.is_none()),
+            (
+                "content_blacklist_address =",
+                content_blacklist_address.is_none(),
+            ),
+            (
+                "content_blacklist_poll_interval_sec =",
+                content_blacklist_poll_interval_sec.is_none(),
+            ),
+            ("chain_id =", chain_id.is_none()),
+            (
+                "rpc_watchdog_interval_sec =",
+                rpc_watchdog_interval_sec.is_none(),
+            ),
+            ("event_poll_interval_ms =", event_poll_interval_ms.is_none()),
+            (
+                "rate_bounds_poll_interval_sec =",
+                rate_bounds_poll_interval_sec.is_none(),
+            ),
+            (
+                "redeem_threshold_micro_usdc =",
+                redeem_threshold_micro_usdc.is_none(),
+            ),
+            (
+                "buyer_initial_deposit_micro_usdc =",
+                buyer_initial_deposit_micro_usdc.is_none(),
+            ),
+            (
+                "buyer_working_deposit_micro_usdc =",
+                buyer_working_deposit_micro_usdc.is_none(),
+            ),
+            ("buyer_max_approve =", buyer_max_approve.is_none()),
+            (
+                "settlement_auto_threshold_micro_usdc =",
+                settlement_auto_threshold_micro_usdc.is_none(),
+            ),
+            (
+                "settlement_auto_by_voucher_nonce_span =",
+                settlement_auto_by_voucher_nonce_span.is_none(),
+            ),
+            ("swap_venue =", swap_venue.is_none()),
+            ("swap_router_address =", swap_router_address.is_none()),
+            ("swap_quoter_address =", swap_quoter_address.is_none()),
+            ("usdc_address =", usdc_address.is_none()),
+            ("swap_fee_tier =", swap_fee_tier.is_none()),
+            ("swap_balancer_pool =", swap_balancer_pool.is_none()),
+            ("swap_pool_address =", swap_pool_address.is_none()),
+        ];
+
+        let config::types::CacheConfig {
+            cache_dir,
+            cache_size_mb,
+            max_blob_size_mb,
+            max_rate_per_mb,
+            origin,
+            origins,
+            pinned_hashes,
+            origin_retry,
+            circuit_breaker,
+            user_agent,
+            gc_interval_sec,
+            fs_rescan_interval_sec,
+            origin_probe_ttl_sec,
+            origin_probe_timeout_ms,
+            origin_probe_memo_capacity,
+            eviction_high_water_pct,
+            eviction_target_pct,
+            eviction_per_sweep_budget,
+            eviction_tick_secs,
+            max_probe_holds,
+            stake_lane_reserved_holds,
+            node_to_node_pull_through_enabled,
+            node_pull_probe_fanout,
+            node_pull_timeout_sec,
+            node_pull_stall_timeout_sec,
+            pull_ahead_bytes,
+            max_unrecouped_leech_bytes,
+            pull_share_ratio_percent,
+        } = &config::types::CacheConfig::default();
+        let cache = [
+            ("cache_dir =", cache_dir.is_none()),
+            ("cache_size_mb =", cache_size_mb.is_none()),
+            ("max_blob_size_mb =", max_blob_size_mb.is_none()),
+            ("max_rate_per_mb =", max_rate_per_mb.is_none()),
+            ("[cache.origin]", origin.is_none()),
+            ("[[cache.origins]]", origins.is_none()),
+            ("pinned_hashes =", pinned_hashes.is_none()),
+            ("[cache.origin_retry]", origin_retry.is_none()),
+            ("[cache.circuit_breaker]", circuit_breaker.is_none()),
+            ("user_agent =", user_agent.is_none()),
+            ("gc_interval_sec =", gc_interval_sec.is_none()),
+            ("fs_rescan_interval_sec =", fs_rescan_interval_sec.is_none()),
+            ("origin_probe_ttl_sec =", origin_probe_ttl_sec.is_none()),
+            (
+                "origin_probe_timeout_ms =",
+                origin_probe_timeout_ms.is_none(),
+            ),
+            (
+                "origin_probe_memo_capacity =",
+                origin_probe_memo_capacity.is_none(),
+            ),
+            (
+                "eviction_high_water_pct =",
+                eviction_high_water_pct.is_none(),
+            ),
+            ("eviction_target_pct =", eviction_target_pct.is_none()),
+            (
+                "eviction_per_sweep_budget =",
+                eviction_per_sweep_budget.is_none(),
+            ),
+            ("eviction_tick_secs =", eviction_tick_secs.is_none()),
+            ("max_probe_holds =", max_probe_holds.is_none()),
+            (
+                "stake_lane_reserved_holds =",
+                stake_lane_reserved_holds.is_none(),
+            ),
+            (
+                "node_to_node_pull_through_enabled =",
+                node_to_node_pull_through_enabled.is_none(),
+            ),
+            ("node_pull_probe_fanout =", node_pull_probe_fanout.is_none()),
+            ("node_pull_timeout_sec =", node_pull_timeout_sec.is_none()),
+            (
+                "node_pull_stall_timeout_sec =",
+                node_pull_stall_timeout_sec.is_none(),
+            ),
+            ("pull_ahead_bytes =", pull_ahead_bytes.is_none()),
+            (
+                "max_unrecouped_leech_bytes =",
+                max_unrecouped_leech_bytes.is_none(),
+            ),
+            (
+                "pull_share_ratio_percent =",
+                pull_share_ratio_percent.is_none(),
+            ),
+        ];
+
+        let config::types::PaymentConfig {
+            rate_per_mb,
+            delivery_floor,
+            voucher_interval_mb,
+            credit_window_bytes,
+            voucher_commit_interval_ms,
+        } = &config::types::PaymentConfig::default();
+        let payment = [
+            ("rate_per_mb =", rate_per_mb.is_none()),
+            ("delivery_floor =", delivery_floor.is_none()),
+            ("voucher_interval_mb =", voucher_interval_mb.is_none()),
+            ("credit_window_bytes =", credit_window_bytes.is_none()),
+            (
+                "voucher_commit_interval_ms =",
+                voucher_commit_interval_ms.is_none(),
+            ),
+        ];
+
+        for (section, keys) in [
+            ("blockchain", blockchain.as_slice()),
+            ("cache", cache.as_slice()),
+            ("payment", payment.as_slice()),
+        ] {
+            for &(token, _referenced) in keys {
+                assert!(
+                    DEFAULT_CONFIG.contains(token),
+                    "DEFAULT_CONFIG template is missing wired [{section}] key `{token}` \
+                     — surface it (at least commented) so init→run does not fail on an \
+                     undocumented key"
+                );
+            }
         }
     }
 
