@@ -11,7 +11,7 @@ alloy.workspace = true
 decdn-client-pull.workspace = true
 decdn-incentive.workspace = true
 decdn-common.workspace = true
-redb = "2"
+redb = "4"
 
 [dev-dependencies]
 tempfile = "3"

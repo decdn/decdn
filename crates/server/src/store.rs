@@ -1,13 +1,12 @@
 use crate::money::MicroUsdc;
 use alloy::primitives::{Address, B256};
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use std::path::Path;
 
 // value encodings are fixed-width big-endian byte arrays for stable ordering.
-// NOTE: redb 2.x has no `Value` impl for `Vec<u8>` (only `&[u8]`, fixed-size
-// arrays, and a handful of primitives) — the brief's `TableDefinition<[u8; 32],
-// Vec<u8>>` does not compile against redb 2.6.3, so the channel record table
-// uses `&[u8]` as its value type instead.
+// redb 4.x still has no `Value` impl for `Vec<u8>` (only `&[u8]`, fixed-size
+// arrays, and a handful of primitives), so the channel record table keeps
+// `&[u8]` as its value type — unchanged from the redb 2.x layout.
 const CHANNELS: TableDefinition<[u8; 32], &[u8]> = TableDefinition::new("channels_v1");
 const CLIENT_INDEX: TableDefinition<[u8; 52], [u8; 32]> = TableDefinition::new("client_index_v1"); // client(20)|node(32)
 const CAP: TableDefinition<[u8; 24], u64> = TableDefinition::new("cap_v1"); // client(20)|bucket(4)
