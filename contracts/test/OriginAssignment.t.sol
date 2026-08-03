@@ -184,6 +184,22 @@ contract OriginAssignmentTest is Test {
         oa.setVettingPolicy(IVettingPolicy(address(0)));
     }
 
+    /// An EOA (or not-yet-deployed address) is rejected: pointing the policy at
+    /// one would make addOrigin revert on the isVetted ABI decode instead.
+    function test_setVettingPolicy_rejectsNonContract() public {
+        address eoa = address(0xE0A);
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(OriginAssignment.VettingPolicyNotAContract.selector, eoa));
+        oa.setVettingPolicy(IVettingPolicy(eoa));
+    }
+
+    /// The constructor applies the same contract guard to the genesis policy.
+    function test_constructor_rejectsNonContractPolicy() public {
+        address eoa = address(0xE0A);
+        vm.expectRevert(abi.encodeWithSelector(OriginAssignment.VettingPolicyNotAContract.selector, eoa));
+        new OriginAssignment(bond, registry, address(blacklist), IVettingPolicy(eoa), admin);
+    }
+
     function test_setVettingPolicy_onlyGovernance() public {
         RejectAllVettingPolicy rejectAll = new RejectAllVettingPolicy();
         vm.prank(stranger);

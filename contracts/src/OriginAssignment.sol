@@ -118,6 +118,10 @@ contract OriginAssignment is AccessControl, ReentrancyGuard {
     error OperatorNotBlacklisted(address operator);
     error ParamOutOfBounds(uint256 value, uint256 floor, uint256 ceiling);
     error PublisherNotVetted(address publisher);
+    /// @notice The vetting policy address holds no code. `addOrigin` would revert
+    ///         on the `isVetted` ABI decode, bricking seating with an opaque
+    ///         low-level failure — so the constructor and setter reject it loudly.
+    error VettingPolicyNotAContract(address policy);
 
     // -----------------------------------------------------------------
     // Constructor (ADR 016 § Deployment Order, step 10)
@@ -143,6 +147,11 @@ contract OriginAssignment is AccessControl, ReentrancyGuard {
         ) {
             revert ZeroAddress();
         }
+        // The policy must be a contract: `addOrigin` calls `isVetted` on it, and a
+        // non-contract address would revert on the ABI decode instead of failing
+        // here. `capacityBond_` / `publisherRegistry_` are likewise called, but
+        // their own constructors already ran, so only the policy needs the guard.
+        if (address(vettingPolicy_).code.length == 0) revert VettingPolicyNotAContract(address(vettingPolicy_));
         capacityBond = capacityBond_;
         publisherRegistry = publisherRegistry_;
         contentBlacklist = contentBlacklist_; // may be zero at deploy
@@ -275,9 +284,13 @@ contract OriginAssignment is AccessControl, ReentrancyGuard {
     /// @notice Install a different vetting policy, changing the vetting procedure
     ///         without touching this contract. Rejecting `address(0)` keeps
     ///         `addOrigin` branch-free and fail-closed — "deny everyone" is a
-    ///         policy whose `isVetted` returns false, not a null policy.
+    ///         policy whose `isVetted` returns false, not a null policy. The
+    ///         policy must be a contract: an EOA (or not-yet-deployed address)
+    ///         would make `addOrigin`'s `isVetted` call revert on ABI decode, so
+    ///         a misconfiguration fails loudly here instead of bricking seating.
     function setVettingPolicy(IVettingPolicy newPolicy) external onlyRole(GOVERNANCE_ROLE) {
         if (address(newPolicy) == address(0)) revert ZeroAddress();
+        if (address(newPolicy).code.length == 0) revert VettingPolicyNotAContract(address(newPolicy));
         address old = address(vettingPolicy);
         vettingPolicy = newPolicy;
         emit VettingPolicyUpdated(old, address(newPolicy));
