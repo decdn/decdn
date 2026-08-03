@@ -6067,6 +6067,7 @@ dependencies = [
  "decdn-client-pull",
  "decdn-common",
  "decdn-incentive",
+ "hex",
  "redb",
  "tempfile",
  "tokio",
