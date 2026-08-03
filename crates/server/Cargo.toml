@@ -1,0 +1,13 @@
+[package]
+name = "sponsord"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+
+[dependencies]
+tokio.workspace = true
+anyhow.workspace = true
+alloy.workspace = true
+decdn-client-pull.workspace = true
+decdn-incentive.workspace = true
+decdn-common.workspace = true

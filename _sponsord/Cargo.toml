@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = ["crates/server", "crates/wrapper"]
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+alloy = { version = "2", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+decdn-client-pull = { path = "../decdn/crates/client-pull" }
+decdn-incentive   = { path = "../decdn/crates/incentive", features = ["redb"] }
+decdn-common      = { path = "../decdn/crates/common" }
