@@ -76,8 +76,6 @@ pub decdn_protocol::client::StreamRequest::channel_id: [u8; 32]
 pub decdn_protocol::client::StreamRequest::hash: [u8; 32]
 pub decdn_protocol::client::StreamRequest::namespace_id: [u8; 32]
 pub decdn_protocol::client::StreamRequest::timestamp_us: u64
-impl decdn_protocol::client::StreamRequest
-pub const fn decdn_protocol::client::StreamRequest::requested_len(&self) -> core::option::Option<core::num::nonzero::NonZeroU64>
 pub struct decdn_protocol::client::StreamRequestExt
 pub decdn_protocol::client::StreamRequestExt::binding: core::option::Option<decdn_protocol::client::ClientBinding>
 pub decdn_protocol::client::StreamRequestExt::voucher_interval_mb: core::option::Option<u64>
@@ -507,8 +505,6 @@ pub decdn_protocol::StreamRequest::channel_id: [u8; 32]
 pub decdn_protocol::StreamRequest::hash: [u8; 32]
 pub decdn_protocol::StreamRequest::namespace_id: [u8; 32]
 pub decdn_protocol::StreamRequest::timestamp_us: u64
-impl decdn_protocol::client::StreamRequest
-pub const fn decdn_protocol::client::StreamRequest::requested_len(&self) -> core::option::Option<core::num::nonzero::NonZeroU64>
 pub struct decdn_protocol::StreamRequestExt
 pub decdn_protocol::StreamRequestExt::binding: core::option::Option<decdn_protocol::client::ClientBinding>
 pub decdn_protocol::StreamRequestExt::voucher_interval_mb: core::option::Option<u64>

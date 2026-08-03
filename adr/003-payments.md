@@ -585,17 +585,18 @@ For how nodes validate `rate_per_mb` against the cached floor before signing pro
 
 ### BuybackBurner
 
-| Function | Purpose |
-| --- | --- |
-| `executeBuyback(amount, minTokenOut)` | Governance multisig or `keeper`: swap `amount` of USDC for ≥ `minTokenOut` TOKEN and burn the proceeds. |
-| `setKeeper(addr)` / `setSwapRouter(addr)` | Governance: rotate the authorized keeper or swap router. |
-| `setSlippageTolerance(bps)` / `setMinBuybackAmount(n)` / `setMaxBuybackAmount(n)` | Governance: per-call execution guards. |
-| `setEpochLiquidityCapFraction(bps)` | Governance: per-epoch USDC liquidity cap as a fraction of epoch-start pool depth (bounded `[1%, 30%]`, [ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol)). |
-| `setVault(addr)` / `setPool(addr)` | Governance: wire/rotate the Balancer V3 Vault and the pool. The Vault serves pool-registration and pool-state reads only; it is not an approval target. |
-| `poke()` | Permissionless: advance the on-chain TWAP price accumulator that backs the `minOut` floor. |
-| `keeper() → address` / `getAccumulatedFees() → uint256` | Views: current keeper and accumulated buyback inflow (USDC). |
+| Function | Purpose | Declared on |
+| --- | --- | --- |
+| `executeBuyback(amount, minTokenOut)` | Governance multisig or `keeper`: swap `amount` of USDC for ≥ `minTokenOut` TOKEN and burn the proceeds. | `BuybackBurner` (abstract base) |
+| `setKeeper(addr)` | Governance: rotate the authorized keeper. | `GuardedBuybackBurner` |
+| `setSlippageTolerance(bps)` / `setMinBuybackAmount(n)` / `setMaxBuybackAmount(n)` | Governance: per-call execution guards. | `GuardedBuybackBurner` |
+| `setEpochLiquidityCapFraction(bps)` | Governance: per-epoch USDC liquidity cap as a fraction of epoch-start pool depth (bounded `[1%, 30%]`, [ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol)). | `GuardedBuybackBurner` |
+| `poke()` | Permissionless: advance the on-chain TWAP price accumulator that backs the `minOut` floor. | `GuardedBuybackBurner` |
+| `keeper() → address` / `getAccumulatedFees() → uint256` | Views: current keeper and accumulated buyback inflow (USDC). | `GuardedBuybackBurner` |
+| `setSwapRouter(addr)` / `setPool(addr)` | Governance: rotate the swap router or the pool. | venue subclass (`BuybackBurnerBalancerV3` / `BuybackBurnerUniswapV3`) |
+| `setVault(addr)` | Governance: wire/rotate the Balancer V3 Vault. The Vault serves pool-registration and pool-state reads only; it is not an approval target. | `BuybackBurnerBalancerV3` only |
 
-This is the canonical `BuybackBurner` interface. [ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split) defines the economic parameters and the 30% router-fed inflow source. [ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol) specifies the venue (Balancer V3 Router + 80/20 weighted pool) and how `setSwapRouter` / `setPool` are configured at deployment. **V3 integration note:** `setSwapRouter` holds the Balancer V3 **Router** address. The Router does not pull input tokens through a plain ERC20 allowance — it pulls them through **Permit2** (`permit2.transferFrom`), so Permit2 is the approval target and the Vault is never one. The concrete `BuybackBurnerBalancerV3` ([#686](https://github.com/decdn/decdn/issues/686)) uses a scoped per-swap Permit2 approval and resets it to `0` after each swap, so no standing allowance survives. The Vault address is held separately and serves pool-registration and pool-state reads only. [ADR 018 § Buyback execution via Balancer V3](018-liquidity-strategy.md#buyback-execution-via-balancer-v3) is authoritative for the mechanism.
+The members above are split across the three-layer `BuybackBurner` hierarchy — the abstract base, the `GuardedBuybackBurner` guard layer, and the concrete venue subclass — as the *Declared on* column records; there is no single flat contract, and `setVault` exists on the Balancer subclass only (`BuybackBurnerUniswapV3` has none). [ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split) defines the economic parameters and the 30% router-fed inflow source. [ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol) specifies the venue (Balancer V3 Router + 80/20 weighted pool) and how `setSwapRouter` / `setPool` are configured at deployment. **V3 integration note:** `setSwapRouter` holds the Balancer V3 **Router** address. The Router does not pull input tokens through a plain ERC20 allowance — it pulls them through **Permit2** (`permit2.transferFrom`), so Permit2 is the approval target and the Vault is never one. The concrete `BuybackBurnerBalancerV3` ([#686](https://github.com/decdn/decdn/issues/686)) uses a scoped per-swap Permit2 approval and resets it to `0` after each swap, so no standing allowance survives. The Vault address is held separately and serves pool-registration and pool-state reads only. [ADR 018 § Buyback execution via Balancer V3](018-liquidity-strategy.md#buyback-execution-via-balancer-v3) is authoritative for the mechanism.
 
 All `set*` functions are governance-only behind a timelock.
 

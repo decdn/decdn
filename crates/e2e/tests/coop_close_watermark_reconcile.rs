@@ -45,9 +45,7 @@
     clippy::expect_used,
     clippy::panic,
     clippy::indexing_slicing,
-    clippy::duration_suboptimal_units,
-    // One sequential on-chain journey reads more clearly unsplit.
-    clippy::too_many_lines
+    clippy::duration_suboptimal_units
 )]
 
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};

@@ -103,9 +103,14 @@ pub struct BlockchainArgs {
     pub origin_assignment_address: Option<String>,
 
     /// `PublisherRegistry` contract address (0x-prefixed hex). Optional; the
-    /// publish CLI's `namespace create`/transfer target (ADR 022). Not consumed
-    /// by the node runtime's origin directory, which keys solely on
-    /// `origin_assignment_address`.
+    /// publish CLI's `namespace create`/transfer target (ADR 022).
+    ///
+    /// **Validate-only on the daemon.** The `decdn-node run` daemon never reads
+    /// this — its origin directory keys solely on `origin_assignment_address`,
+    /// and the `decdn publish` CLI resolves the registry through its own
+    /// `PublishChainArgs`, not `RunArgs`. It is accepted (and zero-rejected)
+    /// here purely so `decdn config validate` gives operators `DECDN_*` env-var
+    /// parity over the same `[blockchain]` table the publish CLI file consumes.
     #[arg(long, value_name = "ADDR", env = "DECDN_PUBLISHER_REGISTRY_ADDRESS")]
     pub publisher_registry_address: Option<String>,
 

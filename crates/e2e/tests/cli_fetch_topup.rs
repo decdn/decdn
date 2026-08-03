@@ -28,9 +28,7 @@
     clippy::expect_used,
     clippy::panic,
     clippy::indexing_slicing,
-    clippy::duration_suboptimal_units,
-    // One sequential on-chain journey reads more clearly unsplit.
-    clippy::too_many_lines
+    clippy::duration_suboptimal_units
 )]
 
 use std::sync::Arc;
@@ -66,6 +64,12 @@ async fn cli_fetch_auto_topup_raises_and_persists_deposit() -> anyhow::Result<()
     Ok(())
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one sequential end-to-end journey: each step depends on the previous step's channel/\
+              deposit state, so decomposing it would thread state through helpers without reducing \
+              the journey's length or making it easier to follow"
+)]
 async fn run() -> anyhow::Result<()> {
     let _ = tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -583,6 +587,12 @@ fn make_multi_interval_blob() -> Vec<u8> {
     v
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one sequential end-to-end journey: each step depends on the previous step's channel/\
+              deposit state, so decomposing it would thread state through helpers without reducing \
+              the journey's length or making it easier to follow"
+)]
 async fn run_multi_interval_topup() -> anyhow::Result<()> {
     let _ = tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -904,6 +914,12 @@ fn make_two_topup_blob() -> Vec<u8> {
     v
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one sequential end-to-end journey: each step depends on the previous step's channel/\
+              deposit state, so decomposing it would thread state through helpers without reducing \
+              the journey's length or making it easier to follow"
+)]
 async fn run_two_topup_fetch() -> anyhow::Result<()> {
     let _ = tracing_subscriber::fmt()
         .with_writer(std::io::stderr)

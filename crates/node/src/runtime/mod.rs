@@ -2021,7 +2021,6 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
         tasks: gossip_handles,
         announce_trigger,
     } = GossipService::spawn(
-        infra.ep.clone(),
         infra.secret_key.clone(),
         infra.gossip.clone(),
         gossip_runtime_cfg,
@@ -2064,7 +2063,6 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
             announce_trigger,
             reload_hook,
             Arc::clone(&drain_trigger),
-            Arc::clone(&infra.eth_signer),
             Arc::clone(&infra.node_metrics),
         )
         // DHT introspection for `admin_v1_status` (issue #741). All handles

@@ -247,7 +247,7 @@ async fn repeat_probes_on_a_reused_endpoint_answer_like_the_first() -> anyhow::R
     );
 
     // The daemon-side copy of the client, on the same warm endpoint.
-    let (warm_node, _rtt) = decdn_node::probe_client::probe_once(
+    let (warm_node, _rtt) = decdn_node::client_requester::probe::probe_once(
         &client,
         target.clone(),
         PROBE_HASH,

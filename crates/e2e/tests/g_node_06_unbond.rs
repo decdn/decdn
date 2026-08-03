@@ -24,9 +24,7 @@
     clippy::expect_used,
     clippy::panic,
     clippy::indexing_slicing,
-    clippy::duration_suboptimal_units,
-    clippy::too_many_lines,
-    clippy::cognitive_complexity
+    clippy::duration_suboptimal_units
 )]
 
 use std::process::Output;
@@ -67,6 +65,13 @@ async fn unbond_reduces_capacity_and_returns_token_after_the_window() -> anyhow:
     Ok(())
 }
 
+#[allow(
+    clippy::cognitive_complexity,
+    clippy::too_many_lines,
+    reason = "sequential on-chain journey: each step depends on the previous step's chain state, \
+              so decomposing it would thread a state bundle through helpers without reducing the \
+              journey's length or making it easier to follow"
+)]
 async fn run() -> anyhow::Result<()> {
     let _ = tracing_subscriber::fmt()
         .with_writer(std::io::stderr)

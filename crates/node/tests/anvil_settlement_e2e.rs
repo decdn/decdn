@@ -61,11 +61,7 @@
     clippy::expect_used,
     clippy::panic,
     clippy::indexing_slicing,
-    // The single end-to-end flow is intentionally one long sequential test;
-    // splitting it would fragment the shared anvil/deploy setup. Second-scale
-    // timeouts read more clearly as `from_secs` than `from_mins` here.
-    clippy::too_many_lines,
-    clippy::cognitive_complexity,
+    // Second-scale timeouts read more clearly as `from_secs` than `from_mins`.
     clippy::duration_suboptimal_units
 )]
 
@@ -355,6 +351,13 @@ async fn e2e_onchain_payment_channel_settlement() -> anyhow::Result<()> {
         .with_context(|| format!("anvil-e2e exceeded the overall {OVERALL_TIMEOUT:?} timeout"))?
 }
 
+#[allow(
+    clippy::cognitive_complexity,
+    clippy::too_many_lines,
+    reason = "single end-to-end settlement journey: each step depends on the previous step's chain \
+              and runtime state, so decomposing it would thread a state bundle through helpers \
+              without reducing the journey's length or making it easier to follow"
+)]
 async fn run_e2e() -> anyhow::Result<()> {
     // Surface the redeemer/watcher background-task logs (the `warn!` carrying an
     // on-chain revert reason is the key diagnostic when a `withdraw`/`close`

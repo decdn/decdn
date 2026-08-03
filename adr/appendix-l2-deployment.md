@@ -149,6 +149,7 @@ Canonical reference for Arbitrum-specific assumptions elsewhere in the ADR set:
 | Native USDC (CCTP) address | `0xaf88d065e77c8cC2239327C5EDb3A432268e5831` | Circle CCTP on Arbitrum One |
 | Balancer V3 Vault | `0xbA1333333333a1BA1108E8412f11850A5C319bA9` | Balancer deployments registry |
 | Balancer V3 Router | `0xEAedc32a51c510d35ebC11088fD5fF2b47aACF2E` | Balancer deployments registry (`Router v2`) |
+| Permit2 | `0x000000000022D473030F116dDEE9F6B43aC78BA3` | Canonical Permit2 (same address on every chain deCDN targets) |
 | Sequencer forced-inclusion delay | ~24 h | Arbitrum delayed inbox |
 | L1 finality window | ~7 days | Nitro fraud-proof window |
 | Block time | ~250 ms | Arbitrum Nitro |
@@ -165,6 +166,14 @@ Canonical reference for Arbitrum-specific assumptions elsewhere in the ADR set:
 
 The production deployment runbook ([ADR 016](016-contract-interactions.md#adr-016-smart-contract-interaction-model)) substitutes Arbitrum Sepolia addresses
 for Arbitrum One mainnet equivalents at each step. No contract logic changes.
+
+**Buyback approvals.** The Balancer V3 buyback path approves **Permit2**, never the
+Vault: `BuybackBurnerBalancerV3` issues a scoped per-swap Permit2 allowance to the
+Router and resets it to `0` after each swap, so no standing USDC allowance is
+required or expected. Granting a standing allowance to the Vault buys nothing and is
+never consumed. [ADR 018 § Buyback execution via Balancer V3](018-liquidity-strategy.md#buyback-execution-via-balancer-v3)
+is authoritative for the mechanism; the canonical Permit2 address is in the
+[§ Chain-Specific Constants](#chain-specific-constants) table above.
 
 ### Tokenomics Validation Requirements
 

@@ -140,7 +140,6 @@ async fn join_gossip_tasks(tasks: impl IntoIterator<Item = tokio::task::JoinHand
 /// emits its own `NodeAnnounce` and validates + inserts peers' announces.
 #[allow(clippy::too_many_arguments)]
 async fn spawn_publisher(
-    ep: Endpoint,
     secret: SecretKey,
     gossip: iroh_gossip::net::Gossip,
     region: &str,
@@ -150,7 +149,6 @@ async fn spawn_publisher(
     gate: OwnedAnnounceGate,
 ) -> decdn_gossip::GossipHandles {
     GossipService::spawn(
-        ep,
         secret,
         gossip,
         GossipRuntimeConfig {
@@ -370,7 +368,6 @@ async fn two_nodes_exchange_node_announce_via_self_hosted_discovery() -> anyhow:
     // path enforces ADR 001 rule 2, and a mutual learn proves the gate is
     // threaded end-to-end and admits staked announcers.
     let a_handles = spawn_publisher(
-        a_ep.clone(),
         a_secret.clone(),
         a_gossip.clone(),
         "US",
@@ -381,7 +378,6 @@ async fn two_nodes_exchange_node_announce_via_self_hosted_discovery() -> anyhow:
     )
     .await;
     let b_handles = spawn_publisher(
-        b_ep.clone(),
         b_secret.clone(),
         b_gossip.clone(),
         "DE",
@@ -513,7 +509,6 @@ async fn non_staked_announce_is_dropped_at_subscriber() -> anyhow::Result<()> {
     // A: staked publisher. Its own gate is irrelevant to the reject direction —
     // what matters is that A actually broadcasts a `NodeAnnounce`.
     let a_handles = spawn_publisher(
-        a_ep.clone(),
         a_secret.clone(),
         a_gossip.clone(),
         "US",
@@ -525,7 +520,6 @@ async fn non_staked_announce_is_dropped_at_subscriber() -> anyhow::Result<()> {
     .await;
     // B: receiver whose gate EXCLUDES A, so B must reject every A announce.
     let b_handles = spawn_publisher(
-        b_ep.clone(),
         b_secret.clone(),
         b_gossip.clone(),
         "DE",

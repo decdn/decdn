@@ -248,6 +248,13 @@ jobs:
               # Guard helpers driven by adr/Makefile (check-anchor-targets), so
               # a change to the guard itself re-runs it against the whole set.
               - 'adr/_build/*.awk'
+              # docs/ and root markdown are in ANCHOR_SRCS (they link into ADR
+              # anchors), so a change to any of them must re-run the anchor guard.
+              - 'docs/**/*.md'
+              - 'CONTRIBUTING.md'
+              - 'CLAUDE.md'
+              - 'CHANGELOG.md'
+              - 'README.md'
               - '.github/workflows/ci.yml'
             solidity_dependencies:
               - '.gitmodules'
@@ -1472,6 +1479,7 @@ jobs:
       - run: make -C adr check-md-anchors
       - run: make -C adr check-anchor-targets
       - run: make -C adr check-no-section-numbers
+      - run: make -C adr check-no-history-links
 
   # Pytest suite for CI helper and path-filter regressions. Non-blocking by design
   # — excluded from ci-success.needs — so a regression in the helper surfaces

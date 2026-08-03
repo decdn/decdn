@@ -40,6 +40,7 @@ use decdn_incentive::{
 use decdn_node::buyer_channel::{
     ChannelOpenPending, ChannelOpener, OpenReported, OpenSlotReserved,
 };
+use decdn_node::client_requester::probe::probe_once;
 use decdn_node::client_requester::{
     ChannelContext, ChannelLedger, Cumulative, LocalPullFault, PullDeadlines, stream_fetch_shared,
 };
@@ -51,7 +52,6 @@ use decdn_node::dht::{
 use decdn_node::leech_governor::{LeechCaps, LeechCapsConfig, LeechGovernor};
 use decdn_node::metrics::Metrics;
 use decdn_node::node_origin::{NodeOrigin, NodeOriginConfig, NodeOriginDeps, TeeVerdict};
-use decdn_node::probe_client::probe_once;
 use decdn_node::region_accounting::{RegionAccountant, RegionResolver};
 use decdn_node::selection::{MAX_PROVIDER_ATTEMPTS, outer_pull_deadline};
 use decdn_protocol::client::{

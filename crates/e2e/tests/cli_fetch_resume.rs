@@ -48,9 +48,7 @@
     clippy::expect_used,
     clippy::panic,
     clippy::indexing_slicing,
-    clippy::duration_suboptimal_units,
-    // One sequential end-to-end journey reads more clearly unsplit.
-    clippy::too_many_lines
+    clippy::duration_suboptimal_units
 )]
 
 use std::time::Duration;
@@ -97,6 +95,12 @@ fn make_blob() -> Vec<u8> {
     v
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one sequential end-to-end journey: each step depends on the previous step's fetch \
+              state, so decomposing it would thread state through helpers without reducing the \
+              journey's length or making it easier to follow"
+)]
 async fn run() -> anyhow::Result<()> {
     let _ = tracing_subscriber::fmt()
         .with_writer(std::io::stderr)

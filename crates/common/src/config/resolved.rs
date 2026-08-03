@@ -4,8 +4,6 @@
 //! universal default; `relay_urls` is a (possibly empty) list — empty means
 //! "fall back to the n0 default relays".
 
-#![allow(dead_code)] // Fields will be consumed by the node runtime.
-
 use std::collections::HashSet;
 use std::path::PathBuf;
 

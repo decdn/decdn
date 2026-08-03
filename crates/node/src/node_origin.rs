@@ -59,6 +59,7 @@ use decdn_incentive::ChannelOpenFailureReason;
 
 use crate::buyer_channel::{ChannelOpenPending, ChannelOpener, OpenReported, OpenSlotReserved};
 use crate::buyer_ledgers::BuyerLedgers;
+use crate::client_requester::probe::probe_once;
 use crate::client_requester::{
     BlobTooLargeClaim, ChannelContext, ChannelLedger, Cumulative, HashMismatch, LocalPullFault,
     PullDeadlines, PullStalled, PullTimeout, RateAboveCeiling, UpstreamPull, UpstreamPullHeader,
@@ -72,7 +73,6 @@ use crate::dht::{
     ProbedProvider, StakerSet,
 };
 use crate::metrics::{Metrics, StreamGuard};
-use crate::probe_client::probe_once;
 use crate::selection::{Candidate, MAX_PROVIDER_ATTEMPTS, PROBE_TIMEOUT, rank_candidates};
 
 /// Record a buyer channel open/reuse failure on `err` to the metrics in `deps`,
