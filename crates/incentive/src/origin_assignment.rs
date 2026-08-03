@@ -9,14 +9,19 @@
 //! directory keeps a `namespaceId → authorized-operator` cache current from
 //! these events, falling back to `getOrigins` for the bootstrap snapshot.
 //!
-//! The contract has two planes. Governance vets a **publisher wallet** once
-//! (`requestVetting` → timelock → `grantVetting`, or an instant
-//! `setPublisherVetted`); a vetted publisher then seats and unseats origins for
+//! The contract has two planes. Whether a **publisher wallet** may seat origins
+//! is decided by a swappable `IVettingPolicy` (governance re-points it with
+//! `setVettingPolicy`); a vetted publisher then seats and unseats origins for
 //! its own namespaces instantly, one operator at a time. So every event here is
 //! a single-operator delta — `OriginAdded` seats one, `OriginRemoved` /
 //! `BlacklistedOriginPruned` remove one — and the directory treats each as a
 //! signal to re-read `getOrigins`, not as history. Namespace 0 has no publisher
 //! and no authorized origins, so `getOrigins(0)` is always empty.
+//!
+//! Vetting is not a CLI flow: a `VETTER_ROLE` holder on the installed policy
+//! (an operator, multisig, or governance) vets a wallet out-of-band, after
+//! which it may seat origins immediately. `OriginAssignment::vettingPolicy`
+//! exposes the installed policy address for tooling that wants to read it.
 
 // The `sol!`-generated bindings include macro-emitted code that uses
 // patterns workspace clippy denies (raw indexing into ABI fixed-size
@@ -64,18 +69,19 @@ mod sol_types {
                 view
                 returns (uint256[] memory);
 
-            /// Whether governance trusts `publisher` to seat origins for its own
-            /// namespaces. `addOrigin` reverts `PublisherNotVetted` while false.
+            /// Whether the installed policy vets `publisher` to seat origins for
+            /// its own namespaces. `addOrigin` reverts `PublisherNotVetted` while
+            /// false. A passthrough to `vettingPolicy().isVetted(publisher)`.
             function isVettedPublisher(address publisher) external view returns (bool);
+
+            /// The installed vetting authority (an `IVettingPolicy`). Exposed for
+            /// tooling that wants to read the policy address; vetting itself is a
+            /// `VETTER_ROLE` action on that policy, not a CLI flow.
+            function vettingPolicy() external view returns (address);
 
             // -----------------------------------------------------------------
             // Write functions (publisher control plane, issues #1029 / #1491)
             // -----------------------------------------------------------------
-
-            /// Publisher asks governance to vet its wallet. Reverts if the
-            /// caller owns no namespace, is already vetted, or already has a
-            /// request pending. Governance grants it after the vetting timelock.
-            function requestVetting() external;
 
             /// Vetted namespace owner seats one more authorized origin. Instant:
             /// there is no pending state and no governance step. Reverts if the
@@ -87,10 +93,6 @@ mod sol_types {
             /// Namespace owner (own namespace) or governance (any) unseats one
             /// authorized origin. Instant; reverts if the operator is not seated.
             function removeOrigin(uint256 namespaceId, address operator) external;
-
-            /// A publisher queued a vetting request. `readyAt` is the unix time
-            /// the timelock elapses (earliest governance grant).
-            event VettingRequested(address indexed publisher, uint256 readyAt);
 
             // -----------------------------------------------------------------
             // Per-namespace origin-membership events

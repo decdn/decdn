@@ -29,7 +29,8 @@ use decdn_incentive::{
 
 use crate::bindings::{
     AccessControl, CapacityBond, ContentBlacklist, ContentBlacklistOrigin, DecdnGovernor, Erc20,
-    OriginAssignment, PublisherRegistry, SlashAppeal, SlashJudge, TimelockController,
+    ManualVettingPolicy, OriginAssignment, PublisherRegistry, SlashAppeal, SlashJudge,
+    TimelockController,
 };
 
 /// Base for the per-fixture chain id. Each `ChainFixture` derives its chain id
@@ -174,6 +175,9 @@ pub struct ContractAddrs {
     pub timelock: Address,
     pub publisher_registry: Address,
     pub origin_assignment: Address,
+    /// `ManualVettingPolicy` — the genesis vetting policy `OriginAssignment`
+    /// reads. The fixture vets publishers here (see [`ChainFixture::vet_publisher`]).
+    pub manual_vetting_policy: Address,
     pub content_blacklist: Address,
 }
 
@@ -595,48 +599,42 @@ impl ChainFixture {
         crate::ensure_mined(&receipt, "removeOrigin")
     }
 
-    /// Vet `publisher` instantly as the governance Timelock — the
-    /// `setPublisherVetted` override. The fast setup for tests whose subject is
-    /// origin seating rather than how the wallet got vetted; see
-    /// [`Self::grant_vetting_after_timelock`] for the slow path.
+    /// Vet `publisher` through the genesis `ManualVettingPolicy`. Governance
+    /// (the Timelock) admins `VETTER_ROLE`, so the fixture impersonates the
+    /// Timelock to grant itself `VETTER_ROLE` (idempotent) and then calls
+    /// `setVetted`. This mirrors how an operator with `VETTER_ROLE` vets a
+    /// publisher on the live network, and takes effect instantly.
     pub async fn vet_publisher(&self, publisher: Address) -> anyhow::Result<()> {
         self.impersonate(self.addrs.timelock).await?;
         let raw = self.raw_provider();
-        let receipt = OriginAssignment::new(self.addrs.origin_assignment, &raw)
-            .setPublisherVetted(publisher, true)
-            .from(self.addrs.timelock)
-            .send()
-            .await
-            .context("setPublisherVetted send")?
-            .get_receipt()
-            .await
-            .context("setPublisherVetted receipt")?;
-        crate::ensure_mined(&receipt, "setPublisherVetted")
-    }
+        let policy = ManualVettingPolicy::new(self.addrs.manual_vetting_policy, &raw);
 
-    /// The full cold path: advance past the vetting delay a `requestVetting`
-    /// already queued, then grant it as the governance Timelock.
-    pub async fn grant_vetting_after_timelock(&self, publisher: Address) -> anyhow::Result<()> {
-        let assignment = OriginAssignment::new(self.addrs.origin_assignment, &self.admin);
-        let delay = assignment
-            .vettingTimelock()
+        let vetter_role = policy
+            .VETTER_ROLE()
             .call()
             .await
-            .context("read vettingTimelock")?;
-        crate::time::increase_time(&self.admin, delay.to::<u64>() + 1).await?;
-
-        self.impersonate(self.addrs.timelock).await?;
-        let raw = self.raw_provider();
-        let receipt = OriginAssignment::new(self.addrs.origin_assignment, &raw)
-            .grantVetting(publisher)
+            .context("read VETTER_ROLE")?;
+        let grant = policy
+            .grantRole(vetter_role, self.addrs.timelock)
             .from(self.addrs.timelock)
             .send()
             .await
-            .context("grantVetting send")?
+            .context("grant VETTER_ROLE send")?
             .get_receipt()
             .await
-            .context("grantVetting receipt")?;
-        crate::ensure_mined(&receipt, "grantVetting")
+            .context("grant VETTER_ROLE receipt")?;
+        crate::ensure_mined(&grant, "grantRole VETTER_ROLE")?;
+
+        let receipt = policy
+            .setVetted(publisher, true)
+            .from(self.addrs.timelock)
+            .send()
+            .await
+            .context("setVetted send")?
+            .get_receipt()
+            .await
+            .context("setVetted receipt")?;
+        crate::ensure_mined(&receipt, "setVetted")
     }
 
     /// Current `FeeRouter.bytesPerEpoch(operator)` for the epoch at the chain's
@@ -1748,6 +1746,11 @@ async fn run_deploy_script(
             .env("USDC_ADDRESS", usdc.to_string())
             .env("INITIAL_TOKEN_HOLDER", initial_token_holder.to_string())
             .env("EMERGENCY_MULTISIG", DEPLOYER_ADDR)
+            // DeployProtocol.s.sol requires a genesis VETTER_ROLE holder (a deploy
+            // with none can vet no publisher and is a governance deadlock). The
+            // deployer plays it here; `vet_publisher` grants the role to the
+            // Timelock and vets through it regardless.
+            .env("INITIAL_VETTER", DEPLOYER_ADDR)
             // ADR 019 § Terms Acceptance — DeployProtocol.s.sol requires a
             // non-zero genesis terms hash (CapacityBond rejects the zero
             // sentinel); registration reads it back from the contract.
@@ -1945,6 +1948,7 @@ fn read_manifest(path: &Path) -> anyhow::Result<ContractAddrs> {
         timelock: get("TimelockController")?,
         publisher_registry: get("PublisherRegistry")?,
         origin_assignment: get("OriginAssignment")?,
+        manual_vetting_policy: get("ManualVettingPolicy")?,
         content_blacklist: get("ContentBlacklist")?,
     })
 }

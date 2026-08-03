@@ -1,9 +1,10 @@
 //! CLI argument parsing for `decdn publish` — the origin-publisher control
-//! plane (issues #1029 / #1491, ADR 002 / ADR 011). Four write commands:
-//! `namespace create` (`PublisherRegistry.createNamespace`), `request-vetting`
-//! (`OriginAssignment.requestVetting`, the one governance-gated step), and then
-//! `assign` / `revoke` (`OriginAssignment.addOrigin` / `removeOrigin`), which a
-//! vetted publisher self-serves with no waiting. `assign` submits one
+//! plane (issues #1029 / #1491, ADR 002 / ADR 011). Three write commands:
+//! `namespace create` (`PublisherRegistry.createNamespace`), and then `assign` /
+//! `revoke` (`OriginAssignment.addOrigin` / `removeOrigin`), which a vetted
+//! publisher self-serves with no waiting. Vetting itself is granted out-of-band
+//! by a `VETTER_ROLE` holder on the installed vetting policy (an operator,
+//! multisig, or governance), not through this CLI. `assign` submits one
 //! `addOrigin` per operator, so it is N transactions rather than one. Content is
 //! bound to a namespace off-chain at fetch time, so there is no per-hash
 //! on-chain claim.
@@ -40,12 +41,10 @@ pub struct PublishArgs {
 pub enum PublishCommand {
     /// Create a new namespace owned by the signer (`createNamespace`).
     Namespace(NamespaceArgs),
-    /// Ask governance to vet the signer as a publisher (`requestVetting`).
-    /// One-time and per wallet: once vetted, `assign` and `revoke` take effect
-    /// immediately for every namespace the signer owns.
-    RequestVetting(RequestVettingArgs),
     /// Seat authorized origins for a namespace (`addOrigin` per operator).
-    /// Requires a vetted signer; effective immediately.
+    /// Requires a signer the installed vetting policy has vetted; effective
+    /// immediately. Vetting is granted out-of-band by a `VETTER_ROLE` holder
+    /// (an operator, multisig, or governance), not through this CLI.
     Assign(AssignArgs),
     /// Unseat one authorized origin from a namespace (`removeOrigin`).
     Revoke(RevokeArgs),
@@ -70,13 +69,6 @@ pub enum NamespaceCommand {
 /// `decdn publish namespace create` flags.
 #[derive(Args, Debug)]
 pub struct NamespaceCreateArgs {
-    #[command(flatten)]
-    pub chain: PublishChainArgs,
-}
-
-/// `decdn publish request-vetting` flags.
-#[derive(Args, Debug)]
-pub struct RequestVettingArgs {
     #[command(flatten)]
     pub chain: PublishChainArgs,
 }

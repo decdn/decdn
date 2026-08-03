@@ -17,6 +17,7 @@ import { DecdnGovernor } from "../src/DecdnGovernor.sol";
 import { PaymentChannel } from "../src/PaymentChannel.sol";
 import { SlashJudge } from "../src/SlashJudge.sol";
 import { OriginAssignment } from "../src/OriginAssignment.sol";
+import { ManualVettingPolicy } from "../src/ManualVettingPolicy.sol";
 import { IEd25519Verifier } from "../src/interfaces/IEd25519Verifier.sol";
 
 /// @title DeployProtocolScriptTest — covers the script-shaped behavior of
@@ -36,6 +37,7 @@ contract DeployProtocolScriptTest is Test, DeployProtocol {
     address internal constant TEST_ED25519 = address(0xeD25);
     address internal constant TEST_MULTISIG = address(0xC0DE);
     address internal constant TEST_INITIAL_HOLDER = address(0xbEEF);
+    address internal constant TEST_VETTER = address(0xDECAF);
 
     // Test-only chain ids so manifest writes never collide with a real
     // `deployments/<realChain>.json`. Each test uses a distinct id to avoid
@@ -55,6 +57,7 @@ contract DeployProtocolScriptTest is Test, DeployProtocol {
         vm.setEnv("USDC_ADDRESS", vm.toString(TEST_USDC));
         vm.setEnv("EMERGENCY_MULTISIG", vm.toString(TEST_MULTISIG));
         vm.setEnv("INITIAL_TOKEN_HOLDER", vm.toString(TEST_INITIAL_HOLDER));
+        vm.setEnv("INITIAL_VETTER", vm.toString(TEST_VETTER));
         vm.setEnv("CURRENT_TERMS_HASH", vm.toString(TEST_TERMS_HASH));
         vm.setEnv("FORCE_OVERWRITE_MANIFEST", "false");
     }
@@ -87,6 +90,7 @@ contract DeployProtocolScriptTest is Test, DeployProtocol {
         assertEq(address(cfg.ed25519Verifier), address(0), "ed25519 resolved at deploy time");
         assertEq(cfg.emergencyMultisig, TEST_MULTISIG, "multisig");
         assertEq(cfg.initialTokenHolder, TEST_INITIAL_HOLDER, "holder");
+        assertEq(cfg.initialVetter, TEST_VETTER, "initialVetter");
         assertEq(cfg.timelockDelay, DEFAULT_TIMELOCK_DELAY, "timelockDelay");
         assertEq(cfg.minBond, DEFAULT_MIN_BOND, "minBond");
         assertEq(cfg.unbondingPeriod, DEFAULT_UNBONDING_PERIOD, "unbondingPeriod");
@@ -105,6 +109,17 @@ contract DeployProtocolScriptTest is Test, DeployProtocol {
         assertEq(cfg.feeRouterShares[1], 0, "buyback share dormant");
         assertEq(cfg.feeRouterShares[2], LAUNCH_TREASURY_SHARE, "treasury share");
         assertEq(cfg.buybackBurner, address(0), "buybackBurner unwired");
+    }
+
+    /// A deploy with no genesis vetter is a governance deadlock (no one can vet a
+    /// publisher, so nothing is served, so served-bytes voting never starts). The
+    /// script refuses rather than ship it.
+    function test_readConfig_requiresInitialVetter() public {
+        vm.setEnv("INITIAL_VETTER", vm.toString(address(0)));
+        vm.expectRevert(DeployProtocol.MissingInitialVetter.selector);
+        this.externalReadConfig();
+        // `vm.setEnv` is process-wide, so restore it for the other tests.
+        vm.setEnv("INITIAL_VETTER", vm.toString(TEST_VETTER));
     }
 
     function test_readConfig_deployerIsTxOrigin() public {
@@ -149,6 +164,7 @@ contract DeployProtocolScriptTest is Test, DeployProtocol {
         d.paymentChannel = PaymentChannel(address(0x09));
         d.slashJudge = SlashJudge(address(0x0A));
         d.originAssignment = OriginAssignment(address(0x0B));
+        d.vettingPolicy = ManualVettingPolicy(address(0x0C));
     }
 
     function test_writeManifest_writesAllAddresses() public {
@@ -174,6 +190,7 @@ contract DeployProtocolScriptTest is Test, DeployProtocol {
         assertEq(json.readAddress(".contracts.PaymentChannel"), address(0x09), "PaymentChannel");
         assertEq(json.readAddress(".contracts.SlashJudge"), address(0x0A), "SlashJudge");
         assertEq(json.readAddress(".contracts.OriginAssignment"), address(0x0B), "OriginAssignment");
+        assertEq(json.readAddress(".contracts.ManualVettingPolicy"), address(0x0C), "ManualVettingPolicy");
         assertEq(json.readAddress(".contracts.BuybackBurner"), address(0), "BuybackBurner unwired");
         // The verifier is script-deployed (#669), so it lives under `contracts`.
         assertEq(json.readAddress(".contracts.Ed25519Verifier"), TEST_ED25519, "ed25519");

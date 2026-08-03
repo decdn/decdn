@@ -46,6 +46,8 @@ contract DeployUSDC is ERC20 {
 contract DeployProtocolTest is Test, BaseProtocolDeploy {
     address internal emergencyMultisig = address(0xC0DE);
     address internal initialTokenHolder = address(0xBEEF);
+    /// @dev Genesis ManualVettingPolicy VETTER_ROLE holder (ADR 011).
+    address internal initialVetter = address(0xDECAF);
     /// @dev ADR 009's 5-of-9 bootstrap-governance multisig, distinct from the 3-of-5
     ///      emergency multisig above. Only used by the bootstrap-mode tests.
     address internal bootstrapMultisig = address(new MockMultisig());
@@ -67,6 +69,7 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
             deployer: address(this),
             emergencyMultisig: emergencyMultisig,
             initialTokenHolder: initialTokenHolder,
+            initialVetter: initialVetter,
             timelockDelay: 48 hours,
             // Direct-to-Timelock handoff; the ADR 009 bootstrap phase is opt-in.
             bootstrapMultisig: address(0),
@@ -181,6 +184,22 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
         assertTrue(d.bond.hasRole(d.bond.SLASH_ROLE(), address(d.slashJudge)), "slashJudge holds SLASH_ROLE on bond");
         assertEq(d.originAssignment.contentBlacklist(), address(d.blacklist), "originAssignment blacklist binding");
         assertEq(address(d.bond.slashJudge()), address(d.slashJudge), "bond slashJudge binding");
+        assertEq(
+            address(d.originAssignment.vettingPolicy()),
+            address(d.vettingPolicy),
+            "originAssignment vetting-policy binding"
+        );
+    }
+
+    /// The genesis vetter is seated with VETTER_ROLE; the deployer is not. The
+    /// role's admin (GOVERNANCE_ROLE) hands off to the Timelock, so governance —
+    /// not the deployer — controls the vetter set after the handoff.
+    function test_manualVettingPolicy_vetterSeatedAndGovernedByTimelock() public view {
+        bytes32 vetterRole = d.vettingPolicy.VETTER_ROLE();
+        assertTrue(d.vettingPolicy.hasRole(vetterRole, initialVetter), "genesis vetter holds VETTER_ROLE");
+        assertFalse(d.vettingPolicy.hasRole(vetterRole, address(this)), "deployer is not a vetter");
+        assertEq(d.vettingPolicy.getRoleAdmin(vetterRole), GOVERNANCE_ROLE, "GOVERNANCE_ROLE admins the vetter set");
+        assertTrue(d.vettingPolicy.hasRole(GOVERNANCE_ROLE, address(d.timelock)), "Timelock governs the vetting policy");
     }
 
     // -----------------------------------------------------------------

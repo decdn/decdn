@@ -224,6 +224,9 @@ async fn run_deploy_script(
             .env("USDC_ADDRESS", usdc.to_string())
             .env("INITIAL_TOKEN_HOLDER", initial_token_holder.to_string())
             .env("EMERGENCY_MULTISIG", DEPLOYER_ADDR)
+            // DeployProtocol requires a genesis VETTER_ROLE holder (a deploy with
+            // none is a governance deadlock); the deployer plays it here.
+            .env("INITIAL_VETTER", DEPLOYER_ADDR)
             // ADR 019 § Terms Acceptance — DeployProtocol requires a non-zero
             // genesis terms hash (CapacityBond rejects the zero sentinel).
             .env(

@@ -2,13 +2,22 @@
 pragma solidity 0.8.28;
 
 import { Test } from "forge-std/Test.sol";
-import { Vm } from "forge-std/Vm.sol";
 import { IAccessControl } from "@openzeppelin/contracts/access/IAccessControl.sol";
 
 import { OriginAssignment } from "../src/OriginAssignment.sol";
+import { ManualVettingPolicy } from "../src/ManualVettingPolicy.sol";
 import { ICapacityBondActivity } from "../src/interfaces/ICapacityBondActivity.sol";
 import { IPublisherRegistryOwnership } from "../src/interfaces/IPublisherRegistryOwnership.sol";
 import { IContentBlacklistOriginView } from "../src/interfaces/IContentBlacklistOriginView.sol";
+import { IVettingPolicy } from "../src/interfaces/IVettingPolicy.sol";
+
+/// A policy that vets nobody — used to prove `setVettingPolicy` changes the
+/// decision `addOrigin` reads.
+contract RejectAllVettingPolicy is IVettingPolicy {
+    function isVetted(address) external pure returns (bool) {
+        return false;
+    }
+}
 
 contract MockBondActivity is ICapacityBondActivity {
     mapping(address => bool) internal _active;
@@ -68,6 +77,7 @@ contract OriginAssignmentTest is Test {
     MockBondActivity internal bond;
     MockPublisherRegistry internal registry;
     MockBlacklistOrigin internal blacklist;
+    ManualVettingPolicy internal policy;
     OriginAssignment internal oa;
 
     address internal admin = address(0xA11CE);
@@ -78,15 +88,17 @@ contract OriginAssignmentTest is Test {
     address internal opC = address(0xC);
 
     uint256 internal constant NS = 1;
-    uint256 internal constant TIMELOCK = 3 days;
     bytes32 internal constant GOVERNANCE_ROLE = keccak256("GOVERNANCE_ROLE");
 
     function setUp() public {
         bond = new MockBondActivity();
         registry = new MockPublisherRegistry();
         blacklist = new MockBlacklistOrigin();
+        // admin holds GOVERNANCE_ROLE and, as `initialVetter`, VETTER_ROLE — so it
+        // can vet directly in these origin-plane tests.
+        policy = new ManualVettingPolicy(admin, admin);
 
-        oa = new OriginAssignment(bond, registry, address(blacklist), admin);
+        oa = new OriginAssignment(bond, registry, address(blacklist), IVettingPolicy(address(policy)), admin);
 
         registry.setOwner(NS, publisher);
         registry.setNamespaceCount(publisher, 1);
@@ -97,11 +109,17 @@ contract OriginAssignmentTest is Test {
         vm.warp(1_000_000);
     }
 
-    /// Governance's instant grant — the fast setup for the origin-plane tests,
+    /// Vet via the installed policy — the fast setup for the origin-plane tests,
     /// which are about seating, not about how the wallet got vetted.
     function _vet(address p) internal {
         vm.prank(admin);
-        oa.setPublisherVetted(p, true);
+        policy.setVetted(p, true);
+    }
+
+    /// Un-vet via the installed policy.
+    function _unvet(address p) internal {
+        vm.prank(admin);
+        policy.setVetted(p, false);
     }
 
     function _seat(address operator) internal {
@@ -118,148 +136,77 @@ contract OriginAssignmentTest is Test {
     }
 
     // -----------------------------------------------------------------
-    // Vetting — request / cancel
+    // Vetting policy — the swappable seam
     // -----------------------------------------------------------------
 
-    function test_requestVetting_storesReadyAt() public {
+    /// `addOrigin` reads the installed policy's decision, not a stored bool.
+    function test_addOrigin_usesPolicyDecision() public {
         vm.prank(publisher);
-        oa.requestVetting();
-        assertEq(oa.getPendingVetting(publisher), block.timestamp + TIMELOCK);
-        assertFalse(oa.isVettedPublisher(publisher), "a request alone does not vet");
-    }
-
-    /// Vetting is for publishers: an address that never created a namespace has
-    /// nothing to seat origins for, so it cannot enter the queue.
-    function test_requestVetting_revertsWithoutANamespace() public {
-        vm.prank(stranger);
-        vm.expectRevert(abi.encodeWithSelector(OriginAssignment.NoNamespaceOwned.selector, stranger));
-        oa.requestVetting();
-    }
-
-    function test_requestVetting_revertsWhileOneIsPending() public {
-        vm.startPrank(publisher);
-        oa.requestVetting();
-        vm.expectRevert(abi.encodeWithSelector(OriginAssignment.VettingRequestPending.selector, publisher));
-        oa.requestVetting();
-        vm.stopPrank();
-    }
-
-    function test_requestVetting_revertsWhenAlreadyVetted() public {
-        _vet(publisher);
-        vm.prank(publisher);
-        vm.expectRevert(abi.encodeWithSelector(OriginAssignment.AlreadyVetted.selector, publisher));
-        oa.requestVetting();
-    }
-
-    function test_cancelVettingRequest_clearsPending() public {
-        vm.startPrank(publisher);
-        oa.requestVetting();
-        oa.cancelVettingRequest();
-        vm.stopPrank();
-        assertEq(oa.getPendingVetting(publisher), 0);
-    }
-
-    function test_cancelVettingRequest_revertsWithoutOne() public {
-        vm.prank(publisher);
-        vm.expectRevert(abi.encodeWithSelector(OriginAssignment.NoVettingRequest.selector, publisher));
-        oa.cancelVettingRequest();
-    }
-
-    // -----------------------------------------------------------------
-    // Vetting — governance grant
-    // -----------------------------------------------------------------
-
-    function test_grantVetting_vetsAfterTimelockAndClearsPending() public {
-        vm.prank(publisher);
-        oa.requestVetting();
-        vm.warp(block.timestamp + TIMELOCK);
-
-        vm.prank(admin);
-        oa.grantVetting(publisher);
-
-        assertTrue(oa.isVettedPublisher(publisher));
-        assertEq(oa.getPendingVetting(publisher), 0);
-    }
-
-    function test_grantVetting_revertsBeforeTimelock() public {
-        vm.prank(publisher);
-        oa.requestVetting();
-        uint256 readyAt = block.timestamp + TIMELOCK;
-
-        vm.prank(admin);
-        vm.expectRevert(abi.encodeWithSelector(OriginAssignment.VettingTimelockNotElapsed.selector, readyAt));
-        oa.grantVetting(publisher);
-    }
-
-    function test_grantVetting_revertsWithoutRequest() public {
-        vm.prank(admin);
-        vm.expectRevert(abi.encodeWithSelector(OriginAssignment.NoVettingRequest.selector, publisher));
-        oa.grantVetting(publisher);
-    }
-
-    function test_grantVetting_onlyGovernance() public {
-        vm.prank(publisher);
-        oa.requestVetting();
-        vm.warp(block.timestamp + TIMELOCK);
-
-        vm.prank(stranger);
-        vm.expectRevert(
-            abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, stranger, GOVERNANCE_ROLE)
-        );
-        oa.grantVetting(publisher);
-    }
-
-    // -----------------------------------------------------------------
-    // Vetting — governance override
-    // -----------------------------------------------------------------
-
-    /// The instant grant also consumes any queued request, so the publisher is
-    /// not left holding a ripened one.
-    function test_setPublisherVetted_grantsInstantlyAndConsumesPending() public {
-        vm.prank(publisher);
-        oa.requestVetting();
+        vm.expectRevert(abi.encodeWithSelector(OriginAssignment.PublisherNotVetted.selector, publisher));
+        oa.addOrigin(NS, opA);
 
         _vet(publisher);
-
-        assertTrue(oa.isVettedPublisher(publisher));
-        assertEq(oa.getPendingVetting(publisher), 0);
+        _seat(opA);
+        assertTrue(oa.isAuthorizedOrigin(NS, opA));
     }
 
-    /// Un-vetting must also clear a pending request — otherwise a rogue
-    /// publisher's already-ripened request would walk it straight back in. The
-    /// request is warped past its timelock FIRST: an implementation that only
-    /// cleared un-ripened requests would pass the un-warped version of this test
-    /// while leaving the exact hole open.
-    function test_setPublisherVetted_unvetClearsRipenedPendingRequest() public {
-        vm.prank(publisher);
-        oa.requestVetting();
-        vm.warp(block.timestamp + TIMELOCK + 1);
-
-        vm.prank(admin);
-        oa.setPublisherVetted(publisher, false);
-
+    /// The passthrough getter mirrors the installed policy.
+    function test_isVettedPublisher_reflectsPolicy() public {
         assertFalse(oa.isVettedPublisher(publisher));
-        assertEq(oa.getPendingVetting(publisher), 0);
-
-        // The ripened request is gone, not merely hidden: governance cannot
-        // grant it, so the publisher must queue a fresh one and wait again.
-        vm.prank(admin);
-        vm.expectRevert(abi.encodeWithSelector(OriginAssignment.NoVettingRequest.selector, publisher));
-        oa.grantVetting(publisher);
+        _vet(publisher);
+        assertTrue(oa.isVettedPublisher(publisher));
     }
 
-    function test_setPublisherVetted_rejectsZeroAddress() public {
+    /// Swapping the policy changes the decision for FUTURE seating: a publisher
+    /// vetted under the old policy can no longer seat once a reject-all policy is
+    /// installed. Already-seated origins are untouched (bounded-work invariant).
+    function test_setVettingPolicy_swapsTheDecision() public {
+        _vet(publisher);
+        _seat(opA);
+
+        RejectAllVettingPolicy rejectAll = new RejectAllVettingPolicy();
+        vm.expectEmit(true, true, true, true);
+        emit OriginAssignment.VettingPolicyUpdated(address(policy), address(rejectAll));
+        vm.prank(admin);
+        oa.setVettingPolicy(IVettingPolicy(address(rejectAll)));
+
+        assertFalse(oa.isVettedPublisher(publisher), "the new policy vets nobody");
+        vm.prank(publisher);
+        vm.expectRevert(abi.encodeWithSelector(OriginAssignment.PublisherNotVetted.selector, publisher));
+        oa.addOrigin(NS, opB);
+
+        assertTrue(oa.isAuthorizedOrigin(NS, opA), "the seated origin is untouched by the swap");
+    }
+
+    function test_setVettingPolicy_rejectsZero() public {
         vm.prank(admin);
         vm.expectRevert(OriginAssignment.ZeroAddress.selector);
-        oa.setPublisherVetted(address(0), true);
+        oa.setVettingPolicy(IVettingPolicy(address(0)));
     }
 
-    function test_setPublisherVetted_onlyGovernance() public {
+    /// An EOA (or not-yet-deployed address) is rejected: pointing the policy at
+    /// one would make addOrigin revert on the isVetted ABI decode instead.
+    function test_setVettingPolicy_rejectsNonContract() public {
+        address eoa = address(0xE0A);
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(OriginAssignment.VettingPolicyNotAContract.selector, eoa));
+        oa.setVettingPolicy(IVettingPolicy(eoa));
+    }
+
+    /// The constructor applies the same contract guard to the genesis policy.
+    function test_constructor_rejectsNonContractPolicy() public {
+        address eoa = address(0xE0A);
+        vm.expectRevert(abi.encodeWithSelector(OriginAssignment.VettingPolicyNotAContract.selector, eoa));
+        new OriginAssignment(bond, registry, address(blacklist), IVettingPolicy(eoa), admin);
+    }
+
+    function test_setVettingPolicy_onlyGovernance() public {
+        RejectAllVettingPolicy rejectAll = new RejectAllVettingPolicy();
         vm.prank(stranger);
         vm.expectRevert(
             abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, stranger, GOVERNANCE_ROLE)
         );
-        oa.setPublisherVetted(publisher, true);
+        oa.setVettingPolicy(IVettingPolicy(address(rejectAll)));
     }
 
     // -----------------------------------------------------------------
@@ -353,9 +300,9 @@ contract OriginAssignmentTest is Test {
     /// Deployment window: with no `ContentBlacklist` bound, seating validates
     /// against `CapacityBond.isActive` alone.
     function test_addOrigin_blacklistSkippedWhenUnset() public {
-        OriginAssignment oaNoBl = new OriginAssignment(bond, registry, address(0), admin);
-        vm.prank(admin);
-        oaNoBl.setPublisherVetted(publisher, true);
+        OriginAssignment oaNoBl =
+            new OriginAssignment(bond, registry, address(0), IVettingPolicy(address(policy)), admin);
+        _vet(publisher);
         // opA "blacklisted" in the standalone mock, but oaNoBl has no binding → check skipped.
         blacklist.setBlacklisted(opA, true);
 
@@ -370,9 +317,9 @@ contract OriginAssignmentTest is Test {
     /// that wrote the wrong slot would ship a permanently unenforced blacklist
     /// with a green suite.
     function test_setContentBlacklist_turnsTheGuardOn() public {
-        OriginAssignment oaNoBl = new OriginAssignment(bond, registry, address(0), admin);
-        vm.prank(admin);
-        oaNoBl.setPublisherVetted(publisher, true);
+        OriginAssignment oaNoBl =
+            new OriginAssignment(bond, registry, address(0), IVettingPolicy(address(policy)), admin);
+        _vet(publisher);
         vm.prank(publisher);
         oaNoBl.addOrigin(NS, opA);
 
@@ -413,8 +360,7 @@ contract OriginAssignmentTest is Test {
         _vet(publisher);
         _seat(opA);
 
-        vm.prank(admin);
-        oa.setPublisherVetted(publisher, false);
+        _unvet(publisher);
 
         vm.prank(publisher);
         vm.expectRevert(abi.encodeWithSelector(OriginAssignment.PublisherNotVetted.selector, publisher));
@@ -514,7 +460,8 @@ contract OriginAssignmentTest is Test {
     }
 
     function test_prune_revertsWhenBlacklistUnset() public {
-        OriginAssignment oaNoBl = new OriginAssignment(bond, registry, address(0), admin);
+        OriginAssignment oaNoBl =
+            new OriginAssignment(bond, registry, address(0), IVettingPolicy(address(policy)), admin);
         vm.prank(stranger);
         vm.expectRevert(OriginAssignment.ContentBlacklistNotSet.selector);
         oaNoBl.pruneBlacklistedOrigin(NS, opA);
@@ -530,62 +477,28 @@ contract OriginAssignmentTest is Test {
         oa.setContentBlacklist(address(0));
     }
 
-    function test_setVettingTimelock_enforcesBounds() public {
-        vm.prank(admin);
-        vm.expectRevert(
-            abi.encodeWithSelector(
-                OriginAssignment.ParamOutOfBounds.selector, uint256(1 hours), uint256(24 hours), uint256(14 days)
-            )
-        );
-        oa.setVettingTimelock(1 hours);
-        // The ceiling half: a copy-paste slip comparing against the FLOOR twice
-        // would pass the check above and let governance set a 90-day delay.
-        vm.prank(admin);
-        vm.expectRevert(
-            abi.encodeWithSelector(
-                OriginAssignment.ParamOutOfBounds.selector, uint256(15 days), uint256(24 hours), uint256(14 days)
-            )
-        );
-        oa.setVettingTimelock(15 days);
-        vm.prank(admin);
-        oa.setVettingTimelock(7 days);
-        assertEq(oa.vettingTimelock(), 7 days);
-    }
-
     /// ADR 011 § Contract promises each governance setter emits its own update
     /// event, and the CHANGELOG tells indexers to map those topics. Nothing
     /// asserted the payloads, so a swapped old/new argument — the classic slip
     /// in a two-value update event — would ship silently.
     function test_governanceSetters_emitOldThenNew() public {
+        RejectAllVettingPolicy rejectAll = new RejectAllVettingPolicy();
         vm.expectEmit(true, true, true, true);
-        emit OriginAssignment.VettingTimelockUpdated(TIMELOCK, 7 days);
+        emit OriginAssignment.VettingPolicyUpdated(address(policy), address(rejectAll));
         vm.prank(admin);
-        oa.setVettingTimelock(7 days);
+        oa.setVettingPolicy(IVettingPolicy(address(rejectAll)));
 
         vm.expectEmit(true, true, true, true);
         emit OriginAssignment.MaxOriginsPerNamespaceUpdated(10, 5);
         vm.prank(admin);
         oa.setMaxOriginsPerNamespace(5);
 
-        OriginAssignment oaNoBl = new OriginAssignment(bond, registry, address(0), admin);
+        OriginAssignment oaNoBl =
+            new OriginAssignment(bond, registry, address(0), IVettingPolicy(address(policy)), admin);
         vm.expectEmit(true, true, true, true);
         emit OriginAssignment.ContentBlacklistUpdated(address(0), address(blacklist));
         vm.prank(admin);
         oaNoBl.setContentBlacklist(address(blacklist));
-    }
-
-    /// `PublisherVetted` carries the direction and the caller; both matter to a
-    /// consumer deciding whether a publisher may still seat origins.
-    function test_setPublisherVetted_emitsDirectionAndCaller() public {
-        vm.expectEmit(true, true, true, true);
-        emit OriginAssignment.PublisherVetted(publisher, true, admin);
-        vm.prank(admin);
-        oa.setPublisherVetted(publisher, true);
-
-        vm.expectEmit(true, true, true, true);
-        emit OriginAssignment.PublisherVetted(publisher, false, admin);
-        vm.prank(admin);
-        oa.setPublisherVetted(publisher, false);
     }
 
     function test_setMaxOrigins_enforcesBounds() public {
@@ -607,11 +520,12 @@ contract OriginAssignmentTest is Test {
     function test_governanceSetters_rejectNonGovernance() public {
         bytes memory denied =
             abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, stranger, GOVERNANCE_ROLE);
+        RejectAllVettingPolicy rejectAll = new RejectAllVettingPolicy();
         vm.startPrank(stranger);
         vm.expectRevert(denied);
         oa.setContentBlacklist(address(blacklist));
         vm.expectRevert(denied);
-        oa.setVettingTimelock(7 days);
+        oa.setVettingPolicy(IVettingPolicy(address(rejectAll)));
         vm.expectRevert(denied);
         oa.setMaxOriginsPerNamespace(5);
         vm.stopPrank();
@@ -632,9 +546,9 @@ contract OriginAssignmentTest is Test {
 
         // Same situation, same reason: a public variable bound by hand in
         // `crates/e2e/src/bindings.rs`.
-        (ok, ret) = address(oa).staticcall(abi.encodeWithSelector(bytes4(keccak256("vettingTimelock()"))));
-        assertTrue(ok, "vettingTimelock() must exist at the frozen selector");
-        assertEq(abi.decode(ret, (uint256)), TIMELOCK, "and must answer the configured delay");
+        (ok, ret) = address(oa).staticcall(abi.encodeWithSelector(bytes4(keccak256("vettingPolicy()"))));
+        assertTrue(ok, "vettingPolicy() must exist at the frozen selector");
+        assertEq(abi.decode(ret, (address)), address(policy), "and must answer the installed policy");
     }
 
     /// Event topic0s, frozen. `InterfaceFreeze` pins function selectors, so
@@ -659,27 +573,10 @@ contract OriginAssignmentTest is Test {
             "BlacklistedOriginPruned"
         );
         assertEq(
-            OriginAssignment.VettingRequested.selector,
-            keccak256("VettingRequested(address,uint256)"),
-            "VettingRequested"
+            OriginAssignment.VettingPolicyUpdated.selector,
+            keccak256("VettingPolicyUpdated(address,address)"),
+            "VettingPolicyUpdated"
         );
-    }
-
-    /// Governance clearing a pending request must not announce it as a
-    /// *cancellation* — that word is reserved for the publisher withdrawing its
-    /// own. A spurious emit here would corrupt the pending-set view of exactly
-    /// the log consumer the event exists for, and Foundry does not fail on
-    /// unexpected events unless an `expectEmit` is armed, so assert it directly.
-    function test_setPublisherVetted_emitsNoCancellation() public {
-        vm.recordLogs();
-        _vet(publisher);
-        Vm.Log[] memory logs = vm.getRecordedLogs();
-        for (uint256 i = 0; i < logs.length; ++i) {
-            assertTrue(
-                logs[i].topics[0] != OriginAssignment.VettingRequestCancelled.selector,
-                "governance must not emit VettingRequestCancelled"
-            );
-        }
     }
 
     // -----------------------------------------------------------------

@@ -810,6 +810,7 @@ mod tests {
             timelock: Address::from([0x88; 20]),
             publisher_registry: Address::from([0x99; 20]),
             origin_assignment: Address::from([0xAA; 20]),
+            manual_vetting_policy: Address::from([0xAB; 20]),
             content_blacklist: Address::from([0xBB; 20]),
         };
         let discovery_peers = [(iroh::SecretKey::from_bytes(&[0xCC; 32]).public(), 4434)];
@@ -876,6 +877,7 @@ mod tests {
             timelock: Address::from([0x88; 20]),
             publisher_registry: Address::from([0x99; 20]),
             origin_assignment: Address::from([0xAA; 20]),
+            manual_vetting_policy: Address::from([0xAB; 20]),
             content_blacklist: Address::from([0xBB; 20]),
         };
         render_config(&RenderConfig {

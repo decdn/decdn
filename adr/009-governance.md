@@ -124,7 +124,6 @@ The α range upper-bounds at 1.8 to prevent a concentration penalty so steep tha
 | Challenge bond | SlashJudge | 1 TOKEN | 1,000 TOKEN |
 | Base slash reset period | CapacityBond | 30 days | 365 days |
 | Compliance window | ContentBlacklist | 1 hour | 7 days |
-| Publisher vetting timelock | OriginAssignment | 24 hours | 14 days |
 | Max origins per namespace | OriginAssignment | 1 | 50 |
 | Max namespaces per publisher | PublisherRegistry | 1 | 1000 |
 | Namespace transfer timelock | PublisherRegistry | 24 hours | 30 days |
@@ -145,7 +144,6 @@ CapacityBond parameters are defined in [ADR 026 § Capacity-bond curve](026-toke
 - **Max evidence age 1–30 days and Unbonding period 7–60 days:** The individual bounds permit a configuration where evidence age ≥ unbonding period, which would let an operator commit any of the three on-chain offenses ([ADR 014 § `Slashed` event and `slashId` allocation](014-on-chain-verification.md#slashed-event-and-slashid-allocation)), initiate unbonding, and complete withdrawal before the evidence window opens. **Cross-parameter invariant:** `SlashJudge` and `CapacityBond` enforce `MAX_EVIDENCE_AGE_US < unbondingPeriod * 1_000_000` at the contract layer on every `setMaxEvidenceAge` / `setUnbondingPeriod` call; updates that would violate this revert. The check applies at deployment as well. See [ADR 014 § Interaction with unbonding period](014-on-chain-verification.md#interaction-with-unbonding-period) for the exact revert conditions.
 - **Rate floor ≥ 1 base unit:** A zero floor allows free-riding nodes that advertise zero rates to attract traffic without generating protocol fees. The minimum of 1 USDC base unit ($0.000001/MB for 6-decimal USDC) is negligibly small but prevents true zero-rate abuse.
 - **Dispute window 48h–72h:** A shorter window is too short for fraud detectors to respond to a stale close, and it must stay above the L2 force-inclusion delay (≤ 24h) so censorship cannot burn the whole window. A 7-day window locks client funds for an unacceptably long period. The floor equals the 48h default, so the baseline can only be tightened upward; PoC deploys at 48 hours to guarantee 24 hours of effective dispute response time under worst-case L2 sequencer censorship. See [ADR 003](003-payments.md#adr-003-payment-model) and [Appendix: Fraud Detection](appendix-fraud-detection.md#appendix-permissionless-stale-close-detection).
-- **Publisher vetting timelock 24 hours–14 days:** Lower bound gives governance and the broader community at least one full business day to surface concerns about a publisher before it can seat origins. Upper bound prevents governance from making vetting effectively unusable through delay.
 - **Max origins per namespace 1–50:** Upper bound prevents storage-cost griefing and unbounded gas in `getOrigins` view calls.
 - **Max namespaces per publisher 1–1000:** Anti-squatting limit.
 - **Namespace transfer timelock 24 hours–30 days:** Lower bound prevents instant key-compromise transfers; upper bound prevents governance from blocking legitimate ownership changes.

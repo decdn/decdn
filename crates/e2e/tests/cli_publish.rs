@@ -8,9 +8,9 @@
 //! 2. `publish assign <id> <operator>` **fails closed while the publisher is
 //!    unvetted** — origin seating is gated on the wallet, not on a per-set
 //!    governance vote.
-//! 3. `publish request-vetting` queues the one governance-gated step, leaving a
-//!    non-zero `getPendingVetting` deadline; the fixture then warps past the
-//!    timelock and grants it as the governance Timelock.
+//! 3. Vetting is not a CLI step. A `VETTER_ROLE` holder on the genesis
+//!    `ManualVettingPolicy` vets the wallet out-of-band (the fixture drives it
+//!    via `ManualVettingPolicy.setVetted`), after which the wallet may seat origins.
 //! 4. `publish assign <id> <operator>` now seats the origin **instantly** —
 //!    `getOrigins` reflects it with no further governance action, and the node's
 //!    origin directory consumes the `OriginAdded` log (asserted through the
@@ -134,24 +134,13 @@ async fn run() -> anyhow::Result<()> {
         "the publisher must start unvetted",
     );
 
-    // ---- 3. `publish request-vetting` queues the single governance-gated step.
-    let requested = run_publish(&node, &["request-vetting", "--json"]).await?;
-    let ready_at = parse_ready_at(&requested.stdout)?;
-    assert!(
-        ready_at > 0,
-        "request-vetting must report a timelock deadline"
-    );
-    assert_eq!(
-        assignment.getPendingVetting(operator).call().await?,
-        U256::from(ready_at),
-        "getPendingVetting must match the readyAt the CLI reported",
-    );
-    // Warp past the timelock and grant as the governance Timelock — the cold
-    // path in full, rather than the `setPublisherVetted` override.
-    chain.grant_vetting_after_timelock(operator).await?;
+    // ---- 3. Vetting is not a CLI step: a `VETTER_ROLE` holder on the genesis
+    // `ManualVettingPolicy` vets the wallet out-of-band, which the fixture drives.
+    // Once vetted, the publisher may seat origins.
+    chain.vet_publisher(operator).await?;
     assert!(
         assignment.isVettedPublisher(operator).call().await?,
-        "grantVetting must vet the publisher",
+        "the publisher must be vetted after the VETTER_ROLE holder approves it",
     );
 
     // ---- 4. Seat then unseat, both instant.
@@ -392,26 +381,6 @@ async fn run_publish_expect_failure(node: &NodeFixture, args: &[&str]) -> anyhow
         args.join(" "),
     );
     Ok(rendered)
-}
-
-/// Parse `ready_at` from a `decdn publish request-vetting --json` receipt, the
-/// same last-non-empty-line contract as [`parse_namespace_id`].
-fn parse_ready_at(stdout: &[u8]) -> anyhow::Result<u64> {
-    let text = String::from_utf8_lossy(stdout);
-    let line = text
-        .lines()
-        .rev()
-        .find(|l| !l.trim().is_empty())
-        .context("request-vetting produced no stdout")?;
-    let v: serde_json::Value =
-        serde_json::from_str(line).context("parse request-vetting JSON receipt")?;
-    anyhow::ensure!(
-        v["status"] == serde_json::json!("vetting_requested"),
-        "request-vetting was not submitted (dry run?): {v}",
-    );
-    v["ready_at"]
-        .as_u64()
-        .context("request-vetting receipt missing a numeric ready_at")
 }
 
 /// Parse the `namespace_id` from a `decdn publish namespace create --json`

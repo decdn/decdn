@@ -17,14 +17,14 @@ No existing ADR addressed either question. This ADR establishes:
 4. An emergency fast-path for time-critical removals
 5. The slashing regime for non-compliance
 6. The known limitations of hash-based blacklisting and the mitigations available
-7. A governance-controlled positive authority for origin assignment (`OriginAssignment`) — governance vets the publisher wallet once, and the vetted publisher then seats origins for its own namespaces instantly; namespace 0 (`namespaceId == 0`) has no authorized origins — built on the publisher/namespace identity primitive defined in [ADR 002](002-content-addressing.md#publisher-identity-and-namespaces)
+7. A governance-controlled positive authority for origin assignment (`OriginAssignment`) — a swappable vetting policy decides which wallets may seat origins, and a vetted publisher then seats origins for its own namespaces instantly; namespace 0 (`namespaceId == 0`) has no authorized origins — built on the publisher/namespace identity primitive defined in [ADR 002](002-content-addressing.md#publisher-identity-and-namespaces)
 
 ## Decision
 
 Content governance over origins has two symmetric authorities, both DAO-controlled:
 
 - **Negative authority — `ContentBlacklist`.** Removes hashes and operators via two governance paths: a global path (network-wide removal) and a regional path (jurisdiction-scoped removal via a designated regional governance body). Nodes must evict blacklisted content and stop announcing it within a defined compliance window; serving a blacklisted hash after the compliance window is a slashable offense. Origin nodes that repeatedly source blacklisted content can themselves be blacklisted by NodeId or operator address, independent of any specific hash — the primary mitigation for hash evasion via trivial re-encoding.
-- **Positive authority — `OriginAssignment`.** Authorizes specific operators to act as origins for specific namespaces (defined in [ADR 002 § Publisher Identity and Namespaces](002-content-addressing.md#publisher-identity-and-namespaces)). Governance vets the publisher wallet through the standard timelock path; the vetted publisher then picks its own origins from the bonded operator set with no further governance action. Namespace 0 (`namespaceId == 0`) has no authorized origins — content under it is served best-effort from cache/DHT per [ADR 002 § Retrieval by namespace](002-content-addressing.md#retrieval-by-namespace). `ContentBlacklist` and `OriginAssignment` integrate via runtime checks with lazy storage cleanup — see [§ Interaction with ContentBlacklist](#interaction-with-contentblacklist).
+- **Positive authority — `OriginAssignment`.** Authorizes specific operators to act as origins for specific namespaces (defined in [ADR 002 § Publisher Identity and Namespaces](002-content-addressing.md#publisher-identity-and-namespaces)). A swappable vetting policy decides which publisher wallets may seat origins; the vetted publisher then picks its own origins from the bonded operator set with no further governance action. Namespace 0 (`namespaceId == 0`) has no authorized origins — content under it is served best-effort from cache/DHT per [ADR 002 § Retrieval by namespace](002-content-addressing.md#retrieval-by-namespace). `ContentBlacklist` and `OriginAssignment` integrate via runtime checks with lazy storage cleanup — see [§ Interaction with ContentBlacklist](#interaction-with-contentblacklist).
 
 Each node also maintains a local denylist for operator-initiated removal without waiting for governance.
 
@@ -259,52 +259,61 @@ The publisher and namespace primitives are defined in [ADR 002 § Publisher Iden
 
 Origin authorization answers two different questions, and each one gets its own plane:
 
-1. **Is this wallet a network-trusted publisher?** This is a governance question. It is asked once per publisher wallet, and it is timelocked.
+1. **May this wallet seat origins at all?** This is decided by a swappable **vetting policy**. `OriginAssignment` holds one governance-settable `IVettingPolicy` address and asks it `isVetted(publisher)`; it depends on nothing more. How a wallet becomes vetted — a manual approval, a timelocked governance grant, an on-chain attestation, or no gate — lives entirely inside the installed policy.
 2. **Does this publisher want operator B serving its namespace?** This is the publisher's own question. The publisher asks it constantly. Each answer is a single-operator delta. Each delta takes effect in the transaction that carries it.
 
-The **cold plane** is publisher vetting. A publisher calls `requestVetting()`, the request ripens after `vettingTimelock`, and governance calls `grantVetting(publisher)`. Governance can also grant or revoke instantly with `setPublisherVetted(publisher, bool)`.
+The **cold plane** is publisher vetting, delegated to the policy. `addOrigin` seats an origin only when `vettingPolicy.isVetted(msg.sender)` is true. A concrete policy is always installed — never the zero address — so the check is unconditional and fails closed; "deny everyone" is a policy whose `isVetted` returns false, not a null policy. Governance changes the vetting *procedure* by installing a different policy with `setVettingPolicy`, never by changing `OriginAssignment`.
 
-The **hot plane** is origin seating. A vetted publisher calls `addOrigin(namespaceId, operator)` for a namespace it owns. The contract validates that operator alone — active in `CapacityBond`, not blacklisted, not already seated, within `maxOriginsPerNamespace` — and seats it immediately. `removeOrigin` unseats one operator the same way.
+The **hot plane** is origin seating. A vetted publisher calls `addOrigin(namespaceId, operator)` for a namespace it owns. The contract validates that operator alone — active in `CapacityBond`, not blacklisted, not already seated, within `maxOriginsPerNamespace` — and seats it immediately. `removeOrigin` unseats one operator the same way. Validation covers only the operator being added, so a transient failure on a live origin never blocks the seating of a redundant one.
 
-This split preserves one guarantee. Governance alone decides who is a network-trusted publisher. The publisher only chooses among bonded operators, and only for its own namespaces.
+This split preserves one guarantee. The network — through whatever policy governance installs — decides who may seat origins. The publisher only chooses among bonded operators, and only for its own namespaces.
 
-The earlier design put both questions in one flow. A publisher proposed a complete operator set. Governance then ratified the whole set after a timelock. That flow coupled every routine change to a governance vote. It also re-validated the already-serving origins each time the publisher added a new one. A transient failure on a live origin therefore blocked the seating of a redundant one. Vetting the wallet once removes both effects.
+### The vetting seam
+
+The whole dependency between `OriginAssignment` and any policy is one view function:
+
+```solidity
+interface IVettingPolicy {
+    // True iff `publisher` may currently seat origins.
+    function isVetted(address publisher) external view returns (bool);
+}
+```
+
+That one function is the whole dependency. A policy is free to add its own surface — a publisher-initiated on-chain application, a timelocked notice window, an attestation read — as its own layer; none of it is part of the seam, and `OriginAssignment` neither knows nor cares.
+
+### Vetting policies
+
+Governance installs one policy at genesis and swaps it at any time with `setVettingPolicy`. Each is a small contract behind the seam above:
+
+- **ManualVettingPolicy** — the genesis default. A `VETTER_ROLE` holder approves publishers with `setVetted(publisher, bool)`. `VETTER_ROLE`'s admin is `GOVERNANCE_ROLE`, so governance decides *who* vets — an operator wallet, a multisig, a Safe, or the Governor — and moves that authority by reassigning the role, with no contract swap. The role confers only vetting, and governance revokes or re-points it at any time, so it is not a standing back door. There is no self-service request: a publisher asks a `VETTER_ROLE` holder off-chain (or via a governance proposal), is vetted, and can seat origins immediately.
+- **OpenVettingPolicy** — vets every publisher. For local and test deployments only; never installed on a production network.
+- Future policies fit the same seam without touching `OriginAssignment`: an **attestation policy** that vets any wallet holding a valid credential from a trusted attester (no per-publisher governance action), or a policy with a publisher-initiated on-chain application and enforced notice window. Each is a governance `setVettingPolicy` call.
 
 ### Contract: OriginAssignment
 
 ```solidity
 interface IOriginAssignment {
-    // ---- Cold plane: publisher vetting (governance-gated, one-time) ----
+    // ---- Vetting: delegated to a swappable policy ----
 
-    // Publisher asks governance to vet its wallet. Reverts if the caller owns
-    // no namespace (PublisherRegistry.namespaceCount == 0), is already vetted,
-    // or already has a request pending. The request ripens at
-    // block.timestamp + vettingTimelock.
-    function requestVetting() external;
+    // The installed vetting authority. addOrigin seats an origin only when
+    // vettingPolicy.isVetted(msg.sender) is true.
+    function vettingPolicy() external view returns (IVettingPolicy);
 
-    // Publisher withdraws its own pending request. Reverts if none is pending.
-    function cancelVettingRequest() external;
-
-    // Governance grants a ripened request. Reverts if no request is pending or
-    // the timelock has not elapsed. GOVERNANCE_ROLE only.
-    function grantVetting(address publisher) external;
-
-    // Governance override in both directions: vet with no wait, or un-vet a
-    // rogue publisher. Clears any pending request either way, so a ripened
-    // request cannot walk an un-vetted publisher straight back in.
-    // GOVERNANCE_ROLE only.
-    function setPublisherVetted(address publisher, bool vetted) external;
+    // Install a different vetting policy, changing the vetting procedure without
+    // changing this contract. Rejects address(0) — a policy is always present, so
+    // addOrigin needs no zero branch and fails closed. GOVERNANCE_ROLE only.
+    function setVettingPolicy(IVettingPolicy newPolicy) external;
 
     // ---- Hot plane: origin seating (publisher self-serve, instant) ----
 
     // Vetted namespace owner seats one more authorized origin. Effective
     // immediately. Reverts if msg.sender does not own the namespace, is not
-    // vetted, or if the operator is not active in CapacityBond,
-    // is blacklisted through EITHER ContentBlacklist mapping, is already
-    // seated, or would exceed maxOriginsPerNamespace. Validation
-    // covers ONLY the operator being added: operators already in the set are
-    // never re-checked, so a transient failure on a live origin cannot block
-    // seating a new one.
+    // vetted (per the installed policy), or if the operator is not active in
+    // CapacityBond, is blacklisted through EITHER ContentBlacklist mapping, is
+    // already seated, or would exceed maxOriginsPerNamespace. Validation covers
+    // ONLY the operator being added: operators already in the set are never
+    // re-checked, so a transient failure on a live origin cannot block seating a
+    // new one.
     function addOrigin(uint256 namespaceId, address operator) external;
 
     // Removal paths:
@@ -334,17 +343,18 @@ interface IOriginAssignment {
     // thereafter; GOVERNANCE_ROLE only.
     function setContentBlacklist(address contentBlacklist) external;
 
-    // Governable parameters with safety bounds (see ADR 009). Each emits its
-    // own update event: MaxOriginsPerNamespaceUpdated, VettingTimelockUpdated.
+    // Governable parameter with safety bounds (see ADR 009). Emits its own
+    // update event: MaxOriginsPerNamespaceUpdated. Vetting-related parameters, if
+    // any, live on the installed policy, not here.
     function setMaxOriginsPerNamespace(uint256 cap) external;
-    function setVettingTimelock(uint256 secondsDelay) external;
 
     // Views. For namespaceId == 0 these return empty / false — namespace 0
     // has no authorized origins.
     function isAuthorizedOrigin(uint256 namespaceId, address operator) external view returns (bool);
     function getOrigins(uint256 namespaceId) external view returns (address[] memory);
+    // Passthrough to vettingPolicy().isVetted(publisher), so a caller reading
+    // vetting status need not know the policy address.
     function isVettedPublisher(address publisher) external view returns (bool);
-    function getPendingVetting(address publisher) external view returns (uint256 readyAt);
 
     // Namespace key-set enumeration, so an off-chain directory can discover
     // which namespaces have origins without replaying events. Order is not
@@ -352,43 +362,36 @@ interface IOriginAssignment {
     function assignedNamespaceCount() external view returns (uint256);
     function assignedNamespaces(uint256 offset, uint256 limit) external view returns (uint256[] memory);
 
-    // Events. A consumer tracking pending vetting requests opens an entry on
-    // VettingRequested and closes it on EITHER VettingRequestCancelled (the
-    // publisher withdrew) or PublisherVetted (governance granted or revoked,
-    // both of which also clear the request). Governance never emits
-    // VettingRequestCancelled: that word is reserved for the publisher's own
-    // withdrawal, and would misdescribe a request governance fulfilled.
-    event VettingRequested(address indexed publisher, uint256 readyAt);
-    event VettingRequestCancelled(address indexed publisher);
-    event PublisherVetted(address indexed publisher, bool vetted, address indexed by);
+    // Events.
+    event VettingPolicyUpdated(address indexed oldPolicy, address indexed newPolicy);
     event OriginAdded(uint256 indexed namespaceId, address indexed operator, address indexed by);
     event OriginRemoved(uint256 indexed namespaceId, address indexed operator, address indexed by);
     event BlacklistedOriginPruned(uint256 indexed namespaceId, address indexed operator, address indexed pruner);
 }
 ```
 
-`OriginAdded` is the only "origin seated" event. An off-chain consumer treats each event as a signal to re-read `getOrigins(namespaceId)`, not as a delta to apply — see [ADR 022 § FIND_VALUE Flow](022-content-discovery.md#adr-022--content-discovery-at-scale).
+`OriginAdded` is the only "origin seated" event. An off-chain consumer treats each event as a signal to re-read `getOrigins(namespaceId)`, not as a delta to apply — see [ADR 022 § FIND_VALUE Flow](022-content-discovery.md#adr-022--content-discovery-at-scale). The vetting lifecycle emits from the installed policy, not from `OriginAssignment`; a consumer that tracks vetting grants follows `VettingPolicyUpdated` to know which policy is current.
 
 ### Edge cases
 
-- **Vetting request expiry** — none. A pending request sits indefinitely until `grantVetting` (governance) or `cancelVettingRequest` (publisher). If governance is unresponsive, the publisher cancels; no expiry timer.
-- **`requestVetting` from an address that owns no namespace** — reverts. Vetting authorizes a publisher to seat origins for its own namespaces, so an address with no namespace has nothing to authorize.
-- **Un-vetting a publisher with live origins** — the seated origins stay. Un-vetting stops new `addOrigin` calls immediately. Governance then removes the live origins one at a time with `removeOrigin`. Eviction from every namespace in one call is unbounded in the publisher's namespace count. `ContentBlacklist.addOperator` avoids a cross-call for the same reason — see [§ Interaction with ContentBlacklist](#interaction-with-contentblacklist).
-- **Namespace transferred away during the vetting window** — `grantVetting` still succeeds. Vetting is a property of the wallet and seats nothing on its own; `addOrigin` checks namespace ownership separately on every call, so a publisher with no namespaces can seat no origins. The `namespaceCount > 0` entry condition is therefore a spam gate on the request queue, not an authorization boundary.
-- **Namespace transferred to an unvetted owner** — the origins already seated for it keep serving. The new owner can call `removeOrigin` but not `addOrigin` until governance vets them. Transfers do not interrupt delivery.
+- **Vetting lifecycle** — internal to the installed policy. Request expiry, cancellation, timelock bounds, and the entry conditions for a request are all defined by the policy, not by `OriginAssignment`. The manual policy has no request at all; the timelocked policy holds a pending request until it is granted or cancelled, with no expiry timer.
+- **Swapping the policy** — takes effect for future seating only. A wallet vetted under the old policy may no longer be vetted under the new one, so its next `addOrigin` reverts `PublisherNotVetted`; origins it already seated are untouched (the same bounded-work reasoning as un-vetting below).
+- **Un-vetting a publisher with live origins** — the seated origins stay. The policy marking a wallet un-vetted stops new `addOrigin` calls immediately. Governance then removes the live origins one at a time with `removeOrigin`. Eviction from every namespace in one call is unbounded in the publisher's namespace count. `ContentBlacklist.addOperator` avoids a cross-call for the same reason — see [§ Interaction with ContentBlacklist](#interaction-with-contentblacklist).
+- **Namespace transferred to an unvetted owner** — the origins already seated for it keep serving. The new owner can call `removeOrigin` but not `addOrigin` until the installed policy vets them. Transfers do not interrupt delivery.
 - **`addOrigin` for an operator that is already seated** — reverts `DuplicateOperator`, whatever the current set size. The duplicate check precedes the cap check, so a re-add never reports `TooManyOrigins`.
 - **`maxOriginsPerNamespace` lowered below a live set** — nothing is evicted. The cap binds `addOrigin` only, so an existing set may exceed it until the publisher removes operators.
+- **A reverting or misconfigured policy** — `addOrigin` reverts, failing closed. Governance owns the policy address, so a loud failure is preferable to silently denying every publisher.
 - **`ContentBlacklist` unbound during the deployment window** — until `setContentBlacklist` is called post-deploy (see [ADR 016 § Post-Deployment Initialization](016-contract-interactions.md#post-deployment-initialization)), `addOrigin` skips the blacklist check and validates only against `CapacityBond.isActive`. Once set the check is mandatory thereafter; `setContentBlacklist(address(0))` reverts to prevent regressing into the deployment-window state. `pruneBlacklistedOrigin` reverts until the binding is set.
 - **`removeOrigin` of a non-member operator** — reverts. Typo protection; the explicit error surfaces accidental address mismatches that would otherwise pass silently.
 
 ### Lifecycle
 
-1. **Publisher vetting.** The publisher calls `requestVetting()`. Governance reviews the publisher off-chain during the timelock window (governance-bounded between 24 hours and 14 days; see [ADR 009](009-governance.md#adr-009-governance-model)) and then calls `grantVetting(publisher)`. The vetting is per wallet and covers every namespace the publisher owns, now and later. Governance can skip the wait with `setPublisherVetted(publisher, true)`.
-2. **Origin seating.** The vetted publisher calls `addOrigin(namespaceId, operator)` for each operator it wants. The contract validates ownership of the namespace, the publisher's vetted status, and that operator's activity, blacklist status, uniqueness, and the per-namespace cap. The operator is authorized when the transaction confirms.
+1. **Publisher vetting.** The publisher becomes vetted through the installed policy. Under the genesis `ManualVettingPolicy` a `VETTER_ROLE` holder approves the wallet with `setVetted(publisher, true)` — the publisher asks off-chain or via a governance proposal, and once approved can seat origins immediately. Vetting is per wallet and covers every namespace the publisher owns, now and later.
+2. **Origin seating.** The vetted publisher calls `addOrigin(namespaceId, operator)` for each operator it wants. The contract validates ownership of the namespace, the publisher's vetted status (via the policy), and that operator's activity, blacklist status, uniqueness, and the per-namespace cap. The operator is authorized when the transaction confirms.
 3. **Operator notification.** Seated operators are now authorized to act as origins for the namespace. They configure their origin store locally and begin serving the namespace's content. The wire protocol does not distinguish origins from cache nodes at probe time — origin status is a publisher-level commitment surfaced via `getOrigins(namespaceId)` for off-chain consumers.
-4. **Removal.** A publisher may unilaterally unseat an operator from its own namespace (e.g., the operator is performing poorly). Governance may unseat any operator from any namespace, and may un-vet the publisher to stop further seating (e.g., the publisher is misbehaving but has not yet crossed the blacklist threshold). Blacklisting (`ContentBlacklist.addOperator`) takes effect via runtime checks rather than a cross-call — see [§ Interaction with ContentBlacklist](#interaction-with-contentblacklist).
+4. **Removal.** A publisher may unilaterally unseat an operator from its own namespace (e.g., the operator is performing poorly). Governance may unseat any operator from any namespace, and may un-vet the publisher — through the installed policy — to stop further seating (e.g., the publisher is misbehaving but has not yet crossed the blacklist threshold). Blacklisting (`ContentBlacklist.addOperator`) takes effect via runtime checks rather than a cross-call — see [§ Interaction with ContentBlacklist](#interaction-with-contentblacklist).
 
-The split between the two decisions is deliberate. Publishers know their content best, so they choose which operators serve it. The DAO decides whether a publisher is trustworthy at all. Only that second question needs protocol-wide policy.
+The split between the two decisions is deliberate. Publishers know their content best, so they choose which operators serve it. The network decides whether a publisher may seat origins at all, through a policy governance can swap as compliance needs change. Only that second question needs protocol-wide policy.
 
 The backstops are reactive, not preventive. Governance removes a bad origin, un-vets a bad publisher, or blacklists a bad operator. Each of the three takes effect on its own, without waiting for the others. Content integrity does not depend on any of them. Clients verify bytes against the BLAKE3 address, whoever served them ([ADR 002](002-content-addressing.md#adr-002-content-addressing)).
 
@@ -407,7 +410,7 @@ The contract rejects an `addOrigin` for an operator already seated in the namesp
 ### Cross-contract integration
 
 - `OriginAssignment` reads `PublisherRegistry.ownerOf(namespaceId)` to validate that the caller owns the namespace it seats or unseats an origin for.
-- `OriginAssignment` reads `PublisherRegistry.namespaceCount(publisher)` to validate that a `requestVetting` caller is a publisher at all.
+- `OriginAssignment` makes no `PublisherRegistry.namespaceCount` read — vetting is the installed policy's concern; `OriginAssignment` only asks it `isVetted(publisher)`. A policy that gates its own application on namespace ownership would read `namespaceCount` itself.
 - `OriginAssignment` reads `CapacityBond.isActive(operator)` to validate an origin candidate at seating time. The check is opportunistic, not enforced at probe time — an operator who unbonds while seated is filtered by clients via the standard bond-active check, not by `OriginAssignment` (avoiding expensive cross-contract checks on every assignment lookup).
 - `OriginAssignment` reads `ContentBlacklist.isOriginBlacklisted(operator)` (and the operator mapping) both to reject a blacklisted candidate at seating time and to decide whether `pruneBlacklistedOrigin` may remove an entry. Permissionless callers can clean up storage one (`namespaceId`, operator) pair at a time.
 - `ContentBlacklist.addOperator(operator)` does not call into `OriginAssignment` — see [§ Interaction with ContentBlacklist](#interaction-with-contentblacklist) below for the rationale and the runtime-check pattern.
