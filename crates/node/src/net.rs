@@ -1,5 +1,7 @@
-//! Shared TCP bind helper for the node's loopback control-plane listeners
-//! (the admin RPC server and the metrics endpoint).
+//! Shared TCP bind helper for the node's control-plane listeners (the admin RPC
+//! server and the metrics endpoint). Both default to loopback but are
+//! operator-settable to a wider bind (`metrics_bind = "0.0.0.0"` for
+//! containerised scrapers), which the listeners warn on but allow.
 //!
 //! Both listeners bind a **fixed** operator-configured port, and both may be
 //! re-bound moments after a prior `decdn-node` process exits — an operator

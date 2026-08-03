@@ -2648,8 +2648,8 @@ impl SettleParty {
 ///
 /// # Errors
 ///
-/// Returns an error if the `TcpListener::bind` call fails (port in use,
-/// permissions, etc.).
+/// Returns an error if the underlying `crate::net::bind_reuseaddr` fails —
+/// socket creation, `bind` (port in use, permissions), or `listen`.
 pub fn bind(addr: SocketAddr) -> anyhow::Result<TcpListener> {
     // `SO_REUSEADDR` so a restart rebinds this fixed port immediately instead of
     // racing a `TIME_WAIT` remnant from the prior process (see `crate::net`).
