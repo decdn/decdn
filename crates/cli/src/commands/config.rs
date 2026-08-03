@@ -909,7 +909,7 @@ mod tests {
             ("cache", cache.as_slice()),
             ("payment", payment.as_slice()),
         ] {
-            for (token, _referenced) in keys {
+            for &(token, _referenced) in keys {
                 assert!(
                     DEFAULT_CONFIG.contains(token),
                     "DEFAULT_CONFIG template is missing wired [{section}] key `{token}` \
