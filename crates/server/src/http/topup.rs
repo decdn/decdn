@@ -91,7 +91,13 @@ pub async fn post(State(state): State<AppState>, Json(req): Json<TopupRequest>) 
             Json(json!({"ok": true, "deposit_micro_usdc": new_dep.0})).into_response()
         }
         Err(e) => {
-            let _ = state.store.cap_refund(rec.client, month_bucket(now), delta);
+            if let Err(refund_err) = state.store.cap_refund(rec.client, month_bucket(now), delta) {
+                tracing::error!(
+                    error = %refund_err,
+                    client = %rec.client,
+                    "cap_refund failed after treasury.top_up_to error"
+                );
+            }
             err_json_detail(StatusCode::BAD_GATEWAY, "topup_failed", &e.to_string())
         }
     }

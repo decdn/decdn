@@ -6,6 +6,5 @@ pub mod http;
 pub mod money;
 pub mod state;
 pub mod store;
-pub mod test_support;
 pub mod topup_auth;
 pub mod treasury;

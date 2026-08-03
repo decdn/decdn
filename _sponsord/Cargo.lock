@@ -7559,6 +7559,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tower",
+ "tracing",
  "wiremock",
 ]
 

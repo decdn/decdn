@@ -98,11 +98,39 @@ pub async fn submit(State(state): State<AppState>, Json(req): Json<FundRequest>)
                 deposit_micro: state.cfg.initial_deposit.0,
                 opened_unix: now,
             };
-            if let Err(e) = state.store.insert_channel(channel_id, &rec) {
+            // `treasury.open` already spent real funds and escrowed
+            // `channel_id` on-chain. If persisting the local
+            // `(client,node)->channel_id` mapping fails, a client retry
+            // would re-enter this handler, miss the idempotency lookup
+            // above, and open a SECOND channel (double-spend). Retry the
+            // insert a few times before giving up; if it still fails, do
+            // NOT refund the cap (the escrow is real) and log everything
+            // needed to recover the orphaned channel by hand.
+            let mut last_err = None;
+            let mut inserted = false;
+            for _ in 0..3 {
+                match state.store.insert_channel(channel_id, &rec) {
+                    Ok(()) => {
+                        inserted = true;
+                        break;
+                    }
+                    Err(e) => last_err = Some(e),
+                }
+            }
+            if !inserted {
+                let channel_id_hex = channel_id_hex(channel_id);
+                tracing::error!(
+                    channel_id = %channel_id_hex,
+                    client = %client,
+                    provider = %pick.provider,
+                    error = %last_err.as_ref().map(ToString::to_string).unwrap_or_default(),
+                    "escrowed channel opened on-chain but failed to persist locally after retries; \
+                     manual recovery needed to avoid a double-spend on client retry"
+                );
                 return err_json_detail(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal",
-                    &e.to_string(),
+                    StatusCode::BAD_GATEWAY,
+                    "open_failed",
+                    &channel_id_hex,
                 );
             }
             Json(json!({
@@ -113,9 +141,17 @@ pub async fn submit(State(state): State<AppState>, Json(req): Json<FundRequest>)
             .into_response()
         }
         Err(e) => {
-            let _ = state
-                .store
-                .cap_refund(client, month_bucket(now), state.cfg.initial_deposit);
+            if let Err(refund_err) =
+                state
+                    .store
+                    .cap_refund(client, month_bucket(now), state.cfg.initial_deposit)
+            {
+                tracing::error!(
+                    error = %refund_err,
+                    client = %client,
+                    "cap_refund failed after treasury.open error"
+                );
+            }
             err_json_detail(StatusCode::BAD_GATEWAY, "open_failed", &e.to_string())
         }
     }

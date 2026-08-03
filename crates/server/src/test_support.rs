@@ -1,12 +1,15 @@
 //! Fakes for the HTTP contract tests (`tests/http_contract.rs`).
 //!
-//! Deliberately **not** gated behind `#[cfg(test)]`: integration tests under
-//! `tests/` are a separate crate that links against the `sponsord` *library*
-//! target built without `cfg(test)` (only unit tests compiled via `cargo test
-//! --lib` see `cfg(test)` items). So this module has to be a plain `pub mod`
-//! for `cargo test -p sponsord` to run `http_contract.rs` with no extra
-//! feature flag. `#[allow(dead_code)]` keeps a normal `cargo build`/`clippy`
-//! pristine, since nothing in the production binary calls these symbols.
+//! This file is **not** part of the `sponsord` lib/bin: it is pulled in only
+//! by the integration test binary via
+//! `#[path = "../src/test_support.rs"] mod test_support;` at the top of
+//! `tests/http_contract.rs`. That keeps these fakes (and their `tempfile`
+//! dependency, panicking constructors, etc.) out of the shipped `sponsord`
+//! library and binary entirely — a normal `cargo build -p sponsord` never
+//! compiles this file. All types referenced below are already `pub` in the
+//! lib, so the test binary can build this module against them with no
+//! feature flag. `#[allow(dead_code)]` keeps `cargo clippy --all-targets`
+//! pristine for any fake surface a given test binary doesn't exercise.
 
 #![allow(dead_code)]
 
@@ -16,16 +19,17 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 use alloy::primitives::{Address, B256};
+use alloy::signers::local::PrivateKeySigner;
 use async_trait::async_trait;
 
-use crate::cap::Cap;
-use crate::captcha::CaptchaVerifier;
-use crate::config::ServerConfig;
-use crate::discovery::{NodePick, ProviderResolver};
-use crate::money::MicroUsdc;
-use crate::state::AppState;
-use crate::store::Store;
-use crate::treasury::Treasury;
+use sponsord::cap::Cap;
+use sponsord::captcha::CaptchaVerifier;
+use sponsord::config::ServerConfig;
+use sponsord::discovery::{NodePick, ProviderResolver};
+use sponsord::money::MicroUsdc;
+use sponsord::state::AppState;
+use sponsord::store::Store;
+use sponsord::treasury::Treasury;
 
 /// In-memory `Treasury`: same fake shape as the `treasury` module's own
 /// unit-test double, made `pub` so the HTTP contract tests can inject it.
@@ -112,12 +116,40 @@ impl ProviderResolver for FakeResolver {
     }
 }
 
+/// A real signer the contract tests can use as a channel's `client` /
+/// voucher-signer address, so `/topup`'s EIP-191 signature-verification path
+/// can be exercised with a signature the recovered address actually matches
+/// — the fixed `CLIENT` test constant has no known private key, so it can
+/// never drive the `/topup` 200 happy path.
+pub struct FakeClient {
+    pub signer: PrivateKeySigner,
+    pub address: Address,
+}
+
+impl FakeClient {
+    /// A fresh random signer/address pair.
+    #[must_use]
+    pub fn random() -> Self {
+        let signer = PrivateKeySigner::random();
+        let address = signer.address();
+        Self { signer, address }
+    }
+}
+
 /// Knobs `app_state_with_options` exposes to the contract tests.
 pub struct FakeOptions {
     /// Whether the injected `FakeCaptcha` reports success.
     pub captcha_passes: bool,
     /// The monthly cap the injected `Cap` policy enforces.
     pub monthly_cap: MicroUsdc,
+    /// `ServerConfig::initial_deposit` — the deposit `/fund` opens a fresh
+    /// channel with.
+    pub initial_deposit: MicroUsdc,
+    /// `ServerConfig::working_balance` — the target `/topup` funds a
+    /// channel back up to. Set this above `initial_deposit` in a test that
+    /// needs to exercise the real `top_up_to` delta path rather than
+    /// `/topup`'s already-at-target short-circuit.
+    pub working_balance: MicroUsdc,
 }
 
 impl Default for FakeOptions {
@@ -125,6 +157,8 @@ impl Default for FakeOptions {
         Self {
             captcha_passes: true,
             monthly_cap: MicroUsdc(10_000_000),
+            initial_deposit: MicroUsdc(2_000_000),
+            working_balance: MicroUsdc(2_000_000),
         }
     }
 }
@@ -161,8 +195,8 @@ pub fn app_state_with_options(opts: FakeOptions) -> AppState {
         payment_channel: Address::ZERO,
         capacity_bond: Address::ZERO,
         treasury_keystore: PathBuf::from("/dev/null"),
-        initial_deposit: MicroUsdc(2_000_000),
-        working_balance: MicroUsdc(2_000_000),
+        initial_deposit: opts.initial_deposit,
+        working_balance: opts.working_balance,
         monthly_cap: opts.monthly_cap,
         turnstile_secret: "secret".into(),
         turnstile_sitekey: "sitekey".into(),

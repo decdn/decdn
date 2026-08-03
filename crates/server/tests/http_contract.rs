@@ -1,13 +1,24 @@
 //! Contract tests for `/fund`, `/channel`, `/topup` over `sponsord`'s
-//! injectable fakes (`sponsord::test_support`). Runs as a plain
-//! `cargo test -p sponsord` integration test — no feature flag needed.
+//! injectable fakes (`test_support`, pulled in below via `#[path]`). Runs as
+//! a plain `cargo test -p sponsord` integration test — no feature flag
+//! needed.
+//!
+//! `test_support` is intentionally NOT part of the `sponsord` lib/bin (see
+//! its doc comment): it is compiled only into this test binary, via the
+//! `#[path]` attribute below, against the `pub` surface the lib already
+//! exposes.
+#[path = "../src/test_support.rs"]
+mod test_support;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use tower::ServiceExt;
 
 use sponsord::money::MicroUsdc;
-use sponsord::test_support::{FakeOptions, app_state_with_fakes, app_state_with_options};
+use sponsord::topup_auth::challenge_message;
+use test_support::{FakeClient, FakeOptions, app_state_with_fakes, app_state_with_options};
+
+use alloy::signers::SignerSync;
 
 const CLIENT: &str = "0x00000000000000000000000000000000000000aa";
 const HASH: &str = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
@@ -154,6 +165,7 @@ async fn fund_rejects_over_cap_with_429() {
     let state = app_state_with_options(FakeOptions {
         captcha_passes: true,
         monthly_cap: MicroUsdc(1), // below initial_deposit (2_000_000)
+        ..FakeOptions::default()
     });
     let app = sponsord::http::router(state);
 
@@ -169,4 +181,73 @@ async fn fund_rejects_over_cap_with_429() {
     assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
     let v = json_body(resp).await;
     assert_eq!(v["error"].as_str(), Some("cap_exhausted"));
+}
+
+#[tokio::test]
+async fn topup_happy_path_returns_200_and_deposit() {
+    // `working_balance` above `initial_deposit` so the topup handler takes
+    // the real `top_up_to` delta path instead of the already-at-target
+    // short-circuit.
+    let state = app_state_with_options(FakeOptions {
+        initial_deposit: MicroUsdc(2_000_000),
+        working_balance: MicroUsdc(3_000_000),
+        ..FakeOptions::default()
+    });
+    let app = sponsord::http::router(state);
+
+    // A real signer stands in for the channel's client/voucher-signer, so
+    // `/topup`'s signature check has a key it can actually verify against.
+    let client = FakeClient::random();
+    let fund_body = serde_json::json!({
+        "client": client.address.to_string(),
+        "hash": HASH,
+        "turnstile_token": "ok",
+    })
+    .to_string();
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post("/fund")
+                .header("content-type", "application/json")
+                .body(Body::from(fund_body))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = json_body(resp).await;
+    let channel_id = v["channel_id"].as_str().expect("channel_id").to_string();
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs();
+    let channel_id_b256: alloy::primitives::B256 = channel_id.parse().expect("parse channel_id");
+    let msg = challenge_message(channel_id_b256, now);
+    let sig = client
+        .signer
+        .sign_message_sync(msg.as_bytes())
+        .expect("sign");
+    let sig_hex = format!("0x{}", hex::encode(sig.as_bytes()));
+
+    let topup_body = serde_json::json!({
+        "channel_id": channel_id,
+        "timestamp": now,
+        "signature": sig_hex,
+    })
+    .to_string();
+    let resp = app
+        .oneshot(
+            Request::post("/topup")
+                .header("content-type", "application/json")
+                .body(Body::from(topup_body))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = json_body(resp).await;
+    assert_eq!(v["ok"].as_bool(), Some(true));
+    assert_eq!(v["deposit_micro_usdc"].as_u64(), Some(3_000_000));
 }
