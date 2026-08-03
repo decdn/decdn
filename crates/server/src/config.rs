@@ -87,12 +87,14 @@ impl ServerConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
+    #[serial]
     fn from_env_reads_required_fields() {
         // set the minimal env then parse. `set_var`/`remove_var` are unsafe
         // in edition 2024 (not thread-safe wrt other threads' env reads);
-        // this is a single self-contained test run with `--test-threads=1`.
+        // guarded by #[serial] to ensure single-threaded execution.
         unsafe {
             std::env::set_var("SPONSOR_RPC_URL", "http://localhost:8545");
             std::env::set_var(

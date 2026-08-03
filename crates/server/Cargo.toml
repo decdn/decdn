@@ -24,6 +24,7 @@ tempfile = "3"
 hex = "0.4"
 wiremock = "0.6"
 serde_json = "1"
+serial_test = "3"
 decdn-e2e = { path = "../../../decdn/crates/e2e", features = ["anvil-e2e"] }
 # Pinned to the same major as decdn's workspace (`decdn/Cargo.toml`) so
 # `iroh::SecretKey` here is the identical type `ChainFixture::onboard_operator`
