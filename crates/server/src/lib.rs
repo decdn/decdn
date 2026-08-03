@@ -1,6 +1,7 @@
 pub mod cap;
 pub mod captcha;
 pub mod config;
+pub mod discovery;
 pub mod money;
 pub mod state;
 pub mod store;
