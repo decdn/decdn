@@ -4,6 +4,7 @@ mod money;
 mod store;
 mod cap;
 mod topup_auth;
+mod captcha;
 
 fn main() {
     // Spike: prove the decdn path dep resolves and a symbol is reachable.

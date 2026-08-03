@@ -12,7 +12,11 @@ decdn-client-pull.workspace = true
 decdn-incentive.workspace = true
 decdn-common.workspace = true
 redb = "4"
+reqwest = { version = "0.12", features = ["json"] }
+serde.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
 hex = "0.4"
+wiremock = "0.6"
+serde_json = "1"
