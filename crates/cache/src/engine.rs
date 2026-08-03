@@ -332,19 +332,6 @@ impl Inner {
     }
 }
 
-/// Coarse-grained cache statistics.
-///
-/// All fields are stubs for now — the gossip crate will read from here once
-/// eviction + accounting land. Kept as a struct (not a tuple) so adding fields
-/// is non-breaking.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct CacheStats {
-    /// Estimated on-disk bytes consumed by cached blobs.
-    pub bytes_stored: u64,
-    /// Number of distinct blobs currently in the store.
-    pub blob_count: u64,
-}
-
 // `PinnedHashes` and `PinDiff` moved to the `decdn-config-types` leaf
 // crate (#578) and are imported above. The engine holds its pinned set
 // internally as `HashSet<Hash>` (the iroh-blobs store hash) and converts
@@ -2315,20 +2302,6 @@ impl CacheEngine {
             .shutdown()
             .await
             .map_err(|e| CacheError::Store(anyhow::Error::from(e)))
-    }
-
-    /// Coarse stats for gossip / observability. MVP returns zeros; the
-    /// method exists so callers don't have to change once real accounting
-    /// lands (it'll read `self.inner` at that point).
-    // `&self` is intentional — the signature is load-bearing across the
-    // eventual accounting implementation, and keeping it spares callers a
-    // churn commit. The `allow` is narrowly scoped to this method.
-    #[allow(clippy::unused_self)]
-    pub const fn stats(&self) -> CacheStats {
-        CacheStats {
-            bytes_stored: 0,
-            blob_count: 0,
-        }
     }
 
     /// Return the last access time for `hash`, or `None` if the hash has

@@ -231,20 +231,6 @@ pub struct StreamRequest {
 /// best-effort from cache / DHT with no authorized origins (ADR 002 §Namespace 0).
 pub const NO_NAMESPACE: [u8; 32] = [0u8; 32];
 
-impl StreamRequest {
-    /// The bounded range length as an explicit option, decoding the `byte_len`
-    /// sentinel in one place: `None` ⇒ whole tail from `byte_offset`; `Some(n)` ⇒
-    /// exactly `n` bytes. Consumers should read the range through this rather than
-    /// re-deriving the `== 0` sentinel. The authoritative bounds check against the
-    /// blob size lives in `decdn_cache::range_pull::align_range`, which every
-    /// serving-side handler MUST route `(byte_offset, byte_len)` through before
-    /// scoping an origin fetch or metering billing.
-    #[must_use]
-    pub const fn requested_len(&self) -> Option<core::num::NonZeroU64> {
-        core::num::NonZeroU64::new(self.byte_len)
-    }
-}
-
 /// Optional [`StreamRequest`] extension fields (ADR 005 §Client identity
 /// binding), carried as trailing bytes after the `StreamRequest` message via the
 /// two-phase pattern (see [`encode_stream_request`] / [`parse_stream_request_ext`]).

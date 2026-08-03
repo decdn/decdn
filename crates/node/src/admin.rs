@@ -15,7 +15,6 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use alloy::primitives::U256;
-use alloy::signers::local::PrivateKeySigner;
 use decdn_cache::{CacheEngine, CacheError};
 use decdn_common::admin::{
     AdminRpcServer, AnnounceResponse, BucketStat, CACHE_ERROR_CODE, CHANNEL_STORE_ERROR_CODE,
@@ -89,16 +88,6 @@ pub struct AdminState {
     /// `Option<…>` like `announce_trigger` / `reload_hook`) and the
     /// runtime wires it unconditionally.
     drain_trigger: Arc<DrainTrigger>,
-    /// Loaded Ethereum keystore signer (issue #406). Required because the
-    /// resolved blockchain config validates the keystore at startup, so any
-    /// successful runtime is guaranteed to have a signer. Stored here
-    /// because `AdminState` is the cross-runtime shared-state struct that
-    /// already plumbs to multiple consumers; future non-RPC consumers
-    /// (vouchers per #319, on-chain txs per #327) clone this `Arc`. The
-    /// `Debug` impl on `PrivateKeySigner` prints the address only — never
-    /// the secret scalar.
-    #[allow(dead_code)] // Wired in #406; consumed by #319 / #327.
-    signer: Arc<PrivateKeySigner>,
     /// Live process metrics handle, used by `admin_v1_health` to read
     /// the current `dispatch_in_flight` gauge for the
     /// `in_flight_streams` field (issue #604). The `Arc<Metrics>` is
@@ -331,7 +320,6 @@ impl AdminState {
         announce_trigger: Option<Arc<AnnounceTrigger>>,
         reload_hook: Option<ReloadHook>,
         drain_trigger: Arc<DrainTrigger>,
-        signer: Arc<PrivateKeySigner>,
         metrics: Arc<Metrics>,
     ) -> Self {
         Self {
@@ -342,7 +330,6 @@ impl AdminState {
             announce_trigger,
             reload_hook,
             drain_trigger,
-            signer,
             metrics,
             dht: None,
             channels: None,
@@ -997,17 +984,6 @@ mod tests {
         (cache, tmp)
     }
 
-    /// Throwaway `PrivateKeySigner` for tests that need an `AdminState` but
-    /// don't exercise any signing logic. The chain id is pinned to Arbitrum
-    /// Sepolia to keep parity with the real runtime — tests that *do*
-    /// exercise signing should construct their own signer with the chain id
-    /// under test.
-    fn throwaway_signer() -> Arc<PrivateKeySigner> {
-        use alloy::signers::Signer;
-        use decdn_incentive::eth_identity::ARBITRUM_SEPOLIA_CHAIN_ID;
-        Arc::new(PrivateKeySigner::random().with_chain_id(Some(ARBITRUM_SEPOLIA_CHAIN_ID)))
-    }
-
     async fn state_with(peers: Vec<([u8; 32], &str, u64, u64)>) -> (AdminState, tempfile::TempDir) {
         let mut table = PeerTable::new(0, 0);
         for (id, region, ts_us, now_us) in peers {
@@ -1024,7 +1000,6 @@ mod tests {
             None,
             None,
             Arc::new(DrainTrigger::new()),
-            throwaway_signer(),
             Arc::new(crate::metrics::Metrics::new()),
         );
         (state, tmp)
@@ -1105,7 +1080,6 @@ mod tests {
             None,
             None,
             Arc::new(DrainTrigger::new()),
-            throwaway_signer(),
             Arc::new(crate::metrics::Metrics::new()),
         );
         let rpc = AdminRpcImpl::new(state);
@@ -1133,7 +1107,6 @@ mod tests {
             None,
             None,
             Arc::new(DrainTrigger::new()),
-            throwaway_signer(),
             Arc::new(crate::metrics::Metrics::new()),
         );
         let rpc = AdminRpcImpl::new(state);
@@ -1234,7 +1207,6 @@ mod tests {
             None,
             None,
             Arc::new(DrainTrigger::new()),
-            throwaway_signer(),
             Arc::new(crate::metrics::Metrics::new()),
         );
         let rpc = AdminRpcImpl::new(state);
@@ -1287,7 +1259,6 @@ mod tests {
             None,
             None,
             Arc::new(DrainTrigger::new()),
-            throwaway_signer(),
             Arc::new(crate::metrics::Metrics::new()),
         );
         let rpc = AdminRpcImpl::new(state);
@@ -1370,7 +1341,6 @@ mod tests {
             None,
             None,
             Arc::new(DrainTrigger::new()),
-            throwaway_signer(),
             Arc::new(crate::metrics::Metrics::new()),
         );
         let rpc = AdminRpcImpl::new(state);
@@ -1487,7 +1457,6 @@ mod tests {
             None,
             None,
             Arc::new(DrainTrigger::new()),
-            throwaway_signer(),
             Arc::new(crate::metrics::Metrics::new()),
         );
         let rpc = AdminRpcImpl::new(state);
@@ -1549,7 +1518,6 @@ mod tests {
             Some(trigger),
             None,
             Arc::new(DrainTrigger::new()),
-            throwaway_signer(),
             Arc::new(crate::metrics::Metrics::new()),
         );
         let rpc = AdminRpcImpl::new(state);
@@ -1618,7 +1586,6 @@ mod tests {
             None,
             Some(hook),
             Arc::new(DrainTrigger::new()),
-            throwaway_signer(),
             Arc::new(crate::metrics::Metrics::new()),
         );
         let rpc = AdminRpcImpl::new(state);
@@ -1710,7 +1677,6 @@ mod tests {
             None,
             None,
             Arc::clone(&trigger),
-            throwaway_signer(),
             Arc::new(crate::metrics::Metrics::new()),
         );
         let rpc = AdminRpcImpl::new(state);
@@ -1760,7 +1726,6 @@ mod tests {
             None,
             None,
             Arc::clone(&trigger),
-            throwaway_signer(),
             Arc::new(crate::metrics::Metrics::new()),
         );
         let rpc = AdminRpcImpl::new(state);
@@ -1818,7 +1783,6 @@ mod tests {
             None,
             None,
             Arc::clone(&trigger),
-            throwaway_signer(),
             Arc::new(crate::metrics::Metrics::new()),
         );
         let rpc = AdminRpcImpl::new(state);
@@ -1862,7 +1826,6 @@ mod tests {
             None,
             None,
             Arc::clone(&trigger),
-            throwaway_signer(),
             Arc::clone(&metrics),
         );
         let rpc = AdminRpcImpl::new(state);
@@ -1936,7 +1899,6 @@ mod tests {
             None,
             Some(hook),
             Arc::new(DrainTrigger::new()),
-            throwaway_signer(),
             Arc::new(crate::metrics::Metrics::new()),
         );
         let rpc = AdminRpcImpl::new(state);

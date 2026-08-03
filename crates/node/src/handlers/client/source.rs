@@ -34,12 +34,6 @@ pub(crate) enum ProgressiveSource {
     Node(NodeProgressivePull),
     /// A local pull streaming an already-held origin's plaintext through the
     /// bao encoder (#1130 Task 3): no upstream to pay or score.
-    // Not yet constructed outside this module's own tests — Task 6 (#1130)
-    // wires the local stream-while-store open site that produces this
-    // variant in production. Narrowed to this variant (rather than the
-    // module-wide allow Task 5 removed) since every method on the enum is
-    // already reachable via `Node`.
-    #[allow(dead_code)]
     LocalOutboard(LocalOutboardPull),
 }
 

@@ -187,13 +187,8 @@ impl GossipService {
     /// live registry set. There is no production path that disables the gate:
     /// `AnnounceGate::Disabled` is `#[cfg(test)]`, so it does not exist in this
     /// build at all.
-    #[allow(
-        clippy::too_many_arguments,
-        clippy::needless_pass_by_value,
-        clippy::cognitive_complexity
-    )]
+    #[allow(clippy::too_many_arguments, clippy::cognitive_complexity)]
     pub async fn spawn(
-        _endpoint: Endpoint,
         secret_key: SecretKey,
         gossip: Gossip,
         cfg: GossipRuntimeConfig,
@@ -1055,13 +1050,12 @@ mod tests {
             .bind()
             .await
             .expect("bind minimal endpoint");
-        let gossip = build_gossip(ep.clone());
+        let gossip = build_gossip(ep);
         let peer_table = Arc::new(RwLock::new(PeerTable::new(60_000_000, 128)));
         let metrics: Arc<dyn GossipMetrics> = Arc::new(crate::metrics::NoopMetrics);
         let shutdown = CancellationToken::new();
 
         let handles = GossipService::spawn(
-            ep,
             SecretKey::generate(),
             gossip,
             cfg,
