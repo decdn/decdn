@@ -2,6 +2,7 @@ use alloy::primitives::Address;
 use crate::money::{MicroUsdc, month_bucket};
 use crate::store::Store;
 
+#[derive(Clone)]
 pub struct Cap {
     pub monthly_limit: MicroUsdc,
 }
