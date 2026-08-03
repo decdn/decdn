@@ -44,8 +44,10 @@ use crate::{from_store_hash, to_store_hash};
 
 /// Engine bundling a filesystem-backed iroh-blobs store with an optional
 /// origin backend. Lookups hit the store first; on miss and when an origin is
-/// configured, bytes are pulled, BLAKE3-verified, and inserted before being
-/// returned to the caller.
+/// configured, bytes are pulled and BLAKE3-verified. Insert-before-return is a
+/// property of the buffered path ([`Self::get`] / [`Self::populate`]), not of
+/// this type: [`Self::open_local_outboard_pull`] streams and tees concurrently,
+/// and [`Self::pull_through_range`] commits only a verified sub-range.
 #[derive(Debug, Clone)]
 pub struct CacheEngine {
     inner: Arc<Inner>,
@@ -2196,6 +2198,14 @@ impl CacheEngine {
     /// degrades to [`Self::populate`] and serves from the store as usual.
     /// This is never a correctness or availability failure, only a forgone
     /// optimization (same contract as [`Self::pull_through_range`]).
+    ///
+    /// Unlike [`Self::populate_local`] the size probe carries no `local_only`
+    /// filter, so it relies on the node→node `Peer` origin overriding neither
+    /// [`Origin::size`] nor [`Origin::fetch_outboard`] (both default to
+    /// `Ok(None)` / `Unsupported`). That is what keeps a paid peer from
+    /// winning the outboard or setting the `total_bytes` the serving node
+    /// signs into its `StreamResponse`. Give `NodeOrigin` either impl and this
+    /// path needs an explicit local-only filter first.
     ///
     /// # Errors
     ///

@@ -1,11 +1,15 @@
 //! Cache engine for deCDN.
 //!
-//! Wraps `iroh-blobs` with origin pull-through logic: on a cache miss, the
-//! engine fetches from a configured [`Origin`] backend, verifies the BLAKE3
-//! hash, and inserts the bytes before returning them to the caller. Node-to-
-//! node pull-through is one such backend — the `node` crate supplies an
-//! [`Origin`] that pays a peer over `cdn/client/v1` — so this crate needs no
-//! knowledge of the paid path.
+//! Wraps `iroh-blobs` with origin pull-through logic. The buffered entry
+//! points ([`engine::CacheEngine::get`] / `populate`) fetch from a configured
+//! [`Origin`] backend on a cache miss, verify the BLAKE3 hash, and insert the
+//! bytes before returning them to the caller. The streaming entry points do
+//! not buffer whole-blob first: [`engine::CacheEngine::open_local_outboard_pull`]
+//! (#1130) streams origin bytes through a bao encoder while teeing them into
+//! the store, and [`engine::CacheEngine::pull_through_range`] (#823) pulls only
+//! a verified sub-range. Node-to-node pull-through is one such backend — the
+//! `node` crate supplies an [`Origin`] (`NodeOrigin`, #831) that pays a peer
+//! over `cdn/client/v1` — so this crate needs no knowledge of the paid path.
 //!
 //! Leaf crate per `adr/appendix-poc-production-seams.md` — no `#[cfg(...)]`
 //! mode branching or feature flags here. The `node` crate's wiring layer

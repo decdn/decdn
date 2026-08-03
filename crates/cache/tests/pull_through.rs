@@ -4765,6 +4765,96 @@ async fn export_bao_range_stream_matches_the_buffered_form_and_is_chunked() -> a
     Ok(())
 }
 
+/// ADR 038 acceptance criterion 4: the two proof sources must produce
+/// **identical wire bytes**, so a client cannot tell whether the node exported
+/// from its own persisted outboard or streamed the blob from an origin that
+/// publishes `{H}.obao4`. Both emit header-less pre-order bao over the same
+/// `IROH_BLOCK_SIZE` tree, but until now nothing compared them to each other:
+/// the streaming encoder is only checked against its own in-crate reference
+/// (`decdn-bao-range`'s `streamed_headerless_matches_reference`), and the
+/// export path only against its buffered form (above). A framing change on
+/// either side — a stray size header, a different pre-order walk — would split
+/// the wire in two while every existing test stayed green.
+#[tokio::test]
+async fn both_proof_sources_emit_identical_wire_bytes() -> anyhow::Result<()> {
+    use futures_util::StreamExt;
+
+    // Several 16 KiB groups plus a short final group, so the tree carries real
+    // interior nodes and the last group is partial.
+    let blob = make_blob(20 * 16 * 1024 + 999);
+    let ob = PreOrderMemOutboard::create(&blob, IROH_BLOCK_SIZE);
+    let hash = Hash::from_bytes(*ob.root.as_bytes());
+    let hex = hash.to_hex();
+    let blob_size = u64::try_from(blob.len())?;
+
+    // `open_local_outboard_pull` probes the size (HEAD) before reading the
+    // outboard and then the whole data object.
+    let server = MockServer::start().await;
+    Mock::given(method("HEAD"))
+        .and(path(format!("/{hex}")))
+        .respond_with(
+            ResponseTemplate::new(200).insert_header("Content-Length", blob.len().to_string()),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{hex}.obao4")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(ob.data.clone()))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{hex}")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(blob.clone()))
+        .mount(&server)
+        .await;
+
+    let (engine, _tmp) = build_engine(&server.uri()).await?;
+
+    // Source 1 — streamed local-outboard pull, taken while the engine still
+    // holds nothing. This is the wire the serve path forwards to the client.
+    let opened = engine.open_local_outboard_pull(hash).await?;
+    let Some((header, mut pull)) = opened else {
+        anyhow::bail!("origin publishes `{hex}.obao4`, so the pull must open");
+    };
+    anyhow::ensure!(
+        header.total_bytes == blob_size,
+        "streamed pull reported {} total bytes, expected {blob_size}",
+        header.total_bytes
+    );
+    let mut streamed = Vec::new();
+    while let Some(chunk) = pull.next_chunk().await? {
+        streamed.extend_from_slice(&chunk);
+    }
+    pull.finish().await?;
+
+    // Source 2 — persisted outboard, after an ordinary buffered import.
+    engine.get(hash).await?;
+    let mut stream = engine
+        .export_bao_range_stream(hash, 0, 0, blob_size)
+        .await?;
+    let mut exported = Vec::new();
+    while let Some(item) = stream.next().await {
+        exported.extend_from_slice(&item?);
+    }
+
+    // Guard against a vacuous pass: two empty vectors compare equal, so pin
+    // the wire to the blob plus its proof nodes (~0.4%) before comparing.
+    let streamed_len = u64::try_from(streamed.len())?;
+    anyhow::ensure!(
+        streamed_len > blob_size && streamed_len < blob_size + blob_size / 100,
+        "streamed wire is {streamed_len} bytes; expected the {blob_size}-byte blob plus ~0.4% \
+         proof nodes"
+    );
+    anyhow::ensure!(
+        streamed == exported,
+        "the two ADR 038 proof sources disagree on the wire: streamed local-outboard pull gave \
+         {} bytes, persisted-outboard export gave {} bytes",
+        streamed.len(),
+        exported.len()
+    );
+    Ok(())
+}
+
 /// The 0-byte blob (#1054) must yield NO items, not one empty item: `ChunkData`
 /// cannot carry an empty payload (#1088), so a zero-length item would be
 /// unsendable and the serve path must go straight to `StreamEnd`.
