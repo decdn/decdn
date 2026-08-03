@@ -1,6 +1,7 @@
 use decdn_incentive::voucher_domain;
 
 mod money;
+mod store;
 
 fn main() {
     // Spike: prove the decdn path dep resolves and a symbol is reachable.
