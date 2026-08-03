@@ -4,6 +4,7 @@ pub mod config;
 pub mod discovery;
 pub mod http;
 pub mod money;
+pub mod reclaim;
 pub mod state;
 pub mod store;
 pub mod topup_auth;

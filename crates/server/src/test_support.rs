@@ -80,6 +80,12 @@ impl Treasury for FakeTreasury {
         d.insert(channel_id, new);
         Ok(MicroUsdc(new))
     }
+
+    async fn reclaim_expired(&self, _channel_id: B256) -> anyhow::Result<bool> {
+        // The HTTP contract tests never exercise the reclaim sweep; keep
+        // this a harmless no-op so it never falsely reports a reclaim.
+        Ok(false)
+    }
 }
 
 /// Pass-through captcha whose verdict can be flipped after construction —
@@ -202,6 +208,8 @@ pub fn app_state_with_options(opts: FakeOptions) -> AppState {
         turnstile_sitekey: "sitekey".into(),
         data_dir,
         topup_max_skew_secs: 120,
+        channel_ttl_secs: 7 * 24 * 60 * 60,
+        reclaim_interval_secs: 3600,
     };
     AppState {
         store,

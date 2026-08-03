@@ -85,6 +85,13 @@ pub trait Treasury: Send + Sync {
         provider_addr: Address,
         target: MicroUsdc,
     ) -> anyhow::Result<MicroUsdc>;
+
+    /// Reclaim `channel_id`'s remaining deposit for the funder (`client`)
+    /// after the on-chain `expiresAt` has passed, via
+    /// `PaymentChannel.reclaimExpired`. Returns `Ok(true)` if the reclaim
+    /// transaction lands; `Ok(false)` if the channel is not yet expired
+    /// on-chain (the sweep should simply retry it on a later tick).
+    async fn reclaim_expired(&self, channel_id: B256) -> anyhow::Result<bool>;
 }
 
 /// The pieces `DecdnTreasury::connect` needs to build its wallet-filled
@@ -229,6 +236,41 @@ impl<P: Provider + Clone + 'static> Treasury for DecdnTreasury<P> {
         }
         self.read_deposit(channel_id).await
     }
+
+    /// `PaymentChannel.reclaimExpired` (`contracts/src/PaymentChannel.sol:835`,
+    /// bound at `decdn_incentive::payment_channel::PaymentChannel::reclaimExpired`):
+    /// refunds the funder's (`ch.client`) remaining deposit once
+    /// `block.timestamp >= ch.expiresAt` and the channel is still `Open`.
+    /// Callable by either channel party; the sponsor treasury is always
+    /// `ch.client` here (it is the funder on every channel it opens).
+    ///
+    /// The contract reverts with `ChannelNotExpired()` if called early and
+    /// `ChannelNotOpen()` if the channel already closed by another path
+    /// (e.g. a cooperative/dispute close raced the sweep). Both are
+    /// "nothing to reclaim right now" from this treasury's point of view, so
+    /// this simulates the call first via `eth_call` (no gas spent, no
+    /// nonce burned) and treats *any* simulated revert as `Ok(false)` — only
+    /// a failure after a successful simulation (e.g. the tx reverting despite
+    /// simulating clean, or an RPC error) is a real `Err`.
+    async fn reclaim_expired(&self, channel_id: B256) -> anyhow::Result<bool> {
+        if let Err(e) = self.contract.reclaimExpired(channel_id).call().await {
+            tracing::debug!("reclaimExpired({channel_id}) not yet claimable: {e}");
+            return Ok(false);
+        }
+        let receipt = self
+            .contract
+            .reclaimExpired(channel_id)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("submit reclaimExpired: {e}"))?
+            .get_receipt()
+            .await
+            .map_err(|e| anyhow::anyhow!("await reclaimExpired receipt: {e}"))?;
+        if !receipt.status() {
+            anyhow::bail!("reclaimExpired reverted for channel {channel_id}");
+        }
+        Ok(true)
+    }
 }
 
 #[cfg(test)]
@@ -260,6 +302,9 @@ mod tests {
                 *d = target.0;
             }
             Ok(MicroUsdc(*d))
+        }
+        async fn reclaim_expired(&self, _id: B256) -> anyhow::Result<bool> {
+            Ok(false)
         }
     }
 

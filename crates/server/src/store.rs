@@ -143,6 +143,43 @@ impl Store {
         Ok(Some(ChannelRecord::decode(raw.value())?))
     }
 
+    /// All persisted channel records, for the expiry-reclaim sweep
+    /// (`crate::reclaim`) to scan. Unordered — the sweep filters by
+    /// `opened_unix` itself.
+    pub fn iter_channels(&self) -> anyhow::Result<Vec<(B256, ChannelRecord)>> {
+        let r = self.db.begin_read()?;
+        let ch = r.open_table(CHANNELS)?;
+        let mut out = Vec::new();
+        for entry in ch.iter()? {
+            let (k, v) = entry?;
+            let id = B256::from(k.value());
+            let rec = ChannelRecord::decode(v.value())?;
+            out.push((id, rec));
+        }
+        Ok(out)
+    }
+
+    /// Remove a reclaimed channel from both the `channels` and
+    /// `client_index` tables. `client`/`node_id` must match the record's own
+    /// fields (the caller has just read them off the same record) so the
+    /// `client_index` entry removed is the one that actually points at `id`.
+    pub fn remove_channel(
+        &self,
+        id: B256,
+        client: Address,
+        node_id: [u8; 32],
+    ) -> anyhow::Result<()> {
+        let w = self.db.begin_write()?;
+        {
+            let mut ch = w.open_table(CHANNELS)?;
+            ch.remove(id.0)?;
+            let mut idx = w.open_table(CLIENT_INDEX)?;
+            idx.remove(client_node_key(client, node_id))?;
+        }
+        w.commit()?;
+        Ok(())
+    }
+
     pub fn cap_spent(&self, client: Address, bucket: u32) -> anyhow::Result<MicroUsdc> {
         let r = self.db.begin_read()?;
         let cap = r.open_table(CAP)?;
@@ -241,5 +278,30 @@ mod tests {
         // refund more than exists, should saturate at 0
         s.cap_refund(client, bucket, MicroUsdc(10_000_000)).unwrap();
         assert_eq!(s.cap_spent(client, bucket).unwrap(), MicroUsdc(0));
+    }
+
+    #[test]
+    fn iter_channels_then_remove_channel_drops_both_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(dir.path()).unwrap();
+        let client = address!("00000000000000000000000000000000000000aa");
+        let node_id = [7u8; 32];
+        let id = b256!("11111111111111111111111111111111111111111111111111111111111111ff");
+        let rec = ChannelRecord {
+            client,
+            provider: address!("00000000000000000000000000000000000000bb"),
+            node_id,
+            deposit_micro: 2_000_000,
+            opened_unix: 1_769_904_000,
+        };
+        s.insert_channel(id, &rec).unwrap();
+
+        let all = s.iter_channels().unwrap();
+        assert_eq!(all, vec![(id, rec)]);
+
+        s.remove_channel(id, client, node_id).unwrap();
+        assert_eq!(s.iter_channels().unwrap(), vec![]);
+        assert_eq!(s.get_by_client_node(client, node_id).unwrap(), None);
+        assert_eq!(s.get_by_channel(id).unwrap(), None);
     }
 }

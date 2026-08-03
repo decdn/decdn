@@ -32,6 +32,13 @@ pub struct ServerConfig {
     pub turnstile_sitekey: String,
     pub data_dir: PathBuf,
     pub topup_max_skew_secs: u64,
+    /// Local bookkeeping TTL the expiry-reclaim sweep (`crate::reclaim`)
+    /// uses to pick channels to attempt reclaiming: `opened_unix + ttl <=
+    /// now`. Distinct from (and expected to stay below) the on-chain
+    /// `PaymentChannel.Channel.expiresAt` the contract itself enforces.
+    pub channel_ttl_secs: u64,
+    /// How often `reclaim::run` sweeps the store for expired channels.
+    pub reclaim_interval_secs: u64,
 }
 
 impl ServerConfig {
@@ -54,6 +61,13 @@ impl ServerConfig {
                 std::env::var("SPONSOR_DATA_DIR").unwrap_or_else(|_| "./data".into()),
             ),
             topup_max_skew_secs: env_u64("SPONSOR_TOPUP_MAX_SKEW_SECS", 120)?,
+            // Default matches `MAX_CHANNEL_DURATION_FLOOR` (7 days) in
+            // `contracts/src/PaymentChannel.sol` — the shortest duration
+            // governance can configure a channel's on-chain expiry to, so
+            // the sweep never fires meaningfully ahead of the earliest a
+            // real channel could actually be expired.
+            channel_ttl_secs: env_u64("SPONSOR_CHANNEL_TTL_SECS", 7 * 24 * 60 * 60)?,
+            reclaim_interval_secs: env_u64("SPONSOR_RECLAIM_INTERVAL_SECS", 3600)?,
         })
     }
 
