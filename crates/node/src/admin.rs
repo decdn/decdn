@@ -860,10 +860,12 @@ fn build_channel_snapshots(
 /// conflicts fail fast rather than deep inside the runtime task graph.
 ///
 /// # Errors
-/// Returns an error if `TcpListener::bind` fails.
-pub async fn bind(addr: SocketAddr) -> anyhow::Result<TcpListener> {
-    let listener = TcpListener::bind(addr)
-        .await
+/// Returns an error if the underlying `crate::net::bind_reuseaddr` fails
+/// (socket creation, `bind`, or `listen`).
+pub fn bind(addr: SocketAddr) -> anyhow::Result<TcpListener> {
+    // `SO_REUSEADDR` so a restart rebinds this fixed port immediately instead of
+    // racing a `TIME_WAIT` remnant from the prior process (see `crate::net`).
+    let listener = crate::net::bind_reuseaddr(addr)
         .map_err(|e| anyhow::anyhow!("admin bind {addr} failed: {e}"))?;
     // Defense-in-depth for the unauthenticated admin RPC surface (#845),
     // mirroring `metrics::bind` (#579). `to_canonical()` unwraps IPv4-mapped
@@ -2345,7 +2347,7 @@ mod tests {
 
         // IPv4 loopback: warn-free.
         let v4_loopback = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-        let listener = bind(v4_loopback).await.unwrap();
+        let listener = bind(v4_loopback).unwrap();
         let bound = listener.local_addr().unwrap();
         assert!(
             bound.ip().is_loopback(),
@@ -2356,7 +2358,7 @@ mod tests {
         // IPv6 loopback `::1`: also warn-free. Some hosts disable IPv6; skip
         // rather than fail if the bind itself errors.
         let v6_loopback = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0);
-        if let Ok(listener) = bind(v6_loopback).await {
+        if let Ok(listener) = bind(v6_loopback) {
             let bound = listener.local_addr().unwrap();
             assert!(
                 bound.ip().is_loopback(),
@@ -2368,7 +2370,7 @@ mod tests {
         // regression that rejected unspecified would surface as a `bind`
         // error here.
         let unspecified = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
-        let listener = bind(unspecified).await.unwrap();
+        let listener = bind(unspecified).unwrap();
         let bound = listener.local_addr().unwrap();
         assert!(
             bound.ip().is_unspecified(),

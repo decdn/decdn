@@ -1477,9 +1477,8 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
         cfg.observability.metrics_bind,
         cfg.observability.metrics_port,
     );
-    let metrics_listener = metrics::bind(metrics_addr)
-        .await
-        .context("failed to bind metrics listener")?;
+    let metrics_listener =
+        metrics::bind(metrics_addr).context("failed to bind metrics listener")?;
 
     let (metrics_stop_tx, metrics_stop_rx) = oneshot::channel::<()>();
 
@@ -1796,11 +1795,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
     // `admin_v1_announce` method has somewhere to forward to.
     let admin_listener = if let Some(admin_port) = cfg.observability.admin_port {
         let admin_addr = std::net::SocketAddr::from(([127, 0, 0, 1], admin_port));
-        Some(
-            admin::bind(admin_addr)
-                .await
-                .context("failed to bind admin listener")?,
-        )
+        Some(admin::bind(admin_addr).context("failed to bind admin listener")?)
     } else {
         tracing::info!("admin server disabled (observability.admin_port = 0)");
         None

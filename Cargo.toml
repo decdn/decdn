@@ -235,6 +235,12 @@ hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 
+# Raw socket options for the loopback control-plane listeners (admin RPC +
+# metrics): `SO_REUSEADDR` so the daemon rebinds its fixed ports immediately
+# after a restart instead of failing on a `TIME_WAIT` remnant. Already in the
+# `decdn-node` tree via `hyper-util`, so this pins no new crate.
+socket2 = "0.6"
+
 # Admin JSON-RPC surface (ADR 025)
 jsonrpsee = { version = "0.26", features = ["server", "http-client", "macros"] }
 
