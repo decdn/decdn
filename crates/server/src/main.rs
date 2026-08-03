@@ -1,5 +1,7 @@
 use decdn_incentive::voucher_domain;
 
+mod money;
+
 fn main() {
     // Spike: prove the decdn path dep resolves and a symbol is reachable.
     let _ = voucher_domain as fn(u64, alloy::primitives::Address) -> _;
