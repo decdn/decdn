@@ -291,8 +291,8 @@ abstract contract GuardedBuybackBurner is BuybackBurner {
     // Views
     // -----------------------------------------------------------------
 
-    /// @notice USDC accumulated in this contract awaiting buyback (canonical
-    ///         `IBuybackBurner.getAccumulatedFees`, ADR 003).
+    /// @notice USDC accumulated in this contract awaiting buyback (the canonical
+    ///         `getAccumulatedFees` accessor, ADR 003).
     function getAccumulatedFees() external view returns (uint256) {
         return usdc.balanceOf(address(this));
     }
