@@ -67,12 +67,7 @@
     // `forged`/`forger`, `stream`/`stream_forger` etc.: the near-identical names
     // pair a forged artifact with the key that forged it, which reads clearer
     // than a contrived rename.
-    clippy::similar_names,
-    // The journey is deliberately one linear narrative (capture → negatives →
-    // positive → finality) sharing one anvil deployment; splitting it would either
-    // duplicate a ~60s deploy per stage or thread the whole world through helpers.
-    clippy::too_many_lines,
-    clippy::cognitive_complexity
+    clippy::similar_names
 )]
 
 use std::time::Duration;
@@ -114,6 +109,13 @@ async fn real_node_responses_are_valid_on_chain_evidence() -> anyhow::Result<()>
     Ok(())
 }
 
+#[allow(
+    clippy::cognitive_complexity,
+    clippy::too_many_lines,
+    reason = "sequential on-chain journey (capture → negatives → positive → finality) sharing one \
+              anvil deployment: splitting it would either duplicate a ~60s deploy per stage or \
+              thread the whole world through helpers without shortening the narrative"
+)]
 async fn run() -> anyhow::Result<()> {
     let _ = tracing_subscriber::fmt()
         .with_writer(std::io::stderr)

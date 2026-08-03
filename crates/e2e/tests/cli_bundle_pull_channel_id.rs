@@ -28,9 +28,7 @@
     clippy::expect_used,
     clippy::panic,
     clippy::indexing_slicing,
-    clippy::duration_suboptimal_units,
-    // One sequential on-chain journey reads more clearly unsplit.
-    clippy::too_many_lines
+    clippy::duration_suboptimal_units
 )]
 
 use std::sync::Arc;
@@ -61,6 +59,12 @@ async fn cli_bundle_pull_adopts_one_channel_for_the_whole_bundle() -> anyhow::Re
     Ok(())
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one sequential end-to-end journey: each step depends on the previous step's channel \
+              state, so decomposing it would thread state through helpers without reducing the \
+              journey's length or making it easier to follow"
+)]
 async fn run() -> anyhow::Result<()> {
     let _ = tracing_subscriber::fmt()
         .with_writer(std::io::stderr)

@@ -47,8 +47,6 @@
     clippy::expect_used,
     clippy::panic,
     clippy::indexing_slicing,
-    clippy::too_many_lines,
-    clippy::cognitive_complexity,
     // Second-scale timeouts read more clearly as `from_secs` than `from_mins`.
     clippy::duration_suboptimal_units
 )]
@@ -298,7 +296,12 @@ fn read_manifest(path: &Path) -> anyhow::Result<DeployedAddrs> {
 /// the given data/cache dirs, keystore, password file, and explicit listener
 /// ports. Mirrors the exhaustive fixture shape in `runtime`'s own tests and in
 /// `sighup_signal.rs`; only the chain/identity/port fields are load-bearing here.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "one flat resolved-config struct literal enumerating every field; the length is field \
+              breadth, not branching complexity, so splitting it would not aid readability"
+)]
 fn build_config(
     data_dir: PathBuf,
     cache_dir: PathBuf,
@@ -416,6 +419,12 @@ fn build_config(
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "single end-to-end bring-up/shutdown journey: each step depends on the previous step's \
+              runtime state, so decomposing it would thread state through helpers without reducing \
+              the journey's length or making it easier to follow"
+)]
 async fn anvil_bringup_shutdown_runtime_graceful_drain() -> anyhow::Result<()> {
     // Surface the runtime's own bring-up/teardown logs on failure. Those tasks
     // run on tokio worker threads under `multi_thread`, so write to process

@@ -62,9 +62,7 @@
     clippy::expect_used,
     clippy::panic,
     clippy::indexing_slicing,
-    clippy::duration_suboptimal_units,
-    clippy::too_many_lines,
-    clippy::cognitive_complexity
+    clippy::duration_suboptimal_units
 )]
 
 use std::time::Duration;
@@ -152,6 +150,13 @@ async fn ratified_rate_bounds_reach_a_live_daemon() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[allow(
+    clippy::cognitive_complexity,
+    clippy::too_many_lines,
+    reason = "sequential on-chain journey: each step depends on the previous step's chain state, \
+              so decomposing it would thread a state bundle through helpers without reducing the \
+              journey's length or making it easier to follow"
+)]
 async fn run() -> anyhow::Result<()> {
     let _ = tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
