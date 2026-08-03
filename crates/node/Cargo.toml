@@ -61,6 +61,7 @@ dirs = { workspace = true }
 rand = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
+socket2 = { workspace = true }
 http-body-util = { workspace = true }
 bytes = { workspace = true }
 indexmap = { workspace = true }
