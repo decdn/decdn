@@ -8,9 +8,10 @@
 //!     standard Kademlia self-lookup populates k-buckets with peers
 //!     close to the local id.
 //!
-//! Step 1 here reads from a [`StakerSet`] (`ConfigStakerSet` today,
-//! `ChainStakerSet` once the on-chain origin-directory follow-up lands;
-//! same trait, drop-in swap).
+//! Step 1 here reads from a [`StakerSet`]. The daemon supplies the
+//! chain-backed [`ChainStakerSet`](crate::dht::chain_staker_set::ChainStakerSet),
+//! projected from `CapacityBond`; `ConfigStakerSet` is the in-memory
+//! implementation of the same trait that tests seed directly.
 //!
 //! Step 2 runs in parallel against up to a small fan-out of the seed
 //! set, with a generous timeout. Failures are non-fatal — a node that

@@ -195,10 +195,10 @@ fn forward_progress_after_restart_is_accepted() -> anyhow::Result<()> {
 /// must both reach their expected terminal state — verifies the store does
 /// not cross-contaminate entries across channel ids. Same-channel
 /// concurrent acceptance is intentionally out of scope: ADR 003 requires
-/// callers to serialise per-channel writes (a future `cdn/client/v1`
-/// handler will hold a per-channel mutex, see `TODO(#317)` in
-/// `runtime/mod.rs`); this test only exercises the cross-channel
-/// independence the store itself must provide.
+/// callers to serialise per-channel writes, and the `cdn/client/v1` handler
+/// does so by holding a per-channel mutex around voucher application (see
+/// the `channels` map in `handlers/client/mod.rs`); this test only exercises
+/// the cross-channel independence the store itself must provide.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_vouchers_across_distinct_channels() -> anyhow::Result<()> {
     let dir = data_dir()?;
