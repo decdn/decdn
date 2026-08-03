@@ -27,7 +27,8 @@ All on-chain contracts inherit from [OpenZeppelin Contracts](https://docs.openze
 | BuybackBurner | [018](018-liquidity-strategy.md#adr-018-liquidity-strategy-balancer-8020-pol), [026](026-tokenomics.md#adr-026-tokenomics) | Yes | USDC, TOKEN (transient) | `AccessControl`, `ReentrancyGuard`, `Pausable` (Balancer V3 swap-and-burn path; receives 30% of every settlement) |
 | ContentBlacklist | [011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting) | No | — | `AccessControl`, `ReentrancyGuard` — not `Pausable`, because the unlawful-content-removal duty is permanent and must survive the pause sunset ([§ Emergency Multisig](#emergency-multisig-production)) (full surface: hash-level — global + regional — operator-level — `addOperator` / `removeOperator` — origin-level — `isOriginBlacklisted` / `setOriginBlacklist` — plus the enumeration views `getScopeRegions` / `blacklistedHashCount` / `blacklistedHashes` / `blacklistedAddressCount` / `blacklistedAddresses` that let the compliance layer rebuild blacklist state without replaying takedown events) |
 | PublisherRegistry | [002](002-content-addressing.md#adr-002-content-addressing) | No | — | `AccessControl` (no `ReentrancyGuard`: the contract makes no external calls and holds no funds, so a reentrancy guard would be dead weight — every function is pure storage bookkeeping) |
-| OriginAssignment | [011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting) | No | — | `AccessControl`, `ReentrancyGuard` |
+| OriginAssignment | [011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting) | No | — | `AccessControl`, `ReentrancyGuard` (delegates the vetting decision to a swappable `IVettingPolicy` set via `setVettingPolicy`; `addOrigin` reads `vettingPolicy.isVetted(msg.sender)`) |
+| ManualVettingPolicy | [011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting) | No | — | `AccessControl` (the genesis `IVettingPolicy`: a `VETTER_ROLE` holder approves publishers via `setVetted`; `VETTER_ROLE`'s admin is `GOVERNANCE_ROLE`, so governance moves *who* vets without a contract swap. Alternative policies — `TimelockedGovernanceVettingPolicy`, `OpenVettingPolicy` (testnet-only), or an attestation policy — implement the same one-function seam and are installed by `OriginAssignment.setVettingPolicy`. No `ReentrancyGuard`: pure storage bookkeeping, no external calls) |
 | SlashJudge | [014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence) | Yes | TOKEN (challenge bonds) | `AccessControl`, `ReentrancyGuard`, `Pausable`, `EIP712` |
 | DecdnGovernor | [009](009-governance.md#adr-009-governance-model), [036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight) | No | — | OZ `Governor` + `GovernorCountingSimple` + `GovernorTimelockControl` with a custom served-bytes vote source: reads `FeeRouter.bytesInWindow(operator, epoch(ts), windowEpochs)` and `FeeRouter.totalBytesInWindow(epoch(ts), windowEpochs)` for the bytes-weighted weight basis, and `CapacityBond.firstBondedAt(operator)` + `CapacityBond.slashedAtEpoch(operator)` for the tenure ramp and slash zero-out per [ADR 036 § Formula](036-served-bytes-voting-weight.md#formula). Vote weight is derived from FeeRouter epoch accounting, not per-account checkpoints, so OZ's `GovernorVotes` / `GovernorVotesQuorumFraction` are not used. Thin wrapper supplying fixed deCDN defaults: timestamp clock, 1-day voting delay, 7-day vote, 0.1% proposal threshold, 4% quorum, 5% per-operator voting cap (applied against bytes-weighted total). EIP-712 delegation per Governor Bravo (voting power delegable, bond non-delegable) per [ADR 026 § Governance](026-tokenomics.md#governance). |
 | TimelockController | [009](009-governance.md#adr-009-governance-model) | Yes (treasury custodian) | USDC | OZ `TimelockController` (no custom code; 48h delay; holds the 10% protocol-treasury bucket per [ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split) and is the `DEFAULT_ADMIN_ROLE` of every contract above) |
@@ -251,10 +252,11 @@ graph TD
     FR["7. FeeRouter"]
     SPC["8. PaymentChannel"]
     PR["9. PublisherRegistry"]
-    OA["10. OriginAssignment"]
-    CB["11. ContentBlacklist"]
-    SJ["12. SlashJudge"]
-    GOV["13. DecdnGovernor"]
+    MVP["10. ManualVettingPolicy"]
+    OA["11. OriginAssignment"]
+    CB["12. ContentBlacklist"]
+    SJ["13. SlashJudge"]
+    GOV["14. DecdnGovernor"]
 
     CBOND --> TOKEN
     SA --> TOKEN
@@ -270,6 +272,7 @@ graph TD
     OA --> CBOND
     OA --> PR
     OA --> CB
+    OA --> MVP
     CB --> CBOND
     SJ --> CBOND
     SJ --> TOKEN
@@ -292,13 +295,15 @@ graph TD
 | 7 | FeeRouter | USDC address, **`TimelockController` address** (treasury bucket destination), `epochLength` (1 week; the canonical served-bytes voting-weight clock per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight)), launch split shares per [ADR 026 § Governable parameters with safety bounds](026-tokenomics.md#governable-parameters-with-safety-bounds) (cross-validated against dependency addresses). **Dependency address** (`buybackBurner`) may be `address(0)` at deploy and set later via the governance-mutable setter in [§ Tunable Economics](#tunable-economics); the cross-validation invariant ensures any non-zero share has a non-zero destination at construction time. Steady-state target shares are `6000 / 3000 / 1000` in basis points. |
 | 8 | PaymentChannel | USDC address, CapacityBond address, FeeRouter address, `disputeWindow` (48h), `maxChannelDuration` (90 days), `deliveryFloor` ([ADR 003](003-payments.md#adr-003-payment-model)). `settleChannel` does not skim a protocol fee inline — it transfers the full operator USDC balance to `FeeRouter.routeSettlement(operator, bytesDelivered, amount)` in the same transaction. `setFeeRouter(address)` is governance-mutable per [§ No proxy deployment patterns](#no-proxy-deployment-patterns) carve-out. |
 | 9 | PublisherRegistry | None. Permissionless namespace creation (publisher identity is implicit on first call); namespace cap and ownership-transfer timelock are stored on `PublisherRegistry` itself and updated via governable setters (`setMaxNamespacesPerPublisher`, `setNamespaceTransferTimelock`) per [ADR 002 § Contract: PublisherRegistry](002-content-addressing.md#contract-publisherregistry). |
-| 10 | OriginAssignment | CapacityBond, PublisherRegistry, ContentBlacklist (latter may be zero at deploy; bound via `setContentBlacklist`). The per-namespace origin cap and the publisher-vetting timelock are governance-controlled. See [ADR 011 § Origin Assignment Authority](011-content-takedown.md#origin-assignment-authority) and [§ OriginAssignment construction notes](#originassignment-construction-notes) below. |
-| 11 | ContentBlacklist | `ContentBlacklist(address capacityBond)`. CapacityBond address is required for `ejectNode()`. `ContentBlacklist` does not cross-call `OriginAssignment`; security relies on runtime checks (see [ADR 011 § Interaction with ContentBlacklist](011-content-takedown.md#interaction-with-contentblacklist)). After deployment, `OriginAssignment.setContentBlacklist(address)` is called once via the deployer / admin to wire the read direction (`OriginAssignment.pruneBlacklistedOrigin` and the `addOrigin` blacklist guard query `ContentBlacklist.isOriginBlacklisted`). |
-| 12 | SlashJudge | CapacityBond address, TOKEN address, ContentBlacklist address (read source for blacklist challenges), `challengeBond` (100 TOKEN, bounded `[1, 1000]e18`), `maxEvidenceAgeUs` (5 days in µs, bounded `[1d, 30d]`), admin address (`DEFAULT_ADMIN_ROLE` + `GOVERNANCE_ROLE`). All four addresses are rejected as zero. The constructor additionally enforces `maxEvidenceAgeUs < CapacityBond.unbondingPeriod × 1e6` (the registry stores seconds; evidence age is microseconds) — see [ADR 014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence). There is no counter-evidence window: a passing reveal slashes synchronously per [ADR 014 § Bond Handling](014-on-chain-verification.md#bond-handling). Deploy after ContentBlacklist (row 11); the reverse binding is wired post-deploy via `CapacityBond.setSlashJudge`. |
-| 13 | DecdnGovernor | OZ Governor wrapper composing `Governor` + `GovernorCountingSimple` + `GovernorTimelockControl`, with a custom served-bytes vote source per [ADR 036 § Formula](036-served-bytes-voting-weight.md#formula) (`_getVotes` → `FeeRouter.bytesInWindow / totalBytesInWindow` capped, multiplied by `age_ramp(CapacityBond.firstBondedAt)`, zeroed if `CapacityBond.slashedAtEpoch` falls inside the window; `quorum` / `proposalThreshold` → `FeeRouter.totalBytesInWindow`). Constructor wires `FeeRouter` (bytes vote source, non-zero) + `CapacityBond` (tenure-ramp + slash-zero-out source, non-zero) + `TimelockController` (execution target) + the fixed [ADR 009](009-governance.md#adr-009-governance-model) defaults (timestamp clock, 1-day delay, 7-day vote, 0.1% proposal threshold, 4% quorum, 5% per-operator voting cap applied against bytes-weighted total). EIP-712 delegation per Governor Bravo. After deployment, `TimelockController.grantRole(PROPOSER_ROLE, address(decdnGovernor))` (and `CANCELLER_ROLE`); execution is open (`executors == [address(0)]`, step 3). A deploy that opts into the [ADR 009 § Bootstrap-multisig phase](009-governance.md#bootstrap-multisig-phase) grants those two roles to the bootstrap multisig instead and leaves the Governor with neither, so it is deployed and vote-wired but cannot propose until the transition batch moves both roles to it. The Governor's constructor arguments are identical in both cases. |
+| 10 | ManualVettingPolicy | `ManualVettingPolicy(address admin, address initialVetter)`. The genesis `IVettingPolicy`. `admin` holds `DEFAULT_ADMIN_ROLE` + `GOVERNANCE_ROLE` (handed to the Timelock like every target); `initialVetter` (may be `address(0)`) is seeded with `VETTER_ROLE`, whose admin is `GOVERNANCE_ROLE`. No other dependencies. Deployed just before `OriginAssignment`, which takes it as a constructor argument. See [ADR 011 § Vetting policies](011-content-takedown.md#vetting-policies). |
+| 11 | OriginAssignment | CapacityBond, PublisherRegistry, ContentBlacklist (latter may be zero at deploy; bound via `setContentBlacklist`), and the vetting policy (`ManualVettingPolicy` at genesis; non-zero, swappable via `setVettingPolicy`). The per-namespace origin cap is governance-controlled; the vetting timelock, when a timelocked policy is installed, is a parameter of that policy. See [ADR 011 § Origin Assignment Authority](011-content-takedown.md#origin-assignment-authority) and [§ OriginAssignment construction notes](#originassignment-construction-notes) below. |
+| 12 | ContentBlacklist | `ContentBlacklist(address capacityBond)`. CapacityBond address is required for `ejectNode()`. `ContentBlacklist` does not cross-call `OriginAssignment`; security relies on runtime checks (see [ADR 011 § Interaction with ContentBlacklist](011-content-takedown.md#interaction-with-contentblacklist)). After deployment, `OriginAssignment.setContentBlacklist(address)` is called once via the deployer / admin to wire the read direction (`OriginAssignment.pruneBlacklistedOrigin` and the `addOrigin` blacklist guard query `ContentBlacklist.isOriginBlacklisted`). |
+| 13 | SlashJudge | CapacityBond address, TOKEN address, ContentBlacklist address (read source for blacklist challenges), `challengeBond` (100 TOKEN, bounded `[1, 1000]e18`), `maxEvidenceAgeUs` (5 days in µs, bounded `[1d, 30d]`), admin address (`DEFAULT_ADMIN_ROLE` + `GOVERNANCE_ROLE`). All four addresses are rejected as zero. The constructor additionally enforces `maxEvidenceAgeUs < CapacityBond.unbondingPeriod × 1e6` (the registry stores seconds; evidence age is microseconds) — see [ADR 014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence). There is no counter-evidence window: a passing reveal slashes synchronously per [ADR 014 § Bond Handling](014-on-chain-verification.md#bond-handling). Deploy after ContentBlacklist (row 12); the reverse binding is wired post-deploy via `CapacityBond.setSlashJudge`. |
+| 14 | DecdnGovernor | OZ Governor wrapper composing `Governor` + `GovernorCountingSimple` + `GovernorTimelockControl`, with a custom served-bytes vote source per [ADR 036 § Formula](036-served-bytes-voting-weight.md#formula) (`_getVotes` → `FeeRouter.bytesInWindow / totalBytesInWindow` capped, multiplied by `age_ramp(CapacityBond.firstBondedAt)`, zeroed if `CapacityBond.slashedAtEpoch` falls inside the window; `quorum` / `proposalThreshold` → `FeeRouter.totalBytesInWindow`). Constructor wires `FeeRouter` (bytes vote source, non-zero) + `CapacityBond` (tenure-ramp + slash-zero-out source, non-zero) + `TimelockController` (execution target) + the fixed [ADR 009](009-governance.md#adr-009-governance-model) defaults (timestamp clock, 1-day delay, 7-day vote, 0.1% proposal threshold, 4% quorum, 5% per-operator voting cap applied against bytes-weighted total). EIP-712 delegation per Governor Bravo. After deployment, `TimelockController.grantRole(PROPOSER_ROLE, address(decdnGovernor))` (and `CANCELLER_ROLE`); execution is open (`executors == [address(0)]`, step 3). A deploy that opts into the [ADR 009 § Bootstrap-multisig phase](009-governance.md#bootstrap-multisig-phase) grants those two roles to the bootstrap multisig instead and leaves the Governor with neither, so it is deployed and vote-wired but cannot propose until the transition batch moves both roles to it. The Governor's constructor arguments are identical in both cases. |
 
 #### OriginAssignment construction notes
 
+- **Vetting policy binding.** `OriginAssignment` takes the vetting policy as a constructor argument and rejects `address(0)` — a concrete policy exists from genesis, with no permissive bootstrap window. The genesis policy is `ManualVettingPolicy` (deployed at step 10). Governance re-points it later with `setVettingPolicy` (see [ADR 011 § Vetting policies](011-content-takedown.md#vetting-policies)); the binding is a helper-address re-point, not a domain-separator input, so it carries the standard 48h timelock like the `contentBlacklist` binding.
 - **Namespace 0.** `namespaceId == 0` has no authorized origins: no set is seated for it, `getOrigins(0)` is empty, and `isAuthorizedOrigin(0, op)` is always false.
 - **ContentBlacklist binding.** Until `setContentBlacklist(address)` is called post-deploy (see [§ Post-Deployment Initialization](#post-deployment-initialization) below), `pruneBlacklistedOrigin` reverts — it cannot read `isOriginBlacklisted` against the zero address, and `addOrigin` skips its blacklist guard and validates against `CapacityBond.isActive` alone. This does not block usage: off-chain consumers of `getOrigins(...)` cross-reference `ContentBlacklist.isOriginBlacklisted` directly via RPC.
 
@@ -380,6 +385,7 @@ graph LR
     CB["ContentBlacklist"]
     PR["PublisherRegistry"]
     OA["OriginAssignment"]
+    MVP["ManualVettingPolicy"]
     SJ["SlashJudge"]
     BB["BuybackBurner"]
     FR["FeeRouter"]
@@ -400,9 +406,11 @@ graph LR
     GOV -->|"setShares / setBuybackBurner / setTreasury / setWindowEpochs"| FR
     CB -->|"ejectNode / unEjectNode(operatorAddress)"| CBOND
     OA -->|"isActive(operator)"| CBOND
-    OA -->|"ownerOf(namespaceId) / namespaceCount(publisher)"| PR
+    OA -->|"ownerOf(namespaceId)"| PR
     OA -->|"isOriginBlacklisted(operator)"| CB
-    GOV -->|"grantVetting / setPublisherVetted(publisher)"| OA
+    OA -->|"isVetted(publisher)"| MVP
+    GOV -->|"setVettingPolicy / removeOrigin / setMaxOriginsPerNamespace"| OA
+    GOV -->|"grantRole(VETTER_ROLE, vetter)"| MVP
     SJ -->|"slash(node, offenseType, evidenceHash)"| CBOND
     SJ -->|"safeTransferFrom / safeTransfer"| ERC
     CBOND -->|"safeTransferFrom / safeTransfer"| ERC
@@ -429,9 +437,13 @@ graph LR
 | Emergency multisig | SlashAppeal | `fastTrackAppeal(slashId)`, `rejectAppeal(slashId)` | `EMERGENCY_MULTISIG_ROLE` on SlashAppeal | Yes |
 | ContentBlacklist | CapacityBond | `ejectNode(operatorAddress)` (on `addOperator`; sets the permanent `blacklistEjected` latch), `unEjectNode(operatorAddress)` (on `removeOperator`; clears the latch — re-entry then follows the normal re-bond path per [ADR 011 § Hash Evasion and Origin Blacklisting](011-content-takedown.md#hash-evasion-and-origin-blacklisting)) | `BLACKLIST_ROLE` | Yes |
 | OriginAssignment | CapacityBond | `isActive(operator)` | Public (read-only) | No |
-| OriginAssignment | PublisherRegistry | `ownerOf(namespaceId)`, `namespaceCount(publisher)` | Public (read-only) | No |
+| OriginAssignment | PublisherRegistry | `ownerOf(namespaceId)` | Public (read-only) | No |
 | OriginAssignment | ContentBlacklist | `isOriginBlacklisted(operator)`, `isOperatorBlacklisted(operator)` | Public (read-only) | No |
-| Governor | OriginAssignment | `grantVetting(publisher)`, `setPublisherVetted(publisher, vetted)`, `removeOrigin(namespaceId, operator)`, `setMaxOriginsPerNamespace(cap)`, `setVettingTimelock(seconds)`, `setContentBlacklist(address)` | `GOVERNANCE_ROLE` on OriginAssignment | Yes |
+| OriginAssignment | vetting policy | `isVetted(publisher)` (the installed `IVettingPolicy`; `addOrigin` gate + `isVettedPublisher` passthrough) | Public (read-only) | No |
+| Governor | OriginAssignment | `setVettingPolicy(policy)`, `removeOrigin(namespaceId, operator)`, `setMaxOriginsPerNamespace(cap)`, `setContentBlacklist(address)` | `GOVERNANCE_ROLE` on OriginAssignment | Yes |
+| Governor | ManualVettingPolicy | `grantRole(VETTER_ROLE, account)` / `revokeRole(...)` — moves who may vet, no contract swap | `GOVERNANCE_ROLE` admins `VETTER_ROLE` | Yes |
+| VETTER_ROLE holder | ManualVettingPolicy | `setVetted(publisher, vetted)` — approve or un-vet a publisher | `VETTER_ROLE` | Yes |
+| ManualVettingPolicy | PublisherRegistry | — (none; the manual policy reads nothing. A `TimelockedGovernanceVettingPolicy`, if installed, reads `namespaceCount(publisher)` in `requestVetting`) | Public (read-only) | No |
 | SlashJudge | CapacityBond | `slash(node, challenger, offenseType, evidenceHash)` — `SlashJudge` forwards the `SlashJudge`-side evidence digest as `evidenceHash`, which `CapacityBond` persists on the `SlashRecord` alongside `offenseType` | `SLASH_ROLE` | Yes |
 | SlashJudge | IERC20 (TOKEN) | `safeTransferFrom()` / `safeTransfer()` | Caller must have allowance/balance | Yes |
 | CapacityBond | IERC20 (TOKEN) | `safeTransferFrom()` / `safeTransfer()` (escrow refund to operator on a granted appeal, or challenger 50% leg at finality; remaining burn leg via `token.burn`) | Caller must have allowance/balance | Yes |
@@ -568,7 +580,9 @@ New top-level contracts integrate with the launch-time set via standard `AccessC
 | --- | --- | --- | --- | --- |
 | `DEFAULT_ADMIN_ROLE` | All contracts | Grant/revoke roles, set parameters | Deployer EOA | `TimelockController` (2-day delay) |
 | `BLACKLIST_ROLE` | CapacityBond | `ejectNode()`, `unEjectNode()` | ContentBlacklist contract | ContentBlacklist contract |
-| `GOVERNANCE_ROLE` | OriginAssignment | `grantVetting()`, `setPublisherVetted()`, `removeOrigin()`, `setMaxOriginsPerNamespace()`, `setVettingTimelock()` | Admin | Governor via timelock |
+| `GOVERNANCE_ROLE` | OriginAssignment | `setVettingPolicy()`, `removeOrigin()`, `setMaxOriginsPerNamespace()`, `setContentBlacklist()` | Admin | Governor via timelock |
+| `GOVERNANCE_ROLE` | ManualVettingPolicy | admin of `VETTER_ROLE` (`grantRole` / `revokeRole` — decides who vets) | Admin | Governor via timelock |
+| `VETTER_ROLE` | ManualVettingPolicy | `setVetted(publisher, bool)` | `initialVetter` (may be unset) | Operator EOA / multisig / Safe / Governor, as governance appoints |
 | `SLASH_ROLE` | CapacityBond | `slash()` | SlashJudge contract | SlashJudge contract |
 | `SLASH_APPEAL_ROLE` | CapacityBond | `markAppealOpen(slashId)`, `settleAppealUpheld(slashId)`, `settleAppealGranted(slashId)` — the escrow-on-slash settle hooks; `settleAppealGranted` also clears `slashedAtEpoch`, restoring served-bytes voting weight per [ADR 036 § Slashing zero-out](036-served-bytes-voting-weight.md#slashing-zero-out) | SlashAppeal | SlashAppeal; granted post-deploy. Per [ADR 028 § Contract surface](028-slashing-appeals.md#contract-surface) |
 | `EMERGENCY_MULTISIG_ROLE` | SlashAppeal | `fastTrackAppeal(slashId)`, `rejectAppeal(slashId)` | Emergency multisig | 3-of-5 multisig ([ADR 009 § Emergency Multisig](009-governance.md#emergency-multisig)) |
@@ -692,15 +706,14 @@ No external calls; no funds held. The contract therefore inherits no `Reentrancy
 
 | Function | External Calls | Guards |
 | --- | --- | --- |
-| `requestVetting()` | `PublisherRegistry.namespaceCount(caller)` (read) | Caller must own at least one namespace, must not already be vetted, and must have no request pending; the request ripens after `vettingTimelock` |
-| `cancelVettingRequest()` | None (state change only) | Caller must have a pending request |
-| `grantVetting(publisher)` | None (state change only) | `GOVERNANCE_ROLE`; a request must be pending and its timelock elapsed |
-| `setPublisherVetted(publisher, bool)` | None (state change only) | `GOVERNANCE_ROLE`; instant grant or un-vet, rejects the zero address, clears any pending request either way |
-| `addOrigin(namespaceId, operator)` | `PublisherRegistry.ownerOf(namespaceId)` (read), `CapacityBond.isActive(operator)` (read), `ContentBlacklist.isOriginBlacklisted(operator)` **and** `isOperatorBlacklisted(operator)` (reads — the guard is the union) | Caller must own the namespace AND be a vetted publisher; the operator must be active, not blacklisted, not already seated, and fit under `maxOriginsPerNamespace`. Validation covers only the operator being added |
+| `addOrigin(namespaceId, operator)` | `vettingPolicy.isVetted(caller)` (read), `PublisherRegistry.ownerOf(namespaceId)` (read), `CapacityBond.isActive(operator)` (read), `ContentBlacklist.isOriginBlacklisted(operator)` **and** `isOperatorBlacklisted(operator)` (reads — the guard is the union) | Caller must own the namespace AND be vetted by the installed policy; the operator must be active, not blacklisted, not already seated, and fit under `maxOriginsPerNamespace`. Validation covers only the operator being added |
 | `removeOrigin(namespaceId, operator)` | `PublisherRegistry.ownerOf(namespaceId)` (read, non-governance callers only) | Either `GOVERNANCE_ROLE` or namespace owner; removal may drop the active set to zero — the namespace simply re-enters the unassigned state |
 | `pruneBlacklistedOrigin(namespaceId, operator)` | `ContentBlacklist.isOriginBlacklisted(operator)` **and** `isOperatorBlacklisted(operator)` (reads — the guard is the union) | Permissionless; reverts if operator is blacklisted through neither mapping |
-| `setMaxOriginsPerNamespace(uint256)`, `setVettingTimelock(uint256)` | None (state change only) | `GOVERNANCE_ROLE`; safety bounds enforced ([ADR 009](009-governance.md#adr-009-governance-model)) |
-| `isAuthorizedOrigin()`, `getOrigins()`, `isVettedPublisher()`, `getPendingVetting()`, `assignedNamespaceCount()`, `assignedNamespaces()` | None (read-only) | N/A |
+| `setVettingPolicy(policy)` | None (state change only) | `GOVERNANCE_ROLE`; rejects the zero address (a concrete policy is always installed) |
+| `setMaxOriginsPerNamespace(uint256)` | None (state change only) | `GOVERNANCE_ROLE`; safety bounds enforced ([ADR 009](009-governance.md#adr-009-governance-model)) |
+| `isAuthorizedOrigin()`, `getOrigins()`, `isVettedPublisher()` (passthrough to the policy), `vettingPolicy()`, `assignedNamespaceCount()`, `assignedNamespaces()` | `isVettedPublisher` reads `vettingPolicy.isVetted`; the rest are local reads | N/A |
+
+The vetting request/grant lifecycle is a property of the installed policy, not `OriginAssignment` — see [ADR 011 § Vetting policies](011-content-takedown.md#vetting-policies) for the `ManualVettingPolicy` / `TimelockedGovernanceVettingPolicy` surfaces.
 
 The contract holds no funds. It maintains an `EnumerableSet` of currently-authorized operators per registered namespace (`namespaceId != 0`). Off-chain consumers of `getOrigins(namespaceId)` cross-reference each returned operator against `ContentBlacklist.isOriginBlacklisted` and treat blacklisted entries as unauthorized regardless of stale `OriginAssignment` state, so storage cleanup via `pruneBlacklistedOrigin` is a lazy optimisation rather than a security primitive. Consumers and the contract both evaluate the union of `isOriginBlacklisted` and `isOperatorBlacklisted`, since an operator can be ejected through either mapping alone.
 
@@ -714,7 +727,7 @@ Every deCDN contract should inherit from audited OpenZeppelin base contracts rat
 
 | OZ Contract | Used By | Purpose |
 | --- | --- | --- |
-| `AccessControl` | CapacityBond, PaymentChannel, FeeRouter, SlashAppeal, SlashJudge, BuybackBurner, ContentBlacklist, OriginAssignment, PublisherRegistry | Role-based function authorization. Every contract other than TOKEN and DecdnGovernor uses it; there is no owner-key surface anywhere in the system — `DEFAULT_ADMIN_ROLE` is the single admin handle and is held by `TimelockController` after deployment |
+| `AccessControl` | CapacityBond, PaymentChannel, FeeRouter, SlashAppeal, SlashJudge, BuybackBurner, ContentBlacklist, OriginAssignment, ManualVettingPolicy, PublisherRegistry | Role-based function authorization. Every contract other than TOKEN and DecdnGovernor uses it; there is no owner-key surface anywhere in the system — `DEFAULT_ADMIN_ROLE` is the single admin handle and is held by `TimelockController` after deployment |
 | `ReentrancyGuard` | Every `AccessControl` contract except PublisherRegistry | `nonReentrant` modifier on state-mutating functions with external calls. PublisherRegistry omits it: pure storage bookkeeping with no external calls and no funds |
 | `Pausable` (via the shared `SunsettingPausable` base) | CapacityBond, PaymentChannel, FeeRouter, SlashAppeal, SlashJudge, BuybackBurner | Emergency pause capability, gated by `PAUSER_ROLE` and expiring at each contract's immutable `pauseDeadline` per [§ Emergency Multisig](#emergency-multisig-production). ContentBlacklist is deliberately not pausable — its unlawful-content-removal duty is permanent |
 | `SafeERC20` | All contracts interacting with ERC-20 tokens | Safe wrappers for `transfer`, `transferFrom`, `approve` |
