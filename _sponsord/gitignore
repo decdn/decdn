@@ -1,0 +1,4 @@
+/target
+.superpowers/
+*.env
+.env
