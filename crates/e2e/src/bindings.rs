@@ -165,23 +165,19 @@ alloy::sol! {
         error NotPendingOwner(uint256 namespaceId, address caller);
     }
 
-    /// `OriginAssignment` publisher vetting (governance) + origin seating
-    /// (publisher) + reads (ADR 011). The two planes: governance vets the
-    /// publisher WALLET once — either the slow `requestVetting` → timelock →
-    /// `grantVetting` path or the instant `setPublisherVetted` override, both
-    /// `GOVERNANCE_ROLE` on the grant side and driven under role impersonation by
-    /// the `ChainFixture` helpers — after which the publisher seats and unseats
-    /// origins itself with no wait.
+    /// `OriginAssignment` origin seating (publisher) + reads (ADR 011). Whether a
+    /// publisher wallet may seat origins is decided by a swappable
+    /// `IVettingPolicy` (see [`ManualVettingPolicy`], the genesis default);
+    /// `vettingPolicy` is the installed address and `setVettingPolicy` re-points
+    /// it under `GOVERNANCE_ROLE`. A vetted publisher seats and unseats origins
+    /// itself with no wait.
     #[sol(rpc)]
     contract OriginAssignment {
-        function vettingTimelock() external view returns (uint256);
-        function requestVetting() external;
-        function grantVetting(address publisher) external;
-        function setPublisherVetted(address publisher, bool vetted) external;
+        // The installed vetting policy, and the governance setter that swaps it.
+        function vettingPolicy() external view returns (address);
+        function setVettingPolicy(address newPolicy) external;
+        // Passthrough to `vettingPolicy().isVetted(publisher)`.
         function isVettedPublisher(address publisher) external view returns (bool);
-        // Unix time a pending vetting request ripens; 0 means none is pending —
-        // the state `decdn publish request-vetting` leaves behind.
-        function getPendingVetting(address publisher) external view returns (uint256);
         // A vetted namespace owner seats one origin. Instant: `getOrigins`
         // reflects it in the same transaction.
         function addOrigin(uint256 namespaceId, address operator) external;
@@ -190,6 +186,21 @@ alloy::sol! {
         function removeOrigin(uint256 namespaceId, address operator) external;
         function getOrigins(uint256 namespaceId) external view returns (address[] memory);
         function isAuthorizedOrigin(uint256 namespaceId, address operator) external view returns (bool);
+    }
+
+    /// `ManualVettingPolicy` — the genesis vetting policy (ADR 011). A
+    /// `VETTER_ROLE` holder approves publishers via `setVetted`; `GOVERNANCE_ROLE`
+    /// admins `VETTER_ROLE` (the Timelock post-handoff). The `ChainFixture` vets a
+    /// publisher by impersonating the Timelock to grant itself `VETTER_ROLE` and
+    /// then calling `setVetted`. `requestVetting` reverts `VettingRequestUnsupported`
+    /// (vetting is not self-service under this policy).
+    #[sol(rpc)]
+    contract ManualVettingPolicy {
+        function VETTER_ROLE() external view returns (bytes32);
+        function grantRole(bytes32 role, address account) external;
+        function setVetted(address publisher, bool vetted) external;
+        function isVetted(address publisher) external view returns (bool);
+        function requestVetting() external;
     }
 
     /// `SlashJudge.submitBlacklistChallenge` — the blacklist-violation slash

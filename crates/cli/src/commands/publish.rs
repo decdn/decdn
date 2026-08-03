@@ -1,9 +1,12 @@
 //! `decdn publish` — origin-publisher control plane (issues #1029 / #1491).
 //!
 //! Submits the `PublisherRegistry` / `OriginAssignment` writes that create
-//! namespaces, ask governance to vet the publisher wallet, and then seat or
-//! unseat that publisher's authorized origins. Vetting is the only step that
-//! waits on governance; once it lands, `assign` and `revoke` take effect in the
+//! namespaces, ask the installed vetting policy to vet the publisher wallet, and
+//! then seat or unseat that publisher's authorized origins. `request-vetting`
+//! targets whatever `IVettingPolicy` `OriginAssignment` currently points at, so
+//! its outcome depends on that policy (a timelocked policy queues a request; the
+//! genesis manual policy has no self-service path and reverts with a reason).
+//! Once the wallet is vetted, `assign` and `revoke` take effect in the
 //! transaction that carries them (ADR 011 § Origin Assignment Authority).
 //! Content is bound to a namespace off-chain by the requester at fetch time
 //! (ADR 002 § Hash-to-namespace association), so there is no per-hash on-chain
@@ -23,7 +26,7 @@ use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types::SolEvent;
 use anyhow::Context;
 use decdn_common::cli;
-use decdn_incentive::origin_assignment::OriginAssignment;
+use decdn_incentive::origin_assignment::{OriginAssignment, VettingRequestable};
 use decdn_incentive::publisher_registry::PublisherRegistry;
 
 use crate::commands::chain_ctx;
@@ -329,31 +332,43 @@ async fn request_vetting(
     if !outcome.dry_run {
         let (signer, provider) = signer_and_provider(&resolved, &args.chain).await?;
         outcome.operator = Some(signer.address());
-        let contract = OriginAssignment::new(oa_addr, &provider);
+        // `request-vetting` is policy-agnostic: it asks the installed vetting
+        // policy, not `OriginAssignment` itself. Read the policy address, then
+        // call `requestVetting()` there. A timelocked policy queues a request and
+        // emits `VettingRequested`; a manual policy reverts
+        // `VettingRequestUnsupported` with a reason; a no-gate policy no-ops.
+        let policy_addr = OriginAssignment::new(oa_addr, &provider)
+            .vettingPolicy()
+            .call()
+            .await
+            .context("read OriginAssignment.vettingPolicy")?;
+        let policy = VettingRequestable::new(policy_addr, &provider);
         let sent = decdn_incentive::tx::send_for_receipt(
-            contract.requestVetting(),
+            policy.requestVetting(),
             "requestVetting",
             Some(
-                "the signer must own at least one namespace (run `decdn publish namespace \
-                 create` first), must not already be vetted, and must not already have a \
-                 request pending",
+                "the installed vetting policy rejected the request — see the revert reason \
+                 above (a manual policy grants vetting through a VETTER_ROLE holder, not \
+                 self-service; a timelocked policy needs the signer to own a namespace and \
+                 have no request already pending)",
             ),
             &mut outcome.tx,
         )
         .await;
 
         match sent {
-            // Surface the timelock deadline (`readyAt`), matching the honest
-            // decode in `namespace_create`: match by signature, then decode.
-            // Every failure here happens AFTER the request is queued on-chain,
-            // so it must not short-circuit the receipt — the tx hash is the only
-            // handle the publisher has on a request that now blocks re-running
-            // this command (`VettingRequestPending`).
+            // Surface the timelock deadline (`readyAt`) when the policy emits one.
+            // A policy without a timelock (e.g. a no-gate policy) succeeds with no
+            // `VettingRequested` log — that is not an error. Every failure here
+            // happens AFTER the request is queued on-chain, so it must not
+            // short-circuit the receipt — the tx hash is the only handle the
+            // publisher has on a request that now blocks re-running this command.
             Ok(receipt) => {
                 landed = true;
-                deadline = decode_vetting_deadline(&receipt);
-                if let Ok(ready_at) = deadline {
-                    outcome.ready_at = Some(ready_at);
+                match decode_vetting_deadline(&receipt) {
+                    Ok(Some(ready_at)) => outcome.ready_at = Some(ready_at),
+                    Ok(None) => {}
+                    Err(err) => deadline = Err(err),
                 }
             }
             Err(err) => {
@@ -409,25 +424,28 @@ const fn vetting_failure_context(landed: bool, in_flight: bool) -> Option<&'stat
     }
 }
 
-/// Pull `readyAt` out of a confirmed `requestVetting` receipt. Split out so the
-/// caller can print its receipt before propagating any of these failures, all of
-/// which happen after the transaction has already taken effect.
-fn decode_vetting_deadline(receipt: &alloy::rpc::types::TransactionReceipt) -> anyhow::Result<u64> {
-    let requested = receipt
-        .inner
-        .logs()
-        .iter()
-        .find(|log| log.topic0() == Some(&OriginAssignment::VettingRequested::SIGNATURE_HASH))
+/// Pull `readyAt` out of a confirmed `requestVetting` receipt, or `None` when the
+/// installed policy emits no `VettingRequested` (it has no timelock — e.g. a
+/// no-gate policy no-ops). Split out so the caller can print its receipt before
+/// propagating a decode failure, which happens after the tx has taken effect.
+fn decode_vetting_deadline(
+    receipt: &alloy::rpc::types::TransactionReceipt,
+) -> anyhow::Result<Option<u64>> {
+    let Some(log) =
+        receipt.inner.logs().iter().find(|log| {
+            log.topic0() == Some(&VettingRequestable::VettingRequested::SIGNATURE_HASH)
+        })
+    else {
+        return Ok(None);
+    };
+    let requested = log
+        .log_decode::<VettingRequestable::VettingRequested>()
         .context(
-            "requestVetting succeeded but its receipt carried no VettingRequested log (the \
-             timelock deadline could not be recovered; check the tx on a block explorer)",
-        )?
-        .log_decode::<OriginAssignment::VettingRequested>()
-        .context(
-            "requestVetting emitted a VettingRequested log that failed to decode (ABI \
-             mismatch between this CLI and the deployed OriginAssignment?)",
+            "requestVetting emitted a VettingRequested log that failed to decode (ABI mismatch \
+         between this CLI and the deployed vetting policy?)",
         )?;
     u64::try_from(requested.inner.data.readyAt)
+        .map(Some)
         .context("vetting readyAt exceeds u64 (unexpected on this chain)")
 }
 
