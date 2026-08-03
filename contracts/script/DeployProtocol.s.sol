@@ -121,6 +121,13 @@ contract DeployProtocol is BaseProtocolDeploy {
     ///         downstream tooling has already cached.
     error ManifestAlreadyExists(string path);
 
+    /// @notice `INITIAL_VETTER` was unset (or zero). A deploy with no genesis
+    ///         `VETTER_ROLE` holder cannot vet any publisher, so no origin is ever
+    ///         seated and no bytes are served — and served-bytes governance
+    ///         (ADR 036) cannot start to grant the role after the fact. The
+    ///         deploy refuses rather than ship that deadlock.
+    error MissingInitialVetter();
+
     /// @notice `tx.origin` was the forge-default sender (no `--sender` flag).
     ///         Refuses to deploy because the operator almost certainly did not
     ///         intend to broadcast from forge's deterministic fallback EOA.
@@ -169,9 +176,14 @@ contract DeployProtocol is BaseProtocolDeploy {
         // any caller that forgets to set it.
         cfg.emergencyMultisig = vm.envAddress("EMERGENCY_MULTISIG");
         cfg.initialTokenHolder = vm.envAddress("INITIAL_TOKEN_HOLDER");
-        // Genesis ManualVettingPolicy VETTER_ROLE holder (ADR 011). Optional:
-        // omit it to ship with no genesis vetter and let governance seat one.
+        // Genesis ManualVettingPolicy VETTER_ROLE holder (ADR 011). REQUIRED: a
+        // deploy with no vetter is a deadlock — no VETTER_ROLE holder means no
+        // publisher can be vetted, so no origin can be seated and nothing gets
+        // published; and served-bytes governance cannot begin until bytes are
+        // served (ADR 036), so there is no one to grant the role after the fact
+        // either. Fail fast rather than ship that chicken-and-egg.
         cfg.initialVetter = vm.envOr("INITIAL_VETTER", address(0));
+        if (cfg.initialVetter == address(0)) revert MissingInitialVetter();
         // `--sender` on the command line becomes `tx.origin` for the script;
         // use that as the deployer so the role grants the constructors emit
         // are attributable to the broadcasting EOA, not this script contract.

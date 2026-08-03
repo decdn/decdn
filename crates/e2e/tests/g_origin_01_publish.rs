@@ -322,9 +322,11 @@ impl Publisher {
     /// `decdn publish namespace create` → the minted namespace id.
     fn namespace_create(&self, chain: &ChainFixture) -> anyhow::Result<u64> {
         let out = self.run(chain, &["publish", "namespace", "create"])?;
+        // `status` distinguishes a confirmed create from a broadcast whose
+        // receipt could not be read; `submitted` is true for both.
         anyhow::ensure!(
-            out["submitted"] == serde_json::json!(true),
-            "namespace create reported submitted=false: {out}"
+            out["status"] == serde_json::json!("created"),
+            "namespace create did not confirm: {out}"
         );
         out["namespace_id"]
             .as_u64()
