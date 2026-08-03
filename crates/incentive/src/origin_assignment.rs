@@ -18,11 +18,10 @@
 //! signal to re-read `getOrigins`, not as history. Namespace 0 has no publisher
 //! and no authorized origins, so `getOrigins(0)` is always empty.
 //!
-//! The self-service `publish request-vetting` command targets the installed
-//! policy, not this contract: it reads `OriginAssignment::vettingPolicy` and
-//! calls `VettingRequestable::requestVetting` there. That call succeeds (a
-//! timelocked policy queues a request and emits `VettingRequested`), no-ops, or
-//! reverts `VettingRequestUnsupported` with a reason, per the installed policy.
+//! Vetting is not a CLI flow: a `VETTER_ROLE` holder on the installed policy
+//! (an operator, multisig, or governance) vets a wallet out-of-band, after
+//! which it may seat origins immediately. `OriginAssignment::vettingPolicy`
+//! exposes the installed policy address for tooling that wants to read it.
 
 // The `sol!`-generated bindings include macro-emitted code that uses
 // patterns workspace clippy denies (raw indexing into ABI fixed-size
@@ -75,8 +74,9 @@ mod sol_types {
             /// false. A passthrough to `vettingPolicy().isVetted(publisher)`.
             function isVettedPublisher(address publisher) external view returns (bool);
 
-            /// The installed vetting authority. `publish request-vetting` reads
-            /// this and calls `requestVetting()` on it (see [`VettingRequestable`]).
+            /// The installed vetting authority (an `IVettingPolicy`). Exposed for
+            /// tooling that wants to read the policy address; vetting itself is a
+            /// `VETTER_ROLE` action on that policy, not a CLI flow.
             function vettingPolicy() external view returns (address);
 
             // -----------------------------------------------------------------
@@ -123,31 +123,7 @@ mod sol_types {
                 address indexed pruner
             );
         }
-
-        /// The self-service vetting surface of whatever policy
-        /// [`OriginAssignment::vettingPolicy`] currently points at (ADR 011,
-        /// `contracts/src/interfaces/IVettingRequestable.sol` +
-        /// `TimelockedGovernanceVettingPolicy`). `publish request-vetting` binds
-        /// this at the policy address and calls `requestVetting()`:
-        /// - a timelocked policy queues a request and emits `VettingRequested`;
-        /// - a policy with no self-service path reverts `VettingRequestUnsupported`
-        ///   with a caller-facing reason (the error is shared across policies so
-        ///   the CLI decodes it without knowing which policy is installed);
-        /// - a no-gate policy no-ops.
-        #[sol(rpc)]
-        contract VettingRequestable {
-            function requestVetting() external;
-
-            /// The installed policy grants vetting some other way; `reason`
-            /// explains how (surfaced verbatim by the CLI).
-            error VettingRequestUnsupported(string reason);
-
-            /// A publisher queued a vetting request. `readyAt` is the unix time
-            /// the timelock elapses (earliest governance grant). Emitted only by
-            /// a timelocked policy.
-            event VettingRequested(address indexed publisher, uint256 readyAt);
-        }
     }
 }
 
-pub use sol_types::{OriginAssignment, VettingRequestable};
+pub use sol_types::OriginAssignment;

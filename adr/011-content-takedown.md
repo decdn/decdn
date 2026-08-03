@@ -279,23 +279,15 @@ interface IVettingPolicy {
 }
 ```
 
-A separate self-service verb lets a publisher ask the installed policy to vet it. `OriginAssignment` never depends on it — only the `decdn publish request-vetting` command does. A policy with no self-service path reverts `VettingRequestUnsupported` with a caller-facing reason; the error is shared across policies so a client decodes it without knowing which policy is installed:
-
-```solidity
-interface IVettingRequestable {
-    error VettingRequestUnsupported(string reason);
-    function requestVetting() external;
-}
-```
+That one function is the whole dependency. A policy is free to add its own surface — a publisher-initiated on-chain application, a timelocked notice window, an attestation read — as its own layer; none of it is part of the seam, and `OriginAssignment` neither knows nor cares.
 
 ### Vetting policies
 
 Governance installs one policy at genesis and swaps it at any time with `setVettingPolicy`. Each is a small contract behind the seam above:
 
-- **ManualVettingPolicy** — the genesis default. A `VETTER_ROLE` holder approves publishers with `setVetted(publisher, bool)`. `VETTER_ROLE`'s admin is `GOVERNANCE_ROLE`, so governance decides *who* vets — an operator wallet, a multisig, a Safe, or the Governor — and moves that authority by reassigning the role, with no contract swap. The role confers only vetting, and governance revokes or re-points it at any time, so it is not a standing back door. `requestVetting` reverts `VettingRequestUnsupported`: under this policy vetting is granted, not self-requested.
-- **TimelockedGovernanceVettingPolicy** — a publisher calls `requestVetting()`, the request ripens after `vettingTimelock` (governance-bounded between 24 hours and 14 days; see [ADR 009](009-governance.md#adr-009-governance-model)), and governance calls `grantVetting(publisher)`; `setPublisherVetted(publisher, bool)` is the instant override in both directions and clears any pending request. `requestVetting` requires the caller to own a namespace — a spam gate on the request queue, not an authorization boundary, since seating checks namespace ownership separately.
+- **ManualVettingPolicy** — the genesis default. A `VETTER_ROLE` holder approves publishers with `setVetted(publisher, bool)`. `VETTER_ROLE`'s admin is `GOVERNANCE_ROLE`, so governance decides *who* vets — an operator wallet, a multisig, a Safe, or the Governor — and moves that authority by reassigning the role, with no contract swap. The role confers only vetting, and governance revokes or re-points it at any time, so it is not a standing back door. There is no self-service request: a publisher asks a `VETTER_ROLE` holder off-chain (or via a governance proposal), is vetted, and can seat origins immediately.
 - **OpenVettingPolicy** — vets every publisher. For local and test deployments only; never installed on a production network.
-- An **attestation policy** that reads an on-chain attestation registry — vetting a wallet that holds a valid credential from a trusted attester, with no per-publisher governance action — fits the same seam. Installing it is a governance `setVettingPolicy` call and needs no change to `OriginAssignment`.
+- Future policies fit the same seam without touching `OriginAssignment`: an **attestation policy** that vets any wallet holding a valid credential from a trusted attester (no per-publisher governance action), or a policy with a publisher-initiated on-chain application and enforced notice window. Each is a governance `setVettingPolicy` call.
 
 ### Contract: OriginAssignment
 
@@ -352,8 +344,8 @@ interface IOriginAssignment {
     function setContentBlacklist(address contentBlacklist) external;
 
     // Governable parameter with safety bounds (see ADR 009). Emits its own
-    // update event: MaxOriginsPerNamespaceUpdated. (The vetting timelock, when a
-    // timelocked policy is installed, is a parameter of that policy.)
+    // update event: MaxOriginsPerNamespaceUpdated. Vetting-related parameters, if
+    // any, live on the installed policy, not here.
     function setMaxOriginsPerNamespace(uint256 cap) external;
 
     // Views. For namespaceId == 0 these return empty / false — namespace 0
@@ -394,7 +386,7 @@ interface IOriginAssignment {
 
 ### Lifecycle
 
-1. **Publisher vetting.** The publisher becomes vetted through the installed policy. Under the genesis `ManualVettingPolicy` a `VETTER_ROLE` holder approves the wallet with `setVetted(publisher, true)`; under a timelocked policy the publisher calls `requestVetting()`, waits the timelock, and governance calls `grantVetting(publisher)`. Vetting is per wallet and covers every namespace the publisher owns, now and later.
+1. **Publisher vetting.** The publisher becomes vetted through the installed policy. Under the genesis `ManualVettingPolicy` a `VETTER_ROLE` holder approves the wallet with `setVetted(publisher, true)` — the publisher asks off-chain or via a governance proposal, and once approved can seat origins immediately. Vetting is per wallet and covers every namespace the publisher owns, now and later.
 2. **Origin seating.** The vetted publisher calls `addOrigin(namespaceId, operator)` for each operator it wants. The contract validates ownership of the namespace, the publisher's vetted status (via the policy), and that operator's activity, blacklist status, uniqueness, and the per-namespace cap. The operator is authorized when the transaction confirms.
 3. **Operator notification.** Seated operators are now authorized to act as origins for the namespace. They configure their origin store locally and begin serving the namespace's content. The wire protocol does not distinguish origins from cache nodes at probe time — origin status is a publisher-level commitment surfaced via `getOrigins(namespaceId)` for off-chain consumers.
 4. **Removal.** A publisher may unilaterally unseat an operator from its own namespace (e.g., the operator is performing poorly). Governance may unseat any operator from any namespace, and may un-vet the publisher — through the installed policy — to stop further seating (e.g., the publisher is misbehaving but has not yet crossed the blacklist threshold). Blacklisting (`ContentBlacklist.addOperator`) takes effect via runtime checks rather than a cross-call — see [§ Interaction with ContentBlacklist](#interaction-with-contentblacklist).
@@ -418,7 +410,7 @@ The contract rejects an `addOrigin` for an operator already seated in the namesp
 ### Cross-contract integration
 
 - `OriginAssignment` reads `PublisherRegistry.ownerOf(namespaceId)` to validate that the caller owns the namespace it seats or unseats an origin for.
-- A timelocked vetting policy reads `PublisherRegistry.namespaceCount(publisher)` to validate that a `requestVetting` caller is a publisher at all. `OriginAssignment` itself makes no such read — it only asks the installed policy `isVetted(publisher)`.
+- `OriginAssignment` makes no `PublisherRegistry.namespaceCount` read — vetting is the installed policy's concern; `OriginAssignment` only asks it `isVetted(publisher)`. A policy that gates its own application on namespace ownership would read `namespaceCount` itself.
 - `OriginAssignment` reads `CapacityBond.isActive(operator)` to validate an origin candidate at seating time. The check is opportunistic, not enforced at probe time — an operator who unbonds while seated is filtered by clients via the standard bond-active check, not by `OriginAssignment` (avoiding expensive cross-contract checks on every assignment lookup).
 - `OriginAssignment` reads `ContentBlacklist.isOriginBlacklisted(operator)` (and the operator mapping) both to reject a blacklisted candidate at seating time and to decide whether `pruneBlacklistedOrigin` may remove an entry. Permissionless callers can clean up storage one (`namespaceId`, operator) pair at a time.
 - `ContentBlacklist.addOperator(operator)` does not call into `OriginAssignment` — see [§ Interaction with ContentBlacklist](#interaction-with-contentblacklist) below for the rationale and the runtime-check pattern.

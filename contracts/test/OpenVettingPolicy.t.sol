@@ -17,11 +17,4 @@ contract OpenVettingPolicyTest is Test {
         assertTrue(policy.isVetted(address(0xBEEF)));
         assertTrue(policy.isVetted(address(this)));
     }
-
-    /// No-op success (does not revert): every caller is already vetted, so the
-    /// CLI `publish request-vetting` reports success under this policy.
-    function test_requestVetting_noop() public {
-        vm.prank(address(0xBEEF));
-        policy.requestVetting();
-    }
 }

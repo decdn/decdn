@@ -4,7 +4,6 @@ pragma solidity 0.8.28;
 import { AccessControl } from "@openzeppelin/contracts/access/AccessControl.sol";
 
 import { IVettingPolicy } from "./interfaces/IVettingPolicy.sol";
-import { IVettingRequestable } from "./interfaces/IVettingRequestable.sol";
 
 /// @title ManualVettingPolicy — the genesis vetting policy (ADR 011)
 /// @notice A `VETTER_ROLE` holder approves publishers directly. Two roles keep
@@ -25,7 +24,7 @@ import { IVettingRequestable } from "./interfaces/IVettingRequestable.sol";
 ///         contract only varies *who* vets under the manual procedure.
 ///
 ///         Holds no funds and makes no external calls, so no `ReentrancyGuard`.
-contract ManualVettingPolicy is AccessControl, IVettingPolicy, IVettingRequestable {
+contract ManualVettingPolicy is AccessControl, IVettingPolicy {
     /// @notice Admin of `VETTER_ROLE` — decides who may vet. Timelock post-handoff.
     bytes32 public constant GOVERNANCE_ROLE = keccak256("GOVERNANCE_ROLE");
 
@@ -62,10 +61,5 @@ contract ManualVettingPolicy is AccessControl, IVettingPolicy, IVettingRequestab
     /// @inheritdoc IVettingPolicy
     function isVetted(address publisher) external view returns (bool) {
         return _vetted[publisher];
-    }
-
-    /// @inheritdoc IVettingRequestable
-    function requestVetting() external pure {
-        revert VettingRequestUnsupported("vetting is granted by a VETTER_ROLE holder, not self-service");
     }
 }

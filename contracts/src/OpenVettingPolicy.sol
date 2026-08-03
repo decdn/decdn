@@ -2,7 +2,6 @@
 pragma solidity 0.8.28;
 
 import { IVettingPolicy } from "./interfaces/IVettingPolicy.sol";
-import { IVettingRequestable } from "./interfaces/IVettingRequestable.sol";
 
 /// @title OpenVettingPolicy — no-gate vetting (ADR 011)
 /// @notice Vets every publisher. For local and dev testnet runs where approving
@@ -15,14 +14,9 @@ import { IVettingRequestable } from "./interfaces/IVettingRequestable.sol";
 ///         re-gate, governance swaps in another policy via
 ///         `OriginAssignment.setVettingPolicy`. "Deny everyone" needs no
 ///         dedicated contract — it is any policy whose `isVetted` returns false.
-contract OpenVettingPolicy is IVettingPolicy, IVettingRequestable {
+contract OpenVettingPolicy is IVettingPolicy {
     /// @inheritdoc IVettingPolicy
     function isVetted(address) external pure returns (bool) {
         return true;
     }
-
-    /// @inheritdoc IVettingRequestable
-    /// @dev No-op success: every caller is already vetted, so the CLI
-    ///      `publish request-vetting` reports success rather than reverting.
-    function requestVetting() external pure { }
 }

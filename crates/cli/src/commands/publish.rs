@@ -1,13 +1,11 @@
 //! `decdn publish` — origin-publisher control plane (issues #1029 / #1491).
 //!
 //! Submits the `PublisherRegistry` / `OriginAssignment` writes that create
-//! namespaces, ask the installed vetting policy to vet the publisher wallet, and
-//! then seat or unseat that publisher's authorized origins. `request-vetting`
-//! targets whatever `IVettingPolicy` `OriginAssignment` currently points at, so
-//! its outcome depends on that policy (a timelocked policy queues a request; the
-//! genesis manual policy has no self-service path and reverts with a reason).
-//! Once the wallet is vetted, `assign` and `revoke` take effect in the
-//! transaction that carries them (ADR 011 § Origin Assignment Authority).
+//! namespaces and then seat or unseat a publisher's authorized origins. Vetting
+//! is not a CLI step: a `VETTER_ROLE` holder on the installed vetting policy (an
+//! operator, multisig, or governance) vets the wallet out-of-band, after which
+//! `assign` and `revoke` take effect in the transaction that carries them
+//! (ADR 011 § Origin Assignment Authority).
 //! Content is bound to a namespace off-chain by the requester at fetch time
 //! (ADR 002 § Hash-to-namespace association), so there is no per-hash on-chain
 //! claim. Mirrors the
@@ -26,7 +24,7 @@ use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types::SolEvent;
 use anyhow::Context;
 use decdn_common::cli;
-use decdn_incentive::origin_assignment::{OriginAssignment, VettingRequestable};
+use decdn_incentive::origin_assignment::OriginAssignment;
 use decdn_incentive::publisher_registry::PublisherRegistry;
 
 use crate::commands::chain_ctx;
@@ -41,7 +39,6 @@ pub async fn publish_dispatch(
         cli::PublishCommand::Namespace(ns) => match &ns.command {
             cli::NamespaceCommand::Create(a) => namespace_create(a, global_config).await,
         },
-        cli::PublishCommand::RequestVetting(a) => request_vetting(a, global_config).await,
         cli::PublishCommand::Assign(a) => assign(a, global_config).await,
         cli::PublishCommand::Revoke(a) => revoke(a, global_config).await,
     }
@@ -255,200 +252,6 @@ async fn namespace_create(
     Ok(())
 }
 
-// -------------------------------------------------------------------------
-// request-vetting
-// -------------------------------------------------------------------------
-
-/// Result of `request-vetting`. `operator`/`tx`/`ready_at` are `None` on a dry
-/// run (which loads no keystore, so the signer address is unknown).
-pub(crate) struct VettingOutcome {
-    pub(crate) operator: Option<Address>,
-    pub(crate) origin_assignment: Address,
-    /// Unix time the vetting timelock elapses (earliest governance grant), from
-    /// the `VettingRequested` event. `None` on a dry run, when the request
-    /// landed but its deadline could not be recovered, and when nothing reached
-    /// the chain at all — read it together with `status`, which distinguishes
-    /// those three.
-    pub(crate) ready_at: Option<u64>,
-    pub(crate) tx: Option<B256>,
-    /// The transaction was broadcast but its outcome could not be read, so the
-    /// request is neither confirmed queued nor known to have failed.
-    pub(crate) in_flight: bool,
-    pub(crate) dry_run: bool,
-}
-
-pub(crate) fn write_vetting_outcome(
-    w: &mut impl io::Write,
-    o: &VettingOutcome,
-    json: bool,
-) -> io::Result<()> {
-    let status = single_tx_status(o.dry_run, o.in_flight, o.tx, "vetting_requested");
-    if json {
-        let value = serde_json::json!({
-            "submitted": o.tx.is_some(),
-            "tx": o.tx.map(|h| format!("{h:#x}")),
-            "operator": o.operator.map(|a| format!("{a:#x}")),
-            "origin_assignment": format!("{:#x}", o.origin_assignment),
-            "ready_at": o.ready_at,
-            "status": status,
-        });
-        return writeln!(w, "{value}");
-    }
-    if let Some(op) = o.operator {
-        writeln!(w, "operator={op:#x}")?;
-    }
-    writeln!(w, "origin_assignment={:#x}", o.origin_assignment)?;
-    if let Some(ready_at) = o.ready_at {
-        writeln!(w, "ready_at={ready_at}")?;
-    }
-    // Requested only: the grant is a separate governance action, and until it
-    // lands `assign` still reverts `PublisherNotVetted`.
-    match o.tx {
-        Some(h) => writeln!(w, "status={status} tx={h:#x}"),
-        None => writeln!(w, "status={status} submitted=false"),
-    }
-}
-
-async fn request_vetting(
-    args: &cli::RequestVettingArgs,
-    global_config: Option<&Path>,
-) -> anyhow::Result<()> {
-    let (resolved, oa_addr) = assignment_ctx(&args.chain, global_config)?;
-    let mut outcome = VettingOutcome {
-        operator: None,
-        origin_assignment: oa_addr,
-        ready_at: None,
-        tx: None,
-        in_flight: false,
-        dry_run: args.chain.common.dry_run,
-    };
-    // `Ok` on the dry-run path: nothing was sent, so there is nothing to decode
-    // and nothing to report as failed.
-    let mut deadline: anyhow::Result<u64> = Ok(0);
-    // Whether the request reached the chain. Only then may the error text claim
-    // a queued request the publisher has to reckon with.
-    let mut landed = false;
-
-    if !outcome.dry_run {
-        let (signer, provider) = signer_and_provider(&resolved, &args.chain).await?;
-        outcome.operator = Some(signer.address());
-        // `request-vetting` is policy-agnostic: it asks the installed vetting
-        // policy, not `OriginAssignment` itself. Read the policy address, then
-        // call `requestVetting()` there. A timelocked policy queues a request and
-        // emits `VettingRequested`; a manual policy reverts
-        // `VettingRequestUnsupported` with a reason; a no-gate policy no-ops.
-        let policy_addr = OriginAssignment::new(oa_addr, &provider)
-            .vettingPolicy()
-            .call()
-            .await
-            .context("read OriginAssignment.vettingPolicy")?;
-        let policy = VettingRequestable::new(policy_addr, &provider);
-        let sent = decdn_incentive::tx::send_for_receipt(
-            policy.requestVetting(),
-            "requestVetting",
-            Some(
-                "the installed vetting policy rejected the request — see the revert reason \
-                 above (a manual policy grants vetting through a VETTER_ROLE holder, not \
-                 self-service; a timelocked policy needs the signer to own a namespace and \
-                 have no request already pending)",
-            ),
-            &mut outcome.tx,
-        )
-        .await;
-
-        match sent {
-            // Surface the timelock deadline (`readyAt`) when the policy emits one.
-            // A policy without a timelock (e.g. a no-gate policy) succeeds with no
-            // `VettingRequested` log — that is not an error. Every failure here
-            // happens AFTER the request is queued on-chain, so it must not
-            // short-circuit the receipt — the tx hash is the only handle the
-            // publisher has on a request that now blocks re-running this command.
-            Ok(receipt) => {
-                landed = true;
-                match decode_vetting_deadline(&receipt) {
-                    Ok(Some(ready_at)) => outcome.ready_at = Some(ready_at),
-                    Ok(None) => {}
-                    Err(err) => deadline = Err(err),
-                }
-            }
-            Err(err) => {
-                // A hash that survived the error means the transaction was
-                // broadcast and only its receipt was unreadable: the request may
-                // well be queued, so report it rather than implying nothing
-                // happened. No hash means the send was rejected or the call
-                // reverted — nothing is queued, and `send_for_receipt`'s own
-                // error already says so.
-                outcome.in_flight = outcome.tx.is_some();
-                deadline = Err(err);
-                landed = false;
-            }
-        }
-    }
-
-    let mut out = io::stdout().lock();
-    let write_err = write_vetting_outcome(&mut out, &outcome, args.chain.common.json).err();
-    drop(out);
-    let context = vetting_failure_context(landed, outcome.in_flight);
-    propagate(
-        deadline.err().map(|err| match context {
-            Some(note) => err.context(note),
-            None => err,
-        }),
-        write_err,
-        "failed to write request-vetting output",
-    )
-}
-
-/// Extra guidance to attach to a `request-vetting` failure, or `None` when the
-/// underlying error already says everything true.
-///
-/// The distinction matters because the publisher's next move differs. A request
-/// that reached the chain blocks the obvious retry (`requestVetting` reverts
-/// `VettingRequestPending`), so the operator must be told it exists. A send that
-/// was rejected — the modal case, since `AlreadyVetted` / `NoNamespaceOwned` /
-/// `VettingRequestPending` all surface from the pre-flight gas estimate before
-/// anything is broadcast — queued nothing, and claiming otherwise sends the
-/// operator looking for a transaction that does not exist.
-const fn vetting_failure_context(landed: bool, in_flight: bool) -> Option<&'static str> {
-    if in_flight {
-        Some(
-            "the transaction was broadcast — check the tx above before re-running, since a \
-             queued request makes `request-vetting` revert VettingRequestPending",
-        )
-    } else if landed {
-        Some("the request is queued on-chain — the tx above is its only handle")
-    } else {
-        // Nothing reached the chain: `send_for_receipt`'s error is already both
-        // accurate and actionable, and there is no hash to point at.
-        None
-    }
-}
-
-/// Pull `readyAt` out of a confirmed `requestVetting` receipt, or `None` when the
-/// installed policy emits no `VettingRequested` (it has no timelock — e.g. a
-/// no-gate policy no-ops). Split out so the caller can print its receipt before
-/// propagating a decode failure, which happens after the tx has taken effect.
-fn decode_vetting_deadline(
-    receipt: &alloy::rpc::types::TransactionReceipt,
-) -> anyhow::Result<Option<u64>> {
-    let Some(log) =
-        receipt.inner.logs().iter().find(|log| {
-            log.topic0() == Some(&VettingRequestable::VettingRequested::SIGNATURE_HASH)
-        })
-    else {
-        return Ok(None);
-    };
-    let requested = log
-        .log_decode::<VettingRequestable::VettingRequested>()
-        .context(
-            "requestVetting emitted a VettingRequested log that failed to decode (ABI mismatch \
-         between this CLI and the deployed vetting policy?)",
-        )?;
-    u64::try_from(requested.inner.data.readyAt)
-        .map(Some)
-        .context("vetting readyAt exceeds u64 (unexpected on this chain)")
-}
-
 /// The `status=` token for a command that submits exactly ONE transaction.
 ///
 /// `in_flight` is the case that needs its own answer: the transaction was
@@ -506,10 +309,10 @@ fn propagate(
 /// The `addOrigin` failure hint: every guard the contract applies, led by the one
 /// a publisher hits first. `removeOrigin` has its own, since none of the operator
 /// guards below apply to unseating.
-const ADD_ORIGIN_HINT: &str = "the signer must be a vetted publisher (run `decdn publish \
-     request-vetting`, then wait for governance to grant it) and own the namespace; the \
-     operator must be an active bonded node, not blacklisted, not already seated, and must \
-     fit under maxOriginsPerNamespace";
+const ADD_ORIGIN_HINT: &str = "the signer must be a vetted publisher (a VETTER_ROLE holder on \
+     the installed vetting policy vets it out-of-band) and own the namespace; the operator must \
+     be an active bonded node, not blacklisted, not already seated, and must fit under \
+     maxOriginsPerNamespace";
 
 /// What happened to one operator in the seating loop.
 ///
@@ -565,7 +368,7 @@ impl SeatOutcome {
 /// misattribute a transaction or silently omit an operator. `dry_run` is a field
 /// rather than inferred from the absence of transactions because "nothing was
 /// sent" and "the first send failed" are different answers that both leave zero
-/// seats — the same reason `VettingOutcome` and `RevokeOutcome` carry it too.
+/// seats — the same reason `RevokeOutcome` carries it too.
 pub(crate) struct AssignOutcome {
     pub(crate) operator: Option<Address>,
     pub(crate) origin_assignment: Address,
@@ -1054,37 +857,6 @@ mod tests {
     }
 
     #[test]
-    fn vetting_output_states_requested_then_dry_run() {
-        let done = VettingOutcome {
-            operator: Some(Address::repeat_byte(0xCD)),
-            origin_assignment: Address::repeat_byte(0x02),
-            ready_at: Some(1_700_000_000),
-            tx: Some(B256::repeat_byte(0x55)),
-            in_flight: false,
-            dry_run: false,
-        };
-        let mut buf = Vec::new();
-        write_vetting_outcome(&mut buf, &done, false).unwrap();
-        let s = String::from_utf8(buf).unwrap();
-        assert!(s.contains("ready_at=1700000000"), "{s}");
-        assert!(s.contains("status=vetting_requested tx=0x5555"), "{s}");
-
-        let dry = VettingOutcome {
-            operator: None,
-            ready_at: None,
-            tx: None,
-            dry_run: true,
-            ..done
-        };
-        let mut buf = Vec::new();
-        write_vetting_outcome(&mut buf, &dry, false).unwrap();
-        let s = String::from_utf8(buf).unwrap();
-        assert!(s.contains("status=dry_run submitted=false"), "{s}");
-        assert!(!s.contains("ready_at="), "{s}");
-        assert!(!s.contains("operator="), "{s}");
-    }
-
-    #[test]
     fn revoke_output_names_the_unseated_operator() {
         let o = RevokeOutcome {
             operator: Some(Address::repeat_byte(0xCD)),
@@ -1186,9 +958,9 @@ mod tests {
         assert!(origins[1]["tx"].is_null(), "{v}");
     }
 
-    /// A `removeOrigin` / `requestVetting` that was broadcast without a readable
-    /// receipt must not print the success label — the operator has to check the
-    /// hash before retrying, because a retry after a landed removal reverts.
+    /// A `removeOrigin` that was broadcast without a readable receipt must not
+    /// print the success label — the operator has to check the hash before
+    /// retrying, because a retry after a landed removal reverts.
     #[test]
     fn single_tx_commands_report_an_unreadable_broadcast_as_unknown() {
         let revoke = RevokeOutcome {
@@ -1215,44 +987,6 @@ mod tests {
             v["tx"],
             serde_json::json!(format!("{:#x}", B256::repeat_byte(0x55)))
         );
-
-        let vetting = VettingOutcome {
-            operator: Some(Address::repeat_byte(0xCD)),
-            origin_assignment: Address::repeat_byte(0x02),
-            ready_at: None,
-            tx: Some(B256::repeat_byte(0x66)),
-            in_flight: true,
-            dry_run: false,
-        };
-        let mut buf = Vec::new();
-        write_vetting_outcome(&mut buf, &vetting, true).unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
-        assert_eq!(v["status"], serde_json::json!("unknown"));
-        assert!(v["ready_at"].is_null(), "{v}");
-    }
-
-    /// The guidance attached to a `request-vetting` failure has to distinguish
-    /// three outcomes. Claiming a queued request on the path where the send was
-    /// rejected — the modal failure, since the contract's guards surface from the
-    /// pre-flight gas estimate — sends the publisher looking for a transaction
-    /// that never existed, and contradicts the `status=failed` receipt printed
-    /// one line above.
-    #[test]
-    fn vetting_failure_context_only_claims_a_queued_request_when_one_exists() {
-        // Broadcast, receipt unreadable: the request may exist, so say so.
-        let in_flight = vetting_failure_context(false, true).unwrap();
-        assert!(in_flight.contains("was broadcast"), "{in_flight}");
-        assert!(in_flight.contains("VettingRequestPending"), "{in_flight}");
-
-        // Confirmed, but the deadline could not be decoded: it IS queued.
-        let landed = vetting_failure_context(true, false).unwrap();
-        assert!(landed.contains("queued on-chain"), "{landed}");
-
-        // Nothing reached the chain — no queued request, and no hash to cite.
-        assert!(
-            vetting_failure_context(false, false).is_none(),
-            "a rejected send must not claim a queued request"
-        );
     }
 
     /// A send that never made it on-chain is `failed`, not `dry_run` — the two
@@ -1272,21 +1006,7 @@ mod tests {
     }
 
     #[test]
-    fn vetting_and_revoke_json_round_trip() {
-        let vetting = VettingOutcome {
-            operator: Some(Address::repeat_byte(0xCD)),
-            origin_assignment: Address::repeat_byte(0x02),
-            ready_at: Some(1_700_000_000),
-            tx: Some(B256::repeat_byte(0x55)),
-            in_flight: false,
-            dry_run: false,
-        };
-        let mut buf = Vec::new();
-        write_vetting_outcome(&mut buf, &vetting, true).unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
-        assert_eq!(v["status"], serde_json::json!("vetting_requested"));
-        assert_eq!(v["ready_at"], serde_json::json!(1_700_000_000)); // number, not string
-
+    fn revoke_json_round_trip() {
         let revoke = RevokeOutcome {
             operator: None,
             origin_assignment: Address::repeat_byte(0x02),

@@ -192,15 +192,13 @@ alloy::sol! {
     /// `VETTER_ROLE` holder approves publishers via `setVetted`; `GOVERNANCE_ROLE`
     /// admins `VETTER_ROLE` (the Timelock post-handoff). The `ChainFixture` vets a
     /// publisher by impersonating the Timelock to grant itself `VETTER_ROLE` and
-    /// then calling `setVetted`. `requestVetting` reverts `VettingRequestUnsupported`
-    /// (vetting is not self-service under this policy).
+    /// then calling `setVetted`. There is no self-service request path.
     #[sol(rpc)]
     contract ManualVettingPolicy {
         function VETTER_ROLE() external view returns (bytes32);
         function grantRole(bytes32 role, address account) external;
         function setVetted(address publisher, bool vetted) external;
         function isVetted(address publisher) external view returns (bool);
-        function requestVetting() external;
     }
 
     /// `SlashJudge.submitBlacklistChallenge` — the blacklist-violation slash

@@ -8,10 +8,9 @@
 //! 2. `publish assign <id> <operator>` **fails closed while the publisher is
 //!    unvetted** — origin seating is gated on the wallet, not on a per-set
 //!    governance vote.
-//! 3. `publish request-vetting` targets the installed vetting policy. The genesis
-//!    `ManualVettingPolicy` has no self-service path, so the command reverts
-//!    `VettingRequestUnsupported`; the fixture then vets the wallet as a
-//!    `VETTER_ROLE` holder (`ManualVettingPolicy.setVetted`).
+//! 3. Vetting is not a CLI step. A `VETTER_ROLE` holder on the genesis
+//!    `ManualVettingPolicy` vets the wallet out-of-band (the fixture drives it
+//!    via `ManualVettingPolicy.setVetted`), after which the wallet may seat origins.
 //! 4. `publish assign <id> <operator>` now seats the origin **instantly** —
 //!    `getOrigins` reflects it with no further governance action, and the node's
 //!    origin directory consumes the `OriginAdded` log (asserted through the
@@ -135,17 +134,9 @@ async fn run() -> anyhow::Result<()> {
         "the publisher must start unvetted",
     );
 
-    // ---- 3. `publish request-vetting` is policy-agnostic: it calls the installed
-    // policy. The genesis `ManualVettingPolicy` has no self-service path, so the
-    // command reverts `VettingRequestUnsupported` with a reason — proving the CLI
-    // surfaces the installed policy's decision rather than assuming one.
-    let rejected = run_publish_expect_failure(&node, &["request-vetting", "--json"]).await?;
-    assert!(
-        rejected.contains("VettingRequestUnsupported") || rejected.contains("not self-service"),
-        "request-vetting must surface the manual policy's revert reason, got:\n{rejected}",
-    );
-    // Vetting under the manual policy is a VETTER_ROLE action, which the fixture
-    // performs; then the publisher may seat origins.
+    // ---- 3. Vetting is not a CLI step: a `VETTER_ROLE` holder on the genesis
+    // `ManualVettingPolicy` vets the wallet out-of-band, which the fixture drives.
+    // Once vetted, the publisher may seat origins.
     chain.vet_publisher(operator).await?;
     assert!(
         assignment.isVettedPublisher(operator).call().await?,

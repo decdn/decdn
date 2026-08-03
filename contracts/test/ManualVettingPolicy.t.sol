@@ -5,7 +5,6 @@ import { Test } from "forge-std/Test.sol";
 import { IAccessControl } from "@openzeppelin/contracts/access/IAccessControl.sol";
 
 import { ManualVettingPolicy } from "../src/ManualVettingPolicy.sol";
-import { IVettingRequestable } from "../src/interfaces/IVettingRequestable.sol";
 
 contract ManualVettingPolicyTest is Test {
     ManualVettingPolicy internal policy;
@@ -95,16 +94,5 @@ contract ManualVettingPolicyTest is Test {
     function test_constructor_rejectsZeroAdmin() public {
         vm.expectRevert(ManualVettingPolicy.ZeroAddress.selector);
         new ManualVettingPolicy(address(0), vetter);
-    }
-
-    function test_requestVetting_revertsUnsupported() public {
-        vm.prank(publisher);
-        vm.expectRevert(
-            abi.encodeWithSelector(
-                IVettingRequestable.VettingRequestUnsupported.selector,
-                "vetting is granted by a VETTER_ROLE holder, not self-service"
-            )
-        );
-        policy.requestVetting();
     }
 }

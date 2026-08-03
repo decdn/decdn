@@ -40,7 +40,7 @@ pub use node::{
 pub use probe::ProbeArgs;
 pub use publish::{
     AssignArgs, NamespaceArgs, NamespaceCommand, NamespaceCreateArgs, PublishArgs,
-    PublishChainArgs, PublishCommand, RequestVettingArgs, RevokeArgs,
+    PublishChainArgs, PublishCommand, RevokeArgs,
 };
 pub use run::RunArgs;
 pub use setup::{PayBondWith, SetupArgs};
