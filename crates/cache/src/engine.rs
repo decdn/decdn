@@ -777,9 +777,8 @@ pub enum RangePullOutcome {
     /// whole-blob origin pull.
     Served,
     /// No configured origin could serve a range pull (none published
-    /// `{H}.obao4`, none honored `Range`, the outboard was short/absent, or
-    /// `origin_range_pull_enabled` was off at the call site). The caller MUST
-    /// fall back to a whole-blob pull.
+    /// `{H}.obao4`, none honored `Range`, or the outboard was short/absent).
+    /// The caller MUST fall back to a whole-blob pull.
     Unsupported,
 }
 
