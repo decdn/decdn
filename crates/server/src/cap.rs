@@ -1,6 +1,6 @@
-use alloy::primitives::Address;
 use crate::money::{MicroUsdc, month_bucket};
 use crate::store::Store;
+use alloy::primitives::Address;
 
 #[derive(Clone)]
 pub struct Cap {
@@ -51,13 +51,19 @@ mod tests {
         let now = 1_769_904_000;
         // five $2 reservations fit
         for i in 1..=5 {
-            match cap.check_and_reserve(&store, c, now, MicroUsdc(2_000_000)).unwrap() {
+            match cap
+                .check_and_reserve(&store, c, now, MicroUsdc(2_000_000))
+                .unwrap()
+            {
                 CapDecision::Allowed { new_total } => assert_eq!(new_total.0, i * 2_000_000),
                 CapDecision::Exhausted { .. } => panic!("should fit at {i}"),
             }
         }
         // sixth does not
-        match cap.check_and_reserve(&store, c, now, MicroUsdc(2_000_000)).unwrap() {
+        match cap
+            .check_and_reserve(&store, c, now, MicroUsdc(2_000_000))
+            .unwrap()
+        {
             CapDecision::Exhausted { spent, limit } => {
                 assert_eq!(spent.0, 10_000_000);
                 assert_eq!(limit.0, 10_000_000);

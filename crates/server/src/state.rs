@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
 use crate::cap::Cap;
-use crate::captcha::Turnstile;
+use crate::captcha::{CaptchaVerifier, Turnstile};
 use crate::config::ServerConfig;
-use crate::discovery::Discovery;
+use crate::discovery::{Discovery, ProviderResolver};
 use crate::store::Store;
 use crate::treasury::Treasury;
 
@@ -13,9 +13,9 @@ pub struct AppState {
     pub store: Arc<Store>,
     pub cap: Cap,
     pub treasury: Arc<dyn Treasury>,
-    pub turnstile: Arc<Turnstile>,
+    pub turnstile: Arc<dyn CaptchaVerifier>,
     pub cfg: Arc<ServerConfig>,
-    pub discovery: Arc<Discovery>,
+    pub discovery: Arc<dyn ProviderResolver>,
 }
 
 /// Assemble the full `AppState` from a `ServerConfig`: opens the redb store,
@@ -27,12 +27,12 @@ pub async fn build(cfg: ServerConfig) -> anyhow::Result<AppState> {
     let cap = Cap {
         monthly_limit: cfg.monthly_cap,
     };
-    let turnstile = Arc::new(Turnstile::new(
+    let turnstile: Arc<dyn CaptchaVerifier> = Arc::new(Turnstile::new(
         cfg.turnstile_secret.clone(),
         reqwest::Client::new(),
     ));
     let treasury: Arc<dyn Treasury> = Arc::from(cfg.build_treasury().await?);
-    let discovery = Arc::new(Discovery {
+    let discovery: Arc<dyn ProviderResolver> = Arc::new(Discovery {
         rpc_url: cfg.rpc_url.clone(),
         capacity_bond: cfg.capacity_bond,
     });

@@ -9,6 +9,7 @@
 //! routing idempotent even though there is no content-aware placement yet.
 
 use alloy::primitives::Address;
+use async_trait::async_trait;
 use decdn_client_pull::discovery::active_nodes;
 
 /// A node selected to serve a request: its iroh node id and the Ethereum
@@ -31,6 +32,14 @@ pub fn pick_deterministic(cands: &[([u8; 32], Address)]) -> Option<NodePick> {
             node_id: *node_id,
             provider: *provider,
         })
+}
+
+/// Abstraction over "resolve a content hash to a node to serve it from" so
+/// the HTTP layer can inject a fake in tests instead of reading the chain.
+/// `Discovery` is the production implementation.
+#[async_trait]
+pub trait ProviderResolver: Send + Sync {
+    async fn resolve(&self, hash: [u8; 32]) -> anyhow::Result<Option<NodePick>>;
 }
 
 /// Resolves a content hash to a node to fetch it from.
@@ -60,6 +69,13 @@ impl Discovery {
     }
 }
 
+#[async_trait]
+impl ProviderResolver for Discovery {
+    async fn resolve(&self, hash: [u8; 32]) -> anyhow::Result<Option<NodePick>> {
+        Discovery::resolve(self, hash).await
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
@@ -69,8 +85,14 @@ mod tests {
     #[test]
     fn picks_lowest_eth_address_for_determinism() {
         let cands = vec![
-            ([2u8; 32], address!("0000000000000000000000000000000000000022")),
-            ([1u8; 32], address!("0000000000000000000000000000000000000011")),
+            (
+                [2u8; 32],
+                address!("0000000000000000000000000000000000000022"),
+            ),
+            (
+                [1u8; 32],
+                address!("0000000000000000000000000000000000000011"),
+            ),
         ];
         let pick = pick_deterministic(&cands).unwrap();
         assert_eq!(

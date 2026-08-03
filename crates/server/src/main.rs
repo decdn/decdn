@@ -1,7 +1,14 @@
-use decdn_incentive::voucher_domain;
+use sponsord::config::ServerConfig;
+use sponsord::{http, state};
 
-fn main() {
-    // Spike: prove the decdn path dep resolves and a symbol is reachable.
-    let _ = voucher_domain as fn(u64, alloy::primitives::Address) -> _;
-    println!("sponsord skeleton ok");
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let cfg = ServerConfig::from_env()?;
+    let bind = cfg.bind;
+    let app_state = state::build(cfg).await?;
+    let app = http::router(app_state);
+    let listener = tokio::net::TcpListener::bind(bind).await?;
+    println!("sponsord listening on {bind}");
+    axum::serve(listener, app).await?;
+    Ok(())
 }

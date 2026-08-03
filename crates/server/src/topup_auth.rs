@@ -40,7 +40,7 @@ pub fn verify(
 mod tests {
     use super::*;
     use alloy::primitives::b256;
-    use alloy::signers::{local::PrivateKeySigner, SignerSync};
+    use alloy::signers::{SignerSync, local::PrivateKeySigner};
 
     #[test]
     fn accepts_fresh_signature_from_expected_signer_rejects_others() {
@@ -55,9 +55,15 @@ mod tests {
         // fresh + correct signer
         assert!(verify(id, ts, ts + 5, &sig_hex, addr, 120).is_ok());
         // stale
-        assert!(matches!(verify(id, ts, ts + 999, &sig_hex, addr, 120), Err(AuthError::Stale)));
+        assert!(matches!(
+            verify(id, ts, ts + 999, &sig_hex, addr, 120),
+            Err(AuthError::Stale)
+        ));
         // wrong expected signer
         let other = PrivateKeySigner::random().address();
-        assert!(matches!(verify(id, ts, ts + 5, &sig_hex, other, 120), Err(AuthError::BadSignature)));
+        assert!(matches!(
+            verify(id, ts, ts + 5, &sig_hex, other, 120),
+            Err(AuthError::BadSignature)
+        ));
     }
 }

@@ -1,4 +1,13 @@
+use async_trait::async_trait;
 use serde::Deserialize;
+
+/// Abstraction over "verify a captcha token" so the HTTP layer can inject a
+/// fake in tests instead of calling out to Cloudflare. `Turnstile` is the
+/// production implementation.
+#[async_trait]
+pub trait CaptchaVerifier: Send + Sync {
+    async fn verify(&self, token: &str, remote_ip: Option<&str>) -> anyhow::Result<bool>;
+}
 
 pub struct Turnstile {
     secret: String,
@@ -46,18 +55,27 @@ impl Turnstile {
     }
 }
 
+#[async_trait]
+impl CaptchaVerifier for Turnstile {
+    async fn verify(&self, token: &str, remote_ip: Option<&str>) -> anyhow::Result<bool> {
+        Turnstile::verify(self, token, remote_ip).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiremock::{MockServer, Mock, ResponseTemplate};
     use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[tokio::test]
     async fn returns_true_on_success_json() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/siteverify"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"success": true})))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"success": true})),
+            )
             .mount(&server)
             .await;
         let ts = Turnstile::with_endpoint(
@@ -73,11 +91,9 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/siteverify"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(
-                    serde_json::json!({"success": false, "error-codes": ["invalid-input-response"]}),
-                ),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"success": false, "error-codes": ["invalid-input-response"]}),
+            ))
             .mount(&server)
             .await;
         let ts = Turnstile::with_endpoint(

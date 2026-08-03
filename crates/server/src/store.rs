@@ -174,7 +174,12 @@ impl Store {
         Ok(MicroUsdc(new_total))
     }
 
-    pub fn cap_refund(&self, client: Address, bucket: u32, amount: MicroUsdc) -> anyhow::Result<()> {
+    pub fn cap_refund(
+        &self,
+        client: Address,
+        bucket: u32,
+        amount: MicroUsdc,
+    ) -> anyhow::Result<()> {
         let w = self.db.begin_write()?;
         {
             let mut cap = w.open_table(CAP)?;
