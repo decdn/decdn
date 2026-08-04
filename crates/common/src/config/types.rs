@@ -254,6 +254,18 @@ pub struct BlockchainConfig {
     /// (logical OR). Absent => disabled (`None`); a configured value of `0` is
     /// rejected at resolution.
     pub settlement_auto_by_voucher_nonce_span: Option<u64>,
+    /// Estimated on-chain gas-cost floor (base units, `µUSDC`) below which the
+    /// node does NOT submit a self-defense `disputeChannel` (#1586). When a
+    /// counterparty closes one of this node's channels at a watermark staler
+    /// than the node's latest voucher, the node reacts by submitting that
+    /// voucher inside the dispute window — but only when the recoverable residual
+    /// (`myAmount − onchainClaimedAmount`) meets this floor, so a dust residual
+    /// never costs more gas than it recovers. Unlike the auto-settlement
+    /// triggers this is an always-on reaction (not opt-in); absent => default
+    /// (0.1 USDC = `100_000`). `0` disables the floor (dispute any positive
+    /// residual). No `> 0` requirement — a zero-recovery dispute is guarded out
+    /// regardless.
+    pub settlement_dispute_min_residual_micro_usdc: Option<u64>,
     /// USDC bond-funding swap venue for `decdn setup --pay-bond-with usdc`
     /// (#991). One of `uniswap-v3` / `balancer-v3`. Absent => no swap (the
     /// operator funds the bond in TOKEN directly). Consumed only by the CLI

@@ -14,7 +14,10 @@
 //!   stays open — no dispute window), `withdrawMany` (batch N single-channel
 //!   redemptions into one tx with a single aggregated `FeeRouter` route — the
 //!   redeem sweep's per-tick collapse, #1587), `closeChannel` (initiate close
-//!   with the latest voucher), and `settleChannel` (finalize after the window);
+//!   with the latest voucher), `disputeChannel` (self-defense reaction, #1586:
+//!   when a counterparty opens a close at a stale watermark, the node submits
+//!   its own higher-nonce voucher inside the dispute window to recover the
+//!   residual), and `settleChannel` (finalize after the window);
 //! - buyer writes (#744): `openChannel` (open a channel against an upstream
 //!   provider on first cache-miss pull), `topUp` (extend an existing
 //!   channel's deposit), and `reclaimExpired` (recover the deposit of an
@@ -24,16 +27,16 @@
 //!   learn the `channelId` + `expiresAt`), `ChannelToppedUp`
 //!   (→ raise the tracked deposit
 //!   so post-top-up vouchers are not wrongly rejected),
-//!   `ChannelCloseInitiated` (observed-only here; the dispute monitor is
-//!   deferred per #324), `ChannelSettled` (→ forget the persisted channel
+//!   `ChannelCloseInitiated` (the settlement watcher reconciles the
+//!   pending-settle obligation and, when the close is stale, reacts with
+//!   `disputeChannel`, #1586), `ChannelSettled` (→ forget the persisted channel
 //!   state), and `ChannelExpiredReclaimed` (emitted by `reclaimExpired`; the
 //!   buyer drops its record after its own reclaim tx, not by watching the log).
 //!
 //! The voucher EIP-712 domain (name `"PaymentChannel"`, version `"1"`) and
-//! the `Voucher` type hash live in [`crate::voucher`]; the close/withdraw
-//! `signature` argument is the bytes of a [`crate::voucher::SignedVoucher`]
-//! over that domain. `disputeChannel` is intentionally omitted (the dispute
-//! monitor is out of scope, #324).
+//! the `Voucher` type hash live in [`crate::voucher`]; the close/withdraw/
+//! dispute `signature` argument is the bytes of a
+//! [`crate::voucher::SignedVoucher`] over that domain.
 
 // The `sol!`-generated bindings include macro-emitted code that uses
 // patterns workspace clippy denies (raw indexing into ABI fixed-size byte
@@ -205,6 +208,21 @@ mod sol_types {
             /// channel, and tests opening a dispute window without one.
             function closeChannelWithoutVoucher(bytes32 channelId) external;
 
+            /// Submit a strictly-higher-nonce voucher during the dispute window
+            /// after a counterparty closed at a stale watermark (#1586). Callable
+            /// by any address; the contract requires `status == Closing`,
+            /// `block.timestamp < disputeDeadline`, and `nonce > claimedNonce`
+            /// (strict). The node's self-defense reaction submits its own latest
+            /// voucher here so a stale close cannot strand the residual
+            /// (`myAmount - onchainClaimedAmount`).
+            function disputeChannel(
+                bytes32 channelId,
+                uint256 amount,
+                uint256 nonce,
+                uint256 bytesDelivered,
+                bytes calldata signature
+            ) external;
+
             /// Finalize after the dispute window expires; routes the
             /// un-withdrawn remainder through `FeeRouter` and refunds the
             /// client. Callable by anyone.
@@ -279,8 +297,10 @@ mod sol_types {
                 uint256 newDeposit
             );
 
-            /// Close initiated (dispute window open). Observed-only here —
-            /// the in-process dispute monitor is deferred (#324).
+            /// Close initiated (dispute window open). The settlement watcher
+            /// reconciles the pending-settle obligation from this and, when the
+            /// close watermark is stale relative to the node's latest voucher,
+            /// reacts with `disputeChannel` (#1586).
             event ChannelCloseInitiated(
                 bytes32 indexed channelId,
                 address indexed initiator,
@@ -288,6 +308,18 @@ mod sol_types {
                 uint256 nonce,
                 uint256 bytesDelivered,
                 uint256 disputeDeadline
+            );
+
+            /// A strictly-higher-nonce voucher was accepted during the dispute
+            /// window, advancing the claim watermark (#1586). Emitted by
+            /// `disputeChannel`; `disputor` is whoever submitted the voucher
+            /// (the node itself, in the self-defense reaction).
+            event ChannelDisputed(
+                bytes32 indexed channelId,
+                address indexed disputor,
+                uint256 newAmount,
+                uint256 newNonce,
+                uint256 newBytes
             );
 
             /// Channel settled and closed. The watcher drops the persisted
