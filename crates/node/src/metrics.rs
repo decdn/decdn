@@ -600,6 +600,23 @@ pub struct DecdnMetrics {
     /// `redemption_failures` does NOT move on these — this is the only signal.
     /// Operator-visible name: `decdn_settlement_auto_failures_total`.
     pub settlement_auto_failures: Counter,
+    /// A self-defense `disputeChannel` (#1586) landed: a counterparty closed the
+    /// channel at a stale watermark, and the node submitted its own
+    /// higher-nonce voucher inside the dispute window to recover the residual
+    /// (`myAmount − onchainClaimedAmount`). Pairs with the success `info!` in
+    /// `maybe_dispute_stale_close`. Operator-visible name:
+    /// `decdn_settlement_dispute_ok_total`.
+    pub settlement_dispute_ok: Counter,
+    /// A self-defense `disputeChannel` (#1586) did NOT land — the `send()`
+    /// errored, the receipt errored, or the tx reverted (most benignly a
+    /// `DisputeWindowClosed` race, or another party already ratcheted the
+    /// watermark to/above the node's). Best-effort: the close still settles at
+    /// whatever watermark stands, so this is a visibility signal, not a
+    /// stuck-settlement one. Pairs with the `warn!` in
+    /// `maybe_dispute_stale_close`. Kept distinct from `settlement_dispute_ok`
+    /// so a fire-vs-recovered ratio is computable. Operator-visible name:
+    /// `decdn_settlement_dispute_failures_total`.
+    pub settlement_dispute_failures: Counter,
     /// `settleChannel` finalization-sweep passes that landed: the closed
     /// channel cleared its dispute window and the provider's un-withdrawn
     /// remainder was routed through the `FeeRouter` (a no-op when the channel
@@ -1981,6 +1998,17 @@ recorders! {
     /// Pairs with the `warn!` in `try_auto_settle_close`. Kept distinct from
     /// `settlement_auto_triggered` so a fire-vs-secured ratio is computable.
     settlement_auto_failure => settlement_auto_failures.inc();
+
+    /// A self-defense `disputeChannel` (#1586) landed: the node ratcheted a
+    /// stale close up to its own higher-nonce voucher, recovering the residual.
+    /// Pairs with the success `info!` in `maybe_dispute_stale_close`.
+    settlement_dispute_ok => settlement_dispute_ok.inc();
+
+    /// A self-defense `disputeChannel` (#1586) did not secure the residual — the
+    /// submit failed, the receipt errored, or the tx reverted (benignly on a
+    /// closed-window / already-higher-watermark race). Pairs with the `warn!` in
+    /// `maybe_dispute_stale_close`.
+    settlement_dispute_failure => settlement_dispute_failures.inc();
 
     /// A `settleChannel` finalization sweep landed: the dispute window cleared,
     /// the provider remainder routed through the `FeeRouter`, and the pending
@@ -3589,6 +3617,42 @@ mod tests {
         assert!(
             has_metric_line(&text, "decdn_settlement_auto_failures_total", 2),
             "expected 2 failed closes:\n{text}"
+        );
+    }
+
+    #[test]
+    fn settlement_dispute_counters_start_at_zero_and_increment() {
+        // #1586. The self-defense-dispute counters: an ok counter (a stale
+        // close was ratcheted up) and a failure counter (the dispute did not
+        // land). Both must be exposed at zero on a fresh registry (dashboards
+        // built before any dispute don't render `(no data)`) and increment
+        // independently so an operator can compute a fire-vs-recovered ratio.
+        // The OpenMetrics encoder appends `_total`, so the exported names are
+        // the suffixed forms asserted here.
+        let metrics = Metrics::new();
+        let text = metrics.encode().unwrap();
+        for name in [
+            "decdn_settlement_dispute_ok_total",
+            "decdn_settlement_dispute_failures_total",
+        ] {
+            assert!(
+                has_metric_line(&text, name, 0),
+                "settlement-dispute counter {name} should start at zero:\n{text}"
+            );
+        }
+
+        metrics.settlement_dispute_ok();
+        metrics.settlement_dispute_failure();
+        metrics.settlement_dispute_failure();
+
+        let text = metrics.encode().unwrap();
+        assert!(
+            has_metric_line(&text, "decdn_settlement_dispute_ok_total", 1),
+            "expected 1 landed dispute:\n{text}"
+        );
+        assert!(
+            has_metric_line(&text, "decdn_settlement_dispute_failures_total", 2),
+            "expected 2 failed disputes:\n{text}"
         );
     }
 

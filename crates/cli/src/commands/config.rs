@@ -198,6 +198,13 @@ pub fn write_validate_summary<W: std::io::Write>(
     }
     writeln!(
         w,
+        "  settlement_dispute_min_residual_micro_usdc: {}",
+        resolved
+            .blockchain
+            .settlement_dispute_min_residual_micro_usdc
+    )?;
+    writeln!(
+        w,
         "  cache_dir:                {}",
         resolved.cache.cache_dir.display()
     )?;
@@ -483,6 +490,7 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # buyer_max_approve = true                       # unlimited USDC approval for PaymentChannel (#744); node default true, decdn client default false (exact deposit-sized approval); set true on the client to opt into unlimited
 # settlement_auto_threshold_micro_usdc = 50000000   # auto-closeChannel once un-redeemed µUSDC reaches this (#742); leave unset/commented to disable — when set it must be > 0
 # settlement_auto_by_voucher_nonce_span = 1000       # auto-closeChannel once the un-redeemed nonce span reaches this (#742); leave unset/commented to disable — when set it must be > 0
+# settlement_dispute_min_residual_micro_usdc = 100000 # self-defense disputeChannel gas-cost floor (#1586): react to a stale close only when the recoverable residual clears this µUSDC; default 0.1 USDC; 0 disables the floor
 # CLI-only [blockchain] keys — consumed by `decdn setup` / `decdn appeal`, NOT the daemon.
 # They live here because [blockchain] denies unknown fields and a node's node.toml is
 # shared with those CLIs, so a config that drives them must still pass `config validate`.
@@ -724,6 +732,7 @@ mod tests {
             buyer_max_approve,
             settlement_auto_threshold_micro_usdc,
             settlement_auto_by_voucher_nonce_span,
+            settlement_dispute_min_residual_micro_usdc,
             swap_venue,
             swap_router_address,
             swap_quoter_address,
@@ -788,6 +797,10 @@ mod tests {
             (
                 "settlement_auto_by_voucher_nonce_span =",
                 settlement_auto_by_voucher_nonce_span.is_none(),
+            ),
+            (
+                "settlement_dispute_min_residual_micro_usdc =",
+                settlement_dispute_min_residual_micro_usdc.is_none(),
             ),
             ("swap_venue =", swap_venue.is_none()),
             ("swap_router_address =", swap_router_address.is_none()),

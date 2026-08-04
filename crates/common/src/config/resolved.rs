@@ -163,6 +163,13 @@ pub struct ResolvedBlockchain {
     /// exact count. `None` disables the span trigger; when `Some`, the resolver
     /// guarantees `> 0`.
     pub settlement_auto_by_voucher_nonce_span: Option<u64>,
+    /// Estimated on-chain gas-cost floor (base units, `µUSDC`) below which the
+    /// node does not submit a self-defense `disputeChannel` (#1586). Always-on
+    /// (not opt-in): the resolver defaults it to
+    /// `super::DEFAULT_DISPUTE_MIN_RESIDUAL_MICRO_USDC`. `0` disables the floor
+    /// (dispute any positive residual); a zero-recovery dispute is guarded out
+    /// regardless of this value.
+    pub settlement_dispute_min_residual_micro_usdc: u64,
 }
 
 /// Resolved cache fields.

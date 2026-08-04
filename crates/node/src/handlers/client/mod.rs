@@ -1292,6 +1292,19 @@ impl ClientHandler {
         Ok(())
     }
 
+    /// Snapshot the latest tracked [`ChannelState`] for `channel_id`, or `None`
+    /// if this node does not track the channel. Used by the settlement watcher's
+    /// self-defense-dispute reaction (#1586) to read the node's latest persisted
+    /// voucher (nonce / amount / signature) when a counterparty closes a channel
+    /// at a stale watermark. Reads the in-memory row, which the voucher-accept
+    /// path advances only *after* the durable store write commits (#527), so the
+    /// snapshot never reports a voucher the node has not persisted.
+    pub async fn channel_state_snapshot(&self, channel_id: ChannelId) -> Option<ChannelState> {
+        let entry = self.channels.lock().await.get(&channel_id).cloned()?;
+        let guard = entry.lock().await;
+        Some(guard.state.clone())
+    }
+
     async fn refresh_channel_metrics(&self) {
         let _refresh = self.channel_metrics_refresh.lock().await;
         let (open, channels) = {
