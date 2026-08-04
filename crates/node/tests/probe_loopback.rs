@@ -839,11 +839,16 @@ async fn probe_rate_limit_returns_rate_limited_close_code() -> anyhow::Result<()
         let target = target.clone();
         async move {
             let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
-            let conn = client_ep
-                .connect(target, ALPN_PROBE)
-                .await
-                .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
-            Ok((client_ep, conn))
+            // Close the just-bound endpoint on a connect error so a retried
+            // attempt never leaks a socket/driver task (matches the file's
+            // explicit-`close()` cleanup convention).
+            match client_ep.connect(target, ALPN_PROBE).await {
+                Ok(conn) => Ok((client_ep, conn)),
+                Err(e) => {
+                    client_ep.close().await;
+                    Err(anyhow::anyhow!("connect: {e}"))
+                }
+            }
         }
     })
     .await?;
@@ -951,11 +956,16 @@ async fn probe_three_layer_limiter_rejects_per_peer() -> anyhow::Result<()> {
         let client_sk = client_sk.clone();
         async move {
             let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
-            let conn = client_ep
-                .connect(target, ALPN_PROBE)
-                .await
-                .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
-            Ok((client_ep, conn))
+            // Close the just-bound endpoint on a connect error so a retried
+            // attempt never leaks a socket/driver task (matches the file's
+            // explicit-`close()` cleanup convention).
+            match client_ep.connect(target, ALPN_PROBE).await {
+                Ok(conn) => Ok((client_ep, conn)),
+                Err(e) => {
+                    client_ep.close().await;
+                    Err(anyhow::anyhow!("connect: {e}"))
+                }
+            }
         }
     })
     .await?;
