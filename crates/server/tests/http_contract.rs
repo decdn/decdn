@@ -139,6 +139,47 @@ async fn fund_then_channel_then_topup_happy_path() {
 }
 
 #[tokio::test]
+async fn fund_page_embeds_sitekey_and_params() {
+    let state = app_state_with_fakes();
+    let app = sponsord::http::router(state);
+
+    let resp = app
+        .oneshot(
+            Request::get(format!("/fund?client={CLIENT}&hash={HASH}"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let html = String::from_utf8(bytes.to_vec()).expect("utf8 body");
+    assert!(html.contains("TEST_SITEKEY"));
+    assert!(html.contains(CLIENT));
+    assert!(html.contains(HASH));
+}
+
+#[tokio::test]
+async fn fund_page_rejects_non_hex_hash_with_400() {
+    let state = app_state_with_fakes();
+    let app = sponsord::http::router(state);
+
+    let resp = app
+        .oneshot(
+            Request::get(format!(
+                "/fund?client={CLIENT}&hash=%3Cscript%3Ealert(1)%3C%2Fscript%3E"
+            ))
+            .body(Body::empty())
+            .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn fund_rejects_bad_captcha_with_403() {
     let state = app_state_with_options(FakeOptions {
         captcha_passes: false,

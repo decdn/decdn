@@ -205,7 +205,7 @@ pub fn app_state_with_options(opts: FakeOptions) -> AppState {
         working_balance: opts.working_balance,
         monthly_cap: opts.monthly_cap,
         turnstile_secret: "secret".into(),
-        turnstile_sitekey: "sitekey".into(),
+        turnstile_sitekey: "TEST_SITEKEY".into(),
         data_dir,
         topup_max_skew_secs: 120,
         channel_ttl_secs: 7 * 24 * 60 * 60,

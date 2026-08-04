@@ -21,17 +21,33 @@ pub struct FundPageQuery {
     pub hash: String,
 }
 
-/// Minimal placeholder page: Task 17 fills in the real Turnstile widget.
-/// Carries the sitekey, client, and hash through so that later task can wire
-/// up the challenge without changing this handler's signature.
-pub async fn page(State(state): State<AppState>, Query(q): Query<FundPageQuery>) -> Html<String> {
-    Html(format!(
-        "<!doctype html><html><body>\n\
-         <div data-turnstile-sitekey=\"{}\" data-client=\"{}\" data-hash=\"{}\">\n\
-         Verify you are not a robot to fund a payment channel.\n\
-         </div></body></html>",
-        state.cfg.turnstile_sitekey, q.client, q.hash
-    ))
+/// The Turnstile-widget page shipped in the binary (`include_str!`, not read
+/// from disk at runtime).
+const FUND_PAGE_TEMPLATE: &str = include_str!("../../assets/fund.html");
+
+/// `true` iff `s` is `expected_len` hex digits, with an optional `0x` prefix.
+/// `client`/`hash` are interpolated verbatim into [`FUND_PAGE_TEMPLATE`]
+/// below, so this is the page's only injection guard: hex-only input can't
+/// carry `<`, `>`, `"`, or any other HTML/script metacharacter.
+fn is_hex_of_len(s: &str, expected_len: usize) -> bool {
+    let digits = s.strip_prefix("0x").unwrap_or(s);
+    digits.len() == expected_len && digits.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Renders the Turnstile widget page: loads the Cloudflare script, shows the
+/// challenge for `cfg.turnstile_sitekey`, and on token wires up a `POST
+/// /fund` with `{client, hash, turnstile_token}` (see `assets/fund.html`).
+/// `client`/`hash` are validated as hex before being interpolated into the
+/// page (see `is_hex_of_len`); either failing to parse is a `400`.
+pub async fn page(State(state): State<AppState>, Query(q): Query<FundPageQuery>) -> Response {
+    if !is_hex_of_len(&q.client, 40) || !is_hex_of_len(&q.hash, 64) {
+        return err_json(StatusCode::BAD_REQUEST, "bad_request");
+    }
+    let html = FUND_PAGE_TEMPLATE
+        .replace("{{SITEKEY}}", &state.cfg.turnstile_sitekey)
+        .replace("{{CLIENT}}", &q.client)
+        .replace("{{HASH}}", &q.hash);
+    Html(html).into_response()
 }
 
 #[derive(Debug, Deserialize)]
