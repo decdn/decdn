@@ -877,6 +877,58 @@ async fn clean_one<P: Provider + Clone>(
     }
 }
 
+/// Best-effort wind-down of the expired buyer channel that `fetch`'s
+/// [`open_or_reuse`](super::fetch::open_or_reuse) is about to replace (#1553).
+/// Drives the same [`clean_one`] state machine `decdn channel clean` uses, so an
+/// expired-and-open channel reclaims its residual deposit in one `reclaimExpired`
+/// (no dispute window) right here — the USDC returns without the operator
+/// remembering the manual clean. It never propagates: a channel already winding
+/// down or a transient RPC error is only reported, and `decdn channel clean`
+/// stays the backstop (the expired row survives in the store even after the
+/// provider index re-points to the replacement). Prints its own status line;
+/// callers ignore the outcome and continue opening the replacement.
+pub(crate) async fn reclaim_replaced_expired<P: Provider + Clone>(
+    store: &RedbBuyerChannelStore,
+    contract: &PaymentChannel::PaymentChannelInstance<P>,
+    signer: &PrivateKeySigner,
+    domain: &Eip712Domain,
+    state: &BuyerChannelState,
+    now: u64,
+) {
+    match clean_one(contract, store, signer, domain, state, now).await {
+        // An on-chain revert (e.g. `reclaimExpired` rejected because clock skew
+        // makes the channel look not-yet-expired) — NOT a dispute window. Don't
+        // claim one; just point at a `channel clean` retry, which re-reads state.
+        Ok(CleanStatus::Reverted(op)) => eprintln!(
+            "warning: auto-reclaiming expired buyer channel {} reverted ({op}); re-run \
+             `decdn channel clean` to retry",
+            state.channel_id
+        ),
+        // Genuinely mid wind-down (just closed, or inside the dispute window): a
+        // later `channel clean` run finalizes it once the window elapses.
+        Ok(status) if status.incomplete() => eprintln!(
+            "warning: expired buyer channel {} is winding down ({}); re-run \
+             `decdn channel clean` after its dispute window to reclaim its deposit",
+            state.channel_id,
+            status.label()
+        ),
+        // Terminal in one shot (reclaimed / settled / already gone on-chain):
+        // the deposit is back and the stale row is cleared. Just report it.
+        Ok(status) => eprintln!(
+            "expired buyer channel {}: {}",
+            state.channel_id,
+            status.label()
+        ),
+        // Transient RPC/receipt failure: the deposit is untouched and still
+        // escrowed. Don't fail the fetch — `channel clean` reclaims it later.
+        Err(e) => eprintln!(
+            "warning: could not auto-reclaim expired buyer channel {} ({e}); its deposit stays \
+             escrowed — reclaim it later with `decdn channel clean`",
+            state.channel_id
+        ),
+    }
+}
+
 /// `decdn channel clean` (#1136): reclaim USDC across every tracked channel by
 /// driving each through the unilateral close → dispute-window → settle/reclaim
 /// sweep. Idempotent and resumable — channels mid dispute-window are reported and
