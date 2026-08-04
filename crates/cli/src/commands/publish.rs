@@ -165,21 +165,103 @@ async fn preflight_chain_id(rpc_url: &str, expected: u64) -> anyhow::Result<()> 
 // namespace create
 // -------------------------------------------------------------------------
 
+/// The outcome of `namespace create`'s single transaction — the five mutually
+/// exclusive states as one value, so text and JSON rendering derive from one
+/// source of truth and can no longer contradict each other (issue #1578). Modeled
+/// on [`SeatOutcome`]: an illegal combination (a hash on a dry run, a `created`
+/// with no hash) is now unrepresentable rather than merely unreached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NamespaceStatus {
+    /// `--dry-run`: nothing was sent, and no keystore was loaded.
+    DryRun,
+    /// Nothing was minted: the node rejected the send before broadcast. Distinct
+    /// from `Reverted` (which mined) and `MaybeBroadcast` (whose fate is unknown).
+    Failed,
+    /// A transport-class send failure (timeout, reset, 5xx). The request may have
+    /// reached the node and minted a namespace, but no hash was captured, so the
+    /// outcome is unknown and a blind retry can burn quota against
+    /// `maxNamespacesPerPublisher` (#1577).
+    MaybeBroadcast,
+    /// The transaction was broadcast but its receipt was unreadable, so a
+    /// namespace may or may not exist. Keeps the hash — the only handle on it.
+    InFlight(B256),
+    /// Mined, but the call reverted: it burned gas and minted nothing. Keeps its
+    /// hash as a permanent handle, so a gas-reconciling consumer can find it —
+    /// distinct from `Failed`, which never broadcast (#1550).
+    Reverted(B256),
+    /// `createNamespace` confirmed. `id` is `None` only when the receipt carried
+    /// no decodable `NamespaceCreated` log; the tx hash is then the sole handle
+    /// on the live namespace, so it is never dropped.
+    Created { tx: B256, id: Option<u64> },
+}
+
+impl NamespaceStatus {
+    /// The transaction hash, for any state that has one.
+    const fn tx(self) -> Option<B256> {
+        match self {
+            Self::InFlight(hash) | Self::Reverted(hash) | Self::Created { tx: hash, .. } => {
+                Some(hash)
+            }
+            Self::DryRun | Self::Failed | Self::MaybeBroadcast => None,
+        }
+    }
+
+    /// The minted namespace id, known only when the create confirmed and its
+    /// `NamespaceCreated` log decoded. `Some` therefore implies `status ==
+    /// "created"`, which is the invariant a `--json` consumer relies on.
+    const fn namespace_id(self) -> Option<u64> {
+        match self {
+            Self::Created { id, .. } => id,
+            Self::DryRun
+            | Self::Failed
+            | Self::MaybeBroadcast
+            | Self::InFlight(_)
+            | Self::Reverted(_) => None,
+        }
+    }
+
+    /// Whether the transaction was broadcast, for the `submitted` field:
+    /// `Some(true)`/`Some(false)` when it is known, and `None` for
+    /// `MaybeBroadcast`, where it is exactly what cannot be answered. A flat
+    /// `false` there is the #1577 lie.
+    const fn submitted(self) -> Option<bool> {
+        match self {
+            Self::MaybeBroadcast => None,
+            Self::InFlight(_) | Self::Reverted(_) | Self::Created { .. } => Some(true),
+            Self::DryRun | Self::Failed => Some(false),
+        }
+    }
+
+    /// The `status=` token in the receipt.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::DryRun => "dry_run",
+            Self::Failed => "failed",
+            Self::MaybeBroadcast => "maybe_broadcast",
+            Self::InFlight(_) => "unknown",
+            Self::Reverted(_) => "reverted",
+            Self::Created { .. } => "created",
+        }
+    }
+}
+
+/// The `submitted=` token for a single-tx text receipt whose transaction has no
+/// hash: a definite `true`/`false`, or `unknown` for a transport failure whose
+/// broadcast cannot be determined.
+const fn submitted_token(submitted: Option<bool>) -> &'static str {
+    match submitted {
+        Some(true) => "true",
+        Some(false) => "false",
+        None => "unknown",
+    }
+}
+
 /// Result of `namespace create`. `operator` is `None` on a dry run (which loads
 /// no keystore, so the signer address is unknown).
 pub(crate) struct NamespaceOutcome {
     pub(crate) operator: Option<Address>,
     pub(crate) registry: Address,
-    /// The minted id, from the `NamespaceCreated` event. `None` whenever it
-    /// could not be read; `status` tells the reasons apart (see
-    /// [`single_tx_status`]). The converse is the part a `--json` consumer needs:
-    /// a non-null `namespace_id` implies `status == "created"`.
-    pub(crate) namespace_id: Option<u64>,
-    /// What the `createNamespace` send did on-chain — the single value the
-    /// receipt's `status`, `tx`, and `submitted` all derive from, so they can no
-    /// longer disagree. `NotSent` on a dry run.
-    pub(crate) send: SendOutcome,
-    pub(crate) dry_run: bool,
+    pub(crate) status: NamespaceStatus,
 }
 
 pub(crate) fn write_namespace_outcome(
@@ -187,15 +269,16 @@ pub(crate) fn write_namespace_outcome(
     o: &NamespaceOutcome,
     json: bool,
 ) -> io::Result<()> {
-    let status = single_tx_status(o.dry_run, o.send, "created");
+    let tx = o.status.tx();
+    let namespace_id = o.status.namespace_id();
     if json {
         let value = serde_json::json!({
-            "submitted": submitted_state(o.dry_run, o.send),
-            "tx": o.send.tx().map(|h| format!("{h:#x}")),
+            "submitted": o.status.submitted(),
+            "tx": tx.map(|h| format!("{h:#x}")),
             "operator": o.operator.map(|a| format!("{a:#x}")),
             "publisher_registry": format!("{:#x}", o.registry),
-            "namespace_id": o.namespace_id,
-            "status": status,
+            "namespace_id": namespace_id,
+            "status": o.status.label(),
         });
         return writeln!(w, "{value}");
     }
@@ -205,10 +288,18 @@ pub(crate) fn write_namespace_outcome(
     writeln!(w, "publisher_registry={:#x}", o.registry)?;
     // Its own line, like `ready_at`: the id is absent whenever it could not be
     // decoded, and `status` + `tx` still have to print without it.
-    if let Some(id) = o.namespace_id {
+    if let Some(id) = namespace_id {
         writeln!(w, "namespace_id={id}")?;
     }
-    write_single_tx_status_line(w, status, o.dry_run, o.send)
+    match tx {
+        Some(h) => writeln!(w, "status={} tx={h:#x}", o.status.label()),
+        None => writeln!(
+            w,
+            "status={} submitted={}",
+            o.status.label(),
+            submitted_token(o.status.submitted())
+        ),
+    }
 }
 
 async fn namespace_create(
@@ -216,52 +307,68 @@ async fn namespace_create(
     global_config: Option<&Path>,
 ) -> anyhow::Result<()> {
     let (resolved, registry) = registry_ctx(&args.chain, global_config)?;
-    let mut outcome = NamespaceOutcome {
-        operator: None,
-        registry,
-        namespace_id: None,
-        send: SendOutcome::NotSent,
-        dry_run: args.chain.common.dry_run,
-    };
+    let dry_run = args.chain.common.dry_run;
+    let mut operator = None;
+    let mut status = NamespaceStatus::DryRun;
     // `Ok` on the dry-run path: nothing was sent, so there is nothing to decode
     // and nothing to report as failed. The 0 is never read — only `created.err()`
     // is — which matters because 0 is the registry's reserved "no namespace" id,
     // so it would be a plausible-looking lie if it ever reached the receipt.
     let mut created: anyhow::Result<u64> = Ok(0);
 
-    if !outcome.dry_run {
+    if !dry_run {
         // The keystore is decrypted only when actually submitting — a dry run
         // needs no secrets.
         let (signer, provider) = signer_and_provider(&resolved, &args.chain).await?;
-        outcome.operator = Some(signer.address());
+        operator = Some(signer.address());
         let contract = PublisherRegistry::new(registry, &provider);
+        let mut recorded = SendOutcome::NotSent;
         let sent = decdn_incentive::tx::send_for_receipt(
             contract.createNamespace(),
             "createNamespace",
             Some("check the RPC, gas, and the registry address"),
-            &mut outcome.send,
+            &mut recorded,
         )
         .await;
 
-        match sent {
-            // Every failure below happens AFTER the namespace exists on-chain,
-            // so it must not short-circuit the receipt — the tx hash is the only
-            // handle the publisher has on a namespace whose id was lost, and a
-            // blind retry mints a second one against `maxNamespacesPerPublisher`.
+        status = match sent {
+            // Every decode failure below happens AFTER the namespace exists
+            // on-chain, so it must not short-circuit the receipt — the tx hash is
+            // the only handle the publisher has on a namespace whose id was lost,
+            // and a blind retry mints a second one against
+            // `maxNamespacesPerPublisher`. The receipt's hash always exists on a
+            // confirmed create, so `Created` carries it unconditionally.
             Ok(receipt) => {
                 created = decode_created_namespace(&receipt);
-                if let Ok(id) = created {
-                    outcome.namespace_id = Some(id);
+                NamespaceStatus::Created {
+                    tx: receipt.transaction_hash,
+                    id: created.as_ref().ok().copied(),
                 }
             }
-            // `outcome.send` already carries which failure this was — a broadcast
-            // whose receipt was unreadable (`InFlight`, keeps its hash), a
-            // transport failure that may still have minted (`MaybeBroadcast`), a
-            // confirmed revert (`Reverted`), or a clean rejection (`Rejected`).
-            Err(err) => created = Err(err),
-        }
+            Err(err) => {
+                created = Err(err);
+                // `recorded` already distinguishes the failure shapes: a broadcast
+                // whose receipt was unreadable (`InFlight`, keeps its hash), a
+                // transport failure that may still have minted (`MaybeBroadcast`),
+                // a confirmed revert (`Reverted`, minted nothing but kept its
+                // hash), or a clean rejection (`Rejected` → `Failed`).
+                match recorded {
+                    SendOutcome::InFlight(hash) => NamespaceStatus::InFlight(hash),
+                    SendOutcome::Reverted(hash) => NamespaceStatus::Reverted(hash),
+                    SendOutcome::MaybeBroadcast => NamespaceStatus::MaybeBroadcast,
+                    SendOutcome::Rejected | SendOutcome::Confirmed(_) | SendOutcome::NotSent => {
+                        NamespaceStatus::Failed
+                    }
+                }
+            }
+        };
     }
 
+    let outcome = NamespaceOutcome {
+        operator,
+        registry,
+        status,
+    };
     let mut out = io::stdout().lock();
     // `flush` explicitly: `Stdout` is a `LineWriter`, so a partial write can
     // buffer the tail and fail at `drop`, where the result is unobservable — a
@@ -270,11 +377,7 @@ async fn namespace_create(
         .and_then(|()| out.flush())
         .err();
     drop(out);
-    // A namespace was minted but its id could not be decoded only when the send
-    // confirmed: that is the case whose recovery needs the log query.
-    let minted_undecoded =
-        matches!(outcome.send, SendOutcome::Confirmed(_)) && outcome.namespace_id.is_none();
-    let context = namespace_failure_context(outcome.send, minted_undecoded);
+    let context = namespace_failure_context(outcome.status);
     propagate(
         created.err().map(|err| match context {
             Some(note) => err.context(note),
@@ -283,8 +386,11 @@ async fn namespace_create(
         write_err,
         "failed to write namespace-create output",
         &single_tx_receipt(
-            outcome.namespace_id.map(|id| format!("namespace_id={id}")),
-            outcome.send.tx(),
+            outcome
+                .status
+                .namespace_id()
+                .map(|id| format!("namespace_id={id}")),
+            outcome.status.tx(),
         ),
     )
 }
@@ -295,52 +401,39 @@ async fn namespace_create(
 /// A namespace cannot be un-created, and creating it already incremented
 /// `namespaceCount` against `maxNamespacesPerPublisher` — so an operator who
 /// retries blind burns quota to mint a second one while the first stays owned
-/// with its id still unrecovered. That warning is only honest once something may
-/// have reached the chain: a rejected send and a confirmed revert both minted
-/// nothing. The clean rejection is also the modal failure, since
-/// `NamespaceCapReached` is `createNamespace`'s only revert and so surfaces from
-/// the pre-flight gas estimate, before anything is broadcast.
-///
-/// `minted_undecoded` is set only when the send confirmed but its id could not
-/// be decoded — the one case where the namespace definitely exists.
-const fn namespace_failure_context(
-    send: SendOutcome,
-    minted_undecoded: bool,
-) -> Option<&'static str> {
-    if minted_undecoded {
+/// with its id still unrecovered. That warning is only honest once something
+/// reached the chain: a rejected send minted nothing and has no hash to point
+/// at. It is also the modal failure, since `NamespaceCapReached` is
+/// `createNamespace`'s only revert and so surfaces from the pre-flight gas
+/// estimate, before anything is broadcast.
+const fn namespace_failure_context(status: NamespaceStatus) -> Option<&'static str> {
+    match status {
+        NamespaceStatus::InFlight(_) => Some(
+            "the transaction was broadcast — check the tx above before re-running, since a \
+             create that landed already counts against maxNamespacesPerPublisher",
+        ),
+        // A transport failure may have minted too, but has no hash to point at,
+        // so the note sends the operator to this signer's own transactions.
+        NamespaceStatus::MaybeBroadcast => Some(
+            "the request may have reached the node and broadcast the transaction — check this \
+             signer's pending and mined transactions before re-running, since a create that \
+             landed already counts against maxNamespacesPerPublisher",
+        ),
         // Names a log query rather than the receipt's own log, and deliberately
         // not `ownerOf`. `ownerOf` maps id → owner, so it needs the very id that
         // was lost — it can confirm a guess, never produce one. An owner-filtered
         // `eth_getLogs` can: `createNamespace` emits `NamespaceCreated`
         // unconditionally and indexes both parameters, so the id arrives in a
-        // topic with no data decode. That holds even for a receipt that came back
-        // without the log — the log is still on-chain, it just was not in what
-        // the RPC returned.
-        return Some(
+        // topic with no data decode. That holds for every failure this note rides
+        // along with, including a receipt that came back without the log — the
+        // log is still on-chain, it just was not in what the RPC returned.
+        NamespaceStatus::Created { .. } => Some(
             "the namespace exists and is owned by the signer — recover its id by filtering the \
              registry's NamespaceCreated logs for this signer rather than re-running, which \
              mints a second namespace",
-        );
-    }
-    match send {
-        // Broadcast, receipt unreadable: the hash is in the receipt above.
-        SendOutcome::InFlight(_) => Some(
-            "the transaction was broadcast — check the tx above before re-running, since a \
-             create that landed already counts against maxNamespacesPerPublisher",
         ),
-        // Transport failure: the send may have broadcast, but there is no hash to
-        // cite, so the operator has to search this signer's own transactions.
-        SendOutcome::MaybeBroadcast => Some(
-            "the request may have reached the node and broadcast the transaction — check this \
-             signer's pending and mined transactions before re-running, since a create that \
-             landed already counts against maxNamespacesPerPublisher",
-        ),
-        // A rejected send or a confirmed revert minted nothing; a confirmed
-        // success with a decoded id is not a failure at all.
-        SendOutcome::Rejected
-        | SendOutcome::Reverted(_)
-        | SendOutcome::NotSent
-        | SendOutcome::Confirmed(_) => None,
+        // A rejected send or a confirmed revert minted nothing.
+        NamespaceStatus::DryRun | NamespaceStatus::Failed | NamespaceStatus::Reverted(_) => None,
     }
 }
 
@@ -380,78 +473,6 @@ fn decode_created_namespace(
         )?;
     u64::try_from(created.inner.data.namespaceId)
         .context("namespace id exceeds u64 (unexpected on this chain)")
-}
-
-/// The `status=` token for a command that submits exactly ONE transaction.
-///
-/// Every non-success case gets its own answer, because they call for different
-/// operator actions:
-///
-/// - `unknown` — broadcast, receipt unreadable ([`SendOutcome::InFlight`]). The
-///   hash is known; check it on an explorer before re-running.
-/// - `maybe_broadcast` — a transport failure ([`SendOutcome::MaybeBroadcast`]).
-///   No hash was captured; the tx may still be in the mempool, so re-running can
-///   double-submit. This is the #1577 case that was being mislabelled `failed`.
-/// - `reverted` — mined but reverted ([`SendOutcome::Reverted`]). The hash is a
-///   permanent handle; the tx burned gas and had no effect. This is the #1550
-///   case that was being flattened into `failed`.
-/// - `failed` — the node rejected the send ([`SendOutcome::Rejected`]); nothing
-///   was broadcast.
-const fn single_tx_status(
-    dry_run: bool,
-    send: SendOutcome,
-    confirmed: &'static str,
-) -> &'static str {
-    if dry_run {
-        return "dry_run";
-    }
-    match send {
-        SendOutcome::Confirmed(_) => confirmed,
-        SendOutcome::InFlight(_) => "unknown",
-        SendOutcome::MaybeBroadcast => "maybe_broadcast",
-        SendOutcome::Reverted(_) => "reverted",
-        SendOutcome::Rejected | SendOutcome::NotSent => "failed",
-    }
-}
-
-/// Whether the transaction was broadcast, for a single-tx receipt's `submitted`
-/// field: a definite `Some(true)`/`Some(false)` for every state whose broadcast
-/// is known, and `None` for [`SendOutcome::MaybeBroadcast`], where whether the
-/// transaction was broadcast is exactly what cannot be answered. Serialized into
-/// JSON it becomes `true`/`false`/`null`; a flat `false` there is the #1577 lie.
-const fn submitted_state(dry_run: bool, send: SendOutcome) -> Option<bool> {
-    if dry_run {
-        return Some(false);
-    }
-    match send {
-        SendOutcome::Confirmed(_) | SendOutcome::Reverted(_) | SendOutcome::InFlight(_) => {
-            Some(true)
-        }
-        SendOutcome::Rejected | SendOutcome::NotSent => Some(false),
-        SendOutcome::MaybeBroadcast => None,
-    }
-}
-
-/// The trailing `status=… (tx=…|submitted=…)` line shared by the single-tx
-/// text receipts. A captured hash is the operator's handle, so it wins; failing
-/// that, `submitted` reports the broadcast state, including the honest
-/// `submitted=unknown` for a transport failure.
-fn write_single_tx_status_line(
-    w: &mut impl io::Write,
-    status: &str,
-    dry_run: bool,
-    send: SendOutcome,
-) -> io::Result<()> {
-    if let Some(h) = send.tx() {
-        writeln!(w, "status={status} tx={h:#x}")
-    } else {
-        let submitted = match submitted_state(dry_run, send) {
-            Some(true) => "true",
-            Some(false) => "false",
-            None => "unknown",
-        };
-        writeln!(w, "status={status} submitted={submitted}")
-    }
 }
 
 /// Return the on-chain failure if there was one, otherwise the stdout-write
@@ -591,9 +612,9 @@ impl SeatOutcome {
     }
 
     /// Whether this seat's outcome is uncertain — a broadcast whose receipt could
-    /// not be read, or a send whose broadcast is unknown. Either one is a state
-    /// the operator must resolve before re-running, so it outranks every other
-    /// status in [`AssignOutcome::status`].
+    /// not be read, or a send whose broadcast is unknown. Either is a state the
+    /// operator must resolve before re-running, so it outranks every other status
+    /// in [`AssignOutcome::status`].
     const fn is_uncertain(self) -> bool {
         matches!(self, Self::InFlight(_) | Self::MaybeBroadcast)
     }
@@ -786,6 +807,65 @@ async fn assign(args: &cli::AssignArgs, global_config: Option<&Path>) -> anyhow:
 // revoke
 // -------------------------------------------------------------------------
 
+/// The outcome of `publish revoke`'s single transaction — the four mutually
+/// exclusive states as one value, the `removeOrigin` parallel of
+/// [`NamespaceStatus`]. It has no decoded payload, so `Revoked` is a bare hash
+/// rather than a struct.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RevokeStatus {
+    /// `--dry-run`: nothing was sent, and no keystore was loaded.
+    DryRun,
+    /// Nothing was unseated: the node rejected the send before broadcast.
+    /// Distinct from `Reverted` (mined) and `MaybeBroadcast` (fate unknown).
+    Failed,
+    /// A transport-class send failure (timeout, reset, 5xx). The request may have
+    /// reached the node and unseated the operator, but no hash was captured, so
+    /// the outcome is unknown and re-running can double-submit (#1577).
+    MaybeBroadcast,
+    /// The transaction was broadcast but its receipt was unreadable, so the
+    /// operator may or may not still be seated. Keeps the hash — the only handle
+    /// on it.
+    InFlight(B256),
+    /// Mined, but the call reverted: it burned gas and unseated nothing. Keeps
+    /// its hash — distinct from `Failed`, which never broadcast (#1550).
+    Reverted(B256),
+    /// `removeOrigin` confirmed. The operator is unseated.
+    Revoked(B256),
+}
+
+impl RevokeStatus {
+    /// The transaction hash, for any state that has one.
+    const fn tx(self) -> Option<B256> {
+        match self {
+            Self::InFlight(hash) | Self::Reverted(hash) | Self::Revoked(hash) => Some(hash),
+            Self::DryRun | Self::Failed | Self::MaybeBroadcast => None,
+        }
+    }
+
+    /// Whether the transaction was broadcast, for the `submitted` field. `None`
+    /// for `MaybeBroadcast`, where it cannot be answered — a flat `false` there
+    /// is the #1577 lie.
+    const fn submitted(self) -> Option<bool> {
+        match self {
+            Self::MaybeBroadcast => None,
+            Self::InFlight(_) | Self::Reverted(_) | Self::Revoked(_) => Some(true),
+            Self::DryRun | Self::Failed => Some(false),
+        }
+    }
+
+    /// The `status=` token in the receipt.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::DryRun => "dry_run",
+            Self::Failed => "failed",
+            Self::MaybeBroadcast => "maybe_broadcast",
+            Self::InFlight(_) => "unknown",
+            Self::Reverted(_) => "reverted",
+            Self::Revoked(_) => "revoked",
+        }
+    }
+}
+
 /// Receipt for `publish revoke`. One transaction, so the shape is simpler than
 /// [`AssignOutcome`] — but it needs the same honesty about a broadcast whose
 /// outcome could not be read.
@@ -795,10 +875,7 @@ pub(crate) struct RevokeOutcome {
     pub(crate) namespace_id: u64,
     /// The operator being unseated.
     pub(crate) revoked: Address,
-    /// What the `removeOrigin` send did on-chain — the single value the receipt's
-    /// `status`, `tx`, and `submitted` derive from. `NotSent` on a dry run.
-    pub(crate) send: SendOutcome,
-    pub(crate) dry_run: bool,
+    pub(crate) status: RevokeStatus,
 }
 
 pub(crate) fn write_revoke_outcome(
@@ -806,16 +883,16 @@ pub(crate) fn write_revoke_outcome(
     o: &RevokeOutcome,
     json: bool,
 ) -> io::Result<()> {
-    let status = single_tx_status(o.dry_run, o.send, "revoked");
+    let tx = o.status.tx();
     if json {
         let value = serde_json::json!({
-            "submitted": submitted_state(o.dry_run, o.send),
-            "tx": o.send.tx().map(|h| format!("{h:#x}")),
+            "submitted": o.status.submitted(),
+            "tx": tx.map(|h| format!("{h:#x}")),
             "operator": o.operator.map(|a| format!("{a:#x}")),
             "origin_assignment": format!("{:#x}", o.origin_assignment),
             "namespace_id": o.namespace_id,
             "revoked_operator": format!("{:#x}", o.revoked),
-            "status": status,
+            "status": o.status.label(),
         });
         return writeln!(w, "{value}");
     }
@@ -825,48 +902,74 @@ pub(crate) fn write_revoke_outcome(
     writeln!(w, "origin_assignment={:#x}", o.origin_assignment)?;
     writeln!(w, "namespace_id={}", o.namespace_id)?;
     writeln!(w, "revoked_operator={:#x}", o.revoked)?;
-    write_single_tx_status_line(w, status, o.dry_run, o.send)
+    match tx {
+        Some(h) => writeln!(w, "status={} tx={h:#x}", o.status.label()),
+        None => writeln!(
+            w,
+            "status={} submitted={}",
+            o.status.label(),
+            submitted_token(o.status.submitted())
+        ),
+    }
 }
 
 async fn revoke(args: &cli::RevokeArgs, global_config: Option<&Path>) -> anyhow::Result<()> {
     let (resolved, oa_addr) = assignment_ctx(&args.chain, global_config)?;
     let revoked = chain_ctx::parse_address(&args.operator, "operator")?;
 
-    let mut outcome = RevokeOutcome {
-        operator: None,
-        origin_assignment: oa_addr,
-        namespace_id: args.namespace,
-        revoked,
-        send: SendOutcome::NotSent,
-        dry_run: args.chain.common.dry_run,
-    };
+    let dry_run = args.chain.common.dry_run;
+    let mut operator = None;
+    let mut status = RevokeStatus::DryRun;
 
     // Print before propagating, for the same reason `assign` does: a broadcast
     // whose receipt could not be read leaves the hash set, and a `--json`
     // consumer that only sees the error loses its one handle on the removal.
     let mut chain_err = None;
-    if !outcome.dry_run {
+    if !dry_run {
         let (signer, provider) = signer_and_provider(&resolved, &args.chain).await?;
-        outcome.operator = Some(signer.address());
+        operator = Some(signer.address());
         let contract = OriginAssignment::new(oa_addr, &provider);
-        if let Err(err) = decdn_incentive::tx::send_for_receipt(
+        let mut send = SendOutcome::NotSent;
+        match decdn_incentive::tx::send_for_receipt(
             contract.removeOrigin(U256::from(args.namespace), revoked),
             "removeOrigin",
             Some(
                 "the signer must own the namespace (or hold GOVERNANCE_ROLE) and the operator \
                  must currently be seated as an authorized origin for it",
             ),
-            &mut outcome.send,
+            &mut send,
         )
         .await
         {
-            chain_err = Some(match revoke_failure_context(outcome.send) {
-                Some(note) => err.context(note),
-                None => err,
-            });
+            Ok(receipt) => status = RevokeStatus::Revoked(receipt.transaction_hash),
+            Err(err) => {
+                // `send` distinguishes a broadcast whose receipt was unreadable
+                // (`InFlight`), a transport failure that may have unseated
+                // (`MaybeBroadcast`), a confirmed revert (`Reverted`, unseated
+                // nothing), and a clean rejection (`Rejected` → `Failed`).
+                status = match send {
+                    SendOutcome::InFlight(hash) => RevokeStatus::InFlight(hash),
+                    SendOutcome::Reverted(hash) => RevokeStatus::Reverted(hash),
+                    SendOutcome::MaybeBroadcast => RevokeStatus::MaybeBroadcast,
+                    SendOutcome::Rejected | SendOutcome::Confirmed(_) | SendOutcome::NotSent => {
+                        RevokeStatus::Failed
+                    }
+                };
+                chain_err = Some(match revoke_failure_context(status) {
+                    Some(note) => err.context(note),
+                    None => err,
+                });
+            }
         }
     }
 
+    let outcome = RevokeOutcome {
+        operator,
+        origin_assignment: oa_addr,
+        namespace_id: args.namespace,
+        revoked,
+        status,
+    };
     let mut out = io::stdout().lock();
     let write_err = write_revoke_outcome(&mut out, &outcome, args.chain.common.json)
         .and_then(|()| out.flush())
@@ -876,7 +979,7 @@ async fn revoke(args: &cli::RevokeArgs, global_config: Option<&Path>) -> anyhow:
         chain_err,
         write_err,
         "failed to write revoke output",
-        &single_tx_receipt(None, outcome.send.tx()),
+        &single_tx_receipt(None, outcome.status.tx()),
     )
 }
 
@@ -884,27 +987,27 @@ async fn revoke(args: &cli::RevokeArgs, global_config: Option<&Path>) -> anyhow:
 /// error already says everything true. The parallel of
 /// [`namespace_failure_context`].
 ///
-/// Only the uncertain cases need it: a removal that landed makes the retry
+/// Only the broadcast case needs it: a removal that landed makes the retry
 /// revert `NotAuthorizedOrigin`, which reads like a permissions problem rather
-/// than "this already worked". A rejected send or a confirmed revert unseated
-/// nothing and needs no warning, so `send_for_receipt`'s own error is complete.
-const fn revoke_failure_context(send: SendOutcome) -> Option<&'static str> {
-    match send {
-        // Broadcast, receipt unreadable: the hash is in the receipt above.
-        SendOutcome::InFlight(_) => Some(
+/// than "this already worked". A rejected send unseated nothing and has no hash
+/// to cite, so `send_for_receipt`'s own error is already complete.
+const fn revoke_failure_context(status: RevokeStatus) -> Option<&'static str> {
+    match status {
+        RevokeStatus::InFlight(_) => Some(
             "the transaction was broadcast — check the tx above before re-running, since a \
              removal that landed makes the retry revert NotAuthorizedOrigin",
         ),
-        // Transport failure: it may have broadcast, but there is no hash to cite.
-        SendOutcome::MaybeBroadcast => Some(
+        // A transport failure may have unseated too, but has no hash to cite.
+        RevokeStatus::MaybeBroadcast => Some(
             "the request may have reached the node and broadcast the transaction — check this \
              signer's pending and mined transactions before re-running, since a removal that \
              landed makes the retry revert NotAuthorizedOrigin",
         ),
-        SendOutcome::Rejected
-        | SendOutcome::Reverted(_)
-        | SendOutcome::NotSent
-        | SendOutcome::Confirmed(_) => None,
+        // A rejected send or a confirmed revert unseated nothing.
+        RevokeStatus::DryRun
+        | RevokeStatus::Failed
+        | RevokeStatus::Reverted(_)
+        | RevokeStatus::Revoked(_) => None,
     }
 }
 
@@ -919,9 +1022,7 @@ mod tests {
         let base = NamespaceOutcome {
             operator: None,
             registry: Address::repeat_byte(0x01),
-            namespace_id: None,
-            send: SendOutcome::NotSent,
-            dry_run: true,
+            status: NamespaceStatus::DryRun,
         };
         let mut buf = Vec::new();
         write_namespace_outcome(&mut buf, &base, false).unwrap();
@@ -932,9 +1033,10 @@ mod tests {
 
         let done = NamespaceOutcome {
             operator: Some(Address::repeat_byte(0xCD)),
-            namespace_id: Some(9),
-            send: SendOutcome::Confirmed(B256::repeat_byte(0x55)),
-            dry_run: false,
+            status: NamespaceStatus::Created {
+                tx: B256::repeat_byte(0x55),
+                id: Some(9),
+            },
             ..base
         };
         let mut buf = Vec::new();
@@ -943,6 +1045,32 @@ mod tests {
         assert!(s.contains("operator=0xcdcd"), "{s}");
         assert!(s.contains("namespace_id=9"), "{s}");
         assert!(s.contains("status=created tx=0x5555"), "{s}");
+    }
+
+    /// The bug this refactor closes (issue #1578): under the old struct a
+    /// `dry_run: true` alongside a `tx: Some` printed `status=dry_run tx=…` and
+    /// emitted `"submitted": true` next to `"status": "dry_run"`. The enum makes
+    /// that pair unrepresentable — `DryRun` carries no hash, so `tx()` is `None`
+    /// and text and JSON agree on both fields — which this pins.
+    #[test]
+    fn namespace_dry_run_carries_no_tx_and_is_not_submitted() {
+        let dry = NamespaceOutcome {
+            operator: None,
+            registry: Address::repeat_byte(0x01),
+            status: NamespaceStatus::DryRun,
+        };
+        let mut buf = Vec::new();
+        write_namespace_outcome(&mut buf, &dry, false).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(!text.contains("tx=0x"), "{text}");
+        assert!(text.contains("status=dry_run submitted=false"), "{text}");
+
+        let mut buf = Vec::new();
+        write_namespace_outcome(&mut buf, &dry, true).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+        assert_eq!(v["status"], serde_json::json!("dry_run"));
+        assert_eq!(v["submitted"], serde_json::json!(false));
+        assert!(v["tx"].is_null(), "{v}");
     }
 
     /// The state this receipt exists for: `createNamespace` confirmed, so the
@@ -959,9 +1087,10 @@ mod tests {
         let o = NamespaceOutcome {
             operator: Some(Address::repeat_byte(0xCD)),
             registry: Address::repeat_byte(0x01),
-            namespace_id: None,
-            send: SendOutcome::Confirmed(B256::repeat_byte(0x55)),
-            dry_run: false,
+            status: NamespaceStatus::Created {
+                tx: B256::repeat_byte(0x55),
+                id: None,
+            },
         };
         let mut buf = Vec::new();
         write_namespace_outcome(&mut buf, &o, false).unwrap();
@@ -987,7 +1116,7 @@ mod tests {
         // but it keeps its hash, because a namespace that may exist needs the
         // same handle as one that does.
         let unknown = NamespaceOutcome {
-            send: SendOutcome::InFlight(B256::repeat_byte(0x55)),
+            status: NamespaceStatus::InFlight(B256::repeat_byte(0x55)),
             ..o
         };
         let mut buf = Vec::new();
@@ -1001,7 +1130,7 @@ mod tests {
 
         // Nothing reached the chain: `failed`, and distinguishable from a dry run.
         let failed = NamespaceOutcome {
-            send: SendOutcome::Rejected,
+            status: NamespaceStatus::Failed,
             ..o
         };
         let mut buf = Vec::new();
@@ -1009,15 +1138,26 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
         assert_eq!(v["status"], serde_json::json!("failed"));
         assert_eq!(v["submitted"], serde_json::json!(false));
+    }
 
-        // A mined revert is `reverted`, NOT `failed`: it kept its hash, which a
-        // gas-reconciling consumer needs (#1550).
-        let reverted = NamespaceOutcome {
-            send: SendOutcome::Reverted(B256::repeat_byte(0x55)),
-            ..o
+    /// A mined revert (#1550) reports `reverted` and keeps its hash; a lost send
+    /// response (#1577) reports `maybe_broadcast` with a NULL `submitted` and no
+    /// hash. Neither may collapse into `failed` — the first has a gas-burning tx
+    /// to reconcile, the second may still mint a namespace against the cap.
+    #[test]
+    fn namespace_output_surfaces_reverted_and_maybe_broadcast() {
+        let base = NamespaceOutcome {
+            operator: Some(Address::repeat_byte(0xCD)),
+            registry: Address::repeat_byte(0x01),
+            status: NamespaceStatus::Reverted(B256::repeat_byte(0x55)),
         };
         let mut buf = Vec::new();
-        write_namespace_outcome(&mut buf, &reverted, true).unwrap();
+        write_namespace_outcome(&mut buf, &base, false).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(text.contains("status=reverted tx=0x5555"), "{text}");
+
+        let mut buf = Vec::new();
+        write_namespace_outcome(&mut buf, &base, true).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
         assert_eq!(v["status"], serde_json::json!("reverted"));
         assert_eq!(v["submitted"], serde_json::json!(true));
@@ -1026,12 +1166,9 @@ mod tests {
             serde_json::json!(format!("{:#x}", B256::repeat_byte(0x55)))
         );
 
-        // A lost send response is `maybe_broadcast` with a NULL `submitted` and
-        // no hash: the tx may be in the mempool, so a flat `false` would be the
-        // #1577 lie that gets namespace quota burned on a retry.
         let maybe = NamespaceOutcome {
-            send: SendOutcome::MaybeBroadcast,
-            ..o
+            status: NamespaceStatus::MaybeBroadcast,
+            ..base
         };
         let mut buf = Vec::new();
         write_namespace_outcome(&mut buf, &maybe, false).unwrap();
@@ -1040,6 +1177,7 @@ mod tests {
             text.contains("status=maybe_broadcast submitted=unknown"),
             "{text}"
         );
+
         let mut buf = Vec::new();
         write_namespace_outcome(&mut buf, &maybe, true).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
@@ -1051,6 +1189,32 @@ mod tests {
         assert!(v["tx"].is_null(), "{v}");
     }
 
+    /// A `created` with a decoded id prints and emits the id, distinguishing it
+    /// from the id-less `created` above — the fifth of the five states, and the
+    /// one whose `namespace_id` a `--json` consumer reads back.
+    #[test]
+    fn namespace_created_with_id_emits_the_id() {
+        let o = NamespaceOutcome {
+            operator: Some(Address::repeat_byte(0xCD)),
+            registry: Address::repeat_byte(0x01),
+            status: NamespaceStatus::Created {
+                tx: B256::repeat_byte(0x55),
+                id: Some(9),
+            },
+        };
+        let mut buf = Vec::new();
+        write_namespace_outcome(&mut buf, &o, false).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains("namespace_id=9"), "{s}");
+        assert!(s.contains("status=created tx=0x5555"), "{s}");
+
+        let mut buf = Vec::new();
+        write_namespace_outcome(&mut buf, &o, true).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+        assert_eq!(v["status"], serde_json::json!("created"));
+        assert_eq!(v["namespace_id"], serde_json::json!(9));
+    }
+
     /// A `namespace create` failure must only warn about the burnt quota when a
     /// namespace was actually minted. Claiming it on the path where the send was
     /// rejected — the modal failure, since `NamespaceCapReached` surfaces from
@@ -1059,25 +1223,21 @@ mod tests {
     /// one line above.
     #[test]
     fn namespace_failure_context_only_claims_a_namespace_when_one_exists() {
-        let hash = B256::repeat_byte(0x55);
-
         // Broadcast, receipt unreadable: it may exist, so say so.
-        let in_flight = namespace_failure_context(SendOutcome::InFlight(hash), false).unwrap();
+        let in_flight =
+            namespace_failure_context(NamespaceStatus::InFlight(B256::repeat_byte(0x55))).unwrap();
         assert!(in_flight.contains("was broadcast"), "{in_flight}");
         assert!(
             in_flight.contains("maxNamespacesPerPublisher"),
             "{in_flight}"
         );
 
-        // A lost send response: it too may have minted, but has no hash to point
-        // at, so the note sends the operator to this signer's own transactions.
-        let maybe = namespace_failure_context(SendOutcome::MaybeBroadcast, false).unwrap();
-        assert!(maybe.contains("may have reached the node"), "{maybe}");
-        assert!(maybe.contains("this signer's pending"), "{maybe}");
-        assert!(maybe.contains("maxNamespacesPerPublisher"), "{maybe}");
-
         // Confirmed, but the id could not be decoded: the namespace IS owned.
-        let landed = namespace_failure_context(SendOutcome::Confirmed(hash), true).unwrap();
+        let landed = namespace_failure_context(NamespaceStatus::Created {
+            tx: B256::repeat_byte(0x55),
+            id: None,
+        })
+        .unwrap();
         assert!(landed.contains("exists and is owned"), "{landed}");
         // The recovery path has to work for every decode failure, including the
         // one where the receipt came back WITHOUT the log — so it points at an
@@ -1090,15 +1250,27 @@ mod tests {
         );
         assert!(!landed.contains("ownerOf"), "{landed}");
 
-        // A rejected send minted nothing and has no hash to cite.
+        // A lost send response may have minted too, but has no hash to point at,
+        // so the note routes the operator to this signer's own transactions.
+        let maybe = namespace_failure_context(NamespaceStatus::MaybeBroadcast).unwrap();
+        assert!(maybe.contains("may have reached the node"), "{maybe}");
+        assert!(maybe.contains("this signer's pending"), "{maybe}");
+        assert!(maybe.contains("maxNamespacesPerPublisher"), "{maybe}");
+
+        // Nothing reached the chain — nothing minted, and no hash to cite.
         assert!(
-            namespace_failure_context(SendOutcome::Rejected, false).is_none(),
+            namespace_failure_context(NamespaceStatus::Failed).is_none(),
             "a rejected send must not claim a created namespace"
         );
-        // A confirmed revert also minted nothing — the create had no effect.
+        // A confirmed revert minted nothing — the create had no effect.
         assert!(
-            namespace_failure_context(SendOutcome::Reverted(hash), false).is_none(),
+            namespace_failure_context(NamespaceStatus::Reverted(B256::repeat_byte(0x55))).is_none(),
             "a reverted create minted nothing"
+        );
+        // A dry run minted nothing either.
+        assert!(
+            namespace_failure_context(NamespaceStatus::DryRun).is_none(),
+            "a dry run must not claim a created namespace"
         );
     }
 
@@ -1339,22 +1511,21 @@ mod tests {
         );
     }
 
-    /// A mined revert (#1550) keeps its hash and reports `reverted`, and a lost
-    /// send response (#1577) reports `maybe_broadcast` with no hash. Neither may
-    /// collapse into a bare `failed` that would tell the operator nothing
-    /// happened. `maybe_broadcast` is uncertain, so it drives `status=unknown`.
+    /// A mined revert (#1550) keeps its hash as `reverted`; a lost send response
+    /// (#1577) reports `maybe_broadcast` with no hash. Neither collapses into a
+    /// bare `failed`. `maybe_broadcast` is uncertain, so it drives `status=unknown`.
     #[test]
     fn assign_seats_distinguish_reverted_and_maybe_broadcast_from_failed() {
-        let reverted_op = Address::repeat_byte(0x11);
-        let maybe_op = Address::repeat_byte(0x22);
-
         // A run whose only send reverted: the seat cites its hash, and with no
         // uncertain seat the run's status is the definite `failed` (0 seated).
         let reverted_only = AssignOutcome {
             operator: Some(Address::repeat_byte(0xCD)),
             origin_assignment: Address::repeat_byte(0x02),
             namespace_id: 7,
-            seats: vec![(reverted_op, SeatOutcome::Reverted(B256::repeat_byte(0x66)))],
+            seats: vec![(
+                Address::repeat_byte(0x11),
+                SeatOutcome::Reverted(B256::repeat_byte(0x66)),
+            )],
             dry_run: false,
         };
         let mut buf = Vec::new();
@@ -1371,7 +1542,7 @@ mod tests {
 
         // A lost send response: uncertain, no hash, so `status=unknown`.
         let maybe = AssignOutcome {
-            seats: vec![(maybe_op, SeatOutcome::MaybeBroadcast)],
+            seats: vec![(Address::repeat_byte(0x22), SeatOutcome::MaybeBroadcast)],
             ..reverted_only
         };
         let mut buf = Vec::new();
@@ -1495,8 +1666,8 @@ mod tests {
 
     #[test]
     fn revoke_failure_context_only_warns_once_something_was_broadcast() {
-        let hash = B256::repeat_byte(0x55);
-        let in_flight = revoke_failure_context(SendOutcome::InFlight(hash)).unwrap();
+        let in_flight =
+            revoke_failure_context(RevokeStatus::InFlight(B256::repeat_byte(0x55))).unwrap();
         assert!(in_flight.contains("was broadcast"), "{in_flight}");
         // The retry's revert reads like a permissions problem, so it has to be
         // named — that is the whole reason this note exists.
@@ -1504,17 +1675,25 @@ mod tests {
 
         // A lost send response warns too, but points at the signer's own txs
         // since there is no hash to cite.
-        let maybe = revoke_failure_context(SendOutcome::MaybeBroadcast).unwrap();
+        let maybe = revoke_failure_context(RevokeStatus::MaybeBroadcast).unwrap();
         assert!(maybe.contains("may have reached the node"), "{maybe}");
         assert!(maybe.contains("NotAuthorizedOrigin"), "{maybe}");
 
         assert!(
-            revoke_failure_context(SendOutcome::Rejected).is_none(),
+            revoke_failure_context(RevokeStatus::Failed).is_none(),
             "a rejected send unseated nothing and has no hash to cite"
         );
         assert!(
-            revoke_failure_context(SendOutcome::Reverted(hash)).is_none(),
+            revoke_failure_context(RevokeStatus::Reverted(B256::repeat_byte(0x55))).is_none(),
             "a confirmed revert unseated nothing"
+        );
+        assert!(
+            revoke_failure_context(RevokeStatus::Revoked(B256::repeat_byte(0x55))).is_none(),
+            "a confirmed removal needs no extra warning"
+        );
+        assert!(
+            revoke_failure_context(RevokeStatus::DryRun).is_none(),
+            "a dry run sent nothing"
         );
     }
 
@@ -1525,8 +1704,7 @@ mod tests {
             origin_assignment: Address::repeat_byte(0x02),
             namespace_id: 7,
             revoked: Address::repeat_byte(0x11),
-            send: SendOutcome::Confirmed(B256::repeat_byte(0x55)),
-            dry_run: false,
+            status: RevokeStatus::Revoked(B256::repeat_byte(0x55)),
         };
         let mut buf = Vec::new();
         write_revoke_outcome(&mut buf, &o, false).unwrap();
@@ -1537,8 +1715,7 @@ mod tests {
 
         let dry = RevokeOutcome {
             operator: None,
-            send: SendOutcome::NotSent,
-            dry_run: true,
+            status: RevokeStatus::DryRun,
             ..o
         };
         let mut buf = Vec::new();
@@ -1554,9 +1731,7 @@ mod tests {
         let dry = NamespaceOutcome {
             operator: None,
             registry: Address::repeat_byte(0x01),
-            namespace_id: None,
-            send: SendOutcome::NotSent,
-            dry_run: true,
+            status: NamespaceStatus::DryRun,
         };
         let mut buf = Vec::new();
         write_namespace_outcome(&mut buf, &dry, true).unwrap();
@@ -1570,9 +1745,10 @@ mod tests {
         let done = NamespaceOutcome {
             operator: Some(Address::repeat_byte(0xCD)),
             registry: Address::repeat_byte(0x01),
-            namespace_id: Some(9),
-            send: SendOutcome::Confirmed(B256::repeat_byte(0x55)),
-            dry_run: false,
+            status: NamespaceStatus::Created {
+                tx: B256::repeat_byte(0x55),
+                id: Some(9),
+            },
         };
         let mut buf = Vec::new();
         write_namespace_outcome(&mut buf, &done, true).unwrap();
@@ -1633,8 +1809,7 @@ mod tests {
             origin_assignment: Address::repeat_byte(0x02),
             namespace_id: 7,
             revoked: Address::repeat_byte(0x11),
-            send: SendOutcome::InFlight(B256::repeat_byte(0x55)),
-            dry_run: false,
+            status: RevokeStatus::InFlight(B256::repeat_byte(0x55)),
         };
         let mut buf = Vec::new();
         write_revoke_outcome(&mut buf, &revoke, false).unwrap();
@@ -1653,45 +1828,68 @@ mod tests {
         );
     }
 
-    /// A send that never made it on-chain is `failed`, not `dry_run` — the two
-    /// were indistinguishable while the status was derived from `tx` alone.
-    /// Each `SendOutcome` maps to a distinct status token, and `dry_run` wins
-    /// over all of them. The three new tokens — `reverted`, `maybe_broadcast`,
-    /// and a `failed` that is no longer the catch-all — are the point of #1550
-    /// and #1577.
+    /// The label/hash derivation for every `NamespaceStatus` state, walked once
+    /// so the two renderers can never disagree with each other about a state.
+    /// `dry_run` and `failed` are the pair the old `tx`-derived status could not
+    /// tell apart; the enum keeps them distinct and hash-free.
     #[test]
-    fn single_tx_status_covers_every_send_outcome() {
-        let h = B256::repeat_byte(1);
-        // dry_run outranks whatever the send says.
-        assert_eq!(
-            single_tx_status(true, SendOutcome::NotSent, "revoked"),
-            "dry_run"
-        );
-        assert_eq!(
-            single_tx_status(true, SendOutcome::Confirmed(h), "revoked"),
-            "dry_run"
-        );
+    fn namespace_status_labels_and_hashes_match_their_states() {
+        let hash = B256::repeat_byte(0x55);
+        assert_eq!(NamespaceStatus::DryRun.label(), "dry_run");
+        assert_eq!(NamespaceStatus::DryRun.tx(), None);
+        assert_eq!(NamespaceStatus::DryRun.namespace_id(), None);
 
-        assert_eq!(
-            single_tx_status(false, SendOutcome::Confirmed(h), "revoked"),
-            "revoked"
-        );
-        assert_eq!(
-            single_tx_status(false, SendOutcome::InFlight(h), "revoked"),
-            "unknown"
-        );
-        assert_eq!(
-            single_tx_status(false, SendOutcome::MaybeBroadcast, "revoked"),
-            "maybe_broadcast"
-        );
-        assert_eq!(
-            single_tx_status(false, SendOutcome::Reverted(h), "revoked"),
-            "reverted"
-        );
-        assert_eq!(
-            single_tx_status(false, SendOutcome::Rejected, "revoked"),
-            "failed"
-        );
+        assert_eq!(NamespaceStatus::Failed.label(), "failed");
+        assert_eq!(NamespaceStatus::Failed.tx(), None);
+        assert_eq!(NamespaceStatus::Failed.namespace_id(), None);
+
+        assert_eq!(NamespaceStatus::InFlight(hash).label(), "unknown");
+        assert_eq!(NamespaceStatus::InFlight(hash).tx(), Some(hash));
+        // A broadcast whose receipt was unreadable never carries a decoded id.
+        assert_eq!(NamespaceStatus::InFlight(hash).namespace_id(), None);
+
+        let created = NamespaceStatus::Created {
+            tx: hash,
+            id: Some(9),
+        };
+        assert_eq!(created.label(), "created");
+        assert_eq!(created.tx(), Some(hash));
+        assert_eq!(created.namespace_id(), Some(9));
+        // Confirmed but the id could not be decoded: still `created`, still keeps
+        // its hash, but has no id — `Some(id)` therefore implies `created`.
+        let created_no_id = NamespaceStatus::Created { tx: hash, id: None };
+        assert_eq!(created_no_id.label(), "created");
+        assert_eq!(created_no_id.tx(), Some(hash));
+        assert_eq!(created_no_id.namespace_id(), None);
+    }
+
+    /// The `RevokeStatus` parallel: a send that never made it on-chain is
+    /// `failed`, not `dry_run` — the two were indistinguishable while the status
+    /// was derived from `tx` alone.
+    #[test]
+    fn revoke_status_labels_and_hashes_match_their_states() {
+        let hash = B256::repeat_byte(0x55);
+        assert_eq!(RevokeStatus::DryRun.label(), "dry_run");
+        assert_eq!(RevokeStatus::DryRun.tx(), None);
+
+        assert_eq!(RevokeStatus::Failed.label(), "failed");
+        assert_eq!(RevokeStatus::Failed.tx(), None);
+
+        assert_eq!(RevokeStatus::InFlight(hash).label(), "unknown");
+        assert_eq!(RevokeStatus::InFlight(hash).tx(), Some(hash));
+
+        assert_eq!(RevokeStatus::Revoked(hash).label(), "revoked");
+        assert_eq!(RevokeStatus::Revoked(hash).tx(), Some(hash));
+
+        // A mined revert keeps its hash (#1550); a lost send response has none
+        // and reports `submitted: null` rather than a definite `false` (#1577).
+        assert_eq!(RevokeStatus::Reverted(hash).label(), "reverted");
+        assert_eq!(RevokeStatus::Reverted(hash).tx(), Some(hash));
+        assert_eq!(RevokeStatus::Reverted(hash).submitted(), Some(true));
+
+        assert_eq!(RevokeStatus::MaybeBroadcast.label(), "maybe_broadcast");
+        assert_eq!(RevokeStatus::MaybeBroadcast.tx(), None);
+        assert_eq!(RevokeStatus::MaybeBroadcast.submitted(), None);
     }
 
     #[test]
@@ -1701,8 +1899,7 @@ mod tests {
             origin_assignment: Address::repeat_byte(0x02),
             namespace_id: 7,
             revoked: Address::repeat_byte(0x11),
-            send: SendOutcome::NotSent,
-            dry_run: true,
+            status: RevokeStatus::DryRun,
         };
         let mut buf = Vec::new();
         write_revoke_outcome(&mut buf, &revoke, true).unwrap();
