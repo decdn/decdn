@@ -1414,20 +1414,42 @@ async fn redeem_one<P: Provider + Clone>(
 }
 
 /// Self-tick sweep (#751): scan every persisted channel and redeem any that
-/// crossed the threshold, independent of hints. The cached-`withdrawn`
-/// pre-check in [`try_redeem`] short-circuits sub-threshold channels for free,
-/// but the cache starts empty and a miss estimates withdrawn-from-zero, so it
-/// can't short-circuit an above-threshold channel: the **first sweep after boot
-/// issues one `getChannel` per above-threshold channel** (O(channels) RPC
-/// fan-out), and likewise whenever fresh bytes push a previously-redeemed
-/// channel back over the threshold. Subsequent ticks are cheap — a `getChannel`
-/// warms the entry, and a successful `withdraw` seeds it to the voucher amount
-/// so the channel short-circuits until it next crosses the threshold. At the
-/// testnet node count this stays well within RPC budget at the 5-min
-/// [`REDEEM_TICK_INTERVAL`]; revisit the cadence (or seed the cache at bootstrap)
-/// if a node tracks enough channels to make the post-boot fan-out costly. Errors
-/// are per-channel (logged in [`redeem_one`]); a store-load failure is logged and
-/// skips this tick.
+/// crossed the threshold, independent of hints. Unlike the per-hint path
+/// ([`redeem_one`]), the sweep collects every above-threshold channel's voucher
+/// and submits **one** `withdrawMany` for the whole tick instead of N single
+/// `withdraw` txs (#1587): each leg's route (approve + `routeSettlement`'s
+/// transferFrom + up to three transfers) is the gas-dominant cost, and one
+/// aggregated route over the summed delta is economically identical to N single
+/// routes (same operator per leg, split linear in amount), dropping the marginal
+/// cost of an extra channel ~20-30x and lowering the per-channel dust floor.
+///
+/// The cached-`withdrawn` pre-check in [`plan_redeem`] short-circuits
+/// sub-threshold channels for free, but the cache starts empty and a miss
+/// estimates withdrawn-from-zero, so it can't short-circuit an above-threshold
+/// channel: the **first sweep after boot issues one `getChannel` per
+/// above-threshold channel** (O(channels) RPC fan-out), and likewise whenever
+/// fresh bytes push a previously-redeemed channel back over the threshold.
+/// Subsequent ticks are cheap — a `getChannel` warms the entry, and a landed
+/// `withdrawMany` seeds every leg's entry to its voucher amount so the channel
+/// short-circuits until it next crosses the threshold. At the testnet node count
+/// this stays well within RPC budget at the 5-min [`REDEEM_TICK_INTERVAL`];
+/// revisit the cadence (or seed the cache at bootstrap) if a node tracks enough
+/// channels to make the post-boot fan-out costly.
+///
+/// Error isolation is preserved through the **preparation** phase: each channel's
+/// load / `getChannel` / auto-settle-close / threshold check runs independently
+/// (a per-channel failure is logged via `redemption_failure` and drops only
+/// that leg from the batch). Auto-settlement closes (#742) stay per-channel
+/// `closeChannel` txs — only the plain `withdraw` legs are batched. The one place
+/// isolation weakens versus N separate txs is the **submission**: `withdrawMany`
+/// is atomic, so a single leg that reverts on-chain (e.g. a race advancing a
+/// watermark between our `getChannel` and the batch) fails the whole batch for
+/// the tick — the next tick re-prepares and retries. That is acceptable because
+/// this node is the sole redeemer of its own channels, so such races are rare;
+/// the batch is validated leg-by-leg against fresh on-chain state before
+/// submission, so an absent-race batch does not revert.
+///
+/// A store-load failure is logged and skips this tick.
 #[allow(clippy::too_many_arguments)]
 async fn redeem_sweep<P: Provider + Clone>(
     contract: &PaymentChannel::PaymentChannelInstance<P>,
@@ -1447,8 +1469,12 @@ async fn redeem_sweep<P: Provider + Clone>(
             return;
         }
     };
+    // Preparation phase — per-channel error isolation. Each channel is loaded,
+    // read from chain, and (if triggered) auto-settle-closed independently; the
+    // survivors that want a plain `withdraw` become batch legs.
+    let mut legs: Vec<PaymentChannel::WithdrawArgs> = Vec::new();
     for st in states {
-        redeem_one(
+        match plan_redeem(
             contract,
             store,
             pending_store,
@@ -1460,8 +1486,84 @@ async fn redeem_sweep<P: Provider + Clone>(
             withdrawn_cache,
             metrics,
         )
-        .await;
+        .await
+        {
+            Ok(RedeemPlan::Skip) => {}
+            Ok(RedeemPlan::Withdraw(arg)) => legs.push(arg),
+            Err(err) => {
+                metrics.redemption_failure();
+                warn!(err = %sanitize_rpc_display(&err), channel_id = %st.channel_id, "redemption planning failed");
+            }
+        }
     }
+    if legs.is_empty() {
+        return;
+    }
+    submit_withdraw_many(contract, legs, withdrawn_cache, metrics).await;
+}
+
+/// Submit one `withdrawMany` for the tick's collected legs (#1587). On a landed
+/// batch, seed every leg's `withdrawn_cache` entry to its voucher
+/// `(amount, nonce)` so subsequent hints short-circuit — mirroring the single
+/// `withdraw` success path. A batch that reverts on-chain (an atomic all-or-none
+/// failure) or fails to send leaves the caches untouched so the next tick
+/// re-prepares and retries, and records a single `redemption_failure` for the
+/// whole batch (the log carries the leg count).
+// Linear send → receipt → status sequence; the nested `match`es on the send and
+// receipt results read more clearly inline than split across helpers.
+#[allow(clippy::cognitive_complexity)]
+async fn submit_withdraw_many<P: Provider + Clone>(
+    contract: &PaymentChannel::PaymentChannelInstance<P>,
+    legs: Vec<PaymentChannel::WithdrawArgs>,
+    withdrawn_cache: &mut HashMap<ChannelId, (U256, U256)>,
+    metrics: &Arc<Metrics>,
+) {
+    let count = legs.len();
+    // Capture the per-leg cache seeds before `legs` is moved into the call.
+    let seeds: Vec<(ChannelId, U256, U256)> = legs
+        .iter()
+        .map(|a| (a.channelId, a.amount, a.nonce))
+        .collect();
+    let receipt = match contract.withdrawMany(legs).send().await {
+        Ok(pending) => match pending.get_receipt().await {
+            Ok(receipt) => receipt,
+            Err(err) => {
+                metrics.redemption_failure();
+                warn!(err = %sanitize_rpc_display(&err), count, "withdrawMany receipt failed; leaving claims for retry");
+                return;
+            }
+        },
+        Err(err) => {
+            metrics.redemption_failure();
+            warn!(err = %sanitize_rpc_display(&err), count, "withdrawMany send failed; leaving claims for retry");
+            return;
+        }
+    };
+    // `get_receipt` resolves even for a reverted tx. A reverted `withdrawMany` is
+    // atomic — no leg's `withdrawnAmount` advanced on-chain — so we MUST NOT seed
+    // any cache entry (that would make later hints short-circuit and silently
+    // never redeem). Leave the caches at their pre-batch `getChannel` values and
+    // let the next tick retry.
+    if !receipt.status() {
+        metrics.redemption_failure();
+        warn!(
+            count,
+            tx = %receipt.transaction_hash,
+            "withdrawMany reverted on-chain; leaving claims for retry"
+        );
+        return;
+    }
+    // Batch landed: every leg's `withdrawnAmount`/`claimedNonce` advanced to its
+    // voucher watermark. Reflect both in the cache so the next hints
+    // short-circuit on the value AND nonce-span bounds.
+    for (channel_id, amount, nonce) in seeds {
+        withdrawn_cache.insert(channel_id, (amount, nonce));
+    }
+    info!(
+        count,
+        tx = %receipt.transaction_hash,
+        "batched channel redemption landed (withdrawMany)"
+    );
 }
 
 /// The un-redeemed nonce SPAN driving the count trigger: the off-chain latest
@@ -1574,16 +1676,37 @@ fn record_auto_settle_close_outcome(
     true
 }
 
+/// The outcome of evaluating one channel for redemption, without yet submitting
+/// the `withdraw` (#1587). Any auto-settlement close (#742) — a distinct,
+/// per-channel `closeChannel` tx — is already issued inside [`plan_redeem`]; only
+/// the plain-`withdraw` decision is deferred here so the caller can either submit
+/// it standalone (the hint path) or batch it into one `withdrawMany` (the sweep).
+enum RedeemPlan {
+    /// Nothing to redeem: below threshold, not this node's / not open, no
+    /// signature, or already secured by an auto-settlement close this call.
+    Skip,
+    /// This channel's latest voucher should be redeemed via `withdraw` (single)
+    /// or as one leg of a `withdrawMany` batch.
+    Withdraw(PaymentChannel::WithdrawArgs),
+}
+
 /// Read the latest persisted voucher and the on-chain channel state; if the
 /// un-redeemed balance crosses an auto-settlement trigger (#742) `closeChannel`
-/// to secure it on-chain, otherwise if it meets the redeem threshold and the
-/// channel is still open submit `withdraw`. Auto-settlement is checked first:
-/// once a channel is large enough to settle, closing it (which secures the full
-/// claim and starts the dispute window) supersedes a `withdraw` that would only
-/// reclaim the same delta while leaving the channel — and its future exposure —
-/// open.
+/// to secure it on-chain (returning [`RedeemPlan::Skip`]), otherwise if it meets
+/// the redeem threshold and the channel is still open return
+/// [`RedeemPlan::Withdraw`] carrying the voucher args the caller submits — as a
+/// single `withdraw` (hint path, [`try_redeem`]) or one leg of a batched
+/// `withdrawMany` (sweep path, [`redeem_sweep`]). Auto-settlement is checked
+/// first: once a channel is large enough to settle, closing it (which secures the
+/// full claim and starts the dispute window) supersedes a `withdraw` that would
+/// only reclaim the same delta while leaving the channel — and its future
+/// exposure — open.
+///
+/// This does the per-channel chain read + decision but issues no `withdraw`
+/// itself, so it is the shared error-isolation boundary: the sweep runs it per
+/// channel and drops only a failing leg from the batch.
 #[allow(clippy::too_many_arguments)]
-async fn try_redeem<P: Provider + Clone>(
+async fn plan_redeem<P: Provider + Clone>(
     contract: &PaymentChannel::PaymentChannelInstance<P>,
     store: &Arc<dyn ChannelStateStore>,
     pending_store: &Arc<dyn PendingSettleStore>,
@@ -1594,17 +1717,17 @@ async fn try_redeem<P: Provider + Clone>(
     channel_id: ChannelId,
     withdrawn_cache: &mut HashMap<ChannelId, (U256, U256)>,
     metrics: &Arc<Metrics>,
-) -> Result<()> {
+) -> Result<RedeemPlan> {
     let Some(st) = store
         .get(channel_id)
         .context("load channel state for redemption")?
     else {
         // Channel not (yet) persisted — e.g. a hint raced the ChannelOpened
         // consumer. The next voucher re-hints.
-        return Ok(());
+        return Ok(RedeemPlan::Skip);
     };
     if st.last_nonce().is_zero() || st.last_signature().is_none() {
-        return Ok(());
+        return Ok(RedeemPlan::Skip);
     }
 
     // Cheap pre-check against the cached on-chain `(withdrawn, claimedNonce)`
@@ -1627,7 +1750,7 @@ async fn try_redeem<P: Provider + Clone>(
         redeem_threshold,
         &auto_settle,
     ) {
-        return Ok(());
+        return Ok(RedeemPlan::Skip);
     }
 
     let ch = contract
@@ -1638,7 +1761,7 @@ async fn try_redeem<P: Provider + Clone>(
     withdrawn_cache.insert(channel_id, (ch.withdrawnAmount, ch.claimedNonce));
     // Defensive: only redeem channels this node provides and that are open.
     if ch.provider != self_address || !matches!(ch.status, PaymentChannel::Status::Open) {
-        return Ok(());
+        return Ok(RedeemPlan::Skip);
     }
     let unredeemed = st.last_amount().saturating_sub(ch.withdrawnAmount);
 
@@ -1658,7 +1781,7 @@ async fn try_redeem<P: Provider + Clone>(
     )
     .await
     {
-        return Ok(());
+        return Ok(RedeemPlan::Skip);
     }
 
     // try_auto_settle_close returned false: either below threshold, or the close
@@ -1666,21 +1789,68 @@ async fn try_redeem<P: Provider + Clone>(
     // still Open, so fall through to a best-effort withdraw — reclaim the delta this
     // tick; the auto-settle close retries on the next sweep.
     if unredeemed < redeem_threshold {
-        return Ok(());
+        return Ok(RedeemPlan::Skip);
     }
 
     // The guard above returned on `last_signature().is_none()`, so this is Some.
     let Some(sig_bytes) = st.last_signature() else {
-        return Ok(());
+        return Ok(RedeemPlan::Skip);
     };
     let sig = Bytes::from(normalize_voucher_signature(sig_bytes));
+    Ok(RedeemPlan::Withdraw(PaymentChannel::WithdrawArgs {
+        channelId: channel_id,
+        amount: st.last_amount(),
+        nonce: st.last_nonce(),
+        bytesDelivered: st.last_bytes_delivered(),
+        signature: sig,
+    }))
+}
+
+/// Hint-path redemption: plan one channel and, if it wants a `withdraw`, submit
+/// it as a single tx (the per-hint path is one channel, so batching buys
+/// nothing — the sweep is where `withdrawMany` collapses N legs, #1587). Reads
+/// the plan, then mirrors the pre-#1587 single-`withdraw` submit + cache-seed
+/// semantics.
+#[allow(clippy::too_many_arguments)]
+async fn try_redeem<P: Provider + Clone>(
+    contract: &PaymentChannel::PaymentChannelInstance<P>,
+    store: &Arc<dyn ChannelStateStore>,
+    pending_store: &Arc<dyn PendingSettleStore>,
+    handler: &Arc<ClientHandler>,
+    self_address: Address,
+    redeem_threshold: U256,
+    auto_settle: AutoSettleConfig,
+    channel_id: ChannelId,
+    withdrawn_cache: &mut HashMap<ChannelId, (U256, U256)>,
+    metrics: &Arc<Metrics>,
+) -> Result<()> {
+    let arg = match plan_redeem(
+        contract,
+        store,
+        pending_store,
+        handler,
+        self_address,
+        redeem_threshold,
+        auto_settle,
+        channel_id,
+        withdrawn_cache,
+        metrics,
+    )
+    .await?
+    {
+        RedeemPlan::Skip => return Ok(()),
+        RedeemPlan::Withdraw(arg) => arg,
+    };
+
+    let amount = arg.amount;
+    let nonce = arg.nonce;
     let receipt = contract
         .withdraw(
-            channel_id,
-            st.last_amount(),
-            st.last_nonce(),
-            st.last_bytes_delivered(),
-            sig,
+            arg.channelId,
+            arg.amount,
+            arg.nonce,
+            arg.bytesDelivered,
+            arg.signature,
         )
         .send()
         .await
@@ -1690,10 +1860,10 @@ async fn try_redeem<P: Provider + Clone>(
         .context("await withdraw receipt")?;
     // `get_receipt` resolves once the tx is mined, even if it reverted — a
     // reverted withdraw left `withdrawnAmount` unchanged on-chain, so we MUST
-    // NOT seed the cache to `st.last_amount()` (that would make every later hint
+    // NOT seed the cache to the voucher amount (that would make every later hint
     // short-circuit and silently never redeem this channel again). The cache
-    // already holds the correct pre-withdraw value from the getChannel read
-    // above; leave it and let the next hint retry.
+    // already holds the correct pre-withdraw value from the getChannel read in
+    // `plan_redeem`; leave it and let the next hint retry.
     if !receipt.status() {
         warn!(
             %channel_id,
@@ -1706,12 +1876,11 @@ async fn try_redeem<P: Provider + Clone>(
     // amount and `claimedNonce` to the voucher nonce (strict watermark advance,
     // PaymentChannel.withdraw); reflect both in the cache so the next hints
     // short-circuit on the value AND nonce-span bounds.
-    withdrawn_cache.insert(channel_id, (st.last_amount(), st.last_nonce()));
+    withdrawn_cache.insert(channel_id, (amount, nonce));
     info!(
         %channel_id,
         tx = %receipt.transaction_hash,
-        unredeemed = %unredeemed,
-        amount = %st.last_amount(),
+        amount = %amount,
         "withdrew accrued channel earnings"
     );
     Ok(())
