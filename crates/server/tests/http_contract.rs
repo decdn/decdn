@@ -7,6 +7,13 @@
 //! its doc comment): it is compiled only into this test binary, via the
 //! `#[path]` attribute below, against the `pub` surface the lib already
 //! exposes.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
+
 #[path = "../src/test_support.rs"]
 mod test_support;
 

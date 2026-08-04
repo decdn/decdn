@@ -12,6 +12,12 @@
 //! pristine for any fake surface a given test binary doesn't exercise.
 
 #![allow(dead_code)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::collections::HashMap;
 use std::path::PathBuf;

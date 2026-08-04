@@ -14,7 +14,12 @@
 //! anvil-e2e`). Mirrors the fixture usage in
 //! `decdn/crates/e2e/tests/cli_fetch_topup.rs`.
 #![cfg(feature = "anvil-e2e")]
-#![allow(clippy::unwrap_used)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use alloy::primitives::{B256, U256};
 use alloy::signers::local::PrivateKeySigner;

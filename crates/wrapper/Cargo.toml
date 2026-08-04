@@ -12,6 +12,9 @@ path = "src/main.rs"
 name = "onramp"
 path = "src/lib.rs"
 
+[lints]
+workspace = true
+
 [dependencies]
 # `signer-keystore-geth-compat` is additive to the workspace default: it
 # turns on `eth-keystore`'s `geth-compat` feature, which writes the
