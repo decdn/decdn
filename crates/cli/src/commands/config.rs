@@ -1,7 +1,10 @@
 //! `decdn config init` and `decdn config validate` — manage the deCDN
 //! node TOML config file from the operator side.
 
+use anyhow::Context;
 use decdn_common::{cli, config};
+
+use crate::known_chains;
 
 /// Validate a configuration and print a resolved summary.
 ///
@@ -416,11 +419,103 @@ pub fn config_init(args: &cli::ConfigInitArgs) -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("failed to create directory {}: {e}", parent.display()))?;
     }
 
-    std::fs::write(&output, DEFAULT_CONFIG)
+    let chain = known_chains::resolve(args.chain.as_deref())?;
+    let contents = render_config(chain)?;
+
+    std::fs::write(&output, &contents)
         .map_err(|e| anyhow::anyhow!("failed to write config file {}: {e}", output.display()))?;
 
-    println!("wrote default config to {}", output.display());
+    match chain {
+        Some(c) => println!(
+            "wrote {} config to {} (run `decdn key-gen` to create the keystore)",
+            c.label,
+            output.display()
+        ),
+        None => println!("wrote blank config template to {}", output.display()),
+    }
     Ok(())
+}
+
+/// Render the config `config init` writes for the selected chain.
+///
+/// `None` returns the blank generic template ([`DEFAULT_CONFIG`]) verbatim.
+/// `Some(chain)` bakes that chain's id, RPC, and manifest contract addresses
+/// into the `[blockchain]` section, leaving every other section at its
+/// commented defaults — so the file runs out of the box once a keystore exists.
+fn render_config(chain: Option<&known_chains::KnownChain>) -> anyhow::Result<String> {
+    let Some(chain) = chain else {
+        return Ok(DEFAULT_CONFIG.to_string());
+    };
+    let filled = render_blockchain_section(chain)?;
+    splice_blockchain_section(DEFAULT_CONFIG, &filled)
+}
+
+/// Build the filled `[blockchain]` section for a known chain.
+fn render_blockchain_section(chain: &known_chains::KnownChain) -> anyhow::Result<String> {
+    let a = chain.addresses()?;
+    Ok(format!(
+        "[blockchain]\n\
+         # Baked in for {label} (chain {chain_id}) from the shipped deployment\n\
+         # manifest (contracts/deployments/{chain_id}.json). Ready to run as-is;\n\
+         # `eth_keystore` defaults to <data_dir>/keystore.json — create it with\n\
+         # `decdn key-gen`. Point `rpc_url` at your own provider for production.\n\
+         rpc_url = \"{rpc}\"\n\
+         chain_id = {chain_id}\n\
+         # eth_keystore = \"~/.decdn/keystore.json\"   # defaults to <data_dir>/keystore.json\n\
+         # --- Contract addresses (from deployments/{chain_id}.json) ---\n\
+         payment_channel_address    = \"{payment_channel}\"\n\
+         capacity_bond_address      = \"{capacity_bond}\"\n\
+         slash_judge_address        = \"{slash_judge}\"\n\
+         content_blacklist_address  = \"{content_blacklist}\"\n\
+         origin_assignment_address  = \"{origin_assignment}\"\n\
+         publisher_registry_address = \"{publisher_registry}\"\n\
+         slash_appeal_address       = \"{slash_appeal}\"\n\
+         usdc_address               = \"{usdc}\"\n\
+         # Optional tuning knobs (economics, poll intervals) and the DEX swap_*\n\
+         # keys for `decdn setup --pay-bond-with usdc` are commented in the blank\n\
+         # template — see `decdn config init --chain none`. Swap addresses are\n\
+         # venue-specific and are not baked in.\n\
+         \n",
+        label = chain.label,
+        chain_id = chain.chain_id,
+        rpc = chain.public_rpc,
+        payment_channel = a.payment_channel,
+        capacity_bond = a.capacity_bond,
+        slash_judge = a.slash_judge,
+        content_blacklist = a.content_blacklist,
+        origin_assignment = a.origin_assignment,
+        publisher_registry = a.publisher_registry,
+        slash_appeal = a.slash_appeal,
+        usdc = a.usdc,
+    ))
+}
+
+/// Replace the blank template's `[blockchain]` block with a filled one.
+///
+/// The generic template's `[blockchain]` section runs from its header to the
+/// start of the next top-level section, `[cache]`. Both headers are guaranteed
+/// present by the template guard tests; a missing marker is a hard error rather
+/// than a silent mis-splice.
+fn splice_blockchain_section(template: &str, filled: &str) -> anyhow::Result<String> {
+    let start = template
+        .find("\n[blockchain]\n")
+        .map(|i| i + 1)
+        .context("template is missing the [blockchain] section header")?;
+    let rest = template
+        .get(start..)
+        .context("template [blockchain] slice out of bounds")?;
+    let cache_rel = rest
+        .find("\n[cache]\n")
+        .map(|i| i + 1)
+        .context("template is missing the [cache] section header after [blockchain]")?;
+    let end = start + cache_rel;
+    let head = template
+        .get(..start)
+        .context("template head slice out of bounds")?;
+    let tail = template
+        .get(end..)
+        .context("template tail slice out of bounds")?;
+    Ok(format!("{head}{filled}{tail}"))
 }
 
 /// Default TOML config file content, written by `decdn config init`.
@@ -965,23 +1060,57 @@ mod tests {
         }
 
         let template = top_level_sections(DEFAULT_CONFIG);
-        for (label, sample) in [
-            (
-                "arbitrum-sepolia.toml",
-                include_str!("../../../../examples/configs/arbitrum-sepolia.toml"),
-            ),
-            (
-                "arbitrum-sepolia-client.toml",
-                include_str!("../../../../examples/configs/arbitrum-sepolia-client.toml"),
-            ),
-        ] {
-            let sample_sections = top_level_sections(sample);
-            let missing: Vec<&String> = sample_sections.difference(&template).collect();
-            assert!(
-                missing.is_empty(),
-                "example {label} uses section(s) absent from DEFAULT_CONFIG: {missing:?} \
-                 (add them to the canonical template)"
-            );
+        let label = "arbitrum-sepolia.toml";
+        let sample = include_str!("../../../../examples/configs/arbitrum-sepolia.toml");
+        let sample_sections = top_level_sections(sample);
+        let missing: Vec<&String> = sample_sections.difference(&template).collect();
+        assert!(
+            missing.is_empty(),
+            "example {label} uses section(s) absent from DEFAULT_CONFIG: {missing:?} \
+             (add them to the canonical template)"
+        );
+    }
+
+    /// `config init` with no `--chain` (the sole-chain default) must emit a
+    /// config that parses, carries the seeded chain id, and has every baked
+    /// contract address active — i.e. runs out of the box modulo a keystore.
+    #[test]
+    fn render_config_for_default_chain_is_runnable() {
+        let chain = known_chains::resolve(None)
+            .expect("resolve")
+            .expect("sole chain");
+        let rendered = render_config(Some(chain)).expect("render");
+
+        let cfg: config::FileConfig =
+            toml::from_str(&rendered).expect("rendered --chain config must parse as FileConfig");
+        let bc = cfg.blockchain.expect("[blockchain] present");
+
+        assert_eq!(bc.chain_id, Some(chain.chain_id));
+        assert_eq!(bc.rpc_url.as_deref(), Some(chain.public_rpc));
+
+        // Every manifest-derived address is filled in (not left commented), and
+        // equals the manifest exactly.
+        let a = chain.addresses().expect("addresses");
+        assert_eq!(bc.payment_channel_address, Some(a.payment_channel));
+        assert_eq!(bc.capacity_bond_address, Some(a.capacity_bond));
+        assert_eq!(bc.slash_judge_address, Some(a.slash_judge));
+        assert_eq!(bc.content_blacklist_address, Some(a.content_blacklist));
+        assert_eq!(bc.origin_assignment_address, Some(a.origin_assignment));
+        assert_eq!(bc.publisher_registry_address, Some(a.publisher_registry));
+        assert_eq!(bc.slash_appeal_address, Some(a.slash_appeal));
+        assert_eq!(bc.usdc_address, Some(a.usdc));
+
+        // Splicing preserved the other sections.
+        for header in ["[identity]", "[cache]", "[payment]", "[content]"] {
+            assert!(rendered.contains(header), "rendered config lost {header}");
         }
+    }
+
+    /// `--chain none` reproduces the blank template byte-for-byte, so the
+    /// generic path is unchanged and every drift guard above still applies.
+    #[test]
+    fn render_config_none_equals_default_template() {
+        let rendered = render_config(None).expect("render");
+        assert_eq!(rendered, DEFAULT_CONFIG);
     }
 }

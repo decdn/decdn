@@ -173,12 +173,13 @@ All client state resides under `~/.decdn/`, with the per-client data dir (`--dat
 
 Default configuration:
 
-The canonical, always-current client config lives at
-[`examples/configs/arbitrum-sepolia-client.toml`](../examples/configs/arbitrum-sepolia-client.toml) —
-CI-validated against the live schema (`decdn_common::config::FileConfig`), so it cannot drift from
-the implementation the way an inline copy here would. Per the workspace single-source-of-truth rule
-this ADR points at that file rather than restating the schema (and risking the two disagreeing). The
-client-relevant shape, in current schema terms:
+A client and a node share one schema (`decdn_common::config::FileConfig`), and `deny_unknown_fields`
+rejects only unknown keys, not node-only sections a client leaves unused. So a client needs no config
+of its own: `decdn config init --chain <name>` writes a ready-to-run file — chain id, RPC endpoint,
+and contract addresses baked in from the shipped deployment manifest — and a client uses the same
+file the node does, ignoring `[cache]`, `[payment]`, and the bond. `decdn fetch` also reads every one
+of these values as a flag, so a client can run with no config file at all. The client-relevant shape,
+in current schema terms:
 
 - `[identity]` — `data_dir` (holds the buyer payment-channel store and, by default, the ETH
   keystore) and an optional ISO 3166-1 alpha-2 `region`.
@@ -189,7 +190,7 @@ client-relevant shape, in current schema terms:
 A client does not configure the voucher cadence: it sends no `voucher_interval_mb` and follows the
 cadence the seller advertises on `cdn/client/v1`
 ([ADR 003 § Voucher Interval Negotiation](003-payments.md#voucher-interval-negotiation)), which is
-why the cited example carries no `[payment]` section.
+why a client leaves the `[payment]` section unset.
 
 The Ed25519 node key and the `peers.json` cache have no config keys of their own: both live inside
 the resolved data dir (see the tree above), so they move with `--data-dir` / `[identity] data_dir`.

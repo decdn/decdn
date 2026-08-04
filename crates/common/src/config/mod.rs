@@ -1029,8 +1029,10 @@ fn resolve_network(
 /// Validate a user-supplied EVM contract address string.
 ///
 /// Requires `0x` prefix, 40 hex characters, and a correct EIP-55 checksum.
-/// Returns the canonical checksummed form.
-fn parse_contract_address(flag_name: &str, raw: &str) -> anyhow::Result<String> {
+/// Returns the canonical checksummed form. Public so callers that generate
+/// config (e.g. `decdn config init --chain`) can apply the same check to
+/// baked-in addresses.
+pub fn parse_contract_address(flag_name: &str, raw: &str) -> anyhow::Result<String> {
     let trimmed = raw.trim();
     let addr = Address::parse_checksummed(trimmed, None).with_context(|| {
         format!(
@@ -10820,8 +10822,8 @@ bind_port = 12345
         assert_eq!(resolved.max_tracked_per_peer, 0);
     }
 
-    /// Shared check for a shipped Arbitrum Sepolia sample config (operator or
-    /// client): the config must stay in lockstep with the live `FileConfig`
+    /// Check for the shipped Arbitrum Sepolia operator sample config: it must
+    /// stay in lockstep with the live `FileConfig`
     /// schema — `deny_unknown_fields` means a renamed or removed key would
     /// otherwise break every user who copied it, and only surface when they run
     /// the binary. Parse it, confirm the seeded chain id, and run each contract
@@ -10873,13 +10875,6 @@ bind_port = 12345
     fn arbitrum_sepolia_operator_sample_config_matches_schema() -> anyhow::Result<()> {
         assert_sample_config_matches_schema(include_str!(
             "../../../../examples/configs/arbitrum-sepolia.toml"
-        ))
-    }
-
-    #[test]
-    fn arbitrum_sepolia_client_sample_config_matches_schema() -> anyhow::Result<()> {
-        assert_sample_config_matches_schema(include_str!(
-            "../../../../examples/configs/arbitrum-sepolia-client.toml"
         ))
     }
 }

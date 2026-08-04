@@ -6,3 +6,4 @@
 //! rather than the binary's `main.rs`.
 
 pub mod commands;
+pub mod known_chains;
