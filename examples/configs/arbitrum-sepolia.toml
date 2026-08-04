@@ -39,25 +39,25 @@ chain_id = 421614
 # Required. Settlement gateway, operator bond, and the slash-signature verifying
 # contract. A wrong/missing slash_judge_address silently produces signatures no
 # verifier accepts, so resolution fails fast if it is absent.
-payment_channel_address = "0xb4bcA0AbF679212708164dCAb98eFa621Fa0F4d3"
-capacity_bond_address   = "0x2aF490628579c08DC6D0B013090cDC11D4d60Dd4"
-slash_judge_address     = "0x20abcCC80F595a586f4Bd906a1b00c4196416EB7"
+payment_channel_address = "0x62B911B7CdEA5eedFB7dC0E2343440516fB8cb43"
+capacity_bond_address   = "0x2F08aE39B0127C92d56F9E5eAd20692b217dDc58"
+slash_judge_address     = "0xa9feAb7c1a82e32a2A52c40aD545C0111eC3A2b4"
 
 # Optional — chain-backed origin directory backing the pull-through gate and
 # FIND_VALUE fallback (ADR 022). Set BOTH or NEITHER; unset => the directory is
 # empty (deny-all) and the pull-through gate finds no authorized origins.
-origin_assignment_address  = "0x06b394f497481c33FB5ae164d5FbB0307299546c"
-publisher_registry_address = "0x32c811eA20326B911B518c2Cf38f9f172aC02e6c"
+origin_assignment_address  = "0x632F49B3447810eF20eee884fF6e7EAB5560b19e"
+publisher_registry_address = "0xa9D014d24924E7A5BCaB9E49A68119B1e92EBCD7"
 
 # Optional — blacklist compliance watcher (ADR 011/031). When set, the node
 # evicts held blobs whose hash is blacklisted in your scope. Unset => no watcher
 # (serving a blacklisted hash past its compliance window is then slashable with
 # no local protection).
-content_blacklist_address = "0xd4b2b7CC768c14004dC3400743E2EDB0724355f3"
+content_blacklist_address = "0x7e903dd1674EDe0596629205E55e5fe1B670dBD3"
 
 # Optional — target for `decdn appeal slash` (ADR 028). Consumed by the CLI only;
 # the daemon accepts but ignores this key (node.toml is shared by both binaries).
-slash_appeal_address = "0x0D60c0AbffBb5D612B66DB6bDd0d741BB36072cF"
+slash_appeal_address = "0x4CA50D80bFcBA877eAC4cFa36FF95D7f803c6590"
 
 [cache]
 # MUST-EDIT — blob cache directory and size budget (MB).

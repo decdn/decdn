@@ -27,13 +27,13 @@ chain_id = 421614
 
 # Required for fetch. The settlement contract, and the SlashJudge whose EIP-712
 # domain the client uses to verify the provider's slash-signed delivery responses.
-payment_channel_address = "0xb4bcA0AbF679212708164dCAb98eFa621Fa0F4d3"
-slash_judge_address     = "0x20abcCC80F595a586f4Bd906a1b00c4196416EB7"
+payment_channel_address = "0x62B911B7CdEA5eedFB7dC0E2343440516fB8cb43"
+slash_judge_address     = "0xa9feAb7c1a82e32a2A52c40aD545C0111eC3A2b4"
 
 # Needed only for provider AUTO-DISCOVERY (`decdn fetch <hash>` with no
 # --node-id): the client reads the active operator set from CapacityBond to pick
 # a region-near holder. Omit if you always pass --node-id + --provider-address.
-capacity_bond_address = "0x2aF490628579c08DC6D0B013090cDC11D4d60Dd4"
+capacity_bond_address = "0x2F08aE39B0127C92d56F9E5eAd20692b217dDc58"
 
 # Buyer channel economics (optional; ADR 003 defaults shown).
 # buyer_initial_deposit_micro_usdc = 500000     # deposit when OPENING a channel (first-contact lock); default 0.5 USDC
