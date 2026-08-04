@@ -99,16 +99,6 @@ pub const REDEEM_HINT_CAPACITY: usize = 256;
 /// lifetimes are long (default 90 days), so an hourly scan is ample.
 const EXPIRY_SWEEP_INTERVAL: Duration = Duration::from_hours(1);
 
-/// How often the redeemer self-tick scans all channels for an above-threshold
-/// claim, independent of hints (#751). Hints from the bounded advisory channel
-/// are best-effort and can be dropped under high channel fan-out; this low-
-/// frequency backstop guarantees a channel that crossed the threshold is still
-/// redeemed (it also recovers a `withdraw` whose receipt errored but later
-/// mined, and a channel that went quiet just below threshold). Kept well below
-/// the expiry sweep's hourly cadence so accrued earnings are withdrawn promptly
-/// without leaning on per-voucher hints.
-const REDEEM_TICK_INTERVAL: Duration = Duration::from_mins(5);
-
 /// How far ahead of a channel's on-chain expiry the sweep closes it. Must be
 /// comfortably larger than [`EXPIRY_SWEEP_INTERVAL`] so the close window is
 /// never missed between scans. After `expiresAt` the contract reverts
@@ -245,6 +235,7 @@ impl<P: Provider + Clone + 'static> PaymentChannelService<P> {
         checkpoint_store: Arc<dyn KeyedCheckpointStore>,
         handler: Arc<ClientHandler>,
         redeem_threshold: U256,
+        redeem_interval: Duration,
         auto_settle: AutoSettleConfig,
         event_poll_interval: Duration,
         head: Arc<dyn HeadSource>,
@@ -334,6 +325,7 @@ impl<P: Provider + Clone + 'static> PaymentChannelService<P> {
             Arc::clone(&handler),
             self_address,
             redeem_threshold,
+            redeem_interval,
             auto_settle,
             redeem_rx,
             Arc::clone(&metrics),
@@ -1335,6 +1327,7 @@ async fn redeemer_loop<P: Provider + Clone>(
     handler: Arc<ClientHandler>,
     self_address: Address,
     redeem_threshold: U256,
+    redeem_interval: Duration,
     auto_settle: AutoSettleConfig,
     mut redeem_rx: mpsc::Receiver<ChannelId>,
     metrics: Arc<Metrics>,
@@ -1349,7 +1342,7 @@ async fn redeemer_loop<P: Provider + Clone>(
     // auto-settlement). A cache miss estimates both from zero, so the first
     // hint per channel still does one RPC.
     let mut withdrawn_cache: HashMap<ChannelId, (U256, U256)> = HashMap::new();
-    let mut ticker = tokio::time::interval(REDEEM_TICK_INTERVAL);
+    let mut ticker = tokio::time::interval(redeem_interval);
     // Skip the immediate first tick: nothing has accrued right after bootstrap,
     // and the bring-up backfill + first vouchers hint anyway.
     ticker.tick().await;
@@ -1423,9 +1416,10 @@ async fn redeem_one<P: Provider + Clone>(
 /// channel back over the threshold. Subsequent ticks are cheap — a `getChannel`
 /// warms the entry, and a successful `withdraw` seeds it to the voucher amount
 /// so the channel short-circuits until it next crosses the threshold. At the
-/// testnet node count this stays well within RPC budget at the 5-min
-/// [`REDEEM_TICK_INTERVAL`]; revisit the cadence (or seed the cache at bootstrap)
-/// if a node tracks enough channels to make the post-boot fan-out costly. Errors
+/// testnet node count this stays well within RPC budget at the default 5-min
+/// redeem interval (`blockchain.redeem_interval_secs`); revisit the cadence (or
+/// seed the cache at bootstrap) if a node tracks enough channels to make the
+/// post-boot fan-out costly. Errors
 /// are per-channel (logged in [`redeem_one`]); a store-load failure is logged and
 /// skips this tick.
 #[allow(clippy::too_many_arguments)]

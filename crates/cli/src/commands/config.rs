@@ -478,6 +478,7 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # event_poll_interval_ms = 7000      # eth_getLogs tick cadence for chain watchers + pending-tx receipt polling (#1011/#1106); default 7000ms, min 250ms (lower for a local anvil)
 # rate_bounds_poll_interval_sec = 3600 # authoritative getRateBounds() re-read cadence, safety net beside the RateBoundsUpdated subscription (#1172); default 3600s, must be > 0
 # redeem_threshold_micro_usdc = 1000000          # seller redeems accrued vouchers on-chain at this µUSDC balance (#327); default 1 USDC
+# redeem_interval_secs = 300                      # redeemer self-tick sweep cadence, the backstop beside the per-voucher hints (#327/#751); default 300s, must be > 0
 # buyer_initial_deposit_micro_usdc = 500000     # deposit when OPENING a channel (first-contact lock); default 0.5 USDC
 # buyer_working_deposit_micro_usdc = 10000000    # refill target on reuse or mid-transfer shortfall; 0 disables top-up; default 10 USDC
 # buyer_max_approve = true                       # unlimited USDC approval for PaymentChannel (#744); node default true, decdn client default false (exact deposit-sized approval); set true on the client to opt into unlimited
@@ -719,6 +720,7 @@ mod tests {
             event_poll_interval_ms,
             rate_bounds_poll_interval_sec,
             redeem_threshold_micro_usdc,
+            redeem_interval_secs,
             buyer_initial_deposit_micro_usdc,
             buyer_working_deposit_micro_usdc,
             buyer_max_approve,
@@ -772,6 +774,7 @@ mod tests {
                 "redeem_threshold_micro_usdc =",
                 redeem_threshold_micro_usdc.is_none(),
             ),
+            ("redeem_interval_secs =", redeem_interval_secs.is_none()),
             (
                 "buyer_initial_deposit_micro_usdc =",
                 buyer_initial_deposit_micro_usdc.is_none(),

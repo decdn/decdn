@@ -196,6 +196,14 @@ pub struct BlockchainConfig {
     /// smaller values bound unsettled exposure. Absent => default
     /// (1 USDC = `1_000_000` `µUSDC`).
     pub redeem_threshold_micro_usdc: Option<u64>,
+    /// Seconds between the redeemer's self-tick sweeps (#327, #751): the
+    /// low-frequency backstop that scans every channel for an above-threshold
+    /// claim independent of the advisory per-voucher hints, so a dropped hint can
+    /// never strand an accrued balance. Smaller values withdraw earnings sooner
+    /// at the cost of more `getChannel` reads; larger values lean harder on the
+    /// hints. Absent => default (300s / 5 min). Must not be `0`; rejected at
+    /// config resolution.
+    pub redeem_interval_secs: Option<u64>,
     /// Deposit (base units, `µUSDC`) the buyer path escrows when it **opens** a
     /// new `PaymentChannel` against a provider (the first-contact lock). Kept
     /// small so an untried node holds little of the buyer's capital on first
