@@ -56,6 +56,10 @@ postcard = { workspace = true, optional = true }
 [dev-dependencies]
 anyhow = { workspace = true }
 tempfile = { workspace = true }
+# Deserializing an `alloy` JSON-RPC `ErrorPayload` in `tx.rs`'s send-error
+# classifier test — `ErrorPayload` is not re-exported through `alloy::transports`,
+# so its wire shape is the only constructor available.
+serde_json = { workspace = true }
 # Cargo.lock parsing for the ed25519 dalek pin-parity test
 # (tests/ed25519_pin_parity.rs).
 toml = { workspace = true }
