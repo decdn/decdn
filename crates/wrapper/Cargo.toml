@@ -1,9 +1,31 @@
 [package]
-name = "wrapper"
+name = "onramp"
 version = "0.1.0"
 edition = "2024"
 publish = false
 
 [[bin]]
-name = "wrapper"
+name = "onramp"
 path = "src/main.rs"
+
+[lib]
+name = "onramp"
+path = "src/lib.rs"
+
+[dependencies]
+# `signer-keystore-geth-compat` is additive to the workspace default: it
+# turns on `eth-keystore`'s `geth-compat` feature, which writes the
+# plaintext `address` field into the v3 keystore JSON. Feature
+# unification means this also applies to `decdn-incentive`'s
+# `eth_identity` keystores when built as part of this binary — needed so
+# `read_address` can read the address without the password. See
+# `keystore.rs` for the discovery (decdn's own keystores omit the field).
+alloy = { workspace = true, features = ["signer-keystore-geth-compat"] }
+anyhow.workspace = true
+tokio.workspace = true
+decdn-incentive.workspace = true
+serde_json.workspace = true
+hex = "0.4"
+
+[dev-dependencies]
+tempfile = "3"
