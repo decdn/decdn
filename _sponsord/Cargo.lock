@@ -5869,13 +5869,16 @@ version = "0.1.0"
 dependencies = [
  "alloy",
  "anyhow",
+ "clap",
  "decdn-incentive",
  "hex",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "serial_test",
  "tempfile",
  "tokio",
+ "toml",
  "wiremock",
 ]
 

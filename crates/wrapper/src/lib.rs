@@ -3,5 +3,7 @@
 //! (in later tasks) proxies requests through the sponsor's channel.
 
 pub mod api;
+pub mod config;
+pub mod flow;
 pub mod keystore;
 pub mod runner;
