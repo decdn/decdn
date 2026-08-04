@@ -35,6 +35,13 @@ pub struct ConfigInitArgs {
     /// Overwrite existing config file if present.
     #[arg(long)]
     pub force: bool,
+
+    /// Deployment to bake in: chain id + contract addresses are filled from the
+    /// shipped deployment manifest so the config runs out of the box. Omit to
+    /// select the only known network; pass `none` for a blank template with
+    /// every address left to fill in.
+    #[arg(long, value_name = "NAME")]
+    pub chain: Option<String>,
 }
 
 /// Validate the resolved configuration without binding ports or connecting to
