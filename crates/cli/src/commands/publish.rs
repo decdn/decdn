@@ -164,26 +164,64 @@ async fn preflight_chain_id(rpc_url: &str, expected: u64) -> anyhow::Result<()> 
 // namespace create
 // -------------------------------------------------------------------------
 
+/// The outcome of `namespace create`'s single transaction — the five mutually
+/// exclusive states as one value, so text and JSON rendering derive from one
+/// source of truth and can no longer contradict each other (issue #1578). Modeled
+/// on [`SeatOutcome`]: an illegal combination (a hash on a dry run, a `created`
+/// with no hash) is now unrepresentable rather than merely unreached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NamespaceStatus {
+    /// `--dry-run`: nothing was sent, and no keystore was loaded.
+    DryRun,
+    /// Nothing was minted: the send was rejected, or the call confirmed as a
+    /// revert. `send_for_receipt` clears the hash on a revert, so the two are
+    /// indistinguishable here — which is why this is not called `reverted`.
+    Failed,
+    /// The transaction was broadcast but its receipt was unreadable, so a
+    /// namespace may or may not exist. Keeps the hash — the only handle on it.
+    InFlight(B256),
+    /// `createNamespace` confirmed. `id` is `None` only when the receipt carried
+    /// no decodable `NamespaceCreated` log; the tx hash is then the sole handle
+    /// on the live namespace, so it is never dropped.
+    Created { tx: B256, id: Option<u64> },
+}
+
+impl NamespaceStatus {
+    /// The transaction hash, for any state that has one.
+    const fn tx(self) -> Option<B256> {
+        match self {
+            Self::InFlight(hash) | Self::Created { tx: hash, .. } => Some(hash),
+            Self::DryRun | Self::Failed => None,
+        }
+    }
+
+    /// The minted namespace id, known only when the create confirmed and its
+    /// `NamespaceCreated` log decoded. `Some` therefore implies `status ==
+    /// "created"`, which is the invariant a `--json` consumer relies on.
+    const fn namespace_id(self) -> Option<u64> {
+        match self {
+            Self::Created { id, .. } => id,
+            Self::DryRun | Self::Failed | Self::InFlight(_) => None,
+        }
+    }
+
+    /// The `status=` token in the receipt.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::DryRun => "dry_run",
+            Self::Failed => "failed",
+            Self::InFlight(_) => "unknown",
+            Self::Created { .. } => "created",
+        }
+    }
+}
+
 /// Result of `namespace create`. `operator` is `None` on a dry run (which loads
 /// no keystore, so the signer address is unknown).
 pub(crate) struct NamespaceOutcome {
     pub(crate) operator: Option<Address>,
     pub(crate) registry: Address,
-    /// The minted id, from the `NamespaceCreated` event. `None` whenever it
-    /// could not be read, which [`single_tx_status`] tells apart: nothing was
-    /// sent (`dry_run`), nothing was minted because the send was rejected or the
-    /// call confirmed as a revert (`failed` — `send_for_receipt` clears the hash
-    /// on a revert, so the two are indistinguishable here), the transaction was
-    /// broadcast but its receipt was unreadable so a namespace may or may not
-    /// exist (`unknown`), or the namespace was created and only its id could not
-    /// be decoded (`created`). The converse is the part a `--json` consumer
-    /// needs: `Some` implies `status == "created"`.
-    pub(crate) namespace_id: Option<u64>,
-    pub(crate) tx: Option<B256>,
-    /// The transaction was broadcast but its outcome could not be read, so the
-    /// namespace is neither confirmed created nor known to have failed.
-    pub(crate) in_flight: bool,
-    pub(crate) dry_run: bool,
+    pub(crate) status: NamespaceStatus,
 }
 
 pub(crate) fn write_namespace_outcome(
@@ -191,15 +229,16 @@ pub(crate) fn write_namespace_outcome(
     o: &NamespaceOutcome,
     json: bool,
 ) -> io::Result<()> {
-    let status = single_tx_status(o.dry_run, o.in_flight, o.tx, "created");
+    let tx = o.status.tx();
+    let namespace_id = o.status.namespace_id();
     if json {
         let value = serde_json::json!({
-            "submitted": o.tx.is_some(),
-            "tx": o.tx.map(|h| format!("{h:#x}")),
+            "submitted": tx.is_some(),
+            "tx": tx.map(|h| format!("{h:#x}")),
             "operator": o.operator.map(|a| format!("{a:#x}")),
             "publisher_registry": format!("{:#x}", o.registry),
-            "namespace_id": o.namespace_id,
-            "status": status,
+            "namespace_id": namespace_id,
+            "status": o.status.label(),
         });
         return writeln!(w, "{value}");
     }
@@ -209,12 +248,12 @@ pub(crate) fn write_namespace_outcome(
     writeln!(w, "publisher_registry={:#x}", o.registry)?;
     // Its own line, like `ready_at`: the id is absent whenever it could not be
     // decoded, and `status` + `tx` still have to print without it.
-    if let Some(id) = o.namespace_id {
+    if let Some(id) = namespace_id {
         writeln!(w, "namespace_id={id}")?;
     }
-    match o.tx {
-        Some(h) => writeln!(w, "status={status} tx={h:#x}"),
-        None => writeln!(w, "status={status} submitted=false"),
+    match tx {
+        Some(h) => writeln!(w, "status={} tx={h:#x}", o.status.label()),
+        None => writeln!(w, "status={} submitted=false", o.status.label()),
     }
 }
 
@@ -223,62 +262,65 @@ async fn namespace_create(
     global_config: Option<&Path>,
 ) -> anyhow::Result<()> {
     let (resolved, registry) = registry_ctx(&args.chain, global_config)?;
-    let mut outcome = NamespaceOutcome {
-        operator: None,
-        registry,
-        namespace_id: None,
-        tx: None,
-        in_flight: false,
-        dry_run: args.chain.common.dry_run,
-    };
+    let dry_run = args.chain.common.dry_run;
+    let mut operator = None;
+    let mut status = NamespaceStatus::DryRun;
     // `Ok` on the dry-run path: nothing was sent, so there is nothing to decode
     // and nothing to report as failed. The 0 is never read — only `created.err()`
     // is — which matters because 0 is the registry's reserved "no namespace" id,
     // so it would be a plausible-looking lie if it ever reached the receipt.
     let mut created: anyhow::Result<u64> = Ok(0);
-    // Whether the namespace reached the chain. Only then may the error text
-    // claim a namespace the publisher now owns.
-    let mut landed = false;
 
-    if !outcome.dry_run {
+    if !dry_run {
         // The keystore is decrypted only when actually submitting — a dry run
         // needs no secrets.
         let (signer, provider) = signer_and_provider(&resolved, &args.chain).await?;
-        outcome.operator = Some(signer.address());
+        operator = Some(signer.address());
         let contract = PublisherRegistry::new(registry, &provider);
+        let mut tx = None;
         let sent = decdn_incentive::tx::send_for_receipt(
             contract.createNamespace(),
             "createNamespace",
             Some("check the RPC, gas, and the registry address"),
-            &mut outcome.tx,
+            &mut tx,
         )
         .await;
 
-        match sent {
-            // Every failure below happens AFTER the namespace exists on-chain,
-            // so it must not short-circuit the receipt — the tx hash is the only
-            // handle the publisher has on a namespace whose id was lost, and a
-            // blind retry mints a second one against `maxNamespacesPerPublisher`.
+        status = match sent {
+            // Every decode failure below happens AFTER the namespace exists
+            // on-chain, so it must not short-circuit the receipt — the tx hash is
+            // the only handle the publisher has on a namespace whose id was lost,
+            // and a blind retry mints a second one against
+            // `maxNamespacesPerPublisher`. The receipt's hash always exists on a
+            // confirmed create, so `Created` carries it unconditionally.
             Ok(receipt) => {
-                landed = true;
                 created = decode_created_namespace(&receipt);
-                if let Ok(id) = created {
-                    outcome.namespace_id = Some(id);
+                NamespaceStatus::Created {
+                    tx: receipt.transaction_hash,
+                    id: created.as_ref().ok().copied(),
                 }
             }
             Err(err) => {
+                created = Err(err);
                 // A hash that survived the error means the transaction was
                 // broadcast and only its receipt was unreadable: the namespace
                 // may well exist, so report it rather than implying nothing
                 // happened. No hash means the send was rejected or the call
                 // reverted — nothing was minted, and `send_for_receipt`'s own
                 // error already says so.
-                outcome.in_flight = outcome.tx.is_some();
-                created = Err(err);
+                match tx {
+                    Some(hash) => NamespaceStatus::InFlight(hash),
+                    None => NamespaceStatus::Failed,
+                }
             }
-        }
+        };
     }
 
+    let outcome = NamespaceOutcome {
+        operator,
+        registry,
+        status,
+    };
     let mut out = io::stdout().lock();
     // `flush` explicitly: `Stdout` is a `LineWriter`, so a partial write can
     // buffer the tail and fail at `drop`, where the result is unobservable — a
@@ -287,7 +329,7 @@ async fn namespace_create(
         .and_then(|()| out.flush())
         .err();
     drop(out);
-    let context = namespace_failure_context(landed, outcome.in_flight);
+    let context = namespace_failure_context(outcome.status);
     propagate(
         created.err().map(|err| match context {
             Some(note) => err.context(note),
@@ -296,8 +338,11 @@ async fn namespace_create(
         write_err,
         "failed to write namespace-create output",
         &single_tx_receipt(
-            outcome.namespace_id.map(|id| format!("namespace_id={id}")),
-            outcome.tx,
+            outcome
+                .status
+                .namespace_id()
+                .map(|id| format!("namespace_id={id}")),
+            outcome.status.tx(),
         ),
     )
 }
@@ -313,13 +358,12 @@ async fn namespace_create(
 /// at. It is also the modal failure, since `NamespaceCapReached` is
 /// `createNamespace`'s only revert and so surfaces from the pre-flight gas
 /// estimate, before anything is broadcast.
-const fn namespace_failure_context(landed: bool, in_flight: bool) -> Option<&'static str> {
-    if in_flight {
-        Some(
+const fn namespace_failure_context(status: NamespaceStatus) -> Option<&'static str> {
+    match status {
+        NamespaceStatus::InFlight(_) => Some(
             "the transaction was broadcast — check the tx above before re-running, since a \
              create that landed already counts against maxNamespacesPerPublisher",
-        )
-    } else if landed {
+        ),
         // Names a log query rather than the receipt's own log, and deliberately
         // not `ownerOf`. `ownerOf` maps id → owner, so it needs the very id that
         // was lost — it can confirm a guess, never produce one. An owner-filtered
@@ -328,13 +372,12 @@ const fn namespace_failure_context(landed: bool, in_flight: bool) -> Option<&'st
         // topic with no data decode. That holds for every failure this note rides
         // along with, including a receipt that came back without the log — the
         // log is still on-chain, it just was not in what the RPC returned.
-        Some(
+        NamespaceStatus::Created { .. } => Some(
             "the namespace exists and is owned by the signer — recover its id by filtering the \
              registry's NamespaceCreated logs for this signer rather than re-running, which \
              mints a second namespace",
-        )
-    } else {
-        None
+        ),
+        NamespaceStatus::DryRun | NamespaceStatus::Failed => None,
     }
 }
 
@@ -374,30 +417,6 @@ fn decode_created_namespace(
         )?;
     u64::try_from(created.inner.data.namespaceId)
         .context("namespace id exceeds u64 (unexpected on this chain)")
-}
-
-/// The `status=` token for a command that submits exactly ONE transaction.
-///
-/// `in_flight` is the case that needs its own answer: the transaction was
-/// broadcast and its outcome could not be read, so neither the success label nor
-/// "failed" is honest. `send_for_receipt` clears the hash on a confirmed revert
-/// and leaves it set when only the receipt fetch failed, which is what makes the
-/// two distinguishable here.
-const fn single_tx_status(
-    dry_run: bool,
-    in_flight: bool,
-    tx: Option<B256>,
-    confirmed: &'static str,
-) -> &'static str {
-    if dry_run {
-        "dry_run"
-    } else if in_flight {
-        "unknown"
-    } else if tx.is_some() {
-        confirmed
-    } else {
-        "failed"
-    }
 }
 
 /// Return the on-chain failure if there was one, otherwise the stdout-write
@@ -711,6 +730,46 @@ async fn assign(args: &cli::AssignArgs, global_config: Option<&Path>) -> anyhow:
 // revoke
 // -------------------------------------------------------------------------
 
+/// The outcome of `publish revoke`'s single transaction — the four mutually
+/// exclusive states as one value, the `removeOrigin` parallel of
+/// [`NamespaceStatus`]. It has no decoded payload, so `Revoked` is a bare hash
+/// rather than a struct.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RevokeStatus {
+    /// `--dry-run`: nothing was sent, and no keystore was loaded.
+    DryRun,
+    /// Nothing was unseated: the send was rejected, or the call confirmed as a
+    /// revert. `send_for_receipt` clears the hash on a revert, so the two are
+    /// indistinguishable here.
+    Failed,
+    /// The transaction was broadcast but its receipt was unreadable, so the
+    /// operator may or may not still be seated. Keeps the hash — the only handle
+    /// on it.
+    InFlight(B256),
+    /// `removeOrigin` confirmed. The operator is unseated.
+    Revoked(B256),
+}
+
+impl RevokeStatus {
+    /// The transaction hash, for any state that has one.
+    const fn tx(self) -> Option<B256> {
+        match self {
+            Self::InFlight(hash) | Self::Revoked(hash) => Some(hash),
+            Self::DryRun | Self::Failed => None,
+        }
+    }
+
+    /// The `status=` token in the receipt.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::DryRun => "dry_run",
+            Self::Failed => "failed",
+            Self::InFlight(_) => "unknown",
+            Self::Revoked(_) => "revoked",
+        }
+    }
+}
+
 /// Receipt for `publish revoke`. One transaction, so the shape is simpler than
 /// [`AssignOutcome`] — but it needs the same honesty about a broadcast whose
 /// outcome could not be read.
@@ -720,11 +779,7 @@ pub(crate) struct RevokeOutcome {
     pub(crate) namespace_id: u64,
     /// The operator being unseated.
     pub(crate) revoked: Address,
-    pub(crate) tx: Option<B256>,
-    /// The transaction was broadcast but its outcome could not be read, so the
-    /// operator may or may not still be seated.
-    pub(crate) in_flight: bool,
-    pub(crate) dry_run: bool,
+    pub(crate) status: RevokeStatus,
 }
 
 pub(crate) fn write_revoke_outcome(
@@ -732,16 +787,16 @@ pub(crate) fn write_revoke_outcome(
     o: &RevokeOutcome,
     json: bool,
 ) -> io::Result<()> {
-    let status = single_tx_status(o.dry_run, o.in_flight, o.tx, "revoked");
+    let tx = o.status.tx();
     if json {
         let value = serde_json::json!({
-            "submitted": o.tx.is_some(),
-            "tx": o.tx.map(|h| format!("{h:#x}")),
+            "submitted": tx.is_some(),
+            "tx": tx.map(|h| format!("{h:#x}")),
             "operator": o.operator.map(|a| format!("{a:#x}")),
             "origin_assignment": format!("{:#x}", o.origin_assignment),
             "namespace_id": o.namespace_id,
             "revoked_operator": format!("{:#x}", o.revoked),
-            "status": status,
+            "status": o.status.label(),
         });
         return writeln!(w, "{value}");
     }
@@ -751,9 +806,9 @@ pub(crate) fn write_revoke_outcome(
     writeln!(w, "origin_assignment={:#x}", o.origin_assignment)?;
     writeln!(w, "namespace_id={}", o.namespace_id)?;
     writeln!(w, "revoked_operator={:#x}", o.revoked)?;
-    match o.tx {
-        Some(h) => writeln!(w, "status={status} tx={h:#x}"),
-        None => writeln!(w, "status={status} submitted=false"),
+    match tx {
+        Some(h) => writeln!(w, "status={} tx={h:#x}", o.status.label()),
+        None => writeln!(w, "status={} submitted=false", o.status.label()),
     }
 }
 
@@ -761,43 +816,54 @@ async fn revoke(args: &cli::RevokeArgs, global_config: Option<&Path>) -> anyhow:
     let (resolved, oa_addr) = assignment_ctx(&args.chain, global_config)?;
     let revoked = chain_ctx::parse_address(&args.operator, "operator")?;
 
-    let mut outcome = RevokeOutcome {
-        operator: None,
-        origin_assignment: oa_addr,
-        namespace_id: args.namespace,
-        revoked,
-        tx: None,
-        in_flight: false,
-        dry_run: args.chain.common.dry_run,
-    };
+    let dry_run = args.chain.common.dry_run;
+    let mut operator = None;
+    let mut status = RevokeStatus::DryRun;
 
     // Print before propagating, for the same reason `assign` does: a broadcast
     // whose receipt could not be read leaves the hash set, and a `--json`
     // consumer that only sees the error loses its one handle on the removal.
     let mut chain_err = None;
-    if !outcome.dry_run {
+    if !dry_run {
         let (signer, provider) = signer_and_provider(&resolved, &args.chain).await?;
-        outcome.operator = Some(signer.address());
+        operator = Some(signer.address());
         let contract = OriginAssignment::new(oa_addr, &provider);
-        if let Err(err) = decdn_incentive::tx::send_for_receipt(
+        let mut tx = None;
+        match decdn_incentive::tx::send_for_receipt(
             contract.removeOrigin(U256::from(args.namespace), revoked),
             "removeOrigin",
             Some(
                 "the signer must own the namespace (or hold GOVERNANCE_ROLE) and the operator \
                  must currently be seated as an authorized origin for it",
             ),
-            &mut outcome.tx,
+            &mut tx,
         )
         .await
         {
-            outcome.in_flight = outcome.tx.is_some();
-            chain_err = Some(match revoke_failure_context(outcome.in_flight) {
-                Some(note) => err.context(note),
-                None => err,
-            });
+            Ok(receipt) => status = RevokeStatus::Revoked(receipt.transaction_hash),
+            Err(err) => {
+                // A hash surviving the error means the transaction was broadcast
+                // and only its receipt was unreadable; no hash means the send was
+                // rejected or the call reverted, unseating nothing.
+                status = match tx {
+                    Some(hash) => RevokeStatus::InFlight(hash),
+                    None => RevokeStatus::Failed,
+                };
+                chain_err = Some(match revoke_failure_context(status) {
+                    Some(note) => err.context(note),
+                    None => err,
+                });
+            }
         }
     }
 
+    let outcome = RevokeOutcome {
+        operator,
+        origin_assignment: oa_addr,
+        namespace_id: args.namespace,
+        revoked,
+        status,
+    };
     let mut out = io::stdout().lock();
     let write_err = write_revoke_outcome(&mut out, &outcome, args.chain.common.json)
         .and_then(|()| out.flush())
@@ -807,7 +873,7 @@ async fn revoke(args: &cli::RevokeArgs, global_config: Option<&Path>) -> anyhow:
         chain_err,
         write_err,
         "failed to write revoke output",
-        &single_tx_receipt(None, outcome.tx),
+        &single_tx_receipt(None, outcome.status.tx()),
     )
 }
 
@@ -819,14 +885,13 @@ async fn revoke(args: &cli::RevokeArgs, global_config: Option<&Path>) -> anyhow:
 /// revert `NotAuthorizedOrigin`, which reads like a permissions problem rather
 /// than "this already worked". A rejected send unseated nothing and has no hash
 /// to cite, so `send_for_receipt`'s own error is already complete.
-const fn revoke_failure_context(in_flight: bool) -> Option<&'static str> {
-    if in_flight {
-        Some(
+const fn revoke_failure_context(status: RevokeStatus) -> Option<&'static str> {
+    match status {
+        RevokeStatus::InFlight(_) => Some(
             "the transaction was broadcast — check the tx above before re-running, since a \
              removal that landed makes the retry revert NotAuthorizedOrigin",
-        )
-    } else {
-        None
+        ),
+        RevokeStatus::DryRun | RevokeStatus::Failed | RevokeStatus::Revoked(_) => None,
     }
 }
 
@@ -841,10 +906,7 @@ mod tests {
         let base = NamespaceOutcome {
             operator: None,
             registry: Address::repeat_byte(0x01),
-            namespace_id: None,
-            tx: None,
-            in_flight: false,
-            dry_run: true,
+            status: NamespaceStatus::DryRun,
         };
         let mut buf = Vec::new();
         write_namespace_outcome(&mut buf, &base, false).unwrap();
@@ -855,9 +917,10 @@ mod tests {
 
         let done = NamespaceOutcome {
             operator: Some(Address::repeat_byte(0xCD)),
-            namespace_id: Some(9),
-            tx: Some(B256::repeat_byte(0x55)),
-            dry_run: false,
+            status: NamespaceStatus::Created {
+                tx: B256::repeat_byte(0x55),
+                id: Some(9),
+            },
             ..base
         };
         let mut buf = Vec::new();
@@ -866,6 +929,32 @@ mod tests {
         assert!(s.contains("operator=0xcdcd"), "{s}");
         assert!(s.contains("namespace_id=9"), "{s}");
         assert!(s.contains("status=created tx=0x5555"), "{s}");
+    }
+
+    /// The bug this refactor closes (issue #1578): under the old struct a
+    /// `dry_run: true` alongside a `tx: Some` printed `status=dry_run tx=…` and
+    /// emitted `"submitted": true` next to `"status": "dry_run"`. The enum makes
+    /// that pair unrepresentable — `DryRun` carries no hash, so `tx()` is `None`
+    /// and text and JSON agree on both fields — which this pins.
+    #[test]
+    fn namespace_dry_run_carries_no_tx_and_is_not_submitted() {
+        let dry = NamespaceOutcome {
+            operator: None,
+            registry: Address::repeat_byte(0x01),
+            status: NamespaceStatus::DryRun,
+        };
+        let mut buf = Vec::new();
+        write_namespace_outcome(&mut buf, &dry, false).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(!text.contains("tx=0x"), "{text}");
+        assert!(text.contains("status=dry_run submitted=false"), "{text}");
+
+        let mut buf = Vec::new();
+        write_namespace_outcome(&mut buf, &dry, true).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+        assert_eq!(v["status"], serde_json::json!("dry_run"));
+        assert_eq!(v["submitted"], serde_json::json!(false));
+        assert!(v["tx"].is_null(), "{v}");
     }
 
     /// The state this receipt exists for: `createNamespace` confirmed, so the
@@ -882,10 +971,10 @@ mod tests {
         let o = NamespaceOutcome {
             operator: Some(Address::repeat_byte(0xCD)),
             registry: Address::repeat_byte(0x01),
-            namespace_id: None,
-            tx: Some(B256::repeat_byte(0x55)),
-            in_flight: false,
-            dry_run: false,
+            status: NamespaceStatus::Created {
+                tx: B256::repeat_byte(0x55),
+                id: None,
+            },
         };
         let mut buf = Vec::new();
         write_namespace_outcome(&mut buf, &o, false).unwrap();
@@ -911,7 +1000,7 @@ mod tests {
         // but it keeps its hash, because a namespace that may exist needs the
         // same handle as one that does.
         let unknown = NamespaceOutcome {
-            in_flight: true,
+            status: NamespaceStatus::InFlight(B256::repeat_byte(0x55)),
             ..o
         };
         let mut buf = Vec::new();
@@ -925,8 +1014,7 @@ mod tests {
 
         // Nothing reached the chain: `failed`, and distinguishable from a dry run.
         let failed = NamespaceOutcome {
-            tx: None,
-            in_flight: false,
+            status: NamespaceStatus::Failed,
             ..o
         };
         let mut buf = Vec::new();
@@ -934,6 +1022,32 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
         assert_eq!(v["status"], serde_json::json!("failed"));
         assert_eq!(v["submitted"], serde_json::json!(false));
+    }
+
+    /// A `created` with a decoded id prints and emits the id, distinguishing it
+    /// from the id-less `created` above — the fifth of the five states, and the
+    /// one whose `namespace_id` a `--json` consumer reads back.
+    #[test]
+    fn namespace_created_with_id_emits_the_id() {
+        let o = NamespaceOutcome {
+            operator: Some(Address::repeat_byte(0xCD)),
+            registry: Address::repeat_byte(0x01),
+            status: NamespaceStatus::Created {
+                tx: B256::repeat_byte(0x55),
+                id: Some(9),
+            },
+        };
+        let mut buf = Vec::new();
+        write_namespace_outcome(&mut buf, &o, false).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains("namespace_id=9"), "{s}");
+        assert!(s.contains("status=created tx=0x5555"), "{s}");
+
+        let mut buf = Vec::new();
+        write_namespace_outcome(&mut buf, &o, true).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+        assert_eq!(v["status"], serde_json::json!("created"));
+        assert_eq!(v["namespace_id"], serde_json::json!(9));
     }
 
     /// A `namespace create` failure must only warn about the burnt quota when a
@@ -945,7 +1059,8 @@ mod tests {
     #[test]
     fn namespace_failure_context_only_claims_a_namespace_when_one_exists() {
         // Broadcast, receipt unreadable: it may exist, so say so.
-        let in_flight = namespace_failure_context(false, true).unwrap();
+        let in_flight =
+            namespace_failure_context(NamespaceStatus::InFlight(B256::repeat_byte(0x55))).unwrap();
         assert!(in_flight.contains("was broadcast"), "{in_flight}");
         assert!(
             in_flight.contains("maxNamespacesPerPublisher"),
@@ -953,7 +1068,11 @@ mod tests {
         );
 
         // Confirmed, but the id could not be decoded: the namespace IS owned.
-        let landed = namespace_failure_context(true, false).unwrap();
+        let landed = namespace_failure_context(NamespaceStatus::Created {
+            tx: B256::repeat_byte(0x55),
+            id: None,
+        })
+        .unwrap();
         assert!(landed.contains("exists and is owned"), "{landed}");
         // The recovery path has to work for every decode failure, including the
         // one where the receipt came back WITHOUT the log — so it points at an
@@ -968,8 +1087,13 @@ mod tests {
 
         // Nothing reached the chain — nothing minted, and no hash to cite.
         assert!(
-            namespace_failure_context(false, false).is_none(),
+            namespace_failure_context(NamespaceStatus::Failed).is_none(),
             "a rejected send must not claim a created namespace"
+        );
+        // A dry run minted nothing either.
+        assert!(
+            namespace_failure_context(NamespaceStatus::DryRun).is_none(),
+            "a dry run must not claim a created namespace"
         );
     }
 
@@ -1322,15 +1446,24 @@ mod tests {
 
     #[test]
     fn revoke_failure_context_only_warns_once_something_was_broadcast() {
-        let in_flight = revoke_failure_context(true).unwrap();
+        let in_flight =
+            revoke_failure_context(RevokeStatus::InFlight(B256::repeat_byte(0x55))).unwrap();
         assert!(in_flight.contains("was broadcast"), "{in_flight}");
         // The retry's revert reads like a permissions problem, so it has to be
         // named — that is the whole reason this note exists.
         assert!(in_flight.contains("NotAuthorizedOrigin"), "{in_flight}");
 
         assert!(
-            revoke_failure_context(false).is_none(),
+            revoke_failure_context(RevokeStatus::Failed).is_none(),
             "a rejected send unseated nothing and has no hash to cite"
+        );
+        assert!(
+            revoke_failure_context(RevokeStatus::Revoked(B256::repeat_byte(0x55))).is_none(),
+            "a confirmed removal needs no extra warning"
+        );
+        assert!(
+            revoke_failure_context(RevokeStatus::DryRun).is_none(),
+            "a dry run sent nothing"
         );
     }
 
@@ -1341,9 +1474,7 @@ mod tests {
             origin_assignment: Address::repeat_byte(0x02),
             namespace_id: 7,
             revoked: Address::repeat_byte(0x11),
-            tx: Some(B256::repeat_byte(0x55)),
-            in_flight: false,
-            dry_run: false,
+            status: RevokeStatus::Revoked(B256::repeat_byte(0x55)),
         };
         let mut buf = Vec::new();
         write_revoke_outcome(&mut buf, &o, false).unwrap();
@@ -1354,8 +1485,7 @@ mod tests {
 
         let dry = RevokeOutcome {
             operator: None,
-            tx: None,
-            dry_run: true,
+            status: RevokeStatus::DryRun,
             ..o
         };
         let mut buf = Vec::new();
@@ -1371,10 +1501,7 @@ mod tests {
         let dry = NamespaceOutcome {
             operator: None,
             registry: Address::repeat_byte(0x01),
-            namespace_id: None,
-            tx: None,
-            in_flight: false,
-            dry_run: true,
+            status: NamespaceStatus::DryRun,
         };
         let mut buf = Vec::new();
         write_namespace_outcome(&mut buf, &dry, true).unwrap();
@@ -1388,10 +1515,10 @@ mod tests {
         let done = NamespaceOutcome {
             operator: Some(Address::repeat_byte(0xCD)),
             registry: Address::repeat_byte(0x01),
-            namespace_id: Some(9),
-            tx: Some(B256::repeat_byte(0x55)),
-            in_flight: false,
-            dry_run: false,
+            status: NamespaceStatus::Created {
+                tx: B256::repeat_byte(0x55),
+                id: Some(9),
+            },
         };
         let mut buf = Vec::new();
         write_namespace_outcome(&mut buf, &done, true).unwrap();
@@ -1452,9 +1579,7 @@ mod tests {
             origin_assignment: Address::repeat_byte(0x02),
             namespace_id: 7,
             revoked: Address::repeat_byte(0x11),
-            tx: Some(B256::repeat_byte(0x55)),
-            in_flight: true,
-            dry_run: false,
+            status: RevokeStatus::InFlight(B256::repeat_byte(0x55)),
         };
         let mut buf = Vec::new();
         write_revoke_outcome(&mut buf, &revoke, false).unwrap();
@@ -1473,20 +1598,58 @@ mod tests {
         );
     }
 
-    /// A send that never made it on-chain is `failed`, not `dry_run` — the two
-    /// were indistinguishable while the status was derived from `tx` alone.
+    /// The label/hash derivation for every `NamespaceStatus` state, walked once
+    /// so the two renderers can never disagree with each other about a state.
+    /// `dry_run` and `failed` are the pair the old `tx`-derived status could not
+    /// tell apart; the enum keeps them distinct and hash-free.
     #[test]
-    fn single_tx_status_separates_failed_from_dry_run() {
-        assert_eq!(single_tx_status(true, false, None, "revoked"), "dry_run");
-        assert_eq!(single_tx_status(false, false, None, "revoked"), "failed");
-        assert_eq!(
-            single_tx_status(false, false, Some(B256::repeat_byte(1)), "revoked"),
-            "revoked"
-        );
-        assert_eq!(
-            single_tx_status(false, true, Some(B256::repeat_byte(1)), "revoked"),
-            "unknown"
-        );
+    fn namespace_status_labels_and_hashes_match_their_states() {
+        let hash = B256::repeat_byte(0x55);
+        assert_eq!(NamespaceStatus::DryRun.label(), "dry_run");
+        assert_eq!(NamespaceStatus::DryRun.tx(), None);
+        assert_eq!(NamespaceStatus::DryRun.namespace_id(), None);
+
+        assert_eq!(NamespaceStatus::Failed.label(), "failed");
+        assert_eq!(NamespaceStatus::Failed.tx(), None);
+        assert_eq!(NamespaceStatus::Failed.namespace_id(), None);
+
+        assert_eq!(NamespaceStatus::InFlight(hash).label(), "unknown");
+        assert_eq!(NamespaceStatus::InFlight(hash).tx(), Some(hash));
+        // A broadcast whose receipt was unreadable never carries a decoded id.
+        assert_eq!(NamespaceStatus::InFlight(hash).namespace_id(), None);
+
+        let created = NamespaceStatus::Created {
+            tx: hash,
+            id: Some(9),
+        };
+        assert_eq!(created.label(), "created");
+        assert_eq!(created.tx(), Some(hash));
+        assert_eq!(created.namespace_id(), Some(9));
+        // Confirmed but the id could not be decoded: still `created`, still keeps
+        // its hash, but has no id — `Some(id)` therefore implies `created`.
+        let created_no_id = NamespaceStatus::Created { tx: hash, id: None };
+        assert_eq!(created_no_id.label(), "created");
+        assert_eq!(created_no_id.tx(), Some(hash));
+        assert_eq!(created_no_id.namespace_id(), None);
+    }
+
+    /// The `RevokeStatus` parallel: a send that never made it on-chain is
+    /// `failed`, not `dry_run` — the two were indistinguishable while the status
+    /// was derived from `tx` alone.
+    #[test]
+    fn revoke_status_labels_and_hashes_match_their_states() {
+        let hash = B256::repeat_byte(0x55);
+        assert_eq!(RevokeStatus::DryRun.label(), "dry_run");
+        assert_eq!(RevokeStatus::DryRun.tx(), None);
+
+        assert_eq!(RevokeStatus::Failed.label(), "failed");
+        assert_eq!(RevokeStatus::Failed.tx(), None);
+
+        assert_eq!(RevokeStatus::InFlight(hash).label(), "unknown");
+        assert_eq!(RevokeStatus::InFlight(hash).tx(), Some(hash));
+
+        assert_eq!(RevokeStatus::Revoked(hash).label(), "revoked");
+        assert_eq!(RevokeStatus::Revoked(hash).tx(), Some(hash));
     }
 
     #[test]
@@ -1496,9 +1659,7 @@ mod tests {
             origin_assignment: Address::repeat_byte(0x02),
             namespace_id: 7,
             revoked: Address::repeat_byte(0x11),
-            tx: None,
-            in_flight: false,
-            dry_run: true,
+            status: RevokeStatus::DryRun,
         };
         let mut buf = Vec::new();
         write_revoke_outcome(&mut buf, &revoke, true).unwrap();
