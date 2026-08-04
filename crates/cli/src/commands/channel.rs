@@ -896,8 +896,16 @@ pub(crate) async fn reclaim_replaced_expired<P: Provider + Clone>(
     now: u64,
 ) {
     match clean_one(contract, store, signer, domain, state, now).await {
-        // Still winding down (just closed, or mid dispute window): a later
-        // `channel clean` run finalizes it. Point the operator at that command.
+        // An on-chain revert (e.g. `reclaimExpired` rejected because clock skew
+        // makes the channel look not-yet-expired) — NOT a dispute window. Don't
+        // claim one; just point at a `channel clean` retry, which re-reads state.
+        Ok(CleanStatus::Reverted(op)) => eprintln!(
+            "warning: auto-reclaiming expired buyer channel {} reverted ({op}); re-run \
+             `decdn channel clean` to retry",
+            state.channel_id
+        ),
+        // Genuinely mid wind-down (just closed, or inside the dispute window): a
+        // later `channel clean` run finalizes it once the window elapses.
         Ok(status) if status.incomplete() => eprintln!(
             "warning: expired buyer channel {} is winding down ({}); re-run \
              `decdn channel clean` after its dispute window to reclaim its deposit",

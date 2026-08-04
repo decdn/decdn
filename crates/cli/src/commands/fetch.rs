@@ -1901,10 +1901,13 @@ pub(crate) fn top_up_decision(additional: U256, is_funder: bool) -> TopUpDecisio
 /// replacement opens, the expired channel's wind-down is kicked off best-effort
 /// (#1553): an expired-and-open channel reclaims its residual deposit in a single
 /// `reclaimExpired`, no dispute window, so the USDC returns without the operator
-/// remembering anything. That step never blocks or fails the fetch; a channel in
-/// any other on-chain state is only reported, and `decdn channel clean` stays the
-/// backstop that finalizes it (its expired row survives in the store, keyed by
-/// channel id, even after the provider index re-points to the replacement).
+/// remembering anything. That step never *fails* the fetch — its errors are
+/// swallowed — but it is awaited (a `getChannel` read plus, on the common path, a
+/// `reclaimExpired` tx and receipt wait), so it can add some latency before the
+/// replacement opens. A channel in any other on-chain state is only reported, and
+/// `decdn channel clean` stays the backstop that finalizes it (its expired row
+/// survives in the store, keyed by channel id, even after the provider index
+/// re-points to the replacement).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn open_or_reuse<P>(
     store: &RedbBuyerChannelStore,
@@ -1999,9 +2002,10 @@ where
         // Kick off its wind-down first (#1553): an expired-and-open channel
         // reclaims its residual deposit in one `reclaimExpired` (no dispute
         // window), so the USDC returns without the operator remembering to run
-        // `decdn channel clean`. Best-effort — this never blocks or fails the
-        // fetch, and `channel clean` remains the backstop for anything it can't
-        // finalize in one shot.
+        // `decdn channel clean`. Best-effort — a failure never aborts the fetch,
+        // though the call is awaited (a read, and usually a reclaim tx + receipt
+        // wait) so it can add latency; `channel clean` remains the backstop for
+        // anything it can't finalize in one shot.
         super::channel::reclaim_replaced_expired(
             store,
             contract,
