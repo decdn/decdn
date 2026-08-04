@@ -2,4 +2,5 @@
 //! process, buys/tops-up a payment channel on the operator's behalf, and
 //! (in later tasks) proxies requests through the sponsor's channel.
 
+pub mod api;
 pub mod keystore;

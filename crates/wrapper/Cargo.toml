@@ -24,8 +24,11 @@ alloy = { workspace = true, features = ["signer-keystore-geth-compat"] }
 anyhow.workspace = true
 tokio.workspace = true
 decdn-incentive.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 hex = "0.4"
+reqwest = { version = "0.12", features = ["json"] }
 
 [dev-dependencies]
 tempfile = "3"
+wiremock = "0.6"
