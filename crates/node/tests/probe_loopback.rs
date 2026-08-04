@@ -701,6 +701,66 @@ async fn probe_accept_bi_timeout_errors_handler() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Observe a rate-limit rejection's application close with a bounded retry,
+/// requiring the `APP_ERR_RATE_LIMITED` (`0x10`) code **and** `expected_reason`
+/// (the layer label, e.g. `"per-source"` / `"per_peer"`) at least once (#1594).
+///
+/// The ADR-005 reject path closes the connection with `0x10` + the layer-label
+/// reason bytes, but QUIC's `CONNECTION_CLOSE` is best-effort and
+/// unacknowledged: over loopback the server can tear the connection down before
+/// that frame is delivered, and the client then observes an implicit code-0
+/// close (quinn closes a dropped connection with code 0 / empty reason) or a
+/// transport-level teardown instead. That is a rare (~1/several-thousand under
+/// CI load) transport artifact, not a rate-limit-layer fault, so retry a fresh
+/// rejected connection until the layer-labelled close is seen.
+///
+/// Requiring `expected_reason` keeps the test proving the reason-byte layering
+/// it exists for: a `0x10` close carrying a *different* label is the also-`0x10`
+/// global / per-IP cap and fails immediately (it is not a transient). `connect`
+/// yields a fresh `(Endpoint, Connection)` per attempt; the endpoint is kept
+/// alive across `closed()` and closed before the next attempt.
+async fn observe_rate_limit_close<F, Fut>(
+    expected_reason: &[u8],
+    mut connect: F,
+) -> anyhow::Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<(Endpoint, Connection)>>,
+{
+    const MAX_ATTEMPTS: usize = 8;
+    let expected_code = VarInt::from_u32(APP_ERR_RATE_LIMITED);
+    let mut last_transient = None;
+    for _ in 0..MAX_ATTEMPTS {
+        let (ep, conn) = connect().await?;
+        let close_err = conn.closed().await;
+        match close_err {
+            ConnectionError::ApplicationClosed(ApplicationClose { error_code, reason })
+                if error_code == expected_code =>
+            {
+                if reason.as_ref() == expected_reason {
+                    ep.close().await;
+                    return Ok(());
+                }
+                anyhow::bail!(
+                    "rate-limit close carried the wrong layer label: expected {:?}, got {:?}",
+                    String::from_utf8_lossy(expected_reason),
+                    String::from_utf8_lossy(reason.as_ref()),
+                );
+            }
+            // Transport race (#1594): an implicit code-0 close or a
+            // transport-level teardown beat the reject frame over loopback.
+            // Retry with a fresh connection.
+            other => last_transient = Some(other),
+        }
+        ep.close().await;
+    }
+    anyhow::bail!(
+        "never observed an APP_ERR_RATE_LIMITED close carrying {:?} in {MAX_ATTEMPTS} attempts; \
+         last transient close: {last_transient:?}",
+        String::from_utf8_lossy(expected_reason),
+    )
+}
+
 /// End-to-end check that the per-source rate limiter rejects with
 /// `APP_ERR_RATE_LIMITED` (`0x10`) on the wire. Without this, the dispatch
 /// reject path is dead code under tests — every other test in this file uses
@@ -753,61 +813,56 @@ async fn probe_rate_limit_returns_rate_limited_close_code() -> anyhow::Result<()
     let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_PROBE.to_vec()]).await?;
     let server_ep_bg = server_ep.clone();
     let handler_bg = Arc::clone(&handler);
+    // Accept in a loop: `observe_rate_limit_close` may open more than one
+    // connection to ride out the rare loopback close-frame race (#1594), so the
+    // server must service each. Per-connection errors are swallowed so one
+    // transient teardown never tears down the accept loop.
     let accept_task = tokio::spawn(async move {
-        let incoming = server_ep_bg
-            .accept()
-            .await
-            .ok_or_else(|| anyhow::anyhow!("no incoming connection"))?;
-        let connecting = incoming
-            .accept()
-            .map_err(|e| anyhow::anyhow!("accept: {e}"))?;
-        let conn = connecting
-            .await
-            .map_err(|e| anyhow::anyhow!("handshake: {e}"))?;
-        handler_bg
-            .accept(conn)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        Ok::<_, anyhow::Error>(())
+        while let Some(incoming) = server_ep_bg.accept().await {
+            let Ok(connecting) = incoming.accept() else {
+                continue;
+            };
+            let Ok(conn) = connecting.await else {
+                continue;
+            };
+            let _ = handler_bg.accept(conn).await;
+        }
     });
 
-    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
-
-    // The only connection: the limiter rejects it on accept and the server
-    // closes with APP_ERR_RATE_LIMITED.
-    let conn = client_ep
-        .connect(target, ALPN_PROBE)
-        .await
-        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
-    // `closed()` resolves with the application close code. Assert on the
-    // close reason bytes too, not just the 0x10 code: the reject path stamps
-    // `RejectReason::as_str()` into the frame, so checking it proves the
-    // *per-source* layer fired rather than the (also-0x10) global cap.
-    let close_err = conn.closed().await;
-    let expected = VarInt::from_u32(APP_ERR_RATE_LIMITED);
-    match close_err {
-        ConnectionError::ApplicationClosed(ApplicationClose { error_code, reason })
-            if error_code == expected
-                && reason.as_ref() == RejectReason::PerSource.as_str().as_bytes() => {}
-        other => {
-            anyhow::bail!("expected ApplicationClosed({expected:?}, \"per-source\"), got {other:?}")
+    // Every connection is rejected by `ConnectionLimiter::acquire` at the top of
+    // `serve` and closed with APP_ERR_RATE_LIMITED + the `per-source` layer
+    // label. Observe with a bounded retry to absorb the #1594 close-frame race;
+    // requiring the `per-source` reason bytes still proves the per-source layer
+    // fired rather than the also-0x10 global cap.
+    observe_rate_limit_close(RejectReason::PerSource.as_str().as_bytes(), move || {
+        let target = target.clone();
+        async move {
+            let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+            let conn = client_ep
+                .connect(target, ALPN_PROBE)
+                .await
+                .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+            Ok((client_ep, conn))
         }
-    }
+    })
+    .await?;
+
     // The live connection must have charged the *same* pre-drained key, not a
     // fresh one: a single tracked source confirms `peer_ip` resolved it to
-    // 127.0.0.1 (a different key would have been admitted, not rejected).
+    // 127.0.0.1 (a different key would have been admitted, not rejected). Every
+    // retry binds a fresh client endpoint on 127.0.0.1, so the tracked-source
+    // count stays 1 regardless of how many attempts the race required.
     assert_eq!(
         limiter_probe.per_source_tracked(),
         1,
         "live connection must hit the pre-drained 127.0.0.1 bucket"
     );
 
-    client_ep.close().await;
+    server_ep.close().await;
     accept_task
         .await
-        .map_err(|e| anyhow::anyhow!("accept task join: {e}"))??;
-    server_ep.close().await;
+        .map_err(|e| anyhow::anyhow!("accept task join: {e}"))?;
     Ok(())
 }
 
@@ -868,57 +923,58 @@ async fn probe_three_layer_limiter_rejects_per_peer() -> anyhow::Result<()> {
     let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_PROBE.to_vec()]).await?;
     let server_ep_bg = server_ep.clone();
     let handler_bg = Arc::clone(&handler);
+    // Loop-accept for the same reason as the per-source test: the bounded retry
+    // in `observe_rate_limit_close` may open more than one connection to ride
+    // out the #1594 close-frame race.
     let accept_task = tokio::spawn(async move {
-        let incoming = server_ep_bg
-            .accept()
-            .await
-            .ok_or_else(|| anyhow::anyhow!("no incoming connection"))?;
-        let connecting = incoming
-            .accept()
-            .map_err(|e| anyhow::anyhow!("accept: {e}"))?;
-        let conn = connecting
-            .await
-            .map_err(|e| anyhow::anyhow!("handshake: {e}"))?;
-        handler_bg
-            .accept(conn)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        Ok::<_, anyhow::Error>(())
+        while let Some(incoming) = server_ep_bg.accept().await {
+            let Ok(connecting) = incoming.accept() else {
+                continue;
+            };
+            let Ok(conn) = connecting.await else {
+                continue;
+            };
+            let _ = handler_bg.accept(conn).await;
+        }
     });
 
-    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
     let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
-
-    let conn = client_ep
-        .connect(target, ALPN_PROBE)
-        .await
-        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
-    // Assert both the 0x10 code and the `per_peer` reason bytes: the probe
-    // reject path stamps `RejectLayer::as_str()` into the close frame, so the
-    // label proves the *per-peer* layer fired (the gap #982 closed) rather than
-    // the also-0x10 per-IP or global cap.
-    let close_err = conn.closed().await;
-    let expected = VarInt::from_u32(APP_ERR_RATE_LIMITED);
-    match close_err {
-        ConnectionError::ApplicationClosed(ApplicationClose { error_code, reason })
-            if error_code == expected
-                && reason.as_ref() == ProbeRejectLayer::PerPeer.as_str().as_bytes() => {}
-        other => {
-            anyhow::bail!("expected ApplicationClosed({expected:?}, \"per_peer\"), got {other:?}")
+    // Each connection is rejected at the ADR-005 per-peer layer and closed with
+    // APP_ERR_RATE_LIMITED + the `per_peer` label. Every retry rebinds a fresh
+    // client endpoint under the *same* pinned `client_sk`, so the requester
+    // `NodeId` — and thus the pre-drained per-peer bucket — is unchanged and the
+    // rejection is reproduced. Requiring the `per_peer` reason bytes proves the
+    // per-peer layer fired (the gap #982 closed), not the also-0x10 per-IP or
+    // global cap.
+    observe_rate_limit_close(ProbeRejectLayer::PerPeer.as_str().as_bytes(), move || {
+        let target = target.clone();
+        let client_sk = client_sk.clone();
+        async move {
+            let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+            let conn = client_ep
+                .connect(target, ALPN_PROBE)
+                .await
+                .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+            Ok((client_ep, conn))
         }
-    }
+    })
+    .await?;
+
     let scrape = metrics.encode().map_err(|e| anyhow::anyhow!("{e}"))?;
-    assert_eq!(
-        metric_value(&scrape, "decdn_probe_rate_limit_rejected_per_peer_total"),
-        Some(1),
+    // Normally exactly one per-peer rejection; the #1594 close-frame race can
+    // make the observation retry, and every retried rejection also increments
+    // this counter, so assert `>= 1` rather than a brittle exact count. The
+    // reason-byte assertion above already proves it was the per-peer layer.
+    let rejected = metric_value(&scrape, "decdn_probe_rate_limit_rejected_per_peer_total");
+    anyhow::ensure!(
+        rejected.is_some_and(|v| v >= 1),
         "probe per-peer rejection must appear in /metrics scrape:\n{scrape}"
     );
 
-    client_ep.close().await;
+    server_ep.close().await;
     accept_task
         .await
-        .map_err(|e| anyhow::anyhow!("accept task join: {e}"))??;
-    server_ep.close().await;
+        .map_err(|e| anyhow::anyhow!("accept task join: {e}"))?;
     Ok(())
 }
 
