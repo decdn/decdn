@@ -2933,6 +2933,7 @@ dependencies = [
  "reqwest 0.13.4",
  "serde",
  "serde_json",
+ "socket2",
  "tokio",
  "tokio-util",
  "toml",
@@ -5870,9 +5871,12 @@ dependencies = [
  "anyhow",
  "decdn-incentive",
  "hex",
+ "reqwest 0.12.28",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
+ "wiremock",
 ]
 
 [[package]]
