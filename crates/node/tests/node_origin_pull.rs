@@ -10002,11 +10002,18 @@ async fn two_concurrent_pulls_to_one_provider_share_the_channel_ledger() -> Resu
 /// Issue #1481 review items 2/3: a real end-to-end exercise of the WIRED resume path
 /// (`fetch_inner`'s retry loop, `crates/client-pull/src/lib.rs`) — not just the
 /// `ChannelLedger::reseed` primitive tested in isolation in `client-pull`'s own unit tests.
-/// This specifically calls [`stream_fetch_shared`], the entrypoint node-to-node cache-miss
-/// pulls use (`node_origin.rs`'s `pull_from_candidate` always passes `byte_offset == 0`), so it
-/// also answers review item 2: a bundled `StaleNonce` reaching that path is retried
-/// transparently INSIDE `client-pull`, before `pull_verdict`/`voucher_verdict` in
-/// `node_origin.rs` ever see it — which is why neither classifier needed to change.
+///
+/// This calls [`stream_fetch_shared`], which UNTIL #1530 was the entrypoint the node's
+/// cache-miss pulls used (at a fixed `byte_offset == 0`). It no longer is: the daemon's miss
+/// leg now drives its own resume loop in `node_origin/resume.rs`, so what this test pins today
+/// is the `client-pull`-internal retry that the CLI's buffered `fetch_blob`/bundle-pull path
+/// still relies on. The node's twin of the same contract — a bundled watermark reseeds rather
+/// than terminating — is pinned by `node_origin::resume::tests::an_advancing_bundle_reseeds`
+/// and its siblings.
+///
+/// The conclusion it reaches is unchanged either way: a bundled `StaleNonce` is retried
+/// transparently before `pull_verdict` / `voucher_verdict` ever see it, which is why neither
+/// classifier needed to change.
 ///
 /// The trigger is genuine, not simulated: two SEPARATE [`ChannelLedger`]s on ONE real channel,
 /// driven one after another against a real `ClientHandler` + real `MemoryChannelStateStore`
@@ -12803,14 +12810,28 @@ impl ChannelOpener for FundingOpener {
             .deposit
             .lock()
             .map_err(|_| anyhow::anyhow!("deposit lock poisoned"))?;
-        if self.funds && target_deposit > *deposit {
-            *deposit = target_deposit;
+        // Restore SPENDABLE HEADROOM to the target, the same semantics the real
+        // `BuyerChannelService::top_up_channel` implements via `refill_amount(deposit,
+        // last_amount, target, target)`. A double that read the raw deposit instead
+        // would refuse to fund a channel sitting AT the target and fully spent —
+        // which is precisely the state this leg exists to rescue (#1600 review).
+        let spent = self
+            .recorded
+            .lock()
+            .map_err(|_| anyhow::anyhow!("recorded lock poisoned"))?
+            .iter()
+            .rev()
+            .find(|(provider, ..)| *provider == provider_addr)
+            .map_or(U256::ZERO, |(_, _, _, amount)| *amount);
+        let remaining = deposit.saturating_sub(spent);
+        if self.funds && target_deposit > remaining {
+            *deposit = deposit.saturating_add(target_deposit.saturating_sub(remaining));
             // The escrow the upstream can see rises with it — a real `topUp` raises one
             // number, and the buyer's belief and the seller's gate are both views of it.
             *self
                 .ceiling
                 .lock()
-                .map_err(|_| anyhow::anyhow!("ceiling lock poisoned"))? = target_deposit;
+                .map_err(|_| anyhow::anyhow!("ceiling lock poisoned"))? = *deposit;
         }
         Ok(*deposit)
     }
@@ -12829,7 +12850,7 @@ async fn serve_with_deposit_ceiling(
     conn: Connection,
     eth: &Arc<PrivateKeySigner>,
     slash: &Eip712Domain,
-    payload: &[u8],
+    payloads: &[Arc<Vec<u8>>],
     rate: u64,
     deposit: &SharedDeposit,
 ) -> Result<()> {
@@ -12838,6 +12859,13 @@ async fn serve_with_deposit_ceiling(
         .await
         .map_err(|e| anyhow::anyhow!("accept_bi: {e}"))?;
     let req = read_stream_request(&mut recv).await?;
+    // Route on the requested hash, so one server can hold several blobs — the
+    // concurrent-pulls regression test needs two pulls on ONE channel.
+    let payload: &[u8] = payloads
+        .iter()
+        .find(|p| *Hash::new(p.as_slice()).as_bytes() == req.hash)
+        .map(|p| p.as_slice())
+        .ok_or_else(|| anyhow::anyhow!("deposit-capped upstream: unknown hash requested"))?;
     let total_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
     let resp = signed_response(&req, eth, slash, rate, total_bytes, None)?;
     write_frame(
@@ -12926,11 +12954,17 @@ fn spawn_deposit_capped_server(
     ep: iroh::Endpoint,
     a_eth: Arc<PrivateKeySigner>,
     slash: Eip712Domain,
-    payload: Arc<Vec<u8>>,
+    payloads: Vec<Arc<Vec<u8>>>,
     rate: u64,
     deposit: SharedDeposit,
 ) -> tokio::task::JoinHandle<()> {
-    let total_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
+    // Same-length blobs only, so the probe's single quoted `total_bytes` is honest
+    // for all of them (`two_concurrent_pulls_...` makes the same choice for the
+    // same reason).
+    let total_bytes = payloads
+        .first()
+        .map_or(0, |p| u64::try_from(p.len()).unwrap_or(u64::MAX));
+    let payloads = Arc::new(payloads);
     tokio::spawn(async move {
         while let Some(incoming) = ep.accept().await {
             let Ok(connecting) = incoming.accept() else {
@@ -12939,7 +12973,7 @@ fn spawn_deposit_capped_server(
             let Ok(conn) = connecting.await else { continue };
             let eth = Arc::clone(&a_eth);
             let dom = slash.clone();
-            let payload = Arc::clone(&payload);
+            let payloads = Arc::clone(&payloads);
             let deposit = Arc::clone(&deposit);
             if conn.alpn() == ALPN_PROBE {
                 tokio::spawn(async move {
@@ -12947,7 +12981,7 @@ fn spawn_deposit_capped_server(
                 });
             } else {
                 tokio::spawn(async move {
-                    let _ = serve_with_deposit_ceiling(conn, &eth, &dom, &payload, rate, &deposit)
+                    let _ = serve_with_deposit_ceiling(conn, &eth, &dom, &payloads, rate, &deposit)
                         .await;
                 });
             }
@@ -13006,6 +13040,20 @@ impl TopUpSetup {
 /// Stand up one deposit-capped upstream and a buyer whose channel starts at
 /// `setup.initial_micro_usdc` and graduates to `setup.working_micro_usdc`.
 async fn top_up_fixture(payload: Arc<Vec<u8>>, setup: TopUpSetup) -> Result<TopUpFixture> {
+    top_up_fixture_multi(vec![payload], setup).await
+}
+
+/// [`top_up_fixture`] over several SAME-LENGTH blobs on one provider (and thus one
+/// channel), for the concurrent-pulls regression test.
+async fn top_up_fixture_multi(
+    payloads: Vec<Arc<Vec<u8>>>,
+    setup: TopUpSetup,
+) -> Result<TopUpFixture> {
+    let payload = Arc::clone(
+        payloads
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("at least one payload"))?,
+    );
     let hash = Hash::new(payload.as_ref());
     let total_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
     let deposit = shared_deposit(setup.initial_micro_usdc);
@@ -13020,7 +13068,7 @@ async fn top_up_fixture(payload: Arc<Vec<u8>>, setup: TopUpSetup) -> Result<TopU
         ep_a.clone(),
         Arc::clone(&a_eth),
         slash_domain(),
-        Arc::clone(&payload),
+        payloads,
         RATE,
         Arc::clone(&ceiling),
     );
@@ -13285,6 +13333,14 @@ async fn a_node_crying_poverty_while_our_ledger_has_headroom_is_not_funded() -> 
         "we must NOT escrow USDC on an upstream's unsupported word"
     );
     assert_counter(&fixture.metrics, "node_pull_reactive_topup_total", 0)?;
+    // ...and the refusal is VISIBLE. This is the counter's whole reason to exist —
+    // it is the only signal that distinguishes a peer extorting escrow from an
+    // ordinary failed pull, and until #1600 the case could never reach it.
+    assert_counter(
+        &fixture.metrics,
+        "node_pull_reactive_topup_refused_total",
+        1,
+    )?;
 
     fixture.shutdown().await;
     Ok(())
@@ -13357,6 +13413,138 @@ async fn a_zero_working_deposit_never_funds_a_pull() -> Result<()> {
         topup_log(&fixture.opener)?.is_empty(),
         "a zero working deposit must not escrow anything"
     );
+
+    fixture.shutdown().await;
+    Ok(())
+}
+
+/// Two CONCURRENT pulls on one channel, one of them resuming across a top-up: the
+/// resume frontier must never overshoot the bytes that pull actually decoded
+/// (#1600 review).
+///
+/// The frontier is derived from the CHANNEL's cumulative wire watermark, and the
+/// ledger is shared with every concurrent pull on the channel (`BuyerLedgers`) — so
+/// the other pull's acked vouchers inflate the delta. Uncapped, the inflated
+/// frontier maps PAST the exhausted pull's decoded bytes; its `truncate` is then a
+/// no-op (truncate never grows) and the resumed leg splices at the wrong position,
+/// producing a blob that fails the cache engine's hash check — after the upstream
+/// was already scored `Delivered`. The clamp in `resume_frontier` bounds the
+/// frontier at the chunk-group floor of what the leg holds, so the worst case is a
+/// bounded re-fetch of already-paid content and both blobs assemble exactly.
+///
+/// Concurrency makes the interleaving nondeterministic, so this cannot pin WHICH
+/// pull exhausts first — but with the clamp both orderings succeed, and without it
+/// the overshoot ordering corrupts, which is what a regression run trips on. The
+/// deterministic pin of the clamp itself is
+/// `resume::tests::a_concurrent_pulls_vouchers_cannot_push_the_frontier_past_decoded_bytes`.
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_pulls_resume_at_their_own_frontier_not_the_channels() -> Result<()> {
+    let len = usize::try_from(MB_BYTES).unwrap_or(usize::MAX) * 3 + 777;
+    let payload_a: Arc<Vec<u8>> = Arc::new(
+        (0..len)
+            .map(|i| u8::try_from(i % 249).unwrap_or(0))
+            .collect(),
+    );
+    let payload_b: Arc<Vec<u8>> = Arc::new(
+        (0..len)
+            .map(|i| u8::try_from(i % 247).unwrap_or(1))
+            .collect(),
+    );
+    let hash_a = Hash::new(payload_a.as_ref());
+    let hash_b = Hash::new(payload_b.as_ref());
+    anyhow::ensure!(hash_a != hash_b, "fixtures must be distinct blobs");
+
+    // Roughly four wire intervals per blob at RATE, so the combined spend of two
+    // concurrent pulls exhausts an initial deposit sized for four — mid-blob, with
+    // real delivered-and-paid bytes on BOTH streams behind the rejection.
+    let fixture = top_up_fixture_multi(
+        vec![Arc::clone(&payload_a), Arc::clone(&payload_b)],
+        TopUpSetup::honest(4 * RATE, 400 * RATE, true),
+    )
+    .await?;
+
+    let (got_a, got_b) = tokio::time::timeout(Duration::from_mins(2), async {
+        tokio::join!(
+            Origin::fetch(&fixture.origin, hash_a, u64::MAX),
+            Origin::fetch(&fixture.origin, hash_b, u64::MAX),
+        )
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("concurrent top-up pulls never finished"))?;
+
+    let bytes_a = got_a
+        .map_err(|e| anyhow::anyhow!("fetch A: {e}"))?
+        .collect_to_bytes()
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("pull A must deliver, not NotFound"))?;
+    let bytes_b = got_b
+        .map_err(|e| anyhow::anyhow!("fetch B: {e}"))?
+        .collect_to_bytes()
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("pull B must deliver, not NotFound"))?;
+    // EXACT bytes, which is the whole point: an overshot frontier assembles a blob
+    // with a gap where the truncate could not rewind, and the engine's hash check
+    // turns that into a NotFound (caught above) — never silently wrong bytes.
+    anyhow::ensure!(bytes_a.as_ref() == payload_a.as_slice(), "pull A corrupted");
+    anyhow::ensure!(bytes_b.as_ref() == payload_b.as_slice(), "pull B corrupted");
+
+    // At least one pull must actually have crossed the ceiling and funded — else
+    // the deposit sizing degenerated and this test stopped exercising the resume.
+    anyhow::ensure!(
+        !topup_log(&fixture.opener)?.is_empty(),
+        "the initial deposit was never exhausted; the test no longer covers the resume path"
+    );
+
+    fixture.shutdown().await;
+    Ok(())
+}
+
+/// The reactive top-up is bounded at ONE per pull, over the wire (#1600 review).
+///
+/// The pure policy is pinned by `resume::tests::reactive_topups_are_bounded`; this
+/// pins the WIRING — the `topups += 1` the loop performs after a landed top-up.
+/// Removing that increment is currently invisible to every other test, because the
+/// funding double is idempotent against its target (a second call at the same
+/// target adds nothing, so `fund` reports no headroom and the loop stops anyway).
+/// Here the working deposit is deliberately still too small for the blob, so a loop
+/// that did not count would keep funding-and-failing rather than ending after one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_working_deposit_that_still_cannot_cover_the_blob_funds_exactly_once() -> Result<()> {
+    // ~10 voucher intervals of wire, so the whole blob costs ~10x RATE. The initial
+    // deposit funds two, and the top-up restores headroom to three more — enough for
+    // real progress on the resumed leg, and still far short of the blob.
+    let len = usize::try_from(MB_BYTES).unwrap_or(usize::MAX) * 9 + 777;
+    let payload: Arc<Vec<u8>> = Arc::new(
+        (0..len)
+            .map(|i| u8::try_from(i % 253).unwrap_or(0))
+            .collect(),
+    );
+    let fixture = top_up_fixture(
+        Arc::clone(&payload),
+        TopUpSetup::honest(2 * RATE, 3 * RATE, true),
+    )
+    .await?;
+
+    let got = tokio::time::timeout(
+        Duration::from_mins(1),
+        Origin::fetch(&fixture.origin, Hash::new(payload.as_ref()), u64::MAX),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("a still-underfunded pull must not loop forever"))?
+    .map_err(|e| anyhow::anyhow!("fetch: {e}"))?;
+    anyhow::ensure!(
+        matches!(got, OriginFetch::NotFound),
+        "a pull the working deposit cannot cover must end as a miss"
+    );
+
+    let log = topup_log(&fixture.opener)?;
+    anyhow::ensure!(
+        log.len() == 1,
+        "exactly one reactive top-up per pull, then give up — an upstream whose rate \
+         outruns the working deposit is a pricing problem, and each extra attempt is a \
+         transaction a waiting client pays for. Got {log:?}"
+    );
+    assert_counter(&fixture.metrics, "node_pull_reactive_topup_total", 1)?;
 
     fixture.shutdown().await;
     Ok(())

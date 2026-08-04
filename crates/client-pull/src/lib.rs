@@ -1434,8 +1434,9 @@ pub const MAX_RESUME_ATTEMPTS: u32 = 3;
 /// Reactive graduation (#1497): the maximum number of times the STREAMING fetch
 /// (`crates/cli/src/commands/fetch.rs`) will `topUp` a channel toward its
 /// `working_deposit` after a genuine mid-fetch `InsufficientDeposit` (validated
-/// against the buyer's own ledger via [`genuine_exhaustion`]) and retry the same
-/// `byte_offset`. Separate from [`MAX_RESUME_ATTEMPTS`]: a top-up is a funding
+/// against the buyer's own ledger via [`genuine_exhaustion`]) and resume at the
+/// PAID FRONTIER ([`sink::content_paid_frontier`]) — not at the failed leg's own
+/// offset, which would re-pay for the credited-but-unpaid tail. Separate from [`MAX_RESUME_ATTEMPTS`]: a top-up is a funding
 /// action with its own on-chain cost and failure mode (a delegate key that
 /// cannot fund, an allowance that fails to land), not a wallet-less resume, so
 /// it is bounded on its own budget rather than sharing/competing with the resume
@@ -1457,8 +1458,8 @@ pub const MAX_TOPUP_ATTEMPTS: u32 = 3;
 /// field on the wire), not a position within THIS blob's byte range. A
 /// channel can fund many blobs; jumping the wire offset ahead to the
 /// channel's cumulative would, for every caller that requested
-/// `byte_offset == 0` (every production caller today — `stream_fetch_shared`
-/// always passes `0`, `crates/node/src/node_origin.rs`), silently return a
+/// `byte_offset == 0` (the CLI's buffered `fetch_blob` / bundle-pull path, which
+/// is what still reaches this wrapper in production), silently return a
 /// TRUNCATED tail instead of the full blob the caller is relying on getting
 /// back. The bytes already streamed in the failed attempt were never decoded
 /// (the error path never reaches `decode_verified_range`), so there is
@@ -1475,16 +1476,22 @@ pub const MAX_TOPUP_ATTEMPTS: u32 = 3;
 /// replying, `handlers/client/wire.rs::write_reject`); a fresh stream can
 /// only be opened by whoever owns the connection, which is here.
 ///
-/// Every existing caller — `stream_fetch` (test-only), [`stream_fetch_tracked`],
-/// [`stream_fetch_tracked_with_progress`], and, importantly,
-/// [`stream_fetch_shared`] (the daemon's own node-to-node cache-miss buyer
-/// leg, ADR 002/037) — goes through this wrapper, so a resumable rejection
-/// on any of those paths is retried transparently: `pull_verdict` /
-/// `voucher_verdict` in `decdn-node`'s `node_origin.rs` only ever see the
-/// FINAL outcome (success, or the original terminal error once
-/// [`MAX_RESUME_ATTEMPTS`] is exhausted or the reason/bundle isn't
-/// eligible) — the `OurDeadChannel` classification there stays correct as
-/// the terminal fallback and needs no change.
+/// Every caller of the BUFFERED path — `stream_fetch` (test-only),
+/// [`stream_fetch_tracked`], [`stream_fetch_tracked_with_progress`], and
+/// [`stream_fetch_shared`] — goes through this wrapper, so a resumable rejection
+/// on any of those paths is retried transparently and the caller only ever sees
+/// the FINAL outcome (success, or the original terminal error once
+/// [`MAX_RESUME_ATTEMPTS`] is exhausted or the reason/bundle isn't eligible).
+///
+/// The daemon's node-to-node cache-miss buyer leg USED to be one of those callers
+/// (via [`stream_fetch_shared`], always at `byte_offset == 0`). Since #1530 it does
+/// not: it drives its own resume loop over [`open_progressive_pull`] in
+/// `decdn-node`'s `node_origin/resume.rs`, which reseeds on the same contract and
+/// additionally answers a genuine `InsufficientDeposit` with an on-chain top-up —
+/// the thing a from-zero buffered retry could never do without re-paying for the
+/// delivered prefix. Either way `pull_verdict` / `voucher_verdict` in `decdn-node`
+/// see only the terminal outcome, so the `OurDeadChannel` classification there
+/// stays correct as the fallback.
 ///
 /// A bundle-less rejection, a non-gated reason, or a bundle that fails
 /// [`WatermarkBundle::validate`] (malformed `last_signature` length) is

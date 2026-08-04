@@ -249,7 +249,7 @@ pub enum AdvanceOutcome {
 /// `#[must_use]` for the same reason as [`AdvanceOutcome`]: a dropped
 /// `ChannelMismatch` / `UnknownChannel` silently looks like a successful
 /// credit.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[must_use]
 pub enum DepositOutcome {
     /// `additional` was added to the committed deposit; carries the new total.

@@ -509,45 +509,47 @@ impl Drop for InFlightOpenGuard {
     }
 }
 
+/// The outcome of a detached funding task (#1146/#1530), as seen by everyone
+/// waiting on it. `DepositOutcome` rather than `()`: the reactive top-up needs the
+/// credited total to update its live `ChannelContext::deposit`, and re-reading the
+/// store cannot distinguish `Added` from the escrowed-but-untracked variants. The
+/// error side is `Arc`'d because [`SharedTopUp`] hands one outcome to every waiter
+/// and `anyhow::Error` is not `Clone`.
+type TopUpOutcome = Result<DepositOutcome, Arc<anyhow::Error>>;
+
+/// A cloneable handle to an in-flight `topUp` for one provider's channel. Every
+/// caller that arrives while one is running — a reactive mid-pull top-up racing
+/// the proactive low-water refill, or vice versa — JOINS this future rather than
+/// escrowing a second deposit for the same shortfall.
+///
+/// This map-of-joinable-futures replaced a plain dedup `HashSet` (#1600 review).
+/// The set answered "is a refill running?" but gave a concurrent caller nothing to
+/// wait on, so the reactive top-up's slot-taken branch could only return the STALE
+/// deposit — which its caller correctly read as "no headroom was added" and ended
+/// the pull on the original exhaustion, wedging the provider until channel expiry
+/// while the refill's funds landed seconds later. And that race is the COMMON
+/// case, not a corner: the reuse that starts a miss pull fires the low-water
+/// refill exactly when the deposit is nearly spent, i.e. exactly the pulls most
+/// likely to exhaust mid-stream.
+type SharedTopUp = futures_util::future::Shared<BoxFuture<'static, TopUpOutcome>>;
+
 /// RAII claim on a provider's slot in [`BuyerChannelService::topups_in_flight`]
-/// (#1146). Held by the detached refill task; its `Drop` frees the provider so a
-/// task that finishes OR panics never wedges future refills to that provider.
-struct RefillSlot {
-    set: Arc<Mutex<HashSet<Address>>>,
+/// (#1146). Held by the detached funding task; its `Drop` frees the provider so a
+/// task that finishes OR panics never wedges future top-ups to that provider.
+struct InFlightTopUpGuard {
+    map: Arc<Mutex<HashMap<Address, SharedTopUp>>>,
     provider: Address,
 }
 
-impl Drop for RefillSlot {
+impl Drop for InFlightTopUpGuard {
     fn drop(&mut self) {
         // Recover a poisoned lock (a prior holder panicked) and still release the
         // slot, mirroring `InFlightOpenGuard`.
-        self.set
+        self.map
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&self.provider);
     }
-}
-
-/// Claim the background-refill slot for `provider`, or `None` if a refill is
-/// already in flight for it (per-provider dedup, #1146). A low-water refill is
-/// best-effort, so it must never propagate a panic into the pull path: a poisoned
-/// lock (a prior holder panicked while holding it) is RECOVERED via
-/// `PoisonError::into_inner` and the claim proceeds, mirroring [`RefillSlot::drop`].
-/// The critical section is a single `HashSet` insert that cannot leave the set
-/// inconsistent, so recovering is safe — and, unlike declining on poison, keeps
-/// refills self-healing rather than permanently disabled after the first panic.
-fn claim_refill_slot(set: &Arc<Mutex<HashSet<Address>>>, provider: Address) -> Option<RefillSlot> {
-    let mut guard = set
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if !guard.insert(provider) {
-        return None; // a refill for this provider is already running
-    }
-    drop(guard);
-    Some(RefillSlot {
-        set: Arc::clone(set),
-        provider,
-    })
 }
 
 /// The `'static` slice of [`BuyerChannelService`] a detached funding task needs.
@@ -714,16 +716,18 @@ pub struct BuyerChannelService<P: Provider + Clone + 'static> {
     /// restart is the persisted channel row (and, for an open that landed without
     /// one, the boot-time `reconcile_orphans_once` scan).
     opens_in_flight: Arc<Mutex<HashMap<Address, SharedOpen>>>,
-    /// Providers with a background low-water top-up currently in flight (#1146).
+    /// Providers with a funding `topUp` currently in flight (#1146/#1530), each
+    /// mapped to a cloneable handle on the detached task performing it.
     ///
-    /// A reused channel whose remaining deposit has run below its low-water mark
-    /// is topped up by a detached, best-effort task so a sustained series of miss
-    /// pulls to one provider is never silently stranded by a spent-down deposit.
-    /// This set dedups those tasks per provider: many concurrent reuse pulls to
-    /// the same provider fire at most one `topUp` tx. In-memory only — a
+    /// One map serves both funding legs. The proactive low-water refill spawns
+    /// here and drops the handle (best-effort, detached); the reactive mid-pull
+    /// top-up spawns OR JOINS here and awaits the outcome — so the two legs racing
+    /// on one provider cannot double-escrow one shortfall, and the loser of the
+    /// race gets the winner's credited deposit instead of a stale read (see
+    /// [`SharedTopUp`] for the wedge that stale read caused). In-memory only — a
     /// process-local dedup, not a durable ledger; the slot is freed when the task
-    /// finishes or panics (see [`RefillSlot`]).
-    topups_in_flight: Arc<Mutex<HashSet<Address>>>,
+    /// finishes or panics (see [`InFlightTopUpGuard`]).
+    topups_in_flight: Arc<Mutex<HashMap<Address, SharedTopUp>>>,
     /// Per-channel consecutive `try_reclaim`-failure tally (#906), shared between
     /// the background reclaim loop and [`Self::sweep_expired_once`]. In-memory
     /// only: a restart resets it, so a persistent failure re-escalates after
@@ -817,7 +821,7 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
         // channel a concurrent cache-miss open just recorded.
         let opens_in_flight = Arc::new(Mutex::new(HashMap::new()));
         // Per-provider dedup for background low-water top-ups (#1146).
-        let topups_in_flight = Arc::new(Mutex::new(HashSet::new()));
+        let topups_in_flight = Arc::new(Mutex::new(HashMap::new()));
 
         // One-shot bootstrap reconciliation (#763): re-hydrate any on-chain
         // channel this node opened but lost track of (record/decode failed
@@ -1033,29 +1037,118 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
 
     /// The synchronous decision behind [`Self::spawn_refill_if_low`]: given the
     /// reused channel's `deposit` and cumulative `prior_amount` (read off the
-    /// [`ChannelContext`] the reuse path already built — no second store read), if
-    /// its remaining deposit is below the low-water mark, claim the per-provider
-    /// refill slot and return it with the top-up amount. `None` means nothing to
-    /// do — still has headroom, or a refill is already in flight for this provider.
-    /// The channel is known-live: `spawn_refill_if_low` is only called after the
-    /// reuse gate (`try_reuse_live`) returns a non-expired channel, so there is no
-    /// expiry or store-fault branch to handle here. Split out from the spawn so the
-    /// decision + claim is unit-testable without spawning the on-chain task.
-    fn plan_refill(
-        &self,
-        provider_addr: Address,
-        deposit_hint: U256,
-        deposit: U256,
-        prior_amount: U256,
-    ) -> Option<(RefillSlot, U256)> {
-        let additional = refill_decision(deposit, prior_amount, deposit_hint, self.working_deposit);
-        if additional.is_zero() {
-            return None; // still above the low-water mark
+    /// [`ChannelContext`] the reuse path already built — no second store read),
+    /// the amount that restores a below-low-water channel to the working target,
+    /// or `U256::ZERO` when it still has headroom. The channel is known-live:
+    /// `spawn_refill_if_low` is only called after the reuse gate
+    /// (`try_reuse_live`) returns a non-expired channel, so there is no expiry or
+    /// store-fault branch to handle here.
+    ///
+    /// Pure — the in-flight dedup that used to be claimed here moved into
+    /// [`Self::join_or_spawn_topup`], where reserving the slot and spawning the
+    /// task are one indivisible step under one lock (the `spawn_open` shape), so
+    /// a concurrent caller has a live future to JOIN rather than a bare "taken"
+    /// bit (#1600 review).
+    fn plan_refill(&self, deposit_hint: U256, deposit: U256, prior_amount: U256) -> U256 {
+        refill_decision(deposit, prior_amount, deposit_hint, self.working_deposit)
+    }
+
+    /// The one way a funding `topUp` for `provider_addr` starts (#1146/#1530):
+    /// join the in-flight task if one is running, else reserve the slot and spawn
+    /// one escrowing `additional` — reservation and spawn under a single lock
+    /// acquisition, so two callers cannot both decide to spawn.
+    ///
+    /// Both funding legs come through here. The proactive refill drops the
+    /// returned handle (the task is detached and self-reporting); the reactive
+    /// top-up awaits it. A joiner gets the RUNNING task's outcome — its
+    /// `additional` was computed against the same working target, so the credited
+    /// deposit it reports is the same number a fresh computation would have
+    /// restored to.
+    ///
+    /// The spawned work is SUPERVISED, exactly as [`InFlightOpenGuard::spawn_open`]
+    /// is and for the same reason: the panic that matters lands during the
+    /// unbounded `get_receipt` wait — minutes long, with the reactive caller
+    /// usually dropped at its outer deadline by then — and a bare task would take
+    /// the `error!`/metric with it, leaving up to a working deposit escrowed with
+    /// no visible trace. A spawned supervisor reports whether or not anyone is
+    /// still listening. (A `Shared` combinator could not: it only advances when
+    /// some clone is polled, and after the callers leave, nobody polls.)
+    ///
+    /// # Errors
+    ///
+    /// A poisoned `topups_in_flight` lock — same severity posture as
+    /// [`Self::join_or_spawn_open`]: every future top-up to every provider would
+    /// fail here, so it is reported as this node's fault, not the provider's.
+    fn join_or_spawn_topup(&self, provider_addr: Address, additional: U256) -> Result<SharedTopUp> {
+        use futures_util::FutureExt as _;
+
+        let mut in_flight = self.topups_in_flight.lock().map_err(|err| {
+            self.metrics.buyer_topup_failure();
+            error!(
+                provider = %provider_addr,
+                %err,
+                "topups_in_flight mutex poisoned by an earlier panic; this node can no longer \
+                 top up a buyer channel to ANY provider and must be restarted"
+            );
+            anyhow::anyhow!("topups_in_flight mutex poisoned: {err}").context(LocalPullFault)
+        })?;
+
+        if let Some(existing) = in_flight.get(&provider_addr) {
+            debug!(
+                provider = %provider_addr,
+                "joining a channel topUp already in flight for this provider"
+            );
+            return Ok(existing.clone());
         }
 
-        // `None` here = a refill for this provider is already in flight (dedup).
-        let slot = claim_refill_slot(&self.topups_in_flight, provider_addr)?;
-        Some((slot, additional))
+        let guard = InFlightTopUpGuard {
+            map: Arc::clone(&self.topups_in_flight),
+            provider: provider_addr,
+        };
+        let handles = self.funding_handles();
+        let funding = tokio::spawn(async move {
+            // Dropped when the task ends (any path, including a panic unwind),
+            // releasing the provider slot — and NOT before.
+            let _guard = guard;
+            fund_channel(&handles, provider_addr, additional)
+                .await
+                .map_err(Arc::new)
+        });
+
+        let metrics = Arc::clone(&self.metrics);
+        let supervised = tokio::spawn(async move {
+            match funding.await {
+                Ok(outcome) => outcome,
+                Err(join_err) => {
+                    metrics.buyer_topup_failure();
+                    error!(
+                        provider = %provider_addr,
+                        %additional,
+                        %join_err,
+                        "buyer channel topUp task died (panicked or was aborted); if its topUp \
+                         had already been broadcast the deposit is escrowed and possibly \
+                         uncredited — reconcile the row against the chain"
+                    );
+                    Err(Arc::new(anyhow::anyhow!(
+                        "buyer channel topUp task failed: {join_err}"
+                    )))
+                }
+            }
+        });
+
+        let fut: BoxFuture<'static, TopUpOutcome> = Box::pin(async move {
+            // The supervisor only awaits and reports, so it cannot panic; this arm
+            // is reachable only if the runtime aborts it at shutdown, where a
+            // caller is the one party that could still be listening.
+            supervised.await.unwrap_or_else(|join_err| {
+                Err(Arc::new(anyhow::anyhow!(
+                    "buyer channel topUp supervisor failed: {join_err}"
+                )))
+            })
+        });
+        let shared = fut.shared();
+        in_flight.insert(provider_addr, shared.clone());
+        Ok(shared)
     }
 
     /// Everything the detached funding task needs, lifted off `&self` so the task
@@ -1098,32 +1191,24 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
         deposit_hint: U256,
         ctx: &ChannelContext,
     ) {
-        let Some((slot, additional)) =
-            self.plan_refill(provider_addr, deposit_hint, ctx.deposit, ctx.prior_amount)
-        else {
-            return;
-        };
+        let additional = self.plan_refill(deposit_hint, ctx.deposit, ctx.prior_amount);
+        if additional.is_zero() {
+            return; // still above the low-water mark
+        }
 
-        let handles = self.funding_handles();
-
-        tokio::spawn(async move {
-            // Freed on task completion OR panic, so a wedged refill never blocks
-            // future refills to this provider.
-            let _slot = slot;
-
-            // Every other outcome is graded, logged, and metered inside
-            // `fund_channel`; the proactive leg is advisory, so there is nothing left
-            // to do but let the pull proceed on the existing deposit.
-            if let Ok(DepositOutcome::Added(_)) =
-                fund_channel(&handles, provider_addr, additional).await
-            {
-                info!(
-                    provider = %provider_addr,
-                    %additional,
-                    "buyer refill: topped up reused channel below its low-water mark (#1146)"
-                );
-            }
-        });
+        info!(
+            provider = %provider_addr,
+            %additional,
+            "buyer refill: reused channel below its low-water mark; funding toward the working \
+             deposit (#1146)"
+        );
+        // Detached: the handle is DROPPED, not awaited — the task runs and
+        // self-reports either way (grading, logging, and metering live in
+        // `fund_channel` and the supervisor), and a reactive top-up arriving while
+        // it runs JOINS the same future instead of finding a bare "taken" bit. A
+        // poisoned map is already reported inside `join_or_spawn_topup` at the
+        // severity it deserves; the refill itself stays advisory.
+        drop(self.join_or_spawn_topup(provider_addr, additional));
     }
 
     /// Join the in-flight open for `provider_addr`, or spawn one.
@@ -1433,9 +1518,13 @@ pub trait ChannelOpener: Send + Sync + std::fmt::Debug {
     /// the caller update its live `ChannelContext::deposit` without a store read — the
     /// resumed leg's headroom arithmetic is wrong otherwise.
     ///
-    /// `target_deposit` is a target, not an increment: implementations add only the
-    /// shortfall. A channel already at or above it is a no-op that returns the current
-    /// deposit.
+    /// `target_deposit` is a target, not an increment, and it targets **spendable
+    /// headroom** rather than the raw deposit: implementations add the amount that
+    /// restores `deposit - last_amount` to it. A channel whose remaining headroom is
+    /// already at or above the target is a no-op returning the current deposit — but
+    /// note a channel whose raw deposit equals the target and is fully SPENT still
+    /// gets the full amount, which is the whole point on a leg that only runs after
+    /// the channel ran dry.
     ///
     /// Defaults to "funding not supported": returns `U256::ZERO`, which every caller
     /// must read as "no headroom was added". An implementation that does not model
@@ -1518,47 +1607,29 @@ impl<P: Provider + Clone + 'static> ChannelOpener for BuyerChannelService<P> {
             return Ok(state.deposit);
         }
 
-        // Share the per-provider dedup set with the proactive refill: a background
-        // low-water top-up racing this one would escrow twice for one shortfall. If a
-        // refill already holds the slot its funds are landing anyway, so report the
-        // current deposit and let the caller's own exhaustion check decide.
-        let Some(slot) = claim_refill_slot(&self.topups_in_flight, provider_addr) else {
-            debug!(
-                provider = %provider_addr,
-                "reactive top-up: a refill is already in flight for this provider; not escrowing twice"
-            );
-            return Ok(state.deposit);
-        };
-
-        // DETACHED, then awaited through a channel — deliberately not an inline
-        // `.await` (#1530).
+        // Join-or-spawn, on a DETACHED supervised task awaited through a shared
+        // handle — deliberately not an inline `.await` of the funding itself (#1530).
         //
-        // `top_up` submits the tx and then waits on `get_receipt()` with no timeout,
-        // and that is correct: giving up on an escrowing tx's receipt does not cancel
-        // it, it only makes us stop watching real USDC that is still going to land
-        // (the same reasoning `bootstrap` records for `openChannel`). But this runs
-        // inside the miss-pull future, which the foreground serve path DROPS on
-        // `outer_pull_deadline`. An inline await would be cancelled mid-receipt: the
-        // tx still mines, `store.add_deposit` never runs, and the deposit is escrowed
-        // and untracked — silently, on the client-facing path.
+        // Detached, because `top_up` submits the tx and then waits on `get_receipt()`
+        // with no timeout — correctly: giving up on an escrowing tx's receipt does
+        // not cancel it, it only makes us stop watching real USDC that is still going
+        // to land (the same reasoning `bootstrap` records for `openChannel`). But
+        // THIS method runs inside the miss-pull future, which the foreground serve
+        // path DROPS on `outer_pull_deadline`. An inline await would be cancelled
+        // mid-receipt: the tx still mines, `store.add_deposit` never runs, and the
+        // deposit is escrowed and untracked — silently, on the client-facing path.
+        // On the spawned task, a dropped caller loses only the *answer*; the credit
+        // still lands and the supervisor still reports.
         //
-        // On the spawned task, a dropped caller loses only the *answer*. The credit
-        // still lands.
-        let handles = self.funding_handles();
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        tokio::spawn(async move {
-            // Freed on completion OR panic, like the proactive refill's slot.
-            let _slot = slot;
-            let outcome = fund_channel(&handles, provider_addr, additional).await;
-            // The receiver is gone (the pull future was dropped): nothing to report,
-            // but the deposit is credited and the store row is correct.
-            drop(tx.send(outcome));
-        });
-
-        match rx
-            .await
-            .context("reactive top-up task ended without reporting")?
-        {
+        // Join-or-spawn, because the proactive low-water refill funds the SAME
+        // shortfall from the same trigger window — the reuse that started this very
+        // pull fired it precisely because the deposit was nearly spent — so the two
+        // legs racing is the common case, not a corner. Joining hands this caller
+        // the running task's credited outcome; the old bare-dedup answer ("slot
+        // taken, here is the stale deposit") read to the caller as "no headroom was
+        // added" and ended the pull terminally while the refill's funds were seconds
+        // from landing (#1600 review).
+        match self.join_or_spawn_topup(provider_addr, additional)?.await {
             Ok(DepositOutcome::Added(new_deposit)) => {
                 info!(
                     provider = %provider_addr,
@@ -1580,7 +1651,9 @@ impl<P: Provider + Clone + 'static> ChannelOpener for BuyerChannelService<P> {
                      deposit is ESCROWED AND UNTRACKED. Reconcile against the chain"
                 ))
             }
-            Err(err) => Err(err),
+            // Un-`Arc` the shared error for this waiter. The task/supervisor already
+            // logged and metered it; this copy is for the caller's classifier.
+            Err(err) => Err(anyhow::anyhow!("reactive top-up failed: {err:#}")),
         }
     }
 }
@@ -3596,97 +3669,283 @@ mod tests {
         assert_eq!(open_deposit(hint, initial), hint);
     }
 
+    /// The per-provider funding slot dedups spawns and frees when the task's guard
+    /// drops, so a later top-up can run (#1146, reshaped by #1600 review: the slot
+    /// now carries a JOINABLE handle rather than a bare bit).
     #[test]
-    fn claim_refill_slot_dedups_per_provider_and_frees_on_drop() {
-        let set: Arc<Mutex<HashSet<Address>>> = Arc::new(Mutex::new(HashSet::new()));
+    fn topup_guard_dedups_per_provider_and_frees_on_drop() {
+        let map: Arc<Mutex<HashMap<Address, SharedTopUp>>> = Arc::new(Mutex::new(HashMap::new()));
         let p = Address::repeat_byte(7);
-        let first = claim_refill_slot(&set, p);
-        assert!(first.is_some(), "first claim must succeed");
+        let noop = || -> SharedTopUp {
+            use futures_util::FutureExt as _;
+            let fut: BoxFuture<'static, TopUpOutcome> =
+                Box::pin(async { Ok(DepositOutcome::Added(U256::ZERO)) });
+            fut.shared()
+        };
+        let first = InFlightTopUpGuard {
+            map: Arc::clone(&map),
+            provider: p,
+        };
+        map.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(p, noop());
         assert!(
-            claim_refill_slot(&set, p).is_none(),
-            "a second claim while the first is held is deduped"
-        );
-        assert!(
-            claim_refill_slot(&set, Address::repeat_byte(8)).is_some(),
-            "a distinct provider is independent"
+            map.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&p),
+            "a running task's slot is visible to joiners"
         );
         drop(first);
         assert!(
-            claim_refill_slot(&set, p).is_some(),
-            "the slot frees on drop so a later refill can run"
+            !map.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&p),
+            "the slot frees on guard drop so a later top-up can run"
         );
     }
 
-    // ---- plan_refill wiring (#1146): decision + per-provider slot claim, from the
-    //      reuse `ctx`'s deposit/prior_amount — no store read, no spawned task.
-    //      (Expiry / no-channel are handled upstream by the reuse gate, so
-    //      `spawn_refill_if_low` is only ever reached for a live channel.) ----
+    // ---- plan_refill (#1146): the pure low-water decision, from the reuse `ctx`'s
+    //      deposit/prior_amount — no store read, no spawned task. The in-flight
+    //      dedup moved into `join_or_spawn_topup` (#1600 review), which reserves
+    //      and spawns under one lock. (Expiry / no-channel are handled upstream by
+    //      the reuse gate, so `spawn_refill_if_low` is only ever reached for a
+    //      live channel.) ----
 
     #[tokio::test]
     #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-    async fn plan_refill_claims_slot_and_amount_below_low_water() {
+    async fn plan_refill_amount_below_low_water() {
         let server = wiremock::MockServer::start().await;
         let service = service_against(&server);
-        let provider = Address::repeat_byte(0x71);
         let ten = U256::from(10_000_000u64); // target 10 USDC, low_water 2 USDC
         // deposit 10 USDC, 9 spent → remaining 1 USDC, below the low-water mark.
-        let (slot, additional) = service
-            .plan_refill(provider, ten, ten, U256::from(9_000_000u64))
-            .expect("a below-low-water channel must plan a refill");
-        assert_eq!(additional, U256::from(9_000_000u64)); // restore to the target
-        assert!(
-            service.topups_in_flight.lock().unwrap().contains(&provider),
-            "planning a refill claims the provider's slot"
-        );
-        drop(slot);
-        assert!(
-            !service.topups_in_flight.lock().unwrap().contains(&provider),
-            "dropping the plan frees the slot"
+        assert_eq!(
+            service.plan_refill(ten, ten, U256::from(9_000_000u64)),
+            U256::from(9_000_000u64), // restore to the target
         );
     }
 
     #[tokio::test]
     #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-    async fn plan_refill_none_with_headroom() {
+    async fn plan_refill_zero_with_headroom() {
         let server = wiremock::MockServer::start().await;
         let service = service_against(&server);
-        let provider = Address::repeat_byte(0x72);
         let ten = U256::from(10_000_000u64);
         // nothing spent → remaining above the 2 USDC low-water mark.
+        assert_eq!(service.plan_refill(ten, ten, U256::ZERO), U256::ZERO);
+    }
+
+    /// No channel tracked for the provider is an ERROR, not a silent zero: the
+    /// caller is about to spend against whatever this returns, and a `0` would
+    /// read as "funded nothing" — indistinguishable from a benign no-op.
+    #[tokio::test]
+    #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    async fn top_up_channel_errors_when_no_channel_is_tracked() {
+        let server = wiremock::MockServer::start().await;
+        let service = service_against(&server);
+        let err = service
+            .top_up_channel(Address::repeat_byte(0x81), U256::from(40u64))
+            .await
+            .expect_err("an untracked provider cannot be topped up");
         assert!(
-            service
-                .plan_refill(provider, ten, ten, U256::ZERO)
-                .is_none(),
-            "a channel with headroom must not plan a refill"
-        );
-        assert!(
-            service.topups_in_flight.lock().unwrap().is_empty(),
-            "no slot is claimed when above the low-water mark"
+            format!("{err:#}").contains("no buyer channel tracked"),
+            "the error must name the missing row, got: {err:#}"
         );
     }
 
+    /// A channel with headroom at or above the target is a no-op returning the
+    /// CURRENT deposit — and, critically, spawns no funding task.
     #[tokio::test]
     #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-    async fn plan_refill_dedups_concurrent_reuse() {
+    async fn top_up_channel_is_a_no_op_when_headroom_already_meets_the_target() {
+        let server = wiremock::MockServer::start().await;
+        let service = service_against(&server);
+        let provider = Address::repeat_byte(0x82);
+        service
+            .store
+            .record(&BuyerChannelState::new(
+                B256::repeat_byte(0x82),
+                provider,
+                service.self_address,
+                service.self_address,
+                service.token,
+                U256::from(100u64),
+                1_900_000_000,
+            ))
+            .expect("seed the row");
+
+        let got = service
+            .top_up_channel(provider, U256::from(40u64))
+            .await
+            .expect("a funded channel needs nothing");
+        assert_eq!(got, U256::from(100u64));
+        assert!(
+            service.topups_in_flight.lock().unwrap().is_empty(),
+            "a no-op must not spawn a funding task"
+        );
+    }
+
+    /// The shortfall is computed against SPENDABLE HEADROOM, not the raw deposit.
+    ///
+    /// A channel whose deposit already equals the target but is fully spent is
+    /// exactly the state the reactive leg exists to rescue; a raw-deposit reading
+    /// would call it "already at target" and decline to fund, stranding the pull.
+    /// The `additional` is not directly observable here (the tx fails against
+    /// wiremock), so the observable proof is that a task was SPAWNED at all.
+    #[tokio::test]
+    #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    async fn top_up_channel_funds_a_spent_channel_sitting_at_the_target() {
+        let server = wiremock::MockServer::start().await;
+        let service = service_against(&server);
+        let provider = Address::repeat_byte(0x83);
+        let target = U256::from(40u64);
+        service
+            .store
+            .record(&BuyerChannelState::new(
+                B256::repeat_byte(0x83),
+                provider,
+                service.self_address,
+                service.self_address,
+                service.token,
+                target, // deposit == target...
+                1_900_000_000,
+            ))
+            .expect("seed the row");
+        drop(
+            service
+                .store
+                .advance_progress(
+                    provider,
+                    B256::repeat_byte(0x83),
+                    U256::from(1u64),
+                    U256::from(1u64),
+                    target, // ...and fully spent, so headroom is zero
+                )
+                .expect("spend it down"),
+        );
+
+        // Fails on the wiremock backend, which is fine: reaching the funding task
+        // at all is the assertion — a raw-deposit reading returns `Ok(target)`
+        // without ever spawning one.
+        let got = service.top_up_channel(provider, target).await;
+        assert!(
+            got.is_err(),
+            "a spent-to-target channel must attempt funding (the mock tx then fails), \
+             got {got:?}"
+        );
+    }
+
+    /// The proactive/reactive race, end to end at the service seam (#1600 review):
+    /// a reactive `top_up_channel` arriving while a refill's funding task is in
+    /// flight must JOIN it and return ITS credited deposit — not the stale store
+    /// read that made the pull end terminally and wedge the provider while the
+    /// refill's funds were seconds from landing.
+    #[tokio::test]
+    #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    async fn a_reactive_topup_joins_an_in_flight_refill_and_sees_its_deposit() {
+        use futures_util::FutureExt as _;
+
+        let server = wiremock::MockServer::start().await;
+        let service = service_against(&server);
+        let provider = Address::repeat_byte(0x77);
+        // A tracked channel with a real shortfall: deposit 10, 9 spent, target 40.
+        service
+            .store
+            .record(&BuyerChannelState::new(
+                B256::repeat_byte(0x77),
+                provider,
+                service.self_address,
+                service.self_address,
+                service.token,
+                U256::from(10u64),
+                1_900_000_000,
+            ))
+            .expect("seed the row");
+        drop(
+            service
+                .store
+                .advance_progress(
+                    provider,
+                    B256::repeat_byte(0x77),
+                    U256::from(1u64),
+                    U256::from(1u64),
+                    U256::from(9u64),
+                )
+                .expect("spend the deposit down"),
+        );
+
+        // A refill is mid-flight: its funding future resolves — after a delay long
+        // enough that the reactive caller must genuinely WAIT on it — to the
+        // credited working deposit.
+        let refilled = U256::from(40u64);
+        let fut: BoxFuture<'static, TopUpOutcome> = Box::pin(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            Ok(DepositOutcome::Added(refilled))
+        });
+        service
+            .topups_in_flight
+            .lock()
+            .unwrap()
+            .insert(provider, fut.shared());
+
+        let got = service
+            .top_up_channel(provider, refilled)
+            .await
+            .expect("joining an in-flight refill is a success, not a stale read");
+        assert_eq!(
+            got, refilled,
+            "the reactive caller must see the refill's credited deposit, so its resumed \
+             leg has real headroom instead of ending on the original exhaustion"
+        );
+    }
+
+    /// Two callers racing on one provider produce ONE spawned funding task; the
+    /// second JOINS the first's future instead of escrowing a second deposit —
+    /// and, unlike the old bare-dedup set, actually receives the first task's
+    /// credited outcome (#1600 review).
+    #[tokio::test]
+    #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    async fn join_or_spawn_topup_joins_rather_than_double_escrowing() {
         let server = wiremock::MockServer::start().await;
         let service = service_against(&server);
         let provider = Address::repeat_byte(0x75);
-        let ten = U256::from(10_000_000u64);
-        let prior = U256::from(9_000_000u64); // remaining 1 USDC, below low-water
 
-        let first = service.plan_refill(provider, ten, ten, prior);
+        let first = service
+            .join_or_spawn_topup(provider, U256::from(1u64))
+            .expect("first caller spawns");
         assert!(
-            first.is_some(),
-            "first reuse below low-water plans a refill"
+            service
+                .topups_in_flight
+                .lock()
+                .unwrap()
+                .contains_key(&provider),
+            "the spawned task's slot is registered"
         );
+        let second = service
+            .join_or_spawn_topup(provider, U256::from(1u64))
+            .expect("second caller joins");
+        // Both handles resolve to the SAME task's outcome (the wiremock backend
+        // fails the tx, which is fine — sameness is the property under test).
+        let (a, b) = tokio::join!(first, second);
+        assert_eq!(a.is_err(), b.is_err(), "joiners see the one shared outcome");
+        // The slot frees once the task ends, so a later top-up can spawn fresh.
+        for _ in 0..50 {
+            if !service
+                .topups_in_flight
+                .lock()
+                .unwrap()
+                .contains_key(&provider)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         assert!(
-            service.plan_refill(provider, ten, ten, prior).is_none(),
-            "a concurrent reuse while the first refill is in flight is deduped"
-        );
-        drop(first);
-        assert!(
-            service.plan_refill(provider, ten, ten, prior).is_some(),
-            "once the in-flight refill completes, a later reuse can plan again"
+            !service
+                .topups_in_flight
+                .lock()
+                .unwrap()
+                .contains_key(&provider),
+            "the slot frees when the funding task completes"
         );
     }
 
@@ -4343,7 +4602,7 @@ mod tests {
             initial_deposit: U256::from(1u64),
             working_deposit: U256::from(1u64),
             opens_in_flight: Arc::new(Mutex::new(HashMap::new())),
-            topups_in_flight: Arc::new(Mutex::new(HashSet::new())),
+            topups_in_flight: Arc::new(Mutex::new(HashMap::new())),
             reclaim_failures: Arc::new(Mutex::new(HashMap::new())),
             metrics: Arc::new(Metrics::new()),
             _reclaimer: AbortOnDrop(tokio::spawn(std::future::pending())),

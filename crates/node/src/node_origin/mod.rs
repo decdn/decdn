@@ -1634,7 +1634,7 @@ async fn try_pull(
 /// this signs with `ctx.client_signer` — the SAME key that signs vouchers — and runs
 /// BEFORE the stream open on both pull paths. So a node with a broken buyer key fails
 /// here, on every candidate, and never reaches the voucher-signing `LocalPullFault` deeper
-/// in `stream_fetch_tracked`. Swallowed here, `node_pull_local_fault` stayed at zero in
+/// in the paid-pull requester's voucher leg (`UpstreamPull::pay_one`). Swallowed here, `node_pull_local_fault` stayed at zero in
 /// precisely the emergency its doc describes ("a node that cannot sign a voucher cannot
 /// pay for anything"), and an operator alerting on it got a false all-clear.
 fn bind_upstream_ctx(deps: &NodeOriginDeps, ctx: ChannelContext) -> anyhow::Result<ChannelContext> {
