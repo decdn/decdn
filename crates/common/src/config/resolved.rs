@@ -136,6 +136,11 @@ pub struct ResolvedBlockchain {
     /// settlement path submits an on-chain `withdraw` (#327). Defaults to
     /// 1 USDC (`1_000_000` `µUSDC`) when unset.
     pub redeem_threshold_micro_usdc: u64,
+    /// Seconds between the redeemer self-tick sweeps (#327, #751): the
+    /// low-frequency backstop that scans every channel for an above-threshold
+    /// claim independent of the advisory per-voucher hints. Defaults to 300s
+    /// (`DEFAULT_REDEEM_INTERVAL_SECS`); the resolver rejects `0`.
+    pub redeem_interval_secs: u64,
     /// First-contact `openChannel` deposit (base units, `µUSDC`). Defaults to
     /// 0.5 USDC (`500_000`); escrowed as configured at open time (no on-chain
     /// floor; only a non-zero requirement). See

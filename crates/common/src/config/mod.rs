@@ -83,6 +83,10 @@ const MIN_EVENT_POLL_INTERVAL_MS: u64 = 250;
 /// At this size the ~$0.10 `withdraw` gas is a few percent of the redeemed
 /// amount while bounding unsettled exposure to ~1 USDC per channel (#327).
 const DEFAULT_REDEEM_THRESHOLD_MICRO_USDC: u64 = 1_000_000;
+/// Default redeemer self-tick interval: 300s (5 min). Kept well below the
+/// hourly expiry sweep so accrued earnings are withdrawn promptly without
+/// leaning on the advisory per-voucher hints (#327, #751).
+const DEFAULT_REDEEM_INTERVAL_SECS: u64 = 300;
 /// Default self-defense-dispute residual floor: 0.1 USDC (`100_000` `µUSDC`,
 /// #1586). The node reacts to a stale channel close by submitting its
 /// higher-nonce voucher only when the recoverable residual clears this, so a
@@ -1431,6 +1435,22 @@ fn resolve_blockchain_into(
         },
     );
 
+    let redeem_interval_secs = file
+        .and_then(|b| b.redeem_interval_secs)
+        .unwrap_or(DEFAULT_REDEEM_INTERVAL_SECS);
+    // A `0` interval would build a zero-period `tokio::time::interval`, which
+    // panics. Reject it; operators wanting a tighter backstop set a small
+    // positive value (the advisory hints already redeem between sweeps).
+    bag.check_with(
+        redeem_interval_secs > 0,
+        "blockchain.redeem_interval_secs",
+        || {
+            "blockchain.redeem_interval_secs must be > 0 (a 0 interval is not a valid \
+             sweep period)"
+                .to_string()
+        },
+    );
+
     let buyer_initial_deposit_micro_usdc = file
         .and_then(|b| b.buyer_initial_deposit_micro_usdc)
         .unwrap_or(DEFAULT_BUYER_INITIAL_DEPOSIT_MICRO_USDC);
@@ -1529,6 +1549,7 @@ fn resolve_blockchain_into(
         event_poll_interval_ms,
         rate_bounds_poll_interval_sec,
         redeem_threshold_micro_usdc,
+        redeem_interval_secs,
         buyer_initial_deposit_micro_usdc,
         buyer_working_deposit_micro_usdc,
         buyer_max_approve,
@@ -8378,6 +8399,7 @@ swap_pool_address = \"0xPool\"
             event_poll_interval_ms: None,
             rate_bounds_poll_interval_sec: None,
             redeem_threshold_micro_usdc: None,
+            redeem_interval_secs: None,
             buyer_initial_deposit_micro_usdc: None,
             buyer_working_deposit_micro_usdc: None,
             buyer_max_approve: None,
@@ -8417,6 +8439,7 @@ swap_pool_address = \"0xPool\"
             event_poll_interval_ms: None,
             rate_bounds_poll_interval_sec: None,
             redeem_threshold_micro_usdc: None,
+            redeem_interval_secs: None,
             buyer_initial_deposit_micro_usdc: None,
             buyer_working_deposit_micro_usdc: None,
             buyer_max_approve: None,
@@ -8851,6 +8874,7 @@ swap_pool_address = \"0xPool\"
             event_poll_interval_ms: None,
             rate_bounds_poll_interval_sec: None,
             redeem_threshold_micro_usdc: None,
+            redeem_interval_secs: None,
             buyer_initial_deposit_micro_usdc: None,
             buyer_working_deposit_micro_usdc: None,
             buyer_max_approve: None,
@@ -8901,6 +8925,7 @@ swap_pool_address = \"0xPool\"
             event_poll_interval_ms: None,
             rate_bounds_poll_interval_sec: None,
             redeem_threshold_micro_usdc: Some(0),
+            redeem_interval_secs: None,
             buyer_initial_deposit_micro_usdc: None,
             buyer_working_deposit_micro_usdc: None,
             buyer_max_approve: None,
@@ -8920,6 +8945,57 @@ swap_pool_address = \"0xPool\"
             msg.contains("redeem_threshold_micro_usdc"),
             "error should name the field: {msg}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_blockchain_rejects_zero_redeem_interval() -> anyhow::Result<()> {
+        let dir = data_dir_with_keystore()?;
+        let cli = BlockchainArgs {
+            origin_assignment_address: None,
+            publisher_registry_address: None,
+            rpc_url: Some("https://example/rpc".to_string()),
+            eth_keystore: None,
+            keystore_password_file: None,
+            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            capacity_bond_address: Some(GOOD_ADDR.to_string()),
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            content_blacklist_address: None,
+            chain_id: None,
+        };
+        let file = types::BlockchainConfig {
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            redeem_interval_secs: Some(0),
+            ..Default::default()
+        };
+        let Err(err) = resolve_blockchain(&cli, Some(&file), dir.path()) else {
+            anyhow::bail!("expected error when redeem interval is 0");
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("redeem_interval_secs"),
+            "error should name the field: {msg}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_blockchain_applies_default_redeem_interval_when_absent() -> anyhow::Result<()> {
+        let dir = data_dir_with_keystore()?;
+        let cli = BlockchainArgs {
+            origin_assignment_address: None,
+            publisher_registry_address: None,
+            rpc_url: Some("https://example/rpc".to_string()),
+            eth_keystore: None,
+            keystore_password_file: None,
+            payment_channel_address: Some(GOOD_ADDR.to_string()),
+            capacity_bond_address: Some(GOOD_ADDR.to_string()),
+            slash_judge_address: Some(GOOD_ADDR.to_string()),
+            content_blacklist_address: Some(GOOD_ADDR.to_string()),
+            chain_id: None,
+        };
+        let resolved = resolve_blockchain(&cli, None, dir.path())?;
+        assert_eq!(resolved.redeem_interval_secs, DEFAULT_REDEEM_INTERVAL_SECS);
         Ok(())
     }
 
@@ -8950,6 +9026,7 @@ swap_pool_address = \"0xPool\"
             event_poll_interval_ms: None,
             rate_bounds_poll_interval_sec: None,
             redeem_threshold_micro_usdc: None,
+            redeem_interval_secs: None,
             buyer_initial_deposit_micro_usdc: None,
             buyer_working_deposit_micro_usdc: None,
             buyer_max_approve: None,
@@ -8999,6 +9076,7 @@ swap_pool_address = \"0xPool\"
             event_poll_interval_ms: None,
             rate_bounds_poll_interval_sec: None,
             redeem_threshold_micro_usdc: None,
+            redeem_interval_secs: None,
             buyer_initial_deposit_micro_usdc: None,
             buyer_working_deposit_micro_usdc: None,
             buyer_max_approve: None,
@@ -9071,6 +9149,7 @@ swap_pool_address = \"0xPool\"
             event_poll_interval_ms: None,
             rate_bounds_poll_interval_sec: None,
             redeem_threshold_micro_usdc: None,
+            redeem_interval_secs: None,
             buyer_initial_deposit_micro_usdc: None,
             buyer_working_deposit_micro_usdc: None,
             buyer_max_approve: None,
@@ -9119,6 +9198,7 @@ swap_pool_address = \"0xPool\"
             event_poll_interval_ms: None,
             rate_bounds_poll_interval_sec: None,
             redeem_threshold_micro_usdc: None,
+            redeem_interval_secs: None,
             buyer_initial_deposit_micro_usdc: None,
             buyer_working_deposit_micro_usdc: None,
             buyer_max_approve: None,
@@ -9162,6 +9242,7 @@ swap_pool_address = \"0xPool\"
             event_poll_interval_ms: None,
             rate_bounds_poll_interval_sec: None,
             redeem_threshold_micro_usdc: None,
+            redeem_interval_secs: None,
             buyer_initial_deposit_micro_usdc: None,
             buyer_working_deposit_micro_usdc: None,
             buyer_max_approve: None,
@@ -9235,6 +9316,7 @@ swap_pool_address = \"0xPool\"
             event_poll_interval_ms: None,
             rate_bounds_poll_interval_sec: None,
             redeem_threshold_micro_usdc: None,
+            redeem_interval_secs: None,
             buyer_initial_deposit_micro_usdc: Some(0),
             buyer_working_deposit_micro_usdc: None,
             buyer_max_approve: None,
@@ -9284,6 +9366,7 @@ swap_pool_address = \"0xPool\"
             event_poll_interval_ms: None,
             rate_bounds_poll_interval_sec: None,
             redeem_threshold_micro_usdc: None,
+            redeem_interval_secs: None,
             buyer_initial_deposit_micro_usdc: Some(2_000_000),
             buyer_working_deposit_micro_usdc: Some(1_000_000),
             buyer_max_approve: None,
@@ -9333,6 +9416,7 @@ swap_pool_address = \"0xPool\"
             event_poll_interval_ms: None,
             rate_bounds_poll_interval_sec: None,
             redeem_threshold_micro_usdc: None,
+            redeem_interval_secs: None,
             buyer_initial_deposit_micro_usdc: Some(500_000),
             buyer_working_deposit_micro_usdc: Some(0),
             buyer_max_approve: None,

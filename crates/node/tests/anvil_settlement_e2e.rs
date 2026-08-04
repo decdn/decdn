@@ -592,6 +592,7 @@ async fn run_e2e() -> anyhow::Result<()> {
         checkpoint_store,
         Arc::clone(&handler),
         U256::from(REDEEM_THRESHOLD_MICRO_USDC),
+        Duration::from_secs(300),
         AutoSettleConfig::default(),
         U256::from(DISPUTE_MIN_RESIDUAL_MICRO_USDC),
         Duration::from_millis(250),
@@ -1120,6 +1121,7 @@ async fn run_e2e() -> anyhow::Result<()> {
         concrete_store.clone(),
         Arc::clone(&handler),
         U256::from(REDEEM_THRESHOLD_MICRO_USDC),
+        Duration::from_secs(300),
         AutoSettleConfig {
             // 5 µUSDC — below the 10 µUSDC redeem threshold and below channel
             // 3's 15 µUSDC claim, so the trigger fires AND the redeem threshold
@@ -1368,6 +1370,7 @@ async fn run_e2e() -> anyhow::Result<()> {
         concrete_store.clone(),
         Arc::clone(&handler),
         U256::from(REDEEM_THRESHOLD_MICRO_USDC),
+        Duration::from_secs(300),
         AutoSettleConfig::default(),
         U256::from(DISPUTE_MIN_RESIDUAL_MICRO_USDC),
         Duration::from_millis(250),
@@ -1456,6 +1459,7 @@ async fn run_e2e() -> anyhow::Result<()> {
         concrete_store.clone(),
         Arc::clone(&handler),
         U256::from(REDEEM_THRESHOLD_MICRO_USDC),
+        Duration::from_secs(300),
         AutoSettleConfig::default(),
         U256::from(DISPUTE_MIN_RESIDUAL_MICRO_USDC),
         Duration::from_millis(250),

@@ -1261,6 +1261,7 @@ async fn build_chain_and_handlers(
         Arc::clone(&infra.watcher_checkpoint_store),
         Arc::clone(&client_handler),
         U256::from(cfg.blockchain.redeem_threshold_micro_usdc),
+        Duration::from_secs(cfg.blockchain.redeem_interval_secs),
         crate::payment_settlement::AutoSettleConfig {
             value_threshold: cfg
                 .blockchain
@@ -3702,6 +3703,7 @@ mod tests {
                 event_poll_interval_ms: 7000,
                 rate_bounds_poll_interval_sec: 3600,
                 redeem_threshold_micro_usdc: 1_000_000,
+                redeem_interval_secs: 300,
                 buyer_initial_deposit_micro_usdc: 10_000_000,
                 buyer_working_deposit_micro_usdc: 10_000_000,
                 buyer_max_approve: true,
