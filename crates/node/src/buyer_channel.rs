@@ -550,6 +550,98 @@ fn claim_refill_slot(set: &Arc<Mutex<HashSet<Address>>>, provider: Address) -> O
     })
 }
 
+/// The `'static` slice of [`BuyerChannelService`] a detached funding task needs.
+///
+/// Both funding legs run their `topUp` on a spawned task rather than inline (see
+/// [`fund_channel`]), so neither can borrow `&self`. Built by
+/// [`BuyerChannelService::funding_handles`].
+struct FundingHandles<P: Provider + Clone + 'static> {
+    contract: PaymentChannel::PaymentChannelInstance<P>,
+    store: Arc<dyn BuyerChannelStore>,
+    rpc: P,
+    token: Address,
+    self_address: Address,
+    payment_channel_addr: Address,
+    metrics: Arc<Metrics>,
+}
+
+/// Escrow `additional` `µUSDC` onto `provider_addr`'s channel: ensure the allowance,
+/// `topUp`, grade the outcome, meter it.
+///
+/// The single funding kernel behind both legs — the proactive low-water refill
+/// ([`BuyerChannelService::spawn_refill_if_low`], #1146) and the reactive mid-pull
+/// top-up ([`BuyerChannelService::top_up_channel`], #1530). They differ in who
+/// waits for the result, not in what happens on chain, so keeping one body is what
+/// stops the allowance posture and the escrowed-but-untracked grading from drifting
+/// between a path an operator watches and a path a pull depends on.
+///
+/// # Errors
+///
+/// The allowance step's error, or `top_up`'s. Both are metered `buyer_topup_failure`
+/// before returning, so a caller that discards the error still leaves the operator
+/// signal intact.
+async fn fund_channel<P: Provider + Clone + 'static>(
+    handles: &FundingHandles<P>,
+    provider_addr: Address,
+    additional: U256,
+) -> Result<DepositOutcome> {
+    // Daemon posture: ensure the standing unlimited allowance (idempotent — skips
+    // when already granted) so `topUp`'s `transferFrom` can pull the funds even if
+    // the standing approval was revoked. Mirrors bootstrap and the CLI refill's
+    // allowance step.
+    if let Err(err) = ensure_allowance(
+        &handles.rpc,
+        handles.token,
+        handles.self_address,
+        handles.payment_channel_addr,
+        None,
+    )
+    .await
+    {
+        warn!(
+            provider = %provider_addr,
+            %additional,
+            error = %format!("{err:#}"),
+            "buyer top-up: ensure_allowance failed; channel not topped up"
+        );
+        handles.metrics.buyer_topup_failure();
+        return Err(err);
+    }
+
+    match decdn_client_pull::buyer_channel::top_up(
+        &handles.contract,
+        handles.store.as_ref(),
+        provider_addr,
+        additional,
+    )
+    .await
+    {
+        Ok(outcome @ DepositOutcome::Added(_)) => {
+            handles.metrics.buyer_topup_ok();
+            Ok(outcome)
+        }
+        // The topUp landed on-chain but the local row vanished or rotated during the
+        // RPC (`top_up` already logged it at error!/warn! with the tx for reconcile).
+        // Funds are escrowed-but-untracked — NOT a clean success, so meter it as a
+        // failure rather than `buyer_topup_ok`, or an operator watching the failure
+        // metric would miss stranded deposits (#1146 review).
+        Ok(outcome) => {
+            handles.metrics.buyer_topup_failure();
+            Ok(outcome)
+        }
+        Err(err) => {
+            warn!(
+                provider = %provider_addr,
+                %additional,
+                error = %format!("{err:#}"),
+                "buyer top-up: topUp failed; channel not topped up"
+            );
+            handles.metrics.buyer_topup_failure();
+            Err(err)
+        }
+    }
+}
+
 /// The low-water top-up amount for a reused channel (#1146, #1103): `U256::ZERO`
 /// when the remaining deposit still has headroom, else the amount that restores
 /// it to the working `target`. `target = max(deposit_hint, working_deposit)` —
@@ -966,6 +1058,23 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
         Some((slot, additional))
     }
 
+    /// Everything the detached funding task needs, lifted off `&self` so the task
+    /// can be `'static`. Built by [`BuyerChannelService::funding_handles`] and
+    /// consumed by [`fund_channel`]; both the proactive low-water refill and the
+    /// reactive mid-pull top-up (#1530) go through it, so the allowance posture,
+    /// the [`DepositOutcome`] grading, and the metering cannot drift apart.
+    fn funding_handles(&self) -> FundingHandles<P> {
+        FundingHandles {
+            contract: self.contract.clone(),
+            store: Arc::clone(&self.store),
+            rpc: self.contract.provider().clone(),
+            token: self.token,
+            self_address: self.self_address,
+            payment_channel_addr: *self.contract.address(),
+            metrics: Arc::clone(&self.metrics),
+        }
+    }
+
     /// Best-effort background top-up of a reused channel that has run below its
     /// low-water mark (#1146). Spawns a detached task and returns immediately — it
     /// NEVER blocks the pull: a synchronous on-chain `topUp` (seconds-to-minutes on
@@ -995,70 +1104,24 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
             return;
         };
 
-        let contract = self.contract.clone();
-        let store = Arc::clone(&self.store);
-        let rpc = self.contract.provider().clone();
-        let token = self.token;
-        let self_address = self.self_address;
-        let payment_channel_addr = *self.contract.address();
-        let metrics = Arc::clone(&self.metrics);
+        let handles = self.funding_handles();
 
         tokio::spawn(async move {
             // Freed on task completion OR panic, so a wedged refill never blocks
             // future refills to this provider.
             let _slot = slot;
 
-            // Daemon posture: ensure the standing unlimited allowance (idempotent —
-            // skips when already granted) so `topUp`'s `transferFrom` can pull the
-            // funds even if the standing approval was revoked. Mirrors bootstrap and
-            // the CLI refill's allowance step.
-            if let Err(err) =
-                ensure_allowance(&rpc, token, self_address, payment_channel_addr, None).await
+            // Every other outcome is graded, logged, and metered inside
+            // `fund_channel`; the proactive leg is advisory, so there is nothing left
+            // to do but let the pull proceed on the existing deposit.
+            if let Ok(DepositOutcome::Added(_)) =
+                fund_channel(&handles, provider_addr, additional).await
             {
-                warn!(
+                info!(
                     provider = %provider_addr,
                     %additional,
-                    error = %format!("{err:#}"),
-                    "buyer refill: ensure_allowance failed; reused channel not topped up"
+                    "buyer refill: topped up reused channel below its low-water mark (#1146)"
                 );
-                metrics.buyer_topup_failure();
-                return;
-            }
-
-            match decdn_client_pull::buyer_channel::top_up(
-                &contract,
-                store.as_ref(),
-                provider_addr,
-                additional,
-            )
-            .await
-            {
-                Ok(DepositOutcome::Added(_)) => {
-                    info!(
-                        provider = %provider_addr,
-                        %additional,
-                        "buyer refill: topped up reused channel below its low-water mark (#1146)"
-                    );
-                    metrics.buyer_topup_ok();
-                }
-                // The topUp landed on-chain but the local row vanished or rotated
-                // during the RPC (`top_up` already logged it at error!/warn! with
-                // the tx for reconcile). Funds are escrowed-but-untracked — NOT a
-                // clean success, so meter it as a failure rather than
-                // `buyer_topup_ok`, or an operator watching the failure metric
-                // would miss stranded deposits (#1146 review).
-                Ok(DepositOutcome::UnknownChannel | DepositOutcome::ChannelMismatch) => {
-                    metrics.buyer_topup_failure();
-                }
-                Err(err) => {
-                    warn!(
-                        provider = %provider_addr,
-                        %additional,
-                        error = %format!("{err:#}"),
-                        "buyer refill: topUp failed; reused channel not topped up"
-                    );
-                    metrics.buyer_topup_failure();
-                }
             }
         });
     }
@@ -1250,33 +1313,26 @@ impl<P: Provider + Clone + 'static> BuyerChannelService<P> {
     /// Add `additional` USDC to the channel tracked for `provider_addr`.
     /// Does not extend the channel expiry (the contract forbids it).
     ///
-    /// Thin delegation to the shared
-    /// [`decdn_client_pull::buyer_channel::top_up`] kernel (the same mechanism
-    /// the CLI fetch buyer's auto-refill uses, #1103): read the `channel_id`,
-    /// `topUp` on-chain, then reconcile the committed deposit — handling the
-    /// escrowed-but-untracked / channel-replaced races.
+    /// Routes through the shared `fund_channel` kernel, so this manual entry
+    /// point (tests / operator tooling) gets the same allowance posture, outcome
+    /// grading, and metering as the two production legs. Drops the outcome to keep
+    /// `Result<()>`; the escrowed-but-untracked variants are already logged and
+    /// metered inside the kernel.
     ///
     /// # Errors
     ///
     /// Errors if no channel is tracked for `provider_addr` *before* the RPC, or
-    /// if the `topUp` transaction fails (submit, revert, or receipt).
+    /// if the allowance step or the `topUp` transaction fails (submit, revert, or
+    /// receipt).
     ///
     /// A row that vanishes or is replaced by a newer open *after* the on-chain
     /// `topUp` lands is logged (with the tx hash) for reconciliation and returns
     /// `Ok(())`, not an error — the funds are already escrowed on-chain against
     /// the topped-up channel, so failing here would not unwind them.
     pub async fn top_up(&self, provider_addr: Address, additional: U256) -> Result<()> {
-        decdn_client_pull::buyer_channel::top_up(
-            &self.contract,
-            self.store.as_ref(),
-            provider_addr,
-            additional,
-        )
-        .await
-        // This manual entry point (used by tests / operator tooling) does not
-        // grade the escrowed-but-untracked outcomes the way the background refill
-        // does — `top_up` already logs them; drop the outcome to keep `Result<()>`.
-        .map(|_| ())
+        fund_channel(&self.funding_handles(), provider_addr, additional)
+            .await
+            .map(|_| ())
     }
 }
 
@@ -1366,6 +1422,35 @@ pub trait ChannelOpener: Send + Sync + std::fmt::Debug {
     fn channel_expiry(&self, _provider_addr: Address) -> Option<u64> {
         None
     }
+
+    /// Raise `provider_addr`'s tracked channel toward `target_deposit` and return
+    /// the channel's NEW total deposit (#1530).
+    ///
+    /// The reactive counterpart of the proactive low-water refill: the node-to-node
+    /// pull loop calls this when an upstream rejects a voucher `InsufficientDeposit`
+    /// AND the buyer's own ledger corroborates it, then resumes at the paid frontier
+    /// on the larger deposit. Returning the new deposit rather than `()` is what lets
+    /// the caller update its live `ChannelContext::deposit` without a store read — the
+    /// resumed leg's headroom arithmetic is wrong otherwise.
+    ///
+    /// `target_deposit` is a target, not an increment: implementations add only the
+    /// shortfall. A channel already at or above it is a no-op that returns the current
+    /// deposit.
+    ///
+    /// Defaults to "funding not supported": returns `U256::ZERO`, which every caller
+    /// must read as "no headroom was added". An implementation that does not model
+    /// on-chain deposits (a test double, a read-only opener) therefore needs no
+    /// override, exactly as for [`Self::channel_expiry`].
+    ///
+    /// # Errors
+    ///
+    /// Implementations error when no channel is tracked for `provider_addr`, when the
+    /// allowance or `topUp` transaction fails, or when the tx lands but the local row
+    /// can no longer be credited (an escrowed-but-untracked deposit — terminal, and
+    /// the caller must not retry into it).
+    async fn top_up_channel(&self, _provider_addr: Address, _target_deposit: U256) -> Result<U256> {
+        Ok(U256::ZERO)
+    }
 }
 
 #[async_trait::async_trait]
@@ -1410,6 +1495,93 @@ impl<P: Provider + Clone + 'static> ChannelOpener for BuyerChannelService<P> {
             .ok()
             .flatten()
             .map(|state| state.expires_at)
+    }
+
+    async fn top_up_channel(&self, provider_addr: Address, target_deposit: U256) -> Result<U256> {
+        let state = self
+            .store
+            .get_by_provider(provider_addr)?
+            .with_context(|| format!("no buyer channel tracked for provider {provider_addr}"))?;
+        // Shortfall against SPENDABLE headroom, not the raw deposit: `last_amount` is
+        // already committed to vouchers the upstream has accepted, so a channel whose
+        // deposit equals the target but is fully spent still needs the full amount.
+        // `refill_amount` with a `low_water` of the target itself is exactly "top up
+        // whenever remaining is below the target" — the reactive trigger, as opposed to
+        // the proactive leg's 20% mark.
+        let additional = refill_amount(
+            state.deposit,
+            state.last_amount,
+            target_deposit,
+            target_deposit,
+        );
+        if additional.is_zero() {
+            return Ok(state.deposit);
+        }
+
+        // Share the per-provider dedup set with the proactive refill: a background
+        // low-water top-up racing this one would escrow twice for one shortfall. If a
+        // refill already holds the slot its funds are landing anyway, so report the
+        // current deposit and let the caller's own exhaustion check decide.
+        let Some(slot) = claim_refill_slot(&self.topups_in_flight, provider_addr) else {
+            debug!(
+                provider = %provider_addr,
+                "reactive top-up: a refill is already in flight for this provider; not escrowing twice"
+            );
+            return Ok(state.deposit);
+        };
+
+        // DETACHED, then awaited through a channel — deliberately not an inline
+        // `.await` (#1530).
+        //
+        // `top_up` submits the tx and then waits on `get_receipt()` with no timeout,
+        // and that is correct: giving up on an escrowing tx's receipt does not cancel
+        // it, it only makes us stop watching real USDC that is still going to land
+        // (the same reasoning `bootstrap` records for `openChannel`). But this runs
+        // inside the miss-pull future, which the foreground serve path DROPS on
+        // `outer_pull_deadline`. An inline await would be cancelled mid-receipt: the
+        // tx still mines, `store.add_deposit` never runs, and the deposit is escrowed
+        // and untracked — silently, on the client-facing path.
+        //
+        // On the spawned task, a dropped caller loses only the *answer*. The credit
+        // still lands.
+        let handles = self.funding_handles();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            // Freed on completion OR panic, like the proactive refill's slot.
+            let _slot = slot;
+            let outcome = fund_channel(&handles, provider_addr, additional).await;
+            // The receiver is gone (the pull future was dropped): nothing to report,
+            // but the deposit is credited and the store row is correct.
+            drop(tx.send(outcome));
+        });
+
+        match rx
+            .await
+            .context("reactive top-up task ended without reporting")?
+        {
+            Ok(DepositOutcome::Added(new_deposit)) => {
+                info!(
+                    provider = %provider_addr,
+                    %additional,
+                    %new_deposit,
+                    "reactive top-up: channel exhausted mid-pull; raised toward the working deposit (#1530)"
+                );
+                Ok(new_deposit)
+            }
+            // The `topUp` MINED — the USDC is escrowed — but the local row could not be
+            // credited. Terminal, and it must not be retried: a second pass would
+            // recompute the same shortfall and escrow again. Graded here rather than
+            // swallowed, because unlike the advisory proactive leg this caller is about
+            // to spend against the deposit it thinks it has.
+            Ok(outcome @ (DepositOutcome::UnknownChannel | DepositOutcome::ChannelMismatch)) => {
+                Err(anyhow::anyhow!(
+                    "reactive top-up of {additional} µUSDC for provider {provider_addr} landed \
+                     on-chain but the local record could not be credited ({outcome:?}): the \
+                     deposit is ESCROWED AND UNTRACKED. Reconcile against the chain"
+                ))
+            }
+            Err(err) => Err(err),
+        }
     }
 }
 

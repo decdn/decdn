@@ -212,11 +212,12 @@ pub struct BlockchainConfig {
     /// non-zero requirement).
     pub buyer_initial_deposit_micro_usdc: Option<u64>,
     /// Deposit (base units, `µUSDC`) every `topUp` refills the channel toward
-    /// once it is reused or runs short mid-transfer. Both refill
-    /// legs target this: the proactive low-water refill, which both binaries
-    /// run on channel reuse, and the reactive mid-fetch top-up, which is
-    /// **`decdn fetch` only** — the daemon's buffered cache-miss pull has no
-    /// paid-frontier resume and is deferred to #1530. Larger values amortize gas
+    /// once it is reused or runs short mid-transfer. Both refill legs target
+    /// this: the proactive low-water refill, which both binaries run on channel
+    /// reuse, and the reactive mid-transfer top-up, which the `decdn fetch`
+    /// streaming path and the daemon's node-to-node cache-miss pull both run
+    /// (#1530). `decdn bundle pull` is the one remaining fetch path with the
+    /// proactive leg only. Larger values amortize gas
     /// across more delivery at the cost of more capital locked for up to the
     /// 48h dispute window. Absent => default (10 USDC = `10_000_000`). `0`
     /// disables top-up entirely (a spent-down channel errors instead of

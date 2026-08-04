@@ -1058,6 +1058,30 @@ pub struct DecdnMetrics {
     /// `node_pull_progress_persist_failures_total` (a real store-write failure that leaves the
     /// watermark lagging) so ordinary settle races do not drown out a genuine persist fault.
     pub node_pull_progress_superseded: Counter,
+    /// `decdn_node_pull_reactive_topup_total` (#1530): a node→node miss pull hit its
+    /// channel's deposit ceiling mid-stream, funded the shortfall on-chain, and
+    /// resumed at the paid frontier.
+    ///
+    /// Expected to be RARE once `buyer_working_deposit_micro_usdc` is sized for the
+    /// blobs this node pulls — the proactive low-water refill should graduate a
+    /// channel long before a single pull outruns it. A sustained rate means the
+    /// initial deposit is too small for the blob sizes in play, and every tick is a
+    /// transaction plus a settlement wait a client sat through.
+    ///
+    /// Distinct from `decdn_buyer_topup_ok_total`, which counts on-chain top-ups from
+    /// BOTH legs: this one isolates the reactive leg, so the proactive refill's
+    /// routine traffic cannot hide it.
+    pub node_pull_reactive_topup: Counter,
+    /// `decdn_node_pull_reactive_topup_refused_total` (#1530): a mid-pull top-up was
+    /// NOT performed, or performed and added nothing.
+    ///
+    /// The interesting cause is an upstream claiming `InsufficientDeposit` while our
+    /// own ledger still covers the next voucher — a lying or buggy peer trying to make
+    /// us escrow more USDC than we owe. We refuse to fund that (`genuine_exhaustion`
+    /// validates the claim against our own accounting), and this is the only place it
+    /// becomes visible. The benign causes are a funding transaction that failed and a
+    /// concurrent proactive refill that already held the provider's slot.
+    pub node_pull_reactive_topup_refused: Counter,
     /// `decdn_node_pull_through_timeouts_total` (#831): cache-miss pull-through
     /// attempts the delivery handler abandoned at its deadline. Distinguishes a
     /// slow/wedged upstream from a genuine miss (both otherwise return
@@ -2285,6 +2309,14 @@ recorders! {
     /// A concurrent settle on the shared channel ledger persisted a higher watermark first, so
     /// this write was superseded (benign under `BuyerLedgers`; #1145 review).
     node_pull_progress_superseded => node_pull_progress_superseded.inc();
+
+    /// A miss pull funded its exhausted channel mid-stream and resumed at the paid
+    /// frontier (#1530).
+    node_pull_reactive_topup => node_pull_reactive_topup.inc();
+
+    /// A mid-pull top-up was declined or added no headroom — most interestingly, an
+    /// upstream claiming exhaustion our own ledger contradicts (#1530).
+    node_pull_reactive_topup_refused => node_pull_reactive_topup_refused.inc();
 
     /// The delivery handler abandoned a pull-through at its deadline (#831).
     node_pull_through_timeout => node_pull_through_timeouts.inc();
