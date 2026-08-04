@@ -561,6 +561,240 @@ contract PaymentChannelTest is Test {
     }
 
     // -----------------------------------------------------------------
+    // withdrawMany (batched redemption)
+    // -----------------------------------------------------------------
+
+    /// @dev Build one signed batch leg for `id`.
+    function _leg(bytes32 id, uint256 amount, uint256 nonce, uint256 bytesDelivered)
+        internal
+        view
+        returns (PaymentChannel.WithdrawArgs memory)
+    {
+        return PaymentChannel.WithdrawArgs({
+            channelId: id,
+            amount: amount,
+            nonce: nonce,
+            bytesDelivered: bytesDelivered,
+            signature: _sign(id, amount, nonce, bytesDelivered)
+        });
+    }
+
+    /// @dev Assert the full withdrawal + claim watermark for `id`.
+    function _assertWithdrawn(bytes32 id, uint256 amount, uint256 nonce, uint256 bytesDelivered) internal view {
+        PaymentChannel.Channel memory ch = channel.getChannel(id);
+        assertEq(ch.claimedAmount, amount);
+        assertEq(ch.claimedNonce, nonce);
+        assertEq(ch.claimedBytes, bytesDelivered);
+        assertEq(ch.withdrawnAmount, amount);
+        assertEq(ch.withdrawnBytes, bytesDelivered);
+    }
+
+    function test_withdrawMany_routesAggregateOnceAndAdvancesAllWatermarks() public {
+        bytes32 a = _open();
+        bytes32 b = _open();
+        bytes32 c = _open();
+
+        PaymentChannel.WithdrawArgs[] memory args = new PaymentChannel.WithdrawArgs[](3);
+        args[0] = _leg(a, 100e6, 1, 10_000_000);
+        args[1] = _leg(b, 250e6, 1, 25_000_000);
+        args[2] = _leg(c, 400e6, 1, 40_000_000);
+
+        vm.prank(provider);
+        channel.withdrawMany(args);
+
+        // Exactly one aggregate route for the whole batch.
+        assertEq(router.callCount(), 1);
+        (address op, uint256 bts, uint256 amt) = router.calls(0);
+        assertEq(op, provider);
+        assertEq(amt, 750e6); // 100 + 250 + 400
+        assertEq(bts, 75_000_000); // 10M + 25M + 40M
+
+        // Each channel's watermark advanced exactly as a standalone withdraw.
+        _assertWithdrawn(a, 100e6, 1, 10_000_000);
+        _assertWithdrawn(b, 250e6, 1, 25_000_000);
+        _assertWithdrawn(c, 400e6, 1, 40_000_000);
+    }
+
+    /// @dev A fresh, identical deployment settled by N single `withdraw`s must
+    ///      reach the same provider payout, served-byte total, and per-channel
+    ///      watermarks as one `withdrawMany` — only the route count differs (1 vs
+    ///      N). Proves the aggregated route is economically identical.
+    function test_withdrawMany_equalsNSingleWithdraws() public {
+        // World A: one withdrawMany over three channels.
+        bytes32 a = _open();
+        bytes32 b = _open();
+        bytes32 c = _open();
+        PaymentChannel.WithdrawArgs[] memory args = new PaymentChannel.WithdrawArgs[](3);
+        args[0] = _leg(a, 130e6, 1, 13_000_000);
+        args[1] = _leg(b, 700e6, 2, 70_000_000);
+        args[2] = _leg(c, 40e6, 1, 4_000_000);
+        vm.prank(provider);
+        channel.withdrawMany(args);
+
+        // World B: an identical fresh deployment, three single withdraws.
+        MockSettlementRouter router2 = new MockSettlementRouter(usdc);
+        PaymentChannel ch2 = new PaymentChannel({
+            usdc_: usdc,
+            capacityBond_: bond,
+            feeRouter_: address(router2),
+            disputeWindow_: DISPUTE_WINDOW,
+            maxChannelDuration_: MAX_DURATION,
+            deliveryFloor_: DELIVERY_FLOOR,
+            admin: admin
+        });
+        vm.prank(client);
+        usdc.approve(address(ch2), type(uint256).max);
+        // Same client + provider + per-contract nonces → identical channel ids.
+        vm.startPrank(client);
+        bytes32 a2 = ch2.openChannel(provider, DEPOSIT, address(0));
+        bytes32 b2 = ch2.openChannel(provider, DEPOSIT, address(0));
+        bytes32 c2 = ch2.openChannel(provider, DEPOSIT, address(0));
+        vm.stopPrank();
+        assertEq(a, a2);
+        assertEq(b, b2);
+        assertEq(c, c2);
+        vm.startPrank(provider);
+        ch2.withdraw(a2, 130e6, 1, 13_000_000, _signFor(address(ch2), a2, 130e6, 1, 13_000_000));
+        ch2.withdraw(b2, 700e6, 2, 70_000_000, _signFor(address(ch2), b2, 700e6, 2, 70_000_000));
+        ch2.withdraw(c2, 40e6, 1, 4_000_000, _signFor(address(ch2), c2, 40e6, 1, 4_000_000));
+        vm.stopPrank();
+
+        // Same payout + served bytes; batch routes once, singles route thrice.
+        assertEq(usdc.balanceOf(address(router)), usdc.balanceOf(address(router2)));
+        assertEq(router.totalRouted(), router2.totalRouted());
+        assertEq(router.totalBytes(), router2.totalBytes());
+        assertEq(router.callCount(), 1);
+        assertEq(router2.callCount(), 3);
+
+        // Identical per-channel end state.
+        _assertChannelsEqual(a, ch2, a2);
+        _assertChannelsEqual(b, ch2, b2);
+        _assertChannelsEqual(c, ch2, c2);
+    }
+
+    function _assertChannelsEqual(bytes32 id1, PaymentChannel ch2, bytes32 id2) internal view {
+        PaymentChannel.Channel memory x = channel.getChannel(id1);
+        PaymentChannel.Channel memory y = ch2.getChannel(id2);
+        assertEq(x.claimedAmount, y.claimedAmount);
+        assertEq(x.claimedNonce, y.claimedNonce);
+        assertEq(x.claimedBytes, y.claimedBytes);
+        assertEq(x.withdrawnAmount, y.withdrawnAmount);
+        assertEq(x.withdrawnBytes, y.withdrawnBytes);
+    }
+
+    /// @dev Mixed legs — one already partly withdrawn (routes only its increment),
+    ///      one fresh, spanning small and large amounts — still aggregate correctly.
+    function test_withdrawMany_mixedIncrementalAndFreshDeltas() public {
+        bytes32 a = _open();
+        bytes32 b = _open();
+        // Pre-withdraw `a`, so its batch leg routes only the increment above the
+        // withdrawal watermark, not the full new cumulative amount.
+        vm.prank(provider);
+        channel.withdraw(a, 100e6, 1, 10_000_000, _sign(a, 100e6, 1, 10_000_000));
+        assertEq(router.callCount(), 1);
+
+        PaymentChannel.WithdrawArgs[] memory args = new PaymentChannel.WithdrawArgs[](2);
+        args[0] = _leg(a, 300e6, 2, 30_000_000); // increment: +200e6 / +20M
+        args[1] = _leg(b, 500e6, 1, 50_000_000); // fresh: +500e6 / +50M
+        vm.prank(provider);
+        channel.withdrawMany(args);
+
+        // The batch's route is the sum of the increment and the fresh leg.
+        assertEq(router.callCount(), 2);
+        (, uint256 bts, uint256 amt) = router.calls(1);
+        assertEq(amt, 700e6); // 200 + 500
+        assertEq(bts, 70_000_000); // 20M + 50M
+        _assertWithdrawn(a, 300e6, 2, 30_000_000);
+        _assertWithdrawn(b, 500e6, 1, 50_000_000);
+    }
+
+    /// @dev A repeated channel across legs advances strictly leg-to-leg (the
+    ///      in-loop watermark write is visible to the later occurrence) and routes
+    ///      the summed increment once.
+    function test_withdrawMany_duplicateChannelAcrossLegs() public {
+        bytes32 a = _open();
+        PaymentChannel.WithdrawArgs[] memory args = new PaymentChannel.WithdrawArgs[](2);
+        args[0] = _leg(a, 100e6, 1, 10_000_000);
+        args[1] = _leg(a, 300e6, 2, 30_000_000);
+        vm.prank(provider);
+        channel.withdrawMany(args);
+
+        assertEq(router.callCount(), 1);
+        (, uint256 bts, uint256 amt) = router.calls(0);
+        assertEq(amt, 300e6); // 100 + 200 increment
+        assertEq(bts, 30_000_000);
+        _assertWithdrawn(a, 300e6, 2, 30_000_000);
+    }
+
+    function test_withdrawMany_duplicateChannelNonMonotonicReverts() public {
+        bytes32 a = _open();
+        PaymentChannel.WithdrawArgs[] memory args = new PaymentChannel.WithdrawArgs[](2);
+        args[0] = _leg(a, 100e6, 1, 10_000_000);
+        args[1] = _leg(a, 300e6, 1, 30_000_000); // nonce 1 again — not strictly higher
+        vm.prank(provider);
+        vm.expectRevert(abi.encodeWithSelector(PaymentChannel.NonMonotonicNonce.selector, uint256(1), uint256(1)));
+        channel.withdrawMany(args);
+    }
+
+    function test_withdrawMany_emitsPerChannelEvents() public {
+        bytes32 a = _open();
+        bytes32 b = _open();
+        PaymentChannel.WithdrawArgs[] memory args = new PaymentChannel.WithdrawArgs[](2);
+        args[0] = _leg(a, 100e6, 1, 10_000_000);
+        args[1] = _leg(b, 250e6, 1, 25_000_000);
+
+        vm.expectEmit(true, true, false, true, address(channel));
+        emit PaymentChannel.ChannelWithdrawn(a, provider, 100e6, 10_000_000, 100e6);
+        vm.expectEmit(true, true, false, true, address(channel));
+        emit PaymentChannel.ChannelWithdrawn(b, provider, 250e6, 25_000_000, 250e6);
+
+        vm.prank(provider);
+        channel.withdrawMany(args);
+    }
+
+    function test_withdrawMany_emptyBatchReverts() public {
+        PaymentChannel.WithdrawArgs[] memory args = new PaymentChannel.WithdrawArgs[](0);
+        vm.prank(provider);
+        vm.expectRevert(PaymentChannel.NothingToWithdraw.selector);
+        channel.withdrawMany(args);
+    }
+
+    function test_withdrawMany_allZeroDeltaReverts() public {
+        bytes32 a = _open();
+        vm.prank(provider);
+        channel.withdraw(a, 200e6, 1, 20_000_000, _sign(a, 200e6, 1, 20_000_000));
+        // Re-present the same cumulative amount at a higher nonce: the watermark
+        // would advance but the routable delta is zero, so the batch has nothing to
+        // route and reverts (the whole tx, including the nonce advance, rolls back).
+        PaymentChannel.WithdrawArgs[] memory args = new PaymentChannel.WithdrawArgs[](1);
+        args[0] = _leg(a, 200e6, 2, 20_000_000);
+        vm.prank(provider);
+        vm.expectRevert(PaymentChannel.NothingToWithdraw.selector);
+        channel.withdrawMany(args);
+    }
+
+    function test_withdrawMany_revertsIfAnyLegNotCallerProvider() public {
+        address provider2 = address(0xB0B2);
+        bond.setActive(provider2, true);
+        bytes32 a = _open(); // provider owns this one
+        vm.prank(client);
+        bytes32 b = channel.openChannel(provider2, DEPOSIT, address(0)); // provider2 owns this one
+
+        PaymentChannel.WithdrawArgs[] memory args = new PaymentChannel.WithdrawArgs[](2);
+        args[0] = _leg(a, 100e6, 1, 10_000_000);
+        args[1] = _leg(b, 100e6, 1, 10_000_000);
+
+        // `provider` may redeem `a` but not `b`; the whole batch reverts.
+        vm.prank(provider);
+        vm.expectRevert(PaymentChannel.NotChannelParty.selector);
+        channel.withdrawMany(args);
+
+        // Nothing routed, and `a`'s watermark rolled back with the batch.
+        assertEq(router.callCount(), 0);
+        _assertWithdrawn(a, 0, 0, 0);
+    }
+
+    // -----------------------------------------------------------------
     // closeChannel + settleChannel
     // -----------------------------------------------------------------
 

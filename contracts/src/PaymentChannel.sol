@@ -450,6 +450,72 @@ contract PaymentChannel is AccessControl, ReentrancyGuard, SunsettingPausable, E
         emit ChannelToppedUp(channelId, received, ch.deposit);
     }
 
+    /// @notice One leg of a batched `withdrawMany` redemption: the same
+    ///         `(channelId, amount, nonce, bytesDelivered, signature)` tuple a
+    ///         single `withdraw` takes.
+    struct WithdrawArgs {
+        bytes32 channelId;
+        uint256 amount;
+        uint256 nonce;
+        uint256 bytesDelivered;
+        bytes signature;
+    }
+
+    /// @notice Provider-only: redeem many channels' accrued deltas in one
+    ///         transaction, routing the summed delta through `FeeRouter` a single
+    ///         time. Each leg is verified and its watermark advanced exactly as a
+    ///         standalone `withdraw` (irreducibly O(N): one `ecrecover` + watermark
+    ///         SSTOREs per leg), but the three-bucket `FeeRouter.routeSettlement`
+    ///         split — the gas-dominant part, and the per-channel dust floor — runs
+    ///         once over the aggregate. This is economically identical to N single
+    ///         `withdraw`s: every leg is redeemed by the same operator
+    ///         (`msg.sender`, required to be each channel's `provider`) and the
+    ///         router split is linear in amount, so `_route(op, ΣbytesDelta,
+    ///         ΣamountDelta)` credits the same buckets and served-byte weight as N
+    ///         separate `_route`s would.
+    /// @dev Reverts if the summed routable delta is zero (an empty batch, or every
+    ///      leg already fully withdrawn) — `_route`/`FeeRouter` reject a zero-amount
+    ///      settlement, and there is nothing to redeem. Per-channel granularity is
+    ///      preserved: a `ChannelWithdrawn` event is emitted inside the loop for
+    ///      every leg. All watermark writes precede the single external `_route`
+    ///      (checks-effects-interactions); `nonReentrant` guards the whole batch.
+    ///      A repeated `channelId` across legs is handled correctly — the in-loop
+    ///      watermark writes make each later occurrence see the advanced state, so
+    ///      strict monotonicity (`_advanceClaimWatermark(strictNonce=true)`) is
+    ///      enforced across duplicates just as across successive single `withdraw`s.
+    // slither-disable-next-line reentrancy-no-eth
+    function withdrawMany(WithdrawArgs[] calldata args) external nonReentrant {
+        uint256 totalDelta = 0;
+        uint256 totalBytesDelta = 0;
+        for (uint256 i = 0; i < args.length; i++) {
+            WithdrawArgs calldata arg = args[i];
+            Channel storage ch = channels[arg.channelId];
+            _requireOpenAndUnexpired(ch);
+            if (msg.sender != ch.provider) revert NotChannelParty();
+
+            _verifyVoucher(arg.channelId, arg.amount, arg.nonce, arg.bytesDelivered, ch.voucherSigner, arg.signature);
+            // Strict monotonicity against the shared claim watermark (invariant 4).
+            _advanceClaimWatermark(ch, arg.amount, arg.nonce, arg.bytesDelivered, true);
+
+            // Capture each leg's routed delta against its PRE-call withdrawal
+            // watermark, then commit the watermark before the aggregate route.
+            uint256 delta = arg.amount - ch.withdrawnAmount;
+            uint256 bytesDelta = arg.bytesDelivered - ch.withdrawnBytes;
+            ch.withdrawnAmount = arg.amount;
+            ch.withdrawnBytes = arg.bytesDelivered;
+
+            totalDelta += delta;
+            totalBytesDelta += bytesDelta;
+
+            emit ChannelWithdrawn(arg.channelId, msg.sender, delta, bytesDelta, arg.amount);
+        }
+
+        // One aggregate route for all legs: every leg shares the operator
+        // (`msg.sender`), so a single `_route` is equivalent to N per-leg ones.
+        if (totalDelta == 0) revert NothingToWithdraw();
+        _route(msg.sender, totalBytesDelta, totalDelta);
+    }
+
     /// @notice Provider-only: redeem the accrued delta of a client-signed voucher
     ///         while the channel stays open. Routes the delta through `FeeRouter`
     ///         in the same transaction; no dispute window — a signed, monotonic
