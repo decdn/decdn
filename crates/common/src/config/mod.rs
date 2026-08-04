@@ -83,6 +83,12 @@ const MIN_EVENT_POLL_INTERVAL_MS: u64 = 250;
 /// At this size the ~$0.10 `withdraw` gas is a few percent of the redeemed
 /// amount while bounding unsettled exposure to ~1 USDC per channel (#327).
 const DEFAULT_REDEEM_THRESHOLD_MICRO_USDC: u64 = 1_000_000;
+/// Default self-defense-dispute residual floor: 0.1 USDC (`100_000` `µUSDC`,
+/// #1586). The node reacts to a stale channel close by submitting its
+/// higher-nonce voucher only when the recoverable residual clears this, so a
+/// dust residual never costs more on-chain gas than it recovers. Small — L2
+/// dispute gas is cheap — but non-zero so a near-zero recovery is skipped.
+const DEFAULT_DISPUTE_MIN_RESIDUAL_MICRO_USDC: u64 = 100_000;
 /// Default first-contact `openChannel` deposit: 0.5 USDC (`500_000` `µUSDC`).
 /// Kept small so an untried node holds little of the buyer's capital on first
 /// contact.
@@ -1492,6 +1498,13 @@ fn resolve_blockchain_into(
                 .to_string()
         },
     );
+    // Always-on self-defense reaction (#1586): unlike the auto-settlement
+    // triggers this defaults rather than disabling when absent, and `0` is a
+    // legal value (disable the gas-cost floor — dispute any positive residual),
+    // so there is no `> 0` check.
+    let settlement_dispute_min_residual_micro_usdc = file
+        .and_then(|b| b.settlement_dispute_min_residual_micro_usdc)
+        .unwrap_or(DEFAULT_DISPUTE_MIN_RESIDUAL_MICRO_USDC);
 
     // CLI/env only — no TOML field. `expand_tilde` for parity with the
     // keystore path itself. Existence check is intentionally deferred to
@@ -1521,6 +1534,7 @@ fn resolve_blockchain_into(
         buyer_max_approve,
         settlement_auto_threshold_micro_usdc,
         settlement_auto_by_voucher_nonce_span,
+        settlement_dispute_min_residual_micro_usdc,
     }
 }
 

@@ -9,14 +9,15 @@
 //!
 //!   1. **On-chain acceptance of the normalized voucher signature `v`-byte** —
 //!      a real client-signed voucher must be accepted by the contract's
-//!      `ECDSA.recover` when the node submits `withdraw` / `closeChannel`.
+//!      `ECDSA.recover` when the node submits `withdraw` / `closeChannel` /
+//!      `disputeChannel`.
 //!   2. **Live event decode** — the [`PaymentChannelService`] watcher's
 //!      subscribe+decode path running against a live RPC. `ChannelOpened` and
 //!      `ChannelSettled` decode are asserted directly (via the resulting store
-//!      transitions — persist then forget). `ChannelCloseInitiated` is
-//!      observe-only in the watcher (no store side-effect), so the test
-//!      exercises it but verifies only the resulting on-chain `Closing` status,
-//!      not the decode itself.
+//!      transitions — persist then forget). `ChannelCloseInitiated` drives the
+//!      self-defense dispute reaction (#1586): the test closes channel 2 at a
+//!      stale watermark and asserts the watcher reacts with `disputeChannel`,
+//!      ratcheting the on-chain claim up to the node's persisted voucher.
 //!
 //! ## Shape
 //!
@@ -36,11 +37,14 @@
 //!    (`getChannel().withdrawnAmount` advances) and `FeeRouter.bytesPerEpoch`
 //!    increments.
 //! 5. Channel 2 — deliver a claim *below* the redeem threshold (stays
-//!    un-redeemed); close it on-chain (assert the `Closing` status) while the
-//!    settlement watcher stays alive; after the dispute window `settleChannel`
-//!    → assert the watcher decodes `ChannelSettled` and `forget`s the row from
-//!    the store. (The service's own graceful-shutdown close path — which now
-//!    cancels the watcher — is exercised after the buyer path, before channel 3.)
+//!    un-redeemed); close it on-chain WITHOUT a voucher (a stale `claimedNonce
+//!    == 0` watermark) while the settlement watcher stays alive → assert the
+//!    watcher self-defense-disputes (#1586), ratcheting `claimedNonce`/
+//!    `claimedAmount` up to the node's persisted voucher; then after the dispute
+//!    window `settleChannel` → assert the watcher decodes `ChannelSettled` and
+//!    `forget`s the row from the store. (The service's own graceful-shutdown
+//!    close path — which now cancels the watcher — is exercised after the buyer
+//!    path, before channel 3.)
 //! 6. Buyer path (#744) — the `client` account drives a [`BuyerChannelService`]
 //!    against the registered provider: `open_or_reuse_channel` opens a channel
 //!    on-chain, a delivery signs vouchers via the service-produced
@@ -132,6 +136,11 @@ const MIB: usize = 1024 * 1024;
 //    (its 1 MiB interval voucher, 10 µUSDC, already crosses the threshold)
 //  - channel 2: 0.5 MiB delivered → claim = ceil(0.5*10) =  5 µUSDC < 10
 const REDEEM_THRESHOLD_MICRO_USDC: u64 = 10;
+// Self-defense-dispute residual floor (#1586) sized well below channel 2's
+// ~5 µUSDC stale-close residual, so the node's dispute reaction fires in this
+// test's tiny-amount economics; a no-op at the other call sites (no stale close
+// occurs there, so `should_dispute` returns `None` on the equal-nonce close).
+const DISPUTE_MIN_RESIDUAL_MICRO_USDC: u64 = 1;
 const DEPOSIT_MICRO_USDC: u64 = 10_000_000; // 10 USDC (ADR 003 recommended minimum)
 const TOPUP_MICRO_USDC: u64 = 2_000_000; // 2 USDC added via topUp in the buyer path (#744)
 // Warp past any governable channel lifetime (max 365 days) so `reclaimExpired`
@@ -584,6 +593,7 @@ async fn run_e2e() -> anyhow::Result<()> {
         Arc::clone(&handler),
         U256::from(REDEEM_THRESHOLD_MICRO_USDC),
         AutoSettleConfig::default(),
+        U256::from(DISPUTE_MIN_RESIDUAL_MICRO_USDC),
         Duration::from_millis(250),
         e2e_head(&node_provider),
         Arc::clone(&metrics),
@@ -786,10 +796,12 @@ async fn run_e2e() -> anyhow::Result<()> {
         "channel 2 should be below the redeem threshold, but was withdrawn"
     );
 
-    // Close the un-redeemed channel 2 directly on-chain (node = provider party,
-    // no voucher — `claimedNonce == 0` since it stayed below the redeem
-    // threshold) to open the dispute window while the settlement watcher stays
-    // ALIVE, so GAP 2 below can observe the live `ChannelSettled`. The
+    // Close the un-redeemed channel 2 directly on-chain WITHOUT a voucher (so
+    // the on-chain watermark stays `claimedNonce == 0 / claimedAmount == 0`,
+    // strictly staler than the node's persisted nonce-1 voucher). This
+    // is the exact "stale close" the self-defense dispute reaction (#1586)
+    // targets. The settlement watcher stays ALIVE so it can both react with
+    // `disputeChannel` and (below) observe the live `ChannelSettled`. The
     // service-driven shutdown-close path is exercised after GAP 2 (it now
     // cancels the watcher, so it cannot run before an assertion that needs the
     // watcher). `withdraw` on channel 1 above already proved a persisted voucher
@@ -814,6 +826,38 @@ async fn run_e2e() -> anyhow::Result<()> {
     anyhow::ensure!(
         closing.is_some(),
         "closeChannelWithoutVoucher did not move channel 2 to Closing"
+    );
+
+    // #1586 — the watcher observes `ChannelCloseInitiated`, sees its persisted
+    // nonce-1 voucher out-ranks the stale on-chain `claimedNonce == 0`, and (the
+    // few-µUSDC residual clearing the tiny `DISPUTE_MIN_RESIDUAL_MICRO_USDC`
+    // floor) reacts with `disputeChannel` INSIDE the window — ratcheting the
+    // on-chain claim up to the node's voucher before we warp past the deadline.
+    let disputed = poll_until(Duration::from_secs(60), || {
+        let pc = pc_read.clone();
+        async move {
+            pc.getChannel(id2)
+                .call()
+                .await
+                .ok()
+                .filter(|ch| ch.claimedNonce == U256::from(1u64))
+        }
+    })
+    .await;
+    let disputed = disputed
+        .context("watcher did not self-defense-dispute the stale channel-2 close (#1586)")?;
+    // Assert against the node's actual persisted voucher amount rather than a
+    // hardcoded figure: the exact µUSDC depends on voucher-interval rounding of
+    // the 0.5 MiB claim, and the point of the check is that the dispute ratcheted
+    // the stale on-chain `claimedAmount == 0` up to the node's voucher.
+    let node_voucher_amount = store
+        .get(id2)?
+        .context("channel 2 state missing from store")?
+        .last_amount();
+    anyhow::ensure!(
+        !node_voucher_amount.is_zero() && disputed.claimedAmount == node_voucher_amount,
+        "dispute must ratchet channel 2's claim to the node's voucher amount {node_voucher_amount}, got {}",
+        disputed.claimedAmount
     );
 
     // Advance past the dispute window and settle (callable by anyone).
@@ -1083,6 +1127,7 @@ async fn run_e2e() -> anyhow::Result<()> {
             value_threshold: Some(U256::from(5u64)),
             voucher_nonce_span_threshold: None,
         },
+        U256::from(DISPUTE_MIN_RESIDUAL_MICRO_USDC),
         Duration::from_millis(250),
         e2e_head(&node_provider),
         Arc::clone(&metrics),
@@ -1324,6 +1369,7 @@ async fn run_e2e() -> anyhow::Result<()> {
         Arc::clone(&handler),
         U256::from(REDEEM_THRESHOLD_MICRO_USDC),
         AutoSettleConfig::default(),
+        U256::from(DISPUTE_MIN_RESIDUAL_MICRO_USDC),
         Duration::from_millis(250),
         e2e_head(&node_provider),
         Arc::clone(&metrics),
@@ -1411,6 +1457,7 @@ async fn run_e2e() -> anyhow::Result<()> {
         Arc::clone(&handler),
         U256::from(REDEEM_THRESHOLD_MICRO_USDC),
         AutoSettleConfig::default(),
+        U256::from(DISPUTE_MIN_RESIDUAL_MICRO_USDC),
         Duration::from_millis(250),
         e2e_head(&node_provider),
         Arc::clone(&metrics),

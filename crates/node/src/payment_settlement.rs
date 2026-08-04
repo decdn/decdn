@@ -126,6 +126,16 @@ const EXPIRY_CLOSE_AHEAD_SECS: u64 = 6 * 3_600;
 /// `as_rsy`-style source).
 const ETH_V_OFFSET: u8 = 27;
 
+/// Bounded receipt wait for the self-defense `disputeChannel` (#1586). The
+/// dispute runs INLINE in the settlement watcher's `ChannelCloseInitiated`
+/// handler, so an unbounded wait on a stuck/dropped/replaced tx would wedge the
+/// tick and stall subsequent event processing — contradicting the best-effort
+/// intent. A lapse yields [`TxOutcome::Timeout`], treated as a non-fatal failure
+/// (the tx may still mine later; the residual is at worst lost, never
+/// double-spent). Sized like `buyer_channel`'s `RECLAIM_RECEIPT_TIMEOUT` — well
+/// above a normal L2 inclusion, short enough not to hold the tick for long.
+const DISPUTE_RECEIPT_TIMEOUT: Duration = Duration::from_mins(3);
+
 /// Current Unix time in seconds for on-chain expiry comparisons. A broken
 /// system clock (time before the epoch) yields `0`, which makes every channel
 /// look not-yet-expired — the safe direction (no spurious early closes / serve
@@ -246,6 +256,7 @@ impl<P: Provider + Clone + 'static> PaymentChannelService<P> {
         handler: Arc<ClientHandler>,
         redeem_threshold: U256,
         auto_settle: AutoSettleConfig,
+        dispute_min_residual: U256,
         event_poll_interval: Duration,
         head: Arc<dyn HeadSource>,
         metrics: Arc<Metrics>,
@@ -294,6 +305,7 @@ impl<P: Provider + Clone + 'static> PaymentChannelService<P> {
             handler: Arc::clone(&handler),
             pending_store: Arc::clone(&pending_store),
             metrics: Arc::clone(&metrics),
+            dispute_min_residual,
         };
         let cfg = WatcherConfig::new(
             head,
@@ -731,6 +743,43 @@ fn should_auto_settle(
     false
 }
 
+/// Pure self-defense-dispute decision (#1586): given the node's latest
+/// off-chain voucher watermark and the on-chain post-close claim watermark,
+/// decide whether submitting `disputeChannel` is worth it. Returns
+/// `Some(residual)` — the recoverable amount, so the caller can log it — when
+/// **both** hold:
+///
+/// - `voucher_nonce > onchain_claimed_nonce` (STRICT): the contract's
+///   `disputeChannel` advances the watermark with `strictNonce = true`, so an
+///   equal-or-lower voucher nonce would revert. This is what distinguishes a
+///   stale close (a counterparty closed at an older watermark) from an honest
+///   one (closed at the node's own latest, or higher).
+/// - `residual = voucher_amount − onchain_claimed_amount >= min_residual`, and
+///   `residual` is non-zero: the residual is the USDC the dispute claws back,
+///   and it must clear the estimated on-chain gas-cost floor (`min_residual`,
+///   `µUSDC`) or disputing costs more than it recovers. The explicit non-zero
+///   guard means a `min_residual` of 0 (operator disabling the floor) still
+///   never triggers a zero-recovery dispute (a byte-only watermark bump).
+///
+/// `>=` matches the sibling settlement thresholds ([`should_auto_settle`]). Pure
+/// so the policy is unit-testable without a live provider.
+fn should_dispute(
+    voucher_nonce: U256,
+    voucher_amount: U256,
+    onchain_claimed_nonce: U256,
+    onchain_claimed_amount: U256,
+    min_residual: U256,
+) -> Option<U256> {
+    if voucher_nonce <= onchain_claimed_nonce {
+        return None;
+    }
+    let residual = voucher_amount.saturating_sub(onchain_claimed_amount);
+    if residual.is_zero() || residual < min_residual {
+        return None;
+    }
+    Some(residual)
+}
+
 /// Pure cheap-pre-check decision: given the off-chain voucher watermark
 /// (`last_amount`, `last_nonce`) and the cached on-chain `(withdrawn, claimed
 /// nonce)` lower bounds, decide whether the `getChannel` RPC can be skipped this
@@ -927,6 +976,132 @@ async fn reconcile_closing_channel<P: Provider + Clone>(
     Ok(())
 }
 
+/// Self-defense reaction to a `ChannelCloseInitiated` (#1586). When a
+/// counterparty closes one of this node's channels at a watermark staler than
+/// the node's latest voucher, submit that voucher via `disputeChannel` inside
+/// the dispute window so the residual (`myAmount − onchainClaimedAmount`) is not
+/// stranded at settlement.
+///
+/// Entirely best-effort — it never returns `Err`, so a benign revert (the window
+/// closed between the read and the mine, or another party already ratcheted the
+/// watermark to/above ours) does not abort the watcher tick and re-scan the
+/// window. It runs INLINE in the watcher's `ChannelCloseInitiated` handler, so
+/// the receipt wait is bounded by [`DISPUTE_RECEIPT_TIMEOUT`] — a stuck tx must
+/// not wedge the tick (a timeout is treated as a non-fatal failure). Gated by
+/// [`should_dispute`]: a strictly-higher voucher nonce AND a
+/// residual clearing `dispute_min_residual` (the estimated gas-cost floor). The
+/// `getChannel` read is bounded by [`timed`] (payment-critical path; an
+/// unbounded read against a stalled provider would wedge the tick), and the
+/// dispute-window check uses [`unix_now`] the same way the expiry/settle gates
+/// do — a fast-skewed clock only skips a still-open dispute (the safe direction:
+/// lose the residual, burn no gas), with the contract's own `block.timestamp`
+/// check the authoritative backstop.
+#[allow(clippy::cognitive_complexity)]
+async fn maybe_dispute_stale_close<P: Provider + Clone>(
+    contract: &PaymentChannel::PaymentChannelInstance<P>,
+    handler: &Arc<ClientHandler>,
+    self_address: Address,
+    dispute_min_residual: U256,
+    channel_id: ChannelId,
+    metrics: &Arc<Metrics>,
+) {
+    let ch = match timed(None, "getChannel", contract.getChannel(channel_id).call()).await {
+        Ok(ch) => ch,
+        Err(err) => {
+            warn!(err = %sanitize_rpc_display(&err), %channel_id, "dispute: getChannel failed; skipping");
+            return;
+        }
+    };
+    // Only our own channels, and only while still in the dispute window.
+    if ch.provider != self_address || !matches!(ch.status, PaymentChannel::Status::Closing) {
+        return;
+    }
+    if unix_now() >= ch.disputeDeadline {
+        debug!(%channel_id, "dispute window already closed; skipping");
+        return;
+    }
+    // Load the node's latest persisted voucher (nonce / amount / bytes / sig).
+    let Some(state) = handler.channel_state_snapshot(channel_id).await else {
+        return; // not a channel this node tracks
+    };
+    let Some(sig_bytes) = state.last_signature() else {
+        return; // no voucher to submit
+    };
+    let Some(residual) = should_dispute(
+        state.last_nonce(),
+        state.last_amount(),
+        ch.claimedNonce,
+        ch.claimedAmount,
+        dispute_min_residual,
+    ) else {
+        return; // honest close (equal/higher nonce) or residual below the floor
+    };
+    let sig = Bytes::from(normalize_voucher_signature(sig_bytes));
+    info!(
+        %channel_id,
+        %residual,
+        voucher_nonce = %state.last_nonce(),
+        onchain_nonce = %ch.claimedNonce,
+        "disputing stale channel close with higher-nonce voucher"
+    );
+    match send_and_await_receipt(
+        contract
+            .disputeChannel(
+                channel_id,
+                state.last_amount(),
+                state.last_nonce(),
+                state.last_bytes_delivered(),
+                sig,
+            )
+            .send()
+            .await,
+        Some(DISPUTE_RECEIPT_TIMEOUT),
+    )
+    .await
+    {
+        TxOutcome::Landed(receipt) => {
+            metrics.settlement_dispute_ok();
+            info!(
+                %channel_id,
+                tx = %receipt.transaction_hash,
+                %residual,
+                "disputeChannel landed; claim watermark ratcheted up"
+            );
+        }
+        TxOutcome::Reverted(receipt) => {
+            // Benign in the expected races: the window closed between our read
+            // and the mine, or another party already advanced the watermark
+            // to/above ours. The close still settles at whatever watermark stands.
+            metrics.settlement_dispute_failure();
+            warn!(
+                %channel_id,
+                tx = %receipt.transaction_hash,
+                "disputeChannel reverted (window closed or already-higher watermark); leaving close as-is"
+            );
+        }
+        TxOutcome::SendErr(err) => {
+            metrics.settlement_dispute_failure();
+            warn!(err = %sanitize_rpc_display(&err), %channel_id, "disputeChannel send failed");
+        }
+        TxOutcome::ReceiptErr(err) => {
+            metrics.settlement_dispute_failure();
+            warn!(err = %sanitize_rpc_display(&err), %channel_id, "disputeChannel receipt failed");
+        }
+        TxOutcome::Timeout => {
+            // The receipt wait is bounded by `DISPUTE_RECEIPT_TIMEOUT` so a
+            // stuck/dropped tx cannot wedge the watcher tick. Non-fatal: the tx
+            // may still mine later, so the residual is at worst lost, never
+            // double-spent.
+            metrics.settlement_dispute_failure();
+            warn!(
+                %channel_id,
+                timeout = ?DISPUTE_RECEIPT_TIMEOUT,
+                "disputeChannel receipt wait elapsed; leaving close as-is"
+            );
+        }
+    }
+}
+
 /// The settlement watcher's cursor start: resume the durable
 /// [`CheckpointKey::ChannelOpened`] floor (#751); a first-ever boot (cold store)
 /// anchors at **head** ([`ColdStart::Head`]) — no channel toward this node can
@@ -969,6 +1144,11 @@ struct SettlementSink<P: Provider + Clone> {
     handler: Arc<ClientHandler>,
     pending_store: Arc<dyn PendingSettleStore>,
     metrics: Arc<Metrics>,
+    /// Estimated on-chain gas-cost floor (`µUSDC`) below which a self-defense
+    /// `disputeChannel` is not worth submitting (#1586). The recoverable
+    /// residual `myAmount − onchainClaimedAmount` must clear this for the node
+    /// to react to a stale close; see [`should_dispute`].
+    dispute_min_residual: U256,
 }
 
 impl<P: Provider + Clone> LogSink for SettlementSink<P> {
@@ -1061,11 +1241,10 @@ impl<P: Provider + Clone> LogSink for SettlementSink<P> {
                             return Ok(());
                         }
                     };
-                // Dispute monitor is deferred (#324); observe-only here.
                 debug!(
                     channel_id = %event.channelId,
                     initiator = %event.initiator,
-                    "ChannelCloseInitiated observed (dispute monitor deferred, #324)"
+                    "ChannelCloseInitiated observed"
                 );
                 // Subsumes the old closing-reconciliation backfill (#839): the
                 // close log is scanned by the same poller. `ChannelCloseInitiated`
@@ -1085,6 +1264,23 @@ impl<P: Provider + Clone> LogSink for SettlementSink<P> {
                     return Err(err)
                         .with_context(|| format!("reconcile closing channel {}", event.channelId));
                 }
+                // Self-defense dispute (#1586): if this close is stale relative
+                // to the node's latest voucher, ratchet the claim up before the
+                // window closes. Best-effort and INDEPENDENT of the reconcile
+                // above — a benign revert (window closed, or another party
+                // already disputed higher) must not fail the tick and re-scan
+                // the window, so it never returns `Err`. Runs after the reconcile
+                // so the pending-settle obligation is already durable if the
+                // dispute (or a later settle) needs it.
+                maybe_dispute_stale_close(
+                    &self.contract,
+                    &self.handler,
+                    self.self_address,
+                    self.dispute_min_residual,
+                    event.channelId,
+                    &self.metrics,
+                )
+                .await;
             }
             // Unreachable today (the filter's topic0 OR-set bounds the inputs);
             // don't panic (anti-panic policy), log so a future OR-set drift leaves
@@ -2992,6 +3188,101 @@ mod tests {
         // Exactly at the span threshold settles (>= comparison).
         assert!(should_auto_settle(&cfg, U256::ZERO, 100));
         assert!(should_auto_settle(&cfg, U256::ZERO, 101));
+    }
+
+    #[test]
+    fn dispute_fires_on_stale_close() {
+        // #1586. The node holds voucher nonce 5 / 5_000_000 µUSDC; a
+        // counterparty closed at a stale watermark (nonce 2 / 1_000_000). The
+        // residual (4_000_000) clears the 100_000 floor, so the node disputes
+        // and the returned residual is what it recovers.
+        assert_eq!(
+            should_dispute(
+                U256::from(5u64),
+                U256::from(5_000_000u64),
+                U256::from(2u64),
+                U256::from(1_000_000u64),
+                U256::from(100_000u64),
+            ),
+            Some(U256::from(4_000_000u64)),
+        );
+    }
+
+    #[test]
+    fn dispute_noop_on_honest_close_equal_nonce() {
+        // The counterparty closed at the node's own latest nonce: there is
+        // nothing higher to submit (the contract's `disputeChannel` requires a
+        // STRICTLY higher nonce), so the node must not dispute even though a
+        // (here nonexistent) residual would clear the floor.
+        assert_eq!(
+            should_dispute(
+                U256::from(5u64),
+                U256::from(5_000_000u64),
+                U256::from(5u64),
+                U256::from(5_000_000u64),
+                U256::from(100_000u64),
+            ),
+            None,
+        );
+        // A close at a HIGHER nonce than the node holds (the counterparty has a
+        // fresher voucher) is likewise a no-op.
+        assert_eq!(
+            should_dispute(
+                U256::from(5u64),
+                U256::from(5_000_000u64),
+                U256::from(6u64),
+                U256::from(6_000_000u64),
+                U256::from(100_000u64),
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn dispute_noop_when_residual_below_floor() {
+        // Nonce is strictly higher, but the recoverable residual (5 µUSDC) sits
+        // below the estimated gas-cost floor (100_000), so disputing would burn
+        // more gas than it recovers — skip it.
+        assert_eq!(
+            should_dispute(
+                U256::from(2u64),
+                U256::from(5u64),
+                U256::from(1u64),
+                U256::ZERO,
+                U256::from(100_000u64),
+            ),
+            None,
+        );
+        // Exactly at the floor is worth it (>= comparison, matching the sibling
+        // settlement thresholds).
+        assert_eq!(
+            should_dispute(
+                U256::from(2u64),
+                U256::from(100_000u64),
+                U256::from(1u64),
+                U256::ZERO,
+                U256::from(100_000u64),
+            ),
+            Some(U256::from(100_000u64)),
+        );
+    }
+
+    #[test]
+    fn dispute_noop_on_zero_residual_even_with_zero_floor() {
+        // A higher nonce that advances no amount (a byte-only watermark bump)
+        // recovers nothing: disputing is pure gas waste. Guard it explicitly so
+        // a floor of 0 (operator disabling the floor) still cannot trigger a
+        // zero-recovery dispute.
+        assert_eq!(
+            should_dispute(
+                U256::from(3u64),
+                U256::from(1_000_000u64),
+                U256::from(2u64),
+                U256::from(1_000_000u64),
+                U256::ZERO,
+            ),
+            None,
+        );
     }
 
     #[test]

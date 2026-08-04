@@ -72,6 +72,7 @@ fn seed_resolved(rate: u64, level: LogLevel) -> ResolvedConfig {
             buyer_max_approve: true,
             settlement_auto_threshold_micro_usdc: None,
             settlement_auto_by_voucher_nonce_span: None,
+            settlement_dispute_min_residual_micro_usdc: 100_000,
             slash_judge_address: "0x0000000000000000000000000000000000000003".to_string(),
             content_blacklist_address: None,
             content_blacklist_poll_interval_sec: 600,
