@@ -104,21 +104,51 @@ impl SendOutcome {
 
 /// Whether a `send()` failure leaves the transaction's fate genuinely unknown.
 ///
-/// A JSON-RPC error *response* means the node processed the request and rejected
-/// it — a pre-flight gas-estimate revert (the modal `createNamespace` /
-/// `addOrigin` failure), a stale nonce, an under-funded account — so nothing
-/// entered the mempool. Everything else is transport-shaped: a timeout, a reset,
-/// a 5xx from an RPC load balancer, a truncated body. There the request may have
-/// reached the node and broadcast the transaction before the response was lost,
-/// and `eth_sendRawTransaction` is not idempotent from the client's view, so the
+/// The question is whether the request could have reached the node and broadcast
+/// the transaction before its response was lost. Two kinds of failure are
+/// definite rejections that broadcast nothing:
+///
+/// - a JSON-RPC error *response* — the node processed the request and rejected
+///   it (a pre-flight gas-estimate revert, the modal `createNamespace` /
+///   `addOrigin` failure; a stale nonce; an under-funded account);
+/// - a client-side fault raised before the request left the process (an
+///   unsupported feature, a local-usage error, a body that failed to serialize),
+///   or an HTTP 4xx where the gateway refused the request outright (a bad path,
+///   an expired key) without forwarding it to the node.
+///
+/// Everything else is genuinely uncertain: a timeout, a connection reset, an HTTP
+/// 5xx from an RPC load balancer, or a response body that could not be
+/// deserialized. There the transaction may already be in the mempool, and
+/// `eth_sendRawTransaction` is not idempotent from the client's view, so the
 /// caller must not report "nothing happened".
+///
+/// The `as_error_resp().is_none()` shorthand is deliberately NOT used: it would
+/// fold the local faults above into the uncertain bucket, warning about a
+/// possibly-broadcast transaction on a bug that never touched the wire.
+///
+/// `const` because the workspace `missing_const_for_fn` clippy lint requires it —
+/// the body is a pure classification with no non-const calls.
 const fn send_broadcast_unknown(err: &ContractError) -> bool {
-    match err {
-        // `as_error_resp()` is `Some` only for a JSON-RPC error response; a
-        // transport kind (connection error, HTTP 5xx, deser failure) is `None`.
-        ContractError::TransportError(e) => e.as_error_resp().is_none(),
-        // ABI and pending-transaction errors are local — nothing reached the wire.
-        _ => false,
+    use alloy::transports::{RpcError, TransportErrorKind};
+
+    let ContractError::TransportError(rpc) = err else {
+        // ABI, pending-transaction, and other contract-level faults are local —
+        // nothing reached the wire.
+        return false;
+    };
+    match rpc {
+        // The node answered, or the client failed before sending: a definite
+        // rejection that broadcast nothing.
+        RpcError::ErrorResp(_)
+        | RpcError::UnsupportedFeature(_)
+        | RpcError::LocalUsageError(_)
+        | RpcError::SerError(_) => false,
+        // An HTTP 4xx is the gateway refusing the request (bad path, bad key)
+        // before it reaches the node; a 5xx may have broadcast before failing.
+        RpcError::Transport(TransportErrorKind::HttpError(h)) => h.status >= 500,
+        // Timeouts, resets, a null response, an undeserializable body: the
+        // request may have been processed before the answer was lost.
+        _ => true,
     }
 }
 
@@ -352,11 +382,23 @@ mod tests {
         assert!(!SendOutcome::NotSent.maybe_effected());
     }
 
-    /// A pre-flight gas-estimate revert (the modal `createNamespace` /
-    /// `addOrigin` failure) comes back as a JSON-RPC error response: the node
-    /// answered, so nothing was broadcast and re-running is safe.
+    /// An HTTP transport error carrying `status`, for the 4xx/5xx split.
+    fn http_error(status: u16) -> ContractError {
+        ContractError::TransportError(alloy::transports::RpcError::Transport(
+            alloy::transports::TransportErrorKind::HttpError(alloy::transports::HttpError {
+                status,
+                body: String::new(),
+            }),
+        ))
+    }
+
+    /// Failures that broadcast nothing: a JSON-RPC error *response* (the node
+    /// answered and rejected), a client-side fault that never left the process,
+    /// and an HTTP 4xx where the gateway refused the request. Re-running any of
+    /// them is safe, so none may warn about a possibly-broadcast transaction.
     #[test]
-    fn a_json_rpc_error_response_is_a_rejection_not_a_broadcast() {
+    fn a_rejection_is_not_a_broadcast() {
+        // The modal case: a pre-flight gas-estimate revert.
         assert!(!send_broadcast_unknown(&error_resp(
             3,
             "execution reverted"
@@ -365,12 +407,21 @@ mod tests {
             -32000,
             "nonce too low"
         )));
-        // A local contract error never reaches the wire either.
+        // Local faults raised before the request leaves the client — these must
+        // NOT be lumped into the uncertain bucket by an `as_error_resp()` shortcut.
+        assert!(!send_broadcast_unknown(&ContractError::TransportError(
+            alloy::transports::RpcError::UnsupportedFeature("batching")
+        )));
+        // A non-transport contract error is local too.
         assert!(!send_broadcast_unknown(&ContractError::ContractNotDeployed));
+        // HTTP 4xx: the gateway refused the request (bad path, expired key).
+        assert!(!send_broadcast_unknown(&http_error(401)));
+        assert!(!send_broadcast_unknown(&http_error(404)));
     }
 
-    /// A timeout / reset / 5xx leaves the tx's fate unknown — it may be in the
-    /// mempool. Classifying this as a clean rejection is the #1577 bug.
+    /// A timeout / reset / 5xx / undeserializable body leaves the tx's fate
+    /// unknown — it may be in the mempool. Classifying this as a clean rejection
+    /// is the #1577 bug.
     #[test]
     fn a_transport_failure_leaves_the_broadcast_unknown() {
         let transport = ContractError::TransportError(
@@ -381,6 +432,9 @@ mod tests {
         assert!(send_broadcast_unknown(&ContractError::TransportError(
             alloy::transports::RpcError::NullResp
         )));
+        // HTTP 5xx: the node may have broadcast before the load balancer failed.
+        assert!(send_broadcast_unknown(&http_error(502)));
+        assert!(send_broadcast_unknown(&http_error(500)));
     }
 
     /// The whole point: an `Err` from `work` must not skip the cleanup. This is
