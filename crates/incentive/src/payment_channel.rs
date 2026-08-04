@@ -11,8 +11,10 @@
 //!   `withdrawnAmount` watermark when deciding whether a redemption delta
 //!   crosses the threshold);
 //! - seller writes: `withdraw` (redeem accrued earnings while the channel
-//!   stays open — no dispute window), `closeChannel` (initiate close with the
-//!   latest voucher), and `settleChannel` (finalize after the window);
+//!   stays open — no dispute window), `withdrawMany` (batch N single-channel
+//!   redemptions into one tx with a single aggregated `FeeRouter` route — the
+//!   redeem sweep's per-tick collapse, #1587), `closeChannel` (initiate close
+//!   with the latest voucher), and `settleChannel` (finalize after the window);
 //! - buyer writes (#744): `openChannel` (open a channel against an upstream
 //!   provider on first cache-miss pull), `topUp` (extend an existing
 //!   channel's deposit), and `reclaimExpired` (recover the deposit of an
@@ -91,6 +93,18 @@ mod sol_types {
                 uint256 withdrawnBytes;
             }
 
+            /// One leg of a batched `withdrawMany` redemption — the same
+            /// `(channelId, amount, nonce, bytesDelivered, signature)` tuple a
+            /// single `withdraw` takes. Field order is part of the ABI tuple; do
+            /// not rearrange.
+            struct WithdrawArgs {
+                bytes32 channelId;
+                uint256 amount;
+                uint256 nonce;
+                uint256 bytesDelivered;
+                bytes signature;
+            }
+
             // -----------------------------------------------------------------
             // View functions
             // -----------------------------------------------------------------
@@ -157,6 +171,17 @@ mod sol_types {
                 uint256 bytesDelivered,
                 bytes calldata signature
             ) external;
+
+            /// Redeem many channels' accrued deltas in one transaction, routing
+            /// the summed delta through `FeeRouter` a single time (#1587). Each
+            /// leg is verified and its watermark advanced exactly as a standalone
+            /// `withdraw`, but the gas-dominant three-bucket router split runs
+            /// once over the aggregate — economically identical to N single
+            /// `withdraw`s (same operator per leg, split linear in amount).
+            /// Reverts if the summed routable delta is zero. Caller MUST be the
+            /// `provider` of every leg's channel. The node's redeem sweep uses
+            /// this to collapse a tick's N redemptions into one tx.
+            function withdrawMany(WithdrawArgs[] calldata args) external;
 
             /// Initiate channel close with the latest voucher; starts the
             /// dispute window. Callable by client or provider.
