@@ -20,6 +20,10 @@ fn env_u64(k: &str, default: u64) -> anyhow::Result<u64> {
 /// variables. See `from_env` for the exact variable names and defaults.
 pub struct ServerConfig {
     pub bind: SocketAddr,
+    /// The gateway's own public base URL, e.g. `https://up.decdn.org`. Baked
+    /// into the templated `GET /decdn.sh` installer script (`{{GATEWAY_BASE}}`)
+    /// so end users never set an env var for it.
+    pub public_url: String,
     pub rpc_url: String,
     pub chain_id: u64,
     pub payment_channel: Address,
@@ -47,6 +51,8 @@ impl ServerConfig {
             bind: SocketAddr::from_str(
                 &std::env::var("SPONSOR_BIND").unwrap_or_else(|_| "127.0.0.1:8080".into()),
             )?,
+            public_url: std::env::var("SPONSOR_PUBLIC_URL")
+                .unwrap_or_else(|_| "https://up.decdn.org".into()),
             rpc_url: env("SPONSOR_RPC_URL")?,
             chain_id: env_u64("SPONSOR_CHAIN_ID", 421_614)?,
             payment_channel: Address::from_str(&env("SPONSOR_PAYMENT_CHANNEL_ADDR")?)?,

@@ -5,6 +5,7 @@
 
 pub mod channel;
 pub mod fund;
+pub mod installer;
 pub mod topup;
 
 use std::str::FromStr;
@@ -22,6 +23,7 @@ use crate::state::AppState;
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
+        .route("/decdn.sh", get(installer::get))
         .route("/fund", get(fund::page).post(fund::submit))
         .route("/channel", get(channel::get))
         .route("/topup", post(topup::post))

@@ -292,3 +292,40 @@ async fn topup_happy_path_returns_200_and_deposit() {
     assert_eq!(v["ok"].as_bool(), Some(true));
     assert_eq!(v["deposit_micro_usdc"].as_u64(), Some(3_000_000));
 }
+
+#[tokio::test]
+async fn decdn_sh_serves_templated_installer() {
+    let state = app_state_with_fakes();
+    let rpc_url = state.cfg.rpc_url.clone();
+    let app = sponsord::http::router(state);
+
+    let resp = app
+        .oneshot(
+            Request::get("/decdn.sh")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .expect("content-type header")
+        .to_str()
+        .expect("ascii header");
+    assert!(content_type.starts_with("text/x-shellscript"));
+
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let body = String::from_utf8(bytes.to_vec()).expect("utf8 body");
+    assert!(
+        body.contains(&rpc_url),
+        "body should contain the templated rpc_url"
+    );
+    assert!(
+        !body.contains("{{"),
+        "no placeholder should remain unsubstituted"
+    );
+}

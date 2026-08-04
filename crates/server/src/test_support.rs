@@ -196,6 +196,7 @@ pub fn app_state_with_options(opts: FakeOptions) -> AppState {
         bind: "127.0.0.1:0"
             .parse()
             .unwrap_or_else(|e| panic!("bind addr: {e}")),
+        public_url: "https://up.decdn.org".into(),
         rpc_url: "http://localhost:8545".into(),
         chain_id: 421_614,
         payment_channel: Address::ZERO,
