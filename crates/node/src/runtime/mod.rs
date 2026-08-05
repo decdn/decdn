@@ -1875,6 +1875,13 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
         // Miss pulls open small and graduate on proof (#1497 task 6): the
         // fresh-open deposit is the INITIAL size, not the working target.
         deposit_hint: buyer_initial_deposit,
+        // ...and graduate to the working target when a single pull outruns that
+        // initial deposit mid-stream (#1530). Same target the proactive low-water
+        // refill uses; `0` disables the reactive leg.
+        working_deposit: buyer_working_deposit,
+        event_poll_interval: std::time::Duration::from_millis(
+            cfg.blockchain.event_poll_interval_ms,
+        ),
         lookup: crate::dht::LookupConfig::default(),
         // Own self-attested region for the ADR 030 latency-vs-claim penalty
         // (#1177); `None` disables it (nothing to compare a peer's claim against).

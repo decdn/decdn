@@ -13,15 +13,18 @@
 //! 2. probes each candidate for rate + RTT and ranks them by the combined
 //!    local+network reputation score ([`crate::selection::rank_candidates`]),
 //! 3. opens (or reuses) a buyer payment channel to the best candidate and pulls
-//!    via `stream_fetch`, falling back through up to
-//!    [`crate::selection::MAX_PROVIDER_ATTEMPTS`] providers,
+//!    progressively (`resume::pull_blob`, #1530 — resumable, so a channel that
+//!    runs dry mid-blob is topped up and the pull continues at the paid frontier),
+//!    falling back through up to [`crate::selection::MAX_PROVIDER_ATTEMPTS`]
+//!    providers,
 //! 4. records the per-provider [`Outcome`] into the local reputation score and
 //!    the observation buffer, so the gossip publisher emits reports about the
 //!    upstreams this node pulled from (ADR 008 §Local Score / §Gossip Protocol).
 //!
 //! The cache engine verifies the returned bytes against the content hash and
-//! ingests them, and `stream_fetch` verifies every chunk group of the bao
-//! verified-stream against the content root (ADR 038), so a dishonest provider
+//! ingests them, and the pull's incremental decoder verifies every chunk group of
+//! the bao verified-stream against the content root as it lands (ADR 038, via
+//! `pull_to_sink`), so a dishonest provider
 //! is detected (and scored [`Outcome::Corruption`]) rather than surfaced to the
 //! caller. On the window path the corruption detector is the cache TEE's
 //! verifying decoder; its verdict reaches the scorer via
@@ -37,6 +40,8 @@
 //! [`NodeOrigin::provision`]). Until that set lands — the feature is off, or the
 //! buyer bootstrap failed — `fetch` returns [`OriginFetch::NotFound`], a clean
 //! miss that leaves the handler behaving exactly as it did before pull-through.
+
+mod resume;
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -62,9 +67,10 @@ use crate::buyer_ledgers::BuyerLedgers;
 use crate::client_requester::probe::probe_once;
 use crate::client_requester::{
     BlobTooLargeClaim, ChannelContext, ChannelLedger, Cumulative, HashMismatch, LocalPullFault,
-    PullDeadlines, PullStalled, PullTimeout, RateAboveCeiling, UpstreamPull, UpstreamPullHeader,
-    UpstreamRefused, UpstreamVoucherRejected, VoucherProgress, effective_rate_ceiling,
-    open_progressive_pull as open_progressive_upstream, sign_client_binding, stream_fetch_shared,
+    PullDeadlines, PullStalled, PullTimeout, RateAboveCeiling, ResumeOffsetPastEnd, UpstreamPull,
+    UpstreamPullHeader, UpstreamRefused, UpstreamVoucherRejected, VoucherProgress,
+    effective_rate_ceiling, open_progressive_pull as open_progressive_upstream,
+    sign_client_binding,
 };
 use crate::dht::negative_cache::Hash as DhtHash;
 use crate::dht::routing::{NodeId as DhtNodeId, RoutingTable};
@@ -256,6 +262,22 @@ pub struct NodeOriginConfig {
     /// (`blockchain.buyer_initial_deposit_micro_usdc`); opens at the small initial
     /// deposit rather than the working target. Ignored when a channel is reused.
     pub deposit_hint: U256,
+    /// The larger graduation target a mid-pull reactive top-up raises an exhausted
+    /// channel toward (`blockchain.buyer_working_deposit_micro_usdc`, #1530).
+    ///
+    /// `U256::ZERO` disables the reactive top-up entirely, matching the same
+    /// `0`-disables sentinel the proactive low-water refill uses
+    /// (`crate::buyer_channel::refill_decision`). The two legs graduate to the same
+    /// target; they differ only in what triggers them.
+    pub working_deposit: U256,
+    /// How often this node's chain watcher polls for events
+    /// (`blockchain.event_poll_interval_ms`), used to size the post-top-up settle
+    /// wait (#1530).
+    ///
+    /// The wait is for the UPSTREAM's watcher, not ours, but every node in the
+    /// network runs the same default cadence and this is the only local reading of
+    /// it we have. See `resume::settle_wait_budget`.
+    pub event_poll_interval: Duration,
     /// DHT lookup tuning.
     pub lookup: LookupConfig,
     /// This node's self-attested region (`identity.region`), or `None` when
@@ -639,8 +661,8 @@ impl NodeOrigin {
         // (→ `open_stream`, #1134): a candidate that accepts the connection and then goes
         // quiet during the handshake / verified response is cut off at `deadlines.open`,
         // which emits a typed `PullTimeout { after: deadlines.open }`. That is the SOLE
-        // per-candidate open bound — the buffered path (`stream_fetch_shared`, below) drives
-        // its open the same way with no outer wrap. We used to add a second, redundant
+        // per-candidate open bound — the buffered path (`resume::pull_blob`, below) drives
+        // each of its opens the same way with no outer wrap. We used to add a second, redundant
         // `tokio::time::timeout(pull_timeout, …)` wrap here (belt-and-braces); it is dropped
         // (#1147) because both clocks were sourced from `pull_timeout`, so the double-bound
         // did nothing but risk drift — an open-specific timeout knob could make a candidate
@@ -756,6 +778,24 @@ pub enum TeeVerdict {
 /// bookkeeping (buyer-watermark persistence #852, reputation scoring, region
 /// accounting) so the serve handler only has to pump chunks and call one
 /// terminal method. Obtain via [`NodeOrigin::open_progressive_pull`].
+///
+/// # No reactive top-up here, deliberately (#1530)
+///
+/// The buffered miss pull resumes across a mid-pull deposit top-up
+/// (`resume::pull_blob`); this path does not, and the asymmetry is structural
+/// rather than an oversight.
+///
+/// The downstream client already holds a signed `StreamResponse { ok: true }` and is
+/// being fed a single continuous stream. Re-opening upstream at `byte_offset > 0`
+/// produces a NEW bao range encoding with its own root→offset proof path — not a
+/// suffix of the one in flight — so splicing it in corrupts what the client is
+/// decoding, and the wire protocol has no way to pause a client mid-delivery while we
+/// go to chain. Nor is exhaustion the binding constraint here: this path fronts at
+/// most one window speculatively and recoups a downstream voucher per window, so its
+/// upstream spend tracks downstream payment instead of racing ahead of it.
+///
+/// If mid-window exhaustion ever does bite, the fix belongs BEFORE the open — raise
+/// the pre-open floor, or force the proactive refill — not mid-stream.
 #[derive(Debug)]
 pub struct NodeProgressivePull {
     deps: Arc<OnceLock<NodeOriginDeps>>,
@@ -1549,7 +1589,7 @@ impl PullMiss {
 
 /// Walk the ranked candidates (best-first), opening a channel and pulling from
 /// each until one delivers, bounded by `budget` remaining attempts. Records a
-/// reputation outcome for every candidate that reaches `stream_fetch`;
+/// reputation outcome for every candidate that reaches the wire;
 /// candidates skipped earlier for an unresolvable operator address or a local
 /// channel-open failure are intentionally not scored (neither is the provider's
 /// fault). `budget` is the fetch-wide [`MAX_PROVIDER_ATTEMPTS`] remainder rather
@@ -1594,7 +1634,7 @@ async fn try_pull(
 /// this signs with `ctx.client_signer` — the SAME key that signs vouchers — and runs
 /// BEFORE the stream open on both pull paths. So a node with a broken buyer key fails
 /// here, on every candidate, and never reaches the voucher-signing `LocalPullFault` deeper
-/// in `stream_fetch_tracked`. Swallowed here, `node_pull_local_fault` stayed at zero in
+/// in the paid-pull requester's voucher leg (`UpstreamPull::pay_one`). Swallowed here, `node_pull_local_fault` stayed at zero in
 /// precisely the emergency its doc describes ("a node that cannot sign a voucher cannot
 /// pay for anything"), and an operator alerting on it got a false all-clear.
 fn bind_upstream_ctx(deps: &NodeOriginDeps, ctx: ChannelContext) -> anyhow::Result<ChannelContext> {
@@ -1607,7 +1647,7 @@ fn bind_upstream_ctx(deps: &NodeOriginDeps, ctx: ChannelContext) -> anyhow::Resu
 /// concurrent pull on it — never a fresh one per pull (#1145 review).
 ///
 /// One call site per pull path, so neither can quietly go back to minting its own. Both did,
-/// and `stream_fetch_shared` (the entrypoint the buffered path calls) exists precisely
+/// and the caller-owned-ledger entrypoints exist precisely
 /// because that is broken: N concurrent pulls each seeded from `ctx.prior_*` all sign
 /// `prior_nonce + 1` and collide, the upstream accepts one and rejects the rest
 /// `StaleNonce`. `ctx.prior_*` is only a SEED — it loses to a live ledger, which is at least
@@ -1629,10 +1669,10 @@ fn channel_ledger(
 }
 
 /// Attempt a single paid pull from one candidate: resolve its operator address,
-/// open/reuse a buyer channel, `stream_fetch`, and record the reputation
-/// outcome. Returns the bytes on success, otherwise the [`PullMiss`] this failure
-/// is (try the next candidate either way — a local fault latches, it does not
-/// abort the walk, #1560).
+/// open/reuse a buyer channel, run the resumable pull (`resume::pull_blob`), and
+/// record the reputation outcome. Returns the bytes on success, otherwise the
+/// [`PullMiss`] this failure is (try the next candidate either way — a local fault
+/// latches, it does not abort the walk, #1560).
 // Sequential resolve → open → fetch → classify pipeline; the tracing macros and
 // the success/failure classification inflate the cognitive-complexity + line
 // metrics past threshold (same inflation noted in `chain_staker_set`). Splitting
@@ -1675,7 +1715,7 @@ async fn pull_from_candidate(
         }
     };
     // #1117: bind the request so the upstream can chain a reactive pull.
-    let ctx = match bind_upstream_ctx(deps, ctx) {
+    let mut ctx = match bind_upstream_ctx(deps, ctx) {
         Ok(ctx) => ctx,
         Err(err) => {
             // As on the window path: our signing fault, metered as ours, peer unscored.
@@ -1737,23 +1777,20 @@ async fn pull_from_candidate(
     // continues in a detached background warm. So "no hard cap here" does not mean
     // "a client can wait forever".
     let _stream_guard = deps.metrics.outbound_stream_guard();
-    let result = stream_fetch_shared(
-        &deps.endpoint,
-        EndpointAddr::new(pk),
-        &ctx,
+    // `ctx` is `&mut` from here on: a landed reactive top-up raises `ctx.deposit`, and
+    // the resumed leg's headroom arithmetic — which decides whether the NEXT rejection
+    // is genuine exhaustion or an upstream lying — reads it (#1530).
+    let result = resume::pull_blob(
+        deps,
+        resume::PullTarget {
+            pk,
+            provider_addr,
+            candidate,
+            hash_bytes,
+        },
+        &mut ctx,
         &ledger,
-        &deps.slash_domain,
-        provider_addr,
-        hash_bytes,
-        0,
-        now_micros(),
         deadlines,
-        deps.config.max_blob_size_bytes,
-        // Refuse a stream quote above the lower of the candidate's probe rate and the
-        // configured absolute ceiling, before paying (#1375). `candidate.rate_per_mb >= 1`
-        // always (`ProbeResponse::validate` rejects a zero rate and `probe_candidate` drops
-        // it), so `effective_rate_ceiling` never treats the probe bound as unbounded here.
-        effective_rate_ceiling(candidate.rate_per_mb, deps.config.max_rate_per_mb),
     )
     .await;
     // Capture the delivery duration BEFORE the guard settles: `record_progress` does
@@ -1762,7 +1799,13 @@ async fn pull_from_candidate(
     let elapsed = started.elapsed();
     drop(settle);
     match result {
-        Ok(bytes) => {
+        Ok(resume::PulledBlob { bytes, paid_wait }) => {
+            // The same exclusion, for the same reason, applied to the other two things
+            // that are not the upstream serving bytes: the settle sleep and the `topUp`
+            // receipt. Both are OUR funding, and charging a peer's delivery-speed score
+            // for the time we spent on a chain would defame it for helping us (#1530).
+            let elapsed = elapsed.saturating_sub(paid_wait);
+            let bytes = Bytes::from(bytes);
             record_outcome(
                 deps,
                 pk,
@@ -1772,9 +1815,12 @@ async fn pull_from_candidate(
                 },
             );
             // Inbound counterpart of the serve path's `record_served` (#858).
-            // `bytes` is the DECODED content buffer (`decode_verified_range` trims
-            // the bao proof and the pre-`byte_offset` bytes, ADR 038), so
-            // `bytes.len()` is CONTENT bytes — slightly under the WIRE bytes the
+            // `bytes` is the DECODED content buffer (`pull_to_sink` writes only
+            // verified plaintext, dropping the bao proof and the pre-`byte_offset`
+            // bytes, ADR 038), so `bytes.len()` is CONTENT bytes — and it counts each
+            // byte ONCE across a resumed pull, because the sink is truncated back to
+            // the resume offset before the next leg appends. Slightly under the WIRE
+            // bytes the
             // voucher watermark advanced in (the proof overhead the buyer paid).
             // Region accounting attributes the delivered content, which is the
             // right unit for a locality signal. Note this tracks *delivered*
@@ -2255,12 +2301,13 @@ fn forget_settled_channel(
 ///
 /// Wallet-less resume (issue #1481 §5 review item 2): this classifier does NOT special-case a
 /// bundled `StaleNonce`/`AmountRegression`/`BytesRegression`/`InsufficientDeposit`, and it does
-/// not need to. `stream_fetch_shared` (the entrypoint this node's own cache-miss buyer leg
-/// always calls, `byte_offset == 0`, see `pull_from_candidate` above) already retries a
-/// resumable rejection ENTIRELY inside `decdn-client-pull::fetch_inner` before it can ever
-/// surface here: the caller reseeds the channel's ledger and reopens the pull, transparently,
-/// and this classifier — like every other caller of `stream_fetch_shared` — sees only the
-/// FINAL outcome. So by the time `pull_verdict` downcasts an error to `UpstreamVoucherRejected`
+/// not need to. `resume::pull_blob` (this node's own cache-miss buyer leg) already retries a
+/// resumable rejection in its own loop before it can ever
+/// surface here: it reseeds the channel's ledger and reopens the pull, transparently,
+/// and this classifier sees only the
+/// FINAL outcome. (Before #1530 the same retry happened one layer down, inside
+/// `decdn-client-pull::fetch_inner`; moving it up is what let the loop also answer a
+/// genuine `InsufficientDeposit` with a top-up instead of a terminal error.) So by the time `pull_verdict` downcasts an error to `UpstreamVoucherRejected`
 /// and reaches this function, the rejection is genuinely terminal: either the reason was never
 /// gated, it carried no bundle, the bundle failed shape validation, or the bounded resume
 /// attempts were exhausted. `OurDeadChannel` remains the correct verdict for all four reasons
@@ -2311,6 +2358,16 @@ fn pull_verdict(err: &anyhow::Error) -> PullVerdict {
     }
     if err.downcast_ref::<RateAboveCeiling>().is_some() {
         return PullVerdict::RateCeiling;
+    }
+    // Above the peer-blaming arms, alongside the other local faults: the upstream
+    // answered honestly ("the blob is only N bytes"), and the offset it refused is one
+    // WE computed — a resume frontier that overran the blob (#1530). Before the miss
+    // path could resume at all this was unreachable, so it had no arm and fell through
+    // to `Unreachable`, which would gossip an honest peer as dead on the strength of
+    // our own arithmetic. `ResumeOffsetPastEnd`'s own doc says it: "this is a statement
+    // about the offset, not about the peer".
+    if err.downcast_ref::<ResumeOffsetPastEnd>().is_some() {
+        return PullVerdict::OurLocalFault;
     }
     if err.downcast_ref::<PullTimeout>().is_some() {
         return PullVerdict::OurDeadline;
