@@ -64,3 +64,52 @@ async fn partial_import_reports_only_the_imported_span() -> anyhow::Result<()> {
     assert!(present_chunk_count >= group_chunks);
     Ok(())
 }
+
+#[tokio::test]
+async fn missing_ranges_empty_when_span_present() -> anyhow::Result<()> {
+    let payload = util::make_blob(200 * 1024);
+    let blob_size = u64::try_from(payload.len())?;
+    let (engine, hash, _tmp, _srv) = util::engine_with_range_origin(&payload).await?;
+
+    let req_start = 64 * 1024;
+    let req_len = 32 * 1024;
+    engine
+        .pull_through_range(hash, req_start, req_len, blob_size)
+        .await?;
+
+    // The exact span we imported is now fully present → nothing missing.
+    let missing = engine
+        .missing_ranges(hash, req_start, req_len, blob_size)
+        .await?;
+    assert!(missing.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn missing_ranges_covers_absent_span() -> anyhow::Result<()> {
+    let payload = util::make_blob(200 * 1024);
+    let blob_size = u64::try_from(payload.len())?;
+    let (engine, hash, _tmp, _srv) = util::engine_with_range_origin(&payload).await?;
+
+    // Import an early span; ask about a disjoint later span.
+    engine
+        .pull_through_range(hash, 0, 32 * 1024, blob_size)
+        .await?;
+    let missing = engine
+        .missing_ranges(hash, 128 * 1024, 32 * 1024, blob_size)
+        .await?;
+    assert!(!missing.is_empty(), "the later span was never imported");
+    Ok(())
+}
+
+#[tokio::test]
+async fn missing_ranges_absent_blob_is_whole_requested_span() -> anyhow::Result<()> {
+    let payload = util::make_blob(200 * 1024);
+    let blob_size = u64::try_from(payload.len())?;
+    let (engine, _tmp) = util::empty_engine().await?;
+    let hash = Hash::new(&payload);
+    // len 0 = to end.
+    let missing = engine.missing_ranges(hash, 0, 0, blob_size).await?;
+    assert!(!missing.is_empty());
+    Ok(())
+}

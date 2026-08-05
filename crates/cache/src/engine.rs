@@ -1411,6 +1411,31 @@ impl CacheEngine {
         })
     }
 
+    /// The chunk-aligned sub-ranges of `[byte_offset, byte_offset + byte_len)`
+    /// (`byte_len == 0` = to `blob_size`) that are NOT present on disk.
+    ///
+    /// Empty ⇒ the requested span is fully present: a completeness-aware read can
+    /// serve it with no fetch, and a resumed pull is a no-op. `blob_size` is
+    /// caller-supplied (the signed `total_bytes`), the same contract as
+    /// [`Self::export_bao_range_stream`].
+    pub async fn missing_ranges(
+        &self,
+        hash: Hash,
+        byte_offset: u64,
+        byte_len: u64,
+        blob_size: u64,
+    ) -> CacheResult<ChunkRanges> {
+        // Same align_range error mapping as `export_bao_range_stream`: a range
+        // that does not fit `blob_size` is an argument error, not an origin fault.
+        let aligned = align_range(byte_offset, byte_len, blob_size).map_err(|e| {
+            CacheError::Store(anyhow::Error::from(e).context("missing_ranges: range alignment"))
+        })?;
+        let present = self.present_ranges(hash).await?;
+        // requested \ present. `ChunkRanges` is a `RangeSet2`, which implements
+        // `Sub` (`owned - &ref -> owned`).
+        Ok(aligned.chunk_ranges().clone() - present.chunk_ranges())
+    }
+
     /// Mark `hash` as evicted: subsequent [`Self::has`] / [`Self::get`] calls
     /// behave as if the blob is absent (returning `false` / `NotFound`
     /// respectively). The corresponding [`Self::access_times_snapshot`] entry
