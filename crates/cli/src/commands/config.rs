@@ -583,6 +583,7 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # redeem_interval_secs = 300                      # redeemer self-tick sweep cadence, the backstop beside the per-voucher hints (#327/#751); default 300s, must be > 0
 # buyer_initial_deposit_micro_usdc = 500000     # deposit when OPENING a channel (first-contact lock); default 0.5 USDC
 # buyer_working_deposit_micro_usdc = 10000000    # refill target on reuse or mid-transfer shortfall; 0 disables top-up; default 10 USDC
+# buyer_reactive_topup_min_ttl_secs = 86400      # min seconds to a channel's on-chain expiry below which a mid-pull reactive top-up is refused (topUp cannot extend expiry, #1603); default ~1 day; 0 disables the guard
 # buyer_max_approve = true                       # unlimited USDC approval for PaymentChannel (#744); node default true, decdn client default false (exact deposit-sized approval); set true on the client to opt into unlimited
 # settlement_auto_threshold_micro_usdc = 50000000   # auto-closeChannel once un-redeemed µUSDC reaches this (#742); leave unset/commented to disable — when set it must be > 0
 # settlement_auto_by_voucher_nonce_span = 1000       # auto-closeChannel once the un-redeemed nonce span reaches this (#742); leave unset/commented to disable — when set it must be > 0
@@ -826,6 +827,7 @@ mod tests {
             redeem_interval_secs,
             buyer_initial_deposit_micro_usdc,
             buyer_working_deposit_micro_usdc,
+            buyer_reactive_topup_min_ttl_secs,
             buyer_max_approve,
             settlement_auto_threshold_micro_usdc,
             settlement_auto_by_voucher_nonce_span,
@@ -886,6 +888,10 @@ mod tests {
             (
                 "buyer_working_deposit_micro_usdc =",
                 buyer_working_deposit_micro_usdc.is_none(),
+            ),
+            (
+                "buyer_reactive_topup_min_ttl_secs =",
+                buyer_reactive_topup_min_ttl_secs.is_none(),
             ),
             ("buyer_max_approve =", buyer_max_approve.is_none()),
             (
