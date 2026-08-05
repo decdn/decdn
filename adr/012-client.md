@@ -43,7 +43,7 @@ Startup sequence from first launch to ready state:
 ```
 1. Load or generate iroh identity key (see Key Management below)
 2. Load Ethereum key from encrypted keystore
-3. Query on-chain registry: paginated getActiveNodes(offset, 100) calls,
+3. Query on-chain registry: paginated getRegisteredNodes(offset, 100) calls,
      starting at offset 0, incrementing until a page returns fewer than 100
      On failure: retry 3× exponential backoff (1 s, 5 s, 30 s)
      The budget is for the WHOLE read, not per page: a page that retries

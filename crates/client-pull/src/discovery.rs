@@ -1,5 +1,5 @@
 //! Client-side node discovery (#936): read the active node set from
-//! `CapacityBond.getActiveNodes` so a client can pick a node instead of being
+//! `CapacityBond.getRegisteredNodes` so a client can pick a node instead of being
 //! handed an explicit `--node-id`/`--addr`/`--provider-address`. Read from
 //! `fetch::discover_provider` and from the discovery branch of
 //! `bundle_pull::bundle_pull`; the ranking half is also used by
@@ -31,12 +31,12 @@ use decdn_protocol::Region;
 use iroh::PublicKey;
 use serde::{Deserialize, Serialize};
 
-/// Page size for the paginated `getActiveNodes` read (ADR 019 § Step 3.3's
+/// Page size for the paginated `getRegisteredNodes` read (ADR 019 § Step 3.3's
 /// worked-example limit). At `PoC` scale (tens of nodes) one page suffices; the
 /// loop preserves the pattern for production scale.
 const PAGE_SIZE: u64 = 100;
 
-/// Backoff before each retry of a failed `getActiveNodes` page call — ADR 012
+/// Backoff before each retry of a failed `getRegisteredNodes` page call — ADR 012
 /// § Bootstrap step 3: "retry 3× exponential backoff (1 s, 5 s, 30 s)". The
 /// length of the table is the retry count, so a fully-failing page costs
 /// 1 + 5 + 30 = 36 s across four attempts.
@@ -129,12 +129,15 @@ pub struct NodeCandidate {
 /// Distill a registry `NodeInfo` into a [`NodeCandidate`], or `None` if it is
 /// not currently active or its `nodeId` is not a valid ed25519 key.
 ///
-/// The `active` field is trusted as a fast filter; a node that is stale-active
-/// (e.g. mid-unbonding) is harmless here because the downstream probe-and-rank
-/// step still has to reach and serve from it, so an unservable node falls out
-/// of selection anyway.
-fn candidate_from(info: &CapacityBond::NodeInfo) -> Option<NodeCandidate> {
-    if !info.active {
+/// `is_active` is the on-chain `isActive` predicate that `getRegisteredNodes`
+/// returns per entry (registered AND bond ≥ minBond AND no unbonding AND not
+/// ejected) — NOT the raw `NodeInfo.active` registration flag, which stays
+/// `true` for an operator mid-unbonding. Filtering on the strict predicate drops
+/// stale-active nodes up front rather than paying a probe round-trip to a node
+/// that is on its way out. The downstream probe-and-rank step is still the final
+/// arbiter of who can actually serve.
+fn candidate_from(info: &CapacityBond::NodeInfo, is_active: bool) -> Option<NodeCandidate> {
+    if !is_active {
         return None;
     }
     let node_id = PublicKey::from_bytes(&info.nodeId.0).ok()?;
@@ -148,7 +151,7 @@ fn candidate_from(info: &CapacityBond::NodeInfo) -> Option<NodeCandidate> {
     })
 }
 
-/// Whether a `getActiveNodes` failure is deterministic — the same call will
+/// Whether a `getRegisteredNodes` failure is deterministic — the same call will
 /// fail the same way however often it is repeated, so retrying it only burns
 /// the 36 s backoff schedule before reporting the error it was always going to
 /// report.
@@ -200,7 +203,7 @@ fn is_permanent(err: &alloy::contract::Error) -> bool {
     }
 }
 
-/// Drive `fetch_page` across the paginated `getActiveNodes` read, retrying on
+/// Drive `fetch_page` across the paginated `getRegisteredNodes` read, retrying on
 /// the ADR 012 § Bootstrap step 3 schedule ([`REGISTRY_RETRY_BACKOFF`]) and
 /// distilling every entry through [`candidate_from`].
 ///
@@ -226,20 +229,20 @@ fn is_permanent(err: &alloy::contract::Error) -> bool {
 async fn paginate_with_retry<F, Fut>(fetch_page: F) -> anyhow::Result<Vec<NodeCandidate>>
 where
     F: Fn(u64) -> Fut,
-    Fut: Future<Output = Result<Vec<CapacityBond::NodeInfo>, alloy::contract::Error>>,
+    Fut: Future<Output = Result<(Vec<CapacityBond::NodeInfo>, Vec<bool>), alloy::contract::Error>>,
 {
     let mut out = Vec::new();
     let mut offset = 0u64;
     // Outside the pagination loop: one budget for the whole read.
     let mut attempt = 0usize;
     loop {
-        let page = loop {
+        let (page, active) = loop {
             match fetch_page(offset).await {
                 Ok(page) => break page,
                 Err(e) if is_permanent(&e) => {
                     return Err(e).with_context(|| {
                         format!(
-                            "CapacityBond.getActiveNodes(offset={offset}) failed and will not \
+                            "CapacityBond.getRegisteredNodes(offset={offset}) failed and will not \
                              succeed on retry — check that blockchain.capacity_bond_address \
                              holds the registry contract and that rpc_url points at the same \
                              chain and accepts this key"
@@ -250,7 +253,7 @@ where
                     let Some(backoff) = REGISTRY_RETRY_BACKOFF.get(attempt).copied() else {
                         return Err(e).with_context(|| {
                             format!(
-                                "CapacityBond.getActiveNodes(offset={offset}) failed after {} \
+                                "CapacityBond.getRegisteredNodes(offset={offset}) failed after {} \
                                  retries across the whole registry read",
                                 REGISTRY_RETRY_BACKOFF.len()
                             )
@@ -266,7 +269,7 @@ where
                         attempt,
                         backoff_ms = backoff.as_millis(),
                         error = %sanitize_rpc_display(&e),
-                        "CapacityBond.getActiveNodes page failed; retrying"
+                        "CapacityBond.getRegisteredNodes page failed; retrying"
                     );
                     tokio::time::sleep(backoff).await;
                     attempt = attempt.saturating_add(1);
@@ -274,7 +277,14 @@ where
             }
         };
         let page_len = page.len() as u64;
-        out.extend(page.iter().filter_map(candidate_from));
+        // `active[i]` is the on-chain `isActive(page[i])`, index-aligned with the
+        // page. Zip so the strict predicate — not the raw `NodeInfo.active` flag —
+        // gates each candidate.
+        out.extend(
+            page.iter()
+                .zip(active.iter())
+                .filter_map(|(info, &is_active)| candidate_from(info, is_active)),
+        );
         // A short page is the last page (Kademlia-style termination).
         if page_len < PAGE_SIZE {
             break;
@@ -284,7 +294,7 @@ where
     Ok(out)
 }
 
-/// Read the active node set from `CapacityBond.getActiveNodes` at
+/// Read the active node set from `CapacityBond.getRegisteredNodes` at
 /// `capacity_bond_addr` over `rpc_url` (a read-only HTTP provider — no signer
 /// needed for a view call). Paginated; inactive / undecodable entries are
 /// skipped.
@@ -300,7 +310,7 @@ where
 /// # Errors
 ///
 /// Fails if `rpc_url` is not a valid URL (before any retry is attempted) or a
-/// `getActiveNodes` page call fails permanently or past its retries.
+/// `getRegisteredNodes` page call fails permanently or past its retries.
 pub async fn active_nodes(
     rpc_url: &str,
     capacity_bond_addr: Address,
@@ -322,9 +332,10 @@ pub async fn active_nodes(
         let registry = &registry;
         async move {
             registry
-                .getActiveNodes(U256::from(offset), U256::from(PAGE_SIZE))
+                .getRegisteredNodes(U256::from(offset), U256::from(PAGE_SIZE))
                 .call()
                 .await
+                .map(|resp| (resp.page, resp.active))
         }
     })
     .await
@@ -802,17 +813,35 @@ mod tests {
         // so derive a real one from a known secret.
         let key = iroh::SecretKey::from_bytes(&[7u8; 32]).public();
         let bytes = *key.as_bytes();
-        assert!(candidate_from(&node_info(bytes, true)).is_some());
+        assert!(candidate_from(&node_info(bytes, true), true).is_some());
         assert!(
-            candidate_from(&node_info(bytes, false)).is_none(),
+            candidate_from(&node_info(bytes, true), false).is_none(),
             "inactive nodes must be filtered out"
+        );
+    }
+
+    /// The filter now keys on the on-chain `isActive` (the `active[]` column of
+    /// `getRegisteredNodes`), NOT the raw `NodeInfo.active` registration flag. A
+    /// node mid-unbonding is still `NodeInfo.active == true` but `isActive ==
+    /// false`, and the client must drop it up front rather than defer to probing.
+    #[test]
+    fn excludes_stale_active_node_when_isactive_false() {
+        let key = iroh::SecretKey::from_bytes(&[7u8; 32]).public();
+        let info = node_info(*key.as_bytes(), true); // raw registration flag true
+        assert!(
+            candidate_from(&info, true).is_some(),
+            "isActive true → kept"
+        );
+        assert!(
+            candidate_from(&info, false).is_none(),
+            "stale-active (isActive false) dropped despite NodeInfo.active == true"
         );
     }
 
     #[test]
     fn carries_eth_address_and_region() {
         let key = iroh::SecretKey::from_bytes(&[9u8; 32]).public();
-        let c = candidate_from(&node_info(*key.as_bytes(), true)).unwrap();
+        let c = candidate_from(&node_info(*key.as_bytes(), true), true).unwrap();
         assert_eq!(c.eth_address, Address::repeat_byte(0xab));
         assert_eq!(c.region_hint, Region::parse("US"));
     }
@@ -825,7 +854,7 @@ mod tests {
         let key = iroh::SecretKey::from_bytes(&[9u8; 32]).public();
         let mut info = node_info(*key.as_bytes(), true);
         info.regionHint = "not-a-region".to_string();
-        let c = candidate_from(&info).unwrap();
+        let c = candidate_from(&info, true).unwrap();
         assert_eq!(c.region_hint, None, "unparseable, not rejected");
         assert_eq!(c.eth_address, Address::repeat_byte(0xab));
     }
@@ -1011,7 +1040,7 @@ mod tests {
                     // Rate-limited twice, then the provider lets us through.
                     0 => Err(error_resp(429, "Too Many Requests")),
                     1 => Err(error_resp(-32005, "exceeded project rate limit")),
-                    _ => Ok(vec![node_info(valid_node_id(3), true)]),
+                    _ => Ok(active_page(vec![node_info(valid_node_id(3), true)])),
                 }
             }
         })
@@ -1029,6 +1058,15 @@ mod tests {
 
     fn valid_node_id(seed: u8) -> [u8; 32] {
         *iroh::SecretKey::from_bytes(&[seed; 32]).public().as_bytes()
+    }
+
+    /// Wrap a page of `NodeInfo` with an all-`true` `active[]` of matching length,
+    /// mirroring what `getRegisteredNodes` returns for a page of active operators.
+    /// These pagination tests exercise the retry/cursor control flow, not the
+    /// active-filter, so every entry is active.
+    fn active_page(infos: Vec<CapacityBond::NodeInfo>) -> (Vec<CapacityBond::NodeInfo>, Vec<bool>) {
+        let n = infos.len();
+        (infos, vec![true; n])
     }
 
     #[tokio::test(start_paused = true)]
@@ -1082,13 +1120,15 @@ mod tests {
                     (0, 0 | 1) => Err(transient()),
                     // … then a full page, which is what makes the loop ask for
                     // a second page rather than terminating on a short one.
-                    (0, _) => Ok((0..PAGE_SIZE)
-                        .map(|i| {
-                            // `u8` seeds wrap past 255; PAGE_SIZE is 100, so
-                            // every id here is distinct regardless.
-                            node_info(valid_node_id(u8::try_from(i).unwrap_or(0)), true)
-                        })
-                        .collect()),
+                    (0, _) => Ok(active_page(
+                        (0..PAGE_SIZE)
+                            .map(|i| {
+                                // `u8` seeds wrap past 255; PAGE_SIZE is 100, so
+                                // every id here is distinct regardless.
+                                node_info(valid_node_id(u8::try_from(i).unwrap_or(0)), true)
+                            })
+                            .collect(),
+                    )),
                     // Page 1 never succeeds.
                     _ => Err(transient()),
                 }
@@ -1151,11 +1191,13 @@ mod tests {
                 match n {
                     // The first page fails once, then serves a full page…
                     0 => Err(transient()),
-                    1 => Ok((0..PAGE_SIZE)
-                        .map(|_| node_info(valid_node_id(1), true))
-                        .collect()),
+                    1 => Ok(active_page(
+                        (0..PAGE_SIZE)
+                            .map(|_| node_info(valid_node_id(1), true))
+                            .collect(),
+                    )),
                     // …and the short second page ends the read.
-                    _ => Ok(vec![node_info(valid_node_id(2), true)]),
+                    _ => Ok(active_page(vec![node_info(valid_node_id(2), true)])),
                 }
             }
         })

@@ -747,9 +747,9 @@ function reclaimNodeId(
 function getNode(bytes32 nodeId) external view returns (NodeInfo memory);
 function getNodeByAddress(address ethAddress) external view returns (NodeInfo memory);
 function isActiveNode(bytes32 nodeId) external view returns (bool);
-function getActiveNodeCount() external view returns (uint256);
-function getActiveNodes(uint256 offset, uint256 limit)
-    external view returns (NodeInfo[] memory);
+function getRegisteredNodeCount() external view returns (uint256);
+function getRegisteredNodes(uint256 offset, uint256 limit)
+    external view returns (NodeInfo[] memory page, bool[] memory active);
 function firstBondedAt(address operator) external view returns (uint64);
 
 // State — per-nodeId nonce for ed25519 registration replay protection
@@ -799,7 +799,7 @@ A governable cooldown (0–86400 seconds, see [ADR 009](009-governance.md#adr-00
 
 Three tiers, from simplest to most scalable:
 
-1. **View functions.** `getActiveNodes(offset, limit)` with pagination. For tens of nodes, a single call with `limit = 100` returns the full node set. Clients call this on first startup to bootstrap their peer list, then rely on gossip for ongoing discovery (see [ADR 001 § Node Discovery (Gossip)](001-network.md#node-discovery-gossip)).
+1. **View functions.** `getRegisteredNodes(offset, limit)` with pagination. For tens of nodes, a single call with `limit = 100` returns the full node set. Clients call this on first startup to bootstrap their peer list, then rely on gossip for ongoing discovery (see [ADR 001 § Node Discovery (Gossip)](001-network.md#node-discovery-gossip)).
 
 2. **Event logs.** Clients index `NodeRegistered`, `NodeMultiaddrUpdated`, `NodeDeregistered`, and `NodeAutoEjected` events (indexed by `nodeId`) to maintain a local cache. More efficient than repeated view calls for larger node sets.
 

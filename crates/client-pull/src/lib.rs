@@ -34,7 +34,7 @@ pub mod buyer_channel;
 /// Client-initiated cooperative close (#971), shared by the CLI and the node.
 pub mod cooperative_close;
 /// Client-side node discovery (#936): read + select the active node set from
-/// `CapacityBond.getActiveNodes`, then rank probed blob-holders.
+/// `CapacityBond.getRegisteredNodes`, then rank probed blob-holders.
 pub mod discovery;
 /// One-shot client `Endpoint` construction: relay + discovery resolution for
 /// the `cdn/client/v1` and `cdn/probe/v1` dial paths (#935/#936).
