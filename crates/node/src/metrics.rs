@@ -1123,71 +1123,6 @@ pub struct DecdnMetrics {
     /// here so it isn't silent. Covers BOTH reactive fill tiers: node→node (#831)
     /// and the local-origin populate (#1116).
     pub node_pull_through_errors: Counter,
-    /// `decdn_node_pull_through_background_spawned_total` (#859): detached
-    /// background cache-fill tasks spawned after the foreground delivery
-    /// deadline fired, to keep warming the cache from a slow-but-available
-    /// upstream for future requests.
-    pub node_pull_through_background_spawned: Counter,
-    /// `decdn_node_pull_through_background_shed_total` (#1145 review): background
-    /// cache-fills NOT spawned because the in-flight warms already reserve the whole
-    /// `MAX_BACKGROUND_FILL_MB` memory budget.
-    ///
-    /// Not an error — shedding speculative work is the designed response to load, and
-    /// the hash stays unclaimed so a later miss retries it. A sustained rate means the
-    /// node is missing faster than it can warm (slow upstreams, or a miss storm); the
-    /// cost is future cache misses, never a failed live request. Since each warm reserves
-    /// `max_blob_size_mb`, a node with a large blob ceiling sheds sooner — that is the
-    /// intended trade, not a fault.
-    pub node_pull_through_background_shed: Counter,
-    /// `decdn_node_pull_through_background_succeeded_total` (#859): background
-    /// cache-fills that populated the blob into the store.
-    pub node_pull_through_background_succeeded: Counter,
-    /// `decdn_node_pull_through_background_failed_total` (#859): background cache-fills
-    /// that failed on a FAULT — a store/IO error, bytes that did not verify, a blob over
-    /// the ceiling, a broken origin, or the absolute cap.
-    ///
-    /// **This is the alertable one.** It used to also count a clean miss (no provider, no
-    /// origin), which is routine and expected — so the two were indistinguishable and no
-    /// threshold on this counter could fire *for* the emergency it would need to signal
-    /// (#1145 review). A warm that finds nothing now lands on
-    /// `node_pull_through_background_missed_total` instead, and this is reserved for the
-    /// faults an operator must act on. Cancellation on shutdown is not a failure either —
-    /// see `node_pull_through_background_cancelled`.
-    pub node_pull_through_background_failed: Counter,
-    /// `decdn_node_pull_through_background_missed_total` (#1145 review): background
-    /// cache-fills that found nothing to warm — no provider had the blob, or no origin is
-    /// configured.
-    ///
-    /// Routine, and split out of `..._failed_total` precisely so that counter can mean
-    /// something. A sustained rate here is a discovery/availability signal (this node keeps
-    /// missing content the network does not hold), not a fault to page on.
-    pub node_pull_through_background_missed: Counter,
-    /// `decdn_node_pull_through_background_panicked_total` (#1145 review): a background
-    /// cache-fill task PANICKED.
-    ///
-    /// Nothing awaits these tasks — they are spawned and their `JoinHandle` dropped — so a
-    /// panic inside `populate`, the tee, or the decoder reaches nobody. It moved no counter
-    /// and wrote no log, and `spawned` simply sat one above the sum of its outcomes forever,
-    /// a gap that reads like an in-flight warm rather than a crash. Recorded from a `Drop`
-    /// guard, which is the only thing that still runs on the unwind.
-    ///
-    /// **Any non-zero value is a bug in this node.** These tasks have no business panicking.
-    pub node_pull_through_background_panicked: Counter,
-    /// `decdn_node_pull_through_background_cancelled_total` (#1145 review): background
-    /// cache-fills abandoned because the node began shutting down — either recorded explicitly
-    /// or, when a spawned warm is dropped UNPOLLED at runtime teardown, by `WarmOutcome::drop`
-    /// (which distinguishes that clean drop from a real panic via `thread::panicking()`).
-    ///
-    /// Exists so the books balance:
-    /// `spawned == succeeded + missed + failed + cancelled + panicked`.
-    ///
-    /// `shed` is NOT a term: a shed warm returns before `spawned` is ever incremented, so it
-    /// is disjoint from all of these (the comment that put it in the identity was wrong —
-    /// an operator building a dashboard from it got an equation that could never balance).
-    /// Without `cancelled` a warm that dies at drain leaves an unexplained gap between
-    /// `spawned` and the terminal counters, which on a node that restarts often looks
-    /// exactly like a leak.
-    pub node_pull_through_background_cancelled: Counter,
     /// `decdn_node_pull_through_window_paused_total` (#856): times the
     /// window-paced serve loop paused the upstream pull because the per-request
     /// unrecouped frontier (`bytes pulled − bytes paid`) reached the effective
@@ -2357,36 +2292,6 @@ recorders! {
 
     /// A cache-engine error (not a clean miss) was hit filling a miss (#831).
     node_pull_through_error => node_pull_through_errors.inc();
-
-    /// A detached background cache-fill was spawned after the foreground
-    /// delivery deadline fired (#859).
-    node_pull_through_background_spawned => node_pull_through_background_spawned.inc();
-
-    /// A background cache-fill was shed because the in-flight warms already reserve the
-    /// whole memory budget (#1145 review). Speculative work dropped under load; the hash
-    /// stays unclaimed, so a later miss retries it.
-    node_pull_through_background_shed => node_pull_through_background_shed.inc();
-
-    /// A background cache-fill populated the blob into the store (#859).
-    node_pull_through_background_succeeded => node_pull_through_background_succeeded.inc();
-
-    /// A background cache-fill failed on a FAULT — a store/IO error, unverifiable bytes, a
-    /// broken origin, or the absolute cap (#859). Alertable; a clean miss is not counted
-    /// here (#1145 review).
-    node_pull_through_background_failed => node_pull_through_background_failed.inc();
-
-    /// A background cache-fill found nothing to warm — no provider, or no origin (#1145
-    /// review). Routine, and kept out of `..._failed_total` so that counter can be alerted
-    /// on.
-    node_pull_through_background_missed => node_pull_through_background_missed.inc();
-
-    /// A background cache-fill task PANICKED (#1145 review). Nothing awaits these tasks, so
-    /// this counter is the only trace one leaves. Any non-zero value is a bug in this node.
-    node_pull_through_background_panicked => node_pull_through_background_panicked.inc();
-
-    /// A background cache-fill was abandoned at shutdown (#1145 review). Not a failure —
-    /// counted so `spawned == succeeded + missed + failed + cancelled + panicked` balances.
-    node_pull_through_background_cancelled => node_pull_through_background_cancelled.inc();
 
     /// A `getOrigins` / `nodeIdOf` resolution failed, leaving an operator
     /// unmapped in the origin directory (#651). Bumps
