@@ -1184,9 +1184,7 @@ mod tests {
     use super::*;
 
     /// Build the smallest `ClientHandler` for the handler-layer tests below.
-    async fn handler_for_warm_tests(
-        metrics: &Arc<Metrics>,
-    ) -> (Arc<ClientHandler>, tempfile::TempDir) {
+    async fn handler_for_tests(metrics: &Arc<Metrics>) -> (Arc<ClientHandler>, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
         let cache = CacheEngine::open(dir.path(), Vec::new(), 16)
             .await
@@ -1228,7 +1226,7 @@ mod tests {
     #[tokio::test]
     async fn channel_metric_refresh_releases_map_and_serializes_snapshots() {
         let metrics = Arc::new(Metrics::new());
-        let (handler, _dir) = handler_for_warm_tests(&metrics).await;
+        let (handler, _dir) = handler_for_tests(&metrics).await;
         let old_id = B256::repeat_byte(0xA1);
         let old = Arc::new(Mutex::new(ChannelDeliveryState {
             state: ChannelState::new(
@@ -1334,7 +1332,7 @@ mod tests {
     #[tokio::test]
     async fn deposit_refusal_warn_reports_exactly_what_it_swallowed() {
         let metrics = Arc::new(Metrics::new());
-        let (handler, _dir) = handler_for_warm_tests(&metrics).await;
+        let (handler, _dir) = handler_for_tests(&metrics).await;
 
         // First refusal is always visible, and has swallowed nothing.
         assert_eq!(handler.note_deposit_refusal(), Some(0));
@@ -1450,10 +1448,10 @@ mod tests {
     #[tokio::test]
     async fn voucher_floor_tracks_live_bounds_not_the_quote() {
         let metrics = Arc::new(Metrics::new());
-        let (handler, _dir) = handler_for_warm_tests(&metrics).await;
+        let (handler, _dir) = handler_for_tests(&metrics).await;
 
         // Quote-time band: floor == F, a generous ceiling. The advertised
-        // `rate_per_mb` atomic is seeded to 1 in `handler_for_warm_tests`, so
+        // `rate_per_mb` atomic is seeded to 1 in `handler_for_tests`, so
         // set the band's floor to F and clamp will raise the quote to F.
         let f: u64 = 500;
         handler.rate_bounds.store(f);
