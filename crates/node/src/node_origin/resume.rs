@@ -136,9 +136,12 @@ enum ResumeAction {
     /// A genuine ceiling hit we WOULD have funded, but the channel is inside the
     /// near-expiry margin — `topUp` cannot extend `expires_at` (the contract forbids
     /// it), so escrowing a fresh working-deposit here would fund a channel that may
-    /// expire before the resumed leg can spend it. End the pull cleanly instead so
-    /// the next miss opens a fresh, full-lifetime channel; the deposit already in the
-    /// near-expiry channel is freed by the reclaim sweep at its (imminent) expiry.
+    /// expire before the resumed leg can spend it. End the pull cleanly instead: the
+    /// caller returns the original exhaustion, which `classify_pull_failure` wedges as
+    /// `OurDeadChannel` — the row is KEPT (its escrowed deposit is refunded by the
+    /// reclaim sweep at expiry) and the provider is suppressed until that expiry, no
+    /// peer scoring. Since expiry is imminent, that suppression is short; the next
+    /// miss after it opens a fresh, full-lifetime channel.
     ///
     /// Its own variant, apart from [`Self::TopUp`], so the caller can METER it: a
     /// channel opened too close to expiry for the blobs this node pulls is a distinct
@@ -481,9 +484,13 @@ pub(super) async fn pull_blob(
             // The channel is too close to expiry to fund: `topUp` cannot extend
             // `expires_at`, so escrowing a fresh deposit here would strand it past a
             // deadline the resumed leg cannot beat. End on the original exhaustion —
-            // `classify_pull_failure` then retires the near-expiry channel and the
-            // next miss opens a fresh, full-lifetime one; its residual deposit is
-            // freed by the reclaim sweep at the (imminent) expiry (#1603).
+            // `classify_pull_failure` reads the `InsufficientDeposit` as
+            // `OurDeadChannel` → `wedged_channel`, which KEEPS the row (its escrowed
+            // deposit is refunded by the reclaim sweep at expiry — `reclaimExpired`
+            // needs the row) and suppresses the provider until that expiry, without
+            // scoring the peer. Because we refused precisely for being near expiry,
+            // that suppression is short; once it lapses the provider is rankable again
+            // and the next miss opens a fresh, full-lifetime channel (#1603).
             ResumeAction::NearExpiry => {
                 warn!(
                     provider = %target.provider_addr,

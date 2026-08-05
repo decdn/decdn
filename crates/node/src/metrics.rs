@@ -1099,8 +1099,10 @@ pub struct DecdnMetrics {
     ///
     /// `topUp` cannot extend expiry, so funding here would escrow a fresh
     /// working-deposit into a channel that may expire before the resumed leg can
-    /// spend it — stranding capital until `reclaimExpired`. The pull ends cleanly
-    /// instead and the next miss opens a fresh, full-lifetime channel.
+    /// spend it — stranding capital until `reclaimExpired`. The pull ends cleanly on
+    /// the original exhaustion instead: the near-expiry channel is wedged
+    /// (`OurDeadChannel` — row KEPT for the reclaim sweep, provider suppressed until
+    /// its imminent expiry), and a later miss opens a fresh, full-lifetime channel.
     ///
     /// Distinct from `_refused`, which is an exhaustion claim our ledger CONTRADICTS
     /// (a lying peer) or a funding failure — there the channel had headroom in time,
