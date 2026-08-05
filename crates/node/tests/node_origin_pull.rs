@@ -12853,6 +12853,7 @@ async fn serve_with_deposit_ceiling(
     payloads: &[Arc<Vec<u8>>],
     rate: u64,
     deposit: &SharedDeposit,
+    resume_delay: Duration,
 ) -> Result<()> {
     let (mut send, mut recv) = conn
         .accept_bi()
@@ -12874,6 +12875,15 @@ async fn serve_with_deposit_ceiling(
     )
     .await
     .map_err(|e| anyhow::anyhow!("write response: {e}"))?;
+
+    // Serve the RESUME leg (`byte_offset > 0`) slowly, AFTER the response is on the
+    // wire so the delay lands in the chunk stream (`pull_to_sink`), not the open. The
+    // paid-wait accounting must count this as the upstream serving bytes, not as our
+    // funding wait: it is the exact time `PulledBlob::paid_wait` must NOT absorb
+    // (#1602). Zero for every test but the delivery-speed regression.
+    if req.byte_offset > 0 && !resume_delay.is_zero() {
+        tokio::time::sleep(resume_delay).await;
+    }
 
     let wire = honest_bao_wire_from(payload, req.byte_offset)?;
     let mut unvouchered: u64 = 0;
@@ -12957,6 +12967,7 @@ fn spawn_deposit_capped_server(
     payloads: Vec<Arc<Vec<u8>>>,
     rate: u64,
     deposit: SharedDeposit,
+    resume_delay: Duration,
 ) -> tokio::task::JoinHandle<()> {
     // Same-length blobs only, so the probe's single quoted `total_bytes` is honest
     // for all of them (`two_concurrent_pulls_...` makes the same choice for the
@@ -12981,8 +12992,16 @@ fn spawn_deposit_capped_server(
                 });
             } else {
                 tokio::spawn(async move {
-                    let _ = serve_with_deposit_ceiling(conn, &eth, &dom, &payloads, rate, &deposit)
-                        .await;
+                    let _ = serve_with_deposit_ceiling(
+                        conn,
+                        &eth,
+                        &dom,
+                        &payloads,
+                        rate,
+                        &deposit,
+                        resume_delay,
+                    )
+                    .await;
                 });
             }
         }
@@ -13023,6 +13042,10 @@ struct TopUpSetup {
     /// What the UPSTREAM enforces, if it must differ from what the buyer believes.
     /// `None` keeps them equal, which is the honest case.
     ceiling_micro_usdc: Option<u64>,
+    /// How slowly the upstream serves the RESUME leg, injected into the chunk stream
+    /// after the open. `ZERO` for every scenario but the delivery-speed regression,
+    /// which needs a completing post-top-up leg whose transfer time is measurable.
+    resume_delay: Duration,
 }
 
 impl TopUpSetup {
@@ -13033,6 +13056,7 @@ impl TopUpSetup {
             working_micro_usdc,
             funds,
             ceiling_micro_usdc: None,
+            resume_delay: Duration::ZERO,
         }
     }
 }
@@ -13048,6 +13072,17 @@ async fn top_up_fixture(payload: Arc<Vec<u8>>, setup: TopUpSetup) -> Result<TopU
 async fn top_up_fixture_multi(
     payloads: Vec<Arc<Vec<u8>>>,
     setup: TopUpSetup,
+) -> Result<TopUpFixture> {
+    top_up_fixture_multi_rep(payloads, setup, LocalReputationConfig::default()).await
+}
+
+/// [`top_up_fixture_multi`] with the buyer's local reputation configured explicitly,
+/// so the delivery-speed regression can read a single delivery's speed off the score
+/// (`alpha = 1.0`, no EWMA blend) against a known `expected_bps`.
+async fn top_up_fixture_multi_rep(
+    payloads: Vec<Arc<Vec<u8>>>,
+    setup: TopUpSetup,
+    rep_config: LocalReputationConfig,
 ) -> Result<TopUpFixture> {
     let payload = Arc::clone(
         payloads
@@ -13071,6 +13106,7 @@ async fn top_up_fixture_multi(
         payloads,
         RATE,
         Arc::clone(&ceiling),
+        setup.resume_delay,
     );
 
     let (ep_b, _) = local_endpoint(fresh_key(), vec![]).await?;
@@ -13084,7 +13120,7 @@ async fn top_up_fixture_multi(
     )
     .await?;
 
-    let local_rep = Arc::new(LocalReputation::new(LocalReputationConfig::default())?);
+    let local_rep = Arc::new(LocalReputation::new(rep_config)?);
     let metrics = Arc::new(Metrics::new());
     let recorded = Arc::new(Mutex::new(Vec::new()));
     let opener = Arc::new(FundingOpener {
@@ -13219,6 +13255,95 @@ async fn a_pull_larger_than_the_initial_deposit_tops_up_once_and_completes() -> 
     Ok(())
 }
 
+/// The completing post-top-up leg is REAL delivery and its transfer time must reach
+/// the delivery-speed reputation signal (ADR 008) — a slow upstream that served
+/// through a top-up must score slow, not instantaneous (#1602).
+///
+/// `paid_wait` excludes chain settlement and the re-open probes from `elapsed`, but it
+/// must NOT excuse the streaming of the resumed leg. The bug timed the whole completing
+/// `stream_leg` — open AND `pull_to_sink` — because `note_successful_open` clears
+/// `awaiting_topup_settle` between them, so the flag read at the loop top still said
+/// "charge this leg". The entire remainder's transfer then landed in `paid_wait` and
+/// was subtracted out of `elapsed`, scoring the upstream as if it delivered in zero
+/// time.
+///
+/// # Why this pins what `score(provider) > 0.5` cannot
+///
+/// The reputation is configured so ONE delivery's speed reads straight off the score:
+/// `alpha = 1.0` drops the EWMA blend, so `score == 0.4·speed + 0.6` with
+/// `speed = min(1, bytes_per_sec / expected_bps)`. The upstream is throttled to serve
+/// the resume leg over [`SLOW_RESUME`], so the honest `elapsed` spans at least that:
+///
+/// - CORRECT: `bytes_per_sec ≤ 3 MiB / 3 s = 1 MiB/s`, and at `expected_bps = 2 MiB/s`
+///   that is `speed ≤ 0.5`, so `score ≤ 0.8` — comfortably under the bound below.
+/// - BUGGED: the ~3 s transfer is folded into `paid_wait`, leaving `elapsed ≈ the
+///   pre-top-up leg` (sub-second, no throttle), so `speed` saturates to 1 and the
+///   score pins at ≈1.0.
+///
+/// `> 0.5` — what the other top-up tests assert — passes both, which is exactly why it
+/// never caught this.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slow_post_topup_delivery_scores_slow_not_instant() -> Result<()> {
+    /// Long enough that the resumed leg's transfer dominates `elapsed`, so a score that
+    /// still reads "fast" can only mean the transfer was wrongly charged to `paid_wait`.
+    const SLOW_RESUME: Duration = Duration::from_secs(3);
+    /// 2 MiB/s. Picked so the throttled resume (≤1 MiB/s over the whole blob) reads as
+    /// `speed ≤ 0.5`, while the bug's sub-second `elapsed` saturates `speed` to 1.
+    const EXPECTED_BPS: u64 = 2 * MB_BYTES;
+
+    let payload = multi_interval_payload();
+    let mut rep_config = LocalReputationConfig::default();
+    // One delivery must move the score to exactly its interaction sample, so the speed
+    // term is legible; the default 0.1 EWMA would compress both cases against neutral.
+    rep_config.alpha = 1.0;
+    rep_config.expected_bps = EXPECTED_BPS;
+
+    let mut setup = TopUpSetup::honest(2 * RATE, 200 * RATE, true);
+    setup.resume_delay = SLOW_RESUME;
+    let fixture = top_up_fixture_multi_rep(vec![Arc::clone(&payload)], setup, rep_config).await?;
+
+    let got = tokio::time::timeout(
+        Duration::from_mins(1),
+        Origin::fetch(&fixture.origin, Hash::new(payload.as_ref()), u64::MAX),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("the reactive top-up pull never finished"))?
+    .map_err(|e| anyhow::anyhow!("fetch: {e}"))?;
+    let bytes = got
+        .collect_to_bytes()
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("a topped-up pull must deliver the blob, not NotFound"))?;
+    anyhow::ensure!(
+        bytes.as_ref() == payload.as_slice(),
+        "the resumed pull delivered {} bytes, expected {}",
+        bytes.len(),
+        payload.len()
+    );
+
+    // The pull DID top up and complete — the same path the headline test drives.
+    assert_counter(&fixture.metrics, "node_pull_reactive_topup_total", 1)?;
+    assert_counter(&fixture.metrics, "node_pull_corruption_total", 0)?;
+    assert_counter(&fixture.metrics, "node_pull_unreachable_total", 0)?;
+
+    // The delivery scored, so the speed term is live (`score > 0.6` means `speed > 0`).
+    // The bound that matters: the throttled resume caps an HONEST `elapsed`'s speed at
+    // 0.5, i.e. `score ≤ 0.8`. The bug charges the transfer to `paid_wait`, saturating
+    // the speed and pinning the score at ≈1.0, which trips the ceiling.
+    let score = fixture.local_rep.score(fixture.provider);
+    anyhow::ensure!(
+        score > 0.6,
+        "a completed delivery must credit correctness+reachability, got {score}"
+    );
+    anyhow::ensure!(
+        score < 0.85,
+        "a slow post-top-up delivery must score slow; a score of {score} means the resume \
+         leg's transfer was wrongly excluded from `elapsed` (folded into `paid_wait`) — #1602"
+    );
+
+    fixture.shutdown().await;
+    Ok(())
+}
+
 /// The money assertion: resuming after a top-up must not re-buy the prefix.
 ///
 /// The persisted watermark is channel-cumulative WIRE bytes, so the whole pull's
@@ -13312,6 +13437,7 @@ async fn a_node_crying_poverty_while_our_ledger_has_headroom_is_not_funded() -> 
             working_micro_usdc: 20_000 * RATE,
             funds: true,
             ceiling_micro_usdc: Some(0),
+            resume_delay: Duration::ZERO,
         },
     )
     .await?;
