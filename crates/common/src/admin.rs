@@ -82,7 +82,10 @@ pub enum BindingStatus {
     /// The operator is bound to a DIFFERENT node id than the local key —
     /// the un-slashable state. Either rotate on-chain to match the local key
     /// (`decdn node rotate-key --key iroh --bind-existing`) or restore the
-    /// key the binding names.
+    /// key the binding names. Sampled once at bring-up like every other
+    /// variant here, so a live repair does not clear this to `Bound` until
+    /// the daemon restarts — a `mismatch` seen right after running
+    /// `--bind-existing` is not a failed repair, just a stale sample.
     Mismatch,
     /// The operator address has no binding at all: never registered, or the
     /// node id was reclaimed. `decdn node register` makes the initial binding.

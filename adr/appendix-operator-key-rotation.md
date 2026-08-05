@@ -69,7 +69,7 @@ If both keys must rotate, rotate the **iroh key first** (cheap, atomic on-chain,
 
 The command does not drain, stop, or restart the node. The iroh key is not hot-reloadable, and the command must also work when the daemon is down. Do steps 2, 3, 7, and 8 yourself.
 
-Use `--dry-run` to print both signatures and both nonces. A dry run writes no file and sends no transaction.
+Use `--dry-run` to print both signatures and both nonces. A dry run writes no file and sends no transaction. The printed signatures stay submittable: anyone holding the dry-run output can submit `bindNodeId` themselves until the binding nonce advances, rebinding you to a key you never persisted. Do not paste dry-run output into a shared ticket or chat before you either bind for real or let the operator's `bindingNonce` advance another way.
 
 Use `--bind-existing` to bind the key that is already at `node.secret`. This repairs a node whose key was replaced by hand. It is also the rollback lever in [§ Failure modes and rollback](#failure-modes-and-rollback).
 

@@ -42,9 +42,15 @@
 //! any window where the daemon serves under an unbound key is an unslashable
 //! node. Here that window does not exist: re-onboarding runs against an operator
 //! that has already deregistered and withdrawn, so it has no bond to be
-//! unslashable about and is not serving. Committing the fresh key up front is
-//! therefore safe, and it makes the phase resumable — a failed `registerNode`
-//! retries against the key already on disk instead of minting a third one.
+//! unslashable about and is not serving. Committing a key up front is
+//! therefore safe — **but only if it is not necessarily a fresh one**:
+//! `reonboard` reuses whatever key is already on disk when nothing on chain
+//! claims it (`key_is_reusable`), and mints a new one only otherwise. Without
+//! that check, an unread `registerNode` receipt followed by a retry could mint
+//! and install a second key while the first transaction is still in flight;
+//! if the first then lands, the daemon ends up holding a key the chain never
+//! bound — the exact mismatch this whole command exists to prevent, reachable
+//! through the retry path instead of the happy one.
 
 use std::io;
 use std::path::Path;
@@ -283,6 +289,13 @@ async fn build_plan<P: Provider + Clone>(
         args,
     )
     .await?;
+    // Checked as soon as the phase names a destination address — covers both
+    // `Reonboard` (before any transaction) and `Complete` (before it is
+    // reported as success) — rather than only inside `execute`, so a bad
+    // `--new-keystore` is refused before the confirmation prompt, not after.
+    if let Some(new_operator) = phase.new_operator() {
+        ensure_distinct_operator(old_operator, new_operator)?;
+    }
 
     Ok(Plan {
         capacity_bond: cb_addr,
@@ -345,9 +358,12 @@ async fn select_phase<P: Provider + Clone, Q: Provider>(
     // Bond fully exited. Everything past here needs the new keystore.
     let new_keystore = args.new_keystore.as_deref().ok_or_else(|| {
         anyhow::anyhow!(
-            "the bond is fully withdrawn — the remaining step is to re-bond and re-register from \
-             the NEW address, so pass `--new-keystore <PATH>` (generate one with `decdn key-gen \
-             --output-dir <dir>`). Fund it with TOKEN and a little ETH for gas first."
+            "the bond is fully withdrawn. Pass `--new-keystore <PATH>` to finish re-bonding and \
+             re-registering from the NEW address — or, if you already completed that step, pass \
+             the SAME `--new-keystore` again to confirm it (this command cannot tell the two \
+             apart without it: `isActive` is checked against whatever address the flag names). \
+             Generate a keystore with `decdn key-gen --output-dir <dir>` and fund it with TOKEN \
+             and a little ETH for gas first if you have not re-onboarded yet."
         )
     })?;
     let new_signer = chain_ctx::load_signer_with_password_file(
@@ -522,26 +538,54 @@ async fn reonboard(
         })?;
     terms::ensure_accepted_async(terms_hash, args.accept_terms).await?;
 
-    // Fresh node key. The old id is still bound to the OLD address
-    // (`deregisterNode` does not clear `nodeIdToAddress`), so re-registering it
-    // here would revert `NodeIdAlreadyBound`. Committed before the transactions
-    // rather than after, because `register::submit_registration` reads the key
-    // from disk and because — unlike the iroh path — there is no serving node to
-    // strand: this operator has already deregistered and withdrawn.
+    // A node key. Committed before the transactions rather than after, because
+    // `register::submit_registration` reads the key from disk and because —
+    // unlike the iroh path — there is no serving node to strand: this operator
+    // has already deregistered and withdrawn.
+    //
+    // NOT unconditionally fresh: if a key is already on disk, reuse it when
+    // nothing on chain claims it — that is what actually makes this phase
+    // resumable. A prior attempt may have minted and installed a key, then
+    // lost its `registerNode` receipt (or the process died before submitting
+    // it at all); re-running must retry with THAT key, not mint a second one.
+    // A same-address double-submit is otherwise possible: run 1 broadcasts
+    // registerNode(K1) and loses the receipt; the operator re-runs before it
+    // mines; `isActive(new_operator)` still reads false, so this phase runs
+    // again — unconditional fresh-minting would install K2 and submit
+    // registerNode(K2); if K1 then lands first, K2's registration reverts
+    // (already active) and the daemon is left holding an unbound K2 while the
+    // chain is bound to K1 — the exact unslashable mismatch this command
+    // exists to prevent, just reachable through a different door.
+    //
+    // The key already on disk when this phase FIRST runs is the OLD iroh key,
+    // not a leftover from this migration — `deregisterNode` never clears
+    // `nodeIdToAddress`, so it is still bound to the OLD address specifically.
+    // `key_is_reusable` reads that as "claimed, don't reuse" and falls through
+    // to minting fresh, which is what makes the two cases the same code path.
     let key_path = identity::key_path(&resolved.data_dir);
-    let staged = identity::stage_node_key(&resolved.data_dir).with_context(|| {
-        format!(
-            "failed to stage a new node key in {}",
-            resolved.data_dir.display()
-        )
-    })?;
-    let new_node_id = B256::from_slice(staged.public().as_bytes());
-    staged.commit().with_context(|| {
-        format!(
-            "failed to install the new node key at {}; nothing was submitted",
-            key_path.display()
-        )
-    })?;
+    let new_node_id = if key_path.exists() {
+        let existing = identity::load_or_generate(&resolved.data_dir).with_context(|| {
+            format!(
+                "failed to load node key from {}",
+                resolved.data_dir.display()
+            )
+        })?;
+        let existing_id = B256::from_slice(existing.public().as_bytes());
+        let bound_to = bond_contract
+            .nodeIdToAddress(existing_id)
+            .call()
+            .await
+            .with_context(|| {
+                format!("failed to read nodeIdToAddress from CapacityBond at {cb_addr}")
+            })?;
+        if key_is_reusable(bound_to) {
+            existing_id
+        } else {
+            stage_and_install_fresh_key(&resolved.data_dir, &key_path)?
+        }
+    } else {
+        stage_and_install_fresh_key(&resolved.data_dir, &key_path)?
+    };
     outcome.new_node_id = Some(new_node_id);
 
     // Reuse `decdn node bond`'s plan + execute so the approve → bond →
@@ -582,6 +626,54 @@ async fn reonboard(
     .await;
     outcome.register = register_tx;
     registration.map(|_| ())
+}
+
+/// Whether a node key already on disk is safe to register in `reonboard`,
+/// given what it is currently bound to on chain.
+///
+/// Pure so the resumability guarantee is unit-testable without a live
+/// provider: reuse is safe only when NOTHING claims the key. Bound to
+/// anyone — including the OLD operator this migration is leaving, since
+/// `deregisterNode` never clears `nodeIdToAddress` — means registering it
+/// here would revert `NodeIdAlreadyBound`, so the caller must mint a fresh
+/// one instead.
+fn key_is_reusable(bound_to: Address) -> bool {
+    bound_to.is_zero()
+}
+
+/// Stage, then install, a freshly generated node key. Split out so both
+/// branches of the reuse-or-mint decision in [`reonboard`] share one path to
+/// disk rather than duplicating the stage/commit/error-context sequence.
+fn stage_and_install_fresh_key(data_dir: &Path, key_path: &Path) -> anyhow::Result<B256> {
+    let staged = identity::stage_node_key(data_dir)
+        .with_context(|| format!("failed to stage a new node key in {}", data_dir.display()))?;
+    let id = B256::from_slice(staged.public().as_bytes());
+    staged.commit().with_context(|| {
+        format!(
+            "failed to install the new node key at {}; nothing was submitted",
+            key_path.display()
+        )
+    })?;
+    Ok(id)
+}
+
+/// Refuse a `--new-keystore` that resolves to the SAME address this
+/// Ethereum-key migration is leaving.
+///
+/// A same-address "migration" is not a mistake the contract catches for us —
+/// `firstBondedAt` is write-once and untouched by `deregisterNode`, so
+/// re-bonding the old address would not even reset the cost this path is
+/// supposed to incur, and reporting `phase=complete` against the address the
+/// operator asked to leave would be actively misleading. Pure so the guard is
+/// testable without a chain.
+fn ensure_distinct_operator(old_operator: Address, new_operator: Address) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        new_operator != old_operator,
+        "--new-keystore resolves to {new_operator:#x}, the SAME address this Ethereum-key \
+         migration is leaving. Point it at a genuinely different keystore — generate one with \
+         `decdn key-gen --output-dir <dir>` if you have not yet."
+    );
+    Ok(())
 }
 
 /// The consequence disclosure, pure so its wording is pinned by a test.
@@ -765,6 +857,43 @@ mod tests {
             region: "DE".to_string(),
             multiaddrs: vec!["/ip4/203.0.113.10/udp/4433/quic-v1".to_string()],
         }
+    }
+
+    /// An unbound key is exactly the state a prior `reonboard` attempt leaves
+    /// behind when its `registerNode` never landed — this is the resumability
+    /// path the module doc promises.
+    #[test]
+    fn unbound_key_is_reusable() {
+        assert!(key_is_reusable(Address::ZERO));
+    }
+
+    /// Bound to ANYONE — not just a different operator — must refuse reuse.
+    /// The realistic case is the OLD operator: `deregisterNode` never clears
+    /// `nodeIdToAddress`, so the pre-migration key reads as "claimed" here,
+    /// which is what forces a fresh mint on the very first `reonboard` call
+    /// rather than an attempt to re-register the old identity.
+    #[test]
+    fn a_key_bound_to_anyone_is_not_reusable() {
+        assert!(!key_is_reusable(Address::repeat_byte(0xAB)));
+    }
+
+    /// The bug both reviewers found: reusing a key bound to someone else
+    /// would revert `NodeIdAlreadyBound` at best; the point of the guard is
+    /// that a retry never attempts it.
+    #[test]
+    fn same_address_migration_is_refused() {
+        let addr = Address::repeat_byte(0xAA);
+        let err = ensure_distinct_operator(addr, addr).expect_err("same address must be refused");
+        assert!(
+            format!("{err}").contains("SAME address"),
+            "names the mistake: {err}"
+        );
+    }
+
+    #[test]
+    fn distinct_address_migration_is_allowed() {
+        ensure_distinct_operator(Address::repeat_byte(0xAA), Address::repeat_byte(0xBB))
+            .expect("a genuinely different address is the whole point of this path");
     }
 
     /// The tier is destroyed by the call being confirmed and cannot be read

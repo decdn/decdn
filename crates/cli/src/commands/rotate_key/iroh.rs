@@ -25,8 +25,11 @@
 //! So the new key is *staged* — generated into a temp file that
 //! [`decdn_common::identity::StagedNodeKey`] removes on drop — signed from
 //! while still staged, and committed only after the receipt carries a
-//! `NodeIdBound` log. A `--dry-run` therefore produces genuine signatures over
-//! a genuine key and still writes nothing: the stage is simply dropped.
+//! `NodeIdBound` log. A `--dry-run` produces genuine signatures over a genuine
+//! key and still writes nothing — literally nothing, not even `data_dir`
+//! itself: staging would create it as a side effect of `ensure_data_dir`, so a
+//! preview generates the key in memory only (see [`NewKey::Preview`]) rather
+//! than going through the stage that a real run uses.
 //!
 //! # What rotation costs
 //!
@@ -76,9 +79,14 @@ pub(crate) async fn run(
     let signer = chain_ctx::load_operator_signer(&args.chain.common, &resolved.keystore).await?;
     let provider = decdn_client_pull::provider::build_provider(&resolved.rpc_url, &signer)?;
 
-    // Stage (or load) the key BEFORE the nonce reads: `registrationNonce` is
-    // keyed on the id being bound, so the id has to exist first.
-    let new_key = NewKey::acquire(&resolved.data_dir, args.bind_existing)?;
+    // Stage (or load, or preview-in-memory) the key BEFORE the nonce reads:
+    // `registrationNonce` is keyed on the id being bound, so the id has to
+    // exist first.
+    let new_key = NewKey::acquire(
+        &resolved.data_dir,
+        args.bind_existing,
+        args.chain.common.dry_run,
+    )?;
 
     let plan = build_plan(
         &provider,
@@ -95,8 +103,10 @@ pub(crate) async fn run(
         let mut out = io::stdout().lock();
         write_plan(&mut out, &plan, json, None, None, true)
             .context("failed to write dry-run output")?;
-        // `new_key` drops here. A staged key's temp file goes with it, so a
-        // preview leaves `node.secret` and the data dir exactly as they were.
+        // `new_key` drops here. For `--bind-existing` nothing was ever staged;
+        // otherwise it is a `Preview` that never touched disk in the first
+        // place — so a preview leaves `node.secret` AND the data dir exactly
+        // as they were, including when the data dir did not exist yet.
         return Ok(());
     }
 
@@ -211,38 +221,59 @@ enum NewKey {
     /// Boxed for the same reason [`Self::Staged`] is — both arms wrap a
     /// `SecretKey`-sized payload, so leaving either inline sizes the enum to it.
     Existing(Box<iroh::SecretKey>),
+    /// A freshly generated key that exists ONLY in memory — used for a
+    /// `--dry-run` preview of a key that would otherwise be generated.
+    ///
+    /// `--dry-run` promises to write nothing, and [`identity::stage_node_key`]
+    /// cannot honor that promise on its own: staging calls
+    /// `ensure_data_dir`, which CREATES `data_dir` (mode `0o700`) when it is
+    /// absent — a real filesystem write, left behind even though the staged
+    /// temp file itself is removed on drop. This variant sidesteps
+    /// `stage_node_key` entirely, so a preview touches no path on disk at all.
+    /// [`Self::commit`] refuses it — reaching that call on a `Preview` would
+    /// be this module's own logic error, since `run` only constructs one on
+    /// the branch that returns before `commit` is ever called.
+    ///
+    /// Boxed for the same reason [`Self::Existing`] is.
+    Preview(Box<iroh::SecretKey>),
 }
 
 impl NewKey {
-    /// Generate a new key into the data dir's staging area, or load the one
-    /// already at `node.secret` under `--bind-existing`.
-    fn acquire(data_dir: &Path, bind_existing: bool) -> anyhow::Result<Self> {
-        if !bind_existing {
-            return identity::stage_node_key(data_dir)
-                .with_context(|| {
-                    format!("failed to stage a new node key in {}", data_dir.display())
-                })
-                .map(|k| Self::Staged(Box::new(k)));
+    /// Generate a new key (staged to disk, or in-memory-only for
+    /// `--dry-run`), or load the one already at `node.secret` under
+    /// `--bind-existing`.
+    fn acquire(data_dir: &Path, bind_existing: bool, dry_run: bool) -> anyhow::Result<Self> {
+        if bind_existing {
+            // `load_or_generate` would MINT a key when none exists and then
+            // bind that, which under a flag whose whole meaning is "use what
+            // is already there" would be the opposite of what was asked.
+            let key_path = identity::key_path(data_dir);
+            anyhow::ensure!(
+                key_path.exists(),
+                "--bind-existing needs a node key at {}, and there is none. Drop the flag to \
+                 generate and bind a fresh key, or restore the key you meant to bind first.",
+                key_path.display(),
+            );
+            return identity::load_or_generate(data_dir)
+                .with_context(|| format!("failed to load node key from {}", data_dir.display()))
+                .map(|k| Self::Existing(Box::new(k)));
         }
-        // `load_or_generate` would MINT a key when none exists and then bind
-        // that, which under a flag whose whole meaning is "use what is already
-        // there" would be the opposite of what was asked.
-        let key_path = identity::key_path(data_dir);
-        anyhow::ensure!(
-            key_path.exists(),
-            "--bind-existing needs a node key at {}, and there is none. Drop the flag to generate \
-             and bind a fresh key, or restore the key you meant to bind first.",
-            key_path.display(),
-        );
-        identity::load_or_generate(data_dir)
-            .with_context(|| format!("failed to load node key from {}", data_dir.display()))
-            .map(|k| Self::Existing(Box::new(k)))
+        if dry_run {
+            // In memory only — see the `Preview` variant's doc for why this
+            // cannot go through `stage_node_key`.
+            return Ok(Self::Preview(Box::new(identity::fresh_secret_key())));
+        }
+        identity::stage_node_key(data_dir)
+            .with_context(|| format!("failed to stage a new node key in {}", data_dir.display()))
+            .map(|k| Self::Staged(Box::new(k)))
     }
 
     fn node_id(&self) -> B256 {
         let public = match self {
             Self::Staged(k) => k.public(),
-            Self::Existing(k) => k.public(),
+            // Both hold a plain `iroh::SecretKey`, unlike `Staged`'s
+            // `StagedNodeKey` wrapper, so they share one arm.
+            Self::Existing(k) | Self::Preview(k) => k.public(),
         };
         B256::from_slice(public.as_bytes())
     }
@@ -250,22 +281,33 @@ impl NewKey {
     fn sign(&self, msg: &[u8]) -> [u8; 64] {
         match self {
             Self::Staged(k) => k.sign(msg).to_bytes(),
-            Self::Existing(k) => k.sign(msg).to_bytes(),
+            Self::Existing(k) | Self::Preview(k) => k.sign(msg).to_bytes(),
         }
     }
 
     /// Install the key, returning the archive path of the one it replaced.
     /// `None` means nothing was archived — either a fresh install, or the
     /// `--bind-existing` no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for [`Self::Preview`] rather than panicking: a
+    /// `Preview` only exists on the `--dry-run` branch of `run`, which returns
+    /// before this is ever called, so reaching this arm means that invariant
+    /// broke — worth a clear error over an anti-panic-policy violation.
     fn commit(self) -> anyhow::Result<Option<PathBuf>> {
         match self {
             Self::Staged(k) => k.commit(),
             Self::Existing(_) => Ok(None),
+            Self::Preview(_) => Err(anyhow::anyhow!(
+                "internal: attempted to commit a --dry-run preview key; this should be \
+                 unreachable — dry-run returns before commit is called"
+            )),
         }
     }
 
     const fn generated(&self) -> bool {
-        matches!(self, Self::Staged(_))
+        matches!(self, Self::Staged(_) | Self::Preview(_))
     }
 }
 
@@ -505,8 +547,13 @@ pub(crate) fn write_plan(
     dry_run: bool,
 ) -> io::Result<()> {
     // A generated key is only knowable after it is committed. On a preview the
-    // stage is discarded, so the id shown is a real signature subject but NOT
-    // the id a later run will bind — say so rather than let it be quoted back.
+    // key is never persisted, so the id shown is a real signature subject but
+    // NOT the id a later run will bind — say so rather than let it be quoted
+    // back. The signatures themselves stay submittable regardless: they cover
+    // the CURRENT on-chain nonces, so anyone holding this output can submit
+    // `bindNodeId` with them until the operator's `bindingNonce` advances,
+    // rebinding the operator to a key whose secret exists nowhere — an
+    // off-chain griefing lever the runbook's `--dry-run` paragraph warns about.
     let preview_key = dry_run && p.generated;
     let tx_hex = tx.map(|v| format!("{v:#x}"));
     let archived_str = archived.map(|a| a.display().to_string());
@@ -560,6 +607,48 @@ pub(crate) fn write_plan(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// A `--dry-run` preview of a fresh key must not create `data_dir`, let
+    /// alone write into it — the bug the FS side effect was: `stage_node_key`
+    /// eagerly creates the directory via `ensure_data_dir` even though its
+    /// temp file is removed on drop, so a preview against a data dir that
+    /// does not exist yet used to leave it behind anyway.
+    #[test]
+    fn dry_run_acquire_creates_no_data_dir() {
+        let tmp = tempfile::tempdir().expect("make a scratch dir");
+        let data_dir = tmp.path().join("does-not-exist-yet");
+        assert!(!data_dir.exists());
+
+        let key = NewKey::acquire(&data_dir, false, true).expect("preview key must build");
+        assert!(
+            !data_dir.exists(),
+            "a --dry-run preview must not create the data dir"
+        );
+        assert!(matches!(key, NewKey::Preview(_)));
+    }
+
+    /// Same guarantee restated at the type level: a preview can sign (the
+    /// receipt needs a real ownership proof) but must refuse to commit,
+    /// because nothing should ever call `commit` on one.
+    #[test]
+    fn preview_key_refuses_to_commit() {
+        let key = NewKey::Preview(Box::new(identity::fresh_secret_key()));
+        // Signing must still work — a dry run's printed signatures are real.
+        let _ = key.sign(b"digest");
+        key.commit().expect_err("a preview must never be committed");
+    }
+
+    /// `--bind-existing` is unaffected by `dry_run`: it only ever loads, and
+    /// `NewKey::acquire`'s existence check runs regardless.
+    #[test]
+    fn bind_existing_dry_run_still_requires_an_existing_key() {
+        let tmp = tempfile::tempdir().expect("make a scratch dir");
+        let result = NewKey::acquire(tmp.path(), true, true);
+        let err = result
+            .err()
+            .expect("bind-existing with no key on disk must fail, dry-run or not");
+        assert!(format!("{err}").contains("--bind-existing needs a node key"));
+    }
 
     fn plan(generated: bool, active: bool) -> Plan {
         Plan {
