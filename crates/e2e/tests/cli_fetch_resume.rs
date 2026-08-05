@@ -31,6 +31,12 @@
 //!    hash. That refusal carries no watermark bundle, so nothing reseeds — and
 //!    leaving the partial in place would wedge the command permanently. Adjacent
 //!    to journey 3 and behaves oppositely, which is exactly why both are here.
+//! 5. **Complete partial, exact-multiple-of-16-KiB blob.** `resume_offset` snaps a
+//!    length DOWN to a group boundary, so a complete `.partial` for a blob whose
+//!    total size is an exact multiple of the chunk-group size yields `byte_offset
+//!    == total_bytes`. The node's range gate refuses that with the same wire
+//!    `NotFound` a stale partial draws, so the naive path rewinds to zero and
+//!    RE-PAYS for a blob already fully on disk. The fetch must finish it for FREE.
 //!
 //! Gated behind the `anvil-e2e` feature (off by default). Requires `anvil` +
 //! `forge` on `PATH` and a prior build of the `decdn` binary:
@@ -95,6 +101,22 @@ fn make_blob() -> Vec<u8> {
     v
 }
 
+/// A blob whose total size is an EXACT multiple of the chunk-group size, so a
+/// COMPLETE `.partial` snaps to `byte_offset == total_bytes` — the aligned-size
+/// resume trap journey 5 guards. Distinct byte pattern from [`make_blob`] so a
+/// crossed-up hash can never pass by coincidence.
+fn make_aligned_blob() -> Vec<u8> {
+    let mut v = vec![0u8; 8 * CHUNK_GROUP];
+    let mut x: u32 = 0x8bad_f00d;
+    for b in &mut v {
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        *b = x.to_le_bytes().first().copied().unwrap_or(0);
+    }
+    v
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "one sequential end-to-end journey: each step depends on the previous step's fetch \
@@ -112,11 +134,22 @@ async fn run() -> anyhow::Result<()> {
 
     let blob = make_blob();
     let blob_hash = Hash::new(&blob);
-    let (node, hashes) = NodeFixture::launch_with_blobs(&chain, "US", &[blob.as_slice()]).await?;
+    // A second blob whose total size is an EXACT multiple of the chunk-group size,
+    // for the aligned-complete-partial journey (journey 5).
+    let aligned = make_aligned_blob();
+    let aligned_hash = Hash::new(&aligned);
+    let (node, hashes) =
+        NodeFixture::launch_with_blobs(&chain, "US", &[blob.as_slice(), aligned.as_slice()])
+            .await?;
     anyhow::ensure!(
         hashes.first() == Some(&blob_hash),
         "seeded blob hash mismatch: {:?} vs {blob_hash}",
         hashes.first()
+    );
+    anyhow::ensure!(
+        hashes.get(1) == Some(&aligned_hash),
+        "seeded aligned blob hash mismatch: {:?} vs {aligned_hash}",
+        hashes.get(1)
     );
 
     // Funded buyer with an on-disk keystore under a `0o700` client data dir (the
@@ -152,6 +185,16 @@ async fn run() -> anyhow::Result<()> {
         client_dir.path(),
         &keystore,
         &out,
+    );
+    let out_aligned = client_dir.path().join("aligned.bin");
+    let partial_aligned = client_dir.path().join("aligned.bin.partial");
+    let aligned_args = fetch_argv(
+        &chain,
+        &node,
+        &aligned_hash,
+        client_dir.path(),
+        &keystore,
+        &out_aligned,
     );
 
     // ---- Journey 1: a clean fetch ----
@@ -275,6 +318,50 @@ async fn run() -> anyhow::Result<()> {
     anyhow::ensure!(
         !partial.exists(),
         "the .partial must be promoted away after recovering from a stale one"
+    );
+
+    // ---- Journey 5: a COMPLETE partial for an exact-multiple-of-16-KiB blob ----
+    //
+    // `resume_offset(len)` snaps DOWN to a chunk-group boundary, so a complete
+    // `.partial` for a blob whose total size is an exact multiple of the group
+    // size yields `byte_offset == total_bytes`. The node's range gate refuses
+    // `byte_offset >= total_bytes` with `RangeNotSatisfiable`, which collapses to
+    // the same wire `NotFound` a stale partial draws — so the naive path reads it
+    // as "wrong blob", rewinds to zero, and RE-PAYS for a blob already fully on
+    // disk. A ragged final group (journeys 1-2) never hits this; only exact
+    // multiples do.
+    //
+    // A complete `.partial` with no `--output` is exactly the on-disk state a
+    // crash between the last flush and the atomic promote leaves behind.
+    std::fs::write(&partial_aligned, &aligned).context("seed complete aligned partial")?;
+    anyhow::ensure!(
+        !out_aligned.exists(),
+        "aligned output should not exist before journey 5"
+    );
+
+    let before_complete = billed_bytes(client_dir.path(), node.operator_addr())?;
+    run_fetch_until_ready(client_dir.path(), &aligned_args).await?;
+
+    let got = std::fs::read(&out_aligned).context("read aligned output")?;
+    anyhow::ensure!(
+        got == aligned,
+        "a complete aligned partial must be promoted as-is: got {} bytes, expected {}",
+        got.len(),
+        aligned.len()
+    );
+    anyhow::ensure!(
+        !partial_aligned.exists(),
+        "the complete .partial must be promoted away, not left beside --output"
+    );
+    let complete_cost =
+        billed_bytes(client_dir.path(), node.operator_addr())?.saturating_sub(before_complete);
+    // THE assertion for this journey: a partial that is already the whole blob is
+    // finished with ZERO further payment. Any positive cost means the file was
+    // truncated and the whole blob re-fetched — the aligned-size re-pay bug.
+    anyhow::ensure!(
+        complete_cost == 0,
+        "a complete partial must cost nothing to finish: billed {complete_cost} extra bytes for a \
+         blob already fully on disk (the aligned-size re-pay bug)"
     );
 
     // `NodeFixture` tears the daemon down on drop; there is nothing to await.
