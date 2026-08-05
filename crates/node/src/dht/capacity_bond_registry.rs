@@ -367,6 +367,16 @@ where
             .call()
             .await
             .with_context(|| format!("getRegisteredNodes(offset={offset}, limit={PAGE_SIZE})"))?;
+        // `page` and `active` are equal-length by construction (the contract fills
+        // both in one loop). A divergence is an ABI/decoder fault; the `zip` below
+        // would silently truncate and drop stakers/bindings, so fail loudly.
+        anyhow::ensure!(
+            resp.page.len() == resp.active.len(),
+            "getRegisteredNodes(offset={offset}) returned mismatched page/active \
+             lengths ({} vs {}) — ABI or decoder fault",
+            resp.page.len(),
+            resp.active.len()
+        );
         if resp.page.is_empty() {
             break;
         }

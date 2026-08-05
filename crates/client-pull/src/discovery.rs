@@ -276,6 +276,16 @@ where
                 }
             }
         };
+        // `page` and `active` are equal-length by construction (the contract
+        // fills both in one loop). A divergence is an ABI/decoder fault; the
+        // `zip` below would silently truncate and drop candidates, so fail loudly.
+        anyhow::ensure!(
+            page.len() == active.len(),
+            "CapacityBond.getRegisteredNodes(offset={offset}) returned mismatched \
+             page/active lengths ({} vs {}) — ABI or decoder fault",
+            page.len(),
+            active.len()
+        );
         let page_len = page.len() as u64;
         // `active[i]` is the on-chain `isActive(page[i])`, index-aligned with the
         // page. Zip so the strict predicate — not the raw `NodeInfo.active` flag —
@@ -1174,6 +1184,23 @@ mod tests {
         assert_eq!(tokio::time::Instant::now() - start, Duration::ZERO);
         assert!(format!("{err:#}").contains("will not succeed on retry"));
         assert!(format!("{err:#}").contains("capacity_bond_address"));
+    }
+
+    /// `getRegisteredNodes` returns `page` and `active` as equal-length arrays by
+    /// construction (the contract fills both in one loop). A divergence means an
+    /// ABI/decoder fault, and zipping would silently truncate — dropping
+    /// candidates without a trace. Fail loudly instead.
+    #[tokio::test]
+    async fn mismatched_page_and_active_lengths_error_rather_than_truncate() {
+        let err = paginate_with_retry(|_offset| async {
+            Ok((vec![node_info(valid_node_id(1), true)], Vec::<bool>::new()))
+        })
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("mismatched"),
+            "expected a length-mismatch error, got: {err:#}"
+        );
     }
 
     #[tokio::test(start_paused = true)]
