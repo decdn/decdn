@@ -812,7 +812,7 @@ async fn build_chain_and_handlers(
     // One CapacityBond enumeration + one watcher feeding both registry
     // projections (#1110). The bindings half is built only when pull-through is
     // on; it derives from page data already read here, so — unlike when it had its
-    // own bootstrap — it has no RPC that can fail on its own. `getActiveNodes`
+    // own bootstrap — it has no RPC that can fail on its own. `getRegisteredNodes`
     // failure was already fatal via this same (unconditional, first-to-run) call,
     // so nothing that boots today loses pull-through.
     let registry = crate::dht::capacity_bond_registry::bootstrap(

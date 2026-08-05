@@ -3,8 +3,8 @@
 //! [`ChainStakerSet`] (membership: `NodeId → active?`) and
 //! [`ChainNodeAddressDirectory`] (bindings: `NodeId → operator address`) are both
 //! derived from the same `CapacityBond` contract. They used to bootstrap and
-//! watch it independently: two paginated `getActiveNodes` reads at boot, and two
-//! `eth_getLogs` poll loops thereafter, filtering the same address — with
+//! watch it independently: two paginated `getRegisteredNodes` reads at boot, and
+//! two `eth_getLogs` poll loops thereafter, filtering the same address — with
 //! node-address's two topics a strict *subset* of staker-set's five. This module
 //! runs one enumeration and one loop, demuxing to both projections.
 //!
@@ -19,8 +19,9 @@
 //!
 //! At bootstrap they genuinely diverge:
 //!
-//! - `active` applies `isActive(operator)` per entry (the `getActiveNodes` page is
-//!   the *unfiltered* `_registeredAddrs` array per the contract's own comment).
+//! - `active` takes the per-entry `active[i]` that `getRegisteredNodes` computes
+//!   on-chain (`isActive(operator)`: registered AND bond ≥ minBond AND no
+//!   unbonding AND not ejected) alongside the `_registeredAddrs` page.
 //! - `bindings` applies no filter: an operator mid-unbonding has `isActive =
 //!   false` but is still payable, so its binding must survive.
 //!
@@ -28,7 +29,7 @@
 //!
 //! Staker-set bootstrap is fatal; node-address bootstrap was non-fatal
 //! (pull-through is opportunistic). Sharing the read *eliminates* rather than
-//! violates that asymmetry: `getActiveNodes`/`isActive` failure was already fatal,
+//! violates that asymmetry: `getRegisteredNodes` failure was already fatal,
 //! because the unconditional staker-set bootstrap ran first and propagated it —
 //! the node-address bootstrap was never reached. With the read shared, the
 //! bindings projection has **no RPC of its own**: it is derived from page data
@@ -63,7 +64,7 @@ use crate::metrics::{Metrics, metric_hook};
 use decdn_common::redact::sanitize_err_chain;
 use decdn_incentive::capacity_bond::CapacityBond;
 
-/// Page size for the paginated `getActiveNodes` read. Matches ADR 019 § Step
+/// Page size for the paginated `getRegisteredNodes` read. Matches ADR 019 § Step
 /// 3.3's worked-example limit.
 const PAGE_SIZE: u64 = 100;
 
@@ -333,7 +334,7 @@ impl<R: RegistryChainReads> LogSink for RegistrySink<R> {
     }
 }
 
-/// How often the watcher re-derives both projections from `getActiveNodes`.
+/// How often the watcher re-derives both projections from `getRegisteredNodes`.
 ///
 /// Fifteen minutes is well under any plausible drift-detection window and costs
 /// one paginated read plus an `isActive` per registered operator — on a network
@@ -343,13 +344,14 @@ impl<R: RegistryChainReads> LogSink for RegistrySink<R> {
 /// lose the only repair for a drifted set short of a process restart.
 const REGISTRY_RESYNC_INTERVAL: Duration = Duration::from_mins(15);
 
-/// One paginated `getActiveNodes` read feeding both projections.
+/// One paginated `getRegisteredNodes` read feeding both projections.
 ///
 /// Always returns both maps and lets the caller drop the unwanted one — a
 /// `want_bindings: bool` parameter would be a boolean trap, and building the map
 /// is free while already iterating the page. See the module doc for why `active`
-/// is `isActive`-filtered (at the cost of an N+1 per entry; `Multicall3` batching
-/// remains the follow-up) and `bindings` is not.
+/// is `isActive`-filtered and `bindings` is not: `getRegisteredNodes` computes
+/// `isActive` per entry on-chain and returns it as a parallel `active[]`, so a
+/// single call per page derives both projections with no per-entry round-trip.
 async fn bootstrap_registry<P>(
     registry: &CapacityBond::CapacityBondInstance<P>,
 ) -> Result<(HashSet<NodeId>, HashMap<NodeId, Address>)>
@@ -360,23 +362,31 @@ where
     let mut bindings = HashMap::new();
     let mut offset = 0u64;
     loop {
-        let page = registry
-            .getActiveNodes(U256::from(offset), U256::from(PAGE_SIZE))
+        let resp = registry
+            .getRegisteredNodes(U256::from(offset), U256::from(PAGE_SIZE))
             .call()
             .await
-            .with_context(|| format!("getActiveNodes(offset={offset}, limit={PAGE_SIZE})"))?;
-        if page.is_empty() {
+            .with_context(|| format!("getRegisteredNodes(offset={offset}, limit={PAGE_SIZE})"))?;
+        // `page` and `active` are equal-length by construction (the contract fills
+        // both in one loop). A divergence is an ABI/decoder fault; the `zip` below
+        // would silently truncate and drop stakers/bindings, so fail loudly.
+        anyhow::ensure!(
+            resp.page.len() == resp.active.len(),
+            "getRegisteredNodes(offset={offset}) returned mismatched page/active \
+             lengths ({} vs {}) — ABI or decoder fault",
+            resp.page.len(),
+            resp.active.len()
+        );
+        if resp.page.is_empty() {
             break;
         }
-        let page_len = page.len() as u64;
-        for node in &page {
+        let page_len = resp.page.len() as u64;
+        // `active[i]` is `isActive(page[i])`, computed on-chain and index-aligned
+        // with `page` by the contract. `bindings` takes every entry (unfiltered):
+        // an operator mid-unbonding is inactive but still payable.
+        for (node, &is_active) in resp.page.iter().zip(resp.active.iter()) {
             let node_id = NodeId::from_bytes(node.nodeId.0);
             bindings.insert(node_id, node.ethAddress);
-            let is_active = registry
-                .isActive(node.ethAddress)
-                .call()
-                .await
-                .with_context(|| format!("isActive({operator})", operator = node.ethAddress))?;
             if is_active {
                 active.insert(node_id);
             }
@@ -415,7 +425,7 @@ where
         .context("read head block for CapacityBond registry snapshot")?;
     let (initial_active, initial_bindings) =
         bootstrap_registry(&registry).await.with_context(|| {
-            format!("paginated getActiveNodes from CapacityBond at {registry_addr}")
+            format!("paginated getRegisteredNodes from CapacityBond at {registry_addr}")
         })?;
     info!(
         active_count = initial_active.len(),

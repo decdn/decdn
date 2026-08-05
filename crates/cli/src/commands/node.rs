@@ -1166,7 +1166,7 @@ fn format_interval(secs: u64) -> String {
 }
 
 /// `decdn node lookup` — unpaid client-side discovery of active nodes via
-/// `CapacityBond.getActiveNodes` (#1481). Unlike `register`/`bond`/`unbond`/
+/// `CapacityBond.getRegisteredNodes` (#1481). Unlike `register`/`bond`/`unbond`/
 /// `deregister`, this never loads a keystore: [`discovery::active_nodes`]
 /// builds its own signer-less read-only provider, so `chain_ctx::resolve`'s
 /// `keystore`/`data_dir` outputs are simply unused here.

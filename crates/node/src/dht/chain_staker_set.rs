@@ -4,15 +4,17 @@
 //! and its accessors. The `CapacityBond` enumeration and
 //! the event watcher that keep it current live in
 //! [`crate::dht::capacity_bond_registry`] (#1110), which builds this via
-//! `ChainStakerSet::from_parts` — it shares one `getActiveNodes` read and one
+//! `ChainStakerSet::from_parts` — it shares one `getRegisteredNodes` read and one
 //! `eth_getLogs` loop with the node-address directory, since both are derived
 //! from the same contract.
 //!
-//! The cached set is seeded from `CapacityBond.getActiveNodes()`, each entry
-//! filtered through `isActive(operator)` to apply the full predicate — registered,
-//! bond ≥ minBond, no unbonding, not ejected — because the `getActiveNodes` page
-//! is the un-filtered `_registeredAddrs` array per the contract's own comment. It
-//! then follows the five membership-mutating events, applying a `StakerChange`
+//! The cached set is seeded from `CapacityBond.getRegisteredNodes()`, keyed on the
+//! parallel `active[]` the contract computes per entry — the full `isActive`
+//! predicate: registered, bond ≥ minBond, no unbonding, not ejected. The page
+//! itself is the un-filtered `_registeredAddrs` array (the node-address directory
+//! keeps every entry), so the contract returns the predicate alongside it rather
+//! than filtering the page. It then follows the five membership-mutating events,
+//! applying a `StakerChange`
 //! for every observed transition. (Not an intra-doc link: `StakerChange` is
 //! private to `dht` since #1231, and this module doc is public.)
 //!
@@ -20,9 +22,9 @@
 //!
 //! - ADR 022 §STORE Flow: the receiver checks `holder` is in the
 //!   cached active-staker set populated from
-//!   `CapacityBond.getActiveNodes()`.
+//!   `CapacityBond.getRegisteredNodes()`.
 //! - ADR 019 § Step 3.3: bootstrap pattern (initial paginated
-//!   `getActiveNodes` + event follow — implemented as an `eth_getLogs`
+//!   `getRegisteredNodes` + event follow — implemented as an `eth_getLogs`
 //!   poll, #1106).
 //! - The event set the watcher follows is grounded in
 //!   `CapacityBond.sol`'s own write-paths — every contract write
@@ -38,7 +40,7 @@
 //! exponentially-growing backoff (1s → 60s cap), and re-polls. The cursor is
 //! retained across the backoff, so the next `eth_getLogs` tick re-scans
 //! `[cursor, head]` and re-applies any membership event that landed during the
-//! outage — no stream-level drift window. (There is still no `getActiveNodes`
+//! outage — no stream-level drift window. (There is still no `getRegisteredNodes`
 //! resync to reconcile against a checkpoint older than the live cursor, but that
 //! is only reachable via the per-event `nodeIdOf` drop below, not a backoff gap.)
 //!
@@ -70,7 +72,7 @@
 //! there is no separate node-address watcher family to correlate against
 //! (#1231).
 //!
-//! A `getActiveNodes` resync-on-extended-outage path is a follow-up;
+//! A `getRegisteredNodes` resync-on-extended-outage path is a follow-up;
 //! these metrics surface the window that path would close.
 
 use std::collections::HashSet;

@@ -135,7 +135,7 @@ After the initial enumeration, the node follows the contract's blacklist events 
 
 #### Step 3.3 — Build initial peer table from on-chain registry
 
-Query `CapacityBond.getActiveNodes(offset=0, limit=100)` to bootstrap the peer table. For PoC (tens of nodes) a single call suffices; for larger networks, paginate until all active nodes are fetched.
+Query `CapacityBond.getRegisteredNodes(offset=0, limit=100)` to bootstrap the peer table. For PoC (tens of nodes) a single call suffices; for larger networks, paginate until all active nodes are fetched.
 
 This registry snapshot is the initial peer table; gossip updates (Phase 4) keep it fresh. The node also subscribes to `NodeRegistered`, `NodeMultiaddrUpdated`, `NodeDeregistered`, and `NodeAutoEjected` events to maintain a local registry cache used during gossip validation ([ADR 001](001-network.md#registry-cache)).
 
