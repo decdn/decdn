@@ -129,7 +129,7 @@ fn parse_range_header(value: &str) -> Option<(u64, u64)> {
     Some((a.parse().ok()?, b.parse().ok()?))
 }
 
-/// Verbatim copy of `serve_range_origin`'s mounting logic
+/// Adapted from `serve_range_origin` (`pull_through.rs`): same outboard + 206-range
 /// (`pull_through.rs:4063`): mounts `{hex}.obao4` (full `200`) and `{hex}`
 /// (`206` on `Range`), adapted to serve arbitrary ranges via
 /// [`RangeResponder`] instead of one pinned range.
