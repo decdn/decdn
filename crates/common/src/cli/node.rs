@@ -666,7 +666,7 @@ pub struct RotateKeyArgs {
     #[arg(long = "key", value_name = "KEY", value_enum)]
     pub key: RotateKeyTarget,
 
-    /// (`--key iroh`) Bind the node key **already on disk** instead of
+    /// (`--key iroh`) Bind the node key ALREADY ON DISK instead of
     /// generating a fresh one.
     ///
     /// Two jobs, both from the runbook's § Failure modes and rollback: repair a
@@ -680,14 +680,21 @@ pub struct RotateKeyArgs {
     /// (`--key eth`) Keystore holding the NEW Ethereum key to migrate onto.
     /// Required to reach the re-onboarding phase; the earlier phases
     /// (deregister, unbond request, window wait, withdraw) all run against the
-    /// current keystore and do not need it.
+    /// current keystore and do not need it. Passing it earlier is still useful:
+    /// the address is validated against the one being migrated away from on
+    /// every invocation, so a same-address mistake is caught on the first run
+    /// rather than after the unbonding window.
+    ///
+    /// Both keystores are unlocked from the same password source
+    /// (`DECDN_KEYSTORE_PASSWORD`, then `--keystore-password-file`, then a
+    /// prompt), so a headless migration needs them to share a password.
     #[arg(long = "new-keystore", value_name = "PATH")]
     pub new_keystore: Option<PathBuf>,
 
-    /// (`--key eth`) Capacity tier to re-declare on the new address. Defaults
-    /// to the tier the old address declared before deregistration, captured at
-    /// the `deregister` phase — pass it explicitly to change tiers across the
-    /// migration.
+    /// (`--key eth`) Capacity tier to re-declare on the new address. Required
+    /// at the re-onboarding phase: `deregisterNode` clears the declared tier and
+    /// it cannot be read back afterwards, so record the value the deregister
+    /// phase prints and pass it here.
     #[arg(long = "mbps", value_name = "MBPS")]
     pub mbps: Option<u64>,
 

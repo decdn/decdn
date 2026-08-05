@@ -288,6 +288,49 @@ impl StagedNodeKey {
         self.committed = true;
         Ok(bak)
     }
+
+    /// Preserve the staged key *without* installing it, at
+    /// `<data_dir>/node.secret.pending.<node_id>`. Returns the path it landed at.
+    ///
+    /// The third outcome, between [`Self::commit`] and the `Drop` that discards
+    /// an abandoned stage. It exists for one situation: a key-rotation
+    /// transaction was broadcast but its receipt could not be read, so whether
+    /// the chain now names this key is **unknown**. Discarding the secret there
+    /// is unrecoverable — if the transaction did land, the operator is bound to
+    /// an identity whose private key no longer exists anywhere, and the daemon
+    /// keeps serving under a key nothing binds. Installing it is equally wrong,
+    /// because the transaction may instead have failed.
+    ///
+    /// So the key is parked under a name that is deliberately *not*
+    /// `node.secret`: no daemon will load it, and the operator can install it
+    /// once they have checked whether the transaction confirmed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the rename fails. On any error the `Drop` handler
+    /// still removes the temp — a key that could not be parked is no more
+    /// recoverable than one that was discarded, and leaving key material at an
+    /// unadvertised temp path would be worse than either.
+    pub fn keep(mut self) -> anyhow::Result<PathBuf> {
+        let parent = self.final_path.parent().ok_or_else(|| {
+            anyhow!(
+                "staged key path has no parent directory: {}",
+                self.final_path.display()
+            )
+        })?;
+        let dest = parent.join(format!("{KEY_FILE_NAME}.pending.{}", self.key.public()));
+        fs::rename(&self.tmp, &dest).with_context(|| {
+            format!(
+                "failed to park the staged node key at {} (it will be discarded)",
+                dest.display()
+            )
+        })?;
+        // Only after the rename succeeds: `Drop` must still clean up the temp if
+        // the rename failed, and must NOT try to delete a path it no longer owns
+        // if it succeeded.
+        self.committed = true;
+        Ok(dest)
+    }
 }
 
 impl Drop for StagedNodeKey {

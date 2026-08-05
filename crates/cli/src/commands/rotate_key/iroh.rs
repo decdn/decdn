@@ -101,7 +101,7 @@ pub(crate) async fn run(
     let json = args.chain.common.json;
     if args.chain.common.dry_run {
         let mut out = io::stdout().lock();
-        write_plan(&mut out, &plan, json, None, None, true)
+        write_plan(&mut out, &plan, json, None, None, true, false)
             .context("failed to write dry-run output")?;
         // `new_key` drops here. For `--bind-existing` nothing was ever staged;
         // otherwise it is a `Preview` that never touched disk in the first
@@ -138,35 +138,134 @@ pub(crate) async fn run(
     let receipt = match sent {
         Ok(receipt) => receipt,
         Err(err) => {
-            let mut out = io::stdout().lock();
-            write_plan(&mut out, &plan, json, outcome.tx().as_ref(), None, false)
-                .context("failed to write result")?;
+            // `maybe_effected()` is the question that decides the key's fate, and
+            // it is NOT the same as "we have a hash": `MaybeBroadcast` has no
+            // hash yet may still have reached the mempool. Whenever the bind may
+            // have landed, the staged secret must survive — dropping it here is
+            // what makes the failure unrecoverable rather than merely annoying.
+            let parked = park_key_if_effected(new_key, &outcome, &plan);
+            report(
+                &plan,
+                json,
+                outcome.tx().as_ref(),
+                None,
+                parked.as_deref(),
+                false,
+            );
             return Err(err);
         }
     };
+
+    // Read the hash BEFORE the gate below: every path from here on may have
+    // moved the binding, and an error that cannot name the transaction leaves
+    // the operator with nothing to check on a block explorer.
+    let tx = receipt.transaction_hash;
 
     // Runbook step 5 verifies the `NodeIdBound` event, and here that check is
     // load-bearing rather than ceremonial: it is the gate on replacing
     // `node.secret`. A receipt that mined without the log means the binding did
     // not move (or the deployed ABI drifted), and committing the key against it
     // is precisely how the daemon ends up unslashable.
-    confirm_bound(&receipt, plan.operator, plan.new_node_id)?;
-    let tx = receipt.transaction_hash;
+    if let Err(err) = confirm_bound(
+        &receipt,
+        plan.operator,
+        plan.new_node_id,
+        plan.capacity_bond,
+    ) {
+        // The transaction MINED, so this is not the harmless "nothing happened"
+        // case. Either the binding did not move (log genuinely absent) or it did
+        // and the log failed to decode (ABI drift) — the two are not
+        // distinguishable from here, so park the key rather than discard a
+        // secret the chain may now be bound to.
+        let parked = park_key(new_key, &plan);
+        report(&plan, json, Some(&tx), None, parked.as_deref(), false);
+        return Err(err);
+    }
 
-    let archived = new_key.commit().with_context(|| {
-        format!(
-            "the on-chain binding has ALREADY moved to {:#x} (tx {tx:#x}), but installing the new \
-             node key failed. The daemon still holds the old key, which is now unbound and cannot \
-             serve. Fix the cause below, then either re-run with `--bind-existing` to bind \
-             whatever key is on disk, or restore the archived key and bind that",
-            plan.new_node_id,
-        )
-    })?;
+    let archived = match new_key.commit() {
+        Ok(archived) => archived,
+        Err(err) => {
+            // The binding is confirmed moved. Report it as a real receipt — a
+            // `--json` consumer that gets empty stdout here cannot tell this
+            // from a config error that sent nothing.
+            report(&plan, json, Some(&tx), None, None, false);
+            return Err(err).with_context(|| {
+                format!(
+                    "the on-chain binding has ALREADY moved to {:#x} (tx {tx:#x}), but installing \
+                     the new node key failed. The daemon still holds the old key, which is now \
+                     unbound and cannot serve. Fix the cause below, then either re-run with \
+                     `--bind-existing` to bind whatever key is on disk, or restore the archived \
+                     key and bind that",
+                    plan.new_node_id,
+                )
+            });
+        }
+    };
 
-    let mut out = io::stdout().lock();
-    write_plan(&mut out, &plan, json, Some(&tx), archived.as_deref(), false)
-        .context("failed to write result")?;
+    report(&plan, json, Some(&tx), archived.as_deref(), None, true);
     Ok(())
+}
+
+/// Write the outcome to stdout, reporting a write failure to stderr rather than
+/// returning it.
+///
+/// Every call site is on a path that already has something more important to
+/// say — a send error, a failed gate, a transaction that may be in flight. If
+/// the stdout write is allowed to `?`, it *replaces* that error: piping this
+/// command into `head` is enough to turn "the transaction may have been
+/// broadcast; re-sending is not idempotent" into "Broken pipe". The receipt is
+/// the less important of the two, so it degrades and the real error survives.
+fn report(
+    plan: &Plan,
+    json: bool,
+    tx: Option<&B256>,
+    archived: Option<&Path>,
+    parked: Option<&Path>,
+    persisted: bool,
+) {
+    let mut out = io::stdout().lock();
+    if let Err(err) = write_plan(&mut out, plan, json, tx, archived, false, persisted) {
+        eprintln!("failed to write the result receipt to stdout: {err}");
+    }
+    if let Some(path) = parked {
+        eprintln!(
+            "the newly generated node key was NOT installed, but has been preserved at {}. \
+             Check whether the transaction confirmed: if it did, this file is the private key \
+             for the node id now bound on-chain and must be moved over `node.secret` before the \
+             daemon can serve. If it did not, delete it.",
+            path.display()
+        );
+    }
+}
+
+/// Park the staged key when the transaction may have taken effect; discard it
+/// (via `Drop`) when it definitively did not.
+///
+/// A `Rejected` send never reached the mempool, so the key is genuinely
+/// worthless and preserving it would only litter the data dir with key material.
+fn park_key_if_effected(key: NewKey, outcome: &SendOutcome, plan: &Plan) -> Option<PathBuf> {
+    if !outcome.maybe_effected() {
+        return None;
+    }
+    park_key(key, plan)
+}
+
+/// Preserve a generated-but-uninstalled key, reporting a failure to stderr.
+///
+/// Returns `None` when there was nothing to preserve — `--bind-existing` binds a
+/// key that is already at `node.secret`, and a `Preview` never reaches a send.
+fn park_key(key: NewKey, plan: &Plan) -> Option<PathBuf> {
+    match key.park() {
+        Ok(path) => path,
+        Err(err) => {
+            eprintln!(
+                "could not preserve the newly generated node key for {:#x}; it has been \
+                 discarded: {err}",
+                plan.new_node_id
+            );
+            None
+        }
+    }
 }
 
 /// Refuse `--key eth` flags on the iroh path instead of ignoring them.
@@ -303,6 +402,24 @@ impl NewKey {
                 "internal: attempted to commit a --dry-run preview key; this should be \
                  unreachable — dry-run returns before commit is called"
             )),
+        }
+    }
+
+    /// Preserve a generated key without installing it, for the case where the
+    /// bind may have landed but could not be confirmed.
+    ///
+    /// `Ok(None)` means there was nothing to preserve, and both arms that return
+    /// it are correct rather than degenerate: `Existing` binds a key that is
+    /// already at `node.secret` and so cannot be lost, and `Preview` never
+    /// reaches a transaction at all.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a failure to rename the staged temp into place.
+    fn park(self) -> anyhow::Result<Option<PathBuf>> {
+        match self {
+            Self::Staged(k) => k.keep().map(Some),
+            Self::Existing(_) | Self::Preview(_) => Ok(None),
         }
     }
 
@@ -462,20 +579,27 @@ fn confirm_bound(
     receipt: &alloy::rpc::types::TransactionReceipt,
     operator: Address,
     new_node_id: B256,
+    capacity_bond: Address,
 ) -> anyhow::Result<()> {
     let found = receipt
         .inner
         .logs()
         .iter()
+        // The emitting contract is part of the claim: a `NodeIdBound` from some
+        // other address is not evidence about THIS deployment's registry, and
+        // the whole point of this function is that a merely well-shaped log is
+        // not good enough to install a key against.
+        .filter(|log| log.address() == capacity_bond)
         .filter(|log| log.topic0() == Some(&CapacityBond::NodeIdBound::SIGNATURE_HASH))
         .filter_map(|log| log.log_decode::<CapacityBond::NodeIdBound>().ok())
         .any(|log| log.inner.data.ethAddress == operator && log.inner.data.nodeId == new_node_id);
     anyhow::ensure!(
         found,
-        "bindNodeId mined but its receipt carried no NodeIdBound log for {operator:#x} → \
-         {new_node_id}. The binding did not move (or the deployed CapacityBond ABI has drifted \
-         from this CLI). The node key on disk was NOT replaced; check the transaction on a block \
-         explorer before retrying."
+        "bindNodeId mined but its receipt carried no NodeIdBound log from {capacity_bond:#x} for \
+         {operator:#x} → {new_node_id}. Either the binding did not move, or the deployed \
+         CapacityBond ABI has drifted from this CLI — the two are not distinguishable from here, \
+         so the new node key was NOT installed and has been preserved separately. Check the \
+         transaction on a block explorer before retrying."
     );
     Ok(())
 }
@@ -545,16 +669,19 @@ pub(crate) fn write_plan(
     tx: Option<&B256>,
     archived: Option<&Path>,
     dry_run: bool,
+    key_persisted: bool,
 ) -> io::Result<()> {
-    // A generated key is only knowable after it is committed. On a preview the
-    // key is never persisted, so the id shown is a real signature subject but
-    // NOT the id a later run will bind — say so rather than let it be quoted
-    // back. The signatures themselves stay submittable regardless: they cover
-    // the CURRENT on-chain nonces, so anyone holding this output can submit
-    // `bindNodeId` with them until the operator's `bindingNonce` advances,
-    // rebinding the operator to a key whose secret exists nowhere — an
-    // off-chain griefing lever the runbook's `--dry-run` paragraph warns about.
-    let preview_key = dry_run && p.generated;
+    // "The id above names a key that is NOT this node's identity on disk."
+    //
+    // Derived from whether the key was actually persisted, NOT from `dry_run`:
+    // a preview is one way to reach that state, but a real run whose send failed
+    // is another, and it is the more dangerous one to misreport. Keying this on
+    // `dry_run` claimed, on exactly that failure path, that the printed id named
+    // a persisted key.
+    //
+    // `--bind-existing` is never a preview: the key it names is already
+    // `node.secret`, whether or not the transaction succeeded.
+    let preview_key = p.generated && !key_persisted;
     let tx_hex = tx.map(|v| format!("{v:#x}"));
     let archived_str = archived.map(|a| a.display().to_string());
     if json {
@@ -607,6 +734,133 @@ pub(crate) fn write_plan(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// Build a receipt carrying `logs`, so the gate can be driven without a
+    /// chain. Only the fields `confirm_bound` reads are meaningful.
+    fn receipt_with(logs: Vec<alloy::rpc::types::Log>) -> alloy::rpc::types::TransactionReceipt {
+        use alloy::consensus::{Eip658Value, Receipt, ReceiptEnvelope, ReceiptWithBloom};
+
+        alloy::rpc::types::TransactionReceipt {
+            inner: ReceiptEnvelope::Eip1559(ReceiptWithBloom {
+                receipt: Receipt {
+                    status: Eip658Value::Eip658(true),
+                    cumulative_gas_used: 0,
+                    logs,
+                },
+                logs_bloom: alloy::primitives::Bloom::ZERO,
+            }),
+            transaction_hash: B256::repeat_byte(0xAB),
+            transaction_index: Some(0),
+            block_hash: None,
+            block_number: None,
+            gas_used: 0,
+            effective_gas_price: 0,
+            blob_gas_used: None,
+            blob_gas_price: None,
+            from: Address::ZERO,
+            to: None,
+            contract_address: None,
+        }
+    }
+
+    /// A `NodeIdBound` log as the contract would emit it.
+    fn bound_log(emitter: Address, operator: Address, node_id: B256) -> alloy::rpc::types::Log {
+        use alloy::sol_types::SolEvent as _;
+
+        let event = CapacityBond::NodeIdBound {
+            ethAddress: operator,
+            nodeId: node_id,
+            bindingNonce: 3,
+        };
+        alloy::rpc::types::Log {
+            inner: alloy::primitives::Log {
+                address: emitter,
+                data: event.encode_log_data(),
+            },
+            block_hash: None,
+            block_number: None,
+            block_timestamp: None,
+            transaction_hash: None,
+            transaction_index: None,
+            log_index: None,
+            removed: false,
+        }
+    }
+
+    const CB: Address = Address::repeat_byte(0xCB);
+    const OP: Address = Address::repeat_byte(0x0E);
+    const NEW_ID: B256 = B256::repeat_byte(0x22);
+
+    /// The gate's whole purpose: a receipt that mined WITHOUT the binding event
+    /// must not green-light replacing `node.secret`.
+    #[test]
+    fn confirm_bound_rejects_a_receipt_with_no_log() {
+        confirm_bound(&receipt_with(Vec::new()), OP, NEW_ID, CB)
+            .expect_err("a mined receipt with no NodeIdBound must not confirm");
+    }
+
+    #[test]
+    fn confirm_bound_accepts_the_matching_log() {
+        confirm_bound(
+            &receipt_with(vec![bound_log(CB, OP, NEW_ID)]),
+            OP,
+            NEW_ID,
+            CB,
+        )
+        .expect("the exact binding this run submitted must confirm");
+    }
+
+    /// Matching the event signature alone is not enough — this is what separates
+    /// a real gate from a ceremonial one. A regression relaxing the operator or
+    /// node-id check would install a key the chain does not point at.
+    #[test]
+    fn confirm_bound_rejects_a_log_for_another_operator() {
+        let other = Address::repeat_byte(0x99);
+        confirm_bound(
+            &receipt_with(vec![bound_log(CB, other, NEW_ID)]),
+            OP,
+            NEW_ID,
+            CB,
+        )
+        .expect_err("a NodeIdBound for a different operator is not evidence for this one");
+    }
+
+    #[test]
+    fn confirm_bound_rejects_a_log_for_another_node_id() {
+        let other_id = B256::repeat_byte(0x77);
+        confirm_bound(
+            &receipt_with(vec![bound_log(CB, OP, other_id)]),
+            OP,
+            NEW_ID,
+            CB,
+        )
+        .expect_err("a NodeIdBound for a different node id must not confirm this rotation");
+    }
+
+    /// The emitting contract is part of the claim: a well-formed event from some
+    /// other address says nothing about THIS deployment's registry.
+    #[test]
+    fn confirm_bound_rejects_a_log_from_a_foreign_contract() {
+        let impostor = Address::repeat_byte(0x01);
+        confirm_bound(
+            &receipt_with(vec![bound_log(impostor, OP, NEW_ID)]),
+            OP,
+            NEW_ID,
+            CB,
+        )
+        .expect_err("a NodeIdBound from another contract is not evidence about CapacityBond");
+    }
+
+    /// The real receipt shape: the matching log sits among unrelated ones.
+    #[test]
+    fn confirm_bound_finds_the_match_among_other_logs() {
+        let logs = vec![
+            bound_log(CB, Address::repeat_byte(0x99), NEW_ID),
+            bound_log(CB, OP, NEW_ID),
+        ];
+        confirm_bound(&receipt_with(logs), OP, NEW_ID, CB)
+            .expect("a matching log must be found even when others precede it");
+    }
 
     /// A `--dry-run` preview of a fresh key must not create `data_dir`, let
     /// alone write into it — the bug the FS side effect was: `stage_node_key`
@@ -666,9 +920,28 @@ mod tests {
         }
     }
 
+    /// The happy-path shape: a run that reached a transaction persisted its key,
+    /// a preview did not. [`rendered_unpersisted`] covers the third case.
     fn rendered(p: &Plan, json: bool, tx: Option<&B256>, dry_run: bool) -> String {
+        rendered_with_persist(p, json, tx, dry_run, tx.is_some() && !dry_run)
+    }
+
+    /// A real run that reached the chain but did NOT end up installing the key —
+    /// the failed-send and failed-gate paths.
+    fn rendered_unpersisted(p: &Plan, tx: Option<&B256>) -> String {
+        rendered_with_persist(p, false, tx, false, false)
+    }
+
+    fn rendered_with_persist(
+        p: &Plan,
+        json: bool,
+        tx: Option<&B256>,
+        dry_run: bool,
+        key_persisted: bool,
+    ) -> String {
         let mut buf = Vec::new();
-        write_plan(&mut buf, p, json, tx, None, dry_run).expect("write to a Vec cannot fail");
+        write_plan(&mut buf, p, json, tx, None, dry_run, key_persisted)
+            .expect("write to a Vec cannot fail");
         String::from_utf8(buf).expect("output is ASCII")
     }
 
@@ -778,6 +1051,23 @@ mod tests {
         // A committed key is not a preview.
         let tx = B256::repeat_byte(0xAB);
         assert!(rendered(&plan(true, true), false, Some(&tx), false).contains("preview_key=false"));
+    }
+
+    /// The regression this flag's derivation was changed for: a REAL run whose
+    /// send failed also leaves the generated key unpersisted. Keying
+    /// `preview_key` on `dry_run` reported `false` there — asserting the printed
+    /// `new_node_id` named a key on disk at exactly the moment it named one that
+    /// had just been discarded or parked.
+    #[test]
+    fn a_failed_real_run_flags_its_key_as_not_persisted() {
+        // Send never landed: no tx, not a dry run.
+        assert!(rendered_unpersisted(&plan(true, true), None).contains("preview_key=true"));
+        // Broadcast, but the key was parked rather than installed.
+        let tx = B256::repeat_byte(0xAB);
+        assert!(rendered_unpersisted(&plan(true, true), Some(&tx)).contains("preview_key=true"));
+        // `--bind-existing` is never a preview — the key is already `node.secret`
+        // regardless of how the transaction went.
+        assert!(rendered_unpersisted(&plan(false, true), Some(&tx)).contains("preview_key=false"));
     }
 
     #[test]

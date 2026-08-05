@@ -11,10 +11,14 @@
 //! - `eth` — migrate the Ethereum address: deregister → unbond → re-onboard.
 //!
 //! What they do share is the failure this command exists to prevent. A node
-//! whose local key is not the on-chain-bound one is **un-slashable**
-//! (`SlashJudge._checkRegistered` reads `nodeIdOf`, so an unbound key has no
-//! operator to charge), which is a protocol fault rather than an outage: the
-//! node keeps serving and keeps getting paid while its bond is unreachable. No
+//! whose local key is not the on-chain-bound one is **un-slashable**:
+//! `SlashJudge._checkRegistered(challengedNode, nodeId)` resolves the challenged
+//! *address* through `nodeIdOf` and requires the cited id to equal the bound
+//! one, so evidence gathered against the key the node is actually serving under
+//! reverts — `NodeIdMismatch` when the operator is bound to some other id,
+//! `NodeNotRegistered` when it is bound to none. Either way the challenge
+//! fails, which is a protocol fault rather than an outage: the node keeps
+//! serving and keeps getting paid while its bond is unreachable. No
 //! ordering of steps here may produce that state even transiently, which is
 //! what fixes the sequencing in both submodules — the iroh path commits
 //! `node.secret` only after the bind confirms, and the eth path reads chain

@@ -31,10 +31,16 @@
 //! `nodeIdToAddress[nodeId]`, so the old address keeps the binding and
 //! `registerNode` from the new address reverts `NodeIdAlreadyBound`. The
 //! re-onboarding phase therefore generates a fresh node key, which is what the
-//! runbook's step 8 says to do. An operator who needs the *original* id back
-//! (for reputation continuity) has to run `--key iroh` on the old address first,
-//! rebinding it to a throwaway id to free the original — a chained procedure
-//! this command does not automate, and names in its disclosure.
+//! runbook's step 8 says to do.
+//!
+//! An operator who needs the *original* id back (for reputation continuity) has
+//! a two-step manual route this command does not automate: run `--key iroh` on
+//! the old address to rebind it to a throwaway, which frees the original
+//! on-chain — and then **restore `node.secret` from the `.bak` archive that
+//! rotation just created**. The restore is not optional. Without it the
+//! throwaway is what sits on disk, `key_is_reusable` sees it bound to the old
+//! address, and this phase mints a third key and registers that. Both the
+//! disclosure and the runbook state the restore step.
 //!
 //! # Why the key ordering is looser than the iroh path's
 //!
@@ -102,10 +108,15 @@ pub(crate) async fn run(
     // silently `Ok`: a wrapper doing `if decdn node rotate-key …; then
     // mark_done; fi` would read a zero exit as "the migration completed".
     if let Phase::Waiting { unlock_at, now, .. } = plan.phase {
-        let mut out = io::stdout().lock();
-        write_plan(&mut out, &plan, json, &Outcome::default(), false)
-            .context("failed to write result")?;
-        drop(out);
+        {
+            // Same rule as the post-execute write below: the maturity message is
+            // what the operator needs, so a failed stdout write degrades rather
+            // than replacing it.
+            let mut out = io::stdout().lock();
+            if let Err(err) = write_plan(&mut out, &plan, json, &Outcome::default(), false) {
+                eprintln!("failed to write the result receipt to stdout: {err}");
+            }
+        }
         anyhow::bail!(
             "unbonding request is still maturing: unlocks at {unlock_at} (in {}s). Re-run this \
              command after that to withdraw, then again with --new-keystore to re-onboard.",
@@ -123,9 +134,18 @@ pub(crate) async fn run(
     let mut outcome = Outcome::default();
     let result = execute(&provider, &plan, args, &resolved, &mut outcome).await;
 
-    let mut out = io::stdout().lock();
-    write_plan(&mut out, &plan, json, &outcome, false).context("failed to write result")?;
-    drop(out);
+    // The receipt write must never REPLACE the operation error. Piping this
+    // command into `head` is enough to make `write_plan` fail with EPIPE, and a
+    // `?` here would discard a `deregisterNode reverted (tx 0x…)` or the
+    // "may have been broadcast — re-sending is not idempotent" warning in
+    // favour of a broken-pipe message. The receipt is the less important of the
+    // two, so it degrades to stderr and the real error survives.
+    {
+        let mut out = io::stdout().lock();
+        if let Err(err) = write_plan(&mut out, &plan, json, &outcome, false) {
+            eprintln!("failed to write the result receipt to stdout: {err}");
+        }
+    }
     result
 }
 
@@ -274,6 +294,7 @@ async fn build_plan<P: Provider + Clone>(
         provider,
         &bond_contract,
         PhaseInputs {
+            old_operator,
             active: info.active,
             active_bond,
             pending_amount: pending.amount,
@@ -311,6 +332,9 @@ async fn build_plan<P: Provider + Clone>(
 /// The registry reads [`select_phase`] decides from, bundled so the selection
 /// signature stays readable.
 struct PhaseInputs {
+    /// The address being migrated away from — needed so the `--new-keystore`
+    /// guard can run before any phase is chosen.
+    old_operator: Address,
     active: bool,
     active_bond: U256,
     pending_amount: U256,
@@ -327,6 +351,32 @@ async fn select_phase<P: Provider + Clone, Q: Provider>(
     st: PhaseInputs,
     args: &cli::RotateKeyArgs,
 ) -> anyhow::Result<Phase> {
+    // Validate `--new-keystore` HERE, before the early returns below, not only
+    // once the bond is exited. The phases that return first — deregister,
+    // request, waiting, withdraw — never read the flag, so a same-address
+    // keystore used to be accepted silently at the very start and only refused
+    // at the re-onboarding call: two weeks, a 14-day window, and four
+    // transactions later, with the tier already cleared and nothing gained.
+    // Refusing on the first invocation is the entire point of the guard.
+    //
+    // Loaded ONCE here and reused below rather than decrypted again per branch:
+    // the keystore KDF is scrypt, which is deliberately expensive, and this
+    // function is on the path of every invocation across a 14-day migration.
+    let new_operator = match args.new_keystore.as_deref() {
+        Some(keystore) => {
+            let signer = chain_ctx::load_signer_with_password_file(
+                args.chain.common.keystore_password_file.as_deref(),
+                keystore,
+            )
+            .await
+            .context("failed to load the new keystore")?;
+            let addr = signer.address();
+            ensure_distinct_operator(st.old_operator, addr)?;
+            Some(addr)
+        }
+        None => None,
+    };
+
     if st.active {
         return Ok(Phase::Deregister {
             declared_mbps: st.declared_mbps,
@@ -355,8 +405,9 @@ async fn select_phase<P: Provider + Clone, Q: Provider>(
         });
     }
 
-    // Bond fully exited. Everything past here needs the new keystore.
-    let new_keystore = args.new_keystore.as_deref().ok_or_else(|| {
+    // Bond fully exited. Everything past here needs the new keystore — already
+    // loaded and validated above if the flag was given.
+    let new_operator = new_operator.ok_or_else(|| {
         anyhow::anyhow!(
             "the bond is fully withdrawn. Pass `--new-keystore <PATH>` to finish re-bonding and \
              re-registering from the NEW address — or, if you already completed that step, pass \
@@ -366,13 +417,6 @@ async fn select_phase<P: Provider + Clone, Q: Provider>(
              and a little ETH for gas first if you have not re-onboarded yet."
         )
     })?;
-    let new_signer = chain_ctx::load_signer_with_password_file(
-        args.chain.common.keystore_password_file.as_deref(),
-        new_keystore,
-    )
-    .await
-    .context("failed to load the new keystore")?;
-    let new_operator = new_signer.address();
 
     if bond_contract
         .isActive(new_operator)
@@ -477,12 +521,22 @@ async fn execute<P: Provider + Clone>(
             .await?;
         }
         Phase::Reonboard {
+            new_operator,
             mbps,
             region,
             multiaddrs,
-            ..
         } => {
-            reonboard(args, resolved, plan, *mbps, region, multiaddrs, outcome).await?;
+            reonboard(
+                args,
+                resolved,
+                plan,
+                *new_operator,
+                *mbps,
+                region,
+                multiaddrs,
+                outcome,
+            )
+            .await?;
         }
         Phase::Complete { .. } => {}
         // `run` bails on `Waiting` before reaching here. Kept loud rather than a
@@ -506,6 +560,7 @@ async fn reonboard(
     args: &cli::RotateKeyArgs,
     resolved: &chain_ctx::Resolved,
     plan: &Plan,
+    planned_operator: Address,
     mbps: u64,
     region: &str,
     multiaddrs: &[String],
@@ -525,6 +580,19 @@ async fn reonboard(
     let new_provider = decdn_client_pull::provider::build_provider(&resolved.rpc_url, &new_signer)?;
     let bond_contract = CapacityBond::new(cb_addr, &new_provider);
     let new_operator = new_signer.address();
+
+    // This is the SECOND load of `--new-keystore`: `select_phase` loaded it to
+    // derive the address, `write_disclosure` printed that address, and the
+    // operator confirmed it — all before this point. Everything below (the
+    // ed25519 ownership digest, the balance check, `registerNode`) keys on
+    // whatever THIS load produced, so without this check the address that
+    // transacts is not provably the one that was shown and agreed to. A file
+    // swapped between the two reads would otherwise migrate the identity
+    // somewhere the operator never saw.
+    anyhow::ensure!(
+        new_operator == planned_operator,
+        "--new-keystore now resolves to {new_operator:#x}, but {planned_operator:#x} is the          address this migration planned and disclosed. Nothing was submitted. Re-run to          re-plan against the current keystore."
+    );
 
     // ADR 019 § Terms Acceptance — re-registration from a new address is a
     // FRESH registration, so it re-accepts terms. (`--key iroh` never does: a
@@ -719,9 +787,12 @@ pub(crate) fn write_disclosure(w: &mut dyn io::Write, p: &Plan) -> io::Result<()
             writeln!(
                 w,
                 "A FRESH node id is generated and registered. The original cannot be reused: \
-                 `deregisterNode` leaves it bound to the old address. To carry it across, rebind \
-                 it away with `decdn node rotate-key --key iroh` on the OLD address first, then \
-                 re-run this."
+                 `deregisterNode` leaves it bound to the old address. Carrying it across takes \
+                 TWO steps, not one: run `decdn node rotate-key --key iroh` on the OLD address to \
+                 rebind it away (that frees the original on-chain, but also archives the original \
+                 key to `node.secret.bak.<ts>` and installs the throwaway), THEN restore that \
+                 archive over `node.secret` before re-running this. Skipping the restore leaves \
+                 the throwaway on disk, and this phase will register that instead."
             )?;
             writeln!(
                 w,
@@ -758,10 +829,21 @@ pub(crate) fn write_plan(
     dry_run: bool,
 ) -> io::Result<()> {
     let phase = p.phase.label();
+    // EVERY transaction slot, not just the headline ones. `bond::execute` can
+    // land `approve` (or `declareMbps`) and then fail, and `reonboard` copies
+    // both into `outcome` before propagating — so omitting them printed
+    // `approve_tx=0x…` next to `submitted=false`, i.e. a standing ERC-20
+    // allowance from the new address reported as "nothing was submitted".
+    // `bond::write_plan`, the direct twin, ORs all three of its slots.
+    //
+    // `new_node_id` is deliberately absent: it is an identity, not a
+    // transaction, and it is set before anything is sent.
     let submitted = o.deregister.is_some()
         || o.request.is_some()
         || o.withdraw.is_some()
+        || o.approve.is_some()
         || o.bond.is_some()
+        || o.declare.is_some()
         || o.register.is_some();
     let hex = |v: Option<B256>| v.map(|h| format!("{h:#x}"));
     let remaining = match p.phase {

@@ -595,9 +595,16 @@ impl ChainFixture {
     }
 
     /// The operator a node id is bound to, or `Address::ZERO` when the id is
-    /// unbound. The inverse of [`Self::node_id_of`], and the read that proves a
-    /// retired node id is no longer slashable: with no operator to charge,
-    /// `SlashJudge` reverts `NodeNotRegistered` for it.
+    /// unbound. The inverse of [`Self::node_id_of`]: after a rotation the
+    /// retired id reads back as `Address::ZERO`, which is what proves
+    /// `bindNodeId` cleared the old mapping rather than merely adding a new one.
+    ///
+    /// Note this is **not** the read the slashing path performs.
+    /// `SlashJudge._checkRegistered(challengedNode, nodeId)` resolves the
+    /// challenged *address* through `nodeIdOf` and compares — it never does a
+    /// nodeId → address lookup. So a challenge citing a retired id against a
+    /// still-bound operator reverts `NodeIdMismatch`; `NodeNotRegistered` fires
+    /// only when the challenged address has no binding at all.
     pub async fn operator_of_node_id(&self, node_id: B256) -> anyhow::Result<Address> {
         CapacityBond::new(self.addrs.capacity_bond, &self.admin)
             .nodeIdToAddress(node_id)
