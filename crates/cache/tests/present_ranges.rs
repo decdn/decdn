@@ -48,10 +48,12 @@ async fn partial_import_reports_only_the_imported_span() -> anyhow::Result<()> {
     assert!(!pr.is_empty(), "the imported span is present");
     // The present chunk ranges must cover the aligned span and not the whole blob.
     let cr = pr.chunk_ranges();
-    let group_chunks = (aligned.fetch_end() - aligned.fetch_start()) / 1024;
+    // Byte→chunk-count via bao-tree's canonical conversion, not a hard-coded 1024.
+    let group_chunks = bao_tree::ChunkNum::chunks(aligned.fetch_end()).0
+        - bao_tree::ChunkNum::chunks(aligned.fetch_start()).0;
     assert!(group_chunks > 0);
     // Whole-blob chunk count is strictly greater than what we imported.
-    let whole_chunks = blob_size.div_ceil(1024);
+    let whole_chunks = bao_tree::ChunkNum::chunks(blob_size).0;
     let present_chunk_count: u64 = cr
         .boundaries()
         .chunks(2)
