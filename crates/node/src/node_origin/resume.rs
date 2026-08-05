@@ -371,15 +371,11 @@ pub(super) async fn pull_blob(
     let mut state = LoopState::new(deps, ledger);
 
     loop {
-        // While waiting out a top-up's settlement, the re-open this iteration performs
-        // is part of OUR funding cost, not the upstream's service — so it is timed and
-        // charged to `paid_wait` alongside the sleep, and kept out of the peer's
-        // delivery-speed score (#1600 review).
-        let leg_started = state.budgets.awaiting_topup_settle.then(Instant::now);
+        // The re-open round trip a settle-wait iteration performs is OUR funding cost,
+        // not the upstream's service, so [`stream_leg`] times it and charges it to
+        // `paid_wait` — but only the OPEN, never the `pull_to_sink` that follows. See
+        // the timing there for why the boundary must live inside the leg (#1602).
         let leg = stream_leg(deps, target, ctx, ledger, deadlines, &mut state).await;
-        if let Some(started) = leg_started {
-            state.paid_wait = state.paid_wait.saturating_add(started.elapsed());
-        }
         let Err(err) = leg else {
             return Ok(PulledBlob {
                 bytes: state.buf,
@@ -506,7 +502,25 @@ async fn stream_leg(
     deadlines: PullDeadlines,
     state: &mut LoopState,
 ) -> anyhow::Result<()> {
-    let (header, pull) = open_leg(deps, target, ctx, ledger, deadlines, state.byte_offset).await?;
+    // Time ONLY the open, and only while waiting out a top-up's settlement. The re-open
+    // round trip (dial, signed request, verified response) is OUR funding cost and is
+    // charged to `paid_wait` whether it succeeds or fails — a failed one is a pure
+    // settle-wait probe, and a successful one is the last such probe before delivery
+    // resumes. What must NOT be charged is the `pull_to_sink` below: it is the upstream
+    // serving bytes, the exact thing the delivery-speed score (ADR 008) measures.
+    //
+    // The boundary lives here, not in [`pull_blob`], because `note_successful_open`
+    // clears `awaiting_topup_settle` between the open and the stream. Timing the whole
+    // leg from the caller — reading the flag at the loop top — folded the completing
+    // leg's entire transfer into `paid_wait`, so a slow upstream that served through a
+    // top-up scored as instantaneous, defaming nobody but corrupting its own delivery
+    // speed in the wrong direction (#1602).
+    let open_started = state.budgets.awaiting_topup_settle.then(Instant::now);
+    let opened = open_leg(deps, target, ctx, ledger, deadlines, state.byte_offset).await;
+    if let Some(started) = open_started {
+        state.paid_wait = state.paid_wait.saturating_add(started.elapsed());
+    }
+    let (header, pull) = opened?;
 
     state.total_bytes = header.total_bytes;
     state.quoted_rate_per_mb = header.rate_per_mb;
