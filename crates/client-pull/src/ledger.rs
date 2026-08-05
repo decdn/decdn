@@ -99,8 +99,8 @@ pub struct ChannelLedger {
     /// only by returning, and this is the record of money already spent (#1145
     /// review). The buffered node pull runs with `hard_cap: None` (#1134), so what
     /// ends a slow-but-progressing transfer is always external — the foreground
-    /// `outer_pull_deadline`, the background warm's hard cap, or the shutdown token —
-    /// and all three DROP the future. Held for a few instructions at a time and never
+    /// `outer_pull_deadline`, or the serve future being dropped (client disconnect,
+    /// shutdown) — which DROPS the future. Held for a few instructions at a time and never
     /// across an await, so it cannot deadlock with the issuance lock.
     pipeline: std::sync::Mutex<Pipeline>,
 }

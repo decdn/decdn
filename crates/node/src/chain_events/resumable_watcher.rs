@@ -482,8 +482,7 @@ where
 /// never awaited, so a panic is otherwise discarded with no log, counter, or
 /// restart; this guard — the only thing that still runs on the unwind — makes it
 /// visible. A graceful `return` (shutdown) or an `AbortOnDrop` teardown drops the
-/// guard with `thread::panicking() == false`, so neither trips it. Mirrors the
-/// `WarmOutcome` precedent in `crate::handlers::client`.
+/// guard with `thread::panicking() == false`, so neither trips it.
 struct PanicGuard<'a> {
     label: &'static str,
     on_panic: Option<&'a WatcherHook>,
@@ -494,9 +493,9 @@ impl Drop for PanicGuard<'_> {
         if std::thread::panicking() {
             // This runs during an unwind: a second panic here would abort the
             // process. Hooks are contractually panic-free (see [`WatcherHook`]),
-            // but unlike the `WarmOutcome` precedent — which calls one hardcoded,
-            // known-infallible method — this guard fires an arbitrary
-            // caller-supplied closure, so catch defensively. A future hook bug
+            // but because this guard fires an arbitrary caller-supplied closure
+            // (not one hardcoded, known-infallible method), catch defensively. A
+            // future hook bug
             // must degrade to a swallowed panic, never take the node down.
             let hook = self.on_panic;
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fire(hook)));
@@ -1540,7 +1539,7 @@ mod tests {
 
     /// The panic guard (#1316) is the only trace a panic in the detached watcher
     /// task leaves: it fires `on_task_panic` iff [`run`] is unwinding, and NOT on
-    /// a graceful drop. Mirrors the `WarmOutcome` false-positive guard.
+    /// a graceful drop.
     #[test]
     #[allow(clippy::panic)] // deliberately unwind a thread to exercise the guard.
     fn panic_guard_fires_only_on_unwind() {

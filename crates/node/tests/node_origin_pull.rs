@@ -4551,8 +4551,8 @@ fn spawn_a_paid_then_silent_server(
 /// is what made it reachable. The buffered pull now carries `hard_cap: None`, so
 /// nothing INSIDE it ends a slow-but-progressing transfer. Everything that does end
 /// one is external, and every one of them DROPS the future rather than returning
-/// through it: the foreground `outer_pull_deadline`, the background warm's
-/// `BACKGROUND_FILL_HARD_CAP`, and `pull_through_bg_shutdown` on restart.
+/// through it: the foreground `outer_pull_deadline`, or the serve future being
+/// dropped (client disconnect, node shutdown).
 ///
 /// `VoucherProgress` promises that its copy-back "runs on every return path … so the
 /// latest acked totals survive a mid-stream failure". A drop is not a return path.
@@ -4631,8 +4631,8 @@ async fn node_origin_cancelled_pull_still_persists_the_acked_watermark() -> Resu
         0,
     );
 
-    // Cancel it: `timeout` drops the fetch future exactly as the background warm's
-    // hard cap and the shutdown token do.
+    // Cancel it: `timeout` drops the fetch future exactly as the foreground
+    // `outer_pull_deadline` and node shutdown do.
     let cancelled = tokio::time::timeout(
         Duration::from_secs(5),
         Origin::fetch(&origin, hash, u64::MAX),
@@ -6092,8 +6092,7 @@ const SLOW_PULL_OPEN_BUDGET: Duration = Duration::from_secs(2);
 /// The old shape wrapped the whole exchange in one wall clock, which silently
 /// capped the blob size a node could pull through at roughly
 /// `pull_timeout × link speed` — at the 20 s default, anything needing more than
-/// ~20 s of transfer was simply unfetchable, and the background warm that should
-/// have rescued it was capped by the same budget. No test caught that, because
+/// ~20 s of transfer was simply unfetchable. No test caught that, because
 /// `serve_wire_paced` paces by voucher interval and never sleeps: nothing in the
 /// suite moved a transfer past the deadline at all.
 ///

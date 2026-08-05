@@ -1913,11 +1913,10 @@ async fn receive_and_pay(
             //
             // But be precise about what this does and does not fix (#1145 review). It fixes
             // the ATTRIBUTION: an honest server with a slow first byte is no longer gossiped
-            // as unreachable. It does NOT make that blob fetchable. The pull still fails, and
-            // the background warm re-pulls through the same path with the same `stall`
-            // budget, so it fails identically — a blob whose server-side materialisation
-            // exceeds the stall window is unfetchable on this path, foreground and warm
-            // alike. The real repair is on the SERVE side: `export_bao_range` returns an
+            // as unreachable. It does NOT make that blob fetchable. The pull still fails —
+            // a blob whose server-side materialisation exceeds the stall window is
+            // unfetchable on this path. The real repair is on the SERVE side:
+            // `export_bao_range` returns an
             // owned `Bytes`, materialising the entire bao encoding before chunk #1 goes out,
             // so TTFB scales with blob size by construction. Streaming it incrementally is
             // what would actually close #1122/#1132; until then this comment must not be read

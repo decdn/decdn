@@ -117,20 +117,13 @@ pub const CHANNEL_OPEN_CALLER_BUDGET: Duration = Duration::from_secs(5);
 /// resets that clock on every byte and can consume the whole outer deadline on its own.
 ///
 /// That is correct: it is succeeding, and falling through mid-stream would restart the
-/// download from zero against another peer. The foreground request gives up (a clean miss)
-/// while a detached background warm RE-PULLS the blob from scratch under a far larger
-/// backstop (`BACKGROUND_FILL_HARD_CAP`), for exactly this reason.
+/// download from zero against another peer, throwing away the bytes already paid for.
+/// On expiry the foreground request gives up with a clean miss and nothing continues in
+/// the background — #1610 removed the detached warm, so a pull only ever runs while a
+/// client is waiting, and the blob is re-acquired on the next real client request.
 ///
-/// "Re-pulls from scratch", not "the transfer continues" (#1145 review): the warm calls
-/// `cache.populate(hash)`, which starts a new pull. Nothing hands it the bytes the
-/// foreground had already paid for. That does not change the conclusion — the acquisition
-/// still completes, under an hour-long cap rather than the client's — but it does undercut
-/// the "restart from zero" argument in the sentence above, which is worth being honest
-/// about: the warm restarts from zero too. What falling through actually costs is the
-/// *paid* bytes, and what it buys is the client a faster answer.
-///
-/// So this is best read as a bound on how long a **client** waits, not on how long
-/// an acquisition takes.
+/// So this bounds how long a **client** waits; there is no longer any acquisition that
+/// outlives that wait.
 #[must_use]
 pub fn outer_pull_deadline(per_candidate: Duration, stall: Duration) -> Duration {
     let attempts = u32::try_from(MAX_PROVIDER_ATTEMPTS).unwrap_or(u32::MAX);
@@ -530,7 +523,6 @@ mod tests {
     //
     //   - `common::config` (the `node_pull_timeout_sec` / `node_pull_stall_timeout_sec` docs)
     //   - `cli::commands::config` (the DEFAULT_CONFIG template)
-    //   - `handlers::client::BACKGROUND_FILL_HARD_CAP` + `runtime` (as a RATIO against it)
     #[test]
     fn outer_pull_deadline_at_defaults_is_167_5s() {
         let outer = outer_pull_deadline(Duration::from_secs(20), Duration::from_secs(20));

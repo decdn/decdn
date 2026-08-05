@@ -192,7 +192,6 @@ impl ClientHandler {
                 // well exist upstream.
                 Ok(Err(miss)) => {
                     tee.abandon();
-                    self.maybe_spawn_background_fill(hash);
                     let reason = FillOutcome::miss_reason(fault_seen || miss.is_local_fault());
                     return self
                         .respond_error(&mut send, req, reason, rate_per_mb)
@@ -201,7 +200,6 @@ impl ClientHandler {
                 Err(_elapsed) => {
                     tee.abandon();
                     self.metrics.node_pull_through_timeout();
-                    self.maybe_spawn_background_fill(hash);
                     let reason = FillOutcome::miss_reason(fault_seen);
                     return self
                         .respond_error(&mut send, req, reason, rate_per_mb)

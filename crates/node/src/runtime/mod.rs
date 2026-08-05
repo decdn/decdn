@@ -729,7 +729,6 @@ struct ChainHandlers<P: Provider + Clone + 'static> {
     client_handler: Arc<ClientHandler>,
     payment_service: PaymentChannelService<P>,
     voucher_activity: Arc<decdn_incentive::VoucherActivity>,
-    pull_through_bg_shutdown: CancellationToken,
     blacklist_watcher: crate::chain_events::resumable_watcher::WatcherHandle,
     blacklist_ready_rx: oneshot::Receiver<crate::blacklist_watcher::InitialSyncResult>,
     rate_bounds_watcher: crate::chain_events::resumable_watcher::WatcherHandle,
@@ -1089,10 +1088,6 @@ async fn build_chain_and_handlers(
     // a restart resets it and channels report "no activity yet" until their
     // next voucher (see `decdn_incentive::VoucherActivity`).
     let voucher_activity = Arc::new(decdn_incentive::VoucherActivity::new());
-    // Cancels the detached background cache-fill tasks (#859) the handler spawns
-    // when the foreground deadline fires; cancelled in the shutdown sequence below
-    // alongside `gossip_shutdown`.
-    let pull_through_bg_shutdown = CancellationToken::new();
 
     // Reactive LOCAL-origin pull-through (#1116). Arm a local-only populate on the
     // serve-miss path whenever the operator configured any origin (`[cache.origin]`),
@@ -1117,7 +1112,6 @@ async fn build_chain_and_handlers(
     // wiring is one construction-time literal; the gates (and their nesting) are
     // preserved exactly.
     let mut pull_through = None;
-    let mut background_fill = None;
     let mut pull_through_origin = None;
     let mut pull_ahead_bytes = None;
     let mut leech_governor = None;
@@ -1138,22 +1132,6 @@ async fn build_chain_and_handlers(
         let stall = Duration::from_secs(cfg.cache.node_pull_stall_timeout_sec);
         let outer_deadline = crate::selection::outer_pull_deadline(per_candidate, stall);
         pull_through = Some(outer_deadline);
-        // Background fill keeps warming the cache after the delivery path gives up. It
-        // does NOT reuse `outer_deadline` (#1134): the foreground deadline bounds how
-        // long a *client* waits, but the warm has no client waiting on it, and capping
-        // it at the budget the foreground just exhausted meant a blob too large to
-        // fetch in one deadline could never be warmed either. The absolute
-        // `BACKGROUND_FILL_HARD_CAP` backstop is a leak guard (inactivity is not
-        // liveness): ~21.5× the foreground deadline, so it constrains no honest
-        // transfer the node's `max_blob_size_mb` ceiling permits, and only stops a
-        // pathological upstream from pinning a task and poisoning a hash forever.
-        // `max_blob_size_mb` additionally bounds the concurrent warms' memory: each
-        // reserves its whole blob ceiling from the `MAX_BACKGROUND_FILL_MB` pool.
-        background_fill = Some(crate::handlers::client::BackgroundFill::new(
-            pull_through_bg_shutdown.clone(),
-            Some(crate::handlers::client::BACKGROUND_FILL_HARD_CAP),
-            cfg.cache.max_blob_size_mb,
-        ));
         // Window-paced pull-through (#856, ADR 037): when the `NodeOrigin` is
         // available, serve cache misses by fusing the upstream pull with downstream
         // delivery (bounded by `pull_ahead_bytes`) instead of the buffered `populate`,
@@ -1216,7 +1194,6 @@ async fn build_chain_and_handlers(
     client_deps.region_accountant = Some(Arc::clone(&region_accountant));
     client_deps.local_populate = local_populate;
     client_deps.pull_through = pull_through;
-    client_deps.background_fill = background_fill;
     client_deps.pull_through_origin = pull_through_origin;
     client_deps.pull_ahead_bytes = pull_ahead_bytes;
     // Downstream paid-delivery credit window (ADR 003 §Credit window, #1477).
@@ -1371,7 +1348,6 @@ async fn build_chain_and_handlers(
         client_handler,
         payment_service,
         voucher_activity,
-        pull_through_bg_shutdown,
         blacklist_watcher,
         blacklist_ready_rx,
         rate_bounds_watcher,
@@ -2231,7 +2207,6 @@ pub async fn run(
         gossip_shutdown: bg.gossip_shutdown,
         capacity_bond_watcher: ch.capacity_bond_watcher,
         slash_watcher: ch.slash_watcher,
-        pull_through_bg_shutdown: ch.pull_through_bg_shutdown,
         receipt_writer_shutdown: infra.receipt_writer_shutdown,
         payment_service: ch.payment_service,
         gossip_handles: bg.gossip_handles,
@@ -2269,7 +2244,6 @@ struct ShutdownHandles<P: Provider + Clone + 'static> {
     gossip_shutdown: CancellationToken,
     capacity_bond_watcher: Arc<crate::chain_events::resumable_watcher::WatcherHandle>,
     slash_watcher: crate::slash_watcher::SlashWatcher,
-    pull_through_bg_shutdown: CancellationToken,
     receipt_writer_shutdown: CancellationToken,
     payment_service: PaymentChannelService<P>,
     gossip_handles: Vec<tokio::task::JoinHandle<()>>,
@@ -2311,7 +2285,6 @@ async fn shutdown<P: Provider + Clone + 'static>(
         gossip_shutdown,
         capacity_bond_watcher,
         slash_watcher,
-        pull_through_bg_shutdown,
         receipt_writer_shutdown,
         payment_service,
         gossip_handles,
@@ -2437,16 +2410,6 @@ async fn shutdown<P: Provider + Clone + 'static>(
     // exit, and each `WatcherHandle`'s `AbortOnDrop` remains the backstop.
     capacity_bond_watcher.shutdown();
     slash_watcher.shutdown();
-    // Cancel any in-flight background cache-fill tasks (#859): the router has
-    // drained, so warming the cache for future requests is moot. They observe
-    // the token at their next await and exit; being advisory, they are not
-    // joined into the drain below. A warm already inside `cache.populate` may
-    // therefore still complete a store write concurrently with the `cache`
-    // shutdown/flush further down — which is safe: iroh-blobs store writes are
-    // self-contained (the same write shape as the foreground delivery path,
-    // already drained above), so a late warm write either lands intact or is
-    // dropped, never corrupting the store.
-    pull_through_bg_shutdown.cancel();
     // The router has drained, so no further vouchers — and therefore no further
     // receipts — will be produced. Signal the receipt writer to flush whatever
     // is already enqueued and exit; it is awaited in the drain phase below so
