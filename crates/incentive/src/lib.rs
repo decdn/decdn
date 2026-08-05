@@ -43,7 +43,6 @@ pub mod capacity_bond;
 pub mod channel;
 pub mod channel_open_error;
 pub mod client_bridge;
-pub mod client_reputation;
 pub mod content_blacklist;
 pub mod coop_close_request;
 pub mod cooperative_close;
@@ -81,10 +80,6 @@ pub use channel_open_error::ChannelOpenFailureReason;
 pub use client_bridge::{
     RetrySignal, WireVoucherError, signed_to_wire_voucher, voucher_reject_reason,
     wire_voucher_to_signed,
-};
-pub use client_reputation::{
-    Admission, ClientReputation, ClientReputationConfig, ClientReputationLedger,
-    ClientReputationStore, ConfigError as ClientReputationConfigError, MemoryClientReputationStore,
 };
 pub use coop_close_request::{
     COOP_CLOSE_REQUEST_SIG_LEN, CoopCloseRequestError, coop_close_request_signing_hash,
