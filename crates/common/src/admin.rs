@@ -59,6 +59,39 @@ pub struct PeersResponse {
     pub peers: Vec<PeerView>,
 }
 
+/// Whether the node's local iroh key is the one bound to its operator address
+/// on-chain (#1034).
+///
+/// This is a correctness signal, not a liveness one. `SlashJudge` resolves an
+/// accused node through `CapacityBond.nodeIdOf`, so a node serving under a key
+/// no binding points at is **unslashable**: it earns normally while its bond is
+/// unreachable, which is a protocol fault rather than an outage — and one with
+/// no symptom the operator would otherwise notice. A key rotation that swapped
+/// `node.secret` without submitting `bindNodeId` lands exactly here, which is
+/// why `decdn node rotate-key` orders its steps to make the state unreachable
+/// and why the daemon reports it when it happens anyway.
+///
+/// Advisory by construction. The check is one RPC at bring-up, and a daemon
+/// that refused to start on it would be brickable by a transient RPC failure
+/// and unable to run the very rotation that repairs it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BindingStatus {
+    /// The on-chain binding names this node's key. Nothing to do.
+    Bound,
+    /// The operator is bound to a DIFFERENT node id than the local key —
+    /// the un-slashable state. Either rotate on-chain to match the local key
+    /// (`decdn node rotate-key --key iroh --bind-existing`) or restore the
+    /// key the binding names.
+    Mismatch,
+    /// The operator address has no binding at all: never registered, or the
+    /// node id was reclaimed. `decdn node register` makes the initial binding.
+    Unbound,
+    /// Not determined — no `[blockchain]` configuration to check against, or
+    /// the read failed. Explicitly not a synonym for "fine".
+    Unknown,
+}
+
 /// Response body for `admin_v1_health`. Shared between the server
 /// (serializes) and `decdn node health` (deserializes via the generated
 /// client). Intentionally minimal: this method exists so an operator
@@ -81,6 +114,16 @@ pub struct HealthResponse {
     /// --wait` (issue #604) to detect when all client streams have
     /// completed during a graceful drain.
     pub in_flight_streams: u64,
+    /// Whether `node_id` is the key bound to this operator on-chain (#1034).
+    /// Sampled once at bring-up — the binding only changes by an explicit
+    /// operator transaction, and re-reading it on every health poll would put
+    /// an RPC round trip behind the readiness probe.
+    pub binding: BindingStatus,
+    /// Lowercase hex of the node id the operator IS bound to, when that could
+    /// be read. Present for [`BindingStatus::Bound`] (where it equals
+    /// `node_id`) and, more usefully, for [`BindingStatus::Mismatch`], where it
+    /// names the key to restore. `None` for `Unbound` and `Unknown`.
+    pub bound_node_id: Option<String>,
 }
 
 /// Request body for `admin_v1_evict` (issue #279).

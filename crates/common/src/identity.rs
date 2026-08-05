@@ -21,7 +21,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, anyhow};
-use iroh::{PublicKey, SecretKey};
+use iroh::{PublicKey, SecretKey, Signature};
 use rand::Rng;
 
 const KEY_FILE_NAME: &str = "node.secret";
@@ -248,6 +248,24 @@ impl StagedNodeKey {
     #[must_use]
     pub fn public(&self) -> PublicKey {
         self.key.public()
+    }
+
+    /// Sign `msg` with the staged secret, without committing it.
+    ///
+    /// `decdn node rotate-key` needs this: `CapacityBond.bindNodeId` demands an
+    /// ed25519 ownership proof from the key being bound, and that proof has to
+    /// exist *before* the transaction is submitted — while committing
+    /// `node.secret` has to happen *after* it confirms, or a reverted bind
+    /// would leave the daemon serving under an unbound identity. Signing from
+    /// the stage is what lets those two orders coexist.
+    ///
+    /// The secret itself stays unreachable: this is deliberately a signing
+    /// oracle rather than a `secret()` accessor, so a staged key cannot be
+    /// copied out and persisted somewhere the archive-on-commit discipline
+    /// does not cover.
+    #[must_use]
+    pub fn sign(&self, msg: &[u8]) -> Signature {
+        self.key.sign(msg)
     }
 
     /// Commit the staged key: archive any existing `node.secret` (so the

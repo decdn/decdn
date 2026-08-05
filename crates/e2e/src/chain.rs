@@ -24,7 +24,8 @@ use anyhow::Context;
 use decdn_incentive::probe_sig::ProbeSlashData;
 use decdn_incentive::stream_sig::StreamSlashData;
 use decdn_incentive::{
-    bind_node_id_domain, node_register, register_node_signing_hash, slash_judge_domain,
+    bind_node_id_domain, binding_signing_hash, node_register, register_node_signing_hash,
+    slash_judge_domain,
 };
 
 use crate::bindings::{
@@ -505,6 +506,114 @@ impl ChainFixture {
             "operator must be active after bond + registerNode"
         );
         Ok(())
+    }
+
+    /// Rebind `operator` to `new_secret`'s node id via `CapacityBond.bindNodeId`
+    /// — the iroh key-rotation path, driven directly rather than through the CLI
+    /// (#1034, G-NODE-07).
+    ///
+    /// The signature ingredients mirror [`Self::onboard_operator`] with two
+    /// differences that matter: the EIP-712 payload is the terms-free
+    /// `BindNodeId` (rebinding does not re-accept terms), and the ed25519 proof
+    /// is signed by the **new** key over `registrationNonce[newNodeId]` — not
+    /// the old key, and not the old id's nonce.
+    ///
+    /// Exists alongside the CLI-driven journey so a test can set up an
+    /// already-rotated chain state without paying for a CLI subprocess, and so a
+    /// CLI regression cannot silently make the fixture agree with it.
+    pub async fn rotate_node_id(
+        &self,
+        operator: &PrivateKeySigner,
+        new_secret: &iroh::SecretKey,
+    ) -> anyhow::Result<()> {
+        let op_addr = operator.address();
+        let new_node_id = B256::from_slice(new_secret.public().as_bytes());
+
+        let op_provider = self.provider_for(operator);
+        let bond = CapacityBond::new(self.addrs.capacity_bond, &op_provider);
+
+        let binding_nonce = bond
+            .bindingNonce(op_addr)
+            .call()
+            .await
+            .context("read bindingNonce")?;
+        // Keyed on the NEW id: a fresh key is usually 0, but an id that was
+        // bound and unbound before carries a bumped nonce, and signing over 0
+        // there reverts `InvalidEd25519Signature`.
+        let registration_nonce = bond
+            .registrationNonce(new_node_id)
+            .call()
+            .await
+            .context("read registrationNonce")?;
+
+        let domain = bind_node_id_domain(self.chain_id, self.addrs.capacity_bond);
+        let bind_hash = binding_signing_hash(new_node_id, binding_nonce, &domain);
+        let binding_sig = operator
+            .sign_hash_sync(&bind_hash)
+            .context("sign binding hash")?
+            .as_bytes()
+            .to_vec();
+
+        let digest = node_register::ownership_message_digest(
+            new_node_id,
+            op_addr,
+            self.chain_id,
+            registration_nonce,
+        );
+        let ed_sig = new_secret.sign(digest.as_slice()).to_bytes().to_vec();
+
+        let receipt = bond
+            .bindNodeId(new_node_id, Bytes::from(binding_sig), Bytes::from(ed_sig))
+            .send()
+            .await
+            .context("bindNodeId send")?
+            .get_receipt()
+            .await
+            .context("bindNodeId receipt")?;
+        crate::ensure_mined(&receipt, "bindNodeId")?;
+
+        anyhow::ensure!(
+            self.node_id_of(op_addr).await? == new_node_id,
+            "operator must be bound to the new node id after bindNodeId"
+        );
+        Ok(())
+    }
+
+    /// The node id `operator` is bound to, or `B256::ZERO` when unbound.
+    ///
+    /// Reads `addressToNodeId` rather than `nodeIdOf`, deliberately: this is the
+    /// exact mapping `SlashJudge._checkRegistered` resolves through, so an
+    /// assertion on it is an assertion about slashability. `nodeIdOf` returns
+    /// the same id but pairs it with a liveness flag that the slashing path
+    /// ignores.
+    pub async fn node_id_of(&self, operator: Address) -> anyhow::Result<B256> {
+        CapacityBond::new(self.addrs.capacity_bond, &self.admin)
+            .addressToNodeId(operator)
+            .call()
+            .await
+            .context("read addressToNodeId")
+    }
+
+    /// The operator a node id is bound to, or `Address::ZERO` when the id is
+    /// unbound. The inverse of [`Self::node_id_of`], and the read that proves a
+    /// retired node id is no longer slashable: with no operator to charge,
+    /// `SlashJudge` reverts `NodeNotRegistered` for it.
+    pub async fn operator_of_node_id(&self, node_id: B256) -> anyhow::Result<Address> {
+        CapacityBond::new(self.addrs.capacity_bond, &self.admin)
+            .nodeIdToAddress(node_id)
+            .call()
+            .await
+            .context("read nodeIdToAddress")
+    }
+
+    /// Unix timestamp of `operator`'s first bond — the ADR 026 age-ramp anchor.
+    /// An iroh-key rotation must preserve it; an Ethereum-key migration cannot.
+    pub async fn first_bonded_at(&self, operator: Address) -> anyhow::Result<u64> {
+        CapacityBond::new(self.addrs.capacity_bond, &self.admin)
+            .firstBondedAt(operator)
+            .call()
+            .await
+            .context("read firstBondedAt")
     }
 
     /// Create a namespace owned by `owner` and return its id (parsed from the
@@ -1754,10 +1863,14 @@ async fn run_deploy_script(
             // ADR 019 § Terms Acceptance — DeployProtocol.s.sol requires a
             // non-zero genesis terms hash (CapacityBond rejects the zero
             // sentinel); registration reads it back from the contract.
-            .env(
-                "CURRENT_TERMS_HASH",
-                "0x0000000000000000000000000000000000000000000000000000000000000001",
-            )
+            //
+            // Deployed as the REAL terms hash, not a sentinel: any journey that
+            // registers through the `decdn` CLI (rather than through
+            // `onboard_operator`, which signs whatever the contract holds) goes
+            // through `terms::ensure_accepted`, which refuses to sign when the
+            // binary's embedded terms do not hash to the network's value. A
+            // sentinel would make every such journey unrunnable.
+            .env("CURRENT_TERMS_HASH", terms_hash().to_string())
             .env("FORCE_OVERWRITE_MANIFEST", "true");
         match forge_output(
             cmd,
@@ -1903,7 +2016,22 @@ async fn evm_revert_and_snapshot(
     evm_snapshot(provider).await
 }
 
-/// Read the protocol contract addresses from the deploy manifest.
+/// The canonical operator terms, embedded from the repo-root `TERMS.md`.
+///
+/// Duplicated from `decdn_cli::commands::terms::TERMS_TEXT` rather than shared:
+/// nothing may depend on `decdn-cli` (it is a binary sink), and moving the terms
+/// into `decdn-common` is a wider refactor than a fixture warrants. The
+/// duplication is of the *recipe*, and it is self-policing — a change to how the
+/// CLI derives its hash makes every CLI registration journey fail immediately,
+/// with the mismatch named in the error.
+const TERMS_TEXT: &str = include_str!("../../../TERMS.md");
+
+/// `keccak256` of the embedded terms — the genesis `currentTermsHash` the
+/// fixture chain deploys with, and the value a CLI registration must match.
+fn terms_hash() -> B256 {
+    alloy::primitives::keccak256(TERMS_TEXT.as_bytes())
+}
+
 /// The global-scope region key: `bytes32("GLOBAL")`.
 #[must_use]
 pub fn global_region() -> B256 {
@@ -1924,6 +2052,7 @@ fn emergency_multisig_role() -> B256 {
     keccak256(b"EMERGENCY_MULTISIG_ROLE")
 }
 
+/// Read the protocol contract addresses from the deploy manifest.
 fn read_manifest(path: &Path) -> anyhow::Result<ContractAddrs> {
     let json: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
     let contracts = json

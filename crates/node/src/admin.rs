@@ -33,6 +33,7 @@ use jsonrpsee::types::ErrorObjectOwned;
 use tokio::net::TcpListener;
 use tokio::sync::{Notify, RwLock, oneshot};
 
+use crate::binding_check::BindingReport;
 use crate::dht::{RecordStore, RepublishScheduler, RoutingTable, StakerSet};
 use crate::metrics::Metrics;
 use crate::region_accounting::RegionAccountant;
@@ -119,6 +120,11 @@ pub struct AdminState {
     /// [`AdminState::with_slash_detection`]. `None` (no `slash_judge_address`
     /// wired / unit tests) → `slashes` returns [`SLASH_DETECTION_UNAVAILABLE_CODE`].
     slash_detection: Option<SlashStatusHandles>,
+    /// Outcome of the bring-up node-id binding check (#1034), attached via
+    /// [`AdminState::with_binding`]. Defaults to
+    /// [`BindingReport::unknown`] — the honest answer for a state that was
+    /// never sampled, and the one the unit tests here construct.
+    binding: BindingReport,
 }
 
 /// Read-only payment-channel handles the `admin_v1_channels` handler
@@ -335,7 +341,19 @@ impl AdminState {
             channels: None,
             region_accountant: None,
             slash_detection: None,
+            binding: BindingReport::unknown(),
         }
+    }
+
+    /// Attach the bring-up node-id binding check so `admin_v1_health` can
+    /// report whether this node's key is the one bound on-chain (#1034). The
+    /// production runtime calls this once after `new`; without it, `health`
+    /// reports `BindingStatus::Unknown`, which means "not checked" rather
+    /// than "fine".
+    #[must_use]
+    pub const fn with_binding(mut self, binding: BindingReport) -> Self {
+        self.binding = binding;
+        self
     }
 
     /// Attach DHT introspection handles so `admin_v1_status` can report
@@ -470,6 +488,14 @@ impl AdminRpcServer for AdminRpcImpl {
             node_id: alloy::primitives::hex::encode(self.state.node_id),
             uptime_s: self.state.started_at.elapsed().as_secs(),
             in_flight_streams: self.state.metrics.dispatch_in_flight_value(),
+            binding: self.state.binding.status,
+            // Same lowercase-hex encoding as `node_id`, so the two are
+            // directly comparable by eye and by script on a mismatch.
+            bound_node_id: self
+                .state
+                .binding
+                .bound_node_id
+                .map(alloy::primitives::hex::encode),
         })
     }
 

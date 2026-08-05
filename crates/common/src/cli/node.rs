@@ -170,6 +170,30 @@ pub enum NodeCommand {
     /// then re-run it after the window to withdraw. Pass `--dry-run` to print
     /// the plan without submitting.
     Deregister(DeregisterArgs),
+    /// Rotate an operator key and keep the on-chain binding in step
+    /// (`adr/appendix-operator-key-rotation.md`, #1034). `--key` chooses which
+    /// key, because the two paths are not comparable in cost or effect.
+    ///
+    /// `--key iroh` rebinds the wire node id through
+    /// `CapacityBond.bindNodeId`. One transaction, no downtime beyond a
+    /// restart, and the Ethereum address — with the bond, the declared tier,
+    /// `firstBondedAt`, and every open payment channel — is untouched. The old
+    /// and new node ids swap slashability in the same block, so there is no
+    /// window in which the operator cannot be slashed.
+    ///
+    /// `--key eth` moves the whole on-chain identity, because no rebinding API
+    /// exists for the address: deregister, wait out the full unbonding window,
+    /// withdraw, then re-bond and re-register from a new address.
+    /// `firstBondedAt` — and with it the governance age-ramp — resets. Like
+    /// `decdn node unbond`, the phase is read from chain state rather than
+    /// passed as a flag, so one command drives the whole window.
+    ///
+    /// Neither path restarts the daemon: the iroh key is not hot-reloadable,
+    /// so drain (`decdn node drain`), stop, rotate, restart stays the
+    /// operator's sequence. Pass `--dry-run` to print the plan — and, on the
+    /// iroh path, both signatures — without submitting or touching any key
+    /// file.
+    RotateKey(RotateKeyArgs),
     /// Unpaid client-side discovery of active nodes via
     /// `CapacityBond.getActiveNodes` (#1481). Maps node-ids/regions to
     /// operator Ethereum addresses — the input `decdn channel open
@@ -592,6 +616,107 @@ pub struct RegisterArgs {
     #[arg(long = "accept-terms")]
     pub accept_terms: bool,
 
+    #[command(flatten)]
+    pub chain: ChainArgs,
+}
+
+/// Which of the operator's keys `decdn node rotate-key` rotates.
+///
+/// A `ValueEnum` with **no default**: the two paths differ by orders of
+/// magnitude in cost and are not interchangeable, so the operator names one.
+/// The runbook's third key — the production slash-sig session key — has no
+/// variant here because it has no implementation to drive
+/// (`adr/024-account-abstraction.md` § Session Keys defers it to an
+/// `erc7579/smartsessions` module); rotating it is a Safe-module operation, not
+/// a deCDN one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum RotateKeyTarget {
+    /// The iroh Ed25519 node key — the wire `NodeId`. One `bindNodeId`
+    /// transaction; the Ethereum address, bond, declared tier,
+    /// `firstBondedAt`, and every open payment channel survive untouched.
+    #[value(name = "iroh")]
+    Iroh,
+    /// The secp256k1 Ethereum signing key. No rebinding API exists for the
+    /// on-chain address, so this moves the whole identity: deregister →
+    /// unbond window → re-bond and re-register from a new address. Costs the
+    /// full unbonding window of downtime and resets `firstBondedAt`.
+    #[value(name = "eth")]
+    Eth,
+}
+
+/// `decdn node rotate-key` — the operator key-rotation runbook
+/// (`adr/appendix-operator-key-rotation.md`) as a command (#1034).
+///
+/// Rotation is the one operator procedure where a half-completed run is worse
+/// than no run: a node whose local key is not the on-chain-bound one is
+/// **un-slashable**, which is a protocol-level fault, not merely an outage. So
+/// both paths order their steps to make that state unreachable — the iroh path
+/// commits `node.secret` only after `bindNodeId` confirms, and the eth path
+/// reads chain state to pick its next phase rather than trusting a flag.
+///
+/// Neither path restarts the daemon. The node key is not hot-reloadable
+/// (`admin_v1_reload` and SIGHUP cover `payment.rate_per_mb`,
+/// `observability.log_level`, `cache.pinned_hashes`, and `security.*` — not the
+/// iroh endpoint), so the runbook's drain → stop → rotate → restart sequence
+/// stays the operator's to drive, with `decdn node drain` for the first step.
+#[derive(Args, Debug)]
+pub struct RotateKeyArgs {
+    /// Which key to rotate: `iroh` or `eth`. Required, because rotating the
+    /// wrong one is not recoverable in the same afternoon.
+    #[arg(long = "key", value_name = "KEY", value_enum)]
+    pub key: RotateKeyTarget,
+
+    /// (`--key iroh`) Bind the node key **already on disk** instead of
+    /// generating a fresh one.
+    ///
+    /// Two jobs, both from the runbook's § Failure modes and rollback: repair a
+    /// node whose `node.secret` was replaced by hand (leaving it un-slashable),
+    /// and roll back a rotation by re-binding a restored `.bak` archive. Since
+    /// nothing is generated, nothing is archived — this only submits the
+    /// transaction.
+    #[arg(long = "bind-existing")]
+    pub bind_existing: bool,
+
+    /// (`--key eth`) Keystore holding the NEW Ethereum key to migrate onto.
+    /// Required to reach the re-onboarding phase; the earlier phases
+    /// (deregister, unbond request, window wait, withdraw) all run against the
+    /// current keystore and do not need it.
+    #[arg(long = "new-keystore", value_name = "PATH")]
+    pub new_keystore: Option<PathBuf>,
+
+    /// (`--key eth`) Capacity tier to re-declare on the new address. Defaults
+    /// to the tier the old address declared before deregistration, captured at
+    /// the `deregister` phase — pass it explicitly to change tiers across the
+    /// migration.
+    #[arg(long = "mbps", value_name = "MBPS")]
+    pub mbps: Option<u64>,
+
+    /// (`--key eth`) `regionHint` for the re-registration. Defaults to the old
+    /// address's registered region.
+    #[arg(long, value_name = "CODE")]
+    pub region: Option<String>,
+
+    /// (`--key eth`) QUIC multiaddr for the re-registration. Repeatable.
+    /// Defaults to the multiaddrs the old address registered.
+    #[arg(long = "multiaddr", value_name = "MA")]
+    pub multiaddrs: Vec<String>,
+
+    /// (`--key eth`) Accept the network's current operator terms
+    /// non-interactively. Re-registration from a new address is a fresh
+    /// registration, so it re-accepts terms (ADR 019 § Terms Acceptance);
+    /// `--key iroh` never does, because rebinding signs the terms-free
+    /// `BindNodeId` payload.
+    #[arg(long = "accept-terms")]
+    pub accept_terms: bool,
+
+    /// Skip the interactive confirmation. Required from a non-interactive
+    /// shell. The consequences are printed either way — this suppresses the
+    /// prompt, not the warning.
+    #[arg(long = "yes", short = 'y')]
+    pub yes: bool,
+
+    // `--dry-run` and `--json` come from the flattened `ChainArgs`
+    // (`CommonChainArgs`); declaring them here too would collide.
     #[command(flatten)]
     pub chain: ChainArgs,
 }

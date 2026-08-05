@@ -65,6 +65,14 @@ If both keys must rotate, rotate the **iroh key first** (cheap, atomic on-chain,
 
 ### Procedure
 
+`decdn node rotate-key --key iroh` performs steps 1, 4, 5, and 6 as one command. It generates the key, builds both signatures, submits `bindNodeId`, and installs the new key. It does the steps in that order on purpose: it replaces `node.secret` only after the transaction confirms and emits `NodeIdBound`. A failed transaction therefore leaves the old key in place. The reverse order can leave the node with a key that no binding names, and such a node is unslashable.
+
+The command does not drain, stop, or restart the node. The iroh key is not hot-reloadable, and the command must also work when the daemon is down. Do steps 2, 3, 7, and 8 yourself.
+
+Use `--dry-run` to print both signatures and both nonces. A dry run writes no file and sends no transaction.
+
+Use `--bind-existing` to bind the key that is already at `node.secret`. This repairs a node whose key was replaced by hand. It is also the rollback lever in [§ Failure modes and rollback](#failure-modes-and-rollback).
+
 1. **Generate** a new iroh ed25519 key offline on the signing host. Keep the old keystore until rotation completes.
 2. **Drain** the node — refuse new inbound connections, let existing streams complete (`decdn node drain`, surfaced via `admin_v1_drain` in [`appendix-local-admin-http.md`](appendix-local-admin-http.md#appendix-local-admin-http-surface)). Confirm:
    - `decdn_streams_active{direction="inbound"} == 0`
@@ -102,6 +110,19 @@ cast code <addr>      # EOA → returns 0x ; Safe → returns deployed proxy cod
 ### EOA → EOA migration (PoC default)
 
 **No rebinding API exists for the on-chain Ethereum address.** The address is the stake owner — to rotate, move the entire identity. Expect downtime and loss of `firstBondedAt` (the `age_ramp` governance-weight anchor in [ADR 026 § Governance](026-tokenomics.md#governance)).
+
+`decdn node rotate-key --key eth` performs steps 3, 4, 5, and 8. Run the same command at each step. It reads the chain and does the next action, in the same way `decdn node unbond` does. It never reads a flag to find out which step already ran, so a run that lost its receipt is safe to repeat.
+
+Two inputs the chain cannot supply:
+
+- **The declared capacity tier.** Step 3 clears it. The command prints the tier before it clears it. Give it back with `--mbps` at step 8.
+- **The new keystore.** Give it with `--new-keystore` at step 8. Fund the new address with TOKEN and a small ETH float first. The command reports a shortfall; it never moves funds between your addresses.
+
+The region and the multiaddrs stay on the registration record, so the command carries them forward. Override them with `--region` and `--multiaddr`.
+
+Step 8 registers a **fresh NodeId**, for the reason step 8 gives below. Use `--accept-terms` for a headless run: a new address is a new registration, so it must accept the operator terms again. [§ iroh node-key rotation only](#iroh-node-key-rotation-only) never re-accepts terms, because a rebinding signs the terms-free `BindNodeId` payload.
+
+While the window matures, the command prints the remaining time and **exits non-zero**. A wrapper that polls it must read a zero exit as "the step completed", not as "the migration completed".
 
 Procedure:
 
@@ -172,7 +193,8 @@ Exception: **emergency compromise of the Ethereum key.** Run [§ Ethereum signin
 
 | Scenario | Detection | Rollback |
 |----------|-----------|----------|
-| `bindNodeId` succeeded but node won't restart | `decdn_node_uptime_seconds` reset, `/health` `not_ready` | Repoint config at old keystore, re-`bindNodeId` to old NodeId from same Ethereum key, restart |
+| `bindNodeId` succeeded but node won't restart | `decdn_node_uptime_seconds` reset, `/health` `not_ready` | Restore the old keystore from its `node.secret.bak.<ts>` archive, then run `decdn node rotate-key --key iroh --bind-existing` to bind it again from the same Ethereum key. Restart |
+| Node key replaced with no on-chain rebinding | `decdn node health` reports `binding=mismatch`, and the daemon logs a WARN at start. The node is **unslashable**: `SlashJudge` resolves an accused node through the binding | Bind the key on disk with `decdn node rotate-key --key iroh --bind-existing`, or restore the key the binding names. Restart, then confirm `binding=bound` |
 | Mid-procedure abort during [§ EOA → EOA migration (PoC default)](#eoa--eoa-migration-poc-default) (deregister submitted, withdraw not done) | `CapacityBond.isActiveNode(nodeId) == false`, stake still locked | Wait the unbonding window; you may re-register from the same address before it elapses — old `nodeId` is reusable |
 | [§ EOA → EOA migration (PoC default)](#eoa--eoa-migration-poc-default) step 7: latent voucher submitted by a counterparty | `closeChannel` event against old address post-deregister | Old keystore must be reachable; `closeChannel` runs against the old address regardless of registration state |
 | [§ Safe owner / session-key rotation (production preferred path)](#safe-owner--session-key-rotation-production-preferred-path) session-key revocation fails | Module revert | Revert to the old session key, file a bug; slash signing degrades gracefully (still-valid old-key signatures accepted) |

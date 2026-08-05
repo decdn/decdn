@@ -7,6 +7,7 @@
 //! user-facing CLI binary (`decdn`) lives in `crates/cli/`.
 
 pub mod admin;
+pub mod binding_check;
 pub mod blacklist_watcher;
 pub mod buyer_channel;
 pub mod buyer_ledgers;

@@ -20,6 +20,7 @@ pub mod node_top;
 pub mod probe;
 pub mod publish;
 pub mod register;
+pub mod rotate_key;
 pub mod setup;
 pub mod terms;
 pub mod unbond;

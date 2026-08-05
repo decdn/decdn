@@ -676,21 +676,24 @@ jobs:
   anvil-e2e-journeys:
     name: anvil e2e (journeys)
     runs-on: blacksmith-4vcpu-ubuntu-2404
-    # Bound above the ~149m balanced journeys schedule (below) plus the bin build
+    # Bound above the ~164m balanced journeys schedule (below) plus the bin build
     # and workspace compile, so a genuinely hung test hits its own clear per-test
     # message before this opaque job-level kill (#785). The step below runs the
     # whole `anvil-e2e` feature with no target filter, so the inventory is every
-    # gated test, not a curated list: at --test-threads 2 that is 25 tests across
-    # 15 files whose per-test `OVERALL_TIMEOUT` ceilings sum to 298m. Count tests,
-    # not files — `cli_fetch_topup` alone is four:
-    #   13m x11  smoke, cli_publish, cli_setup_partial, cli_fetch_resume,
+    # gated test, not a curated list: at --test-threads 2 that is 27 tests across
+    # 16 files whose per-test `OVERALL_TIMEOUT` ceilings sum to 328m. Count tests
+    # that RUN, not files and not `#[tokio::test]` attributes — `cli_fetch_topup`
+    # declares four but one is `#[ignore]`d:
+    #   13m x12  smoke, cli_publish, cli_setup_partial, cli_fetch_resume,
     #            cli_bundle_pull_channel_id, coop_close_watermark_reconcile,
-    #            G-NODE-06 (1 test each) + cli_fetch_topup (4 tests)
-    #   20m x3   slash_appeal, G-GOV-02, G-GOV-03
+    #            G-NODE-06 (1 test each) + cli_fetch_topup (3 running tests)
+    #            + G-NODE-07's iroh-rotation and unbound-key legs
+    #   20m x4   slash_appeal, G-GOV-02, G-GOV-03, G-NODE-07's eth leg (it
+    #            walks the whole unbonding window)
     #   10m x8   G-NODE-04 (3 tests), origin_blacklist_compliance (3 tests),
     #            G-ORIGIN-01 (2 tests)
     #   5m  x3   origin_stream_while_store
-    # A balanced 2-thread schedule is ~149m (298/2, no single test exceeding it),
+    # A balanced 2-thread schedule is ~164m (328/2, no single test exceeding it),
     # so the bound must clear that plus the bin build, the workspace compile and
     # the per-fixture in-test forge deploys. Keep this inventory in sync when
     # adding a journey — it has gone stale three times now (it once described 6
@@ -701,17 +704,20 @@ jobs:
     # repo, counting cli_fetch_topup once when it holds four, and omitting
     # cli_bundle_pull_channel_id and origin_stream_while_store outright).
     # The bound was 130m at a ~128m balanced ceiling, then 160m when
-    # coop_close_watermark_reconcile (#1495) pushed it to ~135m. The corrected
-    # 298m sum puts the real ceiling at ~149m, which leaves 160m only ~11m for
-    # the compile the rule above says it must also cover, so it is raised to 175m
-    # to restore the ~25m of headroom that bump targeted — a hung test must hit
-    # its own clear per-test message before this opaque job-level kill.
+    # coop_close_watermark_reconcile (#1495) pushed it to ~135m, then 175m once a
+    # corrected 298m sum put the real ceiling at ~149m. That 298m over-counted by
+    # 13m: it credited `cli_fetch_topup` with four running tests when its fourth
+    # is `#[ignore]`d. G-NODE-07 (#1034) then adds three tests summing 46m, so the
+    # real sum is 328m and the balanced ceiling ~164m — which leaves 175m only
+    # ~11m for the compile the rule above says this must also cover. Raised to
+    # 200m to restore the ~25m of headroom that bump targeted — a hung test must
+    # hit its own clear per-test message before this opaque job-level kill.
     # In practice the job finishes in ~10m; these are ceilings, not
     # estimates. The generous backstop deliberately lets a wedged compile or a
     # pre-timer forge hang burn the full bound rather than reintroduce the opaque
     # sub-ceiling kill (#785) that masks the clear per-test message this ordering
     # exists to surface.
-    timeout-minutes: 175
+    timeout-minutes: 200
     needs: changes
     if: >-
       needs.changes.outputs.rust == 'true' ||

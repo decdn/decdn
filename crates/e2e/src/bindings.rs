@@ -80,6 +80,16 @@ alloy::sol! {
         function getNodeByAddress(address ethAddress) external view returns (NodeInfo memory);
         function bindingNonce(address operator) external view returns (uint64);
         function registrationNonce(bytes32 nodeId) external view returns (uint64);
+        // Key-rotation surface (#1034, G-NODE-07). `bindNodeId` is the rebind
+        // itself; the two raw mappings are what the journey asserts on, and
+        // they are read directly rather than through `nodeIdOf`/`isActiveNode`
+        // because slashability keys on the binding alone — `SlashJudge`
+        // ignores `active`, so an assertion routed through a liveness-aware
+        // helper would not be testing what the slashing path reads.
+        function bindNodeId(bytes32 nodeId, bytes bindingSignature, bytes ed25519Signature) external;
+        function nodeIdToAddress(bytes32 nodeId) external view returns (address);
+        function addressToNodeId(address operator) external view returns (bytes32);
+        function deregisterNode() external;
         function updateRegion(string newRegion) external;
         // ADR 030 region-change cooldown / ripening window (seconds). Read so the
         // scope-transition journey can advance past the cooldown before its
