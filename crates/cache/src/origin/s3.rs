@@ -545,7 +545,11 @@ fn classify_head_object_error(
 ///     deterministic permanent error as a transient `Other`; and
 ///   * preserves the original `ErrorKind` on the prefixed error, so the
 ///     transient/permanent routing of network faults (`UnexpectedEof`,
-///     `ConnectionReset`, …) is unchanged.
+///     `ConnectionReset`, …) is unchanged; and
+///   * keeps the original error reachable as the `source()` of the returned
+///     error (via [`PrefixedBodyError`]) rather than flattening it into a
+///     formatted `String`, so downstream `.source()` walks and the
+///     payload-preserving intent of `classify_io_error` stay intact.
 fn prefix_body_stream_error(log_target: &str, e: std::io::Error) -> std::io::Error {
     if e.get_ref()
         .is_some_and(|inner| inner.is::<BlobTooLargeMarker>() || inner.is::<OriginError>())
@@ -553,7 +557,35 @@ fn prefix_body_stream_error(log_target: &str, e: std::io::Error) -> std::io::Err
         return e;
     }
     let kind = e.kind();
-    std::io::Error::new(kind, format!("{log_target}: {e}"))
+    std::io::Error::new(
+        kind,
+        PrefixedBodyError {
+            prefix: log_target.to_string(),
+            inner: e,
+        },
+    )
+}
+
+/// Error wrapper produced by [`prefix_body_stream_error`]. `Display` prepends
+/// the `s3://bucket/key` request context; `source()` returns the original
+/// `io::Error` so the error chain is preserved rather than flattened into a
+/// formatted string.
+#[derive(Debug)]
+struct PrefixedBodyError {
+    prefix: String,
+    inner: std::io::Error,
+}
+
+impl std::fmt::Display for PrefixedBodyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.prefix, self.inner)
+    }
+}
+
+impl std::error::Error for PrefixedBodyError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.inner)
+    }
 }
 
 impl Origin for S3Origin {
@@ -663,11 +695,12 @@ impl Origin for S3Origin {
             // `prefix_body_stream_error`, so a mid-stream failure
             // carries the same identifying context as the
             // header-phase `classify_get_object_error` errors
-            // (issue #1617). The adapter only fires on the error
-            // arm — the happy path is untouched — and it preserves
-            // the `io::ErrorKind` and any typed marker so the
-            // engine's `classify_io_error` still routes the error
-            // correctly.
+            // (issue #1617). The per-chunk `map` closure runs for
+            // every item, but it is a cheap passthrough on `Ok`
+            // (no allocation or formatting) and only builds the
+            // prefixed error on `Err`; it preserves the
+            // `io::ErrorKind` and any typed marker so the engine's
+            // `classify_io_error` still routes the error correctly.
             let async_read = resp.body.into_async_read();
             let raw_stream = ReaderStream::new(async_read);
             // Layer the decoder (if any) onto the raw chunk stream. For an
@@ -982,6 +1015,15 @@ mod tests {
         );
         // Kind must survive so retry routing is unchanged.
         assert_eq!(wrapped.kind(), std::io::ErrorKind::ConnectionReset);
+        // The original error must stay reachable as `source()` rather than
+        // being flattened into the prefixed string.
+        let source = std::error::Error::source(&wrapped)
+            .expect("prefixed body error must expose the original error as source()");
+        assert_eq!(
+            source.to_string(),
+            "connection reset",
+            "source() must be the un-prefixed original error"
+        );
     }
 
     #[test]
