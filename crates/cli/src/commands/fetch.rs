@@ -19,9 +19,9 @@
 //! config > default.
 //!
 //! The chain/discovery/delivery seams (`resolve_chain`, `resolve_target_node`,
-//! `probe_and_rank`, `open_or_reuse`, `fetch_blob`, `write_blob_atomic`) are
-//! `pub(crate)` so `decdn bundle pull` (#391) reuses the same paid-fetch kernel
-//! across a bundle's many entries.
+//! `probe_and_rank`, `open_or_reuse`, `fetch_blob_streaming`, `temp_in_parent`)
+//! are `pub(crate)` so `decdn bundle pull` (#391) reuses the same paid-fetch,
+//! reactive-top-up loop across a bundle's many entries.
 
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -37,7 +37,7 @@ use decdn_client_pull::buyer_channel::{
 use decdn_client_pull::{
     ChannelContext, ChannelLedger, Cumulative, ProgressCallback, PullDeadlines,
     ResumeOffsetPastEnd, UpstreamRefused, UpstreamVoucherRejected, VoucherProgress,
-    open_progressive_pull, sign_client_binding, stream_fetch_tracked_with_progress,
+    open_progressive_pull, sign_client_binding,
 };
 use decdn_common::cli::{self, common::expand_tilde};
 use decdn_common::config::{DEFAULT_CHAIN_ID, FileConfig, load_file_config};
@@ -881,7 +881,7 @@ fn partial_path(output: &Path) -> PathBuf {
 }
 
 /// Outcome of a streaming fetch into the partial file.
-struct StreamedFetch {
+pub(crate) struct StreamedFetch {
     /// Whole-blob size the node signed for.
     total_bytes: u64,
     /// Byte offset this attempt started from — non-zero when a prior partial was
@@ -890,20 +890,20 @@ struct StreamedFetch {
     resumed_from: u64,
 }
 
-/// Fetch `hash` into `<output>.partial`, writing each bao chunk group the moment
-/// it verifies and resuming an interrupted prior attempt (#1120, #1122).
-///
-/// This is the streaming counterpart of [`fetch_blob`]. Where that buffers the
-/// whole blob in RAM (twice — the wire form and then the decoded form) and writes
-/// once at the end, this holds one chunk group and appends as it goes, so peak
-/// memory is independent of blob size and an interruption leaves a resumable
-/// prefix on disk instead of nothing.
+/// Fetch `hash` into `partial` (`<output>.partial` for `fetch`, a per-hash
+/// staging file under `.decdn-partial/` for `bundle pull`), writing each bao
+/// chunk group the moment it verifies and resuming an interrupted prior
+/// attempt (#1120, #1122). Holds one chunk group and appends as it goes, so
+/// peak memory is independent of blob size and an interruption leaves a
+/// resumable prefix on disk instead of nothing — never buffers the whole blob
+/// in RAM. Shared by `fetch` and `bundle pull`, the CLI's two paid-pull
+/// callers, so both get the same reactive top-up loop (#1497).
 ///
 /// Resume re-runs discovery in the caller, not here: content is content-addressed,
 /// so whichever node this call is pointed at can serve the tail.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_lines)] // One sequential open→stream→persist→classify attempt loop. Each stage's comment explains a money-relevant decision (which watermark to settle, when a partial is poison, why a flush failure outranks a pull failure); splitting them out would separate those from the loop state they justify.
-async fn fetch_blob_streaming<P>(
+pub(crate) async fn fetch_blob_streaming<P>(
     endpoint: &Endpoint,
     target: EndpointAddr,
     ctx: &mut ChannelContext,
@@ -1472,52 +1472,6 @@ fn persist_watermark(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn fetch_blob(
-    endpoint: &Endpoint,
-    target: EndpointAddr,
-    ctx: &ChannelContext,
-    slash_dom: &Eip712Domain,
-    provider: Address,
-    store: &RedbBuyerChannelStore,
-    hash: [u8; 32],
-    namespace_id: [u8; 32],
-    deadlines: PullDeadlines,
-    max_blob_bytes: u64,
-    max_rate_per_mb: u64,
-    on_progress: Option<&ProgressCallback>,
-) -> anyhow::Result<Vec<u8>> {
-    let channel_id = ctx.channel_id;
-    let timestamp_us = micros_now();
-    // `stream_fetch_tracked_with_progress` reports the acked watermark via
-    // `progress` even on an error/timeout, so a paid-but-failed delivery still
-    // advances the stored watermark — otherwise the next reuse would re-sign a
-    // stale nonce. `on_progress` is the byte-delivery readout (`fetch` renders a
-    // bar; `bundle pull` passes `None`).
-    let mut progress = VoucherProgress::default();
-    let result = stream_fetch_tracked_with_progress(
-        endpoint,
-        target,
-        ctx,
-        slash_dom,
-        provider,
-        hash,
-        namespace_id,
-        0,
-        timestamp_us,
-        deadlines,
-        max_blob_bytes,
-        max_rate_per_mb,
-        &mut progress,
-        on_progress,
-    )
-    .await;
-
-    persist_watermark(store, provider, channel_id, &progress);
-
-    Ok(result?.to_vec())
-}
-
 /// Fetch a single blob over `cdn/client/v1`, auto-opening/reusing a payment
 /// channel, and write it atomically to `--output`. `config_path` (the global
 /// `--config`) supplies relays (#935), discovery (#936), and chain coordinates.
@@ -1723,40 +1677,9 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
     let streamed = streamed.map_err(|err| annotate_unbound_cache_miss(err, &ctx))?;
 
     // A resumed fetch mixed bytes this process verified on the wire with bytes an
-    // earlier process left on disk. The latter are unverified — not because a
-    // prefix cannot be checked, but because this client keeps no outboard sidecar
-    // to check it against (see `sink::resume_offset`) — so settle it here against
-    // the content hash before anything is promoted. A fetch that started at 0
-    // verified every byte as it landed and needs no second pass.
-    if streamed.resumed_from > 0 {
-        let file = std::fs::File::open(&partial)
-            .map_err(|e| anyhow::anyhow!("reopen {}: {e}", partial.display()))?;
-        let genuine =
-            decdn_client_pull::sink::resume_is_genuine(hash, std::io::BufReader::new(file))
-                .map_err(|e| anyhow::anyhow!("verify {}: {e}", partial.display()))?;
-        if !genuine {
-            // The bad bytes are in the prefix we inherited, so there is nothing
-            // to salvage — drop it so the retry starts clean rather than
-            // resuming onto the same corruption forever. If the removal itself
-            // fails, say so: telling the user it "has been discarded" when it
-            // has not sends them into a loop where the error message is what
-            // prevents them diagnosing it.
-            let hex = blake3::Hash::from_bytes(hash).to_hex();
-            return Err(match std::fs::remove_file(&partial) {
-                Ok(()) => anyhow::anyhow!(
-                    "the partial download at {} did not match {hex} and has been discarded; \
-                     re-run to fetch it cleanly",
-                    partial.display()
-                ),
-                Err(e) => anyhow::anyhow!(
-                    "the partial download at {} did not match {hex} and could not be removed \
-                     ({e}); delete it by hand before re-running, or every retry will resume \
-                     onto the same corrupt bytes",
-                    partial.display()
-                ),
-            });
-        }
-    }
+    // earlier process left on disk; settle that prefix against the content hash
+    // before anything downstream trusts it. See [`verify_resumed_prefix`].
+    verify_resumed_prefix(hash, &partial, &streamed)?;
 
     // Promote the verified partial in place of a copy-through: an atomic rename
     // on the same filesystem, so `--output` never exists in a half-written state
@@ -1774,6 +1697,56 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
         args.output.display()
     );
     Ok(())
+}
+
+/// After a streaming fetch into `partial`, confirm any bytes it did NOT itself
+/// verify on the wire — i.e. inherited from a prior partial written by an
+/// earlier process (`streamed.resumed_from > 0`) — actually match `hash`. This
+/// client keeps no outboard sidecar to check a resumed prefix against as it is
+/// read back off disk (see `sink::resume_offset`), so it is settled here,
+/// against the whole-blob content hash, before anything downstream (a promote,
+/// a materialize) trusts the file. A fetch that started at offset 0 verified
+/// every byte as it landed and needs no second pass.
+///
+/// Shared by `fetch` (verifying `<output>.partial`) and `bundle pull`
+/// (verifying its per-hash staging file) — both stream through
+/// [`fetch_blob_streaming`] and both promote/materialize from the same file
+/// this checks.
+pub(crate) fn verify_resumed_prefix(
+    hash: [u8; 32],
+    partial: &Path,
+    streamed: &StreamedFetch,
+) -> anyhow::Result<()> {
+    if streamed.resumed_from == 0 {
+        return Ok(());
+    }
+    let file = std::fs::File::open(partial)
+        .map_err(|e| anyhow::anyhow!("reopen {}: {e}", partial.display()))?;
+    let genuine = decdn_client_pull::sink::resume_is_genuine(hash, std::io::BufReader::new(file))
+        .map_err(|e| anyhow::anyhow!("verify {}: {e}", partial.display()))?;
+    if genuine {
+        return Ok(());
+    }
+    // The bad bytes are in the prefix we inherited, so there is nothing to
+    // salvage — drop it so the retry starts clean rather than resuming onto
+    // the same corruption forever. If the removal itself fails, say so:
+    // telling the user it "has been discarded" when it has not sends them
+    // into a loop where the error message is what prevents them diagnosing
+    // it.
+    let hex = blake3::Hash::from_bytes(hash).to_hex();
+    Err(match std::fs::remove_file(partial) {
+        Ok(()) => anyhow::anyhow!(
+            "the partial download at {} did not match {hex} and has been discarded; \
+             re-run to fetch it cleanly",
+            partial.display()
+        ),
+        Err(e) => anyhow::anyhow!(
+            "the partial download at {} did not match {hex} and could not be removed \
+             ({e}); delete it by hand before re-running, or every retry will resume \
+             onto the same corrupt bytes",
+            partial.display()
+        ),
+    })
 }
 
 /// The `decdn fetch` delivery progress bar plus the callback that drives it,
@@ -2071,17 +2044,6 @@ pub(crate) fn temp_in_parent(target: &Path) -> std::io::Result<tempfile::NamedTe
         Some(p) => tempfile::NamedTempFile::new_in(p),
         None => tempfile::NamedTempFile::new_in("."),
     }
-}
-
-/// Write `bytes` to `target` atomically: a unique `O_CREAT|O_EXCL` temp in the
-/// destination directory, then an atomic rename-replace.
-pub(crate) fn write_blob_atomic(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    let mut tmp = temp_in_parent(target)?;
-    tmp.write_all(bytes)?;
-    tmp.as_file().sync_all()?;
-    tmp.persist(target).map_err(|e| e.error)?;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -2609,15 +2571,6 @@ mod tests {
             partial_path(Path::new("blob.bin")),
             Path::new("blob.bin.partial")
         );
-    }
-
-    #[test]
-    fn write_blob_atomic_replaces_existing_file() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("out.bin");
-        std::fs::write(&path, b"old contents that are longer").expect("seed");
-        write_blob_atomic(&path, b"new").expect("write");
-        assert_eq!(std::fs::read(&path).expect("read back"), b"new");
     }
 
     #[test]
