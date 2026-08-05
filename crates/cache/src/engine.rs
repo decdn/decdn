@@ -393,6 +393,45 @@ pub struct EvictionPreview {
     pub origin_kinds: Vec<OriginKind>,
 }
 
+/// The chunk ranges of a hash currently present in the store.
+///
+/// This is the presence oracle the range-aware cache API builds on: `read`
+/// serves only present ranges, resume re-fetches only missing ones, and disk
+/// admission accounts present bytes. Absent and logically-evicted hashes report
+/// empty + not-complete, matching [`CacheEngine::has`]'s eviction masking.
+#[derive(Debug, Clone)]
+pub struct PresentRanges {
+    ranges: ChunkRanges,
+    complete: bool,
+}
+
+impl PresentRanges {
+    fn absent() -> Self {
+        Self {
+            ranges: ChunkRanges::empty(),
+            complete: false,
+        }
+    }
+
+    /// The whole blob is present.
+    #[must_use]
+    pub const fn is_complete(&self) -> bool {
+        self.complete
+    }
+
+    /// No range of this hash is present (absent or evicted).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.ranges.is_empty()
+    }
+
+    /// The present ranges, in chunk units.
+    #[must_use]
+    pub const fn chunk_ranges(&self) -> &ChunkRanges {
+        &self.ranges
+    }
+}
+
 /// Snapshot of access times for blobs that are eligible for LRU
 /// eviction — i.e. **pinned hashes are already excluded**. Returned by
 /// [`CacheEngine::eviction_candidates`].
@@ -1329,6 +1368,72 @@ impl CacheEngine {
             .has(hash)
             .await
             .map_err(|e| CacheError::Store(anyhow::Error::from(e)))
+    }
+
+    /// Which chunk ranges of `hash` are present on disk right now.
+    ///
+    /// Classifies via `status()` first (so an absent hash returns immediately),
+    /// then snapshots the current bitfield by awaiting `observe` directly — the
+    /// FIRST `observe` item is the current state. It deliberately does NOT call
+    /// `ObserveProgress::await_completion`, which blocks until the blob is
+    /// *complete* and would hang forever on a partial or absent blob.
+    /// Logically-evicted hashes report absent, mirroring [`Self::has`]. Pure
+    /// query: does not touch access times and changes no serving behavior.
+    pub async fn present_ranges(&self, hash: Hash) -> CacheResult<PresentRanges> {
+        if self.refuses(hash) {
+            return Ok(PresentRanges::absent());
+        }
+        // Resolve absence without `observe`: a hash the store has never seen has
+        // no defined current bitfield to await, and a size-0 bitfield reports
+        // `is_complete() == true` vacuously — both are wrong answers here.
+        let status = self
+            .inner
+            .store
+            .blobs()
+            .status(hash)
+            .await
+            .map_err(|e| CacheError::Store(anyhow::Error::from(e)))?;
+        if matches!(status, iroh_blobs::api::blobs::BlobStatus::NotFound) {
+            return Ok(PresentRanges::absent());
+        }
+        // The blob exists (Partial or Complete): its current bitfield is the
+        // first item `observe` yields, available immediately.
+        let bitfield = self
+            .inner
+            .store
+            .blobs()
+            .observe(hash)
+            .await
+            .map_err(|e| CacheError::Store(anyhow::Error::from(e)))?;
+        Ok(PresentRanges {
+            complete: bitfield.is_complete(),
+            ranges: bitfield.ranges,
+        })
+    }
+
+    /// The chunk-aligned sub-ranges of `[byte_offset, byte_offset + byte_len)`
+    /// (`byte_len == 0` = to `blob_size`) that are NOT present on disk.
+    ///
+    /// Empty ⇒ the requested span is fully present: a completeness-aware read can
+    /// serve it with no fetch, and a resumed pull is a no-op. `blob_size` is
+    /// caller-supplied (the signed `total_bytes`), the same contract as
+    /// [`Self::export_bao_range_stream`].
+    pub async fn missing_ranges(
+        &self,
+        hash: Hash,
+        byte_offset: u64,
+        byte_len: u64,
+        blob_size: u64,
+    ) -> CacheResult<ChunkRanges> {
+        // Same align_range error mapping as `export_bao_range_stream`: a range
+        // that does not fit `blob_size` is an argument error, not an origin fault.
+        let aligned = align_range(byte_offset, byte_len, blob_size).map_err(|e| {
+            CacheError::Store(anyhow::Error::from(e).context("missing_ranges: range alignment"))
+        })?;
+        let present = self.present_ranges(hash).await?;
+        // requested \ present. `ChunkRanges` is a `RangeSet2`, which implements
+        // `Sub` (`owned - &ref -> owned`).
+        Ok(aligned.chunk_ranges().clone() - present.chunk_ranges())
     }
 
     /// Mark `hash` as evicted: subsequent [`Self::has`] / [`Self::get`] calls
