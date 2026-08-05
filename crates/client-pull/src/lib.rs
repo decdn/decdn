@@ -1458,8 +1458,10 @@ pub const MAX_TOPUP_ATTEMPTS: u32 = 3;
 /// field on the wire), not a position within THIS blob's byte range. A
 /// channel can fund many blobs; jumping the wire offset ahead to the
 /// channel's cumulative would, for every caller that requested
-/// `byte_offset == 0` (the CLI's buffered `fetch_blob` / bundle-pull path, which
-/// is what still reaches this wrapper in production), silently return a
+/// `byte_offset == 0` (previously the CLI's buffered `fetch_blob` /
+/// bundle-pull path; both CLI commands now stream through
+/// `open_progressive_pull` instead, so only `stream_fetch`'s test-only
+/// callers still reach this wrapper at that offset), silently return a
 /// TRUNCATED tail instead of the full blob the caller is relying on getting
 /// back. The bytes already streamed in the failed attempt were never decoded
 /// (the error path never reaches `decode_verified_range`), so there is

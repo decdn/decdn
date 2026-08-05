@@ -96,7 +96,7 @@ fn group_by_hash(entries: &[ManifestEntry]) -> Vec<HashGroup<'_>> {
 /// a hard link where the filesystem allows it, else a full copy (cross-device
 /// `EXDEV`, or a filesystem that can't link). Staged in `dest`'s parent and
 /// renamed into place so `dest` is only ever absent or complete — the same
-/// atomic-replace invariant `write_blob_atomic` upholds, which bundle pull's
+/// atomic-replace invariant [`materialize`] upholds, which bundle pull's
 /// skip-existing relies on ("a present final file is verified-good").
 fn link_or_copy_atomic(src: &Path, dest: &Path) -> anyhow::Result<()> {
     let parent = dest
@@ -145,6 +145,18 @@ fn plan_slots<'a>(
         .iter()
         .map(|en| match safe_join(out_root, &en.path) {
             Err(e) => Slot::Failed(EntryOutcome::failed(&en.path, &e)),
+            // Reserve the staging dir: an entry resolving inside
+            // `<out_root>/.decdn-partial/` would collide with a per-hash staging
+            // file, and `remove_staging` could then delete a materialized output.
+            Ok(dest) if dest.starts_with(out_root.join(STAGING_DIR)) => {
+                Slot::Failed(EntryOutcome::failed(
+                    &en.path,
+                    &anyhow::anyhow!(
+                        "manifest path {:?} is inside the reserved staging directory {STAGING_DIR}/",
+                        en.path
+                    ),
+                ))
+            }
             Ok(dest) if !overwrite && dest.try_exists().unwrap_or(false) => Slot::Skip,
             Ok(dest) => Slot::Write {
                 label: en.path.as_str(),
@@ -157,11 +169,10 @@ fn plan_slots<'a>(
 /// Turn classified [`Slot`]s into outcomes: materialize the blob at the first
 /// writable destination and hard-link/copy it to the rest. `materialize` is the
 /// paid path and runs **at most once** per group — every later destination goes
-/// through the free `link`,
-/// reported as [`EntryOutcome::Linked`] so the summary never implies a second
-/// paid fetch. If the first materialize fails, the next writable path retries it
-/// from the same in-memory bytes (no re-fetch), so one bad path can't doom the
-/// group.
+/// through the free `link`, reported as [`EntryOutcome::Linked`] so the summary
+/// never implies a second paid fetch. If the first materialize fails, the next
+/// writable path retries it from the same already-fetched staging file (no
+/// re-fetch), so one bad path can't doom the group.
 ///
 /// Parameterized over the two operations so the fetch-once / link-rest invariant
 /// — the core of #1306 — is unit-testable without a live endpoint or channel.
@@ -346,7 +357,7 @@ async fn resolve_selection(
             .transpose()?;
         let (signer, self_address) = load_buyer_signer(chain)?;
         // Read (and guard) the channel's provider to resolve the pinned node. A
-        // throwaway contract just for this one `getChannel`; `fetch_from` rebuilds
+        // throwaway contract just for this one `getChannel`; `fetch_to_staging_from` rebuilds
         // per entry from the now-persisted store row.
         let read_rpc = provider::build_provider(&chain.rpc_url, &signer)?;
         let read_contract = PaymentChannel::new(chain.payment_channel, read_rpc);
@@ -481,8 +492,9 @@ pub async fn bundle_pull(args: &BundlePullArgs, config_path: Option<&Path>) -> a
             .hash
             .as_deref()
             .ok_or_else(|| anyhow!("no bundle source (expected -i or --hash)"))?;
+        let hash = fetch::parse_hash(raw)?;
         let bytes = ctx
-            .fetch(fetch::parse_hash(raw)?)
+            .fetch_to_memory(hash, &args.output)
             .await
             .context("fetch bundle manifest blob")?;
         parse_manifest(&bytes)?
@@ -587,24 +599,32 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         Ok((picked.node_id, picked.eth_address))
     }
 
-    /// Fetch one blob after normal explicit selection or discovery.
-    async fn fetch(&self, hash: [u8; 32]) -> anyhow::Result<Vec<u8>> {
+    /// Fetch one blob after normal explicit selection or discovery, streaming it
+    /// into `staging` (#1497: the same [`fetch::fetch_blob_streaming`] loop
+    /// `decdn fetch` uses, so bundle pull gets reactive top-up too).
+    async fn fetch_to_staging(&self, hash: [u8; 32], staging: &Path) -> anyhow::Result<()> {
         let target = self.pick(hash).await?;
-        self.fetch_from(hash, target).await
+        self.fetch_to_staging_from(hash, target, staging).await
     }
 
-    /// Fetch directly from `node_id`/`provider`, bypassing discovery.
-    async fn fetch_from(
+    /// Fetch directly from `node_id`/`provider`, bypassing discovery, streaming
+    /// into `staging`.
+    async fn fetch_to_staging_from(
         &self,
         hash: [u8; 32],
         (node_id, provider): FetchTarget,
-    ) -> anyhow::Result<Vec<u8>> {
+        staging: &Path,
+    ) -> anyhow::Result<()> {
         // Serialize all access to this provider's channel: the open-or-reuse +
         // voucher-signing critical section must be atomic per channel.
         let lock = self.provider_lock(provider);
         let _guard = lock.lock().await;
 
-        let ctx = match self.payment {
+        // `mut`: `fetch_blob_streaming` takes `&mut ChannelContext` — a genuine
+        // mid-fetch `InsufficientDeposit` mutates `ctx.deposit` after an on-chain
+        // top-up (#1497). This binding is owned and local to one entry's fetch,
+        // so there is nothing else that could be holding a conflicting borrow.
+        let mut ctx = match self.payment {
             Payment::AutoOpen => {
                 // Only an actual channel *open* touches the shared USDC allowance, so
                 // only opens take the global `open_lock`. A live-channel reuse issues no
@@ -680,10 +700,10 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         }
 
         let max_blob_bytes = self.common.max_blob_mb.saturating_mul(1024 * 1024);
-        fetch::fetch_blob(
+        let streamed = fetch::fetch_blob_streaming(
             self.endpoint,
             target,
-            &ctx,
+            &mut ctx,
             self.slash_dom,
             provider,
             self.store,
@@ -702,12 +722,45 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
             )?,
             max_blob_bytes,
             self.common.max_rate_per_mb,
+            staging,
             // Per-entry byte bars would interleave illegibly across a manifest's
             // many concurrent pulls; `bundle pull` reports at entry granularity
             // instead (#1118 scopes the byte bar to single-blob `fetch`).
             None,
+            // Reactive graduation (#1497): funding handles for a mid-fetch top-up,
+            // same shapes `fetch` passes.
+            self.contract,
+            self.rpc,
+            self.self_address,
+            self.chain.payment_channel,
+            self.chain.max_approve,
+            self.chain.working_deposit,
         )
-        .await
+        .await?;
+
+        // On error `staging` is deliberately left in place by the streaming loop
+        // itself (same contract as `fetch`'s `<output>.partial`); nothing to do
+        // here on that path. On success, settle any inherited-from-a-prior-run
+        // prefix against `hash` before the caller trusts this file (see
+        // `verify_resumed_prefix`).
+        fetch::verify_resumed_prefix(hash, staging, &streamed)
+    }
+
+    /// Fetch one blob fully into memory — used only for the bundle manifest
+    /// itself when named by `--hash` rather than read locally via `-i`.
+    /// Manifests are small (unlike bundle entries, which stream straight to
+    /// their destination and never buffer the whole blob), so streaming into a
+    /// staging file under `out_root` and reading it back is cheap; it also
+    /// means a manifest fetch gets the same reactive top-up as everything
+    /// else. The staging file is removed once read back — a manifest fetch has
+    /// nothing further to resume once its bytes are safely in memory.
+    async fn fetch_to_memory(&self, hash: [u8; 32], out_root: &Path) -> anyhow::Result<Vec<u8>> {
+        let staging = staging_path(out_root, hash)?;
+        self.fetch_to_staging(hash, &staging).await?;
+        let bytes =
+            std::fs::read(&staging).with_context(|| format!("read {}", staging.display()))?;
+        remove_staging(&staging);
+        Ok(bytes)
     }
 
     /// Fetch every entry into `out_root`, one unit of work per *distinct* blob
@@ -716,8 +769,8 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
     /// nor *paid for*, twice. `buffer_unordered` polls up to `jobs` futures in
     /// this one task (no `tokio::spawn`, by choice — nothing here is `!Send`);
     /// parallelism comes from concurrent in-flight network I/O, while the
-    /// per-provider locks inside `fetch` serialize same-channel access — now
-    /// over unique blobs.
+    /// per-provider locks inside `fetch_to_staging_from` serialize same-channel
+    /// access — now over unique blobs.
     async fn pull_all(
         &self,
         entries: &[ManifestEntry],
@@ -775,39 +828,132 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
                 .collect();
         }
 
-        let bytes = match self.fetch(hash).await {
-            Ok(fetched) => fetched,
-            Err(e) => {
-                return slots
-                    .into_iter()
-                    .map(|s| match s {
-                        Slot::Failed(o) => o,
-                        Slot::Skip => EntryOutcome::Skipped,
-                        Slot::Write { label, .. } => EntryOutcome::failed(label, &e),
-                    })
-                    .collect();
-            }
+        // Staged once per group under `out_root/.decdn-partial/<hex>.partial`
+        // (#1497): streaming here — rather than buffering the blob — is what
+        // lets a large entry top up mid-fetch, and a staging path derived from
+        // `out_root` is only created once a group actually has something to
+        // write, never for an all-skipped group.
+        let staging = match staging_path(out_root, hash) {
+            Ok(p) => p,
+            Err(e) => return fail_all(slots, &e),
         };
+        if let Err(e) = self.fetch_to_staging(hash, &staging).await {
+            // The streaming loop itself leaves `staging` in place on error — it
+            // is what the next run resumes from rather than re-paying for bytes
+            // already landed (same contract as `fetch`'s `<output>.partial`).
+            return fail_all(slots, &e);
+        }
 
-        // Borrow `bytes` (not move it) into the `FnMut`: `materialize` runs once,
-        // but a retry after a failed first write may call it again.
-        let bytes = &bytes;
-        materialize_group(
+        // `materialize` reads `staging` (not moved), so a retry after a failed
+        // first write may call it again for the next writable path.
+        let outcomes = materialize_group(
             slots,
-            |dest| std::future::ready(materialize(bytes, &dest)),
+            |dest| std::future::ready(materialize(&staging, &dest)),
             link_or_copy_atomic,
         )
-        .await
+        .await;
+
+        // Remove the paid staging file ONLY when every destination landed. If any
+        // materialize failed (unwritable dir, ENOSPC, a link failure), keep it: the
+        // blob is fully fetched and paid for, so a rerun resumes from the complete
+        // `staging` and re-fetches only the trailing partial chunk group instead of
+        // the whole blob. (One residual gap: a blob whose size is an exact multiple
+        // of `CHUNK_GROUP_BYTES` resumes at `byte_offset == total_bytes`, which the
+        // serve gate answers as `NotFound`, so the loop treats it as a stale partial
+        // and restarts from zero — a pre-existing `fetch_blob_streaming` limitation
+        // shared with `decdn fetch`, not specific to this path.) Deleting staging
+        // here would force a full re-fetch — and re-payment — of an unrefunded blob
+        // in *every* case; `fetch`'s single-blob path gets this free from its atomic
+        // `rename`, so the copy-based fan-out must gate it.
+        if !outcomes
+            .iter()
+            .any(|o| matches!(o, EntryOutcome::Failed { .. }))
+        {
+            remove_staging(&staging);
+        }
+
+        outcomes
     }
 }
 
-/// Write already-fetched `bytes` to `dest`, returning the byte count.
-fn materialize(bytes: &[u8], dest: &Path) -> anyhow::Result<u64> {
+/// Copy the already-fetched, already-verified blob at `staging` to `dest`,
+/// returning the byte count. `staging` is read-only here (not consumed) — a
+/// retry after a failed first write calls this again for the next writable
+/// path — so the copy goes through a unique temp file beside `dest` and an
+/// atomic rename, the same source-must-survive shape [`link_or_copy_atomic`]
+/// uses for every later duplicate — built from `fetch::temp_in_parent`, the
+/// same staging primitive `fetch`'s single-blob path used to build its own
+/// (now-deleted) atomic writer from.
+fn materialize(staging: &Path, dest: &Path) -> anyhow::Result<u64> {
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
-    fetch::write_blob_atomic(dest, bytes).with_context(|| format!("write {}", dest.display()))?;
-    Ok(bytes.len() as u64)
+    let mut tmp =
+        fetch::temp_in_parent(dest).with_context(|| format!("stage {}", dest.display()))?;
+    let mut src =
+        std::fs::File::open(staging).with_context(|| format!("open {}", staging.display()))?;
+    let written = std::io::copy(&mut src, tmp.as_file_mut())
+        .with_context(|| format!("copy {} -> {}", staging.display(), dest.display()))?;
+    tmp.as_file()
+        .sync_all()
+        .with_context(|| format!("sync staged copy for {}", dest.display()))?;
+    tmp.persist(dest)
+        .map_err(|e| e.error)
+        .with_context(|| format!("write {}", dest.display()))?;
+    Ok(written)
+}
+
+/// Per-hash staging file a streaming fetch writes into before `fetch_group`
+/// materializes it at the manifest's destination path(s) —
+/// `<out_root>/.decdn-partial/<hex>.partial` (#1497). Reusing
+/// `fetch_blob_streaming` means this survives an interrupted pull the same way
+/// `fetch`'s `<output>.partial` does: a rerun resumes from it rather than
+/// re-paying for bytes already landed. Creates the staging directory
+/// (idempotent, and only ever called once a group has real work to do — an
+/// all-skipped group never creates one) but not the file itself;
+/// `fetch_blob_streaming` does that.
+/// Reserved subdirectory of `out_root` holding per-hash staging files. Manifest
+/// entry paths that resolve inside it are rejected in [`plan_slots`], so a
+/// manifest can never collide with a staging file — nor trick `remove_staging`
+/// into deleting a materialized output.
+const STAGING_DIR: &str = ".decdn-partial";
+
+fn staging_path(out_root: &Path, hash: [u8; 32]) -> anyhow::Result<PathBuf> {
+    let dir = out_root.join(STAGING_DIR);
+    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    Ok(dir.join(format!(
+        "{}.partial",
+        blake3::Hash::from_bytes(hash).to_hex()
+    )))
+}
+
+/// Best-effort cleanup of a staging file whose content is safely elsewhere
+/// (materialized to disk, or read into memory) and so has nothing left to
+/// resume. A leftover file here is harmless clutter, not a correctness issue,
+/// so a removal failure is reported and swallowed rather than propagated.
+fn remove_staging(staging: &Path) {
+    if let Err(e) = std::fs::remove_file(staging)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!(
+            "warning: failed to remove staging file {}: {e}",
+            staging.display()
+        );
+    }
+}
+
+/// Fail every `Write` slot with `e`, preserving `Failed`/`Skip` classification —
+/// the shared tail of `fetch_group`'s two pre-materialize failure paths (a
+/// staging-dir create error, or the fetch itself failing).
+fn fail_all(slots: Vec<Slot<'_>>, e: &anyhow::Error) -> Vec<EntryOutcome> {
+    slots
+        .into_iter()
+        .map(|s| match s {
+            Slot::Failed(o) => o,
+            Slot::Skip => EntryOutcome::Skipped,
+            Slot::Write { label, .. } => EntryOutcome::failed(label, e),
+        })
+        .collect()
 }
 
 impl EntryOutcome {
@@ -1168,6 +1314,37 @@ mod tests {
         let refs: Vec<&ManifestEntry> = entries.iter().collect();
         let slots = plan_slots(&refs, dir.path(), false);
         assert!(matches!(slots[0], Slot::Failed(_)));
+    }
+
+    /// A manifest path inside the reserved staging dir must not be materialized —
+    /// otherwise it could collide with a per-hash staging file and `remove_staging`
+    /// could delete a real output.
+    #[test]
+    fn plan_slots_rejects_the_reserved_staging_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let entries = [entry(&format!("{STAGING_DIR}/deadbeef.partial"), "b3:h")];
+        let refs: Vec<&ManifestEntry> = entries.iter().collect();
+        let slots = plan_slots(&refs, dir.path(), false);
+        assert!(matches!(slots[0], Slot::Failed(_)));
+    }
+
+    /// `materialize` (the paid-path writer) atomically replaces an existing
+    /// destination from the staging file, and leaves the staging file intact so a
+    /// retry for the next duplicate path can read it again.
+    #[test]
+    fn materialize_replaces_dest_and_keeps_staging() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = dir.path().join("blob.partial");
+        std::fs::write(&staging, b"new-content").unwrap();
+        let dest = dir.path().join("out.bin");
+        std::fs::write(&dest, b"stale-old").unwrap();
+
+        let n = materialize(&staging, &dest).unwrap();
+
+        assert_eq!(n, b"new-content".len() as u64);
+        assert_eq!(std::fs::read(&dest).unwrap(), b"new-content");
+        assert!(staging.exists(), "staging must survive for retries");
+        assert_eq!(std::fs::read(&staging).unwrap(), b"new-content");
     }
 
     /// The headline #1306 invariant, testable without a live endpoint: two

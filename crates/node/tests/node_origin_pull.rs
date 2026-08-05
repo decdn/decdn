@@ -10010,8 +10010,11 @@ async fn two_concurrent_pulls_to_one_provider_share_the_channel_ledger() -> Resu
 /// This calls [`stream_fetch_shared`], which UNTIL #1530 was the entrypoint the node's
 /// cache-miss pulls used (at a fixed `byte_offset == 0`). It no longer is: the daemon's miss
 /// leg now drives its own resume loop in `node_origin/resume.rs`, so what this test pins today
-/// is the `client-pull`-internal retry that the CLI's buffered `fetch_blob`/bundle-pull path
-/// still relies on. The node's twin of the same contract — a bundled watermark reseeds rather
+/// is the `client-pull`-internal retry that the CLI's `fetch_blob`/bundle-pull path used to
+/// rely on; both CLI commands now stream through `open_progressive_pull` and drive their own
+/// resume loop instead, so this wrapper's `byte_offset == 0` path is exercised only by
+/// `stream_fetch`'s test-only callers, this test included. The node's twin of the same
+/// contract — a bundled watermark reseeds rather
 /// than terminating — is pinned by `node_origin::resume::tests::an_advancing_bundle_reseeds`
 /// and its siblings.
 ///
