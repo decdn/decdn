@@ -29,16 +29,38 @@
 //!   Memory stays bounded; disk amplification is
 //!   `(1 + max_retries) * max_blob_bytes` worst case until GC.
 //!
-//! ## Coalescing interaction
+//! ## Coalescing interaction and the retry-amplification bound (#1615)
 //!
 //! [`crate::CacheEngine::get`] coalesces concurrent misses for the same hash
-//! through a single owner task. The retry loop runs *inside* that owner;
+//! through a single owner task (#305). The retry loop runs *inside* that owner;
 //! waiters block on the shared `Notify` until the owner either succeeds or
-//! exhausts. After an owner exhausts, however, one waiter may become the
-//! next owner and run its own full retry budget — a sustained outage can
-//! produce up to `N` *sequential* retry budgets across `N` concurrent
-//! waiters. Accepted as a known trade-off: bounding the amplification would
-//! require a shared retry-budget across waiters, which is not implemented.
+//! exhausts. After an owner exhausts, one waiter re-elects itself as the next
+//! owner and runs its own full retry budget — so, taken alone, a burst of `N`
+//! concurrent waiters on a down origin could drive up to `N` *sequential* full
+//! retry budgets.
+//!
+//! That amplification is bounded, but by the per-origin circuit-breaker
+//! ([`crate::circuit_breaker`], #963) rather than by anything in this module.
+//! Each budget-exhaustion against a down origin records one `Unavailable`
+//! outcome; after `failure_threshold` consecutive exhaustions the breaker
+//! trips OPEN and every later waiter short-circuits *before* the retry loop
+//! runs. The worst case is therefore `failure_threshold` full budgets per
+//! origin per cooldown window — a constant, independent of `N`. The
+//! integration test `coalesced_owner_exhaustion_bounded_by_circuit_breaker`
+//! pins this, and also pins the O(`N`) fallback that returns when an operator
+//! disables the breaker.
+//!
+//! A tighter per-hash bound — the owner's failure *shared* to all waiters so
+//! not even `failure_threshold` budgets run — is deliberately NOT implemented.
+//! Coalesced waiters do not all have the same origin reach: a `populate_local`
+//! owner (local origins only, #1116) and a `get` / `populate` waiter (full
+//! chain including the paid `Peer` origin) can coalesce on one hash, and
+//! re-election is load-bearing there — a local-only owner's `NotFound` must
+//! not short-circuit a full-chain waiter that could still succeed via `Peer`.
+//! Sharing the owner's failure blindly would turn that into a wrong answer;
+//! correct sharing would have to be origin-reach-aware. The circuit-breaker
+//! already sheds the outage load without that complexity, so the shared budget
+//! is not worth its risk on this hot, cancellation-sensitive path.
 
 use std::future::Future;
 use std::io;

@@ -2372,6 +2372,22 @@ async fn build_engine_with_retry(
     origin: Arc<dyn Origin>,
     policy: RetryPolicy,
 ) -> anyhow::Result<(CacheEngine, tempfile::TempDir)> {
+    build_engine_with_retry_and_breaker(
+        origin,
+        policy,
+        decdn_cache::CircuitBreakerPolicy::default(),
+    )
+    .await
+}
+
+/// [`build_engine_with_retry`] with an explicit circuit-breaker policy, so a
+/// test can compare the breaker-bounded path against the breaker-disabled
+/// (`CircuitBreakerPolicy::disabled()`) path.
+async fn build_engine_with_retry_and_breaker(
+    origin: Arc<dyn Origin>,
+    policy: RetryPolicy,
+    breaker: decdn_cache::CircuitBreakerPolicy,
+) -> anyhow::Result<(CacheEngine, tempfile::TempDir)> {
     let tmp = tempfile::tempdir()?;
     let engine = CacheEngine::open_full(
         tmp.path(),
@@ -2379,7 +2395,7 @@ async fn build_engine_with_retry(
         16,
         PinnedHashes::empty(),
         policy,
-        decdn_cache::CircuitBreakerPolicy::default(),
+        breaker,
         None,
         Duration::ZERO,
     )
@@ -2769,61 +2785,111 @@ async fn coalesced_owner_retry_unblocks_waiters_on_success() -> anyhow::Result<(
 }
 
 #[tokio::test]
-async fn coalesced_owner_exhaustion_bounded_by_serial_owner_count() -> anyhow::Result<()> {
-    // Documents the known coalescing+retry limitation called out in the
-    // retry.rs module doc: under sustained transient failure, after one
-    // owner exhausts its retry budget, a *waiter* may become the next
-    // owner and run a fresh budget. With N concurrent waiters this
-    // produces up to `N` *sequential* retry budgets (no parallel
-    // fan-out — at any instant exactly one owner is running). The
-    // load-bearing invariants this test pins:
+async fn coalesced_owner_exhaustion_bounded_by_circuit_breaker() -> anyhow::Result<()> {
+    // Retry-amplification bound (#1615), the invariant the retry.rs module
+    // doc describes. Under sustained transient failure, coalescing (#305)
+    // serializes owners — at any instant exactly one owner runs its retry
+    // budget — but after each owner exhausts, a *waiter* re-elects and runs a
+    // fresh budget. Taken alone that is `N` *sequential* budgets for `N`
+    // concurrent waiters. What actually bounds it is the per-origin
+    // circuit-breaker (#963): after `failure_threshold` budget-exhaustions the
+    // breaker trips OPEN and every later waiter short-circuits *before* the
+    // retry loop. This test pins the bound in BOTH directions, with
+    // `N_WAITERS` deliberately above `failure_threshold` so the breaker has to
+    // shed load for the assertion to hold:
     //
-    //   1. Every concurrent get observes a CacheError::OriginError
-    //      (no spurious successes from a stale cache hit).
-    //   2. Total origin fetches stay within the documented worst case
-    //      `N * (1 + max_retries)` — a regression that re-spread retry
-    //      across waiters in parallel would blow this bound.
-    //   3. Total origin fetches stay above the no-coalescing best case
-    //      `1 + max_retries` — confirming retry actually runs.
-    //
-    // The bound is asserted as <= worst-case, not == exact, because the
-    // race between owner-exhaustion-notify and waiter-loop-reentry is
-    // scheduler-dependent. A stricter bound would be flake-prone.
-    const N_WAITERS: u32 = 5;
+    //   1. Every concurrent get observes a `CacheError::OriginError` — no
+    //      spurious success from a stale cache hit, whether or not the breaker
+    //      short-circuited it.
+    //   2. With the breaker DISABLED the amplification is exactly the O(N)
+    //      worst case `N * (1 + max_retries)`: every waiter re-elects and burns
+    //      a full budget.
+    //   3. With the default breaker ENABLED the total origin fetches are capped
+    //      at `failure_threshold * (1 + max_retries)` — a constant independent
+    //      of N — and therefore strictly below the O(N) case. This is what
+    //      would regress to O(N) if the breaker were unwired from pull-through.
+    //   4. Fetches stay at or above the no-coalescing minimum `1 + max_retries`,
+    //      confirming retry actually runs before the breaker sheds.
+    const N_WAITERS: u32 = 12;
     const MAX_RETRIES: u32 = 2;
+
+    // Spawn `N_WAITERS` concurrent gets at a forever-failing origin fronted by
+    // `breaker`; assert every one surfaces `OriginError`, then return the total
+    // number of origin fetches driven. Defined before the statements below to
+    // keep `clippy::items_after_statements` quiet.
+    async fn drive_down_origin(
+        breaker: decdn_cache::CircuitBreakerPolicy,
+        payload: &'static [u8],
+        hash: Hash,
+        n: u32,
+    ) -> anyhow::Result<usize> {
+        let origin = Arc::new(FailingThenSucceedingOrigin::new(payload, usize::MAX));
+        let (engine, _tmp) = build_engine_with_retry_and_breaker(
+            origin.clone() as Arc<dyn Origin>,
+            fast_retry_policy(MAX_RETRIES),
+            breaker,
+        )
+        .await?;
+
+        let mut handles = Vec::new();
+        for _ in 0..n {
+            let e = engine.clone();
+            handles.push(tokio::spawn(async move { e.get(hash).await }));
+        }
+        for h in handles {
+            match h.await? {
+                Err(CacheError::OriginError { .. }) => {}
+                other => anyhow::bail!("expected OriginError, got: {other:?}"),
+            }
+        }
+        Ok(origin.fetches())
+    }
+
+    let budget = 1 + MAX_RETRIES as usize; // attempts per owner turn
     let payload: &[u8] = b"never available";
-    let origin = Arc::new(FailingThenSucceedingOrigin::new(payload, usize::MAX));
-    let (engine, _tmp) = build_engine_with_retry(
-        origin.clone() as Arc<dyn Origin>,
-        fast_retry_policy(MAX_RETRIES),
-    )
-    .await?;
     let hash = Hash::new(payload);
 
-    let mut handles = Vec::new();
-    for _ in 0..N_WAITERS {
-        let e = engine.clone();
-        handles.push(tokio::spawn(async move { e.get(hash).await }));
-    }
-    let mut errors: u32 = 0;
-    for h in handles {
-        match h.await? {
-            Err(CacheError::OriginError { .. }) => errors += 1,
-            other => anyhow::bail!("expected OriginError, got: {other:?}"),
-        }
-    }
-    anyhow::ensure!(errors == N_WAITERS);
-
-    let attempts = origin.fetches();
-    let worst_case = (N_WAITERS as usize) * (1 + MAX_RETRIES as usize);
-    let no_coalesce_minimum = 1 + MAX_RETRIES as usize;
+    // Breaker DISABLED: the amplification is exactly O(N). Each of the N
+    // waiters serially re-elects and burns one full `budget`-attempt turn.
+    let unbounded = drive_down_origin(
+        decdn_cache::CircuitBreakerPolicy::disabled(),
+        payload,
+        hash,
+        N_WAITERS,
+    )
+    .await?;
+    let o_n = (N_WAITERS as usize) * budget;
     anyhow::ensure!(
-        attempts <= worst_case,
-        "attempts={attempts} exceeds worst-case {worst_case} (N_WAITERS * (1+MAX_RETRIES))",
+        unbounded == o_n,
+        "breaker disabled: expected the O(N) worst case {o_n}, got {unbounded}",
+    );
+
+    // Breaker ENABLED (default): the total is capped by the breaker's failure
+    // threshold, independent of N, and strictly below the O(N) case above.
+    let threshold = decdn_cache::CircuitBreakerPolicy::default().failure_threshold as usize;
+    anyhow::ensure!(
+        threshold < N_WAITERS as usize,
+        "test is only meaningful when failure_threshold ({threshold}) < N_WAITERS ({N_WAITERS})",
+    );
+    let bounded = drive_down_origin(
+        decdn_cache::CircuitBreakerPolicy::default(),
+        payload,
+        hash,
+        N_WAITERS,
+    )
+    .await?;
+    let cap = threshold * budget;
+    anyhow::ensure!(
+        bounded <= cap,
+        "breaker enabled: fetches {bounded} exceed the cap {cap} (failure_threshold * budget)",
     );
     anyhow::ensure!(
-        attempts >= no_coalesce_minimum,
-        "attempts={attempts} below the minimum {no_coalesce_minimum} — retry never ran?",
+        bounded < o_n,
+        "breaker enabled: fetches {bounded} not below the O(N) case {o_n} — breaker never shed load",
+    );
+    anyhow::ensure!(
+        bounded >= budget,
+        "breaker enabled: fetches {bounded} below the {budget}-attempt minimum — retry never ran?",
     );
     Ok(())
 }
