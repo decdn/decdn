@@ -940,7 +940,8 @@ where
     // transient fault, `ENOTDIR`) must NOT be read as zero: that would silently
     // truncate a large verified prefix and re-pay for the whole blob, which is
     // real money lost to a condition we could have reported.
-    let mut byte_offset = decdn_client_pull::sink::resume_offset(existing_partial_len(partial)?);
+    let existing_len = existing_partial_len(partial)?;
+    let mut byte_offset = decdn_client_pull::sink::resume_offset(existing_len);
 
     let mut file = std::fs::OpenOptions::new()
         .create(true)
@@ -1145,6 +1146,44 @@ where
         // the blob, the from-zero open fails too and the prefix is still on disk,
         // untouched, for a later run against a node that does.
         if !restarted && byte_offset > 0 && resume_may_be_stale(&err) {
+            // Before treating this as a stale/foreign partial and rewinding to
+            // zero, rule out the one BENIGN cause of the same ambiguous `NotFound`:
+            // the `.partial` is already the complete blob. When a blob's size is an
+            // exact multiple of the chunk-group size, a complete partial snaps to
+            // `byte_offset == total_bytes` — `resume_offset` rounds down to a group
+            // boundary and there is no ragged final group to land below it — and the
+            // node's range gate refuses `byte_offset >= total_bytes` with the very
+            // `NotFound` a foreign partial also draws (see `resume_may_be_stale`).
+            // Rewinding here would `set_len(0)` a verified, already-paid-for file and
+            // re-fetch — and re-pay for — the whole blob. So hash what is on disk
+            // against the target first: if it IS the blob, finish for free; only a
+            // genuine miss falls through to the rewind. This runs solely on this rare
+            // ambiguous refusal, never on an ordinary incomplete resume (whose open
+            // succeeds), so it adds no hashing to the common path.
+            let already_complete = std::fs::File::open(partial)
+                .map_err(|e| anyhow::anyhow!("reopen {}: {e}", partial.display()))
+                .and_then(|f| {
+                    decdn_client_pull::sink::resume_is_genuine(hash, std::io::BufReader::new(f))
+                        .map_err(|e| anyhow::anyhow!("verify {}: {e}", partial.display()))
+                })?;
+            if already_complete {
+                // The bytes on disk hash to the target, so `existing_len` IS the
+                // whole-blob size. Sync for the same durability the normal success
+                // path gives (an earlier process may have died before its own sync),
+                // then report a from-zero fetch so the caller promotes directly —
+                // the whole-file check it runs for `resumed_from > 0` was just done.
+                file.sync_all()
+                    .map_err(|e| anyhow::anyhow!("sync {}: {e}", partial.display()))?;
+                eprintln!(
+                    "note: the partial at {} is already the complete blob; promoting it as-is \
+                     (no bytes re-fetched or re-paid)",
+                    partial.display()
+                );
+                return Ok(StreamedFetch {
+                    total_bytes: existing_len,
+                    resumed_from: 0,
+                });
+            }
             eprintln!(
                 "note: the node would not serve a resume at byte {byte_offset} of {}; \
                  retrying from the start in case the partial belongs to another blob \
