@@ -223,6 +223,17 @@ pub struct BlockchainConfig {
     /// disables top-up entirely (a spent-down channel errors instead of
     /// refilling). Must be `>= buyer_initial_deposit_micro_usdc` when nonzero.
     pub buyer_working_deposit_micro_usdc: Option<u64>,
+    /// Minimum remaining time (SECONDS) to a channel's on-chain `expires_at`
+    /// below which the daemon's node-to-node miss pull will NOT reactively top
+    /// that channel up (#1603). `topUp` deliberately does not extend expiry (the
+    /// contract forbids it), so escrowing a fresh working-deposit into a channel
+    /// this close to expiry risks the deposit expiring before the resumed leg can
+    /// spend it — stranding it until `reclaimExpired`. Inside this margin the pull
+    /// ends cleanly instead, so the next miss opens a fresh, full-lifetime channel.
+    /// Seconds so operators can tune it per chain lane. Absent => default
+    /// (`super::DEFAULT_BUYER_REACTIVE_TOPUP_MIN_TTL_SECS`, ~1 day). `0` disables
+    /// the guard (always top up, whatever the remaining time).
+    pub buyer_reactive_topup_min_ttl_secs: Option<u64>,
     /// Whether to issue an unlimited (max) USDC approval for the
     /// `PaymentChannel` contract so the buyer path can `openChannel` (#744).
     /// The absent-default is **profile-dependent**: the node daemon defaults to

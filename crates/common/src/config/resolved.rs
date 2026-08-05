@@ -150,6 +150,12 @@ pub struct ResolvedBlockchain {
     /// Defaults to 10 USDC (`10_000_000`). `0` disables top-up. Guaranteed
     /// `>= buyer_initial_deposit_micro_usdc` when nonzero.
     pub buyer_working_deposit_micro_usdc: u64,
+    /// Minimum remaining seconds to a channel's on-chain `expires_at` below which
+    /// the node-to-node miss pull refuses a reactive top-up (#1603), since `topUp`
+    /// cannot extend expiry. Defaults to
+    /// `super::DEFAULT_BUYER_REACTIVE_TOPUP_MIN_TTL_SECS` (~1 day); `0` disables
+    /// the guard.
+    pub buyer_reactive_topup_min_ttl_secs: u64,
     /// Whether the buyer path issues a one-time max USDC approval for the
     /// `PaymentChannel` contract at startup (#744, ADR 003 § Deposit
     /// Economics). Defaults to `true`; set `false` to manage the allowance

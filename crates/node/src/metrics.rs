@@ -1091,6 +1091,25 @@ pub struct DecdnMetrics {
     /// it alongside `decdn_buyer_topup_failure_total`, which the latter two also tick
     /// and the first does not.
     pub node_pull_reactive_topup_refused: Counter,
+    /// `decdn_node_pull_reactive_topup_near_expiry_total` (#1603): a mid-pull
+    /// top-up the node WOULD have funded — genuine exhaustion, corroborated by our
+    /// own ledger — was declined because the channel had less than
+    /// `blockchain.buyer_reactive_topup_min_ttl_secs` left to its on-chain
+    /// `expires_at`.
+    ///
+    /// `topUp` cannot extend expiry, so funding here would escrow a fresh
+    /// working-deposit into a channel that may expire before the resumed leg can
+    /// spend it — stranding capital until `reclaimExpired`. The pull ends cleanly on
+    /// the original exhaustion instead: the near-expiry channel is wedged
+    /// (`OurDeadChannel` — row KEPT for the reclaim sweep, provider suppressed until
+    /// its imminent expiry), and a later miss opens a fresh, full-lifetime channel.
+    ///
+    /// Distinct from `_refused`, which is an exhaustion claim our ledger CONTRADICTS
+    /// (a lying peer) or a funding failure — there the channel had headroom in time,
+    /// just not in the node's favour. A sustained rate here means channels are being
+    /// opened too close to expiry for the blob sizes this node pulls, or the margin
+    /// is mis-sized for the chain lane.
+    pub node_pull_reactive_topup_near_expiry: Counter,
     /// `decdn_node_pull_through_timeouts_total` (#831): cache-miss pull-through
     /// attempts the delivery handler abandoned at its deadline. Distinguishes a
     /// slow/wedged upstream from a genuine miss (both otherwise return
@@ -2327,6 +2346,11 @@ recorders! {
     /// exhaustion our own ledger contradicts, a failed funding tx, or a top-up that
     /// credited nothing (#1530).
     node_pull_reactive_topup_refused => node_pull_reactive_topup_refused.inc();
+
+    /// A mid-pull top-up the node would have funded was declined because the channel
+    /// was within its near-expiry margin — `topUp` cannot extend expiry, so the pull
+    /// ends cleanly rather than escrow into a channel that may expire first (#1603).
+    node_pull_reactive_topup_near_expiry => node_pull_reactive_topup_near_expiry.inc();
 
     /// The delivery handler abandoned a pull-through at its deadline (#831).
     node_pull_through_timeout => node_pull_through_timeouts.inc();

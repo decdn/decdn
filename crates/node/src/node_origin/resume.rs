@@ -61,6 +61,7 @@ use crate::client_requester::{
     effective_rate_ceiling, genuine_exhaustion, open_progressive_pull as open_progressive_upstream,
     resumable_watermark,
 };
+use decdn_incentive::buyer_channel::NEVER_EXPIRES;
 use decdn_protocol::client::{StreamError, VoucherRejectReason};
 
 use super::{NodeOriginDeps, now_micros, persist_buyer_progress};
@@ -132,6 +133,20 @@ enum ResumeAction {
     /// A genuine ceiling hit, corroborated by our own ledger: raise the channel
     /// toward this target and resume at the paid frontier.
     TopUp(U256),
+    /// A genuine ceiling hit we WOULD have funded, but the channel is inside the
+    /// near-expiry margin — `topUp` cannot extend `expires_at` (the contract forbids
+    /// it), so escrowing a fresh working-deposit here would fund a channel that may
+    /// expire before the resumed leg can spend it. End the pull cleanly instead: the
+    /// caller returns the original exhaustion, which `classify_pull_failure` wedges as
+    /// `OurDeadChannel` — the row is KEPT (its escrowed deposit is refunded by the
+    /// reclaim sweep at expiry) and the provider is suppressed until that expiry, no
+    /// peer scoring. Since expiry is imminent, that suppression is short; the next
+    /// miss after it opens a fresh, full-lifetime channel.
+    ///
+    /// Its own variant, apart from [`Self::TopUp`], so the caller can METER it: a
+    /// channel opened too close to expiry for the blobs this node pulls is a distinct
+    /// signal from a healthy top-up, and from the adversarial [`Self::RefuseFunding`].
+    NearExpiry,
     /// The upstream holds a voucher we do not — reseed the ledger and retry.
     Reseed,
     /// The upstream claimed `InsufficientDeposit` while OUR ledger still covers
@@ -163,6 +178,14 @@ struct ResumeBudgets {
     awaiting_topup_settle: bool,
     /// The graduation target, or `U256::ZERO` to disable reactive top-up.
     working_deposit: U256,
+    /// The tracked channel's on-chain expiry (Unix seconds), or [`NEVER_EXPIRES`]
+    /// (`0`) when none is tracked / the channel never expires. Fixed for the whole
+    /// pull: `topUp` cannot move it. Gates the near-expiry refusal in [`decide`].
+    expires_at: u64,
+    /// How much time must remain to [`Self::expires_at`] for a reactive top-up to be
+    /// allowed (`blockchain.buyer_reactive_topup_min_ttl_secs`, #1603).
+    /// `Duration::ZERO` disables the guard.
+    min_ttl: Duration,
 }
 
 impl ResumeBudgets {
@@ -230,13 +253,36 @@ fn next_voucher_cost(interval_bytes: u64, rate_per_mb: u64) -> U256 {
         .div_ceil(U256::from(MB_BYTES))
 }
 
-/// Classify a failed attempt. See [`ResumeAction`].
+/// Whether a channel is too close to its on-chain `expires_at` to be worth a
+/// reactive top-up (#1603).
+///
+/// `topUp` deliberately does not extend expiry (the contract forbids it), so a
+/// fresh working-deposit escrowed into a channel with less than `min_ttl` left
+/// could expire before the resumed leg can spend it — stranding capital until
+/// `reclaimExpired` and risking the pull failing anyway. Two escape hatches, both
+/// meaning "never near expiry": a [`NEVER_EXPIRES`] (`0`) channel has no deadline to
+/// be close to, and a `min_ttl` of zero disables the guard so an operator gets the
+/// pre-#1603 always-top-up behaviour back.
+///
+/// `saturating_sub` so an already-past expiry reads as `0` remaining (< any positive
+/// margin ⇒ near expiry), never wrapping.
+const fn near_expiry(expires_at: u64, now: u64, min_ttl: Duration) -> bool {
+    if expires_at == NEVER_EXPIRES || min_ttl.is_zero() {
+        return false;
+    }
+    expires_at.saturating_sub(now) < min_ttl.as_secs()
+}
+
+/// Classify a failed attempt. See [`ResumeAction`]. `now` is the current Unix time
+/// in seconds, against which the channel's `expires_at` is measured for the
+/// near-expiry guard.
 fn decide(
     err: &anyhow::Error,
     ctx: &ChannelContext,
     committed: Cumulative,
     interval_bytes: u64,
     rate_per_mb: u64,
+    now: u64,
     budgets: ResumeBudgets,
 ) -> ResumeAction {
     // Ahead of everything: a refusal we PROVOKED by topping up a moment ago is not
@@ -259,6 +305,13 @@ fn decide(
             next_voucher_cost(interval_bytes, rate_per_mb),
         )
     {
+        // Genuine exhaustion — we would fund it. But `topUp` cannot extend expiry, so
+        // a channel this close to `expires_at` must NOT be topped up: escrowing a
+        // fresh working-deposit into it could strand the capital past a deadline the
+        // resumed leg cannot beat. End the pull cleanly instead (#1603).
+        if near_expiry(budgets.expires_at, now, budgets.min_ttl) {
+            return ResumeAction::NearExpiry;
+        }
         return ResumeAction::TopUp(budgets.working_deposit);
     }
 
@@ -368,7 +421,16 @@ pub(super) async fn pull_blob(
     ledger: &Arc<ChannelLedger>,
     deadlines: PullDeadlines,
 ) -> anyhow::Result<PulledBlob> {
-    let mut state = LoopState::new(deps, ledger);
+    // The channel's on-chain expiry is fixed for the whole pull — `topUp` cannot move
+    // it — so read it once here and carry it in the budgets. `None` (no tracked row)
+    // maps to `NEVER_EXPIRES`, which the near-expiry guard treats as "no deadline",
+    // preserving the pre-#1603 always-top-up behaviour for a channel whose expiry we
+    // cannot see.
+    let expires_at = deps
+        .buyer
+        .channel_expiry(target.provider_addr)
+        .unwrap_or(NEVER_EXPIRES);
+    let mut state = LoopState::new(deps, ledger, expires_at);
 
     loop {
         // The re-open round trip a settle-wait iteration performs is OUR funding cost,
@@ -384,12 +446,14 @@ pub(super) async fn pull_blob(
         };
 
         let committed = ledger.committed();
+        let now = crate::payment_settlement::unix_now();
         match decide(
             &err,
             ctx,
             committed,
             state.voucher_interval_bytes,
             state.quoted_rate_per_mb,
+            now,
             state.budgets,
         ) {
             ResumeAction::SettleWait => {
@@ -412,6 +476,31 @@ pub(super) async fn pull_blob(
                 if !top_up_and_reanchor(deps, target, ctx, ledger, &mut state, want).await {
                     return Err(err);
                 }
+            }
+            // The channel is too close to expiry to fund: `topUp` cannot extend
+            // `expires_at`, so escrowing a fresh deposit here would strand it past a
+            // deadline the resumed leg cannot beat. End on the original exhaustion —
+            // `classify_pull_failure` reads the `InsufficientDeposit` as
+            // `OurDeadChannel` → `wedged_channel`, which KEEPS the row (its escrowed
+            // deposit is refunded by the reclaim sweep at expiry — `reclaimExpired`
+            // needs the row) and suppresses the provider until that expiry, without
+            // scoring the peer. Because we refused precisely for being near expiry,
+            // that suppression is short; once it lapses the provider is rankable again
+            // and the next miss opens a fresh, full-lifetime channel (#1603).
+            ResumeAction::NearExpiry => {
+                warn!(
+                    provider = %target.provider_addr,
+                    deposit = %ctx.deposit,
+                    committed = %committed.amount,
+                    expires_at = state.budgets.expires_at,
+                    now,
+                    min_ttl_secs = state.budgets.min_ttl.as_secs(),
+                    "node-origin: channel exhausted mid-pull but is within the reactive-top-up \
+                     expiry margin; refusing to escrow a fresh deposit into a near-expiry channel \
+                     (topUp cannot extend expiry) and ending the pull (#1603)"
+                );
+                deps.metrics.node_pull_reactive_topup_near_expiry();
+                return Err(err);
             }
             ResumeAction::Reseed => {
                 if !reseed(&err, ctx, ledger, &mut state, target.provider_addr) {
@@ -465,7 +554,7 @@ struct LoopState {
 }
 
 impl LoopState {
-    fn new(deps: &NodeOriginDeps, ledger: &ChannelLedger) -> Self {
+    fn new(deps: &NodeOriginDeps, ledger: &ChannelLedger, expires_at: u64) -> Self {
         Self {
             buf: Vec::new(),
             byte_offset: 0,
@@ -484,6 +573,8 @@ impl LoopState {
                 max_settle_waits: settle_wait_budget(deps.config.event_poll_interval),
                 awaiting_topup_settle: false,
                 working_deposit: deps.config.working_deposit,
+                expires_at,
+                min_ttl: deps.config.reactive_topup_min_ttl,
             },
         }
     }
@@ -778,6 +869,14 @@ mod tests {
         }
     }
 
+    /// A fixed "now" for the pure `decide` tests. Any value works while the guard is
+    /// inert (see [`budgets`]); the near-expiry tests below set `expires_at` relative
+    /// to it explicitly.
+    const NOW: u64 = 1_700_000_000;
+
+    /// Budgets with the near-expiry guard INERT — `NEVER_EXPIRES` and a zero margin
+    /// both mean "never near expiry" — so a test not exercising #1603 sees the
+    /// pre-guard behaviour unchanged.
     fn budgets(working_deposit: U256) -> ResumeBudgets {
         ResumeBudgets {
             topups: 0,
@@ -786,6 +885,8 @@ mod tests {
             max_settle_waits: 28,
             awaiting_topup_settle: false,
             working_deposit,
+            expires_at: NEVER_EXPIRES,
+            min_ttl: Duration::ZERO,
         }
     }
 
@@ -853,6 +954,7 @@ mod tests {
                 committed,
                 MB_BYTES,
                 1_000,
+                NOW,
                 budgets(U256::from(1000u64))
             ),
             ResumeAction::Reseed
@@ -889,6 +991,7 @@ mod tests {
                 committed,
                 MB_BYTES,
                 1_000,
+                NOW,
                 budgets(U256::from(1000u64))
             ),
             ResumeAction::Reseed
@@ -914,7 +1017,7 @@ mod tests {
         let mut spent = budgets(U256::from(1000u64));
         spent.attempts = MAX_RESUME_ATTEMPTS;
         assert_eq!(
-            decide(&err, &ctx, committed, MB_BYTES, 1_000, spent),
+            decide(&err, &ctx, committed, MB_BYTES, 1_000, NOW, spent),
             ResumeAction::Terminal
         );
     }
@@ -938,6 +1041,7 @@ mod tests {
                 committed,
                 MB_BYTES,
                 1_000,
+                NOW,
                 budgets(U256::from(1000u64))
             ),
             ResumeAction::RefuseFunding
@@ -961,7 +1065,7 @@ mod tests {
             StreamError::NotFound,
         ));
         assert_eq!(
-            decide(&err, &ctx, committed, MB_BYTES, 1_000, waiting),
+            decide(&err, &ctx, committed, MB_BYTES, 1_000, NOW, waiting),
             ResumeAction::SettleWait
         );
     }
@@ -1051,6 +1155,7 @@ mod tests {
                 committed,
                 MB_BYTES,
                 1_000,
+                NOW,
                 budgets(working)
             ),
             ResumeAction::TopUp(working)
@@ -1074,6 +1179,7 @@ mod tests {
                 committed,
                 MB_BYTES,
                 1_000,
+                NOW,
                 budgets(U256::ZERO)
             ),
             ResumeAction::Terminal
@@ -1099,6 +1205,7 @@ mod tests {
                 committed,
                 MB_BYTES,
                 1_000,
+                NOW,
                 spent
             ),
             ResumeAction::Terminal
@@ -1122,7 +1229,7 @@ mod tests {
             byte_offset: 200,
         });
         assert_eq!(
-            decide(&err, &ctx, committed, MB_BYTES, 1_000, waiting),
+            decide(&err, &ctx, committed, MB_BYTES, 1_000, NOW, waiting),
             ResumeAction::SettleWait
         );
     }
@@ -1146,9 +1253,154 @@ mod tests {
             byte_offset: 200,
         });
         assert_eq!(
-            decide(&err, &ctx, committed, MB_BYTES, 1_000, spent),
+            decide(&err, &ctx, committed, MB_BYTES, 1_000, NOW, spent),
             ResumeAction::Terminal
         );
+    }
+
+    /// Budgets whose near-expiry guard is ARMED: a channel expiring `secs_left`
+    /// seconds from [`NOW`], and a one-day margin. Genuine exhaustion inside the
+    /// margin must refuse funding rather than escrow into a doomed channel.
+    fn budgets_expiring_in(working_deposit: U256, secs_left: u64) -> ResumeBudgets {
+        ResumeBudgets {
+            expires_at: NOW + secs_left,
+            min_ttl: Duration::from_secs(86_400),
+            ..budgets(working_deposit)
+        }
+    }
+
+    /// #1603: a genuine ceiling hit on a channel inside the near-expiry margin is
+    /// NOT funded — `topUp` cannot extend `expires_at`, so a fresh working-deposit
+    /// escrowed here could expire before the resumed leg spends it. The loop ends
+    /// the pull cleanly instead, and the caller opens a fresh channel next miss.
+    #[test]
+    fn a_near_expiry_channel_is_not_topped_up() {
+        // Exhausted by our own accounting (deposit == committed), so absent the
+        // expiry guard this is exactly `a_corroborated_ceiling_hit_funds_the_channel`
+        // — the ONLY thing steering it away from `TopUp` is the near-expiry margin.
+        let ctx = ctx_with_deposit(U256::from(10u64));
+        let committed = Cumulative {
+            nonce: U256::from(1u64),
+            bytes: U256::from(4096u64),
+            amount: U256::from(10u64),
+        };
+        // One hour left, well inside the one-day margin.
+        let budgets = budgets_expiring_in(U256::from(1000u64), 3_600);
+        assert_eq!(
+            decide(
+                &insufficient_deposit(),
+                &ctx,
+                committed,
+                MB_BYTES,
+                1_000,
+                NOW,
+                budgets
+            ),
+            ResumeAction::NearExpiry
+        );
+    }
+
+    /// #1603: the guard fires ONLY inside the margin. A channel with ample time to
+    /// its expiry is funded exactly as before — the same corroborated exhaustion,
+    /// the same working target — so the guard cannot suppress healthy top-ups.
+    #[test]
+    fn a_healthy_channel_still_funds_even_with_the_guard_armed() {
+        let ctx = ctx_with_deposit(U256::from(10u64));
+        let committed = Cumulative {
+            nonce: U256::from(1u64),
+            bytes: U256::from(4096u64),
+            amount: U256::from(10u64),
+        };
+        let working = U256::from(1000u64);
+        // Ten days left, comfortably past the one-day margin.
+        let budgets = budgets_expiring_in(working, 10 * 86_400);
+        assert_eq!(
+            decide(
+                &insufficient_deposit(),
+                &ctx,
+                committed,
+                MB_BYTES,
+                1_000,
+                NOW,
+                budgets
+            ),
+            ResumeAction::TopUp(working)
+        );
+    }
+
+    /// #1603: an already-past expiry (clock skew, or a channel that expired mid-pull)
+    /// reads as zero time remaining — firmly inside the margin — and is refused, not
+    /// funded. `saturating_sub` is what keeps `expires_at < now` from wrapping to a
+    /// huge remaining time that would wave the top-up through.
+    #[test]
+    fn an_already_past_expiry_is_refused() {
+        let ctx = ctx_with_deposit(U256::from(10u64));
+        let committed = Cumulative {
+            nonce: U256::from(1u64),
+            bytes: U256::from(4096u64),
+            amount: U256::from(10u64),
+        };
+        let budgets = ResumeBudgets {
+            expires_at: NOW - 1,
+            min_ttl: Duration::from_secs(86_400),
+            ..budgets(U256::from(1000u64))
+        };
+        assert_eq!(
+            decide(
+                &insufficient_deposit(),
+                &ctx,
+                committed,
+                MB_BYTES,
+                1_000,
+                NOW,
+                budgets
+            ),
+            ResumeAction::NearExpiry
+        );
+    }
+
+    /// #1603: a zero margin disables the guard — a near-expiry channel funds exactly
+    /// as it did pre-guard, the operator's explicit opt-out.
+    #[test]
+    fn a_zero_margin_disables_the_near_expiry_guard() {
+        let ctx = ctx_with_deposit(U256::from(10u64));
+        let committed = Cumulative {
+            nonce: U256::from(1u64),
+            bytes: U256::from(4096u64),
+            amount: U256::from(10u64),
+        };
+        let working = U256::from(1000u64);
+        // One second to expiry, but the margin is zero, so the guard never arms.
+        let budgets = ResumeBudgets {
+            expires_at: NOW + 1,
+            min_ttl: Duration::ZERO,
+            ..budgets(working)
+        };
+        assert_eq!(
+            decide(
+                &insufficient_deposit(),
+                &ctx,
+                committed,
+                MB_BYTES,
+                1_000,
+                NOW,
+                budgets
+            ),
+            ResumeAction::TopUp(working)
+        );
+    }
+
+    /// #1603: a `NEVER_EXPIRES` (0) channel has no deadline to be close to, so the
+    /// guard never fires however small the wall-clock reading — funding proceeds.
+    #[test]
+    fn a_never_expires_channel_is_never_near_expiry() {
+        assert!(!near_expiry(
+            NEVER_EXPIRES,
+            NOW,
+            Duration::from_secs(86_400)
+        ));
+        // ...and a real deadline one second out IS near expiry under the same margin.
+        assert!(near_expiry(NOW + 1, NOW, Duration::from_secs(86_400)));
     }
 
     /// A rejection that is not about the deposit is nobody's funding problem.
@@ -1170,6 +1422,7 @@ mod tests {
                 committed,
                 MB_BYTES,
                 1_000,
+                NOW,
                 budgets(U256::from(1000u64))
             ),
             ResumeAction::Terminal

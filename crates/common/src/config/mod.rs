@@ -108,6 +108,15 @@ pub const DEFAULT_BUYER_INITIAL_DEPOSIT_MICRO_USDC: u64 = 500_000;
 ///
 /// `pub` — see [`DEFAULT_BUYER_INITIAL_DEPOSIT_MICRO_USDC`].
 pub const DEFAULT_BUYER_WORKING_DEPOSIT_MICRO_USDC: u64 = 10_000_000;
+/// Default near-expiry margin (seconds) for the reactive mid-pull top-up guard
+/// (#1603): roughly one day. A channel with less than this left to its on-chain
+/// `expires_at` is not reactively topped up, because `topUp` cannot extend expiry,
+/// so a fresh working-deposit escrowed into it could expire before the resumed leg
+/// spends it. One day comfortably clears a normal pull while leaving the operator a
+/// wide margin to reclaim; `0` disables the guard entirely.
+///
+/// `pub` — see [`DEFAULT_BUYER_INITIAL_DEPOSIT_MICRO_USDC`].
+pub const DEFAULT_BUYER_REACTIVE_TOPUP_MIN_TTL_SECS: u64 = 86_400;
 /// Default interval between outgoing `NodeAnnounce` messages (ADR 001).
 const DEFAULT_ANNOUNCE_INTERVAL_SEC: u64 = 60;
 /// Default peer-table entry TTL after which a stale entry is evicted.
@@ -1487,6 +1496,14 @@ fn resolve_blockchain_into(
                 .to_string()
         },
     );
+    // Near-expiry guard for the reactive mid-pull top-up (#1603). `0` is the legal
+    // "disable the guard" sentinel (always top up, whatever the remaining time), so
+    // there is no `> 0` check — unlike the interval fields above, a 0 here builds no
+    // timer and cannot panic.
+    let buyer_reactive_topup_min_ttl_secs = file
+        .and_then(|b| b.buyer_reactive_topup_min_ttl_secs)
+        .unwrap_or(DEFAULT_BUYER_REACTIVE_TOPUP_MIN_TTL_SECS);
+
     // Default-on: the one-time max approval is what lets the buyer path open
     // channels without a manual approve step (ADR 003 § Deposit Economics).
     let buyer_max_approve = file.and_then(|b| b.buyer_max_approve).unwrap_or(true);
@@ -1554,6 +1571,7 @@ fn resolve_blockchain_into(
         redeem_interval_secs,
         buyer_initial_deposit_micro_usdc,
         buyer_working_deposit_micro_usdc,
+        buyer_reactive_topup_min_ttl_secs,
         buyer_max_approve,
         settlement_auto_threshold_micro_usdc,
         settlement_auto_by_voucher_nonce_span,
