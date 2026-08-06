@@ -2232,6 +2232,26 @@ impl CacheEngine {
         Ok(RangePullOutcome::Served)
     }
 
+    /// Import an already-encoded interleaved bao range for `hash`, verified
+    /// against the root on import (iroh-blobs `import_bao_bytes`). Thin
+    /// wrapper over the same store call `pull_through_range` makes, exposed so
+    /// `NodeRangedStore::admit` need not reach into the private store handle.
+    pub async fn admit_bao(
+        &self,
+        hash: Hash,
+        chunk_ranges: bao_tree::ChunkRanges,
+        bao_bytes: bytes::Bytes,
+    ) -> CacheResult<()> {
+        self.inner
+            .store
+            .blobs()
+            .import_bao_bytes(hash, chunk_ranges, bao_bytes)
+            .await
+            .map_err(|e| {
+                CacheError::Store(anyhow::Error::from(e).context("admit_bao: import_bao_bytes"))
+            })
+    }
+
     /// Best-effort total byte size of `hash` from the configured origins, for
     /// scoping a range pull ([`Self::pull_through_range`] needs the exact blob
     /// size to align + verify a sub-range against the root `H`, and the
