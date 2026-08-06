@@ -110,7 +110,18 @@ jobs:
       - name: Determine semver baseline
         id: baseline
         run: |
-          PREV=$(git tag --list 'v[0-9]*' --sort=-v:refname | head -n1)
+          # Highest v* tag that does NOT point at HEAD. Skipping tags on HEAD
+          # keeps reruns (dispatched on a commit a release tag already points
+          # at) baselining against the previous release instead of comparing
+          # the revision against itself, which would be a silent no-op.
+          HEAD_SHA=$(git rev-parse HEAD)
+          PREV=""
+          for t in $(git tag --list 'v[0-9]*' --sort=-v:refname); do
+            if [ "$(git rev-list -n1 "$t")" != "$HEAD_SHA" ]; then
+              PREV="$t"
+              break
+            fi
+          done
           if [ -n "$PREV" ]; then
             echo "rev=$PREV" >> "$GITHUB_OUTPUT"
             echo "has_baseline=true" >> "$GITHUB_OUTPUT"
