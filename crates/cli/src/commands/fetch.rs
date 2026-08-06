@@ -1696,8 +1696,14 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
         hash,
         &args.output,
         Some(&on_progress),
+        || bar.finish_and_clear(),
     )
     .await;
+    // Safety net for the header-probe-failure early-return path inside
+    // `drive_fetch` (before `drive()` ever runs, so `finish_progress` above is
+    // never invoked on that path). `finish_and_clear` is idempotent, so this is
+    // a harmless no-op on the success/drive-error paths where the hook already
+    // cleared the bar before `persist_watermark` ran.
     bar.finish_and_clear();
     let total_bytes = result?;
 
@@ -1733,10 +1739,12 @@ pub(crate) struct DriveFetchDeps<'a, P> {
 /// `total_bytes` on success.
 ///
 /// Behavior-preserving extraction of the block `fetch()` ran inline. The
-/// `indicatif` bar stays in the caller (which clears it around this call);
-/// `drive_fetch` reports only through `progress`. The cache-miss annotation is
-/// applied on both the header-open and the drive failure, so both callers get the
-/// same explained error.
+/// `indicatif` bar stays owned by the caller; `drive_fetch` reports progress
+/// only through `progress` and clears the bar via the `finish_progress` hook
+/// (called right after `drive()` returns, before `persist_watermark`, matching
+/// the pre-extraction ordering — `bundle pull` passes a no-op). The cache-miss
+/// annotation is applied on both the header-open and the drive failure, so both
+/// callers get the same explained error.
 ///
 /// `ctx` moves in — it is wrapped in `Arc<Mutex>` so the source and driver can
 /// share it (the source clones it to open each gap's pull; the driver credits a
@@ -1752,6 +1760,7 @@ pub(crate) async fn drive_fetch<P>(
     hash: [u8; 32],
     output: &Path,
     progress: Option<&ProgressCallback>,
+    finish_progress: impl FnOnce(),
 ) -> anyhow::Result<u64>
 where
     P: alloy::providers::Provider + Clone,
@@ -1864,6 +1873,13 @@ where
         progress,
     )
     .await;
+
+    // Clear the progress bar (or run the caller's no-op, for `bundle pull`)
+    // now — matching the pre-extraction `fetch()`, which cleared its `indicatif`
+    // bar immediately after `drive(...).await` returned and BEFORE
+    // `persist_watermark`. `persist_watermark` can `eprintln!` a rare
+    // non-advance warning; that warning must never race the still-active bar.
+    finish_progress();
 
     // Persist the voucher watermark from the shared ledger the same way the
     // pre-#1608 loop's `watermark_after` chose it: on an explicit voucher
