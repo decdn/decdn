@@ -103,12 +103,30 @@ jobs:
           cargo clippy --workspace --all-targets -- -D warnings
           cargo nextest run --workspace --no-tests=pass
 
-      # Semver-checks on patch/minor. Skipped for major since breaking changes are expected.
+      # These crates are never published (publish = false), so semver-checks
+      # has no crates.io baseline. Diff against the previous release tag
+      # instead. The first release has no prior tag, so semver-checks is
+      # skipped then (nothing to compare against).
+      - name: Determine semver baseline
+        id: baseline
+        run: |
+          PREV=$(git tag --list 'v[0-9]*' --sort=-v:refname | head -n1)
+          if [ -n "$PREV" ]; then
+            echo "rev=$PREV" >> "$GITHUB_OUTPUT"
+            echo "has_baseline=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_baseline=false" >> "$GITHUB_OUTPUT"
+            echo "No prior release tag; skipping semver-checks."
+          fi
+
+      # Semver-checks on patch/minor against the previous tag. Skipped for
+      # major (breaking changes expected) and on the first release (no baseline).
       - name: cargo semver-checks
-        if: inputs.level != 'major'
+        if: ${{ inputs.level != 'major' && steps.baseline.outputs.has_baseline == 'true' }}
         uses: obi1kenobi/cargo-semver-checks-action@v2
         with:
           feature-group: default-features
+          baseline-rev: ${{ steps.baseline.outputs.rev }}
 
       # inputs.level is a constrained choice enum (patch/minor/major), not free-text
       - name: Validate release (dry run)
