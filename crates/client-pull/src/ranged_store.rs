@@ -41,6 +41,15 @@ use decdn_bao_range::{AlignedRange, IROH_BLOCK_SIZE, RangedFuture, RangedStore, 
 /// `present` and `data_path` are held behind `Arc<Mutex<..>>` so `admit` and
 /// `finalize` can move clones of them into `tokio::task::spawn_blocking`
 /// closures without borrowing `self` across an await point.
+///
+/// Concurrency: a single `ClientRangedStore` expects at most one in-flight
+/// write operation at a time — do not call [`RangedStore::admit`] /
+/// [`RangedStore::finalize`] concurrently on the same store (nor `admit`
+/// concurrently with itself). Concurrent writers can race the present-range
+/// record's write-and-rename (the record may under-claim, which is the safe
+/// direction — the missing range is simply re-fetched on the next resume)
+/// and, worse, an `admit` racing a `finalize` promote is undefined. Reads are
+/// safe to interleave. The P3 driver drives one write op per blob at a time.
 pub struct ClientRangedStore {
     /// BLAKE3 content root this store verifies against.
     root: [u8; 32],
@@ -123,8 +132,16 @@ fn sidecar_paths(dir: &Path, stem: &str) -> (PathBuf, PathBuf, PathBuf) {
 }
 
 /// Persist `present` to `path` via tempfile-plus-rename (atomic on the same
-/// filesystem), so a crash mid-write cannot tear the record — the next
-/// `open` reads either the old or the new record, never a partial one.
+/// filesystem). This makes the record update atomic: a crash never leaves a
+/// half-written record, so the next `open` reads either the old or the new
+/// record, never a partial one.
+///
+/// It does NOT guarantee durability of the rename itself — there is no
+/// parent-directory `fsync`, so on a non-ordered filesystem a crash can lose
+/// the most recent record update. That is the safe direction: a lost update
+/// only under-claims presence, and the corresponding data (already `fsync`'d
+/// before the record was written) is simply re-listed as missing and
+/// re-fetched on resume. Never an over-claim.
 fn write_ranges_record(path: &Path, present: &ChunkRanges) -> io::Result<()> {
     let boundaries: Vec<u64> = present.boundaries().iter().map(|c| c.0).collect();
     let json = serde_json::to_vec(&boundaries)
