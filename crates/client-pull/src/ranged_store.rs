@@ -27,12 +27,16 @@ use std::io::{self, Cursor};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use bao_tree::io::BaoContentItem;
 use bao_tree::io::DecodeError;
+use bao_tree::io::fsm::{ResponseDecoder, ResponseDecoderNext};
 use bao_tree::io::outboard::PreOrderOutboard;
-use bao_tree::io::sync::{ReadAt, decode_ranges, valid_ranges};
+use bao_tree::io::sync::{OutboardMut, ReadAt, WriteAt, decode_ranges, valid_ranges};
 use bao_tree::{BaoTree, ChunkNum, ChunkRanges};
 use bytes::Bytes;
 use decdn_bao_range::{AlignedRange, IROH_BLOCK_SIZE, RangedFuture, RangedStore, RangedStoreError};
+
+use crate::sink::{StashedFault, classify_decode_error};
 
 /// Client-side [`RangedStore`]: a `.partial` data file, a `.partial.obao4`
 /// pre-order outboard, and a persisted `.partial.ranges` present-range
@@ -359,6 +363,169 @@ impl ClientRangedStore {
     fn present_snapshot(&self) -> Result<ChunkRanges, RangedStoreError> {
         let guard = self.present.lock().map_err(|_| lock_poisoned("present"))?;
         Ok(guard.clone())
+    }
+
+    /// Durably checkpoint present-ranges no more than this many received
+    /// content bytes apart, during [`Self::ingest_stream`]. Fsync'ing the
+    /// data/outboard files and rewriting the `.ranges` record on every single
+    /// 16 KiB chunk group would serialize the whole ingest on disk latency
+    /// (thousands of fsyncs for a large gap); checkpointing only every 4 MiB
+    /// (256 groups) amortizes that cost while still bounding a mid-gap
+    /// failure's un-checkpointed (and therefore re-fetched, re-paid) tail to
+    /// under one interval.
+    const INGEST_CHECKPOINT_BYTES: u64 = 4 * 1024 * 1024;
+
+    /// Stream the raw bao encoding of `range` (from `reader`) into the store:
+    /// verify each chunk group against the root as
+    /// [`bao_tree::io::fsm::ResponseDecoder`] decodes it, positioned-write
+    /// each verified leaf into the `.partial` data file, accumulate each
+    /// parent proof pair into the `.obao4` outboard, and durably checkpoint
+    /// `present` (fsync data+outboard, then persist the `.ranges` record) at
+    /// roughly `INGEST_CHECKPOINT_BYTES` intervals plus once more at
+    /// completion.
+    ///
+    /// This is the streaming sibling of [`RangedStore::admit`]: `admit` takes
+    /// a whole range's bao bytes already assembled in memory, while
+    /// `ingest_stream` consumes them incrementally at O(chunk-group) memory
+    /// (one leaf's ~16 KiB plus one parent's 64 bytes live at a time) — the
+    /// gap driver's fetch of a range too large to buffer whole.
+    ///
+    /// On success, returns `reader` so the caller can hand it to
+    /// `BlobSource::finish` to drain the underlying pull to its stream end and
+    /// recover the acked voucher watermark.
+    ///
+    /// # Durability contract
+    ///
+    /// The same fsync-before-record invariant `write_ranges_record`'s
+    /// callers already establish: a checkpoint never lets `present` (and
+    /// therefore the persisted `.ranges` record) claim bytes that are not yet
+    /// durable on disk. A crash or peer fault between two checkpoints loses
+    /// only the un-checkpointed tail — strictly less than one
+    /// `INGEST_CHECKPOINT_BYTES` interval of received content — which
+    /// the next `missing_ranges`/resume call simply re-fetches. It never loses
+    /// (or re-claims) a byte that a prior checkpoint already made durable, and
+    /// it never claims a byte that was not actually fsync'd.
+    ///
+    /// # Errors
+    ///
+    /// - The typed [`StashedFault`] the reader parked, if any (a stalled or
+    ///   refusing peer) — takes precedence over the decoder's own complaint,
+    ///   mirroring `sink::decode_to_sink`.
+    /// - Otherwise the bao decode failure, classified the same way
+    ///   `sink::decode_to_sink` does: [`crate::HashMismatch`] for a
+    ///   verification failure, a truncation error for a short stream.
+    /// - Any I/O failure opening or writing the `.partial`/`.obao4` files, or
+    ///   persisting the `.ranges` record.
+    pub async fn ingest_stream<R>(&self, range: &AlignedRange, reader: R) -> anyhow::Result<R>
+    where
+        R: iroh_io::AsyncStreamReader + StashedFault + Send,
+    {
+        let path = {
+            let guard = self
+                .data_path
+                .lock()
+                .map_err(|_| anyhow::anyhow!("{}", lock_poisoned("data_path")))?;
+            guard.clone()
+        };
+        let mut data_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)?;
+        let obao_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&self.obao_path)?;
+        let mut outboard = PreOrderOutboard {
+            root: bao_tree::blake3::Hash::from(self.root),
+            tree: self.tree,
+            data: obao_file,
+        };
+
+        let root = bao_tree::blake3::Hash::from(self.root);
+        let ranges = range.chunk_ranges().clone();
+        let mut decoder = ResponseDecoder::new(root, ranges, self.tree, reader);
+
+        // The contiguous prefix of `range`, in bytes, whose leaf writes and
+        // parent saves have landed in this ingest call so far (not yet
+        // necessarily checkpointed — see `checkpointed_end` below).
+        let mut received_end = range.fetch_start();
+        // The prefix already durably checkpointed (fsync'd + present + record
+        // persisted). Only the span `[checkpointed_end, received_end)` is at
+        // risk on a crash/fault.
+        let mut checkpointed_end = range.fetch_start();
+
+        loop {
+            match decoder.next().await {
+                ResponseDecoderNext::More((rest, Ok(BaoContentItem::Leaf(leaf)))) => {
+                    data_file.write_all_at(leaf.offset, &leaf.data)?;
+                    received_end =
+                        received_end
+                            .max(leaf.offset.saturating_add(
+                                u64::try_from(leaf.data.len()).unwrap_or(u64::MAX),
+                            ));
+                    if received_end.saturating_sub(checkpointed_end)
+                        >= Self::INGEST_CHECKPOINT_BYTES
+                    {
+                        self.checkpoint(&mut data_file, &mut outboard, range, received_end)?;
+                        checkpointed_end = received_end;
+                    }
+                    decoder = rest;
+                }
+                ResponseDecoderNext::More((rest, Ok(BaoContentItem::Parent(parent)))) => {
+                    outboard.save(parent.node, &parent.pair)?;
+                    decoder = rest;
+                }
+                ResponseDecoderNext::More((rest, Err(decode_err))) => {
+                    let mut r = rest.finish();
+                    if let Some(fault) = r.take_fault() {
+                        return Err(fault);
+                    }
+                    return Err(classify_decode_error(decode_err));
+                }
+                ResponseDecoderNext::Done(mut r) => {
+                    if received_end > checkpointed_end {
+                        self.checkpoint(&mut data_file, &mut outboard, range, received_end)?;
+                    }
+                    if let Some(fault) = r.take_fault() {
+                        return Err(fault);
+                    }
+                    return Ok(r);
+                }
+            }
+        }
+    }
+
+    /// Durably checkpoint the prefix `[range.fetch_start(), received_end)` of
+    /// an in-progress [`Self::ingest_stream`]: fsync the data and outboard
+    /// files, THEN union the corresponding chunk ranges into `present` and
+    /// persist the `.ranges` record. The fsync-before-record ordering is
+    /// load-bearing — see the durability contract on [`Self::ingest_stream`].
+    fn checkpoint(
+        &self,
+        data_file: &mut std::fs::File,
+        outboard: &mut PreOrderOutboard<std::fs::File>,
+        range: &AlignedRange,
+        received_end: u64,
+    ) -> anyhow::Result<()> {
+        data_file.sync_all()?;
+        outboard.data.sync_all()?;
+
+        let received = decdn_bao_range::align_range(
+            range.fetch_start(),
+            received_end.saturating_sub(range.fetch_start()),
+            self.total_bytes,
+        )?;
+
+        let updated = {
+            let mut guard = self
+                .present
+                .lock()
+                .map_err(|_| anyhow::anyhow!("{}", lock_poisoned("present")))?;
+            *guard |= received.chunk_ranges().clone();
+            guard.clone()
+        };
+        write_ranges_record(&self.ranges_path, &updated)?;
+        Ok(())
     }
 }
 
@@ -1127,5 +1294,180 @@ mod tests {
         let err = ClientRangedStore::open(dir.path(), "blob", root, total)
             .expect_err("truncated final file must be rejected");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    // --- ingest_stream ---
+
+    /// Total bytes covered by a [`ChunkRanges`], reconstructed from its
+    /// boundary pairs the same way [`write_ranges_record`] encodes them
+    /// (`ChunkNum` counts 1 KiB chunks).
+    fn ranges_byte_len(ranges: &ChunkRanges) -> u64 {
+        let boundaries = ranges.boundaries();
+        let mut sum = 0u64;
+        let mut it = boundaries.iter();
+        while let (Some(a), Some(b)) = (it.next(), it.next()) {
+            sum += (b.0 - a.0) * 1024;
+        }
+        sum
+    }
+
+    #[tokio::test]
+    async fn ingest_stream_writes_positioned_and_reflects_presence() -> anyhow::Result<()> {
+        let total = 3 * GROUP + 123;
+        let (root, plaintext, outboard) = synth_blob(usize::try_from(total)?);
+        let store = fresh_store(root, total);
+
+        // A prefix gap: the first two groups only.
+        let aligned = decdn_bao_range::align_range(0, 2 * GROUP, total)?;
+        let bao_bytes = bao_for(root, &plaintext, outboard.clone(), &aligned);
+        let body = bao_bytes.slice(8..);
+        let reader = store.ingest_stream(&aligned, body).await?;
+        drop(reader);
+
+        let present = store.present_ranges().await?;
+        assert_eq!(&present, aligned.chunk_ranges());
+
+        let got = store.read(0, 2 * GROUP).await?;
+        assert_eq!(
+            got.as_ref(),
+            plaintext.get(..usize::try_from(2 * GROUP)?).expect("slice")
+        );
+
+        // The `.partial` file holds the bytes at the right (positioned)
+        // offset, not appended.
+        let on_disk = std::fs::read(store.data_path.lock().expect("lock").clone())?;
+        assert_eq!(
+            on_disk.get(..usize::try_from(2 * GROUP)?),
+            plaintext.get(..usize::try_from(2 * GROUP)?)
+        );
+
+        // Ingest the remaining tail, then finalize promotes.
+        let rest_aligned = decdn_bao_range::align_range(2 * GROUP, 0, total)?;
+        let rest_bao = bao_for(root, &plaintext, outboard, &rest_aligned);
+        let rest_body = rest_bao.slice(8..);
+        let reader = store.ingest_stream(&rest_aligned, rest_body).await?;
+        drop(reader);
+        store.finalize().await.expect("finalize promotes");
+        let final_bytes = store.read(0, total).await?;
+        assert_eq!(final_bytes.as_ref(), plaintext.as_slice());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ingest_stream_mid_gap_fault_checkpoints_received_prefix() -> anyhow::Result<()> {
+        // Big enough to cross at least one 4 MiB checkpoint interval before
+        // the scripted fault lands.
+        let total: u64 = 8 * 1024 * 1024;
+        let plaintext = {
+            let mut v = vec![0u8; usize::try_from(total)?];
+            let mut x: u32 = 0x1234_5678;
+            for b in &mut v {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                *b = x.to_le_bytes().first().copied().unwrap_or(0);
+            }
+            v
+        };
+        let source = crate::source::ScriptedSource::new(plaintext.clone())?
+            .with_fault_after(5 * 1024 * 1024, || {
+                anyhow::anyhow!("scripted mid-gap stall")
+            });
+        let root = source.root();
+        let store_dir = tmp_dir();
+        let store = ClientRangedStore::create(store_dir.path(), "blob", root, total)?;
+
+        let aligned = decdn_bao_range::align_range(0, 0, total)?;
+        let (_header, reader) = {
+            use crate::source::BlobSource;
+            source.open(root, aligned.clone()).await?
+        };
+
+        let err = store
+            .ingest_stream(&aligned, reader)
+            .await
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("mid-gap fault must surface as an error"))?;
+        assert!(
+            err.to_string().contains("scripted mid-gap stall")
+                || format!("{err:?}").contains("scripted mid-gap stall"),
+            "the parked typed fault must survive: {err}"
+        );
+
+        // Re-open the store fresh (simulating a resumed process) and inspect
+        // the persisted record: it must reflect the checkpointed prefix —
+        // more than one checkpoint interval's worth (proving a checkpoint
+        // fired), but strictly less than the whole gap (proving the
+        // un-checkpointed tail was NOT claimed).
+        let reopened = ClientRangedStore::open(store_dir.path(), "blob", root, total)?;
+        let present = reopened.present_ranges().await?;
+        let present_bytes = ranges_byte_len(&present);
+
+        assert!(
+            present_bytes > 0,
+            "a mid-gap fault must not lose the whole gap: present is empty"
+        );
+        assert!(
+            present_bytes >= ClientRangedStore::INGEST_CHECKPOINT_BYTES,
+            "at least one checkpoint interval must have been durably recorded, got {present_bytes} bytes"
+        );
+        assert!(
+            present_bytes < total,
+            "the un-checkpointed tail past the fault must not be claimed as present, \
+             got {present_bytes} of {total} bytes"
+        );
+
+        // And the checkpointed prefix is genuinely readable/verified data,
+        // not garbage — a byte-exact prefix of the plaintext.
+        let checkpointed = reopened
+            .read(0, present_bytes)
+            .await
+            .expect("checkpointed prefix must be readable");
+        assert_eq!(
+            checkpointed.as_ref(),
+            plaintext
+                .get(..usize::try_from(present_bytes)?)
+                .expect("slice")
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ingest_stream_corrupt_bao_is_error_not_written() -> anyhow::Result<()> {
+        let total = 2 * GROUP;
+        let (root, plaintext, outboard) = synth_blob(usize::try_from(total)?);
+        let store = fresh_store(root, total);
+
+        let aligned = decdn_bao_range::align_range(0, 0, total)?;
+        let mut bao_bytes = bao_for(root, &plaintext, outboard, &aligned).to_vec();
+        // Flip a byte well past the 8-byte header, inside the interleaved
+        // proof+data body.
+        let flip_at = bao_bytes.len() - 1;
+        if let Some(b) = bao_bytes.get_mut(flip_at) {
+            *b ^= 0xFF;
+        }
+        let body = Bytes::from(bao_bytes).slice(8..);
+
+        let err = store
+            .ingest_stream(&aligned, body)
+            .await
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("corrupt payload must fail"))?;
+        assert!(
+            err.downcast_ref::<crate::HashMismatch>().is_some(),
+            "corruption must surface as the typed HashMismatch, got: {err}"
+        );
+
+        // Well below one checkpoint interval, so no checkpoint ever fired:
+        // presence must remain exactly what it started as (empty).
+        let present = store.present_ranges().await?;
+        assert!(
+            present.is_empty(),
+            "presence must be unchanged past the last (nonexistent) checkpoint"
+        );
+
+        Ok(())
     }
 }

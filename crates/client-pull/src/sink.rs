@@ -300,7 +300,11 @@ where
 /// matching the taxonomy the buffered decoder and the node-side tee both use
 /// (ADR 038). Only a hash mismatch is provably corruption; a truncated stream is
 /// transport-class and must not tar the peer as a liar.
-fn classify_decode_error(err: DecodeError) -> anyhow::Error {
+///
+/// `pub(crate)`: [`crate::ranged_store::ClientRangedStore::ingest_stream`] reuses
+/// this exact classification for the streaming ingest path rather than
+/// duplicating the match.
+pub(crate) fn classify_decode_error(err: DecodeError) -> anyhow::Error {
     match err {
         DecodeError::ParentHashMismatch(_) | DecodeError::LeafHashMismatch(_) => {
             anyhow::Error::new(HashMismatch)
