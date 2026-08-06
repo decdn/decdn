@@ -317,6 +317,30 @@ async fn case_incomplete_finalize<F: ConformanceFactory>(fx: &Fixture, factory: 
     );
 }
 
+/// Out-of-bounds requests are typed alignment errors, not backend faults —
+/// both backends must agree (a bad range is an argument error).
+async fn case_out_of_bounds_is_alignment<F: ConformanceFactory>(fx: &Fixture, factory: &F) {
+    let store = fx.fresh_store(factory).await;
+
+    let m_err = store
+        .missing_ranges(fx.total, 1)
+        .await
+        .expect_err("missing_ranges out of bounds must error");
+    assert!(
+        matches!(m_err, crate::RangedStoreError::Alignment(_)),
+        "missing_ranges OOB should be Alignment, got {m_err:?}"
+    );
+
+    let r_err = store
+        .read(fx.total, 1)
+        .await
+        .expect_err("read out of bounds must error");
+    assert!(
+        matches!(r_err, crate::RangedStoreError::Alignment(_)),
+        "read OOB should be Alignment, got {r_err:?}"
+    );
+}
+
 /// Runs every conformance case against `factory`. Test-only; asserts on
 /// failure.
 pub async fn run_all<F: ConformanceFactory>(factory: F) {
@@ -328,4 +352,5 @@ pub async fn run_all<F: ConformanceFactory>(factory: F) {
     case_idempotent(&fx, &factory).await;
     case_complete_and_finalize(&fx, &factory).await;
     case_incomplete_finalize(&fx, &factory).await;
+    case_out_of_bounds_is_alignment(&fx, &factory).await;
 }

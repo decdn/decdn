@@ -62,10 +62,16 @@ impl RangedStore for NodeRangedStore {
         byte_len: u64,
     ) -> RangedFuture<'_, bao_tree::ChunkRanges> {
         Box::pin(async move {
-            self.engine
-                .missing_ranges(self.hash, byte_offset, byte_len, self.total_bytes)
+            // Validate + align locally so an out-of-bounds request is a typed
+            // `Alignment` error, not an opaque backend fault (a bad range is an
+            // argument error, and the client backend classifies it the same way).
+            let aligned = decdn_bao_range::align_range(byte_offset, byte_len, self.total_bytes)?;
+            let present = self
+                .engine
+                .present_ranges(self.hash)
                 .await
-                .map_err(backend)
+                .map_err(backend)?;
+            Ok(aligned.chunk_ranges().clone() - present.chunk_ranges())
         })
     }
 
@@ -80,6 +86,10 @@ impl RangedStore for NodeRangedStore {
 
     fn read(&self, byte_offset: u64, byte_len: u64) -> RangedFuture<'_, Bytes> {
         Box::pin(async move {
+            // Reject an out-of-bounds span as a typed `Alignment` error before
+            // touching the store; the aligned widening is discarded — `read` is
+            // byte-exact and forwards the original offset/len.
+            decdn_bao_range::align_range(byte_offset, byte_len, self.total_bytes)?;
             self.engine
                 .export_range(self.hash, byte_offset, byte_len)
                 .await
