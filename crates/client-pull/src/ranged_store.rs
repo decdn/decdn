@@ -5,24 +5,31 @@
 //! stay iroh-blobs-free so the CLI's pull path links no blob store / AWS SDK
 //! (#578).
 //!
-//! This file builds construction plus the read-only query methods
-//! (`total_bytes`, `present_ranges`, `missing_ranges`, `read`,
-//! `is_complete`). `admit` and `finalize` are stubbed pending P2 Task 2,
-//! which will fill them in against the same `data_path` / `present` fields.
+//! Construction plus the query methods (`total_bytes`, `present_ranges`,
+//! `missing_ranges`, `read`, `is_complete`) came from P2 Task 1. `admit` and
+//! `finalize` (P2 Task 2) fill in the write path against the same
+//! `data_path` / `present` fields: `admit` verifies an interleaved bao range
+//! against the root with `bao_tree::io::sync::decode_ranges` (a positioned,
+//! sparse write plus outboard accumulation), and `finalize` runs one
+//! `valid_ranges` sweep over the whole blob to either promote the `.partial`
+//! file to its final path or surgically shrink `present` to the groups that
+//! still verify.
 //!
 //! The present-range record is the load-bearing shortcut that keeps
 //! `present_ranges`/`missing_ranges`/`is_complete` O(1): rather than
 //! re-deriving presence by re-hashing the `.partial` data against the
 //! outboard on every call, [`ClientRangedStore::open`] trusts the record a
-//! prior `admit`/`finalize` wrote (Task 2). The record itself is written with
-//! a tempfile-plus-rename so a crash mid-write cannot tear it.
+//! prior `admit`/`finalize` wrote. The record itself is written with a
+//! tempfile-plus-rename so a crash mid-write cannot tear it.
 
 use std::fs::File;
-use std::io;
+use std::io::{self, Cursor};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use bao_tree::io::sync::ReadAt;
+use bao_tree::io::DecodeError;
+use bao_tree::io::outboard::PreOrderOutboard;
+use bao_tree::io::sync::{ReadAt, decode_ranges, valid_ranges};
 use bao_tree::{BaoTree, ChunkNum, ChunkRanges};
 use bytes::Bytes;
 use decdn_bao_range::{AlignedRange, IROH_BLOCK_SIZE, RangedFuture, RangedStore, RangedStoreError};
@@ -31,10 +38,9 @@ use decdn_bao_range::{AlignedRange, IROH_BLOCK_SIZE, RangedFuture, RangedStore, 
 /// pre-order outboard, and a persisted `.partial.ranges` present-range
 /// record, all for one blob `(root, total_bytes)`.
 ///
-/// `present` and `data_path` are held behind `Arc<Mutex<..>>` so Task 2's
-/// `admit`/`finalize` bodies can move clones of them into
-/// `tokio::task::spawn_blocking` closures without borrowing `self` across an
-/// await point.
+/// `present` and `data_path` are held behind `Arc<Mutex<..>>` so `admit` and
+/// `finalize` can move clones of them into `tokio::task::spawn_blocking`
+/// closures without borrowing `self` across an await point.
 pub struct ClientRangedStore {
     /// BLAKE3 content root this store verifies against.
     root: [u8; 32],
@@ -42,7 +48,7 @@ pub struct ClientRangedStore {
     total_bytes: u64,
     /// Tree geometry (`total_bytes` at [`IROH_BLOCK_SIZE`] chunk groups).
     tree: BaoTree,
-    /// Current data file. `.partial` until `finalize` promotes it (Task 2).
+    /// Current data file. `.partial` until `finalize` promotes it.
     data_path: Arc<Mutex<PathBuf>>,
     /// Pre-order outboard sidecar (`{stem}.partial.obao4`).
     obao_path: PathBuf,
@@ -78,6 +84,35 @@ fn backend<E: std::error::Error + Send + Sync + 'static>(e: E) -> RangedStoreErr
 
 fn lock_poisoned(what: &str) -> RangedStoreError {
     RangedStoreError::Backend(format!("{what} lock poisoned").into())
+}
+
+/// Split a bao decode failure into "the peer/origin lied" and "the stream
+/// ended early", mirroring the taxonomy `sink.rs::classify_decode_error` uses
+/// for the streaming path (ADR 038). A `DecodeError` reaching `admit` is
+/// always a backend/transport/corruption fault, never an argument error: the
+/// caller passes an already-[`AlignedRange`], so there is no bounds question
+/// left to ask by the time bytes hit the decoder.
+fn classify_decode_fault(err: DecodeError) -> RangedStoreError {
+    match err {
+        DecodeError::ParentHashMismatch(_) | DecodeError::LeafHashMismatch(_) => {
+            RangedStoreError::Backend(format!("bao verification failed: {err}").into())
+        }
+        DecodeError::Io(io_err) => backend(io_err),
+        not_found @ (DecodeError::ParentNotFound(_) | DecodeError::LeafNotFound(_)) => {
+            RangedStoreError::Backend(format!("bao stream truncated mid-tree: {not_found}").into())
+        }
+    }
+}
+
+/// What the one [`valid_ranges`] sweep in `finalize` found.
+enum FinalizeOutcome {
+    /// Every chunk group verified: the `.partial` file was promoted to its
+    /// final path.
+    Promoted,
+    /// At least one chunk group failed to verify; carries the surviving
+    /// (still-valid) chunk ranges so the caller can shrink `present` to
+    /// exactly them.
+    Shrink(ChunkRanges),
 }
 
 fn sidecar_paths(dir: &Path, stem: &str) -> (PathBuf, PathBuf, PathBuf) {
@@ -148,7 +183,7 @@ fn read_ranges_record(path: &Path) -> io::Result<ChunkRanges> {
 impl ClientRangedStore {
     /// Create a brand-new `.partial` + sidecars for `(root, total_bytes)`
     /// under `dir`, keyed by `stem` (typically the hex content hash). The
-    /// data file starts empty (Task 2's positioned writes make it sparse),
+    /// data file starts empty (`admit`'s positioned writes make it sparse),
     /// the outboard file is zero-filled to exactly
     /// `BaoTree::outboard_size()` (the length [`decdn_bao_range::encode_verified_range`]
     /// and its callers require of a pre-order outboard for this blob size),
@@ -162,7 +197,7 @@ impl ClientRangedStore {
         let tree = BaoTree::new(total_bytes, IROH_BLOCK_SIZE);
         let (data_path, obao_path, ranges_path) = sidecar_paths(dir, stem);
 
-        // Empty data file; Task 2's positioned writes make it sparse.
+        // Empty data file; `admit`'s positioned writes make it sparse.
         File::create(&data_path)?;
 
         // Zero-filled outboard, sized exactly as a pre-order outboard for
@@ -216,33 +251,33 @@ impl ClientRangedStore {
         self.root
     }
 
-    /// The tree geometry for this blob, for Task 2's `admit`/`finalize`.
+    /// The tree geometry for this blob, used by `admit`/`finalize`.
     #[must_use]
     pub const fn tree(&self) -> BaoTree {
         self.tree
     }
 
-    /// The outboard sidecar path, for Task 2's `admit`/`finalize`.
+    /// The outboard sidecar path, used by `admit`/`finalize`.
     #[must_use]
     pub fn obao_path(&self) -> &Path {
         &self.obao_path
     }
 
-    /// The present-range record path, for Task 2's `admit`/`finalize`.
+    /// The present-range record path, used by `admit`/`finalize`.
     #[must_use]
     pub fn ranges_path(&self) -> &Path {
         &self.ranges_path
     }
 
-    /// Shared handle to the current data file path, for Task 2's
-    /// `spawn_blocking` closures.
+    /// Shared handle to the current data file path, for `admit`'s and
+    /// `finalize`'s `spawn_blocking` closures.
     #[must_use]
     pub fn data_path_handle(&self) -> Arc<Mutex<PathBuf>> {
         Arc::clone(&self.data_path)
     }
 
-    /// Shared handle to the in-memory present set, for Task 2's
-    /// `spawn_blocking` closures.
+    /// Shared handle to the in-memory present set, for `admit`'s and
+    /// `finalize`'s `spawn_blocking` closures.
     #[must_use]
     pub fn present_handle(&self) -> Arc<Mutex<ChunkRanges>> {
         Arc::clone(&self.present)
@@ -271,15 +306,93 @@ impl RangedStore for ClientRangedStore {
         })
     }
 
-    fn admit(&self, _range: AlignedRange, _bao_bytes: Bytes) -> RangedFuture<'_, ()> {
-        // TODO(P2 Task 2): verify `bao_bytes` against `self.root` using the
-        // outboard at `self.obao_path`, write data + proof into the
-        // `.partial` data/outboard files, extend `self.present`, and persist
-        // the updated record to `self.ranges_path`.
+    fn admit(&self, range: AlignedRange, bao_bytes: Bytes) -> RangedFuture<'_, ()> {
         Box::pin(async move {
-            Err(RangedStoreError::Backend(
-                "not yet implemented (P2 Task 2)".into(),
-            ))
+            // `bao_bytes` is the combined wire format `encode_verified_range`
+            // produces (and the shared conformance suite feeds every
+            // backend): an 8-byte little-endian size header followed by the
+            // interleaved bao body. `bao_tree::io::sync::decode_ranges` does
+            // not parse that header itself (it already knows the tree shape
+            // from the outboard) — mirrors the streaming path's
+            // `combined[8..]` split in `sink.rs`.
+            let body = bao_bytes
+                .get(8..)
+                .ok_or_else(|| {
+                    RangedStoreError::Backend(
+                        "admit: bao_bytes shorter than the 8-byte combined-format header".into(),
+                    )
+                })?
+                .to_vec();
+
+            let chunk_ranges = range.chunk_ranges().clone();
+            let root = self.root;
+            let tree = self.tree;
+            let data_path = Arc::clone(&self.data_path);
+            let obao_path = self.obao_path.clone();
+
+            tokio::task::spawn_blocking(move || -> Result<(), RangedStoreError> {
+                let path = data_path
+                    .lock()
+                    .map_err(|_| lock_poisoned("data_path"))?
+                    .clone();
+                let mut data_file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&path)
+                    .map_err(backend)?;
+                let mut obao_file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&obao_path)
+                    .map_err(backend)?;
+
+                // `&mut File` satisfies `WriteAt`/`ReadAt` via positioned-io's
+                // blanket `impl<R: ReadAt + ?Sized> ReadAt for &mut R` /
+                // `impl<W: WriteAt + ?Sized> WriteAt for &mut W`, so both the
+                // decode target and the outboard's backing store can borrow
+                // the files rather than consume them — `data_file` and
+                // `obao_file` are still ours to `sync_all` once
+                // `decode_ranges` returns.
+                let mut outboard = PreOrderOutboard {
+                    root: bao_tree::blake3::Hash::from(root),
+                    tree,
+                    data: &mut obao_file,
+                };
+
+                // Verifies every chunk group against `root` as it decodes (a
+                // tampered range/outboard/root -> `DecodeError`), writes each
+                // verified leaf at its true offset (sparse), and saves each
+                // parent proof pair into the outboard.
+                decode_ranges(
+                    Cursor::new(body.as_slice()),
+                    chunk_ranges.as_ref(),
+                    &mut data_file,
+                    &mut outboard,
+                )
+                .map_err(classify_decode_fault)?;
+
+                data_file.sync_all().map_err(backend)?;
+                obao_file.sync_all().map_err(backend)?;
+                Ok(())
+            })
+            .await
+            .map_err(backend)??;
+
+            // Union into the in-memory present set, then persist the record.
+            // Idempotent: re-admitting an already-present range re-verifies
+            // and re-writes the same bytes, and the union is a no-op.
+            let updated = {
+                let mut guard = self.present.lock().map_err(|_| lock_poisoned("present"))?;
+                *guard |= range.chunk_ranges().clone();
+                guard.clone()
+            };
+            let ranges_path = self.ranges_path.clone();
+            tokio::task::spawn_blocking(move || write_ranges_record(&ranges_path, &updated))
+                .await
+                .map_err(backend)?
+                .map_err(backend)?;
+
+            Ok(())
         })
     }
 
@@ -321,13 +434,115 @@ impl RangedStore for ClientRangedStore {
     }
 
     fn finalize(&self) -> RangedFuture<'_, ()> {
-        // TODO(P2 Task 2): once `is_complete()`, promote the `.partial` data
-        // file to its final (non-`.partial`) path under `self.data_path`'s
-        // lock and leave the sidecars for cleanup by the caller.
         Box::pin(async move {
-            Err(RangedStoreError::Backend(
-                "not yet implemented (P2 Task 2)".into(),
-            ))
+            // Fast path: the record doesn't even claim completeness, so
+            // there is nothing to promote and no point paying for a sweep.
+            if !self.is_complete().await? {
+                return Err(RangedStoreError::Incomplete);
+            }
+
+            let root = self.root;
+            let tree = self.tree;
+            let total_bytes = self.total_bytes;
+            let obao_path = self.obao_path.clone();
+            let ranges_path = self.ranges_path.clone();
+            let data_path = Arc::clone(&self.data_path);
+
+            // The one verify pass: recompute valid ranges over the whole
+            // blob directly from data + outboard, rather than trusting the
+            // (possibly stale, possibly bit-rotted) record. Either every
+            // group verifies (promote) or it doesn't (surgically shrink to
+            // exactly what still verifies).
+            let outcome = tokio::task::spawn_blocking(
+                move || -> Result<FinalizeOutcome, RangedStoreError> {
+                    let current_path = data_path
+                        .lock()
+                        .map_err(|_| lock_poisoned("data_path"))?
+                        .clone();
+
+                    let obao_file = std::fs::OpenOptions::new()
+                        .read(true)
+                        .open(&obao_path)
+                        .map_err(backend)?;
+                    let data_file = std::fs::OpenOptions::new()
+                        .read(true)
+                        .open(&current_path)
+                        .map_err(backend)?;
+                    let outboard = PreOrderOutboard {
+                        root: bao_tree::blake3::Hash::from(root),
+                        tree,
+                        data: obao_file,
+                    };
+
+                    let full = decdn_bao_range::align_range(0, 0, total_bytes)?;
+                    let full_ranges = full.chunk_ranges().clone();
+
+                    let mut valid = ChunkRanges::empty();
+                    for r in valid_ranges(outboard, data_file, full_ranges.as_ref()) {
+                        valid |= ChunkRanges::from(r.map_err(backend)?);
+                    }
+
+                    if (full_ranges.clone() - &valid).is_empty() {
+                        // Every chunk group verifies: promote `.partial` to
+                        // its final (non-`.partial`) path.
+                        let file_name = current_path
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .ok_or_else(|| {
+                                RangedStoreError::Backend("data path has no file name".into())
+                            })?;
+                        let final_name = file_name.strip_suffix(".partial").ok_or_else(|| {
+                            RangedStoreError::Backend("data path is not a .partial file".into())
+                        })?;
+                        let final_path = current_path.with_file_name(final_name);
+
+                        // Durability before the rename: the promoted file
+                        // must contain every byte it claims to.
+                        File::open(&current_path)
+                            .and_then(|f| f.sync_all())
+                            .map_err(backend)?;
+                        std::fs::rename(&current_path, &final_path).map_err(backend)?;
+
+                        {
+                            let mut guard =
+                                data_path.lock().map_err(|_| lock_poisoned("data_path"))?;
+                            *guard = final_path;
+                        }
+
+                        // Sidecar cleanup is best-effort: a promoted blob is
+                        // valid without them, so a delete failure must not
+                        // fail a successful promote.
+                        let _ = std::fs::remove_file(&obao_path);
+                        let _ = std::fs::remove_file(&ranges_path);
+
+                        Ok(FinalizeOutcome::Promoted)
+                    } else {
+                        Ok(FinalizeOutcome::Shrink(valid))
+                    }
+                },
+            )
+            .await
+            .map_err(backend)??;
+
+            match outcome {
+                FinalizeOutcome::Promoted => Ok(()),
+                FinalizeOutcome::Shrink(valid) => {
+                    {
+                        let mut guard =
+                            self.present.lock().map_err(|_| lock_poisoned("present"))?;
+                        *guard = valid.clone();
+                    }
+                    let ranges_path = self.ranges_path.clone();
+                    tokio::task::spawn_blocking(move || write_ranges_record(&ranges_path, &valid))
+                        .await
+                        .map_err(backend)?
+                        .map_err(backend)?;
+                    // Drops only the bad groups: a subsequent `missing_ranges`
+                    // reports exactly them, the caller re-admits just those,
+                    // and a second `finalize` promotes.
+                    Err(RangedStoreError::Incomplete)
+                }
+            }
         })
     }
 }
@@ -501,5 +716,192 @@ mod tests {
 
         let err = store.read(0, 1024).await.expect_err("absent must error");
         assert!(matches!(err, RangedStoreError::Backend(_)));
+    }
+
+    // --- admit / finalize ---
+
+    /// Deterministic blob of `len` bytes plus its bao root and full pre-order
+    /// outboard. Mirrors `crates/bao-range/src/conformance.rs::synth_blob` /
+    /// `crates/cache/tests/range_pull.rs::make_blob` — an xorshift fill, not
+    /// random, so runs are reproducible.
+    fn synth_blob(len: usize) -> ([u8; 32], Vec<u8>, Bytes) {
+        let mut plaintext = vec![0u8; len];
+        let mut x: u32 = 0x9e37_79b9;
+        for b in &mut plaintext {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            *b = x.to_le_bytes().first().copied().unwrap_or(0);
+        }
+        let ob = bao_tree::io::outboard::PreOrderMemOutboard::create(&plaintext, IROH_BLOCK_SIZE);
+        let root: [u8; 32] = *ob.root.as_bytes();
+        (root, plaintext, Bytes::from(ob.data))
+    }
+
+    /// Interleaved bao (combined format: 8-byte header + body) for `aligned`,
+    /// ready to hand to `RangedStore::admit` — exactly what the shared
+    /// conformance suite's `bao_for_range` produces.
+    fn bao_for(root: [u8; 32], plaintext: &[u8], outboard: Bytes, aligned: &AlignedRange) -> Bytes {
+        let s = usize::try_from(aligned.fetch_start()).expect("fits usize");
+        let e = usize::try_from(aligned.fetch_end()).expect("fits usize");
+        let data = plaintext.get(s..e).expect("aligned span in bounds");
+        decdn_bao_range::encode_verified_range(root, aligned, data, outboard).expect("verifies")
+    }
+
+    /// Fresh `.partial` store for `(root, total_bytes)`, keeping its tempdir
+    /// alive for the test's lifetime the same way `store_with_present` does.
+    fn fresh_store(root: [u8; 32], total_bytes: u64) -> ClientRangedStore {
+        let dir = tmp_dir();
+        let store =
+            ClientRangedStore::create(dir.path(), "blob", root, total_bytes).expect("create");
+        std::mem::forget(dir);
+        store
+    }
+
+    #[tokio::test]
+    async fn admit_prefix_range_is_readable_and_present() {
+        let total = 3 * GROUP;
+        let (root, plaintext, outboard) = synth_blob(usize::try_from(total).expect("fits"));
+        let store = fresh_store(root, total);
+
+        let aligned = decdn_bao_range::align_range(0, GROUP, total).expect("align");
+        let bao_bytes = bao_for(root, &plaintext, outboard, &aligned);
+
+        store
+            .admit(aligned.clone(), bao_bytes)
+            .await
+            .expect("admit prefix");
+
+        let present = store.present_ranges().await.expect("present_ranges");
+        assert_eq!(&present, aligned.chunk_ranges());
+
+        let got = store.read(0, GROUP).await.expect("read admitted prefix");
+        assert_eq!(
+            got.as_ref(),
+            plaintext
+                .get(..usize::try_from(GROUP).expect("fits"))
+                .expect("slice")
+        );
+
+        // The `.partial` file holds the bytes at the right offset.
+        let on_disk = std::fs::read(store.data_path.lock().expect("lock").clone()).expect("read");
+        assert_eq!(
+            on_disk.get(..usize::try_from(GROUP).expect("fits")),
+            plaintext.get(..usize::try_from(GROUP).expect("fits"))
+        );
+    }
+
+    #[tokio::test]
+    async fn admit_corrupt_payload_is_backend_error_and_presence_unchanged() {
+        let total = 2 * GROUP;
+        let (root, plaintext, outboard) = synth_blob(usize::try_from(total).expect("fits"));
+        let store = fresh_store(root, total);
+
+        let aligned = decdn_bao_range::align_range(0, GROUP, total).expect("align");
+        let mut bao_bytes = bao_for(root, &plaintext, outboard, &aligned).to_vec();
+        // Flip a byte well past the 8-byte header, inside the interleaved
+        // proof+data body, so the corruption lands in bao-verified content.
+        let flip_at = bao_bytes.len() - 1;
+        if let Some(b) = bao_bytes.get_mut(flip_at) {
+            *b ^= 0xFF;
+        }
+
+        let err = store
+            .admit(aligned, Bytes::from(bao_bytes))
+            .await
+            .expect_err("corrupt payload must fail");
+        assert!(matches!(err, RangedStoreError::Backend(_)));
+
+        let present = store.present_ranges().await.expect("present_ranges");
+        assert!(present.is_empty());
+    }
+
+    #[tokio::test]
+    async fn finalize_promotes_when_every_group_admitted() {
+        let total = 2 * GROUP + 123;
+        let (root, plaintext, outboard) = synth_blob(usize::try_from(total).expect("fits"));
+        let store = fresh_store(root, total);
+
+        let aligned = decdn_bao_range::align_range(0, 0, total).expect("align whole blob");
+        let bao_bytes = bao_for(root, &plaintext, outboard, &aligned);
+        store.admit(aligned, bao_bytes).await.expect("admit all");
+
+        store.finalize().await.expect("finalize promotes");
+
+        let final_path = store.data_path.lock().expect("lock").clone();
+        assert!(!final_path.to_string_lossy().ends_with(".partial"));
+        let on_disk = std::fs::read(&final_path).expect("read final blob");
+        assert_eq!(on_disk, plaintext);
+
+        assert!(!store.obao_path.exists());
+        assert!(!store.ranges_path.exists());
+
+        // Post-finalize `read` still works through the moved `data_path`.
+        let got = store.read(0, 0).await.expect("read post-finalize");
+        assert_eq!(got.as_ref(), plaintext.as_slice());
+    }
+
+    #[tokio::test]
+    async fn finalize_on_incomplete_store_is_incomplete_error() {
+        let total = 2 * GROUP;
+        let (root, _plaintext, _outboard) = synth_blob(usize::try_from(total).expect("fits"));
+        let store = fresh_store(root, total);
+
+        let err = store.finalize().await.expect_err("incomplete must error");
+        assert!(matches!(err, RangedStoreError::Incomplete));
+    }
+
+    #[tokio::test]
+    async fn finalize_shrinks_to_valid_set_on_post_admit_corruption() {
+        let total = 2 * GROUP;
+        let (root, plaintext, outboard) = synth_blob(usize::try_from(total).expect("fits"));
+        let store = fresh_store(root, total);
+
+        let aligned = decdn_bao_range::align_range(0, 0, total).expect("align whole blob");
+        let bao_bytes = bao_for(root, &plaintext, outboard, &aligned);
+        store.admit(aligned, bao_bytes).await.expect("admit all");
+
+        // Corrupt one group directly in the `.partial` data file, bypassing
+        // `admit` entirely — this is the "bit rot after admit" scenario
+        // `finalize`'s verify sweep exists to catch.
+        let data_path = store.data_path.lock().expect("lock").clone();
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&data_path)
+                .expect("open data file");
+            f.seek(SeekFrom::Start(0)).expect("seek");
+            f.write_all(&[0xFFu8; 8]).expect("corrupt first group");
+        }
+
+        let err = store.finalize().await.expect_err("corruption must fail");
+        assert!(matches!(err, RangedStoreError::Incomplete));
+
+        // The first group's chunks are exactly what's now missing; the
+        // second group is untouched and still present.
+        let missing_first = store
+            .missing_ranges(0, GROUP)
+            .await
+            .expect("missing_ranges first group");
+        assert!(!missing_first.is_empty());
+
+        let missing_second = store
+            .missing_ranges(GROUP, GROUP)
+            .await
+            .expect("missing_ranges second group");
+        assert!(missing_second.is_empty());
+
+        // A second finalize, after re-admitting only the bad group, promotes.
+        let aligned_first =
+            decdn_bao_range::align_range(0, GROUP, total).expect("align first group");
+        let outboard_for_reupload =
+            Bytes::from(std::fs::read(store.obao_path.clone()).expect("read obao"));
+        let bao_bytes = bao_for(root, &plaintext, outboard_for_reupload, &aligned_first);
+        store
+            .admit(aligned_first, bao_bytes)
+            .await
+            .expect("re-admit corrupted group");
+        store.finalize().await.expect("second finalize promotes");
     }
 }
