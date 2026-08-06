@@ -1200,6 +1200,20 @@ mod tests {
     }
 
     #[test]
+    fn staging_path_is_the_plain_hex_final_blob_not_a_partial() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let hash = [0xabu8; 32];
+        let p = staging_path(tmp.path(), hash).expect("staging_path");
+        let name = p.file_name().and_then(|n| n.to_str()).expect("name");
+        assert!(
+            !name.ends_with(".partial"),
+            "staging file must be the plain finalized blob, got {name}"
+        );
+        assert_eq!(name, blake3::Hash::from_bytes(hash).to_hex().to_string());
+        assert!(p.starts_with(tmp.path().join(STAGING_DIR)));
+    }
+
+    #[test]
     fn parse_manifest_accepts_v1_with_optional_size() {
         let json = br#"{"version":1,"entries":[{"path":"a.txt","hash":"b3:ab","size":4},{"path":"b","hash":"b3:cd"}]}"#;
         let m = parse_manifest(json).unwrap();
