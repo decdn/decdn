@@ -93,7 +93,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install tools
-        uses: taiki-e/install-action@v2.85.2
+        uses: taiki-e/install-action@v2.85.7
         with:
           tool: cargo-release,git-cliff,cargo-nextest
 
@@ -263,7 +263,7 @@ jobs:
 
       - name: Install cross
         if: matrix.cross
-        uses: taiki-e/install-action@v2.85.2
+        uses: taiki-e/install-action@v2.85.7
         with:
           tool: cross
 

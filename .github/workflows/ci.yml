@@ -182,7 +182,7 @@ jobs:
           shared-key: public-api
           # Restore-only except on `main`; only `main` writes it (see clippy job).
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@v2.85.2
+      - uses: taiki-e/install-action@v2.85.7
         with:
           tool: cargo-nextest
       - run: cargo nextest run -p decdn-protocol --features public-api-test
@@ -377,7 +377,7 @@ jobs:
           # job). This is the largest partition (~1.2 GiB instrumented target),
           # so gating its save is what most relieves the saturated cache store.
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@v2.85.2
+      - uses: taiki-e/install-action@v2.85.7
         with:
           tool: cargo-llvm-cov,cargo-nextest
 
@@ -650,7 +650,7 @@ jobs:
         with:
           shared-key: anvil-e2e-settlement
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@v2.85.2
+      - uses: taiki-e/install-action@v2.85.7
         with:
           tool: cargo-nextest
       # In-process anvil e2e targets: each spawns anvil + shells out to forge,
@@ -751,7 +751,7 @@ jobs:
         with:
           shared-key: anvil-e2e-journeys
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@v2.85.2
+      - uses: taiki-e/install-action@v2.85.7
         with:
           tool: cargo-nextest
       # The cross-layer `decdn-e2e` fixtures spawn the built `decdn-node`
