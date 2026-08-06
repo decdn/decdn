@@ -1663,12 +1663,102 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
         common.hard_cap(),
     )?;
 
-    // Immutable channel facts, captured before `ctx` moves behind the shared,
-    // interior-mutable handle the driver and source both read/write (#1608 A5).
+    // Immutable channel fact captured before `ctx` moves into `drive_fetch`
+    // (which wraps it behind the shared, interior-mutable handle #1608 A5).
     let channel_id = ctx.channel_id;
+
+    // The shared pull/funding deps the driver core borrows for the whole fetch.
+    let deps = DriveFetchDeps {
+        endpoint: &endpoint,
+        store: &store,
+        contract: &contract,
+        rpc: &rpc,
+        slash_dom: &slash_dom,
+        self_address,
+        chain: &chain,
+        namespace_id,
+        max_rate_per_mb: common.max_rate_per_mb,
+        max_blob_bytes,
+        deadlines,
+    };
+
+    // Run the gap-driven driver core (header-probe -> ClientRangedStore ->
+    // PeerSource -> drive -> watermark). The `indicatif` bar and its `on_progress`
+    // closure stay here — `drive_fetch` reports only through the callback. Clear
+    // the bar around the call so it never overwrites the terminal outcome (success
+    // line or error), on either path.
+    let result = drive_fetch(
+        &deps,
+        ctx,
+        target,
+        provider,
+        channel_id,
+        hash,
+        &args.output,
+        Some(&on_progress),
+    )
+    .await;
+    bar.finish_and_clear();
+    let total_bytes = result?;
+
+    println!("fetched {total_bytes} bytes -> {}", args.output.display());
+    Ok(())
+}
+
+/// Shared pull/funding deps [`drive_fetch`] borrows for the lifetime of one
+/// fetch. Mirrors the locals `fetch()` and `bundle_pull::PullCtx` already hold so
+/// both callers drive the same gap-driven core (P4). Every field is a borrow or a
+/// `Copy` scalar; the per-fetch `ctx`, target, and output are passed to
+/// `drive_fetch` directly (the `ctx` moves, since it must be wrapped in
+/// `Arc<Mutex>`).
+pub(crate) struct DriveFetchDeps<'a, P> {
+    pub(crate) endpoint: &'a Endpoint,
+    pub(crate) store: &'a RedbBuyerChannelStore,
+    pub(crate) contract: &'a PaymentChannel::PaymentChannelInstance<P>,
+    pub(crate) rpc: &'a P,
+    pub(crate) slash_dom: &'a Eip712Domain,
+    pub(crate) self_address: Address,
+    pub(crate) chain: &'a ResolvedChain,
+    pub(crate) namespace_id: [u8; 32],
+    pub(crate) max_rate_per_mb: u64,
+    pub(crate) max_blob_bytes: u64,
+    pub(crate) deadlines: PullDeadlines,
+}
+
+/// The gap-driven driver core shared by `decdn fetch` and `bundle pull` (P4):
+/// learn `total_bytes` from a throwaway header-only open, open the
+/// [`ClientRangedStore`] beside `output`, `drive` only the missing ranges into it
+/// (bao-verifying every byte on ingest and promoting `.partial` to `output` on
+/// finalize), then persist the resulting voucher watermark. Returns the whole-blob
+/// `total_bytes` on success.
+///
+/// Behavior-preserving extraction of the block `fetch()` ran inline. The
+/// `indicatif` bar stays in the caller (which clears it around this call);
+/// `drive_fetch` reports only through `progress`. The cache-miss annotation is
+/// applied on both the header-open and the drive failure, so both callers get the
+/// same explained error.
+///
+/// `ctx` moves in — it is wrapped in `Arc<Mutex>` so the source and driver can
+/// share it (the source clones it to open each gap's pull; the driver credits a
+/// mid-fetch top-up's new deposit through the same handle so the next open sees
+/// it).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn drive_fetch<P>(
+    deps: &DriveFetchDeps<'_, P>,
+    ctx: ChannelContext,
+    target: EndpointAddr,
+    provider: Address,
+    channel_id: B256,
+    hash: [u8; 32],
+    output: &Path,
+    progress: Option<&ProgressCallback>,
+) -> anyhow::Result<u64>
+where
+    P: alloy::providers::Provider + Clone,
+{
+    // Immutable channel facts captured before `ctx` moves behind the shared,
+    // interior-mutable handle the driver and source both read/write (#1608 A5).
     let prior_nonce = ctx.prior_nonce;
-    let prior_bytes_delivered = ctx.prior_bytes_delivered;
-    let prior_amount = ctx.prior_amount;
     let token = ctx.token;
 
     // One ledger for this channel, seeded from its persisted cumulative state so
@@ -1677,8 +1767,8 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
     // source; the watermark to persist afterwards is read straight back off it.
     let ledger = Arc::new(ChannelLedger::new(Cumulative {
         nonce: prior_nonce,
-        bytes: prior_bytes_delivered,
-        amount: prior_amount,
+        bytes: ctx.prior_bytes_delivered,
+        amount: ctx.prior_amount,
     }));
 
     // Learn the whole-blob size before constructing the ranged store: the store is
@@ -1689,56 +1779,51 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
     // needs. The cache-miss annotation is applied here too, so an unbound or
     // underfunded refusal is still explained at this first contact.
     let (header, first_pull) = open_progressive_pull(
-        &endpoint,
+        deps.endpoint,
         target.clone(),
         &ctx,
         Arc::clone(&ledger),
-        &slash_dom,
+        deps.slash_dom,
         provider,
         hash,
-        namespace_id,
+        deps.namespace_id,
         0,
         micros_now(),
-        max_blob_bytes,
-        common.max_rate_per_mb,
-        deadlines,
+        deps.max_blob_bytes,
+        deps.max_rate_per_mb,
+        deps.deadlines,
         0,
     )
     .await
-    .map_err(|err| {
-        bar.finish_and_clear();
-        annotate_unbound_cache_miss(err, &ctx)
-    })?;
+    .map_err(|err| annotate_unbound_cache_miss(err, &ctx))?;
     let total_bytes = header.total_bytes;
     drop(first_pull);
 
-    // The store sits beside `--output`, keyed by the output's own file name, so
-    // its promoted final path IS `--output` (no post-finalize rename) and its
-    // `.partial` matches the pre-#1608 `<output>.partial` placement. A prior
-    // `.partial.ranges` record resumes; only `missing_ranges(R)` is re-pulled and
-    // no already-held byte is re-paid.
-    let (store_dir, stem) = ranged_store_location(&args.output)?;
+    // The store sits beside `output`, keyed by the output's own file name, so its
+    // promoted final path IS `output` (no post-finalize rename) and its `.partial`
+    // matches the pre-#1608 `<output>.partial` placement. A prior `.partial.ranges`
+    // record resumes; only `missing_ranges(R)` is re-pulled and no already-held
+    // byte is re-paid.
+    let (store_dir, stem) = ranged_store_location(output)?;
     let ranged_store = ClientRangedStore::open_or_create(&store_dir, &stem, hash, total_bytes)
-        .map_err(|e| {
-            bar.finish_and_clear();
-            anyhow::anyhow!("open ranged store for {}: {e}", args.output.display())
-        })?;
+        .map_err(|e| anyhow::anyhow!("open ranged store for {}: {e}", output.display()))?;
 
     // `topUp` is funder-only on-chain, so a delegate voucher-signer (publisher-pays,
     // #1481) cannot reactively top up — decided once here, up front.
-    let is_funder = store
+    let is_funder = deps
+        .store
         .get_by_provider(provider)?
         .map(|state| state.funder)
-        .is_some_and(|funder| funder == self_address);
+        .is_some_and(|funder| funder == deps.self_address);
     let funder = CliFunder {
-        contract: &contract,
-        rpc: &rpc,
-        store: &store,
+        contract: deps.contract,
+        rpc: deps.rpc,
+        store: deps.store,
         provider,
         token,
-        self_address,
-        payment_channel_addr: chain.payment_channel,
-        max_approve: chain.max_approve,
+        self_address: deps.self_address,
+        payment_channel_addr: deps.chain.payment_channel,
+        max_approve: deps.chain.max_approve,
         is_funder,
     };
 
@@ -1747,24 +1832,24 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
     // through the same handle so the next open sees it.
     let ctx = Arc::new(Mutex::new(ctx));
     let peer_source = PeerSource::new(
-        &endpoint,
+        deps.endpoint,
         target,
         Arc::clone(&ctx),
         Arc::clone(&ledger),
-        &slash_dom,
+        deps.slash_dom,
         provider,
-        namespace_id,
-        max_blob_bytes,
-        common.max_rate_per_mb,
-        deadlines,
+        deps.namespace_id,
+        deps.max_blob_bytes,
+        deps.max_rate_per_mb,
+        deps.deadlines,
     );
     let pacer = BudgetPacer::new();
-    let drive_config = DriveConfig::cli(chain.working_deposit);
+    let drive_config = DriveConfig::cli(deps.chain.working_deposit);
 
     // The gap-driven fetch: `drive` pulls ONLY `missing_ranges(0, 0)` — the whole
     // blob on a fresh fetch, just the gap on a resume — into the ranged store,
     // which bao-verifies every byte on `ingest_stream` and promotes the `.partial`
-    // to `--output` on `finalize`.
+    // to `output` on `finalize`.
     let drive_result = drive(
         &ranged_store,
         &peer_source,
@@ -1776,26 +1861,22 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
         0,
         0,
         &drive_config,
-        Some(&on_progress),
+        progress,
     )
     .await;
-
-    // Clear the bar before the terminal outcome (success line or error) so it
-    // never overwrites the final message, on either path.
-    bar.finish_and_clear();
 
     // Persist the voucher watermark from the shared ledger the same way the
     // pre-#1608 loop's `watermark_after` chose it: on an explicit voucher
     // rejection the acked (committed) watermark is safe; on an ambiguous failure
     // settle HIGH (`settlement`) so a reuse never re-signs a spent nonce.
-    let progress = match &drive_result {
+    let vprogress = match &drive_result {
         Ok(()) => VoucherProgress::from_cumulative(ledger.committed(), prior_nonce),
         Err(err) if err.downcast_ref::<UpstreamVoucherRejected>().is_some() => {
             VoucherProgress::from_cumulative(ledger.committed(), prior_nonce)
         }
         Err(_) => VoucherProgress::from_cumulative(ledger.settlement(), prior_nonce),
     };
-    persist_watermark(&store, provider, channel_id, &progress);
+    persist_watermark(deps.store, provider, channel_id, &vprogress);
 
     // On error the `.partial` + sidecars are deliberately LEFT in place — they are
     // what the next invocation resumes from (only the still-missing gap is
@@ -1808,8 +1889,7 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
         Err(_) => err,
     })?;
 
-    println!("fetched {total_bytes} bytes -> {}", args.output.display());
-    Ok(())
+    Ok(total_bytes)
 }
 
 /// The CLI's [`Funder`] over its funding chain (#1608 A5): a mid-fetch reactive
