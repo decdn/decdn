@@ -62,6 +62,16 @@ jobs:
           git_committer_name: decdn
           git_committer_email: security@decdn.org
 
+      # Set the author identity explicitly too. The import step above sets the
+      # committer, but `cargo release --execute` makes the version-bump commit
+      # and git needs an author identity or it fails with "Please tell me who
+      # you are".
+      - name: Configure git identity (release)
+        if: ${{ !inputs.dry_run }}
+        run: |
+          git config --global user.name "decdn"
+          git config --global user.email "security@decdn.org"
+
       # Dry runs never create a commit or tag, so they need no key — just a
       # placeholder identity so any incidental git operation has one.
       - name: Configure git (dry run)
