@@ -12,5 +12,8 @@ bytes = { workspace = true }
 positioned-io = { workspace = true }
 thiserror = { workspace = true }
 
+[features]
+conformance = []
+
 [lints]
 workspace = true
