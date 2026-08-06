@@ -45,10 +45,40 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Configure git
+      # Real releases sign the version-bump commit and the tag with the
+      # org-owned decdn.org GPG key (identity: decdn <security@decdn.org>).
+      # The (passphrase-less) private key lives only in the
+      # RELEASE_GPG_PRIVATE_KEY Actions secret; no personal maintainer key is
+      # used. See SECURITY.md for verification.
+      - name: Import release GPG key
+        if: ${{ !inputs.dry_run }}
+        uses: crazy-max/ghaction-import-gpg@v6
+        with:
+          gpg_private_key: ${{ secrets.RELEASE_GPG_PRIVATE_KEY }}
+          git_user_signingkey: true
+          git_commit_gpgsign: true
+          git_tag_gpgsign: true
+          git_config_global: true
+          git_committer_name: decdn
+          git_committer_email: security@decdn.org
+
+      # Set the author identity explicitly too. The import step above sets the
+      # committer, but `cargo release --execute` makes the version-bump commit
+      # and git needs an author identity or it fails with "Please tell me who
+      # you are".
+      - name: Configure git identity (release)
+        if: ${{ !inputs.dry_run }}
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global user.name "decdn"
+          git config --global user.email "security@decdn.org"
+
+      # Dry runs never create a commit or tag, so they need no key — just a
+      # placeholder identity so any incidental git operation has one.
+      - name: Configure git (dry run)
+        if: ${{ inputs.dry_run }}
+        run: |
+          git config user.name "decdn"
+          git config user.email "security@decdn.org"
 
       - uses: dtolnay/rust-toolchain@1.95.0
         with:
@@ -267,6 +297,26 @@ jobs:
           path: artifacts
           merge-multiple: true
 
+      - name: Import release GPG key
+        uses: crazy-max/ghaction-import-gpg@v6
+        with:
+          gpg_private_key: ${{ secrets.RELEASE_GPG_PRIVATE_KEY }}
+
+      # A signed SHA256SUMS covers all archives at once; per-archive detached
+      # .asc signatures let a downloader verify a single file without the
+      # manifest. Both are signed by the decdn.org release key.
+      - name: Sign binaries and checksums
+        working-directory: artifacts
+        run: |
+          shopt -s nullglob
+          sha256sum ./*.tar.gz ./*.zip > SHA256SUMS
+          for f in ./*.tar.gz ./*.zip; do
+            gpg --batch --yes --pinentry-mode loopback \
+              --local-user security@decdn.org --armor --detach-sign "$f"
+          done
+          gpg --batch --yes --pinentry-mode loopback \
+            --local-user security@decdn.org --armor --detach-sign SHA256SUMS
+
       - name: Upload to GitHub Release
         run: gh release upload "$TAG" artifacts/*
         env:
@@ -329,9 +379,37 @@ jobs:
           upload-release-assets: false
           upload-artifact: false
 
-      - name: Upload SBOM to release
+      - name: Import release GPG key
+        uses: crazy-max/ghaction-import-gpg@v6
+        with:
+          gpg_private_key: ${{ secrets.RELEASE_GPG_PRIVATE_KEY }}
+
+      # GPG has no native OCI-image signature format, so we sign the pinned
+      # image digest out of band: image-digest.txt records the exact
+      # ghcr.io/...@sha256:... reference, and its detached .asc lets a puller
+      # confirm the digest came from the decdn.org key. cosign will later
+      # replace this with an in-registry signature.
+      - name: Sign SBOM and image digest
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          echo "${IMAGE}@${DIGEST}" > image-digest.txt
+          gpg --batch --yes --pinentry-mode loopback \
+            --local-user security@decdn.org --armor --detach-sign image-digest.txt
+          gpg --batch --yes --pinentry-mode loopback \
+            --local-user security@decdn.org --armor \
+            --detach-sign "decdn-${VERSION}-sbom.spdx.json"
+
+      - name: Upload SBOM and signatures to release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.release.outputs.tag }}
           VERSION: ${{ needs.release.outputs.version }}
-        run: gh release upload "$TAG" "decdn-${VERSION}-sbom.spdx.json"
+        run: |
+          gh release upload "$TAG" \
+            "decdn-${VERSION}-sbom.spdx.json" \
+            "decdn-${VERSION}-sbom.spdx.json.asc" \
+            image-digest.txt \
+            image-digest.txt.asc

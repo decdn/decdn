@@ -6,5 +6,6 @@ pre-release-commit-message = "chore(release): v{{version}}"
 push = true
 push-remote = "origin"
 publish = false
-sign-tag = false
+sign-commit = true
+sign-tag = true
 dependent-version = "upgrade"
