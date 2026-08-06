@@ -225,6 +225,13 @@ impl ClientRangedStore {
     /// — it does NOT re-hash the data file against the outboard; the record
     /// is trusted as written by a prior `admit`/`finalize`.
     ///
+    /// If `finalize` already promoted this blob (the final, non-`.partial`
+    /// file exists), `open` reconstructs a complete store that serves from
+    /// the final file instead: it trusts the prior promote rather than
+    /// re-hashing, and treats the whole blob as present. This also covers a
+    /// crash between `finalize`'s rename and its (best-effort) sidecar
+    /// cleanup — any leftover `.obao4`/`.ranges` sidecars are removed here.
+    ///
     /// # Errors
     ///
     /// Any I/O failure reading the ranges record, including a corrupt
@@ -232,6 +239,28 @@ impl ClientRangedStore {
     pub fn open(dir: &Path, stem: &str, root: [u8; 32], total_bytes: u64) -> io::Result<Self> {
         let tree = BaoTree::new(total_bytes, IROH_BLOCK_SIZE);
         let (data_path, obao_path, ranges_path) = sidecar_paths(dir, stem);
+        let final_path = dir.join(stem);
+
+        if final_path.exists() {
+            // Already finalized (or crashed after the rename but before
+            // sidecar cleanup): the final file is the complete, verified
+            // blob. Best-effort clean up any leftover sidecars and
+            // reconstruct a complete store without re-hashing.
+            let _ = std::fs::remove_file(&obao_path);
+            let _ = std::fs::remove_file(&ranges_path);
+
+            let present = ChunkRanges::from(ChunkNum(0)..tree.chunks());
+            return Ok(Self {
+                root,
+                total_bytes,
+                tree,
+                data_path: Arc::new(Mutex::new(final_path)),
+                obao_path,
+                ranges_path,
+                present: Arc::new(Mutex::new(present)),
+            });
+        }
+
         let present = read_ranges_record(&ranges_path)?;
 
         Ok(Self {
@@ -903,5 +932,74 @@ mod tests {
             .await
             .expect("re-admit corrupted group");
         store.finalize().await.expect("second finalize promotes");
+    }
+
+    #[tokio::test]
+    async fn open_after_finalize_reconstructs_complete_store() {
+        let total = 2 * GROUP + 123;
+        let (root, plaintext, outboard) = synth_blob(usize::try_from(total).expect("fits"));
+        let dir = tmp_dir();
+        let store = ClientRangedStore::create(dir.path(), "blob", root, total).expect("create");
+
+        let aligned = decdn_bao_range::align_range(0, 0, total).expect("align whole blob");
+        let bao_bytes = bao_for(root, &plaintext, outboard, &aligned);
+        store.admit(aligned, bao_bytes).await.expect("admit all");
+        store.finalize().await.expect("finalize promotes");
+        drop(store);
+
+        let reopened =
+            ClientRangedStore::open(dir.path(), "blob", root, total).expect("open finalized");
+
+        assert!(
+            reopened.is_complete().await.expect("is_complete"),
+            "reopened store must be complete"
+        );
+        let got = reopened.read(0, total).await.expect("read");
+        assert_eq!(got.as_ref(), plaintext.as_slice());
+        let missing = reopened.missing_ranges(0, 0).await.expect("missing_ranges");
+        assert!(missing.is_empty());
+    }
+
+    #[tokio::test]
+    async fn open_recovers_from_crash_between_rename_and_sidecar_delete() {
+        let total = 2 * GROUP + 123;
+        let (root, plaintext, outboard) = synth_blob(usize::try_from(total).expect("fits"));
+        let dir = tmp_dir();
+        let store = ClientRangedStore::create(dir.path(), "blob", root, total).expect("create");
+
+        let aligned = decdn_bao_range::align_range(0, 0, total).expect("align whole blob");
+        let bao_bytes = bao_for(root, &plaintext, outboard, &aligned);
+        store.admit(aligned, bao_bytes).await.expect("admit all");
+
+        // Simulate the crash window: rename `.partial` -> final WITHOUT
+        // deleting the sidecars, mirroring a crash between finalize's
+        // rename and its best-effort sidecar cleanup.
+        let partial_path = store.data_path.lock().expect("lock").clone();
+        let final_path = dir.path().join("blob");
+        std::fs::rename(&partial_path, &final_path).expect("simulate promote rename");
+        let obao_path = store.obao_path.clone();
+        let ranges_path = store.ranges_path.clone();
+        assert!(obao_path.exists());
+        assert!(ranges_path.exists());
+        drop(store);
+
+        let reopened =
+            ClientRangedStore::open(dir.path(), "blob", root, total).expect("open post-crash");
+
+        assert!(
+            reopened.is_complete().await.expect("is_complete"),
+            "reopened store must be complete"
+        );
+        let got = reopened.read(0, total).await.expect("read");
+        assert_eq!(got.as_ref(), plaintext.as_slice());
+
+        assert!(
+            !obao_path.exists(),
+            "leftover obao sidecar must be cleaned up"
+        );
+        assert!(
+            !ranges_path.exists(),
+            "leftover ranges sidecar must be cleaned up"
+        );
     }
 }
