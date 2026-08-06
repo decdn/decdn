@@ -25,9 +25,12 @@
 //!   dropped the credited-but-unpaid tail, so there is no `content_paid_frontier`
 //!   arithmetic to redo here (that lived in the CLI because it wrote the raw file
 //!   itself; the store's `missing_ranges` supersedes it).
-//! - **Settle-wait**: after a top-up the node's chain watcher may not have
-//!   observed the new deposit, so a resume-open is refused with the ambiguous
-//!   [`crate::resume_may_be_stale`] shape. The pacer waits it out (bounded).
+//! - **Settle-wait**: after a top-up the driver retries the open immediately —
+//!   the pacer sees the healed deposit and draws right away. If the node's chain
+//!   watcher has not yet observed the new deposit, that retry is refused with the
+//!   ambiguous [`crate::resume_may_be_stale`] shape; ONLY THEN does the driver
+//!   sleep and retry, bounded by the settle-wait budget (this mirrors the legacy
+//!   CLI loop, which only backs off on an actual stale-resume refusal).
 //! - **Reseed** (wallet-less resync, #1481): an authenticated
 //!   [`WatermarkBundle`](decdn_protocol::client::WatermarkBundle) that ADVANCES
 //!   our committed watermark is a healable desync — the driver reseeds the ledger
@@ -93,10 +96,11 @@ pub struct DriveConfig {
     /// The reactive top-up target passed to the pacer as
     /// [`PaceState::working_deposit`]. `U256::ZERO` disables reactive top-up.
     pub working_deposit: U256,
-    /// How many [`PaceDecision::Wait`] settle-backoff steps to spend after a
-    /// top-up before giving up on the node's chain watcher.
+    /// How many settle-backoff steps the driver may spend, after a top-up,
+    /// retrying an open that keeps failing with [`crate::resume_may_be_stale`]
+    /// before giving up on the node's chain watcher.
     pub max_settle_waits: u32,
-    /// How long each [`PaceDecision::Wait`] step sleeps.
+    /// How long each settle-backoff step sleeps.
     pub settle_backoff: Duration,
 }
 
@@ -297,8 +301,10 @@ where
     F: Funder,
 {
     // Per-open state; reset the moment an open succeeds. `awaiting_settle` is set
-    // only by a top-up (or a stale-resume refusal), so the pacer waits before the
-    // next draw rather than spending on a refusal we provoked.
+    // only right after a top-up, and consulted ONLY in the error-classification
+    // path below: it gates the bounded settle-wait on an ACTUAL stale-resume
+    // refusal from the re-open, not proactively before the retry is even
+    // attempted (the pacer always retries the open immediately after a top-up).
     let mut awaiting_settle = false;
     let mut settle_waits = 0u32;
     let mut exhaustion_confirmed = false;
@@ -322,9 +328,6 @@ where
             working_deposit: config.working_deposit,
             topups_used: counters.topups_used,
             max_topups: funder.max_topups(),
-            awaiting_settle,
-            settle_waits_used: settle_waits,
-            max_settle_waits: config.max_settle_waits,
             exhaustion_confirmed,
         };
 
@@ -336,14 +339,6 @@ where
                      deposit cannot cover the next voucher and reactive top-up is \
                      disabled or exhausted"
                 );
-            }
-            PaceDecision::Wait => {
-                // A just-landed top-up the node's chain watcher may not have
-                // observed yet: sleep the bounded settle backoff, then let the
-                // pacer re-decide (it falls through to Draw once the budget is
-                // spent — by then the deposit is healthy again).
-                settle_waits = settle_waits.saturating_add(1);
-                tokio::time::sleep(config.settle_backoff).await;
             }
             PaceDecision::TopUp(additional) => {
                 match funder.top_up(additional).await? {
@@ -521,8 +516,12 @@ mod tests {
 
     use super::{DriveConfig, contiguous_byte_ranges, drive};
     use crate::pacer::BudgetPacer;
-    use crate::source::{FakeFunder, ScriptedSource};
-    use crate::{ChannelContext, ChannelLedger, ClientRangedStore, Cumulative};
+    use crate::source::{BlobSource, FakeFunder, ScriptedSource, SourceFuture};
+    use crate::{
+        ChannelContext, ChannelLedger, ClientRangedStore, Cumulative, UpstreamPullHeader,
+        UpstreamVoucherRejected, VoucherProgress,
+    };
+    use decdn_protocol::client::VoucherRejectReason;
 
     const GROUP: u64 = CHUNK_GROUP_BYTES;
 
@@ -912,5 +911,175 @@ mod tests {
             &plaintext[GROUP as usize..2 * GROUP as usize],
             "the requested range is byte-exact"
         );
+    }
+
+    /// The reader [`FailFirstOpen`] hands out: on the first open, a fault
+    /// parked from the very first byte (so the store checkpoints NOTHING and a
+    /// retry re-covers the whole range); on every later open, the real
+    /// [`ScriptedSource`] reader.
+    enum MaybeFaultReader {
+        Fault(Option<anyhow::Error>),
+        Real(<ScriptedSource as BlobSource>::Reader),
+    }
+
+    impl iroh_io::AsyncStreamReader for MaybeFaultReader {
+        async fn read_bytes(&mut self, len: usize) -> std::io::Result<Bytes> {
+            match self {
+                Self::Fault(_) => Ok(Bytes::new()),
+                Self::Real(r) => r.read_bytes(len).await,
+            }
+        }
+
+        async fn read<const L: usize>(&mut self) -> std::io::Result<[u8; L]> {
+            match self {
+                Self::Fault(_) => Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "scripted immediate fault",
+                )),
+                Self::Real(r) => r.read().await,
+            }
+        }
+    }
+
+    impl crate::sink::StashedFault for MaybeFaultReader {
+        fn take_fault(&mut self) -> Option<anyhow::Error> {
+            match self {
+                Self::Fault(f) => f.take(),
+                Self::Real(r) => r.take_fault(),
+            }
+        }
+    }
+
+    /// A [`BlobSource`] wrapper that fails its FIRST open with a scripted
+    /// upstream `InsufficientDeposit` voucher rejection — the shape a genuine
+    /// mid-fetch exhaustion refusal takes — and delegates every later open to
+    /// the inner [`ScriptedSource`]. Regression coverage for the pacer bug where
+    /// `BudgetPacer` proactively returned `Wait` after every top-up, forcing the
+    /// driver to sleep the full settle budget before even retrying the open.
+    struct FailFirstOpen {
+        inner: ScriptedSource,
+        opens: std::sync::atomic::AtomicUsize,
+    }
+
+    impl BlobSource for FailFirstOpen {
+        type Reader = MaybeFaultReader;
+
+        fn open(
+            &self,
+            hash: [u8; 32],
+            range: AlignedRange,
+        ) -> SourceFuture<'_, (UpstreamPullHeader, Self::Reader)> {
+            let n = self.opens.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move {
+                if n == 0 {
+                    // A real header (so the driver prices `next_voucher_cost`),
+                    // but the reader immediately parks a genuine-exhaustion
+                    // fault instead of yielding any wire bytes.
+                    let header = UpstreamPullHeader {
+                        total_bytes: self.inner.total_bytes(),
+                        rate_per_mb: 1,
+                        interval_bytes: 1024 * 1024,
+                    };
+                    let fault = UpstreamVoucherRejected {
+                        reason: VoucherRejectReason::InsufficientDeposit,
+                        bundle: None,
+                    };
+                    return Ok((
+                        header,
+                        MaybeFaultReader::Fault(Some(anyhow::Error::new(fault))),
+                    ));
+                }
+                let (header, reader) = self.inner.open(hash, range).await?;
+                Ok((header, MaybeFaultReader::Real(reader)))
+            })
+        }
+
+        fn finish(&self, reader: Self::Reader) -> SourceFuture<'_, VoucherProgress> {
+            Box::pin(async move {
+                match reader {
+                    MaybeFaultReader::Fault(_) => Ok(VoucherProgress::default()),
+                    MaybeFaultReader::Real(r) => self.inner.finish(r).await,
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_top_up_is_followed_by_an_immediate_reopen_not_a_settle_wait() {
+        // The buyer starts under-deposited, so the first open's genuine
+        // `InsufficientDeposit` refusal is corroborated by the buyer's OWN
+        // ledger (0 remaining < any nonzero voucher cost) and the pacer tops
+        // up. Before the fix, `BudgetPacer::decide` proactively returned `Wait`
+        // right after that top-up, and the driver slept the WHOLE settle
+        // budget (`max_settle_waits * settle_backoff`) before even retrying the
+        // open. Set a settle_backoff large enough that a real wait would blow
+        // past a tight elapsed-time budget, and assert it does not.
+        let total = 2 * GROUP;
+        let (root, plaintext, _outboard) = synth_blob(total as usize);
+        let store = fresh_store(root, total);
+
+        let inner = ScriptedSource::new(plaintext.clone()).expect("source");
+        let root = inner.root();
+        let source = FailFirstOpen {
+            inner,
+            opens: std::sync::atomic::AtomicUsize::new(0),
+        };
+
+        let pacer = BudgetPacer::new();
+        let funder = FakeFunder::new(3, DepositOutcome::Added(U256::from(u128::MAX)));
+
+        let mut ctx = healthy_ctx();
+        ctx.deposit = U256::ZERO; // under-deposited: the first refusal is genuine
+        let ctx = Arc::new(Mutex::new(ctx));
+        let ledger = Arc::new(ChannelLedger::new(Cumulative::default()));
+
+        let drive_config = DriveConfig {
+            working_deposit: U256::from(10_000u64),
+            max_settle_waits: 2,
+            settle_backoff: std::time::Duration::from_secs(2),
+        };
+
+        let started = std::time::Instant::now();
+        drive(
+            &store,
+            &source,
+            &pacer,
+            &funder,
+            &ctx,
+            &ledger,
+            root,
+            0,
+            0,
+            &drive_config,
+            None,
+        )
+        .await
+        .expect("drive completes after one reactive top-up");
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            source.opens.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "one faulting open + one immediate re-open"
+        );
+        assert_eq!(
+            source.inner.opened_ranges().len(),
+            1,
+            "only the SECOND (successful) open reaches the inner scripted source"
+        );
+        assert_eq!(
+            funder.calls().len(),
+            1,
+            "exactly one reactive top-up funded the genuine exhaustion"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "the re-open must follow the top-up immediately, not after a settle-wait \
+             sleep (settle_backoff was 2s per step): elapsed {elapsed:?}"
+        );
+
+        assert!(store.is_complete().await.expect("is_complete"));
+        let got = store.read(0, 0).await.expect("read whole blob");
+        assert_eq!(got.as_ref(), plaintext.as_slice());
     }
 }

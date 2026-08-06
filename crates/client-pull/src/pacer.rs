@@ -49,15 +49,6 @@ pub struct PaceState {
     /// Reactive top-ups allowed in total, from
     /// [`crate::source::Funder::max_topups`] (CLI 3, node 1).
     pub max_topups: u32,
-    /// A top-up has landed whose settlement the upstream's chain watcher may not
-    /// have observed yet — a resume-open would be refused as a stale deposit
-    /// (#1497). While this holds and the wait budget is not spent, the pacer says
-    /// [`PaceDecision::Wait`].
-    pub awaiting_settle: bool,
-    /// Settle-wait steps already spent since the last top-up.
-    pub settle_waits_used: u32,
-    /// Settle-wait steps allowed in total.
-    pub max_settle_waits: u32,
     /// Whether the last draw failed with an exhaustion the DRIVER confirmed as
     /// genuine via [`crate::genuine_exhaustion`] — a real ceiling hit corroborated
     /// by our own ledger, not a healable desync or a lying peer. `false` on the
@@ -80,9 +71,6 @@ pub enum PaceDecision {
     /// micro-USDC via [`crate::source::Funder::top_up`], then resume at the paid
     /// frontier.
     TopUp(U256),
-    /// A top-up landed but is not yet observed upstream: sleep and re-open at the
-    /// same offset. Costs only time.
-    Wait,
     /// The requested range is fully present: finalize and stop.
     Done,
     /// Out of budget or attempts (deposit cannot cover the next voucher and either
@@ -118,14 +106,7 @@ impl Pacer for BudgetPacer {
         if s.cleared_bytes >= s.requested_bytes {
             return PaceDecision::Done;
         }
-        // 2. A just-landed top-up the upstream may not have observed yet: wait for
-        //    its chain watcher before re-opening, bounded by the wait budget. Ahead
-        //    of the spend decisions, exactly as the node's `decide` orders it — a
-        //    refusal we provoked by topping up is not evidence to spend more on.
-        if s.awaiting_settle && s.settle_waits_used < s.max_settle_waits {
-            return PaceDecision::Wait;
-        }
-        // 3. Exhaustion. Two ways to reach it, both order-free: the driver
+        // 2. Exhaustion. Two ways to reach it, both order-free: the driver
         //    confirmed a genuine reactive ceiling hit (`genuine_exhaustion`), or —
         //    gating on our OWN deposit — the remaining balance cannot even cover
         //    the next voucher. Either way, fund it if a top-up is enabled, budget
@@ -142,7 +123,7 @@ impl Pacer for BudgetPacer {
                 PaceDecision::Refuse
             };
         }
-        // 4. The deposit covers the next voucher and the range is incomplete: keep
+        // 3. The deposit covers the next voucher and the range is incomplete: keep
         //    drawing the remainder of the gap.
         PaceDecision::Draw {
             up_to_bytes: s.requested_bytes.saturating_sub(s.cleared_bytes),
@@ -167,9 +148,6 @@ mod tests {
             working_deposit: U256::from(5_000u64),
             topups_used: 0,
             max_topups: 3,
-            awaiting_settle: false,
-            settle_waits_used: 0,
-            max_settle_waits: 2,
             exhaustion_confirmed: false,
         }
     }
@@ -248,38 +226,17 @@ mod tests {
     }
 
     #[test]
-    fn awaiting_settle_within_budget_waits() {
-        let mut s = healthy();
-        s.awaiting_settle = true;
-        s.settle_waits_used = 1;
-        s.max_settle_waits = 2;
-        assert_eq!(BudgetPacer::new().decide(&s), PaceDecision::Wait);
-    }
-
-    #[test]
-    fn awaiting_settle_past_the_wait_budget_falls_through() {
-        let mut s = healthy();
-        s.awaiting_settle = true;
-        s.settle_waits_used = 2;
-        s.max_settle_waits = 2;
-        // Wait budget spent: the deposit is healthy again (the top-up settled), so
-        // resume drawing rather than waiting forever.
+    fn a_top_up_healed_deposit_draws_immediately() {
+        // After a top-up lands, `remaining_deposit` covers the next voucher again
+        // and the range is incomplete: the pacer must retry the open right away —
+        // no proactive settle-wait. The bounded settle-wait only fires in the
+        // driver, and only on an ACTUAL stale-resume refusal (see driver.rs).
+        let s = healthy();
         assert_eq!(
             BudgetPacer::new().decide(&s),
             PaceDecision::Draw {
                 up_to_bytes: s.requested_bytes - s.cleared_bytes
             }
         );
-    }
-
-    #[test]
-    fn a_satisfied_range_is_done_even_while_awaiting_settle() {
-        let mut s = healthy();
-        s.cleared_bytes = s.requested_bytes;
-        s.awaiting_settle = true;
-        s.settle_waits_used = 0;
-        // Completion outranks the settle-wait: no reason to sleep on a finished
-        // range.
-        assert_eq!(BudgetPacer::new().decide(&s), PaceDecision::Done);
     }
 }
