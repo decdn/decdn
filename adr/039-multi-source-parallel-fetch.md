@@ -38,7 +38,7 @@ Verified units are written into the local partial blob at their offsets. `iroh-b
 
 A unit is re-queued — and reassigned to a **different** source — when its source:
 
-- **Fails verification.** The bao decoder rejects the unit against the root ([ADR 038](038-bao-verified-range-streaming.md#adr-038-bao-verified-range-streaming-on-cdnclientv1)). This is cryptographic proof the bytes do not match the committed content. It is recorded as a reputation penalty and a slashing-evidence candidate against the signed `StreamResponse` ([ADR 014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence)).
+- **Fails verification.** The bao decoder rejects the unit against the root ([ADR 038](038-bao-verified-range-streaming.md#adr-038-bao-verified-range-streaming-on-cdnclientv1)). The client signs no voucher for that unit, so the source is paid nothing for the corrupt range. The failure lowers the source's local reputation score ([ADR 008](008-reputation.md#adr-008-reputation-system)), and the unit goes to a different source. Corruption is not an on-chain offense: the wire absorbs it through post-verification voucher signing ([ADR 003 § Corrupted delivery](003-payments.md#corrupted-delivery)), and the only two slashable offenses are rate manipulation and blacklist violation ([ADR 014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence)).
 - **Stalls.** No verified progress within `unit_deadline_ms`.
 - **Drops or errors.** The stream closes or returns `ok: false`.
 
@@ -85,7 +85,7 @@ Concrete defaults are modeled before locking. The load-bearing commitments are t
 - Aggregate download throughput scales with the number of admitted sources rather than one peer's upload bandwidth, while deadline-based re-dispatch prevents a stalled source from delaying completion indefinitely.
 - No new wire surface: each source is an ordinary `cdn/client/v1` paid stream, bounded by the existing voucher backpressure. The mechanism is a pure client-side policy.
 - A corrupt or vanished source costs only a unit re-dispatch, never a restart — the verified-range property ([ADR 038](038-bao-verified-range-streaming.md#adr-038-bao-verified-range-streaming-on-cdnclientv1)) localizes every failure.
-- Verification failures yield cryptographic slashing evidence and reputation signal, so multi-source fetch hardens the network against bad sources rather than merely tolerating them.
+- Verification failures cost the source its payment for that range and lower its local reputation score, so multi-source fetch hardens the network against bad sources rather than merely tolerating them.
 - No new node-side abuse surface: a source sees a bounded paid stream identical to today's, so the existing seed-leech caps and deposit guard ([ADR 037](037-regional-proxy-warming.md#seed-leech-caps)) apply unchanged.
 
 ### Negative
@@ -114,7 +114,7 @@ Concrete defaults are modeled before locking. The load-bearing commitments are t
 ## Acceptance Criteria
 
 1. For a blob above `multi_source_min_bytes` with at least two admissible holders, the client fetches it as bao-aligned work units assigned dynamically across up to `max_sources` full holders; below the gate it uses single-source delivery unchanged.
-2. Each work unit is verified against the content-hash root on receipt; a unit failing verification is re-queued to a different source, and the failing source is penalized in reputation and recorded as slashing-evidence eligible.
+2. Each work unit is verified against the content-hash root on receipt; a unit failing verification receives no voucher, is re-queued to a different source, and lowers the failing source's local reputation score. No slashing evidence is produced.
 3. A source that stalls past `unit_deadline_ms`, drops, or returns `ok: false` has only its outstanding unit re-dispatched; verified units already stored are not refetched and the download does not restart.
 4. Each source is driven by an ordinary `cdn/client/v1` stream and paid over its own channel for verified delivered bytes only; no end-offset field is added to `StreamRequest`, and bounded ranges are enforced by ceasing vouchers at the unit boundary.
 5. Concurrency is bounded by `per_source_inflight` and `max_inflight_units`, the admitted source set is bounded by `max_sources`, and no unit is outstanding at more than one source at a time.

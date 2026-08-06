@@ -162,7 +162,7 @@ A dispute that raises the settlement amount (e.g., 50 → 80 payment-token units
 
 The governance token (TOKEN) is not used for delivery payments. It is reserved for operator capacity bonding (see [ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve)) and governance (see [ADR 009](009-governance.md#adr-009-governance-model)).
 
-**Rate setting is entirely up to each node.** Nodes advertise their `rate_per_mb` in probe responses and stream responses; the requester sees the rate before committing a voucher. There is no protocol-enforced rate beyond a governance-set floor and ceiling. This creates a market with natural arbitrage dynamics:
+**Rate setting is entirely up to each node.** Nodes advertise their `rate_per_mb` in probe responses and stream responses; the requester sees the rate before committing a voucher. The governance-set delivery-rate floor is the only rate bound the protocol enforces. There is no governance ceiling. A requester that finds a rate too expensive refuses the response as local policy ([ADR 005 § Requester-side validation](005-protocol.md#requester-side-validation-optional)), and the wire constant `MAX_RATE_PER_MB` bounds the field from above. This creates a market with natural arbitrage dynamics:
 
 - Origin-backed nodes set a higher rate because they bear backend costs (storage + egress from their hidden backing store). They are the effective price ceiling for any blob they hold.
 - A cache-only node that pays an origin-backed node to pull a blob can then serve that blob to many clients at a markup, recouping the origin cost across multiple deliveries.

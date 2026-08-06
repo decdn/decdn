@@ -201,6 +201,8 @@ S1 and S2 leave essentially all TOKEN liquid; operators bond TOKEN purchased on 
 | Protocol treasury | 10% | Same-tx to Timelock-custodied wallet |
 | **Total** | **100%** | |
 
+**The table above is the activated steady-state target; launch is dormant.** The genesis deploy ships the buyback bucket switched off: `FeeRouter.buybackBurner == address(0)` and the split is `[9000, 0, 1000]` — 90% operator / 0% buyback / 10% treasury. The 30% buyback share is routed to operators for as long as the bucket stays dormant, and treasury holds its 10% target throughout. Governance activates the bucket with one `setSharesAndDestinations([6000, 3000, 1000], …)` call through the 48-hour Timelock, which moves the split to the target above; the activation criteria are in [ADR 018 § Activation Criteria (Production)](018-liquidity-strategy.md#activation-criteria-production). The deploy script also carries an off-by-default option that runs the same activation bundle at genesis ([ADR 018 § Deploy-time genesis activation](018-liquidity-strategy.md#deploy-time-genesis-activation), [ADR 016 § Tunable Economics](016-contract-interactions.md#tunable-economics)). Every other statement of the split in this ADR refers to the activated target.
+
 **Same-transaction guarantees.** All three buckets transfer in the settlement transaction. There are no epoch buckets, no pull-based claims, no claim windows. `FeeRouter.routeSettlement` does its full work in one tx, recovering the [ADR 003 § FeeRouter Integration](003-payments.md#feerouter-integration) one-tx invariant for every bucket. Per-epoch byte counters do not drive bucket payouts; they are read by `DecdnGovernor` as the served-bytes voting-weight source per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight).
 
 **No standing safety/insurance bucket.** A dedicated 5% safety/insurance reserve was removed (the `SafetyReserve` contract is retired — `ADR 033`). Its only load-bearing job — slash restitution — is now handled by escrow-on-slash (see [§ Slashing and burn](#slashing-and-burn)) without a standing pool. The freed 5% folds into buyback-and-burn (25%→30%). User-facing incident recourse for downtime or bad-data delivery is **not** a protocol contract surface — see [§ Incident recourse](#incident-recourse-no-standing-reserve).
@@ -209,7 +211,7 @@ S1 and S2 leave essentially all TOKEN liquid; operators bond TOKEN purchased on 
 
 **Gross client rate.** $0.01/GB — at parity with Bunny.net's budget tier and 7–20× cheaper than major traditional CDNs. No deCDN-specific premium. The router's 40% non-base skim is absorbed by operator net revenue, recovered through TOKEN-economy exposure (capacity-growth lock demand, deflationary burn) and externally-funded pre-seed USDC subsidies.
 
-**Operator-aligned share = 90%.** 60% direct + 30% burn. The burn raises TOKEN's mechanical demand and benefits every bond-holder uniformly.
+**Operator-aligned share = 90% at the activated target.** 60% direct + 30% burn — a different 90% from the dormant launch's 90% operator base share above. The burn raises TOKEN's mechanical demand and benefits every bond-holder uniformly.
 
 **Value accrual mechanism.** Two prongs:
 
@@ -370,7 +372,7 @@ Router shares and capacity-curve parameters are governable, gated by 48-hour tim
 | Parameter | Default | Min | Max |
 |---|---:|---:|---:|
 | Operator base share | 60% | 40% | 90% |
-| Burn share | 30% | 5% | 50% |
+| Burn share | 30% (0% while dormant) | 5% when active | 50% |
 | Treasury share | 10% | 0% | 30% |
 | α (capacity-curve exponent) | 1.2 | 1.0 | 1.8 |
 | k (capacity-curve constant, TOKEN) | 12.6 | bounded by 1G bond ∈ [10K, 200K] | — |
@@ -381,7 +383,7 @@ Router shares and capacity-curve parameters are governable, gated by 48-hour tim
 | `windowEpochs` (served-bytes voting window, on `FeeRouter`) | 13 | 4 | 26 |
 | Unbonding window | 14 days | 7 days | 60 days |
 
-The 40% floor on the operator base share preserves the cashflow invariant — operators always receive enough liquid USDC to cover infrastructure costs even under extreme governance proposals. The 5% floor on burn and 0% floor on treasury let governance simplify the launch configuration without dropping deflationary pressure entirely.
+The 40% floor on the operator base share preserves the cashflow invariant — operators always receive enough liquid USDC to cover infrastructure costs even under extreme governance proposals. The 0% floor on treasury lets governance simplify the split without dropping operator-aligned cashflow. The burn floor binds only while the burn bucket is active. `FeeRouter` accepts a zero burn share — this is the dormant launch configuration in [§ FeeRouter split](#feerouter-split) — and rejects any non-zero share below 5%. The burn bucket is therefore either off or at 5% or more; no configuration leaves it nominally on at a negligible share.
 
 #### Setter contract-level bound enforcement
 
