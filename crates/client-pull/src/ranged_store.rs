@@ -132,13 +132,17 @@ fn sidecar_paths(dir: &Path, stem: &str) -> (PathBuf, PathBuf, PathBuf) {
 }
 
 /// Persist `present` to `path` via tempfile-plus-rename (atomic on the same
-/// filesystem). This makes the record update atomic: a crash never leaves a
-/// half-written record, so the next `open` reads either the old or the new
-/// record, never a partial one.
+/// filesystem), fsync'ing the temp file's contents before the rename. This
+/// makes the record update both atomic (a crash never leaves a half-written
+/// record, so the next `open` reads either the old or the new record, never
+/// a partial one) and durable (the bytes are on disk before the rename that
+/// makes them visible, so a crash right after the rename cannot leave a
+/// torn/zero-length record).
 ///
-/// It does NOT guarantee durability of the rename itself — there is no
-/// parent-directory `fsync`, so on a non-ordered filesystem a crash can lose
-/// the most recent record update. That is the safe direction: a lost update
+/// It does NOT guarantee durability of the rename's directory entry itself —
+/// there is no parent-directory `fsync`, so on a non-ordered filesystem a
+/// crash can still lose the most recent record update (the rename never
+/// became visible at all). That remains the safe direction: a lost update
 /// only under-claims presence, and the corresponding data (already `fsync`'d
 /// before the record was written) is simply re-listed as missing and
 /// re-fetched on resume. Never an over-claim.
@@ -149,7 +153,13 @@ fn write_ranges_record(path: &Path, present: &ChunkRanges) -> io::Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
     io::Write::write_all(&mut tmp, &json)?;
-    tmp.persist(path).map_err(io::Error::other)?;
+    // Durably write the record bytes before the atomic rename: without this,
+    // a crash right after `persist`'s rename can leave a zero-length/torn
+    // `.ranges` file on a non-ordered filesystem, which then hard-fails JSON
+    // parsing in `read_ranges_record` on the next `open`.
+    tmp.as_file().sync_all()?;
+    tmp.persist(path)
+        .map_err(|e| io::Error::new(e.error.kind(), e.error))?;
     Ok(())
 }
 
@@ -263,6 +273,23 @@ impl ClientRangedStore {
             // sidecar cleanup): the final file is the complete, verified
             // blob. Best-effort clean up any leftover sidecars and
             // reconstruct a complete store without re-hashing.
+
+            // Cheap sanity check before trusting completeness: a truncated
+            // final file (or a wrong caller-supplied `total_bytes`) must not
+            // silently claim completeness, since `is_complete()`/
+            // `missing_ranges()` would then lie and `read()` would fail
+            // later instead. This is a length check only, not a re-hash —
+            // the one verify pass already happened at `finalize`.
+            let len = std::fs::metadata(&final_path)?.len();
+            if len != total_bytes {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "finalized blob {stem}: file length {len} != expected total_bytes {total_bytes}"
+                    ),
+                ));
+            }
+
             let _ = std::fs::remove_file(&obao_path);
             let _ = std::fs::remove_file(&ranges_path);
 
@@ -481,6 +508,27 @@ impl RangedStore for ClientRangedStore {
 
     fn finalize(&self) -> RangedFuture<'_, ()> {
         Box::pin(async move {
+            // Already finalized — e.g. this store was reconstructed by
+            // `open()` from the promoted final file, whose sidecars (incl.
+            // the `.obao4` the sweep below needs) are gone. Match the same
+            // ".partial"-suffix check the promote branch uses below: no
+            // `.partial` suffix on the current data path means there is
+            // nothing left to sweep or promote.
+            let current = {
+                let guard = self
+                    .data_path
+                    .lock()
+                    .map_err(|_| lock_poisoned("data_path"))?;
+                guard.clone()
+            };
+            let is_partial = current
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with(".partial"));
+            if !is_partial {
+                return Ok(());
+            }
+
             // Fast path: the record doesn't even claim completeness, so
             // there is nothing to promote and no point paying for a sweep.
             if !self.is_complete().await? {
@@ -1018,5 +1066,66 @@ mod tests {
             !ranges_path.exists(),
             "leftover ranges sidecar must be cleaned up"
         );
+    }
+
+    #[tokio::test]
+    async fn finalize_is_idempotent_on_reopened_finalized_store() {
+        let total = 2 * GROUP + 123;
+        let (root, plaintext, outboard) = synth_blob(usize::try_from(total).expect("fits"));
+        let dir = tmp_dir();
+        let store = ClientRangedStore::create(dir.path(), "blob", root, total).expect("create");
+
+        let aligned = decdn_bao_range::align_range(0, 0, total).expect("align whole blob");
+        let bao_bytes = bao_for(root, &plaintext, outboard, &aligned);
+        store.admit(aligned, bao_bytes).await.expect("admit all");
+        store.finalize().await.expect("finalize promotes");
+        drop(store);
+
+        let reopened =
+            ClientRangedStore::open(dir.path(), "blob", root, total).expect("open finalized");
+
+        // The `.obao4` sidecar `finalize`'s sweep would need is gone (open()
+        // deleted it); a second `finalize` must not try to open it and must
+        // instead be a no-op.
+        reopened
+            .finalize()
+            .await
+            .expect("finalize on already-finalized store is a no-op Ok");
+
+        let got = reopened.read(0, total).await.expect("read still works");
+        assert_eq!(got.as_ref(), plaintext.as_slice());
+    }
+
+    #[tokio::test]
+    async fn open_rejects_final_file_with_wrong_length() {
+        let total = 2 * GROUP + 123;
+        let (root, plaintext, outboard) = synth_blob(usize::try_from(total).expect("fits"));
+        let dir = tmp_dir();
+        let store = ClientRangedStore::create(dir.path(), "blob", root, total).expect("create");
+
+        let aligned = decdn_bao_range::align_range(0, 0, total).expect("align whole blob");
+        let bao_bytes = bao_for(root, &plaintext, outboard, &aligned);
+        store.admit(aligned, bao_bytes).await.expect("admit all");
+        store.finalize().await.expect("finalize promotes");
+        drop(store);
+
+        // Truncate the promoted final file so its length no longer matches
+        // the caller-supplied `total_bytes`.
+        let final_path = dir.path().join("blob");
+        let truncated_len = final_path
+            .metadata()
+            .expect("metadata")
+            .len()
+            .saturating_sub(1);
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&final_path)
+            .expect("open final file");
+        f.set_len(truncated_len).expect("truncate");
+        drop(f);
+
+        let err = ClientRangedStore::open(dir.path(), "blob", root, total)
+            .expect_err("truncated final file must be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 }
