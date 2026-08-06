@@ -52,7 +52,7 @@ jobs:
       # used. See SECURITY.md for verification.
       - name: Import release GPG key
         if: ${{ !inputs.dry_run }}
-        uses: crazy-max/ghaction-import-gpg@v6
+        uses: crazy-max/ghaction-import-gpg@v7
         with:
           gpg_private_key: ${{ secrets.RELEASE_GPG_PRIVATE_KEY }}
           git_user_signingkey: true
@@ -327,7 +327,7 @@ jobs:
           merge-multiple: true
 
       - name: Import release GPG key
-        uses: crazy-max/ghaction-import-gpg@v6
+        uses: crazy-max/ghaction-import-gpg@v7
         with:
           gpg_private_key: ${{ secrets.RELEASE_GPG_PRIVATE_KEY }}
 
@@ -409,7 +409,7 @@ jobs:
           upload-artifact: false
 
       - name: Import release GPG key
-        uses: crazy-max/ghaction-import-gpg@v6
+        uses: crazy-max/ghaction-import-gpg@v7
         with:
           gpg_private_key: ${{ secrets.RELEASE_GPG_PRIVATE_KEY }}
 
