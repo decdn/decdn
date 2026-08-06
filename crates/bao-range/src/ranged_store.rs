@@ -1,0 +1,62 @@
+pub type RangedFuture<'a, T> =
+    core::pin::Pin<Box<dyn core::future::Future<Output = Result<T, RangedStoreError>> + Send + 'a>>;
+
+#[derive(Debug, thiserror::Error)]
+pub enum RangedStoreError {
+    #[error("range alignment: {0}")]
+    Alignment(#[from] crate::RangeVerifyError),
+    #[error("blob is incomplete: cannot finalize")]
+    Incomplete,
+    #[error("backend: {0}")]
+    Backend(#[source] Box<dyn std::error::Error + Send + Sync>),
+}
+
+/// A source-agnostic, range-aware view of ONE blob `(hash, total_bytes)`.
+/// Speaks `ChunkRanges` + byte offsets only — no hash type — so `bao-range`
+/// stays iroh-blobs-free (#578). Both the node (iroh-blobs cache) and the
+/// client (`.partial` sidecar) backends implement it and pass one shared
+/// conformance suite.
+pub trait RangedStore: Send + Sync {
+    /// Total blob length in bytes (known at construction).
+    fn total_bytes(&self) -> u64;
+    /// Chunk ranges that verify right now.
+    fn present_ranges(&self) -> RangedFuture<'_, bao_tree::ChunkRanges>;
+    /// `[byte_offset, byte_offset+byte_len)` (`byte_len == 0` ⇒ to end) minus what is present.
+    fn missing_ranges(
+        &self,
+        byte_offset: u64,
+        byte_len: u64,
+    ) -> RangedFuture<'_, bao_tree::ChunkRanges>;
+    /// Verify the interleaved `bao_bytes` for `range` against the root in
+    /// transit, write data + proof, record the range. Idempotent per range.
+    fn admit(&self, range: crate::AlignedRange, bao_bytes: bytes::Bytes) -> RangedFuture<'_, ()>;
+    /// Plaintext bytes for the held `[byte_offset, byte_offset+byte_len)` span.
+    fn read(&self, byte_offset: u64, byte_len: u64) -> RangedFuture<'_, bytes::Bytes>;
+    /// The whole blob is present.
+    fn is_complete(&self) -> RangedFuture<'_, bool>;
+    /// Whole-blob wrap-up: verify complete (+ promote/materialize on backends
+    /// that need it). Errors `Incomplete` if any range is still missing.
+    fn finalize(&self) -> RangedFuture<'_, ()>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn error_from_range_verify() {
+        // Any RangeVerifyError becomes RangedStoreError::Alignment via `?`.
+        fn coerce(e: crate::RangeVerifyError) -> RangedStoreError {
+            e.into()
+        }
+        // The trait is dyn-compatible: this type-checks only if object-safe.
+        fn _assert_dyn(_: &dyn RangedStore) {}
+        // Construct a representative RangeVerifyError to exercise the From.
+        let err = coerce(crate::RangeVerifyError::RangeOutOfBounds {
+            offset: 0,
+            len: 0,
+            blob_size: 0,
+        });
+        assert!(matches!(err, RangedStoreError::Alignment(_)));
+    }
+}

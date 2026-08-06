@@ -27,7 +27,9 @@ use bao_tree::{BaoTree, BlockSize, ChunkNum, ChunkRanges};
 use bytes::Bytes;
 use positioned_io::ReadAt;
 
+pub mod ranged_store;
 pub mod streaming;
+pub use ranged_store::{RangedFuture, RangedStore, RangedStoreError};
 
 /// `iroh-blobs`' canonical on-disk block size (16 KiB chunk groups,
 /// `from_chunk_log(4)`). Declared from the `bao-tree` primitive rather than
