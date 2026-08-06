@@ -55,7 +55,7 @@
 //! exists; its shape is not known yet, so this does NOT pre-invent a `Sink` trait
 //! (YAGNI).
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use alloy::primitives::U256;
@@ -67,8 +67,19 @@ use crate::pacer::{PaceDecision, PaceState};
 use crate::source::{BlobSource, Funder};
 use crate::{
     ChannelContext, ChannelLedger, ClientRangedStore, Cumulative, MAX_RESUME_ATTEMPTS, Pacer,
-    UpstreamPullHeader, genuine_exhaustion, resumable_watermark, resume_may_be_stale,
+    ProgressCallback, UpstreamPullHeader, genuine_exhaustion, resumable_watermark,
+    resume_may_be_stale,
 };
+
+/// Read the channel context's current deposit through the shared handle. A tiny
+/// helper so the driver never holds the lock across an `.await` — it locks,
+/// copies the `U256`, and drops the guard.
+fn locked_deposit(ctx: &Mutex<ChannelContext>) -> anyhow::Result<U256> {
+    Ok(ctx
+        .lock()
+        .map_err(|_| anyhow::anyhow!("channel context lock poisoned"))?
+        .deposit)
+}
 
 /// Bytes per [`bao_tree::ChunkNum`] — a 1 KiB bao chunk. A gap's byte span is its
 /// chunk-range boundaries scaled by this.
@@ -185,12 +196,13 @@ pub async fn drive<S, P, F>(
     source: &S,
     pacer: &P,
     funder: &F,
-    ctx: &mut ChannelContext,
+    ctx: &Arc<Mutex<ChannelContext>>,
     ledger: &Arc<ChannelLedger>,
     hash: [u8; 32],
     offset: u64,
     len: u64,
     config: &DriveConfig,
+    on_progress: Option<&ProgressCallback>,
 ) -> anyhow::Result<()>
 where
     S: BlobSource,
@@ -222,6 +234,7 @@ where
             total_bytes,
             config,
             &mut counters,
+            on_progress,
         )
         .await?;
     }
@@ -251,7 +264,7 @@ async fn fill_gap<S, P, F>(
     source: &S,
     pacer: &P,
     funder: &F,
-    ctx: &mut ChannelContext,
+    ctx: &Arc<Mutex<ChannelContext>>,
     ledger: &Arc<ChannelLedger>,
     hash: [u8; 32],
     gap_start: u64,
@@ -259,6 +272,7 @@ async fn fill_gap<S, P, F>(
     total_bytes: u64,
     config: &DriveConfig,
     counters: &mut DriveCounters,
+    on_progress: Option<&ProgressCallback>,
 ) -> anyhow::Result<()>
 where
     S: BlobSource,
@@ -281,7 +295,7 @@ where
         let cleared = gap_len.saturating_sub(missing_bytes);
 
         let committed = ledger.committed();
-        let remaining_deposit = ctx.deposit.saturating_sub(committed.amount);
+        let remaining_deposit = locked_deposit(ctx)?.saturating_sub(committed.amount);
 
         let state = PaceState {
             cleared_bytes: cleared,
@@ -316,7 +330,13 @@ where
             }
             PaceDecision::TopUp(additional) => {
                 match funder.top_up(additional).await? {
-                    DepositOutcome::Added(new_deposit) => ctx.deposit = new_deposit,
+                    DepositOutcome::Added(new_deposit) => {
+                        // Credit the new deposit through the shared handle so the
+                        // source's next open (which clones the context) sees it.
+                        ctx.lock()
+                            .map_err(|_| anyhow::anyhow!("channel context lock poisoned"))?
+                            .deposit = new_deposit;
+                    }
                     DepositOutcome::UnknownChannel => {
                         anyhow::bail!(
                             "mid-fetch top-up of {additional} landed on-chain but no local \
@@ -340,6 +360,13 @@ where
                 settle_waits = 0;
                 exhaustion_confirmed = false;
             }
+            // TODO(#1608 Phase B): honor `up_to_bytes` by capping the open to it
+            // once a sub-gap pacer (the node's `WindowPacer`, ADR 037) ships.
+            // Today `BudgetPacer` returns the full gap remainder as `up_to_bytes`,
+            // so drawing the whole still-missing sub-range below is equivalent and
+            // this is a no-op — but a window pacer will return a tighter bound
+            // that MUST clamp `sub_len`/`aligned` before the open, or the window
+            // is not actually enforced.
             PaceDecision::Draw { .. } => {
                 // Draw the first contiguous still-missing sub-range of this gap —
                 // the whole gap on first entry, a shrunk tail after a mid-gap
@@ -352,11 +379,22 @@ where
                 };
                 let aligned = align_range(sub_start, sub_len, total_bytes)?;
 
+                // Whole-blob content already present, so `ingest_stream`'s
+                // per-range progress can be offset into overall progress: the bar
+                // reports `base + received` against `total_bytes`.
+                let base_present =
+                    ranges_content_len(&(store.present_ranges().await?), total_bytes);
+                let reporter = move |received: u64| {
+                    if let Some(cb) = on_progress {
+                        cb(base_present.saturating_add(received), total_bytes);
+                    }
+                };
+
                 // One paid leg: open -> stream into the store -> drain the pull.
                 let leg: anyhow::Result<()> = match source.open(hash, aligned.clone()).await {
                     Ok((header, reader)) => {
                         counters.next_voucher_cost = voucher_cost(&header);
-                        match store.ingest_stream(&aligned, reader).await {
+                        match store.ingest_stream(&aligned, reader, Some(&reporter)).await {
                             Ok(reader) => {
                                 // Drain to stream end and recover the acked voucher
                                 // watermark. It lives in the ledger the caller owns
@@ -375,7 +413,6 @@ where
                     // shipped predicates) ---
 
                     let committed = ledger.committed();
-                    let remaining = ctx.deposit.saturating_sub(committed.amount);
 
                     // 1. A stale-resume refusal while we are waiting out a top-up:
                     //    the node's watcher has not caught up yet. Sleep and retry
@@ -390,28 +427,43 @@ where
                     }
                     awaiting_settle = false;
 
-                    // 2. Desync heal (driver-owned, NOT a PaceDecision): an
-                    //    authenticated bundle that ADVANCES our committed watermark
-                    //    means the node holds a voucher we lost — reseed and retry.
-                    if counters.resume_attempts < MAX_RESUME_ATTEMPTS
-                        && let Some(bundle) = resumable_watermark(&err, ctx)
-                        && ledger.reseed(Cumulative::from(bundle))
-                    {
+                    // 2 & 3 both read the shared context. Neither `resumable_watermark`
+                    // nor `genuine_exhaustion` awaits, so the guard is held only
+                    // across these synchronous predicate calls (never an `.await`).
+                    let classify = {
+                        let guard = ctx
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("channel context lock poisoned"))?;
+                        let remaining = guard.deposit.saturating_sub(committed.amount);
+
+                        // 2. Desync heal (driver-owned, NOT a PaceDecision): an
+                        //    authenticated bundle that ADVANCES our committed
+                        //    watermark means the node holds a voucher we lost —
+                        //    reseed and retry.
+                        let desync = counters.resume_attempts < MAX_RESUME_ATTEMPTS
+                            && resumable_watermark(&err, &guard)
+                                .is_some_and(|bundle| ledger.reseed(Cumulative::from(bundle)));
+
+                        // 3. Genuine exhaustion (corroborated against our OWN
+                        //    ledger): let the pacer fund it on the next pass. The
+                        //    store already checkpointed the paid prefix, so the
+                        //    retry re-opens only the un-checkpointed tail.
+                        let exhausted = !desync
+                            && genuine_exhaustion(
+                                &err,
+                                &guard,
+                                committed,
+                                remaining,
+                                counters.next_voucher_cost,
+                            );
+                        (desync, exhausted)
+                    };
+
+                    if classify.0 {
                         counters.resume_attempts = counters.resume_attempts.saturating_add(1);
                         continue;
                     }
-
-                    // 3. Genuine exhaustion (corroborated against our OWN ledger):
-                    //    let the pacer fund it on the next pass. The store already
-                    //    checkpointed the paid prefix, so the retry re-opens only
-                    //    the un-checkpointed tail.
-                    if genuine_exhaustion(
-                        &err,
-                        ctx,
-                        committed,
-                        remaining,
-                        counters.next_voucher_cost,
-                    ) {
+                    if classify.1 {
                         exhaustion_confirmed = true;
                         continue;
                     }
@@ -439,7 +491,7 @@ where
     clippy::cast_possible_truncation
 )] // tests
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use alloy::primitives::{Address, B256, U256};
     use alloy::signers::local::PrivateKeySigner;
@@ -563,7 +615,7 @@ mod tests {
         assert_eq!(source.root(), root);
         let pacer = BudgetPacer::new();
         let funder = healthy_funder();
-        let mut ctx = healthy_ctx();
+        let ctx = Arc::new(Mutex::new(healthy_ctx()));
         let ledger = Arc::new(ChannelLedger::new(Cumulative::default()));
 
         drive(
@@ -571,12 +623,13 @@ mod tests {
             &source,
             &pacer,
             &funder,
-            &mut ctx,
+            &ctx,
             &ledger,
             root,
             0,
             0,
             &config(),
+            None,
         )
         .await
         .expect("drive whole blob");
@@ -642,7 +695,7 @@ mod tests {
         let source = ScriptedSource::new(plaintext.clone()).expect("source");
         let pacer = BudgetPacer::new();
         let funder = healthy_funder();
-        let mut ctx = healthy_ctx();
+        let ctx = Arc::new(Mutex::new(healthy_ctx()));
         let ledger = Arc::new(ChannelLedger::new(Cumulative::default()));
 
         drive(
@@ -650,12 +703,13 @@ mod tests {
             &source,
             &pacer,
             &funder,
-            &mut ctx,
+            &ctx,
             &ledger,
             root,
             0,
             0,
             &config(),
+            None,
         )
         .await
         .expect("drive fully-held blob");
@@ -714,7 +768,7 @@ mod tests {
 
         let pacer = BudgetPacer::new();
         let funder = healthy_funder();
-        let mut ctx = healthy_ctx();
+        let ctx = Arc::new(Mutex::new(healthy_ctx()));
         let ledger = Arc::new(ChannelLedger::new(Cumulative::default()));
 
         // Drive #1: faults mid-gap and returns the terminal stall, but checkpoints
@@ -724,12 +778,13 @@ mod tests {
             &source,
             &pacer,
             &funder,
-            &mut ctx,
+            &ctx,
             &ledger,
             root,
             0,
             0,
             &config(),
+            None,
         )
         .await
         .expect_err("the mid-gap stall surfaces as a terminal error");
@@ -748,12 +803,13 @@ mod tests {
             &source,
             &pacer,
             &funder,
-            &mut ctx,
+            &ctx,
             &ledger,
             root,
             0,
             0,
             &config(),
+            None,
         )
         .await
         .expect("resume completes the blob");
@@ -805,7 +861,7 @@ mod tests {
         let source = ScriptedSource::new(plaintext.clone()).expect("source");
         let pacer = BudgetPacer::new();
         let funder = healthy_funder();
-        let mut ctx = healthy_ctx();
+        let ctx = Arc::new(Mutex::new(healthy_ctx()));
         let ledger = Arc::new(ChannelLedger::new(Cumulative::default()));
 
         drive(
@@ -813,12 +869,13 @@ mod tests {
             &source,
             &pacer,
             &funder,
-            &mut ctx,
+            &ctx,
             &ledger,
             root,
             GROUP,
             GROUP,
             &config(),
+            None,
         )
         .await
         .expect("drive interior range");

@@ -26,7 +26,7 @@
 //! chain-handle-agnostic. The reactive-top-up budget is deployment-specific and
 //! travels on the funder ([`Funder::max_topups`] — CLI 3, node 1).
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use alloy::dyn_abi::Eip712Domain;
@@ -158,14 +158,21 @@ fn micros_now() -> u64 {
 /// [`Funder`]: reactive top-up is the driver's concern (it holds the `Funder`
 /// separately and calls it directly), not the source's.
 ///
-/// Borrows rather than owns its `endpoint`/`ctx`/`slash_domain`, mirroring
-/// exactly what [`crate::open_progressive_pull`] itself takes by reference — no
-/// clone on the hot path, and the driver (which already owns these for the
-/// whole fetch) outlives every `PeerSource::open`/`finish` call it makes.
+/// Borrows its `endpoint`/`slash_domain` (the driver, which owns these for the
+/// whole fetch, outlives every `open`/`finish` call), but holds the channel
+/// context behind a SHARED `Arc<Mutex<ChannelContext>>` rather than a `&'a`
+/// borrow. That shared handle is what resolves the #1608 borrow conflict: the
+/// driver mutates the context (crediting a mid-fetch top-up's new deposit)
+/// while this source also reads it to open each pull. A `&'a ChannelContext`
+/// borrow would freeze it for the whole fetch and forbid the driver's `&mut`;
+/// the `Arc<Mutex<..>>` lets both see one state. `open` locks it only to CLONE
+/// the context out (single-writer per fetch — the driver never opens a pull
+/// concurrently with a top-up), then drops the guard before awaiting, so no
+/// lock is ever held across an `.await`.
 pub struct PeerSource<'a> {
     endpoint: &'a Endpoint,
     target: EndpointAddr,
-    ctx: &'a ChannelContext,
+    ctx: Arc<Mutex<ChannelContext>>,
     ledger: Arc<ChannelLedger>,
     slash_domain: &'a Eip712Domain,
     expected_signer: Address,
@@ -200,7 +207,7 @@ impl<'a> PeerSource<'a> {
     pub const fn new(
         endpoint: &'a Endpoint,
         target: EndpointAddr,
-        ctx: &'a ChannelContext,
+        ctx: Arc<Mutex<ChannelContext>>,
         ledger: Arc<ChannelLedger>,
         slash_domain: &'a Eip712Domain,
         expected_signer: Address,
@@ -233,10 +240,20 @@ impl BlobSource for PeerSource<'_> {
         range: AlignedRange,
     ) -> SourceFuture<'_, (UpstreamPullHeader, Self::Reader)> {
         Box::pin(async move {
+            // Snapshot the shared context (single-writer per fetch, so this can
+            // never race a top-up), then drop the guard before the await —
+            // `open_progressive_pull` needs `&ChannelContext` for its whole call,
+            // and no std `Mutex` guard may be held across an `.await`.
+            let ctx = {
+                self.ctx
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("channel context lock poisoned"))?
+                    .clone()
+            };
             let (header, pull) = crate::open_progressive_pull(
                 self.endpoint,
                 self.target.clone(),
-                self.ctx,
+                &ctx,
                 Arc::clone(&self.ledger),
                 self.slash_domain,
                 self.expected_signer,

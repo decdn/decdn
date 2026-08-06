@@ -322,6 +322,37 @@ impl ClientRangedStore {
         })
     }
 
+    /// Reopen an existing `.partial` store for `(root, total_bytes)` if one is
+    /// on disk, otherwise [`create`](Self::create) a fresh one. The presence of
+    /// the `.partial.ranges` record is the resume signal: it is written
+    /// atomically alongside every `admit`/`ingest_stream` checkpoint, so a store
+    /// with a record is resumable and one without is not.
+    ///
+    /// Keyed on the `.ranges` record alone, NOT on the promoted final file:
+    /// once `finalize` promotes and deletes the sidecars, a re-fetch of the same
+    /// stem starts fresh (there is nothing left to resume from) — the same
+    /// behaviour the pre-#1608 CLI had, where `finalize`'s rename moved the
+    /// `.partial` away and a re-run re-downloaded. A stale non-sidecar `.partial`
+    /// (e.g. an old raw-format leftover at the same path) is discarded by
+    /// `create`'s `File::create` truncation.
+    ///
+    /// # Errors
+    ///
+    /// Any I/O failure from the chosen [`open`](Self::open) / [`create`](Self::create).
+    pub fn open_or_create(
+        dir: &Path,
+        stem: &str,
+        root: [u8; 32],
+        total_bytes: u64,
+    ) -> io::Result<Self> {
+        let (_data_path, _obao_path, ranges_path) = sidecar_paths(dir, stem);
+        if ranges_path.exists() {
+            Self::open(dir, stem, root, total_bytes)
+        } else {
+            Self::create(dir, stem, root, total_bytes)
+        }
+    }
+
     /// The content root this store verifies against.
     #[must_use]
     pub const fn root(&self) -> [u8; 32] {
@@ -394,6 +425,12 @@ impl ClientRangedStore {
     /// `BlobSource::finish` to drain the underlying pull to its stream end and
     /// recover the acked voucher watermark.
     ///
+    /// `on_progress`, when set, is called with the CONTENT bytes received so far
+    /// on THIS range (`received_end - range.fetch_start()`) after each verified
+    /// leaf lands — the byte-progress hook the CLI's delivery bar drives (the
+    /// driver offsets it by the already-present base to report whole-blob
+    /// progress). It runs in the hot receive loop, so it must not block or panic.
+    ///
     /// # Durability contract
     ///
     /// The same fsync-before-record invariant `write_ranges_record`'s
@@ -416,7 +453,12 @@ impl ClientRangedStore {
     ///   verification failure, a truncation error for a short stream.
     /// - Any I/O failure opening or writing the `.partial`/`.obao4` files, or
     ///   persisting the `.ranges` record.
-    pub async fn ingest_stream<R>(&self, range: &AlignedRange, reader: R) -> anyhow::Result<R>
+    pub async fn ingest_stream<R>(
+        &self,
+        range: &AlignedRange,
+        reader: R,
+        on_progress: Option<&(dyn Fn(u64) + Send + Sync)>,
+    ) -> anyhow::Result<R>
     where
         R: iroh_io::AsyncStreamReader + StashedFault + Send,
     {
@@ -463,6 +505,9 @@ impl ClientRangedStore {
                             .max(leaf.offset.saturating_add(
                                 u64::try_from(leaf.data.len()).unwrap_or(u64::MAX),
                             ));
+                    if let Some(cb) = on_progress {
+                        cb(received_end.saturating_sub(range.fetch_start()));
+                    }
                     if received_end.saturating_sub(checkpointed_end)
                         >= Self::INGEST_CHECKPOINT_BYTES
                     {
@@ -1321,7 +1366,7 @@ mod tests {
         let aligned = decdn_bao_range::align_range(0, 2 * GROUP, total)?;
         let bao_bytes = bao_for(root, &plaintext, outboard.clone(), &aligned);
         let body = bao_bytes.slice(8..);
-        let reader = store.ingest_stream(&aligned, body).await?;
+        let reader = store.ingest_stream(&aligned, body, None).await?;
         drop(reader);
 
         let present = store.present_ranges().await?;
@@ -1345,7 +1390,7 @@ mod tests {
         let rest_aligned = decdn_bao_range::align_range(2 * GROUP, 0, total)?;
         let rest_bao = bao_for(root, &plaintext, outboard, &rest_aligned);
         let rest_body = rest_bao.slice(8..);
-        let reader = store.ingest_stream(&rest_aligned, rest_body).await?;
+        let reader = store.ingest_stream(&rest_aligned, rest_body, None).await?;
         drop(reader);
         store.finalize().await.expect("finalize promotes");
         let final_bytes = store.read(0, total).await?;
@@ -1385,7 +1430,7 @@ mod tests {
         };
 
         let err = store
-            .ingest_stream(&aligned, reader)
+            .ingest_stream(&aligned, reader, None)
             .await
             .err()
             .ok_or_else(|| anyhow::anyhow!("mid-gap fault must surface as an error"))?;
@@ -1451,7 +1496,7 @@ mod tests {
         let body = Bytes::from(bao_bytes).slice(8..);
 
         let err = store
-            .ingest_stream(&aligned, body)
+            .ingest_stream(&aligned, body, None)
             .await
             .err()
             .ok_or_else(|| anyhow::anyhow!("corrupt payload must fail"))?;
