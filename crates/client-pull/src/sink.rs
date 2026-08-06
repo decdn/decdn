@@ -169,7 +169,14 @@ pub async fn pull_to_sink<W: Write>(
 /// The decoder can only say "the bytes stopped arriving". When the reader knows
 /// WHY — a stalled peer, a mid-stream refusal, a rejected voucher — that reason
 /// is what the caller needs in order to score the peer, so it wins.
-trait StashedFault {
+///
+/// Public because it is a supertrait of [`crate::source::BaoRangeReader`]: a
+/// [`crate::source::BlobSource`]'s reader must preserve the pull's typed faults
+/// so the gap-driven driver (#1608) surfaces them for scoring, exactly as
+/// `decode_to_sink` does here.
+pub trait StashedFault {
+    /// Take the parked typed fault, if any. Returns `None` on a source whose
+    /// bytes carry the whole story (an in-memory buffer, a scripted double).
     fn take_fault(&mut self) -> Option<anyhow::Error>;
 }
 

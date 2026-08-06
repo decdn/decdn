@@ -40,6 +40,9 @@ pub mod discovery;
 /// the `cdn/client/v1` and `cdn/probe/v1` dial paths (#935/#936).
 pub mod endpoint;
 mod ledger;
+/// The pure pacing axis (#1608): [`pacer::Pacer`] / [`pacer::BudgetPacer`] decide
+/// draw / top-up / wait / done / refuse for the gap-driven driver, with no I/O.
+pub mod pacer;
 /// Reusable `cdn/probe/v1` client.
 pub mod probe;
 /// Wallet-filled HTTP provider builder for opening/settling payment channels.
@@ -53,9 +56,18 @@ pub mod rtt_map;
 // module's own links (`ResponseDecoder`, `resume_offset`, …) would go unresolved
 // and fail the `-D warnings` doc gate.
 pub mod sink;
+/// The two sourcing axes of the gap-driven driver (#1608): [`source::BlobSource`]
+/// (raw-bao byte source for a range) and [`source::Funder`] (injected top-up
+/// seam), plus scripted test doubles.
+pub mod source;
 
 pub use ledger::{ChannelLedger, Cumulative};
+pub use pacer::{BudgetPacer, PaceDecision, PaceState, Pacer};
 pub use ranged_store::ClientRangedStore;
+pub use source::{BaoRangeReader, BlobSource, Funder};
+
+#[cfg(any(test, feature = "test-util"))]
+pub use source::{FakeFunder, ScriptedReader, ScriptedSource};
 
 use std::sync::Arc;
 use std::time::Duration;

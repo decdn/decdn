@@ -1,0 +1,418 @@
+//! The two *sourcing* axes of the gap-driven, range-minimized pull driver
+//! (#1608): [`BlobSource`] — a dumb producer of raw interleaved bao bytes for a
+//! contiguous range — and [`Funder`] — the injected channel top-up seam.
+//!
+//! # Why "dumb"
+//!
+//! A [`BlobSource`] never decodes and never verifies. It opens a pull over the
+//! raw bao encoding of one [`decdn_bao_range::AlignedRange`] and yields the wire
+//! bytes on demand; the STORE's ingest decoder (rooted at the blob hash `H`)
+//! verifies each chunk group exactly once, exactly as `sink::decode_to_sink` does
+//! today. This keeps a source — `PeerSource` (paid `cdn/client/v1`, A2) or a
+//! future `BackendSource` (origin re-encode) — free of bao logic, and matches the
+//! "admit verifies once" contract of [`decdn_bao_range::RangedStore`].
+//!
+//! The reader a source yields is a [`BaoRangeReader`]: an
+//! [`iroh_io::AsyncStreamReader`] that also preserves the pull's typed faults via
+//! [`crate::sink::StashedFault`], so a stalled or refusing peer is surfaced to the
+//! reputation layer rather than collapsed into an anonymous decode error.
+//!
+//! # The `Funder` seam
+//!
+//! There is no `trait Funder` in the pre-#1608 code: a mid-fetch top-up is the
+//! free function [`crate::buyer_channel::top_up`], called by hand in each caller
+//! (the CLI's `fetch_blob_streaming`, the node's resume loop). [`Funder`] lifts
+//! that into an injected trait so the driver and `PeerSource` stay
+//! chain-handle-agnostic. The reactive-top-up budget is deployment-specific and
+//! travels on the funder ([`Funder::max_topups`] — CLI 3, node 1).
+
+use alloy::primitives::U256;
+use decdn_bao_range::AlignedRange;
+use decdn_incentive::DepositOutcome;
+
+use crate::sink::StashedFault;
+use crate::{UpstreamPullHeader, VoucherProgress};
+
+/// A boxed, `Send` future returned by the async trait methods in this module —
+/// the same boxed-future async-trait shape [`decdn_bao_range::RangedStore`] and
+/// `cache::Origin` use, so a [`Funder`] can be held as `&dyn Funder`.
+pub type SourceFuture<'a, T> =
+    core::pin::Pin<Box<dyn core::future::Future<Output = anyhow::Result<T>> + Send + 'a>>;
+
+/// A reader over the raw interleaved bao encoding of one range.
+///
+/// The store's ingest decoder pulls bytes on demand through
+/// [`iroh_io::AsyncStreamReader`]; a typed peer fault (stall, refusal, voucher
+/// rejection) is preserved through [`StashedFault`] so it beats the decoder's
+/// generic "bytes stopped arriving". Blanket-implemented, so any reader that is
+/// both is a `BaoRangeReader` with no extra code.
+pub trait BaoRangeReader: iroh_io::AsyncStreamReader + StashedFault + Send {}
+
+impl<T> BaoRangeReader for T where T: iroh_io::AsyncStreamReader + StashedFault + Send {}
+
+/// A source of raw, unverified interleaved bao bytes for contiguous ranges of one
+/// blob. Dumb: it produces bytes (and, for paid sources, pays) — it never decodes
+/// or verifies.
+///
+/// One `BlobSource` serves one gap-driven fetch. The driver calls [`open`] once
+/// per gap (a contiguous [`AlignedRange`] from
+/// [`missing_ranges`](decdn_bao_range::RangedStore::missing_ranges)), streams the
+/// reader into the store's ingest decoder, then calls [`finish`] to drain the
+/// pull to completion and recover the acked voucher watermark to persist.
+///
+/// [`open`]: BlobSource::open
+/// [`finish`]: BlobSource::finish
+pub trait BlobSource: Send + Sync {
+    /// The reader this source yields — raw bao bytes plus preserved typed faults.
+    type Reader: BaoRangeReader;
+
+    /// Open a pull over the raw bao encoding of `range` of the blob `hash`.
+    ///
+    /// Returns the upstream [`UpstreamPullHeader`] (the committed `total_bytes`
+    /// and the quoted `rate_per_mb` / `interval_bytes` the driver prices the next
+    /// voucher from) alongside the live [`Self::Reader`]. An unpaid source reports
+    /// a zero rate/interval; `total_bytes` is always authoritative.
+    ///
+    /// # Errors
+    ///
+    /// The handshake/response faults of the underlying pull (connect/transport, a
+    /// refused or zero-rate response, an over-ceiling rate or size, a resume
+    /// offset past the blob end) — the same set `open_progressive_pull` raises.
+    fn open(
+        &self,
+        hash: [u8; 32],
+        range: AlignedRange,
+    ) -> SourceFuture<'_, (UpstreamPullHeader, Self::Reader)>;
+
+    /// Consume a fully-decoded gap's reader: drain the pull to its stream end,
+    /// enforce wire-byte completeness, and return the acked voucher watermark for
+    /// the driver to persist. An unpaid source returns
+    /// [`VoucherProgress::default`].
+    ///
+    /// # Errors
+    ///
+    /// A short delivery (fewer wire bytes than promised before the stream end) or
+    /// a transport/protocol error while draining — the faults
+    /// [`crate::UpstreamPull::finish`] raises.
+    fn finish(&self, reader: Self::Reader) -> SourceFuture<'_, VoucherProgress>;
+}
+
+/// The injected channel top-up seam. Wraps the deployment's funding path
+/// ([`crate::buyer_channel::top_up`] over the CLI's chain handle; the node's
+/// `top_up_channel` later) so the driver and [`BlobSource`] never name a contract
+/// instance.
+///
+/// A top-up is only ever attempted after a [`crate::pacer::Pacer`] returns
+/// [`crate::pacer::PaceDecision::TopUp`] — i.e. a genuine, ledger-corroborated
+/// mid-fetch exhaustion — so [`max_topups`](Funder::max_topups) is the sole bound
+/// on how many times one fetch will escrow more USDC.
+pub trait Funder: Send + Sync {
+    /// How many reactive top-ups this deployment allows for one fetch. CLI = 3
+    /// ([`crate::MAX_TOPUP_ATTEMPTS`]), node = 1. The driver copies this into the
+    /// pacer's [`PaceState::max_topups`](crate::pacer::PaceState::max_topups).
+    fn max_topups(&self) -> u32;
+
+    /// Add `additional` micro-USDC to the channel on-chain and credit the local record.
+    ///
+    /// Returns the [`DepositOutcome`] of crediting the row: `Added(new_total)` on
+    /// the clean path — the driver updates its channel deposit from it — or the
+    /// escrowed-but-untracked variants (`UnknownChannel` / `ChannelMismatch`),
+    /// which the driver treats as terminal (the USDC is on-chain but the local
+    /// record is gone; reconcile against the tx).
+    ///
+    /// # Errors
+    ///
+    /// If the on-chain `topUp` fails to submit, reverts, or its receipt is not
+    /// obtained — the funds did not move.
+    fn top_up(&self, additional: U256) -> SourceFuture<'_, DepositOutcome>;
+}
+
+// ---------------------------------------------------------------------------
+// Test doubles: a scripted BlobSource + a fake Funder for the A4 driver tests.
+// Feature-gated so a production caller cannot name them, but compiled outside
+// `cfg(test)` under `test-util`, so they must stay anti-panic clean.
+// ---------------------------------------------------------------------------
+
+#[cfg(any(test, feature = "test-util"))]
+mod doubles {
+    use std::sync::{Arc, Mutex};
+
+    use alloy::primitives::U256;
+    use bao_tree::io::outboard::PreOrderMemOutboard;
+    use bytes::Bytes;
+    use decdn_bao_range::{AlignedRange, IROH_BLOCK_SIZE, encode_verified_range};
+    use decdn_incentive::DepositOutcome;
+
+    use super::{SourceFuture, StashedFault};
+    use crate::{UpstreamPullHeader, VoucherProgress};
+
+    /// Fixed quote a [`ScriptedSource`] reports so the driver can price vouchers
+    /// deterministically in tests.
+    const SCRIPTED_RATE_PER_MB: u64 = 1;
+    const SCRIPTED_INTERVAL_BYTES: u64 = 1024 * 1024;
+
+    /// Builds a typed fault to park mid-range. Boxed so a source can be re-opened
+    /// (an `anyhow::Error` is not `Clone`, so it is regenerated per open).
+    type FaultFn = Arc<dyn Fn() -> anyhow::Error + Send + Sync>;
+
+    /// A scripted [`BlobSource`](super::BlobSource) that yields the real bao wire
+    /// for any requested range of a fixed blob, and can truncate a range's wire
+    /// and park a typed fault to simulate a mid-range peer failure.
+    #[derive(Clone)]
+    pub struct ScriptedSource {
+        root: [u8; 32],
+        blob: Bytes,
+        outboard: Bytes,
+        fault: Option<(usize, FaultFn)>,
+    }
+
+    impl std::fmt::Debug for ScriptedSource {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("ScriptedSource")
+                .field("root", &blake3::Hash::from_bytes(self.root))
+                .field("total_bytes", &self.total_bytes())
+                .field("fault_after", &self.fault.as_ref().map(|(after, _)| *after))
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl ScriptedSource {
+        /// Build a source over `blob`, computing its root and outboard once.
+        ///
+        /// # Errors
+        ///
+        /// If the blob length does not fit the bao tree math (only on absurdly
+        /// large inputs a test never uses).
+        pub fn new(blob: impl Into<Bytes>) -> anyhow::Result<Self> {
+            let blob = blob.into();
+            let ob = PreOrderMemOutboard::create(&blob, IROH_BLOCK_SIZE);
+            Ok(Self {
+                root: *ob.root.as_bytes(),
+                blob,
+                outboard: ob.data.into(),
+                fault: None,
+            })
+        }
+
+        /// The blob's BLAKE3 root — the `hash` the driver opens against.
+        #[must_use]
+        pub const fn root(&self) -> [u8; 32] {
+            self.root
+        }
+
+        /// Total blob length.
+        #[must_use]
+        pub const fn total_bytes(&self) -> u64 {
+            self.blob.len() as u64
+        }
+
+        /// After `wire_bytes` of a range's wire, truncate it and park the fault
+        /// `make` produces — the exact shape a stalled/refusing peer leaves.
+        #[must_use]
+        pub fn with_fault_after(
+            mut self,
+            wire_bytes: usize,
+            make: impl Fn() -> anyhow::Error + Send + Sync + 'static,
+        ) -> Self {
+            self.fault = Some((wire_bytes, Arc::new(make)));
+            self
+        }
+
+        /// The header-less bao wire for `range` (content plus interleaved proof,
+        /// the same bytes `UpstreamPull::next_chunk` yields).
+        fn wire_for(&self, range: &AlignedRange) -> anyhow::Result<Bytes> {
+            let s = usize::try_from(range.fetch_start())?;
+            let e = usize::try_from(range.fetch_end())?;
+            let data = self
+                .blob
+                .get(s..e)
+                .ok_or_else(|| anyhow::anyhow!("scripted range out of bounds"))?;
+            let combined = encode_verified_range(self.root, range, data, self.outboard.clone())?;
+            // Strip the 8-byte little-endian size header: the wire the pull yields
+            // is header-less (the node frames the tree itself).
+            let wire = combined
+                .get(8..)
+                .ok_or_else(|| anyhow::anyhow!("combined wire shorter than its 8-byte header"))?;
+            Ok(Bytes::copy_from_slice(wire))
+        }
+    }
+
+    impl super::BlobSource for ScriptedSource {
+        type Reader = ScriptedReader;
+
+        fn open(
+            &self,
+            hash: [u8; 32],
+            range: AlignedRange,
+        ) -> SourceFuture<'_, (UpstreamPullHeader, Self::Reader)> {
+            Box::pin(async move {
+                if hash != self.root {
+                    anyhow::bail!("scripted source opened for a foreign hash");
+                }
+                let mut wire = self.wire_for(&range)?;
+                let mut fault = None;
+                if let Some((after, make)) = &self.fault
+                    && *after < wire.len()
+                {
+                    wire = wire.slice(..*after);
+                    fault = Some(make());
+                }
+                let header = UpstreamPullHeader {
+                    total_bytes: self.total_bytes(),
+                    rate_per_mb: SCRIPTED_RATE_PER_MB,
+                    interval_bytes: SCRIPTED_INTERVAL_BYTES,
+                };
+                Ok((header, ScriptedReader { wire, fault }))
+            })
+        }
+
+        fn finish(&self, _reader: Self::Reader) -> SourceFuture<'_, VoucherProgress> {
+            // Unpaid double: no channel, nothing to drain, no watermark.
+            Box::pin(async move { Ok(VoucherProgress::default()) })
+        }
+    }
+
+    /// The reader a [`ScriptedSource`] yields: a fixed wire buffer, optionally
+    /// holding a parked typed fault. Mirrors the production `PullReader`'s two
+    /// behaviours the decode loop depends on — feed bytes, then reveal the fault.
+    #[derive(Debug)]
+    pub struct ScriptedReader {
+        wire: Bytes,
+        fault: Option<anyhow::Error>,
+    }
+
+    impl iroh_io::AsyncStreamReader for ScriptedReader {
+        async fn read_bytes(&mut self, len: usize) -> std::io::Result<Bytes> {
+            let take = self.wire.len().min(len);
+            Ok(self.wire.split_to(take))
+        }
+
+        async fn read<const L: usize>(&mut self) -> std::io::Result<[u8; L]> {
+            if self.wire.len() < L {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "scripted reader exhausted before a fixed-size bao read",
+                ));
+            }
+            let got = self.wire.split_to(L);
+            let mut out = [0u8; L];
+            out.copy_from_slice(&got);
+            Ok(out)
+        }
+    }
+
+    impl StashedFault for ScriptedReader {
+        fn take_fault(&mut self) -> Option<anyhow::Error> {
+            self.fault.take()
+        }
+    }
+
+    /// A fake [`Funder`](super::Funder): records each requested top-up amount and
+    /// returns a scripted [`DepositOutcome`], so the driver's top-up branch is
+    /// testable without a chain handle.
+    #[derive(Debug)]
+    pub struct FakeFunder {
+        max_topups: u32,
+        outcome: DepositOutcome,
+        calls: Mutex<Vec<U256>>,
+    }
+
+    impl FakeFunder {
+        /// A funder allowing `max_topups` top-ups, each returning `outcome`.
+        #[must_use]
+        pub const fn new(max_topups: u32, outcome: DepositOutcome) -> Self {
+            Self {
+                max_topups,
+                outcome,
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        /// The `additional` amounts passed to [`Funder::top_up`](super::Funder::top_up),
+        /// in call order.
+        #[must_use]
+        pub fn calls(&self) -> Vec<U256> {
+            self.calls.lock().map(|c| c.clone()).unwrap_or_default()
+        }
+    }
+
+    impl super::Funder for FakeFunder {
+        fn max_topups(&self) -> u32 {
+            self.max_topups
+        }
+
+        fn top_up(&self, additional: U256) -> SourceFuture<'_, DepositOutcome> {
+            Box::pin(async move {
+                if let Ok(mut calls) = self.calls.lock() {
+                    calls.push(additional);
+                }
+                Ok(self.outcome)
+            })
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-util"))]
+pub use doubles::{FakeFunder, ScriptedReader, ScriptedSource};
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::cast_possible_truncation)] // tests
+mod tests {
+    use super::{BlobSource, Funder};
+    use crate::sink::StashedFault;
+    use alloy::primitives::U256;
+    use decdn_bao_range::align_range;
+    use decdn_incentive::DepositOutcome;
+    use iroh_io::AsyncStreamReader;
+
+    fn blob(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i % 251) as u8).collect()
+    }
+
+    /// The scripted source yields wire that the store's decoder can verify, and
+    /// reports the blob's true `total_bytes`.
+    #[tokio::test]
+    async fn scripted_source_opens_a_verifiable_range() -> anyhow::Result<()> {
+        let data = blob(200 * 1024 + 7);
+        let source = super::ScriptedSource::new(data.clone())?;
+        let range = align_range(0, 0, data.len() as u64)?;
+        let (header, mut reader) = source.open(source.root(), range).await?;
+        assert_eq!(header.total_bytes, data.len() as u64);
+        let first = reader.read_bytes(64).await?;
+        assert!(!first.is_empty(), "a non-empty blob must yield wire bytes");
+        assert!(
+            reader.take_fault().is_none(),
+            "no fault was scripted, so none should be parked"
+        );
+        Ok(())
+    }
+
+    /// A scripted mid-range fault is parked on the reader for the decode loop to
+    /// surface, exactly as a real stalled peer would.
+    #[tokio::test]
+    async fn scripted_source_parks_a_mid_range_fault() -> anyhow::Result<()> {
+        let data = blob(200 * 1024 + 7);
+        let source = super::ScriptedSource::new(data.clone())?
+            .with_fault_after(4096, || anyhow::anyhow!("scripted stall"));
+        let range = align_range(0, 0, data.len() as u64)?;
+        let (_header, mut reader) = source.open(source.root(), range).await?;
+        // Drain the truncated wire.
+        while !reader.read_bytes(64 * 1024).await?.is_empty() {}
+        assert!(
+            reader.take_fault().is_some(),
+            "the scripted fault must be parked once the truncated wire is drained"
+        );
+        Ok(())
+    }
+
+    /// The fake funder records amounts and echoes its scripted outcome.
+    #[tokio::test]
+    async fn fake_funder_records_and_returns() -> anyhow::Result<()> {
+        let funder = super::FakeFunder::new(3, DepositOutcome::Added(U256::from(100u64)));
+        assert_eq!(funder.max_topups(), 3);
+        let out = funder.top_up(U256::from(40u64)).await?;
+        assert_eq!(out, DepositOutcome::Added(U256::from(100u64)));
+        assert_eq!(funder.calls(), vec![U256::from(40u64)]);
+        Ok(())
+    }
+}
