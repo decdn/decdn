@@ -36,6 +36,11 @@ pub mod cooperative_close;
 /// Client-side node discovery (#936): read + select the active node set from
 /// `CapacityBond.getRegisteredNodes`, then rank probed blob-holders.
 pub mod discovery;
+/// The #1608 gap-driven fetch driver: [`driver::drive`] fills only the
+/// [`missing_ranges`](decdn_bao_range::RangedStore::missing_ranges) of a request,
+/// paying the minimum, by folding the resume / top-up / settle-wait / reseed loop
+/// behind the [`pacer::Pacer`] + [`source::Funder`] axes.
+pub mod driver;
 /// One-shot client `Endpoint` construction: relay + discovery resolution for
 /// the `cdn/client/v1` and `cdn/probe/v1` dial paths (#935/#936).
 pub mod endpoint;
@@ -61,6 +66,7 @@ pub mod sink;
 /// seam), plus scripted test doubles.
 pub mod source;
 
+pub use driver::drive;
 pub use ledger::{ChannelLedger, Cumulative};
 pub use pacer::{BudgetPacer, PaceDecision, PaceState, Pacer};
 pub use ranged_store::ClientRangedStore;
@@ -1711,6 +1717,40 @@ pub fn genuine_exhaustion(
     // Validate the node's claim against our OWN accounting: only genuine if we truly cannot
     // cover the next voucher. Otherwise the node is lying/buggy and we refuse to fund it.
     remaining_spendable < next_voucher_cost
+}
+
+/// Whether a failed open/resume is consistent with the resume offset being wrong
+/// — i.e. the upstream refused it as a range past the end, or with the ambiguous
+/// `NotFound` its range gate collapses `byte_offset >= total_bytes` into.
+///
+/// This is the shared predicate the CLI's streaming fetch loop and the #1608
+/// gap-driven [`driver::drive`] both key their post-top-up settle-wait on: right
+/// after an on-chain `topUp`, the serving node's chain watcher may not yet have
+/// observed the new deposit, so its pre-serve deposit gate (#1518) refuses the
+/// resumed open with exactly this shape. Retrying the OPEN is money-safe (no
+/// vouchers are sent and the offset is unchanged), so the caller waits briefly
+/// for the watcher rather than treating it as terminal.
+///
+/// Two signals qualify, and the second is unavoidably ambiguous:
+///
+/// - [`ResumeOffsetPastEnd`] — the node signed a response whose `total_bytes` is
+///   at or below our offset. Unambiguous, but only reachable against a
+///   non-conforming server.
+/// - `NotFound` — what an honest node actually sends. Its range gate refuses
+///   `byte_offset >= total_bytes` *before* signing, and that deliberately
+///   collapses to `NotFound` on the wire alongside a cache miss and an unknown
+///   channel (`ServeRejectReason::wire_error`), so the client cannot separate
+///   "your offset is past the end" from "I don't have this blob".
+///
+/// Everything else — stalls, resets, hash mismatches, local flush failures — must
+/// NOT qualify. Those say nothing about the offset.
+#[must_use]
+pub fn resume_may_be_stale(err: &anyhow::Error) -> bool {
+    if err.downcast_ref::<ResumeOffsetPastEnd>().is_some() {
+        return true;
+    }
+    err.downcast_ref::<UpstreamRefused>()
+        .is_some_and(|refused| matches!(refused.error(), StreamError::NotFound))
 }
 
 #[allow(clippy::too_many_arguments)]

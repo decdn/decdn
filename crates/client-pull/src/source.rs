@@ -296,6 +296,13 @@ mod doubles {
         blob: Bytes,
         outboard: Bytes,
         fault: Option<(usize, FaultFn)>,
+        /// Every range this source was `open`ed for, in call order, as
+        /// `(fetch_start, fetch_len)`. Shared behind an `Arc<Mutex<..>>` so a
+        /// clone handed to the driver records into the same log the test
+        /// inspects — the ledger the #1608 money assertion reads to prove the
+        /// driver pulled ONLY the gaps of `missing_ranges` and never a held
+        /// range.
+        opened: Arc<Mutex<Vec<(u64, u64)>>>,
     }
 
     impl std::fmt::Debug for ScriptedSource {
@@ -304,6 +311,7 @@ mod doubles {
                 .field("root", &blake3::Hash::from_bytes(self.root))
                 .field("total_bytes", &self.total_bytes())
                 .field("fault_after", &self.fault.as_ref().map(|(after, _)| *after))
+                .field("opened_ranges", &self.opened_ranges())
                 .finish_non_exhaustive()
         }
     }
@@ -323,6 +331,7 @@ mod doubles {
                 blob,
                 outboard: ob.data.into(),
                 fault: None,
+                opened: Arc::new(Mutex::new(Vec::new())),
             })
         }
 
@@ -336,6 +345,25 @@ mod doubles {
         #[must_use]
         pub const fn total_bytes(&self) -> u64 {
             self.blob.len() as u64
+        }
+
+        /// Every range `open` was called for, in call order, as
+        /// `(fetch_start, fetch_len)`. The #1608 money assertion checks this
+        /// equals exactly the contiguous gaps of `missing_ranges` — no held
+        /// range is ever opened, so no held byte is ever re-pulled or re-paid.
+        #[must_use]
+        pub fn opened_ranges(&self) -> Vec<(u64, u64)> {
+            self.opened.lock().map(|o| o.clone()).unwrap_or_default()
+        }
+
+        /// Total content bytes opened across every `open` call (the sum of each
+        /// opened range's `fetch_len`). Equals the gap bytes, NOT the whole blob,
+        /// when the driver skips held ranges.
+        #[must_use]
+        pub fn opened_bytes(&self) -> u64 {
+            self.opened
+                .lock()
+                .map_or(0, |o| o.iter().map(|(_, len)| *len).sum())
         }
 
         /// After `wire_bytes` of a range's wire, truncate it and park the fault
@@ -380,6 +408,9 @@ mod doubles {
             Box::pin(async move {
                 if hash != self.root {
                     anyhow::bail!("scripted source opened for a foreign hash");
+                }
+                if let Ok(mut log) = self.opened.lock() {
+                    log.push((range.fetch_start(), range.fetch_len()));
                 }
                 let mut wire = self.wire_for(&range)?;
                 let mut fault = None;
