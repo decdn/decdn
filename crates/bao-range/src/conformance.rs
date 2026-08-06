@@ -164,6 +164,31 @@ async fn case_admit_prefix<F: ConformanceFactory>(fx: &Fixture, factory: &F) {
         .get(0..to_usize(fx.k))
         .expect("plaintext prefix");
     assert_eq!(got.as_ref(), want, "prefix round-trip");
+
+    // Non-group-aligned sub-span strictly inside the first present group:
+    // read(7, k - 14) starts and ends mid-group but stays within [0, k).
+    // `read` must trim to EXACTLY this span, not return an aligned superset
+    // (e.g. the whole group), so a backend cannot pass by over-fetching.
+    let trim_offset = 7u64;
+    let trim_len = fx.k - 2 * trim_offset;
+    let got_trim = store
+        .read(trim_offset, trim_len)
+        .await
+        .expect("read non-aligned trim");
+    let want_trim = fx
+        .plaintext
+        .get(to_usize(trim_offset)..to_usize(trim_offset + trim_len))
+        .expect("plaintext trim span");
+    assert_eq!(
+        got_trim.as_ref(),
+        want_trim,
+        "byte-exact trim: read must return exactly [offset, offset+len), no group padding"
+    );
+    assert_eq!(
+        got_trim.len(),
+        to_usize(trim_len),
+        "byte-exact trim: returned length must match requested len exactly"
+    );
 }
 
 /// Admit the interior group `[k, l)`: both the prefix and suffix remain

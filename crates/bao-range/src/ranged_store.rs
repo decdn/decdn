@@ -31,6 +31,9 @@ pub trait RangedStore: Send + Sync {
     /// transit, write data + proof, record the range. Idempotent per range.
     fn admit(&self, range: crate::AlignedRange, bao_bytes: bytes::Bytes) -> RangedFuture<'_, ()>;
     /// Plaintext bytes for the held `[byte_offset, byte_offset+byte_len)` span.
+    /// The returned span is collected into `Bytes`, so callers (e.g. a
+    /// future gap-driven driver) should request gap-sized spans rather than
+    /// whole blobs to stay O(gap) in memory.
     fn read(&self, byte_offset: u64, byte_len: u64) -> RangedFuture<'_, bytes::Bytes>;
     /// The whole blob is present.
     fn is_complete(&self) -> RangedFuture<'_, bool>;
