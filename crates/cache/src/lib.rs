@@ -24,6 +24,7 @@ pub mod origin;
 pub mod origin_probe;
 pub mod probe_hold;
 pub mod range_pull;
+pub mod ranged_store;
 pub mod retry;
 
 pub use circuit_breaker::{
@@ -58,6 +59,7 @@ pub use origin::{
 pub use probe_hold::{
     PROBE_HOLD_DURATION, PROBE_HOLD_MARGIN, PROBE_SLASH_WINDOW, ProbeHoldOutcome,
 };
+pub use ranged_store::NodeRangedStore;
 
 // Config-vocabulary types live in the `decdn-config-types` leaf crate
 // (no iroh-blobs / no AWS SDK) so the publisher CLI doesn't link the
