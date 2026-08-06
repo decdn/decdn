@@ -35,6 +35,34 @@ git verify-commit v0.1.0^{commit}
 `decdn <security@decdn.org>` matching the fingerprint above. A missing or bad
 signature means the tag was not produced by the project — do not trust it.
 
-> Binary archives and the GHCR container image are not yet individually signed;
-> that is tracked as a follow-up. For now, verify the signed tag and build/pull
-> from that verified revision.
+### Verify a binary archive
+
+Every release archive ships with a detached `.asc` signature, plus a signed
+`SHA256SUMS` covering all archives:
+
+```bash
+# Verify one archive directly
+gpg --verify decdn-0.1.0-x86_64-unknown-linux-gnu.tar.gz.asc \
+             decdn-0.1.0-x86_64-unknown-linux-gnu.tar.gz
+
+# Or verify the checksum manifest, then check the file against it
+gpg --verify SHA256SUMS.asc SHA256SUMS
+sha256sum --ignore-missing --check SHA256SUMS
+```
+
+### Verify the container image
+
+GPG has no native OCI-image signature, so the release publishes the pinned
+image digest and a detached signature over it. Confirm the signature, then pull
+by that exact digest:
+
+```bash
+gpg --verify image-digest.txt.asc image-digest.txt
+docker pull "$(cat image-digest.txt)"
+```
+
+The SBOM (`decdn-<version>-sbom.spdx.json`) ships with a matching `.asc`.
+
+> Container-image signing here is a GPG-over-digest attestation. A future
+> release will add in-registry signatures (cosign); this section will change
+> when that lands.

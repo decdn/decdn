@@ -287,6 +287,26 @@ jobs:
           path: artifacts
           merge-multiple: true
 
+      - name: Import release GPG key
+        uses: crazy-max/ghaction-import-gpg@v6
+        with:
+          gpg_private_key: ${{ secrets.RELEASE_GPG_PRIVATE_KEY }}
+
+      # A signed SHA256SUMS covers all archives at once; per-archive detached
+      # .asc signatures let a downloader verify a single file without the
+      # manifest. Both are signed by the decdn.org release key.
+      - name: Sign binaries and checksums
+        working-directory: artifacts
+        run: |
+          shopt -s nullglob
+          sha256sum ./*.tar.gz ./*.zip > SHA256SUMS
+          for f in ./*.tar.gz ./*.zip; do
+            gpg --batch --yes --pinentry-mode loopback \
+              --local-user security@decdn.org --armor --detach-sign "$f"
+          done
+          gpg --batch --yes --pinentry-mode loopback \
+            --local-user security@decdn.org --armor --detach-sign SHA256SUMS
+
       - name: Upload to GitHub Release
         run: gh release upload "$TAG" artifacts/*
         env:
@@ -349,9 +369,37 @@ jobs:
           upload-release-assets: false
           upload-artifact: false
 
-      - name: Upload SBOM to release
+      - name: Import release GPG key
+        uses: crazy-max/ghaction-import-gpg@v6
+        with:
+          gpg_private_key: ${{ secrets.RELEASE_GPG_PRIVATE_KEY }}
+
+      # GPG has no native OCI-image signature format, so we sign the pinned
+      # image digest out of band: image-digest.txt records the exact
+      # ghcr.io/...@sha256:... reference, and its detached .asc lets a puller
+      # confirm the digest came from the decdn.org key. cosign will later
+      # replace this with an in-registry signature.
+      - name: Sign SBOM and image digest
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          echo "${IMAGE}@${DIGEST}" > image-digest.txt
+          gpg --batch --yes --pinentry-mode loopback \
+            --local-user security@decdn.org --armor --detach-sign image-digest.txt
+          gpg --batch --yes --pinentry-mode loopback \
+            --local-user security@decdn.org --armor \
+            --detach-sign "decdn-${VERSION}-sbom.spdx.json"
+
+      - name: Upload SBOM and signatures to release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.release.outputs.tag }}
           VERSION: ${{ needs.release.outputs.version }}
-        run: gh release upload "$TAG" "decdn-${VERSION}-sbom.spdx.json"
+        run: |
+          gh release upload "$TAG" \
+            "decdn-${VERSION}-sbom.spdx.json" \
+            "decdn-${VERSION}-sbom.spdx.json.asc" \
+            image-digest.txt \
+            image-digest.txt.asc
