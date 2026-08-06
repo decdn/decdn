@@ -353,6 +353,66 @@ impl ClientRangedStore {
         }
     }
 
+    /// Seed the on-disk state a *checkpointed* interrupted download leaves for
+    /// the first `prefix_len` bytes (rounded UP to a chunk-group boundary) of
+    /// `blob`: the positioned `.partial` prefix, the whole-blob `.obao4`
+    /// pre-order outboard, and a `.ranges` record covering the prefix. A
+    /// subsequent [`open`](Self::open) / [`open_or_create`](Self::open_or_create)
+    /// resumes from it, so a fetch skips the recorded prefix and pulls only the
+    /// suffix. `stem` = the output file name (e.g. `"blob.bin"`), so the sidecars
+    /// sit beside `dir/<stem>` exactly where a fetch opens them.
+    ///
+    /// `prefix_len == blob.len() as u64` seeds a COMPLETE checkpointed partial:
+    /// the record claims the whole blob, so a resume pulls nothing and
+    /// [`finalize`](RangedStore::finalize) promotes for free.
+    ///
+    /// The whole `PreOrderMemOutboard::create` output is written to `.obao4`
+    /// even for a short prefix. Presence is gated by the `.ranges` record, and
+    /// `finalize`'s `valid_ranges` sweep only validates groups whose data is
+    /// present, so the extra suffix proof pairs are harmless — they are exactly
+    /// what a real resumed fetch's outboard would already hold once the suffix
+    /// arrives.
+    ///
+    /// Test/fixture seam only (`#[cfg(any(test, feature = "test-util"))]`): it
+    /// writes files directly without going through the verifying `admit` path,
+    /// which is precisely what makes it a faithful stand-in for "a prior process
+    /// left this checkpoint on disk".
+    ///
+    /// # Errors
+    ///
+    /// Any I/O failure writing the data / outboard / ranges sidecars, or an
+    /// alignment failure (`prefix_len` past the blob end).
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn seed_checkpointed_prefix(
+        dir: &Path,
+        stem: &str,
+        blob: &[u8],
+        prefix_len: u64,
+    ) -> io::Result<()> {
+        let total_bytes = u64::try_from(blob.len())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        let (data_path, obao_path, ranges_path) = sidecar_paths(dir, stem);
+
+        // Whole-blob pre-order outboard (exactly `BaoTree::outboard_size()` long,
+        // the same length `create` zero-fills to).
+        let ob = bao_tree::io::outboard::PreOrderMemOutboard::create(blob, IROH_BLOCK_SIZE);
+        std::fs::write(&obao_path, &ob.data)?;
+
+        // The chunk-group-aligned prefix `[0, prefix_len)`: its positioned data
+        // (a plain write, since it starts at offset 0) and its present record.
+        let aligned = decdn_bao_range::align_range(0, prefix_len, total_bytes)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        let end = usize::try_from(aligned.fetch_end())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        let prefix = blob.get(..end).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "aligned prefix end past blob")
+        })?;
+        std::fs::write(&data_path, prefix)?;
+
+        write_ranges_record(&ranges_path, aligned.chunk_ranges())?;
+        Ok(())
+    }
+
     /// The content root this store verifies against.
     #[must_use]
     pub const fn root(&self) -> [u8; 32] {
@@ -1349,6 +1409,76 @@ mod tests {
         let err = ClientRangedStore::open(dir.path(), "blob", root, total)
             .expect_err("truncated final file must be rejected");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    // --- seed_checkpointed_prefix (test-util fixture seam) ---
+
+    #[tokio::test]
+    async fn seed_prefix_resumes_from_the_recorded_prefix() {
+        let total = 3 * GROUP + 123;
+        let (root, plaintext, _outboard) = synth_blob(usize::try_from(total).expect("fits"));
+        let dir = tmp_dir();
+        let seeded = 2 * GROUP;
+
+        ClientRangedStore::seed_checkpointed_prefix(dir.path(), "blob", &plaintext, seeded)
+            .expect("seed prefix");
+        let store = ClientRangedStore::open(dir.path(), "blob", root, total).expect("open seeded");
+
+        // Present is exactly the aligned recorded prefix; the suffix is missing.
+        let aligned = decdn_bao_range::align_range(0, seeded, total).expect("align prefix");
+        let present = store.present_ranges().await.expect("present_ranges");
+        assert_eq!(&present, aligned.chunk_ranges());
+
+        let full = decdn_bao_range::align_range(0, 0, total).expect("align whole");
+        let expected_missing = full.chunk_ranges().clone() - aligned.chunk_ranges();
+        let missing = store.missing_ranges(0, 0).await.expect("missing_ranges");
+        assert_eq!(missing, expected_missing);
+        assert!(!store.is_complete().await.expect("is_complete"));
+
+        // The recorded prefix is byte-exact readable off the `.partial`.
+        let got = store.read(0, seeded).await.expect("read prefix");
+        assert_eq!(
+            got.as_ref(),
+            plaintext
+                .get(..usize::try_from(seeded).expect("fits"))
+                .expect("slice")
+        );
+    }
+
+    #[tokio::test]
+    async fn seed_complete_prefix_is_complete_and_finalizes() {
+        // An exact-multiple-of-group blob seeded COMPLETE (journey-5 shape): the
+        // record claims the whole blob, so the store is complete on open and
+        // `finalize` promotes with no further pulls.
+        let total = 4 * GROUP;
+        let (root, plaintext, _outboard) = synth_blob(usize::try_from(total).expect("fits"));
+        let dir = tmp_dir();
+
+        ClientRangedStore::seed_checkpointed_prefix(dir.path(), "blob", &plaintext, total)
+            .expect("seed complete");
+        let store = ClientRangedStore::open(dir.path(), "blob", root, total).expect("open seeded");
+
+        assert!(
+            store.is_complete().await.expect("is_complete"),
+            "a complete seed must open complete"
+        );
+        assert!(
+            store
+                .missing_ranges(0, 0)
+                .await
+                .expect("missing_ranges")
+                .is_empty()
+        );
+
+        // The seeded outboard verifies the whole blob, so `finalize` promotes.
+        store
+            .finalize()
+            .await
+            .expect("finalize promotes seeded blob");
+        let final_path = store.data_path.lock().expect("lock").clone();
+        assert!(!final_path.to_string_lossy().ends_with(".partial"));
+        let on_disk = std::fs::read(&final_path).expect("read promoted blob");
+        assert_eq!(on_disk, plaintext);
     }
 
     // --- ingest_stream ---
