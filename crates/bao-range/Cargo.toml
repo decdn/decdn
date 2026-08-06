@@ -12,5 +12,12 @@ bytes = { workspace = true }
 positioned-io = { workspace = true }
 thiserror = { workspace = true }
 
+[features]
+# Exposes the shared `RangedStore` conformance suite (`conformance::run_all`)
+# for downstream test suites. Gated behind a feature rather than `#[cfg(test)]`
+# because a cross-crate `cfg(test)` does not reach a dependency's test builds;
+# enabled by downstream crates via `dev-dependencies`.
+test-util = []
+
 [lints]
 workspace = true
