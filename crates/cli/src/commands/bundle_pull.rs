@@ -600,7 +600,7 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
     }
 
     /// Fetch one blob after normal explicit selection or discovery, streaming it
-    /// into `staging` (#1497: the same [`fetch::fetch_blob_streaming`] loop
+    /// into `staging` (#1497: the same [`fetch::drive_fetch`] gap-driven core
     /// `decdn fetch` uses, so bundle pull gets reactive top-up too).
     async fn fetch_to_staging(&self, hash: [u8; 32], staging: &Path) -> anyhow::Result<()> {
         let target = self.pick(hash).await?;
@@ -620,11 +620,11 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         let lock = self.provider_lock(provider);
         let _guard = lock.lock().await;
 
-        // `mut`: `fetch_blob_streaming` takes `&mut ChannelContext` — a genuine
-        // mid-fetch `InsufficientDeposit` mutates `ctx.deposit` after an on-chain
-        // top-up (#1497). This binding is owned and local to one entry's fetch,
-        // so there is nothing else that could be holding a conflicting borrow.
-        let mut ctx = match self.payment {
+        // Owned and local to one entry's fetch: `drive_fetch` takes `ctx` by
+        // value (it wraps it in `Arc<Mutex>` so its source and driver can share a
+        // mid-fetch top-up's new deposit, #1608 A5), so this binding just supplies
+        // it once and moves it in below.
+        let ctx = match self.payment {
             Payment::AutoOpen => {
                 // Only an actual channel *open* touches the shared USDC allowance, so
                 // only opens take the global `open_lock`. A live-channel reuse issues no
@@ -700,50 +700,58 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         }
 
         let max_blob_bytes = self.common.max_blob_mb.saturating_mul(1024 * 1024);
-        let streamed = fetch::fetch_blob_streaming(
-            self.endpoint,
-            target,
-            &mut ctx,
-            self.slash_dom,
-            provider,
-            self.store,
-            hash,
+        // The shared gap-driven deps, assembled from `PullCtx`'s borrowed chain
+        // plumbing plus this entry's per-fetch budgets — the same shape `decdn
+        // fetch` builds. `drive_fetch` bao-verifies every ingested byte and, on
+        // `finalize`, runs a whole-blob `valid_ranges` sweep, so the old
+        // whole-file `verify_resumed_prefix` re-hash is subsumed and gone.
+        let deps = fetch::DriveFetchDeps {
+            endpoint: self.endpoint,
+            store: self.store,
+            contract: self.contract,
+            rpc: self.rpc,
+            slash_dom: self.slash_dom,
+            self_address: self.self_address,
+            chain: self.chain,
             // Bundle-level `--namespace` (ADR 002): routes any cache-miss origin
             // pull to that namespace's authorized origins. Applies uniformly to the
             // manifest blob and every entry — all funnel through here.
-            self.namespace_id,
-            // Same shape as `fetch` (#1134): a node that accepts the connection and never
-            // answers is as dead as one that stops mid-stream, so the same budget bounds
-            // both stages, under a cap that must outlast them both.
-            PullDeadlines::capped(
+            namespace_id: self.namespace_id,
+            max_rate_per_mb: self.common.max_rate_per_mb,
+            max_blob_bytes,
+            // Same shape as `fetch` (#1134): a node that accepts the connection and
+            // never answers is as dead as one that stops mid-stream, so the same
+            // budget bounds both stages, under a cap that must outlast them both.
+            deadlines: PullDeadlines::capped(
                 self.common.stall_timeout(),
                 self.common.stall_timeout(),
                 self.common.hard_cap(),
             )?,
-            max_blob_bytes,
-            self.common.max_rate_per_mb,
+        };
+
+        // Immutable channel fact captured before `ctx` moves into `drive_fetch`.
+        let channel_id = ctx.channel_id;
+
+        // `drive_fetch` owns the `.partial` + `.obao4`/`.ranges` sidecars beside
+        // `staging` and finalizes to the plain `staging` file this fetch's caller
+        // (`materialize`/`fetch_to_memory`) reads. On error those sidecars are left
+        // in place — the resume prefix a retried entry `open_or_create`s from. No
+        // progress bar: per-entry byte bars would interleave illegibly across a
+        // manifest's many concurrent pulls, so the callback and finish hook are
+        // both no-ops (#1118 scopes the byte bar to single-blob `fetch`).
+        fetch::drive_fetch(
+            &deps,
+            ctx,
+            target,
+            provider,
+            channel_id,
+            hash,
             staging,
-            // Per-entry byte bars would interleave illegibly across a manifest's
-            // many concurrent pulls; `bundle pull` reports at entry granularity
-            // instead (#1118 scopes the byte bar to single-blob `fetch`).
             None,
-            // Reactive graduation (#1497): funding handles for a mid-fetch top-up,
-            // same shapes `fetch` passes.
-            self.contract,
-            self.rpc,
-            self.self_address,
-            self.chain.payment_channel,
-            self.chain.max_approve,
-            self.chain.working_deposit,
+            || {},
         )
         .await?;
-
-        // On error `staging` is deliberately left in place by the streaming loop
-        // itself (same contract as `fetch`'s `<output>.partial`); nothing to do
-        // here on that path. On success, settle any inherited-from-a-prior-run
-        // prefix against `hash` before the caller trusts this file (see
-        // `verify_resumed_prefix`).
-        fetch::verify_resumed_prefix(hash, staging, &streamed)
+        Ok(())
     }
 
     /// Fetch one blob fully into memory — used only for the bundle manifest
@@ -828,19 +836,21 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
                 .collect();
         }
 
-        // Staged once per group under `out_root/.decdn-partial/<hex>.partial`
-        // (#1497): streaming here — rather than buffering the blob — is what
-        // lets a large entry top up mid-fetch, and a staging path derived from
-        // `out_root` is only created once a group actually has something to
-        // write, never for an all-skipped group.
+        // Staged once per group: `drive_fetch` finalizes to
+        // `out_root/.decdn-partial/<hex>` (#1497), streaming its `<hex>.partial`
+        // + sidecars there — rather than buffering the blob — which is what lets a
+        // large entry top up mid-fetch. The staging path derived from `out_root`
+        // is only created once a group actually has something to write, never for
+        // an all-skipped group.
         let staging = match staging_path(out_root, hash) {
             Ok(p) => p,
             Err(e) => return fail_all(slots, &e),
         };
         if let Err(e) = self.fetch_to_staging(hash, &staging).await {
-            // The streaming loop itself leaves `staging` in place on error — it
-            // is what the next run resumes from rather than re-paying for bytes
-            // already landed (same contract as `fetch`'s `<output>.partial`).
+            // `drive_fetch` leaves its `<hex>.partial` + `.obao4`/`.ranges`
+            // sidecars in place on error — they are what the next run resumes from
+            // rather than re-paying for bytes already landed (same contract as
+            // `fetch`'s `<output>.partial` store).
             return fail_all(slots, &e);
         }
 
@@ -853,18 +863,15 @@ impl<P: Provider + Clone> PullCtx<'_, P> {
         )
         .await;
 
-        // Remove the paid staging file ONLY when every destination landed. If any
-        // materialize failed (unwritable dir, ENOSPC, a link failure), keep it: the
-        // blob is fully fetched and paid for, so a rerun resumes from the complete
-        // `staging` and re-fetches only the trailing partial chunk group instead of
-        // the whole blob. (One residual gap: a blob whose size is an exact multiple
-        // of `CHUNK_GROUP_BYTES` resumes at `byte_offset == total_bytes`, which the
-        // serve gate answers as `NotFound`, so the loop treats it as a stale partial
-        // and restarts from zero — a pre-existing `fetch_blob_streaming` limitation
-        // shared with `decdn fetch`, not specific to this path.) Deleting staging
-        // here would force a full re-fetch — and re-payment — of an unrefunded blob
-        // in *every* case; `fetch`'s single-blob path gets this free from its atomic
-        // `rename`, so the copy-based fan-out must gate it.
+        // Remove the paid staging blob (and its sidecars) ONLY when every
+        // destination landed. If any materialize failed (unwritable dir, ENOSPC, a
+        // link failure), keep it: the blob is fully fetched and paid for, and
+        // `drive_fetch` already finalized `<hex>` — a rerun sees the finalized
+        // staging file and re-pulls only the still-missing ranges (typically
+        // none), never the whole blob. Deleting staging here would force a full
+        // re-fetch — and re-payment — of an unrefunded blob in *every* case;
+        // `fetch`'s single-blob path gets this free from its own ranged store, so
+        // the copy-based fan-out must gate it.
         if !outcomes
             .iter()
             .any(|o| matches!(o, EntryOutcome::Failed { .. }))
@@ -903,42 +910,52 @@ fn materialize(staging: &Path, dest: &Path) -> anyhow::Result<u64> {
     Ok(written)
 }
 
-/// Per-hash staging file a streaming fetch writes into before `fetch_group`
+/// Per-hash staging file [`fetch::drive_fetch`] finalizes to before `fetch_group`
 /// materializes it at the manifest's destination path(s) —
-/// `<out_root>/.decdn-partial/<hex>.partial` (#1497). Reusing
-/// `fetch_blob_streaming` means this survives an interrupted pull the same way
-/// `fetch`'s `<output>.partial` does: a rerun resumes from it rather than
-/// re-paying for bytes already landed. Creates the staging directory
-/// (idempotent, and only ever called once a group has real work to do — an
-/// all-skipped group never creates one) but not the file itself;
-/// `fetch_blob_streaming` does that.
-/// Reserved subdirectory of `out_root` holding per-hash staging files. Manifest
-/// entry paths that resolve inside it are rejected in [`plan_slots`], so a
-/// manifest can never collide with a staging file — nor trick `remove_staging`
-/// into deleting a materialized output.
+/// `<out_root>/.decdn-partial/<hex>` (#1497). This is the *plain* final path:
+/// `drive_fetch` owns the `.partial` suffix and the `.obao4`/`.ranges` sidecars
+/// itself, streaming into `<hex>.partial` beside this and renaming to `<hex>` on
+/// `finalize`. Those sidecars are what survives an interrupted pull — a rerun
+/// resumes from them rather than re-paying for bytes already landed. Creates the
+/// staging directory (idempotent, and only ever called once a group has real
+/// work to do — an all-skipped group never creates one) but not the file itself;
+/// `drive_fetch` does that.
+/// Reserved subdirectory of `out_root` holding per-hash staging files and their
+/// sidecars. Manifest entry paths that resolve inside it are rejected in
+/// [`plan_slots`], so a manifest can never collide with a staging file — nor
+/// trick `remove_staging` into deleting a materialized output.
 const STAGING_DIR: &str = ".decdn-partial";
 
 fn staging_path(out_root: &Path, hash: [u8; 32]) -> anyhow::Result<PathBuf> {
     let dir = out_root.join(STAGING_DIR);
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-    Ok(dir.join(format!(
-        "{}.partial",
-        blake3::Hash::from_bytes(hash).to_hex()
-    )))
+    Ok(dir.join(blake3::Hash::from_bytes(hash).to_hex().as_str()))
 }
 
-/// Best-effort cleanup of a staging file whose content is safely elsewhere
-/// (materialized to disk, or read into memory) and so has nothing left to
-/// resume. A leftover file here is harmless clutter, not a correctness issue,
-/// so a removal failure is reported and swallowed rather than propagated.
+/// Best-effort cleanup of a finalized staging blob whose content is safely
+/// elsewhere (materialized to disk, or read into memory) and so has nothing left
+/// to resume. Removes the plain `<hex>` file and, best-effort, any leftover
+/// `<hex>.partial{,.obao4,.ranges}` sidecars: `drive_fetch`'s `finalize` normally
+/// clears those on success, but this is the belt to that brace and never runs on
+/// an errored entry (whose sidecars are the resume prefix a retry needs). A
+/// leftover here is harmless clutter, not a correctness issue, so a removal
+/// failure is reported and swallowed rather than propagated.
 fn remove_staging(staging: &Path) {
-    if let Err(e) = std::fs::remove_file(staging)
-        && e.kind() != std::io::ErrorKind::NotFound
-    {
-        eprintln!(
-            "warning: failed to remove staging file {}: {e}",
-            staging.display()
-        );
+    let sidecars = [
+        staging.to_path_buf(),
+        staging.with_extension("partial"),
+        staging.with_extension("partial.obao4"),
+        staging.with_extension("partial.ranges"),
+    ];
+    for path in sidecars {
+        if let Err(e) = std::fs::remove_file(&path)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!(
+                "warning: failed to remove staging file {}: {e}",
+                path.display()
+            );
+        }
     }
 }
 
