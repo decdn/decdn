@@ -34,7 +34,7 @@ use alloy::signers::local::PrivateKeySigner;
 use decdn_client_pull::buyer_channel::{
     LOW_WATER_DIVISOR, ensure_allowance, open_channel, refill_amount, top_up,
 };
-use decdn_client_pull::driver::{DriveConfig, drive};
+use decdn_client_pull::driver::{DriveConfig, MAX_TOPUP_SETTLE_WAITS, TOPUP_SETTLE_BACKOFF, drive};
 use decdn_client_pull::source::{Funder, SourceFuture};
 use decdn_client_pull::{
     BudgetPacer, ChannelContext, ChannelLedger, ClientRangedStore, Cumulative, PeerSource,
@@ -66,18 +66,10 @@ use decdn_client_pull::provider;
 /// (`--timeout-ms`); a dead candidate falls out of selection after this.
 const SELECT_PROBE_TIMEOUT_MS: u64 = 5_000;
 
-/// Reactive graduation (#1497): after an on-chain `topUp`, the node's settlement
-/// watcher can briefly lag the `ChannelToppedUp` event, so its pre-serve deposit
-/// gate (#1518) still sees the pre-top-up deposit and refuses the resumed open
-/// (collapsed to `NotFound`). The client that performed the top-up waits out that
-/// lag by retrying the open — money-safe, since an open sends no vouchers and does
-/// not move `byte_offset`. `MAX_TOPUP_SETTLE_WAITS * TOPUP_SETTLE_BACKOFF` bounds
-/// the total wait (15s), comfortably above the daemon's chain-event poll cadence
-/// yet well under a fetch's overall deadline.
-const MAX_TOPUP_SETTLE_WAITS: u32 = 30;
-/// Backoff between resume-open retries while waiting for the node's chain watcher
-/// to observe a just-landed top-up (see [`MAX_TOPUP_SETTLE_WAITS`]).
-const TOPUP_SETTLE_BACKOFF: Duration = Duration::from_millis(500);
+// `MAX_TOPUP_SETTLE_WAITS` / `TOPUP_SETTLE_BACKOFF` (#1497 reactive-graduation
+// settle-wait budget) live in `decdn_client_pull::driver` now, so this legacy
+// loop and `drive`'s `DriveConfig::cli` share one definition instead of two
+// that could silently diverge.
 
 /// Parse a user-supplied BLAKE3 hash: 64 hex chars, optionally `0x`- or
 /// `b3:`-prefixed (the `b3:` form is what bundle manifests carry).

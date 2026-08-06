@@ -106,11 +106,28 @@ impl DriveConfig {
     pub const fn cli(working_deposit: U256) -> Self {
         Self {
             working_deposit,
-            max_settle_waits: 30,
-            settle_backoff: Duration::from_millis(500),
+            max_settle_waits: MAX_TOPUP_SETTLE_WAITS,
+            settle_backoff: TOPUP_SETTLE_BACKOFF,
         }
     }
 }
+
+/// Reactive graduation (#1497): after an on-chain `topUp`, the node's settlement
+/// watcher can briefly lag the `ChannelToppedUp` event, so its pre-serve deposit
+/// gate (#1518) still sees the pre-top-up deposit and refuses the resumed open
+/// (collapsed to `NotFound`). The client that performed the top-up waits out that
+/// lag by retrying the open — money-safe, since an open sends no vouchers and does
+/// not move `byte_offset`. `MAX_TOPUP_SETTLE_WAITS * TOPUP_SETTLE_BACKOFF` bounds
+/// the total wait (15s), comfortably above the daemon's chain-event poll cadence
+/// yet well under a fetch's overall deadline.
+///
+/// The single source of truth for both [`drive`]'s settle-wait budget (via
+/// [`DriveConfig::cli`]) and the CLI's legacy `fetch_blob_streaming` /
+/// `bundle_pull` loop, so the two settle-wait policies cannot silently diverge.
+pub const MAX_TOPUP_SETTLE_WAITS: u32 = 30;
+/// Backoff between resume-open retries while waiting for the node's chain watcher
+/// to observe a just-landed top-up (see [`MAX_TOPUP_SETTLE_WAITS`]).
+pub const TOPUP_SETTLE_BACKOFF: Duration = Duration::from_millis(500);
 
 /// Fetch-wide counters that persist ACROSS the request's gaps (a top-up budget is
 /// per-fetch, not per-gap), plus the last upstream quote used to price the next

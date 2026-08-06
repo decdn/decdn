@@ -401,9 +401,17 @@ impl ClientRangedStore {
     /// data/outboard files and rewriting the `.ranges` record on every single
     /// 16 KiB chunk group would serialize the whole ingest on disk latency
     /// (thousands of fsyncs for a large gap); checkpointing only every 4 MiB
-    /// (256 groups) amortizes that cost while still bounding a mid-gap
-    /// failure's un-checkpointed (and therefore re-fetched, re-paid) tail to
-    /// under one interval.
+    /// (256 groups) amortizes that cost.
+    ///
+    /// Checkpoint cadence for durable present-range persistence. On a mid-gap
+    /// fault, content received since the last checkpoint is re-pulled and
+    /// **re-paid** on resume — so this bounds the per-fault re-pay window to
+    /// under one 4 MiB checkpoint interval (≈4 default 1 MiB voucher
+    /// intervals, `DEFAULT_VOUCHER_INTERVAL_MB` in `decdn-protocol`), times
+    /// at most `MAX_RESUME_ATTEMPTS`. Checkpointed (durably-recorded) bytes
+    /// are never re-paid. Larger cadence = fewer fsyncs but a wider re-pay
+    /// window on fault; align to the voucher interval to shrink it toward
+    /// the payment granularity.
     const INGEST_CHECKPOINT_BYTES: u64 = 4 * 1024 * 1024;
 
     /// Stream the raw bao encoding of `range` (from `reader`) into the store:
@@ -439,9 +447,11 @@ impl ClientRangedStore {
     /// durable on disk. A crash or peer fault between two checkpoints loses
     /// only the un-checkpointed tail — strictly less than one
     /// `INGEST_CHECKPOINT_BYTES` interval of received content — which
-    /// the next `missing_ranges`/resume call simply re-fetches. It never loses
-    /// (or re-claims) a byte that a prior checkpoint already made durable, and
-    /// it never claims a byte that was not actually fsync'd.
+    /// the next `missing_ranges`/resume call simply re-fetches AND re-pays
+    /// for (those bytes were already voucher-paid on the fault-side pull; see
+    /// `INGEST_CHECKPOINT_BYTES`'s doc for the re-pay-window bound). It never
+    /// loses (or re-claims) a byte that a prior checkpoint already made
+    /// durable, and it never claims a byte that was not actually fsync'd.
     ///
     /// # Errors
     ///
