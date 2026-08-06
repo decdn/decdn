@@ -26,12 +26,17 @@
 //! chain-handle-agnostic. The reactive-top-up budget is deployment-specific and
 //! travels on the funder ([`Funder::max_topups`] — CLI 3, node 1).
 
-use alloy::primitives::U256;
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use alloy::dyn_abi::Eip712Domain;
+use alloy::primitives::{Address, U256};
 use decdn_bao_range::AlignedRange;
 use decdn_incentive::DepositOutcome;
+use iroh::{Endpoint, EndpointAddr};
 
-use crate::sink::StashedFault;
-use crate::{UpstreamPullHeader, VoucherProgress};
+use crate::sink::{PullReader, StashedFault};
+use crate::{ChannelContext, ChannelLedger, PullDeadlines, UpstreamPullHeader, VoucherProgress};
 
 /// A boxed, `Send` future returned by the async trait methods in this module —
 /// the same boxed-future async-trait shape [`decdn_bao_range::RangedStore`] and
@@ -125,6 +130,133 @@ pub trait Funder: Send + Sync {
     /// If the on-chain `topUp` fails to submit, reverts, or its receipt is not
     /// obtained — the funds did not move.
     fn top_up(&self, additional: U256) -> SourceFuture<'_, DepositOutcome>;
+}
+
+/// Current unix time in microseconds (the requester-echoed
+/// [`decdn_protocol::client::StreamRequest::timestamp_us`]). Mirrors the CLI's
+/// `micros_now` (`crates/cli/src/commands/fetch.rs`) and the node's `now_micros`
+/// (`crates/node/src/node_origin/mod.rs`) — each caller of `open_progressive_pull`
+/// owns its own copy rather than sharing one across crate boundaries, and
+/// `PeerSource` needs the same one-liner here.
+fn micros_now() -> u64 {
+    u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_micros()),
+    )
+    .unwrap_or(u64::MAX)
+}
+
+/// The paid `BlobSource` (#1608 Phase A, A2): wraps
+/// [`crate::open_progressive_pull`] behind [`BlobSource`], scoping every
+/// [`open`](BlobSource::open) to exactly the requested [`AlignedRange`] via the
+/// `byte_len`-bounded pull (the wire `StreamRequest` already carried the field;
+/// only the OPEN-side plumbing was whole-tail before this).
+///
+/// One `PeerSource` serves one gap-driven fetch against one upstream peer — it
+/// holds the pull context (`endpoint`, `target`, `ctx`, `ledger`, …) but not a
+/// [`Funder`]: reactive top-up is the driver's concern (it holds the `Funder`
+/// separately and calls it directly), not the source's.
+///
+/// Borrows rather than owns its `endpoint`/`ctx`/`slash_domain`, mirroring
+/// exactly what [`crate::open_progressive_pull`] itself takes by reference — no
+/// clone on the hot path, and the driver (which already owns these for the
+/// whole fetch) outlives every `PeerSource::open`/`finish` call it makes.
+pub struct PeerSource<'a> {
+    endpoint: &'a Endpoint,
+    target: EndpointAddr,
+    ctx: &'a ChannelContext,
+    ledger: Arc<ChannelLedger>,
+    slash_domain: &'a Eip712Domain,
+    expected_signer: Address,
+    namespace_id: [u8; 32],
+    max_blob_size_bytes: u64,
+    max_rate_per_mb: u64,
+    deadlines: PullDeadlines,
+}
+
+impl std::fmt::Debug for PeerSource<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `ChannelContext` (a signing key) and `Eip712Domain` are not `Debug`,
+        // so this prints only the non-sensitive routing/policy fields.
+        f.debug_struct("PeerSource")
+            .field("target", &self.target)
+            .field("expected_signer", &self.expected_signer)
+            .field("namespace_id", &self.namespace_id)
+            .field("max_blob_size_bytes", &self.max_blob_size_bytes)
+            .field("max_rate_per_mb", &self.max_rate_per_mb)
+            .field("deadlines", &self.deadlines)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'a> PeerSource<'a> {
+    /// Build a source for one gap-driven fetch against `target`, paid out of
+    /// `ledger` over `ctx`'s channel. `namespace_id`, `max_blob_size_bytes`,
+    /// `max_rate_per_mb`, and `deadlines` are the same buyer-side policy knobs
+    /// [`crate::open_progressive_pull`] takes directly — see its docs.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub const fn new(
+        endpoint: &'a Endpoint,
+        target: EndpointAddr,
+        ctx: &'a ChannelContext,
+        ledger: Arc<ChannelLedger>,
+        slash_domain: &'a Eip712Domain,
+        expected_signer: Address,
+        namespace_id: [u8; 32],
+        max_blob_size_bytes: u64,
+        max_rate_per_mb: u64,
+        deadlines: PullDeadlines,
+    ) -> Self {
+        Self {
+            endpoint,
+            target,
+            ctx,
+            ledger,
+            slash_domain,
+            expected_signer,
+            namespace_id,
+            max_blob_size_bytes,
+            max_rate_per_mb,
+            deadlines,
+        }
+    }
+}
+
+impl BlobSource for PeerSource<'_> {
+    type Reader = PullReader;
+
+    fn open(
+        &self,
+        hash: [u8; 32],
+        range: AlignedRange,
+    ) -> SourceFuture<'_, (UpstreamPullHeader, Self::Reader)> {
+        Box::pin(async move {
+            let (header, pull) = crate::open_progressive_pull(
+                self.endpoint,
+                self.target.clone(),
+                self.ctx,
+                Arc::clone(&self.ledger),
+                self.slash_domain,
+                self.expected_signer,
+                hash,
+                self.namespace_id,
+                range.fetch_start(),
+                micros_now(),
+                self.max_blob_size_bytes,
+                self.max_rate_per_mb,
+                self.deadlines,
+                range.fetch_len(),
+            )
+            .await?;
+            Ok((header, PullReader::new(pull)))
+        })
+    }
+
+    fn finish(&self, reader: Self::Reader) -> SourceFuture<'_, VoucherProgress> {
+        Box::pin(async move { reader.into_inner().finish().await })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -403,6 +535,19 @@ mod tests {
             "the scripted fault must be parked once the truncated wire is drained"
         );
         Ok(())
+    }
+
+    /// `PeerSource` implements `BlobSource` — checked at compile time rather than
+    /// exercised end-to-end, since a real run needs a live `Endpoint`/connection.
+    /// A4's driver tests exercise the trait's behavior against `ScriptedSource`;
+    /// the loopback pull tests in `lib.rs`/`sink.rs` (`open_progressive_pull`,
+    /// `decode_to_sink`, the `byte_len` plumbing above) cover `PeerSource`'s own
+    /// building blocks. `'static` is just a concrete lifetime to instantiate the
+    /// generic type parameter with — no value is constructed.
+    #[test]
+    fn peer_source_is_a_blob_source() {
+        fn assert_impl<T: BlobSource>() {}
+        assert_impl::<super::PeerSource<'static>>();
     }
 
     /// The fake funder records amounts and echoes its scripted outcome.

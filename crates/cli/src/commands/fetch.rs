@@ -1050,6 +1050,9 @@ where
             max_blob_bytes,
             max_rate_per_mb,
             deadlines,
+            // Whole-tail fetch; the gap-driven driver (#1608) is not wired in here
+            // yet (A5).
+            0,
         )
         .await;
 

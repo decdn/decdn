@@ -64,7 +64,7 @@ pub mod source;
 pub use ledger::{ChannelLedger, Cumulative};
 pub use pacer::{BudgetPacer, PaceDecision, PaceState, Pacer};
 pub use ranged_store::ClientRangedStore;
-pub use source::{BaoRangeReader, BlobSource, Funder};
+pub use source::{BaoRangeReader, BlobSource, Funder, PeerSource};
 
 #[cfg(any(test, feature = "test-util"))]
 pub use source::{FakeFunder, ScriptedReader, ScriptedSource};
@@ -1370,6 +1370,7 @@ async fn open_stream(
     hash: [u8; 32],
     namespace_id: [u8; 32],
     byte_offset: u64,
+    byte_len: u64,
     timestamp_us: u64,
     open: Duration,
 ) -> anyhow::Result<(
@@ -1400,9 +1401,10 @@ async fn open_stream(
             namespace_id,
             channel_id: ctx.channel_id.into(),
             byte_offset,
-            // Whole-tail fetch; a bounded range is plumbed by the origin range-pull
-            // path (ADR 037 §Origin-tier pull-through), not these node-to-node pulls.
-            byte_len: 0,
+            // `0` = whole-tail fetch; a caller requesting a bounded middle gap
+            // (the gap-driven driver, #1608, via `PeerSource`) passes the gap's
+            // length so the server scopes both the serve and the payment to it.
+            byte_len,
             timestamp_us,
         };
         // Two-phase encode (ADR 005): attach the client identity binding when the
@@ -1745,6 +1747,9 @@ async fn fetch_inner_once(
         // `open_progressive_pull` → `open_stream` directly, not here.
         namespace_id,
         byte_offset,
+        // Whole-tail fetch; a bounded range is plumbed via `open_progressive_pull`
+        // (the gap-driven driver, #1608), not this buffered/loopback path.
+        0,
         timestamp_us,
         open,
     )
@@ -1804,7 +1809,7 @@ async fn fetch_inner_once(
     // Paid/received bytes are **wire** bytes — content plus interleaved bao proof
     // nodes (ADR 038 §Payment metering) — not the content-byte remainder.
     let total_bytes = resp.body.total_bytes;
-    let expected_wire = aligned_wire_len(byte_offset, total_bytes)?;
+    let expected_wire = aligned_wire_len(byte_offset, 0, total_bytes)?;
 
     let (buf, cumulative) = receive_and_pay(
         &mut send,
@@ -1845,16 +1850,17 @@ async fn fetch_inner_once(
     Ok(blob)
 }
 
-/// The wire-byte bound for a resume at `byte_offset` of a `total_bytes` blob:
-/// the bao-encoded size of the chunk-group-aligned range (content plus
-/// interleaved proof, ADR 038 §Payment metering), exactly the byte count the
-/// server emits. The server widens `byte_offset` to enclosing 16 KiB groups;
-/// [`align_range`] / [`AlignedRange::wire_len`](decdn_bao_range::AlignedRange::wire_len)
+/// The wire-byte bound for a fetch of `[byte_offset, byte_offset + byte_len)`
+/// (`byte_len == 0` meaning "to end") of a `total_bytes` blob: the bao-encoded
+/// size of the chunk-group-aligned range (content plus interleaved proof, ADR
+/// 038 §Payment metering), exactly the byte count the server emits. The server
+/// widens the request to enclosing 16 KiB groups; [`align_range`] /
+/// [`AlignedRange::wire_len`](decdn_bao_range::AlignedRange::wire_len)
 /// reproduce that, keeping encoder and receiver in lock-step. Shared by the
 /// buffered [`fetch_inner`] and progressive [`open_progressive_pull`] paths so
 /// the two can't drift.
-fn aligned_wire_len(byte_offset: u64, total_bytes: u64) -> anyhow::Result<u64> {
-    let aligned = align_range(byte_offset, 0, total_bytes)
+fn aligned_wire_len(byte_offset: u64, byte_len: u64, total_bytes: u64) -> anyhow::Result<u64> {
+    let aligned = align_range(byte_offset, byte_len, total_bytes)
         .map_err(|e| anyhow::anyhow!("range alignment: {e}").context(LocalPullFault))?;
     Ok(aligned.wire_len())
 }
@@ -2234,6 +2240,12 @@ pub async fn open_progressive_pull(
     max_blob_size_bytes: u64,
     max_rate_per_mb: u64,
     deadlines: PullDeadlines,
+    // Upper bound on the requested range: `[byte_offset, byte_offset + byte_len)`.
+    // `0` means "to end" (the pre-#1608 whole-tail behavior, unchanged for every
+    // existing caller). A gap-driven caller (`source::PeerSource`, #1608) passes
+    // the exact gap length so the server scopes both the serve and the payment
+    // to it, rather than streaming the whole remainder.
+    byte_len: u64,
 ) -> anyhow::Result<(UpstreamPullHeader, UpstreamPull)> {
     let stall = deadlines.stall;
     let (conn, send, recv, resp) = open_stream(
@@ -2252,6 +2264,7 @@ pub async fn open_progressive_pull(
         // applies.
         namespace_id,
         byte_offset,
+        byte_len,
         timestamp_us,
         deadlines.open,
     )
@@ -2298,7 +2311,7 @@ pub async fn open_progressive_pull(
     // the window path forwards this stream verbatim and pays the upstream in wire
     // bytes (ADR 038 §Payment metering). Same derivation as `fetch_inner`.
     let total_bytes = resp.body.total_bytes;
-    let expected_wire_bytes = aligned_wire_len(byte_offset, total_bytes)?;
+    let expected_wire_bytes = aligned_wire_len(byte_offset, byte_len, total_bytes)?;
     let header = UpstreamPullHeader {
         total_bytes,
         rate_per_mb,
@@ -2819,13 +2832,39 @@ mod tests {
         assert!(PullDeadlines::new(Duration::from_secs(20), Duration::from_secs(20)).is_ok());
     }
 
+    /// `aligned_wire_len`'s new `byte_len` parameter must actually bound the
+    /// quoted wire cost — not just be accepted and ignored. This is the
+    /// construction-level proof that `open_progressive_pull`'s `byte_len`
+    /// threads all the way to the wire-byte bound `PeerSource`'s callers price
+    /// vouchers from (#1608 A2): a middle-gap request must quote strictly less
+    /// than the whole tail, and must match `align_range`'s own `wire_len` for the
+    /// identical bounded span so the two can never drift.
+    #[test]
+    fn aligned_wire_len_is_bounded_by_the_requested_byte_len() {
+        let total = 10 * decdn_bao_range::CHUNK_GROUP_BYTES;
+        let whole_tail = aligned_wire_len(0, 0, total).unwrap_or(0);
+        let one_group = aligned_wire_len(0, decdn_bao_range::CHUNK_GROUP_BYTES, total).unwrap_or(0);
+        assert!(
+            one_group > 0 && one_group < whole_tail,
+            "a one-group byte_len must quote less than the whole 10-group tail: \
+             one_group={one_group}, whole_tail={whole_tail}"
+        );
+        let via_align_range =
+            align_range(0, decdn_bao_range::CHUNK_GROUP_BYTES, total).map_or(0, |r| r.wire_len());
+        assert_eq!(
+            one_group, via_align_range,
+            "aligned_wire_len must reproduce align_range's own wire_len for the same \
+             bounded span, or the two can silently drift"
+        );
+    }
+
     #[test]
     fn the_range_helpers_mark_their_own_faults_as_local() {
         // A 4 KiB blob cannot be resumed from byte 8192 — `align_range` errors rather than
         // clamping (ADR 005), and both callers must own that as OURS. Each assertion covers
         // both halves at once: `None` here means the call wrongly SUCCEEDED, and a `Some`
         // without the marker means it failed and blamed the peer.
-        let aligned = aligned_wire_len(8192, 4096).err();
+        let aligned = aligned_wire_len(8192, 0, 4096).err();
         assert!(
             aligned
                 .as_ref()

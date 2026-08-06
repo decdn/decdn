@@ -48,7 +48,8 @@ use crate::{HashMismatch, LocalPullFault, UpstreamPull, VoucherProgress};
 /// `anyhow::Error` is parked in `fault` and the trait returns a placeholder; the
 /// driver below checks `fault` first and returns the real error, using the
 /// decoder's complaint only when there is no parked fault.
-struct PullReader {
+#[derive(Debug)]
+pub struct PullReader {
     pull: UpstreamPull,
     /// Wire bytes received but not yet consumed by the decoder.
     buf: BytesMut,
@@ -59,13 +60,26 @@ struct PullReader {
 }
 
 impl PullReader {
-    fn new(pull: UpstreamPull) -> Self {
+    pub(crate) fn new(pull: UpstreamPull) -> Self {
         Self {
             pull,
             buf: BytesMut::new(),
             ended: false,
             fault: None,
         }
+    }
+
+    /// Recover the inner [`UpstreamPull`] once the decode loop is done with this
+    /// reader, so [`crate::source::BlobSource::finish`] can drain it to the
+    /// stream end and recover the acked voucher watermark.
+    ///
+    /// Any buffered-but-unconsumed wire bytes and a parked fault are dropped
+    /// silently: the driver only calls this after
+    /// [`crate::source::BaoRangeReader`]'s decode loop reached its clean `Done`
+    /// state, exactly the precondition [`pull_to_sink`] relies on for its own
+    /// `reader.pull.finish()` call below.
+    pub(crate) fn into_inner(self) -> UpstreamPull {
+        self.pull
     }
 
     /// Pull chunks until `buf` holds `n` bytes, the stream ends, or a fault is

@@ -725,6 +725,9 @@ impl NodeOrigin {
             // bait-and-switch cannot select through this path.
             effective_rate_ceiling(candidate.rate_per_mb, deps.config.max_rate_per_mb),
             deadlines,
+            // Whole-tail fetch; a bounded gap request is the gap-driven driver's
+            // (#1608) `source::PeerSource`, not this candidate-fallback open.
+            0,
         )
         .await
         {

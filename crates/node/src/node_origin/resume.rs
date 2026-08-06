@@ -685,6 +685,9 @@ async fn open_leg(
         // unbounded here.
         effective_rate_ceiling(target.candidate.rate_per_mb, deps.config.max_rate_per_mb),
         deadlines,
+        // Whole-tail fetch; a bounded gap request is the gap-driven driver's
+        // (#1608) `source::PeerSource`, not this resume loop.
+        0,
     )
     .await
 }
