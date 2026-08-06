@@ -45,10 +45,30 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Configure git
+      # Real releases sign the version-bump commit and the tag with the
+      # org-owned decdn.org GPG key (identity: decdn <security@decdn.org>).
+      # The (passphrase-less) private key lives only in the
+      # RELEASE_GPG_PRIVATE_KEY Actions secret; no personal maintainer key is
+      # used. See SECURITY.md for verification.
+      - name: Import release GPG key
+        if: ${{ !inputs.dry_run }}
+        uses: crazy-max/ghaction-import-gpg@v6
+        with:
+          gpg_private_key: ${{ secrets.RELEASE_GPG_PRIVATE_KEY }}
+          git_user_signingkey: true
+          git_commit_gpgsign: true
+          git_tag_gpgsign: true
+          git_config_global: true
+          git_committer_name: decdn
+          git_committer_email: security@decdn.org
+
+      # Dry runs never create a commit or tag, so they need no key — just a
+      # placeholder identity so any incidental git operation has one.
+      - name: Configure git (dry run)
+        if: ${{ inputs.dry_run }}
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "decdn"
+          git config user.email "security@decdn.org"
 
       - uses: dtolnay/rust-toolchain@1.95.0
         with:
