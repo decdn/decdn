@@ -27,7 +27,7 @@ use bao_tree::{BaoTree, BlockSize, ChunkNum, ChunkRanges};
 use bytes::Bytes;
 use positioned_io::ReadAt;
 
-#[cfg(feature = "conformance")]
+#[cfg(feature = "test-util")]
 pub mod conformance;
 pub mod ranged_store;
 pub mod streaming;

@@ -5,7 +5,7 @@
 //! drives one implementation through present/missing/admit/read/finalize over
 //! prefix, interior, and disjoint holds so the two backends cannot silently
 //! diverge in behavior. This module has no backend of its own — it is pure
-//! test support, gated behind the `conformance` feature so no production build
+//! test support, gated behind the `test-util` feature so no production build
 //! ever links it.
 #![allow(
     clippy::unwrap_used,

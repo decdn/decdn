@@ -57,7 +57,7 @@ aws-smithy-types = { workspace = true }
 [dev-dependencies]
 # Shared RangedStore conformance suite (#1621 Task 2), run here for the first
 # time against a concrete backend (NodeRangedStore, Task 4).
-decdn-bao-range = { workspace = true, features = ["conformance"] }
+decdn-bao-range = { workspace = true, features = ["test-util"] }
 tempfile = { workspace = true }
 wiremock = { workspace = true }
 # Test fixtures construct gzipped / zstd response bodies for the
