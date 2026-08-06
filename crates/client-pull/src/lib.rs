@@ -44,6 +44,9 @@ mod ledger;
 pub mod probe;
 /// Wallet-filled HTTP provider builder for opening/settling payment channels.
 pub mod provider;
+/// Client-side [`decdn_bao_range::RangedStore`] backend (#1621 P2): a
+/// `.partial` + sidecar store built on `bao-tree`/`decdn-bao-range` only.
+pub mod ranged_store;
 pub mod rtt_map;
 // Docs live in `sink.rs` as `//!`. Deliberately NOT documented here as well:
 // rustdoc resolves intra-doc links on a `mod` item in THIS file's scope, so the
@@ -52,6 +55,7 @@ pub mod rtt_map;
 pub mod sink;
 
 pub use ledger::{ChannelLedger, Cumulative};
+pub use ranged_store::ClientRangedStore;
 
 use std::sync::Arc;
 use std::time::Duration;
