@@ -2704,6 +2704,7 @@ dependencies = [
  "futures-util",
  "iroh",
  "iroh-blobs",
+ "iroh-io",
  "iroh-metrics",
  "positioned-io",
  "rand 0.10.2",
