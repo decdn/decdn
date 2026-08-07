@@ -164,7 +164,17 @@ jobs:
       - name: Create GitHub Release
         if: ${{ !inputs.dry_run }}
         run: |
+          # GitHub caps release bodies at 125000 chars. The first release has
+          # no prior tag to bound `--latest`, so cliff emits the whole history
+          # and overflows; truncate (and flag it) only when we actually exceed
+          # the limit, leaving normal releases untouched.
           git cliff --latest --strip header > /tmp/release-notes.md
+          if [ "$(wc -c < /tmp/release-notes.md)" -gt 125000 ]; then
+            head -c 120000 /tmp/release-notes.md > /tmp/release-notes.trunc.md
+            printf '\n\n_Changelog truncated. See the full commit history for details._\n' \
+              >> /tmp/release-notes.trunc.md
+            mv /tmp/release-notes.trunc.md /tmp/release-notes.md
+          fi
           gh release create "$TAG" \
             --title "$TAG" \
             --notes-file /tmp/release-notes.md
