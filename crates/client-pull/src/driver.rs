@@ -242,6 +242,7 @@ pub async fn drive<St, S, P, F>(
     config: &DriveConfig,
     on_progress: Option<&ProgressCallback>,
     pacing_wait: Option<&dyn PacingWait>,
+    served_paid: Option<&(dyn Fn() -> u64 + Send + Sync)>,
 ) -> anyhow::Result<()>
 where
     St: IngestStore,
@@ -276,6 +277,7 @@ where
             &mut counters,
             on_progress,
             pacing_wait,
+            served_paid,
         )
         .await?;
     }
@@ -315,6 +317,7 @@ async fn fill_gap<St, S, P, F>(
     counters: &mut DriveCounters,
     on_progress: Option<&ProgressCallback>,
     pacing_wait: Option<&dyn PacingWait>,
+    served_paid: Option<&(dyn Fn() -> u64 + Send + Sync)>,
 ) -> anyhow::Result<()>
 where
     St: IngestStore,
@@ -393,14 +396,24 @@ where
             topups_used: counters.topups_used,
             max_topups: funder.max_topups(),
             exhaustion_confirmed,
-            // Inert on the client path: `BudgetPacer` never reads these fields
-            // and a `WindowPacer` is never handed in here. Set to the paid/
-            // delivered frontiers already computed above (rather than a bare
-            // `0`) purely so a future node-side reuse of this construction site
-            // sees sane numbers by default; the client's own pacing decision
-            // does not depend on this choice.
+            // `pulled_frontier` is this leg's own admitted/present frontier —
+            // correct on BOTH the client and node pull legs, since it is always
+            // THIS leg's delivery progress, never the downstream client's. No
+            // seam needed.
             pulled_frontier: delivered_frontier,
-            served_paid_frontier: paid_frontier,
+            // `served_paid_frontier` is NOT this leg's own state — it is the
+            // DOWNSTREAM client's paid frontier, which only the node's serve leg
+            // (a separate, future task) can advance. On the client path
+            // (`served_paid == None`) there is no downstream leg, so this
+            // collapses to the inert local `paid_frontier`: harmless, because
+            // `BudgetPacer` never reads `served_paid_frontier`. The NODE pull leg
+            // MUST pass `Some(reader)` here, reading the shared downstream
+            // `served_paid` frontier, so its `WindowPacer` gates the pull against
+            // the downstream client's payment — not against this leg's own
+            // upstream paid frontier, which would be category-wrong (it would
+            // make the window track the node's own credit-window lag instead of
+            // the client it is serving).
+            served_paid_frontier: served_paid.map_or(paid_frontier, |f| f()),
         };
 
         match pacer.decide(&state) {
@@ -758,6 +771,7 @@ mod tests {
             &config(),
             None,
             None,
+            None,
         )
         .await
         .expect("drive whole blob");
@@ -839,6 +853,7 @@ mod tests {
             &config(),
             None,
             None,
+            None,
         )
         .await
         .expect("drive fully-held blob");
@@ -916,6 +931,7 @@ mod tests {
             &config(),
             None,
             None,
+            None,
         )
         .await
         .expect_err("the mid-gap stall surfaces as a terminal error");
@@ -940,6 +956,7 @@ mod tests {
             0,
             0,
             &config(),
+            None,
             None,
             None,
         )
@@ -1009,6 +1026,7 @@ mod tests {
             GROUP,
             GROUP,
             &config(),
+            None,
             None,
             None,
         )
@@ -1174,6 +1192,7 @@ mod tests {
             &drive_config,
             None,
             None,
+            None,
         )
         .await
         .expect("drive completes after one reactive top-up");
@@ -1260,6 +1279,7 @@ mod tests {
             &config(),
             None,
             None,
+            None,
         )
         .await
         .expect("drive stops cleanly once the stub pacer says Done");
@@ -1337,6 +1357,7 @@ mod tests {
             &config(),
             None,
             Some(&wait_hook),
+            None,
         )
         .await
         .expect("drive completes after the one scripted Wait");
@@ -1350,5 +1371,91 @@ mod tests {
         assert!(store.is_complete().await.expect("is_complete"));
         let got = store.read(0, 0).await.expect("read whole blob");
         assert_eq!(got.as_ref(), plaintext.as_slice());
+    }
+
+    /// A [`PacingWait`] hook that simulates the downstream serve leg clearing one
+    /// window's worth of payment each time it is awaited: it bumps a shared
+    /// counter by `bump_bytes` and resolves immediately (no real sleep), so the
+    /// test stays deterministic. The SAME counter backs the `served_paid` reader
+    /// passed to `drive`, so this is the only thing that can unstick a
+    /// `WindowPacer::Wait`.
+    struct BumpServedPaidWait {
+        served_paid: Arc<std::sync::atomic::AtomicU64>,
+        bump_bytes: u64,
+    }
+
+    impl super::PacingWait for BumpServedPaidWait {
+        fn wait(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+            self.served_paid
+                .fetch_add(self.bump_bytes, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async {})
+        }
+    }
+
+    #[tokio::test]
+    async fn window_pacer_gates_on_injected_served_paid() {
+        // A 3-group gap with a WindowPacer window of exactly one group: the pull
+        // can only run one group ahead of `served_paid` before it must `Wait`.
+        // Nothing but the injected `served_paid` reader (bumped by the
+        // `PacingWait` hook, standing in for the downstream serve leg clearing
+        // payment) can let the drive make further progress — proving both the
+        // seam wiring (`served_paid` reaches `WindowPacer` via `PaceState`) and
+        // the `Wait` -> hook -> re-decide loop actually advances against it.
+        let total = 3 * GROUP;
+        let (root, plaintext, _outboard) = synth_blob(total as usize);
+        let store = fresh_store(root, total);
+
+        let ledger = Arc::new(ChannelLedger::new(Cumulative::default()));
+        let source = ScriptedSource::new(plaintext.clone())
+            .expect("source")
+            .paying(Arc::clone(&ledger));
+        let pacer = crate::pacer::WindowPacer::new(GROUP);
+        let funder = healthy_funder();
+        let ctx = Arc::new(Mutex::new(healthy_ctx()));
+
+        let served_paid_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let wait_hook = BumpServedPaidWait {
+            served_paid: Arc::clone(&served_paid_counter),
+            bump_bytes: GROUP,
+        };
+        let served_paid_reader = {
+            let counter = Arc::clone(&served_paid_counter);
+            move || counter.load(std::sync::atomic::Ordering::SeqCst)
+        };
+
+        drive(
+            &store,
+            &source,
+            &pacer,
+            &funder,
+            &ctx,
+            &ledger,
+            root,
+            0,
+            0,
+            &config(),
+            None,
+            Some(&wait_hook),
+            Some(&served_paid_reader),
+        )
+        .await
+        .expect("drive completes as served_paid advances one window at a time");
+
+        // The window forced at least the two `Wait`s a 3-group gap under a
+        // 1-group window needs (group 2 and group 3 each had to wait for the
+        // previous group's payment to clear downstream).
+        assert!(
+            served_paid_counter.load(std::sync::atomic::Ordering::SeqCst) >= 2 * GROUP,
+            "the injected served_paid reader must have been advanced by the wait \
+             hook for the drive to complete"
+        );
+
+        assert!(store.is_complete().await.expect("is_complete"));
+        let got = store.read(0, 0).await.expect("read whole blob");
+        assert_eq!(
+            got.as_ref(),
+            plaintext.as_slice(),
+            "byte-exact after a window-paced, served-paid-gated drive"
+        );
     }
 }
