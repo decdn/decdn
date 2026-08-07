@@ -1293,6 +1293,7 @@ where
         0,
         &drive_config,
         progress,
+        None, // pacing_wait: BudgetPacer never returns PaceDecision::Wait
     )
     .await;
 

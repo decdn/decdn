@@ -66,9 +66,9 @@ pub mod sink;
 /// seam), plus scripted test doubles.
 pub mod source;
 
-pub use driver::drive;
+pub use driver::{PacingWait, drive};
 pub use ledger::{ChannelLedger, Cumulative};
-pub use pacer::{BudgetPacer, PaceDecision, PaceState, Pacer};
+pub use pacer::{BudgetPacer, PaceDecision, PaceState, Pacer, WindowPacer};
 pub use ranged_store::ClientRangedStore;
 pub use source::{BaoRangeReader, BlobSource, Funder, IngestStore, PeerSource};
 
