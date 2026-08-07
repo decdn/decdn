@@ -2071,12 +2071,14 @@ impl CacheEngine {
     /// fallback is always correct; the optimization only reduces the origin
     /// hop's cost.
     ///
-    /// This is **partial**-blob population: unlike [`Self::populate`] it does
-    /// not promote a named tag or make [`Self::has`] return `true` (which
-    /// requires a `Complete` blob), and it does not announce a DHT insert — a
-    /// node holding only a range is not advertised as a full holder (ADR 037
-    /// §"partial warming copies are not advertised"). A subsequent whole-blob
-    /// pull-through (or further range pulls) completes the blob.
+    /// This is **partial**-blob population. It installs a deterministic
+    /// `decdn-partial-<hash>` named tag so the imported range survives GC
+    /// (#1607, via `protect_partial`) — but, unlike [`Self::populate`],
+    /// it does not make [`Self::has`] return `true` (which requires a `Complete`
+    /// blob), and it does not announce a DHT insert — a node holding only a
+    /// range is not advertised as a full holder (ADR 037 §"partial warming
+    /// copies are not advertised"). A subsequent whole-blob pull-through (or
+    /// further range pulls) completes the blob.
     ///
     /// # Errors
     ///
@@ -7273,20 +7275,32 @@ mod tests {
             BlobStatus::Partial { .. }
         ));
 
-        // Wait out several sweeps. The 1500ms sleep must stay a comfortable
-        // multiple of the 200ms GC interval above; if that interval is retuned,
-        // scale this to keep the control's reclaim deterministic. The control's
-        // `NotFound` assertion gates the test, so any drift fails loud (a false
-        // negative), never silently passes.
-        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-
-        assert!(
-            matches!(
+        // Poll for the control's reclaim rather than sleeping a fixed span:
+        // fails fast once GC sweeps (typically the first 200ms interval), and
+        // only fails if GC never reclaims the untagged control within a generous
+        // budget — robust on slow/loaded CI and independent of the exact GC
+        // interval. The control's `NotFound` gates the test, so a genuine GC
+        // failure still fails loud; it can never silently pass.
+        let deadline = std::time::Duration::from_secs(15);
+        let poll = std::time::Duration::from_millis(50);
+        let start = std::time::Instant::now();
+        loop {
+            let reclaimed = matches!(
                 engine.inner.store.blobs().status(hb).await.unwrap(),
                 BlobStatus::NotFound
-            ),
-            "control proves GC ran: untagged partial reclaimed"
-        );
+            );
+            if reclaimed {
+                break;
+            }
+            assert!(
+                start.elapsed() < deadline,
+                "control never reclaimed within {deadline:?}: GC did not run"
+            );
+            tokio::time::sleep(poll).await;
+        }
+
+        // The tagged partial must STILL be present after the control was swept —
+        // proving the tag (not timing) is what protected it.
         assert!(
             matches!(
                 engine.inner.store.blobs().status(ha).await.unwrap(),
