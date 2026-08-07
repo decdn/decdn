@@ -124,10 +124,11 @@ async fn observe_reflects_progressive_admit() -> anyhow::Result<()> {
 
     let mut watch = ServeStore::observe(&store).await?;
 
-    // First snapshot must already reflect group 0.
-    let first = watch
-        .next()
+    // First snapshot must already reflect group 0. Timeout-bounded like the
+    // later ones so a regressed first-item delivery fails fast, never hangs.
+    let first = tokio::time::timeout(Duration::from_secs(5), watch.next())
         .await
+        .map_err(|_| anyhow::anyhow!("observe stream yielded no first snapshot within 5s"))?
         .ok_or_else(|| anyhow::anyhow!("observe stream ended before first snapshot"))?;
     assert!(
         group0.chunk_ranges().is_subset(&first),
