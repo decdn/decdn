@@ -25,7 +25,7 @@
 
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alloy::dyn_abi::Eip712Domain;
@@ -34,10 +34,12 @@ use alloy::signers::local::PrivateKeySigner;
 use decdn_client_pull::buyer_channel::{
     LOW_WATER_DIVISOR, ensure_allowance, open_channel, refill_amount, top_up,
 };
+use decdn_client_pull::driver::{DriveConfig, MAX_TOPUP_SETTLE_WAITS, TOPUP_SETTLE_BACKOFF, drive};
+use decdn_client_pull::source::{Funder, SourceFuture};
 use decdn_client_pull::{
-    ChannelContext, ChannelLedger, Cumulative, ProgressCallback, PullDeadlines,
-    ResumeOffsetPastEnd, UpstreamRefused, UpstreamVoucherRejected, VoucherProgress,
-    open_progressive_pull, sign_client_binding,
+    BudgetPacer, ChannelContext, ChannelLedger, ClientRangedStore, Cumulative, PeerSource,
+    ProgressCallback, PullDeadlines, ResumeOffsetPastEnd, UpstreamRefused, UpstreamVoucherRejected,
+    VoucherProgress, open_progressive_pull, sign_client_binding,
 };
 use decdn_common::cli::{self, common::expand_tilde};
 use decdn_common::config::{DEFAULT_CHAIN_ID, FileConfig, load_file_config};
@@ -64,18 +66,10 @@ use decdn_client_pull::provider;
 /// (`--timeout-ms`); a dead candidate falls out of selection after this.
 const SELECT_PROBE_TIMEOUT_MS: u64 = 5_000;
 
-/// Reactive graduation (#1497): after an on-chain `topUp`, the node's settlement
-/// watcher can briefly lag the `ChannelToppedUp` event, so its pre-serve deposit
-/// gate (#1518) still sees the pre-top-up deposit and refuses the resumed open
-/// (collapsed to `NotFound`). The client that performed the top-up waits out that
-/// lag by retrying the open — money-safe, since an open sends no vouchers and does
-/// not move `byte_offset`. `MAX_TOPUP_SETTLE_WAITS * TOPUP_SETTLE_BACKOFF` bounds
-/// the total wait (15s), comfortably above the daemon's chain-event poll cadence
-/// yet well under a fetch's overall deadline.
-const MAX_TOPUP_SETTLE_WAITS: u32 = 30;
-/// Backoff between resume-open retries while waiting for the node's chain watcher
-/// to observe a just-landed top-up (see [`MAX_TOPUP_SETTLE_WAITS`]).
-const TOPUP_SETTLE_BACKOFF: Duration = Duration::from_millis(500);
+// `MAX_TOPUP_SETTLE_WAITS` / `TOPUP_SETTLE_BACKOFF` (#1497 reactive-graduation
+// settle-wait budget) live in `decdn_client_pull::driver` now, so this legacy
+// loop and `drive`'s `DriveConfig::cli` share one definition instead of two
+// that could silently diverge.
 
 /// Parse a user-supplied BLAKE3 hash: 64 hex chars, optionally `0x`- or
 /// `b3:`-prefixed (the `b3:` form is what bundle manifests carry).
@@ -870,20 +864,10 @@ fn annotate_unbound_cache_miss(err: anyhow::Error, ctx: &ChannelContext) -> anyh
     }
 }
 
-/// The scratch file a streaming fetch writes into before it is promoted to
-/// `--output`. Living beside the destination (not in `/tmp`) is what makes the
-/// final step an atomic same-filesystem rename, and what lets a later invocation
-/// find the partial and resume it.
-fn partial_path(output: &Path) -> PathBuf {
-    let mut name = output.as_os_str().to_os_string();
-    name.push(".partial");
-    PathBuf::from(name)
-}
-
-/// Outcome of a streaming fetch into the partial file.
+/// Outcome of a streaming fetch into the partial file (the legacy
+/// `fetch_blob_streaming` path still used by `bundle pull`; `decdn fetch` now
+/// runs the gap-driven `drive` instead).
 pub(crate) struct StreamedFetch {
-    /// Whole-blob size the node signed for.
-    total_bytes: u64,
     /// Byte offset this attempt started from — non-zero when a prior partial was
     /// resumed. Drives the whole-file re-hash, which is only needed when some of
     /// the output came off disk rather than off the verified wire.
@@ -1050,6 +1034,9 @@ where
             max_blob_bytes,
             max_rate_per_mb,
             deadlines,
+            // Whole-tail fetch; the gap-driven driver (#1608) is not wired in here
+            // yet (A5).
+            0,
         )
         .await;
 
@@ -1111,7 +1098,6 @@ where
             file.sync_all()
                 .map_err(|e| anyhow::anyhow!("sync {}: {e}", partial.display()))?;
             return Ok(StreamedFetch {
-                total_bytes,
                 resumed_from: byte_offset,
             });
         };
@@ -1179,10 +1165,7 @@ where
                      (no bytes re-fetched or re-paid)",
                     partial.display()
                 );
-                return Ok(StreamedFetch {
-                    total_bytes: existing_len,
-                    resumed_from: 0,
-                });
+                return Ok(StreamedFetch { resumed_from: 0 });
             }
             eprintln!(
                 "note: the node would not serve a resume at byte {byte_offset} of {}; \
@@ -1551,7 +1534,7 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
     // derived from the adopted channel's on-chain `provider`, and there is no
     // discovery/probe/select step to run before prompting for the keystore
     // password.
-    let (node_id, provider, mut ctx, slash_dom, contract, rpc, self_address) =
+    let (node_id, provider, ctx, slash_dom, contract, rpc, self_address) =
         if let Some(raw_channel_id) = &common.channel_id {
             let channel_id = parse_channel_id(raw_channel_id)?;
             let expected_provider = common
@@ -1670,72 +1653,253 @@ pub async fn fetch(args: &cli::FetchArgs, config_path: Option<&Path>) -> anyhow:
         .map_or(decdn_protocol::client::NO_NAMESPACE, |n| {
             alloy::primitives::U256::from(n).to_be_bytes()
         });
-    // Stream to `<output>.partial` rather than buffering the blob (#1120): peak
-    // memory becomes one chunk group instead of ~2× the blob, and an interrupted
-    // fetch leaves a resumable prefix behind instead of nothing. A prior partial
-    // is picked up automatically and only the un-fetched tail is re-paid for.
-    let partial = partial_path(&args.output);
-    let streamed = fetch_blob_streaming(
+    // A node that accepts the connection and never answers is as dead as one that
+    // stops mid-stream, so the same budget answers both (#1134). `capped` enforces
+    // that the hard cap outlasts them both — `ClientFetchArgs::validate` has already
+    // said so in the user's own flags, so this `?` is the belt to those braces.
+    let deadlines = PullDeadlines::capped(
+        common.stall_timeout(),
+        common.stall_timeout(),
+        common.hard_cap(),
+    )?;
+
+    // Immutable channel facts, captured before `ctx` moves behind the shared,
+    // interior-mutable handle the driver and source both read/write (#1608 A5).
+    let channel_id = ctx.channel_id;
+    let prior_nonce = ctx.prior_nonce;
+    let prior_bytes_delivered = ctx.prior_bytes_delivered;
+    let prior_amount = ctx.prior_amount;
+    let token = ctx.token;
+
+    // One ledger for this channel, seeded from its persisted cumulative state so
+    // the first voucher continues at `prior_nonce + 1` (the node rejects a
+    // restart-from-zero as a stale nonce). Shared (`Arc`) with the driver and
+    // source; the watermark to persist afterwards is read straight back off it.
+    let ledger = Arc::new(ChannelLedger::new(Cumulative {
+        nonce: prior_nonce,
+        bytes: prior_bytes_delivered,
+        amount: prior_amount,
+    }));
+
+    // Learn the whole-blob size before constructing the ranged store: the store is
+    // keyed on `(root, total_bytes)`, and the signed `StreamResponse` header is the
+    // authoritative source of `total_bytes`. This throwaway open is a handshake
+    // only — no voucher is signed until the first paid interval, so it pays nothing
+    // — and its pull is dropped immediately; `drive` re-opens exactly the gaps it
+    // needs. The cache-miss annotation is applied here too, so an unbound or
+    // underfunded refusal is still explained at this first contact.
+    let (header, first_pull) = open_progressive_pull(
         &endpoint,
-        target,
-        &mut ctx,
+        target.clone(),
+        &ctx,
+        Arc::clone(&ledger),
         &slash_dom,
         provider,
-        &store,
         hash,
         namespace_id,
-        // A node that accepts the connection and never answers is as dead as one that
-        // stops mid-stream, so the same budget answers both (#1134). `capped` enforces
-        // that the hard cap outlasts them both — `ClientFetchArgs::validate` has already
-        // said so in the user's own flags, so this `?` is the belt to that braces (#1145
-        // review).
-        PullDeadlines::capped(
-            common.stall_timeout(),
-            common.stall_timeout(),
-            common.hard_cap(),
-        )?,
+        0,
+        micros_now(),
         max_blob_bytes,
         common.max_rate_per_mb,
-        &partial,
-        Some(&on_progress),
-        // Reactive graduation (#1497): funding handles for a mid-fetch top-up.
-        &contract,
-        &rpc,
+        deadlines,
+        0,
+    )
+    .await
+    .map_err(|err| {
+        bar.finish_and_clear();
+        annotate_unbound_cache_miss(err, &ctx)
+    })?;
+    let total_bytes = header.total_bytes;
+    drop(first_pull);
+
+    // The store sits beside `--output`, keyed by the output's own file name, so
+    // its promoted final path IS `--output` (no post-finalize rename) and its
+    // `.partial` matches the pre-#1608 `<output>.partial` placement. A prior
+    // `.partial.ranges` record resumes; only `missing_ranges(R)` is re-pulled and
+    // no already-held byte is re-paid.
+    let (store_dir, stem) = ranged_store_location(&args.output)?;
+    let ranged_store = ClientRangedStore::open_or_create(&store_dir, &stem, hash, total_bytes)
+        .map_err(|e| {
+            bar.finish_and_clear();
+            anyhow::anyhow!("open ranged store for {}: {e}", args.output.display())
+        })?;
+
+    // `topUp` is funder-only on-chain, so a delegate voucher-signer (publisher-pays,
+    // #1481) cannot reactively top up — decided once here, up front.
+    let is_funder = store
+        .get_by_provider(provider)?
+        .map(|state| state.funder)
+        .is_some_and(|funder| funder == self_address);
+    let funder = CliFunder {
+        contract: &contract,
+        rpc: &rpc,
+        store: &store,
+        provider,
+        token,
         self_address,
-        chain.payment_channel,
-        chain.max_approve,
-        chain.working_deposit,
+        payment_channel_addr: chain.payment_channel,
+        max_approve: chain.max_approve,
+        is_funder,
+    };
+
+    // Share the context behind interior mutability: the source clones it to open
+    // each gap's pull, and the driver credits a mid-fetch top-up's new deposit
+    // through the same handle so the next open sees it.
+    let ctx = Arc::new(Mutex::new(ctx));
+    let peer_source = PeerSource::new(
+        &endpoint,
+        target,
+        Arc::clone(&ctx),
+        Arc::clone(&ledger),
+        &slash_dom,
+        provider,
+        namespace_id,
+        max_blob_bytes,
+        common.max_rate_per_mb,
+        deadlines,
+    );
+    let pacer = BudgetPacer::new();
+    let drive_config = DriveConfig::cli(chain.working_deposit);
+
+    // The gap-driven fetch: `drive` pulls ONLY `missing_ranges(0, 0)` — the whole
+    // blob on a fresh fetch, just the gap on a resume — into the ranged store,
+    // which bao-verifies every byte on `ingest_stream` and promotes the `.partial`
+    // to `--output` on `finalize`.
+    let drive_result = drive(
+        &ranged_store,
+        &peer_source,
+        &pacer,
+        &funder,
+        &ctx,
+        &ledger,
+        hash,
+        0,
+        0,
+        &drive_config,
+        Some(&on_progress),
     )
     .await;
+
     // Clear the bar before the terminal outcome (success line or error) so it
     // never overwrites the final message, on either path.
     bar.finish_and_clear();
-    // On error the partial file is deliberately LEFT in place — it is what the
-    // next invocation resumes from, and deleting it here would re-charge the user
-    // for every byte already paid for.
-    let streamed = streamed.map_err(|err| annotate_unbound_cache_miss(err, &ctx))?;
 
-    // A resumed fetch mixed bytes this process verified on the wire with bytes an
-    // earlier process left on disk; settle that prefix against the content hash
-    // before anything downstream trusts it. See [`verify_resumed_prefix`].
-    verify_resumed_prefix(hash, &partial, &streamed)?;
+    // Persist the voucher watermark from the shared ledger the same way the
+    // pre-#1608 loop's `watermark_after` chose it: on an explicit voucher
+    // rejection the acked (committed) watermark is safe; on an ambiguous failure
+    // settle HIGH (`settlement`) so a reuse never re-signs a spent nonce.
+    let progress = match &drive_result {
+        Ok(()) => VoucherProgress::from_cumulative(ledger.committed(), prior_nonce),
+        Err(err) if err.downcast_ref::<UpstreamVoucherRejected>().is_some() => {
+            VoucherProgress::from_cumulative(ledger.committed(), prior_nonce)
+        }
+        Err(_) => VoucherProgress::from_cumulative(ledger.settlement(), prior_nonce),
+    };
+    persist_watermark(&store, provider, channel_id, &progress);
 
-    // Promote the verified partial in place of a copy-through: an atomic rename
-    // on the same filesystem, so `--output` never exists in a half-written state
-    // and the blob is never held in memory to be written a second time.
-    std::fs::rename(&partial, &args.output).map_err(|e| {
-        anyhow::anyhow!(
-            "promote {} -> {}: {e}",
-            partial.display(),
-            args.output.display()
-        )
+    // On error the `.partial` + sidecars are deliberately LEFT in place — they are
+    // what the next invocation resumes from (only the still-missing gap is
+    // re-pulled, and no held byte is re-paid). The whole-file re-hash the old
+    // streaming path ran (`verify_resumed_prefix`) is GONE: the store bao-verifies
+    // every ingested byte and `finalize` runs a whole-blob `valid_ranges` sweep, so
+    // an inherited prefix is verified structurally, not by a second full re-hash.
+    drive_result.map_err(|err| match ctx.lock() {
+        Ok(guard) => annotate_unbound_cache_miss(err, &guard),
+        Err(_) => err,
     })?;
-    println!(
-        "fetched {} bytes -> {}",
-        streamed.total_bytes,
-        args.output.display()
-    );
+
+    println!("fetched {total_bytes} bytes -> {}", args.output.display());
     Ok(())
+}
+
+/// The CLI's [`Funder`] over its funding chain (#1608 A5): a mid-fetch reactive
+/// top-up runs the same `top_up_decision -> ensure_allowance -> top_up` path the
+/// pre-#1608 `fetch_blob_streaming` loop ran inline, now behind the driver's
+/// injected [`Funder`] seam so the gap driver stays chain-handle-agnostic. The
+/// driver decides WHETHER to fund (its pacer confirms a genuine, ledger-
+/// corroborated exhaustion and that budget/attempts remain); this only executes
+/// the on-chain move and returns the [`DepositOutcome`] for the driver to credit.
+struct CliFunder<'a, P> {
+    contract: &'a PaymentChannel::PaymentChannelInstance<P>,
+    rpc: &'a P,
+    store: &'a RedbBuyerChannelStore,
+    provider: Address,
+    token: Address,
+    self_address: Address,
+    payment_channel_addr: Address,
+    max_approve: bool,
+    /// Whether `self_address` is the channel's on-chain funder. `topUp` is
+    /// funder-only (`PaymentChannel.sol`), so a delegate voucher-signer
+    /// (publisher-pays, #1481) yields [`TopUpDecision::Exhausted`] and top-up
+    /// fails fast with an actionable message rather than an opaque revert.
+    is_funder: bool,
+}
+
+impl<P> Funder for CliFunder<'_, P>
+where
+    P: alloy::providers::Provider + Clone,
+{
+    fn max_topups(&self) -> u32 {
+        decdn_client_pull::MAX_TOPUP_ATTEMPTS
+    }
+
+    fn top_up(&self, additional: U256) -> SourceFuture<'_, DepositOutcome> {
+        Box::pin(async move {
+            match top_up_decision(additional, self.is_funder) {
+                TopUpDecision::TopUp(additional) => {
+                    // `topUp` pulls `additional` USDC via `transferFrom`, so the
+                    // standing allowance must cover it first: unlimited under
+                    // `--max-approve`, else exactly `additional`.
+                    ensure_allowance(
+                        self.rpc,
+                        self.token,
+                        self.self_address,
+                        self.payment_channel_addr,
+                        if self.max_approve {
+                            None
+                        } else {
+                            Some(additional)
+                        },
+                    )
+                    .await?;
+                    // The escrowed-but-untracked outcomes (`UnknownChannel` /
+                    // `ChannelMismatch`) come straight back for the driver to treat
+                    // as terminal — it will not credit a deposit it cannot track.
+                    top_up(self.contract, self.store, self.provider, additional).await
+                }
+                TopUpDecision::Exhausted => anyhow::bail!(
+                    "channel exhausted mid-fetch: this key ({}) only signs vouchers and is not \
+                     the channel's funder; it cannot top up — ask the funder to raise the deposit",
+                    self.self_address
+                ),
+                // The pacer only asks for a strictly-positive top-up, so a zero
+                // `additional` (`NotNeeded`) is unreachable; reject it defensively.
+                TopUpDecision::NotNeeded => anyhow::bail!(
+                    "reactive top-up requested with nothing to add (deposit already at the working \
+                     target)"
+                ),
+            }
+        })
+    }
+}
+
+/// Where the [`ClientRangedStore`] for `--output` lives: its directory (the
+/// output's parent, or the current dir) and its stem (the output's own file
+/// name). Keying the store by the output name makes its promoted final path IS
+/// `--output` (no post-finalize rename), and its `.partial` sits beside the
+/// destination exactly like the pre-#1608 `<output>.partial`, so promotion is a
+/// same-filesystem atomic rename.
+fn ranged_store_location(output: &Path) -> anyhow::Result<(PathBuf, String)> {
+    let dir = match output.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    let stem = output
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| anyhow::anyhow!("--output {} has no usable file name", output.display()))?
+        .to_string();
+    Ok((dir, stem))
 }
 
 /// After a streaming fetch into `partial`, confirm any bytes it did NOT itself
@@ -2601,15 +2765,25 @@ mod tests {
     }
 
     #[test]
-    fn partial_path_sits_beside_the_output() {
-        let p = partial_path(Path::new("/data/out/movie.mkv"));
-        assert_eq!(p, Path::new("/data/out/movie.mkv.partial"));
-        // A bare filename must stay relative — joining onto a parent of "" would
-        // otherwise send it to the filesystem root.
+    fn ranged_store_location_sits_beside_the_output() {
+        // The store's stem is the output's file name and its dir is the output's
+        // parent, so its promoted final path (`dir/stem`) IS `--output` and its
+        // `.partial` (`dir/{stem}.partial`) sits beside the destination — the
+        // pre-#1608 `<output>.partial` placement, without a post-finalize rename.
+        let (dir, stem) = ranged_store_location(Path::new("/data/out/movie.mkv")).unwrap();
+        assert_eq!(dir, Path::new("/data/out"));
+        assert_eq!(stem, "movie.mkv");
+        assert_eq!(dir.join(&stem), Path::new("/data/out/movie.mkv"));
         assert_eq!(
-            partial_path(Path::new("blob.bin")),
-            Path::new("blob.bin.partial")
+            dir.join(format!("{stem}.partial")),
+            Path::new("/data/out/movie.mkv.partial")
         );
+
+        // A bare filename must stay relative — the dir falls back to "." rather
+        // than joining onto a parent of "" (which would send it to the root).
+        let (dir, stem) = ranged_store_location(Path::new("blob.bin")).unwrap();
+        assert_eq!(dir, Path::new("."));
+        assert_eq!(stem, "blob.bin");
     }
 
     #[test]
