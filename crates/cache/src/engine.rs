@@ -15,12 +15,12 @@ use bao_tree::io::fsm::{ResponseDecoder, ResponseDecoderNext};
 use bao_tree::{BaoTree, ChunkRanges};
 use bytes::{Bytes, BytesMut};
 use futures_util::StreamExt;
-use iroh_blobs::Hash;
 use iroh_blobs::api::blobs::EncodedItem;
 use iroh_blobs::store::fs::FsStore;
 use iroh_blobs::store::fs::options::Options as FsStoreOptions;
 use iroh_blobs::store::{GcConfig, ProtectOutcome};
 use iroh_blobs::util::{RecvStream, RecvStreamAsyncStreamReader};
+use iroh_blobs::{Hash, HashAndFormat};
 use tokio::sync::{Notify, broadcast};
 
 use decdn_config_types::{CircuitBreakerPolicy, DeniedHashes, PinDiff, PinnedHashes, RetryPolicy};
@@ -1578,6 +1578,25 @@ impl CacheEngine {
         Ok(())
     }
 
+    /// Protect a partial (range-admitted) blob from GC by giving its raw hash a
+    /// deterministic named tag. Idempotent — `set` overwrites the same name, so
+    /// re-admitting more ranges never proliferates tags. The `decdn-partial-`
+    /// prefix is opaque to iroh-blobs; `drop_named_tags_for` (evict) matches by
+    /// hash and removes it. A GC sweep in the sub-second window between
+    /// `import_bao_bytes` and this `set` is bounded by the GC interval and
+    /// self-heals on the next admit. #1607.
+    async fn protect_partial(&self, hash: Hash) -> CacheResult<()> {
+        let name = format!("decdn-partial-{hash}");
+        self.inner
+            .store
+            .tags()
+            .set(name.as_bytes(), HashAndFormat::raw(hash))
+            .await
+            .map_err(|e| {
+                CacheError::Store(anyhow::Error::from(e).context("protect_partial: tags().set"))
+            })
+    }
+
     /// Delete every named tag pointing at `hash`, making the underlying
     /// bytes eligible for the iroh-blobs GC sweep.
     ///
@@ -2052,12 +2071,14 @@ impl CacheEngine {
     /// fallback is always correct; the optimization only reduces the origin
     /// hop's cost.
     ///
-    /// This is **partial**-blob population: unlike [`Self::populate`] it does
-    /// not promote a named tag or make [`Self::has`] return `true` (which
-    /// requires a `Complete` blob), and it does not announce a DHT insert — a
-    /// node holding only a range is not advertised as a full holder (ADR 037
-    /// §"partial warming copies are not advertised"). A subsequent whole-blob
-    /// pull-through (or further range pulls) completes the blob.
+    /// This is **partial**-blob population. It installs a deterministic
+    /// `decdn-partial-<hash>` named tag so the imported range survives GC
+    /// (#1607, via `protect_partial`) — but, unlike [`Self::populate`],
+    /// it does not make [`Self::has`] return `true` (which requires a `Complete`
+    /// blob), and it does not announce a DHT insert — a node holding only a
+    /// range is not advertised as a full holder (ADR 037 §"partial warming
+    /// copies are not advertised"). A subsequent whole-blob pull-through (or
+    /// further range pulls) completes the blob.
     ///
     /// # Errors
     ///
@@ -2229,6 +2250,8 @@ impl CacheEngine {
                 )
             })?;
 
+        self.protect_partial(hash).await?;
+
         Ok(RangePullOutcome::Served)
     }
 
@@ -2249,7 +2272,9 @@ impl CacheEngine {
             .await
             .map_err(|e| {
                 CacheError::Store(anyhow::Error::from(e).context("admit_bao: import_bao_bytes"))
-            })
+            })?;
+        self.protect_partial(hash).await?;
+        Ok(())
     }
 
     /// Best-effort total byte size of `hash` from the configured origins, for
@@ -4276,6 +4301,13 @@ where
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::cast_possible_truncation
+)]
 mod tests {
     use super::*;
     use std::future::Future;
@@ -7119,5 +7151,162 @@ mod tests {
             "no origin serves the outboard; open_local_outboard_pull should degrade to Ok(None)"
         );
         Ok(())
+    }
+
+    // -- #1607: admit_bao tags its partial so it survives GC --
+
+    fn synth_blob(len: usize) -> ([u8; 32], Vec<u8>, bytes::Bytes) {
+        let mut plaintext = vec![0u8; len];
+        let mut x: u32 = 0x9e37_79b9;
+        for b in &mut plaintext {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            *b = x.to_le_bytes()[0];
+        }
+        let ob = bao_tree::io::outboard::PreOrderMemOutboard::create(
+            &plaintext,
+            crate::range_pull::IROH_BLOCK_SIZE,
+        );
+        (*ob.root.as_bytes(), plaintext, bytes::Bytes::from(ob.data))
+    }
+
+    fn bao_for(
+        root: [u8; 32],
+        plaintext: &[u8],
+        outboard: bytes::Bytes,
+        off: u64,
+        len: u64,
+        total: u64,
+    ) -> (Hash, bao_tree::ChunkRanges, bytes::Bytes) {
+        let aligned = crate::range_pull::align_range(off, len, total).unwrap();
+        let s = aligned.fetch_start() as usize;
+        let e = aligned.fetch_end() as usize;
+        let encoded =
+            crate::range_pull::encode_verified_range(root, &aligned, &plaintext[s..e], outboard)
+                .unwrap();
+        (Hash::from(root), aligned.chunk_ranges().clone(), encoded)
+    }
+
+    async fn count_tags_for(engine: &CacheEngine, hash: Hash) -> usize {
+        let mut stream = engine.inner.store.tags().list().await.unwrap();
+        let mut n = 0usize;
+        while let Some(info) = stream.next().await {
+            if info.unwrap().hash == hash {
+                n += 1;
+            }
+        }
+        n
+    }
+
+    #[tokio::test]
+    async fn admit_bao_tags_the_partial() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = CacheEngine::open(tmp.path(), vec![], 16).await.unwrap();
+        let group = crate::CHUNK_GROUP_BYTES;
+        let total = 4 * group;
+        let (root, plaintext, outboard) = synth_blob(total as usize);
+
+        // Admit one interior group -> a genuine partial.
+        let (hash, ranges, bao) = bao_for(root, &plaintext, outboard.clone(), group, group, total);
+        engine.admit_bao(hash, ranges, bao).await.unwrap();
+        assert!(
+            !engine.present_ranges(hash).await.unwrap().is_complete(),
+            "still partial"
+        );
+        assert_eq!(
+            count_tags_for(&engine, hash).await,
+            1,
+            "partial admit creates exactly one protecting tag"
+        );
+
+        // Idempotent: admit a second group -> still exactly one tag.
+        let (h2, r2, b2) = bao_for(root, &plaintext, outboard, 2 * group, group, total);
+        engine.admit_bao(h2, r2, b2).await.unwrap();
+        assert_eq!(
+            count_tags_for(&engine, hash).await,
+            1,
+            "re-admit does not proliferate tags"
+        );
+    }
+
+    #[tokio::test]
+    async fn tagged_partial_survives_gc_untagged_is_reclaimed() {
+        use iroh_blobs::api::blobs::BlobStatus;
+        let group = crate::CHUNK_GROUP_BYTES;
+        let total = 4 * group;
+        let tmp = tempfile::tempdir().unwrap();
+        // Short GC interval so the store's internal run_gc loop sweeps quickly.
+        let engine = CacheEngine::open_full(
+            tmp.path(),
+            vec![],
+            16,
+            PinnedHashes::empty(),
+            RetryPolicy::disabled(),
+            CircuitBreakerPolicy::default(),
+            Some(std::sync::Arc::new(CacheMetrics::default())),
+            std::time::Duration::from_millis(200),
+        )
+        .await
+        .unwrap();
+
+        // Tagged: normal admit_bao (protect_partial fires).
+        let (root_a, pt_a, ob_a) = synth_blob(total as usize);
+        let (ha, ra, ba) = bao_for(root_a, &pt_a, ob_a, group, group, total);
+        engine.admit_bao(ha, ra, ba).await.unwrap();
+
+        // Control: same shape, distinct hash, imported WITHOUT a tag (pre-#1607).
+        let (root_b, pt_b, ob_b) = synth_blob((total + group) as usize); // different len -> different root
+        let (hb, rb, bb) = bao_for(root_b, &pt_b, ob_b, group, group, total + group);
+        engine
+            .inner
+            .store
+            .blobs()
+            .import_bao_bytes(hb, rb, bb)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            engine.inner.store.blobs().status(ha).await.unwrap(),
+            BlobStatus::Partial { .. }
+        ));
+        assert!(matches!(
+            engine.inner.store.blobs().status(hb).await.unwrap(),
+            BlobStatus::Partial { .. }
+        ));
+
+        // Poll for the control's reclaim rather than sleeping a fixed span:
+        // fails fast once GC sweeps (typically the first 200ms interval), and
+        // only fails if GC never reclaims the untagged control within a generous
+        // budget — robust on slow/loaded CI and independent of the exact GC
+        // interval. The control's `NotFound` gates the test, so a genuine GC
+        // failure still fails loud; it can never silently pass.
+        let deadline = std::time::Duration::from_secs(15);
+        let poll = std::time::Duration::from_millis(50);
+        let start = std::time::Instant::now();
+        loop {
+            let reclaimed = matches!(
+                engine.inner.store.blobs().status(hb).await.unwrap(),
+                BlobStatus::NotFound
+            );
+            if reclaimed {
+                break;
+            }
+            assert!(
+                start.elapsed() < deadline,
+                "control never reclaimed within {deadline:?}: GC did not run"
+            );
+            tokio::time::sleep(poll).await;
+        }
+
+        // The tagged partial must STILL be present after the control was swept —
+        // proving the tag (not timing) is what protected it.
+        assert!(
+            matches!(
+                engine.inner.store.blobs().status(ha).await.unwrap(),
+                BlobStatus::Partial { .. }
+            ),
+            "tagged partial survives GC"
+        );
     }
 }
