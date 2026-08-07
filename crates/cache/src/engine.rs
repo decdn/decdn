@@ -1411,6 +1411,53 @@ impl CacheEngine {
         })
     }
 
+    /// A live watch of which chunk ranges of `hash` are present, for progressive
+    /// serve-while-filling (#1621 Task 4). Yields the current bitfield's
+    /// [`bao_tree::ChunkRanges`] first, then further updates as the blob fills.
+    ///
+    /// Mirrors [`Self::present_ranges`]'s guards (refuse an evicted/blacklisted
+    /// hash, gate a never-seen hash via `status()` before observing — a hash
+    /// with no defined current state has nothing to watch), but stays a live
+    /// stream instead of a point-in-time snapshot. Deliberately uses
+    /// `ObserveProgress::stream()`, NEVER `await_completion`, which blocks
+    /// until the blob is complete and would hang forever on a partial blob.
+    pub async fn observe_present_ranges(
+        &self,
+        hash: Hash,
+    ) -> CacheResult<Pin<Box<dyn futures_util::Stream<Item = bao_tree::ChunkRanges> + Send>>> {
+        use futures_util::StreamExt;
+        // Same guards as `present_ranges`: never observe an evicted/blacklisted
+        // hash, and gate a never-seen hash (observe has no defined current state).
+        if self.refuses(hash) {
+            return Err(CacheError::Store(anyhow::anyhow!(
+                "observe_present_ranges: hash is evicted/blacklisted"
+            )));
+        }
+        let status = self
+            .inner
+            .store
+            .blobs()
+            .status(hash)
+            .await
+            .map_err(|e| CacheError::Store(anyhow::Error::from(e)))?;
+        if matches!(status, iroh_blobs::api::blobs::BlobStatus::NotFound) {
+            return Err(CacheError::Store(anyhow::anyhow!(
+                "observe_present_ranges: blob not present"
+            )));
+        }
+        // `.stream()` yields the current bitfield first, then updates. NEVER
+        // `.await_completion()` — it loops until complete and hangs on a partial.
+        let stream = self
+            .inner
+            .store
+            .blobs()
+            .observe(hash)
+            .stream()
+            .await
+            .map_err(|e| CacheError::Store(anyhow::Error::from(e)))?;
+        Ok(Box::pin(stream.map(|bf| bf.ranges)))
+    }
+
     /// The chunk-aligned sub-ranges of `[byte_offset, byte_offset + byte_len)`
     /// (`byte_len == 0` = to `blob_size`) that are NOT present on disk.
     ///

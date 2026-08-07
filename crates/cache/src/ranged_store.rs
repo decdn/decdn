@@ -13,6 +13,7 @@ use decdn_bao_range::{AlignedRange, RangedFuture, RangedStore, RangedStoreError}
 use iroh_blobs::Hash;
 
 use crate::engine::CacheEngine;
+use crate::serve_store::{EncodeStream, PresentRangeWatch, ServeStore};
 
 /// Node-side [`RangedStore`]: a per-blob view over the iroh-blobs cache.
 #[derive(Debug)]
@@ -121,6 +122,30 @@ impl RangedStore for NodeRangedStore {
             } else {
                 Err(RangedStoreError::Incomplete)
             }
+        })
+    }
+}
+
+impl ServeStore for NodeRangedStore {
+    fn observe(&self) -> RangedFuture<'_, PresentRangeWatch> {
+        Box::pin(async move {
+            self.engine
+                .observe_present_ranges(self.hash)
+                .await
+                .map_err(backend)
+        })
+    }
+
+    fn encode_range(&self, byte_offset: u64, byte_len: u64) -> RangedFuture<'_, EncodeStream> {
+        Box::pin(async move {
+            let stream = self
+                .engine
+                .export_bao_range_stream(self.hash, byte_offset, byte_len, self.total_bytes)
+                .await
+                .map_err(backend)?;
+            Ok(Box::pin(futures_util::StreamExt::map(stream, |item| {
+                item.map_err(backend)
+            })) as EncodeStream)
         })
     }
 }
