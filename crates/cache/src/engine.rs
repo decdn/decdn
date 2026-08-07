@@ -7164,7 +7164,7 @@ mod tests {
         }
         let ob = bao_tree::io::outboard::PreOrderMemOutboard::create(
             &plaintext,
-            decdn_bao_range::IROH_BLOCK_SIZE,
+            crate::range_pull::IROH_BLOCK_SIZE,
         );
         (*ob.root.as_bytes(), plaintext, bytes::Bytes::from(ob.data))
     }
@@ -7177,11 +7177,11 @@ mod tests {
         len: u64,
         total: u64,
     ) -> (Hash, bao_tree::ChunkRanges, bytes::Bytes) {
-        let aligned = decdn_bao_range::align_range(off, len, total).unwrap();
+        let aligned = crate::range_pull::align_range(off, len, total).unwrap();
         let s = aligned.fetch_start() as usize;
         let e = aligned.fetch_end() as usize;
         let encoded =
-            decdn_bao_range::encode_verified_range(root, &aligned, &plaintext[s..e], outboard)
+            crate::range_pull::encode_verified_range(root, &aligned, &plaintext[s..e], outboard)
                 .unwrap();
         (Hash::from(root), aligned.chunk_ranges().clone(), encoded)
     }
@@ -7201,7 +7201,7 @@ mod tests {
     async fn admit_bao_tags_the_partial() {
         let tmp = tempfile::tempdir().unwrap();
         let engine = CacheEngine::open(tmp.path(), vec![], 16).await.unwrap();
-        let group = decdn_bao_range::CHUNK_GROUP_BYTES;
+        let group = crate::CHUNK_GROUP_BYTES;
         let total = 4 * group;
         let (root, plaintext, outboard) = synth_blob(total as usize);
 
@@ -7231,7 +7231,7 @@ mod tests {
     #[tokio::test]
     async fn tagged_partial_survives_gc_untagged_is_reclaimed() {
         use iroh_blobs::api::blobs::BlobStatus;
-        let group = decdn_bao_range::CHUNK_GROUP_BYTES;
+        let group = crate::CHUNK_GROUP_BYTES;
         let total = 4 * group;
         let tmp = tempfile::tempdir().unwrap();
         // Short GC interval so the store's internal run_gc loop sweeps quickly.
@@ -7273,7 +7273,11 @@ mod tests {
             BlobStatus::Partial { .. }
         ));
 
-        // Wait out several 200ms sweeps.
+        // Wait out several sweeps. The 1500ms sleep must stay a comfortable
+        // multiple of the 200ms GC interval above; if that interval is retuned,
+        // scale this to keep the control's reclaim deterministic. The control's
+        // `NotFound` assertion gates the test, so any drift fails loud (a false
+        // negative), never silently passes.
         tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
 
         assert!(
