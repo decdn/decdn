@@ -2248,6 +2248,8 @@ impl CacheEngine {
                 )
             })?;
 
+        self.protect_partial(hash).await?;
+
         Ok(RangePullOutcome::Served)
     }
 
@@ -7223,6 +7225,70 @@ mod tests {
             count_tags_for(&engine, hash).await,
             1,
             "re-admit does not proliferate tags"
+        );
+    }
+
+    #[tokio::test]
+    async fn tagged_partial_survives_gc_untagged_is_reclaimed() {
+        use iroh_blobs::api::blobs::BlobStatus;
+        let group = decdn_bao_range::CHUNK_GROUP_BYTES;
+        let total = 4 * group;
+        let tmp = tempfile::tempdir().unwrap();
+        // Short GC interval so the store's internal run_gc loop sweeps quickly.
+        let engine = CacheEngine::open_full(
+            tmp.path(),
+            vec![],
+            16,
+            PinnedHashes::empty(),
+            RetryPolicy::disabled(),
+            CircuitBreakerPolicy::default(),
+            Some(std::sync::Arc::new(CacheMetrics::default())),
+            std::time::Duration::from_millis(200),
+        )
+        .await
+        .unwrap();
+
+        // Tagged: normal admit_bao (protect_partial fires).
+        let (root_a, pt_a, ob_a) = synth_blob(total as usize);
+        let (ha, ra, ba) = bao_for(root_a, &pt_a, ob_a, group, group, total);
+        engine.admit_bao(ha, ra, ba).await.unwrap();
+
+        // Control: same shape, distinct hash, imported WITHOUT a tag (pre-#1607).
+        let (root_b, pt_b, ob_b) = synth_blob((total + group) as usize); // different len -> different root
+        let (hb, rb, bb) = bao_for(root_b, &pt_b, ob_b, group, group, total + group);
+        engine
+            .inner
+            .store
+            .blobs()
+            .import_bao_bytes(hb, rb, bb)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            engine.inner.store.blobs().status(ha).await.unwrap(),
+            BlobStatus::Partial { .. }
+        ));
+        assert!(matches!(
+            engine.inner.store.blobs().status(hb).await.unwrap(),
+            BlobStatus::Partial { .. }
+        ));
+
+        // Wait out several 200ms sweeps.
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+
+        assert!(
+            matches!(
+                engine.inner.store.blobs().status(hb).await.unwrap(),
+                BlobStatus::NotFound
+            ),
+            "control proves GC ran: untagged partial reclaimed"
+        );
+        assert!(
+            matches!(
+                engine.inner.store.blobs().status(ha).await.unwrap(),
+                BlobStatus::Partial { .. }
+            ),
+            "tagged partial survives GC"
         );
     }
 }
