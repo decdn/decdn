@@ -14,7 +14,7 @@
 //! money-relevant branches but re-frames them around gaps:
 //!
 //! - **Draw** (the happy path): open the gap's [`AlignedRange`](decdn_bao_range::AlignedRange), stream it through
-//!   [`ClientRangedStore::ingest_stream`] (which durably checkpoints as it goes),
+//!   [`crate::ClientRangedStore::ingest_stream`] (which durably checkpoints as it goes),
 //!   then [`BlobSource::finish`] to drain the pull and recover the acked voucher
 //!   watermark. The store's checkpoints are what make a mid-gap fault re-enter
 //!   with a SMALLER gap, so a resume never re-pulls a checkpointed prefix — the
@@ -22,7 +22,7 @@
 //! - **Reactive top-up**: a genuine mid-fetch exhaustion (confirmed against our
 //!   OWN ledger via [`genuine_exhaustion`]) is funded through [`Funder::top_up`],
 //!   then the gap is retried at its PAID frontier — NOT its checkpointed
-//!   (delivered) frontier. [`ClientRangedStore::ingest_stream`] checkpoints
+//!   (delivered) frontier. [`crate::ClientRangedStore::ingest_stream`] checkpoints
 //!   delivered+verified bytes payment-agnostically (the ADR 003 credit window
 //!   lets the node stream a full interval before the voucher that pays for it is
 //!   due), so a mid-leg exhaustion can leave the store's present-range frontier
@@ -47,7 +47,7 @@
 //!
 //! - The **stale-foreign-partial restart-from-zero**. The CLI kept an opaque
 //!   `.partial` with no outboard, so an ambiguous `NotFound` could mean "this file
-//!   belongs to another blob" and it rewound to zero. A [`ClientRangedStore`] is
+//!   belongs to another blob" and it rewound to zero. A [`crate::ClientRangedStore`] is
 //!   keyed to `(root, total_bytes)` and only ever holds bao-verified ranges, so
 //!   there is no foreign-partial ambiguity to resolve — resume is always driven by
 //!   the verified present set.
@@ -58,26 +58,25 @@
 //!
 //! # Store abstraction
 //!
-//! The store is the concrete `&ClientRangedStore` for now — it is the only
-//! backend that exposes `missing_ranges` / `ingest_stream` / `finalize`. Phase B
-//! will abstract the store-plus-sink behind a trait once the node's tee sink
-//! exists; its shape is not known yet, so this does NOT pre-invent a `Sink` trait
-//! (YAGNI).
+//! The store is generic over [`crate::source::IngestStore`] (`RangedStore` +
+//! `ingest_stream`), not the concrete `&ClientRangedStore` — [`crate::ClientRangedStore`]
+//! is one implementer (the CLI/client backend, writing `.partial`/`.obao4`); a
+//! node backend (B2) admits to the cache and tees to its downstream client
+//! through the same seam.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use alloy::primitives::U256;
 use bao_tree::ChunkRanges;
-use decdn_bao_range::{RangedStore, align_range};
+use decdn_bao_range::align_range;
 use decdn_incentive::DepositOutcome;
 
 use crate::pacer::{PaceDecision, PaceState};
-use crate::source::{BlobSource, Funder};
+use crate::source::{BlobSource, Funder, IngestStore};
 use crate::{
-    ChannelContext, ChannelLedger, ClientRangedStore, Cumulative, MAX_RESUME_ATTEMPTS, Pacer,
-    ProgressCallback, UpstreamPullHeader, genuine_exhaustion, resumable_watermark,
-    resume_may_be_stale,
+    ChannelContext, ChannelLedger, Cumulative, MAX_RESUME_ATTEMPTS, Pacer, ProgressCallback,
+    UpstreamPullHeader, genuine_exhaustion, resumable_watermark, resume_may_be_stale,
 };
 
 /// Read the channel context's current deposit through the shared handle. A tiny
@@ -207,7 +206,7 @@ fn ranges_content_len(ranges: &ChunkRanges, total_bytes: u64) -> u64 {
 ///    finishes the pull. A mid-gap fault re-enters with the checkpointed prefix
 ///    already held, so the re-open covers only the un-checkpointed tail.
 /// 3. When the request's gaps are all filled AND the whole blob is present,
-///    [`finalize`](ClientRangedStore::finalize) it (promoting `.partial` to its
+///    [`finalize`](decdn_bao_range::RangedStore::finalize) it (promoting `.partial` to its
 ///    final path). For a partial `R` that does not complete the blob, `drive`
 ///    returns `Ok(())` and leaves finalization to a later whole-blob fetch — the
 ///    store cannot promote a blob that is still missing bytes outside `R`.
@@ -218,8 +217,8 @@ fn ranges_content_len(ranges: &ChunkRanges, total_bytes: u64) -> u64 {
 /// fault that is neither a healable desync nor a fundable exhaustion, an escrowed-
 /// but-untracked top-up outcome, or a `finalize` failure.
 #[allow(clippy::too_many_arguments)]
-pub async fn drive<S, P, F>(
-    store: &ClientRangedStore,
+pub async fn drive<St, S, P, F>(
+    store: &St,
     source: &S,
     pacer: &P,
     funder: &F,
@@ -232,6 +231,7 @@ pub async fn drive<S, P, F>(
     on_progress: Option<&ProgressCallback>,
 ) -> anyhow::Result<()>
 where
+    St: IngestStore,
     S: BlobSource,
     P: Pacer,
     F: Funder,
@@ -286,8 +286,8 @@ where
 // terminal); splitting them out would separate those from the loop state they act
 // on, exactly as the CLI's `fetch_blob_streaming` keeps them together.
 #[allow(clippy::too_many_lines)]
-async fn fill_gap<S, P, F>(
-    store: &ClientRangedStore,
+async fn fill_gap<St, S, P, F>(
+    store: &St,
     source: &S,
     pacer: &P,
     funder: &F,
@@ -302,6 +302,7 @@ async fn fill_gap<S, P, F>(
     on_progress: Option<&ProgressCallback>,
 ) -> anyhow::Result<()>
 where
+    St: IngestStore,
     S: BlobSource,
     P: Pacer,
     F: Funder,

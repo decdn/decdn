@@ -102,6 +102,38 @@ pub trait BlobSource: Send + Sync {
     fn finish(&self, reader: Self::Reader) -> SourceFuture<'_, VoucherProgress>;
 }
 
+/// The store/sink capability the gap-driven [`crate::drive`] needs beyond
+/// [`decdn_bao_range::RangedStore`]'s queries: ingest one gap's raw bao. The
+/// client backend writes `.partial`/`.obao4`; a node backend (B2) admits to
+/// the cache and tees to its downstream client. Kept a generic method (not
+/// `dyn`) so an impl can stream any [`BaoRangeReader`]; `drive` is already
+/// fully generic.
+///
+/// The returned future is intentionally NOT `Send`-bounded, unlike
+/// [`SourceFuture`]. [`iroh_io::AsyncStreamReader`]'s methods are
+/// return-position-impl-trait-in-trait with no `Send` bound on the trait
+/// itself, so a method generic over `R: BaoRangeReader` (as this one must be,
+/// to stream ANY reader an [`IngestStore`] impl is handed) can never prove its
+/// decode-loop future is `Send` for an arbitrary `R` — only a concrete,
+/// non-generic instantiation could. `drive`/`fill_gap` only ever `.await` this
+/// future in place (never spawn it across a task boundary), so dropping `Send`
+/// here is behavior-preserving.
+pub trait IngestStore: decdn_bao_range::RangedStore {
+    /// Decode-and-admit the raw bao bytes in `reader` as `range`'s content,
+    /// verifying against the store's rooted hash as it streams. Returns the
+    /// drained `reader` (its typed fault, if any, surfaces via
+    /// [`StashedFault`] on the caller's copy) so the
+    /// source can [`finish`](BlobSource::finish) the pull.
+    fn ingest_stream<'a, R>(
+        &'a self,
+        range: &'a AlignedRange,
+        reader: R,
+        on_progress: Option<&'a (dyn Fn(u64) + Send + Sync)>,
+    ) -> core::pin::Pin<Box<dyn core::future::Future<Output = anyhow::Result<R>> + 'a>>
+    where
+        R: BaoRangeReader + 'a;
+}
+
 /// The injected channel top-up seam. Wraps the deployment's funding path
 /// ([`crate::buyer_channel::top_up`] over the CLI's chain handle; the node's
 /// `top_up_channel` later) so the driver and [`BlobSource`] never name a contract
