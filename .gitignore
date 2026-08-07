@@ -26,6 +26,10 @@
 /adr/adrs-book.pdf
 mermaid-filter.err
 
+# cargo-semver-checks-action scratch dir; left in the tree, would make
+# cargo-release's clean-tree check fail during the release workflow
+/semver-checks/
+
 # Python
 __pycache__/
 *.py[cod]
