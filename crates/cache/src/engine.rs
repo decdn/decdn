@@ -15,12 +15,12 @@ use bao_tree::io::fsm::{ResponseDecoder, ResponseDecoderNext};
 use bao_tree::{BaoTree, ChunkRanges};
 use bytes::{Bytes, BytesMut};
 use futures_util::StreamExt;
-use iroh_blobs::Hash;
 use iroh_blobs::api::blobs::EncodedItem;
 use iroh_blobs::store::fs::FsStore;
 use iroh_blobs::store::fs::options::Options as FsStoreOptions;
 use iroh_blobs::store::{GcConfig, ProtectOutcome};
 use iroh_blobs::util::{RecvStream, RecvStreamAsyncStreamReader};
+use iroh_blobs::{Hash, HashAndFormat};
 use tokio::sync::{Notify, broadcast};
 
 use decdn_config_types::{CircuitBreakerPolicy, DeniedHashes, PinDiff, PinnedHashes, RetryPolicy};
@@ -1578,6 +1578,25 @@ impl CacheEngine {
         Ok(())
     }
 
+    /// Protect a partial (range-admitted) blob from GC by giving its raw hash a
+    /// deterministic named tag. Idempotent — `set` overwrites the same name, so
+    /// re-admitting more ranges never proliferates tags. The `decdn-partial-`
+    /// prefix is opaque to iroh-blobs; `drop_named_tags_for` (evict) matches by
+    /// hash and removes it. A GC sweep in the sub-second window between
+    /// `import_bao_bytes` and this `set` is bounded by the GC interval and
+    /// self-heals on the next admit. #1607.
+    async fn protect_partial(&self, hash: Hash) -> CacheResult<()> {
+        let name = format!("decdn-partial-{hash}");
+        self.inner
+            .store
+            .tags()
+            .set(name.as_bytes(), HashAndFormat::raw(hash))
+            .await
+            .map_err(|e| {
+                CacheError::Store(anyhow::Error::from(e).context("protect_partial: tags().set"))
+            })
+    }
+
     /// Delete every named tag pointing at `hash`, making the underlying
     /// bytes eligible for the iroh-blobs GC sweep.
     ///
@@ -2249,7 +2268,9 @@ impl CacheEngine {
             .await
             .map_err(|e| {
                 CacheError::Store(anyhow::Error::from(e).context("admit_bao: import_bao_bytes"))
-            })
+            })?;
+        self.protect_partial(hash).await?;
+        Ok(())
     }
 
     /// Best-effort total byte size of `hash` from the configured origins, for
@@ -4276,6 +4297,13 @@ where
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::cast_possible_truncation
+)]
 mod tests {
     use super::*;
     use std::future::Future;
@@ -7119,5 +7147,82 @@ mod tests {
             "no origin serves the outboard; open_local_outboard_pull should degrade to Ok(None)"
         );
         Ok(())
+    }
+
+    // -- #1607: admit_bao tags its partial so it survives GC --
+
+    fn synth_blob(len: usize) -> ([u8; 32], Vec<u8>, bytes::Bytes) {
+        let mut plaintext = vec![0u8; len];
+        let mut x: u32 = 0x9e37_79b9;
+        for b in &mut plaintext {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            *b = x.to_le_bytes()[0];
+        }
+        let ob = bao_tree::io::outboard::PreOrderMemOutboard::create(
+            &plaintext,
+            decdn_bao_range::IROH_BLOCK_SIZE,
+        );
+        (*ob.root.as_bytes(), plaintext, bytes::Bytes::from(ob.data))
+    }
+
+    fn bao_for(
+        root: [u8; 32],
+        plaintext: &[u8],
+        outboard: bytes::Bytes,
+        off: u64,
+        len: u64,
+        total: u64,
+    ) -> (Hash, bao_tree::ChunkRanges, bytes::Bytes) {
+        let aligned = decdn_bao_range::align_range(off, len, total).unwrap();
+        let s = aligned.fetch_start() as usize;
+        let e = aligned.fetch_end() as usize;
+        let encoded =
+            decdn_bao_range::encode_verified_range(root, &aligned, &plaintext[s..e], outboard)
+                .unwrap();
+        (Hash::from(root), aligned.chunk_ranges().clone(), encoded)
+    }
+
+    async fn count_tags_for(engine: &CacheEngine, hash: Hash) -> usize {
+        let mut stream = engine.inner.store.tags().list().await.unwrap();
+        let mut n = 0usize;
+        while let Some(info) = stream.next().await {
+            if info.unwrap().hash == hash {
+                n += 1;
+            }
+        }
+        n
+    }
+
+    #[tokio::test]
+    async fn admit_bao_tags_the_partial() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = CacheEngine::open(tmp.path(), vec![], 16).await.unwrap();
+        let group = decdn_bao_range::CHUNK_GROUP_BYTES;
+        let total = 4 * group;
+        let (root, plaintext, outboard) = synth_blob(total as usize);
+
+        // Admit one interior group -> a genuine partial.
+        let (hash, ranges, bao) = bao_for(root, &plaintext, outboard.clone(), group, group, total);
+        engine.admit_bao(hash, ranges, bao).await.unwrap();
+        assert!(
+            !engine.present_ranges(hash).await.unwrap().is_complete(),
+            "still partial"
+        );
+        assert_eq!(
+            count_tags_for(&engine, hash).await,
+            1,
+            "partial admit creates exactly one protecting tag"
+        );
+
+        // Idempotent: admit a second group -> still exactly one tag.
+        let (h2, r2, b2) = bao_for(root, &plaintext, outboard, 2 * group, group, total);
+        engine.admit_bao(h2, r2, b2).await.unwrap();
+        assert_eq!(
+            count_tags_for(&engine, hash).await,
+            1,
+            "re-admit does not proliferate tags"
+        );
     }
 }
