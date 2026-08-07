@@ -929,25 +929,27 @@ const STAGING_DIR: &str = ".decdn-partial";
 fn staging_path(out_root: &Path, hash: [u8; 32]) -> anyhow::Result<PathBuf> {
     let dir = out_root.join(STAGING_DIR);
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-    Ok(dir.join(blake3::Hash::from_bytes(hash).to_hex().as_str()))
+    let name = blake3::Hash::from_bytes(hash).to_hex().to_string();
+    Ok(dir.join(name))
 }
 
 /// Best-effort cleanup of a finalized staging blob whose content is safely
 /// elsewhere (materialized to disk, or read into memory) and so has nothing left
-/// to resume. Removes the plain `<hex>` file and, best-effort, any leftover
-/// `<hex>.partial{,.obao4,.ranges}` sidecars: `drive_fetch`'s `finalize` normally
-/// clears those on success, but this is the belt to that brace and never runs on
-/// an errored entry (whose sidecars are the resume prefix a retry needs). A
-/// leftover here is harmless clutter, not a correctness issue, so a removal
-/// failure is reported and swallowed rather than propagated.
+/// to resume. Removes the plain `<hex>` finalized blob itself and, best-effort,
+/// any leftover `<hex>.partial{,.obao4,.ranges}` sidecars: `drive_fetch`'s
+/// `finalize` normally clears those on success, but this is the belt to that
+/// brace and never runs on an errored entry (whose sidecars are the resume
+/// prefix a retry needs). A leftover here is harmless clutter, not a
+/// correctness issue, so a removal failure is reported and swallowed rather
+/// than propagated.
 fn remove_staging(staging: &Path) {
-    let sidecars = [
+    let paths_to_remove = [
         staging.to_path_buf(),
         staging.with_extension("partial"),
         staging.with_extension("partial.obao4"),
         staging.with_extension("partial.ranges"),
     ];
-    for path in sidecars {
+    for path in paths_to_remove {
         if let Err(e) = std::fs::remove_file(&path)
             && e.kind() != std::io::ErrorKind::NotFound
         {

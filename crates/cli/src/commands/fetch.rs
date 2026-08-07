@@ -1143,6 +1143,35 @@ pub(crate) struct DriveFetchDeps<'a, P> {
 /// share it (the source clones it to open each gap's pull; the driver credits a
 /// mid-fetch top-up's new deposit through the same handle so the next open sees
 /// it).
+/// Which ledger reader `drive_fetch` persists, per drive outcome. This is
+/// money: the store refuses to regress a watermark (`AdvanceOutcome::Regressed`
+/// is warn-only), so a value written here is effectively permanent.
+///
+/// - `Ok` → `committed`, what the pull reported was acked.
+/// - Explicit `UpstreamVoucherRejected` → `committed`. The node refused a
+///   voucher and tore the stream down, applying vouchers in strict nonce
+///   order, so anything pipelined behind the rejected one was provably never
+///   taken. Settling at `settlement` would still count those followers and
+///   could inflate the persisted amount past what the node actually holds.
+/// - Any other `Err` → `settlement`, the high reader. The upstream persists a
+///   voucher before acking, so an ambiguous failure (stall, IO error, …)
+///   probably holds the armed ones; settling low risks re-signing a spent
+///   nonce and wedging the channel (#1122).
+fn select_watermark(
+    outcome: &anyhow::Result<()>,
+    committed: Cumulative,
+    settlement: Cumulative,
+    prior_nonce: U256,
+) -> VoucherProgress {
+    match outcome {
+        Ok(()) => VoucherProgress::from_cumulative(committed, prior_nonce),
+        Err(err) if err.downcast_ref::<UpstreamVoucherRejected>().is_some() => {
+            VoucherProgress::from_cumulative(committed, prior_nonce)
+        }
+        Err(_) => VoucherProgress::from_cumulative(settlement, prior_nonce),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn drive_fetch<P>(
     deps: &DriveFetchDeps<'_, P>,
@@ -1278,13 +1307,12 @@ where
     // pre-#1608 loop's `watermark_after` chose it: on an explicit voucher
     // rejection the acked (committed) watermark is safe; on an ambiguous failure
     // settle HIGH (`settlement`) so a reuse never re-signs a spent nonce.
-    let vprogress = match &drive_result {
-        Ok(()) => VoucherProgress::from_cumulative(ledger.committed(), prior_nonce),
-        Err(err) if err.downcast_ref::<UpstreamVoucherRejected>().is_some() => {
-            VoucherProgress::from_cumulative(ledger.committed(), prior_nonce)
-        }
-        Err(_) => VoucherProgress::from_cumulative(ledger.settlement(), prior_nonce),
-    };
+    let vprogress = select_watermark(
+        &drive_result,
+        ledger.committed(),
+        ledger.settlement(),
+        prior_nonce,
+    );
     persist_watermark(deps.store, provider, channel_id, &vprogress);
 
     // On error the `.partial` + sidecars are deliberately LEFT in place — they are
@@ -2149,6 +2177,60 @@ mod tests {
         assert_eq!(
             top_up_decision(U256::from(100u64), false),
             TopUpDecision::Exhausted
+        );
+    }
+
+    /// `select_watermark` is the money-critical 3-way choice `drive_fetch`
+    /// persists after `drive(...)` returns: which ledger reader to trust, per
+    /// outcome. Build two distinct `Cumulative` values standing in for
+    /// `committed` and `settlement` and assert each outcome picks the intended
+    /// one — this is the coverage the deleted `watermark_after` test carried
+    /// for the pre-#1608 loop.
+    #[test]
+    fn select_watermark_picks_the_reader_that_matches_the_outcome() {
+        use decdn_protocol::client::VoucherRejectReason;
+
+        let committed = Cumulative {
+            nonce: U256::from(3u64),
+            bytes: U256::from(3_000u64),
+            amount: U256::from(30u64),
+        };
+        let settlement = Cumulative {
+            nonce: U256::from(5u64),
+            bytes: U256::from(5_000u64),
+            amount: U256::from(50u64),
+        };
+        let prior_nonce = U256::ZERO;
+
+        // Success — persist the acked (committed) watermark.
+        let ok: anyhow::Result<()> = Ok(());
+        let got = select_watermark(&ok, committed, settlement, prior_nonce);
+        assert_eq!(
+            got.acked().map(|(n, _, _)| n),
+            Some(committed.nonce),
+            "success must persist the committed watermark"
+        );
+
+        // Explicit voucher rejection — still committed: vouchers pipelined
+        // behind the rejected one were provably never taken.
+        let rejected: anyhow::Result<()> = Err(anyhow::Error::new(UpstreamVoucherRejected {
+            reason: VoucherRejectReason::StaleNonce,
+            bundle: None,
+        }));
+        let got = select_watermark(&rejected, committed, settlement, prior_nonce);
+        assert_eq!(
+            got.acked().map(|(n, _, _)| n),
+            Some(committed.nonce),
+            "an explicit rejection must persist the committed watermark"
+        );
+
+        // Ambiguous failure — settle HIGH so a reuse never re-signs a spent nonce.
+        let ambiguous: anyhow::Result<()> = Err(anyhow::anyhow!("peer stalled"));
+        let got = select_watermark(&ambiguous, committed, settlement, prior_nonce);
+        assert_eq!(
+            got.acked().map(|(n, _, _)| n),
+            Some(settlement.nonce),
+            "an ambiguous failure must persist the settlement watermark"
         );
     }
 }
