@@ -320,6 +320,13 @@ mod doubles {
         /// driver pulled ONLY the gaps of `missing_ranges` and never a held
         /// range.
         opened: Arc<Mutex<Vec<(u64, u64)>>>,
+        /// Optional ledger to advance on a clean `finish`, modelling payment: a
+        /// real pull pays vouchers for the WIRE bytes it drains, and the driver's
+        /// completion is PAID-frontier based (`content_paid_frontier`), so a double
+        /// that never advanced `committed` would leave the driver's paid frontier at
+        /// zero and it would never complete. `None` keeps the pre-payment "unpaid
+        /// double" behaviour for tests that do not drive `fill_gap` to completion.
+        ledger: Option<Arc<crate::ChannelLedger>>,
     }
 
     impl std::fmt::Debug for ScriptedSource {
@@ -349,7 +356,19 @@ mod doubles {
                 outboard: ob.data.into(),
                 fault: None,
                 opened: Arc::new(Mutex::new(Vec::new())),
+                ledger: None,
             })
+        }
+
+        /// Model payment: on every clean `finish`, advance `ledger`'s committed
+        /// watermark by the leg's drained WIRE bytes (at [`SCRIPTED_RATE_PER_MB`]),
+        /// exactly as a real pull's acked vouchers do. Required by any test that
+        /// drives a gap to completion, since the driver's `Done` is paid-frontier
+        /// based. Pass the SAME `Arc<ChannelLedger>` the driver is handed.
+        #[must_use]
+        pub fn paying(mut self, ledger: Arc<crate::ChannelLedger>) -> Self {
+            self.ledger = Some(ledger);
+            self
         }
 
         /// The blob's BLAKE3 root — the `hash` the driver opens against.
@@ -442,13 +461,45 @@ mod doubles {
                     rate_per_mb: SCRIPTED_RATE_PER_MB,
                     interval_bytes: SCRIPTED_INTERVAL_BYTES,
                 };
-                Ok((header, ScriptedReader { wire, fault }))
+                // Wire bytes this leg will drain (post-fault-truncation). `finish`
+                // is reached only on a CLEAN drain (the driver skips it on an
+                // `ingest_stream` fault), so on the paying path this is the full
+                // range's wire — the exact delta an accepted voucher would cover.
+                let wire_len = wire.len() as u64;
+                Ok((
+                    header,
+                    ScriptedReader {
+                        wire,
+                        fault,
+                        wire_len,
+                    },
+                ))
             })
         }
 
-        fn finish(&self, _reader: Self::Reader) -> SourceFuture<'_, VoucherProgress> {
-            // Unpaid double: no channel, nothing to drain, no watermark.
-            Box::pin(async move { Ok(VoucherProgress::default()) })
+        fn finish(&self, reader: Self::Reader) -> SourceFuture<'_, VoucherProgress> {
+            Box::pin(async move {
+                let Some(ledger) = &self.ledger else {
+                    // Unpaid double: no channel, nothing to drain, no watermark.
+                    return Ok(VoucherProgress::default());
+                };
+                // Model the acked voucher for this leg's wire: issue then resolve,
+                // advancing `committed.bytes` by the drained WIRE bytes so the
+                // driver's paid frontier tracks payment (a real pull does this via
+                // the receive loop's per-interval vouchers + acks).
+                if reader.wire_len > 0 {
+                    ledger
+                        .issue(reader.wire_len, SCRIPTED_RATE_PER_MB, |_next| async {
+                            Ok(())
+                        })
+                        .await?;
+                    let _ = ledger.resolve_ack();
+                }
+                Ok(VoucherProgress::from_cumulative(
+                    ledger.committed(),
+                    U256::ZERO,
+                ))
+            })
         }
     }
 
@@ -459,6 +510,9 @@ mod doubles {
     pub struct ScriptedReader {
         wire: Bytes,
         fault: Option<anyhow::Error>,
+        /// The wire byte count this reader was handed (before consumption), used by
+        /// [`ScriptedSource::finish`] to advance a paying ledger by this leg's spend.
+        wire_len: u64,
     }
 
     impl iroh_io::AsyncStreamReader for ScriptedReader {

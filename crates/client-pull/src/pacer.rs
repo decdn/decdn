@@ -29,9 +29,14 @@ use alloy::primitives::U256;
 /// trivially reproducible in a test.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PaceState {
-    /// Content bytes of the requested range already present (cleared) in the
-    /// store. When this reaches [`requested_bytes`](Self::requested_bytes) the
-    /// range is satisfied.
+    /// Content bytes of the requested range already PAID FOR — the driver's
+    /// per-leg [`content_paid_frontier`](crate::sink::content_paid_frontier)
+    /// progress, NOT the store's delivered frontier. Completion must track
+    /// PAYMENT, not delivery: the node streams a full credit window ahead of the
+    /// voucher that pays for it (ADR 003), and the store checkpoints that tail
+    /// payment-agnostically, so a delivered-frontier gate would return `Done`
+    /// before the delivered-but-unpaid tail is billed (under-pay). When this
+    /// reaches [`requested_bytes`](Self::requested_bytes) the range is fully paid.
     pub cleared_bytes: u64,
     /// Total content bytes the caller requested.
     pub requested_bytes: u64,
@@ -102,7 +107,11 @@ impl BudgetPacer {
 
 impl Pacer for BudgetPacer {
     fn decide(&self, s: &PaceState) -> PaceDecision {
-        // 1. The range is satisfied — nothing left to pull or pay for.
+        // 1. The range is fully PAID — nothing left to pull or pay for. Gating on
+        //    paid (not delivered) progress is what bills the credit-window tail the
+        //    store checkpointed ahead of payment: an exhaustion leaves paid < the
+        //    delivered frontier, so this stays below `requested` and the fund/draw
+        //    branch below re-opens the unpaid tail until payment catches up.
         if s.cleared_bytes >= s.requested_bytes {
             return PaceDecision::Done;
         }
@@ -123,8 +132,9 @@ impl Pacer for BudgetPacer {
                 PaceDecision::Refuse
             };
         }
-        // 3. The deposit covers the next voucher and the range is incomplete: keep
-        //    drawing the remainder of the gap.
+        // 3. The deposit covers the next voucher and the range is not fully paid:
+        //    keep drawing the UNPAID remainder (the driver re-opens it at the paid
+        //    frontier, re-delivering any delivered-but-unpaid span idempotently).
         PaceDecision::Draw {
             up_to_bytes: s.requested_bytes.saturating_sub(s.cleared_bytes),
         }

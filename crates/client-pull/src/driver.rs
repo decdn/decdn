@@ -21,10 +21,16 @@
 //!   loop's own `set_len`/`seek` rewind is gone (the store owns durability now).
 //! - **Reactive top-up**: a genuine mid-fetch exhaustion (confirmed against our
 //!   OWN ledger via [`genuine_exhaustion`]) is funded through [`Funder::top_up`],
-//!   then the gap is retried at its checkpointed frontier — the store already
-//!   dropped the credited-but-unpaid tail, so there is no `content_paid_frontier`
-//!   arithmetic to redo here (that lived in the CLI because it wrote the raw file
-//!   itself; the store's `missing_ranges` supersedes it).
+//!   then the gap is retried at its PAID frontier — NOT its checkpointed
+//!   (delivered) frontier. [`ClientRangedStore::ingest_stream`] checkpoints
+//!   delivered+verified bytes payment-agnostically (the ADR 003 credit window
+//!   lets the node stream a full interval before the voucher that pays for it is
+//!   due), so a mid-leg exhaustion can leave the store's present-range frontier
+//!   AHEAD of the last PAID byte. Resuming from `missing_ranges` alone would then
+//!   skip billing the delivered-but-unpaid tail (an under-pay). So the per-leg
+//!   resume offset is [`sink::content_paid_frontier`] of the leg's paid wire
+//!   watermark, exactly as the pre-#1608 CLI loop computed it — the tail is
+//!   re-delivered (`ingest_stream` re-writes it idempotently) and re-billed.
 //! - **Settle-wait**: after a top-up the driver retries the open immediately —
 //!   the pacer sees the healed deposit and draws right away. If the node's chain
 //!   watcher has not yet observed the new deposit, that retry is refused with the
@@ -309,19 +315,61 @@ where
     let mut settle_waits = 0u32;
     let mut exhaustion_confirmed = false;
 
+    // Paid-frontier anchor (PER-LEG, not per-gap). A "leg" is one contiguous
+    // delivery from one successful open. `leg_anchor` records `(content offset the
+    // leg opened at, channel-cumulative committed WIRE bytes at that moment)`. It
+    // is re-anchored on every successful open (to the previous paid frontier) and
+    // on a reseed (to the healed delivered frontier), and PERSISTS across a fault
+    // so a post-top-up resume prices the paid frontier against the faulted leg's
+    // own spend. Both the completion signal (`paid_cleared`) and the Draw resume
+    // start are derived from it; see the per-pass computation at the loop top.
+    //
+    // Why the PAID frontier and not the store's DELIVERED frontier: `ingest_stream`
+    // checkpoints delivered+verified bytes payment-agnostically (ADR 003's credit
+    // window lets the node stream up to a full interval before the voucher that
+    // pays for it is due), so a mid-leg exhaustion leaves the present-range
+    // frontier AHEAD of the last PAID byte — and the whole blob can be delivered in
+    // one leg while only part is paid. Gating on delivery would `Done` before the
+    // tail is billed (under-pay). `content_paid_frontier` maps the wire an accepted
+    // voucher covered on THIS leg back to the largest chunk-group content boundary
+    // provably inside it, so completion tracks payment and the resumed open
+    // re-delivers (idempotently) and re-bills the tail. Fresh / cross-invocation
+    // resume: `paid_wire == 0`, frontier collapses to the leg start (the disk
+    // frontier), nothing already-paid is re-pulled (the `cli_fetch_resume` property).
+    let mut leg_anchor: Option<(u64, U256)> = None;
+
+    let gap_end = gap_start.saturating_add(gap_len);
+
     loop {
-        // Recompute what is still missing IN THIS GAP each pass: a Draw's ingest
-        // checkpoints advance presence, so `cleared` climbs and a mid-gap fault
-        // shrinks the sub-range the next open covers.
+        // The store's DELIVERED frontier for this gap (contiguous from `gap_start`):
+        // where its present ranges end. Used only to re-anchor after a reseed and
+        // for the progress bar base — NOT for completion, which is payment-based.
         let still_missing = store.missing_ranges(gap_start, gap_len).await?;
         let missing_bytes = ranges_content_len(&still_missing, total_bytes);
-        let cleared = gap_len.saturating_sub(missing_bytes);
+        let delivered_frontier = gap_end.saturating_sub(missing_bytes);
 
         let committed = ledger.committed();
         let remaining_deposit = locked_deposit(ctx)?.saturating_sub(committed.amount);
 
+        // The gap's PAID content frontier — the completion signal. Anchor the leg on
+        // the first pass at `gap_start` with the current committed baseline (fresh /
+        // cross-invocation: `paid_wire == 0`, so the frontier is `gap_start` and
+        // nothing already-paid is re-pulled). `content_paid_frontier` inverts the
+        // wire cost of ONE contiguous delivery from `leg_start`, so it MUST be priced
+        // per-leg: `leg_anchor` re-anchors on every successful open to the previous
+        // paid frontier, keeping the frontier monotonic and never summing two legs'
+        // (proof-duplicating) wire encodings, which would map PAST the true paid
+        // frontier and under-pay.
+        let (leg_start, leg_baseline) = *leg_anchor.get_or_insert((gap_start, committed.bytes));
+        let paid_wire_this_leg =
+            u64::try_from(committed.bytes.saturating_sub(leg_baseline)).unwrap_or(u64::MAX);
+        let paid_frontier =
+            crate::sink::content_paid_frontier(leg_start, total_bytes, paid_wire_this_leg)
+                .min(gap_end);
+        let paid_cleared = paid_frontier.saturating_sub(gap_start);
+
         let state = PaceState {
-            cleared_bytes: cleared,
+            cleared_bytes: paid_cleared,
             requested_bytes: gap_len,
             remaining_deposit,
             next_voucher_cost: counters.next_voucher_cost,
@@ -377,19 +425,23 @@ where
             // Today `BudgetPacer` returns the full gap remainder as `up_to_bytes`,
             // so drawing the whole still-missing sub-range below is equivalent and
             // this is a no-op — but a window pacer will return a tighter bound
-            // that MUST clamp `sub_len`/`aligned` before the open, or the window
+            // that MUST clamp `draw_len`/`aligned` before the open, or the window
             // is not actually enforced.
             PaceDecision::Draw { .. } => {
-                // Draw the first contiguous still-missing sub-range of this gap —
-                // the whole gap on first entry, a shrunk tail after a mid-gap
-                // fault checkpointed a prefix.
-                let sub = contiguous_byte_ranges(&still_missing, total_bytes);
-                let Some(&(sub_start, sub_len)) = sub.first() else {
-                    // Nothing missing after all (a concurrent write, or an
-                    // overshoot) — the gap is satisfied.
+                // Draw the UNPAID tail `[paid_frontier, gap_end)`. This is the
+                // still-missing part when payment tracks delivery, and additionally
+                // the delivered-but-unpaid span `[paid_frontier, delivered_frontier)`
+                // after an exhaustion — `ingest_stream` re-writes the already-present
+                // bytes idempotently and the pull re-bills them, so the credit-window
+                // tail the store checkpointed ahead of payment is finally paid.
+                if paid_frontier >= gap_end {
+                    // Fully paid — the pacer should have returned `Done`; guard
+                    // against a spin.
                     return Ok(());
-                };
-                let aligned = align_range(sub_start, sub_len, total_bytes)?;
+                }
+                let resume_start = paid_frontier;
+                let draw_len = gap_end.saturating_sub(resume_start);
+                let aligned = align_range(resume_start, draw_len, total_bytes)?;
 
                 // Whole-blob content already present, so `ingest_stream`'s
                 // per-range progress can be offset into overall progress: the bar
@@ -406,6 +458,13 @@ where
                 let leg: anyhow::Result<()> = match source.open(hash, aligned.clone()).await {
                     Ok((header, reader)) => {
                         counters.next_voucher_cost = voucher_cost(&header);
+                        // A new leg has opened: re-anchor the paid-frontier baseline
+                        // to THIS open's start and the committed watermark BEFORE it
+                        // streams, so a later top-up on this leg prices its paid
+                        // frontier against this leg's own wire spend alone (the
+                        // pre-#1608 CLI loop re-anchored `fetch_start_offset` /
+                        // `fetch_start_committed_bytes` identically on every open).
+                        leg_anchor = Some((resume_start, ledger.committed().bytes));
                         match store.ingest_stream(&aligned, reader, Some(&reporter)).await {
                             Ok(reader) => {
                                 // Drain to stream end and recover the acked voucher
@@ -473,6 +532,22 @@ where
 
                     if classify.0 {
                         counters.resume_attempts = counters.resume_attempts.saturating_add(1);
+                        // A reseed means the node HOLDS vouchers for content it
+                        // already delivered that our record had lost — so the
+                        // delivered frontier is paid. Re-anchor the leg there with the
+                        // healed committed baseline, so the next pass prices this
+                        // gap's paid frontier AT the delivered frontier (`paid_wire
+                        // delta == 0`): no re-delivery of already-paid bytes, and the
+                        // reseed's jump is not mistaken for this leg's own spend
+                        // (which would map past the true frontier and under-pay).
+                        // `delivered_frontier` is this pass's pre-ingest snapshot
+                        // (loop top); if the reseed fault arrived after some bytes
+                        // were checkpointed this pass it sits slightly behind the
+                        // fresh frontier. That is the SAFE direction — at worst a
+                        // bounded re-deliver/re-pay of the interim span (over-pay),
+                        // never under-pay — and reseed refusals almost always
+                        // surface at open, before any ingest, so the two coincide.
+                        leg_anchor = Some((delivered_frontier, ledger.committed().bytes));
                         continue;
                     }
                     if classify.1 {
@@ -627,12 +702,14 @@ mod tests {
         );
         let want_gap_bytes: u64 = want_gaps.iter().map(|(_, l)| *l).sum();
 
-        let source = ScriptedSource::new(plaintext.clone()).expect("source");
+        let ledger = Arc::new(ChannelLedger::new(Cumulative::default()));
+        let source = ScriptedSource::new(plaintext.clone())
+            .expect("source")
+            .paying(Arc::clone(&ledger));
         assert_eq!(source.root(), root);
         let pacer = BudgetPacer::new();
         let funder = healthy_funder();
         let ctx = Arc::new(Mutex::new(healthy_ctx()));
-        let ledger = Arc::new(ChannelLedger::new(Cumulative::default()));
 
         drive(
             &store,
@@ -774,18 +851,19 @@ mod tests {
         // is already held, so < 5 MiB of wire remains) is under the threshold and
         // completes. One source instance across both drives, so `opened_ranges`
         // records both opens.
+        let ledger = Arc::new(ChannelLedger::new(Cumulative::default()));
         let source = ScriptedSource::new(plaintext.clone())
             .expect("source")
             .with_fault_after(5 * 1024 * 1024, || {
                 anyhow::anyhow!("scripted mid-gap stall")
-            });
+            })
+            .paying(Arc::clone(&ledger));
         let root = source.root();
         let store = fresh_store(root, total);
 
         let pacer = BudgetPacer::new();
         let funder = healthy_funder();
         let ctx = Arc::new(Mutex::new(healthy_ctx()));
-        let ledger = Arc::new(ChannelLedger::new(Cumulative::default()));
 
         // Drive #1: faults mid-gap and returns the terminal stall, but checkpoints
         // a durable prefix into the store first.
@@ -874,11 +952,13 @@ mod tests {
         let (root, plaintext, _outboard) = synth_blob(total as usize);
         let store = fresh_store(root, total);
 
-        let source = ScriptedSource::new(plaintext.clone()).expect("source");
+        let ledger = Arc::new(ChannelLedger::new(Cumulative::default()));
+        let source = ScriptedSource::new(plaintext.clone())
+            .expect("source")
+            .paying(Arc::clone(&ledger));
         let pacer = BudgetPacer::new();
         let funder = healthy_funder();
         let ctx = Arc::new(Mutex::new(healthy_ctx()));
-        let ledger = Arc::new(ChannelLedger::new(Cumulative::default()));
 
         drive(
             &store,
@@ -1018,7 +1098,10 @@ mod tests {
         let (root, plaintext, _outboard) = synth_blob(total as usize);
         let store = fresh_store(root, total);
 
-        let inner = ScriptedSource::new(plaintext.clone()).expect("source");
+        let ledger = Arc::new(ChannelLedger::new(Cumulative::default()));
+        let inner = ScriptedSource::new(plaintext.clone())
+            .expect("source")
+            .paying(Arc::clone(&ledger));
         let root = inner.root();
         let source = FailFirstOpen {
             inner,
@@ -1031,7 +1114,6 @@ mod tests {
         let mut ctx = healthy_ctx();
         ctx.deposit = U256::ZERO; // under-deposited: the first refusal is genuine
         let ctx = Arc::new(Mutex::new(ctx));
-        let ledger = Arc::new(ChannelLedger::new(Cumulative::default()));
 
         let drive_config = DriveConfig {
             working_deposit: U256::from(10_000u64),
