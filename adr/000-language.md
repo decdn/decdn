@@ -16,7 +16,7 @@ Requirements:
 - Concurrent handling of many inbound connections per node.
 - Memory safety without GC-induced latency spikes under load.
 - QUIC transport with content-addressed verified transfer.
-- Two statically linked binaries — a `decdn-node` daemon and a `decdn` CLI — that share a config schema and identity model (see [Appendix: deCDN Binaries](appendix-binaries.md#appendix-decdn-binaries--decdn-node--decdn-split)).
+- Two self-contained binaries — a `decdn-node` daemon and a `decdn` CLI — that share a config schema and identity model (see [Appendix: deCDN Binaries](appendix-binaries.md#appendix-decdn-binaries--decdn-node--decdn-split)).
 
 ## Decision
 
@@ -38,7 +38,7 @@ Components:
 - tokio handles thousands of concurrent connections per node efficiently.
 - iroh bundles QUIC, NAT traversal, content-addressed transfer, and verified streaming — fewer moving parts than assembling separate libraries.
 - BLAKE3 is native to iroh's content model; blob IDs and transport share one hash with no translation layer.
-- Statically linked binaries simplify deployment.
+- Single-file binaries simplify deployment. Each binary carries all of its Rust dependencies. It is not fully static: the Linux targets are `*-unknown-linux-gnu` and link glibc dynamically. Linux release builds therefore use `cross`, which pins an old glibc and sets the support floor at glibc 2.31 (Debian 11, Ubuntu 20.04, RHEL 8). A native build on the CI runner links the runner's glibc instead — currently 2.39 — and the binary then fails to start on any older distribution. The release workflow asserts this floor with `objdump`.
 
 ### Negative
 
