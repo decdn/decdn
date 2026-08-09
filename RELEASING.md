@@ -86,9 +86,11 @@ which:
    one — and pushes the manifest **untagged**, attaching the SBOM and
    `image-digest.txt`.
 
-Draft assets need authentication to download, and no pullable image tag exists
-yet, so nothing a user is meant to consume is reachable until the release is
-signed.
+Draft assets need authentication to download, and no image tag exists yet, so
+nothing resolves by name until the release is signed. The image manifest is
+fetchable by digest in that window — untagged is not unreachable — but the
+digest is not advertised anywhere a user would look, and no tag ever points at
+unsigned bytes.
 
 ## Signing and publishing
 
@@ -159,6 +161,26 @@ storage, so cleanup is optional. If you do delete one, take care: GHCR keys a
 package version by digest and treats tags as metadata on it, so deleting the
 wrong version removes the image behind every tag pointing at it, `latest`
 included. Match the digest against `image-digest.txt` before deleting anything.
+
+## Before open-sourcing
+
+Two of this workflow's protections are **not enforceable while the repository is
+private**, because branch and tag protection are unavailable on the current plan
+— the API returns `403 Upgrade to GitHub Pro or make this repository public`.
+Making the repository public enables both. Configure them at that point:
+
+1. **Tag protection on `v*`.** Without it, anyone with push access can create a
+   release tag. Worse, a `push`-triggered workflow runs the workflow definition
+   *from the pushed ref*, so a tag can carry a `release.yml` with the signature
+   gate deleted and still receive `contents: write` and `packages: write`.
+2. **Branch protection on `main`.** The gate reads `KEYS` from `origin/main`
+   precisely so the tag cannot supply its own trust root. That only means
+   something if `main` is protected.
+
+Until both are set, treat the CI gate as defence in depth. The guarantee that
+does hold is the maintainer signature, because consumers verify it off-platform
+against the fingerprints in [SECURITY.md](SECURITY.md) rather than against
+anything GitHub enforces.
 
 ## Verifying a release as a consumer would
 

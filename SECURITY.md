@@ -19,6 +19,14 @@ Fingerprint: DA75 1570 6F18 73D2 74D8  A369 9E11 A9FF D62D AADB
 A good signature from **any** key listed above is authentic. Adding or removing
 a maintainer is a change to `KEYS`, visible in this repository's history.
 
+**Pin the fingerprint, not the file.** The signature is what protects you, and
+it protects you because you check it against a fingerprint you already trust —
+not because of anything the release pipeline enforces. CI does verify that a
+release tag is signed by a key published on `main`, but that check is defence in
+depth: it lives in the repository it is checking. Record the fingerprint above
+out of band the first time you verify a release, and compare against your copy
+afterwards.
+
 Each release carries five signatures: the tag, the version-bump commit, the
 `SHA256SUMS` manifest covering every archive, `image-digest.txt` naming the
 container image, and the SBOM. Individual archives carry no `.asc` of their
@@ -66,8 +74,10 @@ created only after that digest has been signed, so an unpinned
 `docker pull ghcr.io/decdn/decdn` also resolves to a signed image. Pulling by
 digest is still stronger: it pins the exact bytes you verified.
 
-CI pushes the image manifest untagged, so before signing there is nothing to
-pull by name at all — the tags above are created from the signed digest.
+CI pushes the image manifest untagged, so before signing no tag resolves to it —
+the tags above are created from the signed digest. The manifest is still
+fetchable by digest in that window; what the tags guarantee is that a pull *by
+name* never reaches unsigned bytes.
 
 A prerelease (`v1.2.0-rc1`) is published only as its exact version tag —
 `latest` and `<major>.<minor>` are never moved to a release candidate.

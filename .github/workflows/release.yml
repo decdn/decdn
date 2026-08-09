@@ -8,9 +8,11 @@ name: Release
 #
 # This workflow builds and stages; it does not sign and it does not publish.
 # The GitHub Release is created as a *draft* and the container image manifest is
-# pushed untagged, so no artifact anyone is meant to consume exists before a
-# maintainer has signed it with .github/scripts/sign-release.sh. There is no
-# signing key in Actions secrets.
+# pushed untagged, so no NAME a user would pull resolves to anything before a
+# maintainer has signed it with .github/scripts/sign-release.sh. (The manifest
+# is still fetchable by its digest — untagged is not unreachable — but no tag
+# points at unsigned bytes, and the digest is not advertised anywhere a user
+# would look.) There is no signing key in Actions secrets.
 on:
   push:
     tags:
@@ -60,15 +62,25 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "tag=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
 
-      # The gate that replaces the old org key in Actions secrets: a release is
-      # only built for a tag signed by a maintainer key published on `main`.
+      # A release is only built for a tag signed by a maintainer key published
+      # on `main`. The keyring is read from origin/main, NOT from the tagged
+      # tree: reading it from the tag would let whoever pushes the tag supply
+      # both the key and the check, so the tag would only prove it was signed
+      # by a key it vouches for itself.
       #
-      # The keyring is read from origin/main, NOT from the tagged tree. Reading
-      # it from the tag would let whoever pushes the tag supply both the key
-      # and the check — the tag would only prove it was signed by a key it
-      # vouches for itself. Note this makes push access to `main` the real
-      # trust boundary; the gate does not defend against a compromised token
-      # that can write there.
+      # DEFENCE IN DEPTH, NOT A BOUNDARY — until the repository is public.
+      # For a `push` event GitHub runs the workflow definition from the pushed
+      # ref, so a tag can carry a release.yml with this step deleted, and that
+      # workflow still receives contents:write and packages:write. Reading KEYS
+      # from main does not help while main itself is unprotected.
+      #
+      # Both holes close with the same switch: branch and tag protection are
+      # unavailable on the current plan (the API returns 403 "Upgrade to GitHub
+      # Pro or make this repository public") and become available when this
+      # repository is open-sourced. Configure them AT that point — see
+      # RELEASING.md § Before open-sourcing. Until then the enforceable
+      # guarantee is the maintainer signature itself, which consumers verify
+      # off-platform against a pinned fingerprint.
       #
       # `git verify-tag` exits 0 on a good-but-untrusted signature, so no trust
       # database setup is needed — importing the keyring is enough.
