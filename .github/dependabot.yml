@@ -24,6 +24,19 @@ updates:
       # iroh ecosystem is pinned per ADR 001; upgrades require manual coordination
       - dependency-name: "iroh*"
 
+  # The Dockerfile's `debian:bookworm-slim` base was previously bumped by
+  # nothing at all — the release image is rebuilt from it on every tag, so a
+  # base-image CVE would ship silently between the weekly Trivy scans.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    # Same rationale as the cargo ecosystem above.
+    commit-message:
+      prefix: chore
+      include: scope
+
   - package-ecosystem: github-actions
     directory: /
     schedule:

@@ -66,6 +66,28 @@ repos:
         files: ^adr/(.*\.md|Makefile|_build/.*\.awk)$
         pass_filenames: false
 
+      # --- crates.io packaging -----------------------------------------
+      # An `include_str!` reaching outside its crate builds fine in-tree and
+      # fails for every `cargo install` user, because a published .crate holds
+      # only its own directory. release.yml proves this properly with
+      # `cargo publish --workspace --dry-run`; this is the cheap early signal.
+      - id: package-embeds
+        name: crate embeds stay inside their package
+        entry: .github/scripts/check-package-embeds.sh
+        language: system
+        files: '^crates/.*\.(rs|toml)$'
+        pass_filenames: false
+
+      # The CLI embeds a deployment manifest, but `include_str!` cannot escape
+      # the package, so crates/cli/deployments/ mirrors contracts/deployments/.
+      # Drift means `decdn config init` bakes stale contract addresses.
+      - id: deployment-manifest-mirror
+        name: deployment manifest mirror in sync
+        entry: .github/scripts/check-deployment-mirror.sh
+        language: system
+        files: '^(contracts|crates/cli)/deployments/.*\.json$'
+        pass_filenames: false
+
       # --- Solidity ----------------------------------------------------
       # commit-stage (every commit, fast):
 

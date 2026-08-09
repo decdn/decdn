@@ -16,6 +16,10 @@
 #   DECDN_SKIP_IMAGE_TAGS set to 1 to publish without creating ANY pullable
 #                         image tag — the release then ships with only the
 #                         signed digest in image-digest.txt
+#   DECDN_SKIP_DOCKERHUB  set to 1 to tag on GHCR only, skipping the Docker Hub
+#                         mirror (implied by DECDN_SKIP_IMAGE_TAGS)
+#   DECDN_DOCKERHUB_REPO  override the Docker Hub repository
+#                         (default: decdn/decdn-node)
 #
 # Re-running is safe at any point before the release is published: signatures
 # are re-uploaded with --clobber and the tag promotion is idempotent. Once the
@@ -25,9 +29,15 @@ set -euo pipefail
 TAG="${1:?tag required, e.g. v0.1.2}"
 VERSION="${TAG#v}"
 REPO="${DECDN_REPO:-decdn/decdn}"
-IMAGE="ghcr.io/${REPO}"
+# `-node`: the image carries the daemon only, so it is not named after the repo.
+# Must match release.yml's IMAGE_NAME, which is what wrote image-digest.txt.
+IMAGE="ghcr.io/${REPO}-node"
+DOCKERHUB_IMAGE="docker.io/${DECDN_DOCKERHUB_REPO:-decdn/decdn-node}"
 SIGNING_KEY="${DECDN_SIGNING_KEY:-}"
 SKIP_IMAGE_TAGS="${DECDN_SKIP_IMAGE_TAGS:-}"
+# Skipping every tag necessarily skips the mirror: there would be nothing to
+# mirror, and pushing an untagged copy to a second registry helps nobody.
+SKIP_DOCKERHUB="${DECDN_SKIP_DOCKERHUB:-${SKIP_IMAGE_TAGS:-}}"
 
 # The three files a signature covers. SHA256SUMS transitively covers every
 # archive, so the archives carry no individual .asc.
@@ -58,6 +68,18 @@ if [[ -z "$SKIP_IMAGE_TAGS" ]]; then
     die "docker not found on PATH (set DECDN_SKIP_IMAGE_TAGS=1 to skip tag promotion)"
   docker buildx version >/dev/null 2>&1 ||
     die "docker buildx not available (set DECDN_SKIP_IMAGE_TAGS=1 to skip tag promotion)"
+
+  # A warning, not a die: credential helpers keep no `auths` entry, so a miss
+  # here is not proof of a missing login. Docker Hub is the second registry and
+  # the newer requirement, so it is the one worth flagging early — an operator
+  # who has only ever run `docker login ghcr.io` gets told now rather than
+  # after the signatures are already uploaded.
+  if [[ -z "$SKIP_DOCKERHUB" ]] &&
+     ! grep -q 'index\.docker\.io' "${DOCKER_CONFIG:-$HOME/.docker}/config.json" 2>/dev/null; then
+    echo "warning: no Docker Hub credentials found in the docker config." >&2
+    echo "         Run \`docker login docker.io\`, or set DECDN_SKIP_DOCKERHUB=1" >&2
+    echo "         to tag on GHCR only." >&2
+  fi
 fi
 
 # Resolve the signing key to a full fingerprint. `gpg --list-secret-keys` with
@@ -237,33 +259,57 @@ else
     PROMOTE_TAGS=( "latest" "$VERSION" "${VERSION%.*}" )
   fi
 
-  # Tags the untagged manifest CI already pushed — no rebuild, no pull — so
-  # every tag a user can pull resolves to the digest signed above.
-  echo "==> Promoting image tags to the signed digest: ${PROMOTE_TAGS[*]}"
   DIGEST="${DIGEST_REF#*@}"
-  create_args=()
-  for t in "${PROMOTE_TAGS[@]}"; do
-    create_args+=( -t "${IMAGE}:${t}" )
-  done
-  docker buildx imagetools create "${create_args[@]}" "${IMAGE}@${DIGEST}" || die \
-    "failed to promote image tags (registry auth? run \`docker login ghcr.io\`).
+
+  # Points every tag in PROMOTE_TAGS at the signed digest, in $1.
+  #
+  # `imagetools create` copies the source manifest verbatim, so this both
+  # promotes within GHCR and copies to another registry without a rebuild or a
+  # local pull — and the copy keeps the same digest, which is what lets one
+  # signature over image-digest.txt vouch for the mirror too. The inspect loop
+  # is what PROVES that rather than assuming it: if a future buildx ever
+  # rewrote the manifest, the digest would move and this would refuse to go on.
+  promote_to() {
+    local target="$1" login_hint="$2" t got create_args=()
+    for t in "${PROMOTE_TAGS[@]}"; do
+      create_args+=( -t "${target}:${t}" )
+    done
+    docker buildx imagetools create "${create_args[@]}" "${IMAGE}@${DIGEST}" || die \
+      "failed to promote image tags on ${target} (registry auth? run \`docker login ${login_hint}\`).
 Signatures are uploaded and the release is still a draft.
 Fix the problem and re-run this script — it is idempotent."
 
-  for t in "${PROMOTE_TAGS[@]}"; do
-    got=$(docker buildx imagetools inspect "${IMAGE}:${t}" \
-      --format '{{.Manifest.Digest}}' 2>/dev/null) || got=""
-    [[ "$got" == "$DIGEST" ]] ||
-      die "${IMAGE}:${t} resolves to '${got}', not the signed digest ${DIGEST}"
-    echo "    ${IMAGE}:${t} -> ${DIGEST}"
-  done
+    for t in "${PROMOTE_TAGS[@]}"; do
+      got=$(docker buildx imagetools inspect "${target}:${t}" \
+        --format '{{.Manifest.Digest}}' 2>/dev/null) || got=""
+      [[ "$got" == "$DIGEST" ]] ||
+        die "${target}:${t} resolves to '${got}', not the signed digest ${DIGEST}"
+      echo "    ${target}:${t} -> ${DIGEST}"
+    done
+  }
+
+  # Tags the untagged manifest CI already pushed — no rebuild, no pull — so
+  # every tag a user can pull resolves to the digest signed above.
+  echo "==> Promoting image tags to the signed digest: ${PROMOTE_TAGS[*]}"
+  promote_to "$IMAGE" "ghcr.io"
+
+  if [[ -n "$SKIP_DOCKERHUB" ]]; then
+    echo "==> Skipping the Docker Hub mirror (DECDN_SKIP_DOCKERHUB set)"
+  else
+    # Before the release leaves draft, not after: the two registries are
+    # advertised as interchangeable, so publishing with only one populated
+    # would send half of `docker pull` users to a tag that does not exist.
+    echo "==> Mirroring the signed digest to $DOCKERHUB_IMAGE"
+    promote_to "$DOCKERHUB_IMAGE" "docker.io"
+  fi
 fi
 
 echo "==> Publishing $TAG"
 gh release edit "$TAG" --repo "$REPO" --draft=false || die \
-  "signatures are uploaded and the image tags are promoted, but the release is
-STILL A DRAFT — :latest now serves an unpublished release. Re-run this script,
-or publish manually: gh release edit $TAG --repo $REPO --draft=false"
+  "signatures are uploaded and the image tags are promoted on every registry,
+but the release is STILL A DRAFT — :latest now serves an unpublished release.
+Re-run this script, or publish manually:
+gh release edit $TAG --repo $REPO --draft=false"
 
 echo
 echo "Published: https://github.com/${REPO}/releases/tag/${TAG}"

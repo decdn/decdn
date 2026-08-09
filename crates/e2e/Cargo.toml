@@ -1,6 +1,6 @@
 [package]
 name = "decdn-e2e"
-version = "0.1.1"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true

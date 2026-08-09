@@ -31,7 +31,10 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
+  # `-node`, because the image carries the daemon only — the `decdn` CLI is
+  # deliberately not in it (see Dockerfile). Same repository path on Docker Hub,
+  # which sign-release.sh mirrors the signed digest to.
+  IMAGE_NAME: ${{ github.repository }}-node
 
 jobs:
   release:
@@ -160,10 +163,22 @@ jobs:
           cargo clippy --workspace --all-targets -- -D warnings
           cargo nextest run --workspace --no-tests=pass
 
-      # These crates are never published (publish = false), so semver-checks
-      # has no crates.io baseline. Diff against the previous release tag
-      # instead. The first release has no prior tag, so semver-checks is
-      # skipped then (nothing to compare against).
+      # publish-crates.sh uploads these to crates.io after the release is
+      # signed, and a crates.io version can never be replaced. Packaging must
+      # therefore be proven BEFORE the draft exists, not discovered mid-publish.
+      #
+      # The verify build is the point: it compiles each crate from its packaged
+      # .crate, which is the only thing that catches a file referenced from
+      # outside the package (an `include_str!` reaching the workspace root
+      # builds fine in-tree and fails for every `cargo install` user).
+      - name: Verify every crate packages and builds standalone
+        run: cargo publish --workspace --dry-run --locked
+
+      # semver-checks runs against the previous release tag rather than the
+      # crates.io baseline: at this point in the run the tag's own version is
+      # not on crates.io yet (publish-crates.sh comes after signing), so a
+      # registry baseline would lag by a release. The first release has no prior
+      # tag, so semver-checks is skipped then (nothing to compare against).
       - name: Determine semver baseline
         id: baseline
         env:
@@ -549,7 +564,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v6
         with:
-          images: ghcr.io/${{ github.repository }}
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             type=raw,value=unused
 
@@ -572,14 +587,14 @@ jobs:
           file: Dockerfile
           platforms: linux/amd64,linux/arm64
           labels: ${{ steps.meta.outputs.labels }}
-          outputs: type=image,name=ghcr.io/${{ github.repository }},push-by-digest=true,name-canonical=true,push=true
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
 
       # Scanned by digest in the release package — the untagged manifest is
       # already there, it just has no tag pointing at it yet.
       - name: Generate SBOM
         uses: anchore/sbom-action@v0
         with:
-          image: ghcr.io/${{ github.repository }}@${{ steps.build.outputs.digest }}
+          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
           format: spdx-json
           output-file: decdn-${{ needs.release.outputs.version }}-sbom.spdx.json
           upload-release-assets: false
@@ -591,7 +606,7 @@ jobs:
       # locally. cosign will later replace this with an in-registry signature.
       - name: Record image digest
         env:
-          IMAGE: ghcr.io/${{ github.repository }}
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           DIGEST: ${{ steps.build.outputs.digest }}
         run: echo "${IMAGE}@${DIGEST}" > image-digest.txt
 

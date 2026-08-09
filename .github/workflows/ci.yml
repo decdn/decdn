@@ -1515,6 +1515,28 @@ jobs:
           python3 -m pip install 'pytest==8.*' 'pyyaml==6.*'
           python3 -m pytest .github/scripts/tests -q
 
+  # Guards what `cargo publish` will do on release day. Both checks exist
+  # because a crates.io version can never be replaced: by the time the real
+  # publish runs, the release is signed and its dependency crates are already
+  # uploaded, so a packaging error found there has no clean recovery.
+  #
+  # Cheap by design — no toolchain, no build. The authoritative check is
+  # `cargo publish --workspace --dry-run` in release.yml, which verify-builds
+  # every packaged crate; that costs a full rebuild and belongs on tags, not on
+  # every PR. Unconditional (no `changes` gate) because it takes seconds, which
+  # also keeps it out of ci-success's allowed-skips.
+  packaging:
+    name: packaging
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Crate embeds stay inside their package
+        run: .github/scripts/check-package-embeds.sh
+
+      - name: Deployment manifest mirror in sync
+        run: .github/scripts/check-deployment-mirror.sh
+
   # Single gate for branch protection. Point required-checks at this one job
   # so adding/renaming jobs above doesn't require updating branch rules.
   # The `test` job carries coverage post-processing (LCOV diff, sticky PR
@@ -1562,7 +1584,7 @@ jobs:
             agentic-lock, pr-title, anvil-e2e-settlement, anvil-e2e-journeys,
             solidity-fmt, solidity-build-test, solidity-coverage,
             solidity-solhint, solidity-slither, solidity-aderyn, ed25519-vectors,
-            docker-build]
+            docker-build, packaging]
     steps:
       - uses: re-actors/alls-green@release/v1
         with:
@@ -1574,8 +1596,9 @@ jobs:
           # `needs.changes.outputs.solidity`, and docker-build on
           # `needs.changes.outputs.docker`; each skips when its paths are
           # untouched. alls-green treats `skipped` as failure unless listed
-          # here. `changes` is intentionally omitted — it always runs, so a
-          # skip from it signals a misconfiguration that should fail the gate.
+          # here. `changes` and `packaging` are intentionally omitted — both
+          # always run, so a skip from either signals a misconfiguration that
+          # should fail the gate.
           allowed-skips: fmt, clippy, test, doctest, deny, doc, public-api, adr-book-list,
                          agentic-lock, pr-title, markdownlint,
                          anvil-e2e-settlement, anvil-e2e-journeys,

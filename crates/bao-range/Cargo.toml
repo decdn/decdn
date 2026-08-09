@@ -1,10 +1,15 @@
 [package]
 name = "decdn-bao-range"
-version = "0.1.1"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 description = "Leaf crate: iroh-blobs-free bao verified-range helpers (chunk-group alignment, encoded-size, range encode/verify) shared by decdn-cache (serve/import) and decdn-client-pull (receive). Depends only on bao-tree so the CLI's iroh-blobs-free invariant (#578) holds."
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 bao-tree = { workspace = true }

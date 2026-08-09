@@ -62,12 +62,17 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # GHCR only, deliberately. sign-release.sh mirrors the same manifest to
+      # Docker Hub with `imagetools create`, which copies it verbatim, so both
+      # registries serve byte-identical bytes under one digest — scanning the
+      # mirror would re-scan the image already covered here.
+      #
       # Skip gracefully if no :latest image has been published yet
       # (pre-first-release, or tags cleaned up).
       - name: Check image exists
         id: image
         env:
-          IMAGE: ghcr.io/${{ github.repository }}:latest
+          IMAGE: ghcr.io/${{ github.repository }}-node:latest
         run: |
           if docker manifest inspect "$IMAGE" > /dev/null 2>&1; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
@@ -80,7 +85,7 @@ jobs:
         if: steps.image.outputs.exists == 'true'
         uses: aquasecurity/trivy-action@v0.36.0
         with:
-          image-ref: ghcr.io/${{ github.repository }}:latest
+          image-ref: ghcr.io/${{ github.repository }}-node:latest
           format: table
           severity: CRITICAL,HIGH
           ignore-unfixed: true
