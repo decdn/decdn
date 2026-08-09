@@ -66,9 +66,12 @@ created only after that digest has been signed, so an unpinned
 `docker pull ghcr.io/decdn/decdn` also resolves to a signed image. Pulling by
 digest is still stronger: it pins the exact bytes you verified.
 
-CI stages each build under a `staging-v<version>` tag before it is signed.
-Those tags are build scratch space, are not part of any release, and should
+CI stages each build in a separate `decdn-staging` package before it is signed.
+That package is build scratch space, is not part of any release, and should
 never be pulled.
+
+A prerelease (`v1.2.0-rc1`) is published only as its exact version tag —
+`latest` and `<major>.<minor>` are never moved to a release candidate.
 
 The SBOM (`decdn-<version>-sbom.spdx.json`) ships with a matching `.asc`.
 

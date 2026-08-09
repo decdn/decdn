@@ -81,8 +81,9 @@ which:
 5. creates the GitHub Release as a **draft**;
 6. builds ten archives (`decdn-node` and `decdn`, five targets each) and a
    `SHA256SUMS` manifest, asserting all ten are present;
-7. builds and pushes the multi-arch image under a **staging tag** only
-   (`staging-v<version>`), and attaches the SBOM and `image-digest.txt`.
+7. builds and pushes the multi-arch image to a **separate staging package**
+   (`ghcr.io/decdn/decdn-staging`), and attaches the SBOM and
+   `image-digest.txt`.
 
 Draft assets need authentication to download, and no pullable image tag exists
 yet, so nothing a user is meant to consume is reachable until the release is
@@ -110,8 +111,13 @@ Useful environment overrides:
 | Variable | Effect |
 |----------|--------|
 | `DECDN_SIGNING_KEY` | key to sign with, when your default key is not the one in `KEYS` |
-| `DECDN_SKIP_LATEST` | set to `1` to publish without promoting the image tags |
+| `DECDN_SKIP_IMAGE_TAGS` | set to `1` to publish with **no** pullable image tag at all — the release then ships only the signed digest |
 | `DECDN_REPO` | target a fork instead of `decdn/decdn` |
+
+For a stable version the promoted tags are `latest`, `<version>` and
+`<major>.<minor>`. A prerelease (`v1.2.0-rc1`) gets only its exact version tag:
+moving `latest` to a candidate would hand it to every unpinned pull, and
+`<major>.<minor>` would clobber the stable minor tag.
 
 Re-running is safe at any point before the release is published — signatures
 are re-uploaded with `--clobber` and the tag promotion is idempotent. Once the
@@ -146,9 +152,15 @@ release.
 release behind it is the one state this flow leaves lying around. Either run the
 signing script, or delete the tag as above.
 
-**Cleaning up staging images.** `staging-v<version>` tags accumulate in GHCR.
-Delete the package version in the GitHub UI once the release is out; nothing
-depends on them after promotion.
+**Cleaning up staging images.** Versions accumulate in the
+`ghcr.io/decdn/decdn-staging` package. Delete them in the GitHub UI once the
+release is out; nothing depends on them after promotion.
+
+Delete them from **`decdn-staging`**, never from `decdn`. GHCR keys a package
+version by digest and treats tags as metadata on it, so deleting a version in
+the release package removes the image behind every tag pointing at it —
+including `latest`. Staging lives in its own package precisely so this cleanup
+cannot touch a published release.
 
 ## Verifying a release as a consumer would
 

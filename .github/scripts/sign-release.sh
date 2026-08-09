@@ -11,10 +11,12 @@
 # Usage:  .github/scripts/sign-release.sh v0.1.2
 #
 # Environment:
-#   DECDN_REPO          override the owner/repo (default: decdn/decdn)
-#   DECDN_SIGNING_KEY   key to sign with (default: gpg's default secret key).
-#                       Whatever it resolves to must be published in KEYS.
-#   DECDN_SKIP_LATEST   set to 1 to skip promoting the container image tags
+#   DECDN_REPO            override the owner/repo (default: decdn/decdn)
+#   DECDN_SIGNING_KEY     key to sign with (default: gpg's default secret key).
+#                         Whatever it resolves to must be published in KEYS.
+#   DECDN_SKIP_IMAGE_TAGS set to 1 to publish without creating ANY pullable
+#                         image tag — the release then ships with only the
+#                         signed digest in image-digest.txt
 #
 # Re-running is safe at any point before the release is published: signatures
 # are re-uploaded with --clobber and the tag promotion is idempotent. Once the
@@ -25,9 +27,15 @@ TAG="${1:?tag required, e.g. v0.1.2}"
 VERSION="${TAG#v}"
 REPO="${DECDN_REPO:-decdn/decdn}"
 IMAGE="ghcr.io/${REPO}"
-STAGING_TAG="staging-${TAG}"
+# CI stages the build in a SEPARATE package, not under a staging tag on the
+# release package. GHCR identifies a package version by digest and treats tags
+# as metadata on it, so a staging tag would end up on the same version as
+# `latest` and `<version>` after promotion — and deleting that "version" to
+# clean up the staging tag would delete the released image along with it.
+# A separate package can be deleted without touching the release.
+STAGING_IMAGE="${IMAGE}-staging"
 SIGNING_KEY="${DECDN_SIGNING_KEY:-}"
-SKIP_LATEST="${DECDN_SKIP_LATEST:-}"
+SKIP_IMAGE_TAGS="${DECDN_SKIP_IMAGE_TAGS:-}"
 
 # The three files a signature covers. SHA256SUMS transitively covers every
 # archive, so the archives carry no individual .asc.
@@ -53,11 +61,11 @@ KEYS_FILE="$REPO_ROOT/KEYS"
 
 # Registry auth is the likeliest runtime failure (PATs expire) and the tag
 # promotion is the last step, so check it up front rather than after signing.
-if [[ -z "$SKIP_LATEST" ]]; then
+if [[ -z "$SKIP_IMAGE_TAGS" ]]; then
   command -v docker >/dev/null ||
-    die "docker not found on PATH (set DECDN_SKIP_LATEST=1 to skip tag promotion)"
+    die "docker not found on PATH (set DECDN_SKIP_IMAGE_TAGS=1 to skip tag promotion)"
   docker buildx version >/dev/null 2>&1 ||
-    die "docker buildx not available (set DECDN_SKIP_LATEST=1 to skip tag promotion)"
+    die "docker buildx not available (set DECDN_SKIP_IMAGE_TAGS=1 to skip tag promotion)"
 fi
 
 # Resolve the signing key to a full fingerprint. `gpg --list-secret-keys` with
@@ -207,25 +215,42 @@ for stray in ./*.asc; do
   esac
 done
 
-if [[ -n "$SKIP_LATEST" ]]; then
-  echo "==> Skipping image tag promotion (DECDN_SKIP_LATEST set)"
+if [[ -n "$SKIP_IMAGE_TAGS" ]]; then
+  echo "==> Skipping image tag promotion (DECDN_SKIP_IMAGE_TAGS set)"
+  echo "    This release will ship with no pullable image tag."
 else
+  # A prerelease gets its exact version tag and nothing else. Moving `latest`
+  # or `<major>.<minor>` to an RC would hand it to every unpinned pull, and
+  # `${VERSION%.*}` on 0.2.0-rc1 yields 0.2 — clobbering the stable minor tag
+  # with a candidate.
+  if [[ "$VERSION" == *-* ]]; then
+    PROMOTE_TAGS=( "$VERSION" )
+    echo "==> $VERSION is a prerelease: promoting :$VERSION only"
+  else
+    PROMOTE_TAGS=( "latest" "$VERSION" "${VERSION%.*}" )
+  fi
+
   # Retags the staged manifest by digest — no rebuild, no pull — so every tag a
-  # user can pull resolves to the digest signed above.
-  echo "==> Promoting image tags to the signed digest"
-  docker buildx imagetools create \
-    -t "${IMAGE}:latest" \
-    -t "${IMAGE}:${VERSION}" \
-    -t "${IMAGE}:${VERSION%.*}" \
-    "$DIGEST_REF" || die \
+  # user can pull resolves to the digest signed above. The digest is
+  # content-addressed and so is identical in the staging and release packages.
+  echo "==> Promoting image tags to the signed digest: ${PROMOTE_TAGS[*]}"
+  DIGEST="${DIGEST_REF#*@}"
+  create_args=()
+  for t in "${PROMOTE_TAGS[@]}"; do
+    create_args+=( -t "${IMAGE}:${t}" )
+  done
+  docker buildx imagetools create "${create_args[@]}" "${STAGING_IMAGE}@${DIGEST}" || die \
     "failed to promote image tags (registry auth? run \`docker login ghcr.io\`).
 Signatures are uploaded and the release is still a draft.
 Fix the problem and re-run this script — it is idempotent."
 
-  PROMOTED=$(docker buildx imagetools inspect "${IMAGE}:latest" \
-    --format '{{.Manifest.Digest}}' 2>/dev/null) || PROMOTED=""
-  [[ "$DIGEST_REF" == *"@${PROMOTED}" ]] ||
-    die "${IMAGE}:latest resolves to '${PROMOTED}', not the signed digest"
+  for t in "${PROMOTE_TAGS[@]}"; do
+    got=$(docker buildx imagetools inspect "${IMAGE}:${t}" \
+      --format '{{.Manifest.Digest}}' 2>/dev/null) || got=""
+    [[ "$got" == "$DIGEST" ]] ||
+      die "${IMAGE}:${t} resolves to '${got}', not the signed digest ${DIGEST}"
+    echo "    ${IMAGE}:${t} -> ${DIGEST}"
+  done
 fi
 
 echo "==> Publishing $TAG"
@@ -236,4 +261,8 @@ or publish manually: gh release edit $TAG --repo $REPO --draft=false"
 
 echo
 echo "Published: https://github.com/${REPO}/releases/tag/${TAG}"
-echo "Staging tag ${IMAGE}:${STAGING_TAG} can now be deleted from the GHCR UI."
+if [[ -z "$SKIP_IMAGE_TAGS" ]]; then
+  echo "The ${STAGING_IMAGE} package version for ${TAG} is now redundant and can"
+  echo "be deleted. It is a separate package, so deleting it does not affect the"
+  echo "released image."
+fi

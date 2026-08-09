@@ -460,19 +460,25 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Pushed under a staging tag only. None of the tags a user would pull —
-      # `latest`, `<version>`, `<major>.<minor>` — are created here, because a
-      # tag published before the digest is signed is an unvouched-for image
-      # that anyone can pull. sign-release.sh promotes all three from the
-      # signed digest via `buildx imagetools create`, which retags the existing
-      # manifest without a rebuild.
+      # Pushed to a SEPARATE staging package, not to the release package. None
+      # of the tags a user would pull — `latest`, `<version>`, `<major>.<minor>`
+      # — are created here, because a tag published before the digest is signed
+      # is an unvouched-for image anyone can pull. sign-release.sh promotes them
+      # from the signed digest via `buildx imagetools create`, which retags the
+      # existing manifest without a rebuild.
+      #
+      # A separate package rather than a `staging-*` tag on the release package:
+      # GHCR keys a package version by digest and treats tags as metadata on it,
+      # so after promotion a staging tag would sit on the same version as
+      # `latest`. Deleting that version to clean up the staging tag would delete
+      # the released image with it.
       - name: Docker metadata
         id: meta
         uses: docker/metadata-action@v6
         with:
-          images: ghcr.io/${{ github.repository }}
+          images: ghcr.io/${{ github.repository }}-staging
           tags: |
-            type=raw,value=staging-${{ needs.release.outputs.tag }}
+            type=raw,value=${{ needs.release.outputs.tag }}
 
       - name: Build and push (staging tag)
         id: build
@@ -485,10 +491,12 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
 
+      # Scanned via the staging package: that is the only one carrying this
+      # digest until sign-release.sh promotes it.
       - name: Generate SBOM
         uses: anchore/sbom-action@v0
         with:
-          image: ghcr.io/${{ github.repository }}@${{ steps.build.outputs.digest }}
+          image: ghcr.io/${{ github.repository }}-staging@${{ steps.build.outputs.digest }}
           format: spdx-json
           output-file: decdn-${{ needs.release.outputs.version }}-sbom.spdx.json
           upload-release-assets: false
@@ -498,6 +506,11 @@ jobs:
       # out of band: image-digest.txt records the exact
       # ghcr.io/...@sha256:... reference, and sign-release.sh signs that file
       # locally. cosign will later replace this with an in-registry signature.
+      #
+      # This names the RELEASE package, not the staging one it currently lives
+      # in. A manifest digest is content-addressed, so it is identical in both;
+      # recording the release reference means the signed file is the one
+      # consumers can actually pull once the tags are promoted.
       - name: Record image digest
         env:
           IMAGE: ghcr.io/${{ github.repository }}
