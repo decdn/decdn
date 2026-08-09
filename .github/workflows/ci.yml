@@ -1537,23 +1537,11 @@ jobs:
       - name: Deployment manifest mirror in sync
         run: .github/scripts/check-deployment-mirror.sh
 
-      # The image repository is spelled in three places that must agree:
-      # release.yml's IMAGE_NAME (which writes image-digest.txt), sign-release.sh's
-      # IMAGE (which regex-validates that file), and security.yml's scan target.
-      # A mismatch is caught today only at signing time, after a full release
-      # build — this is the same "constant duplicated across artifacts" shape
-      # that crates/node/src/metrics.rs pins with a test.
+      # In a script, not inline: a `run:` block is templated by Actions before
+      # bash sees it, so an inline grep for the literal `${{ github.repository }}`
+      # would search for the expanded value and never match.
       - name: Image name agrees across workflows and the signing script
-        run: |
-          set -euo pipefail
-          fail=0
-          grep -q 'IMAGE_NAME: \${{ github.repository }}-node' .github/workflows/release.yml || {
-            echo "::error::release.yml IMAGE_NAME is not <repo>-node"; fail=1; }
-          grep -q 'IMAGE="ghcr.io/\${REPO}-node"' .github/scripts/sign-release.sh || {
-            echo "::error::sign-release.sh IMAGE does not match release.yml"; fail=1; }
-          grep -q 'ghcr.io/\${{ github.repository }}-node:latest' .github/workflows/security.yml || {
-            echo "::error::security.yml scans a different image than the release publishes"; fail=1; }
-          exit $fail
+        run: .github/scripts/check-image-name.sh
 
       - uses: dtolnay/rust-toolchain@1.95.0
 
