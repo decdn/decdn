@@ -3,10 +3,9 @@
 #
 # The workflow builds the archives, the container image and the SBOM, but signs
 # nothing and publishes nothing — the GitHub Release is left as a draft and the
-# image is pushed only under a `staging-<tag>` tag. This script is the human
-# step: a maintainer verifies what CI produced, signs it with their own GPG
-# key, promotes the real image tags, and publishes. There is no signing key in
-# Actions secrets.
+# image manifest is pushed untagged. This script is the human step: a maintainer
+# verifies what CI produced, signs it with their own GPG key, promotes the image
+# tags, and publishes. There is no signing key in Actions secrets.
 #
 # Usage:  .github/scripts/sign-release.sh v0.1.2
 #
@@ -27,13 +26,6 @@ TAG="${1:?tag required, e.g. v0.1.2}"
 VERSION="${TAG#v}"
 REPO="${DECDN_REPO:-decdn/decdn}"
 IMAGE="ghcr.io/${REPO}"
-# CI stages the build in a SEPARATE package, not under a staging tag on the
-# release package. GHCR identifies a package version by digest and treats tags
-# as metadata on it, so a staging tag would end up on the same version as
-# `latest` and `<version>` after promotion — and deleting that "version" to
-# clean up the staging tag would delete the released image along with it.
-# A separate package can be deleted without touching the release.
-STAGING_IMAGE="${IMAGE}-staging"
 SIGNING_KEY="${DECDN_SIGNING_KEY:-}"
 SKIP_IMAGE_TAGS="${DECDN_SKIP_IMAGE_TAGS:-}"
 
@@ -245,16 +237,15 @@ else
     PROMOTE_TAGS=( "latest" "$VERSION" "${VERSION%.*}" )
   fi
 
-  # Retags the staged manifest by digest — no rebuild, no pull — so every tag a
-  # user can pull resolves to the digest signed above. The digest is
-  # content-addressed and so is identical in the staging and release packages.
+  # Tags the untagged manifest CI already pushed — no rebuild, no pull — so
+  # every tag a user can pull resolves to the digest signed above.
   echo "==> Promoting image tags to the signed digest: ${PROMOTE_TAGS[*]}"
   DIGEST="${DIGEST_REF#*@}"
   create_args=()
   for t in "${PROMOTE_TAGS[@]}"; do
     create_args+=( -t "${IMAGE}:${t}" )
   done
-  docker buildx imagetools create "${create_args[@]}" "${STAGING_IMAGE}@${DIGEST}" || die \
+  docker buildx imagetools create "${create_args[@]}" "${IMAGE}@${DIGEST}" || die \
     "failed to promote image tags (registry auth? run \`docker login ghcr.io\`).
 Signatures are uploaded and the release is still a draft.
 Fix the problem and re-run this script — it is idempotent."
@@ -276,8 +267,3 @@ or publish manually: gh release edit $TAG --repo $REPO --draft=false"
 
 echo
 echo "Published: https://github.com/${REPO}/releases/tag/${TAG}"
-if [[ -z "$SKIP_IMAGE_TAGS" ]]; then
-  echo "The ${STAGING_IMAGE} package version for ${TAG} is now redundant and can"
-  echo "be deleted. It is a separate package, so deleting it does not affect the"
-  echo "released image."
-fi

@@ -66,9 +66,8 @@ created only after that digest has been signed, so an unpinned
 `docker pull ghcr.io/decdn/decdn` also resolves to a signed image. Pulling by
 digest is still stronger: it pins the exact bytes you verified.
 
-CI stages each build in a separate `decdn-staging` package before it is signed.
-That package is build scratch space, is not part of any release, and should
-never be pulled.
+CI pushes the image manifest untagged, so before signing there is nothing to
+pull by name at all — the tags above are created from the signed digest.
 
 A prerelease (`v1.2.0-rc1`) is published only as its exact version tag —
 `latest` and `<major>.<minor>` are never moved to a release candidate.
@@ -81,9 +80,19 @@ The SBOM (`decdn-<version>-sbom.spdx.json`) ships with a matching `.asc`.
 
 ### What a signature does and does not tell you
 
-CI builds the release archives and the container image on GitHub runners; the
-maintainer verifies the published checksums, then signs them. The signature
-means a named maintainer vouches that these are the release artifacts. It is
-not a reproducible-build attestation, and it does not prove the binaries were
-compiled from the tagged source. To verify that yourself, build from the signed
-tag.
+CI builds the release archives on GitHub runners; the maintainer verifies the
+published checksums, then signs them. The signature means a named maintainer
+vouches that these are the release artifacts. It is not a reproducible-build
+attestation, and it does not prove the binaries were compiled from the tagged
+source. To verify that yourself, build from the signed tag.
+
+The container image is assembled from those same archives rather than compiled
+separately, so the `decdn-node` binary inside it is byte-identical to the one in
+`decdn-node-<version>-<target>.tar.gz`. Checking the archive against the signed
+`SHA256SUMS` therefore also tells you what is in the image:
+
+```bash
+docker run --rm --entrypoint sha256sum ghcr.io/decdn/decdn:<version> \
+  /usr/local/bin/decdn-node
+tar xzOf decdn-node-<version>-x86_64-unknown-linux-gnu.tar.gz | sha256sum
+```

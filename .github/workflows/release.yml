@@ -7,10 +7,10 @@ name: Release
 # below only to generate the GitHub release notes.
 #
 # This workflow builds and stages; it does not sign and it does not publish.
-# The GitHub Release is created as a *draft* and the container image is pushed
-# only under a staging tag, so no artifact anyone is meant to consume exists
-# before a maintainer has signed it with .github/scripts/sign-release.sh.
-# There is no signing key in Actions secrets.
+# The GitHub Release is created as a *draft* and the container image manifest is
+# pushed untagged, so no artifact anyone is meant to consume exists before a
+# maintainer has signed it with .github/scripts/sign-release.sh. There is no
+# signing key in Actions secrets.
 on:
   push:
     tags:
@@ -264,12 +264,20 @@ jobs:
       matrix:
         include:
           # decdn-node (daemon) — five targets.
+          #
+          # Both Linux targets go through `cross`, never a native build. A
+          # native build links against the runner's glibc — ubuntu-latest is
+          # 24.04, glibc 2.39 — which is NEWER than debian:bookworm-slim (2.36),
+          # so the binary would not run in our own container, nor on Debian 12
+          # or RHEL 9. `cross` images pin an old glibc (~2.31), which fixes the
+          # floor independently of whatever ubuntu-latest points at next.
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
             package: decdn-node
             binary: decdn-node
             archive_name: decdn-node
             archive: tar.gz
+            cross: true
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-latest
             package: decdn-node
@@ -295,13 +303,14 @@ jobs:
             binary: decdn-node.exe
             archive_name: decdn-node
             archive: zip
-          # decdn (user CLI) — same five targets.
+          # decdn (user CLI) — same five targets, same glibc reasoning.
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
             package: decdn-cli
             binary: decdn
             archive_name: decdn
             archive: tar.gz
+            cross: true
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-latest
             package: decdn-cli
@@ -447,7 +456,10 @@ jobs:
 
   docker:
     name: Docker image
-    needs: release
+    # Needs build-binaries: the image is assembled from the Linux archives that
+    # job produces, so the binary inside the image is byte-identical to the one
+    # the signed SHA256SUMS covers.
+    needs: [release, build-binaries]
     runs-on: blacksmith-4vcpu-ubuntu-2404
     permissions:
       # `write`, not `read`: this job uploads the SBOM and image-digest.txt to
@@ -460,11 +472,56 @@ jobs:
         with:
           ref: ${{ needs.release.outputs.tag }}
 
+      # Still needed: the apt-get layer runs under emulation for arm64. That is
+      # seconds, not the multi-minute cargo build it replaces.
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v4
 
       - name: Setup Blacksmith Builder
         uses: useblacksmith/setup-docker-builder@v2
+
+      - name: Download Linux daemon archives
+        uses: actions/download-artifact@v8
+        with:
+          pattern: decdn-node-*-unknown-linux-gnu
+          path: archives
+          merge-multiple: true
+
+      # dist/<arch>/ is keyed on buildx's TARGETARCH (amd64/arm64) rather than
+      # the Rust target triple, so the Dockerfile's COPY needs no branching.
+      - name: Unpack archives into dist/
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist/amd64 dist/arm64
+          tar xzf "archives/decdn-node-${VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+            -C dist/amd64
+          tar xzf "archives/decdn-node-${VERSION}-aarch64-unknown-linux-gnu.tar.gz" \
+            -C dist/arm64
+          for a in amd64 arm64; do
+            [ -x "dist/$a/decdn-node" ] || {
+              echo "::error::dist/$a/decdn-node missing or not executable"; exit 1; }
+          done
+          sha256sum dist/*/decdn-node
+
+          # Enforce the glibc floor rather than trusting `cross: true` to stay
+          # in the matrix. A natively-built binary needs GLIBC_2.39 (the
+          # runner's), which does not exist in debian:bookworm-slim (2.36) — it
+          # would fail at exec with "version `GLIBC_2.38' not found", and the
+          # published archive would be unrunnable on Debian 12 / RHEL 9 too.
+          MAX_ALLOWED=2.36
+          for a in amd64 arm64; do
+            need=$(objdump -T "dist/$a/decdn-node" \
+              | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -V | tail -1)
+            echo "dist/$a/decdn-node requires glibc <= $need"
+            if [ "$(printf '%s\n%s\n' "$need" "$MAX_ALLOWED" | sort -V | tail -1)" \
+                 != "$MAX_ALLOWED" ]; then
+              echo "::error::dist/$a/decdn-node needs glibc $need, above the" \
+                   "$MAX_ALLOWED floor. Is this target still built with \`cross\`?"
+              exit 1
+            fi
+          done
 
       - name: Log in to GHCR
         uses: docker/login-action@v4.6.0
@@ -473,43 +530,44 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Pushed to a SEPARATE staging package, not to the release package. None
-      # of the tags a user would pull — `latest`, `<version>`, `<major>.<minor>`
-      # — are created here, because a tag published before the digest is signed
-      # is an unvouched-for image anyone can pull. sign-release.sh promotes them
-      # from the signed digest via `buildx imagetools create`, which retags the
-      # existing manifest without a rebuild.
-      #
-      # A separate package rather than a `staging-*` tag on the release package:
-      # GHCR keys a package version by digest and treats tags as metadata on it,
-      # so after promotion a staging tag would sit on the same version as
-      # `latest`. Deleting that version to clean up the staging tag would delete
-      # the released image with it.
+      # Only `labels` is consumed — `push-by-digest` below creates no tag, so
+      # metadata-action's tag output is unused. `images` is still required for
+      # it to compute the OCI source/revision labels.
       - name: Docker metadata
         id: meta
         uses: docker/metadata-action@v6
         with:
-          images: ghcr.io/${{ github.repository }}-staging
+          images: ghcr.io/${{ github.repository }}
           tags: |
-            type=raw,value=${{ needs.release.outputs.tag }}
+            type=raw,value=unused
 
-      - name: Build and push (staging tag)
+      # Pushed WITHOUT a tag. `push-by-digest=true` uploads the manifest and
+      # leaves it untagged, so nothing is pullable by name until
+      # sign-release.sh promotes `latest`, `<version>` and `<major>.<minor>`
+      # from the signed digest. A tag published before the digest is signed
+      # would be an unvouched-for image anyone could pull.
+      #
+      # An untagged push into the release package, rather than a tagged push
+      # into a staging one: GHCR keys a package version by digest and treats
+      # tags as metadata on it, so a staging tag would end up on the same
+      # version as `latest` after promotion and deleting it to tidy up would
+      # delete the released image.
+      - name: Build and push by digest
         id: build
         uses: useblacksmith/build-push-action@v2.3.0
         with:
           context: .
           file: Dockerfile
-          push: true
           platforms: linux/amd64,linux/arm64
-          tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=ghcr.io/${{ github.repository }},push-by-digest=true,name-canonical=true,push=true
 
-      # Scanned via the staging package: that is the only one carrying this
-      # digest until sign-release.sh promotes it.
+      # Scanned by digest in the release package — the untagged manifest is
+      # already there, it just has no tag pointing at it yet.
       - name: Generate SBOM
         uses: anchore/sbom-action@v0
         with:
-          image: ghcr.io/${{ github.repository }}-staging@${{ steps.build.outputs.digest }}
+          image: ghcr.io/${{ github.repository }}@${{ steps.build.outputs.digest }}
           format: spdx-json
           output-file: decdn-${{ needs.release.outputs.version }}-sbom.spdx.json
           upload-release-assets: false
@@ -519,11 +577,6 @@ jobs:
       # out of band: image-digest.txt records the exact
       # ghcr.io/...@sha256:... reference, and sign-release.sh signs that file
       # locally. cosign will later replace this with an in-registry signature.
-      #
-      # This names the RELEASE package, not the staging one it currently lives
-      # in. A manifest digest is content-addressed, so it is identical in both;
-      # recording the release reference means the signed file is the one
-      # consumers can actually pull once the tags are promoted.
       - name: Record image digest
         env:
           IMAGE: ghcr.io/${{ github.repository }}

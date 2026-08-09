@@ -203,6 +203,7 @@ jobs:
       markdown: ${{ steps.filter.outputs.markdown }}
       scripts: ${{ steps.filter.outputs.scripts }}
       agentic: ${{ steps.filter.outputs.agentic }}
+      docker: ${{ steps.filter.outputs.docker }}
     steps:
       - uses: actions/checkout@v7
       - uses: dorny/paths-filter@v4
@@ -306,6 +307,9 @@ jobs:
               # Deployment manifests are recorded artifacts, not contract
               # inputs. Test-chain 31337*.json manifests are also gitignored.
               - '!contracts/deployments/**'
+            docker:
+              - 'Dockerfile'
+              - '.dockerignore'
 
   test:
     name: test
@@ -1510,6 +1514,39 @@ jobs:
   # comment via .github/scripts/coverage-diff.py) as best-effort steps; those
   # steps' `continue-on-error: true` keeps coverage tooling non-blocking even
   # though the job itself is required.
+  # Nothing validated the Dockerfile until a release tag was cut, which is how
+  # `EXPOSE 4433 9090  # comment` — a hard parse error, since Dockerfile `#`
+  # only starts a comment at the beginning of a line — survived in the tree.
+  # The release workflow assembles the image from prebuilt archives; here a
+  # placeholder stands in for the binary so the build stays cheap.
+  docker-build:
+    name: docker build
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    needs: changes
+    if: ${{ needs.changes.outputs.docker == 'true' || github.event_name != 'pull_request' }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Lint Dockerfile
+        run: docker buildx build --check .
+
+      - name: Build (single platform, placeholder binary)
+        run: |
+          set -euo pipefail
+          mkdir -p dist/amd64
+          printf '#!/bin/sh\necho placeholder\n' > dist/amd64/decdn-node
+          chmod +x dist/amd64/decdn-node
+          docker build --platform linux/amd64 -t decdn-node:ci .
+
+      # Guards the contract the release workflow depends on: the binary must
+      # land on PATH at the expected name and be executable as ENTRYPOINT.
+      - name: Check the entrypoint resolves
+        run: |
+          set -euo pipefail
+          out=$(docker run --rm decdn-node:ci)
+          [ "$out" = "placeholder" ] || {
+            echo "::error::entrypoint did not run the copied binary (got: $out)"; exit 1; }
+
   ci-success:
     name: CI success
     if: always()
@@ -1517,7 +1554,8 @@ jobs:
     needs: [fmt, clippy, changes, test, doctest, deny, doc, public-api, markdownlint, adr-book-list,
             agentic-lock, pr-title, anvil-e2e-settlement, anvil-e2e-journeys,
             solidity-fmt, solidity-build-test, solidity-coverage,
-            solidity-solhint, solidity-slither, solidity-aderyn, ed25519-vectors]
+            solidity-solhint, solidity-slither, solidity-aderyn, ed25519-vectors,
+            docker-build]
     steps:
       - uses: re-actors/alls-green@release/v1
         with:
@@ -1525,8 +1563,9 @@ jobs:
           # Rust jobs are gated on `needs.changes.outputs.rust`,
           # adr-book-list on `needs.changes.outputs.adr`, markdownlint on
           # `needs.changes.outputs.markdown`, agentic-lock on
-          # `needs.changes.outputs.agentic`, and the solidity-* jobs on
-          # `needs.changes.outputs.solidity`; each skips when its paths are
+          # `needs.changes.outputs.agentic`, the solidity-* jobs on
+          # `needs.changes.outputs.solidity`, and docker-build on
+          # `needs.changes.outputs.docker`; each skips when its paths are
           # untouched. alls-green treats `skipped` as failure unless listed
           # here. `changes` is intentionally omitted — it always runs, so a
           # skip from it signals a misconfiguration that should fail the gate.
@@ -1534,4 +1573,5 @@ jobs:
                          agentic-lock, pr-title, markdownlint,
                          anvil-e2e-settlement, anvil-e2e-journeys,
                          solidity-fmt, solidity-build-test, solidity-coverage,
-                         solidity-solhint, solidity-slither, solidity-aderyn, ed25519-vectors
+                         solidity-solhint, solidity-slither, solidity-aderyn, ed25519-vectors,
+                         docker-build

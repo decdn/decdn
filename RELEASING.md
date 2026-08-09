@@ -81,8 +81,9 @@ which:
 5. creates the GitHub Release as a **draft**;
 6. builds ten archives (`decdn-node` and `decdn`, five targets each) and a
    `SHA256SUMS` manifest, asserting all ten are present;
-7. builds and pushes the multi-arch image to a **separate staging package**
-   (`ghcr.io/decdn/decdn-staging`), and attaches the SBOM and
+7. assembles the multi-arch image from those archives — it does not compile
+   from source, so the binary in the image is byte-identical to the archived
+   one — and pushes the manifest **untagged**, attaching the SBOM and
    `image-digest.txt`.
 
 Draft assets need authentication to download, and no pullable image tag exists
@@ -130,8 +131,8 @@ can inspect the bytes rather than re-downloading several hundred megabytes.
 ## Recovery
 
 **CI failed.** No signed artifact escaped and no pullable image tag was
-created, but the tag is on `origin` and a staging image may exist. Delete the
-draft and the tag, fix the problem, and cut again:
+created, but the tag is on `origin` and an untagged image manifest may exist.
+Delete the draft and the tag, fix the problem, and cut again:
 
 ```bash
 gh release delete v0.1.2 --yes
@@ -152,15 +153,12 @@ release.
 release behind it is the one state this flow leaves lying around. Either run the
 signing script, or delete the tag as above.
 
-**Cleaning up staging images.** Versions accumulate in the
-`ghcr.io/decdn/decdn-staging` package. Delete them in the GitHub UI once the
-release is out; nothing depends on them after promotion.
-
-Delete them from **`decdn-staging`**, never from `decdn`. GHCR keys a package
-version by digest and treats tags as metadata on it, so deleting a version in
-the release package removes the image behind every tag pointing at it —
-including `latest`. Staging lives in its own package precisely so this cleanup
-cannot touch a published release.
+**Abandoned image manifests.** A run whose release is never signed leaves an
+untagged manifest in the GHCR package. It is not pullable by name and costs only
+storage, so cleanup is optional. If you do delete one, take care: GHCR keys a
+package version by digest and treats tags as metadata on it, so deleting the
+wrong version removes the image behind every tag pointing at it, `latest`
+included. Match the digest against `image-digest.txt` before deleting anything.
 
 ## Verifying a release as a consumer would
 
