@@ -1537,6 +1537,40 @@ jobs:
       - name: Deployment manifest mirror in sync
         run: .github/scripts/check-deployment-mirror.sh
 
+      # The image repository is spelled in three places that must agree:
+      # release.yml's IMAGE_NAME (which writes image-digest.txt), sign-release.sh's
+      # IMAGE (which regex-validates that file), and security.yml's scan target.
+      # A mismatch is caught today only at signing time, after a full release
+      # build — this is the same "constant duplicated across artifacts" shape
+      # that crates/node/src/metrics.rs pins with a test.
+      - name: Image name agrees across workflows and the signing script
+        run: |
+          set -euo pipefail
+          fail=0
+          grep -q 'IMAGE_NAME: \${{ github.repository }}-node' .github/workflows/release.yml || {
+            echo "::error::release.yml IMAGE_NAME is not <repo>-node"; fail=1; }
+          grep -q 'IMAGE="ghcr.io/\${REPO}-node"' .github/scripts/sign-release.sh || {
+            echo "::error::sign-release.sh IMAGE does not match release.yml"; fail=1; }
+          grep -q 'ghcr.io/\${{ github.repository }}-node:latest' .github/workflows/security.yml || {
+            echo "::error::security.yml scans a different image than the release publishes"; fail=1; }
+          exit $fail
+
+      - uses: dtolnay/rust-toolchain@1.95.0
+
+      # The authoritative packaging check is `cargo publish --workspace
+      # --dry-run` in release.yml, which verify-BUILDS every crate. This is the
+      # cheap half: --no-verify skips the build, so it costs seconds, and it
+      # still catches everything about the packaged *manifests* — a crate whose
+      # README was deleted, a path dependency that lost its `version`, or a new
+      # workspace member that defaults to publishable with no metadata. All of
+      # those are otherwise green until release day, when the version is
+      # already tagged and a crates.io failure has no clean recovery.
+      #
+      # Must be --workspace: `cargo package -p decdn-cli` alone fails, because
+      # the internal path deps are not on crates.io yet.
+      - name: Every crate still packages
+        run: cargo package --workspace --no-verify --locked
+
   # Single gate for branch protection. Point required-checks at this one job
   # so adding/renaming jobs above doesn't require updating branch rules.
   # The `test` job carries coverage post-processing (LCOV diff, sticky PR
