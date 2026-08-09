@@ -292,6 +292,16 @@ jobs:
               # nothing for that job to verify.
               - '.github/scripts/**'
               - '.github/workflows/ci.yml'
+            docker:
+              # Gates `docker-build`. Must live in THIS filter, not the
+              # Solidity one below: that step sets
+              # `predicate-quantifier: every`, which would require a path to
+              # match every rule at once — no file is both Dockerfile and
+              # .dockerignore, so the filter could never fire and the job
+              # would silently skip on the very PRs it exists to check.
+              - 'Dockerfile'
+              - '.dockerignore'
+              - '.github/workflows/ci.yml'
       - name: Detect Solidity contract changes
         uses: dorny/paths-filter@v4
         id: solidity_contracts
@@ -307,9 +317,6 @@ jobs:
               # Deployment manifests are recorded artifacts, not contract
               # inputs. Test-chain 31337*.json manifests are also gitignored.
               - '!contracts/deployments/**'
-            docker:
-              - 'Dockerfile'
-              - '.dockerignore'
 
   test:
     name: test
