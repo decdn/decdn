@@ -47,6 +47,20 @@ cargo release patch --execute              # cut, sign and push the tag
    `decdn` crates.io owner set is what makes it work; the token itself is
    personal and never leaves your machine.
 
+6. **Before the *first* release only — clear the new-crate rate limit.**
+   crates.io limits crate *creation* far harder than updates: `PublishNew`
+   allows a burst of 5, then roughly one per 10 minutes. The first release
+   creates **eleven** crates at once, so a single run would be rate-limited
+   partway through — and since a published version is immutable, that leaves
+   some crates uploaded, the version spent, and no clean retry.
+
+   `publish-crates.sh` refuses to start in that situation, but clearing it is a
+   manual step. Either ask the crates.io team to raise this repo's publish-new
+   limit (the documented route, and the tidier one), or publish the eleven
+   crates by hand ahead of the tag, in dependency order, spacing them out. Once
+   the names exist, every later release is `PublishUpdate` and unconstrained.
+   Set `DECDN_ALLOW_RATE_LIMIT=1` to proceed once the limit has been raised.
+
 ## Cutting a version
 
 `cargo release <patch|minor|major> --execute` does all of the following, driven
@@ -141,8 +155,15 @@ Useful environment overrides:
 | `DECDN_SIGNING_KEY` | key to sign with, when your default key is not the one in `KEYS` |
 | `DECDN_SKIP_IMAGE_TAGS` | set to `1` to publish with **no** pullable image tag at all — the release then ships only the signed digest |
 | `DECDN_SKIP_DOCKERHUB` | set to `1` to tag on GHCR only (implied by `DECDN_SKIP_IMAGE_TAGS`) |
-| `DECDN_DOCKERHUB_REPO` | override `decdn/decdn-node` |
-| `DECDN_REPO` | target a fork instead of `decdn/decdn` |
+| `DECDN_DOCKERHUB_REPO` | override the Docker Hub repository (defaults to `<DECDN_REPO>-node`) |
+| `DECDN_REPO` | target a fork instead of `decdn/decdn` — both registries follow it |
+
+The skip variables take `1`/`true`/`yes` or `0`/`false`/`no`; anything else is
+rejected rather than guessed, so `DECDN_SKIP_DOCKERHUB=0` means *don't* skip.
+
+Both image repositories derive from `DECDN_REPO`, so a fork rehearsal stays
+entirely on the fork. Point `DECDN_DOCKERHUB_REPO` somewhere else only if the
+Docker Hub namespace genuinely differs from the GitHub one.
 
 For a stable version the promoted tags are `latest`, `<version>` and
 `<major>.<minor>`. A prerelease (`v1.2.0-rc1`) gets only its exact version tag:
@@ -165,10 +186,17 @@ Last, once the GitHub Release is out of draft:
 .github/scripts/publish-crates.sh v0.1.2
 ```
 
-It verifies the tag against `KEYS` and against `origin` exactly as
-`sign-release.sh` does, then additionally **requires the release to be
-published, not a draft** — a crates.io version can never be replaced, so nothing
-goes to the registry before the signed release it corresponds to exists.
+It verifies the tag against `KEYS` and against `origin` the way
+`sign-release.sh` does, and adds two checks of its own. It **requires the
+release to be published, not a draft**, and — because leaving draft does not by
+itself prove anything was signed — it **requires `SHA256SUMS.asc` to be
+attached**. A crates.io version can never be replaced, so nothing reaches the
+registry that no maintainer signature vouches for.
+
+`DECDN_SIGNING_KEY` works here too, and accepts the same forms as in
+`sign-release.sh` (fingerprint, key id or uid). It is resolved against `KEYS`
+and compared as a full primary-key fingerprint; an ambiguous value is rejected
+rather than resolved to whichever key sorts first.
 
 It then checks out the tag into a detached worktree and publishes from there,
 not from your working copy, so uncommitted edits or a different branch cannot
